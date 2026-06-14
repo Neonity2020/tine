@@ -82,6 +82,11 @@ try {
       await swatch.click();
       await sleep(300);
       await page.screenshot({ path: `${OUT}/pdf-highlight-light.png` });
+
+      // Open the highlights/notes page from the PDF toolbar.
+      await page.locator(".pdf-notes-btn").click();
+      await sleep(400);
+      await page.screenshot({ path: `${OUT}/pdf-notes-light.png` });
     }
   }
 

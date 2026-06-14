@@ -5,7 +5,7 @@ import { QuickSwitcher } from "./components/QuickSwitcher";
 import { PdfViewer } from "./components/PdfViewer";
 import { backend } from "./backend";
 import { installKeybindings } from "./keybindings";
-import { theme, toggleTheme, sidebarOpen, openSwitcher, pdfTarget } from "./ui";
+import { theme, toggleTheme, sidebarOpen, toggleSidebar, openSwitcher, pdfTarget } from "./ui";
 
 export function App(): JSX.Element {
   onMount(async () => {
@@ -24,7 +24,18 @@ export function App(): JSX.Element {
       </Show>
       <div class="main-container">
         <header class="topbar">
-          <div class="topbar-left" />
+          <div class="topbar-left">
+            <button
+              class="icon-btn"
+              title="Toggle sidebar (t l)"
+              onClick={toggleSidebar}
+            >
+              <svg viewBox="0 0 24 24" class="nav-icon">
+                <rect x="3" y="4" width="18" height="16" rx="2" fill="none" stroke="currentColor" stroke-width="1.7" />
+                <line x1="9" y1="4" x2="9" y2="20" stroke="currentColor" stroke-width="1.7" />
+              </svg>
+            </button>
+          </div>
           <div class="topbar-right">
             <button class="icon-btn" title="Search (Ctrl+K)" onClick={openSwitcher}>
               <svg viewBox="0 0 24 24" class="nav-icon">
@@ -65,7 +76,11 @@ export function App(): JSX.Element {
       </div>
       <Show when={pdfTarget()}>
         <div class="pdf-pane">
-          <PdfViewer filename={pdfTarget()!.filename} label={pdfTarget()!.label} />
+          <PdfViewer
+            filename={pdfTarget()!.filename}
+            label={pdfTarget()!.label}
+            page={pdfTarget()!.page}
+          />
         </div>
       </Show>
       <QuickSwitcher />

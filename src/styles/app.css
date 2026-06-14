@@ -737,6 +737,35 @@ mark {
   white-space: nowrap;
 }
 
+.pdf-toolbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
+.pdf-notes-btn {
+  font-size: 12px;
+  padding: 4px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--bg-primary);
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.pdf-notes-btn:hover {
+  background: var(--bg-tertiary);
+}
+
+/* PDF highlight (annotation) block text */
+.pdf-annotation {
+  cursor: pointer;
+  border-radius: 2px;
+  padding: 0 2px;
+  box-decoration-break: clone;
+}
+
 .pdf-scroll {
   flex: 1;
   overflow-y: auto;

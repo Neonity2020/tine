@@ -244,9 +244,11 @@ impl Graph {
         let edn = crate::pdf::write_highlights(highlights);
         atomic_write(&self.assets_path().join(format!("{key}.edn")), edn.as_bytes())?;
 
-        let page_doc = crate::pdf::hls_page_document(pdf_filename, label, highlights);
-        let page_md = doc::serialize(&page_doc);
+        // Upsert into the existing hls page, preserving note children by id.
         let page_path = self.pages_path().join(format!("{}.md", crate::pdf::hls_page_name(&key)));
+        let existing = fs::read_to_string(&page_path).ok().map(|s| doc::parse(&s));
+        let page_doc = crate::pdf::merge_hls_page(existing.as_ref(), pdf_filename, label, highlights);
+        let page_md = doc::serialize(&page_doc);
         fs::create_dir_all(self.pages_path())?;
         atomic_write(&page_path, page_md.as_bytes())
     }

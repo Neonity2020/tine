@@ -26,6 +26,8 @@ import {
 import { blockView } from "../render/block";
 import { InlineText } from "../render/inline";
 import { QueryMacro, EmbedMacro } from "./Macro";
+import { openPdf } from "../ui";
+import { HL_COLOR_BG } from "../pdf";
 
 // Detect a block whose entire body is a single {{query}} / {{embed}} macro.
 function detectMacro(lines: string[]): { kind: "query" | "embed"; inner: string } | null {
@@ -33,6 +35,17 @@ function detectMacro(lines: string[]): { kind: "query" | "embed"; inner: string 
   const m = /^\{\{(query|embed)\b([\s\S]*)\}\}$/.exec(text);
   if (!m) return null;
   return { kind: m[1] as "query" | "embed", inner: `${m[1]}${m[2]}` };
+}
+
+// Internal/metadata properties hidden from the rendered properties area.
+const INTERNAL_PROPS = new Set(["id", "collapsed", "hl-page", "hl-color", "hl-type", "ls-type"]);
+
+// For a PDF highlight (annotation) block, resolve the PDF filename from the
+// owning hls__ page's `file-path::` property.
+function pdfFileForPage(pageName: string): string | null {
+  const p = doc.pages.find((x) => x.name === pageName);
+  const m = p?.preBlock ? /file-path::\s*(\S+)/.exec(p.preBlock) : null;
+  return m ? m[1].split("/").pop() ?? null : null;
 }
 
 export function Block(props: { id: string }): JSX.Element {
@@ -95,17 +108,50 @@ function Rendered(props: { id: string }): JSX.Element {
 
   const macro = createMemo(() => detectMacro(view().lines));
 
+  // PDF highlight (annotation) blocks: a colored, clickable swatch of text that
+  // opens the PDF at the highlight's page. Notes go in child blocks.
+  const annotation = createMemo(() => {
+    const props = view().properties;
+    if (!props.some(([k, v]) => k === "ls-type" && v === "annotation")) return null;
+    const color = props.find(([k]) => k === "hl-color")?.[1] ?? "yellow";
+    const hlPage = Number(props.find(([k]) => k === "hl-page")?.[1] ?? "1");
+    return { color, hlPage };
+  });
+
+  const openHighlightPdf = (e: MouseEvent) => {
+    e.stopPropagation();
+    const a = annotation();
+    const file = pdfFileForPage(node().page);
+    if (a && file) openPdf(file, file, a.hlPage);
+  };
+
+  const displayProps = () => view().properties.filter(([k]) => !INTERNAL_PROPS.has(k));
+
   const body = (
-    <For each={view().lines}>
-      {(line, i) => (
-        <>
-          <Show when={i() > 0}>
-            <br />
-          </Show>
-          <InlineText text={line} />
-        </>
-      )}
-    </For>
+    <Show
+      when={annotation()}
+      fallback={
+        <For each={view().lines}>
+          {(line, i) => (
+            <>
+              <Show when={i() > 0}>
+                <br />
+              </Show>
+              <InlineText text={line} />
+            </>
+          )}
+        </For>
+      }
+    >
+      <span
+        class="pdf-annotation"
+        style={{ background: HL_COLOR_BG[annotation()!.color] ?? HL_COLOR_BG.yellow }}
+        onClick={openHighlightPdf}
+        title="Open in PDF"
+      >
+        <InlineText text={view().lines[0]} />
+      </span>
+    </Show>
   );
 
   return (
@@ -146,9 +192,9 @@ function Rendered(props: { id: string }): JSX.Element {
           return <span class={`heading-text ${H}`}>{body}</span>;
         })()}
       </Show>
-      <Show when={view().properties.length > 0}>
+      <Show when={displayProps().length > 0}>
         <span class="block-properties">
-          <For each={view().properties}>
+          <For each={displayProps()}>
             {([k, v]) => (
               <span class="prop">
                 <span class="prop-key">{k}</span>

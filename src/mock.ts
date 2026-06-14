@@ -5,6 +5,7 @@
 import type { Backend } from "./backend";
 import type { BlockDto, GraphMeta, Highlight, PageDto, PageEntry, RefGroup } from "./types";
 import { SAMPLE_PDF_B64 } from "./sample-pdf";
+import { hlsPageName } from "./pdf";
 
 function pageRefs(raw: string): string[] {
   const out: string[] = [];
@@ -90,7 +91,30 @@ const NAMED: PageDto[] = [
   },
 ];
 
-const mockHighlights: Record<string, Highlight[]> = {};
+const mockHighlights: Record<string, { label: string; highlights: Highlight[] }> = {};
+
+// Synthesize an hls__ page DTO from stored highlights (mirrors the Rust
+// hls_page_document), so the Notes flow is demoable in the browser.
+function hlsPageDto(name: string): PageDto | null {
+  for (const [pdf, { label, highlights }] of Object.entries(mockHighlights)) {
+    if (hlsPageName(pdf) !== name) continue;
+    const blocks: BlockDto[] = highlights.map((h) => {
+      const lines = [h.text ?? ""];
+      lines.push(`hl-page:: ${h.page}`, `hl-color:: ${h.color}`);
+      if (h.image != null) lines.push("hl-type:: area");
+      lines.push("ls-type:: annotation", `id:: ${h.id}`);
+      return { id: h.id, raw: lines.join("\n"), collapsed: false, children: [] };
+    });
+    return {
+      name,
+      kind: "page",
+      title: label,
+      pre_block: `file:: [${label}](../assets/${pdf})\nfile-path:: ../assets/${pdf}`,
+      blocks,
+    };
+  }
+  return null;
+}
 
 function decodeB64(b64: string): Uint8Array {
   const bin = atob(b64);
@@ -128,6 +152,7 @@ export function mockBackend(): Backend {
       return PAGES.slice(offset, offset + limit);
     },
     async getPage(name: string): Promise<PageDto | null> {
+      if (name.startsWith("hls__")) return hlsPageDto(name);
       return find(name);
     },
     async savePage(): Promise<void> {
@@ -192,10 +217,10 @@ export function mockBackend(): Backend {
       return new Uint8Array();
     },
     async readHighlights(pdf: string): Promise<Highlight[]> {
-      return mockHighlights[pdf] ?? [];
+      return mockHighlights[pdf]?.highlights ?? [];
     },
-    async writeHighlights(pdf: string, _label: string, highlights: Highlight[]): Promise<void> {
-      mockHighlights[pdf] = highlights;
+    async writeHighlights(pdf: string, label: string, highlights: Highlight[]): Promise<void> {
+      mockHighlights[pdf] = { label, highlights };
     },
   };
 }

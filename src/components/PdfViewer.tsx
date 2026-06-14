@@ -3,6 +3,8 @@ import * as pdfjs from "pdfjs-dist";
 import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import { backend } from "../backend";
 import { closePdf } from "../ui";
+import { openPage } from "../router";
+import { hlsPageName } from "../pdf";
 import type { Highlight, Rect } from "../types";
 
 pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
@@ -23,8 +25,9 @@ interface Pending {
   text: string;
 }
 
-export function PdfViewer(props: { filename: string; label: string }): JSX.Element {
+export function PdfViewer(props: { filename: string; label: string; page?: number }): JSX.Element {
   let scrollRef!: HTMLDivElement;
+  const pageEls: Record<number, HTMLDivElement> = {};
   const [highlights, setHighlights] = createSignal<Highlight[]>([]);
   const [menu, setMenu] = createSignal<{ x: number; y: number } | null>(null);
   let pending: Pending | null = null;
@@ -73,6 +76,7 @@ export function PdfViewer(props: { filename: string; label: string }): JSX.Eleme
 
       scrollRef.appendChild(wrap);
       wrap.dataset.page = String(n);
+      pageEls[n] = wrap;
 
       await page.render({ canvasContext: canvas.getContext("2d")!, viewport }).promise;
       const textContent = await page.getTextContent();
@@ -80,6 +84,9 @@ export function PdfViewer(props: { filename: string; label: string }): JSX.Eleme
       await tl.render();
     }
     repaint();
+    if (props.page && pageEls[props.page]) {
+      pageEls[props.page].scrollIntoView({ block: "start" });
+    }
   });
 
   // Repaint highlight overlays whenever the set changes.
@@ -163,9 +170,18 @@ export function PdfViewer(props: { filename: string; label: string }): JSX.Eleme
     <div class="pdf-viewer">
       <div class="pdf-toolbar">
         <span class="pdf-title">{props.label}</span>
-        <button class="icon-btn" title="Close PDF" onClick={closePdf}>
-          ✕
-        </button>
+        <div class="pdf-toolbar-actions">
+          <button
+            class="pdf-notes-btn"
+            title="Open highlights & notes page"
+            onClick={() => openPage(hlsPageName(props.filename), "page")}
+          >
+            Notes
+          </button>
+          <button class="icon-btn" title="Close PDF" onClick={closePdf}>
+            ✕
+          </button>
+        </div>
       </div>
       <div class="pdf-scroll" ref={scrollRef} onMouseUp={onMouseUp} />
       <Show when={menu()}>

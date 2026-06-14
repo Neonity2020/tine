@@ -21,12 +21,15 @@ export function closeSwitcher() {
   setSwitcherOpen(false);
 }
 
-// The PDF currently open in the side pane (filename within assets/, + label).
-export const [pdfTarget, setPdfTarget] = createSignal<{ filename: string; label: string } | null>(
-  null
-);
-export function openPdf(filename: string, label: string) {
-  setPdfTarget({ filename, label });
+// The PDF currently open in the side pane (filename within assets/, + label,
+// + an optional page to scroll to).
+export const [pdfTarget, setPdfTarget] = createSignal<{
+  filename: string;
+  label: string;
+  page?: number;
+} | null>(null);
+export function openPdf(filename: string, label: string, page?: number) {
+  setPdfTarget({ filename, label, page });
 }
 export function closePdf() {
   setPdfTarget(null);

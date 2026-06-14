@@ -9,6 +9,7 @@
 use crate::doc::{DocBlock, Document};
 use crate::edn::{self, Edn};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Rect {
@@ -144,9 +145,35 @@ pub fn hls_page_name(key: &str) -> String {
 
 /// Build the `hls__<key>` index page document for a set of highlights.
 pub fn hls_page_document(pdf_filename: &str, label: &str, highlights: &[Highlight]) -> Document {
+    merge_hls_page(None, pdf_filename, label, highlights)
+}
+
+/// Upsert highlights into an existing `hls__` page, **preserving each existing
+/// annotation block (and its child notes) by `id`**. New highlights are
+/// appended; highlights deleted from the set drop their block. This is what
+/// makes the review flow safe — re-saving never clobbers notes.
+pub fn merge_hls_page(
+    existing: Option<&Document>,
+    pdf_filename: &str,
+    label: &str,
+    highlights: &[Highlight],
+) -> Document {
     let asset_path = format!("../assets/{pdf_filename}");
     let pre = format!("file:: [{label}]({asset_path})\nfile-path:: {asset_path}");
-    let roots = highlights.iter().map(highlight_block).collect();
+
+    let mut by_id: HashMap<String, DocBlock> = HashMap::new();
+    if let Some(doc) = existing {
+        for b in &doc.roots {
+            if let Some(id) = b.property("id") {
+                by_id.insert(id, b.clone());
+            }
+        }
+    }
+
+    let roots = highlights
+        .iter()
+        .map(|h| by_id.remove(&h.id).unwrap_or_else(|| highlight_block(h)))
+        .collect();
     Document { pre_block: Some(pre), roots }
 }
 
@@ -219,6 +246,37 @@ mod tests {
         let back = crate::doc::parse(&md);
         assert_eq!(back.roots.len(), 1);
         assert_eq!(back.roots[0].property("hl-page").as_deref(), Some("42"));
+    }
+
+    #[test]
+    fn merge_preserves_note_children() {
+        // First save: one highlight.
+        let h1 = sample();
+        let page1 = hls_page_document("b.pdf", "b", &[h1.clone()]);
+        // User adds a note child under the highlight, then edits on disk.
+        let mut md = crate::doc::serialize(&page1);
+        md.push_str("\t- my note about this highlight\n");
+        let edited = crate::doc::parse(&md);
+        assert_eq!(edited.roots[0].children.len(), 1);
+
+        // Second save: same highlight + a new one. Note must survive.
+        let mut h2 = sample();
+        h2.id = "new-id-2".into();
+        h2.text = Some("second highlight".into());
+        let merged = merge_hls_page(Some(&edited), "b.pdf", "b", &[h1, h2]);
+        assert_eq!(merged.roots.len(), 2);
+        assert_eq!(merged.roots[0].children.len(), 1, "note child preserved");
+        assert_eq!(merged.roots[0].children[0].raw, "my note about this highlight");
+        assert!(merged.roots[1].raw.contains("second highlight"));
+    }
+
+    #[test]
+    fn merge_drops_deleted_highlights() {
+        let h1 = sample();
+        let page = hls_page_document("b.pdf", "b", &[h1]);
+        // Re-save with an empty highlight set → block removed.
+        let merged = merge_hls_page(Some(&page), "b.pdf", "b", &[]);
+        assert_eq!(merged.roots.len(), 0);
     }
 
     #[test]
