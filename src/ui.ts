@@ -20,3 +20,14 @@ export function openSwitcher() {
 export function closeSwitcher() {
   setSwitcherOpen(false);
 }
+
+// The PDF currently open in the side pane (filename within assets/, + label).
+export const [pdfTarget, setPdfTarget] = createSignal<{ filename: string; label: string } | null>(
+  null
+);
+export function openPdf(filename: string, label: string) {
+  setPdfTarget({ filename, label });
+}
+export function closePdf() {
+  setPdfTarget(null);
+}

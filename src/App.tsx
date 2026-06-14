@@ -2,9 +2,10 @@ import { Show, onCleanup, onMount, type JSX } from "solid-js";
 import { Sidebar } from "./components/Sidebar";
 import { PageView } from "./components/Page";
 import { QuickSwitcher } from "./components/QuickSwitcher";
+import { PdfViewer } from "./components/PdfViewer";
 import { backend } from "./backend";
 import { installKeybindings } from "./keybindings";
-import { theme, toggleTheme, sidebarOpen, openSwitcher } from "./ui";
+import { theme, toggleTheme, sidebarOpen, openSwitcher, pdfTarget } from "./ui";
 
 export function App(): JSX.Element {
   onMount(async () => {
@@ -62,6 +63,11 @@ export function App(): JSX.Element {
           </div>
         </main>
       </div>
+      <Show when={pdfTarget()}>
+        <div class="pdf-pane">
+          <PdfViewer filename={pdfTarget()!.filename} label={pdfTarget()!.label} />
+        </div>
+      </Show>
       <QuickSwitcher />
     </div>
   );

@@ -65,6 +65,26 @@ try {
   await sleep(400);
   await page.screenshot({ path: `${OUT}/page-light.png` });
 
+  // PDF viewer: open the PDF asset link on the page.
+  await page.locator(".pdf-link").first().click();
+  await page.waitForSelector(".pdf-page canvas", { timeout: 8000 }).catch(() => {});
+  await sleep(1200);
+  await page.screenshot({ path: `${OUT}/pdf-light.png` });
+
+  // Try selecting a line of text to trigger the highlight color menu.
+  const span = page.locator(".pdf-page .textLayer span").first();
+  if (await span.count()) {
+    await span.click({ clickCount: 3 });
+    await sleep(300);
+    await page.screenshot({ path: `${OUT}/pdf-select-light.png` });
+    const swatch = page.locator(".pdf-color-swatch").first();
+    if (await swatch.count()) {
+      await swatch.click();
+      await sleep(300);
+      await page.screenshot({ path: `${OUT}/pdf-highlight-light.png` });
+    }
+  }
+
   // Dark theme on the journals feed.
   await page.locator(".nav-item").first().click();
   await sleep(200);

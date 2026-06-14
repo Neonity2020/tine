@@ -106,6 +106,38 @@ fn resolve_block(uuid: String, state: State<'_, AppState>) -> Result<Option<RefG
     with_graph(&state, |g| Ok(g.resolve_block(&uuid)))
 }
 
+#[tauri::command]
+fn read_asset(name: String, state: State<'_, AppState>) -> Result<Vec<u8>, String> {
+    with_graph(&state, |g| g.read_asset(&name).map_err(|e| e.to_string()))
+}
+
+#[tauri::command]
+fn import_asset(path: String, state: State<'_, AppState>) -> Result<String, String> {
+    with_graph(&state, |g| {
+        g.import_asset(std::path::Path::new(&path)).map_err(|e| e.to_string())
+    })
+}
+
+#[tauri::command]
+fn read_highlights(
+    pdf: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<logseq_core::pdf::Highlight>, String> {
+    with_graph(&state, |g| Ok(g.read_highlights(&pdf)))
+}
+
+#[tauri::command]
+fn write_highlights(
+    pdf: String,
+    label: String,
+    highlights: Vec<logseq_core::pdf::Highlight>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    with_graph(&state, |g| {
+        g.write_highlights(&pdf, &label, &highlights).map_err(|e| e.to_string())
+    })
+}
+
 fn main() {
     tauri::Builder::default()
         .manage(AppState { graph: Mutex::new(None) })
@@ -127,7 +159,11 @@ fn main() {
             run_query,
             search,
             quick_switch,
-            resolve_block
+            resolve_block,
+            read_asset,
+            import_asset,
+            read_highlights,
+            write_highlights
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

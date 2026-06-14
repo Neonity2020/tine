@@ -1,0 +1,232 @@
+//! PDF highlight model + OG-compatible persistence.
+//!
+//! Two artifacts, matching Logseq:
+//!  1. `assets/<key>.edn` — `{:highlights [...] :extra {}}` with scaled rects.
+//!  2. `pages/hls__<key>.md` — an index page: a `file::`/`file-path::` pre-block
+//!     plus one annotation block per highlight (`hl-page`, `hl-color`,
+//!     `ls-type:: annotation`, `id`). The block `id` equals the highlight id.
+
+use crate::doc::{DocBlock, Document};
+use crate::edn::{self, Edn};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Rect {
+    pub top: f64,
+    pub left: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Position {
+    pub page: i64,
+    pub bounding: Rect,
+    pub rects: Vec<Rect>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Highlight {
+    pub id: String,
+    pub page: i64,
+    pub position: Position,
+    pub color: String,
+    /// Selected text (text highlight) or None for area highlights.
+    pub text: Option<String>,
+    /// Image stamp (area highlight) or None for text highlights.
+    pub image: Option<i64>,
+}
+
+// ----------------------------------------------------------------- EDN <-> model
+
+fn kw(s: &str) -> Edn {
+    Edn::Keyword(s.to_string())
+}
+
+fn rect_from(e: &Edn) -> Option<Rect> {
+    Some(Rect {
+        top: e.get("top")?.as_f64()?,
+        left: e.get("left")?.as_f64()?,
+        width: e.get("width")?.as_f64()?,
+        height: e.get("height")?.as_f64()?,
+    })
+}
+
+fn rect_to(r: &Rect) -> Edn {
+    Edn::Map(vec![
+        (kw("top"), Edn::Float(r.top)),
+        (kw("left"), Edn::Float(r.left)),
+        (kw("width"), Edn::Float(r.width)),
+        (kw("height"), Edn::Float(r.height)),
+    ])
+}
+
+fn highlight_from(e: &Edn) -> Option<Highlight> {
+    let id = e.get("id")?.as_str()?.to_string();
+    let page = e.get("page")?.as_i64()?;
+    let pos = e.get("position")?;
+    let position = Position {
+        page: pos.get("page").and_then(Edn::as_i64).unwrap_or(page),
+        bounding: rect_from(pos.get("bounding")?)?,
+        rects: pos
+            .get("rects")
+            .and_then(Edn::as_vec)
+            .map(|v| v.iter().filter_map(rect_from).collect())
+            .unwrap_or_default(),
+    };
+    let color = e
+        .get("properties")
+        .and_then(|p| p.get("color"))
+        .and_then(Edn::as_str)
+        .unwrap_or("yellow")
+        .to_string();
+    let content = e.get("content");
+    let text = content.and_then(|c| c.get("text")).and_then(Edn::as_str).map(String::from);
+    let image = content.and_then(|c| c.get("image")).and_then(Edn::as_i64);
+    Some(Highlight { id, page, position, color, text, image })
+}
+
+fn highlight_to(h: &Highlight) -> Edn {
+    let position = Edn::Map(vec![
+        (kw("page"), Edn::Int(h.position.page)),
+        (kw("bounding"), rect_to(&h.position.bounding)),
+        (kw("rects"), Edn::Vec(h.position.rects.iter().map(rect_to).collect())),
+    ]);
+    let mut content_pairs = Vec::new();
+    if let Some(t) = &h.text {
+        content_pairs.push((kw("text"), Edn::Str(t.clone())));
+    }
+    content_pairs.push((kw("image"), h.image.map(Edn::Int).unwrap_or(Edn::Nil)));
+    Edn::Map(vec![
+        (kw("id"), Edn::Str(h.id.clone())),
+        (kw("page"), Edn::Int(h.page)),
+        (kw("position"), position),
+        (kw("content"), Edn::Map(content_pairs)),
+        (kw("properties"), Edn::Map(vec![(kw("color"), Edn::Str(h.color.clone()))])),
+    ])
+}
+
+/// Parse `assets/<key>.edn` contents into highlights.
+pub fn parse_highlights(edn_str: &str) -> Vec<Highlight> {
+    let Some(root) = edn::parse(edn_str) else { return Vec::new() };
+    root.get("highlights")
+        .and_then(Edn::as_vec)
+        .map(|v| v.iter().filter_map(highlight_from).collect())
+        .unwrap_or_default()
+}
+
+/// Serialize highlights to `assets/<key>.edn` contents.
+pub fn write_highlights(highlights: &[Highlight]) -> String {
+    let root = Edn::Map(vec![
+        (kw("highlights"), Edn::Vec(highlights.iter().map(highlight_to).collect())),
+        (kw("extra"), Edn::Map(vec![])),
+    ]);
+    let mut s = edn::to_string(&root);
+    s.push('\n');
+    s
+}
+
+// ----------------------------------------------------------------- hls__ page
+
+/// Sanitize a PDF filename into the key used for the edn file + hls page.
+/// (Approximation of Logseq's `inflate-asset`: lowercased, non-alphanumerics
+/// to underscores. Exact stamping differs, but the structure matches.)
+pub fn asset_key(pdf_filename: &str) -> String {
+    let stem = pdf_filename.strip_suffix(".pdf").unwrap_or(pdf_filename);
+    stem.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '_' })
+        .collect()
+}
+
+pub fn hls_page_name(key: &str) -> String {
+    format!("hls__{key}")
+}
+
+/// Build the `hls__<key>` index page document for a set of highlights.
+pub fn hls_page_document(pdf_filename: &str, label: &str, highlights: &[Highlight]) -> Document {
+    let asset_path = format!("../assets/{pdf_filename}");
+    let pre = format!("file:: [{label}]({asset_path})\nfile-path:: {asset_path}");
+    let roots = highlights.iter().map(highlight_block).collect();
+    Document { pre_block: Some(pre), roots }
+}
+
+fn highlight_block(h: &Highlight) -> DocBlock {
+    let mut lines = Vec::new();
+    if let Some(t) = &h.text {
+        lines.push(t.clone());
+    }
+    lines.push(format!("hl-page:: {}", h.page));
+    lines.push(format!("hl-color:: {}", h.color));
+    if h.image.is_some() {
+        lines.push("hl-type:: area".to_string());
+    }
+    lines.push("ls-type:: annotation".to_string());
+    lines.push(format!("id:: {}", h.id));
+    DocBlock { raw: lines.join("\n"), children: Vec::new() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample() -> Highlight {
+        Highlight {
+            id: "5e8f9c7b-1234-5678-abcd-ef1234567890".into(),
+            page: 42,
+            position: Position {
+                page: 42,
+                bounding: Rect { top: 100.0, left: 50.0, width: 400.0, height: 200.0 },
+                rects: vec![Rect { top: 100.0, left: 50.0, width: 400.0, height: 20.0 }],
+            },
+            color: "yellow".into(),
+            text: Some("some highlighted text".into()),
+            image: None,
+        }
+    }
+
+    #[test]
+    fn highlights_edn_roundtrip() {
+        let hs = vec![sample()];
+        let edn_str = write_highlights(&hs);
+        let parsed = parse_highlights(&edn_str);
+        assert_eq!(parsed, hs);
+    }
+
+    #[test]
+    fn parses_og_shaped_edn() {
+        let src = r#"{:highlights [{:id "abc" :page 3
+            :position {:page 3 :bounding {:top 10 :left 20 :width 30 :height 40}
+                       :rects [{:top 10 :left 20 :width 30 :height 12}]}
+            :content {:text "hello"} :properties {:color "green"}}] :extra {}}"#;
+        let hs = parse_highlights(src);
+        assert_eq!(hs.len(), 1);
+        assert_eq!(hs[0].id, "abc");
+        assert_eq!(hs[0].color, "green");
+        assert_eq!(hs[0].text.as_deref(), Some("hello"));
+        assert_eq!(hs[0].position.rects.len(), 1);
+    }
+
+    #[test]
+    fn hls_page_has_annotation_blocks() {
+        let doc = hls_page_document("my-book.pdf", "My Book", &[sample()]);
+        let md = crate::doc::serialize(&doc);
+        assert!(md.contains("file-path:: ../assets/my-book.pdf"));
+        assert!(md.contains("ls-type:: annotation"));
+        assert!(md.contains("hl-page:: 42"));
+        assert!(md.contains("hl-color:: yellow"));
+        assert!(md.contains("id:: 5e8f9c7b-1234-5678-abcd-ef1234567890"));
+        // The block round-trips through the markdown parser.
+        let back = crate::doc::parse(&md);
+        assert_eq!(back.roots.len(), 1);
+        assert_eq!(back.roots[0].property("hl-page").as_deref(), Some("42"));
+    }
+
+    #[test]
+    fn area_highlight_marks_type() {
+        let mut h = sample();
+        h.text = None;
+        h.image = Some(1659920114630);
+        let md = crate::doc::serialize(&hls_page_document("x.pdf", "x", &[h]));
+        assert!(md.contains("hl-type:: area"));
+    }
+}

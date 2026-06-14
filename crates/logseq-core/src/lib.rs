@@ -5,7 +5,9 @@
 pub mod config;
 pub mod date;
 pub mod doc;
+pub mod edn;
 pub mod model;
+pub mod pdf;
 pub mod query;
 pub mod refs;
 

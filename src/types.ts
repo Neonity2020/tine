@@ -35,3 +35,19 @@ export interface GraphMeta {
   pages_dir: string;
   shortcuts: Record<string, string>;
 }
+
+export interface Rect {
+  top: number;
+  left: number;
+  width: number;
+  height: number;
+}
+
+export interface Highlight {
+  id: string;
+  page: number;
+  position: { page: number; bounding: Rect; rects: Rect[] };
+  color: string;
+  text: string | null;
+  image: number | null;
+}

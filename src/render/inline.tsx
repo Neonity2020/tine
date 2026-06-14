@@ -5,6 +5,7 @@
 import { For, Show, createResource, type JSX } from "solid-js";
 import katex from "katex";
 import { openPage } from "../router";
+import { openPdf } from "../ui";
 import { parseInline, type Seg } from "./parseInline";
 import { blockView } from "./block";
 import { backend } from "../backend";
@@ -59,12 +60,28 @@ function renderSeg(s: Seg): JSX.Element {
       return <span class="macro">{`{{${s.body}}}`}</span>;
     case "math":
       return <MathView tex={s.tex} display={s.display} />;
-    case "link":
+    case "link": {
+      // PDF assets open in the side viewer instead of navigating away.
+      if (/\.pdf$/i.test(s.url)) {
+        const filename = s.url.split("/").pop() ?? s.url;
+        return (
+          <a
+            class="external-link pdf-link"
+            onClick={(e) => {
+              e.stopPropagation();
+              openPdf(filename, s.label || filename);
+            }}
+          >
+            📄 {s.label || filename}
+          </a>
+        );
+      }
       return (
         <a class="external-link" href={s.url} target="_blank" rel="noreferrer">
           {s.label || s.url}
         </a>
       );
+    }
     case "image":
       return <img class="inline-image" src={s.url} alt={s.alt} />;
   }

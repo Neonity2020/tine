@@ -199,6 +199,58 @@ impl Graph {
         crate::query::resolve_block(self, uuid)
     }
 
+    // ---- Assets & PDF highlights ----
+
+    pub fn assets_path(&self) -> PathBuf {
+        self.root.join("assets")
+    }
+
+    /// Read raw bytes of an asset (e.g. a PDF) for the viewer.
+    pub fn read_asset(&self, name: &str) -> io::Result<Vec<u8>> {
+        fs::read(self.assets_path().join(name))
+    }
+
+    /// Copy a file into `assets/`, returning the stored filename.
+    pub fn import_asset(&self, src: &Path) -> io::Result<String> {
+        let name = src
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "bad source filename"))?
+            .to_string();
+        let assets = self.assets_path();
+        fs::create_dir_all(&assets)?;
+        fs::copy(src, assets.join(&name))?;
+        Ok(name)
+    }
+
+    /// Read highlights for a PDF from `assets/<key>.edn`.
+    pub fn read_highlights(&self, pdf_filename: &str) -> Vec<crate::pdf::Highlight> {
+        let key = crate::pdf::asset_key(pdf_filename);
+        match fs::read_to_string(self.assets_path().join(format!("{key}.edn"))) {
+            Ok(s) => crate::pdf::parse_highlights(&s),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Persist highlights: write `assets/<key>.edn` and the `hls__<key>` page.
+    pub fn write_highlights(
+        &self,
+        pdf_filename: &str,
+        label: &str,
+        highlights: &[crate::pdf::Highlight],
+    ) -> io::Result<()> {
+        let key = crate::pdf::asset_key(pdf_filename);
+        fs::create_dir_all(self.assets_path())?;
+        let edn = crate::pdf::write_highlights(highlights);
+        atomic_write(&self.assets_path().join(format!("{key}.edn")), edn.as_bytes())?;
+
+        let page_doc = crate::pdf::hls_page_document(pdf_filename, label, highlights);
+        let page_md = doc::serialize(&page_doc);
+        let page_path = self.pages_path().join(format!("{}.md", crate::pdf::hls_page_name(&key)));
+        fs::create_dir_all(self.pages_path())?;
+        atomic_write(&page_path, page_md.as_bytes())
+    }
+
     pub fn save_page(&self, page: &PageDto) -> io::Result<()> {
         let doc = Document {
             pre_block: page.pre_block.clone(),

@@ -2,7 +2,7 @@
 // browser (Vite dev / Playwright screenshots) we fall back to an in-memory mock
 // seeded from a fixture graph, so the whole UI is exercisable without the shell.
 
-import type { GraphMeta, PageDto, PageEntry, RefGroup } from "./types";
+import type { GraphMeta, Highlight, PageDto, PageEntry, RefGroup } from "./types";
 import { mockBackend } from "./mock";
 
 export interface Backend {
@@ -16,6 +16,9 @@ export interface Backend {
   search(query: string, limit: number): Promise<RefGroup[]>;
   quickSwitch(query: string, limit: number): Promise<PageEntry[]>;
   resolveBlock(uuid: string): Promise<RefGroup | null>;
+  readAsset(name: string): Promise<Uint8Array>;
+  readHighlights(pdf: string): Promise<Highlight[]>;
+  writeHighlights(pdf: string, label: string, highlights: Highlight[]): Promise<void>;
 }
 
 function isTauri(): boolean {
@@ -66,6 +69,16 @@ class TauriBackend implements Backend {
   }
   resolveBlock(uuid: string) {
     return this.call<RefGroup | null>("resolve_block", { uuid });
+  }
+  async readAsset(name: string) {
+    const bytes = await this.call<number[]>("read_asset", { name });
+    return new Uint8Array(bytes);
+  }
+  readHighlights(pdf: string) {
+    return this.call<Highlight[]>("read_highlights", { pdf });
+  }
+  writeHighlights(pdf: string, label: string, highlights: Highlight[]) {
+    return this.call<void>("write_highlights", { pdf, label, highlights });
   }
 }
 

@@ -3,7 +3,8 @@
 // backend's shape so the UI behaves identically.
 
 import type { Backend } from "./backend";
-import type { BlockDto, GraphMeta, PageDto, PageEntry, RefGroup } from "./types";
+import type { BlockDto, GraphMeta, Highlight, PageDto, PageEntry, RefGroup } from "./types";
+import { SAMPLE_PDF_B64 } from "./sample-pdf";
 
 function pageRefs(raw: string): string[] {
   const out: string[] = [];
@@ -84,9 +85,19 @@ const NAMED: PageDto[] = [
       ]),
       b("## Architecture"),
       b("Rust core owns parsing; the frontend owns the live editing tree.\nid:: arch-1"),
+      b("A PDF asset: [sample.pdf](../assets/sample.pdf)"),
     ],
   },
 ];
+
+const mockHighlights: Record<string, Highlight[]> = {};
+
+function decodeB64(b64: string): Uint8Array {
+  const bin = atob(b64);
+  const arr = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+  return arr;
+}
 
 export function mockBackend(): Backend {
   const all = [...PAGES, ...NAMED];
@@ -175,6 +186,16 @@ export function mockBackend(): Backend {
         if (found) return { page: p.name, kind: p.kind, blocks: [found] };
       }
       return null;
+    },
+    async readAsset(name: string): Promise<Uint8Array> {
+      if (name === "sample.pdf") return decodeB64(SAMPLE_PDF_B64);
+      return new Uint8Array();
+    },
+    async readHighlights(pdf: string): Promise<Highlight[]> {
+      return mockHighlights[pdf] ?? [];
+    },
+    async writeHighlights(pdf: string, _label: string, highlights: Highlight[]): Promise<void> {
+      mockHighlights[pdf] = highlights;
     },
   };
 }
