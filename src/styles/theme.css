@@ -1,0 +1,80 @@
+/* Theme tokens ported from Logseq's classic light/dark. */
+
+:root {
+  --ls-font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+  --ls-font-mono: "MonoLisa", "Fira Code", "JetBrains Mono", Menlo, Monaco, Consolas,
+    "Courier New", monospace;
+
+  --ls-main-content-max-width: 810px;
+  --ls-left-sidebar-width: 246px;
+  --ls-headbar-height: 48px;
+  --ls-page-title-size: 28px;
+  --ls-block-bullet-size: 6px;
+  --ls-block-indent: 29px;
+  --ls-border-radius-low: 4px;
+}
+
+html[data-theme="light"] {
+  --bg-primary: #ffffff;
+  --bg-secondary: #f7f7f7;
+  --bg-tertiary: #eaeaea;
+  --bg-quaternary: #e2e2e2;
+
+  --text-primary: #433f38;
+  --text-secondary: #5c5c5c;
+  --text-title: #0f1419;
+  --text-muted: #9b9b9b;
+
+  --link-color: #106ba3;
+  --link-hover: #1a537c;
+  --tag-color: #768aa5;
+
+  --border-color: #e2e2e2;
+  --guide-color: rgba(46, 27, 5, 0.12);
+  --guide-hover: rgba(46, 27, 5, 0.28);
+
+  --bullet-color: #adadad;
+  --bullet-ring: rgba(0, 0, 0, 0.08);
+
+  --selection-bg: #c0e6fd;
+  --block-highlight: #eef6fc;
+
+  --code-bg: #f1f1f1;
+  --mark-bg: #fef3ac;
+  --mark-text: #262626;
+  --marker-color: #b8b8b8;
+  --done-color: #9b9b9b;
+}
+
+html[data-theme="dark"] {
+  --bg-primary: #1a1b1e;
+  --bg-secondary: #25262b;
+  --bg-tertiary: #2f3035;
+  --bg-quaternary: #3a3b40;
+
+  --text-primary: #c6c8cc;
+  --text-secondary: #a0a2a8;
+  --text-title: #ecedf0;
+  --text-muted: #7a7c82;
+
+  --link-color: #6ca6e6;
+  --link-hover: #92c0f2;
+  --tag-color: #8aa0bd;
+
+  --border-color: #34363c;
+  --guide-color: rgba(255, 255, 255, 0.10);
+  --guide-hover: rgba(255, 255, 255, 0.26);
+
+  --bullet-color: #6f7177;
+  --bullet-ring: rgba(255, 255, 255, 0.10);
+
+  --selection-bg: #2b4f74;
+  --block-highlight: #24303d;
+
+  --code-bg: #2a2b30;
+  --mark-bg: #5b5320;
+  --mark-text: #ecedf0;
+  --marker-color: #6f7177;
+  --done-color: #7a7c82;
+}
