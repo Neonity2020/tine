@@ -330,7 +330,7 @@ function Editor(props: { id: string }): JSX.Element {
         setAcIndex((acIndex() - 1 + n) % n);
         return;
       }
-      if (e.key === "Enter" || e.key === "Tab") {
+      if (e.key === "Enter" || e.code === "Tab") {
         e.preventDefault();
         selectAc(acItems()[acIndex()]);
         return;
@@ -357,11 +357,11 @@ function Editor(props: { id: string }): JSX.Element {
       e.preventDefault();
       setRaw(props.id, raw); // flush current text
       splitBlock(props.id, start);
-    } else if (e.key === "Tab" && !e.shiftKey) {
+    } else if (e.code === "Tab" && !e.shiftKey) {
       e.preventDefault();
       setRaw(props.id, raw);
       indentBlock(props.id, start);
-    } else if (e.key === "Tab" && e.shiftKey) {
+    } else if (e.code === "Tab" && e.shiftKey) {
       e.preventDefault();
       setRaw(props.id, raw);
       outdentBlock(props.id, start);
@@ -398,30 +398,44 @@ function Editor(props: { id: string }): JSX.Element {
   };
 
   // Paste an image from the clipboard: save it to assets/ and insert a link.
+  // (DataTransferItemList isn't reliably iterable in WebKit, so use indexed
+  // access and prefer clipboardData.files.)
   const onPaste = async (e: ClipboardEvent) => {
-    const items = e.clipboardData?.items;
-    if (!items) return;
-    for (const it of items) {
-      if (it.kind === "file" && it.type.startsWith("image/")) {
-        e.preventDefault();
-        const file = it.getAsFile();
-        if (!file) return;
-        const bytes = new Uint8Array(await file.arrayBuffer());
-        const ext = it.type.split("/")[1]?.split("+")[0] || "png";
-        const saved = await backend().saveAsset(`image_${Date.now()}.${ext}`, bytes);
-        const md = `![](../assets/${saved})`;
-        const start = ref.selectionStart;
-        const newRaw = ref.value.slice(0, start) + md + ref.value.slice(ref.selectionEnd);
-        setRaw(props.id, newRaw);
-        const pos = start + md.length;
-        queueMicrotask(() => {
-          ref.value = newRaw;
-          ref.setSelectionRange(pos, pos);
-          autosize();
-        });
-        return;
+    const cd = e.clipboardData;
+    if (!cd) return;
+    let imgFile: File | null = null;
+    for (let i = 0; i < (cd.files?.length ?? 0); i++) {
+      const f = cd.files[i];
+      if (f.type.startsWith("image/")) {
+        imgFile = f;
+        break;
       }
     }
+    if (!imgFile) {
+      for (let i = 0; i < (cd.items?.length ?? 0); i++) {
+        const it = cd.items[i];
+        if (it.kind === "file" && it.type.startsWith("image/")) {
+          imgFile = it.getAsFile();
+          break;
+        }
+      }
+    }
+    if (!imgFile) return;
+
+    e.preventDefault();
+    const bytes = new Uint8Array(await imgFile.arrayBuffer());
+    const ext = imgFile.type.split("/")[1]?.split("+")[0] || "png";
+    const saved = await backend().saveAsset(`image_${Date.now()}.${ext}`, bytes);
+    const md = `![](../assets/${saved})`;
+    const start = ref.selectionStart;
+    const newRaw = ref.value.slice(0, start) + md + ref.value.slice(ref.selectionEnd);
+    setRaw(props.id, newRaw);
+    const pos = start + md.length;
+    queueMicrotask(() => {
+      ref.value = newRaw;
+      ref.setSelectionRange(pos, pos);
+      autosize();
+    });
   };
 
   return (

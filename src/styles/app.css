@@ -412,6 +412,7 @@ body {
   word-break: break-word;
   padding: 2px 0;
   line-height: 1.6;
+  min-height: 1.6em; /* empty blocks stay clickable */
 }
 
 .block-content.done {

@@ -100,7 +100,7 @@ export function installKeybindings(overrides: Record<string, string> = {}): () =
       // Cancel GTK/browser focus traversal on Tab/Shift+Tab in the capture
       // phase (WebKitGTK grabs it before the textarea can), but still let the
       // event reach the editor so it can indent/outdent.
-      if (chord.key === "tab") e.preventDefault();
+      if (e.code === "Tab" || chord.key === "tab") e.preventDefault();
       resetSeq();
       return;
     }
