@@ -9,6 +9,7 @@
 import { createStore, produce, unwrap } from "solid-js/store";
 import { createSignal } from "solid-js";
 import type { BlockDto, PageDto, PageKind } from "./types";
+import type { OutlineNode } from "./editor/outline";
 import { backend } from "./backend";
 
 export interface Node {
@@ -363,6 +364,103 @@ export function mergeWithPrev(id: string): boolean {
   startEditing(prev, joinOffset);
   markDirty(pageName);
   return true;
+}
+
+/** Insert a parsed outline (from a paste) as siblings right after `afterId`.
+ *  Returns the last top-level inserted block id (to focus). */
+export function insertOutlineAfter(afterId: string, nodes: OutlineNode[]): string {
+  if (!nodes.length) return afterId;
+  pushUndo("paste");
+  const parent = doc.byId[afterId].parent;
+  const pageName = doc.byId[afterId].page;
+  let lastId = afterId;
+  setDoc(
+    produce((s) => {
+      const create = (n: OutlineNode, par: string | null): string => {
+        const id = freshId();
+        const childIds = n.children.map((c) => create(c, id));
+        s.byId[id] = { id, raw: n.raw, collapsed: false, parent: par, page: pageName, children: childIds };
+        return id;
+      };
+      const created = nodes.map((n) => create(n, parent));
+      const sibs =
+        parent === null
+          ? s.pages[s.pages.findIndex((p) => p.name === pageName)].roots
+          : s.byId[parent].children;
+      sibs.splice(sibs.indexOf(afterId) + 1, 0, ...created);
+      lastId = created[created.length - 1];
+    })
+  );
+  markDirty(pageName);
+  return lastId;
+}
+
+/** Remove a block and its subtree. */
+export function deleteBlock(id: string) {
+  const node = doc.byId[id];
+  if (!node) return;
+  pushUndo("delete");
+  const pageName = node.page;
+  setDoc(
+    produce((s) => {
+      const arr =
+        node.parent === null
+          ? s.pages[s.pages.findIndex((p) => p.name === pageName)].roots
+          : s.byId[node.parent!].children;
+      arr.splice(arr.indexOf(id), 1);
+      const rm = (bid: string) => {
+        for (const c of s.byId[bid].children) rm(c);
+        delete s.byId[bid];
+      };
+      rm(id);
+    })
+  );
+  if (editingId() === id) setEditingId(null);
+  markDirty(pageName);
+}
+
+/** Move a block to be a child of `newParent` (or root of its page) at `index`.
+ *  Used by drag-and-drop. */
+export function moveBlock(id: string, newParent: string | null, index: number) {
+  const node = doc.byId[id];
+  if (!node) return;
+  // Don't drop a block into its own descendant.
+  let p = newParent;
+  while (p !== null) {
+    if (p === id) return;
+    p = doc.byId[p].parent;
+  }
+  pushUndo("move");
+  const oldPage = node.page;
+  const newPage = newParent ? doc.byId[newParent].page : oldPage;
+  setDoc(
+    produce((s) => {
+      const oldArr =
+        node.parent === null
+          ? s.pages[s.pages.findIndex((x) => x.name === oldPage)].roots
+          : s.byId[node.parent!].children;
+      const from = oldArr.indexOf(id);
+      oldArr.splice(from, 1);
+      s.byId[id].parent = newParent;
+      const newArr =
+        newParent === null
+          ? s.pages[s.pages.findIndex((x) => x.name === newPage)].roots
+          : s.byId[newParent].children;
+      let idx = index;
+      if (oldArr === newArr && from < idx) idx -= 1;
+      newArr.splice(Math.max(0, Math.min(idx, newArr.length)), 0, id);
+      // Reassign the moved subtree to the target page.
+      if (newPage !== oldPage) {
+        const reassign = (bid: string) => {
+          s.byId[bid].page = newPage;
+          s.byId[bid].children.forEach(reassign);
+        };
+        reassign(id);
+      }
+    })
+  );
+  markDirty(oldPage);
+  if (newPage !== oldPage) markDirty(newPage);
 }
 
 export function toggleCollapse(id: string) {

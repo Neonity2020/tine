@@ -22,7 +22,11 @@ import {
   takeCaretFor,
   prevVisible,
   nextVisible,
+  insertOutlineAfter,
+  deleteBlock,
+  moveBlock,
 } from "../store";
+import { parseOutline } from "../editor/outline";
 import { blockView } from "../render/block";
 import { InlineText } from "../render/inline";
 import { QueryMacro, EmbedMacro } from "./Macro";
@@ -49,6 +53,19 @@ function pdfFileForPage(pageName: string): string | null {
   return m ? m[1].split("/").pop() ?? null : null;
 }
 
+// Drag-and-drop reorder state (module-level, shared across block instances).
+let draggedBlockId: string | null = null;
+const [dropTarget, setDropTarget] = createSignal<string | null>(null);
+function siblingIndex(id: string): number {
+  const n = doc.byId[id];
+  if (!n) return -1;
+  const sibs =
+    n.parent === null
+      ? doc.pages.find((p) => p.name === n.page)?.roots ?? []
+      : doc.byId[n.parent].children;
+  return sibs.indexOf(id);
+}
+
 export function Block(props: { id: string }): JSX.Element {
   const node = () => doc.byId[props.id];
   const editing = () => editingId() === props.id;
@@ -57,7 +74,27 @@ export function Block(props: { id: string }): JSX.Element {
 
   return (
     <div class="ls-block" classList={{ collapsed: collapsed() }} data-block-id={props.id}>
-      <div class="block-main">
+      <div
+        class="block-main"
+        classList={{ "drop-target": dropTarget() === props.id }}
+        onDragOver={(e) => {
+          if (draggedBlockId && draggedBlockId !== props.id) {
+            e.preventDefault();
+            setDropTarget(props.id);
+          }
+        }}
+        onDragLeave={() => {
+          if (dropTarget() === props.id) setDropTarget(null);
+        }}
+        onDrop={(e) => {
+          e.preventDefault();
+          if (draggedBlockId && draggedBlockId !== props.id) {
+            moveBlock(draggedBlockId, doc.byId[props.id].parent, siblingIndex(props.id) + 1);
+          }
+          draggedBlockId = null;
+          setDropTarget(null);
+        }}
+      >
         <div class="block-controls">
           <span
             class="collapse-toggle"
@@ -73,7 +110,16 @@ export function Block(props: { id: string }): JSX.Element {
           <span
             class="bullet-container"
             classList={{ "bullet-closed": collapsed() && hasChildren() }}
-            title="Zoom into block"
+            title="Click to zoom; drag to move"
+            draggable={true}
+            onDragStart={(e) => {
+              draggedBlockId = props.id;
+              if (e.dataTransfer) e.dataTransfer.effectAllowed = "move";
+            }}
+            onDragEnd={() => {
+              draggedBlockId = null;
+              setDropTarget(null);
+            }}
             onClick={(e) => {
               e.stopPropagation();
               zoomInto(props.id);
@@ -406,7 +452,22 @@ function Editor(props: { id: string }): JSX.Element {
   // not expose image data, so we read the OS clipboard directly (Tauri plugin)
   // and insert an asset link. Text paste proceeds normally (no preventDefault);
   // for an image-only clipboard there is no text to paste.
-  const onPaste = () => {
+  const onPaste = (e: ClipboardEvent) => {
+    const text = e.clipboardData?.getData("text/plain") ?? "";
+    // Multiline text pastes as a block outline (Logseq behavior).
+    if (text.includes("\n")) {
+      e.preventDefault();
+      const nodes = parseOutline(text);
+      if (!nodes.length) return;
+      setRaw(props.id, ref.value);
+      const wasEmpty =
+        doc.byId[props.id].raw.trim() === "" && doc.byId[props.id].children.length === 0;
+      const lastId = insertOutlineAfter(props.id, nodes);
+      if (wasEmpty) deleteBlock(props.id);
+      startEditing(lastId, doc.byId[lastId].raw.length);
+      return;
+    }
+    // Single-line/no text: maybe an image on the OS clipboard.
     void (async () => {
       const saved = await backend().pasteImage();
       if (!saved) return;

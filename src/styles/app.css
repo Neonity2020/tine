@@ -340,6 +340,10 @@ body {
   padding: 1px 0;
 }
 
+.block-main.drop-target {
+  box-shadow: inset 0 -2px 0 var(--link-color);
+}
+
 .block-controls {
   display: flex;
   align-items: center;
