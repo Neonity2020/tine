@@ -25,18 +25,33 @@ export function isPropertyLine(line: string): boolean {
 export interface BlockView {
   marker: string | null;
   done: boolean;
+  priority: "A" | "B" | "C" | null;
   headingLevel: number | null;
-  /** Body lines with marker/heading prefix stripped from the first line. */
+  /** Body lines with marker/priority/heading prefix and SCHEDULED/DEADLINE
+   *  lines stripped. */
   lines: string[];
+  scheduled: string | null;
+  deadline: string | null;
   properties: [string, string][];
 }
+
+const SCHEDULED_RE = /^SCHEDULED:\s*<([^>]+)>/;
+const DEADLINE_RE = /^DEADLINE:\s*<([^>]+)>/;
 
 export function blockView(raw: string): BlockView {
   const allLines = raw.split("\n");
   const properties: [string, string][] = [];
   const lines: string[] = [];
+  let scheduled: string | null = null;
+  let deadline: string | null = null;
   for (const line of allLines) {
-    if (isPropertyLine(line)) {
+    const sm = SCHEDULED_RE.exec(line.trim());
+    const dm = DEADLINE_RE.exec(line.trim());
+    if (sm) {
+      scheduled = sm[1];
+    } else if (dm) {
+      deadline = dm[1];
+    } else if (isPropertyLine(line)) {
       const idx = line.indexOf("::");
       properties.push([line.slice(0, idx).trim(), line.slice(idx + 2).trim()]);
     } else {
@@ -55,6 +70,13 @@ export function blockView(raw: string): BlockView {
     }
   }
 
+  let priority: "A" | "B" | "C" | null = null;
+  const pm = /^\[#([ABC])\]\s?/.exec(first);
+  if (pm) {
+    priority = pm[1] as "A" | "B" | "C";
+    first = first.slice(pm[0].length);
+  }
+
   let headingLevel: number | null = null;
   const hm = /^(#{1,6}) /.exec(first);
   if (hm) {
@@ -66,8 +88,11 @@ export function blockView(raw: string): BlockView {
   return {
     marker,
     done: marker === "DONE" || marker === "CANCELED" || marker === "CANCELLED",
+    priority,
     headingLevel,
     lines,
+    scheduled,
+    deadline,
     properties,
   };
 }

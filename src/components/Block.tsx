@@ -29,6 +29,7 @@ import {
 import { parseOutline } from "../editor/outline";
 import { blockView } from "../render/block";
 import { InlineText } from "../render/inline";
+import { BodyContent } from "../render/body";
 import { QueryMacro, EmbedMacro } from "./Macro";
 import { openPdf, workflow, zoomInto } from "../ui";
 import { HL_COLOR_BG, HL_COLOR_SOLID } from "../pdf";
@@ -186,21 +187,7 @@ function Rendered(props: { id: string }): JSX.Element {
   const displayProps = () => view().properties.filter(([k]) => !INTERNAL_PROPS.has(k));
 
   const body = (
-    <Show
-      when={annotation()}
-      fallback={
-        <For each={view().lines}>
-          {(line, i) => (
-            <>
-              <Show when={i() > 0}>
-                <br />
-              </Show>
-              <InlineText text={line} />
-            </>
-          )}
-        </For>
-      }
-    >
+    <Show when={annotation()} fallback={<BodyContent lines={view().lines} />}>
       <span class="pdf-annotation-line">
         <span class="hl-prefix" onClick={openHighlightPdf} title="Open in PDF (P{annotation()!.hlPage})">
           <span
@@ -251,11 +238,24 @@ function Rendered(props: { id: string }): JSX.Element {
           {view().marker}
         </span>{" "}
       </Show>
+      <Show when={view().priority}>
+        <span class={`block-priority priority-${view().priority}`}>[#{view().priority}]</span>{" "}
+      </Show>
       <Show when={view().headingLevel} fallback={body}>
         {(() => {
           const H = `h${view().headingLevel}`;
           return <span class={`heading-text ${H}`}>{body}</span>;
         })()}
+      </Show>
+      <Show when={view().scheduled}>
+        <span class="date-chip scheduled" title="Scheduled">
+          🗓 {view().scheduled}
+        </span>
+      </Show>
+      <Show when={view().deadline}>
+        <span class="date-chip deadline" title="Deadline">
+          ⏰ {view().deadline}
+        </span>
       </Show>
       <Show when={displayProps().length > 0}>
         <span class="block-properties">

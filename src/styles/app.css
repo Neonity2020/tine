@@ -667,6 +667,105 @@ mark {
   border-radius: 4px;
 }
 
+/* priorities + date chips */
+.block-priority {
+  font-size: 0.74em;
+  font-weight: 700;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: color-mix(in srgb, currentColor 15%, transparent);
+  vertical-align: 1px;
+}
+.priority-A { color: var(--marker-todo); }
+.priority-B { color: var(--marker-doing); }
+.priority-C { color: var(--marker-now); }
+
+.date-chip {
+  display: inline-block;
+  font-size: 0.82em;
+  padding: 0 7px;
+  margin-left: 6px;
+  border-radius: 10px;
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+.date-chip.deadline {
+  color: var(--marker-todo);
+}
+
+/* code blocks */
+.code-block {
+  background: var(--code-bg);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin: 4px 0;
+  overflow-x: auto;
+  font-family: var(--ls-font-mono);
+  font-size: 0.86em;
+  line-height: 1.5;
+}
+.code-block code {
+  font-family: inherit;
+  background: none;
+  padding: 0;
+  white-space: pre;
+}
+.hljs {
+  color: var(--text-primary);
+  background: transparent;
+}
+.hljs-comment,
+.hljs-quote {
+  color: var(--text-muted);
+  font-style: italic;
+}
+.hljs-keyword,
+.hljs-selector-tag,
+.hljs-built_in,
+.hljs-meta {
+  color: var(--marker-later);
+}
+.hljs-string,
+.hljs-attr,
+.hljs-regexp {
+  color: var(--marker-done);
+}
+.hljs-number,
+.hljs-literal,
+.hljs-symbol {
+  color: var(--marker-doing);
+}
+.hljs-title,
+.hljs-section,
+.hljs-name {
+  color: var(--link-color);
+}
+.hljs-type,
+.hljs-class .hljs-title,
+.hljs-variable,
+.hljs-template-variable {
+  color: var(--marker-now);
+}
+
+/* markdown tables */
+.md-table {
+  border-collapse: collapse;
+  margin: 6px 0;
+  font-size: 0.95em;
+}
+.md-table th,
+.md-table td {
+  border: 1px solid var(--border-color);
+  padding: 4px 10px;
+  text-align: left;
+}
+.md-table th {
+  background: var(--bg-secondary);
+  font-weight: 600;
+}
+
 /* ---------------------------------------------------------- references */
 
 .linked-references {
