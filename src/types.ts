@@ -33,6 +33,7 @@ export interface GraphMeta {
   root: string;
   journals_dir: string;
   pages_dir: string;
+  preferred_workflow: string; // "now" | "todo"
   shortcuts: Record<string, string>;
 }
 

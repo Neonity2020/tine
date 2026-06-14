@@ -26,8 +26,9 @@ import {
 import { blockView } from "../render/block";
 import { InlineText } from "../render/inline";
 import { QueryMacro, EmbedMacro } from "./Macro";
-import { openPdf } from "../ui";
+import { openPdf, workflow } from "../ui";
 import { HL_COLOR_BG, HL_COLOR_SOLID } from "../pdf";
+import { cycleMarker } from "../editor/marker";
 
 // Detect a block whose entire body is a single {{query}} / {{embed}} macro.
 function detectMacro(lines: string[]): { kind: "query" | "embed"; inner: string } | null {
@@ -187,7 +188,7 @@ function Rendered(props: { id: string }): JSX.Element {
           class={`block-marker marker-${view().marker?.toLowerCase()}`}
           onClick={(e) => {
             e.stopPropagation();
-            cycleMarker(props.id);
+            cycleBlockMarker(props.id);
           }}
         >
           {view().marker}
@@ -216,24 +217,10 @@ function Rendered(props: { id: string }): JSX.Element {
   );
 }
 
-function cycleMarker(id: string) {
-  // TODO -> DOING -> DONE -> (none), and NOW/LATER similarly. Minimal cycle.
-  const raw = doc.byId[id].raw;
-  const order: Record<string, string> = {
-    TODO: "DOING",
-    DOING: "DONE",
-    DONE: "",
-    NOW: "LATER",
-    LATER: "DONE",
-  };
-  for (const m of Object.keys(order)) {
-    if (raw === m || raw.startsWith(m + " ")) {
-      const rest = raw.slice(m.length).replace(/^ /, "");
-      const next = order[m];
-      setRaw(id, next ? `${next} ${rest}` : rest);
-      return;
-    }
-  }
+// Cycle the task marker on a block (OG order), used by the marker chip click.
+function cycleBlockMarker(id: string) {
+  const { raw } = cycleMarker(doc.byId[id].raw, workflow());
+  setRaw(id, raw);
 }
 
 interface AcItem {
@@ -349,7 +336,18 @@ function Editor(props: { id: string }): JSX.Element {
       }
     }
 
-    if (e.key === "Enter" && !e.shiftKey) {
+    if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+      // mod+enter cycles the task marker (TODO -> DOING -> DONE -> none).
+      e.preventDefault();
+      const { raw: newRaw, delta } = cycleMarker(raw, workflow());
+      setRaw(props.id, newRaw);
+      const pos = Math.max(0, start + delta);
+      queueMicrotask(() => {
+        ref.value = newRaw;
+        ref.setSelectionRange(pos, pos);
+        autosize();
+      });
+    } else if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       setRaw(props.id, raw); // flush current text
       splitBlock(props.id, start);

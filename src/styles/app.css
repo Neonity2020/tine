@@ -36,11 +36,31 @@ body {
 }
 
 .left-sidebar {
+  position: relative;
   width: var(--ls-left-sidebar-width);
   flex: 0 0 var(--ls-left-sidebar-width);
   background: var(--bg-secondary);
   border-right: 1px solid var(--border-color);
   overflow-y: auto;
+}
+
+.sidebar-resizer {
+  position: absolute;
+  top: 0;
+  right: -3px;
+  width: 6px;
+  height: 100%;
+  cursor: col-resize;
+  z-index: 20;
+}
+
+.sidebar-resizer:hover {
+  background: color-mix(in srgb, var(--link-color) 40%, transparent);
+}
+
+.inline-image-missing {
+  color: var(--text-muted);
+  font-size: 0.9em;
 }
 
 .main-container {
@@ -478,18 +498,26 @@ body {
   display: block;
 }
 
-/* markers */
+/* markers — colored by state */
 .block-marker {
-  font-size: 0.78em;
-  font-weight: 650;
-  letter-spacing: 0.02em;
-  padding: 1px 5px;
-  border-radius: 3px;
-  background: var(--bg-tertiary);
+  font-size: 0.74em;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: color-mix(in srgb, currentColor 15%, transparent);
   color: var(--marker-color);
   cursor: pointer;
   vertical-align: 1px;
 }
+
+.marker-todo { color: var(--marker-todo); }
+.marker-doing { color: var(--marker-doing); }
+.marker-now { color: var(--marker-now); }
+.marker-later { color: var(--marker-later); }
+.marker-done { color: var(--marker-done); }
+.marker-waiting,
+.marker-in-progress { color: var(--marker-waiting); }
 
 .marker-done,
 .marker-canceled,

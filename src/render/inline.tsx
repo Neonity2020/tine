@@ -2,7 +2,7 @@
 // [[links]] and #tags), not an innerHTML string. Used to render a block when it
 // is not being edited.
 
-import { For, Show, createResource, type JSX } from "solid-js";
+import { For, Show, createResource, onCleanup, type JSX } from "solid-js";
 import katex from "katex";
 import { openPage, openPageInNewTab } from "../router";
 import { openPdf } from "../ui";
@@ -97,7 +97,7 @@ function renderSeg(s: Seg): JSX.Element {
       );
     }
     case "image":
-      return <img class="inline-image" src={s.url} alt={s.alt} />;
+      return <AssetImage url={s.url} alt={s.alt} />;
   }
 }
 
@@ -114,6 +114,66 @@ function MathView(props: { tex: string; display: boolean }): JSX.Element {
     }
   };
   return <span class="math" classList={{ "math-display": props.display }} innerHTML={html()} />;
+}
+
+// Resolve the path of a graph asset relative to the `assets/` dir.
+function assetRelPath(url: string): string | null {
+  const i = url.indexOf("assets/");
+  return i === -1 ? null : url.slice(i + "assets/".length);
+}
+
+function mimeFromExt(path: string): string {
+  const ext = path.split(".").pop()?.toLowerCase();
+  switch (ext) {
+    case "png":
+      return "image/png";
+    case "jpg":
+    case "jpeg":
+      return "image/jpeg";
+    case "gif":
+      return "image/gif";
+    case "svg":
+      return "image/svg+xml";
+    case "webp":
+      return "image/webp";
+    default:
+      return "application/octet-stream";
+  }
+}
+
+// Image embed: external URLs load directly; graph assets (`../assets/x.png`)
+// are read from disk via the backend and shown as a blob URL.
+function AssetImage(props: { url: string; alt: string }): JSX.Element {
+  if (/^(https?:|data:|blob:)/.test(props.url)) {
+    return <img class="inline-image" src={props.url} alt={props.alt} />;
+  }
+  let objectUrl = "";
+  const [src] = createResource(
+    () => props.url,
+    async (url) => {
+      const rel = assetRelPath(url);
+      if (!rel) return "";
+      try {
+        const bytes = await backend().readAsset(rel);
+        if (!bytes.length) return "";
+        objectUrl = URL.createObjectURL(
+          new Blob([bytes as unknown as BlobPart], { type: mimeFromExt(rel) })
+        );
+        return objectUrl;
+      } catch {
+        return "";
+      }
+    }
+  );
+  onCleanup(() => objectUrl && URL.revokeObjectURL(objectUrl));
+  return (
+    <Show
+      when={src()}
+      fallback={<span class="inline-image-missing">🖼 {props.alt || assetRelPath(props.url)}</span>}
+    >
+      <img class="inline-image" src={src()!} alt={props.alt} />
+    </Show>
+  );
 }
 
 /** Render a block's body text (already stripped of marker/heading prefix). */

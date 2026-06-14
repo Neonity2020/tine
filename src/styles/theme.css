@@ -13,6 +13,14 @@
   --ls-block-bullet-size: 6px;
   --ls-block-indent: 29px;
   --ls-border-radius-low: 4px;
+
+  /* Task-marker accent colors (shared across themes). */
+  --marker-todo: #e05252;
+  --marker-doing: #e0901f;
+  --marker-now: #3b82f6;
+  --marker-later: #9b6fd4;
+  --marker-done: #5fa37a;
+  --marker-waiting: #c08bd0;
 }
 
 html[data-theme="light"] {
@@ -26,9 +34,9 @@ html[data-theme="light"] {
   --text-title: #0f1419;
   --text-muted: #9b9b9b;
 
-  --link-color: #106ba3;
-  --link-hover: #1a537c;
-  --tag-color: #768aa5;
+  --link-color: #1f6fd0;
+  --link-hover: #18548f;
+  --tag-color: #8a45c4;
 
   --border-color: #e2e2e2;
   --guide-color: rgba(46, 27, 5, 0.12);
@@ -58,9 +66,9 @@ html[data-theme="dark"] {
   --text-title: #ecedf0;
   --text-muted: #7a7c82;
 
-  --link-color: #6ca6e6;
-  --link-hover: #92c0f2;
-  --tag-color: #8aa0bd;
+  --link-color: #6cb0ff;
+  --link-hover: #9ccbff;
+  --tag-color: #cf92ec;
 
   --border-color: #34363c;
   --guide-color: rgba(255, 255, 255, 0.10);

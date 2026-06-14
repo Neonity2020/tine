@@ -6,12 +6,24 @@ import { PdfViewer } from "./components/PdfViewer";
 import { TabBar } from "./components/TabBar";
 import { backend } from "./backend";
 import { installKeybindings } from "./keybindings";
-import { theme, toggleTheme, sidebarOpen, toggleSidebar, openSwitcher, pdfTarget } from "./ui";
+import {
+  theme,
+  toggleTheme,
+  sidebarOpen,
+  toggleSidebar,
+  openSwitcher,
+  pdfTarget,
+  setWorkflow,
+  sidebarWidth,
+  setSidebarWidth,
+  persistSidebarWidth,
+} from "./ui";
 
 export function App(): JSX.Element {
   onMount(async () => {
     const graphPath = (window as any).__GRAPH_PATH__ ?? "";
     const meta = await backend().loadGraph(graphPath);
+    setWorkflow(meta?.preferred_workflow === "todo" ? "todo" : "now");
     const dispose = installKeybindings(meta?.shortcuts ?? {});
     onCleanup(dispose);
   });
@@ -19,8 +31,23 @@ export function App(): JSX.Element {
   return (
     <div class="app-container" classList={{ "sidebar-collapsed": !sidebarOpen() }}>
       <Show when={sidebarOpen()}>
-        <div class="left-sidebar">
+        <div class="left-sidebar" style={{ flex: `0 0 ${sidebarWidth()}px`, width: `${sidebarWidth()}px` }}>
           <Sidebar />
+          <div
+            class="sidebar-resizer"
+            onMouseDown={(e) => {
+              e.preventDefault();
+              const onMove = (ev: MouseEvent) =>
+                setSidebarWidth(Math.min(500, Math.max(180, ev.clientX)));
+              const onUp = () => {
+                window.removeEventListener("mousemove", onMove);
+                window.removeEventListener("mouseup", onUp);
+                persistSidebarWidth();
+              };
+              window.addEventListener("mousemove", onMove);
+              window.addEventListener("mouseup", onUp);
+            }}
+          />
         </div>
       </Show>
       <div class="main-container">

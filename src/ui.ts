@@ -2,6 +2,9 @@
 import { createSignal } from "solid-js";
 
 export const [theme, setTheme] = createSignal<"light" | "dark">("light");
+
+// Task workflow from config.edn (:preferred-workflow): drives mod+enter cycling.
+export const [workflow, setWorkflow] = createSignal<"now" | "todo">("now");
 export function toggleTheme() {
   const next = theme() === "light" ? "dark" : "light";
   setTheme(next);
@@ -11,6 +14,25 @@ export function toggleTheme() {
 export const [sidebarOpen, setSidebarOpen] = createSignal(true);
 export function toggleSidebar() {
   setSidebarOpen(!sidebarOpen());
+}
+
+const SIDEBAR_W_KEY = "logseq-claude.sidebarWidth";
+function loadSidebarWidth(): number {
+  try {
+    const v = Number(localStorage.getItem(SIDEBAR_W_KEY));
+    if (v >= 180 && v <= 600) return v;
+  } catch {
+    // ignore
+  }
+  return 246;
+}
+export const [sidebarWidth, setSidebarWidth] = createSignal(loadSidebarWidth());
+export function persistSidebarWidth() {
+  try {
+    localStorage.setItem(SIDEBAR_W_KEY, String(sidebarWidth()));
+  } catch {
+    // ignore
+  }
 }
 
 export const [switcherOpen, setSwitcherOpen] = createSignal(false);
