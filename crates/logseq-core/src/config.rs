@@ -146,3 +146,21 @@ fn keyword_value(edn: &str, key: &str) -> Option<String> {
         .unwrap_or(rest.len());
     Some(rest[..end].to_string())
 }
+
+#[cfg(test)]
+mod commented_dirs_test {
+    use super::*;
+    #[test]
+    fn commented_example_dirs_fall_back_to_defaults() {
+        let edn = r#"{
+ ;; :preferred-format ""
+ ;; if not specified, notes are stored in `pages` directory
+ ;; :pages-directory "your-directory"
+ ;; if not specified, journals are stored in `journals` directory
+ ;; :journals-directory "your-directory"
+}"#;
+        let cfg = Config::parse(edn);
+        assert_eq!(cfg.journals_dir, "journals");
+        assert_eq!(cfg.pages_dir, "pages");
+    }
+}
