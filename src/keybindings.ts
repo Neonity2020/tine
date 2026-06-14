@@ -97,6 +97,10 @@ export function installKeybindings(overrides: Record<string, string> = {}): () =
 
     // While typing, only modifier chords are eligible (so "g j" doesn't fire).
     if (editing && !chord.mod) {
+      // Cancel GTK/browser focus traversal on Tab/Shift+Tab in the capture
+      // phase (WebKitGTK grabs it before the textarea can), but still let the
+      // event reach the editor so it can indent/outdent.
+      if (chord.key === "tab") e.preventDefault();
       resetSeq();
       return;
     }

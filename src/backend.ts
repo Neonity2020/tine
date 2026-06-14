@@ -17,6 +17,7 @@ export interface Backend {
   quickSwitch(query: string, limit: number): Promise<PageEntry[]>;
   resolveBlock(uuid: string): Promise<RefGroup | null>;
   readAsset(name: string): Promise<Uint8Array>;
+  saveAsset(name: string, bytes: Uint8Array): Promise<string>;
   readHighlights(pdf: string): Promise<Highlight[]>;
   writeHighlights(pdf: string, label: string, highlights: Highlight[]): Promise<void>;
 }
@@ -73,6 +74,9 @@ class TauriBackend implements Backend {
   async readAsset(name: string) {
     const bytes = await this.call<number[]>("read_asset", { name });
     return new Uint8Array(bytes);
+  }
+  saveAsset(name: string, bytes: Uint8Array) {
+    return this.call<string>("save_asset", { name, bytes: Array.from(bytes) });
   }
   readHighlights(pdf: string) {
     return this.call<Highlight[]>("read_highlights", { pdf });

@@ -32,7 +32,9 @@ export function App(): JSX.Element {
     <div class="app-container" classList={{ "sidebar-collapsed": !sidebarOpen() }}>
       <Show when={sidebarOpen()}>
         <div class="left-sidebar" style={{ flex: `0 0 ${sidebarWidth()}px`, width: `${sidebarWidth()}px` }}>
-          <Sidebar />
+          <div class="left-sidebar-scroll">
+            <Sidebar />
+          </div>
           <div
             class="sidebar-resizer"
             onMouseDown={(e) => {

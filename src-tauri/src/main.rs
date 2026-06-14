@@ -121,6 +121,11 @@ fn import_asset(path: String, state: State<'_, AppState>) -> Result<String, Stri
 }
 
 #[tauri::command]
+fn save_asset(name: String, bytes: Vec<u8>, state: State<'_, AppState>) -> Result<String, String> {
+    with_graph(&state, |g| g.save_asset(&name, &bytes).map_err(|e| e.to_string()))
+}
+
+#[tauri::command]
 fn read_highlights(
     pdf: String,
     state: State<'_, AppState>,
@@ -141,10 +146,13 @@ fn write_highlights(
 }
 
 fn main() {
-    // WebKitGTK's DMABUF renderer aborts on many GPU/compositor combos
-    // (KDE/Wayland, some Mesa/NVIDIA): "Could not create default EGL display:
-    // EGL_BAD_PARAMETER". Force the stable path unless the user overrides it.
-    if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
+    // WebKitGTK's DMABUF renderer aborts on some GPU/compositor combos
+    // ("Could not create default EGL display: EGL_BAD_PARAMETER"). We disable it
+    // by default for a reliable launch, but that uses software compositing
+    // (slower scrolling). Set TINE_GPU=1 to keep GPU/DMABUF rendering.
+    if std::env::var("TINE_GPU").as_deref() != Ok("1")
+        && std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none()
+    {
         std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
     }
 
@@ -215,6 +223,7 @@ fn main() {
             resolve_block,
             read_asset,
             import_asset,
+            save_asset,
             read_highlights,
             write_highlights
         ])

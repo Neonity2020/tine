@@ -92,6 +92,7 @@ const NAMED: PageDto[] = [
 ];
 
 const mockHighlights: Record<string, { label: string; highlights: Highlight[] }> = {};
+const mockAssets: Record<string, Uint8Array> = {};
 
 // Synthesize an hls__ page DTO from stored highlights (mirrors the Rust
 // hls_page_document), so the Notes flow is demoable in the browser.
@@ -219,8 +220,13 @@ export function mockBackend(): Backend {
       return null;
     },
     async readAsset(name: string): Promise<Uint8Array> {
+      if (mockAssets[name]) return mockAssets[name];
       if (name === "sample.pdf") return decodeB64(SAMPLE_PDF_B64);
       return new Uint8Array();
+    },
+    async saveAsset(name: string, bytes: Uint8Array): Promise<string> {
+      mockAssets[name] = bytes;
+      return name;
     },
     async readHighlights(pdf: string): Promise<Highlight[]> {
       return mockHighlights[pdf]?.highlights ?? [];

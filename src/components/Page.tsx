@@ -23,14 +23,18 @@ function emptyPage(name: string, kind: "journal" | "page"): PageDto {
 export function PageView(): JSX.Element {
   const [ready, setReady] = createSignal(false);
   let journalOffset = 0;
+  let loadingMore = false;
+  let feedDone = false;
 
   createEffect(() => {
     const r = route();
     setReady(false);
     void (async () => {
       if (r.kind === "journals") {
+        feedDone = false;
         const js = await backend().journalsDesc(FEED_PAGE, 0);
         journalOffset = js.length;
+        if (js.length < FEED_PAGE) feedDone = true;
         loadFeed(js.length ? js : []);
       } else {
         const dto = await backend().getPage(r.name, r.pageKind);
@@ -41,10 +45,13 @@ export function PageView(): JSX.Element {
   });
 
   const loadMore = async () => {
-    if (route().kind !== "journals") return;
+    if (route().kind !== "journals" || loadingMore || feedDone) return;
+    loadingMore = true;
     const js = await backend().journalsDesc(FEED_PAGE, journalOffset);
     journalOffset += js.length;
     if (js.length) appendFeed(js);
+    else feedDone = true;
+    loadingMore = false;
   };
 
   return (

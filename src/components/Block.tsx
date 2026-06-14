@@ -78,7 +78,13 @@ export function Block(props: { id: string }): JSX.Element {
           </span>
         </div>
 
-        <div class="block-content-wrapper">
+        <div
+          class="block-content-wrapper"
+          onClick={() => {
+            // Click anywhere in the row (not on a link) starts editing.
+            if (!editing()) startEditing(props.id, doc.byId[props.id].raw.length);
+          }}
+        >
           <Show when={editing()} fallback={<Rendered id={props.id} />}>
             <Editor id={props.id} />
           </Show>
@@ -391,6 +397,33 @@ function Editor(props: { id: string }): JSX.Element {
     if (editingId() === props.id) setEditingId(null);
   };
 
+  // Paste an image from the clipboard: save it to assets/ and insert a link.
+  const onPaste = async (e: ClipboardEvent) => {
+    const items = e.clipboardData?.items;
+    if (!items) return;
+    for (const it of items) {
+      if (it.kind === "file" && it.type.startsWith("image/")) {
+        e.preventDefault();
+        const file = it.getAsFile();
+        if (!file) return;
+        const bytes = new Uint8Array(await file.arrayBuffer());
+        const ext = it.type.split("/")[1]?.split("+")[0] || "png";
+        const saved = await backend().saveAsset(`image_${Date.now()}.${ext}`, bytes);
+        const md = `![](../assets/${saved})`;
+        const start = ref.selectionStart;
+        const newRaw = ref.value.slice(0, start) + md + ref.value.slice(ref.selectionEnd);
+        setRaw(props.id, newRaw);
+        const pos = start + md.length;
+        queueMicrotask(() => {
+          ref.value = newRaw;
+          ref.setSelectionRange(pos, pos);
+          autosize();
+        });
+        return;
+      }
+    }
+  };
+
   return (
     <div class="editor-wrap">
       <textarea
@@ -401,6 +434,7 @@ function Editor(props: { id: string }): JSX.Element {
         onInput={onInput}
         onKeyDown={onKeyDown}
         onBlur={onBlur}
+        onPaste={onPaste}
         rows={1}
       />
       <Show when={ac() && acItems().length > 0}>

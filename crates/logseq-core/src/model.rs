@@ -216,6 +216,25 @@ impl Graph {
         fs::read(self.assets_path().join(name))
     }
 
+    /// Write raw bytes (e.g. a pasted image) into `assets/`, returning the
+    /// stored filename (de-duplicated if it already exists).
+    pub fn save_asset(&self, name: &str, bytes: &[u8]) -> io::Result<String> {
+        let assets = self.assets_path();
+        fs::create_dir_all(&assets)?;
+        let (stem, ext) = match name.rsplit_once('.') {
+            Some((s, e)) => (s.to_string(), format!(".{e}")),
+            None => (name.to_string(), String::new()),
+        };
+        let mut final_name = name.to_string();
+        let mut i = 1;
+        while assets.join(&final_name).exists() {
+            final_name = format!("{stem}_{i}{ext}");
+            i += 1;
+        }
+        fs::write(assets.join(&final_name), bytes)?;
+        Ok(final_name)
+    }
+
     /// Copy a file into `assets/`, returning the stored filename.
     pub fn import_asset(&self, src: &Path) -> io::Result<String> {
         let name = src
