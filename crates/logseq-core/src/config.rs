@@ -35,6 +35,19 @@ impl Default for Config {
 
 impl Config {
     pub fn parse(edn: &str) -> Config {
+        // Strip line comments (`;` to end of line) so commented-out example
+        // keys like `;; :journals-directory "foo"` aren't mistaken for real
+        // settings.
+        let edn: String = edn
+            .lines()
+            .map(|l| match l.find(';') {
+                Some(i) => &l[..i],
+                None => l,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let edn = edn.as_str();
+
         let mut cfg = Config::default();
         if let Some(v) = string_value(edn, ":journals-directory") {
             cfg.journals_dir = v;
