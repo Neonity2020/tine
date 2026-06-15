@@ -375,12 +375,21 @@ impl Graph {
             pre_block: page.pre_block.clone(),
             roots: page.blocks.iter().map(dto_to_doc).collect(),
         };
-        let content = doc::serialize(&doc);
         let path = self.path_for(&page.name, page.kind);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+        // Reproduce the existing file's formatting (trailing newline, post-property
+        // blank line) so an unchanged save is byte-identical and edits produce a
+        // minimal diff — critical to avoid Syncthing churn against Logseq.
+        let existing = fs::read_to_string(&path).ok();
+        let opts = doc::SerializeOpts::detect(existing.as_deref());
+        let content = doc::serialize_with(&doc, &opts);
+        // No-op save: identical bytes already on disk (e.g. focus/blur with no
+        // real edit). Skip the write entirely — keep the cache current though.
+        if existing.as_deref() != Some(content.as_str()) {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            atomic_write(&path, content.as_bytes())?;
         }
-        atomic_write(&path, content.as_bytes())?;
         // Keep the search/backlinks cache in sync without a full rebuild.
         let entry = self.find_entry(&page.name, page.kind).unwrap_or(PageEntry {
             name: page.name.clone(),

@@ -128,6 +128,31 @@ fn search_ignores_hidden_property_metadata() {
 }
 
 #[test]
+fn save_preserves_file_format_no_churn() {
+    use tine_core::model::PageKind;
+
+    let root = std::env::temp_dir().join(format!("tine-fmt-test-{}", std::process::id()));
+    std::fs::create_dir_all(root.join("pages")).unwrap();
+    // Logseq style: no trailing newline. Plus a file that does have one.
+    let no_nl = "- alpha\n\t- beta";
+    let with_nl = "- gamma\n";
+    std::fs::write(root.join("pages").join("A.md"), no_nl).unwrap();
+    std::fs::write(root.join("pages").join("B.md"), with_nl).unwrap();
+
+    let g = Graph::open(&root);
+    // Load then save unchanged must be byte-identical (no churn): each file's
+    // trailing-newline convention is preserved.
+    for name in ["A", "B"] {
+        let dto = g.load_named(name, PageKind::Page).unwrap().unwrap();
+        g.save_page(&dto).unwrap();
+    }
+    assert_eq!(std::fs::read_to_string(root.join("pages").join("A.md")).unwrap(), no_nl);
+    assert_eq!(std::fs::read_to_string(root.join("pages").join("B.md")).unwrap(), with_nl);
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
 fn query_open_tasks() {
     let g = demo_graph();
     let groups = g.run_query("(task TODO DOING)");

@@ -54,7 +54,8 @@ fn main() {
             _ => disk_trail_2 += 1,
         }
         let parsed = doc::parse(content);
-        let out = doc::serialize(&parsed);
+        // Measure what the app would actually write: format-preserving save.
+        let out = doc::serialize_with(&parsed, &doc::SerializeOpts::detect(Some(content)));
         let reparsed = doc::parse(&out);
         if reparsed != parsed {
             structural += 1;

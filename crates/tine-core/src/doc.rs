@@ -199,15 +199,61 @@ fn strip_n_ws(line: &str, n: usize) -> &str {
     &line[i..]
 }
 
-/// Serialize a [`Document`] back to Logseq-compatible markdown.
+/// Formatting knobs detected from a file so re-saving preserves its existing
+/// style (avoids gratuitous diffs / Syncthing churn). Logseq, for instance,
+/// writes files with NO trailing newline; imposing one would rewrite every file.
+#[derive(Debug, Clone, Copy)]
+pub struct SerializeOpts {
+    /// Number of trailing `\n` characters to end the file with.
+    pub trailing_newlines: usize,
+    /// Emit a blank line between the page-property pre-block and the first block.
+    pub blank_after_props: bool,
+}
+
+impl Default for SerializeOpts {
+    fn default() -> Self {
+        SerializeOpts { trailing_newlines: 1, blank_after_props: true }
+    }
+}
+
+impl SerializeOpts {
+    /// Infer the formatting of an existing on-disk file so a save reproduces it.
+    /// `None` (new file) falls back to the default.
+    pub fn detect(existing: Option<&str>) -> SerializeOpts {
+        match existing {
+            None => SerializeOpts::default(),
+            Some(s) => SerializeOpts {
+                trailing_newlines: s.bytes().rev().take_while(|b| *b == b'\n').count(),
+                blank_after_props: blank_after_props(s),
+            },
+        }
+    }
+}
+
+/// Does the file put a blank line between its pre-block and the first bullet?
+fn blank_after_props(s: &str) -> bool {
+    let lines: Vec<&str> = s.split('\n').collect();
+    match lines.iter().position(|l| bullet(l).is_some()) {
+        Some(i) if i > 0 => lines[i - 1].trim().is_empty(),
+        _ => true,
+    }
+}
+
+/// Serialize a [`Document`] back to Logseq-compatible markdown (default style).
 pub fn serialize(doc: &Document) -> String {
+    serialize_with(doc, &SerializeOpts::default())
+}
+
+/// Serialize, reproducing a file's detected formatting (see [`SerializeOpts`]).
+pub fn serialize_with(doc: &Document, opts: &SerializeOpts) -> String {
     let mut out: Vec<String> = Vec::new();
     if let Some(pre) = &doc.pre_block {
         for line in pre.split('\n') {
             out.push(line.to_string());
         }
-        // Blank separator before blocks — only when blocks actually follow.
-        if !doc.roots.is_empty() {
+        // Blank separator before blocks — only when blocks follow and the file
+        // used one.
+        if !doc.roots.is_empty() && opts.blank_after_props {
             out.push(String::new());
         }
     }
@@ -215,7 +261,7 @@ pub fn serialize(doc: &Document) -> String {
         emit_block(block, 0, &mut out);
     }
     let mut s = out.join("\n");
-    s.push('\n');
+    s.push_str(&"\n".repeat(opts.trailing_newlines));
     s
 }
 
