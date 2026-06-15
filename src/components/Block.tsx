@@ -31,7 +31,7 @@ import {
   isSelected,
 } from "../store";
 import { parseOutline } from "../editor/outline";
-import { blockView } from "../render/block";
+import { blockView, isPropertyLine } from "../render/block";
 import { InlineText } from "../render/inline";
 import { BodyContent } from "../render/body";
 import { QueryMacro, EmbedMacro } from "./Macro";
@@ -181,11 +181,8 @@ export function Block(props: { id: string }): JSX.Element {
         <div
           class="block-content-wrapper"
           onClick={() => {
-            // Click anywhere in the row (not on a link) starts editing, except
-            // for PDF-highlight blocks (handled by the inner content → PDF).
-            if (!editing() && !isAnnotationBlock(doc.byId[props.id].raw)) {
-              startEditing(props.id, doc.byId[props.id].raw.length);
-            }
+            // Click anywhere in the row (not on a link) starts editing.
+            if (!editing()) startEditing(props.id, doc.byId[props.id].raw.length);
           }}
         >
           <Show when={editing()} fallback={<Rendered id={props.id} />}>
@@ -229,14 +226,11 @@ function Rendered(props: { id: string }): JSX.Element {
     if (a && file) openPdf(file, file, a.hlPage);
   };
 
-  // Annotation blocks jump to the PDF on click (never expose the raw metadata);
-  // ordinary blocks start editing.
+  // Click edits the block. For annotation blocks the editor shows only the
+  // highlight text (metadata stays hidden); the colored prefix still jumps to
+  // the PDF.
   const onClick = (e: MouseEvent) => {
     e.stopPropagation();
-    if (annotation()) {
-      openHighlightPdf(e);
-      return;
-    }
     startEditing(props.id, node().raw.length);
   };
 
@@ -382,9 +376,29 @@ function assetMarkdown(name: string): string {
     : `[${name}](../assets/${name})`;
 }
 
+// Split a block's raw into editable text vs. trailing `key:: value` property
+// lines. For annotation blocks we edit only the text (the highlight) and keep
+// the metadata (hl-page/hl-color/ls-type/id) hidden but preserved.
+function splitProps(raw: string): { text: string; props: string } {
+  const text: string[] = [];
+  const props: string[] = [];
+  for (const l of raw.split("\n")) (isPropertyLine(l) ? props : text).push(l);
+  return { text: text.join("\n"), props: props.join("\n") };
+}
+function joinProps(text: string, props: string): string {
+  return props ? `${text}\n${props}` : text;
+}
+
 function Editor(props: { id: string }): JSX.Element {
   let ref!: HTMLTextAreaElement;
   const node = () => doc.byId[props.id];
+
+  // Annotation (PDF highlight) blocks expose only their highlight text in the
+  // editor; the metadata properties stay hidden but are reattached on commit.
+  const isAnnot = () => isAnnotationBlock(node().raw);
+  const editorValue = () => (isAnnot() ? splitProps(node().raw).text : node().raw);
+  const commit = (text: string) =>
+    setRaw(props.id, isAnnot() ? joinProps(text, splitProps(node().raw).props) : text);
 
   const [ac, setAc] = createSignal<Trigger | null>(null);
   const [acItems, setAcItems] = createSignal<AcItem[]>([]);
@@ -438,7 +452,7 @@ function Editor(props: { id: string }): JSX.Element {
     const t = ac();
     if (!t) return;
     const r = applyCompletion(ref.value, t.start, t.end, text, caret);
-    setRaw(props.id, r.raw);
+    commit(r.raw);
     closeAc();
     queueMicrotask(() => {
       ref.value = r.raw;
@@ -511,7 +525,7 @@ function Editor(props: { id: string }): JSX.Element {
   };
 
   onMount(() => {
-    const offset = takeCaretFor(props.id) ?? node().raw.length;
+    const offset = takeCaretFor(props.id) ?? editorValue().length;
     ref.focus();
     const o = Math.min(offset, ref.value.length);
     ref.setSelectionRange(o, o);
@@ -519,7 +533,7 @@ function Editor(props: { id: string }): JSX.Element {
   });
 
   const onInput = () => {
-    setRaw(props.id, ref.value);
+    commit(ref.value);
     autosize();
     void updateAutocomplete();
   };
@@ -559,7 +573,7 @@ function Editor(props: { id: string }): JSX.Element {
     // (the DOM reorder can briefly blur the textarea).
     if (matchesCommand(e, "editor/move-block-up") || matchesCommand(e, "editor/move-block-down")) {
       e.preventDefault();
-      setRaw(props.id, raw);
+      commit(raw);
       moveItem(props.id, matchesCommand(e, "editor/move-block-down") ? 1 : -1);
       startEditing(props.id, start);
       return;
@@ -572,7 +586,7 @@ function Editor(props: { id: string }): JSX.Element {
       const atEdge = down ? !raw.slice(start).includes("\n") : !raw.slice(0, start).includes("\n");
       if (atEdge) {
         e.preventDefault();
-        setRaw(props.id, raw);
+        commit(raw);
         selectBlock(props.id);
         moveSelection(down ? 1 : -1, true);
         return;
@@ -582,7 +596,7 @@ function Editor(props: { id: string }): JSX.Element {
     if (matchesCommand(e, "editor/cycle-todo")) {
       e.preventDefault();
       const { raw: newRaw, delta } = cycleMarker(raw, workflow());
-      setRaw(props.id, newRaw);
+      commit(newRaw);
       const pos = Math.max(0, start + delta);
       queueMicrotask(() => {
         ref.value = newRaw;
@@ -591,18 +605,28 @@ function Editor(props: { id: string }): JSX.Element {
       });
     } else if (matchesCommand(e, "editor/indent")) {
       e.preventDefault();
-      setRaw(props.id, raw);
+      commit(raw);
       indentBlock(props.id, start);
     } else if (matchesCommand(e, "editor/outdent")) {
       e.preventDefault();
-      setRaw(props.id, raw);
+      commit(raw);
       outdentBlock(props.id, start);
     } else if (e.key === "Enter" && !e.shiftKey && !e.ctrlKey && !e.metaKey) {
       e.preventDefault();
-      setRaw(props.id, raw); // flush current text
-      splitBlock(props.id, start);
+      commit(raw); // flush current text
+      if (isAnnot()) {
+        // A highlight block isn't split (that would mangle its metadata); Enter
+        // adds a new sibling bullet below, which the user can Tab to nest as a
+        // note under the highlight.
+        const newId = insertOutlineAfter(props.id, [{ raw: "", children: [] }]);
+        startEditing(newId, 0);
+      } else {
+        splitBlock(props.id, start);
+      }
     } else if (e.key === "Backspace" && start === 0 && end === 0) {
-      setRaw(props.id, raw);
+      // Never merge a highlight block away (its metadata must stay intact).
+      if (isAnnot()) return;
+      commit(raw);
       if (mergeWithPrev(props.id)) e.preventDefault();
     } else if (e.key === "ArrowUp") {
       const before = raw.slice(0, start);
@@ -629,7 +653,7 @@ function Editor(props: { id: string }): JSX.Element {
   };
 
   const onBlur = () => {
-    setRaw(props.id, ref.value);
+    commit(ref.value);
     // Only clear if no other block grabbed editing focus.
     if (editingId() === props.id) setEditingId(null);
   };
@@ -645,7 +669,7 @@ function Editor(props: { id: string }): JSX.Element {
       e.preventDefault();
       const nodes = parseOutline(text);
       if (!nodes.length) return;
-      setRaw(props.id, ref.value);
+      commit(ref.value);
       const wasEmpty =
         doc.byId[props.id].raw.trim() === "" && doc.byId[props.id].children.length === 0;
       const lastId = insertOutlineAfter(props.id, nodes);
@@ -660,7 +684,7 @@ function Editor(props: { id: string }): JSX.Element {
       const md = `![](../assets/${saved})`;
       const start = ref.selectionStart;
       const newRaw = ref.value.slice(0, start) + md + ref.value.slice(ref.selectionEnd);
-      setRaw(props.id, newRaw);
+      commit(newRaw);
       const pos = start + md.length;
       queueMicrotask(() => {
         ref.value = newRaw;
@@ -676,7 +700,7 @@ function Editor(props: { id: string }): JSX.Element {
         ref={ref}
         class="block-editor"
         spellcheck={false}
-        value={node().raw}
+        value={editorValue()}
         onInput={onInput}
         onKeyDown={onKeyDown}
         onBlur={onBlur}
