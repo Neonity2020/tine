@@ -5,6 +5,7 @@ import { For, Show, type JSX } from "solid-js";
 import type { BlockDto } from "../types";
 import { blockView } from "../render/block";
 import { InlineText } from "../render/inline";
+import { openInRightSidebar } from "../ui";
 
 export function RefBlocks(props: { blocks: BlockDto[] }): JSX.Element {
   return <For each={props.blocks}>{(b) => <RefBlock block={b} />}</For>;
@@ -16,7 +17,16 @@ function RefBlock(props: { block: BlockDto }): JSX.Element {
     <div class="ls-block ref-block">
       <div class="block-main">
         <div class="block-controls">
-          <span class="bullet-container">
+          <span
+            class="bullet-container"
+            title="Shift-click to open in sidebar"
+            onClick={(e) => {
+              if (e.shiftKey && props.block.id) {
+                e.stopPropagation();
+                openInRightSidebar("block", props.block.id);
+              }
+            }}
+          >
             <span class="bullet" />
           </span>
         </div>

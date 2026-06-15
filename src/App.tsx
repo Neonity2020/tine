@@ -10,6 +10,7 @@ import { Settings } from "./components/Settings";
 import { DatePicker } from "./components/DatePicker";
 import { installKeybindings } from "./keybindings";
 import { loadGraphPath, persistedGraphPath } from "./graph";
+import { goBack, goForward, canGoBack, canGoForward } from "./router";
 import {
   theme,
   toggleTheme,
@@ -78,6 +79,26 @@ export function App(): JSX.Element {
               <svg viewBox="0 0 24 24" class="nav-icon">
                 <rect x="3" y="4" width="18" height="16" rx="2" fill="none" stroke="currentColor" stroke-width="1.7" />
                 <line x1="9" y1="4" x2="9" y2="20" stroke="currentColor" stroke-width="1.7" />
+              </svg>
+            </button>
+            <button
+              class="icon-btn"
+              title="Go back"
+              disabled={!canGoBack()}
+              onClick={goBack}
+            >
+              <svg viewBox="0 0 24 24" class="nav-icon">
+                <path d="M15 5l-7 7 7 7" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+              </svg>
+            </button>
+            <button
+              class="icon-btn"
+              title="Go forward"
+              disabled={!canGoForward()}
+              onClick={goForward}
+            >
+              <svg viewBox="0 0 24 24" class="nav-icon">
+                <path d="M9 5l7 7-7 7" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
               </svg>
             </button>
           </div>

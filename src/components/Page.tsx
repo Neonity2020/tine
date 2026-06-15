@@ -313,22 +313,16 @@ function PageSection(props: { page: FeedPage }): JSX.Element {
           title={isFavorite(props.page.name) ? "Unfavorite" : "Add to favorites"}
           onClick={() => toggleFavorite(props.page.name, props.page.kind)}
         >
-          {isFavorite(props.page.name) ? "★" : "☆"}
+          <svg viewBox="0 0 24 24" class="star-icon" aria-hidden="true">
+            <path
+              d="M12 3.5l2.6 5.27 5.82.85-4.21 4.1.99 5.79L12 16.77l-5.2 2.73.99-5.79-4.21-4.1 5.82-.85z"
+              fill={isFavorite(props.page.name) ? "currentColor" : "none"}
+              stroke="currentColor"
+              stroke-width="1.6"
+              stroke-linejoin="round"
+            />
+          </svg>
         </button>
-        <Show when={props.page.kind === "page"}>
-          <button
-            class="page-delete"
-            title="Delete page"
-            onClick={async () => {
-              if (confirm(`Delete page "${props.page.name}"? This removes the file.`)) {
-                await backend().deletePage(props.page.name, "page");
-                openJournals();
-              }
-            }}
-          >
-            🗑
-          </button>
-        </Show>
       </div>
       <Show when={props.page.preBlock}>
         <div class="page-properties">

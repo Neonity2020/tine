@@ -1,7 +1,8 @@
-// Tab-based routing. Each tab holds a route; the active tab's route drives the
-// page view. Middle-click opens links in a new tab; pinned tabs persist across
-// sessions. `route()`/`openPage()`/`openJournals()` keep their old meaning
-// (acting on the active tab) so existing call sites are unchanged.
+// Tab-based routing with per-tab navigation history. Each tab holds a back/
+// forward stack of routes; the active tab's current route drives the page view.
+// Middle-click opens links in a new tab; pinned tabs persist across sessions.
+// `route()`/`openPage()`/`openJournals()` keep their old meaning (acting on the
+// active tab) so existing call sites are unchanged.
 
 import { createSignal } from "solid-js";
 import { pushRecent } from "./ui";
@@ -12,7 +13,9 @@ export type Route =
 
 export interface Tab {
   id: string;
-  route: Route;
+  // Navigation history (back/forward stack) and the cursor into it.
+  history: Route[];
+  pos: number;
   pinned: boolean;
 }
 
@@ -28,8 +31,13 @@ export function activeTab(): Tab {
   return tabs().find((t) => t.id === activeId()) ?? tabs()[0];
 }
 
+/** The route a tab is currently showing. */
+export function tabRoute(t: Tab): Route {
+  return t.history[t.pos];
+}
+
 export function route(): Route {
-  return activeTab().route;
+  return tabRoute(activeTab());
 }
 
 export function routeTitle(r: Route): string {
@@ -38,23 +46,39 @@ export function routeTitle(r: Route): string {
   return r.name;
 }
 
-function updateActive(r: Route) {
-  setTabs(tabs().map((t) => (t.id === activeId() ? { ...t, route: r } : t)));
+function sameRoute(a: Route, b: Route): boolean {
+  if (a.kind !== b.kind) return false;
+  if (a.kind === "journals") return true;
+  return a.name === (b as typeof a).name && a.pageKind === (b as typeof a).pageKind;
+}
+
+// Navigate the active tab to a new route, pushing it onto the history stack
+// (dropping any forward entries — standard browser behaviour). Re-navigating to
+// the current route is a no-op so the back stack doesn't fill with duplicates.
+function navigate(r: Route) {
+  setTabs(
+    tabs().map((t) => {
+      if (t.id !== activeId()) return t;
+      if (sameRoute(tabRoute(t), r)) return t;
+      const history = [...t.history.slice(0, t.pos + 1), r];
+      return { ...t, history, pos: history.length - 1 };
+    })
+  );
   persist();
 }
 
 export function openPage(name: string, pageKind: "journal" | "page" = "page") {
-  updateActive({ kind: "page", name, pageKind });
+  navigate({ kind: "page", name, pageKind });
   pushRecent(name, pageKind);
 }
 
 export function openJournals() {
-  updateActive({ kind: "journals" });
+  navigate({ kind: "journals" });
 }
 
 export function openInNewTab(r: Route) {
   const id = newId();
-  setTabs([...tabs(), { id, route: r, pinned: false }]);
+  setTabs([...tabs(), { id, history: [r], pos: 0, pinned: false }]);
   setActiveId(id);
   persist();
 }
@@ -62,6 +86,27 @@ export function openInNewTab(r: Route) {
 export function openPageInNewTab(name: string, pageKind: "journal" | "page" = "page") {
   openInNewTab({ kind: "page", name, pageKind });
   pushRecent(name, pageKind);
+}
+
+// ---- back / forward ----
+
+export function canGoBack(): boolean {
+  return activeTab().pos > 0;
+}
+
+export function canGoForward(): boolean {
+  const t = activeTab();
+  return t.pos < t.history.length - 1;
+}
+
+export function goBack() {
+  if (!canGoBack()) return;
+  setTabs(tabs().map((t) => (t.id === activeId() ? { ...t, pos: t.pos - 1 } : t)));
+}
+
+export function goForward() {
+  if (!canGoForward()) return;
+  setTabs(tabs().map((t) => (t.id === activeId() ? { ...t, pos: t.pos + 1 } : t)));
 }
 
 export function setActiveTab(id: string) {
@@ -104,7 +149,7 @@ function persist() {
   try {
     const pinned = tabs()
       .filter((t) => t.pinned)
-      .map((t) => t.route);
+      .map((t) => tabRoute(t));
     localStorage.setItem(KEY, JSON.stringify(pinned));
   } catch {
     // ignore (e.g. storage disabled)
@@ -119,7 +164,15 @@ function restore(): Tab[] {
   } catch {
     pinnedRoutes = [];
   }
-  const pinned: Tab[] = pinnedRoutes.map((r) => ({ id: newId(), route: r, pinned: true }));
+  const pinned: Tab[] = pinnedRoutes.map((r) => ({
+    id: newId(),
+    history: [r],
+    pos: 0,
+    pinned: true,
+  }));
   // Always start on a journals tab.
-  return [{ id: newId(), route: { kind: "journals" }, pinned: false }, ...pinned];
+  return [
+    { id: newId(), history: [{ kind: "journals" }], pos: 0, pinned: false },
+    ...pinned,
+  ];
 }

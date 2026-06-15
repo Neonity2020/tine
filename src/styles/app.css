@@ -295,6 +295,15 @@ body {
   background: var(--bg-tertiary);
 }
 
+.icon-btn:disabled {
+  opacity: 0.3;
+  cursor: default;
+}
+
+.icon-btn:disabled:hover {
+  background: transparent;
+}
+
 /* ---------------------------------------------------------------- page */
 
 .page-title-row {
@@ -336,10 +345,16 @@ body {
   background: none;
   border: none;
   cursor: pointer;
-  font-size: 20px;
+  padding: 2px;
+  display: flex;
+  align-items: center;
   color: var(--text-muted);
   opacity: 0;
   transition: opacity 0.1s;
+}
+.star-icon {
+  width: 18px;
+  height: 18px;
 }
 
 .page-title-row:hover .fav-star,
@@ -1386,6 +1401,24 @@ mark {
   display: flex;
   gap: 8px;
   align-items: center;
+}
+
+.query-collapse {
+  display: flex;
+  align-items: center;
+  cursor: pointer;
+  color: var(--text-muted);
+  margin-left: -2px;
+}
+.query-collapse .triangle {
+  width: 14px;
+  height: 14px;
+  fill: currentColor;
+  transform: rotate(90deg);
+  transition: transform 0.1s ease;
+}
+.query-collapse.collapsed .triangle {
+  transform: rotate(0deg);
 }
 
 .query-view-toggle {

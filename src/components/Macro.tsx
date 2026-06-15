@@ -1,12 +1,34 @@
 import { For, Show, Switch, Match, createMemo, createResource, createSignal, type JSX } from "solid-js";
 import { backend } from "../backend";
-import { openPage } from "../router";
+import { openPage, openPageInNewTab } from "../router";
 import { RefBlocks } from "./RefBlocks";
 import { blockView } from "../render/block";
 import { InlineText } from "../render/inline";
 import type { PageKind } from "../types";
 
 const ADVANCED_RE = /\[\s*:find|:where|:find/;
+
+// Collapsed state for query results, keyed by query string and persisted so a
+// query you fold (e.g. a TODO dashboard parked in the sidebar) stays folded.
+const QCOLLAPSE_KEY = "logseq-claude.queryCollapsed";
+function loadCollapsed(q: string): boolean {
+  try {
+    const m = JSON.parse(localStorage.getItem(QCOLLAPSE_KEY) ?? "{}");
+    return !!m[q];
+  } catch {
+    return false;
+  }
+}
+function saveCollapsed(q: string, v: boolean) {
+  try {
+    const m = JSON.parse(localStorage.getItem(QCOLLAPSE_KEY) ?? "{}");
+    if (v) m[q] = true;
+    else delete m[q];
+    localStorage.setItem(QCOLLAPSE_KEY, JSON.stringify(m));
+  } catch {
+    // ignore
+  }
+}
 
 interface Row {
   page: string;
@@ -24,6 +46,12 @@ export function QueryMacro(props: { body: string }): JSX.Element {
   const [table, setTable] = createSignal(false);
   const [sortCol, setSortCol] = createSignal<string>("");
   const [sortDir, setSortDir] = createSignal(1);
+  const [collapsed, setCollapsed] = createSignal(loadCollapsed(arg()));
+  const toggleCollapsed = () => {
+    const v = !collapsed();
+    setCollapsed(v);
+    saveCollapsed(arg(), v);
+  };
 
   const rows = createMemo<Row[]>(() =>
     (groups() ?? []).flatMap((g) =>
@@ -71,6 +99,19 @@ export function QueryMacro(props: { body: string }): JSX.Element {
         </Match>
         <Match when={true}>
           <div class="query-header">
+            <span
+              class="query-collapse"
+              classList={{ collapsed: collapsed() }}
+              title={collapsed() ? "Expand results" : "Collapse results"}
+              onClick={(e) => {
+                e.stopPropagation();
+                toggleCollapsed();
+              }}
+            >
+              <svg viewBox="0 0 24 24" class="triangle">
+                <path d="M8 5l8 7-8 7z" />
+              </svg>
+            </span>
             Query <span class="query-count">{total()}</span>
             <button
               class="query-view-toggle"
@@ -82,6 +123,7 @@ export function QueryMacro(props: { body: string }): JSX.Element {
               {table() ? "List" : "Table"}
             </button>
           </div>
+          <Show when={!collapsed()}>
           <Show
             when={groups() && groups()!.length > 0}
             fallback={<div class="query-empty">No results</div>}
@@ -97,6 +139,13 @@ export function QueryMacro(props: { body: string }): JSX.Element {
                         onClick={(e) => {
                           e.stopPropagation();
                           openPage(g.page, g.kind);
+                        }}
+                        onAuxClick={(e) => {
+                          if (e.button === 1) {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            openPageInNewTab(g.page, g.kind);
+                          }
                         }}
                       >
                         {g.page}
@@ -130,6 +179,13 @@ export function QueryMacro(props: { body: string }): JSX.Element {
                             e.stopPropagation();
                             openPage(r.page, r.kind);
                           }}
+                          onAuxClick={(e) => {
+                            if (e.button === 1) {
+                              e.preventDefault();
+                              e.stopPropagation();
+                              openPageInNewTab(r.page, r.kind);
+                            }
+                          }}
                         >
                           {r.page}
                         </td>
@@ -140,6 +196,7 @@ export function QueryMacro(props: { body: string }): JSX.Element {
                 </tbody>
               </table>
             </Show>
+          </Show>
           </Show>
         </Match>
       </Switch>

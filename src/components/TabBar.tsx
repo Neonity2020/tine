@@ -7,6 +7,7 @@ import {
   togglePin,
   reorderTab,
   routeTitle,
+  tabRoute,
 } from "../router";
 
 // Tab strip: click to activate, middle-click to close, double-click to pin
@@ -43,7 +44,7 @@ export function TabBar(): JSX.Element {
               <Show when={t.pinned}>
                 <span class="tab-pin">📌</span>
               </Show>
-              <span class="tab-title">{routeTitle(t.route)}</span>
+              <span class="tab-title">{routeTitle(tabRoute(t))}</span>
               <span
                 class="tab-close"
                 onClick={(e) => {

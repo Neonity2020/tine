@@ -29,13 +29,14 @@ import {
   selectBlock,
   moveSelection,
   isSelected,
+  ensureBlockId,
 } from "../store";
 import { parseOutline } from "../editor/outline";
 import { blockView, isPropertyLine } from "../render/block";
 import { InlineText } from "../render/inline";
 import { BodyContent } from "../render/body";
 import { QueryMacro, EmbedMacro } from "./Macro";
-import { openPdf, workflow, zoomInto, openContextMenu, openDatePicker } from "../ui";
+import { openPdf, workflow, zoomInto, openContextMenu, openDatePicker, openInRightSidebar } from "../ui";
 import { matchesCommand } from "../keybindings";
 import { HL_COLOR_BG, HL_COLOR_SOLID } from "../pdf";
 import { cycleMarker } from "../editor/marker";
@@ -174,14 +175,15 @@ export function Block(props: { id: string }): JSX.Element {
           <span
             class="bullet-container"
             classList={{ "bullet-closed": collapsed() && hasChildren() }}
-            title="Click to zoom; drag to move"
+            title="Click to zoom; shift-click to open in sidebar; drag to move"
             onMouseDown={(e) => {
               if (e.button === 0) beginDrag(props.id, e);
             }}
             onClick={(e) => {
               e.stopPropagation();
               if (dragMoved) return; // was a drag, not a click
-              zoomInto(props.id);
+              if (e.shiftKey) openInRightSidebar("block", ensureBlockId(props.id));
+              else zoomInto(props.id);
             }}
           >
             <span class="bullet" />
