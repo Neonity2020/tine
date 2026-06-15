@@ -557,6 +557,74 @@ body {
   color: var(--marker-todo);
 }
 
+.ctx-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 6px;
+}
+.ctx-sep {
+  height: 1px;
+  background: var(--border-color);
+  margin: 4px 2px;
+}
+.ctx-color {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  border: 1px solid rgba(0, 0, 0, 0.15);
+  cursor: pointer;
+  padding: 0;
+  flex: 0 0 auto;
+}
+.ctx-color-none {
+  background: var(--bg-primary);
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1;
+}
+.ctx-color:hover {
+  transform: scale(1.12);
+}
+.ctx-h {
+  flex: 1;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 5px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  padding: 4px 0;
+  cursor: pointer;
+}
+.ctx-h:hover {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+/* Block background color (set via the context menu). */
+.block-content.has-bg {
+  border-radius: 5px;
+  padding: 1px 6px;
+  margin: -1px -6px;
+}
+
+/* Numbered list: replace the bullet dot with a CSS counter. */
+.block-children.ordered {
+  counter-reset: ol;
+}
+.block-children.ordered > .ls-block > .block-main > .block-controls {
+  counter-increment: ol;
+}
+.block-children.ordered > .ls-block > .block-main > .block-controls .bullet {
+  display: none;
+}
+.block-children.ordered > .ls-block > .block-main > .block-controls .bullet-container::after {
+  content: counter(ol) ".";
+  color: var(--text-secondary);
+  font-size: 14px;
+  font-variant-numeric: tabular-nums;
+}
+
 .journal-title {
   cursor: pointer;
 }

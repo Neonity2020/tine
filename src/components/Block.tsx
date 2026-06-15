@@ -49,7 +49,17 @@ function detectMacro(lines: string[]): { kind: "query" | "embed"; inner: string 
 }
 
 // Internal/metadata properties hidden from the rendered properties area.
-const INTERNAL_PROPS = new Set(["id", "collapsed", "hl-page", "hl-color", "hl-type", "ls-type"]);
+const INTERNAL_PROPS = new Set([
+  "id", "collapsed", "hl-page", "hl-color", "hl-type", "ls-type",
+  "background-color", "logseq.order-list-type",
+]);
+
+// Logseq's built-in block background colors → a soft tint for rendering.
+const BLOCK_BG: Record<string, string> = {
+  yellow: "rgba(251,230,158,0.45)", red: "rgba(245,163,163,0.4)", pink: "rgba(243,176,212,0.4)",
+  green: "rgba(166,227,180,0.4)", blue: "rgba(168,201,240,0.4)", purple: "rgba(205,180,238,0.4)",
+  gray: "rgba(211,214,218,0.5)",
+};
 
 // A PDF highlight (annotation) block — its raw is generated metadata, so we
 // never let the user drop into raw edit mode (clicking jumps to the PDF).
@@ -194,7 +204,7 @@ export function Block(props: { id: string }): JSX.Element {
       <Show when={hasChildren() && !collapsed()}>
         <div class="block-children-container">
           <div class="block-children-left-border" />
-          <div class="block-children">
+          <div class="block-children" classList={{ ordered: /(?:^|\n)logseq\.order-list-type:: ?number/.test(node().raw) }}>
             <For each={node().children}>{(cid) => <Block id={cid} />}</For>
           </div>
         </div>
@@ -235,6 +245,10 @@ function Rendered(props: { id: string }): JSX.Element {
   };
 
   const displayProps = () => view().properties.filter(([k]) => !INTERNAL_PROPS.has(k));
+  const bgColor = () => {
+    const v = view().properties.find(([k]) => k === "background-color")?.[1];
+    return v ? BLOCK_BG[v] ?? v : undefined;
+  };
 
   const body = (
     <Show when={annotation()} fallback={<BodyContent lines={view().lines} />}>
@@ -274,7 +288,8 @@ function Rendered(props: { id: string }): JSX.Element {
     >
     <div
       class="block-content"
-      classList={{ done: view().done, [`heading h${view().headingLevel ?? ""}`]: view().headingLevel != null }}
+      classList={{ done: view().done, "has-bg": !!bgColor(), [`heading h${view().headingLevel ?? ""}`]: view().headingLevel != null }}
+      style={bgColor() ? { background: bgColor() } : undefined}
       onClick={onClick}
     >
       <Show when={view().marker}>

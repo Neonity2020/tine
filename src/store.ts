@@ -397,6 +397,65 @@ export function insertOutlineAfter(afterId: string, nodes: OutlineNode[]): strin
   return lastId;
 }
 
+const PROP_LINE = /^([A-Za-z0-9_./-]+):: ?(.*)$/;
+
+/** Current value of a `key:: value` block property, or null. */
+export function blockProperty(id: string, key: string): string | null {
+  const node = doc.byId[id];
+  if (!node) return null;
+  for (const line of node.raw.split("\n")) {
+    const m = PROP_LINE.exec(line);
+    if (m && m[1] === key) return m[2].trim();
+  }
+  return null;
+}
+
+/** Set (or remove, when value is null) a `key:: value` block property. Property
+ *  lines live after the block's content lines, matching Logseq. */
+export function setBlockProperty(id: string, key: string, value: string | null) {
+  const node = doc.byId[id];
+  if (!node) return;
+  pushUndo(`prop:${id}:${key}`);
+  const lines = node.raw.split("\n").filter((l) => {
+    const m = PROP_LINE.exec(l);
+    return !(m && m[1] === key);
+  });
+  if (value !== null) lines.push(`${key}:: ${value}`);
+  setDoc("byId", id, "raw", lines.join("\n"));
+  markDirty(node.page);
+}
+
+/** Toggle a property: set it to `value`, or remove it if already that value. */
+export function toggleBlockProperty(id: string, key: string, value: string) {
+  setBlockProperty(id, key, blockProperty(id, key) === value ? null : value);
+}
+
+/** Set the block's heading level via the markdown `#` prefix (null clears it). */
+export function setHeading(id: string, level: number | null) {
+  const node = doc.byId[id];
+  if (!node) return;
+  pushUndo(`heading:${id}`);
+  const lines = node.raw.split("\n");
+  let first = (lines[0] ?? "").replace(/^#{1,6} /, "");
+  if (level && level >= 1 && level <= 6) first = `${"#".repeat(level)} ${first}`;
+  lines[0] = first;
+  setDoc("byId", id, "raw", lines.join("\n"));
+  markDirty(node.page);
+}
+
+/** Collapse or expand a block and its entire descendant subtree. */
+export function setCollapsedDeep(id: string, collapsed: boolean) {
+  pushUndo("collapse-all");
+  const walk = (bid: string) => {
+    const n = doc.byId[bid];
+    if (!n) return;
+    if (n.children.length) setDoc("byId", bid, "collapsed", collapsed);
+    n.children.forEach(walk);
+  };
+  walk(id);
+  markDirty(doc.byId[id].page);
+}
+
 /** Ensure a block has a persistent `id::` uuid (assigned lazily, like OG);
  *  returns the uuid. Used to make `((uuid))` block references. */
 export function ensureBlockId(id: string): string {
