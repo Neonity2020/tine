@@ -144,21 +144,25 @@ fn save_preserves_file_format_no_churn() {
 
     let root = std::env::temp_dir().join(format!("tine-fmt-test-{}", std::process::id()));
     std::fs::create_dir_all(root.join("pages")).unwrap();
-    // Logseq style: no trailing newline. Plus a file that does have one.
+    // Logseq style: no trailing newline. Plus one with a newline, and a
+    // space-indented file (Tine emits tabs by default — must preserve spaces).
     let no_nl = "- alpha\n\t- beta";
     let with_nl = "- gamma\n";
+    let spaces = "- root\n  - two-space child\n    - grandchild";
     std::fs::write(root.join("pages").join("A.md"), no_nl).unwrap();
     std::fs::write(root.join("pages").join("B.md"), with_nl).unwrap();
+    std::fs::write(root.join("pages").join("C.md"), spaces).unwrap();
 
     let g = Graph::open(&root);
     // Load then save unchanged must be byte-identical (no churn): each file's
-    // trailing-newline convention is preserved.
-    for name in ["A", "B"] {
+    // trailing-newline + indent convention is preserved.
+    for name in ["A", "B", "C"] {
         let dto = g.load_named(name, PageKind::Page).unwrap().unwrap();
         g.save_page(&dto).unwrap();
     }
     assert_eq!(std::fs::read_to_string(root.join("pages").join("A.md")).unwrap(), no_nl);
     assert_eq!(std::fs::read_to_string(root.join("pages").join("B.md")).unwrap(), with_nl);
+    assert_eq!(std::fs::read_to_string(root.join("pages").join("C.md")).unwrap(), spaces);
 
     std::fs::remove_dir_all(&root).ok();
 }

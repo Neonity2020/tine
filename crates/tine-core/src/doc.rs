@@ -202,17 +202,19 @@ fn strip_n_ws(line: &str, n: usize) -> &str {
 /// Formatting knobs detected from a file so re-saving preserves its existing
 /// style (avoids gratuitous diffs / Syncthing churn). Logseq, for instance,
 /// writes files with NO trailing newline; imposing one would rewrite every file.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct SerializeOpts {
     /// Number of trailing `\n` characters to end the file with.
     pub trailing_newlines: usize,
     /// Emit a blank line between the page-property pre-block and the first block.
     pub blank_after_props: bool,
+    /// Whitespace for one level of indentation (e.g. `"\t"` or `"  "`).
+    pub indent: String,
 }
 
 impl Default for SerializeOpts {
     fn default() -> Self {
-        SerializeOpts { trailing_newlines: 1, blank_after_props: true }
+        SerializeOpts { trailing_newlines: 1, blank_after_props: true, indent: "\t".into() }
     }
 }
 
@@ -225,6 +227,7 @@ impl SerializeOpts {
             Some(s) => SerializeOpts {
                 trailing_newlines: s.bytes().rev().take_while(|b| *b == b'\n').count(),
                 blank_after_props: blank_after_props(s),
+                indent: detect_indent(s),
             },
         }
     }
@@ -237,6 +240,32 @@ fn blank_after_props(s: &str) -> bool {
         Some(i) if i > 0 => lines[i - 1].trim().is_empty(),
         _ => true,
     }
+}
+
+fn gcd(a: usize, b: usize) -> usize {
+    if b == 0 { a } else { gcd(b, a % b) }
+}
+
+/// Infer the per-level indentation unit from a file's indented bullet lines:
+/// a tab if any are tab-indented, else N spaces (the GCD of space widths).
+fn detect_indent(s: &str) -> String {
+    let mut space_widths: Vec<usize> = Vec::new();
+    for line in s.split('\n') {
+        let lead_len = line.len() - line.trim_start_matches([' ', '\t']).len();
+        if lead_len == 0 {
+            continue;
+        }
+        let rest = &line[lead_len..];
+        if !(rest == "-" || rest.starts_with("- ")) {
+            continue; // only indented bullet lines reveal the level unit
+        }
+        if line[..lead_len].contains('\t') {
+            return "\t".into();
+        }
+        space_widths.push(lead_len);
+    }
+    let w = space_widths.into_iter().fold(0usize, gcd);
+    if w >= 2 { " ".repeat(w) } else { "\t".into() }
 }
 
 /// Serialize a [`Document`] back to Logseq-compatible markdown (default style).
@@ -258,30 +287,30 @@ pub fn serialize_with(doc: &Document, opts: &SerializeOpts) -> String {
         }
     }
     for block in &doc.roots {
-        emit_block(block, 0, &mut out);
+        emit_block(block, 0, &opts.indent, &mut out);
     }
     let mut s = out.join("\n");
     s.push_str(&"\n".repeat(opts.trailing_newlines));
     s
 }
 
-fn emit_block(block: &DocBlock, tab_level: usize, out: &mut Vec<String>) {
-    let tabs = "\t".repeat(tab_level);
+fn emit_block(block: &DocBlock, level: usize, unit: &str, out: &mut Vec<String>) {
+    let ind = unit.repeat(level);
     let mut lines = block.raw.split('\n');
     let first = lines.next().unwrap_or("");
     if first.is_empty() {
-        out.push(format!("{tabs}-"));
+        out.push(format!("{ind}-"));
     } else {
-        out.push(format!("{tabs}- {first}"));
+        out.push(format!("{ind}- {first}"));
     }
     for line in lines {
         if line.is_empty() {
             out.push(String::new());
         } else {
-            out.push(format!("{tabs}  {line}"));
+            out.push(format!("{ind}  {line}"));
         }
     }
     for child in &block.children {
-        emit_block(child, tab_level + 1, out);
+        emit_block(child, level + 1, unit, out);
     }
 }
