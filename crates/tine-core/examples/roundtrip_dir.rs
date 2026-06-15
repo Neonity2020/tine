@@ -1,7 +1,7 @@
 //! Walk a directory, parse+serialize every `.md`, and report any byte-level
-//! mismatches. Usage: cargo run -p logseq-core --example roundtrip_dir -- <dir>
+//! mismatches. Usage: cargo run -p tine-core --example roundtrip_dir -- <dir>
 
-use logseq_core::doc;
+use tine_core::doc;
 use std::path::Path;
 
 fn main() {

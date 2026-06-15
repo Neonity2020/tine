@@ -82,7 +82,7 @@ DOM. The editor keeps the live tree in the frontend so keystrokes never round-tr
 |------|------|-------|
 | Shell | [Tauri 2](https://tauri.app) (Rust) | OS webview (WebKitGTK on Linux) — tiny runtime vs Electron |
 | Frontend | [SolidJS](https://solidjs.com) + TypeScript + [Vite](https://vitejs.dev) | fine-grained reactivity, no virtual-DOM churn |
-| Core | `crates/logseq-core` (pure Rust) | parsing, Logseq-compatible serialization, model, indexing, queries, PDF/EDN, HTML publish |
+| Core | `crates/tine-core` (pure Rust) | parsing, Logseq-compatible serialization, model, indexing, queries, PDF/EDN, HTML publish |
 | Rendering | [pdf.js](https://mozilla.github.io/pdf.js/), [KaTeX](https://katex.org), highlight.js | PDF, math, code |
 
 The Rust core is GUI-free and unit-tested in isolation; the Tauri layer is a thin set of IPC
@@ -93,7 +93,7 @@ re-reading the tree.
 ## Project layout
 
 ```
-crates/logseq-core/   Rust core: parse/serialize, model, config, dates, refs, query, pdf, edn, publish
+crates/tine-core/   Rust core: parse/serialize, model, config, dates, refs, query, pdf, edn, publish
 src-tauri/            Tauri app — IPC commands + window
 src/                  SolidJS frontend (components, store, render pipeline, keybindings)
 scripts/env.sh        Points CARGO_HOME/RUSTUP_HOME at the persistent toolchain
@@ -133,7 +133,7 @@ npm run app                  # full Tauri dev window  (alias for: tauri dev)
 
 ```bash
 source scripts/env.sh
-cargo test -p logseq-core    # Rust: parse/serialize round-trip, model, queries, search cache
+cargo test -p tine-core    # Rust: parse/serialize round-trip, model, queries, search cache
 npm test                     # Frontend: Vitest (editor ops, outline, autocomplete, markers)
 ```
 

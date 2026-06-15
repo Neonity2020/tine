@@ -1,7 +1,7 @@
 // Prevent a console window on Windows release builds.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use logseq_core::model::{Graph, GraphMeta, PageDto, PageEntry, PageKind, RefGroup};
+use tine_core::model::{Graph, GraphMeta, PageDto, PageEntry, PageKind, RefGroup};
 use std::sync::Mutex;
 use tauri::{Manager, State};
 
@@ -14,7 +14,7 @@ fn resolve_root(path: &str) -> Option<String> {
     if !path.is_empty() {
         return Some(path.to_string());
     }
-    for var in ["TINE_GRAPH", "LOGSEQ_CLAUDE_GRAPH"] {
+    for var in ["TINE_GRAPH"] {
         if let Ok(p) = std::env::var(var) {
             if !p.is_empty() {
                 return Some(p);
@@ -31,7 +31,7 @@ fn load_graph(
     state: State<'_, AppState>,
 ) -> Result<GraphMeta, String> {
     let root = resolve_root(&path).ok_or_else(|| {
-        "no graph path provided (set LOGSEQ_CLAUDE_GRAPH or pass a path)".to_string()
+        "no graph path provided (set TINE_GRAPH or pass a path)".to_string()
     })?;
     let graph = Graph::open(&root);
     let meta = graph.meta();
@@ -163,7 +163,7 @@ fn save_asset(name: String, bytes: Vec<u8>, state: State<'_, AppState>) -> Resul
 fn read_highlights(
     pdf: String,
     state: State<'_, AppState>,
-) -> Result<Vec<logseq_core::pdf::Highlight>, String> {
+) -> Result<Vec<tine_core::pdf::Highlight>, String> {
     with_graph(&state, |g| Ok(g.read_highlights(&pdf)))
 }
 
@@ -171,7 +171,7 @@ fn read_highlights(
 fn write_highlights(
     pdf: String,
     label: String,
-    highlights: Vec<logseq_core::pdf::Highlight>,
+    highlights: Vec<tine_core::pdf::Highlight>,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     with_graph(&state, |g| {
@@ -183,7 +183,9 @@ fn main() {
     // WebKitGTK's DMABUF renderer aborts on some GPU/compositor combos
     // ("Could not create default EGL display: EGL_BAD_PARAMETER"). We disable it
     // by default for a reliable launch, but that uses software compositing
-    // (slower scrolling). Set TINE_GPU=1 to keep GPU/DMABUF rendering.
+    // (slower scrolling). Set TINE_GPU=1 to keep GPU/DMABUF rendering. Linux-only
+    // (no effect on the macOS/Windows webviews).
+    #[cfg(target_os = "linux")]
     if std::env::var("TINE_GPU").as_deref() != Ok("1")
         && std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none()
     {

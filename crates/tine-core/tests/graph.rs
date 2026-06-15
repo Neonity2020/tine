@@ -1,6 +1,6 @@
 //! Integration tests against the on-disk demo graph (standard layout).
 
-use logseq_core::Graph;
+use tine_core::Graph;
 use std::path::PathBuf;
 
 fn demo_graph() -> Graph {
@@ -22,7 +22,7 @@ fn lists_journals_and_pages() {
 #[test]
 fn loads_a_page_with_nesting_and_properties() {
     let g = demo_graph();
-    let entry = g.find_entry("logseq-claude", logseq_core::PageKind::Page).unwrap();
+    let entry = g.find_entry("logseq-claude", tine_core::PageKind::Page).unwrap();
     let dto = g.load_page(&entry).unwrap();
     assert_eq!(dto.pre_block.as_deref(), Some("title:: logseq-claude\ntags:: project, tooling"));
     // Has a nested child under the first block.
@@ -54,7 +54,7 @@ fn publishes_static_html() {
 
 #[test]
 fn search_cache_reflects_saves_and_deletes() {
-    use logseq_core::model::{BlockDto, PageDto, PageKind};
+    use tine_core::model::{BlockDto, PageDto, PageKind};
 
     // Isolated temp graph so we can mutate it freely.
     let root = std::env::temp_dir().join(format!("tine-cache-test-{}", std::process::id()));
@@ -94,7 +94,7 @@ fn search_cache_reflects_saves_and_deletes() {
 
 #[test]
 fn search_ignores_hidden_property_metadata() {
-    use logseq_core::model::{BlockDto, PageDto, PageKind};
+    use tine_core::model::{BlockDto, PageDto, PageKind};
 
     let root = std::env::temp_dir().join(format!("tine-search-meta-{}", std::process::id()));
     std::fs::create_dir_all(root.join("journals")).unwrap();

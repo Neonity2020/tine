@@ -12,4 +12,4 @@ tauri = { version = "2", features = [] }
 tauri-plugin-clipboard-manager = "2"
 serde = { workspace = true }
 serde_json = { workspace = true }
-logseq-core = { path = "../crates/logseq-core" }
+tine-core = { path = "../crates/tine-core" }

@@ -1,4 +1,4 @@
-//! logseq-core: parsing, serialization, and the graph model for a
+//! tine-core: parsing, serialization, and the graph model for a
 //! Logseq-compatible outliner. Pure Rust, no GUI dependencies — fully unit
 //! testable without the Tauri shell.
 

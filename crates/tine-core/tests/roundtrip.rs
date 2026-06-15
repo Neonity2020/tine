@@ -1,7 +1,7 @@
 //! Round-trip fidelity tests: `serialize(parse(x)) == x` for well-formed
 //! Logseq markdown, plus structural and canonicalization checks.
 
-use logseq_core::doc::{self, DocBlock};
+use tine_core::doc::{self, DocBlock};
 use pretty_assertions::assert_eq;
 
 /// Assert byte-exact round-trip.
