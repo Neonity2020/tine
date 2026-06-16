@@ -14,7 +14,8 @@ export type Seg =
   | { t: "macro"; body: string }
   | { t: "math"; tex: string; display: boolean }
   | { t: "link"; label: string; url: string }
-  | { t: "image"; alt: string; url: string; width?: string; height?: string };
+  | { t: "image"; alt: string; url: string; width?: string; height?: string }
+  | { t: "footnote"; id: string };
 
 /** Parse a Logseq image-metadata brace like `{:width 200, :height 100}`. */
 function parseImageMeta(brace: string | undefined): { width?: string; height?: string } {
@@ -51,6 +52,14 @@ export function parseInline(input: string): Seg[] {
     if (m) {
       flush();
       out.push({ t: "image", alt: m[1], url: m[2], ...parseImageMeta(m[3]) });
+      i += m[0].length;
+      continue;
+    }
+    // Footnote reference `[^id]` (before the link rule; `[^id]` has no `(url)`).
+    m = /^\[\^([^\]]+)\]/.exec(rest);
+    if (m) {
+      flush();
+      out.push({ t: "footnote", id: m[1] });
       i += m[0].length;
       continue;
     }

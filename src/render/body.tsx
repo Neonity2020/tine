@@ -4,6 +4,7 @@
 import { For, Show, type JSX } from "solid-js";
 import hljs from "highlight.js/lib/common";
 import { InlineText } from "./inline";
+import { backend } from "../backend";
 
 type Align = "left" | "center" | "right" | null;
 
@@ -135,6 +136,16 @@ export function BodyContent(props: { lines: string[] }): JSX.Element {
         if (seg.kind === "code") {
           return (
             <pre class="code-block">
+              <button
+                class="code-copy"
+                title="Copy code"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  void backend().writeText(seg.code);
+                }}
+              >
+                Copy
+              </button>
               <code class="hljs" innerHTML={highlight(seg.code, seg.lang)} />
             </pre>
           );

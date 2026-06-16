@@ -1795,6 +1795,58 @@ mark {
   margin: 2px 0;
 }
 
+/* video / iframe embeds */
+.embed-iframe-wrap {
+  position: relative;
+  width: 100%;
+  max-width: 640px;
+  aspect-ratio: 16 / 9;
+  margin: 6px 0;
+}
+.embed-iframe {
+  width: 100%;
+  height: 100%;
+  border: none;
+  border-radius: 6px;
+}
+.embed-video {
+  max-width: 640px;
+  width: 100%;
+  border-radius: 6px;
+  margin: 6px 0;
+}
+
+/* footnote reference */
+.footnote-ref {
+  color: var(--link-color);
+  font-size: 0.75em;
+  cursor: default;
+}
+.footnote-ref::before { content: "["; }
+.footnote-ref::after { content: "]"; }
+
+/* copy-code button (appears on hover over a code block) */
+.code-block {
+  position: relative;
+}
+.code-copy {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  font-size: 11px;
+  padding: 2px 8px;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  background: var(--bg-primary);
+  color: var(--text-secondary);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.1s ease;
+}
+.code-block:hover .code-copy {
+  opacity: 1;
+}
+
 /* ------------------------------------------------------ quick switcher */
 
 .switcher-overlay {

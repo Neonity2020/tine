@@ -59,6 +59,14 @@ describe("parseInline", () => {
     ]);
   });
 
+  it("footnote reference", () => {
+    expect(parseInline("see note[^1] here")).toEqual([
+      { t: "text", v: "see note" },
+      { t: "footnote", id: "1" },
+      { t: "text", v: " here" },
+    ]);
+  });
+
   it("mixed line", () => {
     const segs = parseInline("see [[Page]] and **bold** #tag");
     expect(segs).toEqual([

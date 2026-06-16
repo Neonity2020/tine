@@ -113,6 +113,9 @@ const NAMED: PageDto[] = [
       b("Task markers: TODO a, DOING b, NOW c, LATER d, WAIT e, DONE f"),
       b("TODO [#A] high-priority task"),
       b("Inline styles: **bold**, *italic*, ~~strike~~, ==highlight==, `code`"),
+      b("Footnote reference[^1] in a sentence.\n[^1]: the footnote definition."),
+      b("Video embed: {{video https://www.youtube.com/watch?v=dQw4w9WgXcQ}}"),
+      b("Tweet embed: {{tweet https://twitter.com/logseq/status/123}}"),
     ],
   },
 ];

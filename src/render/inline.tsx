@@ -11,7 +11,7 @@ import { openPdf, openPageInSidebar, openPageContextMenu } from "../ui";
 import { parseInline, type Seg } from "./parseInline";
 import { blockView } from "./block";
 import { backend } from "../backend";
-import { QueryMacro, EmbedMacro } from "../components/Macro";
+import { QueryMacro, EmbedMacro, VideoMacro, TweetMacro } from "../components/Macro";
 
 function renderSegs(segs: Seg[]): JSX.Element {
   return <For each={segs}>{(s) => renderSeg(s)}</For>;
@@ -91,6 +91,8 @@ function renderSeg(s: Seg): JSX.Element {
       const body = s.body.trimStart();
       if (/^query\b/i.test(body)) return <QueryMacro body={body} />;
       if (/^embed\b/i.test(body)) return <EmbedMacro body={body} />;
+      if (/^(video|youtube)\b/i.test(body)) return <VideoMacro body={body} />;
+      if (/^tweet\b/i.test(body)) return <TweetMacro body={body} />;
       return <span class="macro">{`{{${s.body}}}`}</span>;
     }
     case "math":
@@ -119,6 +121,8 @@ function renderSeg(s: Seg): JSX.Element {
     }
     case "image":
       return <AssetImage url={s.url} alt={s.alt} width={s.width} height={s.height} />;
+    case "footnote":
+      return <sup class="footnote-ref">{s.id}</sup>;
   }
 }
 
