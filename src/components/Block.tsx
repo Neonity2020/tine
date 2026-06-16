@@ -176,6 +176,8 @@ export function Block(props: { id: string }): JSX.Element {
           "drop-after": dropInd()?.id === props.id && dropInd()?.before === false,
           dragging: dragId() === props.id,
           selected: isSelected(props.id),
+          // Marks the row being edited; drives dim-mode's active-block spotlight.
+          editing: editing(),
         }}
         onContextMenu={(e) => {
           e.preventDefault();

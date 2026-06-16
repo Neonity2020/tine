@@ -17,6 +17,12 @@ import {
   openSettings,
   toggleWideMode,
   toggleDocumentMode,
+  toggleFocusMode,
+  toggleDimInactiveBlocks,
+  focusMode,
+  exitFocusMode,
+  switcherOpen,
+  settingsOpen,
 } from "./ui";
 import { openJournals } from "./router";
 import {
@@ -71,6 +77,8 @@ const COMMANDS: CommandDef[] = [
   { id: "ui/open-settings", binding: "t s", label: "Open settings", scope: "global", run: openSettings },
   { id: "ui/toggle-wide-mode", binding: "t w", label: "Toggle wide mode", scope: "global", run: toggleWideMode },
   { id: "ui/toggle-document-mode", binding: "t d", label: "Toggle document mode", scope: "global", run: toggleDocumentMode },
+  { id: "ui/toggle-focus-mode", binding: "t f", label: "Toggle focus mode", scope: "global", run: toggleFocusMode },
+  { id: "ui/toggle-dim-blocks", binding: "t b", label: "Toggle dim inactive blocks", scope: "global", run: toggleDimInactiveBlocks },
   { id: "editor/undo", binding: "mod+z", label: "Undo", scope: "global", run: undo, global: true },
   { id: "editor/redo", binding: "mod+shift+z", label: "Redo", scope: "global", run: redo, global: true },
   // Editor commands (resolved in Block.tsx / selection handler).
@@ -299,8 +307,12 @@ export function installKeybindings(overrides: Record<string, string> = {}): () =
     // a shortcut the dispatcher is suspended, so Escape there cancels recording
     // instead of reaching here.)
     if (e.key === "Escape") {
+      const overlayOpen = switcherOpen() || settingsOpen();
       closeSwitcher();
       closeSettings();
+      // Exit focus mode last: only when Esc didn't just close an overlay and
+      // there's no block selection (which has its own Esc handling above).
+      if (!overlayOpen && !hasSelection() && focusMode()) void exitFocusMode();
     }
 
     // While typing, only modifier chords are eligible (so "g j" doesn't fire).

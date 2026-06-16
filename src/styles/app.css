@@ -184,6 +184,75 @@ body {
   border-left-color: transparent;
 }
 
+/* Focus mode: hide both sidebars and the topbar for a distraction-free surface
+   (composes with wide/document and the window's fullscreen). Content width is
+   left untouched. */
+.focus-mode .left-sidebar,
+.focus-mode .right-sidebar {
+  display: none;
+}
+/* The topbar slides up out of view; a thin top strip (.topbar-hover-zone) and
+   the bar itself reveal it on hover so controls stay reachable. */
+.focus-mode .topbar {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 40;
+  transform: translateY(-100%);
+  transition: transform 0.16s ease;
+  background: var(--bg-primary);
+  box-shadow: 0 1px 6px rgba(0, 0, 0, 0.12);
+}
+.focus-mode .topbar-hover-zone {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 10px;
+  z-index: 41;
+}
+.focus-mode .topbar-hover-zone:hover + .topbar,
+.focus-mode .topbar:hover {
+  transform: translateY(0);
+}
+
+/* Floating exit-focus affordance: faint until hovered, so it's there as an
+   escape hatch without nagging. */
+.focus-exit {
+  position: fixed;
+  top: 12px;
+  right: 12px;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border: 1px solid var(--border-color);
+  border-radius: 50%;
+  background: var(--bg-primary);
+  color: var(--text-secondary);
+  cursor: pointer;
+  opacity: 0.25;
+  transition: opacity 0.15s ease;
+}
+.focus-exit:hover {
+  opacity: 1;
+}
+
+/* Dim inactive blocks: fade every block's own content line, full opacity on the
+   one being edited (its children stay dimmed — spotlight the active line).
+   Gated by the `dim-mode` container class, which is only applied while a block
+   is actually being edited. */
+.dim-mode .block-content-wrapper {
+  opacity: 0.32;
+  transition: opacity 0.15s ease;
+}
+.dim-mode .block-main.editing > .block-content-wrapper {
+  opacity: 1;
+}
+
 /* ---------------------------------------------------------------- sidebar */
 
 .left-sidebar-inner {

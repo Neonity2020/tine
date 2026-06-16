@@ -1,7 +1,7 @@
 // Small global UI state: theme, left sidebar, and the quick-switcher modal.
 import { createSignal } from "solid-js";
 import type { GraphMeta } from "./types";
-import { backend } from "./backend";
+import { backend, isTauri } from "./backend";
 
 const THEME_KEY = "logseq-claude.theme";
 function loadTheme(): "light" | "dark" {
@@ -68,6 +68,55 @@ export function toggleDocumentMode() {
   const v = !documentMode();
   setDocumentMode(v);
   saveStr(DOC_KEY, v ? "1" : null);
+}
+
+// --- focus mode (hide chrome + fullscreen) + dim-inactive-blocks ---
+// Focus is a deliberate session mode → NOT persisted. Dim is an appearance
+// preference → persisted, like wide/document. Focus composes with wide/document:
+// it only hides the sidebars + topbar and goes fullscreen; it doesn't touch the
+// content width or your other layout toggles.
+export const [focusMode, setFocusMode] = createSignal(false);
+
+const DIM_KEY = "logseq-claude.dim";
+export const [dimInactiveBlocks, setDimInactiveBlocks] = createSignal(loadStr(DIM_KEY) === "1");
+export function toggleDimInactiveBlocks() {
+  const v = !dimInactiveBlocks();
+  setDimInactiveBlocks(v);
+  saveStr(DIM_KEY, v ? "1" : null);
+}
+
+// Remember the window's pre-focus fullscreen state so exiting focus restores it
+// (rather than always dropping out of fullscreen if the user was already in it).
+let preFocusFullscreen = false;
+async function appWindow() {
+  const { getCurrentWindow } = await import("@tauri-apps/api/window");
+  return getCurrentWindow();
+}
+export function toggleFocusMode() {
+  if (focusMode()) void exitFocusMode();
+  else void enterFocusMode();
+}
+export async function enterFocusMode() {
+  if (focusMode()) return;
+  setFocusMode(true);
+  if (!isTauri()) return;
+  try {
+    const w = await appWindow();
+    preFocusFullscreen = await w.isFullscreen();
+    if (!preFocusFullscreen) await w.setFullscreen(true);
+  } catch {
+    // ignore (window plugin unavailable)
+  }
+}
+export async function exitFocusMode() {
+  if (!focusMode()) return;
+  setFocusMode(false);
+  if (!isTauri()) return;
+  try {
+    if (!preFocusFullscreen) (await appWindow()).setFullscreen(false);
+  } catch {
+    // ignore
+  }
 }
 
 // Loaded graph metadata (root path, dirs, shortcut overrides), for Settings.

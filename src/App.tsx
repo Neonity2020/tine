@@ -32,7 +32,11 @@ import {
   shortcutOverrides,
   wideMode,
   documentMode,
+  focusMode,
+  dimInactiveBlocks,
+  exitFocusMode,
 } from "./ui";
+import { editingId } from "./store";
 
 export function App(): JSX.Element {
   onMount(async () => {
@@ -56,6 +60,10 @@ export function App(): JSX.Element {
         "sidebar-collapsed": !sidebarOpen(),
         "wide-mode": wideMode(),
         "document-mode": documentMode(),
+        "focus-mode": focusMode(),
+        // Dim only kicks in while a block is being edited — otherwise the whole
+        // page would sit faded. This gives the typewriter "spotlight the line".
+        "dim-mode": dimInactiveBlocks() && !!editingId(),
       }}
     >
       <Show when={sidebarOpen()}>
@@ -81,6 +89,11 @@ export function App(): JSX.Element {
         </div>
       </Show>
       <div class="main-container">
+        {/* In focus mode the topbar is hidden; this thin strip at the very top
+            reveals it on hover (CSS adjacency), so controls are reachable. */}
+        <Show when={focusMode()}>
+          <div class="topbar-hover-zone" />
+        </Show>
         <header class="topbar">
           <div class="topbar-left">
             <button
@@ -192,6 +205,13 @@ export function App(): JSX.Element {
             page={pdfTarget()!.page}
           />
         </div>
+      </Show>
+      <Show when={focusMode()}>
+        <button class="focus-exit" title="Exit focus (Esc)" onClick={() => void exitFocusMode()}>
+          <svg viewBox="0 0 24 24" class="nav-icon">
+            <path d="M6 6l12 12M18 6L6 18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
+          </svg>
+        </button>
       </Show>
       <QuickSwitcher />
       <ContextMenu />
