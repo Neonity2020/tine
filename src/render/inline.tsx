@@ -7,7 +7,7 @@ import katex from "katex";
 // mhchem extends KaTeX with \ce{…} chemistry support (registers globally on import).
 import "katex/contrib/mhchem";
 import { openPage, openPageInNewTab } from "../router";
-import { openPdf, openPageInSidebar, openPageContextMenu } from "../ui";
+import { openPdf, openPageInSidebar, openPageContextMenu, setLightbox } from "../ui";
 import { parseInline, type Seg } from "./parseInline";
 import { blockView } from "./block";
 import { backend } from "../backend";
@@ -123,6 +123,18 @@ function renderSeg(s: Seg, blockId?: string): JSX.Element {
       return <AssetImage url={s.url} alt={s.alt} width={s.width} height={s.height} />;
     case "footnote":
       return <sup class="footnote-ref">{s.id}</sup>;
+    case "iframe":
+      return (
+        <span class="embed-iframe-wrap" style={{ ...(s.width ? { width: s.width } : {}), ...(s.height ? { "aspect-ratio": "auto", height: s.height } : {}) }}>
+          <iframe
+            class="embed-iframe"
+            src={s.src}
+            sandbox="allow-scripts allow-same-origin allow-popups allow-forms"
+            referrerpolicy="no-referrer"
+            title="embed"
+          />
+        </span>
+      );
   }
 }
 
@@ -174,7 +186,15 @@ function AssetImage(props: { url: string; alt: string; width?: string; height?: 
     ...(props.height ? { height: props.height } : {}),
   });
   if (/^(https?:|data:|blob:)/.test(props.url)) {
-    return <img class="inline-image" src={props.url} alt={props.alt} style={dim()} />;
+    return (
+      <img
+        class="inline-image"
+        src={props.url}
+        alt={props.alt}
+        style={dim()}
+        onClick={(e) => { e.stopPropagation(); setLightbox(props.url); }}
+      />
+    );
   }
   let objectUrl = "";
   const [src] = createResource(
@@ -200,7 +220,13 @@ function AssetImage(props: { url: string; alt: string; width?: string; height?: 
       when={src()}
       fallback={<span class="inline-image-missing">🖼 {props.alt || assetRelPath(props.url)}</span>}
     >
-      <img class="inline-image" src={src()!} alt={props.alt} style={dim()} />
+      <img
+        class="inline-image"
+        src={src()!}
+        alt={props.alt}
+        style={dim()}
+        onClick={(e) => { e.stopPropagation(); setLightbox(src()!); }}
+      />
     </Show>
   );
 }

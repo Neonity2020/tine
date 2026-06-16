@@ -357,6 +357,26 @@ export function closeSettings() {
   setSettingsOpen(false);
 }
 
+// Transient toast notifications (bottom-right), auto-dismissed.
+export interface Toast {
+  id: number;
+  message: string;
+  kind: "info" | "success" | "error";
+}
+let toastSeq = 0;
+export const [toasts, setToasts] = createSignal<Toast[]>([]);
+export function pushToast(message: string, kind: Toast["kind"] = "info") {
+  const id = ++toastSeq;
+  setToasts([...toasts(), { id, message, kind }]);
+  setTimeout(() => dismissToast(id), 3200);
+}
+export function dismissToast(id: number) {
+  setToasts(toasts().filter((t) => t.id !== id));
+}
+
+// Full-screen image lightbox (click an inline image to zoom).
+export const [lightbox, setLightbox] = createSignal<string | null>(null);
+
 export const [switcherOpen, setSwitcherOpen] = createSignal(false);
 // "all" = full Ctrl-K (pages/create/commands/blocks); "commands" = command
 // palette (⌘⇧P), commands only.

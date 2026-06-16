@@ -15,7 +15,8 @@ export type Seg =
   | { t: "math"; tex: string; display: boolean }
   | { t: "link"; label: string; url: string }
   | { t: "image"; alt: string; url: string; width?: string; height?: string }
-  | { t: "footnote"; id: string };
+  | { t: "footnote"; id: string }
+  | { t: "iframe"; src: string; width?: string; height?: string };
 
 /** Parse a Logseq image-metadata brace like `{:width 200, :height 100}`. */
 function parseImageMeta(brace: string | undefined): { width?: string; height?: string } {
@@ -69,6 +70,21 @@ export function parseInline(input: string): Seg[] {
       out.push({ t: "link", label: m[1], url: m[2] });
       i += m[0].length;
       continue;
+    }
+    // Raw <iframe> embed (the safe subset of raw HTML): only an http(s) src is
+    // honoured, rendered sandboxed. General raw HTML is not parsed.
+    m = /^<iframe\b([^>]*)>(?:\s*<\/iframe>)?/i.exec(rest);
+    if (m) {
+      const attrs = m[1];
+      const src = /src\s*=\s*["']([^"']+)["']/i.exec(attrs)?.[1];
+      if (src && /^https?:\/\//i.test(src)) {
+        const width = /width\s*=\s*["']?(\d+%?|\d+px)["']?/i.exec(attrs)?.[1];
+        const height = /height\s*=\s*["']?(\d+%?|\d+px)["']?/i.exec(attrs)?.[1];
+        flush();
+        out.push({ t: "iframe", src, width, height });
+        i += m[0].length;
+        continue;
+      }
     }
     // Angle autolink <https://…> / <mailto:…>
     m = /^<((?:https?:\/\/|mailto:)[^>\s]+)>/.exec(rest);

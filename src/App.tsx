@@ -5,6 +5,7 @@ import { QuickSwitcher } from "./components/QuickSwitcher";
 import { PdfViewer } from "./components/PdfViewer";
 import { TabBar } from "./components/TabBar";
 import { ContextMenu } from "./components/ContextMenu";
+import { Toasts, Lightbox } from "./components/Toasts";
 import { CalendarJump } from "./components/CalendarJump";
 import { ConflictBar } from "./components/ConflictBar";
 import { RightSidebar } from "./components/RightSidebar";
@@ -196,6 +197,8 @@ export function App(): JSX.Element {
       <ContextMenu />
       <DatePicker />
       <Settings />
+      <Toasts />
+      <Lightbox />
     </div>
   );
 }

@@ -1397,6 +1397,58 @@ mark {
   font-weight: 600;
 }
 
+/* ------------------------------------------------------------- toasts */
+.toast-stack {
+  position: fixed;
+  bottom: 18px;
+  right: 18px;
+  z-index: 200;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  pointer-events: none;
+}
+.toast {
+  pointer-events: auto;
+  min-width: 180px;
+  max-width: 360px;
+  padding: 9px 14px;
+  border-radius: 8px;
+  font-size: 13px;
+  color: #fff;
+  background: #334155;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.25);
+  cursor: pointer;
+  animation: toast-in 0.15s ease-out;
+}
+.toast-success { background: #15803d; }
+.toast-error { background: #b91c1c; }
+@keyframes toast-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* ------------------------------------------------------------- lightbox */
+.lightbox-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 210;
+  background: rgba(0, 0, 0, 0.8);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: zoom-out;
+}
+.lightbox-img {
+  max-width: 92vw;
+  max-height: 92vh;
+  border-radius: 6px;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
+}
+.inline-image {
+  cursor: zoom-in;
+}
+
 /* ------------------------------------------------------ block-ref preview */
 .block-ref {
   position: relative;

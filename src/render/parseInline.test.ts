@@ -67,6 +67,14 @@ describe("parseInline", () => {
     ]);
   });
 
+  it("sandboxed iframe embed (http src only)", () => {
+    expect(parseInline('<iframe src="https://example.com" width="320" height="200"></iframe>')).toEqual([
+      { t: "iframe", src: "https://example.com", width: "320", height: "200" },
+    ]);
+    // non-http src is not honoured (stays literal text-ish, no iframe seg)
+    expect(parseInline('<iframe src="javascript:alert(1)"></iframe>').some((s) => s.t === "iframe")).toBe(false);
+  });
+
   it("mixed line", () => {
     const segs = parseInline("see [[Page]] and **bold** #tag");
     expect(segs).toEqual([

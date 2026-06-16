@@ -7,6 +7,7 @@ import {
   openPageInSidebar,
   isFavorite,
   toggleFavorite,
+  pushToast,
 } from "../ui";
 import { openPage, openPageInNewTab, openJournals, route } from "../router";
 import { backend } from "../backend";
@@ -137,8 +138,11 @@ function PageMenu(props: {
     if (next && next !== props.name) {
       void backend()
         .renamePage(props.name, next)
-        .then(() => openPage(next, props.pageKind))
-        .catch(() => {});
+        .then(() => {
+          openPage(next, props.pageKind);
+          pushToast(`Renamed to “${next}”`, "success");
+        })
+        .catch(() => pushToast("Rename failed", "error"));
     }
   };
   const remove = () => {
@@ -148,15 +152,16 @@ function PageMenu(props: {
       .then(() => {
         const r = route();
         if (r.kind === "page" && r.name === props.name) openJournals();
+        pushToast(`Deleted “${props.name}”`, "success");
       })
-      .catch(() => {});
+      .catch(() => pushToast("Delete failed", "error"));
   };
   const items: { label: string; run: () => void; danger?: boolean }[] = [
     { label: "Open", run: () => openPage(props.name, props.pageKind) },
     { label: "Open in sidebar", run: () => openPageInSidebar(props.name, props.pageKind) },
     { label: "Open in new tab", run: () => openPageInNewTab(props.name, props.pageKind) },
     { label: fav() ? "Remove from favorites" : "Add to favorites", run: () => toggleFavorite(props.name, props.pageKind) },
-    { label: "Copy page ref", run: () => void backend().writeText(`[[${props.name}]]`) },
+    { label: "Copy page ref", run: () => { void backend().writeText(`[[${props.name}]]`); pushToast("Copied page ref", "success"); } },
     {
       label: "Copy page as Markdown",
       run: () =>
@@ -164,6 +169,7 @@ function PageMenu(props: {
           .getPage(props.name, props.pageKind)
           .then((p) => {
             if (p) backend().writeText(p.blocks.map((b) => dtoSubtreeMarkdown(b)).join("\n"));
+            pushToast("Copied page as Markdown", "success");
           }),
     },
     ...(props.pageKind === "page"
@@ -189,9 +195,9 @@ function blockActions(id: string): { label: string; run: () => void; danger?: bo
   return [
     { label: "Open in sidebar", run: () => openBlockInSidebar(blockRef(id)) },
     { label: "Zoom into block", run: () => zoomInto(id) },
-    { label: "Copy block ref", run: () => void backend().writeText(`((${ensureBlockId(id)}))`) },
-    { label: "Copy block embed", run: () => void backend().writeText(`{{embed ((${ensureBlockId(id)}))}}`) },
-    { label: "Copy block", run: () => void backend().writeText(blockSubtreeMarkdown(id)) },
+    { label: "Copy block ref", run: () => { void backend().writeText(`((${ensureBlockId(id)}))`); pushToast("Copied block ref", "success"); } },
+    { label: "Copy block embed", run: () => { void backend().writeText(`{{embed ((${ensureBlockId(id)}))}}`); pushToast("Copied block embed", "success"); } },
+    { label: "Copy block", run: () => { void backend().writeText(blockSubtreeMarkdown(id)); pushToast("Copied block", "success"); } },
     {
       label: "Cut block",
       run: () => {
