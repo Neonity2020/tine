@@ -1435,6 +1435,169 @@ mark {
   cursor: pointer;
 }
 
+/* ------------------------------------------------------ query builder bar */
+.qb-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 6px;
+  font-size: 12px;
+  margin-bottom: 8px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--border-color);
+}
+.qb-group {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 6px;
+}
+.qb-bracket {
+  color: var(--text-muted);
+  font-size: 16px;
+  line-height: 1;
+}
+.qb-op-not {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 6px;
+}
+.qb-op {
+  border: none;
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  padding: 2px 6px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.qb-op:hover {
+  color: var(--link-color);
+}
+.qb-chip-wrap,
+.qb-add-wrap {
+  position: relative;
+  display: inline-flex;
+}
+.qb-chip {
+  border: 1px solid var(--border-color);
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  padding: 2px 8px;
+  border-radius: 11px;
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.qb-chip:hover {
+  border-color: var(--link-color);
+}
+.qb-chip-raw {
+  font-family: var(--ls-font-mono);
+  color: var(--text-secondary);
+}
+.qb-add {
+  border: 1px dashed var(--border-color);
+  background: transparent;
+  color: var(--text-muted);
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0;
+}
+.qb-add:hover {
+  color: var(--link-color);
+  border-color: var(--link-color);
+}
+.qb-menu,
+.qb-picker {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: 60;
+  min-width: 180px;
+  max-height: 300px;
+  overflow-y: auto;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.18);
+  padding: 4px;
+  margin-top: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.qb-picker-title {
+  padding: 4px 8px;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.qb-menu-item {
+  text-align: left;
+  border: none;
+  background: transparent;
+  color: var(--text-primary);
+  padding: 5px 10px;
+  border-radius: 5px;
+  font-size: 13px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.qb-menu-item:hover {
+  background: var(--bg-tertiary);
+}
+.qb-value {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 2px;
+}
+.qb-input {
+  border: 1px solid var(--border-color);
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  border-radius: 5px;
+  padding: 4px 8px;
+  font-size: 13px;
+  margin-bottom: 2px;
+}
+.qb-input:focus {
+  outline: none;
+  border-color: var(--link-color);
+}
+.qb-check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.qb-commit {
+  margin-top: 4px;
+  border: 1px solid var(--border-color);
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  border-radius: 5px;
+  padding: 4px 8px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.qb-commit:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
 .query-table th {
   cursor: pointer;
   user-select: none;

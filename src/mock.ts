@@ -207,6 +207,24 @@ export function mockBackend(): Backend {
       }
       return [];
     },
+    async queryFacets(): Promise<[string, string[]][]> {
+      const map = new Map<string, Set<string>>();
+      const internal = new Set(["id", "collapsed"]);
+      const walk = (bs: BlockDto[]) =>
+        bs.forEach((b) => {
+          for (const line of b.raw.split("\n")) {
+            const m = /^([A-Za-z][\w-]*):: ?(.*)$/.exec(line.trim());
+            if (m && !internal.has(m[1])) {
+              const set = map.get(m[1]) ?? new Set<string>();
+              if (m[2].trim()) set.add(m[2].trim());
+              map.set(m[1], set);
+            }
+          }
+          walk(b.children);
+        });
+      all.forEach((p) => walk(p.blocks));
+      return [...map.entries()].map(([k, vs]) => [k, [...vs].sort()] as [string, string[]]);
+    },
     async search(query: string, limit: number): Promise<RefGroup[]> {
       const q = query.trim().toLowerCase();
       if (!q) return [];

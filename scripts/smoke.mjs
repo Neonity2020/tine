@@ -49,6 +49,22 @@ try {
   await page.locator(".query-collapse").first().click();
   await sleep(150);
 
+  // 2b) The query builder bar renders on the standalone query block, parsing the
+  //     existing DSL into chips, and the add-filter picker works end to end:
+  //     "+" -> pick "Scheduled" -> a new chip appears (the DSL was rewritten).
+  const qbBar = await page.locator(".qb-bar").count();
+  if (qbBar === 0) fail("query builder bar did not render");
+  const chipsBefore = await page.locator(".qb-bar .qb-chip").count();
+  if (chipsBefore === 0) fail("builder parsed no chips from the existing query DSL");
+  await page.locator(".qb-add").first().click();
+  await page.waitForSelector(".qb-picker", { timeout: 2000 });
+  await page.locator(".qb-picker .qb-menu-item", { hasText: "Scheduled" }).first().click();
+  await sleep(250);
+  const chipsAfter = await page.locator(".qb-bar .qb-chip").count();
+  if (chipsAfter <= chipsBefore) fail(`add-filter did not add a chip (${chipsBefore} -> ${chipsAfter})`);
+  const hasScheduled = await page.locator(".qb-bar .qb-chip", { hasText: "scheduled" }).count();
+  if (hasScheduled === 0) fail("the added 'scheduled' chip is not present");
+
   // 3) Shift-click a bullet opens that block LIVE in the right sidebar — i.e.
   //    the editable <Block> (with a .block-content-wrapper + collapse toggle),
   //    NOT the old read-only .ref-block snapshot. That structural difference is
@@ -72,7 +88,7 @@ try {
     console.error("SMOKE FAIL: console/page errors:\n" + errors.join("\n"));
     process.exit(1);
   }
-  console.log(`SMOKE OK: feed=${blocks} blocks, query rendered+collapsible, sidebar renders live editable <Block>`);
+  console.log(`SMOKE OK: feed=${blocks} blocks, query rendered+collapsible, builder bar add-filter works, sidebar renders live editable <Block>`);
   process.exit(0);
 } catch (e) {
   fail(String(e));

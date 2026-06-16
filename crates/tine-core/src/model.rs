@@ -365,6 +365,13 @@ impl Graph {
         crate::query::resolve_block(self, uuid)
     }
 
+    /// Property keys (with their distinct values) used across the graph, for the
+    /// query builder's property-filter autocomplete. Excludes internal/metadata
+    /// properties (id, collapsed, hl-*, …).
+    pub fn property_facets(&self) -> Vec<(String, Vec<String>)> {
+        crate::query::property_facets(self)
+    }
+
     // ---- Assets & PDF highlights ----
 
     pub fn assets_path(&self) -> PathBuf {

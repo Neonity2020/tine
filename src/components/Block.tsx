@@ -286,7 +286,7 @@ function Rendered(props: { id: string; owner?: string }): JSX.Element {
         <div class="block-content macro-host" onClick={onClick}>
           <Switch>
             <Match when={macro()!.kind === "query"}>
-              <QueryMacro body={macro()!.inner} />
+              <QueryMacro body={macro()!.inner} blockId={props.id} />
             </Match>
             <Match when={macro()!.kind === "embed"}>
               <EmbedMacro body={macro()!.inner} />

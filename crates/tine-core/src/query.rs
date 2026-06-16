@@ -189,6 +189,47 @@ fn template_dto(b: &DocBlock, strip_template: bool) -> BlockDto {
     }
 }
 
+/// Properties that are internal/metadata and shouldn't be offered as query
+/// filters (mirrors the frontend's hidden-property set).
+const INTERNAL_PROPS: &[&str] = &[
+    "id",
+    "collapsed",
+    "hl-page",
+    "hl-color",
+    "hl-type",
+    "ls-type",
+    "background-color",
+    "logseq.order-list-type",
+    "template",
+    "template-including-parent",
+];
+
+/// Distinct property keys (each with its sorted distinct values) used across the
+/// graph. Drives the query builder's property-filter pickers.
+pub fn property_facets(graph: &Graph) -> Vec<(String, Vec<String>)> {
+    use std::collections::BTreeMap;
+    use std::collections::BTreeSet;
+    graph.with_pages(|pages| {
+        let mut map: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for (_entry, doc) in pages {
+            walk(&doc.roots, &mut |b| {
+                for (k, v) in b.properties() {
+                    if INTERNAL_PROPS.iter().any(|p| p.eq_ignore_ascii_case(&k)) {
+                        continue;
+                    }
+                    let set = map.entry(k).or_default();
+                    if !v.trim().is_empty() {
+                        set.insert(v);
+                    }
+                }
+            });
+        }
+        map.into_iter()
+            .map(|(k, vs)| (k, vs.into_iter().collect()))
+            .collect()
+    })
+}
+
 /// Fuzzy page-name matcher for the quick switcher. Ranks prefix > substring >
 /// subsequence, then by name length.
 pub fn quick_switch(graph: &Graph, query: &str, limit: usize) -> Vec<PageEntry> {

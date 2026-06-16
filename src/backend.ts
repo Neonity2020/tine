@@ -20,6 +20,9 @@ export interface Backend {
   renamePage(old: string, next: string): Promise<void>;
   publishHtml(): Promise<[string, number]>;
   runQuery(query: string): Promise<RefGroup[]>;
+  /** Property keys (each with their distinct values) for query-builder
+   *  autocomplete. */
+  queryFacets(): Promise<[string, string[]][]>;
   search(query: string, limit: number): Promise<RefGroup[]>;
   quickSwitch(query: string, limit: number): Promise<PageEntry[]>;
   listTemplates(): Promise<TemplateDto[]>;
@@ -99,6 +102,9 @@ class TauriBackend implements Backend {
   }
   runQuery(query: string) {
     return this.call<RefGroup[]>("run_query", { query });
+  }
+  queryFacets() {
+    return this.call<[string, string[]][]>("query_facets");
   }
   search(query: string, limit: number) {
     return this.call<RefGroup[]>("search", { query, limit });
