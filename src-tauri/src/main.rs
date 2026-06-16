@@ -223,6 +223,24 @@ fn read_custom_css(state: State<'_, AppState>) -> Result<String, String> {
     with_graph(&state, |g| Ok(g.custom_css()))
 }
 
+/// Open a web/mail URL in the user's default external application. Scheme-gated
+/// to http(s)/mailto; the URL is passed as a single argument (no shell), so it
+/// can't inject commands.
+#[tauri::command]
+fn open_external(url: String) -> Result<(), String> {
+    if !(url.starts_with("http://") || url.starts_with("https://") || url.starts_with("mailto:")) {
+        return Err("unsupported url scheme".into());
+    }
+    #[cfg(target_os = "linux")]
+    let prog = "xdg-open";
+    #[cfg(target_os = "macos")]
+    let prog = "open";
+    #[cfg(target_os = "windows")]
+    let prog = "explorer";
+    std::process::Command::new(prog).arg(&url).spawn().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 #[tauri::command]
 fn search(query: String, limit: usize, state: State<'_, AppState>) -> Result<Vec<RefGroup>, String> {
     with_graph(&state, |g| Ok(g.search(&query, limit)))
@@ -285,13 +303,12 @@ fn write_highlights(
 }
 
 fn main() {
-    // WebKitGTK's DMABUF renderer aborts on some GPU/compositor combos
-    // ("Could not create default EGL display: EGL_BAD_PARAMETER"). We disable it
-    // by default for a reliable launch, but that uses software compositing
-    // (slower scrolling). Set TINE_GPU=1 to keep GPU/DMABUF rendering. Linux-only
-    // (no effect on the macOS/Windows webviews).
+    // GPU/DMABUF rendering is ON by default (smoother scrolling — that's the point
+    // of Tine). On the rare GPU/compositor combo where WebKitGTK's DMABUF renderer
+    // aborts ("Could not create default EGL display: EGL_BAD_PARAMETER"), set
+    // TINE_GPU=0 to fall back to software compositing. Linux-only.
     #[cfg(target_os = "linux")]
-    if std::env::var("TINE_GPU").as_deref() != Ok("1")
+    if std::env::var("TINE_GPU").as_deref() == Ok("0")
         && std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none()
     {
         std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
@@ -369,6 +386,7 @@ fn main() {
             run_query,
             query_facets,
             read_custom_css,
+            open_external,
             search,
             quick_switch,
             list_templates,

@@ -241,6 +241,13 @@ export function mockBackend(): Backend {
     async readCustomCss(): Promise<string> {
       return "";
     },
+    async openExternal(url: string): Promise<void> {
+      try {
+        window.open(url, "_blank", "noreferrer");
+      } catch {
+        // ignore
+      }
+    },
     async queryFacets(): Promise<[string, string[]][]> {
       const map = new Map<string, Set<string>>();
       const internal = new Set(["id", "collapsed"]);

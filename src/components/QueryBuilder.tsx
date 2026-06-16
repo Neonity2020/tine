@@ -138,6 +138,7 @@ function Chip(props: NodeCtx): JSX.Element {
       <button
         class="qb-chip"
         classList={{ "qb-chip-raw": props.clause.kind === "raw" }}
+        title="Click: delete / wrap in AND·OR·NOT (to exclude or nest)"
         onClick={(e) => {
           stop(e);
           props.setOpenMenu(props.openMenu() === key() ? null : key());

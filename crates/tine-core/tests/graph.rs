@@ -305,6 +305,27 @@ fn rename_page_moves_file_and_updates_refs() {
 }
 
 #[test]
+fn query_and_not_includes_everything_except_excluded() {
+    // (and (task TODO) (not [[X]])) must return ALL TODO blocks that don't
+    // reference [[X]] — regression for "NOT excludes right but drops others".
+    let root = std::env::temp_dir().join(format!("tine-not-test-{}", std::process::id()));
+    std::fs::create_dir_all(root.join("pages")).unwrap();
+    std::fs::write(root.join("pages").join("P.md"),
+        "- TODO alpha\n- TODO beta [[X]]\n- TODO gamma\n- DONE delta\n").unwrap();
+    let g = Graph::open(&root);
+    let raws: Vec<String> = g
+        .run_query("(and (task TODO) (not [[X]]))")
+        .iter()
+        .flat_map(|gr| gr.blocks.iter().map(|b| b.raw.clone()))
+        .collect();
+    assert!(raws.iter().any(|r| r.contains("alpha")), "{raws:?}");
+    assert!(raws.iter().any(|r| r.contains("gamma")), "{raws:?}");
+    assert!(!raws.iter().any(|r| r.contains("beta")), "X-referencing excluded: {raws:?}");
+    assert!(!raws.iter().any(|r| r.contains("delta")), "non-TODO excluded: {raws:?}");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
 fn query_open_tasks() {
     let g = demo_graph();
     let groups = g.run_query("(task TODO DOING)");

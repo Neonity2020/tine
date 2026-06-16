@@ -25,6 +25,8 @@ export interface Backend {
   queryFacets(): Promise<[string, string[]][]>;
   /** The graph's logseq/custom.css (empty string if none). */
   readCustomCss(): Promise<string>;
+  /** Open an http(s)/mailto URL in the OS default app. */
+  openExternal(url: string): Promise<void>;
   search(query: string, limit: number): Promise<RefGroup[]>;
   quickSwitch(query: string, limit: number): Promise<PageEntry[]>;
   listTemplates(): Promise<TemplateDto[]>;
@@ -110,6 +112,9 @@ class TauriBackend implements Backend {
   }
   readCustomCss() {
     return this.call<string>("read_custom_css");
+  }
+  openExternal(url: string) {
+    return this.call<void>("open_external", { url });
   }
   search(query: string, limit: number) {
     return this.call<RefGroup[]>("search", { query, limit });

@@ -114,7 +114,17 @@ function renderSeg(s: Seg, blockId?: string): JSX.Element {
         );
       }
       return (
-        <a class="external-link" href={s.url} target="_blank" rel="noreferrer">
+        <a
+          class="external-link"
+          href={s.url}
+          onClick={(e) => {
+            // Open externally; don't navigate the webview or fall through to the
+            // row's click-to-edit.
+            e.preventDefault();
+            e.stopPropagation();
+            void backend().openExternal(s.url);
+          }}
+        >
           {s.label || s.url}
         </a>
       );
