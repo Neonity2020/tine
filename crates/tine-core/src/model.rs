@@ -90,6 +90,10 @@ pub struct GraphMeta {
     /// "now" (LATER/NOW) or "todo" (TODO/DOING) — drives the task cycle.
     pub preferred_workflow: String,
     pub shortcuts: std::collections::HashMap<String, String>,
+    /// First day of week for the date picker (0=Sunday … 6=Saturday).
+    pub start_of_week: u32,
+    /// Extra property keys to hide from the rendered properties area.
+    pub block_hidden_properties: Vec<String>,
 }
 
 impl Graph {
@@ -112,6 +116,8 @@ impl Graph {
                 crate::config::Workflow::Now => "now".into(),
             },
             shortcuts: self.config.shortcuts.clone(),
+            start_of_week: self.config.start_of_week,
+            block_hidden_properties: self.config.block_hidden_properties.clone(),
         }
     }
 

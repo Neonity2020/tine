@@ -40,6 +40,8 @@ export interface GraphMeta {
   pages_dir: string;
   preferred_workflow: string; // "now" | "todo"
   shortcuts: Record<string, string>;
+  start_of_week: number; // 0=Sunday … 6=Saturday
+  block_hidden_properties: string[];
 }
 
 export interface Rect {

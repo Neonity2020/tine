@@ -179,6 +179,8 @@ export function mockBackend(): Backend {
         pages_dir: "pages",
         preferred_workflow: "todo",
         shortcuts: {},
+        start_of_week: 0,
+        block_hidden_properties: [],
       };
     },
     async listPages(): Promise<PageEntry[]> {

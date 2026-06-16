@@ -15,6 +15,11 @@ pub struct Config {
     /// `:publishing/all-pages-public?` — when true, HTML export publishes every
     /// page; otherwise only pages with `public:: true`.
     pub all_pages_public: bool,
+    /// `:start-of-week` — first day of the week in the date picker, 0=Sunday … 6=Saturday.
+    pub start_of_week: u32,
+    /// `:block-hidden-properties #{:a :b}` — extra property keys to hide from the
+    /// rendered properties area, on top of the built-in internal set.
+    pub block_hidden_properties: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +38,8 @@ impl Default for Config {
             preferred_workflow: Workflow::Now,
             shortcuts: HashMap::new(),
             all_pages_public: false,
+            start_of_week: 0,
+            block_hidden_properties: Vec::new(),
         }
     }
 }
@@ -67,8 +74,35 @@ impl Config {
             let after = edn[i + ":publishing/all-pages-public?".len()..].trim_start();
             cfg.all_pages_public = after.starts_with("true");
         }
+        if let Some(n) = int_value(edn, ":start-of-week") {
+            if n <= 6 {
+                cfg.start_of_week = n;
+            }
+        }
+        cfg.block_hidden_properties = parse_keyword_set(edn, ":block-hidden-properties");
         cfg
     }
+}
+
+/// Extract the integer following `key`, if any.
+fn int_value(edn: &str, key: &str) -> Option<u32> {
+    let rest = edn[edn.find(key)? + key.len()..].trim_start();
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
+/// Parse `key #{:a :b}` (an EDN keyword set) into bare keyword strings.
+fn parse_keyword_set(edn: &str, key: &str) -> Vec<String> {
+    let Some(i) = edn.find(key) else { return Vec::new() };
+    let after = &edn[i + key.len()..];
+    let Some(open) = after.find('{') else { return Vec::new() };
+    let body = &after[open + 1..];
+    let Some(close) = body.find('}') else { return Vec::new() };
+    body[..close]
+        .split_whitespace()
+        .filter_map(|t| t.strip_prefix(':'))
+        .map(|t| t.to_string())
+        .collect()
 }
 
 /// Extract the `:shortcuts {...}` map as command-id -> binding (string values).
@@ -97,11 +131,28 @@ fn parse_shortcuts(edn: &str) -> HashMap<String, String> {
             while k < inner.len() && bytes[k].is_ascii_whitespace() {
                 k += 1;
             }
+            // Value forms: "binding" | false (disable) | ["b1" "b2"] (first wins).
             if k < inner.len() && bytes[k] == b'"' {
                 let vstart = k + 1;
                 if let Some(rel) = inner[vstart..].find('"') {
                     map.insert(key.to_string(), inner[vstart..vstart + rel].to_string());
                     i = vstart + rel + 1;
+                    continue;
+                }
+            } else if inner[k..].starts_with("false") {
+                map.insert(key.to_string(), "false".to_string());
+                i = k + "false".len();
+                continue;
+            } else if k < inner.len() && bytes[k] == b'[' {
+                // Take the first quoted binding inside the vector.
+                if let Some(close) = inner[k..].find(']') {
+                    let vec_body = &inner[k + 1..k + close];
+                    if let Some(qs) = vec_body.find('"') {
+                        if let Some(qe) = vec_body[qs + 1..].find('"') {
+                            map.insert(key.to_string(), vec_body[qs + 1..qs + 1 + qe].to_string());
+                        }
+                    }
+                    i = k + close + 1;
                     continue;
                 }
             }
@@ -131,6 +182,24 @@ mod tests {
     fn no_shortcuts_section_is_empty() {
         let cfg = Config::parse(r#"{:preferred-format "Markdown"}"#);
         assert!(cfg.shortcuts.is_empty());
+    }
+
+    #[test]
+    fn shortcut_false_and_vector_forms() {
+        let edn = r#"{:shortcuts {:go/search false
+                                  :editor/indent ["tab" "mod+]"]}}"#;
+        let cfg = Config::parse(edn);
+        assert_eq!(cfg.shortcuts.get("go/search").map(String::as_str), Some("false"));
+        assert_eq!(cfg.shortcuts.get("editor/indent").map(String::as_str), Some("tab"));
+    }
+
+    #[test]
+    fn start_of_week_and_hidden_properties() {
+        let edn = r#"{:start-of-week 1
+                      :block-hidden-properties #{:public :icon}}"#;
+        let cfg = Config::parse(edn);
+        assert_eq!(cfg.start_of_week, 1);
+        assert_eq!(cfg.block_hidden_properties, vec!["public".to_string(), "icon".to_string()]);
     }
 }
 

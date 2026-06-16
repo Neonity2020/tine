@@ -1,12 +1,18 @@
 import { For, Show, createMemo, createSignal, type JSX } from "solid-js";
-import { datePicker, closeDatePicker } from "../ui";
+import { datePicker, closeDatePicker, graphMeta } from "../ui";
 import { readSchedule, setSchedule } from "../store";
 
 const MONTHS = [
   "January", "February", "March", "April", "May", "June",
   "July", "August", "September", "October", "November", "December",
 ];
-const DOW = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"];
+const DOW_BASE = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"];
+// First day of week from config.edn :start-of-week (0=Sunday … 6=Saturday).
+const startOfWeek = () => {
+  const n = graphMeta()?.start_of_week ?? 0;
+  return n >= 0 && n <= 6 ? n : 0;
+};
+const DOW = () => DOW_BASE.slice(startOfWeek()).concat(DOW_BASE.slice(0, startOfWeek()));
 
 // Calendar popup for SCHEDULED / DEADLINE. Writes `<yyyy-MM-dd EEE>` via the
 // store; opening on an existing date pre-fills the shown month + selection.
@@ -29,7 +35,8 @@ function Picker(props: { bid: string; which: "scheduled" | "deadline"; x: number
   // Days laid out in weeks (leading blanks for the first-of-month offset).
   const grid = createMemo(() => {
     const { y, m } = view();
-    const first = new Date(y, m, 1).getDay();
+    // Leading blanks measured from the configured first day of week.
+    const first = (new Date(y, m, 1).getDay() - startOfWeek() + 7) % 7;
     const days = new Date(y, m + 1, 0).getDate();
     const cells: (number | null)[] = [];
     for (let i = 0; i < first; i++) cells.push(null);
@@ -72,7 +79,7 @@ function Picker(props: { bid: string; which: "scheduled" | "deadline"; x: number
           <button class="dp-nav" onClick={() => step(1)} title="Next month">›</button>
         </div>
         <div class="dp-grid dp-dow">
-          <For each={DOW}>{(d) => <span class="dp-dowcell">{d}</span>}</For>
+          <For each={DOW()}>{(d) => <span class="dp-dowcell">{d}</span>}</For>
         </div>
         <div class="dp-grid">
           <For each={grid()}>

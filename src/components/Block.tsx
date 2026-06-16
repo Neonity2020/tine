@@ -50,7 +50,7 @@ import { blockView, isPropertyLine } from "../render/block";
 import { InlineText } from "../render/inline";
 import { BodyContent } from "../render/body";
 import { QueryMacro, EmbedMacro } from "./Macro";
-import { openPdf, workflow, zoomInto, openContextMenu, openDatePicker, openBlockInSidebar } from "../ui";
+import { openPdf, workflow, zoomInto, openContextMenu, openDatePicker, openBlockInSidebar, graphMeta } from "../ui";
 import { matchesCommand } from "../keybindings";
 import { HL_COLOR_BG, HL_COLOR_SOLID } from "../pdf";
 import { cycleMarkerSmart } from "../editor/repeat";
@@ -269,7 +269,10 @@ function Rendered(props: { id: string; owner?: string }): JSX.Element {
     startEditing(props.id, node().raw.length, props.owner ?? null);
   };
 
-  const displayProps = () => view().properties.filter(([k]) => !INTERNAL_PROPS.has(k));
+  const displayProps = () => {
+    const extra = graphMeta()?.block_hidden_properties ?? [];
+    return view().properties.filter(([k]) => !INTERNAL_PROPS.has(k) && !extra.includes(k));
+  };
   const bgColor = () => {
     const v = view().properties.find(([k]) => k === "background-color")?.[1];
     return v ? BLOCK_BG[v] ?? v : undefined;
