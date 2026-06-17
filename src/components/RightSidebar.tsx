@@ -1,4 +1,4 @@
-import { For, Show, createResource, type JSX } from "solid-js";
+import { For, Show, createEffect, type JSX } from "solid-js";
 import {
   rightSidebar,
   rightSidebarOpen,
@@ -66,23 +66,27 @@ export function RightSidebar(): JSX.Element {
   );
 }
 
-// Load the item's page into the working set; returns a signal that flips true
-// once the page (and thus the live nodes) are available.
-function useLoadedPage(name: () => string, kind: () => "journal" | "page") {
-  // Key on graphEpoch so this re-runs once the graph is open: a restored
-  // sidebar mounts before loadGraphPath finishes, so the first attempt can hit
-  // a not-yet-open graph; bumping the epoch retries it.
-  const [ready] = createResource(
-    () => ({ n: name(), k: kind(), e: graphEpoch() }),
-    async ({ n, k }) => {
-      if (!pageByName(n)) {
-        const dto = await backend().getPage(n, k);
-        if (dto) ensurePageLoaded(dto);
-      }
-      return true;
+// Ensure the item's page is loaded into the working set. Fire-and-forget side
+// effect (NOT a resource whose error state could gate rendering): the body
+// renders off actual store presence, so a failed early attempt is harmless.
+// Re-runs on graphEpoch so a sidebar restored *before* the graph is open
+// retries once it opens.
+function useEnsurePage(name: () => string, kind: () => "journal" | "page") {
+  createEffect(() => {
+    graphEpoch();
+    const n = name();
+    const k = kind();
+    if (n && !pageByName(n)) {
+      void backend()
+        .getPage(n, k)
+        .then((dto) => {
+          if (dto) ensurePageLoaded(dto);
+        })
+        .catch(() => {
+          // graph not open yet / page missing — retried on graphEpoch.
+        });
     }
-  );
-  return ready;
+  });
 }
 
 function SidebarItemView(props: { item: SidebarItem; onClose: () => void }): JSX.Element {
@@ -100,7 +104,7 @@ function PageItem(props: {
   item: { name: string; pageKind: "journal" | "page" };
   onClose: () => void;
 }): JSX.Element {
-  const ready = useLoadedPage(() => props.item.name, () => props.item.pageKind);
+  useEnsurePage(() => props.item.name, () => props.item.pageKind);
   const page = () => pageByName(props.item.name);
   return (
     <div class="rs-item">
@@ -112,7 +116,7 @@ function PageItem(props: {
           ✕
         </button>
       </div>
-      <Show when={ready() && page()}>
+      <Show when={page()} fallback={<div class="rs-item-body rs-item-loading" />}>
         <div class="rs-item-body">
           <For each={page()!.roots}>{(id) => <Block id={id} />}</For>
         </div>
@@ -125,7 +129,7 @@ function BlockItem(props: {
   item: { uuid: string; page: string; pageKind: "journal" | "page" };
   onClose: () => void;
 }): JSX.Element {
-  const ready = useLoadedPage(() => props.item.page, () => props.item.pageKind);
+  useEnsurePage(() => props.item.page, () => props.item.pageKind);
   // Resolve by store key first; fall back to finding the loaded node whose
   // persisted id:: matches (the in-memory key can differ from the id:: it was
   // parked under). Returns the live store node so edits stay propagated.
@@ -135,6 +139,7 @@ function BlockItem(props: {
     const re = new RegExp(`(?:^|\\n)id:: *${props.item.uuid}(?:\\s|$)`);
     return Object.values(doc.byId).find((n) => n.page === props.item.page && re.test(n.raw));
   };
+  const pageLoaded = () => !!pageByName(props.item.page);
   const title = () => {
     const n = node();
     return n ? blockView(n.raw).lines[0] || props.item.page : props.item.page;
@@ -153,17 +158,22 @@ function BlockItem(props: {
           ✕
         </button>
       </div>
-      <Show when={ready()} fallback={<div class="rs-item-body rs-item-loading" />}>
-        <Show
-          when={node()}
-          fallback={<div class="rs-item-body rs-item-missing">This block is no longer available.</div>}
-        >
-          {(n) => (
-            <div class="rs-item-body">
-              <Block id={n().id} />
-            </div>
-          )}
-        </Show>
+      <Show
+        when={node()}
+        fallback={
+          <Show
+            when={pageLoaded()}
+            fallback={<div class="rs-item-body rs-item-loading" />}
+          >
+            <div class="rs-item-body rs-item-missing">This block is no longer available.</div>
+          </Show>
+        }
+      >
+        {(n) => (
+          <div class="rs-item-body">
+            <Block id={n().id} />
+          </div>
+        )}
       </Show>
     </div>
   );
