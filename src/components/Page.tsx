@@ -353,6 +353,7 @@ function PageSection(props: { page: FeedPage }): JSX.Element {
             {props.page.title}
           </h1>
         </Show>
+        <CarryActions page={props.page} />
         <button
           class="fav-star"
           classList={{ active: isFavorite(props.page.name) }}
@@ -370,7 +371,6 @@ function PageSection(props: { page: FeedPage }): JSX.Element {
           </svg>
         </button>
       </div>
-      <CarryActions page={props.page} />
       <Show when={props.page.preBlock}>
         <div class="page-properties">
           <For each={props.page.preBlock!.split("\n").filter(isPropertyLine)}>

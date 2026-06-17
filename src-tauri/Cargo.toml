@@ -7,6 +7,14 @@ license.workspace = true
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+# `custom-protocol` switches the app from dev mode (load the frontend from the
+# Vite dev server at devUrl) to prod mode (serve the embedded `dist/` over the
+# tauri:// protocol). The Tauri CLI enables this on `tauri build`; a bare
+# `cargo build --release` does NOT — so release binaries MUST be built with
+# `--features custom-protocol`, else they show "Could not connect to localhost".
+[features]
+custom-protocol = ["tauri/custom-protocol"]
+
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-clipboard-manager = "2"
