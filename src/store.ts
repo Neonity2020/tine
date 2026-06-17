@@ -674,7 +674,9 @@ export function ensureStableBlockId(id: string): void {
   if (!UUID_RE.test(id)) return;
   setDoc("byId", id, "raw", `${node.raw}\nid:: ${id}`);
   markDirty(node.page);
-  scheduleSave();
+  // Persist now, not on the 400ms debounce: the user may quit right after
+  // parking the block, and a pending timer is lost when the webview closes.
+  void flushPage(node.page);
 }
 
 /** Like `blockRef`, but first persists the block's `id::` so the reference
@@ -1014,6 +1016,22 @@ export function scheduleSave() {
       if (saved) scheduleDataRev();
     })();
   }, 400);
+}
+
+/** Save one page immediately, bypassing the debounce — for actions that must
+ *  durably persist before the user might quit (e.g. parking a block in the
+ *  sidebar writes an id:: that has to survive a restart). */
+export async function flushPage(name: string): Promise<void> {
+  if (!doc.loaded || isConflicted(name)) return;
+  dirty.delete(name);
+  const dto = pageToDto(name);
+  if (!dto) return;
+  try {
+    await backend().savePage(dto);
+    scheduleDataRev();
+  } catch (e) {
+    if (String(e).includes("conflict")) markConflict(name);
+  }
 }
 
 /** Resolve a save conflict by overwriting the on-disk file with the in-memory

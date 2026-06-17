@@ -122,8 +122,19 @@ function BlockItem(props: {
   onClose: () => void;
 }): JSX.Element {
   const ready = useLoadedPage(() => props.item.page, () => props.item.pageKind);
-  const node = () => doc.byId[props.item.uuid];
-  const title = () => (node() ? blockView(node().raw).lines[0] || props.item.page : props.item.page);
+  // Resolve by store key first; fall back to finding the loaded node whose
+  // persisted id:: matches (the in-memory key can differ from the id:: it was
+  // parked under). Returns the live store node so edits stay propagated.
+  const node = () => {
+    const direct = doc.byId[props.item.uuid];
+    if (direct) return direct;
+    const re = new RegExp(`(?:^|\\n)id:: *${props.item.uuid}(?:\\s|$)`);
+    return Object.values(doc.byId).find((n) => n.page === props.item.page && re.test(n.raw));
+  };
+  const title = () => {
+    const n = node();
+    return n ? blockView(n.raw).lines[0] || props.item.page : props.item.page;
+  };
   return (
     <div class="rs-item">
       <div class="rs-item-head">
@@ -143,9 +154,11 @@ function BlockItem(props: {
           when={node()}
           fallback={<div class="rs-item-body rs-item-missing">This block is no longer available.</div>}
         >
-          <div class="rs-item-body">
-            <Block id={props.item.uuid} />
-          </div>
+          {(n) => (
+            <div class="rs-item-body">
+              <Block id={n().id} />
+            </div>
+          )}
         </Show>
       </Show>
     </div>

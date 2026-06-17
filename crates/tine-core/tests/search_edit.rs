@@ -83,3 +83,30 @@ fn journal_content_days_distinguishes_empty() {
     assert!(!days.contains(&20260614), "props-only day absent");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn frontend_added_id_survives_reload_and_resolves() {
+    let root = mk("idpersist");
+    std::fs::write(root.join("pages").join("TODOs.md"), "- {{query (task TODO)}}\n").unwrap();
+    let g = Graph::open(&root);
+    g.warm_cache();
+
+    // Simulate the frontend save: load the page, append `id:: <uuid>` to the
+    // query block's raw (what ensureStableBlockId does), save back.
+    let mut dto = g.load_named("TODOs", PageKind::Page).unwrap().unwrap();
+    let uuid = dto.blocks[0].id.clone();
+    eprintln!("store uuid = {uuid}");
+    dto.blocks[0].raw = format!("{}\nid:: {}", dto.blocks[0].raw, uuid);
+    g.save_page(&dto).expect("save");
+
+    eprintln!("--- file on disk ---\n{}", std::fs::read_to_string(root.join("pages").join("TODOs.md")).unwrap());
+
+    // Reopen from scratch (fresh process would do this).
+    let g2 = Graph::open(&root);
+    g2.warm_cache();
+    let dto2 = g2.load_named("TODOs", PageKind::Page).unwrap().unwrap();
+    eprintln!("reloaded uuid = {}", dto2.blocks[0].id);
+    assert_eq!(dto2.blocks[0].id, uuid, "block uuid stable across reload via id::");
+    assert!(g2.resolve_block(&uuid).is_some(), "resolve_block finds it by id::");
+    let _ = std::fs::remove_dir_all(&root);
+}
