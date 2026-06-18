@@ -1,7 +1,14 @@
-// Parse pasted text into an outline tree (for paste-as-blocks). Mirrors the
-// Rust block parser: `- ` bullets, indentation = nesting (tabs or spaces),
-// continuation lines join into the block. Plain multiline text with no bullets
-// becomes a flat list of blocks.
+// Parse pasted text into an outline tree (paste-as-blocks). Handles both a
+// Logseq outline (every line a `- ` bullet, indentation = nesting, continuation
+// lines indented to the bullet's content column) AND arbitrary markdown / plain
+// text where headings, paragraphs and `- ` list items are intermixed.
+//
+// The guiding rule is LOSSLESS: every non-blank line ends up in some block,
+// never silently dropped or merged into an unrelated one. A non-bullet line is
+// treated as a *continuation* of the preceding bullet only when it is indented
+// to at least that bullet's content column with no blank line in between
+// (matching how Logseq writes multi-line block bodies); otherwise it becomes
+// its own block at its own indentation depth.
 
 export interface OutlineNode {
   raw: string;
@@ -28,31 +35,53 @@ function stripWs(line: string, n: number): string {
   return line.slice(i);
 }
 
+interface Frame {
+  col: number; // indentation of this node's marker / first char
+  contentStart: number; // column a continuation line must reach to join this node
+  kind: "bullet" | "block";
+  node: OutlineNode;
+}
+
 export function parseOutline(text: string): OutlineNode[] {
   const lines = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
-
-  // No bullets at all -> each non-empty line is its own flat block.
-  if (!lines.some((l) => bullet(l))) {
-    return lines
-      .map((l) => l.trim())
-      .filter((l) => l.length > 0)
-      .map((l) => ({ raw: l, children: [] }));
-  }
-
   const roots: OutlineNode[] = [];
-  const stack: { col: number; contentStart: number; node: OutlineNode }[] = [];
+  const stack: Frame[] = [];
+  let sawBlank = false;
+
+  // Attach `node` at indentation `col`: pop deeper/equal frames, then nest under
+  // the remaining top (or make it a root).
+  const place = (col: number, node: OutlineNode) => {
+    while (stack.length && stack[stack.length - 1].col >= col) stack.pop();
+    if (stack.length) stack[stack.length - 1].node.children.push(node);
+    else roots.push(node);
+  };
+
   for (const line of lines) {
     const b = bullet(line);
     if (b) {
-      while (stack.length && stack[stack.length - 1].col >= b.col) stack.pop();
       const node: OutlineNode = { raw: b.content, children: [] };
-      if (stack.length) stack[stack.length - 1].node.children.push(node);
-      else roots.push(node);
-      stack.push({ col: b.col, contentStart: b.col + 2, node });
-    } else if (stack.length && line.trim().length > 0) {
-      const top = stack[stack.length - 1];
-      top.node.raw += "\n" + stripWs(line, top.contentStart);
+      place(b.col, node);
+      stack.push({ col: b.col, contentStart: b.col + 2, kind: "bullet", node });
+      sawBlank = false;
+      continue;
     }
+    if (line.trim().length === 0) {
+      sawBlank = true;
+      continue;
+    }
+    const indent = leadingWs(line);
+    const top = stack.length ? stack[stack.length - 1] : null;
+    // Continuation of the current bullet: indented into its body, no blank gap.
+    if (top && top.kind === "bullet" && !sawBlank && indent >= top.contentStart) {
+      top.node.raw += "\n" + stripWs(line, top.contentStart);
+      continue;
+    }
+    // Otherwise its own block (heading / paragraph line / loose text). Like a
+    // flat plain-text paste, a block never absorbs the lines that follow it.
+    const node: OutlineNode = { raw: line.trim(), children: [] };
+    place(indent, node);
+    stack.push({ col: indent, contentStart: indent, kind: "block", node });
+    sawBlank = false;
   }
   return roots;
 }

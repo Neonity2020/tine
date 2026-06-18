@@ -37,4 +37,59 @@ describe("parseOutline", () => {
       { raw: "a", children: [{ raw: "b", children: [{ raw: "c", children: [] }] }] },
     ]);
   });
+
+  it("keeps a bullet's indented continuation lines in the same block", () => {
+    const text = "- first line\n  second line\n- next";
+    expect(parseOutline(text)).toEqual([
+      { raw: "first line\nsecond line", children: [] },
+      { raw: "next", children: [] },
+    ]);
+  });
+
+  it("does NOT drop headings/paragraphs that sit before or between bullets", () => {
+    // Markdown with headings + paragraphs + a `- ` list, intermixed. Regression
+    // for the paste bug where pre-bullet content was dropped and post-bullet
+    // content was swallowed into the last bullet as a continuation.
+    const text = [
+      "# Summary",
+      "",
+      "The paper studies shortest-path network design.",
+      "",
+      "## Strengths",
+      "",
+      "- the paper is well written",
+      "- it studies a relevant problem",
+      "",
+      "## Weaknesses",
+      "",
+      "I would be in favor of accepting.",
+      "",
+      "The ILP is solved by branch-and-price.",
+    ].join("\n");
+    expect(parseOutline(text)).toEqual([
+      { raw: "# Summary", children: [] },
+      { raw: "The paper studies shortest-path network design.", children: [] },
+      { raw: "## Strengths", children: [] },
+      { raw: "the paper is well written", children: [] },
+      { raw: "it studies a relevant problem", children: [] },
+      { raw: "## Weaknesses", children: [] },
+      { raw: "I would be in favor of accepting.", children: [] },
+      { raw: "The ILP is solved by branch-and-price.", children: [] },
+    ]);
+  });
+
+  it("is lossless: every non-blank source line survives somewhere", () => {
+    const text =
+      "# Summary\n\npara one\n\n- bullet a\n- bullet b\n\n## Weaknesses\n\npara two\n";
+    const flatten = (ns: ReturnType<typeof parseOutline>): string[] =>
+      ns.flatMap((n) => [...n.raw.split("\n"), ...flatten(n.children)]);
+    const got = flatten(parseOutline(text))
+      .map((l) => l.trim())
+      .filter((l) => l.length > 0);
+    const want = text
+      .split("\n")
+      .map((l) => l.replace(/^- /, "").trim())
+      .filter((l) => l.length > 0);
+    expect(got.sort()).toEqual(want.sort());
+  });
 });
