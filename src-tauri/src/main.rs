@@ -662,10 +662,11 @@ fn write_highlights(
     pdf: String,
     label: String,
     highlights: Vec<tine_core::pdf::Highlight>,
+    base_ids: Vec<String>,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     with_graph(&state, |g| {
-        g.write_highlights(&pdf, &label, &highlights).map_err(|e| e.to_string())
+        g.write_highlights(&pdf, &label, &highlights, &base_ids).map_err(|e| e.to_string())
     })
 }
 

@@ -52,7 +52,7 @@ export interface Backend {
   pickFile(): Promise<string | null>;
   writeText(text: string): Promise<void>;
   readHighlights(pdf: string): Promise<Highlight[]>;
-  writeHighlights(pdf: string, label: string, highlights: Highlight[]): Promise<void>;
+  writeHighlights(pdf: string, label: string, highlights: Highlight[], baseIds: string[]): Promise<void>;
   /** Subscribe to external file changes (file watcher). Returns an unsubscribe. */
   onGraphChanged(cb: (c: GraphChange) => void): Promise<() => void>;
   /** How many launch snapshots to keep. */
@@ -220,8 +220,8 @@ class TauriBackend implements Backend {
   readHighlights(pdf: string) {
     return this.call<Highlight[]>("read_highlights", { pdf });
   }
-  writeHighlights(pdf: string, label: string, highlights: Highlight[]) {
-    return this.call<void>("write_highlights", { pdf, label, highlights });
+  writeHighlights(pdf: string, label: string, highlights: Highlight[], baseIds: string[]) {
+    return this.call<void>("write_highlights", { pdf, label, highlights, baseIds });
   }
   async onGraphChanged(cb: (c: GraphChange) => void): Promise<() => void> {
     const { listen } = await import("@tauri-apps/api/event");

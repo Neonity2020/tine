@@ -784,24 +784,29 @@ impl Graph {
     }
 
     /// Persist highlights: write `assets/<key>.edn` and the `hls__<key>` page.
+    /// `base_ids` are the highlight ids the editor LOADED (its baseline) — used for
+    /// a 3-way merge so a highlight the user deleted is honored while one added
+    /// externally (e.g. by OG between load and write) is still preserved.
     pub fn write_highlights(
         &self,
         pdf_filename: &str,
         label: &str,
         highlights: &[crate::pdf::Highlight],
+        base_ids: &[String],
     ) -> io::Result<()> {
         let key = crate::pdf::asset_key(pdf_filename);
         fs::create_dir_all(self.assets_path())?;
         let edn_path = self.assets_path().join(format!("{key}.edn"));
-        // Merge with the current on-disk set by id before overwriting, so a
-        // highlight added externally (e.g. by OG between our load and this write)
-        // isn't dropped. The viewer only ADDS highlights, so a union is correct —
-        // our copy wins on a shared id, disk-only ids are kept.
+        // 3-way merge against the on-disk set: keep our current highlights, plus
+        // any disk highlight that is an EXTERNAL addition (id not in our baseline
+        // and not already present). A highlight we deliberately deleted (in the
+        // baseline, absent from current) is NOT resurrected.
         let have: std::collections::HashSet<&str> = highlights.iter().map(|h| h.id.as_str()).collect();
+        let base: std::collections::HashSet<&str> = base_ids.iter().map(|s| s.as_str()).collect();
         let mut merged: Vec<crate::pdf::Highlight> = highlights.to_vec();
         if let Ok(s) = fs::read_to_string(&edn_path) {
             for h in crate::pdf::parse_highlights(&s) {
-                if !have.contains(h.id.as_str()) {
+                if !have.contains(h.id.as_str()) && !base.contains(h.id.as_str()) {
                     merged.push(h);
                 }
             }

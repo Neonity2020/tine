@@ -368,7 +368,7 @@ export function mockBackend(): Backend {
     async readHighlights(pdf: string): Promise<Highlight[]> {
       return mockHighlights[pdf]?.highlights ?? [];
     },
-    async writeHighlights(pdf: string, label: string, highlights: Highlight[]): Promise<void> {
+    async writeHighlights(pdf: string, label: string, highlights: Highlight[], _baseIds: string[]): Promise<void> {
       mockHighlights[pdf] = { label, highlights };
     },
   };

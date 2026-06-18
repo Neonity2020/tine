@@ -184,18 +184,26 @@ fn write_highlights_preserves_externally_added_ones() {
             image: None,
         }
     };
-    // Tine writes H1.
-    g.write_highlights("paper.pdf", "Paper", &[mk_hl("H1", "one")]).unwrap();
+    let ids = |g: &Graph| -> std::collections::HashSet<String> {
+        g.read_highlights("paper.pdf").into_iter().map(|h| h.id).collect()
+    };
+    // Tine writes H1 (no baseline yet).
+    g.write_highlights("paper.pdf", "Paper", &[mk_hl("H1", "one")], &[]).unwrap();
     // An external editor (OG) adds H2 to the same EDN.
     let edn_path = root.join("assets").join(format!("{}.edn", tine_core::pdf::asset_key("paper.pdf")));
     let mut both = tine_core::pdf::parse_highlights(&std::fs::read_to_string(&edn_path).unwrap());
     both.push(mk_hl("H2", "two"));
     std::fs::write(&edn_path, tine_core::pdf::write_highlights(&both)).unwrap();
-    // Tine, still only knowing H1, adds H3 and writes — H2 must NOT be dropped.
-    g.write_highlights("paper.pdf", "Paper", &[mk_hl("H1", "one"), mk_hl("H3", "three")]).unwrap();
-    let after = g.read_highlights("paper.pdf");
-    let ids: std::collections::HashSet<&str> = after.iter().map(|h| h.id.as_str()).collect();
-    assert!(ids.contains("H1") && ids.contains("H2") && ids.contains("H3"), "got {ids:?}");
+    // Tine, baseline [H1], adds H3 and writes — H2 (external) must NOT be dropped.
+    g.write_highlights("paper.pdf", "Paper", &[mk_hl("H1", "one"), mk_hl("H3", "three")], &["H1".into()]).unwrap();
+    assert!(ids(&g).is_superset(&["H1", "H2", "H3"].map(String::from).into_iter().collect()), "got {:?}", ids(&g));
+
+    // Now DELETE H2: baseline is everything currently on disk; current omits H2.
+    let base: Vec<String> = ids(&g).into_iter().collect();
+    g.write_highlights("paper.pdf", "Paper", &[mk_hl("H1", "one"), mk_hl("H3", "three")], &base).unwrap();
+    let after = ids(&g);
+    assert!(!after.contains("H2"), "deleted highlight must stay deleted: {after:?}");
+    assert!(after.contains("H1") && after.contains("H3"), "kept ones must survive: {after:?}");
     let _ = std::fs::remove_dir_all(&root);
 }
 

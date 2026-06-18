@@ -31,9 +31,15 @@ export function PdfViewer(props: { filename: string; label: string; page?: numbe
   const textLayers: Record<number, HTMLDivElement> = {};
   const hlLayers: Record<number, HTMLDivElement> = {};
   const [highlights, setHighlights] = createSignal<Highlight[]>([]);
-  const [menu, setMenu] = createSignal<{ x: number; y: number } | null>(null);
+  // The create-highlight popup (no `id`) OR the edit popup for an existing
+  // highlight (`id` set → offers recolor + remove).
+  const [menu, setMenu] = createSignal<{ x: number; y: number; id?: string } | null>(null);
   const [scale, setScale] = createSignal(1.4);
   let pending: Pending | null = null;
+  // The highlight ids last synced to disk (load baseline, refreshed after each
+  // successful write) — sent so the backend's 3-way merge honors deletions while
+  // preserving externally-added highlights.
+  let baseIds: string[] = [];
   let pdfDoc: pdfjs.PDFDocumentProxy | null = null;
 
   // Per-page unscaled dimensions (index 1..N), fetched once so we can size every
@@ -75,7 +81,24 @@ export function PdfViewer(props: { filename: string; label: string; page?: numbe
   const pendingText = new Set<number>();
   let textTimer: number | undefined;
 
-  const persist = () => backend().writeHighlights(props.filename, props.label, highlights());
+  const persist = async () => {
+    const ids = highlights().map((h) => h.id);
+    await backend().writeHighlights(props.filename, props.label, highlights(), baseIds);
+    baseIds = ids; // what's now on disk becomes the next write's baseline
+  };
+  // Remove a highlight (and its annotation block on the hls page).
+  const deleteHighlight = async (id: string) => {
+    setHighlights(highlights().filter((h) => h.id !== id));
+    setMenu(null);
+    await persist();
+    refreshNotes(hlsPageName(props.filename));
+  };
+  const recolorHighlight = async (id: string, color: string) => {
+    setHighlights(highlights().map((h) => (h.id === id ? { ...h, color } : h)));
+    setMenu(null);
+    await persist();
+    refreshNotes(hlsPageName(props.filename));
+  };
   const clampScale = (s: number) => Math.min(4, Math.max(0.2, s));
   const fitWidthScale = () => (dims[1] ? clampScale((scrollRef.clientWidth - 32) / dims[1].w) : 1);
   const fitHeightScale = () => (dims[1] ? clampScale((scrollRef.clientHeight - 24) / dims[1].h) : 1);
@@ -353,6 +376,7 @@ export function PdfViewer(props: { filename: string; label: string; page?: numbe
 
   onMount(async () => {
     setHighlights(await backend().readHighlights(props.filename));
+    baseIds = highlights().map((h) => h.id); // load baseline for the 3-way merge
     let bytes: Uint8Array;
     try {
       bytes = await backend().readAsset(props.filename);
@@ -418,6 +442,11 @@ export function PdfViewer(props: { filename: string; label: string; page?: numbe
         div.style.width = `${r.width * s}px`;
         div.style.height = `${r.height * s}px`;
         div.style.background = COLOR_RGBA[h.color] ?? COLOR_RGBA.yellow;
+        div.style.cursor = "pointer";
+        div.onclick = (ev) => {
+          ev.stopPropagation();
+          setMenu({ x: ev.clientX, y: ev.clientY, id: h.id }); // open the edit/remove popup
+        };
         layer.appendChild(div);
       }
     }
@@ -552,11 +581,25 @@ export function PdfViewer(props: { filename: string; label: string; page?: numbe
                 style={{ background: COLOR_RGBA[c] }}
                 onMouseDown={(e) => {
                   e.preventDefault();
-                  void createHighlight(c);
+                  const m = menu()!;
+                  if (m.id) void recolorHighlight(m.id, c); // recolor existing
+                  else void createHighlight(c); // create new
                 }}
               />
             )}
           </For>
+          <Show when={menu()!.id}>
+            <button
+              class="pdf-hl-remove"
+              title="Remove highlight"
+              onMouseDown={(e) => {
+                e.preventDefault();
+                void deleteHighlight(menu()!.id!);
+              }}
+            >
+              ✕
+            </button>
+          </Show>
         </div>
       </Show>
     </div>

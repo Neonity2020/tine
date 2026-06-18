@@ -2727,3 +2727,22 @@ mark {
   border: 1px solid var(--border-color);
   cursor: pointer;
 }
+
+.pdf-hl-remove {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  border: 1px solid var(--border-color);
+  background: var(--bg-primary);
+  color: var(--text-secondary, #888);
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.pdf-hl-remove:hover {
+  color: #e44;
+  border-color: #e44;
+}
