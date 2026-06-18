@@ -54,6 +54,10 @@ export function PdfViewer(props: { filename: string; label: string; page?: numbe
   // after the view settles. `textScale[n]` is the scale its text was built at;
   // `pendingText` holds pages whose text needs a (re)build.
   const textScale: Record<number, number> = {};
+  // The live pdf.js TextLayer instance per page, so a zoom can reposition it
+  // cheaply via .update({viewport}) instead of re-extracting text and recreating
+  // every glyph span (the expensive work that made zoom-in janky).
+  const textLayerObjs: Record<number, any> = {};
   const pendingText = new Set<number>();
   let textTimer: number | undefined;
 
@@ -73,11 +77,14 @@ export function PdfViewer(props: { filename: string; label: string; page?: numbe
     for (const k of Object.keys(hlLayers)) delete hlLayers[Number(k)];
     for (const k of Object.keys(renderedScale)) delete renderedScale[Number(k)];
     for (const k of Object.keys(textScale)) delete textScale[Number(k)];
+    for (const k of Object.keys(textLayerObjs)) delete textLayerObjs[Number(k)];
     pendingText.clear();
     clearTimeout(textTimer);
     visible.clear();
     io?.disconnect();
-    io = new IntersectionObserver(onIntersect, { root: scrollRef, rootMargin: "600px 0px" });
+    // Modest prefetch margin: render/text only pages near the viewport, so a
+    // fresh open doesn't do heavy text-layer work for a whole screenful ahead.
+    io = new IntersectionObserver(onIntersect, { root: scrollRef, rootMargin: "200px 0px" });
 
     const s = scale();
     for (let n = 1; n <= pdfDoc.numPages; n++) {
@@ -192,12 +199,26 @@ export function PdfViewer(props: { filename: string; label: string; page?: numbe
     const page = await pdfDoc.getPage(n);
     if (renderedScale[n] !== atScale || !textLayers[n]) return; // re-rastered since
     const viewport = page.getViewport({ scale: atScale });
+
+    // Reposition an existing text layer (cheap) rather than rebuilding it.
+    const existing = textLayerObjs[n];
+    if (existing) {
+      try {
+        await existing.update({ viewport });
+        textScale[n] = atScale;
+        return;
+      } catch {
+        // pdf.js API mismatch — fall through to a full rebuild.
+      }
+    }
+
     const textContent = await page.getTextContent();
     if (renderedScale[n] !== atScale || !textLayers[n]) return;
     const tl = textLayers[n];
     tl.innerHTML = "";
     const layer = new (pdfjs as any).TextLayer({ textContentSource: textContent, container: tl, viewport });
     await layer.render();
+    textLayerObjs[n] = layer;
     textScale[n] = atScale;
   }
 
@@ -318,6 +339,26 @@ export function PdfViewer(props: { filename: string; label: string; page?: numbe
     e.preventDefault();
     zoomBy(e.deltaY < 0 ? 1.1 : 1 / 1.1);
   };
+
+  // Ctrl/Cmd +/-/0 zoom (like every PDF reader). Active while a PDF is open;
+  // preventDefault stops the webview's own page zoom.
+  const onKeyZoom = (e: KeyboardEvent) => {
+    if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
+    if (e.key === "=" || e.key === "+") {
+      e.preventDefault();
+      zoomBy(1.1);
+    } else if (e.key === "-" || e.key === "_") {
+      e.preventDefault();
+      zoomBy(1 / 1.1);
+    } else if (e.key === "0") {
+      e.preventDefault();
+      setScale(fitWidthScale());
+    }
+  };
+  onMount(() => {
+    window.addEventListener("keydown", onKeyZoom);
+    onCleanup(() => window.removeEventListener("keydown", onKeyZoom));
+  });
 
   const onMouseUp = (e: MouseEvent) => {
     const sel = window.getSelection();

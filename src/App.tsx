@@ -53,20 +53,30 @@ export function App(): JSX.Element {
 
   // Persist pending edits before the window closes — the 400ms save debounce
   // would otherwise drop the last keystrokes typed right before quitting.
+  // Hardened so it can NEVER wedge the window open: a re-entry guard, a timeout
+  // cap on the flush, and a destroy()→close() fallback.
   onMount(() => {
     if (!isTauri()) return;
     let unlisten = () => {};
+    let closing = false;
     void (async () => {
       const { getCurrentWindow } = await import("@tauri-apps/api/window");
       const w = getCurrentWindow();
       unlisten = await w.onCloseRequested(async (e) => {
+        if (closing) return; // second pass (from close() below) — let it through
+        closing = true;
         e.preventDefault();
         try {
-          await flushAll();
+          // Cap the wait so a stuck save IPC can't prevent quitting.
+          await Promise.race([flushAll(), new Promise((r) => setTimeout(r, 1500))]);
         } catch {
           // never block quitting on a save error
         }
-        await w.destroy();
+        try {
+          await w.destroy();
+        } catch {
+          await w.close(); // re-fires onCloseRequested; the guard lets it close
+        }
       });
     })();
     onCleanup(() => unlisten());
