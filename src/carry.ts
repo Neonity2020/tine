@@ -35,15 +35,23 @@ async function ensureToday(): Promise<string> {
 
 // Persist the touched pages to disk NOW, before any feed reload — otherwise
 // navigating to journals reloads the (still-old) files and clobbers the move.
-async function persist(names: string[]): Promise<void> {
+// Returns whether every dirty touched page actually saved.
+async function persist(names: string[]): Promise<boolean> {
   const seen = new Set<string>();
-  await Promise.all(
+  const results = await Promise.all(
     names.filter((n) => !seen.has(n) && (seen.add(n), isDirty(n))).map((n) => flushPage(n))
   );
+  return results.every(Boolean);
 }
 
 async function report(n: number, touched: string[]): Promise<void> {
-  await persist(touched);
+  // If a touched page couldn't be saved (conflict / disk error), DON'T reload the
+  // journals feed — that would re-read the old files and drop the carried blocks
+  // from memory. Leave the move in memory and surface the failure.
+  if (!(await persist(touched))) {
+    pushToast("Carry couldn't be saved — resolve the conflict; your moved tasks are kept in the editor.", "error");
+    return;
+  }
   openJournals();
   pushToast(n ? `Carried ${n} item${n === 1 ? "" : "s"} to today` : "No unfinished tasks to carry");
 }

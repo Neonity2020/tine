@@ -90,6 +90,11 @@ pub struct Graph {
     /// search / backlinks / `{{query}}` scan memory instead of re-reading and
     /// re-parsing the entire tree on every keystroke. `None` = not yet built.
     cache: RwLock<Option<Vec<(PageEntry, Document)>>>,
+    /// Bumped on every cache mutation (upsert/remove). The lock-free cache build
+    /// captures this before reading disk and refuses to install its snapshot if a
+    /// mutation raced it (which would otherwise install stale content over a
+    /// concurrent save). See `with_pages`.
+    cache_gen: std::sync::atomic::AtomicU64,
     /// Cached `alias:: → canonical` pairs, derived from the page cache. Rebuilt
     /// lazily and dropped whenever the page cache mutates (the only time aliases
     /// can change). Avoids re-scanning the whole graph for aliases on every page
@@ -122,7 +127,13 @@ impl Graph {
         let config = fs::read_to_string(root.join("logseq").join("config.edn"))
             .map(|s| Config::parse(&s))
             .unwrap_or_default();
-        Graph { root, config, cache: RwLock::new(None), alias_cache: RwLock::new(None) }
+        Graph {
+            root,
+            config,
+            cache: RwLock::new(None),
+            cache_gen: std::sync::atomic::AtomicU64::new(0),
+            alias_cache: RwLock::new(None),
+        }
     }
 
     pub fn meta(&self) -> GraphMeta {
@@ -320,6 +331,12 @@ impl Graph {
     /// stable and consistent with queries / refs / the sidebar. Falls back to a
     /// disk parse for a page not yet in the cache (e.g. just created externally).
     pub fn load_page(&self, entry: &PageEntry) -> io::Result<PageDto> {
+        // Reconcile any external change into the cache FIRST. Otherwise a stale
+        // cache (an edit the 3s watcher hasn't folded in yet) would be served as
+        // the editor's content while the rev below reflects the NEW disk bytes —
+        // and the editor's save would then clobber the external edit with the rev
+        // matching. sync_file is a no-op when the cache already matches disk.
+        self.sync_file(&entry.path);
         // The editor's save-baseline is the hash of the actual on-disk bytes at
         // load time (read regardless of cache hit — load is not the hot path).
         let rev = fs::read_to_string(&entry.path).ok().map(|s| content_rev(&s));
@@ -377,10 +394,19 @@ impl Graph {
         // concurrent read command (search/query/page load) during the startup
         // warm. A racing builder just does duplicate work; the first to grab the
         // lock installs and the rest discard theirs.
+        use std::sync::atomic::Ordering;
+        let gen0 = self.cache_gen.load(Ordering::Acquire);
         let built = self.load_all_pages();
         let mut guard = self.cache.write().unwrap();
         if guard.is_none() {
-            *guard = Some(built);
+            if self.cache_gen.load(Ordering::Acquire) == gen0 {
+                *guard = Some(built); // no mutation raced our read → snapshot is fresh
+            } else {
+                // A save/remove raced our lock-free build (its cache mutation
+                // no-op'd because the cache was still None). Rebuild while holding
+                // the write lock so we can't install a stale snapshot.
+                *guard = Some(self.load_all_pages());
+            }
         }
         f(guard.as_ref().unwrap())
     }
@@ -400,6 +426,9 @@ impl Graph {
     /// Update one page in the cache after we write it (no full rebuild). A no-op
     /// if the cache hasn't been built yet.
     fn cache_upsert(&self, entry: PageEntry, mut doc: Document) {
+        // Signal a mutation so a concurrent lock-free cache build won't install a
+        // snapshot that predates this change (see with_pages).
+        self.cache_gen.fetch_add(1, std::sync::atomic::Ordering::Release);
         // Fill uuids for any block that lacks one (e.g. PDF-highlight writes);
         // blocks saved from the frontend already carry their ids, which are kept.
         for b in &mut doc.roots {
@@ -430,6 +459,7 @@ impl Graph {
 
     /// Drop one page from the cache after deleting its file.
     fn cache_remove(&self, name: &str, kind: PageKind) {
+        self.cache_gen.fetch_add(1, std::sync::atomic::Ordering::Release);
         let mut guard = self.cache.write().unwrap();
         let mut alias_touched = false;
         if let Some(pages) = guard.as_mut() {
@@ -726,16 +756,27 @@ impl Graph {
     /// so the caller can surface it and keep the in-memory edits.
     pub fn save_page(&self, page: &PageDto, base_rev: Option<&str>) -> io::Result<String> {
         let path = self.path_for(&page.name, page.kind);
-        if let Ok(disk_s) = fs::read_to_string(&path) {
-            // A file exists. It must still match the exact bytes the editor loaded
-            // (`base_rev`); if it changed underneath us (external edit / Syncthing
-            // pull — possibly already folded into the cache), refuse to clobber.
-            // `base_rev == None` means the editor believed the page was new, so any
-            // existing file is an external creation and is likewise a conflict.
-            let unchanged = base_rev.is_some_and(|rev| content_rev(&disk_s) == rev);
-            if !unchanged {
-                return Err(io::Error::new(io::ErrorKind::AlreadyExists, "conflict"));
+        match fs::read_to_string(&path) {
+            Ok(disk_s) => {
+                // A file exists. It must still match the exact bytes the editor
+                // loaded (`base_rev`); if it changed underneath us (external edit /
+                // Syncthing pull — possibly already folded into the cache), refuse
+                // to clobber. `base_rev == None` means the editor believed the page
+                // was new, so any existing file is an external creation → conflict.
+                let unchanged = base_rev.is_some_and(|rev| content_rev(&disk_s) == rev);
+                if !unchanged {
+                    return Err(io::Error::new(io::ErrorKind::AlreadyExists, "conflict"));
+                }
             }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                // The file is gone. If the editor had a baseline (the page existed
+                // at load), it was deleted externally — DON'T silently resurrect
+                // it; surface a conflict. base_rev == None is a genuinely new page.
+                if base_rev.is_some() {
+                    return Err(io::Error::new(io::ErrorKind::AlreadyExists, "conflict"));
+                }
+            }
+            Err(e) => return Err(e), // hard error (permission, I/O) — don't write blind
         }
         self.write_page(page)?;
         Ok(self.disk_rev(&path))
@@ -873,12 +914,18 @@ fn page_dto(entry: &PageEntry, doc: &Document) -> PageDto {
 
 /// Whether a document declares an `alias::` anywhere — used to decide if a save
 /// must invalidate the cached alias map (most saves don't touch aliases).
+fn has_alias_prop(text: &str) -> bool {
+    // Case-insensitive (Logseq accepts `Alias::`); ASCII-lowercase is enough and
+    // cheaper than full to_lowercase. Over-matching content is harmless (it just
+    // invalidates the alias cache slightly more often); MISSING `Alias::` would
+    // leave it stale, which is the bug we're avoiding.
+    text.to_ascii_lowercase().contains("alias::")
+}
 fn doc_has_alias(doc: &Document) -> bool {
-    doc.pre_block.as_deref().is_some_and(|p| p.contains("alias::"))
-        || doc.roots.iter().any(block_has_alias)
+    doc.pre_block.as_deref().is_some_and(has_alias_prop) || doc.roots.iter().any(block_has_alias)
 }
 fn block_has_alias(b: &DocBlock) -> bool {
-    b.raw.contains("alias::") || b.children.iter().any(block_has_alias)
+    has_alias_prop(&b.raw) || b.children.iter().any(block_has_alias)
 }
 
 /// Stable (deterministic, seed-free) content hash — FNV-1a/64 as hex. Used as a

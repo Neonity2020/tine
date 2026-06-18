@@ -218,9 +218,20 @@ export function resetStore() {
   setEditingId(null);
 }
 
+// A navigation/feed load must NOT replace a page that has unsaved edits (or an
+// unresolved conflict) with a fresh disk DTO — e.g. you edited it in the sidebar,
+// then opened it in the main view before the debounce saved. Keep the live dirty
+// nodes; the disk version would otherwise be served and the next save could write
+// it, silently dropping the edit. (reloadPage / "use disk version" still replace
+// explicitly via upsertPage.)
+function upsertUnlessDirty(dto: PageDto) {
+  if (pageByName(dto.name) && (isDirty(dto.name) || isConflicted(dto.name))) return;
+  upsertPage(dto);
+}
+
 /** Load a single page and make it the main view. */
 export function loadSingle(dto: PageDto) {
-  upsertPage(dto);
+  upsertUnlessDirty(dto);
   setDoc("feed", [dto.name]);
   setDoc("loaded", true);
   setEditingId(null);
@@ -229,7 +240,7 @@ export function loadSingle(dto: PageDto) {
 
 /** Load the journals feed as the main view. */
 export function loadFeed(dtos: PageDto[]) {
-  for (const d of dtos) upsertPage(d);
+  for (const d of dtos) upsertUnlessDirty(d);
   setDoc("feed", dtos.map((d) => d.name));
   setDoc("loaded", true);
   setEditingId(null);
@@ -240,7 +251,7 @@ export function loadFeed(dtos: PageDto[]) {
 export function appendFeed(dtos: PageDto[]) {
   for (const d of dtos) {
     if (doc.feed.includes(d.name)) continue;
-    upsertPage(d);
+    upsertUnlessDirty(d);
     setDoc("feed", [...doc.feed, d.name]);
   }
   evictIfNeeded();
@@ -1439,10 +1450,22 @@ export async function flushAll(): Promise<boolean> {
     clearTimeout(saveTimer);
     saveTimer = null;
   }
-  const names = new Set<string>([...dirty, ...saveChain.keys()]);
-  const results = await Promise.all([...names].map((n) => enqueueSave(n)));
-  if (results.some(Boolean)) bumpDataRev();
-  return results.every(Boolean);
+  let landed = false;
+  // Drain repeatedly: an edit made WHILE a save is in flight re-dirties the page,
+  // and a queued save may still be running, so one pass can miss work. Keep
+  // flushing until nothing is pending (bounded against a persistently-failing
+  // save).
+  for (let i = 0; i < 4; i++) {
+    const names = new Set<string>([...dirty, ...saveChain.keys()]);
+    if (names.size === 0) break;
+    const results = await Promise.all([...names].map((n) => enqueueSave(n)));
+    if (results.some(Boolean)) landed = true;
+  }
+  if (landed) bumpDataRev();
+  // Success only if nothing is still pending AND there are no unresolved
+  // conflicts (a conflicted page's edit is NOT on disk) — so a destructive
+  // transition (graph switch / restore / close) can abort instead of discarding it.
+  return dirty.size === 0 && conflicts().length === 0;
 }
 
 /** Resolve a save conflict by overwriting the on-disk file with the in-memory

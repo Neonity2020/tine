@@ -197,6 +197,49 @@ fn save_refuses_to_clobber_external_change() {
 }
 
 #[test]
+fn save_conflicts_when_file_deleted_externally() {
+    use tine_core::model::PageKind;
+    let root = std::env::temp_dir().join(format!("tine-del-{}", std::process::id()));
+    std::fs::create_dir_all(root.join("pages")).unwrap();
+    let path = root.join("pages").join("N.md");
+    std::fs::write(&path, "- one").unwrap();
+    let g = Graph::open(&root);
+    g.search("one", 10); // warm cache
+    let dto = g.load_named("N", PageKind::Page).unwrap().unwrap();
+
+    // The file is deleted on disk (Syncthing / Logseq) after we loaded it.
+    std::fs::remove_file(&path).unwrap();
+
+    // Saving must conflict, NOT silently resurrect the deleted note.
+    let err = g.save_page(&dto, dto.rev.as_deref()).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    assert!(!path.exists(), "deleted file must stay deleted on a conflicting save");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn load_reflects_external_change_then_save_is_clean() {
+    use tine_core::model::PageKind;
+    let root = std::env::temp_dir().join(format!("tine-reconcile-{}", std::process::id()));
+    std::fs::create_dir_all(root.join("pages")).unwrap();
+    let path = root.join("pages").join("N.md");
+    std::fs::write(&path, "- one").unwrap();
+    let g = Graph::open(&root);
+    g.warm_cache();
+    let _ = g.load_named("N", PageKind::Page).unwrap().unwrap(); // cache built
+
+    // External writer changes the file; the 3s watcher hasn't run yet.
+    std::fs::write(&path, "- TWO external").unwrap();
+
+    // load_page must reconcile and serve the NEW content (not the stale cache),
+    // and the rev it returns must match disk so a save doesn't spuriously conflict.
+    let dto = g.load_named("N", PageKind::Page).unwrap().unwrap();
+    assert!(dto.blocks[0].raw.contains("TWO external"), "load reflects external change");
+    g.save_page(&dto, dto.rev.as_deref()).expect("save of freshly-loaded current content is clean");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
 fn consecutive_self_saves_do_not_conflict() {
     // Regression: inserting a SCHEDULED date then deleting it (consecutive saves
     // with no external writer) must not raise a spurious "changed on disk"

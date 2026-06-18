@@ -131,7 +131,7 @@ const BACKUP_KEEP_DEFAULT: usize = 12;
 
 fn backup_async(app: tauri::AppHandle) {
     std::thread::spawn(move || {
-        do_backup(&app, "");
+        let _ = do_backup(&app, ""); // launch snapshot is best-effort
     });
 }
 
@@ -140,7 +140,10 @@ fn backup_async(app: tauri::AppHandle) {
 /// app-settings file and prunes old snapshots afterwards. `suffix` tags special
 /// snapshots (e.g. "pre-restore") so they get a distinct, collision-proof
 /// directory name and are exempt from the keep-count prune.
-fn do_backup(app: &tauri::AppHandle, suffix: &str) -> usize {
+/// Returns (files copied, complete) — `complete` is false if ANY `.md`/config
+/// copy failed, so the caller (restore) can refuse to proceed without a full
+/// rollback snapshot.
+fn do_backup(app: &tauri::AppHandle, suffix: &str) -> (usize, bool) {
     // Grab just the paths under the lock, then copy from disk lock-free.
     let (journals, pages, cfg, root) = {
         let state: State<'_, AppState> = app.state();
@@ -152,32 +155,36 @@ fn do_backup(app: &tauri::AppHandle, suffix: &str) -> usize {
                 g.root.join("logseq").join("config.edn"),
                 g.root.clone(),
             ),
-            None => return 0,
+            None => return (0, false),
         }
     };
-    let Ok(data_dir) = app.path().app_data_dir() else { return 0 };
+    let Ok(data_dir) = app.path().app_data_dir() else { return (0, false) };
     let base = data_dir
         .join("backups")
         .join(sanitize_id(&root.display().to_string()));
     let stamp = backup_stamp();
     let name = if suffix.is_empty() { stamp } else { format!("{stamp}-{suffix}") };
     let dest = base.join(name);
-    let mut n = copy_md_dir(&journals, &dest.join(dir_name(&journals)));
-    n += copy_md_dir(&pages, &dest.join(dir_name(&pages)));
+    let (cj, fj) = copy_md_dir(&journals, &dest.join(dir_name(&journals)));
+    let (cp, fp) = copy_md_dir(&pages, &dest.join(dir_name(&pages)));
+    let mut n = cj + cp;
+    let mut failed = fj + fp;
     if cfg.exists() {
         let out = dest.join("logseq");
         if std::fs::create_dir_all(&out).is_ok()
             && std::fs::copy(&cfg, out.join("config.edn")).is_ok()
         {
             n += 1;
+        } else {
+            failed += 1;
         }
     }
     if n == 0 {
         let _ = std::fs::remove_dir_all(&dest);
-        return 0;
+        return (0, failed == 0);
     }
     prune_backups(&base, backup_keep(app));
-    n
+    (n, failed == 0)
 }
 
 // --- local app settings (outside the graph): currently just the backup keep
@@ -299,10 +306,12 @@ fn restore_backup(stamp: String, app: tauri::AppHandle, state: State<'_, AppStat
     // name so it can't collide with (or be pruned by) the launch snapshot the
     // post-restore reload will take. Abort if the snapshot fails while the live
     // graph has content — never run a destructive restore without a way back.
-    let snapshot_n = do_backup(&app, "pre-restore");
+    let (snapshot_n, complete) = do_backup(&app, "pre-restore");
     let live_n = count_md_recursive(&journals) + count_md_recursive(&pages);
-    if live_n > 0 && snapshot_n == 0 {
-        return Err("couldn't create the pre-restore safety snapshot — restore aborted".into());
+    // A destructive restore must be fully reversible: abort unless the pre-restore
+    // snapshot captured everything (every file copied, nothing skipped).
+    if live_n > 0 && (snapshot_n == 0 || !complete) {
+        return Err("couldn't create a complete pre-restore safety snapshot — restore aborted".into());
     }
     // Restore each dir; a copy failure aborts WITHOUT having deleted anything
     // (copy-in happens before delete-extras), so a failure never loses data.
@@ -363,23 +372,24 @@ fn dir_name(p: &std::path::Path) -> String {
 fn sanitize_id(s: &str) -> String {
     s.chars().map(|c| if c.is_alphanumeric() { c } else { '_' }).collect()
 }
-fn copy_md_dir(src: &std::path::Path, dest: &std::path::Path) -> usize {
-    let Ok(rd) = std::fs::read_dir(src) else { return 0 };
-    let mut n = 0;
+/// Copy every `.md` from `src` to `dest`. Returns (copied, failed) so the caller
+/// can tell a complete snapshot from a partial one.
+fn copy_md_dir(src: &std::path::Path, dest: &std::path::Path) -> (usize, usize) {
+    let Ok(rd) = std::fs::read_dir(src) else { return (0, 0) };
+    let (mut copied, mut failed) = (0usize, 0usize);
     for e in rd.flatten() {
         let p = e.path();
         if p.extension().and_then(|x| x.to_str()) != Some("md") {
             continue;
         }
-        if std::fs::create_dir_all(dest).is_ok() {
-            if let Some(name) = p.file_name() {
-                if std::fs::copy(&p, dest.join(name)).is_ok() {
-                    n += 1;
-                }
-            }
+        let Some(name) = p.file_name() else { continue };
+        if std::fs::create_dir_all(dest).is_ok() && std::fs::copy(&p, dest.join(name)).is_ok() {
+            copied += 1;
+        } else {
+            failed += 1;
         }
     }
-    n
+    (copied, failed)
 }
 fn prune_backups(base: &std::path::Path, keep: usize) {
     let Ok(rd) = std::fs::read_dir(base) else { return };

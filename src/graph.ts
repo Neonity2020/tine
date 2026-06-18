@@ -28,11 +28,13 @@ export async function loadGraphPath(path: string): Promise<void> {
   const switching = !!prev && !!path && prev !== path;
   // Persist the current graph's pending edits BEFORE opening another graph —
   // otherwise the debounced save would either fire against the new graph or be
-  // dropped by resetStore. No-op on first load (nothing dirty / same graph).
-  // If something couldn't be saved (conflict / disk error), abort the switch so
-  // resetStore doesn't discard that edit.
+  // dropped by resetStore. No-op on first load (nothing dirty). If something
+  // couldn't be saved (conflict / disk error), abort so resetStore doesn't
+  // discard that edit — gated on whether a graph is actually loaded now, NOT on
+  // the persisted path (which is empty on a TINE_GRAPH/CLI launch).
+  const hadGraph = !!graphMeta();
   const flushed = await flushAll();
-  if (switching && !flushed) {
+  if (hadGraph && !flushed) {
     pushToast("Some pages couldn't be saved — resolve conflicts before switching graphs.", "error");
     return;
   }

@@ -73,13 +73,16 @@ export function RightSidebar(): JSX.Element {
 // retries once it opens.
 function useEnsurePage(name: () => string, kind: () => "journal" | "page") {
   createEffect(() => {
-    graphEpoch();
+    const epoch = graphEpoch();
     const n = name();
     const k = kind();
     if (n && !pageByName(n)) {
       void backend()
         .getPage(n, k)
         .then((dto) => {
+          // Drop a load that resolved after a graph switch — otherwise it would
+          // insert an old-graph page into the new graph's working set.
+          if (epoch !== graphEpoch()) return;
           if (dto) ensurePageLoaded(dto);
         })
         .catch(() => {
