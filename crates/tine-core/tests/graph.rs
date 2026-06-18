@@ -307,6 +307,47 @@ fn sync_file_detects_external_change_and_suppresses_self() {
 }
 
 #[test]
+fn watcher_suppresses_own_write_when_parse_cache_lags() {
+    // Regression for the false "changed on disk" conflict seen during normal
+    // typing (no external writer): the file watcher reads files outside the cache
+    // lock, so in the window between a save's atomic rename and its cache_upsert it
+    // can read disk-ahead-of-cache and flag Tine's own write as an external change.
+    // `recent_writes` lets it recognize our own bytes regardless of cache state.
+    use tine_core::model::{BlockDto, PageDto, PageKind};
+
+    let root = std::env::temp_dir().join(format!("tine-selfwrite-lag-{}", std::process::id()));
+    std::fs::create_dir_all(root.join("pages")).unwrap();
+    let g = Graph::open(&root);
+    g.search("x", 10); // build the (empty) cache
+
+    let path = root.join("pages").join("W.md");
+    let page = PageDto {
+        name: "W".into(),
+        kind: PageKind::Page,
+        title: "W".into(),
+        pre_block: None,
+        // A multi-line block ending in a `>` quote line — the shape that surfaced
+        // the bug (shift-enter then ">").
+        blocks: vec![BlockDto { id: "b1".into(), raw: "hello\n> quote".into(), ..Default::default() }],
+        rev: None,
+    };
+    g.save_page(&page, None).unwrap();
+
+    // Simulate the rename→cache_upsert gap: drop the page from the parse cache so
+    // the cache no longer reflects the file — exactly the state the 3s poller can
+    // read into mid-save.
+    assert!(g.forget_file(&path).is_some(), "page should have been cached by the save");
+
+    // The watcher polling now must STILL recognize our own write and emit nothing.
+    assert!(
+        g.sync_file(&path).is_none(),
+        "Tine's own save must not be reported as an external change"
+    );
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
 fn query_between_filters_by_journal_date() {
     let root = std::env::temp_dir().join(format!("tine-between-test-{}", std::process::id()));
     std::fs::create_dir_all(root.join("journals")).unwrap();

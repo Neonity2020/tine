@@ -121,6 +121,14 @@ pub struct Graph {
     /// keystroke. An externally-created page not yet seen by the watcher is at most
     /// one watcher tick (≤3s) stale here.
     page_list_cache: RwLock<Option<(u64, Vec<PageEntry>)>>,
+    /// `path → content_rev` of the bytes Tine last wrote to each page file,
+    /// recorded *before* the write lands on disk. The file watcher reads files
+    /// outside the cache lock, so during the window between a save's atomic rename
+    /// and its `cache_upsert` it can read disk-ahead-of-cache and mistake Tine's
+    /// own write for an external change. This lets the watcher recognize the exact
+    /// bytes we wrote and suppress that false positive (the parse-cache comparison
+    /// alone races that window). See `write_page` / `sync_file_content`.
+    recent_writes: std::sync::Mutex<std::collections::HashMap<PathBuf, String>>,
 }
 
 /// Gen+today-tagged cache of derived scan results. Reset wholesale whenever the
@@ -167,6 +175,7 @@ impl Graph {
             block_index: RwLock::new(None),
             derived_cache: RwLock::new(None),
             page_list_cache: RwLock::new(None),
+            recent_writes: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -934,6 +943,13 @@ impl Graph {
     /// caller that has just read the file (e.g. load_page) doesn't read it twice.
     fn sync_file_content(&self, path: &Path, content: &str) -> Option<PageEntry> {
         let entry = self.entry_for_path(path)?;
+        // Our own write: if the bytes on disk are exactly what Tine last wrote
+        // here, this is not an external change — suppress it even if the parse
+        // cache hasn't folded in the write yet (the rename→cache_upsert gap the
+        // watcher can read into). The cache comparison below alone races that gap.
+        if self.recent_writes.lock().unwrap().get(path) == Some(&content_rev(content)) {
+            return None;
+        }
         let newdoc = doc::parse(content);
         {
             let guard = self.cache.read().unwrap();
@@ -1036,6 +1052,13 @@ impl Graph {
         // produce a minimal diff — critical to avoid Syncthing churn against Logseq.
         let opts = doc::SerializeOpts::detect(existing);
         let content = doc::serialize_with(&doc, &opts);
+        let rev = content_rev(&content);
+        // Record what we're about to write BEFORE it lands, so the file watcher
+        // (which reads files outside the cache lock) recognizes these exact bytes
+        // as our own write during the window between the atomic rename below and
+        // the `cache_upsert` further down — otherwise it reads disk-ahead-of-cache
+        // and flags Tine's own save as an external change (false conflict).
+        self.recent_writes.lock().unwrap().insert(path.clone(), rev.clone());
         // No-op save: identical bytes already on disk (e.g. focus/blur with no
         // real edit). Skip the write entirely — keep the cache current though.
         if existing != Some(content.as_str()) {
@@ -1059,7 +1082,7 @@ impl Graph {
         self.cache_upsert(entry, doc);
         // The new baseline rev = hash of exactly what's now on disk (the content we
         // serialized, or the identical existing bytes on a no-op) — no re-read.
-        Ok(content_rev(&content))
+        Ok(rev)
     }
 }
 
