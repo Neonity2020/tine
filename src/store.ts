@@ -1299,8 +1299,23 @@ function crossMoveBlocks(ids: string[], fromPage: string, toPage: string, dir: 1
       }
     })
   );
-  markDirty(fromPage);
-  markDirty(toPage);
+  persistCrossPage(toPage, [fromPage]);
+}
+
+/** Persist a cross-page move so the ADDITION side (`dest`) lands on disk BEFORE
+ *  any REMOVAL side (`sources`). If dest fails to save (e.g. an external
+ *  conflict), the sources are NOT written, so disk is never left with the block
+ *  removed from its source but never written to its destination (the data-losing
+ *  state). dest is marked dirty immediately; each source only once dest succeeds. */
+function persistCrossPage(dest: string, sources: string[]) {
+  markDirty(dest);
+  void (async () => {
+    if (!(await flushPage(dest))) return; // dest conflict/failure → leave sources on disk
+    for (const s of sources) {
+      if (s !== dest) markDirty(s);
+    }
+    scheduleSave();
+  })();
 }
 
 /** Resolve the adjacent feed day for a root block at the page boundary, loading

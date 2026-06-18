@@ -36,19 +36,23 @@ async function ensureToday(): Promise<string> {
 // Persist the touched pages to disk NOW, before any feed reload — otherwise
 // navigating to journals reloads the (still-old) files and clobbers the move.
 // Returns whether every dirty touched page actually saved.
-async function persist(names: string[]): Promise<boolean> {
-  const seen = new Set<string>();
+// Persist `today` (the ADDITION side) FIRST and only flush the source days once it
+// lands — so a today-conflict can't leave the carried blocks removed from their
+// source files but never written to today (a removal-only, data-losing state).
+async function persist(today: string, sources: string[]): Promise<boolean> {
+  if (isDirty(today) && !(await flushPage(today))) return false;
+  const seen = new Set<string>([today]);
   const results = await Promise.all(
-    names.filter((n) => !seen.has(n) && (seen.add(n), isDirty(n))).map((n) => flushPage(n))
+    sources.filter((n) => !seen.has(n) && (seen.add(n), isDirty(n))).map((n) => flushPage(n))
   );
   return results.every(Boolean);
 }
 
-async function report(n: number, touched: string[]): Promise<void> {
+async function report(n: number, today: string, sources: string[]): Promise<void> {
   // If a touched page couldn't be saved (conflict / disk error), DON'T reload the
   // journals feed — that would re-read the old files and drop the carried blocks
   // from memory. Leave the move in memory and surface the failure.
-  if (!(await persist(touched))) {
+  if (!(await persist(today, sources))) {
     pushToast("Carry couldn't be saved — resolve the conflict; your moved tasks are kept in the editor.", "error");
     return;
   }
@@ -84,7 +88,7 @@ export async function carryDay(pageName: string): Promise<void> {
   if (pageName === today) return;
   if (!(await ensureLoaded(pageName, "journal"))) return;
   const n = carryUnfinished([pageName], carryKeepsContext(), carryHeaderText());
-  await report(n, [pageName, today]);
+  await report(n, today, [pageName]);
 }
 
 /** Carry unfinished tasks from the last `days` days (today−1 … today−days) to
@@ -102,5 +106,5 @@ export async function carryDaysBack(days: number): Promise<void> {
   const loaded = await Promise.all(candidates.map((t) => ensureLoaded(t, "journal")));
   const titles = candidates.filter((_, i) => loaded[i]); // skip days with no file
   const n = carryUnfinished(titles, carryKeepsContext(), carryHeaderText());
-  await report(n, [today, ...titles]);
+  await report(n, today, titles);
 }
