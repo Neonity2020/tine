@@ -161,19 +161,30 @@ pub fn merge_hls_page(
     let asset_path = format!("../assets/{pdf_filename}");
     let pre = format!("file:: [{label}]({asset_path})\nfile-path:: {asset_path}");
 
-    let mut by_id: HashMap<String, DocBlock> = HashMap::new();
+    // Split existing roots into annotation blocks (keyed by id) and everything
+    // else — user-authored top-level notes that must be PRESERVED, not rebuilt
+    // away. Annotations are regenerated from the (authoritative) highlight list so
+    // a removed highlight drops its block; a non-annotation root is always kept.
+    let mut ann_by_id: HashMap<String, DocBlock> = HashMap::new();
+    let mut user_roots: Vec<DocBlock> = Vec::new();
     if let Some(doc) = existing {
         for b in &doc.roots {
-            if let Some(id) = b.property("id") {
-                by_id.insert(id, b.clone());
+            let is_annotation = b.property("ls-type").as_deref() == Some("annotation");
+            match b.property("id") {
+                Some(id) if is_annotation => {
+                    ann_by_id.insert(id, b.clone());
+                }
+                _ => user_roots.push(b.clone()),
             }
         }
     }
 
-    let roots = highlights
+    let mut roots: Vec<DocBlock> = highlights
         .iter()
-        .map(|h| by_id.remove(&h.id).unwrap_or_else(|| highlight_block(h)))
+        .map(|h| ann_by_id.remove(&h.id).unwrap_or_else(|| highlight_block(h)))
         .collect();
+    // Keep the user's own top-level notes (after the generated annotations).
+    roots.extend(user_roots);
     Document { pre_block: Some(pre), roots }
 }
 
@@ -246,6 +257,20 @@ mod tests {
         let back = crate::doc::parse(&md);
         assert_eq!(back.roots.len(), 1);
         assert_eq!(back.roots[0].property("hl-page").as_deref(), Some("42"));
+    }
+
+    #[test]
+    fn merge_preserves_user_top_level_notes() {
+        let h = sample();
+        // Existing page: a user's own top-level note + one annotation block.
+        let existing = crate::doc::parse(&format!(
+            "- my summary note\n- highlighted text\n  ls-type:: annotation\n  id:: {}\n",
+            h.id
+        ));
+        let merged = merge_hls_page(Some(&existing), "paper.pdf", "Paper", &[h.clone()]);
+        let raws: Vec<&str> = merged.roots.iter().map(|b| b.raw.as_str()).collect();
+        assert!(raws.iter().any(|r| r.contains("my summary note")), "user note dropped: {raws:?}");
+        assert!(raws.iter().any(|r| r.contains(&h.id)), "annotation missing: {raws:?}");
     }
 
     #[test]
