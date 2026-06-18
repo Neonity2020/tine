@@ -375,6 +375,11 @@ fn sanitize_id(s: &str) -> String {
 /// Copy every `.md` from `src` to `dest`. Returns (copied, failed) so the caller
 /// can tell a complete snapshot from a partial one.
 fn copy_md_dir(src: &std::path::Path, dest: &std::path::Path) -> (usize, usize) {
+    // Materialize the dest dir up front, even when src has no .md files — so the
+    // snapshot records "this dir existed and was empty". Otherwise restore can't
+    // tell an empty-at-backup dir from a missing one, and leaves destination .md
+    // extras in place (mixing current files into the restored snapshot).
+    let _ = std::fs::create_dir_all(dest);
     let Ok(rd) = std::fs::read_dir(src) else { return (0, 0) };
     let (mut copied, mut failed) = (0usize, 0usize);
     for e in rd.flatten() {
