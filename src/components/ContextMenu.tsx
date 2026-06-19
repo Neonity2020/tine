@@ -1,4 +1,4 @@
-import { For, Show, type JSX } from "solid-js";
+import { For, Show, createSignal, type JSX } from "solid-js";
 import {
   contextMenu,
   closeContextMenu,
@@ -14,6 +14,7 @@ import { backend } from "../backend";
 import { carryDay } from "../carry";
 import { journalTitle } from "../journal";
 import {
+  doc,
   ensureBlockId,
   persistentBlockRef,
   blockSubtreeMarkdown,
@@ -140,7 +141,78 @@ function BlockMenu(props: { id: string; close: () => void }): JSX.Element {
           </div>
         )}
       </For>
+
+      <div class="ctx-sep" />
+      <MakeTemplate id={props.id} close={props.close} />
     </>
+  );
+}
+
+// "Make a template" — mirrors OG Logseq: a context-menu action that expands into
+// an inline name field (+ an "Include parent block" toggle when the block has
+// children), and on submit marks the block with `template:: <name>`. The block
+// stays where it is; that property is the template. Insert it later via `/<name>`.
+function MakeTemplate(props: { id: string; close: () => void }): JSX.Element {
+  const [editing, setEditing] = createSignal(false);
+  const [name, setName] = createSignal("");
+  // OG default: the toggle starts ON when the block has children — the named
+  // block is inserted together with its children. Off → `template-including-parent::
+  // false` (only the children are inserted; the block is just the template's label).
+  const [includeParent, setIncludeParent] = createSignal(true);
+  const hasChildren = () => (doc.byId[props.id]?.children.length ?? 0) > 0;
+
+  const submit = async () => {
+    const title = name().trim();
+    if (!title) return;
+    const existing = await backend().listTemplates().catch(() => []);
+    if (existing.some((t) => t.name.toLowerCase() === title.toLowerCase())) {
+      pushToast(`A template named “${title}” already exists.`, "error");
+      return;
+    }
+    setBlockProperty(props.id, "template", title);
+    if (hasChildren() && !includeParent()) {
+      setBlockProperty(props.id, "template-including-parent", "false");
+    }
+    pushToast(`Template “${title}” created.`, "success");
+    props.close();
+  };
+
+  return (
+    <Show
+      when={editing()}
+      fallback={
+        <div class="ctx-item" onClick={(e) => { e.stopPropagation(); setEditing(true); }}>
+          Make a template…
+        </div>
+      }
+    >
+      <div class="ctx-template-form">
+        <input
+          class="ctx-template-name"
+          placeholder="Template name"
+          autofocus
+          value={name()}
+          onInput={(e) => setName(e.currentTarget.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") { e.preventDefault(); void submit(); }
+            else if (e.key === "Escape") { e.preventDefault(); setEditing(false); }
+          }}
+        />
+        <Show when={hasChildren()}>
+          <label class="ctx-template-toggle">
+            <input
+              type="checkbox"
+              checked={includeParent()}
+              onChange={(e) => setIncludeParent(e.currentTarget.checked)}
+            />
+            Include parent block
+          </label>
+        </Show>
+        <button class="ctx-template-submit" onClick={() => void submit()}>
+          Create template
+        </button>
+      </div>
+    </Show>
   );
 }
 

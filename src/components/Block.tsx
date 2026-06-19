@@ -56,7 +56,7 @@ import { blockView, isPropertyLine } from "../render/block";
 import { InlineText } from "../render/inline";
 import { BodyContent } from "../render/body";
 import { QueryMacro, EmbedMacro } from "./Macro";
-import { openPdf, workflow, zoomInto, openContextMenu, openDatePicker, openBlockInSidebar, graphMeta } from "../ui";
+import { openPdf, workflow, zoomInto, openContextMenu, openDatePicker, openBlockInSidebar, graphMeta, dataRev } from "../ui";
 import { matchesCommand } from "../keybindings";
 import { HL_COLOR_BG, HL_COLOR_SOLID } from "../pdf";
 import { cycleMarkerSmart } from "../editor/repeat";
@@ -441,10 +441,15 @@ function todayJournalName(d = new Date()): string {
 // Template support: session-cached list of templates, dynamic-var substitution,
 // and DTO→outline conversion for insertion.
 let templateCache: import("../types").TemplateDto[] | null = null;
+let templateCacheRev = -1;
 async function getTemplates(): Promise<import("../types").TemplateDto[]> {
-  if (templateCache) return templateCache;
+  // Re-fetch when the graph has changed since the last fetch (keyed on dataRev),
+  // so a template just created (here or externally) shows up without a reload.
+  const rev = dataRev();
+  if (templateCache && templateCacheRev === rev) return templateCache;
   try {
     templateCache = await backend().listTemplates();
+    templateCacheRev = rev;
   } catch {
     templateCache = [];
   }
