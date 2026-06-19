@@ -99,7 +99,16 @@ function tokenize(src: string): Tok[] {
     } else if (c === '"') {
       let j = i + 1;
       let s = "";
-      while (j < ch.length && ch[j] !== '"') s += ch[j++];
+      // Escape-aware: `\"`/`\\` are literal quote/backslash, so a quote inside
+      // the value doesn't end the string early (mirrors query.rs::tokenize).
+      while (j < ch.length && ch[j] !== '"') {
+        if (ch[j] === "\\" && j + 1 < ch.length) {
+          s += ch[j + 1];
+          j += 2;
+        } else {
+          s += ch[j++];
+        }
+      }
       toks.push({ t: "str", v: s, s: i, e: j + 1 });
       i = j + 1;
     } else {
@@ -293,11 +302,21 @@ export function parseQuery(dsl: string): Clause {
 // Serializer (Clause -> DSL string)
 // ---------------------------------------------------------------------------
 
+// Wrap a value in a DSL double-quoted string, escaping `\` and `"` so a value
+// containing a quote (or backslash) round-trips faithfully — the tokenizer
+// below (and query.rs::tokenize) unescape the same way. Without this, a value
+// like `foo "bar"` serialized to `"foo "bar""` and silently re-parsed as `foo `.
+function quoteStr(s: string): string {
+  return `"${s.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+}
+// Quote when the value can't be a bare word: it has whitespace, is empty, or
+// contains a DSL metacharacter (`(`/`)` would break the paren structure, `"`
+// would start/stop a string mid-word).
 function needsQuote(s: string): boolean {
-  return /\s/.test(s) || s === "";
+  return s === "" || /[\s()"]/.test(s);
 }
 function word(s: string): string {
-  return needsQuote(s) ? `"${s}"` : s;
+  return needsQuote(s) ? quoteStr(s) : s;
 }
 
 function clauseDsl(c: Clause): string {
@@ -333,7 +352,7 @@ function clauseDsl(c: Clause): string {
     case "pageTags":
       return `(page-tags ${c.tags.join(" ")})`;
     case "content":
-      return `"${c.text}"`;
+      return quoteStr(c.text);
     case "raw":
       return c.text;
     case "op": {

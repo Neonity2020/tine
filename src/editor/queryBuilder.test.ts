@@ -72,6 +72,27 @@ describe("parse + serialize round-trip", () => {
     expect(toDsl(t)).toBe('(property title "War and Peace")');
   });
 
+  it("escapes quotes/parens/backslashes in string values so they round-trip", () => {
+    // Full-text content with an embedded quote — was serialized to `"foo "bar""`
+    // and silently truncated to `foo `; now escaped + unescaped symmetrically.
+    const content: Clause = { kind: "op", op: "and", children: [{ kind: "content", text: 'foo "bar"' }] };
+    expect(toDsl(content)).toBe('"foo \\"bar\\""');
+    expect(parseQuery(toDsl(content))).toEqual(content);
+
+    // Property value with whitespace AND a quote.
+    const prop: Clause = { kind: "op", op: "and", children: [{ kind: "property", key: "title", value: 'a "b" c' }] };
+    expect(parseQuery(toDsl(prop))).toEqual(prop);
+
+    // A `)` in a value must force quoting so it can't close the form early.
+    const paren: Clause = { kind: "op", op: "and", children: [{ kind: "property", key: "note", value: "see (x)" }] };
+    expect(toDsl(paren)).toBe('(property note "see (x)")');
+    expect(parseQuery(toDsl(paren))).toEqual(paren);
+
+    // A literal backslash round-trips (escaped on write, unescaped on read).
+    const bs: Clause = { kind: "op", op: "and", children: [{ kind: "content", text: "a\\b" }] };
+    expect(parseQuery(toDsl(bs))).toEqual(bs);
+  });
+
   it("empty query is empty string", () => {
     expect(roundtrip("")).toBe("");
     expect(toDsl(parseQuery(""))).toBe("");

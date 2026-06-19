@@ -765,9 +765,17 @@ fn tokenize(src: &str) -> Vec<Tok> {
         } else if c == '"' {
             let mut j = i + 1;
             let mut s = String::new();
+            // Escape-aware: `\"`/`\\` are a literal quote/backslash, so a quote
+            // inside the value doesn't end the string early (mirrors the
+            // frontend query-builder tokenizer + serializer's quoteStr).
             while j < chars.len() && chars[j] != '"' {
-                s.push(chars[j]);
-                j += 1;
+                if chars[j] == '\\' && j + 1 < chars.len() {
+                    s.push(chars[j + 1]);
+                    j += 2;
+                } else {
+                    s.push(chars[j]);
+                    j += 1;
+                }
             }
             toks.push(Tok::Str(s));
             i = j + 1;
@@ -1000,6 +1008,19 @@ mod tests {
         assert_eq!(pred("(task TODO DOING)"), Pred::Task(vec!["TODO".into(), "DOING".into()]));
         assert_eq!(pred("(property type book)"), Pred::Property("type".into(), Some("book".into())));
         assert_eq!(pred("(property public)"), Pred::Property("public".into(), None));
+    }
+
+    #[test]
+    fn parse_escaped_string_content() {
+        // `\"`/`\\` inside a quoted full-text term are unescaped (mirrors the
+        // query-builder serializer's quoteStr), so a quote in the term doesn't
+        // end the string early and silently truncate the query.
+        assert_eq!(pred("\"foo \\\"bar\\\"\""), Pred::Content("foo \"bar\"".into()));
+        assert_eq!(pred("\"a\\\\b\""), Pred::Content("a\\b".into()));
+        // End-to-end: the term still matches a block whose text contains the quote.
+        let none = ctx_named();
+        let b = DocBlock::new("note: foo \"bar\" baz");
+        assert!(pred("\"foo \\\"bar\\\"\"").eval(&b, &none));
     }
 
     #[test]
