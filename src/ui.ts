@@ -151,7 +151,11 @@ export function setCarryDays(n: number) {
 const AGENDA_BACK_KEY = "logseq-claude.agendaDaysBack";
 const AGENDA_AHEAD_KEY = "logseq-claude.agendaDaysAhead";
 function loadDays(key: string, def: number): number {
-  const n = Number(loadStr(key));
+  // An UNSET key must fall back to `def` — not 0. (Number(null) and Number("")
+  // are both 0, which silently turned the unset 7/7 agenda window into 0/0.)
+  const raw = loadStr(key);
+  if (raw === null || raw.trim() === "") return def;
+  const n = Number(raw);
   return Number.isFinite(n) && n >= 0 ? n : def;
 }
 export const [agendaDaysBack, setAgendaDaysBackSig] = createSignal(loadDays(AGENDA_BACK_KEY, 7));
