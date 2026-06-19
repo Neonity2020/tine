@@ -244,8 +244,17 @@ export const [graphMeta, setGraphMeta] = createSignal<GraphMeta | null>(null);
  *  meta so the UI reflects it immediately. */
 export function setJournalTemplate(name: string | null) {
   const m = graphMeta();
+  const prev = m?.default_journal_template ?? null;
   if (m) setGraphMeta({ ...m, default_journal_template: name });
-  void backend().setDefaultJournalTemplate(name).catch(() => {});
+  // On a config-write failure, revert the optimistic UI + tell the user, rather
+  // than silently showing a template that wasn't actually persisted.
+  void backend()
+    .setDefaultJournalTemplate(name)
+    .catch((e) => {
+      const cur = graphMeta();
+      if (cur) setGraphMeta({ ...cur, default_journal_template: prev });
+      pushToast(`Couldn't save the journal template setting. (${String(e)})`, "error");
+    });
 }
 // Bumped when the open graph changes, so views reload against the new graph.
 export const [graphEpoch, setGraphEpoch] = createSignal(0);

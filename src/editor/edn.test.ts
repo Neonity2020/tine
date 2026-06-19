@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { quoteEdnString, unquoteEdnString, splitTrailingMap } from "./edn";
+import { quoteEdnString, unquoteEdnString, splitTrailingMap, queryMacroExtent } from "./edn";
 
 describe("edn helpers", () => {
   it("quote/unquote round-trips quotes and backslashes", () => {
@@ -21,5 +21,19 @@ describe("edn helpers", () => {
     });
     // A brace inside the form (no trailing map) → no opts.
     expect(splitTrailingMap('(todo "x}")')).toEqual({ form: '(todo "x}")', opts: "" });
+  });
+
+  it("finds the query macro extent, ignoring }} inside strings", () => {
+    expect(queryMacroExtent("not a macro")).toBeNull();
+    const simple = "{{query (todo)}}";
+    expect(queryMacroExtent(simple)).toEqual({ start: 0, end: simple.length });
+    // `}}` inside a :title string must NOT end the macro early (the round-3 bug).
+    const tricky = '{{query (and (task TODO)) {:title "Sprint }} board"}}}';
+    const e1 = queryMacroExtent(tricky)!;
+    expect(tricky.slice(e1.start, e1.end)).toBe(tricky);
+    // Trailing property lines after the macro are excluded (so a rewrite keeps them).
+    const withProps = '{{query (todo) {:title "A"}}}\nid:: abc';
+    const e2 = queryMacroExtent(withProps)!;
+    expect(withProps.slice(e2.start, e2.end)).toBe('{{query (todo) {:title "A"}}}');
   });
 });
