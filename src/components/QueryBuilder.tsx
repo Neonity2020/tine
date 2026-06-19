@@ -26,6 +26,7 @@ import {
   type BetweenField,
 } from "../editor/queryBuilder";
 import { DATE_PRESETS, previewDate } from "../editor/dateExpr";
+import { queryBuilderAutoOpen, setQueryBuilderAutoOpen } from "../ui";
 
 // Interactive query builder: an OG-style chip-bar over a {{query}} DSL string.
 // The DSL text is the single source of truth — we parse it to a tree, apply an
@@ -42,11 +43,16 @@ type ClauseKind = Clause["kind"];
 export function QueryBuilder(props: {
   dsl: () => string;
   onChange: (dsl: string) => void;
+  blockId?: string;
 }): JSX.Element {
   const tree = createMemo(() => parseQuery(props.dsl()));
   // Which popover is open, by op/clause loc + purpose. Only one at a time.
   const [openMenu, setOpenMenu] = createSignal<string | null>(null);
-  const [adding, setAdding] = createSignal<string | null>(null);
+  // Open the root add-picker immediately when this block was just created via
+  // "/Query (visual builder)" — consume the one-shot flag so only this block does.
+  const autoOpen = !!props.blockId && queryBuilderAutoOpen() === props.blockId;
+  if (autoOpen) setQueryBuilderAutoOpen(null);
+  const [adding, setAdding] = createSignal<string | null>(autoOpen ? "add:" : null);
 
   const apply = (next: Clause) => {
     props.onChange(toDsl(next));
@@ -127,7 +133,7 @@ function OpGroup(props: NodeCtx): JSX.Element {
           <Node {...props} clause={child} loc={[...props.loc, i()]} isRoot={false} />
         )}
       </For>
-      <AddButton {...props} />
+      <AddButton {...props} prominent={props.isRoot && op().children.length === 0} />
       <Show when={!props.isRoot}>
         <ChipMenu {...props} />
         <span class="qb-bracket">)</span>
@@ -200,21 +206,24 @@ function ChipMenu(props: NodeCtx): JSX.Element {
   );
 }
 
-// "+" button that opens the add-filter picker, scoped to the op at `loc`.
-function AddButton(props: NodeCtx): JSX.Element {
+// "+" button that opens the add-filter picker, scoped to the op at `loc`. When
+// `prominent` (an empty query), render an inviting "➕ Add filter" call-to-action
+// instead of a bare "+", so leaving the bullet reveals an obvious next step.
+function AddButton(props: NodeCtx & { prominent?: boolean }): JSX.Element {
   const key = () => `add:${locKey(props.loc)}`;
   const open = () => props.adding() === key();
   return (
     <span class="qb-add-wrap">
       <button
         class="qb-add"
+        classList={{ "qb-add-prominent": props.prominent }}
         title="Add filter"
         onClick={(e) => {
           stop(e);
           props.setAdding(open() ? null : key());
         }}
       >
-        +
+        {props.prominent ? "➕ Add filter" : "+"}
       </button>
       <Show when={open()}>
         <AddPicker

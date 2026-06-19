@@ -81,7 +81,8 @@ describe("filterCommands", () => {
       "Heading 3",
       "Heading 4",
     ]);
-    expect(filterCommands("query").map((c) => c.label)).toEqual(["Query"]);
+    // Exact/shorter "Query" ranks ahead of the longer "Query (visual builder)".
+    expect(filterCommands("query").map((c) => c.label)).toEqual(["Query", "Query (visual builder)"]);
     // Action commands surface too.
     expect(filterCommands("scheduled").map((c) => c.label)).toEqual(["Scheduled"]);
     expect(filterCommands("upload").map((c) => c.label)).toEqual(["Upload an asset"]);

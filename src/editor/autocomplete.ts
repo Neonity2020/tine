@@ -82,6 +82,7 @@ export type CommandAction =
   | "upload-asset"
   | "now-time"
   | "today"
+  | "query-builder"
   | "priority-a"
   | "priority-b"
   | "priority-c";
@@ -127,6 +128,7 @@ export const COMMANDS: Command[] = [
   { label: "Quote", insert: "> " },
   { label: "Divider", insert: "---" },
   { label: "Query", insert: "{{query }}", caret: 8 },
+  { label: "Query (visual builder)", action: "query-builder" },
   { label: "Embed", insert: "{{embed }}", caret: 8 },
   { label: "Math block", insert: "$$$$", caret: 2 },
   { label: "Current time", action: "now-time" },

@@ -2163,6 +2163,25 @@ mark {
   cursor: pointer;
 }
 
+.query-title-editable {
+  cursor: text;
+  border-radius: 4px;
+  padding: 0 3px;
+}
+.query-title-editable:hover {
+  background: var(--bg-tertiary);
+}
+.query-title-input {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+  background: var(--bg-primary);
+  border: 1px solid var(--link-color);
+  border-radius: 4px;
+  padding: 1px 5px;
+  width: 12em;
+}
+
 /* ------------------------------------------------------ query builder bar */
 .qb-bar {
   display: flex;
@@ -2241,6 +2260,18 @@ mark {
 }
 .qb-add:hover {
   color: var(--link-color);
+  border-color: var(--link-color);
+}
+/* Empty-query call-to-action: a labelled pill instead of a bare round "+". */
+.qb-add-prominent {
+  width: auto;
+  height: auto;
+  border-radius: 6px;
+  padding: 3px 10px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--link-color);
+  border-style: solid;
   border-color: var(--link-color);
 }
 .qb-menu,

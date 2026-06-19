@@ -179,6 +179,11 @@ export function agendaQuery(): string {
   return `query (or (between scheduled ${lo} ${hi}) (between deadline ${lo} ${hi}))`;
 }
 
+// When a query block is created via the "/Query (visual builder)" command, hold
+// its block id so the freshly-rendered QueryBuilder opens its add-filter picker
+// immediately (the block id, consumed once on mount, then cleared).
+export const [queryBuilderAutoOpen, setQueryBuilderAutoOpen] = createSignal<string | null>(null);
+
 // Remember the window's pre-focus fullscreen state so exiting focus restores it
 // (rather than always dropping out of fullscreen if the user was already in it).
 let preFocusFullscreen = false;

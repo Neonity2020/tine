@@ -56,7 +56,7 @@ import { blockView, isPropertyLine } from "../render/block";
 import { InlineText } from "../render/inline";
 import { BodyContent } from "../render/body";
 import { QueryMacro, EmbedMacro } from "./Macro";
-import { openPdf, workflow, zoomInto, openContextMenu, openDatePicker, openBlockInSidebar, graphMeta, dataRev } from "../ui";
+import { openPdf, workflow, zoomInto, openContextMenu, openDatePicker, openBlockInSidebar, graphMeta, dataRev, setQueryBuilderAutoOpen } from "../ui";
 import { matchesCommand } from "../keybindings";
 import { HL_COLOR_BG, HL_COLOR_SOLID } from "../pdf";
 import { cycleMarkerSmart } from "../editor/repeat";
@@ -706,6 +706,17 @@ function Editor(props: { id: string }): JSX.Element {
       case "now-time":
         replaceTrigger(timeStamp());
         return;
+      case "query-builder": {
+        // Insert an empty query, commit it, and drop straight to the rendered
+        // view so the visual builder appears — then flag this block so the
+        // builder opens its add-filter picker on mount.
+        const r = applyCompletion(ref.value, t.start, t.end, "{{query }}");
+        commit(r.raw);
+        closeAc();
+        setQueryBuilderAutoOpen(props.id);
+        setEditingId(null);
+        return;
+      }
       case "today":
         replaceTrigger(pageInsert(todayJournalName()));
         return;
