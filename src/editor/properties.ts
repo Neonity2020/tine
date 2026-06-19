@@ -50,9 +50,10 @@ export function splitProps(
   return { visible: vis.join("\n"), hidden: hid.join("\n") };
 }
 
-/** Reattach hidden property lines below the visible text. */
+/** Reattach hidden property lines below the visible text. A metadata-only block
+ *  (empty visible) is just its hidden lines — no spurious leading newline. */
 export function joinProps(visible: string, hidden: string): string {
-  return hidden ? `${visible}\n${hidden}` : visible;
+  return hidden ? (visible ? `${visible}\n${hidden}` : hidden) : visible;
 }
 
 /** First value for `key` (case-insensitive) in a property block, or null. */

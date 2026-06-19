@@ -268,6 +268,15 @@ describe("property splitting is fence-aware", () => {
     expect(joinProps(visible, hidden)).toBe(raw);
   });
 
+  it("joinProps on a metadata-only block adds no leading blank line", () => {
+    // splitProps of "id:: x" → visible "", hidden "id:: x"; reassembly must not
+    // prepend a newline (that would corrupt the block with a blank first line).
+    const { visible, hidden } = splitProps("id:: x", isBuiltinHidden);
+    expect(visible).toBe("");
+    expect(hidden).toBe("id:: x");
+    expect(joinProps(visible, hidden)).toBe("id:: x");
+  });
+
   it("hideAll (annotation blocks) is ALSO fence-aware — a key:: inside a fence stays", () => {
     // The old annotation splitter wasn't fence-aware and would yank this out.
     const raw = "highlight text\n```\nkey:: not-a-prop\n```\nls-type:: annotation\nhl-page:: 3";

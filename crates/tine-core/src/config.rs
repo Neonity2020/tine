@@ -330,7 +330,11 @@ fn find_keyword(s: &str, key: &str) -> Option<usize> {
             _ if s[i..].starts_with(key) => {
                 let after = i + key.len();
                 let boundary = after >= b.len()
-                    || matches!(b[after], b' ' | b'\t' | b'\n' | b'\r' | b'"' | b'{' | b'}' | b',');
+                    || matches!(
+                        b[after],
+                        b' ' | b'\t' | b'\n' | b'\r' | b'"' | b'{' | b'}'
+                            | b'[' | b']' | b'(' | b')' | b'#' | b','
+                    );
                 if boundary {
                     return Some(i);
                 }
@@ -475,11 +479,17 @@ fn parse_string_vector(edn: &str, key: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut i = from + 1;
     while i < close {
-        if b[i] == b'"' {
-            out.push(read_string_at(edn, i));
-            i = edn_str_end(edn, i);
-        } else {
-            i += 1;
+        match b[i] {
+            b'"' => {
+                out.push(read_string_at(edn, i));
+                i = edn_str_end(edn, i);
+            }
+            b';' => {
+                while i < close && b[i] != b'\n' {
+                    i += 1; // skip a `;` comment (a commented-out entry isn't a value)
+                }
+            }
+            _ => i += 1,
         }
     }
     out
@@ -509,10 +519,14 @@ fn parse_keyword_set(edn: &str, key: &str) -> Vec<String> {
     }
     let brace = from + 1;
     let close = match_close_brace(edn, brace);
+    // Sets hold only keywords (no strings), so a `;` is always a comment — drop
+    // the commented tail of each line before collecting keywords.
     edn[brace + 1..close]
-        .split_whitespace()
+        .lines()
+        .map(|l| &l[..l.find(';').unwrap_or(l.len())])
+        .flat_map(str::split_whitespace)
         .filter_map(|t| t.strip_prefix(':'))
-        .map(|t| t.to_string())
+        .map(str::to_string)
         .collect()
 }
 
@@ -552,6 +566,12 @@ fn parse_shortcuts(edn: &str) -> HashMap<String, String> {
                 let vclose = match_close_bracket(edn, vfrom);
                 let mut k = vfrom + 1;
                 while k < vclose {
+                    if b[k] == b';' {
+                        while k < vclose && b[k] != b'\n' {
+                            k += 1; // skip a `;` comment before the first binding
+                        }
+                        continue;
+                    }
                     if b[k] == b'"' {
                         map.insert(key.clone(), read_string_at(edn, k));
                         break;
@@ -625,6 +645,22 @@ mod tests {
         let cfg = Config::parse(edn);
         assert_eq!(cfg.start_of_week, 1);
         assert_eq!(cfg.block_hidden_properties, vec!["public".to_string(), "icon".to_string()]);
+    }
+
+    #[test]
+    fn collection_readers_skip_comments_and_read_compact_edn() {
+        // `;` comments INSIDE a vector/set are not read as values (the up-front
+        // strip_edn_comments pass was removed; the collection scans skip comments).
+        let cfg = Config::parse("{:favorites [\"A\" ;; \"B\"\n \"C\"]}");
+        assert_eq!(cfg.favorites, vec!["A".to_string(), "C".to_string()]);
+        let cfg = Config::parse("{:block-hidden-properties #{:public ;; :secret\n :icon}}");
+        assert_eq!(cfg.block_hidden_properties, vec!["public".to_string(), "icon".to_string()]);
+        // Compact (whitespace-free) EDN: the key boundary now includes `[` / `#`.
+        assert_eq!(Config::parse("{:favorites[\"X\"]}").favorites, vec!["X".to_string()]);
+        assert_eq!(
+            Config::parse("{:block-hidden-properties#{:id}}").block_hidden_properties,
+            vec!["id".to_string()]
+        );
     }
 
     #[test]
