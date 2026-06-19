@@ -42,7 +42,7 @@ import { backend, type BackupInfo } from "../backend";
 type Tab = "appearance" | "tasks" | "backups" | "graph" | "shortcuts";
 const TABS: { id: Tab; label: string }[] = [
   { id: "appearance", label: "Appearance" },
-  { id: "tasks", label: "Tasks & carry-over" },
+  { id: "tasks", label: "Journals & tasks" },
   { id: "backups", label: "Backups" },
   { id: "graph", label: "Graph" },
   { id: "shortcuts", label: "Keyboard shortcuts" },
