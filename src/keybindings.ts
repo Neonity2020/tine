@@ -212,6 +212,19 @@ export function matchesCommand(e: KeyboardEvent, id: string): boolean {
   return chordEq(eventToChord(e), cs[0]);
 }
 
+/** The editor-scoped command id whose configured (single-chord) binding matches
+ *  the event, or null. Lets the block editor dispatch via a handler table instead
+ *  of a long sequence of matchesCommand checks. */
+export function editorCommandFor(e: KeyboardEvent): string | null {
+  const chord = eventToChord(e);
+  for (const c of COMMANDS) {
+    if (c.scope !== "editor") continue;
+    const cs = bindings[c.id];
+    if (cs && cs.length === 1 && chordEq(chord, cs[0])) return c.id;
+  }
+  return null;
+}
+
 /** Runnable global commands for the command palette / Ctrl-K Commands group:
  *  every global command with a run handler, with its effective binding. The
  *  switcher itself is excluded (no point launching the launcher). */

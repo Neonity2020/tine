@@ -54,7 +54,7 @@ import { blockView } from "../render/block";
 import { BodyContent } from "../render/body";
 import { QueryMacro, EmbedMacro } from "./Macro";
 import { workflow, zoomInto, openContextMenu, openDatePicker, openBlockInSidebar, graphMeta, dataRev, setQueryBuilderAutoOpen, openPageProps } from "../ui";
-import { matchesCommand } from "../keybindings";
+import { editorCommandFor } from "../keybindings";
 import { cycleMarkerSmart } from "../editor/repeat";
 import { applyTemplateVars } from "../editor/templateVars";
 import { caretAtFirstRow, caretAtLastRow } from "../editor/caretRows";
@@ -749,6 +749,83 @@ function Editor(props: { id: string }): JSX.Element {
     acTimer = setTimeout(() => void updateAutocomplete(), 90);
   };
 
+  // Move the block up/down among siblings, keeping edit mode + caret (the DOM
+  // reorder briefly blurs the textarea; cross-day it remounts).
+  const moveBlockCmd = (e: KeyboardEvent, dir: 1 | -1): boolean => {
+    e.preventDefault();
+    const start = ref.selectionStart;
+    commit(ref.value);
+    setBlockMoving(true);
+    startEditing(props.id, start);
+    void moveBlockFeed(props.id, dir).then(() => {
+      requestAnimationFrame(() => {
+        if (ref.isConnected) {
+          ref.focus();
+          const o = Math.min(start, ref.value.length);
+          ref.setSelectionRange(o, o);
+        }
+        setBlockMoving(false);
+      });
+    });
+    return true;
+  };
+  // Shift+Up/Down: start a block selection only when the caret is on the block's
+  // first/last VISUAL row (source-`\n` pre-filter + visual-row check, so a long
+  // wrapped line isn't treated as one line). Off the edge → return false so the
+  // textarea extends the selection by a wrapped line natively.
+  const selectBlockCmd = (e: KeyboardEvent, dir: 1 | -1): boolean => {
+    const start = ref.selectionStart;
+    const raw = ref.value;
+    const atEdge =
+      dir > 0
+        ? !raw.slice(start).includes("\n") && caretAtLastRow(ref, start)
+        : !raw.slice(0, start).includes("\n") && caretAtFirstRow(ref, start);
+    if (!atEdge) return false;
+    e.preventDefault();
+    commit(raw);
+    selectBlock(props.id);
+    moveSelection(dir, true);
+    return true;
+  };
+  const cycleTodoCmd = () => {
+    const start = ref.selectionStart;
+    const { raw: newRaw, delta } = cycleMarkerSmart(ref.value, workflow());
+    commit(newRaw);
+    const pos = Math.max(0, start + delta);
+    queueMicrotask(() => {
+      ref.value = newRaw;
+      ref.setSelectionRange(pos, pos);
+      autosize();
+    });
+  };
+
+  // Editor command handlers keyed by command id (see keybindings.ts). Each does
+  // its own preventDefault when it handles the event and returns whether it did
+  // (false → fall through to native handling). Read ref fresh at call time.
+  const runEditorCmd: Record<string, (e: KeyboardEvent) => boolean> = {
+    "editor/bold": (e) => { e.preventDefault(); applyEdit(toggleWrap(ref.value, ref.selectionStart, ref.selectionEnd, "**")); return true; },
+    "editor/italics": (e) => { e.preventDefault(); applyEdit(toggleWrap(ref.value, ref.selectionStart, ref.selectionEnd, "*")); return true; },
+    "editor/strike-through": (e) => { e.preventDefault(); applyEdit(toggleWrap(ref.value, ref.selectionStart, ref.selectionEnd, "~~")); return true; },
+    "editor/highlight": (e) => { e.preventDefault(); applyEdit(toggleWrap(ref.value, ref.selectionStart, ref.selectionEnd, "==")); return true; },
+    "editor/insert-link": (e) => { e.preventDefault(); applyEdit(insertLink(ref.value, ref.selectionStart, ref.selectionEnd)); return true; },
+    "editor/clear-block": (e) => { e.preventDefault(); applyEdit({ text: "", start: 0, end: 0 }); return true; },
+    "editor/kill-line-before": (e) => { e.preventDefault(); applyEdit(killLineBefore(ref.value, ref.selectionStart)); return true; },
+    "editor/kill-line-after": (e) => { e.preventDefault(); applyEdit(killLineAfter(ref.value, ref.selectionStart)); return true; },
+    "editor/backward-kill-word": (e) => { e.preventDefault(); applyEdit(killWordBackward(ref.value, ref.selectionStart)); return true; },
+    "editor/forward-kill-word": (e) => { e.preventDefault(); applyEdit(killWordForward(ref.value, ref.selectionStart)); return true; },
+    "editor/backward-word": (e) => { e.preventDefault(); moveCaret(wordBackward(ref.value, ref.selectionStart)); return true; },
+    "editor/forward-word": (e) => { e.preventDefault(); moveCaret(wordForward(ref.value, ref.selectionStart)); return true; },
+    "editor/move-block-up": (e) => moveBlockCmd(e, -1),
+    "editor/move-block-down": (e) => moveBlockCmd(e, 1),
+    "editor/collapse": (e) => { e.preventDefault(); setCollapsed(props.id, true); return true; },
+    "editor/expand": (e) => { e.preventDefault(); setCollapsed(props.id, false); return true; },
+    "editor/select-block-up": (e) => selectBlockCmd(e, -1),
+    "editor/select-block-down": (e) => selectBlockCmd(e, 1),
+    "editor/cycle-todo": (e) => { e.preventDefault(); cycleTodoCmd(); return true; },
+    "editor/indent": (e) => { e.preventDefault(); commit(ref.value); indentBlock(props.id, ref.selectionStart); return true; },
+    "editor/outdent": (e) => { e.preventDefault(); commit(ref.value); outdentBlock(props.id, ref.selectionStart); return true; },
+  };
+
   const onKeyDown = (e: KeyboardEvent) => {
     const start = ref.selectionStart;
     const end = ref.selectionEnd;
@@ -779,97 +856,14 @@ function Editor(props: { id: string }): JSX.Element {
       }
     }
 
-    // Inline-format toggles + Emacs-style motions (pure text ops in format.ts).
-    if (matchesCommand(e, "editor/bold")) { e.preventDefault(); applyEdit(toggleWrap(raw, start, end, "**")); return; }
-    if (matchesCommand(e, "editor/italics")) { e.preventDefault(); applyEdit(toggleWrap(raw, start, end, "*")); return; }
-    if (matchesCommand(e, "editor/strike-through")) { e.preventDefault(); applyEdit(toggleWrap(raw, start, end, "~~")); return; }
-    if (matchesCommand(e, "editor/highlight")) { e.preventDefault(); applyEdit(toggleWrap(raw, start, end, "==")); return; }
-    if (matchesCommand(e, "editor/insert-link")) { e.preventDefault(); applyEdit(insertLink(raw, start, end)); return; }
-    if (matchesCommand(e, "editor/clear-block")) { e.preventDefault(); applyEdit({ text: "", start: 0, end: 0 }); return; }
-    if (matchesCommand(e, "editor/kill-line-before")) { e.preventDefault(); applyEdit(killLineBefore(raw, start)); return; }
-    if (matchesCommand(e, "editor/kill-line-after")) { e.preventDefault(); applyEdit(killLineAfter(raw, start)); return; }
-    if (matchesCommand(e, "editor/backward-kill-word")) { e.preventDefault(); applyEdit(killWordBackward(raw, start)); return; }
-    if (matchesCommand(e, "editor/forward-kill-word")) { e.preventDefault(); applyEdit(killWordForward(raw, start)); return; }
-    if (matchesCommand(e, "editor/backward-word")) { e.preventDefault(); moveCaret(wordBackward(raw, start)); return; }
-    if (matchesCommand(e, "editor/forward-word")) { e.preventDefault(); moveCaret(wordForward(raw, start)); return; }
+    // Configurable editor commands → one dispatch through the handler table
+    // (runEditorCmd) instead of ~20 sequential matchesCommand checks. A handler
+    // returns false to fall through — select-block does this off the block edge
+    // so the textarea extends the selection by a wrapped line.
+    const cmd = editorCommandFor(e);
+    if (cmd && runEditorCmd[cmd]?.(e)) return;
 
-    // Configurable editor shortcuts (resolved against config.edn :shortcuts).
-    // Move block up/down: reorder among siblings, keeping edit mode + caret
-    // (the DOM reorder can briefly blur the textarea).
-    if (matchesCommand(e, "editor/move-block-up") || matchesCommand(e, "editor/move-block-down")) {
-      e.preventDefault();
-      const dir = matchesCommand(e, "editor/move-block-down") ? 1 : -1;
-      commit(raw);
-      // Keep editing the moved block with the caret intact. Within a day the DOM
-      // node is reordered (blurs the textarea); across days it remounts on the
-      // new day. Guard the blur, pre-store the caret (so a cross-day remount
-      // restores it), then refocus the surviving node once the move settles.
-      setBlockMoving(true);
-      startEditing(props.id, start);
-      void moveBlockFeed(props.id, dir).then(() => {
-        requestAnimationFrame(() => {
-          if (ref.isConnected) {
-            ref.focus();
-            const o = Math.min(start, ref.value.length);
-            ref.setSelectionRange(o, o);
-          }
-          setBlockMoving(false);
-        });
-      });
-      return;
-    }
-
-    // Collapse / expand the current block's children (ctrl+up / ctrl+down).
-    if (matchesCommand(e, "editor/collapse")) {
-      e.preventDefault();
-      setCollapsed(props.id, true);
-      return;
-    }
-    if (matchesCommand(e, "editor/expand")) {
-      e.preventDefault();
-      setCollapsed(props.id, false);
-      return;
-    }
-
-    // Select block up/down: only when the caret is on the block's first/last
-    // VISUAL row start a block selection (current block + neighbour) — otherwise
-    // fall through and let the textarea extend the selection by one wrapped line.
-    // The cheap source-`\n` test is a pre-filter; the visual-row check then rules
-    // out a long single line that merely wraps (where there's no `\n` but the
-    // caret isn't actually on the first/last visual row).
-    if (matchesCommand(e, "editor/select-block-up") || matchesCommand(e, "editor/select-block-down")) {
-      const down = matchesCommand(e, "editor/select-block-down");
-      const atEdge = down
-        ? !raw.slice(start).includes("\n") && caretAtLastRow(ref, start)
-        : !raw.slice(0, start).includes("\n") && caretAtFirstRow(ref, start);
-      if (atEdge) {
-        e.preventDefault();
-        commit(raw);
-        selectBlock(props.id);
-        moveSelection(down ? 1 : -1, true);
-        return;
-      }
-    }
-
-    if (matchesCommand(e, "editor/cycle-todo")) {
-      e.preventDefault();
-      const { raw: newRaw, delta } = cycleMarkerSmart(raw, workflow());
-      commit(newRaw);
-      const pos = Math.max(0, start + delta);
-      queueMicrotask(() => {
-        ref.value = newRaw;
-        ref.setSelectionRange(pos, pos);
-        autosize();
-      });
-    } else if (matchesCommand(e, "editor/indent")) {
-      e.preventDefault();
-      commit(raw);
-      indentBlock(props.id, start);
-    } else if (matchesCommand(e, "editor/outdent")) {
-      e.preventDefault();
-      commit(raw);
-      outdentBlock(props.id, start);
-    } else if (e.key === "Enter" && !e.shiftKey && !e.ctrlKey && !e.metaKey) {
+    if (e.key === "Enter" && !e.shiftKey && !e.ctrlKey && !e.metaKey) {
       e.preventDefault();
       commit(raw); // flush current text
       if (isAnnot()) {
