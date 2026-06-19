@@ -31,7 +31,9 @@ import {
   pageByName,
   carryUnfinished,
   ensurePageLoaded,
+  exportNodesFor,
 } from "./store";
+import { exportOutline, DEFAULT_EXPORT_OPTIONS } from "./editor/exportText";
 import { splitProps, joinProps, isBuiltinHidden, hideAll } from "./editor/properties";
 import { journalTitle } from "./journal";
 import type { BlockDto, PageDto } from "./types";
@@ -224,6 +226,26 @@ describe("cross-day move (journal feed as one list)", () => {
     const res = await moveBlockFeed(today.blocks[0].id, -1);
     expect(res).toBe("none");
     expect(raws("Today")).toEqual(["t1"]);
+  });
+});
+
+describe("exportNodesFor (Copy / export selection)", () => {
+  it("a parent + its selected descendants export ONCE (no child duplication)", () => {
+    // selectedIds() is a flat slice of visible order, so a parent selection
+    // includes its children; exporting must not emit them twice.
+    const parent = blk("parent", [blk("c1"), blk("c2"), blk("c3")]);
+    load([parent]);
+    const ids = [parent.id, parent.children[0].id, parent.children[1].id, parent.children[2].id];
+    const nodes = exportNodesFor(ids);
+    expect(nodes.length).toBe(1); // only the parent root
+    expect(exportOutline(nodes, DEFAULT_EXPORT_OPTIONS)).toBe("- parent\n\t- c1\n\t- c2\n\t- c3");
+  });
+
+  it("sibling roots both export (no false dedup)", () => {
+    const a = blk("a");
+    const b = blk("b");
+    load([a, b]);
+    expect(exportOutline(exportNodesFor([a.id, b.id]), DEFAULT_EXPORT_OPTIONS)).toBe("- a\n- b");
   });
 });
 

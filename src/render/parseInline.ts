@@ -94,10 +94,11 @@ export function parseInline(input: string): Seg[] {
       i += m[0].length;
       continue;
     }
-    // Bare URL autolink (trailing sentence punctuation excluded)
+    // Bare URL autolink (trailing sentence punctuation + closing quotes/brackets
+    // excluded — e.g. `"… https://x"` must not swallow the closing quote).
     m = /^https?:\/\/[^\s<]+/.exec(rest);
     if (m) {
-      const url = m[0].replace(/[.,;:!?)\]]+$/, "");
+      const url = m[0].replace(/[.,;:!?)\]"'}>]+$/, "");
       flush();
       out.push({ t: "link", label: url, url });
       i += url.length;

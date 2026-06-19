@@ -57,6 +57,12 @@ describe("parseInline", () => {
     expect(parseInline("<https://x.com>")).toEqual([
       { t: "link", label: "https://x.com", url: "https://x.com" },
     ]);
+    // a closing quote after the URL is NOT part of the link
+    expect(parseInline('"see https://x.com/p"')).toEqual([
+      { t: "text", v: '"see ' },
+      { t: "link", label: "https://x.com/p", url: "https://x.com/p" },
+      { t: "text", v: '"' },
+    ]);
   });
 
   it("footnote reference", () => {

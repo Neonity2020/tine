@@ -1050,12 +1050,28 @@ export function blockSubtreeMarkdown(id: string, level = 0): string {
 /** Build an ExportNode forest (raw + children) for the given block ids and their
  *  subtrees — input to the configurable text exporter (Copy / Export modal). */
 export function exportNodesFor(ids: string[]): ExportNode[] {
+  const set = new Set(ids);
+  // A multi-selection (selectedIds) is a flat slice of visible order, so it can
+  // contain BOTH a parent and its descendants. Export only the selection's roots
+  // — a kept node's subtree already carries its children, so emitting a selected
+  // child again as a top-level node would duplicate it (the "1 2 3 1 2 3" bug).
+  const hasSelectedAncestor = (id: string): boolean => {
+    let p = doc.byId[id]?.parent ?? null;
+    while (p !== null) {
+      if (set.has(p)) return true;
+      p = doc.byId[p]?.parent ?? null;
+    }
+    return false;
+  };
   const toNode = (id: string): ExportNode | null => {
     const n = doc.byId[id];
     if (!n) return null;
     return { raw: n.raw, children: n.children.map(toNode).filter((x): x is ExportNode => x != null) };
   };
-  return ids.map(toNode).filter((x): x is ExportNode => x != null);
+  return ids
+    .filter((id) => !hasSelectedAncestor(id))
+    .map(toNode)
+    .filter((x): x is ExportNode => x != null);
 }
 
 /** Serialize a fetched BlockDto subtree to Logseq markdown (for pages not in the
