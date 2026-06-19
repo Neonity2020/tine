@@ -930,19 +930,30 @@ const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const pad2 = (n: number) => String(n).padStart(2, "0");
 
 /** Read a block's SCHEDULED/DEADLINE date as {y,m,d} (m 0-based), or null. */
-export function readSchedule(id: string, which: "scheduled" | "deadline"): { y: number; m: number; d: number } | null {
+export function readSchedule(
+  id: string,
+  which: "scheduled" | "deadline"
+): { y: number; m: number; d: number; repeater: string | null } | null {
   const node = doc.byId[id];
   if (!node) return null;
   const tag = which === "scheduled" ? "SCHEDULED" : "DEADLINE";
-  const m = new RegExp(`^${tag}:\\s*<(\\d{4})-(\\d{2})-(\\d{2})`, "m").exec(node.raw);
-  return m ? { y: +m[1], m: +m[2] - 1, d: +m[3] } : null;
+  // Optionally capture an org repeater cookie (`+1w`, `.+1w`, `++1w`) after the
+  // weekday, so re-opening the picker can pre-fill the existing recurrence.
+  const m = new RegExp(
+    `^${tag}:\\s*<(\\d{4})-(\\d{2})-(\\d{2})(?:\\s+[A-Za-z]{3})?(?:\\s+((?:\\.\\+|\\+\\+|\\+)\\d+[dwmy]))?`,
+    "m"
+  ).exec(node.raw);
+  return m ? { y: +m[1], m: +m[2] - 1, d: +m[3], repeater: m[4] ?? null } : null;
 }
 
-/** Set or clear a block's SCHEDULED/DEADLINE org-timestamp (line 2, like OG). */
+/** Set or clear a block's SCHEDULED/DEADLINE org-timestamp (line 2, like OG).
+ *  `repeater` is an org recurrence cookie (`+1w`, `.+1w`, `++1w`) or null — it's
+ *  written inside the `<…>` and consumed by repeat.ts when the task is completed. */
 export function setSchedule(
   id: string,
   which: "scheduled" | "deadline",
-  date: { y: number; m: number; d: number } | null
+  date: { y: number; m: number; d: number } | null,
+  repeater?: string | null
 ) {
   const node = doc.byId[id];
   if (!node) return;
@@ -951,7 +962,8 @@ export function setSchedule(
   const lines = node.raw.split("\n").filter((l) => !new RegExp(`^${tag}:`).test(l.trim()));
   if (date) {
     const wd = WEEKDAYS[new Date(date.y, date.m, date.d).getDay()];
-    const stamp = `${tag}: <${date.y}-${pad2(date.m + 1)}-${pad2(date.d)} ${wd}>`;
+    const rep = repeater ? ` ${repeater}` : "";
+    const stamp = `${tag}: <${date.y}-${pad2(date.m + 1)}-${pad2(date.d)} ${wd}${rep}>`;
     lines.splice(Math.min(1, lines.length), 0, stamp);
   }
   setDoc("byId", id, "raw", lines.join("\n"));

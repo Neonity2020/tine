@@ -1743,6 +1743,39 @@ mark {
 .dp-clear {
   color: var(--marker-todo);
 }
+/* Recurrence row in the date picker */
+.dp-repeat {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border-color);
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.dp-rep-unit {
+  font-size: 12px;
+  max-width: 130px;
+  padding-top: 3px;
+  padding-bottom: 3px;
+}
+.dp-rep-num {
+  width: 46px;
+  padding: 3px 6px;
+  border: 1px solid var(--border-color);
+  border-radius: 5px;
+  background-color: var(--bg-primary);
+  color: var(--text-primary);
+  font-size: 12px;
+}
+.dp-rep-fromdone {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+}
 
 /* code blocks */
 .code-block {

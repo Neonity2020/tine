@@ -24,6 +24,13 @@ export function DatePicker(): JSX.Element {
   );
 }
 
+// Parse an org repeater cookie (`+1w`, `.+1w`, `++1w`) into UI state. `.+` means
+// "measure the next due date from the completion day"; plain `+` from the date.
+function parseRepeater(r: string | null): { unit: string; num: number; fromDone: boolean } {
+  const m = r ? /^(\.\+|\+\+|\+)(\d+)([dwmy])$/.exec(r) : null;
+  return m ? { unit: m[3], num: +m[2], fromDone: m[1] === ".+" } : { unit: "", num: 1, fromDone: false };
+}
+
 function Picker(props: { bid: string; which: "scheduled" | "deadline"; x: number; y: number }): JSX.Element {
   const today = new Date();
   const sel = readSchedule(props.bid, props.which);
@@ -31,6 +38,15 @@ function Picker(props: { bid: string; which: "scheduled" | "deadline"; x: number
     y: sel?.y ?? today.getFullYear(),
     m: sel?.m ?? today.getMonth(),
   });
+
+  // Recurrence: a unit ("" = no repeat), an interval N, and whether the next due
+  // date counts from the completion day (`.+`) or the scheduled date (`+`).
+  const init = parseRepeater(sel?.repeater ?? null);
+  const [repUnit, setRepUnit] = createSignal(init.unit);
+  const [repNum, setRepNum] = createSignal(init.num);
+  const [repFromDone, setRepFromDone] = createSignal(init.fromDone);
+  const repeater = (): string | null =>
+    repUnit() ? `${repFromDone() ? ".+" : "+"}${Math.max(1, repNum())}${repUnit()}` : null;
 
   // Days laid out in weeks (leading blanks for the first-of-month offset).
   const grid = createMemo(() => {
@@ -49,15 +65,16 @@ function Picker(props: { bid: string; which: "scheduled" | "deadline"; x: number
     setView({ y: Math.floor(total / 12), m: ((total % 12) + 12) % 12 });
   };
   const pick = (d: number) => {
-    setSchedule(props.bid, props.which, { y: view().y, m: view().m, d });
+    setSchedule(props.bid, props.which, { y: view().y, m: view().m, d }, repeater());
     closeDatePicker();
   };
   const pickToday = () => {
-    setSchedule(props.bid, props.which, {
-      y: today.getFullYear(),
-      m: today.getMonth(),
-      d: today.getDate(),
-    });
+    setSchedule(
+      props.bid,
+      props.which,
+      { y: today.getFullYear(), m: today.getMonth(), d: today.getDate() },
+      repeater()
+    );
     closeDatePicker();
   };
   const isToday = (d: number) =>
@@ -95,6 +112,40 @@ function Picker(props: { bid: string; which: "scheduled" | "deadline"; x: number
               </Show>
             )}
           </For>
+        </div>
+        <div class="dp-repeat" title="Pick a day to apply the repeat. On completion, a repeating task advances to its next date and reopens.">
+          <select
+            class="settings-select dp-rep-unit"
+            value={repUnit()}
+            onChange={(e) => setRepUnit(e.currentTarget.value)}
+          >
+            <option value="">No repeat</option>
+            <option value="d">Daily</option>
+            <option value="w">Weekly</option>
+            <option value="m">Monthly</option>
+            <option value="y">Yearly</option>
+          </select>
+          <Show when={repUnit()}>
+            <span class="dp-rep-every">every</span>
+            <input
+              class="dp-rep-num"
+              type="number"
+              min="1"
+              value={repNum()}
+              onInput={(e) => setRepNum(Math.max(1, parseInt(e.currentTarget.value, 10) || 1))}
+            />
+            <label
+              class="dp-rep-fromdone"
+              title="Next due date is measured from the day you complete the task, not the scheduled date."
+            >
+              <input
+                type="checkbox"
+                checked={repFromDone()}
+                onChange={(e) => setRepFromDone(e.currentTarget.checked)}
+              />
+              from completion
+            </label>
+          </Show>
         </div>
         <div class="dp-foot">
           <button class="dp-btn" onClick={pickToday}>Today</button>
