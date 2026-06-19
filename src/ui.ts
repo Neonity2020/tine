@@ -198,6 +198,16 @@ export function closePageProps() {
   setPagePropsPanel(null);
 }
 
+// "Copy / export as" modal — a live-preview text export of a block subtree or a
+// multi-block selection, with indent-style + remove options (mirrors OG Logseq).
+export const [exportModal, setExportModal] = createSignal<{ ids: string[] } | null>(null);
+export function openExportModal(ids: string[]) {
+  if (ids.length) setExportModal({ ids });
+}
+export function closeExportModal() {
+  setExportModal(null);
+}
+
 // Remember the window's pre-focus fullscreen state so exiting focus restores it
 // (rather than always dropping out of fullscreen if the user was already in it).
 let preFocusFullscreen = false;

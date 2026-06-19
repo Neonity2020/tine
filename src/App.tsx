@@ -16,6 +16,7 @@ import { RightSidebar } from "./components/RightSidebar";
 import { Settings } from "./components/Settings";
 import { DatePicker } from "./components/DatePicker";
 import { PageProps } from "./components/PageProps";
+import { ExportModal } from "./components/ExportModal";
 import { installKeybindings } from "./keybindings";
 import { installBlockSelectionDrag } from "./blockDrag";
 import { loadGraphPath, persistedGraphPath, refreshAliases } from "./graph";
@@ -295,6 +296,7 @@ export function App(): JSX.Element {
       <ContextMenu />
       <DatePicker />
       <PageProps />
+      <ExportModal />
       <Settings />
       <Toasts />
       <Lightbox />

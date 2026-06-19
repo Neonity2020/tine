@@ -587,6 +587,121 @@ body {
   background: var(--bg-tertiary);
 }
 
+/* Copy / export modal */
+.export-modal {
+  width: 620px;
+  max-width: 94vw;
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 12px;
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.3);
+  padding: 16px;
+  gap: 12px;
+}
+.export-head {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+.export-head .export-count {
+  font-weight: 400;
+  color: var(--text-muted);
+  margin-left: 6px;
+}
+.export-preview {
+  width: 100%;
+  box-sizing: border-box;
+  min-height: 200px;
+  flex: 1 1 auto;
+  resize: vertical;
+  padding: 10px 12px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: var(--bg-secondary, rgba(0, 0, 0, 0.03));
+  color: var(--text-primary);
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 12.5px;
+  line-height: 1.5;
+  white-space: pre;
+  overflow: auto;
+}
+.export-opts {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.export-opt-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.export-opt-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  margin-right: 2px;
+}
+.export-indent-btn {
+  padding: 4px 12px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-size: 12.5px;
+  cursor: pointer;
+}
+.export-indent-btn:hover {
+  background: var(--bg-tertiary);
+}
+.export-indent-btn.active {
+  background: var(--link-color);
+  border-color: var(--link-color);
+  color: #fff;
+}
+.export-toggles {
+  gap: 6px 14px;
+}
+.export-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12.5px;
+  color: var(--text-primary);
+  cursor: pointer;
+}
+.export-foot {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.export-btn-secondary,
+.export-btn-primary {
+  padding: 5px 16px;
+  border-radius: 6px;
+  font-size: 13px;
+  cursor: pointer;
+  border: 1px solid var(--border-color);
+}
+.export-btn-secondary {
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+}
+.export-btn-secondary:hover {
+  background: var(--bg-tertiary);
+}
+.export-btn-primary {
+  background: var(--link-color);
+  border-color: var(--link-color);
+  color: #fff;
+}
+.export-btn-primary:hover {
+  filter: brightness(1.05);
+}
+
 .fav-star.active {
   color: #f5c518;
 }

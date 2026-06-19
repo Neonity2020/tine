@@ -10,6 +10,7 @@ import { createStore, produce, unwrap } from "solid-js/store";
 import { createSignal, createMemo, createRoot } from "solid-js";
 import type { BlockDto, PageDto, PageKind } from "./types";
 import type { OutlineNode } from "./editor/outline";
+import type { ExportNode } from "./editor/exportText";
 import { backend } from "./backend";
 import { markConflict, isConflicted, clearConflict, bumpDataRev, rightSidebar, conflicts, pushToast } from "./ui";
 import { blockView } from "./render/block";
@@ -1082,6 +1083,17 @@ export function blockSubtreeMarkdown(id: string, level = 0): string {
   }
   for (const c of n.children) out.push(blockSubtreeMarkdown(c, level + 1));
   return out.join("\n");
+}
+
+/** Build an ExportNode forest (raw + children) for the given block ids and their
+ *  subtrees — input to the configurable text exporter (Copy / Export modal). */
+export function exportNodesFor(ids: string[]): ExportNode[] {
+  const toNode = (id: string): ExportNode | null => {
+    const n = doc.byId[id];
+    if (!n) return null;
+    return { raw: n.raw, children: n.children.map(toNode).filter((x): x is ExportNode => x != null) };
+  };
+  return ids.map(toNode).filter((x): x is ExportNode => x != null);
 }
 
 /** Serialize a fetched BlockDto subtree to Logseq markdown (for pages not in the

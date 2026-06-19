@@ -11,6 +11,7 @@ import {
   graphMeta,
   setJournalTemplate,
   openPageProps,
+  openExportModal,
 } from "../ui";
 import { openPage, openPageInNewTab, openJournals, route } from "../router";
 import { backend } from "../backend";
@@ -30,6 +31,7 @@ import {
   dtoSubtreeMarkdown,
   flushPage,
   deletePage,
+  selectedIds,
 } from "../store";
 
 // Copy a block reference/embed — but only after the block's id:: is durably on
@@ -323,6 +325,15 @@ function blockActions(id: string): { label: string; run: () => void; danger?: bo
     { label: "Copy block ref", run: () => void copyBlockRef(id, (u) => `((${u}))`, "Copied block ref") },
     { label: "Copy block embed", run: () => void copyBlockRef(id, (u) => `{{embed ((${u}))}}`, "Copied block embed") },
     { label: "Copy block", run: () => { void backend().writeText(blockSubtreeMarkdown(id)); pushToast("Copied block", "success"); } },
+    // Open the export modal for the whole selection (if this block is part of a
+    // multi-selection) or just this block's subtree — preview + indent/remove opts.
+    {
+      label: "Copy / export as…",
+      run: () => {
+        const sel = selectedIds();
+        openExportModal(sel.length > 1 && sel.includes(id) ? sel : [id]);
+      },
+    },
     {
       label: "Cut block",
       run: () => {
