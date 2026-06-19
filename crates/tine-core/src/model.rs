@@ -1098,18 +1098,28 @@ impl Graph {
         }
         // Fast freshness check (B1): if the cache for this page already reflects
         // these exact disk bytes, there's nothing to reconcile — skip the parse +
-        // serialize→parse normalization comparison below. By the disk_revs
-        // invariant, a present, matching entry means the cached doc IS fresh; a
-        // missing/mismatched entry falls through to the exact comparison, so this
+        // serialize→parse normalization comparison below. Read disk_revs WHILE
+        // HOLDING cache.read(): cache_upsert publishes the cache slot and its rev
+        // together under cache.write(), so taking the cache read lock here makes
+        // the reader mutually exclusive with that writer and guarantees a
+        // consistent (cache, rev) pair — without it, the reader could observe a
+        // slot already updated to a new doc while its rev hadn't been inserted yet
+        // (separate lock), match the stale rev against disk, and serve the wrong
+        // doc. Lock order cache → disk_revs matches every writer, so no deadlock;
+        // the guard is dropped before the reconcile path below re-locks the cache.
+        // A missing/mismatched entry falls through to the exact comparison, so this
         // can only ever save work, never serve stale content.
-        if self
-            .disk_revs
-            .read()
-            .unwrap()
-            .get(&rev_key(entry.kind, &entry.name))
-            .is_some_and(|r| *r == disk_rev)
         {
-            return None;
+            let _cache_guard = self.cache.read().unwrap();
+            if self
+                .disk_revs
+                .read()
+                .unwrap()
+                .get(&rev_key(entry.kind, &entry.name))
+                .is_some_and(|r| *r == disk_rev)
+            {
+                return None;
+            }
         }
         let newdoc = doc::parse(content);
         {
