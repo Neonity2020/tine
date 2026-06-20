@@ -457,41 +457,29 @@ describe("carry unfinished tasks → today", () => {
     expect(raws("Older")).toEqual(["DONE x", "just a note"]);
   });
 
-  it("pull-out drops the empty scaffolding it hollows out (no leftover blank bullets)", () => {
+  it("removes the carried tasks and leaves finished tasks AND blank spacer bullets untouched", () => {
     const today = journal(TODAY, [blk("")]);
-    // Each task sits under its own empty parent bullet; pulling the tasks out
-    // would otherwise leave a column of empty bullets.
+    // The reported case: open tasks interleaved with a finished task and a blank
+    // spacer bullet. Carrying must remove ONLY the open tasks; the spacer stays.
     const older = journal("Older", [
-      blk("", [blk("TODO a")]),
-      blk("", [blk("TODO b")]),
+      blk("TODO bla"),
+      blk("TODO ble"),
+      blk("TODO something"),
+      blk("DONE something else"),
+      blk(""), // intentional spacer — must survive the carry
+      blk("DONE another thing"),
     ]);
     loadFeed([today, older]);
-    expect(carryUnfinished(["Older"], false, null)).toBe(2);
-    expect(raws("Older")).toEqual([]); // emptied parents pruned
+    expect(carryUnfinished(["Older"], false, null)).toBe(3);
+    expect(raws("Older")).toEqual(["DONE something else", "", "DONE another thing"]);
   });
 
-  it("pull-out removes bare spacer bullets but keeps real scaffolding/notes", () => {
+  it("leaves a blank parent that only held a carried task (no-task blocks are never touched)", () => {
     const today = journal(TODAY, [blk("")]);
-    const older = journal("Older", [
-      blk("TODO a"),
-      blk(""), // spacer → pruned
-      blk("Project X", [blk("TODO b")]), // text parent → kept (real note)
-      blk("done note"), // text → kept
-      blk(""), // trailing spacer → pruned
-    ]);
-    loadFeed([today, older]);
-    expect(carryUnfinished(["Older"], false, null)).toBe(2);
-    expect(raws("Older")).toEqual(["Project X", "done note"]);
-  });
-
-  it("keeps a blank parent that still has surviving (non-task) children", () => {
-    const today = journal(TODAY, [blk("")]);
-    const older = journal("Older", [blk("", [blk("TODO a"), blk("a kept note")])]);
+    const older = journal("Older", [blk("", [blk("TODO a")])]);
     loadFeed([today, older]);
     carryUnfinished(["Older"], false, null);
-    expect(raws("Older")).toEqual([""]); // blank parent stays — it still holds a note
-    const p = pageByName("Older")!.roots[0];
-    expect(doc.byId[p].children.map((id) => doc.byId[id].raw)).toEqual(["a kept note"]);
+    expect(raws("Older")).toEqual([""]); // the empty parent stays — it had no task marker
   });
 });
 

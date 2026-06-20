@@ -1574,27 +1574,6 @@ function collectTopOpenTasks(id: string, acc: string[]) {
   for (const c of doc.byId[id]?.children ?? []) collectTopOpenTasks(c, acc);
 }
 
-/** Drop blocks that are blank (no text) AND childless, bottom-up. After a pull-out
- *  carry the task's scaffolding parent is left behind; if it (or a pre-existing
- *  spacer) is now an empty leaf, remove it so a carried-from day doesn't read as a
- *  column of blank bullets. Blank blocks that still have children are kept (they're
- *  structural), as is the block being edited. Returns the filtered id list. */
-function pruneBlankLeaves(s: DocState, ids: string[]): string[] {
-  const editing = editingId();
-  const kept: string[] = [];
-  for (const id of ids) {
-    const node = s.byId[id];
-    if (!node) continue;
-    node.children = pruneBlankLeaves(s, node.children);
-    if (id !== editing && node.children.length === 0 && node.raw.trim() === "") {
-      delete s.byId[id];
-    } else {
-      kept.push(id);
-    }
-  }
-  return kept;
-}
-
 /** Carry unfinished tasks from `fromPages` into today's journal. Pages are
  *  processed in the given order and each batch is appended, so passing days
  *  newest→oldest puts the newest on top. `keepContext` true moves each top-level
@@ -1643,13 +1622,10 @@ export function carryUnfinished(
         reassignPage(s, item.id, today);
         carried.push(item.id);
       }
-      // Remove blank bullets the pull-out hollowed out (emptied scaffolding parents
-      // and bare spacers) from each source day, so a carried day isn't a row of
-      // empty bullets. Source pages only — today is built up below.
-      for (const name of new Set(plan.map((i) => i.from))) {
-        const pg = s.pages.find((p) => p.name === name);
-        if (pg) pg.roots = pruneBlankLeaves(s, pg.roots);
-      }
+      // NB: only the carried task blocks are removed from the source day. Anything
+      // the user left behind — finished tasks, notes, and blank spacer bullets — is
+      // never touched. (A blank bullet that only *held* a carried task is likewise
+      // left in place; it never had a task marker itself.)
       // Drop today's lone empty placeholder bullet so carried tasks don't sit
       // under a blank line.
       if (todayPage.roots.length === 1) {
