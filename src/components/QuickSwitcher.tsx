@@ -17,7 +17,16 @@ type Item =
 interface Section {
   header: string;
   items: Item[];
+  // True when the backend had more matches than we display — the count badge
+  // then reads "N+" instead of claiming an exact (and wrong) total.
+  more?: boolean;
 }
+
+// How many results we show per backend-capped section. We fetch one MORE than
+// this; getting it back means "there are more than CAP" (the search stops at the
+// cap, so this never walks the whole graph just to count) → render CAP, badge "+".
+const PAGE_CAP = 12;
+const BLOCK_CAP = 50;
 
 // Ctrl-K: grouped search (Pages / Create / Commands / Blocks), command palette
 // (⌘⇧P, commands-only), and recents on an empty query — mirroring OG's cmdk.
@@ -26,6 +35,11 @@ export function QuickSwitcher(): JSX.Element {
   const [sel, setSel] = createSignal(0);
   let inputRef: HTMLInputElement | undefined;
   let resultsRef: HTMLDivElement | undefined;
+  // X11/WebKitGTK pastes the PRIMARY selection into the focused input on ANY
+  // middle-click (not cancelable from the row's mousedown). We want that paste
+  // only when the user middle-clicks the input itself — so a middle-click on a
+  // result row arms this, and the input's onPaste swallows the one that follows.
+  let swallowNextPaste = false;
   // Scroll the highlighted row into view as the cursor moves across sections.
   createEffect(() => {
     sel();
@@ -48,11 +62,11 @@ export function QuickSwitcher(): JSX.Element {
   onCleanup(() => clearTimeout(qTimer));
   const [pages] = createResource(
     () => (commandsOnly() ? "" : debouncedQuery()),
-    (q) => (q.trim() && !commandsOnly() ? backend().quickSwitch(q, 12) : Promise.resolve([] as PageEntry[]))
+    (q) => (q.trim() && !commandsOnly() ? backend().quickSwitch(q, PAGE_CAP + 1) : Promise.resolve([] as PageEntry[]))
   );
   const [hits] = createResource(
     () => (commandsOnly() ? "" : debouncedQuery()),
-    (q) => (q.trim() && !commandsOnly() ? backend().search(q, 50) : Promise.resolve([]))
+    (q) => (q.trim() && !commandsOnly() ? backend().search(q, BLOCK_CAP + 1) : Promise.resolve([]))
   );
 
   const currentPageName = () => {
@@ -92,10 +106,11 @@ export function QuickSwitcher(): JSX.Element {
 
     const ql = q.toLowerCase();
     // Pages (require contiguous substring — fuzzy subsequence reads as noise here).
-    const pageItems: Item[] = (pages() ?? [])
+    const allPages: Item[] = (pages() ?? [])
       .filter((e) => e.name.toLowerCase().includes(ql))
       .map((e) => ({ t: "page", name: e.name, pageKind: e.kind }));
-    if (pageItems.length) out.push({ header: "Pages", items: pageItems });
+    const pageItems = allPages.slice(0, PAGE_CAP);
+    if (pageItems.length) out.push({ header: "Pages", items: pageItems, more: allPages.length > PAGE_CAP });
 
     // Create page (when no exact match exists).
     const exact = pageItems.some((p) => p.t === "page" && p.name.toLowerCase() === ql);
@@ -117,8 +132,13 @@ export function QuickSwitcher(): JSX.Element {
         (cur && g.page === cur ? curItems : otherItems).push(item);
       }
     }
+    // We asked for BLOCK_CAP + 1; if we got past the cap there are more matches
+    // than we show. Trim the "other" bucket (keep the few current-page hits) so
+    // the rendered total is BLOCK_CAP, and flag the overflow on the Blocks badge.
+    const moreBlocks = curItems.length + otherItems.length > BLOCK_CAP;
+    if (moreBlocks) otherItems.length = Math.max(0, BLOCK_CAP - curItems.length);
     if (curItems.length) out.push({ header: "Current page", items: curItems });
-    if (otherItems.length) out.push({ header: "Blocks", items: otherItems });
+    if (otherItems.length) out.push({ header: "Blocks", items: otherItems, more: moreBlocks });
 
     return out;
   });
@@ -228,6 +248,14 @@ export function QuickSwitcher(): JSX.Element {
               setSel(0);
             }}
             onKeyDown={onKeyDown}
+            onPaste={(e) => {
+              // Middle-click-paste into the search bar stays allowed; only the
+              // paste triggered by middle-clicking a result row is swallowed.
+              if (swallowNextPaste) {
+                e.preventDefault();
+                swallowNextPaste = false;
+              }
+            }}
           />
           <div class="switcher-results" ref={resultsRef}>
             <For each={sections()}>
@@ -235,7 +263,7 @@ export function QuickSwitcher(): JSX.Element {
                 <div class="switcher-section">
                   <div class="switcher-group-header">
                     <span>{section.header}</span>
-                    <span class="switcher-count">{section.items.length}</span>
+                    <span class="switcher-count">{section.items.length}{section.more ? "+" : ""}</span>
                   </div>
                   <For each={section.items}>
                     {(it, iIdx) => {
@@ -250,8 +278,13 @@ export function QuickSwitcher(): JSX.Element {
                             // middle-click autoscroll). Left opens + closes;
                             // middle opens a background tab, switcher stays open.
                             e.preventDefault();
-                            if (e.button === 1) openInBackground(it);
-                            else if (e.button === 0) choose(it);
+                            if (e.button === 1) {
+                              // Swallow the PRIMARY-selection paste this click
+                              // triggers into the (still-focused) search input.
+                              swallowNextPaste = true;
+                              setTimeout(() => (swallowNextPaste = false), 200);
+                              openInBackground(it);
+                            } else if (e.button === 0) choose(it);
                           }}
                         >
                           <Row item={it} query={query()} />
