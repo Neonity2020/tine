@@ -1,6 +1,6 @@
 import { For, Show, createEffect, createSignal, onCleanup, onMount, type JSX } from "solid-js";
 import { doc, mainPages, pageByName, reloadPage, loadSingle, loadFeed, appendFeed, isDirty, editingId, setFeedExtender, flushPage, type FeedPage } from "../store";
-import { route, openPage, openJournals } from "../router";
+import { route, openPage, openJournals, openPageInNewTab } from "../router";
 import {
   zoomedBlock, zoomOut, zoomInto, isFavorite, toggleFavorite,
   markConflict, isConflicted, graphEpoch, openPageInSidebar, openPageContextMenu, carryDays, showCarryButtons,
@@ -340,10 +340,16 @@ function PageSection(props: { page: FeedPage }): JSX.Element {
           <h1
             class="page-title"
             classList={{ "journal-title": props.page.kind === "journal" }}
-            title={props.page.kind === "page" ? "Double-click to rename (shift-click → sidebar)" : "Shift-click to open in sidebar"}
+            title={props.page.kind === "page" ? "Double-click to rename (shift-click → sidebar, middle-click → new tab)" : "Shift-click to open in sidebar, middle-click → new tab"}
             onClick={(e) => {
               if (e.shiftKey) openPageInSidebar(props.page.name, props.page.kind);
               else openPage(props.page.name, props.page.kind);
+            }}
+            onAuxClick={(e) => {
+              if (e.button === 1) {
+                e.preventDefault(); // middle-click → background tab, like a body link
+                openPageInNewTab(props.page.name, props.page.kind);
+              }
             }}
             onDblClick={startRename}
             onContextMenu={(e) => {
