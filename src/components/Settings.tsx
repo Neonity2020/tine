@@ -251,7 +251,7 @@ function AppearanceTab(): JSX.Element {
 
       <Field
         label="Interface size"
-        hint="Zoom the whole interface — Ctrl + / Ctrl − / Ctrl 0. Saved on this device. (When the PDF pane is focused, those keys zoom the PDF instead.)"
+        hint="Zoom the whole interface — Ctrl + / Ctrl − / Ctrl 0, or Ctrl + scroll. Saved on this device. (Over/within the PDF pane, those zoom the PDF instead.)"
       >
         <div style={{ display: "flex", "align-items": "center", gap: "8px" }}>
           <button class="settings-btn" title="Smaller (Ctrl −)" onClick={zoomOut}>−</button>

@@ -82,3 +82,33 @@ export function installInterfaceZoomKeys(): () => void {
   window.addEventListener("keydown", onKey, true);
   return () => window.removeEventListener("keydown", onKey, true);
 }
+
+/** Ctrl/Cmd + mouse-wheel → interface zoom, routed by POINTER (not focus): a wheel
+ *  over the PDF pane is left to PdfViewer's own Ctrl+wheel zoom. We preventDefault
+ *  to suppress the webview's built-in wheel zoom (which would double-zoom and
+ *  desync our tracked level), and coalesce a burst of trackpad/pinch events into at
+ *  most one gentle step per frame so the whole-UI relayout stays smooth. Returns an
+ *  uninstaller. */
+export function installInterfaceZoomWheel(): () => void {
+  let pending = 0;
+  let raf = 0;
+  const flush = () => {
+    raf = 0;
+    const d = pending;
+    pending = 0;
+    if (d !== 0) setZoom(interfaceZoom() * (d < 0 ? 1.1 : 1 / 1.1));
+  };
+  const onWheel = (e: WheelEvent) => {
+    if (!(e.ctrlKey || e.metaKey)) return; // plain scroll → normal scrolling
+    const t = e.target as Element | null;
+    if (t?.closest?.(".pdf-pane")) return; // over the PDF → its own wheel-zoom owns it
+    e.preventDefault(); // own the gesture; stop the webview's native page zoom
+    pending += e.deltaY; // sign-based step is robust to wheel vs. line deltaMode
+    if (!raf) raf = requestAnimationFrame(flush);
+  };
+  window.addEventListener("wheel", onWheel, { passive: false, capture: true });
+  return () => {
+    window.removeEventListener("wheel", onWheel, { capture: true } as EventListenerOptions);
+    if (raf) cancelAnimationFrame(raf);
+  };
+}

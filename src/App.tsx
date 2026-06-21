@@ -47,7 +47,7 @@ import {
   dataRev,
   installPaneTracker,
 } from "./ui";
-import { applyZoom, installInterfaceZoomKeys } from "./zoom";
+import { applyZoom, installInterfaceZoomKeys, installInterfaceZoomWheel } from "./zoom";
 import { editingId, flushAll } from "./store";
 import { isTauri } from "./backend";
 
@@ -128,6 +128,7 @@ export function App(): JSX.Element {
     applyZoom();
     onCleanup(installPaneTracker());
     onCleanup(installInterfaceZoomKeys());
+    onCleanup(installInterfaceZoomWheel());
   });
 
   return (
