@@ -1,8 +1,9 @@
 // Tab-based routing with per-tab navigation history. Each tab holds a back/
 // forward stack of routes; the active tab's current route drives the page view.
-// Middle-click opens links in a new tab; pinned tabs persist across sessions.
-// `route()`/`openPage()`/`openJournals()` keep their old meaning (acting on the
-// active tab) so existing call sites are unchanged.
+// Middle-click opens links in a new tab. The whole tab session is persisted, so
+// relaunching restores every tab in order, with its zoom state, and the same tab
+// focused. `route()`/`openPage()`/`openJournals()` keep their old meaning (acting
+// on the active tab) so existing call sites are unchanged.
 
 import { createSignal } from "solid-js";
 import { pushRecent, resolveAlias } from "./ui";
@@ -23,8 +24,9 @@ export interface Tab {
 let counter = 0;
 const newId = () => `tab-${counter++}`;
 
-const [tabs, setTabs] = createSignal<Tab[]>(restore());
-const [activeId, setActiveId] = createSignal<string>(tabs()[0].id);
+const initial = restore();
+const [tabs, setTabs] = createSignal<Tab[]>(initial.tabs);
+const [activeId, setActiveId] = createSignal<string>(initial.tabs[initial.active].id);
 
 export { tabs, activeId };
 
@@ -152,15 +154,18 @@ export function canGoForward(): boolean {
 export function goBack() {
   if (!canGoBack()) return;
   setTabs(tabs().map((t) => (t.id === activeId() ? { ...t, pos: t.pos - 1 } : t)));
+  persist();
 }
 
 export function goForward() {
   if (!canGoForward()) return;
   setTabs(tabs().map((t) => (t.id === activeId() ? { ...t, pos: t.pos + 1 } : t)));
+  persist();
 }
 
 export function setActiveTab(id: string) {
   setActiveId(id);
+  persist();
 }
 
 /** Close the currently-active tab (Ctrl+W). No-op when it's the only tab. */
@@ -196,38 +201,54 @@ export function reorderTab(dragId: string, targetId: string) {
   persist();
 }
 
-// ---- persistence (pinned tabs only) ----
+// ---- persistence (full session) ----
+//
+// The whole tab session is saved on every change: each tab (not just pinned
+// ones), in order, with its full back/forward history and which entry it's on,
+// plus which tab is active. Routes already carry the zoomed-in block, so a tab
+// zoomed into a bullet comes back zoomed. Saved on launch, restored verbatim.
 
-const KEY = "logseq-claude.pinnedTabs";
+const KEY = "logseq-claude.session";
+
+interface PersistedSession {
+  tabs: { history: Route[]; pos: number; pinned: boolean }[];
+  activeIndex: number;
+}
 
 function persist() {
   try {
-    const pinned = tabs()
-      .filter((t) => t.pinned)
-      .map((t) => tabRoute(t));
-    localStorage.setItem(KEY, JSON.stringify(pinned));
+    const list = tabs();
+    const session: PersistedSession = {
+      tabs: list.map((t) => ({ history: t.history, pos: t.pos, pinned: t.pinned })),
+      activeIndex: Math.max(0, list.findIndex((t) => t.id === activeId())),
+    };
+    localStorage.setItem(KEY, JSON.stringify(session));
   } catch {
     // ignore (e.g. storage disabled)
   }
 }
 
-function restore(): Tab[] {
-  let pinnedRoutes: Route[] = [];
+function restore(): { tabs: Tab[]; active: number } {
   try {
     const raw = localStorage.getItem(KEY);
-    if (raw) pinnedRoutes = JSON.parse(raw);
+    if (raw) {
+      const s = JSON.parse(raw) as PersistedSession;
+      const tabs: Tab[] = (s?.tabs ?? [])
+        .filter((t) => t && Array.isArray(t.history) && t.history.length > 0)
+        .map((t) => ({
+          id: newId(),
+          history: t.history,
+          pos: Math.min(Math.max(0, t.pos | 0), t.history.length - 1),
+          pinned: !!t.pinned,
+        }));
+      if (tabs.length) {
+        const active = Math.min(Math.max(0, s.activeIndex | 0), tabs.length - 1);
+        return { tabs, active };
+      }
+    }
   } catch {
-    pinnedRoutes = [];
+    // fall through to a fresh session
   }
-  const pinned: Tab[] = pinnedRoutes.map((r) => ({
-    id: newId(),
-    history: [r],
-    pos: 0,
-    pinned: true,
-  }));
-  // Always start on a journals tab.
-  return [
-    { id: newId(), history: [{ kind: "journals" }], pos: 0, pinned: false },
-    ...pinned,
-  ];
+  // No (or unreadable) saved session: start on a single journals tab.
+  return { tabs: [{ id: newId(), history: [{ kind: "journals" }], pos: 0, pinned: false }], active: 0 };
 }

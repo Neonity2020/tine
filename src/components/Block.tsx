@@ -1,4 +1,4 @@
-import { Show, Switch, Match, For, createMemo, createSignal, createUniqueId, createEffect, onMount, type JSX } from "solid-js";
+import { Show, Switch, Match, For, createMemo, createSignal, createUniqueId, createEffect, onMount, onCleanup, type JSX } from "solid-js";
 import { backend } from "../backend";
 import {
   detectTrigger,
@@ -492,6 +492,9 @@ function assetMarkdown(name: string): string {
 
 function Editor(props: { id: string }): JSX.Element {
   let ref!: HTMLTextAreaElement;
+  // Caret/selection stashed when the *window* (not this block) loses focus, so
+  // returning to Tine resumes editing exactly where you left off.
+  let savedSel: { start: number; end: number } | null = null;
   const node = () => doc.byId[props.id];
 
   // What the textarea shows. Annotation (PDF highlight) blocks expose only their
@@ -963,9 +966,33 @@ function Editor(props: { id: string }): JSX.Element {
     // A block-move reorder blurs us momentarily — stay in edit mode (the move
     // handler refocuses and restores the caret).
     if (isBlockMoving()) return;
+    // The whole window lost focus (switched to another app/window): stay in edit
+    // mode and remember the caret so onWindowFocus can resume exactly here. An
+    // in-window blur (clicking elsewhere, Escape) keeps document focus, so it
+    // still exits editing as before.
+    if (!document.hasFocus()) {
+      savedSel = { start: ref.selectionStart, end: ref.selectionEnd };
+      return;
+    }
     // Only clear if no other block grabbed editing focus.
     if (editingId() === props.id) setEditingId(null);
   };
+
+  // When the window regains focus, re-focus this block's editor and restore the
+  // caret — WebKitGTK drops the native focus on window switch and doesn't put it
+  // back. Guarded so we never steal focus if editing moved on while we were away.
+  const onWindowFocus = () => {
+    if (editingId() !== props.id || !ref || !ref.isConnected) return;
+    ref.focus();
+    if (savedSel) {
+      const end = Math.min(savedSel.end, ref.value.length);
+      const start = Math.min(savedSel.start, end);
+      ref.setSelectionRange(start, end);
+      savedSel = null;
+    }
+  };
+  onMount(() => window.addEventListener("focus", onWindowFocus));
+  onCleanup(() => window.removeEventListener("focus", onWindowFocus));
 
   // Paste an image from the clipboard. WebKitGTK's <textarea> paste event does
   // not expose image data, so we read the OS clipboard directly (Tauri plugin)
