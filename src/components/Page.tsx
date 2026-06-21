@@ -1,6 +1,6 @@
-import { For, Show, createEffect, createSignal, onCleanup, onMount, type JSX } from "solid-js";
+import { For, Show, createEffect, createMemo, createSignal, onCleanup, onMount, type JSX } from "solid-js";
 import { doc, mainPages, pageByName, reloadPage, loadSingle, loadFeed, appendFeed, isDirty, editingId, setFeedExtender, flushPage, type FeedPage } from "../store";
-import { route, openPage, openJournals, openPageInNewTab } from "../router";
+import { route, sameRoute, openPage, openJournals, openPageInNewTab } from "../router";
 import {
   zoomedBlock, zoomInto, isFavorite, toggleFavorite,
   markConflict, isConflicted, graphEpoch, openPageInSidebar, openPageContextMenu, carryDays, showCarryButtons,
@@ -56,8 +56,13 @@ export function PageView(): JSX.Element {
       ? dto
       : { ...dto, blocks: [{ id: `new-${name}`, raw: "", collapsed: false, children: [] }] };
 
+  // Depend on the active route BY VALUE: opening a background tab (or pinning /
+  // reordering / closing another tab) mutates the `tabs` signal but not the active
+  // route — without this, route() would re-fire this loader, remount the feed via
+  // setReady(false), and reset scroll to the top.
+  const currentRoute = createMemo(route, undefined, { equals: sameRoute });
   createEffect(() => {
-    const r = route();
+    const r = currentRoute();
     const epoch = graphEpoch(); // reload when the open graph changes
     setReady(false);
     setLoadError(null);

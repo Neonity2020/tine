@@ -46,7 +46,7 @@ export function routeTitle(r: Route): string {
   return r.name;
 }
 
-function sameRoute(a: Route, b: Route): boolean {
+export function sameRoute(a: Route, b: Route): boolean {
   if (a.kind !== b.kind) return false;
   if (a.kind === "journals") return true;
   const bb = b as typeof a;
