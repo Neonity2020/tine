@@ -1,7 +1,7 @@
 import { For, Show, createSignal, createResource, createEffect, createMemo, onCleanup, type JSX } from "solid-js";
 import { backend } from "../backend";
 import { switcherOpen, closeSwitcher, switcherMode, recentPages } from "../ui";
-import { openPage, openPageAtBlock, route } from "../router";
+import { openPage, openPageAtBlock, openPageInNewTab, route } from "../router";
 import { paletteCommands } from "../keybindings";
 import { fuzzyScore } from "../editor/autocomplete";
 import { blockView } from "../render/block";
@@ -18,8 +18,6 @@ interface Section {
   header: string;
   items: Item[];
 }
-
-const GROUP_LIMIT = 5;
 
 // Ctrl-K: grouped search (Pages / Create / Commands / Blocks), command palette
 // (⌘⇧P, commands-only), and recents on an empty query — mirroring OG's cmdk.
@@ -50,11 +48,11 @@ export function QuickSwitcher(): JSX.Element {
   onCleanup(() => clearTimeout(qTimer));
   const [pages] = createResource(
     () => (commandsOnly() ? "" : debouncedQuery()),
-    (q) => (q.trim() && !commandsOnly() ? backend().quickSwitch(q, 8) : Promise.resolve([] as PageEntry[]))
+    (q) => (q.trim() && !commandsOnly() ? backend().quickSwitch(q, 12) : Promise.resolve([] as PageEntry[]))
   );
   const [hits] = createResource(
     () => (commandsOnly() ? "" : debouncedQuery()),
-    (q) => (q.trim() && !commandsOnly() ? backend().search(q, 20) : Promise.resolve([]))
+    (q) => (q.trim() && !commandsOnly() ? backend().search(q, 50) : Promise.resolve([]))
   );
 
   const currentPageName = () => {
@@ -125,8 +123,10 @@ export function QuickSwitcher(): JSX.Element {
     return out;
   });
 
-  // Flattened item list (capped per section) for the single highlight cursor.
-  const flat = createMemo<Item[]>(() => sections().flatMap((s) => s.items.slice(0, GROUP_LIMIT)));
+  // Flattened item list for the single highlight cursor. Every rendered row is
+  // reachable — the section count badge and what you can scroll/arrow through
+  // now agree (the result set is already bounded by the backend search caps).
+  const flat = createMemo<Item[]>(() => sections().flatMap((s) => s.items));
 
   createEffect(() => {
     if (switcherOpen()) {
@@ -158,6 +158,15 @@ export function QuickSwitcher(): JSX.Element {
         break;
     }
     closeSwitcher();
+  };
+
+  // Middle-click: open in a background tab and KEEP the switcher open, so you can
+  // fan several results out without re-searching. A block opens zoomed into
+  // itself (self-contained and durable — the tab shows exactly what you found);
+  // create/command have no background-tab meaning, so they're ignored.
+  const openInBackground = (it: Item) => {
+    if (it.t === "page") openPageInNewTab(it.name, it.pageKind);
+    else if (it.t === "block") openPageInNewTab(it.page, it.pageKind, it.blockId);
   };
 
   const createPage = async (name: string) => {
@@ -200,7 +209,7 @@ export function QuickSwitcher(): JSX.Element {
   const flatIndex = (sIdx: number, iIdx: number): number => {
     let n = 0;
     const secs = sections();
-    for (let s = 0; s < sIdx; s++) n += Math.min(secs[s].items.length, GROUP_LIMIT);
+    for (let s = 0; s < sIdx; s++) n += secs[s].items.length;
     return n + iIdx;
   };
 
@@ -228,7 +237,7 @@ export function QuickSwitcher(): JSX.Element {
                     <span>{section.header}</span>
                     <span class="switcher-count">{section.items.length}</span>
                   </div>
-                  <For each={section.items.slice(0, GROUP_LIMIT)}>
+                  <For each={section.items}>
                     {(it, iIdx) => {
                       const idx = () => flatIndex(sIdx(), iIdx());
                       return (
@@ -237,8 +246,12 @@ export function QuickSwitcher(): JSX.Element {
                           classList={{ active: idx() === sel() }}
                           onMouseMove={() => setSel(idx())}
                           onMouseDown={(e) => {
+                            // preventDefault keeps input focus (and kills the
+                            // middle-click autoscroll). Left opens + closes;
+                            // middle opens a background tab, switcher stays open.
                             e.preventDefault();
-                            choose(it);
+                            if (e.button === 1) openInBackground(it);
+                            else if (e.button === 0) choose(it);
                           }}
                         >
                           <Row item={it} query={query()} />
