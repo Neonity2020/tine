@@ -142,12 +142,13 @@ pub struct Graph {
     /// mismatched entry always falls through to the correct parse-compare path, so
     /// the worst a desync can cause is redundant work, never a stale serve.
     disk_revs: RwLock<std::collections::HashMap<String, String>>,
-    /// All page names referenced anywhere (`[[link]]`, `#tag`, `#[[..]]`), in
-    /// their as-written display case, keyed by `cache_gen`. Like OG, a page that
-    /// is only referenced (never given its own file) still "exists" — this lets
-    /// quick-switch / `[[ ]]`/`#` autocomplete surface such a page instead of
-    /// offering a misleading "Create …". Built from the page cache, and only when
-    /// it's already warm (never force-built on a keystroke); empty until then.
+    /// All page names referenced anywhere — `[[link]]`/`#tag`/`#[[..]]` plus
+    /// `tags::`/`alias::` property values — in their as-written display case,
+    /// keyed by `cache_gen`. Like OG, a page that is only referenced (never given
+    /// its own file) still "exists" — this lets quick-switch / `[[ ]]`/`#`
+    /// autocomplete surface such a page instead of offering a misleading
+    /// "Create …". Built from the page cache, and only when it's already warm
+    /// (never force-built on a keystroke); empty until then.
     referenced_names_cache: RwLock<Option<(u64, Vec<String>)>>,
 }
 
@@ -256,7 +257,8 @@ impl Graph {
         entries
     }
 
-    /// Page names referenced anywhere in the graph (`[[link]]`, `#tag`, `#[[..]]`),
+    /// Page names referenced anywhere in the graph — inline `[[link]]`/`#tag`/
+    /// `#[[..]]` plus `tags::`/`alias::` property values (block- and page-level) —
     /// display case preserved, deduped case-insensitively. These are the pages
     /// that "exist" by reference even without a file of their own (OG semantics),
     /// so autocomplete/quick-switch can offer them instead of "Create …".
@@ -275,16 +277,42 @@ impl Graph {
         let Some(pages) = guard.as_ref() else {
             return Vec::new(); // cache not warm — don't force a parse, don't memoize
         };
-        fn visit(b: &DocBlock, seen: &mut std::collections::HashMap<String, String>) {
-            for name in crate::refs::page_refs(&b.raw) {
+        fn add(seen: &mut std::collections::HashMap<String, String>, name: String) {
+            if !name.is_empty() {
                 seen.entry(name.to_lowercase()).or_insert(name);
             }
+        }
+        // `tags::` / `alias::` property values are page references in OG too —
+        // comma-separated, written bare or as `[[..]]`/`#..` — so a page named
+        // only in a `tags::`/`alias::` list still "exists". Strip any wrapping
+        // down to the page name. (Line-based, like DocBlock::property.)
+        fn add_property_refs(seen: &mut std::collections::HashMap<String, String>, text: &str) {
+            for line in text.lines() {
+                let Some((k, v)) = crate::doc::parse_property_line(line) else { continue };
+                if !(k.eq_ignore_ascii_case("tags") || k.eq_ignore_ascii_case("alias")) {
+                    continue;
+                }
+                for val in v.split(',') {
+                    let t = val.trim();
+                    let t = t.strip_prefix("[[").and_then(|x| x.strip_suffix("]]")).unwrap_or(t);
+                    add(seen, t.strip_prefix('#').unwrap_or(t).trim().to_string());
+                }
+            }
+        }
+        fn visit(b: &DocBlock, seen: &mut std::collections::HashMap<String, String>) {
+            for name in crate::refs::page_refs(&b.raw) {
+                add(seen, name);
+            }
+            add_property_refs(seen, &b.raw); // block-level tags::/alias::
             for c in &b.children {
                 visit(c, seen);
             }
         }
         let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         for (_, doc) in pages.iter() {
+            if let Some(pre) = &doc.pre_block {
+                add_property_refs(&mut seen, pre); // page-level tags::/alias::
+            }
             for b in &doc.roots {
                 visit(b, &mut seen);
             }
@@ -1550,6 +1578,13 @@ mod tests {
             "- uses #thistag and [[Some Page]]\n",
         )
         .unwrap();
+        // A page whose page-properties carry tags::/alias:: (OG autolinks these as
+        // page references, bare or bracketed).
+        fs::write(
+            dir.join("pages").join("paper.md"),
+            "tags:: ProjectX, [[Linear IP]]\nalias:: LP Survey\n- body\n",
+        )
+        .unwrap();
         let g = Graph::open(&dir);
         g.warm_cache(); // referenced names come from the whole-graph cache
 
@@ -1558,6 +1593,10 @@ mod tests {
         };
         assert!(has("thistag", "thistag"), "referenced #thistag should appear");
         assert!(has("some page", "Some Page"), "referenced [[Some Page]] should appear");
+        // tags:: values (bare and bracketed) and alias:: values count too.
+        assert!(has("projectx", "ProjectX"), "bare tags:: value should appear");
+        assert!(has("linear ip", "Linear IP"), "bracketed tags:: value should appear");
+        assert!(has("lp survey", "LP Survey"), "alias:: value should appear");
         // Neither filed nor referenced → not offered (so autocomplete still says
         // "Create" for a genuinely new name).
         assert!(!has("nonexistent", "nonexistent"));
