@@ -382,11 +382,30 @@ pub fn property_facets(graph: &Graph) -> Vec<(String, Vec<String>)> {
 /// subsequence, then by name length.
 pub fn quick_switch(graph: &Graph, query: &str, limit: usize) -> Vec<PageEntry> {
     let q = query.trim().to_lowercase();
-    let mut scored: Vec<(i32, PageEntry)> = graph
-        .list_pages()
-        .into_iter()
-        .filter_map(|e| score_name(&e.name.to_lowercase(), &q).map(|s| (s - e.name.len() as i32, e)))
+    let file_pages = graph.list_pages();
+    let mut scored: Vec<(i32, PageEntry)> = file_pages
+        .iter()
+        .filter_map(|e| score_name(&e.name.to_lowercase(), &q).map(|s| (s - e.name.len() as i32, e.clone())))
         .collect();
+    // Pages referenced by `#tag` / `[[link]]` but with no file of their own still
+    // "exist" (OG semantics): include them (deduped against file pages, which are
+    // authoritative) so a tag already used elsewhere shows as the page rather than
+    // a misleading "Create …" in autocomplete.
+    let have: std::collections::HashSet<String> =
+        file_pages.iter().map(|e| e.name.to_lowercase()).collect();
+    for name in graph.referenced_page_names() {
+        let lower = name.to_lowercase();
+        if have.contains(&lower) {
+            continue;
+        }
+        if let Some(s) = score_name(&lower, &q) {
+            let len = name.len() as i32;
+            scored.push((
+                s - len,
+                PageEntry { name, kind: PageKind::Page, date_key: None, path: std::path::PathBuf::new() },
+            ));
+        }
+    }
     scored.sort_by(|a, b| b.0.cmp(&a.0));
     scored.into_iter().take(limit).map(|(_, e)| e).collect()
 }

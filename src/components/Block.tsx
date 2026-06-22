@@ -581,7 +581,7 @@ function Editor(props: { id: string }): JSX.Element {
     const pageItem = (name: string): AcItem =>
       t.kind === "page"
         ? { label: name, insert: pageInsert(name) }
-        : { label: name, insert: tagInsert(name) };
+        : { label: `#${name}`, insert: tagInsert(name) }; // tag context reads "#name"
     const createItem: AcItem =
       t.kind === "page"
         ? { label: `Create "${q}"`, insert: pageInsert(q) }

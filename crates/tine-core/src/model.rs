@@ -142,6 +142,13 @@ pub struct Graph {
     /// mismatched entry always falls through to the correct parse-compare path, so
     /// the worst a desync can cause is redundant work, never a stale serve.
     disk_revs: RwLock<std::collections::HashMap<String, String>>,
+    /// All page names referenced anywhere (`[[link]]`, `#tag`, `#[[..]]`), in
+    /// their as-written display case, keyed by `cache_gen`. Like OG, a page that
+    /// is only referenced (never given its own file) still "exists" — this lets
+    /// quick-switch / `[[ ]]`/`#` autocomplete surface such a page instead of
+    /// offering a misleading "Create …". Built from the page cache, and only when
+    /// it's already warm (never force-built on a keystroke); empty until then.
+    referenced_names_cache: RwLock<Option<(u64, Vec<String>)>>,
 }
 
 /// Cache key for `disk_revs` (and any other (kind,name)-keyed side table):
@@ -197,6 +204,7 @@ impl Graph {
             page_list_cache: RwLock::new(None),
             recent_writes: std::sync::Mutex::new(std::collections::HashMap::new()),
             disk_revs: RwLock::new(std::collections::HashMap::new()),
+            referenced_names_cache: RwLock::new(None),
         }
     }
 
@@ -246,6 +254,45 @@ impl Graph {
         entries.extend(list_md(&self.pages_path(), PageKind::Page));
         *self.page_list_cache.write().unwrap() = Some((gen, entries.clone()));
         entries
+    }
+
+    /// Page names referenced anywhere in the graph (`[[link]]`, `#tag`, `#[[..]]`),
+    /// display case preserved, deduped case-insensitively. These are the pages
+    /// that "exist" by reference even without a file of their own (OG semantics),
+    /// so autocomplete/quick-switch can offer them instead of "Create …".
+    ///
+    /// Computed from the whole-graph cache and memoized by `cache_gen`. If the
+    /// cache isn't warm yet it returns empty and memoizes nothing — we never force
+    /// a full-graph parse from here (this runs on autocomplete keystrokes).
+    pub fn referenced_page_names(&self) -> Vec<String> {
+        let gen = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+        if let Some((g, names)) = self.referenced_names_cache.read().unwrap().as_ref() {
+            if *g == gen {
+                return names.clone();
+            }
+        }
+        let guard = self.cache.read().unwrap();
+        let Some(pages) = guard.as_ref() else {
+            return Vec::new(); // cache not warm — don't force a parse, don't memoize
+        };
+        fn visit(b: &DocBlock, seen: &mut std::collections::HashMap<String, String>) {
+            for name in crate::refs::page_refs(&b.raw) {
+                seen.entry(name.to_lowercase()).or_insert(name);
+            }
+            for c in &b.children {
+                visit(c, seen);
+            }
+        }
+        let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for (_, doc) in pages.iter() {
+            for b in &doc.roots {
+                visit(b, &mut seen);
+            }
+        }
+        drop(guard);
+        let names: Vec<String> = seen.into_values().collect();
+        *self.referenced_names_cache.write().unwrap() = Some((gen, names.clone()));
+        names
     }
 
     /// Journals sorted newest-first.
@@ -1485,6 +1532,35 @@ mod tests {
         for n in ["paper.pdf", "paper_1.pdf", "paper_2.pdf", "NOTES", "NOTES_1"] {
             assert!(dir.join(n).exists(), "{n} reserved");
         }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn quick_switch_includes_referenced_pages() {
+        // A page referenced by `#tag` / `[[link]]` but with no file of its own
+        // still "exists" (OG semantics) and must show up in quick-switch — that's
+        // what lets `#`/`[[ ]]` autocomplete say "#thistag" rather than a
+        // misleading "Create #thistag" when the tag is already used elsewhere.
+        let dir = std::env::temp_dir().join(format!("tine-refpages-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("journals")).unwrap();
+        fs::create_dir_all(dir.join("pages")).unwrap();
+        fs::write(
+            dir.join("pages").join("notes.md"),
+            "- uses #thistag and [[Some Page]]\n",
+        )
+        .unwrap();
+        let g = Graph::open(&dir);
+        g.warm_cache(); // referenced names come from the whole-graph cache
+
+        let has = |q: &str, name: &str| {
+            g.quick_switch(q, 8).iter().any(|e| e.name.eq_ignore_ascii_case(name))
+        };
+        assert!(has("thistag", "thistag"), "referenced #thistag should appear");
+        assert!(has("some page", "Some Page"), "referenced [[Some Page]] should appear");
+        // Neither filed nor referenced → not offered (so autocomplete still says
+        // "Create" for a genuinely new name).
+        assert!(!has("nonexistent", "nonexistent"));
         let _ = fs::remove_dir_all(&dir);
     }
 }
