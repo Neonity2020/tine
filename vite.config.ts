@@ -1,5 +1,6 @@
 import { defineConfig } from "vite";
 import solid from "vite-plugin-solid";
+import { fileURLToPath } from "node:url";
 
 // Build timestamp, stamped at bundle time and shown in Settings so it's easy to
 // confirm the running binary is the latest (vs. a stale Syncthing copy).
@@ -19,5 +20,12 @@ export default defineConfig({
   build: {
     target: "esnext",
     outDir: "dist",
+    rollupOptions: {
+      // Two HTML entries: the main app and the standalone quick-capture window.
+      input: {
+        main: fileURLToPath(new URL("./index.html", import.meta.url)),
+        capture: fileURLToPath(new URL("./capture.html", import.meta.url)),
+      },
+    },
   },
 });

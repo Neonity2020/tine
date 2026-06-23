@@ -12,12 +12,27 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "Tine",
         "width": 1200,
         "height": 820,
         "minWidth": 640,
         "minHeight": 480,
         "decorations": false
+      },
+      {
+        "label": "capture",
+        "url": "capture.html",
+        "title": "Quick Capture",
+        "width": 600,
+        "height": 92,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "resizable": false,
+        "center": true,
+        "visible": false,
+        "focus": false
       }
     ],
     "security": {

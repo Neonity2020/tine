@@ -46,9 +46,10 @@ import {
   exitFocusMode,
   dataRev,
   installPaneTracker,
+  pushToast,
 } from "./ui";
 import { applyZoom, installInterfaceZoomKeys, installInterfaceZoomWheel } from "./zoom";
-import { editingId, flushAll } from "./store";
+import { editingId, flushAll, appendToTodayJournal } from "./store";
 import { isTauri } from "./backend";
 import { WindowControls, ResizeGrips, installWindowChrome, maximized } from "./components/WindowChrome";
 
@@ -107,6 +108,29 @@ export function App(): JSX.Element {
         } catch {
           await w.close(); // re-fires onCloseRequested; the guard lets it close
         }
+      });
+    })();
+    onCleanup(() => unlisten());
+  });
+
+  // Global quick-capture: a `tine --capture` launch (bound to a DE hotkey)
+  // signals the running app to pop the capture mini-window; on submit it emits a
+  // `quick-capture` event that the MAIN window turns into an append to today's
+  // journal. Going through the live store (not a separate file writer) keeps a
+  // capture from racing a main-view edit of today's journal into a conflict.
+  onMount(() => {
+    if (!isTauri()) return;
+    let unlisten = () => {};
+    void (async () => {
+      const { listen } = await import("@tauri-apps/api/event");
+      unlisten = await listen<{ text: string }>("quick-capture", async (e) => {
+        const text = e.payload?.text ?? "";
+        if (!text.trim()) return;
+        const ok = await appendToTodayJournal(text);
+        pushToast(
+          ok ? "Captured to today's journal" : "Capture couldn't be saved",
+          ok ? "info" : "error"
+        );
       });
     })();
     onCleanup(() => unlisten());

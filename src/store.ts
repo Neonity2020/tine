@@ -845,6 +845,43 @@ export function insertOutlineAfter(afterId: string, nodes: OutlineNode[]): strin
   return lastId;
 }
 
+/** Append `text` as a new top-level block at the END of today's journal, then
+ *  flush immediately. This is the single writer for global quick-capture: routing
+ *  through the live store (rather than a separate-process file append) means a
+ *  capture can't race a main-view edit of today's journal into a conflict. Loads
+ *  — or, if the day has no file yet, synthesizes — the journal first; never
+ *  clobbers in-progress edits (`ensurePageLoaded` is a no-op when already loaded).
+ *  Returns whether the write reached disk. */
+export async function appendToTodayJournal(text: string): Promise<boolean> {
+  const raw = text.trim();
+  if (!raw) return false;
+  const title = journalTitle(new Date());
+  if (!pageByName(title)) {
+    const dto: PageDto =
+      (await backend().getPage(title, "journal")) ??
+      { name: title, kind: "journal", title, pre_block: null, blocks: [], rev: null };
+    ensurePageLoaded(dto);
+  }
+  const page = pageByName(title);
+  if (!page) return false;
+  if (page.roots.length) {
+    // Append after the last top-level block (end of the journal).
+    insertOutlineAfter(page.roots[page.roots.length - 1], [{ raw, children: [] }]);
+  } else {
+    // Empty (or brand-new) journal — create its first root block.
+    pushUndo("capture", [title]);
+    const id = freshId();
+    setDoc(
+      produce((s) => {
+        s.byId[id] = { id, raw, collapsed: false, parent: null, page: title, children: [] };
+        s.pages[s.pages.findIndex((p) => p.name === title)].roots.push(id);
+      })
+    );
+    markDirty(title);
+  }
+  return await flushPage(title);
+}
+
 const PROP_LINE = /^([A-Za-z0-9_./-]+):: ?(.*)$/;
 
 /** Current value of a `key:: value` block property, or null. */

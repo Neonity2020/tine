@@ -754,6 +754,17 @@ fn write_highlights(
     })
 }
 
+/// Show + focus the always-on-top quick-capture mini window (created hidden at
+/// startup). Re-centers it each time so it lands predictably regardless of where
+/// the main window is. No-op if the window is missing.
+fn show_capture(app: &tauri::AppHandle) {
+    if let Some(w) = app.get_webview_window("capture") {
+        let _ = w.center();
+        let _ = w.show();
+        let _ = w.set_focus();
+    }
+}
+
 fn main() {
     // GPU/DMABUF rendering is ON by default (smoother scrolling — that's the point
     // of Tine). On the rare GPU/compositor combo where WebKitGTK's DMABUF renderer
@@ -767,11 +778,25 @@ fn main() {
     }
 
     tauri::Builder::default()
+        // MUST be the first plugin. A second launch (e.g. the DE hotkey running
+        // `tine --capture`) doesn't start a new process — this fires in the
+        // already-running instance with the new argv. `--capture` pops the
+        // capture window; a plain re-launch just surfaces the main window.
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            if argv.iter().any(|a| a == "--capture") {
+                show_capture(app);
+            } else if let Some(w) = app.get_webview_window("main") {
+                let _ = w.show();
+                let _ = w.unminimize();
+                let _ = w.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
         // Remember window size/position/maximized across launches (Wayland
         // compositors don't restore this per-app). Exclude FULLSCREEN so it
         // doesn't conflict with focus mode, which is intentionally not persisted.
+        // The capture window is centered on demand, so keep it off the denylist.
         .plugin(
             tauri_plugin_window_state::Builder::default()
                 .with_state_flags(
@@ -779,8 +804,20 @@ fn main() {
                         | tauri_plugin_window_state::StateFlags::POSITION
                         | tauri_plugin_window_state::StateFlags::MAXIMIZED,
                 )
+                .with_denylist(&["capture"])
                 .build(),
         )
+        // The hidden capture window would otherwise keep the process alive after
+        // the main window is closed (Tauri exits only when ALL windows are gone).
+        // So when `main` is destroyed, exit explicitly. The JS close handler has
+        // already flushed pending edits by the time it calls destroy().
+        .on_window_event(|window, event| {
+            if window.label() == "main" {
+                if let tauri::WindowEvent::Destroyed = event {
+                    window.app_handle().exit(0);
+                }
+            }
+        })
         .manage(AppState { graph: RwLock::new(None) })
         .setup(|app| {
             // Eagerly open the graph if one was configured at startup.
@@ -840,6 +877,11 @@ fn main() {
             }
             // Watch for external changes (reads whichever graph is current).
             start_watcher(app.handle().clone());
+            // Cold start via `tine --capture` (app wasn't already running): pop
+            // the capture window once we're up (the main window loads too).
+            if std::env::args().any(|a| a == "--capture") {
+                show_capture(app.handle());
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
