@@ -1616,6 +1616,11 @@ body {
   padding: 2px 0;
   line-height: 1.6;
   min-height: 1.6em; /* empty blocks stay clickable */
+  /* Inter's contextual ligatures (calt) draw `->`/`<-`/`<->`/`=>` as arrow
+     glyphs while leaving the underlying ASCII unchanged — exactly how OG Logseq
+     shows arrows (it's the font, not a text substitution; the .md keeps `->`).
+     WebKitGTK leaves calt off by default, so enable it explicitly. */
+  font-variant-ligatures: contextual;
 }
 
 .block-content.done {
@@ -1749,6 +1754,8 @@ body {
   color: var(--text-primary);
   padding: 2px 0;
   margin: 0;
+  /* Match OG: show the arrow ligatures while editing too (see .block-content). */
+  font-variant-ligatures: contextual;
   overflow: hidden;
   display: block;
 }
