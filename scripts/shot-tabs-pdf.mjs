@@ -24,21 +24,40 @@ try {
       await page.goto(`http://localhost:${PORT}/`);
       await page.waitForSelector(".page-title", { timeout: 8000 });
       await sleep(400);
+      // open a few background tabs via distinct page-ref links in the feed
       const refs = page.locator("a.page-ref");
       const seen = new Set();
       const n = await refs.count();
       let opened = 0;
-      for (let i = 0; i < n && opened < 2; i++) {
+      for (let i = 0; i < n && opened < 3; i++) {
         const t = ((await refs.nth(i).textContent()) || "").trim();
-        if (seen.has(t)) continue;
+        if (seen.has(t) || !t) continue;
         seen.add(t);
         await refs.nth(i).click({ button: "middle" });
         opened++;
         await sleep(250);
       }
-      const tabs = page.locator(".tab");
-      if ((await tabs.count()) > 1) await tabs.nth(1).dblclick(); // pin → sticky, sorts left
+      // pin TWO of them (double-click → sticky, sorts left)
+      for (const name of ["logseq-claude", "block editor"]) {
+        const tab = page.locator(".tab", { hasText: name }).first();
+        if (await tab.count()) { await tab.dblclick(); await sleep(250); }
+      }
+      // activate logseq-claude (richer page content than block editor)
+      const lc = page.locator(".tab", { hasText: "logseq-claude" }).first();
+      if (await lc.count()) { await lc.click(); await sleep(400); }
+      // The pin indicator is a 📌 emoji — fine in the app (WebKitGTK has an emoji
+      // font) but a tofu box in headless Chromium here, so swap in an inline SVG
+      // pin purely for the screenshot (no product change). Do this AFTER the last
+      // click, since re-rendering the tab bar would restore the emoji spans.
+      await page.$$eval(".tab-pin", (els) => {
+        for (const e of els) {
+          e.textContent = "";
+          e.innerHTML =
+            '<svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 17v5"/><path d="M9 10.8a2 2 0 0 1-1.1 1.8l-1.8.9A2 2 0 0 0 5 15.3V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.7a2 2 0 0 0-1.1-1.8l-1.8-.9A2 2 0 0 1 15 10.8V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z"/></svg>';
+        }
+      });
       await sleep(300);
+      const tabs = page.locator(".tab");
       await page.screenshot({ path: `${OUT}/feat-tabs.png` });
       console.log("OK    feat-tabs (tabs:", await tabs.count(), ")");
     } catch (e) { console.log("FAIL  feat-tabs", String(e).split("\n")[0]); }
