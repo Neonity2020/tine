@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { aliasNames, isPropertyLine } from "./block";
+import { aliasNames, isPropertyLine, blockView } from "./block";
 
 describe("aliasNames", () => {
   it("parses a comma-separated alias:: line", () => {
@@ -21,5 +21,19 @@ describe("isPropertyLine", () => {
     expect(isPropertyLine("alias:: foo")).toBe(true);
     expect(isPropertyLine("just some text")).toBe(false);
     expect(isPropertyLine(":: leading")).toBe(false);
+  });
+});
+
+describe("blockView SCHEDULED/DEADLINE", () => {
+  it("treats a timestamp-only line as a marker and strips it from the body", () => {
+    const v = blockView("TODO ship it\nSCHEDULED: <2026-07-06 Mon>");
+    expect(v.scheduled).toBe("2026-07-06 Mon");
+    expect(v.lines.join("\n")).toBe("ship it");
+  });
+  it("does NOT drop trailing text after the timestamp — renders the whole line", () => {
+    const v = blockView("TODO \nSCHEDULED: <2026-07-06 Mon> #email ADS1 students");
+    expect(v.scheduled).toBeNull(); // not a valid planning line → no badge
+    expect(v.lines.join("\n")).toContain("#email ADS1 students");
+    expect(v.lines.join("\n")).toContain("SCHEDULED: <2026-07-06 Mon>");
   });
 });

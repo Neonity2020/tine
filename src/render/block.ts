@@ -54,8 +54,12 @@ export interface BlockView {
   properties: [string, string][];
 }
 
-const SCHEDULED_RE = /^SCHEDULED:\s*<([^>]+)>/;
-const DEADLINE_RE = /^DEADLINE:\s*<([^>]+)>/;
+// A planning line is the timestamp ONLY (org/Logseq semantics). If there's text
+// after the `<…>` (e.g. `SCHEDULED: <2026-07-06 Mon> #email do the thing`), it's
+// NOT a valid planning line, so we don't treat it as a marker — it falls through
+// and renders in full, instead of being silently dropped along with its text.
+const SCHEDULED_RE = /^SCHEDULED:\s*<([^>]+)>\s*$/;
+const DEADLINE_RE = /^DEADLINE:\s*<([^>]+)>\s*$/;
 
 export function blockView(raw: string): BlockView {
   const allLines = raw.split("\n");

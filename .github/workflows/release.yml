@@ -66,22 +66,13 @@ jobs:
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # --- macOS code signing + notarization (inert until set) -----------
-          # Add these as repo secrets for notarized, Gatekeeper-clean .dmgs:
-          #   APPLE_CERTIFICATE            base64 of the Developer ID .p12
-          #   APPLE_CERTIFICATE_PASSWORD  the .p12 password
-          #   APPLE_SIGNING_IDENTITY      e.g. "Developer ID Application: Name (TEAMID)"
-          #   APPLE_ID / APPLE_PASSWORD   Apple ID + app-specific password (notarytool)
-          #   APPLE_TEAM_ID               your Apple Developer Team ID
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          # Windows signing is configured via tauri.conf.json (bundle.windows
-          # .certificateThumbprint) or an Azure Trusted Signing action — left
-          # unsigned for now.
+          # macOS/Windows builds are UNSIGNED for now. Do NOT set the APPLE_*
+          # signing env vars here while the secrets are empty — tauri-action sees
+          # an (empty) APPLE_CERTIFICATE as "signing requested" and fails on
+          # `security import`. To enable notarized macOS builds later, add these
+          # repo secrets AND re-add the matching env lines:
+          #   APPLE_CERTIFICATE (base64 .p12), APPLE_CERTIFICATE_PASSWORD,
+          #   APPLE_SIGNING_IDENTITY, APPLE_ID, APPLE_PASSWORD, APPLE_TEAM_ID.
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "Tine ${{ github.ref_name }}"
