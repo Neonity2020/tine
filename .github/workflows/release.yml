@@ -85,7 +85,10 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "Tine ${{ github.ref_name }}"
-          releaseBody: "Download an installer for your platform below. macOS/Windows builds are currently unsigned."
-          releaseDraft: true
+          releaseBody: "Download an installer for your platform below. macOS/Windows builds are currently unsigned (right-click → Open on macOS; More info → Run anyway on Windows)."
+          # Auto-publish: each tagged release goes public on its own, no manual
+          # step. (The v0.1.0 release was cut as a draft before this flip, so that
+          # ONE needs a manual "Publish release"; everything after is automatic.)
+          releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}

@@ -37,7 +37,24 @@ round-trip to Rust, and whole-graph reads (search, backlinks, queries) hit an in
 instead of re-parsing.
 
 > **Status:** a usable daily-driver for outlining, linking, tasks, journals, search, queries, and
-> PDF annotation. Linux-only for now. Not yet 1.0 — see [Roadmap](#roadmap--non-goals).
+> PDF annotation. Linux is the primary, best-tested platform; macOS and Windows builds are produced
+> too but are newer. Not yet 1.0 — see [Roadmap](#roadmap--non-goals).
+
+---
+
+## Install
+
+Grab a prebuilt installer from the **[Releases](https://github.com/martinkoutecky/tine/releases)**
+page. The builds aren't code-signed yet, so your OS may warn the first time — here's how to get past
+it:
+
+- **Linux** — the **AppImage** runs on any distro with no install: `chmod +x Tine_*.AppImage`, then
+  run it. Or use the **`.deb`** (Debian/Ubuntu) or **`.rpm`** (Fedora/openSUSE).
+- **macOS** — open the **`.dmg`**; on first launch macOS says *"unidentified developer"*, so
+  **right-click the app → Open** (just once) and it opens normally after that.
+- **Windows** — run the **`.exe`**; if SmartScreen appears, click **More info → Run anyway**.
+
+(Want to hack on Tine instead? Build from source — see [Build & run](#build--run).)
 
 ---
 
