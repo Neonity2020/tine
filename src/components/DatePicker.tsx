@@ -1,5 +1,5 @@
 import { For, Show, createMemo, createSignal, onCleanup, onMount, type JSX } from "solid-js";
-import { datePicker, closeDatePicker, graphMeta } from "../ui";
+import { datePicker, closeDatePicker, firstDayOfWeek } from "../ui";
 import { readSchedule, setSchedule } from "../store";
 
 const MONTHS = [
@@ -7,11 +7,8 @@ const MONTHS = [
   "July", "August", "September", "October", "November", "December",
 ];
 const DOW_BASE = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"];
-// First day of week from config.edn :start-of-week (0=Sunday … 6=Saturday).
-const startOfWeek = () => {
-  const n = graphMeta()?.start_of_week ?? 0;
-  return n >= 0 && n <= 6 ? n : 0;
-};
+// First day of week from the Tine display pref (see ui.firstDayOfWeek).
+const startOfWeek = () => firstDayOfWeek();
 const DOW = () => DOW_BASE.slice(startOfWeek()).concat(DOW_BASE.slice(0, startOfWeek()));
 
 // Calendar popup for SCHEDULED / DEADLINE. Writes `<yyyy-MM-dd EEE>` via the

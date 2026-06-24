@@ -1,7 +1,7 @@
 import { For, Show, createMemo, createResource, createSignal, type JSX } from "solid-js";
 import { openPage } from "../router";
 import { journalTitle } from "../journal";
-import { graphMeta, dataRev } from "../ui";
+import { dataRev, firstDayOfWeek } from "../ui";
 import { backend } from "../backend";
 
 const MONTHS = [
@@ -17,10 +17,7 @@ export function CalendarJump(): JSX.Element {
   const [open, setOpen] = createSignal(false);
   const today = new Date();
   const [view, setView] = createSignal({ y: today.getFullYear(), m: today.getMonth() });
-  const sow = () => {
-    const n = graphMeta()?.start_of_week ?? 0;
-    return n >= 0 && n <= 6 ? n : 0;
-  };
+  const sow = () => firstDayOfWeek();
   const dow = () => DOW_BASE.slice(sow()).concat(DOW_BASE.slice(0, sow()));
 
   const grid = createMemo(() => {

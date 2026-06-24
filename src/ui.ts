@@ -79,6 +79,48 @@ export function toggleDocumentMode() {
   saveStr(DOC_KEY, v ? "1" : null);
 }
 
+// --- first day of week (calendar + scheduled/deadline date pickers) ---
+// A Tine display pref, NOT config.edn's `:start-of-week` — Logseq's start-of-week
+// uses a Monday-based index that, fed straight to JS getDay() (Sunday-based),
+// rendered the week starting on Saturday. "locale" derives the first day from the
+// system locale (Monday across most of Europe incl. cs-CZ, Sunday for en-US);
+// "sunday"/"monday" force it.
+const FIRST_DAY_KEY = "logseq-claude.first-day";
+export type FirstDayPref = "locale" | "sunday" | "monday";
+export const [firstDayPref, setFirstDayPrefSignal] = createSignal<FirstDayPref>(
+  ((): FirstDayPref => {
+    const v = loadStr(FIRST_DAY_KEY);
+    return v === "sunday" || v === "monday" ? v : "locale";
+  })()
+);
+export function setFirstDayPref(v: FirstDayPref) {
+  setFirstDayPrefSignal(v);
+  saveStr(FIRST_DAY_KEY, v === "locale" ? null : v);
+}
+/** First day of week as a JS getDay() index (0=Sunday … 6=Saturday). Reactive on
+ *  the pref so the pickers re-render when it changes. */
+export function firstDayOfWeek(): number {
+  const p = firstDayPref();
+  if (p === "sunday") return 0;
+  if (p === "monday") return 1;
+  return localeFirstDay();
+}
+function localeFirstDay(): number {
+  try {
+    const loc = new Intl.Locale(navigator.language || "en") as Intl.Locale & {
+      weekInfo?: { firstDay: number };
+      getWeekInfo?: () => { firstDay: number };
+    };
+    // ISO-8601 firstDay: 1=Mon … 7=Sun. (weekInfo is a getter in some engines,
+    // a method in others.)
+    const iso = loc.weekInfo?.firstDay ?? loc.getWeekInfo?.().firstDay;
+    if (typeof iso === "number" && iso >= 1 && iso <= 7) return iso % 7; // 7(Sun)→0, 1(Mon)→1
+  } catch {
+    // Intl.Locale weekInfo unsupported in this engine — fall through.
+  }
+  return 1; // Monday
+}
+
 // --- which content pane is focused. Drives Ctrl+/- zoom routing (notes → whole
 // interface, pdf → the PDF's own scale). Transient session state, not persisted. ---
 export const [activePane, setActivePane] = createSignal<"notes" | "pdf">("notes");
