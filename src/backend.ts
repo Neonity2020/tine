@@ -81,6 +81,10 @@ export interface Backend {
   /** Quick-capture Enter behaviour: true → Enter files; false → Enter = new block. */
   getCaptureEnterFiles(): Promise<boolean>;
   setCaptureEnterFiles(value: boolean): Promise<void>;
+  /** How the file-watcher detects external edits: "inotify" (default, no idle
+   *  wakeups) or "poll" (3s scan, for filesystems where inotify is flaky). */
+  getWatchMode(): Promise<string>;
+  setWatchMode(mode: string): Promise<void>;
   /** Available snapshots for the current graph, newest first. */
   listBackups(): Promise<BackupInfo[]>;
   /** Restore a snapshot (overwrites journals/pages/config; snapshots current
@@ -285,6 +289,12 @@ class TauriBackend implements Backend {
   }
   setCaptureEnterFiles(value: boolean) {
     return this.call<void>("set_capture_enter_files", { value });
+  }
+  getWatchMode() {
+    return this.call<string>("get_watch_mode");
+  }
+  setWatchMode(mode: string) {
+    return this.call<void>("set_watch_mode", { mode });
   }
   listBackups() {
     return this.call<BackupInfo[]>("list_backups");

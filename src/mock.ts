@@ -380,6 +380,12 @@ export function mockBackend(): Backend {
     async setCaptureEnterFiles(): Promise<void> {
       // no-op in the browser mock
     },
+    async getWatchMode(): Promise<string> {
+      return "inotify";
+    },
+    async setWatchMode(): Promise<void> {
+      // no-op in the browser mock
+    },
     async listBackups() {
       return [];
     },

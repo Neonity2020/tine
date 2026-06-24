@@ -4,7 +4,8 @@
 use tine_core::model::{Graph, GraphMeta, PageDto, PageEntry, PageKind, RefGroup};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime};
 use tauri::{Emitter, Manager, State};
 
@@ -14,6 +15,11 @@ use tauri::{Emitter, Manager, State};
 // graph (open / switch) takes the write lock.
 struct AppState {
     graph: RwLock<Option<Arc<Graph>>>,
+    // Poke channel to the file-watcher thread: `load_graph` (graph switch) and
+    // `set_watch_mode` send `()` so the watcher re-targets / switches mechanism
+    // immediately instead of waiting for its next cycle. Set once by
+    // `start_watcher`.
+    watch_ctl: Mutex<Option<Sender<()>>>,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -23,65 +29,148 @@ struct GraphChange {
     removed: bool,
 }
 
-/// Poll the graph dirs for external changes (Logseq, Syncthing) and reconcile
-/// them into the cache, emitting `graph-changed` so the UI can reload. Polling
-/// (not inotify) is deliberate: it's reliable on NFS, where file watchers — and
-/// Syncthing's own — are flaky. Tine's own writes are suppressed by the cache
-/// comparison inside `sync_file`.
+/// Watch the graph dirs for external changes (Logseq, Syncthing) and reconcile
+/// them into the cache, emitting `graph-changed` so the UI can reload. Two
+/// mechanisms, switchable at runtime via the device-local `watch_mode` setting:
+///
+///   - **"inotify" (default):** a real OS filesystem watcher (the `notify`
+///     crate — inotify on Linux). Idle = *zero* periodic wakeups; the thread
+///     blocks until the kernel reports a change. Matches OG Logseq (chokidar)
+///     and is the right choice on a normal local disk.
+///   - **"poll":** a 3-second mtime scan. Robust on filesystems where inotify is
+///     unreliable (some NFS / network mounts), at the cost of constant periodic
+///     wakeups. Use this only when inotify misses external edits.
+///
+/// In both modes the reconcile is identical and suppresses Tine's *own* writes
+/// via the cache comparison inside `sync_file`. A control channel (poked by
+/// `load_graph` on a graph switch and by `set_watch_mode`) lets the thread
+/// re-target or switch mechanism at once, without polling for those either.
 fn start_watcher(app: tauri::AppHandle) {
+    use notify::Watcher;
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    if let Ok(mut slot) = app.state::<AppState>().watch_ctl.lock() {
+        *slot = Some(tx.clone());
+    }
     std::thread::spawn(move || {
         let mut snap: HashMap<PathBuf, SystemTime> = HashMap::new();
         let mut baseline = false;
+        let mut watcher: Option<notify::RecommendedWatcher> = None;
+        let mut watched: Vec<PathBuf> = Vec::new();
+        let mut last_dirs: Option<[PathBuf; 2]> = None;
         loop {
-            std::thread::sleep(Duration::from_secs(3));
-            let state: State<'_, AppState> = app.state();
-            // Clone the graph Arc and release the outer lock immediately, so the
+            let inotify = watch_mode(&app) != "poll";
+            // Clone the graph Arc and release the lock immediately, so the
             // (potentially slow) reconcile below — directory scan + per-file
             // sync_file parses — never holds the lock that a graph switch needs.
             let (dirs, graph) = {
+                let state: State<'_, AppState> = app.state();
                 let g = state.graph.read().unwrap();
                 match g.as_ref() {
-                    Some(g) => ([g.journals_path(), g.pages_path()], g.clone()),
-                    None => continue,
+                    Some(g) => (Some([g.journals_path(), g.pages_path()]), Some(g.clone())),
+                    None => (None, None),
                 }
             };
-            let mut current: HashMap<PathBuf, SystemTime> = HashMap::new();
-            for dir in &dirs {
-                if let Ok(rd) = std::fs::read_dir(dir) {
-                    for e in rd.flatten() {
-                        let p = e.path();
-                        if p.extension().and_then(|x| x.to_str()) != Some("md") {
-                            continue;
+
+            // First load or graph switch: reset the diff baseline (so the new
+            // graph's files aren't all reported as "added") and drop the stale
+            // watches pointing at the previous graph.
+            if dirs != last_dirs {
+                snap.clear();
+                baseline = false;
+                last_dirs = dirs.clone();
+                if let Some(w) = watcher.as_mut() {
+                    for d in &watched {
+                        let _ = w.unwatch(d);
+                    }
+                }
+                watched.clear();
+            }
+
+            // Bring the OS watcher in line with the current mode + dirs.
+            if inotify {
+                if watcher.is_none() {
+                    let txc = tx.clone();
+                    watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+                        // Any successful event wakes the loop for a full rescan;
+                        // we don't trust per-event detail (renames arrive as
+                        // remove+create, etc.) — the rescan is the source of truth.
+                        if res.is_ok() {
+                            let _ = txc.send(());
                         }
-                        if let Ok(m) = e.metadata().and_then(|md| md.modified()) {
-                            current.insert(p, m);
+                    })
+                    .ok();
+                    watched.clear();
+                }
+                if let (Some(w), Some(ds)) = (watcher.as_mut(), dirs.as_ref()) {
+                    if watched.is_empty() {
+                        for d in ds.iter() {
+                            if w.watch(d, notify::RecursiveMode::NonRecursive).is_ok() {
+                                watched.push(d.clone());
+                            }
                         }
                     }
                 }
+            } else if watcher.is_some() {
+                watcher = None; // poll mode → release the OS watcher
+                watched.clear();
             }
-            if !baseline {
-                snap = current;
-                baseline = true;
-                continue; // first scan establishes the baseline; emit nothing
-            }
-            let mut changes: Vec<GraphChange> = Vec::new();
-            for (p, m) in &current {
-                if snap.get(p) != Some(m) {
-                    if let Some(en) = graph.sync_file(p) {
-                        changes.push(GraphChange { name: en.name, kind: en.kind, removed: false });
+
+            // --- reconcile (identical in both modes) ---
+            if let (Some(ds), Some(graph)) = (dirs.as_ref(), graph.as_ref()) {
+                let mut current: HashMap<PathBuf, SystemTime> = HashMap::new();
+                for dir in ds {
+                    if let Ok(rd) = std::fs::read_dir(dir) {
+                        for e in rd.flatten() {
+                            let p = e.path();
+                            if p.extension().and_then(|x| x.to_str()) != Some("md") {
+                                continue;
+                            }
+                            if let Ok(m) = e.metadata().and_then(|md| md.modified()) {
+                                current.insert(p, m);
+                            }
+                        }
+                    }
+                }
+                if !baseline {
+                    snap = current;
+                    baseline = true; // first scan establishes the baseline; emit nothing
+                } else {
+                    let mut changes: Vec<GraphChange> = Vec::new();
+                    for (p, m) in &current {
+                        if snap.get(p) != Some(m) {
+                            if let Some(en) = graph.sync_file(p) {
+                                changes.push(GraphChange { name: en.name, kind: en.kind, removed: false });
+                            }
+                        }
+                    }
+                    for p in snap.keys() {
+                        if !current.contains_key(p) {
+                            if let Some(en) = graph.forget_file(p) {
+                                changes.push(GraphChange { name: en.name, kind: en.kind, removed: true });
+                            }
+                        }
+                    }
+                    snap = current;
+                    for c in changes {
+                        let _ = app.emit("graph-changed", c);
                     }
                 }
             }
-            for p in snap.keys() {
-                if !current.contains_key(p) {
-                    if let Some(en) = graph.forget_file(p) {
-                        changes.push(GraphChange { name: en.name, kind: en.kind, removed: true });
-                    }
+
+            // --- wait for the next cycle ---
+            if inotify && !watched.is_empty() {
+                // Block until the kernel reports a change (or a control poke).
+                // Idle = no wakeups. Coalesce a burst (one save fires several
+                // inotify events) into a single reconcile via a short settle.
+                if rx.recv().is_ok() {
+                    std::thread::sleep(Duration::from_millis(200));
+                    while rx.try_recv().is_ok() {}
                 }
-            }
-            snap = current;
-            for c in changes {
-                let _ = app.emit("graph-changed", c);
+            } else {
+                // Poll mode, or inotify with nothing watched yet (no graph open):
+                // a short sleep, draining any stray pokes so they don't pile up.
+                std::thread::sleep(Duration::from_secs(3));
+                while rx.try_recv().is_ok() {}
             }
         }
     });
@@ -116,6 +205,11 @@ fn load_graph(
     // Recover any journals mis-saved under their title (see method docs).
     graph.migrate_journal_filenames();
     *state.graph.write().unwrap() = Some(Arc::new(graph));
+    // Nudge the watcher so it re-targets the new graph's dirs at once (in inotify
+    // mode it's otherwise blocked on the old graph's events).
+    if let Some(tx) = state.watch_ctl.lock().unwrap().as_ref() {
+        let _ = tx.send(());
+    }
     backup_async(app.clone());
     warm_cache_async(app);
     Ok(meta)
@@ -280,6 +374,44 @@ fn set_capture_enter_files(value: bool, app: tauri::AppHandle) -> Result<(), Str
         .unwrap_or_else(|| serde_json::json!({}));
     json["capture_enter_files"] = serde_json::Value::Bool(value);
     std::fs::write(&p, serde_json::to_string_pretty(&json).unwrap()).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// How the file-watcher detects external changes (device-local, in
+/// tine-settings.json): "inotify" (default) → a real OS watcher, no idle
+/// wakeups; "poll" → a 3s mtime scan for filesystems where inotify is flaky
+/// (some NFS). See `start_watcher`.
+fn watch_mode(app: &tauri::AppHandle) -> String {
+    settings_path(app)
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.get("watch_mode").and_then(|x| x.as_str().map(String::from)))
+        .filter(|m| m == "poll" || m == "inotify")
+        .unwrap_or_else(|| "inotify".to_string())
+}
+
+#[tauri::command]
+fn get_watch_mode(app: tauri::AppHandle) -> String {
+    watch_mode(&app)
+}
+
+#[tauri::command]
+fn set_watch_mode(mode: String, app: tauri::AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    let mode = if mode == "poll" { "poll" } else { "inotify" };
+    let p = settings_path(&app).ok_or("no app-data dir")?;
+    if let Some(parent) = p.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let mut json = std::fs::read_to_string(&p)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    json["watch_mode"] = serde_json::json!(mode);
+    std::fs::write(&p, serde_json::to_string_pretty(&json).unwrap()).map_err(|e| e.to_string())?;
+    // Wake the watcher so it switches mechanism right away.
+    if let Some(tx) = state.watch_ctl.lock().unwrap().as_ref() {
+        let _ = tx.send(());
+    }
     Ok(())
 }
 
@@ -888,7 +1020,7 @@ fn main() {
                 }
             }
         })
-        .manage(AppState { graph: RwLock::new(None) })
+        .manage(AppState { graph: RwLock::new(None), watch_ctl: Mutex::new(None) })
         .setup(|app| {
             // Eagerly open the graph if one was configured at startup.
             if let Some(root) = resolve_root("") {
@@ -990,6 +1122,8 @@ fn main() {
             set_backup_keep,
             get_capture_enter_files,
             set_capture_enter_files,
+            get_watch_mode,
+            set_watch_mode,
             list_backups,
             restore_backup,
             load_session,

@@ -449,6 +449,17 @@ function TasksTab(): JSX.Element {
 }
 
 function GraphTab(props: { publishMsg: string; doPublish: () => void }): JSX.Element {
+  // File-watch mechanism (device-local). Loaded from the backend on mount.
+  const [watchMode, setWatchMode] = createSignal<"inotify" | "poll">("inotify");
+  void backend()
+    .getWatchMode()
+    .then((m) => setWatchMode(m === "poll" ? "poll" : "inotify"))
+    .catch(() => {});
+  const changeWatchMode = (m: "inotify" | "poll") => {
+    if (m === watchMode()) return;
+    setWatchMode(m);
+    void backend().setWatchMode(m).catch(() => {});
+  };
   return (
     <>
       <div class="settings-row">
@@ -462,6 +473,34 @@ function GraphTab(props: { publishMsg: string; doPublish: () => void }): JSX.Ele
           </div>
         </div>
       </div>
+
+      <Field
+        label="Watch for external edits"
+        hint={
+          <>
+            How Tine notices changes made outside it (OG Logseq, Syncthing, an
+            editor). <b>Live</b> uses the OS file watcher (inotify) — no idle CPU
+            wakeups; the right choice on a normal local disk. <b>Poll</b> rescans
+            every 3 seconds — only needed on filesystems where inotify is
+            unreliable (some network/NFS mounts). Saved per device.
+          </>
+        }
+      >
+        <div class="settings-segment">
+          <button
+            classList={{ active: watchMode() === "inotify" }}
+            onClick={() => changeWatchMode("inotify")}
+          >
+            Live (inotify)
+          </button>
+          <button
+            classList={{ active: watchMode() === "poll" }}
+            onClick={() => changeWatchMode("poll")}
+          >
+            Poll (3s)
+          </button>
+        </div>
+      </Field>
 
       <div class="settings-row">
         <span class="settings-label">Publish</span>

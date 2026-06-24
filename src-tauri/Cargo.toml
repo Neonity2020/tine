@@ -23,4 +23,5 @@ tauri-plugin-window-state = "2"
 tauri-plugin-single-instance = "2"
 serde = { workspace = true }
 serde_json = { workspace = true }
+notify = "6"
 tine-core = { path = "../crates/tine-core" }
