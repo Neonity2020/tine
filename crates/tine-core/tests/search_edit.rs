@@ -393,3 +393,43 @@ fn migrate_renames_title_named_journal_files() {
     assert!(g.journals_desc().iter().any(|e| e.name == "Jun 18th, 2026"));
     let _ = std::fs::remove_dir_all(&root);
 }
+
+// CRLF graphs (e.g. a graph edited on Windows) round-trip safely: parsing strips
+// the `\r` so it never pollutes content, an UNCHANGED save stays byte-identical
+// (no Syncthing churn / no LF flip), and a real edit keeps the file's CRLF.
+#[test]
+fn crlf_files_round_trip_without_churn() {
+    let root = mk("crlf");
+    let original = "title:: Win\r\n\r\n- TODO ship it\r\n- second line\r\n";
+    let path = root.join("pages").join("Win.md");
+    std::fs::write(&path, original).unwrap();
+    let g = Graph::open(&root);
+    g.warm_cache();
+
+    let dto = g.load_named("Win", PageKind::Page).unwrap().unwrap();
+    // (1) no stray CR leaks into the in-memory model
+    assert!(dto.pre_block.as_deref().map_or(true, |p| !p.contains('\r')), "pre-block CR");
+    for b in &dto.blocks {
+        assert!(!b.raw.contains('\r'), "block raw carries a CR: {:?}", b.raw);
+    }
+    // (2) an unchanged save is byte-identical — CRLF preserved, no churn
+    g.save_page(&dto, dto.rev.as_deref()).expect("no-op save");
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        original,
+        "unchanged save must keep the exact CRLF bytes"
+    );
+    // (3) a real edit keeps CRLF (only the changed line differs, no lone LF)
+    let mut dto2 = g.load_named("Win", PageKind::Page).unwrap().unwrap();
+    dto2.blocks[0].raw = dto2.blocks[0].raw.replace("ship it", "shipped");
+    g.save_page(&dto2, dto2.rev.as_deref()).expect("edit save");
+    let after = std::fs::read_to_string(&path).unwrap();
+    assert!(after.contains("shipped"), "edit applied: {after:?}");
+    assert!(after.contains("\r\n"), "edited file keeps CRLF: {after:?}");
+    assert_eq!(
+        after.matches('\n').count(),
+        after.matches("\r\n").count(),
+        "no lone LF mixed in: {after:?}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}

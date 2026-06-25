@@ -1159,12 +1159,17 @@ impl Graph {
         // (`page_path` + its lock were taken at the top of this fn.) Prefer the
         // new-key page; fall back to the legacy-key page so its user notes are
         // carried over during migration.
-        let existing = fs::read_to_string(&page_path)
+        let existing_raw = fs::read_to_string(&page_path)
             .ok()
-            .or_else(|| legacy_page.as_ref().and_then(|p| fs::read_to_string(p).ok()))
-            .map(|s| doc::parse(&s));
+            .or_else(|| legacy_page.as_ref().and_then(|p| fs::read_to_string(p).ok()));
+        let existing = existing_raw.as_deref().map(doc::parse);
         let page_doc = crate::pdf::merge_hls_page(existing.as_ref(), pdf_filename, label, &merged);
-        let page_md = doc::serialize(&page_doc);
+        let mut page_md = doc::serialize(&page_doc);
+        // Preserve the notes page's CRLF endings (see write_page), so re-saving a
+        // highlight doesn't flip a Windows-edited hls__ page to LF.
+        if existing_raw.as_deref().is_some_and(|e| e.contains("\r\n")) && !page_md.contains('\r') {
+            page_md = page_md.replace('\n', "\r\n");
+        }
         fs::create_dir_all(self.pages_path())?;
         // The hls page is a normal watched page. Record this write so the file
         // watcher recognizes it as ours — otherwise saving a highlight trips a
@@ -1453,6 +1458,14 @@ impl Graph {
             if e != content && doc::parse(e) == doc::parse(&content) {
                 content = e.to_string();
             }
+        }
+        // CRLF preservation: if the existing file uses Windows line endings, emit
+        // them too — so a real edit produces a minimal diff instead of flipping
+        // every line LF (Syncthing churn vs a Windows editor). No-op saves already
+        // kept the existing bytes verbatim (A5 above, so `content` may already be
+        // CRLF — guard against double-converting). New files stay LF.
+        if existing.is_some_and(|e| e.contains("\r\n")) && !content.contains('\r') {
+            content = content.replace('\n', "\r\n");
         }
         let rev = content_rev(&content);
         // No-op save: identical bytes already on disk (e.g. focus/blur with no real

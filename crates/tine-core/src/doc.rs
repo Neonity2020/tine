@@ -139,6 +139,17 @@ fn bullet(line: &str) -> Option<(usize, &str)> {
 
 /// Parse a file's contents into a [`Document`].
 pub fn parse(content: &str) -> Document {
+    // Normalize CRLF / lone CR to LF so the in-memory model never carries a stray
+    // `\r` (which would otherwise pollute property / `id::` values and break
+    // matching). The file's original line endings are reproduced at the write
+    // boundary (model.rs `write_page`), not here — the model is LF-canonical.
+    let normalized;
+    let content = if content.contains('\r') {
+        normalized = content.replace('\r', "");
+        normalized.as_str()
+    } else {
+        content
+    };
     let body = content.strip_suffix('\n').unwrap_or(content);
     let lines: Vec<&str> = if body.is_empty() { Vec::new() } else { body.split('\n').collect() };
 
@@ -282,7 +293,14 @@ impl SerializeOpts {
         match existing {
             None => SerializeOpts::default(),
             Some(s) => SerializeOpts {
-                trailing_newlines: s.bytes().rev().take_while(|b| *b == b'\n').count(),
+                // Count trailing `\n` within the trailing run of newline bytes, so
+                // a CRLF file's `\r` doesn't truncate the count (`…\r\n\r\n` ⇒ 2).
+                trailing_newlines: s
+                    .bytes()
+                    .rev()
+                    .take_while(|b| *b == b'\n' || *b == b'\r')
+                    .filter(|b| *b == b'\n')
+                    .count(),
                 blank_after_props: blank_after_props(s),
                 indent: detect_indent(s),
             },
@@ -369,5 +387,31 @@ fn emit_block(block: &DocBlock, level: usize, unit: &str, out: &mut Vec<String>)
     }
     for child in &block.children {
         emit_block(child, level + 1, unit, out);
+    }
+}
+
+#[cfg(test)]
+mod crlf_tests {
+    use super::*;
+
+    #[test]
+    fn parse_normalizes_crlf_to_lf() {
+        let crlf = parse("title:: x\r\n\r\n- a\r\n- b\r\n");
+        // No stray CR leaks into the model (would otherwise pollute property/id values).
+        assert_eq!(crlf.pre_block.as_deref(), Some("title:: x"));
+        for b in &crlf.roots {
+            assert!(!b.raw.contains('\r'), "stray CR in block raw: {:?}", b.raw);
+        }
+        // CRLF parses to the same model as LF; serialize is LF-canonical.
+        let lf = parse("title:: x\n\n- a\n- b\n");
+        assert_eq!(serialize(&crlf), serialize(&lf));
+        assert!(!serialize(&crlf).contains('\r'));
+    }
+
+    #[test]
+    fn detect_trailing_newlines_is_crlf_robust() {
+        assert_eq!(SerializeOpts::detect(Some("- a\r\n\r\n")).trailing_newlines, 2);
+        assert_eq!(SerializeOpts::detect(Some("- a\r\n")).trailing_newlines, 1);
+        assert_eq!(SerializeOpts::detect(Some("- a\n\n")).trailing_newlines, 2);
     }
 }
