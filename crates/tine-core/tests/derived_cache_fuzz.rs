@@ -7,7 +7,7 @@
 //! introduce. This guards both the current (full-invalidation) cache and the
 //! scoped one.
 
-use tine_core::{BlockDto, Graph, PageDto, PageKind, RefGroup};
+use tine_core::{BlockDto, Graph, PageKind, RefGroup};
 
 // --- deterministic PRNG (xorshift64) so a failure reproduces from its seed ----
 struct Rng(u64);
@@ -140,7 +140,7 @@ fn run_seed(seed: u64) {
     let live = Graph::open(&root);
     live.warm_cache();
 
-    for iter in 0..80 {
+    for iter in 0..200 {
         // Apply one random CONTENT edit to a random page through the real save path.
         let pi = r.below(PAGES.len());
         let name = PAGES[pi];

@@ -244,6 +244,74 @@ fn run_pred(graph: &Graph, pred: &Pred, opts: &QueryOpts) -> Vec<RefGroup> {
     groups
 }
 
+// --- Scoped-invalidation support (#52) --------------------------------------
+// "Could an edit to page (entry, doc) change this derived result?" Each reuses
+// the SAME parse + EvalCtx + eval (or alias resolution) as the real matcher, so
+// the keep/evict decision can never drift from what a full recompute would give.
+
+/// Whether page (entry, doc) contributes any block to query `src`.
+pub(crate) fn page_affects_query(src: &str, entry: &PageEntry, doc: &Document) -> bool {
+    let today = JournalDate::today();
+    let Some(pred) = Pred::parse(src, today) else { return false };
+    let (page_props, page_tags) = page_facets(doc.pre_block.as_deref());
+    let ctx = EvalCtx {
+        journal: entry.date_key,
+        is_journal: entry.kind == PageKind::Journal,
+        page_name: &entry.name,
+        page_props: &page_props,
+        page_tags: &page_tags,
+    };
+    let mut hit = false;
+    walk(&doc.roots, &mut |b| {
+        if !hit && pred.eval(b, &ctx) {
+            hit = true;
+        }
+    });
+    hit
+}
+
+/// Whether page `doc` references `target` or any of its aliases — i.e. could be
+/// in `backlinks(target)`. Mirrors `backlinks`'s alias resolution; takes the
+/// resolved alias map so the caller needn't hold the graph lock.
+pub(crate) fn page_affects_backlinks(aliases: &[(String, String)], target: &str, doc: &Document) -> bool {
+    let tnorm = refs::normalize(target);
+    let canonical = aliases
+        .iter()
+        .find(|(a, _)| *a == tnorm)
+        .map(|(_, c)| c.clone())
+        .unwrap_or_else(|| target.to_string());
+    let cnorm = refs::normalize(&canonical);
+    let mut names: Vec<String> = vec![canonical];
+    for (a, c) in aliases {
+        if refs::normalize(c) == cnorm {
+            names.push(a.clone());
+        }
+    }
+    let mut hit = false;
+    walk(&doc.roots, &mut |b| {
+        if !hit && names.iter().any(|n| b.projection().refs_contains(n)) {
+            hit = true;
+        }
+    });
+    hit
+}
+
+/// Whether page `doc` plain-text-mentions `target` unlinked — i.e. could be in
+/// `unlinked_refs(target)`. Mirrors `unlinked_refs`'s matcher.
+pub(crate) fn page_affects_unlinked(target: &str, doc: &Document) -> bool {
+    let lower = target.to_lowercase();
+    let mut hit = false;
+    walk(&doc.roots, &mut |b| {
+        if !hit
+            && contains_word(&b.raw.to_lowercase(), &lower)
+            && !b.projection().refs_contains(target)
+        {
+            hit = true;
+        }
+    });
+    hit
+}
+
 /// Result of an advanced (datalog) query: matched groups + which clause heads
 /// ran vs were ignored, so the UI shows "ran X; ignored Y" rather than a blunt
 /// "unsupported". `supported` is false only when nothing in the subset matched.

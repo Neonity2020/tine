@@ -729,7 +729,7 @@ impl Graph {
         // snapshot that predates this change (see with_pages). Update the cache
         // slot BEFORE disk_revs below, so a reader can never observe a fresh rev
         // paired with a stale cached doc.
-        self.cache_gen.fetch_add(1, std::sync::atomic::Ordering::Release);
+        let newgen = self.cache_gen.fetch_add(1, std::sync::atomic::Ordering::Release) + 1;
         // Fill uuids for any block that lacks one (e.g. PDF-highlight writes);
         // blocks saved from the frontend already carry their ids, which are kept.
         assign_doc_uuids(&mut doc.roots);
@@ -739,7 +739,13 @@ impl Graph {
         let new_has_alias = doc_has_alias(&doc);
         let mut alias_touched = new_has_alias;
         let key = rev_key(entry.kind, &entry.name);
+        // Keep the new content + identity for the scoped derived-cache pass below
+        // (the originals are moved into the cache slot).
+        let evict_doc = doc.clone();
+        let evict_entry = entry.clone();
+        let mut is_new_page = false;
         let mut guard = self.cache.write().unwrap();
+        let cache_built = guard.is_some();
         if let Some(pages) = guard.as_mut() {
             match pages.iter_mut().find(|(e, _)| {
                 e.kind == entry.kind && e.name.eq_ignore_ascii_case(&entry.name)
@@ -748,7 +754,10 @@ impl Graph {
                     alias_touched = new_has_alias || doc_has_alias(&slot.1);
                     slot.1 = doc;
                 }
-                None => pages.push((entry, doc)),
+                None => {
+                    is_new_page = true;
+                    pages.push((entry, doc));
+                }
             }
             // Update disk_revs WHILE STILL HOLDING the cache write lock, so the
             // cached doc and its freshness rev are published atomically and can
@@ -765,11 +774,54 @@ impl Graph {
         if alias_touched {
             *self.alias_cache.write().unwrap() = None;
         }
+        // Scoped query/backlink invalidation (#52): a content edit to one page
+        // can't change a derived result the page doesn't participate in, so keep
+        // those (advancing their generation) and recompute only the entries this
+        // page is in or now matches. An alias change, a new page, or a cold cache
+        // has graph-wide effects → drop everything. Guarded by the differential
+        // fuzz oracle in tests/derived_cache_fuzz.rs.
+        let scoped = cache_built && !alias_touched && !is_new_page;
+        self.scope_derived_invalidation(&evict_entry, &evict_doc, newgen, scoped);
+    }
+
+    /// See `cache_upsert`. When `scoped`, evict only derived entries the edited
+    /// page (`entry`, `doc`) participates in and re-tag the survivors to `newgen`;
+    /// otherwise drop the whole derived cache.
+    fn scope_derived_invalidation(&self, entry: &PageEntry, doc: &Document, newgen: u64, scoped: bool) {
+        // Resolve aliases BEFORE locking derived_cache (page_aliases may take the
+        // cache lock); never hold derived while taking cache.
+        let aliases = if scoped { self.page_aliases() } else { Vec::new() };
+        let today = crate::date::JournalDate::today().ordinal_key();
+        let mut g = self.derived_cache.write().unwrap();
+        let Some(dc) = g.as_mut() else { return };
+        if !scoped || dc.today != today {
+            *g = None; // full invalidate (alias/page-set/cold-cache, or day rollover)
+            return;
+        }
+        let pname = &entry.name;
+        dc.results.retain(|key, result| {
+            // Evict iff this page is already in the result OR now matches the key's
+            // predicate; keep (still correct) otherwise.
+            if result.iter().any(|grp| grp.page.eq_ignore_ascii_case(pname)) {
+                return false;
+            }
+            let affects = match key.split_once('\0') {
+                Some(("b", t)) => crate::query::page_affects_backlinks(&aliases, t, doc),
+                Some(("u", t)) => crate::query::page_affects_unlinked(t, doc),
+                Some(("q", s)) => crate::query::page_affects_query(s, entry, doc),
+                _ => true, // unknown key shape → evict to stay safe
+            };
+            !affects
+        });
+        dc.gen = newgen; // survivors are valid for the post-bump generation
     }
 
     /// Drop one page from the cache after deleting its file.
     fn cache_remove(&self, name: &str, kind: PageKind) {
         self.cache_gen.fetch_add(1, std::sync::atomic::Ordering::Release);
+        // A page delete is a page-set change (affects namespaces, exists-by-ref,
+        // every backlink/query) — drop the whole derived cache.
+        *self.derived_cache.write().unwrap() = None;
         let mut guard = self.cache.write().unwrap();
         let mut alias_touched = false;
         if let Some(pages) = guard.as_mut() {
