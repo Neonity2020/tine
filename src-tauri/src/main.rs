@@ -973,6 +973,50 @@ fn show_capture(app: &tauri::AppHandle) {
 }
 
 fn main() {
+    // AppImages bundle their own libwayland-client.so; on a Wayland session it can
+    // mismatch the host compositor and abort WebKitGTK's EGL init ("Could not
+    // create default EGL display: EGL_BAD_PARAMETER"). Self-heal by re-exec'ing
+    // ONCE with the host's libwayland-client preloaded — so users never have to
+    // set LD_PRELOAD by hand. Guarded to the actual problem case: only inside an
+    // AppImage (`APPIMAGE` set), only on Wayland, only once (`TINE_WL_PRELOADED`),
+    // only if a host lib is found. No effect on the raw binary / deb / rpm.
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("APPIMAGE").is_some()
+        && std::env::var_os("WAYLAND_DISPLAY").is_some()
+        && std::env::var_os("TINE_WL_PRELOADED").is_none()
+        && !std::env::var("LD_PRELOAD")
+            .unwrap_or_default()
+            .contains("libwayland-client")
+    {
+        // Common host locations across distros (Debian/Ubuntu, Fedora/openSUSE, Arch).
+        const CANDIDATES: &[&str] = &[
+            "/usr/lib/x86_64-linux-gnu/libwayland-client.so.0",
+            "/usr/lib64/libwayland-client.so.0",
+            "/usr/lib/libwayland-client.so.0",
+            "/lib/x86_64-linux-gnu/libwayland-client.so.0",
+        ];
+        if let (Some(lib), Ok(exe)) = (
+            CANDIDATES.iter().find(|p| std::path::Path::new(p).exists()),
+            std::env::current_exe(),
+        ) {
+            use std::os::unix::process::CommandExt;
+            let existing = std::env::var("LD_PRELOAD").unwrap_or_default();
+            let preload = if existing.is_empty() {
+                lib.to_string()
+            } else {
+                format!("{lib}:{existing}")
+            };
+            // `exec` only returns on failure; on success it replaces this process
+            // (same PID, env + bundled LD_LIBRARY_PATH inherited, host lib preloaded).
+            let err = std::process::Command::new(exe)
+                .args(std::env::args_os().skip(1))
+                .env("LD_PRELOAD", preload)
+                .env("TINE_WL_PRELOADED", "1")
+                .exec();
+            eprintln!("tine: Wayland libwayland-client preload re-exec failed ({err}); continuing");
+        }
+    }
+
     // GPU/DMABUF rendering is ON by default (smoother scrolling — that's the point
     // of Tine). On the rare GPU/compositor combo where WebKitGTK's DMABUF renderer
     // aborts ("Could not create default EGL display: EGL_BAD_PARAMETER"), set
