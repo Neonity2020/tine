@@ -581,12 +581,12 @@ export function Editor(props: { id: string }): JSX.Element {
     const text = ref.value;
     const caret = ref.selectionStart;
     if (delta > 0) {
-      commit(text.slice(0, ll.lineStart) + "  " + text.slice(ll.lineStart));
-      startEditing(props.id, caret + 2);
+      const c = caret + 2;
+      applyEdit({ text: text.slice(0, ll.lineStart) + "  " + text.slice(ll.lineStart), start: c, end: c });
     } else {
       const lead = Math.min(2, ll.indent.length);
-      commit(text.slice(0, ll.lineStart) + text.slice(ll.lineStart + lead));
-      startEditing(props.id, Math.max(ll.lineStart, caret - lead));
+      const c = Math.max(ll.lineStart, caret - lead);
+      applyEdit({ text: text.slice(0, ll.lineStart) + text.slice(ll.lineStart + lead), start: c, end: c });
     }
   };
 
@@ -1065,8 +1065,10 @@ export function Editor(props: { id: string }): JSX.Element {
         const ordered = /\d/.test(ll.marker);
         const nextMarker = ordered ? parseInt(ll.marker) + 1 + ll.marker.replace(/\d+/, "") : ll.marker;
         const prefix = ll.indent + nextMarker + " " + (ll.hasCheckbox ? "[ ] " : "");
-        commit(raw.slice(0, start) + "\n" + prefix + raw.slice(start));
-        startEditing(props.id, start + 1 + prefix.length);
+        const caret = start + 1 + prefix.length;
+        // applyEdit (not commit+startEditing) so the textarea re-autosizes — else
+        // the new line is clipped until the next keystroke.
+        applyEdit({ text: raw.slice(0, start) + "\n" + prefix + raw.slice(start), start: caret, end: caret });
         return;
       }
       commit(raw); // flush current text
@@ -1085,8 +1087,7 @@ export function Editor(props: { id: string }): JSX.Element {
       const ll = listLineAt(raw, start);
       if (ll && start === ll.lineStart + ll.prefixLen) {
         e.preventDefault();
-        commit(raw.slice(0, ll.lineStart) + raw.slice(start));
-        startEditing(props.id, ll.lineStart);
+        applyEdit({ text: raw.slice(0, ll.lineStart) + raw.slice(start), start: ll.lineStart, end: ll.lineStart });
         return;
       }
       if (start === 0) {
