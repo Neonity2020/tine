@@ -12,34 +12,111 @@ fn is_tag_char(c: char) -> bool {
     c.is_alphanumeric() || matches!(c, '-' | '_' | '/' | '.')
 }
 
+/// Byte ranges of `raw` that are inside code — fenced blocks (``` / ~~~) or
+/// inline `…` spans. Like OG, references inside code are literal: they are
+/// neither indexed as backlinks nor rewritten on rename, so a code example that
+/// shows `[[Foo]]`/`#Foo` (or a URL fragment inside code) isn't corrupted when
+/// page Foo is renamed. (A bare URL `…#Foo` in prose is a separate case.)
+fn code_ranges(raw: &str) -> Vec<std::ops::Range<usize>> {
+    let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut fence: Option<(u8, usize)> = None; // (marker byte, run length) while open
+    let mut pos = 0usize;
+    for line in raw.split_inclusive('\n') {
+        let line_start = pos;
+        pos += line.len();
+        let content = line.strip_suffix('\n').unwrap_or(line);
+        let trimmed = content.trim_start();
+        let marker = trimmed.bytes().next().filter(|&c| c == b'`' || c == b'~');
+        let run = marker.map_or(0, |m| trimmed.bytes().take_while(|&c| c == m).count());
+        if let Some((fc, fl)) = fence {
+            ranges.push(line_start..pos); // whole line (incl. newline) is code
+            // A closing fence is the same marker, >= the opening run, nothing after it.
+            if marker == Some(fc) && run >= fl && trimmed.as_bytes()[run..].iter().all(u8::is_ascii_whitespace) {
+                fence = None;
+            }
+            continue;
+        }
+        if run >= 3 {
+            ranges.push(line_start..pos);
+            fence = Some((marker.unwrap(), run));
+            continue;
+        }
+        inline_code_spans(content, line_start, &mut ranges);
+    }
+    ranges
+}
+
+/// Append byte ranges of inline `code` spans on one (non-fenced) line. A span is
+/// a run of N backticks, closed by the next run of exactly N (CommonMark-ish).
+fn inline_code_spans(line: &str, base: usize, out: &mut Vec<std::ops::Range<usize>>) {
+    let b = line.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'`' {
+            let open = i;
+            let k = b[i..].iter().take_while(|&&c| c == b'`').count();
+            let mut j = i + k;
+            let mut end = None;
+            while j < b.len() {
+                if b[j] == b'`' {
+                    let r = b[j..].iter().take_while(|&&c| c == b'`').count();
+                    if r == k {
+                        end = Some(j + k);
+                        break;
+                    }
+                    j += r;
+                } else {
+                    j += 1;
+                }
+            }
+            match end {
+                Some(e) => {
+                    out.push(base + open..base + e);
+                    i = e;
+                }
+                None => i = open + k, // unterminated: the backticks are literal
+            }
+        } else {
+            i += 1;
+        }
+    }
+}
+
+fn in_code(pos: usize, ranges: &[std::ops::Range<usize>]) -> bool {
+    ranges.iter().any(|r| r.contains(&pos))
+}
+
 /// All page references in `raw`: `[[name]]`, `#tag`, and `#[[name]]`. Tags are
 /// included because Logseq treats `#foo` as a reference to page `foo`.
 pub fn page_refs(raw: &str) -> Vec<String> {
+    let code = code_ranges(raw);
     let mut out = Vec::new();
     let mut i = 0;
     while i < raw.len() {
         let rest = &raw[i..];
-        if let Some(after) = rest.strip_prefix("[[") {
-            if let Some(end) = after.find("]]") {
-                out.push(after[..end].to_string());
-                i += 2 + end + 2;
-                continue;
-            }
-        }
-        if rest.starts_with('#') {
-            if let Some(after) = rest.strip_prefix("#[[") {
+        if !in_code(i, &code) {
+            if let Some(after) = rest.strip_prefix("[[") {
                 if let Some(end) = after.find("]]") {
                     out.push(after[..end].to_string());
-                    i += 3 + end + 2;
+                    i += 2 + end + 2;
                     continue;
                 }
             }
-            let after = &rest[1..];
-            let len = after.find(|c: char| !is_tag_char(c)).unwrap_or(after.len());
-            if len > 0 {
-                out.push(after[..len].to_string());
-                i += 1 + len;
-                continue;
+            if rest.starts_with('#') {
+                if let Some(after) = rest.strip_prefix("#[[") {
+                    if let Some(end) = after.find("]]") {
+                        out.push(after[..end].to_string());
+                        i += 3 + end + 2;
+                        continue;
+                    }
+                }
+                let after = &rest[1..];
+                let len = after.find(|c: char| !is_tag_char(c)).unwrap_or(after.len());
+                if len > 0 {
+                    out.push(after[..len].to_string());
+                    i += 1 + len;
+                    continue;
+                }
             }
         }
         i += rest.chars().next().map(|c| c.len_utf8()).unwrap_or(1);
@@ -49,15 +126,18 @@ pub fn page_refs(raw: &str) -> Vec<String> {
 
 /// All block references `((uuid))` in `raw`.
 pub fn block_refs(raw: &str) -> Vec<String> {
+    let code = code_ranges(raw);
     let mut out = Vec::new();
     let mut i = 0;
     while i < raw.len() {
         let rest = &raw[i..];
-        if let Some(after) = rest.strip_prefix("((") {
-            if let Some(end) = after.find("))") {
-                out.push(after[..end].trim().to_string());
-                i += 2 + end + 2;
-                continue;
+        if !in_code(i, &code) {
+            if let Some(after) = rest.strip_prefix("((") {
+                if let Some(end) = after.find("))") {
+                    out.push(after[..end].trim().to_string());
+                    i += 2 + end + 2;
+                    continue;
+                }
             }
         }
         i += rest.chars().next().map(|c| c.len_utf8()).unwrap_or(1);
@@ -77,43 +157,48 @@ pub fn references_page(raw: &str, target: &str) -> bool {
 /// (e.g. spaces), matching Logseq.
 pub fn rename_refs(raw: &str, from: &str, to: &str) -> String {
     let target = normalize(from);
+    let code = code_ranges(raw);
     let mut out = String::with_capacity(raw.len());
     let mut i = 0;
     while i < raw.len() {
         let rest = &raw[i..];
-        if let Some(after) = rest.strip_prefix("[[") {
-            if let Some(end) = after.find("]]") {
-                if normalize(&after[..end]) == target {
-                    out.push_str(&format!("[[{to}]]"));
-                } else {
-                    out.push_str(&raw[i..i + 2 + end + 2]);
+        // Inside a code fence / inline-code span, refs are literal — copy verbatim
+        // (one char), never rewrite, so code examples aren't corrupted by a rename.
+        if !in_code(i, &code) {
+            if let Some(after) = rest.strip_prefix("[[") {
+                if let Some(end) = after.find("]]") {
+                    if normalize(&after[..end]) == target {
+                        out.push_str(&format!("[[{to}]]"));
+                    } else {
+                        out.push_str(&raw[i..i + 2 + end + 2]);
+                    }
+                    i += 2 + end + 2;
+                    continue;
                 }
-                i += 2 + end + 2;
-                continue;
             }
-        }
-        if let Some(after) = rest.strip_prefix("#[[") {
-            if let Some(end) = after.find("]]") {
-                if normalize(&after[..end]) == target {
-                    out.push_str(&tag_for(to));
-                } else {
-                    out.push_str(&raw[i..i + 3 + end + 2]);
+            if let Some(after) = rest.strip_prefix("#[[") {
+                if let Some(end) = after.find("]]") {
+                    if normalize(&after[..end]) == target {
+                        out.push_str(&tag_for(to));
+                    } else {
+                        out.push_str(&raw[i..i + 3 + end + 2]);
+                    }
+                    i += 3 + end + 2;
+                    continue;
                 }
-                i += 3 + end + 2;
-                continue;
             }
-        }
-        if rest.starts_with('#') {
-            let after = &rest[1..];
-            let len = after.find(|c: char| !is_tag_char(c)).unwrap_or(after.len());
-            if len > 0 {
-                if normalize(&after[..len]) == target {
-                    out.push_str(&tag_for(to));
-                } else {
-                    out.push_str(&raw[i..i + 1 + len]);
+            if rest.starts_with('#') {
+                let after = &rest[1..];
+                let len = after.find(|c: char| !is_tag_char(c)).unwrap_or(after.len());
+                if len > 0 {
+                    if normalize(&after[..len]) == target {
+                        out.push_str(&tag_for(to));
+                    } else {
+                        out.push_str(&raw[i..i + 1 + len]);
+                    }
+                    i += 1 + len;
+                    continue;
                 }
-                i += 1 + len;
-                continue;
             }
         }
         let ch = rest.chars().next().unwrap();
@@ -161,5 +246,31 @@ mod tests {
     fn utf8_safe() {
         let raw = "café [[naïve]] θ #tag";
         assert_eq!(page_refs(raw), vec!["naïve", "tag"]);
+    }
+
+    #[test]
+    fn refs_in_code_are_ignored() {
+        // inline code
+        assert_eq!(page_refs("real [[Foo]] but `[[Foo]]` literal"), vec!["Foo"]);
+        // fenced block (multi-line)
+        let raw = "intro [[A]]\n```\nuse [[A]] and #A here\n```\noutro [[A]]";
+        assert_eq!(page_refs(raw), vec!["A", "A"]); // the two outside the fence
+        // a tag inside inline code isn't a ref
+        assert_eq!(page_refs("`#nope` yes #yep"), vec!["yep"]);
+    }
+
+    #[test]
+    fn rename_skips_refs_in_code() {
+        // inline code is preserved verbatim; the prose ref is renamed
+        assert_eq!(
+            rename_refs("see [[Old]] and `[[Old]]`", "Old", "New"),
+            "see [[New]] and `[[Old]]`"
+        );
+        // fenced code is preserved verbatim; refs outside are renamed
+        let raw = "before [[Old]]\n```js\nconst x = \"[[Old]]\"; // #Old\n```\nafter #Old";
+        let got = rename_refs(raw, "Old", "New");
+        assert!(got.contains("before [[New]]"), "prose ref renamed: {got}");
+        assert!(got.contains("after #New"), "trailing tag renamed: {got}");
+        assert!(got.contains("\"[[Old]]\"; // #Old"), "code body untouched: {got}");
     }
 }
