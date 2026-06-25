@@ -14,6 +14,7 @@ import {
   openExportModal,
 } from "../ui";
 import { openPage, openPageInNewTab, openJournals, route } from "../router";
+import { refreshAfterRename } from "../graph";
 import { backend } from "../backend";
 import { carryDay } from "../carry";
 import { journalTitle } from "../journal";
@@ -251,6 +252,10 @@ function PageMenu(props: {
           return backend()
             .renamePage(props.name, next)
             .then(() => {
+              // Backend rewrote refs across pages via the self-write guard (no
+              // watcher reload) → in-memory pages are stale; reset + reload so a
+              // stale save can't revert the rename.
+              refreshAfterRename();
               openPage(next, props.pageKind);
               pushToast(`Renamed to “${next}”`, "success");
             });

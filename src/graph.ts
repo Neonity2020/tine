@@ -85,6 +85,22 @@ export async function refreshAliases(): Promise<void> {
 }
 const loadAliases = refreshAliases;
 
+/** Refresh frontend state after a successful page rename. The backend rename
+ *  rewrites `[[refs]]` across many files through the self-write guard, which
+ *  SUPPRESSES the watcher reload — so every in-memory page (the renamed page, the
+ *  journals feed, satellite/sidebar pages) is potentially stale, and a stale save
+ *  of one would silently revert the rename's rewrite on disk. Reset the store
+ *  (cancels pending/in-flight saves + clears the shared `byId`) and bump the graph
+ *  epoch (drops the block-resolve cache and forces the open view + Linked
+ *  References to refetch from the now-correct backend). Aliases may have moved with
+ *  the renamed file, so refresh those too. Caller must have run flushAll() first
+ *  (so resetStore discards nothing unsaved) and then navigate to the new name. */
+export function refreshAfterRename(): void {
+  resetStore();
+  bumpGraphEpoch();
+  void refreshAliases();
+}
+
 // If config.edn sets :default-templates {:journals "X"}, create today's journal
 // from that template when it doesn't exist yet (or is empty). No-op when unset,
 // so default behaviour is unchanged.

@@ -1051,3 +1051,31 @@ fn query_open_tasks() {
     // A DONE task must not match.
     assert!(!raws.iter().any(|r| r.contains("DONE Validate")), "got: {raws:?}");
 }
+
+#[test]
+fn rename_superstring_rewrites_journal_and_nonjournal_refs() {
+    // Regression for the reported case: the new name CONTAINS the old name, and
+    // the old name is referenced from BOTH a non-journal page and a journal, with
+    // the cache already warm + a backlinks query run first (as in live use).
+    let root = std::env::temp_dir().join(format!("tine-rename-ss-{}", std::process::id()));
+    std::fs::create_dir_all(root.join("pages")).unwrap();
+    std::fs::create_dir_all(root.join("journals")).unwrap();
+    std::fs::write(root.join("pages").join("Testtest.md"), "- the page\n").unwrap();
+    std::fs::write(root.join("pages").join("MyPage.md"), "- see [[Testtest]] here\n").unwrap();
+    std::fs::write(root.join("journals").join("2026_06_15.md"), "- ref [[Testtest]]\n").unwrap();
+
+    let g = Graph::open(&root);
+    g.warm_cache();
+    let _ = g.backlinks("Testtest"); // populate the derived cache, as the UI does
+
+    g.rename_page("Testtest", "TesttestTest").unwrap();
+
+    let my = std::fs::read_to_string(root.join("pages").join("MyPage.md")).unwrap();
+    let jr = std::fs::read_to_string(root.join("journals").join("2026_06_15.md")).unwrap();
+    assert!(my.contains("[[TesttestTest]]") && !my.contains("[[Testtest]]"), "non-journal: {my}");
+    assert!(jr.contains("[[TesttestTest]]"), "journal: {jr}");
+    let bl = g.backlinks("TesttestTest");
+    let after: Vec<&str> = bl.iter().map(|x| x.page.as_str()).collect();
+    assert!(after.contains(&"MyPage"), "backlinks miss non-journal: {after:?}");
+    std::fs::remove_dir_all(&root).ok();
+}
