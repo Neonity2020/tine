@@ -448,6 +448,20 @@ function blockFirstLine(raw: string): string {
   return "";
 }
 
+/** If the caret sits on an in-block markdown list line (`+`/`*`/ordered — NOT the
+ *  outline bullet `-`), return its parts, for caret-context list editing. */
+function listLineAt(
+  text: string,
+  caret: number,
+): { indent: string; marker: string; hasCheckbox: boolean; lineStart: number; prefixLen: number } | null {
+  const lineStart = text.lastIndexOf("\n", caret - 1) + 1;
+  let lineEnd = text.indexOf("\n", caret);
+  if (lineEnd === -1) lineEnd = text.length;
+  const m = /^(\s*)([+*]|\d+[.)])(\s+)(\[[ xX]\]\s+)?/.exec(text.slice(lineStart, lineEnd));
+  if (!m) return null;
+  return { indent: m[1], marker: m[2], hasCheckbox: !!m[4], lineStart, prefixLen: m[0].length };
+}
+
 // Small calendar glyph for date chips (SVG, not emoji — emoji tofu on WebKitGTK).
 function CalGlyph(): JSX.Element {
   return (
@@ -559,6 +573,21 @@ export function Editor(props: { id: string }): JSX.Element {
     // can't rewrite the block's bytes.
     if (next === node().raw) return;
     setRaw(props.id, next);
+  };
+
+  // Nest/un-nest an in-block list item by ±2 leading spaces (Tab/Shift-Tab when
+  // the caret is on a `+`/`*`/ordered list line).
+  const nudgeListItem = (ll: NonNullable<ReturnType<typeof listLineAt>>, delta: number) => {
+    const text = ref.value;
+    const caret = ref.selectionStart;
+    if (delta > 0) {
+      commit(text.slice(0, ll.lineStart) + "  " + text.slice(ll.lineStart));
+      startEditing(props.id, caret + 2);
+    } else {
+      const lead = Math.min(2, ll.indent.length);
+      commit(text.slice(0, ll.lineStart) + text.slice(ll.lineStart + lead));
+      startEditing(props.id, Math.max(ll.lineStart, caret - lead));
+    }
   };
 
   const [ac, setAc] = createSignal<Trigger | null>(null);
@@ -941,8 +970,19 @@ export function Editor(props: { id: string }): JSX.Element {
     "editor/select-block-up": (e) => selectBlockCmd(e, -1),
     "editor/select-block-down": (e) => selectBlockCmd(e, 1),
     "editor/cycle-todo": (e) => { e.preventDefault(); cycleTodoCmd(); return true; },
-    "editor/indent": (e) => { e.preventDefault(); commit(ref.value); indentBlock(props.id, ref.selectionStart); return true; },
-    "editor/outdent": (e) => { e.preventDefault(); commit(ref.value); outdentBlock(props.id, ref.selectionStart); return true; },
+    "editor/indent": (e) => {
+      e.preventDefault();
+      // On an in-block list line, Tab nests the LIST ITEM (intra-block), not the block.
+      const ll = listLineAt(ref.value, ref.selectionStart);
+      if (ll) { nudgeListItem(ll, +2); return true; }
+      commit(ref.value); indentBlock(props.id, ref.selectionStart); return true;
+    },
+    "editor/outdent": (e) => {
+      e.preventDefault();
+      const ll = listLineAt(ref.value, ref.selectionStart);
+      if (ll && ll.indent.length > 0) { nudgeListItem(ll, -2); return true; }
+      commit(ref.value); outdentBlock(props.id, ref.selectionStart); return true;
+    },
   };
 
   const onKeyDown = (e: KeyboardEvent) => {
@@ -1016,6 +1056,19 @@ export function Editor(props: { id: string }): JSX.Element {
       // let the textarea insert the newline natively, like OG.
       if (isCalc()) return;
       e.preventDefault();
+      // In-block list: Enter on a `+`/`*`/ordered list line CONTINUES the list
+      // (new item below, same marker/indent; a checkbox item starts a fresh `[ ]`)
+      // instead of splitting the block. To exit, Backspace the empty item down to a
+      // blank line, then Enter on that non-list line makes a new bullet.
+      const ll = !isAnnot() ? listLineAt(raw, start) : null;
+      if (ll) {
+        const ordered = /\d/.test(ll.marker);
+        const nextMarker = ordered ? parseInt(ll.marker) + 1 + ll.marker.replace(/\d+/, "") : ll.marker;
+        const prefix = ll.indent + nextMarker + " " + (ll.hasCheckbox ? "[ ] " : "");
+        commit(raw.slice(0, start) + "\n" + prefix + raw.slice(start));
+        startEditing(props.id, start + 1 + prefix.length);
+        return;
+      }
       commit(raw); // flush current text
       if (isAnnot()) {
         // A highlight block isn't split (that would mangle its metadata); Enter
@@ -1026,11 +1079,22 @@ export function Editor(props: { id: string }): JSX.Element {
       } else {
         splitBlock(props.id, start);
       }
-    } else if (e.key === "Backspace" && start === 0 && end === 0) {
-      // Never merge a highlight or calc block away (their structure must stay).
-      if (isAnnot() || isCalc()) return;
-      commit(raw);
-      if (mergeWithPrev(props.id)) e.preventDefault();
+    } else if (e.key === "Backspace" && end === start) {
+      // In-block list: Backspace at the head of a list item's text removes the
+      // marker (turns it into a blank/plain line) — the way to exit the list.
+      const ll = listLineAt(raw, start);
+      if (ll && start === ll.lineStart + ll.prefixLen) {
+        e.preventDefault();
+        commit(raw.slice(0, ll.lineStart) + raw.slice(start));
+        startEditing(props.id, ll.lineStart);
+        return;
+      }
+      if (start === 0) {
+        // Never merge a highlight or calc block away (their structure must stay).
+        if (isAnnot() || isCalc()) return;
+        commit(raw);
+        if (mergeWithPrev(props.id)) e.preventDefault();
+      }
     } else if (e.key === "ArrowUp" && !e.shiftKey) {
       // Leave for the previous block only from the FIRST visual row; otherwise
       // let the textarea move the caret up one wrapped line. (A long single line
