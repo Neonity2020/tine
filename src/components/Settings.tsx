@@ -44,7 +44,7 @@ import { commandDefaults, eventToBindingString, setKeybindingsSuspended } from "
 import { switchGraph, loadGraphPath } from "../graph";
 import { flushAll } from "../store";
 import { backend, type BackupInfo } from "../backend";
-import type { AssetInfo, TrashStats } from "../types";
+import type { AssetInfo, TrashStats, JournalFile } from "../types";
 import { formatJournal } from "../journal";
 
 // Journal display-title formats offered in the date-format dropdown — OG's
@@ -753,6 +753,38 @@ function BackupsTab(): JSX.Element {
 // assets/ files no block links to, and let the user move them to the recoverable
 // trash. Tine never auto-deletes media (a deleted block keeps its files), so this
 // is how unused media gets cleaned up.
+// One file in a duplicate-day conflict: click the name to reveal its full
+// contents (these files share a page name, so they can't be opened separately in
+// the editor — this read-only view is how you inspect the stray before trashing).
+function ConflictFileRow(props: { file: JournalFile; onTrash: () => void }): JSX.Element {
+  const [open, setOpen] = createSignal(false);
+  const [content] = createResource(
+    () => (open() ? props.file.name : null),
+    async (name) => (name ? backend().readJournalFile(name).catch((e) => `(couldn’t read: ${String(e)})`) : "")
+  );
+  return (
+    <>
+      <div class="settings-asset-row">
+        <button class="settings-asset-name mono" title="Show this file's contents" onClick={() => setOpen(!open())}>
+          {open() ? "▾ " : "▸ "}
+          {props.file.name}
+          <Show when={props.file.canonical}>
+            <span class="journal-conflict-keep"> · canonical</span>
+          </Show>
+        </button>
+        <span class="settings-asset-date">{props.file.preview}</span>
+        <span />
+        <button class="settings-btn" onClick={props.onTrash}>
+          Trash
+        </button>
+      </div>
+      <Show when={open()}>
+        <pre class="journal-conflict-content">{content.loading ? "…" : content() || "(empty file)"}</pre>
+      </Show>
+    </>
+  );
+}
+
 // Duplicate journal days: a date that resolves to >1 file (e.g. a date-stem file
 // plus a title-named one, usually from a date-format change). Tine never
 // auto-merges, so list them with each file's preview + a Trash affordance.
@@ -796,21 +828,7 @@ function JournalConflictsPanel(): JSX.Element {
               {c.title} →
             </button>
             <For each={c.files}>
-              {(f) => (
-                <div class="settings-asset-row">
-                  <span class="mono">
-                    {f.name}
-                    <Show when={f.canonical}>
-                      <span class="journal-conflict-keep"> · canonical</span>
-                    </Show>
-                  </span>
-                  <span class="settings-asset-date">{f.preview}</span>
-                  <span />
-                  <button class="settings-btn" onClick={() => void trashFile(f.name)}>
-                    Trash
-                  </button>
-                </div>
-              )}
+              {(f) => <ConflictFileRow file={f} onTrash={() => void trashFile(f.name)} />}
             </For>
           </div>
         )}

@@ -1027,6 +1027,13 @@ fn trash_journal_file(name: String, state: State<'_, AppState>) -> Result<(), St
     with_graph(&state, |g| g.trash_journal_file(&name).map_err(|e| e.to_string()))
 }
 
+/// Raw contents of one journal file (by exact filename) — for inspecting a
+/// duplicate day's files before reconciling.
+#[tauri::command]
+fn read_journal_file(name: String, state: State<'_, AppState>) -> Result<String, String> {
+    with_graph(&state, |g| g.read_journal_file(&name).map_err(|e| e.to_string()))
+}
+
 #[tauri::command]
 fn save_asset(name: String, bytes: Vec<u8>, state: State<'_, AppState>) -> Result<String, String> {
     with_graph(&state, |g| g.save_asset(&name, &bytes).map_err(|e| e.to_string()))
@@ -1281,6 +1288,7 @@ fn main() {
             empty_asset_trash,
             list_journal_conflicts,
             trash_journal_file,
+            read_journal_file,
             search,
             quick_switch,
             list_templates,

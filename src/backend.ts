@@ -80,6 +80,9 @@ export interface Backend {
   listJournalConflicts(): Promise<JournalConflict[]>;
   /** Move one journal file (by exact filename) to the recoverable trash. */
   trashJournalFile(name: string): Promise<void>;
+  /** Raw contents of one journal file (by exact filename), for inspecting a
+   *  duplicate day's files before reconciling. */
+  readJournalFile(name: string): Promise<string>;
   search(query: string, limit: number): Promise<RefGroup[]>;
   quickSwitch(query: string, limit: number): Promise<PageEntry[]>;
   listTemplates(): Promise<TemplateDto[]>;
@@ -307,6 +310,9 @@ class TauriBackend implements Backend {
   }
   trashJournalFile(name: string) {
     return this.call<void>("trash_journal_file", { name });
+  }
+  readJournalFile(name: string) {
+    return this.call<string>("read_journal_file", { name });
   }
   importAsset(path: string, name?: string) {
     return this.call<string>("import_asset", { path, name });

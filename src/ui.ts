@@ -148,7 +148,8 @@ export async function refreshJournalConflicts(notify = false): Promise<void> {
     if (notify && c.length) {
       pushToast(
         `${c.length} journal day${c.length === 1 ? "" : "s"} have duplicate files in different formats — reconcile them in Settings → Backups`,
-        "info"
+        "info",
+        { sticky: true }
       );
     }
   } catch {
@@ -737,13 +738,18 @@ export interface Toast {
   id: number;
   message: string;
   kind: "info" | "success" | "error";
+  sticky?: boolean; // stays until the user closes it (✕); no auto-dismiss
 }
 let toastSeq = 0;
 export const [toasts, setToasts] = createSignal<Toast[]>([]);
-export function pushToast(message: string, kind: Toast["kind"] = "info"): number {
+export function pushToast(
+  message: string,
+  kind: Toast["kind"] = "info",
+  opts: { sticky?: boolean } = {}
+): number {
   const id = ++toastSeq;
-  setToasts([...toasts(), { id, message, kind }]);
-  setTimeout(() => dismissToast(id), 3200);
+  setToasts([...toasts(), { id, message, kind, sticky: opts.sticky }]);
+  if (!opts.sticky) setTimeout(() => dismissToast(id), 3200);
   return id;
 }
 export function dismissToast(id: number) {

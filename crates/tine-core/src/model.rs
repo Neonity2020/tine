@@ -605,6 +605,16 @@ impl Graph {
         out
     }
 
+    /// Raw contents of ONE journal file (by exact filename) — lets the UI show a
+    /// duplicate day's individual files (which can't be navigated to separately,
+    /// as pages are keyed by date) so the user can inspect before reconciling.
+    pub fn read_journal_file(&self, name: &str) -> io::Result<String> {
+        if name.is_empty() || name.contains('/') || name.contains('\\') {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "bad journal file name"));
+        }
+        fs::read_to_string(self.journals_path().join(name))
+    }
+
     /// Move ONE journal file (by its exact filename) to the recoverable trash —
     /// the affordance for reconciling a duplicate day. Refuses a path separator so
     /// it can't reach outside `journals/`.

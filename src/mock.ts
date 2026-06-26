@@ -438,6 +438,11 @@ export function mockBackend(): Backend {
     async trashJournalFile(): Promise<void> {
       // no-op in the browser mock
     },
+    async readJournalFile(name: string): Promise<string> {
+      return name.startsWith("Friday")
+        ? "* something something\n*\n"
+        : "* Tried out the Org demo graph in Tine today\n* TODO follow up on the [[kitchen-sink]] feature tour\nSCHEDULED: <2026-06-27 Sat>\n* DONE loaded the graph and clicked around\n";
+    },
     async confirm(message: string): Promise<boolean> {
       // The browser/test env has a working global confirm (unlike the WebKitGTK
       // app), so defer to it. Read it off globalThis so test stubs (vi.stubGlobal)
