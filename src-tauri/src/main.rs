@@ -387,6 +387,37 @@ fn set_capture_enter_files(value: bool, app: tauri::AppHandle) -> Result<(), Str
     Ok(())
 }
 
+/// Smooth-scrolling preference (app-level, in tine-settings.json). Experimental,
+/// default false. Read at startup by the frontend to (re-)install Lenis. Device-
+/// local because it's a feel preference, not graph data.
+fn smooth_scroll(app: &tauri::AppHandle) -> bool {
+    settings_path(app)
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.get("smooth_scroll").and_then(|x| x.as_bool()))
+        .unwrap_or(false)
+}
+
+#[tauri::command]
+fn get_smooth_scroll(app: tauri::AppHandle) -> bool {
+    smooth_scroll(&app)
+}
+
+#[tauri::command]
+fn set_smooth_scroll(value: bool, app: tauri::AppHandle) -> Result<(), String> {
+    let p = settings_path(&app).ok_or("no app-data dir")?;
+    if let Some(parent) = p.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let mut json = std::fs::read_to_string(&p)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    json["smooth_scroll"] = serde_json::Value::Bool(value);
+    std::fs::write(&p, serde_json::to_string_pretty(&json).unwrap()).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// What the backend knows about the rendering path, so the UI can warn — loudly
 /// — when Tine is painting on the CPU. Speed is the whole pitch, and a silent
 /// software-rendering fallback makes scrolling feel sluggish; better to say so.
@@ -1372,7 +1403,9 @@ fn main() {
             restore_backup,
             load_session,
             save_session,
-            gpu_env
+            gpu_env,
+            get_smooth_scroll,
+            set_smooth_scroll
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

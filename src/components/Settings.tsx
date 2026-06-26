@@ -39,6 +39,7 @@ import {
   refreshJournalConflicts,
 } from "../ui";
 import { interfaceZoom, zoomIn, zoomOut, zoomReset } from "../zoom";
+import { smoothScrollEnabled, setSmoothScroll } from "../smoothScroll";
 import { openPage, openFile } from "../router";
 import { commandDefaults, eventToBindingString, setKeybindingsSuspended } from "../keybindings";
 import { switchGraph, loadGraphPath } from "../graph";
@@ -314,6 +315,13 @@ function AppearanceTab(): JSX.Element {
         hint="Auto-enable dim inactive blocks (t b) when entering focus mode (t f)."
       >
         <Toggle on={dimInFocus()} onClick={() => setDimInFocus(!dimInFocus())} />
+      </Field>
+
+      <Field
+        label="Smooth scrolling (experimental)"
+        hint="Animate the journal feed's scrolling to smooth out WebKitGTK's stepped mouse-wheel jumps. Off by default; this is a feel experiment — turn it off if it gets in the way."
+      >
+        <Toggle on={smoothScrollEnabled()} onClick={() => setSmoothScroll(!smoothScrollEnabled())} />
       </Field>
 
       <Field

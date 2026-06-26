@@ -53,6 +53,7 @@ import { applyZoom, installInterfaceZoomKeys, installInterfaceZoomWheel } from "
 import { editingId, flushAll, appendToTodayJournal } from "./store";
 import { backend, isTauri } from "./backend";
 import { warnIfSoftwareRendering } from "./gpu";
+import { initSmoothScroll } from "./smoothScroll";
 import { WindowControls, ResizeGrips, installWindowChrome, maximized } from "./components/WindowChrome";
 
 export function App(): JSX.Element {
@@ -65,6 +66,10 @@ export function App(): JSX.Element {
   // speed, so a silent software-rendering fallback shouldn't read as "Tine is
   // slow". Fire-and-forget; the probe is Tauri-gated and never throws.
   onMount(() => void warnIfSoftwareRendering());
+
+  // Re-install experimental smooth scrolling (Lenis) if it was left on. The feed
+  // (`.main-content`) is mounted by now (onMount runs after first render).
+  onMount(() => void initSmoothScroll());
 
   // Persist pending edits before the window closes — the 400ms save debounce
   // would otherwise drop the last keystrokes typed right before quitting.

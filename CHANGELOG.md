@@ -15,6 +15,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   libraries don't match your system), it shows a banner explaining why scrolling
   may feel slow and how to get the fast path back. Speed is the whole point; a
   silent fallback shouldn't read as "Tine is slow."
+- **Smooth scrolling (experimental, opt-in).** Settings → Appearance →
+  *Smooth scrolling* animates the journal feed to smooth out WebKitGTK's stepped
+  mouse-wheel jumps. Off by default; a feel experiment, easy to switch back off.
 
 ### Changed
 

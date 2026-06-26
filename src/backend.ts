@@ -152,6 +152,9 @@ export interface Backend {
    *  warning (see `gpu.ts`). A silent driver fallback is detected in the webview
    *  (WebGL renderer); this just supplies why/where context for the message. */
   gpuEnv(): Promise<GpuEnv>;
+  /** Experimental smooth-scrolling preference (Lenis), app-level, default off. */
+  getSmoothScroll(): Promise<boolean>;
+  setSmoothScroll(value: boolean): Promise<void>;
 }
 
 /** Backend-visible rendering-environment facts (Linux-relevant; all false on
@@ -427,6 +430,12 @@ class TauriBackend implements Backend {
   }
   gpuEnv() {
     return this.call<GpuEnv>("gpu_env");
+  }
+  getSmoothScroll() {
+    return this.call<boolean>("get_smooth_scroll");
+  }
+  setSmoothScroll(value: boolean) {
+    return this.call<void>("set_smooth_scroll", { value });
   }
 }
 

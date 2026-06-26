@@ -1297,7 +1297,9 @@ export function Editor(props: { id: string }): JSX.Element {
         </div>
       </Show>
       <Show when={ac() && acItems().length > 0}>
-        <div class="autocomplete" ref={acListRef}>
+        {/* data-lenis-prevent: when smooth scrolling is on, let this dropdown
+            scroll natively instead of moving the whole feed. */}
+        <div class="autocomplete" ref={acListRef} data-lenis-prevent>
           <For each={acItems()}>
             {(item, i) => (
               <div

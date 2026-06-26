@@ -103,6 +103,9 @@ export function installInterfaceZoomWheel(): () => void {
     const t = e.target as Element | null;
     if (t?.closest?.(".pdf-pane")) return; // over the PDF → its own wheel-zoom owns it
     e.preventDefault(); // own the gesture; stop the webview's native page zoom
+    // Fully own ctrl+wheel: stop it reaching the feed's smooth-scroll handler
+    // (Lenis listens on `.main-content`), which would otherwise scroll while zooming.
+    e.stopPropagation();
     pending += e.deltaY; // sign-based step is robust to wheel vs. line deltaMode
     if (!raf) raf = requestAnimationFrame(flush);
   };

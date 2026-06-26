@@ -521,6 +521,12 @@ export function mockBackend(): Backend {
     async gpuEnv(): Promise<GpuEnv> {
       return { software_forced: false, appimage: false };
     },
+    async getSmoothScroll(): Promise<boolean> {
+      return false;
+    },
+    async setSmoothScroll(_value: boolean): Promise<void> {
+      // no-op in the browser mock
+    },
     async readHighlights(pdf: string): Promise<Highlight[]> {
       return mockHighlights[pdf]?.highlights ?? [];
     },
