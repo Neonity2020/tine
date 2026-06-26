@@ -507,21 +507,24 @@ impl Graph {
         let mut n = 0;
         for e in rd.flatten() {
             let p = e.path();
-            if p.extension().and_then(|x| x.to_str()) != Some("md") {
-                continue;
-            }
+            // Both formats — an org graph's title-named journals are `.org`.
+            let ext = match p.extension().and_then(|x| x.to_str()) {
+                Some(e @ ("md" | "org")) => e,
+                _ => continue,
+            };
             let Some(stem) = p.file_stem().and_then(|s| s.to_str()) else { continue };
             if JournalDate::from_file_stem(stem).is_some() {
                 continue; // already a plausible date stem (yyyy_MM_dd / yyyy-MM-dd) — leave it
             }
-            // A title-named ("Jun 18th, 2026.md") or otherwise non-stem journal file:
-            // normalize it to the graph's filename format so it round-trips with OG.
+            // A title-named ("Jun 18th, 2026.md", "Thursday, 25-06-2026.org") or
+            // otherwise non-stem journal file: normalize it to the graph's filename
+            // format so it round-trips with OG and is recognized in the feed.
             let Some(d) = self.journal_format.parse(stem) else { continue }; // not a date
             let want = self.journal_format.file_stem(d);
             if want == stem {
                 continue; // already in the graph's filename format
             }
-            let target = dir.join(format!("{want}.md"));
+            let target = dir.join(format!("{want}.{ext}"));
             if target.exists() {
                 continue; // don't clobber an existing stem file
             }
@@ -2414,6 +2417,35 @@ mod tests {
         fs::create_dir_all(dir.join("journals")).unwrap();
         fs::create_dir_all(dir.join("pages")).unwrap();
         dir
+    }
+
+    #[test]
+    fn migrate_recovers_title_named_org_journals() {
+        // Regression: changing :journal/page-title-format while a stale in-memory
+        // format was still active saved new journals under their title
+        // ("Thursday, 25-06-2026.org") instead of the date stem, so they dropped
+        // out of the feed. A reopen + migrate (now .org-aware) must recover them.
+        let dir = scratch("journal-migrate-org");
+        fs::create_dir_all(dir.join("logseq")).unwrap();
+        fs::write(
+            dir.join("logseq").join("config.edn"),
+            "{:preferred-format \"Org\"\n :journal/page-title-format \"EEEE, dd-MM-yyyy\"}\n",
+        )
+        .unwrap();
+        fs::write(dir.join("journals").join("Thursday, 25-06-2026.org"), "* bla\n").unwrap();
+        // A canonical file for another day must be left untouched.
+        fs::write(dir.join("journals").join("2026_06_24.org"), "* prior\n").unwrap();
+
+        let g = Graph::open(&dir);
+        assert_eq!(g.migrate_journal_filenames(), 1, "exactly the title-named file renamed");
+        assert!(dir.join("journals").join("2026_06_25.org").exists(), "renamed to date stem");
+        assert!(!dir.join("journals").join("Thursday, 25-06-2026.org").exists(), "old name gone");
+        assert!(dir.join("journals").join("2026_06_24.org").exists(), "canonical file untouched");
+
+        // It's now recognized in the feed listing (name via the title format).
+        let names: Vec<String> = Graph::open(&dir).journals_desc().into_iter().map(|e| e.name).collect();
+        assert!(names.iter().any(|n| n == "Thursday, 25-06-2026"), "listed: {names:?}");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

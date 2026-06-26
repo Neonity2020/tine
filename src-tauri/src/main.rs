@@ -711,6 +711,21 @@ fn with_graph<T>(
     f(&graph)
 }
 
+/// Re-open the graph so in-memory config (journal date formats, preferred format)
+/// picks up a just-written `config.edn` change — the `journal_format` is built at
+/// open and never mutated, so without this a format change leaves the backend
+/// parsing journal names with the OLD format (mis-naming new journals). Also runs
+/// the journal-filename migration, which now that the format is fresh can rename
+/// any title-named journals (saved during the stale window) back to `yyyy_MM_dd`.
+fn refresh_graph(state: &State<'_, AppState>) {
+    let root = state.graph.read().unwrap().as_ref().map(|g| g.root.clone());
+    if let Some(root) = root {
+        let graph = Graph::open(&root);
+        graph.migrate_journal_filenames();
+        *state.graph.write().unwrap() = Some(Arc::new(graph));
+    }
+}
+
 #[tauri::command]
 fn list_pages(state: State<'_, AppState>) -> Result<Vec<PageEntry>, String> {
     with_graph(&state, |g| Ok(g.list_pages()))
@@ -855,14 +870,18 @@ fn set_preferred_format(format: String, state: State<'_, AppState>) -> Result<()
     } else {
         tine_core::model::Format::Md
     };
-    with_graph(&state, |g| g.set_preferred_format(fmt).map_err(|e| e.to_string()))
+    with_graph(&state, |g| g.set_preferred_format(fmt).map_err(|e| e.to_string()))?;
+    refresh_graph(&state); // so new pages/journals use the new extension immediately
+    Ok(())
 }
 
 /// Set the graph's `:journal/page-title-format` (journal display-title format,
 /// e.g. "MMM do, yyyy"). Display-only — does not rename journal files.
 #[tauri::command]
 fn set_journal_title_format(format: String, state: State<'_, AppState>) -> Result<(), String> {
-    with_graph(&state, |g| g.set_journal_page_title_format(&format).map_err(|e| e.to_string()))
+    with_graph(&state, |g| g.set_journal_page_title_format(&format).map_err(|e| e.to_string()))?;
+    refresh_graph(&state); // pick up the new format + migrate any title-named journals
+    Ok(())
 }
 
 #[tauri::command]

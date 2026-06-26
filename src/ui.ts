@@ -121,8 +121,15 @@ export function changeJournalTitleFormat(fmt: string) {
   if (!m || m.journal_page_title_format === next) return;
   setGraphMeta({ ...m, journal_page_title_format: next });
   setJournalTitleFormat(next);
-  bumpGraphEpoch();
-  void backend().setJournalTitleFormat(next).catch(() => {});
+  bumpGraphEpoch(); // immediate: re-render open journal titles with the new format
+  // The backend rewrites config.edn AND reopens the graph (so its journal_format
+  // + the title-named-journal migration take effect). Bump again once that's done
+  // so the feed reloads against the refreshed backend — otherwise a reload racing
+  // the reopen could re-query the old format.
+  void backend()
+    .setJournalTitleFormat(next)
+    .then(() => bumpGraphEpoch())
+    .catch(() => {});
 }
 
 // --- which content pane is focused. Drives Ctrl+/- zoom routing (notes → whole
