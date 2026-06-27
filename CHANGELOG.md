@@ -37,6 +37,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 - **Clicking a block reference jumps to the block.** A block ref now scrolls to
   and briefly highlights the referenced block (even when it's on the *same* page,
   where it previously appeared to do nothing) instead of only opening the page.
+  **Shift-click** opens the referenced block in the right sidebar.
 - **Block references export correctly.** The static HTML export now resolves
   `((block ref))`s (bare and `[label](((id)))`) to a link to the target block's
   anchor on its exported page, with the block's text/label — instead of the old

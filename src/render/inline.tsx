@@ -7,7 +7,7 @@ import { Dynamic } from "solid-js/web";
 import { mediaKind } from "../media";
 import { openPage, openPageInNewTab, openPageAtBlock } from "../router";
 import { isJournalTitle } from "../journal";
-import { openPdf, openPageInSidebar, openPageContextMenu, setLightbox, graphEpoch } from "../ui";
+import { openPdf, openPageInSidebar, openBlockInSidebar, openPageContextMenu, setLightbox, graphEpoch } from "../ui";
 import { parseInline, type Seg, type Format } from "./parseInline";
 import { EmojiText } from "./emoji";
 import { blockView } from "./block";
@@ -420,14 +420,19 @@ function BlockRefView(props: { id: string; label?: string }): JSX.Element {
     <span
       class="block-ref"
       classList={{ "block-ref-missing": !grp() }}
+      title="Click to go to the block; shift-click → sidebar"
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
       onClick={(e) => {
         e.stopPropagation();
         const g = grp();
-        // Navigate to the referenced BLOCK (scroll + flash it), not just the page —
-        // so a same-page ref visibly jumps to its target instead of doing nothing.
-        if (g) openPageAtBlock(g.page, g.kind, props.id);
+        if (!g) return;
+        // Shift-click opens the referenced block in the right sidebar (the target
+        // already carries an id::, so the ref is durable as-is). A plain click
+        // navigates to the block — scroll + flash it — so a same-page ref visibly
+        // jumps to its target instead of doing nothing.
+        if (e.shiftKey) openBlockInSidebar({ uuid: props.id, page: g.page, pageKind: g.kind });
+        else openPageAtBlock(g.page, g.kind, props.id);
       }}
     >
       <Show when={text() !== undefined} fallback={<>(({props.id.slice(0, 8)}))</>}>

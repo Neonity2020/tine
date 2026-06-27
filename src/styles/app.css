@@ -2964,11 +2964,11 @@ img.emoji {
 }
 
 /* Per-block reference-count badge (OG's `.open-block-ref-link`): a small pill
-   right after the block content. Plain click opens the referrers panel below the
-   block; shift-click opens the block in the sidebar. */
+   floated to the block's right edge — prominent but out of the text flow. Plain
+   click opens the referrers panel below the block; shift-click opens the block in
+   the sidebar. */
 .block-refs-count {
-  display: inline-flex;
-  align-items: center;
+  float: right;
   margin-left: 8px;
   padding: 0 6px;
   font-size: 11px;
@@ -2978,7 +2978,6 @@ img.emoji {
   background: var(--bg-tertiary);
   border-radius: 7px;
   cursor: pointer;
-  vertical-align: middle;
   user-select: none;
 }
 .block-refs-count:hover,
