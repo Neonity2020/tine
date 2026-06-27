@@ -13,7 +13,7 @@ import { Block } from "./Block";
 import { LinkedReferences } from "./LinkedReferences";
 import { UnlinkedReferences } from "./UnlinkedReferences";
 import { QueryMacro } from "./Macro";
-import { NamespaceCrumb, NamespaceChildren } from "./Namespace";
+import { NamespaceCrumb, NamespaceHierarchy } from "./Namespace";
 import { pageProperties, aliasNames, blockView } from "../render/block";
 import { InlineText } from "../render/inline";
 import { EmojiText } from "../render/emoji";
@@ -237,7 +237,7 @@ export function PageView(): JSX.Element {
           </Show>
           <Show when={route().kind === "page" && mainPages()[0]}>
             <Show when={mainPages()[0].kind === "page"}>
-              <NamespaceChildren name={mainPages()[0].name} />
+              <NamespaceHierarchy name={mainPages()[0].name} />
             </Show>
             <LinkedReferences name={mainPages()[0].name} />
             <UnlinkedReferences name={mainPages()[0].name} />

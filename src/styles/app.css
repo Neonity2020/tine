@@ -2855,22 +2855,45 @@ ol.md-list { list-style: decimal; }
   margin: 0 4px;
   opacity: 0.6;
 }
-.namespace-children {
+/* OG's automatic "Hierarchy" section: breadcrumb paths of descendant pages. */
+.page-hierarchy {
   margin-top: 32px;
 }
-.ns-child {
-  padding: 3px 0 3px 6px;
-  color: var(--link-color);
-  cursor: pointer;
+.ns-hierarchy {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
 }
-.ns-child:hover {
-  text-decoration: underline;
+.ns-hierarchy li {
+  margin: 6px 0;
+  line-height: 1.6;
+}
+.ns-hierarchy .page-ref {
+  color: var(--link-color);
+}
+.ns-hier-sep {
+  margin: 0 8px;
+  opacity: 0.3;
 }
 
-/* {{namespace X}} macro — the full nested descendant tree. Each row indents by
-   depth (inline style) and shows the page's icon:: then a clickable segment. */
+/* {{namespace X}} macro — a bold "Namespace" label + the root page link as a
+   header (OG `namespace-hierarchy`), then the descendant tree below. Each row
+   indents by depth (inline style) and shows the page's icon:: then a segment. */
 .ns-macro {
   margin: 4px 0;
+}
+.ns-macro-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 0 6px;
+}
+.ns-macro-label {
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+.ns-macro-head .page-ref {
+  color: var(--link-color);
 }
 .ns-macro-row {
   display: flex;

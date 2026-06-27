@@ -154,46 +154,87 @@ export function NamespaceMacro(props: { root: string }): JSX.Element {
       when={(data()?.tree ?? []).length > 0}
       fallback={<span class="macro">{`{{namespace ${props.root}}}`}</span>}
     >
-      <div class="ns-macro">
-        <For each={data()!.tree}>{(n) => <NsMacroNode node={n} depth={0} icons={data()!.icons} />}</For>
-      </div>
+      {/* OG renders a bold "Namespace " label + the root page link as a header
+         (components/block.cljs `namespace-hierarchy`), then the descendant tree
+         below it — so render the root's children, not the root, as the tree. */}
+      <For each={data()!.tree}>
+        {(root) => (
+          <div class="ns-macro">
+            <div class="ns-macro-head">
+              <span class="ns-macro-label">Namespace</span>
+              <Show when={data()!.icons[root.full]}>
+                <span class="page-icon">
+                  <EmojiText text={data()!.icons[root.full]} />
+                </span>
+              </Show>
+              <a class="page-ref" onClick={(e) => { e.stopPropagation(); openPage(root.full, "page"); }}>
+                <EmojiText text={root.seg} />
+              </a>
+            </div>
+            <For each={root.children}>
+              {(c) => <NsMacroNode node={c} depth={0} icons={data()!.icons} />}
+            </For>
+          </div>
+        )}
+      </For>
     </Show>
   );
 }
 
-/** Direct child pages of a namespace (pages named `<name>/<segment>`). */
-export function NamespaceChildren(props: { name: string }): JSX.Element {
-  const [children] = createResource(
+/** OG's automatic "Hierarchy" section (components/hierarchy.cljs `structures`):
+ *  rendered below any non-journal page that participates in a namespace. It lists
+ *  breadcrumb PATHS — every transitive descendant page as a `/`-joined chain of
+ *  clickable page links (each link targets the cumulative path), sorted by name.
+ *  Matching OG's `get-relation`: for an existing page, `parent-routes` is empty,
+ *  so the set is exactly the descendants; a namespaced LEAF (no descendants) shows
+ *  one row — the path of its parent namespace. */
+export function NamespaceHierarchy(props: { name: string }): JSX.Element {
+  const [rows] = createResource(
     () => ({ n: props.name, e: graphEpoch() }),
-    async ({ n }) => {
+    async ({ n }): Promise<string[][]> => {
+      const all = (await backend().listPages()).map((p) => p.name);
       const prefix = `${n}/`.toLowerCase();
-      const all = await backend().listPages();
-      const seen = new Set<string>();
-      const direct: { name: string; full: string }[] = [];
-      for (const p of all) {
-        if (!p.name.toLowerCase().startsWith(prefix)) continue;
-        const rest = p.name.slice(n.length + 1);
-        const seg = rest.split("/")[0];
-        const full = `${n}/${seg}`;
-        if (!seen.has(full.toLowerCase())) {
-          seen.add(full.toLowerCase());
-          direct.push({ name: seg, full });
-        }
-      }
-      return direct.sort((a, b) => a.name.localeCompare(b.name));
+      const descendants = all
+        .filter((name) => name.toLowerCase().startsWith(prefix))
+        .sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
+      if (descendants.length) return descendants.map((name) => name.split("/"));
+      // Namespaced leaf with no descendants → the parent namespace's path.
+      if (n.includes("/")) return [n.split("/").slice(0, -1)];
+      return [];
     }
   );
   return (
-    <Show when={(children() ?? []).length > 0}>
-      <div class="namespace-children">
-        <div class="references-header">Namespace</div>
-        <For each={children()}>
-          {(c) => (
-            <div class="ns-child" onClick={() => openPage(c.full, "page")}>
-              {c.name}
-            </div>
-          )}
-        </For>
+    <Show when={(rows() ?? []).length > 0}>
+      <div class="page-hierarchy">
+        <div class="references-header">Hierarchy</div>
+        <ul class="ns-hierarchy">
+          <For each={rows()}>
+            {(segs) => (
+              <li>
+                <For each={segs}>
+                  {(seg, i) => {
+                    const full = () => segs.slice(0, i() + 1).join("/");
+                    return (
+                      <>
+                        <Show when={i() > 0}>
+                          <span class="ns-hier-sep">/</span>
+                        </Show>
+                        <a
+                          class="page-ref"
+                          onClick={(e) => { e.stopPropagation(); openPage(full(), "page"); }}
+                        >
+                          <span class="bracket">[[</span>
+                          {seg}
+                          <span class="bracket">]]</span>
+                        </a>
+                      </>
+                    );
+                  }}
+                </For>
+              </li>
+            )}
+          </For>
+        </ul>
       </div>
     </Show>
   );

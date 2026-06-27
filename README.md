@@ -166,8 +166,9 @@ raw speed. (Where a comparison is made, it's against current Logseq desktop core
 - `Ctrl+K` quick switcher: page titles + full-text content hits (visible text only — no false hits
   on hidden properties/uuids), with block breadcrumbs and middle-click → background tab.
 - Command palette (`Mod+Shift+P`), favorites, recent pages, a collapsible **namespace tree** in the
-  sidebar, the **`{{namespace X}}`** macro (nested descendant tree), and read-only **"aka" alias
-  chips** on pages reachable by another name.
+  sidebar, the **`{{namespace X}}`** macro (a bold "Namespace" header + nested descendant tree), an
+  automatic **"Hierarchy"** section (breadcrumb paths of descendant pages) on any namespaced page,
+  and read-only **"aka" alias chips** on pages reachable by another name.
 - **Page icons** — a page's `icon::` emoji shows next to its title and in the namespace tree. Emoji
   render as bundled Twemoji SVG images (not a font), so they show in every engine — including
   WebKitGTK, which paints color-emoji webfonts blank — and work offline.
