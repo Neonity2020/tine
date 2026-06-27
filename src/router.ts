@@ -6,7 +6,15 @@
 // on the active tab) so existing call sites are unchanged.
 
 import { createSignal } from "solid-js";
-import { pushRecent, resolveAlias } from "./ui";
+import {
+  pushRecent,
+  resolveAlias,
+  sidebarOpen,
+  rightSidebarOpen,
+  rightSidebar,
+  applySidebarSession,
+  type SidebarItem,
+} from "./ui";
 import { doc, persistentBlockRef } from "./store";
 import { backend } from "./backend";
 
@@ -290,9 +298,26 @@ export function reorderTab(dragId: string, targetId: string) {
 interface PersistedSession {
   tabs: { history: Route[]; pos: number; pinned: boolean }[];
   activeIndex: number;
+  // Sidebar open/closed + the right sidebar's items — persisted here (the durable
+  // session file) rather than localStorage, which WebKitGTK doesn't keep across
+  // launches, so Tine reopens with the sidebars exactly as you left them.
+  leftSidebar?: boolean;
+  rightSidebar?: boolean;
+  rightSidebarItems?: SidebarItem[];
 }
 
 let saveTimer: ReturnType<typeof setTimeout> | undefined;
+
+function buildSession(): PersistedSession {
+  const list = tabs();
+  return {
+    tabs: list.map((t) => ({ history: t.history, pos: t.pos, pinned: t.pinned })),
+    activeIndex: Math.max(0, list.findIndex((t) => t.id === activeId())),
+    leftSidebar: sidebarOpen(),
+    rightSidebar: rightSidebarOpen(),
+    rightSidebarItems: rightSidebar(),
+  };
+}
 
 function persist() {
   // Light debounce: a burst of tab actions collapses to one backend write, and
@@ -300,14 +325,13 @@ function persist() {
   // that the user won't out-run it before quitting.
   clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
-    const list = tabs();
-    const session: PersistedSession = {
-      tabs: list.map((t) => ({ history: t.history, pos: t.pos, pinned: t.pinned })),
-      activeIndex: Math.max(0, list.findIndex((t) => t.id === activeId())),
-    };
-    void backend().saveSession(JSON.stringify(session)).catch(() => {});
+    void backend().saveSession(JSON.stringify(buildSession())).catch(() => {});
   }, 150);
 }
+
+/** Debounced session save — also called by ui.ts when a sidebar is toggled, so
+ *  the open/closed state and items land in the durable session file. */
+export const scheduleSessionSave = persist;
 
 function parseSession(raw: string): { tabs: Tab[]; active: number } | null {
   try {
@@ -336,13 +360,8 @@ function parseSession(raw: string): { tabs: Tab[]; active: number } | null {
  *  close so a tab action taken right before quitting isn't lost. */
 export async function flushSession(): Promise<void> {
   clearTimeout(saveTimer);
-  const list = tabs();
-  const session: PersistedSession = {
-    tabs: list.map((t) => ({ history: t.history, pos: t.pos, pinned: t.pinned })),
-    activeIndex: Math.max(0, list.findIndex((t) => t.id === activeId())),
-  };
   try {
-    await backend().saveSession(JSON.stringify(session));
+    await backend().saveSession(JSON.stringify(buildSession()));
   } catch {
     // best-effort — session restore is non-critical
   }
@@ -359,8 +378,18 @@ export async function restoreSession(): Promise<void> {
     return; // backend unavailable — keep the default journals tab
   }
   if (!raw) return;
-  // Guard against clobbering: only restore while the strip is still the pristine
-  // single-journals default (the user hasn't navigated during the async read).
+  // Sidebars first — independent of the tab strip, so restore them even if the
+  // tab guard below bails. Runs before first paint (main.tsx awaits this), so the
+  // app renders with the sidebars as they were left.
+  try {
+    const s = JSON.parse(raw) as PersistedSession;
+    applySidebarSession({ left: s.leftSidebar, right: s.rightSidebar, items: s.rightSidebarItems });
+  } catch {
+    // malformed session — fall through; the tab restore below still tries.
+  }
+  // Guard against clobbering: only restore tabs while the strip is still the
+  // pristine single-journals default (the user hasn't navigated during the async
+  // read).
   const cur = tabs();
   if (cur.length !== 1 || cur[0].history.length !== 1 || cur[0].history[0].kind !== "journals") return;
   const parsed = parseSession(raw);

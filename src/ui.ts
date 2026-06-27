@@ -3,7 +3,7 @@ import { createSignal } from "solid-js";
 import type { GraphMeta, JournalConflict } from "./types";
 import { backend, isTauri } from "./backend";
 // Zoom is route state; these are call-time only, so the ui↔router cycle is safe.
-import { route, focusBlock } from "./router";
+import { route, focusBlock, scheduleSessionSave } from "./router";
 import { setJournalTitleFormat } from "./journal";
 
 const THEME_KEY = "logseq-claude.theme";
@@ -403,6 +403,16 @@ export function toggleSidebar() {
   const v = !sidebarOpen();
   setSidebarOpen(v);
   saveStr(SIDEBAR_OPEN_KEY, v ? null : "0");
+  scheduleSessionSave(); // durable open/closed state (localStorage isn't kept)
+}
+
+/** Apply sidebar open/closed + right-sidebar items restored from the persisted
+ *  session (router.restoreSession). Sets the signals directly — no save trigger,
+ *  so restoring can't loop back into another save. */
+export function applySidebarSession(s: { left?: boolean; right?: boolean; items?: SidebarItem[] }) {
+  if (typeof s.left === "boolean") setSidebarOpen(s.left);
+  if (Array.isArray(s.items)) setRightSidebarRaw(s.items.filter(validSidebarItem));
+  if (typeof s.right === "boolean") setRightSidebarOpenSig(s.right);
 }
 
 const SIDEBAR_W_KEY = "logseq-claude.sidebarWidth";
@@ -659,6 +669,7 @@ export const [rightSidebarOpen, setRightSidebarOpenSig] = createSignal(
 function setRightSidebarOpen(v: boolean) {
   setRightSidebarOpenSig(v);
   saveStr(RS_OPEN_KEY, v ? "1" : null);
+  scheduleSessionSave(); // durable open/closed state (localStorage isn't kept)
 }
 export function toggleRightSidebar() {
   setRightSidebarOpen(!rightSidebarOpen());
@@ -671,6 +682,7 @@ export function setRightSidebar(items: SidebarItem[]) {
   } catch {
     // ignore
   }
+  scheduleSessionSave(); // durable right-sidebar items (localStorage isn't kept)
 }
 
 export function openPageInSidebar(name: string, pageKind: "journal" | "page" = "page") {
