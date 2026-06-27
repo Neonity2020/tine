@@ -1316,6 +1316,12 @@ fn show_capture(app: &tauri::AppHandle) {
         }
         let _ = w.show();
         let _ = w.set_focus();
+        // Tell the webview it was (re)shown so it re-fits its window to the
+        // current content. The frontend can't rely on the focus event alone:
+        // this window is created `focus: false` and frameless, so a WM may not
+        // deliver a focus-gained event on show — leaving the window stuck at a
+        // previously-grown size.
+        let _ = app.emit("capture-shown", ());
     }
 }
 

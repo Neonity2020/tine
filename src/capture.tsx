@@ -129,17 +129,36 @@ function Capture() {
       const { getCurrentWindow, LogicalSize } = await import("@tauri-apps/api/window");
       const win = getCurrentWindow();
       if (!(await win.isVisible())) return;
-      // Cap the auto-grow at HALF the screen. A taller capture window is
-      // unwieldy (Martin's feedback: ~80% spanned too much). Content shorter
-      // than the cap still sizes exactly to its content.
+      // Cap the auto-grow at HALF the screen, AND at a fixed 700px ceiling. The
+      // fixed ceiling guards against an over-large `availHeight` reading on HiDPI
+      // displays (WebKitGTK can report it in device pixels, while setSize takes
+      // logical pixels — so `0.5 * availHeight` could exceed the real screen).
       const screenMax = Math.round((window.screen?.availHeight ?? 1000) * 0.5);
-      const h = Math.max(64, Math.min(measureHeight(), screenMax));
+      const measured = measureHeight();
+      const h = Math.max(64, Math.min(measured, screenMax, 700));
+      // Diagnostic (visible when launched from a terminal): if the window is ever
+      // mis-sized, this shows whether the fault is the measurement or setSize.
+      console.log("[capture] fit", { measured, screenMax, h, lastH });
       if (Math.abs(h - lastH) < 2) return; // avoid churn / feedback loops
       lastH = h;
       await win.setSize(new LogicalSize(600, h));
     } catch {
       // not in Tauri (dev preview)
     }
+  };
+
+  // Re-fit the window to its CURRENT content. Run on every (re)show — both the
+  // Rust `capture-shown` event and a focus-gained event — because this window is
+  // created `focus: false` and frameless, so a WM may not deliver a focus event
+  // on show; relying on focus alone left the window stuck at a previously-grown
+  // size. Clearing `lastH` lets it shrink back down (the churn guard would else
+  // suppress it), and re-fitting across a few ticks catches layout settling.
+  const resettle = () => {
+    lastH = 0;
+    scheduleFit();
+    requestAnimationFrame(() => { refit(); scheduleFit(); });
+    setTimeout(() => { refit(); scheduleFit(); }, 80);
+    setTimeout(scheduleFit, 220);
   };
   let fitRaf: number | undefined;
   const scheduleFit = () => {
@@ -263,9 +282,20 @@ function Capture() {
           disposeKeys = installKeybindings(e.payload ?? {});
           setShortcuts(e.payload ?? {}); // keep the hint's submit shortcut current
         });
+        // Rust emits this every time it shows the window — the reliable re-fit
+        // trigger (the focus event isn't guaranteed for a `focus:false` frameless
+        // window). Also refresh the pref/theme/shortcuts that may have changed
+        // while we were hidden.
+        const unShown = await listen("capture-shown", () => {
+          loadPref();
+          void requestTheme();
+          void requestShortcuts();
+          resettle();
+        });
         onCleanup(() => {
           unTheme();
           unKeys();
+          unShown();
         });
       } catch {
         // not in Tauri
@@ -282,15 +312,7 @@ function Capture() {
             loadPref(); // pick up a Settings change made while we were hidden
             void requestTheme(); // and a theme change
             void requestShortcuts(); // and a shortcut remap
-            // Rust resets the OS window to the small base size on each show, but
-            // `lastH` still holds the previous (grown) height — so clear it, else
-            // a reopen with a preserved multi-block draft would skip the re-fit
-            // and stay too small.
-            lastH = 0;
-            requestAnimationFrame(() => {
-              refit();
-              scheduleFit();
-            });
+            resettle();
           } else {
             // Dismiss on blur. The draft is preserved (only Esc/submit clear it)
             // so an accidental focus loss can't lose text.
