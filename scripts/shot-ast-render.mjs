@@ -11,6 +11,7 @@ const G = "/tmp/tgraph-ast";
 const APP = "/home/koutecky/research/tine";
 const TD = "/aux/koutecky/logseq/.toolchain/cargo/bin/tauri-driver";
 const OUT = process.argv[2] || "/tmp/claude-3042/-aux-koutecky-logseq/2e921412-0c07-49c5-87de-46be358044a0/scratchpad/ast-render.png";
+const PAGE = process.argv[3] || "Kitchen";
 
 const KITCHEN = [
   "- # Heading one",
@@ -21,9 +22,9 @@ const KITCHEN = [
   "- ```rust",
   "  fn main() { println!(\"hi\"); }",
   "  ```",
-  "- | left | right |",
-  "  | --- | --- |",
-  "  | a | b |",
+  "- | left | center | right |",
+  "  | :--- | :----: | ----: |",
+  "  | a | b | c |",
   "- > [!NOTE] Heads up",
   "  > a callout body line",
   "- An in-block list:",
@@ -47,7 +48,21 @@ function seed() {
   fs.mkdirSync(`${G}/journals`, { recursive: true });
   fs.mkdirSync(`${G}/logseq`, { recursive: true });
   fs.writeFileSync(`${G}/pages/Kitchen.md`, KITCHEN);
-  fs.writeFileSync(`${G}/journals/2026_06_28.md`, "- open [[Kitchen]]\n");
+  fs.writeFileSync(
+    `${G}/pages/Korg.org`,
+    [
+      "* Heading one",
+      "* Emphasis *bold* /italic/ +strike+ =verb= and a [[Page Ref]]",
+      "* A #tag and inline math $x^2$",
+      "* TODO [#A] an org task",
+      "* A quote",
+      "#+BEGIN_QUOTE",
+      "quoted text",
+      "#+END_QUOTE",
+      "",
+    ].join("\n")
+  );
+  fs.writeFileSync(`${G}/journals/2026_06_28.md`, "- open [[Kitchen]] and [[Korg]]\n");
 }
 
 seed();
@@ -89,8 +104,8 @@ try {
 
   await browser.$(".ls-block, .page-title").waitForExist({ timeout: 20000 });
   await sleep(1200);
-  // Open Kitchen from the journal feed.
-  for (const sel of ["a.page-ref=Kitchen", "span.page-ref=Kitchen", ".page-ref=Kitchen", "*=Kitchen"]) {
+  // Open the target page from the journal feed (which links Kitchen + Korg).
+  for (const sel of [`a.page-ref=${PAGE}`, `span.page-ref=${PAGE}`, `.page-ref=${PAGE}`, `*=${PAGE}`]) {
     const el = await browser.$(sel);
     if (await el.isExisting()) { await el.click(); break; }
   }
