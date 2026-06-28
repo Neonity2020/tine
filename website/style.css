@@ -213,6 +213,9 @@ h2 + .section-lede { margin-top: 1.1rem; }
   width: 100%; border-radius: 11px; border: 1px solid var(--line); box-shadow: var(--shadow);
 }
 .shots figcaption { text-align: center; color: var(--ink-faint); font-size: .85rem; margin-top: .6rem; }
+/* Stacked tile: two short shots (e.g. quick-capture empty → filled) read as one
+   feature. The two images share the grid cell, separated by a small gap. */
+.shots figure.stack img + img { margin-top: .6rem; }
 
 .band-shot { margin: 2.6rem 0 0; }
 .band-shot img { width: 100%; border-radius: var(--radius); border: 1px solid var(--line); box-shadow: var(--shadow-lg); }
