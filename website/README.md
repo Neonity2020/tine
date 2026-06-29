@@ -6,7 +6,7 @@ The static landing page for Tine, served by **GitHub Pages** from this folder.
   no trackers; everything is self-contained and loads from relative paths (so it
   works both at `https://<user>.github.io/tine/` and at a custom apex domain).
 - `img/` — screenshots, copied from `docs/img/` (the same curated set the README uses).
-- `demo/` — a **live demo**: the onboarding demo graph published with Tine's *own*
+- `demo/` — a **demo**: the onboarding demo graph published with Tine's *own*
   HTML export (so the demo dogfoods the publish feature). Generated, not hand-edited —
   see "Regenerating the demo" below. Linked from the nav/hero as a relative `demo/`
   path so it works on either Pages domain.
