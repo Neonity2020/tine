@@ -44,7 +44,7 @@ jobs:
             const fs = require('fs');
             const tag = context.ref.replace('refs/tags/', '');
             const version = tag.replace(/^v/, '');
-            const fallback = 'Download an installer for your platform below. macOS/Windows builds are currently unsigned (right-click → Open on macOS; More info → Run anyway on Windows).';
+            const fallback = 'Download an installer for your platform below. macOS/Windows builds are currently unsigned (right-click → Open on macOS; More info → Run anyway on Windows). On macOS, if Tine keeps asking to access your Documents folder on launch, see the [workaround](https://github.com/martinkoutecky/tine/blob/master/README.md#macos-repeated-documents-permission-prompt).';
             // Pull THIS version's section out of CHANGELOG.md so the GitHub release
             // notes match the changelog: everything between `## [x.y.z]` and the
             // next version heading (or the trailing link-reference block).

@@ -51,10 +51,30 @@ it:
 - **Linux** — the **AppImage** runs on any distro with no install: `chmod +x Tine_*.AppImage`, then
   run it. Or use the **`.deb`** (Debian/Ubuntu) or **`.rpm`** (Fedora/openSUSE).
 - **macOS** — open the **`.dmg`**; on first launch macOS says *"unidentified developer"*, so
-  **right-click the app → Open** (just once) and it opens normally after that.
+  **right-click the app → Open** (just once) and it opens normally after that. If Tine then
+  **keeps asking to access your Documents folder on every launch**, see the
+  [workaround](#macos-repeated-documents-permission-prompt) below.
 - **Windows** — run the **`.exe`**; if SmartScreen appears, click **More info → Run anyway**.
 
 (Want to hack on Tine instead? Build from source — see [Build & run](#build--run).)
+
+### macOS: repeated "Documents" permission prompt
+
+If your Logseq graph lives in `~/Documents` (the common default), macOS gates access to that
+folder behind a permission prompt. Because the build isn't notarized yet **and** is run with the
+download "quarantine" flag, macOS launches it from a randomized temporary location each time
+([Gatekeeper App Translocation](https://developer.apple.com/library/archive/technotes/tn2206/_index.html)),
+so it can't remember your answer — and re-asks on every launch. To make the grant stick:
+
+1. **Move `Tine.app` into `/Applications`** (drag it out of the disk image / Downloads).
+2. Clear the quarantine flag in Terminal:
+   ```sh
+   xattr -dr com.apple.quarantine /Applications/Tine.app
+   ```
+3. Launch Tine from `/Applications` and **Allow** the Documents prompt once — it won't ask again.
+
+(Both this and the "unidentified developer" warning disappear once Tine ships notarized macOS
+builds.)
 
 ---
 
