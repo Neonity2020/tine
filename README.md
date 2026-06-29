@@ -19,6 +19,10 @@
   <img src="docs/img/hero.png" alt="Tine — journals view" width="820">
 </p>
 
+<p align="center">
+  <b>▶ <a href="https://tine.page/demo/">See a live Tine graph</a></b> — the onboarding demo, published with Tine's own HTML export.
+</p>
+
 ---
 
 ## What is Tine?
@@ -108,7 +112,8 @@ raw speed. (Comparisons are against current Logseq desktop core, no plugins.)
 
 ## Features
 
-A quick map of what's in the box — the **[full feature list lives in docs/FEATURES.md](docs/FEATURES.md)**.
+A quick map of what's in the box — the **[full feature list lives in docs/FEATURES.md](docs/FEATURES.md)**,
+and the **[live demo](https://tine.page/demo/)** shows the rendered-content side of it in your browser.
 
 | Area | Highlights |
 |------|-----------|
