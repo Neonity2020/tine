@@ -1,6 +1,7 @@
 import { type JSX } from "solid-js";
 import { openPdf } from "../ui";
 import { InlineText } from "../render/inline";
+import { formatForPage } from "../store";
 import { HL_COLOR_BG, HL_COLOR_SOLID } from "../pdf";
 import { pdfFileForPage } from "../editor/annotation";
 
@@ -24,7 +25,7 @@ export function AnnotationBody(props: {
         <strong class="hl-page-badge">P{props.hlPage}</strong>
       </span>{" "}
       <span class="hl-text" style={{ background: HL_COLOR_BG[props.color] ?? HL_COLOR_BG.yellow }}>
-        <InlineText text={props.line} />
+        <InlineText text={props.line} format={formatForPage(props.page)} />
       </span>
     </span>
   );

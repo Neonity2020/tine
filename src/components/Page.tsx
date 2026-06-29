@@ -1,5 +1,5 @@
 import { For, Show, createEffect, createMemo, createSignal, onCleanup, onMount, type JSX } from "solid-js";
-import { doc, mainPages, pageByName, reloadPage, loadSingle, loadFeed, appendFeed, isDirty, editingId, setFeedExtender, flushAll, type FeedPage } from "../store";
+import { doc, mainPages, pageByName, reloadPage, loadSingle, loadFeed, appendFeed, isDirty, editingId, setFeedExtender, flushAll, formatForBlock, type FeedPage } from "../store";
 import { route, sameRoute, openPage, openJournals, openPageInNewTab, restoreScrollFor } from "../router";
 import {
   zoomedBlock, zoomInto, isFavorite, toggleFavorite,
@@ -288,7 +288,7 @@ function ZoomedView(props: { id: string }): JSX.Element {
             <>
               <span class="crumb-sep">›</span>
               <a class="crumb" onClick={() => zoomInto(aid)}>
-                <InlineText text={crumb(aid)} />
+                <InlineText text={crumb(aid)} format={formatForBlock(aid)} />
               </a>
             </>
           )}

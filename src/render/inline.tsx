@@ -16,7 +16,7 @@ import { blockView } from "./block";
 import { backend } from "../backend";
 import { loadAssetBlob } from "../assetCache";
 import { resolveBlockBatched } from "../resolveBatch";
-import { doc, setRaw } from "../store";
+import { doc, setRaw, formatForPage, formatForBlock } from "../store";
 import { QueryMacro, EmbedMacro, VideoMacro, TweetMacro, YoutubeTimestamp, ClozeMacro, ZoteroMacro } from "../components/Macro";
 import { NamespaceMacro } from "../components/Namespace";
 
@@ -664,7 +664,7 @@ function UserMacroView(props: { name: string; template: string; args: string[]; 
   const expanded = props.template.replace(/\$(\d+)/g, (_, d) => props.args[Number(d) - 1] ?? "");
   userMacroDepth++;
   try {
-    return <InlineText text={expanded} blockId={props.blockId} />;
+    return <InlineText text={expanded} blockId={props.blockId} format={formatForBlock(props.blockId)} />;
   } finally {
     userMacroDepth--;
   }
@@ -682,6 +682,8 @@ function BlockRefView(props: { id: string; label?: string }): JSX.Element {
   const [hover, setHover] = createSignal(false);
   // Visible text: an explicit label wins; otherwise the target's first line.
   const text = () => props.label ?? (grp() ? blockView(grp()!.blocks[0].raw).lines[0] : undefined);
+  // Parse the referenced block's text with ITS page's format (org refs render org).
+  const fmt = () => formatForPage(grp()?.page);
   return (
     <span
       class="block-ref"
@@ -709,7 +711,7 @@ function BlockRefView(props: { id: string; label?: string }): JSX.Element {
       }}
     >
       <Show when={text() !== undefined} fallback={<>(({props.id.slice(0, 8)}))</>}>
-        <InlineText text={text()!} />
+        <InlineText text={text()!} format={fmt()} />
       </Show>
       <Show when={hover() && grp()}>
         <span class="block-ref-preview">
@@ -717,7 +719,7 @@ function BlockRefView(props: { id: string; label?: string }): JSX.Element {
           <For each={grp()!.blocks}>
             {(b) => (
               <span class="block-ref-preview-line">
-                <InlineText text={blockView(b.raw).lines.join(" ")} />
+                <InlineText text={blockView(b.raw).lines.join(" ")} format={fmt()} />
               </span>
             )}
           </For>

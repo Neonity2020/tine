@@ -7,7 +7,7 @@ import { InlineText, renderInlines, renderRawHtml, MathView } from "./inline";
 import type { Block as AstBlock, ListItem as AstListItem, Format } from "./ast";
 import { backend } from "../backend";
 import { evalCalc } from "../editor/calc";
-import { toggleListItemAtIndex, doc } from "../store";
+import { toggleListItemAtIndex, doc, formatForBlock } from "../store";
 import { parseBlock, parserReady } from "./parse";
 
 type Align = "left" | "center" | "right" | null;
@@ -152,7 +152,7 @@ function renderBlock(b: AstBlock, blockId?: string): JSX.Element {
     case "table":
       return renderTable(b, blockId);
     case "properties":
-      return renderProps(b);
+      return renderProps(b, blockId);
     case "hr":
       return <hr class="md-hr" />;
     case "displayed_math":
@@ -263,8 +263,9 @@ function renderTable(b: Extract<AstBlock, { kind: "table" }>, blockId?: string):
   );
 }
 
-function renderProps(b: Extract<AstBlock, { kind: "properties" }>): JSX.Element {
+function renderProps(b: Extract<AstBlock, { kind: "properties" }>, blockId?: string): JSX.Element {
   const visible = b.props.filter(([k]) => !HIDDEN_PROPS.has(k.toLowerCase()));
+  const fmt = formatForBlock(blockId); // parse org property values as org
   return (
     <Show when={visible.length > 0}>
       <span class="block-properties">
@@ -272,7 +273,7 @@ function renderProps(b: Extract<AstBlock, { kind: "properties" }>): JSX.Element 
           {([k, v]) => (
             <span class="block-property">
               <span class="block-property-key">{k}</span>{" "}
-              <span class="block-property-val"><InlineText text={v} /></span>
+              <span class="block-property-val"><InlineText text={v} format={fmt} /></span>
             </span>
           )}
         </For>

@@ -5,6 +5,7 @@ import { For, Show, type JSX } from "solid-js";
 import type { BlockDto } from "../types";
 import { blockView } from "../render/block";
 import { InlineText } from "../render/inline";
+import { formatForPage } from "../store";
 import { openBlockInSidebar } from "../ui";
 
 // `page`/`pageKind` (where these blocks live) are threaded through so a
@@ -61,7 +62,7 @@ function RefBlock(props: {
                   <Show when={i() > 0}>
                     <br />
                   </Show>
-                  <InlineText text={line} />
+                  <InlineText text={line} format={formatForPage(props.page)} />
                 </>
               )}
             </For>

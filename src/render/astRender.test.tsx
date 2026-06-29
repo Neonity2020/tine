@@ -172,6 +172,13 @@ describe("InlineText", () => {
     expect(txt("a **b**")).toContain("<strong>");
   });
 
+  // Audit fix C4: the format prop must drive parsing, so org inline syntax renders
+  // as org (italic), not literally, when the caller is on an org page.
+  it("parses org inline markup as org when format=org (C4)", () => {
+    expect(txt("/italic/", "org")).toContain("<em>");
+    expect(txt("/italic/", "md")).not.toContain("<em>"); // md: literal slashes, no italic
+  });
+
   it.each([
     ["> quote", "quote"],
     ["---", "---"],

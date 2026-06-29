@@ -12,7 +12,7 @@ import type { BlockDto, Format, PageDto, PageKind } from "./types";
 import { parseOutline, type OutlineNode } from "./editor/outline";
 import type { ExportNode } from "./editor/exportText";
 import { backend } from "./backend";
-import { isConflicted, clearConflict, rightSidebar, conflicts, pushToast } from "./ui";
+import { isConflicted, clearConflict, rightSidebar, conflicts, pushToast, graphMeta } from "./ui";
 import { blockView } from "./render/block";
 import { journalTitle } from "./journal";
 import { upsertPropertyLine, readPropertyValue, splitProps, joinProps, isBuiltinHidden } from "./editor/properties";
@@ -89,6 +89,25 @@ export function mainPages(): FeedPage[] {
 /** A loaded page record by name (anywhere in the working set), or undefined. */
 export function pageByName(name: string): FeedPage | undefined {
   return doc.pages.find((p) => p.name === name);
+}
+
+/** The format ("md"/"org") to parse a page's inline content with. Exact for a
+ *  loaded page; for one that isn't loaded (e.g. the source of a backlink) fall back
+ *  to the graph's preferred format — correct for single-format graphs, a safe guess
+ *  otherwise (and far better than always assuming Markdown). Used by the inline
+ *  renderers (InlineText callers) so org markup in property values / breadcrumbs /
+ *  reference previews / block-refs renders as org, not literally. */
+export function formatForPage(name: string | undefined): Format {
+  if (name) {
+    const p = pageByName(name);
+    if (p?.format) return p.format;
+  }
+  return graphMeta()?.preferred_format ?? "md";
+}
+
+/** Like {@link formatForPage} but keyed by a block id (→ its page). */
+export function formatForBlock(id: string | undefined): Format {
+  return formatForPage(id ? doc.byId[id]?.page : undefined);
 }
 
 export const [editingId, setEditingId] = createSignal<string | null>(null);
