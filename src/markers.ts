@@ -17,6 +17,7 @@ export const MARKERS = [
   "LATER",
   "WAITING",
   "WAIT",
+  "STARTED",
   "IN-PROGRESS",
   "DONE",
   "CANCELED",

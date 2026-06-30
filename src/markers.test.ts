@@ -6,10 +6,12 @@ describe("task markers (single source of truth)", () => {
   it("matches the backend set (crates/tine-core/src/doc.rs MARKERS) — keep in sync", () => {
     // If doc.rs::MARKERS changes, update this list (and vice-versa). The two can't
     // share a literal across the language boundary, so this is the drift guard.
+    // This set must equal lsdoc's recognizer (lsdoc/src/parse.rs MARKERS, the
+    // mldoc/OG-faithful authority) — Tine treats exactly what OG treats as a task.
     expect([...MARKERS].sort()).toEqual(
       [
         "CANCELED", "CANCELLED", "DOING", "DONE", "IN-PROGRESS",
-        "LATER", "NOW", "TODO", "WAIT", "WAITING",
+        "LATER", "NOW", "STARTED", "TODO", "WAIT", "WAITING",
       ].sort()
     );
   });
@@ -22,6 +24,7 @@ describe("task markers (single source of truth)", () => {
     // The drift that prompted this: IN-PROGRESS and WAIT are OPEN (carried forward).
     expect(OPEN_MARKERS.has("IN-PROGRESS")).toBe(true);
     expect(OPEN_MARKERS.has("WAIT")).toBe(true);
+    expect(OPEN_MARKERS.has("STARTED")).toBe(true); // in-progress-like → carried forward
     expect(DONE_MARKERS.has("CANCELLED")).toBe(true);
   });
 

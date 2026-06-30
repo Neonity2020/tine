@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 /// Recognized task markers (leading keyword of a block).
 pub const MARKERS: &[&str] = &[
     "TODO", "DOING", "DONE", "NOW", "LATER", "WAITING", "WAIT", "CANCELED", "CANCELLED",
-    "IN-PROGRESS",
+    "STARTED", "IN-PROGRESS",
 ];
 
 /// A parsed `.md` document: an optional page-property pre-block plus a forest
