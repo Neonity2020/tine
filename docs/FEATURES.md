@@ -102,7 +102,11 @@ files. **⊕ marks things Tine adds on top of Logseq core** (no plugins).
   priorities, cycle with `Mod+Enter`.
 - `SCHEDULED:` / `DEADLINE:` via a calendar **date picker** (`/scheduled`,
   `/deadline`), including **recurring tasks** (`+1w` / `.+1w` / `++1w`) where
-  completing a repeater advances the date.
+  completing a repeater advances the date. You can type a planning line *anywhere*
+  in a block while editing; on exit it's moved to its canonical position (after the
+  first line, before properties — OG's layout). A `SCHEDULED:`/`DEADLINE:` inside
+  inline code or a code fence stays literal content (it's not a real timestamp), so
+  it's never turned into a date badge or moved.
 - ⊕ **Carry unfinished tasks forward** to today (presets for the last 7 / 30 / 365
   days or a configurable N), optionally keeping ancestor context.
 - Multi-day **journal feed** (one continuous editable list); today's journal created

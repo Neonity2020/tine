@@ -35,3 +35,4 @@ see the project `CLAUDE.md`.
 | [0006](0006-in-browser-wasm-parsing.md) | Parse in the browser via `lsdoc` compiled to WASM (vendored) | Accepted |
 | [0007](0007-data-safety-invariants.md) | Data-safety invariants: never silently overwrite | Accepted |
 | [0008](0008-lazy-block-body-rendering.md) | Lazy block-body rendering (render-once-keep), not windowing | Accepted |
+| [0009](0009-one-block-facet-source-on-the-dto.md) | One source for block-header facets: the lsdoc parse, shipped on the DTO | Accepted |
