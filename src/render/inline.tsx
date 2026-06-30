@@ -13,7 +13,7 @@ import { copyImageFromSrc } from "../copyImage";
 import { parseBlock, parserReady } from "./parse";
 import type { Inline, Url, MacroInline, TimestampInline, TimestampPoint, EmailValue, Block as AstBlock, Format } from "./ast";
 import { EmojiText } from "./emoji";
-import { blockView } from "./block";
+import { visibleBody } from "./block";
 import { backend } from "../backend";
 import { loadAssetBlob } from "../assetCache";
 import { resolveBlockBatched } from "../resolveBatch";
@@ -744,7 +744,7 @@ function BlockRefView(props: { id: string; label?: string }): JSX.Element {
   );
   const [hover, setHover] = createSignal(false);
   // Visible text: an explicit label wins; otherwise the target's first line.
-  const text = () => props.label ?? (grp() ? blockView(grp()!.blocks[0].raw).lines[0] : undefined);
+  const text = () => props.label ?? (grp() ? visibleBody(grp()!.blocks[0].raw)[0] : undefined);
   // Parse the referenced block's text with ITS page's format (org refs render org).
   const fmt = () => formatForPage(grp()?.page);
   return (
@@ -782,7 +782,7 @@ function BlockRefView(props: { id: string; label?: string }): JSX.Element {
           <For each={grp()!.blocks}>
             {(b) => (
               <span class="block-ref-preview-line">
-                <InlineText text={blockView(b.raw).lines.join(" ")} format={fmt()} />
+                <InlineText text={visibleBody(b.raw).join(" ")} format={fmt()} />
               </span>
             )}
           </For>

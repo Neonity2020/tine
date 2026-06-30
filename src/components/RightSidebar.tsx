@@ -13,7 +13,7 @@ import {
 import { openPage } from "../router";
 import { backend } from "../backend";
 import { doc, ensurePageLoaded, pageByName } from "../store";
-import { blockView } from "../render/block";
+import { visibleBody } from "../render/block";
 import { Block, SurfaceContext } from "./Block";
 import { LinkedReferences } from "./LinkedReferences";
 import { UnlinkedReferences } from "./UnlinkedReferences";
@@ -157,7 +157,7 @@ function BlockItem(props: {
   const pageLoaded = () => !!pageByName(props.item.page);
   const title = () => {
     const n = node();
-    return n ? blockView(n.raw).lines[0] || props.item.page : props.item.page;
+    return n ? visibleBody(n.raw)[0] || props.item.page : props.item.page;
   };
   return (
     <div class="rs-item">

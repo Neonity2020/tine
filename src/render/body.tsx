@@ -130,8 +130,8 @@ export function renderBlocks(blocks: AstBlock[], blockId?: string, headingLevel?
           </Show>
           {/* A `# heading` block's size applies ONLY to the heading's own line (the
               first inline-flow node), NOT to continuation constructs in the same block
-              (e.g. a `> quote` under it) — matching OG. blockView strips the `#` and
-              passes the level down; we wrap just block 0. */}
+              (e.g. a `> quote` under it) — matching OG. The heading level comes from
+              the facet cache (facetsOf); we wrap just block 0. */}
           <Show when={i() === 0 && headingLevel && isInlineFlow(b)} fallback={renderBlock(b, blockId)}>
             <span class={`heading-text h${headingLevel}`}>{renderBlock(b, blockId)}</span>
           </Show>

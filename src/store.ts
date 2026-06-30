@@ -13,14 +13,13 @@ import { parseOutline, type OutlineNode } from "./editor/outline";
 import type { ExportNode } from "./editor/exportText";
 import { backend } from "./backend";
 import { isConflicted, clearConflict, rightSidebar, conflicts, pushToast, graphMeta } from "./ui";
-import { blockView } from "./render/block";
 import { seedFacets, facetsFromDto } from "./render/facets";
 import { journalTitle } from "./journal";
 import { upsertPropertyLine, readPropertyValue, splitProps, joinProps, isBuiltinHidden } from "./editor/properties";
 import { copyIncludeSubtree, copyStripCollapsed } from "./copySettings";
 import { trimBlockTrailingSpace } from "./editor/format";
 import { renderedBlocks } from "./lazyObserve";
-import { OPEN_MARKERS } from "./markers";
+import { OPEN_MARKERS, MARKER_RE } from "./markers";
 import {
   markDirty,
   isDirty,
@@ -1966,7 +1965,9 @@ export async function moveSelectionItems(dir: 1 | -1) {
 // ---------------------------------------------------------------------------
 
 function isOpenTask(id: string): boolean {
-  const m = blockView(doc.byId[id]?.raw ?? "").marker;
+  // Leading task marker via the one markers.ts recognizer (vocabulary == lsdoc's, so
+  // no disagreement) — parser-free, so carry works without the wasm renderer up.
+  const m = MARKER_RE.exec((doc.byId[id]?.raw ?? "").trimStart())?.[1];
   return !!m && OPEN_MARKERS.has(m);
 }
 function subtreeHasOpenTask(id: string): boolean {

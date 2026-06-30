@@ -3,7 +3,8 @@
 
 import { For, Show, createMemo, type JSX } from "solid-js";
 import type { BlockDto } from "../types";
-import { blockView } from "../render/block";
+import { visibleBody } from "../render/block";
+import { facetsOf } from "../render/facets";
 import { InlineText } from "../render/inline";
 import { formatForPage } from "../store";
 import { openBlockInSidebar } from "../ui";
@@ -27,11 +28,12 @@ function RefBlock(props: {
   page?: string;
   pageKind?: "journal" | "page";
 }): JSX.Element {
-  // Memoized: `view()` is read ~5× in the markup below (done / marker ×2 / lines).
-  // As a plain thunk that re-ran `blockView` (drawer-skip loop + per-line regex +
-  // marker/property scan) on each read — ~4× wasted per rendered ref block, and
-  // RefBlocks renders the unlinked/linked panels with hundreds of rows.
-  const view = createMemo(() => blockView(props.block.raw));
+  // Header facts (marker/done) off the one lsdoc parse (cache hit if the panel's
+  // DTOs were seeded); the visible body lines via the shared body-text extractor.
+  // Memoized — read several times in the markup, and the ref panels render hundreds
+  // of rows.
+  const facets = createMemo(() => facetsOf(props.block.raw, formatForPage(props.page)));
+  const lines = createMemo(() => visibleBody(props.block.raw));
   return (
     <div class="ls-block ref-block">
       <div class="block-main">
@@ -54,13 +56,13 @@ function RefBlock(props: {
           </span>
         </div>
         <div class="block-content-wrapper">
-          <div class="block-content" classList={{ done: view().done }}>
-            <Show when={view().marker}>
-              <span class={`block-marker marker-${view().marker?.toLowerCase()}`}>
-                {view().marker}
+          <div class="block-content" classList={{ done: facets().done }}>
+            <Show when={facets().marker}>
+              <span class={`block-marker marker-${facets().marker?.toLowerCase()}`}>
+                {facets().marker}
               </span>{" "}
             </Show>
-            <For each={view().lines}>
+            <For each={lines()}>
               {(line, i) => (
                 <>
                   <Show when={i() > 0}>

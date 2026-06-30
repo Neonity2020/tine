@@ -1,14 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { aliasNames, isPropertyLine, pageProperties, blockView } from "./block";
+import { aliasNames, isPropertyLine, pageProperties, visibleBody } from "./block";
 
-describe("blockView is fence-aware for properties", () => {
-  it("a key:: line inside a code fence is content, not a phantom chip", () => {
-    const v = blockView("title:: Real\n```\nlang:: rust\nlet x = 1;\n```\nfoo:: bar");
-    const keys = v.properties.map(([k]) => k);
-    expect(keys).toContain("title");
-    expect(keys).toContain("foo");
-    expect(keys).not.toContain("lang"); // fenced — stays in the rendered code body
-    expect(v.lines.join("\n")).toContain("lang:: rust");
+describe("visibleBody (body text for labels / reference render)", () => {
+  it("drops real property lines but keeps a fenced key:: as code content", () => {
+    const body = visibleBody("title:: Real\n```\nlang:: rust\nlet x = 1;\n```\nfoo:: bar").join("\n");
+    expect(body).not.toContain("title:: Real"); // real block property → not body text
+    expect(body).not.toContain("foo:: bar");
+    expect(body).toContain("lang:: rust"); // fenced → stays as code content
   });
 });
 
@@ -55,30 +53,19 @@ describe("isPropertyLine", () => {
   });
 });
 
-describe("blockView SCHEDULED/DEADLINE", () => {
-  it("treats a timestamp-only line as a marker and strips it from the body", () => {
-    const v = blockView("TODO ship it\nSCHEDULED: <2026-07-06 Mon>");
-    expect(v.scheduled).toBe("2026-07-06 Mon");
-    expect(v.lines.join("\n")).toBe("ship it");
+describe("visibleBody strips header chrome from the body text", () => {
+  it("strips marker / priority / heading prefix from the first line", () => {
+    expect(visibleBody("TODO [#A] ## ship it")).toEqual(["ship it"]);
+    expect(visibleBody("DOING write the doc")).toEqual(["write the doc"]);
   });
-  it("keeps the badge AND renders trailing text after the timestamp (lenient)", () => {
-    const v = blockView("TODO \nSCHEDULED: <2026-07-06 Mon> #email ADS1 students");
-    expect(v.scheduled).toBe("2026-07-06 Mon"); // badge kept
-    expect(v.marker).toBe("TODO");
-    // No spurious blank line: the marker-only first line is dropped, body is one line.
-    expect(v.lines).toEqual(["#email ADS1 students"]);
-    expect(v.lines.join("\n")).not.toContain("SCHEDULED:"); // the prefix is hidden
+  it("removes a standalone SCHEDULED/DEADLINE planning line (it's a date badge)", () => {
+    expect(visibleBody("TODO ship it\nSCHEDULED: <2026-07-06 Mon>")).toEqual(["ship it"]);
+    expect(visibleBody("DEADLINE: <2026-07-06 Mon>\npay rent")).toEqual(["pay rent"]);
   });
-  it("finds SCHEDULED inline on the same line as the marker (no own line needed)", () => {
-    const v = blockView("TODO SCHEDULED: <2026-07-06 Mon> do the thing");
-    expect(v.scheduled).toBe("2026-07-06 Mon");
-    expect(v.marker).toBe("TODO");
-    expect(v.lines).toEqual(["do the thing"]); // token stripped, text flows after marker
+  it("keeps an inline (non-standalone) SCHEDULED as body text (not a real timestamp)", () => {
+    // Mirrors lsdoc: only a standalone planning line is a Timestamp; inline stays text.
+    expect(visibleBody("do SCHEDULED: <2026-07-06 Mon> the thing")).toEqual([
+      "do SCHEDULED: <2026-07-06 Mon> the thing",
+    ]);
   });
-  it("finds DEADLINE inline too", () => {
-    const v = blockView("DEADLINE: <2026-07-06 Mon> pay rent");
-    expect(v.deadline).toBe("2026-07-06 Mon");
-    expect(v.lines).toEqual(["pay rent"]);
-  });
-
 });

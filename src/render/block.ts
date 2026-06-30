@@ -2,7 +2,7 @@
 // authoritative (round-trip); these are computed projections.
 
 import type { Format } from "./ast";
-import { MARKERS, DONE_MARKERS } from "../markers";
+import { MARKERS } from "../markers";
 
 export { MARKERS };
 
@@ -97,55 +97,33 @@ export function aliasNames(
   return [];
 }
 
-export interface BlockView {
-  marker: string | null;
-  done: boolean;
-  priority: "A" | "B" | "C" | null;
-  headingLevel: number | null;
-  /** Body lines with marker/priority/heading prefix and SCHEDULED/DEADLINE
-   *  lines stripped. */
-  lines: string[];
-  scheduled: string | null;
-  deadline: string | null;
-  properties: [string, string][];
-}
+const PLANNING_LINE = /^\s*(SCHEDULED|DEADLINE):\s*<[^>]+>\s*$/;
 
-// SCHEDULED:/DEADLINE: planning timestamps yield the date badge (capture group 1).
-// OG treats them as timestamp-ONLY lines that must stand alone, but we're
-// intentionally lenient (Martin's call — this is rendering only): match the token
-// ANYWHERE on a line, including inline after the marker (`TODO SCHEDULED: <…> do
-// the thing`) or with text after the `<…>`. We pull the date out for the badge,
-// strip the token (+ its surrounding whitespace), and keep whatever text remains
-// as body. Deliberate, visible deviation from OG.
-const SCHEDULED_RE = /SCHEDULED:\s*<([^>]+)>/;
-const DEADLINE_RE = /DEADLINE:\s*<([^>]+)>/;
-const SCHEDULED_STRIP = /\s*SCHEDULED:\s*<[^>]+>\s*/;
-const DEADLINE_STRIP = /\s*DEADLINE:\s*<[^>]+>\s*/;
-
-export function blockView(raw: string): BlockView {
-  const allLines = raw.split("\n");
-  const properties: [string, string][] = [];
+/** A block's *visible body* lines: the readable text the reader sees, with the
+ *  marker / priority / heading prefix stripped from the first line and the
+ *  property / SCHEDULED / DEADLINE / drawer / CLOCK lines removed. Fence-aware (a
+ *  `key::` or `SCHEDULED:` inside a code fence stays as content).
+ *
+ *  This is ONLY the body text — for short labels (breadcrumbs, search, sidebar
+ *  titles) and the reference-panel inline render. The block-header FACTS
+ *  (marker / priority / heading / scheduled / deadline / properties) are NOT
+ *  derived here; they come from the one lsdoc parse via `render/facets` `facetsOf`.
+ *  So there's no second facet recognizer — just one body-text extractor. */
+export function visibleBody(raw: string): string[] {
   const lines: string[] = [];
-  let scheduled: string | null = null;
-  let deadline: string | null = null;
-  // Skip org drawers (`:LOGBOOK:`/`:PROPERTIES:` … `:END:`) and bare CLOCK lines
-  // so they don't render as literal text. Their content stays in `raw`.
   let inDrawer = false;
-  // Track code fences so a `key:: value` line INSIDE a fence stays literal content
-  // (not pulled out as a phantom property chip). Same rule as the editor's
-  // splitProps, so render and edit agree on what's a property.
   let fence: string | null = null;
-  for (const line of allLines) {
+  for (const line of raw.split("\n")) {
     const fm = /^\s*(`{3,}|~{3,})/.exec(line);
     if (fm) {
       const ch = fm[1][0];
       if (fence === null) fence = ch;
       else if (ch === fence) fence = null;
-      lines.push(line); // the fence delimiter is literal content
+      lines.push(line);
       continue;
     }
     if (fence !== null) {
-      lines.push(line); // inside a code fence — never a property/drawer/date
+      lines.push(line);
       continue;
     }
     const t = line.trim();
@@ -158,67 +136,25 @@ export function blockView(raw: string): BlockView {
       continue;
     }
     if (/^CLOCK:\s/i.test(t)) continue;
-    const sm = SCHEDULED_RE.exec(line);
-    const dm = DEADLINE_RE.exec(line);
-    if (sm || dm) {
-      let rest = line;
-      if (sm) {
-        scheduled = sm[1];
-        rest = rest.replace(SCHEDULED_STRIP, " ");
-      }
-      if (dm) {
-        deadline = dm[1];
-        rest = rest.replace(DEADLINE_STRIP, " ");
-      }
-      rest = rest.trim();
-      if (rest) lines.push(rest); // keep marker/text that shared the line; date is now a badge
-    } else if (isPropertyLine(line)) {
-      const idx = line.indexOf("::");
-      properties.push([line.slice(0, idx).trim(), line.slice(idx + 2).trim()]);
-    } else {
-      lines.push(line);
-    }
+    if (PLANNING_LINE.test(line)) continue; // shown as a date badge, not body text
+    if (isPropertyLine(line)) continue; // shown as a chip, not body text
+    lines.push(line);
   }
   if (lines.length === 0) lines.push("");
-
+  // Strip the marker / priority / heading prefix from the first line (chrome that
+  // facetsOf surfaces separately).
   let first = lines[0];
-  let marker: string | null = null;
   for (const m of MARKERS) {
     if (first === m || first.startsWith(m + " ")) {
-      marker = m;
       first = first.slice(m.length).replace(/^ /, "");
       break;
     }
   }
-
-  let priority: "A" | "B" | "C" | null = null;
-  const pm = /^\[#([ABC])\]\s?/.exec(first);
-  if (pm) {
-    priority = pm[1] as "A" | "B" | "C";
-    first = first.slice(pm[0].length);
-  }
-
-  let headingLevel: number | null = null;
+  const pm = /^\[#[ABC]\]\s?/.exec(first);
+  if (pm) first = first.slice(pm[0].length);
   const hm = /^(#{1,6}) /.exec(first);
-  if (hm) {
-    headingLevel = hm[1].length;
-    first = first.slice(hm[1].length + 1);
-  }
-
+  if (hm) first = first.slice(hm[1].length + 1);
   lines[0] = first;
-  // Drop leading blank body lines so a marker/scheduled-only first line (whose
-  // text became a badge) doesn't render as a spurious blank line above the body —
-  // e.g. `TODO \nSCHEDULED: <…> do the thing` should render the marker, the text,
-  // and the date badge all on one line, not under an empty line.
   while (lines.length > 1 && lines[0].trim() === "") lines.shift();
-  return {
-    marker,
-    done: !!marker && DONE_MARKERS.has(marker),
-    priority,
-    headingLevel,
-    lines,
-    scheduled,
-    deadline,
-    properties,
-  };
+  return lines;
 }

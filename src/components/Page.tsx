@@ -14,7 +14,7 @@ import { LinkedReferences } from "./LinkedReferences";
 import { UnlinkedReferences } from "./UnlinkedReferences";
 import { QueryMacro } from "./Macro";
 import { NamespaceCrumb, NamespaceHierarchy } from "./Namespace";
-import { pageProperties, aliasNames, blockView } from "../render/block";
+import { pageProperties, aliasNames, visibleBody } from "../render/block";
 import { InlineText } from "../render/inline";
 import { EmojiText } from "../render/emoji";
 import { journalTitle } from "../journal";
@@ -268,7 +268,7 @@ function ZoomedView(props: { id: string }): JSX.Element {
   };
   const pageName = () => doc.byId[props.id]?.page ?? "";
   const pageKind = () => doc.pages.find((p) => p.name === pageName())?.kind ?? "page";
-  const crumb = (id: string) => blockView(doc.byId[id].raw).lines[0] || "…";
+  const crumb = (id: string) => visibleBody(doc.byId[id].raw)[0] || "…";
 
   return (
     <div class="page zoomed-page">

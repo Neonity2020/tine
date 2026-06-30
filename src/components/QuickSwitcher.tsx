@@ -4,7 +4,7 @@ import { switcherOpen, closeSwitcher, switcherMode, recentPages } from "../ui";
 import { openPage, openPageAtBlock, openPageInNewTab, route } from "../router";
 import { paletteCommands } from "../keybindings";
 import { fuzzyScore } from "../editor/autocomplete";
-import { blockView } from "../render/block";
+import { visibleBody } from "../render/block";
 import type { PageEntry, PageKind } from "../types";
 
 // One selectable result row.
@@ -148,7 +148,7 @@ export function QuickSwitcher(): JSX.Element {
     const all: { item: Item; onCur: boolean }[] = [];
     for (const g of hits() ?? []) {
       for (const b of g.blocks) {
-        const text = blockView(b.raw).lines.join(" ").trim();
+        const text = visibleBody(b.raw).join(" ").trim();
         if (!text) continue;
         all.push({
           item: { t: "block", page: g.page, pageKind: g.kind, blockId: b.id, text, crumb: b.breadcrumb ?? [] },
