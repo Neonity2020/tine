@@ -78,6 +78,7 @@ import { cycleMarkerSmart } from "../editor/repeat";
 import { applyTemplateVars } from "../editor/templateVars";
 import { caretAtFirstRow, caretAtLastRow } from "../editor/caretRows";
 import { splitProps, joinProps, isBuiltinHidden, hideAll } from "../editor/properties";
+import { normalizePlanning } from "../editor/planning";
 import { isAnnotationBlock, annotationInfo } from "../editor/annotation";
 import { AnnotationBody } from "./AnnotationBody";
 
@@ -1333,18 +1334,25 @@ export function Editor(props: { id: string }): JSX.Element {
   };
 
   const onBlur = () => {
-    commit(ref.value);
     // A block-move reorder blurs us momentarily — stay in edit mode (the move
-    // handler refocuses and restores the caret).
-    if (isBlockMoving()) return;
+    // handler refocuses and restores the caret). Commit as-is, don't normalize.
+    if (isBlockMoving()) {
+      commit(ref.value);
+      return;
+    }
     // The whole window lost focus (switched to another app/window): stay in edit
-    // mode and remember the caret so onWindowFocus can resume exactly here. An
-    // in-window blur (clicking elsewhere, Escape) keeps document focus, so it
-    // still exits editing as before.
+    // mode and remember the caret so onWindowFocus can resume exactly here. Commit
+    // as-is — we're still editing, not exiting.
     if (!document.hasFocus()) {
+      commit(ref.value);
       savedSel = { start: ref.selectionStart, end: ref.selectionEnd };
       return;
     }
+    // A real exit (clicking elsewhere, Escape, Enter→new block): move any
+    // SCHEDULED/DEADLINE planning line to its canonical position (OG layout) as we
+    // commit — type-anywhere-while-editing, normalize-on-exit (M1c). The editor is
+    // closing, so there is no caret to preserve.
+    commit(normalizePlanning(ref.value, pageFmt()));
     // Only clear if no other block grabbed editing focus.
     if (editingId() === props.id) setEditingId(null);
   };
