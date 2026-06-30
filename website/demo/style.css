@@ -59,11 +59,39 @@ a.block-ref:hover{text-decoration:underline}
 span.block-ref{color:var(--muted)}
 a.tag{font-size:.92em}
 a[href^="http"]{color:var(--link)}
-code{background:var(--code);border-radius:4px;padding:.05em .35em;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.9em}
-img{max-width:100%;border-radius:6px;margin:.3rem 0}
+code,.inline-code{background:var(--code);border-radius:4px;padding:.05em .35em;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.9em}
+/* fenced code blocks (highlight.js) — not the inline pill */
+pre.code-block{background:var(--code);border:1px solid var(--line);border-radius:8px;padding:.7em .9em;overflow:auto;margin:.4rem 0}
+pre.code-block code,pre.code-block code.hljs{background:none;border:0;padding:0;font-size:.86em;display:block}
+img,.inline-image{max-width:100%;border-radius:6px;margin:.3rem 0}
+.inline-image-wrap{display:inline-block;max-width:100%}
+.media-embed{max-width:100%;border-radius:6px;margin:.3rem 0}
 .math-display{display:block;text-align:center;margin:.5rem 0}
 strong{font-weight:650}
+/* in-block markdown lists (.b-scoped so they win over the outline ul rules) */
+.b ul.md-list,.b ol.md-list{margin:.2rem 0;padding-left:1.3rem;border-left:none}
+.b ul.md-list{list-style:disc}.b ol.md-list{list-style:decimal}
+.b li.md-list-item{margin:.1rem 0;position:static}
+.b li.md-list-item::before{display:none}
+.md-list-term{font-weight:650}
+.block-checkbox{display:inline-block;width:.95em;height:.95em;border:1.5px solid var(--muted);border-radius:3px;vertical-align:-2px;margin-right:.15em}
+.block-checkbox.checked{background:var(--accent);border-color:var(--accent)}
+/* tables (data-align is the export's beyond-OG column alignment) */
+table.md-table{border-collapse:collapse;margin:.5rem 0;font-size:.94em}
+table.md-table th,table.md-table td{border:1px solid var(--line);padding:.3em .6em;text-align:left}
+table.md-table th{background:var(--code);font-weight:650}
+table.md-table [data-align="center"]{text-align:center}
+table.md-table [data-align="right"]{text-align:right}
+/* blockquote + callouts */
+blockquote.md-quote{margin:.5rem 0;padding:.2rem 0 .2rem .9rem;border-left:3px solid var(--line);color:var(--muted)}
+.callout{margin:.5rem 0;padding:.5rem .8rem;border-radius:8px;border-left:3px solid var(--accent);background:var(--code)}
+.callout-title{font-weight:700;font-size:.82rem;text-transform:uppercase;letter-spacing:.04em;color:var(--accent);margin-bottom:.2rem}
+/* org timestamps + footnotes */
+.org-timestamp{color:var(--muted);font-size:.92em;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+.org-timestamp.inactive{opacity:.6}
+.footnote-def{font-size:.9em;color:var(--muted);margin:.2rem 0}
+.footnote-ref{color:var(--link);font-size:.85em}
 .index-list li{margin:.15rem 0}
 .index-list .k{color:var(--muted);font-size:.8rem;margin-left:.4rem}
-hr{border:none;border-top:1px solid var(--line);margin:1.2rem 0}
+.md-hr,hr{border:none;border-top:1px solid var(--line);margin:1.2rem 0}
 footer{margin-top:64px;color:var(--muted);font-size:.78rem;border-top:1px solid var(--line);padding-top:12px}
