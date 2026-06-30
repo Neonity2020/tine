@@ -210,17 +210,27 @@ function renderQuote(b: Extract<AstBlock, { kind: "quote" }>, blockId?: string):
       const m = /^\[!(\w+)\]\s*(.*)$/.exec(lead.text);
       if (m) {
         const type = m[1].toLowerCase();
-        // The title is `m[2]` (the text after `[!TYPE]` on the first line); the
-        // body is everything AFTER that first line — drop the lead `[!TYPE] …`
-        // plain node and a following soft break so the title isn't repeated.
-        let rest = first.inline.slice(1);
-        if (rest[0]?.k === "break") rest = rest.slice(1);
-        const bodyChildren: AstBlock[] = rest.length
-          ? [{ kind: "paragraph", inline: rest }, ...b.children.slice(1)]
+        // Split the lead paragraph at the FIRST soft break: the `[!TYPE]` text remainder
+        // (`m[2]`) plus the inline markup BEFORE the break is the TITLE; everything after
+        // begins the BODY. (lsdoc v0.2.3: `> [!NOTE] Heads **up**` keeps `**up**` in the
+        // title, not the body — previously it spilled into the body.)
+        const titleText = m[2];
+        const afterLead = first.inline.slice(1);
+        const brk = afterLead.findIndex((n) => n.k === "break");
+        const titleMarkup = brk === -1 ? afterLead : afterLead.slice(0, brk);
+        const bodyInlines = brk === -1 ? [] : afterLead.slice(brk + 1);
+        const titleEmpty = titleText.trim() === "" && titleMarkup.length === 0;
+        const bodyChildren: AstBlock[] = bodyInlines.length
+          ? [{ kind: "paragraph", inline: bodyInlines }, ...b.children.slice(1)]
           : b.children.slice(1);
         return (
           <div class={`callout callout-${type}`}>
-            <div class="callout-title">{m[2].trim() || type.toUpperCase()}</div>
+            <div class="callout-title">
+              <Show when={!titleEmpty} fallback={type.toUpperCase()}>
+                {titleText}
+                {renderInlines(titleMarkup, blockId)}
+              </Show>
+            </div>
             <div class="callout-body">{renderBlocks(bodyChildren, blockId)}</div>
           </div>
         );

@@ -74,11 +74,20 @@ function norm(node: Node): string {
   return out;
 }
 
+/** The displayed heading level (1–6) of the first block, mirroring the facet cache —
+ *  lsdoc v0.2.3 `render_html` wraps a heading bullet in `heading-text` itself, so the
+ *  frontend (which renders the AST) must be given the same level to wrap block 0. */
+function headingLevelOf(blocks: ReturnType<typeof parseBlock>): number | null {
+  const h = blocks[0];
+  if (!h) return null;
+  const size = h.kind === "bullet" ? h.size ?? null : h.kind === "heading" ? h.size ?? h.level : null;
+  return size != null && size >= 1 && size <= 6 ? size : null;
+}
+
 function frontendSkeleton(raw: string): string {
   const div = document.createElement("div");
-  // blockId / headingLevel omitted: the heading-text wrapper is consumer chrome (lsdoc
-  // renders a heading-bullet's inlines bare), so both sides render the bare body here.
-  const dispose = render(() => renderBlocks(parseBlock(raw, false)), div);
+  const blocks = parseBlock(raw, false);
+  const dispose = render(() => renderBlocks(blocks, undefined, headingLevelOf(blocks)), div);
   const out = div.innerHTML;
   dispose();
   return skeleton(out);
@@ -106,6 +115,7 @@ const FIXTURES: Record<string, string> = {
   "definition list (delta 3: term)": "Coffee\n: A hot drink\nTea\n: Another drink",
   "markdown table": "| Name | Age |\n| --- | --- |\n| Ann | 30 |\n| Bob | 25 |",
   "github callout (delta 5)": "> [!NOTE] Heads up\n> the body of the note\n> second body line",
+  "github callout markup title": "> [!TIP] Use **bold** and `code`\n> body line",
   "github callout no title": "> [!WARNING]\n> be careful here",
   "plain blockquote": "> just a quote\n> over two lines",
   "horizontal rule": "text above\n\n---\n\ntext below",

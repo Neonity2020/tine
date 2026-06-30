@@ -377,19 +377,6 @@ fn ref_target_text(raw: &str) -> String {
     ast_plain_text(&first)
 }
 
-/// The displayed heading level (1–6) of a block whose head is a heading bullet
-/// (`### x` → 3). lsdoc renders a bullet's inlines bare and leaves the `size` to the
-/// consumer as chrome, so the export wraps the head line in `<h{n}>`. `None` ⇒ not a heading.
-fn heading_level(blocks: &[Block]) -> Option<u32> {
-    match blocks.first()? {
-        Block::Bullet { size: Some(n), .. } if (1..=6).contains(n) => Some(*n),
-        Block::Heading { size, level, .. } => {
-            let n = (*size).unwrap_or(*level);
-            (1..=6).contains(&n).then_some(n)
-        }
-        _ => None,
-    }
-}
 
 fn render_block(
     b: &DocBlock,
@@ -422,23 +409,13 @@ fn render_block(
         index.push(json!({"slug": slug, "title": title, "anchor": anchor, "text": text}));
     }
 
+    // The whole body via lsdoc's canonical render_html, then decorate the data-* hooks for
+    // a static page. A `# heading` block is wrapped in `<span class="heading-text h{n}">` by
+    // render_html itself (lsdoc v0.2.3), so the export markup matches the app — no separate
+    // `<h{n}>` wrapping here.
     let opts = lsdoc::RenderOpts { format: lsdoc::Format::Md };
-    // A heading block: the displayed `size` is consumer chrome (lsdoc renders the bullet's
-    // inlines bare), so wrap the head line in `<h{n}>` and render any continuation blocks
-    // below it — matching the app's renderBlocks.
-    if let Some(n) = heading_level(&blocks) {
-        let head = decorate(&lsdoc::render_html(&blocks[..1], &opts), refs);
-        out.push_str(&format!("<h{n}>{head}</h{n}>"));
-        if blocks.len() > 1 {
-            let rest = decorate(&lsdoc::render_html(&blocks[1..], &opts), refs);
-            if !rest.is_empty() {
-                out.push_str(&format!("<div class=\"b\">{rest}</div>"));
-            }
-        }
-    } else {
-        let body = decorate(&lsdoc::render_html(&blocks, &opts), refs);
-        out.push_str(&format!("<div class=\"b\">{body}</div>"));
-    }
+    let body = decorate(&lsdoc::render_html(&blocks, &opts), refs);
+    out.push_str(&format!("<div class=\"b\">{body}</div>"));
 
     if !b.children.is_empty() {
         out.push_str("<ul>");
@@ -571,6 +548,10 @@ ul.outline>li::before{display:none}
 .b{padding:1px 0}
 h1,h2,h3,h4,h5,h6{line-height:1.3;margin:.5rem 0 .2rem;letter-spacing:-.01em}
 h2{font-size:1.4rem}h3{font-size:1.18rem}h4{font-size:1.04rem}
+/* block-level `# heading` bodies render as `.heading-text.h{n}` spans (lsdoc render_html). */
+.heading-text{display:block;font-weight:600;line-height:1.3;letter-spacing:-.01em;margin:.4rem 0 .15rem}
+.heading-text.h1{font-size:1.7em}.heading-text.h2{font-size:1.4em}.heading-text.h3{font-size:1.2em}
+.heading-text.h4{font-size:1.1em}.heading-text.h5{font-size:1em}.heading-text.h6{font-size:.9em}
 a.ref,a.tag{color:var(--link);text-decoration:none}
 a.ref:hover,a.tag:hover{text-decoration:underline}
 a.block-ref,span.block-ref{background:var(--code);border-radius:4px;padding:0 .28em;font-size:.95em}

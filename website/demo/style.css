@@ -51,6 +51,10 @@ ul.outline>li::before{display:none}
 .b{padding:1px 0}
 h1,h2,h3,h4,h5,h6{line-height:1.3;margin:.5rem 0 .2rem;letter-spacing:-.01em}
 h2{font-size:1.4rem}h3{font-size:1.18rem}h4{font-size:1.04rem}
+/* block-level `# heading` bodies render as `.heading-text.h{n}` spans (lsdoc render_html). */
+.heading-text{display:block;font-weight:600;line-height:1.3;letter-spacing:-.01em;margin:.4rem 0 .15rem}
+.heading-text.h1{font-size:1.7em}.heading-text.h2{font-size:1.4em}.heading-text.h3{font-size:1.2em}
+.heading-text.h4{font-size:1.1em}.heading-text.h5{font-size:1em}.heading-text.h6{font-size:.9em}
 a.ref,a.tag{color:var(--link);text-decoration:none}
 a.ref:hover,a.tag:hover{text-decoration:underline}
 a.block-ref,span.block-ref{background:var(--code);border-radius:4px;padding:0 .28em;font-size:.95em}
