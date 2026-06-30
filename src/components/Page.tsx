@@ -115,8 +115,16 @@ export function PageView(): JSX.Element {
       .onGraphChanged((c) => {
         const r = route();
         if (c.removed) {
-          // Page deleted externally while open → reload journals in place (not a
-          // new tab, even on a pinned tab — the page no longer exists).
+          // Deleted externally. If the page has unsaved local state, surface a CONFLICT
+          // instead of silently navigating away (which would drop the in-memory edits) —
+          // the user can Keep-mine to recreate it (audit M5). Otherwise reload journals
+          // in place (it no longer exists), even on a pinned tab.
+          const disp = reloadDisposition(c.name);
+          if (disp === "conflict") {
+            markConflict(c.name);
+            return;
+          }
+          if (disp === "skip") return; // being edited / move mid-flight — leave the caret
           if (r.kind === "page" && r.name === c.name) openJournals({ inPlace: true });
           return;
         }

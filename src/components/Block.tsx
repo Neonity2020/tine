@@ -1409,12 +1409,12 @@ export function Editor(props: { id: string }): JSX.Element {
         if (toastId) dismissToast(toastId);
       }
       if (!bytes) return;
-      const name = assetFileName();
+      const candidate = assetFileName();
       // Cache key is the bare filename — assetRelPath() strips the `assets/`
       // prefix before loadAssetBlob() (see render/inline.tsx). Seed it so the
       // image renders instantly, before the disk write lands.
-      seedAssetBlob(name, bytes);
-      const md = assetMarkdown(name);
+      seedAssetBlob(candidate, bytes);
+      const md = assetMarkdown(candidate);
       const start = ref.selectionStart;
       const newRaw = ref.value.slice(0, start) + md + ref.value.slice(ref.selectionEnd);
       commit(newRaw);
@@ -1424,9 +1424,24 @@ export function Editor(props: { id: string }): JSX.Element {
         ref.setSelectionRange(pos, pos);
         autosize();
       });
-      void backend()
-        .saveAsset(name, bytes)
-        .catch(() => pushToast(`Couldn’t save pasted image to assets/`, "error"));
+      void (async () => {
+        let stored: string;
+        try {
+          stored = await backend().saveAsset(candidate, bytes);
+        } catch {
+          pushToast(`Couldn’t save pasted image to assets/`, "error");
+          return;
+        }
+        // The backend de-dups a colliding name (e.g. two pastes in the same second) to
+        // `<name>_1.png`; repoint the link + blob to the ACTUAL stored file so the block
+        // never references a wrong/missing asset and the real file isn't orphaned (M4).
+        if (stored && stored !== candidate) {
+          seedAssetBlob(stored, bytes);
+          const cur = node().raw;
+          const fixed = cur.replace(assetMarkdown(candidate), assetMarkdown(stored));
+          if (fixed !== cur) commit(fixed);
+        }
+      })();
     })();
   };
 
