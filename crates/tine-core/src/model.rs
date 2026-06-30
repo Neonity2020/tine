@@ -1214,19 +1214,40 @@ impl Graph {
         Ok(parse_doc(&entry.path, &content))
     }
 
-    /// Read+parse every page from disk (skipping unreadable files). Used to
-    /// build the in-memory cache.
+    /// Read+parse every page from disk (skipping unreadable files). Used to build
+    /// the in-memory cache on first use — the on-demand `with_pages` build a user
+    /// ACTIVELY WAITS ON when they navigate before the background warm finishes
+    /// (NOT the paced thermal `warm_cache`, which keeps its own serial loop).
+    ///
+    /// The per-file work (read → content_rev → parse → assign uuids) is independent,
+    /// so on a large graph we fan it across cores. Result order is irrelevant: the
+    /// cache is searched by `(kind, name)`, never by position.
     fn load_all_pages(&self) -> Vec<(PageEntry, Document, String)> {
-        self.list_pages()
-            .into_iter()
-            .filter_map(|e| {
-                let content = fs::read_to_string(&e.path).ok()?;
-                let rev = content_rev(&content);
-                let mut d = parse_doc(&e.path, &content);
-                assign_doc_uuids(&mut d.roots);
-                Some((e, d, rev))
-            })
-            .collect()
+        let entries = self.list_pages();
+        let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(8);
+        // Small graphs (or a single core): serial — the parse is fast and thread
+        // spawn isn't worth it. Big graphs: split across `workers` threads.
+        if workers <= 1 || entries.len() < 64 {
+            return entries.into_iter().filter_map(parse_page_entry).collect();
+        }
+        let per = (entries.len() + workers - 1) / workers;
+        // Drain into owned contiguous chunks (no clone of PageEntry).
+        let mut chunks: Vec<Vec<PageEntry>> = Vec::with_capacity(workers);
+        let mut it = entries.into_iter();
+        loop {
+            let chunk: Vec<PageEntry> = it.by_ref().take(per).collect();
+            if chunk.is_empty() {
+                break;
+            }
+            chunks.push(chunk);
+        }
+        std::thread::scope(|s| {
+            let handles: Vec<_> = chunks
+                .into_iter()
+                .map(|chunk| s.spawn(move || chunk.into_iter().filter_map(parse_page_entry).collect::<Vec<_>>()))
+                .collect();
+            handles.into_iter().flat_map(|h| h.join().unwrap_or_default()).collect()
+        })
     }
 
     /// Install a freshly-built whole-graph snapshot atomically: the parsed pages
@@ -2620,6 +2641,18 @@ fn top_level_asset_name(name: &str) -> io::Result<()> {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "bad asset name"));
     }
     Ok(())
+}
+
+/// Read + parse one page file into (entry, doc, content_rev), or `None` if the
+/// file is unreadable/gone. Free fn (no `&self`) so `load_all_pages` can run it
+/// across worker threads. The parse helpers it calls are all pure functions of the
+/// file content.
+fn parse_page_entry(e: PageEntry) -> Option<(PageEntry, Document, String)> {
+    let content = fs::read_to_string(&e.path).ok()?;
+    let rev = content_rev(&content);
+    let mut d = parse_doc(&e.path, &content);
+    assign_doc_uuids(&mut d.roots);
+    Some((e, d, rev))
 }
 
 fn reserve_asset(assets: &Path, name: &str) -> io::Result<(String, fs::File)> {
