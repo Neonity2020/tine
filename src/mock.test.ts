@@ -10,9 +10,9 @@ describe("mock backend", () => {
     expect(raws.some((r) => r.startsWith("DOING Wire"))).toBe(true);
   });
 
-  it("backlinks to logseq-claude include the journal", async () => {
+  it("backlinks to Tine include the journal", async () => {
     const b = mockBackend();
-    const groups = await b.getBacklinks("logseq-claude");
+    const groups = await b.getBacklinks("Tine");
     expect(groups.some((g) => g.page === "Jun 14th, 2026")).toBe(true);
   });
 

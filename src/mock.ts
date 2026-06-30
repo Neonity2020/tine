@@ -55,7 +55,7 @@ const PAGES: PageDto[] = [
     pre_block: null,
     blocks: [
       b("## Today"),
-      b("Started the [[logseq-claude]] rewrite — aiming for a #fast native feel.", [
+      b("Started the [[Tine]] rewrite — aiming for a #fast native feel.", [
         b("The outliner is the core; everything hangs off **blocks**."),
         b("Reading the OG source for the *exact* file format and `mldoc` quirks."),
       ]),
@@ -90,7 +90,7 @@ const PAGES: PageDto[] = [
     title: "Jun 12th, 2026",
     pre_block: null,
     blocks: [
-      b("Set up the [[logseq-claude]] repo and Rust core.", [
+      b("Set up the [[Tine]] repo and Rust core.", [
         b("Round-trip tests pass on the real graph."),
       ]),
       b("DONE Decide the stack: **Tauri** + *SolidJS*"),
@@ -100,10 +100,10 @@ const PAGES: PageDto[] = [
 
 const NAMED: PageDto[] = [
   {
-    name: "logseq-claude",
+    name: "Tine",
     kind: "page",
-    title: "logseq-claude",
-    pre_block: "title:: logseq-claude\ntags:: project, tooling",
+    title: "Tine",
+    pre_block: "title:: Tine\ntags:: project, tooling",
     blocks: [
       b("A fast clone of [[Logseq]] built with **Tauri** + *SolidJS*.", [
         b("Goal: #functional + #visual equivalent."),
@@ -124,7 +124,7 @@ const NAMED: PageDto[] = [
     format: "org",
     blocks: [
       b("Inline styles: *bold*, /italic/, _underline_, +strike+, ~code~, =verbatim=, ^^highlight^^"),
-      b("Org links: [[logseq-claude]], [[logseq-claude][the project]], and [[https://orgmode.org][Org website]]"),
+      b("Org links: [[Tine]], [[Tine][the project]], and [[https://orgmode.org][Org website]]"),
       b("Boundary-safe plain text: a/b/c paths, snake_case_var, and 2*3*4 stay literal"),
       b("TODO [#A] high-priority org task\nSCHEDULED: <2026-06-25 Thu>"),
       b("DOING in-progress task referencing [[n-fold IP]]"),
@@ -574,6 +574,10 @@ export function mockBackend(): Backend {
       return 3;
     },
     async listJournalConflicts() {
+      // Default demo state is clean: no sticky "duplicate journal day" toast and no
+      // reconcile banner cluttering the marketing screenshots. The reconcile flow is
+      // demoed on demand via `?conflicts` (mirrors the `?big` virtualization gate).
+      if (typeof location !== "undefined" && !/[?&]conflicts\b/.test(location.search)) return [];
       return [
         {
           title: "Friday, 26-06-2026",

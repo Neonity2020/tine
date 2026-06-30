@@ -16,7 +16,7 @@ try {
   await waitForServer(`http://localhost:${PORT}/`);
   const browser = await chromium.launch();
   const page = await browser.newPage({ viewport: { width: 900, height: 1180 } });
-  await page.goto(`http://localhost:${PORT}/`);
+  await page.goto(`http://localhost:${PORT}/?conflicts`); // mock surfaces the duplicate-day conflict only with this gate
   await page.waitForSelector(".ls-block", { timeout: 5000 });
   await page.locator('button.icon-btn[title^="Settings"]').first().click();
   await page.waitForSelector(".settings-modal", { timeout: 3000 });

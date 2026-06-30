@@ -38,12 +38,12 @@ try {
         await sleep(250);
       }
       // pin TWO of them (double-click → sticky, sorts left)
-      for (const name of ["logseq-claude", "block editor"]) {
+      for (const name of ["Tine", "block editor"]) {
         const tab = page.locator(".tab", { hasText: name }).first();
         if (await tab.count()) { await tab.dblclick(); await sleep(250); }
       }
-      // activate logseq-claude (richer page content than block editor)
-      const lc = page.locator(".tab", { hasText: "logseq-claude" }).first();
+      // activate Tine (richer page content than block editor)
+      const lc = page.locator(".tab", { hasText: "Tine" }).first();
       if (await lc.count()) { await lc.click(); await sleep(400); }
       // The pin indicator is a 📌 emoji — fine in the app (WebKitGTK has an emoji
       // font) but a tofu box in headless Chromium here, so swap in an inline SVG
@@ -64,15 +64,15 @@ try {
     await page.close();
   }
 
-  // --- PDF: open from logseq-claude, text highlight + area highlight --------
+  // --- PDF: open from Tine, text highlight + area highlight --------
   {
     const page = await browser.newPage({ viewport: { width: 1280, height: 820 }, deviceScaleFactor: 2 });
     try {
       await page.goto(`http://localhost:${PORT}/`);
       await page.waitForSelector(".page-title", { timeout: 8000 });
       await sleep(400);
-      // navigate to logseq-claude via its page-ref link in the feed
-      await page.locator("a.page-ref", { hasText: "logseq-claude" }).first().click();
+      // navigate to Tine via its page-ref link in the feed
+      await page.locator("a.page-ref", { hasText: "Tine" }).first().click();
       await sleep(500);
       // open the PDF (chip class .pdf-link, fallback: any link to a .pdf asset)
       let link = page.locator(".pdf-link");

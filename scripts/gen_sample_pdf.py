@@ -7,7 +7,7 @@ import zlib  # noqa: F401 (kept for parity; not needed for uncompressed stream)
 
 def pdf_bytes() -> bytes:
     text = (
-        "BT /F1 20 Tf 72 720 Td (logseq-claude PDF viewer) Tj ET\n"
+        "BT /F1 20 Tf 72 720 Td (Tine PDF viewer) Tj ET\n"
         "BT /F1 13 Tf 72 690 Td (Select this text to create a highlight.) Tj ET\n"
         "BT /F1 13 Tf 72 668 Td (Highlights persist to assets/<key>.edn + an hls__ page.) Tj ET\n"
     )

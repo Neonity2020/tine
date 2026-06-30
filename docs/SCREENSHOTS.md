@@ -46,7 +46,7 @@ Scripts write to the gitignored `screenshots/` dir; the README set is then
 | `query.png`          | Query results + visual query-builder chip bar      | `shot-features.mjs` → `feat-query.png`           | query rendering or the builder bar changes |
 | `quick-capture.png`  | Quick-capture mini-window with slash menu open     | `shot-capture.mjs` → `rm-quick-capture.png`      | capture window, slash menu, or editor-parity changes |
 | `pdf.png`            | PDF pane + text highlight + area (image) highlight | `shot-tabs-pdf.mjs` → `feat-pdf.png`             | PDF viewer, highlight rendering (text/area), or pane layout changes |
-| `settings.png`       | Settings modal (shortcuts shown)                   | settings shot (curated)                          | Settings modal gains/loses controls (**watch mode, first-day-of-week**, themes, snapshots) |
+| `settings.png`       | Settings modal (shortcuts shown)                   | `shot-settings.mjs` → `settings.png`             | Settings modal gains/loses controls (**watch mode, first-day-of-week**, themes, snapshots) |
 | `calc.png`           | Live `/calc` block (inputs, results, a variable)   | `shot-stills.mjs` → `feat-calc.png`              | calc rendering (line numbers, result column) changes |
 | `callouts.png`       | Colored note / warning / tip callouts              | `shot-stills.mjs` → `feat-callouts.png`          | callout colors/title/body styling changes |
 | `waveform.png`       | Audio waveform overlay player (decoded waveform)   | `shot-media.mjs` → `audio-overlay.png`           | audio overlay / waveform rendering changes (shot synthesizes a real WAV so the waveform draws) |

@@ -63,7 +63,7 @@ try {
     await expandPages();
     const np = page.locator(".nav-page");
     const count = await np.count();
-    if (count) await np.nth(0).click({ button: "middle" }); // logseq-claude → bg tab
+    if (count) await np.nth(0).click({ button: "middle" }); // Tine → bg tab
     await sleep(200);
     if (count > 1) await np.nth(1).click({ button: "middle" }); // kitchen-sink → bg tab
     await sleep(200);
@@ -127,7 +127,7 @@ try {
   await reset(page);
   await shot(page, "feat-pdf", async () => {
     await expandPages();
-    await page.locator(".nav-page").first().click(); // logseq-claude has the PDF
+    await page.locator(".nav-page").first().click(); // Tine has the PDF
     await sleep(300);
     await page.locator(".pdf-link").first().click();
     await page.waitForSelector(".pdf-page canvas", { timeout: 8000 }).catch(() => {});
