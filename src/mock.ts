@@ -6,6 +6,7 @@ import type { Backend, GpuEnv, DebugInfo } from "./backend";
 import type { BlockDto, GraphMeta, Highlight, PageDto, PageEntry, RefGroup } from "./types";
 import { SAMPLE_PDF_B64 } from "./sample-pdf";
 import { hlsPageName } from "./pdf";
+import { MARKER_RE } from "./markers";
 
 function pageRefs(raw: string): string[] {
   const out: string[] = [];
@@ -32,7 +33,7 @@ function blockRefIds(raw: string): string[] {
   return out;
 }
 function leadingMarker(raw: string): string | null {
-  const m = /^(TODO|DOING|DONE|NOW|LATER|WAITING|WAIT|CANCELED|CANCELLED|IN-PROGRESS)\b/.exec(raw);
+  const m = MARKER_RE.exec(raw);
   return m ? m[1] : null;
 }
 

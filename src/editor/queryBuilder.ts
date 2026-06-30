@@ -9,6 +9,8 @@
 // applies an immutable mutation, serializes back, and writes the block — so the
 // tree never drifts from what's stored.
 
+import { MARKERS as TASK_MARKERS } from "../markers";
+
 export type Clause =
   | { kind: "op"; op: "and" | "or" | "not"; children: Clause[] }
   | { kind: "page"; name: string } // a [[page]] / #tag / (page-ref) reference
@@ -35,7 +37,10 @@ export type Clause =
 export type BetweenField = "any" | "journal" | "scheduled" | "deadline";
 export const BETWEEN_FIELDS: BetweenField[] = ["journal", "scheduled", "deadline", "any"];
 
-export const MARKERS = ["TODO", "DOING", "NOW", "LATER", "DONE", "WAITING", "CANCELED"];
+// The full task-marker set (src/markers.ts) as a mutable array for the picker.
+// Was a hand-copied 7 that omitted WAIT / CANCELLED / IN-PROGRESS, so those tasks
+// couldn't be filtered though blocks could be marked with them.
+export const MARKERS: string[] = [...TASK_MARKERS];
 export const PRIORITIES = ["A", "B", "C"];
 
 /** A date bound that resolves on its own (keyword / relative / ISO) is written

@@ -4,9 +4,9 @@
 //   (none) -> LATER (":now" workflow) or TODO (":todo" workflow)
 // Bound to mod+enter (Ctrl+Enter on Linux/Windows) in the editor, like OG.
 
-export type Workflow = "now" | "todo";
+import { MARKERS } from "../markers";
 
-const MARKERS = ["NOW", "LATER", "TODO", "DOING", "IN-PROGRESS", "DONE", "WAITING", "WAIT", "CANCELED", "CANCELLED"];
+export type Workflow = "now" | "todo";
 
 export function nextMarker(marker: string | null, workflow: Workflow): string | null {
   switch (marker) {

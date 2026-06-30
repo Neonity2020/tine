@@ -3,6 +3,8 @@
 // the raw text + selection and returns the new text + selection, so Block.tsx
 // just applies the result to the textarea. Unit-testable.
 
+import { MARKER_RE } from "../markers";
+
 export interface Edit {
   text: string;
   start: number;
@@ -108,7 +110,7 @@ export function killWordBackward(text: string, caret: number): Edit {
 }
 
 // --- priority (sets/replaces `[#A]` after a leading task marker) ---
-const MARKER_RE = /^(NOW|LATER|TODO|DOING|DONE|WAITING|WAIT|CANCELED|CANCELLED|IN-PROGRESS)\b/;
+// MARKER_RE is the shared anchor (src/markers.ts).
 
 /** Set (or replace) the `[#X]` priority on a block's first line, placed after
  *  any task marker. Mirrors OG's add-or-update-priority. */

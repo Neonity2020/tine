@@ -19,6 +19,7 @@ import { upsertPropertyLine, readPropertyValue, splitProps, joinProps, isBuiltin
 import { copyIncludeSubtree, copyStripCollapsed } from "./copySettings";
 import { trimBlockTrailingSpace } from "./editor/format";
 import { renderedBlocks } from "./lazyObserve";
+import { OPEN_MARKERS } from "./markers";
 import {
   markDirty,
   isDirty,
@@ -1941,7 +1942,6 @@ export async function moveSelectionItems(dir: 1 | -1) {
 // Carry unfinished tasks forward (B)
 // ---------------------------------------------------------------------------
 
-const OPEN_MARKERS = new Set(["TODO", "DOING", "NOW", "LATER", "WAITING"]);
 function isOpenTask(id: string): boolean {
   const m = blockView(doc.byId[id]?.raw ?? "").marker;
   return !!m && OPEN_MARKERS.has(m);

@@ -2,19 +2,9 @@
 // authoritative (round-trip); these are computed projections.
 
 import type { Format } from "./ast";
+import { MARKERS, DONE_MARKERS } from "../markers";
 
-export const MARKERS = [
-  "TODO",
-  "DOING",
-  "DONE",
-  "NOW",
-  "LATER",
-  "WAITING",
-  "WAIT",
-  "CANCELED",
-  "CANCELLED",
-  "IN-PROGRESS",
-];
+export { MARKERS };
 
 const PROP_RE = /^[A-Za-z0-9_./-]+::\s?.*$/;
 
@@ -185,7 +175,7 @@ export function blockView(raw: string): BlockView {
   while (lines.length > 1 && lines[0].trim() === "") lines.shift();
   return {
     marker,
-    done: marker === "DONE" || marker === "CANCELED" || marker === "CANCELLED",
+    done: !!marker && DONE_MARKERS.has(marker),
     priority,
     headingLevel,
     lines,
