@@ -249,6 +249,12 @@ fn planning_dates(blocks: &[lsdoc::ast::Block], raw: &str) -> (Option<String>, O
             | Block::Paragraph { inline, span, .. } => (inline, span),
             _ => continue,
         };
+        // Only a STANDALONE planning line is a date badge. lsdoc v0.2.0 also makes a
+        // mid-text `SCHEDULED:` a Timestamp; that's body text, not a badge (and the
+        // frontend keeps it in the body), so this must agree (audit C1).
+        if !is_standalone_planning(inlines) {
+            continue;
+        }
         for i in inlines {
             let Inline::Timestamp { ts, .. } = i else { continue };
             let slot = match ts.as_str() {
@@ -267,6 +273,23 @@ fn planning_dates(blocks: &[lsdoc::ast::Block], raw: &str) -> (Option<String>, O
         }
     }
     (scheduled, deadline)
+}
+
+/// A block whose inline content is ONLY a SCHEDULED/DEADLINE planning timestamp (plus
+/// blank text / line breaks) — the standalone planning line that becomes a date badge.
+/// A mid-text timestamp leaves real content, so it is NOT standalone.
+fn is_standalone_planning(inlines: &[lsdoc::ast::Inline]) -> bool {
+    use lsdoc::ast::Inline;
+    let mut planning = false;
+    for i in inlines {
+        match i {
+            Inline::Timestamp { ts, .. } if ts == "Scheduled" || ts == "Deadline" => planning = true,
+            Inline::Break | Inline::HardBreak => {}
+            Inline::Plain { text } if text.trim().is_empty() => {}
+            _ => return false,
+        }
+    }
+    planning
 }
 
 /// The `<…>` content following a `SCHEDULED:` / `DEADLINE:` keyword in `slice`.

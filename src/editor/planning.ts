@@ -57,6 +57,9 @@ export function normalizePlanning(visible: string, format: Format): string {
     kept.push(line);
   }
   if (planning.length === 0) return visible;
+  // A block that is ONLY planning lines has no first content line to anchor after —
+  // leave it as-is (else `kept[0]` is undefined and the join prepends a blank line).
+  if (kept.length === 0) return visible;
 
   // Canonical order: SCHEDULED before DEADLINE.
   planning.sort((a, b) => (a.startsWith("SCHEDULED") ? 0 : 1) - (b.startsWith("SCHEDULED") ? 0 : 1));

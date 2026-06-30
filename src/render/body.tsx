@@ -11,7 +11,7 @@ import { toggleListItemAtIndex, doc, formatForBlock } from "../store";
 import { graphMeta } from "../ui";
 import { isRenderHiddenProp, isPropertyLine } from "./block";
 import { parserReady } from "./parse";
-import { parseBody } from "./facets";
+import { parseBody, isStandalonePlanning } from "./facets";
 import { observeNear, unobserveNear, renderedBlocks } from "../lazyObserve";
 
 type Align = "left" | "center" | "right" | null;
@@ -352,16 +352,13 @@ function AstList(props: { items: AstListItem[]; blockId?: string; cbItems: AstLi
  *  standalone planning line (lsdoc never makes one mid-text), so dropping any block
  *  that contains one drops exactly the badge lines. */
 function bodyBlocks(raw: string, isOrg: boolean): AstBlock[] {
-  return parseBody(raw, isOrg ? "org" : "md").filter((b) => {
-    if (b.kind === "properties") return false;
-    if (
-      "inline" in b &&
-      Array.isArray(b.inline) &&
-      b.inline.some((i) => i.k === "timestamp" && (i.ts === "Scheduled" || i.ts === "Deadline"))
-    )
-      return false;
-    return true;
-  });
+  // Drop `properties` (chips in chrome) and STANDALONE planning lines (date badges in
+  // chrome). A block with a mid-text/inline `SCHEDULED:` timestamp is NOT standalone —
+  // keep it whole so its body text renders (the old `.some(timestamp)` dropped the
+  // entire bullet, silently eating the text — audit C1).
+  return parseBody(raw, isOrg ? "org" : "md").filter(
+    (b) => b.kind !== "properties" && !isStandalonePlanning(b)
+  );
 }
 
 /** Render a block's body. Parses the WHOLE block's `raw` (re-bulleted like OG, via

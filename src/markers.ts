@@ -34,5 +34,9 @@ export const OPEN_MARKERS: ReadonlySet<string> = new Set(
   MARKERS.filter((m) => !DONE_MARKERS.has(m))
 );
 
-/** A leading task marker at the very start of a line, as a whole word. */
-export const MARKER_RE = new RegExp(`^(${MARKERS.join("|")})\\b`);
+/** A leading task marker at the very start of a line, as a whole word. The marker
+ *  must be followed by whitespace or end-of-line — NOT just a `\b` boundary, which
+ *  would wrongly match `TODO:`, `DONE.`, `WAIT-LIST` (lsdoc marks none of those; the
+ *  carry `isOpenTask` would otherwise move non-task prose). Prefix-safe via the
+ *  MARKERS order (WAITING before WAIT). */
+export const MARKER_RE = new RegExp(`^(${MARKERS.join("|")})(?=\\s|$)`);

@@ -47,6 +47,22 @@ describe("AstBody (no-IO degrade path)", () => {
     await htmlOf(() => AstBody({ raw: "hello", blockId: "blk-latch" }));
     expect(renderedBlocks.has("blk-latch")).toBe(true);
   });
+
+  it("keeps body text around a mid-text/inline planning timestamp — audit C1", async () => {
+    // lsdoc v0.2.0 makes inline SCHEDULED a Timestamp; the old filter dropped the whole
+    // block, eating the text. A non-standalone planning timestamp must stay in the body.
+    const mid = await htmlOf(() => AstBody({ raw: "a paragraph with SCHEDULED: <2026-07-06 Mon> inline", blockId: "c1a" }));
+    expect(mid).toContain("a paragraph with");
+    expect(mid).toContain("inline");
+    const after = await htmlOf(() => AstBody({ raw: "just text\nSCHEDULED: <2026-07-06 Mon>\nmore text after", blockId: "c1b" }));
+    expect(after).toContain("more text after");
+  });
+
+  it("still drops a STANDALONE planning line from the body (it's a date badge)", async () => {
+    const h = await htmlOf(() => AstBody({ raw: "TODO ship it\nSCHEDULED: <2026-07-06 Mon>", blockId: "c1c" }));
+    expect(h).toContain("ship it");
+    expect(h).not.toContain("2026-07-06"); // standalone planning line → badge, not body
+  });
 });
 
 describe("estimateBodyReserve (placeholder height proxy)", () => {

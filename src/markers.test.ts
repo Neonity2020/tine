@@ -38,4 +38,14 @@ describe("task markers (single source of truth)", () => {
     // A non-marker word isn't matched.
     expect(MARKER_RE.exec("TODOLIST x")).toBeNull();
   });
+
+  it("does NOT match a marker word followed by punctuation — audit C2 (carry overmatch)", () => {
+    // `\b` matched these (lsdoc marks none); the carry `isOpenTask` would move non-task
+    // prose. The marker must be followed by whitespace or end-of-line.
+    expect(MARKER_RE.exec("TODO: not a task")).toBeNull();
+    expect(MARKER_RE.exec("DONE. a sentence")).toBeNull();
+    expect(MARKER_RE.exec("WAIT-LIST item")).toBeNull();
+    expect(MARKER_RE.exec("TODO real task")?.[1]).toBe("TODO");
+    expect(MARKER_RE.exec("DONE")?.[1]).toBe("DONE"); // bare marker at end-of-line
+  });
 });

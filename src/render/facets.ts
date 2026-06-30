@@ -121,26 +121,43 @@ function deriveFacets(raw: string, format: Format): Facets {
   };
 }
 
-/** SCHEDULED/DEADLINE display text, gated on lsdoc emitting a real `Timestamp` (so a
- *  `SCHEDULED:` inside inline code, parsed as `Code`, is never badged) — then the
- *  faithful `<…>` text is read from `raw` by an ASCII-safe regex (NOT a byte-span
- *  slice: lsdoc spans are byte offsets, JS string indices are UTF-16 units). The
- *  backend ships these for loaded blocks; this only runs for the edited block. */
+/** A block whose inline content is ONLY a SCHEDULED/DEADLINE planning timestamp
+ *  (plus blank text / line breaks) — the standalone planning line that becomes a date
+ *  BADGE (and is dropped from the rendered body). lsdoc v0.2.0 also makes a MID-TEXT
+ *  `SCHEDULED: <…>` a real `Timestamp`; such a block has other content, so it is NOT
+ *  standalone — it must render normally (the timestamp inline in place), never be
+ *  dropped (that silently ate body text) or badged. */
+export function isStandalonePlanning(b: Block): boolean {
+  if (!("inline" in b) || !Array.isArray(b.inline) || b.inline.length === 0) return false;
+  let planning = false;
+  for (const i of b.inline) {
+    if (i.k === "timestamp" && (i.ts === "Scheduled" || i.ts === "Deadline")) {
+      planning = true;
+      continue;
+    }
+    if (i.k === "break" || i.k === "hardbreak") continue;
+    if (i.k === "plain" && i.text.trim() === "") continue;
+    return false; // real content alongside the timestamp → not standalone
+  }
+  return planning;
+}
+
+/** SCHEDULED/DEADLINE display text for the date badge — ONLY from a standalone planning
+ *  line (a mid-text or inline-code `SCHEDULED:` is body text, not a badge). The faithful
+ *  `<…>` text is read from `raw` by an ASCII-safe regex (NOT a byte-span slice: lsdoc
+ *  spans are byte offsets, JS string indices are UTF-16 units). The backend ships these
+ *  for loaded blocks; this only runs for the edited block. */
 function planningDates(blocks: Block[], raw: string): { scheduled: string | null; deadline: string | null } {
-  const hasTs = (kind: string) =>
-    blocks.some(
-      (b) =>
-        "inline" in b &&
-        Array.isArray(b.inline) &&
-        b.inline.some((i) => i.k === "timestamp" && i.ts === kind)
-    );
+  const standalone = blocks.filter(isStandalonePlanning);
+  const has = (kind: string) =>
+    standalone.some((b) => "inline" in b && b.inline.some((i) => i.k === "timestamp" && i.ts === kind));
   const grab = (kw: string): string | null => {
     const m = new RegExp(kw + "\\s*<([^>]+)>").exec(raw);
     return m ? m[1] : null;
   };
   return {
-    scheduled: hasTs("Scheduled") ? grab("SCHEDULED:") : null,
-    deadline: hasTs("Deadline") ? grab("DEADLINE:") : null,
+    scheduled: has("Scheduled") ? grab("SCHEDULED:") : null,
+    deadline: has("Deadline") ? grab("DEADLINE:") : null,
   };
 }
 
