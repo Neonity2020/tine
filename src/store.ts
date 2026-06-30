@@ -35,6 +35,7 @@ import {
   forgetSaveState,
   resetSaveState,
   isSaving,
+  holdSourcesForDest,
 } from "./persistence";
 // The debounced persistence engine lives in persistence.ts; re-exported here so
 // the rest of the app keeps importing the save API from the store.
@@ -1864,14 +1865,14 @@ function crossMoveBlocks(ids: string[], fromPage: string, toPage: string, dir: 1
  *  removed from its source but never written to its destination (the data-losing
  *  state). dest is marked dirty immediately; each source only once dest succeeds. */
 function persistCrossPage(dest: string, sources: string[]) {
+  // Hold the sources' saves until `dest` is durable (audit C#1), so a concurrent edit to
+  // a source during the dest-write window can't write its post-removal state before the
+  // block exists in the dest. On dest success, doSave → releaseSourcesFor frees +
+  // reschedules the sources; on dest conflict/failure they stay held (the block is kept
+  // on disk in the source) until the dest conflict is resolved and it saves durably.
+  holdSourcesForDest(dest, sources);
   markDirty(dest);
-  void (async () => {
-    if (!(await flushPage(dest))) return; // dest conflict/failure → leave sources on disk
-    for (const s of sources) {
-      if (s !== dest) markDirty(s);
-    }
-    scheduleSave();
-  })();
+  void flushPage(dest);
 }
 
 /** Before a cross-page move mutates memory, durably flush every SOURCE page while

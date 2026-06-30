@@ -35,6 +35,15 @@ let graphToken = 0;
 const saveChain = new Map<string, Promise<boolean>>();
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
 let dataRevTimer: ReturnType<typeof setTimeout> | null = null;
+// Cross-page move barrier (audit C#1): while a moved subtree's DESTINATION write is not
+// yet durable, the SOURCE pages must not save their post-removal state — otherwise an
+// UNRELATED edit to a source during the dest-write window marks it dirty and writes the
+// block out of existence (gone from the source on disk, not yet in the dest). `heldSources`
+// = pages whose saves are blocked; `heldByDest` maps each dest to the sources waiting on
+// it, released the moment that dest saves durably (immediately, or after a conflict is
+// resolved). Until then the source keeps the block on disk, so it's never lost.
+const heldSources = new Set<string>();
+const heldByDest = new Map<string, string[]>();
 
 // ---------------------------------------------------------------------------
 // Accessors — store.ts mutations call these instead of touching the guards.
@@ -62,6 +71,29 @@ export function dirtyPages(): Iterable<string> {
  *  flush the source first so it isn't written after being emptied). */
 export function isSaving(name: string): boolean {
   return saveChain.has(name);
+}
+/** Hold `sources`' saves until `dest` is durably written (cross-page move barrier,
+ *  audit C#1). `releaseSourcesFor(dest)` fires from doSave's success path. */
+export function holdSourcesForDest(dest: string, sources: string[]) {
+  const srcs = sources.filter((s) => s !== dest);
+  if (srcs.length === 0) return;
+  heldByDest.set(dest, srcs);
+  for (const s of srcs) heldSources.add(s);
+}
+/** Dest saved durably → let its held sources persist their post-removal state now
+ *  (the block is on disk in the dest, so removing it from the source loses nothing). */
+function releaseSourcesFor(dest: string) {
+  const srcs = heldByDest.get(dest);
+  if (!srcs) return;
+  heldByDest.delete(dest);
+  let any = false;
+  for (const s of srcs) {
+    if (heldSources.delete(s)) {
+      dirty.add(s); // its removal (and any held edit) can write now
+      any = true;
+    }
+  }
+  if (any) scheduleSave();
 }
 /** Record a page's load/save baseline rev (set on load and after each save). */
 export function setBaseRev(name: string, rev: string | null) {
@@ -96,6 +128,8 @@ export function resetSaveState() {
   dirty.clear();
   baseRev.clear();
   deletedPages.clear();
+  heldSources.clear();
+  heldByDest.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -130,6 +164,9 @@ async function doSave(name: string, force: boolean): Promise<boolean> {
   if (deletedPages.has(name)) return true; // tombstoned — never recreate a deleted page
   if (!force && !dirty.has(name)) return true; // already saved by a prior link
   if (isConflicted(name) && !force) return false;
+  // A cross-page move source: hold its save until the destination is durable (C#1).
+  // Stays dirty, so it writes the moment `releaseSourcesFor(dest)` frees it.
+  if (heldSources.has(name) && !force) return false;
   const token = graphToken;
   const dto = pageToDto(name);
   if (!dto) return false;
@@ -137,6 +174,7 @@ async function doSave(name: string, force: boolean): Promise<boolean> {
   try {
     const rev = await backend().savePage(dto, baseRev.get(name) ?? null, force);
     if (token === graphToken) baseRev.set(name, rev);
+    releaseSourcesFor(name); // if this was a cross-page dest, its sources can save now
     return true;
   } catch (e) {
     if (String(e).includes("conflict")) {
