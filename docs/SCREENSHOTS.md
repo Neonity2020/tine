@@ -47,6 +47,8 @@ Scripts write to the gitignored `screenshots/` dir; the README set is then
 | `quick-capture.png`  | Quick-capture mini-window with slash menu open     | `shot-capture.mjs` → `rm-quick-capture.png`      | capture window, slash menu, or editor-parity changes |
 | `pdf.png`            | PDF pane + text highlight + area (image) highlight | `shot-tabs-pdf.mjs` → `feat-pdf.png`             | PDF viewer, highlight rendering (text/area), or pane layout changes |
 | `settings.png`       | Settings modal (shortcuts shown)                   | settings shot (curated)                          | Settings modal gains/loses controls (**watch mode, first-day-of-week**, themes, snapshots) |
+| `calc.png`           | Live `/calc` block (inputs, results, a variable)   | `shot-stills.mjs` → `feat-calc.png`              | calc rendering (line numbers, result column) changes |
+| `callouts.png`       | Colored note / warning / tip callouts              | `shot-stills.mjs` → `feat-callouts.png`          | callout colors/title/body styling changes |
 
 ## Known limitations / honest caveats
 
@@ -63,7 +65,7 @@ Scripts write to the gitignored `screenshots/` dir; the README set is then
 
 ## Currently unillustrated (candidates for new README shots)
 
-These shipped without a screenshot — add one if the README would benefit:
-`/calc` blocks, callouts (org `#+BEGIN_…` / `> [!note]`), the sidebar namespace
-tree, advanced (datalog) query results. (Tabs, dim, carry, queries+builder, and
-text+area PDF highlights are now illustrated.)
+These shipped without a screenshot — add one if the site would benefit: the
+sidebar namespace tree, advanced (datalog) query results. (Tabs, dim, carry,
+queries+builder, text+area PDF highlights, `/calc` blocks, and callouts are now
+illustrated — calc + callouts via `scripts/shot-stills.mjs`.)
