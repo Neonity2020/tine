@@ -2111,38 +2111,16 @@ impl Graph {
             .or_else(|| legacy_page.as_ref().and_then(|p| fs::read_to_string(p).ok()));
         let existing = existing_raw.as_deref().map(doc::parse);
         let page_doc = crate::pdf::merge_hls_page(existing.as_ref(), pdf_filename, label, &merged);
-        let mut page_md = doc::serialize(&page_doc);
-        // Preserve the notes page's CRLF endings (see write_page), so re-saving a
-        // highlight doesn't flip a Windows-edited hls__ page to LF.
-        if existing_raw.as_deref().is_some_and(|e| e.contains("\r\n")) && !page_md.contains('\r') {
-            page_md = page_md.replace('\n', "\r\n");
-        }
-        fs::create_dir_all(self.pages_path())?;
-        // The hls page is a normal watched page. Record this write so the file
-        // watcher recognizes it as ours — otherwise saving a highlight trips a
-        // false "changed on disk" on the notes page (see write_page /
-        // sync_file_content). The .edn lives under assets/ which isn't watched.
-        let page_rev = content_rev(&page_md);
-        self.note_self_write(&page_path, page_rev.clone());
-        // A3-style last-moment recheck (mirror write_page): we hold the page lock,
-        // so no Tine writer raced us — but a non-cooperating external writer (OG /
-        // Syncthing) could have added a note to the hls page between `page_baseline`
-        // above and now. `merge_hls_page` only carried notes from the bytes we read,
-        // so writing would clobber that external note. Re-read and, if it changed,
-        // abort with a conflict (dropping our self-write marker) rather than
-        // overwrite. The caller (PdfViewer.persist) toasts + reverts; a retry
-        // re-reads the now-current page and merges it cleanly. The .edn was already
-        // written 3-way-merged above, so no highlight is lost — only the page-note
-        // mirror is deferred to the retry.
-        let now = fs::read_to_string(&page_path).ok();
-        if now.as_deref() != page_baseline.as_deref() {
-            let mut recent = self.recent_writes.lock().unwrap();
-            if recent.get(&page_path).is_some_and(|r| *r == page_rev) {
-                recent.remove(&page_path);
-            }
-            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "conflict"));
-        }
-        atomic_write(&page_path, page_md.as_bytes())?;
+        // Preserve the notes page's CRLF (shared with write_page), then go through
+        // the shared write commit (self-write marker → A3 recheck vs `page_baseline`
+        // → atomic_write). The recheck is mandatory here precisely because this path
+        // lacked save_page's guard: a non-cooperating external writer (OG / Syncthing)
+        // could have added a note between `page_baseline` and now, and merge_hls_page
+        // only carried notes from the bytes we read — so an overwrite would clobber it.
+        // On mismatch → conflict; PdfViewer.persist toasts + reverts and a retry merges
+        // cleanly (the .edn was already 3-way-merged, so no highlight is lost).
+        let page_md = preserve_crlf(doc::serialize(&page_doc), existing_raw.as_deref());
+        let page_rev = self.commit_write(&page_path, &page_md, page_baseline.as_deref(), true)?;
         // The hls page is a real page; reflect it in the search cache.
         let name = crate::pdf::hls_page_name(&key);
         let entry = self.find_entry(&name, PageKind::Page).unwrap_or(PageEntry {
@@ -2152,15 +2130,9 @@ impl Graph {
             path: page_path.clone(),
         });
         self.cache_upsert(entry, page_doc, page_rev.clone());
-        // Drop the self-write marker now the write is published (see write_page):
-        // bound it to its write window so it can't linger and later suppress a real
-        // external change. Remove only if it's still ours.
-        {
-            let mut recent = self.recent_writes.lock().unwrap();
-            if recent.get(&page_path).is_some_and(|r| *r == page_rev) {
-                recent.remove(&page_path);
-            }
-        }
+        // Drop the self-write marker now the write is published + cached (see
+        // write_page / drop_self_write_marker).
+        self.drop_self_write_marker(&page_path, &page_rev);
         // Migrate-on-write: the new-key artifacts now durably carry everything
         // from the legacy-key files (highlights above, user notes via
         // `merge_hls_page`), so remove the stale legacy files to avoid leaving a
@@ -2216,6 +2188,56 @@ impl Graph {
             recent.clear();
         }
         recent.insert(path.to_path_buf(), rev);
+    }
+
+    /// Drop the self-write marker for `path` once a write is fully published (after
+    /// the cache_upsert), bounding it to its write window so it can never outlive
+    /// this save and later suppress a real external change. Removes it only if it's
+    /// still OURS (a concurrent same-path writer may have replaced it).
+    fn drop_self_write_marker(&self, path: &Path, rev: &str) {
+        let mut recent = self.recent_writes.lock().unwrap();
+        if recent.get(path).is_some_and(|r| r == rev) {
+            recent.remove(path);
+        }
+    }
+
+    /// The shared page-write commit protocol, written ONCE so `write_page` and
+    /// `write_highlights` can't drift apart on it (a missed step = a stale marker
+    /// suppressing a real external edit, or a phantom conflict):
+    ///   record self-write marker → ensure parent dir → (A3) optional last-moment
+    ///   recheck that disk still == `baseline` → atomic_write.
+    /// We hold the page lock, so no other Tine writer raced us; the recheck guards
+    /// a non-cooperating external writer (OG/Syncthing) that touched the file since
+    /// our baseline read — on mismatch we abort WITHOUT writing and drop our marker
+    /// so the watcher still sees the external change. Returns the new content rev.
+    /// The post-publish marker drop is `drop_self_write_marker` (it must run AFTER
+    /// the caller's cache_upsert, so it stays the caller's responsibility).
+    fn commit_write(
+        &self,
+        path: &Path,
+        content: &str,
+        baseline: Option<&str>,
+        recheck: bool,
+    ) -> io::Result<String> {
+        let rev = content_rev(content);
+        self.note_self_write(path, rev.clone());
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        if recheck {
+            let now = fs::read_to_string(path).ok();
+            let still_matches = match (now.as_deref(), baseline) {
+                (Some(n), Some(e)) => n == e,
+                (None, None) => true,
+                _ => false,
+            };
+            if !still_matches {
+                self.drop_self_write_marker(path, &rev);
+                return Err(io::Error::new(io::ErrorKind::AlreadyExists, "conflict"));
+            }
+        }
+        atomic_write(path, content.as_bytes())?;
+        Ok(rev)
     }
 
     /// Reconcile a (possibly externally-changed) file with the in-memory cache.
@@ -2481,15 +2503,10 @@ impl Graph {
                         content = e.to_string();
                     }
                 }
-                // CRLF preservation: if the existing file uses Windows line
-                // endings, emit them too — so a real edit produces a minimal diff
-                // instead of flipping every line LF (Syncthing churn vs a Windows
-                // editor). No-op saves already kept the existing bytes verbatim
-                // (A5 above), so guard against double-converting. New files = LF.
-                if existing.is_some_and(|e| e.contains("\r\n")) && !content.contains('\r') {
-                    content = content.replace('\n', "\r\n");
-                }
-                content
+                // CRLF preservation (shared with write_highlights). No-op saves
+                // already kept the existing bytes verbatim (A5 above), so this can't
+                // double-convert.
+                preserve_crlf(content, existing)
             }
             Format::Org => {
                 // Corruption firewall: never write a .org file Tine cannot
@@ -2509,45 +2526,19 @@ impl Graph {
                 crate::org::serialize_org_detect(&doc, existing)
             }
         };
-        let rev = content_rev(&content);
         // No-op save: identical bytes already on disk (e.g. focus/blur with no real
         // edit, or a forced flush of an unchanged page). Skip the write, the
         // watcher record, AND — crucially — the cache update below.
         let changed = existing != Some(content.as_str());
-        if changed {
-            // Record what we're about to write BEFORE it lands, so the file watcher
-            // (which reads files outside the cache lock) recognizes these exact
-            // bytes as our own write during the window between the atomic rename
-            // and the `cache_upsert` below — otherwise it reads disk-ahead-of-cache
-            // and flags Tine's own save as an external change (false conflict).
-            self.note_self_write(&path, rev.clone());
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            // A3: last-moment recheck. We hold this page's lock, so no other Tine
-            // writer can have touched the file since our baseline read — but a
-            // non-cooperating external writer (OG/Syncthing) might have. Re-read and
-            // confirm the file still matches the bytes we were authorized against
-            // (`existing`); if it changed, abort WITHOUT writing and drop our marker
-            // so the watcher still sees the external change. `force_save_page` skips
-            // this (recheck=false) so "keep mine" overwrites unconditionally.
-            if recheck {
-                let now = fs::read_to_string(&path).ok();
-                let still_matches = match (now.as_deref(), existing) {
-                    (Some(n), Some(e)) => n == e,
-                    (None, None) => true,
-                    _ => false,
-                };
-                if !still_matches {
-                    let mut recent = self.recent_writes.lock().unwrap();
-                    if recent.get(&path).is_some_and(|r| *r == rev) {
-                        recent.remove(&path);
-                    }
-                    return Err(io::Error::new(io::ErrorKind::AlreadyExists, "conflict"));
-                }
-            }
-            atomic_write(&path, content.as_bytes())?;
-        }
+        // The shared commit protocol (marker → A3 recheck vs `existing` →
+        // atomic_write); `force_save_page` passes recheck=false so "keep mine"
+        // overwrites unconditionally. On a no-op, just hash the unchanged bytes for
+        // the returned/cached rev — no write, no marker.
+        let rev = if changed {
+            self.commit_write(&path, &content, existing, recheck)?
+        } else {
+            content_rev(&content)
+        };
         // Touch the cache only when the bytes changed, or the page isn't in an
         // already-built cache yet (fold a cold page in). A no-op save of an
         // already-cached page MUST NOT call cache_upsert: it bumps `cache_gen`,
@@ -2599,19 +2590,11 @@ impl Graph {
             };
             self.cache_upsert(entry, cache_doc, rev.clone());
         }
-        // Drop the self-write marker now that the write is published. It only had
-        // to cover the window between the atomic write above and the cache_upsert
-        // just done; disk_revs now suppresses the watcher. Removing it here (rather
-        // than leaving it for the watcher to consume) bounds the marker to its
-        // write window, so it can never outlive this save and later suppress a real
-        // external change that happens to restore these exact bytes (e.g. a
-        // delete+recreate, or a cold-cache save). Remove only if it's still OURS — a
-        // concurrent same-path writer may have replaced it.
+        // Drop the self-write marker now the write is published + cached (it only
+        // had to cover the atomic-write → cache_upsert window; disk_revs now
+        // suppresses the watcher). See drop_self_write_marker.
         if changed {
-            let mut recent = self.recent_writes.lock().unwrap();
-            if recent.get(&path).is_some_and(|r| *r == rev) {
-                recent.remove(&path);
-            }
+            self.drop_self_write_marker(&path, &rev);
         }
         // The new baseline rev = hash of exactly what's now on disk (the content we
         // serialized, or the identical existing bytes on a no-op) — no re-read.
@@ -2641,6 +2624,19 @@ fn top_level_asset_name(name: &str) -> io::Result<()> {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "bad asset name"));
     }
     Ok(())
+}
+
+/// Preserve a file's CRLF line endings on re-write: if `existing` used Windows
+/// endings and the freshly-serialized `content` is all-LF, convert it back, so a
+/// real edit produces a minimal diff instead of flipping every line (Syncthing
+/// churn vs a Windows editor). New files stay LF. Shared by write_page +
+/// write_highlights so the two can't drift on it.
+fn preserve_crlf(content: String, existing: Option<&str>) -> String {
+    if existing.is_some_and(|e| e.contains("\r\n")) && !content.contains('\r') {
+        content.replace('\n', "\r\n")
+    } else {
+        content
+    }
 }
 
 /// Read + parse one page file into (entry, doc, content_rev), or `None` if the
