@@ -1,7 +1,7 @@
 // Block-body rendering: splits a block's text lines into paragraphs, fenced
 // code blocks (syntax-highlighted), and markdown tables.
 
-import { For, Show, createMemo, createResource, type JSX } from "solid-js";
+import { For, Show, createMemo, createResource, createSignal, onCleanup, type JSX } from "solid-js";
 import { Dynamic } from "solid-js/web";
 import { InlineText, renderInlines, renderRawHtml, MathView } from "./inline";
 import type { Block as AstBlock, ListItem as AstListItem, Format } from "./ast";
@@ -9,6 +9,7 @@ import { backend } from "../backend";
 import { evalCalc } from "../editor/calc";
 import { toggleListItemAtIndex, doc, formatForBlock } from "../store";
 import { parseBlock, parserReady } from "./parse";
+import { observeNear, unobserveNear, renderedBlocks } from "../lazyObserve";
 
 type Align = "left" | "center" | "right" | null;
 
@@ -355,11 +356,74 @@ function AstList(props: { items: AstListItem[]; blockId?: string; cbItems: AstLi
  *  "renderer failed" banner — plan §7C), so content is never silently blank. */
 export function AstBody(props: { lines: string[]; blockId?: string; format?: Format; headingLevel?: number | null }): JSX.Element {
   const text = createMemo(() => props.lines.join("\n"));
+  // P1 block-render virtualization (see docs/adr): defer the synchronous parse +
+  // AST→DOM build until the block is near the viewport. Until then, show the raw
+  // text in the SAME `.ast-fallback` span the parser-not-ready path uses (a good
+  // height proxy for prose). Render-once-keep: once a block has rendered (latched
+  // by id in `renderedBlocks`) it renders eagerly forever — no second
+  // placeholder↔real transition, so zero scroll-height churn (the content-visibility
+  // flicker trap). A block with no id (not the body path) renders eagerly.
+  const id = props.blockId;
+  const [near, setNear] = createSignal(id == null || renderedBlocks.has(id));
+  let deferredEl: Element | undefined;
+  const observe = (el: Element) => {
+    deferredEl = el;
+    observeNear(el, () => {
+      if (id != null) renderedBlocks.add(id);
+      setNear(true);
+    });
+  };
+  // Robust cleanup: if the block unmounts (page/tab switch, collapse, zoom) while
+  // still deferred, stop observing so the IntersectionObserver doesn't pin the
+  // detached element. Once `near`, observeNear already unobserved (one-shot), so
+  // this is a no-op.
+  onCleanup(() => {
+    if (deferredEl) unobserveNear(deferredEl);
+  });
   return (
-    <Show when={parserReady()} fallback={<span class="ast-fallback">{text()}</span>}>
-      {renderBlocks(parseBlock(text(), props.format === "org"), props.blockId, props.headingLevel)}
+    <Show
+      when={near()}
+      fallback={
+        <span
+          class="ast-fallback ast-deferred"
+          style={estimateBodyReserve(props.lines, props.headingLevel ?? null)}
+          ref={observe}
+        >
+          {text()}
+        </span>
+      }
+    >
+      <Show when={parserReady()} fallback={<span class="ast-fallback">{text()}</span>}>
+        {renderBlocks(parseBlock(text(), props.format === "org"), props.blockId, props.headingLevel)}
+      </Show>
     </Show>
   );
+}
+
+/** A cheap `min-height` for the deferred (raw-text) placeholder, so the one-time
+ *  first render-in doesn't visibly jump for constructs whose raw text is a poor
+ *  height proxy. Prose / lists / fenced code / tables: raw line-count ≈ rendered,
+ *  so no reserve. Headings render larger than their body-size raw line; display
+ *  math (`$$…$$`) and media embeds render much taller than their single raw line.
+ *  Pure — NO DOM measurement (a re-measure loop is the content-visibility trap
+ *  that was reverted in e2cdfc7). Values are approximate; the goal is to shrink,
+ *  not eliminate, the first-view delta. */
+export function estimateBodyReserve(lines: string[], headingLevel: number | null): JSX.CSSProperties | undefined {
+  if (headingLevel != null) {
+    // h1 ≈ 2.1em … h6 ≈ 1.3em, tracking the heading scale in app.css.
+    const em = Math.max(1.3, 2.1 - (headingLevel - 1) * 0.15);
+    return { "min-height": `${em.toFixed(2)}em` };
+  }
+  for (const l of lines) {
+    const t = l.trim();
+    // Display math renders as a centered block ~2.4em tall from one raw `$$` line.
+    if (t.startsWith("$$")) return { "min-height": "2.4em" };
+    // Image/video/audio embed renders a media box far taller than `![](…)`. The
+    // true height is decode-driven (and already reflows on load today), so this is
+    // a rough typical to narrow the gap, not an exact reservation.
+    if (/!\[[^\]]*\]\([^)]+\)/.test(t)) return { "min-height": "6em" };
+  }
+  return undefined;
 }
 
 // Flip the `cbIndex`-th checkbox of the block: find the cbIndex-th `[ ]`/`[x]`

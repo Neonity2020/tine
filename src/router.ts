@@ -17,6 +17,7 @@ import {
 } from "./ui";
 import { doc, persistentBlockRef } from "./store";
 import { backend } from "./backend";
+import { renderedBlocks } from "./lazyObserve";
 
 export type Route =
   | { kind: "journals" }
@@ -218,6 +219,10 @@ export function focusBlock(id: string | null) {
 /** Open a page and scroll the given block into view (block search results jump
  *  to the specific block, not just the page top). */
 export function openPageAtBlock(name: string, pageKind: "journal" | "page", blockId: string) {
+  // Pre-latch the target so its body renders eagerly (not as a deferred raw-text
+  // placeholder) — a heavy target (table/image) then lands at its true height
+  // instead of growing after the scroll. See AstBody / docs/adr (P1 lazy body).
+  renderedBlocks.add(blockId);
   openPage(name, pageKind);
   // Let the page render, then scroll + briefly highlight the target block.
   let tries = 0;

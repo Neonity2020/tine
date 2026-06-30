@@ -18,6 +18,7 @@ import { journalTitle } from "./journal";
 import { upsertPropertyLine, readPropertyValue, splitProps, joinProps, isBuiltinHidden } from "./editor/properties";
 import { copyIncludeSubtree, copyStripCollapsed } from "./copySettings";
 import { trimBlockTrailingSpace } from "./editor/format";
+import { renderedBlocks } from "./lazyObserve";
 import {
   markDirty,
   isDirty,
@@ -776,6 +777,12 @@ export function clearFocusSurface(id: string) {
 }
 
 export function startEditing(id: string, offset: number, owner: string | null = null) {
+  // Latch the block so that when editing ends its body renders eagerly (no
+  // deferred raw-text placeholder frame on blur). A just-created block goes
+  // straight to the editor and is never rendered through AstBody first, so without
+  // this it would briefly show its raw text on blur while the IntersectionObserver
+  // catches up. See AstBody / src/lazyObserve.ts (P1 lazy body).
+  renderedBlocks.add(id);
   setSelAnchor(null);
   setSelFocus(null);
   setCaretTarget({ id, offset });

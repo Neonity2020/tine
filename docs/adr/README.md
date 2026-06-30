@@ -34,3 +34,4 @@ see the project `CLAUDE.md`.
 | [0005](0005-lsdoc-separate-parser-crate.md) | `lsdoc`: a separate, public mldoc reimplementation | Accepted |
 | [0006](0006-in-browser-wasm-parsing.md) | Parse in the browser via `lsdoc` compiled to WASM (vendored) | Accepted |
 | [0007](0007-data-safety-invariants.md) | Data-safety invariants: never silently overwrite | Accepted |
+| [0008](0008-lazy-block-body-rendering.md) | Lazy block-body rendering (render-once-keep), not windowing | Accepted |

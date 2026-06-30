@@ -3,39 +3,11 @@ import { backend } from "../backend";
 import { doc, ensurePageLoaded, pageByName } from "../store";
 import { Block } from "./Block";
 import { RefBlocks } from "./RefBlocks";
+import { observeNear, unobserveNear } from "../lazyObserve";
 import type { BlockDto, PageKind } from "../types";
 
-// One shared IntersectionObserver for ALL live-ref groups — a broad query/backlink
-// set would otherwise spin up O(groups) observers. Each group registers a one-shot
-// "near the viewport" callback; the observer unobserves it once fired.
-const nearCbs = new WeakMap<Element, () => void>();
-let sharedNearIO: IntersectionObserver | null = null;
-function observeNear(el: Element, cb: () => void) {
-  if (!sharedNearIO) {
-    sharedNearIO = new IntersectionObserver(
-      (entries) => {
-        for (const e of entries) {
-          if (!e.isIntersecting) continue;
-          const fn = nearCbs.get(e.target);
-          if (fn) {
-            nearCbs.delete(e.target);
-            sharedNearIO!.unobserve(e.target);
-            fn();
-          }
-        }
-      },
-      { rootMargin: "1200px 0px" }
-    );
-  }
-  nearCbs.set(el, cb);
-  sharedNearIO.observe(el);
-}
-function unobserveNear(el: Element) {
-  if (sharedNearIO && nearCbs.has(el)) {
-    nearCbs.delete(el);
-    sharedNearIO.unobserve(el);
-  }
-}
+// The "near the viewport" lazy-mount observer is shared app-wide (block bodies
+// use it too) — see src/lazyObserve.ts.
 
 // Renders result/backlink/embed blocks as LIVE editable <Block>s, but LAZILY:
 // the group is a reserved-height placeholder until it scrolls within ~1.2 screens

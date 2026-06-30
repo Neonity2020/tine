@@ -224,6 +224,43 @@ const NAMED: PageDto[] = [
   },
 ];
 
+// A large synthetic page (~2000 root blocks) cycling through construct types, for
+// the lazy-body virtualization harness: most blocks start as deferred raw-text
+// placeholders and only parse/render on scroll. Gated behind `?big` so it never
+// pollutes the normal mock screenshots (it would otherwise show up in All-Pages /
+// quick-switch). Reach it with `…/?big` then quick-switch (Ctrl+K) to "Big".
+function bigPageBlocks(n: number): BlockDto[] {
+  const out: BlockDto[] = [];
+  for (let i = 0; i < n; i++) {
+    switch (i % 6) {
+      case 0:
+        out.push(b(`Paragraph **${i}** with *emphasis*, a [[ref ${i % 50}]] and a #tag${i % 20}.`));
+        break;
+      case 1:
+        out.push(b(`## Heading ${i}`));
+        break;
+      case 2:
+        out.push(b("```js\nfunction f" + i + "(x) {\n  return x * " + i + ";\n}\n```"));
+        break;
+      case 3:
+        out.push(b(`| Col A | Col B |\n| --- | --- |\n| row ${i} | val ${i} |\n| row ${i + 1} | val ${i + 1} |`));
+        break;
+      case 4:
+        out.push(b(`Display math: $$\\sum_{k=0}^{${i}} k = \\frac{${i}(${i}+1)}{2}$$`));
+        break;
+      default:
+        out.push(
+          b(`Block ${i}: a longer line of prose that wraps so the placeholder height is a realistic proxy for the rendered paragraph, with a [[link ${i % 30}]].`)
+        );
+        break;
+    }
+  }
+  return out;
+}
+if (typeof location !== "undefined" && /[?&]big\b/.test(location.search)) {
+  NAMED.push({ name: "Big", kind: "page", title: "Big", pre_block: "title:: Big", blocks: bigPageBlocks(2000) });
+}
+
 const mockHighlights: Record<string, { label: string; highlights: Highlight[] }> = {};
 // In-memory UI session for the browser mock (no backend file).
 let mockSession: string | null = null;

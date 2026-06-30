@@ -48,7 +48,10 @@ body {
   color: #fff;
   text-align: center;
 }
-/* Raw block text shown when the parser isn't ready (paired with the banner). */
+/* Raw block text shown when the parser isn't ready (paired with the banner) and,
+   with `.ast-deferred`, while a block's body is lazily deferred until it scrolls
+   near the viewport (P1 block-render virtualization — see src/render/body.tsx).
+   Same look in both cases; `.ast-deferred` is purely a hook for the test harness. */
 .ast-fallback {
   white-space: pre-wrap;
 }
