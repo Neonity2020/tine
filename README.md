@@ -244,6 +244,9 @@ coverage of advanced Datalog queries** (a scoped subset works today — see abov
 **Out of scope (by design):** whiteboards, flashcards, the plugin system, built-in git, and a
 native mobile app — Tine coexists with Logseq mobile over your own sync instead of replacing it.
 
+The full working backlog — what's next, what's deferred, and what's explicitly WONTFIX — lives in
+[`docs/BACKLOG.md`](docs/BACKLOG.md).
+
 ## Acknowledgements
 
 Tine is an independent reimplementation, not a fork — the codebase is original Rust + SolidJS and
