@@ -14,9 +14,47 @@ export const isBuiltinHidden = (key: string): boolean => BUILTIN_HIDDEN.has(key)
 /** Hide every property (annotation blocks edit only their text). */
 export const hideAll = (_key: string): boolean => true;
 
+const FENCE_RE = /^\s*(`{3,}|~{3,})/;
+
+function fenceMarker(line: string): string | null {
+  const m = FENCE_RE.exec(line);
+  return m ? m[1][0] : null;
+}
+
+function fenceTransition(
+  fence: string | null,
+  line: string
+): { opens: boolean; closes: boolean; next: string | null } {
+  const ch = fenceMarker(line);
+  if (ch === null) return { opens: false, closes: false, next: fence };
+  if (fence === null) return { opens: true, closes: false, next: ch };
+  if (ch === fence) return { opens: false, closes: true, next: null };
+  return { opens: false, closes: false, next: fence };
+}
+
 function propLineKey(line: string): string | null {
   const m = /^\s*([A-Za-z0-9_./-]+)::/.exec(line);
   return m ? m[1].toLowerCase() : null;
+}
+
+/** Whether a textarea caret offset is inside a fenced code region. The fence
+ *  delimiter lines themselves are outside; the content lines between them are
+ *  inside, including an unterminated fence while the user is editing. */
+export function caretInFence(raw: string, offset: number): boolean {
+  const target = Math.max(0, Math.min(offset, raw.length));
+  let fence: string | null = null;
+  let pos = 0;
+  while (pos <= raw.length) {
+    const nl = raw.indexOf("\n", pos);
+    const end = nl === -1 ? raw.length : nl;
+    const line = raw.slice(pos, end);
+    const t = fenceTransition(fence, line);
+    if (target <= end) return fence !== null && !t.closes;
+    fence = t.next;
+    if (nl === -1) break;
+    pos = end + 1;
+  }
+  return fence !== null;
 }
 
 /** Split a block's raw into the editor-visible text and the hidden property
@@ -33,11 +71,9 @@ export function splitProps(
   const hid: string[] = [];
   let fence: string | null = null;
   for (const l of raw.split("\n")) {
-    const fm = /^\s*(`{3,}|~{3,})/.exec(l);
-    if (fm) {
-      const ch = fm[1][0];
-      if (fence === null) fence = ch;
-      else if (ch === fence) fence = null;
+    const t = fenceTransition(fence, l);
+    if (t.opens || t.closes) {
+      fence = t.next;
       vis.push(l);
       continue;
     }

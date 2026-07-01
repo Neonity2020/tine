@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { readPropertyValue, upsertPropertyLine } from "./properties";
+import { caretInFence, readPropertyValue, upsertPropertyLine } from "./properties";
 
 describe("property line helpers", () => {
   it("reads a value case-insensitively", () => {
@@ -26,5 +26,27 @@ describe("property line helpers", () => {
 
   it("trims the value and drops blank lines", () => {
     expect(upsertPropertyLine("\n\ntags:: x\n\n", "alias", "  Foo  ")).toBe("tags:: x\nalias:: Foo");
+  });
+});
+
+describe("caretInFence", () => {
+  it("is false before the opening fence", () => {
+    const raw = "before\n```ts\nconst x = 1;\n```\nafter";
+    expect(caretInFence(raw, raw.indexOf("before"))).toBe(false);
+  });
+
+  it("is true on a line inside the fence", () => {
+    const raw = "before\n```ts\nconst x = 1;\n```\nafter";
+    expect(caretInFence(raw, raw.indexOf("const"))).toBe(true);
+  });
+
+  it("is false after the closing fence", () => {
+    const raw = "before\n```ts\nconst x = 1;\n```\nafter";
+    expect(caretInFence(raw, raw.indexOf("after"))).toBe(false);
+  });
+
+  it("is true inside an unterminated fence", () => {
+    const raw = "before\n```\nconst x = 1;";
+    expect(caretInFence(raw, raw.indexOf("const"))).toBe(true);
   });
 });

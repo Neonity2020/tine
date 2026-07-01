@@ -81,7 +81,7 @@ import { editorCommandFor } from "../keybindings";
 import { cycleMarkerSmart } from "../editor/repeat";
 import { applyTemplateVars } from "../editor/templateVars";
 import { caretAtFirstRow, caretAtLastRow } from "../editor/caretRows";
-import { splitProps, joinProps, isBuiltinHidden, hideAll } from "../editor/properties";
+import { splitProps, joinProps, isBuiltinHidden, hideAll, caretInFence } from "../editor/properties";
 import { normalizePlanning } from "../editor/planning";
 import { isAnnotationBlock, annotationInfo } from "../editor/annotation";
 import { AnnotationBody } from "./AnnotationBody";
@@ -1499,6 +1499,19 @@ export function Editor(props: { id: string }): JSX.Element {
     // Multiline text pastes as a block outline (Logseq behavior).
     if (text.includes("\n")) {
       e.preventDefault();
+      const start = ref.selectionStart;
+      const end = ref.selectionEnd;
+      if (isCalc() || caretInFence(ref.value, start)) {
+        const newRaw = ref.value.slice(0, start) + text + ref.value.slice(end);
+        commit(newRaw);
+        const pos = start + text.length;
+        queueMicrotask(() => {
+          ref.value = newRaw;
+          ref.setSelectionRange(pos, pos);
+          autosize();
+        });
+        return;
+      }
       const nodes = parseOutline(text);
       if (!nodes.length) return;
       commit(ref.value);
