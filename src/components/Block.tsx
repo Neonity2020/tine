@@ -197,8 +197,24 @@ export function Block(props: { id: string; hideRefCount?: boolean }): JSX.Elemen
   // surfaces only the instance that was clicked mounts the editor (the rest stay
   // rendered and reflect edits live). null owner = unscoped (keyboard nav).
   const instanceId = createUniqueId();
-  const editing = () =>
-    editingId() === props.id && (editingOwner() === null || editingOwner() === instanceId);
+  // This block's edit "surface": the main pane, a sidebar item, or a secondary
+  // "ref:…" reference view (agenda / {{query}} / {{embed}} / linked+block refs —
+  // all keyed by LiveRefGroup). Drives which instance shows the editor.
+  const surfaceKey = useContext(SurfaceContext);
+  const editing = () => {
+    if (editingId() !== props.id) return false;
+    const owner = editingOwner();
+    // Scoped (a click): only the exact instance that was clicked edits; every other
+    // instance of this uuid stays rendered and reflects the edit live.
+    if (owner !== null) return owner === instanceId;
+    // Unscoped (keyboard nav / split): edit in the PRIMARY surface where the caret
+    // already was. A block that also appears in a secondary "ref:" surface (e.g. the
+    // journal agenda re-lists today's scheduled/deadline bullets) must stay RENDERED
+    // there — arrowing into the real bullet must not flip the agenda copy into an
+    // editor. (Clicking a ref/agenda copy still edits it in place, via the branch
+    // above.) Matches the sidebar rule: edit where you're editing, render elsewhere.
+    return !surfaceKey.startsWith("ref:");
+  };
   const hasChildren = () => node().children.length > 0;
   const collapsed = () => node().collapsed;
   // Heading level of THIS block's first line, so the bullet column can match the
