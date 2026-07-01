@@ -15,7 +15,7 @@ import {
   applySidebarSession,
   type SidebarItem,
 } from "./ui";
-import { doc, persistentBlockRef } from "./store";
+import { doc, persistentBlockRef, extendFeedForScroll } from "./store";
 import { backend } from "./backend";
 import { renderedBlocks } from "./lazyObserve";
 
@@ -114,11 +114,16 @@ function rememberScroll() {
 /** Restore the saved scroll for a route once its content has rendered. A route
  *  with no saved offset (a new page) goes to the top. Retries for ~1s while the
  *  page is still growing toward a deep offset (blocks / linked refs render and
- *  measure asynchronously, so the target height isn't there on the first frame). */
+ *  measure asynchronously, so the target height isn't there on the first frame).
+ *  If the saved offset is DEEPER than the loaded content — a journal-feed position
+ *  in days that haven't been lazy-loaded yet — it pulls in more feed days until the
+ *  target is reachable (or the feed is exhausted), so re-opening lands where you
+ *  left off instead of at the bottom of the default window. */
 export function restoreScrollFor(r: Route) {
   if (typeof requestAnimationFrame === "undefined") return; // no-DOM (unit tests)
   const target = scrollByRoute.get(r) ?? 0;
   let tries = 0;
+  let extending = false;
   // Defer to a frame so the new page's content is laid out first — otherwise a
   // synchronous reset races the content swap (a new page wouldn't actually land
   // at the top). Then for a deep offset keep nudging while the page grows.
@@ -127,7 +132,20 @@ export function restoreScrollFor(r: Route) {
     if (!el) return;
     const max = Math.max(0, el.scrollHeight - el.clientHeight);
     el.scrollTop = Math.min(target, max);
-    if (target > 0 && el.scrollTop < target - 1 && tries++ < 60) requestAnimationFrame(tick);
+    if (target <= 0 || el.scrollTop >= target - 1) return; // top, or reached
+    // Target still out of reach. If the content is genuinely too SHORT (the feed's
+    // deeper days aren't loaded), grow it and keep going; otherwise it's just async
+    // layout catching up, so wait a frame. A deep offset can need several day-loads
+    // (each async), so allow more tries while the feed is still growing.
+    if (max < target - 1 && !extending) {
+      extending = true;
+      void extendFeedForScroll().then((grew) => {
+        extending = false;
+        if (grew ? tries++ < 400 : tries++ < 60) requestAnimationFrame(tick);
+      });
+      return;
+    }
+    if (tries++ < 60) requestAnimationFrame(tick);
   };
   requestAnimationFrame(tick);
 }

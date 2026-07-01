@@ -1921,6 +1921,14 @@ export async function nextVisibleOrExtend(id: string): Promise<string | null> {
   return nextVisible(id); // the newly-appended day's first block is now loaded
 }
 
+/** Pull in the next journal-feed day if there is one; resolves to whether the feed
+ *  actually grew. Used by scroll-restore to reach a saved offset that lives in
+ *  not-yet-loaded days (the feed otherwise only grows on a mouse-wheel sentinel
+ *  hit). No-op (false) on a non-feed page or when the feed is exhausted. */
+export async function extendFeedForScroll(): Promise<boolean> {
+  return feedExtender ? feedExtender() : false;
+}
+
 /** Move a single block one slot, crossing into the adjacent day at a page
  *  boundary. Returns how it moved so the caller can restore the caret. */
 export async function moveBlockFeed(id: string, dir: 1 | -1): Promise<"within" | "crossed" | "none"> {
