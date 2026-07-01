@@ -14,6 +14,9 @@ import {
   setActiveTab,
   sameRoute,
   resetTabsToJournals,
+  reopenClosedTab,
+  activateNextTab,
+  activatePrevTab,
 } from "./router";
 
 // The router holds singleton tab state, so reset to a single unpinned journals
@@ -158,5 +161,52 @@ describe("graph switch tab reset", () => {
     expect(tabs()[0].pinned).toBe(false);
     expect(route()).toEqual({ kind: "journals" });
     expect(activeId()).toBe(tabs()[0].id);
+  });
+});
+
+describe("reopen closed tab (Ctrl+Shift+T)", () => {
+  it("restores the most-recently-closed tab's route and focuses it", async () => {
+    openInNewTab({ kind: "page", name: "Gamma", pageKind: "page" }, true);
+    const gammaId = activeId();
+    expect(route()).toEqual({ kind: "page", name: "Gamma", pageKind: "page" });
+
+    await closeTab(gammaId);
+    expect(tabs().some((t) => t.id === gammaId)).toBe(false);
+
+    reopenClosedTab();
+    expect(route()).toEqual({ kind: "page", name: "Gamma", pageKind: "page" });
+    expect(activeTab().pinned).toBe(false);
+  });
+
+  it("reopens most-recent first (LIFO)", async () => {
+    openInNewTab({ kind: "page", name: "One", pageKind: "page" }, true);
+    const oneId = activeId();
+    openInNewTab({ kind: "page", name: "Two", pageKind: "page" }, true);
+    const twoId = activeId();
+
+    await closeTab(oneId);
+    await closeTab(twoId);
+
+    reopenClosedTab(); // Two was closed last → comes back first
+    expect(route()).toEqual({ kind: "page", name: "Two", pageKind: "page" });
+    reopenClosedTab(); // then One
+    expect(route()).toEqual({ kind: "page", name: "One", pageKind: "page" });
+  });
+});
+
+describe("browser-style tab cycling (Ctrl+PgDn / Ctrl+PgUp)", () => {
+  it("moves to the next / previous tab and wraps around", () => {
+    // journals (idx0) + A (idx1) + B (idx2); B is active (last opened, foreground).
+    openInNewTab({ kind: "page", name: "A", pageKind: "page" }, true);
+    openInNewTab({ kind: "page", name: "B", pageKind: "page" }, true);
+    const ids = tabs().map((t) => t.id);
+    expect(activeId()).toBe(ids[2]);
+
+    activateNextTab(); // wraps to first
+    expect(activeId()).toBe(ids[0]);
+    activatePrevTab(); // wraps back to last
+    expect(activeId()).toBe(ids[2]);
+    activatePrevTab();
+    expect(activeId()).toBe(ids[1]);
   });
 });

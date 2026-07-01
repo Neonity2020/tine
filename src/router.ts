@@ -54,6 +54,13 @@ const [activeId, setActiveId] = createSignal<string>(tabs()[0].id);
 
 export { tabs, activeId };
 
+// Recently-closed tabs (most-recent last), for Ctrl+Shift+T "reopen closed tab".
+// In-memory only — like a browser, a reopen doesn't survive a restart (the whole
+// session is restored from disk on launch anyway). Capped so it can't grow without
+// bound over a long session.
+const CLOSED_CAP = 10;
+const closedTabs: { history: Route[]; pos: number }[] = [];
+
 export function activeTab(): Tab {
   return tabs().find((t) => t.id === activeId()) ?? tabs()[0];
 }
@@ -306,12 +313,48 @@ export async function closeTab(id: string) {
   // this WebKitGTK build, so the tab would close without ever asking. Unpinned
   // tabs skip the await and close synchronously (no behaviour change there).
   if (t?.pinned && !(await backend().confirm(`Close pinned tab “${routeTitle(tabRoute(t))}”?`))) return;
+  // Save the current scroll against the (about-to-close) active tab's route, so a
+  // later Ctrl+Shift+T reopen lands back where it was. The route object survives
+  // in `closedTabs`, so its scrollByRoute entry is still live on reopen.
+  if (activeId() === id) rememberScroll();
   const idx = list.findIndex((x) => x.id === id);
   const next = list.filter((x) => x.id !== id);
+  // Remember the closed tab (its full history + position) so Ctrl+Shift+T can
+  // reopen it. Most-recent last; cap the stack.
+  if (t) {
+    closedTabs.push({ history: t.history, pos: t.pos });
+    if (closedTabs.length > CLOSED_CAP) closedTabs.shift();
+  }
   setTabs(next);
   if (activeId() === id) setActiveId(next[Math.max(0, idx - 1)].id);
   persist();
 }
+
+/** Reopen the most-recently-closed tab (Ctrl+Shift+T), restoring its full
+ *  back/forward history and the entry it was on, and focusing it. No-op if no
+ *  tab has been closed this session (the stack is in-memory only). */
+export function reopenClosedTab() {
+  const last = closedTabs.pop();
+  if (!last || !last.history.length) return;
+  const id = newId();
+  const pos = Math.min(Math.max(0, last.pos | 0), last.history.length - 1);
+  // New tabs are unpinned, so appending preserves the pinned-left invariant.
+  setTabs([...tabs(), { id, history: last.history, pos, pinned: false }]);
+  setActiveId(id);
+  persist();
+}
+
+/** Activate the next (dir=1) / previous (dir=-1) tab in strip order, wrapping
+ *  around — browser-style Ctrl+PgDn / Ctrl+PgUp. No-op with a single tab. */
+export function activateAdjacentTab(dir: 1 | -1) {
+  const list = tabs();
+  if (list.length < 2) return;
+  const i = list.findIndex((t) => t.id === activeId());
+  const next = list[(i + dir + list.length) % list.length];
+  setActiveTab(next.id);
+}
+export const activateNextTab = () => activateAdjacentTab(1);
+export const activatePrevTab = () => activateAdjacentTab(-1);
 
 /** Stable partition: all pinned tabs first (in their relative order), then the
  *  unpinned ones. Pinned tabs always sit to the left of the strip (matches the

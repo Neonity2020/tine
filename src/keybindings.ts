@@ -27,7 +27,15 @@ import {
   carryDays,
 } from "./ui";
 import { carryDaysBack } from "./carry";
-import { openJournals, goBack, goForward, closeActiveTab } from "./router";
+import {
+  openJournals,
+  goBack,
+  goForward,
+  closeActiveTab,
+  reopenClosedTab,
+  activateNextTab,
+  activatePrevTab,
+} from "./router";
 import {
   undo,
   redo,
@@ -83,6 +91,13 @@ const COMMANDS: CommandDef[] = [
   // generic dispatch loop below — closes the active tab even mid-edit (like a
   // browser). The last tab can't be closed, so this never quits the app.
   { id: "tab/close", binding: "mod+w", label: "Close current tab", scope: "global", run: closeActiveTab, global: true },
+  // Reopen the most-recently-closed tab (browser-style). mod-chord ⇒ fires even
+  // mid-edit, like mod+w.
+  { id: "tab/reopen-closed", binding: "mod+shift+t", label: "Reopen closed tab", scope: "global", run: reopenClosedTab, global: true },
+  // Browser-style tab cycling (Ctrl+PgDn / Ctrl+PgUp on Linux/Windows; Cmd on
+  // macOS). mod-chords, so they fire mid-edit; remappable like everything here.
+  { id: "tab/next", binding: "mod+pagedown", label: "Next tab", scope: "global", run: activateNextTab, global: true },
+  { id: "tab/previous", binding: "mod+pageup", label: "Previous tab", scope: "global", run: activatePrevTab, global: true },
   { id: "ui/toggle-theme", binding: "t t", label: "Toggle dark / light", scope: "global", run: toggleTheme },
   { id: "ui/toggle-left-sidebar", binding: "t l", label: "Toggle left sidebar", scope: "global", run: toggleSidebar },
   { id: "ui/toggle-right-sidebar", binding: "t r", label: "Toggle right sidebar", scope: "global", run: toggleRightSidebar },
