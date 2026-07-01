@@ -1,0 +1,20 @@
+{
+  "machine": "Linux x64 / AMD EPYC 7301 16-Core Processor ×64",
+  "calib": 153.8,
+  "metrics": {
+    "bigLoad": {
+      "normalized": 5.663,
+      "rawMin": 870.9
+    },
+    "scrollBig": {
+      "normalized": 0.23,
+      "rawMin": 35.3
+    }
+  },
+  "parseStats": {
+    "calls": 12,
+    "hits": 0,
+    "misses": 12
+  },
+  "note": "normalized = rawMin/calib; regenerate with `npm run bench -- --update` on a QUIET machine"
+}

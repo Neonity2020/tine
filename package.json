@@ -13,7 +13,8 @@
     "test": "vitest run && vitest run --config vitest.render.config.ts",
     "test:render": "vitest run --config vitest.render.config.ts",
     "build:wasm": "node scripts/build-wasm.mjs",
-    "screenshot": "node scripts/screenshot.mjs"
+    "screenshot": "node scripts/screenshot.mjs",
+    "bench": "node scripts/bench.mjs"
   },
   "dependencies": {
     "@fontsource/inter": "^5.2.8",

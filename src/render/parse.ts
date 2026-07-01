@@ -86,10 +86,18 @@ export function parserFailed(): boolean {
 const cache = new Map<string, Block[]>();
 const CACHE_MAX = 8000;
 
-// Dev-only A/B instrumentation: counts parseBlock calls (cold misses + warm hits)
-// so the lazy-body virtualization win is measurable on a large page
-// (`window.__tineParseStats`). Guarded by `import.meta.env.DEV`, so it is
-// dead-code-eliminated from production builds and never runs for users.
+// A/B instrumentation: counts parseBlock calls (cold misses + warm hits) so the
+// lazy-body virtualization win is measurable on a large page
+// (`window.__tineParseStats`). On in dev always; in a PRODUCTION build (what the
+// perf bench runs via `vite preview`) it stays off unless `window.__tineBench` is
+// set before boot — `import.meta.env.DEV` is a compile-time constant, so for
+// normal users the whole path is dead-code-eliminated and never runs.
+function statsEnabled(): boolean {
+  return (
+    import.meta.env.DEV ||
+    (typeof window !== "undefined" && (window as unknown as { __tineBench?: boolean }).__tineBench === true)
+  );
+}
 function bumpParseStats(hit: boolean) {
   if (typeof window === "undefined") return;
   const w = window as unknown as { __tineParseStats?: { calls: number; hits: number; misses: number } };
@@ -108,13 +116,13 @@ export function parseBlock(text: string, isOrg: boolean): Block[] {
   const key = (isOrg ? "o\n" : "m\n") + text;
   const hit = cache.get(key);
   if (hit !== undefined) {
-    if (import.meta.env.DEV) bumpParseStats(true);
+    if (statsEnabled()) bumpParseStats(true);
     // Refresh recency: re-insert so hot entries survive eviction.
     cache.delete(key);
     cache.set(key, hit);
     return hit;
   }
-  if (import.meta.env.DEV) bumpParseStats(false);
+  if (statsEnabled()) bumpParseStats(false);
   const blocks = JSON.parse(parse_block_json(text, isOrg)) as Block[];
   if (cache.size >= CACHE_MAX) cache.delete(cache.keys().next().value!);
   cache.set(key, blocks);
