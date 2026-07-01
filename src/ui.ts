@@ -777,16 +777,18 @@ export interface Toast {
   message: string;
   kind: "info" | "success" | "warn" | "error";
   sticky?: boolean; // stays until the user closes it (✕); no auto-dismiss
+  // Optional action button (e.g. "Download"). Runs, then dismisses the toast.
+  action?: { label: string; run: () => void };
 }
 let toastSeq = 0;
 export const [toasts, setToasts] = createSignal<Toast[]>([]);
 export function pushToast(
   message: string,
   kind: Toast["kind"] = "info",
-  opts: { sticky?: boolean } = {}
+  opts: { sticky?: boolean; action?: { label: string; run: () => void } } = {}
 ): number {
   const id = ++toastSeq;
-  setToasts([...toasts(), { id, message, kind, sticky: opts.sticky }]);
+  setToasts([...toasts(), { id, message, kind, sticky: opts.sticky, action: opts.action }]);
   if (!opts.sticky) setTimeout(() => dismissToast(id), 3200);
   return id;
 }

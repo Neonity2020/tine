@@ -2952,6 +2952,23 @@ body.file-drop-active::after {
 .toast-close:hover {
   opacity: 1;
 }
+/* Optional action button (e.g. "Download" on the update toast). */
+.toast-action {
+  flex: none;
+  align-self: center;
+  background: rgba(255, 255, 255, 0.16);
+  border: 1px solid rgba(255, 255, 255, 0.35);
+  color: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  border-radius: 6px;
+  padding: 3px 9px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.toast-action:hover {
+  background: rgba(255, 255, 255, 0.28);
+}
 /* Sticky toasts persist until closed → a steady cursor (not the click-to-dismiss
    pointer) over the body; only the ✕ closes them. */
 .toast-sticky {

@@ -15,6 +15,18 @@ export function Toasts(): JSX.Element {
             onClick={() => !t.sticky && dismissToast(t.id)}
           >
             <span class="toast-msg">{t.message}</span>
+            <Show when={t.action}>
+              <button
+                class="toast-action"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  t.action!.run();
+                  dismissToast(t.id);
+                }}
+              >
+                {t.action!.label}
+              </button>
+            </Show>
             <button
               class="toast-close"
               aria-label="Dismiss"

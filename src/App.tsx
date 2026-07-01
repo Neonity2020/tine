@@ -22,6 +22,7 @@ import { installKeybindings } from "./keybindings";
 import { installFileDrop } from "./filedrop";
 import { installBlockSelectionDrag } from "./blockDrag";
 import { loadGraphPath, persistedGraphPath, refreshAliases } from "./graph";
+import { checkForUpdate } from "./update";
 import { Welcome } from "./components/Welcome";
 import { goBack, goForward, canGoBack, canGoForward, flushSession } from "./router";
 import {
@@ -92,6 +93,14 @@ export function App(): JSX.Element {
   // speed, so a silent software-rendering fallback shouldn't read as "Tine is
   // slow". Fire-and-forget; the probe is Tauri-gated and never throws.
   onMount(() => void warnIfSoftwareRendering());
+
+  // Once per launch, a few seconds after startup (so it never competes with the
+  // first paint or the graph load), check GitHub for a newer release and toast if
+  // there is one. Best-effort + silent on failure (see update.ts).
+  onMount(() => {
+    const t = setTimeout(() => void checkForUpdate(), 3000);
+    onCleanup(() => clearTimeout(t));
+  });
 
   // Re-install experimental smooth scrolling (Lenis) if it was left on. The feed
   // (`.main-content`) is mounted by now (onMount runs after first render).
