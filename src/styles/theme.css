@@ -48,7 +48,8 @@ html[data-theme="light"] {
   --bullet-color: #adadad;
   --bullet-ring: rgba(0, 0, 0, 0.08);
 
-  --selection-bg: #c0e6fd;
+  --selection-bg: rgba(76, 139, 245, 0.30);
+  --block-select-bg: rgba(76, 139, 245, 0.15);
   --block-highlight: #eef6fc;
 
   --code-bg: #f1f1f1;
@@ -83,7 +84,8 @@ html[data-theme="dark"] {
   --bullet-color: #6f7177;
   --bullet-ring: rgba(255, 255, 255, 0.10);
 
-  --selection-bg: #2b4f74;
+  --selection-bg: rgba(76, 139, 245, 0.50);
+  --block-select-bg: rgba(76, 139, 245, 0.22);
   --block-highlight: #24303d;
 
   --code-bg: #2a2b30;

@@ -24,7 +24,8 @@ body {
 }
 
 ::selection {
-  background: var(--selection-bg);
+  /* WebKit blendWithWhite rewrites opaque ::selection colors; keep alpha per research-selection-theming.md. */
+  background: color-mix(in srgb, var(--selection-bg) 99.6%, transparent);
 }
 
 /* ---------------------------------------------------------------- layout */
@@ -1825,7 +1826,7 @@ body {
   opacity: 0.4;
 }
 .block-main.selected {
-  background: var(--selection-bg);
+  background: var(--block-select-bg);
   border-radius: 4px;
 }
 .bullet-container {
