@@ -38,3 +38,9 @@ see the project `CLAUDE.md`.
 | [0009](0009-one-block-facet-source-on-the-dto.md) | One source for block-header facets: the lsdoc parse, shipped on the DTO | Accepted |
 | [0010](0010-lsdoc-canonical-html-skeleton.md) | lsdoc owns the canonical HTML skeleton; the export consumes it, the frontend conforms | Accepted |
 | [0011](0011-in-app-self-update.md) | In-app self-update on Windows/Linux via the Tauri v2 updater (macOS manual) | Accepted |
+| [0012](0012-save-watch-edit-coherency-protocol.md) | The save/watch/edit coherency protocol has one shape — don't add a second | Accepted |
+| [0013](0013-block-identity-vs-rendered-instance.md) | One block, many rendered instances: focus/caret ownership rules | Accepted |
+| [0014](0014-cache-gen-invalidation-contract.md) | Derived caches self-invalidate via `cache_gen` — no hand-rolled invalidation | Accepted |
+| [0015](0015-lsdoc-wire-contract.md) | The lsdoc wire contract: what Tine may assume about lsdoc's output | Accepted |
+| [0016](0016-mock-backend-intentionally-lossy.md) | The mock backend is an intentionally lossy dev double | Accepted |
+| [0017](0017-snapshot-scope.md) | Launch snapshots cover text + config + PDF highlight sidecars, not asset bytes | Accepted |
