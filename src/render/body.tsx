@@ -14,31 +14,6 @@ import { parserReady } from "./parse";
 import { parseBody, isStandalonePlanning } from "./facets";
 import { observeNear, unobserveNear, renderedBlocks } from "../lazyObserve";
 
-type Align = "left" | "center" | "right" | null;
-
-function isTableSep(line: string): boolean {
-  // Accept org's column-junction `+` (`|---+---|`) as well as markdown's `|---|`.
-  return /^\s*\|?[\s:|+-]+\|?\s*$/.test(line) && line.includes("-");
-}
-
-/** Per-column alignment from a table separator row (`:--`, `--:`, `:-:`). */
-function parseAligns(sep: string): Align[] {
-  return splitRow(sep).map((c) => {
-    const l = c.startsWith(":");
-    const r = c.endsWith(":");
-    return l && r ? "center" : r ? "right" : l ? "left" : null;
-  });
-}
-
-function splitRow(line: string): string[] {
-  return line
-    .trim()
-    .replace(/^\|/, "")
-    .replace(/\|$/, "")
-    .split("|")
-    .map((c) => c.trim());
-}
-
 function escapeHtml(code: string): string {
   return code.replace(/&/g, "&amp;").replace(/</g, "&lt;");
 }
@@ -256,26 +231,11 @@ function renderCustom(b: Extract<AstBlock, { kind: "custom" }>, blockId?: string
   return <>{renderBlocks(b.children, blockId)}</>;
 }
 
-// mldoc/lsdoc discards table column alignment, but Tine renders `:--`/`--:`
-// alignment (a beyond-OG feature). Re-derive it from the block's raw separator
-// row (matched by column count) so aligned tables don't regress.
-function tableAligns(blockId: string | undefined, ncols: number): Align[] {
-  if (!blockId) return [];
-  const node = doc.byId[blockId];
-  if (!node) return [];
-  for (const line of node.raw.split("\n")) {
-    if (isTableSep(line)) {
-      const a = parseAligns(line);
-      if (a.length === ncols) return a;
-    }
-  }
-  return [];
-}
-
 function renderTable(b: Extract<AstBlock, { kind: "table" }>, blockId?: string): JSX.Element {
-  const ncols = b.header?.length ?? b.rows[0]?.length ?? 0;
-  const aligns = tableAligns(blockId, ncols);
-  const al = (i: number) => (aligns[i] ? { "text-align": aligns[i]! } : undefined);
+  const al = (i: number) => {
+    const align = b.aligns[i] ?? null;
+    return align ? { "text-align": align } : undefined;
+  };
   return (
     <table class="md-table">
       <Show when={b.header}>

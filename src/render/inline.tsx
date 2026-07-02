@@ -147,6 +147,7 @@ function urlDest(url: Url): string {
     case "block_ref":
     case "search":
     case "file":
+    case "embed_data":
       return url.v;
     case "complex":
       return url.protocol && url.link != null ? `${url.protocol}://${url.link}` : url.link ?? "";

@@ -58,7 +58,7 @@ mod tests {
                 assert_eq!(marker.as_deref(), Some("TODO"));
                 assert_eq!(priority.as_deref(), Some("A"));
                 // the marker/priority are NOT left in the rendered inline text
-                assert!(matches!(inline.first(), Some(Inline::Plain { text }) if text == "do the thing"));
+                assert!(matches!(inline.first(), Some(Inline::Plain { text, .. }) if text == "do the thing"));
             }
             other => panic!("expected bullet, got {other:?}"),
         }

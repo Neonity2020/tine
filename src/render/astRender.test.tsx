@@ -113,7 +113,7 @@ describe("renderBlocks", () => {
   });
 
   it("table renders cells", () => {
-    const h = blk([{ kind: "table", header: [[{ k: "plain", text: "A" }], [{ k: "plain", text: "B" }]], rows: [[[{ k: "plain", text: "1" }], [{ k: "plain", text: "2" }]]] }]);
+    const h = blk([{ kind: "table", header: [[{ k: "plain", text: "A" }], [{ k: "plain", text: "B" }]], rows: [[[{ k: "plain", text: "1" }], [{ k: "plain", text: "2" }]]], aligns: [] }]);
     expect(h).toContain("md-table");
     expect(h).toContain("A");
     expect(h).toContain("1");

@@ -260,7 +260,11 @@ fn decorate(html: &str, refs: &RefIndex) -> String {
 /// The destination string of a link `url` (mirrors the frontend `urlDest`).
 fn url_dest(url: &Url) -> String {
     match url {
-        Url::PageRef { v } | Url::BlockRef { v } | Url::Search { v } | Url::File { v } => v.clone(),
+        Url::PageRef { v }
+        | Url::BlockRef { v }
+        | Url::Search { v }
+        | Url::File { v }
+        | Url::EmbedData { v } => v.clone(),
         Url::Complex { protocol, link } => match (protocol, link) {
             (Some(p), Some(l)) => format!("{p}://{l}"),
             (_, l) => l.clone().unwrap_or_default(),
@@ -274,11 +278,13 @@ fn url_dest(url: &Url) -> String {
 fn flatten_inlines(inlines: &[Inline], out: &mut String) {
     for s in inlines {
         match s {
-            Inline::Plain { text } | Inline::Code { text } | Inline::Verbatim { text } => out.push_str(text),
+            Inline::Plain { text, .. } | Inline::Code { text, .. } | Inline::Verbatim { text, .. } => {
+                out.push_str(text)
+            }
             Inline::Emphasis { children, .. }
-            | Inline::Subscript { children }
-            | Inline::Superscript { children } => flatten_inlines(children, out),
-            Inline::Tag { children } => {
+            | Inline::Subscript { children, .. }
+            | Inline::Superscript { children, .. } => flatten_inlines(children, out),
+            Inline::Tag { children, .. } => {
                 out.push('#');
                 flatten_inlines(children, out);
             }
@@ -287,11 +293,11 @@ fn flatten_inlines(inlines: &[Inline], out: &mut String) {
                 _ if label.is_empty() => out.push_str(&url_dest(url)),
                 _ => flatten_inlines(label, out),
             },
-            Inline::NestedLink { content } => out.push_str(content),
-            Inline::Target { text } => out.push_str(text),
+            Inline::NestedLink { content, .. } => out.push_str(content),
+            Inline::Target { text, .. } => out.push_str(text),
             Inline::Entity { unicode, .. } => out.push_str(unicode),
             Inline::Latex { body, .. } => out.push_str(body),
-            Inline::Hiccup { v } => out.push_str(v),
+            Inline::Hiccup { v, .. } => out.push_str(v),
             _ => {}
         }
     }

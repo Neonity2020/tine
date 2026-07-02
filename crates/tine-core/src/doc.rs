@@ -253,7 +253,7 @@ fn header_facets(
     let mut properties = Vec::new();
     for b in blocks {
         if let Block::Properties { props, .. } = b {
-            properties.extend(props.iter().cloned());
+            properties.extend(props.iter().map(|p| (p.0.clone(), p.1.clone())));
         }
     }
     (marker, priority, heading_level, properties)
@@ -312,8 +312,8 @@ fn is_standalone_planning(inlines: &[lsdoc::ast::Inline]) -> bool {
     for i in inlines {
         match i {
             Inline::Timestamp { ts, .. } if ts == "Scheduled" || ts == "Deadline" => planning = true,
-            Inline::Break | Inline::HardBreak => {}
-            Inline::Plain { text } if text.trim().is_empty() => {}
+            Inline::Break { .. } | Inline::HardBreak { .. } => {}
+            Inline::Plain { text, .. } if text.trim().is_empty() => {}
             _ => return false,
         }
     }

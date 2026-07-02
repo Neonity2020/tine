@@ -4,10 +4,11 @@
 // for deserializing what the Rust backend (`tine-core`) sends per block. The
 // authoritative sources, in priority order, are:
 //
-//   1. the lsdoc repo's AST.md          — the render contract + vocab
-//   2. the lsdoc repo's src/projection.rs — the Rust types (serde attrs)
+//   1. the lsdoc repo's src/projection.rs — the Rust types (serde attrs)
+//   2. the lsdoc repo's harnesses        — byte-span/contract examples
+//   3. the lsdoc repo's AST.md           — vocab/docs (may lag projection.rs)
 //
-// If either changes, THIS FILE MUST BE UPDATED BY HAND. There is no codegen.
+// If any of these changes, THIS FILE MUST BE UPDATED BY HAND. There is no codegen.
 // The contract is "frozen" only in the sense that every field is gated 0-diff
 // against mldoc@1.5.7; new variants/fields can still be added (e.g. the `comment`
 // block kind was added after AST.md's first draft) — keep this mirror in lockstep.
@@ -36,10 +37,14 @@
 //    serialized as `null` when None — because projection.rs does NOT skip it.
 //    See the Heading comment.)
 //
-//  * `span` ([start,end] byte offsets) is emitted on blocks but is OUT OF THE
-//    RENDER CONTRACT (excluded from the oracle diff). Tine renders read-only, so
-//    it is ignored for rendering; typed here only for completeness. Inline nodes
-//    carry NO span.
+//  * `span` ([start,end) UTF-8 byte offsets) is emitted on blocks and, since
+//    lsdoc v0.3.0, on EVERY inline node. Tine renders read-only, so spans are
+//    ignored for rendering; inline spans are typed optional only because older
+//    hand-built fixtures across the test suite omit them.
+//
+//  * `span_map` is emitted ONLY on `plain` inline nodes whose rendered `text` is
+//    not a byte-exact slice of the source span (e.g. escaped Markdown). Each
+//    segment is `[textOffset, sourceOffset, len]` in UTF-8 bytes.
 //
 //  * Both Markdown and Org graphs produce the SAME AST. Format-specific origin
 //    notes below ("md only" / "org only") describe what SOURCE produces a node,
@@ -64,9 +69,12 @@ export interface Refs {
   block: string[];
 }
 
-/** Block source span `[startByte, endByte]`. Emitted but EXCLUDED from the
- *  render contract — do not rely on it for rendering. Inline nodes have none. */
+/** Source span `[startByte, endByte)` in UTF-8 bytes. Emitted for blocks and
+ *  inline nodes, but not used by the renderer. */
 export type Span = [number, number];
+
+/** Plain-text/source byte correspondence for escaped text segments. */
+export type SpanMap = Array<[number, number, number]>;
 
 // ===========================================================================
 // Block — discriminated union on "kind"
@@ -274,16 +282,21 @@ export interface HrBlock {
  *    each cell an inline run. `null` ⇒ no header row.
  *  - `rows` (always present): the body rows; each row a list of cells; each cell
  *    an inline run. (May be `[]`.)
- *  NO COLUMN ALIGNMENT is available — mldoc 1.5.7 discards it. See RISKS: Tine's
- *  current renderer applies `:--`/`--:` alignment, which the AST cannot provide. */
+ *  - `aligns` (always present): Markdown separator-row alignment per dropped
+ *    separator cell; org tables and tables without a dropped separator use `[]`.
+ *    Consumers must index defensively (`aligns[i] ?? null`) for ragged tables. */
 export interface TableBlock {
   kind: "table";
   /** Header row (cells × inline-runs), or `null` for a header-less table. */
   header: Inline[][] | null;
   /** Body rows (rows × cells × inline-runs). Always present; may be `[]`. */
   rows: Inline[][][];
+  /** Per-column alignment from a Markdown separator row. Always present. */
+  aligns: TableAlign[];
   span?: Span;
 }
+
+export type TableAlign = "left" | "center" | "right" | null;
 
 /** A footnote definition `[^id]: body` / org `[fn:id] body`. `name` is the id,
  *  `inline` is the definition body. */
@@ -356,32 +369,40 @@ export type Inline =
 /** The discriminant string union, handy for exhaustive `switch` checks. */
 export type InlineKind = Inline["k"];
 
+/** Real lsdoc output includes this on every inline node. Optional here because
+ *  many local renderer fixtures construct Inline values by hand. */
+export interface InlineSpan {
+  span?: Span;
+}
+
 /** Literal text. Wrap in <EmojiText> when rendering (Twemoji parity). */
-export interface PlainInline {
+export interface PlainInline extends InlineSpan {
   k: "plain";
   text: string;
+  /** Present only when `text` is not byte-identical to the source span. */
+  span_map?: SpanMap;
 }
 
 /** Inline code `` `code` `` / org `~code~`. Literal (no nested parse). */
-export interface CodeInline {
+export interface CodeInline extends InlineSpan {
   k: "code";
   text: string;
 }
 
 /** Org `=verbatim=`. Distinct node from `code`; renders the same (`<code>`). */
-export interface VerbatimInline {
+export interface VerbatimInline extends InlineSpan {
   k: "verbatim";
   text: string;
 }
 
 /** A SOFT line break (`keep_line_break`). Renders as whitespace (a space), NOT
  *  a `<br>` — see ast-render-contract.md. No fields. */
-export interface BreakInline {
+export interface BreakInline extends InlineSpan {
   k: "break";
 }
 
 /** A HARD break (trailing `\` or two spaces). Renders as `<br>`. No fields. */
-export interface HardBreakInline {
+export interface HardBreakInline extends InlineSpan {
   k: "hardbreak";
 }
 
@@ -389,7 +410,7 @@ export interface HardBreakInline {
  *    "Bold" | "Italic" | "Strike_through" | "Highlight" | "Underline"
  *  (md emits the first four; org adds Underline). `children` is the inner run;
  *  nesting is real, e.g. `***x***` → Italic[ Bold[x] ]. */
-export interface EmphasisInline {
+export interface EmphasisInline extends InlineSpan {
   k: "emphasis";
   emph: EmphKind;
   children: Inline[];
@@ -404,13 +425,13 @@ export type EmphKind =
   | "Underline";
 
 /** Org subscript `_x` / `_{x}` (mldoc Subscript). `children` re-parsed inline. */
-export interface SubscriptInline {
+export interface SubscriptInline extends InlineSpan {
   k: "subscript";
   children: Inline[];
 }
 
 /** Org superscript `^x` / `^{x}` (mldoc Superscript). `children` re-parsed. */
-export interface SuperscriptInline {
+export interface SuperscriptInline extends InlineSpan {
   k: "superscript";
   children: Inline[];
 }
@@ -418,7 +439,7 @@ export interface SuperscriptInline {
 /** A link / image / page-ref / block-ref / autolink — the render-critical node.
  *  See the Url union for the destination shape. Image-ness is the `image` flag
  *  (no need to sniff `full`); size from `metadata`; tooltip from `title`. */
-export interface LinkInline {
+export interface LinkInline extends InlineSpan {
   k: "link";
   /** Always present. The destination. */
   url: Url;
@@ -440,20 +461,20 @@ export interface LinkInline {
 
 /** Logseq nested page ref `[[a [[b]] c]]` — the raw inner is kept verbatim in
  *  `content`. (Current renderer has no equivalent; see RISKS.) */
-export interface NestedLinkInline {
+export interface NestedLinkInline extends InlineSpan {
   k: "nested_link";
   content: string;
 }
 
 /** Org dedicated/radio target `<<name>>` (mldoc Target). Renders as its text. */
-export interface TargetInline {
+export interface TargetInline extends InlineSpan {
   k: "target";
   text: string;
 }
 
 /** A `#tag` / `#[[bracket tag]]`. `children` is the tag name as an inline run
  *  (so `#[[a b]]` keeps spaces). The ref name for routing is the joined text. */
-export interface TagInline {
+export interface TagInline extends InlineSpan {
   k: "tag";
   children: Inline[];
 }
@@ -463,7 +484,7 @@ export interface TagInline {
  *  args were split honouring `[[..]]`, `((..))`, `"..."`; commas elsewhere
  *  split). To reconstruct a body string for a query/embed/user-macro that wants
  *  one, use `name + " " + args.join(", ")`. See RISKS for the round-trip caveat. */
-export interface MacroInline {
+export interface MacroInline extends InlineSpan {
   k: "macro";
   name: string;
   /** Always present; may be `[]` for an argument-less macro. */
@@ -472,7 +493,7 @@ export interface MacroInline {
 
 /** Inline LaTeX. `mode` ∈ {"Inline","Displayed"} (the EXACT strings). `$x$` /
  *  `\(x\)` → Inline; `$$x$$` / `\[x\]` → Displayed. `body` is the raw TeX. */
-export interface LatexInline {
+export interface LatexInline extends InlineSpan {
   k: "latex";
   mode: LatexMode;
   body: string;
@@ -486,7 +507,7 @@ export type LatexMode = "Inline" | "Displayed";
  *  (see TimestampValue). SCHEDULED/DEADLINE/CLOSED and ranges all flow through
  *  here — the `ts` tag distinguishes them; there is no separate heading-meta
  *  field, so planner badges render from this inline. */
-export interface TimestampInline {
+export interface TimestampInline extends InlineSpan {
   k: "timestamp";
   ts: TimestampTs;
   date: TimestampValue;
@@ -522,7 +543,7 @@ export type TimestampValue =
   | Record<string, unknown>;
 
 /** A footnote reference `[^id]` / `[fn:id]`. `name` is the id. */
-export interface FnrefInline {
+export interface FnrefInline extends InlineSpan {
   k: "fnref";
   name: string;
 }
@@ -530,14 +551,14 @@ export interface FnrefInline {
 /** Inline raw HTML, e.g. `<span class="x">…</span>` / org `@@html:…@@`
  *  (mldoc Inline_Html). `text` is verbatim. Tine re-detects the `<iframe>`
  *  subset from this (https-only sandbox); other raw HTML renders as text. */
-export interface InlineHtmlInline {
+export interface InlineHtmlInline extends InlineSpan {
   k: "inline_html";
   text: string;
 }
 
 /** An email autolink `<a@b.com>` (mldoc Email). `text` is mldoc's RAW address
  *  record, declared OPAQUE (see EmailValue). */
-export interface EmailInline {
+export interface EmailInline extends InlineSpan {
   k: "email";
   text: EmailValue;
 }
@@ -555,7 +576,7 @@ export type EmailValue =
  *  "Δ") for display, or `html` for an HTML entity, per the renderer's choice.
  *  NOTE: the current renderer has NO entity handling — `\Delta` renders literal
  *  today; this node CHANGES that. See RISKS. */
-export interface EntityInline {
+export interface EntityInline extends InlineSpan {
   k: "entity";
   name: string;
   /** The LaTeX source, e.g. "\\Delta". */
@@ -573,7 +594,7 @@ export interface EntityInline {
 /** An inline Clojure-hiccup `[:tag …]` (lsdoc v0.1.4). `v` is the raw bracket text,
  *  verbatim (children unparsed, no refs). Rendered as literal text for now — see
  *  [[HiccupBlock]] for the OG-HTML upgrade note. Edge construct, absent from real graphs. */
-export interface HiccupInline {
+export interface HiccupInline extends InlineSpan {
   k: "hiccup";
   v: string;
 }
@@ -587,6 +608,7 @@ export type Url =
   | BlockRefUrl
   | SearchUrl
   | FileUrl
+  | EmbedDataUrl
   | ComplexUrl;
 
 /** The discriminant string union. */
@@ -615,6 +637,12 @@ export interface SearchUrl {
  *  mldoc strips it; confirm against source if it matters). */
 export interface FileUrl {
   type: "file";
+  v: string;
+}
+
+/** A Markdown image destination that is already a complete `data:...` URI. */
+export interface EmbedDataUrl {
+  type: "embed_data";
   v: string;
 }
 

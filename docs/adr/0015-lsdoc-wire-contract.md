@@ -38,3 +38,16 @@ The Tine-facing surface of lsdoc — "FOR-TINE" — is a contract:
   schedules — the audit's explicit verdict was to keep them separate.
 - Adding a *new* lsdoc feature Tine consumes means adding it to the contract
   fixtures, not just using it.
+
+## Status Update - 2026-07-02
+
+lsdoc v0.3.0 extends the wire contract in three frontend-visible ways:
+
+- Inline spans are now total on real parser output. Every inline node carries a
+  `[start, end)` UTF-8 byte span, and escaped `plain` text carries `span_map`
+  segments that map rendered text bytes back to source bytes.
+- `table.aligns` is always serialized. Markdown separator rows provide
+  `"left"`, `"center"`, `"right"`, or `null` per separator cell; org tables and
+  tables without a dropped separator use `[]`.
+- Markdown image links with `data:` destinations use the URL variant
+  `{ "type": "embed_data", "v": "data:..." }`, and Tine renders `v` directly.

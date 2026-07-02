@@ -1,6 +1,6 @@
 import { beforeAll, describe, expect, it } from "vitest";
 import { initParser, parseBlock } from "./parse";
-import type { Block, Inline, ListItem, Url } from "./ast";
+import type { Block, Inline, ListItem, Span, Url } from "./ast";
 
 const DRIFT = "ADR 0015: lsdoc wire contract drift — update src/render/ast.ts + this fixture together";
 
@@ -30,32 +30,32 @@ const BLOCK_REQUIRED_KEYS = {
   latex_env: ["kind", "name", "content"],
   properties: ["kind", "props"],
   hr: ["kind"],
-  table: ["kind", "header", "rows"],
+  table: ["kind", "header", "rows", "aligns"],
   footnote_def: ["kind", "name", "inline"],
   hiccup: ["kind", "v"],
 } as const satisfies Record<BlockKind, readonly string[]>;
 
 const INLINE_REQUIRED_KEYS = {
-  plain: ["k", "text"],
-  code: ["k", "text"],
-  verbatim: ["k", "text"],
-  break: ["k"],
-  hardbreak: ["k"],
-  emphasis: ["k", "emph", "children"],
-  subscript: ["k", "children"],
-  superscript: ["k", "children"],
-  link: ["k", "url", "full"],
-  nested_link: ["k", "content"],
-  target: ["k", "text"],
-  tag: ["k", "children"],
-  macro: ["k", "name", "args"],
-  latex: ["k", "mode", "body"],
-  timestamp: ["k", "ts", "date"],
-  fnref: ["k", "name"],
-  inline_html: ["k", "text"],
-  email: ["k", "text"],
-  entity: ["k", "name", "latex", "latex_mathp", "html", "ascii", "unicode"],
-  hiccup: ["k", "v"],
+  plain: ["k", "text", "span"],
+  code: ["k", "text", "span"],
+  verbatim: ["k", "text", "span"],
+  break: ["k", "span"],
+  hardbreak: ["k", "span"],
+  emphasis: ["k", "emph", "children", "span"],
+  subscript: ["k", "children", "span"],
+  superscript: ["k", "children", "span"],
+  link: ["k", "url", "full", "span"],
+  nested_link: ["k", "content", "span"],
+  target: ["k", "text", "span"],
+  tag: ["k", "children", "span"],
+  macro: ["k", "name", "args", "span"],
+  latex: ["k", "mode", "body", "span"],
+  timestamp: ["k", "ts", "date", "span"],
+  fnref: ["k", "name", "span"],
+  inline_html: ["k", "text", "span"],
+  email: ["k", "text", "span"],
+  entity: ["k", "name", "latex", "latex_mathp", "html", "ascii", "unicode", "span"],
+  hiccup: ["k", "v", "span"],
 } as const satisfies Record<InlineKind, readonly string[]>;
 
 const URL_REQUIRED_KEYS = {
@@ -63,6 +63,7 @@ const URL_REQUIRED_KEYS = {
   block_ref: ["type", "v"],
   search: ["type", "v"],
   file: ["type", "v"],
+  embed_data: ["type", "v"],
   complex: ["type"],
 } as const satisfies Record<UrlType, readonly string[]>;
 
@@ -209,7 +210,7 @@ const FIXTURES: Record<string, Fixture> = {
         link: "example.com/a",
       });
       expect(links[2]?.title, msg(name, "complex link title")).toBe("Title");
-      expect(links[2]?.label, msg(name, "complex link label")).toEqual([{ k: "plain", text: "site" }]);
+      expect(links[2]?.label, msg(name, "complex link label")).toEqual([{ k: "plain", text: "site", span: [26, 30] }]);
       expect(links[3]?.url, msg(name, "search/image url")).toEqual({ type: "search", v: "../asset.png" });
       expect(links[3]?.image, msg(name, "image flag")).toBe(true);
       expect(links[3]?.metadata, msg(name, "image metadata")).toBe("{:width 10}");
@@ -238,7 +239,21 @@ const FIXTURES: Record<string, Fixture> = {
       expectKinds(blocks, ["bullet"], name);
       const link = inlineAt(blockAt(blocks, 0, "bullet", name).inline, 0, "link", name);
       expect(link.url, msg(name, "file URL shape")).toEqual({ type: "file", v: "file:../notes/x.org" });
-      expect(link.label, msg(name, "file link label")).toEqual([{ k: "plain", text: "File Label" }]);
+      expect(link.label, msg(name, "file link label")).toEqual([{ k: "plain", text: "File Label", span: [25, 35] }]);
+    },
+  },
+  "markdown data image uses embed_data URL": {
+    raw: "![x](data:image/png;base64,iVBORw0KGgo=)",
+    assert(blocks, name) {
+      expectKinds(blocks, ["bullet"], name);
+      const link = inlineAt(blockAt(blocks, 0, "bullet", name).inline, 0, "link", name);
+      expect(link.url, msg(name, "data image URL shape")).toEqual({
+        type: "embed_data",
+        v: "data:image/png;base64,iVBORw0KGgo=",
+      });
+      expect(link.image, msg(name, "image flag")).toBe(true);
+      expect(link.label, msg(name, "image alt label")).toEqual([{ k: "plain", text: "x", span: [4, 5] }]);
+      expect(link.span, msg(name, "data image span")).toEqual([2, 42]);
     },
   },
   "markdown active date, range, latex, and entity": {
@@ -319,12 +334,12 @@ const FIXTURES: Record<string, Fixture> = {
       expect(checklist.items[0]?.checkbox, msg(name, "checked checkbox")).toBe(true);
       expect(checklist.items[1]?.checkbox, msg(name, "unchecked checkbox")).toBe(false);
       expect(blockAt(checklist.items[0]?.content ?? [], 0, "paragraph", name).inline, msg(name, "checkbox item body")).toEqual([
-        { k: "plain", text: "done" },
+        { k: "plain", text: "done", span: [13, 17] },
       ]);
       const defList = blockAt(blocks, 2, "list", name);
-      expect(defList.items[0]?.name, msg(name, "definition-list term")).toEqual([{ k: "plain", text: "Tea" }]);
+      expect(defList.items[0]?.name, msg(name, "definition-list term")).toEqual([{ k: "plain", text: "Tea", span: [29, 32] }]);
       expect(blockAt(defList.items[0]?.content ?? [], 0, "paragraph", name).inline, msg(name, "definition-list body")).toEqual([
-        { k: "plain", text: "another" },
+        { k: "plain", text: "another", span: [35, 42] },
       ]);
     },
   },
@@ -423,9 +438,60 @@ const FIXTURES: Record<string, Fixture> = {
       expectKinds(blocks, ["bullet", "hr", "table"], name);
       expect(blockAt(blocks, 1, "hr", name).span, msg(name, "hr span")).toEqual([8, 12]);
       const table = blockAt(blocks, 2, "table", name);
-      expect(table.header, msg(name, "table header cells")).toEqual([[{ k: "plain", text: "A" }], [{ k: "plain", text: "B" }]]);
-      expect(table.rows, msg(name, "table row cells")).toEqual([[[{ k: "plain", text: "1" }], [{ k: "plain", text: "2" }]]]);
+      expect(table.header, msg(name, "table header cells")).toEqual([
+        [{ k: "plain", text: "A", span: [14, 15] }],
+        [{ k: "plain", text: "B", span: [18, 19] }],
+      ]);
+      expect(table.rows, msg(name, "table row cells")).toEqual([
+        [[{ k: "plain", text: "1", span: [38, 39] }], [{ k: "plain", text: "2", span: [42, 43] }]],
+      ]);
+      expect(table.aligns, msg(name, "table aligns")).toEqual([null, null]);
       expect(table.span, msg(name, "table span")).toEqual([12, 45]);
+    },
+  },
+  "markdown table carries parser alignment": {
+    raw: "|h1|h2|\n|:-:|--:|\n|a|b|",
+    assert(blocks, name) {
+      expectKinds(blocks, ["bullet", "table"], name);
+      const table = blockAt(blocks, 1, "table", name);
+      expect(table.aligns, msg(name, "markdown aligns")).toEqual(["center", "right"]);
+      expect(table.header, msg(name, "markdown table header")).toEqual([
+        [{ k: "plain", text: "h1", span: [3, 5] }],
+        [{ k: "plain", text: "h2", span: [6, 8] }],
+      ]);
+    },
+  },
+  "org table carries empty aligns": {
+    raw: "| h1 | h2 |\n|----+----|\n| a  | b  |",
+    format: "org",
+    assert(blocks, name) {
+      expectKinds(blocks, ["bullet", "table"], name);
+      const table = blockAt(blocks, 1, "table", name);
+      expect(table.aligns, msg(name, "org aligns")).toEqual([]);
+      expect(table.header, msg(name, "org table header")).toEqual([
+        [{ k: "plain", text: "h1", span: [4, 6] }],
+        [{ k: "plain", text: "h2", span: [9, 11] }],
+      ]);
+    },
+  },
+  "markdown escaped plain carries span_map": {
+    raw: "a\\*b\nabc",
+    assert(blocks, name) {
+      expectKinds(blocks, ["bullet", "paragraph"], name);
+      const escaped = inlineAt(blockAt(blocks, 0, "bullet", name).inline, 0, "plain", name);
+      expect(escaped, msg(name, "escaped plain shape")).toEqual({
+        k: "plain",
+        text: "a*b",
+        span: [2, 6],
+        span_map: [
+          [0, 2, 1],
+          [1, 4, 2],
+        ],
+      });
+      assertSpanMapSegmentsByteEqual("- a\\*b\nabc", escaped, name);
+      const simple = inlineAt(blockAt(blocks, 1, "paragraph", name).inline, 0, "plain", name);
+      expect(simple, msg(name, "simple plain shape")).toEqual({ k: "plain", text: "abc", span: [7, 10] });
+      expect(simple.span_map, msg(name, "simple plain has no span_map")).toBeUndefined();
     },
   },
   "markdown footnote reference and definition": {
@@ -480,6 +546,14 @@ function parseFixture(fixture: Fixture): Block[] {
   return parseBlock(fixture.raw, fixture.format === "org");
 }
 
+type VisitCtx = {
+  seen: Seen;
+  source: string;
+  sourceBytes: Uint8Array;
+};
+
+const UTF8 = new TextEncoder();
+
 function validateFixtures(): Seen {
   const seen = {
     blockKinds: new Set<BlockKind>(),
@@ -487,20 +561,29 @@ function validateFixtures(): Seen {
     urlTypes: new Set<UrlType>(),
   };
   for (const [name, fixture] of Object.entries(FIXTURES)) {
-    visitBlocks(parseFixture(fixture), `fixture "${name}"`, seen);
+    const source = parserSource(fixture);
+    visitBlocks(parseFixture(fixture), `fixture "${name}"`, {
+      seen,
+      source,
+      sourceBytes: UTF8.encode(source),
+    });
   }
   return seen;
 }
 
-function visitBlocks(value: unknown, path: string, seen: Seen): void {
-  requireArray(value, path).forEach((block, i) => visitBlock(block, `${path}[${i}]`, seen));
+function parserSource(fixture: Fixture): string {
+  return `${fixture.format === "org" ? "*" : "-"} ${fixture.raw}`;
 }
 
-function visitBlock(value: unknown, path: string, seen: Seen): void {
+function visitBlocks(value: unknown, path: string, ctx: VisitCtx): void {
+  requireArray(value, path).forEach((block, i) => visitBlock(block, `${path}[${i}]`, ctx));
+}
+
+function visitBlock(value: unknown, path: string, ctx: VisitCtx): void {
   const block = requireRecord(value, path);
   const kind = block.kind;
   if (typeof kind !== "string" || !isBlockKind(kind)) throw new Error(`${DRIFT}: ${path}.kind unknown block kind ${String(kind)}`);
-  seen.blockKinds.add(kind);
+  ctx.seen.blockKinds.add(kind);
   requireKeys(block, BLOCK_REQUIRED_KEYS[kind], path);
 
   switch (kind) {
@@ -508,20 +591,20 @@ function visitBlock(value: unknown, path: string, seen: Seen): void {
     case "heading":
     case "bullet":
     case "footnote_def":
-      visitInlines(block.inline, `${path}.inline`, seen);
+      visitInlines(block.inline, `${path}.inline`, ctx);
       break;
     case "list":
-      requireArray(block.items, `${path}.items`).forEach((item, i) => visitListItem(item, `${path}.items[${i}]`, seen));
+      requireArray(block.items, `${path}.items`).forEach((item, i) => visitListItem(item, `${path}.items[${i}]`, ctx));
       break;
     case "quote":
     case "custom":
-      visitBlocks(block.children, `${path}.children`, seen);
+      visitBlocks(block.children, `${path}.children`, ctx);
       break;
     case "properties":
       visitProperties(block.props, `${path}.props`);
       break;
     case "table":
-      visitTable(block, path, seen);
+      visitTable(block, path, ctx);
       break;
     case "src":
     case "raw_html":
@@ -537,37 +620,53 @@ function visitBlock(value: unknown, path: string, seen: Seen): void {
   }
 }
 
-function visitListItem(value: unknown, path: string, seen: Seen): void {
+function visitListItem(value: unknown, path: string, ctx: VisitCtx): void {
   const item = requireRecord(value, path);
   requireKeys(item, LIST_ITEM_REQUIRED_KEYS, path);
-  visitBlocks(item.content, `${path}.content`, seen);
-  requireArray(item.items, `${path}.items`).forEach((child, i) => visitListItem(child, `${path}.items[${i}]`, seen));
-  if (hasOwn(item, "name")) visitInlines(item.name, `${path}.name`, seen);
+  visitBlocks(item.content, `${path}.content`, ctx);
+  requireArray(item.items, `${path}.items`).forEach((child, i) => visitListItem(child, `${path}.items[${i}]`, ctx));
+  if (hasOwn(item, "name")) visitInlines(item.name, `${path}.name`, ctx);
 }
 
-function visitInlines(value: unknown, path: string, seen: Seen): void {
-  requireArray(value, path).forEach((inline, i) => visitInline(inline, `${path}[${i}]`, seen));
+function visitInlines(value: unknown, path: string, ctx: VisitCtx, parentSpan?: Span): void {
+  let previousEnd = -1;
+  requireArray(value, path).forEach((inline, i) => {
+    const span = visitInline(inline, `${path}[${i}]`, ctx);
+    if (parentSpan && (span[0] < parentSpan[0] || span[1] > parentSpan[1])) {
+      throw new Error(`${DRIFT}: ${path}[${i}].span must be contained by parent span ${JSON.stringify(parentSpan)}`);
+    }
+    if (span[0] < previousEnd) {
+      throw new Error(`${DRIFT}: ${path}[${i}].span overlaps or precedes previous sibling`);
+    }
+    previousEnd = span[1];
+  });
 }
 
-function visitInline(value: unknown, path: string, seen: Seen): void {
+function visitInline(value: unknown, path: string, ctx: VisitCtx): Span {
   const inline = requireRecord(value, path);
   const kind = inline.k;
   if (typeof kind !== "string" || !isInlineKind(kind)) throw new Error(`${DRIFT}: ${path}.k unknown inline kind ${String(kind)}`);
-  seen.inlineKinds.add(kind);
+  ctx.seen.inlineKinds.add(kind);
   requireKeys(inline, INLINE_REQUIRED_KEYS[kind], path);
+  const span = requireSpan(inline.span, `${path}.span`, ctx.sourceBytes.length);
+  if (kind !== "plain" && hasOwn(inline, "span_map")) {
+    throw new Error(`${DRIFT}: ${path}.span_map is only valid on plain inline nodes`);
+  }
 
   switch (kind) {
     case "emphasis":
     case "subscript":
     case "superscript":
     case "tag":
-      visitInlines(inline.children, `${path}.children`, seen);
+      visitInlines(inline.children, `${path}.children`, ctx, span);
       break;
     case "link":
-      visitUrl(inline.url, `${path}.url`, seen);
-      if (hasOwn(inline, "label")) visitInlines(inline.label, `${path}.label`, seen);
+      visitUrl(inline.url, `${path}.url`, ctx.seen);
+      if (hasOwn(inline, "label")) visitInlines(inline.label, `${path}.label`, ctx, span);
       break;
     case "plain":
+      validatePlainSpanMap(inline, path, span, ctx);
+      break;
     case "code":
     case "verbatim":
     case "break":
@@ -584,6 +683,7 @@ function visitInline(value: unknown, path: string, seen: Seen): void {
     case "hiccup":
       break;
   }
+  return span;
 }
 
 function visitUrl(value: unknown, path: string, seen: Seen): void {
@@ -603,15 +703,78 @@ function visitProperties(value: unknown, path: string): void {
   });
 }
 
-function visitTable(block: Record<string, unknown>, path: string, seen: Seen): void {
+function visitTable(block: Record<string, unknown>, path: string, ctx: VisitCtx): void {
   if (block.header !== null) {
-    requireArray(block.header, `${path}.header`).forEach((cell, i) => visitInlines(cell, `${path}.header[${i}]`, seen));
+    requireArray(block.header, `${path}.header`).forEach((cell, i) => visitInlines(cell, `${path}.header[${i}]`, ctx));
   }
   requireArray(block.rows, `${path}.rows`).forEach((row, rowIndex) => {
     requireArray(row, `${path}.rows[${rowIndex}]`).forEach((cell, cellIndex) =>
-      visitInlines(cell, `${path}.rows[${rowIndex}][${cellIndex}]`, seen),
+      visitInlines(cell, `${path}.rows[${rowIndex}][${cellIndex}]`, ctx),
     );
   });
+  requireArray(block.aligns, `${path}.aligns`).forEach((align, i) => {
+    if (align !== null && align !== "left" && align !== "center" && align !== "right") {
+      throw new Error(`${DRIFT}: ${path}.aligns[${i}] must be left, center, right, or null`);
+    }
+  });
+}
+
+function validatePlainSpanMap(inline: Record<string, unknown>, path: string, span: Span, ctx: VisitCtx): void {
+  if (typeof inline.text !== "string") throw new Error(`${DRIFT}: ${path}.text must be a string`);
+  const textBytes = UTF8.encode(inline.text);
+  const sourceBytes = ctx.sourceBytes.slice(span[0], span[1]);
+  const exact = bytesEqual(textBytes, sourceBytes);
+  if (!hasOwn(inline, "span_map")) {
+    if (!exact) throw new Error(`${DRIFT}: ${path} missing span_map for non-byte-exact plain text`);
+    return;
+  }
+  if (exact) throw new Error(`${DRIFT}: ${path}.span_map present despite byte-exact plain text`);
+  validateSpanMapBytes(inline.span_map, path, span, textBytes, ctx.sourceBytes);
+}
+
+function validateSpanMapBytes(value: unknown, path: string, span: Span, textBytes: Uint8Array, sourceBytes: Uint8Array): void {
+  let lastTextStart = -1;
+  let lastSourceStart = -1;
+  let lastTextEnd = 0;
+  let lastSourceEnd = span[0];
+  requireArray(value, `${path}.span_map`).forEach((segment, i) => {
+    const tuple = requireArray(segment, `${path}.span_map[${i}]`);
+    if (tuple.length !== 3 || !tuple.every((n) => Number.isInteger(n))) {
+      throw new Error(`${DRIFT}: ${path}.span_map[${i}] must be a [text_off, src_off, len] integer tuple`);
+    }
+    const [textOff, sourceOff, len] = tuple as [number, number, number];
+    if (len < 0) throw new Error(`${DRIFT}: ${path}.span_map[${i}][2] must be non-negative`);
+    if (textOff <= lastTextStart || sourceOff <= lastSourceStart || textOff < lastTextEnd || sourceOff < lastSourceEnd) {
+      throw new Error(`${DRIFT}: ${path}.span_map[${i}] must be strictly increasing and non-overlapping`);
+    }
+    if (textOff + len > textBytes.length) throw new Error(`${DRIFT}: ${path}.span_map[${i}] exceeds plain text bytes`);
+    if (sourceOff < span[0] || sourceOff + len > span[1]) throw new Error(`${DRIFT}: ${path}.span_map[${i}] exceeds source span`);
+    const textSegment = textBytes.slice(textOff, textOff + len);
+    const sourceSegment = sourceBytes.slice(sourceOff, sourceOff + len);
+    if (!bytesEqual(textSegment, sourceSegment)) {
+      throw new Error(`${DRIFT}: ${path}.span_map[${i}] text/source bytes differ`);
+    }
+    lastTextStart = textOff;
+    lastSourceStart = sourceOff;
+    lastTextEnd = textOff + len;
+    lastSourceEnd = sourceOff + len;
+  });
+}
+
+function requireSpan(value: unknown, path: string, sourceLen: number): Span {
+  const span = requireArray(value, path);
+  if (span.length !== 2 || !span.every((n) => Number.isInteger(n))) {
+    throw new Error(`${DRIFT}: ${path} must be a [start, end] integer tuple`);
+  }
+  const [start, end] = span as [number, number];
+  if (start < 0 || end < start || end > sourceLen) {
+    throw new Error(`${DRIFT}: ${path} must be in bounds for the parser source`);
+  }
+  return [start, end];
+}
+
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  return a.length === b.length && a.every((byte, i) => byte === b[i]);
 }
 
 function requireArray(value: unknown, path: string): unknown[] {
@@ -664,6 +827,19 @@ function blockAt<K extends BlockKind>(blocks: Block[], index: number, kind: K, f
 function inlineAt<K extends InlineKind>(inlines: Inline[], index: number, kind: K, fixture: string): Extract<Inline, { k: K }> {
   expect(inlines[index]?.k, msg(fixture, `inline ${index} kind`)).toBe(kind);
   return inlines[index] as Extract<Inline, { k: K }>;
+}
+
+function assertSpanMapSegmentsByteEqual(source: string, plain: Extract<Inline, { k: "plain" }>, fixture: string): void {
+  expect(plain.span, msg(fixture, "span_map source span present")).toBeDefined();
+  expect(plain.span_map, msg(fixture, "span_map present")).toBeDefined();
+  const sourceBytes = UTF8.encode(source);
+  const textBytes = UTF8.encode(plain.text);
+  for (const [i, [textOff, sourceOff, len]] of plain.span_map!.entries()) {
+    expect(
+      [...textBytes.slice(textOff, textOff + len)],
+      msg(fixture, `span_map segment ${i} text/source byte equality`),
+    ).toEqual([...sourceBytes.slice(sourceOff, sourceOff + len)]);
+  }
 }
 
 function inlinesOfKind<K extends InlineKind>(inlines: Inline[], kind: K): Extract<Inline, { k: K }>[] {
