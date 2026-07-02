@@ -15,6 +15,7 @@ import { CalendarJump } from "./components/CalendarJump";
 import { ConflictBar } from "./components/ConflictBar";
 import { RightSidebar } from "./components/RightSidebar";
 import { Settings } from "./components/Settings";
+import { HelpPopup } from "./components/HelpShortcuts";
 import { DatePicker } from "./components/DatePicker";
 import { PageProps } from "./components/PageProps";
 import { ExportModal } from "./components/ExportModal";
@@ -44,6 +45,8 @@ import {
   firstLoadDone,
   setFirstLoadDone,
   openSettings,
+  welcomeOpen,
+  closeWelcome,
   shortcutOverrides,
   wideMode,
   documentMode,
@@ -474,7 +477,7 @@ export function App(): JSX.Element {
             {/* Settings sits apart at the far right (separated by a divider) so
                 it reads as app-level config, not another content control. */}
             <span class="topbar-sep" />
-            <button class="icon-btn" title="Settings (t s)" onClick={openSettings}>
+            <button class="icon-btn" title="Settings (t s)" onClick={() => openSettings()}>
               <svg viewBox="0 0 24 24" class="nav-icon" aria-hidden="true">
                 <path
                   fill="currentColor"
@@ -546,10 +549,11 @@ export function App(): JSX.Element {
       <PageProps />
       <ExportModal />
       <Settings />
+      <HelpPopup />
       {/* First-run onboarding: covers the (empty) app when no graph is configured.
           Rendered before Toasts so a "couldn't create graph" toast still shows on top. */}
-      <Show when={(globalThis as any).__FORCE_WELCOME__ === true || (firstLoadDone() && !graphMeta())}>
-        <Welcome />
+      <Show when={welcomeOpen() || (globalThis as any).__FORCE_WELCOME__ === true || (firstLoadDone() && !graphMeta())}>
+        <Welcome onClose={welcomeOpen() ? closeWelcome : undefined} />
       </Show>
       <Toasts />
       <Lightbox />

@@ -129,7 +129,7 @@ and the **[demo](https://tine.page/demo/)** shows the rendered-content side of i
 | **PDF** | Zoomable virtualized viewer, in-PDF find, text + area (image) highlights stored Logseq-compatibly, each a bullet you can annotate. |
 | **Search & nav** | `Ctrl+K` switcher (titles + full text), command palette, namespace tree, tabs, back/forward, focus mode, global quick-capture, page icons. |
 | **Your files** | Safe to run alongside Logseq mobile over Syncthing — conflict detection, format-preserving atomic saves, transactional rename, org-mode (byte-faithful or read-only), snapshots + trash. |
-| **Customize & export** | Remappable shortcuts, themes + custom CSS, multi-language spell check, static HTML export with offline search, copy/export as Markdown. |
+| **Customize & export** | Remappable shortcuts with `?` help, themes + custom CSS, multi-language spell check, static HTML export with offline search, copy/export as Markdown. |
 
 → **[See every feature, with the details, in docs/FEATURES.md.](docs/FEATURES.md)**
 

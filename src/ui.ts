@@ -798,12 +798,35 @@ export function closeContextMenu() {
   setContextMenu(null);
 }
 
+export type SettingsTabId = "appearance" | "editor" | "journals" | "files" | "backups" | "graph" | "shortcuts";
+
 export const [settingsOpen, setSettingsOpen] = createSignal(false);
-export function openSettings() {
+export const [settingsTabRequest, setSettingsTabRequest] = createSignal<SettingsTabId | null>(null);
+export function openSettings(tab?: SettingsTabId) {
+  if (tab) setSettingsTabRequest(tab);
   setSettingsOpen(true);
 }
 export function closeSettings() {
   setSettingsOpen(false);
+}
+export function clearSettingsTabRequest() {
+  setSettingsTabRequest(null);
+}
+
+export const [helpPopupOpen, setHelpPopupOpen] = createSignal(false);
+export function toggleHelpPopup() {
+  setHelpPopupOpen((open) => !open);
+}
+export function closeHelpPopup() {
+  setHelpPopupOpen(false);
+}
+
+export const [welcomeOpen, setWelcomeOpen] = createSignal(false);
+export function openWelcome() {
+  setWelcomeOpen(true);
+}
+export function closeWelcome() {
+  setWelcomeOpen(false);
 }
 
 // Transient toast notifications (bottom-right), auto-dismissed.

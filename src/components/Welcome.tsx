@@ -4,7 +4,7 @@ import { switchGraph, createNewGraph } from "../graph";
 /** First-run onboarding. Shown (as a full-cover layer) when the app starts with
  *  no graph configured: choose to open an existing Logseq graph, or create a new
  *  one that comes pre-loaded with a short guided demo. */
-export function Welcome(): JSX.Element {
+export function Welcome(props: { onClose?: () => void } = {}): JSX.Element {
   const [busy, setBusy] = createSignal<null | "open" | "create">(null);
 
   const run = (which: "open" | "create", fn: () => Promise<void>) => async () => {
@@ -12,6 +12,7 @@ export function Welcome(): JSX.Element {
     setBusy(which);
     try {
       await fn();
+      props.onClose?.();
     } finally {
       // If the graph loaded, this layer unmounts anyway (graphMeta is set); if the
       // picker was cancelled, re-enable the buttons.
@@ -22,6 +23,11 @@ export function Welcome(): JSX.Element {
   return (
     <div class="welcome-overlay">
       <div class="welcome-card">
+        <Show when={props.onClose}>
+          <button class="welcome-close" title="Close welcome" onClick={() => props.onClose?.()}>
+            x
+          </button>
+        </Show>
         <svg class="welcome-mark" width="52" height="64" viewBox="0 0 64 80" aria-hidden="true">
           <g stroke="currentColor" stroke-width="6" stroke-linecap="round" fill="none">
             <path d="M16 14 V36" /><path d="M32 14 V36" /><path d="M48 14 V36" />

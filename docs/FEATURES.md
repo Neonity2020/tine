@@ -198,6 +198,11 @@ files. **⊕ marks things Tine adds on top of Logseq core** (no plugins).
 
 ## Customization & output
 
+- **Help & shortcuts** — `?` toggles the OG-style bottom-right help popup;
+  **Keyboard shortcuts** inside it opens the Settings modal on the shortcuts tab.
+  `g s` opens that tab directly. Unlike OG's popup entry, Tine deliberately shows
+  shortcuts in Settings rather than the right sidebar, so remapping and reference
+  docs live in one place.
 - **Fully remappable keyboard shortcuts** — in the Settings modal or via
   `config.edn :shortcuts`.
 - Light/dark themes, accent color, custom CSS, wide mode (`t w`), document mode

@@ -2,6 +2,8 @@ import { For, Show, createEffect, createMemo, createResource, createSignal, onCl
 import {
   settingsOpen,
   closeSettings,
+  settingsTabRequest,
+  clearSettingsTabRequest,
   setJournalTemplate,
   theme,
   toggleTheme,
@@ -41,6 +43,7 @@ import {
   pushToast,
   journalConflicts,
   refreshJournalConflicts,
+  type SettingsTabId,
 } from "../ui";
 import { interfaceZoom, zoomIn, zoomOut, zoomReset } from "../zoom";
 import { smoothScrollEnabled, setSmoothScroll } from "../smoothScroll";
@@ -74,6 +77,7 @@ import {
 import { formatAssetName } from "../media";
 import { openPage, openFile } from "../router";
 import { commandDefaults, eventToBindingString, setKeybindingsSuspended } from "../keybindings";
+import { ShortcutsSettingsPane } from "./HelpShortcuts";
 import { switchGraph, loadGraphPath } from "../graph";
 import { flushAll } from "../store";
 import { backend, isTauri, type BackupInfo } from "../backend";
@@ -105,7 +109,7 @@ const DATE_FORMATS = [
   "yyyyMMdd",
 ];
 
-type Tab = "appearance" | "editor" | "journals" | "files" | "backups" | "graph" | "shortcuts";
+type Tab = SettingsTabId;
 const TABS: { id: Tab; label: string }[] = [
   { id: "appearance", label: "Appearance" },
   { id: "editor", label: "Editor" },
@@ -139,6 +143,14 @@ export function Settings(): JSX.Element {
       overridden: c.id in ov,
     }));
   };
+
+  createEffect(() => {
+    if (!settingsOpen()) return;
+    const requested = settingsTabRequest();
+    if (!requested) return;
+    setTab(requested);
+    clearSettingsTabRequest();
+  });
 
   // Recording: capture the next chord for the command being remapped.
   const [recording, setRecording] = createSignal<string | null>(null);
@@ -213,39 +225,12 @@ export function Settings(): JSX.Element {
                 <GraphTab publishMsg={publishMsg()} doPublish={doPublish} />
               </Show>
               <Show when={tab() === "shortcuts"}>
-                <div class="settings-hint settings-block">
-                  Click a binding to record new keys ("mod" = Ctrl). Esc cancels.
-                  Overrides are saved locally on top of <code>config.edn</code>.
-                </div>
-                <div class="settings-shortcuts">
-                  <For each={shortcuts()}>
-                    {(s) => (
-                      <div class="settings-shortcut-row">
-                        <span class="settings-shortcut-label">{s.label}</span>
-                        <button
-                          class="settings-shortcut-binding"
-                          classList={{ recording: recording() === s.id, overridden: s.overridden }}
-                          onClick={() => setRecording(recording() === s.id ? null : s.id)}
-                          title="Click to remap"
-                        >
-                          {recording() === s.id ? "Press keys…" : s.effective}
-                        </button>
-                        <span class="settings-shortcut-tail">
-                          <Show when={s.overridden}>
-                            <button
-                              class="settings-shortcut-reset"
-                              title="Reset to default"
-                              onClick={() => resetShortcutOverride(s.id)}
-                            >
-                              ↺
-                            </button>
-                          </Show>
-                          <span class="settings-shortcut-id mono">{s.id}</span>
-                        </span>
-                      </div>
-                    )}
-                  </For>
-                </div>
+                <ShortcutsSettingsPane
+                  shortcuts={shortcuts()}
+                  recording={recording()}
+                  onRecord={(id) => setRecording(recording() === id ? null : id)}
+                  onReset={resetShortcutOverride}
+                />
               </Show>
             </div>
           </div>

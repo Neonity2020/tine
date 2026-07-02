@@ -15,6 +15,7 @@ import {
   closeSwitcher,
   closeSettings,
   openSettings,
+  toggleHelpPopup,
   toggleRightSidebar,
   toggleWideMode,
   toggleDocumentMode,
@@ -62,6 +63,8 @@ interface Chord {
   key: string; // lowercase, normalized
 }
 
+export type ShortcutScope = "global" | "editor" | "select";
+
 interface CommandDef {
   id: string;
   binding: string;
@@ -83,6 +86,7 @@ const COMMANDS: CommandDef[] = [
   { id: "go/search", binding: "mod+k", label: "Search / quick switch", scope: "global", run: openSwitcher, global: true },
   { id: "command-palette/toggle", binding: "mod+shift+p", label: "Command palette", scope: "global", run: openCommandPalette, global: true },
   { id: "go/journals", binding: "g j", label: "Go to journals", scope: "global", run: openJournals },
+  { id: "go/keyboard-shortcuts", binding: "g s", label: "Go to keyboard shortcuts", scope: "global", run: () => openSettings("shortcuts") },
   // Browser-style history nav (per-tab back/forward). Special-cased in the
   // dispatcher so they fire even while editing a block; remappable like any other.
   { id: "go/backward", binding: "alt+left", label: "Go back", scope: "global", run: goBack, global: true },
@@ -106,6 +110,10 @@ const COMMANDS: CommandDef[] = [
   { id: "ui/toggle-document-mode", binding: "t d", label: "Toggle document mode", scope: "global", run: toggleDocumentMode },
   { id: "ui/toggle-focus-mode", binding: "t f", label: "Toggle focus mode", scope: "global", run: toggleFocusMode },
   { id: "ui/toggle-dim-blocks", binding: "t b", label: "Toggle dim inactive blocks", scope: "global", run: toggleDimInactiveBlocks },
+  // Web KeyboardEvent reports Shift+/ as key "?", so the binding must use the
+  // shifted character. OG stores "shift+/" and rewrites it for display; Tine
+  // matches eventToChord's actual output instead.
+  { id: "ui/toggle-help", binding: "shift+?", label: "Toggle help", scope: "global", run: toggleHelpPopup },
   // Carry unfinished tasks forward. Palette-only (no default binding); the presets
   // and the settings-configured N are all surfaced in Ctrl-K.
   { id: "task/carry-7", binding: "", label: "Carry unfinished tasks: last 7 days", scope: "global", run: () => void carryDaysBack(7) },
@@ -146,6 +154,131 @@ const COMMANDS: CommandDef[] = [
   { id: "editor/backward-kill-word", binding: "alt+w", label: "Delete word backward", scope: "editor" },
   { id: "editor/forward-kill-word", binding: "alt+d", label: "Delete word forward", scope: "editor" },
 ];
+
+export interface BuiltinKeyDef {
+  id: string;
+  scope: ShortcutScope;
+  binding: string;
+  label: string;
+  details?: string;
+}
+
+// Hardcoded keys that are intentionally not remappable. Keep this next to
+// COMMANDS so shortcut behavior and shortcut documentation drift together.
+export const BUILTIN_KEYS: BuiltinKeyDef[] = [
+  {
+    id: "builtin/global/escape",
+    scope: "global",
+    binding: "esc",
+    label: "Close overlays or exit focus",
+    details: "Closes Search / Settings first; outside overlays, peels off block selection and focus mode.",
+  },
+  {
+    id: "builtin/editor/enter",
+    scope: "editor",
+    binding: "enter",
+    label: "New block or continue list",
+    details: "Splits the current block, continues an in-block list, or adds a sibling note under PDF annotations.",
+  },
+  {
+    id: "builtin/editor/soft-newline",
+    scope: "editor",
+    binding: "shift+enter",
+    label: "Insert a newline inside the block",
+  },
+  {
+    id: "builtin/editor/escape",
+    scope: "editor",
+    binding: "esc",
+    label: "Leave editing and select the block",
+  },
+  {
+    id: "builtin/editor/backspace-start",
+    scope: "editor",
+    binding: "backspace",
+    label: "Merge at block start",
+    details: "At the start of a block, merges with the previous block or removes an empty block/list marker.",
+  },
+  {
+    id: "builtin/editor/arrow-cross-block",
+    scope: "editor",
+    binding: "up / down",
+    label: "Move across blocks at visual edges",
+    details: "From the first or last visual row, moves the caret to the previous or next visible block.",
+  },
+  {
+    id: "builtin/editor/copy-block-ref",
+    scope: "editor",
+    binding: "mod+c",
+    label: "Copy block reference when no text is selected",
+  },
+  {
+    id: "builtin/editor/ac-nav",
+    scope: "editor",
+    binding: "up / down",
+    label: "Autocomplete: move highlight",
+  },
+  {
+    id: "builtin/editor/ac-accept",
+    scope: "editor",
+    binding: "enter / tab / shift+tab",
+    label: "Autocomplete: accept highlighted item",
+  },
+  {
+    id: "builtin/editor/ac-close",
+    scope: "editor",
+    binding: "esc",
+    label: "Autocomplete: close the popup",
+  },
+  {
+    id: "builtin/select/escape",
+    scope: "select",
+    binding: "esc",
+    label: "Clear block selection",
+  },
+  {
+    id: "builtin/select/move",
+    scope: "select",
+    binding: "up / down",
+    label: "Move the selected block range",
+  },
+  {
+    id: "builtin/select/extend",
+    scope: "select",
+    binding: "shift+up / shift+down",
+    label: "Extend block selection",
+  },
+  {
+    id: "builtin/select/delete",
+    scope: "select",
+    binding: "backspace / delete",
+    label: "Delete selected blocks",
+  },
+  {
+    id: "builtin/select/copy",
+    scope: "select",
+    binding: "mod+c",
+    label: "Copy selected outline",
+  },
+  {
+    id: "builtin/select/cut",
+    scope: "select",
+    binding: "mod+x",
+    label: "Cut selected outline",
+  },
+  {
+    id: "builtin/select/edit",
+    scope: "select",
+    binding: "enter",
+    label: "Edit the last selected block",
+  },
+];
+
+function shortcutScope(c: CommandDef): ShortcutScope {
+  if (c.scope === "editor") return "editor";
+  if (!c.global && c.binding.trim()) return "select";
+  return "global";
+}
 
 function normKey(k: string): string {
   switch (k) {
@@ -203,6 +336,9 @@ let superDown = false;
 function eventToChord(e: KeyboardEvent): Chord {
   // WebKitGTK reports Shift+Tab with e.key != "Tab"; e.code is reliable.
   let key = e.code === "Tab" ? "tab" : e.key.toLowerCase();
+  // Real WebKitGTK reports Shift+/ as key "?"; Playwright/Chromium's synthetic
+  // Shift+/ reports key "/". Normalize both to the binding string we expose.
+  if (e.shiftKey && e.code === "Slash" && key === "/") key = "?";
   key = normKey(key);
   return {
     mod: isMac ? e.metaKey : e.ctrlKey,
@@ -267,19 +403,20 @@ export function paletteCommands(): { id: string; label: string; binding: string;
 }
 
 /** Merged shortcuts for the Settings reference. */
-export function currentShortcuts(): { id: string; label: string; binding: string }[] {
+export function currentShortcuts(): { id: string; label: string; binding: string; scope: ShortcutScope }[] {
   return COMMANDS.map((c) => ({
     id: c.id,
     label: c.label,
     binding: overridesApplied[c.id] ?? c.binding,
+    scope: shortcutScope(c),
   })).filter((c) => c.binding !== "false");
 }
 
 /** Built-in command defaults (id + label + default binding) for the Settings
  *  remap UI, which computes the effective binding reactively from these plus
  *  config.edn and the user's local overrides. */
-export function commandDefaults(): { id: string; label: string; binding: string }[] {
-  return COMMANDS.map((c) => ({ id: c.id, label: c.label, binding: c.binding }));
+export function commandDefaults(): { id: string; label: string; binding: string; scope: ShortcutScope }[] {
+  return COMMANDS.map((c) => ({ id: c.id, label: c.label, binding: c.binding, scope: shortcutScope(c) }));
 }
 
 /** Turn a keyboard event into a binding string like "mod+shift+down". Returns
