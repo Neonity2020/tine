@@ -28,6 +28,12 @@ jobs:
 
       - run: npm ci
 
+      # The pin guard otherwise only runs inside `npm run build`, which fast CI
+      # skips — a Cargo lsdoc bump with stale vendored WASM must fail HERE, not
+      # at release-build time.
+      - name: lsdoc WASM pin check
+        run: node scripts/check-wasm-pin.mjs
+
       - name: Typecheck (tsc)
         run: npx tsc --noEmit
 
@@ -36,3 +42,29 @@ jobs:
 
       - name: Rust core tests
         run: cargo test -p tine-core
+
+  # Perf regression bench (docs/BENCH.md Tier 3). Performance is the #2 project
+  # priority; without this job a lazy-render/cache regression can land silently.
+  # `continue-on-error` for now: shared-runner noise vs the 30% gate is unproven —
+  # watch a few weeks of runs, then drop the flag to make it gating.
+  bench:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - name: Install bench browser (Playwright Chromium)
+        run: npx playwright install --with-deps chromium
+
+      - name: Build (prod — the bench serves dist/)
+        run: npm run build
+
+      - name: Perf bench (non-gating while runner noise is calibrated)
+        continue-on-error: true
+        run: npm run bench
