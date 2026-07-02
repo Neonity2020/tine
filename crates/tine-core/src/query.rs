@@ -892,9 +892,14 @@ pub fn resolve_blocks(graph: &Graph, uuids: &[String]) -> Vec<Option<RefGroup>> 
 
     let mut resolved: HashMap<&str, RefGroup> = HashMap::new();
     graph.with_pages(|pages| {
+        let mut page_by_name: HashMap<&str, (&PageEntry, &std::sync::Arc<Document>)> =
+            HashMap::with_capacity(pages.len());
+        for (entry, doc) in pages {
+            page_by_name.entry(entry.name.as_str()).or_insert((entry, doc));
+        }
         // 1) Each hinted page: ONE walk resolving all of its hinted ids.
         for (page, ids) in &by_page {
-            if let Some((entry, doc)) = pages.iter().find(|(e, _)| &e.name == page) {
+            if let Some(&(entry, doc)) = page_by_name.get(page.as_str()) {
                 let want: HashSet<&str> = ids.iter().copied().collect();
                 resolve_ids_in_page(entry, doc, &want, &mut resolved);
             }

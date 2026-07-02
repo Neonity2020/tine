@@ -1,7 +1,7 @@
 // Prevent a console window on Windows release builds.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use tine_core::model::{Graph, GraphMeta, PageDto, PageEntry, PageKind, RefGroup};
+use tine_core::model::{atomic_copy, Graph, GraphMeta, PageDto, PageEntry, PageKind, RefGroup};
 use std::collections::HashMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -422,18 +422,19 @@ fn backup_async(app: tauri::AppHandle) {
 /// app-settings file and prunes old snapshots afterwards. `suffix` tags special
 /// snapshots (e.g. "pre-restore") so they get a distinct, collision-proof
 /// directory name and are exempt from the keep-count prune.
-/// Returns (files copied, complete) — `complete` is false if ANY `.md`/config
-/// copy failed, so the caller (restore) can refuse to proceed without a full
-/// rollback snapshot.
+/// Returns (files copied, complete) — `complete` is false if ANY graph
+/// text/config/asset-sidecar copy failed, so the caller (restore) can refuse to
+/// proceed without a full rollback snapshot.
 fn do_backup(app: &tauri::AppHandle, suffix: &str) -> (usize, bool) {
     // Grab just the paths under the lock, then copy from disk lock-free.
-    let (journals, pages, cfg, root) = {
+    let (journals, pages, assets, cfg, root) = {
         let state: State<'_, AppState> = app.state();
         let guard = state.graph.read().unwrap();
         match guard.as_ref() {
             Some(g) => (
                 g.journals_path(),
                 g.pages_path(),
+                g.assets_path(),
                 g.root.join("logseq").join("config.edn"),
                 g.root.clone(),
             ),
@@ -450,7 +451,7 @@ fn do_backup(app: &tauri::AppHandle, suffix: &str) -> (usize, bool) {
     // two snapshots in the same second (e.g. a launch snapshot racing a pre-restore
     // snapshot) would otherwise share one directory — and copy_md_dir, which copies
     // in but never removes files absent from the live graph, would mix both
-    // snapshots' files, leaving a later restore with stale notes. `create_dir`
+    // snapshots' files, leaving a later restore with stale notes/sidecars. `create_dir`
     // (non-recursive) fails atomically if the name is taken, so we bump a counter
     // until we win an unused name.
     let _ = std::fs::create_dir_all(&base);
@@ -468,8 +469,9 @@ fn do_backup(app: &tauri::AppHandle, suffix: &str) -> (usize, bool) {
     }
     let (cj, fj) = copy_md_dir(&journals, &dest.join(dir_name(&journals)));
     let (cp, fp) = copy_md_dir(&pages, &dest.join(dir_name(&pages)));
-    let mut n = cj + cp;
-    let mut failed = fj + fp;
+    let (ca, fa) = copy_asset_sidecars_dir(&assets, &dest.join(dir_name(&assets)));
+    let mut n = cj + cp + ca;
+    let mut failed = fj + fp + fa;
     if cfg.exists() {
         let out = dest.join("logseq");
         if std::fs::create_dir_all(&out).is_ok()
@@ -1010,7 +1012,7 @@ fn list_backups(app: tauri::AppHandle) -> Result<Vec<BackupInfo>, String> {
                 Some(s) => s.to_string(),
                 None => continue,
             };
-            let files = count_md_recursive(&p);
+            let files = count_md_recursive(&p) + count_asset_sidecars_recursive(&p.join("assets"));
             out.push(BackupInfo { stamp, files });
         }
     }
@@ -1033,9 +1035,25 @@ fn count_md_recursive(dir: &std::path::Path) -> usize {
     n
 }
 
-/// Restore a snapshot into the live graph, overwriting `journals/`, `pages/` and
-/// `config.edn`. Takes a fresh safety snapshot of the *current* state first (so a
-/// mistaken restore is itself reversible). Destructive — the frontend confirms.
+fn count_asset_sidecars_recursive(dir: &std::path::Path) -> usize {
+    let mut n = 0;
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                n += count_asset_sidecars_recursive(&p);
+            } else if is_asset_sidecar(&p) {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// Restore a snapshot into the live graph, overwriting `journals/`, `pages/`,
+/// asset `.edn` sidecars, and `config.edn`. Takes a fresh safety snapshot of the
+/// *current* state first (so a mistaken restore is itself reversible).
+/// Destructive — the frontend confirms.
 #[tauri::command]
 fn restore_backup(stamp: String, app: tauri::AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     // Guard against path traversal — a stamp is only ever `YYYY-MM-DD_HH-MM-SS`.
@@ -1044,12 +1062,13 @@ fn restore_backup(stamp: String, app: tauri::AppHandle, state: State<'_, AppStat
     {
         return Err("invalid backup id".into());
     }
-    let (journals, pages, cfg_dest) = {
+    let (journals, pages, assets, cfg_dest) = {
         let guard = state.graph.read().unwrap();
         let g = guard.as_ref().ok_or("no graph loaded")?;
         (
             g.journals_path(),
             g.pages_path(),
+            g.assets_path(),
             g.root.join("logseq").join("config.edn"),
         )
     };
@@ -1063,7 +1082,9 @@ fn restore_backup(stamp: String, app: tauri::AppHandle, state: State<'_, AppStat
     // post-restore reload will take. Abort if the snapshot fails while the live
     // graph has content — never run a destructive restore without a way back.
     let (snapshot_n, complete) = do_backup(&app, "pre-restore");
-    let live_n = count_md_recursive(&journals) + count_md_recursive(&pages);
+    let live_n = count_md_recursive(&journals)
+        + count_md_recursive(&pages)
+        + count_asset_sidecars_recursive(&assets);
     // A destructive restore must be fully reversible: abort unless the pre-restore
     // snapshot captured everything (every file copied, nothing skipped).
     if live_n > 0 && (snapshot_n == 0 || !complete) {
@@ -1075,22 +1096,24 @@ fn restore_backup(stamp: String, app: tauri::AppHandle, state: State<'_, AppStat
         .map_err(|e| format!("restore journals failed: {e}"))?;
     restore_md_dir(&src.join(dir_name(&pages)), &pages)
         .map_err(|e| format!("restore pages failed: {e}"))?;
+    restore_asset_sidecars_dir(&src.join(dir_name(&assets)), &assets)
+        .map_err(|e| format!("restore asset sidecars failed: {e}"))?;
     let src_cfg = src.join("logseq").join("config.edn");
     if src_cfg.exists() {
         if let Some(parent) = cfg_dest.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        std::fs::copy(&src_cfg, &cfg_dest).map_err(|e| format!("restore config failed: {e}"))?;
+        atomic_copy(&src_cfg, &cfg_dest).map_err(|e| format!("restore config failed: {e}"))?;
     }
     Ok(())
 }
 
-/// Restore the `.md` files in `dest` from `src`. Each file is copied to a temp
-/// file in `dest` then atomically renamed over the target — so a failure or
-/// power-loss mid-copy can never leave a live note truncated/half-written. Copies
-/// happen FIRST; only after they all succeed do we delete `dest` `.md` files not
-/// in the backup. A copy error returns early leaving a superset of files (no
-/// data lost). Non-`.md` files are left untouched.
+/// Restore graph text files in `dest` from `src`. Each file is copied through
+/// the shared atomic helper, so a failure or power-loss mid-copy can never leave
+/// a live note truncated/half-written. Copies happen FIRST; only after they all
+/// succeed do we delete `dest` graph text files not in the backup. A copy error
+/// returns early leaving a superset of files (no data lost). Other files are left
+/// untouched.
 fn restore_md_dir(src: &std::path::Path, dest: &std::path::Path) -> std::io::Result<()> {
     if !src.is_dir() {
         return Ok(());
@@ -1102,9 +1125,7 @@ fn restore_md_dir(src: &std::path::Path, dest: &std::path::Path) -> std::io::Res
         if is_graph_text(&p) {
             if let Some(name) = p.file_name() {
                 let target = dest.join(name);
-                let tmp = dest.join(format!(".{}.tine-restore", name.to_string_lossy()));
-                std::fs::copy(&p, &tmp)?;
-                std::fs::rename(&tmp, &target)?; // atomic replace on the same fs
+                atomic_copy(&p, &target)?;
                 restored.insert(name.to_string_lossy().into_owned());
             }
         }
@@ -1122,10 +1143,76 @@ fn restore_md_dir(src: &std::path::Path, dest: &std::path::Path) -> std::io::Res
     Ok(())
 }
 
-/// Page/journal text files Tine snapshots + restores: Markdown and Org. (Assets,
-/// `.edn` sidecars, etc. are intentionally not snapshotted here.)
+fn restore_asset_sidecars_dir(src: &std::path::Path, dest: &std::path::Path) -> std::io::Result<()> {
+    if !src.is_dir() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(dest)?;
+    let mut restored: std::collections::HashSet<std::path::PathBuf> =
+        std::collections::HashSet::new();
+    restore_asset_sidecars_copy(src, dest, std::path::Path::new(""), &mut restored)?;
+    delete_unrestored_asset_sidecars(dest, std::path::Path::new(""), &restored)?;
+    Ok(())
+}
+
+fn restore_asset_sidecars_copy(
+    src: &std::path::Path,
+    dest: &std::path::Path,
+    rel: &std::path::Path,
+    restored: &mut std::collections::HashSet<std::path::PathBuf>,
+) -> std::io::Result<()> {
+    for e in std::fs::read_dir(src)? {
+        let e = e?;
+        let ft = e.file_type()?;
+        let rel_child = rel.join(e.file_name());
+        let p = e.path();
+        if ft.is_dir() {
+            std::fs::create_dir_all(dest.join(&rel_child))?;
+            restore_asset_sidecars_copy(&p, dest, &rel_child, restored)?;
+        } else if ft.is_file() && is_asset_sidecar(&p) {
+            let target = dest.join(&rel_child);
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            atomic_copy(&p, &target)?;
+            restored.insert(rel_child);
+        }
+    }
+    Ok(())
+}
+
+fn delete_unrestored_asset_sidecars(
+    dest: &std::path::Path,
+    rel: &std::path::Path,
+    restored: &std::collections::HashSet<std::path::PathBuf>,
+) -> std::io::Result<()> {
+    let dir = dest.join(rel);
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    for e in std::fs::read_dir(&dir)? {
+        let e = e?;
+        let ft = e.file_type()?;
+        let rel_child = rel.join(e.file_name());
+        let p = e.path();
+        if ft.is_dir() {
+            delete_unrestored_asset_sidecars(dest, &rel_child, restored)?;
+        } else if ft.is_file() && is_asset_sidecar(&p) && !restored.contains(&rel_child) {
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+    Ok(())
+}
+
+/// Page/journal text files Tine snapshots + restores: Markdown and Org. Asset
+/// `.edn` sidecars are handled separately under `assets`; binary asset bytes stay
+/// excluded from snapshots by design.
 fn is_graph_text(p: &std::path::Path) -> bool {
     matches!(p.extension().and_then(|x| x.to_str()), Some("md") | Some("org"))
+}
+
+fn is_asset_sidecar(p: &std::path::Path) -> bool {
+    matches!(p.extension().and_then(|x| x.to_str()), Some("edn"))
 }
 
 fn dir_name(p: &std::path::Path) -> String {
@@ -1134,8 +1221,8 @@ fn dir_name(p: &std::path::Path) -> String {
 fn sanitize_id(s: &str) -> String {
     s.chars().map(|c| if c.is_alphanumeric() { c } else { '_' }).collect()
 }
-/// Copy every `.md` from `src` to `dest`. Returns (copied, failed) so the caller
-/// can tell a complete snapshot from a partial one.
+/// Copy every graph text file from `src` to `dest`. Returns (copied, failed) so
+/// the caller can tell a complete snapshot from a partial one.
 fn copy_md_dir(src: &std::path::Path, dest: &std::path::Path) -> (usize, usize) {
     // Materialize the dest dir up front, even when src has no .md files — so the
     // snapshot records "this dir existed and was empty". Otherwise restore can't
@@ -1163,6 +1250,40 @@ fn copy_md_dir(src: &std::path::Path, dest: &std::path::Path) -> (usize, usize) 
             copied += 1;
         } else {
             failed += 1;
+        }
+    }
+    (copied, failed)
+}
+
+fn copy_asset_sidecars_dir(src: &std::path::Path, dest: &std::path::Path) -> (usize, usize) {
+    let _ = std::fs::create_dir_all(dest);
+    let rd = match std::fs::read_dir(src) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (0, 0),
+        Err(_) => return (0, 1),
+    };
+    let (mut copied, mut failed) = (0usize, 0usize);
+    for entry in rd {
+        let Ok(entry) = entry else {
+            failed += 1;
+            continue;
+        };
+        let p = entry.path();
+        let Ok(ft) = entry.file_type() else {
+            failed += 1;
+            continue;
+        };
+        let target = dest.join(entry.file_name());
+        if ft.is_dir() {
+            let (c, f) = copy_asset_sidecars_dir(&p, &target);
+            copied += c;
+            failed += f;
+        } else if ft.is_file() && is_asset_sidecar(&p) {
+            if std::fs::create_dir_all(dest).is_ok() && std::fs::copy(&p, &target).is_ok() {
+                copied += 1;
+            } else {
+                failed += 1;
+            }
         }
     }
     (copied, failed)
@@ -2017,4 +2138,66 @@ fn main() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("tine-tauri-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn copy_asset_sidecars_dir_copies_only_edn_recursively() {
+        let root = scratch("copy-sidecars");
+        let src = root.join("assets");
+        let dst = root.join("backup").join("assets");
+        std::fs::create_dir_all(src.join("nested")).unwrap();
+        std::fs::write(src.join("doc.edn"), "{:a 1}\n").unwrap();
+        std::fs::write(src.join("nested").join("hl.edn"), "{:b 2}\n").unwrap();
+        std::fs::write(src.join("image.png"), b"png").unwrap();
+        std::fs::write(src.join("nested").join("image.png"), b"png").unwrap();
+
+        assert_eq!(copy_asset_sidecars_dir(&src, &dst), (2, 0));
+        assert_eq!(std::fs::read_to_string(dst.join("doc.edn")).unwrap(), "{:a 1}\n");
+        assert_eq!(
+            std::fs::read_to_string(dst.join("nested").join("hl.edn")).unwrap(),
+            "{:b 2}\n"
+        );
+        assert!(!dst.join("image.png").exists());
+        assert!(!dst.join("nested").join("image.png").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn restore_asset_sidecars_dir_restores_sidecars_and_leaves_binary_assets() {
+        let root = scratch("restore-sidecars");
+        let src = root.join("backup").join("assets");
+        let dest = root.join("graph").join("assets");
+        std::fs::create_dir_all(src.join("nested")).unwrap();
+        std::fs::create_dir_all(dest.join("nested")).unwrap();
+        std::fs::write(src.join("doc.edn"), "new\n").unwrap();
+        std::fs::write(src.join("nested").join("hl.edn"), "nested new\n").unwrap();
+        std::fs::write(dest.join("doc.edn"), "old\n").unwrap();
+        std::fs::write(dest.join("stale.edn"), "stale\n").unwrap();
+        std::fs::write(dest.join("image.png"), b"keep").unwrap();
+        std::fs::write(dest.join("nested").join("stale.edn"), "stale\n").unwrap();
+        std::fs::write(dest.join("nested").join("image.png"), b"keep").unwrap();
+
+        restore_asset_sidecars_dir(&src, &dest).unwrap();
+        assert_eq!(std::fs::read_to_string(dest.join("doc.edn")).unwrap(), "new\n");
+        assert_eq!(
+            std::fs::read_to_string(dest.join("nested").join("hl.edn")).unwrap(),
+            "nested new\n"
+        );
+        assert!(!dest.join("stale.edn").exists());
+        assert!(!dest.join("nested").join("stale.edn").exists());
+        assert_eq!(std::fs::read(dest.join("image.png")).unwrap(), b"keep");
+        assert_eq!(std::fs::read(dest.join("nested").join("image.png")).unwrap(), b"keep");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

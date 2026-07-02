@@ -269,6 +269,9 @@ pub struct Graph {
     /// today). Lets a re-render, a second component showing the same query, or
     /// navigating back to a page recompute nothing; never serves a stale result.
     derived_cache: RwLock<Option<DerivedCache>>,
+    /// Memoized advanced-query results. Kept separate from `derived_cache` because
+    /// advanced queries return clause metadata as well as groups.
+    advanced_cache: RwLock<Option<AdvancedCache>>,
     /// Memoized `list_pages()` (the journals//pages/ directory scan), keyed by
     /// cache_gen — which bumps on every page create/delete/rename (Tine or watcher)
     /// — so quick-switch / [[ ]] autocomplete don't re-read both dirs on every
@@ -328,6 +331,12 @@ struct DerivedCache {
     results: std::collections::HashMap<String, Arc<Vec<RefGroup>>>,
 }
 
+struct AdvancedCache {
+    gen: u64,
+    today: i64,
+    results: std::collections::HashMap<String, Arc<crate::query::AdvancedResult>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GraphMeta {
     pub root: String,
@@ -381,6 +390,7 @@ impl Graph {
             block_index: RwLock::new(None),
             block_ref_count_cache: RwLock::new(None),
             derived_cache: RwLock::new(None),
+            advanced_cache: RwLock::new(None),
             page_list_cache: RwLock::new(None),
             recent_writes: std::sync::Mutex::new(std::collections::HashMap::new()),
             disk_revs: RwLock::new(std::collections::HashMap::new()),
@@ -756,9 +766,7 @@ impl Graph {
         }
         let trash = self.root.join("logseq").join(".tine-trash");
         let dest = trash.join(format!("{}__{name}", trash_stamp()));
-        if fs::create_dir_all(&trash).is_err() || fs::rename(&src, &dest).is_err() {
-            fs::remove_file(&src)?;
-        }
+        move_to_trash(&src, &dest, &trash)?;
         Ok(())
     }
 
@@ -1029,21 +1037,41 @@ impl Graph {
     }
 
     /// The `icon::` property value of each named page that has one (for rendering
-    /// page icons next to titles / in the namespace tree, like OG). Loads each
-    /// page (cached) and reads its pre-block; only pages WITH an icon appear in
-    /// the result. On-demand (e.g. a `{{namespace}}` macro), not at index time.
+    /// page icons next to titles / in the namespace tree, like OG). Scans the
+    /// cached pages once, then answers the requested names; only pages WITH an
+    /// icon appear in the result. On-demand (e.g. a `{{namespace}}` macro), not at
+    /// index time.
     pub fn page_icons(
         &self,
         names: &[String],
     ) -> std::collections::HashMap<String, String> {
+        let (mut icons_by_name, real_page_names) = self.with_pages(|pages| {
+            let mut icons = std::collections::HashMap::new();
+            let mut real = std::collections::HashSet::new();
+            for (entry, doc) in pages {
+                if entry.kind != PageKind::Page {
+                    continue;
+                }
+                let key = crate::refs::page_key(&entry.name);
+                real.insert(key.clone());
+                if let Some(icon) = doc.pre_block.as_deref().and_then(pre_block_icon) {
+                    icons.entry(key).or_insert(icon);
+                }
+            }
+            (icons, real)
+        });
+        for (alias, canon) in self.page_aliases() {
+            if real_page_names.contains(&alias) {
+                continue; // `load_named` prefers a real page over an alias fallback.
+            }
+            if let Some(icon) = icons_by_name.get(&crate::refs::page_key(&canon)).cloned() {
+                icons_by_name.entry(alias).or_insert(icon);
+            }
+        }
         let mut out = std::collections::HashMap::new();
         for name in names {
-            if let Ok(Some(dto)) = self.load_named(name, PageKind::Page) {
-                if let Some(pre) = &dto.pre_block {
-                    if let Some(icon) = pre_block_icon(pre) {
-                        out.insert(name.clone(), icon);
-                    }
-                }
+            if let Some(icon) = icons_by_name.get(&crate::refs::page_key(name)) {
+                out.insert(name.clone(), icon.clone());
             }
         }
         out
@@ -1389,6 +1417,7 @@ impl Graph {
         *self.alias_cache.write().unwrap() = None;
         *self.block_index.write().unwrap() = None;
         *self.block_ref_count_cache.write().unwrap() = None;
+        *self.advanced_cache.write().unwrap() = None;
     }
 
     /// Update one page in the cache after we write it (no full rebuild). A no-op
@@ -1452,6 +1481,7 @@ impl Graph {
         if alias_touched {
             *self.alias_cache.write().unwrap() = None;
         }
+        *self.advanced_cache.write().unwrap() = None;
         // Scoped query/backlink invalidation (#52): a content edit to one page
         // can't change a derived result the page doesn't participate in, so keep
         // those (advancing their generation) and recompute only the entries this
@@ -1508,6 +1538,7 @@ impl Graph {
         // A page delete is a page-set change (affects namespaces, exists-by-ref,
         // every backlink/query) — drop the whole derived cache.
         *self.derived_cache.write().unwrap() = None;
+        *self.advanced_cache.write().unwrap() = None;
         let mut guard = self.cache.write().unwrap();
         let mut alias_touched = false;
         if let Some(pages) = guard.as_mut() {
@@ -1568,6 +1599,52 @@ impl Graph {
         result
     }
 
+    fn advanced_memo(
+        &self,
+        key: String,
+        compute: impl FnOnce() -> crate::query::AdvancedResult,
+    ) -> Arc<crate::query::AdvancedResult> {
+        use std::sync::atomic::Ordering;
+        let gen = self.cache_gen.load(Ordering::Acquire);
+        let today = crate::date::JournalDate::today().ordinal_key();
+        {
+            let g = self.advanced_cache.read().unwrap();
+            if let Some(dc) = g.as_ref() {
+                if dc.gen == gen && dc.today == today {
+                    if let Some(r) = dc.results.get(&key) {
+                        return Arc::clone(r);
+                    }
+                }
+            }
+        }
+        let result = Arc::new(compute());
+        let mut g = self.advanced_cache.write().unwrap();
+        match g.as_mut() {
+            Some(dc) if dc.gen == gen && dc.today == today => {
+                dc.results.insert(key, Arc::clone(&result));
+            }
+            _ => {
+                let mut results = std::collections::HashMap::new();
+                results.insert(key, Arc::clone(&result));
+                *g = Some(AdvancedCache { gen, today, results });
+            }
+        }
+        result
+    }
+
+    fn run_advanced_query_cached(
+        &self,
+        query_src: &str,
+        current_page: Option<&str>,
+    ) -> Arc<crate::query::AdvancedResult> {
+        let page_key = current_page
+            .map(|p| format!("p:{}", crate::refs::page_key(p)))
+            .unwrap_or_else(|| "n:".to_string());
+        self.advanced_memo(format!("aq\0{page_key}\0{query_src}"), || {
+            crate::query::run_advanced_query(self, query_src, current_page)
+        })
+    }
+
     /// Backlinks for a page: blocks across the graph that reference it,
     /// grouped by source page. Delegates to the query module (memoized).
     pub fn backlinks(&self, target: &str) -> Arc<Vec<RefGroup>> {
@@ -1591,13 +1668,14 @@ impl Graph {
     }
 
     /// Evaluate an advanced (datalog-subset) query, returning the matched groups
-    /// plus which clauses ran vs were ignored. Not memoized (invoked on demand).
+    /// plus which clauses ran vs were ignored. Memoized by query text, effective
+    /// current page, cache generation, and today.
     pub fn run_advanced_query(
         &self,
         query_src: &str,
         current_page: Option<&str>,
     ) -> crate::query::AdvancedResult {
-        crate::query::run_advanced_query(self, query_src, current_page)
+        self.run_advanced_query_cached(query_src, current_page).as_ref().clone()
     }
 
     /// Unlinked references: plain-text mentions of a page that aren't links
@@ -1824,8 +1902,8 @@ impl Graph {
     /// Delete a page/journal file. Rather than unlinking, the file is moved to a
     /// graph-local trash (`logseq/.tine-trash/`, outside journals//pages/ so it's
     /// never re-loaded) — so a delete that races an unseen external edit, or a
-    /// simple misclick, is recoverable. Best-effort: falls back to removal if the
-    /// trash move fails.
+    /// simple misclick, is recoverable. If the trash move fails, the live file is
+    /// left in place and the error is returned.
     pub fn delete_page(&self, name: &str, kind: PageKind) -> io::Result<()> {
         // M1: with both a .md and a .org twin, "which file?" is ambiguous — refuse
         // rather than trash an arbitrary one.
@@ -1836,9 +1914,7 @@ impl Graph {
             let trash = self.root.join("logseq").join(".tine-trash");
             let fname = entry.path.file_name().and_then(|s| s.to_str()).unwrap_or("page.md");
             let dest = trash.join(format!("{}__{fname}", trash_stamp()));
-            if fs::create_dir_all(&trash).is_err() || fs::rename(&entry.path, &dest).is_err() {
-                fs::remove_file(&entry.path)?;
-            }
+            move_to_trash(&entry.path, &dest, &trash)?;
         }
         self.cache_remove(name, kind);
         Ok(())
@@ -1951,9 +2027,7 @@ impl Graph {
         }
         let trash = self.root.join("logseq").join(".tine-trash");
         let dest = trash.join(format!("{}__{name}", trash_stamp()));
-        if fs::create_dir_all(&trash).is_err() || fs::rename(&src, &dest).is_err() {
-            fs::remove_file(&src)?;
-        }
+        move_to_trash(&src, &dest, &trash)?;
         Ok(())
     }
 
@@ -3079,6 +3153,21 @@ fn trash_stamp() -> String {
     format!("{ms}-{}", SEQ.fetch_add(1, Ordering::Relaxed))
 }
 
+fn move_to_trash(src: &Path, dest: &Path, trash: &Path) -> io::Result<()> {
+    fs::create_dir_all(trash).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("could not create trash directory {}: {e}", trash.display()),
+        )
+    })?;
+    fs::rename(src, dest).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("could not move file to trash {}: {e}", trash.display()),
+        )
+    })
+}
+
 /// Atomic write: write to a temp file in the same directory, then rename. The
 /// temp name is unique per write (pid + sequence) so two concurrent writers to
 /// the same path (e.g. an autosave and a highlight/rename rewrite) can't truncate
@@ -3114,7 +3203,7 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// in the destination dir, fsync it, then atomically rename into place. The temp
 /// is removed on any failure, and the directory entry is fsynced on success. The
 /// temp name is hidden (`.`-prefixed) so the orphan-asset scanner never lists it.
-fn atomic_copy(src: &Path, dst: &Path) -> io::Result<()> {
+pub fn atomic_copy(src: &Path, dst: &Path) -> io::Result<()> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
     let dir = dst.parent().unwrap_or_else(|| Path::new("."));
@@ -3980,6 +4069,35 @@ mod tests {
         let u = g.run_advanced_query("[:find ?b :where [?b :block/foo ?v]]", None);
         assert!(!u.supported);
         assert!(u.groups.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn advanced_query_reuses_cached_result_until_graph_changes() {
+        let dir = scratch("adv-memo");
+        fs::write(dir.join("pages").join("P.md"), "- TODO ship\n").unwrap();
+        let g = Graph::open(&dir);
+        g.warm_cache();
+        let q = r#"[:find (pull ?b [*]) :where (task ?b #{"TODO"})]"#;
+
+        let first = g.run_advanced_query_cached(q, None);
+        let second = g.run_advanced_query_cached(q, None);
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "identical advanced query should be served from the memo cache"
+        );
+        assert_eq!(first.groups.len(), 1);
+
+        let mut dto = g.load_named("P", PageKind::Page).unwrap().unwrap();
+        dto.blocks[0].raw = dto.blocks[0].raw.replace("TODO", "DONE");
+        g.save_page(&dto, dto.rev.as_deref()).unwrap();
+
+        let third = g.run_advanced_query_cached(q, None);
+        assert!(
+            !Arc::ptr_eq(&first, &third),
+            "graph mutation must invalidate the advanced-query memo"
+        );
+        assert!(third.groups.is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
 

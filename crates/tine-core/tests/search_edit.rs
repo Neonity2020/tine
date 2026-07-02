@@ -1,5 +1,6 @@
 //! Regression: full-text search reflects a marker toggle once the edited page is
 //! saved back (the path a {{query}}-result edit takes).
+use tine_core::model::atomic_copy;
 use tine_core::{Graph, PageKind};
 
 fn mk(tag: &str) -> std::path::PathBuf {
@@ -332,6 +333,120 @@ fn delete_page_moves_to_trash_recoverable() {
     let body = std::fs::read_to_string(trashed[0].path()).unwrap();
     assert!(body.contains("keep me"));
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn delete_page_errors_when_trash_path_is_file_and_keeps_page_cached() {
+    let root = mk("deltrash-blocked");
+    std::fs::create_dir_all(root.join("logseq")).unwrap();
+    std::fs::write(root.join("logseq").join(".tine-trash"), "not a dir").unwrap();
+    std::fs::write(root.join("pages").join("Doomed.md"), "- keep me\n").unwrap();
+    let g = Graph::open(&root);
+    g.warm_cache();
+
+    let err = g.delete_page("Doomed", PageKind::Page).expect_err("trash path is blocked");
+    assert!(err.to_string().contains(".tine-trash"), "error should name the trash path: {err}");
+    assert!(root.join("pages").join("Doomed.md").is_file(), "source page survives");
+    let dto = g.load_named("Doomed", PageKind::Page).unwrap().expect("page still loads");
+    assert_eq!(dto.blocks[0].raw, "keep me");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn trash_journal_file_errors_when_trash_path_is_file_and_keeps_source() {
+    let root = mk("journaltrash-blocked");
+    std::fs::create_dir_all(root.join("logseq")).unwrap();
+    std::fs::write(root.join("logseq").join(".tine-trash"), "not a dir").unwrap();
+    let journal = root.join("journals").join("2026_06_20.md");
+    std::fs::write(&journal, "- journal body\n").unwrap();
+    let g = Graph::open(&root);
+
+    let err = g.trash_journal_file("2026_06_20.md").expect_err("trash path is blocked");
+    assert!(err.to_string().contains(".tine-trash"), "error should name the trash path: {err}");
+    assert!(journal.is_file(), "source journal survives");
+    assert_eq!(std::fs::read_to_string(&journal).unwrap(), "- journal body\n");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn trash_asset_errors_when_trash_path_is_file_and_keeps_source() {
+    let root = mk("assettrash-blocked");
+    std::fs::create_dir_all(root.join("logseq")).unwrap();
+    std::fs::create_dir_all(root.join("assets")).unwrap();
+    std::fs::write(root.join("logseq").join(".tine-trash"), "not a dir").unwrap();
+    let asset = root.join("assets").join("clip.png");
+    std::fs::write(&asset, b"asset bytes").unwrap();
+    let g = Graph::open(&root);
+
+    let err = g.trash_asset("clip.png").expect_err("trash path is blocked");
+    assert!(err.to_string().contains(".tine-trash"), "error should name the trash path: {err}");
+    assert!(asset.is_file(), "source asset survives");
+    assert_eq!(std::fs::read(&asset).unwrap(), b"asset bytes");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn atomic_copy_is_public_and_replaces_destination_contents() {
+    let root = mk("atomic-copy");
+    let src = root.join("pages").join("source.edn");
+    let dst = root.join("pages").join("dest.edn");
+    std::fs::write(&src, "{:ok true}\n").unwrap();
+    std::fs::write(&dst, "old").unwrap();
+
+    atomic_copy(&src, &dst).expect("atomic copy");
+    assert_eq!(std::fs::read_to_string(&dst).unwrap(), "{:ok true}\n");
+    let leftovers: Vec<_> = std::fs::read_dir(root.join("pages"))
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().contains(".import.tmp"))
+        .collect();
+    assert!(leftovers.is_empty(), "atomic copy temp should not leak");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn page_icons_answer_from_cached_pages_with_page_key_lookup() {
+    let root = mk("page-icons-cache");
+    std::fs::write(
+        root.join("pages").join("IconPage.md"),
+        "icon:: star\nalias:: Icon Alias\n- body\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("pages").join("NoIcon.md"), "- body\n").unwrap();
+    let g = Graph::open(&root);
+    g.warm_cache();
+    std::fs::rename(root.join("pages"), root.join("pages.offline")).unwrap();
+
+    let icons = g.page_icons(&[
+        "iconpage".to_string(),
+        "Icon Alias".to_string(),
+        "NoIcon".to_string(),
+        "Missing".to_string(),
+    ]);
+    assert_eq!(icons.get("iconpage").map(String::as_str), Some("star"));
+    assert_eq!(icons.get("Icon Alias").map(String::as_str), Some("star"));
+    assert!(!icons.contains_key("NoIcon"));
+    assert!(!icons.contains_key("Missing"));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn resolve_blocks_uses_indexed_hinted_page_lookup() {
+    let src = include_str!("../src/query.rs");
+    assert!(
+        !src.contains("pages.iter().find(|(e, _)| &e.name == page)"),
+        "hinted resolve_blocks lookup must not linearly scan all pages per hinted page"
+    );
+}
+
+#[test]
+fn run_advanced_query_uses_generation_keyed_memo_cache() {
+    let src = include_str!("../src/model.rs");
+    assert!(src.contains("fn advanced_memo("), "advanced queries should have a dedicated memo cache");
+    assert!(
+        !src.contains("Not memoized (invoked on demand)"),
+        "stale non-memoized advanced-query comment should be gone"
+    );
 }
 
 #[test]
