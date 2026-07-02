@@ -23,9 +23,10 @@ _Nothing actively in flight._
 
 ## P1 — do next (high value, bounded scope)
 
-_Nothing currently queued — the previous three entries (table column-alignment,
-user-defined `:macros`, easy embed macros) were already implemented and shipped;
-removed as stale. Next candidates are in P2._
+| Item | Notes |
+|---|---|
+| **1A — Table alignment: one parser (lsdoc owns it)** | Column alignment is currently parsed *outside* lsdoc — the app re-derives it by re-scanning raw text (`body.tsx` `tableAligns`/`parseAligns`/`isTableSep`/`splitRow`) and the export emits `data-align` from a separate source. Two/three parsers of one grammar → violates "one parser per parsed thing". Fix: **lsdoc carries per-column alignment in the Table AST**; Tine reads it and deletes the re-scan. Cross-repo: lsdoc spec at `subagent-tasks/lsdoc-table-alignment-spec.md` (check-first, then add the field), then Tine integration (bump lsdoc tag, rebuild wasm, add `aligns` to the TS mirror, delete the re-derivation, screenshot-verify). Sequenced after the in-flight lsdoc rewrite. |
+| **1B — User `:macros` OG-parity gaps** | `{{name a, b}}` → `$1..$N` substitution works (`inline.tsx` `UserMacroView`; recursion-guarded; re-renders as markdown). Two known gaps to verify against OG's *actual* `:macros` semantics and fill: (i) block-level template output currently degrades to inline (documented limitation, `inline.tsx:726`); (ii) whether OG supports more than positional `$N` (e.g. `$@`/all-args, named args). **Study OG source first** — do not infer semantics from Tine's code. |
 
 ---
 
