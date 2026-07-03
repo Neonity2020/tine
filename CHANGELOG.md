@@ -23,6 +23,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Added
 
+- **Copy/export "Rendered" mode resolves block refs and macros.** Copying or
+  exporting in *Rendered* mode now flattens a `((block ref))` to the referenced
+  block's text and a user `{{macro}}` to its expansion, instead of the bare uuid or
+  the literal `{{…}}` — so the copied text matches what you see. Math stays as TeX
+  (which is what selecting rendered KaTeX copies anyway).
 - **User `:macros` can expand to real blocks (OG parity).** A `config.edn` macro
   whose template is block-level Markdown — a heading, a list, multiple paragraphs —
   now renders as real nested blocks instead of a flattened inline line. Single-

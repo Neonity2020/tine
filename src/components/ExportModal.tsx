@@ -1,7 +1,10 @@
 import { For, Show, createMemo, createSignal, onCleanup, onMount, type JSX } from "solid-js";
-import { exportModal, closeExportModal, pushToast, typographyMode } from "../ui";
-import { exportNodesFor } from "../store";
+import { exportModal, closeExportModal, pushToast, typographyMode, graphMeta } from "../ui";
+import { exportNodesFor, formatForPage } from "../store";
 import { backend } from "../backend";
+import { resolvedBlockRefSync } from "../resolveBatch";
+import { expandTemplate } from "../render/inline";
+import { visibleBody } from "../render/block";
 import {
   exportOutline,
   DEFAULT_EXPORT_OPTIONS,
@@ -51,6 +54,45 @@ const TOGGLES: { key: keyof ExportOptions; label: string; sourceOnly?: boolean }
   { key: "newlineAfterBlock", label: "Newline after block" },
 ];
 
+const BUILT_IN_MACRO_NAMES = new Set([
+  "query",
+  "embed",
+  "video",
+  "youtube",
+  "youtube-timestamp",
+  "vimeo",
+  "bilibili",
+  "tweet",
+  "twitter",
+  "img",
+  "cloze",
+  "zotero",
+  "namespace",
+]);
+
+function isBuiltInMacro(name: string): boolean {
+  const n = name.toLowerCase();
+  return BUILT_IN_MACRO_NAMES.has(n) || n.startsWith("zotero-");
+}
+
+function resolveExportBlockRef(uuid: string) {
+  const g = resolvedBlockRefSync(uuid);
+  const block = g?.blocks[0];
+  if (!block) return null;
+  // Match what BlockRefView shows on screen: the referenced block's FIRST VISIBLE
+  // line — marker/priority/heading/property/planning chrome stripped (visibleBody) —
+  // so a ref to a `TODO`/`## heading`/property-first block copies its text, not the
+  // chrome. renderedText then inline-renders that line (nested refs/macros resolve).
+  return { raw: visibleBody(block.raw)[0] ?? "", format: formatForPage(g.page) };
+}
+
+function resolveExportMacro(name: string, args: string[]) {
+  if (isBuiltInMacro(name)) return null;
+  const macros = graphMeta()?.macros;
+  if (!macros || !Object.prototype.hasOwnProperty.call(macros, name)) return null;
+  return { raw: expandTemplate(macros[name], args), format: "md" as const };
+}
+
 // "Copy / Export" modal — live-preview text export of a block subtree or a
 // multi-block selection, with indent-style + remove options (mirrors OG Logseq's
 // export dialog). Read-only preview; Copy writes to the clipboard.
@@ -75,7 +117,12 @@ function Modal(props: { ids: string[] }): JSX.Element {
   // typographic glyphs exactly when the app displays them (not persisted).
   const nodes = exportNodesFor(props.ids);
   const text = createMemo(() =>
-    exportOutline(nodes, { ...opts(), typographicGlyphs: typographyMode() === "render" })
+    exportOutline(nodes, {
+      ...opts(),
+      typographicGlyphs: typographyMode() === "render",
+      resolveBlockRef: resolveExportBlockRef,
+      resolveMacro: resolveExportMacro,
+    })
   );
 
   const copy = () => {

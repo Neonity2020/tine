@@ -1,9 +1,15 @@
-import { describe, it, expect } from "vitest";
+import { beforeAll, describe, it, expect } from "vitest";
 import { exportOutline, DEFAULT_EXPORT_OPTIONS, type ExportNode, type ExportOptions } from "./exportText";
+import { initParser } from "../render/parse";
 
-// These tests cover the SOURCE serialization (raw + regex transforms); rendered
-// mode needs the wasm parser and is tested in src/render/renderedText.test.tsx.
+// Most tests cover SOURCE serialization (raw + regex transforms); the focused
+// rendered-mode test initializes the wasm parser here.
 const opt = (o: Partial<ExportOptions>): ExportOptions => ({ ...DEFAULT_EXPORT_OPTIONS, content: "source", ...o });
+const REF_ID = "11111111-1111-4111-8111-111111111111";
+
+beforeAll(async () => {
+  await initParser();
+});
 
 // parent / child / grandchild tree for indent-style tests.
 const tree: ExportNode[] = [
@@ -56,5 +62,21 @@ describe("exportOutline", () => {
   it("keeps multi-line block continuation aligned (dashes)", () => {
     const n: ExportNode[] = [{ raw: "first\nsecond", children: [{ raw: "kid", children: [] }] }];
     expect(exportOutline(n, opt({ indent: "dashes" }))).toBe("- first\n  second\n\t- kid");
+  });
+
+  it("threads rendered block-ref and macro resolvers", () => {
+    const n: ExportNode[] = [{ raw: `((${REF_ID})) and {{poem red, blue}}`, children: [] }];
+    expect(
+      exportOutline(
+        n,
+        opt({
+          content: "rendered",
+          indent: "no-indent",
+          resolveBlockRef: (uuid) => (uuid === REF_ID ? { raw: "**Exported** ref\nhidden second", format: "md" } : null),
+          resolveMacro: (name, args) =>
+            name === "poem" ? { raw: `roses ${args[0]}, violets ${args[1]}`, format: "md" } : null,
+        }),
+      ),
+    ).toBe("Exported ref and roses red, violets blue");
   });
 });

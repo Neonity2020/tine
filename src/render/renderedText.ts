@@ -3,11 +3,12 @@
 // Copy/Export modal's "Rendered" mode. Driven by the ONE lsdoc parse (never a
 // regex re-scan of raw): parse the block, walk the AST, emit visible text.
 //
-// Fidelity notes (pragmatic, documented): block refs emit their label or the
-// bare uuid (resolving the referenced block needs live graph state); macros stay
-// in `{{...}}` form (their expansion is graph-dependent); math emits the TeX
-// source (the typeset glyphs aren't text); properties honor the built-in
-// render-hidden set but not the user's `:block-hidden-properties` (graph state).
+// Fidelity notes (pragmatic, documented): graph-dependent leaves are resolved
+// only when callers inject sync leaf resolvers; otherwise block refs emit their
+// label or bare uuid and macros stay in `{{...}}` form. Math intentionally emits
+// the TeX source: browser selection of rendered KaTeX also copies the embedded
+// TeX annotation. Properties honor the built-in render-hidden set but not the
+// user's `:block-hidden-properties` (graph state).
 
 import { parseBlock } from "./parse";
 import { typographic } from "./typography";
@@ -46,7 +47,17 @@ export interface RenderedTextOptions {
   stripLinks: boolean; // [[Foo]] → Foo
   removeTags: boolean; // drop #tag nodes
   removeProperties: boolean; // drop property blocks
+  resolveBlockRef?: (uuid: string) => RenderedTextResolvedLeaf | null;
+  resolveMacro?: (name: string, args: string[]) => RenderedTextResolvedLeaf | null;
 }
+
+export interface RenderedTextResolvedLeaf {
+  raw: string;
+  format: Format;
+}
+
+const MAX_RENDERED_TEXT_RESOLVE_DEPTH = 12;
+let renderedTextResolveDepth = 0;
 
 function urlDest(url: Url): string {
   switch (url.type) {
@@ -59,6 +70,35 @@ function urlDest(url: Url): string {
     case "complex":
       return url.protocol && url.link != null ? `${url.protocol}://${url.link}` : url.link ?? "";
   }
+}
+
+function macroLiteral(name: string, args: string[]): string {
+  return args.length ? `{{${name} ${args.join(", ")}}}` : `{{${name}}}`;
+}
+
+function renderResolvedLeaf<T>(fallback: T, render: () => T): T {
+  if (renderedTextResolveDepth >= MAX_RENDERED_TEXT_RESOLVE_DEPTH) return fallback;
+  renderedTextResolveDepth++;
+  try {
+    return render();
+  } finally {
+    renderedTextResolveDepth--;
+  }
+}
+
+function resolvedBlockRefText(uuid: string, o: RenderedTextOptions): string {
+  if (renderedTextResolveDepth >= MAX_RENDERED_TEXT_RESOLVE_DEPTH) return uuid;
+  const resolved = o.resolveBlockRef?.(uuid);
+  if (!resolved) return uuid;
+  return renderResolvedLeaf(uuid, () => renderedBlockText(resolved.raw, resolved.format, o).split("\n")[0] ?? "");
+}
+
+function resolvedMacroText(name: string, args: string[], o: RenderedTextOptions): string {
+  const fallback = macroLiteral(name, args);
+  if (renderedTextResolveDepth >= MAX_RENDERED_TEXT_RESOLVE_DEPTH) return fallback;
+  const resolved = o.resolveMacro?.(name, args);
+  if (!resolved) return fallback;
+  return renderResolvedLeaf(fallback, () => renderedBlockText(resolved.raw, resolved.format, o));
 }
 
 function inlineText(nodes: Inline[], o: RenderedTextOptions): string {
@@ -88,11 +128,13 @@ function inlineText(nodes: Inline[], o: RenderedTextOptions): string {
         break;
       case "link": {
         const label = s.label && s.label.length ? inlineText(s.label, o) : "";
-        if (s.url.type === "page_ref" || s.url.type === "block_ref") {
+        if (s.url.type === "page_ref") {
           const name = label || s.url.v;
           // The renderer shows `[[name]]` (dimmed brackets) for a bare page ref,
-          // the alias text alone when labeled; block refs show label-or-uuid.
-          out += s.url.type === "page_ref" && !label && !o.stripLinks ? `[[${name}]]` : name;
+          // the alias text alone when labeled.
+          out += !label && !o.stripLinks ? `[[${name}]]` : name;
+        } else if (s.url.type === "block_ref") {
+          out += label || resolvedBlockRefText(s.url.v, o);
         } else {
           out += label || urlDest(s.url);
         }
@@ -102,7 +144,7 @@ function inlineText(nodes: Inline[], o: RenderedTextOptions): string {
         out += o.stripLinks ? s.content : `[[${s.content}]]`;
         break;
       case "macro":
-        out += s.args.length ? `{{${s.name} ${s.args.join(", ")}}}` : `{{${s.name}}}`;
+        out += resolvedMacroText(s.name, s.args, o);
         break;
       case "latex":
         out += s.body;

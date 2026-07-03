@@ -6,7 +6,7 @@
 // modal offers, matching OG's option set within reason.
 
 import { isPropertyLine } from "../render/block";
-import { renderedBlockText } from "../render/renderedText";
+import { renderedBlockText, type RenderedTextOptions } from "../render/renderedText";
 import type { Format } from "../render/ast";
 
 // dashes  = Logseq outline: `\t`×level + "- " + text (paste back into Logseq).
@@ -30,6 +30,8 @@ export interface ExportOptions {
   /** Apply `->`→`→` glyphs in rendered mode; the modal sets this from the app's
    *  typography mode each time (not persisted — it must match what you see). */
   typographicGlyphs?: boolean;
+  resolveBlockRef?: RenderedTextOptions["resolveBlockRef"];
+  resolveMacro?: RenderedTextOptions["resolveMacro"];
 }
 
 export const DEFAULT_EXPORT_OPTIONS: ExportOptions = {
@@ -78,6 +80,8 @@ function blockExportLines(n: ExportNode, opts: ExportOptions): string[] {
       stripLinks: opts.stripLinks,
       removeTags: opts.removeTags,
       removeProperties: opts.removeProperties,
+      resolveBlockRef: opts.resolveBlockRef,
+      resolveMacro: opts.resolveMacro,
     }).split("\n");
   }
   let lines = n.raw.split("\n");

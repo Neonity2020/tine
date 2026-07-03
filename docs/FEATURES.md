@@ -238,9 +238,12 @@ files. **⊕ marks things Tine adds on top of Logseq core** (no plugins).
   canonical HTML), so the export matches what you see: syntax-highlighted code blocks
   (highlight.js), aligned tables, callouts, KaTeX math, lists and task checkboxes, and
   page/block links. (No interactive graph view yet.)
-- **Copy/export as** Markdown for a block subtree or a whole page; a slash menu for
-  headings, code, calculator, quote, callouts, divider, embed, query (raw or visual
-  builder), template, asset upload, and dates.
+- **Copy/export as** Markdown for a block subtree or a whole page, with a *Rendered*
+  mode that flattens to what you see — and in Rendered mode a `((block ref))` resolves
+  to the referenced block's text and a user `{{macro}}` to its expansion (not the bare
+  uuid / literal call); math stays as TeX (which is what copying rendered KaTeX gives).
+- A slash menu for headings, code, calculator, quote, callouts, divider, embed, query
+  (raw or visual builder), template, asset upload, and dates.
 
 <p align="center">
   <img src="img/pdf.png" alt="PDF text + area (image) highlighting with a notes page" width="49%">

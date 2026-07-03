@@ -13,6 +13,7 @@ const O: RenderedTextOptions = {
   removeTags: false,
   removeProperties: false,
 };
+const REF_ID = "11111111-1111-4111-8111-111111111111";
 
 describe("renderedBlockText", () => {
   it("drops markup markers and applies typographic glyphs", () => {
@@ -46,6 +47,64 @@ describe("renderedBlockText", () => {
     expect(renderedBlockText("|a|b|\n|-|-|\n|1|2|", "md", O)).toBe("a | b\n1 | 2");
     expect(renderedBlockText("text\nkey:: val", "md", O)).toBe("text\nkey val");
     expect(renderedBlockText("text\nkey:: val", "md", { ...O, removeProperties: true })).toBe("text");
+  });
+
+  it("keeps refs and macros byte-compatible when no resolvers are supplied", () => {
+    expect(renderedBlockText(`see ((${REF_ID})) and {{poem red, blue}}`, "md", O)).toBe(
+      `see ${REF_ID} and {{poem red, blue}}`,
+    );
+  });
+
+  it("resolves bare block refs to the referenced rendered first line", () => {
+    expect(
+      renderedBlockText(`see ((${REF_ID}))`, "md", {
+        ...O,
+        resolveBlockRef: (uuid) =>
+          uuid === REF_ID ? { raw: "**Referenced** first line\nsecond line", format: "md" } : null,
+      }),
+    ).toBe("see Referenced first line");
+  });
+
+  it("keeps labeled block refs as labels and does not consult the resolver", () => {
+    let calls = 0;
+    expect(
+      renderedBlockText(`see [chosen](((${REF_ID})))`, "md", {
+        ...O,
+        resolveBlockRef: () => {
+          calls++;
+          return { raw: "wrong", format: "md" };
+        },
+      }),
+    ).toBe("see chosen");
+    expect(calls).toBe(0);
+  });
+
+  it("resolves user macros to rendered expanded text", () => {
+    expect(
+      renderedBlockText("{{poem red, blue}}", "md", {
+        ...O,
+        resolveMacro: (name, args) =>
+          name === "poem" ? { raw: `Roses are ${args[0]}, violets are ${args[1]}.`, format: "md" } : null,
+      }),
+    ).toBe("Roses are red, violets are blue.");
+  });
+
+  it("keeps built-in macro names literal when the resolver returns null", () => {
+    expect(
+      renderedBlockText("{{query (task TODO)}}", "md", {
+        ...O,
+        resolveMacro: () => null,
+      }),
+    ).toBe("{{query (task TODO)}}");
+  });
+
+  it("bails to the fallback at the resolver recursion cap", () => {
+    expect(
+      renderedBlockText(`((${REF_ID}))`, "md", {
+        ...O,
+        resolveBlockRef: (uuid) => ({ raw: `((${uuid}))`, format: "md" }),
+      }),
+    ).toBe(REF_ID);
   });
 });
 
