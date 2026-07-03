@@ -17,6 +17,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Added
 
+- **Headings stay heading-sized while you edit them (OG parity).** Clicking into a
+  single-line `#`/`##`/`###…` heading now keeps the editor text at its heading size
+  and weight (the `#` markers stay visible at the same size), instead of shrinking to
+  body size on focus and jumping back on blur. Multi-line heading blocks edit at body
+  size (only the heading's own line is enlarged), matching Logseq's uniline rule.
 - **Select text, then wrap it (OG parity).** With text selected in the editor,
   typing `[` twice wraps it as `[[selection]]` and opens the page search seeded
   with those words — so Enter links it to an existing page or creates it (#18);

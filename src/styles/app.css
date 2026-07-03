@@ -2132,6 +2132,13 @@ body {
   display: block;
 }
 
+.block-editor.h1 { font-size: 1.7em; font-weight: 600; line-height: 1.3; }
+.block-editor.h2 { font-size: 1.4em; font-weight: 600; line-height: 1.3; }
+.block-editor.h3 { font-size: 1.2em; font-weight: 600; line-height: 1.3; }
+.block-editor.h4 { font-size: 1.1em; font-weight: 600; line-height: 1.3; }
+.block-editor.h5 { font-size: 1.0em; font-weight: 600; line-height: 1.3; }
+.block-editor.h6 { font-size: 0.9em; font-weight: 600; line-height: 1.3; }
+
 /* markers — colored by state */
 .block-marker {
   font-size: 0.74em;

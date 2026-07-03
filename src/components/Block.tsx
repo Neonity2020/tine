@@ -233,6 +233,11 @@ export function Block(props: { id: string; hideRefCount?: boolean }): JSX.Elemen
     const n = node();
     return n ? facetsOf(n.raw, pageByName(n.page)?.format ?? "md").headingLevel : null;
   });
+  const editorVisibleValue = createMemo(() => {
+    const n = node();
+    return n ? splitProps(n.raw, isBuiltinHidden).visible : "";
+  });
+  const editorIsUniline = createMemo(() => !editorVisibleValue().includes("\n"));
   // Block-level "linked references" panel toggled by the reference-count badge.
   const [showRefs, setShowRefs] = createSignal(false);
   // Ordered-list label for THIS block's own bullet (OG numbers the block itself,
@@ -248,11 +253,10 @@ export function Block(props: { id: string; hideRefCount?: boolean }): JSX.Elemen
         class="block-main"
         classList={{
           // Heading level on the row so the bullet column can match the (taller)
-          // heading line box and the bullet stays centered on the first line. NOT
-          // while editing: the editor textarea is plain (standard height, no heading
-          // size), so the taller bullet column would make the bullet jump the moment
-          // you type `#`. Apply the offset only in the rendered (heading-sized) view.
-          [`bullet-h${headingLevel()}`]: headingLevel() != null && !editing(),
+          // heading line box and the bullet stays centered on the first line. While
+          // editing, apply the same offset only when the hidden-props-stripped editor
+          // value is still a single line; multi-line heading blocks edit at body size.
+          [`bullet-h${headingLevel()}`]: headingLevel() != null && (!editing() || editorIsUniline()),
           "drop-before": dropInd()?.id === props.id && dropInd()?.before === true,
           "drop-after": dropInd()?.id === props.id && dropInd()?.before === false,
           dragging: dragId() === props.id,
@@ -754,7 +758,12 @@ export function Editor(props: { id: string }): JSX.Element {
   // Annotation blocks hide ALL properties (edit only the highlight text); every
   // other block hides just the built-in id::/collapsed::. One fence-aware splitter.
   const hideFn = () => (isAnnot() ? hideAll : isBuiltinHidden);
-  const editorValue = () => splitProps(node().raw, hideFn()).visible;
+  const editorValue = createMemo(() => splitProps(node().raw, hideFn()).visible);
+  const editorHeadingLevel = createMemo(() => {
+    const visible = editorValue();
+    if (visible.includes("\n")) return null;
+    return facetsOf(visible, pageFmt()).headingLevel;
+  });
   // Live calc preview: when this block is a ```calc fence, show the SAME results
   // panel as the rendered view, recomputed on every keystroke (onInput commits
   // to node().raw live, so editorValue() is current). Matches OG's calculator,
@@ -1685,6 +1694,7 @@ export function Editor(props: { id: string }): JSX.Element {
       <textarea
         ref={ref}
         class="block-editor"
+        classList={{ [`h${editorHeadingLevel()}`]: editorHeadingLevel() != null }}
         spellcheck={spellcheckEnabled()}
         value={isCalc() ? (calcLive() ?? "") : editorValue()}
         placeholder={cap?.bulletHint?.()}

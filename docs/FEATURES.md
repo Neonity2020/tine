@@ -10,6 +10,11 @@ files. **⊕ marks things Tine adds on top of Logseq core** (no plugins).
 
 - Click-to-edit blocks; the caret lands exactly where you clicked, including
   rendered bold/link/heading markup.
+- **Headings stay heading-sized while you edit them** (Logseq parity) — clicking
+  into a single-line `#`/`##`/`###…` heading keeps the text at its heading size and
+  weight (the `#` markers show inline at the same size), so it doesn't shrink to body
+  text on focus and jump back when you leave. Multi-line heading blocks edit at body
+  size — only the heading's own line is enlarged — matching Logseq.
 - `Enter` / `Tab` / `Shift+Tab` / `Backspace` / arrows with correct Logseq
   semantics and caret preservation — no reflow on indent/outdent; arrow nav
   respects *visual* wrapped rows.
