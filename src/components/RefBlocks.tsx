@@ -65,6 +65,9 @@ function RefBlock(props: {
                 {facets().marker}
               </span>{" "}
             </Show>
+            <Show when={facets().priority}>
+              <span class={`block-priority priority-${facets().priority}`}>[#{facets().priority}]</span>{" "}
+            </Show>
             <For each={lines()}>
               {(line, i) => (
                 <>

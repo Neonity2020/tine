@@ -8,6 +8,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+### Fixed
+
+- **Priority `[#A]` chip now shows on query and reference results.** A task
+  surfaced by a query (or in Linked References / an embed) that was rendered in
+  the read-only path dropped its `[#A]`/`[#B]`/`[#C]` priority marker — so a
+  `(priority A)` query could list a block without visibly showing its priority,
+  while the same block elsewhere showed it. The read-only renderer now draws the
+  priority chip, matching the live editor.
+
 ## [0.3.3] — 2026-07-04
 
 ### Changed
