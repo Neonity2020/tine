@@ -26,6 +26,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   `(priority A)` query could list a block without visibly showing its priority,
   while the same block elsewhere showed it. The read-only renderer now draws the
   priority chip, matching the live editor.
+- **Scheduled/deadline date picker no longer jumps when paging months.** The
+  picker's header (`September 2026 · Scheduled`) was too wide for the popup and
+  wrapped to a second line on the longest months, shoving the day grid down a row
+  (and back up on shorter months). The popup is a little wider now and the header
+  is kept to one line, so paging through months is stable.
 
 ## [0.3.3] — 2026-07-04
 

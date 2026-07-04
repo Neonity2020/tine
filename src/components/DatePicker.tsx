@@ -85,7 +85,9 @@ function Picker(props: { bid: string; which: "scheduled" | "deadline"; x: number
   // window grows to make room for the picker, and this repositions it into view.
   const [winW, setWinW] = createSignal(typeof window !== "undefined" ? window.innerWidth : 1280);
   const [winH, setWinH] = createSignal(typeof window !== "undefined" ? window.innerHeight : 800);
-  const left = () => Math.max(4, Math.min(props.x, winW() - 260));
+  // Keep the popup on-screen: clamp its left edge so the full width (see
+  // `.date-picker` = 284px in app.css, +margin) fits before the right window edge.
+  const left = () => Math.max(4, Math.min(props.x, winW() - 300));
   const top = () => Math.max(4, Math.min(props.y, winH() - 300));
   onMount(() => {
     const onResize = () => {
