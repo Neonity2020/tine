@@ -393,6 +393,16 @@ const FORBID_EDIT_SELECTOR = [
   ".inline-image-wrap",
   ".media-embed-wrap",
   ".embed-iframe-wrap",
+  // Query-macro controls: they run their own action on CLICK (toggle collapse,
+  // rename title, navigate to a result page, sort a column) and used to block
+  // the block's edit via click-phase stopPropagation — which no longer suffices
+  // now that edit entry is on mousedown. Opt them out here instead.
+  ".query-collapse",
+  ".query-title-editable",
+  ".query-page",
+  ".query-crumb",
+  ".qt-page",
+  ".query-table th",
 ].join(", ");
 
 function forbidsEditEntry(e: MouseEvent): boolean {
