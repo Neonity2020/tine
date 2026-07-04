@@ -251,34 +251,49 @@ fn run_pred(graph: &Graph, pred: &Pred, opts: &QueryOpts) -> Vec<RefGroup> {
         (groups, recency)
     });
 
-    // sort-by is GLOBAL (like Logseq): flatten every matched block across all
-    // pages, sort the whole set, and emit one block per group in that order — so
-    // e.g. priority-A tasks float to the very top regardless of which page they
-    // live on. (Sorting within each page group, as before, can't express a global
-    // order once results are grouped by page.) Non-sorted queries keep their
+    // sort-by is GLOBAL (like Logseq): order every matched block across all pages on
+    // one axis, so e.g. priority-A tasks float to the very top regardless of which
+    // page they live on. We flatten to one block per group, sort, then RE-COALESCE
+    // runs of adjacent same-page blocks back under a single page heading — N
+    // consecutive results from one page show ONCE, not N times (a page whose blocks
+    // land at different sort positions, e.g. an A and a C task under a priority sort,
+    // still appears at each of those positions). Non-sorted queries keep their
     // natural page grouping untouched.
     if let Some((field, asc)) = &opts.sort {
-        let mut flat: Vec<RefGroup> = Vec::new();
+        // Decorate each block with its sort key (computed ONCE — an lsdoc parse per
+        // result block, not per comparison) and its original index. The index is a
+        // stable tiebreaker so equal-key blocks keep DOCUMENT order in both
+        // directions: a plain `reverse()` for `desc` would flip a page's blocks
+        // upside-down under its heading.
+        let mut flat: Vec<(SortDecor, usize, RefGroup)> = Vec::new();
         for g in groups {
             let RefGroup { page, kind, blocks } = g;
             for b in blocks {
-                flat.push(RefGroup { page: page.clone(), kind, blocks: vec![b] });
+                let key = if is_recency_field(field) {
+                    // Recency is numeric (Unix seconds on one axis): journal pages by
+                    // the day they represent, others by file mtime.
+                    SortDecor::Num(recency_by_page.get(&page).copied().unwrap_or(i64::MIN))
+                } else {
+                    SortDecor::Text(sort_key(&b, &page, field))
+                };
+                let idx = flat.len();
+                flat.push((key, idx, RefGroup { page: page.clone(), kind, blocks: vec![b] }));
             }
         }
-        // Decorate-sort: compute each block's key ONCE (an lsdoc parse per result
-        // block), not per comparison — `sort_by` would re-derive it O(n log n) times.
-        if is_recency_field(field) {
-            // Recency is numeric (Unix seconds on one axis), not text: journal
-            // pages by their represented day, others by file mtime. Ascending =
-            // oldest first; `reverse` gives newest first (the "Newest first" preset).
-            flat.sort_by_cached_key(|g| recency_by_page.get(&g.page).copied().unwrap_or(i64::MIN));
-        } else {
-            flat.sort_by_cached_key(|g| sort_key(&g.blocks[0], &g.page, field));
+        flat.sort_by(|a, b| {
+            let ord = a.0.cmp(&b.0);
+            (if *asc { ord } else { ord.reverse() }).then(a.1.cmp(&b.1))
+        });
+        // Merge adjacent one-block groups that share a page (and kind) into a single
+        // group, so consecutive same-page results render under one heading.
+        let mut merged: Vec<RefGroup> = Vec::with_capacity(flat.len());
+        for (_, _, g) in flat {
+            match merged.last_mut() {
+                Some(last) if last.page == g.page && last.kind == g.kind => last.blocks.extend(g.blocks),
+                _ => merged.push(g),
+            }
         }
-        if !*asc {
-            flat.reverse();
-        }
-        groups = flat;
+        groups = merged;
     }
 
     // sample N: cap total results (deterministic: first N across pages).
@@ -607,6 +622,15 @@ fn resolve_inputs(
         }
     }
     map
+}
+
+/// A result block's sort key: a numeric axis (recency, in Unix seconds) or a text
+/// value (priority/page/property/planning date). Within one sort every block uses
+/// the same variant; the derived `Ord` only ever compares like with like.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum SortDecor {
+    Num(i64),
+    Text(String),
 }
 
 /// Fields naming a block's position on the recency time-axis (journal day for

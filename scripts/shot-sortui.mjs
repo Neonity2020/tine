@@ -60,13 +60,30 @@ try {
 
   // Apply "Newest first" and confirm the chip reflects it + popover closed.
   await page.locator(".qb-sort-preset", { hasText: "Newest first" }).click();
-  await sleep(300);
+  await sleep(400);
   const chip = await page.locator(".qb-chip", { hasText: "sort:" }).allInnerTexts().catch(() => []);
   const stillOpen = await page.locator(".qb-sort-picker").count();
   console.log("after apply — sort chip(s):", chip.join(" | ") || "(none found)", "| popover open:", stillOpen);
 
-  await page.screenshot({ path: `${OUT}/sort-applied.png`, clip: { x: 0, y: Math.max(0, (box?.y ?? 100) - 40), width: 1000, height: 200 } });
-  console.log(`wrote ${OUT}/sort-applied.png`);
+  // Coalescing check: a page heading must not repeat for consecutive same-page
+  // results. Walk the sorted result headings (.query-crumb) + count that no two
+  // adjacent headings name the same page.
+  const headings = await page.locator(".query-group-flat .query-crumb").allInnerTexts();
+  let adjDupes = 0;
+  for (let i = 1; i < headings.length; i++) if (headings[i] === headings[i - 1]) adjDupes++;
+  console.log(`sorted result headings (${headings.length}): ${headings.join(" · ")}`);
+  console.log(adjDupes === 0 ? "COALESCE OK ✅ — no adjacent repeated heading" : `COALESCE FAIL ❌ — ${adjDupes} adjacent dupes`);
+
+  await page.locator(".query-block").first().scrollIntoViewIfNeeded();
+  await sleep(300);
+  const qbox = await page.locator(".query-block").first().boundingBox();
+  if (qbox) {
+    await page.screenshot({
+      path: `${OUT}/sort-applied.png`,
+      clip: { x: Math.max(0, qbox.x - 8), y: Math.max(0, qbox.y - 8), width: Math.min(1200, qbox.width + 16), height: Math.min(1290 - qbox.y, qbox.height + 16) },
+    });
+    console.log(`wrote ${OUT}/sort-applied.png`);
+  }
 
   await browser.close();
 } catch (e) {

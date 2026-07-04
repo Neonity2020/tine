@@ -12,9 +12,10 @@ fn mk(tag: &str) -> std::path::PathBuf {
     root
 }
 
-// `(sort-by priority)` must sort the WHOLE result set, not within each page —
-// so priority-A tasks float to the top no matter which page they're on. The
-// engine returns one block per group (in global order) when a sort is active.
+// `(sort-by priority)` must sort the WHOLE result set, not within each page — so
+// priority-A tasks float to the top no matter which page they're on. Read the
+// global order ACROSS blocks (a sort may coalesce adjacent same-page results into
+// one group — see sort_coalesces_consecutive_same_page_results).
 #[test]
 fn sort_by_priority_is_global_across_pages() {
     let root = mk("sortprio");
@@ -22,14 +23,15 @@ fn sort_by_priority_is_global_across_pages() {
     std::fs::write(root.join("pages").join("P2.md"), "- TODO [#B] b-two\n- TODO [#A] a-two\n").unwrap();
     let g = Graph::open(&root);
     g.warm_cache();
-    let prio = |grp: &tine_core::RefGroup| {
-        let raw = &grp.blocks[0].raw;
-        raw[raw.find("[#").unwrap() + 2..].chars().next().unwrap()
+    let prios = |q: &str| -> Vec<char> {
+        g.run_query(q)
+            .iter()
+            .flat_map(|grp| grp.blocks.iter())
+            .map(|b| b.raw[b.raw.find("[#").unwrap() + 2..].chars().next().unwrap())
+            .collect()
     };
-    let asc: Vec<char> = g.run_query("(and (task TODO) (sort-by priority asc))").iter().map(prio).collect();
-    assert_eq!(asc, vec!['A', 'A', 'B', 'C'], "A floats to the top globally (across pages)");
-    let desc: Vec<char> = g.run_query("(and (task TODO) (sort-by priority desc))").iter().map(prio).collect();
-    assert_eq!(desc, vec!['C', 'B', 'A', 'A'], "descending sinks A to the bottom");
+    assert_eq!(prios("(and (task TODO) (sort-by priority asc))"), vec!['A', 'A', 'B', 'C'], "A floats to the top globally");
+    assert_eq!(prios("(and (task TODO) (sort-by priority desc))"), vec!['C', 'B', 'A', 'A'], "descending sinks A to the bottom");
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -57,7 +59,9 @@ fn sort_by_modified_interleaves_journal_and_pages() {
 }
 
 // `(sort-by deadline)` orders by the DEADLINE planning date — soonest first in
-// ascending order; tasks without a deadline sort last (the `~` sentinel).
+// ascending order; tasks without a deadline sort last (the `~` sentinel). All three
+// live on one page, so they coalesce under a single heading (one group, blocks in
+// sorted order) — read across blocks, not groups.
 #[test]
 fn sort_by_deadline_soonest_first() {
     let root = mk("sortdead");
@@ -68,11 +72,53 @@ fn sort_by_deadline_soonest_first() {
     .unwrap();
     let g = Graph::open(&root);
     g.warm_cache();
-    let tag = |grp: &tine_core::RefGroup| {
-        grp.blocks[0].raw.lines().next().unwrap().split_whitespace().last().unwrap().to_string()
-    };
-    let asc: Vec<String> = g.run_query("(and (task TODO) (sort-by deadline asc))").iter().map(tag).collect();
+    let groups = g.run_query("(and (task TODO) (sort-by deadline asc))");
+    assert_eq!(groups.len(), 1, "same-page results share one heading");
+    let asc: Vec<String> = groups[0]
+        .blocks
+        .iter()
+        .map(|b| b.raw.lines().next().unwrap().split_whitespace().last().unwrap().to_string())
+        .collect();
     assert_eq!(asc, vec!["soon", "later", "none"], "soonest deadline first; no-deadline last");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// The user's case (Jul 4 2026): several matching todos on ONE journal day must
+// render under a SINGLE page heading, not repeat it per block — and a sort keeps
+// document order within that page.
+#[test]
+fn sort_coalesces_consecutive_same_page_results() {
+    let root = mk("sortcoalesce");
+    std::fs::write(root.join("journals").join("2020_02_02.md"), "- TODO a1\n- TODO a2\n- TODO a3\n").unwrap();
+    std::fs::write(root.join("journals").join("2020_01_01.md"), "- TODO b1\n").unwrap();
+    let g = Graph::open(&root);
+    g.warm_cache();
+    let groups = g.run_query("(and (task TODO) (sort-by modified desc))");
+    assert_eq!(groups.len(), 2, "consecutive same-page results share one heading (2, not 4)");
+    assert_eq!(groups[0].blocks.len(), 3, "the 3 same-day todos are under one group");
+    let first_day: Vec<String> =
+        groups[0].blocks.iter().map(|b| b.raw.split_whitespace().last().unwrap().to_string()).collect();
+    assert_eq!(first_day, vec!["a1", "a2", "a3"], "within-page document order kept even under desc");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// Coalescing merges only ADJACENT same-page runs: a page whose blocks sort to
+// DIFFERENT positions (an A and a C task under a priority sort) still appears at
+// each rank — it is not collapsed into one heading.
+#[test]
+fn sort_does_not_over_merge_nonadjacent_same_page() {
+    let root = mk("sortsplit");
+    std::fs::write(root.join("pages").join("P.md"), "- TODO [#A] pa\n- TODO [#C] pc\n").unwrap();
+    std::fs::write(root.join("pages").join("Q.md"), "- TODO [#B] qb\n").unwrap();
+    let g = Graph::open(&root);
+    g.warm_cache();
+    let groups = g.run_query("(and (task TODO) (sort-by priority asc))");
+    let seq: Vec<(String, usize)> = groups.iter().map(|g| (g.page.clone(), g.blocks.len())).collect();
+    assert_eq!(
+        seq,
+        vec![("P".to_string(), 1), ("Q".to_string(), 1), ("P".to_string(), 1)],
+        "P split across its A and C ranks; only adjacent same-page runs merge"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
