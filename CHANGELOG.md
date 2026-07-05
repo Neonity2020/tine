@@ -10,6 +10,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Added
 
+- **Windows ARM64 and Linux ARM64 builds.** Releases now include `aarch64`
+  installers for Windows (Surface Pro X, Snapdragon X laptops) and Linux (Asahi,
+  Raspberry Pi / SBC) alongside the existing x64 builds — pick the one matching
+  your CPU. Linux ARM is built natively; Windows ARM is cross-compiled. (These
+  build starting with the next tagged release.)
 - **Task checkboxes.** A `TODO`/`DOING`/`NOW`/`LATER`/`WAITING`/… block now shows
   a clickable checkbox in front of it (like Logseq): click it to mark the task
   `DONE` (checked), click again to reopen it (`TODO`, or `LATER` under the "now"

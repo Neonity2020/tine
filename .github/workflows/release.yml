@@ -44,7 +44,7 @@ jobs:
             const fs = require('fs');
             const tag = context.ref.replace('refs/tags/', '');
             const version = tag.replace(/^v/, '');
-            const fallback = 'Download an installer for your platform below. Windows users who prefer no installer can grab the portable `Tine_*_x64-portable.zip` — unzip and run the exe (needs the WebView2 runtime, preinstalled on Windows 10/11). macOS/Windows builds are currently unsigned (right-click → Open on macOS; More info → Run anyway on Windows). On macOS, if Tine keeps asking to access your Documents folder on launch, see the [workaround](https://github.com/martinkoutecky/tine/blob/master/README.md#macos-repeated-documents-permission-prompt).';
+            const fallback = 'Download an installer for your platform below. Windows and Linux ship both x64 and ARM64 builds (match your CPU). Windows users who prefer no installer can grab the portable `Tine_*-portable.zip` for their arch — unzip and run the exe (needs the WebView2 runtime, preinstalled on Windows 10/11). macOS/Windows builds are currently unsigned (right-click → Open on macOS; More info → Run anyway on Windows). On macOS, if Tine keeps asking to access your Documents folder on launch, see the [workaround](https://github.com/martinkoutecky/tine/blob/master/README.md#macos-repeated-documents-permission-prompt).';
             // Pull THIS version's section out of CHANGELOG.md so the GitHub release
             // notes match the changelog: everything between `## [x.y.z]` and the
             // next version heading (or the trailing link-reference block).
@@ -85,6 +85,15 @@ jobs:
           - platform: ubuntu-22.04
             args: "--features custom-protocol"
             rust-targets: ""
+          # Linux ARM64: built NATIVELY on GitHub's aarch64 runner (free on public
+          # repos). No cross-compile — GTK/WebKitGTK are system libs that are
+          # painful to cross-compile, so we install the arm64 -dev packages on the
+          # arm runner exactly like the x86 job. Audience: Asahi (fine) + Pi/SBC
+          # (will feel WebKitGTK's paint cost). Ships .deb + raw binary (AppImage
+          # tooling on ARM is historically flaky, so it's fine if that bundle is skipped).
+          - platform: ubuntu-22.04-arm
+            args: "--features custom-protocol"
+            rust-targets: ""
           - platform: macos-latest
             # one universal binary that runs on both Apple Silicon and Intel
             args: "--target universal-apple-darwin --features custom-protocol"
@@ -92,12 +101,25 @@ jobs:
           - platform: windows-latest
             args: "--features custom-protocol"
             rust-targets: ""
+            win-arch: x64
+            win-exe-dir: target/release
+          # Windows ARM64 (Surface Pro X, Snapdragon X laptops): CROSS-compiled from
+          # the x86_64 windows runner. rustup adds the target; the VS 2022 ARM64 MSVC
+          # tools are preinstalled on the windows-latest image. A `--target <triple>`
+          # build outputs under target/<triple>/release/ (NOT target/release/), which
+          # `win-exe-dir` below threads into the portable-zip step. WebView2 exists on
+          # Windows ARM64, so the runtime is fine.
+          - platform: windows-latest
+            args: "--target aarch64-pc-windows-msvc --features custom-protocol"
+            rust-targets: "aarch64-pc-windows-msvc"
+            win-arch: arm64
+            win-exe-dir: target/aarch64-pc-windows-msvc/release
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Linux dependencies
-        if: matrix.platform == 'ubuntu-22.04'
+        if: startsWith(matrix.platform, 'ubuntu-')
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -167,13 +189,16 @@ jobs:
         run: |
           $tag = "${{ github.ref_name }}"
           $version = $tag -replace '^v', ''
-          # Tauri v2 may rename the main binary to productName ("Tine.exe"); the
-          # cargo bin name is "tine.exe". Pick whichever exists — and NOT the
+          # A cross-target build (ARM64) outputs under target/<triple>/release/, a
+          # native build (x64) under target/release/ — matrix.win-exe-dir carries the
+          # right one. Tauri v2 may rename the main binary to productName ("Tine.exe");
+          # the cargo bin name is "tine.exe". Pick whichever exists — and NOT the
           # secondary "tine-check.exe" helper binary.
-          $exe = @('target/release/Tine.exe', 'target/release/tine.exe') |
+          $dir = "${{ matrix.win-exe-dir }}"
+          $exe = @("$dir/Tine.exe", "$dir/tine.exe") |
             Where-Object { Test-Path $_ } | Select-Object -First 1
-          if (-not $exe) { throw "portable: main Tine exe not found under target/release" }
-          $zip = "Tine_${version}_x64-portable.zip"
+          if (-not $exe) { throw "portable: main Tine exe not found under $dir" }
+          $zip = "Tine_${version}_${{ matrix.win-arch }}-portable.zip"
           Compress-Archive -Path $exe -DestinationPath $zip -Force
           gh release upload $tag $zip --clobber --repo $env:GITHUB_REPOSITORY
 
