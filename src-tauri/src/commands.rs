@@ -196,11 +196,16 @@ pub(crate) fn publish_html(state: State<'_, AppState>) -> Result<(String, usize)
 }
 
 /// Render one page to a self-contained HTML document (assets inlined, no sidebar)
-/// for the print-to-PDF export. `Err("no-page")` if the page doesn't exist.
+/// for the print-to-PDF export, with the dialog's options. `Err("no-page")` if the
+/// page doesn't exist.
 #[tauri::command]
-pub(crate) fn page_print_html(name: String, state: State<'_, AppState>) -> Result<String, String> {
+pub(crate) fn page_print_html(
+    name: String,
+    opts: tine_core::publish::PrintOpts,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
     with_graph(&state, |g| {
-        g.page_print_html(&name)
+        g.page_print_html(&name, opts)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| "no-page".to_string())
     })

@@ -1,6 +1,6 @@
-// Open Settings → Backups (with the ?conflicts gate so the mock surfaces a
-// sync-conflict copy), screenshot the panel, then open the merge modal and
-// screenshot it. Verifies the sync-conflict reconcile + block-merge UI.
+// Open Settings → Backups & recovery (with the ?conflicts gate so the mock
+// surfaces a sync-conflict copy), screenshot the panel, then open the merge modal
+// and screenshot it. Verifies the sync-conflict reconcile + block-merge UI.
 import { chromium } from "playwright";
 import { spawn } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -22,7 +22,7 @@ try {
   await page.waitForSelector(".ls-block", { timeout: 5000 });
   await page.locator('button.icon-btn[title^="Settings"]').first().click();
   await page.waitForSelector(".settings-modal", { timeout: 3000 });
-  await page.locator(".settings-nav-item", { hasText: "Journals" }).click();
+  await page.locator(".settings-nav-item", { hasText: "Backups & recovery" }).click();
   await sleep(300);
   // Scroll the sync-conflict panel into view and screenshot it.
   await page.locator(".sync-conflict-row").first().scrollIntoViewIfNeeded();

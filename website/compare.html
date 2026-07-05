@@ -21,6 +21,11 @@
   .g-part { color: #c2410c; }
   .g-no { color: var(--ink-faint); }
   .g-add { color: #7c3aed; }
+  /* "available only via a community plugin" (Logseq) — a small pill, not a glyph. */
+  .plug { display: inline-block; font-size: .68rem; font-weight: 700; line-height: 1;
+    padding: .22em .5em; border-radius: 999px; border: 1px solid var(--line);
+    background: var(--bg-tint); color: var(--ink-soft); text-transform: lowercase;
+    letter-spacing: .02em; white-space: nowrap; }
 
   .qa { max-width: 820px; margin: 2rem auto 0; display: grid; gap: .7rem; }
   .qa-item { background: var(--card); border: 1px solid var(--line); border-left: 3px solid var(--accent); border-radius: var(--radius); padding: .9rem 1.1rem; box-shadow: var(--shadow); }
@@ -91,6 +96,7 @@
         <span><b class="g g-part">◑</b> partial / scoped</span>
         <span><b class="g g-no">✗</b> not yet</span>
         <span><b class="g g-add">⊕</b> Tine goes further</span>
+        <span><span class="plug">plugin</span> Logseq: community plugin only</span>
       </div>
     </div>
 
@@ -106,11 +112,11 @@
       </div>
       <div class="qa-item">
         <div class="qa-q">Queries?</div>
-        <div class="qa-a"><b class="g g-part">◑</b> Yes for simple and compound queries — <code>{{query (and (task TODO) (priority A))}}</code>, page-refs, properties, <code>scheduled</code>/<code>deadline</code>, <code>sort-by</code>, etc. Advanced Datalog (<code>[:find …]</code>) is supported for a <em>mapped subset</em> of clauses; anything it can't map is listed as ignored rather than answered wrongly. Queries even run in the HTML export.</div>
+        <div class="qa-a"><b class="g g-part">◑</b> Yes — the everyday queries work: <code>{{query (and (task TODO) (priority A))}}</code>, page-refs, block/page properties, <code>scheduled</code>/<code>deadline</code> ranges, boolean <code>and</code>/<code>or</code>/<code>not</code>, and <code>sort-by</code>. That's the bulk of real-world use, and there's a <em>visual query builder</em> so you don't have to remember the syntax. The gap is <b>raw Datalog</b> (<code>[:find … :where [?b :block/…]]</code>): Tine translates the common clause heads (task, priority, page-ref, property, between) but skips arbitrary entity–attribute joins, custom rules, and <code>:result-transform</code>/<code>:view</code> — and it <em>tells you</em> which clauses ran and which it ignored, instead of guessing a wrong answer. Queries even run in the HTML export.</div>
       </div>
       <div class="qa-item">
-        <div class="qa-q">Do math on queries?</div>
-        <div class="qa-a"><b class="g g-no">✗</b> Not yet — no aggregation / arithmetic over query results. Worth knowing: Logseq has no <em>native</em> math-on-queries either; it needs advanced <code>:view</code>/<code>:result-transform</code> functions or a plugin. Both are in the same place here.</div>
+        <div class="qa-q">Do math on query results?</div>
+        <div class="qa-a"><b class="g g-no">✗</b> Not yet — no aggregation or arithmetic <em>over</em> the results (count/sum/average matched blocks, compute a derived value). In Logseq you get this only by writing a Clojure <code>:result-transform</code> function (post-processes the result list) or a <code>:view</code> function (renders a custom table) inside the query — an escape hatch most users never touch. Logseq has no <em>native</em>, no-code way either, so both apps sit in the same place; a builder-driven version is on Tine's list.</div>
       </div>
     </div>
   </section>
@@ -126,7 +132,7 @@
         <tbody>
           <tr><td class="feat">Outlining — nest, fold, zoom, move blocks</td><td class="st"><b class="g g-yes">✓</b></td><td class="st"><b class="g g-yes">✓</b></td><td class="note">Keyboard-first; drag to reorder.</td></tr>
           <tr><td class="feat">Bold / italic / strikethrough / highlight / inline code</td><td class="st"><b class="g g-yes">✓</b></td><td class="st"><b class="g g-yes">✓</b></td><td class="note">Cmd+B/I plus a floating selection toolbar; <code>**</code>/<code>==</code>/<code>~~</code> wrap the selection as you type.</td></tr>
-          <tr><td class="feat">Raw inline HTML (<code>&lt;ins&gt;</code>, <code>&lt;sup&gt;</code>, <code>&lt;kbd&gt;</code>…)</td><td class="st"><b class="g g-yes">✓</b></td><td class="st"><b class="g g-part">◑</b></td><td class="note">Renders live, sanitized to a safe allowlist (formatting tags + <code>&lt;img&gt;</code>/<code>&lt;a&gt;</code>); scripts, event handlers and <code>style</code> are stripped (<a href="https://github.com/martinkoutecky/tine/issues/16">#16</a>). Two Logseq-parity notes: a <em>bare</em> <code>&lt;img&gt;</code> is literal in Logseq too (only a self-closed <code>&lt;img/&gt;</code> renders), and <code>^x^</code>/<code>~x~</code> aren't sub/superscript in either — use the HTML tags or <code>$math$</code>.</td></tr>
+          <tr><td class="feat">Raw inline HTML (<code>&lt;ins&gt;</code>, <code>&lt;sup&gt;</code>, <code>&lt;kbd&gt;</code>…)</td><td class="st"><b class="g g-yes">✓</b></td><td class="st"><b class="g g-yes">✓</b></td><td class="note">Renders live, sanitized to a safe allowlist (formatting tags + <code>&lt;img&gt;</code>/<code>&lt;a&gt;</code>); scripts, event handlers and <code>style</code> are stripped (<a href="https://github.com/martinkoutecky/tine/issues/16">#16</a>; new in 0.3.5). Two Logseq-parity notes: a <em>bare</em> <code>&lt;img&gt;</code> is literal in Logseq too (only a self-closed <code>&lt;img/&gt;</code> renders), and <code>^x^</code>/<code>~x~</code> aren't sub/superscript in either — use the HTML tags or <code>$math$</code>.</td></tr>
           <tr><td class="feat">Slash command menu</td><td class="st"><b class="g g-yes">✓</b></td><td class="st"><b class="g g-yes">✓</b></td><td class="note">Blocks, headings, tasks, dates, code, math… A dedicated template picker is still being polished.</td></tr>
           <tr><td class="feat">Auto-pair brackets / <code>[[ ]]</code></td><td class="st"><b class="g g-yes">✓</b></td><td class="st"><b class="g g-yes">✓</b></td><td class="note">Page-ref pairing is always on; general auto-pairing is a toggle.</td></tr>
           <tr><td class="feat">Block references &amp; embeds</td><td class="st"><b class="g g-yes">✓</b></td><td class="st"><b class="g g-yes">✓</b></td><td class="note"><code>((ref))</code>, <code>{{embed}}</code>; copy ref/embed from the right-click menu.</td></tr>
@@ -174,9 +180,9 @@
         <thead><tr><th>Feature</th><th>Logseq</th><th>Tine</th><th>Notes</th></tr></thead>
         <tbody>
           <tr><td class="feat">Simple &amp; compound queries (DSL)</td><td class="st"><b class="g g-yes">✓</b></td><td class="st"><b class="g g-yes">✓</b></td><td class="note">task / priority / property / page-ref / scheduled / deadline / between / sort-by, with and/or/not.</td></tr>
-          <tr><td class="feat">Advanced Datalog (<code>[:find …]</code>)</td><td class="st"><b class="g g-yes">✓</b></td><td class="st"><b class="g g-part">◑</b></td><td class="note">A mapped subset of clauses; unsupported ones are reported as ignored, never guessed.</td></tr>
-          <tr><td class="feat">Query result tables / views</td><td class="st"><b class="g g-yes">✓</b></td><td class="st"><b class="g g-part">◑</b></td><td class="note">Results render as blocks + a query builder; custom table views / <code>:result-transform</code> are limited.</td></tr>
-          <tr><td class="feat">Math / aggregation on results</td><td class="st"><b class="g g-no">✗</b></td><td class="st"><b class="g g-no">✗</b></td><td class="note">Not native in either; needs advanced views / a plugin.</td></tr>
+          <tr><td class="feat">Advanced Datalog (<code>[:find …]</code>)</td><td class="st"><b class="g g-yes">✓</b></td><td class="st"><b class="g g-part">◑</b></td><td class="note">Tine translates the common clause heads (task, priority, page-ref, property, between, and/or/not) onto its engine; raw entity–attribute joins (<code>[?b ?a ?v]</code>) and custom rules aren't mapped. It reports which clauses ran vs. were ignored — never a silently-wrong result.</td></tr>
+          <tr><td class="feat">Query result tables / views</td><td class="st"><b class="g g-yes">✓</b></td><td class="st"><b class="g g-part">◑</b></td><td class="note">Results render as blocks, with a visual builder. Logseq's <code>:view</code> (a Clojure fn that draws a custom table/layout) and <code>:result-transform</code> (a Clojure fn that reshapes the result list) aren't run.</td></tr>
+          <tr><td class="feat">Math / aggregation on results</td><td class="st"><b class="g g-no">✗</b></td><td class="st"><b class="g g-no">✗</b></td><td class="note">Neither has a no-code way; in Logseq it means writing a Clojure <code>:result-transform</code>. On Tine's list as a builder feature.</td></tr>
         </tbody>
       </table></div>
 
@@ -189,7 +195,7 @@
           <tr><td class="feat">PDF viewer + annotation / highlights</td><td class="st"><b class="g g-yes">✓</b></td><td class="st"><b class="g g-yes">✓</b></td><td class="note">Highlights become blocks, same as Logseq.</td></tr>
           <tr><td class="feat">Asset handling (images, files)</td><td class="st"><b class="g g-yes">✓</b></td><td class="st"><b class="g g-yes">✓</b></td><td class="note">Paste an image → saved to <code>assets/</code>.</td></tr>
           <tr><td class="feat">HTML publish / export</td><td class="st"><b class="g g-yes">✓</b></td><td class="st"><b class="g g-yes">✓</b></td><td class="note">Facets, queries, and embeds all render — resolved against your graph at publish time. This site's <a href="demo/">demo</a> is Tine's own export.</td></tr>
-          <tr><td class="feat">PDF export</td><td class="st"><b class="g g-no">✗</b></td><td class="st"><b class="g g-no">✗</b></td><td class="note">Logseq has no native PDF export either (it's a plugin/print job); on Tine's roadmap.</td></tr>
+          <tr><td class="feat">PDF export</td><td class="st"><span class="plug">plugin</span></td><td class="st"><b class="g g-yes">✓</b></td><td class="note">Logseq has no <em>native</em> PDF export — only a community plugin. Tine has it built in: right-click a page → <em>Export to PDF…</em> (whole page, print dialog → Save as PDF).</td></tr>
           <tr><td class="feat">Copy as Markdown / Rendered</td><td class="st"><b class="g g-yes">✓</b></td><td class="st"><b class="g g-add">⊕</b></td><td class="note">Tine adds a <em>Rendered</em> copy (paste formatted into email/docs).</td></tr>
           <tr><td class="feat">Org-mode graphs</td><td class="st"><b class="g g-yes">✓</b></td><td class="st"><b class="g g-yes">✓</b></td><td class="note">Reads/writes <code>.org</code>; per-graph preferred format.</td></tr>
         </tbody>
@@ -202,10 +208,9 @@
         <thead><tr><th>Feature</th><th>Logseq</th><th>Tine</th><th>Notes</th></tr></thead>
         <tbody>
           <tr><td class="feat">Performance on large graphs / older machines</td><td class="st"><b class="g g-part">◑</b></td><td class="st"><b class="g g-add">⊕</b></td><td class="note">The founding goal: a native Rust core + a lean UI, tuned for machines Logseq bogs down on.</td></tr>
-          <tr><td class="feat">Editor tabs</td><td class="st"><b class="g g-no">✗</b></td><td class="st"><b class="g g-add">⊕</b></td><td class="note">Middle-click / Ctrl+W, reorderable, restored on launch.</td></tr>
+          <tr><td class="feat">Editor tabs</td><td class="st"><span class="plug">plugin</span></td><td class="st"><b class="g g-add">⊕</b></td><td class="note">Built in (Logseq needs a community plugin): middle-click / Ctrl+W, reorderable, restored on launch.</td></tr>
           <tr><td class="feat">Global quick capture</td><td class="st"><b class="g g-part">◑</b></td><td class="st"><b class="g g-add">⊕</b></td><td class="note"><code>tine --capture</code> mini-window into today's journal.</td></tr>
           <tr><td class="feat">Typographic replacements (<code>-&gt;</code> → →)</td><td class="st"><b class="g g-part">◑</b></td><td class="st"><b class="g g-add">⊕</b></td><td class="note">Optional render-time only; your <code>.md</code> keeps the ASCII.</td></tr>
-          <tr><td class="feat">lsdoc-vs-Logseq render diff tool</td><td class="st"><b class="g g-no">✗</b></td><td class="st"><b class="g g-add">⊕</b></td><td class="note">Run Logseq's own parser over your graph, locally, and see any divergence.</td></tr>
         </tbody>
       </table></div>
 

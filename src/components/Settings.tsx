@@ -119,7 +119,7 @@ const TABS: { id: Tab; label: string }[] = [
   { id: "editor", label: "Editor" },
   { id: "journals", label: "Journals" },
   { id: "files", label: "Files" },
-  { id: "backups", label: "Backups" },
+  { id: "backups", label: "Backups & recovery" },
   { id: "graph", label: "Graph" },
   { id: "improve", label: "Help improve Tine" },
   { id: "shortcuts", label: "Keyboard shortcuts" },
@@ -815,9 +815,6 @@ function JournalsTab(): JSX.Element {
         />
         <span class="settings-hint">days ahead</span>
       </Field>
-
-      <JournalConflictsPanel />
-      <SyncConflictsPanel />
     </>
   );
 }
@@ -961,6 +958,9 @@ function BackupsTab(): JSX.Element {
           </For>
         </div>
       </Show>
+
+      <JournalConflictsPanel />
+      <SyncConflictsPanel />
     </>
   );
 }

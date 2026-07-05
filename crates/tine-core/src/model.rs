@@ -1953,8 +1953,12 @@ impl Graph {
 
     /// Render a single page to a self-contained HTML document for print-to-PDF
     /// (assets inlined, no sidebar/scripts). `Ok(None)` if the page doesn't exist.
-    pub fn page_print_html(&self, name: &str) -> io::Result<Option<String>> {
-        crate::publish::page_print_html(self, name)
+    pub fn page_print_html(
+        &self,
+        name: &str,
+        opts: crate::publish::PrintOpts,
+    ) -> io::Result<Option<String>> {
+        crate::publish::page_print_html(self, name, opts)
     }
 
     /// Rename a page, OG-style. Moves its file to the new name and rewrites every

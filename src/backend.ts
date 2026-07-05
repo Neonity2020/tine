@@ -16,6 +16,7 @@ import type {
   SyncConflict,
   SyncConflictDiff,
   MergeDecision,
+  PrintOpts,
 } from "./types";
 import { assetFileName } from "./media";
 import { mockBackend } from "./mock";
@@ -75,8 +76,9 @@ export interface Backend {
   renamePage(old: string, next: string): Promise<void>;
   publishHtml(): Promise<[string, number]>;
   /** Render one page to a self-contained HTML document (assets inlined, no
-   *  sidebar) for the print-to-PDF export. Rejects if the page doesn't exist. */
-  pagePrintHtml(name: string): Promise<string>;
+   *  sidebar) for the print-to-PDF export, with the dialog's options. Rejects if
+   *  the page doesn't exist. */
+  pagePrintHtml(name: string, opts: PrintOpts): Promise<string>;
   runQuery(query: string): Promise<RefGroup[]>;
   /** Advanced (datalog-subset) query: maps the supported clauses onto the engine
    *  and reports what ran vs was ignored. `currentPage` resolves `:current-page`. */
@@ -354,8 +356,8 @@ class TauriBackend implements Backend {
   publishHtml() {
     return this.call<[string, number]>("publish_html");
   }
-  pagePrintHtml(name: string) {
-    return this.call<string>("page_print_html", { name });
+  pagePrintHtml(name: string, opts: PrintOpts) {
+    return this.call<string>("page_print_html", { name, opts });
   }
   runQuery(query: string) {
     return this.call<RefGroup[]>("run_query", { query });

@@ -19,6 +19,7 @@ import { HelpPopup } from "./components/HelpShortcuts";
 import { DatePicker } from "./components/DatePicker";
 import { PageProps } from "./components/PageProps";
 import { ExportModal } from "./components/ExportModal";
+import { PdfExportDialog } from "./components/PdfExportDialog";
 import { installKeybindings } from "./keybindings";
 import { installFileDrop } from "./filedrop";
 import { installBlockSelectionDrag } from "./blockDrag";
@@ -560,6 +561,7 @@ export function App(): JSX.Element {
       <DatePicker />
       <PageProps />
       <ExportModal />
+      <PdfExportDialog />
       <Settings />
       <HelpPopup />
       {/* First-run onboarding: covers the (empty) app when no graph is configured.

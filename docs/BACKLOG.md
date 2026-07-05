@@ -23,10 +23,9 @@ _Empty. (The "Help improve Tine" lsdoc↔mldoc diff panel — [ADR 0018](adr/001
 
 ## P1 — do next (high value, bounded scope)
 
-_Empty. The collapsed-query builder flicker (WebKitGTK DMABUF renderer re-rasterizing a
-varying subset of query boxes on pointer re-entry) was fixed Jul 4 2026 by giving each
-`.query-block` a stable compositing layer (`transform: translateZ(0)`) — confirmed on
-Martin's machine. TINE_GPU=0 was the discriminator that proved it was the GPU compositor._
+| Item | Notes |
+|---|---|
+| **Logbook / time-tracking** (Martin, Jul 5 2026) | Bring OG's clock/time-tracking to parity. **Researched → `subagent-tasks/notes/logbook-og-research.md`** (OG source cited throughout). **Format:** an org `:LOGBOOK:`/`:END:` drawer of `CLOCK: [start]--[end] =>  H:MM:SS` lines, timestamps `yyyy-MM-dd E HH:mm[:ss]` in local time, drawer placed after title/SCHEDULED/DEADLINE/properties (`util/clock.cljs`, `util/drawer.cljs`). **Behavior:** clocks are a *side-effect of marker cycling* (no start/stop button) — `handler/editor.cljs` `with-marker-time` clocks-in on →DOING/NOW, clocks-out on →TODO/LATER/DONE, gated by `:feature/enable-timetracking?` (default ON). A per-block elapsed badge + a Type/Start/End/Span tooltip show totals. **Tine already has** the drawer round-trip + hide (`doc.rs` keeps it, `block.ts visibleBody` hides it, lsdoc treats it as an opaque `Drawer`) and OG-parity marker cycling (`src/editor/marker.ts`); it's **missing** the clock side-effect, the summary/totals, and reading the config keys. **Effort ≈ 3–4 days** full parity (or ~1–1.5 for a marker-cycle-only MVP): a clock-in/out module in `tine-core` mirroring `drawer.cljs`+`clock.cljs`, a hook in `cycleMarkerSmart`/the save path, a summary that trusts the stored `=> span`, config keys, and a badge+tooltip UI. **Risks:** byte-exact timestamp round-trip (the `E` weekday + seconds-default), double clock-ins on a running clock (replicate OG's `not logbook-exists?` guards), timezone/DST (trust the stored span, don't recompute), and NOT adding a second drawer parser (one-parser rule). |
 
 ---
 

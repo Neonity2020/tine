@@ -186,3 +186,14 @@ export interface Highlight {
   text: string | null;
   image: number | null;
 }
+
+/** Options for the print-to-PDF export (chosen in the pre-export dialog). Field
+ *  names are snake_case to match the Rust `PrintOpts` serde deserialization. */
+export interface PrintOpts {
+  /** Expand `collapsed:: true` blocks (true = print the whole page). */
+  expand_collapsed: boolean;
+  /** Base body font size, px. */
+  font_px: number;
+  /** Page margin, mm (all four sides). */
+  margin_mm: number;
+}

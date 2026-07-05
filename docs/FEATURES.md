@@ -229,12 +229,12 @@ files. **⊕ marks things Tine adds on top of Logseq core** (no plugins).
   (e.g. `dd-MM-yyyy`, `yyyy-MM-dd`, `yyyyMMdd`), falling back to the defaults so
   old/foreign files still resolve. The display-title format is pickable in Settings.
 - **Duplicate-day reconcile** — if two files ever resolve to the same day, Tine keeps
-  **both** rather than silently dropping one, and Settings → *Journals* → **Duplicate
+  **both** rather than silently dropping one, and Settings → *Backups & recovery* → **Duplicate
   journal days** lets you **Open** / **Merge** / **Rename** / **Trash** each.
 - **Sync-conflict merge** — Syncthing/Dropbox leave a `*.sync-conflict-*` (or
   `(conflicted copy)`) file when the same page was edited on two devices. Tine keeps
   these **out of your page list** (they're not real pages) and surfaces them under
-  Settings → *Journals* → **Sync conflict copies**. **Review & merge** shows a
+  Settings → *Backups & recovery* → **Sync conflict copies**. **Review & merge** shows a
   **block-by-block diff** against the current page — matched by `id::`, then by
   content, then by first-line similarity — with a per-block **keep-current /
   keep-copy / keep-both** choice (and page-property merge); **Discard copy** trashes
@@ -292,14 +292,16 @@ files. **⊕ marks things Tine adds on top of Logseq core** (no plugins).
   `{{namespace}}` lists child pages, and `{{video}}` embeds the player. (No interactive
   graph view yet.) See the live **[Feature showcase](../website/demo/)** demo page.
 - **Export a page to PDF** — right-click a page title → **Export to PDF…** (or the
-  **Export current page to PDF…** command). Tine renders the *whole* page (not just
-  the on-screen blocks — the editor virtualizes long pages) to a self-contained
-  document with images inlined, using the **same parser + renderer as the app and the
-  HTML export**, then opens your OS print dialog with a print stylesheet (sensible
-  margins, no page-chrome, blocks kept off page breaks) so you pick **Save as PDF**.
-  No extra dependency — it reuses the HTML export and the webview's own print engine.
-  (Matches what the Logseq PDF-export community plugin did; OG has no native PDF
-  export.)
+  **Export current page to PDF…** command). A small dialog offers **collapsed blocks:
+  expand / keep folded**, **font size**, and **margins**; then Tine renders the *whole*
+  page (not just the on-screen blocks — the editor virtualizes long pages) to a
+  self-contained document with images inlined, using the **same parser + renderer as
+  the app and the HTML export**, and opens your OS print dialog so you pick **Save as
+  PDF**. The document always prints on a **light** background (printable, whatever your
+  theme) with font ligatures off (so `->`/`--` stay literal), and drops the on-screen
+  bullet rails. No extra dependency — it reuses the HTML export and the webview's own
+  print engine. (Matches what the Logseq PDF-export community plugin did; OG has no
+  native PDF export.)
 - **Copy/export as** Markdown for a block subtree or a whole page, with a *Rendered*
   mode that flattens to what you see — and in Rendered mode a `((block ref))` resolves
   to the referenced block's text and a user `{{macro}}` to its expansion (not the bare

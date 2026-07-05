@@ -182,9 +182,9 @@ export async function refreshJournalConflicts(notify = false): Promise<void> {
     setJournalConflicts(c);
     if (notify && c.length) {
       pushToast(
-        `${c.length} journal day${c.length === 1 ? "" : "s"} have duplicate files in different formats — reconcile them in Settings → Backups`,
+        `${c.length} journal day${c.length === 1 ? "" : "s"} have duplicate files in different formats — reconcile them in Settings → Backups & recovery`,
         "info",
-        { sticky: true }
+        { sticky: true, action: { label: "Open", run: () => openSettings("backups") } }
       );
     }
   } catch {
@@ -194,7 +194,7 @@ export async function refreshJournalConflicts(notify = false): Promise<void> {
 
 // --- sync-tool conflict copies (Syncthing/Dropbox `*.sync-conflict-*` files).
 // Excluded from the page list; surfaced here so the user can review + merge them
-// (Settings → Backups) instead of them rotting as garbage pages. ---
+// (Settings → Backups & recovery) instead of them rotting as garbage pages. ---
 export const [syncConflicts, setSyncConflicts] = createSignal<SyncConflict[]>([]);
 /** Re-fetch the sync-conflict list; with `notify`, toast if any exist. */
 export async function refreshSyncConflicts(notify = false): Promise<void> {
@@ -203,9 +203,9 @@ export async function refreshSyncConflicts(notify = false): Promise<void> {
     setSyncConflicts(c);
     if (notify && c.length) {
       pushToast(
-        `${c.length} sync-conflict file${c.length === 1 ? "" : "s"} in your graph — review + merge them in Settings → Backups`,
+        `${c.length} sync-conflict file${c.length === 1 ? "" : "s"} in your graph — review + merge them in Settings → Backups & recovery`,
         "info",
-        { sticky: true }
+        { sticky: true, action: { label: "Open", run: () => openSettings("backups") } }
       );
     }
   } catch {
@@ -925,6 +925,17 @@ export function openCommandPalette() {
 }
 export function closeSwitcher() {
   setSwitcherOpen(false);
+}
+
+// PDF export: the page whose export-options dialog is open (null = closed). Set by
+// the page context menu / the "Export current page to PDF" command; the dialog
+// collects options and calls exportPagePdf.
+export const [pdfExportPage, setPdfExportPage] = createSignal<string | null>(null);
+export function openPdfExport(name: string) {
+  setPdfExportPage(name);
+}
+export function closePdfExport() {
+  setPdfExportPage(null);
 }
 
 // The PDF currently open in the side pane (filename within assets/, + label,

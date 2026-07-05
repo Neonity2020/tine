@@ -27,6 +27,7 @@ import {
   settingsOpen,
   carryDays,
   pushToast,
+  openPdfExport,
 } from "./ui";
 import { carryDaysBack } from "./carry";
 import {
@@ -39,7 +40,6 @@ import {
   activatePrevTab,
   route,
 } from "./router";
-import { exportPagePdf } from "./print";
 import {
   undo,
   redo,
@@ -116,7 +116,7 @@ const COMMANDS: CommandDef[] = [
     scope: "global",
     run: () => {
       const r = route();
-      if (r.kind === "page") void exportPagePdf(r.name);
+      if (r.kind === "page") openPdfExport(r.name);
       else pushToast("Open a page first to export it to PDF", "warn");
     },
   },

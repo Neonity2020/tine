@@ -872,6 +872,21 @@ body {
   filter: brightness(1.05);
 }
 
+/* PDF export dialog: a note between the options and the buttons explaining the
+   next step (the OS print dialog). */
+.pdf-export-modal {
+  width: min(440px, 92vw);
+}
+.pdf-export-note {
+  font-size: 12px;
+  color: var(--text-secondary);
+  line-height: 1.5;
+  margin: 2px 0 4px;
+}
+.pdf-export-note b {
+  color: var(--text-primary);
+}
+
 .fav-star.active {
   color: #f5c518;
 }

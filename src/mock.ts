@@ -424,7 +424,7 @@ export function mockBackend(): Backend {
     async publishHtml(): Promise<[string, number]> {
       return ["/mock/graph/publish", all.length];
     },
-    async pagePrintHtml(name: string): Promise<string> {
+    async pagePrintHtml(name: string, _opts): Promise<string> {
       // Dev-preview stub: a small self-contained doc so the print harness/flow can
       // render something without the real publish pipeline.
       return (

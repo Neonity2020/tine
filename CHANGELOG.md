@@ -11,24 +11,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 ### Added
 
 - **Export a page to PDF.** Right-click a page title → **Export to PDF…** (or run
-  **Export current page to PDF…** from the command palette). Tine renders the whole
-  page — not just the blocks currently on screen — to a self-contained document (the
-  same lsdoc renderer as the HTML export, with images inlined as data URIs) and opens
-  your OS print dialog with a print stylesheet, so you can **Save as PDF**. No new
-  dependency: it reuses the HTML export plus the webview's own print engine. See ADR
-  0021.
+  **Export current page to PDF…** from the command palette). A pre-export dialog offers
+  **collapsed blocks: expand / keep folded**, **font size**, and **margins**. Tine
+  renders the whole page — not just the blocks currently on screen — to a
+  self-contained document (the same lsdoc renderer as the HTML export, with images
+  inlined as data URIs) and opens your OS print dialog, so you can **Save as PDF**. The
+  PDF always prints on a **light** background (whatever your theme) with font ligatures
+  off. No new dependency: it reuses the HTML export plus the webview's own print
+  engine. See ADR 0021.
 - **Sync-conflict merge.** Syncthing/Dropbox `*.sync-conflict-*` (and Dropbox
   `(conflicted copy)`) files are now kept out of your page list and surfaced under
-  Settings → *Journals* → **Sync conflict copies**. **Review & merge** shows a
+  Settings → *Backups & recovery* → **Sync conflict copies**. **Review & merge** shows a
   block-by-block diff against the current page — matched by `id::`, then content,
   then first-line similarity — with per-block **keep-current / keep-copy / keep-both**
   and a page-property merge; **Discard copy** trashes it. Merges write through the
   normal (base-revision-guarded, atomic) save path and move the copy to the
   recoverable trash — never auto-merged, never unlinked. See ADR 0020.
-- **"Help improve Tine" diff panel** (Settings). Runs Tine's parser (lsdoc) against
-  Logseq's own (mldoc) on your graph, locally, and surfaces anonymized, re-verified
-  divergences to paste into a bug report — crowd-sourcing parser divergence hunting.
-  See ADR 0018.
 - **Page icons on inline references.** A page's `icon::` (emoji/character) now shows
   as a prefix on inline `[[references]]` and `#tags` to it — matching Logseq (Tine
   already showed it on the page title and in the namespace listing). Emoji render as

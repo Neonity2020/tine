@@ -9,12 +9,20 @@
 // the app chrome, so the PDF is the page, nothing else.
 import { backend } from "./backend";
 import { pushToast } from "./ui";
+import type { PrintOpts } from "./types";
+
+/** The default export options (match the Rust `PrintOpts::default`). */
+export const DEFAULT_PRINT_OPTS: PrintOpts = {
+  expand_collapsed: true,
+  font_px: 16,
+  margin_mm: 16,
+};
 
 /** Export a page to PDF via the OS print dialog. Safe to call repeatedly. */
-export async function exportPagePdf(name: string): Promise<void> {
+export async function exportPagePdf(name: string, opts: PrintOpts = DEFAULT_PRINT_OPTS): Promise<void> {
   let html: string;
   try {
-    html = await backend().pagePrintHtml(name);
+    html = await backend().pagePrintHtml(name, opts);
   } catch (e) {
     // `no-page` (deleted mid-action) or any core error — never leave a dangling frame.
     pushToast(`Couldn't prepare “${name}” for PDF`, "error");

@@ -757,6 +757,7 @@ fn render_block(
     title: &str,
     counter: &mut u32,
     index: &mut Vec<serde_json::Value>,
+    opts: PrintOpts,
 ) {
     // ONE lsdoc parse → the canonical body skeleton (M3), property/planning-filtered like
     // the app's `bodyBlocks`. No second hand-rolled inline parser (the old `render_inline`).
@@ -790,10 +791,13 @@ fn render_block(
     out.push_str("</div>");
     emit_trailer_facets(b.scheduled(), b.deadline(), &b.properties(), out);
 
-    if !b.children.is_empty() {
+    // A collapsed block hides its children on screen; the print export expands them
+    // by default (a PDF usually wants the whole page), but the dialog can keep them
+    // folded to match what's visible.
+    if !b.children.is_empty() && (opts.expand_collapsed || !b.collapsed()) {
         out.push_str("<ul>");
         for c in &b.children {
-            render_block(c, out, ctx, slug, title, counter, index);
+            render_block(c, out, ctx, slug, title, counter, index, opts);
         }
         out.push_str("</ul>");
     }
@@ -812,7 +816,8 @@ fn page_html(
     body.push_str("<ul class=\"outline\">");
     let mut counter = 0u32;
     for b in &doc.roots {
-        render_block(b, &mut body, ctx, slug, title, &mut counter, blocks);
+        // The whole-graph site export always expands (no fold state on paper).
+        render_block(b, &mut body, ctx, slug, title, &mut counter, blocks, PrintOpts::default());
     }
     body.push_str("</ul>");
     // Journal titles get a leading calendar glyph, like Logseq.
@@ -861,17 +866,23 @@ fn shell(title: &str, main: &str) -> String {
 /// are inlined as `data:` URIs upstream (`inline_assets`), so no sibling folder is
 /// needed. KaTeX / highlight.js still load from CDN (math/code typeset when online;
 /// offline shows raw TeX / plain code, same as a published page).
-fn print_shell(title: &str, main: &str) -> String {
+fn print_shell(title: &str, main: &str, opts: PrintOpts) -> String {
+    // Dialog-driven knobs (font size + page margin) are appended AFTER PRINT_STYLE so
+    // they win over its `@page`/font defaults. Clamped to sane bounds.
+    let font = opts.font_px.clamp(8, 40);
+    let margin = opts.margin_mm.clamp(0, 50);
+    let tuned = format!("@page{{margin:{margin}mm}}\nbody.print{{font-size:{font}px}}");
     format!(
         "<!doctype html><html><head><meta charset=\"utf-8\">\
 <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{title}</title>\
-{katex}{hljs}<style>{style}\n{print}</style></head><body class=\"print\">\
+{katex}{hljs}<style>{style}\n{print}\n{tuned}</style></head><body class=\"print\">\
 <main>{main}</main></body></html>",
         title = esc(title),
         katex = KATEX_HEAD,
         hljs = HLJS_HEAD,
         style = STYLE,
         print = PRINT_STYLE,
+        tuned = tuned,
         main = main,
     )
 }
@@ -883,15 +894,33 @@ fn print_shell(title: &str, main: &str) -> String {
 /// text so a printed link isn't a mystery blue word).
 const PRINT_STYLE: &str = r#"
 @page{margin:16mm 14mm}
-body.print{display:block}
+/* Force a LIGHT, printable document even if the OS/webview is in dark mode — a PDF
+   should never be white-on-black. These come AFTER STYLE in the same <style>, so
+   they override STYLE's own prefers-color-scheme:dark block (both the default and
+   the dark media query are pinned to the light palette). */
+:root{color-scheme:light;
+  --bg:#fff;--fg:#1c1d1e;--muted:#8a8f98;--line:#e4e4e8;--accent:#10b981;--link:#0b5cad;--code:#f4f5f7;}
+@media (prefers-color-scheme:dark){:root{
+  --bg:#fff;--fg:#1c1d1e;--muted:#8a8f98;--line:#e4e4e8;--accent:#10b981;--link:#0b5cad;--code:#f4f5f7;}}
+body.print{display:block;background:#fff;color:var(--fg);
+  /* WebKitGTK renders Inter's `->` / `--` / `-->` ligatures as arrow/dash glyphs
+     that look garbled in the export (the editor disables ligatures for the same
+     reason). Keep the literal characters in the PDF. */
+  font-variant-ligatures:none;font-feature-settings:"liga" 0,"calt" 0;}
 body.print main{max-width:none;margin:0;padding:0 4mm 8mm}
 body.print h1.page{margin-top:0}
+/* No bullet guide-rails on paper: the connecting lines are a screen-navigation
+   affordance and misalign against the bullet dots when printed — dots alone read
+   cleaner. */
+body.print ul.outline ul{border-left:none}
 @media print{
   body.print main{padding:0}
   a.ref,a.tag,a.block-ref{color:inherit;text-decoration:none}
   li,pre,table,.video-embed,img{break-inside:avoid}
   h1,h2,h3,h4,h5,h6,.heading-text{break-after:avoid}
-  ul.outline ul{border-left:1px solid #ddd}
+  /* Print the accent colors (task-checkbox fills, callout tints) instead of
+     dropping them to grey. */
+  *{-webkit-print-color-adjust:exact;print-color-adjust:exact;}
 }
 "#;
 
@@ -901,7 +930,7 @@ body.print h1.page{margin-top:0}
 /// page (in-page `((ref))` → an in-document anchor); a ref to a block on another
 /// page degrades to its label / muted text (there's no second file to link to),
 /// which is correct for a single-page export.
-pub fn page_print_html(graph: &Graph, name: &str) -> io::Result<Option<String>> {
+pub fn page_print_html(graph: &Graph, name: &str, opts: PrintOpts) -> io::Result<Option<String>> {
     let Some(entry) = graph.list_pages().into_iter().find(|e| e.name == name) else {
         return Ok(None);
     };
@@ -918,11 +947,31 @@ pub fn page_print_html(graph: &Graph, name: &str) -> io::Result<Option<String>> 
     body.push_str("<ul class=\"outline\">");
     let mut counter = 0u32;
     for b in &parsed.roots {
-        render_block(b, &mut body, &ctx, &slug, &entry.name, &mut counter, &mut blocks);
+        render_block(b, &mut body, &ctx, &slug, &entry.name, &mut counter, &mut blocks, opts);
     }
     body.push_str("</ul>");
     let heading = format!("<h1 class=\"page\">{}</h1>", esc(&entry.name));
-    Ok(Some(print_shell(&entry.name, &format!("{heading}{body}"))))
+    Ok(Some(print_shell(&entry.name, &format!("{heading}{body}"), opts)))
+}
+
+/// Options for the single-page print/PDF export, chosen in the pre-export dialog.
+/// `#[serde(default)]` so a partial object from the frontend fills the rest.
+#[derive(Clone, Copy, Debug, serde::Deserialize)]
+#[serde(default)]
+pub struct PrintOpts {
+    /// Render the children of a `collapsed:: true` block anyway (true = expand the
+    /// whole page, the usual PDF want; false = print it folded as on screen).
+    pub expand_collapsed: bool,
+    /// Base body font size in px.
+    pub font_px: u32,
+    /// Page margin in mm (all four sides).
+    pub margin_mm: u32,
+}
+
+impl Default for PrintOpts {
+    fn default() -> Self {
+        Self { expand_collapsed: true, font_px: 16, margin_mm: 16 }
+    }
 }
 
 // KaTeX (from CDN) typesets the `\(..\)` / `\[..\]` math the decorator emits from
@@ -1493,7 +1542,7 @@ mod tests {
         .unwrap();
 
         let g = Graph::open(&dir);
-        let html = g.page_print_html("Report").unwrap().expect("page exists");
+        let html = g.page_print_html("Report", PrintOpts::default()).unwrap().expect("page exists");
 
         // Self-contained: inlined stylesheet + inlined image, no sidebar / app scripts /
         // external style.css.
@@ -1509,7 +1558,23 @@ mod tests {
         assert!(html.contains("@media print"), "print CSS present");
 
         // Missing page → None (not an error).
-        assert!(g.page_print_html("No Such Page").unwrap().is_none());
+        assert!(g.page_print_html("No Such Page", PrintOpts::default()).unwrap().is_none());
+
+        // Collapsed handling: a collapsed parent's children are expanded by default,
+        // and hidden when expand_collapsed is off.
+        fs::write(
+            dir.join("pages").join("Folded.md"),
+            "- Parent\n  collapsed:: true\n\t- hidden child text\n",
+        )
+        .unwrap();
+        let g2 = Graph::open(&dir);
+        let expanded = g2.page_print_html("Folded", PrintOpts::default()).unwrap().unwrap();
+        assert!(expanded.contains("hidden child text"), "default expands collapsed");
+        let folded = g2
+            .page_print_html("Folded", PrintOpts { expand_collapsed: false, ..PrintOpts::default() })
+            .unwrap()
+            .unwrap();
+        assert!(!folded.contains("hidden child text"), "folded hides collapsed children");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1610,6 +1675,7 @@ mod tests {
              - Tasks:\n  * [ ] open item\n  * [x] done item\n\
              - Coffee\n  : A hot drink brewed from beans.\n\
              - > A plain blockquote over\n  > two lines.\n\
+             - let's try again *(something)* -> --> -- en --- em \\alpha \\Delta\n\
              - A meeting <2026-06-30 Tue 14:00> and a deadline.\n",
         );
         fs::write(
@@ -1624,7 +1690,7 @@ mod tests {
 
         // Also emit the single-page print/PDF document for the showcase page, so
         // the print CSS + self-contained render can be eyeballed / screenshotted.
-        let print = g.page_print_html("Rendering Showcase").unwrap().unwrap();
+        let print = g.page_print_html("Rendering Showcase", PrintOpts::default()).unwrap().unwrap();
         let pfile = dir.join("print-sample.html");
         fs::write(&pfile, print).unwrap();
         println!("SAMPLE_PRINT_HTML={}", pfile.display());

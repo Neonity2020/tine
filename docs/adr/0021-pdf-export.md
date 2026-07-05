@@ -53,7 +53,15 @@ Concretely:
   (`iframe.srcdoc` → `contentWindow.print()`), so it prints the complete export
   document, not the virtualized live page and not the app chrome. Entry points: a
   page-title context-menu item **Export to PDF…** and an **Export current page to
-  PDF…** command.
+  PDF…** command, both opening a small **pre-export dialog** (`PdfExportDialog`).
+- The dialog exposes the options that map cleanly to a render/CSS knob (`PrintOpts`):
+  **collapsed blocks — expand / keep folded** (a `render_block` recursion gate on
+  `collapsed::`), **font size**, and **margins** (`@page`). Page size / orientation
+  and header/footer are left to the OS print dialog, which already offers them.
+- The document is **pinned to a light palette** regardless of the OS/webview theme (a
+  PDF should never be white-on-black) and **disables Inter's `->`/`--` ligatures**
+  (WebKitGTK renders them as garbled arrow/dash glyphs — the editor disables them for
+  the same reason).
 
 ## Consequences
 
