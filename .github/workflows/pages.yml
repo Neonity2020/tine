@@ -45,5 +45,12 @@ jobs:
       - uses: actions/upload-pages-artifact@v3
         with:
           path: website
+      # actions/deploy-pages intermittently returns "Deployment failed, try again
+      # later" (a GitHub Pages backend hiccup, not a content error). Retry once
+      # before failing the run, so a transient blip doesn't leave the site stale.
       - id: deployment
+        uses: actions/deploy-pages@v4
+        continue-on-error: true
+      - id: deployment-retry
+        if: steps.deployment.outcome == 'failure'
         uses: actions/deploy-pages@v4

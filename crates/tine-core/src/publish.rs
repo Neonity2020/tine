@@ -866,6 +866,33 @@ fn shell(title: &str, main: &str) -> String {
 /// are inlined as `data:` URIs upstream (`inline_assets`), so no sibling folder is
 /// needed. KaTeX / highlight.js still load from CDN (math/code typeset when online;
 /// offline shows raw TeX / plain code, same as a published page).
+// Inter faces bundled INTO the print document as `@font-face` data URIs. The print
+// doc is a separate document from the app, so it does NOT inherit the app's Inter
+// `@font-face` rules; without this it falls back to a system font, and if that font
+// lacks an italic face WebKitGTK *synthesizes* one — which its PDF (Cairo) backend
+// renders garbled (emphasis in particular). Embedding real normal/italic/bold faces
+// fixes that and makes the PDF self-contained + Inter-faithful. Latin subset only
+// (~120 KB); non-latin falls back to the system font, same as before.
+const INTER_FACES: &[(&[u8], u32, &str)] = &[
+    (include_bytes!("../assets/fonts/inter-400-normal.woff2"), 400, "normal"),
+    (include_bytes!("../assets/fonts/inter-400-italic.woff2"), 400, "italic"),
+    (include_bytes!("../assets/fonts/inter-600-normal.woff2"), 600, "normal"),
+    (include_bytes!("../assets/fonts/inter-700-normal.woff2"), 700, "normal"),
+    (include_bytes!("../assets/fonts/inter-700-italic.woff2"), 700, "italic"),
+];
+
+fn print_fontface() -> String {
+    let mut css = String::new();
+    for (bytes, weight, style) in INTER_FACES {
+        css.push_str(&format!(
+            "@font-face{{font-family:'Inter';font-weight:{weight};font-style:{style};font-display:swap;\
+src:url(data:font/woff2;base64,{}) format('woff2')}}\n",
+            base64_encode(bytes),
+        ));
+    }
+    css
+}
+
 fn print_shell(title: &str, main: &str, opts: PrintOpts) -> String {
     // Dialog-driven knobs (font size + page margin) are appended AFTER PRINT_STYLE so
     // they win over its `@page`/font defaults. Clamped to sane bounds.
@@ -875,11 +902,12 @@ fn print_shell(title: &str, main: &str, opts: PrintOpts) -> String {
     format!(
         "<!doctype html><html><head><meta charset=\"utf-8\">\
 <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{title}</title>\
-{katex}{hljs}<style>{style}\n{print}\n{tuned}</style></head><body class=\"print\">\
+{katex}{hljs}<style>{fonts}{style}\n{print}\n{tuned}</style></head><body class=\"print\">\
 <main>{main}</main></body></html>",
         title = esc(title),
         katex = KATEX_HEAD,
         hljs = HLJS_HEAD,
+        fonts = print_fontface(),
         style = STYLE,
         print = PRINT_STYLE,
         tuned = tuned,
@@ -906,7 +934,10 @@ body.print{display:block;background:#fff;color:var(--fg);
   /* WebKitGTK renders Inter's `->` / `--` / `-->` ligatures as arrow/dash glyphs
      that look garbled in the export (the editor disables ligatures for the same
      reason). Keep the literal characters in the PDF. */
-  font-variant-ligatures:none;font-feature-settings:"liga" 0,"calt" 0;}
+  font-variant-ligatures:none;font-feature-settings:"liga" 0,"calt" 0;
+  /* Only ever use the REAL embedded Inter faces (normal/italic/bold above) — never
+     a synthesized oblique/bold, which WebKitGTK's PDF backend renders garbled. */
+  font-synthesis:none;}
 body.print main{max-width:none;margin:0;padding:0 4mm 8mm}
 body.print h1.page{margin-top:0}
 /* No bullet guide-rails on paper: the connecting lines are a screen-navigation

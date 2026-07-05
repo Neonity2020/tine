@@ -16,9 +16,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   renders the whole page — not just the blocks currently on screen — to a
   self-contained document (the same lsdoc renderer as the HTML export, with images
   inlined as data URIs) and opens your OS print dialog, so you can **Save as PDF**. The
-  PDF always prints on a **light** background (whatever your theme) with font ligatures
-  off. No new dependency: it reuses the HTML export plus the webview's own print
-  engine. See ADR 0021.
+  PDF always prints on a **light** background (whatever your theme), embeds the Inter
+  font it uses (so italic/bold render correctly — no garbled synthesized glyphs) and
+  turns off `->`/`--` ligatures. No new dependency: it reuses the HTML export plus the
+  webview's own print engine. See ADR 0021.
 - **Sync-conflict merge.** Syncthing/Dropbox `*.sync-conflict-*` (and Dropbox
   `(conflicted copy)`) files are now kept out of your page list and surfaced under
   Settings → *Backups & recovery* → **Sync conflict copies**. **Review & merge** shows a

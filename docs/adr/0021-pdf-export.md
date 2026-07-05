@@ -62,6 +62,14 @@ Concretely:
   PDF should never be white-on-black) and **disables Inter's `->`/`--` ligatures**
   (WebKitGTK renders them as garbled arrow/dash glyphs — the editor disables them for
   the same reason).
+- The print doc **embeds the Inter faces it uses** (normal/italic/bold, latin subset,
+  as `@font-face` data URIs) and sets `font-synthesis: none`. A print document is a
+  *separate* document from the app, so it does not inherit the app's `@font-face`
+  rules; without embedding, WebKitGTK falls back to a system font and — if that font
+  lacks an italic face — *synthesizes* one, which its Cairo PDF backend renders
+  garbled (screen looks fine, the PDF doesn't). Embedding real faces fixes that and
+  keeps the PDF Inter-faithful and self-contained (~120 KB/export; non-latin still
+  falls back).
 
 ## Consequences
 
