@@ -17,6 +17,7 @@ import { openPage, openPageInNewTab, openPageAtBlock, openJournals, route } from
 import { refreshAfterRename } from "../graph";
 import { backend } from "../backend";
 import { carryDay } from "../carry";
+import { exportPagePdf } from "../print";
 import { journalTitle } from "../journal";
 import {
   doc,
@@ -331,6 +332,7 @@ function PageMenu(props: {
             pushToast("Copied page as Markdown", "success");
           }),
     },
+    { label: "Export to PDF…", run: () => void exportPagePdf(props.name) },
     { label: "Page properties…", run: () => openPageProps(props.name, props.x, props.y) },
     // Carry a past day's unfinished tasks to today (journal days only, not today).
     ...(props.pageKind === "journal" && props.name !== journalTitle(new Date())

@@ -424,6 +424,18 @@ export function mockBackend(): Backend {
     async publishHtml(): Promise<[string, number]> {
       return ["/mock/graph/publish", all.length];
     },
+    async pagePrintHtml(name: string): Promise<string> {
+      // Dev-preview stub: a small self-contained doc so the print harness/flow can
+      // render something without the real publish pipeline.
+      return (
+        `<!doctype html><html><head><meta charset="utf-8"><title>${name}</title>` +
+        `<style>body{font-family:Inter,sans-serif;margin:0;padding:24px;line-height:1.6}` +
+        `h1{font-size:1.9rem;margin:0 0 1rem}@page{margin:16mm}@media print{a{color:inherit}}</style>` +
+        `</head><body class="print"><main><h1 class="page">${name}</h1>` +
+        `<ul class="outline"><li>Mock print export of <strong>${name}</strong>.</li>` +
+        `<li>The real document is rendered by tine-core.</li></ul></main></body></html>`
+      );
+    },
     async runAdvancedQuery(query: string) {
       // Dev-preview stub: the real engine runs in the Tauri backend.
       void query;

@@ -291,6 +291,15 @@ files. **⊕ marks things Tine adds on top of Logseq core** (no plugins).
   `{{query …}}` runs and lists its results, `{{embed}}` inlines the target block/page,
   `{{namespace}}` lists child pages, and `{{video}}` embeds the player. (No interactive
   graph view yet.) See the live **[Feature showcase](../website/demo/)** demo page.
+- **Export a page to PDF** — right-click a page title → **Export to PDF…** (or the
+  **Export current page to PDF…** command). Tine renders the *whole* page (not just
+  the on-screen blocks — the editor virtualizes long pages) to a self-contained
+  document with images inlined, using the **same parser + renderer as the app and the
+  HTML export**, then opens your OS print dialog with a print stylesheet (sensible
+  margins, no page-chrome, blocks kept off page breaks) so you pick **Save as PDF**.
+  No extra dependency — it reuses the HTML export and the webview's own print engine.
+  (Matches what the Logseq PDF-export community plugin did; OG has no native PDF
+  export.)
 - **Copy/export as** Markdown for a block subtree or a whole page, with a *Rendered*
   mode that flattens to what you see — and in Rendered mode a `((block ref))` resolves
   to the referenced block's text and a user `{{macro}}` to its expansion (not the bare

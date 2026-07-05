@@ -47,3 +47,4 @@ see the project `CLAUDE.md`.
 | [0018](0018-in-app-lsdoc-mldoc-diff-panel.md) | In-app lsdoc↔mldoc diff panel bundles mldoc lazily and runs it in a worker | Accepted |
 | [0019](0019-raw-html-sanitizer.md) | Raw HTML renders live via a shared sanitizer allowlist (DOMPurify + ammonia), mirrored and contract-tested | Accepted |
 | [0020](0020-sync-conflict-merge.md) | Sync-conflict copies: detect + block-tree merge from one shared alignment; resolve only through the safe save path | Accepted |
+| [0021](0021-pdf-export.md) | PDF export reuses the HTML render + the webview's own print engine (hidden iframe + `window.print()`), no new deps | Accepted |

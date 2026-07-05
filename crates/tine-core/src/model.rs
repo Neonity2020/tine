@@ -1951,6 +1951,12 @@ impl Graph {
         crate::publish::publish_graph(self)
     }
 
+    /// Render a single page to a self-contained HTML document for print-to-PDF
+    /// (assets inlined, no sidebar/scripts). `Ok(None)` if the page doesn't exist.
+    pub fn page_print_html(&self, name: &str) -> io::Result<Option<String>> {
+        crate::publish::page_print_html(self, name)
+    }
+
     /// Rename a page, OG-style. Moves its file to the new name and rewrites every
     /// reference across pages AND journals — inline `[[old]]`/`#old`, the page's
     /// OWN self/sibling refs, and bare `tags:: old` property refs — and CASCADES

@@ -10,6 +10,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Added
 
+- **Export a page to PDF.** Right-click a page title → **Export to PDF…** (or run
+  **Export current page to PDF…** from the command palette). Tine renders the whole
+  page — not just the blocks currently on screen — to a self-contained document (the
+  same lsdoc renderer as the HTML export, with images inlined as data URIs) and opens
+  your OS print dialog with a print stylesheet, so you can **Save as PDF**. No new
+  dependency: it reuses the HTML export plus the webview's own print engine. See ADR
+  0021.
 - **Sync-conflict merge.** Syncthing/Dropbox `*.sync-conflict-*` (and Dropbox
   `(conflicted copy)`) files are now kept out of your page list and surfaced under
   Settings → *Journals* → **Sync conflict copies**. **Review & merge** shows a

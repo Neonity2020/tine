@@ -26,6 +26,7 @@ import {
   switcherOpen,
   settingsOpen,
   carryDays,
+  pushToast,
 } from "./ui";
 import { carryDaysBack } from "./carry";
 import {
@@ -36,7 +37,9 @@ import {
   reopenClosedTab,
   activateNextTab,
   activatePrevTab,
+  route,
 } from "./router";
+import { exportPagePdf } from "./print";
 import {
   undo,
   redo,
@@ -106,6 +109,17 @@ const COMMANDS: CommandDef[] = [
   { id: "ui/toggle-left-sidebar", binding: "t l", label: "Toggle left sidebar", scope: "global", run: toggleSidebar },
   { id: "ui/toggle-right-sidebar", binding: "t r", label: "Toggle right sidebar", scope: "global", run: toggleRightSidebar },
   { id: "ui/open-settings", binding: "t s", label: "Open settings", scope: "global", run: openSettings },
+  {
+    id: "page/export-pdf",
+    binding: "",
+    label: "Export current page to PDF…",
+    scope: "global",
+    run: () => {
+      const r = route();
+      if (r.kind === "page") void exportPagePdf(r.name);
+      else pushToast("Open a page first to export it to PDF", "warn");
+    },
+  },
   { id: "ui/toggle-wide-mode", binding: "t w", label: "Toggle wide mode", scope: "global", run: toggleWideMode },
   { id: "ui/toggle-document-mode", binding: "t d", label: "Toggle document mode", scope: "global", run: toggleDocumentMode },
   { id: "ui/toggle-focus-mode", binding: "t f", label: "Toggle focus mode", scope: "global", run: toggleFocusMode },

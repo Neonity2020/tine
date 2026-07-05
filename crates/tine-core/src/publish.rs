@@ -31,6 +31,53 @@ fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
+/// Read a local `assets/<file>` image referenced by an export `data-asset` path
+/// (e.g. `../assets/cat.png`) and return it as a self-contained `data:` URI, for
+/// the single-page print/PDF export. Returns `None` for a non-local URL (http/…),
+/// no graph, an unreadable file, or a path that escapes `assets/` — the caller
+/// then keeps the original `src` (a broken image, never a failed export).
+fn inline_asset_uri(ctx: &Ctx, src: &str) -> Option<String> {
+    let graph = ctx.graph?;
+    // Only local asset references; leave remote/data URLs untouched.
+    if src.contains("://") || src.starts_with("data:") {
+        return None;
+    }
+    // `read_asset` re-guards against traversal; pass just the file name so a
+    // `../assets/x` (or `assets/x`) ref resolves to `<graph>/assets/x`.
+    let name = src.rsplit('/').next().unwrap_or(src);
+    let bytes = graph.read_asset(name).ok()?;
+    let mime = match name.rsplit('.').next().map(|e| e.to_ascii_lowercase()).as_deref() {
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("svg") => "image/svg+xml",
+        Some("bmp") => "image/bmp",
+        Some("avif") => "image/avif",
+        _ => "application/octet-stream",
+    };
+    Some(format!("data:{mime};base64,{}", base64_encode(&bytes)))
+}
+
+/// Minimal standard base64 (no line wrapping) — used only to inline print-export
+/// image assets as `data:` URIs. Dependency-free on purpose (tine-core carries no
+/// base64 crate); correctness is covered by `base64_matches_known_vectors`.
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[(n >> 18 & 63) as usize] as char);
+        out.push(TABLE[(n >> 12 & 63) as usize] as char);
+        out.push(if chunk.len() > 1 { TABLE[(n >> 6 & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { TABLE[(n & 63) as usize] as char } else { '=' });
+    }
+    out
+}
+
 /// Where a block lives — its target page slug + its first content line — keyed by
 /// the block's `id::` uuid, built from the exported (public) pages so that
 /// `((block refs))` can link to the actual block (`<slug>.html#<uuid>`).
@@ -232,9 +279,18 @@ fn decorate(html: &str, ctx: &Ctx, depth: u8) -> String {
         if name == "img" && has_class(inner, "inline-image") {
             if let Some(asset) = tag_attr(inner, "data-asset") {
                 let alt = tag_attr(inner, "alt").map(unescape).unwrap_or_default();
+                let src = unescape(asset);
+                let src = if ctx.inline_assets {
+                    // Self-contained print doc: read the asset and emit a `data:`
+                    // URI. Falls back to the relative path if it can't be read
+                    // (missing file / non-local URL) — a broken img, never a panic.
+                    inline_asset_uri(ctx, &src).unwrap_or(src)
+                } else {
+                    src
+                };
                 out.push_str(&format!(
                     "<img class=\"inline-image\" src=\"{}\" alt=\"{}\">",
-                    esc_attr(&unescape(asset)),
+                    esc_attr(&src),
                     esc_attr(&alt)
                 ));
                 continue;
@@ -402,6 +458,11 @@ fn ref_target_text(raw: &str) -> String {
 struct Ctx<'a> {
     refs: &'a RefIndex,
     graph: Option<&'a Graph>,
+    /// When true (the single-page PDF/print export), rewrite each `data-asset`
+    /// image `src` to a self-contained `data:` URI by reading the asset bytes,
+    /// so the printed document needs no sibling `assets/` folder. The whole-graph
+    /// site export keeps the relative `../assets/<file>` links (`false`).
+    inline_assets: bool,
 }
 
 /// lsdoc render options for a Markdown block body (the canonical skeleton the export decorates).
@@ -794,6 +855,76 @@ fn shell(title: &str, main: &str) -> String {
     )
 }
 
+/// A **self-contained single page** for the print-to-PDF export: the same block
+/// render as a published page, but with the stylesheet + print rules inlined and
+/// no sidebar / search / app scripts — so it prints (or opens) standalone. Assets
+/// are inlined as `data:` URIs upstream (`inline_assets`), so no sibling folder is
+/// needed. KaTeX / highlight.js still load from CDN (math/code typeset when online;
+/// offline shows raw TeX / plain code, same as a published page).
+fn print_shell(title: &str, main: &str) -> String {
+    format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\">\
+<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{title}</title>\
+{katex}{hljs}<style>{style}\n{print}</style></head><body class=\"print\">\
+<main>{main}</main></body></html>",
+        title = esc(title),
+        katex = KATEX_HEAD,
+        hljs = HLJS_HEAD,
+        style = STYLE,
+        print = PRINT_STYLE,
+        main = main,
+    )
+}
+
+/// Print/PDF-only overrides layered on top of `STYLE`. The published-site `STYLE`
+/// lays out a two-column app shell (flex body + sticky sidebar); with no sidebar
+/// here we drop the flex row, widen `main` to the page, set page margins, and add
+/// print niceties (avoid breaking a block across pages, un-style links to plain
+/// text so a printed link isn't a mystery blue word).
+const PRINT_STYLE: &str = r#"
+@page{margin:16mm 14mm}
+body.print{display:block}
+body.print main{max-width:none;margin:0;padding:0 4mm 8mm}
+body.print h1.page{margin-top:0}
+@media print{
+  body.print main{padding:0}
+  a.ref,a.tag,a.block-ref{color:inherit;text-decoration:none}
+  li,pre,table,.video-embed,img{break-inside:avoid}
+  h1,h2,h3,h4,h5,h6,.heading-text{break-after:avoid}
+  ul.outline ul{border-left:1px solid #ddd}
+}
+"#;
+
+/// Render ONE page to a self-contained HTML document for print-to-PDF. `name` is
+/// the page's display name (as shown in the app / `PageEntry.name`). Returns
+/// `Ok(None)` if no such page file exists. Block references resolve within this
+/// page (in-page `((ref))` → an in-document anchor); a ref to a block on another
+/// page degrades to its label / muted text (there's no second file to link to),
+/// which is correct for a single-page export.
+pub fn page_print_html(graph: &Graph, name: &str) -> io::Result<Option<String>> {
+    let Some(entry) = graph.list_pages().into_iter().find(|e| e.name == name) else {
+        return Ok(None);
+    };
+    let content = fs::read_to_string(&entry.path)?;
+    let parsed = doc::parse(&content);
+    let slug = slug(&entry.name);
+    let mut refs = RefIndex::new();
+    collect_block_refs(&parsed.roots, &slug, &mut refs);
+    let ctx = Ctx { refs: &refs, graph: Some(graph), inline_assets: true };
+    // `page_html` builds the heading + outline and wraps it in `shell`; we want the
+    // same body but the print shell, so mirror its body build here.
+    let mut blocks: Vec<serde_json::Value> = Vec::new();
+    let mut body = String::new();
+    body.push_str("<ul class=\"outline\">");
+    let mut counter = 0u32;
+    for b in &parsed.roots {
+        render_block(b, &mut body, &ctx, &slug, &entry.name, &mut counter, &mut blocks);
+    }
+    body.push_str("</ul>");
+    let heading = format!("<h1 class=\"page\">{}</h1>", esc(&entry.name));
+    Ok(Some(print_shell(&entry.name, &format!("{heading}{body}"))))
+}
+
 // KaTeX (from CDN) typesets the `\(..\)` / `\[..\]` math the decorator emits from
 // lsdoc's `data-tex` hook, client-side in the published pages. mhchem (\ce{…}) must
 // register before auto-render runs; `defer` preserves script order, so auto-render's
@@ -1109,7 +1240,7 @@ pub fn publish_graph(graph: &Graph) -> io::Result<(String, usize)> {
     let mut count = 0;
     // The render context: the block-ref index + the graph (so `{{query}}`/`{{embed}}`/
     // `{{namespace}}` macros can resolve against real data at publish time).
-    let ctx = Ctx { refs: &refs, graph: Some(graph) };
+    let ctx = Ctx { refs: &refs, graph: Some(graph), inline_assets: false };
     for (name, slug, kind, parsed) in &public {
         let file = format!("{slug}.html");
         fs::write(out.join(&file), page_html(name, slug, parsed, *kind, &ctx, &mut all_blocks))?;
@@ -1164,7 +1295,7 @@ mod tests {
     /// skeleton (`render_html`) → export decoration. The unit the decorator tests drive.
     fn render_body(raw: &str, refs: &RefIndex) -> String {
         // Graph-less context: the inline decorator under test; macros drop (no graph).
-        let ctx = Ctx { refs, graph: None };
+        let ctx = Ctx { refs, graph: None, inline_assets: false };
         decorate(&lsdoc::render_html(&body_blocks(raw), &md_opts()), &ctx, 0)
     }
     fn search_text(raw: &str) -> String {
@@ -1327,6 +1458,62 @@ mod tests {
     }
 
     #[test]
+    fn base64_matches_known_vectors() {
+        // RFC 4648 test vectors + a binary triple that exercises all 6-bit lanes.
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+        assert_eq!(base64_encode(&[0xff, 0xef, 0xbf]), "/++/");
+    }
+
+    #[test]
+    fn page_print_html_is_self_contained_with_inlined_image() {
+        let dir = std::env::temp_dir().join(format!("tine-print-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("pages")).unwrap();
+        fs::create_dir_all(dir.join("assets")).unwrap();
+        fs::create_dir_all(dir.join("logseq")).unwrap();
+        // A 1x1 PNG (real bytes) so the inliner produces a valid data: URI.
+        let png: [u8; 67] = [
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0a, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9c, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+        ];
+        fs::write(dir.join("assets").join("pic.png"), png).unwrap();
+        fs::write(
+            dir.join("pages").join("Report.md"),
+            "- # Report\n- Some **bold** text and a [[Welcome]] link.\n- ![shot](../assets/pic.png)\n",
+        )
+        .unwrap();
+
+        let g = Graph::open(&dir);
+        let html = g.page_print_html("Report").unwrap().expect("page exists");
+
+        // Self-contained: inlined stylesheet + inlined image, no sidebar / app scripts /
+        // external style.css.
+        assert!(html.contains("<style>"), "stylesheet inlined");
+        assert!(html.contains("data:image/png;base64,"), "image inlined as data URI: {}", &html[..0]);
+        assert!(!html.contains("../assets/pic.png"), "no relative asset link left");
+        assert!(!html.contains("<aside class=\"sidebar\">"), "no sidebar in print doc");
+        assert!(!html.contains("src=\"app.js\""), "no app.js in print doc");
+        assert!(!html.contains("href=\"style.css\""), "no external stylesheet link");
+        // Content actually rendered.
+        assert!(html.contains("<h1 class=\"page\">Report</h1>"), "page heading");
+        assert!(html.contains("<strong>bold</strong>"), "inline markup rendered");
+        assert!(html.contains("@media print"), "print CSS present");
+
+        // Missing page → None (not an error).
+        assert!(g.page_print_html("No Such Page").unwrap().is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn publish_renders_facets_queries_and_embeds() {
         let dir = std::env::temp_dir().join(format!("tine-publish-facets-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -1434,5 +1621,12 @@ mod tests {
         let g = Graph::open(&dir);
         let (outdir, count) = publish_graph(&g).unwrap();
         println!("SAMPLE_EXPORT_DIR={outdir} pages={count}");
+
+        // Also emit the single-page print/PDF document for the showcase page, so
+        // the print CSS + self-contained render can be eyeballed / screenshotted.
+        let print = g.page_print_html("Rendering Showcase").unwrap().unwrap();
+        let pfile = dir.join("print-sample.html");
+        fs::write(&pfile, print).unwrap();
+        println!("SAMPLE_PRINT_HTML={}", pfile.display());
     }
 }
