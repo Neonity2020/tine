@@ -434,6 +434,17 @@ pub(crate) fn list_sync_conflicts(
     with_graph(&state, |g| Ok(g.list_sync_conflicts()))
 }
 
+/// Block-level diff of a sync-conflict copy against its winner (both graph-root-
+/// relative paths) — the data behind the two-column merge UI. Read-only.
+#[tauri::command]
+pub(crate) fn sync_conflict_diff(
+    winner: String,
+    conflict: String,
+    state: State<'_, AppState>,
+) -> Result<Option<tine_core::sync_diff::SyncConflictDiff>, String> {
+    with_graph(&state, |g| g.sync_conflict_diff(&winner, &conflict).map_err(|e| e.to_string()))
+}
+
 /// Move one journal file (by exact filename) to the recoverable trash.
 #[tauri::command]
 pub(crate) fn trash_journal_file(name: String, state: State<'_, AppState>) -> Result<(), String> {

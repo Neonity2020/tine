@@ -861,6 +861,33 @@ impl Graph {
         out
     }
 
+    /// Structural block-level diff of a conflict copy against its winner (both
+    /// graph-root-relative paths). Loads each file directly by path — the conflict
+    /// copy is deliberately not in the page cache — and aligns the two block trees
+    /// (see [`crate::sync_diff`]). This is a READ; nothing is written. `Ok(None)`
+    /// if either path is invalid or the file is gone.
+    pub fn sync_conflict_diff(
+        &self,
+        winner_rel: &str,
+        conflict_rel: &str,
+    ) -> io::Result<Option<crate::sync_diff::SyncConflictDiff>> {
+        let (Some(win), Some(conf)) =
+            (self.resolve_rel(winner_rel), self.resolve_rel(conflict_rel))
+        else {
+            return Ok(None);
+        };
+        let (win_c, conf_c) = match (fs::read_to_string(&win), fs::read_to_string(&conf)) {
+            (Ok(a), Ok(b)) => (a, b),
+            (Err(e), _) | (_, Err(e)) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            (Err(e), _) | (_, Err(e)) => return Err(e),
+        };
+        let mut mine = parse_doc(&win, &win_c);
+        let mut theirs = parse_doc(&conf, &conf_c);
+        assign_doc_uuids(&mut mine.roots);
+        assign_doc_uuids(&mut theirs.roots);
+        Ok(Some(crate::sync_diff::diff_docs(&mine, &theirs)))
+    }
+
     /// Raw contents of ONE journal file (by exact filename) — lets the UI show a
     /// duplicate day's individual files (which can't be navigated to separately,
     /// as pages are keyed by date) so the user can inspect before reconciling.
