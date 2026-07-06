@@ -29,9 +29,16 @@ export function Sidebar(): JSX.Element {
       .sort((a, b) => a.name.localeCompare(b.name))
   );
 
-  const isActive = (path: string, name: string) => {
+  // `path` disambiguates nested pages that share a basename (#21 Phase 2). It's
+  // optional: favorites / recent are keyed by name only, so they match on name
+  // regardless of which file-path variant is currently routed.
+  const isActive = (name: string, path?: string) => {
     const r = route();
-    return r.kind === "page" && r.name === name && (!r.path || r.path === path);
+    return (
+      r.kind === "page" &&
+      r.name === name &&
+      (path === undefined || !r.path || r.path === path)
+    );
   };
   const openEntry = (path: string, name: string) => {
     path ? openFile(path, name, "page") : openPage(name, "page");
@@ -138,7 +145,7 @@ export function Sidebar(): JSX.Element {
               {(p) => (
                 <div
                   class="nav-page"
-                  classList={{ active: isActive(p.path, p.name) }}
+                  classList={{ active: isActive(p.name, p.path) }}
                   onClick={() => openEntry(p.path, p.name)}
                   onAuxClick={(e) => {
                     if (e.button === 1) {
