@@ -47,6 +47,8 @@ export interface GraphSourceFile {
 
 export interface Backend {
   loadGraph(path: string): Promise<GraphMeta>;
+  appPlatform(): Promise<"android" | "ios" | "desktop">;
+  defaultGraphParent(): Promise<string>;
   /** Scaffold a brand-new demo graph (onboarding "create new graph"); returns
    *  the created graph's root path to then `loadGraph`. Creates the graph in
    *  `dir` if empty, else in a fresh `tine-demo` subfolder. */
@@ -312,6 +314,12 @@ class TauriBackend implements Backend {
 
   loadGraph(path: string) {
     return this.call<GraphMeta>("load_graph", { path });
+  }
+  appPlatform() {
+    return this.call<"android" | "ios" | "desktop">("app_platform");
+  }
+  defaultGraphParent() {
+    return this.call<string>("default_graph_parent");
   }
   createGraph(dir: string) {
     return this.call<string>("create_graph", { dir });

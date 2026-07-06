@@ -11,6 +11,7 @@ import { applyTemplateVars } from "./editor/templateVars";
 import { waitForWarmCache } from "./warmCache";
 import { CUSTOM_CSS_STYLE_ID, ensureLsShimStyle } from "./lsShim";
 import { ensureThemeStyle } from "./themeGallery";
+import { isMobile } from "./platform";
 import type { BlockDto } from "./types";
 
 const GRAPH_KEY = "tine.graphPath";
@@ -165,6 +166,13 @@ async function injectCustomCss(): Promise<void> {
 
 /** Pick a folder and open it as the graph. No-op if cancelled. */
 export async function switchGraph(): Promise<void> {
+  if (await isMobile()) {
+    pushToast(
+      "Opening an existing graph on Android is coming soon. For now, tap “Create a new graph” to try Tine.",
+      "info"
+    );
+    return;
+  }
   const path = await backend().pickFolder();
   if (path) await loadGraphPath(path);
 }
@@ -173,7 +181,9 @@ export async function switchGraph(): Promise<void> {
  *  narrated demo graph there, open it, and land on the "Welcome to Tine" tour.
  *  No-op if the folder picker is cancelled. */
 export async function createNewGraph(): Promise<void> {
-  const dir = await backend().pickFolder("Choose where to create your new graph");
+  const dir = (await isMobile())
+    ? await backend().defaultGraphParent()
+    : await backend().pickFolder("Choose where to create your new graph");
   if (!dir) return;
   let root: string;
   try {

@@ -370,6 +370,12 @@ export function mockBackend(): Backend {
         },
       };
     },
+    async appPlatform(): Promise<"android" | "ios" | "desktop"> {
+      return "desktop";
+    },
+    async defaultGraphParent(): Promise<string> {
+      return "/mock";
+    },
     async listPages(): Promise<PageEntry[]> {
       return all.map(mockPageEntry);
     },

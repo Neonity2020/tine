@@ -29,7 +29,10 @@ use commands::{
 use debug::{
     debug_enabled, debug_header, debug_info, debug_init, debug_log, diag, install_panic_logger,
 };
-use graph::{begin_warm_cache, create_graph, load_graph, resolve_root, warm_cache_async, warm_done};
+use graph::{
+    app_platform, begin_warm_cache, create_graph, default_graph_parent, load_graph, resolve_root,
+    warm_cache_async, warm_done,
+};
 use platform::{copy_image_to_clipboard, gpu_env, open_external};
 use settings::{
     get_app_bool, get_app_string, get_capture_enter_files, get_link_first_match, get_smooth_scroll,
@@ -296,6 +299,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             load_graph,
             create_graph,
+            app_platform,
+            default_graph_parent,
             list_pages,
             journals_desc,
             get_page,

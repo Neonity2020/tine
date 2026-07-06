@@ -90,6 +90,27 @@ pub(crate) fn create_graph(dir: String) -> Result<String, String> {
     Ok(root.display().to_string())
 }
 
+#[tauri::command]
+pub(crate) fn app_platform() -> &'static str {
+    if cfg!(target_os = "android") {
+        "android"
+    } else if cfg!(target_os = "ios") {
+        "ios"
+    } else {
+        "desktop"
+    }
+}
+
+#[tauri::command]
+pub(crate) fn default_graph_parent(app: tauri::AppHandle) -> Result<String, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("couldn't resolve app data dir: {e}"))?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("couldn't create app data dir: {e}"))?;
+    Ok(dir.display().to_string())
+}
+
 /// Build the search/backlinks cache off the hot path. We let the frontend's
 /// first journal load grab the graph lock first, then warm in the background so
 /// the first search is instant instead of re-parsing the whole tree. When the
