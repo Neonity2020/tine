@@ -1,0 +1,289 @@
+import { afterEach, beforeAll, describe, expect, it } from "vitest";
+import { render } from "solid-js/web";
+import type { JSX } from "solid-js";
+import { Block } from "./Block";
+import { initParser } from "../render/parse";
+import {
+  doc,
+  hasSelection,
+  isSelected,
+  resetStore,
+  selectBlock,
+  setDoc,
+  type FeedPage,
+  type Node as StoreNode,
+} from "../store";
+import { editingId } from "../editorController";
+import { installKeybindings } from "../keybindings";
+import { cellSel, resetCellSelectionForTests, setCellSel } from "../sheet/selection";
+
+beforeAll(async () => {
+  await initParser();
+});
+
+let disposeKeys: (() => void) | null = null;
+let restoreCaretRange: (() => void) | null = null;
+
+afterEach(() => {
+  disposeKeys?.();
+  disposeKeys = null;
+  restoreCaretRange?.();
+  restoreCaretRange = null;
+  resetCellSelectionForTests();
+  resetStore();
+  document.body.innerHTML = "";
+});
+
+function mount(node: () => JSX.Element): { root: HTMLDivElement; dispose: () => void } {
+  const root = document.createElement("div");
+  document.body.appendChild(root);
+  const dispose = render(node, root);
+  return { root, dispose };
+}
+
+function page(roots: string[]): FeedPage {
+  return {
+    name: "Sheet",
+    kind: "page",
+    title: "Sheet",
+    preBlock: null,
+    roots,
+    format: "md",
+    readOnly: false,
+  };
+}
+
+function node(id: string, raw: string, parent: string | null, children: string[] = []): StoreNode {
+  return { id, raw, collapsed: false, parent, page: "Sheet", children };
+}
+
+function loadSheetDoc() {
+  setDoc({
+    byId: {
+      before: node("before", "Before", null),
+      grid: node("grid", "Grid parent\ntine.view:: grid", null, ["r1", "r2"]),
+      r1: node("r1", "", "grid", ["c1", "c2"]),
+      c1: node("c1", "Alpha", "r1"),
+      c2: node("c2", "Beta", "r1"),
+      r2: node("r2", "", "grid", ["c3"]),
+      c3: node("c3", "Gamma", "r2"),
+      after: node("after", "After", null),
+    },
+    pages: [page(["before", "grid", "after"])],
+    feed: ["Sheet"],
+    loaded: true,
+  });
+}
+
+function setup(): { root: HTMLDivElement; dispose: () => void } {
+  loadSheetDoc();
+  disposeKeys = installKeybindings();
+  return mount(() => <Block id="grid" />);
+}
+
+function tick(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+function cell(root: HTMLElement, row: number, col: number): HTMLElement {
+  const el = root.querySelector(
+    `.sheet-cell[data-sheet-grid-id="grid"][data-row="${row}"][data-col="${col}"]`
+  ) as HTMLElement | null;
+  if (!el) throw new Error(`missing cell ${row},${col}`);
+  return el;
+}
+
+function keydown(target: EventTarget, key: string, init: Partial<KeyboardEvent> = {}): KeyboardEvent {
+  const event = new KeyboardEvent("keydown", {
+    key,
+    code: init.code ?? (key === "Tab" ? "Tab" : key.startsWith("Arrow") ? key : ""),
+    bubbles: true,
+    cancelable: true,
+    shiftKey: init.shiftKey ?? false,
+    ctrlKey: init.ctrlKey ?? false,
+    metaKey: init.metaKey ?? false,
+    altKey: init.altKey ?? false,
+  });
+  target.dispatchEvent(event);
+  return event;
+}
+
+function mouseDown(target: EventTarget): MouseEvent {
+  const event = new MouseEvent("mousedown", { bubbles: true, cancelable: true, button: 0 });
+  target.dispatchEvent(event);
+  return event;
+}
+
+function textRange(root: globalThis.Node, needle: string, offset: number): Range {
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  let node: Text | null;
+  while ((node = walker.nextNode() as Text | null)) {
+    const idx = (node.textContent ?? "").indexOf(needle);
+    if (idx !== -1) {
+      const range = document.createRange();
+      range.setStart(node, idx + offset);
+      return range;
+    }
+  }
+  throw new Error(`text node not found: ${needle}`);
+}
+
+function stubCaretRange(range: Range | null): () => number {
+  const prev = (document as Document & { caretRangeFromPoint?: unknown }).caretRangeFromPoint;
+  let calls = 0;
+  (document as Document & { caretRangeFromPoint?: (x: number, y: number) => Range | null }).caretRangeFromPoint =
+    () => {
+      calls++;
+      return range;
+  };
+  restoreCaretRange = () => {
+    const docWithCaret = document as unknown as { caretRangeFromPoint?: unknown };
+    if (prev === undefined) delete docWithCaret.caretRangeFromPoint;
+    else docWithCaret.caretRangeFromPoint = prev;
+  };
+  return () => calls;
+}
+
+function selectedCell(root: HTMLElement): HTMLElement | null {
+  return root.querySelector(".sheet-cell-selected") as HTMLElement | null;
+}
+
+function activeEditor(root: HTMLElement): HTMLTextAreaElement {
+  const textarea = root.querySelector("textarea.block-editor") as HTMLTextAreaElement | null;
+  if (!textarea) throw new Error("missing active editor");
+  return textarea;
+}
+
+function childrenSnapshot(): Record<string, string[]> {
+  return Object.fromEntries(Object.entries(doc.byId).map(([id, n]) => [id, [...n.children]]));
+}
+
+describe("SheetGrid interaction", () => {
+  it("selects whitespace and enters edit from text with click-point caret", async () => {
+    const { root, dispose } = setup();
+
+    stubCaretRange(null);
+    mouseDown(cell(root, 0, 1));
+    expect(cellSel()).toEqual({ gridId: "grid", row: 0, col: 1 });
+    expect(cell(root, 0, 1).classList.contains("sheet-cell-selected")).toBe(true);
+    expect(editingId()).toBeNull();
+
+    const calls = stubCaretRange(textRange(cell(root, 0, 0), "Alpha", 2));
+    mouseDown(cell(root, 0, 0));
+    await tick();
+
+    expect(calls()).toBe(1);
+    expect(editingId()).toBe("c1");
+    expect(activeEditor(root).selectionStart).toBe(2);
+
+    dispose();
+  });
+
+  it("uses the Esc ladder from cell edit to cell selection to outline selection", async () => {
+    const { root, dispose } = setup();
+    stubCaretRange(textRange(cell(root, 0, 0), "Alpha", 1));
+    mouseDown(cell(root, 0, 0));
+    await tick();
+
+    keydown(activeEditor(root), "Escape");
+    await tick();
+
+    expect(editingId()).toBeNull();
+    expect(cellSel()).toEqual({ gridId: "grid", row: 0, col: 0 });
+    expect(cell(root, 0, 0).classList.contains("sheet-cell-selected")).toBe(true);
+
+    keydown(window, "Escape");
+
+    expect(cellSel()).toBeNull();
+    expect(hasSelection()).toBe(true);
+    expect(isSelected("grid")).toBe(true);
+
+    dispose();
+  });
+
+  it("moves selection with arrows, including holes, and flows out vertically", () => {
+    const { root, dispose } = setup();
+
+    setCellSel({ gridId: "grid", row: 0, col: 0 });
+    keydown(window, "ArrowRight");
+    expect(cellSel()).toEqual({ gridId: "grid", row: 0, col: 1 });
+
+    keydown(window, "ArrowDown");
+    expect(cellSel()).toEqual({ gridId: "grid", row: 1, col: 1 });
+    expect(cell(root, 1, 1).classList.contains("sheet-hole")).toBe(true);
+    expect(selectedCell(root)).toBe(cell(root, 1, 1));
+
+    setCellSel({ gridId: "grid", row: 0, col: 0 });
+    keydown(window, "ArrowUp");
+    expect(cellSel()).toBeNull();
+    expect(isSelected("before")).toBe(true);
+
+    setCellSel({ gridId: "grid", row: 1, col: 0 });
+    keydown(window, "ArrowDown");
+    expect(cellSel()).toBeNull();
+    expect(isSelected("after")).toBe(true);
+
+    dispose();
+  });
+
+  it("tabs across cells with row wrap but not past the grid edges", () => {
+    const { root, dispose } = setup();
+
+    setCellSel({ gridId: "grid", row: 0, col: 1 });
+    keydown(window, "Tab");
+    expect(cellSel()).toEqual({ gridId: "grid", row: 1, col: 0 });
+    expect(selectedCell(root)).toBe(cell(root, 1, 0));
+
+    keydown(window, "Tab", { shiftKey: true });
+    expect(cellSel()).toEqual({ gridId: "grid", row: 0, col: 1 });
+
+    setCellSel({ gridId: "grid", row: 0, col: 0 });
+    keydown(window, "Tab", { shiftKey: true });
+    expect(cellSel()).toEqual({ gridId: "grid", row: 0, col: 0 });
+
+    dispose();
+  });
+
+  it("overtype edits through the mounted editor and Enter commits without structural mutation", async () => {
+    const { root, dispose } = setup();
+    const beforeChildren = childrenSnapshot();
+    const beforeRaws = Object.fromEntries(Object.entries(doc.byId).map(([id, n]) => [id, n.raw]));
+
+    setCellSel({ gridId: "grid", row: 0, col: 0 });
+    keydown(window, "Z");
+    await tick();
+
+    expect(editingId()).toBe("c1");
+    expect(activeEditor(root).value).toBe("Z");
+    expect(doc.byId.c1.raw).toBe("Z");
+
+    keydown(activeEditor(root), "Enter");
+    await tick();
+
+    expect(editingId()).toBeNull();
+    expect(cellSel()).toEqual({ gridId: "grid", row: 0, col: 0 });
+    expect(childrenSnapshot()).toEqual(beforeChildren);
+    expect(Object.keys(doc.byId).sort()).toEqual(Object.keys(beforeRaws).sort());
+    for (const [id, raw] of Object.entries(beforeRaws)) {
+      if (id === "c1") expect(doc.byId[id].raw).toBe("Z");
+      else expect(doc.byId[id].raw).toBe(raw);
+    }
+
+    dispose();
+  });
+
+  it("outline Enter and ArrowRight enter the selected grid block", () => {
+    const { dispose } = setup();
+
+    selectBlock("grid");
+    keydown(window, "Enter");
+    expect(cellSel()).toEqual({ gridId: "grid", row: 0, col: 0 });
+
+    setCellSel(null);
+    selectBlock("grid");
+    keydown(window, "ArrowRight");
+    expect(cellSel()).toEqual({ gridId: "grid", row: 0, col: 0 });
+
+    dispose();
+  });
+});

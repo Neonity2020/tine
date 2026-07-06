@@ -103,6 +103,9 @@ import { inPageFindPreservesEditorBlur } from "../inpageFind";
 import { registerFocusedEditorCommandBridge, type MobileEditorCommandId } from "../editorCommandBridge";
 import { isRecordingAudio, setRecordingAudio, base64ToBytes } from "../mediaCapture";
 import { sheetConfig } from "../sheet/config";
+import { SheetCellContext } from "../sheet/context";
+import { selectCellAfterEdit, moveCellAfterEdit } from "../sheet/selection";
+import { forbidsEditEntry } from "../editor/editTargets";
 import { SheetGrid } from "./SheetGrid";
 
 // Detect a block whose entire body is a single {{query}} / {{embed}} macro.
@@ -393,46 +396,6 @@ export function Block(props: { id: string; hideRefCount?: boolean }): JSX.Elemen
   );
 }
 
-// Interactive targets that must NOT enter edit on mousedown (mirrors OG's
-// target-forbidden-edit?). Their own handlers run on click — after our
-// mousedown — so entering edit first would swap the DOM out from under them.
-const FORBID_EDIT_SELECTOR = [
-  "a",
-  "button",
-  "input",
-  "textarea",
-  "select",
-  "video",
-  "audio",
-  "iframe",
-  "details",
-  "summary",
-  ".block-ref",
-  ".block-marker",
-  ".clock-badge",
-  ".date-chip",
-  ".hl-prefix",
-  ".inline-image-wrap",
-  ".media-embed-wrap",
-  ".embed-iframe-wrap",
-  // Query-macro controls: they run their own action on CLICK (toggle collapse,
-  // rename title, navigate to a result page, sort a column) and used to block
-  // the block's edit via click-phase stopPropagation — which no longer suffices
-  // now that edit entry is on mousedown. Opt them out here instead.
-  ".query-collapse",
-  ".query-title-editable",
-  ".query-page",
-  ".query-crumb",
-  ".qt-page",
-  ".query-table th",
-].join(", ");
-
-function forbidsEditEntry(e: MouseEvent): boolean {
-  const target = e.target as Element | null;
-  const hit = target?.closest?.(FORBID_EDIT_SELECTOR);
-  return !!hit && (e.currentTarget as Element).contains(hit);
-}
-
 // --- Click / drag gesture on rendered block content -------------------------
 //
 // The caret offset is captured at MOUSEDOWN (before the previously-edited
@@ -447,6 +410,14 @@ function forbidsEditEntry(e: MouseEvent): boolean {
 // Deliberately NOT OG's mousedown-instant-edit: that races the native
 // selection against the DOM swap (the inconsistency Martin observed in OG).
 const DRAG_THRESHOLD_PX = 4;
+const SHEET_CELL_BLOCKED_EDITOR_COMMANDS = new Set([
+  "editor/indent",
+  "editor/outdent",
+  "editor/move-block-up",
+  "editor/move-block-down",
+  "editor/select-block-up",
+  "editor/select-block-down",
+]);
 
 interface EditGesture {
   blockId: string;
@@ -849,6 +820,7 @@ function templateToOutline(
 export function Editor(props: { id: string }): JSX.Element {
   // Non-null only inside the quick-capture window (see CaptureCtx).
   const cap = useContext(CaptureCtx);
+  const sheetCell = useContext(SheetCellContext);
   // Which surface (main pane / a specific sidebar item) this editor lives in —
   // drives edit-focus arbitration when the same block renders in several surfaces.
   const surfaceKey = useContext(SurfaceContext);
@@ -1597,6 +1569,66 @@ export function Editor(props: { id: string }): JSX.Element {
   };
   onCleanup(unregisterFocusedEditor);
 
+  const handleSheetCellKey = (e: KeyboardEvent, start: number, end: number, raw: string): boolean => {
+    if (!sheetCell) return false;
+    const plain = !e.ctrlKey && !e.metaKey && !e.altKey;
+    const commitAndSelect = () => {
+      commit(raw);
+      selectCellAfterEdit(sheetCell);
+    };
+    const commitAndMove = (dir: "up" | "down" | "left" | "right" | "tab-forward" | "tab-back") => {
+      commit(raw);
+      moveCellAfterEdit(sheetCell, dir);
+    };
+
+    if (plain && e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      commitAndSelect();
+      return true;
+    }
+    if (!e.ctrlKey && !e.metaKey && !e.altKey && (e.key === "Tab" || e.code === "Tab")) {
+      e.preventDefault();
+      commitAndMove(e.shiftKey ? "tab-back" : "tab-forward");
+      return true;
+    }
+    if (plain && e.key === "Escape") {
+      e.preventDefault();
+      commitAndSelect();
+      return true;
+    }
+    if (plain && e.key === "Backspace" && start === 0 && end === 0) {
+      e.preventDefault();
+      return true;
+    }
+    if (plain && !e.shiftKey && start === end && e.key === "ArrowLeft" && start === 0) {
+      e.preventDefault();
+      commitAndMove("left");
+      return true;
+    }
+    if (plain && !e.shiftKey && start === end && e.key === "ArrowRight" && start === raw.length) {
+      e.preventDefault();
+      commitAndMove("right");
+      return true;
+    }
+    if (plain && !e.shiftKey && start === end && e.key === "ArrowUp") {
+      const before = raw.slice(0, start);
+      if (!before.includes("\n") && caretAtFirstRow(ref, start)) {
+        e.preventDefault();
+        commitAndMove("up");
+        return true;
+      }
+    }
+    if (plain && !e.shiftKey && start === end && e.key === "ArrowDown") {
+      const after = raw.slice(start);
+      if (!after.includes("\n") && caretAtLastRow(ref, start)) {
+        e.preventDefault();
+        commitAndMove("down");
+        return true;
+      }
+    }
+    return false;
+  };
+
   const onKeyDown = (e: KeyboardEvent) => {
     const start = ref.selectionStart;
     const end = ref.selectionEnd;
@@ -1626,6 +1658,8 @@ export function Editor(props: { id: string }): JSX.Element {
         return;
       }
     }
+
+    if (handleSheetCellKey(e, start, end, raw)) return;
 
     // Auto-pair wrap on a SELECTION (OG parity, always-on — independent of the
     // opt-in empty-caret auto-pairing). Typing any of `SELECTION_WRAP` around
@@ -1687,6 +1721,10 @@ export function Editor(props: { id: string }): JSX.Element {
     // returns false to fall through — select-block does this off the block edge
     // so the textarea extends the selection by a wrapped line.
     const cmd = editorCommandFor(e);
+    if (sheetCell && cmd && SHEET_CELL_BLOCKED_EDITOR_COMMANDS.has(cmd)) {
+      e.preventDefault();
+      return;
+    }
     if (cmd && runEditorCmd[cmd]?.(e)) return;
 
     // Quick-capture window key handling (cap set only there). Runs AFTER the

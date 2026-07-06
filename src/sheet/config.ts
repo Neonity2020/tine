@@ -1,3 +1,6 @@
+import { facetsOf } from "../render/facets";
+import type { Format } from "../render/ast";
+
 export type SheetView = "table" | "grid" | "board";
 
 export interface SheetConfig {
@@ -37,4 +40,12 @@ export function sheetConfig(props: readonly [string, string][]): SheetConfig {
   }
 
   return { view, header, colWidths };
+}
+
+/** Sheet config straight from a block's raw text, through the ONE block-property
+ *  recognizer (`facetsOf`, lsdoc-backed + memoized) — never a second `key::` /
+ *  drawer line scanner here (a duplicate recognizer drifts: fence-awareness,
+ *  org drawer edge cases). */
+export function sheetConfigFromRaw(raw: string, format: Format): SheetConfig {
+  return sheetConfig(facetsOf(raw, format).properties);
 }

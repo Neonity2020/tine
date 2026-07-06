@@ -30,6 +30,8 @@ import { copyIncludeSubtree, copyStripCollapsed } from "./copySettings";
 import { trimBlockTrailingSpace } from "./editor/format";
 import { OPEN_MARKERS, MARKER_RE } from "./markers";
 import { editingId, endEdit, startEditing } from "./editorController";
+import { notifyModeReset, notifyOutlineSelectionStarted } from "./modeHooks";
+import { sheetConfigFromRaw } from "./sheet/config";
 import { applyMarkerTransition } from "./logbook";
 import {
   markDirty,
@@ -147,6 +149,11 @@ export function formatForPage(name: string | undefined): Format {
 /** Like {@link formatForPage} but keyed by a block id (→ its page). */
 export function formatForBlock(id: string | undefined): Format {
   return formatForPage(id ? doc.byId[id]?.page : undefined);
+}
+
+export function blockIsGridView(id: string | undefined): boolean {
+  const n = id ? doc.byId[id] : undefined;
+  return !!n && sheetConfigFromRaw(n.raw, formatForBlock(id)).view === "grid";
 }
 
 let idCounter = 0;
@@ -404,6 +411,7 @@ export function resetStore() {
   clearSeededFacets();
   setDoc({ byId: {}, pages: [], feed: [], loaded: false });
   endEdit("graph-switch");
+  notifyModeReset();
 }
 
 // A navigation/feed load must NOT replace a page that has unsaved edits (or an
@@ -563,7 +571,7 @@ const visibleData = createRoot(() =>
         index.set(id, order.length);
         order.push(id);
         const n = doc.byId[id];
-        if (n && !n.collapsed && n.children.length) walk(n.children);
+        if (n && !n.collapsed && n.children.length && !blockIsGridView(id)) walk(n.children);
       }
     };
     for (const p of mainPages()) walk(p.roots);
@@ -586,7 +594,7 @@ function pageVisibleOrder(pageName: string): string[] {
     for (const id of ids) {
       order.push(id);
       const n = doc.byId[id];
-      if (n && !n.collapsed && n.children.length) walk(n.children);
+      if (n && !n.collapsed && n.children.length && !blockIsGridView(id)) walk(n.children);
     }
   };
   walk(page.roots);
@@ -1521,6 +1529,7 @@ export function isSelected(id: string): boolean {
 }
 export function selectBlock(id: string) {
   endEdit("select-block");
+  notifyOutlineSelectionStarted(id);
   setSelAnchor(id);
   setSelFocus(id);
 }
@@ -1531,6 +1540,7 @@ export function clearSelection() {
 /** Extend the current block selection's focus to `id` (mouse-drag / shift-click).
  *  Starts a fresh selection anchored at `id` if none is active. */
 export function extendSelectionTo(id: string) {
+  notifyOutlineSelectionStarted(id);
   if (selAnchor() === null) setSelAnchor(id);
   setSelFocus(id);
 }

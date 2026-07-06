@@ -53,10 +53,12 @@ import {
   selectionMarkdown,
   clearSelection,
   selectedIds,
+  blockIsGridView,
 } from "./store";
 import { startEditing } from "./editorController";
 import { copyOutline } from "./clipboard";
 import { closeInPageFind, inPageFindOpen, openInPageFind } from "./inpageFind";
+import { cellSel, enterGridSelection, handleCellSelectionKey } from "./sheet/selection";
 
 interface Chord {
   mod: boolean;
@@ -472,6 +474,10 @@ function handleSelectionKey(e: KeyboardEvent): boolean {
   if (matchesCommand(e, "editor/indent")) return indentSelection(), true;
   if (matchesCommand(e, "editor/move-block-down")) return moveSelectionItems(1), true;
   if (matchesCommand(e, "editor/move-block-up")) return moveSelectionItems(-1), true;
+  if (e.key === "Enter" || e.key === "ArrowRight") {
+    const ids = selectedIds();
+    if (ids.length === 1 && blockIsGridView(ids[0]) && enterGridSelection(ids[0])) return true;
+  }
   if (e.key === "ArrowDown") return moveSelection(1, e.shiftKey), true;
   if (e.key === "ArrowUp") return moveSelection(-1, e.shiftKey), true;
   if (e.key === "Backspace" || e.key === "Delete") return deleteSelection(), true;
@@ -549,6 +555,11 @@ export function installKeybindings(overrides: Record<string, string> = {}): () =
         return;
       }
       if (editing) return; // defer to the editor's own Esc (capture phase)
+      if (cellSel() && handleCellSelectionKey(e)) {
+        e.preventDefault();
+        resetSeq();
+        return;
+      }
       if (hasSelection()) {
         clearSelection();
         if (focusMode()) void exitFocusMode();
@@ -579,6 +590,15 @@ export function installKeybindings(overrides: Record<string, string> = {}): () =
       resetSeq();
       goForward();
       return;
+    }
+
+    // Cell-selection mode keys (no editor focused).
+    if (!editing && cellSel()) {
+      if (handleCellSelectionKey(e)) {
+        e.preventDefault();
+        resetSeq();
+        return;
+      }
     }
 
     // Block-selection mode keys (no editor focused).

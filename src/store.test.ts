@@ -2,7 +2,8 @@
 // the prior Qt attempt got wrong (caret lost on indent/split/merge). No DOM
 // needed; these are pure operations on the store.
 
-import { describe, it, expect, beforeEach, afterEach, vi, type MockInstance } from "vitest";
+import { describe, it, expect, beforeAll, beforeEach, afterEach, vi, type MockInstance } from "vitest";
+import { initParser } from "./render/parse";
 import {
   doc,
   resetStore,
@@ -83,6 +84,8 @@ function shape(ids: string[] = doc.pages[0].roots): any[] {
     return n.children.length ? [n.raw, shape(n.children)] : [n.raw];
   });
 }
+
+beforeAll(() => initParser());
 
 beforeEach(() => {
   counter = 0;
@@ -749,6 +752,32 @@ describe("collapse / visible order", () => {
     expect(doc.byId[p].raw).toContain("collapsed:: true");
     toggleCollapse(p);
     expect(doc.byId[p].raw).not.toContain("collapsed::");
+  });
+
+  it("treats grid blocks as opaque in visible order", () => {
+    const grid = blk("grid\ntine.view:: grid", [
+      blk("", [blk("r1c1"), blk("r1c2")]),
+      blk("", [blk("r2c1")]),
+    ]);
+    grid.properties = [["tine.view", "grid"]];
+    const plain = blk("plain", [blk("plain child")]);
+    const dto = load([grid, plain]);
+
+    expect(visibleOrder().map((id) => doc.byId[id].raw.split("\n")[0])).toEqual([
+      "grid",
+      "plain",
+      "plain child",
+    ]);
+
+    toggleCollapse(dto.blocks[0].id);
+    expect(visibleOrder().map((id) => doc.byId[id].raw.split("\n")[0])).toEqual([
+      "grid",
+      "plain",
+      "plain child",
+    ]);
+
+    toggleCollapse(dto.blocks[1].id);
+    expect(visibleOrder().map((id) => doc.byId[id].raw.split("\n")[0])).toEqual(["grid", "plain"]);
   });
 });
 

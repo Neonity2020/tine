@@ -67,7 +67,29 @@ to `~/research/tine`. Martin is unavailable for testing.
       the screenshot); Phase 2/3 must render cell header-facets (marker,
       priority chips) inside cells, and remember BOTH facet renderers rule
       (`tine-refblocks-vs-block-facets`) now has a third surface.
-- [ ] **Phase 2 — editable cells + modality + full §4.3 keyboard** (largest phase)
+- [ ] **Phase 2 — editable cells + modality + full §4.3 keyboard** (largest phase;
+      split into sub-chunks)
+  - [x] **2a — cell selection, editing, core keyboard** — DONE Jul 6 2026
+        (codex + one orchestrator fix). Cell = another surface onto the block
+        (`sheet:<gridId>` SurfaceContext key, scoped owner per cell); overtype
+        flows through the real editor commit path (textarea input event, no
+        store bypass); grids OPAQUE to outline nav (`visibleOrder` walkers skip
+        grid interiors); mutual exclusion via new `src/modeHooks.ts` (store
+        emits, sheet listens — no import cycle); `FORBID_EDIT_SELECTOR` moved
+        to shared `src/editor/editTargets.ts`; in-cell editor blocks all
+        structural commands (Enter=commit+reselect, Tab=move, no
+        split/indent/merge). Keyboard: arrows 2-D, flow-out per ADR 0025,
+        Enter/F2/Esc ladder, Tab row-wrap, printable overtype, outline-side
+        Enter/→ entry. **Orchestrator fix on codex output:** its
+        `sheetConfigFromRaw` hand-rolled md+org property scanners (duplicate
+        recognizer — banned); rerouted through `facetsOf` (the one lsdoc
+        recognizer); the real blocker was wasm init in node-config tests →
+        `beforeAll(initParser())` in store/config tests. Verified: npm test
+        45+16 files green, tsc clean, both screenshots eyeballed (selection
+        ring on a hole cell).
+  - [ ] **2b — seams** (insert/delete rows+cols, hole materialization,
+        col-width drag-resize; first structural mutations → `withUndoUnit`)
+  - [ ] **2c — range select, Ctrl+arrow content move, fill, TSV/indented clipboard**
 - [ ] **Phase 3 — field-keyed table + query rowSource + task kanban** (showcase)
 - [ ] **Phase 4 — Hierarchify/Flatten + board + aggregates**
 - [ ] **Phase 5 — recursion + colors + polish**

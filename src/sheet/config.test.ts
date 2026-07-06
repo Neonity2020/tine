@@ -1,5 +1,10 @@
-import { describe, expect, it } from "vitest";
-import { sheetConfig } from "./config";
+import { beforeAll, describe, expect, it } from "vitest";
+import { sheetConfig, sheetConfigFromRaw } from "./config";
+import { initParser } from "../render/parse";
+
+// sheetConfigFromRaw reads properties through the one lsdoc-backed recognizer
+// (facetsOf), which needs the wasm parser initialized.
+beforeAll(() => initParser());
 
 describe("sheetConfig", () => {
   it("reads grid view, header, and positional column widths", () => {
@@ -53,5 +58,12 @@ describe("sheetConfig", () => {
     expect(cfg.view).toBe(null);
     expect(cfg.header).toBe(false);
     expect(cfg.colWidths.size).toBe(0);
+  });
+
+  it("reads sheet config directly from md properties and org drawers", () => {
+    expect(sheetConfigFromRaw("Grid\ntine.view:: grid", "md").view).toBe("grid");
+    expect(
+      sheetConfigFromRaw("Grid\n:PROPERTIES:\n:tine.view: grid\n:tine.header: true\n:END:", "org")
+    ).toMatchObject({ view: "grid", header: true });
   });
 });

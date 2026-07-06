@@ -6,6 +6,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 
 const PORT = 5196;
 const OUT = "/tmp/shot-sheets.png";
+const OUT_SEL = "/tmp/shot-sheets-sel.png";
 
 const server = spawn("npx", ["vite", "preview", "--port", String(PORT), "--strictPort"], {
   stdio: "ignore",
@@ -45,7 +46,19 @@ try {
   await sleep(500);
   await page.screenshot({ path: OUT, fullPage: true });
 
-  console.log(errors.length ? "ERRORS:\n" + errors.join("\n") : `wrote ${OUT}`);
+  const hole = page.locator(".block-sheet-container > .sheet-grid > .sheet-hole").first();
+  if (await hole.count()) {
+    await hole.click();
+  } else {
+    const firstCell = page.locator(".block-sheet-container > .sheet-grid > .sheet-cell").first();
+    const box = await firstCell.boundingBox();
+    await firstCell.click({ position: { x: Math.max(1, (box?.width ?? 12) - 4), y: Math.max(1, (box?.height ?? 12) - 4) } });
+  }
+  await page.waitForSelector(".block-sheet-container > .sheet-grid > .sheet-cell-selected", { timeout: 3000 });
+  await sleep(250);
+  await page.screenshot({ path: OUT_SEL, fullPage: true });
+
+  console.log(errors.length ? "ERRORS:\n" + errors.join("\n") : `wrote ${OUT} and ${OUT_SEL}`);
   await browser.close();
   server.kill("SIGKILL");
   process.exit(errors.length ? 1 : 0);
