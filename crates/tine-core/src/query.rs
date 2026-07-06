@@ -595,13 +595,58 @@ fn parse_adv_group(
                     Pred::PageProperty(k, val)
                 }
             }),
+        "page" => adv_strings(inner).into_iter().next().map(|n| {
+            ran.push("page".into());
+            Pred::Page(n)
+        }),
+        "namespace" => adv_strings(inner).into_iter().next().map(|n| {
+            ran.push("namespace".into());
+            Pred::Namespace(n)
+        }),
+        "page-tags" | "tags" => {
+            let ts = adv_strings(inner);
+            if ts.is_empty() {
+                ignored.push(head.clone());
+                None
+            } else {
+                ran.push("page-tags".into());
+                Some(Pred::PageTags(ts))
+            }
+        }
+        "scheduled" => {
+            ran.push("scheduled".into());
+            Some(Pred::Scheduled)
+        }
+        "deadline" => {
+            ran.push("deadline".into());
+            Some(Pred::Deadline)
+        }
+        "journal" => {
+            ran.push("journal".into());
+            Some(Pred::Journal)
+        }
         "between" => {
-            // (between ?b ?start ?end): the last two args are the bounds.
+            // (between [FIELD] ?b ?start ?end): the last two args are always the
+            // bounds. An optional field keyword (journal|scheduled|deadline) may
+            // appear among the earlier args — matching the simple parser. The bare
+            // `(between ?b lo hi)` keeps OG's journal-day semantics.
             let args: Vec<&str> = inner.split_whitespace().skip(1).collect();
             if args.len() < 2 {
                 ignored.push("between".into());
                 return None;
             }
+            let field = args
+                .iter()
+                .take(args.len() - 2)
+                .find_map(
+                    |a| match a.trim_start_matches(':').to_ascii_lowercase().as_str() {
+                        "scheduled" => Some(BetweenField::Scheduled),
+                        "deadline" => Some(BetweenField::Deadline),
+                        "journal" => Some(BetweenField::Journal),
+                        _ => None,
+                    },
+                )
+                .unwrap_or(BetweenField::Journal);
             let lo = adv_bound(args[args.len() - 2], inputs, today);
             let hi = adv_bound(args[args.len() - 1], inputs, today);
             if lo.is_none() && hi.is_none() {
@@ -609,7 +654,7 @@ fn parse_adv_group(
                 return None;
             }
             ran.push("between".into());
-            Some(Pred::Between(BetweenField::Journal, lo, hi)) // OG :between = journal-day
+            Some(Pred::Between(field, lo, hi))
         }
         other => {
             if !other.is_empty() {
@@ -652,7 +697,9 @@ fn adv_bound(
     if t.starts_with('?') {
         return inputs.get(t).copied();
     }
-    resolve_date_token(t.trim_start_matches(':'), today)
+    // A literal bound may be written as a bare token (`2026-06-24`) or a quoted
+    // string (`"2026-06-24"`); `split_whitespace` keeps the quotes, so strip them.
+    resolve_date_token(t.trim_matches('"').trim_start_matches(':'), today)
 }
 
 /// Build a `?var → yyyymmdd` map by zipping `:in $ ?a ?b …` var names with the

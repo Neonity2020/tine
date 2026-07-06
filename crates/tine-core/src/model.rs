@@ -5095,6 +5095,62 @@ mod tests {
     }
 
     #[test]
+    fn advanced_query_covers_widened_clause_subset() {
+        // 1c: the advanced (datalog) parser maps the same heads the simple DSL
+        // supports — page / namespace / page-tags / scheduled / deadline / journal
+        // — not just the original task/priority/page-ref/property/between set.
+        let dir = scratch("adv-wide");
+        fs::write(
+            dir.join("journals").join("2026_06_20.md"),
+            "- TODO ship it\n  SCHEDULED: <2026-06-25 Thu>\n- pay rent\n  DEADLINE: <2026-06-30 Tue>\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("pages").join("Proj.md"),
+            "tags:: work, urgent\n\n- a task on a named page\n",
+        )
+        .unwrap();
+        // Default file-name format is Legacy (`%2F`), so encode the namespace slash.
+        fs::write(dir.join("pages").join("Proj%2FSub.md"), "- nested note\n").unwrap();
+        let g = Graph::open(&dir);
+        g.warm_cache();
+
+        let count = |src: &str| -> usize {
+            let r = g.run_advanced_query(src, None);
+            assert!(r.supported, "expected supported: {src} (ran={:?})", r.ran);
+            r.groups.iter().map(|grp| grp.blocks.len()).sum()
+        };
+
+        // (scheduled) / (deadline) map to the planning predicates.
+        assert_eq!(count("[:find (pull ?b [*]) :where (scheduled ?b)]"), 1);
+        assert_eq!(count("[:find (pull ?b [*]) :where (deadline ?b)]"), 1);
+        // (journal) restricts to blocks on journal pages.
+        assert_eq!(count("[:find (pull ?b [*]) :where (journal ?b)]"), 2);
+        // (page "Name") pins to one page.
+        assert_eq!(count(r#"[:find (pull ?b [*]) :where (page ?b "Proj")]"#), 1);
+        // (namespace "Proj") matches pages under the namespace.
+        assert_eq!(
+            count(r#"[:find (pull ?b [*]) :where (namespace ?b "Proj")]"#),
+            1
+        );
+        // (page-tags "work") matches the tags:: page-property.
+        assert_eq!(
+            count(r#"[:find (pull ?b [*]) :where (page-tags ?b "work")]"#),
+            1
+        );
+        // (between scheduled …) is now field-aware, not hardwired to journal-day.
+        assert_eq!(
+            count(r#"[:find (pull ?b [*]) :where (between scheduled ?b "2026-06-24" "2026-06-26")]"#),
+            1
+        );
+
+        // Unknown heads still land in `ignored`, never guessed.
+        let r = g.run_advanced_query("[:find ?b :where (bogus ?b)]", None);
+        assert!(r.ignored.contains(&"bogus".to_string()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn advanced_query_reuses_cached_result_until_graph_changes() {
         let dir = scratch("adv-memo");
         fs::write(dir.join("pages").join("P.md"), "- TODO ship\n").unwrap();
