@@ -23,7 +23,10 @@ _Empty. (The "Help improve Tine" lsdoc↔mldoc diff panel — [ADR 0018](adr/001
 
 ## P1 — do next (high value, bounded scope)
 
-_Empty._
+| Item | Notes |
+|---|---|
+| **Mobile camera / photo capture** (Android editor toolbar) | The above-keyboard toolbar (M3) ships without the camera button because a true capture flow needs a **native Android intent** (`ACTION_IMAGE_CAPTURE` / the photo picker) → write the image into the graph's `assets/` → insert the `![]()` ref, mirroring OG's camera button (#7 in `subagent-tasks/notes/android-toolbar-confirmed.md`). Genuinely useful (Martin, Jul 6 2026). Bounded: one Kotlin intent + the existing asset-import path. Add the toolbar button back once wired. |
+| **Voice-memo recording** (mic button) | Record an audio memo from the mobile editor and drop it into the graph as an asset (OG shows a mic icon for this). Needs a native audio-record intent/permission (`RECORD_AUDIO`) → save to `assets/` → insert the media ref; Tine already renders audio (waveform overlay, see [[tine-audio-overlay-website]]), so playback is covered — this is the capture half. Genuinely useful (Martin, Jul 6 2026). |
 
 ---
 

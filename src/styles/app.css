@@ -2606,6 +2606,89 @@ body {
   background: var(--bg-tertiary);
 }
 
+.mobile-keyboard-toolbar {
+  position: fixed;
+  left: env(safe-area-inset-left);
+  right: env(safe-area-inset-right);
+  z-index: 80;
+  transform: translateY(-100%);
+  display: flex;
+  align-items: stretch;
+  gap: 5px;
+  padding: 6px 6px;
+  background: color-mix(in srgb, var(--bg-primary) 96%, var(--text-primary) 4%);
+  border-top: 1px solid color-mix(in srgb, var(--border-color) 82%, transparent);
+  border-bottom: 1px solid color-mix(in srgb, var(--border-color) 60%, transparent);
+  box-shadow: 0 -8px 24px rgba(15, 23, 42, 0.18);
+  pointer-events: auto;
+}
+
+.mobile-keyboard-toolbar-strip {
+  min-width: 0;
+  flex: 1 1 auto;
+  display: flex;
+  gap: 2px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+  -webkit-overflow-scrolling: touch;
+}
+
+.mobile-keyboard-toolbar-strip::-webkit-scrollbar {
+  display: none;
+}
+
+.mobile-keyboard-toolbar-btn {
+  flex: 0 0 40px;
+  width: 40px;
+  min-width: 40px;
+  height: 44px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-primary);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.mobile-keyboard-toolbar-btn:active {
+  background: var(--bg-tertiary);
+  border-color: var(--border-color);
+}
+
+.mobile-keyboard-toolbar-btn svg {
+  width: 22px;
+  height: 22px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.mobile-keyboard-toolbar-text {
+  font-size: 13px;
+  font-weight: 650;
+  line-height: 1;
+  letter-spacing: 0;
+}
+
+.mobile-keyboard-toolbar-slash {
+  font-size: 24px;
+  font-weight: 500;
+}
+
+.mobile-keyboard-toolbar-hide {
+  flex: 0 0 44px;
+  margin-left: 2px;
+  background: var(--bg-secondary);
+  border-color: var(--border-color);
+}
+
 .block-editor {
   width: 100%;
   border: none;

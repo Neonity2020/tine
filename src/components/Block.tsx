@@ -98,6 +98,7 @@ import { isAnnotationBlock, annotationInfo } from "../editor/annotation";
 import { AnnotationBody } from "./AnnotationBody";
 import { logbookInfo, type LogbookInfo } from "../logbook";
 import { inPageFindPreservesEditorBlur } from "../inpageFind";
+import { registerFocusedEditorCommandBridge, type MobileEditorCommandId } from "../editorCommandBridge";
 
 // Detect a block whose entire body is a single {{query}} / {{embed}} macro.
 function detectMacro(raw: string): { kind: "query" | "embed"; inner: string } | null {
@@ -1383,6 +1384,31 @@ export function Editor(props: { id: string }): JSX.Element {
       autosize();
     });
   };
+  const softNewlineCmd = () => {
+    const start = ref.selectionStart;
+    const end = ref.selectionEnd;
+    closeAc();
+    applyEdit({ text: ref.value.slice(0, start) + "\n" + ref.value.slice(end), start: start + 1, end: start + 1 });
+  };
+  const insertPairedRefTrigger = (open: "[[" | "((", close: "]]" | "))") => {
+    const start = ref.selectionStart;
+    const end = ref.selectionEnd;
+    const selected = ref.value.slice(start, end);
+    const insert = `${open}${selected}${close}`;
+    const caret = start + open.length + selected.length;
+    applyEdit({ text: ref.value.slice(0, start) + insert + ref.value.slice(end), start: caret, end: caret });
+    queueMicrotask(() => void updateAutocomplete());
+  };
+  const insertSlashMenuTrigger = () => {
+    const start = ref.selectionStart;
+    const end = ref.selectionEnd;
+    applyEdit({ text: ref.value.slice(0, start) + "/" + ref.value.slice(end), start: start + 1, end: start + 1 });
+    queueMicrotask(() => void updateAutocomplete());
+  };
+  const openScheduledDatePicker = () => {
+    const r = ref.getBoundingClientRect();
+    openDatePicker(props.id, "scheduled", r.left, r.bottom + 4);
+  };
 
   // Editor command handlers keyed by command id (see keybindings.ts). Each does
   // its own preventDefault when it handles the event and returns whether it did
@@ -1421,6 +1447,51 @@ export function Editor(props: { id: string }): JSX.Element {
       commit(ref.value); outdentBlock(props.id, ref.selectionStart); return true;
     },
   };
+  const mobileKeyEvent = { preventDefault() {} } as KeyboardEvent;
+  const dispatchMobileEditorCommand = (command: MobileEditorCommandId): boolean => {
+    if (!ref || !ref.isConnected) return false;
+    ref.focus();
+    switch (command) {
+      case "editor/outdent":
+      case "editor/indent":
+      case "editor/move-block-up":
+      case "editor/move-block-down":
+      case "editor/cycle-todo":
+        return runEditorCmd[command]?.(mobileKeyEvent) ?? false;
+      case "editor/soft-newline":
+        softNewlineCmd();
+        return true;
+      case "editor/upload-asset":
+        uploadAsset();
+        return true;
+      case "editor/open-date-picker":
+        openScheduledDatePicker();
+        return true;
+      case "editor/insert-page-ref":
+        insertPairedRefTrigger("[[", "]]");
+        return true;
+      case "editor/insert-block-ref":
+        insertPairedRefTrigger("((", "))");
+        return true;
+      case "editor/open-slash-menu":
+        insertSlashMenuTrigger();
+        return true;
+    }
+  };
+  let unregisterFocusedEditorBridge: (() => void) | undefined;
+  const registerFocusedEditorBridge = () => {
+    unregisterFocusedEditorBridge?.();
+    unregisterFocusedEditorBridge = registerFocusedEditorCommandBridge({
+      blockId: props.id,
+      dispatch: dispatchMobileEditorCommand,
+      blur: () => ref.blur(),
+    });
+  };
+  const unregisterFocusedEditor = () => {
+    unregisterFocusedEditorBridge?.();
+    unregisterFocusedEditorBridge = undefined;
+  };
+  onCleanup(unregisterFocusedEditor);
 
   const onKeyDown = (e: KeyboardEvent) => {
     const start = ref.selectionStart;
@@ -1543,6 +1614,12 @@ export function Editor(props: { id: string }): JSX.Element {
       }
     }
 
+    if (e.key === "Enter" && e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      e.preventDefault();
+      softNewlineCmd();
+      return;
+    }
+
     if (e.key === "Enter" && !e.shiftKey && !e.ctrlKey && !e.metaKey) {
       // In a calc block, Enter adds a new expression line (stays in the block) —
       // let the textarea insert the newline natively, like OG.
@@ -1654,6 +1731,7 @@ export function Editor(props: { id: string }): JSX.Element {
   };
 
   const onBlur = () => {
+    unregisterFocusedEditor();
     // A block-move reorder blurs us momentarily — stay in edit mode (the move
     // handler refocuses and restores the caret). Commit as-is, don't normalize.
     if (isBlockMoving()) {
@@ -1803,7 +1881,10 @@ export function Editor(props: { id: string }): JSX.Element {
         placeholder={cap?.bulletHint?.()}
         onInput={onInput}
         onKeyDown={onKeyDown}
-        onFocus={() => noteSurfaceFocused(surfaceKey)}
+        onFocus={() => {
+          noteSurfaceFocused(surfaceKey);
+          registerFocusedEditorBridge();
+        }}
         onBlur={onBlur}
         onPaste={onPaste}
         onSelect={updateSel}

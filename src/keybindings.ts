@@ -419,6 +419,13 @@ export function paletteCommands(): { id: string; label: string; binding: string;
     .filter((c) => c.binding !== "false");
 }
 
+export function runGlobalCommand(id: string): boolean {
+  const cmd = COMMANDS.find((c) => c.id === id && c.scope === "global" && c.run);
+  if (!cmd?.run) return false;
+  cmd.run();
+  return true;
+}
+
 /** Merged shortcuts for the Settings reference. */
 export function currentShortcuts(): { id: string; label: string; binding: string; scope: ShortcutScope }[] {
   return COMMANDS.map((c) => ({
