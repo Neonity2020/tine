@@ -19,6 +19,7 @@ import { doc, persistentBlockRef, extendFeedForScroll } from "./store";
 import { backend } from "./backend";
 import { renderedBlocks } from "./lazyObserve";
 import { navReuseTabs } from "./navSettings";
+import { isMobilePlatform } from "./nativeChrome";
 
 export type Route =
   | { kind: "journals" }
@@ -100,6 +101,72 @@ export function sameRoute(a: Route, b: Route): boolean {
 // top, and only a return to a previously-seen entry restores its scroll.
 const scrollByRoute = new WeakMap<Route, number>();
 
+const MOBILE_HISTORY_STATE = { tineRouter: true };
+let mobileHistoryDepth = 0;
+let mobileHistoryBackPending = false;
+let handlingMobilePopState = false;
+let mobileHistoryListenerAttached = false;
+
+function mobileHistoryAvailable(): boolean {
+  return (
+    isMobilePlatform &&
+    typeof window !== "undefined" &&
+    !!window.history &&
+    typeof window.history.pushState === "function" &&
+    typeof window.history.back === "function" &&
+    typeof window.addEventListener === "function"
+  );
+}
+
+function applyRouterBack() {
+  rememberScroll(); // save this entry's scroll before stepping back
+  setTabs(tabs().map((t) => (t.id === activeId() ? { ...t, pos: t.pos - 1 } : t)));
+  persist();
+}
+
+function ensureMobileHistoryBridge() {
+  if (!mobileHistoryAvailable() || mobileHistoryListenerAttached) return;
+  mobileHistoryListenerAttached = true;
+  window.addEventListener("popstate", () => {
+    if (mobileHistoryDepth > 0) mobileHistoryDepth--;
+    mobileHistoryBackPending = false;
+    if (!canGoBack()) return;
+    handlingMobilePopState = true;
+    try {
+      goBack();
+    } finally {
+      handlingMobilePopState = false;
+    }
+  });
+}
+
+function pushMobileHistoryEntry() {
+  if (!mobileHistoryAvailable() || !canGoBack()) return;
+  ensureMobileHistoryBridge();
+  try {
+    window.history.pushState(MOBILE_HISTORY_STATE, "", window.location?.href);
+    mobileHistoryDepth++;
+  } catch {
+    // History is best-effort: if a WebView refuses pushState, router navigation still works.
+  }
+}
+
+function requestMobileHistoryBack(): boolean {
+  if (!mobileHistoryAvailable() || handlingMobilePopState || mobileHistoryDepth <= 0) {
+    return false;
+  }
+  if (mobileHistoryBackPending) return true;
+  ensureMobileHistoryBridge();
+  mobileHistoryBackPending = true;
+  try {
+    window.history.back();
+    return true;
+  } catch {
+    mobileHistoryBackPending = false;
+    return false;
+  }
+}
+
 function mainScroller(): HTMLElement | null {
   if (typeof document === "undefined") return null; // no-DOM (unit tests)
   return document.querySelector(".main-content");
@@ -167,7 +234,10 @@ function navigate(r: Route, opts: { sticky?: boolean } = {}) {
   if (opts.sticky && navReuseTabs()) {
     const existing = tabs().find((t) => sameRoute(tabRoute(t), r));
     if (existing) {
-      if (existing.id !== active.id) setActiveTab(existing.id);
+      if (existing.id !== active.id) {
+        setActiveTab(existing.id);
+        pushMobileHistoryEntry();
+      }
       return;
     }
   }
@@ -185,6 +255,7 @@ function navigate(r: Route, opts: { sticky?: boolean } = {}) {
     })
   );
   persist();
+  pushMobileHistoryEntry();
 }
 
 export function openPage(
@@ -307,9 +378,8 @@ export function canGoForward(): boolean {
 
 export function goBack() {
   if (!canGoBack()) return;
-  rememberScroll(); // save this entry's scroll before stepping back
-  setTabs(tabs().map((t) => (t.id === activeId() ? { ...t, pos: t.pos - 1 } : t)));
-  persist();
+  if (requestMobileHistoryBack()) return;
+  applyRouterBack();
 }
 
 export function goForward() {
@@ -317,6 +387,7 @@ export function goForward() {
   rememberScroll(); // save this entry's scroll before stepping forward
   setTabs(tabs().map((t) => (t.id === activeId() ? { ...t, pos: t.pos + 1 } : t)));
   persist();
+  pushMobileHistoryEntry();
 }
 
 export function setActiveTab(id: string) {

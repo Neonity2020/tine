@@ -474,27 +474,30 @@ function CarryActions(props: { page: FeedPage }): JSX.Element {
           when={isToday()}
           fallback={
             <button
-              class="carry-btn"
+              class="carry-btn carry-btn-push"
               title="Move this day's unfinished tasks to today"
               onClick={() => void carryDay(props.page.name)}
             >
-              Carry unfinished tasks → today
+              <span class="carry-label-full">Carry unfinished tasks → today</span>
+              <span class="carry-label-short">To today</span>
             </button>
           }
         >
           <button
-            class="carry-btn"
+            class="carry-btn carry-btn-prev"
             title="Pull unfinished tasks from the most recent day that has content"
             onClick={() => void carryPrevDay()}
           >
-            Carry from previous day
+            <span class="carry-label-full">Carry from previous day</span>
+            <span class="carry-label-short">Previous</span>
           </button>
           <button
-            class="carry-btn"
+            class="carry-btn carry-btn-days"
             title={`Pull unfinished tasks from the last ${carryDays()} days (change N in Settings)`}
             onClick={() => void carryDaysBack(carryDays())}
           >
-            Carry last {carryDays()} days
+            <span class="carry-label-full">Carry last {carryDays()} days</span>
+            <span class="carry-label-short">Last {carryDays()}d</span>
           </button>
         </Show>
       </div>
