@@ -8,6 +8,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+## [0.4.2] — 2026-07-06
+
+### Fixed
+
+- **Restore the macOS and Windows-arm64 release builds.** 0.4.1 shipped without them: a
+  repo-wide `rust-toolchain.toml` (added while setting up F-Droid) pinned a Rust channel that
+  didn't carry the cross-compile targets the release CI installs, so those two cross-builds
+  failed (every other platform, including the Android APK, was unaffected). Removed the pin;
+  the Android/F-Droid build installs its targets explicitly instead. No app-behavior change.
+
 ## [0.4.1] — 2026-07-06
 
 ### Added
@@ -822,7 +832,8 @@ takes over your graph.
 - macOS and Windows installers are currently **unsigned** — on macOS right-click →
   Open; on Windows choose *More info → Run anyway*.
 
-[Unreleased]: https://github.com/martinkoutecky/tine/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/martinkoutecky/tine/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/martinkoutecky/tine/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/martinkoutecky/tine/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/martinkoutecky/tine/compare/v0.3.5...v0.4.0
 [0.3.5]: https://github.com/martinkoutecky/tine/compare/v0.3.4...v0.3.5

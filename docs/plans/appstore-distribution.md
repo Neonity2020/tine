@@ -67,8 +67,8 @@ auto-updates through the F-Droid client from our own signature.
 Gradle) → **`1 build succeeded`**, output `unsigned/dev.tine.app_4000.apk` (24.8 MB), which
 aapt confirms is `versionCode=4000 versionName=0.4.0` (matches the metadata, so fdroid's
 version check passed). So the recipe below is proven, not theoretical. What's left is
-process: cut a tag that includes `rust-toolchain.toml`, then open the MR from a GitLab
-account. Remaining gates that only F-Droid's server settles: gradle-wrapper.jar hash
+process: point the metadata at the latest complete release tag (v0.4.2) and open the MR from
+a GitLab account. Remaining gates that only F-Droid's server settles: gradle-wrapper.jar hash
 verification (routine) and, if we later want it, reproducible-builds.
 
 **Gotchas hit while validating (documented so the buildserver run is smooth):**
@@ -114,13 +114,19 @@ minor·1e3 + patch`, per `release.yml`), **NDK `26.3.11579264`**, `compileSdk 36
   hits — resolve with `ScannerExclude`/`scandelete` for `node_modules` build-time-only
   binaries, and confirm nothing non-free ends up **inside the APK** (only our JS bundle +
   Rust `.so` should). This is the part that takes iteration.
-- **Rust toolchain.** Pin it: add `rust-toolchain.toml` at repo root
-  (`[toolchain] channel = "1.xx"` + `targets = ["aarch64-linux-android", …]`). The recipe
-  installs rustup in `sudo` if the buildserver lacks the pinned toolchain.
+- **Rust toolchain + targets.** Install the needed targets **in the recipe**
+  (`rustup target add aarch64-linux-android wasm32-unknown-unknown`), NOT via a repo-wide
+  `rust-toolchain.toml`. (We tried a `rust-toolchain.toml` pin and it broke the release CI —
+  see the finding below — so it was removed; F-Droid uses the buildserver's stable rust.)
 
 **Phase-1 findings (validated on the uni box, Jul 6 2026):**
 
-- ✅ `rust-toolchain.toml` added (channel 1.96.0 + the 4 android targets + `wasm32-unknown-unknown`).
+- ⚠️ **A repo-wide `rust-toolchain.toml` was tried and REMOVED.** Pinning `channel = 1.96.0`
+  broke v0.4.1's macOS + Windows-arm release builds: the CI installs each cross-target onto
+  `@stable` (via dtolnay), but the repo pin forced a *different* toolchain that lacked them.
+  Fix: no toolchain file; the F-Droid recipe installs `aarch64-linux-android` +
+  `wasm32-unknown-unknown` explicitly. (Android built fine even with the pin because that
+  target was in the file's list — which is exactly why the diagnosis was unambiguous.)
 - ✅ **Release build is green.** Exact output path confirmed:
   `src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release-unsigned.apk`
   (24.8 MB, arm64). The `universal` flavor comes from the generated `tauri.build.gradle.kts`.
@@ -150,14 +156,16 @@ minor·1e3 + patch`, per `release.yml`), **NDK `26.3.11579264`**, `compileSdk 36
 
 **Remaining steps:**
 
-1. ✅ **Repo prep — done.** `rust-toolchain.toml` is in; the Tauri CLI regenerates the
-   gitignored gen glue on build (verified); wasm rebuilds byte-identical from source.
+1. ✅ **Repo prep — done.** No toolchain file needed (targets installed in-recipe); the Tauri
+   CLI regenerates the gitignored gen glue on build (verified); wasm rebuilds byte-identical
+   from source.
 2. ✅ **Metadata written + recipe validated.** `fdroid lint`/scanner/`fdroid build` all pass
    locally (fdroidserver 2.4.5) → valid unsigned APK `dev.tine.app_4000.apk`
    (`versionCode=4000 versionName=0.4.0`). Harness kept at `/aux/koutecky/logseq/fdroid-work/`
-   (venv + `fdroiddata/` + `run-build.sh`) to re-run after any change.
-3. **Cut a release tag that includes `rust-toolchain.toml`** (v0.4.1+; needs Martin's OK per
-   the version policy) and point the metadata `commit:`/`versionCode:` at it (4001 for 0.4.1).
+   (venv + `fdroiddata/` + `run-build.sh`) to re-run after any change. **Re-validate at the
+   v0.4.2 tag** (versionCode 4002, no toolchain file) before the MR.
+3. **Point the metadata `commit:`/`versionCode:` at the latest complete release tag** (v0.4.2 /
+   4002). No special repo content is required anymore (the toolchain pin was removed).
 4. **Open the MR** to `gitlab.com/fdroid/fdroiddata` (needs a GitLab account — Martin's
    action): fork, add `metadata/dev.tine.app.yml` (real-MR version below, with `sudo:` deps),
    push, open MR, respond to the reviewer. After merge the first build can take days–weeks;
@@ -187,17 +195,16 @@ RepoType: git
 Repo: https://github.com/martinkoutecky/tine.git
 
 Builds:
-  - versionName: 0.4.1            # a TAG that INCLUDES rust-toolchain.toml (v0.4.0 does not)
-    versionCode: 4001             # 0.4.1 → 4*1000+1; for 0.4.0 it is 4000
-    commit: v0.4.1
+  - versionName: 0.4.2            # latest complete release (0.4.1 missed macOS + win-arm)
+    versionCode: 4002             # 0.4.2 → 4*1000+2  (Tauri scheme major·1e6+minor·1e3+patch)
+    commit: v0.4.2
     sudo:
       - apt-get update || true
       - apt-get install -y nodejs npm binaryen   # binaryen = system wasm-opt
-      # If the pinned Rust toolchain / wasm-pack aren't preinstalled, add rustup +
-      # `cargo install wasm-pack --version 0.15.0` here (or in prebuild).
+      # If wasm-pack isn't preinstalled: `cargo install wasm-pack --version 0.15.0`.
     ndk: 26.3.11579264
     build:
-      - rustup target add wasm32-unknown-unknown
+      - rustup target add aarch64-linux-android wasm32-unknown-unknown
       - npm ci
       - npm run build:wasm    # rebuild the parser FROM SOURCE (crates/lsdoc-wasm → lsdoc git dep)
       # Call the binary directly — `npx tauri`/npm eats the --flags (validated finding).
@@ -206,15 +213,16 @@ Builds:
 
 AutoUpdateMode: Version
 UpdateCheckMode: Tags
-CurrentVersion: 0.4.1
-CurrentVersionCode: 4001
+CurrentVersion: 0.4.2
+CurrentVersionCode: 4002
 ```
 
 Notes:
 - **NO `scandelete`** (validated: the scanner doesn't flag the vendored wasm; listing it
   errors "unused"). Provenance comes from the `npm run build:wasm` step rebuilding it.
-- **The `commit` must be a tag containing `rust-toolchain.toml`** — that landed AFTER v0.4.0,
-  so the first F-Droid build needs a fresh tag (v0.4.1+). Do not tag without Martin's OK.
+- **No `rust-toolchain.toml`** — the recipe's `rustup target add` installs the two targets the
+  build needs; a repo-wide pin broke the desktop CI cross-builds (see findings). Point `commit`
+  at the latest complete release tag (v0.4.2).
 - `npm run build:wasm` needs `wasm-pack` + `wasm-opt` (binaryen); it regenerates
   `lsdoc_wasm_bytes.ts` before `tauri android build` runs `npm run build`, whose
   `check-wasm-pin` then passes (tags match).
