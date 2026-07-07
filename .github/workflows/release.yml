@@ -330,6 +330,18 @@ jobs:
           export RUSTFLAGS="--remap-path-prefix=$GITHUB_WORKSPACE=/build --remap-path-prefix=$HOME/.cargo=/cargo"
           npx tauri android build --target aarch64 --apk
 
+      # On a manual dispatch (no tag) there is no release to attach to, so expose
+      # the built APK as a workflow artifact instead — this is how the documented
+      # reproducibility smoke-test inspects the CI-built native lib (compare its
+      # libtine_lib.so against a local `ndk: 26.3.11579264` F-Droid-recipe build).
+      - name: Upload Android APK as artifact (dispatch smoke-test)
+        if: steps.sign.outputs.enabled == 'true' && !startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apk-smoketest
+          path: src-tauri/gen/android/**/release/*-release.apk
+          if-no-files-found: error
+
       - name: Upload Android APK to the release
         if: steps.sign.outputs.enabled == 'true' && startsWith(github.ref, 'refs/tags/')
         env:
