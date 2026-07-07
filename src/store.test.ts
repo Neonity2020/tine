@@ -4,6 +4,7 @@
 
 import { describe, it, expect, beforeAll, beforeEach, afterEach, vi, type MockInstance } from "vitest";
 import { initParser } from "./render/parse";
+import { clearSeededFacets } from "./render/facets";
 import {
   doc,
   resetStore,
@@ -45,6 +46,7 @@ import {
   orderedListMarker,
   blockProperty,
   setBlockProperty,
+  setSchedule,
   pageToDto,
   blockSubtreeMarkdown,
   selectionMarkdown,
@@ -73,9 +75,13 @@ let counter = 0;
 function blk(raw: string, children: BlockDto[] = []): BlockDto {
   return { id: `t${counter++}`, raw, collapsed: false, children };
 }
-function load(blocks: BlockDto[]): PageDto {
-  const dto: PageDto = { name: "Test", kind: "page", title: "Test", pre_block: null, blocks };
+function load(blocks: BlockDto[], format?: "md" | "org"): PageDto {
+  const dto: PageDto = { name: "Test", kind: "page", title: "Test", pre_block: null, blocks, ...(format ? { format } : {}) };
   loadSingle(dto);
+  // Test DTOs carry no `properties`, so the DTO-seeded facet cache would hold
+  // empty facets and mask the derive-from-raw path (the real backend always
+  // ships properties). Clear seeds so facetsOf derives from raw here.
+  clearSeededFacets();
   return dto;
 }
 
@@ -1213,5 +1219,53 @@ describe("setBlockProperty placement & fence safety", () => {
     expect(doc.byId[b.id].raw).toBe("Title\nold:: new\nbody");
     setBlockProperty(b.id, "old", null);
     expect(doc.byId[b.id].raw).toBe("Title\nbody");
+  });
+});
+
+describe("setBlockProperty org drawer (review fix)", () => {
+  it("creates a drawer at the canonical position on an org block", () => {
+    const b = blk("Title\nbody");
+    load([b], "org");
+    setBlockProperty(b.id, "tine.view", "grid");
+    expect(doc.byId[b.id].raw).toBe("Title\n:PROPERTIES:\n:tine.view: grid\n:END:\nbody");
+  });
+
+  it("updates in an existing drawer and keeps planning above it", () => {
+    const b = blk("TODO t\nSCHEDULED: <2026-07-10 Fri>\n:PROPERTIES:\n:tine.view: grid\n:END:\nbody");
+    load([b], "org");
+    setBlockProperty(b.id, "tine.view", "table");
+    expect(doc.byId[b.id].raw).toBe(
+      "TODO t\nSCHEDULED: <2026-07-10 Fri>\n:PROPERTIES:\n:tine.view: table\n:END:\nbody"
+    );
+  });
+
+  it("removing the last property removes the drawer", () => {
+    const b = blk("Title\n:PROPERTIES:\n:tine.view: grid\n:END:\nbody");
+    load([b], "org");
+    setBlockProperty(b.id, "tine.view", null);
+    expect(doc.byId[b.id].raw).toBe("Title\nbody");
+  });
+});
+
+describe("setSchedule fence safety (review fix)", () => {
+  it("never deletes a SCHEDULED lookalike inside a code fence", () => {
+    const raw = "Task\n```\nSCHEDULED: <2026-01-01 Thu>\n```\ntail";
+    const b = blk(raw);
+    load([b]);
+    setSchedule(b.id, "scheduled", { y: 2026, m: 6, d: 15 });
+    expect(doc.byId[b.id].raw).toBe(
+      "Task\nSCHEDULED: <2026-07-15 Wed>\n```\nSCHEDULED: <2026-01-01 Thu>\n```\ntail"
+    );
+    setSchedule(b.id, "scheduled", null);
+    expect(doc.byId[b.id].raw).toBe(raw);
+  });
+});
+
+describe("blockProperty via the one recognizer (review fix)", () => {
+  it("ignores property lookalikes inside code fences", () => {
+    const b = blk("Grid\ntine.view:: grid\n```\ntine.col-widths:: 0=120\n```");
+    load([b]);
+    expect(blockProperty(b.id, "tine.col-widths")).toBe(null);
+    expect(blockProperty(b.id, "tine.view")).toBe("grid");
   });
 });

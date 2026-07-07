@@ -8,11 +8,12 @@ import {
   insertOutlineChildren,
   replaceChildOrders,
   setRaw,
+  pageByName,
   setBlockProperty,
   withUndoUnit,
 } from "../store";
 import { copyRich } from "../clipboard";
-import { splitProps } from "../editor/properties";
+import { isBuiltinHidden, joinProps, splitProps } from "../editor/properties";
 import { parseOutline } from "../editor/outline";
 import { visibleBody } from "../render/block";
 import { serializeColAggregates, serializeColWidths, sheetConfigFromRaw } from "./config";
@@ -43,7 +44,12 @@ function gridRows(gridId: string): string[] | null {
 }
 
 function gridPage(gridId: string): string | null {
-  return doc.byId[gridId]?.page ?? null;
+  // null for read-only pages too (the org round-trip gate): every structural
+  // grid mutation resolves its page through here, so this is the single choke
+  // that keeps sheet writes off pages the block editor already refuses to edit.
+  const page = doc.byId[gridId]?.page ?? null;
+  if (page && pageByName(page)?.readOnly) return null;
+  return page;
 }
 
 function colCount(rows: readonly string[]): number {
@@ -97,6 +103,14 @@ function cellIdAt(gridId: string, row: number, col: number): string | null {
 
 function cellText(blockId: string | null): string {
   return blockId ? visibleBody(doc.byId[blockId]?.raw ?? "").join(" ") : "";
+}
+
+/** Replace a cell's visible text while KEEPING its hidden built-in properties
+ *  (id::/collapsed::): clearing or overwriting a cell must never orphan a
+ *  ((ref)) pointing at it (review finding). Fence-aware via splitProps. */
+function writeCellVisible(id: string, visible: string): void {
+  const hidden = splitProps(doc.byId[id]?.raw ?? "", isBuiltinHidden).hidden;
+  setRaw(id, hidden ? joinProps(visible, hidden) : visible, { timetracking: false });
 }
 
 function rawWithoutId(raw: string): string {
@@ -199,9 +213,16 @@ function indexAggregates(aggregates: ReadonlyMap<string, AggregateFn>): Map<numb
   return out;
 }
 
-function stringIndexAggregates(aggregates: ReadonlyMap<number, AggregateFn>): Map<string, AggregateFn> {
+/** Shift the numeric (positional) aggregate keys while carrying the field-keyed
+ *  entries (`prop:qty=sum`, `state=count`) through untouched — a grid column op
+ *  must never silently drop a field table's aggregate config (review finding). */
+function shiftedAggregates(
+  aggregates: ReadonlyMap<string, AggregateFn>,
+  shift: (m: Map<number, AggregateFn>) => Map<number, AggregateFn>
+): Map<string, AggregateFn> {
   const out = new Map<string, AggregateFn>();
-  for (const [idx, fn] of aggregates) out.set(`${idx}`, fn);
+  for (const [key, fn] of aggregates) if (!/^\d+$/.test(key)) out.set(key, fn);
+  for (const [idx, fn] of shift(indexAggregates(aggregates))) out.set(`${idx}`, fn);
   return out;
 }
 
@@ -231,7 +252,7 @@ export function insertColumn(gridId: string, at: number): void {
       if (row && row.children.length >= at) insertEmptyChildBlock(rowId, at);
     }
     writeColWidths(gridId, shiftedForInsert(colWidths(gridId), at));
-    writeColAggregates(gridId, stringIndexAggregates(shiftedForInsert(indexAggregates(colAggregates(gridId)), at)));
+    writeColAggregates(gridId, shiftedAggregates(colAggregates(gridId), (m) => shiftedForInsert(m, at)));
   });
 }
 
@@ -247,7 +268,7 @@ export function deleteColumn(gridId: string, col: number): void {
       if (cellId) deleteBlock(cellId);
     }
     writeColWidths(gridId, shiftedForDelete(colWidths(gridId), col));
-    writeColAggregates(gridId, stringIndexAggregates(shiftedForDelete(indexAggregates(colAggregates(gridId)), col)));
+    writeColAggregates(gridId, shiftedAggregates(colAggregates(gridId), (m) => shiftedForDelete(m, col)));
   });
 }
 
@@ -319,7 +340,7 @@ export function clearSheetSelection(sel: SheetMutationSelection): boolean {
     for (let row = rect.top; row <= rect.bottom; row++) {
       for (let col = rect.left; col <= rect.right; col++) {
         const id = cellIdAt(sel.gridId, row, col);
-        if (id) setRaw(id, "", { timetracking: false });
+        if (id) writeCellVisible(id, "");
       }
     }
     return true;
@@ -345,7 +366,7 @@ export function fillSheetSelection(sel: SheetMutationSelection, dir: "down" | "r
       for (let row = rect.top + 1; row <= rect.bottom; row++) {
         for (let col = rect.left; col <= rect.right; col++) {
           const target = materializeCell(sel.gridId, row, col);
-          if (target) setRaw(target, sources[col - rect.left], { timetracking: false });
+          if (target) writeCellVisible(target, sources[col - rect.left]);
         }
       }
       return true;

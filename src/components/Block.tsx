@@ -242,7 +242,17 @@ export function Block(props: { id: string; hideRefCount?: boolean }): JSX.Elemen
     const n = node();
     return n ? facetsOf(n.raw, fmt()) : null;
   });
-  const sheet = createMemo(() => sheetConfig(blockFacets()?.properties ?? []));
+  // A {{query}} block's sheet face renders INSIDE the query macro (rowSource:
+  // query, over the results) — the children-source face here would render a
+  // SECOND, empty board/table under it (review-loop finding: duplicate boards
+  // with phantom columns). Grid stays children-source even on a query block.
+  const sheet = createMemo(() => {
+    const cfg = sheetConfig(blockFacets()?.properties ?? []);
+    if ((cfg.view === "table" || cfg.view === "board") && detectMacro(node().raw)?.kind === "query") {
+      return { ...cfg, view: null };
+    }
+    return cfg;
+  });
   // Heading level of THIS block's first line, so the bullet column can match the
   // (taller) heading line box and the bullet stays centered on it.
   const headingLevel = createMemo(() => blockFacets()?.headingLevel ?? null);

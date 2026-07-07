@@ -23,7 +23,7 @@ import {
   logbookWithSecondSupport,
   removeDeletedPageFromNavigation,
 } from "./ui";
-import { seedFacets, facetsFromDto, clearSeededFacets } from "./render/facets";
+import { seedFacets, facetsFromDto, clearSeededFacets, facetsOf } from "./render/facets";
 import { journalTitle } from "./journal";
 import { upsertPropertyLine, readPropertyValue, splitProps, joinProps, isBuiltinHidden } from "./editor/properties";
 import { copyIncludeSubtree, copyStripCollapsed } from "./copySettings";
@@ -1209,15 +1209,25 @@ async function captureOutlineInto(name: string, kind: PageKind, nodes: OutlineNo
 
 const PROP_LINE = /^([A-Za-z0-9_./-]+):: ?(.*)$/;
 
-/** Current value of a `key:: value` block property, or null. */
+/** Current value of a block property, read through the ONE lsdoc-backed
+ *  recognizer (facetsOf) — a raw line scan here returned property-lookalikes
+ *  from code fences/body text and silently suppressed real config writes
+ *  (review finding). Case-insensitive key match, like OG. */
 export function blockProperty(id: string, key: string): string | null {
   const node = doc.byId[id];
   if (!node) return null;
-  for (const line of node.raw.split("\n")) {
-    const m = PROP_LINE.exec(line);
-    if (m && m[1] === key) return m[2].trim();
+  const lower = key.toLowerCase();
+  for (const [k, v] of facetsOf(node.raw, formatForBlock(id)).properties) {
+    if (k.toLowerCase() === lower) return v.trim();
   }
   return null;
+}
+
+/** Whether a block lives on a read-only page (the org round-trip gate) — sheet
+ *  write paths outside the block editor must consult this before mutating. */
+export function blockPageReadOnly(id: string): boolean {
+  const n = doc.byId[id];
+  return n ? (pageByName(n.page)?.readOnly ?? false) : false;
 }
 
 /** Set (or remove, when value is null) a `key:: value` block property. Property
@@ -1227,6 +1237,15 @@ export function setBlockProperty(id: string, key: string, value: string | null) 
   const node = doc.byId[id];
   if (!node) return;
   pushUndo(`prop:${id}:${key}`, [node.page]);
+  if (formatForBlock(id) === "org") {
+    // ORG blocks carry properties in a `:PROPERTIES:` drawer — writing a
+    // markdown `key:: value` line into org renders as visible body text and is
+    // NOT read back as a property (same class as GH #25 for id::). Mirrors
+    // rawWithBlockId's canonical placement: title, planning, drawer, body.
+    setDoc("byId", id, "raw", orgRawWithProperty(node.raw, key, value));
+    markDirty(node.page);
+    return;
+  }
   const lines = node.raw.split("\n");
   const first = lines[0] ?? "";
   // Canonical block shape: first line, planning lines, property lines, body.
@@ -1395,7 +1414,18 @@ export function setSchedule(
   if (!node) return;
   pushUndo(`sched:${id}:${which}`, [node.page]);
   const tag = which === "scheduled" ? "SCHEDULED" : "DEADLINE";
-  const lines = node.raw.split("\n").filter((l) => !new RegExp(`^${tag}:`).test(l.trim()));
+  // Remove the old planning line ONLY from the canonical head region (the run of
+  // planning/property lines right after the first line) — a `SCHEDULED:` inside a
+  // code fence or body text is content and must never be touched (review finding:
+  // the old any-line filter deleted fenced planning-lookalikes).
+  const all = node.raw.split("\n");
+  const isHeadLine = (l: string) => /^\s*(SCHEDULED|DEADLINE):/.test(l) || PROP_LINE.test(l);
+  let headEnd = 1;
+  while (headEnd < all.length && isHeadLine(all[headEnd])) headEnd++;
+  const lines = [
+    ...all.slice(0, headEnd).filter((l, i) => i === 0 || !new RegExp(`^${tag}:`).test(l.trim())),
+    ...all.slice(headEnd),
+  ];
   if (date) {
     const wd = WEEKDAYS[new Date(date.y, date.m, date.d).getDay()];
     const rep = repeater ? ` ${repeater}` : "";
@@ -1480,6 +1510,41 @@ export function rawWithBlockId(raw: string, uuid: string, format: Format): strin
   return [title, ...scheduled, ...deadline, ":PROPERTIES:", `:id: ${uuid}`, ":END:", ...body].join(
     "\n"
   );
+}
+
+/** `raw` with an org drawer property set/updated/removed. Operates ONLY on the
+ *  first `:PROPERTIES:` drawer in the canonical head region (title, planning,
+ *  drawer, body — the same placement rawWithBlockId uses); body text and code
+ *  blocks are never scanned. Removing the last property removes the drawer. */
+function orgRawWithProperty(raw: string, key: string, value: string | null): string {
+  const lines = raw.split("\n");
+  const start = lines.findIndex((l) => l.trim().toUpperCase() === ":PROPERTIES:");
+  const end =
+    start >= 0 ? lines.findIndex((l, i) => i > start && l.trim().toUpperCase() === ":END:") : -1;
+  const keyRe = new RegExp(`^:${key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}:\\s*`, "i");
+  if (start >= 0 && end > start) {
+    const inner = lines.slice(start + 1, end).filter((l) => !keyRe.test(l.trim()));
+    if (value !== null) inner.push(`:${key}: ${value}`);
+    if (inner.length === 0) {
+      // Drawer emptied: drop it entirely.
+      return [...lines.slice(0, start), ...lines.slice(end + 1)].join("\n");
+    }
+    return [...lines.slice(0, start + 1), ...inner, ...lines.slice(end)].join("\n");
+  }
+  if (value === null) return raw; // nothing to remove
+  // No drawer yet: title, SCHEDULED*, DEADLINE*, drawer, rest (rawWithBlockId's rule).
+  const [title, ...rest] = lines;
+  const isPlan = (l: string) => l.startsWith("SCHEDULED") || l.startsWith("DEADLINE");
+  let planEnd = 0;
+  while (planEnd < rest.length && isPlan(rest[planEnd])) planEnd++;
+  return [
+    title,
+    ...rest.slice(0, planEnd),
+    ":PROPERTIES:",
+    `:${key}: ${value}`,
+    ":END:",
+    ...rest.slice(planEnd),
+  ].join("\n");
 }
 
 /** Ensure a block has a persistent id (assigned lazily, like OG) AND that it's

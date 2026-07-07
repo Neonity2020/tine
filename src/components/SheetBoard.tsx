@@ -326,6 +326,14 @@ function BoardCard(props: {
       data-col={props.colIndex}
       data-block-id={props.row.id}
       onPointerDown={beginPointerDrag}
+      onMouseDown={(e: MouseEvent) => {
+        // The card lives inside the query block's content subtree; without this
+        // the mousedown bubbles into that block's beginEditGesture and mouseup
+        // starts an UNSCOPED edit of the {{query}} block, stomping the card's
+        // scoped edit and clearing the cell selection (grid cells already stop
+        // propagation in their own mousedown handler).
+        e.stopPropagation();
+      }}
       onClick={onClick}
       onContextMenu={openCellMenu}
       style={bgColor() ? { background: bgColor() } : undefined}

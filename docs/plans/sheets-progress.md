@@ -180,7 +180,53 @@ to `~/research/tine`. Martin is unavailable for testing.
       npm 50+19 green, tsc, cargo 270, all shots eyeballed, release binary
       rebuilt, e2e ALL PASS.
 
-**SHEETS v1 COMPLETE (Jul 7 2026) — all §11 phases done, branch `sheets`.**
+## Post-v1 hardening pass (Jul 7 2026, same day)
+
+Two independent adversarial reviews over the whole branch diff (codex xhigh +
+an Opus subagent; brief: `subagent-tasks/sheets-v1-review.md`, findings in
+`subagent-tasks/notes/sheets-v1-review-{codex,opus}.md`), plus an extended
+real-app e2e (seams, fill, undo, board card-move — 18 checks, ALL PASS).
+Master was merged INTO the branch (master had moved: GH #25 org id-drawer fix
++ backlog edits; the merge brought the drawer machinery the org fix builds on).
+
+**Fixed (all with regression tests):**
+1. (P1, Opus, validated) `writeField` state-cycle double-applied the
+   timetracking transition → duplicate never-closed `CLOCK:` on every kanban
+   card move. Cycle branch now passes `{timetracking:false}`.
+2. (P1, codex) `setSchedule` deleted `SCHEDULED:` lookalikes anywhere in raw
+   (incl. code fences; pre-existing bug, newly UI-reachable via date cells) —
+   now edits only the canonical head region.
+3. (P1, codex) Sheet faces bypassed the org read-only gate — gated at the
+   chokes: `gridPage` (all structural mutations), `writeField`/`cycleField`,
+   `startCellEditing`, hierarchify/flatten.
+4. (P2, both) `setBlockProperty` wrote markdown `key::` lines into org blocks —
+   org branch now writes the `:PROPERTIES:` drawer (canonical title→planning→
+   drawer→body placement, mirrors master's `rawWithBlockId`); empty drawer
+   removed on last-property delete.
+5. (P3, codex) `blockProperty` reads now go through `facetsOf` (fence-safe,
+   case-insensitive) instead of a raw regex scan that could suppress config
+   writes.
+6. (P3, Opus) grid column insert/delete no longer drops field-keyed
+   `tine.col-aggregates` entries (positional index shift preserves them).
+7. (P3, Opus) cell clear/fill/cut preserve hidden `id::`/`collapsed::` (no
+   more dangling ((refs)) after clearing a referenced cell).
+8. (e2e-found, NEW) board card mousedown bubbled into the query block's edit
+   gesture → unscoped edit of the {{query}} block stomped card editing;
+   stopPropagation like grid cells.
+9. (e2e-found, NEW) a query block with `tine.view:: board`/`table` rendered a
+   SECOND empty children-source board under the query-source one (phantom
+   columns); Block.tsx now defers those faces to the query macro.
+
+**Known, deliberately not fixed (small, noted for Martin):**
+- `cutSheetSelection` clears before the async clipboard write settles (a
+  rejected write loses the cut text; undo recovers it).
+- `setBlockProperty` can't remove a property that IS the block's first line.
+- Hierarchify group labels like `TODO` render as task blocks in OG (bare
+  label text — cosmetic, round-trip safe).
+- Logseq's default workflow is LATER/NOW: a config-less graph shows those
+  board columns, not TODO/DOING (OG parity, surprised the e2e author).
+
+**SHEETS v1 COMPLETE + HARDENED (Jul 7 2026) — all §11 phases done, branch `sheets`.**
 Remaining for v2 (per spec §10): pointer cell drag; merged cells `span::`;
 formulas (Bases DSL); multi-valued group-by (tag boards); `tine.fields::`
 schema; split view; canvas face + whiteboards importer; in-column card

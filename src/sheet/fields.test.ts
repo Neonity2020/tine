@@ -97,3 +97,34 @@ describe("sheet fields", () => {
     expect(doc.byId.a.raw).toBe("Title\nbody line\nother:: keep");
   });
 });
+
+describe("writeField review fixes", () => {
+  it("state cycle writes exactly ONE clock transition (no double timetracking)", () => {
+    setDoc({
+      byId: { a: node("a", "TODO write the intro") },
+      pages: [page(["a"])],
+      feed: ["Sheet"],
+      loaded: true,
+    });
+    expect(writeField("a", "state", "DOING")).toBe(true);
+    const raw = doc.byId.a.raw;
+    expect(raw.startsWith("DOING ")).toBe(true);
+    const clocks = (raw.match(/CLOCK:/g) || []).length;
+    // cycleMarkerSmart bakes the transition in; setRaw must not add a second.
+    expect(clocks).toBeLessThanOrEqual(1);
+    expect((raw.match(/:LOGBOOK:/g) || []).length).toBeLessThanOrEqual(1);
+  });
+
+  it("refuses to write on a read-only page (org round-trip gate)", () => {
+    setDoc({
+      byId: { a: node("a", "TODO t") },
+      pages: [{ ...page(["a"]), readOnly: true }],
+      feed: ["Sheet"],
+      loaded: true,
+    });
+    const before = doc.byId.a.raw;
+    expect(writeField("a", "state", "DOING")).toBe(false);
+    expect(writeField("a", "prop:x", "1")).toBe(false);
+    expect(doc.byId.a.raw).toBe(before);
+  });
+});

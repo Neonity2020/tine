@@ -1,5 +1,5 @@
 import { createRoot, createSignal } from "solid-js";
-import { doc, clearSelection, selectBlock, prevVisible, nextVisible, blockIsGridView, withUndoUnit } from "../store";
+import { doc, clearSelection, selectBlock, prevVisible, nextVisible, blockIsGridView, withUndoUnit, blockPageReadOnly } from "../store";
 import { endEdit, startEditing } from "../editorController";
 import { isBuiltinHidden, splitProps } from "../editor/properties";
 import {
@@ -253,6 +253,7 @@ export function startCellEditing(sel: CellSelInput, offset?: number): boolean {
   if (adapter?.startEditing) return adapter.startEditing(sel, offset);
   const blockId = cellBlockId(sel);
   if (!blockId) return false;
+  if (blockPageReadOnly(blockId)) return false; // org round-trip gate (review finding)
   const node = doc.byId[blockId];
   if (!node) return false;
   const visibleLen = splitProps(node.raw, isBuiltinHidden).visible.length;

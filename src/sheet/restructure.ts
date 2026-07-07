@@ -6,6 +6,7 @@ import {
   replaceChildOrders,
   setRaw,
   withUndoUnit,
+  blockPageReadOnly,
 } from "../store";
 import { visibleBody } from "../render/block";
 import { MARKERS } from "../markers";
@@ -106,6 +107,7 @@ export function canFlatten(parentId: string): boolean {
 }
 
 export function hierarchify(parentId: string, field: FieldId): boolean {
+  if (blockPageReadOnly(parentId)) return false; // org round-trip gate (review finding)
   const parent = doc.byId[parentId];
   if (!parent || !parent.children.length) return false;
   const buckets: GroupBucket[] = [];
@@ -141,6 +143,7 @@ export function hierarchify(parentId: string, field: FieldId): boolean {
 }
 
 export function flatten(parentId: string): boolean {
+  if (blockPageReadOnly(parentId)) return false; // org round-trip gate (review finding)
   const parent = doc.byId[parentId];
   if (!parent || !parent.children.length) return false;
 

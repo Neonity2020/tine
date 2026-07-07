@@ -1,4 +1,4 @@
-import { doc, formatForBlock, setRaw, setBlockProperty, setSchedule } from "../store";
+import { doc, formatForBlock, setRaw, setBlockProperty, setSchedule , blockPageReadOnly } from "../store";
 import { facetsOf, type Facets } from "../render/facets";
 import { isRenderHiddenProp } from "../render/block";
 import { leadingMarker, nextMarker, setMarker } from "../editor/marker";
@@ -120,6 +120,7 @@ function parseDate(value: string): { y: number; m: number; d: number } | null {
 export function writeField(id: string, field: FieldId, value: string): boolean {
   const n = doc.byId[id];
   if (!n) return false;
+  if (blockPageReadOnly(id)) return false; // org round-trip gate (review finding)
   const trimmed = value.trim();
 
   if (field === "state") {
@@ -132,10 +133,16 @@ export function writeField(id: string, field: FieldId, value: string): boolean {
         enabled: timetrackingEnabled(),
         withSeconds: logbookWithSecondSupport(),
       }).raw;
+      // cycleMarkerSmart already baked the LOGBOOK/timetracking transition in --
+      // letting setRaw apply it AGAIN wrote a duplicate (never-closed) CLOCK
+      // entry on every kanban card move (review finding, validated).
+      if (raw !== n.raw) setRaw(id, raw, { timetracking: false });
     } else {
+      // Direct set (non-adjacent state): setRaw's own applyMarkerTransition is
+      // the ONE place the clock transition applies.
       raw = setMarker(n.raw, target);
+      if (raw !== n.raw) setRaw(id, raw);
     }
-    if (raw !== n.raw) setRaw(id, raw);
     return true;
   }
 
@@ -162,6 +169,7 @@ export function writeField(id: string, field: FieldId, value: string): boolean {
 }
 
 export function cycleField(id: string, field: "state" | "priority"): boolean {
+  if (blockPageReadOnly(id)) return false; // org round-trip gate
   const n = doc.byId[id];
   if (!n) return false;
   if (field === "state") {
