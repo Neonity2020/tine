@@ -7,9 +7,23 @@ import fsp from "node:fs/promises";
 import path from "node:path";
 import type { IncomingMessage, ServerResponse } from "node:http";
 
-// Build timestamp, stamped at bundle time and shown in Settings so it's easy to
-// confirm the running binary is the latest (vs. a stale Syncthing copy).
-const BUILD_TIME = new Date().toISOString();
+// Build timestamp, shown in Settings so it's easy to confirm the running binary is
+// the latest (vs. a stale Syncthing copy). Derived from the COMMIT time, not the
+// wall clock, so the bundle is byte-reproducible: F-Droid sets SOURCE_DATE_EPOCH
+// (commit unix time); elsewhere we read the same value from git. Both format the
+// identical unix seconds → identical UTC ISO string. Dev (no git) falls back to now.
+function reproBuildTime(): string {
+  let epoch = process.env.SOURCE_DATE_EPOCH;
+  if (!epoch) {
+    try {
+      epoch = execSync("git show -s --format=%ct HEAD", { encoding: "utf8" }).trim();
+    } catch {
+      /* not a git checkout (e.g. bare source tarball) */
+    }
+  }
+  return epoch ? new Date(Number(epoch) * 1000).toISOString() : new Date().toISOString();
+}
+const BUILD_TIME = reproBuildTime();
 
 // Short commit the bundle was built from — shown in About so an issue reporter
 // can name the exact build. Empty string if git isn't available (e.g. a source

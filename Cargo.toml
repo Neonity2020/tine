@@ -7,10 +7,18 @@ exclude = ["crates/lsdoc-wasm"]
 resolver = "2"
 
 [workspace.package]
-version = "0.4.4"
+version = "0.4.5"
 edition = "2021"
 license = "AGPL-3.0-only"
 authors = ["Martin Koutecký"]
+
+# Reproducible builds (F-Droid #reproducible): the default release profile uses 16
+# parallel codegen units, whose output order (and cross-unit local-symbol renaming)
+# is nondeterministic — two builds of the same source produce differently-ordered
+# .so files. A single codegen unit makes the native lib byte-deterministic (at some
+# build-time/-speed cost). codegen-units is a stable profile key.
+[profile.release]
+codegen-units = 1
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }

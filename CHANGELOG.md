@@ -19,6 +19,32 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   formula group-by axes, `tine.filter::` table/board filters that fail open with a
   visible chip, and a right-click formula/filter editor.
 
+## [0.4.5] - 2026-07-07
+
+### Changed
+
+- **Reproducible Android builds.** The APK is now byte-for-byte reproducible from
+  source (deterministic build timestamp, single codegen unit, canonicalized build
+  paths), so F-Droid can verify its rebuild matches the signed release and ship the
+  developer's own APK.
+- **Developer tools now open as their own window** instead of docked into the app
+  ([#31](https://github.com/martinkoutecky/tine/issues/31)). Docked, WebKitGTK put
+  the window's resize grip at the top of the inspector pane and rendered the
+  inspector at the wrong scale on HiDPI/fractional displays. A separate top-level
+  window avoids both; WebKitGTK's inspector still has an attach button to dock it
+  back. Linux only.
+
+### Fixed
+
+- **Crash (`SIGABRT`) when the sidebar, tabs, or switcher show a page whose name
+  contains a color emoji** ([#29](https://github.com/martinkoutecky/tine/issues/29)).
+  On Linux distros that harden libstdc++ (e.g. Fedora), WebKitGTK's Skia
+  color-font (COLRv1) glyph path aborts while painting a raw emoji. Tine already
+  renders emoji in block content as Twemoji SVG images to sidestep WebKitGTK's
+  emoji handling; the sidebar (favorites, recent, all-pages), tab titles, quick
+  switcher, and right-sidebar titles now go through that same path, so no color
+  glyph is ever handed to the font renderer.
+
 ## [0.4.4] - 2026-07-07
 
 ### Added
@@ -900,7 +926,8 @@ takes over your graph.
 - macOS and Windows installers are currently **unsigned** — on macOS right-click →
   Open; on Windows choose *More info → Run anyway*.
 
-[Unreleased]: https://github.com/martinkoutecky/tine/compare/v0.4.4...HEAD
+[Unreleased]: https://github.com/martinkoutecky/tine/compare/v0.4.5...HEAD
+[0.4.5]: https://github.com/martinkoutecky/tine/compare/v0.4.4...v0.4.5
 [0.4.4]: https://github.com/martinkoutecky/tine/compare/v0.4.3...v0.4.4
 [0.4.3]: https://github.com/martinkoutecky/tine/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/martinkoutecky/tine/compare/v0.4.1...v0.4.2
