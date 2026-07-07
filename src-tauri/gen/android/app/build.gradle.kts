@@ -34,6 +34,11 @@ val hasReleaseKey = releaseStoreFile != null && releaseStoreFile.exists()
 
 android {
     compileSdk = 36
+    // Reproducible build (F-Droid #reproducible): pin the NDK to the same version the
+    // F-Droid recipe declares (`ndk: 26.3.11579264`, clang/lld 17) so AGP never
+    // resolves or downloads a newer NDK. Paired with removing other NDKs on the CI
+    // runner (release.yml) so the tauri-CLI Rust link also uses exactly this one.
+    ndkVersion = "26.3.11579264"
     namespace = "dev.tine.app"
     defaultConfig {
         manifestPlaceholders["usesCleartextTraffic"] = "false"
