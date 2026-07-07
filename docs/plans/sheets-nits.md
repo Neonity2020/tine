@@ -11,8 +11,11 @@ mount-time mismeasure needed a bounded verify loop, not just delayed
 re-measures; probe passes 3/3). Known limitation: nested sub-grids have
 no corner Σ, so sub-grid aggregates are currently unreachable (tolerable;
 revisit on request). NEXT = master→sheets merge (Martin green-lit), then
-batch 4 (N10–N14, scoped down per Martin: N13 = mouse drag + click-select
-only, he re-reviews after).
+batch 4 (N10–N14) SHIPPED `c762fcd` (e2e now 34 checks; ADR 0025 amended;
+spec §13 decision 2 marked RESOLVED). Master→sheets merge `60663d5` done
+(v0.4.3+0.4.4 in; DatePicker #30 woven into dual-target picker; master's
+ADR 0023 renumbered→0029 here). ALL CAPTURED NITS N1–N14 CLOSED —
+awaiting Martin's next re-test round.
 
 Captured verbatim-in-spirit from his post-Phase-7 testing; root causes
 investigated before triage. Batch polish pass runs against this list.
@@ -108,7 +111,7 @@ it stays until the Σ affordance is clicked again (per-grid session-only UI
 state, not persisted). Configured aggregates keep the always-visible row
 (no jump — it is always present). This also structurally fixes N7.
 
-## N10 — descend INTO a sub-grid (caret navigation from edit mode)  [batch 4]
+## N10 — descend INTO a sub-grid (caret navigation from edit mode)  [FIXED — batch 4, c762fcd]
 Martin's ruling (final, Jul 7): **Enter on a selected cell ALWAYS enters
 edit mode** — never descends (a cell can host anything, including MULTIPLE
 grids, so "descend on Enter" would be ill-defined). The ladder strictly
@@ -121,7 +124,7 @@ cells, Enter edits a sub-grid cell — recursion. Esc keeps the shipped
 batch-2 behavior (sub-grid selection → host CELL selection; Esc is "get
 me out", it may collapse rungs).
 
-## N11 — seam selection should be cell-scoped, not column-scoped  [batch 4]
+## N11 — seam selection should be cell-scoped, not column-scoped  [FIXED — batch 4, c762fcd]
 TreeSheets distinguishes the edge between two CELLS from the edge between
 two COLUMNS. Right from a selected cell currently selects the full-height
 column seam; it should select just the edge between the two adjacent
@@ -134,11 +137,11 @@ column-edge highlight leaves "which cell gets my typing?" unclear).
 (Ragged per-row cell insertion = possible follow-up, tree geometry allows
 it — ask Martin before building that.)
 
-## N12 — click should SELECT a cell, not enter edit mode  [batch 4]
+## N12 — click should SELECT a cell, not enter edit mode  [FIXED — batch 4, c762fcd; ADR 0025 amended]
 Single click currently enters edit mode. TreeSheets-style ruling: click →
 select mode (edit is one Enter away); double-click → edit directly.
 
-## N13 — multi-cell selection via mouse  [batch 4 — SCOPED DOWN by Martin]
+## N13 — multi-cell selection via mouse  [FIXED (scoped) — batch 4, c762fcd; drag + shift-click ranges, shortcuts in help; keyboard suite awaits Martin's re-review]
 Martin: "currently no multi-cell selection via either mouse or keyboard".
 Code says keyboard ranges EXIST (Shift+Arrows extend, Shift+Space rows,
 Ctrl+Space cols, Ctrl+A all, Ctrl+C/X copy/cut, Ctrl+D/R fill, a paste
@@ -149,7 +152,7 @@ on a cell + drag = range, keyboard anchor model) + N12 + surfacing the
 existing bindings in the shortcuts help; deep verification of the
 keyboard suite waits for his re-review.
 
-## N14 — board card drag fights outline multi-block selection  [batch 4]
+## N14 — board card drag fights outline multi-block selection  [FIXED — batch 4, c762fcd]
 Dragging a kanban card also drives the outline's multi-block (blue)
 selection — mousedown+move on a card must not start outline block
 selection. Suppress outline selection while a card drag is in progress
