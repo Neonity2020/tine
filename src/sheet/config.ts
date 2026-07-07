@@ -21,6 +21,14 @@ function parseColWidths(value: string): ReadonlyMap<number, number> {
   return out;
 }
 
+export function serializeColWidths(widths: ReadonlyMap<number, number>): string {
+  return [...widths.entries()]
+    .filter(([col, px]) => Number.isInteger(col) && col >= 0 && Number.isFinite(px) && px >= 0)
+    .sort(([a], [b]) => a - b)
+    .map(([col, px]) => `${col}=${Math.round(px)}`)
+    .join(";");
+}
+
 export function sheetConfig(props: readonly [string, string][]): SheetConfig {
   let view: SheetView | null = null;
   let header = false;

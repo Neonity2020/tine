@@ -5,11 +5,13 @@ import { Block } from "./Block";
 import { initParser } from "../render/parse";
 import {
   doc,
+  blockProperty,
   hasSelection,
   isSelected,
   resetStore,
   selectBlock,
   setDoc,
+  undo,
   type FeedPage,
   type Node as StoreNode,
 } from "../store";
@@ -61,7 +63,7 @@ function loadSheetDoc() {
   setDoc({
     byId: {
       before: node("before", "Before", null),
-      grid: node("grid", "Grid parent\ntine.view:: grid", null, ["r1", "r2"]),
+      grid: node("grid", "Grid parent\ntine.view:: grid\ntine.col-widths:: 0=120;1=80", null, ["r1", "r2"]),
       r1: node("r1", "", "grid", ["c1", "c2"]),
       c1: node("c1", "Alpha", "r1"),
       c2: node("c2", "Beta", "r1"),
@@ -164,7 +166,7 @@ describe("SheetGrid interaction", () => {
 
     stubCaretRange(null);
     mouseDown(cell(root, 0, 1));
-    expect(cellSel()).toEqual({ gridId: "grid", row: 0, col: 1 });
+    expect(cellSel()).toEqual({ kind: "cell", gridId: "grid", row: 0, col: 1 });
     expect(cell(root, 0, 1).classList.contains("sheet-cell-selected")).toBe(true);
     expect(editingId()).toBeNull();
 
@@ -189,7 +191,7 @@ describe("SheetGrid interaction", () => {
     await tick();
 
     expect(editingId()).toBeNull();
-    expect(cellSel()).toEqual({ gridId: "grid", row: 0, col: 0 });
+    expect(cellSel()).toEqual({ kind: "cell", gridId: "grid", row: 0, col: 0 });
     expect(cell(root, 0, 0).classList.contains("sheet-cell-selected")).toBe(true);
 
     keydown(window, "Escape");
@@ -201,24 +203,38 @@ describe("SheetGrid interaction", () => {
     dispose();
   });
 
-  it("moves selection with arrows, including holes, and flows out vertically", () => {
+  it("moves selection with arrows through seams, including holes, and flows out vertically", async () => {
     const { root, dispose } = setup();
 
     setCellSel({ gridId: "grid", row: 0, col: 0 });
     keydown(window, "ArrowRight");
-    expect(cellSel()).toEqual({ gridId: "grid", row: 0, col: 1 });
+    expect(cellSel()).toEqual({ kind: "col-seam", gridId: "grid", at: 1, row: 0 });
+    await tick();
+    expect(root.querySelector(".sheet-seam-selected")).not.toBeNull();
+
+    keydown(window, "ArrowRight");
+    expect(cellSel()).toEqual({ kind: "cell", gridId: "grid", row: 0, col: 1 });
 
     keydown(window, "ArrowDown");
-    expect(cellSel()).toEqual({ gridId: "grid", row: 1, col: 1 });
+    expect(cellSel()).toEqual({ kind: "row-seam", gridId: "grid", at: 1, col: 1 });
+
+    keydown(window, "ArrowDown");
+    expect(cellSel()).toEqual({ kind: "cell", gridId: "grid", row: 1, col: 1 });
     expect(cell(root, 1, 1).classList.contains("sheet-hole")).toBe(true);
     expect(selectedCell(root)).toBe(cell(root, 1, 1));
 
     setCellSel({ gridId: "grid", row: 0, col: 0 });
     keydown(window, "ArrowUp");
+    expect(cellSel()).toEqual({ kind: "row-seam", gridId: "grid", at: 0, col: 0 });
+
+    keydown(window, "ArrowUp");
     expect(cellSel()).toBeNull();
     expect(isSelected("before")).toBe(true);
 
     setCellSel({ gridId: "grid", row: 1, col: 0 });
+    keydown(window, "ArrowDown");
+    expect(cellSel()).toEqual({ kind: "row-seam", gridId: "grid", at: 2, col: 0 });
+
     keydown(window, "ArrowDown");
     expect(cellSel()).toBeNull();
     expect(isSelected("after")).toBe(true);
@@ -231,15 +247,15 @@ describe("SheetGrid interaction", () => {
 
     setCellSel({ gridId: "grid", row: 0, col: 1 });
     keydown(window, "Tab");
-    expect(cellSel()).toEqual({ gridId: "grid", row: 1, col: 0 });
+    expect(cellSel()).toEqual({ kind: "cell", gridId: "grid", row: 1, col: 0 });
     expect(selectedCell(root)).toBe(cell(root, 1, 0));
 
     keydown(window, "Tab", { shiftKey: true });
-    expect(cellSel()).toEqual({ gridId: "grid", row: 0, col: 1 });
+    expect(cellSel()).toEqual({ kind: "cell", gridId: "grid", row: 0, col: 1 });
 
     setCellSel({ gridId: "grid", row: 0, col: 0 });
     keydown(window, "Tab", { shiftKey: true });
-    expect(cellSel()).toEqual({ gridId: "grid", row: 0, col: 0 });
+    expect(cellSel()).toEqual({ kind: "cell", gridId: "grid", row: 0, col: 0 });
 
     dispose();
   });
@@ -261,7 +277,7 @@ describe("SheetGrid interaction", () => {
     await tick();
 
     expect(editingId()).toBeNull();
-    expect(cellSel()).toEqual({ gridId: "grid", row: 0, col: 0 });
+    expect(cellSel()).toEqual({ kind: "cell", gridId: "grid", row: 0, col: 0 });
     expect(childrenSnapshot()).toEqual(beforeChildren);
     expect(Object.keys(doc.byId).sort()).toEqual(Object.keys(beforeRaws).sort());
     for (const [id, raw] of Object.entries(beforeRaws)) {
@@ -272,17 +288,86 @@ describe("SheetGrid interaction", () => {
     dispose();
   });
 
+  it("typing on a row seam inserts a row and mounts the editor", async () => {
+    const { root, dispose } = setup();
+    const before = doc.byId.grid.children.length;
+
+    setCellSel({ kind: "row-seam", gridId: "grid", at: 1, col: 0 });
+    keydown(window, "N");
+    await tick();
+    await tick();
+
+    expect(doc.byId.grid.children).toHaveLength(before + 1);
+    const rowId = doc.byId.grid.children[1];
+    const cellId = doc.byId[rowId].children[0];
+    expect(editingId()).toBe(cellId);
+    expect(activeEditor(root).value).toBe("N");
+    expect(doc.byId[cellId].raw).toBe("N");
+
+    dispose();
+  });
+
+  it("Backspace on a row seam deletes the row before it and one undo restores it", () => {
+    const { dispose } = setup();
+
+    setCellSel({ kind: "row-seam", gridId: "grid", at: 1, col: 0 });
+    keydown(window, "Backspace");
+
+    expect(doc.byId.grid.children).toEqual(["r2"]);
+    expect(doc.byId.r1).toBeUndefined();
+
+    undo();
+    expect(doc.byId.grid.children).toEqual(["r1", "r2"]);
+    expect(doc.byId.r1.children).toEqual(["c1", "c2"]);
+
+    dispose();
+  });
+
+  it("typing on a hole materializes exactly the missing cells", async () => {
+    const { root, dispose } = setup();
+
+    setCellSel({ gridId: "grid", row: 1, col: 1 });
+    keydown(window, "H");
+    await tick();
+    await tick();
+
+    expect(doc.byId.r2.children).toHaveLength(2);
+    const made = doc.byId.r2.children[1];
+    expect(editingId()).toBe(made);
+    expect(activeEditor(root).value).toBe("H");
+    expect(doc.byId[made].raw).toBe("H");
+
+    dispose();
+  });
+
+  it("typing on a column seam inserts a column and shifts col-width keys", async () => {
+    const { root, dispose } = setup();
+
+    setCellSel({ kind: "col-seam", gridId: "grid", at: 1, row: 0 });
+    keydown(window, "C");
+    await tick();
+    await tick();
+
+    expect(doc.byId.r1.children).toHaveLength(3);
+    const made = doc.byId.r1.children[1];
+    expect(editingId()).toBe(made);
+    expect(activeEditor(root).value).toBe("C");
+    expect(blockProperty("grid", "tine.col-widths")).toBe("0=120;2=80");
+
+    dispose();
+  });
+
   it("outline Enter and ArrowRight enter the selected grid block", () => {
     const { dispose } = setup();
 
     selectBlock("grid");
     keydown(window, "Enter");
-    expect(cellSel()).toEqual({ gridId: "grid", row: 0, col: 0 });
+    expect(cellSel()).toEqual({ kind: "cell", gridId: "grid", row: 0, col: 0 });
 
     setCellSel(null);
     selectBlock("grid");
     keydown(window, "ArrowRight");
-    expect(cellSel()).toEqual({ gridId: "grid", row: 0, col: 0 });
+    expect(cellSel()).toEqual({ kind: "cell", gridId: "grid", row: 0, col: 0 });
 
     dispose();
   });

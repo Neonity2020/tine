@@ -30,7 +30,7 @@ describe("cell selection state", () => {
 
     setCellSel({ gridId: "grid-a", row: 1, col: 2 });
 
-    expect(cellSel()).toEqual({ gridId: "grid-a", row: 1, col: 2 });
+    expect(cellSel()).toEqual({ kind: "cell", gridId: "grid-a", row: 1, col: 2 });
     expect(lastCellFor("grid-a")).toEqual({ row: 1, col: 2 });
     expect(clearOutlineSelection).toHaveBeenCalledTimes(1);
     expect(endActiveEdit).toHaveBeenCalledTimes(1);
@@ -63,7 +63,7 @@ describe("cell selection state", () => {
 
     setCellSel({ gridId: "grid-a", row: 0, col: 1 });
     startEditing("cell-block", 0, "sheet:grid-a:0:1");
-    expect(cellSel()).toEqual({ gridId: "grid-a", row: 0, col: 1 });
+    expect(cellSel()).toEqual({ kind: "cell", gridId: "grid-a", row: 0, col: 1 });
 
     startEditing("outline-block", 0, null);
     expect(cellSel()).toBeNull();

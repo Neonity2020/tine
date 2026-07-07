@@ -7,6 +7,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 const PORT = 5196;
 const OUT = "/tmp/shot-sheets.png";
 const OUT_SEL = "/tmp/shot-sheets-sel.png";
+const OUT_SEAM = "/tmp/shot-sheets-seam.png";
 
 const server = spawn("npx", ["vite", "preview", "--port", String(PORT), "--strictPort"], {
   stdio: "ignore",
@@ -58,7 +59,12 @@ try {
   await sleep(250);
   await page.screenshot({ path: OUT_SEL, fullPage: true });
 
-  console.log(errors.length ? "ERRORS:\n" + errors.join("\n") : `wrote ${OUT} and ${OUT_SEL}`);
+  await page.keyboard.press("ArrowRight");
+  await page.waitForSelector(".block-sheet-container > .sheet-grid > .sheet-seam-selected", { timeout: 3000 });
+  await sleep(250);
+  await page.screenshot({ path: OUT_SEAM, fullPage: true });
+
+  console.log(errors.length ? "ERRORS:\n" + errors.join("\n") : `wrote ${OUT}, ${OUT_SEL}, and ${OUT_SEAM}`);
   await browser.close();
   server.kill("SIGKILL");
   process.exit(errors.length ? 1 : 0);

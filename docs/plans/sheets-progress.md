@@ -87,8 +87,23 @@ to `~/research/tine`. Martin is unavailable for testing.
         `beforeAll(initParser())` in store/config tests. Verified: npm test
         45+16 files green, tsc clean, both screenshots eyeballed (selection
         ring on a hole cell).
-  - [ ] **2b — seams** (insert/delete rows+cols, hole materialization,
-        col-width drag-resize; first structural mutations → `withUndoUnit`)
+  - [x] **2b — seams** — DONE Jul 7 2026 (codex + orchestrator fix).
+        `withUndoUnit(tag, pages, fn)` in store.ts (one snapshot, nested pushes
+        suppressed, rollback-on-throw, nested units join — unit-tested);
+        `insertEmptyChildBlock` keeps produce-surgery inside store.ts;
+        `src/sheet/mutations.ts` orchestrates insertRow/deleteRow/insertColumn/
+        deleteColumn/materializeCell/setColumnWidth — column ops rewrite
+        `tine.col-widths` indices in the SAME unit; `serializeColWidths` lives
+        beside `parseColWidths` (one grammar owner). Seam selection (`SheetSel`
+        row-seam/col-seam + companion index), arrow-stepping cell→seam→cell
+        (module const `SEAM_STEPPING`, boundary seams then flow-out), type/
+        Enter-on-seam inserts + edits, Backspace/Delete delete before/after,
+        pointer seam click (±3px ruling hit) + column drag-resize (live
+        preview, one property write on pointerup, dbl-click clears width).
+        **Orchestrator fix:** boundary seams painted nothing — positioned
+        exactly on the `.sheet-grid` overflow-clip edge; clamped into the
+        content box (`seamStyleFor`). Verified: npm test 46+16 files green,
+        tsc, interact tests 10/10, seam bar eyeballed in the cropped shot.
   - [ ] **2c — range select, Ctrl+arrow content move, fill, TSV/indented clipboard**
 - [ ] **Phase 3 — field-keyed table + query rowSource + task kanban** (showcase)
 - [ ] **Phase 4 — Hierarchify/Flatten + board + aggregates**

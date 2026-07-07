@@ -661,6 +661,7 @@ type UndoEntry = SnapEntry | RawEntry;
 const undoStack: UndoEntry[] = [];
 let redoStack: UndoEntry[] = [];
 let lastUndoTag: string | null = null;
+let undoSuppressionDepth = 0;
 
 /** Discard all undo/redo history. Called on graph switch/reset so old-graph
  *  snapshots can't be replayed into a different graph. */
@@ -668,6 +669,7 @@ export function clearUndoHistory() {
   undoStack.length = 0;
   redoStack = [];
   lastUndoTag = null;
+  undoSuppressionDepth = 0;
 }
 
 /** Does an undo entry reference page `name`? A raw entry by its `page`; a snap
@@ -742,6 +744,7 @@ function snapEntry(affected?: string[] | null): SnapEntry {
  *  op changes, including a cross-page move's source AND destination, or undo
  *  would miss a page. `tag` resets the typing-coalesce marker. */
 function pushUndo(tag: string, affected?: string[]) {
+  if (undoSuppressionDepth > 0) return;
   undoStack.push(snapEntry(affected));
   if (undoStack.length > 200) undoStack.shift();
   redoStack = [];
@@ -751,6 +754,7 @@ function pushUndo(tag: string, affected?: string[]) {
 /** Record an O(1) inverse patch for a single-block text edit (typing). A typing
  *  burst in one block coalesces to a single entry holding the pre-burst text. */
 function pushRawUndo(id: string, prevRaw: string) {
+  if (undoSuppressionDepth > 0) return;
   const tag = `type:${id}`;
   if (tag === lastUndoTag) return; // mid-burst: keep the first (pre-burst) raw
   undoStack.push({ kind: "raw", id, raw: prevRaw, page: doc.byId[id].page });
@@ -810,6 +814,30 @@ function applyEntry(e: UndoEntry): UndoEntry {
   return inverse;
 }
 
+export function withUndoUnit<T>(tag: string, pages: string[], fn: () => T): T {
+  if (undoSuppressionDepth > 0) return fn();
+
+  const undoBefore = undoStack.slice();
+  const redoBefore = redoStack.slice();
+  const tagBefore = lastUndoTag;
+  pushUndo(tag, pages);
+  undoSuppressionDepth++;
+  try {
+    return fn();
+  } catch (err) {
+    undoSuppressionDepth--;
+    const entry = undoStack[undoStack.length - 1];
+    if (entry) applyEntry(entry);
+    undoStack.length = 0;
+    undoStack.push(...undoBefore);
+    redoStack = redoBefore;
+    lastUndoTag = tagBefore;
+    throw err;
+  } finally {
+    if (undoSuppressionDepth > 0) undoSuppressionDepth--;
+  }
+}
+
 export function undo() {
   if (!undoStack.length) return;
   redoStack.push(applyEntry(undoStack.pop()!));
@@ -845,6 +873,22 @@ export function setRaw(id: string, raw: string, opts?: { timetracking?: boolean 
   pushRawUndo(id, prev);
   setDoc("byId", id, "raw", next);
   markDirty(doc.byId[id].page);
+}
+
+export function insertEmptyChildBlock(parentId: string, at: number): string | null {
+  const parent = doc.byId[parentId];
+  if (!parent || at < 0 || at > parent.children.length) return null;
+  pushUndo(`insert-child:${parentId}`, [parent.page]);
+  const id = freshId();
+  const pageName = parent.page;
+  setDoc(
+    produce((s) => {
+      s.byId[id] = { id, raw: "", collapsed: false, parent: parentId, page: pageName, children: [] };
+      s.byId[parentId].children.splice(at, 0, id);
+    })
+  );
+  markDirty(pageName);
+  return id;
 }
 
 /** Enter: split the block at `offset`. Built-in `id::`/`collapsed::` props are

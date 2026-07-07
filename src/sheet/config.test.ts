@@ -1,5 +1,5 @@
 import { beforeAll, describe, expect, it } from "vitest";
-import { sheetConfig, sheetConfigFromRaw } from "./config";
+import { serializeColWidths, sheetConfig, sheetConfigFromRaw } from "./config";
 import { initParser } from "../render/parse";
 
 // sheetConfigFromRaw reads properties through the one lsdoc-backed recognizer
@@ -47,6 +47,11 @@ describe("sheetConfig", () => {
       [2, 88],
       [4, 0],
     ]);
+  });
+
+  it("serializes positional column widths in the parser-owned grammar", () => {
+    expect(serializeColWidths(new Map([[2, 88], [0, 120]]))).toBe("0=120;2=88");
+    expect(serializeColWidths(new Map([[1, 40.4], [-1, 20], [3, Number.NaN]]))).toBe("1=40");
   });
 
   it("ignores non-tine properties", () => {

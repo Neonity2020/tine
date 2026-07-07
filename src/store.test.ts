@@ -48,6 +48,7 @@ import {
   blockSubtreeMarkdown,
   selectionMarkdown,
   toggleListItemAtIndex,
+  withUndoUnit,
 } from "./store";
 import { editingId, startEditing, takeCaretFor } from "./editorController";
 import { exportOutline, DEFAULT_EXPORT_OPTIONS } from "./editor/exportText";
@@ -809,6 +810,57 @@ describe("undo / redo", () => {
     expect(shape()).toEqual([["first", [["second"]]]]);
     undo();
     expect(shape()).toEqual([["first"], ["second"]]);
+  });
+
+  it("withUndoUnit coalesces multiple raw edits into one undo step", () => {
+    const dto = load([blk("one"), blk("two")]);
+    const [a, b] = dto.blocks;
+
+    withUndoUnit("composite", ["Test"], () => {
+      setRaw(a.id, "ONE");
+      setRaw(b.id, "TWO");
+    });
+
+    expect(doc.byId[a.id].raw).toBe("ONE");
+    expect(doc.byId[b.id].raw).toBe("TWO");
+
+    undo();
+    expect(doc.byId[a.id].raw).toBe("one");
+    expect(doc.byId[b.id].raw).toBe("two");
+  });
+
+  it("withUndoUnit rolls back a throwing composite and leaves no undo entry", () => {
+    const dto = load([blk("one"), blk("two")]);
+    const [a, b] = dto.blocks;
+
+    expect(() =>
+      withUndoUnit("throwing", ["Test"], () => {
+        setRaw(a.id, "ONE");
+        setRaw(b.id, "TWO");
+        throw new Error("boom");
+      })
+    ).toThrow("boom");
+
+    expect(doc.byId[a.id].raw).toBe("one");
+    expect(doc.byId[b.id].raw).toBe("two");
+    undo();
+    expect(doc.byId[a.id].raw).toBe("one");
+    expect(doc.byId[b.id].raw).toBe("two");
+  });
+
+  it("withUndoUnit redo works after undo", () => {
+    const dto = load([blk("one"), blk("two")]);
+    const [a, b] = dto.blocks;
+
+    withUndoUnit("composite", ["Test"], () => {
+      setRaw(a.id, "ONE");
+      setRaw(b.id, "TWO");
+    });
+
+    undo();
+    redo();
+    expect(doc.byId[a.id].raw).toBe("ONE");
+    expect(doc.byId[b.id].raw).toBe("TWO");
   });
 });
 

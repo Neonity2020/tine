@@ -3738,6 +3738,10 @@ body.file-drop-active::after {
   background: var(--border-color);
   border: 1px solid var(--border-color);
   overflow: auto;
+  position: relative;
+}
+.sheet-grid-resizing {
+  cursor: col-resize;
 }
 .sheet-cell {
   min-width: 48px;
@@ -3755,6 +3759,13 @@ body.file-drop-active::after {
     inset 0 0 0 2px var(--accent, #4c8bf5),
     inset 0 0 0 3px color-mix(in srgb, var(--bg-primary) 85%, transparent);
   z-index: 1;
+}
+.sheet-seam-selected {
+  position: absolute;
+  z-index: 3;
+  background: var(--accent, #4c8bf5);
+  border-radius: 1px;
+  pointer-events: none;
 }
 .sheet-cell-body:empty {
   min-height: 1.45em;
