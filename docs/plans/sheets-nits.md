@@ -11,9 +11,12 @@ mount-time mismeasure needed a bounded verify loop, not just delayed
 re-measures; probe passes 3/3). Known limitation: nested sub-grids have
 no corner Σ, so sub-grid aggregates are currently unreachable (tolerable;
 revisit on request). NEXT = master→sheets merge (Martin green-lit), then
-batch 4 (N10–N14) SHIPPED `c762fcd`; master merge `60663d5` done. ROUND 2
-(Jul 7 night, 4 screenshots) = N15–N22 below, batch 5 spec at
-`subagent-tasks/sheets-nits-batch5-round2.md`.
+batch 4 (N10–N14) SHIPPED `c762fcd`; master merge `60663d5` done. ROUND 2 (N15–N22) SHIPPED
+`33e0f0a` (batch 5; orchestrator additions: the REAL ghost-board gate —
+codex's fixed a strawman — plus two breakout-measure bugs: parity
+oscillation from reading the shifted margin, and parent-padding offset on
+the macro path; e2e = 39 checks). ALL N1–N22 CLOSED — awaiting Martin's
+round 3.
 
 Captured verbatim-in-spirit from his post-Phase-7 testing; root causes
 investigated before triage. Batch polish pass runs against this list.
@@ -163,7 +166,7 @@ or whenever master lands editor/caret/mousedown work that touches shared
 code. Full gates + sheets e2e after every such merge. First merge: after
 batch 3 lands.
 
-## N15 — query-board justification still a mess  [batch 5]
+## N15 — query-board justification still a mess  [FIXED — batch 5, 33e0f0a]
 Round 2 (Jul 7 night, screenshot): the §4 query kanban overflows past the
 window's right edge, uncentered, no scrollbar. ROOT CAUSE (confirmed in
 code): macro-rendered query sheets (Macro.tsx:481/484) are NOT wrapped in
@@ -171,7 +174,7 @@ SheetContainer — they never got the breakout/centering/scroll treatment
 that children-source sheets got in batches 1/3. Fix: same wrapper for the
 macro path.
 
-## N15b — ghost empty kanban under the query board  [batch 5]
+## N15b — ghost empty kanban under the query board  [FIXED — batch 5, 33e0f0a — orchestrator: codex's detectMacro gate missed the REAL shape (heading + {{query}} + props in ONE block, the drifted §4 demo); replaced with a body-CONTAINS-query-macro gate; necessity-proven via pre-fix worktree (2 boards → 1)]
 Martin: "what is the third empty kanban under the working one?" ROOT
 CAUSE (confirmed): the query block renders TWICE — the macro path renders
 the query board, and Block.tsx's children-Switch ALSO fires (sheet().view
@@ -179,7 +182,7 @@ the query board, and Block.tsx's children-Switch ALSO fires (sheet().view
 empty LATER/NOW/DONE columns. Fix: gate the children-sheet Match arms on
 the block body NOT being a macro (detectMacro).
 
-## N16 — hover scrollbars obscure content incl. the Σ  [batch 5]
+## N16 — hover scrollbars obscure content incl. the Σ  [FIXED — batch 5, 33e0f0a — .sheet-scroll restructure, zero outer overflow]
 Tables show tiny vertical+horizontal scrollbars on hover that obscure
 content; Martin couldn't click the Σ at all (WebKitGTK scrollbars are
 fatter than my Chromium probe's). ROOT CAUSE: the corner Σ toggle sits at
@@ -189,7 +192,7 @@ scrollable overflow on both axes. Fix: restructure — outer
 .sheet-scroll (the ONE scroll region) > face; corner overlay lives in the
 outer. Zero overflow when content fits → no scrollbars at all.
 
-## N17 — tag board: last card leaves → column vanishes; want add-column  [batch 5]
+## N17 — tag board: last card leaves → column vanishes; want add-column  [FIXED — batch 5, 33e0f0a — session-only + new tag column]
 Correct but unexpected. Martin's fix (agreed): an "add column" affordance
 on tag boards = add a new tag. Design: ghost "+ new tag" column at the
 right end; click → inline name input → creates a session-local empty
@@ -197,7 +200,7 @@ column (a tag exists on disk only via cards, so the empty column lives in
 UI state until a card is dropped/created in it — same pin-style session
 map as the Σ toggle).
 
-## N18 — click-select landed inconsistently; select+edit at once; shake  [batch 5]
+## N18 — click-select landed inconsistently; select+edit at once; shake  [FIXED — batch 5, 33e0f0a — single pointer entry]
 In §1's grid: clicking a first-column cell still enters EDIT mode;
 clicking a second-column cell yields BOTH select highlight AND a caret,
 and the table "shakes" left-right. Batch 4's pointerSelection did not
@@ -206,14 +209,14 @@ fires (double-handling). Fix: ONE pointer entry for all cell mousedowns
 (pointerSelection), kill/route the legacy handlers, double-click = edit.
 The shake is N19's width instability triggered by the spurious edit.
 
-## N19 — column width must not change select↔edit  [batch 5]
+## N19 — column width must not change select↔edit  [FIXED — batch 5, 33e0f0a — widths frozen across edit sessions]
 The column renders wider when a cell is in edit mode than in select mode.
 Martin's rule: the table NEVER moves while navigating or entering edit;
 only actual content changes may reflow. Fix: freeze effective column
 widths for the duration of an edit session (or make the editor fit the
 cell's existing box) — no max-content re-measure from editor mounting.
 
-## N20 — sub-grid descent selects the wrong edge  [batch 5]
+## N20 — sub-grid descent selects the wrong edge  [FIXED — batch 5, 33e0f0a]
 Down from edit of the host cell ("inner grid in this cell", caret in
 text) should select the SUB-GRID's TOP edge; Martin observes the HOST
 cell's bottom edge instead ("that edge should be selectable when I am in
@@ -221,7 +224,7 @@ select mode of the outer grid" — it belongs to the outer grid). Reproduce
 in the §2 demo, find why selectTopRowSeamAfterEdit lands on the wrong
 grid/edge (or renders as if it did), fix + component test.
 
-## N21 — seam ladder broken/incorrectly rendered in grids  [batch 5]
+## N21 — seam ladder broken/incorrectly rendered in grids  [FIXED — batch 5, 33e0f0a — cell/seam alternation, cell-scoped segments, no dead states]
 From Sweet (§1, row Apples|Sweet|12|30Kč): ArrowLeft selects the WHOLE
 Product|Taste column edge (should be only the Apples|Sweet edge segment
 in Sweet's row — the cell-scoped rendering shipped in batch 4 is not
@@ -231,7 +234,7 @@ Left selects the grid's leftmost whole edge. Expected ladder
 seam(grid left edge, that row) → stop. Reproduce, fix model + rendering,
 selection tests + e2e.
 
-## N22 — the two "+" chips need a real design  [batch 5 — proposal accepted-pending-Martin]
+## N22 — the two "+" chips need a real design  [FIXED — batch 5, 33e0f0a — ghost add-column header + add-row row, zero layout shift]
 Tooltips explain them but "better design is called for; think about it."
 PROPOSAL (implementing unless Martin objects): Notion-style ghosts —
 "add column" = a ghost header cell at the far right of the header row
