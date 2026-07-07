@@ -1,5 +1,6 @@
 import {
   blockIsGridView,
+  blockPageReadOnly,
   blockProperty,
   deleteBlock,
   doc,
@@ -306,6 +307,7 @@ export function setColumnWidth(gridId: string, col: number, px: number | null): 
 export function setColumnAggregate(ownerId: string, key: string, fn: AggregateFn | null): void {
   const node = doc.byId[ownerId];
   if (!node || !key.trim()) return;
+  if (blockPageReadOnly(ownerId)) return; // review finding: footer bypassed the gridPage gate
   withUndoUnit("sheet:column-aggregate", [node.page], () => {
     const next = new Map(colAggregates(ownerId));
     if (fn) next.set(key, fn);

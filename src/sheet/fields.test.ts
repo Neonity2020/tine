@@ -175,6 +175,17 @@ describe("writeTagDelta", () => {
     expect(doc.byId.a.raw).toBe("Start");
   });
 
+  it("removes every first-line occurrence of a duplicated tag", () => {
+    // review finding: a single cut returned true with the tag still present
+    loadOne("#a foo #a bar");
+    expect(writeTagDelta("a", { remove: "a" })).toBe(true);
+    expect(doc.byId.a.raw).toBe("foo bar");
+
+    loadOne("x #b #[[b]] y");
+    expect(writeTagDelta("a", { remove: "b" })).toBe(true);
+    expect(doc.byId.a.raw).toBe("x y");
+  });
+
   it("refuses to remove a tag that exists only below the first line", () => {
     loadOne("Title\nBody #alpha");
     expect(writeTagDelta("a", { remove: "alpha" })).toBe(false);

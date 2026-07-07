@@ -41,7 +41,7 @@ import {
   type FieldValue,
 } from "../sheet/fields";
 import { parseFields, serializeFields, sheetConfig, type FieldSpec, type FieldType } from "../sheet/config";
-import { isPlainDecimalNumber } from "../sheet/typed";
+import { isPlainDecimalNumber, parseIsoDateLike } from "../sheet/typed";
 import { openActionContextMenu, openDatePicker, openSheetCellContextMenu, openSheetContextMenu, type ContextMenuAction } from "../ui";
 import { blockBackgroundColor } from "../blockColors";
 import type { BlockDto, RefGroup } from "../types";
@@ -904,14 +904,5 @@ function isEnumFieldType(type: FieldType | undefined): type is { enum: readonly 
 }
 
 function validDateLike(value: string): boolean {
-  const m = /^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2}))?$/.exec(value);
-  if (!m) return false;
-  const y = Number(m[1]);
-  const mo = Number(m[2]);
-  const d = Number(m[3]);
-  const hh = m[4] == null ? 0 : Number(m[4]);
-  const mm = m[5] == null ? 0 : Number(m[5]);
-  if (mo < 1 || mo > 12 || hh > 23 || mm > 59) return false;
-  const dt = new Date(Date.UTC(y, mo - 1, d, hh, mm));
-  return dt.getUTCFullYear() === y && dt.getUTCMonth() === mo - 1 && dt.getUTCDate() === d;
+  return parseIsoDateLike(value) !== null;
 }

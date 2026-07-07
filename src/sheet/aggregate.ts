@@ -1,4 +1,5 @@
 import type { FieldValue } from "./fields";
+import { isoDatePrefix } from "./typed";
 
 export type AggregateFn =
   | "sum"
@@ -93,9 +94,9 @@ function dateValues(values: readonly (FieldValue | string | null | undefined)[])
   let numericNonDates = 0;
   for (const value of values) {
     const text = textOf(value).trim();
-    const m = /^<?(\d{4}-\d{2}-\d{2})/.exec(text);
-    if (m) {
-      dates.push(m[1]);
+    const iso = isoDatePrefix(text);
+    if (iso) {
+      dates.push(iso);
     } else {
       if (Number.isFinite(parseFloat(text))) numericNonDates++;
       skipped++;

@@ -2,6 +2,7 @@ import { For, Show, createMemo, createSignal, onCleanup, onMount, type JSX } fro
 import { datePicker, closeDatePicker, firstDayOfWeek, type DatePickerTarget } from "../ui";
 import { readSchedule, setSchedule } from "../store";
 import { fieldLabel, readField, writeField, type FieldId } from "../sheet/fields";
+import { parseIsoDateLike } from "../sheet/typed";
 
 const MONTHS = [
   "January", "February", "March", "April", "May", "June",
@@ -37,23 +38,9 @@ function isScheduleTarget(which: DatePickerTarget): which is "scheduled" | "dead
   return which === "scheduled" || which === "deadline";
 }
 
-function parseIsoDate(value: string): { y: number; m: number; d: number; time: string | null } | null {
-  const m = /^\s*(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2}))?\s*$/.exec(value);
-  if (!m) return null;
-  const y = Number(m[1]);
-  const mo = Number(m[2]);
-  const d = Number(m[3]);
-  const hh = m[4] == null ? 0 : Number(m[4]);
-  const mm = m[5] == null ? 0 : Number(m[5]);
-  if (mo < 1 || mo > 12 || hh > 23 || mm > 59) return null;
-  const dt = new Date(Date.UTC(y, mo - 1, d, hh, mm));
-  if (dt.getUTCFullYear() !== y || dt.getUTCMonth() !== mo - 1 || dt.getUTCDate() !== d) return null;
-  return { y, m: mo - 1, d, time: m[4] == null ? null : `${m[4]}:${m[5]}` };
-}
-
 function propDateSelection(bid: string, field: FieldId): { y: number; m: number; d: number; time: string | null } | null {
   const value = readField(bid, field)?.raw ?? "";
-  return parseIsoDate(value);
+  return parseIsoDateLike(value);
 }
 
 function Picker(props: { bid: string; which: DatePickerTarget; x: number; y: number }): JSX.Element {

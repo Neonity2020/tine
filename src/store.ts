@@ -1123,6 +1123,10 @@ export function mergeWithPrev(id: string): boolean {
  *  Returns the last top-level inserted block id (to focus). */
 export function insertOutlineAfter(afterId: string, nodes: OutlineNode[]): string {
   if (!nodes.length) return afterId;
+  // Read-only gate at the choke point — file drops (and any future caller)
+  // must not mutate a page the round-trip self-check marked read-only
+  // (Phase-6 review finding, validated).
+  if (blockPageReadOnly(afterId)) return afterId;
   pushUndo("paste", [doc.byId[afterId].page]);
   const parent = doc.byId[afterId].parent;
   const pageName = doc.byId[afterId].page;
@@ -1191,18 +1195,21 @@ async function captureOutlineInto(name: string, kind: PageKind, nodes: OutlineNo
   } else {
     // Empty (or brand-new) page: seed an empty anchor root, append after it, then
     // drop the anchor — reuses insertOutlineAfter's subtree creation rather than a
-    // bespoke root builder.
-    pushUndo("capture", [name]);
-    const anchor = freshId();
-    setDoc(
-      produce((s) => {
-        s.byId[anchor] = { id: anchor, raw: "", collapsed: false, parent: null, page: name, children: [] };
-        s.pages[s.pages.findIndex((p) => p.name === name)].roots.push(anchor);
-      })
-    );
-    markDirty(name);
-    insertOutlineAfter(anchor, nodes);
-    deleteBlock(anchor);
+    // bespoke root builder. One undo unit: the anchor/insert/delete sequence used
+    // to push three undo entries, so one undo left the anchor + row behind
+    // (Phase-6 review finding, validated).
+    withUndoUnit("capture", [name], () => {
+      const anchor = freshId();
+      setDoc(
+        produce((s) => {
+          s.byId[anchor] = { id: anchor, raw: "", collapsed: false, parent: null, page: name, children: [] };
+          s.pages[s.pages.findIndex((p) => p.name === name)].roots.push(anchor);
+        })
+      );
+      markDirty(name);
+      insertOutlineAfter(anchor, nodes);
+      deleteBlock(anchor);
+    });
   }
   return await flushPage(name);
 }

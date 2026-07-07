@@ -376,12 +376,43 @@ ADR 0026 (schema) + ADR 0027 (tags write-back / tag boards).
   files. E2E re-run on the rebuilt binary: 24 checks ALL PASS. Sample page
   gained a §8 pipe table to convert (round-trip re-validated).
 
+**Phase-6 adversarial review (Jul 7, post-6d)** — two independent
+validating reviewers (codex xhigh + Opus subagent), whole-subsystem scope,
+every finding reproduced by the orchestrator before fixing. ALL FIXED same
+day (regression tests in `src/sheet/review-regressions.test.ts` +
+`fields.test.ts`; e2e re-run ALL PASS):
+- **P1 (codex)**: OS file-drop could mutate READ-ONLY pages —
+  `insertOutlineAfter` had no gate; now refuses at the choke point (covers
+  every caller).
+- **P1 (codex)**: the aggregate footer's `setColumnAggregate` bypassed the
+  `gridPage` read-only gate and wrote `tine.col-aggregates::` onto
+  read-only owners; gated.
+- **P2 (codex)**: tag-page add-row into an EMPTY today journal pushed three
+  undo entries (anchor/insert/delete) — one undo left an empty anchor + the
+  row behind; the empty-page append path is now one `withUndoUnit`.
+- **P2 (opus)**: `writeTagDelta` removed only the FIRST occurrence of a
+  duplicated first-line tag and reported success (board move fails open);
+  now cuts until gone.
+- **P3 (opus)**: four hand-rolled ISO-date recognizers (fields/aggregate/
+  SheetTable/DatePicker) consolidated into `typed.ts`
+  (`parseIsoDateLike`/`isoDatePrefix`) — one-parser rule restored.
+- **P3 (opus)**: `read_text_file` now also canonicalizes and re-checks the
+  extension on the RESOLVED path (symlink named `x.csv` can't dodge the
+  gate).
+Both full reports: `subagent-tasks/notes/sheets-phase6-review-{codex,opus}.md`
+(local). Notable: both P1s were v1-era paths — the whole-subsystem scope
+rule (not diff-only) is what caught them.
+
 **Phase 6 leftovers for a later pass** (deliberate): list chip editor
 (comma-text editing works); enum types are hand-edit-only in the header
 menu; tag columns key by exact string (`#ChoCo`≠`#choco` as columns, though
 removal matches case-insensitively); query-block tables don't inherit a tag
 page's schema (no parsed tag target at the call site); org tags write-back
-(htags-shaped, own decision needed).
+(htags-shaped, own decision needed); lsdoc `\|` table-cell fidelity (escaped
+pipes don't round-trip, so `|`-cells refuse conversion — an lsdoc/oracle
+question, the runtime probe auto-upgrades when fixed); planning
+time-of-day dropped when a SCHEDULED/DEADLINE is rewritten from a sheet
+date cell (needs `setSchedule` time support).
 
 Martin's v1 UX nits are PARKED (his list, not yet captured) — batch later,
 don't interleave.

@@ -9,6 +9,7 @@ import { workflow, timetrackingEnabled, logbookWithSecondSupport } from "../ui";
 import type { Inline } from "../render/ast";
 import { rebulletedSourceByteToRawByte, utf8ByteLength, utf8ByteToUtf16Offset } from "../render/spans";
 import { tagRef } from "../tags";
+import { parseIsoDateLike } from "./typed";
 import type { BlockDto } from "../types";
 
 export type FieldId =
@@ -206,11 +207,6 @@ export function readField(id: string, field: FieldId): FieldValue | null {
   }
 }
 
-function parseDate(value: string): { y: number; m: number; d: number } | null {
-  const m = /^\s*(\d{4})-(\d{2})-(\d{2})/.exec(value);
-  if (!m) return null;
-  return { y: Number(m[1]), m: Number(m[2]) - 1, d: Number(m[3]) };
-}
 
 export function writeField(id: string, field: FieldId, value: string): boolean {
   const n = doc.byId[id];
@@ -249,7 +245,7 @@ export function writeField(id: string, field: FieldId, value: string): boolean {
   }
 
   if (field === "scheduled" || field === "deadline") {
-    const date = trimmed ? parseDate(trimmed) : null;
+    const date = trimmed ? parseIsoDateLike(trimmed) : null;
     if (trimmed && !date) return false;
     setSchedule(id, field, date);
     return true;
@@ -275,9 +271,15 @@ export function writeTagDelta(id: string, delta: { add?: string; remove?: string
 
   let raw = n.raw;
   if (remove) {
-    const next = removeTagFromRaw(raw, remove);
+    // The first line may carry the same tag more than once — cut until gone
+    // (a single cut would return true while the block still carries the tag;
+    // Phase-6 review finding, validated).
+    let next = removeTagFromRaw(raw, remove);
     if (next == null) return false;
-    raw = next;
+    while (next != null) {
+      raw = next;
+      next = removeTagFromRaw(raw, remove);
+    }
   }
 
   if (add && !tagSetHas(facetsOf(raw, "md"), add)) raw = addTagToRaw(raw, add);
