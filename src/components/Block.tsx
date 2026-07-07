@@ -111,6 +111,7 @@ import { forbidsEditEntry } from "../editor/editTargets";
 import { SheetGrid } from "./SheetGrid";
 import { SheetTable } from "./SheetTable";
 import { SheetBoard } from "./SheetBoard";
+import { blockBackgroundColor } from "../blockColors";
 
 // Detect a block whose entire body is a single {{query}} / {{embed}} macro.
 function detectMacro(raw: string): { kind: "query" | "embed"; inner: string } | null {
@@ -124,13 +125,6 @@ function detectMacro(raw: string): { kind: "query" | "embed"; inner: string } | 
 
 // (Rendered-property hidden set lives in render/block.ts as RENDER_HIDDEN_PROPS /
 // isRenderHiddenProp, shared with body.tsx's renderProps.)
-
-// Logseq's built-in block background colors → a soft tint for rendering.
-const BLOCK_BG: Record<string, string> = {
-  yellow: "rgba(251,230,158,0.45)", red: "rgba(245,163,163,0.4)", pink: "rgba(243,176,212,0.4)",
-  green: "rgba(166,227,180,0.4)", blue: "rgba(168,201,240,0.4)", purple: "rgba(205,180,238,0.4)",
-  gray: "rgba(211,214,218,0.5)",
-};
 
 // Pointer-based drag reorder (HTML5 DnD is unreliable in WebKitGTK).
 const [dragId, setDragId] = createSignal<string | null>(null);
@@ -544,8 +538,7 @@ function Rendered(props: { id: string; owner?: string; trailing?: JSX.Element })
     return facets().properties.filter(([k]) => !isRenderHiddenProp(k, extra));
   };
   const bgColor = () => {
-    const v = facets().properties.find(([k]) => k === "background-color")?.[1];
-    return v ? BLOCK_BG[v] ?? v : undefined;
+    return blockBackgroundColor(facets().properties);
   };
 
   const body = (

@@ -1607,7 +1607,7 @@ fn parse_expr(toks: &[Tok], pos: &mut usize, today: JournalDate) -> Option<Pred>
                         Pred::Priority(ps)
                     }
                 }
-                "page-ref" => {
+                "page-ref" | "tag" => {
                     let name = parse_name(toks, pos)?;
                     Pred::PageRef(name)
                 }
@@ -1800,6 +1800,7 @@ mod tests {
     fn parse_pageref_and_tag() {
         assert_eq!(pred("[[Foo]]"), Pred::PageRef("Foo".into()));
         assert_eq!(pred("#bar"), Pred::PageRef("bar".into()));
+        assert_eq!(pred("(tag Foo)"), Pred::PageRef("Foo".into()));
     }
 
     #[test]

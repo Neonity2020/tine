@@ -23,7 +23,8 @@ import {
   type FieldId,
 } from "../sheet/fields";
 import { MARKERS } from "../markers";
-import { openSheetContextMenu, workflow } from "../ui";
+import { openSheetCellContextMenu, openSheetContextMenu, workflow } from "../ui";
+import { blockBackgroundColor } from "../blockColors";
 import type { BlockDto, RefGroup } from "../types";
 import { Editor, SurfaceContext } from "./Block";
 
@@ -249,6 +250,10 @@ function BoardCard(props: {
   const cell = (): SheetCellCtx => ({ gridId: props.ownerId, row: props.rowIndex, col: props.colIndex });
   const editing = () => editingId() === props.row.id && editingOwner() === cellOwner(cell());
   const fmt = () => (doc.byId[props.row.id] ? formatForBlock(props.row.id) : formatForPage(props.row.page));
+  const bgColor = createMemo(() => {
+    const f = recordFacets(props.row);
+    return f ? blockBackgroundColor(f.properties) : undefined;
+  });
 
   const select = () => setCellSel(cell());
 
@@ -293,6 +298,21 @@ function BoardCard(props: {
     select();
     if (doc.byId[props.row.id]) startCellEditing(cell());
   };
+  const openCellMenu = (e: MouseEvent) => {
+    if (!doc.byId[props.row.id]) return;
+    e.preventDefault();
+    e.stopPropagation();
+    select();
+    openSheetCellContextMenu(e.clientX, e.clientY, props.row.id);
+  };
+  const openCellMenuFromHandle = (e: MouseEvent) => {
+    if (!doc.byId[props.row.id]) return;
+    e.preventDefault();
+    e.stopPropagation();
+    select();
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    openSheetCellContextMenu(rect.right, rect.bottom + 2, props.row.id);
+  };
 
   return (
     <article
@@ -307,7 +327,26 @@ function BoardCard(props: {
       data-block-id={props.row.id}
       onPointerDown={beginPointerDrag}
       onClick={onClick}
+      onContextMenu={openCellMenu}
+      style={bgColor() ? { background: bgColor() } : undefined}
     >
+      <Show when={doc.byId[props.row.id]}>
+        <button
+          class="sheet-cell-handle sheet-card-handle"
+          title="Card menu"
+          onPointerDown={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+          }}
+          onMouseDown={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+          }}
+          onClick={openCellMenuFromHandle}
+        >
+          ⋮
+        </button>
+      </Show>
       <Show
         when={editing()}
         fallback={

@@ -2,8 +2,10 @@ import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import { render } from "solid-js/web";
 import type { JSX } from "solid-js";
 import { Block } from "./Block";
+import { ContextMenu } from "./ContextMenu";
 import { initParser } from "../render/parse";
 import { blockProperty, resetStore, setDoc, type Node, type FeedPage } from "../store";
+import { openJournals, route } from "../router";
 
 beforeAll(async () => {
   await initParser();
@@ -11,6 +13,7 @@ beforeAll(async () => {
 
 afterEach(() => {
   resetStore();
+  openJournals({ inPlace: true });
   document.body.innerHTML = "";
 });
 
@@ -45,6 +48,18 @@ function node(
 
 function change(target: EventTarget): Event {
   const event = new Event("change", { bubbles: true, cancelable: true });
+  target.dispatchEvent(event);
+  return event;
+}
+
+function contextMenu(target: EventTarget): MouseEvent {
+  const event = new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 20, clientY: 30 });
+  target.dispatchEvent(event);
+  return event;
+}
+
+function pointerEnter(target: EventTarget): Event {
+  const event = new Event("pointerenter", { bubbles: false, cancelable: true });
   target.dispatchEvent(event);
   return event;
 }
@@ -122,6 +137,73 @@ describe("SheetGrid", () => {
     dispose();
   });
 
+  it("renders block highlight colors and writes them from the cell menu", () => {
+    loadMdSheetDoc();
+    const { root, dispose } = mount(() => (
+      <>
+        <Block id="grid" />
+        <ContextMenu />
+      </>
+    ));
+    const cell = root.querySelector('.sheet-cell[data-block-id="c1"]') as HTMLElement | null;
+    expect(cell).not.toBeNull();
+
+    contextMenu(cell!);
+    (document.querySelector('.ctx-color[title="yellow"]') as HTMLButtonElement).click();
+
+    expect(blockProperty("c1", "background-color")).toBe("yellow");
+    expect(cell!.style.background).toContain("rgba");
+    dispose();
+  });
+
+  it("cell menu switches children between outline/grid/table and zooms into the cell", () => {
+    loadMdSheetDoc();
+    const { root, dispose } = mount(() => (
+      <>
+        <Block id="grid" />
+        <ContextMenu />
+      </>
+    ));
+    const cell = root.querySelector('.sheet-cell[data-block-id="c2"]') as HTMLElement | null;
+    expect(cell).not.toBeNull();
+
+    contextMenu(cell!);
+    ([...document.querySelectorAll(".ctx-item")].find((el) => el.textContent?.trim() === "Table") as HTMLElement).click();
+    expect(blockProperty("c2", "tine.view")).toBe("table");
+
+    contextMenu(cell!);
+    ([...document.querySelectorAll(".ctx-item")].find((el) => el.textContent?.trim() === "Outline") as HTMLElement).click();
+    expect(blockProperty("c2", "tine.view")).toBeNull();
+
+    contextMenu(cell!);
+    ([...document.querySelectorAll(".ctx-item")].find((el) => el.textContent?.includes("Zoom into cell")) as HTMLElement).click();
+    expect(route()).toMatchObject({ kind: "page", name: "Sheet", pageKind: "page" });
+    expect((route() as { block?: string }).block).toBeTruthy();
+
+    dispose();
+  });
+
+  it("renders a nested field table inside a positional grid cell", () => {
+    const pageName = "Sheet";
+    setDoc({
+      byId: {
+        grid: node("grid", "Grid parent\ntine.view:: grid", pageName, null, ["r1"]),
+        r1: node("r1", "", pageName, "grid", ["cell"]),
+        cell: node("cell", "Nested table\ntine.view:: table", pageName, "r1", ["tr1"]),
+        tr1: node("tr1", "TODO Nested row\nowner:: Martin", pageName, "cell"),
+      },
+      pages: [page("md", ["grid"])],
+      feed: [pageName],
+      loaded: true,
+    });
+    const { root, dispose } = mount(() => <Block id="grid" />);
+
+    expect(root.querySelector(".sheet-cell .sheet-table")).not.toBeNull();
+    expect(root.textContent).toContain("Martin");
+
+    dispose();
+  });
+
   it("leaves non-grid blocks on the existing vertical children renderer", () => {
     loadMdSheetDoc();
     const { root, dispose } = mount(() => <Block id="plain" />);
@@ -180,6 +262,12 @@ describe("SheetGrid", () => {
       loaded: true,
     });
     const { root, dispose } = mount(() => <Block id="grid" />);
+    const grid = root.querySelector(".sheet-grid") as HTMLElement | null;
+    expect(root.querySelector(".sheet-footer-cell")).toBeNull();
+    pointerEnter(grid!);
+    const add = root.querySelector(".sheet-footer-overlay .sheet-aggregate-add") as HTMLButtonElement | null;
+    expect(add).not.toBeNull();
+    add!.click();
     const select = root.querySelector(".sheet-aggregate-select") as HTMLSelectElement | null;
     expect(select).not.toBeNull();
 

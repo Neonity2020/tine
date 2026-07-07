@@ -28,11 +28,11 @@ import {
   type FieldValue,
 } from "../sheet/fields";
 import { sheetConfig } from "../sheet/config";
-import { aggregate, AGGREGATE_FNS, AGGREGATE_LABELS, type AggregateFn } from "../sheet/aggregate";
-import { setColumnAggregate } from "../sheet/mutations";
-import { openSheetContextMenu } from "../ui";
+import { openDatePicker, openSheetCellContextMenu, openSheetContextMenu } from "../ui";
+import { blockBackgroundColor } from "../blockColors";
 import type { BlockDto, RefGroup } from "../types";
 import { Editor, SurfaceContext } from "./Block";
+import { SheetAggregateFooterCell } from "./SheetAggregateFooter";
 
 interface RowRecord {
   id: string;
@@ -46,11 +46,14 @@ export function SheetTable(props: {
   ownerId: string;
   rowSource: "children" | "query";
   groups?: readonly RefGroup[];
+  addRow?: () => void | Promise<void>;
+  addRowLabel?: string;
 }): JSX.Element {
   const [sort, setSort] = createSignal<SortState>(null);
   const [extraFields, setExtraFields] = createSignal<FieldId[]>([]);
   const [addingColumn, setAddingColumn] = createSignal(false);
   const [editingProp, setEditingProp] = createSignal<{ rowId: string; field: FieldId; initial: string } | null>(null);
+  const [hovering, setHovering] = createSignal(false);
   const config = createMemo(() => {
     const owner = doc.byId[props.ownerId];
     return sheetConfig(owner ? facetsOf(owner.raw, formatForBlock(props.ownerId)).properties : []);
@@ -97,6 +100,11 @@ export function SheetTable(props: {
   });
 
   const columns = createMemo(() => ["title" as const, ...fields()]);
+  const hasActionColumn = () => props.rowSource === "children" || !!props.addRow;
+  const gridColumns = createMemo(() =>
+    `minmax(180px, max-content) repeat(${fields().length}, max-content) ${hasActionColumn() ? "34px" : ""}`
+  );
+  const hasAggregates = createMemo(() => config().colAggregates.size > 0);
 
   const sortedRows = createMemo(() => {
     const s = sort();
@@ -140,6 +148,7 @@ export function SheetTable(props: {
     if (!doc.byId[row.id]) return true;
     if (col === "state") return cycleField(row.id, "state");
     if (col === "priority") return cycleField(row.id, "priority");
+    if (col === "scheduled" || col === "deadline") return true;
     if (col.startsWith("prop:")) {
       openPropInput(row.id, col);
       return true;
@@ -153,6 +162,7 @@ export function SheetTable(props: {
     if (!row || !col) return true;
     if (col === "title") return false;
     if (col.startsWith("prop:") && doc.byId[row.id]) openPropInput(row.id, col, text);
+    else if ((col === "scheduled" || col === "deadline") && doc.byId[row.id]) writeField(row.id, col, text);
     return true;
   };
 
@@ -181,11 +191,29 @@ export function SheetTable(props: {
   };
 
   return (
-    <Show when={rows().length > 0} fallback={<div class="sheet-table sheet-empty">empty table</div>}>
+    <Show
+      when={rows().length > 0}
+      fallback={
+        <div class="sheet-table sheet-empty">
+          <span>empty table</span>
+          <Show when={props.addRow}>
+            <button
+              class="sheet-add-field-btn sheet-add-row-btn"
+              title={props.addRowLabel ?? "Add row"}
+              onClick={() => void props.addRow?.()}
+            >
+              +
+            </button>
+          </Show>
+        </div>
+      }
+    >
       <div
         class="sheet-table"
         data-sheet-grid-id={props.ownerId}
-        style={{ "grid-template-columns": `minmax(180px, max-content) repeat(${fields().length}, max-content) ${props.rowSource === "children" ? "34px" : ""}` }}
+        style={{ "grid-template-columns": gridColumns() }}
+        onPointerEnter={() => setHovering(true)}
+        onPointerLeave={() => setHovering(false)}
         onContextMenu={openSheetMenu}
       >
         <div class="sheet-cell sheet-header-cell sheet-title-header" onClick={() => sortHeader(0)}>
@@ -198,21 +226,37 @@ export function SheetTable(props: {
             </div>
           )}
         </For>
-        <Show when={props.rowSource === "children"}>
+        <Show when={hasActionColumn()}>
           <div class="sheet-cell sheet-header-cell sheet-add-field">
             <Show
-              when={addingColumn()}
+              when={props.rowSource === "children" && addingColumn()}
               fallback={
-                <button
-                  class="sheet-add-field-btn"
-                  title="Add property column"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    setAddingColumn(true);
-                  }}
+                <Show
+                  when={props.rowSource === "children"}
+                  fallback={
+                    <button
+                      class="sheet-add-field-btn sheet-add-row-btn"
+                      title={props.addRowLabel ?? "Add row"}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        void props.addRow?.();
+                      }}
+                    >
+                      +
+                    </button>
+                  }
                 >
-                  +
-                </button>
+                  <button
+                    class="sheet-add-field-btn"
+                    title="Add property column"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setAddingColumn(true);
+                    }}
+                  >
+                    +
+                  </button>
+                </Show>
               }
             >
               <input
@@ -262,54 +306,50 @@ export function SheetTable(props: {
                   />
                 )}
               </For>
-              <Show when={props.rowSource === "children"}>
+              <Show when={hasActionColumn()}>
                 <div class="sheet-cell sheet-row-tail" />
               </Show>
             </>
           )}
         </For>
-        <div class="sheet-cell sheet-footer-cell sheet-footer-title" />
-        <For each={fields()}>
-          {(field) => (
-            <AggregateFooterCell
-              ownerId={props.ownerId}
-              columnKey={field}
-              fn={config().colAggregates.get(field) ?? null}
-              values={sortedRows().map((row) => fieldValue(row, field))}
-            />
-          )}
-        </For>
-        <Show when={props.rowSource === "children"}>
-          <div class="sheet-cell sheet-footer-cell sheet-row-tail" />
+        <Show when={hasAggregates()}>
+          <div class="sheet-cell sheet-footer-cell sheet-footer-title" />
+          <For each={fields()}>
+            {(field) => (
+              <SheetAggregateFooterCell
+                ownerId={props.ownerId}
+                columnKey={field}
+                fn={config().colAggregates.get(field) ?? null}
+                values={sortedRows().map((row) => fieldValue(row, field))}
+                showEmpty={hovering()}
+              />
+            )}
+          </For>
+          <Show when={hasActionColumn()}>
+            <div class="sheet-cell sheet-footer-cell sheet-row-tail" />
+          </Show>
+        </Show>
+        <Show when={!hasAggregates() && hovering()}>
+          <div class="sheet-footer-overlay" style={{ "grid-template-columns": gridColumns() }}>
+            <div class="sheet-cell sheet-footer-cell sheet-footer-title" />
+            <For each={fields()}>
+              {(field) => (
+                <SheetAggregateFooterCell
+                  ownerId={props.ownerId}
+                  columnKey={field}
+                  fn={null}
+                  values={sortedRows().map((row) => fieldValue(row, field))}
+                  showEmpty
+                />
+              )}
+            </For>
+            <Show when={hasActionColumn()}>
+              <div class="sheet-cell sheet-footer-cell sheet-row-tail" />
+            </Show>
+          </div>
         </Show>
       </div>
     </Show>
-  );
-}
-
-function AggregateFooterCell(props: {
-  ownerId: string;
-  columnKey: string;
-  fn: AggregateFn | null;
-  values: readonly (FieldValue | null)[];
-}): JSX.Element {
-  const stop = (e: Event) => e.stopPropagation();
-  return (
-    <div class="sheet-cell sheet-footer-cell" onPointerDown={stop} onMouseDown={stop} onClick={stop}>
-      <select
-        class="sheet-aggregate-select"
-        value={props.fn ?? ""}
-        onChange={(e) => setColumnAggregate(props.ownerId, props.columnKey, e.currentTarget.value ? (e.currentTarget.value as AggregateFn) : null)}
-      >
-        <option value="">None</option>
-        <For each={AGGREGATE_FNS}>
-          {(fn) => <option value={fn}>{AGGREGATE_LABELS[fn]}</option>}
-        </For>
-      </select>
-      <span class="sheet-aggregate-value" classList={{ "sheet-aggregate-empty": !props.fn }}>
-        {props.fn ? aggregate(props.fn, props.values) : "Σ"}
-      </span>
-    </div>
   );
 }
 
@@ -402,6 +442,10 @@ function TitleCell(props: { ownerId: string; row: RowRecord; rowIndex: number; s
   const editing = () => editingId() === props.row.id && editingOwner() === cellOwner(cell());
   const fmt = () => (doc.byId[props.row.id] ? formatForBlock(props.row.id) : formatForPage(props.row.page));
   const raw = () => rowRaw(props.row);
+  const bgColor = createMemo(() => {
+    const f = recordFacets(props.row);
+    return f ? blockBackgroundColor(f.properties) : undefined;
+  });
 
   const onMouseDown = (e: MouseEvent) => {
     if (e.button !== 0 || e.shiftKey || e.ctrlKey || e.metaKey || e.altKey) return;
@@ -414,6 +458,21 @@ function TitleCell(props: { ownerId: string; row: RowRecord; rowIndex: number; s
     }
     startCellEditing(cell(), clickOffset(e, contentRef, raw()) ?? undefined);
   };
+  const openCellMenu = (e: MouseEvent) => {
+    if (!doc.byId[props.row.id]) return;
+    e.preventDefault();
+    e.stopPropagation();
+    setCellSel(cell());
+    openSheetCellContextMenu(e.clientX, e.clientY, props.row.id);
+  };
+  const openCellMenuFromHandle = (e: MouseEvent) => {
+    if (!doc.byId[props.row.id]) return;
+    e.preventDefault();
+    e.stopPropagation();
+    setCellSel(cell());
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    openSheetCellContextMenu(rect.right, rect.bottom + 2, props.row.id);
+  };
 
   return (
     <div
@@ -423,8 +482,23 @@ function TitleCell(props: { ownerId: string; row: RowRecord; rowIndex: number; s
       data-block-id={props.row.id}
       data-row={props.rowIndex}
       data-col={0}
+      style={bgColor() ? { background: bgColor() } : undefined}
       onMouseDown={onMouseDown}
+      onContextMenu={openCellMenu}
     >
+      <Show when={doc.byId[props.row.id]}>
+        <button
+          class="sheet-cell-handle"
+          title="Cell menu"
+          onMouseDown={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+          }}
+          onClick={openCellMenuFromHandle}
+        >
+          ⋮
+        </button>
+      </Show>
       <div class="sheet-cell-body" ref={contentRef}>
         <Show
           when={editing()}
@@ -450,12 +524,16 @@ function FieldCell(props: {
   selected: boolean;
   editing: boolean;
   initial: string;
-  openPropInput: (rowId: string, field: FieldId) => void;
+  openPropInput: (rowId: string, field: FieldId, initial?: string) => void;
   closePropInput: () => void;
 }): JSX.Element {
   const value = () => fieldValue(props.row, props.field);
   const editable = () => !!doc.byId[props.row.id];
   const select = () => setCellSel({ gridId: props.ownerId, row: props.rowIndex, col: props.colIndex });
+  const bgColor = createMemo(() => {
+    const f = recordFacets(props.row);
+    return f ? blockBackgroundColor(f.properties) : undefined;
+  });
   const commit = (value: string) => {
     if (editable()) writeField(props.row.id, props.field, value);
     props.closePropInput();
@@ -469,7 +547,26 @@ function FieldCell(props: {
     if (!editable()) return;
     if (props.field === "state") cycleField(props.row.id, "state");
     else if (props.field === "priority") cycleField(props.row.id, "priority");
+    else if (props.field === "scheduled" || props.field === "deadline") {
+      const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+      openDatePicker(props.row.id, props.field, rect.left, rect.bottom + 4);
+    }
     else if (props.field.startsWith("prop:")) props.openPropInput(props.row.id, props.field);
+  };
+  const openCellMenu = (e: MouseEvent) => {
+    if (!editable()) return;
+    e.preventDefault();
+    e.stopPropagation();
+    select();
+    openSheetCellContextMenu(e.clientX, e.clientY, props.row.id);
+  };
+  const openCellMenuFromHandle = (e: MouseEvent) => {
+    if (!editable()) return;
+    e.preventDefault();
+    e.stopPropagation();
+    select();
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    openSheetCellContextMenu(rect.right, rect.bottom + 2, props.row.id);
   };
 
   return (
@@ -477,13 +574,29 @@ function FieldCell(props: {
       class="sheet-cell sheet-field-cell"
       classList={{
         "sheet-cell-selected": props.selected,
-        "sheet-readonly-cell": !editable() || props.field === "tags" || props.field === "page" || props.field === "scheduled" || props.field === "deadline",
+        "sheet-readonly-cell": !editable() || props.field === "tags" || props.field === "page",
       }}
       data-sheet-grid-id={props.ownerId}
+      data-block-id={props.row.id}
       data-row={props.rowIndex}
       data-col={props.colIndex}
+      style={bgColor() ? { background: bgColor() } : undefined}
       onMouseDown={onMouseDown}
+      onContextMenu={openCellMenu}
     >
+      <Show when={editable()}>
+        <button
+          class="sheet-cell-handle"
+          title="Cell menu"
+          onMouseDown={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+          }}
+          onClick={openCellMenuFromHandle}
+        >
+          ⋮
+        </button>
+      </Show>
       <Show
         when={props.editing && props.field.startsWith("prop:")}
         fallback={<FieldValueView field={props.field} value={value()} page={props.row.page} />}

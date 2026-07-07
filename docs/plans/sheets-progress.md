@@ -162,7 +162,29 @@ to `~/research/tine`. Martin is unavailable for testing.
       green, tsc, cargo 270 (new fixtures), shots + e2e ALL PASS.
       **Phase-5 polish note:** footer is always-visible None-dropdowns —
       should collapse to values/dimmed Σ until hover.
-- [ ] **Phase 5 — recursion + colors + polish**
+- [x] **Phase 5 — v1 completion & polish** — DONE Jul 7 2026 (codex, verified
+      clean). Shared `src/blockColors.ts` (block + cell menus, one write
+      path); cell context menu (face switch via `tine.view` on the cell,
+      zoom-into-cell, colors) + hover-reveal ⋮ handle (menu-only; pointer
+      cell-drag deferred to v2); aggregate footer collapsed to quiet
+      values/hover-Σ (no layout jump); scheduled/deadline cells edit via the
+      existing DatePicker through `writeField`; **tag-page table**: opt-in
+      `tine.tag-table:: true` toggle replaces linked refs with a query-sourced
+      field table over `(tag <page>)` (`tag` added as additive alias of
+      `page-ref` in the Rust DSL) + **add-row → today's journal** with the
+      pre-filled tag (decided: scattered instances have no home page);
+      onboarding `[[Features/Sheets]]` template + website/demo regenerated
+      (static demo renders sheet blocks as plain outline — correct, it's the
+      round-trip story); FEATURES.md rewritten to the shipped list;
+      `docs/img/sheets.png` + SCREENSHOTS.md row + README image. Verified:
+      npm 50+19 green, tsc, cargo 270, all shots eyeballed, release binary
+      rebuilt, e2e ALL PASS.
+
+**SHEETS v1 COMPLETE (Jul 7 2026) — all §11 phases done, branch `sheets`.**
+Remaining for v2 (per spec §10): pointer cell drag; merged cells `span::`;
+formulas (Bases DSL); multi-valued group-by (tag boards); `tine.fields::`
+schema; split view; canvas face + whiteboards importer; in-column card
+reorder; tags/page field write-back; multi-level (cross-hierarchy) ranges.
 
 ## Decisions made (by Claude, per mandate)
 

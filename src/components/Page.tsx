@@ -1,10 +1,10 @@
-import { For, Show, createEffect, createMemo, createSignal, onCleanup, onMount, type JSX } from "solid-js";
-import { doc, mainPages, pageByName, reloadPage, loadSingle, loadFeed, appendFeed, emptyPage, isDirty, isSaving, reloadDisposition, setFeedExtender, flushAll, formatForBlock, type FeedPage } from "../store";
+import { For, Show, createEffect, createMemo, createResource, createSignal, onCleanup, onMount, type JSX } from "solid-js";
+import { doc, mainPages, pageByName, reloadPage, loadSingle, loadFeed, appendFeed, emptyPage, isDirty, isSaving, reloadDisposition, setFeedExtender, flushAll, formatForBlock, readPageProperty, setPageProperty, appendToTodayJournal, type FeedPage } from "../store";
 import { route, sameRoute, openPage, openJournals, openPageInNewTab, restoreScrollFor } from "../router";
 import {
   zoomedBlock, zoomInto, isFavorite, toggleFavorite,
   markConflict, isConflicted, graphEpoch, openPageInSidebar, openPageContextMenu, carryDays, showCarryButtons,
-  agendaQuery, openPageProps,
+  agendaQuery, openPageProps, dataRev,
 } from "../ui";
 import { carryDay, carryPrevDay, carryDaysBack } from "../carry";
 import { backend } from "../backend";
@@ -13,19 +13,22 @@ import { Block } from "./Block";
 import { LinkedReferences } from "./LinkedReferences";
 import { UnlinkedReferences } from "./UnlinkedReferences";
 import { QueryMacro } from "./Macro";
+import { SheetTable } from "./SheetTable";
 import { NamespaceCrumb, NamespaceHierarchy } from "./Namespace";
 import { pageProperties, aliasNames, visibleBody } from "../render/block";
 import { InlineText } from "../render/inline";
 import { EmojiText } from "../render/emoji";
 import { journalTitle } from "../journal";
-import type { PageDto } from "../types";
+import { startEditing } from "../editorController";
+import type { PageDto, RefGroup } from "../types";
 
 const FEED_PAGE = 3;
 
 // Page properties NOT shown in the under-title property list: `alias` is surfaced
 // as "aka" chips above, and `icon` is consumed as the page icon next to the title
 // (OG hides it too). Other internal/metadata page props could be added here.
-const PAGE_PROPS_HIDDEN = new Set(["alias", "icon"]);
+const PAGE_PROPS_HIDDEN = new Set(["alias", "icon", "tine.tag-table"]);
+const TAG_TABLE_PROP = "tine.tag-table";
 
 // OG always shows today's journal at the top of the feed, even with no file yet
 // (the file is created lazily on first edit — Tine writes on save). So prepend
@@ -241,7 +244,12 @@ export function PageView(): JSX.Element {
             <Show when={mainPages()[0].kind === "page"}>
               <NamespaceHierarchy name={mainPages()[0].name} />
             </Show>
-            <LinkedReferences name={mainPages()[0].name} />
+            <Show
+              when={mainPages()[0].kind === "page" && tagTableEnabled(mainPages()[0].name)}
+              fallback={<LinkedReferences name={mainPages()[0].name} />}
+            >
+              <TagPageTable pageName={mainPages()[0].name} />
+            </Show>
             <UnlinkedReferences name={mainPages()[0].name} />
           </Show>
         </div>
@@ -392,6 +400,7 @@ function PageSection(props: { page: FeedPage }): JSX.Element {
           </h1>
         </Show>
         <CarryActions page={props.page} />
+        <TagTableToggle page={props.page} />
         <button
             class="page-gear"
             title="Page properties (alias, public, tags, icon, title)"
@@ -456,6 +465,72 @@ function PageSection(props: { page: FeedPage }): JSX.Element {
       <div class="page-blocks">
         <For each={props.page.roots}>{(id) => <Block id={id} />}</For>
       </div>
+    </div>
+  );
+}
+
+function tagTableEnabled(pageName: string): boolean {
+  return readPageProperty(pageName, TAG_TABLE_PROP)?.toLowerCase() === "true";
+}
+
+function quoteQueryString(value: string): string {
+  return `"${value.replace(/\\/g, "\\\\").replace(/"/g, "\\\"")}"`;
+}
+
+function tagQuery(pageName: string): string {
+  return `(tag ${quoteQueryString(pageName)})`;
+}
+
+function tagRef(pageName: string): string {
+  return /^[A-Za-z0-9_./-]+$/.test(pageName) ? `#${pageName}` : `#[[${pageName}]]`;
+}
+
+function taggedCount(groups: readonly RefGroup[] | undefined): number {
+  return groups?.reduce((sum, group) => sum + group.blocks.length, 0) ?? 0;
+}
+
+export function TagTableToggle(props: { page: FeedPage }): JSX.Element {
+  const [groups] = createResource(
+    () => (props.page.kind === "page" ? `${props.page.name}\0${dataRev()}` : null),
+    () => backend().runQuery(tagQuery(props.page.name))
+  );
+  const enabled = () => tagTableEnabled(props.page.name);
+  const visible = () => props.page.kind === "page" && (enabled() || taggedCount(groups()) > 0);
+  return (
+    <Show when={visible()}>
+      <button
+        class="tag-table-toggle"
+        classList={{ active: enabled() }}
+        title={enabled() ? "Hide tag table" : "Show tagged blocks as a table"}
+        onClick={() => setPageProperty(props.page.name, TAG_TABLE_PROP, enabled() ? null : "true")}
+      >
+        ⊞ Table
+      </button>
+    </Show>
+  );
+}
+
+export function TagPageTable(props: { pageName: string }): JSX.Element {
+  const [groups] = createResource(
+    () => `${props.pageName}\0${dataRev()}`,
+    () => backend().runQuery(tagQuery(props.pageName))
+  );
+  const addRow = async () => {
+    const ok = await appendToTodayJournal(`${tagRef(props.pageName)} `);
+    if (!ok) return;
+    const today = pageByName(journalTitle(new Date()));
+    const id = today?.roots[today.roots.length - 1];
+    if (id && doc.byId[id]) startEditing(id, doc.byId[id].raw.length);
+  };
+  return (
+    <div class="tag-page-table">
+      <SheetTable
+        ownerId={`tag-page:${encodeURIComponent(props.pageName)}`}
+        rowSource="query"
+        groups={groups() ?? []}
+        addRow={addRow}
+        addRowLabel={`Add ${tagRef(props.pageName)} row`}
+      />
     </div>
   );
 }

@@ -584,6 +584,11 @@ export function mockBackend(): Backend {
           return !!m && set.includes(m);
         });
       }
+      const tag = /\(\s*tag\s+(?:"((?:[^"\\]|\\.)*)"|([^) \t\r\n]+))\s*\)/i.exec(query);
+      if (tag) {
+        const n = (tag[1] ?? tag[2] ?? "").replace(/\\"/g, "\"").replace(/\\\\/g, "\\").toLowerCase();
+        return collect((b) => pageRefs(b.raw).some((r) => r.toLowerCase() === n));
+      }
       const ref = pageRefs(query)[0];
       if (ref) {
         const n = ref.toLowerCase();

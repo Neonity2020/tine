@@ -1,6 +1,7 @@
 import { For, Show, createMemo, createSignal, onCleanup, onMount, type JSX } from "solid-js";
 import { datePicker, closeDatePicker, firstDayOfWeek } from "../ui";
 import { readSchedule, setSchedule } from "../store";
+import { writeField } from "../sheet/fields";
 
 const MONTHS = [
   "January", "February", "March", "April", "May", "June",
@@ -10,6 +11,8 @@ const DOW_BASE = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"];
 // First day of week from the Tine display pref (see ui.firstDayOfWeek).
 const startOfWeek = () => firstDayOfWeek();
 const DOW = () => DOW_BASE.slice(startOfWeek()).concat(DOW_BASE.slice(0, startOfWeek()));
+const pad2 = (n: number) => String(n).padStart(2, "0");
+const fieldDate = (y: number, m: number, d: number) => `${y}-${pad2(m + 1)}-${pad2(d)}`;
 
 // Calendar popup for SCHEDULED / DEADLINE. Writes `<yyyy-MM-dd EEE>` via the
 // store; opening on an existing date pre-fills the shown month + selection.
@@ -64,16 +67,21 @@ function Picker(props: { bid: string; which: "scheduled" | "deadline"; x: number
     setView({ y: Math.floor(total / 12), m: ((total % 12) + 12) % 12 });
   };
   const pick = (d: number) => {
-    setSchedule(props.bid, props.which, { y: view().y, m: view().m, d }, repeater());
+    if (repeater()) setSchedule(props.bid, props.which, { y: view().y, m: view().m, d }, repeater());
+    else writeField(props.bid, props.which, fieldDate(view().y, view().m, d));
     closeDatePicker();
   };
   const pickToday = () => {
-    setSchedule(
-      props.bid,
-      props.which,
-      { y: today.getFullYear(), m: today.getMonth(), d: today.getDate() },
-      repeater()
-    );
+    if (repeater()) {
+      setSchedule(
+        props.bid,
+        props.which,
+        { y: today.getFullYear(), m: today.getMonth(), d: today.getDate() },
+        repeater()
+      );
+    } else {
+      writeField(props.bid, props.which, fieldDate(today.getFullYear(), today.getMonth(), today.getDate()));
+    }
     closeDatePicker();
   };
   const isToday = (d: number) =>
@@ -179,7 +187,7 @@ function Picker(props: { bid: string; which: "scheduled" | "deadline"; x: number
           <Show when={sel}>
             <button
               class="dp-btn dp-clear"
-              onClick={() => { setSchedule(props.bid, props.which, null); closeDatePicker(); }}
+              onClick={() => { writeField(props.bid, props.which, ""); closeDatePicker(); }}
             >
               Clear
             </button>

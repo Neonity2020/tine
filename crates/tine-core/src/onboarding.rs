@@ -30,6 +30,7 @@ const PAGES: &[(&str, &str)] = &[
         "Features/Tips & shortcuts",
         include_str!("templates/tips.md"),
     ),
+    ("Features/Sheets", include_str!("templates/sheets.md")),
     ("Features/PDF annotation", include_str!("templates/pdf.md")),
     ("Project/Roadmap", include_str!("templates/roadmap.md")),
 ];

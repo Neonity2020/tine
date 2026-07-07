@@ -45,11 +45,11 @@ function node(id: string, raw: string, parent: string | null, children: string[]
   return { id, raw, collapsed: false, parent, page: "Sheet", children };
 }
 
-function loadBoardDoc() {
+function loadBoardDoc(todoRaw = "TODO Write tests\nowner:: Codex") {
   setDoc({
     byId: {
       board: node("board", "Board\ntine.view:: board\ntine.group-by:: state", null, ["todo", "doing", "plain"]),
-      todo: node("todo", "TODO Write tests\nowner:: Codex", "board"),
+      todo: node("todo", todoRaw, "board"),
       doing: node("doing", "DOING Implement board", "board"),
       plain: node("plain", "No marker", "board"),
     },
@@ -83,6 +83,17 @@ describe("SheetBoard", () => {
 
     const headers = [...root.querySelectorAll(".sheet-board-header")].map((h) => h.textContent?.trim());
     expect(headers).toEqual(["TODO1", "DOING1", "DONE0", "(none)1"]);
+
+    dispose();
+  });
+
+  it("renders a block highlight color on the card", () => {
+    loadBoardDoc("TODO Write tests\nbackground-color:: blue\nowner:: Codex");
+    const { root, dispose } = mount(() => <Block id="board" />);
+
+    const card = root.querySelector('[data-block-id="todo"]') as HTMLElement | null;
+    expect(card).not.toBeNull();
+    expect(card!.style.background).toContain("rgba");
 
     dispose();
   });

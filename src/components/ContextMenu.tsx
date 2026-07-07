@@ -19,6 +19,7 @@ import { refreshAfterRename } from "../graph";
 import { backend } from "../backend";
 import { carryDay } from "../carry";
 import { journalTitle } from "../journal";
+import { BLOCK_COLOR_NAMES, BLOCK_COLOR_SWATCH } from "../blockColors";
 import {
   doc,
   ensureBlockId,
@@ -55,18 +56,6 @@ async function copyBlockRef(id: string, fmt: (uuid: string) => string, okMsg: st
   pushToast(okMsg, "success");
 }
 
-// Block background colors, matching Logseq's built-in set.
-const COLORS = ["yellow", "red", "pink", "green", "blue", "purple", "gray"];
-const COLOR_BG: Record<string, string> = {
-  yellow: "#fbe69e",
-  red: "#f5a3a3",
-  pink: "#f3b0d4",
-  green: "#a6e3b4",
-  blue: "#a8c9f0",
-  purple: "#cdb4ee",
-  gray: "#d3d6da",
-};
-
 // Right-click context menu. Universal over its target: a block (full editing
 // menu — colors, headings, open/copy/cut, collapse, numbered list) or a page
 // reference (open / open in sidebar / new tab / copy ref). The target is
@@ -95,6 +84,9 @@ export function ContextMenu(): JSX.Element {
                   pageKind={(m() as { pageKind: "journal" | "page" }).pageKind}
                   close={close}
                 />
+              </Match>
+              <Match when={m().kind === "sheet-cell"}>
+                <SheetCellMenu id={(m() as { blockId: string }).blockId} close={close} />
               </Match>
               <Match when={m().kind === "page"}>
                 <PageMenu
@@ -126,25 +118,7 @@ function BlockMenu(props: { id: string; close: () => void }): JSX.Element {
   return (
     <>
       {/* Color row */}
-      <div class="ctx-row ctx-colors">
-        <button
-          class="ctx-color ctx-color-none"
-          title="No background"
-          onClick={() => { setBlockProperty(props.id, "background-color", null); props.close(); }}
-        >
-          ✕
-        </button>
-        <For each={COLORS}>
-          {(c) => (
-            <button
-              class="ctx-color"
-              title={c}
-              style={{ background: COLOR_BG[c] }}
-              onClick={() => { toggleBlockProperty(props.id, "background-color", c); props.close(); }}
-            />
-          )}
-        </For>
-      </div>
+      <ColorPalette id={props.id} close={props.close} />
 
       {/* Heading row */}
       <div class="ctx-row ctx-headings">
@@ -176,6 +150,69 @@ function BlockMenu(props: { id: string; close: () => void }): JSX.Element {
 
       <div class="ctx-sep" />
       <MakeTemplate id={props.id} close={props.close} />
+    </>
+  );
+}
+
+function ColorPalette(props: { id: string; close: () => void }): JSX.Element {
+  return (
+    <div class="ctx-row ctx-colors">
+      <button
+        class="ctx-color ctx-color-none"
+        title="No background"
+        onClick={() => { setBlockProperty(props.id, "background-color", null); props.close(); }}
+      >
+        ✕
+      </button>
+      <For each={BLOCK_COLOR_NAMES}>
+        {(c) => (
+          <button
+            class="ctx-color"
+            title={c}
+            style={{ background: BLOCK_COLOR_SWATCH[c] }}
+            onClick={() => { toggleBlockProperty(props.id, "background-color", c); props.close(); }}
+          />
+        )}
+      </For>
+    </div>
+  );
+}
+
+function SheetCellMenu(props: { id: string; close: () => void }): JSX.Element {
+  const view = () => blockProperty(props.id, "tine.view") ?? "outline";
+  const setView = (next: "outline" | "grid" | "table") => {
+    setBlockProperty(props.id, "tine.view", next === "outline" ? null : next);
+    props.close();
+  };
+  const label = (name: string, active: boolean) => `${active ? "✓ " : ""}${name}`;
+
+  return (
+    <>
+      <ColorPalette id={props.id} close={props.close} />
+      <div class="ctx-sep" />
+      <div class="ctx-item ctx-submenu">
+        <span>Show children as →</span>
+        <div class="ctx-submenu-menu">
+          <div class="ctx-item" onClick={() => setView("outline")}>
+            {label("Outline", view() === "outline")}
+          </div>
+          <div class="ctx-item" onClick={() => setView("grid")}>
+            {label("Grid", view() === "grid")}
+          </div>
+          <div class="ctx-item" onClick={() => setView("table")}>
+            {label("Table", view() === "table")}
+          </div>
+        </div>
+      </div>
+      <div
+        class="ctx-item"
+        onClick={() => {
+          zoomInto(props.id);
+          props.close();
+        }}
+      >
+        Zoom into cell
+      </div>
     </>
   );
 }

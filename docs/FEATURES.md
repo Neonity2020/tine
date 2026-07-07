@@ -184,13 +184,33 @@ outline — no sidecars, no coordinates, no lock-in.
 - **Clipboard interop** — copy a range as TSV (+ an HTML table, so it pastes
   into real spreadsheets); paste TSV/CSV to fill and grow the grid; paste
   indented text to build nested structure.
+- **Field tables** — `tine.view:: table` turns children or query results into an
+  editable table whose columns come from facets: task state, priority,
+  scheduled/deadline dates, tags, page, and block properties. Writable fields
+  write back to the source block.
+- **Task kanban** — `tine.view:: board` groups task/query rows by state,
+  priority, or a property; dragging a card or pressing `Ctrl+←/→` writes the
+  grouping field back to the card.
+- **Hierarchify / Flatten** — commit a field grouping into the outline, or pull
+  grouped children back up into a flat table.
+- **Aggregates** — per-column summaries (sum, average, min/max, dates, filled,
+  unique, checked, and more) live in a quiet footer and store only the selected
+  aggregate token.
+- **Cell polish** — cells/cards render Logseq block highlight colors, cell
+  menus can switch child rendering between outline/grid/table or zoom into the
+  cell, and scheduled/deadline table cells use the same date picker as normal
+  blocks.
+- **Tag-page tables** — a tag page with tagged references can opt into a table
+  view (`tine.tag-table:: true`) and add new tagged rows to today's journal.
+- **Slash commands** — `/grid`, `/table`, and `/board` convert the current block
+  into the corresponding sheet face.
 - **Safety** — every grid gesture is a single undo step, and grid pages are
   byte-exact round-trip tested (md and org).
 
-Coming next on this front: field-keyed tables (columns from task state /
-priority / dates / properties), a query-driven task kanban, grouping
-(Hierarchify/Flatten), and column aggregates — see the spec in
-`docs/breadth-grid-spec.md`.
+V1 limits: `tags` and `page` columns are read-only; range operations are
+single-level within the current grid; board cards can move between columns but
+not reorder within a column; formulas, merged cells, schemas, and multi-value
+group-by are still v2+.
 
 ## Tasks, journals & dates
 

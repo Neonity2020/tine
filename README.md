@@ -98,6 +98,7 @@ raw speed. (Comparisons are against current Logseq desktop core, no plugins.)
 - **⚡ Global quick-capture** — bind `tine --capture` to a desktop hotkey and a small always-on-top
   box pops from *any* app with the full editor, filing a bullet to today's journal.
 - **🔁 Carry unfinished tasks forward** to today (last 7 / 30 / 365 days, or a configurable N).
+- **▦ Sheets** — recursive grids, editable field tables, task boards, aggregates, colors, and tag-page tables over plain bullets.
 - **🛟 A real data-safety story** — conflict detection instead of silent overwrites, launch
   snapshots with one-click restore, and delete-to-trash; built to live safely on a graph you also
   edit from Logseq mobile over Syncthing.
@@ -108,6 +109,10 @@ raw speed. (Comparisons are against current Logseq desktop core, no plugins.)
   <img src="docs/img/quick-capture.png" alt="Global quick-capture mini-window" width="32%">
   <img src="docs/img/focus-dim.png" alt="Focus mode with inactive blocks dimmed" width="32%">
   <img src="docs/img/tabs.png" alt="Built-in tabs" width="32%">
+</p>
+
+<p align="center">
+  <img src="docs/img/sheets.png" alt="Sheets grid, field table, and task board" width="640">
 </p>
 
 <p align="center">

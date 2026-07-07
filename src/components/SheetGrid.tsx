@@ -14,16 +14,17 @@ import {
   startCellEditing,
   type SheetSel,
 } from "../sheet/selection";
-import { setColumnAggregate, setColumnWidth } from "../sheet/mutations";
-import { aggregate, AGGREGATE_FNS, AGGREGATE_LABELS, type AggregateFn } from "../sheet/aggregate";
+import { setColumnWidth } from "../sheet/mutations";
 import { editorOffsetFromRenderedRange } from "../render/spans";
 import { isBuiltinHidden } from "../editor/properties";
 import { forbidsEditEntry } from "../editor/editTargets";
 import { editingId, editingOwner } from "../editorController";
-import { openSheetContextMenu } from "../ui";
+import { openSheetCellContextMenu, openSheetContextMenu } from "../ui";
+import { blockBackgroundColor } from "../blockColors";
 import { Editor, SurfaceContext } from "./Block";
 import { SheetTable } from "./SheetTable";
 import { SheetBoard } from "./SheetBoard";
+import { SheetAggregateFooterCell } from "./SheetAggregateFooter";
 
 const MAX_GRID_DEPTH = 5;
 
@@ -170,6 +171,7 @@ function SheetGridInner(props: { id: string; depth: number }): JSX.Element {
   let gridRef: HTMLDivElement | undefined;
   const [seamStyle, setSeamStyle] = createSignal<JSX.CSSProperties | null>(null);
   const [resizing, setResizing] = createSignal(false);
+  const [hovering, setHovering] = createSignal(false);
   const config = createMemo(() => configForBlock(props.id));
   const rows = createMemo(() =>
     blockChildren(props.id).map((id) => ({
@@ -179,6 +181,7 @@ function SheetGridInner(props: { id: string; depth: number }): JSX.Element {
   );
   const matrix = createMemo(() => buildMatrix(rows()));
   const columns = createMemo(() => columnTracks(matrix().cols, config().colWidths));
+  const hasAggregates = createMemo(() => config().colAggregates.size > 0);
 
   createEffect(() => {
     const sel = cellSel();
@@ -296,6 +299,8 @@ function SheetGridInner(props: { id: string; depth: number }): JSX.Element {
           tabIndex={-1}
           style={{ "grid-template-columns": columns() }}
           onPointerDown={onPointerDown}
+          onPointerEnter={() => setHovering(true)}
+          onPointerLeave={() => setHovering(false)}
           onDblClick={onDoubleClick}
           onContextMenu={openSheetMenu}
         >
@@ -309,48 +314,40 @@ function SheetGridInner(props: { id: string; depth: number }): JSX.Element {
               />
             )}
           </For>
-          <For each={Array.from({ length: matrix().cols }, (_, col) => col)}>
-            {(col) => (
-              <GridAggregateFooterCell
-                ownerId={props.id}
-                col={col}
-                fn={config().colAggregates.get(`${col}`) ?? null}
-                values={columnValues(col)}
-              />
-            )}
-          </For>
+          <Show when={hasAggregates()}>
+            <For each={Array.from({ length: matrix().cols }, (_, col) => col)}>
+              {(col) => (
+                <SheetAggregateFooterCell
+                  ownerId={props.id}
+                  columnKey={`${col}`}
+                  fn={config().colAggregates.get(`${col}`) ?? null}
+                  values={columnValues(col)}
+                  showEmpty={hovering()}
+                />
+              )}
+            </For>
+          </Show>
+          <Show when={!hasAggregates() && hovering()}>
+            <div class="sheet-footer-overlay" style={{ "grid-template-columns": columns() }}>
+              <For each={Array.from({ length: matrix().cols }, (_, col) => col)}>
+                {(col) => (
+                  <SheetAggregateFooterCell
+                    ownerId={props.id}
+                    columnKey={`${col}`}
+                    fn={null}
+                    values={columnValues(col)}
+                    showEmpty
+                  />
+                )}
+              </For>
+            </div>
+          </Show>
           <Show when={seamStyle()}>
             {(style) => <div class="sheet-seam-selected" style={style()} />}
           </Show>
         </div>
       </Show>
     </Show>
-  );
-}
-
-function GridAggregateFooterCell(props: {
-  ownerId: string;
-  col: number;
-  fn: AggregateFn | null;
-  values: readonly string[];
-}): JSX.Element {
-  const stop = (e: Event) => e.stopPropagation();
-  return (
-    <div class="sheet-cell sheet-footer-cell" onPointerDown={stop} onMouseDown={stop} onClick={stop}>
-      <select
-        class="sheet-aggregate-select"
-        value={props.fn ?? ""}
-        onChange={(e) => setColumnAggregate(props.ownerId, `${props.col}`, e.currentTarget.value ? (e.currentTarget.value as AggregateFn) : null)}
-      >
-        <option value="">None</option>
-        <For each={AGGREGATE_FNS}>
-          {(fn) => <option value={fn}>{AGGREGATE_LABELS[fn]}</option>}
-        </For>
-      </select>
-      <span class="sheet-aggregate-value" classList={{ "sheet-aggregate-empty": !props.fn }}>
-        {props.fn ? aggregate(props.fn, props.values) : "Σ"}
-      </span>
-    </div>
   );
 }
 
@@ -383,6 +380,11 @@ function clickOffset(e: MouseEvent, contentRef: HTMLDivElement | undefined, raw:
 function SheetGridCell(props: { gridId: string; cell: MatrixCell; header: boolean; depth: number }): JSX.Element {
   const sel = (): SheetCellCtx => ({ gridId: props.gridId, row: props.cell.row, col: props.cell.col });
   let contentRef: HTMLDivElement | undefined;
+  const bgColor = createMemo(() => {
+    const id = props.cell.blockId;
+    const node = id ? doc.byId[id] : null;
+    return node ? blockBackgroundColor(facetsOf(node.raw, formatForBlock(id!)).properties) : undefined;
+  });
   const onMouseDown = (e: MouseEvent) => {
     if (e.button !== 0 || e.shiftKey || e.ctrlKey || e.metaKey || e.altKey) return;
     if (forbidsEditEntry(e)) return;
@@ -398,6 +400,23 @@ function SheetGridCell(props: { gridId: string; cell: MatrixCell; header: boolea
     if (offset == null) setCellSel(sel());
     else startCellEditing(sel(), offset);
   };
+  const openCellMenu = (e: MouseEvent) => {
+    const blockId = props.cell.blockId;
+    if (!blockId) return;
+    e.preventDefault();
+    e.stopPropagation();
+    setCellSel(sel());
+    openSheetCellContextMenu(e.clientX, e.clientY, blockId);
+  };
+  const openCellMenuFromHandle = (e: MouseEvent) => {
+    const blockId = props.cell.blockId;
+    if (!blockId) return;
+    e.preventDefault();
+    e.stopPropagation();
+    setCellSel(sel());
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    openSheetCellContextMenu(rect.right, rect.bottom + 2, blockId);
+  };
 
   return (
     <div
@@ -412,8 +431,23 @@ function SheetGridCell(props: { gridId: string; cell: MatrixCell; header: boolea
       data-block-id={props.cell.blockId ?? undefined}
       data-row={props.cell.row}
       data-col={props.cell.col}
+      style={bgColor() ? { background: bgColor() } : undefined}
       onMouseDown={onMouseDown}
+      onContextMenu={openCellMenu}
     >
+      <Show when={props.cell.blockId}>
+        <button
+          class="sheet-cell-handle"
+          title="Cell menu"
+          onMouseDown={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+          }}
+          onClick={openCellMenuFromHandle}
+        >
+          ⋮
+        </button>
+      </Show>
       <Show when={props.cell.blockId}>
         {(blockId) => (
           <SheetBlock

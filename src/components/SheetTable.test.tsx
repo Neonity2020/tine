@@ -3,6 +3,7 @@ import { render } from "solid-js/web";
 import type { JSX } from "solid-js";
 import { Block } from "./Block";
 import { SheetTable } from "./SheetTable";
+import { DatePicker } from "./DatePicker";
 import { initParser } from "../render/parse";
 import { blockProperty, doc, resetStore, setDoc, type FeedPage, type Node as StoreNode } from "../store";
 import { setWorkflow } from "../ui";
@@ -57,6 +58,12 @@ function keydown(target: EventTarget, key: string): KeyboardEvent {
 
 function change(target: EventTarget): Event {
   const event = new Event("change", { bubbles: true, cancelable: true });
+  target.dispatchEvent(event);
+  return event;
+}
+
+function pointerEnter(target: EventTarget): Event {
+  const event = new Event("pointerenter", { bubbles: false, cancelable: true });
   target.dispatchEvent(event);
   return event;
 }
@@ -140,7 +147,7 @@ describe("SheetTable", () => {
 
     (root.querySelector(".sheet-title-header") as HTMLElement).click();
 
-    const titles = [...root.querySelectorAll(".sheet-title-cell")].map((c) => c.textContent?.trim());
+    const titles = [...root.querySelectorAll(".sheet-title-cell .sheet-cell-body")].map((c) => c.textContent?.trim());
     expect(titles).toEqual(["Alpha", "Beta"]);
     expect(doc.byId.table.children).toEqual(["b", "a"]);
     dispose();
@@ -190,13 +197,44 @@ describe("SheetTable", () => {
   it("writes the selected field aggregate token", () => {
     loadTableDoc();
     const { root, dispose } = mount(() => <Block id="table" />);
-    const selects = [...root.querySelectorAll(".sheet-aggregate-select")] as HTMLSelectElement[];
-    const estimateSelect = selects[selects.length - 1];
+    const table = root.querySelector(".sheet-table") as HTMLElement | null;
+    expect(root.querySelector(".sheet-footer-cell")).toBeNull();
+    pointerEnter(table!);
+    const adds = [...root.querySelectorAll(".sheet-footer-overlay .sheet-aggregate-add")] as HTMLButtonElement[];
+    const estimateAdd = adds[adds.length - 1];
+    expect(estimateAdd).not.toBeUndefined();
+    estimateAdd.click();
+    const estimateSelect = root.querySelector(".sheet-aggregate-select") as HTMLSelectElement | null;
+    expect(estimateSelect).not.toBeNull();
 
-    estimateSelect.value = "sum";
-    change(estimateSelect);
+    estimateSelect!.value = "sum";
+    change(estimateSelect!);
 
     expect(blockProperty("table", "tine.col-aggregates")).toBe("prop:estimate=sum");
+    dispose();
+  });
+
+  it("edits scheduled cells through the shared date picker and can clear the planning line", () => {
+    loadTableDoc();
+    const { root, dispose } = mount(() => (
+      <>
+        <Block id="table" />
+        <DatePicker />
+      </>
+    ));
+
+    mouseDown(cell(root, 0, 3));
+    expect(root.querySelector(".date-picker")).not.toBeNull();
+    const day10 = [...root.querySelectorAll(".date-picker .dp-cell")]
+      .find((el) => el.textContent?.trim() === "10") as HTMLButtonElement | undefined;
+    expect(day10).not.toBeUndefined();
+    day10!.click();
+    expect(doc.byId.r1.raw).toContain("SCHEDULED: <2026-07-10 Fri>");
+
+    mouseDown(cell(root, 0, 3));
+    (root.querySelector(".date-picker .dp-clear") as HTMLButtonElement).click();
+    expect(doc.byId.r1.raw).not.toContain("SCHEDULED:");
+
     dispose();
   });
 
