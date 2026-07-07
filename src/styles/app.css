@@ -2085,8 +2085,38 @@ body {
   background: var(--bg-tertiary);
 }
 
+.ctx-item.ctx-disabled {
+  color: var(--text-muted);
+  cursor: default;
+}
+
+.ctx-item.ctx-disabled:hover {
+  background: transparent;
+}
+
 .ctx-item.danger {
   color: var(--marker-todo);
+}
+
+.ctx-submenu {
+  position: relative;
+}
+
+.ctx-submenu-menu {
+  display: none;
+  position: absolute;
+  left: 100%;
+  top: -4px;
+  min-width: 160px;
+  padding: 4px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--bg-primary);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+}
+
+.ctx-submenu:hover .ctx-submenu-menu {
+  display: block;
 }
 
 .ctx-row {
@@ -3827,6 +3857,39 @@ body.file-drop-active::after {
   min-width: 34px;
   padding: 0;
   background: var(--bg-secondary);
+}
+.sheet-footer-cell {
+  min-height: 28px;
+  padding: 3px 6px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+.sheet-footer-title {
+  min-width: 180px;
+}
+.sheet-aggregate-select {
+  max-width: 92px;
+  min-width: 70px;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  padding: 1px 4px;
+  background: var(--bg-primary);
+  color: var(--text-secondary);
+  font: inherit;
+}
+.sheet-aggregate-select:focus {
+  outline: 1px solid var(--accent, #4c8bf5);
+}
+.sheet-aggregate-value {
+  color: var(--text-primary);
+  white-space: nowrap;
+}
+.sheet-aggregate-empty {
+  color: var(--text-muted);
 }
 .sheet-add-field {
   min-width: 34px;

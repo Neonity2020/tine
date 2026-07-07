@@ -27,6 +27,10 @@ import {
   type FieldId,
   type FieldValue,
 } from "../sheet/fields";
+import { sheetConfig } from "../sheet/config";
+import { aggregate, AGGREGATE_FNS, AGGREGATE_LABELS, type AggregateFn } from "../sheet/aggregate";
+import { setColumnAggregate } from "../sheet/mutations";
+import { openSheetContextMenu } from "../ui";
 import type { BlockDto, RefGroup } from "../types";
 import { Editor, SurfaceContext } from "./Block";
 
@@ -47,6 +51,10 @@ export function SheetTable(props: {
   const [extraFields, setExtraFields] = createSignal<FieldId[]>([]);
   const [addingColumn, setAddingColumn] = createSignal(false);
   const [editingProp, setEditingProp] = createSignal<{ rowId: string; field: FieldId; initial: string } | null>(null);
+  const config = createMemo(() => {
+    const owner = doc.byId[props.ownerId];
+    return sheetConfig(owner ? facetsOf(owner.raw, formatForBlock(props.ownerId)).properties : []);
+  });
 
   const queryPages = createMemo(() => {
     const map = new Map<string, RefGroup>();
@@ -165,12 +173,20 @@ export function SheetTable(props: {
     setExtraFields((cur) => (cur.includes(field) ? cur : [...cur, field]));
   };
 
+  const openSheetMenu = (e: MouseEvent) => {
+    if (props.rowSource !== "children") return;
+    e.preventDefault();
+    e.stopPropagation();
+    openSheetContextMenu(e.clientX, e.clientY, props.ownerId, "table", props.rowSource);
+  };
+
   return (
     <Show when={rows().length > 0} fallback={<div class="sheet-table sheet-empty">empty table</div>}>
       <div
         class="sheet-table"
         data-sheet-grid-id={props.ownerId}
         style={{ "grid-template-columns": `minmax(180px, max-content) repeat(${fields().length}, max-content) ${props.rowSource === "children" ? "34px" : ""}` }}
+        onContextMenu={openSheetMenu}
       >
         <div class="sheet-cell sheet-header-cell sheet-title-header" onClick={() => sortHeader(0)}>
           Block{sortArrow(0)}
@@ -252,8 +268,48 @@ export function SheetTable(props: {
             </>
           )}
         </For>
+        <div class="sheet-cell sheet-footer-cell sheet-footer-title" />
+        <For each={fields()}>
+          {(field) => (
+            <AggregateFooterCell
+              ownerId={props.ownerId}
+              columnKey={field}
+              fn={config().colAggregates.get(field) ?? null}
+              values={sortedRows().map((row) => fieldValue(row, field))}
+            />
+          )}
+        </For>
+        <Show when={props.rowSource === "children"}>
+          <div class="sheet-cell sheet-footer-cell sheet-row-tail" />
+        </Show>
       </div>
     </Show>
+  );
+}
+
+function AggregateFooterCell(props: {
+  ownerId: string;
+  columnKey: string;
+  fn: AggregateFn | null;
+  values: readonly (FieldValue | null)[];
+}): JSX.Element {
+  const stop = (e: Event) => e.stopPropagation();
+  return (
+    <div class="sheet-cell sheet-footer-cell" onPointerDown={stop} onMouseDown={stop} onClick={stop}>
+      <select
+        class="sheet-aggregate-select"
+        value={props.fn ?? ""}
+        onChange={(e) => setColumnAggregate(props.ownerId, props.columnKey, e.currentTarget.value ? (e.currentTarget.value as AggregateFn) : null)}
+      >
+        <option value="">None</option>
+        <For each={AGGREGATE_FNS}>
+          {(fn) => <option value={fn}>{AGGREGATE_LABELS[fn]}</option>}
+        </For>
+      </select>
+      <span class="sheet-aggregate-value" classList={{ "sheet-aggregate-empty": !props.fn }}>
+        {props.fn ? aggregate(props.fn, props.values) : "Σ"}
+      </span>
+    </div>
   );
 }
 

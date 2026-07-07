@@ -36,6 +36,8 @@ import {
   restoreTodayJournalInFeed,
   selectedIds,
 } from "../store";
+import { canFlatten, flatten, hierarchify } from "../sheet/restructure";
+import { fieldIdsForBlocks, fieldLabel, isFieldId, type FieldId } from "../sheet/fields";
 import { copyStripCollapsed } from "../copySettings";
 import { copyOutline } from "../clipboard";
 import type { PageKind } from "../types";
@@ -103,6 +105,15 @@ export function ContextMenu(): JSX.Element {
                   close={close}
                 />
               </Match>
+              <Match when={m().kind === "sheet"}>
+                <SheetMenu
+                  ownerId={(m() as { ownerId: string }).ownerId}
+                  surface={(m() as { surface: "grid" | "table" | "board" }).surface}
+                  rowSource={(m() as { rowSource: "children" | "query" }).rowSource}
+                  groupBy={(m() as { groupBy?: string | null }).groupBy}
+                  close={close}
+                />
+              </Match>
             </Switch>
           </div>
         </div>
@@ -166,6 +177,69 @@ function BlockMenu(props: { id: string; close: () => void }): JSX.Element {
       <div class="ctx-sep" />
       <MakeTemplate id={props.id} close={props.close} />
     </>
+  );
+}
+
+function sheetFields(ownerId: string): FieldId[] {
+  return fieldIdsForBlocks(doc.byId[ownerId]?.children ?? []).filter(
+    (field): field is FieldId => field === "state" || field === "priority" || field.startsWith("prop:")
+  );
+}
+
+function SheetMenu(props: {
+  ownerId: string;
+  surface: "grid" | "table" | "board";
+  rowSource: "children" | "query";
+  groupBy?: string | null;
+  close: () => void;
+}): JSX.Element {
+  const fields = () => sheetFields(props.ownerId);
+  const doHierarchify = (field: FieldId) => {
+    hierarchify(props.ownerId, field);
+    props.close();
+  };
+  const doFlatten = () => {
+    flatten(props.ownerId);
+    props.close();
+  };
+  const boardField = () => (props.groupBy && isFieldId(props.groupBy) ? props.groupBy : null);
+
+  return (
+    <Show when={props.rowSource === "children"} fallback={<div class="ctx-item ctx-disabled">No structural actions</div>}>
+      <Show when={props.surface === "board" && boardField()}>
+        {(field) => (
+          <div class="ctx-item" onClick={() => doHierarchify(field())}>
+            Hierarchify into columns
+          </div>
+        )}
+      </Show>
+      <Show
+        when={fields().length > 0}
+        fallback={<div class="ctx-item ctx-disabled">Hierarchify by →</div>}
+      >
+        <div class="ctx-item ctx-submenu">
+          <span>Hierarchify by →</span>
+          <div class="ctx-submenu-menu">
+            <For each={fields()}>
+              {(field) => (
+                <div class="ctx-item" onClick={() => doHierarchify(field)}>
+                  {fieldLabel(field)}
+                </div>
+              )}
+            </For>
+          </div>
+        </div>
+      </Show>
+      <div
+        class="ctx-item"
+        classList={{ "ctx-disabled": !canFlatten(props.ownerId) }}
+        onClick={() => {
+          if (canFlatten(props.ownerId)) doFlatten();
+        }}
+      >
+        Flatten
+      </div>
+    </Show>
   );
 }
 

@@ -1,5 +1,6 @@
 import { facetsOf } from "../render/facets";
 import type { Format } from "../render/ast";
+import { isAggregateFn, type AggregateFn } from "./aggregate";
 
 export type SheetView = "table" | "grid" | "board";
 
@@ -8,6 +9,7 @@ export interface SheetConfig {
   groupBy: string | null;
   header: boolean;
   colWidths: ReadonlyMap<number, number>;
+  colAggregates: ReadonlyMap<string, AggregateFn>;
 }
 
 const VIEWS = new Set<SheetView>(["table", "grid", "board"]);
@@ -22,6 +24,18 @@ function parseColWidths(value: string): ReadonlyMap<number, number> {
   return out;
 }
 
+function parseColAggregates(value: string): ReadonlyMap<string, AggregateFn> {
+  const out = new Map<string, AggregateFn>();
+  for (const part of value.split(";")) {
+    const m = /^\s*([^=;\s][^=;]*)\s*=\s*([a-z-]+)\s*$/.exec(part);
+    if (!m) continue;
+    const key = m[1].trim();
+    const fn = m[2].toLowerCase();
+    if (key && isAggregateFn(fn)) out.set(key, fn);
+  }
+  return out;
+}
+
 export function serializeColWidths(widths: ReadonlyMap<number, number>): string {
   return [...widths.entries()]
     .filter(([col, px]) => Number.isInteger(col) && col >= 0 && Number.isFinite(px) && px >= 0)
@@ -30,11 +44,27 @@ export function serializeColWidths(widths: ReadonlyMap<number, number>): string 
     .join(";");
 }
 
+export function serializeColAggregates(aggregates: ReadonlyMap<string, AggregateFn>): string {
+  return [...aggregates.entries()]
+    .filter(([key, fn]) => key.trim() && !/[=;\n\r]/.test(key) && isAggregateFn(fn))
+    .sort(([a], [b]) => {
+      const ai = /^\d+$/.test(a) ? Number(a) : null;
+      const bi = /^\d+$/.test(b) ? Number(b) : null;
+      if (ai != null && bi != null) return ai - bi;
+      if (ai != null) return -1;
+      if (bi != null) return 1;
+      return a.localeCompare(b);
+    })
+    .map(([key, fn]) => `${key}=${fn}`)
+    .join(";");
+}
+
 export function sheetConfig(props: readonly [string, string][]): SheetConfig {
   let view: SheetView | null = null;
   let groupBy: string | null = null;
   let header = false;
   let colWidths: ReadonlyMap<number, number> = new Map();
+  let colAggregates: ReadonlyMap<string, AggregateFn> = new Map();
 
   for (const [rawKey, rawValue] of props) {
     const key = rawKey.trim().toLowerCase();
@@ -48,10 +78,12 @@ export function sheetConfig(props: readonly [string, string][]): SheetConfig {
       header = value.toLowerCase() === "true";
     } else if (key === "tine.col-widths") {
       colWidths = parseColWidths(value);
+    } else if (key === "tine.col-aggregates") {
+      colAggregates = parseColAggregates(value);
     }
   }
 
-  return { view, groupBy, header, colWidths };
+  return { view, groupBy, header, colWidths, colAggregates };
 }
 
 /** Sheet config straight from a block's raw text, through the ONE block-property

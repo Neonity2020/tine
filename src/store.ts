@@ -1610,7 +1610,8 @@ function deleteBlockInternal(id: string) {
         node.parent === null
           ? s.pages[s.pages.findIndex((p) => p.name === pageName)].roots
           : s.byId[node.parent!].children;
-      arr.splice(arr.indexOf(id), 1);
+      const ix = arr.indexOf(id);
+      if (ix >= 0) arr.splice(ix, 1);
       const rm = (bid: string) => {
         for (const c of s.byId[bid].children) rm(c);
         delete s.byId[bid];

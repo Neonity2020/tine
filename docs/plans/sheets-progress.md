@@ -145,7 +145,23 @@ to `~/research/tine`. Martin is unavailable for testing.
       lsdoc extractor verified clean by probe) — lookbehind fix. Verified:
       npm 48+18 files green, tsc, cargo 270 (incl. new md+org table/board
       round-trip fixtures), table+board shots eyeballed, e2e ALL PASS.
-- [ ] **Phase 4 — Hierarchify/Flatten + board + aggregates**
+- [x] **Phase 4 — Hierarchify/Flatten + aggregates** — DONE Jul 7 2026 (codex,
+      verified clean). `src/sheet/restructure.ts`: hierarchify(parent, field)
+      groups children by field value into new first-seen-order group blocks
+      (one withUndoUnit); flatten pulls grandchildren up, deletes emptied
+      groups, writes labels back only for writable round-tripping fields the
+      row lacks (group-by config → inferred; unknown property keys = no
+      write-back, documented). Inverse-pair + undo + no-op tests. Context
+      menus: Hierarchify-by submenu + Flatten (children-source only), board
+      "Hierarchify into columns". `src/sheet/aggregate.ts`: Bases v1 set
+      (+count), skipped-count display; footer selector row on table+grid;
+      `tine.col-aggregates::` (field ids / positional indices) parsed+
+      serialized beside col-widths; column insert/delete shifts BOTH configs
+      in one unit; values derived, never stored. Safe guard added to
+      deleteBlockInternal (detached-block tolerance). Verified: npm 50+18
+      green, tsc, cargo 270 (new fixtures), shots + e2e ALL PASS.
+      **Phase-5 polish note:** footer is always-visible None-dropdowns —
+      should collapse to values/dimmed Σ until hover.
 - [ ] **Phase 5 — recursion + colors + polish**
 
 ## Decisions made (by Claude, per mandate)

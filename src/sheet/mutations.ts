@@ -15,7 +15,8 @@ import { copyRich } from "../clipboard";
 import { splitProps } from "../editor/properties";
 import { parseOutline } from "../editor/outline";
 import { visibleBody } from "../render/block";
-import { serializeColWidths, sheetConfigFromRaw } from "./config";
+import { serializeColAggregates, serializeColWidths, sheetConfigFromRaw } from "./config";
+import type { AggregateFn } from "./aggregate";
 import { looksLikeDelimitedText, parseDelimitedText, serializeTsv } from "./tsv";
 
 export interface SheetPoint {
@@ -148,6 +149,11 @@ function colWidths(gridId: string): ReadonlyMap<number, number> {
   return node ? sheetConfigFromRaw(node.raw, formatForBlock(gridId)).colWidths : new Map();
 }
 
+function colAggregates(gridId: string): ReadonlyMap<string, AggregateFn> {
+  const node = doc.byId[gridId];
+  return node ? sheetConfigFromRaw(node.raw, formatForBlock(gridId)).colAggregates : new Map();
+}
+
 function writeColWidths(gridId: string, widths: ReadonlyMap<number, number>): void {
   const serialized = serializeColWidths(widths);
   const current = blockProperty(gridId, "tine.col-widths");
@@ -159,19 +165,44 @@ function writeColWidths(gridId: string, widths: ReadonlyMap<number, number>): vo
   setBlockProperty(gridId, "tine.col-widths", serialized);
 }
 
-function shiftedForInsert(widths: ReadonlyMap<number, number>, at: number): Map<number, number> {
-  const next = new Map<number, number>();
-  for (const [col, px] of widths) next.set(col >= at ? col + 1 : col, px);
+function writeColAggregates(gridId: string, aggregates: ReadonlyMap<string, AggregateFn>): void {
+  const serialized = serializeColAggregates(aggregates);
+  const current = blockProperty(gridId, "tine.col-aggregates");
+  if (serialized === "") {
+    if (current !== null) setBlockProperty(gridId, "tine.col-aggregates", null);
+    return;
+  }
+  if (current === serialized) return;
+  setBlockProperty(gridId, "tine.col-aggregates", serialized);
+}
+
+function shiftedForInsert<T>(values: ReadonlyMap<number, T>, at: number): Map<number, T> {
+  const next = new Map<number, T>();
+  for (const [col, value] of values) next.set(col >= at ? col + 1 : col, value);
   return next;
 }
 
-function shiftedForDelete(widths: ReadonlyMap<number, number>, col: number): Map<number, number> {
-  const next = new Map<number, number>();
-  for (const [idx, px] of widths) {
+function shiftedForDelete<T>(values: ReadonlyMap<number, T>, col: number): Map<number, T> {
+  const next = new Map<number, T>();
+  for (const [idx, value] of values) {
     if (idx === col) continue;
-    next.set(idx > col ? idx - 1 : idx, px);
+    next.set(idx > col ? idx - 1 : idx, value);
   }
   return next;
+}
+
+function indexAggregates(aggregates: ReadonlyMap<string, AggregateFn>): Map<number, AggregateFn> {
+  const out = new Map<number, AggregateFn>();
+  for (const [key, fn] of aggregates) {
+    if (/^\d+$/.test(key)) out.set(Number(key), fn);
+  }
+  return out;
+}
+
+function stringIndexAggregates(aggregates: ReadonlyMap<number, AggregateFn>): Map<string, AggregateFn> {
+  const out = new Map<string, AggregateFn>();
+  for (const [idx, fn] of aggregates) out.set(`${idx}`, fn);
+  return out;
 }
 
 export function insertRow(gridId: string, at: number): string | null {
@@ -200,6 +231,7 @@ export function insertColumn(gridId: string, at: number): void {
       if (row && row.children.length >= at) insertEmptyChildBlock(rowId, at);
     }
     writeColWidths(gridId, shiftedForInsert(colWidths(gridId), at));
+    writeColAggregates(gridId, stringIndexAggregates(shiftedForInsert(indexAggregates(colAggregates(gridId)), at)));
   });
 }
 
@@ -215,6 +247,7 @@ export function deleteColumn(gridId: string, col: number): void {
       if (cellId) deleteBlock(cellId);
     }
     writeColWidths(gridId, shiftedForDelete(colWidths(gridId), col));
+    writeColAggregates(gridId, stringIndexAggregates(shiftedForDelete(indexAggregates(colAggregates(gridId)), col)));
   });
 }
 
@@ -246,6 +279,17 @@ export function setColumnWidth(gridId: string, col: number, px: number | null): 
     if (px === null) next.delete(col);
     else next.set(col, Math.max(40, Math.round(px)));
     writeColWidths(gridId, next);
+  });
+}
+
+export function setColumnAggregate(ownerId: string, key: string, fn: AggregateFn | null): void {
+  const node = doc.byId[ownerId];
+  if (!node || !key.trim()) return;
+  withUndoUnit("sheet:column-aggregate", [node.page], () => {
+    const next = new Map(colAggregates(ownerId));
+    if (fn) next.set(key, fn);
+    else next.delete(key);
+    writeColAggregates(ownerId, next);
   });
 }
 

@@ -3,7 +3,7 @@ import { render } from "solid-js/web";
 import type { JSX } from "solid-js";
 import { Block } from "./Block";
 import { initParser } from "../render/parse";
-import { resetStore, setDoc, type Node, type FeedPage } from "../store";
+import { blockProperty, resetStore, setDoc, type Node, type FeedPage } from "../store";
 
 beforeAll(async () => {
   await initParser();
@@ -41,6 +41,12 @@ function node(
   children: string[] = []
 ): Node {
   return { id, raw, collapsed: false, parent, page: pageName, children };
+}
+
+function change(target: EventTarget): Event {
+  const event = new Event("change", { bubbles: true, cancelable: true });
+  target.dispatchEvent(event);
+  return event;
 }
 
 function loadMdSheetDoc() {
@@ -135,6 +141,52 @@ describe("SheetGrid", () => {
     expect(root.querySelectorAll(".sheet-header-cell")).toHaveLength(2);
     expect(root.textContent).not.toContain("tine.view");
 
+    dispose();
+  });
+
+  it("renders a configured positional aggregate footer", () => {
+    const pageName = "Sheet";
+    setDoc({
+      byId: {
+        grid: node("grid", "Grid parent\ntine.view:: grid\ntine.col-aggregates:: 1=sum", pageName, null, ["r1", "r2"]),
+        r1: node("r1", "", pageName, "grid", ["a1", "a2"]),
+        a1: node("a1", "Alpha", pageName, "r1"),
+        a2: node("a2", "2", pageName, "r1"),
+        r2: node("r2", "", pageName, "grid", ["b1", "b2"]),
+        b1: node("b1", "Beta", pageName, "r2"),
+        b2: node("b2", "5", pageName, "r2"),
+      },
+      pages: [page("md", ["grid"])],
+      feed: [pageName],
+      loaded: true,
+    });
+    const { root, dispose } = mount(() => <Block id="grid" />);
+
+    expect(root.textContent).toContain("7");
+
+    dispose();
+  });
+
+  it("writes the selected positional aggregate token", () => {
+    const pageName = "Sheet";
+    setDoc({
+      byId: {
+        grid: node("grid", "Grid parent\ntine.view:: grid", pageName, null, ["r1"]),
+        r1: node("r1", "", pageName, "grid", ["a1"]),
+        a1: node("a1", "2", pageName, "r1"),
+      },
+      pages: [page("md", ["grid"])],
+      feed: [pageName],
+      loaded: true,
+    });
+    const { root, dispose } = mount(() => <Block id="grid" />);
+    const select = root.querySelector(".sheet-aggregate-select") as HTMLSelectElement | null;
+    expect(select).not.toBeNull();
+
+    select!.value = "sum";
+    change(select!);
+
+    expect(blockProperty("grid", "tine.col-aggregates")).toBe("0=sum");
     dispose();
   });
 });

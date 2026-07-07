@@ -36,6 +36,8 @@ function loadGrid(raw = "Grid\ntine.view:: grid"): string {
   grid.properties = [["tine.view", "grid"]];
   const widths = /(?:^|\n)tine\.col-widths:: ?([^\n]*)/.exec(raw)?.[1];
   if (widths != null) grid.properties.push(["tine.col-widths", widths]);
+  const aggregates = /(?:^|\n)tine\.col-aggregates:: ?([^\n]*)/.exec(raw)?.[1];
+  if (aggregates != null) grid.properties.push(["tine.col-aggregates", aggregates]);
   const dto: PageDto = { name: "Sheet", kind: "page", title: "Sheet", pre_block: null, blocks: [grid] };
   loadSingle(dto);
   return grid.id;
@@ -96,29 +98,33 @@ describe("sheet structural mutations", () => {
   });
 
   it("inserts a column across ragged rows and shifts col-width keys in the same undo unit", () => {
-    const gridId = loadGrid("Grid\ntine.view:: grid\ntine.col-widths:: 0=120;2=88");
+    const gridId = loadGrid("Grid\ntine.view:: grid\ntine.col-widths:: 0=120;2=88\ntine.col-aggregates:: 0=sum;2=average");
 
     insertColumn(gridId, 1);
 
     expect(gridShape(gridId)).toEqual([["A", "", "B", "C"], ["D", ""], []]);
     expect(blockProperty(gridId, "tine.col-widths")).toBe("0=120;3=88");
+    expect(blockProperty(gridId, "tine.col-aggregates")).toBe("0=sum;3=average");
 
     undo();
     expect(gridShape(gridId)).toEqual([["A", "B", "C"], ["D"], []]);
     expect(blockProperty(gridId, "tine.col-widths")).toBe("0=120;2=88");
+    expect(blockProperty(gridId, "tine.col-aggregates")).toBe("0=sum;2=average");
   });
 
   it("deletes a column across ragged rows and rewrites col-width keys in the same undo unit", () => {
-    const gridId = loadGrid("Grid\ntine.view:: grid\ntine.col-widths:: 0=120;1=77;2=88");
+    const gridId = loadGrid("Grid\ntine.view:: grid\ntine.col-widths:: 0=120;1=77;2=88\ntine.col-aggregates:: 0=sum;1=max;2=average");
 
     deleteColumn(gridId, 1);
 
     expect(gridShape(gridId)).toEqual([["A", "C"], ["D"], []]);
     expect(blockProperty(gridId, "tine.col-widths")).toBe("0=120;1=88");
+    expect(blockProperty(gridId, "tine.col-aggregates")).toBe("0=sum;1=average");
 
     undo();
     expect(gridShape(gridId)).toEqual([["A", "B", "C"], ["D"], []]);
     expect(blockProperty(gridId, "tine.col-widths")).toBe("0=120;1=77;2=88");
+    expect(blockProperty(gridId, "tine.col-aggregates")).toBe("0=sum;1=max;2=average");
   });
 
   it("materializes a hole by appending exactly the missing cells", () => {

@@ -823,7 +823,8 @@ export async function pruneSidebarBlocks(): Promise<void> {
 export type CtxTarget =
   | { kind: "block"; blockId: string }
   | { kind: "page"; name: string; pageKind: "journal" | "page" }
-  | { kind: "blockref"; uuid: string; page: string; pageKind: "journal" | "page" };
+  | { kind: "blockref"; uuid: string; page: string; pageKind: "journal" | "page" }
+  | { kind: "sheet"; ownerId: string; surface: "grid" | "table" | "board"; rowSource: "children" | "query"; groupBy?: string | null };
 export const [contextMenu, setContextMenu] = createSignal<
   ({ x: number; y: number } & CtxTarget) | null
 >(null);
@@ -846,6 +847,16 @@ export function openBlockRefContextMenu(
   pageKind: "journal" | "page" = "page"
 ) {
   setContextMenu({ x, y, kind: "blockref", uuid, page, pageKind });
+}
+export function openSheetContextMenu(
+  x: number,
+  y: number,
+  ownerId: string,
+  surface: "grid" | "table" | "board",
+  rowSource: "children" | "query",
+  groupBy?: string | null
+) {
+  setContextMenu({ x, y, kind: "sheet", ownerId, surface, rowSource, groupBy });
 }
 export function closeContextMenu() {
   setContextMenu(null);

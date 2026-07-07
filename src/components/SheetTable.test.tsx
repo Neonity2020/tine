@@ -4,7 +4,7 @@ import type { JSX } from "solid-js";
 import { Block } from "./Block";
 import { SheetTable } from "./SheetTable";
 import { initParser } from "../render/parse";
-import { doc, resetStore, setDoc, type FeedPage, type Node as StoreNode } from "../store";
+import { blockProperty, doc, resetStore, setDoc, type FeedPage, type Node as StoreNode } from "../store";
 import { setWorkflow } from "../ui";
 import { resetCellSelectionForTests } from "../sheet/selection";
 import type { RefGroup } from "../types";
@@ -51,6 +51,12 @@ function mouseDown(target: EventTarget): MouseEvent {
 
 function keydown(target: EventTarget, key: string): KeyboardEvent {
   const event = new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true });
+  target.dispatchEvent(event);
+  return event;
+}
+
+function change(target: EventTarget): Event {
+  const event = new Event("change", { bubbles: true, cancelable: true });
   target.dispatchEvent(event);
   return event;
 }
@@ -159,6 +165,63 @@ describe("SheetTable", () => {
     expect(root.textContent).toContain("Query row");
     expect(root.textContent).toContain("Page");
     expect(root.querySelector(".sheet-add-field-btn")).toBeNull();
+    dispose();
+  });
+
+  it("renders a configured field aggregate footer", () => {
+    setDoc({
+      byId: {
+        table: node("table", "Table\ntine.view:: table\ntine.col-aggregates:: prop:estimate=sum", null, ["r1", "r2", "r3"]),
+        r1: node("r1", "TODO First\nestimate:: 2h", "table"),
+        r2: node("r2", "TODO Second\nestimate:: 5h", "table"),
+        r3: node("r3", "DONE Third", "table"),
+      },
+      pages: [page(["table"])],
+      feed: ["Sheet"],
+      loaded: true,
+    });
+    const { root, dispose } = mount(() => <Block id="table" />);
+
+    expect(root.textContent).toContain("7 (1 skipped)");
+
+    dispose();
+  });
+
+  it("writes the selected field aggregate token", () => {
+    loadTableDoc();
+    const { root, dispose } = mount(() => <Block id="table" />);
+    const selects = [...root.querySelectorAll(".sheet-aggregate-select")] as HTMLSelectElement[];
+    const estimateSelect = selects[selects.length - 1];
+
+    estimateSelect.value = "sum";
+    change(estimateSelect);
+
+    expect(blockProperty("table", "tine.col-aggregates")).toBe("prop:estimate=sum");
+    dispose();
+  });
+
+  it("recomputes a field aggregate after an inline cell edit", () => {
+    setDoc({
+      byId: {
+        table: node("table", "Table\ntine.view:: table\ntine.col-aggregates:: prop:estimate=sum", null, ["r1", "r2", "r3"]),
+        r1: node("r1", "TODO First\nestimate:: 2h", "table"),
+        r2: node("r2", "TODO Second\nestimate:: 5h", "table"),
+        r3: node("r3", "DONE Third", "table"),
+      },
+      pages: [page(["table"])],
+      feed: ["Sheet"],
+      loaded: true,
+    });
+    const { root, dispose } = mount(() => <Block id="table" />);
+
+    expect(root.textContent).toContain("7 (1 skipped)");
+    mouseDown(cell(root, 1, 2));
+    const input = root.querySelector("input.sheet-prop-input") as HTMLInputElement | null;
+    expect(input).not.toBeNull();
+    input!.value = "8h";
+    keydown(input!, "Enter");
+
+    expect(root.textContent).toContain("10 (1 skipped)");
     dispose();
   });
 });

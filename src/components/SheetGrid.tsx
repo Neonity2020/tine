@@ -1,6 +1,7 @@
 import { For, Match, Show, Switch, createEffect, createMemo, createSignal, type JSX } from "solid-js";
 import { doc, formatForBlock } from "../store";
 import { AstBody } from "../render/body";
+import { visibleBody } from "../render/block";
 import { facetsOf } from "../render/facets";
 import { sheetConfig } from "../sheet/config";
 import { buildMatrix, type MatrixCell } from "../sheet/matrix";
@@ -13,11 +14,13 @@ import {
   startCellEditing,
   type SheetSel,
 } from "../sheet/selection";
-import { setColumnWidth } from "../sheet/mutations";
+import { setColumnAggregate, setColumnWidth } from "../sheet/mutations";
+import { aggregate, AGGREGATE_FNS, AGGREGATE_LABELS, type AggregateFn } from "../sheet/aggregate";
 import { editorOffsetFromRenderedRange } from "../render/spans";
 import { isBuiltinHidden } from "../editor/properties";
 import { forbidsEditEntry } from "../editor/editTargets";
 import { editingId, editingOwner } from "../editorController";
+import { openSheetContextMenu } from "../ui";
 import { Editor, SurfaceContext } from "./Block";
 import { SheetTable } from "./SheetTable";
 import { SheetBoard } from "./SheetBoard";
@@ -269,6 +272,17 @@ function SheetGridInner(props: { id: string; depth: number }): JSX.Element {
     setColumnWidth(props.id, hit.at - 1, null);
   };
 
+  const openSheetMenu = (e: MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    openSheetContextMenu(e.clientX, e.clientY, props.id, "grid", "children");
+  };
+
+  const columnValues = (col: number): string[] =>
+    matrix().cells
+      .filter((cell) => cell.col === col && !(config().header && cell.row === 0))
+      .map((cell) => (cell.blockId ? visibleBody(doc.byId[cell.blockId]?.raw ?? "").join(" ") : ""));
+
   return (
     <Show when={props.depth < MAX_GRID_DEPTH} fallback={<SheetOutline ids={blockChildren(props.id)} depth={props.depth} />}>
       <Show when={rows().length > 0} fallback={<div class="sheet-grid sheet-empty">empty grid</div>}>
@@ -283,6 +297,7 @@ function SheetGridInner(props: { id: string; depth: number }): JSX.Element {
           style={{ "grid-template-columns": columns() }}
           onPointerDown={onPointerDown}
           onDblClick={onDoubleClick}
+          onContextMenu={openSheetMenu}
         >
           <For each={matrix().cells}>
             {(cell) => (
@@ -294,12 +309,48 @@ function SheetGridInner(props: { id: string; depth: number }): JSX.Element {
               />
             )}
           </For>
+          <For each={Array.from({ length: matrix().cols }, (_, col) => col)}>
+            {(col) => (
+              <GridAggregateFooterCell
+                ownerId={props.id}
+                col={col}
+                fn={config().colAggregates.get(`${col}`) ?? null}
+                values={columnValues(col)}
+              />
+            )}
+          </For>
           <Show when={seamStyle()}>
             {(style) => <div class="sheet-seam-selected" style={style()} />}
           </Show>
         </div>
       </Show>
     </Show>
+  );
+}
+
+function GridAggregateFooterCell(props: {
+  ownerId: string;
+  col: number;
+  fn: AggregateFn | null;
+  values: readonly string[];
+}): JSX.Element {
+  const stop = (e: Event) => e.stopPropagation();
+  return (
+    <div class="sheet-cell sheet-footer-cell" onPointerDown={stop} onMouseDown={stop} onClick={stop}>
+      <select
+        class="sheet-aggregate-select"
+        value={props.fn ?? ""}
+        onChange={(e) => setColumnAggregate(props.ownerId, `${props.col}`, e.currentTarget.value ? (e.currentTarget.value as AggregateFn) : null)}
+      >
+        <option value="">None</option>
+        <For each={AGGREGATE_FNS}>
+          {(fn) => <option value={fn}>{AGGREGATE_LABELS[fn]}</option>}
+        </For>
+      </select>
+      <span class="sheet-aggregate-value" classList={{ "sheet-aggregate-empty": !props.fn }}>
+        {props.fn ? aggregate(props.fn, props.values) : "Σ"}
+      </span>
+    </div>
   );
 }
 

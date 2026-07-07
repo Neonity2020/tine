@@ -23,7 +23,7 @@ import {
   type FieldId,
 } from "../sheet/fields";
 import { MARKERS } from "../markers";
-import { workflow } from "../ui";
+import { openSheetContextMenu, workflow } from "../ui";
 import type { BlockDto, RefGroup } from "../types";
 import { Editor, SurfaceContext } from "./Block";
 
@@ -132,9 +132,16 @@ export function SheetBoard(props: {
     if (target) writeField(row.id, groupBy(), target.key ?? "");
   };
 
+  const openSheetMenu = (e: MouseEvent) => {
+    if (props.rowSource !== "children") return;
+    e.preventDefault();
+    e.stopPropagation();
+    openSheetContextMenu(e.clientX, e.clientY, props.ownerId, "board", props.rowSource, groupBy());
+  };
+
   return (
     <Show when={columns().length > 0} fallback={<div class="sheet-board sheet-empty">empty board</div>}>
-      <div class="sheet-board" data-sheet-grid-id={props.ownerId}>
+      <div class="sheet-board" data-sheet-grid-id={props.ownerId} onContextMenu={openSheetMenu}>
         <For each={columns()}>
           {(col, colIndex) => (
             <section
