@@ -1,5 +1,16 @@
 # Sheets — Martin's nit list (Jul 7 2026) + triage
 
+**Resume state (post-compaction):** batch 1 (N1) dispatched to codex
+(`subagent-tasks/sheets-nits-batch1-layout.md`) — verify on landing
+(wide-table screenshot proof, all gates, e2e), commit+push, deploy to
+`~/research/tine-sheets`. Then write + dispatch batch 2 = N2 (drag ghost +
+grabbing cursor), N3 (Esc walks up from nested sub-grid to the containing
+cell), N4 (cell editor hides `tine.*`/hidden props — splitProps pattern),
+N5 guard (toast when a query-board move ejects the card from the refreshed
+results). Samples already fixed. Martin approved the canvas proposal
+(breakout + sticky edges + zoom = the canvas; no infinite-pan widget) and
+re-tests after the fixes → expect a SECOND nit batch.
+
 Captured verbatim-in-spirit from his post-Phase-7 testing; root causes
 investigated before triage. Batch polish pass runs against this list.
 Status legend: FIXED / IN PROGRESS / PROPOSED (needs Martin's call).
