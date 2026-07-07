@@ -15,7 +15,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   typed `tine.fields::` schemas, editable task/property cells, tag boards with
   write-back, aggregates, markdown pipe-table conversion, and CSV/TSV file-drop
   import — all stored as ordinary Logseq markdown/org outlines plus `tine.*`
-  properties.
+  properties. Phase 7 adds typed `tine.formula.<name>::` computed columns and
+  formula group-by axes, `tine.filter::` table/board filters that fail open with a
+  visible chip, and a right-click formula/filter editor.
 
 ### Fixed
 

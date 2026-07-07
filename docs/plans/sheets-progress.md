@@ -458,8 +458,24 @@ Plan: [sheets-phase7-plan.md](sheets-phase7-plan.md); DSL decided in ADR 0028.
   note + a §10 filtered-table section (round-trip re-validated; NOTE:
   Martin is actively editing that graph while testing — always re-read
   before editing).
-- **7d NEXT** — docs sync (FEATURES/README/CHANGELOG), onboarding
-  template + website demo, screenshots, org sample parity for formulas.
+- **7d DONE (Jul 7) — PHASE 7 COMPLETE** — docs pass: FEATURES.md gained
+  the full formula/filter/editor section (syntax examples, stdlib list,
+  honesty rule spelled out), README bullet + pitch, CHANGELOG Unreleased
+  Sheets entry extended, onboarding template gained a formula line +
+  website demo regenerated, SCREENSHOTS.md triggers updated,
+  docs/img/sheets.png refreshed. Orchestrator fix: codex's README roadmap
+  edit dropped "configurable typographic auto-replace" (still genuinely
+  planned) and invented an "iOS" entry (redundant with the Mobile
+  paragraph) — restored; its removal of the advanced-Datalog item was
+  correct (shipped, CHANGELOG confirms). tine-test §10 filter sample
+  re-applied after the concurrent-save clobber (Martin's app was holding
+  the page) and re-validated; binary rebuilt with the new onboarding
+  template and deployed to `~/research/tine-sheets`.
+
+**Phase 7 leftovers** (deliberate): org-graph sample has no formula
+section yet (Martin actively testing; add on request); custom
+`values`-expression footer summaries; formula rename in the editor
+(remove + re-add works); `.relative()`/`.format()` token set is minimal.
 
 **Phase 6 leftovers for a later pass** (deliberate): list chip editor
 (comma-text editing works); enum types are hand-edit-only in the header

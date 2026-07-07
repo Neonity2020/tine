@@ -192,11 +192,35 @@ coordinates, no lock-in.
   write back to the source block. Optional `tine.fields::` schemas pin column
   order and type cells as text, number, date/datetime, checkbox, list, ref, or
   enum; the header menu edits that schema in place.
+- **Formula columns and filters** — add read-only computed columns with one
+  property per expression:
+  `tine.formula.effort:: points * 2`,
+  `tine.formula.due-soon:: if(isEmpty(deadline), false, deadline < today() + "7d")`,
+  and filter rows with `tine.filter:: status != "done" && formula.due-soon`.
+  The DSL is a JS-flavored, typed expression subset: field names are bare
+  identifiers, formulas can reference `formula.<name>`, and the stdlib is
+  deliberately small (`if`, `isEmpty`; text `.contains/.lower/.trim/.replace/.length`;
+  number `.round/.floor/.ceil/.abs/.toFixed(n)`; date `now()`, `today()`,
+  `.format(fmt)`, `.year/.month/.day`, `.relative()`; list
+  `.length/.join(sep)/.contains(x)`). Errors are values: a bad formula renders an
+  ⚠ chip with the message on hover, and formula values are derived at render time
+  and never stored back onto blocks.
 - **Task kanban** — `tine.view:: board` groups task/query rows by state,
   priority, or a property; dragging a card or pressing `Ctrl+←/→` writes the
   grouping field back to the card.
 - **Tag boards** — boards can group by tags too: a multi-tag card appears in
   each matching column, and moving it adds/removes the tag on that block.
+- **Formula group-by and fail-open filters** — boards can group on computed axes
+  with `tine.group-by:: formula.due-soon`; formula axes are read-only, so moving a
+  card cannot rewrite a derived value. `tine.filter::` works on tables and boards
+  with the same evaluator. Honesty rule: if the filter has a parse error, returns
+  a non-boolean, or any row evaluates to an error, filtering is disabled for the
+  whole view and Tine shows a **Filter disabled** chip instead of quietly hiding
+  rows.
+- **Validating formula editor** — right-click a table or board and choose **Add
+  formula…** or **Edit filter…**. The popup live-validates the expression with a
+  caret marker, offers field/formula/stdlib chips, and keeps Save disabled until
+  the expression parses.
 - **Hierarchify / Flatten** — commit a field grouping into the outline, or pull
   grouped children back up into a flat table.
 - **Conversions** — convert a markdown pipe table block into a grid, or export
@@ -219,7 +243,7 @@ coordinates, no lock-in.
 
 V1 limits: `page` columns are read-only; range operations are single-level
 within the current grid; board cards can move between columns but not reorder
-within a column; formulas and merged cells are still v2+.
+within a column; merged cells are still v2+.
 
 ## Tasks, journals & dates
 
