@@ -491,6 +491,31 @@ date cell (needs `setSchedule` time support).
 Martin's v1 UX nits are PARKED (his list, not yet captured) — batch later,
 don't interleave.
 
+## Round 5 — split view (Martin, Jul 8) [NEXT — architecture study dispatched]
+
+Martin (Jul 8): wants BOTH deferred v3 tracks unless a new reason against
+emerged — (1) whiteboards-lite (free-floating cards) and (2) split screen
+with the grid nav model (à la TreeSheets: typing at an edge opens a new
+split). **He's more excited about split screen** — it goes first.
+
+Assessment (no new reasons against; the picture IMPROVED in rounds 1–4):
+
+- **Split view** (`leafKind: pane`, spec §10 v3): the hard UX half — the
+  seam-as-selection-target machinery, edge-typing materialization, the
+  select→edit ladder — now EXISTS and is daily-driven in the grid. What
+  remains is the known cost, unchanged since the spec: per-pane
+  `RouteContext` instead of the singleton `route()`/tabs in `src/router.ts`,
+  a pane split-tree (workspace state, NOT document — must persist via the
+  Rust backend, WebKitGTK localStorage is ephemeral), pane chrome, and
+  pointer-events-only seam/tab drag (never HTML5 DnD).
+- **Whiteboards-lite** = the canvas face (`trackModel: free`, spec §10 v3,
+  Jul 5 decomposition): cards + `tine.x/y/w/h` scalar props + ref edges,
+  round-trips as a flat bullet list. No new reason against; one thing got
+  BETTER: master's #38 media-editor registry (drawio/Excalidraw
+  edit-externally) just merged in, so the freehand-ink job is served
+  outside the engine and the canvas face stays cleanly cards-only.
+  Queued as Round 6, after split view.
+
 ## Working notes
 
 - **Deploys (Martin, Jul 7): Sheets builds go to `~/research/tine-sheets`**;
