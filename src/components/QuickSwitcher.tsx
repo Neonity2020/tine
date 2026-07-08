@@ -4,6 +4,7 @@ import { switcherOpen, closeSwitcher, switcherMode, recentPages } from "../ui";
 import { openPage, openPageAtBlock, openPageInNewTab, openFile, openInNewTab, route } from "../router";
 import { paletteCommands } from "../keybindings";
 import { fuzzyScore } from "../editor/autocomplete";
+import { parseSearchQuery, matcherMatches, matchHighlight, type SearchMatcher } from "../editor/searchQuery";
 import { visibleBody } from "../render/block";
 import { EmojiText } from "../render/emoji";
 import type { PageEntry, PageKind } from "../types";
@@ -62,6 +63,9 @@ export function QuickSwitcher(): JSX.Element {
   });
 
   const commandsOnly = () => switcherMode() === "commands";
+  // The parsed search dialect (#44): drives page filtering, snippet highlighting,
+  // and the invalid-regex hint. Blocks are already matched by the backend.
+  const matcher = createMemo<SearchMatcher>(() => parseSearchQuery(query()));
   // The backend search/quick-switch IPC keys off a debounced query so holding
   // keys doesn't fire a whole-graph scan per character; local sections (recents,
   // commands, create-option) still react to `query()` instantly.
@@ -121,9 +125,12 @@ export function QuickSwitcher(): JSX.Element {
     }
 
     const ql = q.toLowerCase();
-    // Pages (require contiguous substring — fuzzy subsequence reads as noise here).
+    const mt = matcher();
+    // Pages: a bare single term keeps contiguous-substring / fuzzy backend ranking;
+    // operators / a 2nd term / `/regex/` apply the full dialect (mirrors the Rust
+    // block matcher, so the same query filters pages and blocks consistently).
     const allPages: Item[] = (pages() ?? [])
-      .filter((e) => e.name.toLowerCase().includes(ql))
+      .filter((e) => matcherMatches(mt, e.name.toLowerCase(), e.name))
       .map((e) => ({ t: "page", name: e.name, pageKind: e.kind, path: e.path }));
     const morePages = allPages.length > pageLimit();
     const pageItems = morePages ? allPages.slice(0, pageLimit()) : allPages;
@@ -325,7 +332,7 @@ export function QuickSwitcher(): JSX.Element {
                             } else if (e.button === 0) choose(it);
                           }}
                         >
-                          <Row item={it} query={query()} />
+                          <Row item={it} matcher={matcher()} />
                         </div>
                       );
                     }}
@@ -345,7 +352,12 @@ export function QuickSwitcher(): JSX.Element {
                 </div>
               )}
             </For>
-            <Show when={query().trim() && flat().length === 0}>
+            <Show when={matcher().kind === "invalid"}>
+              <div class="switcher-empty switcher-error">
+                Invalid regex: {(matcher() as { kind: "invalid"; error: string }).error}
+              </div>
+            </Show>
+            <Show when={query().trim() && flat().length === 0 && matcher().kind !== "invalid"}>
               <div class="switcher-empty">No matched results</div>
             </Show>
           </div>
@@ -362,7 +374,7 @@ export function QuickSwitcher(): JSX.Element {
 
 // A single result row body, with an icon tag, label, and (for blocks) a
 // highlighted snippet windowed around the match.
-function Row(props: { item: Item; query: string }): JSX.Element {
+function Row(props: { item: Item; matcher: SearchMatcher }): JSX.Element {
   const it = props.item;
   switch (it.t) {
     case "page":
@@ -398,31 +410,31 @@ function Row(props: { item: Item; query: string }): JSX.Element {
               <EmojiText text={it.page} />
               <EmojiText text={it.crumb.length ? ` › ${it.crumb.join(" › ")} › ` : ": "} />
             </span>
-            {snippet(it.text, props.query)}
+            {snippet(it.text, props.matcher)}
           </span>
         </>
       );
   }
 }
 
-// Window the text around the first case-insensitive match and wrap it in <mark>.
-function snippet(text: string, query: string): JSX.Element {
-  const q = query.trim();
+// Window the text around the first match (first positive term, or first regex
+// match) and wrap it in <mark>.
+function snippet(text: string, matcher: SearchMatcher): JSX.Element {
   // Every text run goes through EmojiText: a raw color-emoji glyph in block
   // content crashes WebKitGTK's Skia COLRv1 path on hardened libstdc++ (#29).
-  if (!q) return <EmojiText text={text.slice(0, 120)} />;
-  const i = text.toLowerCase().indexOf(q.toLowerCase());
-  if (i === -1) return <EmojiText text={text.slice(0, 120)} />;
+  const hit = matchHighlight(matcher, text);
+  if (!hit) return <EmojiText text={text.slice(0, 120)} />;
+  const i = hit.start;
   const start = Math.max(0, i - 30);
   const pre = (start > 0 ? "…" : "") + text.slice(start, i);
-  const match = text.slice(i, i + q.length);
-  const post = text.slice(i + q.length, i + q.length + 60);
+  const match = text.slice(i, i + hit.len);
+  const post = text.slice(i + hit.len, i + hit.len + 60);
   return (
     <>
       <EmojiText text={pre} />
       <mark><EmojiText text={match} /></mark>
       <EmojiText text={post} />
-      {i + q.length + 60 < text.length ? "…" : ""}
+      {i + hit.len + 60 < text.length ? "…" : ""}
     </>
   );
 }

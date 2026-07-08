@@ -1,0 +1,70 @@
+import { describe, it, expect } from "vitest";
+import { parseSearchQuery, matcherMatches, simpleTerm, matchHighlight } from "./searchQuery";
+
+// Mirrors crates/tine-core/src/search_query.rs tests — keep the two in sync.
+const hit = (q: string, text: string) =>
+  matcherMatches(parseSearchQuery(q), text.toLowerCase(), text);
+
+describe("searchQuery parser (#44)", () => {
+  it("single bare term is simple", () => {
+    expect(simpleTerm(parseSearchQuery("hello"))).toBe("hello");
+    expect(hit("hello", "well HELLO there")).toBe(true);
+    expect(hit("hello", "goodbye")).toBe(false);
+  });
+
+  it("whitespace is order-independent AND", () => {
+    expect(simpleTerm(parseSearchQuery("foo bar"))).toBeNull();
+    expect(hit("foo bar", "bar then foo")).toBe(true);
+    expect(hit("foo bar", "only foo")).toBe(false);
+  });
+
+  it("OR keyword splits groups; AND binds tighter", () => {
+    expect(hit("cat OR dog", "i have a dog")).toBe(true);
+    expect(hit("cat OR dog", "i have a fish")).toBe(false);
+    expect(hit("apple pie OR cake", "cake")).toBe(true);
+    expect(hit("apple pie OR cake", "apple pie")).toBe(true);
+    expect(hit("apple pie OR cake", "apple tart")).toBe(false);
+  });
+
+  it("negation excludes; pure negation matches nothing", () => {
+    expect(hit("foo -bar", "foo only")).toBe(true);
+    expect(hit("foo -bar", "foo and bar")).toBe(false);
+    expect(parseSearchQuery("-bar").kind).toBe("empty");
+    expect(hit("-bar", "anything")).toBe(false);
+  });
+
+  it("quoted phrase is contiguous and not simple", () => {
+    expect(hit('"foo bar"', "a foo bar b")).toBe(true);
+    expect(hit('"foo bar"', "foo x bar")).toBe(false);
+    expect(simpleTerm(parseSearchQuery('"foo"'))).toBeNull();
+    expect(hit('keep -"foo bar"', "keep foo x bar")).toBe(true);
+    expect(hit('-"foo bar"', "foo bar here")).toBe(false);
+  });
+
+  it("whole-query regex is case-sensitive", () => {
+    expect(hit("/[A-Z]{3}/", "abc ABC def")).toBe(true);
+    expect(hit("/[A-Z]{3}/", "abc def")).toBe(false);
+    expect(hit("/^start/", "start of line")).toBe(true);
+    expect(hit("/^start/", "not at start")).toBe(false);
+  });
+
+  it("invalid regex reports an error and matches nothing", () => {
+    const m = parseSearchQuery("/(unclosed/");
+    expect(m.kind).toBe("invalid");
+    expect(hit("/(unclosed/", "(unclosed")).toBe(false);
+  });
+
+  it("`//` is a literal term, not a regex", () => {
+    expect(parseSearchQuery("//").kind).toBe("boolean");
+    expect(hit("//", "a // b")).toBe(true);
+  });
+
+  it("highlight picks the earliest positive term / regex match", () => {
+    expect(matchHighlight(parseSearchQuery("bar"), "foo bar baz")).toEqual({ start: 4, len: 3 });
+    // earliest of two AND terms
+    expect(matchHighlight(parseSearchQuery("baz foo"), "foo bar baz")).toEqual({ start: 0, len: 3 });
+    expect(matchHighlight(parseSearchQuery("/b.z/"), "foo bar baz")).toEqual({ start: 8, len: 3 });
+    // negated terms are never highlighted
+    expect(matchHighlight(parseSearchQuery("foo -bar"), "foo bar")).toEqual({ start: 0, len: 3 });
+  });
+});

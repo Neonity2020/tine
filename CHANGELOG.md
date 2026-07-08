@@ -10,6 +10,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Added
 
+- **Search operators in Ctrl-K** ([#44](https://github.com/martinkoutecky/tine/issues/44)).
+  The quick-search box now understands the mainstream full-text dialect: multiple
+  words are an order-independent **AND** (all must match), `OR` (uppercase) is an
+  alternation, `-word` **excludes**, `"a phrase"` matches contiguously, and
+  `/regex/` runs a (case-sensitive) regular expression with an inline "invalid
+  pattern" hint. A single bare word still ranks pages fuzzily as before; any
+  second term or operator switches both the page list and block results to the
+  operator grammar. Search is case-insensitive except inside `/regex/`.
+
 - **Diagrams via your own drawio / Excalidraw** ([#38](https://github.com/martinkoutecky/tine/issues/38),
   proposed by @nataloko). Keep diagrams next to your notes as ordinary image
   assets and edit them in the diagram app you already have — Tine bundles no

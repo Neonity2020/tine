@@ -4434,6 +4434,7 @@ dependencies = [
  "chrono",
  "lsdoc",
  "pretty_assertions",
+ "regex",
  "serde",
  "serde_json",
  "slotmap",

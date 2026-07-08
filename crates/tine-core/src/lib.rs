@@ -16,6 +16,7 @@ pub mod publish;
 pub mod query;
 pub mod refs;
 pub mod render;
+pub mod search_query;
 pub mod sync_diff;
 
 /// Re-export the lsdoc parser so the Tauri shell can name its AST types

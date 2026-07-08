@@ -835,11 +835,14 @@ fn sort_key(b: &BlockDto, page: &str, field: &str) -> String {
     }
 }
 
-/// Full-text search: blocks whose visible text contains `query`
-/// (case-insensitive), grouped by page, capped at `limit` total blocks.
+/// Full-text search: blocks whose visible text matches `query` under the Ctrl-K
+/// search dialect (whitespace=AND, `OR`, `-exclude`, `"phrase"`, `/regex/`; see
+/// [`crate::search_query`]), grouped by page, capped at `limit` total blocks.
 pub fn search(graph: &Graph, query: &str, limit: usize) -> Vec<RefGroup> {
-    let q = query.trim().to_lowercase();
-    if q.is_empty() || limit == 0 {
+    use crate::search_query::Matcher;
+    let matcher = Matcher::parse(query);
+    // Empty / invalid-regex queries match nothing — skip the whole-graph walk.
+    if limit == 0 || matches!(matcher, Matcher::Empty | Matcher::InvalidRegex(_)) {
         return Vec::new();
     }
     // Stop scanning once we've collected `limit` matches, rather than walking the
@@ -858,7 +861,8 @@ pub fn search(graph: &Graph, query: &str, limit: usize) -> Vec<RefGroup> {
                 if remaining == 0 {
                     return;
                 }
-                if b.projection().visible_lower.contains(&q) {
+                let proj = b.projection();
+                if matcher.matches(&proj.visible_lower, &proj.visible) {
                     let mut dto = block_to_dto(b);
                     dto.breadcrumb = anc.iter().map(|a| crumb_line(a)).collect();
                     matched.push(dto);
@@ -978,7 +982,30 @@ pub fn property_facets(graph: &Graph) -> Vec<(String, Vec<String>)> {
 /// Fuzzy page-name matcher for the quick switcher. Ranks prefix > substring >
 /// subsequence, then by name length.
 pub fn quick_switch(graph: &Graph, query: &str, limit: usize) -> Vec<PageEntry> {
-    let q = query.trim().to_lowercase();
+    use crate::search_query::Matcher;
+    let matcher = Matcher::parse(query);
+    // A bare single term keeps today's fuzzy ranking (`score_name`); any operator
+    // / second term / regex switches to the boolean+regex grammar via `matcher`.
+    // We pass the simple term as `q` so the fuzzy path is byte-for-byte unchanged.
+    let simple = matcher.simple_term();
+    // An invalid regex matches nothing; `limit == 0` asks for nothing. (An Empty
+    // matcher — blank query — still lists every page via `score_name("")==0`, the
+    // just-opened state, so it is NOT short-circuited here.)
+    if limit == 0 || matches!(matcher, Matcher::InvalidRegex(_)) {
+        return Vec::new();
+    }
+    let q = simple.unwrap_or("").to_string();
+    // Score a page name: the simple/empty path keeps the fuzzy `score_name`
+    // (prefix > substring > subsequence); a boolean/regex query scores via the
+    // shared matcher (regex needs the original-case name).
+    let use_matcher = simple.is_none() && !matches!(matcher, Matcher::Empty);
+    let score = |lower: &str, orig: &str| -> Option<i32> {
+        if use_matcher {
+            matcher.score_name(lower, orig)
+        } else {
+            score_name(lower, &q)
+        }
+    };
     // `list_pages` / `referenced_page_names` are `cache_gen`-memoized and return a
     // clone-on-read snapshot ON PURPOSE (so a keystroke never holds the cache lock
     // across this scoring work) — those single snapshot clones stay. What we DO
@@ -995,7 +1022,7 @@ pub fn quick_switch(graph: &Graph, query: &str, limit: usize) -> Vec<PageEntry> 
         .iter()
         .enumerate()
         .filter_map(|(i, e)| {
-            score_name(&e.name.to_lowercase(), &q).map(|s| (s - e.name.len() as i32, Cand::File(i)))
+            score(&e.name.to_lowercase(), &e.name).map(|s| (s - e.name.len() as i32, Cand::File(i)))
         })
         .collect();
     // Pages referenced by `#tag` / `[[link]]` but with no file of their own still
@@ -1009,7 +1036,7 @@ pub fn quick_switch(graph: &Graph, query: &str, limit: usize) -> Vec<PageEntry> 
         if have.contains(&lower) {
             continue;
         }
-        if let Some(s) = score_name(&lower, &q) {
+        if let Some(s) = score(&name.to_lowercase(), &name) {
             let len = name.len() as i32;
             scored.push((
                 s - len,
