@@ -19,6 +19,47 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   formula group-by axes, `tine.filter::` table/board filters that fail open with a
   visible chip, and a right-click formula/filter editor.
 
+- **Diagrams via your own drawio / Excalidraw** ([#38](https://github.com/martinkoutecky/tine/issues/38),
+  proposed by @nataloko). Keep diagrams next to your notes as ordinary image
+  assets and edit them in the diagram app you already have — Tine bundles no
+  editor. A `/drawio` command creates a new editable `assets/…​.drawio.svg`,
+  inserts it as an image, and opens it in drawio; hovering any `*.drawio.svg` (or
+  `*.excalidraw.svg` / `.png`) shows an **Edit in …** button. When you switch back
+  to Tine the rendered image refreshes. Because the file is a normal image
+  reference, the same graph still renders in Logseq (round-trip intact). Configure
+  the editor commands (with autodetect for drawio) under **Settings → Files →
+  Diagram editors**; empty uses your system default opener. Desktop only.
+
+- **Hover peek for page links** ([#40](https://github.com/martinkoutecky/tine/issues/40)).
+  Dwelling on a `[[page]]` or `#tag` opens a small read-only preview card of that
+  page's blocks — a quick look without navigating away, like Logseq. The fetch is
+  lazy (only on hover, cached per open graph) and the preview is bounded, so it
+  costs nothing until used.
+
+### Changed
+
+- **Foldable blocks are now discoverable in the right sidebar**
+  ([#41](https://github.com/martinkoutecky/tine/issues/41)). Blocks opened in the
+  sidebar were already foldable (they're the same live blocks as the main pane),
+  but the fold arrow only appeared on a pixel-precise hover and was easy to miss
+  in the narrow pane. It now stays softly visible while the sidebar item is
+  hovered, going full-strength on the block itself.
+
+### Fixed
+
+- **Shift-clicking a link no longer selects text** ([#42](https://github.com/martinkoutecky/tine/issues/42)).
+  Shift-clicking a `[[page]]`, `#tag`, or block reference opens it in the sidebar;
+  the browser's native shift-range-selection is now suppressed so no stray text in
+  the main editor gets selected as a side effect.
+- **Org property drawers no longer show in the editor** ([#37](https://github.com/martinkoutecky/tine/issues/37)).
+  In `.org` files a block's built-in `id` lives in a `:PROPERTIES:`/`:END:` drawer;
+  when a block was zoomed/opened (which stamps an id for durable references) that
+  drawer appeared as raw text on edit. It's now hidden from the editor — and the
+  empty drawer wrapper removed — exactly like markdown `id::`, matching Logseq's
+  `remove-built-in-properties`. The drawer is reattached at its canonical spot on
+  save; a user property in the same drawer keeps it visible (only the built-in
+  line is hidden).
+
 ## [0.4.5] - 2026-07-07
 
 ### Changed

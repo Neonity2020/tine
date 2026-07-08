@@ -2,7 +2,7 @@
 // [[links]] and #tags), not an innerHTML string. Used to render a block when it
 // is not being edited.
 
-import { For, Show, createEffect, createMemo, createResource, createSignal, type JSX } from "solid-js";
+import { For, Show, createEffect, createMemo, createResource, createSignal, onCleanup, type JSX } from "solid-js";
 import { Dynamic } from "solid-js/web";
 import { mediaKind } from "../media";
 import { openPage, openPageInNewTab, openPageAtBlock, focusBlock } from "../router";
@@ -12,6 +12,7 @@ import { openPdf, openPageInSidebar, openBlockInSidebar, openPageContextMenu, op
 import { copyImageFromSrc } from "../copyImage";
 import { parseBlock, parserReady } from "./parse";
 import type { Inline, Url, MacroInline, TimestampInline, EmailValue, Block as AstBlock, Format } from "./ast";
+import type { BlockDto, PageKind } from "../types";
 import { timestampText } from "./renderedText";
 import { EmojiText } from "./emoji";
 import { sanitizeRawHtml, rawHtmlLocalImages } from "./htmlSanitize";
@@ -23,7 +24,11 @@ import { typographyMode } from "../ui";
 import { visibleBody } from "./block";
 import { AstBody } from "./body";
 import { backend } from "../backend";
-import { loadAssetBlob, loadLocalImageBlob } from "../assetCache";
+import { loadAssetBlob, loadLocalImageBlob, assetVersion } from "../assetCache";
+import { mediaEditorForAsset } from "../mediaEditors";
+import { mediaEditorCommand } from "../mediaEditorSettings";
+import { refreshAssetOnReturn } from "../assetRefresh";
+import { isMobilePlatform } from "../nativeChrome";
 import { resolveBlockBatched } from "../resolveBatch";
 import { doc, setRaw, formatForPage, formatForBlock } from "../store";
 import { QueryMacro, EmbedMacro, VideoMacro, TweetMacro, YoutubeTimestamp, ClozeMacro, ZoteroMacro } from "../components/Macro";
@@ -177,6 +182,30 @@ function macroBody(s: MacroInline): string {
   return s.args.length ? `${s.name} ${s.args.join(", ")}` : s.name;
 }
 
+// How long the cursor must dwell on a link before its hover preview opens, and
+// how many block first-lines the preview renders (bounded so a hover on a huge
+// page never mounts the whole tree — perf directive).
+const PAGE_PEEK_DWELL_MS = 350;
+const PAGE_PEEK_LINE_CAP = 40;
+
+// Flatten a page's block tree to (first-line, depth) rows for the hover peek,
+// skipping empty bullets, stopping at PAGE_PEEK_LINE_CAP. Depth drives a small
+// indent so the preview conveys structure without block-level DOM (the card
+// lives inside an <a>, so it must stay spans-only — see PageRef).
+function flattenPeek(
+  blocks: BlockDto[],
+  depth = 0,
+  out: { text: string; depth: number }[] = [],
+): { text: string; depth: number }[] {
+  for (const b of blocks) {
+    if (out.length >= PAGE_PEEK_LINE_CAP) break;
+    const first = visibleBody(b.raw)[0] ?? "";
+    if (first.trim()) out.push({ text: first, depth });
+    if (b.children.length) flattenPeek(b.children, depth + 1, out);
+  }
+  return out;
+}
+
 // A `[[page]]` / `#tag` anchor — shared by page_ref links, bare refs, and #tags.
 function PageRef(props: { name: string; alias?: JSX.Element; tag?: boolean; spanAttrs?: SpanDomAttrs }): JSX.Element {
   // The referenced page's `icon::`, shown as a prefix like OG (and Tine's own page
@@ -184,22 +213,45 @@ function PageRef(props: { name: string; alias?: JSX.Element; tag?: boolean; span
   // WebKitGTK paints color-emoji webfonts blank. Reactive + batched + cached per
   // graph; an icon-less graph costs one IPC and no re-render (see pageIconBatch).
   const icon = () => pageIcon(props.name);
+  const kind = (): PageKind => (isJournalTitle(props.name) ? "journal" : "page");
   const open = (e: MouseEvent) => {
     e.stopPropagation();
-    const kind = isJournalTitle(props.name) ? "journal" : "page";
-    if (e.shiftKey) openPageInSidebar(props.name, kind);
-    else openPage(props.name, kind);
+    if (e.shiftKey) openPageInSidebar(props.name, kind());
+    else openPage(props.name, kind());
   };
+
+  // Hover peek (GH #40): after a short dwell, fetch the target page and show a
+  // read-only preview card — mirrors OG's page hover popup and Tine's own
+  // block-ref preview. The fetch is lazy (only once hovered) and cached per open
+  // graph via the resource key; leaving cancels a pending open so a cursor merely
+  // grazing links while reading never spawns popups.
+  const [peek, setPeek] = createSignal(false);
+  let dwell: ReturnType<typeof setTimeout> | undefined;
+  const cancelDwell = () => { if (dwell) { clearTimeout(dwell); dwell = undefined; } };
+  const enter = () => { cancelDwell(); dwell = setTimeout(() => setPeek(true), PAGE_PEEK_DWELL_MS); };
+  const leave = () => { cancelDwell(); setPeek(false); };
+  onCleanup(cancelDwell);
+  const [preview] = createResource(
+    () => (peek() ? `${props.name} ${graphEpoch()}` : null),
+    () => backend().getPage(props.name, kind()),
+  );
+
   return (
     <a
       class={props.tag ? "tag" : "page-ref"}
       {...(props.spanAttrs ?? {})}
+      // Shift+click opens the page in the sidebar (via `open`); suppress the
+      // browser's native shift-range-selection so the main editor's text isn't
+      // selected as a side effect (GH #42).
+      onMouseDown={(e) => { if (e.shiftKey) e.preventDefault(); }}
       onClick={open}
+      onMouseEnter={enter}
+      onMouseLeave={leave}
       onAuxClick={(e) => {
         if (e.button === 1) {
           e.preventDefault();
           e.stopPropagation();
-          openPageInNewTab(props.name, isJournalTitle(props.name) ? "journal" : "page");
+          openPageInNewTab(props.name, kind());
         }
       }}
       onContextMenu={(e) => {
@@ -217,6 +269,18 @@ function PageRef(props: { name: string; alias?: JSX.Element; tag?: boolean; span
         </Show>
       }>
         #{props.name}
+      </Show>
+      <Show when={peek() && preview() && preview()!.blocks.length > 0}>
+        <span class="page-ref-preview" onMouseDown={(e) => e.stopPropagation()}>
+          <span class="page-ref-preview-title"><EmojiText text={props.name} /></span>
+          <For each={flattenPeek(preview()!.blocks)}>
+            {(ln) => (
+              <span class="page-ref-preview-line" style={{ "padding-left": `${ln.depth * 12}px` }}>
+                <InlineText text={ln.text} format={preview()!.format === "org" ? "org" : "md"} />
+              </span>
+            )}
+          </For>
+        </span>
       </Show>
     </a>
   );
@@ -496,14 +560,21 @@ function AssetImage(props: {
     ...(props.height ? { height: props.height } : {}),
   });
   const external = /^(https?:|data:|blob:)/.test(props.url);
+  const rel = () => (external ? null : assetRelPath(props.url));
   // Served from a shared, graph-scoped blob cache so repeated references and
   // re-mounts don't re-read the file or mint duplicate blob URLs. The cache owns
   // the URL's lifetime (cleared on graph switch), so we don't revoke on unmount.
+  // The source key folds in the per-asset version (GH #38) so an external edit —
+  // which bumps that version after invalidating the cache — re-runs this resource
+  // and the <img> re-reads the new bytes from disk.
   const [diskSrc] = createResource(
-    () => (external ? null : props.url),
-    async (url) => {
-      const rel = assetRelPath(url);
-      return rel ? await loadAssetBlob(rel) : "";
+    () => {
+      const r = rel();
+      return r == null ? null : `${r} ${assetVersion(r)}`;
+    },
+    async () => {
+      const r = rel();
+      return r ? await loadAssetBlob(r) : "";
     }
   );
   const src = () => (external ? props.url : diskSrc());
@@ -563,6 +634,23 @@ function AssetImage(props: {
     }
   };
 
+  // "Edit in <external editor>" (GH #38): shown only for a graph asset whose
+  // filename matches a media-editor registry entry (e.g. *.drawio.svg). Launches
+  // the configured command (empty = OS opener) and marks the asset to refresh
+  // when Tine regains focus after the edit.
+  const editor = () =>
+    assetActions() && !isMobilePlatform ? mediaEditorForAsset(assetRelPath(props.url)) : undefined;
+  const onEditAsset = (e: MouseEvent) => {
+    e.stopPropagation();
+    const name = assetRelPath(props.url);
+    const ed = editor();
+    if (!name || !ed) return;
+    void backend()
+      .editAssetExternal(name, mediaEditorCommand(ed.settingKey))
+      .catch(() => pushToast(`Couldn't open ${ed.label.replace(/^Edit in /, "")}`, "error"));
+    refreshAssetOnReturn(name);
+  };
+
   return (
     <Show
       when={external || src()}
@@ -579,6 +667,14 @@ function AssetImage(props: {
         />
         <Show when={assetActions()}>
           <span class="asset-action-bar" aria-hidden="true">
+            <Show when={editor()}>
+              <button class="asset-action-btn" title={editor()!.label} onClick={onEditAsset}>
+                <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M12 20h9" />
+                  <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z" />
+                </svg>
+              </button>
+            </Show>
             <button class="asset-action-btn" title="Copy image" onClick={onCopyAsset}>
               <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
                 <rect x="9" y="9" width="11" height="11" rx="2" />
@@ -858,6 +954,8 @@ function BlockRefView(props: { id: string; label?: string; spanAttrs?: SpanDomAt
       classList={{ "block-ref-missing": !grp() }}
       {...(props.spanAttrs ?? {})}
       title="Click to go to the block; shift-click → sidebar; right-click for more"
+      // Suppress native shift-range-selection when shift+click opens the sidebar (GH #42).
+      onMouseDown={(e) => { if (e.shiftKey) e.preventDefault(); }}
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
       onContextMenu={(e) => {

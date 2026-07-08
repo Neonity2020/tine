@@ -70,9 +70,11 @@ import { parserFailed } from "./render/parse";
 import { warnIfSoftwareRendering } from "./gpu";
 import { initSmoothScroll } from "./smoothScroll";
 import { initCopySettings } from "./copySettings";
+import { initRefCompletionSettings } from "./refCompletionSettings";
 import { initNavSettings } from "./navSettings";
 import { initLocalFileSettings } from "./localFileSettings";
 import { initAssetSettings } from "./assetSettings";
+import { initMediaEditorSettings } from "./mediaEditorSettings";
 import { initSpellcheckSettings } from "./spellcheckSettings";
 import { initLinkDefault } from "./editor/linkDefault";
 import { initDebug, dbg } from "./debug";
@@ -117,6 +119,7 @@ export function App(): JSX.Element {
   // (`.main-content`) is mounted by now (onMount runs after first render).
   onMount(() => void initSmoothScroll());
   onMount(() => void initCopySettings());
+  onMount(() => void initRefCompletionSettings());
   onMount(() => void initNavSettings());
   // Load the local-file images opt-in (Settings → Editing). Default off.
   onMount(() => void initLocalFileSettings());
@@ -130,6 +133,8 @@ export function App(): JSX.Element {
   });
   // Load the asset-filename format template (Settings → Backups → Asset names).
   onMount(() => void initAssetSettings());
+  // Load external media-editor command templates (Settings → Files; GH #38).
+  onMount(() => void initMediaEditorSettings());
   // Load spellcheck prefs (toggle + languages) and apply them to the webview.
   onMount(() => void initSpellcheckSettings());
 
