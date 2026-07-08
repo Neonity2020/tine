@@ -1647,13 +1647,13 @@ fn parse_expr(toks: &[Tok], pos: &mut usize, today: JournalDate) -> Option<Pred>
                     Pred::Namespace(name)
                 }
                 "property" => {
-                    let key = parse_name(toks, pos)?;
-                    let val = parse_opt_name(toks, pos);
+                    let key = normalize_prop_key(&parse_name(toks, pos)?);
+                    let val = parse_opt_value(toks, pos);
                     Pred::Property(key, val)
                 }
                 "page-property" => {
-                    let key = parse_name(toks, pos)?;
-                    let val = parse_opt_name(toks, pos);
+                    let key = normalize_prop_key(&parse_name(toks, pos)?);
+                    let val = parse_opt_value(toks, pos);
                     Pred::PageProperty(key, val)
                 }
                 "page-tags" | "tags" => Pred::PageTags(parse_words(toks, pos)),
@@ -1788,6 +1788,30 @@ fn parse_opt_name(toks: &[Tok], pos: &mut usize) -> Option<String> {
     }
 }
 
+/// A property KEY, normalized the way Logseq's query DSL does (`(name k)` then
+/// `_`→`-`, see query_dsl.cljs build-property-two-arg): drop a leading `:` so the
+/// keyword form `:fach` and the symbol form `fach` both mean `fach`, and map
+/// underscores to dashes (Logseq stores `my_key` as `my-key`). WITHOUT this the
+/// simple parser kept `:fach` verbatim and it never matched the stored key `fach`.
+fn normalize_prop_key(k: &str) -> String {
+    k.trim_start_matches(':').replace('_', "-")
+}
+
+/// Optional property VALUE: like `parse_opt_name`, but also accepts a `[[page]]`
+/// or `#tag` token (Logseq's parse-property-value extracts the page name and
+/// strips a leading `#`; `value_matches` does the ref/tag stripping on both
+/// sides). WITHOUT this, `(property k [[Page]])` / `(property k #tag)` dropped the
+/// value AND leaked the ref token, which was then mis-parsed as a stray page-ref
+/// clause — the second reported failure mode.
+fn parse_opt_value(toks: &[Tok], pos: &mut usize) -> Option<String> {
+    match toks.get(*pos) {
+        Some(Tok::Word(_)) | Some(Tok::Str(_)) | Some(Tok::PageRef(_)) | Some(Tok::Tag(_)) => {
+            parse_name(toks, pos)
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1855,6 +1879,72 @@ mod tests {
             pred("(property public)"),
             Pred::Property("public".into(), None)
         );
+    }
+
+    #[test]
+    fn property_key_and_ref_value_match_logseq() {
+        // Leading `:` on the key is stripped (keyword form == symbol form).
+        assert_eq!(
+            pred("(property :type book)"),
+            Pred::Property("type".into(), Some("book".into()))
+        );
+        // `_` → `-` (Logseq stores `my_key` as `my-key`).
+        assert_eq!(
+            pred("(property my_key v)"),
+            Pred::Property("my-key".into(), Some("v".into()))
+        );
+        // A `[[page]]` value is captured (was dropped, leaking a stray page-ref).
+        assert_eq!(
+            pred("(property :fach [[Foo Bar]])"),
+            Pred::Property("fach".into(), Some("Foo Bar".into()))
+        );
+        // A `#tag` value is captured.
+        assert_eq!(
+            pred("(property :type #assignment)"),
+            Pred::Property("type".into(), Some("assignment".into()))
+        );
+        // page-property mirrors the same normalization + value capture.
+        assert_eq!(
+            pred("(page-property :fach [[Foo]])"),
+            Pred::PageProperty("fach".into(), Some("Foo".into()))
+        );
+    }
+
+    #[test]
+    fn reported_and_of_colon_properties_parses_both_clauses() {
+        // GH: `(and (property :fach [[X]]) (property :type "#assignment"))` used to
+        // parse to And[Property(":fach", None), PageRef(X)] — the colon key never
+        // matched, the ref leaked, and the second clause was dropped → "No results".
+        let p = pred(
+            r##"(and (property :fach [[Management der digitalen Transformation]]) (property :type "#assignment"))"##,
+        );
+        assert_eq!(
+            p,
+            Pred::And(vec![
+                Pred::Property(
+                    "fach".into(),
+                    Some("Management der digitalen Transformation".into())
+                ),
+                Pred::Property("type".into(), Some("#assignment".into())),
+            ])
+        );
+    }
+
+    #[test]
+    fn eval_colon_property_and_query_matches_block() {
+        let none = ctx_named();
+        let mut b = DocBlock::new("assignment one");
+        b.raw
+            .push_str("\nfach:: [[Management der digitalen Transformation]]\ntype:: #assignment");
+        // The reported query now matches a block carrying both properties.
+        assert!(pred(
+            r##"(and (property :fach [[Management der digitalen Transformation]]) (property :type "#assignment"))"##
+        )
+        .eval(&b, &none));
+        // A different course value does not match.
+        assert!(!pred("(property :fach [[Other Course]])").eval(&b, &none));
+        // Colon-less form still works (unchanged behavior).
+        assert!(pred("(property type assignment)").eval(&b, &none));
     }
 
     #[test]

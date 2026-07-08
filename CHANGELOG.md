@@ -56,6 +56,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **`{{query (property …)}}` with `:colon` keys and `[[page]]`/`#tag` values now
+  matches.** A simple query like `(and (property :fach [[Course]]) (property :type
+  "#assignment"))` returned "No results": the parser kept the leading `:` on the
+  key (so `:fach` never matched the property `fach`) and dropped a `[[page]]` or
+  `#tag` used as a property value. Both are now handled the way Logseq does (drop
+  the `:`, map `_`→`-`, extract the page name / strip the `#`), for `property` and
+  `page-property`, in both the query engine and the visual query builder.
+
 - **Camera / voice-memo captures no longer overwrite each other's names.** Photos
   and voice memos were being named `photo.jpg` / `voice-memo.m4a` (colliding to
   `photo_1.jpg` / `voice-memo_1.m4a`), losing the timestamp naming that pasted

@@ -201,8 +201,8 @@ function parseExpr(toks: Tok[], cur: Cur, src: string): Clause | null {
           clause = null;
           break;
         }
-        const value = parseOptName(toks, cur);
-        clause = { kind: "property", key, value };
+        const value = parseOptValue(toks, cur);
+        clause = { kind: "property", key: normPropKey(key), value };
         break;
       }
       case "page-property": {
@@ -211,8 +211,8 @@ function parseExpr(toks: Tok[], cur: Cur, src: string): Clause | null {
           clause = null;
           break;
         }
-        const value = parseOptName(toks, cur);
-        clause = { kind: "pageProperty", key, value };
+        const value = parseOptValue(toks, cur);
+        clause = { kind: "pageProperty", key: normPropKey(key), value };
         break;
       }
       case "page-tags":
@@ -333,6 +333,23 @@ function parseName(toks: Tok[], cur: Cur): string | null {
 function parseOptName(toks: Tok[], cur: Cur): string | null {
   const t = toks[cur.pos];
   if (t && (t.t === "word" || t.t === "str")) return parseName(toks, cur);
+  return null;
+}
+
+/** A property KEY normalized as Logseq's query DSL does (mirrors
+ *  query.rs::normalize_prop_key): drop a leading `:` (keyword form `:fach` ==
+ *  symbol form `fach`) and map `_`→`-`. */
+function normPropKey(k: string): string {
+  return k.replace(/^:+/, "").replace(/_/g, "-");
+}
+
+/** Optional property VALUE: like `parseOptName` but also accepts a `[[page]]` /
+ *  `#tag` token (mirrors query.rs::parse_opt_value) so `(property k [[Page]])`
+ *  keeps its value instead of dropping it and leaking a stray page-ref clause. */
+function parseOptValue(toks: Tok[], cur: Cur): string | null {
+  const t = toks[cur.pos];
+  if (t && (t.t === "word" || t.t === "str" || t.t === "page" || t.t === "tag"))
+    return parseName(toks, cur);
   return null;
 }
 
