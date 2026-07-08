@@ -44,6 +44,34 @@ describe("parse + serialize round-trip", () => {
     );
   });
 
+  it("property keys drop a leading colon / underscore and keep ref values", () => {
+    // Mirrors query.rs: `:fach` → `fach`, `_`→`-`, and a [[page]] / #tag VALUE is
+    // captured (was dropped, leaking a stray page-ref) — the reported bug's builder side.
+    const prop = (dsl: string) => {
+      const root = parseQuery(dsl);
+      // parseQuery wraps a single clause in an `and` root.
+      const c = root.kind === "op" ? root.children[0] : root;
+      return c;
+    };
+    expect(prop("(property :type book)")).toEqual({ kind: "property", key: "type", value: "book" });
+    expect(prop("(property my_key v)")).toEqual({ kind: "property", key: "my-key", value: "v" });
+    expect(prop("(property :fach [[Foo Bar]])")).toEqual({
+      kind: "property",
+      key: "fach",
+      value: "Foo Bar",
+    });
+    expect(prop("(property :type #assignment)")).toEqual({
+      kind: "property",
+      key: "type",
+      value: "assignment",
+    });
+    expect(prop("(page-property :fach [[Foo]])")).toEqual({
+      kind: "pageProperty",
+      key: "fach",
+      value: "Foo",
+    });
+  });
+
   it("new OG-parity filters round-trip", () => {
     expect(roundtrip("(page Project/Alpha)")).toBe("(page Project/Alpha)");
     expect(roundtrip("(namespace Project)")).toBe("(namespace Project)");

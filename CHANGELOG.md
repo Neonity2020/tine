@@ -24,6 +24,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   links in another pane, tabs can be dragged to another pane or seam, and the
   layout persists across launches.
 
+## [0.4.6] - 2026-07-08
+
+### Added
+
+- **Search operators in Ctrl-K** ([#44](https://github.com/martinkoutecky/tine/issues/44)).
+  The quick-search box now understands the mainstream full-text dialect: multiple
+  words are an order-independent **AND** (all must match), `OR` (uppercase) is an
+  alternation, `-word` **excludes**, `"a phrase"` matches contiguously, and
+  `/regex/` runs a (case-sensitive) regular expression with an inline "invalid
+  pattern" hint. A single bare word still ranks pages fuzzily as before; any
+  second term or operator switches both the page list and block results to the
+  operator grammar. Search is case-insensitive except inside `/regex/`.
+
 - **Diagrams via your own drawio / Excalidraw** ([#38](https://github.com/martinkoutecky/tine/issues/38),
   proposed by @nataloko). Keep diagrams next to your notes as ordinary image
   assets and edit them in the diagram app you already have — Tine bundles no
@@ -34,6 +47,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   reference, the same graph still renders in Logseq (round-trip intact). Configure
   the editor commands (with autodetect for drawio) under **Settings → Files →
   Diagram editors**; empty uses your system default opener. Desktop only.
+
+- **Desktop voice memos** (`/record`). On desktop, `/record` starts a microphone
+  recording in the app (via the WebView's recorder) and a second `/record` stops
+  it and inserts the audio as an asset — no phone required. Previously mic capture
+  existed only on Android.
+
+- **Journals button in the toolbar.** A one-click "go to Journals" button now sits
+  next to the date-jump control in the top bar, so you no longer need the sidebar
+  to get back to today's journal.
 
 - **Hover peek for page links** ([#40](https://github.com/martinkoutecky/tine/issues/40)).
   Dwelling on a `[[page]]` or `#tag` opens a small read-only preview card of that
@@ -51,6 +73,34 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   hovered, going full-strength on the block itself.
 
 ### Fixed
+
+- **`{{query (property …)}}` with `:colon` keys and `[[page]]`/`#tag` values now
+  matches.** A simple query like `(and (property :fach [[Course]]) (property :type
+  "#assignment"))` returned "No results": the parser kept the leading `:` on the
+  key (so `:fach` never matched the property `fach`) and dropped a `[[page]]` or
+  `#tag` used as a property value. Both are now handled the way Logseq does (drop
+  the `:`, map `_`→`-`, extract the page name / strip the `#`), for `property` and
+  `page-property`, in both the query engine and the visual query builder.
+
+- **Camera / voice-memo captures no longer overwrite each other's names.** Photos
+  and voice memos were being named `photo.jpg` / `voice-memo.m4a` (colliding to
+  `photo_1.jpg` / `voice-memo_1.m4a`), losing the timestamp naming that pasted
+  images get. Captures now get the same unique `yyyymmdd-hhmmss-…` name as a paste,
+  with their real extension.
+
+- **Pasting a screenshot now works on Windows** ([#43](https://github.com/martinkoutecky/tine/issues/43),
+  reported by @msjsc001). `Ctrl+V` of an image copied by a Windows screenshot
+  tool (e.g. PixPin) did nothing; Tine now reads the image straight from the
+  paste event on Windows and macOS (falling back to the OS clipboard on Linux),
+  so the screenshot lands in `assets/` and inserts into the block directly.
+
+- **The query builder's "⚙ advanced" pill no longer destroys the query.**
+  Clicking it used to replace the simple query with a multi-line Datalog
+  template that a `{{query}}` macro cannot even hold (macros are single-line
+  and brace-free), so the block stopped rendering as a query and the original
+  filters were lost. It now *converts* the current query clause-by-clause to
+  an equivalent single-line `[:find …]` form, refuses (with a toast) when a
+  clause has no Datalog equivalent, and undo restores the simple form.
 
 - **Shift-clicking a link no longer selects text** ([#42](https://github.com/martinkoutecky/tine/issues/42)).
   Shift-clicking a `[[page]]`, `#tag`, or block reference opens it in the sidebar;

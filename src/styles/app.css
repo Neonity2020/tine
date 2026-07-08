@@ -5969,6 +5969,10 @@ img.emoji {
   font-size: 14px;
 }
 
+.switcher-empty.switcher-error {
+  color: var(--error, #d33);
+}
+
 .switcher-group-header {
   display: flex;
   align-items: center;

@@ -85,6 +85,8 @@ import { editorOffsetFromRenderedRange } from "../render/spans";
 import {
   assetMarkdown,
   assetFileName,
+  captureAssetFileName,
+  recordingExt,
   insertedAssetMarkdownTarget,
   replaceInsertedAssetMarkdown,
 } from "../media";
@@ -1159,8 +1161,8 @@ export function Editor(props: { id: string }): JSX.Element {
   // Seed + insert an asset from raw bytes at the caret, then persist to assets/
   // in the background (repointing the link if the backend de-dups the name).
   // Shared by clipboard-image paste and mobile capture (camera / voice memo).
-  const insertAssetBytes = (bytes: Uint8Array, origName?: string) => {
-    const candidate = assetFileName(origName);
+  const insertAssetBytes = (bytes: Uint8Array, origName?: string, captureExt?: string) => {
+    const candidate = captureExt !== undefined ? captureAssetFileName(captureExt) : assetFileName(origName);
     // Cache key is the bare filename — assetRelPath() strips the `assets/` prefix
     // before loadAssetBlob() (see render/inline.tsx). Seed it so the asset renders
     // instantly, before the disk write lands.
@@ -1206,7 +1208,7 @@ export function Editor(props: { id: string }): JSX.Element {
       pushToast(`Couldn’t capture a photo (${String(err)})`, "error");
       return;
     }
-    if (res.status === "ok" && res.data) insertAssetBytes(base64ToBytes(res.data), `photo.${res.ext || "jpg"}`);
+    if (res.status === "ok" && res.data) insertAssetBytes(base64ToBytes(res.data), undefined, res.ext || "jpg");
   };
 
   // Mobile: toggle voice-memo recording. First tap starts (prompts for mic
@@ -1221,7 +1223,7 @@ export function Editor(props: { id: string }): JSX.Element {
         pushToast(`Couldn’t save the recording (${String(err)})`, "error");
         return;
       }
-      if (res.status === "ok" && res.data) insertAssetBytes(base64ToBytes(res.data), `voice-memo.${res.ext || "m4a"}`);
+      if (res.status === "ok" && res.data) insertAssetBytes(base64ToBytes(res.data), undefined, res.ext || "m4a");
       return;
     }
     let res;
@@ -1235,6 +1237,63 @@ export function Editor(props: { id: string }): JSX.Element {
       setRecordingAudio(true);
       pushToast("Recording… tap the mic again to stop", "info");
     }
+  };
+
+  // Desktop voice memo (/record): the Android start_recording/stop_recording Tauri
+  // commands are stubbed to error on desktop, so record entirely in the WebView with
+  // getUserMedia + MediaRecorder, then reuse insertAssetBytes with the real ext.
+  // First /record starts; second stops and inserts.
+  let desktopRecorder: MediaRecorder | undefined;
+  let desktopRecorderStream: MediaStream | undefined;
+  let desktopRecorderChunks: Blob[] = [];
+  const desktopVoiceMemoToggle = async () => {
+    if (isRecordingAudio() && desktopRecorder) {
+      // Second /record: stop; onstop (below) inserts the asset.
+      desktopRecorder.stop();
+      return;
+    }
+    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
+      pushToast("Mic capture isn’t available here", "error");
+      return;
+    }
+    let stream: MediaStream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch (err) {
+      pushToast(`Couldn’t access the microphone (${String(err)})`, "error");
+      return;
+    }
+    let recorder: MediaRecorder;
+    try {
+      recorder = new MediaRecorder(stream);
+    } catch (err) {
+      stream.getTracks().forEach((t) => t.stop());
+      pushToast(`Couldn’t start recording (${String(err)})`, "error");
+      return;
+    }
+    desktopRecorder = recorder;
+    desktopRecorderStream = stream;
+    desktopRecorderChunks = [];
+    recorder.ondataavailable = (e) => {
+      if (e.data && e.data.size > 0) desktopRecorderChunks.push(e.data);
+    };
+    recorder.onstop = () => {
+      const chunks = desktopRecorderChunks;
+      const mime = recorder.mimeType;
+      desktopRecorderStream?.getTracks().forEach((t) => t.stop());
+      desktopRecorder = undefined;
+      desktopRecorderStream = undefined;
+      desktopRecorderChunks = [];
+      setRecordingAudio(false);
+      void (async () => {
+        const blob = new Blob(chunks, { type: mime });
+        const bytes = new Uint8Array(await blob.arrayBuffer());
+        if (bytes.length) insertAssetBytes(bytes, undefined, recordingExt(mime));
+      })();
+    };
+    recorder.start();
+    setRecordingAudio(true);
+    pushToast("Recording… run /record again to stop", "info");
   };
 
   const uploadAsset = async () => {
@@ -1363,6 +1422,10 @@ export function Editor(props: { id: string }): JSX.Element {
       case "upload-asset":
         replaceTrigger(""); // drop the "/upload" trigger text
         uploadAsset();
+        return;
+      case "record":
+        replaceTrigger(""); // drop the "/record" trigger text
+        void desktopVoiceMemoToggle();
         return;
       case "drawio":
         replaceTrigger(""); // drop the "/drawio" trigger text
@@ -2183,13 +2246,46 @@ export function Editor(props: { id: string }): JSX.Element {
         return;
       }
     }
-    // Single-line/no text: maybe an image on the OS clipboard. Show an immediate
-    // "Pasting image…" hint when the clipboard clearly holds one (so there's no
-    // dead 1–2s), then render it instantly from the in-memory bytes and write to
-    // disk in the background.
-    const looksImage =
-      Array.from(e.clipboardData?.items ?? []).some((it) => it.type.startsWith("image/")) ||
-      (e.clipboardData?.types ?? []).some((t) => t.startsWith("image/") || t === "Files");
+    // Single-line/no text: maybe an image on the OS clipboard. Two paths:
+    //   1) The paste event's OWN image data (a DataTransferItem of kind "file",
+    //      type image/*). Chromium (Windows WebView2) and WKWebView (macOS)
+    //      expose it here and normalize Windows' CF_DIBV5/bitmap formats — the
+    //      ones screenshot tools like PixPin emit (#43) — into a clean PNG far
+    //      more reliably than the Rust arboard plugin does. Read it directly.
+    //   2) Linux WebKitGTK does NOT expose image data in the paste event, so
+    //      fall back to reading the OS clipboard via the Tauri plugin.
+    // The DataTransfer is only valid synchronously, so grab the File now (its
+    // reference stays live for the async arrayBuffer read).
+    const imageItem = Array.from(e.clipboardData?.items ?? []).find(
+      (it) => it.kind === "file" && it.type.startsWith("image/")
+    );
+    const imageFile = imageItem?.getAsFile() ?? null;
+    if (imageFile) {
+      e.preventDefault(); // no text to paste; keep the raw file bytes out of the block
+      const toastId = pushToast("Pasting image…", "info");
+      void (async () => {
+        let bytes: Uint8Array | null = null;
+        try {
+          bytes = new Uint8Array(await imageFile.arrayBuffer());
+        } catch {
+          bytes = null;
+        } finally {
+          dismissToast(toastId);
+        }
+        // Don't pass file.name: Chromium synthesizes "image.png" for a pasted
+        // screenshot, which would name it image.png/image_1.png. Fall through to
+        // the same timestamp+uniqueness naming a Linux clipboard paste gets.
+        if (bytes && bytes.length) insertAssetBytes(bytes);
+      })();
+      return;
+    }
+    // No image File in the event → try the OS clipboard (the Linux path). Show an
+    // immediate "Pasting image…" hint when the clipboard clearly holds one (so
+    // there's no dead 1–2s), then render it instantly from the in-memory bytes
+    // and write to disk in the background.
+    const looksImage = (e.clipboardData?.types ?? []).some(
+      (t) => t.startsWith("image/") || t === "Files"
+    );
     const toastId = looksImage ? pushToast("Pasting image…", "info") : 0;
     void (async () => {
       let bytes: Uint8Array | null = null;
