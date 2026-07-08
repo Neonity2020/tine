@@ -26,6 +26,12 @@ move them between tiers in place. When Next drains, review Later and promote (in
   [docs/breadth-grid-spec.md](breadth-grid-spec.md); live build state:
   [docs/plans/sheets-progress.md](plans/sheets-progress.md).
 
+- **Split view (Round 5, branch `sheets`)** — panes with the grid nav model
+  (TreeSheets-style: selectable seams, typing at an edge opens a new split),
+  per-pane tabs/history, `Ctrl+click` → open in other pane. Martin's Jul 8 pick
+  over whiteboards-lite (which is queued behind it). Spec:
+  [docs/split-view-spec.md](split-view-spec.md), ADR 0032.
+
 - **Inline-code property lookalikes parse as properties** (Martin, Jul 8 2026:
   fix in Now, "should be treated as code"). A bullet whose text STARTS with an
   inline-code span containing `::` — e.g. a line beginning with

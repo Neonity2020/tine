@@ -491,7 +491,13 @@ date cell (needs `setSchedule` time support).
 Martin's v1 UX nits are PARKED (his list, not yet captured) — batch later,
 don't interleave.
 
-## Round 5 — split view (Martin, Jul 8) [NEXT — architecture study dispatched]
+## Round 5 — split view (Martin, Jul 8) [IN PROGRESS — spec written, S1 dispatched]
+
+**GO confirmed by Martin ("Ok - go for the split screen"). Spec =
+`docs/split-view-spec.md` (phases S1–S4); architecture facts =
+`subagent-tasks/notes/split-view-architecture.md`; decision spine = ADR 0032
+(shape A: pane-router factory + PaneContext + focused-pane shims; single
+journals feed pane v1; layout in tine-session.json).**
 
 Martin (Jul 8): wants BOTH deferred v3 tracks unless a new reason against
 emerged — (1) whiteboards-lite (free-floating cards) and (2) split screen

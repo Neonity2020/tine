@@ -58,3 +58,4 @@ see the project `CLAUDE.md`.
 | [0029](0029-sigkill-webkit-children-on-exit.md) | SIGKILL WebKitGTK's helper processes at quit (Linux) to prevent the GL-driver exit-teardown coredump (was master's 0023; renumbered in the sheets merge) | Accepted |
 | [0030](0030-query-view-unification.md) | Query view unification: query DSL owns membership, `tine.view::` owns presentation | Accepted |
 | [0031](0031-recursive-cell-form.md) | Recursive sheet cell form: compact and hosted grids with structural clipboard paste | Accepted |
+| [0032](0032-pane-split-tree-architecture.md) | Split view: pane-router factory + focused-pane shims, pane split-tree, single journals feed pane | Accepted |
