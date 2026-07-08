@@ -105,6 +105,36 @@ Pane-select mode = the top rung of the existing select→edit ladder:
 - Closing a pane's last tab closes the pane (collapsing its split); the last
   remaining pane can never be closed (same invariant as the last tab today).
 
+## 3a. Open-target rules (Martin's Jul 8 usability questions — rulings)
+
+- **No pane is ever born empty.** Every creation gesture carries its own
+  content: the explicit "split right/down" command **duplicates the current
+  tab** (page + zoom + scroll position) into the new pane — the
+  VSCode/Obsidian convention, and two live surfaces of one page already work
+  (sidebar precedent). You split to *keep something visible*, then navigate
+  one side away. Type-on-seam/Enter-on-seam creates an embryo pane whose
+  content is chosen in the prefilled QuickSwitcher (Esc cancels and unsplits,
+  so no empty pane can result). Ctrl+click carries the clicked target; tab
+  drag carries the dragged tab.
+- **The switcher (Ctrl+K) acts on the focused pane.** One app-modal palette,
+  centered, as today — not per-pane. Enter opens in the focused pane
+  (respecting the tab-reuse setting, exactly today's semantics); the existing
+  new-tab modifier keeps meaning "new tab in the focused pane";
+  **Alt+Enter = open in the OTHER pane**, creating a split (right) if none
+  exists — quick-open's "open to the side". Corollary requirement: a
+  **visible focused-pane indicator** whenever more than one pane exists
+  (subtle accent on the pane's tab strip or a 1px ring), so "where will this
+  open" is always legible at a glance. Single-pane layout shows no indicator
+  (zero visual change from today).
+- **A page moves between splits by dragging its TAB** (the page's handle —
+  S4): drop on another pane's strip = move it there at the drop position;
+  drop on a seam or pane edge = split there and move (with a half-pane
+  highlight preview while hovering). Keyboard equivalent ("move current tab
+  to next pane") is default-bound per §3. Moving a pane's last tab out
+  collapses that pane. In-content drags stay pane-local in v1: block drag
+  keeps its reorder meaning and never becomes "open here" across a boundary
+  (mis-drop risk), link drag is not a gesture.
+
 ## 4. Persistence
 
 Extend `PersistedSession` (`router.ts:503-516`) → same `tine-session.json`,
@@ -128,13 +158,14 @@ safe). Layout is per-machine state: session file, never config.edn.
   on the shim assumption.
 - **S2 — two panes work.** PaneTree renderer + seam resizer; page-pane
   satellite loading; per-pane scroll/strip; split/close/open-in-other-pane
-  commands + Ctrl+click; watcher hoist; eviction pins; session layout schema.
+  commands (split duplicates the current tab, §3a) + Ctrl+click;
+  focused-pane indicator; watcher hoist; eviction pins; session layout schema.
   Gates: suites + new render tests + a real-app two-pane e2e probe
   (edit in A while B shows the same page; navigate B, A's editor keeps the
   caret; session survives restart).
 - **S3 — the nav model.** Pane-select rung + seam stepping + type-on-seam
-  materialization + QuickSwitcher prefill + all default bindings + selection
-  scoping. Gates: suites + e2e keyboard walk (Esc ladder up, arrow to seam,
+  materialization + QuickSwitcher prefill + switcher Alt+Enter open-in-other-
+  pane (§3a) + all default bindings + selection scoping. Gates: suites + e2e keyboard walk (Esc ladder up, arrow to seam,
   type, pick page, Esc unsplit).
 - **S4 — tab drag + polish.** TabBar reorder converted HTML5 DnD → pointer
   `beginDrag` pattern; drag-tab-to-seam = split, drag-tab-to-other-strip =
