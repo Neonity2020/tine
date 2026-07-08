@@ -8,6 +8,32 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+## [0.4.7] - 2026-07-08
+
+### Fixed
+
+- **Enter nests when you're zoomed into a leaf block** ([#46](https://github.com/martinkoutecky/tine/issues/46)).
+  When zoomed into a block that has no children, pressing Enter created a new
+  block as a *sibling* — outside the zoomed view — instead of a child. It now
+  creates a child, matching Logseq. Applies to both Markdown and Org graphs.
+
+- **The Command key no longer resizes the interface after scrolling on macOS**
+  ([#27](https://github.com/martinkoutecky/tine/issues/27)). A trackpad scroll
+  leaves a brief momentum "tail"; pressing Command during it was misread as a
+  Command-scroll zoom, shrinking or growing the whole UI. Tine now zooms only when
+  Command/Ctrl is held *before* the scroll gesture begins.
+
+- **"Edit in draw.io" reliably appears and opens your editor** ([#38](https://github.com/martinkoutecky/tine/issues/38),
+  reported by @nataloko). A second `/drawio` diagram could be saved under a mangled
+  name that lost the edit affordance, and an unconfigured editor fell back to the
+  system image viewer instead of draw.io. Diagrams now use the unique-name asset
+  convention (so double extensions like `.drawio.svg` survive name collisions) and
+  Tine auto-detects an installed draw.io the first time you edit.
+
+- **Journal feed scrolls on first open** ([#39](https://github.com/martinkoutecky/tine/issues/39)).
+  On macOS the journals view could open unscrollable until a window resize; Tine
+  now forces the relayout itself once the feed loads.
+
 ## [0.4.6] - 2026-07-08
 
 ### Added
@@ -1016,7 +1042,9 @@ takes over your graph.
 - macOS and Windows installers are currently **unsigned** — on macOS right-click →
   Open; on Windows choose *More info → Run anyway*.
 
-[Unreleased]: https://github.com/martinkoutecky/tine/compare/v0.4.5...HEAD
+[Unreleased]: https://github.com/martinkoutecky/tine/compare/v0.4.7...HEAD
+[0.4.7]: https://github.com/martinkoutecky/tine/compare/v0.4.6...v0.4.7
+[0.4.6]: https://github.com/martinkoutecky/tine/compare/v0.4.5...v0.4.6
 [0.4.5]: https://github.com/martinkoutecky/tine/compare/v0.4.4...v0.4.5
 [0.4.4]: https://github.com/martinkoutecky/tine/compare/v0.4.3...v0.4.4
 [0.4.3]: https://github.com/martinkoutecky/tine/compare/v0.4.2...v0.4.3
