@@ -92,7 +92,7 @@ import { refreshAssetOnReturn } from "../assetRefresh";
 import { isMobilePlatform } from "../nativeChrome";
 import { calcSource, wrapCalc, evalCalc } from "../editor/calc";
 import { QueryMacro, EmbedMacro } from "./Macro";
-import { workflow, zoomInto, openContextMenu, openDatePicker, openBlockInSidebar, graphMeta, dataRev, setQueryBuilderAutoOpen, openPageProps, pushToast, dismissToast, autoPairing, typographyMode, timetrackingEnabled, logbookWithSecondSupport } from "../ui";
+import { workflow, zoomInto, zoomedBlock, openContextMenu, openDatePicker, openBlockInSidebar, graphMeta, dataRev, setQueryBuilderAutoOpen, openPageProps, pushToast, dismissToast, autoPairing, typographyMode, timetrackingEnabled, logbookWithSecondSupport } from "../ui";
 import { seedAssetBlob } from "../assetCache";
 import { openPageInNewTab } from "../router";
 import { blockRefCount } from "../blockRefCounts";
@@ -1865,7 +1865,7 @@ export function Editor(props: { id: string }): JSX.Element {
         const newId = insertOutlineAfter(props.id, [{ raw: "", children: [] }]);
         startEditing(newId, 0);
       } else {
-        splitBlock(props.id, start);
+        splitBlock(props.id, start, zoomedBlock() === props.id && doc.byId[props.id].children.length === 0);
       }
     } else if (e.key === "Backspace" && end === start) {
       // Auto-pair Backspace: caret between an empty pair (`(|)`) deletes both

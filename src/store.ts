@@ -842,7 +842,7 @@ export function setRaw(id: string, raw: string, opts?: { timetracking?: boolean 
 /** Enter: split the block at `offset`. Built-in `id::`/`collapsed::` props are
  *  hidden from the editor (see editor/properties splitProps): the caret offset is
  *  in visible space, and hidden props stay with the ORIGINAL block across a split. */
-export function splitBlock(id: string, offset: number) {
+export function splitBlock(id: string, offset: number, forceChild: boolean = false) {
   pushUndo("split", [doc.byId[id].page]);
   const node = doc.byId[id];
   const fmt = formatForBlock(id);
@@ -889,7 +889,7 @@ export function splitBlock(id: string, offset: number) {
     produce((s) => {
       s.byId[id].raw = joinProps(before, hidden, fmt);
       const hasVisibleChildren = node.children.length > 0 && !node.collapsed;
-      if (hasVisibleChildren) {
+      if (hasVisibleChildren || forceChild) {
         s.byId[newId] = {
           id: newId, raw: orderedAfter, collapsed: false, parent: id, page: pageName, children: [],
         };
