@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { render } from "solid-js/web";
 import { PaneTree } from "../App";
 import { layoutRoot, resetPaneLayoutToSingle, restorePaneLayout } from "../panes";
+import { setPaneSel } from "../paneSelect";
 import { resetStore } from "../store";
 import type { PaneSnapshot } from "../router";
 
@@ -12,6 +13,7 @@ const pageSnapshot = (name: string): PaneSnapshot => ({
 
 afterEach(() => {
   document.body.innerHTML = "";
+  setPaneSel(null);
   resetStore();
   resetPaneLayoutToSingle({
     tabs: [{ history: [{ kind: "journals" }], pos: 0, pinned: false }],
@@ -74,6 +76,32 @@ describe("PaneTree", () => {
       "main"
     );
     expect(root.querySelector('[data-pane-id="pane-3"] .tab-title')?.textContent).toContain("Third");
+    dispose();
+  });
+
+  it("renders pane-select ring and seam highlight targets", () => {
+    restorePaneLayout(
+      {
+        kind: "split",
+        dir: "row",
+        ratio: 0.5,
+        children: [
+          { kind: "pane", paneId: "main" },
+          { kind: "pane", paneId: "pane-2" },
+        ],
+      },
+      new Map([["main", pageSnapshot("Left")], ["pane-2", pageSnapshot("Right")]]),
+      "main"
+    );
+    setPaneSel({ kind: "pane", paneId: "pane-2" });
+    const root = document.createElement("div");
+    document.body.appendChild(root);
+    const dispose = render(() => <PaneTree node={layoutRoot()} path={[]} />, root);
+
+    expect(root.querySelector('[data-pane-id="pane-2"]')?.classList.contains("pane-selected")).toBe(true);
+
+    setPaneSel({ kind: "seam", path: [] });
+    expect(root.querySelector(".pane-resizer")?.classList.contains("pane-seam-selected")).toBe(true);
     dispose();
   });
 });

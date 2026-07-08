@@ -1,7 +1,10 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { closeInPageFind, inPageFindOpen } from "./inpageFind";
 import { commandDefaults, eventToBindingString, installKeybindings } from "./keybindings";
-import { setPdfTarget } from "./ui";
+import { closeSwitcher, focusMode, openSwitcher, setFocusMode, setPdfTarget, switcherOpen } from "./ui";
+import { layoutPaneIds, resetPaneLayoutToSingle, splitRootAtEdge } from "./panes";
+import { exitPaneSelect, paneSel } from "./paneSelect";
+import type { PaneSnapshot } from "./router";
 
 function keyEvent(init: Partial<KeyboardEvent>): KeyboardEvent {
   return {
@@ -42,6 +45,7 @@ function installFakeWindow() {
   Object.defineProperty(globalThis, "document", {
     value: {
       activeElement: null,
+      querySelector: () => null,
       querySelectorAll: () => [],
     },
     configurable: true,
@@ -89,8 +93,44 @@ function modFEvent() {
   };
 }
 
+function trackedKeyEvent(init: Partial<KeyboardEvent>) {
+  let prevented = false;
+  const event = {
+    key: "",
+    code: "",
+    shiftKey: false,
+    ctrlKey: false,
+    metaKey: false,
+    altKey: false,
+    target: null,
+    preventDefault: () => {
+      prevented = true;
+    },
+    stopPropagation: () => {},
+    ...init,
+  } as unknown as KeyboardEvent;
+  return {
+    event,
+    prevented: () => prevented,
+  };
+}
+
+const pageSnapshot = (name: string): PaneSnapshot => ({
+  tabs: [{ history: [{ kind: "page", name, pageKind: "page" }], pos: 0, pinned: false }],
+  activeIndex: 0,
+});
+
+const journalsSnapshot = (): PaneSnapshot => ({
+  tabs: [{ history: [{ kind: "journals" }], pos: 0, pinned: false }],
+  activeIndex: 0,
+});
+
 afterEach(() => {
   setPdfTarget(null);
+  setFocusMode(false);
+  exitPaneSelect();
+  if (switcherOpen()) closeSwitcher();
+  resetPaneLayoutToSingle(journalsSnapshot());
   if (inPageFindOpen()) closeInPageFind({ restoreFocus: false });
   restoreFakeGlobals?.();
 });
@@ -146,6 +186,97 @@ describe("find-in-page routing", () => {
     expect(e.prevented()).toBe(false);
     expect(e.stopped()).toBe(false);
 
+    dispose();
+  });
+});
+
+describe("pane-select Esc cascade", () => {
+  it("enters pane-select only after earlier Escape handlers decline", () => {
+    const fake = installFakeWindow();
+    const dispose = installKeybindings();
+    const e = trackedKeyEvent({ key: "Escape", code: "Escape" });
+
+    fake.dispatchCaptureKeydown(e.event);
+
+    expect(paneSel()).toEqual({ kind: "pane", paneId: "main" });
+    expect(e.prevented()).toBe(true);
+    dispose();
+  });
+
+  it("lets focus mode consume Escape before pane-select entry", () => {
+    const fake = installFakeWindow();
+    const dispose = installKeybindings();
+    const e = trackedKeyEvent({ key: "Escape", code: "Escape" });
+    setFocusMode(true);
+
+    fake.dispatchCaptureKeydown(e.event);
+
+    expect(focusMode()).toBe(false);
+    expect(paneSel()).toBeNull();
+    expect(e.prevented()).toBe(true);
+    dispose();
+  });
+
+  it("exits pane-select on the second Escape", () => {
+    const fake = installFakeWindow();
+    const dispose = installKeybindings();
+
+    fake.dispatchCaptureKeydown(trackedKeyEvent({ key: "Escape", code: "Escape" }).event);
+    fake.dispatchCaptureKeydown(trackedKeyEvent({ key: "Escape", code: "Escape" }).event);
+
+    expect(paneSel()).toBeNull();
+    dispose();
+  });
+
+  it("never intercepts keys while a text field has focus (stale mode)", () => {
+    const fake = installFakeWindow();
+    const dispose = installKeybindings();
+    // Enter pane-select, then simulate the user having clicked into an editor
+    // (a stale mode): typing must reach the textarea untouched.
+    fake.dispatchCaptureKeydown(trackedKeyEvent({ key: "Escape", code: "Escape" }).event);
+    expect(paneSel()).not.toBeNull();
+
+    const typed = trackedKeyEvent({
+      key: "a",
+      code: "KeyA",
+      target: { tagName: "TEXTAREA", isContentEditable: false } as unknown as EventTarget,
+    });
+    fake.dispatchCaptureKeydown(typed.event);
+
+    expect(typed.prevented()).toBe(false);
+    dispose();
+  });
+
+  it("cancels an embryo switcher by closing the materialized pane", () => {
+    resetPaneLayoutToSingle(pageSnapshot("Source"));
+    const embryo = splitRootAtEdge("right", "main")!;
+    openSwitcher({ mode: "embryo", paneId: embryo, prefill: "x" });
+    const fake = installFakeWindow();
+    const dispose = installKeybindings();
+
+    fake.dispatchCaptureKeydown(trackedKeyEvent({ key: "Escape", code: "Escape" }).event);
+
+    expect(switcherOpen()).toBe(false);
+    expect(layoutPaneIds()).toEqual(["main"]);
+    dispose();
+  });
+
+  it("typing on a selected edge materializes an embryo pane that Escape unsplits", () => {
+    resetPaneLayoutToSingle(pageSnapshot("Source"));
+    const fake = installFakeWindow();
+    const dispose = installKeybindings();
+
+    fake.dispatchCaptureKeydown(trackedKeyEvent({ key: "Escape", code: "Escape" }).event);
+    fake.dispatchCaptureKeydown(trackedKeyEvent({ key: "ArrowRight", code: "ArrowRight" }).event);
+    fake.dispatchCaptureKeydown(trackedKeyEvent({ key: "z", code: "KeyZ" }).event);
+
+    expect(switcherOpen()).toBe(true);
+    expect(layoutPaneIds()).toHaveLength(2);
+
+    fake.dispatchCaptureKeydown(trackedKeyEvent({ key: "Escape", code: "Escape" }).event);
+
+    expect(switcherOpen()).toBe(false);
+    expect(layoutPaneIds()).toEqual(["main"]);
     dispose();
   });
 });

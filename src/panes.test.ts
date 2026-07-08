@@ -1,14 +1,18 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import {
   closeLayoutPane,
+  focusPane,
   layoutPaneIds,
   layoutRoot,
+  focusedPaneId,
+  moveActiveTabToPane,
   paneRouter,
   resetPaneLayoutToSingle,
   splitLayoutNode,
   splitPane,
   type LayoutNode,
 } from "./panes";
+import { hasSelection, selectBlock } from "./store";
 import type { PaneSnapshot } from "./router";
 
 const pageSnapshot = (name: string): PaneSnapshot => ({
@@ -23,6 +27,7 @@ const journalsSnapshot = (): PaneSnapshot => ({
 
 beforeEach(() => {
   resetPaneLayoutToSingle(journalsSnapshot());
+  paneRouter("main").setScrollerElement(null);
 });
 
 describe("pane layout mutations", () => {
@@ -84,5 +89,69 @@ describe("pane layout mutations", () => {
 
     expect(layoutPaneIds(layoutRoot())).toEqual(["main"]);
     expect(paneRouter("main").tabs()).toHaveLength(1);
+  });
+
+  it("adopts the active tab into another pane preserving history, pin, and scroll", () => {
+    resetPaneLayoutToSingle({
+      tabs: [
+        {
+          history: [
+            { kind: "page", name: "One", pageKind: "page" },
+            { kind: "page", name: "Two", pageKind: "page" },
+          ],
+          pos: 1,
+          pinned: true,
+        },
+        { history: [{ kind: "page", name: "Spare", pageKind: "page" }], pos: 0, pinned: false },
+      ],
+      activeIndex: 0,
+    });
+    const target = splitPane("main", "row")!;
+    paneRouter("main").setScrollerElement({ scrollTop: 73, isConnected: true } as HTMLElement);
+
+    expect(moveActiveTabToPane("main", target)).toBe(true);
+
+    const snap = paneRouter(target).snapshot();
+    const adopted = snap.tabs[snap.activeIndex];
+    expect(adopted).toMatchObject({
+      history: [
+        { kind: "page", name: "One", pageKind: "page" },
+        { kind: "page", name: "Two", pageKind: "page" },
+      ],
+      pos: 1,
+      pinned: true,
+    });
+    expect(snap.scrolls?.[snap.activeIndex]).toBe(73);
+  });
+
+  it("moving the last page tab out closes the emptied pane", () => {
+    resetPaneLayoutToSingle(pageSnapshot("Source"));
+    const target = splitPane("main", "row")!;
+
+    expect(moveActiveTabToPane("main", target)).toBe(true);
+
+    expect(layoutPaneIds(layoutRoot())).toEqual([target]);
+    expect(focusedPaneId()).toBe(target);
+  });
+
+  it("does not move the feed pane's last journals tab", () => {
+    resetPaneLayoutToSingle(journalsSnapshot());
+    const target = splitPane("main", "row")!;
+
+    expect(moveActiveTabToPane("main", target)).toBe(false);
+
+    expect(layoutPaneIds(layoutRoot())).toEqual(["main", target]);
+    expect(paneRouter("main").route()).toEqual({ kind: "journals" });
+  });
+
+  it("clears block selection when focus moves to another pane", () => {
+    resetPaneLayoutToSingle(pageSnapshot("Source"));
+    const target = splitPane("main", "row")!;
+    focusPane("main");
+    selectBlock("selected-block");
+
+    focusPane(target);
+
+    expect(hasSelection()).toBe(false);
   });
 });

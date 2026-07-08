@@ -119,6 +119,7 @@ body {
   display: flex;
   min-height: 0;
   overflow: hidden;
+  position: relative;
 }
 
 .topbar {
@@ -333,6 +334,13 @@ body {
   background: var(--bg-primary);
 }
 
+.pane-selected {
+  outline: 2px solid color-mix(in srgb, var(--link-color) 72%, white 12%);
+  outline-offset: -2px;
+  position: relative;
+  z-index: 2;
+}
+
 .pane-main-content {
   min-height: 0;
 }
@@ -355,6 +363,47 @@ body {
 
 .pane-resizer:hover {
   background: color-mix(in srgb, var(--link-color) 35%, transparent);
+}
+
+.pane-resizer.pane-seam-selected {
+  background: color-mix(in srgb, var(--link-color) 62%, transparent);
+}
+
+.pane-edge-highlight {
+  position: absolute;
+  z-index: 8;
+  pointer-events: none;
+  background: color-mix(in srgb, var(--link-color) 62%, transparent);
+}
+
+.pane-edge-highlight-left,
+.pane-edge-highlight-right {
+  top: 0;
+  bottom: 0;
+  width: 4px;
+}
+
+.pane-edge-highlight-left {
+  left: 0;
+}
+
+.pane-edge-highlight-right {
+  right: 0;
+}
+
+.pane-edge-highlight-top,
+.pane-edge-highlight-bottom {
+  left: 0;
+  right: 0;
+  height: 4px;
+}
+
+.pane-edge-highlight-top {
+  top: 0;
+}
+
+.pane-edge-highlight-bottom {
+  bottom: 0;
 }
 
 .main-content-inner {

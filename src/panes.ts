@@ -12,9 +12,10 @@ import {
   type Route,
 } from "./router";
 import { registerPaneFocusSetter } from "./ui";
-import { doc, pageByName, registerPaneRouteProvider } from "./store";
+import { clearSelection, doc, pageByName, registerPaneRouteProvider } from "./store";
 import { journalTitle } from "./journal";
 import { isMobilePlatform } from "./nativeChrome";
+import { nearestPane } from "./paneSelect";
 
 export type LayoutNode =
   | {
@@ -29,7 +30,13 @@ export const [layoutRoot, setLayoutRoot] = createSignal<LayoutNode>({
   kind: "pane",
   paneId: "main",
 });
-export const [focusedPaneId, setFocusedPaneId] = createSignal("main");
+const [focusedPaneIdAccessor, writeFocusedPaneId] = createSignal("main");
+export const focusedPaneId = focusedPaneIdAccessor;
+
+export function setFocusedPaneId(paneId: string) {
+  if (focusedPaneId() !== paneId) clearSelection();
+  writeFocusedPaneId(paneId);
+}
 
 const routers = new Map<string, PaneRouter>([["main", mainPaneRouter]]);
 let paneCounter = 1;
@@ -105,14 +112,23 @@ export function splitLayoutNode(
   dir: "row" | "col",
   newPaneId: string
 ): LayoutNode {
+  return splitLayoutNodeAt(node, paneId, dir, newPaneId, "after");
+}
+
+export function splitLayoutNodeAt(
+  node: LayoutNode,
+  paneId: string,
+  dir: "row" | "col",
+  newPaneId: string,
+  position: "before" | "after" = "after"
+): LayoutNode {
+  const oldLeaf: LayoutNode = { kind: "pane", paneId };
+  const newLeaf: LayoutNode = { kind: "pane", paneId: newPaneId };
   return replacePaneInLayout(node, paneId, {
     kind: "split",
     dir,
     ratio: 0.5,
-    children: [
-      { kind: "pane", paneId },
-      { kind: "pane", paneId: newPaneId },
-    ],
+    children: position === "before" ? [newLeaf, oldLeaf] : [oldLeaf, newLeaf],
   });
 }
 
@@ -171,7 +187,7 @@ function splitSnapshotForNewPane(source: PaneRouter): PaneSnapshot {
 export function splitPane(
   paneId = focusedPaneId(),
   dir: "row" | "col" = "row",
-  opts: { focusNew?: boolean } = {}
+  opts: { focusNew?: boolean; position?: "before" | "after" } = {}
 ): string | null {
   if (isMobilePlatform) return null;
   if (!layoutPaneIds().includes(paneId)) return null;
@@ -179,7 +195,66 @@ export function splitPane(
   const source = paneRouter(paneId);
   const router = paneRouter(newPaneId);
   router.restoreSnapshot(splitSnapshotForNewPane(source));
-  setLayoutRoot(splitLayoutNode(layoutRoot(), paneId, dir, newPaneId));
+  setLayoutRoot(splitLayoutNodeAt(layoutRoot(), paneId, dir, newPaneId, opts.position ?? "after"));
+  if (opts.focusNew !== false) setFocusedPaneId(newPaneId);
+  focusedRouter().scheduleSessionSave();
+  return newPaneId;
+}
+
+function nodeAtPath(node: LayoutNode, path: number[]): LayoutNode | null {
+  let cur: LayoutNode | null = node;
+  for (const idx of path) {
+    if (!cur || cur.kind === "pane") return null;
+    cur = cur.children[idx] ?? null;
+  }
+  return cur;
+}
+
+function nodeContainsPane(node: LayoutNode, paneId: string): boolean {
+  if (node.kind === "pane") return node.paneId === paneId;
+  return nodeContainsPane(node.children[0], paneId) || nodeContainsPane(node.children[1], paneId);
+}
+
+export function splitPaneAtSeam(path: number[], sourcePaneId: string | null): string | null {
+  const split = nodeAtPath(layoutRoot(), path);
+  if (!split || split.kind === "pane") return null;
+  const source = sourcePaneId && layoutPaneIds().includes(sourcePaneId) ? sourcePaneId : null;
+  const sourceSide =
+    source && nodeContainsPane(split.children[0], source)
+      ? 0
+      : source && nodeContainsPane(split.children[1], source)
+        ? 1
+        : 0;
+  const paneId = source && nodeContainsPane(split.children[sourceSide], source)
+    ? source
+    : firstPaneId(split.children[sourceSide]);
+  if (!paneId) return null;
+  return splitPane(paneId, split.dir, {
+    position: sourceSide === 0 ? "after" : "before",
+  });
+}
+
+export function splitRootAtEdge(
+  side: "left" | "right" | "top" | "bottom",
+  sourcePaneId = focusedPaneId(),
+  opts: { focusNew?: boolean } = {}
+): string | null {
+  if (isMobilePlatform) return null;
+  const ids = layoutPaneIds();
+  const sourceId = ids.includes(sourcePaneId) ? sourcePaneId : ids[0];
+  if (!sourceId) return null;
+  const newPaneId = freshPaneId();
+  paneRouter(newPaneId).restoreSnapshot(splitSnapshotForNewPane(paneRouter(sourceId)));
+  const oldRoot = layoutRoot();
+  const newLeaf: LayoutNode = { kind: "pane", paneId: newPaneId };
+  const dir = side === "left" || side === "right" ? "row" : "col";
+  const newFirst = side === "left" || side === "top";
+  setLayoutRoot({
+    kind: "split",
+    dir,
+    ratio: 0.5,
+    children: newFirst ? [newLeaf, oldRoot] : [oldRoot, newLeaf],
+  });
   if (opts.focusNew !== false) setFocusedPaneId(newPaneId);
   focusedRouter().scheduleSessionSave();
   return newPaneId;
@@ -198,6 +273,25 @@ export function closePane(paneId = focusedPaneId()): boolean {
 
 export function focusPane(paneId: string) {
   if (layoutPaneIds().includes(paneId)) setFocusedPaneId(paneId);
+}
+
+export function moveActiveTabToPane(sourcePaneId: string, targetPaneId: string): boolean {
+  if (sourcePaneId === targetPaneId) return false;
+  const ids = layoutPaneIds();
+  if (!ids.includes(sourcePaneId) || !ids.includes(targetPaneId)) return false;
+  const source = paneRouter(sourcePaneId);
+  if (source.tabs().length === 1 && source.route().kind === "journals") return false;
+  const moved = source.extractActiveTabForAdoption();
+  if (!moved) return false;
+  paneRouter(targetPaneId).adoptTab(moved.tab, true);
+  setFocusedPaneId(targetPaneId);
+  if (moved.emptied) {
+    closePane(sourcePaneId);
+    if (layoutPaneIds().includes(targetPaneId)) setFocusedPaneId(targetPaneId);
+  } else {
+    focusedRouter().scheduleSessionSave();
+  }
+  return true;
 }
 
 export function setSplitRatio(path: number[], ratio: number) {
@@ -219,7 +313,7 @@ export function setSplitRatio(path: number[], ratio: number) {
 
 export function openRouteInOtherPane(route: Route, sourcePaneId = focusedPaneId()): string | null {
   const ids = layoutPaneIds();
-  let target = ids.find((id) => id !== sourcePaneId) ?? null;
+  let target = nearestPane(layoutRoot(), sourcePaneId) ?? ids.find((id) => id !== sourcePaneId) ?? null;
   if (!target) target = splitPane(sourcePaneId, "row", { focusNew: false });
   if (!target) return null;
   const router = paneRouter(target);

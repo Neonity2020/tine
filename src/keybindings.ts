@@ -25,11 +25,22 @@ import {
   focusMode,
   exitFocusMode,
   switcherOpen,
+  switcherEmbryo,
   settingsOpen,
   carryDays,
+  audioPlayer,
+  contextMenu,
+  datePicker,
+  exportModal,
+  formulaEditor,
+  helpPopupOpen,
+  lightbox,
+  pagePropsPanel,
+  pdfExportPage,
   pushToast,
   openPdfExport,
   pdfTarget,
+  welcomeOpen,
 } from "./ui";
 import { carryDaysBack } from "./carry";
 import {
@@ -60,7 +71,28 @@ import { startEditing } from "./editorController";
 import { copyOutline } from "./clipboard";
 import { closeInPageFind, inPageFindOpen, openInPageFind } from "./inpageFind";
 import { cellSel, enterGridSelection, handleCellSelectionKey, handleSheetPasteEvent } from "./sheet/selection";
-import { closePane, focusedPaneId, splitPane } from "./panes";
+import {
+  closePane,
+  focusPane,
+  focusedPaneId,
+  layoutHasMultiplePanes,
+  layoutPaneIds,
+  layoutRoot,
+  moveActiveTabToPane,
+  splitPane,
+  splitPaneAtSeam,
+  splitRootAtEdge,
+} from "./panes";
+import {
+  enterPaneSelect,
+  exitPaneSelect,
+  movePaneSelection,
+  nearestPaneInDirection,
+  paneSel,
+  previousPaneSelectionTarget,
+  readingOrderPanes,
+  type PaneDirection,
+} from "./paneSelect";
 
 interface Chord {
   mod: boolean;
@@ -89,6 +121,102 @@ interface CommandDef {
 }
 
 const isMac = typeof navigator !== "undefined" && /Mac/.test(navigator.platform);
+
+function focusPaneByNumber(n: number) {
+  if (!layoutHasMultiplePanes()) return;
+  const pane = readingOrderPanes(layoutRoot())[n - 1];
+  if (pane) focusPane(pane.paneId);
+}
+
+function focusPaneInDirection(dir: PaneDirection) {
+  if (!layoutHasMultiplePanes()) return;
+  const target = nearestPaneInDirection(layoutRoot(), focusedPaneId(), dir);
+  if (target) focusPane(target);
+}
+
+function moveActiveTabInDirection(dir: PaneDirection) {
+  if (!layoutHasMultiplePanes()) return;
+  const target = nearestPaneInDirection(layoutRoot(), focusedPaneId(), dir);
+  if (target) moveActiveTabToPane(focusedPaneId(), target);
+}
+
+function enterPaneSelectFromFocus() {
+  const ids = layoutPaneIds();
+  const focused = focusedPaneId();
+  enterPaneSelect(ids.includes(focused) ? focused : ids[0] ?? "main");
+}
+
+function materializePaneSelection(prefill: string) {
+  const target = paneSel();
+  if (!target || target.kind === "pane") return;
+  const source = previousPaneSelectionTarget() ?? focusedPaneId();
+  const paneId =
+    target.kind === "seam"
+      ? splitPaneAtSeam(target.path, source)
+      : splitRootAtEdge(target.side, source);
+  if (!paneId) return;
+  exitPaneSelect();
+  openSwitcher({ mode: "embryo", paneId, prefill });
+}
+
+function directionForKey(key: string): PaneDirection | null {
+  switch (key) {
+    case "ArrowLeft": return "left";
+    case "ArrowRight": return "right";
+    case "ArrowUp": return "up";
+    case "ArrowDown": return "down";
+    default: return null;
+  }
+}
+
+function isPrintableKey(e: KeyboardEvent): boolean {
+  return e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey;
+}
+
+function handlePaneSelectKey(e: KeyboardEvent): boolean {
+  const target = paneSel();
+  if (!target) return false;
+  const dir = directionForKey(e.key);
+  if (dir && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    movePaneSelection(layoutRoot(), dir);
+    return true;
+  }
+  if (e.key === "Escape") {
+    exitPaneSelect();
+    return true;
+  }
+  if (e.key === "Enter") {
+    if (target.kind === "pane") {
+      exitPaneSelect();
+      focusPane(target.paneId);
+    } else {
+      materializePaneSelection("");
+    }
+    return true;
+  }
+  if (isPrintableKey(e)) {
+    if (target.kind !== "pane") materializePaneSelection(e.key);
+    return true;
+  }
+  return false;
+}
+
+function anyOverlayOpen(): boolean {
+  return !!(
+    switcherOpen() ||
+    settingsOpen() ||
+    datePicker() ||
+    formulaEditor() ||
+    pagePropsPanel() ||
+    exportModal() ||
+    contextMenu() ||
+    helpPopupOpen() ||
+    lightbox() ||
+    audioPlayer() ||
+    pdfExportPage() ||
+    welcomeOpen()
+  );
+}
 
 // Default command table. Editor command ids mirror OG Logseq where practical.
 const COMMANDS: CommandDef[] = [
@@ -122,6 +250,22 @@ const COMMANDS: CommandDef[] = [
   { id: "pane/split-right", binding: "mod+alt+\\", label: "Split right", scope: "global", run: () => void splitPane(focusedPaneId(), "row"), global: true },
   { id: "pane/split-down", binding: "mod+alt+shift+\\", label: "Split down", scope: "global", run: () => void splitPane(focusedPaneId(), "col"), global: true },
   { id: "pane/close", binding: "", label: "Close pane", scope: "global", run: () => void closePane(focusedPaneId()), global: true },
+  ...Array.from({ length: 9 }, (_, i): CommandDef => ({
+    id: `pane/focus-${i + 1}`,
+    binding: `mod+${i + 1}`,
+    label: `Focus pane ${i + 1}`,
+    scope: "global",
+    run: () => focusPaneByNumber(i + 1),
+    global: true,
+  })),
+  { id: "pane/focus-left", binding: "mod+alt+left", label: "Focus pane left", scope: "global", run: () => focusPaneInDirection("left"), global: true },
+  { id: "pane/focus-right", binding: "mod+alt+right", label: "Focus pane right", scope: "global", run: () => focusPaneInDirection("right"), global: true },
+  { id: "pane/focus-up", binding: "mod+alt+up", label: "Focus pane up", scope: "global", run: () => focusPaneInDirection("up"), global: true },
+  { id: "pane/focus-down", binding: "mod+alt+down", label: "Focus pane down", scope: "global", run: () => focusPaneInDirection("down"), global: true },
+  { id: "pane/move-tab-left", binding: "mod+alt+shift+left", label: "Move tab to pane left", scope: "global", run: () => moveActiveTabInDirection("left"), global: true },
+  { id: "pane/move-tab-right", binding: "mod+alt+shift+right", label: "Move tab to pane right", scope: "global", run: () => moveActiveTabInDirection("right"), global: true },
+  { id: "pane/move-tab-up", binding: "mod+alt+shift+up", label: "Move tab to pane up", scope: "global", run: () => moveActiveTabInDirection("up"), global: true },
+  { id: "pane/move-tab-down", binding: "mod+alt+shift+down", label: "Move tab to pane down", scope: "global", run: () => moveActiveTabInDirection("down"), global: true },
   { id: "ui/toggle-theme", binding: "t t", label: "Toggle dark / light", scope: "global", run: toggleTheme },
   { id: "ui/toggle-left-sidebar", binding: "t l", label: "Toggle left sidebar", scope: "global", run: toggleSidebar },
   { id: "ui/toggle-right-sidebar", binding: "t r", label: "Toggle right sidebar", scope: "global", run: toggleRightSidebar },
@@ -579,6 +723,15 @@ export function installKeybindings(overrides: Record<string, string> = {}): () =
     const chord = eventToChord(e);
     const editing = isEditableTarget(e.target);
 
+    // !editing guard: pane-select must NEVER eat keys while a text field has
+    // focus — a stale mode (entered via Esc, then click into a block) would
+    // otherwise swallow every printable/arrow/Enter and break typing.
+    if (paneSel() && !editing && handlePaneSelectKey(e)) {
+      e.preventDefault();
+      resetSeq();
+      return;
+    }
+
     // Escape, in priority order, so focus mode peels off one layer at a time
     // (Logseq-like): overlays first; then if editing a block's text let the
     // editor exit text-editing (don't exit focus yet); then a selected block
@@ -592,7 +745,9 @@ export function installKeybindings(overrides: Record<string, string> = {}): () =
         return;
       }
       if (switcherOpen() || settingsOpen()) {
+        const embryo = switcherEmbryo();
         closeSwitcher();
+        if (embryo) closePane(embryo.paneId);
         closeSettings();
         e.preventDefault();
         resetSeq();
@@ -617,6 +772,13 @@ export function installKeybindings(overrides: Record<string, string> = {}): () =
         resetSeq();
         return;
       }
+      if (anyOverlayOpen()) {
+        resetSeq();
+        return;
+      }
+      enterPaneSelectFromFocus();
+      e.preventDefault();
+      resetSeq();
       return;
     }
 

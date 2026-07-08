@@ -49,6 +49,13 @@ export interface PaneSnapshot {
   scrolls?: (number | null)[];
 }
 
+export interface AdoptedTab {
+  history: Route[];
+  pos: number;
+  pinned: boolean;
+  scroll: number | null;
+}
+
 export interface PaneRouter {
   paneId: string;
   tabs: Accessor<Tab[]>;
@@ -88,6 +95,8 @@ export interface PaneRouter {
   activatePrevTab(): void;
   togglePin(id: string): void;
   reorderTab(dragId: string, targetId: string): void;
+  extractActiveTabForAdoption(): { tab: AdoptedTab; emptied: boolean } | null;
+  adoptTab(tab: AdoptedTab, foreground?: boolean): void;
   snapshot(): PaneSnapshot;
   restoreSnapshot(snapshot: PaneSnapshot): boolean;
   duplicateActiveSnapshot(): PaneSnapshot;
@@ -588,6 +597,43 @@ export function createPaneRouter(paneId = "main"): PaneRouter {
     persist();
   }
 
+  function extractActiveTabForAdoption(): { tab: AdoptedTab; emptied: boolean } | null {
+    const list = tabs();
+    const active = activeTab();
+    if (!active) return null;
+    rememberScroll();
+    const moved: AdoptedTab = {
+      history: active.history,
+      pos: active.pos,
+      pinned: active.pinned,
+      scroll: scrollByRoute.get(tabRoute(active)) ?? null,
+    };
+    if (list.length === 1) {
+      const id = newId();
+      setTabs([{ id, history: [{ kind: "journals" }], pos: 0, pinned: false }]);
+      setActiveId(id);
+      persist();
+      return { tab: moved, emptied: true };
+    }
+    const idx = list.findIndex((t) => t.id === active.id);
+    const next = list.filter((t) => t.id !== active.id);
+    setTabs(next);
+    setActiveId(next[Math.max(0, idx - 1)].id);
+    persist();
+    return { tab: moved, emptied: false };
+  }
+
+  function adoptTab(tab: AdoptedTab, foreground = true) {
+    if (!tab.history.length) return;
+    const id = newId();
+    const pos = Math.min(Math.max(0, tab.pos | 0), tab.history.length - 1);
+    const adopted: Tab = { id, history: tab.history, pos, pinned: tab.pinned };
+    if (typeof tab.scroll === "number" && tab.scroll > 0) scrollByRoute.set(adopted.history[pos], tab.scroll);
+    setTabs(partitionPinned([...tabs(), adopted]));
+    if (foreground) setActiveId(id);
+    persist();
+  }
+
   function snapshot(): PaneSnapshot {
     const list = tabs();
     rememberScroll();
@@ -678,6 +724,8 @@ export function createPaneRouter(paneId = "main"): PaneRouter {
     activatePrevTab,
     togglePin,
     reorderTab,
+    extractActiveTabForAdoption,
+    adoptTab,
     snapshot,
     restoreSnapshot,
     duplicateActiveSnapshot,

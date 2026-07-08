@@ -105,6 +105,7 @@ import {
   setSplitRatio,
   type LayoutNode,
 } from "./panes";
+import { paneSel, samePaneTarget } from "./paneSelect";
 import { SurfaceContext } from "./components/Block";
 
 async function handleGraphChange(c: GraphChange) {
@@ -193,6 +194,7 @@ function PaneResizer(props: { dir: "row" | "col"; path: number[] }): JSX.Element
   return (
     <div
       class={`pane-resizer pane-resizer-${props.dir}`}
+      classList={{ "pane-seam-selected": samePaneTarget(paneSel(), { kind: "seam", path: props.path }) }}
       onPointerDown={(e) => {
         e.preventDefault();
         const box = (e.currentTarget.parentElement as HTMLElement).getBoundingClientRect();
@@ -229,6 +231,7 @@ function PaneLeaf(props: { paneId: string }): JSX.Element {
           fallback={
             <main
               class="main-content"
+              classList={{ "pane-selected": samePaneTarget(paneSel(), { kind: "pane", paneId: props.paneId }) }}
               data-pane-id={props.paneId}
               ref={(el) => router.setScrollerElement(el)}
             >
@@ -240,7 +243,10 @@ function PaneLeaf(props: { paneId: string }): JSX.Element {
         >
           <div
             class="pane-leaf"
-            classList={{ "pane-focused": focusedPaneId() === props.paneId }}
+            classList={{
+              "pane-focused": focusedPaneId() === props.paneId,
+              "pane-selected": samePaneTarget(paneSel(), { kind: "pane", paneId: props.paneId }),
+            }}
             data-pane-id={props.paneId}
           >
             <TabBar
@@ -258,6 +264,18 @@ function PaneLeaf(props: { paneId: string }): JSX.Element {
         </Show>
       </SurfaceContext.Provider>
     </PaneContext.Provider>
+  );
+}
+
+export function PaneEdgeHighlights(): JSX.Element {
+  const edge = () => {
+    const target = paneSel();
+    return target?.kind === "edge" ? target.side : null;
+  };
+  return (
+    <Show when={edge()}>
+      {(side) => <div class={`pane-edge-highlight pane-edge-highlight-${side()}`} />}
+    </Show>
   );
 }
 
@@ -666,7 +684,7 @@ export function App(): JSX.Element {
           </Show>
           <div class="topbar-right">
             <CalendarJump />
-            <button class="icon-btn" title="Search (Ctrl+K)" onClick={openSwitcher}>
+            <button class="icon-btn" title="Search (Ctrl+K)" onClick={() => openSwitcher()}>
               <svg viewBox="0 0 24 24" class="nav-icon">
                 <circle cx="11" cy="11" r="7" fill="none" stroke="currentColor" stroke-width="1.7" />
                 <line x1="16.5" y1="16.5" x2="21" y2="21" stroke="currentColor" stroke-width="1.7" />
@@ -733,6 +751,7 @@ export function App(): JSX.Element {
             window controls at the far right) spans the full window width and the
             right sidebar / PDF pane sit UNDER it — not beside the close button. */}
         <div class="content-row">
+          <PaneEdgeHighlights />
           <PaneTree node={layoutRoot()} path={[]} />
           <RightSidebar />
           <Show when={pdfTarget()}>

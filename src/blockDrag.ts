@@ -12,20 +12,26 @@ const CHROME = ".bullet-container, .block-controls, .collapse-toggle, a, button,
 const SHEET_INTERNAL =
   ".block-sheet-container, .sheet-grid, .sheet-table, .sheet-board, .sheet-cell, .sheet-board-card";
 
-function blockIdAt(x: number, y: number): string | null {
+function blockIdAt(x: number, y: number, paneId: string | null): string | null {
   const el = document.elementFromPoint(x, y);
+  if (paneId) {
+    const overPane = el?.closest("[data-pane-id]")?.getAttribute("data-pane-id") ?? null;
+    if (overPane !== paneId) return null;
+  }
   return el?.closest("[data-block-id]")?.getAttribute("data-block-id") ?? null;
 }
 
 export function installBlockSelectionDrag(): () => void {
   let armed = false; // a potential drag started inside a block's content
   let startId: string | null = null;
+  let startPaneId: string | null = null;
   let converting = false; // crossed a boundary → now in block-selection mode
 
   const onMouseDown = (e: MouseEvent) => {
     armed = false;
     converting = false;
     startId = null;
+    startPaneId = null;
     if (e.button !== 0) return;
     const target = e.target as Element | null;
     if (!target || target.closest(CHROME)) return;
@@ -33,6 +39,7 @@ export function installBlockSelectionDrag(): () => void {
     const block = target.closest("[data-block-id]");
     if (!block) return; // not in the outline (sidebar, title, dialogs, …)
     startId = block.getAttribute("data-block-id");
+    startPaneId = block.closest("[data-pane-id]")?.getAttribute("data-pane-id") ?? null;
     armed = !!startId;
   };
 
@@ -42,7 +49,7 @@ export function installBlockSelectionDrag(): () => void {
       armed = false; // button was released without a mouseup reaching us
       return;
     }
-    const overId = blockIdAt(e.clientX, e.clientY);
+    const overId = blockIdAt(e.clientX, e.clientY, startPaneId);
     if (overId === null) return; // off the outline — keep current selection
     // Still inside the start block and haven't crossed yet: leave the native
     // in-textarea text selection alone (this is the "select part of a bullet" case).
@@ -58,6 +65,7 @@ export function installBlockSelectionDrag(): () => void {
 
   const onMouseUp = () => {
     armed = false;
+    startPaneId = null;
     if (!converting) return;
     converting = false;
     // Swallow the click the browser synthesizes after this drag so it doesn't

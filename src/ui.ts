@@ -5,6 +5,7 @@ import { backend, isTauri } from "./backend";
 // Zoom is route state; these are call-time only, so the ui↔router cycle is safe.
 import { route, focusBlock, scheduleSessionSave } from "./router";
 import { PaneContext } from "./paneContext";
+import { exitPaneSelect } from "./paneSelect";
 import { setJournalTitleFormat, isJournalTitle } from "./journal";
 
 const THEME_KEY = "logseq-claude.theme";
@@ -252,10 +253,17 @@ export function installPaneTracker(): () => void {
     paneFocusSetter?.(paneId);
     setActivePane(paneId === "pdf" ? "pdf" : "notes");
   };
-  window.addEventListener("pointerdown", update, true);
+  const pointerdown = (e: Event) => {
+    // Any click exits pane-select (standard modal behavior); without this the
+    // mode goes stale — the ring lingers and, worse, its keyboard handler
+    // would still be armed after the user clicks off to do something else.
+    exitPaneSelect();
+    update(e);
+  };
+  window.addEventListener("pointerdown", pointerdown, true);
   window.addEventListener("focusin", update, true);
   return () => {
-    window.removeEventListener("pointerdown", update, true);
+    window.removeEventListener("pointerdown", pointerdown, true);
     window.removeEventListener("focusin", update, true);
   };
 }
@@ -1006,8 +1014,13 @@ export const [switcherOpen, setSwitcherOpen] = createSignal(false);
 // palette (⌘⇧P), commands only.
 export type SwitcherMode = "all" | "commands";
 export const [switcherMode, setSwitcherMode] = createSignal<SwitcherMode>("all");
-export function openSwitcher() {
+export const [switcherEmbryo, setSwitcherEmbryo] =
+  createSignal<{ paneId: string; prefill: string } | null>(null);
+export function openSwitcher(opts?: { mode?: "embryo"; paneId?: string; prefill?: string }) {
   setSwitcherMode("all");
+  setSwitcherEmbryo(opts?.mode === "embryo" && opts.paneId
+    ? { paneId: opts.paneId, prefill: opts.prefill ?? "" }
+    : null);
   setSwitcherOpen(true);
 }
 /** Toggle the WebView developer tools (WebKit Web Inspector) for theme/CSS
@@ -1018,10 +1031,12 @@ export function openDevtools() {
 }
 export function openCommandPalette() {
   setSwitcherMode("commands");
+  setSwitcherEmbryo(null);
   setSwitcherOpen(true);
 }
 export function closeSwitcher() {
   setSwitcherOpen(false);
+  setSwitcherEmbryo(null);
 }
 
 // PDF export: the page whose export-options dialog is open (null = closed). Set by
