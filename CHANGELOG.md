@@ -8,6 +8,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-09
+
 ### Added
 
 - **Sheets: grids, databases, and boards over plain bullets.** Blocks can now
@@ -1194,7 +1196,8 @@ takes over your graph.
 - macOS and Windows installers are currently **unsigned** — on macOS right-click →
   Open; on Windows choose *More info → Run anyway*.
 
-[Unreleased]: https://github.com/martinkoutecky/tine/compare/v0.4.7...HEAD
+[Unreleased]: https://github.com/martinkoutecky/tine/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/martinkoutecky/tine/compare/v0.4.7...v0.5.0
 [0.4.7]: https://github.com/martinkoutecky/tine/compare/v0.4.6...v0.4.7
 [0.4.6]: https://github.com/martinkoutecky/tine/compare/v0.4.5...v0.4.6
 [0.4.5]: https://github.com/martinkoutecky/tine/compare/v0.4.4...v0.4.5
