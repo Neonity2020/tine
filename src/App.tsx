@@ -364,6 +364,25 @@ export function PaneEdgeHighlights(): JSX.Element {
   );
 }
 
+export async function installMobileExternalLinkHandler(): Promise<() => void> {
+  if ((await backend().appPlatform()) === "desktop") return () => {};
+
+  const onClick = (e: MouseEvent) => {
+    const target = e.target;
+    const el = target instanceof Element ? target : target instanceof Node ? target.parentElement : null;
+    const a = el?.closest?.("a[href]") as HTMLAnchorElement | null;
+    const href = a?.getAttribute("href")?.trim() ?? "";
+    if (!a || !/^(https?:\/\/|mailto:)/i.test(href)) return;
+
+    e.preventDefault();
+    e.stopPropagation();
+    void backend().openExternal(a.href);
+  };
+
+  document.addEventListener("click", onClick, true);
+  return () => document.removeEventListener("click", onClick, true);
+}
+
 export function App(): JSX.Element {
   // Startup debug trace (TINE_DEBUG=1 / --debug): forward UI milestones + errors
   // into the backend log so a remote "bad startup" is diagnosable in one file.
@@ -450,6 +469,20 @@ export function App(): JSX.Element {
 
   // Load the `[[`/`#` autocomplete default-action preference (link-first vs create).
   onMount(() => void initLinkDefault());
+
+  // Android/iOS WebViews otherwise navigate raw target=_blank links in-app.
+  onMount(() => {
+    let uninstall = () => {};
+    let disposed = false;
+    void installMobileExternalLinkHandler().then((u) => {
+      if (disposed) u();
+      else uninstall = u;
+    });
+    onCleanup(() => {
+      disposed = true;
+      uninstall();
+    });
+  });
 
   // Persist pending edits before the window closes — the 400ms save debounce
   // would otherwise drop the last keystrokes typed right before quitting.
