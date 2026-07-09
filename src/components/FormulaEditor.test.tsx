@@ -33,6 +33,7 @@ function page(roots: string[]): FeedPage {
     roots,
     format: "md",
     readOnly: false,
+    guide: false,
   };
 }
 

@@ -548,24 +548,27 @@ function ConditionFace(props: {
       />
     );
   }
-  if (props.ast.op === "&&" || props.ast.op === "||") {
-    const flip = () => props.onChange({ ...props.ast, op: props.ast.op === "&&" ? "||" : "&&" });
+  // Narrow to the binary node once: TS drops the guard's narrowing inside the
+  // closures below (props.ast is a mutable union member), so capture it in a const.
+  const ast = props.ast;
+  if (ast.op === "&&" || ast.op === "||") {
+    const flip = () => props.onChange({ ...ast, op: ast.op === "&&" ? "||" : "&&" });
     return (
       <span class="formula-builder-condition formula-builder-condition-group">
         <ConditionFace
-          ast={props.ast.left}
+          ast={ast.left}
           fields={props.fields}
           formulas={props.formulas}
-          onChange={(left) => props.onChange({ ...props.ast, left })}
+          onChange={(left) => props.onChange({ ...ast, left })}
         />
         <button type="button" class="qb-op formula-builder-boolean-op" title="Toggle AND / OR" onClick={flip}>
-          {props.ast.op === "&&" ? "AND" : "OR"}
+          {ast.op === "&&" ? "AND" : "OR"}
         </button>
         <ConditionFace
-          ast={props.ast.right}
+          ast={ast.right}
           fields={props.fields}
           formulas={props.formulas}
-          onChange={(right) => props.onChange({ ...props.ast, right })}
+          onChange={(right) => props.onChange({ ...ast, right })}
         />
       </span>
     );
@@ -573,17 +576,17 @@ function ConditionFace(props: {
   return (
     <span class="formula-builder-condition">
       <ValueFace
-        ast={props.ast.left}
+        ast={ast.left}
         fields={props.fields}
         formulas={props.formulas}
-        onChange={(left) => props.onChange({ ...props.ast, left })}
+        onChange={(left) => props.onChange({ ...ast, left })}
       />
-      <OperatorSelect op={props.ast.op} onChange={(op) => props.onChange({ ...props.ast, op })} />
+      <OperatorSelect op={ast.op} onChange={(op) => props.onChange({ ...ast, op })} />
       <ValueFace
-        ast={props.ast.right}
+        ast={ast.right}
         fields={props.fields}
         formulas={props.formulas}
-        onChange={(right) => props.onChange({ ...props.ast, right })}
+        onChange={(right) => props.onChange({ ...ast, right })}
       />
     </span>
   );

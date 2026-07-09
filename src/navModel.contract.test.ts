@@ -57,6 +57,7 @@ const sheetHarness: NavHarness = {
       roots: ["grid"],
       format: "md",
       readOnly: false,
+      guide: false,
     };
     const node = (id: string, raw: string, parent: string | null, children: string[] = []): StoreNode => ({
       id,

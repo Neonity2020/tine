@@ -36,7 +36,7 @@ function mount(node: () => JSX.Element): { root: HTMLDivElement; dispose: () => 
 }
 
 function page(name: string, kind: "page" | "journal", roots: string[], preBlock: string | null = null): FeedPage {
-  return { name, kind, title: name, preBlock, roots, format: "md", readOnly: false };
+  return { name, kind, title: name, preBlock, roots, format: "md", readOnly: false, guide: false };
 }
 
 function node(id: string, raw: string, pageName: string, parent: string | null = null, children: string[] = []): StoreNode {

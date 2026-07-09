@@ -22,6 +22,7 @@ function page(roots: string[], opts: Partial<Pick<FeedPage, "format" | "readOnly
     roots,
     format: opts.format ?? "md",
     readOnly: opts.readOnly ?? false,
+    guide: false,
   };
 }
 

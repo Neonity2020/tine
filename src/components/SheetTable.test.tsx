@@ -39,6 +39,7 @@ function page(roots: string[], preBlock: string | null = null): FeedPage {
     roots,
     format: "md",
     readOnly: false,
+    guide: false,
   };
 }
 

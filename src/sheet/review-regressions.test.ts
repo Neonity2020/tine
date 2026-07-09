@@ -25,7 +25,7 @@ beforeEach(() => {
 });
 
 function page(name: string, kind: "page" | "journal", roots: string[], readOnly = false): FeedPage {
-  return { name, kind, title: name, preBlock: null, roots, format: "md", readOnly };
+  return { name, kind, title: name, preBlock: null, roots, format: "md", readOnly, guide: false };
 }
 function node(id: string, raw: string, pageName: string, parent: string | null = null, children: string[] = []): Node {
   return { id, raw, collapsed: false, parent, page: pageName, children };

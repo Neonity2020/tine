@@ -35,6 +35,7 @@ function page(format: "md" | "org", roots: string[]): FeedPage {
     roots,
     format,
     readOnly: false,
+    guide: false,
   };
 }
 

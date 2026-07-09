@@ -64,8 +64,8 @@ describe("in-page find model", () => {
       loaded: true,
       feed: ["Feed"],
       pages: [
-        { name: "Feed", kind: "journal", title: "Feed", preBlock: null, roots: ["feed-block"], format: "md", readOnly: false },
-        { name: "Pane", kind: "page", title: "Pane", preBlock: null, roots: ["pane-block"], format: "md", readOnly: false },
+        { name: "Feed", kind: "journal", title: "Feed", preBlock: null, roots: ["feed-block"], format: "md", readOnly: false, guide: false },
+        { name: "Pane", kind: "page", title: "Pane", preBlock: null, roots: ["pane-block"], format: "md", readOnly: false, guide: false },
       ],
       byId: {
         "feed-block": { id: "feed-block", raw: "needle in feed", collapsed: false, parent: null, page: "Feed", children: [] },

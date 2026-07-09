@@ -95,7 +95,7 @@ function loadStructuralPasteDoc() {
       er1: { id: "er1", raw: "", collapsed: false, parent: "target", page: "Sheet", children: ["ec1"] },
       ec1: { id: "ec1", raw: "Existing", collapsed: false, parent: "er1", page: "Sheet", children: [] },
     },
-    pages: [{ name: "Sheet", kind: "page", title: "Sheet", preBlock: null, roots: ["src", "dst"], format: "md", readOnly: false }],
+    pages: [{ name: "Sheet", kind: "page", title: "Sheet", preBlock: null, roots: ["src", "dst"], format: "md", readOnly: false, guide: false }],
     feed: ["Sheet"],
     loaded: true,
   });
@@ -548,7 +548,7 @@ describe("org-format sheet writes", () => {
   function loadOrgDoc(byId: Record<string, ReturnType<typeof orgNode>>, roots: string[]) {
     setDoc({
       byId,
-      pages: [{ name: "Org", kind: "page", title: "Org", preBlock: null, roots, format: "org", readOnly: false }],
+      pages: [{ name: "Org", kind: "page", title: "Org", preBlock: null, roots, format: "org", readOnly: false, guide: false }],
       feed: ["Org"],
       loaded: true,
     });
@@ -617,7 +617,7 @@ describe("fill preserves target hidden properties", () => {
         a: { id: "a", raw: "A", collapsed: false, parent: "r1", page: "Sheet", children: [] },
         b: { id: "b", raw: "B\nid:: keep", collapsed: false, parent: "r1", page: "Sheet", children: [] },
       },
-      pages: [{ name: "Sheet", kind: "page", title: "Sheet", preBlock: null, roots: ["grid"], format: "md", readOnly: false }],
+      pages: [{ name: "Sheet", kind: "page", title: "Sheet", preBlock: null, roots: ["grid"], format: "md", readOnly: false, guide: false }],
       feed: ["Sheet"],
       loaded: true,
     });

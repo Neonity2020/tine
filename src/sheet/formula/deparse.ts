@@ -16,28 +16,11 @@ const BINARY_PRECEDENCE: Record<BinaryOp, number> = {
   "%": 6,
 };
 
-const PREC_ATOM = 9;
 const PREC_MEMBER = 8;
 const PREC_UNARY = 7;
 
 function quoteString(value: string): string {
   return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
-}
-
-function precedence(ast: Ast): number {
-  switch (ast.kind) {
-    case "literal":
-    case "field":
-    case "formulaRef":
-    case "call":
-      return PREC_ATOM;
-    case "member":
-      return PREC_MEMBER;
-    case "unary":
-      return PREC_UNARY;
-    case "binary":
-      return BINARY_PRECEDENCE[ast.op];
-  }
 }
 
 function withParens(text: string, needsParens: boolean): string {
