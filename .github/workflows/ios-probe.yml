@@ -1,0 +1,72 @@
+# iOS build PROBE — a throwaway "is the codebase even iOS-clean?" check.
+#
+# This does NOT sign, distribute, or produce anything installable. It answers one
+# question cheaply, on GitHub's macOS runners, with no Mac and no Apple Developer
+# account on our side: does Tine's Rust compile for iOS, and does `tauri ios init`
+# generate a valid Xcode project?
+#
+# Real iOS delivery would still need (a) a signed build [$99/yr Apple Developer
+# Program + TestFlight, or sideloading], and (b) iOS file-access plumbing so the
+# app can actually open a Logseq graph — iOS sandboxing means the Android folder
+# picker (android_folder_picker.rs) has no iOS equivalent yet. Neither is in scope
+# here; this is only a compile/scaffold sanity signal before investing in those.
+#
+# Manual trigger only — it never runs on push, so it can't burn minutes unattended.
+name: iOS build probe
+
+on:
+  workflow_dispatch:
+
+jobs:
+  ios-probe:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pin to the same toolchain the Android mobile build uses (release.yml), so
+      # this probes the compiler we'd actually ship mobile with, not a moving stable.
+      - uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      # Frontend bundle that `tauri ios init` / the Xcode project reference.
+      - name: Build frontend
+        run: npm run build
+
+      # --- HARD GATE 1: does the Rust compile for iOS? -----------------------
+      # This is the highest-value signal. It exercises every `#[cfg(mobile)]` /
+      # `#[cfg(not(desktop))]` path (e.g. the opener plugin added for GH #49) on
+      # the real iOS targets — device and simulator. If iOS is going to break,
+      # it almost certainly breaks here first, and cheaply.
+      - name: Cross-compile Rust lib for iOS device
+        run: cargo build --lib -p tine --target aarch64-apple-ios
+
+      - name: Cross-compile Rust lib for iOS simulator
+        run: cargo build --lib -p tine --target aarch64-apple-ios-sim
+
+      # --- HARD GATE 2: does the Xcode project generate? ---------------------
+      # Validates the bundle identifier (page.tine.app), Info.plist, and plugin
+      # wiring. --ci skips the interactive prompts.
+      - name: tauri ios init
+        run: npx tauri ios init --ci --verbose
+
+      # --- BONUS (best-effort): full unsigned Simulator build ----------------
+      # Simulator builds aren't code-signed, so this can run without an Apple
+      # account — it shakes out Swift/Xcode/plist issues the Rust build can't.
+      # Marked continue-on-error: a failure HERE (often signing/export quirks)
+      # is not a verdict on the codebase; the two hard gates above are. Read its
+      # log for extra signal, but the job's pass/fail hinges on the gates.
+      - name: tauri ios build (simulator, unsigned)
+        continue-on-error: true
+        run: npx tauri ios build --target aarch64-sim --ci
