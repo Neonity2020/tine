@@ -37,6 +37,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   previously the axis was fixed to `state` at creation and only changeable by
   hand-editing `tine.group-by::`.
 
+- **Sheets: paste nests or splats depending on mode.** Pasting a copied grid
+  region while cells are **selected** now **splats** it into the surrounding grid
+  (anchored at the selection's top-left, growing/padding/overwriting the footprint
+  in one undo, with a toast to undo if it replaced non-empty cells) instead of
+  burying it as a nested grid. Pasting while **editing** a cell still **nests** the
+  copy as a subgrid at the caret. This fixes the accidental double-nested grid and
+  needs no modifier — the paste mode is the signal (ADR 0037).
+
 - **In-app Guide.** Help → Guide and the *Open Guide* command now open bundled,
   read-only how-to pages for Sheets, quick capture, PDF annotation, tips, and the
   feature showcase. Guide pages live only in memory under `Tine-guide/` until you

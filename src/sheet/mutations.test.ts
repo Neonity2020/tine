@@ -18,19 +18,21 @@ import {
   copySheetSelection,
   appendSheetCellChild,
   clearSheetSelection,
+  cutSheetSelection,
   fillSheetSelection,
   insertColumn,
   insertRow,
   materializeCell,
   moveSheetSelection,
-  pasteStructuralSheetSelection,
   pasteTextIntoSheetSelection,
   sheetSelectionText,
+  splatStructuralSheetSelection,
   structuralSheetPasteNode,
   deleteRows,
   deleteColumns,
 } from "./mutations";
 import { parseDelimitedText } from "./tsv";
+import { setToasts, toasts } from "../ui";
 
 let counter = 0;
 function blk(raw: string, children: BlockDto[] = []): BlockDto {
@@ -104,6 +106,7 @@ beforeAll(() => initParser());
 beforeEach(() => {
   counter = 0;
   resetStore();
+  setToasts([]);
 });
 
 describe("sheet structural mutations", () => {
@@ -261,38 +264,197 @@ describe("sheet structural mutations", () => {
     expect(pageToDto("Sheet")).toEqual(before);
   });
 
-  it("copies a grid structurally and pastes it as a hosted child grid after auto-wrapping a compact target", async () => {
+  it("copies a grid structurally and splats it into the selected target grid", async () => {
     loadStructuralPasteDoc();
     const before = pageToDto("Sheet");
-
-    await copySheetSelection({
+    const copied = {
       kind: "range",
       gridId: "src",
       anchor: { row: 0, col: 0 },
       focus: { row: 1, col: 1 },
+    } as const;
+    const { text } = sheetSelectionText(copied);
+
+    await copySheetSelection(copied);
+    const next = splatStructuralSheetSelection({ kind: "cell", gridId: "dst", row: 0, col: 0 }, text);
+
+    expect(next).toEqual({
+      kind: "range",
+      gridId: "dst",
+      anchor: { row: 0, col: 0 },
+      focus: { row: 1, col: 1 },
     });
-    const next = pasteStructuralSheetSelection({ kind: "cell", gridId: "dst", row: 0, col: 0 }, "A\tB\nC\t");
+    expect(doc.byId.dst.children).toHaveLength(2);
+    const [row0, row1] = doc.byId.dst.children;
+    expect(doc.byId[row0].children).toHaveLength(2);
+    expect(doc.byId[row1].children).toHaveLength(2);
+    const [a, b] = doc.byId[row0].children;
+    const [c, d] = doc.byId[row1].children;
+    expect(a).toBe("target");
+    expect(doc.byId[a].raw.split("\n").slice(0, 2).join("\n")).toBe("A\nprop:: one");
+    expect(doc.byId[b].raw).toBe("B");
+    expect(doc.byId[c].raw).toBe("C");
+    expect(doc.byId[d].raw).toBe("");
+    expect(doc.byId[a].children.map((id) => doc.byId[id].raw)).toEqual(["A child"]);
+    expect(doc.byId[a].children.some((id) => blockIsGridView(id))).toBe(false);
+    expect(Object.values(doc.byId).filter((n) => n.parent === "target" && blockIsGridView(n.id))).toEqual([]);
 
-    expect(next).toEqual({ kind: "cell", gridId: doc.byId.target.children[1], row: 0, col: 0 });
-    expect(doc.byId.target.raw).toBe("Target");
-    expect(doc.byId.target.children).toHaveLength(2);
-    const [existingHost, pastedHost] = doc.byId.target.children;
-    expect(doc.byId[existingHost].raw).toBe(
-      "tine.view:: grid\ntine.header:: true\ntine.col-widths:: 0=100\ntine.col-aggregates:: 0=sum"
-    );
-    expect(doc.byId[existingHost].children).toEqual(["er1"]);
-    expect(doc.byId.er1.parent).toBe(existingHost);
-    expect(blockIsGridView(existingHost)).toBe(true);
-    expect(blockIsGridView(pastedHost)).toBe(true);
+    undo();
+    expect(pageToDto("Sheet")).toEqual(before);
+  });
 
-    const [pr1, pr2] = doc.byId[pastedHost].children;
-    expect(doc.byId[pr1].raw).toBe("");
-    expect(doc.byId[pr1].children.map((id) => doc.byId[id].raw)).toEqual(["A\nprop:: one", "B"]);
-    const copiedA = doc.byId[pr1].children[0];
-    expect(doc.byId[doc.byId[copiedA].children[0]].raw).toBe("A child");
-    expect(doc.byId[pr2].raw).toBe("");
-    expect(doc.byId[pr2].children.map((id) => doc.byId[id].raw)).toEqual(["C", ""]);
+  it("splat appends exactly the missing rows when the footprint extends past the grid", async () => {
+    const gridId = loadGrid();
+    const copied = {
+      kind: "range",
+      gridId,
+      anchor: { row: 0, col: 0 },
+      focus: { row: 1, col: 1 },
+    } as const;
+    const { text } = sheetSelectionText(copied);
+    await copySheetSelection(copied);
 
+    const next = splatStructuralSheetSelection({ kind: "cell", gridId, row: 2, col: 0 }, text);
+
+    expect(next).toEqual({
+      kind: "range",
+      gridId,
+      anchor: { row: 2, col: 0 },
+      focus: { row: 3, col: 1 },
+    });
+    expect(rows(gridId)).toHaveLength(4);
+    expect(gridShape(gridId)).toEqual([["A", "B", "C"], ["D"], ["A", "B"], ["D", ""]]);
+  });
+
+  it("splat pads a ragged short row up to the anchor column before placing cells", async () => {
+    const gridId = loadGrid();
+    const copied = {
+      kind: "range",
+      gridId,
+      anchor: { row: 0, col: 0 },
+      focus: { row: 0, col: 1 },
+    } as const;
+    const { text } = sheetSelectionText(copied);
+    await copySheetSelection(copied);
+
+    splatStructuralSheetSelection({ kind: "cell", gridId, row: 1, col: 2 }, text);
+
+    expect(rowCells(rows(gridId)[1])).toEqual(["D", "", "A", "B"]);
+  });
+
+  it("splat overwrites footprint text and subtrees and returns the pasted range", async () => {
+    loadStructuralPasteDoc();
+    const copied = {
+      kind: "range",
+      gridId: "src",
+      anchor: { row: 0, col: 0 },
+      focus: { row: 1, col: 1 },
+    } as const;
+    const { text } = sheetSelectionText(copied);
+    await copySheetSelection(copied);
+
+    const next = splatStructuralSheetSelection({ kind: "cell", gridId: "dst", row: 0, col: 0 }, text);
+
+    expect(next).toEqual({
+      kind: "range",
+      gridId: "dst",
+      anchor: { row: 0, col: 0 },
+      focus: { row: 1, col: 1 },
+    });
+    expect(doc.byId.target.raw.split("\n").slice(0, 2).join("\n")).toBe("A\nprop:: one");
+    expect(doc.byId.er1).toBeUndefined();
+    expect(doc.byId.ec1).toBeUndefined();
+    expect(doc.byId[doc.byId.target.children[0]].raw).toBe("A child");
+    const pastedB = doc.byId[doc.byId.dr1.children[1]];
+    expect(pastedB.raw).toBe("B");
+    expect(pastedB.children).toEqual([]);
+  });
+
+  it("splat undo restores rows, padded cells, text, and subtrees in one undo", async () => {
+    const gridId = loadGrid();
+    const before = pageToDto("Sheet");
+    const copied = {
+      kind: "range",
+      gridId,
+      anchor: { row: 0, col: 0 },
+      focus: { row: 1, col: 1 },
+    } as const;
+    const { text } = sheetSelectionText(copied);
+    await copySheetSelection(copied);
+
+    splatStructuralSheetSelection({ kind: "cell", gridId, row: 2, col: 1 }, text);
+    expect(pageToDto("Sheet")).not.toEqual(before);
+
+    undo();
+    expect(pageToDto("Sheet")).toEqual(before);
+  });
+
+  it("splat shows an undo toast only when overwriting non-empty cells", async () => {
+    loadStructuralPasteDoc();
+    const copied = {
+      kind: "range",
+      gridId: "src",
+      anchor: { row: 0, col: 0 },
+      focus: { row: 1, col: 1 },
+    } as const;
+    const { text } = sheetSelectionText(copied);
+    await copySheetSelection(copied);
+
+    splatStructuralSheetSelection({ kind: "cell", gridId: "dst", row: 0, col: 0 }, text);
+
+    expect(toasts()).toHaveLength(1);
+    expect(toasts()[0].message).toBe("Pasted over existing cells.");
+    expect(toasts()[0].kind).toBe("info");
+    expect(toasts()[0].action?.label).toBe("Undo");
+
+    resetStore();
+    setToasts([]);
+    const gridId = loadGrid();
+    const emptyCopy = {
+      kind: "range",
+      gridId,
+      anchor: { row: 0, col: 0 },
+      focus: { row: 0, col: 1 },
+    } as const;
+    const { text: emptyText } = sheetSelectionText(emptyCopy);
+    await copySheetSelection(emptyCopy);
+
+    splatStructuralSheetSelection({ kind: "cell", gridId, row: 2, col: 0 }, emptyText);
+
+    expect(toasts()).toEqual([]);
+  });
+
+  it("TSV matrix paste shows the same undo toast only when overwriting non-empty cells", () => {
+    const gridId = loadGrid();
+
+    pasteTextIntoSheetSelection({ kind: "cell", gridId, row: 0, col: 0 }, "X\tY");
+
+    expect(toasts()).toHaveLength(1);
+    expect(toasts()[0].message).toBe("Pasted over existing cells.");
+    expect(toasts()[0].action?.label).toBe("Undo");
+
+    setToasts([]);
+    pasteTextIntoSheetSelection({ kind: "cell", gridId, row: 2, col: 0 }, "P\tQ");
+
+    expect(toasts()).toEqual([]);
+  });
+
+  it("single copied cell returns undefined so the caller falls through to text paste", async () => {
+    loadStructuralPasteDoc();
+    const one = { kind: "cell", gridId: "src", row: 0, col: 0 } as const;
+    const { text } = sheetSelectionText(one);
+    await copySheetSelection(one);
+
+    expect(splatStructuralSheetSelection({ kind: "cell", gridId: "dst", row: 0, col: 0 }, text)).toBeUndefined();
+  });
+
+  it("cut clears the source and one undo restores it", () => {
+    const gridId = loadGrid();
+    const before = pageToDto("Sheet");
+
+    cutSheetSelection({ kind: "range", gridId, anchor: { row: 0, col: 0 }, focus: { row: 0, col: 1 } });
+
+    expect(rowCells(rows(gridId)[0])).toEqual(["", "", "C"]);
     undo();
     expect(pageToDto("Sheet")).toEqual(before);
   });
@@ -338,7 +500,7 @@ describe("sheet structural mutations", () => {
     loadStructuralPasteDoc();
     await copySheetSelection({ kind: "cell", gridId: "src", row: 0, col: 0 });
 
-    expect(pasteStructuralSheetSelection({ kind: "cell", gridId: "dst", row: 0, col: 0 }, "X\tY")).toBeUndefined();
+    expect(splatStructuralSheetSelection({ kind: "cell", gridId: "dst", row: 0, col: 0 }, "X\tY")).toBeUndefined();
     const next = pasteTextIntoSheetSelection({ kind: "cell", gridId: "dst", row: 0, col: 0 }, "X\tY");
 
     expect(next).toEqual({ kind: "range", gridId: "dst", anchor: { row: 0, col: 0 }, focus: { row: 0, col: 1 } });

@@ -12,12 +12,14 @@ import {
   setRaw,
   pageByName,
   setBlockProperty,
+  undo,
   withUndoUnit,
 } from "../store";
 import { copyRich } from "../clipboard";
 import { isSheetCellHidden, joinProps, splitProps } from "../editor/properties";
 import { parseOutline, type OutlineNode } from "../editor/outline";
 import { visibleBody } from "../render/block";
+import { pushToast } from "../ui";
 import { serializeColAggregates, serializeColWidths, sheetConfigFromRaw } from "./config";
 import type { AggregateFn } from "./aggregate";
 import { looksLikeDelimitedText, parseDelimitedText, serializeTsv } from "./tsv";
@@ -652,31 +654,54 @@ export function structuralSheetPasteNode(text: string): OutlineNode | null {
   return { raw: "tine.view:: grid", children: rows };
 }
 
-export function pasteStructuralSheetSelection(
+function cellHasVisibleTextOrChildren(id: string): boolean {
+  return cellText(id).trim() !== "" || (doc.byId[id]?.children.length ?? 0) > 0;
+}
+
+function pushPasteOverwriteToast(): void {
+  pushToast("Pasted over existing cells.", "info", { action: { label: "Undo", run: () => undo() } });
+}
+
+export function splatStructuralSheetSelection(
   sel: SheetMutationSelection,
   text: string
 ): SheetMutationSelection | null | undefined {
   if (!lastSheetCopy || lastSheetCopy.fingerprint !== text) return undefined;
   const rows = parseOutline(lastSheetCopy.outlineMd);
   if (!rows.length) return null;
+  const cellCount = rows.reduce((sum, row) => sum + row.children.length, 0);
+  if (cellCount <= 1) return undefined;
   const rect = rectForSheetSelection(sel);
   const anchor = { row: rect.top, col: rect.left };
-  let pastedHost: string | null = null;
-  const ok = withSheetUndo(sel.gridId, "sheet:paste-structural", () => {
-    const target = materializeCell(sel.gridId, anchor.row, anchor.col);
-    if (!target) return false;
-    if (isCompactGridCell(target) && !wrapCompactGridCell(target)) return false;
-    const host = insertEmptyChildBlock(target, doc.byId[target]?.children.length ?? 0);
-    if (!host) return false;
-    setRaw(host, "tine.view:: grid", { timetracking: false });
-    if (!insertOutlineChildren(host, rows)) return false;
-    pastedHost = host;
-    return true;
-  }) ?? false;
-  if (!ok || !pastedHost) return null;
-  const firstRow = doc.byId[pastedHost]?.children[0];
-  const firstCell = firstRow ? doc.byId[firstRow]?.children[0] : null;
-  return firstCell ? { kind: "cell", gridId: pastedHost, row: 0, col: 0 } : null;
+  const height = rows.length;
+  const width = Math.max(...rows.map((row) => row.children.length));
+  const result =
+    withSheetUndo(sel.gridId, "sheet:paste-splat", () => {
+      if (!ensureGridRows(sel.gridId, anchor.row + height - 1)) return false;
+      let overwroteNonEmpty = false;
+      for (let r = 0; r < height; r++) {
+        const row = rows[r];
+        for (let c = 0; c < row.children.length; c++) {
+          const srcCell = row.children[c];
+          const target = materializeCell(sel.gridId, anchor.row + r, anchor.col + c);
+          if (!target) return false;
+          if (cellHasVisibleTextOrChildren(target)) overwroteNonEmpty = true;
+          const existingChildren = [...(doc.byId[target]?.children ?? [])];
+          for (const child of existingChildren) deleteBlock(child);
+          writeCellVisible(target, srcCell.raw);
+          if (srcCell.children.length && !insertOutlineChildren(target, srcCell.children)) return false;
+        }
+      }
+      return { overwroteNonEmpty };
+    }) ?? false;
+  if (!result) return null;
+  if (result.overwroteNonEmpty) pushPasteOverwriteToast();
+  return {
+    kind: "range",
+    gridId: sel.gridId,
+    anchor,
+    focus: { row: anchor.row + height - 1, col: anchor.col + width - 1 },
+  };
 }
 
 export function pasteTextIntoSheetSelection(sel: SheetMutationSelection, text: string): SheetMutationSelection | null {
@@ -685,19 +710,23 @@ export function pasteTextIntoSheetSelection(sel: SheetMutationSelection, text: s
   if (looksLikeDelimitedText(text)) {
     const matrix = parseDelimitedText(text);
     if (!matrix.length) return sel;
-    const ok = withSheetUndo(sel.gridId, "sheet:paste-matrix", () => {
+    const result = withSheetUndo(sel.gridId, "sheet:paste-matrix", () => {
       if (!ensureGridRows(sel.gridId, anchor.row + matrix.length - 1)) return false;
+      let overwroteNonEmpty = false;
       for (let r = 0; r < matrix.length; r++) {
         const row = matrix[r];
         for (let c = 0; c < row.length; c++) {
+          const existing = cellIdAt(sel.gridId, anchor.row + r, anchor.col + c);
+          if (existing && cellHasVisibleTextOrChildren(existing)) overwroteNonEmpty = true;
           const id = materializeCell(sel.gridId, anchor.row + r, anchor.col + c);
           if (!id) return false;
           writeCellVisible(id, row[c]);
         }
       }
-      return true;
+      return { overwroteNonEmpty };
     }) ?? false;
-    if (!ok) return null;
+    if (!result) return null;
+    if (result.overwroteNonEmpty) pushPasteOverwriteToast();
     const height = matrix.length;
     const width = Math.max(1, ...matrix.map((row) => row.length));
     if (height === 1 && width === 1) return { kind: "cell", gridId: sel.gridId, row: anchor.row, col: anchor.col };

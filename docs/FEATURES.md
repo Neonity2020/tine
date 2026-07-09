@@ -206,6 +206,12 @@ coordinates, no lock-in.
   into real spreadsheets); paste TSV/CSV to fill and grow the grid; paste
   indented text to build nested structure. Dropping a `.csv` or `.tsv` file
   onto a page creates a new grid block.
+- **Paste: nest vs splat by mode** — paste while cells are **selected** (not
+  editing) **splats** a copied region into the surrounding grid, anchored at the
+  selection's top-left: it grows the grid to fit, pads short rows, and overwrites
+  the footprint (one undo; a toast offers Undo if it replaced non-empty cells).
+  Paste while **editing** a cell **nests** the copy as a subgrid at the caret.
+  No modifier — the mode you're already in is the signal (ADR 0037).
 - **Field tables** — `tine.view:: table` turns children or query results into an
   editable table whose columns come from facets: task state, priority,
   scheduled/deadline dates, tags, page, and block properties. Writable fields

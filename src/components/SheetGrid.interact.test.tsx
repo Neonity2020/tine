@@ -8,6 +8,7 @@ import { initParser } from "../render/parse";
 import {
   doc,
   blockProperty,
+  blockIsGridView,
   hasSelection,
   isSelected,
   resetStore,
@@ -1010,6 +1011,58 @@ describe("SheetGrid interaction", () => {
     await tick();
 
     expect(writes).toEqual(["Alpha\tBeta\nGamma\t"]);
+
+    dispose();
+  });
+
+  it("select-mode paste of a structural grid copy splats into the selected grid", async () => {
+    const writes = mockClipboard();
+    const { dispose } = setup();
+
+    setCellSel({ kind: "range", gridId: "grid", anchor: { row: 0, col: 0 }, focus: { row: 1, col: 1 } });
+    keydown(window, "c", { ctrlKey: true });
+    await tick();
+    expect(writes).toEqual(["Alpha\tBeta\nGamma\t"]);
+
+    setCellSel({ gridId: "grid", row: 1, col: 1 });
+    const event = pasteText(writes[0]);
+    await tick();
+
+    expect(event.defaultPrevented).toBe(true);
+    expect(doc.byId.grid.children).toHaveLength(3);
+    expect(doc.byId.r2.children.map((id) => doc.byId[id].raw)).toEqual(["Gamma", "Alpha", "Beta"]);
+    const newRow = doc.byId.grid.children[2];
+    expect(doc.byId[newRow].children.map((id) => doc.byId[id].raw)).toEqual(["", "Gamma", ""]);
+    const anchor = doc.byId.r2.children[1];
+    expect(doc.byId[anchor].children.some((id) => blockIsGridView(id))).toBe(false);
+
+    dispose();
+  });
+
+  it("edit-mode paste of a structural grid copy nests a subgrid in the edited cell", async () => {
+    const writes = mockClipboard();
+    const { root, dispose } = setup();
+
+    setCellSel({ kind: "range", gridId: "grid", anchor: { row: 0, col: 0 }, focus: { row: 1, col: 1 } });
+    keydown(window, "c", { ctrlKey: true });
+    await tick();
+    expect(writes).toEqual(["Alpha\tBeta\nGamma\t"]);
+
+    setCellSel({ gridId: "grid", row: 1, col: 0 });
+    keydown(window, "Enter");
+    await tick();
+    const editor = activeEditor(root);
+    const event = pasteInto(editor, writes[0]);
+    await tick();
+
+    expect(event.defaultPrevented).toBe(true);
+    expect(doc.byId.c3.raw).toBe("Gamma");
+    const host = doc.byId.c3.children[0];
+    expect(blockIsGridView(host)).toBe(true);
+    expect(doc.byId[host].raw).toBe("tine.view:: grid");
+    const [row0, row1] = doc.byId[host].children;
+    expect(doc.byId[row0].children.map((id) => doc.byId[id].raw)).toEqual(["Alpha", "Beta"]);
+    expect(doc.byId[row1].children.map((id) => doc.byId[id].raw)).toEqual(["Gamma", ""]);
 
     dispose();
   });

@@ -63,3 +63,4 @@ see the project `CLAUDE.md`.
 | [0034](0034-one-nav-model-two-steppers.md) | One spatial nav model for sheets and panes: shared key protocol (navProtocol.ts), deliberately separate steppers (lattice vs tiling), dual-harness contract test pins the shared invariants | Accepted |
 | [0035](0035-sheets-formula-builder-text-truth.md) | Sheets formula builder: expression text stays authoritative, AST edits deparse through a round-trip gate, unsupported shapes stay raw | Accepted |
 | [0036](0036-in-app-guide.md) | In-app Guide pages are read-only bundled templates with explicit copy-into-graph writes | Accepted |
+| [0037](0037-sheet-paste-mode-nest-vs-splat.md) | Sheet paste: edit mode nests a subgrid, select mode splats the region into the grid (amends 0031) | Accepted |
