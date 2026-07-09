@@ -157,6 +157,22 @@ pub(crate) fn save_page(
 }
 
 #[tauri::command]
+pub(crate) fn guide_pages() -> Vec<tine_core::onboarding::GuidePage> {
+    tine_core::onboarding::bundled_guide_pages()
+}
+
+#[tauri::command]
+pub(crate) fn copy_guide_page(
+    title: String,
+    state: State<'_, AppState>,
+) -> Result<tine_core::onboarding::GuideCopyResult, String> {
+    let result: Result<tine_core::onboarding::GuideCopyResult, String> = with_graph(&state, |g| {
+        tine_core::onboarding::copy_guide_page_into_graph(g, &title).map_err(|e| e.to_string())
+    });
+    result
+}
+
+#[tauri::command]
 pub(crate) fn get_backlinks(
     name: String,
     state: State<'_, AppState>,
@@ -299,6 +315,19 @@ pub(crate) fn set_timetracking_enabled(
 ) -> Result<(), String> {
     with_graph(&state, |g| {
         g.set_timetracking_enabled(enabled)
+            .map_err(|e| e.to_string())
+    })?;
+    refresh_graph(&state);
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) fn set_guide_announced(
+    announced: bool,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    with_graph(&state, |g| {
+        g.set_guide_announced(announced)
             .map_err(|e| e.to_string())
     })?;
     refresh_graph(&state);

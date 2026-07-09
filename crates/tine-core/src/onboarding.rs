@@ -9,7 +9,7 @@
 use std::io;
 use std::path::Path;
 
-use crate::model::{atomic_write, Graph, PageKind};
+use crate::model::{atomic_write, markdown_page_dto, Graph, PageDto, PageKind};
 
 /// `logseq/config.edn` for the demo graph (triple-lowbar namespace filenames,
 /// the welcome page pinned as a favorite).
@@ -22,6 +22,7 @@ const QUICK_CAPTURE_PNG: &[u8] = include_bytes!("templates/assets/quick-capture.
 /// with a `/` create namespaces (e.g. `Features/Quick capture`).
 const PAGES: &[(&str, &str)] = &[
     ("Welcome to Tine", include_str!("templates/welcome.md")),
+    ("Tine Guide", include_str!("templates/guide.md")),
     (
         "Features/Quick capture",
         include_str!("templates/quick-capture.md"),
@@ -32,8 +33,96 @@ const PAGES: &[(&str, &str)] = &[
     ),
     ("Features/Sheets", include_str!("templates/sheets.md")),
     ("Features/PDF annotation", include_str!("templates/pdf.md")),
+    ("Feature showcase", include_str!("templates/showcase.md")),
     ("Project/Roadmap", include_str!("templates/roadmap.md")),
 ];
+
+/// In-memory namespace for bundled, read-only guide pages. These pages are
+/// rendered live in the running app but are not graph files.
+pub const GUIDE_DISPLAY_PREFIX: &str = "Tine-guide/";
+
+/// Real graph namespace used only by the explicit "Copy into my graph" action.
+pub const GUIDE_COPY_PREFIX: &str = "tine-guide/";
+
+struct GuideTemplate {
+    title: &'static str,
+    markdown: &'static str,
+}
+
+const GUIDE_TEMPLATES: &[GuideTemplate] = &[
+    GuideTemplate {
+        title: "Tine Guide",
+        markdown: include_str!("templates/guide.md"),
+    },
+    GuideTemplate {
+        title: "Features/Sheets",
+        markdown: include_str!("templates/sheets.md"),
+    },
+    GuideTemplate {
+        title: "Features/Quick capture",
+        markdown: include_str!("templates/quick-capture.md"),
+    },
+    GuideTemplate {
+        title: "Features/PDF annotation",
+        markdown: include_str!("templates/pdf.md"),
+    },
+    GuideTemplate {
+        title: "Features/Tips & shortcuts",
+        markdown: include_str!("templates/tips.md"),
+    },
+    GuideTemplate {
+        title: "Feature showcase",
+        markdown: include_str!("templates/showcase.md"),
+    },
+];
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GuidePage {
+    pub title: String,
+    pub markdown: String,
+    pub page: PageDto,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GuideCopyResult {
+    pub name: String,
+    pub created: bool,
+}
+
+pub fn guide_page_name(title: &str) -> String {
+    format!("{GUIDE_DISPLAY_PREFIX}{title}")
+}
+
+pub fn bundled_guide_pages() -> Vec<GuidePage> {
+    GUIDE_TEMPLATES
+        .iter()
+        .map(|t| {
+            let mut page = markdown_page_dto(&guide_page_name(t.title), t.title, t.markdown);
+            page.read_only = true;
+            page.guide = true;
+            GuidePage {
+                title: t.title.to_string(),
+                markdown: t.markdown.to_string(),
+                page,
+            }
+        })
+        .collect()
+}
+
+pub fn copy_guide_page_into_graph(graph: &Graph, title: &str) -> io::Result<GuideCopyResult> {
+    let Some(template) = GUIDE_TEMPLATES
+        .iter()
+        .find(|t| t.title.eq_ignore_ascii_case(title))
+    else {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "unknown bundled guide page",
+        ));
+    };
+    let name = format!("{GUIDE_COPY_PREFIX}{}", template.title);
+    let created = graph.create_markdown_page_if_absent(&name, template.markdown)?;
+    Ok(GuideCopyResult { name, created })
+}
 
 /// Scaffold a fresh demo graph at `root`: the standard Logseq directory layout,
 /// a config, the narrated welcome pages, and the embedded assets. `root` must be
@@ -85,6 +174,8 @@ mod tests {
         let cfg = Config::parse(&std::fs::read_to_string(dir.join("logseq/config.edn")).unwrap());
         assert_eq!(cfg.file_name_format, FileNameFormat::TripleLowbar);
         assert!(dir.join("pages/Features___Quick capture.md").is_file());
+        assert!(dir.join("pages/Tine Guide.md").is_file());
+        assert!(dir.join("pages/Feature showcase.md").is_file());
         assert!(dir.join("pages/Project___Roadmap.md").is_file());
 
         // Every page loads by its (namespace-decoded) title, and every page parses.
@@ -134,6 +225,51 @@ mod tests {
             parents("# Welcome to Tine"),
             "page heading should parent its intro"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bundled_guide_pages_are_read_only_virtual_pages() {
+        let pages = bundled_guide_pages();
+        let index = pages
+            .iter()
+            .find(|p| p.title == "Tine Guide")
+            .expect("guide index is bundled");
+        assert_eq!(index.page.name, "Tine-guide/Tine Guide");
+        assert!(index.page.read_only);
+        assert!(index.page.guide);
+
+        let sheets = pages
+            .iter()
+            .find(|p| p.title == "Features/Sheets")
+            .expect("sheets guide is bundled");
+        assert!(sheets.markdown.contains("Create one yourself"));
+        assert!(sheets.page.blocks.iter().any(|b| b.raw.contains("Positional grid")));
+    }
+
+    #[test]
+    fn copy_guide_page_writes_lowercase_namespace_without_overwrite() {
+        let dir = std::env::temp_dir().join(format!("tine-guide-copy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        create_demo_graph(&dir).unwrap();
+        let graph = Graph::open(&dir);
+
+        let copied = copy_guide_page_into_graph(&graph, "Features/Sheets").unwrap();
+        assert_eq!(copied.name, "tine-guide/Features/Sheets");
+        assert!(copied.created);
+        let path = graph.path_for(&copied.name, PageKind::Page);
+        assert!(path.is_file());
+        let original = std::fs::read_to_string(&path).unwrap();
+        assert!(original.contains("# Sheets"));
+        assert!(!original.contains("Tine-guide/"));
+
+        std::fs::write(&path, "- user edits stay\n").unwrap();
+        let existing = copy_guide_page_into_graph(&graph, "Features/Sheets").unwrap();
+        assert_eq!(existing.name, copied.name);
+        assert!(!existing.created);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "- user edits stay\n");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

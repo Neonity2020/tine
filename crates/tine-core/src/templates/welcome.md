@@ -15,6 +15,7 @@ icon:: 👋
 	- And here is that same bullet **embedded** inline — it stays in sync with the original:
 		- {{embed ((7a1c0f5e-0000-4000-8000-000000000001))}}
 - ## Keep exploring
+	- [[Tine Guide]] — open the in-app how-to guide beside your own graph, with live examples you can copy into a sandbox.
 	- [[Features/Quick capture]] — drop a thought into your graph from **any** app with a global hotkey. (Set this one up — it's genuinely good.)
 	- [[Features/Tips & shortcuts]] — slash commands, the command palette, tabs, the sidebar, focus mode and dimming.
 	- [[Features/Sheets]] — grids, field tables, and task boards over plain bullets.
