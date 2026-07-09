@@ -52,16 +52,20 @@ fn looks_like_tine_data(dir: &Path) -> bool {
         || dir.join("backups").is_dir()
 }
 
-/// Does `dir` hold REAL user working state (not just fresh WebKit/Tauri scaffolding
-/// or a default settings file)? A `tine-session.json` or a non-empty `backups/` only
-/// ever appears once a graph has actually been opened (opening a graph snapshots a
-/// backup and the UI persists a session), so either is proof the user has been
-/// working in THIS identifier's dir. We deliberately do NOT count `tine-settings.json`
-/// (written with defaults even on the Welcome screen) or a bare WebKit `storage/`
-/// (localStorage may hold only Welcome-tour UI state) — those must not block a
-/// backfill of genuinely stranded data.
+/// Does `dir` hold REAL user working state (not just fresh WebKit/Tauri
+/// scaffolding)? A non-empty `backups/` is the one bulletproof signal: Tine snapshots
+/// a backup whenever a graph is OPENED (backup.rs, called from load_graph) and the
+/// keep-count is clamped to >= 1, so a non-empty `backups/` proves the user actually
+/// opened a graph in THIS identifier's dir. We deliberately do NOT count:
+///   - `tine-settings.json` — written with defaults even on the Welcome screen;
+///   - `tine-session.json`  — the window-close handler flushes a session (with the
+///     default "journals" tab) on EVERY quit, including a Welcome-only launch, so
+///     its mere presence does not mean a graph was ever opened;
+///   - a bare WebKit `storage/` — localStorage may hold only Welcome-tour UI state.
+/// Counting any of those would wrongly block a backfill for exactly the user we need
+/// to rescue: someone who launched the renamed build, saw Welcome, and quit.
 fn has_real_user_data(dir: &Path) -> bool {
-    dir.join("tine-session.json").exists() || dir_has_entries(&dir.join("backups"))
+    dir_has_entries(&dir.join("backups"))
 }
 
 fn dir_has_entries(dir: &Path) -> bool {
@@ -221,24 +225,26 @@ mod tests {
     }
 
     #[test]
-    fn never_clobbers_real_new_data() {
-        let base = tmp("noclobber");
+    fn a_welcome_only_session_file_does_not_block_backfill() {
+        // THE regression to guard: the user launched the renamed build, saw Welcome
+        // and quit — the close handler flushed a `tine-session.json` (default
+        // "journals" tab) into the new dir. That must NOT be mistaken for real use,
+        // or the stranded legacy data never gets recovered.
+        let base = tmp("welcome-session");
         let _ = std::fs::remove_dir_all(&base);
         let old = base.join("dev.tine.app");
         let new = base.join("page.tine.app");
-        write(&old, "tine-settings.json", "{\"old\":true}");
-        // New dir has a real session => the user has worked here; must not migrate.
-        write(&new, "tine-session.json", "{\"tabs\":[]}");
+        write(&old, "tine-settings.json", "{}");
+        write(&old, "SENTINEL", "real");
+        std::fs::create_dir_all(old.join("backups")).unwrap();
+        write(&old.join("backups"), "snap1", "x");
+        // New dir = fresh scaffolding + a Welcome-close session (no backups!).
+        scaffold(&new);
+        write(&new, "tine-session.json", "{\"tabs\":[{\"history\":[{\"kind\":\"journals\"}]}]}");
 
-        assert!(!migrate_app_data_dir(&new));
-        assert!(
-            !new.join("tine-settings.json").exists() || {
-                let g = std::fs::read_to_string(new.join("tine-settings.json")).unwrap_or_default();
-                !g.contains("old")
-            },
-            "old data must not overwrite the in-use new dir"
-        );
-        assert!(old.exists(), "legacy dir left intact");
+        assert!(migrate_app_data_dir(&new), "must still backfill over a Welcome session");
+        assert!(new.join("SENTINEL").exists());
+        assert!(!old.exists());
         let _ = std::fs::remove_dir_all(&base);
     }
 
