@@ -979,6 +979,20 @@ function FieldCell(props: {
     }
   };
 
+  const isDateField = () =>
+    props.field === "scheduled" ||
+    props.field === "deadline" ||
+    (props.field.startsWith("prop:") && (props.fieldType === "date" || props.fieldType === "datetime"));
+  // A date cell with no value renders nothing to click (the chip is the only
+  // control), so there's no way to ADD a date to a row that lacks one (Martin's
+  // nit). Let a single click anywhere in an EMPTY date cell open the picker; a
+  // filled cell keeps its chip handler (which stops propagation, so this no-ops).
+  const onCellClick = (e: MouseEvent) => {
+    if (!isDateField() || !editable()) return;
+    if ((e.target as HTMLElement).closest(".date-chip")) return; // chip already handles it
+    runControlAction(e);
+  };
+
   const onDoubleClick = (e: MouseEvent) => {
     if (e.button !== 0 || e.ctrlKey || e.metaKey || e.altKey) return;
     e.preventDefault();
@@ -992,7 +1006,7 @@ function FieldCell(props: {
     e.preventDefault();
     e.stopPropagation();
     select();
-    openSheetCellContextMenu(e.clientX, e.clientY, props.row.id);
+    openSheetCellContextMenu(e.clientX, e.clientY, props.row.id, { rowId: props.row.id });
   };
   const openCellMenuFromHandle = (e: MouseEvent) => {
     if (!editable()) return;
@@ -1000,7 +1014,7 @@ function FieldCell(props: {
     e.stopPropagation();
     select();
     const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-    openSheetCellContextMenu(rect.right, rect.bottom + 2, props.row.id);
+    openSheetCellContextMenu(rect.right, rect.bottom + 2, props.row.id, { rowId: props.row.id });
   };
 
   return (
@@ -1019,6 +1033,7 @@ function FieldCell(props: {
       data-row={props.rowIndex}
       data-col={props.colIndex}
       style={bgColor() ? { background: bgColor() } : undefined}
+      onClick={onCellClick}
       onDblClick={onDoubleClick}
       onContextMenu={openCellMenu}
     >

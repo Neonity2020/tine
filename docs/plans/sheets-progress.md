@@ -707,6 +707,38 @@ app reopening a probe's persisted `tine.graphPath` instead of `TINE_GRAPH`
 state between probe runs; a clean HEAD binary reproduced the "failures"
 identically, which is what exonerated the diff.
 
+## Field-cell nits batch (Martin, Jul 9) [SHIPPED]
+
+Three small table/field nits from his second field report, all fixed +
+real-app verified (`probe-sheet-fields.mjs` 7/7 in dark theme):
+
+1. **Checkbox rendered white-on-dark.** `.sheet-checkbox` was a bare native
+   `<input type=checkbox>` — a native control renders white under any theme
+   that doesn't set `color-scheme: dark` (custom gallery themes). Now
+   custom-drawn from theme vars (`appearance:none` + `--accent`/currentColor),
+   mirroring `.block-checkbox` — theme-proof.
+2. **No way to add a date to a date row that lacks one.** An empty date cell
+   renders no chip, so there was nothing to click. Added a cell-level `onClick`
+   that opens the date picker for empty scheduled/deadline/date/datetime cells
+   (filled cells keep their chip handler, which stops propagation).
+3. **No discoverable row/column removal.** Added **"Delete row"** (grid + table)
+   and **"Delete column"** (grid; tables already remove columns via the header's
+   "Remove from schema") to the cell right-click menu — `openSheetCellContextMenu`
+   now carries a `SheetCellRemoveCtx` (`rowId` sort-safe via `deleteBlock`,
+   `gridId`/`col` for positional column delete). Grid keyboard remove (A4) still
+   works; this is the discoverable path.
+
+Also answered his questions (see the reply): a grid/table/board is just a
+`tine.view::`-tagged outline tree in the block (rows = child bullets); formula
+columns already evaluate over query-sourced tables (formulas + queries compose);
+and there's no visual *formula* builder yet — the `FormulaEditor` is chip-assisted
+text. Formula builder queued in BACKLOG (Later), Martin thinking on the design.
+
+Tests: 676 node + 274 render (3 new, necessity-checked). Env note: after the
+sandbox restart Xvfb needed restarting (`Xvfb :99 -screen 0 1600x1000x24`);
+probe now spawns the driver `detached` and kills the whole process group on
+teardown, so grandchildren don't orphan into zombies (stayed ~20, not ~1600).
+
 ## Working notes
 
 - **Deploys (Martin, Jul 7): Sheets builds go to `~/research/tine-sheets`**;

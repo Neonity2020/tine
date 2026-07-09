@@ -490,13 +490,18 @@ function SheetGridCell(props: { gridId: string; cell: MatrixCell; header: boolea
     const offset = node ? clickOffset(e, contentRef, node.raw) : null;
     startCellEditing(sel(), offset ?? undefined);
   };
+  const removeCtx = () => ({
+    rowId: doc.byId[props.gridId]?.children[props.cell.row],
+    gridId: props.gridId,
+    col: props.cell.col,
+  });
   const openCellMenu = (e: MouseEvent) => {
     const blockId = props.cell.blockId;
     if (!blockId) return;
     e.preventDefault();
     e.stopPropagation();
     setCellSel(sel());
-    openSheetCellContextMenu(e.clientX, e.clientY, blockId);
+    openSheetCellContextMenu(e.clientX, e.clientY, blockId, removeCtx());
   };
   const openCellMenuFromHandle = (e: MouseEvent) => {
     const blockId = props.cell.blockId;
@@ -505,7 +510,7 @@ function SheetGridCell(props: { gridId: string; cell: MatrixCell; header: boolea
     e.stopPropagation();
     setCellSel(sel());
     const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-    openSheetCellContextMenu(rect.right, rect.bottom + 2, blockId);
+    openSheetCellContextMenu(rect.right, rect.bottom + 2, blockId, removeCtx());
   };
 
   return (

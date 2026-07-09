@@ -15,6 +15,7 @@ import {
   openPdfExport,
   openFormulaEditor,
   type ContextMenuAction,
+  type SheetCellRemoveCtx,
 } from "../ui";
 import { openPage, openPageInNewTab, openPageAtBlock } from "../router";
 import { closePane, layoutPaneIds, paneRouter } from "../panes";
@@ -42,7 +43,7 @@ import {
 } from "../store";
 import { canFlatten, flatten, hierarchify } from "../sheet/restructure";
 import { canConvertPipeTableToGrid, convertGridToPipeTable, convertPipeTableToGrid } from "../sheet/conversions";
-import { appendSheetCellChild } from "../sheet/mutations";
+import { appendSheetCellChild, deleteColumn } from "../sheet/mutations";
 import { cellForBlockId, cellOwner, setCellSel } from "../sheet/selection";
 import { fieldIdsForBlocks, fieldLabel, isFieldId, type FieldId } from "../sheet/fields";
 import { startEditing } from "../editorController";
@@ -93,7 +94,11 @@ export function ContextMenu(): JSX.Element {
                 />
               </Match>
               <Match when={m().kind === "sheet-cell"}>
-                <SheetCellMenu id={(m() as { blockId: string }).blockId} close={close} />
+                <SheetCellMenu
+                  id={(m() as { blockId: string }).blockId}
+                  remove={(m() as { remove?: SheetCellRemoveCtx }).remove}
+                  close={close}
+                />
               </Match>
               <Match when={m().kind === "page"}>
                 <PageMenu
@@ -238,8 +243,21 @@ function ColorPalette(props: { id: string; close: () => void }): JSX.Element {
   );
 }
 
-function SheetCellMenu(props: { id: string; close: () => void }): JSX.Element {
+function SheetCellMenu(props: { id: string; remove?: SheetCellRemoveCtx; close: () => void }): JSX.Element {
   const view = () => blockProperty(props.id, "tine.view") ?? "outline";
+  const canDeleteRow = () => !!props.remove?.rowId && !!doc.byId[props.remove.rowId];
+  const canDeleteColumn = () =>
+    props.remove?.gridId != null && props.remove?.col != null && !!doc.byId[props.remove.gridId];
+  const deleteRow = () => {
+    const rowId = props.remove?.rowId;
+    if (rowId && doc.byId[rowId]) deleteBlock(rowId);
+    props.close();
+  };
+  const deleteColumnHere = () => {
+    const { gridId, col } = props.remove ?? {};
+    if (gridId != null && col != null) deleteColumn(gridId, col);
+    props.close();
+  };
   const setView = (next: "outline" | "grid" | "table") => {
     setBlockProperty(props.id, "tine.view", next === "outline" ? null : next);
     props.close();
@@ -292,6 +310,19 @@ function SheetCellMenu(props: { id: string; close: () => void }): JSX.Element {
       >
         Zoom into cell
       </div>
+      <Show when={canDeleteRow() || canDeleteColumn()}>
+        <div class="ctx-sep" />
+        <Show when={canDeleteRow()}>
+          <div class="ctx-item danger" onClick={deleteRow}>
+            Delete row
+          </div>
+        </Show>
+        <Show when={canDeleteColumn()}>
+          <div class="ctx-item danger" onClick={deleteColumnHere}>
+            Delete column
+          </div>
+        </Show>
+      </Show>
     </>
   );
 }

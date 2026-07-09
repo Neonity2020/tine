@@ -685,6 +685,80 @@ describe("SheetTable", () => {
     dispose();
   });
 
+  it("clicking an EMPTY date cell opens the picker so you can add a date to a row that lacks one", () => {
+    setDoc({
+      byId: {
+        table: node("table", "Table\ntine.view:: table\ntine.fields:: due=date", null, ["r1"]),
+        r1: node("r1", "Task", "table"), // no due value
+      },
+      pages: [page(["table"])],
+      feed: ["Sheet"],
+      loaded: true,
+    });
+    const { root, dispose } = mount(() => (
+      <>
+        <Block id="table" />
+        <DatePicker />
+      </>
+    ));
+
+    const dueCell = cell(root, 0, 1);
+    expect(dueCell.querySelector(".date-chip")).toBeNull(); // empty → nothing to click before the fix
+    dueCell.click();
+    expect(root.querySelector(".date-picker")).not.toBeNull();
+    const day15 = [...root.querySelectorAll(".date-picker .dp-cell")].find(
+      (el) => el.textContent?.trim() === "15"
+    ) as HTMLButtonElement | undefined;
+    day15!.click();
+    expect(doc.byId.r1.raw).toContain("due:: ");
+
+    dispose();
+  });
+
+  it("cell menu 'Delete row' removes the row block in a table", () => {
+    loadTableDoc(); // r1, r2
+    const { root, dispose } = mount(() => (
+      <>
+        <Block id="table" />
+        <ContextMenu />
+      </>
+    ));
+
+    contextMenu(cell(root, 0, 6)); // right-click r1's owner cell
+    clickMenuItem("Delete row");
+    expect(doc.byId.r1).toBeUndefined();
+    expect(doc.byId.table.children).toEqual(["r2"]);
+
+    dispose();
+  });
+
+  it("cell menu 'Delete column' removes the positional column in a grid", () => {
+    setDoc({
+      byId: {
+        grid: node("grid", "Grid\ntine.view:: grid", null, ["gr1"]),
+        gr1: node("gr1", "", "grid", ["ca", "cb"]),
+        ca: node("ca", "A", "gr1"),
+        cb: node("cb", "B", "gr1"),
+      },
+      pages: [page(["grid"])],
+      feed: ["Sheet"],
+      loaded: true,
+    });
+    const { root, dispose } = mount(() => (
+      <>
+        <Block id="grid" />
+        <ContextMenu />
+      </>
+    ));
+
+    contextMenu(cell(root, 0, 0, "grid")); // right-click cell A (col 0)
+    clickMenuItem("Delete column");
+    expect(doc.byId.ca).toBeUndefined();
+    expect(doc.byId.gr1.children).toEqual(["cb"]);
+
+    dispose();
+  });
+
   it("sorts the table view without changing child order", () => {
     setDoc({
       byId: {

@@ -872,11 +872,17 @@ export async function pruneSidebarBlocks(): Promise<void> {
 
 // Right-click context menu — universal over its target (a block or a page),
 // mirroring the sidebar's two reference kinds.
+/** Structural-removal context for a sheet cell's right-click menu. `rowId` is the
+ *  row block to drop (works for grid + table, sort-safe). `gridId`/`col` enable a
+ *  positional column delete (grid only; tables remove columns via "Remove from
+ *  schema" on the header instead). */
+export type SheetCellRemoveCtx = { rowId?: string; gridId?: string; col?: number };
+
 export type CtxTarget =
   | { kind: "block"; blockId: string }
   | { kind: "page"; name: string; pageKind: "journal" | "page" }
   | { kind: "blockref"; uuid: string; page: string; pageKind: "journal" | "page" }
-  | { kind: "sheet-cell"; blockId: string }
+  | { kind: "sheet-cell"; blockId: string; remove?: SheetCellRemoveCtx }
   | {
       kind: "sheet";
       ownerId: string;
@@ -919,8 +925,8 @@ export function openBlockRefContextMenu(
 ) {
   setContextMenu({ x, y, kind: "blockref", uuid, page, pageKind });
 }
-export function openSheetCellContextMenu(x: number, y: number, blockId: string) {
-  setContextMenu({ x, y, kind: "sheet-cell", blockId });
+export function openSheetCellContextMenu(x: number, y: number, blockId: string, remove?: SheetCellRemoveCtx) {
+  setContextMenu({ x, y, kind: "sheet-cell", blockId, remove });
 }
 export function openSheetContextMenu(
   x: number,
