@@ -53,6 +53,7 @@ import {
   orderedListMarker,
   withUndoUnit,
   blockIsGridView,
+  trackAssetWrite,
 } from "../store";
 import {
   clearFocusSurface,
@@ -91,6 +92,7 @@ import {
   recordingExt,
   insertedAssetMarkdownTarget,
   replaceInsertedAssetMarkdown,
+  removeInsertedAssetMarkdown,
 } from "../media";
 import { MEDIA_EDITORS } from "../mediaEditors";
 import { resolveMediaEditorCommand } from "../mediaEditorSettings";
@@ -1207,8 +1209,11 @@ export function Editor(props: { id: string }): JSX.Element {
     void (async () => {
       let stored: string;
       try {
-        stored = await backend().saveAsset(candidate, bytes);
+        stored = await trackAssetWrite(backend().saveAsset(candidate, bytes));
       } catch {
+        const cur = node().raw;
+        const rolledBack = removeInsertedAssetMarkdown(cur, candidate, fixupTarget);
+        if (rolledBack !== cur) commit(rolledBack);
         pushToast(`Couldn’t save to assets/`, "error");
         return;
       }

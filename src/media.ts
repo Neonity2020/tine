@@ -212,3 +212,23 @@ export function replaceInsertedAssetMarkdown(
   const afterOriginalOffset = positions.find((p) => p >= target.insertedAt);
   return replaceAt(raw, afterOriginalOffset ?? positions[0], from.length, to);
 }
+
+export function removeInsertedAssetMarkdown(
+  raw: string,
+  candidate: string,
+  target: AssetMarkdownFixupTarget
+): string {
+  const from = assetMarkdown(candidate);
+  if (!from) return raw;
+  const positions: number[] = [];
+  let pos = raw.indexOf(from);
+  while (pos >= 0) {
+    positions.push(pos);
+    pos = raw.indexOf(from, pos + from.length);
+  }
+  if (!positions.length) return raw;
+  const exact = positions[target.occurrence];
+  if (exact !== undefined) return replaceAt(raw, exact, from.length, "");
+  const afterOriginalOffset = positions.find((p) => p >= target.insertedAt);
+  return replaceAt(raw, afterOriginalOffset ?? positions[0], from.length, "");
+}

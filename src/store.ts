@@ -50,10 +50,11 @@ import {
   resetSaveState,
   isSaving,
   holdSourcesForDest,
+  trackAssetWrite,
 } from "./persistence";
 // The debounced persistence engine lives in persistence.ts; re-exported here so
 // the rest of the app keeps importing the save API from the store.
-export { markDirty, isDirty, isSaving, scheduleSave, flushPage, flushAll, forceSave };
+export { markDirty, isDirty, isSaving, scheduleSave, flushPage, flushAll, forceSave, trackAssetWrite };
 
 export interface Node {
   id: string;

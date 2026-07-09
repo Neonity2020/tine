@@ -35,6 +35,7 @@ let graphToken = 0;
 const saveChain = new Map<string, Promise<boolean>>();
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
 let dataRevTimer: ReturnType<typeof setTimeout> | null = null;
+const assetWriteChain = new Set<Promise<boolean>>();
 // Cross-page move barrier (audit C#1): while a moved subtree's DESTINATION write is not
 // yet durable, the SOURCE pages must not save their post-removal state — otherwise an
 // UNRELATED edit to a source during the dest-write window marks it dirty and writes the
@@ -79,6 +80,21 @@ export function holdSourcesForDest(dest: string, sources: string[]) {
   if (srcs.length === 0) return;
   heldByDest.set(dest, srcs);
   for (const s of srcs) heldSources.add(s);
+}
+
+/** Track an optimistic asset write so flushAll/app-close waits for the bytes to
+ *  land before letting the process exit. The caller still owns success/failure
+ *  handling for any UI/store rollback. */
+export function trackAssetWrite<T>(write: Promise<T>): Promise<T> {
+  let tracked: Promise<boolean>;
+  tracked = write.then(
+    () => true,
+    () => false
+  ).finally(() => {
+    assetWriteChain.delete(tracked);
+  });
+  assetWriteChain.add(tracked);
+  return write;
 }
 /** Dest saved durably → let its held sources persist their post-removal state now
  *  (the block is on disk in the dest, so removing it from the source loses nothing). */
@@ -234,15 +250,19 @@ export async function flushAll(): Promise<boolean> {
   // save).
   for (let i = 0; i < 4; i++) {
     const names = new Set<string>([...dirty, ...saveChain.keys()]);
-    if (names.size === 0) break;
-    const results = await Promise.all([...names].map((n) => enqueueSave(n)));
+    const assetWrites = [...assetWriteChain];
+    if (names.size === 0 && assetWrites.length === 0) break;
+    const [results] = await Promise.all([
+      Promise.all([...names].map((n) => enqueueSave(n))),
+      Promise.all(assetWrites),
+    ]);
     if (results.some(Boolean)) landed = true;
   }
   if (landed) bumpDataRev();
   // Success only if nothing is still pending AND there are no unresolved
   // conflicts (a conflicted page's edit is NOT on disk) — so a destructive
   // transition (graph switch / restore / close) can abort instead of discarding it.
-  return dirty.size === 0 && conflicts().length === 0;
+  return dirty.size === 0 && assetWriteChain.size === 0 && conflicts().length === 0;
 }
 
 /** Resolve a save conflict by overwriting the on-disk file with the in-memory
