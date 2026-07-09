@@ -2711,6 +2711,22 @@ impl Graph {
             .unwrap_or_default()
     }
 
+    fn asset_key_in_use_by_pdf(&self, candidate_key: &str) -> bool {
+        let Ok(entries) = fs::read_dir(self.assets_path()) else {
+            return false;
+        };
+        entries.flatten().any(|entry| {
+            let filename = entry.file_name();
+            let Some(filename) = filename.to_str() else {
+                return false;
+            };
+            if !filename.ends_with(".pdf") && !filename.ends_with(".PDF") {
+                return false;
+            }
+            crate::pdf::asset_key(filename) == candidate_key
+        })
+    }
+
     /// Persist highlights: write `assets/<key>.edn` and the `hls__<key>` page.
     /// `base_ids` are the highlight ids the editor LOADED (its baseline) — used for
     /// a 3-way merge so a highlight the user deleted is honored while one added
@@ -2727,9 +2743,10 @@ impl Graph {
         // exist, we read those as the baseline and migrate them to the new key
         // below — so the key change never strands existing highlights.
         let legacy_key = crate::pdf::legacy_asset_key(pdf_filename);
+        let legacy_active = legacy_key != key && !self.asset_key_in_use_by_pdf(&legacy_key);
         let legacy_edn =
-            (legacy_key != key).then(|| self.assets_path().join(format!("{legacy_key}.edn")));
-        let legacy_page = (legacy_key != key).then(|| {
+            legacy_active.then(|| self.assets_path().join(format!("{legacy_key}.edn")));
+        let legacy_page = legacy_active.then(|| {
             self.pages_path()
                 .join(format!("{}.md", crate::pdf::hls_page_name(&legacy_key)))
         });
@@ -5091,6 +5108,96 @@ mod tests {
                 .join(format!("hls__{legacy_key}.md"))
                 .exists(),
             "legacy hls page removed"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_highlights_does_not_migrate_legacy_key_used_by_another_pdf() {
+        let dir = scratch("hl-legacy-collision");
+        let assets = dir.join("assets");
+        fs::create_dir_all(&assets).unwrap();
+
+        let lower_pdf = "my_paper.pdf";
+        let spaced_pdf = "My Paper.pdf";
+        fs::write(assets.join(lower_pdf), b"lower pdf").unwrap();
+        fs::write(assets.join(spaced_pdf), b"spaced pdf").unwrap();
+
+        let lower_key = crate::pdf::asset_key(lower_pdf);
+        let spaced_key = crate::pdf::asset_key(spaced_pdf);
+        let spaced_legacy_key = crate::pdf::legacy_asset_key(spaced_pdf);
+        assert_eq!(lower_key, spaced_legacy_key);
+        assert_ne!(spaced_key, spaced_legacy_key);
+
+        let lower_highlight = mkhl(
+            "33333333-3333-3333-3333-333333333333",
+            3,
+            Some("lower pdf highlight"),
+        );
+        let lower_edn = crate::pdf::write_highlights(&[lower_highlight.clone()], "");
+        let lower_edn_path = assets.join(format!("{lower_key}.edn"));
+        fs::write(&lower_edn_path, &lower_edn).unwrap();
+
+        let mut lower_page =
+            crate::pdf::hls_page_document(lower_pdf, "Lower Paper", &[lower_highlight.clone()]);
+        lower_page.roots[0]
+            .children
+            .push(DocBlock::new("lower pdf private note"));
+        let lower_page_bytes = doc::serialize(&lower_page);
+        let lower_page_path = dir
+            .join("pages")
+            .join(format!("{}.md", crate::pdf::hls_page_name(&lower_key)));
+        fs::write(&lower_page_path, &lower_page_bytes).unwrap();
+
+        let g = Graph::open(&dir);
+        g.warm_cache();
+        let spaced_highlight = mkhl(
+            "44444444-4444-4444-4444-444444444444",
+            4,
+            Some("spaced pdf highlight"),
+        );
+        g.write_highlights(spaced_pdf, "My Paper", &[spaced_highlight], &[])
+            .unwrap();
+
+        assert!(
+            lower_edn_path.exists(),
+            "live colliding pdf edn must not be deleted"
+        );
+        assert_eq!(
+            fs::read_to_string(&lower_edn_path).unwrap(),
+            lower_edn,
+            "live colliding pdf edn must remain byte-for-byte intact"
+        );
+        assert!(
+            lower_page_path.exists(),
+            "live colliding pdf hls page must not be deleted"
+        );
+        assert_eq!(
+            fs::read_to_string(&lower_page_path).unwrap(),
+            lower_page_bytes,
+            "live colliding pdf hls page must remain byte-for-byte intact"
+        );
+
+        let spaced_edn_path = assets.join(format!("{spaced_key}.edn"));
+        let spaced_edn = fs::read_to_string(&spaced_edn_path).unwrap();
+        let spaced_highlights = crate::pdf::parse_highlights(&spaced_edn);
+        assert_eq!(spaced_highlights.len(), 1);
+        assert_eq!(
+            spaced_highlights[0].id,
+            "44444444-4444-4444-4444-444444444444"
+        );
+
+        let spaced_page_path = dir
+            .join("pages")
+            .join(format!("{}.md", crate::pdf::hls_page_name(&spaced_key)));
+        let spaced_page = fs::read_to_string(&spaced_page_path).unwrap();
+        assert!(
+            !spaced_page.contains("lower pdf private note"),
+            "colliding pdf note must not be merged into the spaced pdf hls page"
+        );
+        assert!(
+            !spaced_page.contains(&lower_highlight.id),
+            "colliding pdf highlight must not be merged into the spaced pdf hls page"
         );
         let _ = fs::remove_dir_all(&dir);
     }
