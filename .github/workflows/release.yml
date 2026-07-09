@@ -6,11 +6,12 @@
 # …or run it manually from the Actions tab (workflow_dispatch) to smoke-test the
 # build matrix WITHOUT cutting a release.
 #
-# Auto-publish: this uses the canonical tauri-action three-job flow —
-#   create-release (draft) → build matrix (upload assets) → publish-release.
-# The release is flipped to PUBLISHED only after ALL three platforms build
-# successfully, so there is no manual "Publish release" step and a partial/failed
-# build never goes public (the draft is just left for inspection).
+# Auto-publish: create-release makes a DRAFT, then each build/android leg flips it
+# to PUBLISHED the moment its own assets are uploaded — so installers drop as they
+# are generated instead of all waiting for the slowest platform. With max-parallel:1
+# the first finished leg publishes and the rest just add their assets to the now-
+# public release. A run where every leg fails never reaches the publish step, so a
+# totally-failed build still stays an unpublished draft (left for inspection).
 #
 # Signing: macOS/Windows installers are UNSIGNED until you add the secrets noted
 # below. Unsigned builds still run, but Gatekeeper (macOS) and SmartScreen
@@ -211,6 +212,26 @@ jobs:
           Compress-Archive -Path $exe -DestinationPath $zip -Force
           gh release upload $tag $zip --clobber --repo $env:GITHUB_REPOSITORY
 
+      # Publish the release as soon as THIS leg's assets are up, so each platform's
+      # installer appears the moment it finishes instead of everyone waiting for the
+      # slowest leg. Idempotent: with max-parallel:1 the first finished leg flips the
+      # draft to published, later legs re-assert it (a no-op) and just add their
+      # assets to the now-public release. Only on a real tag (a manual dispatch has
+      # no release to publish). A totally-failed release still never publishes (no
+      # leg reaches this step), so the draft-on-failure safety is preserved.
+      - name: Publish the release (drop assets as they build)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.updateRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              release_id: ${{ needs.create-release.outputs.release_id }},
+              draft: false,
+              prerelease: false,
+            });
+
   # 2b) Android: build a SIGNED release APK and upload it to the draft release.
   #     The private signing key lives ONLY in encrypted repo secrets — never in the
   #     repo or on a build host (see docs/ANDROID-RELEASE.md). Add these once, on the
@@ -365,20 +386,10 @@ jobs:
           cp "$apk" "Tine_${version}_android-arm64.apk"
           gh release upload "$tag" "Tine_${version}_android-arm64.apk" --clobber --repo "$GITHUB_REPOSITORY"
 
-      - name: Remove signing material
-        if: always()
-        run: rm -f "$RUNNER_TEMP/tine-release.jks" src-tauri/gen/android/keystore.properties
-
-  # 3) All platforms built → flip the draft to a published release. Skipped if any
-  #    build failed (the draft stays unpublished) or on a manual dispatch. The
-  #    android job is a soft gate: it succeeds-and-skips until secrets are set, so
-  #    it never blocks here, but once configured a failed signed build does.
-  publish-release:
-    needs: [create-release, build, android]
-    if: startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-22.04
-    steps:
-      - name: Publish release
+      # Same incremental-publish as the desktop legs: flip the draft public once the
+      # APK is up so it drops independently of the (slower) desktop builds.
+      - name: Publish the release (drop the APK as it builds)
+        if: steps.sign.outputs.enabled == 'true' && startsWith(github.ref, 'refs/tags/')
         uses: actions/github-script@v7
         with:
           script: |
@@ -389,3 +400,13 @@ jobs:
               draft: false,
               prerelease: false,
             });
+
+      - name: Remove signing material
+        if: always()
+        run: rm -f "$RUNNER_TEMP/tine-release.jks" src-tauri/gen/android/keystore.properties
+
+  # Note: there is no final "publish-release" gate any more. Each build/android leg
+  # publishes the release itself the moment its own assets are uploaded (see the
+  # "Publish the release …" steps above), so installers drop as they are generated
+  # rather than all waiting for the slowest platform. A run where every leg fails
+  # never reaches those steps, so the release correctly stays an unpublished draft.
