@@ -4,7 +4,8 @@
 //!  1. `assets/<key>.edn` — `{:highlights [...] :extra {}}` with scaled rects.
 //!  2. `pages/hls__<key>.md` — an index page: a `file::`/`file-path::` pre-block
 //!     plus one annotation block per highlight (`hl-page`, `hl-color`,
-//!     `ls-type:: annotation`, `id`). The block `id` equals the highlight id.
+//!     `ls-type:: annotation`, `id`, and area-image `hl-stamp`). The block `id`
+//!     equals the highlight id.
 
 use crate::doc::{DocBlock, Document};
 use crate::edn::{self, Edn};
@@ -417,8 +418,11 @@ fn highlight_block(h: &Highlight) -> DocBlock {
     }
     lines.push(format!("hl-page:: {}", h.page));
     lines.push(format!("hl-color:: {}", h.color));
-    if h.image.is_some() {
+    if let Some(image_stamp) = h.image {
         lines.push("hl-type:: area".to_string());
+        // OG's file-graph writer copies :content.image verbatim into hl-stamp.
+        // Text highlights have no image stamp and omit both area properties.
+        lines.push(format!("hl-stamp:: {image_stamp}"));
     }
     lines.push("ls-type:: annotation".to_string());
     lines.push(format!("id:: {}", h.id));
@@ -671,11 +675,33 @@ mod tests {
     }
 
     #[test]
-    fn area_highlight_marks_type() {
+    fn text_highlight_omits_area_metadata() {
+        let md = crate::doc::serialize(&hls_page_document("x.pdf", "x", &[sample()]));
+        assert!(!md.contains("hl-type:: area"));
+        assert!(!md.contains("hl-stamp::"));
+    }
+
+    #[test]
+    fn area_highlight_uses_image_as_hl_stamp() {
         let mut h = sample();
         h.text = None;
         h.image = Some(1659920114630);
         let md = crate::doc::serialize(&hls_page_document("x.pdf", "x", &[h]));
         assert!(md.contains("hl-type:: area"));
+        assert!(md.contains("hl-stamp:: 1659920114630"));
+    }
+
+    #[test]
+    fn merge_preserves_existing_annotation_properties() {
+        let h = sample();
+        let existing = crate::doc::parse(&format!(
+            "- highlighted text\n  hl-page:: 1\n  hl-color:: red\n  ls-type:: annotation\n  id:: {}\n  hl-stamp:: foreign-value\n  plugin-data:: keep-me\n",
+            h.id
+        ));
+
+        let merged = merge_hls_page(Some(&existing), "x.pdf", "x", &[h]);
+        let raw = &merged.roots[0].raw;
+        assert!(raw.contains("hl-stamp:: foreign-value"), "{raw}");
+        assert!(raw.contains("plugin-data:: keep-me"), "{raw}");
     }
 }
