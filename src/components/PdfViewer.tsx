@@ -23,6 +23,15 @@ const COLOR_RGBA: Record<string, string> = Object.fromEntries(
   Object.entries(COLOR_RGB).map(([k, v]) => [k, `rgba(${v}, 0.4)`])
 );
 
+// Resource ceilings are deliberately generous for books, scanned documents, and
+// architectural drawings, but bounded below the point where pdf.js/WebView canvas
+// allocations can take down the whole application.
+const MAX_PDF_BYTES = 256 * 1024 * 1024;
+const MAX_PDF_PAGES = 5000;
+const MAX_PAGE_DIMENSION = 14_400; // PDF points: 200 inches at 72 dpi.
+const MAX_CANVAS_DIMENSION = 16_384;
+const MAX_CANVAS_PIXELS = 16_777_216; // 64 MiB for an RGBA backing store.
+
 interface Pending {
   page: number;
   rects: Rect[];
@@ -91,12 +100,10 @@ export function PdfViewer(props: { filename: string; label: string; page?: numbe
   // never hit the cap, so they keep every canvas (instant scroll-back).
   const lru: number[] = [];
   const CANVAS_CAP = 24;
-  // Fail-safe ceiling on page count. `buildLayout` builds one sized wrapper per
-  // page up front; if a corrupt file (or wrong bytes handed in via a bad path)
-  // reports an absurd page count, that loop would allocate until the app OOMs and
-  // freezes. Real documents don't approach this, so cap it and fail gracefully
-  // instead (gh #61: "fail safely instead of freezing").
-  const MAX_PDF_PAGES = 20000;
+  // Actual backing-store scale used for each rendered page. This can be lower
+  // than devicePixelRatio for an unusually large page, keeping canvas memory
+  // bounded while preserving the requested CSS zoom level.
+  const renderedPixelRatio: Record<number, number> = {};
   // Pages currently intersecting the viewport — the only ones we rasterize.
   const visible = new Set<number>();
   let io: IntersectionObserver | null = null;
@@ -163,7 +170,6 @@ export function PdfViewer(props: { filename: string; label: string; page?: numbe
 
   function failPdf(message: string) {
     if (loadError()) return;
-    setLoadError(message);
     io?.disconnect();
     io = null;
     clearTimeout(zoomTimer);
@@ -173,12 +179,42 @@ export function PdfViewer(props: { filename: string; label: string; page?: numbe
       tasks[Number(k)]?.cancel();
       delete tasks[Number(k)];
     }
+    scrollRef?.replaceChildren();
+    const doc = pdfDoc;
     pdfDoc = null;
+    if (doc) void doc.destroy().catch(() => {});
+    setLoadError(message);
   }
 
   function errorMessage(action: string, err?: unknown): string {
     const detail = err instanceof Error ? err.message : err ? String(err) : "";
     return detail ? `${action}: ${detail}` : action;
+  }
+
+  function pageDimensionsError(page: number, width: number, height: number): string | null {
+    if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+      return `PDF page ${page} reports invalid dimensions (${width} x ${height}).`;
+    }
+    if (width > MAX_PAGE_DIMENSION || height > MAX_PAGE_DIMENSION) {
+      return `PDF page ${page} is too large to render safely (${Math.round(width)} x ${Math.round(height)} points).`;
+    }
+    return null;
+  }
+
+  function safeCanvasSize(width: number, height: number) {
+    const requestedRatio = Math.min(window.devicePixelRatio || 1, 2);
+    const ratio = Math.min(
+      requestedRatio,
+      MAX_CANVAS_DIMENSION / width,
+      MAX_CANVAS_DIMENSION / height,
+      Math.sqrt(MAX_CANVAS_PIXELS / (width * height))
+    );
+    if (!Number.isFinite(ratio) || ratio <= 0) return null;
+    return {
+      ratio,
+      width: Math.max(1, Math.min(MAX_CANVAS_DIMENSION, Math.floor(width * ratio))),
+      height: Math.max(1, Math.min(MAX_CANVAS_DIMENSION, Math.floor(height * ratio))),
+    };
   }
 
   // Build all page wrappers once, sized for the current scale. Cheap: no
@@ -191,6 +227,7 @@ export function PdfViewer(props: { filename: string; label: string; page?: numbe
     for (const k of Object.keys(textLayers)) delete textLayers[Number(k)];
     for (const k of Object.keys(hlLayers)) delete hlLayers[Number(k)];
     for (const k of Object.keys(renderedScale)) delete renderedScale[Number(k)];
+    for (const k of Object.keys(renderedPixelRatio)) delete renderedPixelRatio[Number(k)];
     for (const k of Object.keys(textScale)) delete textScale[Number(k)];
     for (const k of Object.keys(textLayerObjs)) delete textLayerObjs[Number(k)];
     pendingText.clear();
@@ -274,6 +311,11 @@ export function PdfViewer(props: { filename: string; label: string; page?: numbe
       dimsKnown.add(n);
       const rw = viewport.width / s;
       const rh = viewport.height / s;
+      const dimensionError = pageDimensionsError(n, rw, rh);
+      if (dimensionError) {
+        failPdf(dimensionError);
+        return;
+      }
       if (Math.abs(rw - dims[n].w) > 0.5 || Math.abs(rh - dims[n].h) > 0.5) {
         dims[n] = { w: rw, h: rh };
         sizeWrapper(n, scale());
@@ -289,9 +331,14 @@ export function PdfViewer(props: { filename: string; label: string; page?: numbe
     // back down, so text is crisp on HiDPI displays. Cap the device-pixel factor
     // at 2 — beyond that the extra pixels aren't visible but the raster cost (and
     // zoom-in lag) grows quadratically.
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
-    canvas.width = Math.ceil(viewport.width * dpr);
-    canvas.height = Math.ceil(viewport.height * dpr);
+    const canvasSize = safeCanvasSize(viewport.width, viewport.height);
+    if (!canvasSize) {
+      failPdf(`PDF page ${n} couldn't be sized safely for rendering.`);
+      return;
+    }
+    const dpr = canvasSize.ratio;
+    canvas.width = canvasSize.width;
+    canvas.height = canvasSize.height;
     canvas.style.width = `${Math.floor(viewport.width)}px`;
     canvas.style.height = `${Math.floor(viewport.height)}px`;
     canvas.style.transform = "";
@@ -315,6 +362,7 @@ export function PdfViewer(props: { filename: string; label: string; page?: numbe
     // Canvas is crisp now — the page is usable. Rebuild the (expensive) text
     // layer off the hot path so it doesn't make every zoom step janky.
     renderedScale[n] = s;
+    renderedPixelRatio[n] = dpr;
     clearTransform(n);
     repaintPage(n);
     scheduleText(n);
@@ -348,6 +396,7 @@ export function PdfViewer(props: { filename: string; label: string; page?: numbe
     delete tasks[n];
     pageEls[n]?.querySelector("canvas")?.remove();
     delete renderedScale[n];
+    delete renderedPixelRatio[n];
     if (textLayers[n]) textLayers[n].innerHTML = "";
     delete textLayerObjs[n];
     delete textScale[n];
@@ -501,14 +550,18 @@ export function PdfViewer(props: { filename: string; label: string; page?: numbe
       failPdf("Couldn't read this PDF asset: file is empty");
       return;
     }
+    if (bytes.byteLength > MAX_PDF_BYTES) {
+      failPdf("This PDF is larger than 256 MiB and can't be opened safely.");
+      return;
+    }
     try {
       pdfDoc = await pdfjs.getDocument({ data: bytes }).promise;
     } catch (err) {
       failPdf(errorMessage("Couldn't load this PDF", err));
       return;
     }
-    if (pdfDoc.numPages > MAX_PDF_PAGES || !Number.isFinite(pdfDoc.numPages)) {
-      failPdf(`This PDF reports an implausible page count (${pdfDoc.numPages}) and won't be rendered.`);
+    if (!Number.isSafeInteger(pdfDoc.numPages) || pdfDoc.numPages < 1 || pdfDoc.numPages > MAX_PDF_PAGES) {
+      failPdf(`This PDF reports an unsafe page count (${pdfDoc.numPages}); at most ${MAX_PDF_PAGES} pages can be displayed.`);
       return;
     }
     // Measure ONLY page 1 up front (for fit-width + as the size estimate for the
@@ -524,6 +577,11 @@ export function PdfViewer(props: { filename: string; label: string; page?: numbe
       return;
     }
     const vp1 = p1.getViewport({ scale: 1 });
+    const dimensionError = pageDimensionsError(1, vp1.width, vp1.height);
+    if (dimensionError) {
+      failPdf(dimensionError);
+      return;
+    }
     dims[1] = { w: vp1.width, h: vp1.height };
     dimsKnown.clear();
     dimsKnown.add(1);
@@ -546,6 +604,9 @@ export function PdfViewer(props: { filename: string; label: string; page?: numbe
     clearTimeout(findDebounce);
     if (scrollRaf !== undefined) cancelAnimationFrame(scrollRaf);
     for (const k of Object.keys(tasks)) tasks[Number(k)]?.cancel();
+    const doc = pdfDoc;
+    pdfDoc = null;
+    if (doc) void doc.destroy().catch(() => {});
     window.removeEventListener("mousemove", onAreaMove);
     window.removeEventListener("mouseup", onAreaUp);
   });
@@ -782,7 +843,7 @@ export function PdfViewer(props: { filename: string; label: string; page?: numbe
     if (!canvas) return null;
     // The canvas backing store is `unscaledWidth * s * dpr` px wide (see renderPage),
     // so one unscaled unit = `s * dpr` backing pixels.
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const dpr = renderedPixelRatio[page] ?? 1;
     const f = s * dpr;
     const sx = Math.max(0, Math.round(rect.left * f));
     const sy = Math.max(0, Math.round(rect.top * f));
