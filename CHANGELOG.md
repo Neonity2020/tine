@@ -25,6 +25,23 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Graph and recovery operations now stay inside the selected graph.** Unsafe
+  configured page/journal paths and escaping journal filenames are rejected,
+  overlapping graph windows are refused, and every graph-scoped IPC is pinned to
+  the window binding that issued it.
+- **Backups are root-bound and complete before they become restorable.** Snapshot
+  namespaces use a canonical-root digest, complete snapshots carry a v2 manifest,
+  partial/legacy-unverified directories are hidden from normal restore, and restore
+  rebuilds the live graph using the snapshot's recorded directories.
+- **Exact duplicate-journal navigation cannot edit the canonical file by mistake.**
+  Loading a path-pinned file replaces a same-name working-set slot and preserves
+  that exact path through save and undo.
+- **Captured media is durable before its Markdown link is inserted.** A crash can
+  leave a recoverable orphan, but not a saved note pointing to bytes that only
+  existed in WebView memory.
+- **Configuration updates and rename rollback preserve concurrent/failing work.**
+  Config read-modify-write retries external changes, and rename rollback now
+  includes the move whose source removal failed.
 - **Android release builds use the stable `page.tine.app` application ID.** The
   desktop-only app-ID rename no longer makes Tauri search for a nonexistent Java
   package, which had prevented the signed APK from being produced for v0.5.1 and

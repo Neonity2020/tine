@@ -24,7 +24,8 @@ _(**Shipped & merged to master**, removed from Now: **Sheets** — the grid/tabl
 layout engine (spec [docs/breadth-grid-spec.md](breadth-grid-spec.md)) — and **Split view**
 with per-pane tabs/history and the TreeSheets grid nav model (spec
 [docs/split-view-spec.md](split-view-spec.md), ADR 0032); both merged `8bc66a9` and shipped
-in **v0.5.0**.)_
+in **v0.5.0**. **Multi-graph + multi-window workflow** (GH #55/#70/#56; ADR 0038)
+merged to master as `ad9bf67`.)_
 
 - **Inline-code property lookalikes parse as properties** (Martin, Jul 8 2026:
   fix in Now, "should be treated as code"). A bullet whose text STARTS with an
@@ -36,13 +37,6 @@ in **v0.5.0**.)_
   what OG/mldoc does for the parity record before changing behavior — if OG has
   the same bug we deviate deliberately). Found while authoring the tine-test
   [[Sheets guide]] page.
-- **Multi-graph + multi-window workflow** (GH #55/#70/#56; ADR 0038) — one
-  process remains the sole writer while each graph gets an independent desktop
-  window, watcher/cache/session state, and quick-capture routing. Includes the
-  durable MRU graph switcher (click = switch, Shift-click = new window) and
-  forwarding `tine <graph>` into the running instance. Active on the
-  `multiprocess` branch.
-
 ---
 
 ## Next — the ordered queue (top = do first)

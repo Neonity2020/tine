@@ -102,6 +102,12 @@ Concretely:
 - New commitments: warm-cache generation, the `warm-cache-done` event, and any
   future whole-graph cache all become **per-window-key** rather than global; a
   reviewer must check no command still reads a process-global "current graph".
+- Each binding has a unique generation carried by graph-scoped frontend IPC. The
+  backend rejects stale generations, closing the interval where a command queued
+  under graph A executes after the same window has been rebound to graph B.
+- Ownership is overlap-aware: equal and ancestor/descendant canonical roots cannot
+  be bound to different windows because recursive page discovery would make them
+  share physical files despite distinct registry keys.
 - Quick-capture routes to the last-focused graph window. This is part of #70,
   not a follow-on: the existing process-global event would otherwise be handled
   by every graph webview and duplicate a capture across graphs.

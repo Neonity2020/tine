@@ -35,6 +35,11 @@ The protocol, and who owns each piece:
   writes, …) must go through these primitives — `save_page`/`commit_write`/
   `atomic_write` on the Rust side, the persistence chain on the frontend side —
   or explicitly document why not.
+- **Graph transitions are quiescent and leased.** Switch, restore, and close first
+  block interaction and commit the active editor, then flush. Every graph-scoped
+  IPC carries the generation of the window→graph binding; Rust rejects a stale
+  generation before resolving the graph, so queued old-window work cannot land in
+  a newly bound graph.
 
 ## Consequences
 
