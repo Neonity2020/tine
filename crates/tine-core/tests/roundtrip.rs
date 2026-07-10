@@ -143,6 +143,50 @@ fn headings() {
 }
 
 #[test]
+fn preamble_collapsed_heading_owns_the_following_outline() {
+    // Some Logseq importers/plugins emit the parent ATX heading without a list
+    // bullet. Logseq still treats it as the collapsible parent, but Tine used to
+    // hide it in the page preamble and promote its children to page roots (#67).
+    let input = "title:: Imported feed\n\n# Park Ji Hyun Confirmed To Reunite\ncollapsed:: true\n- article link\n- article body\n";
+    let parsed = doc::parse(input);
+
+    assert_eq!(parsed.pre_block.as_deref(), Some("title:: Imported feed"));
+    assert_eq!(parsed.roots.len(), 1);
+    assert_eq!(
+        parsed.roots[0].raw,
+        "# Park Ji Hyun Confirmed To Reunite\ncollapsed:: true"
+    );
+    assert!(parsed.roots[0].collapsed());
+    assert_eq!(parsed.roots[0].children.len(), 2);
+    assert_eq!(parsed.roots[0].children[0].raw, "article link");
+    assert_eq!(parsed.roots[0].children[1].raw, "article body");
+
+    let saved = doc::serialize_with(&parsed, &doc::SerializeOpts::detect(Some(input)));
+    assert_eq!(
+        doc::parse(&saved),
+        parsed,
+        "canonical save preserves the recovered tree"
+    );
+    assert!(saved.contains("title:: Imported feed"));
+    assert!(saved.contains("# Park Ji Hyun Confirmed To Reunite"));
+    assert!(saved.contains("collapsed:: true"));
+    assert!(saved.contains("article link"));
+    assert!(saved.contains("article body"));
+}
+
+#[test]
+fn ordinary_markdown_preamble_is_not_promoted() {
+    let input = "# A normal Markdown introduction\nprose remains page-level\n\n- first list item\n";
+    let parsed = doc::parse(input);
+    assert_eq!(
+        parsed.pre_block.as_deref(),
+        Some("# A normal Markdown introduction\nprose remains page-level")
+    );
+    assert_eq!(parsed.roots.len(), 1);
+    assert_eq!(parsed.roots[0].raw, "first list item");
+}
+
+#[test]
 fn empty_block() {
     assert_roundtrip("- before\n-\n- after\n");
     let doc = doc::parse("- before\n-\n- after\n");

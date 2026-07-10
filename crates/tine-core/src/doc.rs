@@ -614,6 +614,68 @@ pub(crate) fn next_fence(cur: Option<(char, usize)>, line: &str) -> Option<(char
     }
 }
 
+fn markdown_property_line(line: &str) -> bool {
+    let Some((key, _)) = line.trim().split_once("::") else {
+        return false;
+    };
+    !key.is_empty()
+        && key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '/' | '-'))
+}
+
+/// Recover a Logseq block shape emitted by some importers/plugins:
+///
+/// ```markdown
+/// # Parent heading
+/// collapsed:: true
+/// - child
+/// - child
+/// ```
+///
+/// The ATX heading is not list-bulleted, so the generic outline parser would put
+/// it in the page preamble and expose its children as roots. Logseq nevertheless
+/// treats this particular shape as one collapsed parent. Promote it narrowly:
+/// only an ATX heading at the END of the preamble, followed solely by block
+/// property lines and carrying `collapsed:: true`. Ordinary page prose/headings
+/// and genuine page properties remain untouched.
+fn promote_preamble_collapsed_heading(pre_block: &mut Option<String>, roots: &mut Vec<DocBlock>) {
+    if roots.is_empty() {
+        return;
+    }
+    let Some(pre) = pre_block.as_deref() else {
+        return;
+    };
+    let lines: Vec<&str> = pre.split('\n').collect();
+    let Some(start) = lines.iter().rposition(|line| {
+        let trimmed = line.trim_start();
+        let hashes = trimmed.chars().take_while(|c| *c == '#').count();
+        (1..=6).contains(&hashes) && trimmed.as_bytes().get(hashes) == Some(&b' ')
+    }) else {
+        return;
+    };
+    if !lines[start + 1..]
+        .iter()
+        .all(|line| !line.trim().is_empty() && markdown_property_line(line))
+    {
+        return;
+    }
+
+    let raw = lines[start..].join("\n");
+    let mut parent = DocBlock::new(raw);
+    if parent.heading_level().is_none() || !parent.collapsed() {
+        return;
+    }
+    parent.children = std::mem::take(roots);
+    roots.push(parent);
+
+    let mut pre_end = start;
+    while pre_end > 0 && lines[pre_end - 1].trim().is_empty() {
+        pre_end -= 1;
+    }
+    *pre_block = (pre_end > 0).then(|| lines[..pre_end].join("\n"));
+}
+
 pub fn parse(content: &str) -> Document {
     // Normalize CRLF / lone CR to LF so the in-memory model never carries a stray
     // `\r` (which would otherwise pollute property / `id::` values and break
@@ -646,7 +708,7 @@ pub fn parse(content: &str) -> Document {
     while pre_end > 0 && pre_lines[pre_end - 1].trim().is_empty() {
         pre_end -= 1;
     }
-    let pre_block = if pre_end == 0 {
+    let mut pre_block = if pre_end == 0 {
         None
     } else {
         Some(pre_lines[..pre_end].join("\n"))
@@ -723,6 +785,8 @@ pub fn parse(content: &str) -> Document {
         // (A continuation before any bullet can't happen: it'd be pre-block.)
     }
     fold_to(&mut stack, &mut roots, 0);
+
+    promote_preamble_collapsed_heading(&mut pre_block, &mut roots);
 
     Document { pre_block, roots }
 }

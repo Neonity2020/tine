@@ -15,6 +15,18 @@ function renderBody(raw: string): { host: HTMLDivElement; dispose: () => void } 
 }
 
 describe("multiline block heading rendering", () => {
+  it("keeps an ATX heading visible when the block has collapsed metadata", () => {
+    const { host, dispose } = renderBody(
+      "# Park Ji Hyun Confirmed To Reunite With Song Joong Ki In New Romance Drama\ncollapsed:: true"
+    );
+    try {
+      expect(host.textContent).toContain(
+        "Park Ji Hyun Confirmed To Reunite With Song Joong Ki In New Romance Drama"
+      );
+      expect(host.textContent).not.toContain("collapsed");
+    } finally { dispose(); }
+  });
+
   it("styles a heading on a continuation line at its own ATX size", () => {
     const { host, dispose } = renderBody("## foo\nbar\n### baz");
     try {
