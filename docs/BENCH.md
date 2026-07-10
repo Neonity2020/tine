@@ -50,6 +50,33 @@ recorded on a fast box still roughly holds on a slow one.
 The baseline (`scripts/bench-baseline.json`) records the machine it was taken on;
 `--update` on that same machine when quiet is the most meaningful comparison.
 
+## Graph-scale bench (Rust core, on-disk graph)
+
+`npm run bench` drives the **mock** backend, so it can only see frontend
+render/scroll cost — never graph-scale core scans (page lookups, queries, publish,
+the switcher). Those live in `tine-core` over a real directory graph, so they have
+their own harness: the `graph_scale_bench` example.
+
+```bash
+source scripts/env.sh
+cargo run --release --example graph_scale_bench -p tine-core -- 2000 10000
+```
+
+It generates a synthetic graph (N pages incl. ~15% **nested** under `pages/ns-*/`,
+30 journals, and a query-heavy `Dashboard.md` of `{{query}}`/`{{embed}}` macros)
+and prints a per-scale table: `cold_open`, `cache_build`, **`find_entry_K`**
+(500 distinct `load_named` lookups — the page-lookup fanout), `switcher`,
+`warm_query`, and **`publish`** (runs the Dashboard's queries/embeds during export).
+Scale = page count; args override the default `2000 10000 20000`. Output graphs go
+to `/tmp/graph-scale-bench-<scale>` (regenerated each run, seeded/deterministic).
+
+Use it to get a before/after curve on the graph-scale perf-audit fixes: a healthy
+scan is ~flat per-item as scale grows; a fanout (e.g. `find_entry` re-walking the
+dir on every lookup) grows with scale.
+
+There is also `sheets_phase0_bench` (query/edit-cycle costs at 10k–200k blocks) in
+the same examples dir.
+
 ## Deferred (not built here)
 
 - **Tab-switch** and **per-keystroke typing** metrics — dropped from this pass
