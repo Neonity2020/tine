@@ -979,6 +979,74 @@ pub fn property_facets(graph: &Graph) -> Vec<(String, Vec<String>)> {
     })
 }
 
+enum QuickSwitchCand {
+    File(usize),
+    Ref(PageEntry), // referenced-only page (no file entry to index into)
+}
+
+struct ScoredQuickSwitchCand {
+    score: i32,
+    index: usize,
+    cand: QuickSwitchCand,
+}
+
+impl ScoredQuickSwitchCand {
+    fn is_better_than(&self, other: &Self) -> bool {
+        self.score > other.score || (self.score == other.score && self.index < other.index)
+    }
+}
+
+impl PartialEq for ScoredQuickSwitchCand {
+    fn eq(&self, other: &Self) -> bool {
+        self.score == other.score && self.index == other.index
+    }
+}
+
+impl Eq for ScoredQuickSwitchCand {}
+
+impl PartialOrd for ScoredQuickSwitchCand {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ScoredQuickSwitchCand {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // BinaryHeap is max-first; define "greater" as worse so the root is the
+        // candidate to evict. The final rank remains score desc, index asc.
+        other
+            .score
+            .cmp(&self.score)
+            .then_with(|| self.index.cmp(&other.index))
+    }
+}
+
+fn push_quick_switch_top(
+    heap: &mut std::collections::BinaryHeap<ScoredQuickSwitchCand>,
+    limit: usize,
+    candidate: ScoredQuickSwitchCand,
+) {
+    if heap.len() < limit {
+        heap.push(candidate);
+        return;
+    }
+    if heap
+        .peek()
+        .is_some_and(|worst| candidate.is_better_than(worst))
+    {
+        let mut worst = heap.peek_mut().unwrap();
+        *worst = candidate;
+    }
+}
+
+fn finish_quick_switch_top(
+    heap: std::collections::BinaryHeap<ScoredQuickSwitchCand>,
+) -> Vec<ScoredQuickSwitchCand> {
+    let mut top = heap.into_vec();
+    top.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.index.cmp(&b.index)));
+    top
+}
+
 /// Fuzzy page-name matcher for the quick switcher. Ranks prefix > substring >
 /// subsequence, then by name length.
 pub fn quick_switch(graph: &Graph, query: &str, limit: usize) -> Vec<PageEntry> {
@@ -1014,49 +1082,59 @@ pub fn quick_switch(graph: &Graph, query: &str, limit: usize) -> Vec<PageEntry> 
     // the old `e.clone()` per match was a second whole-list copy each keystroke;
     // now only the `limit` winners are materialized. (perf F4)
     let file_pages = graph.list_pages();
-    enum Cand {
-        File(usize),
-        Ref(PageEntry), // referenced-only page (no file entry to index into)
+    let mut top = std::collections::BinaryHeap::new();
+    for (i, e) in file_pages.iter().enumerate() {
+        // P7: lowercase-cache candidate. `list_pages()` exposes public
+        // `PageEntry`s, so caching the lowercase name cleanly needs an internal
+        // snapshot shape rather than widening the public type.
+        if let Some(s) = score(&e.name.to_lowercase(), &e.name) {
+            push_quick_switch_top(
+                &mut top,
+                limit,
+                ScoredQuickSwitchCand {
+                    score: s - e.name.len() as i32,
+                    index: i,
+                    cand: QuickSwitchCand::File(i),
+                },
+            );
+        }
     }
-    let mut scored: Vec<(i32, Cand)> = file_pages
-        .iter()
-        .enumerate()
-        .filter_map(|(i, e)| {
-            score(&e.name.to_lowercase(), &e.name).map(|s| (s - e.name.len() as i32, Cand::File(i)))
-        })
-        .collect();
     // Pages referenced by `#tag` / `[[link]]` but with no file of their own still
     // "exist" (OG semantics): include them (deduped against file pages, which are
     // authoritative) so a tag already used elsewhere shows as the page rather than
     // a misleading "Create …" in autocomplete.
     let have: std::collections::HashSet<String> =
         file_pages.iter().map(|e| refs::page_key(&e.name)).collect();
-    for name in graph.referenced_page_names() {
+    for (offset, name) in graph.referenced_page_names().into_iter().enumerate() {
+        let index = file_pages.len() + offset;
         let lower = refs::page_key(&name);
         if have.contains(&lower) {
             continue;
         }
         if let Some(s) = score(&name.to_lowercase(), &name) {
             let len = name.len() as i32;
-            scored.push((
-                s - len,
-                Cand::Ref(PageEntry {
-                    name,
-                    kind: PageKind::Page,
-                    date_key: None,
-                    rel_path: String::new(),
-                    path: std::path::PathBuf::new(),
-                }),
-            ));
+            push_quick_switch_top(
+                &mut top,
+                limit,
+                ScoredQuickSwitchCand {
+                    score: s - len,
+                    index,
+                    cand: QuickSwitchCand::Ref(PageEntry {
+                        name,
+                        kind: PageKind::Page,
+                        date_key: None,
+                        rel_path: String::new(),
+                        path: std::path::PathBuf::new(),
+                    }),
+                },
+            );
         }
     }
-    scored.sort_by(|a, b| b.0.cmp(&a.0));
-    scored
+    finish_quick_switch_top(top)
         .into_iter()
-        .take(limit)
-        .map(|(_, c)| match c {
-            Cand::File(i) => file_pages[i].clone(),
-            Cand::Ref(e) => e,
+        .map(|scored| match scored.cand {
+            QuickSwitchCand::File(i) => file_pages[i].clone(),
+            QuickSwitchCand::Ref(e) => e,
         })
         .collect()
 }
@@ -2212,6 +2290,149 @@ mod tests {
             block_date_ordinals("DEADLINE: <2026-07-06 Mon>", Some("DEADLINE:")),
             vec![ord]
         );
+    }
+
+    fn quick_switch_fingerprint(entries: Vec<PageEntry>) -> Vec<(String, PageKind, String)> {
+        entries
+            .into_iter()
+            .map(|e| (e.name, e.kind, e.rel_path))
+            .collect()
+    }
+
+    fn quick_switch_reference_full_sort(
+        graph: &Graph,
+        query: &str,
+        limit: usize,
+    ) -> Vec<PageEntry> {
+        use crate::search_query::Matcher;
+        let matcher = Matcher::parse(query);
+        let simple = matcher.simple_term();
+        if limit == 0 || matches!(matcher, Matcher::InvalidRegex(_)) {
+            return Vec::new();
+        }
+        let q = simple.unwrap_or("").to_string();
+        let use_matcher = simple.is_none() && !matches!(matcher, Matcher::Empty);
+        let score = |lower: &str, orig: &str| -> Option<i32> {
+            if use_matcher {
+                matcher.score_name(lower, orig)
+            } else {
+                score_name(lower, &q)
+            }
+        };
+        let file_pages = graph.list_pages();
+        enum Cand {
+            File(usize),
+            Ref(PageEntry),
+        }
+        let mut scored: Vec<(i32, Cand)> = file_pages
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| {
+                score(&e.name.to_lowercase(), &e.name)
+                    .map(|s| (s - e.name.len() as i32, Cand::File(i)))
+            })
+            .collect();
+        let have: std::collections::HashSet<String> =
+            file_pages.iter().map(|e| refs::page_key(&e.name)).collect();
+        for name in graph.referenced_page_names() {
+            let lower = refs::page_key(&name);
+            if have.contains(&lower) {
+                continue;
+            }
+            if let Some(s) = score(&name.to_lowercase(), &name) {
+                let len = name.len() as i32;
+                scored.push((
+                    s - len,
+                    Cand::Ref(PageEntry {
+                        name,
+                        kind: PageKind::Page,
+                        date_key: None,
+                        rel_path: String::new(),
+                        path: std::path::PathBuf::new(),
+                    }),
+                ));
+            }
+        }
+        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        scored
+            .into_iter()
+            .take(limit)
+            .map(|(_, c)| match c {
+                Cand::File(i) => file_pages[i].clone(),
+                Cand::Ref(e) => e,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn quick_switch_topk_matches_stable_full_sort_with_ties() {
+        use std::fs;
+        let dir =
+            std::env::temp_dir().join(format!("tine-quick-switch-topk-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("journals")).unwrap();
+        fs::create_dir_all(dir.join("pages")).unwrap();
+
+        for i in 0..220 {
+            fs::write(
+                dir.join("pages").join(format!("aa{i:03}.md")),
+                "- tied page\n",
+            )
+            .unwrap();
+        }
+        let refs = (0..40)
+            .map(|i| format!("[[aa-ref-{i:03}]]"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        fs::write(dir.join("pages").join("zzsource.md"), format!("- {refs}\n")).unwrap();
+
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+
+        for query in ["", "aa", "000"] {
+            for limit in [1, 7, 12, 64, 199, 240, 300] {
+                let got = quick_switch_fingerprint(quick_switch(&graph, query, limit));
+                let expected = quick_switch_fingerprint(quick_switch_reference_full_sort(
+                    &graph, query, limit,
+                ));
+                assert_eq!(got, expected, "query={query:?} limit={limit}");
+            }
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn quick_switch_topk_sorts_only_survivors() {
+        let limit = 12;
+        let total = 240;
+        let mut heap = std::collections::BinaryHeap::with_capacity(limit);
+        let mut reference = Vec::with_capacity(total);
+        for index in 0..total {
+            let score = (index % 6) as i32;
+            reference.push((score, index));
+            push_quick_switch_top(
+                &mut heap,
+                limit,
+                ScoredQuickSwitchCand {
+                    score,
+                    index,
+                    cand: QuickSwitchCand::File(index),
+                },
+            );
+        }
+
+        let top = finish_quick_switch_top(heap);
+        assert_eq!(
+            top.len(),
+            limit,
+            "survivor sort must be bounded by limit, not total candidates"
+        );
+
+        reference.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        reference.truncate(limit);
+        let got: Vec<(i32, usize)> = top.into_iter().map(|c| (c.score, c.index)).collect();
+        assert_eq!(got, reference);
     }
 
     /// Issue #9: linked references are grouped by referring page, ordered by the
