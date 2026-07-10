@@ -635,12 +635,13 @@ pub(crate) fn open_asset(name: String, state: GraphContext<'_>) -> Result<(), St
 /// template for that editor (from Settings → Files); empty falls back to the OS
 /// opener, exactly like `open_asset`. The template is tokenised on whitespace:
 /// token[0] is the program, a `{}` inside any token is replaced by the asset
-/// path, and if no token contains `{}` the path is appended as the final arg.
+/// path, and if no argument contains `{}` the path is appended as the final arg.
 /// Spawned as an argv (no shell → no injection) through `opener_command`, which
 /// scrubs the WebKitGTK/AppImage env and detaches the child (so a Flatpak drawio
 /// doesn't inherit Tine's bundled `LD_LIBRARY_PATH`). Path-gated to `assets/`.
-/// (Template limitation: a program/arg cannot itself contain spaces — use PATH
-/// or a wrapper script. Fine for `flatpak run …`, `/usr/bin/drawio`, `drawio {}`.)
+/// Double quotes group a program/argument containing whitespace; backslashes are
+/// literal so Windows paths such as `"C:\Program Files\draw.io\draw.io.exe" {}`
+/// survive unchanged.
 #[tauri::command]
 pub(crate) fn edit_asset_external(
     name: String,
@@ -680,8 +681,7 @@ pub(crate) fn edit_asset_external(
                 .map_err(|e| e.to_string())?;
             return Ok(());
         }
-        let (prog, args) = build_editor_argv(trimmed, &target_str)
-            .ok_or_else(|| "empty editor command".to_string())?;
+        let (prog, args) = build_editor_argv(trimmed, &target_str)?;
         diag(format!("edit_asset_external: {name} -> {prog} {args:?}"));
         opener_command(&prog)
             .args(&args)
@@ -758,14 +758,42 @@ fn detect_drawio() -> String {
     }
     #[cfg(target_os = "windows")]
     {
-        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-            let exe = std::path::Path::new(&local).join("Programs\\draw.io\\draw.io.exe");
-            if exe.exists() {
-                return format!("{} {{}}", exe.display());
-            }
-        }
-        String::new()
+        detect_drawio_windows_with(std::env::var_os, |path| path.is_file())
     }
+}
+
+/// Windows installers can be per-user (`LOCALAPPDATA`) or per-machine
+/// (`ProgramFiles`, including 32-bit installs). Keep the environment/filesystem
+/// inputs injectable so this platform-specific discovery policy is covered by
+/// host tests without mutating the process environment.
+#[cfg(any(target_os = "windows", test))]
+fn detect_drawio_windows_with<V, F>(mut var: V, mut is_file: F) -> String
+where
+    V: FnMut(&str) -> Option<std::ffi::OsString>,
+    F: FnMut(&std::path::Path) -> bool,
+{
+    let locations = [
+        ("LOCALAPPDATA", Some("Programs")),
+        ("ProgramFiles", None),
+        ("ProgramFiles(x86)", None),
+    ];
+    for (variable, extra) in locations {
+        let Some(root) = var(variable) else {
+            continue;
+        };
+        let mut exe = std::path::PathBuf::from(root);
+        if let Some(component) = extra {
+            exe.push(component);
+        }
+        exe.push("draw.io");
+        exe.push("draw.io.exe");
+        if is_file(&exe) {
+            // Windows executable paths commonly contain spaces. The tokenizer
+            // below strips these grouping quotes before direct argv spawning.
+            return format!("\"{}\" {{}}", exe.display());
+        }
+    }
+    String::new()
 }
 
 /// Find an executable by name on `$PATH` (stat only, no exec). Linux/macOS.
@@ -777,15 +805,50 @@ fn which_on_path(name: &str) -> Option<std::path::PathBuf> {
         .find(|cand| cand.is_file())
 }
 
-/// Split a user command template into (program, args) for an editor launch,
-/// substituting `{}` in any token with the target path; if no token contains
-/// `{}`, the path is appended as the final arg. Whitespace-tokenised (v1: a
-/// program/arg cannot itself contain spaces — use PATH or a wrapper script).
-/// Returns None for a whitespace-only template.
+/// Split a user command template into (program, args) for an editor launch.
+/// Double quotes group whitespace but are not passed to the child; backslashes
+/// are always literal, which is required for ordinary Windows paths. This is a
+/// deliberately small argv tokenizer, not a shell: there is no expansion,
+/// interpolation, or escape syntax. Unmatched quotes and an empty program are
+/// rejected. `{}` is substituted in arguments; otherwise the target path is
+/// appended as the final argument.
 #[cfg(any(desktop, test))]
-fn build_editor_argv(command: &str, target: &str) -> Option<(String, Vec<String>)> {
-    let tokens: Vec<&str> = command.split_whitespace().collect();
-    let (prog, rest) = tokens.split_first()?;
+fn build_editor_argv(command: &str, target: &str) -> Result<(String, Vec<String>), String> {
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    let mut token_started = false;
+    let mut quoted = false;
+    for ch in command.chars() {
+        match ch {
+            '"' => {
+                quoted = !quoted;
+                token_started = true;
+            }
+            ch if ch.is_whitespace() && !quoted => {
+                if token_started {
+                    tokens.push(std::mem::take(&mut token));
+                    token_started = false;
+                }
+            }
+            _ => {
+                token.push(ch);
+                token_started = true;
+            }
+        }
+    }
+    if quoted {
+        return Err("unclosed double quote in editor command".to_string());
+    }
+    if token_started {
+        tokens.push(token);
+    }
+
+    let (prog, rest) = tokens
+        .split_first()
+        .ok_or_else(|| "empty editor command".to_string())?;
+    if prog.is_empty() {
+        return Err("editor command program is empty".to_string());
+    }
     let mut args: Vec<String> = Vec::new();
     let mut substituted = false;
     for tok in rest {
@@ -799,12 +862,13 @@ fn build_editor_argv(command: &str, target: &str) -> Option<(String, Vec<String>
     if !substituted {
         args.push(target.to_string());
     }
-    Some(((*prog).to_string(), args))
+    Ok((prog.clone(), args))
 }
 
 #[cfg(test)]
 mod editor_argv_tests {
-    use super::build_editor_argv;
+    use super::{build_editor_argv, detect_drawio_windows_with};
+    use std::{ffi::OsString, path::PathBuf};
 
     #[test]
     fn appends_path_when_no_placeholder() {
@@ -829,9 +893,84 @@ mod editor_argv_tests {
     }
 
     #[test]
-    fn whitespace_only_is_none() {
-        assert!(build_editor_argv("   ", "/g/x.svg").is_none());
-        assert!(build_editor_argv("", "/g/x.svg").is_none());
+    fn quoted_windows_program_path_is_one_argv_token() {
+        let (p, a) = build_editor_argv(
+            r#""C:\Program Files\draw.io\draw.io.exe" {}"#,
+            r#"C:\graph\assets\x.drawio.svg"#,
+        )
+        .unwrap();
+        assert_eq!(p, r#"C:\Program Files\draw.io\draw.io.exe"#);
+        assert_eq!(a, vec![r#"C:\graph\assets\x.drawio.svg"#]);
+    }
+
+    #[test]
+    fn quoted_argument_with_spaces_is_one_argv_token() {
+        let (p, a) = build_editor_argv(
+            r#"drawio --profile "C:\Users\Me\Drawio Profile" {}"#,
+            r#"C:\graph\assets\x.drawio.svg"#,
+        )
+        .unwrap();
+        assert_eq!(p, "drawio");
+        assert_eq!(
+            a,
+            vec![
+                r#"--profile"#,
+                r#"C:\Users\Me\Drawio Profile"#,
+                r#"C:\graph\assets\x.drawio.svg"#,
+            ]
+        );
+    }
+
+    #[test]
+    fn malformed_or_empty_commands_are_rejected() {
+        assert_eq!(
+            build_editor_argv("   ", "/g/x.svg").unwrap_err(),
+            "empty editor command"
+        );
+        assert_eq!(
+            build_editor_argv(r#""C:\Program Files\draw.io\draw.io.exe {}"#, "/g/x.svg")
+                .unwrap_err(),
+            "unclosed double quote in editor command"
+        );
+        assert_eq!(
+            build_editor_argv(r#""" {}"#, "/g/x.svg").unwrap_err(),
+            "editor command program is empty"
+        );
+    }
+
+    #[test]
+    fn windows_autodetect_checks_per_machine_install_locations() {
+        for variable in ["ProgramFiles", "ProgramFiles(x86)"] {
+            let root = PathBuf::from(format!("/{variable}"));
+            let expected = root.join("draw.io").join("draw.io.exe");
+            let command = detect_drawio_windows_with(
+                |key| (key == variable).then(|| OsString::from(&root)),
+                |path| path == expected,
+            );
+            assert_eq!(command, format!("\"{}\" {{}}", expected.display()));
+        }
+    }
+
+    #[test]
+    fn windows_autodetect_keeps_per_user_install_first() {
+        let local = PathBuf::from("/Local App Data");
+        let machine = PathBuf::from("/Program Files");
+        let expected = local.join("Programs").join("draw.io").join("draw.io.exe");
+        let command = detect_drawio_windows_with(
+            |key| match key {
+                "LOCALAPPDATA" => Some(OsString::from(&local)),
+                "ProgramFiles" => Some(OsString::from(&machine)),
+                _ => None,
+            },
+            |path| path == expected || path == machine.join("draw.io").join("draw.io.exe"),
+        );
+        assert_eq!(command, format!("\"{}\" {{}}", expected.display()));
+    }
+
+    #[test]
+    fn windows_autodetect_returns_empty_when_no_candidate_is_a_file() {
+        let command = detect_drawio_windows_with(|_| Some(OsString::from("/missing")), |_| false);
+        assert!(command.is_empty());
     }
 }
 

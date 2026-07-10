@@ -8,6 +8,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+### Fixed
+
+- **Default Windows draw.io installations now autodetect and launch correctly.**
+  External-editor command templates accept double-quoted executable paths such as
+  `"C:\Program Files\draw.io\draw.io.exe" {}`, and autodetection checks both
+  `%ProgramFiles%` locations in addition to the per-user install directory. The
+  command is still spawned directly without a shell. (GH #71; follow-up to #38)
+
 ## [0.5.4] - 2026-07-10
 
 Focused bug-fix release for journal templates, linked-reference filters,

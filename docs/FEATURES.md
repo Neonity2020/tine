@@ -100,8 +100,9 @@ files. **⊕ marks things Tine adds on top of Logseq core** (no plugins).
   image reference, so the graph still renders in Logseq. Set the editor commands
   (drawio has an **Autodetect**) under **Settings → Files → Diagram editors**; empty
   uses the system default opener. A `{}` in the command is replaced by the file path.
-  Desktop only. (For Excalidraw, export with *Embed scene* into `assets/` as
-  `name.excalidraw.svg`; there's no in-app "new Excalidraw".)
+  Wrap a program or argument containing spaces in double quotes. Desktop only. (For
+  Excalidraw, export with *Embed scene* into `assets/` as `name.excalidraw.svg`;
+  there's no in-app "new Excalidraw".)
 
 ## Linking, references & queries
 
