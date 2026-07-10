@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::sync::RwLock;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PageKind {
     Journal,
@@ -368,6 +368,11 @@ pub struct Graph {
     /// keystroke. An externally-created page not yet seen by the watcher is at most
     /// one watcher tick (≤3s) stale here.
     page_list_cache: RwLock<Option<(u64, Vec<PageEntry>)>>,
+    /// Memoized exact `find_entry(name, kind)` resolution, keyed by `cache_gen`.
+    /// Unlike `list_pages()`, this index is built from raw `list_md` output so it
+    /// preserves `find_entry`'s duplicate selection: date-stem file first, else
+    /// first directory-walk match.
+    find_entry_cache: RwLock<Option<(u64, FindEntryIndex)>>,
     /// `path → content_rev` of the bytes Tine last wrote to each page file,
     /// recorded *before* the write lands on disk. The file watcher reads files
     /// outside the cache lock, so during the window between a save's atomic rename
@@ -411,6 +416,14 @@ fn rev_key(kind: PageKind, name: &str) -> String {
     format!("{kind:?}\u{1}{}", crate::refs::page_key(name))
 }
 
+fn is_date_stem_entry(entry: &PageEntry) -> bool {
+    entry
+        .path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .is_some_and(|s| crate::date::JournalDate::from_file_stem(s).is_some())
+}
+
 /// Gen+today-tagged cache of derived scan results. Reset wholesale whenever the
 /// tag no longer matches — so every entry is always consistent with the current
 /// graph state (no per-entry invalidation to get wrong).
@@ -426,6 +439,36 @@ struct AdvancedCache {
     gen: u64,
     today: i64,
     results: std::collections::HashMap<String, Arc<crate::query::AdvancedResult>>,
+}
+
+struct FindEntryIndex {
+    entries: std::collections::HashMap<(PageKind, String), PageEntry>,
+    pages_loaded: bool,
+    journals_loaded: bool,
+}
+
+impl FindEntryIndex {
+    fn new() -> Self {
+        Self {
+            entries: std::collections::HashMap::new(),
+            pages_loaded: false,
+            journals_loaded: false,
+        }
+    }
+
+    fn has_kind(&self, kind: PageKind) -> bool {
+        match kind {
+            PageKind::Journal => self.journals_loaded,
+            PageKind::Page => self.pages_loaded,
+        }
+    }
+
+    fn mark_kind_loaded(&mut self, kind: PageKind) {
+        match kind {
+            PageKind::Journal => self.journals_loaded = true,
+            PageKind::Page => self.pages_loaded = true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -494,6 +537,7 @@ impl Graph {
             derived_cache: RwLock::new(None),
             advanced_cache: RwLock::new(None),
             page_list_cache: RwLock::new(None),
+            find_entry_cache: RwLock::new(None),
             recent_writes: std::sync::Mutex::new(std::collections::HashMap::new()),
             disk_revs: RwLock::new(std::collections::HashMap::new()),
             referenced_names_cache: RwLock::new(None),
@@ -1334,6 +1378,8 @@ impl Graph {
         // disappearance from journals/) show up immediately; the parsed-doc cache
         // folds the new file in on its next load / the watcher's create event.
         *self.page_list_cache.write().unwrap() = None;
+        self.cache_gen
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 
@@ -1446,34 +1492,66 @@ impl Graph {
     /// first (which could mismatch the save target and raise a phantom conflict).
     /// The stray is reached by path via `load_by_path`.
     pub fn find_entry(&self, name: &str, kind: PageKind) -> Option<PageEntry> {
-        let dir = match kind {
-            PageKind::Journal => self.journals_path(),
-            PageKind::Page => self.pages_path(),
-        };
-        let rel_dir = match kind {
-            PageKind::Journal => &self.config.journals_dir,
-            PageKind::Page => &self.config.pages_dir,
-        };
-        let matches: Vec<PageEntry> = list_md(
-            &dir,
-            kind,
-            &self.journal_format,
-            self.config.file_name_format,
-            rel_dir,
-        )
-        .into_iter()
-        .filter(|e| crate::refs::same_page(&e.name, name))
-        .collect();
-        matches
-            .iter()
-            .find(|e| {
-                e.path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .is_some_and(|s| crate::date::JournalDate::from_file_stem(s).is_some())
-            })
-            .or_else(|| matches.first())
-            .cloned()
+        let key = (kind, crate::refs::page_key(name));
+        loop {
+            let gen = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+            if let Some((g, index)) = self.find_entry_cache.read().unwrap().as_ref() {
+                if *g == gen && index.has_kind(kind) {
+                    return index.entries.get(&key).cloned();
+                }
+            }
+
+            let dir = match kind {
+                PageKind::Journal => self.journals_path(),
+                PageKind::Page => self.pages_path(),
+            };
+            let rel_dir = match kind {
+                PageKind::Journal => &self.config.journals_dir,
+                PageKind::Page => &self.config.pages_dir,
+            };
+            let mut built = FindEntryIndex::new();
+            for entry in list_md(
+                &dir,
+                kind,
+                &self.journal_format,
+                self.config.file_name_format,
+                rel_dir,
+            ) {
+                let entry_key = (kind, crate::refs::page_key(&entry.name));
+                match built.entries.get_mut(&entry_key) {
+                    Some(winner) => {
+                        if !is_date_stem_entry(winner) && is_date_stem_entry(&entry) {
+                            *winner = entry;
+                        }
+                    }
+                    None => {
+                        built.entries.insert(entry_key, entry);
+                    }
+                }
+            }
+            built.mark_kind_loaded(kind);
+
+            let found = {
+                let mut guard = self.find_entry_cache.write().unwrap();
+                match guard.as_mut() {
+                    Some((g, index)) if *g == gen => {
+                        if !index.has_kind(kind) {
+                            index.entries.extend(built.entries);
+                            index.mark_kind_loaded(kind);
+                        }
+                        index.entries.get(&key).cloned()
+                    }
+                    _ => {
+                        let found = built.entries.get(&key).cloned();
+                        *guard = Some((gen, built));
+                        found
+                    }
+                }
+            };
+            if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == gen {
+                return found;
+            }
+        }
     }
 
     /// Load a page by name; returns `None` if it doesn't exist on disk. Falls
@@ -3096,8 +3174,12 @@ impl Graph {
                 // the page SET may have changed (this could be a newly-created
                 // file). Drop the page-list memo so list_pages — and the eventual
                 // warm build that reads it — re-scan the dir and include it.
+                // This path does NOT bump cache_gen, so the gen-keyed find_entry
+                // index would otherwise stay stale here (miss the new/removed file)
+                // until some other op bumps the gen — drop it alongside the list memo.
                 drop(guard);
                 *self.page_list_cache.write().unwrap() = None;
+                *self.find_entry_cache.write().unwrap() = None;
                 return None;
             };
             if let Some((_, cached)) = cache
@@ -3523,6 +3605,11 @@ fn dedup_journal_days(entries: Vec<PageEntry>) -> Vec<PageEntry> {
     out
 }
 
+#[cfg(test)]
+thread_local! {
+    static LIST_MD_CALLS: std::cell::Cell<usize> = std::cell::Cell::new(0);
+}
+
 fn list_md(
     dir: &Path,
     kind: PageKind,
@@ -3530,6 +3617,9 @@ fn list_md(
     name_fmt: FileNameFormat,
     rel_dir: &str,
 ) -> Vec<PageEntry> {
+    #[cfg(test)]
+    LIST_MD_CALLS.with(|calls| calls.set(calls.get() + 1));
+
     let mut out = Vec::new();
     walk_page_files(dir, |path| {
         let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
@@ -4454,6 +4544,163 @@ mod tests {
         fs::create_dir_all(dir.join("journals")).unwrap();
         fs::create_dir_all(dir.join("pages")).unwrap();
         dir
+    }
+
+    fn reset_list_md_calls() {
+        LIST_MD_CALLS.with(|calls| calls.set(0));
+    }
+
+    fn list_md_calls() -> usize {
+        LIST_MD_CALLS.with(|calls| calls.get())
+    }
+
+    fn reference_find_entry(g: &Graph, name: &str, kind: PageKind) -> Option<PageEntry> {
+        let dir = match kind {
+            PageKind::Journal => g.journals_path(),
+            PageKind::Page => g.pages_path(),
+        };
+        let rel_dir = match kind {
+            PageKind::Journal => &g.config.journals_dir,
+            PageKind::Page => &g.config.pages_dir,
+        };
+        let matches: Vec<PageEntry> = list_md(
+            &dir,
+            kind,
+            &g.journal_format,
+            g.config.file_name_format,
+            rel_dir,
+        )
+        .into_iter()
+        .filter(|e| crate::refs::same_page(&e.name, name))
+        .collect();
+        matches
+            .iter()
+            .find(|e| is_date_stem_entry(e))
+            .or_else(|| matches.first())
+            .cloned()
+    }
+
+    #[test]
+    fn find_entry_cache_avoids_per_lookup_list_md_fanout() {
+        let dir = scratch("find-entry-cache-fanout");
+        for i in 0..16 {
+            fs::write(dir.join("pages").join(format!("Page {i}.md")), "- body\n").unwrap();
+        }
+        let g = Graph::open(&dir);
+        g.warm_cache();
+
+        reset_list_md_calls();
+        for i in 0..16 {
+            let entry = g
+                .find_entry(&format!("Page {i}"), PageKind::Page)
+                .expect("page exists");
+            assert_eq!(entry.name, format!("Page {i}"));
+        }
+        assert_eq!(
+            list_md_calls(),
+            1,
+            "all page lookups in one generation should share one raw page scan"
+        );
+
+        for i in 0..16 {
+            assert!(g.find_entry(&format!("Page {i}"), PageKind::Page).is_some());
+        }
+        assert_eq!(
+            list_md_calls(),
+            1,
+            "warm find_entry index should serve repeated lookups without rescanning"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_entry_cache_matches_old_list_md_selection() {
+        let dir = scratch("find-entry-cache-equivalence");
+        fs::create_dir_all(dir.join("logseq")).unwrap();
+        fs::write(
+            dir.join("logseq").join("config.edn"),
+            "{:preferred-format \"Org\"\n :journal/page-title-format \"EEEE, dd-MM-yyyy\"}\n",
+        )
+        .unwrap();
+        fs::write(dir.join("pages").join("Foo.md"), "- normal\n").unwrap();
+        fs::create_dir_all(dir.join("pages").join("sub")).unwrap();
+        fs::write(
+            dir.join("pages").join("sub").join("Nested.md"),
+            "- nested\n",
+        )
+        .unwrap();
+        fs::write(dir.join("journals").join("2026_06_26.org"), "* canonical\n").unwrap();
+        fs::write(
+            dir.join("journals").join("Friday, 26-06-2026.org"),
+            "* stray\n",
+        )
+        .unwrap();
+        let g = Graph::open(&dir);
+
+        for (name, kind) in [
+            ("foo", PageKind::Page),
+            ("Nested", PageKind::Page),
+            ("Friday, 26-06-2026", PageKind::Journal),
+        ] {
+            let expected = reference_find_entry(&g, name, kind)
+                .unwrap_or_else(|| panic!("reference missing {kind:?} {name:?}"));
+            let actual = g
+                .find_entry(name, kind)
+                .unwrap_or_else(|| panic!("cached lookup missing {kind:?} {name:?}"));
+            assert_eq!(
+                actual.path, expected.path,
+                "cached lookup must match old selection for {kind:?} {name:?}"
+            );
+        }
+
+        let journal = g
+            .find_entry("Friday, 26-06-2026", PageKind::Journal)
+            .unwrap();
+        assert_eq!(journal.rel_path, "journals/2026_06_26.org");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_entry_cache_rebuilds_after_file_rescue_generation_bump() {
+        let dir = scratch("find-entry-cache-rescue");
+        fs::write(dir.join("journals").join("Loose.md"), "- loose\n").unwrap();
+        let g = Graph::open(&dir);
+
+        assert!(g.find_entry("Rescued", PageKind::Page).is_none());
+        assert!(g.find_entry("Loose", PageKind::Journal).is_some());
+
+        g.rename_file_to_page("journals/Loose.md", "Rescued")
+            .unwrap();
+        assert!(g.find_entry("Loose", PageKind::Journal).is_none());
+        assert!(g.find_entry("Rescued", PageKind::Page).is_some());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_entry_cache_invalidated_by_cold_sync_file() {
+        // Regression: the gen-keyed find_entry index must not go stale on
+        // sync_file's cold-cache branch (the parsed-doc cache not yet built), which
+        // drops the page-list memo WITHOUT bumping cache_gen. Before the fix,
+        // find_entry kept serving the pre-create index here (missing the new file)
+        // until some other op happened to bump the generation.
+        let dir = scratch("find-entry-cache-cold-sync");
+        fs::write(dir.join("pages").join("Existing.md"), "- body\n").unwrap();
+        let g = Graph::open(&dir);
+
+        // Do NOT warm the doc cache: find_entry builds only its own index, so
+        // self.cache stays cold and sync_file below takes the else-branch.
+        assert!(g.find_entry("New", PageKind::Page).is_none());
+
+        // A brand-new external file appears (as Logseq/Syncthing would create it),
+        // reconciled while the doc cache is still cold.
+        fs::write(dir.join("pages").join("New.md"), "- new body\n").unwrap();
+        g.sync_file(&dir.join("pages").join("New.md"));
+
+        assert!(
+            g.find_entry("New", PageKind::Page).is_some(),
+            "find_entry index must reflect a file added via the cold sync_file branch"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
