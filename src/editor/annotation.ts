@@ -26,5 +26,9 @@ export function annotationInfo(
 export function pdfFileForPage(pageName: string): string | null {
   const p = doc.pages.find((x) => x.name === pageName);
   const m = p?.preBlock ? /file-path::\s*(\S+)/.exec(p.preBlock) : null;
-  return m ? m[1].split("/").pop() ?? null : null;
+  // Reduce a `file-path::` value to its basename. Split on BOTH separators: a
+  // graph edited on Windows can carry backslash paths (`..\assets\book.pdf` or an
+  // absolute `C:\...\book.pdf`), and splitting on "/" alone would hand the whole
+  // path to the asset reader as a bogus filename (gh #61).
+  return m ? m[1].split(/[\\/]/).pop() ?? null : null;
 }

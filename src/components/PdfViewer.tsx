@@ -91,6 +91,12 @@ export function PdfViewer(props: { filename: string; label: string; page?: numbe
   // never hit the cap, so they keep every canvas (instant scroll-back).
   const lru: number[] = [];
   const CANVAS_CAP = 24;
+  // Fail-safe ceiling on page count. `buildLayout` builds one sized wrapper per
+  // page up front; if a corrupt file (or wrong bytes handed in via a bad path)
+  // reports an absurd page count, that loop would allocate until the app OOMs and
+  // freezes. Real documents don't approach this, so cap it and fail gracefully
+  // instead (gh #61: "fail safely instead of freezing").
+  const MAX_PDF_PAGES = 20000;
   // Pages currently intersecting the viewport — the only ones we rasterize.
   const visible = new Set<number>();
   let io: IntersectionObserver | null = null;
@@ -499,6 +505,10 @@ export function PdfViewer(props: { filename: string; label: string; page?: numbe
       pdfDoc = await pdfjs.getDocument({ data: bytes }).promise;
     } catch (err) {
       failPdf(errorMessage("Couldn't load this PDF", err));
+      return;
+    }
+    if (pdfDoc.numPages > MAX_PDF_PAGES || !Number.isFinite(pdfDoc.numPages)) {
+      failPdf(`This PDF reports an implausible page count (${pdfDoc.numPages}) and won't be rendered.`);
       return;
     }
     // Measure ONLY page 1 up front (for fit-width + as the size estimate for the
