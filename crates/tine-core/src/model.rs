@@ -4603,6 +4603,52 @@ mod tests {
     }
 
     #[test]
+    fn gh62_alias_from_first_bullet_merges_backlinks() {
+        // GH #62: a user types `alias:: book` as the FIRST bullet on the "books"
+        // page (the natural outliner action). OG treats a properties-only first
+        // block as page properties, so `#book` references must resolve to "books"
+        // and appear in its backlinks. Before the fix this only worked when the
+        // alias lived in the page pre-block (dedicated properties panel / Logseq
+        // file convention); the bulleted form silently did nothing.
+        let build = |books_body: &str| {
+            let dir = std::env::temp_dir()
+                .join(format!("tine-gh62-{}-{}", books_body.len(), std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(dir.join("journals")).unwrap();
+            fs::create_dir_all(dir.join("pages")).unwrap();
+            fs::write(dir.join("pages").join("books.md"), books_body).unwrap();
+            fs::write(dir.join("pages").join("note.md"), "- I read a #book today\n").unwrap();
+            let g = Graph::open(&dir);
+            g.warm_cache();
+            let aliases = g.page_aliases();
+            let n: usize = g.backlinks("books").iter().map(|grp| grp.blocks.len()).sum();
+            let _ = fs::remove_dir_all(&dir);
+            (aliases, n)
+        };
+
+        // Alias as the first bullet — now recognized.
+        let (a, n) = build("- alias:: book\n- I like reading\n");
+        assert_eq!(a, vec![("book".to_string(), "books".to_string())], "first-bullet alias registered");
+        assert_eq!(n, 1, "#book backlink merges onto the books page");
+
+        // Pre-block alias keeps working (Logseq file convention / properties panel).
+        let (a, n) = build("alias:: book\n\n- I like reading\n");
+        assert_eq!(a, vec![("book".to_string(), "books".to_string())], "pre-block alias still registered");
+        assert_eq!(n, 1, "pre-block alias backlink still merges");
+
+        // A NON-first bullet with `alias::` is a block property, NOT a page alias
+        // (OG parity — only the first properties block counts).
+        let (a, n) = build("- I like reading\n- alias:: book\n");
+        assert!(a.is_empty(), "alias in a non-first block is not a page alias: {a:?}");
+        assert_eq!(n, 0, "no backlink merge for a mid-page block alias");
+
+        // A first block that mixes content with the property is a regular block,
+        // not a page-properties block.
+        let (a, _) = build("- reading list\nalias:: book\n");
+        assert!(a.is_empty(), "content+property first block is not page properties: {a:?}");
+    }
+
+    #[test]
     fn quick_switch_includes_referenced_pages() {
         // A page referenced by `#tag` / `[[link]]` but with no file of its own
         // still "exists" (OG semantics) and must show up in quick-switch — that's

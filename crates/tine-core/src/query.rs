@@ -97,14 +97,46 @@ fn collect(
     })
 }
 
-/// Map of `alias::` → canonical page name (original case), scanned from every
-/// page's pre-block. The alias key is normalized for lookup.
+/// True when every non-empty line of a block's raw text is a `key:: value`
+/// property line — i.e. the block carries only properties. OG treats such a
+/// FIRST block as the page-properties (pre-)block. Empty (no property) → false.
+fn is_properties_only(raw: &str) -> bool {
+    let mut saw_prop = false;
+    for line in raw.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if crate::doc::parse_property_line(line).is_none() {
+            return false;
+        }
+        saw_prop = true;
+    }
+    saw_prop
+}
+
+/// Map of `alias::` → canonical page name (original case). The alias key is
+/// normalized for lookup. Page-level `alias::` comes from the page pre-block
+/// (Logseq's on-disk file convention) OR — when the user typed it as the first
+/// bullet in the outliner — from a properties-only first block, which OG also
+/// treats as page properties (GH #62). Without the latter, `- alias:: book`
+/// typed in the editor never registers as an alias, so link navigation and
+/// backlinks don't merge the two pages.
 pub fn page_aliases(graph: &Graph) -> Vec<(String, String)> {
     graph.with_pages(|pages| {
         let mut out: Vec<(String, String)> = Vec::new();
         for (entry, doc) in pages {
-            let Some(pre) = &doc.pre_block else { continue };
-            for line in pre.lines() {
+            let alias_text: Option<&str> = match &doc.pre_block {
+                Some(pre) => Some(pre.as_str()),
+                // No pre-block: a properties-only FIRST block is the page-properties
+                // block in OG (it gets written back as a pre-block on save there).
+                None => doc
+                    .roots
+                    .first()
+                    .filter(|b| is_properties_only(&b.raw))
+                    .map(|b| b.raw.as_str()),
+            };
+            let Some(text) = alias_text else { continue };
+            for line in text.lines() {
                 if let Some((k, v)) = crate::doc::parse_property_line(line) {
                     if k.eq_ignore_ascii_case("alias") {
                         for a in v.split(',') {
