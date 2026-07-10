@@ -2102,6 +2102,15 @@ export function Editor(props: { id: string }): JSX.Element {
       // let the textarea insert the newline natively, like OG.
       if (isCalc()) return;
       e.preventDefault();
+      // Inside a fenced code block, Enter inserts a real newline and stays in the
+      // block instead of splitting into a new bullet (which would break the fence
+      // — GH #66). caretInFence treats a still-unterminated fence (being typed) as
+      // inside too, and returns false when the caret sits on a ``` delimiter line,
+      // so Enter on the closing fence still exits the block.
+      if (!isAnnot() && caretInFence(raw, start)) {
+        softNewlineCmd();
+        return;
+      }
       // In-block list: Enter on a `+`/`*`/ordered list line CONTINUES the list
       // (new item below, same marker/indent; a checkbox item starts a fresh `[ ]`)
       // instead of splitting the block. To exit, Backspace the empty item down to a
