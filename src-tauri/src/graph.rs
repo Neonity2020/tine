@@ -1,5 +1,6 @@
 use crate::backup::{backup_async, backup_graph_now};
-use crate::state::AppState;
+use crate::settings::remember_graph;
+use crate::state::{canonical_graph_root, poke_watcher, slot_for_window, AppState, GraphSlot};
 use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -8,9 +9,9 @@ use tine_core::model::{Graph, GraphMeta};
 
 /// Reset the warm flag for a new graph load and return the new warm generation
 /// (passed to `warm_cache_async`, which only reports done if still current).
-pub(crate) fn begin_warm_cache(state: &AppState) -> u64 {
-    state.warm_done.store(false, Ordering::Release);
-    state.warm_generation.fetch_add(1, Ordering::AcqRel) + 1
+pub(crate) fn begin_warm_cache(slot: &GraphSlot) -> u64 {
+    slot.warm_done.store(false, Ordering::Release);
+    slot.warm_generation.fetch_add(1, Ordering::AcqRel) + 1
 }
 
 /// Resolve the graph root: explicit path, else env var, else first CLI arg.
@@ -25,7 +26,31 @@ pub(crate) fn resolve_root(path: &str) -> Option<String> {
             }
         }
     }
-    std::env::args().nth(1)
+    std::env::args().skip(1).find(|arg| !arg.starts_with('-'))
+}
+
+#[tauri::command]
+pub(crate) fn startup_graph_path(app: tauri::AppHandle) -> Option<String> {
+    resolve_root("").or_else(|| crate::settings::last_graph_path(&app))
+}
+
+#[tauri::command]
+pub(crate) fn capture_target(state: State<'_, AppState>) -> Result<String, String> {
+    let preferred = state.last_focused.lock().unwrap().clone();
+    if let Some(label) =
+        preferred.filter(|label| state.graphs.read().unwrap().slot(label).is_some())
+    {
+        return Ok(label);
+    }
+    state
+        .graphs
+        .read()
+        .unwrap()
+        .entries()
+        .into_iter()
+        .next()
+        .map(|entry| entry.0)
+        .ok_or_else(|| "no graph window is open".to_string())
 }
 
 struct LoadedGraph {
@@ -63,27 +88,131 @@ fn open_graph_for_load(
 pub(crate) fn load_graph(
     path: String,
     app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
     state: State<'_, AppState>,
-) -> Result<GraphMeta, String> {
+) -> Result<LoadGraphResult, String> {
+    load_graph_for_label(path, &app, window.label(), &state)
+}
+
+pub(crate) fn load_graph_for_label(
+    path: String,
+    app: &tauri::AppHandle,
+    window_label: &str,
+    state: &State<'_, AppState>,
+) -> Result<LoadGraphResult, String> {
     let root = resolve_root(&path)
         .ok_or_else(|| "no graph path provided (set TINE_GRAPH or pass a path)".to_string())?;
+    let root_key = canonical_graph_root(&root)?;
+    let _load = state.graph_load.lock().unwrap();
+    if let Some(owner) = state.graphs.read().unwrap().owner(&root_key) {
+        if owner == window_label {
+            let slot = slot_for_window(&state, &owner)?;
+            return Ok(LoadGraphResult::AlreadyCurrent {
+                meta: slot.graph.meta(),
+            });
+        }
+        if let Some(existing) = app.get_webview_window(&owner) {
+            let _ = existing.show();
+            #[cfg(desktop)]
+            let _ = existing.unminimize();
+            let _ = existing.set_focus();
+        }
+        return Ok(LoadGraphResult::FocusedExisting {
+            window_label: owner,
+        });
+    }
+    let root = root_key.display().to_string();
     let LoadedGraph {
         graph,
         meta,
         launch_backup_done,
-    } = open_graph_for_load(&root, |graph| backup_graph_now(&app, graph, ""));
-    let warm_generation = begin_warm_cache(&state);
-    *state.graph.write().unwrap() = Some(Arc::new(graph));
-    // Nudge the watcher so it re-targets the new graph's dirs at once (in inotify
-    // mode it's otherwise blocked on the old graph's events).
-    if let Some(tx) = state.watch_ctl.lock().unwrap().as_ref() {
-        let _ = tx.send(());
-    }
+    } = open_graph_for_load(&root, |graph| backup_graph_now(app, graph, ""));
+    let slot = Arc::new(GraphSlot::new(graph, root_key));
+    let warm_generation = begin_warm_cache(&slot);
+    state
+        .graphs
+        .write()
+        .unwrap()
+        .bind(window_label.to_string(), slot.clone())?;
+    *state.last_focused.lock().unwrap() = Some(window_label.to_string());
+    poke_watcher(&state);
     if !launch_backup_done {
-        backup_async(app.clone());
+        backup_async(app.clone(), &slot.graph);
     }
-    warm_cache_async(app, warm_generation);
-    Ok(meta)
+    remember_graph(app, &meta.root)?;
+    if let Some(window) = app.get_webview_window(window_label) {
+        let name = Path::new(&meta.root)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("Graph");
+        let _ = window.set_title(&format!("Tine — {name}"));
+    }
+    warm_cache_async(app.clone(), window_label.to_string(), slot, warm_generation);
+    Ok(LoadGraphResult::Loaded { meta })
+}
+
+#[tauri::command]
+pub(crate) fn open_graph_window(
+    path: String,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<LoadGraphResult, String> {
+    #[cfg(desktop)]
+    {
+        let id = state.next_window.fetch_add(1, Ordering::Relaxed);
+        let label = format!("graph-{id}");
+        let result = load_graph_for_label(path, &app, &label, &state)?;
+        if let LoadGraphResult::Loaded { ref meta } = result {
+            let name = Path::new(&meta.root)
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("Graph");
+            let builder = tauri::WebviewWindowBuilder::new(
+                &app,
+                &label,
+                tauri::WebviewUrl::App("index.html".into()),
+            )
+            .title(format!("Tine — {name}"))
+            .inner_size(1200.0, 820.0)
+            .min_inner_size(640.0, 480.0)
+            .initialization_script(format!(
+                "window.__GRAPH_PATH__ = {};",
+                serde_json::to_string(&meta.root).unwrap_or_else(|_| "\"\"".to_string())
+            ));
+            #[cfg(target_os = "macos")]
+            let builder = builder
+                .decorations(true)
+                .title_bar_style(tauri::TitleBarStyle::Overlay)
+                .hidden_title(true);
+            #[cfg(not(target_os = "macos"))]
+            let builder = builder.decorations(false);
+            let built = builder.build();
+            match built {
+                Ok(window) => {
+                    let _ = window.set_focus();
+                }
+                Err(error) => {
+                    state.graphs.write().unwrap().remove(&label);
+                    poke_watcher(&state);
+                    return Err(format!("couldn't create graph window: {error}"));
+                }
+            }
+        }
+        Ok(result)
+    }
+    #[cfg(not(desktop))]
+    {
+        let _ = (path, app, state);
+        Err("multiple graph windows are desktop-only".to_string())
+    }
+}
+
+#[derive(serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum LoadGraphResult {
+    Loaded { meta: GraphMeta },
+    AlreadyCurrent { meta: GraphMeta },
+    FocusedExisting { window_label: String },
 }
 
 fn dir_is_empty(p: &Path) -> bool {
@@ -152,26 +281,33 @@ pub(crate) fn default_graph_parent(app: tauri::AppHandle) -> Result<String, Stri
 /// flip `warm_done` and tell the frontend, which has been HOLDING its
 /// whole-graph fetches (aliases, ref-count badges) so graph open never does
 /// graph-sized work in the foreground.
-pub(crate) fn warm_cache_async(app: tauri::AppHandle, warm_generation: u64) {
+pub(crate) fn warm_cache_async(
+    app: tauri::AppHandle,
+    window_label: String,
+    slot: Arc<GraphSlot>,
+    warm_generation: u64,
+) {
     std::thread::spawn(move || {
         // Brief delay so the first journal paint (which only needs a few pages)
         // grabs the lock first; then build the whole-graph cache in the
         // background so the first search / query / `g j` agenda doesn't pay for
         // parsing every file synchronously under the lock.
         std::thread::sleep(std::time::Duration::from_millis(250));
-        let state: State<'_, AppState> = app.state();
-        if state.warm_generation.load(Ordering::Acquire) != warm_generation {
+        if slot.warm_generation.load(Ordering::Acquire) != warm_generation {
             return; // the graph was switched while we slept — a newer warm owns it
         }
-        // Clone the Arc and drop the state lock BEFORE the (long) warm, so a
-        // graph switch isn't blocked behind it.
-        let graph = state.graph.read().unwrap().as_ref().cloned();
-        if let Some(g) = graph {
-            g.warm_cache();
-            if state.warm_generation.load(Ordering::Acquire) == warm_generation {
-                state.warm_done.store(true, Ordering::Release);
-                let _ = app.emit("warm-cache-done", ());
-            }
+        slot.graph.warm_cache();
+        let state: State<'_, AppState> = app.state();
+        let still_current = state
+            .graphs
+            .read()
+            .unwrap()
+            .slot(&window_label)
+            .map(|current| Arc::ptr_eq(&current, &slot))
+            .unwrap_or(false);
+        if still_current && slot.warm_generation.load(Ordering::Acquire) == warm_generation {
+            slot.warm_done.store(true, Ordering::Release);
+            let _ = app.emit_to(&window_label, "warm-cache-done", ());
         }
     });
 }
@@ -180,8 +316,13 @@ pub(crate) fn warm_cache_async(app: tauri::AppHandle, warm_generation: u64) {
 /// Polled once by the frontend after it subscribes to `warm-cache-done`, closing
 /// the boot race where the event fired before the listener mounted.
 #[tauri::command]
-pub(crate) fn warm_done(state: State<'_, AppState>) -> bool {
-    state.warm_done.load(Ordering::Acquire)
+pub(crate) fn warm_done(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+) -> Result<bool, String> {
+    Ok(slot_for_window(&state, window.label())?
+        .warm_done
+        .load(Ordering::Acquire))
 }
 
 #[cfg(test)]

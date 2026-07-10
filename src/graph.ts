@@ -5,7 +5,7 @@ import { backend } from "./backend";
 import { setGraphMeta, setWorkflow, bumpGraphEpoch, setRightSidebar, graphMeta, graphEpoch, setAliasMap, seedFavorites, pruneSidebarBlocks, pushToast, refreshJournalConflicts, refreshSyncConflicts, clearRecent } from "./ui";
 import { resetStore, flushAll } from "./store";
 import { clearAssetBlobCache } from "./assetCache";
-import { resetTabsToJournals, openPage } from "./router";
+import { resetTabsToJournals, openPage, restoreSession, flushSession } from "./router";
 import { resetPaneLayoutToSingle } from "./panes";
 import { journalTitle, setJournalTitleFormat } from "./journal";
 import { applyTemplateVars } from "./editor/templateVars";
@@ -32,7 +32,7 @@ export async function loadGraphPath(path: string): Promise<void> {
   // Whether we're switching to a *different* graph than last time. Only then do
   // we drop the persisted right-sidebar items; reopening the same graph at
   // startup keeps them (and we prune stale block refs below).
-  const prev = persistedGraphPath();
+  const prev = graphMeta()?.root || persistedGraphPath();
   const switching = !!prev && !!path && prev !== path;
   // Persist the current graph's pending edits BEFORE opening another graph —
   // otherwise the debounced save would either fire against the new graph or be
@@ -46,7 +46,11 @@ export async function loadGraphPath(path: string): Promise<void> {
     pushToast("Some pages couldn't be saved — resolve conflicts before switching graphs.", "error");
     return;
   }
-  const meta = await backend().loadGraph(path);
+  if (hadGraph) await flushSession();
+  const result = await backend().loadGraph(path);
+  if (result.kind === "focused_existing") return;
+  const meta = result.meta;
+  if (result.kind === "already_current" && hadGraph) return;
   resetStore();
   clearAssetBlobCache(); // old graph's image blob URLs must not leak into the new one
   if (switching) {
@@ -83,6 +87,11 @@ export async function loadGraphPath(path: string): Promise<void> {
   if (switching) {
     resetTabsToJournals();
     resetPaneLayoutToSingle();
+    await restoreSession();
+  } else if (!hadGraph) {
+    // Upgrade/first-bind fallback: main.tsx may have probed the old global
+    // session before the backend knew which graph this webview would own.
+    await restoreSession();
   }
 }
 

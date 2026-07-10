@@ -5,7 +5,8 @@ import { dismissToast, graphMeta, setGraphMeta, setToasts, toasts } from "./ui";
 
 async function seedMeta(root: string) {
   const meta = await backend().loadGraph("");
-  setGraphMeta({ ...meta, root, guide_announced: false });
+  if (meta.kind === "focused_existing") throw new Error("mock graph unexpectedly focused another window");
+  setGraphMeta({ ...meta.meta, root, guide_announced: false });
   setToasts([]);
 }
 

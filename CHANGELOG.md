@@ -10,6 +10,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Added
 
+- **Multiple graphs can stay open in independent desktop windows.** The graph
+  switcher now keeps a durable removable MRU list; click switches the current
+  window and Shift-click opens another OS window. Each window owns its graph,
+  watcher events, warm cache, backups, and persisted tab/pane session, while
+  quick capture safely targets only the last-focused graph. A second
+  `tine <graph>` launch opens or focuses that graph in the existing process.
+
 - **Files copied in the OS file manager can be pasted directly into a block.**
   Tine imports regular files into `assets/` and inserts Logseq-compatible links;
   multiple files are supported, directories are skipped, native file paths avoid

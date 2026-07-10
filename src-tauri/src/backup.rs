@@ -1,7 +1,7 @@
 use crate::settings::{settings_path, update_settings};
-use crate::state::AppState;
+use crate::state::{slot_for_window, GraphContext};
 use std::path::PathBuf;
-use tauri::{Manager, State};
+use tauri::Manager;
 use tine_core::model::{atomic_copy, Graph};
 
 // Snapshot the graph's markdown into the OS app-data dir on open, keeping the
@@ -10,7 +10,8 @@ use tine_core::model::{atomic_copy, Graph};
 // it never blocks startup or holds the graph lock during file copies.
 const BACKUP_KEEP_DEFAULT: usize = 12;
 
-pub(crate) fn backup_async(app: tauri::AppHandle) {
+pub(crate) fn backup_async(app: tauri::AppHandle, graph: &Graph) {
+    let source = BackupSource::from_graph(graph);
     std::thread::spawn(move || {
         // Defer the launch snapshot ~1s so its whole-graph file copy doesn't
         // contend for disk I/O with first-journal paint and the warm-cache parse
@@ -19,7 +20,7 @@ pub(crate) fn backup_async(app: tauri::AppHandle) {
         // the first second — the on-disk files are still intact — so a crash in
         // that window loses nothing the snapshot would have protected.
         std::thread::sleep(std::time::Duration::from_millis(1000));
-        let _ = do_backup(&app, ""); // launch snapshot is best-effort
+        let _ = do_backup_source(&app, source, ""); // launch snapshot is best-effort
     });
 }
 
@@ -39,19 +40,6 @@ pub(crate) fn backup_graph_now(
 /// Returns (files copied, complete) — `complete` is false if ANY graph
 /// text/config/asset-sidecar copy failed, so the caller (restore) can refuse to
 /// proceed without a full rollback snapshot.
-fn do_backup(app: &tauri::AppHandle, suffix: &str) -> (usize, bool) {
-    // Grab just the paths under the lock, then copy from disk lock-free.
-    let source = {
-        let state: State<'_, AppState> = app.state();
-        let guard = state.graph.read().unwrap();
-        match guard.as_ref() {
-            Some(g) => BackupSource::from_graph(g),
-            None => return (0, false),
-        }
-    };
-    do_backup_source(app, source, suffix)
-}
-
 struct BackupSource {
     journals: PathBuf,
     pages: PathBuf,
@@ -151,25 +139,26 @@ pub(crate) fn get_backup_keep(app: tauri::AppHandle) -> usize {
 }
 
 #[tauri::command]
-pub(crate) fn set_backup_keep(keep: usize, app: tauri::AppHandle) -> Result<(), String> {
+pub(crate) fn set_backup_keep(
+    keep: usize,
+    app: tauri::AppHandle,
+    state: GraphContext<'_>,
+) -> Result<(), String> {
     let keep = keep.clamp(1, 1000);
     update_settings(&app, |json| {
         json["backup_keep"] = serde_json::json!(keep);
     })?;
     // Apply the new (possibly lower) cap to the current graph's snapshots now.
-    if let Some(base) = backup_base(&app) {
+    let slot = slot_for_window(&state.state, state.window.label())?;
+    if let Some(base) = backup_base(&app, &slot.graph) {
         prune_backups(&base, keep);
     }
     Ok(())
 }
 
 /// The backup directory for the currently-open graph (`<app-data>/backups/<id>`).
-fn backup_base(app: &tauri::AppHandle) -> Option<PathBuf> {
-    let root = {
-        let state: State<'_, AppState> = app.state();
-        let guard = state.graph.read().unwrap();
-        guard.as_ref().map(|g| g.root.clone())?
-    };
+fn backup_base(app: &tauri::AppHandle, graph: &Graph) -> Option<PathBuf> {
+    let root = graph.root.clone();
     let data_dir = app.path().app_data_dir().ok()?;
     Some(
         data_dir
@@ -179,8 +168,12 @@ fn backup_base(app: &tauri::AppHandle) -> Option<PathBuf> {
 }
 
 #[tauri::command]
-pub(crate) fn list_backups(app: tauri::AppHandle) -> Result<Vec<BackupInfo>, String> {
-    let Some(base) = backup_base(&app) else {
+pub(crate) fn list_backups(
+    app: tauri::AppHandle,
+    state: GraphContext<'_>,
+) -> Result<Vec<BackupInfo>, String> {
+    let slot = slot_for_window(&state.state, state.window.label())?;
+    let Some(base) = backup_base(&app, &slot.graph) else {
         return Ok(Vec::new());
     };
     let mut out = Vec::new();
@@ -243,7 +236,7 @@ fn count_asset_sidecars_recursive(dir: &std::path::Path) -> usize {
 pub(crate) fn restore_backup(
     stamp: String,
     app: tauri::AppHandle,
-    state: State<'_, AppState>,
+    state: GraphContext<'_>,
 ) -> Result<(), String> {
     // Guard against path traversal — a stamp is only ever `YYYY-MM-DD_HH-MM-SS`.
     if stamp.is_empty()
@@ -253,17 +246,18 @@ pub(crate) fn restore_backup(
     {
         return Err("invalid backup id".into());
     }
-    let (journals, pages, assets, cfg_dest) = {
-        let guard = state.graph.read().unwrap();
-        let g = guard.as_ref().ok_or("no graph loaded")?;
+    let slot = slot_for_window(&state.state, state.window.label())?;
+    let (journals, pages, assets, cfg_dest, source) = {
+        let g = &slot.graph;
         (
             g.journals_path(),
             g.pages_path(),
             g.assets_path(),
             g.root.join("logseq").join("config.edn"),
+            BackupSource::from_graph(g),
         )
     };
-    let base = backup_base(&app).ok_or("no app-data dir")?;
+    let base = backup_base(&app, &slot.graph).ok_or("no app-data dir")?;
     let src = base.join(&stamp);
     if !src.is_dir() {
         return Err("backup not found".into());
@@ -272,7 +266,7 @@ pub(crate) fn restore_backup(
     // name so it can't collide with (or be pruned by) the launch snapshot the
     // post-restore reload will take. Abort if the snapshot fails while the live
     // graph has content — never run a destructive restore without a way back.
-    let (snapshot_n, complete) = do_backup(&app, "pre-restore");
+    let (snapshot_n, complete) = do_backup_source(&app, source, "pre-restore");
     let live_n = count_md_recursive(&journals)
         + count_md_recursive(&pages)
         + count_asset_sidecars_recursive(&assets);

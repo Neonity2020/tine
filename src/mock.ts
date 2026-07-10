@@ -3,7 +3,7 @@
 // backend's shape so the UI behaves identically.
 
 import type { Backend, GpuEnv, DebugInfo } from "./backend";
-import type { BlockDto, GraphMeta, GuideCopyResult, GuidePage, Highlight, PageDto, PageEntry, RefGroup } from "./types";
+import type { BlockDto, GuideCopyResult, GuidePage, Highlight, PageDto, PageEntry, RefGroup } from "./types";
 import { SAMPLE_PDF_B64 } from "./sample-pdf";
 import { hlsPageName } from "./pdf";
 import { MARKER_RE } from "./markers";
@@ -578,8 +578,8 @@ export function mockBackend(): Backend {
   };
 
   return {
-    async loadGraph(): Promise<GraphMeta> {
-      return {
+    async loadGraph() {
+      return { kind: "loaded" as const, meta: {
         root: "/mock/graph",
         journals_dir: "journals",
         pages_dir: "pages",
@@ -603,13 +603,29 @@ export function mockBackend(): Backend {
           hi: "Hello, **$1**! See [[$2]].",
           card: "## $1\n\n$2\n\n+ see [[$1]]",
         },
-      };
+      }};
     },
+    async listKnownGraphs() {
+      return [{ path: "/mock/graph", name: "graph" }];
+    },
+    async openGraphWindow() {
+      return { kind: "focused_existing" as const, window_label: "main" };
+    },
+    async startupGraphPath() {
+      return "/mock/graph";
+    },
+    async captureTarget() {
+      return "main";
+    },
+    async forgetKnownGraph() {},
     async appPlatform(): Promise<"android" | "ios" | "desktop"> {
       return "desktop";
     },
     async quit(): Promise<void> {
       // No-op in the mock/screenshot harness — there's no process to exit.
+    },
+    async closeGraphWindow(): Promise<void> {
+      // No-op in the mock/screenshot harness.
     },
     async openDevtools(): Promise<void> {
       // No-op in the mock/screenshot harness — no native WebView inspector.

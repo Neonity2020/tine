@@ -1,5 +1,5 @@
 use crate::settings::{settings_path, update_settings};
-use crate::state::AppState;
+use crate::state::{AppState, GraphSlot};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -215,6 +215,14 @@ fn reconcile_pending(
     }
 }
 
+fn pending_for_graph(paths: &HashSet<PathBuf>, dirs: &[PathBuf; 2]) -> HashSet<PathBuf> {
+    paths
+        .iter()
+        .filter(|path| dirs.iter().any(|dir| path.starts_with(dir)))
+        .cloned()
+        .collect()
+}
+
 /// Watch the graph dirs for external changes (Logseq, Syncthing) and reconcile
 /// them into the cache, emitting `graph-changed` so the UI can reload. Two
 /// mechanisms, switchable at runtime via the device-local `watch_mode` setting:
@@ -239,47 +247,43 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
         *slot = Some(tx.clone());
     }
     std::thread::spawn(move || {
-        // (mtime, size) per file — not mtime alone: on coarse-mtime mounts (some
-        // NFS, FAT) an external write landing in the same tick Tine already recorded
-        // would otherwise read as "unchanged" and never reconcile, leaving stale
-        // backlinks/queries. Size catches the overwhelmingly common case (content
-        // length changed) even when the clock didn't move.
-        let mut snap: HashMap<PathBuf, (SystemTime, u64)> = HashMap::new();
-        let mut baseline = false;
+        struct WatchedGraph {
+            slot: Arc<GraphSlot>,
+            dirs: [PathBuf; 2],
+            snap: HashMap<PathBuf, (SystemTime, u64)>,
+            baseline: bool,
+        }
+
+        let mut graphs: HashMap<String, WatchedGraph> = HashMap::new();
         let mut watcher: Option<notify::RecommendedWatcher> = None;
-        let mut watched: Vec<PathBuf> = Vec::new();
-        let mut last_dirs: Option<[PathBuf; 2]> = None;
+        let mut watched: HashSet<PathBuf> = HashSet::new();
         loop {
             let inotify = watch_mode(&app) != "poll";
-            // Clone the graph Arc and release the lock immediately, so the
-            // (potentially slow) reconcile below — directory scan + per-file
-            // sync_file parses — never holds the lock that a graph switch needs.
-            let (dirs, graph) = {
-                let state: State<'_, AppState> = app.state();
-                let g = state.graph.read().unwrap();
-                match g.as_ref() {
-                    Some(g) => (Some([g.journals_path(), g.pages_path()]), Some(g.clone())),
-                    None => (None, None),
-                }
-            };
-
-            // First load or graph switch: reset the diff baseline (so the new
-            // graph's files aren't all reported as "added") and drop the stale
-            // watches pointing at the previous graph.
-            if dirs != last_dirs {
-                snap.clear();
-                baseline = false;
-                last_dirs = dirs.clone();
-                if let Ok(mut p) = pending.lock() {
-                    *p = Pending::default();
-                }
-                if let Some(w) = watcher.as_mut() {
-                    for d in &watched {
-                        let _ = w.unwatch(d);
+            let entries = app.state::<AppState>().graphs.read().unwrap().entries();
+            let live: HashSet<String> = entries.iter().map(|(label, _)| label.clone()).collect();
+            graphs.retain(|label, _| live.contains(label));
+            for (label, slot) in entries {
+                let dirs = [slot.graph.journals_path(), slot.graph.pages_path()];
+                match graphs.get_mut(&label) {
+                    Some(current) if current.dirs == dirs => current.slot = slot,
+                    _ => {
+                        graphs.insert(
+                            label,
+                            WatchedGraph {
+                                slot,
+                                dirs,
+                                snap: HashMap::new(),
+                                baseline: false,
+                            },
+                        );
                     }
                 }
-                watched.clear();
             }
+
+            let desired: HashSet<PathBuf> = graphs
+                .values()
+                .flat_map(|graph| graph.dirs.iter().cloned())
+                .collect();
 
             // Bring the OS watcher in line with the current mode + dirs.
             if inotify {
@@ -299,16 +303,15 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                         .ok();
                     watched.clear();
                 }
-                if let (Some(w), Some(ds)) = (watcher.as_mut(), dirs.as_ref()) {
-                    if watched.is_empty() {
-                        for d in ds.iter() {
-                            // Recursive so a page created/edited in a SUB-directory
-                            // (#21) — or delivered there by Syncthing — wakes the
-                            // reconcile. notify emulates recursion on inotify by
-                            // watching subdirs; scoped to journals/ + pages/ only.
-                            if w.watch(d, notify::RecursiveMode::Recursive).is_ok() {
-                                watched.push(d.clone());
-                            }
+                if let Some(w) = watcher.as_mut() {
+                    for dir in watched.difference(&desired).cloned().collect::<Vec<_>>() {
+                        let _ = w.unwatch(&dir);
+                        watched.remove(&dir);
+                    }
+                    for dir in desired.difference(&watched).cloned().collect::<Vec<_>>() {
+                        // Recursive so nested graph pages wake the reconcile.
+                        if w.watch(&dir, notify::RecursiveMode::Recursive).is_ok() {
+                            watched.insert(dir);
                         }
                     }
                 }
@@ -318,31 +321,39 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
             }
 
             // --- reconcile (identical in both modes) ---
-            if let (Some(ds), Some(graph)) = (dirs.as_ref(), graph.as_ref()) {
-                if !baseline {
-                    snap = collect_graph_page_files(ds);
-                    baseline = true; // first scan establishes the baseline; emit nothing
+            let (paths, event_need_full) = if inotify {
+                if let Ok(mut p) = pending.lock() {
+                    let paths = std::mem::take(&mut p.paths);
+                    let need_full = p.need_full;
+                    p.need_full = false;
+                    (paths, need_full)
                 } else {
-                    let (paths, event_need_full) = if inotify {
-                        if let Ok(mut p) = pending.lock() {
-                            let paths = std::mem::take(&mut p.paths);
-                            let need_full = p.need_full;
-                            p.need_full = false;
-                            (paths, need_full)
-                        } else {
-                            (HashSet::new(), true)
-                        }
-                    } else {
-                        (HashSet::new(), true)
-                    };
-                    let need_full = event_need_full || !inotify;
-                    let (changes, conflicts_dirty, _) =
-                        reconcile_pending(graph, ds, &mut snap, &paths, need_full);
-                    for c in changes {
-                        let _ = app.emit("graph-changed", c);
+                    (HashSet::new(), true)
+                }
+            } else {
+                (HashSet::new(), true)
+            };
+            for (label, graph) in graphs.iter_mut() {
+                if !graph.baseline {
+                    graph.snap = collect_graph_page_files(&graph.dirs);
+                    graph.baseline = true;
+                    continue;
+                }
+                let owned = pending_for_graph(&paths, &graph.dirs);
+                let need_full = event_need_full || !inotify;
+                if need_full || !owned.is_empty() {
+                    let (changes, conflicts_dirty, _) = reconcile_pending(
+                        &graph.slot.graph,
+                        &graph.dirs,
+                        &mut graph.snap,
+                        &owned,
+                        need_full,
+                    );
+                    for change in changes {
+                        let _ = app.emit_to(label, "graph-changed", change);
                     }
                     if conflicts_dirty {
-                        let _ = app.emit("conflicts-changed", ());
+                        let _ = app.emit_to(label, "conflicts-changed", ());
                     }
                 }
             }
@@ -350,15 +361,12 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
             // --- wait for the next cycle ---
             if inotify && !watched.is_empty() {
                 // Block until the kernel reports a change (or a control poke).
-                // Idle = no wakeups. Coalesce a burst (one save fires several
-                // inotify events) into a single reconcile via a short settle.
+                // Coalesce the several events produced by one atomic save.
                 if rx.recv().is_ok() {
                     std::thread::sleep(Duration::from_millis(200));
                     while rx.try_recv().is_ok() {}
                 }
             } else {
-                // Poll mode, or inotify with nothing watched yet (no graph open):
-                // a short sleep, draining any stray pokes so they don't pile up.
                 std::thread::sleep(Duration::from_secs(3));
                 while rx.try_recv().is_ok() {}
             }
@@ -414,6 +422,27 @@ pub(crate) fn set_watch_mode(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn pending_paths_are_dispatched_only_to_the_owning_graph() {
+        let paths = HashSet::from([
+            PathBuf::from("/graphs/a/pages/one.md"),
+            PathBuf::from("/graphs/b/journals/2026_07_10.md"),
+        ]);
+        let a = [
+            PathBuf::from("/graphs/a/journals"),
+            PathBuf::from("/graphs/a/pages"),
+        ];
+        let b = [
+            PathBuf::from("/graphs/b/journals"),
+            PathBuf::from("/graphs/b/pages"),
+        ];
+        assert_eq!(pending_for_graph(&paths, &a).len(), 1);
+        assert_eq!(pending_for_graph(&paths, &b).len(), 1);
+        assert!(pending_for_graph(&paths, &a)
+            .iter()
+            .all(|path| path.starts_with("/graphs/a")));
+    }
 
     struct TempGraph {
         root: PathBuf,

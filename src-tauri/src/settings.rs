@@ -1,5 +1,12 @@
+use crate::state::{slot_for_window, GraphContext};
 use std::path::PathBuf;
 use tauri::Manager;
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub(crate) struct KnownGraph {
+    pub(crate) path: String,
+    pub(crate) name: String,
+}
 
 // --- local app settings (outside the graph): currently just the backup keep
 // count. A tiny JSON file in the OS app-data dir. ---
@@ -35,6 +42,71 @@ pub(crate) fn update_settings(
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     })
     .map_err(|e| e.to_string())
+}
+
+fn graph_display_name(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(path)
+        .to_string()
+}
+
+fn parse_known_graphs(json: &serde_json::Value) -> Vec<KnownGraph> {
+    json.get("known_graphs")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default()
+}
+
+fn remember_graph_json(json: &mut serde_json::Value, path: &str) {
+    let mut graphs = parse_known_graphs(json);
+    graphs.retain(|graph| graph.path != path);
+    graphs.insert(
+        0,
+        KnownGraph {
+            path: path.to_string(),
+            name: graph_display_name(path),
+        },
+    );
+    json["known_graphs"] = serde_json::to_value(graphs).unwrap_or_default();
+    json["last_graph_path"] = serde_json::Value::String(path.to_string());
+}
+
+fn forget_graph_json(json: &mut serde_json::Value, path: &str) {
+    let mut graphs = parse_known_graphs(json);
+    graphs.retain(|graph| graph.path != path);
+    json["known_graphs"] = serde_json::to_value(graphs).unwrap_or_default();
+}
+
+pub(crate) fn remember_graph(app: &tauri::AppHandle, path: &str) -> Result<(), String> {
+    update_settings(app, |json| remember_graph_json(json, path))
+}
+
+#[tauri::command]
+pub(crate) fn list_known_graphs(app: tauri::AppHandle) -> Vec<KnownGraph> {
+    settings_path(&app)
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .map(|json| parse_known_graphs(&json))
+        .unwrap_or_default()
+}
+
+#[tauri::command]
+pub(crate) fn forget_known_graph(path: String, app: tauri::AppHandle) -> Result<(), String> {
+    update_settings(&app, |json| forget_graph_json(json, &path))
+}
+
+pub(crate) fn last_graph_path(app: &tauri::AppHandle) -> Option<String> {
+    settings_path(app)
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|json| {
+            json.get("last_graph_path")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+        })
 }
 
 /// Quick-capture Enter behaviour (app-level, in tine-settings.json): true → a
@@ -152,25 +224,74 @@ pub(crate) fn set_app_string(
 /// app-level window state, not graph content, so it lives next to the settings
 /// file in the app-data dir. (WebKitGTK's localStorage is not durably persisted
 /// for this app, so the frontend can't rely on it — it round-trips here.)
-fn session_path(app: &tauri::AppHandle) -> Option<PathBuf> {
+fn legacy_session_path(app: &tauri::AppHandle) -> Option<PathBuf> {
     app.path()
         .app_data_dir()
         .ok()
         .map(|d| d.join("tine-session.json"))
 }
 
+fn session_id(root: &std::path::Path) -> String {
+    // Stable FNV-1a over the canonical path. The readable basename is cosmetic;
+    // the hash prevents two same-named graphs in different folders colliding.
+    let text = root.to_string_lossy();
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in text.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    let name = root
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("graph")
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect::<String>();
+    format!("{name}-{hash:016x}.json")
+}
+
+fn session_path(app: &tauri::AppHandle, root: &std::path::Path) -> Option<PathBuf> {
+    app.path()
+        .app_data_dir()
+        .ok()
+        .map(|d| d.join("sessions").join(session_id(root)))
+}
+
+static SESSION_MIGRATION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[tauri::command]
-pub(crate) fn load_session(app: tauri::AppHandle) -> Option<String> {
-    std::fs::read_to_string(session_path(&app)?).ok()
+pub(crate) fn load_session(
+    app: tauri::AppHandle,
+    state: GraphContext<'_>,
+) -> Result<Option<String>, String> {
+    let slot = slot_for_window(&state.state, state.window.label())?;
+    let path = session_path(&app, &slot.root_key).ok_or("no app-data dir")?;
+    if !path.exists() {
+        let _migration = SESSION_MIGRATION_LOCK.lock().unwrap();
+        if !path.exists() {
+            if let Some(legacy) = legacy_session_path(&app).filter(|p| p.exists()) {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                }
+                std::fs::rename(legacy, &path).map_err(|e| e.to_string())?;
+            }
+        }
+    }
+    Ok(std::fs::read_to_string(path).ok())
 }
 
 #[tauri::command]
-pub(crate) fn save_session(data: String, app: tauri::AppHandle) -> Result<(), String> {
+pub(crate) fn save_session(
+    data: String,
+    app: tauri::AppHandle,
+    state: GraphContext<'_>,
+) -> Result<(), String> {
     use std::sync::atomic::{AtomicU64, Ordering};
     // Unique temp name per write so two concurrent saves (a burst of tab actions)
     // can't clobber each other's temp file before the rename.
     static SEQ: AtomicU64 = AtomicU64::new(0);
-    let p = session_path(&app).ok_or("no app-data dir")?;
+    let slot = slot_for_window(&state.state, state.window.label())?;
+    let p = session_path(&app, &slot.root_key).ok_or("no app-data dir")?;
     if let Some(parent) = p.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -181,4 +302,42 @@ pub(crate) fn save_session(data: String, app: tauri::AppHandle) -> Result<(), St
     std::fs::write(&tmp, data.as_bytes()).map_err(|e| e.to_string())?;
     std::fs::rename(&tmp, &p).map_err(|e| e.to_string())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn known_graphs_are_deduplicated_mru_and_removable() {
+        let mut json = serde_json::json!({});
+        remember_graph_json(&mut json, "/graphs/alpha");
+        remember_graph_json(&mut json, "/other/beta");
+        remember_graph_json(&mut json, "/graphs/alpha");
+        assert_eq!(
+            parse_known_graphs(&json),
+            vec![
+                KnownGraph {
+                    path: "/graphs/alpha".into(),
+                    name: "alpha".into()
+                },
+                KnownGraph {
+                    path: "/other/beta".into(),
+                    name: "beta".into()
+                },
+            ]
+        );
+        assert_eq!(json["last_graph_path"], "/graphs/alpha");
+        forget_graph_json(&mut json, "/graphs/alpha");
+        assert_eq!(parse_known_graphs(&json).len(), 1);
+        assert_eq!(json["last_graph_path"], "/graphs/alpha");
+    }
+
+    #[test]
+    fn session_ids_separate_same_named_graphs() {
+        assert_ne!(
+            session_id(std::path::Path::new("/one/graph")),
+            session_id(std::path::Path::new("/two/graph"))
+        );
+    }
 }

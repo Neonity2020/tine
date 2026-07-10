@@ -776,6 +776,37 @@ body {
   z-index: 41;
   min-width: 0;
 }
+.graph-switch-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.graph-switch-row.active {
+  color: var(--text-title);
+  font-weight: 600;
+}
+.graph-switch-row-name {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.graph-switch-remove {
+  flex: 0 0 auto;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+  padding: 1px 4px;
+}
+.graph-switch-remove:hover {
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+}
 
 .nav-search {
   padding: 0 6px 10px;

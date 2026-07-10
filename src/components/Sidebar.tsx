@@ -1,7 +1,8 @@
-import { For, Show, createEffect, createMemo, createSignal, onCleanup, type JSX } from "solid-js";
+import { For, Show, createEffect, createMemo, createResource, createSignal, onCleanup, type JSX } from "solid-js";
 import { openJournals, openPage, openPageInNewTab, openFile, openInNewTab, route } from "../router";
-import { openSwitcher, favorites, recentPages, openPageContextMenu, graphMeta, openPageInSidebar } from "../ui";
-import { switchGraph, createNewGraph } from "../graph";
+import { openSwitcher, favorites, recentPages, openPageContextMenu, graphMeta, openPageInSidebar, pushToast } from "../ui";
+import { switchGraph, createNewGraph, loadGraphPath } from "../graph";
+import { backend } from "../backend";
 import { allPages as allGraphPages, pageListLabel } from "../pages";
 import { EmojiText } from "../render/emoji";
 import { NamespaceTree } from "./Namespace";
@@ -218,14 +219,33 @@ function graphDisplayName(): string {
   return base || root;
 }
 
+export interface KnownGraphOpenDeps {
+  switchInPlace(path: string): Promise<void>;
+  openNewWindow(path: string): Promise<unknown>;
+}
+
+export function openKnownGraph(
+  path: string,
+  newWindow: boolean,
+  deps: KnownGraphOpenDeps = {
+    switchInPlace: loadGraphPath,
+    openNewWindow: (target) => backend().openGraphWindow(target),
+  }
+): Promise<unknown> {
+  return newWindow ? deps.openNewWindow(path) : deps.switchInPlace(path);
+}
+
 // The current-graph control in the sidebar header. OG puts a graph-name dropdown
-// top-left (database icon → switch/new/all-graphs/re-index). Tine has no
-// multi-graph list yet (that's R4a), so this surfaces the already-existing
-// open/create actions — making graph switching DISCOVERABLE rather than buried
-// in Settings.
+// top-left (database icon → switch/new/all-graphs/re-index). Tine lists its known
+// graphs here alongside open/create actions; Shift-click opens a peer window.
 function GraphSwitcher(): JSX.Element {
   const [open, setOpen] = createSignal(false);
+  const [knownGraphs, { refetch }] = createResource(() => backend().listKnownGraphs());
   const close = () => setOpen(false);
+
+  createEffect(() => {
+    if (open()) void refetch();
+  });
 
   // Esc closes the menu (the backdrop handles click-outside).
   createEffect(() => {
@@ -262,6 +282,41 @@ function GraphSwitcher(): JSX.Element {
           }}
         />
         <div class="ctx-menu graph-switch-menu">
+          <For each={knownGraphs() ?? []}>
+            {(graph) => (
+              <div
+                class="ctx-item graph-switch-row"
+                classList={{ active: graph.path === graphMeta()?.root }}
+                title={graph.path}
+                onClick={(event) => {
+                  close();
+                  const open = openKnownGraph(graph.path, event.shiftKey);
+                  void open.catch((error) =>
+                    pushToast(`Couldn't open ${graph.name}. (${String(error)})`, "error")
+                  );
+                }}
+              >
+                <span class="graph-switch-row-name">{graph.name}</span>
+                <button
+                  class="graph-switch-remove"
+                  title={`Remove ${graph.name} from this list`}
+                  aria-label={`Remove ${graph.name} from this list`}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    void backend()
+                      .forgetKnownGraph(graph.path)
+                      .then(() => refetch())
+                      .catch((error) => pushToast(`Couldn't remove graph. (${String(error)})`, "error"));
+                  }}
+                >
+                  ×
+                </button>
+              </div>
+            )}
+          </For>
+          <Show when={(knownGraphs() ?? []).length > 0}>
+            <div class="ctx-separator" />
+          </Show>
           <div
             class="ctx-item"
             onClick={() => {

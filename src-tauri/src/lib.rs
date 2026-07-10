@@ -17,40 +17,43 @@ mod watcher;
 
 use backup::{get_backup_keep, list_backups, restore_backup, set_backup_keep};
 use commands::{
-    asset_trash_stats, block_ref_counts, block_referrers, delete_page, detect_media_editor,
-    copy_guide_into_graph, edit_asset_external, empty_asset_trash,
-    get_backlinks, get_page, get_page_by_path, get_unlinked_refs, graph_source_files, import_asset,
-    guide_pages, journal_content_days, journals_desc, list_journal_conflicts, list_orphan_assets, list_pages,
-    list_sync_conflicts, list_templates, merge_pages, open_asset, page_aliases, page_icons,
-    page_print_html, publish_html, query_facets, quick_switch, read_asset, read_custom_css,
-    read_highlights, read_journal_file, read_local_image, read_text_file, rename_file_to_page,
-    rename_page, resolve_block, resolve_blocks, resolve_sync_conflict, run_advanced_query,
-    run_query, save_asset, save_page, save_pdf_area_image, search, set_default_journal_template,
-    set_favorites, set_journal_title_format, set_preferred_format, set_preferred_workflow,
-    set_guide_announced, set_start_of_week, set_timetracking_enabled, sync_conflict_diff, tine_open_devtools, tine_quit,
-    trash_asset, trash_journal_file, trash_sync_conflict, write_highlights,
+    asset_trash_stats, block_ref_counts, block_referrers, close_graph_window,
+    copy_guide_into_graph, delete_page, detect_media_editor, edit_asset_external,
+    empty_asset_trash, get_backlinks, get_page, get_page_by_path, get_unlinked_refs,
+    graph_source_files, guide_pages, import_asset, journal_content_days, journals_desc,
+    list_journal_conflicts, list_orphan_assets, list_pages, list_sync_conflicts, list_templates,
+    merge_pages, open_asset, page_aliases, page_icons, page_print_html, publish_html, query_facets,
+    quick_switch, read_asset, read_custom_css, read_highlights, read_journal_file,
+    read_local_image, read_text_file, rename_file_to_page, rename_page, resolve_block,
+    resolve_blocks, resolve_sync_conflict, run_advanced_query, run_query, save_asset, save_page,
+    save_pdf_area_image, search, set_default_journal_template, set_favorites, set_guide_announced,
+    set_journal_title_format, set_preferred_format, set_preferred_workflow, set_start_of_week,
+    set_timetracking_enabled, sync_conflict_diff, tine_open_devtools, tine_quit, trash_asset,
+    trash_journal_file, trash_sync_conflict, write_highlights,
 };
 use debug::{
     debug_enabled, debug_header, debug_info, debug_init, debug_log, diag, install_panic_logger,
 };
 use graph::{
-    app_platform, begin_warm_cache, create_graph, default_graph_parent, load_graph, resolve_root,
-    warm_cache_async, warm_done,
+    app_platform, capture_target, create_graph, default_graph_parent, load_graph,
+    open_graph_window, resolve_root, startup_graph_path, warm_done,
 };
 use platform::{clipboard_files, copy_image_to_clipboard, gpu_env, open_external};
 use settings::{
-    get_app_bool, get_app_string, get_capture_enter_files, get_link_first_match, get_smooth_scroll,
-    load_session, save_session, set_app_bool, set_app_string, set_capture_enter_files,
-    set_link_first_match, set_smooth_scroll,
+    forget_known_graph, get_app_bool, get_app_string, get_capture_enter_files,
+    get_link_first_match, get_smooth_scroll, list_known_graphs, load_session, save_session,
+    set_app_bool, set_app_string, set_capture_enter_files, set_link_first_match, set_smooth_scroll,
 };
 use spellcheck::{
     apply_spellcheck, apply_spellcheck_all, list_spellcheck_dictionaries, parse_spellcheck_langs,
 };
 use state::AppState;
-use std::sync::atomic::{AtomicBool, AtomicU64};
-use std::sync::{Arc, Mutex, RwLock};
-use tauri::{Emitter, Manager, State};
-use tine_core::model::Graph;
+#[cfg(desktop)]
+use std::sync::atomic::AtomicU64;
+use std::sync::{Mutex, RwLock};
+#[cfg(desktop)]
+use tauri::Emitter;
+use tauri::Manager;
 use watcher::{get_watch_mode, set_watch_mode, start_watcher};
 
 /// Show + focus the always-on-top quick-capture mini window (created hidden at
@@ -78,6 +81,65 @@ fn show_capture(app: &tauri::AppHandle) {
         // deliver a focus-gained event on show — leaving the window stuck at a
         // previously-grown size.
         let _ = app.emit("capture-shown", ());
+    }
+}
+
+#[cfg(desktop)]
+fn focus_last_graph_window(app: &tauri::AppHandle) {
+    let state = app.state::<AppState>();
+    let label = state.last_focused.lock().unwrap().clone().or_else(|| {
+        state
+            .graphs
+            .read()
+            .unwrap()
+            .entries()
+            .into_iter()
+            .next()
+            .map(|e| e.0)
+    });
+    if let Some(window) = label.and_then(|label| app.get_webview_window(&label)) {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
+#[cfg(desktop)]
+fn forwarded_graph_path(argv: &[String], cwd: &str) -> Option<String> {
+    let raw = argv.iter().skip(1).find(|arg| !arg.starts_with('-'))?;
+    let path = std::path::Path::new(raw);
+    Some(
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::path::Path::new(cwd).join(path)
+        }
+        .display()
+        .to_string(),
+    )
+}
+
+#[cfg(all(test, desktop))]
+mod multi_window_tests {
+    use super::*;
+
+    #[test]
+    fn forwarded_path_ignores_flags_and_resolves_against_sender_cwd() {
+        let argv = vec![
+            "tine".to_string(),
+            "--debug".to_string(),
+            "graphs/second".to_string(),
+        ];
+        assert_eq!(
+            forwarded_graph_path(&argv, "/home/user").as_deref(),
+            Some("/home/user/graphs/second")
+        );
+    }
+
+    #[test]
+    fn capture_only_launch_has_no_graph_path() {
+        let argv = vec!["tine".to_string(), "--capture".to_string()];
+        assert!(forwarded_graph_path(&argv, "/tmp").is_none());
     }
 }
 
@@ -170,13 +232,14 @@ pub fn run() {
         // `tine --capture`) doesn't start a new process — this fires in the
         // already-running instance with the new argv. `--capture` pops the
         // capture window; a plain re-launch just surfaces the main window.
-        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+        .plugin(tauri_plugin_single_instance::init(|app, argv, cwd| {
             if argv.iter().any(|a| a == "--capture") {
                 show_capture(app);
-            } else if let Some(w) = app.get_webview_window("main") {
-                let _ = w.show();
-                let _ = w.unminimize();
-                let _ = w.set_focus();
+            } else if let Some(path) = forwarded_graph_path(&argv, &cwd) {
+                let state = app.state::<AppState>();
+                let _ = open_graph_window(path, app.clone(), state);
+            } else {
+                focus_last_graph_window(app);
             }
         }))
         // In-app self-update. The updater reads `plugins.updater` from
@@ -214,28 +277,60 @@ pub fn run() {
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_process::init())
-        // The hidden capture window would otherwise keep the process alive after
-        // the main window is closed (Tauri exits only when ALL windows are gone).
-        // So when `main` is destroyed, exit explicitly. The JS close handler has
-        // already flushed pending edits by the time it calls destroy().
         .on_window_event(|window, event| {
-            if window.label() == "main" {
-                if let tauri::WindowEvent::Destroyed = event {
-                    window.app_handle().exit(0);
+            let label = window.label();
+            if label != "main" && !label.starts_with("graph-") {
+                return;
+            }
+            let app = window.app_handle();
+            let state = app.state::<AppState>();
+            match event {
+                tauri::WindowEvent::Focused(true) => {
+                    let changed = {
+                        let mut last = state.last_focused.lock().unwrap();
+                        if last.as_deref() == Some(label) {
+                            false
+                        } else {
+                            *last = Some(label.to_string());
+                            true
+                        }
+                    };
+                    if changed {
+                        if let Ok(slot) = state::slot_for_window(&state, label) {
+                            let _ =
+                                settings::remember_graph(app, &slot.root_key.display().to_string());
+                        }
+                    }
                 }
+                tauri::WindowEvent::Destroyed => {
+                    state.graphs.write().unwrap().remove(label);
+                    state::poke_watcher(&state);
+                    if state.graphs.read().unwrap().len() == 0 {
+                        #[cfg(target_os = "linux")]
+                        platform::kill_webkit_children();
+                        app.exit(0);
+                    }
+                }
+                _ => {}
             }
         })
         .manage(AppState {
-            graph: RwLock::new(None),
-            warm_done: AtomicBool::new(false),
-            warm_generation: AtomicU64::new(0),
+            graphs: RwLock::new(state::GraphRegistry::default()),
+            graph_load: Mutex::new(()),
             watch_ctl: Mutex::new(None),
+            last_focused: Mutex::new(None),
+            #[cfg(desktop)]
+            next_window: AtomicU64::new(1),
         })
         .setup(|app| {
             diag("setup() begin");
             // Eagerly open the graph if one was configured at startup.
-            if let Some(root) = resolve_root("") {
-                let g = Graph::open(&root);
+            let startup_root = resolve_root("").or_else(|| settings::last_graph_path(app.handle()));
+            if let Some(root) = startup_root {
+                let state = app.state::<AppState>();
+                graph::load_graph_for_label(root, app.handle(), "main", &state)?;
+                let slot = state::slot_for_window(&state, "main")?;
+                let g = &slot.graph;
                 // These diagnostics enumerate dirs AND force a whole-graph cache
                 // build (journals_desc()/list_pages()) — on the cold-cache critical
                 // path to first paint, before warm_cache_async. The format! args
@@ -284,15 +379,6 @@ pub fn run() {
                         diag(format!("sample journal files: {sample:?}"));
                     }
                 }
-                let state: State<'_, AppState> = app.state();
-                let warm_generation = begin_warm_cache(&state);
-                *state.graph.write().unwrap() = Some(Arc::new(g));
-                // Warm the whole-graph cache in the background. Without this the
-                // startup (TINE_GRAPH / argv) path never warms — only the
-                // `load_graph` command did — so the user's first `g j` (whose
-                // agenda query touches the whole graph) paid to parse every file
-                // synchronously. First nav slow, second fine; this fixes it.
-                warm_cache_async(app.handle().clone(), warm_generation);
             } else {
                 diag("NO graph root resolved — set TINE_GRAPH=/path/to/graph");
             }
@@ -323,6 +409,9 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             load_graph,
+            open_graph_window,
+            startup_graph_path,
+            capture_target,
             create_graph,
             app_platform,
             default_graph_parent,
@@ -407,6 +496,8 @@ pub fn run() {
             restore_backup,
             load_session,
             save_session,
+            list_known_graphs,
+            forget_known_graph,
             migrate_identifier::take_identifier_migration_notice,
             gpu_env,
             get_smooth_scroll,
@@ -420,6 +511,7 @@ pub fn run() {
             debug_info,
             debug_log,
             tine_quit,
+            close_graph_window,
             tine_open_devtools
         ])
         .run(tauri::generate_context!())

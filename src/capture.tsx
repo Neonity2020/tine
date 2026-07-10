@@ -204,6 +204,7 @@ function Capture() {
     id: string;
     attemptsStarted: number;
     payload: QuickCaptureRequest;
+    target: string;
     unlisten?: () => void;
     timer?: number;
   };
@@ -225,8 +226,9 @@ function Capture() {
   };
   const requestTheme = async () => {
     try {
-      const { emit } = await import("@tauri-apps/api/event");
-      await emit("capture-request-theme");
+      const { emitTo } = await import("@tauri-apps/api/event");
+      const target = await backend().captureTarget();
+      await emitTo(target, "capture-request-theme", { target });
     } catch {
       // not in Tauri
     }
@@ -240,8 +242,9 @@ function Capture() {
   let disposeKeys: () => void = () => {};
   const requestShortcuts = async () => {
     try {
-      const { emit } = await import("@tauri-apps/api/event");
-      await emit("capture-request-shortcuts");
+      const { emitTo } = await import("@tauri-apps/api/event");
+      const target = await backend().captureTarget();
+      await emitTo(target, "capture-request-shortcuts", { target });
     } catch {
       // not in Tauri
     }
@@ -261,10 +264,20 @@ function Capture() {
         return;
       }
       const id = createQuickCaptureRequestId();
+      let target: string;
+      try {
+        target = await backend().captureTarget();
+      } catch {
+        setCaptureStatus("error");
+        setCaptureMessage("No graph window is ready — text kept");
+        scheduleFit();
+        return;
+      }
       const pending: PendingCapture = {
         id,
         attemptsStarted: 0,
-        payload: { id, text: md, title: pageTitle },
+        payload: { id, target, text: md, title: pageTitle },
+        target,
       };
       const finish = async (ok: boolean) => {
         if (pendingCapture !== pending) return;
@@ -285,7 +298,7 @@ function Capture() {
         if (pendingCapture !== pending) return;
         disposePendingCapture();
         setCaptureStatus("error");
-        setCaptureMessage("main window not ready — try again");
+        setCaptureMessage("graph window not ready — try again");
         scheduleFit();
       };
       setCaptureStatus("saving");
@@ -299,7 +312,7 @@ function Capture() {
         return;
       }
       if (pendingCapture !== pending) return;
-      const { emit, listen } = eventApi;
+      const { emitTo, listen } = eventApi;
       const scheduleTimeout = () => {
         pending.timer = window.setTimeout(() => {
           if (pendingCapture !== pending) return;
@@ -318,7 +331,7 @@ function Capture() {
         pending.attemptsStarted += 1;
         try {
           // `title` set → the main window files this as a NEW page; empty → today.
-          await emit("quick-capture", pending.payload);
+          await emitTo(pending.target, "quick-capture", pending.payload);
         } catch {
           giveUp();
           return;

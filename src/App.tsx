@@ -417,7 +417,14 @@ export function App(): JSX.Element {
   });
 
   onMount(async () => {
-    const graphPath = persistedGraphPath() || ((window as any).__GRAPH_PATH__ ?? "");
+    const injected = (window as any).__GRAPH_PATH__ ?? "";
+    let startup = "";
+    try {
+      startup = (await backend().startupGraphPath()) ?? "";
+    } catch {
+      startup = "";
+    }
+    const graphPath = injected || startup || persistedGraphPath();
     dbg(`loading graph: ${graphPath || "(default/configured)"}`);
     try {
       await loadGraphPath(graphPath);
@@ -528,7 +535,7 @@ export function App(): JSX.Element {
           // WebKitGTK build, which would quit and discard the unsaved edits with
           // no prompt at all. The whole point here is to NOT lose them silently.
           const quit = await backend().confirm(
-            "Tine has unsaved changes that couldn't be saved (a conflict or a stuck save).\n\nQuit anyway and lose them?",
+            "Tine has unsaved changes that couldn't be saved (a conflict or a stuck save).\n\nClose this window anyway and lose them?",
             "Unsaved changes"
           );
           if (!quit) return; // stay open
@@ -542,16 +549,11 @@ export function App(): JSX.Element {
           // best-effort
         }
         closing = true;
-        // Quit via the backend so it can SIGKILL WebKitGTK's helper processes
-        // before they run their crash-y GL-driver exit teardown (GH #28). This
-        // never resolves (the process exits); the destroy()/close() below are only
-        // reached if the quit IPC didn't take (older backend, non-Linux edge), so
-        // the window still closes.
+        // Close only this graph window. The backend exits the process (including
+        // Linux WebKit cleanup) only when this is the final graph window.
         try {
-          await Promise.race([
-            backend().quit(),
-            new Promise((r) => setTimeout(r, 2000)),
-          ]);
+          await backend().closeGraphWindow();
+          return;
         } catch {
           // fall through to the direct close below
         }
@@ -567,7 +569,7 @@ export function App(): JSX.Element {
 
   // Global quick-capture: a `tine --capture` launch (bound to a DE hotkey)
   // signals the running app to pop the capture mini-window; on submit it emits a
-  // `quick-capture` event that the MAIN window turns into an append to today's
+  // `quick-capture` event that the selected graph window turns into an append to today's
   // journal. Going through the live store (not a separate file writer) keeps a
   // capture from racing a main-view edit of today's journal into a conflict.
   onMount(() => {
@@ -585,11 +587,17 @@ export function App(): JSX.Element {
       }
     };
     void (async () => {
-      const { emit, listen } = await import("@tauri-apps/api/event");
+      const { emitTo, listen } = await import("@tauri-apps/api/event");
+      const { getCurrentWindow } = await import("@tauri-apps/api/window");
+      const windowLabel = getCurrentWindow().label;
       const ack = (id: string | undefined, ok: boolean) => {
-        if (id) void emit("quick-capture-ack", { id, ok } satisfies QuickCaptureAck);
+        if (id) void emitTo("capture", "quick-capture-ack", { id, ok } satisfies QuickCaptureAck);
       };
       unlisten = await listen<QuickCaptureRequest>("quick-capture", async (e) => {
+        // WebKitGTK currently exposes targeted Tauri events to every graph
+        // listener in this process. Treat the payload label as the authority so
+        // only the selected graph can ever perform the write.
+        if (e.payload?.target !== windowLabel) return;
         const id = e.payload?.id;
         if (id && completed.has(id)) {
           ack(id, completed.get(id) ?? false);
@@ -645,9 +653,12 @@ export function App(): JSX.Element {
     if (!isTauri()) return;
     let unlisten = () => {};
     void (async () => {
-      const { emit, listen } = await import("@tauri-apps/api/event");
-      unlisten = await listen("capture-request-theme", () => {
-        void emit("capture-apply-theme", { theme: theme() });
+      const { emitTo, listen } = await import("@tauri-apps/api/event");
+      const { getCurrentWindow } = await import("@tauri-apps/api/window");
+      const windowLabel = getCurrentWindow().label;
+      unlisten = await listen<{ target: string }>("capture-request-theme", (e) => {
+        if (e.payload?.target !== windowLabel) return;
+        void emitTo("capture", "capture-apply-theme", { theme: theme() });
       });
     })();
     onCleanup(() => unlisten());
@@ -664,8 +675,15 @@ export function App(): JSX.Element {
     const t = theme();
     if (!isTauri()) return;
     void (async () => {
-      const { emit } = await import("@tauri-apps/api/event");
-      await emit("capture-apply-theme", { theme: t });
+      try {
+        const { emitTo } = await import("@tauri-apps/api/event");
+        const { getCurrentWindow } = await import("@tauri-apps/api/window");
+        if ((await backend().captureTarget()) === getCurrentWindow().label) {
+          await emitTo("capture", "capture-apply-theme", { theme: t });
+        }
+      } catch {
+        // No graph is bound yet (Welcome) or capture is unavailable.
+      }
     })();
   });
 
@@ -683,8 +701,15 @@ export function App(): JSX.Element {
   const broadcastShortcuts = () => {
     if (!isTauri()) return;
     void (async () => {
-      const { emit } = await import("@tauri-apps/api/event");
-      await emit("capture-apply-shortcuts", latestShortcuts);
+      try {
+        const { emitTo } = await import("@tauri-apps/api/event");
+        const { getCurrentWindow } = await import("@tauri-apps/api/window");
+        if ((await backend().captureTarget()) === getCurrentWindow().label) {
+          await emitTo("capture", "capture-apply-shortcuts", latestShortcuts);
+        }
+      } catch {
+        // No graph is bound yet (Welcome) or capture is unavailable.
+      }
     })();
   };
   createEffect(() => {
@@ -699,8 +724,13 @@ export function App(): JSX.Element {
     if (!isTauri()) return;
     let unlisten = () => {};
     void (async () => {
-      const { listen } = await import("@tauri-apps/api/event");
-      unlisten = await listen("capture-request-shortcuts", broadcastShortcuts);
+      const { emitTo, listen } = await import("@tauri-apps/api/event");
+      const { getCurrentWindow } = await import("@tauri-apps/api/window");
+      const windowLabel = getCurrentWindow().label;
+      unlisten = await listen<{ target: string }>("capture-request-shortcuts", (e) => {
+        if (e.payload?.target !== windowLabel) return;
+        void emitTo("capture", "capture-apply-shortcuts", latestShortcuts);
+      });
     })();
     onCleanup(() => unlisten());
   });

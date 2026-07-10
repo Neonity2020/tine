@@ -1,6 +1,6 @@
 # 0038. Multi-window, multi-graph: one process, per-window graph map
 
-- **Status:** Proposed (Claude, design note for GH #70/#56/#55 — Martin to review)
+- **Status:** Accepted (Martin, 2026-07-10)
 - **Date:** 2026-07-10
 
 ## Context
@@ -74,6 +74,11 @@ Concretely:
   dropdown. This needs none of the map refactor above.
 - **#56 is the glue on top of #70:** shift-click a row in the #55 list calls the
   "open in new window" path instead of the in-place switch.
+- Graph windows are peers: closing one leaves the others running, while closing
+  the last graph window exits the process. Each graph has its own persisted UI
+  session; only the last-focused graph is reopened on the next launch.
+- The known-graphs list is an uncapped, deduplicated MRU with explicit removal.
+  Temporarily unavailable paths remain listed until the user removes them.
 - Scope is **desktop only.** Android/iOS are single-activity; multi-window is a
   non-goal there and those targets keep the single-graph slot.
 
@@ -97,9 +102,9 @@ Concretely:
 - New commitments: warm-cache generation, the `warm-cache-done` event, and any
   future whole-graph cache all become **per-window-key** rather than global; a
   reviewer must check no command still reads a process-global "current graph".
-- Quick-capture needs a routing decision once multiple graphs are open: which
-  graph a capture lands in (the last-focused window's graph is the likely answer).
-  Recorded as follow-on, not solved here.
+- Quick-capture routes to the last-focused graph window. This is part of #70,
+  not a follow-on: the existing process-global event would otherwise be handled
+  by every graph webview and duplicate a capture across graphs.
 - Memory / footprint grows with the number of open graphs (each holds its warm
   caches); acceptable for a deliberate "open a second graph" action, and bounded by
   how many windows the user opens.

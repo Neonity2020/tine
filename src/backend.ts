@@ -72,8 +72,22 @@ export interface MediaCaptureResult {
   ext?: string | null;
 }
 
+export interface KnownGraph {
+  path: string;
+  name: string;
+}
+
+export type LoadGraphResult =
+  | { kind: "loaded" | "already_current"; meta: GraphMeta }
+  | { kind: "focused_existing"; window_label: string };
+
 export interface Backend {
-  loadGraph(path: string): Promise<GraphMeta>;
+  loadGraph(path: string): Promise<LoadGraphResult>;
+  openGraphWindow(path: string): Promise<LoadGraphResult>;
+  startupGraphPath(): Promise<string | null>;
+  captureTarget(): Promise<string>;
+  listKnownGraphs(): Promise<KnownGraph[]>;
+  forgetKnownGraph(path: string): Promise<void>;
   appPlatform(): Promise<"android" | "ios" | "desktop">;
   defaultGraphParent(): Promise<string>;
   /** Quit the app. On Linux this first SIGKILLs WebKitGTK's helper subprocesses so
@@ -81,6 +95,7 @@ export interface Backend {
    *  the caller MUST have flushed pending edits first. Does not resolve — the
    *  process exits. */
   quit(): Promise<void>;
+  closeGraphWindow(): Promise<void>;
   /** Toggle the WebView developer tools (WebKit Web Inspector) for theme/CSS
    *  debugging. No-op on a build without devtools compiled in. */
   openDevtools(): Promise<void>;
@@ -385,13 +400,31 @@ class TauriBackend implements Backend {
   }
 
   loadGraph(path: string) {
-    return this.call<GraphMeta>("load_graph", { path });
+    return this.call<LoadGraphResult>("load_graph", { path });
+  }
+  openGraphWindow(path: string) {
+    return this.call<LoadGraphResult>("open_graph_window", { path });
+  }
+  startupGraphPath() {
+    return this.call<string | null>("startup_graph_path");
+  }
+  captureTarget() {
+    return this.call<string>("capture_target");
+  }
+  listKnownGraphs() {
+    return this.call<KnownGraph[]>("list_known_graphs");
+  }
+  forgetKnownGraph(path: string) {
+    return this.call<void>("forget_known_graph", { path });
   }
   appPlatform() {
     return this.call<"android" | "ios" | "desktop">("app_platform");
   }
   quit() {
     return this.call<void>("tine_quit");
+  }
+  closeGraphWindow() {
+    return this.call<void>("close_graph_window");
   }
   openDevtools() {
     return this.call<void>("tine_open_devtools");

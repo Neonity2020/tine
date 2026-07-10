@@ -1,5 +1,7 @@
 export interface QuickCaptureRequest {
   id?: string;
+  /** Destination graph-window label. Receivers must verify this explicitly. */
+  target: string;
   text: string;
   title?: string;
 }
