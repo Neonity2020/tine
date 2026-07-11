@@ -8,6 +8,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+### Changed
+
+- **Release publication now fails closed on an incomplete platform set.** Tagged
+  releases require Android signing, a successful real offline Flatpak build,
+  lockstep version/changelog metadata, cross-platform-stable vendored oracle
+  bytes, all 21 expected artifacts, and all 12 updater platform entries before
+  the draft can become public.
+
 ## [0.5.6] - 2026-07-11
 
 Parser-integration and release-recovery patch: lsdoc 0.5.2, private and

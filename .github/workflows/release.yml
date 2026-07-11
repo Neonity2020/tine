@@ -25,9 +25,38 @@ permissions:
   contents: write # create the release + upload assets
 
 jobs:
+  # Cheap deterministic guards run before a tagged release can create its draft.
+  # The same workflow also calls the real offline Flatpak build below; together
+  # these prevent dependency-pin drift from surfacing only after a tag is public.
+  preflight:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - name: Version, Android code, tag, and changelog agree
+        run: node scripts/check-release-preflight.mjs
+      - name: Flatpak offline npm sources are current
+        run: node scripts/check-flatpak-node-sources.mjs
+      - name: Flatpak offline Cargo sources are current
+        run: node scripts/check-flatpak-cargo-sources.mjs
+      - name: lsdoc WASM pin is current
+        run: node scripts/check-wasm-pin.mjs
+      - name: lsdoc oracle bytes and cross-platform EOL policy are current
+        run: node scripts/check-lsdoc-oracle-sync.mjs
+
+  # Reuse the actual privileged, network-disabled Flatpak bundle build. It runs
+  # in parallel with the platform packages but is a hard publication dependency.
+  flatpak:
+    uses: ./.github/workflows/flatpak.yml
+
   # 1) Create the (draft) release once, up front, and hand its id to the matrix.
   #    Only on a tag push — a manual dispatch skips this and just builds (below).
   create-release:
+    needs: preflight
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-22.04
     outputs:
@@ -75,8 +104,11 @@ jobs:
   #    manual dispatch create-release is skipped, releaseId is empty, and
   #    tauri-action builds without uploading (a pure smoke test).
   build:
-    needs: create-release
-    if: always() && (needs.create-release.result == 'success' || needs.create-release.result == 'skipped')
+    needs: [preflight, create-release]
+    if: >-
+      always() &&
+      needs.preflight.result == 'success' &&
+      (needs.create-release.result == 'success' || needs.create-release.result == 'skipped')
     strategy:
       fail-fast: false
       # Serialize platform legs only for tagged releases. tauri-action's latest.json upload is a
@@ -220,11 +252,14 @@ jobs:
   #       ANDROID_KEYSTORE_PASSWORD  keystore password
   #       ANDROID_KEY_ALIAS          key alias (e.g. tine)
   #       ANDROID_KEY_PASSWORD       key password
-  #     Until ANDROID_KEYSTORE_BASE64 is set this job SKIPS (succeeds, builds
-  #     nothing), so it never blocks the desktop release.
+  #     A manual smoke may skip when the secret is absent. A tagged release MUST
+  #     fail and remain draft rather than silently publishing without Android.
   android:
-    needs: create-release
-    if: always() && (needs.create-release.result == 'success' || needs.create-release.result == 'skipped')
+    needs: [preflight, create-release]
+    if: >-
+      always() &&
+      needs.preflight.result == 'success' &&
+      (needs.create-release.result == 'success' || needs.create-release.result == 'skipped')
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -235,8 +270,14 @@ jobs:
         id: sign
         run: echo "enabled=${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}" >> "$GITHUB_OUTPUT"
 
+      - name: Require Android signing for tagged releases
+        if: startsWith(github.ref, 'refs/tags/') && steps.sign.outputs.enabled != 'true'
+        run: |
+          echo "::error::ANDROID_KEYSTORE_BASE64 is required for tagged releases; refusing to publish without Android."
+          exit 1
+
       - name: Note skip
-        if: steps.sign.outputs.enabled != 'true'
+        if: ${{ !startsWith(github.ref, 'refs/tags/') && steps.sign.outputs.enabled != 'true' }}
         run: echo "::notice::ANDROID_KEYSTORE_BASE64 not set — skipping signed Android build. Add the ANDROID_* secrets to enable it."
 
       - uses: actions/setup-java@v4
@@ -385,14 +426,22 @@ jobs:
         run: rm -f "$RUNNER_TEMP/tine-release.jks" src-tauri/gen/android/keystore.properties
 
   publish-release:
-    needs: [create-release, build, android]
+    needs: [preflight, flatpak, create-release, build, android]
     if: >-
       startsWith(github.ref, 'refs/tags/') &&
       needs.create-release.result == 'success' &&
+      needs.preflight.result == 'success' &&
+      needs.flatpak.result == 'success' &&
       needs.build.result == 'success' &&
       needs.android.result == 'success'
     runs-on: ubuntu-22.04
     steps:
+      - uses: actions/checkout@v4
+      - name: Verify complete asset set and updater manifest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node scripts/check-release-assets.mjs "${{ github.ref_name }}"
+
       - name: Publish only the complete release
         uses: actions/github-script@v7
         with:

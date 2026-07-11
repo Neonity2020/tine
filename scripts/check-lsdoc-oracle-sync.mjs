@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const vendorDir = join(root, "src", "devtools", "lsdoc-diff", "vendor");
+const attributes = readFileSync(join(root, ".gitattributes"), "utf8");
 const metadata = JSON.parse(readFileSync(join(vendorDir, "refs.source.json"), "utf8"));
 const cargo = readFileSync(join(root, "crates", "tine-core", "Cargo.toml"), "utf8");
 const pin = cargo.match(/lsdoc\s*=\s*\{[^}]*\btag\s*=\s*"([^"]+)"/)?.[1];
@@ -13,6 +14,9 @@ if (!pin) throw new Error("could not read tine-core's lsdoc tag");
 const bytes = readFileSync(join(vendorDir, "refs.mjs"));
 const digest = createHash("sha256").update(bytes).digest("hex");
 const problems = [];
+if (!/^src\/devtools\/lsdoc-diff\/vendor\/refs\.mjs text eol=lf$/m.test(attributes)) {
+  problems.push(".gitattributes must force the byte-pinned refs.mjs oracle to LF on every platform");
+}
 if (metadata.lsdocTag !== pin) {
   problems.push(`Cargo pins ${pin}, but the vendored reference oracle came from ${metadata.lsdocTag}`);
 }
