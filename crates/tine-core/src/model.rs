@@ -3820,9 +3820,9 @@ impl Graph {
     pub fn sync_file(&self, path: &Path) -> Option<PageEntry> {
         match self.sync_file_checked(path) {
             Ok(entry) => entry,
-            Err(error) => {
+            Err(_error) => {
                 #[cfg(debug_assertions)]
-                eprintln!("file reconcile deferred for {}: {error}", path.display());
+                eprintln!("file reconcile deferred for {}: {_error}", path.display());
                 None
             }
         }
@@ -4157,9 +4157,9 @@ impl Graph {
         // A missing receipt is conservative (the file is treated as external),
         // not data loss. Do not turn a successful page save into a false conflict
         // if this secondary provenance write fails.
-        if let Err(error) = sync.record_projection(&rel, &content) {
+        if let Err(_error) = sync.record_projection(&rel, &content) {
             #[cfg(debug_assertions)]
-            eprintln!("managed-sync projection receipt failed for {rel}: {error}");
+            eprintln!("managed-sync projection receipt failed for {rel}: {_error}");
         }
     }
 
