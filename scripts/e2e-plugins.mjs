@@ -48,10 +48,25 @@ try {
   await page.getByText("Query filter shortcuts v0.1.0", { exact: true }).waitFor();
   await page.getByText(/Signed registry.*automated deterministic.*AI audits/).waitFor();
 
+  const bullet = page.locator(".settings-field", { hasText: "Bullet threading" });
+  const queryFilter = page.locator(".settings-field", { hasText: "Query filter shortcuts" });
+  await bullet.getByText("Low-risk automated pass", { exact: true }).waitFor();
+  await queryFilter.getByText("Manually approved after review", { exact: true }).waitFor();
+  await queryFilter.getByRole("button", { name: "Safety report", exact: true }).click();
+  await queryFilter.getByText(/automated policy quarantined this version/i).waitFor({ timeout: 15_000 });
+  await queryFilter.getByText(/graph-write behavior reviewed after the automated audit found/i).waitFor();
+  const evidenceIds = await queryFilter.locator(".plugin-safety-report code[title]").evaluateAll((elements) =>
+    elements.map((element) => element.getAttribute("title"))
+  );
+  if (evidenceIds.length !== 3 || !evidenceIds.slice(1).every((value) => /^[0-9a-f]{64}$/.test(value ?? ""))) {
+    throw new Error(`safety report did not expose verified source/package/report identities: ${evidenceIds.join(", ")}`);
+  }
+
   mkdirSync("screenshots", { recursive: true });
+  await page.screenshot({ path: "screenshots/plugins-safety-report.png" });
+  await queryFilter.getByRole("button", { name: "Hide safety report", exact: true }).click();
   await page.screenshot({ path: "screenshots/plugins-light.png" });
 
-  const bullet = page.locator(".settings-field", { hasText: "Bullet threading" });
   await bullet.getByRole("button", { name: "Install", exact: true }).click();
   await page.getByText(/installed disabled/i).waitFor({ timeout: 15_000 });
   await bullet.getByRole("button", { name: "Installed", exact: true }).waitFor();

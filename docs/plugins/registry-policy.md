@@ -34,4 +34,6 @@ forever. Tine Labs is separate and reserved for experiments plausibly headed to 
 
 Reports are public beside the version and distinguish deterministic facts from AI
 judgment. Passing review is not a guarantee. The app always shows identity,
-capabilities, platforms, digest, audit age/status, and source before enablement.
+capabilities, platforms, package/report digests, audit age/status, automated versus
+manual publication, and source before enablement. Report details are fetched lazily
+and displayed only after their signed digest verifies.

@@ -15,7 +15,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   a public-registry safety model. This is not Logseq or Obsidian API compatibility.
 - Add disabled-by-default local and signed-community installation, explicit
   capability review and enable/disable controls, registry revocations, immutable
-  manifest/WASM digests, and desktop/mobile plugin catalogue layouts.
+  manifest/WASM/report digests, expandable safety findings, automatic-versus-manual
+  publication labels, and desktop/mobile plugin catalogue layouts.
 - Publish the first AI-primary examples (bullet threading and query-filter
   shortcuts), a Rust guest SDK/template, deterministic package checker, and
   developer/security documentation.

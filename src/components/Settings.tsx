@@ -100,8 +100,10 @@ import { installedPlugins, pluginManager } from "../plugins/manager";
 import {
   communityPlugins,
   installCommunityPlugin,
+  loadSafetyReport,
   refreshCommunityRegistry,
   registryState,
+  type PluginSafetyReport,
   type RegistryPlugin,
   type RegistryVersion,
 } from "../plugins/registry";
@@ -406,6 +408,30 @@ function PluginsTab(): JSX.Element {
             const version = () => plugin.versions[plugin.versions.length - 1];
             const installed = () =>
               installedPlugins().some((item) => item.manifest.id === plugin.id && item.manifest.version === version().version);
+            const [reportOpen, setReportOpen] = createSignal(false);
+            const [reportState, setReportState] = createSignal<"idle" | "loading" | "ready" | "error">("idle");
+            const [report, setReport] = createSignal<PluginSafetyReport | null>(null);
+            const showReport = async () => {
+              if (reportOpen()) {
+                setReportOpen(false);
+                return;
+              }
+              setReportOpen(true);
+              if (report()) return;
+              setReportState("loading");
+              try {
+                setReport(await loadSafetyReport(plugin, version()));
+                setReportState("ready");
+              } catch {
+                setReportState("error");
+              }
+            };
+            const safetyLabel = () =>
+              version().audit.manualApproval
+                ? "Manually approved after review"
+                : version().audit.risk === "low"
+                  ? "Low-risk automated pass"
+                  : "Automated review passed";
             return (
               <div class="settings-field">
                 <div class="settings-field-row">
@@ -422,9 +448,67 @@ function PluginsTab(): JSX.Element {
                   {plugin.description}<br />
                   {plugin.license} · {plugin.aiDevelopment === "none" ? "Human-written" : `AI-${plugin.aiDevelopment}`} · {version().platforms.join(", ")}
                   <br />Capabilities: {version().capabilities.length ? version().capabilities.join(", ") : "none"}
-                  {" · "}<button class="settings-link" onClick={() => void backend().openExternal(version().audit.url)}>Audit</button>
                   {" · "}<button class="settings-link" onClick={() => void backend().openExternal(plugin.source)}>Source</button>
                 </div>
+                <div class="plugin-safety-row">
+                  <span
+                    class="plugin-safety-badge"
+                    classList={{ manual: version().audit.manualApproval, low: !version().audit.manualApproval }}
+                  >
+                    {safetyLabel()}
+                  </span>
+                  <span class="settings-hint">Checked {version().audit.checkedAt.slice(0, 10)}</span>
+                  <button class="settings-link" onClick={() => void showReport()}>
+                    {reportOpen() ? "Hide safety report" : "Safety report"}
+                  </button>
+                </div>
+                <Show when={reportOpen()}>
+                  <div class="plugin-safety-report">
+                    <Show when={reportState() === "loading"}>
+                      <div class="settings-hint">Verifying the signed report…</div>
+                    </Show>
+                    <Show when={reportState() === "error"}>
+                      <div class="settings-hint" style={{ color: "var(--danger, #c44)" }}>
+                        The report could not be fetched and digest-verified.
+                      </div>
+                    </Show>
+                    <Show when={report()} keyed>
+                      {(safety) => (
+                        <>
+                          <p>{safety.summary}</p>
+                          <Show when={safety.manualApproval} keyed>
+                            {(approval) => (
+                              <div class="plugin-safety-manual">
+                                The automated policy quarantined this version. {approval.by} approved it after review:
+                                {" “"}{approval.note}{"”"}
+                              </div>
+                            )}
+                          </Show>
+                          <Show when={safety.findings.length > 0}>
+                            <div class="plugin-safety-findings">
+                              <For each={safety.findings}>
+                                {(finding) => (
+                                  <div class="plugin-safety-finding">
+                                    <span class={`plugin-finding-severity severity-${finding.severity}`}>{finding.severity}</span>
+                                    <div><strong>{finding.title}</strong><br /><span>{finding.impact}</span></div>
+                                  </div>
+                                )}
+                              </For>
+                            </div>
+                          </Show>
+                          <div class="settings-hint">
+                            Source <code title={safety.sourceCommit}>{safety.sourceCommit.slice(0, 12)}</code>
+                            {" · Package "}<code title={version().sha256}>{version().sha256.slice(0, 12)}</code>
+                            {" · Report "}<code title={version().audit.sha256}>{version().audit.sha256.slice(0, 12)}</code>
+                            {" · "}{safety.areasReviewed.length} areas reviewed
+                            {" · "}<button class="settings-link" onClick={() => void backend().openExternal(version().audit.url)}>Raw report</button>
+                          </div>
+                          <div class="settings-hint">Automated review is evidence, not a guarantee.</div>
+                        </>
+                      )}
+                    </Show>
+                  </div>
+                </Show>
               </div>
             );
           }}

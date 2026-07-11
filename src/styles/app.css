@@ -1489,6 +1489,78 @@ body {
   line-height: 1.5;
   max-width: 62ch;
 }
+.plugin-safety-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 7px 10px;
+  margin-top: 7px;
+}
+.plugin-safety-badge,
+.plugin-finding-severity {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  line-height: 1.5;
+  padding: 1px 8px;
+  text-transform: uppercase;
+}
+.plugin-safety-badge.low {
+  color: #25633b;
+  background: rgba(46, 160, 88, 0.14);
+}
+.plugin-safety-badge.manual {
+  color: #805500;
+  background: rgba(217, 147, 10, 0.16);
+}
+.plugin-safety-report {
+  margin-top: 9px;
+  padding: 11px 12px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.plugin-safety-report p {
+  margin: 0 0 9px;
+}
+.plugin-safety-manual {
+  margin: 8px 0;
+  padding: 7px 9px;
+  border-left: 3px solid #d9930a;
+  background: rgba(217, 147, 10, 0.08);
+}
+.plugin-safety-findings {
+  display: grid;
+  gap: 7px;
+  margin: 9px 0;
+}
+.plugin-safety-finding {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: 8px;
+}
+.plugin-finding-severity {
+  margin-top: 1px;
+  color: var(--text-secondary);
+  background: var(--bg-tertiary);
+}
+.plugin-finding-severity.severity-low,
+.plugin-finding-severity.severity-medium {
+  color: #805500;
+  background: rgba(217, 147, 10, 0.16);
+}
+.plugin-finding-severity.severity-high,
+.plugin-finding-severity.severity-critical {
+  color: var(--danger, #b33);
+  background: rgba(190, 45, 45, 0.14);
+}
 /* Segmented two-option control (e.g. task workflow). */
 .settings-segment {
   display: inline-flex;

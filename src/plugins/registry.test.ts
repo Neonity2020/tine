@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseRegistryIndex } from "./registry";
+import { parseRegistryIndex, parseSafetyReport } from "./registry";
 
 const version = {
   version: "0.1.0",
@@ -10,7 +10,15 @@ const version = {
   manifestSha256: "b".repeat(64),
   manifestUrl: "https://example.invalid/manifest.json",
   wasmUrl: "https://example.invalid/plugin.wasm",
-  audit: { status: "passed", url: "https://example.invalid/audit.json" },
+  audit: {
+    status: "passed",
+    url: "https://example.invalid/audit.json",
+    sha256: "c".repeat(64),
+    risk: "review",
+    automatedDisposition: "quarantine",
+    manualApproval: true,
+    checkedAt: "2026-07-11T00:00:00Z",
+  },
   publishedAt: "2026-07-11T00:00:00Z",
 };
 const plugin = {
@@ -43,5 +51,35 @@ describe("signed plugin registry parsing", () => {
     expect(() =>
       parseRegistryIndex({ ...root, plugins: [{ ...plugin, versions: [{ ...version, wasmUrl: "http://unsafe/plugin.wasm" }] }] })
     ).toThrow(/https/);
+  });
+
+  it("parses a digest-bound manual safety review and rejects summary drift", () => {
+    const parsed = parseRegistryIndex({
+      schemaVersion: 1,
+      generatedAt: "2026-07-11T00:00:00Z",
+      plugins: [plugin],
+      revocations: [],
+    });
+    const registeredPlugin = parsed.plugins[0];
+    const registeredVersion = registeredPlugin.versions[0];
+    const report = {
+      format: "tine-plugin-audit-result/v1",
+      submission: { pluginId: plugin.id, version: version.version, commit: "d".repeat(40) },
+      commitVerified: "d".repeat(40),
+      disposition: "quarantine",
+      checker: { status: "passed", risk: "review", checkedAt: "2026-07-11T00:00:00Z" },
+      aiReview: {
+        disposition: "pass",
+        uncertain: false,
+        summary: "A focused write was reviewed.",
+        findings: [{ severity: "low", title: "Focused write", impact: "Only the focused block can change." }],
+        areasReviewed: ["graph effects"],
+      },
+      manualApproval: { by: "Sol", note: "Reviewed after a scope fix.", approvedAt: "2026-07-11T00:10:00Z" },
+    };
+    expect(parseSafetyReport(report, registeredPlugin, registeredVersion).manualApproval?.note).toMatch(/scope fix/);
+    expect(() =>
+      parseSafetyReport({ ...report, checker: { ...report.checker, risk: "low" } }, registeredPlugin, registeredVersion)
+    ).toThrow(/signed summary/);
   });
 });

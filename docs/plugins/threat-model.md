@@ -44,8 +44,10 @@ disables the plugin without blocking graph startup.
 The registry signs separate digests for the manifest and WASM bytes rather than
 trusting mutable download URLs. Tine verifies both before installation, so neither
 the executable nor its displayed authority/contribution metadata can drift under a
-valid index signature. Revocation is per immutable version, reasoned, timestamped,
-and signature-verified by Tine.
+valid index signature. The complete automated safety report has its own signed
+digest; Tine verifies it before showing findings, risk, or manual-approval
+provenance. Revocation is per immutable version, reasoned, timestamped, and
+signature-verified by Tine.
 
 ## Local audit boundary
 
