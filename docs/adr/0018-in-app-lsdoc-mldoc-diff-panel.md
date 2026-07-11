@@ -45,7 +45,10 @@ port of `graph-check.mjs` against the user's own graph, entirely locally:
   on what a divergence is.
 - Divergence snippets are shown/copied **only after anonymization is re-verified to
   still reproduce the divergence** — the privacy guarantee for sharing from a private
-  graph.
+  graph. Source paths are replaced with neutral labels. For URLs, anonymization
+  preserves only the literal `http://` / `https://` scheme needed for parser
+  recognition; host, path, query, and fragment content are scrubbed before the
+  re-verification pass.
 
 ## Consequences
 

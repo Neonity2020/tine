@@ -15,6 +15,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Help improve Tine reports no longer expose page names or private URLs.**
+  Source files use neutral labels, URL schemes remain parseable while hosts and
+  paths are scrubbed, URL-sensitive divergences survive anonymization more
+  reliably, and copied reports record the Tine version used for the comparison.
 - **Release CI catches platform-only compilation and stale Flatpak sources before
   tagging.** Windows and Android compile guards now run on ordinary CI, the
   Flatpak offline npm manifest is checked against `package-lock.json`, and a
