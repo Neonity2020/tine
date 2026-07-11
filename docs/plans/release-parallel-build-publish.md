@@ -1,8 +1,11 @@
 # Plan — parallel release builds, single publisher
 
-**Status:** planned after v0.5.6; not implemented. This is the resume-from-cold
-spec for replacing tagged desktop serialization without reopening the
-`latest.json` race.
+**Status:** implemented on `master` in `dd6e0e0` (2026-07-11). Manual release
+run [29165451611](https://github.com/martinkoutecky/tine/actions/runs/29165451611)
+proved all five desktop builds + Android overlap, the real Flatpak build passes,
+and candidate assembly produces exactly 21 assets / 12 updater entries without
+touching GitHub Releases. The first real tagged publisher run is intentionally
+the next explicitly authorized release; no dummy public version was cut.
 
 ## Outcome
 
@@ -26,9 +29,9 @@ Expected effect: tagged release wall time becomes approximately the slowest
 platform build plus a short publication step, rather than the sum of five
 desktop build times.
 
-## Why the current workflow serializes
+## Why the old workflow serialized
 
-`tauri-apps/tauri-action` currently builds and publishes in one step. Each matrix
+`tauri-apps/tauri-action` built and published in one step. Each matrix
 leg reads the draft's current `latest.json`, adds its platform, then deletes and
 re-uploads the file. Parallel legs race: one can overwrite another platform or
 collide on the same release asset. `max-parallel: 1` prevents corruption, but it

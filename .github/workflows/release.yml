@@ -156,8 +156,8 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           # macOS/Windows builds are UNSIGNED for now (that's OS code-signing, not
           # the updater key above). Do NOT set the APPLE_* signing env vars here
-          # while the secrets are empty — tauri-action sees an (empty)
-          # APPLE_CERTIFICATE as "signing requested" and fails on `security import`.
+          # while the secrets are empty — the macOS bundler can interpret an empty
+          # APPLE_CERTIFICATE as "signing requested" and fail on `security import`.
           # To enable notarized macOS builds later, add these repo secrets AND
           # re-add the matching env lines:
           #   APPLE_CERTIFICATE (base64 .p12), APPLE_CERTIFICATE_PASSWORD,
