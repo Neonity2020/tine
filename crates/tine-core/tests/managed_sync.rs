@@ -274,3 +274,22 @@ fn managed_restore_rejects_pre_identity_backups_before_writing_an_operation() {
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     assert_eq!(update_chunks(dir.path()).len(), before);
 }
+
+#[test]
+fn watcher_turns_an_external_file_deletion_into_an_operation() {
+    let dir = TestDir::new("external-delete");
+    let path = dir.path().join("pages/Page.md");
+    fs::write(&path, "- delete in Logseq\n").unwrap();
+    let graph = Graph::open(dir.path());
+    graph
+        .enable_managed_sync(Uuid::new_v4(), Uuid::new_v4())
+        .unwrap();
+    let before = update_chunks(dir.path()).len();
+
+    fs::remove_file(&path).unwrap();
+    graph.sync_deleted_file(&path).unwrap();
+
+    assert_eq!(update_chunks(dir.path()).len(), before + 1);
+    graph.project_all_managed_sync().unwrap();
+    assert!(!path.exists());
+}

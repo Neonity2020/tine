@@ -3818,30 +3818,37 @@ impl Graph {
     /// cache (i.e. a real external change) — Tine's own writes keep the cache in
     /// sync, so they return None. No-op if the cache hasn't been built yet.
     pub fn sync_file(&self, path: &Path) -> Option<PageEntry> {
-        let lock = self.page_lock(path);
-        let _guard = lock.lock().unwrap();
-        let mut content = fs::read_to_string(path).ok()?;
-        let imported_external = match self.reconcile_managed_external_locked(path, &content, None) {
-            Ok(changed) => changed,
+        match self.sync_file_checked(path) {
+            Ok(entry) => entry,
             Err(error) => {
                 #[cfg(debug_assertions)]
-                eprintln!(
-                    "managed-sync external import deferred for {}: {error}",
-                    path.display()
-                );
-                false
+                eprintln!("file reconcile deferred for {}: {error}", path.display());
+                None
             }
+        }
+    }
+
+    /// Checked watcher entrypoint. When managed sync is active, an unexplained
+    /// file must be durably imported before its bytes enter the live cache.
+    pub fn sync_file_checked(&self, path: &Path) -> io::Result<Option<PageEntry>> {
+        let lock = self.page_lock(path);
+        let _guard = lock.lock().unwrap();
+        let mut content = match fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
         };
+        let imported_external = self.reconcile_managed_external_locked(path, &content, None)?;
         if imported_external {
-            content = fs::read_to_string(path).ok()?;
+            content = fs::read_to_string(path)?;
         }
         // The watcher consumes the self-write marker (one-shot) so the map stays
         // bounded to in-flight writes.
         let reconciled = self.sync_file_content(path, &content, true);
         if imported_external {
-            reconciled.or_else(|| self.entry_for_path(path))
+            Ok(reconciled.or_else(|| self.entry_for_path(path)))
         } else {
-            reconciled
+            Ok(reconciled)
         }
     }
 
@@ -4042,6 +4049,19 @@ impl Graph {
         };
         self.cache_remove(&entry.name, entry.kind);
         was_cached.then_some(entry)
+    }
+
+    /// Checked watcher path for an externally removed projection. A Tine delete
+    /// or rename already removed the CRDT page/path, so this is idempotent; an OG
+    /// Logseq/provider deletion becomes operation truth before cache eviction.
+    pub fn sync_deleted_file(&self, path: &Path) -> io::Result<Option<PageEntry>> {
+        let lock = self.page_lock(path);
+        let _guard = lock.lock().unwrap();
+        if path.exists() {
+            return Ok(None);
+        }
+        self.commit_managed_delete(path)?;
+        Ok(self.forget_file(path))
     }
 
     /// Count blocks that still need a durable on-disk identity before managed
