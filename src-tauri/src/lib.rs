@@ -142,6 +142,18 @@ mod multi_window_tests {
         let argv = vec!["tine".to_string(), "--capture".to_string()];
         assert!(forwarded_graph_path(&argv, "/tmp").is_none());
     }
+
+    #[test]
+    fn graph_window_creation_stays_out_of_synchronous_windows_handlers() {
+        // Windows WebView2 can deadlock the process if WebviewWindowBuilder is
+        // reached from a synchronous command or event callback. Guard both
+        // entry points: Shift-click IPC and single-instance argv forwarding.
+        let graph_source = include_str!("graph.rs");
+        let lib_source = include_str!("lib.rs");
+        assert!(graph_source.contains("pub(crate) async fn open_graph_window("));
+        assert!(lib_source.contains("tauri::async_runtime::spawn(async move"));
+        assert!(lib_source.contains("open_graph_window(path, command_app.clone(), state).await"));
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -240,8 +252,14 @@ pub fn run() {
             if argv.iter().any(|a| a == "--capture") {
                 show_capture(app);
             } else if let Some(path) = forwarded_graph_path(&argv, &cwd) {
-                let state = app.state::<AppState>();
-                let _ = open_graph_window(path, app.clone(), state);
+                // WebView2 deadlocks if a WebviewWindow is built directly from
+                // a synchronous event handler. Use the async command path so
+                // Windows' event loop remains available while Tauri creates it.
+                let command_app = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    let state = command_app.state::<AppState>();
+                    let _ = open_graph_window(path, command_app.clone(), state).await;
+                });
             } else {
                 focus_last_graph_window(app);
             }

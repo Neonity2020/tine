@@ -108,7 +108,7 @@ import { editorCommandFor } from "../keybindings";
 import { cycleMarkerSmart, toggleTaskDone } from "../editor/repeat";
 import { taskCheckboxState } from "../markers";
 import { applyTemplateVars } from "../editor/templateVars";
-import { caretAtFirstRow, caretAtLastRow } from "../editor/caretRows";
+import { caretAtFirstRow, caretAtLastRow, caretOffsetOnLastRow } from "../editor/caretRows";
 import { splitProps, joinProps, isBuiltinHidden, isSheetCellHidden, hideAll, caretInFence } from "../editor/properties";
 import { normalizePlanning } from "../editor/planning";
 import { caretOnOpeningFence } from "../editor/fences";
@@ -121,7 +121,7 @@ import { isRecordingAudio, setRecordingAudio, base64ToBytes } from "../mediaCapt
 import { sheetConfig } from "../sheet/config";
 import { SheetCellContext } from "../sheet/context";
 import { appendSheetCellChild, structuralSheetPasteNode } from "../sheet/mutations";
-import { cellBlockId, cellOwner, selectCellAfterEdit, moveCellAfterEdit, selectTopRowSeamAfterEdit } from "../sheet/selection";
+import { cellBlockId, cellOwner, cellSurfaceKey, selectCellAfterEdit, moveCellAfterEdit, selectTopRowSeamAfterEdit } from "../sheet/selection";
 import { forbidsEditEntry } from "../editor/editTargets";
 import { SheetGrid } from "./SheetGrid";
 import { SheetTable } from "./SheetTable";
@@ -1260,6 +1260,18 @@ export function Editor(props: { id: string }): JSX.Element {
 
   const MAX_BYTE_CLIPBOARD_FILE = 64 * 1024 * 1024;
   const MAX_CLIPBOARD_FILES = 32;
+  let pasteMultilineInline = false;
+  let pasteMultilineInlineToken = 0;
+  let pasteMultilineInlineTimer: number | undefined;
+  const clearPasteMultilineInline = () => {
+    pasteMultilineInline = false;
+    pasteMultilineInlineToken += 1;
+    if (pasteMultilineInlineTimer !== undefined) {
+      window.clearTimeout(pasteMultilineInlineTimer);
+      pasteMultilineInlineTimer = undefined;
+    }
+  };
+  onCleanup(clearPasteMultilineInline);
 
   /** Import file-manager paths without materializing their bytes in the WebView.
    * If a platform exposes only browser File objects, save those sequentially so
@@ -1274,8 +1286,8 @@ export function Editor(props: { id: string }): JSX.Element {
         nativeUnavailable = true;
         return { files: [], skipped: 0, truncated: false };
       });
-      skipped += native.skipped;
       if (native.files.length) {
+        skipped += native.skipped;
         for (const file of native.files) {
           try {
             stored.push(await trackAssetWrite(backend().importAsset(file.path, assetFileName(file.name))));
@@ -1291,18 +1303,23 @@ export function Editor(props: { id: string }): JSX.Element {
         // such as Chromium's generic "image.png".
         if (files.length === 1 && files[0].type.startsWith("image/")) {
           const image = files[0];
-          if (image.size > MAX_BYTE_CLIPBOARD_FILE) skipped += 1;
+          if (image.size > MAX_BYTE_CLIPBOARD_FILE) skipped += Math.max(1, native.skipped);
           else {
             try {
               const bytes = new Uint8Array(await image.arrayBuffer());
-              if (bytes.length) insertAssetBytes(bytes);
-              else skipped += 1;
+              if (bytes.length && bytes.length <= MAX_BYTE_CLIPBOARD_FILE) {
+                // A Windows bitmap clipboard can appear as one invalid native
+                // path plus one valid WebView2 image File. Once the bytes win,
+                // suppress that native pseudo-entry's skipped count (GH #78).
+                await insertAssetBytes(bytes);
+              } else skipped += Math.max(1, native.skipped);
             } catch {
-              skipped += 1;
+              skipped += Math.max(1, native.skipped);
             }
           }
           return;
         }
+        skipped += native.skipped;
         for (const file of files) {
           if (file.size > MAX_BYTE_CLIPBOARD_FILE) {
             skipped += 1;
@@ -1652,16 +1669,20 @@ export function Editor(props: { id: string }): JSX.Element {
     } else if (typeof want === "number") {
       offset = want;
     } else {
-      // Cross-block Up/Down: land `col` chars into this (target) block's FIRST
-      // (Down) or LAST (Up) source line, clamped to that line — OG parity. Resolved
-      // here against the target's real value, so multi-line planning blocks work.
+      // Cross-block navigation: Down targets the first source line; Up targets
+      // the bottom visual row. The latter uses the mounted textarea's wrapping;
+      // no-layout environments retain the old last-source-line fallback.
       if (want.edge === "first") {
         const nl = v.indexOf("\n");
         const lineLen = nl === -1 ? v.length : nl;
         offset = Math.min(want.col, lineLen);
       } else {
-        const lineStart = v.lastIndexOf("\n") + 1;
-        offset = lineStart + Math.min(want.col, v.length - lineStart);
+        const visualOffset = caretOffsetOnLastRow(ref, want.col);
+        if (visualOffset !== null) offset = visualOffset;
+        else {
+          const lineStart = v.lastIndexOf("\n") + 1;
+          offset = lineStart + Math.min(want.col, v.length - lineStart);
+        }
       }
     }
     const o = Math.min(offset, v.length);
@@ -2010,7 +2031,11 @@ export function Editor(props: { id: string }): JSX.Element {
     const commitAndDescend = () => {
       const nestedGridId = sheetFaceGridId(props.id);
       commit(raw);
-      if (nestedGridId) selectTopRowSeamAfterEdit(nestedGridId);
+      if (nestedGridId) selectTopRowSeamAfterEdit(
+        nestedGridId,
+        0,
+        sheetCell ? cellSurfaceKey(sheetCell.gridId, sheetCell.surfaceId) : undefined
+      );
       else {
         const hostId = cellBlockId(sheetCell);
         const next = hostId
@@ -2090,6 +2115,22 @@ export function Editor(props: { id: string }): JSX.Element {
     const start = ref.selectionStart;
     const end = ref.selectionEnd;
     const raw = ref.value;
+
+    // Ctrl/Cmd+Shift+V is Logseq's "paste as plain text" gesture: multiline
+    // clipboard text stays inside this block instead of becoming an outline.
+    // ClipboardEvent does not expose modifier keys, so remember the preceding
+    // keydown briefly and consume it in onPaste. Do not preventDefault: the
+    // platform still has to perform the native clipboard read and dispatch paste.
+    if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === "v") {
+      clearPasteMultilineInline();
+      pasteMultilineInline = true;
+      const token = ++pasteMultilineInlineToken;
+      pasteMultilineInlineTimer = window.setTimeout(() => {
+        if (pasteMultilineInlineToken === token) clearPasteMultilineInline();
+      }, 1_000);
+      return;
+    }
+    if (pasteMultilineInline) clearPasteMultilineInline();
 
     // Autocomplete popup takes priority for navigation/selection keys.
     if (ac() && acItems().length) {
@@ -2307,8 +2348,8 @@ export function Editor(props: { id: string }): JSX.Element {
         const prev = prevVisible(props.id, outlineScope);
         if (prev) {
           e.preventDefault();
-          // OG parity: keep the caret's column — land it that many chars into the
-          // LAST source line of the previous block (clamped). No sticky goal column.
+          // Keep the caret's column on the previous block's bottom visual row.
+          // Resolution happens after its textarea mounts, when wrapping is known.
           startEditing(prev, { col: start - (before.lastIndexOf("\n") + 1), edge: "last" });
         }
       }
@@ -2342,6 +2383,7 @@ export function Editor(props: { id: string }): JSX.Element {
   };
 
   const onBlur = () => {
+    clearPasteMultilineInline();
     unregisterFocusedEditor();
     if (sheetCanceling) return;
     // A block-move reorder blurs us momentarily — stay in edit mode (the move
@@ -2397,6 +2439,10 @@ export function Editor(props: { id: string }): JSX.Element {
   // imports; browser-only file payloads use a bounded byte fallback. Ordinary
   // text keeps the existing structural/outline/link behavior below.
   const onPaste = (e: ClipboardEvent) => {
+    // Consume the modifier latch on EVERY paste, including file/image pastes.
+    // Otherwise an intercepted shortcut could affect a later context-menu paste.
+    const inlineMultiline = pasteMultilineInline;
+    clearPasteMultilineInline();
     const text = e.clipboardData?.getData("text/plain") ?? "";
     // File managers commonly include path text alongside the real file-list
     // clipboard flavor. Claim the paste synchronously so those paths never land
@@ -2415,6 +2461,19 @@ export function Editor(props: { id: string }): JSX.Element {
     if (hasFileFlavor) {
       e.preventDefault();
       void pasteClipboardFiles(eventFiles);
+      return;
+    }
+    if (inlineMultiline && text.includes("\n")) {
+      e.preventDefault();
+      const start = ref.selectionStart;
+      const newRaw = ref.value.slice(0, start) + text + ref.value.slice(ref.selectionEnd);
+      commit(newRaw);
+      const pos = start + text.length;
+      queueMicrotask(() => {
+        ref.value = newRaw;
+        ref.setSelectionRange(pos, pos);
+        autosize();
+      });
       return;
     }
     // A structural sheet copy (multiple grid cells) pasted into a block editor
@@ -2486,29 +2545,6 @@ export function Editor(props: { id: string }): JSX.Element {
     //      fall back to reading the OS clipboard via the Tauri plugin.
     // The DataTransfer is only valid synchronously, so grab the File now (its
     // reference stays live for the async arrayBuffer read).
-    const imageItem = clipboardItems.find(
-      (it) => it.kind === "file" && it.type.startsWith("image/")
-    );
-    const imageFile = imageItem?.getAsFile() ?? null;
-    if (imageFile) {
-      e.preventDefault(); // no text to paste; keep the raw file bytes out of the block
-      const toastId = pushToast("Pasting image…", "info");
-      void (async () => {
-        let bytes: Uint8Array | null = null;
-        try {
-          bytes = new Uint8Array(await imageFile.arrayBuffer());
-        } catch {
-          bytes = null;
-        } finally {
-          dismissToast(toastId);
-        }
-        // Don't pass file.name: Chromium synthesizes "image.png" for a pasted
-        // screenshot, which would name it image.png/image_1.png. Fall through to
-        // the same timestamp+uniqueness naming a Linux clipboard paste gets.
-        if (bytes && bytes.length) insertAssetBytes(bytes);
-      })();
-      return;
-    }
     // No image File in the event → try the OS clipboard (the Linux path). Show an
     // immediate "Pasting image…" hint when the clipboard clearly holds one (so
     // there's no dead 1–2s), then render it instantly from the in-memory bytes
@@ -2546,6 +2582,9 @@ export function Editor(props: { id: string }): JSX.Element {
         onInput={onInput}
         onCompositionEnd={onCompositionEnd}
         onKeyDown={onKeyDown}
+        onKeyUp={(e) => {
+          if (e.key.toLowerCase() === "v") clearPasteMultilineInline();
+        }}
         onFocus={() => {
           noteSurfaceFocused(surfaceKey);
           registerFocusedEditorBridge();

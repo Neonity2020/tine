@@ -1,4 +1,4 @@
-import { For, Show, createEffect, createMemo, createSignal, onCleanup, onMount, untrack, type JSX } from "solid-js";
+import { For, Show, createEffect, createMemo, createSignal, onCleanup, onMount, untrack, useContext, type JSX } from "solid-js";
 import { observeNear, unobserveNear } from "../lazyObserve";
 import { blockPageReadOnly, doc, formatForBlock, formatForPage, pageByName, readPageProperty } from "../store";
 import { facetsFromDto, facetsOf, type Facets } from "../render/facets";
@@ -11,10 +11,13 @@ import {
   cellSel,
   cellSurfaceKey,
   addEmptyTagColumn,
+  clearSelectedSheetInstance,
   clearEmptyTagColumns,
   emptyTagColumnsForBoard,
   pruneEmptyTagColumns,
   registerSheetViewAdapter,
+  rebaseSelectedCell,
+  rebaseSelectedRange,
   setCellSel,
   startCellEditing,
   type CellSel,
@@ -34,21 +37,17 @@ import {
 } from "../sheet/fields";
 import { parseFields, sheetConfig, type FieldSpec } from "../sheet/config";
 import { formulasOf, mergeFormulas } from "../sheet/formulaFields";
-import { createFormulaFilterMemo } from "../sheet/formulaEval";
+import { createFormulaFilterMemo, formulaRowKey, liveFormulaRowNode, type FormulaEvalRow } from "../sheet/formulaEval";
 import { setBoardGroupBy } from "../sheet/mutations";
 import { MARKERS } from "../markers";
 import { graphEpoch, openDatePicker, openSheetCellContextMenu, openSheetContextMenu, pushToast, workflow } from "../ui";
 import { blockBackgroundColor } from "../blockColors";
-import type { BlockDto, RefGroup } from "../types";
+import type { RefGroup } from "../types";
 import { Editor, SurfaceContext } from "./Block";
 import { isBareTagName } from "../tags";
 import { hydrateVisibleQueryPages, SHEET_RENDER_PAGE } from "../sheet/queryHydration";
 
-interface RowRecord {
-  id: string;
-  page: string;
-  dto?: BlockDto;
-}
+interface RowRecord extends FormulaEvalRow {}
 
 interface BoardColumn {
   key: string | null;
@@ -56,10 +55,15 @@ interface BoardColumn {
   rows: RowRecord[];
 }
 
+function boardColumnId(key: string | null): string {
+  return JSON.stringify(key);
+}
+
 const NONE_LABEL = "(none)";
 
 export const __sheetBoardTestHooks: {
   onGroupingRowWalk?: (rowId: string) => void;
+  onPointIndexRow?: (rowId: string) => void;
 } = {};
 
 export function SheetBoard(props: {
@@ -69,6 +73,7 @@ export function SheetBoard(props: {
   groups?: readonly RefGroup[];
   schemaPage?: string;
 }): JSX.Element {
+  const surfaceId = useContext(SurfaceContext);
   const groupBy = createMemo<FieldId>(() => {
     const raw = props.groupBy || "state";
     const normalized = raw.startsWith("formula.") ? `formula:${raw.slice("formula.".length)}` : raw;
@@ -109,7 +114,7 @@ export function SheetBoard(props: {
         page: doc.byId[id]?.page ?? doc.byId[props.ownerId]?.page ?? "",
       }));
     }
-    return (props.groups ?? []).flatMap((g) => g.blocks.map((b) => ({ id: b.id, page: g.page, dto: b })));
+    return (props.groups ?? []).flatMap((g) => g.blocks.map((b) => ({ id: b.id, page: g.page, kind: g.kind, dto: b })));
   });
   const filterState = createFormulaFilterMemo({
     rows: allRows,
@@ -146,16 +151,87 @@ export function SheetBoard(props: {
       .map((tag): BoardColumn => ({ key: tag, label: tag, rows: [] }));
     return [...cols, ...empty];
   });
+  const dragVersion = createMemo(() => ({ groups: props.groups, groupBy: groupBy(), columns: columns() }));
+  const pointIndex = createMemo(() => {
+    const membership = new Map<string, { row: number; col: number }>();
+    const first = new Map<string, { row: number; col: number }>();
+    const rowOrder = new Map<string, number>();
+    const byBlockId = new Map<string, { row: number; col: number; rowKey: string; columnId: string } | null>();
+    rows().forEach((candidate, index) => rowOrder.set(formulaRowKey(candidate), index));
+    columns().forEach((column, col) => {
+      const columnId = boardColumnId(column.key);
+      column.rows.forEach((candidate, row) => {
+        __sheetBoardTestHooks.onPointIndexRow?.(candidate.id);
+        const point = { row, col };
+        const rowKey = formulaRowKey(candidate);
+        membership.set(JSON.stringify([rowKey, columnId]), point);
+        if (!first.has(rowKey)) first.set(rowKey, point);
+        if (liveFormulaRowNode(candidate)) {
+          if (byBlockId.has(candidate.id)) byBlockId.set(candidate.id, null);
+          else byBlockId.set(candidate.id, { ...point, rowKey, columnId });
+        }
+      });
+    });
+    return { membership, first, rowOrder, byBlockId };
+  });
+  const pointForRowId = (rowId: string, preferredColumnId?: string) => {
+    if (preferredColumnId !== undefined) {
+      const point = pointIndex().membership.get(JSON.stringify([rowId, preferredColumnId]));
+      if (point) return point;
+      if (groupBy() === "tags") return null;
+    }
+    return pointIndex().first.get(rowId) ?? null;
+  };
+  createEffect(() => {
+    const sel = cellSel();
+    if (!sel || sel.gridId !== props.ownerId || sel.surfaceId !== surfaceId) return;
+    if (sel.kind === "cell" && sel.rowId) {
+      const point = pointForRowId(sel.rowId, sel.columnId);
+      if (point) rebaseSelectedCell(props.ownerId, surfaceId, sel.rowId, point, boardColumnId(columns()[point.col].key));
+      else clearSelectedSheetInstance(props.ownerId, surfaceId);
+    } else if (sel.kind === "range" && sel.anchorRowId && sel.focusRowId) {
+      const anchor = pointForRowId(sel.anchorRowId, sel.anchorColumnId);
+      const focus = pointForRowId(sel.focusRowId, sel.focusColumnId);
+      if (anchor && focus) {
+        rebaseSelectedRange(
+          props.ownerId,
+          surfaceId,
+          sel.anchorRowId,
+          anchor,
+          sel.focusRowId,
+          focus,
+          boardColumnId(columns()[anchor.col].key),
+          boardColumnId(columns()[focus.col].key)
+        );
+      } else clearSelectedSheetInstance(props.ownerId, surfaceId);
+    }
+  });
   const [renderLimit, setRenderLimit] = createSignal(SHEET_RENDER_PAGE);
   createEffect(() => {
     props.groups;
     setRenderLimit(SHEET_RENDER_PAGE);
   });
   const displayedRows = createMemo(() => rows().slice(0, renderLimit()));
-  const displayedIds = createMemo(() => new Set(displayedRows().map((row) => row.id)));
+  const displayedIds = createMemo(() => new Set(displayedRows().map(formulaRowKey)));
   const displayedColumns = createMemo(() => {
     const ids = displayedIds();
-    return columns().map((column) => ({ ...column, rows: column.rows.filter((row) => ids.has(row.id)) }));
+    return columns().map((column) => ({ ...column, rows: column.rows.filter((row) => ids.has(formulaRowKey(row))) }));
+  });
+  const ensureDisplayedThrough = (row: number) => {
+    if (row < 0 || row < displayedRows().length) return;
+    setRenderLimit(Math.min(rows().length, Math.ceil((row + 1) / SHEET_RENDER_PAGE) * SHEET_RENDER_PAGE));
+  };
+  createEffect(() => {
+    const sel = cellSel();
+    if (!sel || sel.gridId !== props.ownerId || sel.surfaceId !== surfaceId) return;
+    if (sel.kind === "cell" && sel.rowId) {
+      const row = pointIndex().rowOrder.get(sel.rowId);
+      if (row !== undefined) ensureDisplayedThrough(row);
+    } else if (sel.kind === "range" && sel.anchorRowId && sel.focusRowId) {
+      const anchor = pointIndex().rowOrder.get(sel.anchorRowId);
+      const focus = pointIndex().rowOrder.get(sel.focusRowId);
+      if (anchor !== undefined && focus !== undefined) ensureDisplayedThrough(Math.max(anchor, focus));
+    }
   });
   createEffect(() => {
     if (groupBy() !== "tags") return;
@@ -185,7 +261,7 @@ export function SheetBoard(props: {
 
   const selected = (col: number, row: number) => {
     const sel = cellSel();
-    if (!sel || sel.gridId !== props.ownerId) return false;
+    if (!sel || sel.gridId !== props.ownerId || (sel.surfaceId && sel.surfaceId !== surfaceId)) return false;
     if (sel.kind === "cell") return sel.col === col && sel.row === row;
     if (sel.kind === "range") return sel.focus.col === col && sel.focus.row === row;
     return false;
@@ -198,18 +274,32 @@ export function SheetBoard(props: {
 
   const moveCard = (sel: CellSel, dir: "left" | "right"): boolean => {
     const cols = columns();
-    const from = cols[sel.col];
-    const row = from?.rows[sel.row];
-    const targetCol = dir === "left" ? sel.col - 1 : sel.col + 1;
+    if (sel.rowId && !displayedIds().has(sel.rowId)) return true;
+    const point = sel.rowId ? pointForRowId(sel.rowId, sel.columnId) : { row: sel.row, col: sel.col };
+    if (!point) return true;
+    const from = cols[point.col];
+    const row = sel.rowId ? from?.rows[point.row] : displayedColumns()[point.col]?.rows[point.row];
+    if (!sel.rowId && !row) {
+      clearSelectedSheetInstance(props.ownerId, surfaceId);
+      return true;
+    }
+    const targetCol = dir === "left" ? point.col - 1 : point.col + 1;
     const target = cols[targetCol];
     if (isFormulaField(groupBy())) return true;
-    if (!row || !target || !doc.byId[row.id]) return true;
+    if (!row || !target || !liveFormulaRowNode(row)) return true;
     if (moveRowToColumn(row, from.key, target.key, groupBy())) {
       noteQueryMove(row);
       const nextCols = columns();
       const nextCol = Math.max(0, nextCols.findIndex((c) => c.key === target.key));
       const nextRows = nextCols[nextCol]?.rows ?? [];
-      setCellSel({ gridId: props.ownerId, col: nextCol, row: Math.max(0, nextRows.findIndex((r) => r.id === row.id)) });
+      setCellSel({
+        gridId: props.ownerId,
+        surfaceId,
+        rowId: formulaRowKey(row),
+        columnId: boardColumnId(nextCols[nextCol]?.key ?? null),
+        col: nextCol,
+        row: Math.max(0, nextRows.findIndex((r) => r.id === row.id)),
+      });
     }
     return true;
   };
@@ -217,18 +307,34 @@ export function SheetBoard(props: {
   onMount(() => {
     const dispose = registerSheetViewAdapter(props.ownerId, {
       bounds: () => ({ rows: maxRows(), cols: columns().length }),
-      blockIdAt: (row, col) => columns()[col]?.rows[row]?.id ?? null,
-      cellForBlock: (blockId) => {
-        const cols = columns();
-        for (let col = 0; col < cols.length; col++) {
-          const row = cols[col].rows.findIndex((r) => r.id === blockId);
-          if (row >= 0) return { kind: "cell", gridId: props.ownerId, row, col };
+      rowIdAt: (row, col = 0) => {
+        const candidate = displayedColumns()[col]?.rows[row];
+        return candidate ? formulaRowKey(candidate) : null;
+      },
+      columnIdAt: (_row, col) => columns()[col] ? boardColumnId(columns()[col].key) : null,
+      blockIdAt: (row, col, rowId, columnId) => {
+        if (rowId) {
+          if (!displayedIds().has(rowId)) return null;
+          const point = pointForRowId(rowId, columnId);
+          const candidate = point ? columns()[point.col]?.rows[point.row] : null;
+          return candidate && liveFormulaRowNode(candidate) ? candidate.id : null;
         }
-        return null;
+        const candidate = displayedColumns()[col]?.rows[row];
+        return candidate && liveFormulaRowNode(candidate) ? candidate.id : null;
+      },
+      cellForBlock: (blockId) => {
+        const match = pointIndex().byBlockId.get(blockId);
+        return match && displayedIds().has(match.rowKey)
+          ? { kind: "cell", gridId: props.ownerId, surfaceId, rowId: match.rowKey, columnId: match.columnId, row: match.row, col: match.col }
+          : null;
       },
       activate: (sel) => {
-        const row = columns()[sel.col]?.rows[sel.row];
-        if (!row || !doc.byId[row.id]) return true;
+        if (sel.rowId && !displayedIds().has(sel.rowId)) return true;
+        const point = sel.rowId ? pointForRowId(sel.rowId, sel.columnId) : { row: sel.row, col: sel.col };
+        const row = sel.rowId
+          ? (point ? columns()[point.col]?.rows[point.row] : null)
+          : displayedColumns()[sel.col]?.rows[sel.row];
+        if (!row || !liveFormulaRowNode(row)) return true;
         return false;
       },
       overtype: () => true,
@@ -236,17 +342,30 @@ export function SheetBoard(props: {
         if (dir === "left" || dir === "right") return moveCard(sel, dir);
         return true;
       },
-    });
+    }, surfaceId);
     onCleanup(dispose);
   });
 
-  const dropCard = (row: RowRecord, colIndex: number, targetCol: number | null) => {
-    if (isFormulaField(groupBy())) return;
-    if (targetCol == null || targetCol === colIndex || !doc.byId[row.id]) return;
+  const dropCard = (
+    row: RowRecord,
+    rowKey: string,
+    sourceColumnId: string,
+    targetColumnId: string | null,
+    dragGroupBy: FieldId,
+  ) => {
+    if (dragGroupBy !== groupBy() || isFormulaField(groupBy()) || !displayedIds().has(rowKey)) return;
     const cols = columns();
-    const from = cols[colIndex];
-    const target = cols[targetCol];
-    if (from && target && moveRowToColumn(row, from.key, target.key, groupBy())) noteQueryMove(row);
+    const sourcePoint = pointForRowId(rowKey, sourceColumnId);
+    const source = sourcePoint ? cols[sourcePoint.col] : null;
+    const target = targetColumnId === null
+      ? null
+      : cols.find((column) => boardColumnId(column.key) === targetColumnId) ?? null;
+    const currentRow = sourcePoint ? source?.rows[sourcePoint.row] : null;
+    if (!source || !target || sourceColumnId === targetColumnId ||
+        boardColumnId(source.key) !== sourceColumnId || !currentRow ||
+        formulaRowKey(currentRow) !== rowKey || formulaRowKey(row) !== rowKey ||
+        !liveFormulaRowNode(currentRow)) return;
+    if (moveRowToColumn(currentRow, source.key, target.key, groupBy())) noteQueryMove(currentRow);
   };
 
   const openSheetMenu = (e: MouseEvent) => {
@@ -299,6 +418,7 @@ export function SheetBoard(props: {
           class="sheet-board"
           classList={{ "sheet-filter-broken": !!filterError() }}
           data-sheet-grid-id={props.ownerId}
+          data-sheet-surface-id={surfaceId}
           onContextMenu={openSheetMenu}
         >
           <Show when={filterError()}>
@@ -314,6 +434,7 @@ export function SheetBoard(props: {
                 class="sheet-board-column"
                 classList={{ "sheet-board-drop": drag()?.overCol === colIndex() }}
                 data-board-col={colIndex()}
+                data-board-column-id={boardColumnId(col.key)}
               >
                 <header class="sheet-board-header">
                   <span>{col.label}</span>
@@ -324,13 +445,16 @@ export function SheetBoard(props: {
                     {(row, rowIndex) => (
                       <BoardCard
                         ownerId={props.ownerId}
+                        surfaceId={surfaceId}
                         row={row}
                         groupBy={groupBy()}
+                        columnId={boardColumnId(col.key)}
                         colIndex={colIndex()}
                         rowIndex={rowIndex()}
                         selected={selected(colIndex(), rowIndex())}
                         dragging={drag()?.id === row.id && drag()?.col === colIndex() && drag()?.row === rowIndex()}
                         canMove={!isFormulaField(groupBy())}
+                        dragVersion={dragVersion()}
                         hydrate={props.rowSource === "query"
                           ? () => void hydrateVisibleQueryPages([row], props.groups)
                           : undefined}
@@ -487,7 +611,7 @@ function enumValuesFor(schema: readonly FieldSpec[], field: FieldId): readonly s
 }
 
 function observedFieldsForRows(rows: readonly RowRecord[], includePage: boolean): FieldId[] {
-  const loadedIds = rows.filter((r) => doc.byId[r.id]).map((r) => r.id);
+  const loadedIds = rows.filter((r) => liveFormulaRowNode(r)).map((r) => r.id);
   if (loadedIds.length === rows.length) return fieldIdsForBlocks(loadedIds, { includePage });
   return fieldIdsForRecords(rows, includePage);
 }
@@ -535,7 +659,7 @@ function formulaReferenceName(field: FieldId): string | null {
 }
 
 function recordFacets(row: RowRecord): Facets | null {
-  const n = doc.byId[row.id];
+  const n = liveFormulaRowNode(row);
   if (n) return facetsOf(n.raw, formatForBlock(row.id));
   return row.dto ? facetsFromDto(row.dto) : null;
 }
@@ -564,7 +688,7 @@ function dtoField(row: RowRecord, field: FieldId): string | null {
 }
 
 function rowRaw(row: RowRecord): string {
-  return doc.byId[row.id]?.raw ?? row.dto?.raw ?? "";
+  return liveFormulaRowNode(row)?.raw ?? row.dto?.raw ?? "";
 }
 
 function rowTitle(row: RowRecord): string {
@@ -587,20 +711,30 @@ export function resetBoardCardVirtualizationForTests() {
 
 function BoardCard(props: {
   ownerId: string;
+  surfaceId: string;
   row: RowRecord;
   groupBy: FieldId;
+  columnId: string;
   colIndex: number;
   rowIndex: number;
   selected: boolean;
   dragging: boolean;
   canMove: boolean;
+  dragVersion: unknown;
   hydrate?: () => void;
   setDrag: (v: { id: string; col: number; row: number; overCol: number | null } | null) => void;
-  dropCard: (row: RowRecord, colIndex: number, targetCol: number | null) => void;
+  dropCard: (row: RowRecord, rowKey: string, sourceColumnId: string, targetColumnId: string | null, groupBy: FieldId) => void;
 }): JSX.Element {
-  const cell = (): SheetCellCtx => ({ gridId: props.ownerId, row: props.rowIndex, col: props.colIndex });
+  const cell = (): SheetCellCtx => ({
+    gridId: props.ownerId,
+    surfaceId: props.surfaceId,
+    rowId: formulaRowKey(props.row),
+    columnId: props.columnId,
+    row: props.rowIndex,
+    col: props.colIndex,
+  });
   const editing = () => editingId() === props.row.id && editingOwner() === cellOwner(cell());
-  const fmt = () => (doc.byId[props.row.id] ? formatForBlock(props.row.id) : formatForPage(props.row.page));
+  const fmt = () => (liveFormulaRowNode(props.row) ? formatForBlock(props.row.id) : formatForPage(props.row.page));
   const [near, setNear] = createSignal(renderedBoardCards.has(props.row.id));
   const observeCard = (el: Element) => {
     if (near()) {
@@ -620,10 +754,20 @@ function BoardCard(props: {
   });
 
   const select = () => setCellSel(cell());
+  let cancelActiveDrag: (() => void) | null = null;
+  let observedDragVersion = props.dragVersion;
+  createEffect(() => {
+    const next = props.dragVersion;
+    if (next === observedDragVersion) return;
+    observedDragVersion = next;
+    cancelActiveDrag?.();
+  });
+  onCleanup(() => cancelActiveDrag?.());
 
   const beginPointerDrag = (e: PointerEvent) => {
     if (!props.canMove) return;
     if (e.button !== 0 || e.shiftKey || e.ctrlKey || e.metaKey || e.altKey) return;
+    cancelActiveDrag?.();
     const card = e.currentTarget as HTMLElement;
     if (typeof card.setPointerCapture === "function" && typeof e.pointerId === "number") {
       card.setPointerCapture(e.pointerId);
@@ -632,7 +776,11 @@ function BoardCard(props: {
     const startY = e.clientY;
     let moved = false;
     let overCol: number | null = null;
+    let targetColumnId: string | null = null;
     let ghost: HTMLElement | null = null;
+    const rowKey = formulaRowKey(props.row);
+    const sourceColumnId = props.columnId;
+    const dragGroupBy = props.groupBy;
     const dragState = () => ({ id: props.row.id, col: props.colIndex, row: props.rowIndex, overCol });
     const updateGhost = (ev: PointerEvent) => {
       if (ghost) ghost.style.transform = `translate(${Math.round(ev.clientX + 10)}px, ${Math.round(ev.clientY + 10)}px)`;
@@ -672,22 +820,26 @@ function BoardCard(props: {
       const el = (document.elementFromPoint(ev.clientX, ev.clientY) as HTMLElement | null)?.closest(".sheet-board-column") as HTMLElement | null;
       const idx = el ? Number(el.dataset.boardCol) : NaN;
       const nextOverCol = Number.isFinite(idx) ? idx : null;
-      if (nextOverCol !== overCol) {
+      const nextTargetColumnId = nextOverCol === null ? null : el?.dataset.boardColumnId ?? null;
+      if (nextOverCol !== overCol || nextTargetColumnId !== targetColumnId) {
         overCol = nextOverCol;
+        targetColumnId = nextTargetColumnId;
         props.setDrag(dragState());
       }
       ev.preventDefault();
     };
     const onUp = (ev: PointerEvent) => {
       removeListeners();
+      cancelActiveDrag = null;
       if (moved) {
-        props.dropCard(props.row, props.colIndex, overCol);
+        props.dropCard(props.row, rowKey, sourceColumnId, targetColumnId, dragGroupBy);
         cleanup();
         ev.preventDefault();
       }
     };
     const onCancel = () => {
       removeListeners();
+      cancelActiveDrag = null;
       cleanup();
     };
     const onKeyDown = (ev: KeyboardEvent) => {
@@ -700,6 +852,7 @@ function BoardCard(props: {
     window.addEventListener("pointercancel", onCancel, true);
     window.addEventListener("blur", onCancel, true);
     window.addEventListener("keydown", onKeyDown, true);
+    cancelActiveDrag = onCancel;
   };
 
   const onClick = (e: MouseEvent) => {
@@ -711,14 +864,14 @@ function BoardCard(props: {
     e.preventDefault();
     e.stopPropagation();
     select();
-    if (doc.byId[props.row.id]) startCellEditing(cell());
+    if (liveFormulaRowNode(props.row)) startCellEditing(cell());
   };
   const onChipClick = (field: FieldId, e: MouseEvent) => {
     if (e.button !== 0 || e.ctrlKey || e.metaKey || e.altKey) return;
     e.preventDefault();
     e.stopPropagation();
     select();
-    if (!doc.byId[props.row.id]) return;
+    if (!liveFormulaRowNode(props.row)) return;
     if (field === "priority") cycleField(props.row.id, "priority");
     else if (field === "scheduled" || field === "deadline") {
       const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
@@ -726,14 +879,14 @@ function BoardCard(props: {
     }
   };
   const openCellMenu = (e: MouseEvent) => {
-    if (!doc.byId[props.row.id]) return;
+    if (!liveFormulaRowNode(props.row)) return;
     e.preventDefault();
     e.stopPropagation();
     select();
     openSheetCellContextMenu(e.clientX, e.clientY, props.row.id);
   };
   const openCellMenuFromHandle = (e: MouseEvent) => {
-    if (!doc.byId[props.row.id]) return;
+    if (!liveFormulaRowNode(props.row)) return;
     e.preventDefault();
     e.stopPropagation();
     select();
@@ -750,6 +903,8 @@ function BoardCard(props: {
         "sheet-board-card-static": !props.canMove,
       }}
       data-sheet-grid-id={props.ownerId}
+      data-sheet-surface-id={props.surfaceId}
+      data-sheet-column-id={props.columnId}
       data-row={props.rowIndex}
       data-col={props.colIndex}
       data-block-id={props.row.id}
@@ -768,7 +923,7 @@ function BoardCard(props: {
       style={bgColor() ? { background: bgColor() } : undefined}
       ref={observeCard}
     >
-      <Show when={near() && doc.byId[props.row.id]}>
+      <Show when={near() && liveFormulaRowNode(props.row)}>
         <button
           class="sheet-cell-handle sheet-card-handle"
           title="Card menu"
@@ -800,7 +955,7 @@ function BoardCard(props: {
         }
       >
         <SheetCellContext.Provider value={cell()}>
-          <SurfaceContext.Provider value={cellSurfaceKey(props.ownerId)}>
+          <SurfaceContext.Provider value={cellSurfaceKey(props.ownerId, props.surfaceId)}>
             <Editor id={props.row.id} />
           </SurfaceContext.Provider>
         </SheetCellContext.Provider>
@@ -810,7 +965,7 @@ function BoardCard(props: {
 }
 
 function CardChips(props: { row: RowRecord; groupBy: FieldId; onFieldClick: (field: FieldId, e: MouseEvent) => void }): JSX.Element {
-  const value = (field: FieldId) => (doc.byId[props.row.id] ? readField(props.row.id, field)?.text ?? "" : dtoField(props.row, field) ?? "");
+  const value = (field: FieldId) => (liveFormulaRowNode(props.row) ? readField(props.row.id, field)?.text ?? "" : dtoField(props.row, field) ?? "");
   const priority = () => props.groupBy === "priority" ? "" : value("priority");
   const scheduled = () => props.groupBy === "scheduled" ? "" : value("scheduled");
   const deadline = () => props.groupBy === "deadline" ? "" : value("deadline");

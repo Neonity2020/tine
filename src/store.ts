@@ -34,6 +34,7 @@ import { OPEN_MARKERS, MARKER_RE } from "./markers";
 import { editingId, endEdit, startEditing } from "./editorController";
 import { notifyModeReset, notifyOutlineSelectionStarted } from "./modeHooks";
 import { sheetConfigFromRaw } from "./sheet/config";
+import { clearMatrixDimensionCache, invalidateAllMatrixDimensions } from "./sheet/matrix";
 import { applyMarkerTransition } from "./logbook";
 import {
   markDirty,
@@ -276,6 +277,7 @@ function upsertPage(dto: PageDto) {
       else s.pages.push(fp);
     })
   );
+  invalidateAllMatrixDimensions();
   if (replacing) invalidateUndoForPage(dto.name);
 }
 
@@ -345,6 +347,7 @@ export function forgetPage(name: string) {
       if (fi >= 0) s.feed.splice(fi, 1);
     })
   );
+  invalidateAllMatrixDimensions();
 }
 
 /** Delete a page: tombstone it (so any pending/in-flight save can't recreate the
@@ -444,6 +447,7 @@ function evictIfNeeded() {
       }
     })
   );
+  invalidateAllMatrixDimensions();
 }
 
 /** Clear the entire working set. Used for test isolation and when switching
@@ -462,6 +466,7 @@ export function resetStore() {
   // Drop the old graph's seeded facets (the never-evicted tier) so they don't linger
   // across the switch (audit P2).
   clearSeededFacets();
+  clearMatrixDimensionCache();
   setDoc({ byId: {}, pages: [], feed: [], loaded: false });
   endEdit("graph-switch");
   notifyModeReset();
@@ -962,6 +967,7 @@ function applyEntry(e: UndoEntry): UndoEntry {
     );
   }
   for (const p of e.dirty) addDirty(p);
+  invalidateAllMatrixDimensions();
   return inverse;
 }
 

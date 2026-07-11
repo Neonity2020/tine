@@ -2,7 +2,7 @@
 // persisting the choice so it reopens next launch.
 
 import { backend } from "./backend";
-import { setGraphMeta, setWorkflow, bumpGraphEpoch, setRightSidebar, graphMeta, graphEpoch, setAliasMap, seedFavorites, pruneSidebarBlocks, pushToast, refreshJournalConflicts, refreshSyncConflicts, clearRecent, graphTransitioning, setGraphTransitioning } from "./ui";
+import { setGraphMeta, setWorkflow, bumpGraphEpoch, setRightSidebar, graphMeta, graphEpoch, setAliasMap, seedFavorites, pruneSidebarBlocks, pushToast, refreshJournalConflicts, refreshSyncConflicts, clearRecent, graphTransitioning, setGraphTransitioning, renamePageInNavigation } from "./ui";
 import { resetStore, flushAll } from "./store";
 import { clearAssetBlobCache } from "./assetCache";
 import { resetTabsToJournals, openPage, restoreSession, flushSession } from "./router";
@@ -160,7 +160,8 @@ async function loadAliases(): Promise<void> {
  *  References to refetch from the now-correct backend). Aliases may have moved with
  *  the renamed file, so refresh those too. Caller must have run flushAll() first
  *  (so resetStore discards nothing unsaved) and then navigate to the new name. */
-export function refreshAfterRename(): void {
+export function refreshAfterRename(from: string, to: string): void {
+  renamePageInNavigation(from, to);
   resetStore();
   bumpGraphEpoch();
   void refreshAliases();

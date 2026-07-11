@@ -8,8 +8,37 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+### Added
+
+- **Ctrl/Cmd+Shift+V pastes multiline plain text into the current block.** Normal
+  multiline paste keeps Logseq's outline-building behavior, while the modified
+  shortcut preserves embedded newlines at the caret. (GH #81)
+
 ### Fixed
 
+- **Sheets remain identity-safe across split panes, sorting, pagination, and
+  asynchronous query hydration.** Selection and mutation targets are scoped to
+  their grid surface and source block, stale query results cannot overwrite a
+  newer view, formula/aggregate dependencies invalidate correctly, and large
+  Grid/Table/Board views keep bounded lookup and rendering work.
+- **Raw block punctuation and numbers use normal text metrics in edit mode.**
+  Inter or the configured monospace face now handles `#`, `*`, brackets, and
+  digits before the bundled emoji fallback, while actual emoji remain protected
+  from WebKitGTK's unsafe system COLRv1 path.
+- **Arrow Up enters a wrapped previous block on its bottom visual row.** The
+  caret keeps its horizontal source column instead of jumping to the matching
+  position on that block's top row.
+- **Windows graph windows are created off synchronous Tauri event handlers.**
+  Shift-opening a second graph no longer takes the WebView2 deadlock path that
+  could leave the new window blank and the original window uneditable. (GH #70)
+- **Windows screenshot paste reaches the image-byte path again.** WebView2 image
+  clipboard payloads no longer fall into native file-list import and report a
+  spurious skipped item; byte-only images retain the 64 MiB safety bound and
+  mixed copied files still use path-based import. (GH #78)
+- **Page rename and alias navigation keep sidebar state live.** Successful
+  renames re-key and deduplicate Favorites and Recents, while alias favorites
+  resolve to their canonical page for ordinary, sidebar, new-tab, and context
+  actions. (GH #79, GH #80)
 - **Read-only Org pages now reject every frontend mutation path.** Collapse,
   context-menu, selection, drag/move, sheet, property, durable-ID, dirty-state,
   and persistence entry points enforce the round-trip safety boundary rather

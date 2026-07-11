@@ -46,7 +46,7 @@ import {
 import { canFlatten, flatten, hierarchify } from "../sheet/restructure";
 import { canConvertPipeTableToGrid, convertGridToPipeTable, convertPipeTableToGrid } from "../sheet/conversions";
 import { appendSheetCellChild, deleteColumn, setBoardGroupBy } from "../sheet/mutations";
-import { cellForBlockId, cellOwner, setCellSel } from "../sheet/selection";
+import { cellBlockId, cellForBlockId, cellOwner, cellSel, focusCell, setCellSel } from "../sheet/selection";
 import { boardGroupByOptions, fieldIdsForBlocks, fieldLabel, isFieldId, type FieldId } from "../sheet/fields";
 import { startEditing } from "../editorController";
 import { copyStripCollapsed } from "../copySettings";
@@ -340,7 +340,9 @@ function SheetCellMenu(props: { id: string; remove?: SheetCellRemoveCtx; close: 
     props.close();
   };
   const addChild = () => {
-    const sel = cellForBlockId(props.id);
+    const active = cellSel();
+    const activeCell = active && active.kind !== "row-seam" && active.kind !== "col-seam" ? focusCell(active) : null;
+    const sel = activeCell && cellBlockId(activeCell) === props.id ? activeCell : cellForBlockId(props.id);
     const child = appendSheetCellChild(props.id);
     if (child) {
       if (sel) {
@@ -794,7 +796,7 @@ function RenamePage(props: {
       // Backend rewrote refs across pages via the self-write guard (no watcher
       // reload) → in-memory pages are stale; reset + reload so a stale save can't
       // revert the rename.
-      refreshAfterRename();
+      refreshAfterRename(from, next);
       openPage(next, kind);
       pushToast(`Renamed to “${next}”`, "success");
     } catch (e) {

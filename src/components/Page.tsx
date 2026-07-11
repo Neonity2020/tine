@@ -344,7 +344,7 @@ function PageSection(props: { page: FeedPage }): JSX.Element {
       // The backend rewrote refs across many pages via the self-write guard (no
       // watcher reload), so every in-memory page is now potentially stale; reset
       // + reload so a stale copy can't be saved back and revert the rename.
-      refreshAfterRename();
+      refreshAfterRename(props.page.name, next);
       router.openPage(next, "page");
     } catch (e) {
       alert(`Rename failed: ${String(e)}`);

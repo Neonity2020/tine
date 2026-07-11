@@ -24,6 +24,7 @@ import { SheetTable } from "./SheetTable";
 import { SheetBoard } from "./SheetBoard";
 import { SheetContainer } from "./SheetContainer";
 import type { PageKind, RefGroup } from "../types";
+import { sharedQueryResult } from "../queryResultCache";
 
 const ADVANCED_RE = /\[\s*:find|:where|:find/;
 type QueryView = "list" | "table" | "board";
@@ -239,17 +240,23 @@ export function QueryMacro(props: {
   // its count and doesn't re-run a whole-graph scan on every save while hidden;
   // expanding it (key flips to include dataRev) refreshes it.
   const [groups] = createResource(
-    () => (collapsed() ? `collapsed ${form()}` : `${form()} ${dataRev()}`),
-    async () => {
+    () => `${graphEpoch()}\0${collapsed() ? `collapsed ${form()}` : `${form()} ${dataRev()}`}`,
+    async (requestKey) => {
+      const scope = `${graphMeta()?.root ?? ""}\0${graphEpoch()}`;
       // Advanced (datalog) queries take a separate path that maps the supported
       // clause subset onto the engine and reports what ran vs was ignored.
       if (isAdvanced()) {
-        const r = await backend().runAdvancedQuery(form(), currentPage());
+        const page = currentPage();
+        const r = await sharedQueryResult(
+          scope,
+          `advanced\0${page ?? ""}\0${requestKey}`,
+          () => backend().runAdvancedQuery(form(), page),
+        );
         setAdvInfo({ ran: r.ran, ignored: r.ignored, supported: r.supported });
         return r.groups;
       }
       setAdvInfo(null);
-      return backend().runQuery(form());
+      return sharedQueryResult(scope, `simple\0${requestKey}`, () => backend().runQuery(form()));
     }
   );
   const total = () => groups()?.reduce((a, g) => a + g.blocks.length, 0) ?? 0;
