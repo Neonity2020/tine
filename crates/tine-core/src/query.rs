@@ -336,6 +336,19 @@ fn run_pred(graph: &Graph, pred: &Pred, opts: &QueryOpts) -> Vec<RefGroup> {
         (groups, recency)
     });
 
+    // `with_pages` inherits filesystem/cache enumeration order. Make the base
+    // order stable before sampling and before it becomes the tie-breaker for an
+    // explicit sort; otherwise identical graph exports can differ by machine.
+    groups.sort_by(|a, b| {
+        a.page.cmp(&b.page).then_with(|| {
+            let rank = |kind| match kind {
+                PageKind::Journal => 0,
+                PageKind::Page => 1,
+            };
+            rank(a.kind).cmp(&rank(b.kind))
+        })
+    });
+
     // sort-by is GLOBAL (like Logseq): order every matched block across all pages on
     // one axis, so e.g. priority-A tasks float to the very top regardless of which
     // page they live on. We flatten to one block per group, sort, then RE-COALESCE
