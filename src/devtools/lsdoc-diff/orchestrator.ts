@@ -12,6 +12,7 @@ import { projectionKey } from "./projection";
 import { minimize, toBytes } from "./minimize";
 import { anonymizeAndVerify, anonymizeSourceRel } from "./anonymize";
 import { benchFromResults, summarizeBenchRuns, type BenchRun, type BenchSummary } from "./bench";
+import { shouldQuarantineMldocBacktickStateArtifact } from "./oracle-artifacts";
 
 export interface DiffOptions {
   mode: "diff" | "bench" | "both";
@@ -32,7 +33,14 @@ export type Finding =
         | { ok: false };
     }
   | { type: "mldoc-failure"; rel: string; status: string; detail: string }
-  | { type: "unstable-divergence"; rel: string };
+  | { type: "unstable-divergence"; rel: string }
+  | {
+      type: "mldoc-oracle-artifact";
+      rel: string;
+      lineStart: number;
+      lineEnd: number;
+      detail: string;
+    };
 
 export interface DiffReport {
   tineVersion: string;
@@ -151,6 +159,29 @@ async function runDiff(
     }
     const buf = toBytes(f.text);
     const min = await minimize(buf, f.format, (t, fmt) => parseBothFresh(t, fmt));
+    // `contextDependent` means the minimizer could not reproduce the mismatch in
+    // any independently parsed range; every such probe used parseFresh and thus
+    // a brand-new mldoc realm. Suppress only the exact issue #82 one-backtick
+    // Plain/Code ownership shift. Other context-sensitive differences remain
+    // actionable divergences.
+    if (
+      original.lsdocProjection
+      && original.mldocProjection
+      && shouldQuarantineMldocBacktickStateArtifact(
+        min.contextDependent,
+        original.lsdocProjection,
+        original.mldocProjection,
+      )
+    ) {
+      findings.push({
+        type: "mldoc-oracle-artifact",
+        rel,
+        lineStart: min.lineStart,
+        lineEnd: min.lineEnd,
+        detail: "suppressed: mldoc leaked failed double-backtick parser state; fresh-range parses agree",
+      });
+      continue;
+    }
     const anon = await anonymizeAndVerify<Projection>(min.input, (candidate) => parseBothFresh(candidate, f.format));
     findings.push({
       type: "divergence",
