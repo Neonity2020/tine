@@ -38,7 +38,7 @@ jobs:
 
       - name: UI regression catalog and release evidence contracts
         run: |
-          npm run check:ui-catalog
+          npm run check:regressions
           npm run check:release-readiness
           npm run blog:check
 

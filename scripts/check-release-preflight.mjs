@@ -68,7 +68,7 @@ if (process.env.GITHUB_REF?.startsWith("refs/tags/")) {
 
 if (process.env.REQUIRE_RELEASE_READINESS === "1") {
   for (const [script, args = []] of [
-    ["check-ui-regression-catalog.mjs"],
+    ["check-regression-catalog.mjs"],
     ["check-release-readiness.mjs"],
     ["check-reddit-blog.mjs"],
     ["build-guide-demo.mjs", ["--check"]],

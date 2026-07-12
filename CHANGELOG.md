@@ -18,6 +18,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Changed
 
+- **Bug reports now feed a durable regression and follow-up workflow.** The issue
+  form asks for exact steps and an anonymized minimal graph, UI and non-UI bugs
+  share one indexed catalog, and a reporter's comment on a closed issue reopens
+  it automatically for triage.
 - **Release publication now fails closed on an incomplete platform set.** Tagged
   releases require Android signing, a successful real offline Flatpak build,
   lockstep version/changelog metadata, cross-platform-stable vendored oracle

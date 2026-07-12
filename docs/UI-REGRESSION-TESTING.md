@@ -13,9 +13,10 @@ before changing production code. A GitHub bug uses its issue number; an
 internally found regression gets a stable descriptive ID. Every entry names a
 behavioral boundary and points to executable evidence or an explicit exemption.
 
-`npm run check:ui-catalog` validates the schema, issue coverage, referenced
-files, and exemption reasons. The release preflight fails when the catalog is
-invalid.
+`tests/regressions/catalog.json` is the top-level regression index; non-UI bugs
+live in its sibling `non-ui.json`. `npm run check:regressions` validates both
+inventories, issue ownership, referenced files, and exemption reasons. The
+release preflight fails when either catalog is invalid.
 
 ## Suites
 

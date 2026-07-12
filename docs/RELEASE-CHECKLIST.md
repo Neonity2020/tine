@@ -11,8 +11,9 @@ may tag, publish, comment, and close issues.
    Fixed changelog bullet. For each item record regression coverage and its
    Guide/docs, website, and blog disposition (`update`, `current`,
    `not-applicable`, or `consult`). `consult` blocks the release.
-3. For every accepted bug, require a UI-regression catalog entry before the
-   production fix begins. Public Fixed entries reference their GitHub issue;
+3. For every accepted bug, require an entry in the indexed regression catalogs
+   before the production fix begins (UI/native in the UI inventory; other bugs
+   in the non-UI inventory). Public Fixed entries reference their GitHub issue;
    internal reports use a stable catalog ID. An exemption needs substitute
    evidence and a reason.
 4. Regenerate the canonical Guide/demo site and prove the checked-in

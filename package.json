@@ -15,6 +15,7 @@
     "build:wasm": "node scripts/build-wasm.mjs",
     "check:lsdoc-oracle": "node scripts/check-lsdoc-oracle-sync.mjs",
     "check:ui-catalog": "node scripts/check-ui-regression-catalog.mjs",
+    "check:regressions": "node scripts/check-regression-catalog.mjs",
     "check:release-readiness": "node scripts/check-release-readiness.mjs",
     "docs:build": "node scripts/build-guide-demo.mjs",
     "docs:check": "node scripts/build-guide-demo.mjs --check",
