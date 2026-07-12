@@ -144,20 +144,28 @@ fn activate_capture_window(app: &tauri::AppHandle) {
     });
 }
 
-#[cfg(desktop)]
 #[tauri::command]
 fn capture_frontend_ready(
     window: tauri::WebviewWindow,
     app: tauri::AppHandle,
 ) -> Result<(), String> {
-    if window.label() != "capture" {
-        return Err("capture activation is only available to the capture window".into());
+    #[cfg(desktop)]
+    {
+        if window.label() != "capture" {
+            return Err("capture activation is only available to the capture window".into());
+        }
+        if !window.is_visible().map_err(|error| error.to_string())? {
+            return Err("capture window is hidden".into());
+        }
+        activate_capture_window(&app);
+        Ok(())
     }
-    if !window.is_visible().map_err(|error| error.to_string())? {
-        return Err("capture window is hidden".into());
+
+    #[cfg(not(desktop))]
+    {
+        let _ = (window, app);
+        Err("quick capture is only available on desktop".into())
     }
-    activate_capture_window(&app);
-    Ok(())
 }
 
 #[cfg(desktop)]
