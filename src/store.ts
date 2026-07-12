@@ -1329,6 +1329,38 @@ export function insertOutlineAfter(afterId: string, nodes: OutlineNode[]): strin
   return lastId;
 }
 
+/** Replace one empty leaf with a parsed outline in one store transaction and one
+ * undo entry. Structured/multiline paste uses this instead of insert-then-delete,
+ * which could leave a partial import after one Undo. */
+export function replaceEmptyBlockWithOutline(id: string, nodes: OutlineNode[]): string {
+  const current = doc.byId[id];
+  if (!nodes.length || !current || current.children.length || !blockWritable(id)) return id;
+  const format = formatForBlock(id);
+  const split = splitProps(current.raw, isBuiltinHidden, format);
+  if (split.visible.trim()) return id;
+  pushUndo("paste-replace-empty", [current.page]);
+  let lastId = id;
+  setDoc(produce((state) => {
+    const create = (outline: OutlineNode, parent: string | null, reuseId?: string): string => {
+      const created = reuseId ?? freshId();
+      const children = outline.children.map((child) => create(child, created));
+      const raw = reuseId ? joinProps(outline.raw, split.hidden, format) : outline.raw;
+      state.byId[created] = { id: created, raw, collapsed: false, parent, page: current.page, children };
+      return created;
+    };
+    // Reuse the host for the first imported root. Besides avoiding a ghost blank,
+    // this preserves its hidden id/properties and therefore inbound references.
+    const created = nodes.map((node, index) => create(node, current.parent, index === 0 ? id : undefined));
+    const siblings = current.parent === null
+      ? state.pages[state.pages.findIndex((page) => page.name === current.page)].roots
+      : state.byId[current.parent].children;
+    siblings.splice(siblings.indexOf(id), 1, ...created);
+    lastId = created[created.length - 1];
+  }));
+  markDirty(current.page);
+  return lastId;
+}
+
 /** Append a quick-capture (Logseq outline markdown, as produced by the capture
  *  window's editor — usually one bullet, but templates/multi-line paste can make
  *  several) at the END of today's journal, then flush immediately. This is the

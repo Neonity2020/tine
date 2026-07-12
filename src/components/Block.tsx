@@ -36,6 +36,7 @@ import {
   nextVisibleOrExtend,
   insertEmptyChildBlock,
   insertOutlineAfter,
+  replaceEmptyBlockWithOutline,
   insertOutlineChildren,
   deleteBlock,
   moveBlock,
@@ -68,6 +69,7 @@ import {
   takeCaretFor,
 } from "../editorController";
 import { parseOutline } from "../editor/outline";
+import { structuredHtmlOutline } from "../editor/htmlPaste";
 import {
   toggleWrap,
   insertLink,
@@ -2483,6 +2485,7 @@ export function Editor(props: { id: string }): JSX.Element {
     const inlineMultiline = pasteMultilineInline;
     clearPasteMultilineInline();
     const text = e.clipboardData?.getData("text/plain") ?? "";
+    const html = e.clipboardData?.getData("text/html") ?? "";
     // File managers commonly include path text alongside the real file-list
     // clipboard flavor. Claim the paste synchronously so those paths never land
     // as text; actual paths are accepted only from the native clipboard API.
@@ -2526,12 +2529,30 @@ export function Editor(props: { id: string }): JSX.Element {
       insertOutlineChildren(props.id, [sheetGridNode]);
       return;
     }
+    // Preserve only structure explicitly represented by the clipboard HTML.
+    // Shift-paste above remains the literal/plain escape hatch, and editor
+    // surfaces whose contents are syntax-sensitive retain their native text
+    // insertion semantics.
+    const start = ref.selectionStart;
+    const syntaxSensitive = sheetCell || isCalc() || caretInFence(ref.value, start) || caretOnOpeningFence(ref.value, start);
+    const htmlNodes = syntaxSensitive ? null : structuredHtmlOutline(html, text);
+    if (htmlNodes) {
+      e.preventDefault();
+      const wasEmpty = ref.value.trim() === "" && doc.byId[props.id].children.length === 0;
+      const lastId = withUndoUnit("structured-paste", [doc.byId[props.id].page], () => {
+        commit(ref.value);
+        return wasEmpty
+          ? replaceEmptyBlockWithOutline(props.id, htmlNodes)
+          : insertOutlineAfter(props.id, htmlNodes);
+      });
+      startEditing(lastId, doc.byId[lastId].raw.length);
+      return;
+    }
     // Multiline text pastes as a block outline (Logseq behavior).
     if (text.includes("\n")) {
       e.preventDefault();
-      const start = ref.selectionStart;
       const end = ref.selectionEnd;
-      if (sheetCell || isCalc() || caretInFence(ref.value, start) || caretOnOpeningFence(ref.value, start)) {
+      if (syntaxSensitive) {
         const newRaw = ref.value.slice(0, start) + text + ref.value.slice(end);
         commit(newRaw);
         const pos = start + text.length;
@@ -2544,11 +2565,14 @@ export function Editor(props: { id: string }): JSX.Element {
       }
       const nodes = parseOutline(text);
       if (!nodes.length) return;
-      commit(ref.value);
       const wasEmpty =
         ref.value.trim() === "" && doc.byId[props.id].children.length === 0;
-      const lastId = insertOutlineAfter(props.id, nodes);
-      if (wasEmpty) deleteBlock(props.id);
+      const lastId = withUndoUnit("outline-paste", [doc.byId[props.id].page], () => {
+        commit(ref.value);
+        return wasEmpty
+          ? replaceEmptyBlockWithOutline(props.id, nodes)
+          : insertOutlineAfter(props.id, nodes);
+      });
       startEditing(lastId, doc.byId[lastId].raw.length);
       return;
     }

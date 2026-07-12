@@ -74,6 +74,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   covers labels, descriptions, and aliases, identifies the tab/section, and
   temporarily reveals matching hidden controls without changing the saved
   disclosure state. (GH #112)
+- **Pasting selected structured content preserves its explicit outline.** Safe
+  clipboard HTML is deterministically converted into nested lists, headings,
+  paragraphs, quotes, fenced code, links, emphasis, and one-block GFM tables;
+  malformed, semantic-free, or bounded-out payloads use the existing plain-text
+  path. The import is one normal persistence transaction and one Undo, while
+  Ctrl/Cmd+Shift+V remains literal plain-text paste. (GH #58)
 
 ### Changed
 

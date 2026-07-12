@@ -32,6 +32,7 @@ const suites = {
     ["multigraph", "scripts/e2e-multigraph.mjs", {}],
     ["sheets", "scripts/e2e-sheets.mjs", {}],
     ["selection-wrap", "scripts/e2e-selectwrap.mjs", {}],
+    ["structured-paste", "scripts/e2e-structured-paste.mjs", {}],
     ["media", "scripts/e2e-media.mjs", {}],
     ["page-file-actions", "scripts/e2e-page-file-actions.mjs", {}],
   ],
