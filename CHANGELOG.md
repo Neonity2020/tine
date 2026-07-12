@@ -25,6 +25,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Changed
 
+- **Block embeds now begin with one interactive root bullet instead of two.**
+  The referenced root keeps its collapse, zoom, sidebar, navigation, and editing
+  behavior, while a slightly heavier descendant guide marks the embedded outline
+  without adding a surrounding box. (GH #88)
 - **Bug reports now feed a durable regression and follow-up workflow.** The issue
   form asks for exact steps and an anonymized minimal graph, UI and non-UI bugs
   share one indexed catalog, and a reporter's comment on a closed issue reopens

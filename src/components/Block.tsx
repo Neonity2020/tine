@@ -324,9 +324,21 @@ export function Block(props: { id: string; hideRefCount?: boolean; forceExpanded
   // An org page Tine can't round-trip is shown but NOT editable (Tine must never
   // rewrite it). Clicking a block doesn't enter the editor on such a page.
   const readOnly = () => pageByName(node().page)?.readOnly ?? false;
+  // A whole-block `{{embed ((uuid))}}` is a transparent host for the referenced
+  // outline. Showing both this storage block's controls and the referenced root's
+  // controls produces two consecutive bullets. Keep the referenced root controls
+  // (they own collapse/zoom/sidebar behavior) and suppress only the macro host.
+  const blockEmbedHost = createMemo(() => {
+    const m = detectMacro(node().raw);
+    return m?.kind === "embed" && /^embed\s*\(\([^)]+\)\)\s*$/i.test(m.inner);
+  });
 
   return (
-    <div class="ls-block" classList={{ collapsed: collapsed() }} data-block-id={props.id}>
+    <div
+      class="ls-block"
+      classList={{ collapsed: collapsed(), "block-embed-host": blockEmbedHost() }}
+      data-block-id={props.id}
+    >
       <div
         class="block-main"
         classList={{
@@ -347,6 +359,7 @@ export function Block(props: { id: string; hideRefCount?: boolean; forceExpanded
           openContextMenu(e.clientX, e.clientY, props.id);
         }}
       >
+        <Show when={!blockEmbedHost()}>
         <div class="block-controls">
           <span
             class="collapse-toggle"
@@ -386,6 +399,7 @@ export function Block(props: { id: string; hideRefCount?: boolean; forceExpanded
             </Show>
           </span>
         </div>
+        </Show>
 
         <div
           class="block-content-wrapper"

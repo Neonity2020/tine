@@ -393,6 +393,24 @@ if (typeof location !== "undefined" && /[?&]regressions\b/.test(location.search)
       pre_block: null,
       blocks: [b("alias:: fbpr\ntags:: testing, properties"), b("Visible body")],
     },
+    {
+      name: "Block embed source regression",
+      kind: "page",
+      title: "Block embed source regression",
+      pre_block: null,
+      blocks: [
+        b("Embedded root\nid:: ui-block-embed-root", [
+          b("Embedded child", [b("Embedded grandchild")]),
+        ]),
+      ],
+    },
+    {
+      name: "Block embed regression",
+      kind: "page",
+      title: "Block embed regression",
+      pre_block: null,
+      blocks: [b("{{embed ((ui-block-embed-root))}}")],
+    },
   );
 }
 

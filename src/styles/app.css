@@ -6306,6 +6306,25 @@ img.emoji {
   margin: 2px 0;
 }
 
+/* A whole-block block embed is visually the referenced outline, not an empty
+   parent followed by another root. Block.tsx removes only the macro host's
+   controls; the referenced root keeps its real interactive bullet, collapse
+   toggle, zoom/sidebar actions, and editor surface. Removing the wrapper inset
+   puts that surviving bullet on the ordinary outline column. Its descendant
+   guide is slightly heavier to identify the embedded boundary without a box. */
+.block-embed-host > .block-main > .block-content-wrapper > .macro-host {
+  padding: 0;
+}
+.block-embed-host > .block-main > .block-content-wrapper > .macro-host > .embed-block {
+  border-left: 0;
+  padding-left: 0;
+  margin: 0;
+}
+.block-embed-host .embed-block > .live-ref-group > .ls-block > .block-children-container > .block-children {
+  border-left-width: 2px;
+  border-left-color: var(--border-color);
+}
+
 /* video / iframe embeds */
 .embed-iframe-wrap {
   position: relative;
