@@ -36,6 +36,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   obsolete load failures cannot replace a newer page, and the performance gate
   compares every candidate on one machine with both an immutable long-term
   anchor and the previous release.
+- **Clicks inside inline code now put the caret on the clicked character.**
+  Literal delimiters are mapped separately from their content instead of
+  snapping clicks to the start or end of the formatted span. (GH #114)
+- **Quick Capture focuses its first bullet even when its initial show event
+  races frontend startup.** Typing can begin immediately without an extra mouse
+  click. (GH #117)
+- **Table arrow-key navigation is now covered through the real global keyboard
+  path.** The deployed app already had the Grid-equivalent behavior reported in
+  GH #113; component and Linux real-app regressions now guard it.
 
 ### Changed
 

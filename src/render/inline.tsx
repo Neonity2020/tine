@@ -19,7 +19,7 @@ import { sanitizeRawHtml, rawHtmlLocalImages } from "./htmlSanitize";
 import { allowLocalFileImages } from "../localFileSettings";
 import { pageIcon } from "../pageIconBatch";
 import { typographic } from "./typography";
-import { coarseSpanAttrs, plainSpanAttrs, typographicPlainSpanAttrs, type SpanDomAttrs } from "./spans";
+import { coarseSpanAttrs, literalSpanAttrs, plainSpanAttrs, typographicPlainSpanAttrs, type SpanDomAttrs } from "./spans";
 import { typographyMode } from "../ui";
 import { visibleBody } from "./block";
 import { AstBody } from "./body";
@@ -94,7 +94,7 @@ function renderInline(s: Inline, blockId?: string, spanMode = true): JSX.Element
     case "verbatim":
       return (
         <span class="inline-copy-wrap">
-          <code class="inline-code" {...((spanMode ? coarseSpanAttrs(s.span) : undefined) ?? {})}>{s.text}</code>
+          <code class="inline-code" {...((spanMode ? literalSpanAttrs(s.text, s.span) : undefined) ?? {})}>{s.text}</code>
           <CopyButton text={s.text} title="Copy code" class="copy-inline" />
         </span>
       );

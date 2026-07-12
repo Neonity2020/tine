@@ -263,6 +263,21 @@ try {
 
   // --- Typed cells (phase 6b): checkbox toggle + enum popup write ------------
   // Seed has a schema'd table: columns title=0, state=1, topic(enum)=2, shipped(checkbox)=3.
+  const tableNavStart = await browser.$('.sheet-table .sheet-cell[data-row="0"][data-col="0"]');
+  if (await tableNavStart.isExisting()) {
+    await tableNavStart.click();
+    await sleep(200);
+    await browser.keys(["ArrowRight"]);
+    await sleep(200);
+    const tableNav = await browser.execute(() => {
+      const selected = document.querySelector('.sheet-table .sheet-cell-selected');
+      return selected ? { row: selected.getAttribute("data-row"), col: selected.getAttribute("data-col") } : null;
+    });
+    check("Table ArrowRight uses the real global key path", tableNav?.row === "0" && tableNav?.col === "1", JSON.stringify(tableNav));
+  } else {
+    check("Table ArrowRight uses the real global key path", false, "no Table cell (0,0)");
+  }
+
   const cbCell = await browser.$('.sheet-table .sheet-cell[data-row="0"][data-col="3"]');
   if (await cbCell.isExisting()) {
     await browser.execute(() => {

@@ -44,6 +44,7 @@ const PAGE = `- **bold** rest of line
   DEADLINE: <2026-07-10 Fri>
 - plain target below
 - another plain block
+- before \`a literal block\` after
 `;
 
 fs.rmSync(G, { recursive: true, force: true });
@@ -185,6 +186,7 @@ try {
   };
   const raw0 = "**bold** rest of line\nsecond line here";
   const raw1 = "**bold** start then a -> b and x -- y here\nmore -- dashed text line";
+  const raw5 = "before `a literal block` after";
 
   console.log("\n=== BUG 1a: click inside bold (line 1) of multiline block 0 ===");
   let p = await charPoint(0, "bold", 2);
@@ -219,6 +221,18 @@ try {
   console.log("point:", JSON.stringify(p));
   requirePoint(p, "typography dashed point"); await realClick(p.x, p.y);
   expectEditor(await probe("typo dashed+3"), 1, raw1.indexOf("dashed") + 3, "typography dashed click");
+  await browser.keys(["Escape"]); await sleep(400);
+
+  console.log("\n=== INLINE CODE: click the middle of a literal (GH #114) ===");
+  p = await charPoint(5, "a literal block", 7);
+  console.log("point:", JSON.stringify(p));
+  requirePoint(p, "inline-code point"); await realClick(p.x, p.y);
+  expectEditor(
+    await probe("inline code +7"),
+    5,
+    raw5.indexOf("a literal block") + 7,
+    "inline-code click",
+  );
   await browser.keys(["Escape"]); await sleep(400);
 
   console.log("\n=== BUG 2: focus TODO block (idx 1), then click 'plain target below' (idx 2) ===");

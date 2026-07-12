@@ -63,6 +63,26 @@ describe("click-to-caret span mapping", () => {
     }
   });
 
+  it("maps clicks inside inline code to the corresponding source character (GH #114)", () => {
+    const raw = "before `a literal block` after";
+    const { root, dispose } = mountedBody(raw);
+    try {
+      const codeStart = raw.indexOf("a literal block");
+      for (const offset of [0, 2, 8, "a literal block".length]) {
+        expect(
+          editorOffsetFromRenderedRange(
+            root,
+            textRange(root, "a literal block", offset),
+            raw,
+            isBuiltinHidden,
+          ),
+        ).toBe(codeStart + offset);
+      }
+    } finally {
+      dispose();
+    }
+  });
+
   it("puts the caret AFTER a trailing link when clicked to its right (GH #34)", () => {
     // Clicking past the end of a block that ends in a link used to snap to the
     // span START (caret before the first `[`); it must land after `]]` instead.
