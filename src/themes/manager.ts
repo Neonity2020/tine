@@ -13,7 +13,8 @@ export interface InstalledTheme {
 }
 
 const [installedThemes, setInstalledThemes] = createSignal<InstalledTheme[]>([]);
-export { installedThemes };
+const [revokedThemeVersions, setRevokedThemeVersions] = createSignal<ReadonlySet<string>>(new Set());
+export { installedThemes, revokedThemeVersions };
 
 function parseStoredThemes(text: string): ThemeManifest[] {
   try {
@@ -47,12 +48,24 @@ export async function initThemePackages(): Promise<void> {
 }
 
 export function installedThemeByKey(key: string): InstalledTheme | undefined {
+  if (revokedThemeVersions().has(key)) return undefined;
   return installedThemes().find((theme) => theme.key === key);
+}
+
+export function themeVersionIsRevoked(key: string): boolean {
+  return revokedThemeVersions().has(key);
+}
+
+export function applyThemeRevocations(revoked: ReadonlySet<string>): void {
+  setRevokedThemeVersions(new Set(revoked));
 }
 
 export async function installThemePackage(value: unknown): Promise<InstalledTheme> {
   const manifest = parseThemeManifest(value);
   const key = themeVersionKey(manifest);
+  if (themeVersionIsRevoked(key)) {
+    throw new Error("this theme version was revoked by the signed registry");
+  }
   const current = installedThemes();
   if (!current.some((theme) => theme.key === key) && current.length >= MAX_INSTALLED_THEMES) {
     throw new Error(`at most ${MAX_INSTALLED_THEMES} theme versions may be installed`);

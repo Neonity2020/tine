@@ -88,7 +88,12 @@ import { mediaEditorCommand, setMediaEditorCommand } from "../mediaEditorSetting
 import { formatAssetName } from "../media";
 import { galleryThemes, selectedGalleryTheme, applyTheme as applyGalleryTheme } from "../themeGallery";
 import type { GalleryTheme } from "../styles/themes";
-import { installThemePackage, installedThemes, uninstallThemePackage } from "../themes/manager";
+import {
+  installThemePackage,
+  installedThemes,
+  themeVersionIsRevoked,
+  uninstallThemePackage,
+} from "../themes/manager";
 import { openPage, openFile } from "../router";
 import { commandDefaults, eventToBindingString, setKeybindingsSuspended } from "../keybindings";
 import { ShortcutsSettingsPane } from "./HelpShortcuts";
@@ -1099,23 +1104,24 @@ function AppearanceTab(props: { search: string }): JSX.Element {
             const version = () => themeEntry.versions[themeEntry.versions.length - 1];
             const key = () => `${themeEntry.id}@${version().version}`;
             const installed = () => installedThemes().some((theme) => theme.key === key());
+            const revoked = () => themeVersionIsRevoked(key());
             return (
               <div class="settings-field">
                 <div class="settings-field-row">
                   <div>
                     <div class="settings-label">{themeEntry.name} <span class="settings-hint">v{version().version}</span></div>
                     <div class="settings-hint settings-field-hint">
-                      {themeEntry.description}<br />{themeEntry.license} · {version().modes.join(" + ")} · {version().audit.manualApproval ? "Human-reviewed" : "Low-risk automated pass"}
+                      {themeEntry.description}<br />{themeEntry.license} · {version().modes.join(" + ")} · {revoked() ? "Revoked by the signed registry" : version().audit.manualApproval ? "Human-reviewed" : "Low-risk automated pass"}
                     </div>
                   </div>
                   <div class="settings-field-control">
                     <button class="settings-link" onClick={() => void backend().openExternal(themeEntry.source)}>Details &amp; screenshots</button>
                     <button
                       class="settings-btn"
-                      disabled={installed() || themePackageBusy() !== null || version().audit.status !== "passed"}
+                      disabled={installed() || revoked() || themePackageBusy() !== null || version().audit.status !== "passed"}
                       onClick={() => void installRegistryTheme(themeEntry)}
                     >
-                      {installed() ? "Installed" : themePackageBusy() === key() ? "Verifying…" : "Install"}
+                      {revoked() ? "Revoked" : installed() ? "Installed" : themePackageBusy() === key() ? "Verifying…" : "Install"}
                     </button>
                   </div>
                 </div>
@@ -1147,6 +1153,7 @@ function AppearanceTab(props: { search: string }): JSX.Element {
           <For each={installedThemes()}>
             {(installed) => {
               const previewMode = () => installed.manifest.modes[theme()] ?? installed.manifest.modes.light ?? installed.manifest.modes.dark ?? {};
+              const revoked = () => themeVersionIsRevoked(installed.key);
               return (
                 <div class="settings-field installed-theme-row">
                   <div class="settings-field-row">
@@ -1161,16 +1168,16 @@ function AppearanceTab(props: { search: string }): JSX.Element {
                       >●</span>
                       <div>
                         <div class="settings-label">{installed.manifest.name} <span class="settings-hint">v{installed.manifest.version}</span></div>
-                        <div class="settings-hint">{installed.manifest.author} · {installed.manifest.license} · {Object.keys(installed.manifest.modes).join(" + ")}</div>
+                        <div class="settings-hint">{installed.manifest.author} · {installed.manifest.license} · {Object.keys(installed.manifest.modes).join(" + ")}{revoked() ? " · Revoked and disabled" : ""}</div>
                       </div>
                     </div>
                     <div class="settings-field-control">
                       <button
                         class="settings-btn"
-                        disabled={selectedGalleryTheme() === installed.key}
+                        disabled={revoked() || selectedGalleryTheme() === installed.key}
                         onClick={() => applyGalleryTheme(installed.key)}
                       >
-                        {selectedGalleryTheme() === installed.key ? "Selected" : "Use theme"}
+                        {revoked() ? "Revoked" : selectedGalleryTheme() === installed.key ? "Selected" : "Use theme"}
                       </button>
                       <button class="settings-link" onClick={() => void backend().openExternal(installed.manifest.source)}>Details</button>
                       <button

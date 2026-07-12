@@ -6,7 +6,7 @@ import {
   ensureThemeStyle,
   selectedGalleryTheme,
 } from "./themeGallery";
-import { installThemePackage, uninstallThemePackage } from "./themes/manager";
+import { applyThemeRevocations, installThemePackage, uninstallThemePackage } from "./themes/manager";
 
 function managedStyleIds(): string[] {
   return Array.from(document.head.children)
@@ -19,6 +19,7 @@ describe("theme gallery style layer", () => {
     document.head.innerHTML = "";
     document.body.innerHTML = "";
     applyTheme("");
+    applyThemeRevocations(new Set());
   });
 
   it("inserts #tine-theme between the shim and custom.css", () => {
@@ -76,5 +77,30 @@ describe("theme gallery style layer", () => {
     expect(managedStyleIds()).toEqual([LS_SHIM_STYLE_ID, THEME_GALLERY_STYLE_ID, CUSTOM_CSS_STYLE_ID]);
     await uninstallThemePackage(installed.key);
     applyTheme("");
+  });
+
+  it("refuses to apply or reinstall a theme version revoked by the signed registry", async () => {
+    const manifest = {
+      schemaVersion: 1 as const,
+      id: "page.tine.theme.revoked",
+      name: "Revoked tokens",
+      version: "1.0.0",
+      apiVersion: "0.1" as const,
+      description: "A revoked test theme.",
+      author: "Tine",
+      license: "MIT",
+      source: "https://example.invalid/theme",
+      modes: { dark: { "--ls-primary-background-color": "#010203" } },
+      screenshots: [],
+    };
+    const installed = await installThemePackage(manifest);
+    applyTheme(installed.key);
+    applyThemeRevocations(new Set([installed.key]));
+    applyTheme(installed.key);
+
+    expect(selectedGalleryTheme()).toBe("");
+    expect(document.getElementById(THEME_GALLERY_STYLE_ID)?.textContent).toBe("");
+    await expect(installThemePackage(manifest)).rejects.toThrow(/revoked/);
+    await uninstallThemePackage(installed.key);
   });
 });

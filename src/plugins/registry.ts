@@ -10,7 +10,8 @@ import {
 } from "./manifest";
 import { pluginManager } from "./manager";
 import { THEME_API_VERSION, parseThemeManifest } from "../themes/manifest";
-import { installThemePackage } from "../themes/manager";
+import { applyThemeRevocations, installThemePackage, themeVersionIsRevoked } from "../themes/manager";
+import { applyTheme, selectedGalleryTheme } from "../themeGallery";
 
 export const COMMUNITY_REGISTRY_URL =
   "https://raw.githubusercontent.com/martinkoutecky/tine-plugin-registry/main/index.json";
@@ -373,7 +374,10 @@ export async function refreshCommunityRegistry(): Promise<void> {
     ]);
     setCommunityPlugins(index.plugins);
     setCommunityThemes(index.themes);
-    await pluginManager.applyRevocations(new Set(index.revocations.map((item) => `${item.id}@${item.version}`)));
+    const revoked = new Set(index.revocations.map((item) => `${item.id}@${item.version}`));
+    await pluginManager.applyRevocations(revoked);
+    applyThemeRevocations(revoked);
+    applyTheme(selectedGalleryTheme());
     setRegistryState("ready");
   } catch {
     try {
@@ -385,7 +389,10 @@ export async function refreshCommunityRegistry(): Promise<void> {
       const index = await verifiedIndex(cached, signature);
       setCommunityPlugins(index.plugins);
       setCommunityThemes(index.themes);
-      await pluginManager.applyRevocations(new Set(index.revocations.map((item) => `${item.id}@${item.version}`)));
+      const revoked = new Set(index.revocations.map((item) => `${item.id}@${item.version}`));
+      await pluginManager.applyRevocations(revoked);
+      applyThemeRevocations(revoked);
+      applyTheme(selectedGalleryTheme());
       setRegistryState("offline");
     } catch {
       setCommunityPlugins([]);
@@ -526,6 +533,9 @@ export async function installCommunityPlugin(plugin: RegistryPlugin, version: Re
 
 export async function installCommunityTheme(theme: RegistryTheme, version: RegistryThemeVersion) {
   if (version.audit.status !== "passed") throw new Error("registry theme audit is not passing");
+  if (themeVersionIsRevoked(`${theme.id}@${version.version}`)) {
+    throw new Error("this theme version was revoked by the signed registry");
+  }
   const manifestBytes = await boundedBytes(version.manifestUrl, 64 * 1024);
   if ((await digestHex(manifestBytes)) !== version.manifestSha256) {
     throw new Error("theme manifest digest does not match the signed registry");

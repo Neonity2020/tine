@@ -43,6 +43,11 @@ from Settings → Appearance → Theme packages. The checker rejects unknown tok
 CSS indirection, `url()`, `var()`, selector escapes, non-HTTPS metadata, and missing
 registry licenses.
 
+Installed versions are addressed immutably by `id@version`. A version revoked by the
+signed community registry cannot be installed or selected; if it was active, Tine
+immediately clears its generated style and returns to Default. Uninstall remains
+available so revocation never traps a package on the device.
+
 ## Ports
 
 Behavioral or source-derived ports add `portedFrom` with the original ecosystem,

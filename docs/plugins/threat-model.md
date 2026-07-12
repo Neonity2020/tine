@@ -51,12 +51,15 @@ signature-verified by Tine.
 
 ## Local audit boundary
 
-Hostile plugin builds run in a fresh rootless Podman container with no host home,
-secrets, GitHub write credential, or Codex authentication; network is off after any
-pinned dependency-fetch phase. The AI reviewer is a separate process which reads
-source and deterministic artifacts but never executes plugin code. Its subscription
-credential is not mounted into the build container. A third narrow publisher process
-can post only the structured report/status for the submission it leased.
+Hostile plugin builds run in a fresh rootless Podman container, or the registry's
+audited Bubblewrap fallback, with no host home, secrets, GitHub write credential, or
+Codex authentication. Dependency fetch gets network without credentials; submitted
+build scripts run only after network is disabled. The auditor refuses executable
+submissions if neither sandbox is available. The AI reviewer is a separate process
+which reads source and deterministic artifacts but never executes plugin code. Its
+subscription credential is not mounted into the build sandbox. A third narrow
+publisher process can post only the structured report/status for the submission it
+leased.
 
 AI review is advisory defense in depth, not the runtime sandbox. Prompt injection can
 mislead a review, so deterministic authority/import/schema/digest checks decide the

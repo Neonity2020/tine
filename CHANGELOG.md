@@ -38,6 +38,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   and let command plugins declare ordinary remappable default shortcuts without
   receiving keyboard, DOM, or global-input authority.
 
+### Fixed
+
+- Apply signed registry revocations to inert theme packages as well as executable
+  plugins: revoked themes can no longer be installed or selected, and an active
+  revoked theme falls back to Default while remaining uninstallable.
+
 ## [0.5.7] - 2026-07-12
 
 ### Fixed
