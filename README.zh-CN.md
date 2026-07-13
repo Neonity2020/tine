@@ -9,7 +9,7 @@
 
 <p align="center">
   <a href="README.md">English</a> | <a href="README.zh-CN.md">简体中文</a><br>
-  <sub>本译文基于英文 README 修订版 <code>682cba63acb0ffb62698f0a063949f8e2515a230</code>（2026-07-10）。若中英文内容存在差异，请以最新英文 README 为准。</sub>
+  <sub>本译文最初基于英文 README 修订版 <code>682cba63acb0ffb62698f0a063949f8e2515a230</code>（2026-07-10）。若中英文内容存在差异，请以最新英文 README 为准。</sub>
 </p>
 
 <p align="center">
@@ -217,7 +217,11 @@ Tine 是由一位维护者独立维护的项目，采用一种不同寻常的贡
 
 **移动端：**自 0.4.0 起，Tine 已提供**原生 Android 构建**（Tauri v2）——可通过你自行选择的同步方式，在手机上打开和编辑真实的 Logseq 图谱，并与 Logseq 移动端配合使用。iOS 版本正在规划中。
 
-**明确不做（设计如此）：**白板、记忆卡片（Flashcards）、插件系统和内置 Git。
+**下一步——插件（0.6.x）：**计划推出一个权限受限的插件系统，先通过实际扩展逐步确定稳定的 API，同时不向插件开放对图谱或宿主环境的不受限制访问。
+
+**尚在讨论，未作承诺：**内置 Git 集成。
+
+**明确不做（设计如此）：**白板和记忆卡片（Flashcards）。
 
 完整的开发待办——接下来要做什么、延后什么，以及明确标记为 WONTFIX 的内容——位于 [`docs/BACKLOG.md`](docs/BACKLOG.md)。
 

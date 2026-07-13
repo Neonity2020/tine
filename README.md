@@ -284,7 +284,13 @@ navigation, `Ctrl+click` open-to-side, and tab drag to panes/seams (see
 **Mobile:** Tine has a **native Android build** (Tauri v2) as of 0.4.0 — it opens and edits your real
 Logseq graph on the phone over your own sync, alongside the Logseq mobile app. iOS is being scoped.
 
-**Out of scope (by design):** whiteboards, flashcards, the plugin system, and built-in git.
+**Next — Plugins (0.6.x):** a capability-limited plugin system is planned, starting with real
+extensions that help define a stable API without giving plugins unrestricted access to the graph
+or host.
+
+**Under discussion, not promised:** built-in git integration.
+
+**Out of scope (by design):** whiteboards and flashcards.
 
 The full working backlog — what's next, what's deferred, and what's explicitly WONTFIX — lives in
 [`docs/BACKLOG.md`](docs/BACKLOG.md).
