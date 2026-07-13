@@ -23,6 +23,7 @@ import {
   timetrackingEnabled,
   logbookWithSecondSupport,
   removeDeletedPageFromNavigation,
+  removeDeletedBlocksFromSidebar,
   bumpDataRev,
 } from "./ui";
 import { seedFacets, facetsFromDto, clearSeededFacets, facetsOf } from "./render/facets";
@@ -2007,6 +2008,17 @@ function deleteBlockInternal(id: string) {
   const node = doc.byId[id];
   if (!node) return;
   const pageName = node.page;
+  const format = pageByName(pageName)?.format ?? "md";
+  const removedSidebarIds = new Set<string>();
+  const collectRemovedIds = (bid: string) => {
+    const current = doc.byId[bid];
+    if (!current) return;
+    removedSidebarIds.add(current.id);
+    const durable = existingBlockId(current.raw, format);
+    if (durable) removedSidebarIds.add(durable);
+    current.children.forEach(collectRemovedIds);
+  };
+  collectRemovedIds(id);
   setDoc(
     produce((s) => {
       const arr =
@@ -2022,6 +2034,7 @@ function deleteBlockInternal(id: string) {
       rm(id);
     })
   );
+  removeDeletedBlocksFromSidebar(removedSidebarIds);
   if (editingId() === id) endEdit("delete-block");
   markDirty(pageName);
 }

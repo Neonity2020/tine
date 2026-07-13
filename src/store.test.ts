@@ -72,6 +72,8 @@ import {
   recentPages,
   setFavorites,
   setRecentPages,
+  rightSidebar,
+  setRightSidebar,
   seedFavorites,
   renamePageInNavigation,
   dataRev,
@@ -125,6 +127,7 @@ beforeEach(() => {
   });
   setFavorites([]);
   setRecentPages([]);
+  setRightSidebar([]);
   setCopyIncludeSubtree(false); // copy prefs default OFF; reset so tests don't leak
   setCopyStripCollapsed(false);
 });
@@ -1202,6 +1205,11 @@ describe("save engine (persistence)", () => {
     ]);
     setFavorites([{ name: "Older", kind: "journal" }, { name: "Pinned", kind: "page" }]);
     setRecentPages([{ name: "Older", kind: "journal" }, { name: "Pinned", kind: "page" }]);
+    setRightSidebar([
+      { kind: "page", name: "Older", pageKind: "journal", collapsed: true },
+      { kind: "block", uuid: "older-block", page: "Older", pageKind: "journal", collapsed: true },
+      { kind: "page", name: "Pinned", pageKind: "page" },
+    ]);
 
     expect(await deletePage("Older", "journal")).toBe(true);
 
@@ -1209,6 +1217,7 @@ describe("save engine (persistence)", () => {
     expect(pageByName("Older")).toBeUndefined();
     expect(favorites()).toEqual([{ name: "Pinned", kind: "page" }]);
     expect(recentPages()).toEqual([{ name: "Pinned", kind: "page" }]);
+    expect(rightSidebar()).toEqual([{ kind: "page", name: "Pinned", pageKind: "page" }]);
   });
 
   it("a successful rename re-keys favorites and collapses old/new recent duplicates", () => {
@@ -1222,6 +1231,10 @@ describe("save engine (persistence)", () => {
       { name: "Other", kind: "page" },
       { name: "Old", kind: "page" },
     ]);
+    setRightSidebar([
+      { kind: "page", name: "Old", pageKind: "page", collapsed: true },
+      { kind: "block", uuid: "kept", page: "Old", pageKind: "page", collapsed: false },
+    ]);
 
     renamePageInNavigation("Old", "New");
 
@@ -1233,6 +1246,23 @@ describe("save engine (persistence)", () => {
       { name: "New", kind: "page" },
       { name: "Other", kind: "page" },
     ]);
+    expect(rightSidebar()).toEqual([
+      { kind: "page", name: "New", pageKind: "page", collapsed: true },
+      { kind: "block", uuid: "kept", page: "New", pageKind: "page", collapsed: false },
+    ]);
+  });
+
+  it("deleteBlock removes a matching sidebar item and its disclosure state", () => {
+    const target = blk("Target\nid:: stable-target");
+    load([target, blk("Keep")]);
+    setRightSidebar([
+      { kind: "block", uuid: "stable-target", page: "Test", pageKind: "page", collapsed: true },
+      { kind: "page", name: "Test", pageKind: "page" },
+    ]);
+
+    deleteBlock(target.id);
+
+    expect(rightSidebar()).toEqual([{ kind: "page", name: "Test", pageKind: "page" }]);
   });
 
   it("seedFavorites replaces (per-graph) on graph open, clearing to empty for a graph with none", () => {

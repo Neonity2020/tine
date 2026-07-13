@@ -6,6 +6,8 @@ import {
   applySidebarSession,
   favoritesSectionExpanded,
   recentSectionExpanded,
+  rightSidebar,
+  setRightSidebar,
   setFavoritesSectionExpanded,
   setRecentSectionExpanded,
 } from "./ui";
@@ -88,6 +90,23 @@ describe("persisted split session", () => {
     applySidebarSession({});
     expect(favoritesSectionExpanded()).toBe(true);
     expect(recentSectionExpanded()).toBe(true);
+  });
+
+  it("round-trips each right-sidebar item's graph-local disclosure state", () => {
+    setRightSidebar([
+      { kind: "page", name: "Expanded", pageKind: "page", collapsed: false },
+      { kind: "block", uuid: "stable-block", page: "Source", pageKind: "page", collapsed: true },
+    ]);
+    const persisted = buildPersistedSession();
+    expect(persisted.rightSidebarItems?.map((item) => item.collapsed)).toEqual([false, true]);
+
+    const parsed = parsePersistedSession(JSON.stringify(persisted))!;
+    setRightSidebar([]);
+    applySidebarSession(parsed.sidebar);
+    expect(rightSidebar()).toEqual(persisted.rightSidebarItems);
+
+    applySidebarSession({ items: [{ kind: "page", name: "Legacy", pageKind: "page" }] });
+    expect(rightSidebar()[0].collapsed).toBeUndefined();
   });
 
   it("rewrites duplicate restored journals panes to a previous page route", () => {

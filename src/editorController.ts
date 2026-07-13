@@ -21,6 +21,7 @@ export type EndEditReason =
   | "query-builder"
   | "redo"
   | "select-block"
+  | "sidebar-collapse"
   | "undo";
 
 const [editingId, setEditingId] = createSignal<string | null>(null);

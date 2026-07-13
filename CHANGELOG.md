@@ -10,6 +10,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Added
 
+- **Right-sidebar items can now be collapsed independently.** Each page or block
+  has an accessible disclosure that parks its body without mounting its outline
+  or references; a compact menu provides Collapse all, Expand all, and Close
+  all. State is local to this installation and graph, survives restarts and
+  renames, and active edits commit before a body is removed. (GH #106)
 - **Block embeds have a restrained, theme-aware identity cue.** The embedded
   root bullet and its heavier descendant guide share a muted accent derived
   from the active theme; ordinary bullets, guides, text, and backgrounds remain

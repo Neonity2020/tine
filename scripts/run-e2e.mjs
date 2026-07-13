@@ -38,6 +38,7 @@ const suites = {
     ["page-file-actions", "scripts/e2e-page-file-actions.mjs", {}],
     ["block-embed", "scripts/e2e-block-embed.mjs", {}],
     ["sidebar-sections", "scripts/e2e-sidebar-sections.mjs", {}],
+    ["right-sidebar-collapse", "scripts/e2e-right-sidebar-collapse.mjs", {}],
   ],
   "windows-smoke": [
     ["windows-core", "scripts/e2e-windows-smoke.mjs", {}],

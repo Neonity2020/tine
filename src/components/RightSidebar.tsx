@@ -1,13 +1,17 @@
-import { For, Show, createEffect, type JSX } from "solid-js";
+import { For, Show, createEffect, createSignal, createUniqueId, type JSX } from "solid-js";
 import {
   rightSidebar,
   rightSidebarOpen,
   toggleRightSidebar,
   closeRightSidebarItem,
+  closeAllRightSidebarItems,
+  setRightSidebarItemCollapsed,
+  setAllRightSidebarItemsCollapsed,
   rightSidebarWidth,
   setRightSidebarWidth,
   persistRightSidebarWidth,
   graphEpoch,
+  sidebarItemKey,
   type SidebarItem,
 } from "../ui";
 import { openPage } from "../router";
@@ -18,6 +22,31 @@ import { visibleBody } from "../render/block";
 import { Block, SurfaceContext } from "./Block";
 import { LinkedReferences } from "./LinkedReferences";
 import { UnlinkedReferences } from "./UnlinkedReferences";
+import { endEditForSurface } from "../editorController";
+
+function surfaceKey(item: SidebarItem): string {
+  return `sidebar:${sidebarItemKey(item)}`;
+}
+
+/** Commit the active textarea synchronously through its blur handler before a
+ * disclosure removes the owning surface. Then clear any remaining edit owner
+ * (for example when the window-focus preservation path kept edit mode alive). */
+function prepareSurfaceForUnmount(key: string) {
+  const active = document.activeElement;
+  if (active instanceof HTMLElement) {
+    const surface = active.closest<HTMLElement>("[data-sidebar-surface]");
+    if (surface?.dataset.sidebarSurface === key) active.blur();
+  }
+  endEditForSurface("sidebar-collapse", key);
+}
+
+function restoreDisclosureFocus(key: string) {
+  queueMicrotask(() => {
+    const surface = [...document.querySelectorAll<HTMLElement>("[data-sidebar-surface]")]
+      .find((element) => element.dataset.sidebarSurface === key);
+    surface?.querySelector<HTMLButtonElement>("[data-right-sidebar-item-toggle]")?.focus();
+  });
+}
 
 // Right sidebar: a stack of pages/blocks opened for reference. Each item is a
 // LIVE reference — it loads its page into the shared working set and renders the
@@ -25,6 +54,40 @@ import { UnlinkedReferences } from "./UnlinkedReferences";
 // underlying node and propagate everywhere (OG's model, kept lazy). A parked
 // {{query}} also stays live, since it's the real block.
 export function RightSidebar(): JSX.Element {
+  const [actionsOpen, setActionsOpen] = createSignal(false);
+  let actionsButton: HTMLButtonElement | undefined;
+  let actionsMenu: HTMLDivElement | undefined;
+  createEffect(() => {
+    if (actionsOpen()) queueMicrotask(() => actionsMenu?.querySelector<HTMLButtonElement>("button")?.focus());
+  });
+  const prepareAll = () => {
+    for (const item of rightSidebar()) prepareSurfaceForUnmount(surfaceKey(item));
+  };
+  const runBulk = (action: "collapse" | "expand" | "close") => {
+    if (action !== "expand") prepareAll();
+    if (action === "collapse") setAllRightSidebarItemsCollapsed(true);
+    else if (action === "expand") setAllRightSidebarItemsCollapsed(false);
+    else closeAllRightSidebarItems();
+    setActionsOpen(false);
+    actionsButton?.focus();
+  };
+  const onMenuKeyDown: JSX.EventHandlerUnion<HTMLDivElement, KeyboardEvent> = (event) => {
+    const buttons = [...(actionsMenu?.querySelectorAll<HTMLButtonElement>("button") ?? [])];
+    const index = buttons.indexOf(document.activeElement as HTMLButtonElement);
+    let next = index;
+    if (event.key === "ArrowDown") next = (index + 1 + buttons.length) % buttons.length;
+    else if (event.key === "ArrowUp") next = (index - 1 + buttons.length) % buttons.length;
+    else if (event.key === "Home") next = 0;
+    else if (event.key === "End") next = buttons.length - 1;
+    else if (event.key === "Escape") {
+      event.preventDefault();
+      setActionsOpen(false);
+      actionsButton?.focus();
+      return;
+    } else return;
+    event.preventDefault();
+    buttons[next]?.focus();
+  };
   return (
     <Show when={rightSidebarOpen()}>
       <div
@@ -48,7 +111,27 @@ export function RightSidebar(): JSX.Element {
         />
         <div class="right-sidebar-header">
           <span>Sidebar</span>
-          <button class="rs-close" title="Close sidebar (t r)" onClick={toggleRightSidebar}>✕</button>
+          <div class="rs-header-actions">
+            <button
+              ref={actionsButton}
+              class="rs-actions-button"
+              type="button"
+              title="Sidebar item actions"
+              aria-label="Sidebar item actions"
+              aria-haspopup="menu"
+              aria-expanded={actionsOpen()}
+              data-right-sidebar-actions
+              onClick={() => setActionsOpen((open) => !open)}
+            >⋯</button>
+            <Show when={actionsOpen()}>
+              <div ref={actionsMenu} class="rs-actions-menu" role="menu" onKeyDown={onMenuKeyDown}>
+                <button type="button" role="menuitem" data-right-sidebar-action="collapse-all" onClick={() => runBulk("collapse")}>Collapse all</button>
+                <button type="button" role="menuitem" data-right-sidebar-action="expand-all" onClick={() => runBulk("expand")}>Expand all</button>
+                <button type="button" role="menuitem" data-right-sidebar-action="close-all" onClick={() => runBulk("close")}>Close all</button>
+              </div>
+            </Show>
+            <button class="rs-close" title="Close sidebar (t r)" onClick={toggleRightSidebar}>✕</button>
+          </div>
         </div>
         <div class="right-sidebar-body">
           <Show
@@ -60,13 +143,27 @@ export function RightSidebar(): JSX.Element {
             }
           >
             <For each={rightSidebar()}>
-              {(item, i) => (
+              {(item, i) => {
+                const key = surfaceKey(item);
+                const collapse = (control: HTMLButtonElement) => {
+                  const keepFocus = document.activeElement === control;
+                  const next = !item.collapsed;
+                  if (next) prepareSurfaceForUnmount(key);
+                  setRightSidebarItemCollapsed(i(), next);
+                  if (keepFocus) restoreDisclosureFocus(key);
+                };
+                const close = () => {
+                  prepareSurfaceForUnmount(key);
+                  closeRightSidebarItem(i());
+                };
+                return (
                 // Each sidebar item is its own editing surface, so a block that
                 // also shows in the main pane doesn't fight it for the caret.
-                <SurfaceContext.Provider value={`sidebar:${i()}`}>
-                  <SidebarItemView item={item} onClose={() => closeRightSidebarItem(i())} />
+                <SurfaceContext.Provider value={key}>
+                  <SidebarItemView item={item} surfaceKey={key} collapsed={!!item.collapsed} onToggle={collapse} onClose={close} />
                 </SurfaceContext.Provider>
-              )}
+                );
+              }}
             </For>
           </Show>
         </div>
@@ -80,8 +177,9 @@ export function RightSidebar(): JSX.Element {
 // renders off actual store presence, so a failed early attempt is harmless.
 // Re-runs on graphEpoch so a sidebar restored *before* the graph is open
 // retries once it opens.
-function useEnsurePage(name: () => string, kind: () => "journal" | "page") {
+function useEnsurePage(name: () => string, kind: () => "journal" | "page", enabled: () => boolean) {
   createEffect(() => {
+    if (!enabled()) return;
     const epoch = graphEpoch();
     const n = name();
     const k = kind();
@@ -101,26 +199,39 @@ function useEnsurePage(name: () => string, kind: () => "journal" | "page") {
   });
 }
 
-function SidebarItemView(props: { item: SidebarItem; onClose: () => void }): JSX.Element {
+function SidebarItemView(props: {
+  item: SidebarItem;
+  surfaceKey: string;
+  collapsed: boolean;
+  onToggle: (control: HTMLButtonElement) => void;
+  onClose: () => void;
+}): JSX.Element {
   return (
     <Show
       when={props.item.kind === "page"}
-      fallback={<BlockItem item={props.item as Extract<SidebarItem, { kind: "block" }>} onClose={props.onClose} />}
+      fallback={<BlockItem item={props.item as Extract<SidebarItem, { kind: "block" }>} surfaceKey={props.surfaceKey} collapsed={props.collapsed} onToggle={props.onToggle} onClose={props.onClose} />}
     >
-      <PageItem item={props.item as Extract<SidebarItem, { kind: "page" }>} onClose={props.onClose} />
+      <PageItem item={props.item as Extract<SidebarItem, { kind: "page" }>} surfaceKey={props.surfaceKey} collapsed={props.collapsed} onToggle={props.onToggle} onClose={props.onClose} />
     </Show>
   );
 }
 
 function PageItem(props: {
   item: { name: string; pageKind: "journal" | "page" };
+  surfaceKey: string;
+  collapsed: boolean;
+  onToggle: (control: HTMLButtonElement) => void;
   onClose: () => void;
 }): JSX.Element {
-  useEnsurePage(() => props.item.name, () => props.item.pageKind);
+  useEnsurePage(() => props.item.name, () => props.item.pageKind, () => !props.collapsed);
   const page = () => pageByName(props.item.name);
+  const bodyId = `rs-item-body-${createUniqueId()}`;
   return (
-    <div class="rs-item">
+    <div class="rs-item" data-sidebar-surface={props.surfaceKey} classList={{ collapsed: props.collapsed }}>
       <div class="rs-item-head">
+        <button class="rs-item-toggle" type="button" aria-label={props.collapsed ? "Expand sidebar item" : "Collapse sidebar item"} aria-expanded={!props.collapsed} aria-controls={bodyId} data-right-sidebar-item-toggle onClick={(event) => props.onToggle(event.currentTarget)}>
+          <span aria-hidden="true">▸</span>
+        </button>
         <a class="rs-item-title" onClick={() => openPage(props.item.name, props.item.pageKind)}>
           <EmojiText text={props.item.name} />
         </a>
@@ -128,14 +239,16 @@ function PageItem(props: {
           ✕
         </button>
       </div>
-      <Show when={page()} fallback={<div class="rs-item-body rs-item-loading" />}>
-        <div class="rs-item-body">
-          <For each={page()!.roots}>{(id) => <Block id={id} />}</For>
-          {/* OG shows a page's Linked/Unlinked References in the sidebar view too,
-              not just the main pane. Same lazy components, so this stays cheap. */}
-          <LinkedReferences name={props.item.name} />
-          <UnlinkedReferences name={props.item.name} />
-        </div>
+      <Show when={!props.collapsed}>
+        <Show when={page()} fallback={<div id={bodyId} class="rs-item-body rs-item-loading" />}>
+          <div id={bodyId} class="rs-item-body">
+            <For each={page()!.roots}>{(id) => <Block id={id} />}</For>
+            {/* OG shows a page's Linked/Unlinked References in the sidebar view too,
+                not just the main pane. Same lazy components, so this stays cheap. */}
+            <LinkedReferences name={props.item.name} />
+            <UnlinkedReferences name={props.item.name} />
+          </div>
+        </Show>
       </Show>
     </div>
   );
@@ -143,9 +256,12 @@ function PageItem(props: {
 
 function BlockItem(props: {
   item: { uuid: string; page: string; pageKind: "journal" | "page" };
+  surfaceKey: string;
+  collapsed: boolean;
+  onToggle: (control: HTMLButtonElement) => void;
   onClose: () => void;
 }): JSX.Element {
-  useEnsurePage(() => props.item.page, () => props.item.pageKind);
+  useEnsurePage(() => props.item.page, () => props.item.pageKind, () => !props.collapsed);
   // Resolve by store key first; fall back to finding the loaded node whose
   // persisted id:: matches (the in-memory key can differ from the id:: it was
   // parked under). Returns the live store node so edits stay propagated.
@@ -160,9 +276,13 @@ function BlockItem(props: {
     const n = node();
     return n ? visibleBody(n.raw)[0] || props.item.page : props.item.page;
   };
+  const bodyId = `rs-item-body-${createUniqueId()}`;
   return (
-    <div class="rs-item">
+    <div class="rs-item" data-sidebar-surface={props.surfaceKey} classList={{ collapsed: props.collapsed }}>
       <div class="rs-item-head">
+        <button class="rs-item-toggle" type="button" aria-label={props.collapsed ? "Expand sidebar item" : "Collapse sidebar item"} aria-expanded={!props.collapsed} aria-controls={bodyId} data-right-sidebar-item-toggle onClick={(event) => props.onToggle(event.currentTarget)}>
+          <span aria-hidden="true">▸</span>
+        </button>
         <a
           class="rs-item-title"
           onClick={() => openPage(props.item.page, props.item.pageKind)}
@@ -174,22 +294,24 @@ function BlockItem(props: {
           ✕
         </button>
       </div>
-      <Show
-        when={node()}
-        fallback={
-          <Show
-            when={pageLoaded()}
-            fallback={<div class="rs-item-body rs-item-loading" />}
-          >
-            <div class="rs-item-body rs-item-missing">This block is no longer available.</div>
-          </Show>
-        }
-      >
-        {(n) => (
-          <div class="rs-item-body">
-            <Block id={n().id} />
-          </div>
-        )}
+      <Show when={!props.collapsed}>
+        <Show
+          when={node()}
+          fallback={
+            <Show
+              when={pageLoaded()}
+              fallback={<div id={bodyId} class="rs-item-body rs-item-loading" />}
+            >
+              <div id={bodyId} class="rs-item-body rs-item-missing">This block is no longer available.</div>
+            </Show>
+          }
+        >
+          {(n) => (
+            <div id={bodyId} class="rs-item-body">
+              <Block id={n().id} />
+            </div>
+          )}
+        </Show>
       </Show>
     </div>
   );
