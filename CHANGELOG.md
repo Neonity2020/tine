@@ -17,6 +17,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Linked and unlinked references now use the complete page identity.** Plain
+  text mentions of a page alias appear under the canonical page's unlinked
+  references, while explicit links in page-level properties appear as exact,
+  read-only backlink rows. Scoped cache invalidation follows the same rules, so
+  edited references update immediately. (GH #126)
 - **Block embeds now behave as live editing surfaces.** Real disclosure clicks
   fold same-page and cross-page embedded branches locally without editing the
   macro host or changing the source block's collapse state, and Enter keeps the

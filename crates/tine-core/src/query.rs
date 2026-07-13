@@ -5,7 +5,9 @@
 
 use crate::date::JournalDate;
 use crate::doc::{DocBlock, Document};
-use crate::model::{block_to_dto, BlockDto, Graph, PageEntry, PageKind, RefGroup, TemplateDto};
+use crate::model::{
+    block_to_dto, BlockDto, Format, Graph, PageEntry, PageKind, RefGroup, TemplateDto,
+};
 use crate::refs;
 
 /// Parse a journal-page title (e.g. "Jan 1st, 2022") to a `yyyymmdd` ordinal.
@@ -78,6 +80,7 @@ fn crumb_line(b: &DocBlock) -> String {
 fn collect(
     graph: &Graph,
     mut keep: impl FnMut(&DocBlock) -> bool,
+    mut keep_page_properties: impl FnMut(&PageEntry, &str) -> Option<BlockDto>,
     exclude: Option<&str>,
 ) -> Vec<RefGroup> {
     let ex = exclude.map(refs::normalize);
@@ -90,6 +93,11 @@ fn collect(
                 continue;
             }
             let mut matched: Vec<BlockDto> = Vec::new();
+            if let Some(pre) = doc.pre_block.as_deref() {
+                if let Some(property_ref) = keep_page_properties(entry, pre) {
+                    matched.push(property_ref);
+                }
+            }
             let mut path: Vec<&DocBlock> = Vec::new();
             walk_path(&doc.roots, &mut path, &mut |b, anc| {
                 if keep(b) {
@@ -179,35 +187,102 @@ pub fn page_aliases(graph: &Graph) -> Vec<(String, String)> {
     })
 }
 
-pub fn backlinks(graph: &Graph, target: &str) -> Vec<RefGroup> {
-    // Alias-aware: a page's backlinks include references made through any of its
-    // aliases, and looking up an alias resolves to its canonical page. Use the
-    // cached alias map rather than rescanning every page on each backlink call.
-    let aliases = graph.page_aliases();
-    let tnorm = refs::normalize(target);
+/// Resolve a requested page/alias to its canonical display name and all
+/// normalized names that identify that page. The normalized list is shared by
+/// backlinks, unlinked references, and their scoped-invalidation predicates so
+/// those paths cannot drift.
+fn equivalent_page_names(aliases: &[(String, String)], target: &str) -> (String, Vec<String>) {
+    let target_norm = refs::normalize(target);
     let canonical = aliases
         .iter()
-        .find(|(a, _)| *a == tnorm)
-        .map(|(_, c)| c.clone())
+        .find(|(alias, _)| *alias == target_norm)
+        .map(|(_, canonical)| canonical.clone())
         .unwrap_or_else(|| target.to_string());
-    let cnorm = refs::normalize(&canonical);
-    let mut names: Vec<String> = vec![canonical.clone()];
-    for (a, c) in &aliases {
-        if refs::normalize(c) == cnorm {
-            names.push(a.clone());
+    let canonical_norm = refs::normalize(&canonical);
+    let mut names = vec![canonical_norm.clone()];
+    for (alias, alias_target) in aliases {
+        if refs::normalize(alias_target) == canonical_norm && !names.contains(alias) {
+            names.push(alias.clone());
         }
     }
-    // Pre-normalize the target names ONCE, not once per block per name:
-    // `refs_contains` re-`normalize`d its argument for every block, so a hub
-    // page on a large graph allocated O(blocks × names) throwaway normalized
-    // strings. Compare the already-normalized projection refs directly.
-    let names_norm: Vec<String> = names.iter().map(|n| refs::normalize(n)).collect();
+    (canonical, names)
+}
+
+fn org_property_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    if let Some(rest) = trimmed.strip_prefix("#+") {
+        return rest
+            .split_once(':')
+            .is_some_and(|(key, _)| !key.trim().is_empty());
+    }
+    trimmed
+        .strip_prefix(':')
+        .and_then(|rest| rest.split_once(':'))
+        .is_some_and(|(key, _)| !key.trim().is_empty())
+}
+
+/// Keep only page-property source lines from a document pre-block. Free-form
+/// preamble text is not a Logseq page property and must not become a backlink.
+fn page_property_raw(pre: &str, is_org: bool) -> String {
+    pre.lines()
+        .filter(|line| {
+            crate::doc::parse_property_line(line).is_some() || (is_org && org_property_line(line))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn property_projection(raw: &str, is_org: bool) -> DocBlock {
+    DocBlock {
+        raw: raw.to_string(),
+        children: Vec::new(),
+        uuid: String::new(),
+        is_org,
+        proj: std::sync::OnceLock::new(),
+    }
+}
+
+fn page_properties_reference_names(
+    pre: &str,
+    is_org: bool,
+    names_norm: &[String],
+) -> Option<String> {
+    let raw = page_property_raw(pre, is_org);
+    if raw.is_empty() {
+        return None;
+    }
+    let block = property_projection(&raw, is_org);
+    let refs = &block.projection().refs_norm;
+    names_norm
+        .iter()
+        .any(|name| refs.iter().any(|reference| reference == name))
+        .then_some(raw)
+}
+
+fn page_property_backlink(entry: &PageEntry, pre: &str, names_norm: &[String]) -> Option<BlockDto> {
+    let is_org = Format::from_path(&entry.path) == Format::Org;
+    let raw = page_properties_reference_names(pre, is_org, names_norm)?;
+    let mut block = property_projection(&raw, is_org);
+    block.uuid = format!(
+        "page-property:{:?}:{}",
+        entry.kind,
+        refs::page_key(&entry.name)
+    );
+    let mut dto = block_to_dto(&block);
+    dto.page_property = true;
+    Some(dto)
+}
+
+pub fn backlinks(graph: &Graph, target: &str) -> Vec<RefGroup> {
+    let aliases = graph.page_aliases();
+    let (canonical, names_norm) = equivalent_page_names(&aliases, target);
     collect(
         graph,
         |b| {
             let refs = &b.projection().refs_norm;
             names_norm.iter().any(|n| refs.iter().any(|r| r == n))
         },
+        |entry, pre| page_property_backlink(entry, pre, &names_norm),
         Some(&canonical),
     )
 }
@@ -225,6 +300,7 @@ pub fn block_referrers(graph: &Graph, uuid: &str) -> Vec<RefGroup> {
     collect(
         graph,
         |b| b.projection().block_refs.iter().any(|r| r == u),
+        |_, _| None,
         None,
     )
 }
@@ -251,17 +327,19 @@ fn contains_word(hay: &str, needle: &str) -> bool {
 /// Unlinked references: blocks that mention `target` as plain text (whole word)
 /// but do NOT link it via `[[..]]`/`#tag`.
 pub fn unlinked_refs(graph: &Graph, target: &str) -> Vec<RefGroup> {
-    let lower = target.to_lowercase();
-    // Hoist the loop-invariant ref normalization out of the per-block closure
-    // (was re-normalized inside `refs_contains` for every block — F3/Codex#5).
-    let target_norm = refs::normalize(target);
+    let aliases = graph.page_aliases();
+    let (canonical, names_norm) = equivalent_page_names(&aliases, target);
     collect(
         graph,
         |b| {
-            contains_word(&b.raw.to_lowercase(), &lower)
-                && !b.projection().refs_contains_norm(&target_norm)
+            let lower = b.raw.to_lowercase();
+            names_norm.iter().any(|name| contains_word(&lower, name))
+                && !names_norm
+                    .iter()
+                    .any(|name| b.projection().refs_contains_norm(name))
         },
-        Some(target),
+        |_, _| None,
+        Some(&canonical),
     )
 }
 
@@ -455,24 +533,27 @@ pub(crate) fn page_affects_query(src: &str, entry: &PageEntry, doc: &Document) -
 pub(crate) fn page_affects_backlinks(
     aliases: &[(String, String)],
     target: &str,
+    entry: &PageEntry,
     doc: &Document,
 ) -> bool {
-    let tnorm = refs::normalize(target);
-    let canonical = aliases
-        .iter()
-        .find(|(a, _)| *a == tnorm)
-        .map(|(_, c)| c.clone())
-        .unwrap_or_else(|| target.to_string());
-    let cnorm = refs::normalize(&canonical);
-    let mut names: Vec<String> = vec![canonical];
-    for (a, c) in aliases {
-        if refs::normalize(c) == cnorm {
-            names.push(a.clone());
-        }
+    let (_, names_norm) = equivalent_page_names(aliases, target);
+    if doc.pre_block.as_deref().is_some_and(|pre| {
+        page_properties_reference_names(
+            pre,
+            Format::from_path(&entry.path) == Format::Org,
+            &names_norm,
+        )
+        .is_some()
+    }) {
+        return true;
     }
     let mut hit = false;
     walk(&doc.roots, &mut |b| {
-        if !hit && names.iter().any(|n| b.projection().refs_contains(n)) {
+        if !hit
+            && names_norm
+                .iter()
+                .any(|name| b.projection().refs_contains_norm(name))
+        {
             hit = true;
         }
     });
@@ -481,14 +562,20 @@ pub(crate) fn page_affects_backlinks(
 
 /// Whether page `doc` plain-text-mentions `target` unlinked — i.e. could be in
 /// `unlinked_refs(target)`. Mirrors `unlinked_refs`'s matcher.
-pub(crate) fn page_affects_unlinked(target: &str, doc: &Document) -> bool {
-    let lower = target.to_lowercase();
-    let target_norm = refs::normalize(target); // hoisted (F3/Codex#5)
+pub(crate) fn page_affects_unlinked(
+    aliases: &[(String, String)],
+    target: &str,
+    doc: &Document,
+) -> bool {
+    let (_, names_norm) = equivalent_page_names(aliases, target);
     let mut hit = false;
     walk(&doc.roots, &mut |b| {
+        let lower = b.raw.to_lowercase();
         if !hit
-            && contains_word(&b.raw.to_lowercase(), &lower)
-            && !b.projection().refs_contains_norm(&target_norm)
+            && names_norm.iter().any(|name| contains_word(&lower, name))
+            && !names_norm
+                .iter()
+                .any(|name| b.projection().refs_contains_norm(name))
         {
             hit = true;
         }

@@ -167,6 +167,10 @@ pub struct BlockDto {
     /// empty for normal page loads. Lets the UI show a "parent › child" trail.
     #[serde(default)]
     pub breadcrumb: Vec<String>,
+    /// Synthetic, read-only result row representing references from the source
+    /// page's property pre-block rather than an editable outline block.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub page_property: bool,
     // --- M1: block-header facets, computed ONCE off the lsdoc projection (the one
     // grammar source) and shipped so the frontend never re-derives them with its
     // own scanner. Derived (not authoritative — `raw` round-trips); the frontend
@@ -2475,8 +2479,8 @@ impl Graph {
                 return false;
             }
             let affects = match key.split_once('\0') {
-                Some(("b", t)) => crate::query::page_affects_backlinks(&aliases, t, doc),
-                Some(("u", t)) => crate::query::page_affects_unlinked(t, doc),
+                Some(("b", t)) => crate::query::page_affects_backlinks(&aliases, t, entry, doc),
+                Some(("u", t)) => crate::query::page_affects_unlinked(&aliases, t, doc),
                 Some(("q", s)) => crate::query::page_affects_query(s, entry, doc),
                 _ => true, // unknown key shape → evict to stay safe
             };
@@ -4448,6 +4452,7 @@ pub fn block_to_dto(b: &DocBlock) -> BlockDto {
         collapsed: b.collapsed(),
         children: b.children.iter().map(block_to_dto).collect(),
         breadcrumb: Vec::new(),
+        page_property: false,
         // All header facets off the one lsdoc projection (marker/priority/heading/
         // properties/scheduled/deadline) — priority is header-position only, matching
         // the chip, so a loaded block never shows a priority the edit path wouldn't.

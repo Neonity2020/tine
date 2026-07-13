@@ -9,6 +9,8 @@ export interface BlockDto {
   children: BlockDto[];
   /** Ancestor first-lines (search/reference results only). */
   breadcrumb?: string[];
+  /** Synthetic read-only backlink row sourced from page-level properties. */
+  page_property?: boolean;
   // M1 block-header facets, computed once off the Rust lsdoc projection and shipped
   // so the frontend reads them off the DTO (no parse on load) instead of re-deriving
   // with its own scanner. Omitted by the backend when empty (see model.rs BlockDto).
