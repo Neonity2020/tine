@@ -21,6 +21,10 @@
   --marker-later: #9b6fd4;
   --marker-done: #5fa37a;
   --marker-waiting: #c08bd0;
+
+  /* A restrained semantic cue for block embeds. It follows both built-in and
+     custom theme tokens, and custom.css may override this token directly. */
+  --block-embed-accent: color-mix(in srgb, var(--accent) 35%, var(--bullet-color));
 }
 
 html[data-theme="light"] {

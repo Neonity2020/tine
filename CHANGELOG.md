@@ -10,6 +10,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Added
 
+- **Block embeds have a restrained, theme-aware identity cue.** The embedded
+  root bullet and its heavier descendant guide share a muted accent derived
+  from the active theme; ordinary bullets, guides, text, and backgrounds remain
+  unchanged, and custom CSS can override the semantic token. (GH #125)
 - **Favorites and Recent can now be collapsed independently in the left
   sidebar.** Both sections default open, retain their item counts while folded,
   work as keyboard-accessible disclosures, and remember their state separately

@@ -6403,9 +6403,12 @@ img.emoji {
   padding-left: 0;
   margin: 0;
 }
+.block-embed-host .embed-block > .live-ref-group > .ls-block > .block-main > .block-controls .bullet {
+  background: var(--block-embed-accent);
+}
 .block-embed-host .embed-block > .live-ref-group > .ls-block > .block-children-container > .block-children {
   border-left-width: 2px;
-  border-left-color: var(--border-color);
+  border-left-color: var(--block-embed-accent);
 }
 
 /* video / iframe embeds */
