@@ -4,10 +4,18 @@
 // Usage: npm run build && node scripts/shot-block-embed.mjs
 import { chromium } from "playwright";
 import { spawn } from "node:child_process";
+import { mkdirSync } from "node:fs";
 import { setTimeout as sleep } from "node:timers/promises";
 
 const PORT = 5206;
-const OUT = "screenshots/block-embed-root.png";
+const OUT = "screenshots/block-embed-accent";
+const CASES = [
+  { name: "default-light", theme: "", mode: "light" },
+  { name: "default-dark", theme: "", mode: "dark" },
+  { name: "nord-dark", theme: "nord", mode: "dark" },
+  { name: "solarized-dark", theme: "solarized", mode: "dark" },
+  { name: "gruvbox-dark", theme: "gruvbox", mode: "dark" },
+];
 const server = spawn("npx", ["vite", "preview", "--port", String(PORT), "--strictPort"], { stdio: "ignore" });
 let browser;
 let failed = false;
@@ -23,6 +31,7 @@ async function waitForServer(url) {
 }
 
 try {
+  mkdirSync(OUT, { recursive: true });
   await waitForServer(`http://localhost:${PORT}/?regressions`);
   browser = await chromium.launch();
   const page = await browser.newPage({ viewport: { width: 900, height: 600 } });
@@ -49,6 +58,40 @@ try {
   );
   const guideWidth = await rootGuide.evaluate((element) => getComputedStyle(element).borderLeftWidth);
 
+  async function accentMetrics() {
+    return host.evaluate((element) => {
+      const root = element.querySelector(
+        ".embed-block > .live-ref-group > .ls-block",
+      );
+      const child = root?.querySelector(":scope > .block-children-container > .block-children > .ls-block");
+      const rootBullet = root?.querySelector(":scope > .block-main > .block-controls .bullet");
+      const childBullet = child?.querySelector(":scope > .block-main > .block-controls .bullet");
+      const rootGuide = root?.querySelector(":scope > .block-children-container > .block-children");
+      const childGuide = child?.querySelector(":scope > .block-children-container > .block-children");
+      if (!rootBullet || !childBullet || !rootGuide || !childGuide) {
+        throw new Error("missing embedded root/child accent geometry");
+      }
+      return {
+        rootBullet: getComputedStyle(rootBullet).backgroundColor,
+        childBullet: getComputedStyle(childBullet).backgroundColor,
+        rootGuide: getComputedStyle(rootGuide).borderLeftColor,
+        childGuide: getComputedStyle(childGuide).borderLeftColor,
+      };
+    });
+  }
+
+  function assertAccent(label, metrics) {
+    if (metrics.rootBullet !== metrics.rootGuide) {
+      throw new Error(`${label}: root bullet ${metrics.rootBullet} and guide ${metrics.rootGuide} drifted`);
+    }
+    if (metrics.rootBullet === metrics.childBullet) {
+      throw new Error(`${label}: embedded root bullet did not differ from ordinary child bullet`);
+    }
+    if (metrics.rootGuide === metrics.childGuide) {
+      throw new Error(`${label}: embedded root guide did not differ from ordinary child guide`);
+    }
+  }
+
   if (bulletCount !== 3) {
     // One root + child + grandchild. The removed host bullet would make four.
     throw new Error(`expected 3 outline bullets, got ${bulletCount}`);
@@ -60,13 +103,47 @@ try {
     throw new Error(`embedded live outline has no collapse control: ${await host.locator(".embed-block").innerHTML()}`);
   }
   const child = host.getByText("Embedded child", { exact: true });
-  await rootToggle.dispatchEvent("click");
+  await rootToggle.click();
   await child.waitFor({ state: "detached", timeout: 3000 });
-  await rootToggle.dispatchEvent("click");
+  await rootToggle.click();
   await host.getByText("Embedded grandchild", { exact: true }).waitFor({ timeout: 3000 });
   if (errors.length) throw new Error(`browser errors:\n${errors.join("\n")}`);
 
-  await host.screenshot({ path: OUT });
+  for (const testCase of CASES) {
+    await page.evaluate(({ theme, mode }) => {
+      document.documentElement.setAttribute("data-theme", mode);
+      window.__tineApplyTheme?.(theme);
+    }, testCase);
+    await sleep(180);
+    const metrics = await accentMetrics();
+    assertAccent(testCase.name, metrics);
+    await host.screenshot({ path: `${OUT}/${testCase.name}.png` });
+    console.log(JSON.stringify({ case: testCase.name, ...metrics }));
+  }
+
+  const previousMetrics = await accentMetrics();
+  const custom = await page.evaluate(() => {
+    const style = document.createElement("style");
+    style.id = "block-embed-accent-probe";
+    style.textContent = 'html[data-theme="dark"] { --accent: rgb(210, 70, 90); --bullet-color: rgb(90, 100, 110); }';
+    document.head.appendChild(style);
+    return true;
+  });
+  if (!custom) throw new Error("could not install custom accent probe");
+  const customMetrics = await accentMetrics();
+  assertAccent("custom accent", customMetrics);
+  if (customMetrics.rootBullet === previousMetrics.rootBullet) {
+    throw new Error("custom accent tokens did not recolor the block-embed accent");
+  }
+
+  await page.evaluate(() => {
+    const style = document.getElementById("block-embed-accent-probe");
+    if (style) style.textContent += "\n:root { --block-embed-accent: rgb(1, 2, 3); }";
+  });
+  const overrideMetrics = await accentMetrics();
+  if (overrideMetrics.rootBullet !== "rgb(1, 2, 3)" || overrideMetrics.rootGuide !== "rgb(1, 2, 3)") {
+    throw new Error(`custom --block-embed-accent override did not win: ${JSON.stringify(overrideMetrics)}`);
+  }
   console.log(JSON.stringify({ out: OUT, bulletCount, hostControlCount, embeddedBulletCount, guideWidth }));
 } catch (error) {
   console.error(String(error));

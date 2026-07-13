@@ -79,3 +79,21 @@ describe("RefBlocks task checkbox (parity with <Block>, OG block-checkbox)", () 
     expect(canceled.html).not.toContain("block-task-checkbox");
   });
 });
+
+describe("RefBlocks page-property references", () => {
+  it("renders an exact synthetic page-property backlink instead of hiding it as block metadata", () => {
+    const out = html(() => RefBlocks({
+      page: "A",
+      blocks: [dto({
+        id: "page-property:A",
+        raw: "created:: [[Jul 13th, 2026]]",
+        page_property: true,
+        marker: undefined,
+        priority: undefined,
+      })],
+    }));
+    expect(out.html).toContain("page-property-reference");
+    expect(out.text).toContain("created::");
+    expect(out.text).toContain("Jul 13th, 2026");
+  });
+});

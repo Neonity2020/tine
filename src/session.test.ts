@@ -2,6 +2,15 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { buildPersistedSession, parsePersistedSession, type PersistedSession } from "./session";
 import { resetPaneLayoutToSingle, restorePaneLayout, type LayoutNode } from "./panes";
 import type { PaneSnapshot } from "./router";
+import {
+  applySidebarSession,
+  favoritesSectionExpanded,
+  recentSectionExpanded,
+  rightSidebar,
+  setRightSidebar,
+  setFavoritesSectionExpanded,
+  setRecentSectionExpanded,
+} from "./ui";
 
 const journals = (): PaneSnapshot => ({
   tabs: [{ history: [{ kind: "journals" }], pos: 0, pinned: false }],
@@ -17,6 +26,7 @@ const page = (name: string): PaneSnapshot => ({
 
 beforeEach(() => {
   resetPaneLayoutToSingle(journals());
+  applySidebarSession({});
 });
 
 describe("persisted split session", () => {
@@ -61,6 +71,72 @@ describe("persisted split session", () => {
       pinned: true,
     });
     expect(parsed.snapshots.get("main")?.scrolls).toEqual([99]);
+  });
+
+  it("round-trips a bounded virtual query workspace without persisting results", () => {
+    const raw = JSON.stringify({
+      tabs: [{
+        history: [{
+          kind: "query",
+          id: "query-1",
+          sourceKind: "search",
+          source: "alpha -draft",
+          presentation: "search",
+        }],
+        pos: 0,
+        pinned: true,
+      }],
+      activeIndex: 0,
+    });
+
+    const parsed = parsePersistedSession(raw)!;
+    expect(parsed.snapshots.get("main")?.tabs[0]).toMatchObject({
+      pinned: true,
+      history: [{
+        kind: "query",
+        id: "query-1",
+        sourceKind: "search",
+        source: "alpha -draft",
+        presentation: "search",
+      }],
+    });
+    expect(JSON.stringify(parsed)).not.toContain("results");
+  });
+
+  it("round-trips graph-scoped Favorites and Recent disclosure state and defaults legacy sessions open", () => {
+    setFavoritesSectionExpanded(false);
+    setRecentSectionExpanded(true);
+    const persisted = buildPersistedSession();
+    expect(persisted.favoritesSectionExpanded).toBe(false);
+    expect(persisted.recentSectionExpanded).toBe(true);
+
+    const parsed = parsePersistedSession(JSON.stringify(persisted))!;
+    setFavoritesSectionExpanded(true);
+    setRecentSectionExpanded(false);
+    applySidebarSession(parsed.sidebar);
+    expect(favoritesSectionExpanded()).toBe(false);
+    expect(recentSectionExpanded()).toBe(true);
+
+    applySidebarSession({});
+    expect(favoritesSectionExpanded()).toBe(true);
+    expect(recentSectionExpanded()).toBe(true);
+  });
+
+  it("round-trips each right-sidebar item's graph-local disclosure state", () => {
+    setRightSidebar([
+      { kind: "page", name: "Expanded", pageKind: "page", collapsed: false },
+      { kind: "block", uuid: "stable-block", page: "Source", pageKind: "page", collapsed: true },
+    ]);
+    const persisted = buildPersistedSession();
+    expect(persisted.rightSidebarItems?.map((item) => item.collapsed)).toEqual([false, true]);
+
+    const parsed = parsePersistedSession(JSON.stringify(persisted))!;
+    setRightSidebar([]);
+    applySidebarSession(parsed.sidebar);
+    expect(rightSidebar()).toEqual(persisted.rightSidebarItems);
+
+    applySidebarSession({ items: [{ kind: "page", name: "Legacy", pageKind: "page" }] });
+    expect(rightSidebar()[0].collapsed).toBeUndefined();
   });
 
   it("rewrites duplicate restored journals panes to a previous page route", () => {

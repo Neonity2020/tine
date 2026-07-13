@@ -19,6 +19,7 @@ import type {
   SyncConflictDiff,
   MergeDecision,
   PrintOpts,
+  QueryExecution,
 } from "./types";
 import { assetFileName } from "./media";
 import { mockBackend } from "./mock";
@@ -90,7 +91,15 @@ export type LoadGraphResult =
   | { kind: "loaded" | "already_current"; meta: GraphMeta; binding_generation: number }
   | { kind: "focused_existing"; window_label: string };
 
+export interface GraphAccessInspection {
+  graph_root: string;
+  external_assets_path: string | null;
+  approved: boolean;
+}
+
 export interface Backend {
+  inspectGraphAccess(path: string): Promise<GraphAccessInspection>;
+  approveExternalAssets(graphRoot: string, assetsPath: string): Promise<void>;
   loadGraph(path: string): Promise<LoadGraphResult>;
   openGraphWindow(path: string): Promise<LoadGraphResult>;
   startupGraphPath(): Promise<string | null>;
@@ -249,6 +258,14 @@ export interface Backend {
    *  appeared or vanished). Returns an unlisten fn. */
   onConflictsChanged(cb: () => void): Promise<() => void>;
   search(query: string, limit: number, lane?: string): Promise<RefGroup[]>;
+  /** One Rust-authoritative graph selection plan for page and block hits. */
+  runGraphSearch(
+    source: string,
+    pageLimit: number,
+    blockLimit: number,
+    lane?: string,
+    explain?: boolean
+  ): Promise<QueryExecution>;
   quickSwitch(query: string, limit: number): Promise<PageEntry[]>;
   listTemplates(): Promise<TemplateDto[]>;
   resolveBlock(uuid: string): Promise<RefGroup | null>;
@@ -433,6 +450,12 @@ class TauriBackend implements Backend {
     if (result.kind !== "focused_existing") this.bindingGeneration = result.binding_generation;
     return result;
   }
+  inspectGraphAccess(path: string) {
+    return this.call<GraphAccessInspection>("inspect_graph_access", { path });
+  }
+  approveExternalAssets(graphRoot: string, assetsPath: string) {
+    return this.call<void>("approve_external_assets", { graphRoot, assetsPath });
+  }
   openGraphWindow(path: string) {
     return this.call<LoadGraphResult>("open_graph_window", { path });
   }
@@ -604,6 +627,9 @@ class TauriBackend implements Backend {
   }
   search(query: string, limit: number, lane?: string) {
     return this.call<RefGroup[]>("search", { query, limit, lane });
+  }
+  runGraphSearch(source: string, pageLimit: number, blockLimit: number, lane = "graph-search", explain = false) {
+    return this.call<QueryExecution>("run_graph_search", { source, pageLimit, blockLimit, lane, explain });
   }
   quickSwitch(query: string, limit: number) {
     return this.call<PageEntry[]>("quick_switch", { query, limit });

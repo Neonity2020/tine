@@ -27,6 +27,8 @@ import {
   deleteBlock,
   ensureEmptyBlock,
   toggleCollapse,
+  collapsibleDescendantIds,
+  setCollapsedDescendants,
   visibleOrder,
   setRaw,
   undo,
@@ -72,6 +74,8 @@ import {
   recentPages,
   setFavorites,
   setRecentPages,
+  rightSidebar,
+  setRightSidebar,
   seedFavorites,
   renamePageInNavigation,
   dataRev,
@@ -125,6 +129,7 @@ beforeEach(() => {
   });
   setFavorites([]);
   setRecentPages([]);
+  setRightSidebar([]);
   setCopyIncludeSubtree(false); // copy prefs default OFF; reset so tests don't leak
   setCopyStripCollapsed(false);
 });
@@ -892,6 +897,57 @@ describe("collapse / visible order", () => {
     expect(doc.byId[p].raw).not.toContain("collapsed::");
   });
 
+  it("changes collapsible descendants but not the guide parent in one undo unit", () => {
+    const dto = load([
+      blk("root", [
+        blk("child", [blk("grandchild", [blk("great")])]),
+        blk("leaf"),
+      ]),
+    ]);
+    const root = dto.blocks[0].id;
+    const child = dto.blocks[0].children[0].id;
+    const grandchild = dto.blocks[0].children[0].children[0].id;
+    const leaf = dto.blocks[0].children[1].id;
+
+    expect(collapsibleDescendantIds(root)).toEqual([child, grandchild]);
+    setCollapsedDescendants(root, true);
+    expect(doc.byId[root].collapsed).toBe(false);
+    expect(doc.byId[child].collapsed).toBe(true);
+    expect(doc.byId[grandchild].collapsed).toBe(true);
+    expect(doc.byId[leaf].collapsed).toBe(false);
+
+    undo();
+    expect(doc.byId[child].collapsed).toBe(false);
+    expect(doc.byId[grandchild].collapsed).toBe(false);
+  });
+
+  it("walks a large subtree once without relying on mounted DOM descendants", () => {
+    const byId: Record<string, (typeof doc.byId)[string]> = {
+      root: { id: "root", raw: "root", collapsed: false, parent: null, page: "Large", children: [] },
+    };
+    for (let i = 0; i < 2_000; i++) {
+      const branch = `branch-${i}`;
+      const leaf = `leaf-${i}`;
+      byId.root.children.push(branch);
+      byId[branch] = { id: branch, raw: branch, collapsed: false, parent: "root", page: "Large", children: [leaf] };
+      byId[leaf] = { id: leaf, raw: leaf, collapsed: false, parent: branch, page: "Large", children: [] };
+    }
+    setDoc({
+      byId,
+      pages: [{
+        name: "Large", kind: "page", title: "Large", preBlock: null, roots: ["root"],
+        format: "md", readOnly: false, guide: false,
+      }],
+      feed: [],
+      loaded: true,
+    });
+
+    expect(collapsibleDescendantIds("root")).toHaveLength(2_000);
+    setCollapsedDescendants("root", true);
+    expect(doc.byId["branch-1999"].collapsed).toBe(true);
+    expect(doc.byId.root.collapsed).toBe(false);
+  });
+
   it("treats grid blocks as opaque in visible order", () => {
     const grid = blk("grid\ntine.view:: grid", [
       blk("", [blk("r1c1"), blk("r1c2")]),
@@ -1202,6 +1258,11 @@ describe("save engine (persistence)", () => {
     ]);
     setFavorites([{ name: "Older", kind: "journal" }, { name: "Pinned", kind: "page" }]);
     setRecentPages([{ name: "Older", kind: "journal" }, { name: "Pinned", kind: "page" }]);
+    setRightSidebar([
+      { kind: "page", name: "Older", pageKind: "journal", collapsed: true },
+      { kind: "block", uuid: "older-block", page: "Older", pageKind: "journal", collapsed: true },
+      { kind: "page", name: "Pinned", pageKind: "page" },
+    ]);
 
     expect(await deletePage("Older", "journal")).toBe(true);
 
@@ -1209,6 +1270,7 @@ describe("save engine (persistence)", () => {
     expect(pageByName("Older")).toBeUndefined();
     expect(favorites()).toEqual([{ name: "Pinned", kind: "page" }]);
     expect(recentPages()).toEqual([{ name: "Pinned", kind: "page" }]);
+    expect(rightSidebar()).toEqual([{ kind: "page", name: "Pinned", pageKind: "page" }]);
   });
 
   it("a successful rename re-keys favorites and collapses old/new recent duplicates", () => {
@@ -1222,6 +1284,10 @@ describe("save engine (persistence)", () => {
       { name: "Other", kind: "page" },
       { name: "Old", kind: "page" },
     ]);
+    setRightSidebar([
+      { kind: "page", name: "Old", pageKind: "page", collapsed: true },
+      { kind: "block", uuid: "kept", page: "Old", pageKind: "page", collapsed: false },
+    ]);
 
     renamePageInNavigation("Old", "New");
 
@@ -1233,6 +1299,23 @@ describe("save engine (persistence)", () => {
       { name: "New", kind: "page" },
       { name: "Other", kind: "page" },
     ]);
+    expect(rightSidebar()).toEqual([
+      { kind: "page", name: "New", pageKind: "page", collapsed: true },
+      { kind: "block", uuid: "kept", page: "New", pageKind: "page", collapsed: false },
+    ]);
+  });
+
+  it("deleteBlock removes a matching sidebar item and its disclosure state", () => {
+    const target = blk("Target\nid:: stable-target");
+    load([target, blk("Keep")]);
+    setRightSidebar([
+      { kind: "block", uuid: "stable-target", page: "Test", pageKind: "page", collapsed: true },
+      { kind: "page", name: "Test", pageKind: "page" },
+    ]);
+
+    deleteBlock(target.id);
+
+    expect(rightSidebar()).toEqual([{ kind: "page", name: "Test", pageKind: "page" }]);
   });
 
   it("seedFavorites replaces (per-graph) on graph open, clearing to empty for a graph with none", () => {

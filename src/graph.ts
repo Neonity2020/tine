@@ -2,7 +2,7 @@
 // persisting the choice so it reopens next launch.
 
 import { backend } from "./backend";
-import { setGraphMeta, setWorkflow, bumpGraphEpoch, setRightSidebar, graphMeta, graphEpoch, setAliasMap, seedFavorites, pruneSidebarBlocks, pushToast, refreshJournalConflicts, refreshSyncConflicts, clearRecent, graphTransitioning, setGraphTransitioning, renamePageInNavigation } from "./ui";
+import { setGraphMeta, setWorkflow, bumpGraphEpoch, setRightSidebar, graphMeta, graphEpoch, setAliasMap, seedFavorites, pruneSidebarBlocks, pushToast, refreshJournalConflicts, refreshSyncConflicts, clearRecent, graphTransitioning, setGraphTransitioning, renamePageInNavigation, resetLeftSidebarSections } from "./ui";
 import { resetStore, flushAll } from "./store";
 import { clearAssetBlobCache } from "./assetCache";
 import { resetTabsToJournals, openPage, restoreSession, flushSession } from "./router";
@@ -32,6 +32,29 @@ export function persistedGraphPath(): string {
 export type LoadGraphPathOutcome =
   | { kind: "loaded" | "already_current"; root: string }
   | { kind: "focused_existing" | "aborted" };
+
+/** Establish the one exceptional filesystem capability Tine supports: a graph
+ * may point `assets` at an external directory, but only after this installation
+ * shows the resolved target and receives explicit consent. */
+export async function authorizeGraphAccess(path: string): Promise<boolean> {
+  const access = await backend().inspectGraphAccess(path);
+  const external = access.external_assets_path;
+  if (!external || access.approved) return true;
+  const approved = await backend().confirm(
+    `This graph's assets folder points outside the graph to:\n\n${external}\n\nAllow Tine to read and write assets in this directory? This approval is stored only on this device.`,
+    "Allow external assets directory?"
+  );
+  if (!approved) {
+    pushToast(
+      `Graph not opened: its external assets directory was not approved (${external}).`,
+      "error",
+      { sticky: true }
+    );
+    return false;
+  }
+  await backend().approveExternalAssets(access.graph_root, external);
+  return true;
+}
 
 export async function loadGraphPath(
   path: string,
@@ -66,6 +89,7 @@ export async function loadGraphPath(
     return { kind: "aborted" };
   }
   if (hadGraph) await flushSession();
+  if (!(await authorizeGraphAccess(path))) return { kind: "aborted" };
   const result = await backend().loadGraph(path);
   if (result.kind === "focused_existing") return { kind: "focused_existing" };
   const meta = result.meta;
@@ -81,6 +105,7 @@ export async function loadGraphPath(
     setRightSidebar([]);
     clearRecent();
   }
+  if (switching || !hadGraph) resetLeftSidebarSections();
   setGraphMeta(meta ?? null);
   // Revoke every in-flight result from the previous binding NOW, before the
   // awaited journal-template step. This is also required for same-root force

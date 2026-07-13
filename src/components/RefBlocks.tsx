@@ -37,16 +37,20 @@ function RefBlock(props: {
   // computed these). Ref/linked/unlinked panels render hundreds of rows; parsing each
   // was a real hot-path cost and churned the facet cache (audit P3).
   const facets = createMemo(() => facetsFromDto(props.block));
-  const lines = createMemo(() => visibleBody(props.block.raw));
+  const lines = createMemo(() =>
+    props.block.page_property
+      ? props.block.raw.split("\n").filter((line) => line.trim().length > 0)
+      : visibleBody(props.block.raw)
+  );
   return (
-    <div class="ls-block ref-block">
+    <div class="ls-block ref-block" classList={{ "page-property-reference": !!props.block.page_property }}>
       <div class="block-main">
         <div class="block-controls">
           <span
             class="bullet-container"
-            title="Shift-click to open in sidebar"
+            title={props.block.page_property ? "Page property reference" : "Shift-click to open in sidebar"}
             onClick={(e) => {
-              if (e.shiftKey) {
+              if (!props.block.page_property && e.shiftKey) {
                 e.stopPropagation();
                 openBlockInSidebar({
                   uuid: props.block.id,

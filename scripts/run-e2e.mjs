@@ -16,6 +16,21 @@ const artifactRoot = path.resolve(process.env.E2E_ARTIFACT_DIR || path.join(root
 const timeoutMs = Number(process.env.E2E_SCENARIO_TIMEOUT_MS || 180_000);
 const suiteStartedAt = new Date().toISOString();
 
+// Rootless/container fallback for native focus tests. CI images normally
+// install openbox + xdotool system-wide; a developer sandbox may instead keep
+// their extracted Debian packages outside the repository. Discover that
+// workspace-local bundle automatically so the documented npm command remains
+// the complete gate rather than requiring a remembered shell incantation.
+const portableDeps = path.resolve(process.env.TINE_E2E_DEPS_ROOT || path.join(root, "../.codex-deps/openbox/root"));
+const baseProcessEnv = { ...process.env };
+if (fs.existsSync(path.join(portableDeps, "usr/bin/openbox")) && fs.existsSync(path.join(portableDeps, "usr/bin/xdotool"))) {
+  const lib = path.join(portableDeps, "usr/lib/x86_64-linux-gnu");
+  baseProcessEnv.PATH = `${path.join(portableDeps, "usr/bin")}${path.delimiter}${baseProcessEnv.PATH || ""}`;
+  baseProcessEnv.LD_LIBRARY_PATH = [lib, baseProcessEnv.LD_LIBRARY_PATH].filter(Boolean).join(path.delimiter);
+  baseProcessEnv.XDG_CONFIG_DIRS = [path.join(portableDeps, "etc/xdg"), baseProcessEnv.XDG_CONFIG_DIRS || "/etc/xdg"].join(path.delimiter);
+  baseProcessEnv.XDG_DATA_DIRS = [path.join(portableDeps, "usr/share"), baseProcessEnv.XDG_DATA_DIRS || "/usr/local/share:/usr/share"].join(path.delimiter);
+}
+
 const suites = {
   "linux-smoke": [
     ["caret-agenda", "scripts/e2e-caret.mjs", { CARET_MODE: "agenda", CARET_LABEL: "runner" }],
@@ -34,8 +49,16 @@ const suites = {
     ["selection-wrap", "scripts/e2e-selectwrap.mjs", {}],
     ["structured-paste", "scripts/e2e-structured-paste.mjs", {}],
     ["media", "scripts/e2e-media.mjs", {}],
+    ["external-assets", "scripts/e2e-external-assets.mjs", {}],
     ["capture", "scripts/e2e-capture.mjs", { E2E_WINDOW_MANAGER: process.env.E2E_WINDOW_MANAGER || "openbox" }],
     ["page-file-actions", "scripts/e2e-page-file-actions.mjs", {}],
+    ["block-embed", "scripts/e2e-block-embed.mjs", {}],
+    ["sidebar-sections", "scripts/e2e-sidebar-sections.mjs", {}],
+    ["right-sidebar-collapse", "scripts/e2e-right-sidebar-collapse.mjs", {}],
+    ["tab-overflow", "scripts/e2e-tab-overflow.mjs", {}],
+    ["outline-guide", "scripts/e2e-outline-guide.mjs", {}],
+    ["query-workspace", "scripts/e2e-query-workspace.mjs", {}],
+    ["scrollbars", "scripts/e2e-scrollbars.mjs", {}],
   ],
   "windows-smoke": [
     ["windows-core", "scripts/e2e-windows-smoke.mjs", {}],
@@ -87,7 +110,7 @@ async function runScenario([id, script, extraEnv]) {
   const nativePort = await freePort();
   const previewPort = await freePort();
   const env = {
-    ...process.env,
+    ...baseProcessEnv,
     ...extraEnv,
     TINE_APP: app,
     E2E_ARTIFACT_DIR: dir,
@@ -104,9 +127,11 @@ async function runScenario([id, script, extraEnv]) {
   // cannot forward the next scenario into the previous app. Processes spawned
   // inside one scenario still share the bus, preserving the multigraph and
   // Quick Capture handoff coverage.
-  const command = nativeLinux ? (process.env.DBUS_RUN_SESSION || "dbus-run-session") : process.execPath;
+  const command = nativeLinux ? "xvfb-run" : process.execPath;
   const args = nativeLinux
-    ? ["--", "xvfb-run", "-a", process.execPath, path.join(root, script)]
+    // Xvfb must wrap the private bus: D-Bus-activated GTK portal services need
+    // DISPLAY in the activation environment for auxiliary-window behavior.
+    ? ["-a", process.env.DBUS_RUN_SESSION || "dbus-run-session", "--", process.execPath, path.join(root, script)]
     : [path.join(root, script)];
   const child = spawn(command, args, { cwd: root, env, detached: process.platform !== "win32", stdio: ["ignore", stdout, stderr] });
   let timedOut = false;

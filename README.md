@@ -8,6 +8,11 @@
 </p>
 
 <p align="center">
+  <a href="README.md">English</a> | <a href="README.zh-CN.md">简体中文</a><br>
+  <sub>The English README is authoritative if the versions differ.</sub>
+</p>
+
+<p align="center">
   <img src="https://img.shields.io/badge/Tauri-2-24C8DB?logo=tauri&logoColor=white" alt="Tauri 2">
   <img src="https://img.shields.io/badge/SolidJS-1.9-2C4F7C?logo=solid&logoColor=white" alt="SolidJS">
   <img src="https://img.shields.io/badge/Rust-2021-000000?logo=rust&logoColor=white" alt="Rust">
@@ -279,9 +284,11 @@ navigation, `Ctrl+click` open-to-side, and tab drag to panes/seams (see
 **Mobile:** Tine has a **native Android build** (Tauri v2) as of 0.4.0 — it opens and edits your real
 Logseq graph on the phone over your own sync, alongside the Logseq mobile app. iOS is being scoped.
 
-**Out of scope (by design):** whiteboards, flashcards, unrestricted in-process plugins,
-and built-in git. Tine's experimental plugin API instead uses capability-limited
-WebAssembly guests and inert token themes; see [the developer guide](docs/plugins/README.md).
+**Under discussion, not promised:** built-in git integration.
+
+**Out of scope (by design):** whiteboards, flashcards, and unrestricted in-process
+plugins. Tine's experimental plugin API instead uses capability-limited WebAssembly
+guests and inert token themes; see [the developer guide](docs/plugins/README.md).
 
 The full working backlog — what's next, what's deferred, and what's explicitly WONTFIX — lives in
 [`docs/BACKLOG.md`](docs/BACKLOG.md).

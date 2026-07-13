@@ -167,6 +167,10 @@ pub struct BlockDto {
     /// empty for normal page loads. Lets the UI show a "parent › child" trail.
     #[serde(default)]
     pub breadcrumb: Vec<String>,
+    /// Synthetic, read-only result row representing references from the source
+    /// page's property pre-block rather than an editable outline block.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub page_property: bool,
     // --- M1: block-header facets, computed ONCE off the lsdoc projection (the one
     // grammar source) and shipped so the frontend never re-derives them with its
     // own scanner. Derived (not authoritative — `raw` round-trips); the frontend
@@ -315,6 +319,11 @@ pub struct PageDto {
 
 pub struct Graph {
     pub root: PathBuf,
+    /// The canonical filesystem capability used for every asset operation. For
+    /// ordinary graphs this is `<root>/assets`; when the runtime has explicitly
+    /// approved an external assets symlink/junction it is that exact resolved
+    /// directory. No other managed graph path may use this capability.
+    assets_root: PathBuf,
     pub config: Config,
     /// Journal date formats (filename + title) resolved from `config.edn`, used to
     /// recognize journal files in the user's format and render new ones. Built once
@@ -699,12 +708,76 @@ impl Graph {
     /// available for the many in-crate disposable fixtures, but runtime graph
     /// binding must use this checked entry point.
     pub fn open_checked(root: impl AsRef<Path>) -> io::Result<Graph> {
-        let graph = Self::open(root);
+        Self::open_checked_with_assets(root, None)
+    }
+
+    /// Resolve an `assets` link/junction that lands outside the graph. The
+    /// returned path is canonical and therefore suitable for showing to the user
+    /// and binding a device-local approval. An in-graph directory (or a missing
+    /// directory that Tine may create normally) returns `None`.
+    pub fn external_assets_target(root: impl AsRef<Path>) -> io::Result<Option<PathBuf>> {
+        let root = fs::canonicalize(root.as_ref())?;
+        let assets = root.join("assets");
+        match fs::symlink_metadata(&assets) {
+            Ok(_) => {
+                let resolved = fs::canonicalize(&assets)?;
+                if !resolved.is_dir() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("assets path is not a directory: {}", assets.display()),
+                    ));
+                }
+                Ok((!resolved.starts_with(&root)).then_some(resolved))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Checked runtime open with one narrowly-scoped exception to the graph-root
+    /// boundary: an external `assets` link/junction is accepted only when its
+    /// current canonical target exactly matches the caller's approved target.
+    /// This makes a retargeted link fail closed instead of inheriting old trust.
+    pub fn open_checked_with_assets(
+        root: impl AsRef<Path>,
+        approved_assets: Option<&Path>,
+    ) -> io::Result<Graph> {
+        let mut graph = Self::open(root);
         validate_managed_dir(&graph.root, &graph.config.journals_dir, "journals")?;
         validate_managed_dir(&graph.root, &graph.config.pages_dir, "pages")?;
-        validate_managed_dir(&graph.root, "assets", "assets")?;
         validate_managed_dir(&graph.root, "logseq", "logseq")?;
         validate_managed_dir(&graph.root, "publish", "publish")?;
+        if let Some(resolved) = Self::external_assets_target(&graph.root)? {
+            let approved = approved_assets.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "external assets directory requires approval: {}",
+                        resolved.display()
+                    ),
+                )
+            })?;
+            let approved = fs::canonicalize(approved).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("approved assets directory is unavailable: {error}"),
+                )
+            })?;
+            if approved != resolved {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "external assets directory changed; approved {} but graph now resolves to {}",
+                        approved.display(),
+                        resolved.display()
+                    ),
+                ));
+            }
+            graph.assets_root = resolved;
+        } else {
+            validate_managed_dir(&graph.root, "assets", "assets")?;
+            graph.assets_root = graph.root.join("assets");
+        }
         Ok(graph)
     }
 
@@ -721,6 +794,28 @@ impl Graph {
         }
     }
 
+    /// Asset writes have their own capability boundary. Keeping this separate
+    /// from `ensure_write_target` means approving external assets cannot widen a
+    /// page/config/publish write into the same directory.
+    fn ensure_asset_write_target(&self, target: &Path) -> io::Result<()> {
+        if self.assets_root == self.root.join("assets") {
+            return self.ensure_write_target(target);
+        }
+        if path_stays_within_root(&self.assets_root, target)
+            && !path_uses_managed_alias(&self.assets_root, target)
+        {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "write target escapes approved assets root: {}",
+                    target.display()
+                ),
+            ))
+        }
+    }
+
     /// Open a graph directory, reading `logseq/config.edn` if present.
     pub fn open(root: impl AsRef<Path>) -> Graph {
         let root = root.as_ref().to_path_buf();
@@ -732,6 +827,7 @@ impl Graph {
             config.journal_page_title_format.as_deref(),
         );
         Graph {
+            assets_root: root.join("assets"),
             root,
             config,
             journal_format,
@@ -891,7 +987,10 @@ impl Graph {
             .unwrap_or_else(|| Ok(self.path_for(name, kind)))?;
         let canonical = candidate.canonicalize()?;
         if !canonical.is_file() {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "page source is not a file"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "page source is not a file",
+            ));
         }
         let pages = self.pages_path().canonicalize()?;
         let journals = self.journals_path().canonicalize()?;
@@ -2475,8 +2574,8 @@ impl Graph {
                 return false;
             }
             let affects = match key.split_once('\0') {
-                Some(("b", t)) => crate::query::page_affects_backlinks(&aliases, t, doc),
-                Some(("u", t)) => crate::query::page_affects_unlinked(t, doc),
+                Some(("b", t)) => crate::query::page_affects_backlinks(&aliases, t, entry, doc),
+                Some(("u", t)) => crate::query::page_affects_unlinked(&aliases, t, doc),
                 Some(("q", s)) => crate::query::page_affects_query(s, entry, doc),
                 _ => true, // unknown key shape → evict to stay safe
             };
@@ -2767,7 +2866,11 @@ impl Graph {
             let new_path = self
                 .pages_path()
                 .join(format!("{encoded_new}.{}", entry_format.ext()));
-            let other_ext = if entry_format == Format::Org { "md" } else { "org" };
+            let other_ext = if entry_format == Format::Org {
+                "md"
+            } else {
+                "org"
+            };
             let other_format_target = self.pages_path().join(format!("{encoded_new}.{other_ext}"));
             if entries.iter().any(|other| {
                 other.kind == PageKind::Page
@@ -2979,18 +3082,14 @@ impl Graph {
                     };
                     if source_restored {
                         let ours = content_rev(&e.new_content);
-                        if fs::read_to_string(&e.dst)
-                            .is_ok_and(|disk| content_rev(&disk) == ours)
-                        {
+                        if fs::read_to_string(&e.dst).is_ok_and(|disk| content_rev(&disk) == ours) {
                             let _ = fs::remove_file(&e.dst);
                         }
                     }
                     self.recent_writes.lock().unwrap().remove(&e.dst);
                 } else {
                     let ours = content_rev(&e.new_content);
-                    if fs::read_to_string(&e.dst)
-                        .is_ok_and(|disk| content_rev(&disk) == ours)
-                    {
+                    if fs::read_to_string(&e.dst).is_ok_and(|disk| content_rev(&disk) == ours) {
                         self.note_self_write(&e.dst, content_rev(&e.orig));
                         let _ = atomic_write(&e.dst, e.orig.as_bytes());
                     } else {
@@ -3053,6 +3152,20 @@ impl Graph {
         crate::query::search(self, query, limit)
     }
 
+    /// Execute the typed, combined graph-search plan (page names + block text).
+    /// Commands and page creation remain frontend providers and are deliberately
+    /// outside this graph query result.
+    pub fn run_graph_search(
+        &self,
+        source: &str,
+        page_limit: usize,
+        block_limit: usize,
+        explain: bool,
+    ) -> crate::query_plan::QueryExecution {
+        crate::query_plan::QueryPlan::friendly(source, page_limit, block_limit)
+            .execute_with_explain(self, || false, explain)
+    }
+
     /// Interactive search lane: a newer request in the same lane cooperatively
     /// cancels the older whole-graph scan. Separate lanes keep the Ctrl-K
     /// switcher and in-editor block picker from canceling one another.
@@ -3069,6 +3182,30 @@ impl Graph {
         crate::query::search_cancellable(self, query, limit, || {
             epoch.load(Ordering::Acquire) != mine
         })
+    }
+
+    /// Latest-wins combined graph search.  It shares the same lane epochs as the
+    /// legacy block-search adapter, so migrating a consumer cannot leave an older
+    /// request from either API running in that logical lane.
+    pub fn run_graph_search_latest(
+        &self,
+        lane: &str,
+        source: &str,
+        page_limit: usize,
+        block_limit: usize,
+        explain: bool,
+    ) -> crate::query_plan::QueryExecution {
+        use std::sync::atomic::Ordering;
+        let epoch = {
+            let mut lanes = self.search_lanes.lock().unwrap();
+            lanes
+                .entry(lane.to_owned())
+                .or_insert_with(|| Arc::new(std::sync::atomic::AtomicU64::new(0)))
+                .clone()
+        };
+        let mine = epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        crate::query_plan::QueryPlan::friendly(source, page_limit, block_limit)
+            .execute_with_explain(self, || epoch.load(Ordering::Acquire) != mine, explain)
     }
 
     /// Fuzzy page-name matches for the quick switcher.
@@ -3110,7 +3247,7 @@ impl Graph {
     // ---- Assets & PDF highlights ----
 
     pub fn assets_path(&self) -> PathBuf {
-        self.root.join("assets")
+        self.assets_root.clone()
     }
 
     /// Top-level `assets/` files that NO block references — orphans the user may
@@ -3183,7 +3320,7 @@ impl Graph {
             return Err(io::Error::new(io::ErrorKind::NotFound, "no such asset"));
         }
         let trash = typed_trash_dir(&self.root, TrashEntryKind::Asset);
-        self.ensure_write_target(&src)?;
+        self.ensure_asset_write_target(&src)?;
         self.ensure_write_target(&trash)?;
         let dest = trash.join(format!("{}__{name}", trash_stamp()));
         move_to_trash(&src, &dest, &trash)?;
@@ -3238,8 +3375,20 @@ impl Graph {
 
     /// Read raw bytes of an asset (e.g. a PDF) for the viewer.
     pub fn read_asset(&self, name: &str) -> io::Result<Vec<u8>> {
+        fs::read(self.asset_file_for_read(name)?)
+    }
+
+    /// Resolve an existing top-level regular asset through the canonical asset
+    /// capability. A symlink may point elsewhere inside that approved root, but
+    /// can never turn a read/open into access outside it.
+    pub fn asset_file_for_read(&self, name: &str) -> io::Result<PathBuf> {
         top_level_asset_name(name)?;
-        fs::read(self.assets_path().join(name))
+        let assets = fs::canonicalize(self.assets_path())?;
+        let path = fs::canonicalize(self.assets_path().join(name))?;
+        if !path.starts_with(&assets) || !fs::metadata(&path)?.is_file() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid asset"));
+        }
+        Ok(path)
     }
 
     /// Canonical, regular-file path for the native asset protocol. This is used
@@ -3247,7 +3396,6 @@ impl Graph {
     /// instead of copying a multi-gigabyte file through Rust Vec → IPC → Blob.
     pub fn stream_asset_path(&self, name: &str) -> io::Result<PathBuf> {
         top_level_asset_name(name)?;
-        let assets = fs::canonicalize(self.assets_path())?;
         let candidate = self.assets_path().join(name);
         if fs::symlink_metadata(&candidate)?.file_type().is_symlink() {
             return Err(io::Error::new(
@@ -3255,11 +3403,7 @@ impl Graph {
                 "asset symlinks cannot be streamed",
             ));
         }
-        let path = fs::canonicalize(candidate)?;
-        if !path.starts_with(&assets) || !fs::metadata(&path)?.is_file() {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid asset"));
-        }
-        Ok(path)
+        self.asset_file_for_read(name)
     }
 
     /// Read an asset only if its current on-disk size is within `max_bytes`.
@@ -3267,7 +3411,7 @@ impl Graph {
     /// the file between those operations.
     pub fn read_asset_limited(&self, name: &str, max_bytes: u64) -> io::Result<Vec<u8>> {
         top_level_asset_name(name)?;
-        let path = self.assets_path().join(name);
+        let path = self.asset_file_for_read(name)?;
         let metadata = fs::metadata(&path)?;
         if !metadata.is_file() {
             return Err(io::Error::new(
@@ -3295,7 +3439,7 @@ impl Graph {
     /// stored filename (de-duplicated if it already exists).
     pub fn save_asset(&self, name: &str, bytes: &[u8]) -> io::Result<String> {
         let assets = self.assets_path();
-        self.ensure_write_target(&assets)?;
+        self.ensure_asset_write_target(&assets)?;
         fs::create_dir_all(&assets)?;
         top_level_asset_name(name)?;
         let (stem, ext) = split_asset_stem_ext(name);
@@ -3328,7 +3472,7 @@ impl Graph {
                 .to_string(),
         };
         let assets = self.assets_path();
-        self.ensure_write_target(&assets)?;
+        self.ensure_asset_write_target(&assets)?;
         fs::create_dir_all(&assets)?;
         top_level_asset_name(&name)?;
         let (stem, ext) = split_asset_stem_ext(&name);
@@ -3365,7 +3509,7 @@ impl Graph {
     ) -> io::Result<String> {
         let key = crate::pdf::asset_key(pdf_filename);
         let dir = self.assets_path().join(&key);
-        self.ensure_write_target(&dir)?;
+        self.ensure_asset_write_target(&dir)?;
         fs::create_dir_all(&dir)?;
         let name = format!("{page}_{id}_{stamp}.png");
         // The highlight `id` round-trips through the graph `.edn`, so a synced/hand-edited
@@ -3373,7 +3517,7 @@ impl Graph {
         // dir and write a `.png` anywhere (audit M3, path traversal).
         top_level_asset_name(&name)?;
         let target = dir.join(&name);
-        self.ensure_write_target(&target)?;
+        self.ensure_asset_write_target(&target)?;
         atomic_write(&target, bytes)?;
         Ok(format!("{key}/{name}"))
     }
@@ -3386,13 +3530,17 @@ impl Graph {
     /// by pre-launch Tine builds from disappearing after the key change.
     pub fn read_highlights(&self, pdf_filename: &str) -> Vec<crate::pdf::Highlight> {
         let key = crate::pdf::asset_key(pdf_filename);
-        let s = fs::read_to_string(self.assets_path().join(format!("{key}.edn")))
+        let s = self
+            .asset_file_for_read(&format!("{key}.edn"))
+            .and_then(fs::read_to_string)
             .ok()
             .or_else(|| {
                 let legacy = crate::pdf::legacy_asset_key(pdf_filename);
                 (legacy != key)
                     .then(|| {
-                        fs::read_to_string(self.assets_path().join(format!("{legacy}.edn"))).ok()
+                        self.asset_file_for_read(&format!("{legacy}.edn"))
+                            .and_then(fs::read_to_string)
+                            .ok()
                     })
                     .flatten()
             });
@@ -3451,7 +3599,7 @@ impl Graph {
         let _guard = lock.lock().unwrap();
         fs::create_dir_all(self.assets_path())?;
         let edn_path = self.assets_path().join(format!("{key}.edn"));
-        self.ensure_write_target(&edn_path)?;
+        self.ensure_asset_write_target(&edn_path)?;
         // 3-way merge against the on-disk set: keep our current highlights, plus
         // any disk highlight that is an EXTERNAL addition (id not in our baseline
         // and not already present). A highlight we deliberately deleted (in the
@@ -3470,7 +3618,9 @@ impl Graph {
         } else {
             None
         };
-        let existing_raw = page_baseline.clone().or_else(|| legacy_page_baseline.clone());
+        let existing_raw = page_baseline
+            .clone()
+            .or_else(|| legacy_page_baseline.clone());
         // Merge and publish the sidecar with the same external-writer guard as
         // config updates. If Logseq/Syncthing changes either the primary or the
         // legacy fallback after our read, retry against those new bytes instead
@@ -3501,7 +3651,8 @@ impl Graph {
                     }
                 }
             }
-            let next = crate::pdf::write_highlights(&merged, existing_edn.map_or("", String::as_str));
+            let next =
+                crate::pdf::write_highlights(&merged, existing_edn.map_or("", String::as_str));
             let primary_now = read_optional_text(&edn_path)?;
             let legacy_now = if primary_now.is_none() && primary_baseline.is_none() {
                 match &legacy_edn {
@@ -3573,7 +3724,10 @@ impl Graph {
         fs::create_dir_all(&trash)?;
         if let (Some(path), Some(baseline)) = (&legacy_edn, &committed_legacy_edn_baseline) {
             if read_optional_text(path)?.as_ref() == Some(baseline) {
-                let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("legacy.edn");
+                let name = path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("legacy.edn");
                 let dest = trash.join(format!("{}__legacy__{name}", trash_stamp()));
                 if move_file_noreplace(path, &dest).is_ok()
                     && read_optional_text(&dest)?.as_ref() != Some(baseline)
@@ -3588,7 +3742,10 @@ impl Graph {
         }
         if let (Some(path), Some(baseline)) = (&legacy_page, &legacy_page_baseline) {
             if read_optional_text(path)?.as_ref() == Some(baseline) {
-                let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("legacy.md");
+                let name = path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("legacy.md");
                 let dest = trash.join(format!("{}__legacy__{name}", trash_stamp()));
                 if move_file_noreplace(path, &dest).is_ok() {
                     if read_optional_text(&dest)?.as_ref() != Some(baseline) {
@@ -3719,9 +3876,7 @@ impl Graph {
         // canonical containment immediately before the read to close rename /
         // symlink-swap races between directory scanning and reconciliation.
         let md = fs::symlink_metadata(path).ok()?;
-        if md.file_type().is_symlink()
-            || !md.is_file()
-            || !path_stays_within_root(&self.root, path)
+        if md.file_type().is_symlink() || !md.is_file() || !path_stays_within_root(&self.root, path)
         {
             return None;
         }
@@ -4448,6 +4603,7 @@ pub fn block_to_dto(b: &DocBlock) -> BlockDto {
         collapsed: b.collapsed(),
         children: b.children.iter().map(block_to_dto).collect(),
         breadcrumb: Vec::new(),
+        page_property: false,
         // All header facets off the one lsdoc projection (marker/priority/heading/
         // properties/scheduled/deadline) — priority is header-position only, matching
         // the chip, so a loaded block never shows a priority the edit path wouldn't.
@@ -4987,11 +5143,7 @@ fn atomic_write_new(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("page");
     let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp = dir.join(format!(
-        ".{fname}.{}.{}.new.tmp",
-        std::process::id(),
-        seq
-    ));
+    let tmp = dir.join(format!(".{fname}.{}.{}.new.tmp", std::process::id(), seq));
     let res = (|| {
         let mut file = fs::OpenOptions::new()
             .write(true)
@@ -5368,41 +5520,66 @@ mod tests {
         // alias lived in the page pre-block (dedicated properties panel / Logseq
         // file convention); the bulleted form silently did nothing.
         let build = |books_body: &str| {
-            let dir = std::env::temp_dir()
-                .join(format!("tine-gh62-{}-{}", books_body.len(), std::process::id()));
+            let dir = std::env::temp_dir().join(format!(
+                "tine-gh62-{}-{}",
+                books_body.len(),
+                std::process::id()
+            ));
             let _ = fs::remove_dir_all(&dir);
             fs::create_dir_all(dir.join("journals")).unwrap();
             fs::create_dir_all(dir.join("pages")).unwrap();
             fs::write(dir.join("pages").join("books.md"), books_body).unwrap();
-            fs::write(dir.join("pages").join("note.md"), "- I read a #book today\n").unwrap();
+            fs::write(
+                dir.join("pages").join("note.md"),
+                "- I read a #book today\n",
+            )
+            .unwrap();
             let g = Graph::open(&dir);
             g.warm_cache();
             let aliases = g.page_aliases();
-            let n: usize = g.backlinks("books").iter().map(|grp| grp.blocks.len()).sum();
+            let n: usize = g
+                .backlinks("books")
+                .iter()
+                .map(|grp| grp.blocks.len())
+                .sum();
             let _ = fs::remove_dir_all(&dir);
             (aliases, n)
         };
 
         // Alias as the first bullet — now recognized.
         let (a, n) = build("- alias:: book\n- I like reading\n");
-        assert_eq!(a, vec![("book".to_string(), "books".to_string())], "first-bullet alias registered");
+        assert_eq!(
+            a,
+            vec![("book".to_string(), "books".to_string())],
+            "first-bullet alias registered"
+        );
         assert_eq!(n, 1, "#book backlink merges onto the books page");
 
         // Pre-block alias keeps working (Logseq file convention / properties panel).
         let (a, n) = build("alias:: book\n\n- I like reading\n");
-        assert_eq!(a, vec![("book".to_string(), "books".to_string())], "pre-block alias still registered");
+        assert_eq!(
+            a,
+            vec![("book".to_string(), "books".to_string())],
+            "pre-block alias still registered"
+        );
         assert_eq!(n, 1, "pre-block alias backlink still merges");
 
         // A NON-first bullet with `alias::` is a block property, NOT a page alias
         // (OG parity — only the first properties block counts).
         let (a, n) = build("- I like reading\n- alias:: book\n");
-        assert!(a.is_empty(), "alias in a non-first block is not a page alias: {a:?}");
+        assert!(
+            a.is_empty(),
+            "alias in a non-first block is not a page alias: {a:?}"
+        );
         assert_eq!(n, 0, "no backlink merge for a mid-page block alias");
 
         // A first block that mixes content with the property is a regular block,
         // not a page-properties block.
         let (a, _) = build("- reading list\nalias:: book\n");
-        assert!(a.is_empty(), "content+property first block is not page properties: {a:?}");
+        assert!(
+            a.is_empty(),
+            "content+property first block is not page properties: {a:?}"
+        );
     }
 
     #[test]
@@ -7020,10 +7197,8 @@ mod tests {
     fn write_pdf_area_image_rejects_nested_asset_symlink_escape() {
         use std::os::unix::fs::symlink;
         let dir = scratch("areaimg-nested-symlink");
-        let outside = std::env::temp_dir().join(format!(
-            "tine-areaimg-outside-{}",
-            std::process::id()
-        ));
+        let outside =
+            std::env::temp_dir().join(format!("tine-areaimg-outside-{}", std::process::id()));
         let _ = fs::remove_dir_all(&outside);
         fs::create_dir_all(&outside).unwrap();
         fs::create_dir_all(dir.join("assets")).unwrap();
@@ -7279,8 +7454,14 @@ mod tests {
         }
         let derived = g.derived_cache.read().unwrap();
         let advanced = g.advanced_cache.read().unwrap();
-        assert_eq!(derived.as_ref().unwrap().results.len(), DERIVED_CACHE_MAX_ENTRIES);
-        assert_eq!(advanced.as_ref().unwrap().results.len(), DERIVED_CACHE_MAX_ENTRIES);
+        assert_eq!(
+            derived.as_ref().unwrap().results.len(),
+            DERIVED_CACHE_MAX_ENTRIES
+        );
+        assert_eq!(
+            advanced.as_ref().unwrap().results.len(),
+            DERIVED_CACHE_MAX_ENTRIES
+        );
         let oldest = format!("test\0{}", 0);
         assert!(!derived.as_ref().unwrap().results.contains_key(&oldest));
         assert!(!advanced.as_ref().unwrap().results.contains_key(&oldest));
@@ -7485,6 +7666,99 @@ mod tests {
             let _ = fs::remove_dir_all(&dir);
             let _ = fs::remove_dir_all(&outside);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checked_open_accepts_only_the_approved_external_assets_target() {
+        use std::os::unix::fs::symlink;
+        let dir = scratch("checked-open-approved-assets");
+        let outside = std::env::temp_dir().join(format!(
+            "tine-checked-open-approved-assets-outside-{}",
+            std::process::id()
+        ));
+        let other = std::env::temp_dir().join(format!(
+            "tine-checked-open-approved-assets-other-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&outside);
+        let _ = fs::remove_dir_all(&other);
+        fs::create_dir_all(&outside).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        let _ = fs::remove_dir_all(dir.join("assets"));
+        symlink(&outside, dir.join("assets")).unwrap();
+
+        assert!(Graph::open_checked(&dir).is_err());
+        assert!(Graph::open_checked_with_assets(&dir, Some(&other)).is_err());
+        let graph = Graph::open_checked_with_assets(&dir, Some(&outside)).unwrap();
+        assert_eq!(graph.assets_path(), outside.canonicalize().unwrap());
+        assert_eq!(
+            graph.save_asset("approved.txt", b"safe").unwrap(),
+            "approved.txt"
+        );
+        assert_eq!(fs::read(outside.join("approved.txt")).unwrap(), b"safe");
+
+        // Retargeting the graph link cannot redirect an already-open graph: the
+        // Graph holds the originally approved canonical capability. A fresh open
+        // also fails because the stored approval no longer matches.
+        fs::remove_file(dir.join("assets")).unwrap();
+        symlink(&other, dir.join("assets")).unwrap();
+        assert_eq!(
+            graph
+                .save_asset("after-retarget.txt", b"still safe")
+                .unwrap(),
+            "after-retarget.txt"
+        );
+        assert!(outside.join("after-retarget.txt").exists());
+        assert!(!other.join("after-retarget.txt").exists());
+        assert!(Graph::open_checked_with_assets(&dir, Some(&outside)).is_err());
+
+        // A nested link inside the approved root remains confined: neither read
+        // nor write may follow it into another directory.
+        symlink(other.join("secret.txt"), outside.join("escape.txt")).unwrap();
+        fs::write(other.join("secret.txt"), b"private").unwrap();
+        assert!(graph.read_asset("escape.txt").is_err());
+        let area_key = crate::pdf::asset_key("Escaping area.pdf");
+        symlink(&other, outside.join(&area_key)).unwrap();
+        assert!(graph
+            .write_pdf_area_image("Escaping area.pdf", 1, "id", 1, b"png")
+            .is_err());
+
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&outside);
+        let _ = fs::remove_dir_all(&other);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn checked_open_accepts_an_approved_windows_assets_junction() {
+        let dir = scratch("checked-open-approved-assets-junction");
+        let outside = std::env::temp_dir().join(format!(
+            "tine-approved-assets-junction-outside-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&outside);
+        fs::create_dir_all(&outside).unwrap();
+        let _ = fs::remove_dir_all(dir.join("assets"));
+        let status = std::process::Command::new("cmd")
+            .args([
+                "/C",
+                "mklink",
+                "/J",
+                &dir.join("assets").display().to_string(),
+                &outside.display().to_string(),
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success(), "mklink /J must create the test junction");
+
+        assert!(Graph::open_checked(&dir).is_err());
+        let graph = Graph::open_checked_with_assets(&dir, Some(&outside)).unwrap();
+        assert_eq!(graph.assets_path(), outside.canonicalize().unwrap());
+
+        let _ = fs::remove_dir(dir.join("assets"));
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&outside);
     }
 
     #[cfg(unix)]

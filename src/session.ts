@@ -9,10 +9,13 @@ import {
 } from "./router";
 import {
   applySidebarSession,
+  favoritesSectionExpanded,
+  recentSectionExpanded,
   rightSidebar,
   rightSidebarOpen,
   sidebarOpen,
   type SidebarItem,
+  type SidebarSessionState,
 } from "./ui";
 import {
   feedPaneId,
@@ -42,6 +45,8 @@ export interface PersistedSession extends PaneSnapshot {
   leftSidebar?: boolean;
   rightSidebar?: boolean;
   rightSidebarItems?: SidebarItem[];
+  favoritesSectionExpanded?: boolean;
+  recentSectionExpanded?: boolean;
   layout?: PersistedLayoutNode;
   focusedPaneId?: string;
 }
@@ -52,6 +57,13 @@ function validRoute(r: unknown): r is Route {
   if (!r || typeof r !== "object") return false;
   const o = r as Record<string, unknown>;
   if (o.kind === "journals") return true;
+  if (o.kind === "query") {
+    return typeof o.id === "string" && o.id.length > 0 && o.id.length <= 128
+      && (o.sourceKind === "search" || o.sourceKind === "dsl")
+      && typeof o.source === "string" && o.source.length <= 65_536
+      && (o.presentation === "search" || o.presentation === "list"
+        || o.presentation === "table" || o.presentation === "board");
+  }
   return o.kind === "page" && typeof o.name === "string" && (o.pageKind === "journal" || o.pageKind === "page");
 }
 
@@ -172,6 +184,8 @@ export function buildPersistedSession(): PersistedSession {
     leftSidebar: sidebarOpen(),
     rightSidebar: rightSidebarOpen(),
     rightSidebarItems: rightSidebar(),
+    favoritesSectionExpanded: favoritesSectionExpanded(),
+    recentSectionExpanded: recentSectionExpanded(),
     layout: serializeLayout(layoutRoot()),
     focusedPaneId: focusedPaneId(),
   };
@@ -181,11 +195,17 @@ export function parsePersistedSession(raw: string): {
   layout: LayoutNode;
   snapshots: Map<string, PaneSnapshot>;
   focusedPaneId: string;
-  sidebar: { left?: boolean; right?: boolean; items?: SidebarItem[] };
+  sidebar: SidebarSessionState;
 } | null {
   try {
     const s = JSON.parse(raw) as PersistedSession;
-    const sidebar = { left: s.leftSidebar, right: s.rightSidebar, items: s.rightSidebarItems };
+    const sidebar = {
+      left: s.leftSidebar,
+      right: s.rightSidebar,
+      items: s.rightSidebarItems,
+      favoritesExpanded: s.favoritesSectionExpanded,
+      recentExpanded: s.recentSectionExpanded,
+    };
     if (s.layout && !isMobilePlatform) {
       const snapshots = new Map<string, PaneSnapshot>();
       const layout = parseLayoutNode(s.layout, snapshots, { value: false });

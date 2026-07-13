@@ -37,8 +37,74 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 - Let host-rendered decoration plugins respond live to their declarative settings,
   and let command plugins declare ordinary remappable default shortcuts without
   receiving keyboard, DOM, or global-input authority.
+- **Search and queries now share a persistent result workspace.** Ctrl+K can
+  open its complete page-and-block result set in a graph-scoped tab, switch
+  between search, list, table, and board presentations, survive an app restart,
+  and become one ordinary query page when named—without writing temporary graph
+  files. (GH #99)
+- **Query creation has a friendly primary surface and an optional deeper one.**
+  Plain search syntax remains editable as plain text; a Gmail-style filter
+  dialog can build richer searches or hand off losslessly to the visual query
+  builder and raw DSL, while on-demand explanations and diagnostics show what
+  the engine interpreted. (GH #69)
+- **Search results now show bounded, useful evidence.** Block results separate
+  page/breadcrumb context from a two-line excerpt and highlight every positive
+  term that actually caused the Rust engine to match; negated terms are never
+  presented as evidence, and the combobox exposes its active result to
+  assistive technology. (GH #98)
+- **Primary panes now share quiet, theme-aware scrollbar styling.** The left
+  sidebar, page/split scrollers, and right sidebar use the same semantic thumb
+  colors without forcing overlay scrollbars into layout-consuming geometry;
+  forced-colors and coarse-pointer environments retain native controls. (GH
+  #103)
+- **Clicking an outline guide now expands or collapses the complete descendant
+  subtree.** If any collapsible descendant is folded, the guide expands them
+  all; otherwise it folds them all while leaving the guide's parent open. The
+  forgiving hit target is keyboard-accessible, normal pages persist the change
+  as one Undo step, and embeds/references keep it local to that surface. (GH
+  #128)
+- **Overflowing tab strips now keep titles readable and provide a complete tab
+  overview.** A pane-local button appears only when its tabs no longer fit,
+  lists every full title with active, pinned, and close controls, and supports
+  keyboard navigation. Activating a tab reveals it in the horizontal strip;
+  ordinary tab closing, pinning, and drag-and-drop behavior remains intact. (GH
+  #105)
+- **Right-sidebar items can now be collapsed independently.** Each page or block
+  has an accessible disclosure that parks its body without mounting its outline
+  or references; a compact menu provides Collapse all, Expand all, and Close
+  all. State is local to this installation and graph, survives restarts and
+  renames, and active edits commit before a body is removed. (GH #106)
+- **Block embeds have a restrained, theme-aware identity cue.** The embedded
+  root bullet and its heavier descendant guide share a muted accent derived
+  from the active theme; ordinary bullets, guides, text, and backgrounds remain
+  unchanged, and custom CSS can override the semantic token. (GH #125)
+- **Favorites and Recent can now be collapsed independently in the left
+  sidebar.** Both sections default open, retain their item counts while folded,
+  work as keyboard-accessible disclosures, and remember their state separately
+  for each graph across restarts. (GH #101)
 
 ### Fixed
+
+- **Graphs with an external `assets` symlink or Windows junction can be opened
+  safely.** Tine shows the resolved directory for explicit, device-local
+  approval, then confines every asset read and write to that exact canonical
+  target. Declining leaves the graph closed with a useful explanation, while a
+  stale or retargeted link fails closed without widening access to pages,
+  journals, configuration, or other managed files. (GH #127)
+- **Linked and unlinked references now use the complete page identity.** Plain
+  text mentions of a page alias appear under the canonical page's unlinked
+  references, while explicit links in page-level properties appear as exact,
+  read-only backlink rows. Scoped cache invalidation follows the same rules, so
+  edited references update immediately. (GH #126)
+- **Block embeds now behave as live editing surfaces.** Real disclosure clicks
+  fold same-page and cross-page embedded branches locally without editing the
+  macro host or changing the source block's collapse state, and Enter keeps the
+  new block and caret inside the visible embed while persisting one source edit.
+  (GH #124)
+- **Help with Tine no longer exports a scrubbed reproduction that has lost the
+  original actionable parser delta and retained only mldoc's known backtick
+  state artifact.** The anonymizer now tries its remaining privacy tiers and
+  omits the case if none preserves a non-artifact divergence. (GH #82)
 
 - Keep legacy or otherwise incompatible installed plugins uninstallable by
   retaining their validated package identity even when the UI must show a

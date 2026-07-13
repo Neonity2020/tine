@@ -9,6 +9,8 @@ export interface BlockDto {
   children: BlockDto[];
   /** Ancestor first-lines (search/reference results only). */
   breadcrumb?: string[];
+  /** Synthetic read-only backlink row sourced from page-level properties. */
+  page_property?: boolean;
   // M1 block-header facets, computed once off the Rust lsdoc projection and shipped
   // so the frontend reads them off the DTO (no parse on load) instead of re-deriving
   // with its own scanner. Omitted by the backend when empty (see model.rs BlockDto).
@@ -171,6 +173,56 @@ export interface RefGroup {
   page: string;
   kind: PageKind;
   blocks: BlockDto[];
+}
+
+export interface MatchSpan {
+  /** UTF-16 code-unit offsets into QueryHit.display_text; end is exclusive. */
+  start: number;
+  end: number;
+}
+
+export interface MatchEvidence {
+  clause_id: number;
+  field: "page_name" | "visible_content";
+  mode: "contains" | "phrase" | "regex" | "fuzzy";
+  spans: MatchSpan[];
+  score?: number;
+}
+
+export interface QueryDiagnostic {
+  code: string;
+  message: string;
+  span?: MatchSpan;
+}
+
+export interface QueryExplainNode {
+  clause_id?: number;
+  description: string;
+  children: QueryExplainNode[];
+}
+
+export type QueryHit =
+  | {
+      entity: "page";
+      page: PageEntry;
+      display_text: string;
+      evidence: MatchEvidence[];
+      score: number;
+    }
+  | {
+      entity: "block";
+      page: string;
+      kind: PageKind;
+      block: BlockDto;
+      display_text: string;
+      evidence: MatchEvidence[];
+    };
+
+export interface QueryExecution {
+  hits: QueryHit[];
+  diagnostics: QueryDiagnostic[];
+  explanation: { branches: QueryExplainNode[] };
+  cancelled: boolean;
 }
 
 /** Result of an advanced (datalog) query: matched groups + which clause heads

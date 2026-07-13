@@ -68,4 +68,5 @@ see the project `CLAUDE.md`.
 | [0039](0039-filesystem-scope-boundary.md) | Canonical graph root is a hard boundary for configured paths, windows, and backups | Accepted |
 | [0040](0040-file-path-is-storage-identity.md) | Physical file path, not logical page name, is storage identity | Accepted |
 | [0041](0041-rendered-outline-navigation-scope.md) | Outline navigation is scoped to the rendered model, not the whole page | Accepted |
-| [0042](0042-tine-native-plugin-platform.md) | Tine-native plugins run as capability-limited WebAssembly guests | Accepted |
+| [0042](0042-one-query-plan-many-frontends.md) | One typed query plan serves friendly search, visual builders, DSL, and virtual query workspaces | Accepted |
+| [0043](0043-tine-native-plugin-platform.md) | Tine-native plugins run as capability-limited WebAssembly guests | Accepted |

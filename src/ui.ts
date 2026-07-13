@@ -506,6 +506,27 @@ export function toggleTheme() {
 // Left sidebar open/collapsed — persisted (default open; store only when collapsed).
 const SIDEBAR_OPEN_KEY = "logseq-claude.sidebarOpen";
 export const [sidebarOpen, setSidebarOpen] = createSignal(loadStr(SIDEBAR_OPEN_KEY) !== "0");
+export const [favoritesSectionExpanded, setFavoritesSectionExpanded] = createSignal(true);
+export const [recentSectionExpanded, setRecentSectionExpanded] = createSignal(true);
+
+export function toggleFavoritesSection() {
+  setFavoritesSectionExpanded((open) => !open);
+  scheduleSessionSave();
+}
+
+export function toggleRecentSection() {
+  setRecentSectionExpanded((open) => !open);
+  scheduleSessionSave();
+}
+
+/** Reset graph-scoped disclosure preferences before another graph's persisted
+ * session is restored. A legacy/missing session therefore defaults expanded
+ * instead of inheriting the graph that was open previously. */
+export function resetLeftSidebarSections() {
+  setFavoritesSectionExpanded(true);
+  setRecentSectionExpanded(true);
+}
+
 export function toggleSidebar() {
   const v = !sidebarOpen();
   setSidebarOpen(v);
@@ -516,10 +537,20 @@ export function toggleSidebar() {
 /** Apply sidebar open/closed + right-sidebar items restored from the persisted
  *  session (router.restoreSession). Sets the signals directly — no save trigger,
  *  so restoring can't loop back into another save. */
-export function applySidebarSession(s: { left?: boolean; right?: boolean; items?: SidebarItem[] }) {
+export interface SidebarSessionState {
+  left?: boolean;
+  right?: boolean;
+  items?: SidebarItem[];
+  favoritesExpanded?: boolean;
+  recentExpanded?: boolean;
+}
+
+export function applySidebarSession(s: SidebarSessionState) {
   if (typeof s.left === "boolean") setSidebarOpen(s.left);
   if (Array.isArray(s.items)) setRightSidebarRaw(s.items.filter(validSidebarItem));
   if (typeof s.right === "boolean") setRightSidebarOpenSig(s.right);
+  setFavoritesSectionExpanded(s.favoritesExpanded ?? true);
+  setRecentSectionExpanded(s.recentExpanded ?? true);
 }
 
 const SIDEBAR_W_KEY = "logseq-claude.sidebarWidth";
@@ -629,6 +660,11 @@ export function removeDeletedPageFromNavigation(name: string, kind: PageKind) {
       // ignore
     }
   }
+
+  const nextSidebar = rightSidebar().filter((item) =>
+    item.kind === "page" ? item.name !== name : item.page !== name
+  );
+  if (nextSidebar.length !== rightSidebar().length) setRightSidebar(nextSidebar);
 }
 
 /** Re-key sidebar navigation state after the backend has atomically renamed a
@@ -664,6 +700,21 @@ export function renamePageInNavigation(from: string, to: string) {
     } catch {
       // ignore
     }
+  }
+
+  const seenSidebar = new Set<string>();
+  const nextSidebar: SidebarItem[] = [];
+  for (const item of rightSidebar()) {
+    const next: SidebarItem = item.kind === "page"
+      ? (item.name === from ? { ...item, name: to } : item)
+      : (item.page === from ? { ...item, page: to } : item);
+    const key = sidebarItemKey(next);
+    if (seenSidebar.has(key)) continue;
+    seenSidebar.add(key);
+    nextSidebar.push(next);
+  }
+  if (nextSidebar.some((item, i) => item !== rightSidebar()[i]) || nextSidebar.length !== rightSidebar().length) {
+    setRightSidebar(nextSidebar);
   }
 }
 /** Seed favorites from config.edn `:favorites` on graph open. config.edn is the
@@ -822,14 +873,25 @@ export interface SidebarPage {
   kind: "page";
   name: string;
   pageKind: "journal" | "page";
+  collapsed?: boolean;
 }
 export interface SidebarBlock {
   kind: "block";
   uuid: string; // stable block id — the live handle into the store
   page: string; // the page it lives on (loaded on demand)
   pageKind: "journal" | "page";
+  collapsed?: boolean;
 }
 export type SidebarItem = SidebarPage | SidebarBlock;
+
+/** Stable presentation identity for one sidebar collection item. Unlike an
+ * array index, it survives closing a neighbor and page renames are re-keyed by
+ * renamePageInNavigation. */
+export function sidebarItemKey(item: SidebarItem): string {
+  return item.kind === "page"
+    ? `page:${item.pageKind}:${item.name}`
+    : `block:${item.uuid}`;
+}
 
 // What's open in the right sidebar — persisted across restarts. Items are plain
 // JSON (page name / block uuid). Page items always restore; block items resolve
@@ -840,6 +902,7 @@ const RS_ITEMS_KEY = "logseq-claude.rightSidebarItems";
 function validSidebarItem(i: unknown): i is SidebarItem {
   if (!i || typeof i !== "object") return false;
   const o = i as Record<string, unknown>;
+  if (o.collapsed !== undefined && typeof o.collapsed !== "boolean") return false;
   if (o.kind === "page") return typeof o.name === "string";
   if (o.kind === "block") return typeof o.uuid === "string" && typeof o.page === "string";
   return false;
@@ -887,16 +950,42 @@ export function setRightSidebar(items: SidebarItem[]) {
 export function openPageInSidebar(name: string, pageKind: "journal" | "page" = "page") {
   if (pageKind === "page") name = resolveAlias(name);
   setRightSidebarOpen(true);
-  if (rightSidebar().some((i) => i.kind === "page" && i.name === name)) return;
+  const existing = rightSidebar().findIndex((i) => i.kind === "page" && i.name === name);
+  if (existing >= 0) {
+    setRightSidebar(rightSidebar().map((item, i) => i === existing ? { ...item, collapsed: false } : item));
+    return;
+  }
   setRightSidebar([{ kind: "page", name, pageKind }, ...rightSidebar()]);
 }
 export function openBlockInSidebar(ref: { uuid: string; page: string; pageKind: "journal" | "page" }) {
   setRightSidebarOpen(true);
-  if (rightSidebar().some((i) => i.kind === "block" && i.uuid === ref.uuid)) return;
+  const existing = rightSidebar().findIndex((i) => i.kind === "block" && i.uuid === ref.uuid);
+  if (existing >= 0) {
+    setRightSidebar(rightSidebar().map((item, i) => i === existing ? { ...item, collapsed: false } : item));
+    return;
+  }
   setRightSidebar([{ kind: "block", ...ref }, ...rightSidebar()]);
+}
+export function setRightSidebarItemCollapsed(idx: number, collapsed: boolean) {
+  setRightSidebar(rightSidebar().map((item, i) => i === idx ? { ...item, collapsed } : item));
+}
+export function setAllRightSidebarItemsCollapsed(collapsed: boolean) {
+  setRightSidebar(rightSidebar().map((item) => ({ ...item, collapsed })));
 }
 export function closeRightSidebarItem(idx: number) {
   setRightSidebar(rightSidebar().filter((_, i) => i !== idx));
+}
+export function closeAllRightSidebarItems() {
+  setRightSidebar([]);
+}
+
+/** Remove block items whose live targets were structurally deleted. Their
+ * collapse preference lives on the item, so no parallel stale-state map can
+ * survive the removal. */
+export function removeDeletedBlocksFromSidebar(uuids: ReadonlySet<string>) {
+  if (!uuids.size) return;
+  const next = rightSidebar().filter((item) => item.kind !== "block" || !uuids.has(item.uuid));
+  if (next.length !== rightSidebar().length) setRightSidebar(next);
 }
 
 /** Drop restored block items whose block can't be resolved (its in-memory uuid

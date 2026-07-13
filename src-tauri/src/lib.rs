@@ -27,7 +27,7 @@ use commands::{
     merge_pages, open_asset, open_page_file, page_aliases, page_icons, page_print_html, publish_html, query_facets,
     quick_switch, read_asset, read_custom_css, read_highlights, read_journal_file,
     read_local_image, read_text_file, rename_file_to_page, rename_page, resolve_block,
-    resolve_blocks, resolve_sync_conflict, run_advanced_query, run_query, save_asset, save_page,
+    resolve_blocks, resolve_sync_conflict, run_advanced_query, run_graph_search, run_query, save_asset, save_page,
     save_pdf_area_image, search, set_default_journal_template, set_favorites, set_guide_announced,
     set_journal_title_format, set_preferred_format, set_preferred_workflow, set_start_of_week,
     set_timetracking_enabled, stream_asset_path, sync_conflict_diff, tine_open_devtools, tine_quit, trash_asset,
@@ -37,8 +37,8 @@ use debug::{
     debug_enabled, debug_header, debug_info, debug_init, debug_log, diag, install_panic_logger,
 };
 use graph::{
-    app_platform, capture_target, create_graph, default_graph_parent, load_graph,
-    open_graph_window, resolve_root, startup_graph_path, warm_done,
+    app_platform, approve_external_assets, capture_target, create_graph, default_graph_parent,
+    inspect_graph_access, load_graph, open_graph_window, resolve_root, startup_graph_path, warm_done,
 };
 use platform::{clipboard_files, copy_image_to_clipboard, gpu_env, open_external};
 use plugins::{
@@ -520,6 +520,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             load_graph,
+            inspect_graph_access,
+            approve_external_assets,
             open_graph_window,
             startup_graph_path,
             capture_target,
@@ -549,6 +551,7 @@ pub fn run() {
             publish_html,
             page_print_html,
             run_query,
+            run_graph_search,
             run_advanced_query,
             query_facets,
             page_aliases,

@@ -3,10 +3,12 @@
 // backend's shape so the UI behaves identically.
 
 import type { Backend, GpuEnv, DebugInfo, InstalledPluginRecord } from "./backend";
-import type { BlockDto, GuideCopyResult, GuidePage, Highlight, PageDto, PageEntry, RefGroup } from "./types";
+import type { BlockDto, GuideCopyResult, GuidePage, Highlight, PageDto, PageEntry, QueryExecution, RefGroup } from "./types";
 import { SAMPLE_PDF_B64 } from "./sample-pdf";
 import { hlsPageName } from "./pdf";
 import { MARKER_RE } from "./markers";
+import { fuzzyScore } from "./editor/autocomplete";
+import { matcherMatches, matchHighlights, parseSearchQuery, simpleTerm } from "./editor/searchQuery";
 
 function pageRefs(raw: string): string[] {
   const out: string[] = [];
@@ -646,6 +648,10 @@ export function mockBackend(): Backend {
     async listKnownGraphs() {
       return [{ path: "/mock/graph", name: "graph" }];
     },
+    async inspectGraphAccess(path: string) {
+      return { graph_root: path || "/mock/graph", external_assets_path: null, approved: true };
+    },
+    async approveExternalAssets() {},
     async openGraphWindow() {
       return { kind: "focused_existing" as const, window_label: "main" };
     },
@@ -941,6 +947,67 @@ export function mockBackend(): Backend {
         n -= g.blocks.length;
       }
       return groups.filter((g) => g.blocks.length > 0);
+    },
+    async runGraphSearch(source: string, pageLimit: number, blockLimit: number, _lane?: string, explain = false): Promise<QueryExecution> {
+      // Browser-preview approximation only (ADR 0016). Production matching,
+      // diagnostics, and UTF-16 evidence come from Rust's QueryPlan evaluator.
+      const matcher = parseSearchQuery(source);
+      if (matcher.kind === "invalid") {
+        return {
+          hits: [],
+          diagnostics: [{ code: "invalid_regex", message: matcher.error }],
+          explanation: { branches: [] },
+          cancelled: false,
+        };
+      }
+      const bare = simpleTerm(matcher);
+      const pages = all
+        .map((page) => ({ page, score: bare ? fuzzyScore(bare, page.name) : 0 }))
+        .filter(({ page, score }) => bare ? score > 0 : matcherMatches(matcher, page.name.toLowerCase(), page.name))
+        .sort((a, b) => b.score - a.score)
+        .slice(0, pageLimit)
+        .map(({ page, score }) => ({
+          entity: "page" as const,
+          page: mockPageEntry(page),
+          display_text: page.name,
+          evidence: [{
+            clause_id: 1,
+            field: "page_name" as const,
+            mode: bare ? "fuzzy" as const : matcher.kind === "regex" ? "regex" as const : "contains" as const,
+            spans: matchHighlights(matcher, page.name),
+            score,
+          }],
+          score,
+        }));
+      const blocks = collect((block) => matcherMatches(matcher, block.raw.toLowerCase(), block.raw))
+        .flatMap((group) => group.blocks.map((block) => ({ group, block })))
+        .slice(0, Math.max(0, blockLimit))
+        .map(({ group, block }) => {
+          return {
+            entity: "block" as const,
+            page: group.page,
+            kind: group.kind,
+            block,
+            display_text: block.raw,
+            evidence: [{
+              clause_id: 1,
+              field: "visible_content" as const,
+              mode: matcher.kind === "regex" ? "regex" as const : "contains" as const,
+              spans: matchHighlights(matcher, block.raw),
+            }],
+          };
+        });
+      return {
+        hits: [...pages, ...blocks],
+        diagnostics: [],
+        explanation: {
+          branches: explain ? [
+            { description: bare ? `Page names fuzzily match “${source}”` : `Page names match “${source}”`, children: [] },
+            { description: `Block content matches “${source}”`, children: [] },
+          ] : [],
+        },
+        cancelled: false,
+      };
     },
     async listTemplates() {
       return [

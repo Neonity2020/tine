@@ -57,12 +57,15 @@ import {
   withUndoUnit,
   blockIsGridView,
   trackAssetWrite,
+  collapsibleDescendantIds,
+  setCollapsedDescendants,
   type OutlineScope,
 } from "../store";
 import {
   clearFocusSurface,
   editingId,
   editingOwner,
+  editingSurface,
   endEdit,
   focusSurfaceFor,
   noteSurfaceFocused,
@@ -263,6 +266,14 @@ export const CaptureCtx = createContext<CaptureApi | null>(null);
 // surfaces at once (see startEditing's surface stamping).
 export const SurfaceContext = createContext<string>("main");
 export const OutlineScopeContext = createContext<OutlineScope | null>(null);
+export interface CollapseSurfaceApi {
+  collapsed: (id: string, stored: boolean) => boolean;
+  toggle: (id: string, current: boolean) => void;
+  setMany: (ids: readonly string[], collapsed: boolean) => void;
+}
+// A transclusion can fold a source block locally, matching Logseq, without
+// writing collapsed:: into the source outline.
+export const CollapseSurfaceContext = createContext<CollapseSurfaceApi | null>(null);
 
 export function Block(props: { id: string; hideRefCount?: boolean; forceExpanded?: boolean }): JSX.Element {
   const node = () => doc.byId[props.id];
@@ -275,22 +286,43 @@ export function Block(props: { id: string; hideRefCount?: boolean; forceExpanded
   // all keyed by LiveRefGroup). Drives which instance shows the editor.
   const surfaceKey = useContext(SurfaceContext);
   const outlineScope = useContext(OutlineScopeContext);
+  const collapseSurface = useContext(CollapseSurfaceContext);
   const editing = () => {
     if (editingId() !== props.id) return false;
     const owner = editingOwner();
     // Scoped (a click): only the exact instance that was clicked edits; every other
     // instance of this uuid stays rendered and reflects the edit live.
     if (owner !== null) return owner === instanceId;
+    const scopedSurface = editingSurface();
+    if (scopedSurface !== null) return scopedSurface === surfaceKey;
     // Unscoped (keyboard nav / split): edit in the PRIMARY surface where the caret
     // already was. A block that also appears in a secondary "ref:" surface (e.g. the
     // journal agenda re-lists today's scheduled/deadline bullets) must stay RENDERED
     // there — arrowing into the real bullet must not flip the agenda copy into an
     // editor. (Clicking a ref/agenda copy still edits it in place, via the branch
     // above.) Matches the sidebar rule: edit where you're editing, render elsewhere.
-    return !surfaceKey.startsWith("ref:");
+    return !surfaceKey.startsWith("ref:") && !surfaceKey.startsWith("embed:");
   };
   const hasChildren = () => node().children.length > 0;
-  const collapsed = () => node().collapsed;
+  const collapsed = () => collapseSurface?.collapsed(props.id, node().collapsed) ?? node().collapsed;
+  const collapsibleDescendants = createMemo(() => collapsibleDescendantIds(props.id));
+  const hasCollapsedDescendant = createMemo(() =>
+    collapsibleDescendants().some((id) => {
+      const descendant = doc.byId[id];
+      return descendant
+        ? collapseSurface?.collapsed(id, descendant.collapsed) ?? descendant.collapsed
+        : false;
+    })
+  );
+  const toggleCollapsedDescendants = () => {
+    const ids = collapsibleDescendants();
+    if (!ids.length || (readOnly() && !collapseSurface)) return;
+    // OG semantics: any folded descendant means “expand all”; only a completely
+    // open subtree means “collapse all”. The guide parent itself stays open.
+    const next = !hasCollapsedDescendant();
+    if (collapseSurface) collapseSurface.setMany(ids, next);
+    else setCollapsedDescendants(props.id, next);
+  };
   const fmt = () => pageByName(node().page)?.format ?? "md";
   const blockFacets = createMemo(() => {
     const n = node();
@@ -374,7 +406,11 @@ export function Block(props: { id: string; hideRefCount?: boolean; forceExpanded
             class="collapse-toggle"
             classList={{ "has-children": hasChildren(), disabled: readOnly() }}
             aria-disabled={readOnly() ? "true" : undefined}
-            onClick={() => { if (!readOnly()) toggleCollapse(props.id); }}
+            onClick={() => {
+              if (readOnly()) return;
+              if (collapseSurface) collapseSurface.toggle(props.id, collapsed());
+              else toggleCollapse(props.id);
+            }}
           >
             <Show when={hasChildren()}>
               <svg viewBox="0 0 24 24" class="triangle">
@@ -482,7 +518,18 @@ export function Block(props: { id: string; hideRefCount?: boolean; forceExpanded
           </Match>
           <Match when={true}>
             <div class="block-children-container">
-              <div class="block-children-left-border" />
+              <button
+                type="button"
+                class="block-children-left-border"
+                aria-label={hasCollapsedDescendant() ? "Expand all descendants" : "Collapse all descendants"}
+                aria-expanded={!hasCollapsedDescendant()}
+                disabled={collapsibleDescendants().length === 0 || (readOnly() && !collapseSurface)}
+                title={hasCollapsedDescendant() ? "Expand all descendants" : "Collapse all descendants"}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  toggleCollapsedDescendants();
+                }}
+              />
               <div class="block-children">
                 <For each={node().children}>{(cid) => <Block id={cid} />}</For>
               </div>
@@ -957,6 +1004,10 @@ export function Editor(props: { id: string }): JSX.Element {
   // drives edit-focus arbitration when the same block renders in several surfaces.
   const surfaceKey = useContext(SurfaceContext);
   const outlineScope = useContext(OutlineScopeContext);
+  // Generic ref/query surfaces intentionally return structural keyboard edits to
+  // the primary outline. An embed is a live editing surface: Enter-created blocks
+  // must remain in the transclusion the user is looking at.
+  const enterSurface = () => surfaceKey.startsWith("embed:") ? surfaceKey : null;
   let ref!: HTMLTextAreaElement;
   // Caret/selection stashed when the *window* (not this block) loses focus, so
   // returning to Tine resumes editing exactly where you left off.
@@ -2366,7 +2417,7 @@ export function Editor(props: { id: string }): JSX.Element {
             commit(trimmed);
             newId = insertOutlineAfter(props.id, [{ raw: "", children: [] }]);
           });
-          startEditing(newId, 0);
+          startEditing(newId, 0, null, enterSurface());
           return;
         }
       }
@@ -2404,10 +2455,10 @@ export function Editor(props: { id: string }): JSX.Element {
         // adds a new sibling bullet below, which the user can Tab to nest as a
         // note under the highlight.
         const newId = insertOutlineAfter(props.id, [{ raw: "", children: [] }]);
-        startEditing(newId, 0);
+        startEditing(newId, 0, null, enterSurface());
       } else {
         const zoomRoot = outlineScope?.forceExpandedRoot === props.id;
-        splitBlock(props.id, start, zoomRoot, zoomRoot);
+        splitBlock(props.id, start, zoomRoot, zoomRoot, enterSurface());
       }
     } else if (e.key === "Backspace" && end === start) {
       // Auto-pair Backspace: caret between an empty pair (`(|)`) deletes both

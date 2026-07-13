@@ -48,6 +48,93 @@ fn backlinks_to_parameterized_complexity() {
 }
 
 #[test]
+fn unlinked_references_include_plain_text_alias_mentions() {
+    let root =
+        std::env::temp_dir().join(format!("tine-unlinked-alias-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("journals")).unwrap();
+    std::fs::create_dir_all(root.join("pages")).unwrap();
+    std::fs::write(
+        root.join("pages/20260713145345.md"),
+        "alias:: 20260713150352\n\n- Alias target page\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("pages/Alias Mention Test.md"),
+        "- No matching text yet.\n- The alias is already linked as [[20260713150352]].\n",
+    )
+    .unwrap();
+
+    let g = Graph::open(&root);
+    assert!(
+        g.unlinked_refs("20260713145345").is_empty(),
+        "warm the derived cache before the source edit"
+    );
+    let entry = g
+        .find_entry("Alias Mention Test", tine_core::PageKind::Page)
+        .unwrap();
+    let mut page = g.load_page(&entry).unwrap();
+    page.blocks[0].raw = "This block mentions 20260713150352 as plain text.".into();
+    g.save_page(&page, page.rev.as_deref()).unwrap();
+    let groups = g.unlinked_refs("20260713145345");
+    assert_eq!(
+        groups
+            .iter()
+            .map(|group| group.page.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Alias Mention Test"],
+        "an alias is another plain-text name for the canonical target: {groups:?}"
+    );
+    assert_eq!(groups[0].blocks.len(), 1, "linked aliases stay excluded");
+    assert_eq!(
+        groups[0].blocks[0].raw,
+        "This block mentions 20260713150352 as plain text."
+    );
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn backlinks_include_explicit_links_in_page_properties() {
+    let root = std::env::temp_dir().join(format!(
+        "tine-page-property-backlink-test-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("journals")).unwrap();
+    std::fs::create_dir_all(root.join("pages")).unwrap();
+    std::fs::write(
+        root.join("pages/A.md"),
+        "created:: none\n\n- Page containing a linked reference inside a page property.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("journals/2026_07_13.md"),
+        "- Reference target journal page.\n",
+    )
+    .unwrap();
+
+    let g = Graph::open(&root);
+    assert!(
+        g.backlinks("Jul 13th, 2026").is_empty(),
+        "warm the derived cache before the page-property edit"
+    );
+    let entry = g.find_entry("A", tine_core::PageKind::Page).unwrap();
+    let mut page = g.load_page(&entry).unwrap();
+    page.pre_block = Some("created:: [[Jul 13th, 2026]]".into());
+    g.save_page(&page, page.rev.as_deref()).unwrap();
+    let groups = g.backlinks("Jul 13th, 2026");
+    let source = groups
+        .iter()
+        .find(|group| group.page == "A")
+        .expect("page-property source should be a backlink group");
+    assert_eq!(source.blocks.len(), 1, "one page entity counts once");
+    assert_eq!(source.blocks[0].raw, "created:: [[Jul 13th, 2026]]");
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
 fn block_ref_counts_and_referrers() {
     // Isolated temp graph: a target block (id:: aaaaaaaa-0000-0000-0000-000000000001) referenced by a same-page
     // block and three blocks on another page (labeled, embed, and a double ref that
