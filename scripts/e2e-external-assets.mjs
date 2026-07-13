@@ -69,7 +69,14 @@ try {
     const link = await browser.$(selector);
     if (await link.isExisting()) { await link.click(); break; }
   }
-  await browser.$("img.media-image, img[src*='pixel.png']").waitForExist({ timeout: 20_000 });
+  await browser.waitUntil(async () => (await browser.$("h1.page-title").getText()).trim() === "External assets", {
+    timeout: 10_000, timeoutMsg: "external-assets page did not open",
+  });
+  const image = await browser.$("img.inline-image");
+  await image.waitForExist({ timeout: 20_000 });
+  await browser.waitUntil(async () => (await image.getProperty("complete")) === true, {
+    timeout: 10_000, timeoutMsg: "external asset image did not finish loading",
+  });
 
   const write = await browser.executeAsync((graph, done) => {
     (async () => {
