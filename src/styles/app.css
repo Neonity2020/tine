@@ -3347,6 +3347,52 @@ textarea {
   border-radius: 3px;
 }
 
+/* On a phone, desktop's 29px step leaves almost no text column after a handful
+   of levels. Keep the hierarchy legible with a 20px step and recover the fold
+   arrow's left-hand width by making it a visible trailing row action. The
+   guide remains centered under the parent bullet instead of drifting with the
+   tighter indentation. Desktop and precise-pointer layouts stay unchanged. */
+@media (max-width: 640px) and (pointer: coarse) {
+  :root {
+    --ls-block-indent: 20px;
+  }
+
+  .block-main {
+    position: relative;
+  }
+
+  .collapse-toggle {
+    position: absolute;
+    top: 0;
+    right: 0;
+    z-index: 2;
+    width: 44px;
+    height: 30px;
+  }
+
+  .collapse-toggle.has-children {
+    opacity: 0.62;
+  }
+
+  .ls-block:hover > .block-main > .block-controls > .collapse-toggle.has-children,
+  .collapse-toggle.has-children:focus-visible {
+    opacity: 1;
+  }
+
+  .block-main:has(> .block-controls > .collapse-toggle.has-children) > .block-content-wrapper {
+    padding-right: 44px;
+  }
+
+  .block-children {
+    margin-left: calc(8px - var(--ls-block-indent));
+    padding-left: calc(var(--ls-block-indent) - 8px);
+  }
+
+  .block-children-left-border {
+    left: calc(1px - var(--ls-block-indent));
+  }
+}
+
 /* editor */
 .editor-wrap {
   position: relative;

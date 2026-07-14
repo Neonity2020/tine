@@ -21,6 +21,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   known oracle artifacts.** A harmless `undefined`-versus-omitted field can no
   longer make a backtick-state-only mismatch look like a new divergence.
   (GH #82)
+- **Deep outlines keep a useful text column on Android.** Coarse-pointer phone
+  layouts use a tighter nesting step, keep guide lines under their parent
+  bullets, and expose folding as a visible trailing touch action; desktop
+  geometry is unchanged. (GH #150)
 - **Persistent Search results now fit their pane and retain their evidence.**
   Search, List, Table, and Board keep the matched terms highlighted; result
   rows wrap instead of widening a narrow pane; and Ctrl+F searches the visible
