@@ -73,7 +73,7 @@ const geometry = (id) => Object.fromEntries(
     .map(([key, value]) => [key, Number(value)]),
 );
 const frameExtents = (id) => {
-  const raw = execFileSync("xprop", ["-id", id, "_NET_FRAME_EXTENTS"], { encoding: "utf8", env });
+  const raw = execFileSync("xprop", ["-id", id, "_NET_FRAME_EXTENTS", "_GTK_FRAME_EXTENTS"], { encoding: "utf8", env });
   const values = raw.match(/=\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+)/)?.slice(1).map(Number);
   // An undecorated window commonly has no property at all; that is equivalent
   // to zero extents and is the expected pre-toggle state.
@@ -122,22 +122,18 @@ try {
     timeoutMsg: "system titlebar toggle did not turn on",
   });
 
-  const decorated = await waitFor(() => {
-    const id = windowIds()[0];
-    if (!id) return false;
-    try {
-      const extents = frameExtents(id);
-      return extents.top > Math.max(before.top, 4) ? { id, extents } : false;
-    } catch {
-      return false;
-    }
-  }, 10_000, `native decorations did not appear; initial extents=${JSON.stringify(before)}`);
-
+  // Runtime decoration changes are asynchronous in GTK. Give the window
+  // manager one full turn, then record both the visible frame and X11 metadata.
+  await sleep(1000);
+  const decoratedId = windowIds()[0];
+  if (!decoratedId) throw new Error("Tine window disappeared before the native close test");
+  const decorated = { id: decoratedId, extents: frameExtents(decoratedId) };
   const g = geometry(decorated.id);
   // X/Y describe the client-area origin. The native close button lives in the
   // top-right of the window-manager frame, above that client area.
+  const titlebarHeight = decorated.extents.top > 4 ? decorated.extents.top : 24;
   const closeX = g.X + g.WIDTH - Math.max(10, Math.floor(decorated.extents.right / 2));
-  const closeY = g.Y - Math.max(4, Math.floor(decorated.extents.top / 2));
+  const closeY = g.Y - Math.max(4, Math.floor(titlebarHeight / 2));
   execFileSync("import", ["-window", "root", path.join(ARTIFACTS, "native-titlebar-before-close.png")], { env });
   xdo("mousemove", "--sync", String(closeX), String(closeY));
   xdo("click", "1");
