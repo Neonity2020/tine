@@ -63,8 +63,8 @@ const suites = {
     ["scrollbars", "scripts/e2e-scrollbars.mjs", {}],
   ],
   "windows-smoke": [
-    ["windows-core", "scripts/e2e-windows-smoke.mjs", {}],
     ["pdf-logseq", "scripts/e2e-pdf-logseq.mjs", {}],
+    ["windows-core", "scripts/e2e-windows-smoke.mjs", {}],
   ],
 };
 

@@ -41,6 +41,16 @@ const now = new Date();
 const journal = `${now.getFullYear()}_${String(now.getMonth() + 1).padStart(2, "0")}_${String(now.getDate()).padStart(2, "0")}`;
 fs.writeFileSync(path.join(GRAPH, "journals", `${journal}.md`), "- ![Logseq sample](../assets/logseq-sample.pdf)\n");
 
+// Windows Tauri/WebView2 can outlive tauri-driver briefly after a preceding
+// scenario. On an isolated CI runner, remove only this test binary before
+// starting so the single-instance plugin cannot forward us into the old graph.
+function stopCiWindowsApp() {
+  if (process.platform === "win32" && process.env.CI === "true") {
+    spawnSync("taskkill", ["/IM", path.basename(APP), "/T", "/F"], { stdio: "ignore" });
+  }
+}
+stopCiWindowsApp();
+
 const env = {
   ...process.env,
   TINE_GRAPH: GRAPH,
@@ -100,9 +110,27 @@ try {
     connectionRetryCount: 1, connectionRetryTimeout: 60_000,
     capabilities: { browserName: "wry", "wdio:enforceWebDriverClassic": true, "tauri:options": { application: APP } },
   });
-  await browser.$(".pdf-link").waitForExist({ timeout: 20_000 });
+  await browser.$(".ls-block").waitForExist({ timeout: 30_000 });
+  const pdfLink = browser.$(".pdf-link");
+  try {
+    await pdfLink.waitForExist({ timeout: 20_000 });
+  } catch (error) {
+    const diagnostic = await browser.execute(() => ({
+      href: location.href,
+      title: document.title,
+      bodyText: document.body.innerText.slice(0, 4000),
+      blocks: Array.from(document.querySelectorAll(".ls-block")).slice(0, 20).map((block) => ({
+        text: block.textContent?.slice(0, 500),
+        html: block.innerHTML.slice(0, 1500),
+      })),
+    }));
+    const evidenceDir = process.env.E2E_ARTIFACT_DIR || TMP;
+    fs.writeFileSync(path.join(evidenceDir, "startup-diagnostic.json"), JSON.stringify(diagnostic, null, 2));
+    try { await browser.saveScreenshot(path.join(evidenceDir, "startup-diagnostic.png")); } catch {}
+    throw new Error(`PDF link did not render: ${JSON.stringify(diagnostic)}`, { cause: error });
+  }
   const before = processTreeRssKiB();
-  await browser.$(".pdf-link").click();
+  await pdfLink.click();
   let peak = before;
   for (let i = 0; i < 15; i++) {
     await sleep(200);
@@ -151,5 +179,6 @@ try {
   try { await browser?.deleteSession(); } catch {}
   if (process.platform === "win32") spawnSync("taskkill", ["/PID", String(td.pid), "/T", "/F"], { stdio: "ignore" });
   else try { process.kill(-td.pid, "SIGKILL"); } catch {}
+  stopCiWindowsApp();
   fs.closeSync(log);
 }

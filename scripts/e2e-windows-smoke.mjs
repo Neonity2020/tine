@@ -67,5 +67,8 @@ try {
 } finally {
   try { await browser?.deleteSession(); } catch {}
   spawnSync("taskkill", ["/PID", String(driver.pid), "/T", "/F"], { stdio: "ignore" });
+  if (process.env.CI === "true") {
+    spawnSync("taskkill", ["/IM", path.basename(APP), "/T", "/F"], { stdio: "ignore" });
+  }
   fs.closeSync(log);
 }
