@@ -50,7 +50,8 @@ const xdoEnv = process.env.E2E_XDOTOOL_LIB
 const xdo = (...args) => execFileSync(XDOTOOL, args, { encoding: "utf8", env: xdoEnv }).trim();
 const windowIds = () => {
   try {
-    return xdo("search", "--name", "^Tine(?: — .*)?$").split(/\s+/).filter(Boolean);
+    // xdotool uses POSIX extended regular expressions (no `(?:...)`).
+    return xdo("search", "--name", "^Tine( — .*)?$").split(/\s+/).filter(Boolean);
   } catch {
     return [];
   }
