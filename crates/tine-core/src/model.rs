@@ -1095,16 +1095,24 @@ impl Graph {
                 let Some((k, v)) = crate::doc::parse_property_line(line) else {
                     continue;
                 };
-                if !(k.eq_ignore_ascii_case("tags") || k.eq_ignore_ascii_case("alias")) {
+                if !(k.eq_ignore_ascii_case("tags")
+                    || k.eq_ignore_ascii_case("alias")
+                    || k.eq_ignore_ascii_case("aliases"))
+                {
                     continue;
                 }
-                for val in v.split(',') {
+                let quoted = v.trim();
+                if quoted.len() >= 2 && quoted.starts_with('"') && quoted.ends_with('"') {
+                    continue;
+                }
+                for val in v.split([',', '，']) {
                     let t = val.trim();
+                    let t = t.strip_prefix('#').unwrap_or(t).trim();
                     let t = t
                         .strip_prefix("[[")
                         .and_then(|x| x.strip_suffix("]]"))
                         .unwrap_or(t);
-                    add(seen, t.strip_prefix('#').unwrap_or(t).trim().to_string());
+                    add(seen, t.trim().to_string());
                 }
             }
         }
@@ -4680,7 +4688,8 @@ fn has_alias_prop(text: &str) -> bool {
     // cheaper than full to_lowercase. Over-matching content is harmless (it just
     // invalidates the alias cache slightly more often); MISSING `Alias::` would
     // leave it stale, which is the bug we're avoiding.
-    text.to_ascii_lowercase().contains("alias::")
+    let lower = text.to_ascii_lowercase();
+    lower.contains("alias::") || lower.contains("aliases::")
 }
 fn doc_has_alias(doc: &Document) -> bool {
     doc.pre_block.as_deref().is_some_and(has_alias_prop) || doc.roots.iter().any(block_has_alias)
@@ -5564,6 +5573,23 @@ mod tests {
         );
         assert_eq!(n, 1, "pre-block alias backlink still merges");
 
+        // Both Logseq spellings and both common comma glyphs are accepted.
+        let (a, n) = build("- aliases:: book，volume\n- I like reading\n");
+        assert_eq!(
+            a,
+            vec![
+                ("book".to_string(), "books".to_string()),
+                ("volume".to_string(), "books".to_string()),
+            ],
+            "plural aliases and full-width comma registered"
+        );
+        assert_eq!(n, 1, "plural alias backlink merges");
+
+        // A whole quoted value is literal text, not a list of page aliases.
+        let (a, n) = build("- alias:: \"book\"\n- I like reading\n");
+        assert!(a.is_empty(), "quoted alias stays literal: {a:?}");
+        assert_eq!(n, 0, "quoted alias does not merge backlinks");
+
         // A NON-first bullet with `alias::` is a block property, NOT a page alias
         // (OG parity — only the first properties block counts).
         let (a, n) = build("- I like reading\n- alias:: book\n");
@@ -5642,7 +5668,7 @@ mod tests {
         // page references, bare or bracketed).
         fs::write(
             dir.join("pages").join("paper.md"),
-            "tags:: ProjectX, [[Linear IP]]\nalias:: LP Survey\n- body\n",
+            "tags:: ProjectX， [[Linear IP]]\naliases:: LP Survey，Paper Notes\nstatus:: \"Private, Draft\"\n- body\n",
         )
         .unwrap();
         let g = Graph::open(&dir);
@@ -5671,6 +5697,14 @@ mod tests {
             "bracketed tags:: value should appear"
         );
         assert!(has("lp survey", "LP Survey"), "alias:: value should appear");
+        assert!(
+            has("paper notes", "Paper Notes"),
+            "aliases:: value should appear"
+        );
+        assert!(
+            !has("private", "Private"),
+            "quoted custom value stays literal"
+        );
         // Neither filed nor referenced → not offered (so autocomplete still says
         // "Create" for a genuinely new name).
         assert!(!has("nonexistent", "nonexistent"));

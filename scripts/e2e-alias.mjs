@@ -1,4 +1,4 @@
-// Real-app regression for GH #62/#86. A first bullet becomes syntactically a
+// Real-app regression for GH #62/#86/#138/#139. A first bullet becomes syntactically a
 // page-property block as soon as the second ':' in `alias::` is typed. The page
 // must not hide/unmount its textarea at that intermediate point.
 import { spawn } from "node:child_process";
@@ -43,7 +43,8 @@ try {
     capabilities: { browserName: "wry", "wdio:enforceWebDriverClassic": true, "tauri:options": { application: APP } },
   });
   await browser.$(".ls-block, .page-title").waitForExist({ timeout: 20_000 });
-  const link = await browser.$("*=Books");
+  const link = await browser.$(".page-ref");
+  await link.waitForExist({ timeout: 10_000 });
   await link.click();
   await browser.waitUntil(async () => (await browser.$("h1.page-title").getText()) === "Books", { timeout: 10_000 });
 
@@ -64,15 +65,37 @@ try {
   console.log("alias editor remained mounted after delimiter");
   await editor.addValue(" book");
   console.log("typed alias value");
-  await browser.$("h1.page-title").click();
+
+  // GH #138: Enter stays inside this special first property block. The next
+  // property can be typed without creating a separate outline bullet; a second
+  // Enter on the trailing blank line exits to an ordinary body bullet.
+  await browser.keys(["Enter"]);
+  editor = await browser.$(".page-blocks textarea.block-editor");
+  if ((await editor.getValue()) !== "alias:: book\n") throw new Error("Enter left the first page-property block");
+  await editor.addValue("tags:: blah，foobar");
+  await browser.keys(["Enter"]);
+  if ((await editor.getValue()) !== "alias:: book\ntags:: blah，foobar\n") {
+    throw new Error(`second property did not stay in one block: ${JSON.stringify(await editor.getValue())}`);
+  }
+  await browser.keys(["Enter"]);
+  await browser.waitUntil(async () => (await browser.$$(".page-blocks textarea.block-editor")).length === 1, {
+    timeout: 5_000, timeoutMsg: "double Enter did not create and focus one body bullet",
+  });
+  const bodyEditor = await browser.$(".page-blocks textarea.block-editor");
+  if ((await bodyEditor.getValue()) !== "") throw new Error("double Enter did not focus the empty body bullet");
 
   await browser.waitUntil(async () => (await browser.$(".page-aliases").getText()).includes("book"), {
     timeout: 5000, timeoutMsg: "completed alias did not render as a page alias",
   });
+  const propertyLinks = await browser.execute(() => [...document.querySelectorAll(".prop-row")]
+    .find((row) => row.querySelector(".prop-key")?.textContent === "tags")
+    ?.querySelectorAll(".page-ref").length ?? 0);
+  if (propertyLinks !== 2) throw new Error(`tags property did not expose two page links: ${propertyLinks}`);
+  await browser.$("h1.page-title").click();
   await browser.waitUntil(() => fs.readFileSync(`${GRAPH}/pages/Books.md`, "utf8").startsWith("- alias:: book\n"), {
     timeout: 5000, timeoutMsg: "completed alias was not saved to disk",
   });
-  console.log("PASS: alias:: stayed editable through its delimiter and persisted as a page alias");
+  console.log("PASS: first-bullet properties stay in one editor, exit cleanly, link page values, and persist");
 } finally {
   try { await browser?.deleteSession(); } catch {}
   try { process.kill(-td.pid, "SIGKILL"); } catch {}

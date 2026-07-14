@@ -27,6 +27,10 @@ describe("aliasNames", () => {
     expect(aliasNames("#+TITLE: P\n#+ALIAS: foo, bar", "org")).toEqual(["foo", "bar"]);
     expect(aliasNames(":PROPERTIES:\n:alias: baz\n:END:", "org")).toEqual(["baz"]);
   });
+  it("accepts aliases:: and full-width separators while quoted values suppress refs", () => {
+    expect(aliasNames("aliases:: Foo， Bar, Baz")).toEqual(["Foo", "Bar", "Baz"]);
+    expect(aliasNames('alias:: "Foo, Bar"')).toEqual([]);
+  });
 });
 
 describe("pageProperties", () => {

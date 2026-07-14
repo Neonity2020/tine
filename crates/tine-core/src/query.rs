@@ -154,8 +154,13 @@ pub fn page_aliases(graph: &Graph) -> Vec<(String, String)> {
             let Some(text) = alias_text else { continue };
             for line in text.lines() {
                 if let Some((k, v)) = crate::doc::parse_property_line(line) {
-                    if k.eq_ignore_ascii_case("alias") {
-                        for a in v.split(',') {
+                    if k.eq_ignore_ascii_case("alias") || k.eq_ignore_ascii_case("aliases") {
+                        let trimmed = v.trim();
+                        if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"')
+                        {
+                            continue;
+                        }
+                        for a in v.split([',', '，']) {
                             let a = strip_ref(a.trim());
                             if !a.is_empty() {
                                 out.push((refs::normalize(&a), entry.name.clone()));
@@ -1643,11 +1648,12 @@ fn value_matches(stored: &str, query: Option<&str>) -> bool {
 }
 fn strip_ref(s: &str) -> String {
     let t = s.trim();
+    let t = t.strip_prefix('#').unwrap_or(t).trim();
     let t = t
         .strip_prefix("[[")
         .and_then(|x| x.strip_suffix("]]"))
         .unwrap_or(t);
-    t.strip_prefix('#').unwrap_or(t).trim().to_string()
+    t.trim().to_string()
 }
 
 /// Resolve a `between` bound token to a `yyyymmdd` ordinal: `today`/`yesterday`/

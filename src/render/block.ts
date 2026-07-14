@@ -87,15 +87,38 @@ export function aliasNames(
   preBlock: string | null | undefined,
   format: Format = "md"
 ): string[] {
+  const out: string[] = [];
   for (const [k, v] of pageProperties(preBlock, format)) {
-    if (k.toLowerCase() === "alias") {
-      return v
-        .split(",")
-        .map((s) => s.trim())
-        .filter(Boolean);
-    }
+    if (k.toLowerCase() !== "alias" && k.toLowerCase() !== "aliases") continue;
+    if (isQuotedPagePropertyValue(v)) continue;
+    out.push(...v
+      .split(/[,，]/)
+      .map(normalizeImplicitPageName)
+      .filter(Boolean));
   }
-  return [];
+  return out;
+}
+
+/** Built-in page-property values that Logseq treats as page references even
+ * without explicit `[[...]]` syntax. Custom properties stay ordinary text. */
+export function isImplicitPageRefProperty(key: string): boolean {
+  const lower = key.toLowerCase();
+  return lower === "alias" || lower === "aliases" || lower === "tags";
+}
+
+/** A whole quoted property value is literal text, including its commas. */
+export function isQuotedPagePropertyValue(value: string): boolean {
+  const trimmed = value.trim();
+  return trimmed.length >= 2 && trimmed.startsWith('"') && trimmed.endsWith('"');
+}
+
+/** Normalize one implicit page value for alias resolution / display. */
+export function normalizeImplicitPageName(value: string): string {
+  let trimmed = value.trim();
+  if (trimmed.startsWith("#[[") && trimmed.endsWith("]]")) trimmed = trimmed.slice(3, -2);
+  else if (trimmed.startsWith("[[") && trimmed.endsWith("]]")) trimmed = trimmed.slice(2, -2);
+  else if (trimmed.startsWith("#")) trimmed = trimmed.slice(1);
+  return trimmed.trim();
 }
 
 const PLANNING_LINE = /^\s*(SCHEDULED|DEADLINE):\s*<[^>]+>\s*$/;

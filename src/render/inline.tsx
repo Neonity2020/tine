@@ -235,7 +235,7 @@ function createPeekBridge(disabled: () => boolean) {
 }
 
 // A `[[page]]` / `#tag` anchor — shared by page_ref links, bare refs, and #tags.
-function PageRef(props: { name: string; alias?: JSX.Element; tag?: boolean; blockId?: string; spanAttrs?: SpanDomAttrs }): JSX.Element {
+export function PageRef(props: { name: string; alias?: JSX.Element; tag?: boolean; blockId?: string; spanAttrs?: SpanDomAttrs }): JSX.Element {
   const pane = useContext(PaneContext);
   const insidePeek = useContext(PeekContext);
   let anchorEl: HTMLAnchorElement | undefined;

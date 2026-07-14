@@ -119,7 +119,7 @@ import {
   caretColumnOnVisualRow,
   caretOffsetOnLastRow,
 } from "../editor/caretRows";
-import { splitProps, joinProps, isBuiltinHidden, isSheetCellHidden, hideAll, caretInFence, multilineExitTrim } from "../editor/properties";
+import { splitProps, joinProps, isBuiltinHidden, isSheetCellHidden, hideAll, caretInFence, caretOnPropertyLine, isPropertiesOnly, multilineExitTrim } from "../editor/properties";
 import { normalizePlanning } from "../editor/planning";
 import { caretOnOpeningFence } from "../editor/fences";
 import { isAnnotationBlock, annotationInfo } from "../editor/annotation";
@@ -1009,6 +1009,13 @@ export function Editor(props: { id: string }): JSX.Element {
   const sheetInitialRaw = sheetCell ? node()?.raw ?? "" : null;
   // Page format drives in-block list markers (`-` is an org bullet, not md).
   const pageFmt = (): "md" | "org" => (pageByName(node().page)?.format === "org" ? "org" : "md");
+  const isFirstPagePropertiesBlock = (raw: string) => {
+    const page = pageByName(node().page);
+    return page?.format === "md"
+      && !page.preBlock
+      && page.roots[0] === props.id
+      && isPropertiesOnly(raw);
+  };
 
   // What the textarea shows. Annotation (PDF highlight) blocks expose only their
   // highlight text (all metadata hidden); every other block hides just the
@@ -2351,12 +2358,14 @@ export function Editor(props: { id: string }): JSX.Element {
 
     if (e.key === "Enter" && !e.shiftKey && !e.ctrlKey && !e.metaKey) {
       const inFence = !isAnnot() && caretInFence(raw, start);
+      const inPageProperties = !isAnnot() && isFirstPagePropertiesBlock(raw);
       // Double-Enter escape: the first Enter creates a trailing blank line; the
       // second removes that sentinel and creates a normal sibling. Keep the text
       // trim and structural insertion in one undo unit so one Undo restores the
       // exact pre-exit special block and removes the sibling.
-      if ((isCalc() || inFence) && start === end) {
-        const trimmed = multilineExitTrim(raw, start, isCalc() ? "calc" : "fence");
+      if ((isCalc() || inFence || inPageProperties) && start === end) {
+        const kind = isCalc() ? "calc" : inFence ? "fence" : "properties";
+        const trimmed = multilineExitTrim(raw, start, kind);
         if (trimmed !== null) {
           e.preventDefault();
           let newId = props.id;
@@ -2367,6 +2376,17 @@ export function Editor(props: { id: string }): JSX.Element {
           startEditing(newId, 0, null, editSurface());
           return;
         }
+      }
+      // A Markdown page's first properties-only bullet is OG's page-property
+      // editor. Enter after a property stays in the same textarea so the next
+      // `key:: value` pair can be typed; Enter again on the empty trailing line
+      // takes the double-Enter exit above and creates an ordinary body bullet.
+      // Use the explicit edit path instead of relying on a browser textarea's
+      // native default so the update/autosize/undo behavior is deterministic.
+      if (inPageProperties && caretOnPropertyLine(raw, start)) {
+        e.preventDefault();
+        softNewlineCmd();
+        return;
       }
       // In a calc block, Enter adds a new expression line (stays in the block) —
       // let the textarea insert the newline natively, like OG.

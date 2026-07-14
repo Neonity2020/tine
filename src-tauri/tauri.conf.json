@@ -18,7 +18,8 @@
         "height": 820,
         "minWidth": 640,
         "minHeight": 480,
-        "decorations": false
+        "decorations": false,
+        "visible": false
       },
       {
         "label": "capture",

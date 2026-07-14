@@ -27,7 +27,10 @@ export function UnlinkedReferences(props: { name: string }): JSX.Element {
               <div class="reference-page" onClick={() => openPage(g.page, g.kind)}>
                 {g.page}
               </div>
-              <div class="reference-blocks">
+              <div
+                class="reference-blocks"
+                data-inpage-find-surface={`unlinked:${props.name}:${g.kind}:${g.page}`}
+              >
                 <RefBlocks blocks={g.blocks} page={g.page} pageKind={g.kind} />
               </div>
             </div>

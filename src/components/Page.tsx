@@ -16,8 +16,8 @@ import { UnlinkedReferences } from "./UnlinkedReferences";
 import { QueryMacro } from "./Macro";
 import { SheetTable } from "./SheetTable";
 import { NamespaceCrumb, NamespaceHierarchy } from "./Namespace";
-import { pageProperties, aliasNames, visibleBody } from "../render/block";
-import { InlineText } from "../render/inline";
+import { pageProperties, aliasNames, isImplicitPageRefProperty, isQuotedPagePropertyValue, normalizeImplicitPageName, visibleBody } from "../render/block";
+import { InlineText, PageRef } from "../render/inline";
 import { EmojiText } from "../render/emoji";
 import { journalTitle } from "../journal";
 import { editingId, endEditForSurface, startEditing } from "../editorController";
@@ -36,6 +36,29 @@ let feedDone = false;
 // (OG hides it too). Other internal/metadata page props could be added here.
 const PAGE_PROPS_HIDDEN = new Set(["alias", "icon", "tine.tag-table"]);
 const TAG_TABLE_PROP = "tine.tag-table";
+
+/** Render Logseq's implicit page-reference properties without changing the
+ * stored text. Bare alias/aliases/tags values become navigable, while explicit
+ * inline markup, separators, spacing, custom properties, and quoted values keep
+ * their authored representation. */
+function PagePropertyValue(props: { propertyKey: string; value: string; format: "md" | "org" }): JSX.Element {
+  if (!isImplicitPageRefProperty(props.propertyKey) || isQuotedPagePropertyValue(props.value)) {
+    return <InlineText text={props.value} format={props.format} />;
+  }
+  return (
+    <For each={props.value.split(/([,，])/g)}>
+      {(part) => {
+        if (part === "," || part === "，") return part;
+        const leading = part.match(/^\s*/)?.[0] ?? "";
+        const trailing = part.match(/\s*$/)?.[0] ?? "";
+        const value = part.slice(leading.length, part.length - trailing.length);
+        if (!value) return part;
+        const name = normalizeImplicitPageName(value);
+        return <>{leading}<PageRef name={name} alias={name} />{trailing}</>;
+      }}
+    </For>
+  );
+}
 
 function paneContextFromContext() {
   const ctx = useContext(PaneContext);
@@ -526,7 +549,7 @@ function PageSection(props: { page: FeedPage }): JSX.Element {
         <div class="page-aliases" title="Also known as — other names that link here">
           <span class="page-aliases-label">aka</span>
           <For each={aliasNames(propertySource(), props.page.format)}>
-            {(a) => <span class="alias-chip">{a}</span>}
+            {(a) => <span class="alias-chip"><PageRef name={a} alias={a} /></span>}
           </For>
         </div>
       </Show>
@@ -538,7 +561,7 @@ function PageSection(props: { page: FeedPage }): JSX.Element {
               <div class="prop-row">
                 <span class="prop-key">{key}</span>
                 <span class="prop-value">
-                  <InlineText text={value} format={props.page.format} />
+                  <PagePropertyValue propertyKey={key} value={value} format={props.page.format} />
                 </span>
               </div>
             )}

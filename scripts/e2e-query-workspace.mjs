@@ -35,6 +35,7 @@ fs.writeFileSync(`${GRAPH}/pages/Query parity.md`, [
   "",
 ].join("\n"));
 fs.writeFileSync(`${GRAPH}/pages/Templates.md`, "- TODO [#A] Excluded template result\n");
+fs.writeFileSync(`${GRAPH}/pages/Unlinked source.md`, "- Unlinked visible phrase names Query parity without brackets\n");
 const now = new Date();
 const journal = `${now.getFullYear()}_${String(now.getMonth() + 1).padStart(2, "0")}_${String(now.getDate()).padStart(2, "0")}`;
 fs.writeFileSync(`${GRAPH}/journals/${journal}.md`, "- Open [[Research]] and [[Query parity]]\n");
@@ -90,23 +91,81 @@ async function inlineQueryViewButton(browser, label) {
   throw new Error(`missing inline-query ${label} view button`);
 }
 
+async function assertInPageFind(browser, query, activeSelector) {
+  // WebKitWebDriver itself reserves native Ctrl+F on some builds; dispatch the
+  // identical cancelable DOM chord so this still exercises Tine's real global
+  // keybinding and find UI without handing the session to the driver's browser UI.
+  await browser.execute(() => window.dispatchEvent(new KeyboardEvent("keydown", {
+    key: "f", code: "KeyF", ctrlKey: true, bubbles: true, cancelable: true,
+  })));
+  const input = await browser.$(".inpage-find-input");
+  await input.waitForExist({ timeout: 5_000 });
+  await input.setValue(query);
+  try {
+    await browser.waitUntil(async () => {
+      const count = (await browser.$(".inpage-find-count").getText()).trim();
+      return count !== "" && count !== "No results";
+    }, { timeout: 10_000, timeoutMsg: `in-page find did not find ${query}` });
+  } catch (error) {
+    const proof = await browser.execute(() => ({
+      value: document.querySelector(".inpage-find-input")?.value,
+      count: document.querySelector(".inpage-find-count")?.textContent,
+      paneIds: [...document.querySelectorAll("[data-pane-id]")].map((element) => element.getAttribute("data-pane-id")),
+      surfaces: [...document.querySelectorAll("[data-inpage-find-surface]")].map((element) => ({
+        id: element.getAttribute("data-inpage-find-surface"), text: element.textContent?.trim().slice(0, 200),
+      })),
+    }));
+    throw new Error(`${String(error)}; proof=${JSON.stringify(proof)}`);
+  }
+  await browser.$(activeSelector).waitForExist({ timeout: 5_000 });
+  await browser.execute(() => document.querySelector(".inpage-find-input")?.dispatchEvent(
+    new KeyboardEvent("keydown", { key: "Escape", code: "Escape", bubbles: true, cancelable: true })
+  ));
+  await input.waitForExist({ reverse: true, timeout: 5_000 });
+}
+
 await withApp(0, async (browser) => {
+  // The page outline is viewport-lazy; wait for the observed AST body rather
+  // than treating its short-lived literal fallback as app readiness.
+  await browser.$(".page-ref").waitForExist({ timeout: 10_000 });
   const routed = await browser.execute(() => {
     const refs = [...document.querySelectorAll(".page-ref")];
     const ref = refs.find((element) => element.textContent?.includes("Query parity"));
-    if (!ref) return { ok: false, refs: refs.map((element) => element.textContent?.trim()) };
+    if (!ref) return {
+      ok: false,
+      refs: refs.map((element) => element.textContent?.trim()),
+      title: document.querySelector("h1.page-title")?.textContent?.trim(),
+      text: document.querySelector(".page")?.textContent?.trim().slice(0, 500),
+      parser: document.documentElement.dataset.lsdocParser,
+      bodyHtml: document.querySelector(".block-content")?.innerHTML.slice(0, 1_000),
+    };
     for (const type of ["mousedown", "mouseup", "click"]) {
       ref.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, button: 0 }));
     }
-    return { ok: true, refs: [] };
+    return { ok: true, refs: [], title: "", text: "" };
   });
-  if (!routed.ok) throw new Error(`query fixture page-ref is missing: ${JSON.stringify(routed.refs)}`);
+  if (!routed.ok) throw new Error(`query fixture page-ref is missing: ${JSON.stringify(routed)}`);
   await browser.waitUntil(async () => (await browser.$("h1.page-title").getText()).trim() === "Query parity", {
     timeout: 10_000, timeoutMsg: "could not route to the DSL query fixture",
   });
   await browser.waitUntil(async () => (await browser.$(".query-count").getText()).trim() === "9", {
     timeout: 10_000, timeoutMsg: "ordinary query did not produce its nine expected blocks",
   });
+  const referenceBlocks = await browser.$(".reference-blocks");
+  await referenceBlocks.waitForExist({ timeout: 10_000 });
+  await referenceBlocks.scrollIntoView();
+  await browser.waitUntil(async () => (await browser.$(".reference-blocks").getText()).includes("Open"), {
+    timeout: 10_000, timeoutMsg: "linked-reference content did not finish rendering",
+  });
+  await assertInPageFind(browser, "Open", ".reference-blocks.inpage-find-active-block");
+  await browser.$(".unlinked-references .references-header").click();
+  const unlinkedBlocks = await browser.$(".unlinked-references .reference-blocks");
+  await unlinkedBlocks.waitForExist({ timeout: 10_000 });
+  await unlinkedBlocks.scrollIntoView();
+  await browser.waitUntil(async () => (await unlinkedBlocks.getText()).includes("Unlinked visible phrase"), {
+    timeout: 10_000, timeoutMsg: "unlinked-reference content did not finish rendering",
+  });
+  await assertInPageFind(browser, "Unlinked visible phrase", ".unlinked-references .reference-blocks.inpage-find-active-block");
   const inlineSearchButton = await inlineQueryViewButton(browser, "Search");
   await inlineSearchButton.click();
   await browser.waitUntil(async () => (await browser.$$(".query-search-results .query-search-hit")).length === 9, {
@@ -164,6 +223,53 @@ await withApp(0, async (browser) => {
   await browser.$(".query-workspace").waitForExist({ timeout: 10_000 });
   const source = await browser.$(".query-workspace-source");
   if ((await source.getValue()) !== "alpha beta -draft") throw new Error("query workspace lost the Ctrl+K source");
+
+  // GH #140: every persistent presentation keeps the authoritative evidence
+  // highlights, and every visible result remains an in-page-find surface.
+  await browser.setWindowSize(720, 700);
+  const presentations = [
+    ["Search", ".query-results-search"],
+    ["List", ".query-results-list"],
+    ["Table", ".query-results-table"],
+    ["Board", ".query-results-board"],
+  ];
+  for (const [label, selector] of presentations) {
+    await (await presentationButton(browser, label)).click();
+    await browser.$(selector).waitForExist({ timeout: 5_000 });
+    await browser.waitUntil(async () => (await browser.$$(".query-workspace mark")).length >= 4, {
+      timeout: 5_000, timeoutMsg: `${label} presentation dropped search highlights`,
+    });
+    const presentationProof = await browser.execute(() => ({
+      rows: [...document.querySelectorAll(".query-workspace [data-inpage-find-surface]")].map((row) => ({
+        marks: [...row.querySelectorAll("mark")].map((mark) => mark.textContent?.toLowerCase()),
+      })),
+    }));
+    if (presentationProof.rows.length !== 2
+      || presentationProof.rows.some((row) => !row.marks.includes("alpha") || !row.marks.includes("beta"))) {
+      throw new Error(`${label} evidence/surface mismatch: ${JSON.stringify(presentationProof)}`);
+    }
+  }
+  await (await presentationButton(browser, "Search")).click();
+  const wrapProof = await browser.execute(() => {
+    const workspace = document.querySelector(".query-workspace")?.getBoundingClientRect();
+    return [...document.querySelectorAll(".query-result-row")].map((row) => {
+      const rect = row.getBoundingClientRect();
+      return {
+        scrollWidth: row.scrollWidth,
+        clientWidth: row.clientWidth,
+        left: rect.left,
+        right: rect.right,
+        workspaceLeft: workspace?.left,
+        workspaceRight: workspace?.right,
+      };
+    });
+  });
+  if (!wrapProof.length || wrapProof.some((row) => row.scrollWidth > row.clientWidth + 1
+    || row.left < row.workspaceLeft - 1 || row.right > row.workspaceRight + 1)) {
+    throw new Error(`persistent search rows overflow the narrow pane: ${JSON.stringify(wrapProof)}`);
+  }
+  await assertInPageFind(browser, "alpha", ".query-result-row.inpage-find-active-block");
+
   await browser.$(".query-explain-toggle").click();
   await browser.$(".query-workspace-explanation").waitForExist({ timeout: 10_000 });
   await browser.$(".query-advanced-toggle").click();
@@ -189,7 +295,7 @@ await withApp(1, async (browser) => {
     throw new Error("restart lost the query presentation");
   }
   const graphFilesBefore = fs.readdirSync(`${GRAPH}/pages`).sort();
-  const expectedBefore = ["Query parity.md", "Research.md", "Templates.md"];
+  const expectedBefore = ["Query parity.md", "Research.md", "Templates.md", "Unlinked source.md"];
   if (JSON.stringify(graphFilesBefore) !== JSON.stringify(expectedBefore)) {
     throw new Error(`virtual query wrote a temporary page: ${graphFilesBefore.join(", ")}`);
   }

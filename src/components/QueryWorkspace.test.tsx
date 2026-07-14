@@ -200,11 +200,18 @@ describe("QueryWorkspace", () => {
     expect(root.querySelector(".search-result-context")?.textContent).toContain("Page");
     expect(root.querySelectorAll(".query-result-row")).toHaveLength(2);
 
-    const table = [...root.querySelectorAll<HTMLButtonElement>(".query-presentations button")]
-      .find((button) => button.textContent === "Table")!;
-    table.click();
-    expect(root.querySelector(".query-results-table")).not.toBeNull();
-    expect(router.updateActiveQuery).toHaveBeenCalledWith({ presentation: "table" });
+    for (const [label, selector] of [
+      ["List", ".query-results-list"],
+      ["Table", ".query-results-table"],
+      ["Board", ".query-results-board"],
+    ] as const) {
+      const button = [...root.querySelectorAll<HTMLButtonElement>(".query-presentations button")]
+        .find((candidate) => candidate.textContent === label)!;
+      button.click();
+      expect(root.querySelector(selector)).not.toBeNull();
+      expect([...root.querySelectorAll("mark")].map((mark) => mark.textContent)).toEqual(["Alpha", "alpha"]);
+      expect(router.updateActiveQuery).toHaveBeenCalledWith({ presentation: label.toLowerCase() });
+    }
 
     const explain = root.querySelector(".query-explain-toggle") as HTMLButtonElement;
     explain.click();

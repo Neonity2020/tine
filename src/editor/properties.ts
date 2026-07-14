@@ -19,6 +19,17 @@ export function isPropertiesOnly(raw: string): boolean {
   return sawProperty;
 }
 
+/** Whether the textarea caret is on a complete `key:: value` line. This is
+ * deliberately line-local: an empty line after a run of page properties is the
+ * double-Enter exit sentinel, not another property line. */
+export function caretOnPropertyLine(raw: string, caret: number): boolean {
+  const c = Math.max(0, Math.min(caret, raw.length));
+  const lineStart = raw.lastIndexOf("\n", c - 1) + 1;
+  const nextNewline = raw.indexOf("\n", c);
+  const lineEnd = nextNewline === -1 ? raw.length : nextNewline;
+  return PROP_LINE.test(raw.slice(lineStart, lineEnd));
+}
+
 /** Split a Markdown page preamble into real page-property lines and ordinary
  * content. Property-looking text inside a fenced code block stays content. */
 export function splitPagePreamble(raw: string | null | undefined): {
@@ -68,7 +79,7 @@ function propLineKey(line: string): string | null {
 export function multilineExitTrim(
   text: string,
   caret: number,
-  kind: "calc" | "fence"
+  kind: "calc" | "fence" | "properties"
 ): string | null {
   const c = Math.max(0, Math.min(caret, text.length));
   const lineStart = text.lastIndexOf("\n", c - 1) + 1;
@@ -76,7 +87,7 @@ export function multilineExitTrim(
   if (lineEnd === -1) lineEnd = text.length;
   if (text.slice(lineStart, lineEnd).trim() !== "" || lineStart === 0) return null;
 
-  if (kind === "calc") {
+  if (kind === "calc" || kind === "properties") {
     if (text.slice(lineEnd).trim() !== "") return null;
     return text.slice(0, lineStart - 1);
   }

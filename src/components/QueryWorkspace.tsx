@@ -205,7 +205,30 @@ function hitKind(hit: QueryHit): "Page" | "Block" {
 }
 
 function MarkedText(props: { text: string; spans: MatchSpan[] }): JSX.Element {
-  const segments = () => buildSearchExcerpt(props.text, props.spans);
+  const segments = () => {
+    const spans = props.spans
+      .map((span) => ({
+        start: Math.max(0, Math.min(props.text.length, span.start)),
+        end: Math.max(0, Math.min(props.text.length, span.end)),
+      }))
+      .filter((span) => span.end > span.start)
+      .sort((a, b) => a.start - b.start || a.end - b.end);
+    const merged: MatchSpan[] = [];
+    for (const span of spans) {
+      const previous = merged[merged.length - 1];
+      if (previous && span.start <= previous.end) previous.end = Math.max(previous.end, span.end);
+      else merged.push({ ...span });
+    }
+    const out: { text: string; marked: boolean }[] = [];
+    let cursor = 0;
+    for (const span of merged) {
+      if (span.start > cursor) out.push({ text: props.text.slice(cursor, span.start), marked: false });
+      out.push({ text: props.text.slice(span.start, span.end), marked: true });
+      cursor = span.end;
+    }
+    if (cursor < props.text.length) out.push({ text: props.text.slice(cursor), marked: false });
+    return out;
+  };
   return (
     <For each={segments()}>{(segment) => segment.marked
       ? <mark>{segment.text}</mark>
@@ -587,6 +610,8 @@ export function QueryWorkspace(props: QueryWorkspaceProps): JSX.Element {
     if (hit.entity === "page") props.router.openPage(hit.page.name, hit.page.kind);
     else props.router.openPageAtBlock(hit.page, hit.kind, hit.block.id);
   };
+  const hitSurfaceId = (hit: QueryHit) =>
+    `query:${props.route.id}:${hit.entity}:${hit.entity === "page" ? hit.page.name : hit.block.id}`;
   const save = async (event: SubmitEvent) => {
     event.preventDefault();
     if (saving()) return;
@@ -610,7 +635,12 @@ export function QueryWorkspace(props: QueryWorkspaceProps): JSX.Element {
   };
 
   const resultButton = (hit: QueryHit, body: JSX.Element) => (
-    <button type="button" class="query-result-row switcher-row" onClick={() => openHit(hit)}>
+    <button
+      type="button"
+      class="query-result-row switcher-row"
+      data-inpage-find-surface={hitSurfaceId(hit)}
+      onClick={() => openHit(hit)}
+    >
       {body}
     </button>
   );
@@ -738,7 +768,11 @@ export function QueryWorkspace(props: QueryWorkspaceProps): JSX.Element {
                     <span class="switcher-kind">page</span>
                     <span class="search-result-body">
                       <span class="search-result-context">Page</span>
-                      <span class="search-result-excerpt"><MarkedText text={hit.display_text} spans={hitSpans(hit)} /></span>
+                      <span class="search-result-excerpt">
+                        <For each={buildSearchExcerpt(hit.display_text, hitSpans(hit))}>{(segment) => segment.marked
+                          ? <mark>{segment.text}</mark>
+                          : segment.text}</For>
+                      </span>
                     </span>
                   </>)}
               </div>
@@ -750,9 +784,9 @@ export function QueryWorkspace(props: QueryWorkspaceProps): JSX.Element {
           <ul class="query-results-list" aria-label="Query results">
             <For each={hits()}>{(hit) => (
               <li>
-                <button type="button" onClick={() => openHit(hit)}>
+                <button type="button" data-inpage-find-surface={hitSurfaceId(hit)} onClick={() => openHit(hit)}>
                   <span class="query-list-context">{hitPage(hit)}</span>
-                  <span class="query-list-text">{hit.display_text}</span>
+                  <span class="query-list-text"><MarkedText text={hit.display_text} spans={hitSpans(hit)} /></span>
                 </button>
               </li>
             )}</For>
@@ -766,10 +800,10 @@ export function QueryWorkspace(props: QueryWorkspaceProps): JSX.Element {
               <thead><tr><th scope="col">Type</th><th scope="col">Page</th><th scope="col">Content</th></tr></thead>
               <tbody>
                 <For each={hits()}>{(hit) => (
-                  <tr>
+                  <tr data-inpage-find-surface={hitSurfaceId(hit)}>
                     <td>{hitKind(hit)}</td>
                     <td><button type="button" onClick={() => openHit(hit)}>{hitPage(hit)}</button></td>
-                    <td>{hit.display_text}</td>
+                    <td><MarkedText text={hit.display_text} spans={hitSpans(hit)} /></td>
                   </tr>
                 )}</For>
               </tbody>
@@ -784,8 +818,8 @@ export function QueryWorkspace(props: QueryWorkspaceProps): JSX.Element {
                 <h2>{page}<span class="query-board-count">{pageHits.length}</span></h2>
                 <div role="list">
                   <For each={pageHits}>{(hit) => (
-                    <button type="button" role="listitem" class="query-board-card" onClick={() => openHit(hit)}>
-                      <span class="sr-only">{hitKind(hit)}: </span>{hit.display_text}
+                    <button type="button" role="listitem" class="query-board-card" data-inpage-find-surface={hitSurfaceId(hit)} onClick={() => openHit(hit)}>
+                      <span class="sr-only">{hitKind(hit)}: </span><MarkedText text={hit.display_text} spans={hitSpans(hit)} />
                     </button>
                   )}</For>
                 </div>

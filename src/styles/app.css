@@ -7887,10 +7887,14 @@ img.emoji {
   gap: 3px;
 }
 .query-result-row {
+  box-sizing: border-box;
   width: 100%;
+  max-width: 100%;
+  min-width: 0;
   min-height: 48px;
   padding: 6px 9px;
   text-align: left;
+  white-space: normal;
 }
 .query-results-list {
   margin: 0;

@@ -394,6 +394,53 @@ describe("page properties", () => {
     }
   });
 
+  it("links bare alias and tag values but leaves ordinary bare properties as text (GH #139)", async () => {
+    const propsId = "11111111-1111-4111-8111-111111111111";
+    const bodyId = "22222222-2222-4222-8222-222222222222";
+    const raw = [
+      "aliases:: Book shelf，Reading",
+      "tags:: books, [[Knowledge work]]",
+      "owner:: Martin",
+      "reviewer:: [[Jane Doe]]",
+      'status:: "Draft, Private"',
+    ].join("\n");
+    const dto = {
+      name: "Books",
+      kind: "page" as const,
+      title: "Books",
+      pre_block: null,
+      blocks: [
+        { id: propsId, raw, collapsed: false, children: [] },
+        { id: bodyId, raw: "Reading list", collapsed: false, children: [] },
+      ],
+    };
+    setDoc({
+      byId: {
+        [propsId]: node(propsId, raw, dto.name),
+        [bodyId]: node(bodyId, dto.blocks[1].raw, dto.name),
+      },
+      pages: [page(dto.name, "page", [propsId, bodyId])], feed: [dto.name], loaded: true,
+    });
+    vi.spyOn(backend(), "getPage").mockResolvedValue(dto);
+    mainPaneRouter.openPage(dto.name, "page", { inPlace: true });
+
+    const { root, dispose } = mount(() => <PageView />);
+    try {
+      await tick();
+      const rows = [...root.querySelectorAll<HTMLElement>(".prop-row")];
+      const row = (key: string) => rows.find((candidate) => candidate.querySelector(".prop-key")?.textContent === key)!;
+      expect([...row("tags").querySelectorAll(".page-ref")].map((link) => link.textContent)).toEqual(["books", "Knowledge work"]);
+      expect([...row("aliases").querySelectorAll(".page-ref")].map((link) => link.textContent)).toEqual(["Book shelf", "Reading"]);
+      expect(row("owner").querySelector(".page-ref")).toBeNull();
+      // Explicit custom-property refs keep the app's ordinary dimmed [[bracket]]
+      // styling; only the newly inferred bare built-ins need a plain label.
+      expect([...row("reviewer").querySelectorAll(".page-ref")].map((link) => link.textContent)).toEqual(["[[Jane Doe]]"]);
+      expect(row("status").querySelector(".page-ref")).toBeNull();
+    } finally {
+      dispose();
+    }
+  });
+
   it("keeps an editable blank body after hiding an only properties block", async () => {
     const propsId = "11111111-1111-4111-8111-111111111111";
     const dto = {

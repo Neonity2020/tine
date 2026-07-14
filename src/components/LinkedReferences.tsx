@@ -160,7 +160,10 @@ export function LinkedReferences(props: { name: string }): JSX.Element {
                 >
                   {g.page}
                 </div>
-                <div class="reference-blocks">
+                <div
+                  class="reference-blocks"
+                  data-inpage-find-surface={`linked:${props.name}:${g.kind}:${g.page}`}
+                >
                   <LiveRefGroup page={g.page} kind={g.kind} blocks={g.blocks} />
                 </div>
               </div>

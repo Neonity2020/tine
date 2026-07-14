@@ -57,6 +57,31 @@ use tauri::Emitter;
 use tauri::Manager;
 use watcher::{get_watch_mode, set_watch_mode, start_watcher};
 
+#[cfg(desktop)]
+const MAIN_WINDOW_REVEAL_FALLBACK_MS: u64 = 3_000;
+
+/// The frontend normally reveals the main window after its themed App has
+/// painted. Keep a native fail-safe so a parser/session/frontend failure cannot
+/// strand the process as an invisible application.
+#[cfg(desktop)]
+fn schedule_main_window_reveal_fallback(app: &tauri::AppHandle) {
+    let app = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(
+            MAIN_WINDOW_REVEAL_FALLBACK_MS,
+        ));
+        let main_thread_app = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            let Some(window) = main_thread_app.get_webview_window("main") else {
+                return;
+            };
+            if !window.is_visible().unwrap_or(false) {
+                let _ = window.show();
+            }
+        });
+    });
+}
+
 /// Show + focus the always-on-top quick-capture mini window (created hidden at
 /// startup). Each show resets it to the small base size and anchors it near the
 /// top of the screen so the frontend can grow it downward (multiple blocks, an
@@ -430,6 +455,8 @@ pub fn run() {
         })
         .setup(|app| {
             diag("setup() begin");
+            #[cfg(desktop)]
+            schedule_main_window_reveal_fallback(app.handle());
             // Eagerly open the graph if one was configured at startup.
             let startup_root = resolve_root("").or_else(|| settings::last_graph_path(app.handle()));
             if let Some(root) = startup_root {

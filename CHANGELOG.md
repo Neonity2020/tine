@@ -8,8 +8,29 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+### Added
+
+- **Page-valued properties now provide direct navigation.** Bare values in
+  `tags`, `alias`, and `aliases` are rendered as page links (including
+  comma-separated values), while custom and wholly quoted properties stay
+  literal unless they contain an explicit page reference. (GH #139)
+
 ### Fixed
 
+- **Persistent Search results now fit their pane and retain their evidence.**
+  Search, List, Table, and Board keep the matched terms highlighted; result
+  rows wrap instead of widening a narrow pane; and Ctrl+F searches the visible
+  query results as well as linked and unlinked reference rows. (GH #140)
+- **Enter now adds another page property when editing the first properties-only
+  bullet.** A second Enter on the trailing empty line exits cleanly to a normal
+  body bullet, matching Logseq without splitting the property list. (GH #138)
+- **Android's Interface size setting now scales the complete application.** It
+  uses the document-level Chromium path on Android, where Wry's native zoom API
+  is a no-op, while desktop and iOS retain native webview scaling. (GH #133)
+- **Desktop startup no longer exposes intermediate unthemed layout frames.**
+  The main window is revealed only after the themed app has painted, with a
+  bounded native fallback so a frontend failure cannot leave Tine invisible.
+  (GH #132)
 - **Arrow navigation and empty-block deletion inside a block embed keep the
   caret in the visible embed.** The underlying source outline is still edited,
   but structural focus no longer jumps to the source block. (GH #134)
