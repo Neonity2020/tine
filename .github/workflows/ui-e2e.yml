@@ -2,6 +2,11 @@ name: ui-e2e
 
 on:
   workflow_dispatch:
+    inputs:
+      linux_scenario:
+        description: Optional single Linux scenario for focused debugging
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -39,7 +44,12 @@ jobs:
       - name: Run complete Linux UI regression catalog
         env:
           E2E_ALLOW_SYNTHETIC_FOCUS: "1"
-        run: npm run e2e:linux:release
+        run: |
+          if [ -n "${{ inputs.linux_scenario }}" ]; then
+            npm run e2e:linux:release -- --scenario=${{ inputs.linux_scenario }}
+          else
+            npm run e2e:linux:release
+          fi
       - name: Upload Linux E2E evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -51,6 +61,7 @@ jobs:
 
   windows-smoke:
     name: Windows x64 ${{ matrix.scenario }} real-app smoke (advisory)
+    if: ${{ inputs.linux_scenario == '' }}
     runs-on: windows-latest
     timeout-minutes: 45
     strategy:

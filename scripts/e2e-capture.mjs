@@ -101,6 +101,13 @@ const appLog = fs.openSync(`${ARTIFACT_DIR}/tine.log`, "w");
 const app = spawn(APP, [], { env, stdio: ["ignore", appLog, appLog], detached: true });
 try {
   await waitForWindow("Tine", 20_000);
+  // This scenario exercises the normal global-shortcut path: hand off to an
+  // app that is already running. GitHub's cold WebKit/portal startup can expose
+  // a titled main window before its native surfaces have settled; launching the
+  // second process during that unrelated cold-start race can leave Openbox
+  // focused on its root window. Require one stable turn before the handoff.
+  await sleep(1500);
+  await waitForWindow("Tine", 5000);
 
   const second = spawn(APP, ["--capture"], { env, stdio: ["ignore", appLog, appLog], detached: true });
   second.unref();
