@@ -14,6 +14,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   handle and Alt+Up/Down keyboard actions update the pane's canonical tab order
   while preserving active, pinned, split-pane, close, and persistence behavior.
   (GH #141)
+- **The selection toolbar can now toggle page links and inline code.** The
+  actions preserve the inner selection, unwrap existing syntax, participate in
+  Undo, and keep the toolbar compact through a narrow-layout overflow. (GH #142)
 - **Page-valued properties now provide direct navigation.** Bare values in
   `tags`, `alias`, and `aliases` are rendered as page links (including
   comma-separated values), while custom and wholly quoted properties stay

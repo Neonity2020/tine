@@ -4,7 +4,7 @@ import { render } from "solid-js/web";
 import { startEditing } from "../editorController";
 import { installKeybindings } from "../keybindings";
 import { initParser } from "../render/parse";
-import { loadSingle, pageByName, resetStore } from "../store";
+import { doc, loadSingle, pageByName, resetStore, undo } from "../store";
 import type { BlockDto } from "../types";
 import { Block } from "./Block";
 
@@ -89,6 +89,47 @@ describe("selection wrapping with Alt-modified literal delimiters (GH #83)", () 
     } finally {
       dispose();
       disposeKeys();
+    }
+  });
+});
+
+describe("selection toolbar actions (GH #142)", () => {
+  it("toggles page-link and inline-code wrappers while retaining the selection", async () => {
+    const { textarea, root, dispose } = mountEditor("alpha beta");
+    try {
+      textarea.setSelectionRange(0, 5);
+      textarea.dispatchEvent(new Event("select", { bubbles: true }));
+      const pageLink = root.querySelector<HTMLButtonElement>('[data-selection-action="page-link"]');
+      const inlineCode = root.querySelector<HTMLButtonElement>('[data-selection-action="inline-code"]');
+      expect(pageLink).not.toBeNull();
+      expect(inlineCode).not.toBeNull();
+
+      pageLink!.click();
+      await vi.waitFor(() => expect(textarea.value).toBe("[[alpha]] beta"));
+      expect([textarea.selectionStart, textarea.selectionEnd]).toEqual([2, 7]);
+      pageLink!.click();
+      await vi.waitFor(() => expect(textarea.value).toBe("alpha beta"));
+      expect([textarea.selectionStart, textarea.selectionEnd]).toEqual([0, 5]);
+
+      inlineCode!.click();
+      await vi.waitFor(() => expect(textarea.value).toBe("`alpha` beta"));
+      expect([textarea.selectionStart, textarea.selectionEnd]).toEqual([1, 6]);
+    } finally {
+      dispose();
+    }
+  });
+
+  it("records a toolbar edit as one undoable editor change", async () => {
+    const { textarea, root, dispose } = mountEditor("alpha beta");
+    try {
+      textarea.setSelectionRange(0, 5);
+      textarea.dispatchEvent(new Event("select", { bubbles: true }));
+      root.querySelector<HTMLButtonElement>('[data-selection-action="inline-code"]')!.click();
+      await vi.waitFor(() => expect(doc.byId["selection-wrap"].raw).toBe("`alpha` beta"));
+      undo();
+      expect(doc.byId["selection-wrap"].raw).toBe("alpha beta");
+    } finally {
+      dispose();
     }
   });
 });

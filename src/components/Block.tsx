@@ -87,6 +87,11 @@ import {
   setPriority,
   type Edit,
 } from "../editor/format";
+import {
+  essentialSelectionActions,
+  secondarySelectionActions,
+  type SelectionAction,
+} from "../editor/selectionActions";
 import { isRenderHiddenProp, isPropertyLine } from "../render/block";
 import { facetsOf } from "../render/facets";
 import { AstBody } from "../render/body";
@@ -1243,13 +1248,24 @@ export function Editor(props: { id: string }): JSX.Element {
   // non-empty selection exists in this block's editor.
   const [hasSel, setHasSel] = createSignal(false);
   const updateSel = () => setHasSel(ref.selectionStart !== ref.selectionEnd);
-  const fmt = (left: string, right?: string) => {
-    applyEdit(toggleWrap(ref.value, ref.selectionStart, ref.selectionEnd, left, right));
+  const [selectionOverflowOpen, setSelectionOverflowOpen] = createSignal(false);
+  const runSelectionAction = (action: SelectionAction) => {
+    applyEdit(action.apply(ref.value, ref.selectionStart, ref.selectionEnd));
+    setSelectionOverflowOpen(false);
     queueMicrotask(updateSel);
   };
-  const doLink = () => {
-    applyEdit(insertLink(ref.value, ref.selectionStart, ref.selectionEnd));
-    setHasSel(false);
+  const selectionActionLabel = (action: SelectionAction): JSX.Element => {
+    if (action.id === "bold") return <b>{action.label}</b>;
+    if (action.id === "italic") return <i>{action.label}</i>;
+    if (action.id === "strikethrough") return <s>{action.label}</s>;
+    if (action.id === "highlight") return <mark>{action.label}</mark>;
+    if (action.id === "link") return (
+      <svg viewBox="0 0 24 24" width="13" height="13" aria-hidden="true">
+        <path d="M9 15l6-6M10 6l1-1a4 4 0 015.7 5.7l-1 1M14 18l-1 1a4 4 0 01-5.7-5.7l1-1"
+          fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
+      </svg>
+    );
+    return action.label;
   };
 
   // Insert `text` in place of the active trigger and restore the caret. If the
@@ -2761,16 +2777,46 @@ export function Editor(props: { id: string }): JSX.Element {
       </Show>
       <Show when={hasSel()}>
         <div class="sel-toolbar" onMouseDown={(e) => e.preventDefault()}>
-          <button title="Bold (mod+b)" onClick={() => fmt("**")}><b>B</b></button>
-          <button title="Italic (mod+i)" onClick={() => fmt("*")}><i>I</i></button>
-          <button title="Strikethrough" onClick={() => fmt("~~")}><s>S</s></button>
-          <button title="Highlight" onClick={() => fmt("==")}><mark>H</mark></button>
-          <button title="Link" onClick={doLink}>
-            <svg viewBox="0 0 24 24" width="13" height="13" aria-hidden="true">
-              <path d="M9 15l6-6M10 6l1-1a4 4 0 015.7 5.7l-1 1M14 18l-1 1a4 4 0 01-5.7-5.7l1-1"
-                fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
-            </svg>
-          </button>
+          <For each={essentialSelectionActions}>{(action) => (
+            <button
+              classList={{ "sel-action-page-link": action.id === "page-link" }}
+              title={action.title}
+              aria-label={action.title}
+              data-selection-action={action.id}
+              onClick={() => runSelectionAction(action)}
+            >{selectionActionLabel(action)}</button>
+          )}</For>
+          <div class="sel-toolbar-secondary">
+            <For each={secondarySelectionActions}>{(action) => (
+              <button
+                title={action.title}
+                aria-label={action.title}
+                data-selection-action={action.id}
+                onClick={() => runSelectionAction(action)}
+              >{selectionActionLabel(action)}</button>
+            )}</For>
+          </div>
+          <button
+            class="sel-toolbar-more"
+            title="More formatting"
+            aria-label="More formatting"
+            aria-haspopup="menu"
+            aria-expanded={selectionOverflowOpen()}
+            onClick={() => setSelectionOverflowOpen((open) => !open)}
+          >…</button>
+          <Show when={selectionOverflowOpen()}>
+            <div class="sel-toolbar-overflow" role="menu" aria-label="More formatting">
+              <For each={secondarySelectionActions}>{(action) => (
+                <button
+                  role="menuitem"
+                  title={action.title}
+                  aria-label={action.title}
+                  data-selection-action={action.id}
+                  onClick={() => runSelectionAction(action)}
+                >{selectionActionLabel(action)}</button>
+              )}</For>
+            </div>
+          </Show>
         </div>
       </Show>
       <Show when={ac() && acItems().length > 0 && acRect()}>
