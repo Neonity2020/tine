@@ -23,7 +23,10 @@ for (const source of sources) {
     const match = command.match(/"cargo\/(?:git-)?vendor\/([^/\"]+)"\s*$/);
     if (!match) throw new Error(`unrecognized generated git-vendor command: ${command}`);
     gitPackages.add(match[1]);
-    return command.replace(`"cargo/vendor/${match[1]}"`, `"cargo/git-vendor/${match[1]}"`);
+    const routed = command.replace(`"cargo/vendor/${match[1]}"`, `"cargo/git-vendor/${match[1]}"`);
+    return routed.includes('mkdir -p "cargo/git-vendor" &&')
+      ? routed
+      : `mkdir -p "cargo/git-vendor" && ${routed}`;
   });
 }
 if (!gitPackages.size) throw new Error("generated Flatpak sources contain no git packages");

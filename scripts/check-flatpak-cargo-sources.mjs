@@ -59,6 +59,12 @@ for (const source of sources) {
     if (command.includes("flatpak-cargo/git/") && command.includes('"cargo/vendor/')) {
       problems.push(`git package still shares the registry vendor: ${command}`);
     }
+    if (
+      command.includes("flatpak-cargo/git/") &&
+      !command.includes('mkdir -p "cargo/git-vendor" &&')
+    ) {
+      problems.push(`git package copy does not create its parent directory: ${command}`);
+    }
   }
 }
 

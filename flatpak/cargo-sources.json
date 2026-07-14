@@ -2887,7 +2887,7 @@
     {
         "type": "shell",
         "commands": [
-            "cp -r --reflink=auto \"flatpak-cargo/git/lsdoc-96e9096/.\" \"cargo/git-vendor/lsdoc\""
+            "mkdir -p \"cargo/git-vendor\" && cp -r --reflink=auto \"flatpak-cargo/git/lsdoc-96e9096/.\" \"cargo/git-vendor/lsdoc\""
         ]
     },
     {
@@ -4985,7 +4985,7 @@
     {
         "type": "shell",
         "commands": [
-            "cp -r --reflink=auto \"flatpak-cargo/git/tao-07f3742/.\" \"cargo/git-vendor/tao\""
+            "mkdir -p \"cargo/git-vendor\" && cp -r --reflink=auto \"flatpak-cargo/git/tao-07f3742/.\" \"cargo/git-vendor/tao\""
         ]
     },
     {
@@ -5016,7 +5016,7 @@
     {
         "type": "shell",
         "commands": [
-            "cp -r --reflink=auto \"flatpak-cargo/git/tao-07f3742/tao-macros\" \"cargo/git-vendor/tao-macros\""
+            "mkdir -p \"cargo/git-vendor\" && cp -r --reflink=auto \"flatpak-cargo/git/tao-07f3742/tao-macros\" \"cargo/git-vendor/tao-macros\""
         ]
     },
     {
