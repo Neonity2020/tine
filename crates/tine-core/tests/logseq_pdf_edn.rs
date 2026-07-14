@@ -22,10 +22,7 @@ mod unix {
         if std::env::var_os(CHILD_ENV).is_some() {
             let highlights = tine_core::pdf::parse_highlights(SIDE_CAR);
             assert_eq!(highlights.len(), 1);
-            assert_eq!(
-                highlights[0].id,
-                "6a5604f8-a337-4336-a711-2ba6bc14fbfd"
-            );
+            assert_eq!(highlights[0].id, "6a5604f8-a337-4336-a711-2ba6bc14fbfd");
             return;
         }
 

@@ -282,6 +282,10 @@ export interface Rect {
   left: number;
   width: number;
   height: number;
+  /** Coordinate-space dimensions from a current Logseq PDF sidecar. Absent on
+   * rectangles written by older Tine versions, which already use page space. */
+  source_width?: number;
+  source_height?: number;
 }
 
 export interface Highlight {

@@ -18,6 +18,13 @@ pub struct Rect {
     pub left: f64,
     pub width: f64,
     pub height: f64,
+    /// Coordinate-space dimensions used by current Logseq sidecars. `None`
+    /// means the rectangle already uses the PDF's scale-1 page coordinates
+    /// (the shape written by older Tine versions).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_width: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_height: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -45,26 +52,101 @@ fn kw(s: &str) -> Edn {
     Edn::Keyword(s.to_string())
 }
 
+fn finite(values: &[f64]) -> bool {
+    values.iter().all(|value| value.is_finite())
+}
+
 fn rect_from(e: &Edn) -> Option<Rect> {
-    Some(Rect {
-        top: e.get("top")?.as_f64()?,
-        left: e.get("left")?.as_f64()?,
-        width: e.get("width")?.as_f64()?,
-        height: e.get("height")?.as_f64()?,
-    })
+    if let (Some(top), Some(left), Some(width), Some(height)) = (
+        e.get("top").and_then(Edn::as_f64),
+        e.get("left").and_then(Edn::as_f64),
+        e.get("width").and_then(Edn::as_f64),
+        e.get("height").and_then(Edn::as_f64),
+    ) {
+        return (finite(&[top, left, width, height]) && width >= 0.0 && height >= 0.0).then_some(
+            Rect {
+                top,
+                left,
+                width,
+                height,
+                source_width: None,
+                source_height: None,
+            },
+        );
+    }
+
+    // Logseq's current sidecars store rectangle corners as x1/y1/x2/y2; their
+    // width/height fields describe the full PDF page rather than this rectangle.
+    let left = e.get("x1")?.as_f64()?;
+    let top = e.get("y1")?.as_f64()?;
+    let right = e.get("x2")?.as_f64()?;
+    let bottom = e.get("y2")?.as_f64()?;
+    let source_width = e.get("width")?.as_f64()?;
+    let source_height = e.get("height")?.as_f64()?;
+    (finite(&[left, top, right, bottom, source_width, source_height])
+        && right >= left
+        && bottom >= top
+        && source_width > 0.0
+        && source_height > 0.0)
+        .then_some(Rect {
+            top,
+            left,
+            width: right - left,
+            height: bottom - top,
+            source_width: Some(source_width),
+            source_height: Some(source_height),
+        })
 }
 
 fn rect_to(r: &Rect) -> Edn {
-    Edn::Map(vec![
-        (kw("top"), Edn::Float(r.top)),
-        (kw("left"), Edn::Float(r.left)),
-        (kw("width"), Edn::Float(r.width)),
-        (kw("height"), Edn::Float(r.height)),
-    ])
+    match (r.source_width, r.source_height) {
+        (Some(source_width), Some(source_height))
+            if source_width.is_finite()
+                && source_height.is_finite()
+                && source_width > 0.0
+                && source_height > 0.0 =>
+        {
+            Edn::Map(vec![
+                (kw("x1"), Edn::Float(r.left)),
+                (kw("y1"), Edn::Float(r.top)),
+                (kw("x2"), Edn::Float(r.left + r.width)),
+                (kw("y2"), Edn::Float(r.top + r.height)),
+                (kw("width"), Edn::Float(source_width)),
+                (kw("height"), Edn::Float(source_height)),
+            ])
+        }
+        _ => Edn::Map(vec![
+            (kw("top"), Edn::Float(r.top)),
+            (kw("left"), Edn::Float(r.left)),
+            (kw("width"), Edn::Float(r.width)),
+            (kw("height"), Edn::Float(r.height)),
+        ]),
+    }
+}
+
+fn highlight_id(e: &Edn) -> Option<&str> {
+    match e {
+        Edn::Str(id) => Some(id),
+        Edn::Tagged(tag, value) if tag == "uuid" => match value.as_ref() {
+            Edn::Str(id) => Some(id),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn id_to(id: &str) -> Edn {
+    if uuid::Uuid::parse_str(id).is_ok() {
+        Edn::Tagged("uuid".to_string(), Box::new(Edn::Str(id.to_string())))
+    } else {
+        // Preserve compatibility with old/non-UUID fixtures rather than writing
+        // an invalid #uuid reader literal that Logseq would reject.
+        Edn::Str(id.to_string())
+    }
 }
 
 fn highlight_from(e: &Edn) -> Option<Highlight> {
-    let id = e.get("id")?.as_str()?.to_string();
+    let id = highlight_id(e.get("id")?)?.to_string();
     let page = e.get("page")?.as_i64()?;
     let pos = e.get("position")?;
     let position = Position {
@@ -104,7 +186,7 @@ fn highlight_to(h: &Highlight) -> Edn {
         (kw("bounding"), rect_to(&h.position.bounding)),
         (
             kw("rects"),
-            Edn::Vec(h.position.rects.iter().map(rect_to).collect()),
+            Edn::List(h.position.rects.iter().map(rect_to).collect()),
         ),
     ]);
     let mut content_pairs = Vec::new();
@@ -113,7 +195,7 @@ fn highlight_to(h: &Highlight) -> Edn {
     }
     content_pairs.push((kw("image"), h.image.map(Edn::Int).unwrap_or(Edn::Nil)));
     Edn::Map(vec![
-        (kw("id"), Edn::Str(h.id.clone())),
+        (kw("id"), id_to(&h.id)),
         (kw("page"), Edn::Int(h.page)),
         (kw("position"), position),
         (kw("content"), Edn::Map(content_pairs)),
@@ -126,7 +208,7 @@ fn highlight_to(h: &Highlight) -> Edn {
 
 /// Parse `assets/<key>.edn` contents into highlights.
 pub fn parse_highlights(edn_str: &str) -> Vec<Highlight> {
-    let Some(root) = edn::parse(edn_str) else {
+    let Some(root) = edn::parse_strict(edn_str) else {
         return Vec::new();
     };
     root.get("highlights")
@@ -158,6 +240,30 @@ fn merge_highlight(existing: Option<&Edn>, h: &Highlight) -> Edn {
     match (existing, highlight_to(h)) {
         (Some(Edn::Map(old)), Edn::Map(new)) => {
             let mut merged = old.clone();
+            // `:position/:bounding` is deep-merged so foreign metadata survives,
+            // but its old and current coordinate spellings must not coexist: an
+            // old `:top` would otherwise shadow newly-written `:x1` on the next
+            // read. `:rects` is replaced as a whole by deep_merge below.
+            if let Some((_, Edn::Map(position))) = merged
+                .iter_mut()
+                .find(|(key, _)| matches!(key, Edn::Keyword(name) if name == "position"))
+            {
+                if let Some((_, Edn::Map(bounding))) = position
+                    .iter_mut()
+                    .find(|(key, _)| matches!(key, Edn::Keyword(name) if name == "bounding"))
+                {
+                    bounding.retain(|(key, _)| {
+                        !matches!(
+                            key,
+                            Edn::Keyword(name)
+                                if matches!(
+                                    name.as_str(),
+                                    "top" | "left" | "x1" | "y1" | "x2" | "y2" | "width" | "height"
+                                )
+                        )
+                    });
+                }
+            }
             deep_merge(&mut merged, new);
             Edn::Map(merged)
         }
@@ -171,14 +277,14 @@ fn merge_highlight(existing: Option<&Edn>, h: &Highlight) -> Edn {
 /// fields round-trip untouched. Rebuilding from our model alone dropped all of it (audit
 /// C#4: Logseq's `:extra`/metadata was silently erased on every highlight edit).
 pub fn write_highlights(highlights: &[Highlight], existing_edn: &str) -> String {
-    let root = edn::parse(existing_edn);
+    let root = edn::parse_strict(existing_edn);
     let existing_by_id: HashMap<String, Edn> = root
         .as_ref()
         .and_then(|r| r.get("highlights"))
         .and_then(Edn::as_vec)
         .map(|v| {
             v.iter()
-                .filter_map(|h| Some((h.get("id")?.as_str()?.to_string(), h.clone())))
+                .filter_map(|h| Some((highlight_id(h.get("id")?)?.to_string(), h.clone())))
                 .collect()
         })
         .unwrap_or_default();
@@ -450,12 +556,16 @@ mod tests {
                     left: 50.0,
                     width: 400.0,
                     height: 200.0,
+                    source_width: None,
+                    source_height: None,
                 },
                 rects: vec![Rect {
                     top: 100.0,
                     left: 50.0,
                     width: 400.0,
                     height: 20.0,
+                    source_width: None,
+                    source_height: None,
                 }],
             },
             color: "yellow".into(),
@@ -527,6 +637,71 @@ mod tests {
         assert_eq!(hs[0].color, "green");
         assert_eq!(hs[0].text.as_deref(), Some("hello"));
         assert_eq!(hs[0].position.rects.len(), 1);
+    }
+
+    #[test]
+    fn parses_current_logseq_uuid_list_and_corner_rect_shape() {
+        let src = r#"{:highlights [{:id #uuid "6a5604f8-a337-4336-a711-2ba6bc14fbfd"
+            :page 1
+            :position {:bounding {:x1 292.1 :y1 488.4 :x2 555.5 :y2 535.1
+                                  :width 822 :height 1063.7}
+                       :rects ({:x1 292.1 :y1 488.4 :x2 555.5 :y2 535.1
+                                :width 822 :height 1063.7})
+                       :page 1}
+            :content {:text "MyLifeOrganized"}
+            :properties {:color "yellow"}}]
+            :extra {:page 1}}"#;
+        let hs = parse_highlights(src);
+        assert_eq!(hs.len(), 1);
+        assert_eq!(hs[0].id, "6a5604f8-a337-4336-a711-2ba6bc14fbfd");
+        assert_eq!(hs[0].position.bounding.left, 292.1);
+        assert!((hs[0].position.bounding.width - 263.4).abs() < 1e-9);
+        assert_eq!(hs[0].position.bounding.source_width, Some(822.0));
+        assert_eq!(hs[0].position.bounding.source_height, Some(1063.7));
+        assert_eq!(hs[0].position.rects.len(), 1);
+        assert!((hs[0].position.rects[0].height - 46.7).abs() < 1e-9);
+    }
+
+    #[test]
+    fn writes_current_logseq_uuid_list_and_corner_rect_shape() {
+        let mut h = sample();
+        for rect in std::iter::once(&mut h.position.bounding).chain(h.position.rects.iter_mut()) {
+            rect.source_width = Some(612.0);
+            rect.source_height = Some(792.0);
+        }
+        let out = write_highlights(&[h.clone()], "");
+        assert!(
+            out.contains(r#":id #uuid "5e8f9c7b-1234-5678-abcd-ef1234567890""#),
+            "{out}"
+        );
+        assert!(out.contains(":rects ("), "{out}");
+        assert!(out.contains(":x1 50"), "{out}");
+        assert!(out.contains(":x2 450"), "{out}");
+        assert_eq!(parse_highlights(&out), vec![h]);
+    }
+
+    #[test]
+    fn geometry_migration_removes_shadowing_old_keys_but_keeps_foreign_metadata() {
+        let existing = r#"{:highlights [{:id #uuid "5e8f9c7b-1234-5678-abcd-ef1234567890"
+          :page 42 :position {:page 42
+            :bounding {:top 1 :left 2 :width 3 :height 4 :plugin-note "keep"}
+            :rects [{:top 1 :left 2 :width 3 :height 4}]}
+          :content {:text "old"} :properties {:color "yellow"}}] :extra {}}"#;
+        let mut h = sample();
+        for rect in std::iter::once(&mut h.position.bounding).chain(h.position.rects.iter_mut()) {
+            rect.source_width = Some(612.0);
+            rect.source_height = Some(792.0);
+        }
+        let out = write_highlights(&[h.clone()], existing);
+        let root = edn::parse_strict(&out).unwrap();
+        let stored = &root.get("highlights").and_then(Edn::as_vec).unwrap()[0];
+        let bounding = stored.get("position").unwrap().get("bounding").unwrap();
+        assert_eq!(bounding.get("top"), None, "old geometry survived: {out}");
+        assert_eq!(
+            bounding.get("plugin-note").and_then(Edn::as_str),
+            Some("keep")
+        );
+        assert_eq!(parse_highlights(&out), vec![h]);
     }
 
     #[test]

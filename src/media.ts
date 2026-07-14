@@ -31,10 +31,11 @@ export function mediaKind(nameOrUrl: string): MediaKind | null {
   return null;
 }
 
-/** Markdown for an inserted asset: the `![…]` media form for image/video/audio
- *  (matching OG, which reuses the image syntax for all media), else a plain link
- *  (e.g. a PDF, which Tine opens in its side viewer). */
+/** Markdown for an inserted asset. Logseq uses image/embed syntax for PDFs as
+ *  well as inline media; keeping the filename as a PDF label makes a graph made
+ *  in Tine open the same PDF surface in either application. */
 export function assetMarkdown(name: string): string {
+  if (extOf(name) === "pdf") return `![${name}](../assets/${name})`;
   return mediaKind(name) ? `![](../assets/${name})` : `[${name}](../assets/${name})`;
 }
 

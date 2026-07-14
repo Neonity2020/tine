@@ -7033,6 +7033,8 @@ mod tests {
             left: 2.0,
             width: 3.0,
             height: 4.0,
+            source_width: None,
+            source_height: None,
         };
         crate::pdf::Highlight {
             id: id.into(),

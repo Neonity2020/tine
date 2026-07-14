@@ -64,6 +64,7 @@ const suites = {
   ],
   "windows-smoke": [
     ["windows-core", "scripts/e2e-windows-smoke.mjs", {}],
+    ["pdf-logseq", "scripts/e2e-pdf-logseq.mjs", {}],
   ],
 };
 

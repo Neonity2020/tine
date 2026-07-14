@@ -225,7 +225,7 @@ describe("asset paste durability", () => {
       ]));
       await settle();
       expect(native).toHaveBeenCalledOnce();
-      expect(doc.byId[id].raw).toBe("![](../assets/photo.png)\n[report.pdf](../assets/report.pdf)");
+      expect(doc.byId[id].raw).toBe("![](../assets/photo.png)\n![report.pdf](../assets/report.pdf)");
     } finally {
       dispose();
     }
@@ -253,7 +253,7 @@ describe("asset paste durability", () => {
 
       expect(event.defaultPrevented).toBe(true);
       expect(backend().importAsset).toHaveBeenCalledWith("C:\\Users\\me\\report.pdf", "report.pdf");
-      expect(doc.byId[id].raw).toBe("[report.pdf](../assets/report.pdf)");
+      expect(doc.byId[id].raw).toBe("![report.pdf](../assets/report.pdf)");
       expect(doc.byId[id].raw).not.toContain("C:\\Users");
     } finally {
       dispose();
@@ -276,7 +276,7 @@ describe("asset paste durability", () => {
       await settle();
 
       expect(backend().saveAsset).toHaveBeenCalledOnce();
-      await vi.waitFor(() => expect(doc.byId[id].raw).toBe("[notes.pdf](../assets/notes.pdf)"));
+      await vi.waitFor(() => expect(doc.byId[id].raw).toBe("![notes.pdf](../assets/notes.pdf)"));
     } finally {
       dispose();
     }

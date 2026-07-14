@@ -1,26 +1,29 @@
 // Real-app regression for GH #61: current Logseq highlight sidecars use #uuid
 // reader tags, list-shaped :rects, and x1/y1/x2/y2 coordinates. Opening the PDF
 // used to make the native process allocate without bound before the pane mounted.
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { remote } from "webdriverio";
 import { setTimeout as sleep } from "node:timers/promises";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const APP = process.env.TINE_APP || path.join(ROOT, "target/release/tine");
+const APP = process.env.TINE_APP || path.join(ROOT, process.platform === "win32" ? "target/release/tine.exe" : "target/release/tine");
 const TD = process.env.TAURI_DRIVER ||
   (process.env.CARGO_HOME ? path.join(process.env.CARGO_HOME, "bin", "tauri-driver") : "tauri-driver");
 const DRIVER_PORT = Number(process.env.E2E_DRIVER_PORT || 4520);
 const NATIVE_PORT = Number(process.env.E2E_NATIVE_PORT || 4521);
-const TMP = "/tmp/tine-pdf-logseq-e2e";
-const GRAPH = `${TMP}/graph`;
+const TMP = path.join(os.tmpdir(), `tine-pdf-logseq-e2e-${process.pid}`);
+const GRAPH = path.join(TMP, "graph");
 const PDF = "JVBERi0xLjQKMSAwIG9iago8PCAvVHlwZSAvQ2F0YWxvZyAvUGFnZXMgMiAwIFIgPj4KZW5kb2JqCjIgMCBvYmoKPDwgL1R5cGUgL1BhZ2VzIC9LaWRzIFszIDAgUl0gL0NvdW50IDEgPj4KZW5kb2JqCjMgMCBvYmoKPDwgL1R5cGUgL1BhZ2UgL1BhcmVudCAyIDAgUiAvTWVkaWFCb3ggWzAgMCA2MTIgNzkyXSAvUmVzb3VyY2VzIDw8IC9Gb250IDw8IC9GMSA1IDAgUiA+PiA+PiAvQ29udGVudHMgNCAwIFIgPj4KZW5kb2JqCjQgMCBvYmoKPDwgL0xlbmd0aCAyMDUgPj4Kc3RyZWFtCkJUIC9GMSAyMCBUZiA3MiA3MjAgVGQgKFRpbmUgUERGIHZpZXdlcikgVGogRVQKQlQgL0YxIDEzIFRmIDcyIDY5MCBUZCAoU2VsZWN0IHRoaXMgdGV4dCB0byBjcmVhdGUgYSBoaWdobGlnaHQuKSBUaiBFVApCVCAvRjEgMTMgVGYgNzIgNjY4IFRkIChIaWdobGlnaHRzIHBlcnNpc3QgdG8gYXNzZXRzLzxrZXk+LmVkbiArIGFuIGhsc19fIHBhZ2UuKSBUaiBFVAoKZW5kc3RyZWFtCmVuZG9iago1IDAgb2JqCjw8IC9UeXBlIC9Gb250IC9TdWJ0eXBlIC9UeXBlMSAvQmFzZUZvbnQgL0hlbHZldGljYSA+PgplbmRvYmoKeHJlZgowIDYKMDAwMDAwMDAwMCA2NTUzNSBmIAowMDAwMDAwMDA5IDAwMDAwIG4gCjAwMDAwMDAwNTggMDAwMDAgbiAKMDAwMDAwMDExNSAwMDAwMCBuIAowMDAwMDAwMjQxIDAwMDAwIG4gCjAwMDAwMDA0OTcgMDAwMDAgbiAKdHJhaWxlcgo8PCAvU2l6ZSA2IC9Sb290IDEgMCBSID4+CnN0YXJ0eHJlZgo1NjcKJSVFT0Y=";
 const EDN = `{:highlights [{:id #uuid "6a5604f8-a337-4336-a711-2ba6bc14fbfd"
   :page 1
-  :position {:bounding {:x1 72 :y1 698 :x2 248 :y2 724 :width 612 :height 792}
-             :rects ({:x1 72 :y1 698 :x2 248 :y2 724 :width 612 :height 792})
+  :position {:bounding {:x1 96.7058823529 :y1 937.452777778 :x2 333.098039216 :y2 972.372222222
+                        :width 822 :height 1063.7}
+             :rects ({:x1 96.7058823529 :y1 937.452777778 :x2 333.098039216 :y2 972.372222222
+                      :width 822 :height 1063.7})
              :page 1}
   :content {:text "Tine PDF viewer"}
   :properties {:color "yellow"}}]
@@ -28,35 +31,42 @@ const EDN = `{:highlights [{:id #uuid "6a5604f8-a337-4336-a711-2ba6bc14fbfd"
 `;
 
 fs.rmSync(TMP, { recursive: true, force: true });
-for (const dir of ["pages", "journals", "logseq", "assets"]) fs.mkdirSync(`${GRAPH}/${dir}`, { recursive: true });
-for (const dir of ["data", "config", "cache"]) fs.mkdirSync(`${TMP}/xdg/${dir}`, { recursive: true });
-fs.writeFileSync(`${GRAPH}/logseq/config.edn`, "{}\n");
-fs.writeFileSync(`${GRAPH}/assets/logseq-sample.pdf`, Buffer.from(PDF, "base64"));
-fs.writeFileSync(`${GRAPH}/assets/logseq-sample.edn`, EDN);
+for (const dir of ["pages", "journals", "logseq", "assets"]) fs.mkdirSync(path.join(GRAPH, dir), { recursive: true });
+for (const dir of ["data", "config", "cache"]) fs.mkdirSync(path.join(TMP, "xdg", dir), { recursive: true });
+fs.writeFileSync(path.join(GRAPH, "logseq", "config.edn"), "{}\n");
+fs.writeFileSync(path.join(GRAPH, "assets", "logseq-sample.pdf"), Buffer.from(PDF, "base64"));
+const sidecar = path.join(GRAPH, "assets", "logseq-sample.edn");
+fs.writeFileSync(sidecar, EDN);
 const now = new Date();
 const journal = `${now.getFullYear()}_${String(now.getMonth() + 1).padStart(2, "0")}_${String(now.getDate()).padStart(2, "0")}`;
-fs.writeFileSync(`${GRAPH}/journals/${journal}.md`, "- ![Logseq sample](../assets/logseq-sample.pdf)\n");
+fs.writeFileSync(path.join(GRAPH, "journals", `${journal}.md`), "- ![Logseq sample](../assets/logseq-sample.pdf)\n");
 
 const env = {
   ...process.env,
   TINE_GRAPH: GRAPH,
-  XDG_DATA_HOME: `${TMP}/xdg/data`,
-  XDG_CONFIG_HOME: `${TMP}/xdg/config`,
-  XDG_CACHE_HOME: `${TMP}/xdg/cache`,
+  XDG_DATA_HOME: path.join(TMP, "xdg", "data"),
+  XDG_CONFIG_HOME: path.join(TMP, "xdg", "config"),
+  XDG_CACHE_HOME: path.join(TMP, "xdg", "cache"),
+  APPDATA: path.join(TMP, "appdata"),
+  LOCALAPPDATA: path.join(TMP, "localappdata"),
   WEBKIT_DISABLE_DMABUF_RENDERER: "1",
   WEBKIT_DISABLE_COMPOSITING_MODE: "1",
   LIBGL_ALWAYS_SOFTWARE: "1",
   GDK_BACKEND: "x11",
 };
-const log = fs.openSync(`${TMP}/tauri-driver.log`, "w");
-const td = spawn(TD, [
-  "--port", String(DRIVER_PORT),
-  "--native-port", String(NATIVE_PORT),
-  "--native-driver", process.env.WEBKIT_DRIVER || "/usr/bin/WebKitWebDriver",
-], { env, stdio: ["ignore", log, log], detached: true });
+const log = fs.openSync(path.join(process.env.E2E_ARTIFACT_DIR || TMP, "tauri-driver.log"), "w");
+const driverArgs = process.platform === "win32"
+  ? ["--port", String(DRIVER_PORT)]
+  : [
+      "--port", String(DRIVER_PORT),
+      "--native-port", String(NATIVE_PORT),
+      "--native-driver", process.env.WEBKIT_DRIVER || "/usr/bin/WebKitWebDriver",
+    ];
+const td = spawn(TD, driverArgs, { env, stdio: ["ignore", log, log], detached: process.platform !== "win32" });
 await sleep(2500);
 
 function processTreeRssKiB() {
+  if (process.platform !== "linux") return null;
   const rows = [];
   for (const entry of fs.readdirSync("/proc")) {
     if (!/^\d+$/.test(entry)) continue;
@@ -96,26 +106,50 @@ try {
   let peak = before;
   for (let i = 0; i < 15; i++) {
     await sleep(200);
-    peak = Math.max(peak, processTreeRssKiB());
-    if (peak - before > 768 * 1024) throw new Error("opening the Logseq PDF grew resident memory by more than 768 MiB");
+    const rss = processTreeRssKiB();
+    if (rss != null && before != null) {
+      peak = Math.max(peak, rss);
+      if (peak - before > 768 * 1024) throw new Error("opening the Logseq PDF grew resident memory by more than 768 MiB");
+    }
   }
   await browser.$(".pdf-page canvas").waitForExist({ timeout: 20_000 });
   await browser.$(".pdf-hl").waitForExist({ timeout: 10_000 });
   const geometry = await browser.execute(() => {
     const highlight = document.querySelector(".pdf-hl");
+    const page = document.querySelector(".pdf-page");
     return highlight ? {
       left: highlight.style.left,
       top: highlight.style.top,
       width: highlight.style.width,
       height: highlight.style.height,
+      leftRatio: parseFloat(highlight.style.left) / parseFloat(page.style.width),
+      widthRatio: parseFloat(highlight.style.width) / parseFloat(page.style.width),
     } : null;
   });
-  if (!geometry || Object.values(geometry).some((value) => !value || value.includes("NaN"))) {
+  if (!geometry || Object.values(geometry).some((value) => !value || String(value).includes("NaN"))) {
     throw new Error(`Logseq highlight geometry was not converted safely: ${JSON.stringify(geometry)}`);
   }
-  console.log(`PASS: Logseq PDF sidecar opened with bounded memory and highlight geometry ${JSON.stringify(geometry)}`);
+  if (Math.abs(geometry.leftRatio - 72 / 612) > 0.005 || Math.abs(geometry.widthRatio - 176 / 612) > 0.005) {
+    throw new Error(`Logseq zoom-space highlight was misplaced: ${JSON.stringify(geometry)}`);
+  }
+
+  // Recoloring is a real mutation. It must preserve the foreign root metadata
+  // while writing the UUID/list/corner shape that Logseq itself consumes.
+  await browser.$(".pdf-hl").click();
+  await browser.$(".pdf-color-menu").waitForExist({ timeout: 5000 });
+  await browser.execute(() => {
+    document.querySelector(".pdf-color-swatch")?.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+  });
+  await browser.waitUntil(() => {
+    const written = fs.readFileSync(sidecar, "utf8");
+    return written.includes('#uuid "6a5604f8-a337-4336-a711-2ba6bc14fbfd"') &&
+      written.includes(":rects (") && written.includes(":x1 ") &&
+      written.includes(":extra {:page 1}");
+  }, { timeout: 10_000, timeoutMsg: "Tine did not persist a Logseq-compatible sidecar" });
+  console.log(`PASS: Logseq PDF opened with bounded resources, correct zoom-space geometry, and compatible write-back on ${process.platform}`);
 } finally {
   try { await browser?.deleteSession(); } catch {}
-  try { process.kill(-td.pid, "SIGKILL"); } catch {}
+  if (process.platform === "win32") spawnSync("taskkill", ["/PID", String(td.pid), "/T", "/F"], { stdio: "ignore" });
+  else try { process.kill(-td.pid, "SIGKILL"); } catch {}
   fs.closeSync(log);
 }

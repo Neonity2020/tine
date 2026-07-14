@@ -5,7 +5,7 @@ import { backend } from "../backend";
 import { closePdf, pushToast, isConflicted, activePane } from "../ui";
 import { flushPage, isDirty, reloadHlsIfLoaded, trackAssetWrite } from "../store";
 import { openPage } from "../router";
-import { hlsPageName } from "../pdf";
+import { hlsPageName, rectInPageSpace, rectWithSourceSpace, type PdfPageDimensions } from "../pdf";
 import { decideWheelZoomGesture, type WheelZoomGestureState } from "../zoom";
 import type { Highlight, Rect } from "../types";
 
@@ -124,6 +124,43 @@ export function PdfViewer(props: { filename: string; label: string; page?: numbe
   const pendingText = new Set<number>();
   let textTimer: number | undefined;
 
+  async function exactPageDimensions(pageNumber: number): Promise<PdfPageDimensions> {
+    if (dimsKnown.has(pageNumber) && dims[pageNumber]) return dims[pageNumber];
+    if (!pdfDoc || pageNumber < 1 || pageNumber > pdfDoc.numPages) {
+      throw new Error(`highlight refers to missing PDF page ${pageNumber}`);
+    }
+    const page = await pdfDoc.getPage(pageNumber);
+    const viewport = page.getViewport({ scale: 1 });
+    const dimensionError = pageDimensionsError(pageNumber, viewport.width, viewport.height);
+    if (dimensionError) throw new Error(dimensionError);
+    dims[pageNumber] = { w: viewport.width, h: viewport.height };
+    dimsKnown.add(pageNumber);
+    sizeWrapper(pageNumber, scale());
+    return dims[pageNumber];
+  }
+
+  async function highlightsForWrite(items: Highlight[]): Promise<Highlight[]> {
+    const pages = new Map<number, PdfPageDimensions>();
+    for (const highlight of items) {
+      const allRects = [highlight.position.bounding, ...highlight.position.rects];
+      if (allRects.some((rect) => rect.source_width == null || rect.source_height == null)) {
+        pages.set(highlight.page, await exactPageDimensions(highlight.page));
+      }
+    }
+    return items.map((highlight) => {
+      const page = pages.get(highlight.page);
+      if (!page) return highlight;
+      return {
+        ...highlight,
+        position: {
+          ...highlight.position,
+          bounding: rectWithSourceSpace(highlight.position.bounding, page),
+          rects: highlight.position.rects.map((rect) => rectWithSourceSpace(rect, page)),
+        },
+      };
+    });
+  }
+
   // Persist the current highlight set to disk. Returns false (and toasts) without
   // mutating the on-disk baseline if anything failed, so the caller can revert the
   // optimistic UI change rather than show a highlight that didn't actually save.
@@ -139,16 +176,21 @@ export function PdfViewer(props: { filename: string; label: string; page?: numbe
         return false;
       }
     }
-    const ids = highlights().map((h) => h.id);
     try {
+      // Current Logseq sidecars store x1/y1/x2/y2 plus the coordinate-space page
+      // dimensions. Enrich old Tine rectangles lazily on the first real edit so
+      // merely opening a graph never rewrites it.
+      const persisted = await highlightsForWrite(highlights());
+      const ids = persisted.map((h) => h.id);
       await trackAssetWrite(
-        backend().writeHighlights(props.filename, props.label, highlights(), baseIds)
+        backend().writeHighlights(props.filename, props.label, persisted, baseIds)
       );
+      setHighlights(persisted);
+      baseIds = ids; // what's now on disk becomes the next write's baseline
     } catch (e) {
       pushToast(`Couldn't save highlight — try again. (${String(e)})`, "error");
       return false;
     }
-    baseIds = ids; // what's now on disk becomes the next write's baseline
     // Refresh the loaded notes page (content + save baseline) to include the change.
     await reloadHlsIfLoaded(hlsName);
     return true;
@@ -647,7 +689,7 @@ export function PdfViewer(props: { filename: string; label: string; page?: numbe
       // cropped region stays visible underneath the live page canvas), so it
       // reads as a framed area rather than a text shade.
       if (h.image != null) {
-        const r = h.position.bounding;
+        const r = rectInPageSpace(h.position.bounding, dims[n]);
         const rgb = COLOR_RGB[h.color] ?? COLOR_RGB.yellow;
         const div = document.createElement("div");
         div.className = "pdf-hl pdf-hl-area";
@@ -662,7 +704,8 @@ export function PdfViewer(props: { filename: string; label: string; page?: numbe
         layer.appendChild(div);
         continue;
       }
-      for (const r of h.position.rects) {
+      for (const storedRect of h.position.rects) {
+        const r = rectInPageSpace(storedRect, dims[n]);
         const div = document.createElement("div");
         div.className = "pdf-hl";
         div.style.left = `${r.left * s}px`;
@@ -748,6 +791,8 @@ export function PdfViewer(props: { filename: string; label: string; page?: numbe
       top: (r.top - base.top) / s,
       width: r.width / s,
       height: r.height / s,
+      source_width: dims[pageNum].w,
+      source_height: dims[pageNum].h,
     }));
     const left = Math.min(...rects.map((r) => r.left));
     const top = Math.min(...rects.map((r) => r.top));
@@ -756,7 +801,14 @@ export function PdfViewer(props: { filename: string; label: string; page?: numbe
     pending = {
       page: pageNum,
       rects,
-      bounding: { left, top, width: right - left, height: bottom - top },
+      bounding: {
+        left,
+        top,
+        width: right - left,
+        height: bottom - top,
+        source_width: dims[pageNum].w,
+        source_height: dims[pageNum].h,
+      },
       text: sel.toString(),
     };
     setMenu({ x: e.clientX, y: e.clientY });
@@ -829,6 +881,8 @@ export function PdfViewer(props: { filename: string; label: string; page?: numbe
       top: Math.min(y, drag.startY) / s,
       width: Math.abs(x - drag.startX) / s,
       height: Math.abs(y - drag.startY) / s,
+      source_width: dims[drag.page].w,
+      source_height: dims[drag.page].h,
     };
     if (rect.width < 4 || rect.height < 4) return; // ignore a tiny/accidental drag
     void createAreaHighlight(drag.page, drag.wrap, rect);

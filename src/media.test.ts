@@ -29,11 +29,11 @@ describe("media helpers", () => {
     expect(mediaKind("../assets/sketch.excalidraw.png")).toBe("image");
   });
 
-  it("assetMarkdown: ![] for image/video/audio, [] link for other", () => {
+  it("assetMarkdown: Logseq-compatible embeds for PDF and inline media", () => {
     expect(assetMarkdown("clip.mp4")).toBe("![](../assets/clip.mp4)");
     expect(assetMarkdown("song.mp3")).toBe("![](../assets/song.mp3)");
     expect(assetMarkdown("pic.png")).toBe("![](../assets/pic.png)");
-    expect(assetMarkdown("paper.pdf")).toBe("[paper.pdf](../assets/paper.pdf)");
+    expect(assetMarkdown("paper.pdf")).toBe("![paper.pdf](../assets/paper.pdf)");
   });
 
   it("assetFileName: default = plain (sanitized) original name; paste → stamp.png", () => {

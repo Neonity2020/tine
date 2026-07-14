@@ -59,6 +59,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Logseq PDF highlights open safely and round-trip between both apps.** The
+  bounded EDN reader now consumes Logseq's UUID tags and list-shaped rectangles
+  without runaway allocation, preserves creation-zoom coordinates for correct
+  placement, and writes Logseq's current sidecar shape back without erasing
+  foreign metadata. Newly inserted PDFs also use Logseq's compatible embed form.
+  (GH #61)
 - **Linux Developer Tools now detach reliably where the native backend supports
   it.** On X11/XWayland, the old implementation asked an asynchronously-created
   inspector to detach too early, so the request was normally a no-op. A one-shot,

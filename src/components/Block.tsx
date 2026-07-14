@@ -987,7 +987,7 @@ function templateToOutline(
   };
 }
 // Markdown for a freshly saved asset: images embed inline, everything else
-// (PDFs included) becomes a link — a .pdf link renders as a clickable chip that
+// (PDFs included) becomes an asset reference — a .pdf reference renders as a clickable chip that
 // opens the PDF pane.
 // `onSubmit`/`onCancel` (set only by the quick-capture window) repurpose a plain
 // Enter / Escape when the autocomplete popup is closed: Enter commits the capture
