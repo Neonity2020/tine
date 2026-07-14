@@ -10,3 +10,31 @@ export async function resettleIfVisible(
 ): Promise<void> {
   if (await window.isVisible()) resettle();
 }
+
+/**
+ * A newly mapped auxiliary window can report an unfocused transition before
+ * the window manager has honored its first activation request. Treating that
+ * transition as an ordinary user blur hides Quick Capture before the bounded
+ * native focus retries can run. Arm blur-to-dismiss only after this show has
+ * actually owned focus; explicit hides disarm the next stale transition too.
+ */
+export function createCaptureBlurGate(): {
+  focusChanged(focused: boolean): boolean;
+  disarm(): void;
+} {
+  let armed = false;
+  return {
+    focusChanged(focused) {
+      if (focused) {
+        armed = true;
+        return false;
+      }
+      if (!armed) return false;
+      armed = false;
+      return true;
+    },
+    disarm() {
+      armed = false;
+    },
+  };
+}

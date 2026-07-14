@@ -26,7 +26,7 @@ import { installKeybindings, eventToBindingString } from "./keybindings";
 import { backend } from "./backend";
 import { initSpellcheckSettings } from "./spellcheckSettings";
 import { initRefCompletionSettings } from "./refCompletionSettings";
-import { resettleIfVisible } from "./captureVisibility";
+import { createCaptureBlurGate, resettleIfVisible } from "./captureVisibility";
 import {
   QUICK_CAPTURE_ACK_TIMEOUT_MS,
   createQuickCaptureRequestId,
@@ -212,6 +212,7 @@ function Capture() {
     resettle();
     activateWhenEditorReady();
   };
+  const blurGate = createCaptureBlurGate();
   let fitRaf: number | undefined;
   const scheduleFit = () => {
     if (fitRaf !== undefined) return;
@@ -222,6 +223,7 @@ function Capture() {
   };
 
   const hideWindow = async () => {
+    blurGate.disarm();
     try {
       const { getCurrentWindow } = await import("@tauri-apps/api/window");
       await getCurrentWindow().hide();
@@ -482,14 +484,17 @@ function Capture() {
         const { getCurrentWindow } = await import("@tauri-apps/api/window");
         await getCurrentWindow().onFocusChanged(({ payload: focused }) => {
           if (focused) {
+            blurGate.focusChanged(true);
             loadPref(); // pick up a Settings change made while we were hidden
             void requestTheme(); // and a theme change
             void requestShortcuts(); // and a shortcut remap
             resettle();
           } else {
             // Dismiss on blur. The draft is preserved (only Esc/submit clear it)
-            // so an accidental focus loss can't lose text.
-            void hideWindow();
+            // so an accidental focus loss can't lose text. A newly mapped
+            // window may emit an initial false transition before the WM honors
+            // activation; wait until this show has actually held focus.
+            if (blurGate.focusChanged(false)) void hideWindow();
           }
         });
       } catch {

@@ -31,6 +31,23 @@ if (fs.existsSync(path.join(portableDeps, "usr/bin/openbox")) && fs.existsSync(p
   baseProcessEnv.XDG_DATA_DIRS = [path.join(portableDeps, "usr/share"), baseProcessEnv.XDG_DATA_DIRS || "/usr/local/share:/usr/share"].join(path.delimiter);
 }
 
+// xprop lives in x11-utils rather than the Openbox/xdotool dependency bundle.
+// Worktrees are one directory deeper than tine-master, so search both normal
+// workspace layouts (or honor an explicit override) and add the first complete
+// portable bundle to PATH. This keeps `npm run e2e:linux:release` sufficient in
+// the rootless Codex sandbox instead of relying on a remembered PATH prefix.
+const portableX11Deps = [
+  process.env.TINE_E2E_X11_DEPS_ROOT,
+  path.join(root, "../.codex-deps/x11-utils/root"),
+  path.join(root, "../../.codex-deps/x11-utils/root"),
+]
+  .filter(Boolean)
+  .map((candidate) => path.resolve(candidate))
+  .find((candidate) => fs.existsSync(path.join(candidate, "usr/bin/xprop")));
+if (portableX11Deps) {
+  baseProcessEnv.PATH = `${path.join(portableX11Deps, "usr/bin")}${path.delimiter}${baseProcessEnv.PATH || ""}`;
+}
+
 const suites = {
   "linux-smoke": [
     ["caret-agenda", "scripts/e2e-caret.mjs", { CARET_MODE: "agenda", CARET_LABEL: "runner" }],
