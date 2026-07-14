@@ -997,9 +997,10 @@ export function Editor(props: { id: string }): JSX.Element {
   const surfaceKey = useContext(SurfaceContext);
   const outlineScope = useContext(OutlineScopeContext);
   // Generic ref/query surfaces intentionally return structural keyboard edits to
-  // the primary outline. An embed is a live editing surface: Enter-created blocks
-  // must remain in the transclusion the user is looking at.
-  const enterSurface = () => surfaceKey.startsWith("embed:") ? surfaceKey : null;
+  // the primary outline. An embed is a live editing surface: structural destinations
+  // (Enter, Arrow navigation, and empty-block merge/delete) must remain in the
+  // transclusion the user is looking at.
+  const editSurface = () => surfaceKey.startsWith("embed:") ? surfaceKey : null;
   let ref!: HTMLTextAreaElement;
   // Caret/selection stashed when the *window* (not this block) loses focus, so
   // returning to Tine resumes editing exactly where you left off.
@@ -2363,7 +2364,7 @@ export function Editor(props: { id: string }): JSX.Element {
             commit(trimmed);
             newId = insertOutlineAfter(props.id, [{ raw: "", children: [] }]);
           });
-          startEditing(newId, 0, null, enterSurface());
+          startEditing(newId, 0, null, editSurface());
           return;
         }
       }
@@ -2401,10 +2402,10 @@ export function Editor(props: { id: string }): JSX.Element {
         // adds a new sibling bullet below, which the user can Tab to nest as a
         // note under the highlight.
         const newId = insertOutlineAfter(props.id, [{ raw: "", children: [] }]);
-        startEditing(newId, 0, null, enterSurface());
+        startEditing(newId, 0, null, editSurface());
       } else {
         const zoomRoot = outlineScope?.forceExpandedRoot === props.id;
-        splitBlock(props.id, start, zoomRoot, zoomRoot, enterSurface());
+        splitBlock(props.id, start, zoomRoot, zoomRoot, editSurface());
       }
     } else if (e.key === "Backspace" && end === start) {
       // Auto-pair Backspace: caret between an empty pair (`(|)`) deletes both
@@ -2432,7 +2433,7 @@ export function Editor(props: { id: string }): JSX.Element {
         // Never merge a highlight or calc block away (their structure must stay).
         if (isAnnot() || isCalc()) return;
         commit(raw);
-        if (mergeWithPrev(props.id, outlineScope)) {
+        if (mergeWithPrev(props.id, outlineScope, editSurface())) {
           e.preventDefault();
           return;
         }
@@ -2441,7 +2442,7 @@ export function Editor(props: { id: string }): JSX.Element {
         if (n && splitProps(n.raw, hideFn(), pageFmt()).visible.trim() === "" && n.children.length === 0 && next && doc.byId[next]?.page === n.page) {
           e.preventDefault();
           deleteBlock(props.id);
-          startEditing(next, 0);
+          startEditing(next, 0, null, editSurface());
         }
       }
     } else if (e.key === "ArrowUp" && !e.shiftKey) {
@@ -2456,7 +2457,7 @@ export function Editor(props: { id: string }): JSX.Element {
           e.preventDefault();
           // Keep the caret's column on the previous block's bottom visual row.
           // Resolution happens after its textarea mounts, when wrapping is known.
-          startEditing(prev, { col: start - (before.lastIndexOf("\n") + 1), edge: "last" });
+          startEditing(prev, { col: start - (before.lastIndexOf("\n") + 1), edge: "last" }, null, editSurface());
         }
       }
     } else if (e.key === "ArrowDown" && !e.shiftKey) {
@@ -2471,7 +2472,7 @@ export function Editor(props: { id: string }): JSX.Element {
         const next = nextVisible(props.id, outlineScope);
         if (next) {
           e.preventDefault();
-          startEditing(next, { col, edge: "first" });
+          startEditing(next, { col, edge: "first" }, null, editSurface());
         } else {
           // No next LOADED block. In the journal feed, pull in the next day so
           // Down-arrow keeps going past the loaded window (previously only a
@@ -2480,7 +2481,9 @@ export function Editor(props: { id: string }): JSX.Element {
           if (!outlineScope) {
             e.preventDefault();
             commit(raw);
-            void nextVisibleOrExtend(props.id).then((n) => n && startEditing(n, { col, edge: "first" }));
+            void nextVisibleOrExtend(props.id).then((n) =>
+              n && startEditing(n, { col, edge: "first" }, null, editSurface())
+            );
           }
         }
       }

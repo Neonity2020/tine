@@ -1252,7 +1252,11 @@ export function outdentBlock(id: string, caretOffset: number) {
 }
 
 /** Backspace at offset 0: merge into the previous visible block (same page). */
-export function mergeWithPrev(id: string, scope: OutlineScope | null = null): boolean {
+export function mergeWithPrev(
+  id: string,
+  scope: OutlineScope | null = null,
+  editingSurface: string | null = null,
+): boolean {
   if (!blockWritable(id)) return false;
   const prev = prevVisible(id, scope);
   if (prev === null) return false;
@@ -1293,7 +1297,7 @@ export function mergeWithPrev(id: string, scope: OutlineScope | null = null): bo
       delete s.byId[id];
     })
   );
-  startEditing(prev, joinOffset);
+  startEditing(prev, joinOffset, null, editingSurface);
   markDirty(pageName);
   return true;
 }

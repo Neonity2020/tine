@@ -8,6 +8,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+### Fixed
+
+- **Arrow navigation and empty-block deletion inside a block embed keep the
+  caret in the visible embed.** The underlying source outline is still edited,
+  but structural focus no longer jumps to the source block. (GH #134)
+
 ## [0.5.8] - 2026-07-13
 
 ### Added
