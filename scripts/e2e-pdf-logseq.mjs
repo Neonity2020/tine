@@ -279,15 +279,41 @@ try {
 
   const firstSecondRef = browser.$(`[data-block-ref="${SECOND_FIRST_ID}"]`);
   await firstSecondRef.waitForExist({ timeout: 10_000 });
-  await firstSecondRef.click();
   await browser.waitUntil(() => browser.execute((highlightId) =>
-    document.querySelector(".pdf-viewer")?.getAttribute("data-pdf-filename") === "logseq-second.pdf" &&
-    document.querySelector(".pdf-viewer")?.getAttribute("data-pdf-highlight-target") === highlightId &&
-    document.querySelector(".pdf-hl-target")?.getAttribute("data-highlight-id") === highlightId &&
-    document.querySelector(".pdf-viewer")?.getAttribute("data-pdf-ready") === "true", SECOND_FIRST_ID), {
+    !document.querySelector(`[data-block-ref="${highlightId}"]`)?.classList.contains("block-ref-missing"), SECOND_FIRST_ID), {
     timeout: 10_000,
-    timeoutMsg: "a block reference did not open PDF B at its exact first highlight",
+    timeoutMsg: "the first PDF annotation block reference did not resolve",
   });
+  await firstSecondRef.click();
+  try {
+    await browser.waitUntil(() => browser.execute((highlightId) =>
+      document.querySelector(".pdf-viewer")?.getAttribute("data-pdf-filename") === "logseq-second.pdf" &&
+      document.querySelector(".pdf-viewer")?.getAttribute("data-pdf-highlight-target") === highlightId &&
+      document.querySelector(".pdf-hl-target")?.getAttribute("data-highlight-id") === highlightId &&
+      document.querySelector(".pdf-viewer")?.getAttribute("data-pdf-ready") === "true", SECOND_FIRST_ID), {
+      timeout: 10_000,
+      timeoutMsg: "a block reference did not open PDF B at its exact first highlight",
+    });
+  } catch (error) {
+    const diagnostic = await browser.execute(() => ({
+      filename: document.querySelector(".pdf-viewer")?.getAttribute("data-pdf-filename"),
+      target: document.querySelector(".pdf-viewer")?.getAttribute("data-pdf-highlight-target"),
+      ready: document.querySelector(".pdf-viewer")?.getAttribute("data-pdf-ready"),
+      highlights: [...document.querySelectorAll(".pdf-hl")].map((element) => ({
+        id: element.getAttribute("data-highlight-id"),
+        target: element.classList.contains("pdf-hl-target"),
+      })),
+      toast: document.querySelector(".toast")?.textContent,
+      references: [...document.querySelectorAll("[data-block-ref]")].map((element) => ({
+        id: element.getAttribute("data-block-ref"),
+        className: element.className,
+        title: element.getAttribute("title"),
+      })),
+      location: location.href,
+      headings: [...document.querySelectorAll("h1,h2,.page-title")].map((element) => element.textContent),
+    }));
+    throw new Error(`${error.message}: ${JSON.stringify(diagnostic)}`, { cause: error });
+  }
   const secondViewerElementId = (await browser.$(".pdf-viewer")).elementId;
   const secondZoom = await browser.$(".pdf-zoom-level").getText();
   if (secondZoom !== "125%") throw new Error(`second PDF inherited the first PDF scale: ${secondZoom}`);
