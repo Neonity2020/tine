@@ -622,6 +622,74 @@ pub(crate) fn import_asset(
     })
 }
 
+/// Import a bounded Android voice memo by native cache-file capability. The
+/// recording never crosses Kotlin/WebView/Rust as base64; Rust streams the open
+/// file into the graph and removes the temp only after the durable asset commit.
+#[tauri::command]
+pub(crate) fn import_recording(
+    path: String,
+    name: String,
+    app: tauri::AppHandle,
+    state: GraphContext<'_>,
+) -> Result<String, String> {
+    use cap_std::{ambient_authority, fs::Dir};
+    use tauri::Manager;
+
+    const MAX_RECORDING_BYTES: u64 = 32 * 1024 * 1024;
+    let source = std::path::Path::new(&path);
+    let filename = source
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| value.starts_with("tine_memo_") && value.ends_with(".m4a"))
+        .ok_or_else(|| "invalid recording token".to_string())?;
+    let cache_path = app
+        .path()
+        .app_cache_dir()
+        .map_err(|error| error.to_string())?;
+    let token_parent = source
+        .parent()
+        .ok_or_else(|| "recording has no cache parent".to_string())?;
+    let cache_dir =
+        Dir::open_ambient_dir(&cache_path, ambient_authority()).map_err(|error| error.to_string())?;
+    let token_dir =
+        Dir::open_ambient_dir(token_parent, ambient_authority()).map_err(|error| error.to_string())?;
+    let cache_identity = same_file::Handle::from_file(
+        cache_dir
+            .try_clone()
+            .map_err(|error| error.to_string())?
+            .into_std_file(),
+    )
+    .map_err(|error| error.to_string())?;
+    let token_identity = same_file::Handle::from_file(
+        token_dir
+            .try_clone()
+            .map_err(|error| error.to_string())?
+            .into_std_file(),
+    )
+    .map_err(|error| error.to_string())?;
+    if token_identity != cache_identity {
+        return Err("recording is outside Tine's native cache".into());
+    }
+
+    let capture = token_dir
+        .open(filename)
+        .map_err(|error| error.to_string())?;
+    let metadata = capture.metadata().map_err(|error| error.to_string())?;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_RECORDING_BYTES {
+        return Err("recording is empty or exceeds the 32 MiB limit".into());
+    }
+    let mut capture = capture.into_std();
+    let stored = with_graph(&state, |graph| {
+        graph
+            .import_asset_file(&mut capture, &name, MAX_RECORDING_BYTES)
+            .map_err(|error| error.to_string())
+    })?;
+    // The graph asset is authoritative now. Cleanup failure is harmless cache
+    // litter and must not make the frontend omit the already-durable reference.
+    let _ = cache_dir.remove_file(filename);
+    Ok(stored)
+}
+
 /// Read a dropped delimited-text file for the CSV/TSV → grid drop path.
 /// Deliberately NARROW: this is the only webview-reachable read of a
 /// caller-chosen path (everything else is gated to the graph/assets dirs),

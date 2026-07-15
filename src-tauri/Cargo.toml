@@ -34,6 +34,8 @@ notify = "6"
 # Asset write commands receive bytes as base64 (a single compact string) instead
 # of a JSON number[] (~4-5x payload + a giant per-element parse on the UI thread).
 base64 = "0.22"
+cap-std = "4.0.2"
+same-file = "1.0.6"
 sha2 = "0.10"
 # Resolve the app-data dir before the Tauri app (and its `path()` API) exists, so
 # the identifier-rename migration can run BEFORE the webview creates its store.

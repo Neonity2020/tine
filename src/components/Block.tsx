@@ -1542,7 +1542,15 @@ export function Editor(props: { id: string }): JSX.Element {
         pushToast(`Couldn’t save the recording (${String(err)})`, "error");
         return;
       }
-      if (res.status === "ok" && res.data) insertAssetBytes(base64ToBytes(res.data), undefined, res.ext || "m4a");
+      if (res.status === "ok" && res.path) {
+        const candidate = captureAssetFileName(res.ext || "m4a");
+        try {
+          const stored = await trackAssetWrite(backend().importRecording(res.path, candidate));
+          insertStoredAssets([{ stored }]);
+        } catch (err) {
+          pushToast(`Couldn’t import the recording (${String(err)})`, "error");
+        }
+      }
       return;
     }
     let res;

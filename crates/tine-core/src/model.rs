@@ -11,7 +11,7 @@ use crate::date::{JournalDate, JournalFormat};
 use crate::doc::{self, DocBlock, Document};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -3679,6 +3679,36 @@ impl Graph {
         unreachable!()
     }
 
+    /// Stream an already-open native capture into `assets/` without ever
+    /// materializing it as a bridge/base64 value. The source handle is the
+    /// capability validated by the native caller; collision retries rewind it.
+    pub fn import_asset_file(
+        &self,
+        src: &mut fs::File,
+        name: &str,
+        max_bytes: u64,
+    ) -> io::Result<String> {
+        let assets = self.assets_path();
+        self.ensure_asset_write_target(&assets)?;
+        fs::create_dir_all(&assets)?;
+        top_level_asset_name(name)?;
+        let (stem, ext) = split_asset_stem_ext(name);
+        for i in 0usize.. {
+            let final_name = if i == 0 {
+                name.to_string()
+            } else {
+                format!("{stem}_{i}{ext}")
+            };
+            src.seek(io::SeekFrom::Start(0))?;
+            match atomic_copy_file_new(src, &assets.join(&final_name), max_bytes) {
+                Ok(()) => return Ok(final_name),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!()
+    }
+
     /// Write a cropped area-highlight image to OG's file-graph layout:
     /// `assets/<key>/<page>_<id>_<stamp>.png` (`<stamp>` = the `js/Date.now()`
     /// epoch-ms integer also stored in the highlight's `:content {:image …}`).
@@ -5801,6 +5831,50 @@ pub fn atomic_copy_new(src: &Path, dst: &Path) -> io::Result<()> {
     res
 }
 
+/// Copy from an already-open source capability into a new destination while
+/// enforcing a byte ceiling during the stream. This is the native-capture path:
+/// it avoids reopening an attacker-replaceable pathname and avoids whole-value
+/// Android/IPC/base64 amplification.
+pub fn atomic_copy_file_new(
+    input: &mut fs::File,
+    dst: &Path,
+    max_bytes: u64,
+) -> io::Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+    let dir = dst.parent().unwrap_or_else(|| Path::new("."));
+    let fname = dst.file_name().and_then(|s| s.to_str()).unwrap_or("file");
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = dir.join(format!(
+        ".{fname}.{}.{}.capture.tmp",
+        std::process::id(),
+        seq
+    ));
+    let res = (|| {
+        let mut output = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        let mut limited = input.take(max_bytes.saturating_add(1));
+        let copied = io::copy(&mut limited, &mut output)?;
+        if copied > max_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("capture exceeds {max_bytes} byte limit"),
+            ));
+        }
+        output.sync_all()?;
+        drop(output);
+        move_file_noreplace(&tmp, dst)?;
+        let _ = fs::File::open(dir).and_then(|directory| directory.sync_all());
+        Ok(())
+    })();
+    if res.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    res
+}
+
 /// Read–modify–write a small text file (config.edn, device settings) under a lock,
 /// committed via [`atomic_write`]. The ONE guarded path every settings writer goes
 /// through, so the discipline is uniform rather than re-derived per call site:
@@ -6019,6 +6093,41 @@ mod tests {
         }
         // A plain top-level name still works.
         assert_eq!(reserve_asset(&dir, "ok.png").unwrap().0, "ok.png");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn native_capture_import_streams_with_limit_and_collision_rewind() {
+        let dir = scratch("native-capture-import");
+        let graph = Graph::open(&dir);
+        let source_path = dir.join("tine_memo_source.m4a");
+        fs::write(&source_path, b"bounded voice memo").unwrap();
+        let mut source = fs::File::open(&source_path).unwrap();
+
+        fs::create_dir_all(dir.join("assets")).unwrap();
+        fs::write(dir.join("assets/voice.m4a"), b"existing memo").unwrap();
+        let stored = graph
+            .import_asset_file(&mut source, "voice.m4a", 32 * 1024 * 1024)
+            .unwrap();
+        assert_eq!(stored, "voice_1.m4a");
+        assert_eq!(
+            fs::read(dir.join("assets/voice_1.m4a")).unwrap(),
+            b"bounded voice memo"
+        );
+        assert_eq!(
+            fs::read(dir.join("assets/voice.m4a")).unwrap(),
+            b"existing memo",
+            "collision retry must not overwrite an existing graph asset"
+        );
+
+        source.seek(io::SeekFrom::Start(0)).unwrap();
+        assert!(graph
+            .import_asset_file(&mut source, "too-large.m4a", 4)
+            .is_err());
+        assert!(
+            !dir.join("assets/too-large.m4a").exists(),
+            "an over-limit stream must not leave a visible partial asset"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

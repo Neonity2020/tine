@@ -65,12 +65,13 @@ export interface ClipboardFileList {
   truncated: boolean;
 }
 
-/** Result of an Android media-capture command (camera / voice memo). When
- *  `status === "ok"`, `data` is base64-encoded file bytes and `ext` its
- *  extension (no dot). Other statuses carry no data. */
+/** Result of an Android media-capture command. Photos return bounded legacy
+ *  base64 `data`; voice memos return a native cache-file `path` which Rust
+ *  streams directly into the graph. */
 export interface MediaCaptureResult {
   status: "ok" | "recording" | "cancelled";
   data?: string | null;
+  path?: string | null;
   ext?: string | null;
 }
 
@@ -275,6 +276,9 @@ export interface Backend {
   /** Copy a file (by absolute path) into assets/, returning the stored name.
    *  `name` (optional) is the desired stored filename (timestamped). */
   importAsset(path: string, name?: string): Promise<string>;
+  /** Stream a bounded native Android voice-memo temp into assets and retire the
+   *  temp only after the graph copy commits. */
+  importRecording(path: string, name: string): Promise<string>;
   /** Paths explicitly copied in the OS file manager. Empty when the clipboard
    *  has no native file-list flavor or the platform cannot expose one. */
   clipboardFiles(): Promise<ClipboardFileList>;
@@ -300,7 +304,7 @@ export interface Backend {
   /** Android: start a voice-memo recording (prompts for mic permission on first
    *  use). `status: "recording"` on success. */
   startRecording(): Promise<MediaCaptureResult>;
-  /** Android: stop the active recording → base64 audio bytes + ext. */
+  /** Android: stop the active recording → native cache-file path + ext. */
   stopRecording(): Promise<MediaCaptureResult>;
   /** Android: discard an in-progress recording without inserting anything. */
   cancelRecording(): Promise<MediaCaptureResult>;
@@ -712,6 +716,9 @@ class TauriBackend implements Backend {
   }
   importAsset(path: string, name?: string) {
     return this.call<string>("import_asset", { path, name });
+  }
+  importRecording(path: string, name: string) {
+    return this.call<string>("import_recording", { path, name });
   }
   clipboardFiles() {
     return this.call<ClipboardFileList>("clipboard_files");

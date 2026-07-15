@@ -175,7 +175,7 @@
     },
     {
       "id": "REG-PUBLISH-ATOMIC-TREE-REPLACEMENT-001",
-      "title": "Republishing atomically retires stale pages without following a replaced output directory",
+      "title": "Republishing retires stale pages and binds staging and recovery writes to directory capabilities",
       "family": "data-safety",
       "sources": { "issues": [], "commits": [] },
       "platforms": ["all"],
@@ -183,7 +183,7 @@
       "status": "covered",
       "coverage": {
         "tests": ["crates/tine-core/src/publish.rs", "crates/tine-core/src/model.rs"],
-        "scenario": "publish.atomic-tree-replacement",
+        "scenario": "publish.atomic-tree-replacement-and-bound-directories",
         "failBefore": "proven"
       }
     }

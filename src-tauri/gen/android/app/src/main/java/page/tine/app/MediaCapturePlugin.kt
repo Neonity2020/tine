@@ -25,10 +25,10 @@ import app.tauri.plugin.Plugin
 import java.io.File
 
 // Camera / photo-picker capture and voice-memo recording for the mobile editor
-// toolbar (#7 camera, mic). Each command returns the captured bytes as base64
-// in `data` with a file `ext`; the frontend writes them into the graph's
-// `assets/` (backend save_asset) and inserts the media ref. Mirrors the
-// GraphFolderPickerPlugin bridge pattern.
+// toolbar (#7 camera, mic). Photos remain bounded separately in the legacy
+// bridge path. Voice memos return a native cache-file token; Rust streams that
+// file into the graph so an allowed recording is never multiplied through two
+// base64 bridge round trips.
 private const val TAG = "Tine/MediaCapture"
 private const val MAX_RECORDING_BYTES = 32L * 1024L * 1024L
 private const val MAX_RECORDING_DURATION_MS = 30 * 60 * 1000
@@ -152,6 +152,12 @@ class MediaCapturePlugin(private val activity: Activity) : Plugin(activity) {
       return
     }
     try {
+      // A process death or failed frontend import may leave one recoverable
+      // memo in cache. Retire stale memos before starting another so repeated
+      // failures cannot grow cache without bound.
+      activity.cacheDir.listFiles()
+        ?.filter { it.name.startsWith("tine_memo_") && it.name.endsWith(".m4a") }
+        ?.forEach { it.delete() }
       val out = File.createTempFile("tine_memo_", ".m4a", activity.cacheDir)
       @Suppress("DEPRECATION")
       val rec = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -159,6 +165,11 @@ class MediaCapturePlugin(private val activity: Activity) : Plugin(activity) {
       } else {
         MediaRecorder()
       }
+      // Own both resources before any fallible codec setup so prepare/start
+      // failures release the recorder and delete the temp instead of leaking.
+      recorder = rec
+      recordFile = out
+      recordingStoppedAtLimit = false
       rec.setAudioSource(MediaRecorder.AudioSource.MIC)
       rec.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
       rec.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
@@ -178,14 +189,13 @@ class MediaCapturePlugin(private val activity: Activity) : Plugin(activity) {
       }
       rec.prepare()
       rec.start()
-      recorder = rec
-      recordFile = out
-      recordingStoppedAtLimit = false
       val ret = JSObject()
       ret.put("status", "recording")
       invoke.resolve(ret)
     } catch (ex: Exception) {
+      val out = recordFile
       releaseRecorder()
+      out?.delete()
       invoke.reject(ex.message ?: "Failed to start recording")
     }
   }
@@ -214,25 +224,26 @@ class MediaCapturePlugin(private val activity: Activity) : Plugin(activity) {
     }
     releaseRecorder()
     try {
+      if (!out.exists() || out.length() <= 0) {
+        out.delete()
+        invoke.reject("No audio data recorded")
+        return
+      }
       if (out.length() > MAX_RECORDING_BYTES) {
         out.delete()
         invoke.reject("Recording exceeded the 32 MiB limit")
         return
       }
-      val bytes = if (out.exists() && out.length() > 0) out.readBytes() else null
-      out.delete()
-      if (bytes == null || bytes.isEmpty()) {
-        invoke.reject("No audio data recorded")
-        return
-      }
       val ret = JSObject()
       ret.put("status", "ok")
-      ret.put("data", Base64.encodeToString(bytes, Base64.NO_WRAP))
+      ret.put("path", out.absolutePath)
       ret.put("ext", "m4a")
       invoke.resolve(ret)
     } catch (ex: Exception) {
-      out.delete()
-      invoke.reject(ex.message ?: "Failed to read recording")
+      // Preserve the bounded native temp on import/finalization failure so the
+      // recording is recoverable from app cache instead of being destroyed at
+      // the failure boundary.
+      invoke.reject(ex.message ?: "Failed to finalize recording")
     }
   }
 

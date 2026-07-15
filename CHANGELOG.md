@@ -13,13 +13,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 - **Static publishing now treats the public page set as a hard privacy
   boundary.** Queries, page/block embeds, and namespace macros cannot expand
   private content; each export is assembled in a guarded staging tree and then
-  swapped as one unit, so formerly public pages disappear and a concurrent
-  `publish/` symlink or junction cannot redirect generated writes outside the
-  graph. The previous output remains in Tine's recoverable conflict trash.
+  swapped as one unit through bound directory capabilities, so formerly public
+  pages disappear and concurrent staging, recovery, or `publish/` symlink and
+  junction swaps cannot redirect generated writes outside the graph. The
+  previous output remains in Tine's recoverable conflict trash.
 - **Voice memos have one bounded, reachable recorder.** Desktop recording is
   process-owned, cancels when its editor disappears, rejects concurrent starts,
   and stops at 30 minutes or 32 MiB; Android applies the same duration/size
-  ceilings before reading or encoding its native temp file.
+  ceilings and streams the native temp directly into the graph instead of
+  multiplying a valid recording through Kotlin, JavaScript, and Rust base64
+  buffers. Failed native setup also releases its recorder and temp file.
 - **Android long-press text selection keeps the native selection UI.** Tine no
   longer intercepts editor/content `contextmenu` gestures with the desktop
   block menu; the bullet remains the explicit mobile block-action target.

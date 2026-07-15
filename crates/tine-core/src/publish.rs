@@ -5,12 +5,16 @@
 use crate::doc::{self, DocBlock};
 use crate::model::{BlockDto, Graph, PageKind, RefGroup};
 use crate::refs::block_id;
+use cap_std::ambient_authority;
+use cap_std::fs::{Dir, OpenOptions};
 use lsdoc::ast::{Block, Inline, Url};
+use same_file::Handle as FileIdentity;
 use serde_json::json;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 
 /// URL/file-safe slug for a page name (links and filenames must match).
 pub fn slug(name: &str) -> String {
@@ -1709,18 +1713,46 @@ fn page_is_public(pre_block: Option<&str>) -> bool {
     })
 }
 
-fn reserve_publish_stage(graph: &Graph) -> io::Result<std::path::PathBuf> {
+struct PublishStage {
+    path: PathBuf,
+    root: Dir,
+    dir: Dir,
+    identity: FileIdentity,
+}
+
+struct PublishRecovery {
+    #[cfg(test)]
+    path: PathBuf,
+    dir: Dir,
+}
+
+fn dir_identity(dir: &Dir) -> io::Result<FileIdentity> {
+    FileIdentity::from_file(dir.try_clone()?.into_std_file())
+}
+
+fn reserve_publish_stage(graph: &Graph) -> io::Result<PublishStage> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
+    let root = Dir::open_ambient_dir(&graph.root, ambient_authority())?;
     for _ in 0..128 {
-        let stage = graph.root.join(format!(
+        let name = format!(
             ".tine-publish-stage-{}-{}",
             std::process::id(),
             SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        graph.ensure_write_target(&stage)?;
-        match fs::create_dir(&stage) {
-            Ok(()) => return Ok(stage),
+        );
+        let path = graph.root.join(&name);
+        graph.ensure_write_target(&path)?;
+        match root.create_dir(&name) {
+            Ok(()) => {
+                let dir = root.open_dir(&name)?;
+                let identity = dir_identity(&dir)?;
+                return Ok(PublishStage {
+                    path,
+                    root,
+                    dir,
+                    identity,
+                });
+            }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error),
         }
@@ -1731,87 +1763,171 @@ fn reserve_publish_stage(graph: &Graph) -> io::Result<std::path::PathBuf> {
     ))
 }
 
-fn write_publish_stage_file(
-    graph: &Graph,
-    stage: &std::path::Path,
-    name: &str,
-    bytes: &[u8],
-) -> io::Result<()> {
-    let target = stage.join(name);
-    // Revalidate the actual target immediately before every write. If the
-    // reserved stage was renamed and replaced by a managed-directory alias,
-    // fail closed instead of following it outside the graph.
-    graph.ensure_write_target(&target)?;
-    crate::model::atomic_write(&target, bytes)
+fn write_publish_stage_file(stage: &PublishStage, name: &str, bytes: &[u8]) -> io::Result<()> {
+    let relative = Path::new(name);
+    if relative.file_name().is_none_or(|value| value != name)
+        || relative
+            .parent()
+            .is_some_and(|parent| parent != Path::new(""))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "static-publish output name must be one file",
+        ));
+    }
+    publish_stage_write_race_hook(stage)?;
+    // All generation is relative to the directory handle reserved above. A
+    // rename plus symlink/junction replacement of the ambient stage pathname
+    // therefore cannot redirect an open or truncate outside the graph.
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    let mut file = stage.dir.open_with(relative, &options)?;
+    file.write_all(bytes)?;
+    file.sync_all()
 }
 
-fn publish_recovery_path(graph: &Graph) -> io::Result<std::path::PathBuf> {
+#[cfg(test)]
+thread_local! {
+    static PUBLISH_STAGE_WRITE_SWAP: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    static PUBLISH_RECOVERY_SWAP: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn replace_bound_dir_path(path: &Path, outside: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        let displaced = path.with_file_name(format!(
+            "{}.displaced",
+            path.file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("bound")
+        ));
+        fs::rename(path, &displaced)?;
+        symlink(outside, path)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, outside);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+fn publish_stage_write_race_hook(stage: &PublishStage) -> io::Result<()> {
+    PUBLISH_STAGE_WRITE_SWAP.with(|outside| match outside.borrow_mut().take() {
+        Some(outside) => replace_bound_dir_path(&stage.path, &outside),
+        None => Ok(()),
+    })
+}
+
+#[cfg(not(test))]
+fn publish_stage_write_race_hook(_stage: &PublishStage) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+fn publish_recovery_race_hook(recovery: &PublishRecovery) -> io::Result<()> {
+    PUBLISH_RECOVERY_SWAP.with(|outside| match outside.borrow_mut().take() {
+        Some(outside) => replace_bound_dir_path(&recovery.path, &outside),
+        None => Ok(()),
+    })
+}
+
+#[cfg(not(test))]
+fn publish_recovery_race_hook(_recovery: &PublishRecovery) -> io::Result<()> {
+    Ok(())
+}
+
+fn reserve_publish_recovery(graph: &Graph, stage: &PublishStage) -> io::Result<PublishRecovery> {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
     static SEQ: AtomicU64 = AtomicU64::new(0);
-    let recovery = graph
-        .root
-        .join("logseq")
-        .join(".tine-trash")
-        .join("conflicts");
+    let recovery_rel = Path::new("logseq").join(".tine-trash").join("conflicts");
+    let recovery = graph.root.join(&recovery_rel);
     graph.ensure_write_target(&recovery)?;
-    fs::create_dir_all(&recovery)?;
+    stage.root.create_dir_all(&recovery_rel)?;
+    let recovery_root = stage.root.open_dir(&recovery_rel)?;
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or(0);
-    Ok(recovery.join(format!(
-        "{stamp}-{}__previous-publish",
-        SEQ.fetch_add(1, Ordering::Relaxed)
-    )))
+    for _ in 0..128 {
+        let name = format!(
+            "{stamp}-{}__previous-publish",
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        match recovery_root.create_dir(&name) {
+            Ok(()) => {
+                return Ok(PublishRecovery {
+                    #[cfg(test)]
+                    path: recovery.join(&name),
+                    dir: recovery_root.open_dir(&name)?,
+                });
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not reserve static-publish recovery directory",
+    ))
 }
 
-fn commit_publish_stage(
-    graph: &Graph,
-    stage: &std::path::Path,
-    out: &std::path::Path,
-) -> io::Result<()> {
-    graph.ensure_write_target(stage)?;
+fn commit_publish_stage(graph: &Graph, stage: &PublishStage, out: &Path) -> io::Result<()> {
     graph.ensure_write_target(out)?;
-    let stage_meta = fs::symlink_metadata(stage)?;
-    if !stage_meta.is_dir() || stage_meta.file_type().is_symlink() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "static-publish staging directory was replaced",
-        ));
-    }
+    // cap-std may represent a directory capability with an O_PATH descriptor on
+    // Linux, which cannot itself be fsynced. Every generated file is fsynced;
+    // directory durability remains best-effort, matching the other atomic paths.
+    let _ = stage.dir.try_clone()?.into_std_file().sync_all();
 
-    // The old tree may contain user-added files as well as generated output, so
-    // retire it intact rather than deleting it. Moving the currently named inode
-    // is race-safe even if an external process swaps `publish/` at the boundary.
-    let old_recovery = if fs::symlink_metadata(out).is_ok() {
-        let recovery = publish_recovery_path(graph)?;
-        crate::model::move_file_noreplace(out, &recovery)?;
-        Some(recovery)
-    } else {
-        None
+    // Reject a pre-existing alias without touching it. A replacement racing the
+    // check is moved as an inode into bound recovery and rejected there; it is
+    // never followed for a write.
+    let old_recovery = match stage.root.symlink_metadata("publish") {
+        Ok(metadata) => {
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "static-publish output is not a real directory",
+                ));
+            }
+            let recovery = reserve_publish_recovery(graph, stage)?;
+            publish_recovery_race_hook(&recovery)?;
+            stage.root.rename("publish", &recovery.dir, "previous")?;
+            let retired = recovery.dir.symlink_metadata("previous")?;
+            if !retired.is_dir() || retired.file_type().is_symlink() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "static-publish output changed during retirement",
+                ));
+            }
+            Some(recovery)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
     };
 
-    if let Err(error) = crate::model::move_file_noreplace(stage, out) {
-        if !out.exists() {
-            if let Some(old) = &old_recovery {
-                let _ = crate::model::move_file_noreplace(old, out);
-            }
-        }
+    if let Err(error) = crate::model::move_file_noreplace(&stage.path, out) {
+        // The previous site stays complete in conflict recovery. Avoid a
+        // compare-then-replace restoration that could clobber a late winner.
+        let _ = old_recovery;
         return Err(error);
     }
     let out_meta = fs::symlink_metadata(out)?;
-    if out_meta.is_dir() && !out_meta.file_type().is_symlink() {
+    let same_stage = out_meta.is_dir()
+        && !out_meta.file_type().is_symlink()
+        && FileIdentity::from_path(out).is_ok_and(|live| live == stage.identity);
+    if same_stage {
         return Ok(());
     }
 
-    // A replaced stage must never become a live alias. Quarantine it and restore
-    // the previous tree when possible; all versions remain recoverable.
-    let bad = publish_recovery_path(graph)?;
-    let _ = crate::model::move_file_noreplace(out, &bad);
-    if let Some(old) = &old_recovery {
-        let _ = crate::model::move_file_noreplace(old, out);
-    }
+    // A replaced stage must never remain live. Move it through the bound graph
+    // and recovery directory handles; the previous complete site is already
+    // retained separately and is not overwritten during automatic recovery.
+    let bad = reserve_publish_recovery(graph, stage)?;
+    let _ = stage.root.rename("publish", &bad.dir, "invalid-stage");
     Err(io::Error::new(
         io::ErrorKind::InvalidInput,
         "static-publish staging directory changed during commit",
@@ -1825,16 +1941,15 @@ pub fn publish_graph(graph: &Graph) -> io::Result<(String, usize)> {
     let out = graph.root.join("publish");
     graph.ensure_write_target(&out)?;
     let stage = reserve_publish_stage(graph)?;
-    write_publish_stage_file(graph, &stage, "style.css", STYLE.as_bytes())?;
+    write_publish_stage_file(&stage, "style.css", STYLE.as_bytes())?;
     // Sidebar + fuzzy search are JS-driven: Fuse (vendored, OG's version) + our tiny
     // app.js, both loaded as `<script src>` so they work offline / over file://.
     write_publish_stage_file(
-        graph,
         &stage,
         "fuse.min.js",
         include_str!("../assets/fuse.min.js").as_bytes(),
     )?;
-    write_publish_stage_file(graph, &stage, "app.js", APP_JS.as_bytes())?;
+    write_publish_stage_file(&stage, "app.js", APP_JS.as_bytes())?;
     let all_public = graph.config.all_pages_public;
     let favorites: HashSet<&str> = graph.config.favorites.iter().map(|s| s.as_str()).collect();
 
@@ -1941,7 +2056,7 @@ pub fn publish_graph(graph: &Graph) -> io::Result<(String, usize)> {
         if name.eq_ignore_ascii_case("Welcome to Tine") {
             welcome_html = Some(html.clone());
         }
-        write_publish_stage_file(graph, &stage, &file, html.as_bytes())?;
+        write_publish_stage_file(&stage, &file, html.as_bytes())?;
         let journal = *kind == PageKind::Journal;
         let tag = if journal {
             "<span class=\"k\">journal</span>"
@@ -1971,7 +2086,7 @@ pub fn publish_graph(graph: &Graph) -> io::Result<(String, usize)> {
         serde_json::to_string(&sidebar_pages).unwrap_or_else(|_| "[]".into()),
         serde_json::to_string(&all_blocks).unwrap_or_else(|_| "[]".into()),
     );
-    write_publish_stage_file(graph, &stage, "search-index.js", data.as_bytes())?;
+    write_publish_stage_file(&stage, "search-index.js", data.as_bytes())?;
 
     // Keep the alphabetical page list separately discoverable. When the public
     // set contains Welcome to Tine, index.html is that actual rendered page and
@@ -1983,9 +2098,9 @@ pub fn publish_graph(graph: &Graph) -> io::Result<(String, usize)> {
         index_list
     );
     let pages_html = shell("Pages", &main, &home_file);
-    write_publish_stage_file(graph, &stage, "pages.html", pages_html.as_bytes())?;
+    write_publish_stage_file(&stage, "pages.html", pages_html.as_bytes())?;
     let entry_html = welcome_html.unwrap_or(pages_html);
-    write_publish_stage_file(graph, &stage, "index.html", entry_html.as_bytes())?;
+    write_publish_stage_file(&stage, "index.html", entry_html.as_bytes())?;
     commit_publish_stage(graph, &stage, &out)?;
     Ok((out.display().to_string(), count))
 }
@@ -2354,7 +2469,7 @@ mod tests {
         fs::write(outside.join("index.html"), "outside sentinel").unwrap();
         let graph = Graph::open(&dir);
         let stage = reserve_publish_stage(&graph).unwrap();
-        write_publish_stage_file(&graph, &stage, "index.html", b"generated site").unwrap();
+        write_publish_stage_file(&stage, "index.html", b"generated site").unwrap();
         symlink(&outside, dir.join("publish")).unwrap();
 
         assert!(commit_publish_stage(&graph, &stage, &dir.join("publish")).is_err());
@@ -2367,6 +2482,84 @@ mod tests {
             .unwrap()
             .file_type()
             .is_symlink());
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publish_stage_handle_survives_ambient_symlink_swap_without_outside_write() {
+        let dir = std::env::temp_dir().join(format!(
+            "tine-publish-stage-capability-{}",
+            std::process::id()
+        ));
+        let outside = std::env::temp_dir().join(format!(
+            "tine-publish-stage-capability-outside-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&outside);
+        fs::create_dir_all(dir.join("logseq")).unwrap();
+        fs::create_dir_all(dir.join("pages")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(
+            dir.join("pages/Public.md"),
+            "public:: true\n- generated sentinel\n",
+        )
+        .unwrap();
+        fs::write(outside.join("style.css"), "outside sentinel").unwrap();
+        PUBLISH_STAGE_WRITE_SWAP.with(|slot| *slot.borrow_mut() = Some(outside.clone()));
+
+        let graph = Graph::open(&dir);
+        assert!(publish_graph(&graph).is_err());
+        assert_eq!(
+            fs::read_to_string(outside.join("style.css")).unwrap(),
+            "outside sentinel"
+        );
+        assert!(!outside.join("public.html").exists());
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publish_recovery_handle_survives_ambient_symlink_swap_without_outside_move() {
+        let dir = std::env::temp_dir().join(format!(
+            "tine-publish-recovery-capability-{}",
+            std::process::id()
+        ));
+        let outside = std::env::temp_dir().join(format!(
+            "tine-publish-recovery-capability-outside-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&outside);
+        fs::create_dir_all(dir.join("logseq")).unwrap();
+        fs::create_dir_all(dir.join("pages")).unwrap();
+        fs::create_dir_all(dir.join("publish")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(dir.join("publish/index.html"), "previous site").unwrap();
+        fs::write(
+            dir.join("pages/Public.md"),
+            "public:: true\n- generated sentinel\n",
+        )
+        .unwrap();
+        fs::write(outside.join("previous"), "outside sentinel").unwrap();
+        PUBLISH_RECOVERY_SWAP.with(|slot| *slot.borrow_mut() = Some(outside.clone()));
+
+        let graph = Graph::open(&dir);
+        let (out, count) = publish_graph(&graph).unwrap();
+        assert_eq!(count, 1);
+        assert!(Path::new(&out).join("public.html").exists());
+        assert_eq!(
+            fs::read_to_string(outside.join("previous")).unwrap(),
+            "outside sentinel"
+        );
+        let conflicts = dir.join("logseq/.tine-trash/conflicts");
+        assert!(fs::read_dir(conflicts)
+            .unwrap()
+            .flatten()
+            .any(|entry| entry.path().join("previous/index.html").exists()));
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&outside);
     }

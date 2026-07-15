@@ -1028,6 +1028,9 @@ export function mockBackend(): Backend {
     async importAsset(path: string, name?: string): Promise<string> {
       return name ?? path.split("/").pop() ?? path;
     },
+    async importRecording(path: string, name: string): Promise<string> {
+      return name || path.split("/").pop() || path;
+    },
     async clipboardFiles() {
       return { files: [], skipped: 0, truncated: false };
     },
