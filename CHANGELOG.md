@@ -34,7 +34,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   invalidate them, and overflow metadata is never retained across an unknowable
   negative transition. Persisted simple and advanced query sources fail closed
   at shared byte and nesting ceilings before parser recursion or cache-key
-  construction. Unlinked-reference edges follow Logseq's ASCII boundary rule.
+  construction, including static publication's now-bounded query memo.
+  Unlinked-reference edges follow Logseq's ASCII boundary rule.
 - **Clipboard image paste validates dimensions before decoding RGBA.** Pixel,
   raw-buffer, PNG, frontend IPC, and native base64 limits now form one bounded
   ingress path, avoiding several simultaneous unbounded image copies.

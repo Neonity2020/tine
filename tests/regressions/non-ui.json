@@ -415,7 +415,7 @@
     },
     {
       "id": "REG-QUERY-SOURCE-RESOURCE-BOUNDS-001",
-      "title": "Persisted simple and advanced queries fail closed at shared source-size and nesting-depth limits before parser recursion or cache-key construction",
+      "title": "Persisted simple and advanced queries fail closed at shared source-size and nesting-depth limits before parser recursion or cache-key construction, including bounded static-publication memoization",
       "family": "performance-data-safety",
       "sources": { "issues": [], "commits": [] },
       "platforms": ["all"],
@@ -425,7 +425,8 @@
         "tests": [
           "crates/tine-core/src/query.rs",
           "crates/tine-core/src/model.rs",
-          "src-tauri/src/commands.rs"
+          "src-tauri/src/commands.rs",
+          "crates/tine-core/src/publish.rs"
         ],
         "scenario": "performance.query-source-size-and-recursion-bounds",
         "failBefore": "source-proven"

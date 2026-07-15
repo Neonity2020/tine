@@ -135,7 +135,47 @@ enum QueryCacheKey {
     Advanced(String),
 }
 
-type QueryCache = RefCell<HashMap<QueryCacheKey, crate::query::BoundedGroups>>;
+impl QueryCacheKey {
+    fn source_len(&self) -> usize {
+        match self {
+            Self::Simple(source) | Self::Advanced(source) => source.len(),
+        }
+    }
+}
+
+const QUERY_CACHE_MAX_ENTRIES: usize = 64;
+const QUERY_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
+
+#[derive(Default)]
+struct QueryCache {
+    entries: HashMap<QueryCacheKey, crate::query::BoundedGroups>,
+    bytes: usize,
+}
+
+impl QueryCache {
+    fn get(&self, key: &QueryCacheKey) -> Option<crate::query::BoundedGroups> {
+        self.entries.get(key).cloned()
+    }
+
+    fn insert(&mut self, key: QueryCacheKey, groups: crate::query::BoundedGroups) {
+        if self.entries.contains_key(&key) || self.entries.len() >= QUERY_CACHE_MAX_ENTRIES {
+            return;
+        }
+        let bytes = key
+            .source_len()
+            .saturating_add(crate::model::ref_groups_estimated_bytes(&groups.groups))
+            .saturating_add(256);
+        if bytes > QUERY_CACHE_MAX_BYTES
+            || self.bytes.saturating_add(bytes) > QUERY_CACHE_MAX_BYTES
+        {
+            return;
+        }
+        self.bytes += bytes;
+        self.entries.insert(key, groups);
+    }
+}
+
+type SharedQueryCache = RefCell<QueryCache>;
 
 #[cfg(test)]
 mod publish_test_counts {
@@ -905,7 +945,7 @@ struct Ctx<'a> {
     /// Export-local `{{query}}` memo. Whole-graph publish sets this so repeated
     /// macros do one graph scan per distinct source; print export/tests leave it
     /// `None` and keep the old direct call path.
-    query_cache: Option<&'a QueryCache>,
+    query_cache: Option<&'a SharedQueryCache>,
     /// Pass-1 parsed public page documents, keyed by Logseq page identity. Page
     /// embeds use this before falling back to disk for non-public/unseen pages.
     pages: Option<&'a HashMap<String, &'a doc::Document>>,
@@ -1127,6 +1167,15 @@ fn expand_macro(name: &str, args: &[String], ctx: &Ctx, depth: u8) -> String {
 fn render_query(graph: &Graph, src: &str, ctx: &Ctx, depth: u8) -> String {
     const STATIC_QUERY_MAX_ROWS: usize = 20_000;
     const STATIC_QUERY_MAX_BYTES: usize = 32 * 1024 * 1024;
+    if !crate::query::query_source_within_limit(src) {
+        return format!(
+            "<div class=\"query query-too-large\">Query source exceeds the {} KiB publication limit.</div>",
+            crate::query::QUERY_SOURCE_MAX_BYTES / 1024
+        );
+    }
+    if !crate::query::query_nesting_within_limit(src) {
+        return "<div class=\"query query-too-large\">Query nesting is too deep to publish safely.</div>".to_string();
+    }
     let is_advanced = crate::query::is_advanced(src);
     let bounded = if let Some(cache) = ctx.query_cache {
         let key = if is_advanced {
@@ -1134,7 +1183,7 @@ fn render_query(graph: &Graph, src: &str, ctx: &Ctx, depth: u8) -> String {
         } else {
             QueryCacheKey::Simple(src.to_string())
         };
-        let cached = cache.borrow().get(&key).cloned();
+        let cached = cache.borrow().get(&key);
         if let Some(groups) = cached {
             groups
         } else {
@@ -2447,7 +2496,7 @@ pub fn publish_graph(graph: &Graph) -> io::Result<(String, usize)> {
             &mut reverse_refs,
         );
     }
-    let query_cache: QueryCache = RefCell::new(HashMap::new());
+    let query_cache: SharedQueryCache = RefCell::new(QueryCache::default());
 
     // Pass 2: render each public page (collecting the per-block search index along
     // the way), accumulate the sidebar page index (`__tinePages`) and the static
@@ -3586,6 +3635,52 @@ mod tests {
             "each macro occurrence still renders independently"
         );
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn publication_rejects_query_sources_before_keying_and_bounds_valid_memos() {
+        let dir = std::env::temp_dir().join(format!(
+            "tine-publish-query-source-bound-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("journals")).unwrap();
+        fs::create_dir_all(dir.join("pages")).unwrap();
+        fs::create_dir_all(dir.join("logseq")).unwrap();
+        fs::write(dir.join("pages").join("P.md"), "- TODO target\n").unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+        let refs = RefIndex::new();
+        let cache: SharedQueryCache = RefCell::new(QueryCache::default());
+        let ctx = Ctx {
+            refs: &refs,
+            reverse_refs: None,
+            graph: Some(&graph),
+            slugs: None,
+            inline_assets: false,
+            print_asset_budget: None,
+            query_cache: Some(&cache),
+            pages: None,
+        };
+
+        let oversized = "x".repeat(crate::query::QUERY_SOURCE_MAX_BYTES + 1);
+        assert!(render_query(&graph, &oversized, &ctx, 0).contains("publication limit"));
+        let nested = format!(
+            "{}(task TODO){}",
+            "(and ".repeat(1_000),
+            ")".repeat(1_000)
+        );
+        assert!(render_query(&graph, &nested, &ctx, 0).contains("nesting is too deep"));
+        assert!(cache.borrow().entries.is_empty());
+
+        for index in 0..(QUERY_CACHE_MAX_ENTRIES + 20) {
+            let source = format!("(and (task TODO) (content \"memo-{index}\"))");
+            let _ = render_query(&graph, &source, &ctx, 0);
+        }
+        let cache = cache.borrow();
+        assert_eq!(cache.entries.len(), QUERY_CACHE_MAX_ENTRIES);
+        assert!(cache.bytes <= QUERY_CACHE_MAX_BYTES);
         let _ = fs::remove_dir_all(&dir);
     }
 
