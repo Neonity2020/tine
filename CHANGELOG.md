@@ -29,9 +29,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   are removed, and queries, references, facets, block resolution, publishing,
   and query export enforce row/byte limits while constructing—not after cloning
   a complete result. Reference occurrence evidence is capped while scanning,
-  all live bounded result families retain warm caches across unrelated edits,
-  and overflow metadata is never retained across an unknowable negative
-  transition. Unlinked-reference edges follow Logseq's ASCII boundary rule.
+  all live bounded result families retain warm caches across unrelated edits
+  (including pages with unchanged aliases), semantic alias transitions still
+  invalidate them, and overflow metadata is never retained across an unknowable
+  negative transition. Unlinked-reference edges follow Logseq's ASCII boundary
+  rule.
 - **Clipboard image paste validates dimensions before decoding RGBA.** Pixel,
   raw-buffer, PNG, frontend IPC, and native base64 limits now form one bounded
   ingress path, avoiding several simultaneous unbounded image copies.

@@ -2698,10 +2698,10 @@ impl Graph {
         // Only the alias map needs dropping when an `alias::` was added/changed/
         // removed — invalidating on every save would make a normal edit an O(P)
         // alias rescan on the next navigation.
-        let new_has_alias = doc_has_alias(&doc);
+        let new_aliases = crate::query::document_aliases(&doc);
         let new_block_refs = document_block_ref_counts(&doc);
         let mut block_refs_touched = false;
-        let mut alias_touched = new_has_alias;
+        let mut alias_touched = !new_aliases.is_empty();
         let key = rev_key(entry.kind, &entry.name);
         let doc = Arc::new(doc);
         // Keep the new content + identity for the scoped derived-cache pass below
@@ -2717,7 +2717,7 @@ impl Graph {
             match self.cached_page_index(pages, entry.kind, &entry.name) {
                 Some(i) => {
                     let slot = &mut pages[i];
-                    alias_touched = new_has_alias || doc_has_alias(&slot.1);
+                    alias_touched = new_aliases != crate::query::document_aliases(&slot.1);
                     block_refs_touched = document_block_ref_counts(&slot.1) != new_block_refs;
                     previous_doc = Some(Arc::clone(&slot.1));
                     slot.1 = doc;
@@ -2980,7 +2980,7 @@ impl Graph {
         if let Some(pages) = guard.as_mut() {
             let pages = Arc::make_mut(pages);
             if let Some(i) = self.cached_page_index(pages, kind, name) {
-                alias_touched = doc_has_alias(&pages[i].1);
+                alias_touched = !crate::query::document_aliases(&pages[i].1).is_empty();
                 block_refs_touched = !document_block_ref_counts(&pages[i].1).is_empty();
             }
             pages.retain(|(e, _)| !(e.kind == kind && crate::refs::same_page(&e.name, name)));
@@ -5678,23 +5678,6 @@ pub fn markdown_page_dto(name: &str, title: &str, markdown: &str) -> PageDto {
 /// it (lest it corrupt the user's graph). Markdown pages are always editable.
 fn read_only_org(path: &Path, content: &str) -> bool {
     Format::from_path(path) == Format::Org && !crate::org::org_editable(content)
-}
-
-/// Whether a document declares an `alias::` anywhere — used to decide if a save
-/// must invalidate the cached alias map (most saves don't touch aliases).
-fn has_alias_prop(text: &str) -> bool {
-    // Case-insensitive (Logseq accepts `Alias::`); ASCII-lowercase is enough and
-    // cheaper than full to_lowercase. Over-matching content is harmless (it just
-    // invalidates the alias cache slightly more often); MISSING `Alias::` would
-    // leave it stale, which is the bug we're avoiding.
-    let lower = text.to_ascii_lowercase();
-    lower.contains("alias::") || lower.contains("aliases::")
-}
-fn doc_has_alias(doc: &Document) -> bool {
-    doc.pre_block.as_deref().is_some_and(has_alias_prop) || doc.roots.iter().any(block_has_alias)
-}
-fn block_has_alias(b: &DocBlock) -> bool {
-    has_alias_prop(&b.raw) || b.children.iter().any(block_has_alias)
 }
 
 /// A page's `icon::` property value from its pre-block, handling markdown
@@ -8940,7 +8923,11 @@ mod tests {
     fn advanced_query_reuses_cached_result_until_graph_changes() {
         let dir = scratch("adv-memo");
         fs::write(dir.join("pages").join("P.md"), "- TODO ship\n").unwrap();
-        fs::write(dir.join("pages").join("Notes.md"), "- ordinary note\n").unwrap();
+        fs::write(
+            dir.join("pages").join("Notes.md"),
+            "alias:: Scratch\n- ordinary note\n",
+        )
+        .unwrap();
         let g = Graph::open(&dir);
         g.warm_cache();
         let q = r#"[:find (pull ?b [*]) :where (task ?b #{"TODO"})]"#;
@@ -8990,6 +8977,19 @@ mod tests {
         );
         assert!(Arc::ptr_eq(&bounded_first, &bounded_after_unrelated));
 
+        notes.pre_block = Some("alias:: Renamed Scratch\n".into());
+        let rev = g
+            .load_named("Notes", PageKind::Page)
+            .unwrap()
+            .unwrap()
+            .rev;
+        g.save_page(&notes, rev.as_deref()).unwrap();
+        let after_alias_change = g.run_advanced_query_cached(q, None);
+        assert!(
+            !Arc::ptr_eq(&first, &after_alias_change),
+            "a semantic alias change must invalidate graph-wide derived results"
+        );
+
         let mut dto = g.load_named("P", PageKind::Page).unwrap().unwrap();
         dto.blocks[0].raw = dto.blocks[0].raw.replace("TODO", "DONE");
         g.save_page(&dto, dto.rev.as_deref()).unwrap();
@@ -9021,7 +9021,11 @@ mod tests {
     fn bounded_query_memo_survives_unrelated_edits_and_recomputes_affected_pages() {
         let dir = scratch("bounded-query-scoped-memo");
         fs::write(dir.join("pages").join("Tasks.md"), "- TODO ship\n").unwrap();
-        fs::write(dir.join("pages").join("Notes.md"), "- ordinary note\n").unwrap();
+        fs::write(
+            dir.join("pages").join("Notes.md"),
+            "alias:: Scratch\n- ordinary note\n",
+        )
+        .unwrap();
         let g = Graph::open(&dir);
         g.warm_cache();
 
@@ -9059,7 +9063,11 @@ mod tests {
         )
         .unwrap();
         fs::write(dir.join("pages").join("Target.md"), "- target page\n").unwrap();
-        fs::write(dir.join("pages").join("Notes.md"), "- ordinary note\n").unwrap();
+        fs::write(
+            dir.join("pages").join("Notes.md"),
+            "alias:: Scratch\n- ordinary note\n",
+        )
+        .unwrap();
         let g = Graph::open(&dir);
         g.warm_cache();
 

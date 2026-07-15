@@ -340,37 +340,54 @@ fn is_properties_only(raw: &str) -> bool {
 /// treats as page properties (GH #62). Without the latter, `- alias:: book`
 /// typed in the editor never registers as an alias, so link navigation and
 /// backlinks don't merge the two pages.
+/// The normalized aliases contributed by one document, using the exact same
+/// page-property rules as [`page_aliases`]. Keeping this extraction shared also
+/// lets cache invalidation compare the old and new semantic alias sets instead
+/// of treating the mere presence of an unchanged `alias::` line as a change.
+pub(crate) fn document_aliases(doc: &Document) -> Vec<String> {
+    let alias_text: Option<&str> = match &doc.pre_block {
+        Some(pre) => Some(pre.as_str()),
+        // No pre-block: a properties-only FIRST block is the page-properties
+        // block in OG (it gets written back as a pre-block on save there).
+        None => doc
+            .roots
+            .first()
+            .filter(|b| is_properties_only(&b.raw))
+            .map(|b| b.raw.as_str()),
+    };
+    let Some(text) = alias_text else {
+        return Vec::new();
+    };
+    let mut aliases = Vec::new();
+    for line in text.lines() {
+        if let Some((k, v)) = crate::doc::parse_property_line(line) {
+            if k.eq_ignore_ascii_case("alias") || k.eq_ignore_ascii_case("aliases") {
+                let trimmed = v.trim();
+                if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
+                    continue;
+                }
+                for alias in v.split([',', '，']) {
+                    let alias = strip_ref(alias.trim());
+                    if !alias.is_empty() {
+                        aliases.push(refs::normalize(&alias));
+                    }
+                }
+            }
+        }
+    }
+    // Ordering and duplicate spelling do not alter alias resolution. Comparing
+    // the semantic set avoids graph-wide invalidation for harmless formatting.
+    aliases.sort_unstable();
+    aliases.dedup();
+    aliases
+}
+
 pub fn page_aliases(graph: &Graph) -> Vec<(String, String)> {
     graph.with_pages(|pages| {
         let mut out: Vec<(String, String)> = Vec::new();
         for (entry, doc) in pages {
-            let alias_text: Option<&str> = match &doc.pre_block {
-                Some(pre) => Some(pre.as_str()),
-                // No pre-block: a properties-only FIRST block is the page-properties
-                // block in OG (it gets written back as a pre-block on save there).
-                None => doc
-                    .roots
-                    .first()
-                    .filter(|b| is_properties_only(&b.raw))
-                    .map(|b| b.raw.as_str()),
-            };
-            let Some(text) = alias_text else { continue };
-            for line in text.lines() {
-                if let Some((k, v)) = crate::doc::parse_property_line(line) {
-                    if k.eq_ignore_ascii_case("alias") || k.eq_ignore_ascii_case("aliases") {
-                        let trimmed = v.trim();
-                        if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"')
-                        {
-                            continue;
-                        }
-                        for a in v.split([',', '，']) {
-                            let a = strip_ref(a.trim());
-                            if !a.is_empty() {
-                                out.push((refs::normalize(&a), entry.name.clone()));
-                            }
-                        }
-                    }
-                }
+            for alias in document_aliases(doc) {
+                out.push((alias, entry.name.clone()));
             }
         }
         out

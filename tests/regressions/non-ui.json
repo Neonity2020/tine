@@ -415,7 +415,7 @@
     },
     {
       "id": "REG-BOUNDED-RESULT-EVIDENCE-CACHE-001",
-      "title": "Bounded query and reference results cap occurrence construction and retain every warm result family across unrelated edits without preserving stale overflow metadata",
+      "title": "Bounded query and reference results cap occurrence construction and retain every warm result family across unrelated edits, including pages with unchanged aliases, without preserving stale overflow metadata",
       "family": "performance-correctness",
       "sources": { "issues": [], "commits": [] },
       "platforms": ["all"],
