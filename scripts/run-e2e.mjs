@@ -75,6 +75,7 @@ const suites = {
     ["capture", "scripts/e2e-capture.mjs", { E2E_WINDOW_MANAGER: "openbox" }],
     ["native-titlebar", "scripts/e2e-native-titlebar.mjs", { E2E_WINDOW_MANAGER: "openbox" }],
     ["page-file-actions", "scripts/e2e-page-file-actions.mjs", {}],
+    ["print-security", "scripts/e2e-print-security.mjs", {}],
     ["block-embed", "scripts/e2e-block-embed.mjs", {}],
     ["sidebar-sections", "scripts/e2e-sidebar-sections.mjs", {}],
     ["right-sidebar-collapse", "scripts/e2e-right-sidebar-collapse.mjs", {}],
@@ -86,6 +87,7 @@ const suites = {
   "windows-smoke": [
     ["page-properties", "scripts/e2e-page-properties.mjs", {}],
     ["pdf-logseq", "scripts/e2e-pdf-logseq.mjs", {}],
+    ["print-security", "scripts/e2e-print-security.mjs", {}],
     ["windows-core", "scripts/e2e-windows-smoke.mjs", {}],
   ],
 };

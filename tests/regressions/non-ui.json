@@ -262,6 +262,24 @@
         "scenario": "performance.interleaved-multiround-median-and-spread-gate",
         "failBefore": "proven"
       }
+    },
+    {
+      "id": "REG-PRINT-SCRIPT-FREE-PRIVILEGE-BOUNDARY-001",
+      "title": "PDF export locally renders math and code into a script-free sandbox that cannot inherit app IPC privileges",
+      "family": "security",
+      "sources": { "issues": [], "commits": [] },
+      "platforms": ["desktop"],
+      "layer": "core-native-ui",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/publish.rs",
+          "src/print.security.test.tsx",
+          "scripts/e2e-print-security.mjs"
+        ],
+        "scenario": "security.print-script-free-sandbox-and-local-rendering",
+        "failBefore": "source-proven"
+      }
     }
   ]
 }

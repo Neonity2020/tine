@@ -10,6 +10,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **PDF export documents no longer inherit Tine's native privileges.** Math and
+  code highlighting are rendered from bundled libraries before printing; the
+  resulting document is script-free, carries a restrictive content-security
+  policy, and runs in a sandbox without script permission instead of loading
+  executable code from a CDN inside the app origin.
 - **Nested query, reference, and block-resolution results no longer amplify
   overlapping subtrees quadratically or omit valid nested occurrences.** Query
   shaping now transcribes Logseq's actual rule—suppress a match only when its

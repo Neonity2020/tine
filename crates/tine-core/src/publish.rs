@@ -1390,10 +1390,11 @@ fn shell(title: &str, main: &str, home_href: &str) -> String {
 
 /// A **self-contained single page** for the print-to-PDF export: the same block
 /// render as a published page, but with the stylesheet + print rules inlined and
-/// no sidebar / search / app scripts — so it prints (or opens) standalone. Assets
-/// are inlined as `data:` URIs upstream (`inline_assets`), so no sibling folder is
-/// needed. KaTeX / highlight.js still load from CDN (math/code typeset when online;
-/// offline shows raw TeX / plain code, same as a published page).
+/// no sidebar / search / scripts — so the returned document cannot execute in the
+/// privileged Tauri origin. Assets are inlined as `data:` URIs upstream
+/// (`inline_assets`). The frontend upgrades math/code with its locally bundled
+/// KaTeX/highlight.js before placing this static document in a script-disabled
+/// sandbox.
 // Inter faces bundled INTO the print document as `@font-face` data URIs. The print
 // doc is a separate document from the app, so it does NOT inherit the app's Inter
 // `@font-face` rules; without this it falls back to a system font, and if that font
@@ -1450,11 +1451,10 @@ fn print_shell(title: &str, main: &str, opts: PrintOpts) -> String {
     format!(
         "<!doctype html><html><head><meta charset=\"utf-8\">\
 <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{title}</title>\
-{katex}{hljs}<style>{fonts}{style}\n{print}\n{tuned}</style></head><body class=\"print\">\
+<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; script-src 'none'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; img-src 'self' data:; media-src 'self' data:; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'\">\
+<style>{fonts}{style}\n{print}\n{tuned}</style></head><body class=\"print\">\
 <main>{main}</main></body></html>",
         title = esc(title),
-        katex = KATEX_HEAD,
-        hljs = HLJS_HEAD,
         fonts = print_fontface(),
         style = STYLE,
         print = PRINT_STYLE,
@@ -2934,6 +2934,12 @@ mod tests {
             "no sidebar in print doc"
         );
         assert!(!html.contains("src=\"app.js\""), "no app.js in print doc");
+        assert!(!html.contains("<script"), "print doc executes no scripts");
+        assert!(!html.contains("cdn.jsdelivr.net"), "print doc has no CDN resources");
+        assert!(
+            html.contains("script-src 'none'"),
+            "print doc denies script execution even if markup regresses"
+        );
         assert!(
             !html.contains("href=\"style.css\""),
             "no external stylesheet link"
