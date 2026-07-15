@@ -270,13 +270,37 @@ fn esc(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
+/// A print document crosses Rust -> IPC -> WebKit and base64 expands its inputs.
+/// Bound both one pathological file and the complete export before any bytes are
+/// read. The cumulative input ceiling keeps the resulting HTML below roughly
+/// 43 MiB even when many otherwise-valid images are present.
+const PRINT_ASSET_MAX_BYTES: u64 = 12 * 1024 * 1024;
+const PRINT_ASSETS_TOTAL_MAX_BYTES: u64 = 32 * 1024 * 1024;
+
+#[derive(Debug)]
+struct PrintAssetBudget {
+    per_asset: u64,
+    remaining: u64,
+}
+
+impl PrintAssetBudget {
+    fn standard() -> Self {
+        Self {
+            per_asset: PRINT_ASSET_MAX_BYTES,
+            remaining: PRINT_ASSETS_TOTAL_MAX_BYTES,
+        }
+    }
+}
+
 /// Read a local `assets/<file>` image referenced by an export `data-asset` path
 /// (e.g. `../assets/cat.png`) and return it as a self-contained `data:` URI, for
 /// the single-page print/PDF export. Returns `None` for a non-local URL (http/…),
-/// no graph, an unreadable file, or a path that escapes `assets/` — the caller
-/// then keeps the original `src` (a broken image, never a failed export).
+/// no graph, an unreadable/oversized file, an exhausted export budget, or a path
+/// that escapes `assets/`. The caller emits an inert omission marker rather than
+/// leaving a broken or network-capable image in the privileged export flow.
 fn inline_asset_uri(ctx: &Ctx, src: &str) -> Option<String> {
     let graph = ctx.graph?;
+    let budget_cell = ctx.print_asset_budget?;
     // Only local asset references; leave remote/data URLs untouched.
     if src.contains("://") || src.starts_with("data:") {
         return None;
@@ -284,7 +308,10 @@ fn inline_asset_uri(ctx: &Ctx, src: &str) -> Option<String> {
     // `read_asset` re-guards against traversal; pass just the file name so a
     // `../assets/x` (or `assets/x`) ref resolves to `<graph>/assets/x`.
     let name = src.rsplit('/').next().unwrap_or(src);
-    let bytes = graph.read_asset(name).ok()?;
+    let mut budget = budget_cell.borrow_mut();
+    let admission_limit = budget.per_asset.min(budget.remaining);
+    let bytes = graph.read_asset_limited(name, admission_limit).ok()?;
+    budget.remaining = budget.remaining.saturating_sub(bytes.len() as u64);
     let mime = match name
         .rsplit('.')
         .next()
@@ -591,19 +618,25 @@ fn decorate(html: &str, ctx: &Ctx, depth: u8) -> String {
             if let Some(asset) = tag_attr(inner, "data-asset") {
                 let alt = tag_attr(inner, "alt").map(unescape).unwrap_or_default();
                 let src = unescape(asset);
-                let src = if ctx.inline_assets {
-                    // Self-contained print doc: read the asset and emit a `data:`
-                    // URI. Falls back to the relative path if it can't be read
-                    // (missing file / non-local URL) — a broken img, never a panic.
-                    inline_asset_uri(ctx, &src).unwrap_or(src)
+                if ctx.inline_assets {
+                    if let Some(inlined) = inline_asset_uri(ctx, &src) {
+                        out.push_str(&format!(
+                            "<img class=\"inline-image\" src=\"{}\" alt=\"{}\">",
+                            esc_attr(&inlined),
+                            esc_attr(&alt)
+                        ));
+                    } else {
+                        out.push_str(
+                            "<span class=\"print-asset-omitted\">[Image omitted from PDF: unavailable or exceeds the print size limit]</span>",
+                        );
+                    }
                 } else {
-                    src
-                };
-                out.push_str(&format!(
-                    "<img class=\"inline-image\" src=\"{}\" alt=\"{}\">",
-                    esc_attr(&src),
-                    esc_attr(&alt)
-                ));
+                    out.push_str(&format!(
+                        "<img class=\"inline-image\" src=\"{}\" alt=\"{}\">",
+                        esc_attr(&src),
+                        esc_attr(&alt)
+                    ));
+                }
                 continue;
             }
         }
@@ -786,6 +819,10 @@ struct Ctx<'a> {
     /// so the printed document needs no sibling `assets/` folder. The whole-graph
     /// site export keeps the relative `../assets/<file>` links (`false`).
     inline_assets: bool,
+    /// Shared admission state for every image in one print document. Present
+    /// exactly when `inline_assets` is true; all images therefore consume one
+    /// cumulative byte ceiling before base64/IPC/DOM amplification.
+    print_asset_budget: Option<&'a RefCell<PrintAssetBudget>>,
     /// Export-local `{{query}}` memo. Whole-graph publish sets this so repeated
     /// macros do one graph scan per distinct source; print export/tests leave it
     /// `None` and keep the old direct call path.
@@ -1492,6 +1529,7 @@ body.print h1.page{margin-top:0}
    affordance and misalign against the bullet dots when printed — dots alone read
    cleaner. */
 body.print ul.outline ul{border-left:none}
+.print-asset-omitted{display:inline-block;color:#777;font-style:italic;margin:.3rem 0}
 @media print{
   body.print main{padding:0}
   a.ref,a.tag,a.block-ref{color:inherit;text-decoration:none}
@@ -1518,12 +1556,14 @@ pub fn page_print_html(graph: &Graph, name: &str, opts: PrintOpts) -> io::Result
     let slug = slug(&entry.name);
     let mut refs = RefIndex::new();
     collect_block_refs(&parsed.roots, &slug, &mut refs);
+    let print_asset_budget = RefCell::new(PrintAssetBudget::standard());
     let ctx = Ctx {
         refs: &refs,
         reverse_refs: None,
         graph: Some(graph),
         slugs: None,
         inline_assets: true,
+        print_asset_budget: Some(&print_asset_budget),
         query_cache: None,
         pages: None,
     };
@@ -2217,6 +2257,7 @@ pub fn publish_graph(graph: &Graph) -> io::Result<(String, usize)> {
         graph: Some(graph),
         slugs: Some(&slugs),
         inline_assets: false,
+        print_asset_budget: None,
         query_cache: Some(&query_cache),
         pages: Some(&page_docs),
     };
@@ -2308,6 +2349,7 @@ mod tests {
             graph: None,
             slugs: None,
             inline_assets: false,
+            print_asset_budget: None,
             query_cache: None,
             pages: None,
         };
@@ -2890,6 +2932,60 @@ mod tests {
     }
 
     #[test]
+    fn print_asset_inlining_enforces_per_file_and_shared_export_budgets() {
+        let dir = std::env::temp_dir().join(format!("tine-print-budget-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("assets")).unwrap();
+        fs::write(dir.join("assets/one.png"), b"1234").unwrap();
+        fs::write(dir.join("assets/two.png"), b"5678").unwrap();
+        fs::write(dir.join("assets/large.png"), b"123456").unwrap();
+        let graph = Graph::open(&dir);
+        let refs = no_refs();
+        let cumulative = RefCell::new(PrintAssetBudget {
+            per_asset: 5,
+            remaining: 7,
+        });
+        let cumulative_ctx = Ctx {
+            refs: &refs,
+            reverse_refs: None,
+            graph: Some(&graph),
+            slugs: None,
+            inline_assets: true,
+            print_asset_budget: Some(&cumulative),
+            query_cache: None,
+            pages: None,
+        };
+
+        assert!(inline_asset_uri(&cumulative_ctx, "../assets/one.png").is_some());
+        assert_eq!(cumulative.borrow().remaining, 3);
+        assert!(
+            inline_asset_uri(&cumulative_ctx, "../assets/two.png").is_none(),
+            "the second valid file must not cross the shared export ceiling"
+        );
+        assert_eq!(
+            cumulative.borrow().remaining,
+            3,
+            "a rejection consumes no budget"
+        );
+
+        let per_file = RefCell::new(PrintAssetBudget {
+            per_asset: 5,
+            remaining: 20,
+        });
+        let per_file_ctx = Ctx {
+            print_asset_budget: Some(&per_file),
+            ..cumulative_ctx
+        };
+        assert!(
+            inline_asset_uri(&per_file_ctx, "../assets/large.png").is_none(),
+            "one oversized file must be rejected before it is returned"
+        );
+        assert_eq!(per_file.borrow().remaining, 20);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn page_print_html_is_self_contained_with_inlined_image() {
         let dir = std::env::temp_dir().join(format!("tine-print-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -2905,9 +3001,11 @@ mod tests {
             0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
         ];
         fs::write(dir.join("assets").join("pic.png"), png).unwrap();
+        let oversized = fs::File::create(dir.join("assets").join("oversized.png")).unwrap();
+        oversized.set_len(PRINT_ASSET_MAX_BYTES + 1).unwrap();
         fs::write(
             dir.join("pages").join("Report.md"),
-            "- # Report\n- Some **bold** text and a [[Welcome]] link.\n- ![shot](../assets/pic.png)\n",
+            "- # Report\n- Some **bold** text and a [[Welcome]] link.\n- ![shot](../assets/pic.png)\n- ![large](../assets/oversized.png)\n",
         )
         .unwrap();
 
@@ -2928,6 +3026,14 @@ mod tests {
         assert!(
             !html.contains("../assets/pic.png"),
             "no relative asset link left"
+        );
+        assert!(
+            html.contains("class=\"print-asset-omitted\""),
+            "an oversized image becomes an explicit inert marker"
+        );
+        assert!(
+            !html.contains("oversized.png"),
+            "the rejected source path is not retained in the print document"
         );
         assert!(
             !html.contains("<aside class=\"sidebar\">"),

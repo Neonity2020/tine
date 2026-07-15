@@ -319,7 +319,7 @@
       "sources": { "issues": [], "commits": [] },
       "platforms": ["desktop"],
       "layer": "core-native-ui",
-      "status": "fixing",
+      "status": "covered",
       "coverage": {
         "tests": [
           "crates/tine-core/src/publish.rs",

@@ -10,6 +10,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **PDF export now bounds image bytes before crossing the native/WebView
+  boundary.** Each image has a 12 MiB ceiling and one export shares a 32 MiB
+  source-byte budget; missing, remote, oversized, and over-budget images become
+  inert omission markers instead of being read, base64-expanded, copied through
+  IPC, and materialized in the print DOM without a limit.
 - **Long high-zoom PDF sessions have a real memory ceiling.** Canvas admission
   now uses aggregate backing-store pixels (with a lower mobile budget) instead
   of retaining up to 24 maximum-size pages, evicts before allocating, and zeroes

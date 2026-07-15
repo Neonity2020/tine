@@ -21,11 +21,15 @@ fs.rmSync(TMP, { recursive: true, force: true });
 for (const dir of ["pages", "journals", "logseq", "assets"]) fs.mkdirSync(path.join(GRAPH, dir), { recursive: true });
 for (const dir of ["data", "config", "cache"]) fs.mkdirSync(path.join(TMP, "xdg", dir), { recursive: true });
 fs.writeFileSync(path.join(GRAPH, "logseq", "config.edn"), "{}\n");
+const oversizedAsset = path.join(GRAPH, "assets", "oversized.png");
+fs.writeFileSync(oversizedAsset, "");
+fs.truncateSync(oversizedAsset, 12 * 1024 * 1024 + 1);
 fs.writeFileSync(path.join(GRAPH, "pages", "Print proof.md"), [
   "- Math $x^2$ stays typeset",
   "- ```rust",
   "  fn main() {}",
   "  ```",
+  "- ![large](../assets/oversized.png)",
   "",
 ].join("\n"));
 const now = new Date();
@@ -118,10 +122,11 @@ try {
   }
   if (/<script\b/i.test(proof.srcdoc) || /cdn\.jsdelivr\.net/i.test(proof.srcdoc)
     || !/script-src 'none'/.test(proof.srcdoc) || !/class="katex/.test(proof.srcdoc)
-    || !/hljs-keyword/.test(proof.srcdoc)) {
+    || !/hljs-keyword/.test(proof.srcdoc) || !/print-asset-omitted/.test(proof.srcdoc)
+    || /oversized\.png/.test(proof.srcdoc)) {
     throw new Error(`print document privilege boundary failed: ${proof.srcdoc.slice(0, 2_000)}`);
   }
-  console.log("PASS: native page-to-PDF path locally renders a script-disabled sandboxed print document");
+  console.log("PASS: native page-to-PDF path locally renders a bounded, script-disabled sandboxed print document");
 } finally {
   try { await browser?.deleteSession(); } catch {}
   try {
