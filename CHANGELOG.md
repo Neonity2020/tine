@@ -10,6 +10,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Bare hashtag autocomplete stays open for Unicode IME input.** CJK, Kana,
+  Hangul, Thai, accented, emoji, and namespaced tag prefixes now use the same
+  hard-stop contract as the parser instead of JavaScript's ASCII-only word
+  class, while punctuation and embedded-hash boundaries still close the picker.
+  (GH #167)
 - **Static publication is now a closed capability boundary.** Ambiguous
   public/private source identities fail closed, generated anchors are escaped
   separately for HTML attributes and URL fragments, ordinary links and media

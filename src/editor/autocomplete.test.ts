@@ -122,8 +122,33 @@ describe("detectTrigger", () => {
     expect(t).toEqual({ kind: "tag", query: "pro", start: 2, end: 6 });
   });
 
+  it("keeps bare tag completion active for Unicode text committed by an IME (GH #167)", () => {
+    // Logseq OG 6e7afa8, frontend/handler/editor.cljs `handle-last-input` and
+    // `close-autocomplete-if-outside`: the marker boundary starts hashtag search,
+    // and committed text is not restricted to ASCII keyboard word characters.
+    for (const query of ["倘", "かな", "한글", "ไทย", "café", "🧠"]) {
+      const raw = `prefix #${query}`;
+      expect(detectTrigger(raw, raw.length)).toEqual({
+        kind: "tag",
+        query,
+        start: "prefix ".length,
+        end: raw.length,
+      });
+    }
+  });
+
   it("tag requires start or whitespace before #", () => {
     expect(detectTrigger("email@x#y", 9)).toBeNull();
+  });
+
+  it("shares bare-tag hard stops without narrowing namespaces or punctuation inside names", () => {
+    const raw = "#team/foo.bar;baz";
+    expect(detectTrigger(raw, raw.length)).toEqual({
+      kind: "tag", query: "team/foo.bar;baz", start: 0, end: raw.length,
+    });
+    for (const rawWithStop of ["#tag,", "#tag!", "#tag?", "#tag:", "#tag#"]) {
+      expect(detectTrigger(rawWithStop, rawWithStop.length)).toBeNull();
+    }
   });
 
   it("detects / command trigger at block start", () => {

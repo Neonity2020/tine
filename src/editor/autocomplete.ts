@@ -2,7 +2,7 @@
 // trigger at the caret, and apply a chosen completion. No DOM — unit-testable.
 
 import { TEMPLATE_VARS } from "./templateVars";
-import { tagRef } from "../tags";
+import { isBareTagPrefix, tagRef } from "../tags";
 
 export type TriggerKind = "page" | "tag" | "command" | "block" | "code-language";
 
@@ -121,11 +121,17 @@ export function detectTrigger(raw: string, caret: number): Trigger | null {
     }
   }
 
-  // #tag — `#` at start or after whitespace, followed by tag chars.
-  const tag = /(^|\s)#([\w/_.-]*)$/.exec(before);
-  if (tag) {
-    const start = lineStart + before.length - tag[2].length - 1; // position of '#'
-    return { kind: "tag", query: tag[2], start, end: caret };
+  // #tag — `#` at start or after whitespace, followed by the same hard-stop
+  // contract as lsdoc's bare-tag lexer. Do not use `\w`: it is ASCII-only and
+  // closes the picker after CJK/Indic/emoji IME commits. Logseq OG 6e7afa8
+  // (`handle-last-input` + `close-autocomplete-if-outside`) likewise starts on
+  // the marker boundary and keeps arbitrary committed tag text active.
+  const hash = before.lastIndexOf("#");
+  if (hash !== -1 && (hash === 0 || /\s/u.test(before[hash - 1]))) {
+    const query = before.slice(hash + 1);
+    if (isBareTagPrefix(query)) {
+      return { kind: "tag", query, start: lineStart + hash, end: caret };
+    }
   }
 
   // /command — `/` at start or after whitespace.
