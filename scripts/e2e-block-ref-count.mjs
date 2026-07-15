@@ -1,6 +1,7 @@
-// Real-app regression for GH #154. A graph-wide reference-count map is loaded
-// before a new block reference exists; saving the reference must refresh the
-// source block's badge without reopening the graph.
+// Real-app regressions for GH #154 and GH #166. A graph-wide reference-count map
+// is loaded before a new block reference exists; saving the reference must
+// refresh the source block's badge without reopening the graph. Editing that
+// already-loaded source must then refresh the inline reference text as well.
 import { spawn } from "node:child_process";
 import { remote } from "webdriverio";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -92,7 +93,45 @@ try {
   const badge = await browser.$(".block-refs-count");
   await badge.waitForExist({ timeout: 10_000 });
   if ((await badge.getText()).trim() !== "1") throw new Error(`expected reference count 1, got ${JSON.stringify(await badge.getText())}`);
-  console.log("PASS: saved block reference refreshed the source badge to 1");
+
+  const sourceEditArmed = await browser.execute(() => {
+    const content = document.querySelector(".page-blocks .block-content");
+    if (!(content instanceof HTMLElement)) return false;
+    const rect = content.getBoundingClientRect();
+    const clientX = rect.left + Math.min(12, Math.max(1, rect.width / 2));
+    const clientY = rect.top + Math.max(1, rect.height / 2);
+    content.dispatchEvent(new MouseEvent("mousedown", {
+      bubbles: true, cancelable: true, button: 0, buttons: 1, clientX, clientY,
+    }));
+    document.dispatchEvent(new MouseEvent("mouseup", {
+      bubbles: true, cancelable: true, button: 0, buttons: 0, clientX, clientY,
+    }));
+    return true;
+  });
+  if (!sourceEditArmed) throw new Error("source block content was not available for editing");
+  await sleep(200);
+  const sourceEditApplied = await browser.execute((value) => {
+    const editor = document.querySelector(".page-blocks textarea.block-editor");
+    if (!(editor instanceof HTMLTextAreaElement)) return false;
+    editor.focus();
+    editor.value = value;
+    editor.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: null }));
+    return true;
+  }, "Updated source target");
+  if (!sourceEditApplied) throw new Error("source block editor did not open for input");
+  await browser.keys(["Escape"]);
+  await browser.waitUntil(() => fs.readFileSync(`${GRAPH}/pages/Source Target.md`, "utf8").includes("Updated source target"), {
+    timeout: 10_000, timeoutMsg: "updated source block was not saved",
+  });
+
+  await back.click();
+  await browser.waitUntil(async () => (await browser.$("h1.page-title").getText()).trim() === "Tester", {
+    timeout: 10_000, timeoutMsg: "Tester did not return after source edit",
+  });
+  await browser.waitUntil(async () => (await browser.$(".page-blocks .block-ref").getText()).trim() === "Updated source target", {
+    timeout: 10_000, timeoutMsg: "inline block reference kept stale source text",
+  });
+  console.log("PASS: reference count refreshed to 1 and inline text followed the loaded source edit");
 } finally {
   try { await browser?.deleteSession(); } catch {}
   try { process.kill(-td.pid, "SIGKILL"); } catch {}

@@ -10,6 +10,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Inline block-reference text follows source edits immediately.** A referenced
+  block that is already loaded shares its reactive editor node with every
+  visible `((reference))`, avoiding stale text without graph-wide refreshes on
+  ordinary saves. (GH #166)
 - **Graph writes are safer under sync and filesystem races.** New pages, PDF
   artifacts, and demo files use no-replace publication when no baseline exists;
   PDF highlight sidecars are restored or quarantined if their paired annotation

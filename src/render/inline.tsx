@@ -1110,10 +1110,15 @@ function BlockRefView(props: { id: string; label?: string; spanAttrs?: SpanDomAt
     () => resolveBlockBatched(props.id)
   );
   const peek = createPeekBridge(() => insidePeek);
+  // A loaded target shares the editor's reactive node, so references update on
+  // the keystroke without re-resolving every visible uuid after every save. The
+  // backend snapshot remains the fallback for targets outside the working set.
+  const liveTarget = () => doc.byId[props.id];
+  const targetRaw = () => liveTarget()?.raw ?? grp()?.blocks[0].raw;
   // Visible text: an explicit label wins; otherwise the target's first line.
-  const text = () => props.label ?? (grp() ? visibleBody(grp()!.blocks[0].raw)[0] : undefined);
+  const text = () => props.label ?? (targetRaw() ? visibleBody(targetRaw()!)[0] : undefined);
   // Parse the referenced block's text with ITS page's format (org refs render org).
-  const fmt = () => formatForPage(grp()?.page);
+  const fmt = () => liveTarget() ? formatForBlock(props.id) : formatForPage(grp()?.page);
   const annotation = () => {
     const block = grp()?.blocks[0];
     return block ? annotationInfoForBlock(block) : null;
