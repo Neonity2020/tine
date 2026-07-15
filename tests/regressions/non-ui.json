@@ -41,6 +41,81 @@
         "scenario": "backup.restore-cross-filesystem-recovery",
         "failBefore": "proven"
       }
+    },
+    {
+      "id": "REG-PDF-HIGHLIGHT-PAIR-ATOMICITY-001",
+      "title": "A failed PDF annotation-page save restores the highlight sidecar to its exact pre-write state",
+      "family": "data-safety",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": ["all"],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/model.rs"
+        ],
+        "scenario": "pdf.highlight-pair-failure-atomicity",
+        "failBefore": "proven"
+      }
+    },
+    {
+      "id": "REG-ABSENT-FILE-PUBLISH-NOREPLACE-001",
+      "title": "Creating pages PDF artifacts and demo files never replaces an external race winner",
+      "family": "data-safety",
+      "sources": { "issues": [], "commits": [] },
+      "platforms": ["all"],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": ["crates/tine-core/src/model.rs", "crates/tine-core/src/onboarding.rs"],
+        "scenario": "filesystem.absent-publish-no-replace",
+        "failBefore": "source-proven"
+      }
+    },
+    {
+      "id": "REG-GUIDE-COPY-CONTAINMENT-001",
+      "title": "Copy Guide revalidates page and asset targets after managed-directory swaps",
+      "family": "filesystem-safety",
+      "sources": { "issues": [], "commits": [] },
+      "platforms": ["all"],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": ["crates/tine-core/src/model.rs", "crates/tine-core/src/onboarding.rs"],
+        "scenario": "filesystem.guide-copy-containment",
+        "failBefore": "source-proven"
+      }
+    },
+    {
+      "id": "REG-WATCHER-ATOMIC-SAVE-SCOPE-001",
+      "title": "Atomic page-save events reconcile incrementally and never rescan unrelated graphs",
+      "family": "performance",
+      "sources": { "issues": [], "commits": [] },
+      "platforms": ["desktop"],
+      "layer": "native",
+      "status": "covered",
+      "coverage": {
+        "tests": ["src-tauri/src/watcher.rs"],
+        "scenario": "watcher.atomic-save-incremental-scope",
+        "failBefore": "source-proven"
+      }
+    },
+    {
+      "id": "REG-BLOCK-REF-COUNTS-SCOPED-001",
+      "title": "Ordinary non-reference edits reuse the block-reference count index",
+      "family": "performance",
+      "sources": { "issues": [], "commits": [] },
+      "platforms": ["all"],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": ["crates/tine-core/src/model.rs", "src-tauri/src/commands.rs"],
+        "scenario": "references.count-index-scoped-invalidation",
+        "failBefore": "source-proven"
+      }
     }
   ]
 }

@@ -493,6 +493,25 @@ fn page_cache_key(kind: PageKind, name: &str) -> (PageKind, String) {
     (kind, crate::refs::page_key(name))
 }
 
+fn document_block_ref_counts(
+    doc: &Document,
+) -> std::collections::HashMap<String, usize> {
+    fn walk(blocks: &[DocBlock], counts: &mut std::collections::HashMap<String, usize>) {
+        for block in blocks {
+            // projection().block_refs is already de-duplicated per referrer block,
+            // matching the badge's OG-compatible counting semantics.
+            for id in &block.projection().block_refs {
+                *counts.entry(id.clone()).or_insert(0) += 1;
+            }
+            walk(&block.children, counts);
+        }
+    }
+
+    let mut counts = std::collections::HashMap::new();
+    walk(&doc.roots, &mut counts);
+    counts
+}
+
 fn build_page_cache_index(pages: &[(PageEntry, Arc<Document>)]) -> PageCacheIndex {
     let mut index = std::collections::HashMap::with_capacity(pages.len());
     for (i, (entry, _)) in pages.iter().enumerate() {
@@ -1895,6 +1914,7 @@ impl Graph {
         if self.find_entry(name, PageKind::Page).is_some() || path.exists() {
             return Ok(false);
         }
+        self.ensure_write_target(&path)?;
         fs::create_dir_all(self.pages_path())?;
         match atomic_write_new(&path, content.as_bytes()) {
             Ok(()) => {}
@@ -1917,6 +1937,21 @@ impl Graph {
         self.cache_gen
             .fetch_add(1, std::sync::atomic::Ordering::Release);
         Ok(true)
+    }
+
+    /// Create one named top-level asset without replacing an existing file. The
+    /// approved asset capability is revalidated at the actual write target so a
+    /// managed-directory symlink/junction swap cannot redirect this creation.
+    pub(crate) fn create_asset_if_absent(&self, name: &str, bytes: &[u8]) -> io::Result<bool> {
+        top_level_asset_name(name)?;
+        let path = self.assets_path().join(name);
+        self.ensure_asset_write_target(&path)?;
+        fs::create_dir_all(self.assets_path())?;
+        match atomic_write_new(&path, bytes) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     /// Whether BOTH a `.md` and a `.org` file exist for the same logical page —
@@ -2135,38 +2170,43 @@ impl Graph {
     }
 
     /// `block uuid → # of distinct referrer blocks`, over the whole graph, via a
-    /// `cache_gen`-keyed index (same pattern as `block_page_hint`). A referrer is a
+    /// `cache_gen`-keyed index whose generation is advanced across edits that do
+    /// not change the edited page's block-reference projection. A referrer is a
     /// block whose text references the uuid (`((uuid))`, `[..](((uuid)))`, or
     /// `{{embed ((uuid))}}`); multiple refs from one block count once (OG semantics).
-    /// O(graph) to (re)build once per cache change, then O(1) refcount bump.
+    /// O(graph) to build initially or after a reference-bearing edit, then O(1)
+    /// reuse across ordinary edits.
     pub fn block_ref_counts(&self) -> Arc<std::collections::HashMap<String, usize>> {
         use std::sync::atomic::Ordering;
-        let gen = self.cache_gen.load(Ordering::Acquire);
-        if let Some((idx_gen, map)) = self.block_ref_count_cache.read().unwrap().as_ref() {
-            if *idx_gen == gen {
-                return Arc::clone(map);
-            }
-        }
-        fn walk_counts(blocks: &[DocBlock], m: &mut std::collections::HashMap<String, usize>) {
-            for b in blocks {
-                // Dedupe per referrer block: the projection's block_refs is a
-                // de-duplicated list, so each distinct target gets +1 per referrer.
-                for id in &b.projection().block_refs {
-                    *m.entry(id.clone()).or_insert(0) += 1;
+        loop {
+            let gen = self.cache_gen.load(Ordering::Acquire);
+            if let Some((idx_gen, map)) = self.block_ref_count_cache.read().unwrap().as_ref() {
+                if *idx_gen == gen {
+                    return Arc::clone(map);
                 }
-                walk_counts(&b.children, m);
+            }
+
+            let map = self.with_pages(|pages| {
+                let mut counts = std::collections::HashMap::new();
+                for (_entry, doc) in pages {
+                    for (id, count) in document_block_ref_counts(doc) {
+                        *counts.entry(id).or_insert(0) += count;
+                    }
+                }
+                counts
+            });
+            // A save can race the scan. Never publish its old snapshot under the
+            // new generation; retry against the current cache instead.
+            if self.cache_gen.load(Ordering::Acquire) != gen {
+                continue;
+            }
+            let arc = Arc::new(map);
+            let mut cache = self.block_ref_count_cache.write().unwrap();
+            if self.cache_gen.load(Ordering::Acquire) == gen {
+                *cache = Some((gen, Arc::clone(&arc)));
+                return arc;
             }
         }
-        let map = self.with_pages(|pages| {
-            let mut m = std::collections::HashMap::new();
-            for (_entry, doc) in pages {
-                walk_counts(&doc.roots, &mut m);
-            }
-            m
-        });
-        let arc = Arc::new(map);
-        *self.block_ref_count_cache.write().unwrap() = Some((gen, Arc::clone(&arc)));
-        arc
     }
 
     /// Locate a page in the parsed-doc cache by logical `(kind, name)` without
@@ -2538,6 +2578,8 @@ impl Graph {
         // removed — invalidating on every save would make a normal edit an O(P)
         // alias rescan on the next navigation.
         let new_has_alias = doc_has_alias(&doc);
+        let new_block_refs = document_block_ref_counts(&doc);
+        let mut block_refs_touched = false;
         let mut alias_touched = new_has_alias;
         let key = rev_key(entry.kind, &entry.name);
         let doc = Arc::new(doc);
@@ -2554,10 +2596,12 @@ impl Graph {
                 Some(i) => {
                     let slot = &mut pages[i];
                     alias_touched = new_has_alias || doc_has_alias(&slot.1);
+                    block_refs_touched = document_block_ref_counts(&slot.1) != new_block_refs;
                     slot.1 = doc;
                 }
                 None => {
                     is_new_page = true;
+                    block_refs_touched = !new_block_refs.is_empty();
                     let index_key = page_cache_key(entry.kind, &entry.name);
                     pages.push((entry, doc));
                     if let Some(index) = self.cache_index.write().unwrap().as_mut() {
@@ -2591,6 +2635,14 @@ impl Graph {
             .fetch_add(1, std::sync::atomic::Ordering::Release)
             + 1;
         drop(guard);
+        {
+            let mut counts = self.block_ref_count_cache.write().unwrap();
+            if block_refs_touched {
+                *counts = None;
+            } else if let Some((generation, _)) = counts.as_mut() {
+                *generation = newgen;
+            }
+        }
         if alias_touched {
             *self.alias_cache.write().unwrap() = None;
         }
@@ -2674,10 +2726,12 @@ impl Graph {
         *self.advanced_cache.write().unwrap() = None;
         let mut guard = self.cache.write().unwrap();
         let mut alias_touched = false;
+        let mut block_refs_touched = false;
         if let Some(pages) = guard.as_mut() {
             let pages = Arc::make_mut(pages);
             if let Some(i) = self.cached_page_index(pages, kind, name) {
                 alias_touched = doc_has_alias(&pages[i].1);
+                block_refs_touched = !document_block_ref_counts(&pages[i].1).is_empty();
             }
             pages.retain(|(e, _)| !(e.kind == kind && crate::refs::same_page(&e.name, name)));
             // Drop the rev under the cache lock (same cache → disk_revs order as
@@ -2688,9 +2742,19 @@ impl Graph {
         // Bump AFTER the removal is published (under the cache lock), so a reader
         // that loads the new gen is guaranteed to see the page gone — see the
         // gen-after-content note in cache_upsert.
-        self.cache_gen
-            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        let newgen = self
+            .cache_gen
+            .fetch_add(1, std::sync::atomic::Ordering::Release)
+            + 1;
         drop(guard);
+        {
+            let mut counts = self.block_ref_count_cache.write().unwrap();
+            if block_refs_touched {
+                *counts = None;
+            } else if let Some((generation, _)) = counts.as_mut() {
+                *generation = newgen;
+            }
+        }
         if alias_touched {
             *self.alias_cache.write().unwrap() = None;
         }
@@ -3717,8 +3781,15 @@ impl Graph {
                 validate_highlight_edn(&external)?;
                 sidecar = Some(external);
             } else {
-                atomic_write(&sidecar_path, skeleton.as_bytes())?;
-                sidecar = Some(skeleton);
+                match atomic_write_new(&sidecar_path, skeleton.as_bytes()) {
+                    Ok(()) => sidecar = Some(skeleton),
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                        let external = read_optional_text(&sidecar_path)?.ok_or(error)?;
+                        validate_highlight_edn(&external)?;
+                        sidecar = Some(external);
+                    }
+                    Err(error) => return Err(error),
+                }
             }
         }
         let state = crate::pdf::parse_pdf_state(sidecar.as_deref().unwrap_or(""));
@@ -3785,8 +3856,20 @@ impl Graph {
             if read_optional_text(&sidecar_path)? != baseline {
                 continue;
             }
-            atomic_write(&sidecar_path, next.as_bytes())?;
-            return Ok(());
+            let publish = if baseline.is_none() {
+                atomic_write_new(&sidecar_path, next.as_bytes())
+            } else {
+                atomic_write(&sidecar_path, next.as_bytes())
+            };
+            match publish {
+                Ok(()) => return Ok(()),
+                Err(error)
+                    if baseline.is_none() && error.kind() == io::ErrorKind::AlreadyExists =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
         }
         Err(io::Error::new(
             io::ErrorKind::WouldBlock,
@@ -3883,8 +3966,7 @@ impl Graph {
         // config updates. If Logseq/Syncthing changes either the primary or the
         // legacy fallback after our read, retry against those new bytes instead
         // of replacing them with a stale full-file serialization.
-        let mut committed_merged = None;
-        let mut committed_legacy_edn_baseline = None;
+        let mut committed_sidecar = None;
         for _attempt in 0..4 {
             let primary_baseline = read_optional_text(&edn_path)?;
             let legacy_baseline = if primary_baseline.is_none() {
@@ -3925,12 +4007,30 @@ impl Graph {
             {
                 continue;
             }
-            atomic_write(&edn_path, next.as_bytes())?;
-            committed_merged = Some(merged);
-            committed_legacy_edn_baseline = legacy_baseline;
+            let publish = if primary_baseline.is_none() {
+                atomic_write_new(&edn_path, next.as_bytes())
+            } else {
+                atomic_write(&edn_path, next.as_bytes())
+            };
+            match publish {
+                Ok(()) => {}
+                Err(error)
+                    if primary_baseline.is_none()
+                        && error.kind() == io::ErrorKind::AlreadyExists =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+            committed_sidecar = Some((merged, primary_baseline, legacy_baseline, next));
             break;
         }
-        let merged = committed_merged.ok_or_else(|| {
+        let (
+            merged,
+            committed_primary_edn_baseline,
+            committed_legacy_edn_baseline,
+            committed_edn,
+        ) = committed_sidecar.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "highlight sidecar changed repeatedly during update",
@@ -3963,10 +4063,23 @@ impl Graph {
         // On mismatch → conflict; PdfViewer.persist toasts + reverts and a retry merges
         // cleanly (the .edn was already 3-way-merged, so no highlight is lost).
         let page_md = serialize_pdf_hls_page(&page_path, &page_doc, existing_raw.as_deref())?;
-        let page_rev = match self.commit_write(&page_path, &page_md, page_baseline.as_deref(), true)
-        {
+        let page_rev = match self.commit_write(&page_path, &page_md, page_baseline.as_deref(), true) {
             Ok(rev) => rev,
-            Err(e) => return Err(e),
+            Err(page_error) => {
+                if let Err(rollback_error) = self.rollback_highlight_sidecar(
+                    &edn_path,
+                    committed_primary_edn_baseline.as_deref(),
+                    &committed_edn,
+                ) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!(
+                            "highlight notes page was not saved ({page_error}); the sidecar rollback also failed ({rollback_error})"
+                        ),
+                    ));
+                }
+                return Err(page_error);
+            }
         };
         // The hls page is a real page; reflect it in the search cache.
         let name = crate::pdf::hls_page_name(&key);
@@ -4090,6 +4203,50 @@ impl Graph {
         }
     }
 
+    /// Restore a PDF highlight sidecar after the paired `hls__` page failed to
+    /// commit. The sidecar is restored only while it still contains the exact
+    /// bytes this call published; a later external edit is never knowingly
+    /// replaced. A newly-created sidecar is moved to recoverable conflict trash
+    /// rather than hard-deleted.
+    fn rollback_highlight_sidecar(
+        &self,
+        path: &Path,
+        baseline: Option<&str>,
+        committed: &str,
+    ) -> io::Result<()> {
+        if read_optional_text(path)?.as_deref() != Some(committed) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "highlight sidecar changed after its commit",
+            ));
+        }
+        if let Some(previous) = baseline {
+            return atomic_write(path, previous.as_bytes());
+        }
+
+        let trash = typed_trash_dir(&self.root, TrashEntryKind::Conflict);
+        self.ensure_write_target(&trash)?;
+        fs::create_dir_all(&trash)?;
+        let name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("highlights.edn");
+        let destination = trash.join(format!(
+            "{}__failed-highlight-pair__{name}",
+            trash_stamp()
+        ));
+        move_file_noreplace(path, &destination)?;
+        if read_optional_text(&destination)?.as_deref() == Some(committed) {
+            return Ok(());
+        }
+
+        let _ = move_file_noreplace(&destination, path);
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "highlight sidecar changed during rollback",
+        ))
+    }
+
     /// The shared page-write commit protocol, written ONCE so `write_page` and
     /// `write_highlights` can't drift apart on it (a missed step = a stale marker
     /// suppressing a real external edit, or a phantom conflict):
@@ -4110,25 +4267,34 @@ impl Graph {
     ) -> io::Result<String> {
         let rev = content_rev(content);
         self.note_self_write(path, rev.clone());
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        if recheck {
-            // Only NotFound means "no baseline file". Permission errors, invalid
-            // UTF-8, and transient I/O failures must abort; collapsing them to
-            // None would authorize an overwrite of unreadable on-disk data.
-            let now = read_optional_text(path)?;
-            let still_matches = match (now.as_deref(), baseline) {
-                (Some(n), Some(e)) => n == e,
-                (None, None) => true,
-                _ => false,
-            };
-            if !still_matches {
-                self.drop_self_write_marker(path, &rev);
-                return Err(io::Error::new(io::ErrorKind::AlreadyExists, "conflict"));
+        let result = (|| {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
             }
+            if recheck {
+                // Only NotFound means "no baseline file". Permission errors, invalid
+                // UTF-8, and transient I/O failures must abort; collapsing them to
+                // None would authorize an overwrite of unreadable on-disk data.
+                let now = read_optional_text(path)?;
+                let still_matches = match (now.as_deref(), baseline) {
+                    (Some(n), Some(e)) => n == e,
+                    (None, None) => true,
+                    _ => false,
+                };
+                if !still_matches {
+                    return Err(io::Error::new(io::ErrorKind::AlreadyExists, "conflict"));
+                }
+            }
+            if baseline.is_none() {
+                atomic_write_new(path, content.as_bytes())
+            } else {
+                atomic_write(path, content.as_bytes())
+            }
+        })();
+        if let Err(error) = result {
+            self.drop_self_write_marker(path, &rev);
+            return Err(error);
         }
-        atomic_write(path, content.as_bytes())?;
         Ok(rev)
     }
 
@@ -5423,7 +5589,7 @@ fn move_file_noreplace(src: &Path, dest: &Path) -> io::Result<()> {
 /// Atomically publish a newly-created file without clobbering a destination that
 /// appeared after the caller's collision check. The payload is fsynced in a
 /// same-directory temp, then atomically renamed into the final name only if absent.
-fn atomic_write_new(path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub(crate) fn atomic_write_new(path: &Path, bytes: &[u8]) -> io::Result<()> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
@@ -6402,6 +6568,41 @@ mod tests {
         assert!(
             std::sync::Arc::ptr_eq(&first, &second),
             "re-entering block_ref_counts should reuse the warmed Arc"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn non_reference_edit_reuses_block_ref_count_index() {
+        let dir = scratch("block-ref-count-scoped");
+        fs::write(
+            dir.join("pages").join("Target.md"),
+            "- target\n  id:: aaaaaaaa-0000-0000-0000-000000000001\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("pages").join("Refs.md"),
+            "- see ((aaaaaaaa-0000-0000-0000-000000000001))\n",
+        )
+        .unwrap();
+
+        let g = Graph::open(&dir);
+        g.warm_cache();
+        let before = g.block_ref_counts();
+        let mut target = g.load_named("Target", PageKind::Page).unwrap().unwrap();
+        target.blocks[0].raw = "target edited without changing references".into();
+        g.save_page(&target, target.rev.as_deref()).unwrap();
+        let after = g.block_ref_counts();
+
+        assert!(
+            Arc::ptr_eq(&before, &after),
+            "a non-reference edit must retain the already-built whole-graph count map"
+        );
+        assert_eq!(
+            after
+                .get("aaaaaaaa-0000-0000-0000-000000000001")
+                .copied(),
+            Some(1)
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -7409,6 +7610,88 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
         assert_eq!(fs::read_to_string(&sidecar_path).unwrap(), original);
         assert_eq!(fs::read_to_string(&page_path).unwrap(), "* a\n*** c\n");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_highlights_rolls_back_sidecar_when_notes_page_commit_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = scratch("highlights-page-commit-rollback");
+        let g = Graph::open(&dir);
+        let key = crate::pdf::asset_key("paper.pdf");
+        let page_path = dir.join("pages").join(format!("hls__{key}.md"));
+        let page_before = "- Existing annotation note\n";
+        fs::write(&page_path, page_before).unwrap();
+        let sidecar_path = dir.join("assets").join(format!("{key}.edn"));
+        fs::create_dir_all(dir.join("assets")).unwrap();
+        let sidecar_before = "{:highlights [] :extra {:plugin \"keep\"}}\n";
+        fs::write(&sidecar_path, sidecar_before).unwrap();
+        let h = mkhl(
+            "11111111-1111-1111-1111-111111111111",
+            1,
+            Some("text"),
+        );
+
+        let pages = dir.join("pages");
+        let original_permissions = fs::metadata(&pages).unwrap().permissions();
+        let mut read_only = original_permissions.clone();
+        read_only.set_mode(0o555);
+        fs::set_permissions(&pages, read_only).unwrap();
+        let result = g.write_highlights("paper.pdf", "Paper", &[h], &[]);
+        fs::set_permissions(&pages, original_permissions).unwrap();
+
+        assert!(result.is_err(), "the notes-page commit must fail in a read-only directory");
+        assert_eq!(fs::read_to_string(&sidecar_path).unwrap(), sidecar_before);
+        assert_eq!(fs::read_to_string(&page_path).unwrap(), page_before);
+        assert!(
+            !g.recent_writes.lock().unwrap().contains_key(&page_path),
+            "a failed page commit must not leave a stale watcher suppression marker"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_highlights_quarantines_new_sidecar_when_notes_page_commit_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = scratch("highlights-new-sidecar-page-failure");
+        let g = Graph::open(&dir);
+        let key = crate::pdf::asset_key("paper.pdf");
+        let page_path = dir.join("pages").join(format!("hls__{key}.md"));
+        let page_before = "- Existing annotation note\n";
+        fs::write(&page_path, page_before).unwrap();
+        fs::create_dir_all(dir.join("assets")).unwrap();
+        let sidecar_path = dir.join("assets").join(format!("{key}.edn"));
+        let h = mkhl(
+            "11111111-1111-1111-1111-111111111111",
+            1,
+            Some("text"),
+        );
+
+        let pages = dir.join("pages");
+        let original_permissions = fs::metadata(&pages).unwrap().permissions();
+        let mut read_only = original_permissions.clone();
+        read_only.set_mode(0o555);
+        fs::set_permissions(&pages, read_only).unwrap();
+        let result = g.write_highlights("paper.pdf", "Paper", &[h], &[]);
+        fs::set_permissions(&pages, original_permissions).unwrap();
+
+        assert!(result.is_err());
+        assert!(!sidecar_path.exists(), "the failed pair must leave the primary target absent");
+        assert_eq!(fs::read_to_string(&page_path).unwrap(), page_before);
+        let trash = typed_trash_dir(&dir, TrashEntryKind::Conflict);
+        assert!(
+            fs::read_dir(trash).unwrap().flatten().any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("failed-highlight-pair")
+            }),
+            "the exact new sidecar remains recoverable in conflict trash"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

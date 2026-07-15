@@ -10,6 +10,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Graph writes are safer under sync and filesystem races.** New pages, PDF
+  artifacts, and demo files use no-replace publication when no baseline exists;
+  PDF highlight sidecars are restored or quarantined if their paired annotation
+  page fails; and Copy Guide rechecks page and asset containment at write time.
+- **Settled edits avoid two graph-sized background costs.** Tine's own atomic-save
+  temp events stay on the incremental watcher path and are scoped to their owning
+  graph, while edits that do not alter block references reuse the existing badge
+  count index; any necessary rebuild now runs off the command thread.
+- **Broken audio and MKV fallback is memory-bounded.** Whole-file fallback is
+  limited to one active embed with lower size ceilings and no redundant
+  JavaScript copy; normal media remains range-streamed and larger files retain
+  the external-player escape hatch.
 - **Plasma Wayland task switchers now resolve Tine's icon for standalone
   binaries.** Tine replaces GTK's executable-name fallback only after the
   Wayland top-level exists, while retaining the compatible post-map update for

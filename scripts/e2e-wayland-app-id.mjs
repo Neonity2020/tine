@@ -67,16 +67,22 @@ async function waitFor(predicate, timeoutMs, message) {
   throw new Error(message);
 }
 
-function stopGroup(child) {
+async function stopGroup(child) {
   if (!child || child.exitCode !== null) return;
+  const exited = () => new Promise((resolve) => {
+    if (child.exitCode !== null) resolve();
+    else child.once("exit", resolve);
+  });
   try {
     process.kill(-child.pid, "SIGTERM");
   } catch {}
-  setTimeout(() => {
+  await Promise.race([exited(), delay(1_000)]);
+  if (child.exitCode === null) {
     try {
       process.kill(-child.pid, "SIGKILL");
     } catch {}
-  }, 1_000).unref();
+    await Promise.race([exited(), delay(1_000)]);
+  }
 }
 
 const compositor = spawn(
@@ -155,7 +161,14 @@ try {
   );
   console.log("Wayland app ID OK: page.tine.Tine before the first visible buffer");
 } finally {
-  stopGroup(client);
-  stopGroup(compositor);
-  fs.rmSync(runtime, { recursive: true, force: true });
+  await stopGroup(client);
+  await stopGroup(compositor);
+  try {
+    fs.rmSync(runtime, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  } catch (error) {
+    // The runtime is unique to this process and contains no user data. A late
+    // portal helper can briefly recreate an entry during shutdown; cleanup must
+    // not turn a successful wire-level identity proof into an application failure.
+    console.warn(`Wayland runtime cleanup deferred: ${error}`);
+  }
 }

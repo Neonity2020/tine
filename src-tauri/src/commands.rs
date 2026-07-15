@@ -192,10 +192,13 @@ pub(crate) fn get_unlinked_refs(
 /// reference-count badge). Small map (only referenced uuids); fetched once per
 /// graph generation by the frontend.
 #[tauri::command]
-pub(crate) fn block_ref_counts(
+pub(crate) async fn block_ref_counts(
     state: GraphContext<'_>,
 ) -> Result<Arc<std::collections::HashMap<String, usize>>, String> {
-    with_graph(&state, |g| Ok(g.block_ref_counts()))
+    let graph = Arc::clone(&slot_for_context(&state)?.graph);
+    tauri::async_runtime::spawn_blocking(move || graph.block_ref_counts())
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// The blocks that reference block `uuid`, grouped by page (the badge's referrers

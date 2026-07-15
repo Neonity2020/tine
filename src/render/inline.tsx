@@ -816,6 +816,19 @@ function renderImgMacro(body: string): JSX.Element {
 // controls>), and on a media error — typically WebKitGTK lacking the mp4/h264
 // codec — fall back to a click-to-open chip that launches the OS default player.
 // Matches the user's "inline when it works, otherwise open externally" intent.
+const AUDIO_BLOB_FALLBACK_MAX_BYTES = 64 * 1024 * 1024;
+const VIDEO_BLOB_FALLBACK_MAX_BYTES = 128 * 1024 * 1024;
+const MEDIA_BLOB_FALLBACK_TOTAL_MAX_BYTES = 128 * 1024 * 1024;
+let mediaBlobFallbackRetainedBytes = 0;
+let mediaBlobFallbackQueue: Promise<void> = Promise.resolve();
+
+function enqueueMediaBlobFallback(task: () => Promise<void>): void {
+  const queued = mediaBlobFallbackQueue.then(task, task);
+  // A failed item must not poison later fallbacks. Each component handles its
+  // own failure state; this tail exists only to serialize whole-file reads.
+  mediaBlobFallbackQueue = queued.catch(() => {});
+}
+
 function MediaEmbed(props: {
   url: string;
   kind: "video" | "audio";
@@ -846,8 +859,21 @@ function MediaEmbed(props: {
   };
   let tryingBlobFallback = false;
   let ownedBlobUrl = "";
+  let ownedBlobBytes = 0;
+  let disposed = false;
+  const releaseBlobFallback = () => {
+    if (ownedBlobUrl) {
+      URL.revokeObjectURL(ownedBlobUrl);
+      ownedBlobUrl = "";
+    }
+    if (ownedBlobBytes) {
+      mediaBlobFallbackRetainedBytes = Math.max(0, mediaBlobFallbackRetainedBytes - ownedBlobBytes);
+      ownedBlobBytes = 0;
+    }
+  };
   onCleanup(() => {
-    if (ownedBlobUrl) URL.revokeObjectURL(ownedBlobUrl);
+    disposed = true;
+    releaseBlobFallback();
   });
   const onMediaError = () => {
     const r = rel();
@@ -859,7 +885,6 @@ function MediaEmbed(props: {
     const canRetry = props.kind === "audio" || r?.toLowerCase().endsWith(".mkv");
     if (!external && r && canRetry && !tryingBlobFallback && !blobFallback()) {
       tryingBlobFallback = true;
-      const maxBytes = props.kind === "audio" ? 256 * 1024 * 1024 : 512 * 1024 * 1024;
       const ext = r.split(".").pop()?.toLowerCase();
       const mime = props.kind === "video" ? "video/x-matroska" :
         ext === "mp3" || ext === "mpeg" ? "audio/mpeg" :
@@ -868,12 +893,33 @@ function MediaEmbed(props: {
         ext === "ogg" || ext === "oga" ? "audio/ogg" :
         ext === "opus" ? "audio/opus" :
         ext === "flac" ? "audio/flac" : "application/octet-stream";
-      void backend().readAsset(r, maxBytes).then((bytes) => {
-        ownedBlobUrl = URL.createObjectURL(new Blob([Uint8Array.from(bytes).buffer], { type: mime }));
-        setBlobFallback(ownedBlobUrl);
-      }).catch(() => setFailed(true));
+      enqueueMediaBlobFallback(async () => {
+        if (disposed) return;
+        try {
+          const perFileMax = props.kind === "audio"
+            ? AUDIO_BLOB_FALLBACK_MAX_BYTES
+            : VIDEO_BLOB_FALLBACK_MAX_BYTES;
+          // Serialize reads and pass only the remaining global allowance to
+          // Rust. Peak retained + in-flight bytes therefore cannot exceed the
+          // global budget, while several small media embeds can still play.
+          const remaining = MEDIA_BLOB_FALLBACK_TOTAL_MAX_BYTES - mediaBlobFallbackRetainedBytes;
+          if (remaining <= 0) throw new Error("media blob fallback budget exhausted");
+          const bytes = await backend().readAsset(r, Math.min(perFileMax, remaining));
+          if (disposed) return;
+          ownedBlobBytes = bytes.byteLength;
+          mediaBlobFallbackRetainedBytes += ownedBlobBytes;
+          // `bytes` is already a full Uint8Array view over Tauri's raw ArrayBuffer.
+          // Reuse that backing store instead of the previous full-file Uint8Array.from copy.
+          ownedBlobUrl = URL.createObjectURL(new Blob([bytes.buffer as ArrayBuffer], { type: mime }));
+          setBlobFallback(ownedBlobUrl);
+        } catch {
+          releaseBlobFallback();
+          if (!disposed) setFailed(true);
+        }
+      });
       return;
     }
+    releaseBlobFallback();
     setFailed(true);
   };
 

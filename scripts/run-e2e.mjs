@@ -131,6 +131,17 @@ function isRetryableDriverTransportFailure(output, errors, timedOut) {
     && /(UND_ERR_SOCKET|ECONNREFUSED|ECONNRESET|socket hang up)/.test(combined);
 }
 
+function isRetryableNativeHarnessFailure(id, output, errors, timedOut) {
+  if (timedOut || id !== "capture") return false;
+  const combined = `${output}\n${errors}`;
+  // Hosted Openbox occasionally leaves its active-window property pointing at
+  // a frame destroyed during the short single-instance forwarder's teardown.
+  // Retry the entire isolated scenario once; the second run must still prove
+  // first-show native + DOM focus and save real keyboard input.
+  return /BadWindow \(invalid Window parameter\)/.test(combined)
+    && /Quick Capture never received native focus/.test(combined);
+}
+
 function archiveInfrastructureAttempt(dir, attempt) {
   const archive = path.join(dir, `infrastructure-attempt-${attempt}`);
   fs.mkdirSync(archive, { recursive: true });
@@ -193,8 +204,13 @@ async function runScenario([id, script, extraEnv]) {
     const output = fs.readFileSync(path.join(dir, "stdout.log"), "utf8");
     const errors = fs.readFileSync(path.join(dir, "stderr.log"), "utf8");
     const status = result.code === 0 && !timedOut ? "passed" : "failed";
-    if (status === "failed" && attempt === 1 && isRetryableDriverTransportFailure(output, errors, timedOut)) {
-      process.stdout.write(`RETRY ${id}: WebDriver session transport failed before app assertions; retaining attempt 1\n`);
+    const retryDriver = isRetryableDriverTransportFailure(output, errors, timedOut);
+    const retryNativeHarness = isRetryableNativeHarnessFailure(id, output, errors, timedOut);
+    if (status === "failed" && attempt === 1 && (retryDriver || retryNativeHarness)) {
+      const reason = retryDriver
+        ? "WebDriver session transport failed before app assertions"
+        : "hosted X11 active-window state raced a destroyed transient frame";
+      process.stdout.write(`RETRY ${id}: ${reason}; retaining attempt 1\n`);
       process.stdout.write(`${output.slice(-1200)}\n${errors.slice(-1200)}\n`);
       archiveInfrastructureAttempt(dir, attempt);
       continue;
