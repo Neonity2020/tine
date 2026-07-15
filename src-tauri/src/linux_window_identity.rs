@@ -14,7 +14,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use gtk::{gdk::prelude::DisplayExtManual, glib::translate::ToGlibPtr, prelude::WidgetExt};
+use gtk::{
+    gdk::prelude::DisplayExtManual,
+    glib::{prelude::ObjectExt, translate::ToGlibPtr},
+    prelude::WidgetExt,
+};
 
 const APP_ID: &str = "page.tine.Tine";
 const DESKTOP_FILE: &str = "page.tine.Tine.desktop";
@@ -180,10 +184,7 @@ pub(crate) fn install_desktop_identity() {
     }
 }
 
-fn set_wayland_app_id(window: &gtk::ApplicationWindow) {
-    let Some(gdk_window) = window.window() else {
-        return;
-    };
+fn set_wayland_app_id(gdk_window: &gtk::gdk::Window) {
     let app_id = CString::new(APP_ID).expect("static app ID has no NUL");
     // SAFETY: this runs on GTK's main thread, only for a GDK Wayland display,
     // and `gdk_window` remains alive for the duration of the call.
@@ -194,9 +195,50 @@ fn set_wayland_app_id(window: &gtk::ApplicationWindow) {
     }
 }
 
+fn attach_to_gdk_window(gdk_window: &gtk::gdk::Window) {
+    // If the xdg_toplevel already exists (for example, a dynamically-created
+    // graph window built visible), update it immediately.
+    set_wayland_app_id(gdk_window);
+
+    // GtkWidget::realize only creates the GdkWindow. GTK creates the Wayland
+    // xdg_toplevel later, while mapping it, and silently ignores
+    // gdk_wayland_window_set_application_id before that point. This GDK signal
+    // is emitted after the xdg_toplevel exists and before its first surface
+    // commit, immediately after GTK has assigned its executable-name fallback.
+    // It was added late in GTK 3.24, so look it up rather than panicking on
+    // older supported WebKitGTK stacks.
+    if let Some(signal) =
+        gtk::glib::subclass::SignalId::lookup("xdg-toplevel-realized", gdk_window.type_())
+    {
+        let gdk_window = gdk_window.clone();
+        gdk_window
+            .clone()
+            .connect_local_id(signal, None, false, move |_| {
+                set_wayland_app_id(&gdk_window);
+                None
+            });
+    }
+}
+
+fn attach_to_gtk_window(window: &gtk::ApplicationWindow) {
+    if let Some(gdk_window) = window.window() {
+        attach_to_gdk_window(&gdk_window);
+    }
+}
+
+fn set_mapped_wayland_app_id(window: &gtk::ApplicationWindow) {
+    if let Some(gdk_window) = window.window() {
+        // xdg-shell explicitly permits changing app_id after mapping. This is
+        // the compatibility path for GTK versions without
+        // xdg-toplevel-realized, and a harmless verification update otherwise.
+        set_wayland_app_id(&gdk_window);
+    }
+}
+
 /// Give a Tauri top-level window the stable Wayland identity whose desktop entry
 /// supplies Tine's icon. The configured windows are usually realized by setup;
-/// the signal path covers dynamically-created and future lazily-realized ones.
+/// the signal paths cover dynamically-created, lazily-realized, and older GTK
+/// windows whose xdg_toplevel appears only while mapping.
 pub(crate) fn apply_to_window(window: &tauri::WebviewWindow) {
     let Ok(gtk_window) = window.gtk_window() else {
         return;
@@ -205,9 +247,13 @@ pub(crate) fn apply_to_window(window: &tauri::WebviewWindow) {
         return;
     }
     if gtk_window.is_realized() {
-        set_wayland_app_id(&gtk_window);
+        attach_to_gtk_window(&gtk_window);
     } else {
-        gtk_window.connect_realize(set_wayland_app_id);
+        gtk_window.connect_realize(attach_to_gtk_window);
+    }
+    gtk_window.connect_map(set_mapped_wayland_app_id);
+    if gtk_window.is_mapped() {
+        set_mapped_wayland_app_id(&gtk_window);
     }
 }
 

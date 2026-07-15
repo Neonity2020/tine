@@ -47,6 +47,16 @@ requireMatch(
 );
 requireMatch(
   identity,
+  /SignalId::lookup\("xdg-toplevel-realized"[\s\S]*connect_local_id[\s\S]*set_wayland_app_id/,
+  "newer GTK Wayland windows do not assign the app ID before the first surface commit",
+);
+requireMatch(
+  identity,
+  /connect_map\(set_mapped_wayland_app_id\)/,
+  "older GTK Wayland windows do not update the app ID after xdg_toplevel mapping",
+);
+requireMatch(
+  identity,
   /page\.tine\.Tine\.desktop[\s\S]*Icon=page\.tine\.Tine/,
   "raw Linux runs do not provide the desktop entry used for Wayland icon lookup",
 );

@@ -55,6 +55,7 @@ const suites = {
     ["sheets", "scripts/e2e-sheets.mjs", {}],
   ],
   "linux-release": [
+    ["wayland-app-id", "scripts/e2e-wayland-app-id.mjs", {}],
     ["caret-agenda", "scripts/e2e-caret.mjs", { CARET_MODE: "agenda", CARET_LABEL: "runner" }],
     ["caret-page", "scripts/e2e-caret.mjs", { CARET_MODE: "page", CARET_LABEL: "runner" }],
     ["click-caret", "scripts/e2e-clickcaret-repro.mjs", {}],
@@ -161,7 +162,7 @@ async function runScenario([id, script, extraEnv]) {
       TAURI_DRIVER: process.env.TAURI_DRIVER || "tauri-driver",
       WEBKIT_DRIVER: process.env.WEBKIT_DRIVER || "/usr/bin/WebKitWebDriver",
     };
-    const nativeLinux = process.platform === "linux" && id !== "selection-wrap";
+    const nativeLinux = process.platform === "linux" && id !== "selection-wrap" && id !== "wayland-app-id";
     // Tauri's Linux single-instance plugin owns a well-known session-bus name.
     // Give each native scenario a private bus so a slow WebKit/Tauri teardown
     // cannot forward the next scenario into the previous app. Processes spawned

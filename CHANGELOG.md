@@ -8,6 +8,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+### Fixed
+
+- **Plasma Wayland task switchers now resolve Tine's icon for standalone
+  binaries.** Tine replaces GTK's executable-name fallback only after the
+  Wayland top-level exists, while retaining the compatible post-map update for
+  older GTK 3.24 runtimes; the advertised ID now matches the installed desktop
+  entry before the first visible buffer.
+
 ## [0.5.9] - 2026-07-14
 
 ### Added
