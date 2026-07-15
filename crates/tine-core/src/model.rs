@@ -205,6 +205,16 @@ pub struct RefGroup {
     pub evidence: Vec<ReferenceBlockEvidence>,
 }
 
+/// Cache-friendly bounded result metadata. The groups stay behind one `Arc` so
+/// routine frontend refreshes can reuse the generation-scoped native result
+/// without a deep clone while preserving the construction ceiling's outcome.
+#[derive(Debug, Clone)]
+pub struct BoundedRefGroups {
+    pub groups: Arc<Vec<RefGroup>>,
+    pub total: usize,
+    pub exceeded: bool,
+}
+
 /// A deliberately bounded block-reference hover preview. Ordinary query,
 /// reference, and batched-resolution results carry shallow block identities;
 /// callers that genuinely need a subtree must ask for one explicitly and give
@@ -549,7 +559,7 @@ struct DerivedCache {
     today: i64,
     // `Arc<Vec<RefGroup>>` so serving a memoized result (every dataRev re-render)
     // is a refcount bump, not a deep clone of every matched block (see derived_memo).
-    results: std::collections::HashMap<String, (Arc<Vec<RefGroup>>, usize)>,
+    results: std::collections::HashMap<String, (BoundedRefGroups, usize)>,
     lru: std::collections::VecDeque<String>,
     bytes: usize,
 }
@@ -557,9 +567,16 @@ struct DerivedCache {
 struct AdvancedCache {
     gen: u64,
     today: i64,
-    results: std::collections::HashMap<String, (Arc<crate::query::AdvancedResult>, usize)>,
+    results: std::collections::HashMap<String, (CachedAdvancedResult, usize)>,
     lru: std::collections::VecDeque<String>,
     bytes: usize,
+}
+
+#[derive(Clone)]
+struct CachedAdvancedResult {
+    result: Arc<crate::query::AdvancedResult>,
+    total: usize,
+    exceeded: bool,
 }
 
 // Query results contain owned DTO subtrees and can be close to graph-sized. A
@@ -632,7 +649,7 @@ fn touch_lru(lru: &mut std::collections::VecDeque<String>, key: &str) {
 }
 
 fn prune_result_cache<T>(
-    results: &mut std::collections::HashMap<String, (Arc<T>, usize)>,
+    results: &mut std::collections::HashMap<String, (T, usize)>,
     lru: &mut std::collections::VecDeque<String>,
     bytes: &mut usize,
 ) {
@@ -990,6 +1007,23 @@ impl Graph {
             page_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
             search_lanes: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Construct a read-only graph projection from one caller-owned document
+    /// snapshot. The empty `root` is only a fail-closed fallback: whole-graph
+    /// consumers use the preinstalled cache and page list, so they can never
+    /// mix these documents with a later revision from the live graph.
+    pub(crate) fn from_page_snapshot(
+        root: impl AsRef<Path>,
+        pages: Vec<(PageEntry, Arc<Document>)>,
+    ) -> Graph {
+        let graph = Graph::open(root);
+        let entries = pages.iter().map(|(entry, _)| entry.clone()).collect();
+        let index = build_page_cache_index(&pages);
+        *graph.cache.write().unwrap() = Some(Arc::new(pages));
+        *graph.cache_index.write().unwrap() = Some(index);
+        *graph.page_list_cache.write().unwrap() = Some((0, entries));
+        graph
     }
 
     /// The write lock for a resolved page path (see `page_locks`). Returns an
@@ -2777,6 +2811,7 @@ impl Graph {
             // Evict iff this page is already in the result OR now matches the key's
             // predicate; keep (still correct) otherwise.
             if result
+                .groups
                 .iter()
                 .any(|grp| crate::refs::same_page(&grp.page, pname))
             {
@@ -2784,9 +2819,29 @@ impl Graph {
                 return false;
             }
             let affects = match key.split_once('\0') {
-                Some(("b", t)) => crate::query::page_affects_backlinks(&aliases, t, entry, doc),
-                Some(("u", t)) => crate::query::page_affects_unlinked(&aliases, t, doc),
-                Some(("q", s)) => crate::query::page_affects_query(s, entry, doc),
+                Some(("b", target)) => {
+                    crate::query::page_affects_backlinks(&aliases, target, entry, doc)
+                }
+                Some(("u", target)) => {
+                    crate::query::page_affects_unlinked(&aliases, target, doc)
+                }
+                Some(("q", source)) => crate::query::page_affects_query(source, entry, doc),
+                Some(("B", rest)) => rest
+                    .splitn(3, '\0')
+                    .nth(2)
+                    .is_none_or(|target| {
+                        crate::query::page_affects_backlinks(&aliases, target, entry, doc)
+                    }),
+                Some(("U", rest)) => rest
+                    .splitn(3, '\0')
+                    .nth(2)
+                    .is_none_or(|target| {
+                        crate::query::page_affects_unlinked(&aliases, target, doc)
+                    }),
+                Some(("Q", rest)) => rest
+                    .splitn(3, '\0')
+                    .nth(2)
+                    .is_none_or(|source| crate::query::page_affects_query(source, entry, doc)),
                 _ => true, // unknown key shape → evict to stay safe
             };
             if affects {
@@ -2845,11 +2900,11 @@ impl Graph {
     /// `key`. On a tag mismatch the whole cache is dropped, so a hit is always
     /// consistent with the current graph. `compute` runs with NO lock held (it
     /// takes the cache read lock itself), so it can't deadlock against `with_pages`.
-    fn derived_memo(
+    fn derived_memo_bounded(
         &self,
         key: String,
-        compute: impl FnOnce() -> Vec<RefGroup>,
-    ) -> Arc<Vec<RefGroup>> {
+        compute: impl FnOnce() -> crate::query::BoundedGroups,
+    ) -> BoundedRefGroups {
         use std::sync::atomic::Ordering;
         let gen = self.cache_gen.load(Ordering::Acquire);
         let today = crate::date::JournalDate::today().ordinal_key();
@@ -2858,15 +2913,20 @@ impl Graph {
             if let Some(dc) = g.as_mut() {
                 if dc.gen == gen && dc.today == today {
                     if let Some((r, _)) = dc.results.get(&key) {
-                        let result = Arc::clone(r);
+                        let result = r.clone();
                         touch_lru(&mut dc.lru, &key);
                         return result;
                     }
                 }
             }
         }
-        let result = Arc::new(compute());
-        let result_bytes = ref_groups_estimated_bytes(result.as_slice());
+        let computed = compute();
+        let result = BoundedRefGroups {
+            groups: Arc::new(computed.groups),
+            total: computed.total,
+            exceeded: computed.exceeded,
+        };
+        let result_bytes = ref_groups_estimated_bytes(result.groups.as_slice());
         if result_bytes > DERIVED_CACHE_MAX_ENTRY_BYTES {
             return result;
         }
@@ -2875,7 +2935,7 @@ impl Graph {
             Some(dc) if dc.gen == gen && dc.today == today => {
                 if let Some((_, old_bytes)) = dc
                     .results
-                    .insert(key.clone(), (Arc::clone(&result), result_bytes))
+                    .insert(key.clone(), (result.clone(), result_bytes))
                 {
                     dc.bytes = dc.bytes.saturating_sub(old_bytes);
                 }
@@ -2885,8 +2945,85 @@ impl Graph {
             }
             _ => {
                 let mut results = std::collections::HashMap::new();
-                results.insert(key.clone(), (Arc::clone(&result), result_bytes));
+                results.insert(key.clone(), (result.clone(), result_bytes));
                 *g = Some(DerivedCache {
+                    gen,
+                    today,
+                    results,
+                    lru: std::collections::VecDeque::from([key]),
+                    bytes: result_bytes,
+                });
+            }
+        }
+        result
+    }
+
+    fn derived_memo(
+        &self,
+        key: String,
+        compute: impl FnOnce() -> Vec<RefGroup>,
+    ) -> Arc<Vec<RefGroup>> {
+        self.derived_memo_bounded(key, || {
+            let groups = compute();
+            let total = groups.iter().map(|group| group.blocks.len()).sum();
+            crate::query::BoundedGroups {
+                groups,
+                total,
+                exceeded: false,
+            }
+        })
+        .groups
+    }
+
+    fn advanced_memo_bounded(
+        &self,
+        key: String,
+        compute: impl FnOnce() -> (crate::query::AdvancedResult, bool, usize),
+    ) -> CachedAdvancedResult {
+        use std::sync::atomic::Ordering;
+        let gen = self.cache_gen.load(Ordering::Acquire);
+        let today = crate::date::JournalDate::today().ordinal_key();
+        {
+            let mut g = self.advanced_cache.write().unwrap();
+            if let Some(dc) = g.as_mut() {
+                if dc.gen == gen && dc.today == today {
+                    if let Some((r, _)) = dc.results.get(&key) {
+                        let result = r.clone();
+                        touch_lru(&mut dc.lru, &key);
+                        return result;
+                    }
+                }
+            }
+        }
+        let (computed, exceeded, total) = compute();
+        let result = CachedAdvancedResult {
+            result: Arc::new(computed),
+            total,
+            exceeded,
+        };
+        let result_bytes = ref_groups_estimated_bytes(&result.result.groups)
+            + result.result.ran.iter().map(String::len).sum::<usize>()
+            + result.result.ignored.iter().map(String::len).sum::<usize>();
+        if result_bytes > DERIVED_CACHE_MAX_ENTRY_BYTES {
+            return result;
+        }
+        let mut g = self.advanced_cache.write().unwrap();
+        match g.as_mut() {
+            Some(dc) if dc.gen == gen && dc.today == today => {
+                if let Some((_, old_bytes)) = dc
+                    .results
+                    .insert(key.clone(), (result.clone(), result_bytes))
+                {
+                    dc.bytes = dc.bytes.saturating_sub(old_bytes);
+                }
+                dc.bytes = dc.bytes.saturating_add(result_bytes);
+                touch_lru(&mut dc.lru, &key);
+                prune_result_cache(&mut dc.results, &mut dc.lru, &mut dc.bytes);
+            }
+            _ => {
+                let mut results = std::collections::HashMap::new();
+                results.insert(key.clone(), (result.clone(), result_bytes));
+                *g = Some(AdvancedCache {
                     gen,
                     today,
                     results,
@@ -2903,54 +3040,12 @@ impl Graph {
         key: String,
         compute: impl FnOnce() -> crate::query::AdvancedResult,
     ) -> Arc<crate::query::AdvancedResult> {
-        use std::sync::atomic::Ordering;
-        let gen = self.cache_gen.load(Ordering::Acquire);
-        let today = crate::date::JournalDate::today().ordinal_key();
-        {
-            let mut g = self.advanced_cache.write().unwrap();
-            if let Some(dc) = g.as_mut() {
-                if dc.gen == gen && dc.today == today {
-                    if let Some((r, _)) = dc.results.get(&key) {
-                        let result = Arc::clone(r);
-                        touch_lru(&mut dc.lru, &key);
-                        return result;
-                    }
-                }
-            }
-        }
-        let result = Arc::new(compute());
-        let result_bytes = ref_groups_estimated_bytes(&result.groups)
-            + result.ran.iter().map(String::len).sum::<usize>()
-            + result.ignored.iter().map(String::len).sum::<usize>();
-        if result_bytes > DERIVED_CACHE_MAX_ENTRY_BYTES {
-            return result;
-        }
-        let mut g = self.advanced_cache.write().unwrap();
-        match g.as_mut() {
-            Some(dc) if dc.gen == gen && dc.today == today => {
-                if let Some((_, old_bytes)) = dc
-                    .results
-                    .insert(key.clone(), (Arc::clone(&result), result_bytes))
-                {
-                    dc.bytes = dc.bytes.saturating_sub(old_bytes);
-                }
-                dc.bytes = dc.bytes.saturating_add(result_bytes);
-                touch_lru(&mut dc.lru, &key);
-                prune_result_cache(&mut dc.results, &mut dc.lru, &mut dc.bytes);
-            }
-            _ => {
-                let mut results = std::collections::HashMap::new();
-                results.insert(key.clone(), (Arc::clone(&result), result_bytes));
-                *g = Some(AdvancedCache {
-                    gen,
-                    today,
-                    results,
-                    lru: std::collections::VecDeque::from([key]),
-                    bytes: result_bytes,
-                });
-            }
-        }
-        result
+        self.advanced_memo_bounded(key, || {
+            let result = compute();
+            let total = result.groups.iter().map(|group| group.blocks.len()).sum();
+            (result, false, total)
+        })
+        .result
     }
 
     fn run_advanced_query_cached(
@@ -2966,12 +3061,54 @@ impl Graph {
         })
     }
 
+    pub fn run_advanced_query_bounded_cached(
+        &self,
+        query_src: &str,
+        current_page: Option<&str>,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> (crate::query::AdvancedResult, bool, usize) {
+        let page_key = current_page
+            .map(|page| format!("p:{}", crate::refs::page_key(page)))
+            .unwrap_or_else(|| "n:".to_string());
+        let cached = self.advanced_memo_bounded(
+            format!("AQ\0{max_rows}\0{max_bytes}\0{page_key}\0{query_src}"),
+            || {
+                crate::query::run_advanced_query_bounded(
+                    self,
+                    query_src,
+                    current_page,
+                    max_rows,
+                    max_bytes,
+                )
+            },
+        );
+        (
+            cached.result.as_ref().clone(),
+            cached.exceeded,
+            cached.total,
+        )
+    }
+
     /// Backlinks for a page: blocks across the graph that reference it,
     /// grouped by source page. Delegates to the query module (memoized).
     pub fn backlinks(&self, target: &str) -> Arc<Vec<RefGroup>> {
         self.derived_memo(format!("b\0{}", crate::refs::normalize(target)), || {
             crate::query::backlinks(self, target)
         })
+    }
+
+    pub fn backlinks_bounded(
+        &self,
+        target: &str,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> BoundedRefGroups {
+        let normalized = crate::refs::normalize(target);
+        self.derived_memo_bounded(
+            format!("B\0{max_rows}\0{max_bytes}\0{normalized}"),
+            || crate::query::backlinks_bounded(self, target, max_rows, max_bytes),
+        )
     }
 
     /// Block-level referrers for a block uuid: every block across the graph that
@@ -2983,11 +3120,36 @@ impl Graph {
         })
     }
 
+    pub fn block_referrers_bounded(
+        &self,
+        uuid: &str,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> BoundedRefGroups {
+        let uuid = uuid.trim();
+        self.derived_memo_bounded(
+            format!("R\0{max_rows}\0{max_bytes}\0{uuid}"),
+            || crate::query::block_referrers_bounded(self, uuid, max_rows, max_bytes),
+        )
+    }
+
     /// Evaluate a `{{query ...}}` body over the graph (memoized).
     pub fn run_query(&self, query_src: &str) -> Arc<Vec<RefGroup>> {
         self.derived_memo(format!("q\0{query_src}"), || {
             crate::query::run_query(self, query_src)
         })
+    }
+
+    pub fn run_query_bounded(
+        &self,
+        query_src: &str,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> BoundedRefGroups {
+        self.derived_memo_bounded(
+            format!("Q\0{max_rows}\0{max_bytes}\0{query_src}"),
+            || crate::query::run_query_bounded(self, query_src, max_rows, max_bytes),
+        )
     }
 
     /// Evaluate an advanced (datalog-subset) query, returning the matched groups
@@ -3009,6 +3171,20 @@ impl Graph {
         self.derived_memo(format!("u\0{}", crate::refs::normalize(target)), || {
             crate::query::unlinked_refs(self, target)
         })
+    }
+
+
+    pub fn unlinked_refs_bounded(
+        &self,
+        target: &str,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> BoundedRefGroups {
+        let normalized = crate::refs::normalize(target);
+        self.derived_memo_bounded(
+            format!("U\0{max_rows}\0{max_bytes}\0{normalized}"),
+            || crate::query::unlinked_refs_bounded(self, target, max_rows, max_bytes),
+        )
     }
 
     /// Explicit, uncached target-scoped trace of the exact reference engine.
@@ -8670,6 +8846,38 @@ mod tests {
             "graph mutation must invalidate the advanced-query memo"
         );
         assert!(third.groups.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bounded_query_memo_survives_unrelated_edits_and_recomputes_affected_pages() {
+        let dir = scratch("bounded-query-scoped-memo");
+        fs::write(dir.join("pages").join("Tasks.md"), "- TODO ship\n").unwrap();
+        fs::write(dir.join("pages").join("Notes.md"), "- ordinary note\n").unwrap();
+        let g = Graph::open(&dir);
+        g.warm_cache();
+
+        let first = g.run_query_bounded("(task TODO)", 20_000, 32 * 1024 * 1024);
+        let second = g.run_query_bounded("(task TODO)", 20_000, 32 * 1024 * 1024);
+        assert!(Arc::ptr_eq(&first.groups, &second.groups));
+
+        let mut notes = g.load_named("Notes", PageKind::Page).unwrap().unwrap();
+        notes.blocks[0].raw = "still an ordinary note".into();
+        g.save_page(&notes, notes.rev.as_deref()).unwrap();
+        let after_unrelated =
+            g.run_query_bounded("(task TODO)", 20_000, 32 * 1024 * 1024);
+        assert!(
+            Arc::ptr_eq(&first.groups, &after_unrelated.groups),
+            "an unrelated edit must retain the scoped bounded-query memo"
+        );
+
+        let mut tasks = g.load_named("Tasks", PageKind::Page).unwrap().unwrap();
+        tasks.blocks[0].raw = "DONE ship".into();
+        g.save_page(&tasks, tasks.rev.as_deref()).unwrap();
+        let after_affected =
+            g.run_query_bounded("(task TODO)", 20_000, 32 * 1024 * 1024);
+        assert!(!Arc::ptr_eq(&first.groups, &after_affected.groups));
+        assert!(after_affected.groups.is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
 

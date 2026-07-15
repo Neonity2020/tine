@@ -16,6 +16,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 // `same_file::Handle` keeps its Windows handle open without FILE_SHARE_DELETE,
 // which makes MoveFileW reject the final stage rename. Keep a separately-opened
@@ -139,59 +140,48 @@ type QueryCache = RefCell<HashMap<QueryCacheKey, crate::query::BoundedGroups>>;
 #[cfg(test)]
 mod publish_test_counts {
     use crate::model::Graph;
-    use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Mutex, MutexGuard};
+    use std::cell::Cell;
+    use std::path::Path;
 
-    static SERIAL: Mutex<()> = Mutex::new(());
-    static ACTIVE_ROOT: Mutex<Option<PathBuf>> = Mutex::new(None);
-    static QUERY_RUNS: AtomicUsize = AtomicUsize::new(0);
-    static PAGE_DOC_LOADS: AtomicUsize = AtomicUsize::new(0);
-
-    pub(super) struct Guard {
-        _serial: MutexGuard<'static, ()>,
+    thread_local! {
+        static ACTIVE: Cell<bool> = const { Cell::new(false) };
+        static QUERY_RUNS: Cell<usize> = const { Cell::new(0) };
+        static PAGE_DOC_LOADS: Cell<usize> = const { Cell::new(0) };
     }
 
-    pub(super) fn count_for(root: &Path) -> Guard {
-        let serial = SERIAL.lock().unwrap();
-        *ACTIVE_ROOT.lock().unwrap() = Some(root.to_path_buf());
-        QUERY_RUNS.store(0, Ordering::SeqCst);
-        PAGE_DOC_LOADS.store(0, Ordering::SeqCst);
-        Guard { _serial: serial }
+    pub(super) struct Guard;
+
+    pub(super) fn count_for(_root: &Path) -> Guard {
+        ACTIVE.set(true);
+        QUERY_RUNS.set(0);
+        PAGE_DOC_LOADS.set(0);
+        Guard
     }
 
     impl Drop for Guard {
         fn drop(&mut self) {
-            *ACTIVE_ROOT.lock().unwrap() = None;
+            ACTIVE.set(false);
         }
     }
 
-    fn active_for(graph: &Graph) -> bool {
-        ACTIVE_ROOT
-            .lock()
-            .unwrap()
-            .as_ref()
-            .is_some_and(|root| root == &graph.root)
-    }
-
-    pub(super) fn bump_query_run(graph: &Graph) {
-        if active_for(graph) {
-            QUERY_RUNS.fetch_add(1, Ordering::SeqCst);
+    pub(super) fn bump_query_run(_graph: &Graph) {
+        if ACTIVE.get() {
+            QUERY_RUNS.set(QUERY_RUNS.get() + 1);
         }
     }
 
-    pub(super) fn bump_page_doc_load(graph: &Graph) {
-        if active_for(graph) {
-            PAGE_DOC_LOADS.fetch_add(1, Ordering::SeqCst);
+    pub(super) fn bump_page_doc_load(_graph: &Graph) {
+        if ACTIVE.get() {
+            PAGE_DOC_LOADS.set(PAGE_DOC_LOADS.get() + 1);
         }
     }
 
     pub(super) fn query_runs() -> usize {
-        QUERY_RUNS.load(Ordering::SeqCst)
+        QUERY_RUNS.get()
     }
 
     pub(super) fn page_doc_loads() -> usize {
-        PAGE_DOC_LOADS.load(Ordering::SeqCst)
+        PAGE_DOC_LOADS.get()
     }
 }
 
@@ -1075,9 +1065,8 @@ fn render_query_groups(graph: &Graph, groups: &[RefGroup], out: &mut String, ctx
             .collect::<std::collections::HashMap<_, _>>();
         for group in groups {
             let Some(doc) = page_by_key.get(&(group.page.as_str(), group.kind)) else {
-                for block in &group.blocks {
-                    render_result_block(block, out, ctx, depth);
-                }
+                // A result without a source in this exact projection has no
+                // publication capability. Never fall back to cached DTO bytes.
                 continue;
             };
             let wanted = group
@@ -1090,8 +1079,6 @@ fn render_query_groups(graph: &Graph, groups: &[RefGroup], out: &mut String, ctx
             for block in &group.blocks {
                 if let Some(source) = found.get(block.id.as_str()) {
                     render_embedded_block(source, out, ctx, depth);
-                } else {
-                    render_result_block(block, out, ctx, depth);
                 }
             }
         }
@@ -1388,12 +1375,14 @@ fn render_page_embed_doc(page: &str, doc: &doc::Document, ctx: &Ctx, depth: u8) 
 
 /// Read + parse a page's file by name (for `{{embed [[Page]]}}`), case-insensitively.
 fn load_page_doc(graph: &Graph, name: &str) -> Option<doc::Document> {
-    let pages = graph.list_pages();
-    let e = pages.iter().find(|e| e.name.eq_ignore_ascii_case(name))?;
     #[cfg(test)]
     publish_test_counts::bump_page_doc_load(graph);
-    let content = fs::read_to_string(&e.path).ok()?;
-    Some(doc::parse(&content))
+    graph.with_pages(|pages| {
+        pages
+            .iter()
+            .find(|(entry, _)| entry.name.eq_ignore_ascii_case(name))
+            .map(|(_, document)| document.as_ref().clone())
+    })
 }
 
 fn render_block(
@@ -2054,6 +2043,46 @@ struct PublishStage {
     identity: FileIdentity,
 }
 
+struct PublicationGraphSnapshot {
+    graph: Graph,
+    root: PathBuf,
+}
+
+impl PublicationGraphSnapshot {
+    fn new(pages: Vec<(crate::model::PageEntry, Arc<doc::Document>)>) -> io::Result<Self> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let temp = std::env::temp_dir();
+        for _ in 0..128 {
+            let root = temp.join(format!(
+                "tine-publication-snapshot-{}-{}",
+                std::process::id(),
+                SEQ.fetch_add(1, Ordering::Relaxed)
+            ));
+            match fs::create_dir(&root) {
+                Ok(()) => {
+                    return Ok(Self {
+                        graph: Graph::from_page_snapshot(&root, pages),
+                        root,
+                    });
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not reserve an immutable publication snapshot root",
+        ))
+    }
+}
+
+impl Drop for PublicationGraphSnapshot {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
 struct PublishRecovery {
     #[cfg(test)]
     path: PathBuf,
@@ -2330,12 +2359,20 @@ pub fn publish_graph(graph: &Graph) -> io::Result<(String, usize)> {
     // Pass 1: parse every page, keep only the public ones. `entries` is already
     // sorted by name, so `public` (and hence the slug assignment below) is
     // deterministic across runs.
-    let mut public: Vec<(&str, PageKind, doc::Document)> = Vec::new();
+    let mut public: Vec<(&str, PageKind, Arc<doc::Document>)> = Vec::new();
+    let mut snapshot_pages = Vec::new();
     for e in entries {
-        let Ok(content) = fs::read_to_string(&e.path) else {
-            continue;
+        let content = fs::read_to_string(&e.path)?;
+        let mut parsed = if e
+            .path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("org"))
+        {
+            crate::org::parse_org(&content)
+        } else {
+            doc::parse(&content)
         };
-        let parsed = doc::parse(&content);
         if !all_public && !page_is_public(parsed.pre_block.as_deref()) {
             continue;
         }
@@ -2351,8 +2388,17 @@ pub fn publish_graph(graph: &Graph) -> io::Result<(String, usize)> {
             );
             continue;
         }
-        public.push((e.name.as_str(), e.kind, parsed));
+        crate::model::assign_doc_uuids(&mut parsed.roots);
+        let parsed = Arc::new(parsed);
+        public.push((e.name.as_str(), e.kind, Arc::clone(&parsed)));
+        snapshot_pages.push((e.clone(), parsed));
     }
+
+    // Every downstream resolver gets the same exact document revision as the
+    // visibility pass. The snapshot graph has an empty private root and a fully
+    // preinstalled cache/page list, so a query/embed/namespace lookup cannot
+    // fall through to the live graph or a stale pre-export cache.
+    let snapshot = PublicationGraphSnapshot::new(snapshot_pages)?;
 
     // ONE source of truth: a unique, nonempty name→slug map for the exported set.
     // Every filename, cross-page link, block-ref target, and search-index entry is
@@ -2387,7 +2433,7 @@ pub fn publish_graph(graph: &Graph) -> io::Result<(String, usize)> {
 
     let page_docs: HashMap<String, &doc::Document> = public
         .iter()
-        .map(|(name, _, parsed)| (crate::refs::page_key(name), parsed))
+        .map(|(name, _, parsed)| (crate::refs::page_key(name), parsed.as_ref()))
         .collect();
     let mut reverse_refs = ReverseRefIndex::new();
     for (name, _, parsed) in &public {
@@ -2417,7 +2463,7 @@ pub fn publish_graph(graph: &Graph) -> io::Result<(String, usize)> {
     let ctx = Ctx {
         refs: &refs,
         reverse_refs: Some(&reverse_refs),
-        graph: Some(graph),
+        graph: Some(&snapshot.graph),
         slugs: Some(&slugs),
         inline_assets: false,
         print_asset_budget: None,
@@ -2879,6 +2925,62 @@ mod tests {
                 || dashboard.contains("Embedded content is not public"),
             "private macro targets should fail closed: {dashboard}"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn publish_uses_one_fresh_snapshot_after_external_visibility_rewrite() {
+        let dir = std::env::temp_dir().join(format!(
+            "tine-publish-external-visibility-snapshot-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("journals")).unwrap();
+        fs::create_dir_all(dir.join("pages")).unwrap();
+        fs::create_dir_all(dir.join("logseq")).unwrap();
+        let source_id = "99999999-9999-4999-8999-999999999998";
+        fs::write(
+            dir.join("pages/Dashboard.md"),
+            format!(
+                "public:: true\n- {{{{query (task TODO)}}}}\n- {{{{query [:find (pull ?b [*]) :where (task ?b \"TODO\")]}}}}\n- {{{{embed (({source_id}))}}}}\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("pages/Source.md"),
+            format!("- TODO PRIVATE_STALE_TOKEN\n  id:: {source_id}\n"),
+        )
+        .unwrap();
+
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+
+        // Simulate a sync/editor outside Tine changing both visibility and body
+        // after the live graph cache was populated. Publication must not combine
+        // the fresh public classification with stale cached query/embed DTOs.
+        fs::write(
+            dir.join("pages/Source.md"),
+            format!("public:: true\n- harmless current body\n  id:: {source_id}\n"),
+        )
+        .unwrap();
+
+        let (outdir, count) = publish_graph(&graph).unwrap();
+        assert_eq!(count, 2);
+        let out = Path::new(&outdir);
+        let dashboard = fs::read_to_string(out.join("dashboard.html")).unwrap();
+        let source = fs::read_to_string(out.join("source.html")).unwrap();
+        let search = fs::read_to_string(out.join("search-index.js")).unwrap();
+        let published = format!("{dashboard}\n{source}\n{search}");
+        assert!(published.contains("harmless current body"), "{published}");
+        assert!(
+            !published.contains("PRIVATE_STALE_TOKEN"),
+            "a stale live-graph query/embed result crossed the publication snapshot: {published}"
+        );
+        assert!(
+            dashboard.contains("harmless current body"),
+            "the block embed must resolve from the same fresh snapshot: {dashboard}"
+        );
+
         let _ = fs::remove_dir_all(&dir);
     }
 

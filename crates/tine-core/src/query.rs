@@ -29,11 +29,6 @@ struct ConstructionBudget {
     exceeded: bool,
 }
 
-enum Budgeted<T> {
-    Admitted(T),
-    Denied,
-}
-
 impl ConstructionBudget {
     fn new(max_rows: usize, max_bytes: usize) -> Self {
         Self {
@@ -46,18 +41,30 @@ impl ConstructionBudget {
         }
     }
 
-    fn admit(&mut self, page: &str, block: &BlockDto) -> bool {
+    fn admit_estimated(&mut self, page: &str, payload_bytes: usize) -> bool {
         self.total = self.total.saturating_add(1);
-        let bytes = crate::model::block_dto_estimated_bytes(block)
+        let bytes = payload_bytes
             .saturating_add(page.len())
             .saturating_add(256);
-        if self.rows >= self.max_rows || self.bytes.saturating_add(bytes) > self.max_bytes {
+        if self.exceeded
+            || self.rows >= self.max_rows
+            || self.bytes.saturating_add(bytes) > self.max_bytes
+        {
             self.exceeded = true;
             return false;
         }
         self.rows += 1;
         self.bytes += bytes;
         true
+    }
+
+    fn deny_match(&mut self) {
+        self.total = self.total.saturating_add(1);
+        self.exceeded = true;
+    }
+
+    fn closed(&self) -> bool {
+        self.exceeded || self.rows >= self.max_rows
     }
 }
 
@@ -80,20 +87,23 @@ fn walk<'a>(blocks: &'a [DocBlock], f: &mut impl FnMut(&'a DocBlock)) {
 /// not prune the rest of a matching block's subtree. Reference occurrence
 /// surfaces use `suppress_direct_child = false` because every referring block is
 /// independently countable/navigable.
-fn collect_matching_path<'a, T>(
+fn collect_matching_path<'a, M, T>(
     blocks: &'a [DocBlock],
     path: &mut Vec<&'a DocBlock>,
     parent_matched: bool,
     suppress_direct_child: bool,
-    classify: &mut impl FnMut(&'a DocBlock, &[&'a DocBlock]) -> Option<T>,
+    classify: &mut impl FnMut(&'a DocBlock, &[&'a DocBlock]) -> Option<M>,
+    materialize: &mut impl FnMut(&'a DocBlock, &[&'a DocBlock], M) -> Option<T>,
     out: &mut Vec<T>,
 ) {
     for block in blocks {
-        let item = classify(block, path);
-        let matched = item.is_some();
-        if let Some(item) = item {
-            if !suppress_direct_child || !parent_matched {
-                out.push(item);
+        let classification = classify(block, path);
+        let matched = classification.is_some();
+        if !suppress_direct_child || !parent_matched {
+            if let Some(classification) = classification {
+                if let Some(item) = materialize(block, path, classification) {
+                    out.push(item);
+                }
             }
         }
         path.push(block);
@@ -103,28 +113,87 @@ fn collect_matching_path<'a, T>(
             matched,
             suppress_direct_child,
             classify,
+            materialize,
             out,
         );
         path.pop();
     }
 }
 
-fn collect_og_query_roots<'a, T>(
+fn collect_og_query_roots<'a, M, T>(
     blocks: &'a [DocBlock],
     path: &mut Vec<&'a DocBlock>,
-    classify: &mut impl FnMut(&'a DocBlock, &[&'a DocBlock]) -> Option<T>,
+    classify: &mut impl FnMut(&'a DocBlock, &[&'a DocBlock]) -> Option<M>,
+    materialize: &mut impl FnMut(&'a DocBlock, &[&'a DocBlock], M) -> Option<T>,
     out: &mut Vec<T>,
 ) {
-    collect_matching_path(blocks, path, false, true, classify, out);
+    collect_matching_path(blocks, path, false, true, classify, materialize, out);
 }
 
-fn collect_reference_matches<'a, T>(
+fn collect_reference_matches<'a, M, T>(
     blocks: &'a [DocBlock],
     path: &mut Vec<&'a DocBlock>,
-    classify: &mut impl FnMut(&'a DocBlock, &[&'a DocBlock]) -> Option<T>,
+    classify: &mut impl FnMut(&'a DocBlock, &[&'a DocBlock]) -> Option<M>,
+    materialize: &mut impl FnMut(&'a DocBlock, &[&'a DocBlock], M) -> Option<T>,
     out: &mut Vec<T>,
 ) {
-    collect_matching_path(blocks, path, false, false, classify, out);
+    collect_matching_path(blocks, path, false, false, classify, materialize, out);
+}
+
+fn crumb_line_estimated_bytes(block: &DocBlock) -> usize {
+    let line = block.visible_text().lines().next().unwrap_or("").trim();
+    let mut chars = line.chars();
+    let bytes = chars.by_ref().take(60).map(char::len_utf8).sum::<usize>();
+    bytes + usize::from(chars.next().is_some()) * '…'.len_utf8()
+}
+
+fn shallow_dto_estimated_bytes(block: &DocBlock, ancestors: &[&DocBlock]) -> usize {
+    let projection = block.projection();
+    let id_bytes = if block.uuid.is_empty() { 36 } else { block.uuid.len() };
+    id_bytes
+        .saturating_add(block.raw.len())
+        .saturating_add(
+            ancestors
+                .iter()
+                .map(|ancestor| crumb_line_estimated_bytes(ancestor))
+                .sum::<usize>(),
+        )
+        .saturating_add(projection.tags.iter().map(String::len).sum::<usize>())
+        .saturating_add(
+            projection
+                .properties
+                .iter()
+                .map(|(key, value)| key.len().saturating_add(value.len()))
+                .sum::<usize>(),
+        )
+        .saturating_add(128)
+}
+
+fn reference_evidence_estimated_bytes(evidence: &ReferenceBlockEvidence) -> usize {
+    evidence.block_id.len()
+        + evidence
+            .occurrences
+            .iter()
+            .map(|occurrence| {
+                occurrence
+                    .matched_name
+                    .len()
+                    .saturating_add(occurrence.canonical.len())
+                    .saturating_add(occurrence.rule.len())
+                    .saturating_add(std::mem::size_of_val(occurrence))
+            })
+            .sum::<usize>()
+}
+
+fn result_dto(block: &DocBlock) -> BlockDto {
+    #[cfg(test)]
+    RESULT_DTO_CONSTRUCTIONS.with(|count| count.set(count.get().saturating_add(1)));
+    block_to_shallow_dto(block)
+}
+
+#[cfg(test)]
+thread_local! {
+    static RESULT_DTO_CONSTRUCTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Cancellable variant used by interactive search. Returning false from `f`
@@ -183,11 +252,14 @@ fn collect_bounded(
             if ex.as_deref() == Some(&refs::normalize(&entry.name)) {
                 continue;
             }
-            let mut matched: Vec<Budgeted<BlockDto>> = Vec::new();
+            let mut matched: Vec<BlockDto> = Vec::new();
             if let Some(pre) = doc.pre_block.as_deref() {
                 if let Some(property_ref) = keep_page_properties(entry, pre) {
-                    if budget.admit(&entry.name, &property_ref) {
-                        matched.push(Budgeted::Admitted(property_ref));
+                    if budget.admit_estimated(
+                        &entry.name,
+                        crate::model::block_dto_estimated_bytes(&property_ref),
+                    ) {
+                        matched.push(property_ref);
                     }
                 }
             }
@@ -195,26 +267,24 @@ fn collect_bounded(
             collect_reference_matches(
                 &doc.roots,
                 &mut path,
-                &mut |b, anc| {
-                    keep(b).then(|| {
-                        let mut dto = block_to_shallow_dto(b);
-                        dto.breadcrumb = anc.iter().map(|a| crumb_line(a)).collect();
-                        if budget.admit(&entry.name, &dto) {
-                            Budgeted::Admitted(dto)
-                        } else {
-                            Budgeted::Denied
-                        }
-                    })
+                &mut |block, _| keep(block).then_some(()),
+                &mut |block, ancestors, ()| {
+                    if budget.closed() {
+                        budget.deny_match();
+                        return None;
+                    }
+                    if !budget.admit_estimated(
+                        &entry.name,
+                        shallow_dto_estimated_bytes(block, ancestors),
+                    ) {
+                        return None;
+                    }
+                    let mut dto = result_dto(block);
+                    dto.breadcrumb = ancestors.iter().map(|ancestor| crumb_line(ancestor)).collect();
+                    Some(dto)
                 },
                 &mut matched,
             );
-            let matched = matched
-                .into_iter()
-                .filter_map(|item| match item {
-                    Budgeted::Admitted(dto) => Some(dto),
-                    Budgeted::Denied => None,
-                })
-                .collect::<Vec<_>>();
             if !matched.is_empty() {
                 groups.push((
                     entry.date_key,
@@ -443,7 +513,9 @@ fn collect_reference_occurrences_bounded(
                     {
                         let mut dto = block_to_shallow_dto(&block);
                         dto.page_property = true;
-                        if budget.admit(&entry.name, &dto) {
+                        let estimated = crate::model::block_dto_estimated_bytes(&dto)
+                            .saturating_add(reference_evidence_estimated_bytes(&hit));
+                        if budget.admit_estimated(&entry.name, estimated) {
                             blocks.push(dto);
                             evidence.push(hit);
                         }
@@ -454,31 +526,33 @@ fn collect_reference_occurrences_bounded(
                 }
             }
             let mut path = Vec::new();
-            let mut found: Vec<Budgeted<(BlockDto, ReferenceBlockEvidence)>> = Vec::new();
+            let mut found: Vec<(BlockDto, ReferenceBlockEvidence)> = Vec::new();
             collect_reference_matches(
                 &doc.roots,
                 &mut path,
-                &mut |block, ancestors| {
-                    block_reference_evidence(block, canonical, names_norm, kind).map(|hit| {
-                        let mut dto = block_to_shallow_dto(block);
-                        dto.breadcrumb = ancestors
-                            .iter()
-                            .map(|ancestor| crumb_line(ancestor))
-                            .collect();
-                        if budget.admit(&entry.name, &dto) {
-                            Budgeted::Admitted((dto, hit))
-                        } else {
-                            Budgeted::Denied
-                        }
-                    })
+                &mut |block, _| block_reference_evidence(block, canonical, names_norm, kind),
+                &mut |block, ancestors, hit| {
+                    if budget.closed() {
+                        budget.deny_match();
+                        return None;
+                    }
+                    let estimated = shallow_dto_estimated_bytes(block, ancestors)
+                        .saturating_add(reference_evidence_estimated_bytes(&hit));
+                    if !budget.admit_estimated(&entry.name, estimated) {
+                        return None;
+                    }
+                    let mut dto = result_dto(block);
+                    dto.breadcrumb = ancestors
+                        .iter()
+                        .map(|ancestor| crumb_line(ancestor))
+                        .collect();
+                    Some((dto, hit))
                 },
                 &mut found,
             );
-            for found in found {
-                if let Budgeted::Admitted((dto, hit)) = found {
-                    blocks.push(dto);
-                    evidence.push(hit);
-                }
+            for (dto, hit) in found {
+                blocks.push(dto);
+                evidence.push(hit);
             }
             if !blocks.is_empty() {
                 groups.push((
@@ -740,35 +814,30 @@ fn run_pred_bounded(
                 page_props: &page_props,
                 page_tags: &page_tags,
             };
-            let mut matched: Vec<Budgeted<BlockDto>> = Vec::new();
+            let mut matched: Vec<BlockDto> = Vec::new();
             let mut path = Vec::new();
             collect_og_query_roots(
                 &doc.roots,
                 &mut path,
-                &mut |block, _| {
-                    if !pred.eval(block, &ctx) {
+                &mut |block, _| pred.eval(block, &ctx).then_some(()),
+                &mut |block, _, ()| {
+                    if sample_admission_cap.is_some_and(|cap| budget.rows >= cap) {
                         return None;
                     }
-                    let dto = block_to_shallow_dto(block);
-                    Some(
-                        if sample_admission_cap.is_some_and(|cap| budget.rows >= cap) {
-                            Budgeted::Denied
-                        } else if budget.admit(&entry.name, &dto) {
-                            Budgeted::Admitted(dto)
-                        } else {
-                            Budgeted::Denied
-                        },
-                    )
+                    if budget.closed() {
+                        budget.deny_match();
+                        return None;
+                    }
+                    if !budget.admit_estimated(
+                        &entry.name,
+                        shallow_dto_estimated_bytes(block, &[]),
+                    ) {
+                        return None;
+                    }
+                    Some(result_dto(block))
                 },
                 &mut matched,
             );
-            let matched = matched
-                .into_iter()
-                .filter_map(|item| match item {
-                    Budgeted::Admitted(dto) => Some(dto),
-                    Budgeted::Denied => None,
-                })
-                .collect::<Vec<_>>();
             if !matched.is_empty() {
                 if want_recency {
                     recency.insert(entry.name.clone(), page_recency_secs(entry));
@@ -1732,7 +1801,10 @@ pub fn resolve_blocks_bounded(
             let group = resolved.get(u.as_str())?;
             let block = group.blocks.first()?;
             output_budget
-                .admit(&group.page, block)
+                .admit_estimated(
+                    &group.page,
+                    crate::model::block_dto_estimated_bytes(block),
+                )
                 .then(|| group.clone())
         })
         .collect();
@@ -2109,8 +2181,12 @@ fn resolve_ids_in_page<'a>(
                     .filter(|id| !resolved.contains_key(id))
             });
         if let Some(id) = hit {
-            let dto = block_to_shallow_dto(b);
-            if budget.admit(&entry.name, &dto) {
+            if budget.closed() {
+                budget.deny_match();
+                return;
+            }
+            if budget.admit_estimated(&entry.name, shallow_dto_estimated_bytes(b, &[])) {
+                let dto = result_dto(b);
                 resolved.insert(
                     id,
                     RefGroup {
@@ -3789,6 +3865,7 @@ mod tests {
         fs::write(dir.join("pages/Target.md"), "- target\n").unwrap();
         let graph = Graph::open(&dir);
 
+        RESULT_DTO_CONSTRUCTIONS.with(|count| count.set(0));
         let query = run_query_bounded(&graph, "(task TODO)", 3, usize::MAX);
         assert!(query.exceeded);
         assert_eq!(query.total, 12);
@@ -3800,7 +3877,9 @@ mod tests {
                 .sum::<usize>(),
             3
         );
+        assert_eq!(RESULT_DTO_CONSTRUCTIONS.with(std::cell::Cell::get), 3);
 
+        RESULT_DTO_CONSTRUCTIONS.with(|count| count.set(0));
         let refs = backlinks_bounded(&graph, "Target", 2, usize::MAX);
         assert!(refs.exceeded);
         assert_eq!(refs.total, 12);
@@ -3811,6 +3890,13 @@ mod tests {
                 .sum::<usize>(),
             2
         );
+        assert_eq!(RESULT_DTO_CONSTRUCTIONS.with(std::cell::Cell::get), 2);
+
+        RESULT_DTO_CONSTRUCTIONS.with(|count| count.set(0));
+        let sample = run_query_bounded(&graph, "(and (task TODO) (sample 1))", 20, usize::MAX);
+        assert!(!sample.exceeded);
+        assert_eq!(sample.total, 1);
+        assert_eq!(RESULT_DTO_CONSTRUCTIONS.with(std::cell::Cell::get), 1);
 
         let (facets, facets_exceeded) = property_facets_bounded(&graph, 2, usize::MAX);
         assert!(facets_exceeded);

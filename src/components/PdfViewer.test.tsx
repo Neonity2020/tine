@@ -404,6 +404,95 @@ describe("PdfViewer OG state and reference behavior", () => {
     }
   });
 
+  it("destroys a late document load after its asset identity was replaced", async () => {
+    vi.spyOn(backend() as any, "openPdf").mockResolvedValue({ highlights: [], page: 1, scale: 1 });
+    vi.spyOn(backend(), "readAsset").mockResolvedValue(new Uint8Array([1]));
+    const stale = documentWithPages([page(612, 792)]);
+    const current = documentWithPages([page(612, 792)]);
+    let resolveStale!: (document: typeof stale) => void;
+    const staleLoad = new Promise<typeof stale>((resolve) => { resolveStale = resolve; });
+    getDocumentMock
+      .mockReturnValueOnce({ promise: staleLoad })
+      .mockReturnValueOnce({ promise: Promise.resolve(current) });
+    const [target, setTarget] = createSignal({ filename: "a.pdf", label: "A" });
+
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const dispose = render(() => <KeyedPdfViewer target={target} />, host);
+    try {
+      await flush();
+      setTarget({ filename: "b.pdf", label: "B" });
+      await flush();
+      resolveStale(stale);
+      await flush();
+
+      expect(stale.destroy).toHaveBeenCalledOnce();
+      expect(current.destroy).not.toHaveBeenCalled();
+      expect(host.querySelector(".pdf-viewer")?.getAttribute("data-pdf-filename")).toBe("b.pdf");
+      expect(host.querySelector(".pdf-viewer")?.getAttribute("data-pdf-ready")).toBe("true");
+    } finally {
+      dispose();
+    }
+  });
+
+  it("keeps one PDF mounted and scrolls repeated references to the exact highlight", async () => {
+    const firstId = "11111111-1111-4111-8111-111111111111";
+    const secondId = "22222222-2222-4222-8222-222222222222";
+    const rect = (top: number) => ({ top, left: 20, width: 80, height: 12 });
+    const openPdf = vi.spyOn(backend() as any, "openPdf").mockResolvedValue({
+      highlights: [
+        {
+          id: firstId,
+          page: 1,
+          position: { page: 1, bounding: rect(40), rects: [rect(40)] },
+          color: "yellow",
+          text: "first",
+          image: null,
+        },
+        {
+          id: secondId,
+          page: 1,
+          position: { page: 1, bounding: rect(500), rects: [rect(500)] },
+          color: "green",
+          text: "second",
+          image: null,
+        },
+      ],
+      page: 1,
+      scale: 1,
+    });
+    vi.spyOn(backend(), "readAsset").mockResolvedValue(new Uint8Array([1]));
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue({} as CanvasRenderingContext2D);
+    const pdf = documentWithPages([page(612, 792)]);
+    getDocumentMock.mockReturnValue({ promise: Promise.resolve(pdf) });
+    const [target, setTarget] = createSignal({
+      filename: "paper.pdf",
+      label: "Paper",
+      page: 1,
+      highlightId: firstId,
+    });
+
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const dispose = render(() => <KeyedPdfViewer target={target} />, host);
+    try {
+      await flush();
+      const viewer = host.querySelector(".pdf-viewer");
+      expect(viewer?.querySelector(".pdf-hl-target")?.getAttribute("data-highlight-id")).toBe(firstId);
+
+      setTarget({ filename: "paper.pdf", label: "Paper", page: 1, highlightId: secondId });
+      await flush();
+
+      expect(openPdf).toHaveBeenCalledOnce();
+      expect(host.querySelector(".pdf-viewer")).toBe(viewer);
+      expect(pdf.destroy).not.toHaveBeenCalled();
+      expect(viewer?.getAttribute("data-pdf-highlight-target")).toBe(secondId);
+      expect(viewer?.querySelector(".pdf-hl-target")?.getAttribute("data-highlight-id")).toBe(secondId);
+    } finally {
+      dispose();
+    }
+  });
+
   it("caps PDF Find occurrences and labels the result as truncated", async () => {
     vi.useFakeTimers();
     vi.spyOn(backend() as any, "openPdf").mockResolvedValue({ highlights: [], page: 1, scale: 1 });

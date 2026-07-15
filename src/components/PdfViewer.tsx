@@ -2,7 +2,7 @@ import { For, Show, createEffect, createSignal, on, onCleanup, onMount, type JSX
 import * as pdfjs from "pdfjs-dist";
 import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import { backend } from "../backend";
-import { closePdf, pushToast, isConflicted, activePane } from "../ui";
+import { closePdf, pushToast, isConflicted, activePane, type PdfTarget } from "../ui";
 import { flushPage, isDirty, reloadHlsIfLoaded, trackAssetWrite } from "../store";
 import { openPage } from "../router";
 import { areaHighlightPosition, hlsPageName, rectInPageSpace, rectWithSourceSpace, type PdfPageDimensions } from "../pdf";
@@ -48,27 +48,32 @@ interface Pending {
   text: string;
 }
 
-export interface PdfTarget {
-  filename: string;
-  label: string;
-  page?: number;
-}
-
 /**
- * A PDF filename is a resource identity, not merely a reactive prop. Keying the
- * child mirrors Logseq's teardown-before-open lifecycle: all document-local
- * caches, delayed view writes, highlights, and pdf.js tasks belong to exactly
- * one asset and are disposed before another asset mounts.
+ * A PDF filename is a resource identity, not a navigation request. Key only on
+ * that identity: page/highlight changes within one asset stay reactive, while
+ * switching assets still tears down every document-local cache and pdf.js task.
  */
 export function KeyedPdfViewer(props: { target: () => PdfTarget | null }): JSX.Element {
   return (
-    <Show when={props.target()} keyed>
-      {(target) => <PdfViewer filename={target.filename} label={target.label} page={target.page} />}
+    <Show when={props.target()?.filename} keyed>
+      {(filename) => (
+        <PdfViewer
+          filename={filename}
+          label={props.target()?.label ?? filename}
+          page={props.target()?.page}
+          navigation={props.target}
+        />
+      )}
     </Show>
   );
 }
 
-export function PdfViewer(props: { filename: string; label: string; page?: number }): JSX.Element {
+export function PdfViewer(props: {
+  filename: string;
+  label: string;
+  page?: number;
+  navigation?: () => PdfTarget | null;
+}): JSX.Element {
   let scrollRef!: HTMLDivElement;
   const pageEls: Record<number, HTMLDivElement> = {};
   const textLayers: Record<number, HTMLDivElement> = {};
@@ -118,6 +123,8 @@ export function PdfViewer(props: { filename: string; label: string; page?: numbe
   let baseIds: string[] = [];
   let pdfDoc: pdfjs.PDFDocumentProxy | null = null;
   let disposed = false;
+  let navigationToken = 0;
+  let activeHighlightId: string | undefined;
 
   // Per-page unscaled dimensions (index 1..N), fetched once so we can size every
   // page wrapper up front — that gives correct scroll geometry without having to
@@ -493,6 +500,49 @@ export function PdfViewer(props: { filename: string; label: string; page?: numbe
     evictCanvases();
   }
 
+  function currentNavigation(): PdfTarget {
+    const target = props.navigation?.();
+    return target?.filename === props.filename
+      ? target
+      : { filename: props.filename, label: props.label, page: props.page };
+  }
+
+  async function navigateToTarget(target: PdfTarget) {
+    const token = ++navigationToken;
+    const highlight = target.highlightId
+      ? highlights().find((candidate) => candidate.id === target.highlightId)
+      : undefined;
+    activeHighlightId = highlight?.id;
+    const requestedPage = highlight?.page ?? target.page ?? 1;
+    const page = pageEls[requestedPage] ? requestedPage : 1;
+    setCurPage(page);
+    setPageField(String(page));
+    pageEls[page]?.scrollIntoView({ block: "start" });
+
+    if (!highlight) {
+      for (const element of scrollRef.querySelectorAll(".pdf-hl-target")) {
+        element.classList.remove("pdf-hl-target");
+      }
+      return;
+    }
+
+    // OG carries the highlight entity through open-block-ref! and scrolls the
+    // finder to that exact highlight. Render the destination page first so the
+    // overlay exists even when it was outside the lazy viewport.
+    await renderPage(page);
+    if (disposed || token !== navigationToken) return;
+    const layer = hlLayers[page];
+    const exact = layer
+      ? Array.from(layer.querySelectorAll<HTMLElement>(".pdf-hl"))
+          .find((element) => element.dataset.highlightId === highlight.id)
+      : undefined;
+    for (const element of scrollRef.querySelectorAll(".pdf-hl-target")) {
+      element.classList.remove("pdf-hl-target");
+    }
+    exact?.classList.add("pdf-hl-target");
+    exact?.scrollIntoView({ block: "center", inline: "nearest" });
+  }
+
   // Record `n` as most-recently rendered.
   function touchLru(n: number) {
     const i = lru.indexOf(n);
@@ -759,14 +809,11 @@ export function PdfViewer(props: { filename: string; label: string; page?: numbe
     setScale(restoredScale != null ? clampScale(restoredScale) : fitWidthScale());
     setNumPages(doc.numPages);
     buildLayout();
-    const requestedPage = props.page ?? restoredPage ?? 1;
-    const startPage = pageEls[requestedPage] ? requestedPage : 1;
-    setCurPage(startPage);
-    setPageField(String(startPage));
-    if (startPage > 1) {
-      pageEls[startPage].scrollIntoView({ block: "start" });
-    }
-    viewStateBaseline = { page: startPage, scale: scale() };
+    const navigation = currentNavigation();
+    const requestedPage = navigation.page ?? restoredPage ?? 1;
+    await navigateToTarget({ ...navigation, page: requestedPage });
+    if (disposed) return;
+    viewStateBaseline = { page: curPage(), scale: scale() };
     viewStateReady = true;
     setReady(true);
   });
@@ -800,12 +847,15 @@ export function PdfViewer(props: { filename: string; label: string; page?: numbe
   createEffect(on(highlights, () => {
     for (const n of Object.keys(renderedScale)) repaintPage(Number(n));
   }));
-  // Jump to a highlight's page when asked while the viewer is already open.
+  // A new intent within the same asset must navigate without remounting the
+  // PDF. Asset switches are handled by KeyedPdfViewer's filename key.
   createEffect(
     on(
-      () => props.page,
-      (p) => {
-        if (p && pageEls[p]) pageEls[p].scrollIntoView({ block: "start" });
+      () => props.navigation?.(),
+      (target) => {
+        if (viewStateReady && target?.filename === props.filename) {
+          void navigateToTarget(target);
+        }
       },
       { defer: true }
     )
@@ -830,6 +880,8 @@ export function PdfViewer(props: { filename: string; label: string; page?: numbe
         const rgb = COLOR_RGB[h.color] ?? COLOR_RGB.yellow;
         const div = document.createElement("div");
         div.className = "pdf-hl pdf-hl-area";
+        div.dataset.highlightId = h.id;
+        div.classList.toggle("pdf-hl-target", h.id === activeHighlightId);
         div.style.left = `${r.left * s}px`;
         div.style.top = `${r.top * s}px`;
         div.style.width = `${r.width * s}px`;
@@ -845,6 +897,8 @@ export function PdfViewer(props: { filename: string; label: string; page?: numbe
         const r = rectInPageSpace(storedRect, dims[n]);
         const div = document.createElement("div");
         div.className = "pdf-hl";
+        div.dataset.highlightId = h.id;
+        div.classList.toggle("pdf-hl-target", h.id === activeHighlightId);
         div.style.left = `${r.left * s}px`;
         div.style.top = `${r.top * s}px`;
         div.style.width = `${r.width * s}px`;
@@ -1299,7 +1353,12 @@ export function PdfViewer(props: { filename: string; label: string; page?: numbe
   };
 
   return (
-    <div class="pdf-viewer" data-pdf-filename={props.filename} data-pdf-ready={ready() ? "true" : "false"}>
+    <div
+      class="pdf-viewer"
+      data-pdf-filename={props.filename}
+      data-pdf-highlight-target={props.navigation?.()?.highlightId}
+      data-pdf-ready={ready() ? "true" : "false"}
+    >
       <div class="pdf-toolbar">
         <span class="pdf-title">{props.label}</span>
         <div class="pdf-toolbar-actions">

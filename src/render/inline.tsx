@@ -1119,6 +1119,7 @@ function BlockRefView(props: { id: string; label?: string; spanAttrs?: SpanDomAt
     <>
       <span
         ref={anchorEl}
+        data-block-ref={props.id}
         class="block-ref"
         classList={{ "block-ref-missing": !grp() }}
         {...(props.spanAttrs ?? {})}
@@ -1149,7 +1150,7 @@ function BlockRefView(props: { id: string; label?: string; spanAttrs?: SpanDomAt
               .getPage(g.page, g.kind)
               .then((page) => {
                 const file = pdfFileFromPreBlock(page?.pre_block);
-                if (file) openPdf(file, file, ann.hlPage);
+                if (file) openPdf(file, file, ann.hlPage, props.id);
                 else pushToast("Couldn't find the PDF for this highlight", "error");
               })
               .catch(() => pushToast("Couldn't open the PDF for this highlight", "error"));

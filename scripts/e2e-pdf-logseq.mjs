@@ -18,6 +18,8 @@ const NATIVE_PORT = Number(process.env.E2E_NATIVE_PORT || 4521);
 const TMP = path.join(os.tmpdir(), `tine-pdf-logseq-e2e-${process.pid}`);
 const GRAPH = path.join(TMP, "graph");
 const PDF = "JVBERi0xLjQKMSAwIG9iago8PCAvVHlwZSAvQ2F0YWxvZyAvUGFnZXMgMiAwIFIgPj4KZW5kb2JqCjIgMCBvYmoKPDwgL1R5cGUgL1BhZ2VzIC9LaWRzIFszIDAgUl0gL0NvdW50IDEgPj4KZW5kb2JqCjMgMCBvYmoKPDwgL1R5cGUgL1BhZ2UgL1BhcmVudCAyIDAgUiAvTWVkaWFCb3ggWzAgMCA2MTIgNzkyXSAvUmVzb3VyY2VzIDw8IC9Gb250IDw8IC9GMSA1IDAgUiA+PiA+PiAvQ29udGVudHMgNCAwIFIgPj4KZW5kb2JqCjQgMCBvYmoKPDwgL0xlbmd0aCAyMDUgPj4Kc3RyZWFtCkJUIC9GMSAyMCBUZiA3MiA3MjAgVGQgKFRpbmUgUERGIHZpZXdlcikgVGogRVQKQlQgL0YxIDEzIFRmIDcyIDY5MCBUZCAoU2VsZWN0IHRoaXMgdGV4dCB0byBjcmVhdGUgYSBoaWdobGlnaHQuKSBUaiBFVApCVCAvRjEgMTMgVGYgNzIgNjY4IFRkIChIaWdobGlnaHRzIHBlcnNpc3QgdG8gYXNzZXRzLzxrZXk+LmVkbiArIGFuIGhsc19fIHBhZ2UuKSBUaiBFVAoKZW5kc3RyZWFtCmVuZG9iago1IDAgb2JqCjw8IC9UeXBlIC9Gb250IC9TdWJ0eXBlIC9UeXBlMSAvQmFzZUZvbnQgL0hlbHZldGljYSA+PgplbmRvYmoKeHJlZgowIDYKMDAwMDAwMDAwMCA2NTUzNSBmIAowMDAwMDAwMDA5IDAwMDAwIG4gCjAwMDAwMDAwNTggMDAwMDAgbiAKMDAwMDAwMDExNSAwMDAwMCBuIAowMDAwMDAwMjQxIDAwMDAwIG4gCjAwMDAwMDA0OTcgMDAwMDAgbiAKdHJhaWxlcgo8PCAvU2l6ZSA2IC9Sb290IDEgMCBSID4+CnN0YXJ0eHJlZgo1NjcKJSVFT0Y=";
+const SECOND_FIRST_ID = "7b6704f8-a337-4336-a711-2ba6bc14fbf1";
+const SECOND_SECOND_ID = "7b6704f8-a337-4336-a711-2ba6bc14fbf2";
 const EDN = `{:highlights [{:id #uuid "6a5604f8-a337-4336-a711-2ba6bc14fbfd"
   :page 1
   :position {:bounding {:x1 96.7058823529 :y1 937.452777778 :x2 333.098039216 :y2 972.372222222
@@ -30,7 +32,24 @@ const EDN = `{:highlights [{:id #uuid "6a5604f8-a337-4336-a711-2ba6bc14fbfd"
   :extra {:page 1 :scale 1.75 :plugin "keep"}
   :future-root 42}
 `;
-const EDN_SECOND = `{:highlights []
+const EDN_SECOND = `{:highlights [{:id #uuid "${SECOND_FIRST_ID}"
+  :page 1
+  :position {:bounding {:x1 96.7058823529 :y1 937.452777778 :x2 333.098039216 :y2 972.372222222
+                        :width 822 :height 1063.7}
+             :rects ({:x1 96.7058823529 :y1 937.452777778 :x2 333.098039216 :y2 972.372222222
+                      :width 822 :height 1063.7})
+             :page 1}
+  :content {:text "Second PDF first"}
+  :properties {:color "yellow"}}
+ {:id #uuid "${SECOND_SECOND_ID}"
+  :page 1
+  :position {:bounding {:x1 96.7058823529 :y1 850 :x2 333.098039216 :y2 884
+                        :width 822 :height 1063.7}
+             :rects ({:x1 96.7058823529 :y1 850 :x2 333.098039216 :y2 884
+                      :width 822 :height 1063.7})
+             :page 1}
+  :content {:text "Second PDF second"}
+  :properties {:color "green"}}]
   :extra {:page 1 :scale 1.25 :plugin "second-keep"}
   :future-root 84}
 `;
@@ -40,7 +59,11 @@ for (const dir of ["pages", "journals", "logseq", "assets"]) fs.mkdirSync(path.j
 for (const dir of ["data", "config", "cache"]) fs.mkdirSync(path.join(TMP, "xdg", dir), { recursive: true });
 fs.writeFileSync(path.join(GRAPH, "logseq", "config.edn"), "{:preferred-format \"Org\"}\n");
 fs.writeFileSync(path.join(GRAPH, "assets", "logseq-sample.pdf"), Buffer.from(PDF, "base64"));
-fs.writeFileSync(path.join(GRAPH, "assets", "logseq-second.pdf"), Buffer.from(PDF, "base64"));
+const secondPdf = Buffer.from(PDF, "base64");
+const pdfLabelOffset = secondPdf.indexOf(Buffer.from("Tine PDF viewer"));
+if (pdfLabelOffset < 0) throw new Error("PDF fixture label was not found");
+Buffer.from("Second PDF test").copy(secondPdf, pdfLabelOffset); // same byte length: xref stays valid
+fs.writeFileSync(path.join(GRAPH, "assets", "logseq-second.pdf"), secondPdf);
 const sidecar = path.join(GRAPH, "assets", "logseq-sample.edn");
 fs.writeFileSync(sidecar, EDN);
 const originalSidecar = fs.readFileSync(sidecar, "utf8");
@@ -48,11 +71,33 @@ const secondSidecar = path.join(GRAPH, "assets", "logseq-second.edn");
 fs.writeFileSync(secondSidecar, EDN_SECOND);
 const originalSecondSidecar = fs.readFileSync(secondSidecar, "utf8");
 const hlsPage = path.join(GRAPH, "pages", "hls__logseq-sample.org");
+fs.writeFileSync(path.join(GRAPH, "pages", "hls__logseq-second.org"), [
+  "#+FILE: [[../assets/logseq-second.pdf][Logseq second]]",
+  "#+FILE-PATH: ../assets/logseq-second.pdf",
+  "* Second PDF first",
+  ":PROPERTIES:",
+  ":hl-page: 1",
+  ":hl-color: yellow",
+  ":ls-type: annotation",
+  `:id: ${SECOND_FIRST_ID}`,
+  ":END:",
+  "* Second PDF second",
+  ":PROPERTIES:",
+  ":hl-page: 1",
+  ":hl-color: green",
+  ":ls-type: annotation",
+  `:id: ${SECOND_SECOND_ID}`,
+  ":END:",
+  "",
+].join("\n"));
 const now = new Date();
 const journal = `${now.getFullYear()}_${String(now.getMonth() + 1).padStart(2, "0")}_${String(now.getDate()).padStart(2, "0")}`;
 fs.writeFileSync(path.join(GRAPH, "journals", `${journal}.md`), [
   "- ![Logseq sample](../assets/logseq-sample.pdf)",
   "- ![Logseq second](../assets/logseq-second.pdf)",
+  `- First exact annotation ((${SECOND_FIRST_ID}))`,
+  `- Second exact annotation ((${SECOND_SECOND_ID}))`,
+  "- [[hls__logseq-second]]",
   "",
 ].join("\n"));
 
@@ -193,23 +238,27 @@ try {
     throw new Error(`Logseq zoom-space highlight was misplaced: ${JSON.stringify(geometry)}`);
   }
 
-  // OG persists last-view page/scale in :extra after a debounce. Tine must
-  // update only those fields, retaining both unknown :extra and root data. A
-  // target switch is a complete viewer identity boundary: cleanup flushes A to
-  // A, then B opens with only B's state and sidecar baseline.
+  // OG carries an annotation entity through block-ref navigation, then scrolls
+  // to that exact highlight. A filename is the resource identity; a second
+  // target in the same file must not remount it. A different filename still is
+  // a complete boundary: cleanup flushes A to A, then B opens only B's state.
   await browser.$('button[title="Zoom in"]').click();
-  await browser.execute(() => {
-    const links = [...document.querySelectorAll(".pdf-link")];
-    links[1]?.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
-  });
+
+  // First prove ordinary direct-link A -> B -> A with real pointer clicks and
+  // visibly distinct document bytes, before exercising highlight entry paths.
+  let pdfLinks = await browser.$$(".pdf-link");
+  await pdfLinks[1].click();
   await browser.waitUntil(() => browser.execute(() =>
     document.querySelector(".pdf-viewer")?.getAttribute("data-pdf-filename") === "logseq-second.pdf" &&
     document.querySelector(".pdf-viewer")?.getAttribute("data-pdf-ready") === "true"), {
     timeout: 10_000,
-    timeoutMsg: "switching PDFs did not replace and finish loading the viewer identity",
+    timeoutMsg: "a direct PDF link did not switch from A to B",
   });
-  const secondZoom = await browser.$(".pdf-zoom-level").getText();
-  if (secondZoom !== "125%") throw new Error(`second PDF inherited the first PDF scale: ${secondZoom}`);
+  await browser.waitUntil(() => browser.execute(() =>
+    document.querySelector(".textLayer")?.textContent?.includes("Second PDF test")), {
+    timeout: 10_000,
+    timeoutMsg: "PDF B's distinct text never appeared",
+  });
   await browser.waitUntil(() => {
     const written = fs.readFileSync(sidecar, "utf8");
     return written.includes(":scale 1.93") && written.includes(':plugin "keep"') && written.includes(":future-root 42");
@@ -217,10 +266,68 @@ try {
   if (fs.readFileSync(secondSidecar, "utf8") !== originalSecondSidecar) {
     throw new Error("switching from PDF A wrote A's pending state or baseline into PDF B");
   }
-  await browser.execute(() => {
-    const links = [...document.querySelectorAll(".pdf-link")];
-    links[0]?.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+  pdfLinks = await browser.$$(".pdf-link");
+  await pdfLinks[0].click();
+  await browser.waitUntil(() => browser.execute(() =>
+    document.querySelector(".pdf-viewer")?.getAttribute("data-pdf-filename") === "logseq-sample.pdf" &&
+    document.querySelector(".pdf-viewer")?.getAttribute("data-pdf-ready") === "true"), {
+    timeout: 10_000,
+    timeoutMsg: "a direct PDF link did not switch from B back to A",
   });
+  const directReturnedZoom = await browser.$(".pdf-zoom-level").getText();
+  if (directReturnedZoom !== "193%") throw new Error(`PDF A did not restore its own state after direct B: ${directReturnedZoom}`);
+
+  const firstSecondRef = browser.$(`[data-block-ref="${SECOND_FIRST_ID}"]`);
+  await firstSecondRef.waitForExist({ timeout: 10_000 });
+  await firstSecondRef.click();
+  await browser.waitUntil(() => browser.execute((highlightId) =>
+    document.querySelector(".pdf-viewer")?.getAttribute("data-pdf-filename") === "logseq-second.pdf" &&
+    document.querySelector(".pdf-viewer")?.getAttribute("data-pdf-highlight-target") === highlightId &&
+    document.querySelector(".pdf-hl-target")?.getAttribute("data-highlight-id") === highlightId &&
+    document.querySelector(".pdf-viewer")?.getAttribute("data-pdf-ready") === "true", SECOND_FIRST_ID), {
+    timeout: 10_000,
+    timeoutMsg: "a block reference did not open PDF B at its exact first highlight",
+  });
+  const secondViewerElementId = (await browser.$(".pdf-viewer")).elementId;
+  const secondZoom = await browser.$(".pdf-zoom-level").getText();
+  if (secondZoom !== "125%") throw new Error(`second PDF inherited the first PDF scale: ${secondZoom}`);
+  if (fs.readFileSync(secondSidecar, "utf8") !== originalSecondSidecar) {
+    throw new Error("switching from PDF A wrote A's pending state or baseline into PDF B");
+  }
+
+  await browser.$(`[data-block-ref="${SECOND_SECOND_ID}"]`).click();
+  await browser.waitUntil(() => browser.execute((highlightId) =>
+    document.querySelector(".pdf-viewer")?.getAttribute("data-pdf-highlight-target") === highlightId &&
+    document.querySelector(".pdf-hl-target")?.getAttribute("data-highlight-id") === highlightId, SECOND_SECOND_ID), {
+    timeout: 10_000,
+    timeoutMsg: "a same-PDF block reference did not scroll to its exact second highlight",
+  });
+  if ((await browser.$(".pdf-viewer")).elementId !== secondViewerElementId) {
+    throw new Error("same-PDF highlight navigation remounted the PDF resource");
+  }
+  if (fs.readFileSync(secondSidecar, "utf8") !== originalSecondSidecar) {
+    throw new Error("same-PDF highlight navigation rewrote the sidecar");
+  }
+
+  // Exercise the sibling entry surface too: navigate to the hls page and click
+  // the rendered annotation badge, not merely an inline ((block ref)).
+  await browser.$("=hls__logseq-second").click();
+  await browser.$(`.pdf-annotation-line .hl-prefix[data-highlight-id="${SECOND_FIRST_ID}"]`)
+    .waitForExist({ timeout: 10_000 });
+  await browser.$(`.pdf-annotation-line .hl-prefix[data-highlight-id="${SECOND_FIRST_ID}"]`).click();
+  await browser.waitUntil(() => browser.execute((highlightId) =>
+    document.querySelector(".pdf-hl-target")?.getAttribute("data-highlight-id") === highlightId, SECOND_FIRST_ID), {
+    timeout: 10_000,
+    timeoutMsg: "a rendered AnnotationBody did not navigate to its exact highlight",
+  });
+  if ((await browser.$(".pdf-viewer")).elementId !== secondViewerElementId) {
+    throw new Error("AnnotationBody navigation remounted the same PDF resource");
+  }
+
+  await browser.back();
+  await browser.$(`[data-block-ref="${SECOND_FIRST_ID}"]`).waitForExist({ timeout: 10_000 });
+  pdfLinks = await browser.$$(".pdf-link");
+  await pdfLinks[0].click();
   await browser.waitUntil(() => browser.execute(() =>
     document.querySelector(".pdf-viewer")?.getAttribute("data-pdf-filename") === "logseq-sample.pdf" &&
     document.querySelector(".pdf-viewer")?.getAttribute("data-pdf-ready") === "true"), {
@@ -252,7 +359,7 @@ try {
       written.includes(":rects (") && written.includes(":x1 ") &&
       written.includes(":extra {:page 1") && written.includes(':plugin "keep"') && written.includes(":future-root 42");
   }, { timeout: 10_000, timeoutMsg: "Tine did not persist a Logseq-compatible sidecar" });
-  console.log(`PASS: Logseq PDFs switch as isolated identities with bounded resources, restored view state, OG-compatible notes, correct geometry, and compatible write-back on ${process.platform}`);
+  console.log(`PASS: Logseq PDFs keep asset identity separate from exact highlight navigation, with bounded resources, restored view state, OG-compatible notes, correct geometry, and compatible write-back on ${process.platform}`);
 } finally {
   try { await browser?.deleteSession(); } catch {}
   if (process.platform === "win32") spawnSync("taskkill", ["/PID", String(td.pid), "/T", "/F"], { stdio: "ignore" });

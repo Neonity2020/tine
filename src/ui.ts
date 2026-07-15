@@ -1207,15 +1207,19 @@ export function closePdfExport() {
   setPdfExportPage(null);
 }
 
-// The PDF currently open in the side pane (filename within assets/, + label,
-// + an optional page to scroll to).
-export const [pdfTarget, setPdfTarget] = createSignal<{
+// The PDF currently open in the side pane. `filename` is the stable resource
+// identity; page/highlightId are a navigation intent within that resource.
+// Keeping those concepts separate lets a second reference into the same PDF
+// scroll precisely without tearing down the loaded document.
+export interface PdfTarget {
   filename: string;
   label: string;
   page?: number;
-} | null>(null);
-export function openPdf(filename: string, label: string, page?: number) {
-  setPdfTarget({ filename, label, page });
+  highlightId?: string;
+}
+export const [pdfTarget, setPdfTarget] = createSignal<PdfTarget | null>(null);
+export function openPdf(filename: string, label: string, page?: number, highlightId?: string) {
+  setPdfTarget({ filename, label, page, highlightId });
 }
 export function closePdf() {
   setPdfTarget(null);

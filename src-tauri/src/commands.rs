@@ -27,7 +27,7 @@ fn enforce_result_bridge_budget(groups: &[RefGroup]) -> Result<(), String> {
 }
 
 fn bounded_groups_or_error(
-    result: tine_core::query::BoundedGroups,
+    result: tine_core::model::BoundedRefGroups,
 ) -> Result<Arc<Vec<RefGroup>>, String> {
     if result.exceeded {
         return Err(format!(
@@ -35,7 +35,7 @@ fn bounded_groups_or_error(
             result.total
         ));
     }
-    Ok(Arc::new(result.groups))
+    Ok(result.groups)
 }
 
 fn enforce_query_execution_budget(
@@ -330,8 +330,7 @@ pub(crate) fn get_backlinks(
     state: GraphContext<'_>,
 ) -> Result<Arc<Vec<RefGroup>>, String> {
     with_graph(&state, |g| {
-        bounded_groups_or_error(tine_core::query::backlinks_bounded(
-            g,
+        bounded_groups_or_error(g.backlinks_bounded(
             &name,
             RESULT_BRIDGE_MAX_ROWS,
             RESULT_BRIDGE_MAX_BYTES,
@@ -345,8 +344,7 @@ pub(crate) fn get_unlinked_refs(
     state: GraphContext<'_>,
 ) -> Result<Arc<Vec<RefGroup>>, String> {
     with_graph(&state, |g| {
-        bounded_groups_or_error(tine_core::query::unlinked_refs_bounded(
-            g,
+        bounded_groups_or_error(g.unlinked_refs_bounded(
             &name,
             RESULT_BRIDGE_MAX_ROWS,
             RESULT_BRIDGE_MAX_BYTES,
@@ -375,8 +373,7 @@ pub(crate) fn block_referrers(
     state: GraphContext<'_>,
 ) -> Result<Arc<Vec<RefGroup>>, String> {
     with_graph(&state, |g| {
-        bounded_groups_or_error(tine_core::query::block_referrers_bounded(
-            g,
+        bounded_groups_or_error(g.block_referrers_bounded(
             &uuid,
             RESULT_BRIDGE_MAX_ROWS,
             RESULT_BRIDGE_MAX_BYTES,
@@ -429,8 +426,7 @@ pub(crate) fn run_query(
     state: GraphContext<'_>,
 ) -> Result<Arc<Vec<RefGroup>>, String> {
     with_graph(&state, |g| {
-        bounded_groups_or_error(tine_core::query::run_query_bounded(
-            g,
+        bounded_groups_or_error(g.run_query_bounded(
             &query,
             RESULT_BRIDGE_MAX_ROWS,
             RESULT_BRIDGE_MAX_BYTES,
@@ -528,8 +524,7 @@ pub(crate) fn run_advanced_query(
     state: GraphContext<'_>,
 ) -> Result<tine_core::query::AdvancedResult, String> {
     with_graph(&state, |g| {
-        let (result, exceeded, total) = tine_core::query::run_advanced_query_bounded(
-            g,
+        let (result, exceeded, total) = g.run_advanced_query_bounded_cached(
             &query,
             current_page.as_deref(),
             RESULT_BRIDGE_MAX_ROWS,

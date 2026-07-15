@@ -15,10 +15,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   separately for HTML attributes and URL fragments, ordinary links and media
   macros share a safe-scheme policy, and the site CSP no longer permits inline
   script handlers.
-- **PDF switching and Find are document-scoped and memory-bounded.** Changing
-  assets tears down the old viewer before mounting the new identity, including
-  delayed state writes and late pdf.js loads; Find retains a bounded text LRU,
-  caps page text and occurrences, and drops cancelled work. (GH #169)
+- **PDF resources, highlight navigation, and Find have the right lifetimes.**
+  Changing assets tears down the old viewer before mounting the new identity,
+  including delayed state writes and late pdf.js loads; references into the
+  already-open asset keep it mounted and scroll to the exact highlight rather
+  than only its page. Find retains a bounded text LRU, caps page text and
+  occurrences, and drops cancelled work. (GH #169)
 - **Graph-open background work and result construction have hard ceilings.** A
   replaced graph binding cancels warm-cache and backup work between files,
   process-wide permits prevent I/O amplification, failed `.partial-*` backups
