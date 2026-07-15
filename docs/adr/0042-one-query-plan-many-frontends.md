@@ -33,14 +33,17 @@ match evidence, diagnostics, and optional explanation data. Existing query DSL
 defaults to block targets and non-fuzzy matching. Ctrl+K may execute a combined
 page/block plan, but commands and page creation remain outside the query engine.
 
-Block-result membership is identity-based and non-overlapping. Matching follows
-Logseq OG's `tree/filter-top-level-blocks`: if a matching block contains another
-match, the ancestor is the result root and the descendant remains in its live
-subtree rather than becoming a second overlapping root. Query, reference,
+Block-result membership is identity-based. Query presentation transcribes
+Logseq OG's `tree/filter-top-level-blocks` literally: a result is suppressed only
+when its immediate parent is also present in the unfiltered result set. A matching
+descendant below a non-matching intermediate block remains a separate result.
+Reference occurrence surfaces do not reuse that presentation filter: every
+referring block remains independently countable and navigable. Query, reference,
 search, and batched block-resolution DTOs are shallow; list/embed renderers load
-the source page once to obtain hierarchy. A consumer that genuinely needs an
-owned subtree (hover or export) must use an explicit pre-serialization node
-budget. Native bridge commands also enforce total row and byte budgets.
+source hierarchy only where their presentation calls for it. A consumer that
+genuinely needs an owned subtree (hover or export) must apply explicit node and
+byte/work budgets before hydration and serialization. Native bridge commands
+also enforce total row and byte budgets.
 
 Search workspaces are virtual, graph-scoped, device-local routes that persist the
 source expression rather than a result snapshot. They create no graph file until

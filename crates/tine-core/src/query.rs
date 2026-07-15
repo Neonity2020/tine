@@ -26,26 +26,57 @@ fn walk<'a>(blocks: &'a [DocBlock], f: &mut impl FnMut(&'a DocBlock)) {
     }
 }
 
-/// Collect the outermost matches in document order. This mirrors Logseq OG's
-/// `tree/filter-top-level-blocks`: once a block is a result, matching descendants
-/// remain part of that block's live subtree instead of becoming overlapping
-/// result roots of their own. `classify` is evaluated exactly once per visited
-/// candidate and can carry evidence alongside the match.
-fn collect_top_level_path<'a, T>(
+/// Collect matches in document order while evaluating every candidate exactly
+/// once. OG query presentation removes a result only when its *immediate parent*
+/// is also in the unfiltered result set (`tree/filter-top-level-blocks`); it does
+/// not prune the rest of a matching block's subtree. Reference occurrence
+/// surfaces use `suppress_direct_child = false` because every referring block is
+/// independently countable/navigable.
+fn collect_matching_path<'a, T>(
+    blocks: &'a [DocBlock],
+    path: &mut Vec<&'a DocBlock>,
+    parent_matched: bool,
+    suppress_direct_child: bool,
+    classify: &mut impl FnMut(&'a DocBlock, &[&'a DocBlock]) -> Option<T>,
+    out: &mut Vec<T>,
+) {
+    for block in blocks {
+        let item = classify(block, path);
+        let matched = item.is_some();
+        if let Some(item) = item {
+            if !suppress_direct_child || !parent_matched {
+                out.push(item);
+            }
+        }
+        path.push(block);
+        collect_matching_path(
+            &block.children,
+            path,
+            matched,
+            suppress_direct_child,
+            classify,
+            out,
+        );
+        path.pop();
+    }
+}
+
+fn collect_og_query_roots<'a, T>(
     blocks: &'a [DocBlock],
     path: &mut Vec<&'a DocBlock>,
     classify: &mut impl FnMut(&'a DocBlock, &[&'a DocBlock]) -> Option<T>,
     out: &mut Vec<T>,
 ) {
-    for block in blocks {
-        if let Some(item) = classify(block, path) {
-            out.push(item);
-            continue;
-        }
-        path.push(block);
-        collect_top_level_path(&block.children, path, classify, out);
-        path.pop();
-    }
+    collect_matching_path(blocks, path, false, true, classify, out);
+}
+
+fn collect_reference_matches<'a, T>(
+    blocks: &'a [DocBlock],
+    path: &mut Vec<&'a DocBlock>,
+    classify: &mut impl FnMut(&'a DocBlock, &[&'a DocBlock]) -> Option<T>,
+    out: &mut Vec<T>,
+) {
+    collect_matching_path(blocks, path, false, false, classify, out);
 }
 
 /// Cancellable variant used by interactive search. Returning false from `f`
@@ -91,7 +122,7 @@ fn collect(
                 }
             }
             let mut path: Vec<&DocBlock> = Vec::new();
-            collect_top_level_path(
+            collect_reference_matches(
                 &doc.roots,
                 &mut path,
                 &mut |b, anc| {
@@ -316,7 +347,7 @@ fn collect_reference_occurrences(
             }
             let mut path = Vec::new();
             let mut found = Vec::new();
-            collect_top_level_path(
+            collect_reference_matches(
                 &doc.roots,
                 &mut path,
                 &mut |block, ancestors| {
@@ -509,7 +540,7 @@ fn run_pred(graph: &Graph, pred: &Pred, opts: &QueryOpts) -> Vec<RefGroup> {
             };
             let mut matched: Vec<BlockDto> = Vec::new();
             let mut path = Vec::new();
-            collect_top_level_path(
+            collect_og_query_roots(
                 &doc.roots,
                 &mut path,
                 &mut |block, _| pred.eval(block, &ctx).then(|| block_to_shallow_dto(block)),
@@ -1447,14 +1478,31 @@ fn subtree_node_count(root: &DocBlock) -> usize {
     count
 }
 
-fn block_to_bounded_dto(block: &DocBlock, remaining: &mut usize) -> Option<BlockDto> {
-    if *remaining == 0 {
+fn block_to_bounded_dto(
+    block: &DocBlock,
+    remaining_nodes: &mut usize,
+    remaining_bytes: &mut usize,
+) -> Option<BlockDto> {
+    if *remaining_nodes == 0 {
         return None;
     }
-    *remaining -= 1;
+    let minimum_bytes = block
+        .raw
+        .len()
+        .saturating_add(if block.uuid.is_empty() { 36 } else { block.uuid.len() })
+        .saturating_add(128);
+    if minimum_bytes > *remaining_bytes {
+        return None;
+    }
     let mut dto = block_to_shallow_dto(block);
+    let dto_bytes = crate::model::block_dto_estimated_bytes(&dto);
+    if dto_bytes > *remaining_bytes {
+        return None;
+    }
+    *remaining_nodes -= 1;
+    *remaining_bytes -= dto_bytes;
     for child in &block.children {
-        let Some(child_dto) = block_to_bounded_dto(child, remaining) else {
+        let Some(child_dto) = block_to_bounded_dto(child, remaining_nodes, remaining_bytes) else {
             break;
         };
         dto.children.push(child_dto);
@@ -1463,10 +1511,26 @@ fn block_to_bounded_dto(block: &DocBlock, remaining: &mut usize) -> Option<Block
 }
 
 /// Resolve one block for a hover/export consumer that explicitly needs a
-/// subtree. Unlike ordinary resolution this operation is bounded before DTO
-/// allocation and serialization; `truncated` reports the omitted node count.
+/// subtree. This compatibility wrapper applies the caller's node bound; native
+/// and export consumers use `preview_block_with_budget` to add a byte bound.
 pub fn preview_block(graph: &Graph, uuid: &str, max_nodes: usize) -> Option<BlockPreview> {
+    preview_block_with_budget(graph, uuid, max_nodes, usize::MAX)
+}
+
+/// Node-and-byte-bounded preview used by IPC and static/export consumers. The
+/// byte cap is applied while constructing the DTO, so a legal node count cannot
+/// still create an unbounded structured-clone payload. If even the root cannot
+/// fit, the preview is returned with an empty block list and the exact omitted
+/// count; callers can disclose truncation without confusing "too large" with
+/// "block not found".
+pub fn preview_block_with_budget(
+    graph: &Graph,
+    uuid: &str,
+    max_nodes: usize,
+    max_bytes: usize,
+) -> Option<BlockPreview> {
     let max_nodes = max_nodes.max(1);
+    let max_bytes = max_bytes.max(1);
     let hint = graph.block_page_hint(uuid);
     graph.with_pages(|pages| {
         let find_in = |entry: &PageEntry, doc: &Document| -> Option<BlockPreview> {
@@ -1480,15 +1544,21 @@ pub fn preview_block(graph: &Graph, uuid: &str, max_nodes: usize) -> Option<Bloc
             });
             found.map(|block| {
                 let total = subtree_node_count(block);
-                let mut remaining = max_nodes;
-                let dto = block_to_bounded_dto(block, &mut remaining)
-                    .expect("a positive preview budget always emits its root");
-                let emitted = max_nodes - remaining;
+                let mut remaining_nodes = max_nodes;
+                let mut remaining_bytes = max_bytes;
+                let blocks = block_to_bounded_dto(
+                    block,
+                    &mut remaining_nodes,
+                    &mut remaining_bytes,
+                )
+                .into_iter()
+                .collect::<Vec<_>>();
+                let emitted = max_nodes - remaining_nodes;
                 BlockPreview {
                     group: RefGroup {
                         page: entry.name.clone(),
                         kind: entry.kind,
-                        blocks: vec![dto],
+                        blocks,
                         evidence: Vec::new(),
                     },
                     truncated: total.saturating_sub(emitted),
@@ -2908,9 +2978,10 @@ mod tests {
 
     /// Regression for the pre-0.6 performance audit: recursive `block_to_dto`
     /// used to clone a nested suffix for every matching/query/reference id,
-    /// producing N(N+1)/2 wire nodes (and ~1.8 GiB RSS at N=2,000). OG first
-    /// filters result membership to top-level matches; ordinary/batch resolution
-    /// is shallow, and an explicit preview is bounded before allocation.
+    /// producing N(N+1)/2 wire nodes (and ~1.8 GiB RSS at N=2,000). OG query
+    /// presentation suppresses a result whose direct parent is also a result;
+    /// references retain every occurrence. All wire rows stay shallow, and an
+    /// explicit preview is bounded before allocation.
     #[test]
     fn nested_result_contract_is_non_overlapping_and_preview_is_bounded() {
         use std::fs;
@@ -2958,8 +3029,16 @@ mod tests {
         assert_eq!(dto_nodes(&query[0].blocks), 1, "query membership DTOs stay shallow");
 
         let linked = backlinks(&graph, "Target");
-        assert_eq!(linked.iter().map(|g| g.blocks.len()).sum::<usize>(), 1);
-        assert_eq!(dto_nodes(&linked[0].blocks), 1, "reference rows stay shallow");
+        assert_eq!(linked.iter().map(|g| g.blocks.len()).sum::<usize>(), DEPTH);
+        assert_eq!(
+            linked
+                .iter()
+                .flat_map(|group| &group.blocks)
+                .map(|block| dto_nodes(std::slice::from_ref(block)))
+                .sum::<usize>(),
+            DEPTH,
+            "every reference occurrence remains independently countable but shallow"
+        );
 
         let resolved = resolve_blocks(&graph, &ids);
         assert_eq!(resolved.len(), DEPTH);
@@ -2976,6 +3055,83 @@ mod tests {
         let preview = preview_block(&graph, &ids[0], 50).unwrap();
         assert_eq!(dto_nodes(&preview.group.blocks), 50);
         assert_eq!(preview.truncated, DEPTH - 50);
+
+        let byte_bounded = preview_block_with_budget(&graph, &ids[0], DEPTH, 512).unwrap();
+        assert!(
+            byte_bounded
+                .group
+                .blocks
+                .iter()
+                .map(crate::model::block_dto_estimated_bytes)
+                .sum::<usize>()
+                <= 512
+        );
+        assert!(byte_bounded.truncated > 0);
+
+        let root_too_large = preview_block_with_budget(&graph, &ids[0], DEPTH, 64).unwrap();
+        assert!(root_too_large.group.blocks.is_empty());
+        assert_eq!(root_too_large.truncated, DEPTH);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn og_query_roots_and_reference_occurrences_cover_matching_descendants_below_a_gap() {
+        use std::fs;
+
+        const TARGET_ID: &str = "11111111-1111-4111-8111-111111111111";
+        let dir = std::env::temp_dir().join(format!(
+            "tine-og-query-root-gap-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("pages")).unwrap();
+        fs::create_dir_all(dir.join("journals")).unwrap();
+        fs::write(
+            dir.join("pages").join("Nested.md"),
+            format!(
+                "- TODO [[Target]] (({TARGET_ID})) PlainName ancestor\n  - DONE non-matching gap\n    - TODO [[Target]] (({TARGET_ID})) PlainName grandchild\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("pages").join("Target.md"),
+            format!("- target\n  id:: {TARGET_ID}\n"),
+        )
+        .unwrap();
+        fs::write(dir.join("pages").join("PlainName.md"), "- target\n").unwrap();
+
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+        let raws = |groups: &[RefGroup]| {
+            groups
+                .iter()
+                .flat_map(|group| group.blocks.iter().map(|block| block.raw.clone()))
+                .collect::<Vec<_>>()
+        };
+
+        let simple = raws(&run_query(&graph, "(task TODO)"));
+        assert_eq!(simple.len(), 2);
+        assert!(simple.iter().any(|raw| raw.contains("ancestor")));
+        assert!(simple.iter().any(|raw| raw.contains("grandchild")));
+
+        let advanced = run_advanced_query(
+            &graph,
+            "[:find (pull ?b [*]) :where (task ?b \"TODO\")]",
+            None,
+        );
+        assert!(advanced.supported);
+        assert_eq!(raws(&advanced.groups).len(), 2);
+
+        let linked = backlinks(&graph, "Target");
+        assert_eq!(raws(&linked).len(), 2);
+        assert_eq!(linked.iter().map(|group| group.evidence.len()).sum::<usize>(), 2);
+
+        let unlinked = unlinked_refs(&graph, "PlainName");
+        assert_eq!(raws(&unlinked).len(), 2);
+        assert_eq!(unlinked.iter().map(|group| group.evidence.len()).sum::<usize>(), 2);
+
+        assert_eq!(raws(&block_referrers(&graph, TARGET_ID)).len(), 2);
 
         let _ = fs::remove_dir_all(&dir);
     }

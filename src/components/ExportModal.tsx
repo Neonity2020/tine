@@ -181,29 +181,36 @@ function copyTreeWithinBudget(block: BlockDto, remaining: { nodes: number; omitt
   return { ...block, children };
 }
 
-async function queryGroupsToExportNodes(
+export async function queryGroupsToExportNodes(
   groups: RefGroup[],
   pages: PageReadCache,
+  loadPage: typeof cachedPage = cachedPage,
 ): Promise<{ nodes: ExportNode[]; shown: number; total: number; omittedNodes: number }> {
   let shown = 0;
   let selected = 0;
-  let total = 0;
+  const total = groups.reduce((count, group) => count + group.blocks.length, 0);
   const nodes: ExportNode[] = [];
   const remaining = { nodes: QUERY_EXPORT_NODE_LIMIT, omitted: 0 };
   for (const g of groups) {
-    const page = await cachedPage(pages, g.page, g.kind);
+    // The result and node caps bound work, not just emitted text. Count every
+    // shallow membership row up front, then hydrate only source pages that can
+    // still contribute one of the first roots. A broad query must not turn a
+    // 50-root clipboard export into thousands of full-page IPCs and retained
+    // PageDto promises.
+    if (selected >= QUERY_EXPORT_BLOCK_LIMIT || remaining.nodes <= 0) break;
+    const candidates = g.blocks.slice(0, QUERY_EXPORT_BLOCK_LIMIT - selected);
+    if (!candidates.length) continue;
+    const page = await loadPage(pages, g.page, g.kind);
     const byId = page ? indexPageBlocks(page.blocks) : new Map<string, BlockDto>();
     const kept: BlockDto[] = [];
-    for (const block of g.blocks) {
-      total++;
-      if (selected < QUERY_EXPORT_BLOCK_LIMIT) {
-        selected++;
-        const source = byId.get(block.id) ?? block;
-        const copied = copyTreeWithinBudget(source, remaining);
-        if (copied) {
-          kept.push(copied);
-          shown++;
-        }
+    for (const block of candidates) {
+      if (remaining.nodes <= 0) break;
+      selected++;
+      const source = byId.get(block.id) ?? block;
+      const copied = copyTreeWithinBudget(source, remaining);
+      if (copied) {
+        kept.push(copied);
+        shown++;
       }
     }
     if (kept.length) {

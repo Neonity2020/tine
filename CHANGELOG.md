@@ -11,11 +11,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 ### Fixed
 
 - **Nested query, reference, and block-resolution results no longer amplify
-  overlapping subtrees quadratically.** Matching membership now follows
-  Logseq's top-level-result rule and crosses the native bridge as shallow block
-  identities; live pages hydrate hierarchy once, hover/export subtree requests
-  are explicitly bounded, and oversized result payloads stop with a useful
-  narrowing message before serialization.
+  overlapping subtrees quadratically or omit valid nested occurrences.** Query
+  shaping now transcribes Logseq's actual rule—suppress a match only when its
+  immediate parent also matched—while reference panels retain every independently
+  countable occurrence. All native result rows stay shallow; hover previews are
+  bounded by nodes and bytes before transport, and Copy/Export applies its
+  50-root/2,000-node cap before loading source pages.
 - **Backup restore stays inside the selected graph under symlink and directory
   races.** Recovery areas and live-file publication are now bound to opened
   directory capabilities, use create-without-replace semantics, and refuse a

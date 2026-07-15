@@ -208,11 +208,12 @@ pub struct RefGroup {
 /// A deliberately bounded block-reference hover preview. Ordinary query,
 /// reference, and batched-resolution results carry shallow block identities;
 /// callers that genuinely need a subtree must ask for one explicitly and give
-/// it a node budget so an outline cannot be multiplied across the IPC bridge.
+/// it node and byte budgets so an outline cannot be multiplied across the IPC
+/// bridge.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockPreview {
     pub group: RefGroup,
-    /// Number of descendant nodes omitted after `max_nodes` was reached.
+    /// Number of nodes omitted after either construction budget was reached.
     pub truncated: usize,
 }
 
@@ -3446,6 +3447,15 @@ impl Graph {
     /// Resolve a bounded subtree for an explicitly expanded preview/export.
     pub fn preview_block(&self, uuid: &str, max_nodes: usize) -> Option<BlockPreview> {
         crate::query::preview_block(self, uuid, max_nodes)
+    }
+
+    pub fn preview_block_with_budget(
+        &self,
+        uuid: &str,
+        max_nodes: usize,
+        max_bytes: usize,
+    ) -> Option<BlockPreview> {
+        crate::query::preview_block_with_budget(self, uuid, max_nodes, max_bytes)
     }
 
     /// The graph's `logseq/custom.css`, if present (for user theming).

@@ -231,7 +231,7 @@
     },
     {
       "id": "REG-RESULT-SUBTREE-NONOVERLAP-001",
-      "title": "Nested query reference and resolution membership never duplicates overlapping subtrees across the bridge",
+      "title": "Nested query/reference memberships stay complete and shallow while preview/export work remains bounded",
       "family": "performance",
       "sources": { "issues": [], "commits": [] },
       "platforms": ["all"],
@@ -241,10 +241,11 @@
         "tests": [
           "crates/tine-core/src/query.rs",
           "src-tauri/src/commands.rs",
+          "src/components/ExportModal.queryBudget.test.tsx",
           "src/components/Block.embedHierarchy.test.tsx",
           "src/render/pagePeek.test.tsx"
         ],
-        "scenario": "performance.result-subtree-nonoverlap-and-bounded-preview",
+        "scenario": "performance.complete-shallow-membership-and-bounded-preview-export",
         "failBefore": "proven"
       }
     }

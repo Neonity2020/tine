@@ -169,9 +169,11 @@ files. **⊕ marks things Tine adds on top of Logseq core** (no plugins).
   surface, a Gmail-style filter dialog, the interactive **visual query builder**
   (chip/clause bar), and the raw DSL all compile to the same query plan. Explanations
   show what Tine understood and diagnostics identify unsupported or invalid parts.
-  Nested matches follow Logseq's top-level-result rule: one live ancestor subtree,
-  never repeated owned copies of the same descendants; explicit previews/exports
-  and native result transport are bounded before serialization.
+  Nested query matches follow Logseq's exact top-level-result rule: a match is
+  suppressed only when its immediate parent is also a match, so a valid match
+  below a non-matching gap remains visible. Reference surfaces keep every direct
+  occurrence. Transport rows stay shallow, while explicit previews/exports are
+  node-and-byte/work bounded before hydration or serialization.
   The builder's **Sort** control offers one-click presets
   — *Newest / Oldest first*, *Priority*, *Page*, *Deadline*, *Scheduled* — plus a
   free-text field for any other property. *Newest first* orders results on one

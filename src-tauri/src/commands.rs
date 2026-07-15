@@ -594,7 +594,17 @@ pub(crate) fn preview_block(
 ) -> Result<Option<tine_core::BlockPreview>, String> {
     const MAX_PREVIEW_NODES: usize = 2_000;
     with_graph(&state, |g| {
-        Ok(g.preview_block(&uuid, max_nodes.clamp(1, MAX_PREVIEW_NODES)))
+        // Leave room for RefGroup/page/serializer overhead, then assert the
+        // shared bridge invariant as a second line of defense.
+        let preview = g.preview_block_with_budget(
+            &uuid,
+            max_nodes.clamp(1, MAX_PREVIEW_NODES),
+            RESULT_BRIDGE_MAX_BYTES.saturating_sub(4 * 1024),
+        );
+        if let Some(preview) = &preview {
+            enforce_result_bridge_budget(std::slice::from_ref(&preview.group))?;
+        }
+        Ok(preview)
     })
 }
 

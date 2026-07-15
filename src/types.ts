@@ -23,10 +23,10 @@ export interface BlockDto {
   properties?: [string, string][];
 }
 
-/** Explicitly bounded subtree used only for block-reference previews/exports. */
+/** Node-and-byte-bounded subtree used only for block-reference previews/exports. */
 export interface BlockPreview {
   group: RefGroup;
-  /** Descendant nodes omitted after the requested preview budget. */
+  /** Nodes omitted after the requested preview construction budget. */
   truncated: number;
 }
 

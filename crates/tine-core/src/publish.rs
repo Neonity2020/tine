@@ -929,10 +929,9 @@ fn collect_wanted_doc_blocks<'a>(
     for block in blocks {
         if wanted.contains(block.uuid.as_str()) {
             found.insert(block.uuid.as_str(), block);
-            // Query results are top-level/non-overlapping, so a matched root's
-            // descendants cannot be independent roots in the same group.
-            continue;
         }
+        // OG can retain a matching descendant below a non-matching child of a
+        // retained ancestor. Keep walking so both roots hydrate from source.
         collect_wanted_doc_blocks(&block.children, wanted, found);
     }
 }
@@ -940,35 +939,40 @@ fn collect_wanted_doc_blocks<'a>(
 /// Query DTOs intentionally carry shallow membership rows. Static publishing
 /// has the source graph in-process, so hydrate each result subtree directly from
 /// its page once instead of shipping/caching overlapping owned DTO trees.
-fn render_query_group(
+fn render_query_groups(
     graph: &Graph,
-    group: &RefGroup,
+    groups: &[RefGroup],
     out: &mut String,
     ctx: &Ctx,
     depth: u8,
 ) {
     graph.with_pages(|pages| {
-        let Some((_, doc)) = pages
+        // One lookup index for the complete query avoids O(pages * groups)
+        // source-page scans during static/print export.
+        let page_by_key = pages
             .iter()
-            .find(|(entry, _)| entry.name == group.page && entry.kind == group.kind)
-        else {
+            .map(|(entry, doc)| ((entry.name.as_str(), entry.kind), doc.as_ref()))
+            .collect::<std::collections::HashMap<_, _>>();
+        for group in groups {
+            let Some(doc) = page_by_key.get(&(group.page.as_str(), group.kind)) else {
+                for block in &group.blocks {
+                    render_result_block(block, out, ctx, depth);
+                }
+                continue;
+            };
+            let wanted = group
+                .blocks
+                .iter()
+                .map(|block| block.id.as_str())
+                .collect::<std::collections::HashSet<_>>();
+            let mut found = std::collections::HashMap::with_capacity(wanted.len());
+            collect_wanted_doc_blocks(&doc.roots, &wanted, &mut found);
             for block in &group.blocks {
-                render_result_block(block, out, ctx, depth);
-            }
-            return;
-        };
-        let wanted = group
-            .blocks
-            .iter()
-            .map(|block| block.id.as_str())
-            .collect::<std::collections::HashSet<_>>();
-        let mut found = std::collections::HashMap::with_capacity(wanted.len());
-        collect_wanted_doc_blocks(&doc.roots, &wanted, &mut found);
-        for block in &group.blocks {
-            if let Some(source) = found.get(block.id.as_str()) {
-                render_embedded_block(source, out, ctx, depth);
-            } else {
-                render_result_block(block, out, ctx, depth);
+                if let Some(source) = found.get(block.id.as_str()) {
+                    render_embedded_block(source, out, ctx, depth);
+                } else {
+                    render_result_block(block, out, ctx, depth);
+                }
             }
         }
     });
@@ -1062,9 +1066,7 @@ fn render_query(graph: &Graph, src: &str, ctx: &Ctx, depth: u8) -> String {
         out.push_str("<div class=\"query-empty\">No matching blocks.</div>");
     } else {
         out.push_str("<ul class=\"query-results\">");
-        for group in &groups {
-            render_query_group(graph, group, &mut out, ctx, depth);
-        }
+        render_query_groups(graph, &groups, &mut out, ctx, depth);
         out.push_str("</ul>");
     }
     out.push_str("</div>");
@@ -1080,7 +1082,13 @@ fn render_embed(graph: &Graph, arg: &str, ctx: &Ctx, depth: u8) -> String {
                 .into();
         }
         const STATIC_EMBED_BLOCK_LIMIT: usize = 10_000;
-        return match crate::query::preview_block(graph, uuid, STATIC_EMBED_BLOCK_LIMIT) {
+        const STATIC_EMBED_BYTE_LIMIT: usize = 8 * 1024 * 1024;
+        return match crate::query::preview_block_with_budget(
+            graph,
+            uuid,
+            STATIC_EMBED_BLOCK_LIMIT,
+            STATIC_EMBED_BYTE_LIMIT,
+        ) {
             Some(preview) if publish_page_allowed(ctx, &preview.group.page) => {
                 let mut out = String::from(
                     "<div class=\"embed block-embed single-root\"><ul class=\"embed-outline\">",
@@ -3111,6 +3119,49 @@ mod tests {
             dash.matches("class=\"query\"").count(),
             5,
             "each macro occurrence still renders independently"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn publish_query_keeps_and_hydrates_a_match_below_a_nonmatching_gap() {
+        let dir = std::env::temp_dir().join(format!(
+            "tine-publish-query-gap-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("journals")).unwrap();
+        fs::create_dir_all(dir.join("pages")).unwrap();
+        fs::create_dir_all(dir.join("logseq")).unwrap();
+        fs::write(
+            dir.join("logseq").join("config.edn"),
+            "{:publishing/all-pages-public? true}\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("pages").join("Tasks.md"),
+            "- TODO parity ancestor\n  - DONE parity gap\n    - TODO parity grandchild\n      - live child below retained grandchild\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("pages").join("Dashboard.md"),
+            "- {{query (task TODO)}}\n",
+        )
+        .unwrap();
+
+        let graph = Graph::open(&dir);
+        let (outdir, _) = publish_graph(&graph).unwrap();
+        let dashboard =
+            fs::read_to_string(std::path::Path::new(&outdir).join("dashboard.html")).unwrap();
+
+        assert_eq!(dashboard.matches("parity grandchild").count(), 2, "{dashboard}");
+        assert_eq!(
+            dashboard
+                .matches("live child below retained grandchild")
+                .count(),
+            2,
+            "{dashboard}"
         );
 
         let _ = fs::remove_dir_all(&dir);
