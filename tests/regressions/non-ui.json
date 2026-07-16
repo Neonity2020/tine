@@ -5,7 +5,7 @@
       "id": "REG-QUERY-OG-MEMBERSHIP-BOUNDS-001",
       "title": "Simple query page terms unquoted search and date ranges match OG membership and bounds across presentations",
       "family": "query-correctness",
-      "sources": { "issues": [], "commits": ["b54a331", "8fa8c51", "cb9e749"] },
+      "sources": { "issues": [], "commits": ["b54a331", "8fa8c51", "cb9e749", "83f902b"] },
       "platforms": ["all"],
       "layer": "core-native-ui",
       "status": "covered",
