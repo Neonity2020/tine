@@ -282,11 +282,14 @@ try {
     connectionRetryTimeout: 60_000,
     capabilities: tauriCapabilities(APP, "initial", process.platform, webviewTarget.debuggerAddress),
   });
+  // EdgeDriver's WebView2 attach can complete while the target still exposes
+  // its transient pre-navigation document.  Wait for Tine's document before
+  // querying the Tauri bridge, just as the other real-app scenarios do.
+  await browser.$(".ls-block, .page-title").waitForExist({ timeout: 20_000 });
   receipt.appIdentity.version = await browser.execute(() => window.__TAURI_INTERNALS__.invoke("plugin:app|version"));
   if (receipt.appIdentity.version !== receipt.appIdentity.declaredVersion) {
     throw new Error(`running app version ${receipt.appIdentity.version} disagrees with checkout declaration ${receipt.appIdentity.declaredVersion}`);
   }
-  await browser.$(".ls-block, .page-title").waitForExist({ timeout: 20_000 });
   let opened = false;
   for (const selector of ["a.page-ref=OG Parity References", "span.page-ref=OG Parity References", "*=OG Parity References"]) {
     const pageLink = await browser.$(selector);
