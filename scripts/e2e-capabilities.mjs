@@ -19,3 +19,49 @@ export function tauriCapabilities(application, session = "default", platform = p
     "tauri:options": options,
   };
 }
+
+function nestedActivePort(directory, depth = 0) {
+  if (depth > 4 || !fs.existsSync(directory)) return undefined;
+  for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+    const candidate = path.join(directory, entry.name);
+    if (entry.isFile() && entry.name === "DevToolsActivePort") return candidate;
+    if (entry.isDirectory()) {
+      const found = nestedActivePort(candidate, depth + 1);
+      if (found) return found;
+    }
+  }
+  return undefined;
+}
+
+export function mirrorWindowsDevToolsActivePortOnce(root) {
+  if (!fs.existsSync(root)) return 0;
+  let mirrored = 0;
+  for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const session = path.join(root, entry.name);
+    const expected = path.join(session, "DevToolsActivePort");
+    if (fs.existsSync(expected)) continue;
+    const actual = nestedActivePort(session);
+    if (!actual || actual === expected || fs.statSync(actual).size === 0) continue;
+    // Current Edge/WebView2 releases can put this file in EBWebView/ while
+    // EdgeDriver polls the configured UDF root.  Mirror, do not move: WebView2
+    // continues to own its original profile layout.
+    fs.copyFileSync(actual, expected);
+    mirrored += 1;
+  }
+  return mirrored;
+}
+
+export function startWindowsDevToolsActivePortMirror(root, platform = process.platform) {
+  if (platform !== "win32") return () => {};
+  const timer = setInterval(() => {
+    try {
+      mirrorWindowsDevToolsActivePortOnce(root);
+    } catch {
+      // The WebView process creates and renames profile files concurrently.
+      // A later poll gets a stable snapshot; the scenario timeout remains the
+      // fail-closed boundary if no valid port ever appears.
+    }
+  }, 50);
+  return () => clearInterval(timer);
+}

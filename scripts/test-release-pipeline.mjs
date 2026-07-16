@@ -6,7 +6,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { assembleCandidate } from "./assemble-release-candidate.mjs";
-import { tauriCapabilities } from "./e2e-capabilities.mjs";
+import { mirrorWindowsDevToolsActivePortOnce, tauriCapabilities } from "./e2e-capabilities.mjs";
 import { candidateProblems, releaseLayout, RELEASE_LANES } from "./release-layout.mjs";
 
 const version = "0.5.6";
@@ -156,6 +156,14 @@ try {
   assert.equal(
     windowsCapabilities["tauri:options"].webviewOptions.userDataFolder,
     path.join(temporary, "webview2", "fixture-session"),
+  );
+  const nestedPort = path.join(temporary, "webview2", "fixture-session", "EBWebView", "DevToolsActivePort");
+  fs.mkdirSync(path.dirname(nestedPort), { recursive: true });
+  fs.writeFileSync(nestedPort, "12345\n/devtools/browser/fixture\n");
+  assert.equal(mirrorWindowsDevToolsActivePortOnce(path.join(temporary, "webview2")), 1);
+  assert.equal(
+    fs.readFileSync(path.join(temporary, "webview2", "fixture-session", "DevToolsActivePort"), "utf8"),
+    "12345\n/devtools/browser/fixture\n",
   );
   if (priorWebviewRoot === undefined) delete process.env.E2E_WEBVIEW_USER_DATA_ROOT;
   else process.env.E2E_WEBVIEW_USER_DATA_ROOT = priorWebviewRoot;
