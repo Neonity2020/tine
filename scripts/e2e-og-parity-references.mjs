@@ -160,14 +160,19 @@ const ensureParityPage = async (browser) => {
   await browser.$(".ls-block, .page-title").waitForExist({ timeout: 20_000 });
   const current = await browser.$("h1.page-title").getText().catch(() => "");
   if (current.trim() !== "OG Parity References") {
-    await browser.keys(["Control", "k"]);
+    // WebView2 attach does not itself transfer native focus to the WebView.
+    // Fixture navigation is not a shortcut assertion, so enter the same
+    // switcher through its visible application control.
+    const search = await browser.$('button[title^="Search (Ctrl+K)"]');
+    await search.waitForExist({ timeout: 5000 });
+    await search.click();
     const input = await browser.$(".switcher-input");
     await input.waitForExist({ timeout: 5000 });
     await input.setValue("OG Parity References");
     await browser.waitUntil(() => browser.execute((wanted) => [...document.querySelectorAll(".switcher-row:not(.block-result) .switcher-name")]
       .some((node) => node.textContent?.trim() === wanted), "OG Parity References"), {
       timeout: 10_000,
-      timeoutMsg: "named parity page was absent from Ctrl-K after restart",
+      timeoutMsg: "named parity page was absent from the switcher after restart",
     });
     const clicked = await browser.execute((wanted) => {
       const name = [...document.querySelectorAll(".switcher-row:not(.block-result) .switcher-name")]
@@ -290,50 +295,7 @@ try {
   if (receipt.appIdentity.version !== receipt.appIdentity.declaredVersion) {
     throw new Error(`running app version ${receipt.appIdentity.version} disagrees with checkout declaration ${receipt.appIdentity.declaredVersion}`);
   }
-  let opened = false;
-  for (const selector of ["a.page-ref=OG Parity References", "span.page-ref=OG Parity References", "*=OG Parity References"]) {
-    const pageLink = await browser.$(selector);
-    if (await pageLink.isExisting()) {
-      await pageLink.click();
-      opened = true;
-      break;
-    }
-  }
-  if (!opened) {
-    await browser.keys(["Control", "k"]);
-    const switcher = await browser.$(".switcher-input");
-    await switcher.waitForExist({ timeout: 5000 });
-    await switcher.setValue("OG Parity References");
-    // The Create row appears synchronously, before the debounced graph search.
-    // Wait for the exact graph-backed Pages result; selecting the first row can
-    // silently create a page or choose a block hit instead of opening fixture.
-    try {
-      await browser.waitUntil(() => browser.execute((wanted) => [...document.querySelectorAll(".switcher-section")].some((section) =>
-        section.querySelector(".switcher-group-header > span:first-child")?.textContent?.trim() === "Pages"
-        && [...section.querySelectorAll(".switcher-row:not(.block-result) .switcher-name")]
-          .some((element) => element.textContent?.trim() === wanted)
-      ), "OG Parity References"), { timeout: 10_000, interval: 100 });
-    } catch (error) {
-      const dump = await browser.$(".switcher").getText().catch(() => "<switcher absent>");
-      throw new Error(`exact Pages result did not resolve; switcher was ${dump.slice(0, 2400)}`, { cause: error });
-    }
-    const selected = await browser.execute((wanted) => {
-      const section = [...document.querySelectorAll(".switcher-section")].find((candidate) =>
-        candidate.querySelector(".switcher-group-header > span:first-child")?.textContent?.trim() === "Pages"
-      );
-      const name = [...(section?.querySelectorAll(".switcher-row:not(.block-result) .switcher-name") ?? [])]
-        .find((candidate) => candidate.textContent?.trim() === wanted);
-      const row = name?.closest(".switcher-row");
-      if (!row) return false;
-      row.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, button: 0 }));
-      return true;
-    }, "OG Parity References");
-    if (!selected) throw new Error("exact Pages result disappeared before selection");
-  }
-  await browser.waitUntil(async () => (await browser.$("h1.page-title").getText()).trim() === "OG Parity References", {
-    timeout: 10_000,
-    timeoutMsg: "OG parity reference page did not open",
-  });
+  await ensureParityPage(browser);
 
   const content = await browser.$(`[data-block-id="${EDITOR}"] .block-content`);
   await content.click();
