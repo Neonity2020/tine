@@ -8,7 +8,7 @@ on:
         required: false
         default: ""
       windows_scenario:
-        description: Optional single Windows scenario for focused debugging
+        description: Optional single Windows scenario, or all, for focused debugging
         required: false
         default: ""
 
@@ -65,14 +65,14 @@ jobs:
           retention-days: 14
 
   windows-smoke:
-    name: Windows x64 ${{ matrix.scenario }} real-app smoke (advisory)
+    name: Windows x64 ${{ matrix.scenario }} real-app smoke
     if: ${{ inputs.linux_scenario == '' }}
     runs-on: windows-latest
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        scenario: ${{ fromJSON(inputs.windows_scenario != '' && format('["{0}"]', inputs.windows_scenario) || '["windows-core","og-parity-references","page-properties","page-trailing-block","pdf-logseq","print-security"]') }}
+        scenario: ${{ fromJSON((inputs.windows_scenario == '' || inputs.windows_scenario == 'all') && '["windows-core","og-parity-references","page-properties","page-trailing-block","pdf-logseq","print-security"]' || format('["{0}"]', inputs.windows_scenario)) }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -102,7 +102,6 @@ jobs:
           $driverDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           & "$driverDir\msedgedriver.exe" --version
       - name: Run Windows WebView2 smoke
-        continue-on-error: true
         env:
           TINE_APP: ${{ github.workspace }}\target\release\tine.exe
         run: npm run e2e:windows:smoke -- --scenario=${{ matrix.scenario }}

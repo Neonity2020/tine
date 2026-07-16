@@ -15,6 +15,7 @@ const repository = "martinkoutecky/tine";
 const layout = releaseLayout(version);
 const releaseWorkflow = fs.readFileSync(path.join(process.cwd(), ".github/workflows/release.yml"), "utf8");
 const ciWorkflow = fs.readFileSync(path.join(process.cwd(), ".github/workflows/ci.yml"), "utf8");
+const uiE2eWorkflow = fs.readFileSync(path.join(process.cwd(), ".github/workflows/ui-e2e.yml"), "utf8");
 const preflight = fs.readFileSync(path.join(process.cwd(), "scripts/check-release-preflight.mjs"), "utf8");
 const e2eRunner = fs.readFileSync(path.join(process.cwd(), "scripts/run-e2e.mjs"), "utf8");
 const printSecurity = fs.readFileSync(path.join(process.cwd(), "scripts/e2e-print-security.mjs"), "utf8");
@@ -40,6 +41,16 @@ assert.match(
   releaseWorkflow,
   /windows-smoke:\n    needs: \[preflight, build\][\s\S]*?if: \$\{\{ always\(\) && needs\.preflight\.result == 'success' && needs\.build\.result != 'cancelled' \}\}[\s\S]*?continue-on-error: true[\s\S]*?name: release-windows-x64[\s\S]*?name: release-e2e-frontend-windows-x64[\s\S]*?npm run e2e:windows:smoke -- --scenario=\$\{\{ matrix\.scenario \}\}/,
   "Windows advisory scenarios do not consume the staged app independently of assembly"
+);
+assert.match(
+  uiE2eWorkflow,
+  /windows_scenario == 'all'[\s\S]*?\["windows-core","og-parity-references","page-properties","page-trailing-block","pdf-logseq","print-security"\]/,
+  "the focused UI workflow cannot fan out all Windows scenarios explicitly"
+);
+assert.doesNotMatch(
+  uiE2eWorkflow,
+  /name: Run Windows WebView2 smoke\n\s+continue-on-error:/,
+  "the focused Windows workflow hides a 0\/N scenario result behind a green job"
 );
 assert.match(
   releaseWorkflow,
