@@ -209,7 +209,7 @@ export function splitPane(
   const router = paneRouter(newPaneId);
   router.restoreSnapshot(opts.snapshot ?? splitSnapshotForNewPane(source));
   setLayoutRoot(splitLayoutNodeAt(layoutRoot(), paneId, dir, newPaneId, opts.position ?? "after"));
-  if (opts.focusNew !== false) setFocusedPaneId(newPaneId);
+  if (opts.focusNew !== false) focusPane(newPaneId);
   focusedRouter().scheduleSessionSave();
   return newPaneId;
 }
@@ -274,18 +274,23 @@ export function splitRootAtEdge(
     ratio: 0.5,
     children: newFirst ? [newLeaf, oldRoot] : [oldRoot, newLeaf],
   });
-  if (opts.focusNew !== false) setFocusedPaneId(newPaneId);
+  if (opts.focusNew !== false) focusPane(newPaneId);
   focusedRouter().scheduleSessionSave();
   return newPaneId;
 }
 
 export function closePane(paneId = focusedPaneId()): boolean {
   if (layoutPaneIds().length <= 1) return false;
+  const closingFocusedPane = focusedPaneId() === paneId;
   const res = closeLayoutPane(layoutRoot(), paneId);
   if (!res.closed) return false;
   setLayoutRoot(res.node);
   if (paneId !== "main") routers.delete(paneId);
-  setFocusedPaneId(res.focusedPaneId);
+  // Closing a background pane must not manufacture a foreground visit. When
+  // the focused pane closes, however, its sibling becomes the page the user is
+  // actually looking at and must pass through the same activation boundary as
+  // a pointer-driven pane focus change.
+  if (closingFocusedPane) focusPane(res.focusedPaneId);
   focusedRouter().scheduleSessionSave();
   return true;
 }
@@ -297,10 +302,10 @@ export function focusPane(paneId: string) {
 }
 
 function finishMovedTab(sourcePaneId: string, targetPaneId: string, moved: { emptied: boolean }) {
-  setFocusedPaneId(targetPaneId);
+  focusPane(targetPaneId);
   if (moved.emptied) {
     closePane(sourcePaneId);
-    if (layoutPaneIds().includes(targetPaneId)) setFocusedPaneId(targetPaneId);
+    if (layoutPaneIds().includes(targetPaneId)) focusPane(targetPaneId);
   } else {
     focusedRouter().scheduleSessionSave();
   }
@@ -319,7 +324,7 @@ export function moveTabToPane(
   if (sourcePaneId === targetPaneId) {
     if (typeof index === "number") source.moveTabToIndex(tabId, index);
     else source.setActiveTab(tabId);
-    setFocusedPaneId(targetPaneId);
+    focusPane(targetPaneId);
     return true;
   }
   const moved = source.extractTabForAdoption(tabId);
@@ -464,7 +469,7 @@ installNavigationInterceptor((paneId, r) => {
   if (r.kind !== "journals") return false;
   const existing = feedPaneId();
   if (existing && existing !== paneId) {
-    setFocusedPaneId(existing);
+    focusPane(existing);
     return true;
   }
   return false;
