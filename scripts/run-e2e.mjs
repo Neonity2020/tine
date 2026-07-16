@@ -189,7 +189,7 @@ async function runScenario([id, script, extraEnv]) {
       E2E_PREVIEW_PORT: String(previewPort),
       TINE_SOURCE_REVISION: process.env.TINE_SOURCE_REVISION || checkoutRevision,
       E2E_LEGACY_NOTES: "0",
-      TAURI_DRIVER: process.env.TAURI_DRIVER || "tauri-driver",
+      TAURI_DRIVER: process.env.TAURI_DRIVER || (process.platform === "win32" ? "msedgedriver.exe" : "tauri-driver"),
     };
     if (process.platform === "linux") {
       env.WEBKIT_DRIVER = process.env.WEBKIT_DRIVER || "/usr/bin/WebKitWebDriver";

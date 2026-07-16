@@ -72,6 +72,11 @@ assert.match(
   /if \(process\.platform === "linux"\) \{\n      env\.WEBKIT_DRIVER = process\.env\.WEBKIT_DRIVER \|\| "\/usr\/bin\/WebKitWebDriver";/,
   "the suite runner leaks Linux WebKitWebDriver into Windows"
 );
+assert.match(
+  e2eRunner,
+  /TAURI_DRIVER: process\.env\.TAURI_DRIVER \|\| \(process\.platform === "win32" \? "msedgedriver\.exe" : "tauri-driver"\)/,
+  "Windows scenarios still route native WebView2 through the unnecessary Tauri proxy"
+);
 assert.ok(
   e2eRunner.includes("return /BadWindow \\(invalid Window parameter\\)/.test(combined)")
     && e2eRunner.includes("xdo_get_active_window reported an error"),
@@ -169,9 +174,11 @@ try {
   process.env.E2E_WEBVIEW_USER_DATA_ROOT = path.join(temporary, "webview2");
   const windowsCapabilities = tauriCapabilities("C:/Tine.exe", "fixture session", "win32");
   assert.equal(
-    windowsCapabilities["tauri:options"].webviewOptions.userDataFolder,
+    windowsCapabilities["ms:edgeOptions"].webviewOptions.userDataFolder,
     path.join(temporary, "webview2", "fixture-session"),
   );
+  assert.equal(windowsCapabilities.browserName, "webview2");
+  assert.equal(windowsCapabilities["ms:edgeOptions"].binary, "C:/Tine.exe");
   const nestedPort = path.join(temporary, "webview2", "fixture-session", "EBWebView", "DevToolsActivePort");
   fs.mkdirSync(path.dirname(nestedPort), { recursive: true });
   fs.writeFileSync(nestedPort, "12345\n/devtools/browser/fixture\n");
