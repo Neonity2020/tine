@@ -40,7 +40,8 @@ const GRID_MD = [
   "- TODO buy milk",
   "- task table",
   "  tine.view:: table",
-  "  tine.fields:: state=state;topic=enum:infra,ui;shipped=checkbox",
+  "  tine.fields:: state=state;topic=enum:infra,ui;shipped=checkbox;severity=number;occurrence=number;DET=number",
+  "  tine.formula.rpn:: severity * occurrence * DET",
   "\t- WAIT row one",
   "\t  topic:: infra",
   "\t  shipped:: false",
@@ -313,6 +314,50 @@ try {
     }
   } else {
     check("schema'd table rendered", false, "no table cell (0,2) found");
+  }
+
+  // GH #176: Tab from a native typed-cell input must commit before advancing
+  // the sheet selection. Before the fix, blur saved `severity:: 2` but left
+  // selection on severity, so typing 3 immediately overtyped it.
+  const severityCell = await browser.$('.sheet-table .sheet-cell[data-row="0"][data-col="4"]');
+  if (await severityCell.isExisting()) {
+    await browser.execute(() => {
+      const el = document.querySelector('.sheet-table .sheet-cell[data-row="0"][data-col="4"]');
+      el?.dispatchEvent(new MouseEvent("dblclick", { bubbles: true, cancelable: true, button: 0 }));
+    });
+    await sleep(250);
+    await browser.keys(["2"]);
+    await browser.keys(["Tab"]);
+    await sleep(250);
+    const afterSeverityTab = await browser.execute(() => {
+      const selected = document.querySelector('.sheet-table .sheet-cell-selected');
+      return selected ? { row: selected.getAttribute("data-row"), col: selected.getAttribute("data-col") } : null;
+    });
+    check("typed Table Tab commits then advances", afterSeverityTab?.row === "0" && afterSeverityTab?.col === "5", JSON.stringify(afterSeverityTab));
+
+    await browser.keys(["3"]);
+    await sleep(150);
+    const occurrenceDraft = await browser.execute(() =>
+      document.querySelector('.sheet-table .sheet-cell[data-row="0"][data-col="5"] input.sheet-prop-input')?.value ?? null
+    );
+    check("typing after Tab targets the next cell", occurrenceDraft === "3", JSON.stringify(occurrenceDraft));
+    await browser.keys(["Enter"]);
+    await browser.keys(["Tab"]);
+    await browser.keys(["4"]);
+    await sleep(150);
+    await browser.keys(["Enter"]);
+    await sleep(500);
+
+    const formulaValue = await browser.execute(() =>
+      document.querySelector('.sheet-table .sheet-cell[data-row="0"][data-col="7"]')?.textContent?.replace("⋮", "").trim() ?? null
+    );
+    check("formula observes all Tab-committed values", formulaValue === "24", JSON.stringify(formulaValue));
+    await sleep(2500);
+    const diskTyped = fs.readFileSync(JFILE, "utf8");
+    check("typed Table values survive the next edit and save",
+      diskTyped.includes("severity:: 2") && diskTyped.includes("occurrence:: 3") && diskTyped.includes("DET:: 4"), JSON.stringify(diskTyped));
+  } else {
+    check("typed Table Tab commits then advances", false, "no Table cell (0,4)");
   }
 
   // --- Formula editor (phase 7c): add a formula, value computed not stored ---

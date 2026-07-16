@@ -26,6 +26,7 @@ import {
   cellIsInRange,
   cellSel,
   cellSurfaceKey,
+  handleCellSelectionKey,
   aggregateFooterPinned,
   clearSelectedSheetInstance,
   registerSheetViewAdapter,
@@ -1282,7 +1283,15 @@ function FieldCell(props: {
           onKeyDown={(e) => {
             e.stopPropagation();
             if (e.key === "Enter") commit(e.currentTarget.value);
-            else if (e.key === "Escape") {
+            else if (!e.ctrlKey && !e.metaKey && !e.altKey && (e.key === "Tab" || e.code === "Tab")) {
+              // A native input's Tab never reaches the global sheet-selection
+              // handler. Commit first, then advance through the same stable
+              // row/column path used by selected cells. Otherwise blur saves
+              // this draft but leaves selection behind, so the next typed
+              // value overtypes this same cell (GH #176).
+              if (commit(e.currentTarget.value)) handleCellSelectionKey(e);
+              e.preventDefault();
+            } else if (e.key === "Escape") {
               setInputInvalid(false);
               props.closePropInput();
             }

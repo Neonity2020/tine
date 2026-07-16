@@ -27,6 +27,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   pointer action instead of handing the pointer to the parent tab-drag capture
   session, while ordinary tab activation and drag-to-reorder stay unchanged.
   (GH #174)
+- **Table cell values now commit before Tab advances to the next cell.** Typing
+  the next value no longer overtypes the cell that was just saved, and formula
+  columns react to the preserved inputs as expected. (GH #176)
 
 ## [0.5.10] - 2026-07-16
 

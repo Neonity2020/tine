@@ -795,6 +795,46 @@ describe("SheetTable", () => {
     dispose();
   });
 
+  it("commits a typed cell before Tab advances so the next value does not overwrite it (GH #176)", () => {
+    setDoc({
+      byId: {
+        table: node(
+          "table",
+          "Table\ntine.view:: table\ntine.fields:: severity=number;occurrence=number\ntine.formula.rpn:: severity * occurrence",
+          null,
+          ["r1"],
+        ),
+        r1: node("r1", "Risk", "table"),
+      },
+      pages: [page(["table"])],
+      feed: ["Sheet"],
+      loaded: true,
+    });
+    const { root, dispose } = mount(() => <Block id="table" />);
+
+    doubleClick(cell(root, 0, 1));
+    const severity = root.querySelector("input.sheet-prop-input") as HTMLInputElement;
+    severity.value = "2";
+    input(severity);
+    const tab = keydown(severity, "Tab");
+    // jsdom does not perform native focus traversal. Mirror the browser blur
+    // only when the component did not take ownership of the Tab gesture.
+    if (!tab.defaultPrevented) severity.dispatchEvent(new FocusEvent("blur"));
+
+    expect(blockProperty("r1", "severity")).toBe("2");
+    expect(cellSel()).toMatchObject({ kind: "cell", gridId: "table", row: 0, col: 2 });
+
+    expect(handleCellSelectionKey(new KeyboardEvent("keydown", { key: "3" }))).toBe(true);
+    const occurrence = root.querySelector("input.sheet-prop-input") as HTMLInputElement;
+    expect(occurrence.value).toBe("3");
+    keydown(occurrence, "Enter");
+
+    expect(doc.byId.r1.raw).toBe("Risk\nseverity:: 2\noccurrence:: 3");
+    expect(cell(root, 0, 3).textContent).toContain("6");
+
+    dispose();
+  });
+
   it("checkbox typed cells toggle true and false on single click", async () => {
     setDoc({
       byId: {
