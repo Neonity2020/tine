@@ -41,10 +41,14 @@ const GRID_MD = [
   "- task table",
   "  tine.view:: table",
   "  tine.fields:: state=state;topic=enum:infra,ui;shipped=checkbox;severity=number;occurrence=number;DET=number",
-  "  tine.formula.rpn:: severity * occurrence * DET",
+  '  tine.formula.rpn:: severity * occurrence * DET + if(label == "occurrence", formula.occurrence, 0)',
+  "  tine.filter:: true || occurrence > 1",
+  "  tine.group-by:: prop:occurrence",
+  "  tine.col-aggregates:: prop:occurrence=sum;prop:severity=max",
   "\t- WAIT row one",
   "\t  topic:: infra",
   "\t  shipped:: false",
+  "\t  label:: other",
   "- reading list",
   "  tine.view:: board",
   "  tine.group-by:: tags",
@@ -371,8 +375,10 @@ try {
   }
 
   // GH #175: a declared, children-backed property field is a local schema
-  // identity. Rename it through the literal header menu and prove that schema,
-  // row keys and dependent formulas move together as one persisted Undo unit.
+  // identity. Rename it through the literal header menu and prove that every
+  // local dependency (schema, row keys, formula field refs, filter field AST,
+  // group-by and aggregates) moves together as one persisted Undo unit. String
+  // literals and non-field formula member names deliberately stay byte-stable.
   const renameMenuOpened = await browser.execute(() => {
     const header = [...document.querySelectorAll(".sheet-table .sheet-field-header")]
       .find((el) => (el.textContent ?? "").trim() === "occurrence");
@@ -415,26 +421,48 @@ try {
       renamedView.headers.filter((h) => h === "OCC").length === 1 &&
       !renamedView.headers.includes("occurrence") && renamedView.formula === "24",
       JSON.stringify(renamedView));
-    check("rename persists schema, row key and formula with no old identity",
+    const renamedDependencies =
       renamedDisk.includes("tine.fields:: state=state;topic=enum:infra,ui;shipped=checkbox;severity=number;OCC=number;DET=number") &&
-      renamedDisk.includes("tine.formula.rpn:: severity * OCC * DET") &&
+      renamedDisk.includes('tine.formula.rpn:: severity * OCC * DET + if(label == "occurrence", formula.occurrence, 0)') &&
+      renamedDisk.includes("tine.filter:: true || OCC > 1") &&
+      renamedDisk.includes("tine.group-by:: prop:OCC") &&
+      renamedDisk.includes("tine.col-aggregates:: prop:OCC=sum;prop:severity=max") &&
       renamedDisk.includes("OCC:: 3") && !renamedDisk.includes("occurrence::") &&
-      !renamedDisk.includes("severity * occurrence * DET"), JSON.stringify(renamedDisk));
+      !renamedDisk.includes("occurrence=number") &&
+      !renamedDisk.includes("severity * occurrence * DET") &&
+      !renamedDisk.includes("true || occurrence > 1") &&
+      !renamedDisk.includes("prop:occurrence");
+    check("rename persists every dependency with no old field identity", renamedDependencies,
+      JSON.stringify(renamedDisk));
+    check("rename preserves string literals and non-field formula member names",
+      renamedDisk.includes('if(label == "occurrence", formula.occurrence, 0)'), JSON.stringify(renamedDisk));
 
     await browser.keys(["Control", "z"]);
     await sleep(2400);
     const undoneDisk = fs.readFileSync(JFILE, "utf8");
-    check("one Undo restores schema, row key and formula together",
+    check("one Undo restores every field dependency together",
       undoneDisk.includes("occurrence=number") && undoneDisk.includes("occurrence:: 3") &&
-      undoneDisk.includes("severity * occurrence * DET") && !undoneDisk.includes("OCC:: 3"),
+      undoneDisk.includes('severity * occurrence * DET + if(label == "occurrence", formula.occurrence, 0)') &&
+      undoneDisk.includes("tine.filter:: true || occurrence > 1") &&
+      undoneDisk.includes("tine.group-by:: prop:occurrence") &&
+      undoneDisk.includes("tine.col-aggregates:: prop:occurrence=sum;prop:severity=max") &&
+      !undoneDisk.includes("OCC=number") && !undoneDisk.includes("OCC:: 3") &&
+      !undoneDisk.includes("severity * OCC * DET") && !undoneDisk.includes("true || OCC > 1") &&
+      !undoneDisk.includes("prop:OCC"),
       JSON.stringify(undoneDisk));
 
     await browser.keys(["Control", "Shift", "z"]);
     await sleep(2400);
     const redoneDisk = fs.readFileSync(JFILE, "utf8");
-    check("one Redo reapplies the complete field migration",
+    check("one Redo reapplies every field dependency",
       redoneDisk.includes("OCC=number") && redoneDisk.includes("OCC:: 3") &&
-      redoneDisk.includes("severity * OCC * DET") && !redoneDisk.includes("occurrence:: 3"),
+      redoneDisk.includes('severity * OCC * DET + if(label == "occurrence", formula.occurrence, 0)') &&
+      redoneDisk.includes("tine.filter:: true || OCC > 1") &&
+      redoneDisk.includes("tine.group-by:: prop:OCC") &&
+      redoneDisk.includes("tine.col-aggregates:: prop:OCC=sum;prop:severity=max") &&
+      !redoneDisk.includes("occurrence=number") && !redoneDisk.includes("occurrence:: 3") &&
+      !redoneDisk.includes("severity * occurrence * DET") && !redoneDisk.includes("true || occurrence > 1") &&
+      !redoneDisk.includes("prop:occurrence"),
       JSON.stringify(redoneDisk));
 
     await browser.refresh();
@@ -446,9 +474,18 @@ try {
         ?.textContent?.replace("⋮", "").trim() ?? null;
       return { headers, formula };
     });
-    check("renamed field and formula survive a real app reload",
-      reloaded.headers.filter((h) => h === "OCC").length === 1 && reloaded.formula === "24",
-      JSON.stringify(reloaded));
+    const reloadedDisk = fs.readFileSync(JFILE, "utf8");
+    check("renamed field and every dependency survive a real app reload",
+      reloaded.headers.filter((h) => h === "OCC").length === 1 && reloaded.formula === "24" &&
+      reloadedDisk.includes("OCC=number") && reloadedDisk.includes("OCC:: 3") &&
+      reloadedDisk.includes('severity * OCC * DET + if(label == "occurrence", formula.occurrence, 0)') &&
+      reloadedDisk.includes("tine.filter:: true || OCC > 1") &&
+      reloadedDisk.includes("tine.group-by:: prop:OCC") &&
+      reloadedDisk.includes("tine.col-aggregates:: prop:OCC=sum;prop:severity=max") &&
+      !reloadedDisk.includes("occurrence=number") && !reloadedDisk.includes("occurrence:: 3") &&
+      !reloadedDisk.includes("severity * occurrence * DET") && !reloadedDisk.includes("true || occurrence > 1") &&
+      !reloadedDisk.includes("prop:occurrence"),
+      JSON.stringify({ reloaded, reloadedDisk }));
   }
 
   // --- Formula editor (phase 7c): add a formula, value computed not stored ---

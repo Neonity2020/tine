@@ -689,6 +689,11 @@ describe("SheetTable", () => {
     expect(doc.byId.table.raw).toContain("tine.filter:: OCC > 1");
     expect(doc.byId.table.raw).toContain("tine.group-by:: prop:OCC");
     expect(doc.byId.table.raw).toContain("tine.col-aggregates:: prop:OCC=sum;prop:severity=max");
+    expect(doc.byId.table.raw).not.toContain("occurrence=number");
+    expect(doc.byId.table.raw).not.toContain("severity * occurrence * detection");
+    expect(doc.byId.table.raw).not.toContain("tine.filter:: occurrence > 1");
+    expect(doc.byId.table.raw).not.toContain("prop:occurrence");
+    expect(doc.byId.table.raw).toContain('if(label == "occurrence", formula.occurrence, 0)');
     expect(doc.byId.r1.raw).toBe("Row\nseverity:: 2\nOCC:: 2\ndetection:: 2\nlabel:: other");
     expect(cell(root, 0, 4).textContent?.trim()).toBe("8");
 
@@ -702,7 +707,16 @@ describe("SheetTable", () => {
     redo();
     await tick();
     expect(doc.byId.table.raw).toContain("tine.fields:: severity=number;OCC=number;detection=number");
+    expect(doc.byId.table.raw).toContain('tine.formula.rpn:: severity * OCC * detection + if(label == "occurrence", formula.occurrence, 0)');
+    expect(doc.byId.table.raw).toContain("tine.filter:: OCC > 1");
+    expect(doc.byId.table.raw).toContain("tine.group-by:: prop:OCC");
+    expect(doc.byId.table.raw).toContain("tine.col-aggregates:: prop:OCC=sum;prop:severity=max");
+    expect(doc.byId.table.raw).not.toContain("occurrence=number");
+    expect(doc.byId.table.raw).not.toContain("severity * occurrence * detection");
+    expect(doc.byId.table.raw).not.toContain("tine.filter:: occurrence > 1");
+    expect(doc.byId.table.raw).not.toContain("prop:occurrence");
     expect(doc.byId.r1.raw).toContain("OCC:: 2");
+    expect(doc.byId.r1.raw).not.toContain("occurrence:: 2");
     expect([...root.querySelectorAll(".sheet-header-cell")].map((h) => h.textContent?.trim()).filter((label) => label === "OCC"))
       .toHaveLength(1);
     expect(cell(root, 0, 4).textContent?.trim()).toBe("8");
