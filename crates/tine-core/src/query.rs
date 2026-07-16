@@ -2954,6 +2954,7 @@ impl Pred {
         }
     }
 
+    #[cfg(test)]
     fn eval(&self, block: &DocBlock, ctx: &EvalCtx) -> bool {
         self.eval_with_path_refs(block, &PathRefCounts::new(), ctx)
     }
