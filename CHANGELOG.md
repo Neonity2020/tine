@@ -8,6 +8,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+### Added
+
+- **Children-backed Sheet fields can now be renamed in place.** Right-click a
+  column header or double-click its name to update the local schema and its
+  dependent filter, grouping, aggregate, and formula configuration as one
+  undoable, persistence-safe edit. Ambiguous or colliding renames are rejected.
+  (GH #175)
+- **Linked References can now be filtered without loading complete subtrees.**
+  The panel combines bounded content search with page, tag, property, and task
+  facets while preserving reference counts and lazy result expansion. (GH #173)
+
 ### Changed
 
 - **Broad CI now runs once for a frozen release candidate instead of after each
@@ -18,6 +29,24 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Selection formatting no longer wraps selected outer spaces.** Bold, italic,
+  strike, and highlight actions keep leading and trailing selected whitespace
+  outside their Markdown or Org delimiters, whether invoked from the keyboard
+  or toolbar. (GH #178)
+- **Nested WebView scroll regions no longer overscroll the Tine window.** Scroll
+  gestures stop at the viewport boundary while panes, sidebars, and drawers
+  retain their own scrolling. (GH #177)
+- **Every foreground page activation now updates graph-global Recent pages.**
+  Opening or focusing a page through the main pane, split panes, sidebar, or
+  history uses the same RECENT ordering instead of tracking only some routes.
+  (GH #170)
+- **Simple queries now match Logseq's membership and journal-date semantics.**
+  Bare page references include inherited page membership, date bounds are
+  inclusive and order-independent, and Search preserves the same result
+  identities as List, Table, and Board for supported simple queries.
+- **Line-leading inline code containing `::` remains visible code.** It is no
+  longer misclassified as a property drawer, while actual properties and
+  references outside the code span keep their existing behavior.
 - **Escape and Android Back now close every visible popup before the surface
   beneath it.** Calendar Jump, selection formatting overflow, PDF Find and
   highlight actions, QueryBuilder menus, and formula value pickers all join the
