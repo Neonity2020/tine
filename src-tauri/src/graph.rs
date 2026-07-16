@@ -302,6 +302,12 @@ pub(crate) async fn open_graph_window(
                 .hidden_title(true);
             #[cfg(any(target_os = "linux", target_os = "windows"))]
             let builder = builder.decorations(crate::settings::native_frame_active());
+            #[cfg(target_os = "windows")]
+            let builder = if let Some(arguments) = crate::windows_webdriver_args_from_env(None) {
+                builder.additional_browser_args(&arguments)
+            } else {
+                builder
+            };
             let built = builder.build();
             match built {
                 Ok(window) => {
