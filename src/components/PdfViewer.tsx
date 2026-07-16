@@ -2,9 +2,9 @@ import { For, Show, createEffect, createSignal, on, onCleanup, onMount, type JSX
 import * as pdfjs from "pdfjs-dist";
 import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import { backend } from "../backend";
-import { closePdf, pushToast, isConflicted, activePane, type PdfTarget } from "../ui";
+import { closePdf, pushToast, isConflicted, activePane, requestBlockReferences, type PdfTarget } from "../ui";
 import { flushPage, isDirty, reloadHlsIfLoaded, trackAssetWrite } from "../store";
-import { openPage } from "../router";
+import { openPage, openPageAtBlock } from "../router";
 import { areaHighlightPosition, hlsPageName, rectInPageSpace, rectWithSourceSpace, type PdfPageDimensions } from "../pdf";
 import { decideWheelZoomGesture, type WheelZoomGestureState } from "../zoom";
 import type { Highlight, Rect } from "../types";
@@ -243,6 +243,24 @@ export function PdfViewer(props: {
   const copyCreatedHighlightRef = async (id: string) => {
     await backend().writeText(`((${id}))`);
     pushToast("Copied highlight ref", "success");
+  };
+  // An OG/externally-created sidecar can outlive or predate its annotation
+  // block. Reuse the paired guarded writer before exposing the id: it upserts
+  // the hls__ block while preserving notes and refuses conflicts/partial writes.
+  const ensureExistingHighlightRef = async (id: string): Promise<boolean> => {
+    if (!highlights().some((highlight) => highlight.id === id)) return false;
+    return persist();
+  };
+  const copyExistingHighlightRef = async (id: string) => {
+    setMenu(null);
+    if (!(await ensureExistingHighlightRef(id))) return;
+    await copyCreatedHighlightRef(id);
+  };
+  const openExistingHighlightReferences = async (id: string) => {
+    setMenu(null);
+    if (!(await ensureExistingHighlightRef(id))) return;
+    requestBlockReferences(id);
+    openPageAtBlock(hlsPageName(props.filename), "page", id);
   };
   // Remove a highlight (and its annotation block on the hls page).
   const deleteHighlight = async (id: string) => {
@@ -867,6 +885,7 @@ export function PdfViewer(props: {
     layer.innerHTML = "";
     const s = scale();
     const openEdit = (id: string) => (ev: MouseEvent) => {
+      ev.preventDefault();
       ev.stopPropagation();
       setMenu({ x: ev.clientX, y: ev.clientY, id }); // open the edit/remove popup
     };
@@ -890,6 +909,7 @@ export function PdfViewer(props: {
         div.style.background = `rgba(${rgb}, 0.18)`; // translucent fill over the captured region
         div.style.cursor = "pointer";
         div.onclick = openEdit(h.id);
+        if (!isMobilePlatform) div.oncontextmenu = openEdit(h.id);
         layer.appendChild(div);
         continue;
       }
@@ -906,6 +926,7 @@ export function PdfViewer(props: {
         div.style.background = COLOR_RGBA[h.color] ?? COLOR_RGBA.yellow;
         div.style.cursor = "pointer";
         div.onclick = openEdit(h.id);
+        if (!isMobilePlatform) div.oncontextmenu = openEdit(h.id);
         layer.appendChild(div);
       }
     }
@@ -1501,6 +1522,26 @@ export function PdfViewer(props: {
               />
             )}
           </For>
+          <Show when={menu()!.id && !isMobilePlatform}>
+            <button
+              class="pdf-hl-action"
+              onMouseDown={(e) => {
+                e.preventDefault();
+                void copyExistingHighlightRef(menu()!.id!);
+              }}
+            >
+              Copy ref
+            </button>
+            <button
+              class="pdf-hl-action"
+              onMouseDown={(e) => {
+                e.preventDefault();
+                void openExistingHighlightReferences(menu()!.id!);
+              }}
+            >
+              Linked references
+            </button>
+          </Show>
           <Show when={menu()!.id}>
             <button
               class="pdf-hl-remove"

@@ -111,7 +111,7 @@ import { refreshAssetOnReturn } from "../assetRefresh";
 import { isMobilePlatform } from "../nativeChrome";
 import { calcSource, serializeCalcExitCommit, evalCalc } from "../editor/calc";
 import { QueryMacro, EmbedMacro } from "./Macro";
-import { workflow, zoomInto, openContextMenu, openDatePicker, openBlockInSidebar, graphMeta, dataRev, setQueryBuilderAutoOpen, openPageProps, pushToast, dismissToast, autoPairing, typographyMode, timetrackingEnabled, logbookWithSecondSupport } from "../ui";
+import { workflow, zoomInto, openContextMenu, openDatePicker, openBlockInSidebar, graphMeta, dataRev, setQueryBuilderAutoOpen, openPageProps, pushToast, dismissToast, autoPairing, typographyMode, timetrackingEnabled, logbookWithSecondSupport, blockReferencesRequest } from "../ui";
 import { seedAssetBlob } from "../assetCache";
 import { openPageInNewTab } from "../router";
 import { blockRefCount } from "../blockRefCounts";
@@ -370,6 +370,9 @@ export function Block(props: { id: string; hideRefCount?: boolean; forceExpanded
   const editorIsUniline = createMemo(() => !editorVisibleValue().includes("\n"));
   // Block-level "linked references" panel toggled by the reference-count badge.
   const [showRefs, setShowRefs] = createSignal(false);
+  createEffect(() => {
+    if (blockReferencesRequest()?.id === props.id) setShowRefs(true);
+  });
   // Ordered-list label for THIS block's own bullet (OG numbers the block itself,
   // not its children); null for a normal bullet.
   const orderMarker = () => orderedListMarker(props.id);

@@ -17,6 +17,7 @@ const DRIVER_PORT = Number(process.env.E2E_DRIVER_PORT || 4520);
 const NATIVE_PORT = Number(process.env.E2E_NATIVE_PORT || 4521);
 const TMP = path.join(os.tmpdir(), `tine-pdf-logseq-e2e-${process.pid}`);
 const GRAPH = path.join(TMP, "graph");
+const SAMPLE_ID = "6a5604f8-a337-4336-a711-2ba6bc14fbfd";
 const PDF = "JVBERi0xLjQKMSAwIG9iago8PCAvVHlwZSAvQ2F0YWxvZyAvUGFnZXMgMiAwIFIgPj4KZW5kb2JqCjIgMCBvYmoKPDwgL1R5cGUgL1BhZ2VzIC9LaWRzIFszIDAgUl0gL0NvdW50IDEgPj4KZW5kb2JqCjMgMCBvYmoKPDwgL1R5cGUgL1BhZ2UgL1BhcmVudCAyIDAgUiAvTWVkaWFCb3ggWzAgMCA2MTIgNzkyXSAvUmVzb3VyY2VzIDw8IC9Gb250IDw8IC9GMSA1IDAgUiA+PiA+PiAvQ29udGVudHMgNCAwIFIgPj4KZW5kb2JqCjQgMCBvYmoKPDwgL0xlbmd0aCAyMDUgPj4Kc3RyZWFtCkJUIC9GMSAyMCBUZiA3MiA3MjAgVGQgKFRpbmUgUERGIHZpZXdlcikgVGogRVQKQlQgL0YxIDEzIFRmIDcyIDY5MCBUZCAoU2VsZWN0IHRoaXMgdGV4dCB0byBjcmVhdGUgYSBoaWdobGlnaHQuKSBUaiBFVApCVCAvRjEgMTMgVGYgNzIgNjY4IFRkIChIaWdobGlnaHRzIHBlcnNpc3QgdG8gYXNzZXRzLzxrZXk+LmVkbiArIGFuIGhsc19fIHBhZ2UuKSBUaiBFVAoKZW5kc3RyZWFtCmVuZG9iago1IDAgb2JqCjw8IC9UeXBlIC9Gb250IC9TdWJ0eXBlIC9UeXBlMSAvQmFzZUZvbnQgL0hlbHZldGljYSA+PgplbmRvYmoKeHJlZgowIDYKMDAwMDAwMDAwMCA2NTUzNSBmIAowMDAwMDAwMDA5IDAwMDAwIG4gCjAwMDAwMDAwNTggMDAwMDAgbiAKMDAwMDAwMDExNSAwMDAwMCBuIAowMDAwMDAwMjQxIDAwMDAwIG4gCjAwMDAwMDA0OTcgMDAwMDAgbiAKdHJhaWxlcgo8PCAvU2l6ZSA2IC9Sb290IDEgMCBSID4+CnN0YXJ0eHJlZgo1NjcKJSVFT0Y=";
 const SECOND_FIRST_ID = "7b6704f8-a337-4336-a711-2ba6bc14fbf1";
 const SECOND_SECOND_ID = "7b6704f8-a337-4336-a711-2ba6bc14fbf2";
@@ -71,6 +72,14 @@ const secondSidecar = path.join(GRAPH, "assets", "logseq-second.edn");
 fs.writeFileSync(secondSidecar, EDN_SECOND);
 const originalSecondSidecar = fs.readFileSync(secondSidecar, "utf8");
 const hlsPage = path.join(GRAPH, "pages", "hls__logseq-sample.org");
+// Existing sidecar plus an existing annotation page whose block is missing:
+// Copy ref / Linked references must repair the pair through the guarded writer
+// before exposing SAMPLE_ID (GH #168).
+fs.writeFileSync(hlsPage, [
+  "#+FILE: [[../assets/logseq-sample.pdf][Logseq sample]]",
+  "#+FILE-PATH: ../assets/logseq-sample.pdf",
+  "",
+].join("\n"));
 fs.writeFileSync(path.join(GRAPH, "pages", "hls__logseq-second.org"), [
   "#+FILE: [[../assets/logseq-second.pdf][Logseq second]]",
   "#+FILE-PATH: ../assets/logseq-second.pdf",
@@ -97,6 +106,7 @@ fs.writeFileSync(path.join(GRAPH, "journals", `${journal}.md`), [
   "- ![Logseq second](../assets/logseq-second.pdf)",
   `- First exact annotation ((${SECOND_FIRST_ID}))`,
   `- Second exact annotation ((${SECOND_SECOND_ID}))`,
+  `- First sample annotation ((${SAMPLE_ID}))`,
   "- [[hls__logseq-second]]",
   "",
 ].join("\n"));
@@ -211,13 +221,11 @@ try {
   for (const expected of [
     "#+FILE: [[../assets/logseq-sample.pdf][Logseq sample]]",
     "#+FILE-PATH: ../assets/logseq-sample.pdf",
-    "* Tine PDF viewer",
-    ":PROPERTIES:",
-    ":hl-page: 1",
-    ":ls-type: annotation",
-    ":id: 6a5604f8-a337-4336-a711-2ba6bc14fbfd",
   ]) {
     if (!hls.includes(expected)) throw new Error(`OG-compatible Org hls page is missing ${expected}: ${hls}`);
+  }
+  if (hls.includes(`:id: ${SAMPLE_ID}`)) {
+    throw new Error("opening an existing hls page unexpectedly repaired its missing annotation before a reference action");
   }
   const geometry = await browser.execute(() => {
     const highlight = document.querySelector(".pdf-hl");
@@ -237,6 +245,58 @@ try {
   if (Math.abs(geometry.leftRatio - 72 / 612) > 0.005 || Math.abs(geometry.widthRatio - 176 / 612) > 0.005) {
     throw new Error(`Logseq zoom-space highlight was misplaced: ${JSON.stringify(geometry)}`);
   }
+
+  // GH #168: both click and right-click share the existing-highlight menu. The
+  // reference actions must safely ensure a missing annotation block before
+  // copying or routing, and Linked references must reveal ordinary referrers.
+  await browser.execute(() => {
+    const highlight = document.querySelector(".pdf-hl");
+    const rect = highlight?.getBoundingClientRect();
+    highlight?.dispatchEvent(new MouseEvent("contextmenu", {
+      bubbles: true,
+      cancelable: true,
+      clientX: rect?.left ?? 120,
+      clientY: rect?.top ?? 120,
+      view: window,
+    }));
+  });
+  await browser.$(".pdf-color-menu").waitForExist({ timeout: 5000 });
+  const existingActionElements = await browser.$$(".pdf-hl-action");
+  const existingActions = await Promise.all(existingActionElements.map((element) => element.getText()));
+  if (!existingActions.includes("Copy ref") || !existingActions.includes("Linked references")) {
+    throw new Error(`existing PDF highlight menu omitted reference actions: ${JSON.stringify(existingActions)}`);
+  }
+  await browser.$('//button[normalize-space()="Copy ref"]').click();
+  await browser.waitUntil(() => fs.readFileSync(hlsPage, "utf8").includes(`:id: ${SAMPLE_ID}`), {
+    timeout: 10_000,
+    timeoutMsg: "Copy ref did not safely upsert the missing annotation block",
+  });
+  await browser.waitUntil(() => browser.execute(() =>
+    [...document.querySelectorAll(".toast")].some((toast) => toast.textContent?.includes("Copied highlight ref"))), {
+    timeout: 5000,
+    timeoutMsg: "Copy ref did not reach the native clipboard success boundary",
+  });
+  const repairedHls = fs.readFileSync(hlsPage, "utf8");
+  for (const expected of ["* Tine PDF viewer", ":hl-page: 1", ":ls-type: annotation", `:id: ${SAMPLE_ID}`]) {
+    if (!repairedHls.includes(expected)) throw new Error(`repaired annotation page is missing ${expected}: ${repairedHls}`);
+  }
+
+  await browser.$(".pdf-hl").click();
+  await browser.$('//button[normalize-space()="Linked references"]').click();
+  await browser.waitUntil(() => browser.execute((highlightId) => {
+    const block = document.querySelector(`.ls-block[data-block-id="${highlightId}"]`);
+    return block?.querySelector(".block-references")?.textContent?.includes("First sample annotation") ?? false;
+  }, SAMPLE_ID), {
+    timeout: 10_000,
+    timeoutMsg: "Linked references did not open the annotation block with its ordinary referrers visible",
+  });
+  await browser.$('button[title="Go back"]').click();
+  await browser.waitUntil(() => browser.execute(() =>
+    document.querySelectorAll(".pdf-link").length >= 2 &&
+    document.querySelector(".pdf-viewer")?.getAttribute("data-pdf-filename") === "logseq-sample.pdf"), {
+    timeout: 10_000,
+    timeoutMsg: "returning from PDF highlight references did not restore the journal surface",
+  });
 
   // OG carries an annotation entity through block-ref navigation, then scrolls
   // to that exact highlight. A filename is the resource identity; a second

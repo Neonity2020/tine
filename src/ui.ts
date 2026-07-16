@@ -1085,6 +1085,18 @@ export function closeContextMenu() {
   setContextMenu(null);
 }
 
+// A navigation surface can request that the ordinary per-block referrer panel
+// open when its target block mounts. The monotonically increasing token makes a
+// repeated request for the same block observable after the user closed it.
+let blockReferencesRequestToken = 0;
+export const [blockReferencesRequest, setBlockReferencesRequest] = createSignal<{
+  id: string;
+  token: number;
+} | null>(null);
+export function requestBlockReferences(id: string) {
+  setBlockReferencesRequest({ id, token: ++blockReferencesRequestToken });
+}
+
 export type SettingsTabId = "appearance" | "editor" | "journals" | "files" | "backups" | "graph" | "improve" | "shortcuts" | "about";
 
 export const [settingsOpen, setSettingsOpen] = createSignal(false);

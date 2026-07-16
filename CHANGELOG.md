@@ -10,6 +10,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Existing PDF highlights now expose their reference workflow.** On desktop,
+  text and area highlights offer **Copy ref** and **Linked references** from the
+  same click or right-click menu; both actions safely ensure the annotation
+  block before copying or opening it with its ordinary referrers visible.
+  (GH #168)
 - **Bare hashtag autocomplete stays open for Unicode IME input.** CJK, Kana,
   Hangul, Thai, accented, emoji, and namespaced tag prefixes now use the same
   hard-stop contract as the parser instead of JavaScript's ASCII-only word
