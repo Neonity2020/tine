@@ -48,7 +48,8 @@ export function validateDisposition(owner, value, problems) {
 }
 
 export function auditableSourceFingerprint(root) {
-  const roots = ["src", "src-tauri/src", "crates", "fixtures"];
+  const pluginRoots = ["plugin-sdk", "community-plugins"];
+  const roots = ["src", "src-tauri/src", "crates", "fixtures", ...pluginRoots];
   const individual = ["Cargo.toml", "Cargo.lock", "package.json", "package-lock.json", "src-tauri/tauri.conf.json"];
   const files = [];
   const walk = (relative) => {
@@ -56,6 +57,9 @@ export function auditableSourceFingerprint(root) {
     if (!fs.existsSync(absolute)) return;
     const stat = fs.lstatSync(absolute);
     if (stat.isDirectory()) {
+      const pluginBuildOutput = path.basename(relative) === "target"
+        && pluginRoots.some((pluginRoot) => relative.startsWith(`${pluginRoot}${path.sep}`));
+      if (pluginBuildOutput) return;
       for (const name of fs.readdirSync(absolute).sort()) walk(path.join(relative, name));
     } else if (stat.isFile()) files.push(relative.replaceAll(path.sep, "/"));
   };
