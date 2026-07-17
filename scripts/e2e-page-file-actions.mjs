@@ -121,7 +121,9 @@ try {
   ));
   const assertExpanded = async (expected, label) => {
     const actual = await expandedByPane();
-    if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+    const keys = Object.keys(actual);
+    if (keys.length !== Object.keys(expected).length
+        || Object.entries(expected).some(([paneId, value]) => actual[paneId] !== value)) {
       throw new Error(`${label}: ${JSON.stringify(actual)} expected ${JSON.stringify(expected)}`);
     }
   };
