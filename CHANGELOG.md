@@ -73,6 +73,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   selected graph-relative path. Stale or ambiguous rename/delete targets fail
   closed instead of touching a same-name sibling, while older logical/pathless
   links, Favorites, and sessions remain compatible.
+- **Signed plugin registry cache updates are now failure-atomic and revocations
+  remain durable.** The verified index and signature share one native envelope,
+  legacy split keys migrate through a guarded transaction, torn or unreadable
+  cache state holds guest activation, and cached/live revocations clear the
+  installed enable bit before any guest bytes or runtime can be used.
 - **Cached signed plugin and theme revocations now take effect before startup
   activation.** A stalled catalogue refresh is abort-bounded, one broken plugin
   no longer blocks the rest, and a newer verified revocation immediately stops
