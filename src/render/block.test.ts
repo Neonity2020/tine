@@ -40,6 +40,14 @@ describe("pageProperties", () => {
       ["tags", "a, b"],
     ]);
   });
+  it("only renders the canonical header prefix, never later prose/fence lookalikes", () => {
+    expect(pageProperties("Intro\ncustom:: not-a-header")).toEqual([]);
+    expect(pageProperties("```\ncustom:: not-a-header\n```")).toEqual([]);
+    expect(pageProperties("klíč:: hodnota\n\ncustom/key:: value\n\nIntro\nlater:: body")).toEqual([
+      ["klíč", "hodnota"],
+      ["custom/key", "value"],
+    ]);
+  });
   it("org #+KEY: directives and :PROPERTIES: drawer (keys lowercased)", () => {
     expect(pageProperties("#+TITLE: org-sink\n#+FILETAGS: :demo:org:", "org")).toEqual([
       ["title", "org-sink"],

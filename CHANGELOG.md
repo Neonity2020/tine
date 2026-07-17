@@ -29,6 +29,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Markdown page-header properties are now directly editable and stay
+  unbulleted on disk.** Clicking an existing header, or crossing into it with
+  the arrow keys, uses the ordinary block editor; newly authored custom and
+  Unicode properties reopen as canonical Logseq page metadata without changing
+  body blocks or unsafe preambles. (GH #163)
 - **Mixed-case page links now open the existing canonical page.** Wiki links,
   tags, aliases, tabs, and sidebar navigation share the same case-insensitive
   page identity instead of opening a blank, non-editable case variant. (GH #179)

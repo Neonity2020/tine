@@ -92,10 +92,28 @@ try {
     ?.querySelectorAll(".page-ref").length ?? 0);
   if (propertyLinks !== 2) throw new Error(`tags property did not expose two page links: ${propertyLinks}`);
   await browser.$("h1.page-title").click();
-  await browser.waitUntil(() => fs.readFileSync(`${GRAPH}/pages/Books.md`, "utf8").startsWith("- alias:: book\n"), {
+  await browser.waitUntil(() => fs.readFileSync(`${GRAPH}/pages/Books.md`, "utf8").startsWith("alias:: book\n"), {
     timeout: 5000, timeoutMsg: "completed alias was not saved to disk",
   });
-  console.log("PASS: first-bullet properties stay in one editor, exit cleanly, link page values, and persist");
+  const saved = fs.readFileSync(`${GRAPH}/pages/Books.md`, "utf8");
+  if (/^- alias::/m.test(saved) || !saved.includes("tags:: blah，foobar")) {
+    throw new Error(`new page properties did not persist as an unbulleted canonical header: ${JSON.stringify(saved)}`);
+  }
+  await browser.execute(() => [...document.querySelectorAll(".nav-item")]
+    .find((element) => element.textContent?.trim() === "Journals")
+    ?.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, button: 0 })));
+  await browser.waitUntil(() => browser.execute(() => [...document.querySelectorAll("a.page-ref")]
+    .some((element) => element.textContent?.includes("Books"))), {
+    timeout: 5_000, timeoutMsg: "Journals did not expose the Books link for a cold reopen",
+  });
+  await browser.execute(() => [...document.querySelectorAll("a.page-ref")]
+    .find((element) => element.textContent?.includes("Books"))
+    ?.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, button: 0 })));
+  await browser.waitUntil(async () => (await browser.$("h1.page-title").getText()) === "Books", { timeout: 10_000 });
+  if (!(await browser.$(".page-aliases").getText()).includes("book")) {
+    throw new Error("reopened page did not parse the authored header as metadata");
+  }
+  console.log("PASS: first-bullet properties stay in one editor, persist unbulleted, and reopen as page metadata");
 } finally {
   try { await browser?.deleteSession(); } catch {}
   try { process.kill(-td.pid, "SIGKILL"); } catch {}

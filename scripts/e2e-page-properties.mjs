@@ -218,12 +218,51 @@ try {
 
   await openPage("Property detailed");
   await exerciseNativeFormTabTraversal("Test Record, Alternate");
+  const customRow = await browser.execute(() => {
+    const rows = [...document.querySelectorAll(".page-properties .prop-row")];
+    const row = rows.find((element) => element.querySelector(".prop-key")?.textContent?.trim() === "ai-prompt");
+    if (!row) return false;
+    row.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, button: 0 }));
+    return true;
+  });
+  if (!customRow) throw new Error("missing rendered custom page property authoring target");
+  let headerEditor = await browser.$(".page-blocks textarea.block-editor");
+  await headerEditor.waitForExist({ timeout: 5_000 });
+  const originalHeader = await headerEditor.getValue();
+  if (!originalHeader.includes("ai-prompt:: [[Prompt-Test]]") || !originalHeader.includes("\n\npage-level::")) {
+    throw new Error(`page-header ordinary editor lost raw properties/separators: ${JSON.stringify(originalHeader)}`);
+  }
+  const editedHeader = originalHeader.replace("ai-prompt:: [[Prompt-Test]]", "ai-prompt:: [[Prompt-Edited]]");
+  await headerEditor.setValue(editedHeader);
+  await browser.execute(() => {
+    const editor = document.querySelector(".page-blocks textarea.block-editor");
+    editor?.focus();
+    if (editor instanceof HTMLTextAreaElement) editor.setSelectionRange(editor.value.length, editor.value.length);
+  });
+  await browser.keys(["ArrowDown"]);
+  await browser.waitUntil(async () => (await browser.$(".page-blocks textarea.block-editor").getValue()) === "Example content block", {
+    timeout: 5_000,
+    timeoutMsg: "Arrow Down did not cross from the page header into the first body block",
+  });
+  await browser.execute(() => {
+    const editor = document.querySelector(".page-blocks textarea.block-editor");
+    editor?.focus();
+    if (editor instanceof HTMLTextAreaElement) editor.setSelectionRange(2, 2);
+  });
+  await browser.keys(["ArrowUp"]);
+  await browser.waitUntil(async () => (await browser.$(".page-blocks textarea.block-editor").getValue()).includes("Prompt-Edited"), {
+    timeout: 5_000,
+    timeoutMsg: "Arrow Up did not cross from the first body block back into the page header",
+  });
+  await browser.$("h1.page-title").click();
   const detailedAfter = await waitForFile(
     `${GRAPH}/pages/Property detailed.md`,
-    (text) => text.includes("alias:: Test Record, Alternate"),
+    (text) => text.includes("alias:: Test Record, Alternate") && text.includes("ai-prompt:: [[Prompt-Edited]]"),
     "detailed page property edit",
   );
-  const detailedExpected = detailed.replace("alias:: Test Record", "alias:: Test Record, Alternate");
+  const detailedExpected = detailed
+    .replace("alias:: Test Record", "alias:: Test Record, Alternate")
+    .replace("ai-prompt:: [[Prompt-Test]]", "ai-prompt:: [[Prompt-Edited]]");
   if (detailedAfter !== detailedExpected) {
     throw new Error(`detailed page changed outside the edited line\nEXPECTED:\n${detailedExpected}\nACTUAL:\n${detailedAfter}`);
   }
@@ -246,7 +285,14 @@ try {
   if (!lines.includes("A:: XX") || !lines.includes("B:: XX") || !lines.includes("C:: XX") || !lines.includes("icon:: ★")) {
     throw new Error(`simple page properties were lost or merged: ${JSON.stringify(lines)}`);
   }
-  console.log("PASS: page-property native Tab traversal and literal reporter files survive the real Tauri/WebKit save path");
+  await openPage("Property detailed");
+  const reopenedCustom = await browser.execute(() => [...document.querySelectorAll(".page-properties .prop-row")]
+    .find((row) => row.querySelector(".prop-key")?.textContent?.trim() === "ai-prompt")
+    ?.querySelector(".prop-value")?.textContent?.trim() ?? null);
+  if (!reopenedCustom?.includes("Prompt-Edited")) {
+    throw new Error(`reopened page did not parse the edited custom header: ${JSON.stringify(reopenedCustom)}`);
+  }
+  console.log("PASS: page-header click/edit/navigation, gear traversal, disk bytes, and real-app reopen are canonical");
 } finally {
   try { await browser?.deleteSession(); } catch {}
   if (process.platform === "win32") {

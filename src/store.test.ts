@@ -63,6 +63,8 @@ import {
   readSchedule,
   readPageProperty,
   setPageProperty,
+  beginPageHeaderEdit,
+  finishPageHeaderEdit,
 } from "./store";
 import { editingId, startEditing, takeCaretFor } from "./editorController";
 import { exportOutline, DEFAULT_EXPORT_OPTIONS } from "./editor/exportText";
@@ -120,6 +122,97 @@ describe("properties-only first block", () => {
     setPageProperty("Test", "tags", "blah, reference");
     expect(doc.pages[0].preBlock).toBeNull();
     expect(doc.byId[properties.id].raw).toContain("tags:: blah, reference");
+  });
+
+  it("opens an existing header as a representation-only ordinary root and canonicalizes it for persistence", () => {
+    const body = blk("Reading list");
+    loadSingle({
+      name: "Test", kind: "page", title: "Test",
+      pre_block: "alias:: book\n\nklíč:: hodnota\n\nIntro",
+      blocks: [body], format: "md",
+    });
+    const id = beginPageHeaderEdit("Test");
+    expect(id).not.toBeNull();
+    expect(doc.byId[id!]).toMatchObject({
+      raw: "alias:: book\n\nklíč:: hodnota",
+      originatedFromPageHeader: true,
+      children: [],
+    });
+    expect(doc.pages[0].roots).toEqual([id, body.id]);
+    expect(doc.pages[0].preBlock).toBe("\n\nIntro");
+    expect(isDirty("Test")).toBe(false);
+    expect(pageToDto("Test")).toMatchObject({
+      pre_block: "alias:: book\n\nklíč:: hodnota\n\nIntro",
+      blocks: [{ raw: "Reading list" }],
+    });
+  });
+
+  it("fails closed on an invalid marked header draft and keeps the draft editable", () => {
+    loadSingle({
+      name: "Test", kind: "page", title: "Test", pre_block: "alias:: book",
+      blocks: [blk("Body")], format: "md",
+    });
+    const id = beginPageHeaderEdit("Test")!;
+    setRaw(id, "alias:: book\nprose");
+    expect(pageToDto("Test")).toBeNull();
+    expect(doc.byId[id].raw).toBe("alias:: book\nprose");
+    expect(doc.byId[id].originatedFromPageHeader).toBe(true);
+    undo();
+    expect(doc.byId[id].raw).toBe("alias:: book");
+    finishPageHeaderEdit(id);
+    expect(doc.byId[id].originatedFromPageHeader).toBe(true);
+    expect(pageToDto("Test")?.pre_block).toBe("alias:: book");
+  });
+
+  it("deleting the header leaves no root or disk bullet and undo restores it in one step", () => {
+    const body = blk("Body");
+    loadSingle({ name: "Test", kind: "page", title: "Test", pre_block: "alias:: book", blocks: [body], format: "md" });
+    const id = beginPageHeaderEdit("Test")!;
+    setRaw(id, "");
+    finishPageHeaderEdit(id);
+    expect(doc.byId[id]).toBeUndefined();
+    expect(doc.pages[0].roots).toEqual([body.id]);
+    expect(pageToDto("Test")?.pre_block).toBeNull();
+    expect(pageToDto("Test")?.blocks.map((block) => block.raw)).toEqual(["Body"]);
+
+    undo();
+    expect(doc.pages[0].roots).toEqual([id, body.id]);
+    expect(doc.byId[id].raw).toBe("alias:: book");
+    expect(pageToDto("Test")?.pre_block).toBe("alias:: book");
+    redo();
+    expect(doc.pages[0].roots).toEqual([body.id]);
+    expect(doc.byId[id]).toBeUndefined();
+  });
+
+  it("does not synthesize page-header editors for Org, Guide, read-only, prose or fenced preambles", () => {
+    for (const [name, format, pre_block, read_only, guide] of [
+      ["Org", "org", "alias:: visible org text", false, false],
+      ["Guide", "md", "alias:: book", false, true],
+      ["Read only", "md", "alias:: book", true, false],
+      ["Prose", "md", "Intro\nalias:: not-header", false, false],
+      ["Fence", "md", "```\nalias:: not-header\n```", false, false],
+    ] as const) {
+      resetStore();
+      loadSingle({
+        name, kind: "page", title: name, pre_block, blocks: [blk("Body")], format,
+        read_only, guide,
+      });
+      expect(beginPageHeaderEdit(name), name).toBeNull();
+      expect(doc.pages[0].roots).toHaveLength(1);
+      expect(doc.pages[0].preBlock).toBe(pre_block);
+    }
+  });
+
+  it("edits the real preamble when the first body block also looks property-only", () => {
+    const body = blk("body-key:: body value");
+    loadSingle({
+      name: "Test", kind: "page", title: "Test", pre_block: "alias:: book",
+      blocks: [body], format: "md",
+    });
+    const id = beginPageHeaderEdit("Test");
+    expect(id).not.toBe(body.id);
+    expect(doc.byId[id!].raw).toBe("alias:: book");
+    expect(doc.byId[body.id].raw).toBe("body-key:: body value");
   });
 });
 

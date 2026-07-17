@@ -5116,7 +5116,7 @@ impl Graph {
         // `:journal/file-name-format` — so custom-format graphs create the correct
         // file for the day instead of a misplaced default-named duplicate.)
         let dto_is_org = matches!(Format::from_path(path), Format::Org);
-        let doc = Document {
+        let mut doc = Document {
             pre_block: page.pre_block.clone(),
             roots: page
                 .blocks
@@ -5134,12 +5134,44 @@ impl Graph {
         // outline; promotion keeps property lines in the pre-block.  Refuse both
         // normal and force writes that do so, leaving the original bytes intact.
         if let Some(existing) = existing {
+            // A nonempty disk preamble is authoritative. If a contradictory DTO
+            // drops it while presenting a first-root header candidate, refusing
+            // the save is safer than either overwriting the preamble or silently
+            // keeping the candidate as a bullet. This also protects force-save.
+            let existing_doc = doc::parse(existing);
+            if existing_doc
+                .pre_block
+                .as_deref()
+                .is_some_and(|pre| !pre.is_empty())
+                && doc.pre_block.as_deref().unwrap_or("").is_empty()
+                && first_root_is_promotable_page_header(&doc)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "refusing to drop an existing page preamble while authoring page-header properties",
+                ));
+            }
             if let Some(line) = moved_page_property_line(existing, &doc) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("refusing to move page-header property into outline content: {line}"),
                 ));
             }
+        }
+        // Match OG's pre-block serialization decision at one native boundary:
+        // a genuinely headerless Markdown page may author a qualifying first
+        // root through the ordinary editor, but the persisted/cache shape is an
+        // unbulleted page header. Existing nonempty preambles were rejected above.
+        if !dto_is_org
+            && page.pre_block.as_deref().unwrap_or("").is_empty()
+            && existing
+                .map(doc::parse)
+                .and_then(|parsed| parsed.pre_block)
+                .as_deref()
+                .unwrap_or("")
+                .is_empty()
+        {
+            promote_first_root_page_header(&mut doc);
         }
         // Own the caller's resolved+locked path (M2: never re-resolve path_for here).
         let path = path.to_path_buf();
@@ -5267,6 +5299,62 @@ impl Graph {
         // serialized, or the identical existing bytes on a no-op) — no re-read.
         Ok(rev)
     }
+}
+
+/// Canonical Markdown page-header property grammar mirrored from
+/// `src/editor/properties.ts`. It is deliberately narrower than OG's historical
+/// "first line contains `:: `" serializer heuristic, so ordinary prose/fences
+/// can never be promoted accidentally.
+fn page_header_property_line(line: &str) -> Option<(&str, &str)> {
+    static KEY: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let (key, value) = line.split_once("::")?;
+    if key.is_empty() || key.starts_with('#') {
+        return None;
+    }
+    let valid = KEY
+        .get_or_init(|| regex::Regex::new(r"^[\p{L}\p{M}\p{N}_./-]+$").unwrap())
+        .is_match(key);
+    valid.then_some((key, value))
+}
+
+fn page_header_properties_only(raw: &str) -> bool {
+    if raw.is_empty() || raw.starts_with('\n') || raw.ends_with('\n') {
+        return false;
+    }
+    let mut saw_property = false;
+    for line in raw.split('\n') {
+        if line.is_empty() {
+            if !saw_property {
+                return false;
+            }
+            continue;
+        }
+        if page_header_property_line(line).is_none() {
+            return false;
+        }
+        saw_property = true;
+    }
+    saw_property
+}
+
+fn first_root_is_promotable_page_header(doc: &Document) -> bool {
+    let Some(first) = doc.roots.first() else {
+        return false;
+    };
+    first.children.is_empty()
+        && page_header_properties_only(&first.raw)
+        && !first.raw.split('\n').any(|line| {
+            page_header_property_line(line)
+                .is_some_and(|(key, _)| key.eq_ignore_ascii_case("id"))
+        })
+}
+
+fn promote_first_root_page_header(doc: &mut Document) {
+    if !first_root_is_promotable_page_header(doc) {
+        return;
+    }
+    let first = doc.roots.remove(0);
+    doc.pre_block = Some(first.raw);
 }
 
 /// Return the first existing page-header property line that a proposed DTO has
@@ -8311,6 +8399,204 @@ mod tests {
                 Some("icon:: ★\nA:: XX\nB:: XX\nC:: XX")
             );
             assert!(reopened.blocks.is_empty());
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn new_property_only_first_root_becomes_canonical_page_header() {
+        let dir = scratch("page-property-authoring");
+        let g = Graph::open(&dir);
+        g.warm_cache();
+        let page = PageDto {
+            name: "Property Authoring".into(),
+            kind: PageKind::Page,
+            title: "Property Authoring".into(),
+            pre_block: None,
+            blocks: vec![
+                BlockDto {
+                    id: "transient-header".into(),
+                    raw: "alias:: book\n\nklíč:: hodnota".into(),
+                    ..Default::default()
+                },
+                BlockDto {
+                    id: "body".into(),
+                    raw: "Reading list".into(),
+                    ..Default::default()
+                },
+            ],
+            rev: None,
+            format: Format::Md,
+            read_only: false,
+            path: String::new(),
+            guide: false,
+        };
+        g.save_page(&page, None).unwrap();
+        let path = dir.join("pages").join("Property Authoring.md");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "alias:: book\n\nklíč:: hodnota\n\n- Reading list\n"
+        );
+
+        let warm = g
+            .load_named("Property Authoring", PageKind::Page)
+            .unwrap()
+            .unwrap();
+        assert_eq!(warm.pre_block.as_deref(), Some("alias:: book\n\nklíč:: hodnota"));
+        assert_eq!(warm.blocks.len(), 1);
+        assert_eq!(warm.blocks[0].raw, "Reading list");
+        assert_eq!(warm.blocks[0].id, "body", "normalization changed the body root identity");
+        drop(g);
+        let cold = Graph::open(&dir)
+            .load_named("Property Authoring", PageKind::Page)
+            .unwrap()
+            .unwrap();
+        assert_eq!(cold.pre_block, warm.pre_block);
+        assert_eq!(cold.blocks.len(), warm.blocks.len());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn page_header_authoring_is_bounded_and_preserves_existing_preambles() {
+        assert!(page_header_properties_only("alias:: book\n\ne\u{301}/plugin.key::value"));
+        for invalid in [
+            " alias:: x",
+            "#alias:: x",
+            "alias key:: x",
+            "alias:: x\nprose",
+            "```\nalias:: x\n```",
+            "alias:: x\n",
+        ] {
+            assert!(!page_header_properties_only(invalid), "accepted {invalid:?}");
+        }
+
+        // A headerless CRLF page can add a canonical header; both the warm cache
+        // and a fresh parser expose exactly the normalized document shape.
+        let dir = scratch("page-property-existing-headerless");
+        let path = dir.join("pages").join("Existing.md");
+        fs::write(&path, "- Body\r\n").unwrap();
+        let g = Graph::open(&dir);
+        g.warm_cache();
+        let mut dto = g.load_named("Existing", PageKind::Page).unwrap().unwrap();
+        dto.blocks.insert(
+            0,
+            BlockDto {
+                id: "transient-header".into(),
+                raw: "custom/key:: exact value".into(),
+                ..Default::default()
+            },
+        );
+        g.save_page(&dto, dto.rev.as_deref()).unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "custom/key:: exact value\r\n\r\n- Body\r\n"
+        );
+        let warm = g.load_named("Existing", PageKind::Page).unwrap().unwrap();
+        assert_eq!(warm.pre_block.as_deref(), Some("custom/key:: exact value"));
+        assert_eq!(warm.blocks.len(), 1);
+        drop(g);
+        let cold = Graph::open(&dir)
+            .load_named("Existing", PageKind::Page)
+            .unwrap()
+            .unwrap();
+        assert_eq!(cold.pre_block, warm.pre_block);
+        assert_eq!(cold.blocks.len(), warm.blocks.len());
+        let _ = fs::remove_dir_all(&dir);
+
+        // A non-property preamble may only move through GH #85's explicit prose
+        // promotion. A property candidate cannot make that preamble disappear,
+        // even through force-save, and the warm cache stays on the disk version.
+        let dir = scratch("page-property-preamble-loss");
+        let path = dir.join("pages").join("Imported.md");
+        let original = "Intro before outline\n\n- Body\n";
+        fs::write(&path, original).unwrap();
+        let g = Graph::open(&dir);
+        g.warm_cache();
+        let mut dto = g.load_named("Imported", PageKind::Page).unwrap().unwrap();
+        dto.pre_block = None;
+        dto.blocks.insert(
+            0,
+            BlockDto {
+                id: "candidate".into(),
+                raw: "alias:: book".into(),
+                ..Default::default()
+            },
+        );
+        for forced in [false, true] {
+            let err = if forced {
+                g.force_save_page(&dto).unwrap_err()
+            } else {
+                g.save_page(&dto, dto.rev.as_deref()).unwrap_err()
+            };
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            assert!(err.to_string().contains("existing page preamble"));
+            assert_eq!(fs::read_to_string(&path).unwrap(), original);
+            let cached = g.load_named("Imported", PageKind::Page).unwrap().unwrap();
+            assert_eq!(cached.pre_block.as_deref(), Some("Intro before outline"));
+            assert_eq!(cached.blocks.len(), 1);
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn page_header_authoring_never_promotes_unsafe_or_nonfirst_roots() {
+        let cases: Vec<(&str, Format, Vec<BlockDto>)> = vec![
+            (
+                "later",
+                Format::Md,
+                vec![
+                    BlockDto { id: "body".into(), raw: "Body".into(), ..Default::default() },
+                    BlockDto { id: "prop".into(), raw: "alias:: book".into(), ..Default::default() },
+                ],
+            ),
+            ("mixed", Format::Md, vec![BlockDto { id: "mixed".into(), raw: "alias:: book\nprose".into(), ..Default::default() }]),
+            ("fenced", Format::Md, vec![BlockDto { id: "fenced".into(), raw: "```\nalias:: book\n```".into(), ..Default::default() }]),
+            ("empty", Format::Md, vec![BlockDto { id: "empty".into(), raw: "".into(), ..Default::default() }]),
+            (
+                "childful",
+                Format::Md,
+                vec![BlockDto {
+                    id: "parent".into(),
+                    raw: "alias:: book".into(),
+                    children: vec![BlockDto { id: "child".into(), raw: "Child".into(), ..Default::default() }],
+                    ..Default::default()
+                }],
+            ),
+            ("id-bearing", Format::Md, vec![BlockDto { id: "durable".into(), raw: "id:: 11111111-1111-4111-8111-111111111111".into(), ..Default::default() }]),
+            ("org", Format::Org, vec![BlockDto { id: "org".into(), raw: "alias:: book".into(), ..Default::default() }]),
+        ];
+        for (label, format, blocks) in cases {
+            let dir = scratch(&format!("page-property-negative-{label}"));
+            if format == Format::Org {
+                fs::create_dir_all(dir.join("logseq")).unwrap();
+                fs::write(dir.join("logseq").join("config.edn"), "{:preferred-format \"Org\"}\n").unwrap();
+            }
+            let g = Graph::open(&dir);
+            let page = PageDto {
+                name: format!("Negative {label}"),
+                kind: PageKind::Page,
+                title: format!("Negative {label}"),
+                pre_block: None,
+                blocks: blocks.clone(),
+                rev: None,
+                format,
+                read_only: false,
+                path: String::new(),
+                guide: false,
+            };
+            g.save_page(&page, None).unwrap();
+            let reopened = g
+                .load_named(&page.name, PageKind::Page)
+                .unwrap()
+                .unwrap();
+            assert!(reopened.pre_block.is_none(), "promoted unsafe case {label}");
+            assert_eq!(reopened.blocks.len(), blocks.len(), "changed root count for {label}");
+            if label == "id-bearing" {
+                assert!(
+                    g.resolve_block("11111111-1111-4111-8111-111111111111").is_some(),
+                    "ID-bearing root lost addressability"
+                );
+            }
             let _ = fs::remove_dir_all(&dir);
         }
     }

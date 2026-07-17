@@ -9,7 +9,29 @@ import {
   upsertPropertyLine,
   isBuiltinHidden,
   rawOffsetToVisibleOffset,
+  isPageHeaderPropertiesOnly,
+  parsePageHeaderPropertyLine,
+  splitPagePreamble,
 } from "./properties";
+
+describe("canonical Markdown page-header grammar (GH #163)", () => {
+  it("accepts Unicode/plugin keys and preserves internal blank separators", () => {
+    expect(parsePageHeaderPropertyLine("klíč:: hodnota")).toEqual({ key: "klíč", value: " hodnota" });
+    expect(parsePageHeaderPropertyLine("e\u0301/plugin.key::value")).toEqual({ key: "e\u0301/plugin.key", value: "value" });
+    expect(isPageHeaderPropertiesOnly("alias:: book\n\nklíč:: hodnota")).toBe(true);
+    expect(splitPagePreamble("alias:: book\n\nklíč:: hodnota\n\nIntro")).toEqual({
+      properties: "alias:: book\n\nklíč:: hodnota",
+      content: "Intro",
+      remainder: "\n\nIntro",
+    });
+  });
+
+  it("rejects leading whitespace, headings, prose, fences and trailing blanks", () => {
+    for (const raw of [" alias:: x", "#alias:: x", "alias key:: x", "```\na:: b\n```", "alias:: x\nprose", "alias:: x\n"]) {
+      expect(isPageHeaderPropertiesOnly(raw), raw).toBe(false);
+    }
+  });
+});
 
 describe("multilineExitTrim — Enter on a trailing blank line exits a code/calc block", () => {
   it("fenced: exits only on the blank last content line and keeps the closing fence", () => {

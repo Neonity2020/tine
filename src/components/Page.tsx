@@ -1,5 +1,5 @@
 import { For, Show, createEffect, createMemo, createResource, createSignal, onCleanup, untrack, useContext, type JSX } from "solid-js";
-import { doc, mainPages, pageByName, loadFeed, appendFeed, emptyPage, ensurePageLoaded, setFeedExtender, flushAll, formatForBlock, readPageProperty, setPageProperty, appendToTodayJournal, ensureEmptyBlock, insertEmptyChildBlock, insertOutlineAfter, promotePagePreamble, trailingVisibleEmptyLeaf, isBlockMoving, isDirty, isSaving, type FeedPage } from "../store";
+import { doc, mainPages, pageByName, loadFeed, appendFeed, emptyPage, ensurePageLoaded, setFeedExtender, flushAll, formatForBlock, readPageProperty, setPageProperty, appendToTodayJournal, ensureEmptyBlock, insertEmptyChildBlock, insertOutlineAfter, promotePagePreamble, beginPageHeaderEdit, trailingVisibleEmptyLeaf, isBlockMoving, isDirty, isSaving, type FeedPage } from "../store";
 import { sameRoute, type PaneRouter } from "../router";
 import { PaneContext, focusedRouter } from "../panes";
 import {
@@ -546,6 +546,9 @@ function PageSection(props: { page: FeedPage }): JSX.Element {
   };
   const propertySource = () => {
     const first = firstPropertiesId();
+    if (first && doc.byId[first].originatedFromPageHeader) {
+      return doc.byId[first].raw + (props.page.preBlock ?? "");
+    }
     return [props.page.preBlock, first ? doc.byId[first].raw : null].filter(Boolean).join("\n") || null;
   };
   const rootsToRender = () => firstPropertiesId() ? props.page.roots.slice(1) : props.page.roots;
@@ -554,6 +557,11 @@ function PageSection(props: { page: FeedPage }): JSX.Element {
   const editPreamble = () => {
     const id = promotePagePreamble(props.page.name);
     if (id) startEditing(id, doc.byId[id].raw.length);
+  };
+  const editPageHeader = (event?: MouseEvent) => {
+    if (event?.target instanceof Element && event.target.closest("a, button")) return;
+    const id = beginPageHeaderEdit(props.page.name);
+    if (id) startEditing(id, doc.byId[id].raw.length, null, editSurface());
   };
   const focusTrailing = () => {
     const roots = rootsToRender();
@@ -665,7 +673,14 @@ function PageSection(props: { page: FeedPage }): JSX.Element {
                 ?.trim()}
             >
               {(icon) => (
-                <span class="page-icon page-title-icon">
+                <span
+                  class="page-icon page-title-icon"
+                  onClick={(event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    editPageHeader();
+                  }}
+                >
                   <EmojiText text={icon()} />
                 </span>
               )}
@@ -717,7 +732,7 @@ function PageSection(props: { page: FeedPage }): JSX.Element {
         </Show>
       </div>
       <Show when={aliasNames(propertySource(), props.page.format).length}>
-        <div class="page-aliases" title="Also known as — other names that link here">
+        <div class="page-aliases" title="Also known as — other names that link here" onClick={editPageHeader}>
           <span class="page-aliases-label">aka</span>
           <For each={aliasNames(propertySource(), props.page.format)}>
             {(a) => <span class="alias-chip"><PageRef name={a} alias={a} /></span>}
@@ -725,7 +740,7 @@ function PageSection(props: { page: FeedPage }): JSX.Element {
         </div>
       </Show>
       <Show when={pageProperties(propertySource(), props.page.format).filter(([k]) => !PAGE_PROPS_HIDDEN.has(k.toLowerCase())).length}>
-        <div class="page-properties">
+        <div class="page-properties" onClick={editPageHeader}>
           {/* `alias`/`icon` are surfaced elsewhere (chips / title icon) — see PAGE_PROPS_HIDDEN. */}
           <For each={pageProperties(propertySource(), props.page.format).filter(([k]) => !PAGE_PROPS_HIDDEN.has(k.toLowerCase()))}>
             {([key, value]) => (

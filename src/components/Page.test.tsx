@@ -12,6 +12,8 @@ import {
   setDoc,
   extendFeedForScroll,
   flushPage,
+  isDirty,
+  pageToDto,
   setBlockMoving,
   undo,
   type FeedPage,
@@ -934,6 +936,48 @@ describe("page properties", () => {
 });
 
 describe("Markdown preamble content", () => {
+  it("opens canonical page-header properties in the ordinary editor without dirtying on entry", async () => {
+    const bodyId = "33333333-3333-4333-8333-333333333333";
+    const dto = {
+      name: "Header",
+      kind: "page" as const,
+      title: "Header",
+      pre_block: "klíč:: hodnota\n\nalias:: Book",
+      blocks: [{ id: bodyId, raw: "First body", collapsed: false, children: [] }],
+    };
+    setDoc({
+      byId: { [bodyId]: node(bodyId, "First body", dto.name) },
+      pages: [page(dto.name, "page", [bodyId], dto.pre_block)],
+      feed: [], loaded: true,
+    });
+    vi.spyOn(backend(), "getPage").mockResolvedValue(dto);
+    mainPaneRouter.openPage(dto.name, "page", { inPlace: true });
+    const { root, dispose } = mount(() => <PageView />);
+    try {
+      await tick(); await tick();
+      (root.querySelector(".page-properties .prop-row") as HTMLElement).click();
+      await tick();
+      const headerId = pageByName(dto.name)!.roots[0];
+      const editor = root.querySelector(`[data-block-id="${headerId}"] textarea`) as HTMLTextAreaElement;
+      expect(editor.value).toBe(dto.pre_block);
+      expect(doc.byId[headerId].originatedFromPageHeader).toBe(true);
+      expect(isDirty(dto.name)).toBe(false);
+      expect(pageToDto(dto.name)?.pre_block).toBe(dto.pre_block);
+
+      editor.value = "klíč:: změněno\n\nalias:: Book";
+      editor.dispatchEvent(new Event("input", { bubbles: true }));
+      expect(isDirty(dto.name)).toBe(true);
+      expect(pageToDto(dto.name)?.pre_block).toBe("klíč:: změněno\n\nalias:: Book");
+      expect(pageToDto(dto.name)?.blocks.map((block) => block.raw)).toEqual(["First body"]);
+      endEdit("blur");
+      await tick();
+      expect(root.querySelector(".page-properties")?.textContent).toContain("změněno");
+      expect(root.querySelector(`[data-block-id="${headerId}"] textarea`)).toBeNull();
+    } finally {
+      dispose();
+    }
+  });
+
   it("renders text before the first bullet and promotes it only when edited (GH #85)", async () => {
     const bodyId = "22222222-2222-4222-8222-222222222222";
     const dto = {

@@ -35,6 +35,8 @@ import {
   prevVisible,
   nextVisible,
   nextVisibleOrExtend,
+  beginPageHeaderEdit,
+  finishPageHeaderEdit,
   insertEmptyChildBlock,
   insertOutlineAfter,
   replaceEmptyBlockWithOutline,
@@ -1041,10 +1043,11 @@ export function Editor(props: { id: string }): JSX.Element {
   const pageFmt = (): "md" | "org" => (pageByName(node().page)?.format === "org" ? "org" : "md");
   const isFirstPagePropertiesBlock = (raw: string) => {
     const page = pageByName(node().page);
+    const propertyDraft = isPropertiesOnly(raw)
+      || (raw.endsWith("\n") && isPropertiesOnly(raw.slice(0, -1)));
     return page?.format === "md"
-      && !page.preBlock
       && page.roots[0] === props.id
-      && isPropertiesOnly(raw);
+      && (node().originatedFromPageHeader || (!page.preBlock && propertyDraft));
   };
 
   // What the textarea shows. Annotation (PDF highlight) blocks expose only their
@@ -2662,7 +2665,18 @@ export function Editor(props: { id: string }): JSX.Element {
       // to the parent from the second visual row.)
       const before = raw.slice(0, start);
       if (!before.includes("\n") && caretAtFirstRow(ref, start)) {
-        const prev = prevVisible(props.id, outlineScope);
+        let prev = prevVisible(props.id, outlineScope);
+        // A canonical page header is not normally an outline node. Materialize
+        // its transient ordinary-editor representation only when the primary
+        // page/pane caret crosses the first-body boundary; reference, embed and
+        // right-sidebar copies must never synthesize it.
+        if (
+          !prev && !outlineScope
+          && (surfaceKey === "main" || surfaceKey.startsWith("pane:"))
+          && pageByName(node().page)?.roots[0] === props.id
+        ) {
+          prev = beginPageHeaderEdit(node().page);
+        }
         if (prev) {
           e.preventDefault();
           // Keep the caret's column on the previous block's bottom visual row.
@@ -2735,6 +2749,7 @@ export function Editor(props: { id: string }): JSX.Element {
     // closing, so there is no caret to preserve.
     const calcExit = isCalc();
     commit(calcExit ? ref.value : normalizePlanning(ref.value, pageFmt()), calcExit ? { calc: true } : undefined);
+    finishPageHeaderEdit(props.id);
     // Only clear if no other block grabbed editing focus.
     if (editingId() === props.id) endEdit("blur");
   };

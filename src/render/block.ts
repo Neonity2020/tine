@@ -3,6 +3,7 @@
 
 import type { Format } from "./ast";
 import { MARKERS } from "../markers";
+import { parsePageHeaderPropertyLine, splitPagePreamble } from "../editor/properties";
 
 export { MARKERS };
 
@@ -71,11 +72,11 @@ export function pageProperties(
       }
     }
   } else {
-    for (const line of preBlock.split("\n")) {
-      if (isPropertyLine(line)) {
-        const idx = line.indexOf("::");
-        out.push([line.slice(0, idx).trim(), line.slice(idx + 2).trim()]);
-      }
+    const header = splitPagePreamble(preBlock).properties;
+    if (!header) return out;
+    for (const line of header.split("\n")) {
+      const property = parsePageHeaderPropertyLine(line);
+      if (property) out.push([property.key, property.value.trim()]);
     }
   }
   return out;
