@@ -148,6 +148,19 @@ fn push_explicit(
     let Some(range) = span.and_then(|span| mapper.map(span, raw_len)) else {
         return;
     };
+    push_explicit_range(projection, name, range, raw_len, rule);
+}
+
+fn push_explicit_range(
+    projection: &mut ReferenceSourceProjection,
+    name: String,
+    range: Range<usize>,
+    raw_len: usize,
+    rule: &'static str,
+) {
+    if range.start > range.end || range.end > raw_len {
+        return;
+    }
     if !name.trim().is_empty() {
         projection
             .explicit
@@ -276,7 +289,11 @@ fn walk_list_item(
     }
 }
 
-fn property_values(span: Option<&Span>, mapper: SpanMapper, raw: &str) -> Vec<(usize, String)> {
+fn property_values(
+    span: Option<&Span>,
+    mapper: SpanMapper,
+    raw: &str,
+) -> Vec<(String, usize, String)> {
     let Some(range) = span.and_then(|span| mapper.map(span, raw.len())) else {
         return Vec::new();
     };
@@ -287,14 +304,64 @@ fn property_values(span: Option<&Span>, mapper: SpanMapper, raw: &str) -> Vec<(u
     let mut line_offset = range.start;
     for line in source.split_inclusive('\n') {
         let line_without_newline = line.strip_suffix('\n').unwrap_or(line);
-        if let Some((_key, value)) = crate::doc::parse_property_line(line_without_newline) {
+        if let Some((key, value)) = crate::doc::parse_property_line(line_without_newline) {
             if let Some(value_at) = line_without_newline.rfind(&value) {
-                out.push((line_offset + value_at, value));
+                out.push((key, line_offset + value_at, value));
             }
         }
         line_offset += line.len();
     }
     out
+}
+
+fn project_implicit_linkable_property(
+    projection: &mut ReferenceSourceProjection,
+    key: &str,
+    value_offset: usize,
+    value: &str,
+    raw_len: usize,
+) {
+    if !(key.eq_ignore_ascii_case("tags")
+        || key.eq_ignore_ascii_case("alias")
+        || key.eq_ignore_ascii_case("aliases"))
+    {
+        return;
+    }
+    let whole = value.trim();
+    if whole.len() >= 2 && whole.starts_with('"') && whole.ends_with('"') {
+        return;
+    }
+
+    let mut segment_start = 0;
+    for (index, separator) in value
+        .char_indices()
+        .filter(|(_, ch)| *ch == ',' || *ch == '，')
+        .map(|(index, ch)| (index, ch.len_utf8()))
+        .chain(std::iter::once((value.len(), 0)))
+    {
+        let segment = &value[segment_start..index];
+        let leading = segment.len() - segment.trim_start().len();
+        let name = segment.trim();
+        // Wrapped page refs and tags are already parser-owned explicit
+        // occurrences. Mixed syntax is likewise left to the parser rather than
+        // inventing a second interpretation for one property member.
+        if !name.is_empty()
+            && !name.contains("[[")
+            && !name.contains("]]")
+            && !name.starts_with('#')
+        {
+            let start = value_offset + segment_start + leading;
+            let end = start + name.len();
+            push_explicit_range(
+                projection,
+                name.to_string(),
+                start..end,
+                raw_len,
+                "implicit_linkable_property",
+            );
+        }
+        segment_start = index + separator;
+    }
 }
 
 fn walk_blocks(
@@ -333,7 +400,7 @@ fn walk_blocks(
                 }
             }
             Block::Properties { span, .. } => {
-                for (offset, value) in property_values(span.as_ref(), mapper, raw) {
+                for (key, offset, value) in property_values(span.as_ref(), mapper, raw) {
                     let parsed = lsdoc::parse_format(&value, if is_org { "org" } else { "md" });
                     walk_blocks(
                         &parsed.blocks,
@@ -342,6 +409,7 @@ fn walk_blocks(
                         is_org,
                         projection,
                     );
+                    project_implicit_linkable_property(projection, &key, offset, &value, raw.len());
                 }
             }
             _ => {}
@@ -684,6 +752,43 @@ mod tests {
         let got = evidence("\\[[Target]] and `Target`\n```\nTarget\n```", &["Target"]);
         assert_eq!(got.len(), 1, "{got:?}");
         assert_eq!(got[0].kind, ReferenceKind::Plain);
+    }
+
+    #[test]
+    fn bare_linkable_property_values_project_exact_explicit_evidence() {
+        for raw in [
+            "tags:: Target",
+            "alias:: Target",
+            "aliases:: Other, Target, Third",
+            "tags:: Other，Target，Third",
+        ] {
+            let got = evidence(raw, &["Target"]);
+            let explicit = got
+                .iter()
+                .filter(|hit| hit.kind == ReferenceKind::Explicit)
+                .collect::<Vec<_>>();
+            assert_eq!(explicit.len(), 1, "{raw}: {got:?}");
+            assert_eq!(explicit[0].rule, "implicit_linkable_property");
+            let start = raw.find("Target").unwrap();
+            assert_eq!(explicit[0].span.start, byte_to_utf16(raw, start));
+            assert_eq!(explicit[0].span.end, byte_to_utf16(raw, start + 6));
+        }
+    }
+
+    #[test]
+    fn explicit_property_syntax_is_not_duplicated_or_promoted_from_custom_values() {
+        let raw = "tags:: [[Target]]\nalias:: #Target\ncustom:: Target\naliases:: \"Target\"";
+        let parsed = crate::render::parse_projection(raw, false);
+        let projected = project(raw, false, &parsed.blocks);
+        let target = projected
+            .explicit
+            .iter()
+            .filter(|reference| refs::same_page(&reference.name, "Target"))
+            .collect::<Vec<_>>();
+        assert_eq!(target.len(), 2, "{target:?}");
+        assert!(target
+            .iter()
+            .all(|reference| reference.rule != "implicit_linkable_property"));
     }
 
     #[test]

@@ -29,6 +29,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Bare `tags`, `alias`, and `aliases` property values now create Linked
+  References.** Page and block properties use the same canonical reference
+  evidence as wrapped page links and hashtags, including after an in-place edit.
+  (GH #180)
 - **Selection formatting no longer wraps selected outer spaces.** Bold, italic,
   strike, and highlight actions keep leading and trailing selected whitespace
   outside their Markdown or Org delimiters, whether invoked from the keyboard

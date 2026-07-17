@@ -56,6 +56,7 @@ fs.writeFileSync(`${GRAPH}/pages/Linked source.md`, [
   "  - A descendant-only filter witness carries #Evidence",
   "",
 ].join("\n"));
+fs.writeFileSync(`${GRAPH}/pages/Tagged source.md`, "tags:: Query parity\n\n- This page is tagged through a bare page property.\n");
 const now = new Date();
 const journal = `${now.getFullYear()}_${String(now.getMonth() + 1).padStart(2, "0")}_${String(now.getDate()).padStart(2, "0")}`;
 fs.writeFileSync(`${GRAPH}/journals/${journal}.md`, "- Open [[Research]] and [[Query parity]]\n");
@@ -417,6 +418,7 @@ await withApp(1, async (browser) => {
     "Query parity.md",
     "Research.md",
     "Second unlinked.md",
+    "Tagged source.md",
     "Templates.md",
     "Unlinked source.md",
     ...Array.from({ length: 140 }, (_, index) => {
@@ -482,13 +484,17 @@ await withApp(2, async (browser) => {
   const linkedProof = await browser.execute(() => {
     const groups = [...document.querySelectorAll(".linked-references .reference-group")];
     const source = groups.find((group) => group.querySelector(".reference-page")?.textContent?.trim() === "Linked source");
+    const tagged = groups.find((group) => group.querySelector(".reference-page")?.textContent?.trim() === "Tagged source");
     return {
       groupCount: groups.length,
       mentions: source?.querySelector(".reference-mention-count")?.textContent?.trim(),
       jumps: source?.querySelectorAll(".reference-occurrence-jump").length,
+      taggedMentions: tagged?.querySelector(".reference-mention-count")?.textContent?.trim(),
+      taggedJumps: tagged?.querySelectorAll(".reference-occurrence-jump").length,
     };
   });
-  if (linkedProof.groupCount < 2 || linkedProof.mentions !== "2 mentions" || linkedProof.jumps !== 2) {
+  if (linkedProof.groupCount < 3 || linkedProof.mentions !== "2 mentions" || linkedProof.jumps !== 2
+    || linkedProof.taggedMentions !== "1 mention" || linkedProof.taggedJumps !== 1) {
     throw new Error(`linked reference evidence is incomplete: ${JSON.stringify(linkedProof)}`);
   }
 
@@ -497,17 +503,18 @@ await withApp(2, async (browser) => {
   const linkedFilterSearch = await browser.$(".linked-references .reference-filter-search");
   await linkedFilterSearch.waitForExist({ timeout: 5_000 });
   await linkedFilterSearch.setValue('"descendant-only filter witness"');
-  await browser.waitUntil(() => browser.execute(() => {
+  await browser.waitUntil(() => browser.execute((expectedGroups) => {
     const summary = document.querySelector(".linked-references .reference-filter-summary")?.textContent ?? "";
     const pages = [...document.querySelectorAll(".linked-references .reference-page")]
       .map((item) => item.textContent?.trim());
-    return summary.includes("1 of 2") && pages.length === 1 && pages[0] === "Linked source";
-  }), { timeout: 10_000, timeoutMsg: "descendant-only linked-reference search did not retain its backlink root" });
+    return summary.includes(`1 of ${expectedGroups}`) && pages.length === 1 && pages[0] === "Linked source";
+  }, linkedProof.groupCount), { timeout: 10_000, timeoutMsg: "descendant-only linked-reference search did not retain its backlink root" });
   await browser.saveScreenshot(`${ARTIFACTS}/linked-reference-filter.png`);
 
   await browser.$(".linked-references .reference-filter-clear").click();
-  await browser.waitUntil(() => browser.execute(() =>
-    (document.querySelector(".linked-references .reference-filter-summary")?.textContent ?? "").includes("2 of 2")), {
+  await browser.waitUntil(() => browser.execute((expectedGroups) =>
+    (document.querySelector(".linked-references .reference-filter-summary")?.textContent ?? "").includes(`${expectedGroups} of ${expectedGroups}`),
+  linkedProof.groupCount), {
     timeout: 5_000,
     timeoutMsg: "clearing linked-reference search did not restore every root",
   });
