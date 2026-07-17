@@ -69,6 +69,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   Current, alternate, background-tab, and right-sidebar activation preserve the
   selected graph-relative path, including duplicate-name sidebar restore and
   block-reference persistence, without breaking older pathless sessions.
+- **Cached signed plugin and theme revocations now take effect before startup
+  activation.** A stalled catalogue refresh is abort-bounded, one broken plugin
+  no longer blocks the rest, and a newer verified revocation immediately stops
+  an affected active plugin without restoring older cached state afterward.
 - **PDF area selection now follows Logseq's platform gesture and confirmation
   flow.** Shift-drag on Linux and Windows, or Command-drag on macOS, must exceed
   10 pixels in both dimensions and opens the color chooser before anything is
