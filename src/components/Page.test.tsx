@@ -623,6 +623,51 @@ describe("trailing page block target", () => {
 });
 
 describe("page actions entry point", () => {
+  it("exposes expanded state only on the trigger that owns the open page menu", async () => {
+    const dto: PageDto = {
+      name: "Duplicate actions",
+      kind: "page",
+      title: "Duplicate actions",
+      pre_block: null,
+      blocks: [{ id: "duplicate-actions-root", raw: "Body", collapsed: false, children: [] }],
+    };
+    setDoc({
+      byId: { "duplicate-actions-root": node("duplicate-actions-root", "Body", dto.name) },
+      pages: [page(dto.name, "page", ["duplicate-actions-root"])],
+      feed: [],
+      loaded: true,
+    });
+    vi.spyOn(backend(), "getPage").mockResolvedValue(dto);
+    mainPaneRouter.openPage(dto.name, "page", { inPlace: true });
+
+    const { root, dispose } = mount(() => <><PageView /><PageView /></>);
+    try {
+      await tick();
+      await tick();
+      const triggers = [...root.querySelectorAll<HTMLButtonElement>("[data-page-actions-trigger]")];
+      expect(triggers).toHaveLength(2);
+      expect(triggers.map((trigger) => trigger.getAttribute("aria-expanded"))).toEqual(["false", "false"]);
+
+      triggers[0].click();
+      await tick();
+      expect(triggers.map((trigger) => trigger.getAttribute("aria-expanded"))).toEqual(["true", "false"]);
+
+      closeContextMenu();
+      await tick();
+      const titles = [...root.querySelectorAll<HTMLElement>(".page-title")];
+      titles[0].dispatchEvent(new MouseEvent("contextmenu", {
+        bubbles: true,
+        cancelable: true,
+        clientX: 10,
+        clientY: 10,
+      }));
+      await tick();
+      expect(triggers.map((trigger) => trigger.getAttribute("aria-expanded"))).toEqual(["false", "false"]);
+    } finally {
+      dispose();
+    }
+  });
+
   it("exposes a named page actions ellipsis as a real menu button", async () => {
     const dto: PageDto = {
       name: "Actions",
