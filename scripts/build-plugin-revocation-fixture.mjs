@@ -20,4 +20,5 @@ if (result.status !== 0) process.exit(result.status ?? 1);
 const source = path.join(crateRoot, "target/wasm32-unknown-unknown/release/tine_plugin_revocation_sentinel.wasm");
 const destination = path.join(fixtureRoot, "plugin.wasm");
 fs.copyFileSync(source, destination);
+fs.chmodSync(destination, 0o644);
 console.log(`wrote ${path.relative(root, destination)} (${fs.statSync(destination).size} bytes)`);

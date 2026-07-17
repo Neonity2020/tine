@@ -20,12 +20,23 @@ read or write a graph.
 - `revoked-index.json` is canonical JSON in the same sorted-key serialization
   used by `tine-plugin-registry/auditor/publisher.py`. It names only the reserved
   sentinel identity.
-- `sentinel-src/` is the complete harmless guest source. Rebuild it with
+- `sentinel-src/` is the complete harmless guest source. It implements only the
+  three stable host ABI exports and returns an empty-effects response. It is
+  deliberately dependency-free: a path dependency on the SDK made Rust's
+  crate disambiguation and linked function order depend on the checkout's
+  absolute path even though the source and toolchain were locked. Rebuild it with
   `source scripts/env.sh && TINE_PLUGIN_OFFLINE=1 npm run plugin:revocation-fixture:build`.
 
+Verify both the ABI and byte-for-byte reproducibility from two distinct absolute
+source roots with `npm run plugin:revocation-fixture:repro`. Before this change,
+the type/import/function/table/global/export/start/data sections matched between
+worktrees, but the element and code sections did not; there were no custom
+sections to strip safely. Removing the irrelevant path dependency makes every
+section identical without rewriting compiled WebAssembly.
+
 The committed byte identities are recorded in `fixture.json`. The sentinel WASM
-is 148,022 bytes and has SHA-256
-`e06aafc590c2fbc8b3e6ab3e8c1dc0dff1fd877104d3413f2052c0d69792d2e1`.
+is 12,989 bytes and has SHA-256
+`be8035e6e648b3b7e3bb09e1299926ad8213656471701256fb19ee0bec7fad56`.
 
 ## Deliberate one-signature handoff
 

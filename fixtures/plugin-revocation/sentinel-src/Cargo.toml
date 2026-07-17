@@ -10,5 +10,9 @@ publish = false
 [lib]
 crate-type = ["cdylib"]
 
-[dependencies]
-tine-plugin-sdk = { path = "../../../plugin-sdk/rust" }
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1
+opt-level = "z"
+strip = true
