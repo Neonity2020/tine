@@ -38,6 +38,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **PDF area selection now follows Logseq's platform gesture and confirmation
+  flow.** Shift-drag on Linux and Windows, or Command-drag on macOS, must exceed
+  10 pixels in both dimensions and opens the color chooser before anything is
+  written; dismissing the chooser leaves the graph unchanged.
+- **The PDF reader now has persistent Light, Warm, and Dark themes plus document
+  outlines.** Nested outline entries expand independently and navigate through
+  both named and explicit PDF destinations, while theme preference remains
+  application-local rather than entering graph or annotation files.
 - **Search now treats canonically equivalent Unicode spellings as identical.**
   Composed and decomposed page names, aliases, and block text share membership,
   exact-page detection, ranking identity, and source-accurate highlights without
