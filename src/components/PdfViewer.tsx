@@ -1283,6 +1283,7 @@ export function PdfViewer(props: {
     };
     pendingArea = { page: drag.page, wrap: drag.wrap, rect };
     setMenu({ x: e.clientX, y: e.clientY });
+    setAreaMode(false);
   };
 
   // Crop the page canvas to `rect` (unscaled coords) → PNG bytes.

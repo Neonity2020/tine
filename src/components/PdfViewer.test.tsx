@@ -409,6 +409,44 @@ describe("PdfViewer OG area-highlight selection", () => {
     }
   });
 
+  it("clears toolbar Area mode after a valid drag so ordinary drags stay ordinary", async () => {
+    const saveArea = vi.spyOn(backend(), "savePdfAreaImage").mockResolvedValue("");
+    const writeHighlights = vi.spyOn(backend(), "writeHighlights").mockResolvedValue(undefined);
+    const { host, wrap, dispose } = await mountAreaViewer();
+    try {
+      const areaButton = host.querySelector('button[title^="Area highlight"]') as HTMLButtonElement;
+      areaButton.click();
+      expect(areaButton.classList.contains("active")).toBe(true);
+
+      dragArea(wrap, { x: 45, y: 55 });
+      await flush();
+      expect(host.querySelectorAll(".pdf-color-swatch")).toHaveLength(5);
+      expect(areaButton.classList.contains("active")).toBe(false);
+
+      document.body.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true }));
+      await flush();
+      expect(host.querySelector(".pdf-color-menu")).toBeNull();
+
+      const ordinaryDown = new MouseEvent("mousedown", {
+        bubbles: true,
+        cancelable: true,
+        button: 0,
+        clientX: 20,
+        clientY: 30,
+      });
+      expect(wrap.dispatchEvent(ordinaryDown)).toBe(true);
+      window.dispatchEvent(new MouseEvent("mousemove", { bubbles: true, clientX: 45, clientY: 55 }));
+      window.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, clientX: 45, clientY: 55 }));
+      await flush();
+
+      expect(host.querySelector(".pdf-color-menu")).toBeNull();
+      expect(saveArea).not.toHaveBeenCalled();
+      expect(writeHighlights).not.toHaveBeenCalled();
+    } finally {
+      dispose();
+    }
+  });
+
   it("defers toolbar area writes until color choice and dismisses without changing selection or view", async () => {
     const id = "33333333-3333-4333-8333-333333333333";
     vi.spyOn(crypto, "randomUUID").mockReturnValue(id);
@@ -421,7 +459,8 @@ describe("PdfViewer OG area-highlight selection", () => {
     vi.spyOn(window, "getSelection").mockReturnValue(selection);
     const { host, wrap, dispose } = await mountAreaViewer();
     try {
-      (host.querySelector('button[title^="Area highlight"]') as HTMLButtonElement).click();
+      const areaButton = host.querySelector('button[title^="Area highlight"]') as HTMLButtonElement;
+      areaButton.click();
       dragArea(wrap, { x: 45, y: 55 });
       await flush();
 
@@ -436,6 +475,7 @@ describe("PdfViewer OG area-highlight selection", () => {
       expect(writeHighlights).not.toHaveBeenCalled();
       expect(writeText).not.toHaveBeenCalled();
 
+      areaButton.click();
       dragArea(wrap, { x: 45, y: 55 });
       await flush();
       expect(host.querySelectorAll(".pdf-color-swatch")).toHaveLength(5);
@@ -450,6 +490,7 @@ describe("PdfViewer OG area-highlight selection", () => {
       expect((host.querySelector(".pdf-page-input") as HTMLInputElement).value).toBe("1");
       expect(host.querySelector(".pdf-zoom-level")?.textContent).toBe("100%");
 
+      areaButton.click();
       dragArea(wrap, { x: 45, y: 55 });
       await flush();
       const blue = host.querySelectorAll<HTMLButtonElement>(".pdf-color-swatch")[2];
