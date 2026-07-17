@@ -1,6 +1,6 @@
 import { For, Show, createSignal, createResource, createEffect, createMemo, onCleanup, type JSX } from "solid-js";
 import { backend } from "../backend";
-import { switcherOpen, closeSwitcher, switcherMode, switcherEmbryo, recentPages, graphMeta, isFavorite, pushToast } from "../ui";
+import { switcherOpen, closeSwitcher, switcherMode, switcherEmbryo, recentPages, graphMeta, isFavorite, pushToast, bumpPageInventoryRev } from "../ui";
 import { openPage, openPageAtBlock, openPageInNewTab, openFile, openInNewTab, route } from "../router";
 import { paletteCommands } from "../keybindings";
 import { closePane, focusPane, focusedRouter, layoutPaneIds, openRouteInOtherPane, paneRouter } from "../panes";
@@ -341,6 +341,7 @@ export function QuickSwitcher(): JSX.Element {
         null, // brand-new page — no baseline
         false
       );
+      bumpPageInventoryRev();
     } catch {
       // ignore — still navigate; the page will be created on first edit
     }

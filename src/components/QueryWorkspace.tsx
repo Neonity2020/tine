@@ -31,6 +31,7 @@ import type {
 import { QueryBuilder } from "./QueryBuilder";
 import { SearchResultRow, buildSearchExcerpt } from "./SearchResultRow";
 import { registerTransientLayer } from "../transientLayers";
+import { bumpPageInventoryRev } from "../ui";
 
 const PAGE_LIMIT = 40;
 const BLOCK_LIMIT = 100;
@@ -133,6 +134,7 @@ export async function materializeQueryWorkspace(
       }],
     };
     const rev = await deps.savePage(page, null, false);
+    bumpPageInventoryRev();
     return { ok: true, name, page, rev };
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);

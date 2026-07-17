@@ -14,6 +14,7 @@ import {
   type MaterializeQueryDependencies,
   type QueryWorkspaceDependencies,
 } from "./QueryWorkspace";
+import { pageInventoryRev } from "../ui";
 
 afterEach(() => {
   clearTransientLayersForTest();
@@ -72,6 +73,7 @@ describe("materializeQueryWorkspace", () => {
   });
   it("creates one canonical friendly query block through the guarded no-baseline save", async () => {
     const deps = materializeDeps();
+    const beforeInventory = pageInventoryRev();
     const result = await materializeQueryWorkspace({
       title: "  Project dashboard  ",
       sourceKind: "search",
@@ -97,6 +99,7 @@ describe("materializeQueryWorkspace", () => {
     expect(deps.getPage).toHaveBeenCalledWith("Project dashboard", "page");
     expect(deps.savePage).toHaveBeenCalledTimes(1);
     expect(deps.savePage).toHaveBeenCalledWith(result.page, null, false);
+    expect(pageInventoryRev()).toBeGreaterThan(beforeInventory);
   });
 
   it("preserves canonical raw DSL and writes a presentation property only when needed", async () => {

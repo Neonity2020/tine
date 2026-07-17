@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { render } from "solid-js/web";
 import { QuickSwitcher } from "./QuickSwitcher";
-import { closeSwitcher, openSwitcher, toasts } from "../ui";
+import { closeSwitcher, openSwitcher, pageInventoryRev, toasts } from "../ui";
 import { activeId, closeTab, route } from "../router";
 import { backend } from "../backend";
 import { closePane, focusPane, paneRouter, resetPaneLayoutToSingle, setFocusedPaneId, splitPane } from "../panes";
@@ -13,6 +13,32 @@ afterEach(() => {
 });
 
 describe("QuickSwitcher search syntax help", () => {
+  it("refreshes canonical page inventory after a direct create", async () => {
+    const save = vi.spyOn(backend(), "savePage").mockResolvedValue("created-rev");
+    const before = pageInventoryRev();
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <QuickSwitcher />, root);
+    try {
+      openSwitcher();
+      const input = root.querySelector<HTMLInputElement>(".switcher-input")!;
+      input.value = "Fresh canonical page";
+      input.dispatchEvent(new InputEvent("input", { bubbles: true }));
+      await vi.waitFor(() => {
+        expect([...root.querySelectorAll<HTMLElement>('.switcher-row[role="option"]')]
+          .some((row) => row.textContent?.includes("Create page: Fresh canonical page"))).toBe(true);
+      });
+      const create = [...root.querySelectorAll<HTMLElement>('.switcher-row[role="option"]')]
+        .find((row) => row.textContent?.includes("Create page: Fresh canonical page"))!;
+      create.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, button: 0 }));
+      await vi.waitFor(() => expect(save).toHaveBeenCalledTimes(1));
+      expect(pageInventoryRev()).toBeGreaterThan(before);
+    } finally {
+      save.mockRestore();
+      dispose();
+    }
+  });
+
   it("opens an empty virtual Search tab from an enabled authoring action", async () => {
     const root = document.createElement("div");
     document.body.append(root);
