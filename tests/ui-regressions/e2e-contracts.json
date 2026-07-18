@@ -163,7 +163,7 @@
       ],
       "acceptableVariations": ["The reserved signed fixture may use a host-owned command or thread-lines block-decoration contribution, provided the positive control makes activation observable.", "Catalogue wording and settings-row presentation may vary while the native envelope, disable bit, and non-execution outcomes remain exact."],
       "nonRequirements": ["Exact styling, worker implementation details, or live-request timing before the abort deadline."],
-      "stability": "burn-in"
+      "stability": "stable"
     },
     "scripts/e2e-plugin-graph-ownership.mjs": {
       "contracts": [

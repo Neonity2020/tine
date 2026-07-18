@@ -51,6 +51,11 @@ key and confirms that `plugin-revocation` is registered in `linux-release`:
 npm run plugin:revocation-fixture:check
 ```
 
-The remaining work is to run the registered native revocation journey and the
-manager-owned unchanged-binary burn-in. Until those steps are complete, this
-fixture is not release evidence.
+The registered native revocation journey passed three consecutive release-mode
+runs against the unchanged `f688b74676188fe4354b322f2709ac8c84ed19fe`
+candidate binary (SHA-256
+`dd9b9d11cfbf5f2d94247134821ca674b4270c3e6c118e49ce4cd7b3d83bd44c`):
+13.1s, 13.2s, and 13.1s. The retained artifacts are under
+`test-results/e2e/plugin-revocation-burn-in-{1,2,3}`. This completes the
+production-signature handoff and unchanged-binary burn-in; the journey is a
+stable `linux-release` gate.
