@@ -10,7 +10,6 @@ import {
   releaseSection,
   validateDisposition,
 } from "./release-readiness-lib.mjs";
-import { validateRedditReleaseEvidence } from "./reddit-release-evidence-lib.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const version = JSON.parse(fs.readFileSync(path.join(root, "src-tauri/tauri.conf.json"), "utf8")).version;
@@ -85,17 +84,6 @@ if (section && fs.existsSync(impactPath)) {
           problems.push(`audit area ${id} is not clean or lacks report digest`);
         }
       }
-    }
-    const redditPath = path.join(root, `docs/releases/v${version}-reddit.json`);
-    if (!fs.existsSync(redditPath)) problems.push(`missing minor Reddit/blog evidence ${path.basename(redditPath)}`);
-    else {
-      const reddit = JSON.parse(fs.readFileSync(redditPath, "utf8"));
-      const redditManifest = JSON.parse(fs.readFileSync(path.join(root, "website/blog/reddit-sources.json"), "utf8"));
-      problems.push(...validateRedditReleaseEvidence(reddit, {
-        version,
-        author: redditManifest.author,
-        requiredSources: redditManifest.sources,
-      }));
     }
   }
 }

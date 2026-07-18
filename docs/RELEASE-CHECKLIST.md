@@ -58,13 +58,18 @@ may tag, publish, comment, and close issues.
 
 ## Additional `0.x.0` minor-release gates
 
-1. Run `npm run blog:sync -- --version=X.Y.0`, synchronize every reported new
-   `r/TineOutline` post into the human blog, and re-check every Reddit thread
-   already cited by an existing entry. Author discovery and cited-discussion
-   refresh must use Reddit's public REST/JSON feeds. Do not use RSS/Atom: those
-   endpoints are throttled and are not complete release evidence. Commit only a
-   complete schema-v2 `docs/releases/vX.Y.0-reddit.json`; network, pagination,
-   or discussion-tree incompleteness remains release-blocking.
+1. Do the Reddit/blog pass locally; Reddit must never be fetched, validated, or
+   artifacted by GitHub Actions or release packaging. Run
+   `npm run blog:sync -- --version=X.Y.0`, review every `r/TineOutline` post by
+   Martin plus every comment/reply in threads already cited by an existing blog
+   entry, update `website/blog/reddit-sources.json` for new source posts, and edit
+   `website/blog/` with the substantive new material. The sync script writes an
+   ignored working snapshot under `test-results/reddit/`; it does not write the
+   editorial prose and its output is not committed. Prefer Reddit's public
+   REST/JSON feeds, never RSS/Atom. If Reddit rejects the local REST request,
+   inspect the live post and comment pages directly rather than moving the work
+   to a hosted runner. Run `npm run blog:check` locally when the editorial pass
+   is complete.
 2. Run three independent audit areas: data safety/security/privacy;
    behavioral correctness/Logseq compatibility; performance/resource
    lifecycle.

@@ -13,9 +13,10 @@ if (!/^\d+\.\d+\.0$/.test(version ?? "")) {
 }
 
 const manifest = JSON.parse(fs.readFileSync(path.join(root, "website/blog/reddit-sources.json"), "utf8"));
-const output = path.join(root, `docs/releases/v${version}-reddit.json`);
+const output = path.join(root, "test-results", "reddit", `v${version}-reddit.json`);
 
 function atomicWriteJson(file, value) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
   const temporary = `${file}.tmp-${process.pid}-${Date.now()}`;
   try {
     fs.writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, { flag: "wx" });

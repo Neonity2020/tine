@@ -28,12 +28,6 @@ on:
           - windows
           - android
           - performance
-          - reddit
-      reddit_version:
-        description: Exact minor version whose Reddit JSON evidence should be refreshed
-        required: false
-        default: ""
-        type: string
 
 permissions:
   contents: read
@@ -66,8 +60,6 @@ jobs:
           node scripts/check-flatpak-node-sources.mjs
           node scripts/check-flatpak-cargo-sources.mjs
           node scripts/test-release-readiness-lib.mjs
-          node scripts/test-reddit-release-evidence.mjs
-          node scripts/test-reddit-evidence-artifact.mjs
           node scripts/test-release-pipeline.mjs
 
       - name: lsdoc generated artifacts are current
@@ -114,8 +106,6 @@ jobs:
       - name: Release pipeline contract fixtures
         run: |
           node scripts/test-release-readiness-lib.mjs
-          node scripts/test-reddit-release-evidence.mjs
-          node scripts/test-reddit-evidence-artifact.mjs
           node scripts/test-release-pipeline.mjs
 
       - name: Performance baseline policy is current
@@ -132,7 +122,6 @@ jobs:
         run: |
           npm run check:regressions
           npm run check:release-readiness
-          npm run blog:check
 
       - name: Canonical Guide/demo is generated and current
         run: npm run docs:check
@@ -245,43 +234,6 @@ jobs:
         with:
           name: plugin-launch-android-e2e-${{ github.run_attempt }}
           path: test-results/plugin-docs-android
-          if-no-files-found: warn
-          retention-days: 14
-
-  reddit-release-evidence:
-    name: Reddit release evidence / REST JSON artifact
-    if: github.event_name == 'workflow_dispatch' && inputs.scope == 'reddit'
-    runs-on: ubuntu-22.04
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-
-      - run: npm ci
-
-      - name: Refresh Reddit REST/JSON release evidence
-        id: reddit-evidence
-        env:
-          REDDIT_VERSION: ${{ inputs.reddit_version }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          GITHUB_SHA: ${{ github.sha }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
-          GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
-        run: node scripts/reddit-evidence-artifact.mjs create
-
-      - name: Upload Reddit release evidence artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ steps.reddit-evidence.outputs.version && format('reddit-release-evidence-{0}-{1}-{2}-{3}', steps.reddit-evidence.outputs.version, github.sha, github.run_id, github.run_attempt) || format('reddit-release-evidence-invalid-{0}-{1}-{2}-{3}', github.sha, github.run_id, github.run_attempt) }}
-          path: ${{ runner.temp }}/reddit-release-evidence
           if-no-files-found: warn
           retention-days: 14
 

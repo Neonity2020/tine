@@ -26,7 +26,6 @@ try {
   const releaseEvidence = new Map([
     ["docs/releases/v0.6.0-audit-attestation.json", '{"sourceFingerprint":"before"}\n'],
     ["docs/releases/v0.6.0-impact.json", '{"items":[]}\n'],
-    ["docs/releases/v0.6.0-reddit.json", '{"threadSnapshots":[]}\n'],
   ]);
   for (const [relative, contents] of releaseEvidence) write(relative, contents);
 
