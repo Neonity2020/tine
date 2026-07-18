@@ -8,6 +8,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+### Fixed
+
+- Mouse side buttons (X1/X2, also called buttons 4/5) now navigate page history
+  back and forward, matching Alt+Left / Alt+Right (GH #156).
+
 ## [0.6.0] - 2026-07-17
 
 ### Added

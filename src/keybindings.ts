@@ -962,17 +962,33 @@ export function installKeybindings(overrides: Record<string, string> = {}): () =
     if (!cellSel()) return;
     if (handleSheetPasteEvent(e)) e.preventDefault();
   };
+  // Mouse side buttons: X1 (DOM button 3) navigates back, X2 (button 4) forward,
+  // reusing the same history ops as Alt+Left / Alt+Right (GH #156). `auxclick`
+  // fires once per non-primary button release, so a single listener never
+  // double-navigates; preventDefault suppresses any webview built-in nav.
+  // Middle-click (button 1) is left untouched for new-tab handlers.
+  const mouseNav = (e: MouseEvent) => {
+    if (e.button === 3) {
+      e.preventDefault();
+      goBack();
+    } else if (e.button === 4) {
+      e.preventDefault();
+      goForward();
+    }
+  };
 
   window.addEventListener("keydown", handler, true);
   window.addEventListener("paste", pasteHandler, true);
   window.addEventListener("keydown", superTracker, true);
   window.addEventListener("keyup", superTracker, true);
   window.addEventListener("blur", clearSuper);
+  window.addEventListener("auxclick", mouseNav, true);
   return () => {
     window.removeEventListener("keydown", handler, true);
     window.removeEventListener("paste", pasteHandler, true);
     window.removeEventListener("keydown", superTracker, true);
     window.removeEventListener("keyup", superTracker, true);
     window.removeEventListener("blur", clearSuper);
+    window.removeEventListener("auxclick", mouseNav, true);
   };
 }

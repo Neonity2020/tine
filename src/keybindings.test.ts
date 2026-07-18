@@ -8,6 +8,7 @@ import { exitPaneSelect, paneSel } from "./paneSelect";
 import { clearSelection, doc, loadSingle, moveSelection, resetStore, selectBlock, setDoc } from "./store";
 import { endEdit, startEditing } from "./editorController";
 import { pluginManager } from "./plugins/manager";
+import * as router from "./router";
 import type { PaneSnapshot } from "./router";
 import type { GraphMeta } from "./types";
 
@@ -77,6 +78,14 @@ function installFakeWindow() {
       listeners
         .filter((l) => l.type === "keydown" && l.capture)
         .forEach((l) => l.listener(event));
+    },
+    dispatchAuxClick(button: number) {
+      let prevented = false;
+      const event = { button, preventDefault: () => { prevented = true; } } as unknown as MouseEvent;
+      listeners
+        .filter((l) => l.type === "auxclick" && l.capture)
+        .forEach((l) => l.listener(event as unknown as Event));
+      return { prevented: () => prevented };
     },
   };
 }
@@ -162,6 +171,33 @@ afterEach(() => {
   resetPaneLayoutToSingle(journalsSnapshot());
   if (inPageFindOpen()) closeInPageFind({ restoreFocus: false });
   restoreFakeGlobals?.();
+});
+
+describe("mouse side-button navigation (#156)", () => {
+  it("aux button 3 (X1) goes back and button 4 (X2) goes forward, once each", () => {
+    const back = vi.spyOn(router, "goBack").mockImplementation(() => {});
+    const fwd = vi.spyOn(router, "goForward").mockImplementation(() => {});
+    const fake = installFakeWindow();
+    const dispose = installKeybindings();
+
+    const r3 = fake.dispatchAuxClick(3);
+    expect(back).toHaveBeenCalledTimes(1);
+    expect(fwd).not.toHaveBeenCalled();
+    expect(r3.prevented()).toBe(true);
+
+    const r4 = fake.dispatchAuxClick(4);
+    expect(fwd).toHaveBeenCalledTimes(1);
+    expect(back).toHaveBeenCalledTimes(1);
+    expect(r4.prevented()).toBe(true);
+
+    // Middle-click (button 1) must NOT navigate — it opens links in a new tab.
+    const r1 = fake.dispatchAuxClick(1);
+    expect(back).toHaveBeenCalledTimes(1);
+    expect(fwd).toHaveBeenCalledTimes(1);
+    expect(r1.prevented()).toBe(false);
+
+    dispose();
+  });
 });
 
 describe("plugin command context", () => {
