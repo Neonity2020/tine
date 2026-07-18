@@ -296,9 +296,11 @@ function xmlEscape(value) {
 function isRetryableDriverTransportFailure(output, errors, timedOut) {
   if (timedOut) return false;
   const combined = `${output}\n${errors}`;
-  return /WebDriverError/.test(combined)
-    && /\/session/.test(combined)
+  const webDriverError = /WebDriverError/.test(combined);
+  const invalidSession = /WebDriverError:\s*invalid session id\b/.test(combined);
+  const transportLost = /\/session/.test(combined)
     && /(UND_ERR_SOCKET|ECONNREFUSED|ECONNRESET|socket hang up|DevToolsActivePort file doesn't exist)/.test(combined);
+  return webDriverError && (invalidSession || transportLost);
 }
 
 function isRetryableNativeHarnessFailure(id, output, errors, timedOut) {
@@ -421,7 +423,7 @@ async function runScenario([id, script, extraEnv], contractEntry) {
     const retryNativeHarness = isRetryableNativeHarnessFailure(id, output, errors, timedOut);
     if (status === "failed" && attempt === 1 && (retryDriver || retryNativeHarness)) {
       const reason = retryDriver
-        ? "WebDriver session transport failed before app assertions"
+        ? "WebDriver session became invalid or lost transport"
         : "hosted X11 active-window state raced a destroyed transient frame";
       process.stdout.write(`RETRY ${id}: ${reason}; retaining attempt 1\n`);
       process.stdout.write(`${output.slice(-1200)}\n${errors.slice(-1200)}\n`);

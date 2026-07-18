@@ -219,6 +219,44 @@ assert.match(
   /TAURI_DRIVER: process\.env\.TAURI_DRIVER \|\| \(process\.platform === "win32" \? "msedgedriver\.exe" : "tauri-driver"\)/,
   "Windows scenarios still route native WebView2 through the unnecessary Tauri proxy"
 );
+const driverTransportFailureSource = e2eRunner.match(
+  /function isRetryableDriverTransportFailure\(output, errors, timedOut\) \{[\s\S]*?\n\}/
+);
+assert.ok(driverTransportFailureSource, "the release runner is missing its WebDriver transport retry predicate");
+const isRetryableDriverTransportFailure = new Function(
+  `${driverTransportFailureSource[0]}\nreturn isRetryableDriverTransportFailure;`
+)();
+assert.equal(
+  isRetryableDriverTransportFailure(
+    'WebDriverError: invalid session id when running\n"element/.../property/value" with method "GET"\nError: Arrow Down did not cross from the page header into the first body block',
+    "",
+    false
+  ),
+  true,
+  "the hosted terminal WebDriver invalid-session failure is not retried"
+);
+assert.equal(
+  isRetryableDriverTransportFailure("WebDriverError: GET /session failed: UND_ERR_SOCKET", "", false),
+  true,
+  "existing WebDriver socket transport failures are not retried"
+);
+assert.equal(
+  isRetryableDriverTransportFailure("Arrow Down assertion failed: invalid session id", "", false), false,
+  "generic invalid-session text without a WebDriver error must not be retried"
+);
+assert.equal(
+  isRetryableDriverTransportFailure("WebDriverError: element assertion failed", "", false), false,
+  "arbitrary WebDriver assertion failures must not be retried"
+);
+assert.equal(
+  isRetryableDriverTransportFailure("Arrow Down did not cross from the page header into the first body block", "", false),
+  false,
+  "product assertion failures without a WebDriver error must not be retried"
+);
+assert.equal(
+  isRetryableDriverTransportFailure("WebDriverError: invalid session id", "", true), false,
+  "scenario timeouts must not be retried as driver infrastructure failures"
+);
 const nativeHarnessFailureSource = e2eRunner.match(
   /function isRetryableNativeHarnessFailure\(id, output, errors, timedOut\) \{[\s\S]*?\n\}/
 );
