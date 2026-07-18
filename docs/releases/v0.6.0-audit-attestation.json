@@ -1,7 +1,9 @@
 {
   "schemaVersion": 1,
   "version": "0.6.0",
-  "sourceFingerprint": "d69ee63084f8fe7ffb3746642ac1ed2fc64406f9a769b7bb44739a869091943a",
+  "sourceFingerprint": "44e38090f7e8e1cd151439b65e1b4b4b418128deac3a4c7433992b0711568f89",
+  "fingerprintRebasedFrom": "d69ee63084f8fe7ffb3746642ac1ed2fc64406f9a769b7bb44739a869091943a",
+  "fingerprintRebaseReason": "The fingerprint definition now excludes the three plugin-revocation native-proof evidence files; no production or audited source changed after the final sweep.",
   "areas": [
     {
       "id": "data-safety-security-privacy",

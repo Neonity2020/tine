@@ -29,6 +29,14 @@ try {
   ]);
   for (const [relative, contents] of releaseEvidence) write(relative, contents);
 
+  const revocationProofEvidence = new Map([
+    ["fixtures/plugin-revocation/README.md", "Proof handoff notes.\n"],
+    ["fixtures/plugin-revocation/fixture.json", '{"revokedSignatureSha256":"proof-only"}\n'],
+    ["fixtures/plugin-revocation/revoked-index.json.sig", "signed-proof-only\n"],
+  ]);
+  for (const [relative, contents] of revocationProofEvidence) write(relative, contents);
+  write("fixtures/plugin-revocation/revoked-index.json", '{"generation":1}\n');
+
   const baseline = auditableSourceFingerprint(temporary);
   assert.equal(auditableSourceFingerprint(temporary), baseline, "unchanged inputs must hash deterministically");
 
@@ -59,8 +67,24 @@ try {
       `${relative} must not invalidate the source audit that it records`,
     );
   }
+
+  for (const [relative, original] of revocationProofEvidence) {
+    write(relative, `${original.trimEnd()} changed\n`);
+    assert.equal(
+      auditableSourceFingerprint(temporary),
+      baseline,
+      `${relative} must not invalidate the production-source audit it supports`,
+    );
+  }
+
+  write("fixtures/plugin-revocation/revoked-index.json", '{"generation":2}\n');
+  assert.notEqual(
+    auditableSourceFingerprint(temporary),
+    baseline,
+    "the material revocation fixture must continue to invalidate the audit fingerprint",
+  );
 } finally {
   fs.rmSync(temporary, { recursive: true, force: true });
 }
 
-console.log("Release-readiness fingerprint tests passed (plugin sources covered; release evidence excluded).");
+console.log("Release-readiness fingerprint tests passed (production/plugin sources covered; proof evidence excluded).");
