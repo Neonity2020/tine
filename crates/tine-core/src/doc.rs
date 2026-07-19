@@ -217,10 +217,11 @@ impl DocBlock {
     }
 
     pub fn property(&self, key: &str) -> Option<String> {
+        let key = property_key_norm(key);
         self.projection()
             .properties
             .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(key))
+            .find(|(k, _)| property_key_norm(k) == key)
             .map(|(_, v)| v.clone())
     }
 
@@ -604,6 +605,10 @@ fn visible_minus_properties(raw: &str, blocks: &[lsdoc::ast::Block]) -> String {
     }
     out.push_str(&raw[pos..]);
     out.trim_end_matches('\n').to_string()
+}
+
+pub(crate) fn property_key_norm(key: &str) -> String {
+    key.trim().to_ascii_lowercase().replace([' ', '_'], "-")
 }
 
 pub(crate) fn parse_property_line(line: &str) -> Option<(String, String)> {

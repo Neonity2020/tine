@@ -9,7 +9,7 @@ import { coarseSpanAttrs, type SpanDomAttrs } from "./spans";
 import { evalCalc } from "../editor/calc";
 import { toggleListItemAtIndex, doc, formatForBlock } from "../store";
 import { graphMeta } from "../ui";
-import { isRenderHiddenProp, isPropertyLine } from "./block";
+import { isRenderHiddenProp, isPropertyLine, propertyKeyNorm } from "./block";
 import { isQuarantined, parserReady } from "./parse";
 import { parseBody, stripPlanningLines } from "./facets";
 import { observeNear, unobserveNear, renderedBlocks } from "../lazyObserve";
@@ -279,7 +279,7 @@ function renderProps(b: Extract<AstBlock, { kind: "properties" }>, blockId?: str
         <For each={visible}>
           {([k, v]) => (
             <span class="block-property">
-              <span class="block-property-key">{k}</span>{" "}
+              <span class="block-property-key">{propertyKeyNorm(k)}</span>{" "}
               <span class="block-property-val"><InlineText text={v} format={fmt} /></span>
             </span>
           )}

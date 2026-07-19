@@ -4,7 +4,7 @@
 //! detected and reported as unsupported rather than crashed.
 
 use crate::date::JournalDate;
-use crate::doc::{DocBlock, Document};
+use crate::doc::{property_key_norm, DocBlock, Document};
 use crate::model::{
     block_to_shallow_dto, BacklinkFilterContext, BacklinkFilterEntry, BacklinkFilterTarget,
     BlockDto, BlockPreview, Format, Graph, PageEntry, PageKind, RefGroup, ReferenceBlockEvidence,
@@ -487,7 +487,8 @@ pub(crate) fn document_aliases(doc: &Document) -> Vec<String> {
     let mut aliases = Vec::new();
     for line in text.lines() {
         if let Some((k, v)) = crate::doc::parse_property_line(line) {
-            if k.eq_ignore_ascii_case("alias") || k.eq_ignore_ascii_case("aliases") {
+            let key = property_key_norm(&k);
+            if key == "alias" || key == "aliases" {
                 let trimmed = v.trim();
                 if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
                     continue;
@@ -1249,7 +1250,7 @@ fn page_facets(pre_block: Option<&str>) -> (Vec<(String, String)>, Vec<String>) 
     if let Some(pre) = pre_block {
         for line in pre.lines() {
             if let Some((k, v)) = crate::doc::parse_property_line(line) {
-                if k.eq_ignore_ascii_case("tags") {
+                if property_key_norm(&k) == "tags" {
                     tags = v
                         .split(',')
                         .map(|t| strip_ref(t.trim()))
@@ -2074,10 +2075,11 @@ fn sort_key(b: &BlockDto, page: &str, field: &str) -> String {
         // Otherwise: a block property value (off the DTO's lsdoc properties — no
         // reparse, format-correct, audit P4), else the block's visible first line.
         _ => {
+            let field = property_key_norm(field);
             if let Some((_, v)) = b
                 .properties
                 .iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case(field))
+                .find(|(k, _)| property_key_norm(k) == field)
             {
                 return v.to_lowercase();
             }
@@ -2207,7 +2209,8 @@ pub fn property_facets_bounded(
         for (_entry, doc) in pages {
             walk(&doc.roots, &mut |b| {
                 for (k, v) in b.properties() {
-                    if INTERNAL_PROPS.iter().any(|p| p.eq_ignore_ascii_case(&k)) {
+                    let k = property_key_norm(&k);
+                    if INTERNAL_PROPS.iter().any(|p| property_key_norm(p) == k) {
                         continue;
                     }
                     if v.trim().is_empty() {
@@ -3112,10 +3115,12 @@ impl Pred {
                 .priority()
                 .map(|p| ps.iter().any(|x| x.eq_ignore_ascii_case(p)))
                 .unwrap_or(false),
-            Pred::Property(key, val) => block
-                .properties()
-                .iter()
-                .any(|(k, v)| k.eq_ignore_ascii_case(key) && value_matches(v, val.as_deref())),
+            Pred::Property(key, val) => {
+                let key = property_key_norm(key);
+                block.properties().iter().any(|(k, v)| {
+                    property_key_norm(k) == key && value_matches(v, val.as_deref())
+                })
+            }
             Pred::Scheduled => block.raw.contains("SCHEDULED:"),
             Pred::Deadline => block.raw.contains("DEADLINE:"),
             Pred::Journal => ctx.is_journal,
@@ -3143,10 +3148,12 @@ impl Pred {
                 let n = refs::normalize(ns);
                 p.starts_with(&format!("{n}/"))
             }
-            Pred::PageProperty(key, val) => ctx
-                .page_props
-                .iter()
-                .any(|(k, v)| k.eq_ignore_ascii_case(key) && value_matches(v, val.as_deref())),
+            Pred::PageProperty(key, val) => {
+                let key = property_key_norm(key);
+                ctx.page_props.iter().any(|(k, v)| {
+                    property_key_norm(k) == key && value_matches(v, val.as_deref())
+                })
+            }
             Pred::PageTags(tags) => tags
                 .iter()
                 .any(|t| ctx.page_tags.iter().any(|pt| pt.eq_ignore_ascii_case(t))),
@@ -3564,13 +3571,11 @@ fn parse_opt_name(toks: &[Tok], pos: &mut usize) -> Option<String> {
     }
 }
 
-/// A property KEY, normalized the way Logseq's query DSL does (`(name k)` then
-/// `_`→`-`, see query_dsl.cljs build-property-two-arg): drop a leading `:` so the
-/// keyword form `:fach` and the symbol form `fach` both mean `fach`, and map
-/// underscores to dashes (Logseq stores `my_key` as `my-key`). WITHOUT this the
-/// simple parser kept `:fach` verbatim and it never matched the stored key `fach`.
+/// A property KEY normalized the way Logseq's query DSL does: drop a leading `:`,
+/// lowercase, and map spaces/underscores to dashes. Thus keyword and symbol forms
+/// share the same effective key as the stored-property comparison.
 fn normalize_prop_key(k: &str) -> String {
-    k.trim_start_matches(':').replace('_', "-")
+    property_key_norm(k.trim_start_matches(':'))
 }
 
 /// Optional property VALUE: like `parse_opt_name`, but also accepts a `[[page]]`
@@ -4201,6 +4206,44 @@ mod tests {
         assert!(pred("(property tags research)").eval(&mv, &none));
         assert!(pred("(property tags optimization)").eval(&mv, &none));
         assert!(!pred("(property tags cooking)").eval(&mv, &none));
+    }
+
+    #[test]
+    fn property_query_matches_folded_source_key() {
+        let none = ctx_named();
+        let mut block = DocBlock::new("shipped task");
+        block.raw.push_str("\ndone_at:: 2026-07-19");
+
+        assert!(pred("(property done-at 2026-07-19)").eval(&block, &none));
+        assert!(pred("(property DONE_AT)").eval(&block, &none));
+    }
+
+    #[test]
+    fn property_facets_group_folded_keys() {
+        use std::fs;
+
+        let dir = std::env::temp_dir().join(format!(
+            "tine-property-key-norm-facets-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("pages")).unwrap();
+        fs::create_dir_all(dir.join("journals")).unwrap();
+        fs::write(
+            dir.join("pages/Properties.md"),
+            "- first\n  done_at:: one\n- second\n  done-at:: two\n",
+        )
+        .unwrap();
+
+        let graph = Graph::open(&dir);
+        assert_eq!(
+            property_facets(&graph),
+            vec![(
+                "done-at".to_string(),
+                vec!["one".to_string(), "two".to_string()]
+            )]
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

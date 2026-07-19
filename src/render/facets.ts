@@ -12,6 +12,7 @@
 // edited); that one derives from a single wasm lsdoc parse. Robust to every mutation:
 // any raw → lookup → hit (backend-known) or one parse (novel).
 import { parseBlock } from "./parse";
+import { propertyKeyNorm } from "./block";
 import { DONE_MARKERS } from "../markers";
 import type { Block, Format, Inline } from "./ast";
 
@@ -130,7 +131,7 @@ function deriveFacets(raw: string, format: Format): Facets {
   const properties: [string, string][] = [];
   for (const b of blocks) if (b.kind === "properties") properties.push(...b.props);
   if (headingLevel == null) {
-    const heading = properties.find(([key]) => key.toLowerCase() === "heading")?.[1]?.trim().toLowerCase();
+    const heading = properties.find(([key]) => propertyKeyNorm(key) === "heading")?.[1]?.trim().toLowerCase();
     if (heading === "true") headingLevel = 1;
     else if (heading && /^[1-6]$/.test(heading)) headingLevel = Number(heading);
   }

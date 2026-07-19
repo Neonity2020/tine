@@ -100,7 +100,7 @@ import {
   secondarySelectionActions,
   type SelectionAction,
 } from "../editor/selectionActions";
-import { isRenderHiddenProp, isPropertyLine } from "../render/block";
+import { isRenderHiddenProp, isPropertyLine, propertyKeyNorm } from "../render/block";
 import { facetsOf } from "../render/facets";
 import { AstBody } from "../render/body";
 import { InlineText } from "../render/inline";
@@ -835,7 +835,7 @@ function Rendered(props: {
           <For each={displayProps()}>
             {([k, v]) => (
               <span class="prop">
-                <span class="prop-key">{k}</span>
+                <span class="prop-key">{propertyKeyNorm(k)}</span>
                 {/* Render the value through the inline parser so a `[[wiki]]`/`#tag`
                     property value becomes a clickable link, matching OG and the
                     page-property path (Page.tsx). Issue #10. */}

@@ -7,6 +7,10 @@ import { parsePageHeaderPropertyLine, splitPagePreamble } from "../editor/proper
 
 export { MARKERS };
 
+export function propertyKeyNorm(key: string): string {
+  return key.trim().toLowerCase().replace(/[ _]/g, "-");
+}
+
 // Property keys NOT shown as rendered chips (id/uuid/collapsed + Logseq internals
 // + display-only keys). Single source for the two render paths — Block.tsx's live
 // chip filter and body.tsx's renderProps — which had drifted ~15 keys apart, and
@@ -21,13 +25,15 @@ export const RENDER_HIDDEN_PROPS: ReadonlySet<string> = new Set([
   "background-color", "logseq.order-list-type",
   "heading", "title", "filters", "created-at", "updated-at", "last-modified-at",
   "query-table", "query-properties", "query-sort-by", "query-sort-desc", "logseq.tldraw.shape",
-]);
+].map(propertyKeyNorm));
 
 /** Whether a property key is hidden from the rendered chips: a built-in internal
  *  key (case-insensitive) OR one the user listed in `:block-hidden-properties`. */
 export function isRenderHiddenProp(key: string, userHidden: readonly string[] = []): boolean {
-  const lower = key.toLowerCase();
-  return lower.startsWith("tine.") || RENDER_HIDDEN_PROPS.has(lower) || userHidden.some((k) => k.toLowerCase() === lower);
+  const normalized = propertyKeyNorm(key);
+  return normalized.startsWith("tine.")
+    || RENDER_HIDDEN_PROPS.has(normalized)
+    || userHidden.some((k) => propertyKeyNorm(k) === normalized);
 }
 
 const PROP_RE = /^[A-Za-z0-9_./-]+::\s?.*$/;
@@ -90,7 +96,8 @@ export function aliasNames(
 ): string[] {
   const out: string[] = [];
   for (const [k, v] of pageProperties(preBlock, format)) {
-    if (k.toLowerCase() !== "alias" && k.toLowerCase() !== "aliases") continue;
+    const key = propertyKeyNorm(k);
+    if (key !== "alias" && key !== "aliases") continue;
     if (isQuotedPagePropertyValue(v)) continue;
     out.push(...v
       .split(/[,，]/)
@@ -103,8 +110,8 @@ export function aliasNames(
 /** Built-in page-property values that Logseq treats as page references even
  * without explicit `[[...]]` syntax. Custom properties stay ordinary text. */
 export function isImplicitPageRefProperty(key: string): boolean {
-  const lower = key.toLowerCase();
-  return lower === "alias" || lower === "aliases" || lower === "tags";
+  const normalized = propertyKeyNorm(key);
+  return normalized === "alias" || normalized === "aliases" || normalized === "tags";
 }
 
 /** A whole quoted property value is literal text, including its commas. */

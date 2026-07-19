@@ -24,6 +24,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- Property names now fold to lowercase with spaces and underscores shown and
+  matched as `-`, matching Logseq while preserving the file's original bytes.
 - `#+BEGIN_QUOTE`/`#+BEGIN_EXAMPLE` (and other org container) blocks whose body contains a `- ` list were split into separate blocks — corrupting the block structure on save and leaking the raw delimiters in rendering; they now stay one block.
 - Pages whose page-header properties came from an older version (e.g. a page that
   is only `title::`/`tags::` metadata) no longer get stuck with a repeating
