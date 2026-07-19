@@ -283,6 +283,11 @@ pub struct ReferenceOccurrence {
 pub struct ReferenceBlockEvidence {
     pub block_id: String,
     pub occurrences: Vec<ReferenceOccurrence>,
+    /// Total parser-owned matches before the bounded evidence cap.
+    #[serde(default)]
+    pub total: usize,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2212,8 +2217,12 @@ impl Graph {
             return load(&entry);
         }
         if kind == PageKind::Page {
-            let tnorm = crate::refs::normalize(name);
-            if let Some((_, canon)) = self.page_aliases().into_iter().find(|(a, _)| *a == tnorm) {
+            let tnorm = crate::refs::page_key(name);
+            if let Some((_, canon)) = self
+                .page_aliases()
+                .into_iter()
+                .find(|(alias, _)| crate::refs::page_key(alias) == tnorm)
+            {
                 if let Some(entry) = self.find_entry(&canon, kind) {
                     return load(&entry);
                 }
@@ -2835,10 +2844,10 @@ impl Graph {
     ) {
         // Resolve aliases BEFORE taking the derived lock (page_aliases may take the
         // cache lock); never hold derived while taking cache.
-        let aliases = if scoped {
-            self.page_aliases()
+        let (aliases, real_pages) = if scoped {
+            (self.page_aliases(), crate::query::real_page_names(self))
         } else {
-            Vec::new()
+            (Vec::new(), crate::query::RealPageNames::new())
         };
         let today = crate::date::JournalDate::today().ordinal_key();
         // Hold the derived write lock across the WHOLE prune+re-tag. This is
@@ -2894,10 +2903,22 @@ impl Graph {
                 }
                 let page_affects = |candidate: &Document| match key.split_once('\0') {
                     Some(("b", target)) => {
-                        crate::query::page_affects_backlinks(&aliases, target, entry, candidate)
+                        crate::query::page_affects_backlinks(
+                            &real_pages,
+                            &aliases,
+                            target,
+                            entry,
+                            candidate,
+                        )
                     }
                     Some(("u", target)) => {
-                        crate::query::page_affects_unlinked(&aliases, target, candidate)
+                        crate::query::page_affects_unlinked(
+                            &real_pages,
+                            &aliases,
+                            target,
+                            entry,
+                            candidate,
+                        )
                     }
                     Some(("br", uuid)) => {
                         crate::query::page_affects_block_referrers(uuid, candidate)
@@ -2906,10 +2927,22 @@ impl Graph {
                         crate::query::page_affects_query(source, entry, candidate)
                     }
                     Some(("B", rest)) => rest.splitn(3, '\0').nth(2).is_none_or(|target| {
-                        crate::query::page_affects_backlinks(&aliases, target, entry, candidate)
+                        crate::query::page_affects_backlinks(
+                            &real_pages,
+                            &aliases,
+                            target,
+                            entry,
+                            candidate,
+                        )
                     }),
                     Some(("U", rest)) => rest.splitn(3, '\0').nth(2).is_none_or(|target| {
-                        crate::query::page_affects_unlinked(&aliases, target, candidate)
+                        crate::query::page_affects_unlinked(
+                            &real_pages,
+                            &aliases,
+                            target,
+                            entry,
+                            candidate,
+                        )
                     }),
                     Some(("Q", rest)) => rest.splitn(3, '\0').nth(2).is_none_or(|source| {
                         crate::query::page_affects_query(source, entry, candidate)
@@ -9877,6 +9910,79 @@ mod tests {
         assert_eq!(affected_block.total, 0);
         assert_eq!(affected_backlink.total, 0);
         assert_eq!(affected_unlinked.total, 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scoped_reference_invalidation_uses_real_page_before_colliding_alias() {
+        let dir = scratch("reference-invalidation-real-page-first");
+        fs::write(
+            dir.join("pages").join("X.md"),
+            "alias:: Q\n\n- real X\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("pages").join("Y.md"),
+            "alias:: X\n\n- alias owner\n",
+        )
+        .unwrap();
+        fs::write(dir.join("pages").join("Source.md"), "- unrelated\n").unwrap();
+        let g = Graph::open(&dir);
+        g.warm_cache();
+
+        let first_linked = g.backlinks("X");
+        let first_unlinked = g.unlinked_refs("X");
+        assert!(!first_linked.iter().any(|group| group.page == "Source"));
+        assert!(!first_unlinked.iter().any(|group| group.page == "Source"));
+
+        let mut source = g
+            .load_named("Source", PageKind::Page)
+            .unwrap()
+            .unwrap();
+        source.blocks[0].raw = "Q and [[Q]]".into();
+        g.save_page(&source, source.rev.as_deref()).unwrap();
+
+        let linked = g.backlinks("X");
+        let unlinked = g.unlinked_refs("X");
+        assert!(!Arc::ptr_eq(&first_linked, &linked));
+        assert!(!Arc::ptr_eq(&first_unlinked, &unlinked));
+        assert!(linked.iter().any(|group| group.page == "Source"));
+        assert!(unlinked.iter().any(|group| group.page == "Source"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn nfd_alias_resolves_and_canonical_equivalent_alias_cannot_shadow_real_page() {
+        let dir = scratch("nfd-alias-resolution");
+        fs::write(
+            dir.join("pages").join("Owner.md"),
+            "alias:: Re\u{301}sume\u{301}\n\n- owner\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("pages").join("Shadow.md"),
+            "alias:: Cafe\u{301}\n\n- shadow\n",
+        )
+        .unwrap();
+        fs::write(dir.join("pages").join("Café.md"), "- real page\n").unwrap();
+        let g = Graph::open(&dir);
+        g.warm_cache();
+
+        assert_eq!(
+            g.load_named("Re\u{301}sume\u{301}", PageKind::Page)
+                .unwrap()
+                .unwrap()
+                .name,
+            "Owner"
+        );
+        assert_eq!(
+            g.load_named("Cafe\u{301}", PageKind::Page)
+                .unwrap()
+                .unwrap()
+                .name,
+            "Café",
+            "the canonically equivalent real title must win before alias fallback"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -1545,7 +1545,7 @@ mod tests {
                     match_class: ObjectiveMatchClass::Exact,
                     matched_alias: Some(name),
                     ..
-                }) if page.name == "Cafe\u{301}" && name == "re\u{301}sume\u{301}"
+                }) if page.name == "Cafe\u{301}" && name == "résumé"
             ),
             "{:#?}",
             alias.hits

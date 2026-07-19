@@ -12,6 +12,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 - Android versions below 11 (API < 30) no longer crash on launch with an
   `UnsatisfiedLinkError` for `renameat2` (GH #192).
+- Linked and Unlinked References now match Logseq: Unicode-canonical (NFC) page
+  and alias identity, plain (unbracketed) property text counted as an unlinked
+  mention, same-named pages from different folders merged into one reference
+  group, and a real page title no longer shadowed by another page's alias
+  (GH #137).
+- Reference panels now show result truncation ("showing N of M") and a bounded
+  error state instead of an empty panel when limits are exceeded (GH #137).
 
 ## [0.6.1] - 2026-07-18
 

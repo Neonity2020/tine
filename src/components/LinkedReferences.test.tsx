@@ -35,6 +35,34 @@ afterEach(() => {
 });
 
 describe("Linked References filters", () => {
+  it("renders a bounded bridge error instead of an empty panel", async () => {
+    vi.spyOn(backend(), "getBacklinks").mockRejectedValue(new Error("result-too-large: 20001 matches"));
+    const root = document.createElement("div");
+    document.body.appendChild(root);
+    const dispose = render(() => <LinkedReferences name="Target" />, root);
+
+    await tick();
+    await tick();
+    expect(root.querySelector<HTMLElement>('[role="alert"]')?.textContent).toContain(
+      "bounded result limit was exceeded"
+    );
+    dispose();
+  });
+
+  it("does not mislabel an ordinary backend failure as a bounded bridge error", async () => {
+    vi.spyOn(backend(), "getBacklinks").mockRejectedValue(new Error("database unavailable"));
+    const root = document.createElement("div");
+    document.body.appendChild(root);
+    const dispose = render(() => <LinkedReferences name="Target" />, root);
+
+    await tick();
+    await tick();
+    const message = root.querySelector<HTMLElement>('[role="alert"]')?.textContent ?? "";
+    expect(message).toContain("Couldn’t load references");
+    expect(message).not.toContain("bounded result limit");
+    dispose();
+  });
+
   it("requests ancestor context for every linked-reference hit", async () => {
     vi.spyOn(backend(), "getBacklinks").mockResolvedValue([
       { page: "Journal", kind: "journal", blocks: [block("nested", "Nested [[Target]]")] },

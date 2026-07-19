@@ -74,6 +74,7 @@ describe("favorite alias navigation", () => {
 
   it("uses the same contextual Unicode lowercase key as core refs::page_key", () => {
     expect(pageIdentityKey(" ΟΣ ")).toBe("ος");
+    expect(pageIdentityKey("/Cafe\u{301}/")).toBe("café");
     setAliasMap({ ος: "ΟΣ" });
     const normal = vi.fn();
     openSidebarPageTarget("ΟΣ", "page", "normal", undefined, {

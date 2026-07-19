@@ -220,9 +220,17 @@ export async function refreshAliases(): Promise<void> {
   const request = ++aliasRequest;
   const result = await Promise.allSettled([backend().pageAliases()]);
   if (epoch !== graphEpoch() || navigationEpoch !== epoch || request !== aliasRequest) return;
-  aliasEntries = result[0].status === "fulfilled"
-    ? Object.fromEntries(result[0].value)
-    : {};
+  aliasEntries = {};
+  if (result[0].status === "fulfilled") {
+    for (const [alias, owner] of result[0].value) {
+      const key = pageIdentityKey(alias);
+      // Core returns owners in deterministic path order; preserve its first-wins
+      // fallback when duplicate owners contribute the same folded alias.
+      if (!Object.prototype.hasOwnProperty.call(aliasEntries, key)) {
+        aliasEntries[key] = owner;
+      }
+    }
+  }
   commitNavigationIndex();
 }
 

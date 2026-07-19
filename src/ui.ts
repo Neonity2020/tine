@@ -1464,10 +1464,15 @@ export const [audioPlayer, setAudioPlayer] =
 
 // Page aliases (alias:: → canonical), keyed by normalized alias; loaded per graph.
 export const [aliasMap, setAliasMap] = createSignal<Record<string, string>>({});
-/** Mirror core `refs::page_key`: trim, then Unicode string lowercase. String
- *  lowercasing is intentionally contextual (for example `ΟΣ` → `ος`). */
+/** Mirror core `refs::page_key`: trim, Unicode lowercase, remove one boundary
+ *  slash at each side, then NFC. Lowercasing is contextual (`ΟΣ` → `ος`). */
 export function pageIdentityKey(name: string): string {
-  return name.trim().toLowerCase();
+  const lowered = name.trim().toLowerCase();
+  const withoutLeading = lowered.startsWith("/") ? lowered.slice(1) : lowered;
+  const withoutBoundaries = withoutLeading.endsWith("/")
+    ? withoutLeading.slice(0, -1)
+    : withoutLeading;
+  return withoutBoundaries.normalize("NFC");
 }
 /** Resolve a page name through `alias::` to its canonical page (else unchanged). */
 export function resolveAlias(name: string): string {

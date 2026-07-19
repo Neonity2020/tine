@@ -8,6 +8,39 @@ import { shouldOpenTextContextMenu } from "../contextMenuPolicy";
 import { canonicalFold, matcherMatches, parseSearchQuery } from "../editor/searchQuery";
 
 const norm = (s: string) => s.trim().toLowerCase();
+const pageIdentity = (s: string) => {
+  const lowered = s.trim().toLowerCase();
+  const withoutLeading = lowered.startsWith("/") ? lowered.slice(1) : lowered;
+  const withoutBoundaries = withoutLeading.endsWith("/") ? withoutLeading.slice(0, -1) : withoutLeading;
+  return withoutBoundaries.normalize("NFC");
+};
+
+type BoundedEvidence = NonNullable<RefGroup["evidence"]>[number] & {
+  total?: number;
+  truncated?: boolean;
+};
+
+function mergeReferenceGroups(groups: RefGroup[]): RefGroup[] {
+  const merged = new Map<string, RefGroup>();
+  for (const group of groups) {
+    const key = pageIdentity(group.page);
+    const existing = merged.get(key);
+    if (existing) {
+      existing.blocks.push(...group.blocks);
+      existing.evidence = [...(existing.evidence ?? []), ...(group.evidence ?? [])];
+    } else {
+      merged.set(key, { ...group, blocks: [...group.blocks], evidence: [...(group.evidence ?? [])] });
+    }
+  }
+  return [...merged.values()];
+}
+
+type ReferenceLoadError = "bounded" | "backend";
+
+function classifyReferenceLoadError(error: unknown): ReferenceLoadError {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.startsWith("result-too-large:") ? "bounded" : "backend";
+}
 
 // Persist the per-page include/exclude reference filter so it survives reload.
 type FilterMap = Record<string, "in" | "out">;
@@ -68,10 +101,20 @@ function fallbackFilterEntry(block: BlockDto): SearchableFilterEntry {
 // filterable by co-referenced page (click a chip: include → exclude → off),
 // mirroring OG's reference filter.
 export function LinkedReferences(props: { name: string }): JSX.Element {
+  const [loadError, setLoadError] = createSignal<ReferenceLoadError | null>(null);
   const [groups] = createResource(
     () => props.name,
-    (n) => backend().getBacklinks(n)
+    async (n) => {
+      setLoadError(null);
+      try {
+        return await backend().getBacklinks(n);
+      } catch (error) {
+        setLoadError(classifyReferenceLoadError(error));
+        return [];
+      }
+    }
   );
+  const mergedGroups = createMemo(() => mergeReferenceGroups(groups() ?? []));
   const [collapsed, setCollapsed] = createSignal(false);
   const [collapsedGroups, setCollapsedGroups] = createSignal<Set<string>>(new Set());
   const [filterOpen, setFilterOpen] = createSignal(false);
@@ -93,7 +136,7 @@ export function LinkedReferences(props: { name: string }): JSX.Element {
   });
 
   const targets = createMemo<BacklinkFilterTarget[]>(() =>
-    (groups() ?? []).flatMap((group) =>
+    mergedGroups().flatMap((group) =>
       group.blocks.map((block) => ({ page: group.page, kind: group.kind, block_id: block.id }))
     )
   );
@@ -107,7 +150,7 @@ export function LinkedReferences(props: { name: string }): JSX.Element {
   );
   const fallbackByRoot = createMemo(() =>
     new Map(
-      (groups() ?? []).flatMap((group) =>
+      mergedGroups().flatMap((group) =>
         group.blocks.map((block) => [
           filterKey(group.page, group.kind, block.id),
           fallbackFilterEntry(block),
@@ -130,7 +173,7 @@ export function LinkedReferences(props: { name: string }): JSX.Element {
   // Co-referenced pages/tags and task states in each backlink tree, with counts.
   const coRefs = createMemo(() => {
     const counts = new Map<string, { name: string; count: number }>();
-    for (const g of groups() ?? []) {
+    for (const g of mergedGroups()) {
       for (const b of g.blocks) {
         for (const name of rootEntry(g, b).facets) {
           const key = norm(name);
@@ -162,9 +205,9 @@ export function LinkedReferences(props: { name: string }): JSX.Element {
     const searching = parsed.kind !== "empty" && parsed.kind !== "invalid";
     // Do not flash descendant-only matches away while their on-demand native
     // index is still in flight. Once it arrives, filtering is synchronous.
-    if ((searching || ins.length || outs.length) && nativeContext.loading) return groups() ?? [];
-    if (!searching && !ins.length && !outs.length) return groups() ?? [];
-    return (groups() ?? [])
+    if ((searching || ins.length || outs.length) && nativeContext.loading) return mergedGroups();
+    if (!searching && !ins.length && !outs.length) return mergedGroups();
+    return mergedGroups()
       .map((g) => ({
         ...g,
         blocks: g.blocks.filter((b) => {
@@ -181,7 +224,7 @@ export function LinkedReferences(props: { name: string }): JSX.Element {
       .filter((g) => g.blocks.length > 0);
   });
 
-  const groupKey = (group: RefGroup) => `${group.kind}:${group.page}`;
+  const groupKey = (group: RefGroup) => pageIdentity(group.page);
   const shownByKey = createMemo(() => new Map(shown().map((group) => [groupKey(group), group] as const)));
   const groupCollapsed = (group: RefGroup) => collapsedGroups().has(groupKey(group));
   const setGroupCollapsed = (group: RefGroup, value: boolean) => {
@@ -206,7 +249,18 @@ export function LinkedReferences(props: { name: string }): JSX.Element {
     saveFilters(props.name, f);
   };
   const count = () => shown().reduce((acc, g) => acc + g.blocks.length, 0);
-  const totalCount = () => (groups() ?? []).reduce((acc, g) => acc + g.blocks.length, 0);
+  const totalCount = () => mergedGroups().reduce((acc, g) => acc + g.blocks.length, 0);
+  const occurrenceLimit = createMemo(() => {
+    let shown = 0;
+    let total = 0;
+    for (const group of mergedGroups()) {
+      for (const evidence of (group.evidence ?? []) as BoundedEvidence[]) {
+        shown += evidence.occurrences.length;
+        total += evidence.total ?? evidence.occurrences.length;
+      }
+    }
+    return { shown, total, truncated: total > shown };
+  });
   const hasActiveFilter = () => searchDraft().trim() !== "" || Object.keys(filters()).length > 0;
   const updateSearch = (value: string) => {
     setSearchDraft(value);
@@ -222,7 +276,20 @@ export function LinkedReferences(props: { name: string }): JSX.Element {
   };
 
   return (
-    <Show when={groups() && groups()!.length > 0}>
+    <Show
+      when={loadError() === null}
+      fallback={
+        <div class="linked-references reference-error" role="alert">
+          <div class="references-header">Linked References</div>
+          <div class="reference-filter-error">
+            {loadError() === "bounded"
+              ? "Couldn’t load references: the bounded result limit was exceeded."
+              : "Couldn’t load references because the backend request failed."}
+          </div>
+        </div>
+      }
+    >
+    <Show when={groups() && mergedGroups().length > 0}>
       <div class="linked-references">
         <div class="references-header" onClick={() => setCollapsed(!collapsed())}>
           <span class="ref-collapse" classList={{ collapsed: collapsed() }}>
@@ -247,6 +314,11 @@ export function LinkedReferences(props: { name: string }): JSX.Element {
           </button>
         </div>
         <Show when={!collapsed()}>
+          <Show when={occurrenceLimit().truncated}>
+            <div class="reference-truncation" role="status">
+              Showing {occurrenceLimit().shown} of {occurrenceLimit().total} matching occurrences.
+            </div>
+          </Show>
           <Show when={filterOpen()}>
             <div class="reference-filter-panel">
               <div class="reference-filter-search-row">
@@ -360,6 +432,7 @@ export function LinkedReferences(props: { name: string }): JSX.Element {
           </For>
         </Show>
       </div>
+    </Show>
     </Show>
   );
 }

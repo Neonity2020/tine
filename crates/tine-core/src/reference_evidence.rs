@@ -9,6 +9,7 @@ use crate::model::{ReferenceKind, ReferenceOccurrence, ReferenceSpan};
 use crate::refs;
 use lsdoc::ast::{Block, Inline, ListItem, Span, Url};
 use std::ops::Range;
+use unicode_normalization::UnicodeNormalization;
 
 pub const ENGINE_VERSION: &str = "reference-evidence/v1";
 const MAX_OCCURRENCES_PER_BLOCK: usize = 64;
@@ -24,6 +25,13 @@ pub(crate) struct ProjectedPageRef {
 pub(crate) struct ReferenceSourceProjection {
     pub explicit: Vec<ProjectedPageRef>,
     pub plain_ranges: Vec<Range<usize>>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BoundedOccurrences {
+    pub occurrences: Vec<ReferenceOccurrence>,
+    pub total: usize,
+    pub truncated: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -364,6 +372,12 @@ fn project_implicit_linkable_property(
     }
 }
 
+fn structural_property(key: &str, raw: &str) -> bool {
+    (key.eq_ignore_ascii_case("id") && refs::block_id(raw).is_some())
+        || key.eq_ignore_ascii_case("collapsed")
+        || key.to_ascii_lowercase().starts_with("logseq.")
+}
+
 fn walk_blocks(
     blocks: &[Block],
     mapper: SpanMapper,
@@ -401,6 +415,9 @@ fn walk_blocks(
             }
             Block::Properties { span, .. } => {
                 for (key, offset, value) in property_values(span.as_ref(), mapper, raw) {
+                    if structural_property(&key, raw) {
+                        continue;
+                    }
                     let parsed = lsdoc::parse_format(&value, if is_org { "org" } else { "md" });
                     walk_blocks(
                         &parsed.blocks,
@@ -463,6 +480,7 @@ fn visit_plain_matches(
     if needle.is_empty() {
         return;
     }
+    let needle: String = needle.to_lowercase().nfc().collect();
     let first_requires_boundary = needle.chars().next().is_some_and(|ch| ch.is_alphanumeric());
     let last_requires_boundary = needle
         .chars()
@@ -470,17 +488,26 @@ fn visit_plain_matches(
         .is_some_and(|ch| ch.is_alphanumeric());
     for (offset, _) in source.char_indices() {
         let start = range.start + offset;
-        let mut candidate = source[offset..].char_indices().flat_map(|(relative, ch)| {
-            let end = start + relative + ch.len_utf8();
-            ch.to_lowercase().map(move |lower| (lower, end))
-        });
         let mut end = start;
-        let matched = needle.chars().flat_map(char::to_lowercase).all(|expected| {
-            candidate.next().is_some_and(|(actual, actual_end)| {
-                end = actual_end;
-                actual == expected
-            })
-        });
+        let mut candidate_raw = String::new();
+        let mut matched = false;
+        for (relative, ch) in source[offset..].char_indices() {
+            candidate_raw.push(ch);
+            end = start + relative + ch.len_utf8();
+            let candidate: String = candidate_raw.to_lowercase().nfc().collect();
+            if candidate == needle {
+                matched = true;
+                break;
+            }
+            // The final scalar may still compose with the next combining mark.
+            let without_last = candidate
+                .char_indices()
+                .next_back()
+                .map_or("", |(index, _)| &candidate[..index]);
+            if !needle.starts_with(&candidate) && !needle.starts_with(without_last) {
+                break;
+            }
+        }
         if !matched {
             continue;
         }
@@ -544,14 +571,15 @@ pub(crate) fn occurrence_constructions() -> usize {
     OCCURRENCE_CONSTRUCTIONS.with(std::cell::Cell::get)
 }
 
-pub(crate) fn occurrences_of_kind(
+pub(crate) fn occurrences_of_kind_bounded(
     raw: &str,
     projection: &ReferenceSourceProjection,
     canonical: &str,
     names_norm: &[String],
     kind: ReferenceKind,
-) -> Vec<ReferenceOccurrence> {
+) -> BoundedOccurrences {
     let mut out = Vec::with_capacity(MAX_OCCURRENCES_PER_BLOCK.min(8));
+    let mut total = 0usize;
     if kind == ReferenceKind::Explicit {
         for reference in &projection.explicit {
             if !names_norm
@@ -560,29 +588,30 @@ pub(crate) fn occurrences_of_kind(
             {
                 continue;
             }
-            if out.len() >= MAX_OCCURRENCES_PER_BLOCK {
-                break;
-            }
-            if !push_unique_bounded(
-                &mut out,
-                reference.name.trim(),
-                canonical,
-                kind,
-                ReferenceSpan {
-                    start: byte_to_utf16(raw, reference.range.start),
-                    end: byte_to_utf16(raw, reference.range.end),
-                },
-                reference.rule,
-            ) {
-                break;
+            total = total.saturating_add(1);
+            if out.len() < MAX_OCCURRENCES_PER_BLOCK {
+                let _ = push_unique_bounded(
+                    &mut out,
+                    reference.name.trim(),
+                    canonical,
+                    kind,
+                    ReferenceSpan {
+                        start: byte_to_utf16(raw, reference.range.start),
+                        end: byte_to_utf16(raw, reference.range.end),
+                    },
+                    reference.rule,
+                );
             }
         }
-        return out;
+        return BoundedOccurrences {
+            truncated: total > out.len(),
+            occurrences: out,
+            total,
+        };
     }
 
-    'names: for name in names_norm {
+    for name in names_norm {
         for eligible in &projection.plain_ranges {
-            let mut full = false;
             visit_plain_matches(raw, eligible, name, |range| {
                 if projection
                     .explicit
@@ -591,31 +620,40 @@ pub(crate) fn occurrences_of_kind(
                 {
                     return true;
                 }
-                if out.len() >= MAX_OCCURRENCES_PER_BLOCK {
-                    full = true;
-                    return false;
+                total = total.saturating_add(1);
+                if out.len() < MAX_OCCURRENCES_PER_BLOCK {
+                    let _ = push_unique_bounded(
+                        &mut out,
+                        raw.get(range.clone()).unwrap_or(name),
+                        canonical,
+                        kind,
+                        ReferenceSpan {
+                            start: byte_to_utf16(raw, range.start),
+                            end: byte_to_utf16(raw, range.end),
+                        },
+                        "plain_og_boundary",
+                    );
                 }
-                let keep_scanning = push_unique_bounded(
-                    &mut out,
-                    raw.get(range.clone()).unwrap_or(name),
-                    canonical,
-                    kind,
-                    ReferenceSpan {
-                        start: byte_to_utf16(raw, range.start),
-                        end: byte_to_utf16(raw, range.end),
-                    },
-                    "plain_og_boundary",
-                );
-                full = !keep_scanning;
-                keep_scanning
+                true
             });
-            if full {
-                break 'names;
-            }
         }
     }
     out.sort_by_key(|occurrence| (occurrence.span.start, occurrence.span.end));
-    out
+    BoundedOccurrences {
+        truncated: total > out.len(),
+        occurrences: out,
+        total,
+    }
+}
+
+pub(crate) fn occurrences_of_kind(
+    raw: &str,
+    projection: &ReferenceSourceProjection,
+    canonical: &str,
+    names_norm: &[String],
+    kind: ReferenceKind,
+) -> Vec<ReferenceOccurrence> {
+    occurrences_of_kind_bounded(raw, projection, canonical, names_norm, kind).occurrences
 }
 
 /// Cheap membership path used once a result construction budget is closed.
@@ -807,6 +845,32 @@ mod tests {
         assert_eq!(got.len(), MAX_OCCURRENCES_PER_BLOCK);
         assert_eq!(occurrence_constructions(), MAX_OCCURRENCES_PER_BLOCK);
         assert!(got.capacity() <= MAX_OCCURRENCES_PER_BLOCK);
+    }
+
+    #[test]
+    fn occurrence_cap_reports_total_and_truncation() {
+        let raw = "Target ".repeat(70);
+        let parsed = crate::render::parse_projection(&raw, false);
+        let projected = project(&raw, false, &parsed.blocks);
+        let got = occurrences_of_kind_bounded(
+            &raw,
+            &projected,
+            "Target",
+            &[refs::normalize("Target")],
+            ReferenceKind::Plain,
+        );
+        assert_eq!(got.occurrences.len(), MAX_OCCURRENCES_PER_BLOCK);
+        assert_eq!(got.total, 70);
+        assert!(got.truncated);
+    }
+
+    #[test]
+    fn structural_id_property_is_not_plain_reference_text() {
+        let got = evidence(
+            "id:: 6a55b643-1234-5678-9abc-def012345678",
+            &["6a55b643"],
+        );
+        assert!(got.is_empty(), "structural id leaked into evidence: {got:?}");
     }
 
     #[test]

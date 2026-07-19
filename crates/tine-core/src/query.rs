@@ -495,7 +495,7 @@ pub(crate) fn document_aliases(doc: &Document) -> Vec<String> {
                 for alias in v.split([',', '，']) {
                     let alias = strip_ref(alias.trim());
                     if !alias.is_empty() {
-                        aliases.push(refs::normalize(&alias));
+                        aliases.push(refs::page_key(&alias));
                     }
                 }
             }
@@ -508,15 +508,50 @@ pub(crate) fn document_aliases(doc: &Document) -> Vec<String> {
     aliases
 }
 
+fn sorted_alias_owners(
+    mut owned: Vec<(std::path::PathBuf, String, String)>,
+) -> Vec<(String, String)> {
+    // Alias fallback is first-wins, so sort the physical owners before dropping
+    // their paths. This makes the winner independent of read_dir/cache order.
+    owned.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    owned
+        .into_iter()
+        .map(|(_, alias, owner)| (alias, owner))
+        .collect()
+}
+
 pub fn page_aliases(graph: &Graph) -> Vec<(String, String)> {
     graph.with_pages(|pages| {
-        let mut out: Vec<(String, String)> = Vec::new();
+        let mut owned = Vec::new();
         for (entry, doc) in pages {
             for alias in document_aliases(doc) {
-                out.push((alias, entry.name.clone()));
+                owned.push((entry.path.clone(), alias, entry.name.clone()));
             }
         }
-        out
+        sorted_alias_owners(owned)
+    })
+}
+
+pub(crate) type RealPageNames =
+    std::collections::HashMap<String, (std::path::PathBuf, String)>;
+
+pub(crate) fn real_page_names(graph: &Graph) -> RealPageNames {
+    graph.with_pages(|pages| {
+        let mut real = RealPageNames::new();
+        for (entry, _) in pages {
+            let key = refs::page_key(&entry.name);
+            match real.get_mut(&key) {
+                Some((winner_path, winner_name)) if entry.path < *winner_path => {
+                    *winner_path = entry.path.clone();
+                    *winner_name = entry.name.clone();
+                }
+                Some(_) => {}
+                None => {
+                    real.insert(key, (entry.path.clone(), entry.name.clone()));
+                }
+            }
+        }
+        real
     })
 }
 
@@ -524,21 +559,39 @@ pub fn page_aliases(graph: &Graph) -> Vec<(String, String)> {
 /// normalized names that identify that page. The normalized list is shared by
 /// backlinks, unlinked references, and their scoped-invalidation predicates so
 /// those paths cannot drift.
-fn equivalent_page_names(aliases: &[(String, String)], target: &str) -> (String, Vec<String>) {
+fn equivalent_page_names(
+    real_pages: &RealPageNames,
+    aliases: &[(String, String)],
+    target: &str,
+) -> (String, Vec<String>) {
     let target_norm = refs::normalize(target);
-    let canonical = aliases
-        .iter()
-        .find(|(alias, _)| *alias == target_norm)
-        .map(|(_, canonical)| canonical.clone())
+    let canonical = real_pages
+        .get(&target_norm)
+        .map(|(_, name)| name.clone())
+        .or_else(|| {
+            aliases
+                .iter()
+                .find(|(alias, _)| refs::page_key(alias) == target_norm)
+                .map(|(_, canonical)| canonical.clone())
+        })
         .unwrap_or_else(|| target.to_string());
-    let canonical_norm = refs::normalize(&canonical);
+    let canonical_norm = refs::page_key(&canonical);
     let mut names = vec![canonical_norm.clone()];
     for (alias, alias_target) in aliases {
-        if refs::normalize(alias_target) == canonical_norm && !names.contains(alias) {
-            names.push(alias.clone());
+        let alias_norm = refs::page_key(alias);
+        if refs::page_key(alias_target) == canonical_norm && !names.contains(&alias_norm) {
+            names.push(alias_norm);
         }
     }
     (canonical, names)
+}
+
+fn graph_equivalent_page_names(
+    graph: &Graph,
+    aliases: &[(String, String)],
+    target: &str,
+) -> (String, Vec<String>) {
+    equivalent_page_names(&real_page_names(graph), aliases, target)
 }
 
 fn org_property_line(line: &str) -> bool {
@@ -596,16 +649,18 @@ fn block_reference_evidence(
     names_norm: &[String],
     kind: ReferenceKind,
 ) -> Option<ReferenceBlockEvidence> {
-    let occurrences = crate::reference_evidence::occurrences_of_kind(
+    let result = crate::reference_evidence::occurrences_of_kind_bounded(
         &block.raw,
         &block.projection().reference_source,
         canonical,
         names_norm,
         kind,
     );
-    (!occurrences.is_empty()).then(|| ReferenceBlockEvidence {
+    (!result.occurrences.is_empty()).then(|| ReferenceBlockEvidence {
         block_id: block.uuid.clone(),
-        occurrences,
+        occurrences: result.occurrences,
+        total: result.total,
+        truncated: result.truncated,
     })
 }
 
@@ -651,38 +706,37 @@ fn collect_reference_occurrences_bounded(
     let mut budget = ConstructionBudget::new(max_rows, max_bytes);
     let groups = graph.with_pages(|pages| {
         let mut groups: Vec<(Option<i64>, RefGroup)> = Vec::new();
-        for (entry, doc) in pages {
+        let mut by_name = std::collections::HashMap::<String, usize>::new();
+        let mut sources = pages.iter().collect::<Vec<_>>();
+        sources.sort_by(|(a, _), (b, _)| a.path.cmp(&b.path));
+        for (entry, doc) in sources {
             if refs::normalize(&entry.name) == exclude {
                 continue;
             }
             let mut blocks = Vec::new();
             let mut evidence = Vec::new();
-            if kind == ReferenceKind::Explicit {
-                if let Some(mut block) = doc
-                    .pre_block
-                    .as_deref()
-                    .and_then(|pre| page_property_block(entry, pre))
-                {
-                    if budget.closed() {
-                        if block_has_reference(&block, names_norm, kind) {
-                            budget.deny_match();
-                        }
-                    } else if let Some(hit) =
-                        block_reference_evidence(&block, canonical, names_norm, kind)
-                    {
-                        let mut dto = block_to_shallow_dto(&block);
-                        dto.page_property = true;
-                        let estimated = crate::model::block_dto_estimated_bytes(&dto)
-                            .saturating_add(reference_evidence_estimated_bytes(&hit));
-                        if budget.admit_estimated(&entry.name, estimated) {
-                            blocks.push(dto);
-                            evidence.push(hit);
-                        }
+            if let Some(mut block) = doc
+                .pre_block
+                .as_deref()
+                .and_then(|pre| page_property_block(entry, pre))
+            {
+                if budget.closed() {
+                    if block_has_reference(&block, names_norm, kind) {
+                        budget.deny_match();
                     }
-                    // Make it impossible to accidentally retain this synthetic
-                    // block past the result construction boundary.
-                    block.children.clear();
+                } else if let Some(hit) =
+                    block_reference_evidence(&block, canonical, names_norm, kind)
+                {
+                    let mut dto = block_to_shallow_dto(&block);
+                    dto.page_property = true;
+                    let estimated = crate::model::block_dto_estimated_bytes(&dto)
+                        .saturating_add(reference_evidence_estimated_bytes(&hit));
+                    if budget.admit_estimated(&entry.name, estimated) {
+                        blocks.push(dto);
+                        evidence.push(hit);
+                    }
                 }
+                block.children.clear();
             }
             let mut path = Vec::new();
             let mut found: Vec<(BlockDto, ReferenceBlockEvidence)> = Vec::new();
@@ -724,15 +778,28 @@ fn collect_reference_occurrences_bounded(
                 evidence.push(hit);
             }
             if !blocks.is_empty() {
-                groups.push((
-                    entry.date_key,
-                    RefGroup {
-                        page: entry.name.clone(),
-                        kind: entry.kind,
-                        blocks,
-                        evidence,
-                    },
-                ));
+                let key = refs::normalize(&entry.name);
+                if let Some(&index) = by_name.get(&key) {
+                    let (date_key, group) = &mut groups[index];
+                    *date_key = match (*date_key, entry.date_key) {
+                        (Some(a), Some(b)) => Some(a.max(b)),
+                        (current @ Some(_), None) => current,
+                        (None, other) => other,
+                    };
+                    group.blocks.extend(blocks);
+                    group.evidence.extend(evidence);
+                } else {
+                    by_name.insert(key, groups.len());
+                    groups.push((
+                        entry.date_key,
+                        RefGroup {
+                            page: entry.name.clone(),
+                            kind: entry.kind,
+                            blocks,
+                            evidence,
+                        },
+                    ));
+                }
             }
         }
         groups.sort_by(|a, b| {
@@ -751,7 +818,7 @@ fn collect_reference_occurrences_bounded(
 
 pub fn backlinks(graph: &Graph, target: &str) -> Vec<RefGroup> {
     let aliases = graph.page_aliases();
-    let (canonical, names_norm) = equivalent_page_names(&aliases, target);
+    let (canonical, names_norm) = graph_equivalent_page_names(graph, &aliases, target);
     collect_reference_occurrences(graph, &canonical, &names_norm, ReferenceKind::Explicit)
 }
 
@@ -762,7 +829,7 @@ pub fn backlinks_bounded(
     max_bytes: usize,
 ) -> BoundedGroups {
     let aliases = graph.page_aliases();
-    let (canonical, names_norm) = equivalent_page_names(&aliases, target);
+    let (canonical, names_norm) = graph_equivalent_page_names(graph, &aliases, target);
     collect_reference_occurrences_bounded(
         graph,
         &canonical,
@@ -890,7 +957,7 @@ pub fn backlink_filter_context(
     targets: &[BacklinkFilterTarget],
 ) -> BacklinkFilterContext {
     let aliases = graph.page_aliases();
-    let (_, names_norm) = equivalent_page_names(&aliases, target);
+    let (_, names_norm) = graph_equivalent_page_names(graph, &aliases, target);
     let excluded_refs = names_norm.into_iter().collect::<std::collections::HashSet<_>>();
     let mut requested = std::collections::HashMap::<
         (PageKind, String),
@@ -1035,7 +1102,7 @@ pub fn block_referrers_bounded(
 /// with the corresponding occurrence evidence.
 pub fn unlinked_refs(graph: &Graph, target: &str) -> Vec<RefGroup> {
     let aliases = graph.page_aliases();
-    let (canonical, names_norm) = equivalent_page_names(&aliases, target);
+    let (canonical, names_norm) = graph_equivalent_page_names(graph, &aliases, target);
     collect_reference_occurrences(graph, &canonical, &names_norm, ReferenceKind::Plain)
 }
 
@@ -1046,7 +1113,7 @@ pub fn unlinked_refs_bounded(
     max_bytes: usize,
 ) -> BoundedGroups {
     let aliases = graph.page_aliases();
-    let (canonical, names_norm) = equivalent_page_names(&aliases, target);
+    let (canonical, names_norm) = graph_equivalent_page_names(graph, &aliases, target);
     collect_reference_occurrences_bounded(
         graph,
         &canonical,
@@ -1062,7 +1129,7 @@ pub fn unlinked_refs_bounded(
 /// projection-cache drift visible. No launcher history is read or returned.
 pub fn reference_diagnostics(graph: &Graph, target: &str) -> ReferenceDiagnostics {
     let aliases = graph.page_aliases();
-    let (canonical, names_norm) = equivalent_page_names(&aliases, target);
+    let (canonical, names_norm) = graph_equivalent_page_names(graph, &aliases, target);
     let excluded_page = refs::normalize(&canonical);
     let mut traces = graph.with_pages(|pages| {
         let mut traces = Vec::new();
@@ -1385,12 +1452,13 @@ pub(crate) fn page_affects_query(src: &str, entry: &PageEntry, doc: &Document) -
 /// in `backlinks(target)`. Mirrors `backlinks`'s alias resolution; takes the
 /// resolved alias map so the caller needn't hold the graph lock.
 pub(crate) fn page_affects_backlinks(
+    real_pages: &RealPageNames,
     aliases: &[(String, String)],
     target: &str,
     entry: &PageEntry,
     doc: &Document,
 ) -> bool {
-    let (canonical, names_norm) = equivalent_page_names(aliases, target);
+    let (canonical, names_norm) = equivalent_page_names(real_pages, aliases, target);
     if doc.pre_block.as_deref().is_some_and(|pre| {
         page_property_block(entry, pre).is_some_and(|block| {
             block_reference_evidence(&block, &canonical, &names_norm, ReferenceKind::Explicit)
@@ -1414,11 +1482,21 @@ pub(crate) fn page_affects_backlinks(
 /// Whether page `doc` plain-text-mentions `target` unlinked — i.e. could be in
 /// `unlinked_refs(target)`. Mirrors `unlinked_refs`'s matcher.
 pub(crate) fn page_affects_unlinked(
+    real_pages: &RealPageNames,
     aliases: &[(String, String)],
     target: &str,
+    entry: &PageEntry,
     doc: &Document,
 ) -> bool {
-    let (canonical, names_norm) = equivalent_page_names(aliases, target);
+    let (canonical, names_norm) = equivalent_page_names(real_pages, aliases, target);
+    if doc.pre_block.as_deref().is_some_and(|pre| {
+        page_property_block(entry, pre).is_some_and(|block| {
+            block_reference_evidence(&block, &canonical, &names_norm, ReferenceKind::Plain)
+                .is_some()
+        })
+    }) {
+        return true;
+    }
     let mut hit = false;
     walk(&doc.roots, &mut |b| {
         if !hit
@@ -4530,6 +4608,147 @@ mod tests {
             .unwrap()
             .contains("launcher-ranking"));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn og_page_identity_and_reference_grouping_use_nfc_without_accent_folding() {
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!("tine-ref-nfc-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("pages")).unwrap();
+        fs::write(dir.join("pages/Café.md"), "- target\n").unwrap();
+        fs::write(dir.join("pages/Source.md"), "- [[Cafe\u{301}]] and plain Cafe\u{301}\n").unwrap();
+        fs::write(dir.join("pages/Ascii.md"), "- [[cafe]]\n").unwrap();
+        let graph = Graph::open(&dir);
+        let linked = backlinks(&graph, "Café");
+        assert_eq!(linked.iter().filter(|group| group.page == "Source").count(), 1);
+        assert!(!linked.iter().any(|group| group.page == "Ascii"));
+        let unlinked = unlinked_refs(&graph, "Café");
+        assert_eq!(unlinked.iter().filter(|group| group.page == "Source").count(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn plain_page_property_is_unlinked_and_diagnostics_agree() {
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!("tine-page-prop-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("pages")).unwrap();
+        fs::write(dir.join("pages/Target.md"), "- target\n").unwrap();
+        fs::write(dir.join("pages/PageProps.md"), "note:: Target\n\n- body\n").unwrap();
+        fs::write(dir.join("pages/BlockProps.md"), "- note:: Target\n").unwrap();
+        let graph = Graph::open(&dir);
+        let groups = unlinked_refs(&graph, "Target");
+        for page in ["PageProps", "BlockProps"] {
+            assert_eq!(groups.iter().find(|group| group.page == page).unwrap().blocks.len(), 1);
+        }
+        assert!(groups.iter().find(|group| group.page == "PageProps").unwrap().blocks[0].page_property);
+        let diagnostics = reference_diagnostics(&graph, "Target");
+        assert!(diagnostics.traces.iter().find(|trace| trace.page == "PageProps").unwrap().included_unlinked);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn duplicate_source_page_names_merge_into_one_reference_group() {
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!("tine-ref-groups-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("pages/a")).unwrap();
+        fs::create_dir_all(dir.join("pages/b")).unwrap();
+        fs::write(dir.join("pages/a/Note.md"), "- first [[Target]]\n").unwrap();
+        fs::write(dir.join("pages/b/Note.md"), "- second [[Target]]\n").unwrap();
+        let graph = Graph::open(&dir);
+        let groups = backlinks(&graph, "Target");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].page, "Note");
+        assert_eq!(groups[0].blocks.len(), 2);
+        assert_eq!(groups[0].evidence.len(), 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn structural_id_value_never_creates_an_unlinked_group() {
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!("tine-ref-id-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("pages")).unwrap();
+        fs::write(dir.join("pages/6a55b643.md"), "- target\n").unwrap();
+        fs::write(
+            dir.join("pages/Source.md"),
+            "- id:: 6a55b643-1234-5678-9abc-def012345678\n",
+        )
+        .unwrap();
+        let graph = Graph::open(&dir);
+        assert!(unlinked_refs(&graph, "6a55b643").is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bounded_occurrence_evidence_reaches_reference_results() {
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!("tine-ref-total-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("pages")).unwrap();
+        fs::write(dir.join("pages/Target.md"), "- target\n").unwrap();
+        fs::write(
+            dir.join("pages/Source.md"),
+            format!("- {}\n", "Target ".repeat(70)),
+        )
+        .unwrap();
+        let graph = Graph::open(&dir);
+        let groups = unlinked_refs(&graph, "Target");
+        let evidence = &groups[0].evidence[0];
+        assert_eq!(evidence.occurrences.len(), 64);
+        assert_eq!(evidence.total, 70);
+        assert!(evidence.truncated);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn real_title_beats_colliding_alias() {
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!(
+            "tine-real-page-before-alias-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("pages")).unwrap();
+        fs::write(dir.join("pages/X.md"), "- real title\n").unwrap();
+        fs::write(dir.join("pages/Y.md"), "alias:: X\n\n- [[X]]\n").unwrap();
+        let graph = Graph::open(&dir);
+        assert!(backlinks(&graph, "X")
+            .iter()
+            .any(|group| group.page == "Y"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn duplicate_alias_owner_is_lowest_path_even_when_input_is_reversed() {
+        let owned = vec![
+            (
+                std::path::PathBuf::from("pages/z/B.md"),
+                "z".to_string(),
+                "B".to_string(),
+            ),
+            (
+                std::path::PathBuf::from("pages/a/A.md"),
+                "z".to_string(),
+                "A".to_string(),
+            ),
+        ];
+        let aliases = sorted_alias_owners(owned);
+        assert_eq!(
+            aliases,
+            vec![
+                ("z".to_string(), "A".to_string()),
+                ("z".to_string(), "B".to_string()),
+            ],
+            "alias ownership must be path-sorted, not inherited from enumeration order"
+        );
+        assert_eq!(
+            equivalent_page_names(&RealPageNames::new(), &aliases, "Z").0,
+            "A"
+        );
     }
 
     /// Regression for the pre-0.6 performance audit: recursive `block_to_dto`
