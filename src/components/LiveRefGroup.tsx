@@ -1,4 +1,4 @@
-import { For, Show, createEffect, createMemo, createResource, createSignal, createUniqueId, onCleanup, onMount, type JSX } from "solid-js";
+import { For, Show, createEffect, createMemo, createResource, createSignal, createUniqueId, onCleanup, onMount, untrack, type JSX } from "solid-js";
 import { backend } from "../backend";
 import { doc, ensurePageLoaded, formatForPage, pageByName } from "../store";
 import { Block, CollapseSurfaceContext, SurfaceContext, type CollapseSurfaceApi } from "./Block";
@@ -13,6 +13,12 @@ import { visibleBody } from "../render/block";
 
 // The "near the viewport" lazy-mount observer is shared app-wide (block bodies
 // use it too) — see src/lazyObserve.ts.
+
+// Instrumentation seam (GH #185): counts how many times the collapse-state GC
+// walk below actually runs. A regression test uses it to prove the walk fires on
+// result-membership change but NOT on unrelated descendant edits. Cost is one
+// integer increment per real prune.
+export const __livRefGroupInternals = { pruneRuns: 0 };
 
 // Renders result/backlink/embed blocks as LIVE editable <Block>s, but LAZILY:
 // the group is a reserved-height placeholder until it scrolls within ~1.2 screens
@@ -149,26 +155,40 @@ export function LiveRefGroup(props: {
   // Result DTOs are replaced during filter/query refresh. Retain local choices
   // for stable roots and their live descendants, but discard state once a root
   // leaves this group so an old choice cannot leak into a later membership.
+  //
+  // GH #185: prune only when result-root MEMBERSHIP changes — the sole moment a
+  // stale collapse choice could leak into a new membership. `resultRootIds()` is
+  // the effect's one reactive dependency (plus `ready()`); the subtree walk below
+  // is wrapped in `untrack` so its doc.byId[...].children reads no longer
+  // subscribe this effect to every descendant. Previously they did, so any
+  // structural edit anywhere in a large reference subtree re-ran the whole
+  // O(subtree) GC walk. A key for a block deleted or moved out of the group
+  // between refreshes is never read (only mounted blocks query collapse state)
+  // and is reclaimed at the next membership change.
   createEffect(() => {
     if (!ready()) return;
-    const present = new Set<string>();
-    const visit = (id: string) => {
-      if (present.has(id)) return;
-      present.add(id);
-      for (const child of doc.byId[id]?.children ?? []) visit(child);
-    };
-    for (const root of resultRootIds()) visit(root);
-    for (const id of initialCollapsed.keys()) {
-      if (!present.has(id)) initialCollapsed.delete(id);
-    }
-    setLocalCollapsed((state) => {
-      let changed = false;
-      const next: Record<string, boolean> = {};
-      for (const [id, value] of Object.entries(state)) {
-        if (present.has(id)) next[id] = value;
-        else changed = true;
+    const roots = resultRootIds();
+    untrack(() => {
+      __livRefGroupInternals.pruneRuns += 1;
+      const present = new Set<string>();
+      const visit = (id: string) => {
+        if (present.has(id)) return;
+        present.add(id);
+        for (const child of doc.byId[id]?.children ?? []) visit(child);
+      };
+      for (const root of roots) visit(root);
+      for (const id of initialCollapsed.keys()) {
+        if (!present.has(id)) initialCollapsed.delete(id);
       }
-      return changed ? next : state;
+      setLocalCollapsed((state) => {
+        let changed = false;
+        const next: Record<string, boolean> = {};
+        for (const [id, value] of Object.entries(state)) {
+          if (present.has(id)) next[id] = value;
+          else changed = true;
+        }
+        return changed ? next : state;
+      });
     });
   });
   onCleanup(() => initialCollapsed.clear());

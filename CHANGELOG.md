@@ -8,6 +8,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+### Changed
+
+- Linked/Unlinked/query reference groups prune their per-group collapse state
+  only when the result set actually changes, instead of re-walking the entire
+  reference subtree on every structural edit anywhere inside it. Collapse
+  behavior is unchanged; large reference sections do less bookkeeping work while
+  you edit (GH #185).
+
 ### Fixed
 
 - Pages whose page-header properties came from an older version (e.g. a page that
