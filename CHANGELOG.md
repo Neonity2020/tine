@@ -24,6 +24,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   where the block sits in the graph; inline and Ctrl+K pools match Logseq's
   sizes, and autocomplete ordering uses the same Unicode (NFC) identity as the
   rest of search (GH #186).
+- Settings now scroll on narrow and mobile viewports, so lower settings are
+  reachable instead of being clipped by the modal.
 
 ## [0.6.1] - 2026-07-18
 

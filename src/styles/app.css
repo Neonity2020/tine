@@ -1646,6 +1646,12 @@ textarea {
 .settings-pane {
   flex: 1;
   min-width: 0;
+  /* min-height:0 lets this flex child shrink below its content height so the
+     body's overflow scroll actually engages. Without it, in the mobile column
+     layout (.settings-modal flex-direction:column) the pane grows to fit its
+     content and the modal's overflow:hidden clips the overflow, making lower
+     settings unreachable on narrow viewports / Android (GH: Martin). */
+  min-height: 0;
   display: flex;
   flex-direction: column;
 }
@@ -1693,6 +1699,7 @@ textarea {
 .settings-search-empty { padding: 8px; color: var(--text-muted); font-size: 13px; }
 .settings-pane-body {
   flex: 1;
+  min-height: 0;
   overflow-y: auto;
   padding: 6px 20px 18px;
 }
