@@ -14,6 +14,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   inserting a word in front of the current text — and accepting a completion now
   rewrites the whole reference instead of leaving a stray `]]`/`))`, matching
   Logseq (GH #199).
+- Linked References no longer show a redundant "1 mention" label and jump button
+  on a block that mentions the page only once; the occurrence count and
+  jump-to-occurrence controls now appear only when a block mentions the page more
+  than once, matching Logseq (GH #200).
+- Clicking a Markdown external link on Linux now opens the browser with a
+  browser-appropriate environment instead of failing with a KIOExec file error;
+  only bundle/loader environment variables are scrubbed, desktop/session state is
+  preserved (GH #195).
 - Android versions below 11 (API < 30) no longer crash on launch with an
   `UnsatisfiedLinkError` for `renameat2` (GH #192).
 - Linked and Unlinked References now match Logseq: Unicode-canonical (NFC) page

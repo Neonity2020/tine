@@ -36,7 +36,14 @@ export function OccurrenceControls(props: {
   onOccurrence: (offset: number) => void;
 }): JSX.Element {
   const total = () => props.evidence.total ?? props.evidence.occurrences.length;
+  // Logseq shows no per-block mention count or occurrence-jump controls in
+  // Linked References. For a single mention the "1 mention" label + lone "1" jump
+  // button are redundant and confusing (GH #200), so surface these controls only
+  // when a block mentions the page more than once — where jumping to a specific
+  // occurrence is actually useful. Gate on the true total (GH #137), not the
+  // capped occurrence list, so an honest ">1" is what shows the controls.
   return (
+    <Show when={total() > 1}>
     <span class="reference-occurrence-controls">
       <span class="reference-mention-count">
         {total()} {total() === 1 ? "mention" : "mentions"}
@@ -55,6 +62,7 @@ export function OccurrenceControls(props: {
         )}
       </For>
     </span>
+    </Show>
   );
 }
 
