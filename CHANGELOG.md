@@ -10,6 +10,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- Page-property backlinks (e.g. `tags:: blah`) now render their linkified value in
+  Linked References through the same renderer used in-page, instead of showing raw
+  `key:: value` markdown (GH #212).
 - Recursive and deeply nested block/page embeds and queries now stop with an
   "Embed depth is too deep" notice (OG's depth-5 guard) instead of expanding
   forever; a page can no longer embed itself (GH #206).

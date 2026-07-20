@@ -28,6 +28,13 @@ function html(node: () => JSX.Element): { html: string; text: string } {
   return out;
 }
 
+function pageRefLabels(markup: string): string[] {
+  const div = document.createElement("div");
+  div.innerHTML = markup;
+  return [...div.querySelectorAll<HTMLAnchorElement>("a.page-ref")]
+    .map((anchor) => anchor.textContent ?? "");
+}
+
 const dto = (over: Partial<BlockDto>): BlockDto => ({
   id: "x",
   raw: "TODO [#A] Ship the slice",
@@ -81,19 +88,37 @@ describe("RefBlocks task checkbox (parity with <Block>, OG block-checkbox)", () 
 });
 
 describe("RefBlocks page-property references", () => {
-  it("renders an exact synthetic page-property backlink instead of hiding it as block metadata", () => {
+  it("renders synthetic page-property backlinks as parsed keys and linkified values (GH #212)", () => {
     const out = html(() => RefBlocks({
-      page: "A",
+      page: "Books",
       blocks: [dto({
-        id: "page-property:A",
-        raw: "created:: [[Jul 13th, 2026]]",
+        id: "page-property:Books",
+        raw: "tags:: blah\nalias:: Reading\nowner:: [[Martin]]",
         page_property: true,
         marker: undefined,
         priority: undefined,
       })],
     }));
     expect(out.html).toContain("page-property-reference");
-    expect(out.text).toContain("created::");
-    expect(out.text).toContain("Jul 13th, 2026");
+    expect(out.text).toContain("tags");
+    expect(out.text).toContain("alias");
+    expect(out.text).toContain("owner");
+    expect(out.text).not.toContain("::");
+    expect(pageRefLabels(out.html)).toEqual(["blah", "Reading", "[[Martin]]"]);
+  });
+
+  it("keeps an ordinary reference block on the existing inline-rendering path", () => {
+    const out = html(() => RefBlocks({
+      page: "Books",
+      blocks: [dto({
+        id: "ordinary-reference",
+        raw: "Read [[blah]] next",
+        marker: undefined,
+        priority: undefined,
+      })],
+    }));
+    expect(out.html).not.toContain("page-property-reference");
+    expect(out.text).toBe("Read [[blah]] next");
+    expect(pageRefLabels(out.html)).toEqual(["[[blah]]"]);
   });
 });

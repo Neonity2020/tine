@@ -16,7 +16,7 @@ import { UnlinkedReferences } from "./UnlinkedReferences";
 import { QueryMacro } from "./Macro";
 import { SheetTable } from "./SheetTable";
 import { NamespaceCrumb, NamespaceHierarchy } from "./Namespace";
-import { pageProperties, aliasNames, isImplicitPageRefProperty, isQuotedPagePropertyValue, normalizeImplicitPageName, visibleBody } from "../render/block";
+import { pageProperties, aliasNames, visibleBody } from "../render/block";
 import { InlineText, PageRef } from "../render/inline";
 import { EmojiText } from "../render/emoji";
 import { journalTitle } from "../journal";
@@ -26,6 +26,7 @@ import { tagRef } from "../tags";
 import { copyGuideIntoGraph, ensureGuidePagesLoaded, isGuidePageName } from "../guide";
 import { isPropertiesOnly, splitPagePreamble } from "../editor/properties";
 import { shouldOpenTextContextMenu } from "../contextMenuPolicy";
+import { PagePropertyValue } from "./PagePropertyValue";
 
 export const FEED_PAGE = 3;
 let journalAsOfDay: number | null = null;
@@ -112,29 +113,6 @@ async function restartJournalFeed(owner: JournalsFeedOwner, retried = false): Pr
 // (OG hides it too). Other internal/metadata page props could be added here.
 const PAGE_PROPS_HIDDEN = new Set(["alias", "icon", "tine.tag-table"]);
 const TAG_TABLE_PROP = "tine.tag-table";
-
-/** Render Logseq's implicit page-reference properties without changing the
- * stored text. Bare alias/aliases/tags values become navigable, while explicit
- * inline markup, separators, spacing, custom properties, and quoted values keep
- * their authored representation. */
-function PagePropertyValue(props: { propertyKey: string; value: string; format: "md" | "org" }): JSX.Element {
-  if (!isImplicitPageRefProperty(props.propertyKey) || isQuotedPagePropertyValue(props.value)) {
-    return <InlineText text={props.value} format={props.format} />;
-  }
-  return (
-    <For each={props.value.split(/([,，])/g)}>
-      {(part) => {
-        if (part === "," || part === "，") return part;
-        const leading = part.match(/^\s*/)?.[0] ?? "";
-        const trailing = part.match(/\s*$/)?.[0] ?? "";
-        const value = part.slice(leading.length, part.length - trailing.length);
-        if (!value) return part;
-        const name = normalizeImplicitPageName(value);
-        return <>{leading}<PageRef name={name} alias={name} />{trailing}</>;
-      }}
-    </For>
-  );
-}
 
 function paneContextFromContext() {
   const ctx = useContext(PaneContext);

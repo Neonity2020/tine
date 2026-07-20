@@ -3,12 +3,13 @@
 
 import { For, Show, createMemo, type JSX } from "solid-js";
 import type { BlockDto } from "../types";
-import { visibleBody } from "../render/block";
+import { pageProperties, visibleBody } from "../render/block";
 import { facetsFromDto } from "../render/facets";
 import { taskCheckboxState } from "../markers";
 import { InlineText } from "../render/inline";
 import { formatForPage } from "../store";
 import { openBlockInSidebar } from "../ui";
+import { PagePropertyValue } from "./PagePropertyValue";
 
 // `page`/`pageKind` (where these blocks live) are threaded through so a
 // shift-click can open the block live in the sidebar.
@@ -37,10 +38,10 @@ function RefBlock(props: {
   // computed these). Ref/linked/unlinked panels render hundreds of rows; parsing each
   // was a real hot-path cost and churned the facet cache (audit P3).
   const facets = createMemo(() => facetsFromDto(props.block));
-  const lines = createMemo(() =>
-    props.block.page_property
-      ? props.block.raw.split("\n").filter((line) => line.trim().length > 0)
-      : visibleBody(props.block.raw)
+  const format = createMemo(() => formatForPage(props.page));
+  const lines = createMemo(() => visibleBody(props.block.raw));
+  const properties = createMemo(() =>
+    props.block.page_property ? pageProperties(props.block.raw, format()) : []
   );
   return (
     <div class="ls-block ref-block" classList={{ "page-property-reference": !!props.block.page_property }}>
@@ -83,16 +84,37 @@ function RefBlock(props: {
             <Show when={facets().priority}>
               <span class={`block-priority priority-${facets().priority}`}>[#{facets().priority}]</span>{" "}
             </Show>
-            <For each={lines()}>
-              {(line, i) => (
-                <>
-                  <Show when={i() > 0}>
-                    <br />
-                  </Show>
-                  <InlineText text={line} format={formatForPage(props.page)} />
-                </>
-              )}
-            </For>
+            <Show
+              when={props.block.page_property}
+              fallback={
+                <For each={lines()}>
+                  {(line, i) => (
+                    <>
+                      <Show when={i() > 0}>
+                        <br />
+                      </Show>
+                      <InlineText text={line} format={format()} />
+                    </>
+                  )}
+                </For>
+              }
+            >
+              <For each={properties()}>
+                {([key, value], i) => (
+                  <>
+                    <Show when={i() > 0}>
+                      <br />
+                    </Show>
+                    <span class="page-property-reference-row">
+                      <span class="prop-key">{key}</span>{" "}
+                      <span class="prop-value">
+                        <PagePropertyValue propertyKey={key} value={value} format={format()} />
+                      </span>
+                    </span>
+                  </>
+                )}
+              </For>
+            </Show>
           </div>
         </div>
       </div>
