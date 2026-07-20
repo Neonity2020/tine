@@ -53,7 +53,7 @@ import { shouldOpenTextContextMenu } from "../contextMenuPolicy";
 function renderMacroBody(raw: string, blockId?: string, userArgs?: string[]): JSX.Element {
   const body = raw.trimStart();
   if (/^query\b/i.test(body)) return <QueryMacro body={body} blockId={blockId} />;
-  if (/^embed\b/i.test(body)) return <EmbedMacro body={body} />;
+  if (/^embed\b/i.test(body)) return <EmbedMacro body={body} blockId={blockId} />;
   if (/^youtube-timestamp\b/i.test(body)) return <YoutubeTimestamp body={body} />;
   if (/^(video|youtube|vimeo|bilibili)\b/i.test(body)) return <VideoMacro body={body} />;
   if (/^(tweet|twitter)\b/i.test(body)) return <TweetMacro body={body} />;

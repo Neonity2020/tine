@@ -1,4 +1,4 @@
-import { For, Show, createEffect, createMemo, createResource, createSignal, createUniqueId, onCleanup, onMount, untrack, type JSX } from "solid-js";
+import { For, Show, createEffect, createMemo, createResource, createSignal, createUniqueId, onCleanup, onMount, untrack, useContext, type JSX } from "solid-js";
 import { backend } from "../backend";
 import { doc, ensurePageLoaded, formatForPage, pageByName } from "../store";
 import { Block, CollapseSurfaceContext, SurfaceContext, type CollapseSurfaceApi } from "./Block";
@@ -10,6 +10,7 @@ import { OccurrenceControls } from "./ReferenceEvidence";
 import { startEditing } from "../editorController";
 import { isBuiltinHidden, rawOffsetToVisibleOffset } from "../editor/properties";
 import { visibleBody } from "../render/block";
+import { LinkDepthContext } from "./linkDepth";
 
 // The "near the viewport" lazy-mount observer is shared app-wide (block bodies
 // use it too) — see src/lazyObserve.ts.
@@ -40,6 +41,7 @@ export function LiveRefGroup(props: {
   surface: "ref" | "query" | "embed";
   evidence?: ReferenceBlockEvidence[];
 }): JSX.Element {
+  const linkDepth = useContext(LinkDepthContext);
   const [near, setNear] = createSignal(false);
   let el: HTMLDivElement | undefined;
   onMount(() => {
@@ -202,6 +204,7 @@ export function LiveRefGroup(props: {
       <Show when={near()}>
         <CollapseSurfaceContext.Provider value={collapseSurface}>
         <SurfaceContext.Provider value={surface}>
+        <LinkDepthContext.Provider value={linkDepth + 1}>
         <For each={props.blocks.map((b) => b.id)}>
           {(id) => {
             const crumb = () => {
@@ -259,6 +262,7 @@ export function LiveRefGroup(props: {
             );
           }}
         </For>
+        </LinkDepthContext.Provider>
         </SurfaceContext.Provider>
         </CollapseSurfaceContext.Provider>
       </Show>

@@ -10,6 +10,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- Recursive and deeply nested block/page embeds and queries now stop with an
+  "Embed depth is too deep" notice (OG's depth-5 guard) instead of expanding
+  forever; a page can no longer embed itself (GH #206).
 - Pressing Enter while typing page-header properties no longer shows a validation
   error or jams later saves for that page; the transient trailing newline remains
   in the editor while the persisted header stays canonical (GH #210).

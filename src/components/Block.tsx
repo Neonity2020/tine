@@ -756,7 +756,7 @@ function Rendered(props: {
               <QueryMacro body={macro()!.inner} blockId={props.id} />
             </Match>
             <Match when={macro()!.kind === "embed"}>
-              <EmbedMacro body={macro()!.inner} />
+              <EmbedMacro body={macro()!.inner} blockId={props.id} />
             </Match>
           </Switch>
         </div>

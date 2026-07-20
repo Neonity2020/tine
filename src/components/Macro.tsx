@@ -1,8 +1,8 @@
-import { For, Show, Switch, Match, createMemo, createResource, createSignal, type JSX } from "solid-js";
+import { For, Show, Switch, Match, createMemo, createResource, createSignal, useContext, type JSX } from "solid-js";
 import { backend } from "../backend";
 import { openPageTarget, openPageAtBlock, openPageTargetInNewTab } from "../router";
-import { openPageInSidebar, openPageContextMenu, dataRev, graphEpoch, graphMeta } from "../ui";
-import { blockProperty, doc, formatForPage, formatForBlock, resolveGuidePageDto, setBlockProperty, setRaw, withUndoUnit } from "../store";
+import { openPageInSidebar, openPageContextMenu, dataRev, graphEpoch, graphMeta, pageIdentityKey } from "../ui";
+import { blockProperty, doc, formatForPage, formatForBlock, pageByName, resolveGuidePageDto, setBlockProperty, setRaw, withUndoUnit } from "../store";
 import { resolveBlockBatched } from "../resolveBatch";
 import { shouldOpenTextContextMenu } from "../contextMenuPolicy";
 import { LiveRefGroup } from "./LiveRefGroup";
@@ -29,6 +29,7 @@ import type { PageKind, RefGroup } from "../types";
 import { sharedQueryResult } from "../queryResultCache";
 import { savedDslToFriendlySearch } from "../editor/searchQuery";
 import type { QueryExecution, QueryHit } from "../types";
+import { LinkDepthContext, LinkDepthWarning, MAX_DEPTH_OF_LINKS } from "./linkDepth";
 
 const ADVANCED_RE = /\[\s*:find|:where|:find/;
 type QueryView = "search" | "list" | "table" | "board";
@@ -106,6 +107,9 @@ export function QueryMacro(props: {
   // editable).
   hideWhenEmpty?: boolean;
 }): JSX.Element {
+  const linkDepth = useContext(LinkDepthContext);
+  if (linkDepth > MAX_DEPTH_OF_LINKS) return <LinkDepthWarning />;
+
   const arg = () => props.body.replace(/^query\s*/i, "").trim();
   // Split a trailing front-matter options map ({:title … :collapsed? … :table-view? …})
   // off the query form, so builder/engine see only the form and the options drive
@@ -899,11 +903,23 @@ export function ZoteroMacro(props: { body: string }): JSX.Element {
 }
 
 // A {{embed ((uuid))}} or {{embed [[Page]]}} block.
-export function EmbedMacro(props: { body: string }): JSX.Element {
+export function EmbedMacro(props: { body: string; blockId?: string }): JSX.Element {
+  const linkDepth = useContext(LinkDepthContext);
+  if (linkDepth > MAX_DEPTH_OF_LINKS) return <LinkDepthWarning />;
+
   const target = () => props.body.replace(/^embed\s*/i, "").trim();
+  const pageTarget = () => /^\[\[([^\]]+)\]\]$/.exec(target())?.[1];
+  const selfPageEmbed = () => {
+    const sourcePage = props.blockId ? doc.byId[props.blockId]?.page : undefined;
+    const targetPage = pageTarget();
+    return !!sourcePage
+      && pageByName(sourcePage)?.kind === "page"
+      && !!targetPage
+      && pageIdentityKey(sourcePage) === pageIdentityKey(targetPage);
+  };
 
   const [data] = createResource(
-    () => `${target()} ${graphEpoch()} ${dataRev()}`,
+    () => selfPageEmbed() ? null : `${target()} ${graphEpoch()} ${dataRev()}`,
     async () => {
     const t = target();
     const blockRef = /^\(\(([^)]+)\)\)$/.exec(t);
@@ -925,8 +941,10 @@ export function EmbedMacro(props: { body: string }): JSX.Element {
 
   return (
     <div class="embed-block">
-      <Show when={data()} fallback={<div class="embed-missing">{`{{${props.body}}}`}</div>}>
-        <LiveRefGroup page={data()!.page} kind={data()!.kind} blocks={data()!.blocks} embedId={data()!.embedId} surface="embed" />
+      <Show when={!selfPageEmbed()}>
+        <Show when={data()} fallback={<div class="embed-missing">{`{{${props.body}}}`}</div>}>
+          <LiveRefGroup page={data()!.page} kind={data()!.kind} blocks={data()!.blocks} embedId={data()!.embedId} surface="embed" />
+        </Show>
       </Show>
     </div>
   );
