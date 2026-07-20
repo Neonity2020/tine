@@ -10,6 +10,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- The mobile/narrow top bar no longer pushes action buttons off-screen: the
+  workspace switcher now lives in the left-sidebar header (with a compact one-tap
+  fallback in the toolbar when the sidebar is closed), and lower-priority toolbar
+  actions collapse into a "…" overflow menu when the bar is narrow — driven by the
+  toolbar's real width (zoom/DPI-aware), so narrow desktop windows adapt too
+  (GH #205).
 - Page-property backlinks (e.g. `tags:: blah`) now render their linkified value in
   Linked References through the same renderer used in-page, instead of showing raw
   `key:: value` markdown (GH #212).

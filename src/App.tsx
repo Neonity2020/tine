@@ -10,6 +10,7 @@ const KeyedPdfViewer = lazy(() =>
 );
 import { TabBar, tabDropHighlightsPane, tabSplitPreviewSideForPane } from "./components/TabBar";
 import { WorkspaceSwitcher } from "./components/WorkspaceSwitcher";
+import { TopbarOverflowMenu } from "./components/TopbarOverflowMenu";
 import { ContextMenu } from "./components/ContextMenu";
 import { Toasts, Lightbox } from "./components/Toasts";
 import { AudioOverlay } from "./components/AudioOverlay";
@@ -508,6 +509,15 @@ export async function installMobileExternalLinkHandler(): Promise<() => void> {
 }
 
 export function App(): JSX.Element {
+  let openCalendarJump = () => {};
+  const topbarActions = {
+    calendar: () => openCalendarJump(),
+    journals: () => openJournals(),
+    theme: () => toggleTheme(),
+    rightSidebar: (trigger?: HTMLElement | null) => toggleRightSidebar(trigger),
+    back: () => goBack(),
+    forward: () => goForward(),
+  };
   // Startup debug trace (TINE_DEBUG=1 / --debug): forward UI milestones + errors
   // into the backend log so a remote "bad startup" is diagnosable in one file.
   onMount(() => void initDebug());
@@ -921,6 +931,9 @@ export function App(): JSX.Element {
           }}
         >
           <div class="left-sidebar-scroll">
+            <div class="sidebar-header workspace-sidebar-header" data-workspace-switcher-sidebar>
+              <WorkspaceSwitcher />
+            </div>
             <Show when={mobileDrawerMode()}>
               <button class="mobile-drawer-close" type="button" aria-label="Close navigation sidebar" onClick={() => dismissDrawerAndRestore("explicit")}>Close</button>
             </Show>
@@ -979,31 +992,34 @@ export function App(): JSX.Element {
               </svg>
             </button>
             <button
-              class="icon-btn"
+              class="icon-btn topbar-navigation-action"
               title="Go back"
               data-pane-focus-neutral
               disabled={!canGoBack()}
-              onClick={goBack}
+              onClick={topbarActions.back}
             >
               <svg viewBox="0 0 24 24" class="nav-icon">
                 <path d="M15 5l-7 7 7 7" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
               </svg>
             </button>
             <button
-              class="icon-btn"
+              class="icon-btn topbar-navigation-action"
               title="Go forward"
               data-pane-focus-neutral
               disabled={!canGoForward()}
-              onClick={goForward}
+              onClick={topbarActions.forward}
             >
               <svg viewBox="0 0 24 24" class="nav-icon">
                 <path d="M9 5l7 7-7 7" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
               </svg>
             </button>
           </div>
-          {/* Workspaces own the whole window context. Keep this one instance in
-              window chrome, before every pane-scoped TabBar. */}
-          <WorkspaceSwitcher />
+          {/* A collapsed sidebar has no mounted sidebar header. Keep a compact
+              one-tap workspace path in the toolbar without putting its full
+              non-shrinking label back in this no-wrap row. */}
+          <Show when={!sidebarOpen()}>
+            <WorkspaceSwitcher compact />
+          </Show>
           {/* The tab strip is a desktop feature; on a phone it only crowds the
               single-row toolbar (and its pill clips). Hide it there, keeping a
               flex spacer so the right-side icons stay pinned to the edge. */}
@@ -1015,8 +1031,8 @@ export function App(): JSX.Element {
             </Show>
           </Show>
           <div class="topbar-right">
-            <CalendarJump />
-            <button class="icon-btn" title="Journals" data-pane-focus-neutral onClick={() => openJournals()}>
+            <CalendarJump triggerClass="topbar-optional-action" onOpenReady={(open) => { openCalendarJump = open; }} />
+            <button class="icon-btn topbar-optional-action" title="Journals" data-pane-focus-neutral onClick={topbarActions.journals}>
               <svg viewBox="0 0 24 24" class="nav-icon">
                 <path d="M4 5h11a2 2 0 0 1 2 2v12H6a2 2 0 0 1-2-2V5z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" />
                 <line x1="8" y1="9" x2="14" y2="9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" />
@@ -1024,7 +1040,7 @@ export function App(): JSX.Element {
                 <path d="M17 5h3v14a2 2 0 0 1-2 2 1 1 0 0 1-1-1V5z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" />
               </svg>
             </button>
-            <button class="icon-btn" title="Toggle theme (t t)" onClick={toggleTheme}>
+            <button class="icon-btn topbar-optional-action" title="Toggle theme (t t)" onClick={topbarActions.theme}>
               <Show
                 when={theme() === "light"}
                 fallback={
@@ -1048,16 +1064,26 @@ export function App(): JSX.Element {
               </Show>
             </button>
             <button
-              class="icon-btn"
+              class="icon-btn topbar-optional-action"
               classList={{ active: rightSidebarOpen() }}
               title="Toggle right sidebar (t r)"
-              onClick={(event) => toggleRightSidebar(event.currentTarget)}
+              onClick={(event) => topbarActions.rightSidebar(event.currentTarget)}
             >
               <svg viewBox="0 0 24 24" class="nav-icon">
                 <rect x="3" y="4" width="18" height="16" rx="2" fill="none" stroke="currentColor" stroke-width="1.7" />
                 <line x1="15" y1="4" x2="15" y2="20" stroke="currentColor" stroke-width="1.7" />
               </svg>
             </button>
+            <TopbarOverflowMenu
+              onCalendar={topbarActions.calendar}
+              onJournals={topbarActions.journals}
+              onToggleTheme={topbarActions.theme}
+              onToggleRightSidebar={topbarActions.rightSidebar}
+              onBack={topbarActions.back}
+              onForward={topbarActions.forward}
+              canGoBack={canGoBack}
+              canGoForward={canGoForward}
+            />
             {/* Settings sits apart at the far right (separated by a divider) so
                 it reads as app-level config, not another content control. */}
             <span class="topbar-sep" />

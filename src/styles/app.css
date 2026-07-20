@@ -263,11 +263,16 @@ textarea {
 .topbar {
   height: var(--ls-headbar-height);
   flex: 0 0 var(--ls-headbar-height);
+  min-width: 0;
   display: flex;
   align-items: center;
   gap: 8px;
   padding: 0 14px;
   border-bottom: 1px solid var(--border-color);
+  /* Toolbar density follows the actual available inline width, including
+     browser zoom and fractional-DPI window sizes, not user-agent guesses. */
+  container-type: inline-size;
+  container-name: topbar;
 }
 .topbar-left,
 .topbar-right {
@@ -326,6 +331,10 @@ textarea {
   font-size: 12px;
 }
 .workspace-switcher-caret { flex: none; font-size: 9px; opacity: .7; }
+.workspace-switcher-compact .workspace-switcher-btn {
+  gap: 3px;
+  padding-inline: 5px;
+}
 .workspace-quick-menu,
 .workspace-menu {
   position: absolute;
@@ -427,6 +436,71 @@ textarea {
   align-self: stretch;
   margin: 6px 6px;
   background: var(--border-color);
+}
+
+/* Lower-priority toolbar actions collapse into a registry-owned popover when
+   the toolbar's REAL inline space is tight. Essentials stay inline: left
+   sidebar toggle, search, Settings, and (when shown) native window controls. */
+.topbar-overflow {
+  position: relative;
+  display: none;
+}
+.topbar-overflow-trigger {
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  line-height: 1;
+}
+.topbar-overflow-menu {
+  position: absolute;
+  z-index: 70;
+  top: calc(100% + 6px);
+  right: 0;
+  min-width: 174px;
+  padding: 4px;
+  border: 1px solid var(--border-color);
+  border-radius: 7px;
+  background: var(--bg-primary);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, .18);
+}
+.topbar-overflow-menu button {
+  display: block;
+  width: 100%;
+  min-height: 30px;
+  padding: 5px 8px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-primary);
+  text-align: left;
+  cursor: pointer;
+}
+.topbar-overflow-menu button:hover:not(:disabled),
+.topbar-overflow-menu button:focus-visible {
+  background: var(--bg-tertiary);
+}
+.topbar-overflow-menu button:disabled {
+  color: var(--text-muted);
+  cursor: default;
+}
+.topbar-overflow-sep {
+  height: 1px;
+  margin: 4px 2px;
+  background: var(--border-color);
+}
+
+@container topbar (max-width: 760px) {
+  .topbar > .tab-bar,
+  .topbar .topbar-navigation-action,
+  .topbar .topbar-optional-action {
+    display: none;
+  }
+  .topbar .topbar-right {
+    margin-left: auto;
+  }
+  .topbar .topbar-overflow {
+    display: block;
+  }
 }
 
 /* Tabs live inline in the topbar (between nav arrows and the action icons) to
@@ -1097,6 +1171,16 @@ textarea {
 
 .sidebar-header {
   padding: 4px 8px 10px;
+}
+
+/* Window-level workspaces belong with the other low-frequency sidebar context
+   controls, above the graph switcher and navigation tree. */
+.workspace-sidebar-header {
+  padding: 12px 16px 2px;
+}
+.workspace-sidebar-header .workspace-switcher,
+.workspace-sidebar-header .workspace-switcher-btn {
+  width: 100%;
 }
 
 .app-logo {

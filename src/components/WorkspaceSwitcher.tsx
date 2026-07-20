@@ -16,7 +16,7 @@ import {
 
 type EditState = { kind: "new"; value: string } | { kind: "rename"; id: string; value: string };
 
-export function WorkspaceSwitcher(): JSX.Element {
+export function WorkspaceSwitcher(props: { compact?: boolean } = {}): JSX.Element {
   let root: HTMLDivElement | undefined;
   let editInput: HTMLInputElement | undefined;
   const [hoverOpen, setHoverOpen] = createSignal(false);
@@ -84,7 +84,9 @@ export function WorkspaceSwitcher(): JSX.Element {
   return (
     <div
       class="workspace-switcher"
+      classList={{ "workspace-switcher-compact": props.compact === true }}
       data-workspace-switcher
+      data-workspace-switcher-compact={props.compact ? "true" : undefined}
       ref={root}
       onMouseEnter={() => { if (!menuOpen() && workspaces().length) setHoverOpen(true); }}
       onMouseLeave={() => setHoverOpen(false)}
@@ -103,9 +105,11 @@ export function WorkspaceSwitcher(): JSX.Element {
         }}
       >
         <span class="workspace-switcher-mark" aria-hidden="true">W</span>
-        <span class="workspace-switcher-name">
-          <EmojiText text={active() ? workspaceDisplayName(active()!) : "Workspace"} />
-        </span>
+        <Show when={!props.compact}>
+          <span class="workspace-switcher-name">
+            <EmojiText text={active() ? workspaceDisplayName(active()!) : "Workspace"} />
+          </span>
+        </Show>
         <span class="workspace-switcher-caret" aria-hidden="true">▾</span>
       </button>
 

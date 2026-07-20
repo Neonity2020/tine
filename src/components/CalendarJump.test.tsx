@@ -34,6 +34,21 @@ function lowerSentinel(id: string) {
 }
 
 describe("CalendarJump transient ownership", () => {
+  it("exposes the same date-picker opener for a compact toolbar parent", async () => {
+    let openFromOverflow: (() => void) | undefined;
+    const root = document.createElement("div");
+    document.body.append(root);
+    vi.spyOn(backend(), "journalContentDays").mockResolvedValue([]);
+    const dispose = render(() => <CalendarJump onOpenReady={(open) => { openFromOverflow = open; }} />, root);
+    try {
+      await vi.waitFor(() => expect(openFromOverflow).toBeTypeOf("function"));
+      openFromOverflow!();
+      await vi.waitFor(() => expect(root.querySelector(".calendar-jump-pop")).not.toBeNull());
+    } finally {
+      dispose();
+    }
+  });
+
   it.each(["escape", "back"] as const)("owns one %s rung and restores its real trigger", async (reason) => {
     const lower = lowerSentinel(`calendar-lower-${reason}`);
     const { root, dispose } = mountCalendar();
