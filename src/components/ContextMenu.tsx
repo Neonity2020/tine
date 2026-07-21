@@ -827,6 +827,21 @@ function PageMenu(props: {
     { id: "favorite-toggle", label: fav() ? "Remove from favorites" : "Add to favorites", run: () => toggleFavorite(props.name, props.pageKind) },
     { id: "copy-page-ref", label: "Copy page ref", run: () => { void backend().writeText(`[[${props.name}]]`); pushToast("Copied page ref", "success"); } },
     {
+      id: "copy-export",
+      label: "Copy / export as…",
+      run: () => {
+        const page = pageByName(props.name);
+        if (!pageTargetMatchesLoaded(target(), page)) {
+          pushToast("This page target changed; reopen the page actions menu.", "error");
+          return;
+        }
+        // OG 1.0.0 routes the page name through the same export modal used by
+        // blocks (src/main/frontend/components/page_menu.cljs:139-143). Tine's
+        // modal consumes a forest root-id list, so pass this page's exact roots.
+        openExportModal([...page!.roots]);
+      },
+    },
+    {
       id: "copy-page-markdown",
       label: "Copy page as Markdown",
       run: () => {

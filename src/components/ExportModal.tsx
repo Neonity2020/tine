@@ -16,11 +16,14 @@ import {
   type IndentStyle,
   type MaxDepth,
 } from "../editor/exportText";
+import { exportOpml } from "../editor/exportOpml";
+import { exportHtml } from "../editor/exportHtml";
 import type { Block, Format, Inline, ListItem } from "../render/ast";
 import type { BlockDto, PageDto, QueryExportResult, QueryExportSpec, RefGroup } from "../types";
 import { registerTransientLayer } from "../transientLayers";
 
 const STORE_KEY = "tine.exportOptions";
+type ExportFormat = "text" | "opml" | "html";
 
 // Persist the last-used options so the modal opens the way you left it (the
 // indent style especially — most people pick one and keep it).
@@ -46,6 +49,12 @@ const CONTENT_STYLES: { value: ExportContent; label: string; hint: string }[] = 
   { value: "source", label: "Source", hint: "the raw Markdown/Org text" },
 ];
 
+const FORMAT_STYLES: { value: ExportFormat; label: string }[] = [
+  { value: "text", label: "Text" },
+  { value: "opml", label: "OPML" },
+  { value: "html", label: "HTML" },
+];
+
 const INDENT_STYLES: { value: IndentStyle; label: string; hint: string }[] = [
   { value: "dashes", label: "Dashes", hint: "Logseq outline (- bullets)" },
   { value: "spaces", label: "Spaces", hint: "indent, no bullets" },
@@ -55,10 +64,13 @@ const INDENT_STYLES: { value: IndentStyle; label: string; hint: string }[] = [
 const MAX_DEPTHS: MaxDepth[] = ["all", 1, 2, 3, 4, 5, 6, 7, 8, 9];
 
 // `sourceOnly` toggles are moot in rendered mode (the markers are already gone).
-const TOGGLES: { key: keyof ExportOptions; label: string; sourceOnly?: boolean; renderedOnly?: boolean }[] = [
+type ExportToggle = { key: keyof ExportOptions; label: string; sourceOnly?: boolean; renderedOnly?: boolean };
+const COMMON_TOGGLES: ExportToggle[] = [
   { key: "stripLinks", label: "[[links]] → text" },
   { key: "removeEmphasis", label: "Remove emphasis", sourceOnly: true },
   { key: "removeTags", label: "Remove #tags" },
+];
+const TEXT_TOGGLES: ExportToggle[] = [
   { key: "removeProperties", label: "Remove properties" },
   { key: "newlineAfterBlock", label: "Newline after block" },
   { key: "resolveRefsFully", label: "Resolve refs fully", renderedOnly: true },
@@ -343,9 +355,9 @@ export async function warmExportResolutions(nodes: ExportNode[], warmed: Map<str
   );
 }
 
-// "Copy / Export" modal — live-preview text export of a block subtree or a
-// multi-block selection, with indent-style + remove options (mirrors OG Logseq's
-// export dialog). Read-only preview; Copy writes to the clipboard.
+// "Copy / Export" modal — live-preview Text/OPML/HTML export of a block forest,
+// with per-format controls mirroring OG Logseq's dialog. Read-only preview;
+// Copy writes the currently selected serializer payload to the clipboard.
 export function ExportModal(): JSX.Element {
   return (
     <Show when={exportModal()}>
@@ -361,6 +373,7 @@ function Modal(props: { ids: string[] }): JSX.Element {
     onCleanup(unregister);
   });
   const [opts, setOpts] = createSignal<ExportOptions>(loadOptions());
+  const [format, setFormat] = createSignal<ExportFormat>("text");
   const [warmRev, setWarmRev] = createSignal(0);
   const [warming, setWarming] = createSignal(false);
   const warmedMacros = new Map<string, WarmedMacro>();
@@ -391,8 +404,10 @@ function Modal(props: { ids: string[] }): JSX.Element {
     }
     return resolveExportMacro(name, args);
   };
-  const text = createMemo(() => {
+  const payload = createMemo(() => {
     warmRev();
+    if (format() === "opml") return exportOpml(nodes, opts());
+    if (format() === "html") return exportHtml(nodes, opts());
     return exportOutline(nodes, {
       ...opts(),
       typographicGlyphs: typographyMode() === "render",
@@ -402,8 +417,8 @@ function Modal(props: { ids: string[] }): JSX.Element {
   });
 
   const copy = () => {
-    if (opts().content === "rendered" && warming()) return;
-    void backend().writeText(text());
+    if (format() === "text" && opts().content === "rendered" && warming()) return;
+    void backend().writeText(payload());
     pushToast("Copied to clipboard", "success");
     closeExportModal();
   };
@@ -431,11 +446,13 @@ function Modal(props: { ids: string[] }): JSX.Element {
     onCleanup(() => window.removeEventListener("keydown", onKey, true));
   });
 
-  const toggleDisabled = (t: (typeof TOGGLES)[number]) =>
-    (t.sourceOnly && opts().content === "rendered") || (t.renderedOnly && opts().content !== "rendered");
-  const toggleTitle = (t: (typeof TOGGLES)[number]) => {
-    if (t.sourceOnly && opts().content === "rendered") return "Rendered text has no markup markers";
-    if (t.renderedOnly && opts().content !== "rendered") return "Only applies to rendered text";
+  const visibleToggles = () => format() === "text" ? [...COMMON_TOGGLES, ...TEXT_TOGGLES] : COMMON_TOGGLES;
+  const toggleDisabled = (t: ExportToggle) =>
+    format() === "text"
+      && ((t.sourceOnly && opts().content === "rendered") || (t.renderedOnly && opts().content !== "rendered"));
+  const toggleTitle = (t: ExportToggle) => {
+    if (format() === "text" && t.sourceOnly && opts().content === "rendered") return "Rendered text has no markup markers";
+    if (format() === "text" && t.renderedOnly && opts().content !== "rendered") return "Only applies to rendered text";
     return undefined;
   };
 
@@ -447,39 +464,59 @@ function Modal(props: { ids: string[] }): JSX.Element {
           Copy / export <span class="export-count">{blockCount} block{blockCount === 1 ? "" : "s"}</span>
         </div>
 
-        <textarea class="export-preview" readonly spellcheck={false} value={text()} />
+        <textarea class="export-preview" readonly spellcheck={false} value={payload()} />
 
         <div class="export-opts">
+          {/* OG 1.0.0 exposes Text/OPML/HTML together at
+              src/main/frontend/components/export.cljs:148-162. */}
           <div class="export-opt-row export-indent">
-            <span class="export-opt-label">Content</span>
-            <For each={CONTENT_STYLES}>
+            <span class="export-opt-label">Format</span>
+            <For each={FORMAT_STYLES}>
               {(s) => (
                 <button
                   class="export-indent-btn"
-                  classList={{ active: opts().content === s.value }}
-                  title={s.hint}
-                  onClick={() => update({ content: s.value })}
+                  classList={{ active: format() === s.value }}
+                  onClick={() => setFormat(s.value)}
                 >
                   {s.label}
                 </button>
               )}
             </For>
           </div>
-          <div class="export-opt-row export-indent">
-            <span class="export-opt-label">Indent</span>
-            <For each={INDENT_STYLES}>
-              {(s) => (
-                <button
-                  class="export-indent-btn"
-                  classList={{ active: opts().indent === s.value }}
-                  title={s.hint}
-                  onClick={() => update({ indent: s.value })}
-                >
-                  {s.label}
-                </button>
-              )}
-            </For>
-          </div>
+          <Show when={format() === "text"}>
+            {/* OG keeps content indentation, property, and newline controls
+                Text-only (components/export.cljs:190-206,240-260). */}
+            <div class="export-opt-row export-indent">
+              <span class="export-opt-label">Content</span>
+              <For each={CONTENT_STYLES}>
+                {(s) => (
+                  <button
+                    class="export-indent-btn"
+                    classList={{ active: opts().content === s.value }}
+                    title={s.hint}
+                    onClick={() => update({ content: s.value })}
+                  >
+                    {s.label}
+                  </button>
+                )}
+              </For>
+            </div>
+            <div class="export-opt-row export-indent">
+              <span class="export-opt-label">Indent</span>
+              <For each={INDENT_STYLES}>
+                {(s) => (
+                  <button
+                    class="export-indent-btn"
+                    classList={{ active: opts().indent === s.value }}
+                    title={s.hint}
+                    onClick={() => update({ indent: s.value })}
+                  >
+                    {s.label}
+                  </button>
+                )}
+              </For>
+            </div>
+          </Show>
           <label class="export-opt-row export-indent">
             <span class="export-opt-label">Level ≤</span>
             <select
@@ -495,7 +532,9 @@ function Modal(props: { ids: string[] }): JSX.Element {
             </select>
           </label>
           <div class="export-opt-row export-toggles">
-            <For each={TOGGLES}>
+            {/* Cleanup + depth are shared by Text/OPML/HTML in OG
+                (components/export.cljs:207-238,262-275). */}
+            <For each={visibleToggles()}>
               {(t) => (
                 <label
                   class="export-toggle"
@@ -517,8 +556,12 @@ function Modal(props: { ids: string[] }): JSX.Element {
 
         <div class="export-foot">
           <button class="export-btn-secondary" onClick={closeExportModal}>Close</button>
-          <button class="export-btn-primary" disabled={opts().content === "rendered" && warming()} onClick={copy}>
-            {opts().content === "rendered" && warming() ? "Resolving..." : "Copy"}
+          <button
+            class="export-btn-primary"
+            disabled={format() === "text" && opts().content === "rendered" && warming()}
+            onClick={copy}
+          >
+            {format() === "text" && opts().content === "rendered" && warming() ? "Resolving..." : "Copy"}
           </button>
         </div>
       </div>

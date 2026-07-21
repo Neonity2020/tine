@@ -4,7 +4,13 @@ import type { JSX } from "solid-js";
 import { ContextMenu, deletePageMenuLabel, pageMenuAvailability } from "./ContextMenu";
 import { initParser } from "../render/parse";
 import { blockProperty, resetStore, setDoc, type Node as StoreNode } from "../store";
-import { closeContextMenu, openContextMenu, openPageContextMenu } from "../ui";
+import {
+  closeContextMenu,
+  closeExportModal,
+  exportModal,
+  openContextMenu,
+  openPageContextMenu,
+} from "../ui";
 import { clearTransientLayersForTest, dismissTopTransient } from "../transientLayers";
 
 describe("PageMenu page-kind availability", () => {
@@ -26,6 +32,7 @@ describe("BlockMenu — convert an outline into a grid (Show children as →)", 
   afterEach(() => {
     resetStore();
     closeContextMenu();
+    closeExportModal();
     clearTransientLayersForTest();
     document.body.innerHTML = "";
   });
@@ -101,6 +108,7 @@ describe("BlockMenu — convert an outline into a grid (Show children as →)", 
       "open-new-tab",
       "favorite-toggle",
       "copy-page-ref",
+      "copy-export",
       "copy-page-markdown",
       "export-pdf",
       "show-in-folder",
@@ -133,7 +141,7 @@ describe("BlockMenu — convert an outline into a grid (Show children as →)", 
     expect(activeId()).toBe("delete-page");
     press("Home");
     expect(activeId()).toBe("open");
-    expect(menu.querySelectorAll('[role="menuitem"]')).toHaveLength(12);
+    expect(menu.querySelectorAll('[role="menuitem"]')).toHaveLength(13);
     dispose();
   });
 
@@ -186,7 +194,7 @@ describe("BlockMenu — convert an outline into a grid (Show children as →)", 
     openPageContextMenu(10, 10, "P", "page", true);
     expect(ids()).toEqual([
       "open", "open-sidebar", "open-new-tab", "favorite-toggle",
-      "copy-page-ref", "copy-page-markdown", "export-pdf",
+      "copy-page-ref", "copy-export", "copy-page-markdown", "export-pdf",
       "show-in-folder", "open-default-app",
     ]);
     closeContextMenu();
@@ -198,10 +206,23 @@ describe("BlockMenu — convert an outline into a grid (Show children as →)", 
     openPageContextMenu(10, 10, "2000-01-01", "journal", true);
     expect(ids()).toEqual([
       "open", "open-sidebar", "open-new-tab", "favorite-toggle",
-      "copy-page-ref", "copy-page-markdown", "export-pdf",
+      "copy-page-ref", "copy-export", "copy-page-markdown", "export-pdf",
       "show-in-folder", "open-default-app", "page-properties",
       "carry-unfinished", "delete-journal",
     ]);
+    dispose();
+  });
+
+  it("opens the shared export modal with the page root forest and preserves page Markdown/PDF actions", () => {
+    load();
+    const dispose = mount(() => <ContextMenu />);
+
+    openPageContextMenu(10, 10, "P", "page", true);
+    expect(menuLabels()).toContain("Copy page as Markdown");
+    expect(menuLabels()).toContain("Export to PDF…");
+    document.querySelector<HTMLButtonElement>('[data-page-action-id="copy-export"]')!.click();
+
+    expect(exportModal()).toEqual({ ids: ["parent", "leaf"] });
     dispose();
   });
 

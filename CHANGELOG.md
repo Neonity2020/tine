@@ -18,6 +18,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 - The Copy/export modal gained Logseq's **maximum-depth control** (`Level ≤`
   all/1..9): descendants deeper than the selected level are omitted from the
   exported text, in both Rendered and Source modes.
+- **OPML and HTML export**, like Logseq: the Copy/export modal now offers
+  Text/OPML/HTML for a block selection, and the **page menu gained
+  "Copy / export as…"** opening the same dialog for the whole page. Each format
+  shows Logseq's option set (cleanup + max depth for OPML/HTML; the full set
+  for Text); OPML/HTML always omit property lines.
 
 ### Fixed
 
