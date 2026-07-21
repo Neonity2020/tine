@@ -54,6 +54,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- The `/Today` command now inserts the date in the journal date format your
+  graph is configured with (`:journal/page-title-format`) instead of always
+  `MMM do, yyyy`, so the link points at the actual journal page (GH #220).
 - PDF annotation files written by Tine now match Logseq's exact field shape
   (text highlights omit the empty `:image` key; area highlights write
   Logseq's `"[:span]"` text sentinel), so a graph annotated in Tine looks

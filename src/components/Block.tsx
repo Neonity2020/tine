@@ -128,6 +128,7 @@ import { MEDIA_EDITORS } from "../mediaEditors";
 import { resolveMediaEditorCommand } from "../mediaEditorSettings";
 import { refreshAssetOnReturn } from "../assetRefresh";
 import { isMobilePlatform } from "../nativeChrome";
+import { journalTitle } from "../journal";
 import { calcSource, serializeCalcExitCommit, evalCalc } from "../editor/calc";
 import { QueryMacro, EmbedMacro, youtubeTimestampMacroFor } from "./Macro";
 import { workflow, zoomInto, openContextMenu, openDatePicker, openBlockInSidebar, graphMeta, dataRev, setQueryBuilderAutoOpen, openPageProps, pushToast, dismissToast, autoPairing, typographyMode, timetrackingEnabled, logbookWithSecondSupport, blockReferencesRequest, documentMode, docModeEnterForNewBlock } from "../ui";
@@ -1001,26 +1002,6 @@ function CalGlyph(): JSX.Element {
 function timeStamp(d = new Date()): string {
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 }
-// Today's journal page name in the default "MMM do, yyyy" title format the app
-// uses (matches logseq-core's JournalDate::title), so [[Today]] resolves.
-function todayJournalName(d = new Date()): string {
-  const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-  const n = d.getDate();
-  const a = n % 10;
-  const b = n % 100;
-  const suffix =
-    (a === 1 && b === 11) || (a === 2 && b === 12) || (a === 3 && b === 13)
-      ? "th"
-      : a === 1
-        ? "st"
-        : a === 2
-          ? "nd"
-          : a === 3
-            ? "rd"
-            : "th";
-  return `${months[d.getMonth()]} ${n}${suffix}, ${d.getFullYear()}`;
-}
-
 // Template support: session-cached list of templates, dynamic-var substitution,
 // and DTO→outline conversion for insertion.
 let templateCache: import("../types").TemplateDto[] | null = null;
@@ -2112,7 +2093,9 @@ export function Editor(props: { id: string }): JSX.Element {
         return;
       }
       case "today":
-        replaceTrigger(pageInsert(todayJournalName()));
+        // GH #220: the link must use the graph's configured journal title
+        // format, or it points at a page that isn't the journal day.
+        replaceTrigger(pageInsert(journalTitle(new Date())));
         return;
       case "upload-asset":
         replaceTrigger(""); // drop the "/upload" trigger text
