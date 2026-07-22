@@ -300,7 +300,7 @@ try {
   await browser.keys(["ArrowDown"]);
   await browser.keys(["Shift", "Enter"]);
   const duplicateBlockSurface = `[data-sidebar-surface="sidebar:block:${NONCANONICAL_BLOCK_ID}"]`;
-  await browser.$(`${duplicateBlockSurface} .rs-item-body [data-block-id="${NONCANONICAL_BLOCK_ID}"]`).waitForExist({ timeout: 10_000 });
+  await browser.$(`${duplicateBlockSurface} .rs-item-body [data-block-ref="${NONCANONICAL_BLOCK_ID}"]`).waitForExist({ timeout: 10_000 });
   const duplicateBlockText = await browser.$(`${duplicateBlockSurface} .rs-item-body`).getText();
   if (!duplicateBlockText.includes(NONCANONICAL_BLOCK_QUERY)) {
     throw new Error(`noncanonical block sidebar body was ${JSON.stringify(duplicateBlockText)}`);
@@ -349,7 +349,7 @@ try {
   await expectMainRoute(browser, MAIN_PAGE, "Shift-Enter block activation navigated the main route");
   const blockSurface = `[data-sidebar-surface="sidebar:block:${BLOCK_ID}"]`;
   await browser.$(blockSurface).waitForExist({ timeout: 10_000 });
-  await browser.$(`${blockSurface} .rs-item-body [data-block-id="${BLOCK_ID}"]`).waitForExist({ timeout: 10_000 });
+  await browser.$(`${blockSurface} .rs-item-body [data-block-ref="${BLOCK_ID}"]`).waitForExist({ timeout: 10_000 });
   const blockSidebarText = await browser.$(`${blockSurface} .rs-item-body`).getText();
   if (!blockSidebarText.includes(BLOCK_QUERY)) throw new Error(`sidebar block body was ${JSON.stringify(blockSidebarText)}`);
   receipt.observations.blockSidebar = {
@@ -361,7 +361,7 @@ try {
 
   // 3. Current-page search includes a descendant hidden by source collapse but
   // excludes the identical block on another page and all global providers.
-  if (await browser.$(`[data-block-id="${CURRENT_BLOCK_ID}"]`).isExisting()) {
+  if (await browser.$(`[data-block-ref="${CURRENT_BLOCK_ID}"]`).isExisting()) {
     throw new Error("collapsed descendant was already mounted before current-page search");
   }
   await openSwitcher(browser, ["Control", "Shift", "k"], "Search blocks in current page…");

@@ -1394,7 +1394,7 @@ try {
     action?.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, view: window }));
   });
   await browser.waitUntil(() => browser.execute((highlightId) => {
-    const block = document.querySelector(`.ls-block[data-block-id="${highlightId}"]`);
+    const block = document.querySelector(`.ls-block[data-block-ref="${highlightId}"]`);
     return block?.querySelector(".block-references")?.textContent?.includes("First sample annotation") ?? false;
   }, SAMPLE_ID), {
     timeout: 10_000,
