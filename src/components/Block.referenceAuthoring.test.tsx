@@ -118,10 +118,12 @@ describe("reference authoring", () => {
     }
   });
 
-  it.each([
+  const blockReferenceCases: Array<[string, [string, string][] | undefined, string]> = [
     ["authored id", [["id", "11111111-1111-4111-8111-111111111111"]], "11111111-1111-4111-8111-111111111111"],
     ["id-less fallback", undefined, "f8358fac-56bd-8bb1-ba45-bd7fd1ba2add"],
-  ] as const)("inserts the %s for an accepted block-reference suggestion", async (_case, properties, expectedId) => {
+  ];
+
+  it.each(blockReferenceCases)("inserts the %s for an accepted block-reference suggestion", async (_case, properties, expectedId) => {
     vi.spyOn(backend(), "search").mockResolvedValue([{
       page: "Source",
       kind: "page",
@@ -144,7 +146,7 @@ describe("reference authoring", () => {
       inputAt(textarea, "((test", 6);
       await vi.waitFor(() => expect(document.body.querySelector(".autocomplete .ac-label")?.textContent).toBe("test"));
       accept(textarea);
-      await vi.waitFor(() => expect(doc.byId["reference-authoring"].raw).toBe(`((${expectedId}))`));
+      await vi.waitFor(() => expect(doc.byId["reference-authoring"].raw).toBe(`((${expectedId})) `));
     } finally {
       dispose();
     }
