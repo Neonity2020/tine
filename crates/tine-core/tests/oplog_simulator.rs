@@ -3,8 +3,8 @@ use tine_core::oplog::simulator::{
     ByteMutation, DeterministicSimulator, ExpectedWorkspaceState, ExternalFileFixture,
     IngressExpectation, InvariantAssertion, InvariantPredicate, ProviderLocation, ProviderSource,
     ProviderTree, ReplicaExpectation, ScenarioError, ScenarioWorkspace, ScheduledAction,
-    ScheduledActionKind, SimulatorDeviceState, StageExpectation, WireBatch, WireBytes, WireItem,
-    MAX_PROVIDER_RESCAN_BYTES, MAX_PROVIDER_RESCAN_DEPTH,
+    ScheduledActionKind, SimulatorBlockedEvidence, SimulatorDeviceState, StageExpectation,
+    WireBatch, WireBytes, WireItem, MAX_PROVIDER_RESCAN_BYTES, MAX_PROVIDER_RESCAN_DEPTH,
 };
 use tine_core::oplog::{
     AuthorBatch, BatchId, BlockId, BlockLocation, CrdtPeerId, DeviceId, DocumentId, LineageDigest,
@@ -1660,6 +1660,7 @@ fn filesystem_rescan_reconstructs_from_disk_after_tine_crash_without_hidden_meta
     .unwrap();
 
     simulator.run().unwrap();
+    println!("{:?}", simulator.outcomes());
     let states = simulator.states().unwrap();
     let [SimulatorDeviceState::Operational(snapshot)] = states.as_slice() else {
         panic!("disk-only restart did not reconstruct an operational replica");
@@ -2477,7 +2478,7 @@ fn filesystem_provider_fixture_executes_real_transport_and_terminal_oracles() {
 }
 
 #[test]
-fn fixture_seed_corpus_is_canonical_v3_json() {
+fn fixture_seed_corpus_is_canonical_v4_json() {
     let fixtures = [
         include_str!("fixtures/oplog-simulator/object-before-manifest.scenario.json"),
         include_str!("fixtures/oplog-simulator/manifest-before-objects-and-missing.scenario.json"),
@@ -2493,10 +2494,200 @@ fn fixture_seed_corpus_is_canonical_v3_json() {
         ),
         include_str!("fixtures/oplog-simulator/moved-away-move-delete.scenario.json"),
         include_str!("fixtures/oplog-simulator/filesystem-provider-transport.scenario.json"),
+        include_str!("fixtures/oplog-simulator/page-name-conflict-restart.scenario.json"),
     ];
     for fixture in fixtures {
         let fixture = fixture.trim_end();
         let scenario = Scenario::decode(fixture.as_bytes()).unwrap();
         assert_eq!(scenario.encode().unwrap(), fixture.as_bytes());
+    }
+}
+
+fn page_name_conflict_restart_scenario() -> Scenario {
+    let ids = Ids::new();
+    let base = BatchId::from_uuid(uuid(400));
+    let left = BatchId::from_uuid(uuid(401));
+    let right = BatchId::from_uuid(uuid(402));
+    let mut actions = vec![event(
+        1,
+        ScheduledActionKind::AuthorLocal {
+            device: "alpha".into(),
+            batch_id: base,
+            session_id: SessionId::from_uuid(uuid(4_400)),
+            transaction: tx(vec![SemanticOperation::CreatePage {
+                page_id: ids.page_c,
+                home_document_id: ids.home_c,
+                name: tine_core::oplog::LogicalPageName::parse("Seed").unwrap(),
+                path: path("pages/seed.md"),
+                kind: ManagedTextKind::Page,
+            }]),
+        },
+    )];
+    let mut next = 2;
+    for index in 0..3 {
+        actions.push(event(
+            next,
+            ScheduledActionKind::DeliverItem {
+                device: "beta".into(),
+                item_id: format!("auth/{base}/object/{index}"),
+                mutation: ByteMutation::Exact,
+                expected: None,
+            },
+        ));
+        next += 1;
+    }
+    actions.push(event(
+        next,
+        ScheduledActionKind::DeliverItem {
+            device: "beta".into(),
+            item_id: format!("auth/{base}/manifest/0"),
+            mutation: ByteMutation::Exact,
+            expected: None,
+        },
+    ));
+    next += 1;
+    actions.push(event(
+        next,
+        ScheduledActionKind::ProbeBatch {
+            device: "beta".into(),
+            batch_id: base,
+            expected: Some(StageExpectation::Accepted),
+        },
+    ));
+    next += 1;
+    actions.push(event(
+        next,
+        ScheduledActionKind::AuthorLocal {
+            device: "alpha".into(),
+            batch_id: left,
+            session_id: SessionId::from_uuid(uuid(4_401)),
+            transaction: tx(vec![SemanticOperation::CreatePage {
+                page_id: ids.page_a,
+                home_document_id: ids.home_a,
+                name: tine_core::oplog::LogicalPageName::parse("Concurrent Shared").unwrap(),
+                path: path("pages/left.md"),
+                kind: ManagedTextKind::Page,
+            }]),
+        },
+    ));
+    next += 1;
+    actions.push(event(
+        next,
+        ScheduledActionKind::AuthorLocal {
+            device: "beta".into(),
+            batch_id: right,
+            session_id: SessionId::from_uuid(uuid(4_402)),
+            transaction: tx(vec![SemanticOperation::CreatePage {
+                page_id: ids.page_b,
+                home_document_id: ids.home_b,
+                name: tine_core::oplog::LogicalPageName::parse("concurrent shared").unwrap(),
+                path: path("pages/right.md"),
+                kind: ManagedTextKind::Page,
+            }]),
+        },
+    ));
+    next += 1;
+    for index in 0..3 {
+        actions.push(event(
+            next,
+            ScheduledActionKind::DeliverItem {
+                device: "alpha".into(),
+                item_id: format!("auth/{right}/object/{index}"),
+                mutation: ByteMutation::Exact,
+                expected: None,
+            },
+        ));
+        next += 1;
+    }
+    actions.push(event(
+        next,
+        ScheduledActionKind::DeliverItem {
+            device: "alpha".into(),
+            item_id: format!("auth/{right}/manifest/0"),
+            mutation: ByteMutation::Exact,
+            expected: None,
+        },
+    ));
+    next += 1;
+    actions.push(event(
+        next,
+        ScheduledActionKind::ProbeBatch {
+            device: "alpha".into(),
+            batch_id: right,
+            expected: Some(StageExpectation::Quarantined),
+        },
+    ));
+    next += 1;
+    actions.push(event(
+        next,
+        ScheduledActionKind::Crash {
+            device: "alpha".into(),
+        },
+    ));
+    next += 1;
+    actions.push(event(
+        next,
+        ScheduledActionKind::Restart {
+            device: "alpha".into(),
+        },
+    ));
+    next += 1;
+    actions.push(event(
+        next,
+        ScheduledActionKind::AssertInvariant {
+            assertion: InvariantAssertion::RestartReplay {
+                device: "alpha".into(),
+            },
+        },
+    ));
+    Scenario::from_schedule(
+        "page-name-conflict-restart",
+        400,
+        ids.workspace(),
+        vec![device("alpha", 1), device("beta", 2)],
+        Vec::new(),
+        Vec::new(),
+        actions,
+        Vec::new(),
+        Vec::new(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn page_name_conflict_restart_uses_typed_durable_evidence() {
+    let scenario = page_name_conflict_restart_scenario();
+    assert_eq!(
+        scenario.encode().unwrap(),
+        include_str!("fixtures/oplog-simulator/page-name-conflict-restart.scenario.json")
+            .trim_end()
+            .as_bytes()
+    );
+    let mut simulator = DeterministicSimulator::new(scenario).unwrap();
+    simulator.run().unwrap();
+    let states = simulator.states().unwrap();
+    assert!(states.into_iter().any(|state| matches!(
+        state,
+        SimulatorDeviceState::Blocked(SimulatorBlockedEvidence::PageName(evidence))
+            if !evidence.is_empty()
+    )));
+}
+
+#[test]
+fn scenario_decode_rejects_prior_v3_and_future_v5() {
+    for version in [3, 5] {
+        let bytes = format!(
+            "{{\"scenario_schema_version\":{version},\"family\":\"version-gate\",\"seed\":1,\
+             \"workspace\":{{\"workspace_id\":\"00000000-0000-0000-0000-000000000001\",\
+             \"lineage_digest\":\"594b2ffe782f7984a7a1de511368306d352f22e6b3c0a67f73faf31b7bcb8c33\",\
+             \"catalog_document_id\":\"00000000-0000-0000-0000-000000000002\"}},\
+             \"devices\":[{{\"name\":\"alpha\",\"device_id\":\"00000000-0000-0000-0000-0000000003e9\",\
+             \"crdt_peer_id\":1}}],\"wire_batches\":[],\"initial_replicas\":[],\"actions\":[],\
+             \"terminal\":[],\"external_files\":[]}}"
+        );
+        assert!(
+            Scenario::decode(bytes.as_bytes()).is_err(),
+            "accepted v{version}"
+        );
     }
 }

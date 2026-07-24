@@ -3702,6 +3702,19 @@ mod tests {
         let mut corrupt = encoded.clone();
         *corrupt.last_mut().unwrap() ^= 0x80;
         assert!(PageNameConflictEvidenceV1::decode(&corrupt).is_err());
+        let canonical_binding = super::super::object_store::PageNameDurableBinding {
+            ownership_root: root.clone(),
+            conflicts: vec![evidence.clone()],
+        };
+        canonical_binding.validate().unwrap();
+        let duplicate_binding = super::super::object_store::PageNameDurableBinding {
+            ownership_root: root.clone(),
+            conflicts: vec![evidence.clone(), evidence.clone()],
+        };
+        assert!(matches!(
+            duplicate_binding.validate(),
+            Err(StoreError::MalformedHistoryIndex)
+        ));
         let mut prior = evidence.clone();
         prior.schema_version = 0;
         assert!(matches!(

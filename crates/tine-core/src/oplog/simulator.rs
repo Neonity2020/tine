@@ -35,14 +35,17 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::object_store::{ensure_directory_nofollow, open_dir_nofollow, sync_dir_required};
+use super::page_name_index::PageNameConflictEvidenceV1;
 use super::{
     AuthorBatch, BatchDisposition, BatchId, BatchInspection, CanonicalSnapshot, CrdtPeerId,
     DeviceId, DocumentId, EngineError, EngineStatus, ImmutableHomeEvidence, LineageDigest,
-    ObjectStore, OperationTransaction, SemanticOperation, SessionId, ShardedHotEngine,
-    StageOutcome, WorkspaceId, WorkspaceStatus,
+    ObjectStore, OperationTransaction, ProjectionEndpointBinding, ProjectionEndpointId,
+    ProjectionReceiptStore, SemanticOperation, SessionId, ShardedHotEngine, StageOutcome,
+    WorkspaceId, WorkspaceStatus,
 };
+use crate::Graph;
 
-pub const SCENARIO_SCHEMA_VERSION: u32 = 3;
+pub const SCENARIO_SCHEMA_VERSION: u32 = 4;
 pub const MAX_SCENARIO_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_SCENARIO_ACTIONS: usize = 16_384;
 pub const MAX_SCENARIO_DEVICES: usize = 8;
@@ -216,7 +219,7 @@ pub struct InitialReplica {
 #[serde(rename_all = "snake_case")]
 pub enum ExpectedWorkspaceState {
     Operational,
-    Blocked { evidence: ImmutableHomeEvidence },
+    Blocked { evidence: SimulatorBlockedEvidence },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -227,6 +230,45 @@ pub struct ReplicaExpectation {
     pub state: ExpectedWorkspaceState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<CanonicalSnapshot>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "evidence", rename_all = "snake_case")]
+pub enum SimulatorBlockedEvidence {
+    ImmutableHome(ImmutableHomeEvidence),
+    PageName(Vec<PageNameConflictEvidenceV1>),
+}
+
+impl SimulatorBlockedEvidence {
+    fn validate(&self) -> Result<(), ScenarioError> {
+        if let Self::PageName(evidence) = self {
+            let digests = evidence
+                .iter()
+                .map(PageNameConflictEvidenceV1::digest)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| ScenarioError::InvalidReplica)?;
+            if evidence.is_empty() || digests.windows(2).any(|pair| pair[0] >= pair[1]) {
+                return Err(ScenarioError::InvalidReplica);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for SimulatorBlockedEvidence {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ImmutableHome(evidence) => write!(f, "immutable-home:{evidence}"),
+            Self::PageName(evidence) => {
+                f.write_str("page-name")?;
+                for conflict in evidence {
+                    let digest = conflict.digest().map_err(|_| fmt::Error)?;
+                    write!(f, ":{digest}")?;
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 impl ReplicaExpectation {
@@ -1009,7 +1051,7 @@ impl FailureCapsule {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SimulatorDeviceState {
     Operational(CanonicalSnapshot),
-    Blocked(ImmutableHomeEvidence),
+    Blocked(SimulatorBlockedEvidence),
 }
 
 #[derive(Clone)]
@@ -3518,6 +3560,7 @@ impl ProviderRetryJournal {
 
 struct DeviceRuntime {
     name: String,
+    device_id: DeviceId,
     root: PathBuf,
     store: Option<ObjectStore>,
     engine: Option<ShardedHotEngine>,
@@ -3527,6 +3570,38 @@ struct DeviceRuntime {
 }
 
 impl DeviceRuntime {
+    fn open_durable_engine(
+        root: &Path,
+        archive_path: &Path,
+        device_id: DeviceId,
+        workspace: &ScenarioWorkspace,
+    ) -> Result<ShardedHotEngine, ScenarioError> {
+        let graph_path = root.join("projection-graph");
+        fs::create_dir_all(&graph_path).map_err(|error| ScenarioError::Io(error.to_string()))?;
+        let graph = Graph::open(&graph_path);
+        let binding = ProjectionEndpointBinding::enroll_graph(
+            &graph,
+            ProjectionEndpointId::from_uuid(device_id.as_uuid()),
+            device_id,
+        )
+        .map_err(|error| ScenarioError::Engine(error.to_string()))?;
+        let receipts = ProjectionReceiptStore::open_for_endpoint(
+            &root.join("projection-receipts"),
+            workspace.workspace_id,
+            binding,
+        )
+        .map_err(|error| ScenarioError::Engine(error.to_string()))?;
+        let engine_store = ObjectStore::open(archive_path, workspace.workspace_id)
+            .map_err(|error| ScenarioError::Store(error.to_string()))?;
+        Ok(ShardedHotEngine::with_enrolled_projection(
+            engine_store,
+            workspace.lineage_digest,
+            workspace.catalog_document_id,
+            &graph,
+            &receipts,
+        ))
+    }
+
     fn open(
         root: PathBuf,
         identity: &ScenarioDevice,
@@ -3536,17 +3611,13 @@ impl DeviceRuntime {
         let archive_path = root.join("archive");
         let store = ObjectStore::open(&archive_path, workspace.workspace_id)
             .map_err(|error| ScenarioError::Store(error.to_string()))?;
-        let engine_store = ObjectStore::open(&archive_path, workspace.workspace_id)
-            .map_err(|error| ScenarioError::Store(error.to_string()))?;
-        let engine = ShardedHotEngine::with_archive_store(
-            engine_store,
-            workspace.lineage_digest,
-            workspace.catalog_document_id,
-        );
+        let engine =
+            Self::open_durable_engine(&root, &archive_path, identity.device_id, workspace)?;
         let provider = ProviderRuntime::open(root.join("provider"))?;
         let provider_journal = ProviderRetryJournal::open(root.join("provider-local-journal"))?;
         Ok(Self {
             name: identity.name.clone(),
+            device_id: identity.device_id,
             root,
             store: Some(store),
             engine: Some(engine),
@@ -3604,20 +3675,28 @@ impl DeviceRuntime {
         let manifests = store
             .committed_manifests()
             .map_err(|error| ScenarioError::Store(error.to_string()))?;
-        let engine_store = ObjectStore::open(&self.archive_path(), workspace.workspace_id)
-            .map_err(|error| ScenarioError::Store(error.to_string()))?;
-        let mut engine = ShardedHotEngine::with_archive_store(
-            engine_store,
-            workspace.lineage_digest,
-            workspace.catalog_document_id,
-        );
+        let mut engine =
+            Self::open_durable_engine(&self.root, &self.archive_path(), self.device_id, workspace)?;
         let mut outcomes = Vec::new();
-        for manifest in manifests {
-            outcomes.push(
-                engine
-                    .stage_archive_batch(manifest.batch_id())
-                    .map_err(|error| ScenarioError::Engine(error.to_string()))?,
+        // Terminal state, including typed page-name evidence, is restored
+        // solely from authenticated durable history. Operational replicas
+        // still replay their wider CRDT hot state because P2N2 does not own
+        // general document-state recovery.
+        if matches!(engine.status().workspace(), WorkspaceStatus::Operational) {
+            let replay_store = ObjectStore::open(&self.archive_path(), workspace.workspace_id)
+                .map_err(|error| ScenarioError::Store(error.to_string()))?;
+            engine = ShardedHotEngine::with_archive_store(
+                replay_store,
+                workspace.lineage_digest,
+                workspace.catalog_document_id,
             );
+            for manifest in manifests {
+                outcomes.push(
+                    engine
+                        .stage_archive_batch(manifest.batch_id())
+                        .map_err(|error| ScenarioError::Engine(error.to_string()))?,
+                );
+            }
         }
         self.store = Some(store);
         self.engine = Some(engine);
@@ -4945,7 +5024,7 @@ struct DeviceObservation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum OfferedState {
     Operational(Vec<BatchId>),
-    Blocked(ImmutableHomeEvidence),
+    Blocked(SimulatorBlockedEvidence),
 }
 
 fn observation_from_engine(
@@ -4972,9 +5051,14 @@ fn observation_from_engine(
                 .canonical_snapshot()
                 .map_err(|error| ScenarioError::Engine(error.to_string()))?,
         ),
-        WorkspaceStatus::Blocked(_) => {
-            SimulatorDeviceState::Blocked(collect_fatal_evidence(engine)?)
+        WorkspaceStatus::Blocked(_) if !engine.page_name_conflicts().is_empty() => {
+            let evidence = SimulatorBlockedEvidence::PageName(engine.page_name_conflicts());
+            evidence.validate()?;
+            SimulatorDeviceState::Blocked(evidence)
         }
+        WorkspaceStatus::Blocked(_) => SimulatorDeviceState::Blocked(
+            SimulatorBlockedEvidence::ImmutableHome(collect_fatal_evidence(engine)?),
+        ),
     };
     Ok(DeviceObservation {
         accepted,
@@ -5163,6 +5247,9 @@ fn validate_replica_expectation(
     }
     if !strictly_sorted(&replica.expected.accepted) || !strictly_sorted(&replica.expected.offered) {
         return Err(ScenarioError::InvalidReplica);
+    }
+    if let ExpectedWorkspaceState::Blocked { evidence } = &replica.expected.state {
+        evidence.validate()?;
     }
     Ok(())
 }

@@ -5191,6 +5191,118 @@ fn durable_terminal_portable_latch_blocks_projection_state_after_restart() {
 }
 
 #[test]
+fn durable_page_name_latch_restores_typed_evidence_without_legacy_fatal_evidence() {
+    let ids = Ids::new();
+    let dir = TestDir::new("page-name-terminal-restart");
+    let archive_path = dir.path().join("archive");
+    let graph_path = dir.path().join("graph");
+    std::fs::create_dir(&graph_path).unwrap();
+    let graph = Graph::open(&graph_path);
+    let binding = ProjectionEndpointBinding::enroll_graph(
+        &graph,
+        ProjectionEndpointId::from_uuid(uuid(40_260)),
+        DeviceId::from_uuid(uuid(40_261)),
+    )
+    .unwrap();
+    let receipts = ProjectionReceiptStore::open_for_endpoint(
+        &dir.path().join("receipts"),
+        ids.workspace,
+        binding,
+    )
+    .unwrap();
+    let writer = ObjectStore::open(&archive_path, ids.workspace).unwrap();
+    let baseline = ids
+        .engine()
+        .prepare_bootstrap_transaction(
+            author(40_262, 40_262),
+            &tx(vec![SemanticOperation::CreatePage {
+                page_id: ids.page_c,
+                home_document_id: ids.home_c,
+                name: tine_core::oplog::LogicalPageName::parse("Baseline").unwrap(),
+                path: path("pages/baseline.md"),
+                kind: ManagedTextKind::Page,
+            }]),
+        )
+        .unwrap();
+    let baseline = ready(&writer, &baseline);
+    let mut left_author = ids.engine();
+    let mut right_author = ids.engine();
+    left_author.stage_ready(baseline.clone());
+    right_author.stage_ready(baseline.clone());
+    let left = left_author
+        .prepare_bootstrap_transaction(
+            author(40_263, 40_263),
+            &tx(vec![SemanticOperation::CreatePage {
+                page_id: ids.page_a,
+                home_document_id: ids.home_a,
+                name: tine_core::oplog::LogicalPageName::parse("Shared Name").unwrap(),
+                path: path("pages/left-distinct.md"),
+                kind: ManagedTextKind::Page,
+            }]),
+        )
+        .unwrap();
+    let right = right_author
+        .prepare_bootstrap_transaction(
+            author(40_264, 40_264),
+            &tx(vec![SemanticOperation::CreatePage {
+                page_id: ids.page_b,
+                home_document_id: ids.home_b,
+                name: tine_core::oplog::LogicalPageName::parse("shared name").unwrap(),
+                path: path("pages/right-distinct.md"),
+                kind: ManagedTextKind::Page,
+            }]),
+        )
+        .unwrap();
+    writer.publish_prepared(&left).unwrap();
+    writer.publish_prepared(&right).unwrap();
+
+    let mut engine = ShardedHotEngine::with_enrolled_projection(
+        ObjectStore::open(&archive_path, ids.workspace).unwrap(),
+        ids.lineage,
+        ids.catalog,
+        &graph,
+        &receipts,
+    );
+    for batch_id in [baseline.manifest().batch_id(), left.manifest().batch_id()] {
+        assert!(matches!(
+            engine.stage_archive_batch(batch_id).unwrap().disposition(),
+            BatchDisposition::Accepted { .. }
+        ));
+    }
+    assert!(matches!(
+        engine
+            .stage_archive_batch(right.manifest().batch_id())
+            .unwrap()
+            .disposition(),
+        BatchDisposition::Quarantined
+    ));
+    let root = engine.page_name_index_root().clone();
+    let evidence = engine.page_name_conflicts();
+    assert!(!evidence.is_empty());
+    assert!(engine.fatal_evidence().is_none());
+    assert!(engine.fatal_evidence_handle().is_none());
+    assert!(engine.fatal_evidence_page(None, 1).unwrap().is_none());
+    drop(engine);
+
+    let recovery = ShardedHotEngine::with_enrolled_projection(
+        ObjectStore::open(&archive_path, ids.workspace).unwrap(),
+        ids.lineage,
+        ids.catalog,
+        &graph,
+        &receipts,
+    );
+    assert_eq!(recovery.page_name_index_root(), &root);
+    assert_eq!(recovery.page_name_conflicts(), evidence);
+    assert!(matches!(
+        recovery.status().workspace(),
+        WorkspaceStatus::Blocked(_)
+    ));
+    assert!(recovery.fatal_evidence().is_none());
+    assert!(recovery.fatal_evidence_handle().is_none());
+    assert!(recovery.fatal_evidence_page(None, 1).unwrap().is_none());
+}
+
+#[test]
 fn sequential_duplicates_reject_before_batch_and_atomic_swap_and_causal_reuse_succeed() {
     let ids = Ids::new();
     let dir = TestDir::new("portable-sequential-swap-reuse");

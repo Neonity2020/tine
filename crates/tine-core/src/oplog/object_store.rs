@@ -50,7 +50,7 @@ const ENGINE_HISTORY_ROOTS_DIR: &str = "roots";
 const ENGINE_HISTORY_CLAIM_FILE: &str = "engine-history.claim";
 const ENGINE_HISTORY_HEAD_FILE: &str = "engine-history.head";
 const ENGINE_HISTORY_ROOT_SUFFIX: &str = ".history-root";
-const ENGINE_HISTORY_ROOT_SCHEMA_VERSION: u32 = 5;
+const ENGINE_HISTORY_ROOT_SCHEMA_VERSION: u32 = 6;
 const MAX_ENGINE_HISTORY_RECORD_BYTES: u64 = 1024 * 1024;
 const MAX_ENGINE_HISTORY_INDEX_BYTES: u64 = 2 * 1024 * 1024;
 const ENGINE_HISTORY_INDEX_SCHEMA_VERSION: u32 = 1;
@@ -84,6 +84,13 @@ thread_local! {
         std::cell::RefCell::new(None);
     static ENROLLED_OPEN_ACT_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         std::cell::RefCell::new(None);
+    static ENGINE_HISTORY_FAIL_BEFORE_HEAD_SWAP: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_engine_history_head_swap() {
+    ENGINE_HISTORY_FAIL_BEFORE_HEAD_SWAP.with(|fail| fail.set(true));
 }
 
 #[cfg(test)]
@@ -259,6 +266,7 @@ pub(crate) struct EngineHistoryBinding {
     pub catalog_checkpoint_binding: ContentDigest,
     pub portable_path_conflicts: Vec<super::PortablePathConflict>,
     pub terminal_evidence: Option<EngineTerminalEvidenceBinding>,
+    pub page_names: PageNameDurableBinding,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -268,6 +276,35 @@ pub(crate) struct EngineTerminalEvidenceBinding {
     pub conflict_count: u64,
     pub participant_count: u64,
     pub canonical_digest: ContentDigest,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PageNameDurableBinding {
+    pub ownership_root: super::page_name_index::PageNameOwnershipRootV1,
+    pub conflicts: Vec<super::page_name_index::PageNameConflictEvidenceV1>,
+}
+
+impl PageNameDurableBinding {
+    pub(crate) fn empty() -> Self {
+        Self {
+            ownership_root: super::page_name_index::PageNameOwnershipRootV1::empty(),
+            conflicts: Vec::new(),
+        }
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), StoreError> {
+        self.ownership_root.encode()?;
+        let digests = self
+            .conflicts
+            .iter()
+            .map(super::page_name_index::PageNameConflictEvidenceV1::digest)
+            .collect::<Result<Vec<_>, _>>()?;
+        if digests.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(StoreError::MalformedHistoryIndex);
+        }
+        Ok(())
+    }
 }
 
 impl EngineHistoryBinding {
@@ -280,6 +317,7 @@ impl EngineHistoryBinding {
             ),
             portable_path_conflicts: Vec::new(),
             terminal_evidence: None,
+            page_names: PageNameDurableBinding::empty(),
         }
     }
 }
@@ -2040,6 +2078,15 @@ impl DurableEngineHistoryStore {
             temp.write_all(replacement.to_string().as_bytes())?;
             temp.sync_all()?;
             drop(temp);
+            #[cfg(test)]
+            ENGINE_HISTORY_FAIL_BEFORE_HEAD_SWAP.with(|fail| {
+                if fail.replace(false) {
+                    return Err(StoreError::Io(std::io::Error::other(
+                        "injected engine history failure before authenticated head swap",
+                    )));
+                }
+                Ok(())
+            })?;
             self.control
                 .rename(&temp_name, &self.control, ENGINE_HISTORY_HEAD_FILE)?;
             sync_dir_required(&self.control)?;
@@ -2108,6 +2155,7 @@ fn validate_engine_history_root(
     {
         return Err(StoreError::MalformedHistoryIndex);
     }
+    root.binding.page_names.validate()?;
     Ok(())
 }
 
@@ -4004,6 +4052,49 @@ mod history_index_tests {
         assert_eq!(snapshot(&archive_path), before);
         drop(history);
         drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn engine_history_failure_before_head_swap_keeps_prior_authority() {
+        let root = test_root("history-pre-head-swap-failure");
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(55_000));
+        let endpoint = crate::oplog::ProjectionEndpointId::from_uuid(Uuid::from_u128(55_001));
+        let binding = crate::oplog::hot_engine::ProjectionStorageBinding {
+            endpoint: crate::oplog::ProjectionEndpointBinding {
+                endpoint_id: endpoint,
+                device_id: crate::oplog::DeviceId::from_uuid(Uuid::from_u128(55_002)),
+                graph_resource_id: crate::oplog::CanonicalGraphResourceId::from_capability_identity(
+                    b"test",
+                    b"history-pre-head-swap-failure",
+                ),
+            },
+            receipt_store_id: crate::oplog::ProjectionReceiptStoreId::from_capability_identity(
+                b"test",
+                b"history-pre-head-swap-failure-receipts",
+            ),
+        };
+        let archive_path = root.join("archive");
+        let store = ObjectStore::open(&archive_path, workspace).unwrap();
+        let history = store.open_engine_history(binding).unwrap();
+        let before = history.current_with_binding().unwrap();
+        fail_next_engine_history_head_swap();
+        assert!(history
+            .publish(
+                BatchId::from_uuid(Uuid::from_u128(55_003)),
+                b"unpublished record-v8 candidate",
+                EngineHistoryBinding::empty(),
+            )
+            .is_err());
+        assert_eq!(history.current_with_binding().unwrap(), before);
+        drop(history);
+        drop(store);
+
+        let reopened = ObjectStore::open(&archive_path, workspace).unwrap();
+        let reopened_history = reopened.open_engine_history(binding).unwrap();
+        assert_eq!(reopened_history.current_with_binding().unwrap(), before);
+        drop(reopened_history);
+        drop(reopened);
         std::fs::remove_dir_all(root).unwrap();
     }
 
