@@ -2557,6 +2557,29 @@ fn page_name_conflict_restart_scenario() -> Scenario {
     next += 1;
     actions.push(event(
         next,
+        ScheduledActionKind::Crash {
+            device: "alpha".into(),
+        },
+    ));
+    next += 1;
+    actions.push(event(
+        next,
+        ScheduledActionKind::Restart {
+            device: "alpha".into(),
+        },
+    ));
+    next += 1;
+    actions.push(event(
+        next,
+        ScheduledActionKind::AssertInvariant {
+            assertion: InvariantAssertion::RestartReplay {
+                device: "alpha".into(),
+            },
+        },
+    ));
+    next += 1;
+    actions.push(event(
+        next,
         ScheduledActionKind::AuthorLocal {
             device: "alpha".into(),
             batch_id: left,
@@ -2657,14 +2680,14 @@ fn page_name_conflict_restart_scenario() -> Scenario {
 #[test]
 fn page_name_conflict_restart_uses_typed_durable_evidence() {
     let scenario = page_name_conflict_restart_scenario();
+    let mut simulator = DeterministicSimulator::new(scenario.clone()).unwrap();
+    simulator.run().unwrap();
     assert_eq!(
         scenario.encode().unwrap(),
         include_str!("fixtures/oplog-simulator/page-name-conflict-restart.scenario.json")
             .trim_end()
             .as_bytes()
     );
-    let mut simulator = DeterministicSimulator::new(scenario).unwrap();
-    simulator.run().unwrap();
     let states = simulator.states().unwrap();
     assert!(states.into_iter().any(|state| matches!(
         state,

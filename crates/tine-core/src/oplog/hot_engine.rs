@@ -1853,6 +1853,12 @@ impl AcceptedBatchCursor<'_> {
 /// Experimental, disconnected v2 hot state. The immutable archive is retained
 /// separately from visible Loro documents. Only `ValidatedBatch` values from
 /// the object-store Ready boundary enter semantic validation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DurableAuthorityMode {
+    Ephemeral,
+    EnrolledRequired,
+}
+
 pub struct ShardedHotEngine {
     workspace_id: WorkspaceId,
     lineage_digest: LineageDigest,
@@ -1869,6 +1875,10 @@ pub struct ShardedHotEngine {
     history_generation: u64,
     history_root: ContentDigest,
     history_failure: Option<EngineError>,
+    durable_authority_mode: DurableAuthorityMode,
+    authenticated_history_replay: bool,
+    authenticated_replayed_batches: BTreeSet<BatchId>,
+    precommit_history_publication_failure: Option<EngineError>,
     archive_fingerprints: BTreeMap<BatchId, ContentDigest>,
     persisted_staged: BTreeSet<BatchId>,
     statuses: BTreeMap<BatchId, ArchiveStatus>,
@@ -1960,6 +1970,10 @@ impl ShardedHotEngine {
             history_generation: 0,
             history_root: super::object_store::EngineHistoryStore::empty_root(),
             history_failure: None,
+            durable_authority_mode: DurableAuthorityMode::Ephemeral,
+            authenticated_history_replay: false,
+            authenticated_replayed_batches: BTreeSet::new(),
+            precommit_history_publication_failure: None,
             archive_fingerprints: BTreeMap::new(),
             persisted_staged: BTreeSet::new(),
             statuses: BTreeMap::new(),
@@ -2131,6 +2145,7 @@ impl ShardedHotEngine {
             );
         }
         let mut engine = Self::with_archive_store(store, lineage_digest, catalog_document_id);
+        engine.durable_authority_mode = DurableAuthorityMode::EnrolledRequired;
         // An enrolled runtime may use the persistent page-name index only
         // after the authenticated history root and its latest record prove the
         // exact same typed binding.
@@ -2297,7 +2312,50 @@ impl ShardedHotEngine {
         let mut engine = Self::new(workspace_id, lineage_digest, catalog_document_id);
         engine.archive_store = Some(Arc::new(store));
         engine.history_failure = Some(error);
+        engine.durable_authority_mode = DurableAuthorityMode::EnrolledRequired;
         engine
+    }
+
+    /// Reset only reconstructible run-local state before replaying an
+    /// operational enrolled archive. The enrolled history, projection, index,
+    /// archive, and scratch capabilities remain attached; replay recomputes
+    /// their roots from the immutable batches and validates each already
+    /// authenticated final record instead of publishing it again.
+    pub(crate) fn prepare_operational_recovery_replay(&mut self) -> Result<(), EngineError> {
+        if !matches!(self.workspace_status(), WorkspaceStatus::Operational) {
+            return Err(EngineError::Archive(
+                "terminal enrolled authority cannot enter operational recovery replay".into(),
+            ));
+        }
+        self.verify_current_durable_page_name_authority()?;
+
+        let mut replay = Self::new(
+            self.workspace_id,
+            self.lineage_digest,
+            self.catalog_document_id,
+        );
+        replay.archive_store = self.archive_store.take();
+        replay.projection_endpoint = self.projection_endpoint;
+        replay.projection_receipt_store_id = self.projection_receipt_store_id;
+        replay.projection_work_index = self.projection_work_index.take();
+        replay.scratch = self.scratch.take();
+        replay.history_store = self.history_store.take();
+        replay.history_generation = self.history_generation;
+        replay.history_root = self.history_root;
+        replay.durable_authority_mode = self.durable_authority_mode;
+        replay.authenticated_history_replay = true;
+        replay.block_claim_index = self.block_claim_index.take();
+        replay.logseq_claim_index = self.logseq_claim_index.take();
+        replay.portable_path_index = self.portable_path_index.take();
+        replay.page_name_index = self.page_name_index.take();
+        *self = replay;
+        Ok(())
+    }
+
+    pub(crate) fn finish_operational_recovery_replay(&mut self) -> Result<(), EngineError> {
+        self.verify_current_durable_page_name_authority()?;
+        self.authenticated_history_replay = false;
+        Ok(())
     }
 
     pub(crate) fn enrolled_projection_runtime(
@@ -2972,6 +3030,74 @@ impl ShardedHotEngine {
         &self.page_name_root
     }
 
+    pub(crate) fn verify_current_durable_page_name_authority(&self) -> Result<(), EngineError> {
+        if self.durable_authority_mode != DurableAuthorityMode::EnrolledRequired {
+            return Err(EngineError::Archive(
+                "persistent page-name authority requires an enrolled engine".into(),
+            ));
+        }
+        if let Some(error) = &self.history_failure {
+            return Err(error.clone());
+        }
+        let store = self.history_store.as_ref().ok_or_else(|| {
+            EngineError::Archive(
+                "persistent page-name authority requires enrolled durable history".into(),
+            )
+        })?;
+        let (generation, root, latest_batch_id, binding) = store
+            .current_with_binding()
+            .map_err(|error| EngineError::Archive(error.to_string()))?;
+        if generation != self.history_generation || root != self.history_root {
+            return Err(EngineError::Archive(
+                "run-local durable history head differs from enrolled authority".into(),
+            ));
+        }
+        binding
+            .page_names
+            .validate()
+            .map_err(|error| EngineError::Archive(error.to_string()))?;
+        let current = super::object_store::PageNameDurableBinding {
+            ownership_root: self.page_name_root.clone(),
+            conflicts: self.page_name_conflicts.values().cloned().collect(),
+        };
+        if binding.page_names != current {
+            return Err(EngineError::Archive(
+                "run-local page-name authority differs from durable history".into(),
+            ));
+        }
+        self.page_name_index
+            .as_ref()
+            .ok_or_else(|| {
+                EngineError::Archive("enrolled page-name authority has no ownership index".into())
+            })?
+            .validate_root(&binding.page_names.ownership_root)
+            .map_err(|error| EngineError::Archive(error.to_string()))?;
+        match (generation, latest_batch_id) {
+            (0, None) => Ok(()),
+            (0, Some(_)) | (_, None) => Err(EngineError::Archive(
+                "durable page-name authority has no latest history record".into(),
+            )),
+            (_, Some(latest_batch_id)) => {
+                let bytes = store
+                    .lookup(root, latest_batch_id)
+                    .map_err(|error| EngineError::Archive(error.to_string()))?
+                    .ok_or_else(|| {
+                        EngineError::Archive(
+                            "durable page-name authority latest record is absent".into(),
+                        )
+                    })?;
+                store.note_history_decode();
+                let record = decode_history_record(latest_batch_id, &bytes)?;
+                if record.generation != generation || history_record_binding(&record) != binding {
+                    return Err(EngineError::Archive(
+                        "durable page-name record/root binding mismatch".into(),
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+
     pub fn page_name_conflicts(&self) -> Vec<PageNameConflictEvidenceV1> {
         self.page_name_conflicts.values().cloned().collect()
     }
@@ -3353,6 +3479,8 @@ impl ShardedHotEngine {
 
     fn stage_ready_scratch(&mut self, batch: ValidatedBatch) -> StageOutcome {
         let offered_batch_id = batch.manifest().batch_id();
+        self.precommit_history_publication_failure = None;
+        let roots_before_stage = self.scratch_roots.clone();
         if let Some(error) = &self.history_failure {
             return self.outcome(
                 offered_batch_id,
@@ -3487,6 +3615,7 @@ impl ShardedHotEngine {
         let mut supplied = Some(batch);
         let mut accepted = Vec::new();
         loop {
+            let roots_before_pop = self.scratch_roots.clone();
             let (roots, ready) =
                 match super::dependency_queue::pop_ready(&store, &self.scratch_roots) {
                     Ok(result) => result,
@@ -3574,6 +3703,21 @@ impl ShardedHotEngine {
                     }
                 }
             };
+            if let Some(error) = self.precommit_history_publication_failure.take() {
+                self.scratch_roots = if batch_id == offered_batch_id && accepted.is_empty() {
+                    roots_before_stage
+                } else {
+                    roots_before_pop
+                };
+                self.statuses.remove(&batch_id);
+                self.archive_fingerprints.remove(&batch_id);
+                self.archive.remove(&batch_id);
+                return self.outcome(
+                    offered_batch_id,
+                    BatchDisposition::Rejected { error },
+                    accepted,
+                );
+            }
             let encoded = match encode_archive_status(&final_status) {
                 Ok(encoded) => encoded,
                 Err(error) => {
@@ -6377,7 +6521,12 @@ impl ShardedHotEngine {
             ));
         }
         let Some(store) = self.history_store.as_ref().map(Arc::clone) else {
-            return Ok(());
+            return match self.durable_authority_mode {
+                DurableAuthorityMode::Ephemeral => Ok(()),
+                DurableAuthorityMode::EnrolledRequired => Err(EngineError::Archive(
+                    "enrolled archive-backed engine has no authenticated durable history".into(),
+                )),
+            };
         };
         binding
             .page_names
@@ -6394,13 +6543,66 @@ impl ShardedHotEngine {
         {
             store.note_history_decode();
             let existing = decode_history_record(batch_id, &bytes)?;
-            if existing.manifest_fingerprint != manifest_fingerprint
-                || existing.status != status
-                || existing.portable_path_key_version != super::PORTABLE_PATH_KEY_VERSION
-                || history_record_binding(&existing) != binding
+            let replay_status_matches = match (&existing.status, &status) {
+                (
+                    ArchiveStatus::Accepted {
+                        no_op: existing, ..
+                    },
+                    ArchiveStatus::Accepted {
+                        no_op: candidate, ..
+                    },
+                ) => existing == candidate,
+                (ArchiveStatus::Quarantined, ArchiveStatus::Quarantined) => true,
+                (ArchiveStatus::Rejected(existing), ArchiveStatus::Rejected(candidate)) => {
+                    existing == candidate
+                }
+                _ => false,
+            };
+            // Accepted evidence and the catalog checkpoint intentionally embed
+            // run-local scratch page references. Recovery recomputes those
+            // wider hot indexes in a fresh scratch run, but the immutable
+            // batch, final disposition, and persistent typed authority must
+            // still match the already-authenticated record exactly.
+            if (self.authenticated_history_replay
+                || self.authenticated_replayed_batches.contains(&batch_id))
+                && existing.manifest_fingerprint == manifest_fingerprint
+                && replay_status_matches
+                && existing.portable_path_key_version == super::PORTABLE_PATH_KEY_VERSION
+                && existing.portable_path_root.digest() == binding.portable_path_root
+                && existing.portable_path_conflicts == binding.portable_path_conflicts
+                && existing.terminal_evidence == binding.terminal_evidence
+                && existing.page_names == binding.page_names
             {
+                if self.authenticated_history_replay {
+                    self.authenticated_replayed_batches.insert(batch_id);
+                }
+                self.status_point_cache
+                    .borrow_mut()
+                    .insert(batch_id, Some(existing));
+                return Ok(());
+            }
+            let mismatch = if existing.manifest_fingerprint != manifest_fingerprint {
+                Some("manifest fingerprint")
+            } else if existing.status != status {
+                Some("final status")
+            } else if existing.portable_path_key_version != super::PORTABLE_PATH_KEY_VERSION {
+                Some("portable-path key version")
+            } else if existing.portable_path_root.digest() != binding.portable_path_root {
+                Some("portable-path root")
+            } else if existing.catalog_checkpoint_binding != binding.catalog_checkpoint_binding {
+                Some("catalog checkpoint")
+            } else if existing.portable_path_conflicts != binding.portable_path_conflicts {
+                Some("portable-path conflicts")
+            } else if existing.terminal_evidence != binding.terminal_evidence {
+                Some("terminal evidence")
+            } else if existing.page_names != binding.page_names {
+                Some("page-name authority")
+            } else {
+                None
+            };
+            if let Some(mismatch) = mismatch {
                 return Err(EngineError::Archive(format!(
-                    "durable engine history collision for batch {batch_id}"
+                    "durable engine history {mismatch} collision for batch {batch_id}"
                 )));
             }
             self.status_point_cache
@@ -7410,12 +7612,15 @@ impl ShardedHotEngine {
                     });
                 }
                 let fingerprint = self.archive_fingerprints[&batch_id];
-                self.persist_durable_final_status_with_binding(
+                if let Err(error) = self.persist_durable_final_status_with_binding(
                     batch_id,
                     fingerprint,
                     ArchiveStatus::Quarantined,
                     binding,
-                )?;
+                ) {
+                    self.precommit_history_publication_failure = Some(error.clone());
+                    return Err(error);
+                }
             }
             if self.scratch.is_some() {
                 self.scratch_roots = candidate_roots;
@@ -7448,7 +7653,7 @@ impl ShardedHotEngine {
                 self.durable_history_binding_with_page_names(catalog_binding, page_name_binding);
             binding.portable_path_root = portable_paths.root.digest();
             let fingerprint = self.archive_fingerprints[&batch_id];
-            self.persist_durable_final_status_with_binding(
+            if let Err(error) = self.persist_durable_final_status_with_binding(
                 batch_id,
                 fingerprint,
                 ArchiveStatus::Accepted {
@@ -7456,7 +7661,10 @@ impl ShardedHotEngine {
                     evidence: status_evidence.clone(),
                 },
                 binding,
-            )?;
+            ) {
+                self.precommit_history_publication_failure = Some(error.clone());
+                return Err(error);
+            }
         }
         if self.scratch.is_some() {
             self.block_claim_root = identity.block_claim_root;
@@ -16199,6 +16407,130 @@ mod validation_tests {
             !clock.contains("collect_batch_ancestry") && !clock.contains("self.archive"),
             "inline causal-clock construction must use only direct-head lookups"
         );
+    }
+
+    #[test]
+    fn enrolled_history_head_swap_failure_preserves_visible_terminal_and_status_state() {
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(89_000));
+        let catalog = DocumentId::from_uuid(Uuid::from_u128(89_001));
+        let lineage = LineageDigest::of(b"enrolled-history-pre-head-swap");
+        let root = std::env::temp_dir().join(format!(
+            "tine-oplog-enrolled-history-failure-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let archive_path = root.join("archive");
+        let graph_path = root.join("graph");
+        std::fs::create_dir(&graph_path).unwrap();
+        let graph = Graph::open(&graph_path);
+        let endpoint = ProjectionEndpointBinding::enroll_graph(
+            &graph,
+            ProjectionEndpointId::from_uuid(Uuid::from_u128(89_002)),
+            DeviceId::from_uuid(Uuid::from_u128(89_003)),
+        )
+        .unwrap();
+        let receipts =
+            ProjectionReceiptStore::open_for_endpoint(&root.join("receipts"), workspace, endpoint)
+                .unwrap();
+        let writer = ObjectStore::open(&archive_path, workspace).unwrap();
+        let mut engine = ShardedHotEngine::with_enrolled_projection(
+            ObjectStore::open(&archive_path, workspace).unwrap(),
+            lineage,
+            catalog,
+            &graph,
+            &receipts,
+        );
+
+        let baseline = engine
+            .prepare_bootstrap_transaction(
+                test_author(89_010, 89_010),
+                &OperationTransaction::new(vec![SemanticOperation::CreatePage {
+                    page_id: PageId::from_uuid(Uuid::from_u128(89_011)),
+                    home_document_id: DocumentId::from_uuid(Uuid::from_u128(89_012)),
+                    name: LogicalPageName::parse("Durable Baseline").unwrap(),
+                    path: ManagedPath::parse("pages/durable-baseline.md").unwrap(),
+                    kind: ManagedTextKind::Page,
+                }])
+                .unwrap(),
+            )
+            .unwrap();
+        writer.publish_prepared(&baseline).unwrap();
+        assert!(matches!(
+            engine
+                .stage_archive_batch(baseline.manifest().batch_id())
+                .unwrap()
+                .disposition(),
+            BatchDisposition::Accepted { .. }
+        ));
+
+        let prior_history = engine
+            .history_store
+            .as_ref()
+            .unwrap()
+            .current_with_binding()
+            .unwrap();
+        let prior_snapshot = engine.canonical_snapshot().unwrap();
+        let prior_page_name_root = engine.page_name_root.clone();
+        let prior_page_name_conflicts = engine.page_name_conflicts.clone();
+        let prior_frontier = engine.exact_frontier().unwrap();
+        let prior_frontier_root = engine.accepted_frontier_root().unwrap();
+        let prior_accepted_count = engine.accepted_batch_count().unwrap();
+        let prior_status = engine.history_records().unwrap();
+        let prior_workspace_status = engine.workspace_status();
+        let prior_visible_heads = engine.visible_document_heads.clone();
+        let prior_terminal_heads = engine.terminal_document_heads.clone();
+
+        let update = engine
+            .prepare_bootstrap_transaction(
+                test_author(89_020, 89_020),
+                &OperationTransaction::new(vec![SemanticOperation::CreatePage {
+                    page_id: PageId::from_uuid(Uuid::from_u128(89_021)),
+                    home_document_id: DocumentId::from_uuid(Uuid::from_u128(89_022)),
+                    name: LogicalPageName::parse("Must Not Publish").unwrap(),
+                    path: ManagedPath::parse("pages/must-not-publish.md").unwrap(),
+                    kind: ManagedTextKind::Page,
+                }])
+                .unwrap(),
+            )
+            .unwrap();
+        writer.publish_prepared(&update).unwrap();
+        super::super::object_store::fail_next_engine_history_head_swap();
+        let outcome = engine
+            .stage_archive_batch(update.manifest().batch_id())
+            .unwrap();
+        assert!(matches!(
+            outcome.disposition(),
+            BatchDisposition::Rejected {
+                error: EngineError::Archive(_),
+            }
+        ));
+
+        assert_eq!(
+            engine
+                .history_store
+                .as_ref()
+                .unwrap()
+                .current_with_binding()
+                .unwrap(),
+            prior_history
+        );
+        assert_eq!(engine.canonical_snapshot().unwrap(), prior_snapshot);
+        assert_eq!(engine.page_name_root, prior_page_name_root);
+        assert_eq!(engine.page_name_conflicts, prior_page_name_conflicts);
+        assert_eq!(engine.exact_frontier().unwrap(), prior_frontier);
+        assert_eq!(
+            engine.accepted_frontier_root().unwrap(),
+            prior_frontier_root
+        );
+        assert_eq!(engine.accepted_batch_count().unwrap(), prior_accepted_count);
+        assert_eq!(engine.history_records().unwrap(), prior_status);
+        assert_eq!(engine.workspace_status(), prior_workspace_status);
+        assert_eq!(engine.visible_document_heads, prior_visible_heads);
+        assert_eq!(engine.terminal_document_heads, prior_terminal_heads);
+
+        drop(engine);
+        drop(writer);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -3683,13 +3683,9 @@ impl DeviceRuntime {
         // still replay their wider CRDT hot state because P2N2 does not own
         // general document-state recovery.
         if matches!(engine.status().workspace(), WorkspaceStatus::Operational) {
-            let replay_store = ObjectStore::open(&self.archive_path(), workspace.workspace_id)
-                .map_err(|error| ScenarioError::Store(error.to_string()))?;
-            engine = ShardedHotEngine::with_archive_store(
-                replay_store,
-                workspace.lineage_digest,
-                workspace.catalog_document_id,
-            );
+            engine
+                .prepare_operational_recovery_replay()
+                .map_err(|error| ScenarioError::Engine(error.to_string()))?;
             for manifest in manifests {
                 outcomes.push(
                     engine
@@ -3697,6 +3693,9 @@ impl DeviceRuntime {
                         .map_err(|error| ScenarioError::Engine(error.to_string()))?,
                 );
             }
+            engine
+                .finish_operational_recovery_replay()
+                .map_err(|error| ScenarioError::Engine(error.to_string()))?;
         }
         self.store = Some(store);
         self.engine = Some(engine);
@@ -4849,6 +4848,10 @@ impl DeterministicSimulator {
     fn assert_restart_replay(&self, event_id: u64, device: &str) -> Result<(), ScenarioError> {
         let observed = self.observation(device, event_id)?;
         let runtime = self.device(device)?;
+        runtime
+            .engine()?
+            .verify_current_durable_page_name_authority()
+            .map_err(|error| ScenarioError::Engine(error.to_string()))?;
         let store = ObjectStore::open(
             &runtime.archive_path(),
             self.scenario.workspace.workspace_id,
