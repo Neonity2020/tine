@@ -62,6 +62,7 @@ const LOGSEQ_CLAIM_INDEX_DIR: &str = "logseq-uuid-claim-index-v1";
 const PORTABLE_PATH_INDEX_DIR: &str = "portable-path-index-v1";
 #[allow(dead_code)] // opened by the intentionally unwired P2N2 foundation
 const PAGE_NAME_OWNERSHIP_INDEX_DIR: &str = "page-name-ownership-index-v1";
+const REFERENCE_CATALOG_DIR: &str = "reference-catalog-v1";
 const PROJECTION_WORK_DIR: &str = "projection-work-index-v1";
 const BLOCK_CLAIM_INDEX_SCHEMA_VERSION: u32 = 1;
 const BLOCK_CLAIM_RADIX_DEPTH: u8 = 32;
@@ -971,6 +972,20 @@ impl ObjectStore {
         ensure_directory_nofollow(&self.capability, PAGE_NAME_OWNERSHIP_INDEX_DIR)?;
         let index = open_dir_nofollow(&self.capability, PAGE_NAME_OWNERSHIP_INDEX_DIR)?;
         super::page_name_index::PageNameOwnershipStore::open(index)
+    }
+
+    pub(crate) fn open_reference_catalog(
+        &self,
+    ) -> Result<super::reference_catalog::ReferenceCatalogStore, StoreError> {
+        ensure_directory_nofollow(&self.capability, REFERENCE_CATALOG_DIR)?;
+        let catalog = open_dir_nofollow(&self.capability, REFERENCE_CATALOG_DIR)?;
+        for name in ["nodes", "postings"] {
+            ensure_directory_nofollow(&catalog, name)?;
+        }
+        Ok(super::reference_catalog::ReferenceCatalogStore::new(
+            open_dir_nofollow(&catalog, "nodes")?,
+            open_dir_nofollow(&catalog, "postings")?,
+        ))
     }
 
     #[cfg(test)]

@@ -199,6 +199,58 @@ impl PatriciaIndexStore {
         Ok(found)
     }
 
+    pub(crate) fn visit_all(
+        &self,
+        root: PatriciaIndexRoot,
+        mut visit: impl FnMut(&[u8], &[u8]) -> bool,
+    ) -> Result<(), StoreError> {
+        if root == PatriciaIndexRoot::empty() {
+            return Ok(());
+        }
+        let budget = traversal_node_budget(MAX_KEY_BYTES)?;
+        let mut pending = vec![(root.digest(), None, budget)];
+        while let Some((digest, constraint, remaining_nodes)) = pending.pop() {
+            let remaining_nodes = consume_node_budget(remaining_nodes)?;
+            let node = self.read_node(digest)?;
+            validate_node_path(&node, constraint.as_ref())?;
+            match node {
+                Node::Leaf { key, value, .. } => {
+                    if !visit(&key, &value) {
+                        return Ok(());
+                    }
+                }
+                Node::Branch {
+                    prefix,
+                    prefix_bit_len,
+                    left,
+                    right,
+                    ..
+                } => {
+                    let split = prefix_bit_len as usize;
+                    pending.push((
+                        right,
+                        Some(ChildPathConstraint {
+                            parent_prefix: prefix.clone(),
+                            parent_prefix_bit_len: split,
+                            right: true,
+                        }),
+                        remaining_nodes,
+                    ));
+                    pending.push((
+                        left,
+                        Some(ChildPathConstraint {
+                            parent_prefix: prefix,
+                            parent_prefix_bit_len: split,
+                            right: false,
+                        }),
+                        remaining_nodes,
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn insert_many(
         &self,
         root: PatriciaIndexRoot,
@@ -210,6 +262,98 @@ impl PatriciaIndexStore {
             root = PatriciaIndexRoot(self.insert(root, key, value)?);
         }
         Ok(root)
+    }
+
+    pub(crate) fn remove_many(
+        &self,
+        root: PatriciaIndexRoot,
+        keys: &[Vec<u8>],
+    ) -> Result<PatriciaIndexRoot, StoreError> {
+        if keys.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(StoreError::MalformedLogseqClaimIndex);
+        }
+        let mut root = root;
+        for key in keys {
+            validate_key(key)?;
+            root = self.remove(root, key)?;
+        }
+        Ok(root)
+    }
+
+    fn remove(&self, root: PatriciaIndexRoot, key: &[u8]) -> Result<PatriciaIndexRoot, StoreError> {
+        if root == PatriciaIndexRoot::empty() {
+            return Ok(root);
+        }
+        let mut digest = root.digest();
+        let mut constraint = None;
+        let mut remaining_nodes = traversal_node_budget(key.len())?;
+        let mut ancestors = Vec::new();
+        loop {
+            remaining_nodes = consume_node_budget(remaining_nodes)?;
+            let node = self.read_node(digest)?;
+            validate_node_path(&node, constraint.as_ref())?;
+            match node {
+                Node::Leaf { key: found, .. } => {
+                    if found != key {
+                        return Ok(root);
+                    }
+                    break;
+                }
+                Node::Branch {
+                    prefix,
+                    prefix_bit_len,
+                    left,
+                    right,
+                    ..
+                } => {
+                    let split = prefix_bit_len as usize;
+                    if !prefix_matches(key, &prefix, split)? {
+                        return Ok(root);
+                    }
+                    let rightward = key_bit(key, split)?;
+                    digest = if rightward { right } else { left };
+                    constraint = Some(ChildPathConstraint {
+                        parent_prefix: prefix.clone(),
+                        parent_prefix_bit_len: split,
+                        right: rightward,
+                    });
+                    ancestors.push(BranchFrame {
+                        prefix,
+                        prefix_bit_len,
+                        left,
+                        right,
+                        rightward,
+                    });
+                }
+            }
+        }
+
+        let Some(parent) = ancestors.pop() else {
+            return Ok(PatriciaIndexRoot::empty());
+        };
+        let replacement = if parent.rightward {
+            parent.left
+        } else {
+            parent.right
+        };
+        let rebuilt = ancestors
+            .into_iter()
+            .rev()
+            .try_fold(replacement, |child, ancestor| {
+                let (left, right) = if ancestor.rightward {
+                    (ancestor.left, child)
+                } else {
+                    (child, ancestor.right)
+                };
+                self.publish_node(&Node::Branch {
+                    schema_version: NODE_SCHEMA_VERSION,
+                    prefix: ancestor.prefix,
+                    prefix_bit_len: ancestor.prefix_bit_len,
+                    left,
+                    right,
+                })
+            })?;
+        Ok(PatriciaIndexRoot(rebuilt))
     }
 
     fn insert(

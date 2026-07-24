@@ -88,11 +88,26 @@ pub(crate) struct ProjectedPageRef {
     pub name: String,
     pub range: Range<usize>,
     pub rule: &'static str,
+    pub property_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum ProjectedBlockRefKind {
+    Reference,
+    Embed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProjectedBlockRef {
+    pub raw_claim: String,
+    pub range: Range<usize>,
+    pub kind: ProjectedBlockRefKind,
 }
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ReferenceSourceProjection {
     pub explicit: Vec<ProjectedPageRef>,
+    pub block_references: Vec<ProjectedBlockRef>,
     pub plain_ranges: Vec<Range<usize>>,
 }
 
@@ -221,11 +236,12 @@ fn push_explicit(
     mapper: SpanMapper,
     raw_len: usize,
     rule: &'static str,
+    property_key: Option<&str>,
 ) {
     let Some(range) = span.and_then(|span| mapper.map(span, raw_len)) else {
         return;
     };
-    push_explicit_range(projection, name, range, raw_len, rule);
+    push_explicit_range(projection, name, range, raw_len, rule, property_key);
 }
 
 fn push_explicit_range(
@@ -234,14 +250,38 @@ fn push_explicit_range(
     range: Range<usize>,
     raw_len: usize,
     rule: &'static str,
+    property_key: Option<&str>,
 ) {
     if range.start > range.end || range.end > raw_len {
         return;
     }
     if !name.trim().is_empty() {
-        projection
-            .explicit
-            .push(ProjectedPageRef { name, range, rule });
+        projection.explicit.push(ProjectedPageRef {
+            name,
+            range,
+            rule,
+            property_key: property_key.map(crate::doc::property_key_norm),
+        });
+    }
+}
+
+fn push_block_reference(
+    projection: &mut ReferenceSourceProjection,
+    raw_claim: String,
+    span: Option<&Span>,
+    mapper: SpanMapper,
+    raw_len: usize,
+    kind: ProjectedBlockRefKind,
+) {
+    let Some(range) = span.and_then(|span| mapper.map(span, raw_len)) else {
+        return;
+    };
+    if !raw_claim.trim().is_empty() {
+        projection.block_references.push(ProjectedBlockRef {
+            raw_claim,
+            range,
+            kind,
+        });
     }
 }
 
@@ -276,6 +316,7 @@ fn walk_inlines(
     mapper: SpanMapper,
     raw_len: usize,
     is_org: bool,
+    property_key: Option<&str>,
     projection: &mut ReferenceSourceProjection,
 ) {
     for inline in inlines {
@@ -288,6 +329,22 @@ fn walk_inlines(
                 }
             }
             Inline::Link {
+                url: Url::BlockRef { v },
+                label,
+                span,
+                ..
+            } => {
+                push_block_reference(
+                    projection,
+                    v.clone(),
+                    span.as_ref(),
+                    mapper,
+                    raw_len,
+                    ProjectedBlockRefKind::Reference,
+                );
+                walk_inlines(label, mapper, raw_len, is_org, property_key, projection);
+            }
+            Inline::Link {
                 url, label, span, ..
             } => {
                 if let Some(name) = link_page_name(url, label, is_org) {
@@ -298,9 +355,10 @@ fn walk_inlines(
                         mapper,
                         raw_len,
                         "explicit_link",
+                        property_key,
                     );
                 }
-                walk_inlines(label, mapper, raw_len, is_org, projection);
+                walk_inlines(label, mapper, raw_len, is_org, property_key, projection);
             }
             Inline::NestedLink { content, span } => {
                 for name in nested_names(content) {
@@ -311,6 +369,7 @@ fn walk_inlines(
                         mapper,
                         raw_len,
                         "explicit_nested_link",
+                        property_key,
                     );
                 }
             }
@@ -322,8 +381,9 @@ fn walk_inlines(
                     mapper,
                     raw_len,
                     "explicit_tag",
+                    property_key,
                 );
-                walk_inlines(children, mapper, raw_len, is_org, projection);
+                walk_inlines(children, mapper, raw_len, is_org, property_key, projection);
             }
             Inline::Macro { name, args, span } if name == "embed" => {
                 let value = if args.len() <= 1 {
@@ -331,19 +391,35 @@ fn walk_inlines(
                 } else {
                     args.join(", ")
                 };
-                push_explicit(
-                    projection,
-                    unbracket(&value).trim().to_string(),
-                    span.as_ref(),
-                    mapper,
-                    raw_len,
-                    "explicit_embed",
-                );
+                let trimmed = value.trim();
+                if let Some(claim) = trimmed
+                    .strip_prefix("((")
+                    .and_then(|rest| rest.strip_suffix("))"))
+                {
+                    push_block_reference(
+                        projection,
+                        claim.trim().to_string(),
+                        span.as_ref(),
+                        mapper,
+                        raw_len,
+                        ProjectedBlockRefKind::Embed,
+                    );
+                } else {
+                    push_explicit(
+                        projection,
+                        unbracket(&value).trim().to_string(),
+                        span.as_ref(),
+                        mapper,
+                        raw_len,
+                        "explicit_embed",
+                        property_key,
+                    );
+                }
             }
             Inline::Emphasis { children, .. }
             | Inline::Subscript { children, .. }
             | Inline::Superscript { children, .. } => {
-                walk_inlines(children, mapper, raw_len, is_org, projection)
+                walk_inlines(children, mapper, raw_len, is_org, property_key, projection)
             }
             // Code/verbatim and the remaining opaque inline forms are deliberately
             // not plain-reference search ranges.
@@ -357,16 +433,29 @@ fn walk_list_item(
     mapper: SpanMapper,
     raw: &str,
     is_org: bool,
+    property_key: Option<&str>,
     projection: &mut ReferenceSourceProjection,
 ) {
-    walk_inlines(&item.name, mapper, raw.len(), is_org, projection);
-    walk_blocks(&item.content, mapper, raw, is_org, projection);
+    walk_inlines(
+        &item.name,
+        mapper,
+        raw.len(),
+        is_org,
+        property_key,
+        projection,
+    );
+    walk_blocks(&item.content, mapper, raw, is_org, property_key, projection);
     for child in &item.items {
-        walk_list_item(child, mapper, raw, is_org, projection);
+        walk_list_item(child, mapper, raw, is_org, property_key, projection);
     }
 }
 
-fn property_values(span: Option<&Span>, mapper: SpanMapper, raw: &str) -> Vec<PropertySource> {
+fn property_values(
+    span: Option<&Span>,
+    mapper: SpanMapper,
+    raw: &str,
+    is_org: bool,
+) -> Vec<PropertySource> {
     let Some(range) = span.and_then(|span| mapper.map(span, raw.len())) else {
         return Vec::new();
     };
@@ -377,23 +466,52 @@ fn property_values(span: Option<&Span>, mapper: SpanMapper, raw: &str) -> Vec<Pr
     let mut line_offset = range.start;
     for line in source.split_inclusive('\n') {
         let line_without_newline = line.strip_suffix('\n').unwrap_or(line);
-        if let Some((key, value)) = crate::doc::parse_property_line(line_without_newline) {
-            let delimiter = line_without_newline.find("::").unwrap_or_default();
-            let key_source = &line_without_newline[..delimiter];
-            let key_leading = key_source.len() - key_source.trim_start().len();
-            if let Some(value_at) = line_without_newline.rfind(&value) {
-                out.push(PropertySource {
-                    key,
-                    key_range: line_offset + key_leading
-                        ..line_offset + key_leading + key_source.trim().len(),
-                    value_offset: line_offset + value_at,
-                    value,
-                });
-            }
+        let parsed = if is_org {
+            parse_org_property_line(line_without_newline)
+        } else {
+            crate::doc::parse_property_line(line_without_newline).and_then(|(key, value)| {
+                let delimiter = line_without_newline.find("::")?;
+                let key_source = &line_without_newline[..delimiter];
+                let key_leading = key_source.len() - key_source.trim_start().len();
+                let value_at = line_without_newline.rfind(&value)?;
+                Some((key, value, key_leading, key_source.trim().len(), value_at))
+            })
+        };
+        if let Some((key, value, key_at, key_len, value_at)) = parsed {
+            out.push(PropertySource {
+                key,
+                key_range: line_offset + key_at..line_offset + key_at + key_len,
+                value_offset: line_offset + value_at,
+                value,
+            });
         }
         line_offset += line.len();
     }
     out
+}
+
+fn parse_org_property_line(line: &str) -> Option<(String, String, usize, usize, usize)> {
+    let leading = line.len() - line.trim_start().len();
+    let source = line.get(leading..)?;
+    let rest = source.strip_prefix(':')?;
+    let delimiter = rest.find(':')?;
+    let key_source = &rest[..delimiter];
+    if key_source.is_empty()
+        || key_source.eq_ignore_ascii_case("properties")
+        || key_source.eq_ignore_ascii_case("end")
+    {
+        return None;
+    }
+    let value_source = &rest[delimiter + 1..];
+    let value_leading = value_source.len() - value_source.trim_start().len();
+    let value = value_source.trim().to_string();
+    Some((
+        key_source.to_string(),
+        value,
+        leading + 1,
+        key_source.len(),
+        leading + 1 + delimiter + 1 + value_leading,
+    ))
 }
 
 struct PropertySource {
@@ -425,6 +543,7 @@ fn project_property_key(
             key_range,
             raw_len,
             "explicit_property_key",
+            Some(key),
         );
     }
 }
@@ -473,6 +592,7 @@ fn project_implicit_linkable_property(
                 start..end,
                 raw_len,
                 "implicit_linkable_property",
+                Some(key),
             );
         }
         segment_start = index + separator;
@@ -490,6 +610,7 @@ fn walk_blocks(
     mapper: SpanMapper,
     raw: &str,
     is_org: bool,
+    property_key: Option<&str>,
     projection: &mut ReferenceSourceProjection,
 ) {
     for block in blocks {
@@ -498,30 +619,30 @@ fn walk_blocks(
             | Block::Heading { inline, .. }
             | Block::Bullet { inline, .. }
             | Block::FootnoteDef { inline, .. } => {
-                walk_inlines(inline, mapper, raw.len(), is_org, projection)
+                walk_inlines(inline, mapper, raw.len(), is_org, property_key, projection)
             }
             Block::Quote { children, .. } | Block::Custom { children, .. } => {
-                walk_blocks(children, mapper, raw, is_org, projection)
+                walk_blocks(children, mapper, raw, is_org, property_key, projection)
             }
             Block::List { items, .. } => {
                 for item in items {
-                    walk_list_item(item, mapper, raw, is_org, projection);
+                    walk_list_item(item, mapper, raw, is_org, property_key, projection);
                 }
             }
             Block::Table { header, rows, .. } => {
                 if let Some(header) = header {
                     for cell in header {
-                        walk_inlines(cell, mapper, raw.len(), is_org, projection);
+                        walk_inlines(cell, mapper, raw.len(), is_org, property_key, projection);
                     }
                 }
                 for row in rows {
                     for cell in row {
-                        walk_inlines(cell, mapper, raw.len(), is_org, projection);
+                        walk_inlines(cell, mapper, raw.len(), is_org, property_key, projection);
                     }
                 }
             }
             Block::Properties { span, .. } => {
-                for property in property_values(span.as_ref(), mapper, raw) {
+                for property in property_values(span.as_ref(), mapper, raw, is_org) {
                     project_property_key(
                         projection,
                         &property.key,
@@ -543,6 +664,7 @@ fn walk_blocks(
                         SpanMapper::direct(offset),
                         raw,
                         is_org,
+                        Some(&key),
                         projection,
                     );
                     project_implicit_linkable_property(projection, &key, offset, &value, raw.len());
@@ -555,7 +677,14 @@ fn walk_blocks(
 
 pub(crate) fn project(raw: &str, is_org: bool, blocks: &[Block]) -> ReferenceSourceProjection {
     let mut projection = ReferenceSourceProjection::default();
-    walk_blocks(blocks, SpanMapper::block(raw), raw, is_org, &mut projection);
+    walk_blocks(
+        blocks,
+        SpanMapper::block(raw),
+        raw,
+        is_org,
+        None,
+        &mut projection,
+    );
     projection.explicit.sort_by(|a, b| {
         a.range
             .start
@@ -564,6 +693,15 @@ pub(crate) fn project(raw: &str, is_org: bool, blocks: &[Block]) -> ReferenceSou
             .then_with(|| a.name.cmp(&b.name))
     });
     projection.explicit.dedup();
+    projection.block_references.sort_by(|left, right| {
+        left.range
+            .start
+            .cmp(&right.range.start)
+            .then_with(|| left.range.end.cmp(&right.range.end))
+            .then_with(|| left.kind.cmp(&right.kind))
+            .then_with(|| left.raw_claim.cmp(&right.raw_claim))
+    });
+    projection.block_references.dedup();
     projection
         .plain_ranges
         .sort_by_key(|range| (range.start, range.end));

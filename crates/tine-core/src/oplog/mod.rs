@@ -27,6 +27,7 @@ pub mod projection_manifest;
 pub mod projection_store;
 pub mod projection_work_index;
 pub mod receipt;
+pub mod reference_catalog;
 pub(crate) mod scratch_store;
 pub mod semantic;
 pub mod simulator;
@@ -112,6 +113,14 @@ pub use receipt::{
     DIFF_SCHEMA_VERSION, MANAGED_ENTITY_SET_VERSION, PORTABLE_PATH_CASE_FOLD_UNICODE_VERSION,
     PORTABLE_PATH_KEY_VERSION, PORTABLE_PATH_NORMALIZATION_UNICODE_VERSION,
     PROJECTION_POLICY_VERSION, PROJECTION_SCHEMA_VERSION, RECEIPT_SCHEMA_VERSION,
+};
+pub use reference_catalog::{
+    BlockReferenceFactV1, BlockReferenceKindV1, PageNameReferenceFactV1, PageReferenceKindV1,
+    ReferenceCatalogDeltaV1, ReferenceCatalogError, ReferenceCatalogPolicyV1,
+    ReferenceCatalogRootV1, ReferenceFactV1, ReferenceSourceLocatorV1, ReferenceSourcePostingV1,
+    MAX_REFERENCE_CATALOG_DELTA_BYTES, MAX_REFERENCE_CATALOG_DELTA_SOURCES,
+    REFERENCE_CATALOG_EXTRACTOR_VERSION, REFERENCE_CATALOG_POLICY_VERSION,
+    REFERENCE_CATALOG_ROOT_SCHEMA_VERSION, REFERENCE_CATALOG_SCHEMA_VERSION,
 };
 pub use semantic::{
     BlockDelta, BlockOwner, BlockState, CanonicalSnapshot, LogicalPageName, LogicalPageNameError,

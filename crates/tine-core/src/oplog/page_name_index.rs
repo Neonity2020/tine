@@ -420,6 +420,13 @@ pub(crate) struct PageNamePublicationCandidateV1 {
 }
 
 impl EphemeralPageNameOwnershipStateV1 {
+    pub(crate) fn resolve_current(&self, key: PageNameKeyDigest) -> Option<PageId> {
+        self.records
+            .get(&key)
+            .and_then(PageNameOwnershipRecordV1::occupied)
+            .map(PageNameOwnershipOccupiedV1::page_id)
+    }
+
     pub(crate) fn commit(&mut self, candidate: PageNamePublicationCandidateV1) {
         let Some(candidate) = candidate.ephemeral else {
             return;
