@@ -1708,6 +1708,7 @@ struct ManagedMigrationWriterBoundary {
     final_reread_bytes: u64,
     retained_before_writer: u64,
     writer_reservation_bytes: u64,
+    writer_reservation_attempted: bool,
     retained_after_writer: u64,
     pre_mutation_retained: u64,
     pre_mutation_peak: u64,
@@ -10719,6 +10720,7 @@ impl Graph {
         observe_managed_migration_writer(|observation| {
             observation.retained_before_writer = budget.retained();
             observation.writer_reservation_bytes = writer_reservation_bytes;
+            observation.writer_reservation_attempted = true;
         });
         let writer_reservation = budget.reserve(
             writer_reservation_bytes,
@@ -23731,6 +23733,26 @@ mod tests {
         let rejected_boundary = rejected_observer.observation();
         drop(rejected_observer);
         assert_eq!(rejected_boundary.pre_mutation_observations, 0);
+        assert_eq!(
+            rejected_boundary.final_reread_retained, boundary.final_reread_retained,
+            "the rejected run must retain the same final reread state"
+        );
+        assert_eq!(
+            rejected_boundary.final_reread_bytes, boundary.final_reread_bytes,
+            "the rejected run must reserve the same final reread bytes"
+        );
+        assert_eq!(
+            rejected_boundary.retained_before_writer, boundary.retained_before_writer,
+            "the rejected run must reach the same pre-writer retained state"
+        );
+        assert_eq!(
+            rejected_boundary.writer_reservation_bytes, boundary.writer_reservation_bytes,
+            "the rejected run must attempt the same source-derived writer reservation"
+        );
+        assert!(rejected_boundary.writer_reservation_attempted);
+        assert_eq!(rejected_boundary.retained_after_writer, 0);
+        assert_eq!(rejected_boundary.pre_mutation_retained, 0);
+        assert_eq!(rejected_boundary.pre_mutation_peak, 0);
         assert_eq!(fs::read(rejected.join("pages/A.md")).unwrap(), disk_before);
         assert_eq!(
             regular_file_tree(&rejected.join(".tine-sync")),
