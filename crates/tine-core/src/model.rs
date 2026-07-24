@@ -1702,6 +1702,19 @@ pub(crate) struct ProjectionGraphTestCounters {
 }
 
 #[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ManagedMigrationWriterBoundary {
+    final_reread_retained: u64,
+    final_reread_bytes: u64,
+    retained_before_writer: u64,
+    writer_reservation_bytes: u64,
+    retained_after_writer: u64,
+    pre_mutation_retained: u64,
+    pre_mutation_peak: u64,
+    pre_mutation_observations: usize,
+}
+
+#[cfg(test)]
 thread_local! {
     static FAIL_NEXT_RENAME_SOURCE_REMOVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static WITHDRAW_RACE_REPLACEMENT: std::cell::RefCell<Option<Vec<u8>>> = const { std::cell::RefCell::new(None) };
@@ -1720,8 +1733,7 @@ thread_local! {
     static INITIAL_SHADOW_REVALIDATION_RACE: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static MANAGED_TEXT_INVENTORY_LIMITS_OVERRIDE: std::cell::RefCell<Option<ManagedTextInventoryLimits>> = const { std::cell::RefCell::new(None) };
     static MANAGED_TEXT_BUDGET_LAST_PEAK: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    static MANAGED_MIGRATION_PRE_WRITER_PEAK: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    static MANAGED_MIGRATION_WRITER_ADMITTED_PEAK: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static MANAGED_MIGRATION_WRITER_OBSERVER: std::cell::RefCell<Option<Rc<Cell<ManagedMigrationWriterBoundary>>>> = const { std::cell::RefCell::new(None) };
     static BOUNDED_READ_AFTER_METADATA: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static HANDOFF_MINT_AFTER_RESERVATION: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static HANDOFF_TRANSFER_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
@@ -1733,6 +1745,59 @@ thread_local! {
     static MANAGED_WRITE_REPLACEMENT_HANDOFF: std::cell::RefCell<Option<HandoffSafe>> = const { std::cell::RefCell::new(None) };
     static SYNC_IDENTITY_AFTER_PREPARE: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static MANAGED_SYNC_ENABLE_AFTER_SNAPSHOT: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+struct ManagedMigrationWriterObserver {
+    observation: Rc<Cell<ManagedMigrationWriterBoundary>>,
+}
+
+#[cfg(test)]
+impl ManagedMigrationWriterObserver {
+    fn new() -> Self {
+        let observation = Rc::new(Cell::new(ManagedMigrationWriterBoundary::default()));
+        MANAGED_MIGRATION_WRITER_OBSERVER.with(|observer| {
+            let mut observer = observer.borrow_mut();
+            assert!(
+                observer.is_none(),
+                "managed migration writer observer is already installed"
+            );
+            *observer = Some(Rc::clone(&observation));
+        });
+        Self { observation }
+    }
+
+    fn observation(&self) -> ManagedMigrationWriterBoundary {
+        self.observation.get()
+    }
+}
+
+#[cfg(test)]
+impl Drop for ManagedMigrationWriterObserver {
+    fn drop(&mut self) {
+        MANAGED_MIGRATION_WRITER_OBSERVER.with(|observer| {
+            let mut observer = observer.borrow_mut();
+            if observer
+                .as_ref()
+                .is_some_and(|current| Rc::ptr_eq(current, &self.observation))
+            {
+                observer.take();
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+fn observe_managed_migration_writer(update: impl FnOnce(&mut ManagedMigrationWriterBoundary)) {
+    MANAGED_MIGRATION_WRITER_OBSERVER.with(|observer| {
+        let observer = observer.borrow();
+        let Some(observation) = observer.as_ref() else {
+            return;
+        };
+        let mut value = observation.get();
+        update(&mut value);
+        observation.set(value);
+    });
 }
 
 #[cfg(test)]
@@ -10463,11 +10528,6 @@ impl Graph {
         write: &ManagedTextWritePermit,
         budget: &RetainedContentBudget,
     ) -> io::Result<SyncIdentityMigration> {
-        #[cfg(test)]
-        {
-            MANAGED_MIGRATION_PRE_WRITER_PEAK.with(|value| value.set(0));
-            MANAGED_MIGRATION_WRITER_ADMITTED_PEAK.with(|value| value.set(0));
-        }
         let mut prepared = Vec::new();
         let mut prepared_slots =
             RetainedHeapCharge::new(Some(budget), "managed migration prepared vector capacity")?;
@@ -10596,7 +10656,10 @@ impl Graph {
             ));
         }
         #[cfg(test)]
-        MANAGED_MIGRATION_PRE_WRITER_PEAK.with(|value| value.set(budget.state.peak.get()));
+        observe_managed_migration_writer(|observation| {
+            observation.final_reread_retained = budget.retained();
+            observation.final_reread_bytes = current.reservation.bytes;
+        });
         if let Some(prepared) =
             self.prepare_managed_save(page, &path, Some(&current), cache, budget)?
         {
@@ -10650,10 +10713,21 @@ impl Graph {
             )?,
             "managed save retained expansion/projection scan bound",
         )?;
+        let writer_reservation_bytes =
+            self.managed_save_writer_upper_bound(&prepared.page, path, existing, cache)?;
+        #[cfg(test)]
+        observe_managed_migration_writer(|observation| {
+            observation.retained_before_writer = budget.retained();
+            observation.writer_reservation_bytes = writer_reservation_bytes;
+        });
         let writer_reservation = budget.reserve(
-            self.managed_save_writer_upper_bound(&prepared.page, path, existing, cache)?,
+            writer_reservation_bytes,
             "managed save writer/serialization/cache publication bound",
         )?;
+        #[cfg(test)]
+        observe_managed_migration_writer(|observation| {
+            observation.retained_after_writer = budget.retained();
+        });
         Ok(Some(PreparedManagedSaveOperation {
             budget: budget.clone(),
             page: prepared,
@@ -12457,6 +12531,12 @@ impl PreparedManagedSaveOperation {
             _operation_scan_reservation,
             _writer_reservation,
         } = self;
+        #[cfg(test)]
+        observe_managed_migration_writer(|observation| {
+            observation.pre_mutation_retained = _budget.retained();
+            observation.pre_mutation_peak = _budget.state.peak.get();
+            observation.pre_mutation_observations += 1;
+        });
         let sync_guard = graph.managed_sync.lock().unwrap();
         snapshot.commit_page_with_guard_then(sync_guard, || {
             let result = graph.write_page(write, &page.page, path, existing, recheck, cache);
@@ -12690,9 +12770,6 @@ mod prepared_crdt_mutation {
                 snapshot,
                 _reservation,
             } = self;
-            #[cfg(test)]
-            MANAGED_MIGRATION_WRITER_ADMITTED_PEAK
-                .with(|value| value.set(_reservation.state.peak.get()));
             let mut authority = PreparedCrdtMutationCapability::new(&_reservation);
             sync.commit_page_owned(snapshot, &mut authority)
                 .map_err(crdt_io_error)
@@ -17181,13 +17258,6 @@ mod tests {
 
     fn last_managed_content_budget_peak() -> u64 {
         MANAGED_TEXT_BUDGET_LAST_PEAK.with(Cell::get)
-    }
-
-    fn managed_migration_writer_boundary() -> (u64, u64) {
-        (
-            MANAGED_MIGRATION_PRE_WRITER_PEAK.with(Cell::get),
-            MANAGED_MIGRATION_WRITER_ADMITTED_PEAK.with(Cell::get),
-        )
     }
 
     #[test]
@@ -23607,12 +23677,30 @@ mod tests {
             .enable_managed_sync(Uuid::from_u128(91_047_501), Uuid::from_u128(91_047_502))
             .unwrap();
         fs::write(probe.join("pages/A.md"), &probe_changed).unwrap();
+        probe_graph.warm_cache();
+        let probe_observer = ManagedMigrationWriterObserver::new();
         probe_graph.migrate_sync_identities().unwrap();
-        let (pre_writer_peak, admitted_writer_peak) = managed_migration_writer_boundary();
-        assert!(
-            admitted_writer_peak > pre_writer_peak,
-            "writer+reread admission must exceed the already-admitted CRDT preparation"
+        let boundary = probe_observer.observation();
+        drop(probe_observer);
+        assert_eq!(boundary.pre_mutation_observations, 1);
+        assert!(boundary.final_reread_bytes > 0);
+        assert!(boundary.final_reread_retained >= boundary.final_reread_bytes);
+        assert!(boundary.retained_before_writer >= boundary.final_reread_retained);
+        assert!(boundary.writer_reservation_bytes > boundary.final_reread_bytes);
+        assert_eq!(
+            boundary.retained_after_writer,
+            boundary.retained_before_writer + boundary.writer_reservation_bytes,
         );
+        assert_eq!(
+            boundary.pre_mutation_retained,
+            boundary.retained_after_writer,
+            "the reread and source-derived writer/cache/serialization reservation must remain live until CRDT mutation"
+        );
+        assert_eq!(
+            boundary.pre_mutation_peak, boundary.pre_mutation_retained,
+            "the final writer reservation must define the exact pre-mutation peak"
+        );
+        let admitted_writer_boundary = boundary.pre_mutation_retained;
 
         let rejected = scratch("active-migration-writer-bound-b");
         let (initial, changed) = populate(&rejected);
@@ -23636,12 +23724,13 @@ mod tests {
             )
         };
 
-        set_managed_content_budget_limit(admitted_writer_peak - 1);
+        set_managed_content_budget_limit(admitted_writer_boundary - 1);
+        let rejected_observer = ManagedMigrationWriterObserver::new();
         let error = graph.migrate_sync_identities().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        let (failed_pre_writer, failed_admitted_writer) = managed_migration_writer_boundary();
-        assert!(failed_pre_writer <= admitted_writer_peak - 1);
-        assert_eq!(failed_admitted_writer, 0);
+        let rejected_boundary = rejected_observer.observation();
+        drop(rejected_observer);
+        assert_eq!(rejected_boundary.pre_mutation_observations, 0);
         assert_eq!(fs::read(rejected.join("pages/A.md")).unwrap(), disk_before);
         assert_eq!(
             regular_file_tree(&rejected.join(".tine-sync")),
@@ -23667,9 +23756,13 @@ mod tests {
             );
         }
 
-        set_managed_content_budget_limit(admitted_writer_peak);
+        set_managed_content_budget_limit(admitted_writer_boundary);
+        let retry_observer = ManagedMigrationWriterObserver::new();
         let retry = graph.migrate_sync_identities().unwrap();
         clear_managed_content_budget_limit();
+        let retry_boundary = retry_observer.observation();
+        drop(retry_observer);
+        assert_eq!(retry_boundary, boundary);
         assert_eq!(retry.pages_changed, 1);
         assert!(
             fs::read_to_string(rejected.join("pages/A.md"))

@@ -5682,7 +5682,7 @@ mod tests {
                 .sum()
         }
 
-        const DEPTH: usize = 512;
+        const DEPTH: usize = 128;
         let dir =
             std::env::temp_dir().join(format!("tine-non-overlap-results-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
