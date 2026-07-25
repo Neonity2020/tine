@@ -29,10 +29,11 @@ use super::object_store::{
 };
 use super::{
     BaseBlob, BlobDescription, CapabilityCapturedProjectionInput,
-    CapabilityCapturedProjectionState, ManagedPath, ProjectionCompletion,
-    ProjectionEndpointBinding, ProjectionIntent, ProjectionIntentId, ProjectionPrecondition,
-    ProjectionReceiptStoreId, ProjectionWork, ProjectionWorkCompletionAuthority,
-    ProjectionWorkTarget, ReceiptError, WorkspaceId,
+    CapabilityCapturedProjectionState, ManagedPath, ProjectionCompletedReceipt,
+    ProjectionCompletion, ProjectionDirectCompletionAuthority, ProjectionEndpointBinding,
+    ProjectionIntent, ProjectionIntentId, ProjectionPrecondition, ProjectionReceiptStoreId,
+    ProjectionWork, ProjectionWorkCompletionAuthority, ProjectionWorkTarget, ReceiptError,
+    WorkspaceId,
 };
 use crate::model::{Graph, ProjectionWriteProof};
 
@@ -1157,6 +1158,74 @@ impl ProjectionReceiptStore {
         }
         self.reconcile_completed_mutation(intent, intent_id)?;
         Ok(Some(completion))
+    }
+
+    /// Load one completed receipt through an authenticated work-index row.
+    /// This performs direct immutable intent/completion reads only; it never
+    /// enumerates a receipt namespace.
+    pub(crate) fn load_completed_receipt(
+        &self,
+        completed: &ProjectionCompletedReceipt,
+    ) -> Result<(ProjectionIntent, ProjectionCompletion), ProjectionStoreError> {
+        let intents = self.namespace(INTENTS_DIR)?;
+        let filename = intent_filename(completed.intent_id());
+        let bytes =
+            read_optional_regular(&intents, &filename, MAX_PROJECTION_EVIDENCE_BYTES, None)?
+                .ok_or(ProjectionStoreError::MissingPriorCompletion)?;
+        let intent = ProjectionIntent::decode(&bytes)?;
+        self.require_workspace(&intent)?;
+        if intent.encode()? != bytes
+            || intent.id()? != completed.intent_id()
+            || filename != intent_filename(intent.id()?)
+        {
+            return Err(ProjectionStoreError::PathBindingMismatch(
+                "projection intent",
+            ));
+        }
+        let target_matches = match completed.target() {
+            ProjectionWorkTarget::Absent => intent.target() == BlobDescription::of(&[]),
+            ProjectionWorkTarget::Present(target) => intent.target() == target,
+        };
+        if intent.page_id() != completed.page_id()
+            || intent.path() != completed.path()
+            || intent.frontier() != completed.frontier()
+            || !target_matches
+        {
+            return Err(ProjectionStoreError::EndpointBindingMismatch);
+        }
+        let completion = self
+            .load_completion(&intent)?
+            .ok_or(ProjectionStoreError::MissingPriorCompletion)?;
+        if completion.logical_completion_id() != completed.logical_completion_id() {
+            return Err(ProjectionStoreError::PathBindingMismatch(
+                "projection completed-work mapping",
+            ));
+        }
+        Ok((intent, completion))
+    }
+
+    pub(crate) fn completed_direct_authority(
+        &self,
+        intent: &ProjectionIntent,
+    ) -> Result<ProjectionDirectCompletionAuthority, ProjectionStoreError> {
+        let endpoint = self
+            .endpoint
+            .ok_or(ProjectionStoreError::EndpointBindingMismatch)?;
+        self.require_endpoint(endpoint)?;
+        self.require_workspace(intent)?;
+        let completion = self
+            .load_completion(intent)?
+            .ok_or(ProjectionStoreError::MissingPriorCompletion)?;
+        completion.validate_against(intent)?;
+        Ok(
+            ProjectionDirectCompletionAuthority::from_durable_completion(
+                endpoint.endpoint_id,
+                endpoint.graph_resource_id,
+                self.store_id,
+                intent,
+                &completion,
+            ),
+        )
     }
 
     pub(crate) fn completed_work_authority(

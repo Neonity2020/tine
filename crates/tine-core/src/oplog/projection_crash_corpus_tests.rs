@@ -461,7 +461,11 @@ fn assert_live_fixture_pages_semantics(pages: &[SemanticFixturePage]) {
         .map(|(_, _, path)| path.as_str())
         .collect::<Vec<_>>();
     let import = plan_affected_import(&graph, &receipts, &engine, &requested);
-    assert_eq!(import.status(), ImportPlanStatus::Noop);
+    assert_eq!(
+        import.status(),
+        ImportPlanStatus::Noop,
+        "live projection fixture must be import-clean: {import:#?}"
+    );
     let inventory = import.inventory().unwrap();
     let matches = import.matches().unwrap();
     assert_eq!(matches.pages().len(), live.len());

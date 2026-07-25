@@ -13,14 +13,15 @@ use super::external_import::{
     ExternalImportObservationEntry, ExternalImportObservationMaterial,
     ExternalImportObservationMaterialError, ExternalImportObservationState,
 };
-use super::hot_engine::AcceptedFrontierRoot;
+use super::hot_engine::{AcceptedFrontierRoot, MAX_TRANSACTION_OPERATIONS};
 use super::{
     plan_projection, AnnotatedIdentity, BatchId, BatchOrigin, BlobDescription, BlockId,
     BlockLocation, ContentDigest, CurrentPageAtPath, DocumentId, ImportId, ImportInventoryEntry,
     ImportInventoryState, ImportLocator, LogicalCompletionId, LogicalPageName,
     LogseqIdentityMutation, LogseqUuid, ManagedPath, ManagedTextKind, OperationTransaction, PageId,
-    ProjectionCompletion, ProjectionIntent, ProjectionReceiptStore, SemanticOperation,
-    ShardedHotEngine, StructuralLocator, StructuralSpan, WorkspaceId, DIFF_SCHEMA_VERSION,
+    ProjectionCompletedReceipt, ProjectionCompletion, ProjectionIntent, ProjectionReceiptStore,
+    SemanticOperation, ShardedHotEngine, StructuralLocator, StructuralSpan, WorkspaceId,
+    DIFF_SCHEMA_VERSION,
 };
 use crate::doc::Document;
 use crate::model::{path_is_sync_conflict, Graph, PageKind};
@@ -158,11 +159,21 @@ impl RawInventory {
             })
     }
 
-    fn derivation_entries(&self) -> Vec<ImportInventoryEntry> {
+    fn derivation_entries(
+        &self,
+        path_identities: &BTreeMap<ManagedPath, ImportedPathIdentity>,
+    ) -> Result<Vec<ImportInventoryEntry>, ImportExecutionError> {
         self.entries
             .iter()
             .map(|(path, observation)| {
-                ImportInventoryEntry::new(
+                let identity =
+                    path_identities
+                        .get(path)
+                        .ok_or(ImportExecutionError::IncompletePlan(
+                            "sealed inventory path has no Graph-decoded managed kind",
+                        ))?;
+                Ok(ImportInventoryEntry::with_kind(
+                    identity.kind,
                     path.clone(),
                     match observation {
                         RawObservation::Present(bytes) => {
@@ -170,7 +181,7 @@ impl RawInventory {
                         }
                         RawObservation::Absent => ImportInventoryState::Absent,
                     },
-                )
+                ))
             })
             .collect()
     }
@@ -327,25 +338,12 @@ fn retain_rendered_target(
     Ok(())
 }
 
-fn require_default_layout(graph: &Graph) -> Result<(), InventoryError> {
-    let (pages_directory, journals_directory) = graph.raw_managed_text_layout();
-    if pages_directory == "pages" && journals_directory == "journals" {
-        Ok(())
-    } else {
-        Err(InventoryError::UnsupportedManagedLayout {
-            pages_directory: pages_directory.to_owned(),
-            journals_directory: journals_directory.to_owned(),
-        })
-    }
-}
-
 /// Read only the explicitly named affected paths. No directory enumeration is
 /// performed, including when a requested path is absent.
 pub fn inventory_affected(
     graph: &Graph,
     requested_paths: &[&str],
 ) -> Result<RawInventory, InventoryError> {
-    require_default_layout(graph)?;
     if requested_paths.len() > MAX_IMPORT_FILES {
         return Err(InventoryError::ResourceBudgetExceeded {
             resource: "requested managed path count",
@@ -402,7 +400,6 @@ pub fn inventory_affected(
 /// later import boundary; a caller may not retain this snapshot and assume the
 /// live graph remained unchanged.
 pub fn inventory_initial_shadow(graph: &Graph) -> Result<RawInventory, InventoryError> {
-    require_default_layout(graph)?;
     let captured = graph
         .initial_shadow_raw_managed_text_inventory()
         .map_err(|error| {
@@ -499,9 +496,20 @@ struct InventoryPathFingerprint {
     file_resource_id: Option<ContentDigest>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AffectedReceiptEntry {
+    completed: ProjectionCompletedReceipt,
+    intent: ProjectionIntent,
+    completion: ProjectionCompletion,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct AffectedReceiptCatalog {
+    by_path: BTreeMap<ManagedPath, Vec<AffectedReceiptEntry>>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct CatalogAuthority {
-    generation: u64,
     digest: ContentDigest,
 }
 
@@ -802,10 +810,36 @@ impl ImportPlan {
             }
         }
     }
+
+    /// Consume a reconciliable plan at the engine handoff boundary.  This
+    /// deliberately moves the observation bytes: the execution adapter must
+    /// not clone an already-bounded external observation just to author it.
+    #[allow(dead_code)]
+    pub(crate) fn into_execution_material(
+        mut self,
+    ) -> Result<ImportExecutionMaterial, ImportExecutionError> {
+        match self.status {
+            ImportPlanStatus::Noop | ImportPlanStatus::Blocked => {
+                Err(ImportExecutionError::RefusedStatus(self.status))
+            }
+            ImportPlanStatus::Reconcile => {
+                self.scope
+                    .take()
+                    .ok_or(ImportExecutionError::IncompletePlan(
+                        "reconcile plan has no sealed import scope",
+                    ))?;
+                self.execution
+                    .take()
+                    .ok_or(ImportExecutionError::IncompletePlan(
+                        "reconcile plan has no sealed execution material",
+                    ))
+            }
+        }
+    }
 }
 
-/// Minimal crate-internal handoff from receipt-backed import planning to a
-/// future hot-engine adapter. It carries no write capability, engine reference,
+/// Minimal crate-internal handoff from receipt-backed import planning to the
+/// hot-engine draft adapter. It carries no write capability, engine reference,
 /// captured projection input, or publish authority.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ImportExecutionMaterial {
@@ -814,8 +848,8 @@ pub(crate) struct ImportExecutionMaterial {
     observation: ExternalImportObservationMaterial,
 }
 
-// Packet 4B intentionally stops before hot-engine authoring and publication.
-// The next adapter packet consumes this sealed material through these methods.
+// The hot-engine adapter consumes this sealed material for drafting only;
+// capability recapture and publication remain separate authority boundaries.
 #[allow(dead_code)]
 impl ImportExecutionMaterial {
     pub(crate) const fn import_id(&self) -> ImportId {
@@ -839,6 +873,16 @@ impl ImportExecutionMaterial {
     pub(crate) fn observation(&self) -> &ExternalImportObservationMaterial {
         &self.observation
     }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        ImportId,
+        OperationTransaction,
+        ExternalImportObservationMaterial,
+    ) {
+        (self.import_id, self.transaction, self.observation)
+    }
 }
 
 #[allow(dead_code)]
@@ -847,6 +891,7 @@ pub(crate) enum ImportExecutionError {
     RefusedStatus(ImportPlanStatus),
     IncompletePlan(&'static str),
     InvalidMaterial(String),
+    OperationLimit,
     Observation(ExternalImportObservationMaterialError),
 }
 
@@ -861,6 +906,10 @@ impl fmt::Display for ImportExecutionError {
             }
             Self::IncompletePlan(detail) => formatter.write_str(detail),
             Self::InvalidMaterial(detail) => formatter.write_str(detail),
+            Self::OperationLimit => write!(
+                formatter,
+                "external reconciliation operation count exceeds {MAX_TRANSACTION_OPERATIONS}"
+            ),
             Self::Observation(error) => error.fmt(formatter),
         }
     }
@@ -884,7 +933,7 @@ pub fn plan_affected_import(
         requested_paths: requested_paths.len(),
         ..ImportInstrumentation::default()
     };
-    let paths = match parse_requested_paths(graph, requested_paths) {
+    let paths = match parse_requested_paths(requested_paths) {
         Ok(paths) => paths,
         Err(error) => return blocked_inventory_error(error, instrumentation),
     };
@@ -903,10 +952,11 @@ pub fn plan_affected_import(
             );
         }
     };
-    let (catalog, catalog_authority) = match capture_catalog(receipts, &mut instrumentation) {
-        Ok(snapshot) => snapshot,
-        Err(block) => return blocked_authority_error(None, block, instrumentation),
-    };
+    let (catalog, catalog_authority) =
+        match capture_affected_catalog(receipts, engine, &paths, &mut instrumentation) {
+            Ok(snapshot) => snapshot,
+            Err(block) => return blocked_authority_error(None, block, instrumentation),
+        };
     let (inventory, inventory_fingerprints, first_raw_bytes) =
         match capture_inventory(graph, &paths, true, 0, &mut instrumentation) {
             Ok((Some(inventory), fingerprints, raw_bytes)) => (inventory, fingerprints, raw_bytes),
@@ -944,13 +994,14 @@ pub fn plan_affected_import(
                 );
             }
         };
-    let (_, post_catalog_authority) = match capture_catalog(receipts, &mut instrumentation) {
-        Ok(snapshot) => snapshot,
-        Err(mut block) => {
-            block.reason = ImportBlockReason::StaleScope;
-            return blocked_authority_error(Some(inventory), block, instrumentation);
-        }
-    };
+    let (_, post_catalog_authority) =
+        match capture_affected_catalog(receipts, engine, &paths, &mut instrumentation) {
+            Ok(snapshot) => snapshot,
+            Err(mut block) => {
+                block.reason = ImportBlockReason::StaleScope;
+                return blocked_authority_error(Some(inventory), block, instrumentation);
+            }
+        };
     let post_frontier = match post_snapshot_frontier(engine) {
         Ok(root) => root,
         Err(error) => {
@@ -970,7 +1021,7 @@ pub fn plan_affected_import(
             authority_block(
                 ImportBlockReason::StaleScope,
                 None,
-                "inventory, receipt catalog, or accepted frontier changed between snapshot passes",
+                "inventory, exact affected receipt authority, or accepted frontier changed between snapshot passes",
             ),
             instrumentation,
         );
@@ -978,7 +1029,7 @@ pub fn plan_affected_import(
     // Equal bounded collections detect stale diagnostic input only under the
     // explicit quiescent-writer boundary. They are neither a portable atomic
     // filesystem snapshot nor authority for later publication.
-    plan_import(inventory, scope, instrumentation)
+    plan_import(inventory, scope, engine, instrumentation)
 }
 
 #[cfg(test)]
@@ -1009,11 +1060,7 @@ fn post_snapshot_frontier(
     engine.accepted_frontier_root()
 }
 
-fn parse_requested_paths(
-    graph: &Graph,
-    requested_paths: &[&str],
-) -> Result<Vec<ManagedPath>, InventoryError> {
-    require_default_layout(graph)?;
+fn parse_requested_paths(requested_paths: &[&str]) -> Result<Vec<ManagedPath>, InventoryError> {
     if requested_paths.len() > MAX_IMPORT_FILES {
         return Err(InventoryError::ResourceBudgetExceeded {
             resource: "requested managed path count",
@@ -1116,78 +1163,111 @@ fn capture_inventory(
     Ok((inventory, fingerprints, raw_bytes))
 }
 
-fn capture_catalog(
+/// Capture only the durable receipts reachable from the enrolled completed-work
+/// mapping for the requested exact paths.  The work index's authenticated
+/// Patricia root supplies the path-to-intent ids; the receipt store then makes
+/// the matching immutable point reads.  No receipt directory is enumerated.
+fn capture_affected_catalog(
     receipts: &ProjectionReceiptStore,
+    engine: &ShardedHotEngine,
+    requested_paths: &[ManagedPath],
     instrumentation: &mut ImportInstrumentation,
-) -> Result<
-    (
-        Vec<super::projection_store::ProjectionCatalogEntry>,
-        CatalogAuthority,
-    ),
-    ImportBlock,
-> {
-    let catalog = receipts.validated_catalog().map_err(|error| {
+) -> Result<(AffectedReceiptCatalog, CatalogAuthority), ImportBlock> {
+    let (_, work_index) = engine.enrolled_projection_runtime().map_err(|error| {
         authority_block(
-            if matches!(&error, super::ProjectionStoreError::EvidenceTooLarge { .. }) {
-                ImportBlockReason::ResourceLimit
-            } else {
-                ImportBlockReason::CorruptBase
-            },
+            ImportBlockReason::AuthorityUnavailable,
             None,
-            format!("durable receipt catalog is invalid: {error}"),
+            error.to_string(),
         )
     })?;
-    if catalog.len() > MAX_IMPORT_CATALOG_ENTRIES {
+    if work_index.receipt_store_id() != receipts.store_id() {
         return Err(authority_block(
-            ImportBlockReason::ResourceLimit,
+            ImportBlockReason::AuthorityUnavailable,
             None,
-            format!(
-                "receipt catalog entry budget exceeded: observed {}, limit {}",
-                catalog.len(),
-                MAX_IMPORT_CATALOG_ENTRIES
-            ),
+            "enrolled work index is not bound to the receipt store",
         ));
     }
-    instrumentation.catalog_entries = instrumentation
-        .catalog_entries
-        .saturating_add(catalog.len());
+
+    let mut catalog = AffectedReceiptCatalog::default();
+    let mut captured_entries = 0usize;
     let mut hasher = Sha256::new();
-    hasher.update(b"tine/import-receipt-catalog-snapshot/v1\0");
+    hasher.update(b"tine/import-affected-receipt-snapshot/v2\0");
     hasher.update(receipts.store_id().as_bytes());
-    for entry in &catalog {
-        let intent = entry.intent.encode().map_err(|error| {
-            authority_block(ImportBlockReason::CorruptBase, None, error.to_string())
-        })?;
-        instrumentation.catalog_bytes_hashed = instrumentation
-            .catalog_bytes_hashed
-            .saturating_add(intent.len() as u64);
-        hasher.update((intent.len() as u64).to_be_bytes());
-        hasher.update(&intent);
-        match &entry.completion {
-            Some(completion) => {
-                let completion = completion.encode().map_err(|error| {
-                    authority_block(ImportBlockReason::CorruptBase, None, error.to_string())
-                })?;
-                instrumentation.catalog_bytes_hashed = instrumentation
-                    .catalog_bytes_hashed
-                    .saturating_add(completion.len() as u64);
-                hasher.update([1]);
-                hasher.update((completion.len() as u64).to_be_bytes());
-                hasher.update(completion);
-            }
-            None => hasher.update([0]),
+    for path in requested_paths {
+        hasher.update((path.as_str().len() as u64).to_be_bytes());
+        hasher.update(path.as_str().as_bytes());
+        let completed = work_index
+            .completed_receipts_for_path(path)
+            .map_err(|error| {
+                authority_block(
+                    ImportBlockReason::CorruptBase,
+                    Some(path),
+                    format!("authenticated completed-work path lookup failed: {error}"),
+                )
+            })?;
+        if completed.len() > MAX_IMPORT_CATALOG_ENTRIES.saturating_sub(captured_entries) {
+            return Err(authority_block(
+                ImportBlockReason::ResourceLimit,
+                Some(path),
+                format!(
+                    "affected completed-work entry budget exceeded: observed {} after {}, limit {}",
+                    completed.len(),
+                    captured_entries,
+                    MAX_IMPORT_CATALOG_ENTRIES
+                ),
+            ));
         }
+        let mut entries = Vec::with_capacity(completed.len());
+        for completed in completed {
+            let (intent, completion) =
+                receipts
+                    .load_completed_receipt(&completed)
+                    .map_err(|error| {
+                        authority_block(
+                            ImportBlockReason::CorruptBase,
+                            Some(path),
+                            format!("durable exact receipt lookup is invalid: {error}"),
+                        )
+                    })?;
+            let intent_bytes = intent.encode().map_err(|error| {
+                authority_block(
+                    ImportBlockReason::CorruptBase,
+                    Some(path),
+                    error.to_string(),
+                )
+            })?;
+            let completion_bytes = completion.encode().map_err(|error| {
+                authority_block(
+                    ImportBlockReason::CorruptBase,
+                    Some(path),
+                    error.to_string(),
+                )
+            })?;
+            instrumentation.catalog_entries = instrumentation.catalog_entries.saturating_add(1);
+            instrumentation.catalog_bytes_hashed = instrumentation
+                .catalog_bytes_hashed
+                .saturating_add(intent_bytes.len() as u64)
+                .saturating_add(completion_bytes.len() as u64);
+            hasher.update(completed.intent_id().as_bytes());
+            hasher.update((intent_bytes.len() as u64).to_be_bytes());
+            hasher.update(intent_bytes);
+            hasher.update((completion_bytes.len() as u64).to_be_bytes());
+            hasher.update(completion_bytes);
+            entries.push(AffectedReceiptEntry {
+                completed,
+                intent,
+                completion,
+            });
+            captured_entries = captured_entries.saturating_add(1);
+        }
+        catalog.by_path.insert(path.clone(), entries);
     }
-    let authority = CatalogAuthority {
-        generation: catalog.len().saturating_add(
-            catalog
-                .iter()
-                .filter(|entry| entry.completion.is_some())
-                .count(),
-        ) as u64,
-        digest: ContentDigest::from_bytes(hasher.finalize().into()),
-    };
-    Ok((catalog, authority))
+    Ok((
+        catalog,
+        CatalogAuthority {
+            digest: ContentDigest::from_bytes(hasher.finalize().into()),
+        },
+    ))
 }
 
 fn capture_import_scope(
@@ -1195,7 +1275,7 @@ fn capture_import_scope(
     receipts: &ProjectionReceiptStore,
     engine: &ShardedHotEngine,
     requested_paths: &[ManagedPath],
-    catalog: Vec<super::projection_store::ProjectionCatalogEntry>,
+    catalog: AffectedReceiptCatalog,
     instrumentation: &mut ImportInstrumentation,
 ) -> Result<ImportScopeSnapshot, ImportBlock> {
     let endpoint = engine.projection_endpoint_binding().ok_or_else(|| {
@@ -1221,16 +1301,6 @@ fn capture_import_scope(
             None,
             "graph, engine, receipt workspace, or endpoint binding differs",
         ));
-    }
-
-    let mut catalog_by_path = BTreeMap::<ManagedPath, Vec<_>>::new();
-    for entry in catalog {
-        instrumentation.catalog_path_inserts =
-            instrumentation.catalog_path_inserts.saturating_add(1);
-        catalog_by_path
-            .entry(entry.intent.path().clone())
-            .or_default()
-            .push(entry);
     }
 
     let mut paths = BTreeMap::new();
@@ -1259,7 +1329,7 @@ fn capture_import_scope(
         path_identities.insert(path.clone(), ImportedPathIdentity { name, kind });
         instrumentation.catalog_path_lookups =
             instrumentation.catalog_path_lookups.saturating_add(1);
-        let catalog_entries = catalog_by_path.get(path).map(Vec::as_slice).unwrap_or(&[]);
+        let catalog_entries = catalog.by_path.get(path).map(Vec::as_slice).unwrap_or(&[]);
         let current_owner = engine.current_page_at_path(path).map_err(|error| {
             authority_block(
                 ImportBlockReason::AuthorityUnavailable,
@@ -1293,30 +1363,13 @@ fn capture_import_scope(
                         || entry.intent.path() != path
                         || entry.intent.frontier() != work.post_frontier()
                         || entry.intent.target() != BlobDescription::of(&[])
+                        || entry.completed.page_id() != work.page_id()
+                        || entry.completed.frontier() != work.post_frontier()
+                        || entry.completed.target() != super::ProjectionWorkTarget::Absent
                     {
                         continue;
                     }
-                    let authority = receipts
-                        .completed_work_authority(&work, &entry.intent)
-                        .map_err(|error| {
-                            authority_block(
-                                ImportBlockReason::ConflictingLocalTail,
-                                Some(path),
-                                format!("released path completion is unavailable: {error}"),
-                            )
-                        })?;
-                    work_index.require_completed(&authority).map_err(|error| {
-                        authority_block(
-                            ImportBlockReason::ConflictingLocalTail,
-                            Some(path),
-                            format!("released path completion is stale: {error}"),
-                        )
-                    })?;
-                    let logical = entry
-                        .completion
-                        .as_ref()
-                        .expect("completion authority requires completion")
-                        .logical_completion_id();
+                    let logical = entry.completion.logical_completion_id();
                     if completion_id.replace(logical).is_some() {
                         return Err(authority_block(
                             ImportBlockReason::CorruptBase,
@@ -1460,27 +1513,16 @@ fn capture_import_scope(
             .remove(&base_key)
             .expect("exact replay key remains cached")
             .1;
-        let completion = match &entry.completion {
-            Some(completion) => {
-                completion
-                    .validate_against(&entry.intent)
-                    .map_err(|error| {
-                        authority_block(
-                            ImportBlockReason::CorruptBase,
-                            Some(path),
-                            error.to_string(),
-                        )
-                    })?;
-                completion.clone()
-            }
-            None => {
-                return Err(authority_block(
-                    ImportBlockReason::MissingBase,
+        let completion = entry.completion.clone();
+        completion
+            .validate_against(&entry.intent)
+            .map_err(|error| {
+                authority_block(
+                    ImportBlockReason::CorruptBase,
                     Some(path),
-                    "current accepted projection has no durable Graph-proved completion",
-                ));
-            }
-        };
+                    error.to_string(),
+                )
+            })?;
         paths.insert(
             path.clone(),
             ScopedPathEvidence::Existing(ReceiptBackedPage {
@@ -1522,6 +1564,7 @@ fn authority_block(
 fn plan_import(
     inventory: RawInventory,
     scope: ImportScopeSnapshot,
+    engine: &ShardedHotEngine,
     mut instrumentation: ImportInstrumentation,
 ) -> ImportPlan {
     if scope.paths.len() != inventory.entries().len()
@@ -1627,10 +1670,26 @@ fn plan_import(
     }));
     completion_ids.sort_unstable();
     completion_ids.dedup();
+    let derivation_entries = match inventory.derivation_entries(&scope.path_identities) {
+        Ok(entries) => entries,
+        Err(error) => {
+            return blocked_authority_error(
+                Some(inventory),
+                ImportBlock {
+                    reason: ImportBlockReason::StaleScope,
+                    paths: Vec::new(),
+                    logical_completion_ids: completion_ids,
+                    observation: None,
+                    detail: error.to_string(),
+                },
+                instrumentation,
+            );
+        }
+    };
     let import_id = match ImportId::derive(
         scope.workspace_id,
         &completion_ids,
-        &inventory.derivation_entries(),
+        &derivation_entries,
         DIFF_SCHEMA_VERSION,
     ) {
         Ok(import_id) => import_id,
@@ -1649,6 +1708,12 @@ fn plan_import(
         }
     };
 
+    if let Err(block) =
+        preflight_desired_page_names(&inventory, &matches, &scope, import_id, engine)
+    {
+        return blocked_authority_error(Some(inventory), block, instrumentation);
+    }
+
     let completed_paths = completed
         .iter()
         .map(|page| page.path().clone())
@@ -1664,13 +1729,23 @@ fn plan_import(
         matches!(observation, RawObservation::Present(_)) && !completed_paths.contains(path)
     });
     let execution = if changed {
-        match build_execution_material(import_id, &inventory, &matches, &scope) {
+        match build_execution_material(
+            import_id,
+            &inventory,
+            &matches,
+            &scope,
+            &mut instrumentation,
+        ) {
             Ok(execution) => Some(execution),
             Err(error) => {
                 return blocked_authority_error(
                     Some(inventory),
                     ImportBlock {
-                        reason: ImportBlockReason::UnsafeInput,
+                        reason: if matches!(&error, ImportExecutionError::OperationLimit) {
+                            ImportBlockReason::ResourceLimit
+                        } else {
+                            ImportBlockReason::UnsafeInput
+                        },
                         paths: Vec::new(),
                         logical_completion_ids: completion_ids,
                         observation: None,
@@ -1701,6 +1776,83 @@ fn plan_import(
     }
 }
 
+/// Refuse a transaction before authoring when two affected files would acquire
+/// one logical page name, or when an affected destination name is already
+/// owned by another authenticated page.  Paths are deliberately not used as a
+/// name namespace: duplicate basenames at different paths remain visible
+/// ambiguity instead of a silently successful reconciliation.
+fn preflight_desired_page_names(
+    inventory: &RawInventory,
+    matches: &ImportMatches,
+    scope: &ImportScopeSnapshot,
+    import_id: ImportId,
+    engine: &ShardedHotEngine,
+) -> Result<(), ImportBlock> {
+    let matched_pages = matches
+        .pages()
+        .iter()
+        .map(|page| (page.path().clone(), page.page_id()))
+        .collect::<BTreeMap<_, _>>();
+    let mut desired = BTreeMap::new();
+    for (path, observation) in inventory.entries() {
+        if !matches!(observation, RawObservation::Present(_)) {
+            continue;
+        }
+        let identity = scope.path_identities.get(path).ok_or_else(|| {
+            authority_block(
+                ImportBlockReason::StaleScope,
+                Some(path),
+                "present inventory path has no Graph-decoded logical identity",
+            )
+        })?;
+        let page_id = matched_pages
+            .get(path)
+            .copied()
+            .unwrap_or_else(|| import_id.unmatched_page_id(&ImportLocator::page(path.clone())));
+        if let Some((prior_path, prior_page_id, prior_name)) = desired.insert(
+            identity.name.key_digest(),
+            (path.clone(), page_id, identity.name.clone()),
+        ) {
+            if prior_page_id != page_id {
+                return Err(ImportBlock {
+                    reason: ImportBlockReason::ConflictingLocalTail,
+                    paths: vec![prior_path.as_str().to_owned(), path.as_str().to_owned()],
+                    logical_completion_ids: Vec::new(),
+                    observation: inventory_observation(inventory, path.as_str()),
+                    detail: format!(
+                        "affected paths decode to the same logical page name: {} and {}",
+                        prior_name.as_str(),
+                        identity.name.as_str()
+                    ),
+                });
+            }
+        }
+    }
+    for (_, (path, page_id, name)) in desired {
+        let owner = engine
+            .current_page_for_logical_name(&name)
+            .map_err(|error| {
+                authority_block(
+                    ImportBlockReason::AuthorityUnavailable,
+                    Some(&path),
+                    format!("authenticated logical page-name lookup failed: {error}"),
+                )
+            })?;
+        if owner.is_some_and(|owner| owner != page_id) {
+            return Err(authority_block(
+                ImportBlockReason::ConflictingLocalTail,
+                Some(&path),
+                format!(
+                    "decoded destination logical page name {} is already owned by page {}",
+                    name.as_str(),
+                    owner.expect("checked above")
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug)]
 struct CurrentImportBlock {
     page_id: PageId,
@@ -1729,11 +1881,23 @@ struct DesiredImportBlock {
     existing: bool,
 }
 
+fn push_operation(
+    operations: &mut Vec<SemanticOperation>,
+    operation: SemanticOperation,
+) -> Result<(), ImportExecutionError> {
+    if operations.len() == MAX_TRANSACTION_OPERATIONS {
+        return Err(ImportExecutionError::OperationLimit);
+    }
+    operations.push(operation);
+    Ok(())
+}
+
 fn build_execution_material(
     import_id: ImportId,
     inventory: &RawInventory,
     matches: &ImportMatches,
     scope: &ImportScopeSnapshot,
+    instrumentation: &mut ImportInstrumentation,
 ) -> Result<ImportExecutionMaterial, ImportExecutionError> {
     let mut current_pages = BTreeMap::<PageId, &ReceiptBackedPage>::new();
     let mut current_blocks = BTreeMap::<BlockId, CurrentImportBlock>::new();
@@ -1811,7 +1975,7 @@ fn build_execution_material(
                 DesiredImportPage {
                     page_id: current.page_id,
                     home_document_id: current.home_document_id,
-                    name: current.name.clone(),
+                    name: path_identity.name.clone(),
                     path: path.clone(),
                     kind: path_identity.kind,
                     existing: true,
@@ -1836,7 +2000,6 @@ fn build_execution_material(
         }
     }
 
-    let mut execution_instrumentation = ImportInstrumentation::default();
     let mut trees = BTreeMap::<ManagedPath, ParsedTree>::new();
     for (path, observation) in inventory.entries() {
         let RawObservation::Present(bytes) = observation else {
@@ -1849,7 +2012,7 @@ fn build_execution_material(
         }
         trees.insert(
             path.clone(),
-            parse_nodes(path, bytes.bytes(), &mut execution_instrumentation)
+            parse_nodes(path, bytes.bytes(), instrumentation)
                 .map_err(|block| ImportExecutionError::InvalidMaterial(block.detail))?,
         );
     }
@@ -1905,7 +2068,7 @@ fn build_execution_material(
                 })?;
                 let mut annotations = Vec::with_capacity(tree.nodes.len());
                 for index in 0..tree.nodes.len() {
-                    let locator = materialize_locator(tree, index, &mut execution_instrumentation)
+                    let locator = materialize_locator(tree, index, instrumentation)
                         .map_err(|block| ImportExecutionError::InvalidMaterial(block.detail))?;
                     let matched = block_matches.get(&(path.clone(), locator.clone())).copied();
                     let (block_id, existing, home_document_id) = match matched {
@@ -1938,9 +2101,7 @@ fn build_execution_material(
                         external_logseq_uuid(path, &locator, &tree.nodes[index], &rejected_raw_ids);
                     annotations.push(AnnotatedIdentity::new(
                         locator.clone(),
-                        StructuralSpan::new(0, bytes.bytes().len() as u64).map_err(|error| {
-                            ImportExecutionError::InvalidMaterial(error.to_string())
-                        })?,
+                        tree.nodes[index].span,
                         block_id,
                         logseq_uuid,
                     ));
@@ -1992,13 +2153,16 @@ fn build_execution_material(
 
     let mut operations = Vec::new();
     for page in desired_pages.values().filter(|page| !page.existing) {
-        operations.push(SemanticOperation::CreatePage {
-            page_id: page.page_id,
-            home_document_id: page.home_document_id,
-            name: page.name.clone(),
-            path: page.path.clone(),
-            kind: page.kind,
-        });
+        push_operation(
+            &mut operations,
+            SemanticOperation::CreatePage {
+                page_id: page.page_id,
+                home_document_id: page.home_document_id,
+                name: page.name.clone(),
+                path: page.path.clone(),
+                kind: page.kind,
+            },
+        )?;
     }
     for page in desired_pages.values().filter(|page| page.existing) {
         let current = current_pages.get(&page.page_id).ok_or_else(|| {
@@ -2015,25 +2179,40 @@ fn build_execution_material(
             ))?
             .kind;
         if current.name != page.name || current.path != page.path || current_kind != page.kind {
-            operations.push(SemanticOperation::ReconcileExternalPageState {
-                page_id: page.page_id,
-                name: page.name.clone(),
-                path: page.path.clone(),
-                kind: page.kind,
-            });
+            push_operation(
+                &mut operations,
+                SemanticOperation::ReconcileExternalPageState {
+                    page_id: page.page_id,
+                    name: page.name.clone(),
+                    path: page.path.clone(),
+                    kind: page.kind,
+                },
+            )?;
         }
     }
-    for desired in desired_blocks.values().filter(|block| !block.existing) {
-        operations.push(SemanticOperation::CreateBlock {
-            block: BlockLocation {
-                block_id: desired.block_id,
-                home_document_id: desired.home_document_id,
+    let mut new_blocks = desired_blocks
+        .values()
+        .filter(|block| !block.existing)
+        .collect::<Vec<_>>();
+    new_blocks.sort_unstable_by(|left, right| {
+        desired_block_depth(left.block_id, &desired_blocks)
+            .cmp(&desired_block_depth(right.block_id, &desired_blocks))
+            .then_with(|| left.block_id.cmp(&right.block_id))
+    });
+    for desired in new_blocks {
+        push_operation(
+            &mut operations,
+            SemanticOperation::CreateBlock {
+                block: BlockLocation {
+                    block_id: desired.block_id,
+                    home_document_id: desired.home_document_id,
+                },
+                page_id: desired.page_id,
+                parent: desired.parent,
+                order: desired.order.clone(),
+                content: desired.content.clone(),
             },
-            page_id: desired.page_id,
-            parent: desired.parent,
-            order: desired.order.clone(),
-            content: desired.content.clone(),
-        });
+        )?;
     }
 
     let mut moves = desired_blocks
@@ -2051,16 +2230,19 @@ fn build_execution_material(
             .then_with(|| left.page_id.cmp(&right.page_id))
     });
     for (block_id, desired, current) in &moves {
-        operations.push(SemanticOperation::MoveSubtree {
-            root: BlockLocation {
-                block_id: *block_id,
-                home_document_id: current.block.home_document_id,
+        push_operation(
+            &mut operations,
+            SemanticOperation::MoveSubtree {
+                root: BlockLocation {
+                    block_id: *block_id,
+                    home_document_id: current.block.home_document_id,
+                },
+                from_page_id: current.page_id,
+                to_page_id: desired.page_id,
+                parent: desired.parent,
+                order: desired.order.clone(),
             },
-            from_page_id: current.page_id,
-            to_page_id: desired.page_id,
-            parent: desired.parent,
-            order: desired.order.clone(),
-        });
+        )?;
     }
 
     let moved_blocks = moves
@@ -2074,12 +2256,15 @@ fn build_execution_material(
         if !moved_blocks.contains(block_id)
             && (current.block.parent != desired.parent || current.block.order != desired.order)
         {
-            operations.push(SemanticOperation::ReorderBlock {
-                block_id: *block_id,
-                page_id: desired.page_id,
-                parent: desired.parent,
-                order: desired.order.clone(),
-            });
+            push_operation(
+                &mut operations,
+                SemanticOperation::ReorderBlock {
+                    block_id: *block_id,
+                    page_id: desired.page_id,
+                    parent: desired.parent,
+                    order: desired.order.clone(),
+                },
+            )?;
         }
     }
 
@@ -2096,10 +2281,13 @@ fn build_execution_material(
         .collect::<Vec<_>>();
     deletions.sort_unstable();
     for (block_id, page_id) in deletions {
-        operations.push(SemanticOperation::DeleteSubtree {
-            root_block_id: block_id,
-            page_id,
-        });
+        push_operation(
+            &mut operations,
+            SemanticOperation::DeleteSubtree {
+                root_block_id: block_id,
+                page_id,
+            },
+        )?;
     }
 
     for (block_id, desired) in &desired_blocks {
@@ -2107,13 +2295,16 @@ fn build_execution_material(
             continue;
         };
         if current.block.content != desired.content {
-            operations.push(SemanticOperation::EditBlockContent {
-                block: BlockLocation {
-                    block_id: *block_id,
-                    home_document_id: current.block.home_document_id,
+            push_operation(
+                &mut operations,
+                SemanticOperation::EditBlockContent {
+                    block: BlockLocation {
+                        block_id: *block_id,
+                        home_document_id: current.block.home_document_id,
+                    },
+                    content: desired.content.clone(),
                 },
-                content: desired.content.clone(),
-            });
+            )?;
         }
     }
     for (block_id, desired) in &desired_blocks {
@@ -2131,13 +2322,16 @@ fn build_execution_material(
             (None, None) | (Some(_), Some(_)) => None,
         };
         if let Some(mutation) = mutation {
-            operations.push(SemanticOperation::MutateBlockLogseqIdentity {
-                block: BlockLocation {
-                    block_id: *block_id,
-                    home_document_id: desired.home_document_id,
+            push_operation(
+                &mut operations,
+                SemanticOperation::MutateBlockLogseqIdentity {
+                    block: BlockLocation {
+                        block_id: *block_id,
+                        home_document_id: desired.home_document_id,
+                    },
+                    mutation,
                 },
-                mutation,
-            });
+            )?;
         }
     }
 
@@ -2151,10 +2345,13 @@ fn build_execution_material(
         if current_preamble != Some(tree.preamble.clone())
             && (page.existing || tree.preamble.is_some())
         {
-            operations.push(SemanticOperation::SetPagePreamble {
-                page_id: page.page_id,
-                preamble: tree.preamble.clone(),
-            });
+            push_operation(
+                &mut operations,
+                SemanticOperation::SetPagePreamble {
+                    page_id: page.page_id,
+                    preamble: tree.preamble.clone(),
+                },
+            )?;
         }
     }
 
@@ -2164,7 +2361,10 @@ fn build_execution_material(
         .collect::<BTreeSet<_>>();
     for page_id in current_pages.keys() {
         if !desired_page_ids.contains(page_id) {
-            operations.push(SemanticOperation::DeletePage { page_id: *page_id });
+            push_operation(
+                &mut operations,
+                SemanticOperation::DeletePage { page_id: *page_id },
+            )?;
         }
     }
 
@@ -2209,6 +2409,26 @@ fn current_block_depth(
         };
         depth = depth.saturating_add(1);
         cursor = block.block.parent;
+    }
+    depth
+}
+
+fn desired_block_depth(
+    block_id: BlockId,
+    desired_blocks: &BTreeMap<BlockId, DesiredImportBlock>,
+) -> usize {
+    let mut depth = 0_usize;
+    let mut cursor = Some(block_id);
+    let mut visited = BTreeSet::new();
+    while let Some(block_id) = cursor {
+        if !visited.insert(block_id) {
+            return usize::MAX;
+        }
+        let Some(block) = desired_blocks.get(&block_id) else {
+            return usize::MAX;
+        };
+        depth = depth.saturating_add(1);
+        cursor = block.parent;
     }
     depth
 }
@@ -2430,6 +2650,7 @@ struct ParsedNode {
     sibling_position: u32,
     depth: usize,
     children: Vec<usize>,
+    span: StructuralSpan,
     raw: String,
     raw_ids: Vec<String>,
 }
@@ -2453,7 +2674,7 @@ fn parse_nodes(
     } else {
         crate::doc::parse(text)
     };
-    flatten_document(path, &document, instrumentation)
+    flatten_document(path, bytes, &document, instrumentation)
 }
 
 fn preflight_depth(path: &ManagedPath, text: &str, parsed_nodes: usize) -> Result<(), ImportBlock> {
@@ -2513,9 +2734,11 @@ fn preflight_depth(path: &ManagedPath, text: &str, parsed_nodes: usize) -> Resul
 
 fn flatten_document(
     path: &ManagedPath,
+    bytes: &[u8],
     document: &Document,
     instrumentation: &mut ImportInstrumentation,
 ) -> Result<ParsedTree, ImportBlock> {
+    let spans = source_block_spans(path, bytes)?;
     let mut nodes = Vec::<ParsedNode>::new();
     let mut roots = Vec::new();
     let mut pending = document
@@ -2548,11 +2771,19 @@ fn flatten_document(
             })
             .collect();
         let index = nodes.len();
+        let span = spans.get(index).copied().ok_or_else(|| {
+            authority_block(
+                ImportBlockReason::UnsafeInput,
+                Some(path),
+                "parser tree has more blocks than exact source-span capture",
+            )
+        })?;
         nodes.push(ParsedNode {
             parent,
             sibling_position,
             depth,
             children: Vec::with_capacity(block.children.len()),
+            span,
             raw: block.raw.clone(),
             raw_ids,
         });
@@ -2567,12 +2798,72 @@ fn flatten_document(
             pending.push((child, Some(index), position as u32, depth.saturating_add(1)));
         }
     }
+    if spans.len() != nodes.len() {
+        return Err(authority_block(
+            ImportBlockReason::UnsafeInput,
+            Some(path),
+            "exact source-span capture disagrees with the parsed block tree",
+        ));
+    }
     Ok(ParsedTree {
         path: path.clone(),
         preamble: document.pre_block.clone(),
         roots,
         nodes,
     })
+}
+
+/// Capture a byte interval for every physical block header in source order.
+/// The normal document parsers remain the semantic authority; if this small
+/// source-position pass cannot account for precisely the same block count, the
+/// import fails closed instead of attaching a file-wide span to every block.
+fn source_block_spans(
+    path: &ManagedPath,
+    bytes: &[u8],
+) -> Result<Vec<StructuralSpan>, ImportBlock> {
+    let mut starts = Vec::new();
+    let mut offset = 0_usize;
+    for line in bytes.split_inclusive(|byte| *byte == b'\n') {
+        let mut body = line;
+        if body.last() == Some(&b'\n') {
+            body = &body[..body.len() - 1];
+        }
+        if body.last() == Some(&b'\r') {
+            body = &body[..body.len() - 1];
+        }
+        let is_block = if path.as_str().ends_with(".org") {
+            let stars = body.iter().take_while(|byte| **byte == b'*').count();
+            stars > 0 && matches!(body.get(stars), None | Some(b' ') | Some(b'\t'))
+        } else {
+            let indent = body
+                .iter()
+                .take_while(|byte| matches!(**byte, b' ' | b'\t'))
+                .count();
+            body.get(indent..)
+                .is_some_and(|rest| rest == b"-" || rest.starts_with(b"- "))
+        };
+        if is_block {
+            starts.push(offset);
+        }
+        offset = offset.saturating_add(line.len());
+    }
+    starts
+        .iter()
+        .enumerate()
+        .map(|(index, start)| {
+            StructuralSpan::new(
+                *start as u64,
+                starts.get(index + 1).copied().unwrap_or(bytes.len()) as u64,
+            )
+            .map_err(|error| {
+                authority_block(
+                    ImportBlockReason::UnsafeInput,
+                    Some(path),
+                    error.to_string(),
+                )
+            })
+        })
+        .collect()
 }
 
 fn materialize_locator(
@@ -3299,6 +3590,10 @@ mod tests {
                 fs::write(graph_root.join("logseq/config.edn"), config).unwrap();
             }
             let graph = Graph::open(&graph_root);
+            for path in paths {
+                let parent = graph_root.join(path).parent().unwrap().to_path_buf();
+                fs::create_dir_all(parent).unwrap();
+            }
             let workspace = WorkspaceId::from_uuid(Uuid::from_u128(1));
             let endpoint = ProjectionEndpointBinding::enroll_graph(
                 &graph,
@@ -3321,18 +3616,15 @@ mod tests {
                 let seed = 100 + index as u128 * 10;
                 let page_id = PageId::from_uuid(Uuid::from_u128(seed));
                 let home = DocumentId::from_uuid(Uuid::from_u128(seed + 1));
-                let kind = match path.split_once('/') {
-                    Some(("pages", rest)) if !rest.is_empty() => ManagedTextKind::Page,
-                    Some(("journals", rest)) if !rest.is_empty() => ManagedTextKind::Journal,
-                    _ => panic!("snapshot fixture path is outside the guarded default layout"),
-                };
+                let managed_path = ManagedPath::parse((*path).to_owned()).unwrap();
+                let kind = graph.classify_managed_text_path(&managed_path).unwrap();
                 page_ids.push(page_id);
                 operations.push(SemanticOperation::CreatePage {
                     page_id,
                     home_document_id: home,
                     name: crate::oplog::LogicalPageName::parse(format!("Snapshot Page {index}"))
                         .unwrap(),
-                    path: ManagedPath::parse((*path).to_owned()).unwrap(),
+                    path: managed_path,
                     kind,
                 });
                 operations.push(SemanticOperation::CreateBlock {
@@ -3543,11 +3835,13 @@ mod tests {
 
         let left_object = left_material
             .observation()
-            .operation_object(PortablePathIndexRoot::empty())
+            .clone()
+            .into_operation_object(PortablePathIndexRoot::empty())
             .unwrap();
         let right_object = right_material
             .observation()
-            .operation_object(PortablePathIndexRoot::empty())
+            .clone()
+            .into_operation_object(PortablePathIndexRoot::empty())
             .unwrap();
         assert_eq!(left_object, right_object);
         assert_eq!(
@@ -3629,7 +3923,8 @@ mod tests {
             .execution_material()
             .unwrap()
             .observation()
-            .operation_object(PortablePathIndexRoot::empty())
+            .clone()
+            .into_operation_object(PortablePathIndexRoot::empty())
             .unwrap();
         let duplicate_observation =
             super::super::external_import::ExternalImportObservation::decode(
@@ -3655,7 +3950,8 @@ mod tests {
             .execution_material()
             .unwrap()
             .observation()
-            .operation_object(PortablePathIndexRoot::empty())
+            .clone()
+            .into_operation_object(PortablePathIndexRoot::empty())
             .unwrap();
         let invalid_observation = super::super::external_import::ExternalImportObservation::decode(
             invalid_object.payload(),
@@ -3733,8 +4029,6 @@ mod tests {
         }
         let legacy_plan = legacy.plan(&[
             "pages/first/second/Project%2FPlan.md",
-            "pages/left/shared.md",
-            "pages/right/shared.md",
             "journals/archive/deep/25-07-2026.md",
         ]);
         assert_eq!(legacy_plan.status(), ImportPlanStatus::Reconcile);
@@ -3757,18 +4051,17 @@ mod tests {
             "nested directories select the managed root but never become a page namespace"
         );
         assert_eq!(
-            legacy_creates["pages/left/shared.md"],
-            ("shared", ManagedTextKind::Page)
-        );
-        assert_eq!(
-            legacy_creates["pages/right/shared.md"],
-            ("shared", ManagedTextKind::Page),
-            "same basenames in different directories remain separate exact paths"
-        );
-        assert_eq!(
             legacy_creates["journals/archive/deep/25-07-2026.md"],
             ("2026-07-25", ManagedTextKind::Journal),
             "nested journals use the configured JournalFormat title"
+        );
+
+        let duplicate_names = legacy.plan(&["pages/left/shared.md", "pages/right/shared.md"]);
+        assert_eq!(duplicate_names.status(), ImportPlanStatus::Blocked);
+        assert_eq!(
+            duplicate_names.blocks()[0].reason,
+            ImportBlockReason::ConflictingLocalTail,
+            "same basenames in distinct paths are a visible ambiguity, never a successful import"
         );
 
         let triple_lowbar = SnapshotFixture::new_with_graph_config(
@@ -3811,6 +4104,277 @@ mod tests {
             ("literal___marker", ManagedTextKind::Page),
             "TripleLowbar decodes separators before percent escapes, preserving encoded literals"
         );
+    }
+
+    #[test]
+    fn configured_nested_managed_roots_use_graph_kind_and_filename_decoding() {
+        let fixture = SnapshotFixture::new_with_graph_config(
+            "configured-nested-roots",
+            &["content/pages/seed.md"],
+            "{:pages-directory \"content/pages\"\n\
+              :journals-directory \"content/journals\"\n\
+              :journal/file-name-format \"dd-MM-yyyy\"\n\
+              :journal/page-title-format \"yyyy-MM-dd\"}\n",
+        );
+        for path in [
+            "content/pages/deep/Project%2FPlan.md",
+            "content/journals/archive/deep/25-07-2026.md",
+        ] {
+            let target = fixture.graph_root.join(path);
+            fs::create_dir_all(target.parent().unwrap()).unwrap();
+            fs::write(target, b"- external\n").unwrap();
+        }
+        let plan = fixture.plan(&[
+            "content/pages/deep/Project%2FPlan.md",
+            "content/journals/archive/deep/25-07-2026.md",
+        ]);
+        assert_eq!(plan.status(), ImportPlanStatus::Reconcile);
+        let created = plan
+            .execution_material()
+            .unwrap()
+            .transaction()
+            .operations
+            .iter()
+            .filter_map(|operation| match operation {
+                SemanticOperation::CreatePage {
+                    path, name, kind, ..
+                } => Some((path.as_str(), (name.as_str(), *kind))),
+                _ => None,
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            created["content/pages/deep/Project%2FPlan.md"],
+            ("Project/Plan", ManagedTextKind::Page)
+        );
+        assert_eq!(
+            created["content/journals/archive/deep/25-07-2026.md"],
+            ("2026-07-25", ManagedTextKind::Journal)
+        );
+    }
+
+    #[test]
+    fn exact_rename_adopts_graph_decoded_destination_name_before_authoring() {
+        let fixture = SnapshotFixture::new("rename-destination-name", &["pages/old.md"]);
+        let destination = fixture.graph_root.join("pages/Project%2FPlan.md");
+        fs::rename(fixture.graph_root.join("pages/old.md"), &destination).unwrap();
+        let plan = fixture.plan(&["pages/old.md", "pages/Project%2FPlan.md"]);
+        assert_eq!(plan.status(), ImportPlanStatus::Reconcile);
+        assert!(plan
+            .execution_material()
+            .unwrap()
+            .transaction()
+            .operations
+            .iter()
+            .any(|operation| matches!(
+                operation,
+                SemanticOperation::ReconcileExternalPageState { name, path, .. }
+                    if name.as_str() == "Project/Plan" && path.as_str() == "pages/Project%2FPlan.md"
+            )));
+    }
+
+    #[test]
+    fn sealed_external_execution_drafts_through_the_engine_in_parent_before_child_order() {
+        let fixture = SnapshotFixture::new("external-engine-draft", &["pages/old.md"]);
+        let destination = fixture.graph_root.join("pages/Project%2FPlan.md");
+        fs::rename(fixture.graph_root.join("pages/old.md"), &destination).unwrap();
+        fs::write(
+            fixture.graph_root.join("pages/new.md"),
+            b"- parent\n\t- child\n",
+        )
+        .unwrap();
+
+        let plan = fixture.plan(&["pages/old.md", "pages/Project%2FPlan.md", "pages/new.md"]);
+        assert_eq!(plan.status(), ImportPlanStatus::Reconcile);
+        let material = plan.into_execution_material().unwrap();
+        let operations = &material.transaction().operations;
+        assert!(operations.iter().any(|operation| matches!(
+            operation,
+            SemanticOperation::ReconcileExternalPageState { name, path, .. }
+                if name.as_str() == "Project/Plan" && path.as_str() == "pages/Project%2FPlan.md"
+        )));
+
+        let created = operations
+            .iter()
+            .enumerate()
+            .filter_map(|(index, operation)| match operation {
+                SemanticOperation::CreateBlock { block, parent, .. } => {
+                    Some((index, block.block_id, *parent))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let (child_index, _, parent) = created
+            .iter()
+            .copied()
+            .find(|(_, _, parent)| parent.is_some())
+            .expect("new nested child must be created");
+        let parent = parent.expect("selected child has a parent");
+        let parent_index = created
+            .iter()
+            .find_map(|(index, block_id, _)| (*block_id == parent).then_some(*index))
+            .expect("new child parent must be created in this transaction");
+        assert!(parent_index < child_index);
+
+        // The external-import draft adapter applies the sealed operations to the
+        // engine's prospective documents, so this catches ordering and
+        // semantic preflight regressions that an operation-list inspection
+        // would miss. Final external publication deliberately remains behind
+        // the capability recapture boundary.
+        let draft = fixture
+            .engine
+            .draft_external_import_transaction(
+                AuthorBatch {
+                    batch_id: material.batch_id(),
+                    author_device_id: DeviceId::from_uuid(Uuid::from_u128(3)),
+                    author_session_id: SessionId::from_uuid(Uuid::from_u128(9_412)),
+                    crdt_peer_id: CrdtPeerId::from_u64(9_413),
+                },
+                material,
+            )
+            .unwrap();
+        assert!(!draft.requirements().is_empty());
+
+        // Identity replacement and removal travel through the same engine
+        // draft path; these are semantic mutations, not observation-only
+        // annotations.
+        let prior = LogseqUuid::from_uuid(Uuid::from_u128(9_410));
+        let replacement = LogseqUuid::from_uuid(Uuid::from_u128(9_411));
+        let replacement_fixture = SnapshotFixture::new_with_initial_uuid(
+            "external-engine-id-replacement",
+            &["pages/a.md"],
+            Some(prior),
+        );
+        fs::write(
+            replacement_fixture.graph_root.join("pages/a.md"),
+            format!("- page 0\n  id:: {replacement}\n"),
+        )
+        .unwrap();
+        let replacement_plan = replacement_fixture.plan(&["pages/a.md"]);
+        let replacement_material = replacement_plan.into_execution_material().unwrap();
+        assert!(replacement_material
+            .transaction()
+            .operations
+            .iter()
+            .any(|operation| matches!(
+                operation,
+                SemanticOperation::MutateBlockLogseqIdentity {
+                    mutation: LogseqIdentityMutation::ReplaceExternal { logseq_uuid },
+                    ..
+                } if *logseq_uuid == replacement
+            )));
+        replacement_fixture
+            .engine
+            .draft_external_import_transaction(
+                AuthorBatch {
+                    batch_id: replacement_material.batch_id(),
+                    author_device_id: DeviceId::from_uuid(Uuid::from_u128(3)),
+                    author_session_id: SessionId::from_uuid(Uuid::from_u128(9_414)),
+                    crdt_peer_id: CrdtPeerId::from_u64(9_415),
+                },
+                replacement_material,
+            )
+            .unwrap();
+
+        let removal_fixture = SnapshotFixture::new_with_initial_uuid(
+            "external-engine-id-removal",
+            &["pages/a.md"],
+            Some(prior),
+        );
+        fs::write(removal_fixture.graph_root.join("pages/a.md"), b"- page 0\n").unwrap();
+        let removal_plan = removal_fixture.plan(&["pages/a.md"]);
+        let removal_material = removal_plan.into_execution_material().unwrap();
+        assert!(removal_material
+            .transaction()
+            .operations
+            .iter()
+            .any(|operation| matches!(
+                operation,
+                SemanticOperation::MutateBlockLogseqIdentity {
+                    mutation: LogseqIdentityMutation::RemoveExternal,
+                    ..
+                }
+            )));
+        removal_fixture
+            .engine
+            .draft_external_import_transaction(
+                AuthorBatch {
+                    batch_id: removal_material.batch_id(),
+                    author_device_id: DeviceId::from_uuid(Uuid::from_u128(3)),
+                    author_session_id: SessionId::from_uuid(Uuid::from_u128(9_416)),
+                    crdt_peer_id: CrdtPeerId::from_u64(9_417),
+                },
+                removal_material,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn existing_authenticated_logical_name_collision_blocks_before_execution_material() {
+        let fixture = SnapshotFixture::new("existing-name-collision", &["pages/seed.md"]);
+        let target = fixture.graph_root.join("pages/Snapshot%20Page%200.md");
+        fs::write(&target, b"- external\n").unwrap();
+        let plan = fixture.plan(&["pages/Snapshot%20Page%200.md"]);
+        assert_eq!(plan.status(), ImportPlanStatus::Blocked);
+        assert_eq!(
+            plan.blocks()[0].reason,
+            ImportBlockReason::ConflictingLocalTail
+        );
+        assert!(plan.blocks()[0].detail.contains("already owned"));
+    }
+
+    #[test]
+    fn external_observation_annotations_use_each_nested_block_exact_byte_span() {
+        let fixture = SnapshotFixture::new("nested-exact-spans", &["pages/a.md"]);
+        let bytes = b"- parent\n\t- child\n";
+        fs::write(fixture.graph_root.join("pages/a.md"), bytes).unwrap();
+        let plan = fixture.plan(&["pages/a.md"]);
+        assert_eq!(plan.status(), ImportPlanStatus::Reconcile);
+        let entry = &plan.execution_material().unwrap().observation().entries()[0];
+        let spans = entry
+            .state()
+            .annotations()
+            .iter()
+            .map(|annotation| (annotation.span().start(), annotation.span().end()))
+            .collect::<Vec<_>>();
+        assert_eq!(spans, vec![(0, 9), (9, bytes.len() as u64)]);
+    }
+
+    #[test]
+    fn affected_receipt_capture_ignores_unrelated_completed_receipts() {
+        use crate::oplog::projection_store::{
+            projection_store_test_counters, reset_projection_store_test_counters,
+        };
+
+        let paths = (0..33)
+            .map(|index| format!("pages/unrelated/{index:02}.md"))
+            .collect::<Vec<_>>();
+        let path_refs = paths.iter().map(String::as_str).collect::<Vec<_>>();
+        let fixture = SnapshotFixture::new("bounded-receipt-capture", &path_refs);
+        fs::write(
+            fixture.graph_root.join("pages/unrelated/00.md"),
+            b"- changed\n",
+        )
+        .unwrap();
+        let unrelated_completion = fixture
+            .receipts
+            .root_path()
+            .join("completions")
+            .join(completion_name(&fixture.intents[32]));
+        reset_projection_store_test_counters();
+        SNAPSHOT_REVALIDATION_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                fs::remove_file(unrelated_completion).unwrap();
+            }));
+        });
+        let plan = fixture.plan(&["pages/unrelated/00.md"]);
+        assert_eq!(plan.status(), ImportPlanStatus::Reconcile);
+        let counters = projection_store_test_counters();
+        assert_eq!(counters.catalog_directory_entries, 0);
+        assert_eq!(
+            counters.completion_lookups, 2,
+            "only the requested receipt is point-loaded in each snapshot pass"
+        );
+        assert_eq!(plan.instrumentation().catalog_entries, 2);
     }
 
     #[test]
@@ -3879,6 +4443,7 @@ mod tests {
                 sibling_position: 0,
                 depth: 1,
                 children: Vec::new(),
+                span: StructuralSpan::new(0, 0).unwrap(),
                 raw: "node".into(),
                 raw_ids: Vec::new(),
             }],
@@ -3919,6 +4484,30 @@ mod tests {
     }
 
     #[test]
+    fn operation_count_bound_refuses_the_100001st_operation_before_publication() {
+        let mut operations = Vec::with_capacity(MAX_TRANSACTION_OPERATIONS);
+        for index in 0..MAX_TRANSACTION_OPERATIONS {
+            push_operation(
+                &mut operations,
+                SemanticOperation::DeletePage {
+                    page_id: PageId::from_uuid(Uuid::from_u128(index as u128 + 1)),
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(operations.len(), MAX_TRANSACTION_OPERATIONS);
+        assert!(matches!(
+            push_operation(
+                &mut operations,
+                SemanticOperation::DeletePage {
+                    page_id: PageId::from_uuid(Uuid::from_u128(100_001)),
+                },
+            ),
+            Err(ImportExecutionError::OperationLimit)
+        ));
+    }
+
+    #[test]
     fn structural_common_prefix_work_and_repeated_deep_locators_are_charged() {
         let path = ManagedPath::parse("pages/structural.md").unwrap();
         let mut text = String::new();
@@ -3946,6 +4535,7 @@ mod tests {
                     .then_some(depth)
                     .into_iter()
                     .collect(),
+                span: StructuralSpan::new(0, 0).unwrap(),
                 raw: "node".into(),
                 raw_ids: vec!["duplicate".into(), "duplicate".into()],
             });
@@ -3980,6 +4570,7 @@ mod tests {
                         sibling_position: 0,
                         depth: 1,
                         children: Vec::new(),
+                        span: StructuralSpan::new(0, 0).unwrap(),
                         raw: format!("unique-{index:08}"),
                         raw_ids: Vec::new(),
                     }],

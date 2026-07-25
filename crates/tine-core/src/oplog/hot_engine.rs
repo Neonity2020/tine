@@ -13,6 +13,8 @@ use loro::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use super::external_import::ExternalImportObservationMaterial;
+use super::import::ImportExecutionMaterial;
 use super::object_store::{BlockClaimIndexRoot, BlockClaimIndexStore, BlockClaimIndexValue};
 use super::page_name_index::{
     extract_authenticated_catalog_page_names, extract_authoritative_catalog_page_names,
@@ -66,7 +68,7 @@ const SHARD_LOGSEQ_IDENTITY_ORIGINS: &str = "logseq_identity_origins";
 const SHARD_PAGE_PREAMBLE: &str = "page_preamble";
 const SHARD_PAGE_PREAMBLE_VALUE: &str = "value";
 const TOMBSTONE: &str = "tombstone";
-const MAX_TRANSACTION_OPERATIONS: usize = 100_000;
+pub(crate) const MAX_TRANSACTION_OPERATIONS: usize = 100_000;
 const MAX_DOCUMENT_ENTRIES: usize = 1_000_000;
 const MAX_HOT_NON_CATALOG_DOCUMENTS: usize = 64;
 const CRDT_UPDATE_PAYLOAD_SCHEMA_VERSION: u32 = 7;
@@ -3651,6 +3653,28 @@ impl ShardedHotEngine {
         }
     }
 
+    /// Authenticated exact logical-name ownership lookup for sparse import
+    /// preflight.  Unlike a catalog scan this is one page-name-index point
+    /// lookup and it preserves the engine's canonical-name collision policy.
+    pub(crate) fn current_page_for_logical_name(
+        &self,
+        name: &LogicalPageName,
+    ) -> Result<Option<PageId>, EngineError> {
+        self.begin_point_operation();
+        self.ensure_not_blocked()?;
+        match &self.page_name_index {
+            Some(index) => index
+                .lookup(&self.page_name_root, name.key_digest())
+                .map(|record| {
+                    record
+                        .and_then(|record| record.occupied().cloned())
+                        .map(|occupied| occupied.page_id())
+                })
+                .map_err(|error| EngineError::Archive(error.to_string())),
+            None => Ok(self.ephemeral_page_names.resolve_current(name.key_digest())),
+        }
+    }
+
     pub(crate) fn verify_current_durable_page_name_authority(&self) -> Result<(), EngineError> {
         if self.durable_authority_mode != DurableAuthorityMode::EnrolledRequired {
             return Err(EngineError::Archive(
@@ -4560,6 +4584,7 @@ impl ShardedHotEngine {
                 super::BatchOrigin::BootstrapImport,
                 transaction,
                 false,
+                None,
             )?
             .prepared)
     }
@@ -4570,6 +4595,40 @@ impl ShardedHotEngine {
         origin: BatchOrigin,
         transaction: &OperationTransaction,
     ) -> Result<AuthorTransactionDraft, EngineError> {
+        self.draft_author_transaction_with_observation(author, origin, transaction, None)
+    }
+
+    /// Draft a sealed external-import transaction with its already bounded
+    /// observation object. The object joins the core manifest before the
+    /// engine applies semantic operations, so object-set validation and the
+    /// prospective CRDT state are exercised as one closed draft.
+    #[allow(dead_code)]
+    pub(crate) fn draft_external_import_transaction(
+        &self,
+        author: AuthorBatch,
+        material: ImportExecutionMaterial,
+    ) -> Result<AuthorTransactionDraft, EngineError> {
+        let (import_id, transaction, observation) = material.into_parts();
+        if author.batch_id != import_id.batch_id() {
+            return Err(EngineError::InvalidTransaction(
+                "external-import author batch id does not match the sealed import id".into(),
+            ));
+        }
+        self.draft_author_transaction_with_observation(
+            author,
+            BatchOrigin::ExternalReconciliation { import_id },
+            &transaction,
+            Some(observation),
+        )
+    }
+
+    fn draft_author_transaction_with_observation(
+        &self,
+        author: AuthorBatch,
+        origin: BatchOrigin,
+        transaction: &OperationTransaction,
+        observation: Option<ExternalImportObservationMaterial>,
+    ) -> Result<AuthorTransactionDraft, EngineError> {
         if origin == BatchOrigin::BootstrapImport {
             return Err(EngineError::InvalidTransaction(
                 "bootstrap import must use the origin-explicit bootstrap helper".into(),
@@ -4577,7 +4636,8 @@ impl ShardedHotEngine {
         }
         let generation = self.history_generation;
         let root_token = self.author_generation_root()?;
-        let parts = self.prepare_transaction_core(author, origin, transaction, true)?;
+        let parts =
+            self.prepare_transaction_core(author, origin, transaction, true, observation)?;
         let affected_pages = affected_projection_pages(&parts.semantic_effect);
         let mut pages = BTreeMap::new();
         for page_id in affected_pages {
@@ -4943,6 +5003,7 @@ impl ShardedHotEngine {
         origin: super::BatchOrigin,
         transaction: &OperationTransaction,
         capture_prospective_documents: bool,
+        observation: Option<ExternalImportObservationMaterial>,
     ) -> Result<PreparedTransactionParts, EngineError> {
         self.begin_point_operation();
         // A pending author buffer is only an optimization for the immediately
@@ -5092,7 +5153,7 @@ impl ShardedHotEngine {
             .iter()
             .map(OperationObject::descriptor)
             .collect::<Result<Vec<_>, _>>()?;
-        let manifest = if let Some(store) = &self.scratch {
+        let mut manifest = if let Some(store) = &self.scratch {
             let peer = CausalPeerId::from_device_id(author.author_device_id);
             let (dot, prior_batch) =
                 super::causal_index::next_dot(store, &self.scratch_roots, peer)
@@ -5207,6 +5268,45 @@ impl ShardedHotEngine {
                     "locally authored transaction would create a page-name conflict".into(),
                 ));
             }
+        }
+        if let Some(observation) = observation {
+            let import_id = match manifest.origin() {
+                BatchOrigin::ExternalReconciliation { import_id } => import_id,
+                BatchOrigin::LocalMutation | BatchOrigin::BootstrapImport => {
+                    return Err(EngineError::InvalidTransaction(
+                        "external-import observation requires ExternalReconciliation origin".into(),
+                    ));
+                }
+            };
+            if observation.workspace_id() != self.workspace_id
+                || observation.import_id() != import_id
+            {
+                return Err(EngineError::InvalidTransaction(
+                    "external-import observation is not bound to the drafted import".into(),
+                ));
+            }
+            objects.push(
+                observation
+                    .into_operation_object(portable_path_root)
+                    .map_err(|error| EngineError::InvalidTransaction(error.to_string()))?,
+            );
+            let descriptors = objects
+                .iter()
+                .map(OperationObject::descriptor)
+                .collect::<Result<Vec<_>, _>>()?;
+            manifest = OperationBatch::new_with_causality(
+                manifest.workspace_id(),
+                manifest.lineage_digest(),
+                manifest.batch_id(),
+                manifest.author_device_id(),
+                manifest.author_session_id(),
+                manifest.origin(),
+                manifest.causal_dot(),
+                manifest.causal_dependency_heads().to_vec(),
+                manifest.dependency_frontier().clone(),
+                manifest.semantic_effect_digest(),
+                descriptors,
+            )?;
         }
         let prepared = PreparedBatch::new(manifest, objects).map_err(EngineError::from)?;
         let prospective_documents = if capture_prospective_documents {

@@ -184,6 +184,11 @@ impl ExternalImportObservationMaterial {
             PortablePathIndexRoot::empty(),
             entries,
         )?;
+        // Establish the final bounded wire-size claim while planning, before a
+        // Reconcile plan can be published.  The portable-root field has fixed
+        // width, so the empty root proves the same encoded-size bound as the
+        // later prospective root without retaining another payload copy.
+        let _ = observation.encode()?;
         Ok(Self {
             workspace_id,
             import_id,
@@ -203,15 +208,15 @@ impl ExternalImportObservationMaterial {
         &self.entries
     }
 
-    pub(crate) fn operation_object(
-        &self,
+    pub(crate) fn into_operation_object(
+        self,
         prospective_portable_path_root: PortablePathIndexRoot,
     ) -> Result<OperationObject, ExternalImportObservationMaterialError> {
         let observation = ExternalImportObservation::new(
             self.workspace_id,
             self.import_id,
             prospective_portable_path_root,
-            self.entries.clone(),
+            self.entries,
         )?;
         let payload = observation.encode()?;
         OperationObject::new(
@@ -1026,6 +1031,38 @@ mod tests {
             ExternalImportObservation::decode(&oversized).unwrap_err(),
             ExternalImportObservationError::TooLarge(oversized.len())
         );
+    }
+
+    #[test]
+    fn planning_material_checks_near_and_over_encoded_observation_bounds() {
+        let near = ExternalImportObservationEntry::new(
+            ManagedPath::parse("pages/near.md").unwrap(),
+            ManagedTextKind::Page,
+            ExternalImportObservationState::present(
+                vec![0; MAX_EXTERNAL_IMPORT_OBSERVATION_BYTES - 4_096],
+                Vec::new(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            ExternalImportObservationMaterial::new(workspace(1), import(0x22), vec![near]).is_ok()
+        );
+
+        let over = ExternalImportObservationEntry::new(
+            ManagedPath::parse("pages/over.md").unwrap(),
+            ManagedTextKind::Page,
+            ExternalImportObservationState::present(
+                vec![0; MAX_EXTERNAL_IMPORT_OBSERVATION_BYTES],
+                Vec::new(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            ExternalImportObservationMaterial::new(workspace(1), import(0x23), vec![over]),
+            Err(ExternalImportObservationError::TooLarge(_))
+        ));
     }
 
     #[test]

@@ -20,8 +20,8 @@ use super::{
     ManifestedProjectionIntent, MaterializedBlock, MaterializedPage, ObjectKind, ObjectStore,
     PageId, ProjectionCompletion, ProjectionEndpointId, ProjectionIntent, ProjectionPageState,
     ProjectionPrecondition, ProjectionReceiptStore, ProjectionStoreError, ProjectionWork,
-    ProjectionWorkBlockAuthority, ProjectionWorkIndex, ProjectionWorkStatus, ReceiptError,
-    ShardedHotEngine, StructuralLocator, StructuralSpan, WorkspaceId,
+    ProjectionWorkBlockAuthority, ProjectionWorkIndex, ProjectionWorkStatus, ProjectionWorkTarget,
+    ReceiptError, ShardedHotEngine, StructuralLocator, StructuralSpan, WorkspaceId,
 };
 use crate::doc::{DocBlock, Document, SerializeOpts};
 use crate::Graph;
@@ -506,6 +506,7 @@ pub fn write_projection_exact(
         &mut authority,
     )?;
     let completion = store.publish_completion(authority, plan.intent(), &proof)?;
+    record_completed_path(store, engine, page_id, plan.intent())?;
     debug_assert_eq!(authorization.state().page.page_id, page_id);
     Ok(ProjectionWrite { plan, completion })
 }
@@ -596,10 +597,56 @@ pub fn recover_incomplete_projections(
             Some((Err(error), _)) => return Err(error.into()),
         };
         let completion = store.reconstruct_completion(authority, &intent, plan.target(), &proof)?;
+        record_completed_path(store, engine, intent.page_id(), &intent)?;
         debug_assert_eq!(authorization.state().page.page_id, intent.page_id());
         recovered.push(ProjectionWrite { plan, completion });
     }
     Ok(recovered)
+}
+
+/// Make every durable completion visible through the enrolled authenticated
+/// completed-path tree.  Both ordinary writes and crash recovery use this
+/// route; otherwise a recovered receipt would be durable but intentionally
+/// invisible to bounded external import.
+fn record_completed_path(
+    store: &ProjectionReceiptStore,
+    engine: &ShardedHotEngine,
+    page_id: PageId,
+    intent: &ProjectionIntent,
+) -> Result<(), ProjectionError> {
+    // The compatibility writer still produces a normal enrolled completion.
+    // Mirror it into the authenticated completed-path tree when its accepted
+    // work row is present, so sparse import never has to fall back to receipt
+    // directory enumeration for this path.
+    if let Ok((_, work_index)) = engine.enrolled_projection_runtime() {
+        let target = ProjectionWorkTarget::Present(intent.target());
+        let mut exact = work_index
+            .pending_for_path(intent.path())
+            .map_err(|error| ProjectionError::Work(error.to_string()))?
+            .into_iter()
+            .filter(|work| {
+                work.page_id() == page_id
+                    && work.post_frontier() == intent.frontier()
+                    && work.target() == target
+            });
+        if let Some(work) = exact.next() {
+            if exact.next().is_some() {
+                return Err(ProjectionError::Work(
+                    "multiple ready work rows match one direct projection completion".into(),
+                ));
+            }
+            let authority = store.completed_work_authority(&work, intent)?;
+            work_index
+                .mark_completed(authority)
+                .map_err(|error| ProjectionError::Work(error.to_string()))?;
+        } else {
+            let authority = store.completed_direct_authority(intent)?;
+            work_index
+                .mark_direct_completed(authority)
+                .map_err(|error| ProjectionError::Work(error.to_string()))?;
+        }
+    }
+    Ok(())
 }
 
 fn require_endpoint_authority(

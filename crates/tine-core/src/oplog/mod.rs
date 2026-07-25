@@ -95,13 +95,14 @@ pub use projection_store::{
     LocalProjectionEvidenceRecord, ProjectionAttemptReservation, ProjectionReceiptStore,
     ProjectionStoreError,
 };
+pub(crate) use projection_work_index::{
+    ProjectionCompletedReceipt, ProjectionDirectCompletionAuthority, ProjectionWorkBlockAuthority,
+    ProjectionWorkCompletionAuthority,
+};
 pub use projection_work_index::{
     ProjectionPendingActivation, ProjectionPendingCursor, ProjectionPendingPage, ProjectionWork,
     ProjectionWorkCursor, ProjectionWorkError, ProjectionWorkId, ProjectionWorkIndex,
     ProjectionWorkIndexStats, ProjectionWorkPage, ProjectionWorkStatus, ProjectionWorkTarget,
-};
-pub(crate) use projection_work_index::{
-    ProjectionWorkBlockAuthority, ProjectionWorkCompletionAuthority,
 };
 pub(crate) use receipt::managed_component_is_portable;
 pub use receipt::{

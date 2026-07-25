@@ -36,13 +36,17 @@ use super::{
 };
 
 const WORK_SCHEMA_VERSION: u32 = 3;
-const INDEX_SCHEMA_VERSION: u32 = 5;
+// v7 adds the authenticated, exact-path completed-receipt tree used by sparse
+// external import.  It is deliberately separate from the ready-path tree:
+// completed rows must stay point-addressable after they leave the ready queue.
+const INDEX_SCHEMA_VERSION: u32 = 7;
 const MAX_WORK_ROW_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_PREPARED_BATCH_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_INDEX_NODE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_INDEX_KEY_BYTES: usize = 4 * 1024;
 const MAX_READY_PAGE: usize = 256;
 const MAX_PENDING_PAGE: usize = 256;
+const MAX_COMPLETED_PATH_WORKS: usize = 4_096;
 const MAX_PREFLIGHT_NODES: usize = 2_000_000;
 const MAX_PREFLIGHT_RECORDS: usize = 2_000_000;
 const MAX_PREFLIGHT_ROOTS: usize = 2_000_000;
@@ -249,6 +253,79 @@ pub(crate) struct ProjectionWorkCompletionAuthority {
     logical_completion_id: LogicalCompletionId,
 }
 
+/// A completed receipt selected through the authenticated exact-path tree.
+/// The receipt store still loads and validates the named immutable
+/// intent/completion; callers cannot manufacture this mapping.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProjectionCompletedReceipt {
+    page_id: PageId,
+    path: ManagedPath,
+    frontier: FrontierV2,
+    target: ProjectionWorkTarget,
+    intent_id: ProjectionIntentId,
+    logical_completion_id: LogicalCompletionId,
+}
+
+impl ProjectionCompletedReceipt {
+    pub(crate) const fn page_id(&self) -> PageId {
+        self.page_id
+    }
+
+    pub(crate) fn path(&self) -> &ManagedPath {
+        &self.path
+    }
+
+    pub(crate) fn frontier(&self) -> &FrontierV2 {
+        &self.frontier
+    }
+
+    pub(crate) const fn target(&self) -> ProjectionWorkTarget {
+        self.target
+    }
+
+    pub(crate) const fn intent_id(&self) -> ProjectionIntentId {
+        self.intent_id
+    }
+
+    pub(crate) const fn logical_completion_id(&self) -> LogicalCompletionId {
+        self.logical_completion_id
+    }
+}
+
+pub(crate) struct ProjectionDirectCompletionAuthority {
+    workspace_id: WorkspaceId,
+    endpoint_id: ProjectionEndpointId,
+    graph_resource_id: super::CanonicalGraphResourceId,
+    receipt_store_id: super::ProjectionReceiptStoreId,
+    receipt: ProjectionCompletedReceipt,
+}
+
+impl ProjectionDirectCompletionAuthority {
+    pub(super) fn from_durable_completion(
+        endpoint_id: ProjectionEndpointId,
+        graph_resource_id: super::CanonicalGraphResourceId,
+        receipt_store_id: super::ProjectionReceiptStoreId,
+        intent: &super::ProjectionIntent,
+        completion: &super::ProjectionCompletion,
+    ) -> Self {
+        Self {
+            workspace_id: intent.workspace_id(),
+            endpoint_id,
+            graph_resource_id,
+            receipt_store_id,
+            receipt: ProjectionCompletedReceipt {
+                page_id: intent.page_id(),
+                path: intent.path().clone(),
+                frontier: intent.frontier().clone(),
+                target: ProjectionWorkTarget::Present(intent.target()),
+                intent_id: completion.intent_id(),
+                logical_completion_id: completion.logical_completion_id(),
+            },
+        }
+    }
+}
+
 impl ProjectionWorkCompletionAuthority {
     pub(super) fn from_durable_completion(
         work: &ProjectionWork,
@@ -430,6 +507,7 @@ enum PreflightTree {
     Rows,
     Ready,
     Paths,
+    CompletedPaths,
     Accepted,
     Pending,
 }
@@ -624,6 +702,7 @@ impl ProjectionWorkIndex {
             (PreflightTree::Rows, root.rows_root),
             (PreflightTree::Ready, root.ready_root),
             (PreflightTree::Paths, root.paths_root),
+            (PreflightTree::CompletedPaths, root.completed_paths_root),
             (PreflightTree::Accepted, root.accepted_root),
             (PreflightTree::Pending, root.pending_root),
         ];
@@ -655,6 +734,23 @@ impl ProjectionWorkIndex {
                             let ids: Vec<ProjectionWorkId> = decode_canonical(&value)?;
                             if !strictly_sorted(&ids) {
                                 return Err(ProjectionWorkError::NonCanonical);
+                            }
+                        }
+                        PreflightTree::CompletedPaths => {
+                            let receipts: Vec<ProjectionCompletedReceipt> =
+                                decode_canonical(&value)?;
+                            if receipts.len() > MAX_COMPLETED_PATH_WORKS
+                                || !strictly_sorted_by(
+                                    &receipts,
+                                    ProjectionCompletedReceipt::intent_id,
+                                )
+                            {
+                                return Err(ProjectionWorkError::NonCanonical);
+                            }
+                            for receipt in receipts {
+                                if receipt.path().as_str().is_empty() {
+                                    return Err(ProjectionWorkError::BindingMismatch);
+                                }
                             }
                         }
                         PreflightTree::Pending => {
@@ -1290,6 +1386,31 @@ impl ProjectionWorkIndex {
         Ok(work)
     }
 
+    /// Return only the completed work rows recorded for this exact managed
+    /// path.  This is a Patricia point lookup rooted in the enrolled index;
+    /// it never enumerates receipt namespaces or unrelated work rows.
+    pub(crate) fn completed_receipts_for_path(
+        &self,
+        path: &ManagedPath,
+    ) -> Result<Vec<ProjectionCompletedReceipt>, ProjectionWorkError> {
+        let (_, root) = self.load_head_root()?;
+        let Some(bytes) = self.tree_lookup(root.completed_paths_root, &path_key(path))? else {
+            return Ok(Vec::new());
+        };
+        let receipts: Vec<ProjectionCompletedReceipt> = decode_canonical(&bytes)?;
+        if receipts.len() > MAX_COMPLETED_PATH_WORKS
+            || !strictly_sorted_by(&receipts, ProjectionCompletedReceipt::intent_id)
+        {
+            return Err(ProjectionWorkError::NonCanonical);
+        }
+        for receipt in &receipts {
+            if receipt.path() != path {
+                return Err(ProjectionWorkError::BindingMismatch);
+            }
+        }
+        Ok(receipts)
+    }
+
     pub(crate) fn require_accepted_ready(
         &self,
         work: &ProjectionWork,
@@ -1394,6 +1515,7 @@ impl ProjectionWorkIndex {
                 work_key(authority.work_id),
                 encode_canonical(&state)?,
             )?;
+            root = index.add_completed_path_work(root, &state.work, &authority)?;
             Ok(root)
         })
     }
@@ -1417,6 +1539,55 @@ impl ProjectionWorkIndex {
             return Err(ProjectionWorkError::ConflictingStatus);
         }
         Ok(())
+    }
+
+    /// Record a completion produced by the compatibility exact writer.  The
+    /// opaque authority can only be minted by the enrolled receipt store after
+    /// it rereads a durable completion, so this remains rooted in both durable
+    /// authorities rather than trusting caller metadata.
+    pub(crate) fn mark_direct_completed(
+        &self,
+        authority: ProjectionDirectCompletionAuthority,
+    ) -> Result<(), ProjectionWorkError> {
+        if authority.workspace_id != self.workspace_id
+            || authority.endpoint_id != self.endpoint_id
+            || authority.graph_resource_id != self.graph_resource_id
+            || authority.receipt_store_id != self.receipt_store_id
+        {
+            return Err(ProjectionWorkError::BindingMismatch);
+        }
+        self.transition(|index, _, root| {
+            let key = path_key(authority.receipt.path());
+            let mut receipts: Vec<ProjectionCompletedReceipt> = index
+                .tree_lookup(root.completed_paths_root, &key)?
+                .map(|bytes| decode_canonical(&bytes))
+                .transpose()?
+                .unwrap_or_default();
+            if receipts.len() > MAX_COMPLETED_PATH_WORKS
+                || !strictly_sorted_by(&receipts, ProjectionCompletedReceipt::intent_id)
+            {
+                return Err(ProjectionWorkError::NonCanonical);
+            }
+            match receipts.binary_search_by_key(
+                &authority.receipt.intent_id,
+                ProjectionCompletedReceipt::intent_id,
+            ) {
+                Ok(index) if receipts[index] == authority.receipt => return Ok(root),
+                Ok(_) => return Err(ProjectionWorkError::BindingMismatch),
+                Err(index_at) => {
+                    if receipts.len() == MAX_COMPLETED_PATH_WORKS {
+                        return Err(ProjectionWorkError::TooLarge(
+                            receipts.len().saturating_add(1),
+                        ));
+                    }
+                    receipts.insert(index_at, authority.receipt);
+                }
+            }
+            let mut next = root;
+            next.completed_paths_root =
+                index.tree_insert(next.completed_paths_root, key, encode_canonical(&receipts)?)?;
+            Ok(next)
+        })
     }
 
     #[allow(clippy::result_large_err)]
@@ -1737,6 +1908,50 @@ impl ProjectionWorkIndex {
             Err(index) => ids.insert(index, work.work_id()),
         }
         root.paths_root = self.tree_insert(root.paths_root, key, encode_canonical(&ids)?)?;
+        Ok(root)
+    }
+
+    fn add_completed_path_work(
+        &self,
+        mut root: ProjectionRoot,
+        work: &ProjectionWork,
+        authority: &ProjectionWorkCompletionAuthority,
+    ) -> Result<ProjectionRoot, ProjectionWorkError> {
+        let key = path_key(work.path());
+        let mut receipts: Vec<ProjectionCompletedReceipt> = self
+            .tree_lookup(root.completed_paths_root, &key)?
+            .map(|bytes| decode_canonical(&bytes))
+            .transpose()?
+            .unwrap_or_default();
+        if receipts.len() > MAX_COMPLETED_PATH_WORKS
+            || !strictly_sorted_by(&receipts, ProjectionCompletedReceipt::intent_id)
+        {
+            return Err(ProjectionWorkError::NonCanonical);
+        }
+        let receipt = ProjectionCompletedReceipt {
+            page_id: work.page_id(),
+            path: work.path().clone(),
+            frontier: work.post_frontier().clone(),
+            target: work.target(),
+            intent_id: authority.intent_id,
+            logical_completion_id: authority.logical_completion_id,
+        };
+        match receipts
+            .binary_search_by_key(&receipt.intent_id, ProjectionCompletedReceipt::intent_id)
+        {
+            Ok(index) if receipts[index] == receipt => {}
+            Ok(_) => return Err(ProjectionWorkError::BindingMismatch),
+            Err(index) => {
+                if receipts.len() == MAX_COMPLETED_PATH_WORKS {
+                    return Err(ProjectionWorkError::TooLarge(
+                        receipts.len().saturating_add(1),
+                    ));
+                }
+                receipts.insert(index, receipt);
+            }
+        }
+        root.completed_paths_root =
+            self.tree_insert(root.completed_paths_root, key, encode_canonical(&receipts)?)?;
         Ok(root)
     }
 
@@ -2285,6 +2500,7 @@ struct ProjectionRoot {
     rows_root: ContentDigest,
     ready_root: ContentDigest,
     paths_root: ContentDigest,
+    completed_paths_root: ContentDigest,
     accepted_root: ContentDigest,
     pending_root: ContentDigest,
 }
@@ -2308,6 +2524,7 @@ impl ProjectionRoot {
             rows_root: empty_tree_root(),
             ready_root: empty_tree_root(),
             paths_root: empty_tree_root(),
+            completed_paths_root: empty_tree_root(),
             accepted_root: empty_tree_root(),
             pending_root: empty_tree_root(),
         }
@@ -2793,6 +3010,7 @@ mod tests {
         }
 
         fn completion_authority(&self, work: &ProjectionWork) -> ProjectionWorkCompletionAuthority {
+            let page_bits = work.page_id().as_uuid().as_u128();
             ProjectionWorkCompletionAuthority {
                 workspace_id: work.workspace_id(),
                 endpoint_id: work.endpoint_id(),
@@ -2802,9 +3020,15 @@ mod tests {
                 page_id: work.page_id(),
                 path: work.path().clone(),
                 target: work.target(),
-                intent_id: ProjectionIntentId::test_only_zero(),
-                logical_completion_id: serde_json::from_str(&format!("\"{}\"", "00".repeat(32)))
+                // The durable completed-path mapping is keyed by intent id.
+                // Fixture completions must therefore model distinct immutable
+                // receipts rather than reusing one synthetic receipt id.
+                intent_id: serde_json::from_str(&format!("\"{page_bits:032x}{page_bits:032x}\""))
                     .unwrap(),
+                logical_completion_id: serde_json::from_str(&format!(
+                    "\"{page_bits:032x}{page_bits:032x}\""
+                ))
+                .unwrap(),
             }
         }
 
@@ -3253,6 +3477,43 @@ mod tests {
             fixture.index.status(second.work_id()).unwrap(),
             Some(ProjectionWorkStatus::Ready)
         );
+    }
+
+    #[test]
+    fn completed_path_receipt_mapping_reopens_and_tampering_fails_closed() {
+        let fixture = Fixture::new("completed-path-reopen");
+        let work = fixture.work(1, "pages/reopen.md");
+        let fingerprint = fixture.prepare(&work);
+        fixture
+            .index
+            .accept_batch(work.batch_id(), fingerprint)
+            .unwrap();
+        fixture
+            .index
+            .mark_completed(fixture.completion_authority(&work))
+            .unwrap();
+        let reopened = ObjectStore::open(&fixture.path, fixture.workspace_id)
+            .unwrap()
+            .open_projection_work_index(fixture.binding())
+            .unwrap();
+        let receipts = reopened.completed_receipts_for_path(work.path()).unwrap();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].page_id(), work.page_id());
+
+        let (_, root) = reopened.load_head_root().unwrap();
+        let root_path = fixture
+            .path
+            .join("projection-work-index-v1")
+            .join(fixture.endpoint_id.to_string())
+            .join("roots")
+            .join(root_filename(ContentDigest::of(
+                &encode_canonical(&root).unwrap(),
+            )));
+        fs::write(root_path, b"tampered").unwrap();
+        assert!(ObjectStore::open(&fixture.path, fixture.workspace_id)
+            .unwrap()
+            .open_projection_work_index(fixture.binding())
+            .is_err());
     }
 
     #[test]
