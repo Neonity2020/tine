@@ -2753,6 +2753,31 @@ impl ShardedHotEngine {
     }
 
     pub(crate) fn finish_operational_recovery_replay(&mut self) -> Result<(), EngineError> {
+        if !self.authenticated_history_replay {
+            return Err(EngineError::Archive(
+                "operational recovery finish requires an active authenticated history replay"
+                    .into(),
+            ));
+        }
+        let replayed_records =
+            u64::try_from(self.authenticated_replayed_batches.len()).map_err(|_| {
+                EngineError::Archive(
+                    "authenticated recovery replay record count exceeds durable generation range"
+                        .into(),
+                )
+            })?;
+        // Durable history generation advances exactly once for each new
+        // BatchId record. This set gains a BatchId only after either its
+        // current-root record matched every authenticated binding or recovery
+        // durably finalized that exact manifest. Equal unique counts therefore
+        // prove coverage of every current durable final record without a
+        // graph-sized finish scan.
+        if replayed_records != self.history_generation {
+            return Err(EngineError::Archive(format!(
+                "authenticated recovery replay covered {replayed_records} of {} durable final history records",
+                self.history_generation
+            )));
+        }
         self.verify_current_durable_page_name_authority()?;
         self.reference_catalog
             .finish_recovery()
@@ -4075,6 +4100,9 @@ impl ShardedHotEngine {
                     existing.status,
                     ArchiveStatus::Rejected(_) | ArchiveStatus::Quarantined
                 ) {
+                    if self.authenticated_history_replay {
+                        self.authenticated_replayed_batches.insert(offered_batch_id);
+                    }
                     return self.outcome(
                         offered_batch_id,
                         disposition_from_final_status(existing.status, true),
@@ -6799,6 +6827,11 @@ impl ShardedHotEngine {
         if let Some(error) = &self.history_failure {
             return Err(error.clone());
         }
+        if self.authenticated_history_replay {
+            return Err(EngineError::ReferenceCatalog(
+                "reference catalog recovery requires complete authenticated history replay".into(),
+            ));
+        }
         if let Some(error) = self.workspace_blocked_error() {
             return Err(error);
         }
@@ -7288,6 +7321,9 @@ impl ShardedHotEngine {
         }
         self.history_generation = published_generation;
         self.history_root = published_root;
+        if self.authenticated_history_replay {
+            self.authenticated_replayed_batches.insert(batch_id);
+        }
         let mut point_cache = self.status_point_cache.borrow_mut();
         point_cache.clear();
         point_cache.insert(batch_id, Some(record));
@@ -18214,9 +18250,10 @@ mod validation_tests {
             ),
             Err(EngineError::ReferenceCatalog(_))
         ));
-        reopened
-            .verify_current_durable_page_name_authority()
-            .unwrap();
+        reopened.prepare_operational_recovery_replay().unwrap();
+        for manifest in writer.committed_manifests().unwrap() {
+            reopened.stage_archive_batch(manifest.batch_id()).unwrap();
+        }
         reopened.finish_operational_recovery_replay().unwrap();
         assert!(reopened
             .reference_source_posting(PageId::from_uuid(Uuid::from_u128(89_011)))
@@ -18604,6 +18641,151 @@ mod validation_tests {
     }
 
     #[test]
+    fn operational_recovery_finish_requires_complete_authenticated_history_replay() {
+        let lineage = LineageDigest::of(b"operational-recovery-requires-complete-history");
+        let (root, writer, mut engine, catalog) = enrolled_test_engine(89_450, lineage);
+        let workspace = writer.workspace_id();
+        let page_id = PageId::from_uuid(Uuid::from_u128(89_451));
+        let home_document_id = DocumentId::from_uuid(Uuid::from_u128(89_452));
+        let block_id = BlockId::from_uuid(Uuid::from_u128(89_453));
+        let first = engine
+            .prepare_bootstrap_transaction(
+                test_author(89_454, 89_454),
+                &create_page_with_block(
+                    page_id,
+                    home_document_id,
+                    block_id,
+                    "Replay Baseline",
+                    "pages/replay-baseline.md",
+                ),
+            )
+            .unwrap();
+        writer.publish_prepared(&first).unwrap();
+        assert!(matches!(
+            engine
+                .stage_archive_batch(first.manifest().batch_id())
+                .unwrap()
+                .disposition(),
+            BatchDisposition::Accepted { no_op: false }
+        ));
+        let second = engine
+            .prepare_bootstrap_transaction(
+                test_author(89_455, 89_455),
+                &OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
+                    block: BlockLocation {
+                        block_id,
+                        home_document_id,
+                    },
+                    content: "Replay Baseline identity".into(),
+                }])
+                .unwrap(),
+            )
+            .unwrap();
+        writer.publish_prepared(&second).unwrap();
+        let second_outcome = engine
+            .stage_archive_batch(second.manifest().batch_id())
+            .unwrap();
+        assert!(
+            matches!(
+                second_outcome.disposition(),
+                BatchDisposition::Rejected {
+                    error: EngineError::CrdtUpdateBaseMismatch(_)
+                }
+            ),
+            "unexpected second outcome: {second_outcome:?}"
+        );
+        assert_eq!(engine.history_generation, 2);
+        drop(engine);
+
+        let graph = Graph::open(&root.join("graph"));
+        let endpoint = ProjectionEndpointBinding::enroll_graph(
+            &graph,
+            ProjectionEndpointId::from_uuid(Uuid::from_u128(89_452)),
+            DeviceId::from_uuid(Uuid::from_u128(89_453)),
+        )
+        .unwrap();
+        let receipts =
+            ProjectionReceiptStore::open_for_endpoint(&root.join("receipts"), workspace, endpoint)
+                .unwrap();
+        let mut reopened = ShardedHotEngine::with_enrolled_projection(
+            ObjectStore::open(&root.join("archive"), workspace).unwrap(),
+            lineage,
+            catalog,
+            &graph,
+            &receipts,
+        );
+        assert!(matches!(
+            reopened.reference_source_posting(page_id),
+            Err(EngineError::ReferenceCatalog(_))
+        ));
+        assert!(matches!(
+            reopened.exact_frontier(),
+            Err(EngineError::ReferenceCatalog(_))
+        ));
+        assert!(matches!(
+            reopened.finish_operational_recovery_replay(),
+            Err(EngineError::Archive(_))
+        ));
+        assert!(matches!(
+            reopened.reference_source_posting(page_id),
+            Err(EngineError::ReferenceCatalog(_))
+        ));
+
+        reopened.prepare_operational_recovery_replay().unwrap();
+        assert!(matches!(
+            reopened.finish_operational_recovery_replay(),
+            Err(EngineError::Archive(_))
+        ));
+        assert!(matches!(
+            reopened.reference_source_posting(page_id),
+            Err(EngineError::ReferenceCatalog(_))
+        ));
+        assert!(matches!(
+            reopened.exact_frontier(),
+            Err(EngineError::ReferenceCatalog(_))
+        ));
+
+        assert!(matches!(
+            reopened
+                .stage_archive_batch(first.manifest().batch_id())
+                .unwrap()
+                .disposition(),
+            BatchDisposition::Accepted { no_op: false }
+        ));
+        reopened
+            .verify_current_durable_page_name_authority()
+            .unwrap();
+        assert!(matches!(
+            reopened.finish_operational_recovery_replay(),
+            Err(EngineError::Archive(_))
+        ));
+        assert!(reopened.authenticated_history_replay);
+        assert!(matches!(
+            reopened.reference_source_posting(page_id),
+            Err(EngineError::ReferenceCatalog(_))
+        ));
+
+        assert!(matches!(
+            reopened
+                .stage_archive_batch(second.manifest().batch_id())
+                .unwrap()
+                .disposition(),
+            BatchDisposition::Rejected {
+                error: EngineError::CrdtUpdateBaseMismatch(_)
+            }
+        ));
+        reopened.finish_operational_recovery_replay().unwrap();
+        assert!(reopened
+            .reference_source_posting(page_id)
+            .unwrap()
+            .is_some());
+
+        drop(reopened);
+        drop(writer);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn terminal_evidence_precedes_catalog_recovery_for_queries_and_mutation() {
         let lineage = LineageDigest::of(b"terminal-before-catalog-recovery");
         let (root, writer, mut engine, catalog) = enrolled_test_engine(89_500, lineage);
@@ -18725,6 +18907,10 @@ mod validation_tests {
                 .fatal_evidence_handle()
                 .expect("durable terminal evidence"),
         );
+        assert!(matches!(
+            reopened.prepare_operational_recovery_replay(),
+            Err(EngineError::Archive(_))
+        ));
         let fact = super::super::PageNameReferenceFactV1 {
             source: super::super::ReferenceSourceLocatorV1::Preamble,
             kind: super::super::PageReferenceKindV1::PageLink,
