@@ -3871,7 +3871,7 @@ impl ShardedHotEngine {
     pub fn stage_archive_batch(&mut self, batch_id: BatchId) -> Result<StageOutcome, EngineError> {
         self.begin_point_operation();
         self.ensure_not_blocked()?;
-        self.stage_archive_batch_internal(batch_id)
+        self.stage_archive_batch_internal(batch_id, None)
     }
 
     pub(crate) fn stage_archive_batch_for_recovery(
@@ -3884,12 +3884,24 @@ impl ShardedHotEngine {
                 "recovery archive staging requires an active authenticated history replay".into(),
             ));
         }
-        self.stage_archive_batch_internal(batch_id)
+        let Some(history_record) = self.authenticated_recovery_history_record(batch_id)? else {
+            return Ok(self.outcome(
+                batch_id,
+                BatchDisposition::Rejected {
+                    error: EngineError::Archive(format!(
+                        "authenticated recovery cannot stage archive-only batch {batch_id} absent from durable history"
+                    )),
+                },
+                Vec::new(),
+            ));
+        };
+        self.stage_archive_batch_internal(batch_id, Some(history_record))
     }
 
     fn stage_archive_batch_internal(
         &mut self,
         batch_id: BatchId,
+        recovery_history_record: Option<ColdHistoryRecord>,
     ) -> Result<StageOutcome, EngineError> {
         self.ensure_history_store()?;
         let inspection = self
@@ -3899,6 +3911,15 @@ impl ShardedHotEngine {
             .inspect_batch(batch_id)
             .map_err(|error| EngineError::Archive(error.to_string()))?;
         match inspection {
+            BatchInspection::Absent if recovery_history_record.is_some() => Ok(self.outcome(
+                batch_id,
+                BatchDisposition::Rejected {
+                    error: EngineError::Archive(format!(
+                        "authenticated recovery durable batch {batch_id} is absent from the immutable archive"
+                    )),
+                },
+                Vec::new(),
+            )),
             BatchInspection::Absent => Ok(self.outcome(
                 batch_id,
                 BatchDisposition::IncompleteStaged {
@@ -3907,6 +3928,18 @@ impl ShardedHotEngine {
                 },
                 Vec::new(),
             )),
+            BatchInspection::Staged { missing, .. } if recovery_history_record.is_some() => {
+                Ok(self.outcome(
+                    batch_id,
+                    BatchDisposition::Rejected {
+                        error: EngineError::Archive(format!(
+                            "authenticated recovery durable batch {batch_id} is missing {} immutable objects",
+                            missing.len()
+                        )),
+                    },
+                    Vec::new(),
+                ))
+            }
             BatchInspection::Staged { missing, .. } => Ok(self.outcome(
                 batch_id,
                 BatchDisposition::IncompleteStaged {
@@ -3917,7 +3950,8 @@ impl ShardedHotEngine {
             )),
             BatchInspection::Ready(batch) => {
                 let batch_id = batch.manifest().batch_id();
-                let outcome = self.stage_ready_internal(batch, true);
+                let outcome =
+                    self.stage_ready_internal(batch, true, recovery_history_record);
                 self.resolve_pending_author(batch_id, &outcome.disposition);
                 self.prune_persisted_archive_cache();
                 Ok(outcome)
@@ -3941,7 +3975,7 @@ impl ShardedHotEngine {
         if let Err(error) = self.ensure_not_blocked() {
             return self.outcome(batch_id, BatchDisposition::Rejected { error }, Vec::new());
         }
-        let outcome = self.stage_ready_internal(batch, false);
+        let outcome = self.stage_ready_internal(batch, false, None);
         self.resolve_pending_author(batch_id, &outcome.disposition);
         outcome
     }
@@ -3971,7 +4005,12 @@ impl ShardedHotEngine {
         drop(pending);
     }
 
-    fn stage_ready_internal(&mut self, batch: ValidatedBatch, persisted: bool) -> StageOutcome {
+    fn stage_ready_internal(
+        &mut self,
+        batch: ValidatedBatch,
+        persisted: bool,
+        recovery_history_record: Option<ColdHistoryRecord>,
+    ) -> StageOutcome {
         self.begin_point_operation();
         let batch_id = batch.manifest().batch_id();
         if let Some(error) = &self.history_failure {
@@ -3989,8 +4028,30 @@ impl ShardedHotEngine {
                 .unwrap_or_else(|| EngineError::ReferenceCatalog(catalog_error.to_string()));
             return self.outcome(batch_id, BatchDisposition::Rejected { error }, Vec::new());
         }
+        if self.authenticated_history_replay && recovery_history_record.is_none() {
+            return self.outcome(
+                batch_id,
+                BatchDisposition::Rejected {
+                    error: EngineError::Archive(
+                        "authenticated recovery staging requires a durable history record".into(),
+                    ),
+                },
+                Vec::new(),
+            );
+        }
+        if !self.authenticated_history_replay && recovery_history_record.is_some() {
+            return self.outcome(
+                batch_id,
+                BatchDisposition::Rejected {
+                    error: EngineError::Archive(
+                        "normal staging cannot consume a recovery history record".into(),
+                    ),
+                },
+                Vec::new(),
+            );
+        }
         if persisted && self.scratch.is_some() {
-            return self.stage_ready_scratch(batch);
+            return self.stage_ready_scratch(batch, recovery_history_record);
         }
         if let Err(error) = self.check_batch_namespace(&batch) {
             return self.outcome(batch_id, BatchDisposition::Rejected { error }, Vec::new());
@@ -4101,7 +4162,11 @@ impl ShardedHotEngine {
         self.outcome(batch_id, disposition, accepted)
     }
 
-    fn stage_ready_scratch(&mut self, batch: ValidatedBatch) -> StageOutcome {
+    fn stage_ready_scratch(
+        &mut self,
+        batch: ValidatedBatch,
+        recovery_history_record: Option<ColdHistoryRecord>,
+    ) -> StageOutcome {
         let offered_batch_id = batch.manifest().batch_id();
         self.precommit_history_publication_failure = None;
         let roots_before_stage = self.scratch_roots.clone();
@@ -4122,7 +4187,11 @@ impl ShardedHotEngine {
             );
         }
         let fingerprint = batch_fingerprint(&batch);
-        match self.cold_history_record(offered_batch_id) {
+        let history_record = match recovery_history_record {
+            Some(record) => Ok(Some(record)),
+            None => self.cold_history_record(offered_batch_id),
+        };
+        match history_record {
             Ok(Some(existing)) => {
                 if existing.manifest_fingerprint != fingerprint {
                     let error = EngineError::BatchCollision(offered_batch_id);
@@ -7405,6 +7474,41 @@ impl ShardedHotEngine {
                 .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))?;
         }
         Ok(())
+    }
+
+    fn authenticated_recovery_history_record(
+        &self,
+        batch_id: BatchId,
+    ) -> Result<Option<ColdHistoryRecord>, EngineError> {
+        if !self.authenticated_history_replay {
+            return Err(EngineError::Archive(
+                "durable recovery history lookup requires active authenticated replay".into(),
+            ));
+        }
+        let store = self.history_store.as_ref().ok_or_else(|| {
+            EngineError::Archive(
+                "authenticated recovery has no enrolled durable history store".into(),
+            )
+        })?;
+        let bytes = store
+            .lookup(self.history_root, batch_id)
+            .map_err(|error| EngineError::Archive(error.to_string()))?;
+        if bytes.is_some() {
+            store.note_history_decode();
+        }
+        bytes
+            .map(|bytes| {
+                let record = decode_history_record(batch_id, &bytes)?;
+                self.validate_record_catalog_transition(&record)?;
+                if record.generation == 0 || record.generation > self.history_generation {
+                    return Err(EngineError::Archive(
+                        "recovery history record is not bound to the sealed durable generation"
+                            .into(),
+                    ));
+                }
+                Ok(record)
+            })
+            .transpose()
     }
 
     fn cold_history_record(
@@ -18281,8 +18385,29 @@ mod validation_tests {
         .unwrap();
         let malformed_orphan = PreparedBatch::new(malformed_manifest, malformed_objects).unwrap();
         let malformed_orphan_id = malformed_orphan.manifest().batch_id();
+        let incomplete_orphan = engine
+            .prepare_bootstrap_transaction(
+                test_author(89_050, 89_050),
+                &OperationTransaction::new(vec![SemanticOperation::CreatePage {
+                    page_id: PageId::from_uuid(Uuid::from_u128(89_051)),
+                    home_document_id: DocumentId::from_uuid(Uuid::from_u128(89_052)),
+                    name: LogicalPageName::parse("Incomplete Archive Orphan").unwrap(),
+                    path: ManagedPath::parse("pages/incomplete-archive-orphan.md").unwrap(),
+                    kind: ManagedTextKind::Page,
+                }])
+                .unwrap(),
+            )
+            .unwrap();
+        let incomplete_orphan_id = incomplete_orphan.manifest().batch_id();
         writer.publish_prepared(&update).unwrap();
         writer.publish_prepared(&malformed_orphan).unwrap();
+        writer
+            .stage_manifest_bytes(&incomplete_orphan.manifest().encode().unwrap())
+            .unwrap();
+        assert!(matches!(
+            writer.inspect_batch(incomplete_orphan_id).unwrap(),
+            BatchInspection::Staged { .. }
+        ));
         let prior_observable = observable_engine_state(&engine);
         super::super::object_store::fail_next_engine_history_head_swap();
         let outcome = engine
@@ -18364,7 +18489,26 @@ mod validation_tests {
             Err(EngineError::ReferenceCatalog(_))
         ));
         reopened.prepare_operational_recovery_replay().unwrap();
+        for orphan_id in [
+            BatchId::from_uuid(Uuid::from_u128(89_060)),
+            incomplete_orphan_id,
+        ] {
+            let before = observable_engine_state(&reopened);
+            let outcome = reopened
+                .stage_archive_batch_for_recovery(orphan_id)
+                .unwrap();
+            assert!(matches!(
+                outcome.disposition(),
+                BatchDisposition::Rejected {
+                    error: EngineError::Archive(_),
+                }
+            ));
+            assert_eq!(observable_engine_state(&reopened), before);
+        }
         for manifest in writer.committed_manifests().unwrap() {
+            if manifest.batch_id() == incomplete_orphan_id {
+                continue;
+            }
             let before = (manifest.batch_id() == malformed_orphan_id)
                 .then(|| observable_engine_state(&reopened));
             let outcome = reopened
@@ -20227,7 +20371,7 @@ mod replay_benchmark {
             inspection_elapsed += inspection_started.elapsed();
             let validation_started = Instant::now();
             assert!(matches!(
-                replay.stage_ready_internal(batch, true).disposition(),
+                replay.stage_ready_internal(batch, true, None).disposition(),
                 BatchDisposition::Accepted { .. }
             ));
             replay.prune_persisted_archive_cache();
