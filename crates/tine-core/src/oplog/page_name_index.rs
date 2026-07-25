@@ -68,11 +68,29 @@ impl AuthenticatedCatalogPageNameCheckpointV1 {
     pub(crate) const fn catalog_checkpoint_content_digest(&self) -> ContentDigest {
         self.catalog_checkpoint_content_digest
     }
+
+    /// Reuse the bounded observations only after the caller has independently
+    /// proven that current catalog authority is exactly this authenticated
+    /// frontier. The authenticated checkpoint itself remains the persistent
+    /// transition proof.
+    pub(crate) fn observations_for_equal_current(
+        &self,
+    ) -> AuthoritativeCatalogPageNameObservationsV1 {
+        AuthoritativeCatalogPageNameObservationsV1 {
+            entries: self.entries.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct AuthoritativeCatalogPageNameObservationsV1 {
     entries: BTreeMap<PageId, Option<PageState>>,
+}
+
+impl AuthoritativeCatalogPageNameObservationsV1 {
+    pub(crate) fn entries(&self) -> &BTreeMap<PageId, Option<PageState>> {
+        &self.entries
+    }
 }
 
 pub(crate) fn extract_authoritative_catalog_page_names(
@@ -97,6 +115,28 @@ pub(crate) fn extract_authoritative_catalog_page_names(
                 .map_err(|_| StoreError::MalformedPageNameIndex)
         })
         .collect::<Result<_, _>>()?;
+    Ok(AuthoritativeCatalogPageNameObservationsV1 { entries })
+}
+
+/// Select bounded affected-page observations from a catalog map that has
+/// already passed complete replacement/catalog validation.
+pub(crate) fn extract_validated_catalog_page_names(
+    validated_pages: &BTreeMap<PageId, PageState>,
+    requested_page_ids: &[PageId],
+) -> Result<AuthoritativeCatalogPageNameObservationsV1, StoreError> {
+    if requested_page_ids.len() > MAX_PAGE_NAME_POINT_BATCH {
+        return Err(StoreError::PageNamePointBatchTooLarge {
+            actual: requested_page_ids.len(),
+            limit: MAX_PAGE_NAME_POINT_BATCH,
+        });
+    }
+    if requested_page_ids.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(StoreError::NonCanonicalPageNamePointKeys);
+    }
+    let entries = requested_page_ids
+        .iter()
+        .map(|page_id| (*page_id, validated_pages.get(page_id).cloned()))
+        .collect();
     Ok(AuthoritativeCatalogPageNameObservationsV1 { entries })
 }
 

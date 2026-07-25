@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
+#[cfg(test)]
+use std::time::Instant;
 
 use loro::{LoroDoc, VersionVector};
 use serde::{Deserialize, Serialize};
@@ -8,7 +10,9 @@ use serde::{Deserialize, Serialize};
 use super::loro_store::{
     AuthenticatedLoroStore, LoroHistoryWitness, LoroStoreRoot, LoroStoreStats,
 };
-use super::scratch_store::{ScratchBlobRef, ScratchPageKind, ScratchRoots, ScratchStore};
+use super::scratch_store::{
+    ScratchBlobRef, ScratchLsmRoot, ScratchPageKind, ScratchRoots, ScratchStore,
+};
 use super::{
     BatchId, ContentDigest, CrdtPeerCounter, CrdtPeerId, DocumentCausalDigest,
     DocumentDependencies, DocumentId,
@@ -17,6 +21,7 @@ use super::{
 const DOCUMENT_STATE_SCHEMA_VERSION: u32 = 1;
 const EXTERNAL_DOCUMENT_STATE_SCHEMA_VERSION: u32 = 1;
 const CHECKPOINT_CHUNK_BYTES: usize = 64 * 1024;
+const CHECKPOINT_BLOB_DEDUP_FLUSH_CAP: usize = 4096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[repr(u8)]
@@ -125,6 +130,7 @@ pub(crate) struct AuthenticatedExternalExactCheckpoint {
     peer_counters: Vec<CrdtPeerCounter>,
     exact_direct_heads: Vec<BatchId>,
     document: ExternalDocument,
+    state_work: DocumentStateWork,
     checkpoint_binding: ContentDigest,
     checkpoint_content_digest: ContentDigest,
     archive_anchor: Option<(BatchId, ContentDigest, ContentDigest)>,
@@ -162,6 +168,13 @@ impl AuthenticatedExternalExactCheckpoint {
     pub(crate) const fn document(&self) -> &LoroDoc {
         self.document.document()
     }
+
+    /// Consume the trust-bearing checkpoint only after all derived evidence
+    /// has been extracted, preserving the load work that must be charged by
+    /// the caller retaining the authenticated document state.
+    pub(crate) fn into_external_document_with_work(self) -> (ExternalDocument, DocumentStateWork) {
+        (self.document, self.state_work)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -174,6 +187,48 @@ pub(crate) struct DocumentStateWork {
     pub external_range_scans: usize,
     pub external_history_page_reads: usize,
     pub external_history_blob_reads: usize,
+    #[cfg(test)]
+    pub external_checkpoint_phase_calls: usize,
+    #[cfg(test)]
+    pub external_checkpoint_nonempty_calls: usize,
+    #[cfg(test)]
+    pub external_checkpoint_documents: usize,
+    #[cfg(test)]
+    pub checkpoint_chunks: usize,
+    #[cfg(test)]
+    pub checkpoint_existing_hits: usize,
+    #[cfg(test)]
+    pub checkpoint_staged_hits: usize,
+    #[cfg(test)]
+    pub checkpoint_new_chunks: usize,
+    #[cfg(test)]
+    pub blob_dedup_lsm_flushes: usize,
+    #[cfg(test)]
+    pub blob_dedup_lsm_insert_nanos: u128,
+    #[cfg(test)]
+    pub checkpoint_chunk_digest_nanos: u128,
+    #[cfg(test)]
+    pub blob_dedup_lookup_nanos: u128,
+    #[cfg(test)]
+    pub checkpoint_blob_append_nanos: u128,
+    #[cfg(test)]
+    pub checkpoint_whole_digest_nanos: u128,
+    #[cfg(test)]
+    pub loro_external_flush_nanos: u128,
+    #[cfg(test)]
+    pub state_checkpoint_export_nanos: u128,
+    #[cfg(test)]
+    pub external_witness_root_nanos: u128,
+    #[cfg(test)]
+    pub blob_tree_nanos: u128,
+    #[cfg(test)]
+    pub external_record_validation_nanos: u128,
+    #[cfg(test)]
+    pub external_record_encoding_nanos: u128,
+    #[cfg(test)]
+    pub external_exact_map_insert_nanos: u128,
+    #[cfg(test)]
+    pub external_current_map_insert_nanos: u128,
 }
 
 pub(crate) struct ExternalCheckpointInput<'a> {
@@ -234,10 +289,17 @@ fn commit_external_batch(
     let mut exact_changes = BTreeMap::new();
     let mut current_changes = BTreeMap::new();
     let mut work = DocumentStateWork::default();
+    #[cfg(test)]
+    {
+        work.external_checkpoint_phase_calls = 1;
+        work.external_checkpoint_nonempty_calls = usize::from(!inputs.is_empty());
+        work.external_checkpoint_documents = inputs.len();
+    }
+    let mut blob_writer = CheckpointBlobWriter::new(store, &roots.blob_dedup_root);
     for input in inputs {
-        let (next, record, bytes, record_work) = prepare_external_record(
+        let (record, bytes, record_work) = prepare_external_record(
             store,
-            &candidate,
+            &mut blob_writer,
             lane,
             input.document_id,
             input.document,
@@ -246,7 +308,6 @@ fn commit_external_batch(
             latest_manifest_fingerprint,
             input.latest_update_digest,
         )?;
-        candidate = next;
         work.state_page_bytes_written = work
             .state_page_bytes_written
             .saturating_add(record_work.state_page_bytes_written);
@@ -265,6 +326,8 @@ fn commit_external_batch(
         work.external_history_blob_reads = work
             .external_history_blob_reads
             .saturating_add(record_work.external_history_blob_reads);
+        #[cfg(test)]
+        accumulate_test_timing(&mut work, &record_work);
         exact_changes.insert(
             external_exact_key(lane, input.document_id, record.causal_digest),
             Some(bytes.clone()),
@@ -273,19 +336,39 @@ fn commit_external_batch(
             current_changes.insert(current_key(lane, input.document_id), Some(bytes));
         }
     }
+    blob_writer.flush_staged()?;
+    candidate.blob_dedup_root = blob_writer.candidate_root.clone();
+    #[cfg(test)]
+    blob_writer.record_test_work(&mut work);
     if !exact_changes.is_empty() {
+        #[cfg(test)]
+        let exact_map_started = Instant::now();
         candidate.external_document_state_root = store.insert_many(
             &candidate.external_document_state_root,
             ScratchPageKind::DocumentExternalExact,
             &exact_changes,
         )?;
+        #[cfg(test)]
+        {
+            work.external_exact_map_insert_nanos = work
+                .external_exact_map_insert_nanos
+                .saturating_add(exact_map_started.elapsed().as_nanos());
+        }
     }
     if !current_changes.is_empty() {
+        #[cfg(test)]
+        let current_map_started = Instant::now();
         candidate.external_document_current_root = store.insert_many(
             &candidate.external_document_current_root,
             ScratchPageKind::DocumentExternalCurrent,
             &current_changes,
         )?;
+        #[cfg(test)]
+        {
+            work.external_current_map_insert_nanos = work
+                .external_current_map_insert_nanos
+                .saturating_add(current_map_started.elapsed().as_nanos());
+        }
     }
     Ok((candidate, work))
 }
@@ -293,7 +376,7 @@ fn commit_external_batch(
 #[allow(clippy::too_many_arguments)]
 fn prepare_external_record(
     store: &Arc<ScratchStore>,
-    roots: &ScratchRoots,
+    blob_writer: &mut CheckpointBlobWriter<'_>,
     lane: DocumentLane,
     document_id: DocumentId,
     external: &ExternalDocument,
@@ -301,15 +384,7 @@ fn prepare_external_record(
     latest_source_batch: BatchId,
     latest_manifest_fingerprint: ContentDigest,
     latest_update_digest: ContentDigest,
-) -> Result<
-    (
-        ScratchRoots,
-        ExternalDocumentStateRecord,
-        Vec<u8>,
-        DocumentStateWork,
-    ),
-    DocumentStateError,
-> {
+) -> Result<(ExternalDocumentStateRecord, Vec<u8>, DocumentStateWork), DocumentStateError> {
     let document = external.document();
     let history_before = external.history_store.stats();
     exact_direct_heads.sort_unstable();
@@ -322,9 +397,15 @@ fn prepare_external_record(
     )
     .map_err(|error| DocumentStateError::InvalidCrdt(error.to_string()))?;
     let causal_digest = dependencies.causal_state_digest();
+    #[cfg(test)]
+    let checkpoint_export_started = Instant::now();
     let state_checkpoint = document
         .flush_external_store()
         .map_err(|error| DocumentStateError::InvalidCrdt(error.to_string()))?;
+    #[cfg(test)]
+    let checkpoint_export_nanos = checkpoint_export_started.elapsed().as_nanos();
+    #[cfg(test)]
+    let witness_root_started = Instant::now();
     let witness = LoroHistoryWitness::new(
         store.workspace_id(),
         document_id,
@@ -335,9 +416,21 @@ fn prepare_external_record(
         latest_update_digest,
     )?;
     let history_root = external.history_store.publish_root(witness)?;
+    #[cfg(test)]
+    let witness_root_nanos = witness_root_started.elapsed().as_nanos();
     let history_after = external.history_store.stats();
-    let (next, state_checkpoint, state_page_bytes_written) =
-        put_blob_tree(store, roots, &state_checkpoint, true)?;
+    #[cfg(test)]
+    let blob_tree_started = Instant::now();
+    #[cfg(test)]
+    let blob_lsm_insert_before = blob_writer.lsm_insert_nanos;
+    let (state_checkpoint, state_page_bytes_written) =
+        blob_writer.put_blob_tree(&state_checkpoint)?;
+    #[cfg(test)]
+    let blob_tree_nanos = blob_tree_started.elapsed().as_nanos().saturating_sub(
+        blob_writer
+            .lsm_insert_nanos
+            .saturating_sub(blob_lsm_insert_before),
+    );
     let record = ExternalDocumentStateRecord {
         schema_version: EXTERNAL_DOCUMENT_STATE_SCHEMA_VERSION,
         document_id,
@@ -351,14 +444,274 @@ fn prepare_external_record(
         latest_manifest_fingerprint,
         latest_update_digest,
     };
+    #[cfg(test)]
+    let record_validation_started = Instant::now();
     validate_external_record(store, &record)?;
+    #[cfg(test)]
+    let record_validation_nanos = record_validation_started.elapsed().as_nanos();
+    #[cfg(test)]
+    let record_encoding_started = Instant::now();
     let bytes = encode_canonical(&record)?;
+    #[cfg(test)]
+    let record_encoding_nanos = record_encoding_started.elapsed().as_nanos();
     let mut work = DocumentStateWork {
         state_page_bytes_written,
         ..DocumentStateWork::default()
     };
     record_loro_store_work(&mut work, history_before, history_after);
-    Ok((next, record, bytes, work))
+    #[cfg(test)]
+    {
+        work.loro_external_flush_nanos = history_after
+            .flush_nanos
+            .saturating_sub(history_before.flush_nanos);
+        work.state_checkpoint_export_nanos =
+            checkpoint_export_nanos.saturating_sub(work.loro_external_flush_nanos);
+        work.external_witness_root_nanos = witness_root_nanos;
+        work.blob_tree_nanos = blob_tree_nanos;
+        work.external_record_validation_nanos = record_validation_nanos;
+        work.external_record_encoding_nanos = record_encoding_nanos;
+    }
+    Ok((record, bytes, work))
+}
+
+#[cfg(test)]
+fn accumulate_test_timing(total: &mut DocumentStateWork, record: &DocumentStateWork) {
+    total.loro_external_flush_nanos = total
+        .loro_external_flush_nanos
+        .saturating_add(record.loro_external_flush_nanos);
+    total.state_checkpoint_export_nanos = total
+        .state_checkpoint_export_nanos
+        .saturating_add(record.state_checkpoint_export_nanos);
+    total.external_witness_root_nanos = total
+        .external_witness_root_nanos
+        .saturating_add(record.external_witness_root_nanos);
+    total.blob_tree_nanos = total.blob_tree_nanos.saturating_add(record.blob_tree_nanos);
+    total.external_record_validation_nanos = total
+        .external_record_validation_nanos
+        .saturating_add(record.external_record_validation_nanos);
+    total.external_record_encoding_nanos = total
+        .external_record_encoding_nanos
+        .saturating_add(record.external_record_encoding_nanos);
+}
+
+struct CheckpointBlobWriter<'a> {
+    store: &'a ScratchStore,
+    candidate_root: ScratchLsmRoot,
+    staged: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    #[cfg(test)]
+    chunks: usize,
+    #[cfg(test)]
+    existing_hits: usize,
+    #[cfg(test)]
+    staged_hits: usize,
+    #[cfg(test)]
+    new_chunks: usize,
+    #[cfg(test)]
+    lsm_flushes: usize,
+    #[cfg(test)]
+    lsm_insert_nanos: u128,
+    #[cfg(test)]
+    chunk_digest_nanos: u128,
+    #[cfg(test)]
+    dedup_lookup_nanos: u128,
+    #[cfg(test)]
+    blob_append_nanos: u128,
+    #[cfg(test)]
+    whole_checkpoint_digest_nanos: u128,
+}
+
+impl<'a> CheckpointBlobWriter<'a> {
+    fn new(store: &'a ScratchStore, root: &ScratchLsmRoot) -> Self {
+        Self {
+            store,
+            candidate_root: root.clone(),
+            staged: BTreeMap::new(),
+            #[cfg(test)]
+            chunks: 0,
+            #[cfg(test)]
+            existing_hits: 0,
+            #[cfg(test)]
+            staged_hits: 0,
+            #[cfg(test)]
+            new_chunks: 0,
+            #[cfg(test)]
+            lsm_flushes: 0,
+            #[cfg(test)]
+            lsm_insert_nanos: 0,
+            #[cfg(test)]
+            chunk_digest_nanos: 0,
+            #[cfg(test)]
+            dedup_lookup_nanos: 0,
+            #[cfg(test)]
+            blob_append_nanos: 0,
+            #[cfg(test)]
+            whole_checkpoint_digest_nanos: 0,
+        }
+    }
+
+    fn put_blob_tree(&mut self, bytes: &[u8]) -> Result<(BlobTree, usize), DocumentStateError> {
+        if bytes.is_empty() {
+            return Err(DocumentStateError::InvalidCrdt(
+                "empty document checkpoint".into(),
+            ));
+        }
+        let mut chunks = Vec::new();
+        let mut new_blob_bytes = 0_usize;
+        for chunk in bytes.chunks(CHECKPOINT_CHUNK_BYTES) {
+            #[cfg(test)]
+            {
+                self.chunks = self.chunks.saturating_add(1);
+            }
+            #[cfg(test)]
+            let chunk_digest_started = Instant::now();
+            let digest = ContentDigest::of(chunk);
+            #[cfg(test)]
+            {
+                self.chunk_digest_nanos = self
+                    .chunk_digest_nanos
+                    .saturating_add(chunk_digest_started.elapsed().as_nanos());
+            }
+            let key = digest.as_bytes().to_vec();
+            let chunk_ref = if let Some(encoded) = self.staged.get(&key) {
+                let encoded = encoded
+                    .as_deref()
+                    .ok_or(DocumentStateError::MalformedRecord)?;
+                let chunk_ref = self.validate_candidate(encoded, digest, chunk)?;
+                #[cfg(test)]
+                {
+                    self.staged_hits = self.staged_hits.saturating_add(1);
+                }
+                chunk_ref
+            } else if let Some(encoded) = self.lookup_dedup(&key)? {
+                let chunk_ref = self.validate_candidate(&encoded, digest, chunk)?;
+                #[cfg(test)]
+                {
+                    self.existing_hits = self.existing_hits.saturating_add(1);
+                }
+                chunk_ref
+            } else {
+                let chunk_ref = self.append_blob(chunk)?;
+                self.staged.insert(key, Some(encode_canonical(&chunk_ref)?));
+                new_blob_bytes = new_blob_bytes.saturating_add(chunk.len());
+                #[cfg(test)]
+                {
+                    self.new_chunks = self.new_chunks.saturating_add(1);
+                }
+                if self.staged.len() == CHECKPOINT_BLOB_DEDUP_FLUSH_CAP {
+                    self.flush_staged()?;
+                }
+                chunk_ref
+            };
+            chunks.push(chunk_ref);
+        }
+        #[cfg(test)]
+        let whole_digest_started = Instant::now();
+        let whole_digest = ContentDigest::of(bytes);
+        #[cfg(test)]
+        {
+            self.whole_checkpoint_digest_nanos = self
+                .whole_checkpoint_digest_nanos
+                .saturating_add(whole_digest_started.elapsed().as_nanos());
+        }
+        Ok((
+            BlobTree {
+                schema_version: DOCUMENT_STATE_SCHEMA_VERSION,
+                encoded_len: bytes.len() as u64,
+                digest: whole_digest,
+                chunks,
+            },
+            new_blob_bytes,
+        ))
+    }
+
+    fn lookup_dedup(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, DocumentStateError> {
+        #[cfg(test)]
+        let lookup_started = Instant::now();
+        let result = self
+            .store
+            .lookup(&self.candidate_root, ScratchPageKind::BlobDedup, key);
+        #[cfg(test)]
+        {
+            self.dedup_lookup_nanos = self
+                .dedup_lookup_nanos
+                .saturating_add(lookup_started.elapsed().as_nanos());
+        }
+        Ok(result?)
+    }
+
+    fn append_blob(&mut self, chunk: &[u8]) -> Result<ScratchBlobRef, DocumentStateError> {
+        #[cfg(test)]
+        let append_started = Instant::now();
+        let result = self.store.append_blob(chunk);
+        #[cfg(test)]
+        {
+            self.blob_append_nanos = self
+                .blob_append_nanos
+                .saturating_add(append_started.elapsed().as_nanos());
+        }
+        Ok(result?)
+    }
+
+    fn validate_candidate(
+        &self,
+        encoded: &[u8],
+        digest: ContentDigest,
+        chunk: &[u8],
+    ) -> Result<ScratchBlobRef, DocumentStateError> {
+        let chunk_ref: ScratchBlobRef = decode_canonical(encoded)?;
+        if chunk_ref.digest() != digest || self.store.read_blob(&chunk_ref)? != chunk {
+            return Err(DocumentStateError::MisboundRecord);
+        }
+        Ok(chunk_ref)
+    }
+
+    fn flush_staged(&mut self) -> Result<(), DocumentStateError> {
+        if self.staged.is_empty() {
+            return Ok(());
+        }
+        #[cfg(test)]
+        let insert_started = Instant::now();
+        self.candidate_root = self.store.insert_many(
+            &self.candidate_root,
+            ScratchPageKind::BlobDedup,
+            &self.staged,
+        )?;
+        #[cfg(test)]
+        {
+            self.lsm_flushes = self.lsm_flushes.saturating_add(1);
+            self.lsm_insert_nanos = self
+                .lsm_insert_nanos
+                .saturating_add(insert_started.elapsed().as_nanos());
+        }
+        self.staged.clear();
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn record_test_work(&self, work: &mut DocumentStateWork) {
+        work.checkpoint_chunks = work.checkpoint_chunks.saturating_add(self.chunks);
+        work.checkpoint_existing_hits = work
+            .checkpoint_existing_hits
+            .saturating_add(self.existing_hits);
+        work.checkpoint_staged_hits = work.checkpoint_staged_hits.saturating_add(self.staged_hits);
+        work.checkpoint_new_chunks = work.checkpoint_new_chunks.saturating_add(self.new_chunks);
+        work.blob_dedup_lsm_flushes = work.blob_dedup_lsm_flushes.saturating_add(self.lsm_flushes);
+        work.blob_dedup_lsm_insert_nanos = work
+            .blob_dedup_lsm_insert_nanos
+            .saturating_add(self.lsm_insert_nanos);
+        work.checkpoint_chunk_digest_nanos = work
+            .checkpoint_chunk_digest_nanos
+            .saturating_add(self.chunk_digest_nanos);
+        work.blob_dedup_lookup_nanos = work
+            .blob_dedup_lookup_nanos
+            .saturating_add(self.dedup_lookup_nanos);
+        work.checkpoint_blob_append_nanos = work
+            .checkpoint_blob_append_nanos
+            .saturating_add(self.blob_append_nanos);
+        work.checkpoint_whole_digest_nanos = work
+            .checkpoint_whole_digest_nanos
+            .saturating_add(self.whole_checkpoint_digest_nanos);
+    }
 }
 
 pub(crate) fn load_external_current(
@@ -436,7 +789,7 @@ pub(crate) fn load_authenticated_external_exact(
     let causal_digest = dependencies
         .map(DocumentDependencies::causal_state_digest)
         .unwrap_or_else(|| DocumentCausalDigest::of(document_id, &[], &[]));
-    if let Some((record, document, _)) =
+    if let Some((record, document, state_work)) =
         load_external_exact(store, roots, lane, document_id, causal_digest)?
     {
         if record.peer_counters != peer_counters
@@ -468,6 +821,7 @@ pub(crate) fn load_authenticated_external_exact(
                 record.latest_update_digest,
             )),
             document,
+            state_work,
             checkpoint_binding,
             checkpoint_content_digest,
         }));
@@ -496,6 +850,7 @@ pub(crate) fn load_authenticated_external_exact(
         exact_direct_heads: Vec::new(),
         archive_anchor: None,
         document,
+        state_work: DocumentStateWork::default(),
         checkpoint_binding,
         checkpoint_content_digest,
     }))
@@ -605,63 +960,6 @@ fn record_loro_store_work(
             .history_blob_reads
             .saturating_sub(before.history_blob_reads),
     );
-}
-
-fn put_blob_tree(
-    store: &ScratchStore,
-    roots: &ScratchRoots,
-    bytes: &[u8],
-    structurally_share: bool,
-) -> Result<(ScratchRoots, BlobTree, usize), DocumentStateError> {
-    if bytes.is_empty() {
-        return Err(DocumentStateError::InvalidCrdt(
-            "empty document checkpoint".into(),
-        ));
-    }
-    let mut next = roots.clone();
-    let mut chunks = Vec::new();
-    let mut new_blob_bytes = 0_usize;
-    for chunk in bytes.chunks(CHECKPOINT_CHUNK_BYTES) {
-        let digest = ContentDigest::of(chunk);
-        let key = digest.as_bytes().to_vec();
-        let existing = if structurally_share {
-            store.lookup(&next.blob_dedup_root, ScratchPageKind::BlobDedup, &key)?
-        } else {
-            None
-        };
-        let chunk_ref = match existing {
-            Some(encoded) => {
-                let chunk_ref: ScratchBlobRef = decode_canonical(&encoded)?;
-                if chunk_ref.digest() != digest || store.read_blob(&chunk_ref)? != chunk {
-                    return Err(DocumentStateError::MisboundRecord);
-                }
-                chunk_ref
-            }
-            None => {
-                let chunk_ref = store.append_blob(chunk)?;
-                if structurally_share {
-                    next.blob_dedup_root = store.insert_many(
-                        &next.blob_dedup_root,
-                        ScratchPageKind::BlobDedup,
-                        &BTreeMap::from([(key, Some(encode_canonical(&chunk_ref)?))]),
-                    )?;
-                }
-                new_blob_bytes = new_blob_bytes.saturating_add(chunk.len());
-                chunk_ref
-            }
-        };
-        chunks.push(chunk_ref);
-    }
-    Ok((
-        next,
-        BlobTree {
-            schema_version: DOCUMENT_STATE_SCHEMA_VERSION,
-            encoded_len: bytes.len() as u64,
-            digest: ContentDigest::of(bytes),
-            chunks,
-        },
-        new_blob_bytes,
-    ))
 }
 
 fn read_blob_tree(
@@ -988,6 +1286,199 @@ mod tests {
         drop(reopened);
         drop(exact);
         drop(external);
+        drop(scratch);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn identical_checkpoints_share_staged_blob_refs_and_one_dedup_flush() {
+        let path = std::env::temp_dir().join(format!("tine-external-shared-{}", Uuid::new_v4()));
+        let archive = archive(&path);
+        let scratch = Arc::new(ScratchStore::open(&archive, workspace(31)).unwrap());
+        let document_a = document(32);
+        let document_b = document(33);
+        let source_batch = batch(34);
+        let external_a = external_document(&scratch, 7, "same", "checkpoint");
+        let external_b = external_document(&scratch, 7, "same", "checkpoint");
+        let expected = external_a.document().get_deep_value();
+        assert_eq!(external_b.document().get_deep_value(), expected);
+
+        let (roots, work) = commit_external_current_batch(
+            &scratch,
+            &ScratchRoots::default(),
+            DocumentLane::Visible,
+            source_batch,
+            ContentDigest::of(b"shared-manifest"),
+            vec![
+                ExternalCheckpointInput {
+                    document_id: document_a,
+                    document: &external_a,
+                    exact_direct_heads: vec![source_batch],
+                    latest_update_digest: ContentDigest::of(b"shared-a"),
+                },
+                ExternalCheckpointInput {
+                    document_id: document_b,
+                    document: &external_b,
+                    exact_direct_heads: vec![source_batch],
+                    latest_update_digest: ContentDigest::of(b"shared-b"),
+                },
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(work.external_checkpoint_phase_calls, 1);
+        assert_eq!(work.external_checkpoint_nonempty_calls, 1);
+        assert_eq!(work.external_checkpoint_documents, 2);
+        assert_eq!(work.external_flushes, 2);
+        assert_eq!(work.checkpoint_new_chunks, 1);
+        assert_eq!(work.checkpoint_existing_hits, 0);
+        assert_eq!(work.checkpoint_staged_hits, work.checkpoint_new_chunks);
+        assert_eq!(
+            work.checkpoint_chunks,
+            work.checkpoint_new_chunks.saturating_mul(2)
+        );
+        assert_eq!(work.blob_dedup_lsm_flushes, 1);
+
+        let (record_a, reopened_a, _) =
+            load_external_current(&scratch, &roots, DocumentLane::Visible, document_a)
+                .unwrap()
+                .unwrap();
+        let (record_b, reopened_b, _) =
+            load_external_current(&scratch, &roots, DocumentLane::Visible, document_b)
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            record_a.state_checkpoint.chunks,
+            record_b.state_checkpoint.chunks
+        );
+        assert_ne!(record_a, record_b);
+        assert_eq!(record_a.history_root().witness().document_id(), document_a);
+        assert_eq!(record_b.history_root().witness().document_id(), document_b);
+        assert_eq!(reopened_a.document().get_deep_value(), expected);
+        assert_eq!(reopened_b.document().get_deep_value(), expected);
+
+        drop(reopened_a);
+        drop(reopened_b);
+        drop(external_a);
+        drop(external_b);
+        drop(scratch);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn distinct_checkpoints_do_not_share_blob_refs_and_reopen_exactly() {
+        let path = std::env::temp_dir().join(format!("tine-external-distinct-{}", Uuid::new_v4()));
+        let archive = archive(&path);
+        let scratch = Arc::new(ScratchStore::open(&archive, workspace(41)).unwrap());
+        let document_a = document(42);
+        let document_b = document(43);
+        let source_batch = batch(44);
+        let external_a = external_document(&scratch, 1, "state", "left");
+        let external_b = external_document(&scratch, 2, "state", "right");
+        let expected_a = external_a.document().get_deep_value();
+        let expected_b = external_b.document().get_deep_value();
+
+        let (roots, work) = commit_external_current_batch(
+            &scratch,
+            &ScratchRoots::default(),
+            DocumentLane::Visible,
+            source_batch,
+            ContentDigest::of(b"distinct-manifest"),
+            vec![
+                ExternalCheckpointInput {
+                    document_id: document_a,
+                    document: &external_a,
+                    exact_direct_heads: vec![source_batch],
+                    latest_update_digest: ContentDigest::of(b"distinct-a"),
+                },
+                ExternalCheckpointInput {
+                    document_id: document_b,
+                    document: &external_b,
+                    exact_direct_heads: vec![source_batch],
+                    latest_update_digest: ContentDigest::of(b"distinct-b"),
+                },
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(work.checkpoint_staged_hits, 0);
+        assert_eq!(work.checkpoint_existing_hits, 0);
+        assert_eq!(work.checkpoint_new_chunks, work.checkpoint_chunks);
+        assert_eq!(work.blob_dedup_lsm_flushes, 1);
+        let (record_a, reopened_a, _) =
+            load_external_current(&scratch, &roots, DocumentLane::Visible, document_a)
+                .unwrap()
+                .unwrap();
+        let (record_b, reopened_b, _) =
+            load_external_current(&scratch, &roots, DocumentLane::Visible, document_b)
+                .unwrap()
+                .unwrap();
+        assert_ne!(
+            record_a.state_checkpoint.chunks,
+            record_b.state_checkpoint.chunks
+        );
+        assert_eq!(reopened_a.document().get_deep_value(), expected_a);
+        assert_eq!(reopened_b.document().get_deep_value(), expected_b);
+
+        drop(reopened_a);
+        drop(reopened_b);
+        drop(external_a);
+        drop(external_b);
+        drop(scratch);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn misbound_existing_dedup_ref_fails_closed() {
+        let path = std::env::temp_dir().join(format!("tine-external-misbound-{}", Uuid::new_v4()));
+        let archive = archive(&path);
+        let scratch = Arc::new(ScratchStore::open(&archive, workspace(51)).unwrap());
+        let requested = b"requested checkpoint bytes";
+        let wrong_ref = scratch.append_blob(b"different checkpoint bytes").unwrap();
+        let key = ContentDigest::of(requested).as_bytes().to_vec();
+        let mut changes = BTreeMap::new();
+        changes.insert(key, Some(encode_canonical(&wrong_ref).unwrap()));
+        let mut roots = ScratchRoots::default();
+        roots.blob_dedup_root = scratch
+            .insert_many(&roots.blob_dedup_root, ScratchPageKind::BlobDedup, &changes)
+            .unwrap();
+        let original_root = roots.blob_dedup_root.clone();
+        let mut writer = CheckpointBlobWriter::new(&scratch, &roots.blob_dedup_root);
+
+        assert_eq!(
+            writer.put_blob_tree(requested).unwrap_err(),
+            DocumentStateError::MisboundRecord
+        );
+        assert_eq!(writer.candidate_root, original_root);
+        assert!(writer.staged.is_empty());
+
+        drop(scratch);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn capped_dedup_flush_exposes_later_duplicates_through_candidate_root() {
+        let path = std::env::temp_dir().join(format!("tine-external-cap-{}", Uuid::new_v4()));
+        let archive = archive(&path);
+        let scratch = Arc::new(ScratchStore::open(&archive, workspace(61)).unwrap());
+        let requested = b"checkpoint at deterministic cap";
+        let mut writer =
+            CheckpointBlobWriter::new(&scratch, &ScratchRoots::default().blob_dedup_root);
+        for value in 0..CHECKPOINT_BLOB_DEDUP_FLUSH_CAP - 1 {
+            writer
+                .staged
+                .insert((value as u64).to_be_bytes().to_vec(), Some(vec![0]));
+        }
+
+        let (first, _) = writer.put_blob_tree(requested).unwrap();
+        assert!(writer.staged.is_empty());
+        assert_eq!(writer.lsm_flushes, 1);
+        let (second, _) = writer.put_blob_tree(requested).unwrap();
+        assert_eq!(first.chunks, second.chunks);
+        assert_eq!(writer.new_chunks, 1);
+        assert_eq!(writer.existing_hits, 1);
+        assert_eq!(writer.staged_hits, 0);
+
         drop(scratch);
         fs::remove_dir_all(path).unwrap();
     }

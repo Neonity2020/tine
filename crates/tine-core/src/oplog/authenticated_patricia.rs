@@ -1,6 +1,6 @@
 #![allow(clippy::result_large_err)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use cap_std::fs::Dir;
@@ -256,12 +256,35 @@ impl PatriciaIndexStore {
         root: PatriciaIndexRoot,
         records: &BTreeMap<Vec<u8>, Vec<u8>>,
     ) -> Result<PatriciaIndexRoot, StoreError> {
-        let mut root = root;
+        let (root, staged) = self.stage_many(root, records)?;
+        self.publish_staged_reachable(root, &staged)?;
+        Ok(root)
+    }
+
+    pub(crate) fn insert_many_verify_existing(
+        &self,
+        root: PatriciaIndexRoot,
+        records: &BTreeMap<Vec<u8>, Vec<u8>>,
+    ) -> Result<PatriciaIndexRoot, StoreError> {
+        let (root, staged) = self.stage_many(root, records)?;
+        self.verify_staged_reachable(root, &staged)?;
+        Ok(root)
+    }
+
+    fn stage_many(
+        &self,
+        root: PatriciaIndexRoot,
+        records: &BTreeMap<Vec<u8>, Vec<u8>>,
+    ) -> Result<(PatriciaIndexRoot, BTreeMap<ContentDigest, Node>), StoreError> {
         for (key, value) in records {
             validate_record(key, value)?;
-            root = PatriciaIndexRoot(self.insert(root, key, value)?);
         }
-        Ok(root)
+        let mut root = root;
+        let mut staged = BTreeMap::new();
+        for (key, value) in records {
+            root = PatriciaIndexRoot(self.insert_staged(root, key, value, &mut staged)?);
+        }
+        Ok((root, staged))
     }
 
     pub(crate) fn remove_many(
@@ -356,27 +379,32 @@ impl PatriciaIndexStore {
         Ok(PatriciaIndexRoot(rebuilt))
     }
 
-    fn insert(
+    fn insert_staged(
         &self,
         root: PatriciaIndexRoot,
         key: &[u8],
         value: &[u8],
+        staged: &mut BTreeMap<ContentDigest, Node>,
     ) -> Result<ContentDigest, StoreError> {
         if root == PatriciaIndexRoot::empty() {
-            return self.publish_node(&Node::Leaf {
-                schema_version: NODE_SCHEMA_VERSION,
-                key: key.to_vec(),
-                value: value.to_vec(),
-            });
+            return Self::stage_node(
+                staged,
+                Node::Leaf {
+                    schema_version: NODE_SCHEMA_VERSION,
+                    key: key.to_vec(),
+                    value: value.to_vec(),
+                },
+            );
         }
-        self.insert_at(root.digest(), key, value)
+        self.insert_at_staged(root.digest(), key, value, staged)
     }
 
-    fn insert_at(
+    fn insert_at_staged(
         &self,
         root: ContentDigest,
         key: &[u8],
         value: &[u8],
+        staged: &mut BTreeMap<ContentDigest, Node>,
     ) -> Result<ContentDigest, StoreError> {
         let mut digest = root;
         let mut constraint = None;
@@ -384,18 +412,21 @@ impl PatriciaIndexStore {
         let mut ancestors = Vec::new();
         let replacement = loop {
             remaining_nodes = consume_node_budget(remaining_nodes)?;
-            let node = self.read_node(digest)?;
+            let node = self.read_staged_or_persisted(digest, staged)?;
             validate_node_path(&node, constraint.as_ref())?;
             let node_prefix = node_prefix(&node);
             let node_prefix_bits = node_prefix_bits(&node)?;
             let shared = common_prefix_bits(key, node_prefix, node_prefix_bits)?;
             if shared < node_prefix_bits {
-                let leaf = self.publish_node(&Node::Leaf {
-                    schema_version: NODE_SCHEMA_VERSION,
-                    key: key.to_vec(),
-                    value: value.to_vec(),
-                })?;
-                break self.publish_split(key, shared, digest, node_prefix, leaf)?;
+                let leaf = Self::stage_node(
+                    staged,
+                    Node::Leaf {
+                        schema_version: NODE_SCHEMA_VERSION,
+                        key: key.to_vec(),
+                        value: value.to_vec(),
+                    },
+                )?;
+                break Self::stage_split(staged, key, shared, digest, node_prefix, leaf)?;
             }
 
             match node {
@@ -408,19 +439,25 @@ impl PatriciaIndexStore {
                         if found_value == value {
                             break digest;
                         }
-                        break self.publish_node(&Node::Leaf {
+                        break Self::stage_node(
+                            staged,
+                            Node::Leaf {
+                                schema_version: NODE_SCHEMA_VERSION,
+                                key: key.to_vec(),
+                                value: value.to_vec(),
+                            },
+                        )?;
+                    }
+                    let shared = common_prefix_bits(key, &found_key, key_bit_len(key)?)?;
+                    let leaf = Self::stage_node(
+                        staged,
+                        Node::Leaf {
                             schema_version: NODE_SCHEMA_VERSION,
                             key: key.to_vec(),
                             value: value.to_vec(),
-                        })?;
-                    }
-                    let shared = common_prefix_bits(key, &found_key, key_bit_len(key)?)?;
-                    let leaf = self.publish_node(&Node::Leaf {
-                        schema_version: NODE_SCHEMA_VERSION,
-                        key: key.to_vec(),
-                        value: value.to_vec(),
-                    })?;
-                    break self.publish_split(key, shared, digest, &found_key, leaf)?;
+                        },
+                    )?;
+                    break Self::stage_split(staged, key, shared, digest, &found_key, leaf)?;
                 }
                 Node::Branch {
                     prefix,
@@ -457,18 +494,21 @@ impl PatriciaIndexStore {
                 } else {
                     (child, ancestor.right)
                 };
-                self.publish_node(&Node::Branch {
-                    schema_version: NODE_SCHEMA_VERSION,
-                    prefix: ancestor.prefix,
-                    prefix_bit_len: ancestor.prefix_bit_len,
-                    left,
-                    right,
-                })
+                Self::stage_node(
+                    staged,
+                    Node::Branch {
+                        schema_version: NODE_SCHEMA_VERSION,
+                        prefix: ancestor.prefix,
+                        prefix_bit_len: ancestor.prefix_bit_len,
+                        left,
+                        right,
+                    },
+                )
             })
     }
 
-    fn publish_split(
-        &self,
+    fn stage_split(
+        staged: &mut BTreeMap<ContentDigest, Node>,
         key: &[u8],
         shared: usize,
         existing: ContentDigest,
@@ -485,14 +525,89 @@ impl PatriciaIndexStore {
         } else {
             (leaf, existing)
         };
-        self.publish_node(&Node::Branch {
-            schema_version: NODE_SCHEMA_VERSION,
-            prefix: masked_prefix(key, shared),
-            prefix_bit_len: u16::try_from(shared)
-                .map_err(|_| StoreError::MalformedLogseqClaimIndex)?,
-            left,
-            right,
-        })
+        Self::stage_node(
+            staged,
+            Node::Branch {
+                schema_version: NODE_SCHEMA_VERSION,
+                prefix: masked_prefix(key, shared),
+                prefix_bit_len: u16::try_from(shared)
+                    .map_err(|_| StoreError::MalformedLogseqClaimIndex)?,
+                left,
+                right,
+            },
+        )
+    }
+
+    fn stage_node(
+        staged: &mut BTreeMap<ContentDigest, Node>,
+        node: Node,
+    ) -> Result<ContentDigest, StoreError> {
+        validate_node(&node)?;
+        let bytes =
+            postcard::to_allocvec(&node).map_err(|_| StoreError::MalformedLogseqClaimIndex)?;
+        if bytes.len() as u64 > MAX_NODE_BYTES {
+            return Err(StoreError::MalformedLogseqClaimIndex);
+        }
+        let digest = ContentDigest::of(&bytes);
+        staged.entry(digest).or_insert(node);
+        Ok(digest)
+    }
+
+    fn read_staged_or_persisted(
+        &self,
+        digest: ContentDigest,
+        staged: &BTreeMap<ContentDigest, Node>,
+    ) -> Result<Node, StoreError> {
+        match staged.get(&digest) {
+            Some(node) => Ok(node.clone()),
+            None => self.read_node(digest),
+        }
+    }
+
+    fn publish_staged_reachable(
+        &self,
+        root: PatriciaIndexRoot,
+        staged: &BTreeMap<ContentDigest, Node>,
+    ) -> Result<(), StoreError> {
+        let mut pending = vec![root.digest()];
+        let mut visited = BTreeSet::new();
+        while let Some(digest) = pending.pop() {
+            if !visited.insert(digest) {
+                continue;
+            }
+            let Some(node) = staged.get(&digest) else {
+                continue;
+            };
+            if let Node::Branch { left, right, .. } = node {
+                pending.push(*left);
+                pending.push(*right);
+            }
+            self.publish_node(node)?;
+        }
+        Ok(())
+    }
+
+    fn verify_staged_reachable(
+        &self,
+        root: PatriciaIndexRoot,
+        staged: &BTreeMap<ContentDigest, Node>,
+    ) -> Result<(), StoreError> {
+        let mut pending = vec![root.digest()];
+        let mut visited = BTreeSet::new();
+        while let Some(digest) = pending.pop() {
+            if !visited.insert(digest) {
+                continue;
+            }
+            let Some(node) = staged.get(&digest) else {
+                continue;
+            };
+            if let Node::Branch { left, right, .. } = node {
+                pending.push(*left);
+                pending.push(*right);
+            }
+            self.read_node(digest)?;
+        }
+        Ok(())
     }
 
     fn collect_prefix(

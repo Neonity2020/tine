@@ -4,6 +4,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use cap_std::fs::Dir;
 use serde::{Deserialize, Serialize};
 
@@ -30,6 +33,19 @@ const POSTING_DOMAIN: &[u8] = b"tine/reference-catalog/source-posting/v1";
 const ROOT_DOMAIN: &[u8] = b"tine/reference-catalog/root/v1";
 const DELTA_MAGIC: &[u8; 8] = b"TINEREF1";
 const COVERAGE_VALUE: &[u8] = b"live-source-v1";
+
+#[cfg(test)]
+static REFERENCE_EVIDENCE_PARSE_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn reset_reference_evidence_parse_calls() {
+    REFERENCE_EVIDENCE_PARSE_CALLS.store(0, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) fn reference_evidence_parse_calls() -> usize {
+    REFERENCE_EVIDENCE_PARSE_CALLS.load(Ordering::Relaxed)
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -861,6 +877,9 @@ impl ReferenceCatalogStore {
             .validate_root(coverage_root)
             .map_err(store_error)?;
         let mut source_count = delta.prior_root.source_count;
+        let mut fact_updates = BTreeMap::new();
+        let mut coverage_updates = BTreeMap::new();
+        let mut removals = Vec::new();
         for replacement in replacements {
             let key = replacement.page_id.as_uuid().as_bytes().to_vec();
             let prior_value = self
@@ -885,17 +904,8 @@ impl ReferenceCatalogStore {
                     if posting.source_page_id != replacement.page_id {
                         return Err(ReferenceCatalogError::MalformedTransition);
                     }
-                    let facts =
-                        BTreeMap::from([(key.clone(), reference.digest.as_bytes().to_vec())]);
-                    let coverage = BTreeMap::from([(key, COVERAGE_VALUE.to_vec())]);
-                    facts_root = self
-                        .patricia
-                        .insert_many(facts_root, &facts)
-                        .map_err(store_error)?;
-                    coverage_root = self
-                        .patricia
-                        .insert_many(coverage_root, &coverage)
-                        .map_err(store_error)?;
+                    fact_updates.insert(key.clone(), reference.digest.as_bytes().to_vec());
+                    coverage_updates.insert(key, COVERAGE_VALUE.to_vec());
                     if !prior_covered {
                         source_count = source_count
                             .checked_add(1)
@@ -903,14 +913,7 @@ impl ReferenceCatalogStore {
                     }
                 }
                 None => {
-                    facts_root = self
-                        .patricia
-                        .remove_many(facts_root, std::slice::from_ref(&key))
-                        .map_err(store_error)?;
-                    coverage_root = self
-                        .patricia
-                        .remove_many(coverage_root, std::slice::from_ref(&key))
-                        .map_err(store_error)?;
+                    removals.push(key);
                     if prior_covered {
                         source_count = source_count
                             .checked_sub(1)
@@ -919,6 +922,22 @@ impl ReferenceCatalogStore {
                 }
             }
         }
+        facts_root = self
+            .patricia
+            .insert_many_verify_existing(facts_root, &fact_updates)
+            .map_err(store_error)?;
+        coverage_root = self
+            .patricia
+            .insert_many_verify_existing(coverage_root, &coverage_updates)
+            .map_err(store_error)?;
+        facts_root = self
+            .patricia
+            .remove_many(facts_root, &removals)
+            .map_err(store_error)?;
+        coverage_root = self
+            .patricia
+            .remove_many(coverage_root, &removals)
+            .map_err(store_error)?;
         if source_count != delta.post_root.source_count
             || facts_root.digest() != delta.post_root.facts_root
             || coverage_root.digest() != delta.post_root.source_coverage_root
@@ -1275,6 +1294,9 @@ impl ReferenceCatalogStateV1 {
         let mut coverage_root = PatriciaIndexRoot::from_digest(self.root.source_coverage_root);
         let mut source_count = self.root.source_count;
         let mut replacements = Vec::with_capacity(sources.len());
+        let mut fact_updates = BTreeMap::new();
+        let mut coverage_updates = BTreeMap::new();
+        let mut removals = Vec::new();
         for (page_id, source) in sources {
             let key = page_id.as_uuid().as_bytes().to_vec();
             let prior_posting_digest = store
@@ -1289,17 +1311,8 @@ impl ReferenceCatalogStateV1 {
             let post_posting = match posting {
                 Some(posting) => {
                     let reference = store.publish_posting(&posting)?;
-                    let facts =
-                        BTreeMap::from([(key.clone(), reference.digest.as_bytes().to_vec())]);
-                    let coverage = BTreeMap::from([(key.clone(), COVERAGE_VALUE.to_vec())]);
-                    facts_root = store
-                        .patricia
-                        .insert_many(facts_root, &facts)
-                        .map_err(store_error)?;
-                    coverage_root = store
-                        .patricia
-                        .insert_many(coverage_root, &coverage)
-                        .map_err(store_error)?;
+                    fact_updates.insert(key.clone(), reference.digest.as_bytes().to_vec());
+                    coverage_updates.insert(key.clone(), COVERAGE_VALUE.to_vec());
                     if prior_posting_digest.is_none() {
                         source_count = source_count
                             .checked_add(1)
@@ -1308,14 +1321,7 @@ impl ReferenceCatalogStateV1 {
                     Some(reference)
                 }
                 None => {
-                    facts_root = store
-                        .patricia
-                        .remove_many(facts_root, std::slice::from_ref(&key))
-                        .map_err(store_error)?;
-                    coverage_root = store
-                        .patricia
-                        .remove_many(coverage_root, std::slice::from_ref(&key))
-                        .map_err(store_error)?;
+                    removals.push(key);
                     if prior_posting_digest.is_some() {
                         source_count = source_count
                             .checked_sub(1)
@@ -1330,6 +1336,22 @@ impl ReferenceCatalogStateV1 {
                 post_posting,
             });
         }
+        facts_root = store
+            .patricia
+            .insert_many(facts_root, &fact_updates)
+            .map_err(store_error)?;
+        coverage_root = store
+            .patricia
+            .insert_many(coverage_root, &coverage_updates)
+            .map_err(store_error)?;
+        facts_root = store
+            .patricia
+            .remove_many(facts_root, &removals)
+            .map_err(store_error)?;
+        coverage_root = store
+            .patricia
+            .remove_many(coverage_root, &removals)
+            .map_err(store_error)?;
         let post_root = ReferenceCatalogRootV1::new(
             &self.policy,
             source_count,
@@ -1349,7 +1371,10 @@ impl ReferenceCatalogStateV1 {
             post_root,
             transition,
         };
-        store.validate_delta(&delta)?;
+        // The engine independently replays this delta against durable catalog
+        // authority in `persist_durable_final_status_with_binding`, before the
+        // candidate can be committed to hot state. Replaying it here as well
+        // only reconstructs the same authenticated trees a second time.
         delta.encode()?;
         Ok(ReferenceCatalogCandidateV1 {
             delta,
@@ -1421,6 +1446,17 @@ fn extract_text_facts(
     source: ReferenceSourceLocatorV1,
     facts: &mut Vec<ReferenceFactV1>,
 ) -> Result<(), ReferenceCatalogError> {
+    // `reference_evidence::project` derives facts only from parser nodes whose
+    // surface syntax includes one of these bytes: links and nested links `[`,
+    // tags `#`, block references `(`, embeds `{`, or Markdown/Org property
+    // declarations `:`. With none present, parsing cannot produce evidence.
+    // This is deliberately a negative gate: every possible evidence-bearing
+    // source still follows the parser-owned V1 extraction path below.
+    if !may_contain_reference_evidence(raw) {
+        return Ok(());
+    }
+    #[cfg(test)]
+    REFERENCE_EVIDENCE_PARSE_CALLS.fetch_add(1, Ordering::Relaxed);
     let parsed = crate::render::parse_projection(raw, is_org);
     let projection = crate::reference_evidence::project(raw, is_org, &parsed.blocks);
     facts
@@ -1487,6 +1523,12 @@ fn extract_text_facts(
         }));
     }
     Ok(())
+}
+
+fn may_contain_reference_evidence(raw: &str) -> bool {
+    raw.as_bytes()
+        .iter()
+        .any(|byte| matches!(byte, b'[' | b'#' | b'(' | b'{' | b':'))
 }
 
 fn memory_facts_digest(facts: &BTreeMap<PageId, ContentDigest>) -> ContentDigest {

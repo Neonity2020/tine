@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -34,6 +34,7 @@ const ACCEPTED_SEQUENCE_NODE_FANOUT: usize = 32;
 const AUTHENTICATED_MAP_SCHEMA_VERSION: u32 = 1;
 const MAX_AUTHENTICATED_MAP_DEPTH: usize = 256;
 const CURRENT_FILTER_WORDS: usize = 16_384;
+const MAX_COVERED_BLOB_DEDUP_ROOTS: usize = 256;
 const MAX_MARKER_BYTES: u64 = 4 * 1024;
 const MAX_PAGE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_BLOB_BYTES: usize = 256 * 1024 * 1024;
@@ -113,6 +114,58 @@ impl FixedPointFilter {
                 .wrapping_add(second.wrapping_mul(index as u64))
                 .wrapping_rem(bits) as usize
         })
+    }
+}
+
+#[derive(Debug)]
+struct CoveredBlobDedupFilter {
+    points: FixedPointFilter,
+    covered_generation: u64,
+    covered_roots: VecDeque<ScratchLsmRoot>,
+}
+
+impl Default for CoveredBlobDedupFilter {
+    fn default() -> Self {
+        Self {
+            points: FixedPointFilter::default(),
+            covered_generation: 0,
+            covered_roots: VecDeque::from([ScratchLsmRoot::default()]),
+        }
+    }
+}
+
+impl CoveredBlobDedupFilter {
+    fn record_insert(
+        &mut self,
+        parent: &ScratchLsmRoot,
+        next: &ScratchLsmRoot,
+        records: &BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    ) {
+        for (key, value) in records {
+            if value.is_some() {
+                self.points.insert(key);
+            }
+        }
+        self.covered_generation = self.covered_generation.max(next.next_generation);
+        if self.covers_root(parent) {
+            self.covered_roots.push_back(next.clone());
+            if self.covered_roots.len() > MAX_COVERED_BLOB_DEDUP_ROOTS {
+                self.covered_roots.pop_front();
+            }
+        }
+    }
+
+    fn covers_root(&self, root: &ScratchLsmRoot) -> bool {
+        root.next_generation <= self.covered_generation
+            && self
+                .covered_roots
+                .iter()
+                .rev()
+                .any(|covered| covered == root)
+    }
+
+    fn proves_absent(&self, root: &ScratchLsmRoot, key: &[u8]) -> bool {
+        self.covers_root(root) && !self.points.might_contain(key)
     }
 }
 
@@ -392,6 +445,7 @@ pub(crate) struct ScratchStore {
     blobs: Mutex<fs::File>,
     counters: Arc<ScratchCounters>,
     document_current_filter: Mutex<FixedPointFilter>,
+    blob_dedup_filter: Mutex<CoveredBlobDedupFilter>,
 }
 
 impl fmt::Debug for ScratchStore {
@@ -444,6 +498,7 @@ impl ScratchStore {
             blobs: Mutex::new(blobs),
             counters: Arc::new(ScratchCounters::default()),
             document_current_filter: Mutex::new(FixedPointFilter::default()),
+            blob_dedup_filter: Mutex::new(CoveredBlobDedupFilter::default()),
         };
         if let Err(error) = store.reclaim_stale_runs() {
             store.cleanup_own_run();
@@ -566,6 +621,12 @@ impl ScratchStore {
                     }
                 }
             }
+            if kind == ScratchPageKind::BlobDedup {
+                self.blob_dedup_filter
+                    .lock()
+                    .map_err(|_| ScratchError::Poisoned)?
+                    .record_insert(root, &next, records);
+            }
             return Ok(next);
         }
         Err(ScratchError::IndexCapacity)
@@ -585,6 +646,15 @@ impl ScratchStore {
                 .lock()
                 .map_err(|_| ScratchError::Poisoned)?
                 .might_contain(key)
+        {
+            return Ok(None);
+        }
+        if kind == ScratchPageKind::BlobDedup
+            && self
+                .blob_dedup_filter
+                .lock()
+                .map_err(|_| ScratchError::Poisoned)?
+                .proves_absent(root, key)
         {
             return Ok(None);
         }
@@ -2063,6 +2133,268 @@ mod tests {
             vec![(b"a".to_vec(), b"new".to_vec())]
         );
         assert_eq!(store.stats().scratch_syncs, 0);
+        drop(store);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn covered_blob_dedup_negative_skips_physical_page_reads() {
+        let path =
+            std::env::temp_dir().join(format!("tine-scratch-dedup-negative-{}", Uuid::new_v4()));
+        let archive = archive(&path);
+        let store = ScratchStore::open(&archive, workspace(11)).unwrap();
+        let root = store
+            .insert_many(
+                &ScratchLsmRoot::default(),
+                ScratchPageKind::BlobDedup,
+                &BTreeMap::from([
+                    (b"a".to_vec(), Some(b"left".to_vec())),
+                    (b"z".to_vec(), Some(b"right".to_vec())),
+                ]),
+            )
+            .unwrap();
+        let before = store.stats();
+
+        assert_eq!(
+            store
+                .lookup(&root, ScratchPageKind::BlobDedup, b"missing")
+                .unwrap(),
+            None
+        );
+        assert_eq!(store.stats().page_reads, before.page_reads);
+
+        drop(store);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn covered_blob_dedup_present_key_returns_canonical_bytes() {
+        let path =
+            std::env::temp_dir().join(format!("tine-scratch-dedup-present-{}", Uuid::new_v4()));
+        let archive = archive(&path);
+        let store = ScratchStore::open(&archive, workspace(12)).unwrap();
+        let root = store
+            .insert_many(
+                &ScratchLsmRoot::default(),
+                ScratchPageKind::BlobDedup,
+                &BTreeMap::from([(b"digest".to_vec(), Some(b"canonical-ref".to_vec()))]),
+            )
+            .unwrap();
+
+        assert_eq!(
+            store
+                .lookup(&root, ScratchPageKind::BlobDedup, b"digest")
+                .unwrap(),
+            Some(b"canonical-ref".to_vec())
+        );
+        assert_eq!(store.stats().page_reads, 1);
+
+        drop(store);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn covered_blob_dedup_present_key_still_authenticates_tampered_page() {
+        let path =
+            std::env::temp_dir().join(format!("tine-scratch-dedup-tamper-{}", Uuid::new_v4()));
+        let archive = archive(&path);
+        let store = ScratchStore::open(&archive, workspace(15)).unwrap();
+        let root = store
+            .insert_many(
+                &ScratchLsmRoot::default(),
+                ScratchPageKind::BlobDedup,
+                &BTreeMap::from([(b"digest".to_vec(), Some(b"canonical-ref".to_vec()))]),
+            )
+            .unwrap();
+        let page_offset = root
+            .levels
+            .iter()
+            .flatten()
+            .next()
+            .expect("blob dedup segment")
+            .page_ref
+            .offset;
+        store.tamper_page_byte_for_test(page_offset);
+
+        assert!(matches!(
+            store.lookup(&root, ScratchPageKind::BlobDedup, b"digest"),
+            Err(ScratchError::PageDigestMismatch(_))
+        ));
+
+        drop(store);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn uncovered_or_newer_blob_dedup_root_bypasses_negative_filter() {
+        let path =
+            std::env::temp_dir().join(format!("tine-scratch-dedup-uncovered-{}", Uuid::new_v4()));
+        let archive = archive(&path);
+        let store = ScratchStore::open(&archive, workspace(13)).unwrap();
+        let root = store
+            .insert_many(
+                &ScratchLsmRoot::default(),
+                ScratchPageKind::BlobDedup,
+                &BTreeMap::from([(b"stored".to_vec(), Some(b"value".to_vec()))]),
+            )
+            .unwrap();
+        let mut unseen_newer = root.clone();
+        unseen_newer.next_generation = unseen_newer.next_generation.saturating_add(1);
+        {
+            let mut filter = store
+                .blob_dedup_filter
+                .lock()
+                .expect("blob dedup filter lock");
+            filter.points = FixedPointFilter::default();
+        }
+
+        assert_eq!(
+            store
+                .lookup(&unseen_newer, ScratchPageKind::BlobDedup, b"stored")
+                .unwrap(),
+            Some(b"value".to_vec())
+        );
+        {
+            let mut filter = store
+                .blob_dedup_filter
+                .lock()
+                .expect("blob dedup filter lock");
+            filter.covered_roots.retain(|covered| covered != &root);
+        }
+        assert_eq!(
+            store
+                .lookup(&root, ScratchPageKind::BlobDedup, b"stored")
+                .unwrap(),
+            Some(b"value".to_vec())
+        );
+        assert_eq!(store.stats().page_reads, 2);
+
+        drop(store);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn divergent_and_orphan_blob_dedup_roots_never_false_negative() {
+        let path =
+            std::env::temp_dir().join(format!("tine-scratch-dedup-divergent-{}", Uuid::new_v4()));
+        let archive = archive(&path);
+        let store = ScratchStore::open(&archive, workspace(14)).unwrap();
+        let base = store
+            .insert_many(
+                &ScratchLsmRoot::default(),
+                ScratchPageKind::BlobDedup,
+                &BTreeMap::from([(b"base".to_vec(), Some(b"base-value".to_vec()))]),
+            )
+            .unwrap();
+        let orphan = store
+            .insert_many(
+                &base,
+                ScratchPageKind::BlobDedup,
+                &BTreeMap::from([(b"orphan".to_vec(), Some(b"orphan-value".to_vec()))]),
+            )
+            .unwrap();
+        let divergent = store
+            .insert_many(
+                &base,
+                ScratchPageKind::BlobDedup,
+                &BTreeMap::from([(b"branch".to_vec(), Some(b"branch-value".to_vec()))]),
+            )
+            .unwrap();
+        let tombstoned = store
+            .insert_many(
+                &orphan,
+                ScratchPageKind::BlobDedup,
+                &BTreeMap::from([(b"orphan".to_vec(), None)]),
+            )
+            .unwrap();
+
+        assert_eq!(
+            store
+                .lookup(&orphan, ScratchPageKind::BlobDedup, b"orphan")
+                .unwrap(),
+            Some(b"orphan-value".to_vec())
+        );
+        assert_eq!(
+            store
+                .lookup(&divergent, ScratchPageKind::BlobDedup, b"branch")
+                .unwrap(),
+            Some(b"branch-value".to_vec())
+        );
+        assert_eq!(
+            store
+                .lookup(&divergent, ScratchPageKind::BlobDedup, b"base")
+                .unwrap(),
+            Some(b"base-value".to_vec())
+        );
+        assert_eq!(
+            store
+                .lookup(&divergent, ScratchPageKind::BlobDedup, b"orphan")
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            store
+                .lookup(&tombstoned, ScratchPageKind::BlobDedup, b"orphan")
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            store
+                .blob_dedup_filter
+                .lock()
+                .expect("blob dedup filter lock")
+                .covered_generation,
+            tombstoned.next_generation
+        );
+
+        drop(store);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn evicted_blob_dedup_root_falls_back_to_authenticated_lookup() {
+        let path =
+            std::env::temp_dir().join(format!("tine-scratch-dedup-evicted-{}", Uuid::new_v4()));
+        let archive = archive(&path);
+        let store = ScratchStore::open(&archive, workspace(14)).unwrap();
+        let first_root = store
+            .insert_many(
+                &ScratchLsmRoot::default(),
+                ScratchPageKind::BlobDedup,
+                &BTreeMap::from([
+                    (b"a".to_vec(), Some(b"left".to_vec())),
+                    (b"z".to_vec(), Some(b"right".to_vec())),
+                ]),
+            )
+            .unwrap();
+        let mut current = first_root.clone();
+        for index in 1..=MAX_COVERED_BLOB_DEDUP_ROOTS {
+            current = store
+                .insert_many(
+                    &current,
+                    ScratchPageKind::BlobDedup,
+                    &BTreeMap::from([(
+                        format!("key-{index:04}").into_bytes(),
+                        Some(index.to_be_bytes().to_vec()),
+                    )]),
+                )
+                .unwrap();
+        }
+        assert!(!store
+            .blob_dedup_filter
+            .lock()
+            .expect("blob dedup filter lock")
+            .covers_root(&first_root));
+        let before = store.stats();
+
+        assert_eq!(
+            store
+                .lookup(&first_root, ScratchPageKind::BlobDedup, b"middle")
+                .unwrap(),
+            None
+        );
+        assert!(store.stats().page_reads > before.page_reads);
+
         drop(store);
         fs::remove_dir_all(path).unwrap();
     }
