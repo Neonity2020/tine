@@ -153,6 +153,101 @@ pub(crate) struct ExternalImportObservation {
     entries: Vec<ExternalImportObservationEntry>,
 }
 
+/// Exact external observations retained by a sealed import execution plan.
+///
+/// The later hot-engine adapter supplies the prospective portable-path root
+/// only after it has drafted the semantic transaction. Keeping that one
+/// engine-derived value out of this material preserves the import boundary's
+/// read-only, authority-free contract while still forcing the final object
+/// through this module's canonical encoder.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ExternalImportObservationMaterial {
+    workspace_id: WorkspaceId,
+    import_id: ImportId,
+    entries: Vec<ExternalImportObservationEntry>,
+}
+
+// Packet 4B deliberately leaves the draft/finalize adapter for the following
+// packet, so these crate-internal handoff methods have no production caller yet.
+#[allow(dead_code)]
+impl ExternalImportObservationMaterial {
+    pub(crate) fn new(
+        workspace_id: WorkspaceId,
+        import_id: ImportId,
+        entries: Vec<ExternalImportObservationEntry>,
+    ) -> Result<Self, ExternalImportObservationError> {
+        // Reuse the frozen observation validation and canonical entry ordering
+        // instead of duplicating a second import-only object format.
+        let observation = ExternalImportObservation::new(
+            workspace_id,
+            import_id,
+            PortablePathIndexRoot::empty(),
+            entries,
+        )?;
+        Ok(Self {
+            workspace_id,
+            import_id,
+            entries: observation.entries,
+        })
+    }
+
+    pub(crate) const fn workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
+    }
+
+    pub(crate) const fn import_id(&self) -> ImportId {
+        self.import_id
+    }
+
+    pub(crate) fn entries(&self) -> &[ExternalImportObservationEntry] {
+        &self.entries
+    }
+
+    pub(crate) fn operation_object(
+        &self,
+        prospective_portable_path_root: PortablePathIndexRoot,
+    ) -> Result<OperationObject, ExternalImportObservationMaterialError> {
+        let observation = ExternalImportObservation::new(
+            self.workspace_id,
+            self.import_id,
+            prospective_portable_path_root,
+            self.entries.clone(),
+        )?;
+        let payload = observation.encode()?;
+        OperationObject::new(
+            self.workspace_id,
+            observation.descriptor_document_id(),
+            ObjectKind::ExternalImportObservation,
+            payload,
+        )
+        .map_err(ExternalImportObservationMaterialError::Object)
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ExternalImportObservationMaterialError {
+    Observation(ExternalImportObservationError),
+    Object(super::BatchError),
+}
+
+impl From<ExternalImportObservationError> for ExternalImportObservationMaterialError {
+    fn from(error: ExternalImportObservationError) -> Self {
+        Self::Observation(error)
+    }
+}
+
+impl fmt::Display for ExternalImportObservationMaterialError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Observation(error) => error.fmt(formatter),
+            Self::Object(error) => write!(formatter, "external-import observation object: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for ExternalImportObservationMaterialError {}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ExternalImportObservationWire {

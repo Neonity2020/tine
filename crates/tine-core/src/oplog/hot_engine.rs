@@ -1875,6 +1875,9 @@ pub struct MaterializationStats {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaterializedPage {
     pub page_id: PageId,
+    /// Immutable membership-shard document selected by the accepted live page
+    /// state that was materialized with this page.
+    pub home_document_id: DocumentId,
     pub name: LogicalPageName,
     pub path: ManagedPath,
     pub preamble: Option<String>,
@@ -2256,6 +2259,8 @@ pub struct ShardedHotEngine {
     #[cfg(test)]
     reference_source_observations: Cell<ReferenceSourceObservationStats>,
     #[cfg(test)]
+    canonical_snapshot_calls: Cell<usize>,
+    #[cfg(test)]
     external_publication_failure_index: Option<usize>,
     #[cfg(test)]
     pending_author_fast_path_attempts: usize,
@@ -2353,6 +2358,8 @@ impl ShardedHotEngine {
             catalog_checkpoint_loads: Cell::new(CatalogCheckpointLoadStats::default()),
             #[cfg(test)]
             reference_source_observations: Cell::new(ReferenceSourceObservationStats::default()),
+            #[cfg(test)]
+            canonical_snapshot_calls: Cell::new(0),
             #[cfg(test)]
             external_publication_failure_index: None,
             #[cfg(test)]
@@ -6666,6 +6673,7 @@ impl ShardedHotEngine {
         });
         Ok(MaterializedPage {
             page_id,
+            home_document_id: page_document_id,
             name,
             path,
             preamble,
@@ -6863,6 +6871,7 @@ impl ShardedHotEngine {
         let reads_after = self.archive_read_stats();
         let page = MaterializedPage {
             page_id,
+            home_document_id: page_document_id,
             name,
             path,
             preamble,
@@ -6887,6 +6896,9 @@ impl ShardedHotEngine {
     }
 
     pub fn canonical_snapshot(&self) -> Result<super::CanonicalSnapshot, EngineError> {
+        #[cfg(test)]
+        self.canonical_snapshot_calls
+            .set(self.canonical_snapshot_calls.get().saturating_add(1));
         self.ensure_not_blocked()?;
         let Some(catalog) = self.visible_documents.get(&self.catalog_document_id) else {
             return Ok(super::CanonicalSnapshot::default());
@@ -6946,6 +6958,11 @@ impl ShardedHotEngine {
             memberships,
             path_conflicts,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn canonical_snapshot_calls_for_test(&self) -> usize {
+        self.canonical_snapshot_calls.get()
     }
 
     /// Test-only exact catalog lookup used by durability corpus assertions.

@@ -2913,16 +2913,35 @@ impl Graph {
         }
         let rel_path = self.rel_path(path);
         let managed_path = ManagedPath::parse(rel_path.clone()).map_err(|_| bad_path())?;
-        let kind = match self
-            .classify_managed_text_path(&managed_path)
-            .map_err(|_| bad_path())?
-        {
+        let mut entry = self
+            .managed_entry_for_managed_path(&managed_path)
+            .map_err(|_| bad_path())?;
+        entry.rel_path = rel_path;
+        entry.path = path.to_path_buf();
+        Ok(Some(entry))
+    }
+
+    /// Interpret one already-validated graph-relative managed path exactly as
+    /// normal Graph loading does, without touching the filesystem or warming
+    /// the page cache. The final filename component is the logical source;
+    /// nested directories select ownership only and never form namespaces.
+    pub(crate) fn managed_entry_for_managed_path(
+        &self,
+        path: &ManagedPath,
+    ) -> Result<PageEntry, ReceiptError> {
+        let kind = match self.classify_managed_text_path(path)? {
             ManagedTextKind::Page => PageKind::Page,
             ManagedTextKind::Journal => PageKind::Journal,
         };
-        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
-            return Ok(None);
-        };
+        let filename = Path::new(path.as_str())
+            .file_name()
+            .and_then(|filename| filename.to_str())
+            .ok_or_else(|| ReceiptError::UnsafeManagedPath(path.as_str().to_owned()))?;
+        let stem = filename
+            .strip_suffix(".md")
+            .or_else(|| filename.strip_suffix(".org"))
+            .filter(|stem| !stem.is_empty())
+            .ok_or_else(|| ReceiptError::UnsafeManagedPath(path.as_str().to_owned()))?;
         let (name, date_key) = match kind {
             PageKind::Journal => match self.journal_format.parse(stem) {
                 Some(date) => (self.journal_format.title(date), Some(date.ordinal_key())),
@@ -2930,13 +2949,13 @@ impl Graph {
             },
             PageKind::Page => (decode_page_name(stem, self.config.file_name_format), None),
         };
-        Ok(Some(PageEntry {
+        Ok(PageEntry {
             name,
             kind,
             date_key,
-            rel_path,
-            path: path.to_path_buf(),
-        }))
+            rel_path: path.as_str().to_owned(),
+            path: self.root.join(path.as_str()),
+        })
     }
 
     fn managed_find_entry(
