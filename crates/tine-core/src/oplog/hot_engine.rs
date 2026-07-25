@@ -3577,6 +3577,42 @@ impl ShardedHotEngine {
             .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))
     }
 
+    /// Point-read one source at a catalog root already bound by accepted
+    /// frontier evidence.  This is the only historical catalog read exposed to
+    /// the SQLite adapter; callers cannot enumerate a root or derive facts from
+    /// SQLite/Markdown.
+    pub(crate) fn reference_source_posting_at(
+        &self,
+        root: &ReferenceCatalogRootV1,
+        page_id: PageId,
+    ) -> Result<Option<super::ReferenceSourcePostingV1>, EngineError> {
+        self.ensure_not_blocked()?;
+        self.reference_catalog
+            .posting_at_root(root, page_id)
+            .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))
+    }
+
+    /// Resolve a logical name through the authenticated exact-name owner.
+    /// Aliases intentionally remain a reference-query concern: they are not
+    /// page-name ownership records and therefore cannot authorize a rename.
+    pub fn resolve_logical_page_name(
+        &self,
+        name: &LogicalPageName,
+    ) -> Result<Option<PageId>, EngineError> {
+        self.ensure_not_blocked()?;
+        match &self.page_name_index {
+            Some(index) => index
+                .lookup(&self.page_name_root, name.key_digest())
+                .map(|record| {
+                    record
+                        .and_then(|record| record.occupied().cloned())
+                        .map(|occupied| occupied.page_id())
+                })
+                .map_err(|error| EngineError::Archive(error.to_string())),
+            None => Ok(self.ephemeral_page_names.resolve_current(name.key_digest())),
+        }
+    }
+
     pub fn resolve_reference_page_name(
         &self,
         fact: &super::PageNameReferenceFactV1,

@@ -377,6 +377,21 @@ impl ReferenceCatalogRootV1 {
         self.source_coverage_root
     }
 
+    /// Digest of the parser/extractor construction bound into this catalog.
+    ///
+    /// SQLite records this value only as a disposable dependency stamp.  It is
+    /// deliberately exposed here so that the projection can prove it used the
+    /// same extractor as the authenticated catalog, not so SQLite can choose
+    /// an extractor of its own.
+    pub const fn extractor_digest(&self) -> ContentDigest {
+        self.extractor_digest
+    }
+
+    /// Digest of the reference policy construction bound into this catalog.
+    pub const fn policy_digest(&self) -> ContentDigest {
+        self.policy_digest
+    }
+
     pub const fn page_name_authority_root(&self) -> ContentDigest {
         self.page_name_authority_root
     }
@@ -1136,6 +1151,29 @@ impl ReferenceCatalogStateV1 {
         match &self.backend {
             ReferenceCatalogBackend::Memory(memory) => Ok(memory.postings.get(&page_id).cloned()),
             ReferenceCatalogBackend::Store(store) => store.posting(&self.root, page_id),
+            ReferenceCatalogBackend::RecoveryRequired(_) => {
+                Err(ReferenceCatalogError::RecoveryRequired)
+            }
+        }
+    }
+
+    /// Read a source posting at an already-authenticated catalog root.
+    ///
+    /// Historical roots are available only from the immutable catalog store.
+    /// The in-memory catalog is intentionally not a historical cache: using it
+    /// for a different root would turn a current snapshot into a forged tail.
+    pub(crate) fn posting_at_root(
+        &self,
+        root: &ReferenceCatalogRootV1,
+        page_id: PageId,
+    ) -> Result<Option<ReferenceSourcePostingV1>, ReferenceCatalogError> {
+        root.validate()?;
+        match &self.backend {
+            ReferenceCatalogBackend::Store(store) => store.posting(root, page_id),
+            ReferenceCatalogBackend::Memory(memory) if root == &self.root => {
+                Ok(memory.postings.get(&page_id).cloned())
+            }
+            ReferenceCatalogBackend::Memory(_) => Err(ReferenceCatalogError::StoreRequired),
             ReferenceCatalogBackend::RecoveryRequired(_) => {
                 Err(ReferenceCatalogError::RecoveryRequired)
             }

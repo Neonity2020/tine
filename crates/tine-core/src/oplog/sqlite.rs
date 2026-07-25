@@ -47,8 +47,9 @@ use uuid::Uuid;
 
 use super::hot_engine::AcceptedFrontierRoot;
 use super::{
-    BatchCausalDot, BatchId, BatchInspection, CausalPeerId, ContentDigest, DocumentDependencies,
-    DocumentId, FrontierV2, LineageDigest, ObjectKind, ObjectStore, SemanticEffect,
+    BatchCausalDot, BatchId, BatchInspection, BlockId, CausalPeerId, ContentDigest,
+    DocumentDependencies, DocumentId, FrontierV2, LineageDigest, LogseqUuid, LogseqUuidResolution,
+    ObjectKind, ObjectStore, PageId, ReferenceFactV1, ReferenceSourceLocatorV1, SemanticEffect,
     SemanticEffectDigest, ShardedHotEngine, ValidatedBatch, WorkspaceId, WorkspaceStatus,
     MANAGED_ENTITY_SET_VERSION, MANIFEST_ENCODING_VERSION, OBJECT_ENVELOPE_SCHEMA_VERSION,
     OPERATION_SCHEMA_VERSION, OPLOG_PROTOCOL_VERSION,
@@ -570,6 +571,10 @@ impl AcceptedBatchEvent {
         self.manifest_digest
     }
 
+    pub const fn event_binding_digest(&self) -> ContentDigest {
+        self.event_binding_digest
+    }
+
     pub fn semantic_effect(&self) -> &[u8] {
         &self.semantic_effect
     }
@@ -763,6 +768,152 @@ impl<'a> RebuildSource<'a> {
     }
 }
 
+fn attach_authenticated_reference_catalog(
+    engine: &ShardedHotEngine,
+    event: &AcceptedBatchEvent,
+    change: super::MaterializationChange,
+) -> Result<super::MaterializationChange, ProjectionError> {
+    attach_authenticated_reference_catalog_at(
+        engine,
+        event.semantic_effect(),
+        event.prior_frontier_root(),
+        event.post_frontier_root(),
+        change,
+    )
+}
+
+fn attach_authenticated_reference_catalog_at(
+    engine: &ShardedHotEngine,
+    semantic_effect: &[u8],
+    prior_frontier_root: &AcceptedFrontierRoot,
+    post_frontier_root: &AcceptedFrontierRoot,
+    change: super::MaterializationChange,
+) -> Result<super::MaterializationChange, ProjectionError> {
+    let effect = SemanticEffect::decode(semantic_effect)
+        .map_err(|error| ProjectionError::Materialization(error.to_string()))?;
+    let post_root = post_frontier_root.reference_catalog_root().clone();
+    let prior_root = prior_frontier_root.reference_catalog_root().clone();
+    let stamp = super::sqlite_materialization::ReferenceExtractorDependencyStamp::new(
+        post_root.extractor_digest(),
+        post_root.policy_digest(),
+    )?;
+    let mut postings = Vec::new();
+    let mut aliases = Vec::new();
+    let mut coverage = Vec::new();
+    let mut removed_sources = Vec::new();
+    for page_id in super::reference_catalog::affected_reference_sources(&effect) {
+        let Some(posting) = engine
+            .reference_source_posting_at(&post_root, page_id)
+            .map_err(|error| ProjectionError::Materialization(error.to_string()))?
+        else {
+            removed_sources.push(page_id);
+            continue;
+        };
+        coverage.push(super::sqlite_materialization::SourceCoverageFacet {
+            source_page_id: page_id,
+            source_digest: posting
+                .digest()
+                .map_err(|error| ProjectionError::Materialization(error.to_string()))?,
+            extractor_dependency_stamp: stamp,
+        });
+        for (ordinal, fact) in posting.facts().iter().enumerate() {
+            let ordinal = u32::try_from(ordinal).map_err(|_| {
+                ProjectionError::Materialization(
+                    "reference posting ordinal exceeds the SQLite adapter bound".into(),
+                )
+            })?;
+            let (source_entity, source_locator) = match fact {
+                ReferenceFactV1::PageName(fact) => (fact.source, fact.source),
+                ReferenceFactV1::Block(fact) => (fact.source, fact.source),
+            };
+            let source_entity = match source_entity {
+                ReferenceSourceLocatorV1::Preamble => super::MaterializedEntityId::Page(page_id),
+                ReferenceSourceLocatorV1::Block { block_id, .. } => {
+                    super::MaterializedEntityId::Block(block_id)
+                }
+            };
+            let (kind, target) = match fact {
+                ReferenceFactV1::PageName(fact) => (
+                    super::sqlite_materialization::ReferenceCatalogReferenceKind::from_page_kind(
+                        fact.kind,
+                    ),
+                    super::sqlite_materialization::MaterializedReferenceTarget::PageName {
+                        raw_name: fact.raw_target.clone(),
+                        normalized_name: fact.normalized_target.clone(),
+                        resolved_page_id: None,
+                    },
+                ),
+                ReferenceFactV1::Block(fact) => (
+                    super::sqlite_materialization::ReferenceCatalogReferenceKind::from_block_kind(
+                        fact.kind,
+                    ),
+                    super::sqlite_materialization::MaterializedReferenceTarget::ExternalUuid {
+                        raw_claim: fact.logseq_uuid,
+                        resolved_block_id: None,
+                    },
+                ),
+            };
+            postings.push(
+                super::sqlite_materialization::MaterializedReferencePosting {
+                    source_page_id: page_id,
+                    source_entity,
+                    source_locator,
+                    ordinal,
+                    kind,
+                    target,
+                },
+            );
+            if let ReferenceFactV1::PageName(fact) = fact {
+                if matches!(fact.kind, super::PageReferenceKindV1::AliasDeclaration) {
+                    aliases.push(
+                        super::sqlite_materialization::MaterializedAliasDeclaration {
+                            source_page_id: page_id,
+                            source_entity,
+                            source_locator,
+                            ordinal,
+                            raw_alias: fact.raw_target.clone(),
+                            normalized_alias: fact.normalized_target.clone(),
+                        },
+                    );
+                }
+            }
+        }
+    }
+    let reference_catalog =
+        super::sqlite_materialization::ReferenceCatalogMaterializationInput::new(
+            prior_root,
+            post_root,
+            postings,
+            aliases,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            coverage,
+            removed_sources,
+        )?;
+    change
+        .with_authenticated_reference_catalog(reference_catalog)
+        .map_err(Into::into)
+}
+
+fn authenticated_reference_materialization(
+    event: &AcceptedBatchEvent,
+) -> Result<super::sqlite_materialization::AuthenticatedReferenceMaterialization, ProjectionError> {
+    Ok(
+        super::sqlite_materialization::AuthenticatedReferenceMaterialization {
+            event_binding_digest: event.event_binding_digest(),
+            prior_frontier_root_digest: ContentDigest::of(&canonical_frontier_root_bytes(
+                event.prior_frontier_root(),
+            )?),
+            post_frontier_root_digest: ContentDigest::of(&canonical_frontier_root_bytes(
+                event.post_frontier_root(),
+            )?),
+            prior_catalog_root: event.prior_frontier_root().reference_catalog_root().clone(),
+            post_catalog_root: event.post_frontier_root().reference_catalog_root().clone(),
+        },
+    )
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ForensicEvidence {
     pub original_path: PathBuf,
@@ -905,6 +1056,72 @@ pub struct TailOverlay {
     reservations: BTreeMap<u64, usize>,
     reserved_bytes: usize,
     next_reservation_id: u64,
+}
+
+/// Causal accounting for a frontier-gated reference query.  The counters make
+/// the bounded work visible to tests without adding a graph-sized hot cache.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ReferenceQueryInstrumentation {
+    pub sqlite_candidate_sources: usize,
+    pub tail_source_postings: usize,
+    pub revalidated_sources: usize,
+}
+
+/// One exact parser-owned reference occurrence.  `fact` deliberately retains
+/// the user-authored spelling and byte range; callers must not reconstruct it
+/// from a normalized page key.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FrontierReferenceHit {
+    pub source_page_id: PageId,
+    pub fact: ReferenceFactV1,
+    pub resolved_page_id: Option<PageId>,
+    pub resolved_block_id: Option<BlockId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FrontierReferenceResults {
+    pub hits: Vec<FrontierReferenceHit>,
+    pub instrumentation: ReferenceQueryInstrumentation,
+}
+
+/// Bounded rename candidate plan.  The caller still supplies projection
+/// captures to `ShardedHotEngine::finalize_author_transaction`; this plan only
+/// carries an already revalidated semantic transaction.
+#[derive(Clone, Debug)]
+pub struct FrontierRenamePlan {
+    target_page_id: PageId,
+    transaction: super::OperationTransaction,
+    touched_sources: Vec<PageId>,
+    instrumentation: ReferenceQueryInstrumentation,
+}
+
+impl FrontierRenamePlan {
+    pub const fn target_page_id(&self) -> PageId {
+        self.target_page_id
+    }
+
+    pub const fn transaction(&self) -> &super::OperationTransaction {
+        &self.transaction
+    }
+
+    pub fn touched_sources(&self) -> &[PageId] {
+        &self.touched_sources
+    }
+
+    pub const fn instrumentation(&self) -> ReferenceQueryInstrumentation {
+        self.instrumentation
+    }
+}
+
+/// Read-only reference view at the engine's current authenticated frontier.
+/// SQLite contributes only reverse-index candidates from its stamped prefix;
+/// every returned candidate is checked against the catalog's current exact
+/// posting, and the bounded tail is read from that same catalog.
+pub struct FrontierReferenceQuery<'a> {
+    database: &'a SqliteFrontier,
+    engine: &'a ShardedHotEngine,
+    tail_sources: BTreeMap<PageId, Option<super::ReferenceSourcePostingV1>>,
+    instrumentation: ReferenceQueryInstrumentation,
 }
 
 impl TailOverlay {
@@ -1480,6 +1697,22 @@ impl SqliteFrontier {
         self.apply_internal_with_materialization(event, ApplyFault::None, Some(materialization))
     }
 
+    /// Materialize an accepted batch together with the exact authenticated
+    /// reference-catalog transition.  The page materialization remains caller
+    /// supplied because parser/search/task facets are not semantic-operation
+    /// data; the reference component is derived only here from immutable
+    /// catalog objects bound to `event`.
+    pub fn apply_authenticated_reference_catalog_materialized_accepted(
+        &mut self,
+        event: &AcceptedBatchEvent,
+        materialization: super::MaterializationChange,
+        engine: &ShardedHotEngine,
+    ) -> Result<ApplyDisposition, ProjectionError> {
+        let materialization =
+            attach_authenticated_reference_catalog(engine, event, materialization)?;
+        self.apply_internal_with_materialization(event, ApplyFault::None, Some(&materialization))
+    }
+
     pub fn materialized_read(&self) -> Result<super::SqliteMaterializedRead<'_>, ProjectionError> {
         let root = read_frontier_root(&self.connection)?;
         let root_bytes = canonical_frontier_root_bytes(&root)?;
@@ -1491,6 +1724,84 @@ impl SqliteFrontier {
         .map_err(Into::into)
     }
 
+    fn authenticated_reference_catalog_root(
+        &self,
+    ) -> Result<super::ReferenceCatalogRootV1, ProjectionError> {
+        let frontier = read_frontier_root(&self.connection)?;
+        let frontier_bytes = canonical_frontier_root_bytes(&frontier)?;
+        let stamp: (
+            i64,
+            Vec<u8>,
+            Option<Vec<u8>>,
+            Option<Vec<u8>>,
+            Option<Vec<u8>>,
+            Option<Vec<u8>>,
+        ) = self.connection.query_row(
+            "SELECT acceptance_sequence, frontier_root_digest, catalog_root,
+                        catalog_root_digest, coverage_digest,
+                        extractor_dependency_stamp_digest
+                 FROM materialization_stamp WHERE singleton = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )?;
+        if u64::try_from(stamp.0).ok() != Some(frontier.acceptance_sequence())
+            || stamp.1.as_slice() != ContentDigest::of(&frontier_bytes).as_bytes()
+        {
+            return Err(ProjectionError::Materialization(
+                "reference materialization stamp is stale against SQLite frontier".into(),
+            ));
+        }
+        let (Some(root_bytes), Some(root_digest), Some(coverage_digest), Some(stamp_digest)) =
+            (stamp.2, stamp.3, stamp.4, stamp.5)
+        else {
+            return Err(ProjectionError::Materialization(
+                "SQLite frontier has no authenticated reference catalog materialization".into(),
+            ));
+        };
+        let root = super::ReferenceCatalogRootV1::decode(&root_bytes)
+            .map_err(|error| ProjectionError::Materialization(error.to_string()))?;
+        let expected = frontier.reference_catalog_root();
+        if &root != expected
+            || root_digest.as_slice()
+                != root
+                    .external_digest()
+                    .map_err(|error| ProjectionError::Materialization(error.to_string()))?
+                    .as_bytes()
+            || coverage_digest.as_slice() != root.source_coverage_root().as_bytes()
+            || stamp_digest.as_slice()
+                != super::sqlite_materialization::ReferenceExtractorDependencyStamp::new(
+                    root.extractor_digest(),
+                    root.policy_digest(),
+                )?
+                .digest()?
+                .as_bytes()
+        {
+            return Err(ProjectionError::Materialization(
+                "SQLite reference catalog stamp is not bound to its authenticated frontier".into(),
+            ));
+        }
+        let coverage_count: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM reference_source_coverage",
+            [],
+            |row| row.get(0),
+        )?;
+        if u64::try_from(coverage_count).ok() != Some(root.source_count()) {
+            return Err(ProjectionError::Materialization(
+                "SQLite reference source coverage is incomplete for its catalog root".into(),
+            ));
+        }
+        Ok(root)
+    }
+
     /// Rebuild only the disposable graph-wide rows from a streaming sequence
     /// of authoritative, oplog-derived materialization inputs.
     ///
@@ -1499,6 +1810,32 @@ impl SqliteFrontier {
     /// committed with its materialization stamp. Until the final sequence is
     /// present, [`Self::materialized_read`] fails closed as stale.
     pub fn rebuild_materialization<I>(&mut self, changes: I) -> Result<usize, ProjectionError>
+    where
+        I: IntoIterator<Item = super::MaterializationChange>,
+    {
+        self.rebuild_materialization_inner(changes, None)
+    }
+
+    /// Rebuild a disposable materialization while deriving every reference
+    /// row afresh from the catalog roots bound to accepted history.  Generic
+    /// page/search facets still come from the supplied projection inputs;
+    /// reference facts never do.
+    pub fn rebuild_authenticated_reference_catalog_materialization<I>(
+        &mut self,
+        changes: I,
+        engine: &ShardedHotEngine,
+    ) -> Result<usize, ProjectionError>
+    where
+        I: IntoIterator<Item = super::MaterializationChange>,
+    {
+        self.rebuild_materialization_inner(changes, Some(engine))
+    }
+
+    fn rebuild_materialization_inner<I>(
+        &mut self,
+        changes: I,
+        reference_engine: Option<&ShardedHotEngine>,
+    ) -> Result<usize, ProjectionError>
     where
         I: IntoIterator<Item = super::MaterializationChange>,
     {
@@ -1513,29 +1850,41 @@ impl SqliteFrontier {
         let mut changes = changes.into_iter();
         let mut applied = 0_u64;
         for sequence in 1..=expected_count {
-            let Some(change) = changes.next() else {
+            let Some(mut change) = changes.next() else {
                 return Err(ProjectionError::Materialization(format!(
                     "materialization rebuild ended before accepted sequence {sequence}"
                 )));
             };
-            let (batch_id, semantic_effect, prior_digest, post_digest): (
-                Vec<u8>,
-                Vec<u8>,
-                Vec<u8>,
-                Vec<u8>,
-            ) = self.connection.query_row(
-                "SELECT batch_id, semantic_effect, prior_frontier_root_digest,
-                        post_frontier_root_digest
-                 FROM applied_batches WHERE sequence = ?1",
-                params![i64::try_from(sequence).map_err(|_| {
-                    ProjectionError::Corrupt("accepted sequence exceeds SQLite".into())
-                })?],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )?;
-            let batch_id = BatchId::from_uuid(decode_uuid(&batch_id)?);
-            let input_digest = change.validate_against_stored(batch_id, &semantic_effect)?;
-            let prior_digest = decode_content_digest(&prior_digest)?;
-            let post_digest = decode_content_digest(&post_digest)?;
+            let sequence_i64 = i64::try_from(sequence)
+                .map_err(|_| ProjectionError::Corrupt("accepted sequence exceeds SQLite".into()))?;
+            let stored =
+                load_batch_at_sequence(&self.connection, sequence_i64)?.ok_or_else(|| {
+                    ProjectionError::Corrupt(format!(
+                        "accepted history is missing materialization sequence {sequence}"
+                    ))
+                })?;
+            if let Some(engine) = reference_engine {
+                if change.reference_catalog().is_none() {
+                    let prior = decode_frontier_root(&stored.prior_frontier_root)?;
+                    let post = decode_frontier_root(&stored.post_frontier_root)?;
+                    change = attach_authenticated_reference_catalog_at(
+                        engine,
+                        &stored.semantic_effect,
+                        &prior,
+                        &post,
+                        change,
+                    )?;
+                }
+            }
+            let input_digest =
+                change.validate_against_stored(stored.batch_id, &stored.semantic_effect)?;
+            let prior_digest = decode_content_digest(&stored.prior_frontier_root_digest)?;
+            let post_digest = decode_content_digest(&stored.post_frontier_root_digest)?;
+            let authenticated_reference = change
+                .reference_catalog()
+                .is_some()
+                .then(|| stored.authenticated_reference_materialization())
+                .transpose()?;
             super::sqlite_materialization::ensure_stamp(
                 &self.connection,
                 sequence - 1,
@@ -1547,10 +1896,11 @@ impl SqliteFrontier {
             super::sqlite_materialization::apply_change(
                 &transaction,
                 &change,
-                &semantic_effect,
+                &stored.semantic_effect,
                 sequence,
                 input_digest,
                 post_digest,
+                authenticated_reference.as_ref(),
             )?;
             transaction.commit()?;
             applied = sequence;
@@ -1869,6 +2219,11 @@ impl SqliteFrontier {
         if let (Some(materialization), Some(input_digest)) =
             (materialization, materialization_digest)
         {
+            let authenticated_reference = materialization
+                .reference_catalog()
+                .is_some()
+                .then(|| authenticated_reference_materialization(event))
+                .transpose()?;
             super::sqlite_materialization::apply_change(
                 &transaction,
                 materialization,
@@ -1876,6 +2231,7 @@ impl SqliteFrontier {
                 event.acceptance_sequence,
                 input_digest,
                 ContentDigest::of(&post_frontier_root),
+                authenticated_reference.as_ref(),
             )?;
         }
         #[cfg(test)]
@@ -2809,6 +3165,37 @@ impl StoredBatch {
             .map_err(|_| ProjectionError::Corrupt("stored causal counter is invalid".into()))?;
         BatchCausalDot::new(peer, counter)
             .map_err(|error| ProjectionError::Corrupt(error.to_string()))
+    }
+
+    fn authenticated_reference_materialization(
+        &self,
+    ) -> Result<super::sqlite_materialization::AuthenticatedReferenceMaterialization, ProjectionError>
+    {
+        let manifest_digest = decode_content_digest(&self.manifest_digest)?;
+        let semantic_effect_digest = decode_semantic_effect_digest(&self.semantic_effect_digest)?;
+        let dependency_frontier = decode_frontier(&self.dependency_frontier)?;
+        let causal_dependency_heads = decode_batch_ids(&self.causal_dependency_heads)?;
+        let event_binding_digest = super::AcceptedBatchEvidence::binding_digest_for(
+            self.batch_id,
+            manifest_digest,
+            semantic_effect_digest,
+            &dependency_frontier,
+            &causal_dependency_heads,
+        )
+        .map_err(|error| ProjectionError::Corrupt(error.to_string()))?;
+        let prior = decode_frontier_root(&self.prior_frontier_root)?;
+        let post = decode_frontier_root(&self.post_frontier_root)?;
+        Ok(
+            super::sqlite_materialization::AuthenticatedReferenceMaterialization {
+                event_binding_digest,
+                prior_frontier_root_digest: decode_content_digest(
+                    &self.prior_frontier_root_digest,
+                )?,
+                post_frontier_root_digest: decode_content_digest(&self.post_frontier_root_digest)?,
+                prior_catalog_root: prior.reference_catalog_root().clone(),
+                post_catalog_root: post.reference_catalog_root().clone(),
+            },
+        )
     }
 }
 
@@ -5071,6 +5458,659 @@ impl From<super::sqlite_materialization::MaterializationError> for ProjectionErr
     }
 }
 
+impl SqliteFrontier {
+    /// Open a read-only reference view at `engine`'s exact accepted frontier.
+    /// A SQLite prefix is usable only when its catalog stamp matches its
+    /// authenticated frontier; any newer portion is bounded by the existing
+    /// tail limits and read from immutable catalog postings.
+    pub fn frontier_reference_query<'a>(
+        &'a self,
+        engine: &'a ShardedHotEngine,
+        store: &'a ObjectStore,
+    ) -> Result<FrontierReferenceQuery<'a>, ProjectionError> {
+        let source = RebuildSource::new(engine, store)?;
+        let mut expected = self.frontier_root()?;
+        let _base_catalog_root = self.authenticated_reference_catalog_root()?;
+        let accepted = engine
+            .accepted_frontier_root()
+            .map_err(|error| ProjectionError::Materialization(error.to_string()))?;
+        if expected.acceptance_sequence() > accepted.acceptance_sequence()
+            || expected.retained_bytes_total() > accepted.retained_bytes_total()
+        {
+            return Err(ProjectionError::FrontierRegression);
+        }
+        let mut tail_sources = BTreeMap::new();
+        let mut tail_bytes = 0_usize;
+        let mut tail_batches = 0_usize;
+        for sequence in
+            expected.acceptance_sequence().saturating_add(1)..=accepted.acceptance_sequence()
+        {
+            let event = source.accepted_event_at(sequence)?;
+            if event.prior_frontier_root() != &expected {
+                return Err(ProjectionError::Materialization(
+                    "SQLite reference query tail does not continue its authenticated frontier"
+                        .into(),
+                ));
+            }
+            tail_batches = tail_batches.saturating_add(1);
+            tail_bytes = tail_bytes.saturating_add(event.retained_bytes());
+            if tail_batches > TAIL_MAX_BATCHES || tail_bytes > TAIL_MAX_BYTES {
+                return Err(ProjectionError::Materialization(
+                    "SQLite reference query requires an over-limit authenticated tail".into(),
+                ));
+            }
+            let effect = SemanticEffect::decode(event.semantic_effect())
+                .map_err(|error| ProjectionError::Materialization(error.to_string()))?;
+            let catalog_root = event.post_frontier_root().reference_catalog_root();
+            for source_page_id in super::reference_catalog::affected_reference_sources(&effect) {
+                let posting = engine
+                    .reference_source_posting_at(catalog_root, source_page_id)
+                    .map_err(|error| ProjectionError::Materialization(error.to_string()))?;
+                tail_sources.insert(source_page_id, posting);
+            }
+            expected = event.post_frontier_root().clone();
+        }
+        if expected != accepted {
+            return Err(ProjectionError::Materialization(
+                "SQLite reference query tail did not reach the requested authenticated frontier"
+                    .into(),
+            ));
+        }
+        Ok(FrontierReferenceQuery {
+            database: self,
+            engine,
+            instrumentation: ReferenceQueryInstrumentation {
+                tail_source_postings: tail_sources.len(),
+                ..ReferenceQueryInstrumentation::default()
+            },
+            tail_sources,
+        })
+    }
+}
+
+impl FrontierReferenceQuery<'_> {
+    fn limit(limit: usize) -> Result<usize, ProjectionError> {
+        if limit == 0 || limit > super::MAX_MATERIALIZATION_QUERY_ROWS {
+            return Err(ProjectionError::Materialization(format!(
+                "reference query limit {limit} is outside 1..={}",
+                super::MAX_MATERIALIZATION_QUERY_ROWS
+            )));
+        }
+        Ok(limit)
+    }
+
+    fn sqlite_candidates_for_names(
+        &self,
+        names: &BTreeSet<String>,
+    ) -> Result<BTreeSet<PageId>, ProjectionError> {
+        let hard_limit = super::MAX_MATERIALIZATION_QUERY_ROWS;
+        let mut candidates = BTreeSet::new();
+        for name in names {
+            let mut statement = self.database.connection.prepare(
+                "SELECT DISTINCT source_page_id FROM reference_postings
+                 WHERE normalized_name = ?1 AND reference_kind != 4
+                 ORDER BY source_page_id LIMIT ?2",
+            )?;
+            let rows = statement.query_map(
+                params![
+                    name,
+                    i64::try_from(hard_limit.saturating_add(1)).map_err(|_| {
+                        ProjectionError::Materialization(
+                            "reference query candidate limit overflowed".into(),
+                        )
+                    })?
+                ],
+                |row| row.get::<_, Vec<u8>>(0),
+            )?;
+            for row in rows {
+                candidates.insert(decode_reference_page_id(&row?)?);
+                if candidates.len() > hard_limit {
+                    return Err(ProjectionError::Materialization(
+                        "reference query candidate source limit exceeded".into(),
+                    ));
+                }
+            }
+        }
+        Ok(candidates)
+    }
+
+    fn sqlite_candidates_for_logseq_uuid(
+        &self,
+        logseq_uuid: LogseqUuid,
+    ) -> Result<BTreeSet<PageId>, ProjectionError> {
+        let hard_limit = super::MAX_MATERIALIZATION_QUERY_ROWS;
+        let mut statement = self.database.connection.prepare(
+            "SELECT DISTINCT source_page_id FROM reference_postings
+             WHERE target_type = 1 AND raw_uuid_claim = ?1
+             ORDER BY source_page_id LIMIT ?2",
+        )?;
+        let rows = statement.query_map(
+            params![
+                logseq_uuid.as_uuid().as_bytes().as_slice(),
+                i64::try_from(hard_limit.saturating_add(1)).map_err(|_| {
+                    ProjectionError::Materialization(
+                        "reference query candidate limit overflowed".into(),
+                    )
+                })?
+            ],
+            |row| row.get::<_, Vec<u8>>(0),
+        )?;
+        let mut candidates = BTreeSet::new();
+        for row in rows {
+            candidates.insert(decode_reference_page_id(&row?)?);
+            if candidates.len() > hard_limit {
+                return Err(ProjectionError::Materialization(
+                    "reference query candidate source limit exceeded".into(),
+                ));
+            }
+        }
+        Ok(candidates)
+    }
+
+    fn sqlite_alias_candidates(
+        &self,
+        normalized_alias: &str,
+    ) -> Result<BTreeSet<PageId>, ProjectionError> {
+        let mut statement = self.database.connection.prepare(
+            "SELECT DISTINCT resolved_page_id FROM reference_alias_bindings
+             WHERE normalized_alias = ?1 AND resolved_page_id IS NOT NULL
+             ORDER BY resolved_page_id LIMIT ?2",
+        )?;
+        let candidates = statement
+            .query_map(
+                params![
+                    normalized_alias,
+                    i64::try_from(super::MAX_MATERIALIZATION_QUERY_ROWS.saturating_add(1))
+                        .map_err(|_| ProjectionError::Materialization(
+                            "reference alias candidate limit overflowed".into()
+                        ))?,
+                ],
+                |row| row.get::<_, Vec<u8>>(0),
+            )?
+            .map(|row| {
+                row.map_err(ProjectionError::from)
+                    .and_then(|bytes| decode_reference_page_id(&bytes))
+            })
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        if candidates.len() > super::MAX_MATERIALIZATION_QUERY_ROWS {
+            return Err(ProjectionError::Materialization(
+                "reference alias candidate source limit exceeded".into(),
+            ));
+        }
+        Ok(candidates)
+    }
+
+    fn current_posting(
+        &mut self,
+        source_page_id: PageId,
+    ) -> Result<super::ReferenceSourcePostingV1, ProjectionError> {
+        let posting = self
+            .engine
+            .reference_source_posting(source_page_id)
+            .map_err(|error| ProjectionError::Materialization(error.to_string()))?
+            .ok_or_else(|| {
+                ProjectionError::Materialization(
+                    "reference candidate has no current authenticated source posting".into(),
+                )
+            })?;
+        self.instrumentation.revalidated_sources =
+            self.instrumentation.revalidated_sources.saturating_add(1);
+        Ok(posting)
+    }
+
+    fn resolve_name(
+        &mut self,
+        name: &super::LogicalPageName,
+    ) -> Result<Option<PageId>, ProjectionError> {
+        if let Some(page_id) = self
+            .engine
+            .resolve_logical_page_name(name)
+            .map_err(|error| ProjectionError::Materialization(error.to_string()))?
+        {
+            return Ok(Some(page_id));
+        }
+        let normalized_alias = crate::refs::page_key(name.as_str());
+        let mut candidates = self.sqlite_alias_candidates(&normalized_alias)?;
+        candidates.retain(|page_id| !self.tail_sources.contains_key(page_id));
+        for (page_id, posting) in &self.tail_sources {
+            if posting.as_ref().is_some_and(|posting| {
+                posting.facts().iter().any(|fact| {
+                    matches!(
+                        fact,
+                        ReferenceFactV1::PageName(fact)
+                            if fact.kind == super::PageReferenceKindV1::AliasDeclaration
+                                && fact.normalized_target == normalized_alias
+                    )
+                })
+            }) {
+                candidates.insert(*page_id);
+            }
+        }
+        if candidates.len() > super::MAX_MATERIALIZATION_QUERY_ROWS {
+            return Err(ProjectionError::Materialization(
+                "reference alias candidate source limit exceeded".into(),
+            ));
+        }
+        let mut verified = BTreeSet::new();
+        for page_id in candidates {
+            let posting = self.current_posting(page_id)?;
+            if posting.facts().iter().any(|fact| {
+                matches!(
+                    fact,
+                    ReferenceFactV1::PageName(fact)
+                        if fact.kind == super::PageReferenceKindV1::AliasDeclaration
+                            && fact.normalized_target == normalized_alias
+                )
+            }) {
+                verified.insert(page_id);
+            }
+        }
+        Ok((verified.len() == 1).then(|| *verified.first().expect("one alias candidate")))
+    }
+
+    fn names_for_target(
+        &mut self,
+        requested: &super::LogicalPageName,
+        target: Option<PageId>,
+    ) -> Result<BTreeSet<String>, ProjectionError> {
+        let mut names = BTreeSet::from([crate::refs::page_key(requested.as_str())]);
+        let Some(target) = target else {
+            return Ok(names);
+        };
+        let page = self
+            .engine
+            .materialize_page(target)
+            .map_err(|error| ProjectionError::Materialization(error.to_string()))?;
+        names.insert(crate::refs::page_key(page.name.as_str()));
+        let posting = self.current_posting(target)?;
+        names.extend(posting.facts().iter().filter_map(|fact| match fact {
+            ReferenceFactV1::PageName(fact)
+                if fact.kind == super::PageReferenceKindV1::AliasDeclaration =>
+            {
+                Some(fact.normalized_target.clone())
+            }
+            ReferenceFactV1::PageName(_) | ReferenceFactV1::Block(_) => None,
+        }));
+        if names.len() > super::MAX_MATERIALIZATION_QUERY_ROWS {
+            return Err(ProjectionError::Materialization(
+                "reference target has too many alias names".into(),
+            ));
+        }
+        Ok(names)
+    }
+
+    /// Return exact raw page-reference evidence at the current authenticated
+    /// frontier.  A missing target intentionally remains queryable as a
+    /// dangling textual reference.
+    pub fn references_to_page_name(
+        &mut self,
+        requested: &super::LogicalPageName,
+        limit: usize,
+    ) -> Result<FrontierReferenceResults, ProjectionError> {
+        self.references_to_page_name_inner(requested, limit, false)
+    }
+
+    fn references_to_page_name_inner(
+        &mut self,
+        requested: &super::LogicalPageName,
+        limit: usize,
+        require_complete: bool,
+    ) -> Result<FrontierReferenceResults, ProjectionError> {
+        let limit = Self::limit(limit)?;
+        let target = self.resolve_name(requested)?;
+        let names = self.names_for_target(requested, target)?;
+        let mut candidates = self.sqlite_candidates_for_names(&names)?;
+        candidates.retain(|page_id| !self.tail_sources.contains_key(page_id));
+        candidates.extend(self.tail_sources.iter().filter_map(|(page_id, posting)| {
+            posting
+                .as_ref()
+                .is_some_and(|posting| {
+                    posting.facts().iter().any(|fact| {
+                        matches!(
+                            fact,
+                            ReferenceFactV1::PageName(fact)
+                                if fact.kind != super::PageReferenceKindV1::AliasDeclaration
+                                    && names.contains(&fact.normalized_target)
+                        )
+                    })
+                })
+                .then_some(*page_id)
+        }));
+        if candidates.len() > super::MAX_MATERIALIZATION_QUERY_ROWS {
+            return Err(ProjectionError::Materialization(
+                "reference query candidate source limit exceeded".into(),
+            ));
+        }
+        let sqlite_candidates = candidates
+            .iter()
+            .filter(|page_id| !self.tail_sources.contains_key(page_id))
+            .count();
+        self.instrumentation.sqlite_candidate_sources = self
+            .instrumentation
+            .sqlite_candidate_sources
+            .saturating_add(sqlite_candidates);
+        let mut hits = Vec::new();
+        'sources: for source_page_id in candidates {
+            let posting = self.current_posting(source_page_id)?;
+            for fact in posting.facts() {
+                let ReferenceFactV1::PageName(fact) = fact else {
+                    continue;
+                };
+                if fact.kind == super::PageReferenceKindV1::AliasDeclaration
+                    || !names.contains(&fact.normalized_target)
+                {
+                    continue;
+                }
+                let resolved_page_id = self.resolve_name(
+                    &super::LogicalPageName::parse(fact.raw_target.clone())
+                        .map_err(|error| ProjectionError::Materialization(error.to_string()))?,
+                )?;
+                if target.is_some() && resolved_page_id != target {
+                    continue;
+                }
+                if hits.len() == limit {
+                    if require_complete {
+                        return Err(ProjectionError::Materialization(
+                            "complete reference query result limit exceeded".into(),
+                        ));
+                    }
+                    break 'sources;
+                }
+                hits.push(FrontierReferenceHit {
+                    source_page_id,
+                    fact: ReferenceFactV1::PageName(fact.clone()),
+                    resolved_page_id,
+                    resolved_block_id: None,
+                });
+            }
+        }
+        hits.sort_unstable_by(|left, right| {
+            (left.source_page_id, &left.fact).cmp(&(right.source_page_id, &right.fact))
+        });
+        Ok(FrontierReferenceResults {
+            hits,
+            instrumentation: self.instrumentation,
+        })
+    }
+
+    /// Return raw block-reference evidence for an exact Logseq UUID claim.
+    /// UUID binding is always resolved through the authenticated engine; an
+    /// unclaimed or ambiguous UUID remains visible but never gains an active
+    /// target from SQLite.
+    pub fn references_to_logseq_uuid(
+        &mut self,
+        logseq_uuid: LogseqUuid,
+        limit: usize,
+    ) -> Result<FrontierReferenceResults, ProjectionError> {
+        let limit = Self::limit(limit)?;
+        let resolved_block_id = match self
+            .engine
+            .resolve_logseq_uuid(logseq_uuid)
+            .map_err(|error| ProjectionError::Materialization(error.to_string()))?
+        {
+            LogseqUuidResolution::Unique(claim) => Some(claim.block_id),
+            LogseqUuidResolution::Unclaimed | LogseqUuidResolution::Ambiguous { .. } => None,
+        };
+        let mut candidates = self.sqlite_candidates_for_logseq_uuid(logseq_uuid)?;
+        candidates.retain(|page_id| !self.tail_sources.contains_key(page_id));
+        candidates.extend(self.tail_sources.iter().filter_map(|(page_id, posting)| {
+            posting
+                .as_ref()
+                .is_some_and(|posting| {
+                    posting.facts().iter().any(|fact| {
+                        matches!(fact, ReferenceFactV1::Block(fact) if fact.logseq_uuid == logseq_uuid)
+                    })
+                })
+                .then_some(*page_id)
+        }));
+        if candidates.len() > super::MAX_MATERIALIZATION_QUERY_ROWS {
+            return Err(ProjectionError::Materialization(
+                "reference query candidate source limit exceeded".into(),
+            ));
+        }
+        let sqlite_candidates = candidates
+            .iter()
+            .filter(|page_id| !self.tail_sources.contains_key(page_id))
+            .count();
+        self.instrumentation.sqlite_candidate_sources = self
+            .instrumentation
+            .sqlite_candidate_sources
+            .saturating_add(sqlite_candidates);
+        let mut hits = Vec::new();
+        'sources: for source_page_id in candidates {
+            let posting = self.current_posting(source_page_id)?;
+            for fact in posting.facts() {
+                let ReferenceFactV1::Block(fact) = fact else {
+                    continue;
+                };
+                if fact.logseq_uuid != logseq_uuid {
+                    continue;
+                }
+                if hits.len() == limit {
+                    break 'sources;
+                }
+                hits.push(FrontierReferenceHit {
+                    source_page_id,
+                    fact: ReferenceFactV1::Block(fact.clone()),
+                    resolved_page_id: None,
+                    resolved_block_id,
+                });
+            }
+        }
+        hits.sort_unstable_by(|left, right| {
+            (left.source_page_id, &left.fact).cmp(&(right.source_page_id, &right.fact))
+        });
+        Ok(FrontierReferenceResults {
+            hits,
+            instrumentation: self.instrumentation,
+        })
+    }
+
+    /// Build a rename transaction from the target plus reverse-indexed
+    /// referrers.  Every candidate is reread from the authenticated catalog
+    /// and its exact current source bytes are checked before the transaction is
+    /// returned; SQLite therefore cannot authorize a projection write.
+    pub fn plan_page_rename(
+        &mut self,
+        old_name: &super::LogicalPageName,
+        new_name: super::LogicalPageName,
+        new_path: super::ManagedPath,
+    ) -> Result<FrontierRenamePlan, ProjectionError> {
+        let target_page_id = self.resolve_name(old_name)?.ok_or_else(|| {
+            ProjectionError::Materialization(
+                "rename target has no authenticated exact page-name owner".into(),
+            )
+        })?;
+        let results = self.references_to_page_name_inner(
+            old_name,
+            super::MAX_MATERIALIZATION_QUERY_ROWS,
+            true,
+        )?;
+        let mut preamble_facts = BTreeMap::<PageId, Vec<super::PageNameReferenceFactV1>>::new();
+        let mut block_facts = BTreeMap::<
+            (PageId, DocumentId, super::BlockId),
+            Vec<super::PageNameReferenceFactV1>,
+        >::new();
+        let mut touched = BTreeSet::from([target_page_id]);
+        for hit in &results.hits {
+            let ReferenceFactV1::PageName(fact) = &hit.fact else {
+                continue;
+            };
+            if matches!(
+                fact.kind,
+                super::PageReferenceKindV1::AliasDeclaration
+                    | super::PageReferenceKindV1::PropertyKeyPseudoPage
+            ) {
+                continue;
+            }
+            touched.insert(hit.source_page_id);
+            match fact.source {
+                ReferenceSourceLocatorV1::Preamble => {
+                    preamble_facts
+                        .entry(hit.source_page_id)
+                        .or_default()
+                        .push(fact.clone());
+                }
+                ReferenceSourceLocatorV1::Block {
+                    block_id,
+                    home_document_id,
+                } => {
+                    block_facts
+                        .entry((hit.source_page_id, home_document_id, block_id))
+                        .or_default()
+                        .push(fact.clone());
+                }
+            }
+        }
+        let mut page_preamble_rewrites = Vec::new();
+        let mut block_rewrites = Vec::new();
+        for source_page_id in &touched {
+            let posting = self.current_posting(*source_page_id)?;
+            let page = self
+                .engine
+                .materialize_page(*source_page_id)
+                .map_err(|error| ProjectionError::Materialization(error.to_string()))?;
+            if let Some(facts) = preamble_facts.get(source_page_id) {
+                verify_current_page_facts(&posting, facts)?;
+                let source = page.preamble.as_deref().ok_or_else(|| {
+                    ProjectionError::Materialization(
+                        "rename preamble candidate has no current source bytes".into(),
+                    )
+                })?;
+                page_preamble_rewrites.push(super::PagePreambleRewrite {
+                    page_id: *source_page_id,
+                    new_preamble: Some(rewrite_raw_page_targets(source, facts, new_name.as_str())?),
+                });
+            }
+            for ((page_id, home_document_id, block_id), facts) in block_facts
+                .iter()
+                .filter(|((page_id, _, _), _)| page_id == source_page_id)
+            {
+                verify_current_page_facts(&posting, facts)?;
+                let block = page
+                    .blocks
+                    .iter()
+                    .find(|block| {
+                        block.block_id == *block_id && block.home_document_id == *home_document_id
+                    })
+                    .ok_or_else(|| {
+                        ProjectionError::Materialization(
+                            "rename block candidate has no current source state".into(),
+                        )
+                    })?;
+                block_rewrites.push(super::BlockContentRewrite {
+                    block: super::BlockLocation {
+                        block_id: *block_id,
+                        home_document_id: *home_document_id,
+                    },
+                    new_content: rewrite_raw_page_targets(
+                        &block.content,
+                        facts,
+                        new_name.as_str(),
+                    )?,
+                });
+                debug_assert_eq!(*page_id, *source_page_id);
+            }
+        }
+        block_rewrites.sort_unstable_by_key(|rewrite| {
+            (rewrite.block.home_document_id, rewrite.block.block_id)
+        });
+        page_preamble_rewrites.sort_unstable_by_key(|rewrite| rewrite.page_id);
+        let transaction = super::OperationTransaction::new(vec![
+            super::SemanticOperation::RenamePagesAndRewriteReferrers {
+                page_changes: vec![super::PageRename {
+                    page_id: target_page_id,
+                    new_name,
+                    new_path,
+                }],
+                block_rewrites,
+                page_preamble_rewrites,
+            },
+        ])
+        .map_err(|error| ProjectionError::Materialization(error.to_string()))?;
+        Ok(FrontierRenamePlan {
+            target_page_id,
+            transaction,
+            touched_sources: touched.into_iter().collect(),
+            instrumentation: self.instrumentation,
+        })
+    }
+}
+
+fn verify_current_page_facts(
+    posting: &super::ReferenceSourcePostingV1,
+    facts: &[super::PageNameReferenceFactV1],
+) -> Result<(), ProjectionError> {
+    if facts.iter().any(|fact| {
+        !posting
+            .facts()
+            .contains(&ReferenceFactV1::PageName(fact.clone()))
+    }) {
+        return Err(ProjectionError::Materialization(
+            "rename candidate no longer matches its authenticated source posting".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn decode_reference_page_id(bytes: &[u8]) -> Result<PageId, ProjectionError> {
+    Ok(PageId::from_uuid(decode_uuid(bytes)?))
+}
+
+fn rewrite_raw_page_targets(
+    source: &str,
+    facts: &[super::PageNameReferenceFactV1],
+    replacement: &str,
+) -> Result<String, ProjectionError> {
+    let mut facts = facts.to_vec();
+    facts.sort_unstable_by(|left, right| {
+        right
+            .byte_start
+            .cmp(&left.byte_start)
+            .then_with(|| right.byte_end.cmp(&left.byte_end))
+    });
+    let mut next_start = source.len();
+    let mut rewritten = source.to_owned();
+    for fact in facts {
+        let span_start = usize::try_from(fact.byte_start).map_err(|_| {
+            ProjectionError::Materialization("reference source offset is invalid".into())
+        })?;
+        let span_end = usize::try_from(fact.byte_end).map_err(|_| {
+            ProjectionError::Materialization("reference source offset is invalid".into())
+        })?;
+        if span_start >= span_end || span_end > next_start {
+            return Err(ProjectionError::Materialization(
+                "rename candidate source bytes no longer match raw reference evidence".into(),
+            ));
+        }
+        let span = rewritten.get(span_start..span_end).ok_or_else(|| {
+            ProjectionError::Materialization(
+                "rename candidate source bytes no longer match raw reference evidence".into(),
+            )
+        })?;
+        let mut occurrences = span.match_indices(&fact.raw_target);
+        let Some((offset, _)) = occurrences.next() else {
+            return Err(ProjectionError::Materialization(
+                "rename candidate source bytes no longer match raw reference evidence".into(),
+            ));
+        };
+        if occurrences.next().is_some() {
+            return Err(ProjectionError::Materialization(
+                "rename candidate source range has ambiguous raw reference evidence".into(),
+            ));
+        }
+        let start = span_start.checked_add(offset).ok_or_else(|| {
+            ProjectionError::Materialization("reference source offset overflowed".into())
+        })?;
+        let end = start.checked_add(fact.raw_target.len()).ok_or_else(|| {
+            ProjectionError::Materialization("reference source offset overflowed".into())
+        })?;
+        rewritten.replace_range(start..end, replacement);
+        next_start = span_start;
+    }
+    Ok(rewritten)
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -5999,6 +7039,342 @@ mod tests {
     }
 
     #[test]
+    fn frontier_reference_query_is_catalog_gated_raw_and_bounded_for_rename() {
+        let ids = TestIds::new(1_750);
+        let source_ids = TestIds {
+            document: DocumentId::from_uuid(uuid(1_756)),
+            page: PageId::from_uuid(uuid(1_757)),
+            block: BlockId::from_uuid(uuid(1_758)),
+            ..ids
+        };
+        let recreated_ids = TestIds {
+            document: DocumentId::from_uuid(uuid(1_759)),
+            page: PageId::from_uuid(uuid(1_760)),
+            block: BlockId::from_uuid(uuid(1_761)),
+            ..ids
+        };
+        let dir = TestDir::new("frontier-reference-query");
+        let (mut database, mut engine, store) = open_empty(&dir, ids);
+
+        let target_path = "nested/owners/target.md";
+        let target = engine
+            .prepare_bootstrap_transaction(
+                author(1_751),
+                &root_transaction_named(ids, target_path, "Target", "aliases:: Old Target"),
+            )
+            .unwrap();
+        publish_and_stage(&mut engine, &store, &target);
+        let target_event =
+            AcceptedBatchEvent::from_accepted(&engine, &store, target.manifest().batch_id())
+                .unwrap();
+        database
+            .apply_authenticated_reference_catalog_materialized_accepted(
+                &target_event,
+                rich_materialization(
+                    &target_event,
+                    ids,
+                    target_path,
+                    ManagedTextKind::Page,
+                    "Target",
+                    "aliases:: Old Target",
+                ),
+                &engine,
+            )
+            .unwrap();
+
+        let source_path = "nested/referrers/arbitrary/depth/source.md";
+        let raw_uuid = "6a55b643-1234-5678-9abc-def012345678";
+        let source_content = format!("prefix [[Target]] and [[Old Target]] (({raw_uuid}))");
+        let source = engine
+            .prepare_bootstrap_transaction(
+                author(1_752),
+                &root_transaction_named(source_ids, source_path, "Source", &source_content),
+            )
+            .unwrap();
+        publish_and_stage(&mut engine, &store, &source);
+        let source_event =
+            AcceptedBatchEvent::from_accepted(&engine, &store, source.manifest().batch_id())
+                .unwrap();
+        database
+            .apply_authenticated_reference_catalog_materialized_accepted(
+                &source_event,
+                rich_materialization(
+                    &source_event,
+                    source_ids,
+                    source_path,
+                    ManagedTextKind::Page,
+                    "Source",
+                    &source_content,
+                ),
+                &engine,
+            )
+            .unwrap();
+
+        let target_name = crate::oplog::LogicalPageName::parse("Target").unwrap();
+        let mut query = database.frontier_reference_query(&engine, &store).unwrap();
+        let results = query.references_to_page_name(&target_name, 16).unwrap();
+        assert_eq!(results.hits.len(), 2);
+        assert_eq!(
+            results
+                .hits
+                .iter()
+                .map(|hit| match &hit.fact {
+                    ReferenceFactV1::PageName(fact) => fact.raw_target.as_str(),
+                    ReferenceFactV1::Block(_) => panic!("expected page reference"),
+                })
+                .collect::<Vec<_>>(),
+            vec!["Old Target", "Target"],
+        );
+        assert!(results
+            .hits
+            .iter()
+            .all(|hit| hit.source_page_id == source_ids.page
+                && hit.resolved_page_id == Some(ids.page)));
+        assert!(results.instrumentation.sqlite_candidate_sources <= 2);
+        assert_eq!(results.instrumentation.tail_source_postings, 0);
+        let limited = query.references_to_page_name(&target_name, 1).unwrap();
+        assert_eq!(limited.hits.len(), 1);
+
+        let uuid = LogseqUuid::parse(raw_uuid).unwrap();
+        let uuid_results = query.references_to_logseq_uuid(uuid, 16).unwrap();
+        assert_eq!(uuid_results.hits.len(), 1);
+        assert!(matches!(
+            &uuid_results.hits[0].fact,
+            ReferenceFactV1::Block(fact) if fact.raw_claim == raw_uuid
+        ));
+        assert_eq!(uuid_results.hits[0].resolved_block_id, None);
+
+        let old_alias = crate::oplog::LogicalPageName::parse("Old Target").unwrap();
+        let alias_results = query.references_to_page_name(&old_alias, 16).unwrap();
+        assert_eq!(alias_results.hits.len(), 2);
+        assert!(alias_results
+            .hits
+            .iter()
+            .all(|hit| hit.source_page_id == source_ids.page));
+        let source_posting = engine
+            .reference_source_posting(source_ids.page)
+            .unwrap()
+            .unwrap();
+        for fact in source_posting.facts() {
+            if let ReferenceFactV1::PageName(fact) = fact {
+                let parser_owned_span =
+                    &source_content[fact.byte_start as usize..fact.byte_end as usize];
+                assert_eq!(parser_owned_span.match_indices(&fact.raw_target).count(), 1);
+            }
+        }
+
+        let renamed = crate::oplog::LogicalPageName::parse("Renamed").unwrap();
+        let plan = query
+            .plan_page_rename(
+                &target_name,
+                renamed.clone(),
+                ManagedPath::parse("nested/renamed/target.md").unwrap(),
+            )
+            .unwrap_or_else(|error| panic!("rename plan failed: {error:?}"));
+        assert_eq!(plan.touched_sources(), &[ids.page, source_ids.page]);
+        assert!(plan.instrumentation().revalidated_sources >= 2);
+        let SemanticOperation::RenamePagesAndRewriteReferrers { block_rewrites, .. } =
+            &plan.transaction().operations[0]
+        else {
+            panic!("expected rename transaction");
+        };
+        assert_eq!(block_rewrites.len(), 1);
+        assert_eq!(block_rewrites[0].block.block_id, source_ids.block);
+        assert_eq!(
+            block_rewrites[0].new_content,
+            format!("prefix [[Renamed]] and [[Renamed]] (({raw_uuid}))")
+        );
+
+        let delete = engine
+            .prepare_bootstrap_transaction(
+                author(1_753),
+                &OperationTransaction::new(vec![SemanticOperation::DeletePage {
+                    page_id: ids.page,
+                }])
+                .unwrap(),
+            )
+            .unwrap();
+        publish_and_stage(&mut engine, &store, &delete);
+        let delete_event =
+            AcceptedBatchEvent::from_accepted(&engine, &store, delete.manifest().batch_id())
+                .unwrap();
+        database
+            .apply_authenticated_reference_catalog_materialized_accepted(
+                &delete_event,
+                MaterializationChange::new(delete_event.batch_id(), Vec::new(), vec![ids.page])
+                    .unwrap(),
+                &engine,
+            )
+            .unwrap();
+        let mut dangling = database.frontier_reference_query(&engine, &store).unwrap();
+        let dangling_results = dangling.references_to_page_name(&target_name, 16).unwrap();
+        assert_eq!(dangling_results.hits.len(), 1);
+        assert_eq!(dangling_results.hits[0].resolved_page_id, None);
+        assert!(matches!(
+            &dangling_results.hits[0].fact,
+            ReferenceFactV1::PageName(fact) if fact.raw_target == "Target"
+        ));
+
+        let recreate_path = "nested/recreated/target.md";
+        let recreate = engine
+            .prepare_bootstrap_transaction(
+                author(1_754),
+                &root_transaction_named(
+                    recreated_ids,
+                    recreate_path,
+                    "Target",
+                    "recreated at a different nested path",
+                ),
+            )
+            .unwrap();
+        publish_and_stage(&mut engine, &store, &recreate);
+        let recreate_event =
+            AcceptedBatchEvent::from_accepted(&engine, &store, recreate.manifest().batch_id())
+                .unwrap();
+        database
+            .apply_authenticated_reference_catalog_materialized_accepted(
+                &recreate_event,
+                rich_materialization(
+                    &recreate_event,
+                    recreated_ids,
+                    recreate_path,
+                    ManagedTextKind::Page,
+                    "Target",
+                    "recreated at a different nested path",
+                ),
+                &engine,
+            )
+            .unwrap();
+        let mut rebound = database.frontier_reference_query(&engine, &store).unwrap();
+        let rebound_results = rebound.references_to_page_name(&target_name, 16).unwrap();
+        assert_eq!(rebound_results.hits.len(), 1);
+        assert_eq!(
+            rebound_results.hits[0].resolved_page_id,
+            Some(recreated_ids.page)
+        );
+    }
+
+    #[test]
+    fn frontier_reference_query_rejects_stale_sqlite_catalog_stamp() {
+        let ids = TestIds::new(1_770);
+        let dir = TestDir::new("frontier-reference-stale-stamp");
+        let (mut database, mut engine, store) = open_empty(&dir, ids);
+        let prepared = engine
+            .prepare_bootstrap_transaction(
+                author(1_771),
+                &root_transaction(ids, "nested/stale.md", "[[Target]]"),
+            )
+            .unwrap();
+        publish_and_stage(&mut engine, &store, &prepared);
+        let event =
+            AcceptedBatchEvent::from_accepted(&engine, &store, prepared.manifest().batch_id())
+                .unwrap();
+        database
+            .apply_authenticated_reference_catalog_materialized_accepted(
+                &event,
+                rich_materialization(
+                    &event,
+                    ids,
+                    "nested/stale.md",
+                    ManagedTextKind::Page,
+                    "Root Fixture Page",
+                    "[[Target]]",
+                ),
+                &engine,
+            )
+            .unwrap();
+        let unapplied_tail = engine
+            .prepare_bootstrap_transaction(
+                author(1_772),
+                &OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
+                    block: BlockLocation {
+                        block_id: ids.block,
+                        home_document_id: ids.document,
+                    },
+                    content: "[[Other]]".into(),
+                }])
+                .unwrap(),
+            )
+            .unwrap();
+        publish_and_stage(&mut engine, &store, &unapplied_tail);
+        database
+            .connection
+            .execute(
+                "UPDATE materialization_stamp SET catalog_root_digest = zeroblob(32) WHERE singleton = 1",
+                [],
+            )
+            .unwrap();
+        assert!(matches!(
+            database.frontier_reference_query(&engine, &store),
+            Err(ProjectionError::Materialization(message))
+                if message.contains("not bound to its authenticated frontier")
+        ));
+    }
+
+    #[test]
+    fn rebuild_materialization_rebinds_authenticated_reference_transition() {
+        let ids = TestIds::new(1_780);
+        let dir = TestDir::new("rebuild-authenticated-reference-catalog");
+        let (mut database, mut engine, store) = open_empty(&dir, ids);
+        let prepared = engine
+            .prepare_bootstrap_transaction(
+                author(1_781),
+                &root_transaction(ids, "nested/rebuild/source.md", "[[Target]]"),
+            )
+            .unwrap();
+        publish_and_stage(&mut engine, &store, &prepared);
+        let event =
+            AcceptedBatchEvent::from_accepted(&engine, &store, prepared.manifest().batch_id())
+                .unwrap();
+        let change = attach_authenticated_reference_catalog(
+            &engine,
+            &event,
+            rich_materialization(
+                &event,
+                ids,
+                "nested/rebuild/source.md",
+                ManagedTextKind::Page,
+                "Root Fixture Page",
+                "[[Target]]",
+            ),
+        )
+        .unwrap();
+        database
+            .apply_materialized_accepted(&event, &change)
+            .unwrap();
+        assert_eq!(database.rebuild_materialization(vec![change]).unwrap(), 1);
+        let mut query = database.frontier_reference_query(&engine, &store).unwrap();
+        let hits = query
+            .references_to_page_name(&crate::oplog::LogicalPageName::parse("Target").unwrap(), 16)
+            .unwrap();
+        assert_eq!(hits.hits.len(), 1);
+        assert_eq!(hits.hits[0].source_page_id, ids.page);
+    }
+
+    #[test]
+    fn rename_rewrite_fails_closed_when_current_source_bytes_no_longer_match() {
+        let target = crate::oplog::LogicalPageName::parse("Target").unwrap();
+        let fact = crate::oplog::PageNameReferenceFactV1 {
+            source: ReferenceSourceLocatorV1::Preamble,
+            kind: crate::oplog::PageReferenceKindV1::PageLink,
+            raw_target: "Target".into(),
+            normalized_target: crate::refs::page_key("Target"),
+            target_key: target.key_digest(),
+            byte_start: 0,
+            byte_end: 10,
+        };
+        assert_eq!(
+            rewrite_raw_page_targets("[[Target]]", &[fact.clone()], "Renamed").unwrap(),
+            "[[Renamed]]"
+        );
+        assert!(matches!(
+            rewrite_raw_page_targets("[[Other]]", &[fact], "Renamed"),
+            Err(ProjectionError::Materialization(message))
+                if message.contains("no longer match raw reference evidence")
+        ));
+    }
+
+    #[test]
     fn materialization_rejects_name_and_key_contradictions_before_writing() {
         let ids = TestIds::new(1_750);
         let dir = TestDir::new("materialization-page-name-authority");
@@ -6121,7 +7497,11 @@ mod tests {
                 "initial",
             );
             database
-                .apply_materialized_accepted(&root_event, &root_change)
+                .apply_authenticated_reference_catalog_materialized_accepted(
+                    &root_event,
+                    root_change,
+                    &engine,
+                )
                 .unwrap();
             let prior_page = database
                 .materialized_read()
@@ -6894,7 +8274,11 @@ mod tests {
             )
             .unwrap();
             database
-                .apply_materialized_accepted(&root_event, &root_change)
+                .apply_authenticated_reference_catalog_materialized_accepted(
+                    &root_event,
+                    root_change,
+                    &engine,
+                )
                 .unwrap();
 
             let move_prepared = engine
@@ -6947,8 +8331,14 @@ mod tests {
             )
             .unwrap();
             database
-                .apply_materialized_accepted(&move_event, &move_change)
+                .apply_authenticated_reference_catalog_materialized_accepted(
+                    &move_event,
+                    move_change,
+                    &engine,
+                )
                 .unwrap();
+
+            assert!(database.authenticated_reference_catalog_root().is_ok());
 
             let read = database.materialized_read().unwrap();
             assert_eq!(

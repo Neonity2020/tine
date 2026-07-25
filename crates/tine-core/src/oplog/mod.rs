@@ -135,11 +135,12 @@ pub use simulator::{
     FAILURE_CAPSULE_SCHEMA_VERSION, SCENARIO_SCHEMA_VERSION,
 };
 pub use sqlite::{
-    AcceptedBatchEvent, ApplicationRuntimeRoot, ApplyDisposition, ForensicEvidence, OpenProjection,
-    ProjectionClaim, ProjectionError as SqliteProjectionError, ProjectionRecovery,
-    RebuildInstrumentation, RebuildSource, SqliteFrontier, TailOverlay, TailOverlayError,
-    TailOverlayStatus, TailReservation, SQLITE_APPLICATION_ID, SQLITE_SCHEMA_VERSION,
-    TAIL_MAX_BATCHES, TAIL_MAX_BYTES,
+    AcceptedBatchEvent, ApplicationRuntimeRoot, ApplyDisposition, ForensicEvidence,
+    FrontierReferenceHit, FrontierReferenceQuery, FrontierReferenceResults, FrontierRenamePlan,
+    OpenProjection, ProjectionClaim, ProjectionError as SqliteProjectionError, ProjectionRecovery,
+    RebuildInstrumentation, RebuildSource, ReferenceQueryInstrumentation, SqliteFrontier,
+    TailOverlay, TailOverlayError, TailOverlayStatus, TailReservation, SQLITE_APPLICATION_ID,
+    SQLITE_SCHEMA_VERSION, TAIL_MAX_BATCHES, TAIL_MAX_BYTES,
 };
 pub use sqlite_materialization::{
     MaterializationChange, MaterializationError, MaterializedBlockInput, MaterializedBlockRow,

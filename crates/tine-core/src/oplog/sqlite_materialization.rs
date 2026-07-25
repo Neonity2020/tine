@@ -18,7 +18,7 @@ use uuid::Uuid;
 use super::{
     AcceptedBatchEvent, BatchId, BlockId, BlockOwner, ContentDigest, DocumentId,
     LogseqIdentityOrigin, LogseqUuid, ManagedPath, ManagedTextKind, PageId, PageState,
-    PolicyGeneratedAnchorReason, ReferenceSourceLocatorV1, SemanticEffect,
+    PolicyGeneratedAnchorReason, ReferenceCatalogRootV1, ReferenceSourceLocatorV1, SemanticEffect,
     REFERENCE_CATALOG_EXTRACTOR_VERSION, REFERENCE_CATALOG_POLICY_VERSION,
 };
 
@@ -48,7 +48,11 @@ const REFERENCE_CATALOG_POSTING_OVERHEAD_BYTES: usize = 96;
 const REFERENCE_CATALOG_ALIAS_OVERHEAD_BYTES: usize = 80;
 const REFERENCE_CATALOG_BINDING_OVERHEAD_BYTES: usize = 64;
 const REFERENCE_CATALOG_COVERAGE_OVERHEAD_BYTES: usize = 80;
-const MATERIALIZATION_INPUT_SCHEMA_VERSION: u32 = 2;
+// Packet 3 attaches the already-authenticated reference-catalog transition to
+// the same SQL transaction as the ordinary page materialization.  The SQLite
+// schema stays at v9: these are values for its existing v9 tables, not a new
+// user-data format.
+const MATERIALIZATION_INPUT_SCHEMA_VERSION: u32 = 3;
 pub(crate) const REFERENCE_EXTRACTOR_DEPENDENCY_STAMP_SCHEMA_VERSION: u32 = 1;
 const REFERENCE_EXTRACTOR_DEPENDENCY_STAMP_DOMAIN: &[u8] =
     b"tine/sqlite-reference-extractor-dependency-stamp/v1";
@@ -126,9 +130,9 @@ pub(crate) const MATERIALIZATION_BATCHES_DDL: &str = "CREATE TABLE materializati
          AND catalog_change_digest IS NOT NULL AND canonical_input_digest IS NOT NULL)
     )
 ) WITHOUT ROWID, STRICT";
-// The current v2 materialization applier has no authenticated catalog-change
-// adapter. It records `input_digest` and leaves the all-or-nothing catalog
-// authority group NULL; it must never synthesize zero or sentinel authority.
+// Generic page materialization leaves this authority group NULL.  The packet-3
+// adapter fills it atomically only from an accepted catalog transition; it
+// must never synthesize zero or sentinel authority.
 pub(crate) const REFERENCE_SOURCE_COVERAGE_DDL: &str = "CREATE TABLE reference_source_coverage (
     source_page_id BLOB PRIMARY KEY CHECK (length(source_page_id) = 16),
     source_digest BLOB NOT NULL CHECK (length(source_digest) = 32),
@@ -894,29 +898,45 @@ pub(crate) struct MaterializedReferenceAliasBinding {
     pub(crate) catalog_root_digest: ContentDigest,
 }
 
-/// Fully validated local values ready for a future authenticated catalog
-/// adapter. This is intentionally not part of `MaterializationChange` yet:
-/// the accepted catalog-change binding needed for input schema v3 is not
-/// available in this slice.
+/// The accepted evidence which binds a catalog transition to a particular
+/// frontier step.  It is deliberately separate from SQLite-shaped input: a
+/// rebuilt projection must recover this only from authenticated history.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AuthenticatedReferenceMaterialization {
+    pub(crate) event_binding_digest: ContentDigest,
+    pub(crate) prior_frontier_root_digest: ContentDigest,
+    pub(crate) post_frontier_root_digest: ContentDigest,
+    pub(crate) prior_catalog_root: ReferenceCatalogRootV1,
+    pub(crate) post_catalog_root: ReferenceCatalogRootV1,
+}
+
+/// Fully validated catalog rows that may be projected only with matching
+/// accepted frontier evidence.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ReferenceCatalogMaterializationInput {
+    prior_catalog_root: ReferenceCatalogRootV1,
+    post_catalog_root: ReferenceCatalogRootV1,
     postings: Vec<MaterializedReferencePosting>,
     aliases: Vec<MaterializedAliasDeclaration>,
     name_bindings: Vec<MaterializedReferenceNameBinding>,
     uuid_bindings: Vec<MaterializedReferenceUuidBinding>,
     alias_bindings: Vec<MaterializedReferenceAliasBinding>,
     coverage: Vec<SourceCoverageFacet>,
+    removed_sources: Vec<PageId>,
 }
 
 impl ReferenceCatalogMaterializationInput {
     pub(crate) fn new(
+        prior_catalog_root: ReferenceCatalogRootV1,
+        post_catalog_root: ReferenceCatalogRootV1,
         mut postings: Vec<MaterializedReferencePosting>,
         mut aliases: Vec<MaterializedAliasDeclaration>,
         mut name_bindings: Vec<MaterializedReferenceNameBinding>,
         mut uuid_bindings: Vec<MaterializedReferenceUuidBinding>,
         mut alias_bindings: Vec<MaterializedReferenceAliasBinding>,
         mut coverage: Vec<SourceCoverageFacet>,
+        mut removed_sources: Vec<PageId>,
     ) -> Result<Self, MaterializationError> {
         postings.sort_unstable();
         aliases.sort_unstable();
@@ -924,19 +944,33 @@ impl ReferenceCatalogMaterializationInput {
         uuid_bindings.sort_unstable();
         alias_bindings.sort_unstable();
         coverage.sort_unstable();
+        removed_sources.sort_unstable();
         let input = Self {
+            prior_catalog_root,
+            post_catalog_root,
             postings,
             aliases,
             name_bindings,
             uuid_bindings,
             alias_bindings,
             coverage,
+            removed_sources,
         };
         input.validate()?;
         Ok(input)
     }
 
+    pub(crate) fn prior_catalog_root(&self) -> &ReferenceCatalogRootV1 {
+        &self.prior_catalog_root
+    }
+
     fn validate(&self) -> Result<(), MaterializationError> {
+        self.prior_catalog_root
+            .encode()
+            .map_err(|error| MaterializationError::InvalidInput(error.to_string()))?;
+        self.post_catalog_root
+            .encode()
+            .map_err(|error| MaterializationError::InvalidInput(error.to_string()))?;
         if !strictly_sorted_unique_by(&self.postings, |posting| {
             (
                 posting.source_page_id,
@@ -991,12 +1025,42 @@ impl ReferenceCatalogMaterializationInput {
                 "reference source coverage is not canonical".into(),
             ));
         }
+        if !strictly_sorted_unique_by(&self.removed_sources, |page_id| *page_id) {
+            return Err(MaterializationError::InvalidInput(
+                "removed reference sources are not canonical".into(),
+            ));
+        }
+
+        let covered = self
+            .coverage
+            .iter()
+            .map(|facet| facet.source_page_id)
+            .collect::<BTreeSet<_>>();
+        if self
+            .removed_sources
+            .iter()
+            .any(|page_id| covered.contains(page_id))
+        {
+            return Err(MaterializationError::InvalidInput(
+                "one reference source is both covered and removed".into(),
+            ));
+        }
 
         let mut input_budget = MaterializationInputBudget::default();
         for posting in &self.postings {
+            if !covered.contains(&posting.source_page_id) {
+                return Err(MaterializationError::InvalidInput(
+                    "reference posting has no source coverage".into(),
+                ));
+            }
             validate_reference_posting(posting, &mut input_budget)?;
         }
         for alias in &self.aliases {
+            if !covered.contains(&alias.source_page_id) {
+                return Err(MaterializationError::InvalidInput(
+                    "reference alias has no source coverage".into(),
+                ));
+            }
             validate_alias_declaration(alias, &mut input_budget)?;
         }
         for binding in &self.name_bindings {
@@ -1039,6 +1103,55 @@ impl ReferenceCatalogMaterializationInput {
             input_budget.add_bytes(REFERENCE_CATALOG_COVERAGE_OVERHEAD_BYTES)?;
         }
         Ok(())
+    }
+
+    fn validate_for_authenticated_transition(
+        &self,
+        authenticated: &AuthenticatedReferenceMaterialization,
+        effect: &SemanticEffect,
+    ) -> Result<(), MaterializationError> {
+        self.validate()?;
+        if self.prior_catalog_root != authenticated.prior_catalog_root
+            || self.post_catalog_root != authenticated.post_catalog_root
+        {
+            return Err(MaterializationError::Contradiction(
+                "reference catalog input is not bound to the accepted frontier transition".into(),
+            ));
+        }
+        let expected = super::reference_catalog::affected_reference_sources(effect);
+        let supplied = self
+            .coverage
+            .iter()
+            .map(|facet| facet.source_page_id)
+            .chain(self.removed_sources.iter().copied())
+            .collect::<BTreeSet<_>>();
+        if supplied != expected {
+            return Err(MaterializationError::Incomplete(
+                "reference catalog input does not cover the accepted affected sources".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_for_event(
+        &self,
+        event: &AcceptedBatchEvent,
+        effect: &SemanticEffect,
+    ) -> Result<(), MaterializationError> {
+        let authenticated = AuthenticatedReferenceMaterialization {
+            event_binding_digest: event.event_binding_digest(),
+            prior_frontier_root_digest: ContentDigest::of(
+                &postcard::to_allocvec(event.prior_frontier_root())
+                    .map_err(|error| MaterializationError::InvalidInput(error.to_string()))?,
+            ),
+            post_frontier_root_digest: ContentDigest::of(
+                &postcard::to_allocvec(event.post_frontier_root())
+                    .map_err(|error| MaterializationError::InvalidInput(error.to_string()))?,
+            ),
+            prior_catalog_root: event.prior_frontier_root().reference_catalog_root().clone(),
+            post_catalog_root: event.post_frontier_root().reference_catalog_root().clone(),
+        };
+        self.validate_for_authenticated_transition(&authenticated, effect)
     }
 }
 
@@ -1108,6 +1221,7 @@ pub struct MaterializationChange {
     batch_id: BatchId,
     replacements: Vec<MaterializedPageInput>,
     deletions: Vec<PageId>,
+    reference_catalog: Option<ReferenceCatalogMaterializationInput>,
 }
 
 impl MaterializationChange {
@@ -1126,6 +1240,7 @@ impl MaterializationChange {
             batch_id,
             replacements,
             deletions,
+            reference_catalog: None,
         };
         change.validate_shape()?;
         Ok(change)
@@ -1141,6 +1256,27 @@ impl MaterializationChange {
 
     pub fn deletions(&self) -> &[PageId] {
         &self.deletions
+    }
+
+    /// Attach the catalog transition that was independently authenticated by
+    /// an accepted batch.  This is crate-private so callers cannot make a
+    /// SQLite row claim a catalog root without the engine/store adapter.
+    pub(crate) fn with_authenticated_reference_catalog(
+        mut self,
+        reference_catalog: ReferenceCatalogMaterializationInput,
+    ) -> Result<Self, MaterializationError> {
+        if self.reference_catalog.is_some() {
+            return Err(MaterializationError::InvalidInput(
+                "materialization change already has a reference catalog transition".into(),
+            ));
+        }
+        self.reference_catalog = Some(reference_catalog);
+        self.validate_shape()?;
+        Ok(self)
+    }
+
+    pub(crate) fn reference_catalog(&self) -> Option<&ReferenceCatalogMaterializationInput> {
+        self.reference_catalog.as_ref()
     }
 
     pub fn digest(&self) -> Result<ContentDigest, MaterializationError> {
@@ -1170,6 +1306,9 @@ impl MaterializationChange {
         let effect = SemanticEffect::decode(event.semantic_effect())
             .map_err(|error| MaterializationError::InvalidInput(error.to_string()))?;
         self.validate_against_effect(&effect)?;
+        if let Some(reference_catalog) = &self.reference_catalog {
+            reference_catalog.validate_for_event(event, &effect)?;
+        }
         self.digest()
     }
 
@@ -1187,6 +1326,9 @@ impl MaterializationChange {
         let effect = SemanticEffect::decode(semantic_effect)
             .map_err(|error| MaterializationError::InvalidInput(error.to_string()))?;
         self.validate_against_effect(&effect)?;
+        if let Some(reference_catalog) = &self.reference_catalog {
+            reference_catalog.validate()?;
+        }
         self.digest()
     }
 
@@ -1239,6 +1381,9 @@ impl MaterializationChange {
                     )));
                 }
             }
+        }
+        if let Some(reference_catalog) = &self.reference_catalog {
+            reference_catalog.validate()?;
         }
         Ok(())
     }
@@ -2105,6 +2250,227 @@ pub(crate) fn recorded_digest(
     bytes.map(decode_digest).transpose()
 }
 
+fn apply_reference_catalog_change(
+    transaction: &Transaction<'_>,
+    input: &ReferenceCatalogMaterializationInput,
+) -> Result<(Vec<u8>, ContentDigest, ContentDigest, ContentDigest), MaterializationError> {
+    input.validate()?;
+    let post_root_bytes = input
+        .post_catalog_root
+        .encode()
+        .map_err(|error| MaterializationError::InvalidInput(error.to_string()))?;
+    let post_root_digest = input
+        .post_catalog_root
+        .external_digest()
+        .map_err(|error| MaterializationError::InvalidInput(error.to_string()))?;
+    let extractor_stamp = ReferenceExtractorDependencyStamp::new(
+        input.post_catalog_root.extractor_digest(),
+        input.post_catalog_root.policy_digest(),
+    )?;
+    let extractor_stamp_digest = extractor_stamp.digest()?;
+    let coverage_digest = input.post_catalog_root.source_coverage_root();
+    let sources = input
+        .coverage
+        .iter()
+        .map(|facet| facet.source_page_id)
+        .chain(input.removed_sources.iter().copied())
+        .collect::<BTreeSet<_>>();
+    let mut altered_aliases = BTreeSet::new();
+    let mut prior_alias_candidates = BTreeMap::<String, BTreeSet<PageId>>::new();
+    for page_id in &sources {
+        let mut statement = transaction.prepare(
+            "SELECT normalized_alias FROM reference_alias_declarations
+             WHERE source_page_id = ?1",
+        )?;
+        let aliases = statement
+            .query_map(params![page_id.as_uuid().as_bytes().as_slice()], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        altered_aliases.extend(aliases);
+    }
+    altered_aliases.extend(
+        input
+            .aliases
+            .iter()
+            .map(|alias| alias.normalized_alias.clone()),
+    );
+    for alias in &altered_aliases {
+        let mut statement = transaction.prepare(
+            "SELECT DISTINCT resolved_page_id FROM reference_alias_bindings
+             WHERE normalized_alias = ?1 AND resolved_page_id IS NOT NULL",
+        )?;
+        let candidates = statement
+            .query_map(params![alias], |row| row.get::<_, Vec<u8>>(0))?
+            .map(|row| {
+                row.map_err(MaterializationError::from)
+                    .and_then(|bytes| decode_page_id(&bytes))
+            })
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        prior_alias_candidates.insert(alias.clone(), candidates);
+    }
+
+    for page_id in &sources {
+        let page_uuid = page_id.as_uuid();
+        let id = page_uuid.as_bytes();
+        transaction.execute(
+            "DELETE FROM reference_postings WHERE source_page_id = ?1",
+            params![id.as_slice()],
+        )?;
+        transaction.execute(
+            "DELETE FROM reference_alias_declarations WHERE source_page_id = ?1",
+            params![id.as_slice()],
+        )?;
+        transaction.execute(
+            "DELETE FROM reference_source_coverage WHERE source_page_id = ?1",
+            params![id.as_slice()],
+        )?;
+    }
+    for facet in &input.coverage {
+        transaction.execute(
+            "INSERT INTO reference_source_coverage (
+                 source_page_id, source_digest, extractor_dependency_stamp_digest
+             ) VALUES (?1, ?2, ?3)",
+            params![
+                facet.source_page_id.as_uuid().as_bytes().as_slice(),
+                facet.source_digest.as_bytes().as_slice(),
+                facet
+                    .extractor_dependency_stamp
+                    .digest()?
+                    .as_bytes()
+                    .as_slice(),
+            ],
+        )?;
+    }
+    for posting in &input.postings {
+        let (source_entity_type, source_entity_id) = posting.source_entity.sql_parts();
+        let locator = canonical_reference_source_locator_bytes(posting.source_locator)?;
+        let (
+            target_type,
+            raw_name,
+            normalized_name,
+            raw_uuid_claim,
+            resolved_page_id,
+            resolved_block_id,
+        ) = match &posting.target {
+            MaterializedReferenceTarget::PageName {
+                raw_name,
+                normalized_name,
+                resolved_page_id,
+            } => (
+                0_i64,
+                Some(raw_name.as_str()),
+                Some(normalized_name.as_str()),
+                None,
+                resolved_page_id.map(|id| id.as_uuid().as_bytes().to_vec()),
+                None,
+            ),
+            MaterializedReferenceTarget::ExternalUuid {
+                raw_claim,
+                resolved_block_id,
+            } => (
+                1_i64,
+                None,
+                None,
+                Some(raw_claim.as_uuid().as_bytes().to_vec()),
+                None,
+                resolved_block_id.map(|id| id.as_uuid().as_bytes().to_vec()),
+            ),
+        };
+        transaction.execute(
+            "INSERT INTO reference_postings (
+                 source_page_id, source_entity_type, source_entity_id, source_locator,
+                 ordinal, reference_kind, target_type, raw_name, normalized_name,
+                 raw_uuid_claim, resolved_page_id, resolved_block_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                posting.source_page_id.as_uuid().as_bytes().as_slice(),
+                source_entity_type,
+                source_entity_id.as_slice(),
+                locator,
+                i64::from(posting.ordinal),
+                posting.kind.sql_value(),
+                target_type,
+                raw_name,
+                normalized_name,
+                raw_uuid_claim,
+                resolved_page_id,
+                resolved_block_id,
+            ],
+        )?;
+    }
+    for alias in &input.aliases {
+        let (source_entity_type, source_entity_id) = alias.source_entity.sql_parts();
+        let locator = canonical_reference_source_locator_bytes(alias.source_locator)?;
+        transaction.execute(
+            "INSERT INTO reference_alias_declarations (
+                 source_page_id, source_entity_type, source_entity_id, source_locator,
+                 ordinal, raw_alias, normalized_alias
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                alias.source_page_id.as_uuid().as_bytes().as_slice(),
+                source_entity_type,
+                source_entity_id.as_slice(),
+                locator,
+                i64::from(alias.ordinal),
+                &alias.raw_alias,
+                &alias.normalized_alias,
+            ],
+        )?;
+    }
+    for alias in altered_aliases {
+        let mut candidates = prior_alias_candidates.remove(&alias).unwrap_or_default();
+        candidates.retain(|page_id| !sources.contains(page_id));
+        candidates.extend(
+            input
+                .aliases
+                .iter()
+                .filter(|declaration| declaration.normalized_alias == alias)
+                .map(|declaration| declaration.source_page_id),
+        );
+        transaction.execute(
+            "DELETE FROM reference_alias_bindings WHERE normalized_alias = ?1",
+            params![&alias],
+        )?;
+        for (ordinal, page_id) in candidates.into_iter().enumerate() {
+            transaction.execute(
+                "INSERT INTO reference_alias_bindings (
+                     normalized_alias, candidate_ordinal, resolved_page_id, catalog_root_digest
+                 ) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    &alias,
+                    i64::try_from(ordinal).map_err(|_| {
+                        MaterializationError::InvalidInput(
+                            "reference alias candidate ordinal overflowed".into(),
+                        )
+                    })?,
+                    page_id.as_uuid().as_bytes().as_slice(),
+                    post_root_digest.as_bytes().as_slice(),
+                ],
+            )?;
+        }
+    }
+    let coverage_count: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM reference_source_coverage",
+        [],
+        |row| row.get(0),
+    )?;
+    if u64::try_from(coverage_count).ok() != Some(input.post_catalog_root.source_count()) {
+        return Err(MaterializationError::Incomplete(
+            format!(
+                "SQLite reference source coverage {coverage_count} does not match authenticated catalog source count {}",
+                input.post_catalog_root.source_count(),
+            ),
+        ));
+    }
+    Ok((
+        post_root_bytes,
+        post_root_digest,
+        coverage_digest,
+        extractor_stamp_digest,
+    ))
+}
+
 pub(crate) fn apply_change(
     transaction: &Transaction<'_>,
     change: &MaterializationChange,
@@ -2112,11 +2478,20 @@ pub(crate) fn apply_change(
     sequence: u64,
     input_digest: ContentDigest,
     post_frontier_digest: ContentDigest,
+    authenticated_reference: Option<&AuthenticatedReferenceMaterialization>,
 ) -> Result<(), MaterializationError> {
     change.validate_shape()?;
     let effect = SemanticEffect::decode(semantic_effect)
         .map_err(|error| MaterializationError::InvalidInput(error.to_string()))?;
     change.validate_against_effect(&effect)?;
+    if let Some(reference_catalog) = change.reference_catalog() {
+        let authenticated = authenticated_reference.ok_or_else(|| {
+            MaterializationError::Incomplete(
+                "authenticated reference materialization requires accepted event evidence".into(),
+            )
+        })?;
+        reference_catalog.validate_for_authenticated_transition(authenticated, &effect)?;
+    }
     change.validate_preserved_page_metadata(transaction, &effect)?;
     // A block can move between two replacement pages. Keep its inbound refs
     // through every cleanup pass, then remove every old owner before inserting
@@ -2135,34 +2510,103 @@ pub(crate) fn apply_change(
     for page in &change.replacements {
         insert_page(transaction, page)?;
     }
-    transaction.execute(
-        "INSERT INTO materialization_batches (
-             acceptance_sequence, batch_id, input_digest
-         ) VALUES (?1, ?2, ?3)",
-        params![
-            i64::try_from(sequence).map_err(|_| {
-                MaterializationError::Corrupt("acceptance sequence exceeds SQLite".into())
-            })?,
-            change.batch_id.as_uuid().as_bytes().as_slice(),
-            input_digest.as_bytes().as_slice(),
-        ],
-    )?;
-    transaction.execute(
-        "UPDATE materialization_stamp
-         SET acceptance_sequence = ?1,
-             frontier_root_digest = ?2,
-             catalog_root = NULL,
-             catalog_root_digest = NULL,
-             coverage_digest = NULL,
-             extractor_dependency_stamp_digest = NULL
-         WHERE singleton = 1",
-        params![
-            i64::try_from(sequence).map_err(|_| {
-                MaterializationError::Corrupt("acceptance sequence exceeds SQLite".into())
-            })?,
-            post_frontier_digest.as_bytes().as_slice(),
-        ],
-    )?;
+    let reference_values = change
+        .reference_catalog()
+        .map(|input| apply_reference_catalog_change(transaction, input))
+        .transpose()?;
+    let sequence = i64::try_from(sequence)
+        .map_err(|_| MaterializationError::Corrupt("acceptance sequence exceeds SQLite".into()))?;
+    if let Some((catalog_root, catalog_root_digest, coverage_digest, extractor_stamp_digest)) =
+        reference_values
+    {
+        let authenticated = authenticated_reference
+            .expect("reference values require authenticated transition evidence");
+        let catalog_change = postcard::to_allocvec(change.reference_catalog().expect("present"))
+            .map_err(|error| MaterializationError::InvalidInput(error.to_string()))?;
+        let catalog_change_digest = ContentDigest::of(&catalog_change);
+        transaction.execute(
+            "INSERT INTO materialization_batches (
+                 acceptance_sequence, batch_id, input_digest, event_binding_digest,
+                 prior_frontier_root_digest, post_frontier_root_digest,
+                 prior_catalog_root, prior_catalog_root_digest,
+                 post_catalog_root, post_catalog_root_digest,
+                 catalog_change, catalog_change_digest, canonical_input_digest
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                sequence,
+                change.batch_id.as_uuid().as_bytes().as_slice(),
+                input_digest.as_bytes().as_slice(),
+                authenticated.event_binding_digest.as_bytes().as_slice(),
+                authenticated
+                    .prior_frontier_root_digest
+                    .as_bytes()
+                    .as_slice(),
+                authenticated
+                    .post_frontier_root_digest
+                    .as_bytes()
+                    .as_slice(),
+                change
+                    .reference_catalog()
+                    .expect("present")
+                    .prior_catalog_root()
+                    .encode()
+                    .map_err(|error| MaterializationError::InvalidInput(error.to_string()))?,
+                change
+                    .reference_catalog()
+                    .expect("present")
+                    .prior_catalog_root()
+                    .external_digest()
+                    .map_err(|error| MaterializationError::InvalidInput(error.to_string()))?
+                    .as_bytes()
+                    .as_slice(),
+                catalog_root,
+                catalog_root_digest.as_bytes().as_slice(),
+                catalog_change,
+                catalog_change_digest.as_bytes().as_slice(),
+                input_digest.as_bytes().as_slice(),
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE materialization_stamp
+             SET acceptance_sequence = ?1,
+                 frontier_root_digest = ?2,
+                 catalog_root = ?3,
+                 catalog_root_digest = ?4,
+                 coverage_digest = ?5,
+                 extractor_dependency_stamp_digest = ?6
+             WHERE singleton = 1",
+            params![
+                sequence,
+                post_frontier_digest.as_bytes().as_slice(),
+                catalog_root,
+                catalog_root_digest.as_bytes().as_slice(),
+                coverage_digest.as_bytes().as_slice(),
+                extractor_stamp_digest.as_bytes().as_slice(),
+            ],
+        )?;
+    } else {
+        transaction.execute(
+            "INSERT INTO materialization_batches (
+                 acceptance_sequence, batch_id, input_digest
+             ) VALUES (?1, ?2, ?3)",
+            params![
+                sequence,
+                change.batch_id.as_uuid().as_bytes().as_slice(),
+                input_digest.as_bytes().as_slice(),
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE materialization_stamp
+             SET acceptance_sequence = ?1,
+                 frontier_root_digest = ?2,
+                 catalog_root = NULL,
+                 catalog_root_digest = NULL,
+                 coverage_digest = NULL,
+                 extractor_dependency_stamp_digest = NULL
+             WHERE singleton = 1",
+            params![sequence, post_frontier_digest.as_bytes().as_slice()],
+        )?;
+    }
     Ok(())
 }
 
@@ -3340,6 +3784,16 @@ mod tests {
         .unwrap()
     }
 
+    fn empty_reference_catalog_root() -> ReferenceCatalogRootV1 {
+        let page_names = super::super::PageNameOwnershipRootV1::empty();
+        ReferenceCatalogRootV1::empty(
+            &super::super::ReferenceCatalogPolicyV1::default(),
+            &page_names,
+            ContentDigest::of(b"external UUID authority"),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn sqlite_v9_reference_schema_is_exact_strict_and_checked() {
         let connection = Connection::open_in_memory().unwrap();
@@ -3530,7 +3984,10 @@ mod tests {
         let normalized_alias = crate::refs::page_key(&raw_alias);
         let uuid_claim = LogseqUuid::from_uuid(Uuid::from_u128(4));
         let catalog_root = ContentDigest::of(b"catalog root");
+        let root = empty_reference_catalog_root();
         let input = ReferenceCatalogMaterializationInput::new(
+            root.clone(),
+            root,
             vec![MaterializedReferencePosting {
                 source_page_id: source_page,
                 source_entity: MaterializedEntityId::Block(source_block),
@@ -3573,6 +4030,7 @@ mod tests {
                 source_digest: ContentDigest::of(b"source"),
                 extractor_dependency_stamp: extractor_stamp(),
             }],
+            Vec::new(),
         )
         .unwrap();
         assert_eq!(
@@ -3607,7 +4065,10 @@ mod tests {
         };
         assert!(matches!(
             ReferenceCatalogMaterializationInput::new(
+                empty_reference_catalog_root(),
+                empty_reference_catalog_root(),
                 vec![malformed],
+                Vec::new(),
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
@@ -3664,7 +4125,10 @@ mod tests {
         ] {
             assert!(matches!(
                 ReferenceCatalogMaterializationInput::new(
+                    empty_reference_catalog_root(),
+                    empty_reference_catalog_root(),
                     vec![posting],
+                    Vec::new(),
                     Vec::new(),
                     Vec::new(),
                     Vec::new(),
@@ -3804,7 +4268,7 @@ mod tests {
 
     #[test]
     fn materialization_input_schema_refuses_prior_and_future_before_sqlite_write() {
-        assert_eq!(MATERIALIZATION_INPUT_SCHEMA_VERSION, 2);
+        assert_eq!(MATERIALIZATION_INPUT_SCHEMA_VERSION, 3);
         let current = MaterializationChange::new(
             batch_id(500_000),
             vec![page_input(page_id(500_001), "current".into())],
@@ -3839,6 +4303,7 @@ mod tests {
                     1,
                     ContentDigest::of(b"input"),
                     ContentDigest::of(b"next"),
+                    None,
                 ),
                 Err(MaterializationError::InvalidInput(message))
                     if message == format!("unknown materialization input schema {schema_version}")
@@ -3902,6 +4367,7 @@ mod tests {
                 1,
                 change.digest().unwrap(),
                 ContentDigest::of(b"next"),
+                None,
             ),
             Err(MaterializationError::Incomplete(message))
                 if message.contains("lacks prior validated metadata")
@@ -3953,6 +4419,7 @@ mod tests {
                 group as u64 + 1,
                 digest,
                 final_frontier,
+                None,
             )
             .unwrap();
             transaction.commit().unwrap();
