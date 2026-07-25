@@ -18,7 +18,7 @@ use uuid::Uuid;
 use super::{
     AcceptedBatchEvent, BatchId, BlockId, BlockOwner, ContentDigest, DocumentId,
     LogseqIdentityOrigin, LogseqUuid, ManagedPath, ManagedTextKind, PageId, PageState,
-    PolicyGeneratedAnchorReason, ReferenceCatalogRootV1, ReferenceSourceLocatorV1, SemanticEffect,
+    PolicyGeneratedAnchorReason, ReferenceCatalogRootV2, ReferenceSourceLocatorV1, SemanticEffect,
     REFERENCE_CATALOG_EXTRACTOR_VERSION, REFERENCE_CATALOG_POLICY_VERSION,
 };
 
@@ -52,10 +52,10 @@ const REFERENCE_CATALOG_COVERAGE_OVERHEAD_BYTES: usize = 80;
 // the same SQL transaction as the ordinary page materialization.  The SQLite
 // schema stays at v9: these are values for its existing v9 tables, not a new
 // user-data format.
-const MATERIALIZATION_INPUT_SCHEMA_VERSION: u32 = 3;
-pub(crate) const REFERENCE_EXTRACTOR_DEPENDENCY_STAMP_SCHEMA_VERSION: u32 = 1;
+const MATERIALIZATION_INPUT_SCHEMA_VERSION: u32 = 4;
+pub(crate) const REFERENCE_EXTRACTOR_DEPENDENCY_STAMP_SCHEMA_VERSION: u32 = 2;
 const REFERENCE_EXTRACTOR_DEPENDENCY_STAMP_DOMAIN: &[u8] =
-    b"tine/sqlite-reference-extractor-dependency-stamp/v1";
+    b"tine/sqlite-reference-extractor-dependency-stamp/v2";
 
 pub(crate) const MATERIALIZATION_STAMP_DDL: &str = "CREATE TABLE materialization_stamp (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -906,8 +906,8 @@ pub(crate) struct AuthenticatedReferenceMaterialization {
     pub(crate) event_binding_digest: ContentDigest,
     pub(crate) prior_frontier_root_digest: ContentDigest,
     pub(crate) post_frontier_root_digest: ContentDigest,
-    pub(crate) prior_catalog_root: ReferenceCatalogRootV1,
-    pub(crate) post_catalog_root: ReferenceCatalogRootV1,
+    pub(crate) prior_catalog_root: ReferenceCatalogRootV2,
+    pub(crate) post_catalog_root: ReferenceCatalogRootV2,
 }
 
 /// Fully validated catalog rows that may be projected only with matching
@@ -915,8 +915,8 @@ pub(crate) struct AuthenticatedReferenceMaterialization {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ReferenceCatalogMaterializationInput {
-    prior_catalog_root: ReferenceCatalogRootV1,
-    post_catalog_root: ReferenceCatalogRootV1,
+    prior_catalog_root: ReferenceCatalogRootV2,
+    post_catalog_root: ReferenceCatalogRootV2,
     postings: Vec<MaterializedReferencePosting>,
     aliases: Vec<MaterializedAliasDeclaration>,
     name_bindings: Vec<MaterializedReferenceNameBinding>,
@@ -928,8 +928,8 @@ pub(crate) struct ReferenceCatalogMaterializationInput {
 
 impl ReferenceCatalogMaterializationInput {
     pub(crate) fn new(
-        prior_catalog_root: ReferenceCatalogRootV1,
-        post_catalog_root: ReferenceCatalogRootV1,
+        prior_catalog_root: ReferenceCatalogRootV2,
+        post_catalog_root: ReferenceCatalogRootV2,
         mut postings: Vec<MaterializedReferencePosting>,
         mut aliases: Vec<MaterializedAliasDeclaration>,
         mut name_bindings: Vec<MaterializedReferenceNameBinding>,
@@ -960,7 +960,7 @@ impl ReferenceCatalogMaterializationInput {
         Ok(input)
     }
 
-    pub(crate) fn prior_catalog_root(&self) -> &ReferenceCatalogRootV1 {
+    pub(crate) fn prior_catalog_root(&self) -> &ReferenceCatalogRootV2 {
         &self.prior_catalog_root
     }
 
@@ -1277,6 +1277,12 @@ impl MaterializationChange {
 
     pub(crate) fn reference_catalog(&self) -> Option<&ReferenceCatalogMaterializationInput> {
         self.reference_catalog.as_ref()
+    }
+
+    pub(crate) fn without_reference_catalog(mut self) -> Result<Self, MaterializationError> {
+        self.reference_catalog = None;
+        self.validate_shape()?;
+        Ok(self)
     }
 
     pub fn digest(&self) -> Result<ContentDigest, MaterializationError> {
@@ -3784,9 +3790,9 @@ mod tests {
         .unwrap()
     }
 
-    fn empty_reference_catalog_root() -> ReferenceCatalogRootV1 {
+    fn empty_reference_catalog_root() -> ReferenceCatalogRootV2 {
         let page_names = super::super::PageNameOwnershipRootV1::empty();
-        ReferenceCatalogRootV1::empty(
+        ReferenceCatalogRootV2::empty(
             &super::super::ReferenceCatalogPolicyV1::default(),
             &page_names,
             ContentDigest::of(b"external UUID authority"),
@@ -4268,7 +4274,7 @@ mod tests {
 
     #[test]
     fn materialization_input_schema_refuses_prior_and_future_before_sqlite_write() {
-        assert_eq!(MATERIALIZATION_INPUT_SCHEMA_VERSION, 3);
+        assert_eq!(MATERIALIZATION_INPUT_SCHEMA_VERSION, 4);
         let current = MaterializationChange::new(
             batch_id(500_000),
             vec![page_input(page_id(500_001), "current".into())],

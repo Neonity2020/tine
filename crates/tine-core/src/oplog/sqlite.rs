@@ -56,7 +56,7 @@ use super::{
 };
 
 pub const SQLITE_APPLICATION_ID: u32 = 0x5449_4e45;
-pub const SQLITE_SCHEMA_VERSION: u32 = 9;
+pub const SQLITE_SCHEMA_VERSION: u32 = 10;
 pub const TAIL_MAX_BYTES: usize = 16 * 1024 * 1024;
 pub const TAIL_MAX_BATCHES: usize = 10_000;
 
@@ -1120,6 +1120,7 @@ impl FrontierRenamePlan {
 pub struct FrontierReferenceQuery<'a> {
     database: &'a SqliteFrontier,
     engine: &'a ShardedHotEngine,
+    base_catalog_root: super::ReferenceCatalogRootV2,
     tail_sources: BTreeMap<PageId, Option<super::ReferenceSourcePostingV1>>,
     instrumentation: ReferenceQueryInstrumentation,
 }
@@ -1726,7 +1727,7 @@ impl SqliteFrontier {
 
     fn authenticated_reference_catalog_root(
         &self,
-    ) -> Result<super::ReferenceCatalogRootV1, ProjectionError> {
+    ) -> Result<super::ReferenceCatalogRootV2, ProjectionError> {
         let frontier = read_frontier_root(&self.connection)?;
         let frontier_bytes = canonical_frontier_root_bytes(&frontier)?;
         let stamp: (
@@ -1767,7 +1768,7 @@ impl SqliteFrontier {
                 "SQLite frontier has no authenticated reference catalog materialization".into(),
             ));
         };
-        let root = super::ReferenceCatalogRootV1::decode(&root_bytes)
+        let root = super::ReferenceCatalogRootV2::decode(&root_bytes)
             .map_err(|error| ProjectionError::Materialization(error.to_string()))?;
         let expected = frontier.reference_catalog_root();
         if &root != expected
@@ -1864,17 +1865,20 @@ impl SqliteFrontier {
                     ))
                 })?;
             if let Some(engine) = reference_engine {
-                if change.reference_catalog().is_none() {
-                    let prior = decode_frontier_root(&stored.prior_frontier_root)?;
-                    let post = decode_frontier_root(&stored.post_frontier_root)?;
-                    change = attach_authenticated_reference_catalog_at(
-                        engine,
-                        &stored.semantic_effect,
-                        &prior,
-                        &post,
-                        change,
-                    )?;
-                }
+                let prior = decode_frontier_root(&stored.prior_frontier_root)?;
+                let post = decode_frontier_root(&stored.post_frontier_root)?;
+                change = attach_authenticated_reference_catalog_at(
+                    engine,
+                    &stored.semantic_effect,
+                    &prior,
+                    &post,
+                    change.without_reference_catalog()?,
+                )?;
+            } else if change.reference_catalog().is_some() {
+                return Err(ProjectionError::Materialization(
+                    "reference catalog rebuild input requires authenticated engine authority"
+                        .into(),
+                ));
             }
             let input_digest =
                 change.validate_against_stored(stored.batch_id, &stored.semantic_effect)?;
@@ -5470,7 +5474,7 @@ impl SqliteFrontier {
     ) -> Result<FrontierReferenceQuery<'a>, ProjectionError> {
         let source = RebuildSource::new(engine, store)?;
         let mut expected = self.frontier_root()?;
-        let _base_catalog_root = self.authenticated_reference_catalog_root()?;
+        let base_catalog_root = self.authenticated_reference_catalog_root()?;
         let accepted = engine
             .accepted_frontier_root()
             .map_err(|error| ProjectionError::Materialization(error.to_string()))?;
@@ -5519,6 +5523,7 @@ impl SqliteFrontier {
         Ok(FrontierReferenceQuery {
             database: self,
             engine,
+            base_catalog_root,
             instrumentation: ReferenceQueryInstrumentation {
                 tail_source_postings: tail_sources.len(),
                 ..ReferenceQueryInstrumentation::default()
@@ -5562,13 +5567,38 @@ impl FrontierReferenceQuery<'_> {
                 ],
                 |row| row.get::<_, Vec<u8>>(0),
             )?;
+            let mut sqlite_for_name = BTreeSet::new();
             for row in rows {
-                candidates.insert(decode_reference_page_id(&row?)?);
-                if candidates.len() > hard_limit {
+                sqlite_for_name.insert(decode_reference_page_id(&row?)?);
+                if sqlite_for_name.len() > hard_limit {
                     return Err(ProjectionError::Materialization(
                         "reference query candidate source limit exceeded".into(),
                     ));
                 }
+            }
+            let logical = super::LogicalPageName::parse(name.clone())
+                .map_err(|error| ProjectionError::Materialization(error.to_string()))?;
+            let authenticated = self
+                .engine
+                .reference_candidates_at(
+                    &self.base_catalog_root,
+                    super::reference_catalog::ReferenceCandidateTargetV2::PageName(
+                        logical.key_digest(),
+                    ),
+                    hard_limit,
+                )
+                .map_err(|error| ProjectionError::Materialization(error.to_string()))?;
+            if sqlite_for_name != authenticated {
+                return Err(ProjectionError::Materialization(
+                    "SQLite page-reference candidates differ from the authenticated reverse catalog"
+                        .into(),
+                ));
+            }
+            candidates.extend(authenticated);
+            if candidates.len() > hard_limit {
+                return Err(ProjectionError::Materialization(
+                    "reference query candidate source limit exceeded".into(),
+                ));
             }
         }
         Ok(candidates)
@@ -5604,7 +5634,21 @@ impl FrontierReferenceQuery<'_> {
                 ));
             }
         }
-        Ok(candidates)
+        let authenticated = self
+            .engine
+            .reference_candidates_at(
+                &self.base_catalog_root,
+                super::reference_catalog::ReferenceCandidateTargetV2::BlockUuid(logseq_uuid),
+                hard_limit,
+            )
+            .map_err(|error| ProjectionError::Materialization(error.to_string()))?;
+        if candidates != authenticated {
+            return Err(ProjectionError::Materialization(
+                "SQLite block-reference candidates differ from the authenticated reverse catalog"
+                    .into(),
+            ));
+        }
+        Ok(authenticated)
     }
 
     fn sqlite_alias_candidates(
@@ -5637,7 +5681,24 @@ impl FrontierReferenceQuery<'_> {
                 "reference alias candidate source limit exceeded".into(),
             ));
         }
-        Ok(candidates)
+        let logical = super::LogicalPageName::parse(normalized_alias.to_owned())
+            .map_err(|error| ProjectionError::Materialization(error.to_string()))?;
+        let authenticated = self
+            .engine
+            .reference_candidates_at(
+                &self.base_catalog_root,
+                super::reference_catalog::ReferenceCandidateTargetV2::PageAlias(
+                    logical.key_digest(),
+                ),
+                super::MAX_MATERIALIZATION_QUERY_ROWS,
+            )
+            .map_err(|error| ProjectionError::Materialization(error.to_string()))?;
+        if candidates != authenticated {
+            return Err(ProjectionError::Materialization(
+                "SQLite alias bindings differ from the authenticated reverse catalog".into(),
+            ));
+        }
+        Ok(authenticated)
     }
 
     fn current_posting(
@@ -5916,11 +5977,15 @@ impl FrontierReferenceQuery<'_> {
         new_name: super::LogicalPageName,
         new_path: super::ManagedPath,
     ) -> Result<FrontierRenamePlan, ProjectionError> {
-        let target_page_id = self.resolve_name(old_name)?.ok_or_else(|| {
-            ProjectionError::Materialization(
-                "rename target has no authenticated exact page-name owner".into(),
-            )
-        })?;
+        let target_page_id = self
+            .engine
+            .resolve_logical_page_name(old_name)
+            .map_err(|error| ProjectionError::Materialization(error.to_string()))?
+            .ok_or_else(|| {
+                ProjectionError::Materialization(
+                    "rename target has no authenticated exact page-name owner".into(),
+                )
+            })?;
         let results = self.references_to_page_name_inner(
             old_name,
             super::MAX_MATERIALIZATION_QUERY_ROWS,
@@ -7151,6 +7216,15 @@ mod tests {
             .hits
             .iter()
             .all(|hit| hit.source_page_id == source_ids.page));
+        assert!(matches!(
+            query.plan_page_rename(
+                &old_alias,
+                crate::oplog::LogicalPageName::parse("Alias Must Not Rename").unwrap(),
+                ManagedPath::parse("nested/alias-must-not-rename.md").unwrap(),
+            ),
+            Err(ProjectionError::Materialization(message))
+                if message.contains("no authenticated exact page-name owner")
+        ));
         let source_posting = engine
             .reference_source_posting(source_ids.page)
             .unwrap()
@@ -7312,6 +7386,218 @@ mod tests {
     }
 
     #[test]
+    fn frontier_reference_query_detects_posting_and_alias_binding_tamper_and_reads_tail() {
+        let ids = TestIds::new(1_775);
+        let dir = TestDir::new("frontier-reference-row-tamper");
+        let engine_store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
+        let store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
+        let mut engine =
+            ShardedHotEngine::with_archive_store(engine_store, ids.lineage, ids.catalog);
+        let mut database = open_test_projection(
+            &dir.path().join("frontier.sqlite"),
+            ids.claim(),
+            RebuildSource::new(&engine, &store).unwrap(),
+        )
+        .unwrap()
+        .database;
+        let content = "aliases:: Old Owner\n[[Target]]";
+        let prepared = engine
+            .prepare_bootstrap_transaction(
+                author(1_776),
+                &root_transaction_named(ids, "nested/tamper/owner.md", "Owner", content),
+            )
+            .unwrap();
+        publish_and_stage_archive(&mut engine, &store, &prepared);
+        let event =
+            AcceptedBatchEvent::from_accepted(&engine, &store, prepared.manifest().batch_id())
+                .unwrap();
+        let base = rich_materialization(
+            &event,
+            ids,
+            "nested/tamper/owner.md",
+            ManagedTextKind::Page,
+            "Owner",
+            content,
+        );
+        database
+            .apply_authenticated_reference_catalog_materialized_accepted(
+                &event,
+                base.clone(),
+                &engine,
+            )
+            .unwrap();
+        let target = crate::oplog::LogicalPageName::parse("Target").unwrap();
+        let old_owner = crate::oplog::LogicalPageName::parse("Old Owner").unwrap();
+        let target_key = crate::refs::page_key("Target");
+        let old_owner_key = crate::refs::page_key("Old Owner");
+
+        assert_eq!(
+            database
+                .frontier_reference_query(&engine, &store)
+                .unwrap()
+                .references_to_page_name(&target, crate::oplog::MAX_MATERIALIZATION_QUERY_ROWS,)
+                .unwrap()
+                .hits
+                .len(),
+            1
+        );
+        for invalid_limit in [0, crate::oplog::MAX_MATERIALIZATION_QUERY_ROWS + 1] {
+            assert!(database
+                .frontier_reference_query(&engine, &store)
+                .unwrap()
+                .references_to_page_name(&target, invalid_limit)
+                .is_err());
+        }
+
+        database
+            .connection
+            .execute(
+                "DELETE FROM reference_postings WHERE normalized_name = ?1",
+                params![target_key],
+            )
+            .unwrap();
+        assert!(matches!(
+            database
+                .frontier_reference_query(&engine, &store)
+                .unwrap()
+                .references_to_page_name(&target, 16),
+            Err(ProjectionError::Materialization(message))
+                if message.contains("authenticated reverse catalog")
+        ));
+        database
+            .rebuild_authenticated_reference_catalog_materialization(vec![base.clone()], &engine)
+            .unwrap();
+
+        database
+            .connection
+            .execute(
+                "UPDATE reference_postings
+                 SET normalized_name = 'tampered'
+                 WHERE normalized_name = ?1",
+                params![target_key],
+            )
+            .unwrap();
+        assert!(database
+            .frontier_reference_query(&engine, &store)
+            .unwrap()
+            .references_to_page_name(&target, 16)
+            .is_err());
+        database
+            .rebuild_authenticated_reference_catalog_materialization(vec![base.clone()], &engine)
+            .unwrap();
+
+        let inserted_source = PageId::from_uuid(uuid(1_799));
+        database
+            .connection
+            .execute(
+                "INSERT INTO reference_postings (
+                     source_page_id, source_entity_type, source_entity_id, source_locator,
+                     ordinal, reference_kind, target_type, raw_name, normalized_name,
+                     raw_uuid_claim, resolved_page_id, resolved_block_id
+                 )
+                 SELECT ?1, source_entity_type, source_entity_id, source_locator,
+                        ordinal, reference_kind, target_type, raw_name, normalized_name,
+                        raw_uuid_claim, resolved_page_id, resolved_block_id
+                 FROM reference_postings WHERE normalized_name = ?2 LIMIT 1",
+                params![inserted_source.as_uuid().as_bytes().as_slice(), target_key],
+            )
+            .unwrap();
+        assert!(database
+            .frontier_reference_query(&engine, &store)
+            .unwrap()
+            .references_to_page_name(&target, 16)
+            .is_err());
+        database
+            .rebuild_authenticated_reference_catalog_materialization(vec![base.clone()], &engine)
+            .unwrap();
+
+        database
+            .connection
+            .execute(
+                "DELETE FROM reference_alias_bindings WHERE normalized_alias = ?1",
+                params![old_owner_key],
+            )
+            .unwrap();
+        assert!(matches!(
+            database
+                .frontier_reference_query(&engine, &store)
+                .unwrap()
+                .references_to_page_name(&old_owner, 16),
+            Err(ProjectionError::Materialization(message))
+                if message.contains("alias bindings")
+        ));
+        database
+            .rebuild_authenticated_reference_catalog_materialization(vec![base.clone()], &engine)
+            .unwrap();
+
+        database
+            .connection
+            .execute(
+                "UPDATE reference_alias_bindings
+                 SET normalized_alias = 'tampered'
+                 WHERE normalized_alias = ?1",
+                params![old_owner_key],
+            )
+            .unwrap();
+        assert!(database
+            .frontier_reference_query(&engine, &store)
+            .unwrap()
+            .references_to_page_name(&old_owner, 16)
+            .is_err());
+        database
+            .rebuild_authenticated_reference_catalog_materialization(vec![base.clone()], &engine)
+            .unwrap();
+
+        database
+            .connection
+            .execute(
+                "INSERT INTO reference_alias_bindings (
+                     normalized_alias, candidate_ordinal, resolved_page_id, catalog_root_digest
+                 )
+                 SELECT normalized_alias, candidate_ordinal + 1000000, ?1, catalog_root_digest
+                 FROM reference_alias_bindings WHERE normalized_alias = ?2 LIMIT 1",
+                params![
+                    inserted_source.as_uuid().as_bytes().as_slice(),
+                    old_owner_key
+                ],
+            )
+            .unwrap();
+        assert!(database
+            .frontier_reference_query(&engine, &store)
+            .unwrap()
+            .references_to_page_name(&old_owner, 16)
+            .is_err());
+        database
+            .rebuild_authenticated_reference_catalog_materialization(vec![base], &engine)
+            .unwrap();
+
+        let tail_content = "aliases:: Old Owner\n[[Target]] and [[Tail Target]]";
+        let tail = engine
+            .prepare_bootstrap_transaction(
+                author(1_777),
+                &OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
+                    block: BlockLocation {
+                        block_id: ids.block,
+                        home_document_id: ids.document,
+                    },
+                    content: tail_content.into(),
+                }])
+                .unwrap(),
+            )
+            .unwrap();
+        publish_and_stage_archive(&mut engine, &store, &tail);
+        let tail_target = crate::oplog::LogicalPageName::parse("Tail Target").unwrap();
+        let results = database
+            .frontier_reference_query(&engine, &store)
+            .unwrap()
+            .references_to_page_name(&tail_target, 16)
+            .unwrap();
+        assert_eq!(results.hits.len(), 1);
+        assert_eq!(results.hits[0].source_page_id, ids.page);
+        assert_eq!(results.instrumentation.tail_source_postings, 1);
+    }
+
+    #[test]
     fn rebuild_materialization_rebinds_authenticated_reference_transition() {
         let ids = TestIds::new(1_780);
         let dir = TestDir::new("rebuild-authenticated-reference-catalog");
@@ -7342,7 +7628,52 @@ mod tests {
         database
             .apply_materialized_accepted(&event, &change)
             .unwrap();
-        assert_eq!(database.rebuild_materialization(vec![change]).unwrap(), 1);
+        let post_root = event.post_frontier_root().reference_catalog_root().clone();
+        let forged_reference =
+            super::super::sqlite_materialization::ReferenceCatalogMaterializationInput::new(
+                event.prior_frontier_root()
+                    .reference_catalog_root()
+                    .clone(),
+                post_root.clone(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                vec![
+                    super::super::sqlite_materialization::SourceCoverageFacet {
+                        source_page_id: ids.page,
+                        source_digest: ContentDigest::of(b"caller-forged-source"),
+                        extractor_dependency_stamp:
+                            super::super::sqlite_materialization::ReferenceExtractorDependencyStamp::new(
+                                post_root.extractor_digest(),
+                                post_root.policy_digest(),
+                            )
+                            .unwrap(),
+                    },
+                ],
+                Vec::new(),
+            )
+            .unwrap();
+        let forged = MaterializationChange::new(
+            event.batch_id(),
+            change.replacements().to_vec(),
+            change.deletions().to_vec(),
+        )
+        .unwrap()
+        .with_authenticated_reference_catalog(forged_reference)
+        .unwrap();
+        assert!(matches!(
+            database.rebuild_materialization(vec![forged.clone()]),
+            Err(ProjectionError::Materialization(message))
+                if message.contains("requires authenticated engine authority")
+        ));
+        assert_eq!(
+            database
+                .rebuild_authenticated_reference_catalog_materialization(vec![forged], &engine)
+                .unwrap(),
+            1
+        );
         let mut query = database.frontier_reference_query(&engine, &store).unwrap();
         let hits = query
             .references_to_page_name(&crate::oplog::LogicalPageName::parse("Target").unwrap(), 16)

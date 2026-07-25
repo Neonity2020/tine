@@ -62,7 +62,7 @@ const LOGSEQ_CLAIM_INDEX_DIR: &str = "logseq-uuid-claim-index-v1";
 const PORTABLE_PATH_INDEX_DIR: &str = "portable-path-index-v1";
 #[allow(dead_code)] // opened by the intentionally unwired P2N2 foundation
 const PAGE_NAME_OWNERSHIP_INDEX_DIR: &str = "page-name-ownership-index-v1";
-const REFERENCE_CATALOG_DIR: &str = "reference-catalog-v1";
+const REFERENCE_CATALOG_DIR: &str = "reference-catalog-v2";
 const PROJECTION_WORK_DIR: &str = "projection-work-index-v1";
 const BLOCK_CLAIM_INDEX_SCHEMA_VERSION: u32 = 1;
 const BLOCK_CLAIM_RADIX_DEPTH: u8 = 32;

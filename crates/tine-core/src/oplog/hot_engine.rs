@@ -27,9 +27,10 @@ use super::portable_path_index::{
     PortablePathReleased,
 };
 use super::reference_catalog::{
-    affected_reference_sources, reference_source_is_org, ReferenceCatalogCandidateV1,
-    ReferenceCatalogDeltaV1, ReferenceCatalogPolicyV1, ReferenceCatalogRootV1,
-    ReferenceCatalogStateV1, ReferenceCatalogStore, ReferenceSourceBlockV1, ReferenceSourcePageV1,
+    affected_reference_sources, reference_source_is_org, ReferenceCandidateTargetV2,
+    ReferenceCatalogCandidateV2, ReferenceCatalogDeltaV2, ReferenceCatalogPolicyV1,
+    ReferenceCatalogRootV2, ReferenceCatalogStateV2, ReferenceCatalogStore, ReferenceSourceBlockV1,
+    ReferenceSourcePageV1,
 };
 #[cfg(test)]
 use super::reference_catalog::{
@@ -69,11 +70,11 @@ const MAX_TRANSACTION_OPERATIONS: usize = 100_000;
 const MAX_DOCUMENT_ENTRIES: usize = 1_000_000;
 const MAX_HOT_NON_CATALOG_DOCUMENTS: usize = 64;
 const CRDT_UPDATE_PAYLOAD_SCHEMA_VERSION: u32 = 7;
-const ENGINE_HISTORY_SCHEMA_VERSION: u32 = 9;
+const ENGINE_HISTORY_SCHEMA_VERSION: u32 = 10;
 const BLOCK_CLAIM_RECORD_SCHEMA_VERSION: u32 = 2;
 const LOGSEQ_CLAIM_RECORD_SCHEMA_VERSION: u32 = 1;
-const ACCEPTED_EVIDENCE_SCHEMA_VERSION: u32 = 5;
-const ACCEPTED_FRONTIER_ROOT_SCHEMA_VERSION: u32 = 4;
+const ACCEPTED_EVIDENCE_SCHEMA_VERSION: u32 = 6;
+const ACCEPTED_FRONTIER_ROOT_SCHEMA_VERSION: u32 = 5;
 const MAX_EPHEMERAL_BLOCK_CLAIMS: usize = 4_096;
 const MAX_EPHEMERAL_LOGSEQ_CLAIMS: usize = 4_096;
 const MAX_EPHEMERAL_PORTABLE_PATHS: usize = 4_096;
@@ -1337,7 +1338,7 @@ pub struct AcceptedBatchEvidence {
     prior_frontier_root: AcceptedFrontierRoot,
     post_frontier_root: AcceptedFrontierRoot,
     affected_documents: Vec<DocumentDependencies>,
-    reference_catalog_delta: ReferenceCatalogDeltaV1,
+    reference_catalog_delta: ReferenceCatalogDeltaV2,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1362,7 +1363,7 @@ pub struct AcceptedFrontierRoot {
     // causal dot, and authenticated sparse-clock root.
     batch_map_root_key: Option<[u8; 16]>,
     batch_map_root_digest: ContentDigest,
-    reference_catalog_root: ReferenceCatalogRootV1,
+    reference_catalog_root: ReferenceCatalogRootV2,
     state_digest: ContentDigest,
     scratch_root: Option<super::scratch_store::ScratchLsmRoot>,
 }
@@ -1412,7 +1413,7 @@ impl AcceptedBatchEvidence {
             prior_frontier_root,
             post_frontier_root,
             affected_documents,
-            reference_catalog_delta: ReferenceCatalogDeltaV1::empty_transition(
+            reference_catalog_delta: ReferenceCatalogDeltaV2::empty_transition(
                 reference_catalog_root,
             ),
         }
@@ -1465,7 +1466,7 @@ impl AcceptedBatchEvidence {
         &self.affected_documents
     }
 
-    pub const fn reference_catalog_delta(&self) -> &ReferenceCatalogDeltaV1 {
+    pub const fn reference_catalog_delta(&self) -> &ReferenceCatalogDeltaV2 {
         &self.reference_catalog_delta
     }
 
@@ -1511,7 +1512,7 @@ impl AcceptedFrontierRoot {
         self.state_digest
     }
 
-    pub const fn reference_catalog_root(&self) -> &ReferenceCatalogRootV1 {
+    pub const fn reference_catalog_root(&self) -> &ReferenceCatalogRootV2 {
         &self.reference_catalog_root
     }
 
@@ -1828,7 +1829,7 @@ struct ColdHistoryRecord {
     page_names: super::object_store::PageNameDurableBinding,
     logseq_claim_root: LogseqClaimIndexRoot,
     reference_catalog_policy: ReferenceCatalogPolicyV1,
-    reference_catalog_root: ReferenceCatalogRootV1,
+    reference_catalog_root: ReferenceCatalogRootV2,
     status: ArchiveStatus,
 }
 
@@ -2218,7 +2219,7 @@ pub struct ShardedHotEngine {
     page_name_root: PageNameOwnershipRootV1,
     ephemeral_page_names: EphemeralPageNameOwnershipStateV1,
     page_name_conflicts: BTreeMap<ContentDigest, PageNameConflictEvidenceV1>,
-    reference_catalog: ReferenceCatalogStateV1,
+    reference_catalog: ReferenceCatalogStateV2,
     fatal_evidence: Option<ImmutableHomeEvidence>,
     fatal_handle: Option<FatalEvidenceHandle>,
     visible_documents: BTreeMap<DocumentId, LoroDoc>,
@@ -2282,7 +2283,7 @@ impl ShardedHotEngine {
     ) -> Self {
         let page_name_root = PageNameOwnershipRootV1::empty();
         let logseq_claim_root = LogseqClaimIndexRoot::empty();
-        let reference_catalog = ReferenceCatalogStateV1::empty(
+        let reference_catalog = ReferenceCatalogStateV2::empty(
             ReferenceCatalogPolicyV1::default(),
             &page_name_root,
             logseq_claim_root.digest(),
@@ -2636,7 +2637,7 @@ impl ShardedHotEngine {
                                     )
                                 })?;
                             engine.reference_catalog =
-                                ReferenceCatalogStateV1::restore_recovery_required(
+                                ReferenceCatalogStateV2::restore_recovery_required(
                                     record.reference_catalog_policy,
                                     record.reference_catalog_root,
                                     &record.page_names.ownership_root,
@@ -2858,7 +2859,7 @@ impl ShardedHotEngine {
             ));
         }
         let reference_store = self.reference_catalog.store_handle();
-        self.reference_catalog = ReferenceCatalogStateV1::empty(
+        self.reference_catalog = ReferenceCatalogStateV2::empty(
             policy,
             &self.page_name_root,
             self.logseq_claim_root.digest(),
@@ -3225,7 +3226,7 @@ impl ShardedHotEngine {
         replacements: &BTreeMap<DocumentId, EngineDocument>,
         replacement_heads: &BTreeMap<DocumentId, BTreeSet<BatchId>>,
         candidate_roots: &ScratchRoots,
-        reference_catalog_delta: &ReferenceCatalogDeltaV1,
+        reference_catalog_delta: &ReferenceCatalogDeltaV2,
     ) -> Result<
         (
             Option<BTreeMap<DocumentId, DocumentDependencies>>,
@@ -3562,7 +3563,7 @@ impl ShardedHotEngine {
         Ok(&self.page_name_root)
     }
 
-    pub fn reference_catalog_root(&self) -> Result<&ReferenceCatalogRootV1, EngineError> {
+    pub fn reference_catalog_root(&self) -> Result<&ReferenceCatalogRootV2, EngineError> {
         self.ensure_not_blocked()?;
         Ok(self.reference_catalog.root())
     }
@@ -3583,12 +3584,24 @@ impl ShardedHotEngine {
     /// SQLite/Markdown.
     pub(crate) fn reference_source_posting_at(
         &self,
-        root: &ReferenceCatalogRootV1,
+        root: &ReferenceCatalogRootV2,
         page_id: PageId,
     ) -> Result<Option<super::ReferenceSourcePostingV1>, EngineError> {
         self.ensure_not_blocked()?;
         self.reference_catalog
             .posting_at_root(root, page_id)
+            .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))
+    }
+
+    pub(crate) fn reference_candidates_at(
+        &self,
+        root: &ReferenceCatalogRootV2,
+        target: ReferenceCandidateTargetV2,
+        limit: usize,
+    ) -> Result<BTreeSet<PageId>, EngineError> {
+        self.ensure_not_blocked()?;
+        self.reference_catalog
+            .reverse_candidates_at_root(root, target, limit)
             .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))
     }
 
@@ -7320,7 +7333,7 @@ impl ShardedHotEngine {
         status: ArchiveStatus,
         binding: super::object_store::EngineHistoryBinding,
         logseq_claim_root: LogseqClaimIndexRoot,
-        reference_catalog_root: ReferenceCatalogRootV1,
+        reference_catalog_root: ReferenceCatalogRootV2,
     ) -> Result<(), EngineError> {
         if matches!(status, ArchiveStatus::Staged) {
             return Err(EngineError::Archive(
@@ -9218,7 +9231,7 @@ impl ShardedHotEngine {
         observations: &ValidatedReferenceSourceObservations<'_>,
         page_name_root: &PageNameOwnershipRootV1,
         logseq_claim_root: LogseqClaimIndexRoot,
-    ) -> Result<ReferenceCatalogCandidateV1, EngineError> {
+    ) -> Result<ReferenceCatalogCandidateV2, EngineError> {
         #[cfg(test)]
         let source_started = Instant::now();
         let affected = affected_reference_sources(effect);
@@ -9355,7 +9368,7 @@ impl ShardedHotEngine {
         }
     }
 
-    fn commit_reference_catalog_updates(&mut self, candidate: ReferenceCatalogCandidateV1) {
+    fn commit_reference_catalog_updates(&mut self, candidate: ReferenceCatalogCandidateV2) {
         self.reference_catalog.commit(candidate);
     }
 
@@ -12277,7 +12290,7 @@ fn decode_accepted_evidence(bytes: &[u8]) -> Result<AcceptedBatchEvidence, Engin
 }
 
 fn empty_accepted_frontier_root() -> AcceptedFrontierRoot {
-    let reference_catalog_root = ReferenceCatalogRootV1::empty(
+    let reference_catalog_root = ReferenceCatalogRootV2::empty(
         &ReferenceCatalogPolicyV1::default(),
         &PageNameOwnershipRootV1::empty(),
         LogseqClaimIndexRoot::empty().digest(),
@@ -12287,7 +12300,7 @@ fn empty_accepted_frontier_root() -> AcceptedFrontierRoot {
 }
 
 fn empty_accepted_frontier_root_with_catalog(
-    reference_catalog_root: ReferenceCatalogRootV1,
+    reference_catalog_root: ReferenceCatalogRootV2,
 ) -> AcceptedFrontierRoot {
     let mut state_bytes = b"tine/oplog/accepted-frontier/v4/empty\0".to_vec();
     state_bytes.extend_from_slice(
@@ -12323,7 +12336,7 @@ fn next_accepted_frontier_root(
     document_map_root_digest: ContentDigest,
     batch_map_root_key: Option<[u8; 16]>,
     batch_map_root_digest: ContentDigest,
-    reference_catalog_root: ReferenceCatalogRootV1,
+    reference_catalog_root: ReferenceCatalogRootV2,
     scratch_root: Option<super::scratch_store::ScratchLsmRoot>,
 ) -> Result<AcceptedFrontierRoot, EngineError> {
     validate_accepted_frontier_root(prior)?;
@@ -12817,7 +12830,7 @@ fn new_history_record(
     binding: super::object_store::EngineHistoryBinding,
     logseq_claim_root: LogseqClaimIndexRoot,
     reference_catalog_policy: ReferenceCatalogPolicyV1,
-    reference_catalog_root: ReferenceCatalogRootV1,
+    reference_catalog_root: ReferenceCatalogRootV2,
     status: ArchiveStatus,
 ) -> ColdHistoryRecord {
     ColdHistoryRecord {
@@ -12925,7 +12938,7 @@ fn validate_history_catalog(
             ArchiveStatus::Accepted { evidence, .. } => {
                 let initial_root = (!accepted_transition_seen)
                     .then(|| {
-                        ReferenceCatalogRootV1::empty_for_authority_digests(
+                        ReferenceCatalogRootV2::empty_for_authority_digests(
                             &record.reference_catalog_policy,
                             PageNameOwnershipRootV1::empty()
                                 .external_digest()
@@ -15207,7 +15220,7 @@ mod validation_tests {
         ephemeral_page_names: EphemeralPageNameOwnershipStateV1,
         page_name_conflicts: BTreeMap<ContentDigest, PageNameConflictEvidenceV1>,
         reference_catalog_policy: ReferenceCatalogPolicyV1,
-        reference_catalog_root: ReferenceCatalogRootV1,
+        reference_catalog_root: ReferenceCatalogRootV2,
         reference_catalog_hot_entries: usize,
         fatal_evidence: Option<ImmutableHomeEvidence>,
         fatal_handle: Option<FatalEvidenceHandle>,
@@ -19904,7 +19917,7 @@ mod validation_tests {
         let left_then_right = deliver(left.manifest().batch_id(), right.manifest().batch_id());
         let right_then_left = deliver(right.manifest().batch_id(), left.manifest().batch_id());
         assert_eq!(left_then_right, right_then_left);
-        assert_eq!(ENGINE_HISTORY_SCHEMA_VERSION, 9);
+        assert_eq!(ENGINE_HISTORY_SCHEMA_VERSION, 10);
         assert_eq!(
             super::super::page_name_index::PAGE_NAME_OWNERSHIP_ROOT_SCHEMA_VERSION,
             1
@@ -20686,7 +20699,7 @@ mod replay_benchmark {
 
         let mut tampered = engine.cold_history_record(batch_id).unwrap().unwrap();
         tampered.generation = 1;
-        let arbitrary_prior = ReferenceCatalogRootV1::empty(
+        let arbitrary_prior = ReferenceCatalogRootV2::empty(
             &tampered.reference_catalog_policy,
             &tampered.page_names.ownership_root,
             tampered.logseq_claim_root.digest(),

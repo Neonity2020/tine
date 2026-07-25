@@ -190,12 +190,21 @@ impl PatriciaIndexStore {
         root: PatriciaIndexRoot,
         prefix: &[u8],
     ) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, StoreError> {
+        self.lookup_prefix_limited(root, prefix, usize::MAX)
+    }
+
+    pub(crate) fn lookup_prefix_limited(
+        &self,
+        root: PatriciaIndexRoot,
+        prefix: &[u8],
+        limit: usize,
+    ) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, StoreError> {
         validate_key(prefix)?;
         let mut found = BTreeMap::new();
-        if root == PatriciaIndexRoot::empty() {
+        if root == PatriciaIndexRoot::empty() || limit == 0 {
             return Ok(found);
         }
-        self.collect_prefix(root.digest(), prefix, &mut found)?;
+        self.collect_prefix(root.digest(), prefix, limit, &mut found)?;
         Ok(found)
     }
 
@@ -614,6 +623,7 @@ impl PatriciaIndexStore {
         &self,
         root: ContentDigest,
         requested: &[u8],
+        limit: usize,
         found: &mut BTreeMap<Vec<u8>, Vec<u8>>,
     ) -> Result<(), StoreError> {
         let budget = traversal_node_budget(MAX_KEY_BYTES)?;
@@ -626,6 +636,9 @@ impl PatriciaIndexStore {
                 Node::Leaf { key, value, .. } => {
                     if key.starts_with(requested) {
                         found.insert(key, value);
+                        if found.len() == limit {
+                            return Ok(());
+                        }
                     }
                 }
                 Node::Branch {

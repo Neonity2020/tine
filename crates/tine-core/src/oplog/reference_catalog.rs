@@ -19,20 +19,24 @@ use super::{
     PageId, PageNameKeyDigest, PageNameOwnershipRootV1, SemanticEffect,
 };
 
-pub const REFERENCE_CATALOG_SCHEMA_VERSION: u32 = 1;
-pub const REFERENCE_CATALOG_ROOT_SCHEMA_VERSION: u32 = 1;
+pub const REFERENCE_CATALOG_SCHEMA_VERSION: u32 = 2;
+pub const REFERENCE_CATALOG_ROOT_SCHEMA_VERSION: u32 = 2;
 pub const REFERENCE_CATALOG_POLICY_VERSION: u32 = 1;
-pub const REFERENCE_CATALOG_EXTRACTOR_VERSION: u32 = 1;
+pub const REFERENCE_CATALOG_EXTRACTOR_VERSION: u32 = 2;
 pub const MAX_REFERENCE_CATALOG_DELTA_SOURCES: usize = super::semantic::MAX_SEMANTIC_DELTA_ENTRIES;
 pub const MAX_REFERENCE_CATALOG_DELTA_BYTES: usize = super::semantic::MAX_SEMANTIC_EFFECT_BYTES;
 pub const MAX_REFERENCE_TARGET_BYTES: usize = super::semantic::MAX_LOGICAL_PAGE_NAME_BYTES;
 const MAX_EPHEMERAL_REFERENCE_CATALOG_SOURCES: usize = 4_096;
 const MAX_REFERENCE_OBJECT_BYTES: u64 = super::MAX_OBJECT_BYTES as u64;
 const TARGET_POSTING_CHUNK_BYTES: usize = 1024 * 1024;
-const POSTING_DOMAIN: &[u8] = b"tine/reference-catalog/source-posting/v1";
-const ROOT_DOMAIN: &[u8] = b"tine/reference-catalog/root/v1";
-const DELTA_MAGIC: &[u8; 8] = b"TINEREF1";
-const COVERAGE_VALUE: &[u8] = b"live-source-v1";
+const POSTING_DOMAIN: &[u8] = b"tine/reference-catalog/source-posting/v2";
+const ROOT_DOMAIN: &[u8] = b"tine/reference-catalog/root/v2";
+const DELTA_MAGIC: &[u8; 8] = b"TINEREF2";
+const COVERAGE_VALUE: &[u8] = b"live-source-v2";
+const REVERSE_VALUE: &[u8] = b"reference-source-v2";
+const PAGE_REFERENCE_PREFIX: u8 = 0;
+const PAGE_ALIAS_PREFIX: u8 = 1;
+const BLOCK_UUID_PREFIX: u8 = 2;
 
 #[cfg(test)]
 static REFERENCE_EVIDENCE_PARSE_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -177,6 +181,13 @@ pub enum ReferenceFactV1 {
     Block(BlockReferenceFactV1),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReferenceCandidateTargetV2 {
+    PageName(PageNameKeyDigest),
+    PageAlias(PageNameKeyDigest),
+    BlockUuid(LogseqUuid),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReferenceSourcePostingV1 {
@@ -271,7 +282,7 @@ pub(crate) struct ReferenceSourceBlockV1 {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ReferenceCatalogRootV1 {
+pub struct ReferenceCatalogRootV2 {
     schema_version: u32,
     extractor_version: u32,
     extractor_digest: ContentDigest,
@@ -280,11 +291,12 @@ pub struct ReferenceCatalogRootV1 {
     source_count: u64,
     source_coverage_root: ContentDigest,
     facts_root: ContentDigest,
+    reverse_candidates_root: ContentDigest,
     page_name_authority_root: ContentDigest,
     external_uuid_claim_authority_root: ContentDigest,
 }
 
-impl ReferenceCatalogRootV1 {
+impl ReferenceCatalogRootV2 {
     pub fn empty(
         policy: &ReferenceCatalogPolicyV1,
         page_names: &PageNameOwnershipRootV1,
@@ -293,6 +305,7 @@ impl ReferenceCatalogRootV1 {
         Self::new(
             policy,
             0,
+            empty_map_digest(),
             empty_map_digest(),
             empty_map_digest(),
             page_names,
@@ -314,6 +327,7 @@ impl ReferenceCatalogRootV1 {
             source_count: 0,
             source_coverage_root: empty_map_digest(),
             facts_root: empty_map_digest(),
+            reverse_candidates_root: empty_map_digest(),
             page_name_authority_root,
             external_uuid_claim_authority_root,
         };
@@ -326,6 +340,7 @@ impl ReferenceCatalogRootV1 {
         source_count: u64,
         source_coverage_root: ContentDigest,
         facts_root: ContentDigest,
+        reverse_candidates_root: ContentDigest,
         page_names: &PageNameOwnershipRootV1,
         external_uuid_claim_authority_root: ContentDigest,
     ) -> Result<Self, ReferenceCatalogError> {
@@ -338,6 +353,7 @@ impl ReferenceCatalogRootV1 {
             source_count,
             source_coverage_root,
             facts_root,
+            reverse_candidates_root,
             page_name_authority_root: page_names
                 .external_digest()
                 .map_err(|error| ReferenceCatalogError::Authority(error.to_string()))?,
@@ -375,6 +391,10 @@ impl ReferenceCatalogRootV1 {
 
     pub const fn source_coverage_root(&self) -> ContentDigest {
         self.source_coverage_root
+    }
+
+    pub const fn reverse_candidates_root(&self) -> ContentDigest {
+        self.reverse_candidates_root
     }
 
     /// Digest of the parser/extractor construction bound into this catalog.
@@ -438,7 +458,8 @@ impl ReferenceCatalogRootV1 {
         if self.extractor_digest != extractor_digest()
             || (self.source_count == 0
                 && (self.source_coverage_root != empty_map_digest()
-                    || self.facts_root != empty_map_digest()))
+                    || self.facts_root != empty_map_digest()
+                    || self.reverse_candidates_root != empty_map_digest()))
             || (self.source_count > 0
                 && (self.source_coverage_root == empty_map_digest()
                     || self.facts_root == empty_map_digest()))
@@ -492,16 +513,16 @@ enum ReferenceTransitionBindingV1 {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ReferenceCatalogDeltaV1 {
+pub struct ReferenceCatalogDeltaV2 {
     schema_version: u32,
-    prior_root: ReferenceCatalogRootV1,
-    post_root: ReferenceCatalogRootV1,
+    prior_root: ReferenceCatalogRootV2,
+    post_root: ReferenceCatalogRootV2,
     transition: ReferenceTransitionBindingV1,
 }
 
-impl ReferenceCatalogDeltaV1 {
+impl ReferenceCatalogDeltaV2 {
     #[cfg(test)]
-    pub(crate) fn empty_transition(root: ReferenceCatalogRootV1) -> Self {
+    pub(crate) fn empty_transition(root: ReferenceCatalogRootV2) -> Self {
         Self {
             schema_version: REFERENCE_CATALOG_SCHEMA_VERSION,
             prior_root: root.clone(),
@@ -511,15 +532,15 @@ impl ReferenceCatalogDeltaV1 {
     }
 
     #[cfg(test)]
-    pub(crate) fn replace_prior_root_for_test(&mut self, root: ReferenceCatalogRootV1) {
+    pub(crate) fn replace_prior_root_for_test(&mut self, root: ReferenceCatalogRootV2) {
         self.prior_root = root;
     }
 
-    pub const fn prior_root(&self) -> &ReferenceCatalogRootV1 {
+    pub const fn prior_root(&self) -> &ReferenceCatalogRootV2 {
         &self.prior_root
     }
 
-    pub const fn post_root(&self) -> &ReferenceCatalogRootV1 {
+    pub const fn post_root(&self) -> &ReferenceCatalogRootV2 {
         &self.post_root
     }
 
@@ -566,6 +587,8 @@ impl ReferenceCatalogDeltaV1 {
                 if self.prior_root.source_count != self.post_root.source_count
                     || self.prior_root.source_coverage_root != self.post_root.source_coverage_root
                     || self.prior_root.facts_root != self.post_root.facts_root
+                    || self.prior_root.reverse_candidates_root
+                        != self.post_root.reverse_candidates_root
                 {
                     return Err(ReferenceCatalogError::MalformedTransition);
                 }
@@ -853,7 +876,7 @@ impl ReferenceCatalogStore {
 
     fn posting(
         &self,
-        root: &ReferenceCatalogRootV1,
+        root: &ReferenceCatalogRootV2,
         page_id: PageId,
     ) -> Result<Option<ReferenceSourcePostingV1>, ReferenceCatalogError> {
         let value = self
@@ -872,9 +895,41 @@ impl ReferenceCatalogStore {
             .transpose()
     }
 
+    fn reverse_candidates(
+        &self,
+        root: &ReferenceCatalogRootV2,
+        target: ReferenceCandidateTargetV2,
+        limit: usize,
+    ) -> Result<BTreeSet<PageId>, ReferenceCatalogError> {
+        let prefix = reverse_candidate_prefix(target);
+        let rows = self
+            .patricia
+            .lookup_prefix_limited(
+                PatriciaIndexRoot::from_digest(root.reverse_candidates_root),
+                &prefix,
+                limit.saturating_add(1),
+            )
+            .map_err(store_error)?;
+        if rows.len() > limit {
+            return Err(ReferenceCatalogError::TooManyCandidates(rows.len()));
+        }
+        rows.into_iter()
+            .map(|(key, value)| {
+                if value != REVERSE_VALUE {
+                    return Err(ReferenceCatalogError::MalformedRoot);
+                }
+                let (found_prefix, page_id) = decode_reverse_candidate_key(&key)?;
+                if found_prefix != prefix {
+                    return Err(ReferenceCatalogError::MalformedRoot);
+                }
+                Ok(page_id)
+            })
+            .collect()
+    }
+
     pub(crate) fn validate_delta(
         &self,
-        delta: &ReferenceCatalogDeltaV1,
+        delta: &ReferenceCatalogDeltaV2,
     ) -> Result<(), ReferenceCatalogError> {
         delta.validate()?;
         let replacements = match &delta.transition {
@@ -885,16 +940,23 @@ impl ReferenceCatalogStore {
         let mut facts_root = PatriciaIndexRoot::from_digest(delta.prior_root.facts_root);
         let mut coverage_root =
             PatriciaIndexRoot::from_digest(delta.prior_root.source_coverage_root);
+        let mut reverse_root =
+            PatriciaIndexRoot::from_digest(delta.prior_root.reverse_candidates_root);
         self.patricia
             .validate_root(facts_root)
             .map_err(store_error)?;
         self.patricia
             .validate_root(coverage_root)
             .map_err(store_error)?;
+        self.patricia
+            .validate_root(reverse_root)
+            .map_err(store_error)?;
         let mut source_count = delta.prior_root.source_count;
         let mut fact_updates = BTreeMap::new();
         let mut coverage_updates = BTreeMap::new();
         let mut removals = Vec::new();
+        let mut reverse_updates = BTreeMap::new();
+        let mut reverse_removals = BTreeSet::new();
         for replacement in replacements {
             let key = replacement.page_id.as_uuid().as_bytes().to_vec();
             let prior_value = self
@@ -913,12 +975,22 @@ impl ReferenceCatalogStore {
             {
                 return Err(ReferenceCatalogError::MalformedTransition);
             }
+            let prior_reverse_keys = prior_value
+                .map(|digest| {
+                    let reference = self.posting_reference(replacement.page_id, digest)?;
+                    self.read_posting(&reference)
+                        .map(|posting| reverse_candidate_keys(&posting))
+                })
+                .transpose()?
+                .unwrap_or_default();
+            let mut post_reverse_keys = BTreeSet::new();
             match replacement.post_posting {
                 Some(reference) => {
                     let posting = self.read_posting(&reference)?;
                     if posting.source_page_id != replacement.page_id {
                         return Err(ReferenceCatalogError::MalformedTransition);
                     }
+                    post_reverse_keys = reverse_candidate_keys(&posting);
                     fact_updates.insert(key.clone(), reference.digest.as_bytes().to_vec());
                     coverage_updates.insert(key, COVERAGE_VALUE.to_vec());
                     if !prior_covered {
@@ -936,6 +1008,12 @@ impl ReferenceCatalogStore {
                     }
                 }
             }
+            reverse_removals.extend(prior_reverse_keys.difference(&post_reverse_keys).cloned());
+            reverse_updates.extend(
+                post_reverse_keys
+                    .into_iter()
+                    .map(|key| (key, REVERSE_VALUE.to_vec())),
+            );
         }
         facts_root = self
             .patricia
@@ -953,9 +1031,21 @@ impl ReferenceCatalogStore {
             .patricia
             .remove_many(coverage_root, &removals)
             .map_err(store_error)?;
+        reverse_root = self
+            .patricia
+            .insert_many_verify_existing(reverse_root, &reverse_updates)
+            .map_err(store_error)?;
+        reverse_root = self
+            .patricia
+            .remove_many(
+                reverse_root,
+                &reverse_removals.into_iter().collect::<Vec<_>>(),
+            )
+            .map_err(store_error)?;
         if source_count != delta.post_root.source_count
             || facts_root.digest() != delta.post_root.facts_root
             || coverage_root.digest() != delta.post_root.source_coverage_root
+            || reverse_root.digest() != delta.post_root.reverse_candidates_root
         {
             return Err(ReferenceCatalogError::MalformedTransition);
         }
@@ -964,12 +1054,14 @@ impl ReferenceCatalogStore {
 
     pub(crate) fn validate_catalog_root(
         &self,
-        root: &ReferenceCatalogRootV1,
+        root: &ReferenceCatalogRootV2,
     ) -> Result<(), ReferenceCatalogError> {
         root.validate()?;
         let facts_root = PatriciaIndexRoot::from_digest(root.facts_root);
         let coverage_root = PatriciaIndexRoot::from_digest(root.source_coverage_root);
+        let reverse_root = PatriciaIndexRoot::from_digest(root.reverse_candidates_root);
         let mut fact_count = 0u64;
+        let mut expected_reverse = BTreeSet::new();
         let mut validation_error = None;
         self.patricia
             .visit_all(facts_root, |key, value| {
@@ -977,7 +1069,8 @@ impl ReferenceCatalogStore {
                     let page_id = page_id_key(key)?;
                     let digest = digest_value(value)?;
                     let reference = self.posting_reference(page_id, digest)?;
-                    self.read_posting(&reference)?;
+                    let posting = self.read_posting(&reference)?;
+                    expected_reverse.extend(reverse_candidate_keys(&posting));
                     if self
                         .patricia
                         .lookup(coverage_root, key)
@@ -1025,22 +1118,37 @@ impl ReferenceCatalogStore {
         if fact_count != root.source_count || coverage_count != root.source_count {
             return Err(ReferenceCatalogError::MalformedRoot);
         }
+        let mut found_reverse = BTreeSet::new();
+        let mut malformed_reverse = false;
+        self.patricia
+            .visit_all(reverse_root, |key, value| {
+                if value != REVERSE_VALUE || decode_reverse_candidate_key(key).is_err() {
+                    malformed_reverse = true;
+                    return false;
+                }
+                found_reverse.insert(key.to_vec());
+                true
+            })
+            .map_err(store_error)?;
+        if malformed_reverse || found_reverse != expected_reverse {
+            return Err(ReferenceCatalogError::MalformedRoot);
+        }
         Ok(())
     }
 }
 
 #[derive(Debug)]
-pub(crate) struct ReferenceCatalogCandidateV1 {
-    delta: ReferenceCatalogDeltaV1,
+pub(crate) struct ReferenceCatalogCandidateV2 {
+    delta: ReferenceCatalogDeltaV2,
     memory: Option<MemoryCatalog>,
 }
 
-impl ReferenceCatalogCandidateV1 {
-    pub(crate) const fn root(&self) -> &ReferenceCatalogRootV1 {
+impl ReferenceCatalogCandidateV2 {
+    pub(crate) const fn root(&self) -> &ReferenceCatalogRootV2 {
         self.delta.post_root()
     }
 
-    pub(crate) const fn delta(&self) -> &ReferenceCatalogDeltaV1 {
+    pub(crate) const fn delta(&self) -> &ReferenceCatalogDeltaV2 {
         &self.delta
     }
 }
@@ -1050,6 +1158,7 @@ struct MemoryCatalog {
     postings: BTreeMap<PageId, ReferenceSourcePostingV1>,
     facts: BTreeMap<PageId, ContentDigest>,
     coverage: BTreeSet<PageId>,
+    reverse_candidates: BTreeSet<Vec<u8>>,
 }
 
 #[derive(Debug)]
@@ -1060,20 +1169,20 @@ enum ReferenceCatalogBackend {
 }
 
 #[derive(Debug)]
-pub(crate) struct ReferenceCatalogStateV1 {
+pub(crate) struct ReferenceCatalogStateV2 {
     policy: ReferenceCatalogPolicyV1,
-    root: ReferenceCatalogRootV1,
+    root: ReferenceCatalogRootV2,
     backend: ReferenceCatalogBackend,
 }
 
-impl ReferenceCatalogStateV1 {
+impl ReferenceCatalogStateV2 {
     pub(crate) fn empty(
         policy: ReferenceCatalogPolicyV1,
         page_names: &PageNameOwnershipRootV1,
         external_uuid_claim_authority_root: ContentDigest,
     ) -> Result<Self, ReferenceCatalogError> {
         let root =
-            ReferenceCatalogRootV1::empty(&policy, page_names, external_uuid_claim_authority_root)?;
+            ReferenceCatalogRootV2::empty(&policy, page_names, external_uuid_claim_authority_root)?;
         Ok(Self {
             policy,
             root,
@@ -1094,7 +1203,7 @@ impl ReferenceCatalogStateV1 {
 
     pub(crate) fn restore_recovery_required(
         policy: ReferenceCatalogPolicyV1,
-        root: ReferenceCatalogRootV1,
+        root: ReferenceCatalogRootV2,
         page_names: &PageNameOwnershipRootV1,
         external_uuid_claim_authority_root: ContentDigest,
         store: Arc<ReferenceCatalogStore>,
@@ -1107,7 +1216,7 @@ impl ReferenceCatalogStateV1 {
         })
     }
 
-    pub(crate) const fn root(&self) -> &ReferenceCatalogRootV1 {
+    pub(crate) const fn root(&self) -> &ReferenceCatalogRootV2 {
         &self.root
     }
 
@@ -1164,7 +1273,7 @@ impl ReferenceCatalogStateV1 {
     /// for a different root would turn a current snapshot into a forged tail.
     pub(crate) fn posting_at_root(
         &self,
-        root: &ReferenceCatalogRootV1,
+        root: &ReferenceCatalogRootV2,
         page_id: PageId,
     ) -> Result<Option<ReferenceSourcePostingV1>, ReferenceCatalogError> {
         root.validate()?;
@@ -1180,9 +1289,43 @@ impl ReferenceCatalogStateV1 {
         }
     }
 
+    pub(crate) fn reverse_candidates_at_root(
+        &self,
+        root: &ReferenceCatalogRootV2,
+        target: ReferenceCandidateTargetV2,
+        limit: usize,
+    ) -> Result<BTreeSet<PageId>, ReferenceCatalogError> {
+        root.validate()?;
+        match &self.backend {
+            ReferenceCatalogBackend::Store(store) => store.reverse_candidates(root, target, limit),
+            ReferenceCatalogBackend::Memory(memory) if root == &self.root => {
+                let prefix = reverse_candidate_prefix(target);
+                let mut candidates = BTreeSet::new();
+                for key in memory.reverse_candidates.range(prefix.clone()..) {
+                    if !key.starts_with(&prefix) {
+                        break;
+                    }
+                    let (found_prefix, page_id) = decode_reverse_candidate_key(key)?;
+                    if found_prefix != prefix {
+                        return Err(ReferenceCatalogError::MalformedRoot);
+                    }
+                    candidates.insert(page_id);
+                    if candidates.len() > limit {
+                        return Err(ReferenceCatalogError::TooManyCandidates(candidates.len()));
+                    }
+                }
+                Ok(candidates)
+            }
+            ReferenceCatalogBackend::Memory(_) => Err(ReferenceCatalogError::StoreRequired),
+            ReferenceCatalogBackend::RecoveryRequired(_) => {
+                Err(ReferenceCatalogError::RecoveryRequired)
+            }
+        }
+    }
+
     pub(crate) fn validate_delta(
         &self,
-        delta: &ReferenceCatalogDeltaV1,
+        delta: &ReferenceCatalogDeltaV2,
     ) -> Result<(), ReferenceCatalogError> {
         match &self.backend {
             ReferenceCatalogBackend::Store(store)
@@ -1213,7 +1356,7 @@ impl ReferenceCatalogStateV1 {
         sources: BTreeMap<PageId, Option<ReferenceSourcePageV1>>,
         page_names: &PageNameOwnershipRootV1,
         external_uuid_claim_authority_root: ContentDigest,
-    ) -> Result<ReferenceCatalogCandidateV1, ReferenceCatalogError> {
+    ) -> Result<ReferenceCatalogCandidateV2, ReferenceCatalogError> {
         self.ensure_ready()?;
         if sources.len() > MAX_REFERENCE_CATALOG_DELTA_SOURCES {
             return Err(ReferenceCatalogError::TooManySources(sources.len()));
@@ -1243,7 +1386,7 @@ impl ReferenceCatalogStateV1 {
         sources: BTreeMap<PageId, Option<ReferenceSourcePageV1>>,
         page_names: &PageNameOwnershipRootV1,
         external_uuid_claim_authority_root: ContentDigest,
-    ) -> Result<ReferenceCatalogCandidateV1, ReferenceCatalogError> {
+    ) -> Result<ReferenceCatalogCandidateV2, ReferenceCatalogError> {
         let additions = sources
             .iter()
             .filter(|(page_id, source)| source.is_some() && !prior.postings.contains_key(page_id))
@@ -1265,9 +1408,22 @@ impl ReferenceCatalogStateV1 {
         let mut replacements = Vec::with_capacity(sources.len());
         for (page_id, source) in sources {
             let prior_posting_digest = memory.facts.get(&page_id).copied();
+            let prior_reverse_keys = memory
+                .postings
+                .get(&page_id)
+                .map(reverse_candidate_keys)
+                .unwrap_or_default();
             let posting = source
                 .map(|source| extract_source_posting(&self.policy, source))
                 .transpose()?;
+            let post_reverse_keys = posting
+                .as_ref()
+                .map(reverse_candidate_keys)
+                .unwrap_or_default();
+            for key in prior_reverse_keys.difference(&post_reverse_keys) {
+                memory.reverse_candidates.remove(key);
+            }
+            memory.reverse_candidates.extend(post_reverse_keys);
             let post_posting = match posting {
                 Some(posting) => {
                     let digest = posting.digest()?;
@@ -1295,11 +1451,12 @@ impl ReferenceCatalogStateV1 {
                 post_posting,
             });
         }
-        let post_root = ReferenceCatalogRootV1::new(
+        let post_root = ReferenceCatalogRootV2::new(
             &self.policy,
             memory.coverage.len() as u64,
             memory_coverage_digest(&memory.coverage),
             memory_facts_digest(&memory.facts),
+            memory_reverse_digest(&memory.reverse_candidates),
             page_names,
             external_uuid_claim_authority_root,
         )?;
@@ -1308,14 +1465,14 @@ impl ReferenceCatalogStateV1 {
         } else {
             ReferenceTransitionBindingV1::Inline(replacements)
         };
-        let delta = ReferenceCatalogDeltaV1 {
+        let delta = ReferenceCatalogDeltaV2 {
             schema_version: REFERENCE_CATALOG_SCHEMA_VERSION,
             prior_root: self.root.clone(),
             post_root,
             transition,
         };
         delta.encode()?;
-        Ok(ReferenceCatalogCandidateV1 {
+        Ok(ReferenceCatalogCandidateV2 {
             delta,
             memory: Some(memory),
         })
@@ -1327,14 +1484,17 @@ impl ReferenceCatalogStateV1 {
         sources: BTreeMap<PageId, Option<ReferenceSourcePageV1>>,
         page_names: &PageNameOwnershipRootV1,
         external_uuid_claim_authority_root: ContentDigest,
-    ) -> Result<ReferenceCatalogCandidateV1, ReferenceCatalogError> {
+    ) -> Result<ReferenceCatalogCandidateV2, ReferenceCatalogError> {
         let mut facts_root = PatriciaIndexRoot::from_digest(self.root.facts_root);
         let mut coverage_root = PatriciaIndexRoot::from_digest(self.root.source_coverage_root);
+        let mut reverse_root = PatriciaIndexRoot::from_digest(self.root.reverse_candidates_root);
         let mut source_count = self.root.source_count;
         let mut replacements = Vec::with_capacity(sources.len());
         let mut fact_updates = BTreeMap::new();
         let mut coverage_updates = BTreeMap::new();
         let mut removals = Vec::new();
+        let mut reverse_updates = BTreeMap::new();
+        let mut reverse_removals = BTreeSet::new();
         for (page_id, source) in sources {
             let key = page_id.as_uuid().as_bytes().to_vec();
             let prior_posting_digest = store
@@ -1343,9 +1503,28 @@ impl ReferenceCatalogStateV1 {
                 .map_err(store_error)?
                 .map(|value| digest_value(&value))
                 .transpose()?;
+            let prior_reverse_keys = prior_posting_digest
+                .map(|digest| {
+                    let reference = store.posting_reference(page_id, digest)?;
+                    store
+                        .read_posting(&reference)
+                        .map(|posting| reverse_candidate_keys(&posting))
+                })
+                .transpose()?
+                .unwrap_or_default();
             let posting = source
                 .map(|source| extract_source_posting(&self.policy, source))
                 .transpose()?;
+            let post_reverse_keys = posting
+                .as_ref()
+                .map(reverse_candidate_keys)
+                .unwrap_or_default();
+            reverse_removals.extend(prior_reverse_keys.difference(&post_reverse_keys).cloned());
+            reverse_updates.extend(
+                post_reverse_keys
+                    .into_iter()
+                    .map(|key| (key, REVERSE_VALUE.to_vec())),
+            );
             let post_posting = match posting {
                 Some(posting) => {
                     let reference = store.publish_posting(&posting)?;
@@ -1390,11 +1569,23 @@ impl ReferenceCatalogStateV1 {
             .patricia
             .remove_many(coverage_root, &removals)
             .map_err(store_error)?;
-        let post_root = ReferenceCatalogRootV1::new(
+        reverse_root = store
+            .patricia
+            .insert_many(reverse_root, &reverse_updates)
+            .map_err(store_error)?;
+        reverse_root = store
+            .patricia
+            .remove_many(
+                reverse_root,
+                &reverse_removals.into_iter().collect::<Vec<_>>(),
+            )
+            .map_err(store_error)?;
+        let post_root = ReferenceCatalogRootV2::new(
             &self.policy,
             source_count,
             coverage_root.digest(),
             facts_root.digest(),
+            reverse_root.digest(),
             page_names,
             external_uuid_claim_authority_root,
         )?;
@@ -1403,7 +1594,7 @@ impl ReferenceCatalogStateV1 {
         } else {
             ReferenceTransitionBindingV1::Stored(store.publish_transition(&replacements)?)
         };
-        let delta = ReferenceCatalogDeltaV1 {
+        let delta = ReferenceCatalogDeltaV2 {
             schema_version: REFERENCE_CATALOG_SCHEMA_VERSION,
             prior_root: self.root.clone(),
             post_root,
@@ -1414,13 +1605,13 @@ impl ReferenceCatalogStateV1 {
         // candidate can be committed to hot state. Replaying it here as well
         // only reconstructs the same authenticated trees a second time.
         delta.encode()?;
-        Ok(ReferenceCatalogCandidateV1 {
+        Ok(ReferenceCatalogCandidateV2 {
             delta,
             memory: None,
         })
     }
 
-    pub(crate) fn commit(&mut self, candidate: ReferenceCatalogCandidateV1) {
+    pub(crate) fn commit(&mut self, candidate: ReferenceCatalogCandidateV2) {
         debug_assert_eq!(candidate.delta.prior_root, self.root);
         if let Some(memory) = candidate.memory {
             self.backend = ReferenceCatalogBackend::Memory(memory);
@@ -1569,14 +1760,89 @@ fn may_contain_reference_evidence(raw: &str) -> bool {
         .any(|byte| matches!(byte, b'[' | b'#' | b'(' | b'{' | b':'))
 }
 
+fn reverse_candidate_keys(posting: &ReferenceSourcePostingV1) -> BTreeSet<Vec<u8>> {
+    posting
+        .facts
+        .iter()
+        .map(|fact| {
+            let target = match fact {
+                ReferenceFactV1::PageName(fact)
+                    if fact.kind == PageReferenceKindV1::AliasDeclaration =>
+                {
+                    ReferenceCandidateTargetV2::PageAlias(fact.target_key)
+                }
+                ReferenceFactV1::PageName(fact) => {
+                    ReferenceCandidateTargetV2::PageName(fact.target_key)
+                }
+                ReferenceFactV1::Block(fact) => {
+                    ReferenceCandidateTargetV2::BlockUuid(fact.logseq_uuid)
+                }
+            };
+            let mut key = reverse_candidate_prefix(target);
+            key.extend_from_slice(posting.source_page_id.as_uuid().as_bytes());
+            key
+        })
+        .collect()
+}
+
+fn reverse_candidate_prefix(target: ReferenceCandidateTargetV2) -> Vec<u8> {
+    match target {
+        ReferenceCandidateTargetV2::PageName(target_key) => {
+            let mut prefix = Vec::with_capacity(33);
+            prefix.push(PAGE_REFERENCE_PREFIX);
+            prefix.extend_from_slice(target_key.as_bytes());
+            prefix
+        }
+        ReferenceCandidateTargetV2::PageAlias(target_key) => {
+            let mut prefix = Vec::with_capacity(33);
+            prefix.push(PAGE_ALIAS_PREFIX);
+            prefix.extend_from_slice(target_key.as_bytes());
+            prefix
+        }
+        ReferenceCandidateTargetV2::BlockUuid(logseq_uuid) => {
+            let mut prefix = Vec::with_capacity(17);
+            prefix.push(BLOCK_UUID_PREFIX);
+            prefix.extend_from_slice(logseq_uuid.as_uuid().as_bytes());
+            prefix
+        }
+    }
+}
+
+fn decode_reverse_candidate_key(key: &[u8]) -> Result<(Vec<u8>, PageId), ReferenceCatalogError> {
+    let prefix_len = match key.first() {
+        Some(&PAGE_REFERENCE_PREFIX) | Some(&PAGE_ALIAS_PREFIX) if key.len() == 49 => 33,
+        Some(&BLOCK_UUID_PREFIX) if key.len() == 33 => 17,
+        _ => return Err(ReferenceCatalogError::MalformedRoot),
+    };
+    let page_bytes: [u8; 16] = key[prefix_len..]
+        .try_into()
+        .map_err(|_| ReferenceCatalogError::MalformedRoot)?;
+    Ok((
+        key[..prefix_len].to_vec(),
+        PageId::from_uuid(uuid::Uuid::from_bytes(page_bytes)),
+    ))
+}
+
 fn memory_facts_digest(facts: &BTreeMap<PageId, ContentDigest>) -> ContentDigest {
     if facts.is_empty() {
         return empty_map_digest();
     }
-    let mut bytes = b"tine/reference-catalog/test-memory-facts/v1".to_vec();
+    let mut bytes = b"tine/reference-catalog/test-memory-facts/v2".to_vec();
     for (page_id, digest) in facts {
         bytes.extend_from_slice(page_id.as_uuid().as_bytes());
         bytes.extend_from_slice(digest.as_bytes());
+    }
+    ContentDigest::of(&bytes)
+}
+
+fn memory_reverse_digest(reverse_candidates: &BTreeSet<Vec<u8>>) -> ContentDigest {
+    if reverse_candidates.is_empty() {
+        return empty_map_digest();
+    }
+    let mut bytes = b"tine/reference-catalog/test-memory-reverse/v2".to_vec();
+    for key in reverse_candidates {
+        bytes.extend_from_slice(&(key.len() as u64).to_be_bytes());
+        bytes.extend_from_slice(key);
     }
     ContentDigest::of(&bytes)
 }
@@ -1585,7 +1851,7 @@ fn memory_coverage_digest(coverage: &BTreeSet<PageId>) -> ContentDigest {
     if coverage.is_empty() {
         return empty_map_digest();
     }
-    let mut bytes = b"tine/reference-catalog/test-memory-coverage/v1".to_vec();
+    let mut bytes = b"tine/reference-catalog/test-memory-coverage/v2".to_vec();
     for page_id in coverage {
         bytes.extend_from_slice(page_id.as_uuid().as_bytes());
     }
@@ -1597,7 +1863,7 @@ fn empty_map_digest() -> ContentDigest {
 }
 
 fn extractor_digest() -> ContentDigest {
-    let mut bytes = b"tine/reference-catalog/extractor/v1\0".to_vec();
+    let mut bytes = b"tine/reference-catalog/extractor/v2\0".to_vec();
     bytes.extend_from_slice(&REFERENCE_CATALOG_EXTRACTOR_VERSION.to_be_bytes());
     bytes.extend_from_slice(crate::reference_evidence::ENGINE_VERSION.as_bytes());
     ContentDigest::of(&bytes)
@@ -1719,6 +1985,7 @@ pub enum ReferenceCatalogError {
     StoreRequired,
     Store(String),
     TooLarge(usize),
+    TooManyCandidates(usize),
     TooManySources(usize),
     UnknownVersion {
         component: &'static str,
@@ -1762,6 +2029,12 @@ impl fmt::Display for ReferenceCatalogError {
                 write!(
                     formatter,
                     "reference catalog encoding is too large: {bytes} bytes"
+                )
+            }
+            Self::TooManyCandidates(count) => {
+                write!(
+                    formatter,
+                    "reference target has too many candidate sources: {count}"
                 )
             }
             Self::TooManySources(count) => {
@@ -1943,7 +2216,7 @@ mod tests {
         let names = PageNameOwnershipRootV1::empty();
         let uuid_root = ContentDigest::of(b"uuid");
         let mut state =
-            ReferenceCatalogStateV1::empty(ReferenceCatalogPolicyV1::default(), &names, uuid_root)
+            ReferenceCatalogStateV2::empty(ReferenceCatalogPolicyV1::default(), &names, uuid_root)
                 .unwrap();
         let sources = (1..=MAX_EPHEMERAL_REFERENCE_CATALOG_SOURCES as u128)
             .map(|value| {
@@ -1996,7 +2269,7 @@ mod tests {
         let names = PageNameOwnershipRootV1::empty();
         let uuid_root = ContentDigest::of(b"uuid");
         let mut forward =
-            ReferenceCatalogStateV1::empty(ReferenceCatalogPolicyV1::default(), &names, uuid_root)
+            ReferenceCatalogStateV2::empty(ReferenceCatalogPolicyV1::default(), &names, uuid_root)
                 .unwrap();
         forward.attach_store(Arc::clone(&catalog)).unwrap();
         let sources = (1..=128)
@@ -2014,7 +2287,7 @@ mod tests {
 
         let (other_path, other_catalog) = store("reverse");
         let mut reverse =
-            ReferenceCatalogStateV1::empty(ReferenceCatalogPolicyV1::default(), &names, uuid_root)
+            ReferenceCatalogStateV2::empty(ReferenceCatalogPolicyV1::default(), &names, uuid_root)
                 .unwrap();
         reverse.attach_store(other_catalog).unwrap();
         let reversed = sources.into_iter().rev().collect();
@@ -2045,7 +2318,7 @@ mod tests {
         let names = PageNameOwnershipRootV1::empty();
         let uuid_root = ContentDigest::of(b"uuid");
         let mut state =
-            ReferenceCatalogStateV1::empty(ReferenceCatalogPolicyV1::default(), &names, uuid_root)
+            ReferenceCatalogStateV2::empty(ReferenceCatalogPolicyV1::default(), &names, uuid_root)
                 .unwrap();
         state.attach_store(catalog).unwrap();
         let raw = (0..12_000)
@@ -2109,7 +2382,7 @@ mod tests {
         let names = PageNameOwnershipRootV1::empty();
         let uuid_root = ContentDigest::of(b"uuid");
         let mut state =
-            ReferenceCatalogStateV1::empty(ReferenceCatalogPolicyV1::default(), &names, uuid_root)
+            ReferenceCatalogStateV2::empty(ReferenceCatalogPolicyV1::default(), &names, uuid_root)
                 .unwrap();
         state.attach_store(Arc::clone(&catalog)).unwrap();
         let candidate = state
@@ -2121,7 +2394,7 @@ mod tests {
             .unwrap();
         state.commit(candidate);
         let root = state.root().clone();
-        let mut reopened = ReferenceCatalogStateV1::restore_recovery_required(
+        let mut reopened = ReferenceCatalogStateV2::restore_recovery_required(
             ReferenceCatalogPolicyV1::default(),
             root,
             &names,
@@ -2145,6 +2418,42 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_reverse_candidates_enforce_exact_limit_boundary() {
+        let (path, catalog) = store("reverse-candidate-limit");
+        let names = PageNameOwnershipRootV1::empty();
+        let uuid_root = ContentDigest::of(b"uuid");
+        let mut state =
+            ReferenceCatalogStateV2::empty(ReferenceCatalogPolicyV1::default(), &names, uuid_root)
+                .unwrap();
+        state.attach_store(catalog).unwrap();
+        let candidate = state
+            .prepare(
+                BTreeMap::from([
+                    (page(1), Some(source(page(1), "[[Target]]"))),
+                    (page(2), Some(source(page(2), "[[Target]]"))),
+                ]),
+                &names,
+                uuid_root,
+            )
+            .unwrap();
+        state.commit(candidate);
+        let target = ReferenceCandidateTargetV2::PageName(
+            LogicalPageName::parse("Target").unwrap().key_digest(),
+        );
+        assert_eq!(
+            state
+                .reverse_candidates_at_root(state.root(), target, 2)
+                .unwrap(),
+            BTreeSet::from([page(1), page(2)])
+        );
+        assert!(matches!(
+            state.reverse_candidates_at_root(state.root(), target, 1),
+            Err(ReferenceCatalogError::TooManyCandidates(2))
+        ));
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
     fn recovery_rejects_missing_and_tampered_reachable_nodes() {
         for tamper in [false, true] {
             let (path, catalog) = store(if tamper {
@@ -2154,7 +2463,7 @@ mod tests {
             });
             let names = PageNameOwnershipRootV1::empty();
             let uuid_root = ContentDigest::of(b"uuid");
-            let mut state = ReferenceCatalogStateV1::empty(
+            let mut state = ReferenceCatalogStateV2::empty(
                 ReferenceCatalogPolicyV1::default(),
                 &names,
                 uuid_root,
@@ -2171,7 +2480,7 @@ mod tests {
             state.commit(candidate);
             let root = state.root().clone();
             let node = path
-                .join("reference-catalog-v1")
+                .join("reference-catalog-v2")
                 .join("nodes")
                 .join(format!("{}.patricia-node", root.facts_root()));
             if tamper {
@@ -2179,7 +2488,7 @@ mod tests {
             } else {
                 std::fs::remove_file(&node).unwrap();
             }
-            let mut reopened = ReferenceCatalogStateV1::restore_recovery_required(
+            let mut reopened = ReferenceCatalogStateV2::restore_recovery_required(
                 ReferenceCatalogPolicyV1::default(),
                 root,
                 &names,
@@ -2198,7 +2507,7 @@ mod tests {
         let names = PageNameOwnershipRootV1::empty();
         let uuid_root = ContentDigest::of(b"uuid");
         let mut state =
-            ReferenceCatalogStateV1::empty(ReferenceCatalogPolicyV1::default(), &names, uuid_root)
+            ReferenceCatalogStateV2::empty(ReferenceCatalogPolicyV1::default(), &names, uuid_root)
                 .unwrap();
         state.attach_store(Arc::clone(&catalog)).unwrap();
         let candidate = state
@@ -2211,6 +2520,10 @@ mod tests {
         let mut post_root = candidate.delta().clone();
         post_root.post_root.facts_root = ContentDigest::of(b"tampered");
         assert!(catalog.validate_delta(&post_root).is_err());
+
+        let mut reverse_root = candidate.delta().clone();
+        reverse_root.post_root.reverse_candidates_root = ContentDigest::of(b"tampered");
+        assert!(catalog.validate_delta(&reverse_root).is_err());
 
         let mut transition = candidate.delta().clone();
         let ReferenceTransitionBindingV1::Stored(reference) = &mut transition.transition else {
