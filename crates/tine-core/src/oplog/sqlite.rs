@@ -6448,7 +6448,7 @@ mod tests {
             panic!("schema-7 database was reopened without a disposable rebuild");
         };
         assert!(
-            reason.contains("user_version 7 != 8"),
+            reason.contains(&format!("user_version 7 != {SQLITE_SCHEMA_VERSION}")),
             "unexpected rebuild reason: {reason}"
         );
         let stale_rows: i64 = reopened
