@@ -182,6 +182,7 @@ fn page(path: &str, blocks: Vec<MaterializedBlock>) -> ProjectionPageState {
             home_document_id: DocumentId::from_uuid(uuid(501)),
             name: tine_core::oplog::LogicalPageName::parse("Projection Page").unwrap(),
             path: ManagedPath::parse(path).unwrap(),
+            kind: ManagedTextKind::Page,
             preamble: None,
             blocks,
             stats: MaterializationStats::default(),

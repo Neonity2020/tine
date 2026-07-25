@@ -1882,6 +1882,7 @@ pub struct MaterializedPage {
     pub home_document_id: DocumentId,
     pub name: LogicalPageName,
     pub path: ManagedPath,
+    pub kind: ManagedTextKind,
     pub preamble: Option<String>,
     pub blocks: Vec<MaterializedBlock>,
     pub stats: MaterializationStats,
@@ -2186,7 +2187,28 @@ enum DurableAuthorityMode {
     EnrolledRequired,
 }
 
+struct EngineAuthorityMarker;
+
+/// Opaque identity for one live engine instance.
+///
+/// This capability is deliberately neither serialized nor derived from
+/// workspace-controlled bytes. Cloning it preserves one engine's identity;
+/// constructing another engine always mints a distinct identity.
+#[derive(Clone)]
+pub(crate) struct EngineAuthority(Arc<EngineAuthorityMarker>);
+
+impl EngineAuthority {
+    fn mint() -> Self {
+        Self(Arc::new(EngineAuthorityMarker))
+    }
+
+    pub(crate) fn matches(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
 pub struct ShardedHotEngine {
+    runtime_authority: EngineAuthority,
     workspace_id: WorkspaceId,
     lineage_digest: LineageDigest,
     catalog_document_id: DocumentId,
@@ -2302,6 +2324,7 @@ impl ShardedHotEngine {
         )
         .expect("empty reference catalog has a fixed canonical binding");
         Self {
+            runtime_authority: EngineAuthority::mint(),
             workspace_id,
             lineage_digest,
             catalog_document_id,
@@ -2415,6 +2438,10 @@ impl ShardedHotEngine {
         }
         engine.archive_store = Some(Arc::new(store));
         engine
+    }
+
+    pub(crate) fn runtime_authority(&self) -> &EngineAuthority {
+        &self.runtime_authority
     }
 
     /// Open the enrolled projection capabilities without replaying non-empty
@@ -2801,6 +2828,7 @@ impl ShardedHotEngine {
             self.lineage_digest,
             self.catalog_document_id,
         );
+        replay.runtime_authority = self.runtime_authority.clone();
         replay.configure_reference_catalog_policy(reference_policy)?;
         replay.archive_store = self.archive_store.take();
         replay.projection_endpoint = self.projection_endpoint;
@@ -3282,6 +3310,119 @@ impl ShardedHotEngine {
         bytes
             .map(|bytes| decode_accepted_document(document_id, &bytes))
             .transpose()
+    }
+
+    fn authenticate_accepted_frontier_root(
+        &self,
+        root: &AcceptedFrontierRoot,
+    ) -> Result<(), EngineError> {
+        self.ensure_not_blocked()?;
+        validate_accepted_frontier_root(root)?;
+        if root.acceptance_sequence() == 0 {
+            if root != &AcceptedFrontierRoot::empty() {
+                return Err(EngineError::Archive(
+                    "requested empty accepted frontier is not canonical".into(),
+                ));
+            }
+            return Ok(());
+        }
+        let (_, evidence) = self
+            .accepted_batch_entry_at(root.acceptance_sequence())?
+            .ok_or_else(|| {
+                EngineError::Archive(format!(
+                    "requested accepted frontier sequence {} is unavailable",
+                    root.acceptance_sequence()
+                ))
+            })?;
+        match evidence {
+            Some(evidence) if evidence.post_frontier_root() == root => Ok(()),
+            Some(_) => Err(EngineError::Archive(
+                "requested accepted frontier root is not bound to accepted history".into(),
+            )),
+            None if root == &self.accepted_frontier_root => Ok(()),
+            None => Err(EngineError::Archive(
+                "historical frontier authentication requires store-backed accepted history".into(),
+            )),
+        }
+    }
+
+    fn load_document_at_accepted_frontier(
+        &self,
+        root: &AcceptedFrontierRoot,
+        document_id: DocumentId,
+    ) -> Result<Option<LoroDoc>, EngineError> {
+        let Some(dependencies) = self.accepted_frontier_document(root, document_id)? else {
+            return Ok(None);
+        };
+        let frontier = FrontierV2::new(vec![dependencies]).map_err(EngineError::from)?;
+        let mut documents = self.reconstruct_projection_frontier(&frontier)?;
+        documents
+            .remove(&document_id)
+            .ok_or(EngineError::MissingDocument(document_id))
+            .map(Some)
+    }
+
+    pub(crate) fn materialize_page_at_accepted_root(
+        &self,
+        root: &AcceptedFrontierRoot,
+        page_id: PageId,
+    ) -> Result<Option<MaterializedPage>, EngineError> {
+        self.begin_point_operation();
+        self.authenticate_accepted_frontier_root(root)?;
+        let reads_before = self.archive_read_stats();
+        let Some(catalog) =
+            self.load_document_at_accepted_frontier(root, self.catalog_document_id)?
+        else {
+            return Ok(None);
+        };
+        let Some(page_state) = validate_catalog_page(self.catalog_document_id, &catalog, page_id)?
+        else {
+            return Ok(None);
+        };
+        let PageState::Live {
+            home_document_id: page_document_id,
+            ..
+        } = page_state
+        else {
+            return Ok(None);
+        };
+        let page_document = self
+            .load_document_at_accepted_frontier(root, page_document_id)?
+            .ok_or(EngineError::MissingDocument(page_document_id))?;
+        validate_shard(self.catalog_document_id, page_document_id, &page_document)?;
+        if shard_page_id(&page_document)? != Some(page_id) {
+            return Err(EngineError::MalformedDocument {
+                document_id: page_document_id,
+                reason: "membership shard page identity mismatch".into(),
+            });
+        }
+        let members = read_memberships(page_document_id, &page_document)?;
+        let mut documents = BTreeMap::from([
+            (self.catalog_document_id, catalog),
+            (page_document_id, page_document),
+        ]);
+        for home_document_id in members
+            .values()
+            .map(|claim| claim.home_document_id)
+            .collect::<BTreeSet<_>>()
+        {
+            if documents.contains_key(&home_document_id) {
+                continue;
+            }
+            let home = self
+                .load_document_at_accepted_frontier(root, home_document_id)?
+                .ok_or(EngineError::MissingDocument(home_document_id))?;
+            documents.insert(home_document_id, home);
+        }
+        let mut page = self.materialize_page_from_documents(page_id, &documents)?;
+        let reads_after = self.archive_read_stats();
+        page.stats.physical_manifest_reads = reads_after
+            .manifest_reads
+            .saturating_sub(reads_before.manifest_reads);
+        page.stats.physical_object_reads = reads_after
+            .object_reads
+            .saturating_sub(reads_before.object_reads);
+        Ok(Some(page))
     }
 
     /// Point lookup of immutable evidence bound when this batch became
@@ -6868,6 +7009,7 @@ impl ShardedHotEngine {
         let PageState::Live {
             name,
             path,
+            kind,
             home_document_id: page_document_id,
             ..
         } = page_state
@@ -6927,6 +7069,7 @@ impl ShardedHotEngine {
             home_document_id: page_document_id,
             name,
             path,
+            kind,
             preamble,
             blocks,
             stats: MaterializationStats {
@@ -6971,6 +7114,7 @@ impl ShardedHotEngine {
         let PageState::Live {
             name,
             path,
+            kind,
             home_document_id: page_document_id,
             ..
         } = page_state
@@ -7125,6 +7269,7 @@ impl ShardedHotEngine {
             home_document_id: page_document_id,
             name,
             path,
+            kind,
             preamble,
             blocks,
             stats: MaterializationStats {
@@ -15715,6 +15860,29 @@ mod validation_tests {
             &receipts,
         );
         (root, writer, engine, catalog)
+    }
+
+    #[test]
+    fn runtime_authority_is_unique_per_engine_and_survives_in_place_recovery() {
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(89_470));
+        let lineage = LineageDigest::of(b"runtime-engine-authority");
+        let catalog = DocumentId::from_uuid(Uuid::from_u128(89_471));
+        let first = ShardedHotEngine::new(workspace, lineage, catalog);
+        let second = ShardedHotEngine::new(workspace, lineage, catalog);
+        assert!(!first
+            .runtime_authority()
+            .matches(second.runtime_authority()));
+
+        let (root, writer, mut engine, _) = enrolled_test_engine(89_472, lineage);
+        let authority = engine.runtime_authority().clone();
+        engine.prepare_operational_recovery_replay().unwrap();
+        assert!(authority.matches(engine.runtime_authority()));
+        engine.finish_operational_recovery_replay().unwrap();
+        assert!(authority.matches(engine.runtime_authority()));
+
+        drop(engine);
+        drop(writer);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn create_page_with_block(

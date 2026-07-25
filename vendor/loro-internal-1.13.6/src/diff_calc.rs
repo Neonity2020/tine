@@ -587,7 +587,8 @@ impl ExternalImportBaseline {
         }
 
         let changes = oplog.collect_changes_causally_between(&self.vv, &self.frontiers, to_vv)?;
-        let mut compact_birth_eligibility = FxHashMap::<ContainerIdx, bool>::default();
+        let mut compact_birth_candidates =
+            FxHashMap::<ContainerIdx, Option<CompactTextBirth>>::default();
         for (change, (start_counter, end_counter), _) in &changes {
             let iter_start = change
                 .ops
@@ -604,27 +605,86 @@ impl ExternalImportBaseline {
                     continue;
                 }
                 let full_op = op.counter >= *start_counter && op.ctr_end() <= *end_counter;
-                let simple_birth = full_op
-                    && matches!(
-                        &op.content,
-                        InnerContent::List(InnerListOp::InsertText {
-                            unicode_len,
-                            pos,
-                            ..
-                        }) if *pos == 0
-                            && *unicode_len > 0
-                            && *unicode_len as usize == op.atom_len()
-                    );
-                compact_birth_eligibility
-                    .entry(op.container)
-                    .and_modify(|eligible| *eligible = false)
-                    .or_insert(simple_birth);
+                let rich_op = RichOp::new_by_change(change, op);
+                let piece = match &op.content {
+                    InnerContent::List(InnerListOp::InsertText {
+                        unicode_start,
+                        unicode_len,
+                        pos,
+                        ..
+                    }) if full_op && *unicode_len > 0 && *unicode_len as usize == op.atom_len() => {
+                        Some((rich_op.id_full(), *unicode_start, *unicode_len, *pos))
+                    }
+                    _ => None,
+                };
+                match compact_birth_candidates.entry(op.container) {
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        let candidate = piece.and_then(|(id, unicode_start, unicode_len, pos)| {
+                            (pos == 0).then_some(CompactTextBirth {
+                                id,
+                                real_id: Some((id.peer, id.counter)),
+                                future: false,
+                                delete_times: 0,
+                                origin_left: None,
+                                origin_right: None,
+                                len: unicode_len,
+                                unicode_start,
+                            })
+                        });
+                        entry.insert(candidate);
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut entry) => {
+                        let Some(candidate) = entry.get_mut() else {
+                            continue;
+                        };
+                        let Some((id, unicode_start, unicode_len, pos)) = piece else {
+                            entry.insert(None);
+                            continue;
+                        };
+                        let Ok(candidate_counter_len) = Counter::try_from(candidate.len) else {
+                            entry.insert(None);
+                            continue;
+                        };
+                        let Some(expected_counter) =
+                            candidate.id.counter.checked_add(candidate_counter_len)
+                        else {
+                            entry.insert(None);
+                            continue;
+                        };
+                        let Some(expected_lamport) =
+                            candidate.id.lamport.checked_add(candidate.len)
+                        else {
+                            entry.insert(None);
+                            continue;
+                        };
+                        let Some(expected_unicode_start) =
+                            candidate.unicode_start.checked_add(candidate.len)
+                        else {
+                            entry.insert(None);
+                            continue;
+                        };
+                        if id.peer != candidate.id.peer
+                            || id.counter != expected_counter
+                            || id.lamport != expected_lamport
+                            || unicode_start != expected_unicode_start
+                            || pos != candidate.len
+                        {
+                            entry.insert(None);
+                            continue;
+                        }
+                        let Some(len) = candidate.len.checked_add(unicode_len) else {
+                            entry.insert(None);
+                            continue;
+                        };
+                        candidate.len = len;
+                    }
+                }
             }
         }
-        let compact_births = compact_birth_eligibility
+        let compact_births = compact_birth_candidates
             .into_iter()
-            .filter_map(|(idx, eligible)| eligible.then_some(idx))
-            .collect::<FxHashSet<_>>();
+            .filter_map(|(idx, candidate)| candidate.map(|candidate| (idx, candidate)))
+            .collect::<FxHashMap<_, _>>();
         let mut maps = BTreeMap::<ContainerIdx, FxHashMap<InternalString, Option<MapValue>>>::new();
         let mut touched_text = BTreeSet::new();
         for (change, (start_counter, end_counter), vv) in changes {
@@ -680,41 +740,22 @@ impl ExternalImportBaseline {
                             ));
                         }
                         next.text_containers.insert(op.container);
-                        if compact_births.contains(&op.container) {
-                            let InnerContent::List(InnerListOp::InsertText {
-                                unicode_start,
-                                unicode_len,
-                                pos,
-                                ..
-                            }) = &rich_op.raw_op().content
-                            else {
-                                unreachable!()
-                            };
-                            debug_assert_eq!(*pos, 0);
-                            debug_assert_eq!(*unicode_len as usize, rich_op.content_len());
-                            let id = rich_op.id_full();
-                            if next
-                                .text_trackers
-                                .insert(
-                                    op.container,
-                                    ExternalTextTracker::Compact(CompactTextBirth {
-                                        id,
-                                        real_id: Some((id.peer, id.counter)),
-                                        future: false,
-                                        delete_times: 0,
-                                        origin_left: None,
-                                        origin_right: None,
-                                        len: *unicode_len,
-                                        unicode_start: *unicode_start,
-                                    }),
-                                )
-                                .is_some()
-                            {
-                                return Err(external_baseline_error(
-                                    "compact text birth replaced an existing tracker",
-                                ));
+                        if let Some(compact) = compact_births.get(&op.container) {
+                            if rich_op.id_full() == compact.id {
+                                if next
+                                    .text_trackers
+                                    .insert(
+                                        op.container,
+                                        ExternalTextTracker::Compact(compact.clone()),
+                                    )
+                                    .is_some()
+                                {
+                                    return Err(external_baseline_error(
+                                        "compact text birth replaced an existing tracker",
+                                    ));
+                                }
+                                record_compact_birth();
                             }
-                            record_compact_birth();
                             touched_text.insert(op.container);
                             continue;
                         }

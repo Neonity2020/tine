@@ -1642,6 +1642,34 @@ fn compact_fresh_unicode_text_matches_forced_generic_snapshot_and_reuses_encodin
 }
 
 #[test]
+fn split_fresh_text_birth_uses_one_canonical_compact_tracker() {
+    let text = "x".repeat(65_536);
+    let (store_control, store, checkpoint, _, stats) = publish_imported_fresh_text(&text, false);
+
+    assert_eq!(
+        stats,
+        ExternalTrackerCodecStats {
+            compact_births: 1,
+            commitment_hashes: 1,
+            coverage_scans: 1,
+            ..ExternalTrackerCodecStats::default()
+        },
+        "an internally split fresh-text birth must not materialize a generic tracker"
+    );
+    let entries =
+        decode_baseline_tracker_blobs(&decode_xm(&store_control.raw_get(b"xm").unwrap()).baseline);
+    assert_eq!(entries.len(), 1);
+    let tracker: WireTracker = postcard::from_bytes(&entries[0].1.tracker).unwrap();
+    assert_eq!(tracker.spans.len(), 1);
+    assert!(tracker.deletes.is_empty());
+    assert_eq!(tracker.applied_vv, tracker.current_vv);
+    assert_eq!(tracker.spans[0].len as usize, text.len());
+
+    drop(store);
+    drop(checkpoint);
+}
+
+#[test]
 fn multiple_fresh_text_ops_in_one_import_use_the_generic_tracker() {
     let (store_control, store) = FaultStore::new();
     let external = LoroDoc::from_external_store(None, store.clone()).unwrap();

@@ -1278,6 +1278,7 @@ impl MaterializationChange {
         self.reference_catalog.as_ref()
     }
 
+    #[cfg(test)]
     pub(crate) fn without_reference_catalog(mut self) -> Result<Self, MaterializationError> {
         self.reference_catalog = None;
         self.validate_shape()?;
@@ -1317,6 +1318,7 @@ impl MaterializationChange {
         self.digest()
     }
 
+    #[cfg(test)]
     pub(crate) fn validate_against_stored(
         &self,
         batch_id: BatchId,
@@ -2615,6 +2617,7 @@ pub(crate) fn apply_change(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn reset(
     transaction: &Transaction<'_>,
     empty_frontier_digest: ContentDigest,

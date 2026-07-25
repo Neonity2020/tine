@@ -1382,6 +1382,7 @@ mod tests {
                 home_document_id: DocumentId::from_uuid(Uuid::from_u128(3)),
                 name: crate::oplog::LogicalPageName::parse("Policy").unwrap(),
                 path: ManagedPath::parse("pages/policy.md").unwrap(),
+                kind: crate::oplog::ManagedTextKind::Page,
                 preamble: None,
                 blocks: vec![
                     MaterializedBlock {

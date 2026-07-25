@@ -45,7 +45,7 @@ use rusqlite::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::hot_engine::AcceptedFrontierRoot;
+use super::hot_engine::{AcceptedFrontierRoot, EngineAuthority};
 use super::{
     BatchCausalDot, BatchId, BatchInspection, BlockId, CausalPeerId, ContentDigest,
     DocumentDependencies, DocumentId, FrontierV2, LineageDigest, LogseqUuid, LogseqUuidResolution,
@@ -667,6 +667,7 @@ fn platform_application_runtime_root() -> Result<PathBuf, ProjectionError> {
 pub struct RebuildSource<'a> {
     engine: &'a ShardedHotEngine,
     store: &'a ObjectStore,
+    runtime_authority: EngineAuthority,
     exact_frontier_root: AcceptedFrontierRoot,
     accepted_batch_count: u64,
 }
@@ -724,6 +725,7 @@ impl<'a> RebuildSource<'a> {
         Ok(Self {
             engine,
             store,
+            runtime_authority: engine.runtime_authority().clone(),
             exact_frontier_root,
             accepted_batch_count,
         })
@@ -757,6 +759,31 @@ impl<'a> RebuildSource<'a> {
         Ok(event)
     }
 
+    fn authenticate_exact_frontier(&self) -> Result<(), ProjectionError> {
+        if !self
+            .runtime_authority
+            .matches(self.engine.runtime_authority())
+        {
+            return Err(ProjectionError::AuthorityMismatch);
+        }
+        if self.accepted_batch_count == 0 {
+            if self.exact_frontier_root != AcceptedFrontierRoot::empty() {
+                return Err(ProjectionError::Rebuild(
+                    "empty accepted history has a non-empty frontier".into(),
+                ));
+            }
+            return Ok(());
+        }
+        let event = self.accepted_event_at(self.accepted_batch_count)?;
+        authenticate_event_for_engine(self.engine, &event)?;
+        if event.post_frontier_root() != &self.exact_frontier_root {
+            return Err(ProjectionError::Rebuild(
+                "accepted history tail is not bound to the exact rebuild frontier".into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn cursor(&'a self) -> Result<RebuildCursor<'a>, ProjectionError> {
         Ok(RebuildCursor {
             source: self,
@@ -766,6 +793,184 @@ impl<'a> RebuildSource<'a> {
                 .map_err(|error| ProjectionError::Rebuild(error.to_string()))?,
         })
     }
+}
+
+fn authenticate_event_for_engine(
+    engine: &ShardedHotEngine,
+    event: &AcceptedBatchEvent,
+) -> Result<(), ProjectionError> {
+    if event.workspace_id != engine.workspace_id() {
+        return Err(ProjectionError::WorkspaceMismatch {
+            expected: engine.workspace_id(),
+            found: event.workspace_id,
+        });
+    }
+    if event.lineage_digest != engine.lineage_digest() {
+        return Err(ProjectionError::LineageMismatch {
+            expected: engine.lineage_digest(),
+            found: event.lineage_digest,
+        });
+    }
+    let evidence = engine
+        .accepted_batch_evidence(event.batch_id())
+        .map_err(|error| ProjectionError::InvalidAcceptedEvent(error.to_string()))?;
+    if evidence.manifest_fingerprint() != event.manifest_digest()
+        || evidence.event_binding_digest() != event.event_binding_digest()
+        || evidence.acceptance_sequence() != event.acceptance_sequence()
+        || evidence.prior_frontier_root() != event.prior_frontier_root()
+        || evidence.post_frontier_root() != event.post_frontier_root()
+        || evidence.affected_documents() != event.affected_documents()
+    {
+        return Err(ProjectionError::InvalidAcceptedEvent(format!(
+            "accepted event {} is not bound to the engine's authenticated history",
+            event.batch_id()
+        )));
+    }
+    Ok(())
+}
+
+fn document_facets(
+    content: &str,
+    is_org: bool,
+) -> (
+    String,
+    Option<u8>,
+    bool,
+    Vec<super::MaterializedProperty>,
+    Vec<String>,
+    Option<super::MaterializedTask>,
+) {
+    // `DocBlock` removes only parser-recognized properties from visible text.
+    // Every other facet needs a property/header/tag/priority marker or an
+    // uppercase task/planning token. If none can occur, preserve the same
+    // searchable text without constructing a potentially very large AST.
+    let may_have_facets = content
+        .as_bytes()
+        .iter()
+        .any(|byte| matches!(byte, b':' | b'#' | b'[' | b'*') || byte.is_ascii_uppercase());
+    if !may_have_facets {
+        return (
+            content.split_whitespace().collect::<Vec<_>>().join(" "),
+            None,
+            false,
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
+    }
+    let mut block = crate::doc::DocBlock::new(content);
+    block.is_org = is_org;
+    let searchable_text = block
+        .visible_text()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let heading_level = block.heading_level();
+    let collapsed = block.collapsed();
+    let properties = block
+        .properties()
+        .into_iter()
+        .map(|(name, value)| super::MaterializedProperty { name, value })
+        .collect();
+    let tags = block.tags();
+    let task = block.marker().map(|marker| super::MaterializedTask {
+        marker: marker.to_owned(),
+        priority: block.priority().map(str::to_owned),
+        scheduled: block.scheduled().map(str::to_owned),
+        deadline: block.deadline().map(str::to_owned),
+    });
+    (
+        searchable_text,
+        heading_level,
+        collapsed,
+        properties,
+        tags,
+        task,
+    )
+}
+
+fn materialized_page_input(page: super::MaterializedPage) -> super::MaterializedPageInput {
+    let is_org = super::reference_catalog::reference_source_is_org(&page.path);
+    let (preamble_search, _, _, properties, tags, _) = page
+        .preamble
+        .as_deref()
+        .map(|preamble| document_facets(preamble, is_org))
+        .unwrap_or_default();
+    let mut page_search = Vec::with_capacity(2);
+    page_search.push(page.name.as_str().to_owned());
+    if !preamble_search.is_empty() {
+        page_search.push(preamble_search);
+    }
+    let blocks = page
+        .blocks
+        .into_iter()
+        .map(|block| {
+            let (searchable_text, heading_level, collapsed, properties, tags, task) =
+                document_facets(&block.content, is_org);
+            super::MaterializedBlockInput {
+                block_id: block.block_id,
+                home_document_id: block.home_document_id,
+                parent: block.parent,
+                order: block.order,
+                content: block.content,
+                searchable_text,
+                heading_level,
+                collapsed,
+                logseq_uuid: block.logseq_uuid,
+                logseq_identity_origin: block.logseq_identity_origin,
+                references: Vec::new(),
+                properties,
+                tags,
+                task,
+            }
+        })
+        .collect::<Vec<_>>();
+    super::MaterializedPageInput {
+        page_id: page.page_id,
+        home_document_id: page.home_document_id,
+        name: page.name.as_str().to_owned(),
+        name_key: page.name.canonical_key(),
+        path: page.path,
+        kind: page.kind,
+        preamble: page.preamble,
+        searchable_text: page_search.join(" "),
+        references: Vec::new(),
+        properties,
+        tags,
+        blocks,
+    }
+}
+
+pub(crate) fn materialize_accepted_event(
+    engine: &ShardedHotEngine,
+    event: &AcceptedBatchEvent,
+) -> Result<super::MaterializationChange, ProjectionError> {
+    authenticate_event_for_engine(engine, event)?;
+    let effect = SemanticEffect::decode(event.semantic_effect())
+        .map_err(|error| ProjectionError::Materialization(error.to_string()))?;
+    let canonical_effect = effect
+        .encode()
+        .map_err(|error| ProjectionError::Materialization(error.to_string()))?;
+    if canonical_effect != event.semantic_effect() {
+        return Err(ProjectionError::InvalidAcceptedEvent(format!(
+            "accepted event {} has a non-canonical semantic effect",
+            event.batch_id()
+        )));
+    }
+    let mut replacements = Vec::new();
+    let mut deletions = Vec::new();
+    for page_id in super::reference_catalog::affected_reference_sources(&effect) {
+        match engine
+            .materialize_page_at_accepted_root(event.post_frontier_root(), page_id)
+            .map_err(|error| ProjectionError::Materialization(error.to_string()))?
+        {
+            Some(page) => {
+                replacements.push(materialized_page_input(page));
+            }
+            None => deletions.push(page_id),
+        }
+    }
+    super::MaterializationChange::new(event.batch_id(), replacements, deletions).map_err(Into::into)
 }
 
 fn attach_authenticated_reference_catalog(
@@ -1046,6 +1251,7 @@ struct TailDescriptor {
 }
 
 pub struct TailOverlay {
+    runtime_authority: EngineAuthority,
     hot_descriptors: BTreeMap<u64, TailDescriptor>,
     retained_bytes: usize,
     authoritative_retained_bytes_total: u64,
@@ -1056,6 +1262,23 @@ pub struct TailOverlay {
     reservations: BTreeMap<u64, usize>,
     reserved_bytes: usize,
     next_reservation_id: u64,
+    authenticated_source_frontier: Option<AcceptedFrontierRoot>,
+}
+
+struct RequiredFrontierTransition {
+    replacement: Option<AcceptedFrontierRoot>,
+}
+
+struct TailAdmissionPlan {
+    required_frontier: RequiredFrontierTransition,
+    applied_through: u64,
+    applied_retained_bytes_total: u64,
+    authoritative_through: u64,
+    authoritative_retained_bytes_total: u64,
+    retained_bytes: usize,
+    descriptor_overflow: bool,
+    descriptor: Option<(u64, TailDescriptor)>,
+    observed: bool,
 }
 
 /// Causal accounting for a frontier-gated reference query.  The counters make
@@ -1127,8 +1350,9 @@ pub struct FrontierReferenceQuery<'a> {
 
 impl TailOverlay {
     #[cfg(test)]
-    fn empty_for_test() -> Self {
+    fn empty_for_test(engine: &ShardedHotEngine) -> Self {
         Self {
+            runtime_authority: engine.runtime_authority().clone(),
             hot_descriptors: BTreeMap::new(),
             retained_bytes: 0,
             authoritative_retained_bytes_total: 0,
@@ -1139,6 +1363,7 @@ impl TailOverlay {
             reservations: BTreeMap::new(),
             reserved_bytes: 0,
             next_reservation_id: 0,
+            authenticated_source_frontier: None,
         }
     }
 
@@ -1151,6 +1376,13 @@ impl TailOverlay {
         database: &SqliteFrontier,
         source: &RebuildSource<'_>,
     ) -> Result<Self, TailOverlayError> {
+        if !database
+            .runtime_authority
+            .matches(&source.runtime_authority)
+        {
+            return Err(ProjectionError::AuthorityMismatch.into());
+        }
+        source.authenticate_exact_frontier()?;
         let applied = database.frontier_root()?;
         let accepted = &source.exact_frontier_root;
         if applied.acceptance_sequence() > accepted.acceptance_sequence()
@@ -1170,6 +1402,7 @@ impl TailOverlay {
             .acceptance_sequence()
             .saturating_sub(applied.acceptance_sequence());
         Ok(Self {
+            runtime_authority: source.runtime_authority.clone(),
             hot_descriptors: BTreeMap::new(),
             retained_bytes,
             authoritative_retained_bytes_total: accepted.retained_bytes_total(),
@@ -1181,6 +1414,7 @@ impl TailOverlay {
             reservations: BTreeMap::new(),
             reserved_bytes: 0,
             next_reservation_id: 0,
+            authenticated_source_frontier: Some(source.exact_frontier_root.clone()),
         })
     }
 
@@ -1267,14 +1501,21 @@ impl TailOverlay {
         &mut self,
         reservation: TailReservation,
         database: &mut SqliteFrontier,
+        engine: &ShardedHotEngine,
         event: AcceptedBatchEvent,
     ) -> Result<bool, TailOverlayError> {
-        let Some(retained_bytes) = self.reservations.remove(&reservation.id) else {
+        self.authenticate_event_authority(database, engine)?;
+        let Some(&retained_bytes) = self.reservations.get(&reservation.id) else {
             return Err(TailOverlayError::UnknownReservation);
         };
         debug_assert_eq!(retained_bytes, reservation.retained_bytes);
+        authenticate_event_for_engine(engine, &event)?;
+        let plan = self.plan_authenticated_admission(database, &event)?;
+        let observed = plan.observed;
+        self.commit_admission(database, plan);
+        self.reservations.remove(&reservation.id);
         self.reserved_bytes = self.reserved_bytes.saturating_sub(retained_bytes);
-        self.observe_authoritative(database, &event)
+        Ok(observed)
     }
 
     /// Observe an already-authoritative local or provider event. The durable
@@ -1283,71 +1524,173 @@ impl TailOverlay {
     pub fn try_enqueue(
         &mut self,
         database: &mut SqliteFrontier,
+        engine: &ShardedHotEngine,
         event: &AcceptedBatchEvent,
     ) -> Result<bool, TailOverlayError> {
-        self.observe_authoritative(database, event)
+        self.authenticate_event_authority(database, engine)?;
+        authenticate_event_for_engine(engine, event)?;
+        let plan = self.plan_authenticated_admission(database, event)?;
+        let observed = plan.observed;
+        self.commit_admission(database, plan);
+        Ok(observed)
     }
 
-    fn observe_authoritative(
-        &mut self,
-        database: &mut SqliteFrontier,
+    fn authenticate_event_authority(
+        &self,
+        database: &SqliteFrontier,
+        engine: &ShardedHotEngine,
+    ) -> Result<(), TailOverlayError> {
+        if !self.runtime_authority.matches(&database.runtime_authority)
+            || !self.runtime_authority.matches(engine.runtime_authority())
+        {
+            return Err(ProjectionError::AuthorityMismatch.into());
+        }
+        Ok(())
+    }
+
+    fn plan_authenticated_admission(
+        &self,
+        database: &SqliteFrontier,
         event: &AcceptedBatchEvent,
-    ) -> Result<bool, TailOverlayError> {
+    ) -> Result<TailAdmissionPlan, TailOverlayError> {
+        let required_frontier = database.plan_required_frontier(event.post_frontier_root())?;
         let applied = database.frontier_root()?;
-        self.applied_through = self.applied_through.max(applied.acceptance_sequence());
-        self.applied_retained_bytes_total = self
+        let applied_through = self.applied_through.max(applied.acceptance_sequence());
+        let applied_retained_bytes_total = self
             .applied_retained_bytes_total
             .max(applied.retained_bytes_total());
         if event.acceptance_sequence <= applied.acceptance_sequence() {
-            return match database.apply_accepted(event)? {
-                ApplyDisposition::Duplicate => Ok(false),
-                ApplyDisposition::Applied => Err(ProjectionError::Corrupt(
-                    "stale provider event unexpectedly advanced SQLite".into(),
-                )
-                .into()),
-            };
+            database.validate_applied_tail_duplicate(event, &applied)?;
+            return Ok(TailAdmissionPlan {
+                required_frontier,
+                applied_through,
+                applied_retained_bytes_total,
+                authoritative_through: self.authoritative_through,
+                authoritative_retained_bytes_total: self.authoritative_retained_bytes_total,
+                retained_bytes: self.retained_bytes,
+                descriptor_overflow: self.descriptor_overflow,
+                descriptor: None,
+                observed: false,
+            });
         }
         let descriptor = TailDescriptor {
             batch_id: event.batch_id,
             manifest_digest: event.manifest_digest,
             retained_bytes: event.retained_bytes,
         };
+        if event.post_frontier_root.acceptance_sequence() != event.acceptance_sequence {
+            return Err(ProjectionError::InvalidAcceptedEvent(
+                "accepted event sequence differs from its authenticated post-root".into(),
+            )
+            .into());
+        }
         if let Some(existing) = self.hot_descriptors.get(&event.acceptance_sequence) {
+            if existing != &descriptor {
+                return Err(TailOverlayError::BatchCollision(descriptor.batch_id));
+            }
+            return Ok(TailAdmissionPlan {
+                required_frontier,
+                applied_through,
+                applied_retained_bytes_total,
+                authoritative_through: self.authoritative_through,
+                authoritative_retained_bytes_total: self.authoritative_retained_bytes_total,
+                retained_bytes: self.retained_bytes,
+                descriptor_overflow: self.descriptor_overflow,
+                descriptor: None,
+                observed: false,
+            });
+        }
+
+        let mut authoritative_through = self.authoritative_through;
+        let mut authoritative_retained_bytes_total = self.authoritative_retained_bytes_total;
+        let mut retained_bytes = self.retained_bytes;
+        if event.acceptance_sequence > authoritative_through {
+            authoritative_through = event.acceptance_sequence;
+            authoritative_retained_bytes_total = event
+                .post_frontier_root
+                .retained_bytes_total()
+                .max(authoritative_retained_bytes_total);
+            let retained = authoritative_retained_bytes_total
+                .checked_sub(applied_retained_bytes_total)
+                .ok_or(ProjectionError::FrontierRegression)?;
+            retained_bytes = usize::try_from(retained).map_err(|_| {
+                ProjectionError::Corrupt(
+                    "durable accepted backlog exceeds addressable memory".into(),
+                )
+            })?;
+        }
+        let mut descriptor_overflow = self.descriptor_overflow;
+        let descriptor =
+            if self.hot_descriptors.len() < TAIL_MAX_BATCHES && retained_bytes <= TAIL_MAX_BYTES {
+                Some((event.acceptance_sequence, descriptor))
+            } else {
+                descriptor_overflow = true;
+                None
+            };
+        Ok(TailAdmissionPlan {
+            required_frontier,
+            applied_through,
+            applied_retained_bytes_total,
+            authoritative_through,
+            authoritative_retained_bytes_total,
+            retained_bytes,
+            descriptor_overflow,
+            descriptor,
+            observed: true,
+        })
+    }
+
+    fn commit_admission(&mut self, database: &mut SqliteFrontier, plan: TailAdmissionPlan) {
+        database.commit_required_frontier(plan.required_frontier);
+        self.applied_through = plan.applied_through;
+        self.applied_retained_bytes_total = plan.applied_retained_bytes_total;
+        self.authoritative_through = plan.authoritative_through;
+        self.authoritative_retained_bytes_total = plan.authoritative_retained_bytes_total;
+        self.retained_bytes = plan.retained_bytes;
+        self.descriptor_overflow = plan.descriptor_overflow;
+        if let Some((sequence, descriptor)) = plan.descriptor {
+            self.hot_descriptors.insert(sequence, descriptor);
+        }
+    }
+
+    /// Direct bounded-accounting harness for the provider-cap regression.
+    #[cfg(test)]
+    fn record_authoritative_descriptor(
+        &mut self,
+        acceptance_sequence: u64,
+        authoritative_retained_bytes_total: u64,
+        descriptor: TailDescriptor,
+    ) -> Result<bool, TailOverlayError> {
+        if let Some(existing) = self.hot_descriptors.get(&acceptance_sequence) {
             return if existing == &descriptor {
                 Ok(false)
             } else {
-                Err(TailOverlayError::BatchCollision(event.batch_id))
+                Err(TailOverlayError::BatchCollision(descriptor.batch_id))
             };
         }
-        if event.acceptance_sequence > self.authoritative_through {
-            let authoritative_retained_bytes_total =
-                if event.post_frontier_root.acceptance_sequence() == event.acceptance_sequence {
-                    event.post_frontier_root.retained_bytes_total()
-                } else {
-                    #[cfg(test)]
-                    {
-                        // Large-tail tests use private synthetic descriptors
-                        // without manufacturing authenticated frontier roots.
-                        self.authoritative_retained_bytes_total
-                            .saturating_add(u64::try_from(event.retained_bytes).unwrap_or(u64::MAX))
-                    }
-                    #[cfg(not(test))]
-                    {
-                        return Err(ProjectionError::InvalidAcceptedEvent(
-                            "accepted event sequence differs from its authenticated post-root"
-                                .into(),
-                        )
-                        .into());
-                    }
-                };
-            self.authoritative_retained_bytes_total =
-                authoritative_retained_bytes_total.max(self.authoritative_retained_bytes_total);
-            self.authoritative_through = event.acceptance_sequence;
-            self.refresh_retained_bytes()?;
+        let mut next_authoritative_through = self.authoritative_through;
+        let mut next_authoritative_retained_bytes_total = self.authoritative_retained_bytes_total;
+        let mut next_retained_bytes = self.retained_bytes;
+        if acceptance_sequence > next_authoritative_through {
+            next_authoritative_through = acceptance_sequence;
+            next_authoritative_retained_bytes_total =
+                authoritative_retained_bytes_total.max(next_authoritative_retained_bytes_total);
+            let retained_bytes = next_authoritative_retained_bytes_total
+                .checked_sub(self.applied_retained_bytes_total)
+                .ok_or(ProjectionError::FrontierRegression)?;
+            next_retained_bytes = usize::try_from(retained_bytes).map_err(|_| {
+                ProjectionError::Corrupt(
+                    "durable accepted backlog exceeds addressable memory".into(),
+                )
+            })?;
         }
-        if self.hot_descriptors.len() < TAIL_MAX_BATCHES && self.retained_bytes <= TAIL_MAX_BYTES {
-            self.hot_descriptors
-                .insert(event.acceptance_sequence, descriptor);
+        let insert =
+            self.hot_descriptors.len() < TAIL_MAX_BATCHES && next_retained_bytes <= TAIL_MAX_BYTES;
+        self.authoritative_through = next_authoritative_through;
+        self.authoritative_retained_bytes_total = next_authoritative_retained_bytes_total;
+        self.retained_bytes = next_retained_bytes;
+        if insert {
+            self.hot_descriptors.insert(acceptance_sequence, descriptor);
         } else {
             self.descriptor_overflow = true;
         }
@@ -1374,8 +1717,29 @@ impl TailOverlay {
         source: &RebuildSource<'_>,
         max_batches: usize,
     ) -> Result<usize, TailOverlayError> {
-        let mut applied = 0;
+        if !self.runtime_authority.matches(&database.runtime_authority)
+            || !self.runtime_authority.matches(&source.runtime_authority)
+            || !source
+                .runtime_authority
+                .matches(source.engine.runtime_authority())
+        {
+            return Err(ProjectionError::AuthorityMismatch.into());
+        }
+        let authenticate_source =
+            self.authenticated_source_frontier.as_ref() != Some(&source.exact_frontier_root);
+        if authenticate_source {
+            source.authenticate_exact_frontier()?;
+        }
+        let required_frontier = database.plan_required_frontier(&source.exact_frontier_root)?;
+
+        // Once the bound exact source is authenticated, keep reads gated to
+        // that root while its accepted prefix drains.
+        database.commit_required_frontier(required_frontier);
+        if authenticate_source {
+            self.authenticated_source_frontier = Some(source.exact_frontier_root.clone());
+        }
         self.authoritative_through = self.authoritative_through.max(source.accepted_batch_count);
+        let mut applied = 0;
         while applied < max_batches {
             let expected_sequence =
                 database
@@ -1397,7 +1761,7 @@ impl TailOverlay {
                     return Err(TailOverlayError::BatchCollision(event.batch_id));
                 }
             }
-            database.apply_accepted(&event)?;
+            database.apply_engine_owned_accepted(&event, source.engine)?;
             self.hot_descriptors.remove(&expected_sequence);
             self.applied_through = expected_sequence;
             self.applied_retained_bytes_total = event.post_frontier_root.retained_bytes_total();
@@ -1423,6 +1787,8 @@ pub struct SqliteFrontier {
     path: PathBuf,
     claim: ProjectionClaim,
     connection: Connection,
+    runtime_authority: EngineAuthority,
+    required_frontier_root: AcceptedFrontierRoot,
     checkpoint_each_apply: bool,
     _lease: Arc<ProcessLease>,
 }
@@ -1448,6 +1814,7 @@ impl SqliteFrontier {
         source: RebuildSource<'_>,
     ) -> Result<OpenProjection, ProjectionError> {
         validate_source(claim, &source)?;
+        source.authenticate_exact_frontier()?;
         let path = prepare_database_path(path)?;
         let lease = Arc::new(ProcessLease::acquire(
             source.store,
@@ -1468,6 +1835,8 @@ impl SqliteFrontier {
                                 path,
                                 claim,
                                 connection,
+                                runtime_authority: source.runtime_authority.clone(),
+                                required_frontier_root: source.exact_frontier_root.clone(),
                                 checkpoint_each_apply: true,
                                 _lease: lease,
                             },
@@ -1487,6 +1856,8 @@ impl SqliteFrontier {
                             path,
                             claim,
                             connection,
+                            runtime_authority: source.runtime_authority.clone(),
+                            required_frontier_root: source.exact_frontier_root.clone(),
                             checkpoint_each_apply: true,
                             _lease: lease,
                         },
@@ -1543,7 +1914,13 @@ impl SqliteFrontier {
     ) -> Result<(Self, RebuildInstrumentation), ProjectionError> {
         let candidate_path = candidate_database_path(path)?;
         remove_projection_files(&candidate_path)?;
-        let mut candidate = Self::create_new(&candidate_path, claim, Arc::clone(&lease))?;
+        let mut candidate = Self::create_new(
+            &candidate_path,
+            claim,
+            Arc::clone(&lease),
+            source.runtime_authority.clone(),
+        )?;
+        candidate.require_frontier(&source.exact_frontier_root)?;
         let rebuild = match candidate.rebuild_stream(source) {
             Ok(rebuild) => rebuild,
             Err(error) => {
@@ -1582,6 +1959,8 @@ impl SqliteFrontier {
                 path: path.to_path_buf(),
                 claim,
                 connection,
+                runtime_authority: source.runtime_authority.clone(),
+                required_frontier_root: source.exact_frontier_root.clone(),
                 checkpoint_each_apply: true,
                 _lease: lease,
             },
@@ -1593,6 +1972,7 @@ impl SqliteFrontier {
         path: &Path,
         claim: ProjectionClaim,
         lease: Arc<ProcessLease>,
+        runtime_authority: EngineAuthority,
     ) -> Result<Self, ProjectionError> {
         let connection = open_writable(path)?;
         initialize_schema(&connection, claim)?;
@@ -1602,6 +1982,8 @@ impl SqliteFrontier {
             path: path.to_path_buf(),
             claim,
             connection,
+            runtime_authority,
+            required_frontier_root: AcceptedFrontierRoot::empty(),
             checkpoint_each_apply: false,
             _lease: lease,
         })
@@ -1613,6 +1995,80 @@ impl SqliteFrontier {
 
     pub const fn claim(&self) -> ProjectionClaim {
         self.claim
+    }
+
+    fn plan_required_frontier(
+        &self,
+        root: &AcceptedFrontierRoot,
+    ) -> Result<RequiredFrontierTransition, ProjectionError> {
+        canonical_frontier_root_bytes(root)?;
+        let replacement = match root
+            .acceptance_sequence()
+            .cmp(&self.required_frontier_root.acceptance_sequence())
+        {
+            std::cmp::Ordering::Greater => Some(root.clone()),
+            std::cmp::Ordering::Equal if root == &self.required_frontier_root => None,
+            std::cmp::Ordering::Equal => {
+                return Err(ProjectionError::Corrupt(
+                    "two accepted frontier roots claim the same required sequence".into(),
+                ));
+            }
+            std::cmp::Ordering::Less => None,
+        };
+        Ok(RequiredFrontierTransition { replacement })
+    }
+
+    fn commit_required_frontier(&mut self, transition: RequiredFrontierTransition) {
+        if let Some(root) = transition.replacement {
+            self.required_frontier_root = root;
+        }
+    }
+
+    fn require_frontier(&mut self, root: &AcceptedFrontierRoot) -> Result<(), ProjectionError> {
+        let transition = self.plan_required_frontier(root)?;
+        self.commit_required_frontier(transition);
+        Ok(())
+    }
+
+    fn validate_applied_tail_duplicate(
+        &self,
+        event: &AcceptedBatchEvent,
+        current_root: &AcceptedFrontierRoot,
+    ) -> Result<(), ProjectionError> {
+        self.validate_event_claim(event)?;
+        if let Some(existing) = load_batch(&self.connection, event.batch_id)? {
+            let mut rows_read = 0;
+            if authenticated_batch_record(
+                &self.connection,
+                current_root,
+                event.batch_id,
+                &mut rows_read,
+            )?
+            .is_none()
+            {
+                return Err(ProjectionError::Corrupt(format!(
+                    "stored batch {} is absent from the authenticated accepted map",
+                    event.batch_id
+                )));
+            }
+            if !existing.matches(event)? {
+                return Err(ProjectionError::BatchCollision(event.batch_id));
+            }
+            if current_root.acceptance_sequence() >= event.acceptance_sequence
+                && current_root.state_digest() != event.prior_frontier_root.state_digest()
+            {
+                return Ok(());
+            }
+            return Err(ProjectionError::FrontierRegression);
+        }
+        let expected = current_root
+            .acceptance_sequence()
+            .checked_add(1)
+            .ok_or_else(|| ProjectionError::Corrupt("applied batch sequence overflowed".into()))?;
+        Err(ProjectionError::AcceptanceOrder {
+            expected,
+            found: event.acceptance_sequence,
+        })
     }
 
     pub fn frontier_root(&self) -> Result<AcceptedFrontierRoot, ProjectionError> {
@@ -1683,14 +2139,16 @@ impl SqliteFrontier {
             .map(|record| record.is_some())
     }
 
-    pub fn apply_accepted(
+    #[cfg(test)]
+    fn apply_accepted(
         &mut self,
         event: &AcceptedBatchEvent,
     ) -> Result<ApplyDisposition, ProjectionError> {
         self.apply_internal(event, ApplyFault::None)
     }
 
-    pub fn apply_materialized_accepted(
+    #[cfg(test)]
+    fn apply_materialized_accepted(
         &mut self,
         event: &AcceptedBatchEvent,
         materialization: &super::MaterializationChange,
@@ -1698,17 +2156,33 @@ impl SqliteFrontier {
         self.apply_internal_with_materialization(event, ApplyFault::None, Some(materialization))
     }
 
-    /// Materialize an accepted batch together with the exact authenticated
-    /// reference-catalog transition.  The page materialization remains caller
-    /// supplied because parser/search/task facets are not semantic-operation
-    /// data; the reference component is derived only here from immutable
-    /// catalog objects bound to `event`.
-    pub fn apply_authenticated_reference_catalog_materialized_accepted(
+    /// Apply one accepted event using only projection data derived by the
+    /// bound engine at the event's authenticated accepted root.
+    fn apply_engine_owned_accepted(
+        &mut self,
+        event: &AcceptedBatchEvent,
+        engine: &ShardedHotEngine,
+    ) -> Result<ApplyDisposition, ProjectionError> {
+        if !self.runtime_authority.matches(engine.runtime_authority()) {
+            return Err(ProjectionError::AuthorityMismatch);
+        }
+        let materialization = materialize_accepted_event(engine, event)?;
+        let materialization =
+            attach_authenticated_reference_catalog(engine, event, materialization)?;
+        self.apply_internal_with_materialization(event, ApplyFault::None, Some(&materialization))
+    }
+
+    #[cfg(test)]
+    fn apply_authenticated_reference_catalog_materialized_accepted(
         &mut self,
         event: &AcceptedBatchEvent,
         materialization: super::MaterializationChange,
         engine: &ShardedHotEngine,
     ) -> Result<ApplyDisposition, ProjectionError> {
+        if !self.runtime_authority.matches(engine.runtime_authority()) {
+            return Err(ProjectionError::AuthorityMismatch);
+        }
+        authenticate_event_for_engine(engine, event)?;
         let materialization =
             attach_authenticated_reference_catalog(engine, event, materialization)?;
         self.apply_internal_with_materialization(event, ApplyFault::None, Some(&materialization))
@@ -1716,6 +2190,13 @@ impl SqliteFrontier {
 
     pub fn materialized_read(&self) -> Result<super::SqliteMaterializedRead<'_>, ProjectionError> {
         let root = read_frontier_root(&self.connection)?;
+        if root != self.required_frontier_root {
+            return Err(ProjectionError::Materialization(format!(
+                "SQLite materialization frontier {} is behind required accepted frontier {}",
+                root.acceptance_sequence(),
+                self.required_frontier_root.acceptance_sequence()
+            )));
+        }
         let root_bytes = canonical_frontier_root_bytes(&root)?;
         super::SqliteMaterializedRead::new(
             &self.connection,
@@ -1810,7 +2291,8 @@ impl SqliteFrontier {
     /// against the stored accepted semantic effect at the same sequence and is
     /// committed with its materialization stamp. Until the final sequence is
     /// present, [`Self::materialized_read`] fails closed as stale.
-    pub fn rebuild_materialization<I>(&mut self, changes: I) -> Result<usize, ProjectionError>
+    #[cfg(test)]
+    fn rebuild_materialization<I>(&mut self, changes: I) -> Result<usize, ProjectionError>
     where
         I: IntoIterator<Item = super::MaterializationChange>,
     {
@@ -1821,7 +2303,8 @@ impl SqliteFrontier {
     /// row afresh from the catalog roots bound to accepted history.  Generic
     /// page/search facets still come from the supplied projection inputs;
     /// reference facts never do.
-    pub fn rebuild_authenticated_reference_catalog_materialization<I>(
+    #[cfg(test)]
+    fn rebuild_authenticated_reference_catalog_materialization<I>(
         &mut self,
         changes: I,
         engine: &ShardedHotEngine,
@@ -1829,9 +2312,13 @@ impl SqliteFrontier {
     where
         I: IntoIterator<Item = super::MaterializationChange>,
     {
+        if !self.runtime_authority.matches(engine.runtime_authority()) {
+            return Err(ProjectionError::AuthorityMismatch);
+        }
         self.rebuild_materialization_inner(changes, Some(engine))
     }
 
+    #[cfg(test)]
     fn rebuild_materialization_inner<I>(
         &mut self,
         changes: I,
@@ -1980,7 +2467,7 @@ impl SqliteFrontier {
             instrumentation.max_live_events = instrumentation.max_live_events.max(1);
             instrumentation.max_live_evidence_records =
                 instrumentation.max_live_evidence_records.max(1);
-            self.apply_internal(&event, ApplyFault::None)?;
+            self.apply_engine_owned_accepted(&event, source.engine)?;
             instrumentation.accepted_events_applied += 1;
             maybe_abort_rebuild_test(instrumentation.accepted_events_applied);
         }
@@ -2003,6 +2490,7 @@ impl SqliteFrontier {
         Ok(instrumentation)
     }
 
+    #[cfg(test)]
     fn apply_internal(
         &mut self,
         event: &AcceptedBatchEvent,
@@ -2020,6 +2508,7 @@ impl SqliteFrontier {
         #[cfg(not(test))]
         let _ = fault;
         self.validate_event_claim(event)?;
+        self.require_frontier(event.post_frontier_root())?;
         let materialization_digest = materialization
             .map(|change| change.validate_for_event(event))
             .transpose()?;
@@ -2453,6 +2942,14 @@ fn validate_existing(
             return Err("SQLite final accepted row is not bound to the frontier root".into());
         }
     }
+    let root_bytes =
+        canonical_frontier_root_bytes(&found_frontier).map_err(|error| error.to_string())?;
+    super::sqlite_materialization::ensure_stamp(
+        &connection,
+        found_frontier.acceptance_sequence(),
+        ContentDigest::of(&root_bytes),
+    )
+    .map_err(|error| error.to_string())?;
     Ok(())
 }
 
@@ -3171,6 +3668,7 @@ impl StoredBatch {
             .map_err(|error| ProjectionError::Corrupt(error.to_string()))
     }
 
+    #[cfg(test)]
     fn authenticated_reference_materialization(
         &self,
     ) -> Result<super::sqlite_materialization::AuthenticatedReferenceMaterialization, ProjectionError>
@@ -5337,6 +5835,7 @@ pub enum ProjectionError {
     Io(String),
     UnsafePath(String),
     LeaseContended(PathBuf),
+    AuthorityMismatch,
     WorkspaceMismatch {
         expected: WorkspaceId,
         found: WorkspaceId,
@@ -5380,6 +5879,12 @@ impl fmt::Display for ProjectionError {
             Self::UnsafePath(error) => write!(f, "unsafe SQLite projection path: {error}"),
             Self::LeaseContended(path) => {
                 write!(f, "SQLite applier lease is held: {}", path.display())
+            }
+            Self::AuthorityMismatch => {
+                write!(
+                    f,
+                    "SQLite projection is bound to another live engine authority"
+                )
             }
             Self::WorkspaceMismatch { expected, found } => {
                 write!(f, "workspace mismatch: expected {expected}, found {found}")
@@ -5472,7 +5977,11 @@ impl SqliteFrontier {
         engine: &'a ShardedHotEngine,
         store: &'a ObjectStore,
     ) -> Result<FrontierReferenceQuery<'a>, ProjectionError> {
+        if !self.runtime_authority.matches(engine.runtime_authority()) {
+            return Err(ProjectionError::AuthorityMismatch);
+        }
         let source = RebuildSource::new(engine, store)?;
+        source.authenticate_exact_frontier()?;
         let mut expected = self.frontier_root()?;
         let base_catalog_root = self.authenticated_reference_catalog_root()?;
         let accepted = engine
@@ -6190,7 +6699,8 @@ mod tests {
         ManagedPath, ManagedTextKind, MaterializationChange, MaterializedBlockInput,
         MaterializedEntityId, MaterializedPageInput, MaterializedProperty, MaterializedReference,
         MaterializedReferenceKind, MaterializedReferrerRow, MaterializedTask, OperationBatch,
-        OperationObject, OperationTransaction, PageId, PreparedBatch, SemanticOperation, SessionId,
+        OperationObject, OperationTransaction, PageId, PageRename, PreparedBatch,
+        SemanticOperation, SessionId,
     };
 
     struct TestDir(PathBuf);
@@ -6469,12 +6979,14 @@ mod tests {
             )
             .unwrap();
         store.publish_prepared(&prepared).unwrap();
-        let mut accepted_engine = ids.engine();
+        let engine_store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
+        let mut accepted_engine =
+            ShardedHotEngine::with_archive_store(engine_store, ids.lineage, ids.catalog);
         assert!(matches!(
             accepted_engine
-                .stage_from_store(&store, prepared.manifest().batch_id())
+                .stage_archive_batch(prepared.manifest().batch_id())
                 .unwrap()
-                .disposition(),
+                .disposition,
             BatchDisposition::Accepted { .. }
         ));
         let path = dir.path().join("frontier.sqlite");
@@ -6514,6 +7026,54 @@ mod tests {
             ProjectionRecovery::RebuiltMissing { applied_batches: 0 }
         );
         (opened.database, engine, store)
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct OverlayLogicalState {
+        hot_descriptors: BTreeMap<u64, TailDescriptor>,
+        retained_bytes: usize,
+        authoritative_retained_bytes_total: u64,
+        applied_retained_bytes_total: u64,
+        authoritative_through: u64,
+        applied_through: u64,
+        descriptor_overflow: bool,
+        reservations: BTreeMap<u64, usize>,
+        reserved_bytes: usize,
+        next_reservation_id: u64,
+        authenticated_source_frontier: Option<AcceptedFrontierRoot>,
+    }
+
+    fn overlay_logical_state(overlay: &TailOverlay) -> OverlayLogicalState {
+        OverlayLogicalState {
+            hot_descriptors: overlay.hot_descriptors.clone(),
+            retained_bytes: overlay.retained_bytes,
+            authoritative_retained_bytes_total: overlay.authoritative_retained_bytes_total,
+            applied_retained_bytes_total: overlay.applied_retained_bytes_total,
+            authoritative_through: overlay.authoritative_through,
+            applied_through: overlay.applied_through,
+            descriptor_overflow: overlay.descriptor_overflow,
+            reservations: overlay.reservations.clone(),
+            reserved_bytes: overlay.reserved_bytes,
+            next_reservation_id: overlay.next_reservation_id,
+            authenticated_source_frontier: overlay.authenticated_source_frontier.clone(),
+        }
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct DatabaseLogicalState {
+        frontier_root: AcceptedFrontierRoot,
+        required_frontier_root: AcceptedFrontierRoot,
+        applied_batch_count: usize,
+        semantic_digest: ContentDigest,
+    }
+
+    fn database_logical_state(database: &SqliteFrontier) -> DatabaseLogicalState {
+        DatabaseLogicalState {
+            frontier_root: database.frontier_root().unwrap(),
+            required_frontier_root: database.required_frontier_root.clone(),
+            applied_batch_count: database.applied_batch_count().unwrap(),
+            semantic_digest: database.semantic_projection_digest().unwrap(),
+        }
     }
 
     fn stored_semantic_effects(database: &SqliteFrontier) -> Vec<SemanticEffect> {
@@ -6778,13 +7338,15 @@ mod tests {
         }
 
         if mode == "recover" {
-            let mut accepted_engine = ids.engine();
+            let engine_store = ObjectStore::open(&root.join("objects"), ids.workspace).unwrap();
+            let mut accepted_engine =
+                ShardedHotEngine::with_archive_store(engine_store, ids.lineage, ids.catalog);
             for manifest in store.committed_manifests().unwrap() {
                 assert!(matches!(
                     accepted_engine
-                        .stage_from_store(&store, manifest.batch_id())
+                        .stage_archive_batch(manifest.batch_id())
                         .unwrap()
-                        .disposition(),
+                        .disposition,
                     BatchDisposition::Accepted { .. }
                 ));
             }
@@ -6799,12 +7361,14 @@ mod tests {
         }
 
         let batch_id = batch(seed + 100);
-        let mut accepted_engine = ids.engine();
+        let engine_store = ObjectStore::open(&root.join("objects"), ids.workspace).unwrap();
+        let mut accepted_engine =
+            ShardedHotEngine::with_archive_store(engine_store, ids.lineage, ids.catalog);
         assert!(matches!(
             accepted_engine
-                .stage_from_store(&store, batch_id)
+                .stage_archive_batch(batch_id)
                 .unwrap()
-                .disposition(),
+                .disposition,
             BatchDisposition::Accepted { .. }
         ));
         let empty_engine = ids.engine();
@@ -7937,11 +8501,12 @@ mod tests {
                     "{case} {field} contradiction must fail"
                 );
                 assert_eq!(database.applied_batch_count().unwrap(), 1, "{case} {field}");
-                let read = database.materialized_read().unwrap();
-                assert_eq!(
-                    read.page(ids.page).unwrap(),
-                    Some(prior_page.clone()),
-                    "{case} {field}"
+                assert!(
+                    matches!(
+                        database.materialized_read(),
+                        Err(ProjectionError::Materialization(_))
+                    ),
+                    "{case} {field} exposed stale rows after an accepted event failed"
                 );
                 let stamp: i64 = database
                     .connection
@@ -8148,7 +8713,7 @@ mod tests {
         let database_path = database.path().to_path_buf();
         drop(database);
 
-        let mut reopened = open_test_projection(
+        let reopened = open_test_projection(
             &database_path,
             ids.claim(),
             RebuildSource::new(&engine, &store).unwrap(),
@@ -8162,24 +8727,12 @@ mod tests {
             reason.contains(&format!("user_version 7 != {SQLITE_SCHEMA_VERSION}")),
             "unexpected rebuild reason: {reason}"
         );
-        let stale_rows: i64 = reopened
+        let rebuilt_rows: i64 = reopened
             .database
             .connection
             .query_row("SELECT COUNT(*) FROM pages", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(stale_rows, 0);
-        assert!(matches!(
-            reopened.database.materialized_read(),
-            Err(ProjectionError::Materialization(_))
-        ));
-
-        assert_eq!(
-            reopened
-                .database
-                .rebuild_materialization(vec![current])
-                .unwrap(),
-            1
-        );
+        assert_eq!(rebuilt_rows, 1);
         let page = reopened
             .database
             .materialized_read()
@@ -8359,10 +8912,18 @@ mod tests {
         let mut rebuilt = open_test_projection(
             &database_path,
             ids.claim(),
-            RebuildSource::new(&engine, &store).unwrap(),
+            RebuildSource::new(&ids.engine(), &store).unwrap(),
         )
         .unwrap()
         .database;
+        assert_eq!(
+            rebuilt.apply_accepted(&root_event).unwrap(),
+            ApplyDisposition::Applied
+        );
+        assert_eq!(
+            rebuilt.apply_accepted(&replacement_event).unwrap(),
+            ApplyDisposition::Applied
+        );
         assert!(matches!(
             rebuilt.materialized_read(),
             Err(ProjectionError::Materialization(_))
@@ -8431,6 +8992,405 @@ mod tests {
         assert!(read.tags("block-tag", 10).unwrap().is_empty());
         assert!(read.tasks(None, 10).unwrap().is_empty());
         assert!(read.search("fresh", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn historical_adapter_preserves_rich_event_state_and_matches_clean_rebuild() {
+        let ids = TestIds::new(2_200);
+        let dir = TestDir::new("historical-rich-adapter");
+        let store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
+        let engine_store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
+        let mut engine =
+            ShardedHotEngine::with_archive_store(engine_store, ids.lineage, ids.catalog);
+        let normal_path = dir.path().join("normal.sqlite");
+        let mut normal = open_test_projection(
+            &normal_path,
+            ids.claim(),
+            RebuildSource::new(&engine, &store).unwrap(),
+        )
+        .unwrap()
+        .database;
+        let child = BlockId::from_uuid(uuid(2_206));
+        let original_content = "TODO [#A] Ship #project\n\
+            SCHEDULED: <2026-07-25 Sat>\n\
+            DEADLINE: <2026-07-26 Sun>\n\
+            owner:: Ada\n\
+            collapsed:: true";
+        let create = engine
+            .prepare_bootstrap_transaction(
+                author(2_210),
+                &OperationTransaction::new(vec![
+                    SemanticOperation::CreatePage {
+                        page_id: ids.page,
+                        home_document_id: ids.document,
+                        name: crate::oplog::LogicalPageName::parse("Historical Original").unwrap(),
+                        path: ManagedPath::parse("pages/historical-original.md").unwrap(),
+                        kind: ManagedTextKind::Page,
+                    },
+                    SemanticOperation::CreateBlock {
+                        block: BlockLocation {
+                            block_id: ids.block,
+                            home_document_id: ids.document,
+                        },
+                        page_id: ids.page,
+                        parent: None,
+                        order: "a".into(),
+                        content: original_content.into(),
+                    },
+                    SemanticOperation::CreateBlock {
+                        block: BlockLocation {
+                            block_id: child,
+                            home_document_id: ids.document,
+                        },
+                        page_id: ids.page,
+                        parent: Some(ids.block),
+                        order: "a".into(),
+                        content: "nested original".into(),
+                    },
+                ])
+                .unwrap(),
+            )
+            .unwrap();
+        publish_and_stage_archive(&mut engine, &store, &create);
+        let create_event =
+            AcceptedBatchEvent::from_accepted(&engine, &store, create.manifest().batch_id())
+                .unwrap();
+
+        let edited_content = "DONE [#B] Shipped #complete\nowner:: Grace";
+        let edit = engine
+            .prepare_bootstrap_transaction(
+                author(2_211),
+                &OperationTransaction::new(vec![
+                    SemanticOperation::RenamePagesAndRewriteReferrers {
+                        page_changes: vec![PageRename {
+                            page_id: ids.page,
+                            new_name: crate::oplog::LogicalPageName::parse("Historical Renamed")
+                                .unwrap(),
+                            new_path: ManagedPath::parse("pages/historical-renamed.md").unwrap(),
+                        }],
+                        block_rewrites: Vec::new(),
+                        page_preamble_rewrites: Vec::new(),
+                    },
+                    SemanticOperation::EditBlockContent {
+                        block: BlockLocation {
+                            block_id: ids.block,
+                            home_document_id: ids.document,
+                        },
+                        content: edited_content.into(),
+                    },
+                    SemanticOperation::ReorderBlock {
+                        block_id: child,
+                        page_id: ids.page,
+                        parent: None,
+                        order: "b".into(),
+                    },
+                ])
+                .unwrap(),
+            )
+            .unwrap();
+        publish_and_stage_archive(&mut engine, &store, &edit);
+        let edit_event =
+            AcceptedBatchEvent::from_accepted(&engine, &store, edit.manifest().batch_id()).unwrap();
+
+        let historical = materialize_accepted_event(&engine, &create_event).unwrap();
+        let historical_page = &historical.replacements()[0];
+        assert_eq!(historical_page.name, "Historical Original");
+        assert_eq!(
+            historical_page.path.as_str(),
+            "pages/historical-original.md"
+        );
+        let historical_parent = historical_page
+            .blocks
+            .iter()
+            .find(|block| block.block_id == ids.block)
+            .unwrap();
+        let historical_child = historical_page
+            .blocks
+            .iter()
+            .find(|block| block.block_id == child)
+            .unwrap();
+        assert_eq!(historical_parent.content, original_content);
+        assert!(historical_parent.collapsed);
+        assert_eq!(historical_parent.tags, vec!["project"]);
+        assert_eq!(historical_parent.properties[0].name, "owner");
+        assert_eq!(historical_parent.properties[0].value, "Ada");
+        assert_eq!(historical_parent.task.as_ref().unwrap().marker, "TODO");
+        assert_eq!(
+            historical_parent.task.as_ref().unwrap().priority.as_deref(),
+            Some("A")
+        );
+        assert_eq!(
+            historical_parent
+                .task
+                .as_ref()
+                .unwrap()
+                .scheduled
+                .as_deref(),
+            Some("2026-07-25 Sat")
+        );
+        assert_eq!(
+            historical_parent.task.as_ref().unwrap().deadline.as_deref(),
+            Some("2026-07-26 Sun")
+        );
+        assert_eq!(historical_child.parent, Some(ids.block));
+
+        let current = materialize_accepted_event(&engine, &edit_event).unwrap();
+        let current_page = &current.replacements()[0];
+        assert_eq!(current_page.name, "Historical Renamed");
+        assert_eq!(current_page.path.as_str(), "pages/historical-renamed.md");
+        let current_parent = current_page
+            .blocks
+            .iter()
+            .find(|block| block.block_id == ids.block)
+            .unwrap();
+        let current_child = current_page
+            .blocks
+            .iter()
+            .find(|block| block.block_id == child)
+            .unwrap();
+        assert_eq!(current_parent.content, edited_content);
+        assert_eq!(current_parent.tags, vec!["complete"]);
+        assert_eq!(current_parent.properties[0].value, "Grace");
+        assert_eq!(current_parent.task.as_ref().unwrap().marker, "DONE");
+        assert_eq!(current_child.parent, None);
+
+        let mut forged = create_event.clone();
+        forged.post_frontier_root = edit_event.post_frontier_root().clone();
+        assert!(matches!(
+            materialize_accepted_event(&engine, &forged),
+            Err(ProjectionError::InvalidAcceptedEvent(_))
+        ));
+
+        let mut overlay = TailOverlay::empty_for_test(&engine);
+        assert!(overlay
+            .try_enqueue(&mut normal, &engine, &create_event)
+            .unwrap());
+        assert!(overlay
+            .try_enqueue(&mut normal, &engine, &edit_event)
+            .unwrap());
+        let source = RebuildSource::new(&engine, &store).unwrap();
+        assert_eq!(overlay.drain_ready(&mut normal, &source, 2).unwrap(), 2);
+        let expected_frontier = normal.frontier_root().unwrap();
+        let expected_digest = normal.semantic_projection_digest().unwrap();
+        let read = normal.materialized_read().unwrap();
+        let expected_page = read.page(ids.page).unwrap();
+        let expected_parent = read.block(ids.block).unwrap();
+        let expected_child = read.block(child).unwrap();
+        let expected_properties = read.properties_named("owner", None, 10).unwrap();
+        let expected_tags = read.tags("complete", 10).unwrap();
+        let expected_tasks = read.tasks(Some("DONE"), 10).unwrap();
+        let expected_search = read.search("Shipped", 10).unwrap();
+        drop(normal);
+
+        let rebuilt_path = dir.path().join("rebuilt.sqlite");
+        let rebuilt = open_test_projection(
+            &rebuilt_path,
+            ids.claim(),
+            RebuildSource::new(&engine, &store).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            rebuilt.recovery,
+            ProjectionRecovery::RebuiltMissing { applied_batches: 2 }
+        );
+        assert_eq!(rebuilt.database.frontier_root().unwrap(), expected_frontier);
+        assert_eq!(
+            rebuilt.database.semantic_projection_digest().unwrap(),
+            expected_digest
+        );
+        let read = rebuilt.database.materialized_read().unwrap();
+        assert_eq!(read.page(ids.page).unwrap(), expected_page);
+        assert_eq!(read.block(ids.block).unwrap(), expected_parent);
+        assert_eq!(read.block(child).unwrap(), expected_child);
+        assert_eq!(
+            read.properties_named("owner", None, 10).unwrap(),
+            expected_properties
+        );
+        assert_eq!(read.tags("complete", 10).unwrap(), expected_tags);
+        assert_eq!(read.tasks(Some("DONE"), 10).unwrap(), expected_tasks);
+        assert_eq!(read.search("Shipped", 10).unwrap(), expected_search);
+        drop(rebuilt);
+        let reopened = open_test_projection(
+            &normal_path,
+            ids.claim(),
+            RebuildSource::new(&engine, &store).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(reopened.recovery, ProjectionRecovery::OpenedExisting);
+        let mut normal = reopened.database;
+
+        let delete = engine
+            .prepare_bootstrap_transaction(
+                author(2_212),
+                &OperationTransaction::new(vec![SemanticOperation::DeletePage {
+                    page_id: ids.page,
+                }])
+                .unwrap(),
+            )
+            .unwrap();
+        publish_and_stage_archive(&mut engine, &store, &delete);
+        let delete_event =
+            AcceptedBatchEvent::from_accepted(&engine, &store, delete.manifest().batch_id())
+                .unwrap();
+        let deletion = materialize_accepted_event(&engine, &delete_event).unwrap();
+        assert!(deletion.replacements().is_empty());
+        assert_eq!(deletion.deletions(), &[ids.page]);
+
+        assert!(overlay
+            .try_enqueue(&mut normal, &engine, &delete_event)
+            .unwrap());
+        let source = RebuildSource::new(&engine, &store).unwrap();
+        assert_eq!(overlay.drain_ready(&mut normal, &source, 1).unwrap(), 1);
+        let read = normal.materialized_read().unwrap();
+        assert_eq!(read.page(ids.page).unwrap(), None);
+        assert_eq!(read.block(ids.block).unwrap(), None);
+        assert_eq!(read.block(child).unwrap(), None);
+        drop(normal);
+
+        let deleted_rebuild = open_test_projection(
+            &dir.path().join("deleted-rebuild.sqlite"),
+            ids.claim(),
+            source,
+        )
+        .unwrap();
+        assert_eq!(
+            deleted_rebuild.recovery,
+            ProjectionRecovery::RebuiltMissing { applied_batches: 3 }
+        );
+        let read = deleted_rebuild.database.materialized_read().unwrap();
+        assert_eq!(read.page(ids.page).unwrap(), None);
+        assert_eq!(
+            deleted_rebuild.database.frontier_root().unwrap(),
+            engine.accepted_frontier_root().unwrap()
+        );
+    }
+
+    #[test]
+    fn historical_page_lookup_is_point_local_and_rejects_foreign_roots() {
+        const PAGE_COUNT: u128 = 8;
+        let ids = TestIds::new(2_300);
+        let dir = TestDir::new("historical-root-locality");
+        let store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
+        let engine_store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
+        let mut engine =
+            ShardedHotEngine::with_archive_store(engine_store, ids.lineage, ids.catalog);
+        let mut operations = Vec::new();
+        for index in 0..PAGE_COUNT {
+            let page_id = if index == 0 {
+                ids.page
+            } else {
+                PageId::from_uuid(uuid(2_400 + index))
+            };
+            let document_id = if index == 0 {
+                ids.document
+            } else {
+                DocumentId::from_uuid(uuid(2_500 + index))
+            };
+            let block_id = if index == 0 {
+                ids.block
+            } else {
+                BlockId::from_uuid(uuid(2_600 + index))
+            };
+            operations.push(SemanticOperation::CreatePage {
+                page_id,
+                home_document_id: document_id,
+                name: crate::oplog::LogicalPageName::parse(&format!("Locality {index}")).unwrap(),
+                path: ManagedPath::parse(&format!("pages/locality-{index}.md")).unwrap(),
+                kind: ManagedTextKind::Page,
+            });
+            operations.push(SemanticOperation::CreateBlock {
+                block: BlockLocation {
+                    block_id,
+                    home_document_id: document_id,
+                },
+                page_id,
+                parent: None,
+                order: "a".into(),
+                content: format!("locality content {index}"),
+            });
+        }
+        let create = engine
+            .prepare_bootstrap_transaction(
+                author(2_310),
+                &OperationTransaction::new(operations).unwrap(),
+            )
+            .unwrap();
+        publish_and_stage_archive(&mut engine, &store, &create);
+        let event =
+            AcceptedBatchEvent::from_accepted(&engine, &store, create.manifest().batch_id())
+                .unwrap();
+        let page = engine
+            .materialize_page_at_accepted_root(event.post_frontier_root(), ids.page)
+            .unwrap()
+            .unwrap();
+        assert_eq!(page.blocks.len(), 1);
+        assert_eq!(page.stats.distinct_home_documents, vec![ids.document]);
+        assert!(
+            page.stats.physical_manifest_reads <= 2,
+            "one historical page read scanned unrelated manifests: {:?}",
+            page.stats
+        );
+        assert!(
+            page.stats.physical_object_reads <= 2,
+            "one historical page read scanned unrelated objects: {:?}",
+            page.stats
+        );
+
+        let foreign_ids = TestIds::new(2_700);
+        let foreign_dir = TestDir::new("foreign-historical-root");
+        let foreign_store =
+            ObjectStore::open(&foreign_dir.path().join("objects"), foreign_ids.workspace).unwrap();
+        let foreign_engine_store =
+            ObjectStore::open(&foreign_dir.path().join("objects"), foreign_ids.workspace).unwrap();
+        let mut foreign_engine = ShardedHotEngine::with_archive_store(
+            foreign_engine_store,
+            foreign_ids.lineage,
+            foreign_ids.catalog,
+        );
+        let foreign_create = foreign_engine
+            .prepare_bootstrap_transaction(
+                author(2_710),
+                &root_transaction(foreign_ids, "pages/foreign.md", "foreign original"),
+            )
+            .unwrap();
+        publish_and_stage_archive(&mut foreign_engine, &foreign_store, &foreign_create);
+        let foreign_first = AcceptedBatchEvent::from_accepted(
+            &foreign_engine,
+            &foreign_store,
+            foreign_create.manifest().batch_id(),
+        )
+        .unwrap();
+        assert!(engine
+            .materialize_page_at_accepted_root(foreign_first.post_frontier_root(), ids.page)
+            .is_err());
+
+        let foreign_edit = foreign_engine
+            .prepare_bootstrap_transaction(
+                author(2_711),
+                &OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
+                    block: BlockLocation {
+                        block_id: foreign_ids.block,
+                        home_document_id: foreign_ids.document,
+                    },
+                    content: "foreign edited".into(),
+                }])
+                .unwrap(),
+            )
+            .unwrap();
+        publish_and_stage_archive(&mut foreign_engine, &foreign_store, &foreign_edit);
+        let foreign_second = AcceptedBatchEvent::from_accepted(
+            &foreign_engine,
+            &foreign_store,
+            foreign_edit.manifest().batch_id(),
+        )
+        .unwrap();
+        let error = engine
+            .materialize_page_at_accepted_root(foreign_second.post_frontier_root(), ids.page)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("sequence 2 is unavailable"),
+            "foreign unavailable root failed for the wrong reason: {error}"
+        );
     }
 
     #[test]
@@ -8635,32 +9595,24 @@ mod tests {
                 move_prepared.manifest().batch_id(),
             )
             .unwrap();
-            let move_change = MaterializationChange::new(
-                move_event.batch_id(),
-                vec![
-                    page_replacement(
-                        source_page,
-                        source_document,
-                        &source_path,
-                        "Move Source",
-                        Vec::new(),
-                    ),
-                    page_replacement(
-                        destination_page,
-                        destination_document,
-                        &destination_path,
-                        "Move Destination",
-                        vec![block_replacement(
-                            target_block,
-                            source_document,
-                            "target",
-                            Vec::new(),
-                        )],
-                    ),
-                ],
-                Vec::new(),
-            )
-            .unwrap();
+            let move_change = materialize_accepted_event(&engine, &move_event).unwrap();
+            let source = move_change
+                .replacements()
+                .iter()
+                .find(|page| page.page_id == source_page)
+                .unwrap();
+            let destination = move_change
+                .replacements()
+                .iter()
+                .find(|page| page.page_id == destination_page)
+                .unwrap();
+            assert!(source.blocks.is_empty());
+            assert_eq!(destination.blocks.len(), 1);
+            assert_eq!(destination.blocks[0].block_id, target_block);
+            assert_eq!(
+                destination.blocks[0].home_document_id, source_document,
+                "a cross-page move must preserve the block's immutable home"
+            );
             database
                 .apply_authenticated_reference_catalog_materialized_accepted(
                     &move_event,
@@ -8792,15 +9744,17 @@ mod tests {
     fn accepted_events_keep_compact_historical_roots_and_structural_applied_closure() {
         let ids = TestIds::new(2_100);
         let dir = TestDir::new("historical-frontier");
+        let engine_store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
         let store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
-        let mut engine = ids.engine();
+        let mut engine =
+            ShardedHotEngine::with_archive_store(engine_store, ids.lineage, ids.catalog);
         let root = engine
             .prepare_bootstrap_transaction(
                 author(2_200),
                 &root_transaction(ids, "pages/root.md", "root"),
             )
             .unwrap();
-        publish_and_stage(&mut engine, &store, &root);
+        publish_and_stage_archive(&mut engine, &store, &root);
         let early_root =
             AcceptedBatchEvent::from_accepted(&engine, &store, root.manifest().batch_id()).unwrap();
 
@@ -8817,7 +9771,7 @@ mod tests {
                 .unwrap(),
             )
             .unwrap();
-        publish_and_stage(&mut engine, &store, &child);
+        publish_and_stage_archive(&mut engine, &store, &child);
         let child_event =
             AcceptedBatchEvent::from_accepted(&engine, &store, child.manifest().batch_id())
                 .unwrap();
@@ -9869,15 +10823,24 @@ mod tests {
     fn overlay_reorders_dependencies_and_enforces_both_limits() {
         let ids = TestIds::new(4_000);
         let dir = TestDir::new("overlay");
-        let (mut database, _empty, store) = open_empty(&dir, ids);
-        let mut engine = ids.engine();
+        let store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
+        let engine_store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
+        let mut engine =
+            ShardedHotEngine::with_archive_store(engine_store, ids.lineage, ids.catalog);
+        let mut database = open_test_projection(
+            &dir.path().join("frontier.sqlite"),
+            ids.claim(),
+            RebuildSource::new(&engine, &store).unwrap(),
+        )
+        .unwrap()
+        .database;
         let root_prepared = engine
             .prepare_bootstrap_transaction(
                 author(4_010),
                 &root_transaction(ids, "pages/overlay.md", "root"),
             )
             .unwrap();
-        publish_and_stage(&mut engine, &store, &root_prepared);
+        publish_and_stage_archive(&mut engine, &store, &root_prepared);
         let root =
             AcceptedBatchEvent::from_accepted(&engine, &store, root_prepared.manifest().batch_id())
                 .unwrap();
@@ -9894,7 +10857,7 @@ mod tests {
                 .unwrap(),
             )
             .unwrap();
-        publish_and_stage(&mut engine, &store, &child_prepared);
+        publish_and_stage_archive(&mut engine, &store, &child_prepared);
         let child = AcceptedBatchEvent::from_accepted(
             &engine,
             &store,
@@ -9902,13 +10865,13 @@ mod tests {
         )
         .unwrap();
         let source = RebuildSource::new(&engine, &store).unwrap();
-        let mut overlay = TailOverlay::empty_for_test();
-        assert!(overlay.try_enqueue(&mut database, &child).unwrap());
+        let mut overlay = TailOverlay::empty_for_test(&engine);
+        assert!(overlay.try_enqueue(&mut database, &engine, &child).unwrap());
         assert_eq!(
             overlay.status().retained_bytes,
             usize::try_from(child.post_frontier_root().retained_bytes_total()).unwrap()
         );
-        assert!(overlay.try_enqueue(&mut database, &root).unwrap());
+        assert!(overlay.try_enqueue(&mut database, &engine, &root).unwrap());
         assert_eq!(
             overlay.status().retained_bytes,
             usize::try_from(child.post_frontier_root().retained_bytes_total()).unwrap()
@@ -9935,10 +10898,10 @@ mod tests {
             engine.exact_frontier().unwrap()
         );
         assert_eq!(overlay.status().unapplied_batches, 0);
-        assert!(!overlay.try_enqueue(&mut database, &root).unwrap());
+        assert!(!overlay.try_enqueue(&mut database, &engine, &root).unwrap());
         assert_eq!(overlay.status().unapplied_batches, 0);
 
-        let mut count_limited = TailOverlay::empty_for_test();
+        let mut count_limited = TailOverlay::empty_for_test(&engine);
         let mut reservations = Vec::with_capacity(TAIL_MAX_BATCHES);
         for _ in 0..TAIL_MAX_BATCHES {
             reservations.push(count_limited.reserve_mutation(1).unwrap());
@@ -9955,7 +10918,7 @@ mod tests {
             count_limited.cancel_reservation(reservation).unwrap();
         }
 
-        let mut byte_limited = TailOverlay::empty_for_test();
+        let mut byte_limited = TailOverlay::empty_for_test(&engine);
         let reservation = byte_limited.reserve_mutation(TAIL_MAX_BYTES).unwrap();
         assert!(byte_limited.status().backpressured);
         assert!(matches!(
@@ -9968,33 +10931,418 @@ mod tests {
         byte_limited.cancel_reservation(reservation).unwrap();
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum AuthoritySubstitutionPath {
+        TryEnqueue,
+        EnqueueReserved,
+        DrainReady,
+    }
+
+    #[test]
+    fn engine_owned_apply_rejects_honest_same_lineage_substitute_before_mutation() {
+        let ids = TestIds::new(4_300);
+        let dir = TestDir::new("engine-owned-apply-authority");
+        let store = ObjectStore::open(&dir.path().join("primary-objects"), ids.workspace).unwrap();
+        let engine_store =
+            ObjectStore::open(&dir.path().join("primary-objects"), ids.workspace).unwrap();
+        let mut engine =
+            ShardedHotEngine::with_archive_store(engine_store, ids.lineage, ids.catalog);
+        let mut database = open_test_projection(
+            &dir.path().join("frontier.sqlite"),
+            ids.claim(),
+            RebuildSource::new(&engine, &store).unwrap(),
+        )
+        .unwrap()
+        .database;
+        let prepared = engine
+            .prepare_bootstrap_transaction(
+                author(4_310),
+                &root_transaction(
+                    ids,
+                    "pages/engine-owned.md",
+                    "TODO [#A] engine-owned #authority",
+                ),
+            )
+            .unwrap();
+        publish_and_stage_archive(&mut engine, &store, &prepared);
+        let event =
+            AcceptedBatchEvent::from_accepted(&engine, &store, prepared.manifest().batch_id())
+                .unwrap();
+
+        let substitute_store =
+            ObjectStore::open(&dir.path().join("substitute-objects"), ids.workspace).unwrap();
+        substitute_store.publish_prepared(&prepared).unwrap();
+        let substitute_engine_store =
+            ObjectStore::open(&dir.path().join("substitute-objects"), ids.workspace).unwrap();
+        let mut substitute_engine =
+            ShardedHotEngine::with_archive_store(substitute_engine_store, ids.lineage, ids.catalog);
+        assert!(matches!(
+            substitute_engine
+                .stage_archive_batch(prepared.manifest().batch_id())
+                .unwrap()
+                .disposition,
+            BatchDisposition::Accepted { .. }
+        ));
+        let substitute_event = AcceptedBatchEvent::from_accepted(
+            &substitute_engine,
+            &substitute_store,
+            prepared.manifest().batch_id(),
+        )
+        .unwrap();
+        assert_eq!(substitute_event.batch_id(), event.batch_id());
+        assert_eq!(
+            substitute_event.post_frontier_root(),
+            event.post_frontier_root()
+        );
+        authenticate_event_for_engine(&substitute_engine, &event).unwrap();
+
+        let logical_before = database_logical_state(&database);
+        let rows_before: (i64, i64, i64, i64) = database
+            .connection
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM applied_batches),
+                    (SELECT COUNT(*) FROM pages),
+                    (SELECT COUNT(*) FROM blocks),
+                    (SELECT acceptance_sequence
+                     FROM materialization_stamp WHERE singleton = 1)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        let total_changes_before: i64 = database
+            .connection
+            .query_row("SELECT total_changes()", [], |row| row.get(0))
+            .unwrap();
+        let checkpoint_path = sidecar_path(database.path(), "-auth");
+        let checkpoint_before = fs::read(&checkpoint_path).unwrap();
+
+        assert_eq!(
+            database.apply_engine_owned_accepted(&event, &substitute_engine),
+            Err(ProjectionError::AuthorityMismatch)
+        );
+        assert_eq!(database_logical_state(&database), logical_before);
+        let rows_after: (i64, i64, i64, i64) = database
+            .connection
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM applied_batches),
+                    (SELECT COUNT(*) FROM pages),
+                    (SELECT COUNT(*) FROM blocks),
+                    (SELECT acceptance_sequence
+                     FROM materialization_stamp WHERE singleton = 1)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(rows_after, rows_before);
+        assert_eq!(
+            database
+                .connection
+                .query_row("SELECT total_changes()", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            total_changes_before
+        );
+        assert_eq!(fs::read(&checkpoint_path).unwrap(), checkpoint_before);
+
+        assert_eq!(
+            database
+                .apply_engine_owned_accepted(&event, &engine)
+                .unwrap(),
+            ApplyDisposition::Applied
+        );
+        assert_eq!(database.applied_batch_count().unwrap(), 1);
+        let read = database.materialized_read().unwrap();
+        assert_eq!(
+            read.block(ids.block).unwrap().unwrap().content,
+            "TODO [#A] engine-owned #authority"
+        );
+        assert_eq!(read.tasks(Some("TODO"), 10).unwrap().len(), 1);
+        assert_eq!(read.tags("authority", 10).unwrap().len(), 1);
+        assert_eq!(read.search("authority", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn production_sqlite_mutation_surface_is_engine_owned() {
+        let source = include_str!("sqlite.rs");
+        let production = source
+            .split_once("\n#[cfg(test)]\nmod tests")
+            .map(|(production, _)| production)
+            .expect("SQLite source keeps a distinct test module");
+        for unavailable in [
+            concat!("pub fn apply_", "accepted("),
+            concat!("pub fn apply_", "materialized_accepted("),
+            concat!(
+                "pub fn apply_authenticated_reference_catalog_",
+                "materialized_accepted("
+            ),
+            concat!("pub fn rebuild_", "materialization"),
+            concat!(
+                "pub fn rebuild_authenticated_reference_catalog_",
+                "materialization"
+            ),
+            concat!("pub fn apply_internal_", "with_materialization("),
+        ] {
+            assert!(
+                !production.contains(unavailable),
+                "non-test caller-controlled SQLite mutation surface remains: {unavailable}"
+            );
+        }
+        for test_only in [
+            "#[cfg(test)]\n    fn apply_accepted(",
+            "#[cfg(test)]\n    fn apply_materialized_accepted(",
+            "#[cfg(test)]\n    fn apply_authenticated_reference_catalog_materialized_accepted(",
+            "#[cfg(test)]\n    fn rebuild_materialization",
+            "#[cfg(test)]\n    fn rebuild_authenticated_reference_catalog_materialization",
+            "#[cfg(test)]\n    fn rebuild_materialization_inner",
+            "#[cfg(test)]\n    fn apply_internal(",
+        ] {
+            assert!(
+                production.contains(test_only),
+                "fixture mutation helper is not test-only: {test_only}"
+            );
+        }
+        assert!(production.contains("fn apply_engine_owned_accepted("));
+    }
+
+    fn assert_authority_substitution_is_atomic(
+        seed: u128,
+        foreign_workspace: bool,
+        path: AuthoritySubstitutionPath,
+    ) {
+        let ids = TestIds::new(seed);
+        let dir = TestDir::new("authority-substitution-local");
+        let store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
+        let engine_store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
+        let mut engine =
+            ShardedHotEngine::with_archive_store(engine_store, ids.lineage, ids.catalog);
+        let mut database = open_test_projection(
+            &dir.path().join("frontier.sqlite"),
+            ids.claim(),
+            RebuildSource::new(&engine, &store).unwrap(),
+        )
+        .unwrap()
+        .database;
+        let prepared = engine
+            .prepare_bootstrap_transaction(
+                author(seed + 10),
+                &root_transaction(ids, "pages/local-tail.md", "local accepted"),
+            )
+            .unwrap();
+        publish_and_stage_archive(&mut engine, &store, &prepared);
+        let local =
+            AcceptedBatchEvent::from_accepted(&engine, &store, prepared.manifest().batch_id())
+                .unwrap();
+
+        let substitute_ids = if foreign_workspace {
+            TestIds::new(seed + 100)
+        } else {
+            ids
+        };
+        let substitute_dir = TestDir::new("authority-substitution-source");
+        let substitute_store = ObjectStore::open(
+            &substitute_dir.path().join("objects"),
+            substitute_ids.workspace,
+        )
+        .unwrap();
+        let substitute_engine_store = ObjectStore::open(
+            &substitute_dir.path().join("objects"),
+            substitute_ids.workspace,
+        )
+        .unwrap();
+        let mut substitute_engine = ShardedHotEngine::with_archive_store(
+            substitute_engine_store,
+            substitute_ids.lineage,
+            substitute_ids.catalog,
+        );
+        let substitute_prepared = substitute_engine
+            .prepare_bootstrap_transaction(
+                author(seed + 10),
+                &root_transaction(
+                    substitute_ids,
+                    "pages/substitute-tail.md",
+                    "substitute accepted",
+                ),
+            )
+            .unwrap();
+        publish_and_stage_archive(
+            &mut substitute_engine,
+            &substitute_store,
+            &substitute_prepared,
+        );
+        let substitute = AcceptedBatchEvent::from_accepted(
+            &substitute_engine,
+            &substitute_store,
+            substitute_prepared.manifest().batch_id(),
+        )
+        .unwrap();
+        assert_eq!(
+            local.acceptance_sequence(),
+            substitute.acceptance_sequence()
+        );
+        if !foreign_workspace {
+            assert_eq!(local.batch_id(), substitute.batch_id());
+            assert_ne!(local.post_frontier_root(), substitute.post_frontier_root());
+        }
+
+        let mut overlay = TailOverlay::empty_for_test(&engine);
+        let reservation = matches!(path, AuthoritySubstitutionPath::EnqueueReserved)
+            .then(|| overlay.reserve_mutation(local.retained_bytes()).unwrap());
+        let overlay_before = overlay_logical_state(&overlay);
+        let database_before = database_logical_state(&database);
+        let error = match path {
+            AuthoritySubstitutionPath::TryEnqueue => overlay
+                .try_enqueue(&mut database, &substitute_engine, &substitute)
+                .unwrap_err(),
+            AuthoritySubstitutionPath::EnqueueReserved => overlay
+                .enqueue_reserved(
+                    reservation.unwrap(),
+                    &mut database,
+                    &substitute_engine,
+                    substitute,
+                )
+                .unwrap_err(),
+            AuthoritySubstitutionPath::DrainReady => {
+                let substitute_source =
+                    RebuildSource::new(&substitute_engine, &substitute_store).unwrap();
+                overlay
+                    .drain_ready(&mut database, &substitute_source, 1)
+                    .unwrap_err()
+            }
+        };
+        assert_eq!(
+            error,
+            TailOverlayError::Projection(ProjectionError::AuthorityMismatch)
+        );
+        assert_eq!(overlay_logical_state(&overlay), overlay_before);
+        assert_eq!(database_logical_state(&database), database_before);
+        assert!(database.materialized_read().is_ok());
+        if let Some(reservation) = reservation {
+            overlay.cancel_reservation(reservation).unwrap();
+        }
+
+        assert!(overlay.try_enqueue(&mut database, &engine, &local).unwrap());
+        let source = RebuildSource::new(&engine, &store).unwrap();
+        assert_eq!(overlay.drain_ready(&mut database, &source, 1).unwrap(), 1);
+        let block = database
+            .materialized_read()
+            .unwrap()
+            .block(ids.block)
+            .unwrap()
+            .unwrap();
+        assert_eq!(block.content, "local accepted");
+    }
+
+    #[test]
+    fn foreign_engine_and_source_substitution_all_paths_are_atomic() {
+        for (index, path) in [
+            AuthoritySubstitutionPath::TryEnqueue,
+            AuthoritySubstitutionPath::EnqueueReserved,
+            AuthoritySubstitutionPath::DrainReady,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_authority_substitution_is_atomic(4_400 + index as u128 * 1_000, true, path);
+        }
+    }
+
+    #[test]
+    fn same_id_divergent_engine_and_source_substitution_all_paths_are_atomic() {
+        for (index, path) in [
+            AuthoritySubstitutionPath::TryEnqueue,
+            AuthoritySubstitutionPath::EnqueueReserved,
+            AuthoritySubstitutionPath::DrainReady,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_authority_substitution_is_atomic(8_400 + index as u128 * 1_000, false, path);
+        }
+    }
+
+    #[test]
+    fn post_authentication_retained_byte_failure_preserves_gate_accounting_and_reservation() {
+        let ids = TestIds::new(12_400);
+        let dir = TestDir::new("atomic-retained-byte-admission");
+        let store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
+        let engine_store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
+        let mut engine =
+            ShardedHotEngine::with_archive_store(engine_store, ids.lineage, ids.catalog);
+        let mut database = open_test_projection(
+            &dir.path().join("frontier.sqlite"),
+            ids.claim(),
+            RebuildSource::new(&engine, &store).unwrap(),
+        )
+        .unwrap()
+        .database;
+        let prepared = engine
+            .prepare_bootstrap_transaction(
+                author(12_410),
+                &root_transaction(ids, "pages/atomic-tail.md", "atomic accepted"),
+            )
+            .unwrap();
+        publish_and_stage_archive(&mut engine, &store, &prepared);
+        let event =
+            AcceptedBatchEvent::from_accepted(&engine, &store, prepared.manifest().batch_id())
+                .unwrap();
+
+        let mut overlay = TailOverlay::empty_for_test(&engine);
+        overlay.applied_retained_bytes_total = event
+            .post_frontier_root()
+            .retained_bytes_total()
+            .checked_add(1)
+            .unwrap();
+        let reservation = overlay.reserve_mutation(event.retained_bytes()).unwrap();
+        let overlay_before = overlay_logical_state(&overlay);
+        let database_before = database_logical_state(&database);
+        assert_eq!(
+            overlay.enqueue_reserved(reservation, &mut database, &engine, event),
+            Err(TailOverlayError::Projection(
+                ProjectionError::FrontierRegression
+            ))
+        );
+        assert_eq!(overlay_logical_state(&overlay), overlay_before);
+        assert_eq!(database_logical_state(&database), database_before);
+        overlay.cancel_reservation(reservation).unwrap();
+        assert!(!overlay.reservations.contains_key(&reservation.id));
+    }
+
     #[test]
     fn provider_tail_over_cap_retains_only_bounded_hot_descriptors() {
-        let ids = TestIds::new(4_050);
-        let dir = TestDir::new("provider-tail-cap");
-        let (mut database, _engine, store) = open_empty(&dir, ids);
-        let (root, _) = root_and_child_events(&store, ids);
-        let mut overlay = TailOverlay::empty_for_test();
+        let engine = TestIds::new(16_400).engine();
+        let mut overlay = TailOverlay::empty_for_test(&engine);
         let tail = TAIL_MAX_BATCHES + 257;
         for index in (0..tail).rev() {
-            let mut event = root.clone();
-            event.batch_id = batch(80_000 + index as u128);
-            event.manifest_digest = ContentDigest::of(&index.to_be_bytes());
-            event.acceptance_sequence = index as u64 + 1;
-            event.retained_bytes = 1;
-            assert!(overlay.try_enqueue(&mut database, &event).unwrap());
+            let acceptance_sequence = index as u64 + 1;
+            assert!(overlay
+                .record_authoritative_descriptor(
+                    acceptance_sequence,
+                    acceptance_sequence,
+                    TailDescriptor {
+                        batch_id: batch(80_000 + index as u128),
+                        manifest_digest: ContentDigest::of(&index.to_be_bytes()),
+                        retained_bytes: 1,
+                    },
+                )
+                .unwrap());
         }
         assert_eq!(overlay.status().unapplied_batches, tail);
         assert!(overlay.status().backpressured);
         assert_eq!(overlay.hot_descriptor_count(), TAIL_MAX_BATCHES);
         assert!(overlay.hot_descriptor_count() <= TAIL_MAX_BATCHES);
 
-        let mut duplicate = root;
-        duplicate.batch_id = batch(80_000 + (tail - 1) as u128);
-        duplicate.manifest_digest = ContentDigest::of(&(tail - 1).to_be_bytes());
-        duplicate.acceptance_sequence = tail as u64;
-        duplicate.retained_bytes = 1;
-        assert!(!overlay.try_enqueue(&mut database, &duplicate).unwrap());
+        assert!(!overlay
+            .record_authoritative_descriptor(
+                tail as u64,
+                tail as u64,
+                TailDescriptor {
+                    batch_id: batch(80_000 + (tail - 1) as u128),
+                    manifest_digest: ContentDigest::of(&(tail - 1).to_be_bytes()),
+                    retained_bytes: 1,
+                },
+            )
+            .unwrap());
         assert_eq!(overlay.hot_descriptor_count(), TAIL_MAX_BATCHES);
     }
 
@@ -10003,7 +11351,17 @@ mod tests {
         let ids = TestIds::new(4_100);
         let dir = TestDir::new("oversized-overlay");
         let store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
-        let mut overlay = TailOverlay::empty_for_test();
+        let engine_store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
+        let mut engine =
+            ShardedHotEngine::with_archive_store(engine_store, ids.lineage, ids.catalog);
+        let mut database = open_test_projection(
+            &dir.path().join("frontier.sqlite"),
+            ids.claim(),
+            RebuildSource::new(&engine, &store).unwrap(),
+        )
+        .unwrap()
+        .database;
+        let mut overlay = TailOverlay::empty_for_test(&engine);
         assert!(matches!(
             overlay.reserve_mutation(TAIL_MAX_BYTES + 1),
             Err(TailOverlayError::Backpressure(_))
@@ -10018,7 +11376,7 @@ mod tests {
             path: ManagedPath::parse("pages/oversized.md").unwrap(),
             kind: ManagedTextKind::Page,
         }];
-        for index in 0..5_u128 {
+        for index in 0..2_u128 {
             operations.push(SemanticOperation::CreateBlock {
                 block: BlockLocation {
                     block_id: BlockId::from_uuid(uuid(4_200 + index)),
@@ -10030,27 +11388,18 @@ mod tests {
                 content: content.clone(),
             });
         }
-        let mut engine = ids.engine();
         let prepared = engine
             .prepare_bootstrap_transaction(
                 author(4_300),
                 &OperationTransaction::new(operations).unwrap(),
             )
             .unwrap();
-        publish_and_stage(&mut engine, &store, &prepared);
+        publish_and_stage_archive(&mut engine, &store, &prepared);
         let event =
             AcceptedBatchEvent::from_accepted(&engine, &store, prepared.manifest().batch_id())
                 .unwrap();
         assert!(event.retained_bytes() > TAIL_MAX_BYTES);
-        let empty = ids.engine();
-        let mut database = open_test_projection(
-            &dir.path().join("frontier.sqlite"),
-            ids.claim(),
-            RebuildSource::new(&empty, &store).unwrap(),
-        )
-        .unwrap()
-        .database;
-        assert!(overlay.try_enqueue(&mut database, &event).unwrap());
+        assert!(overlay.try_enqueue(&mut database, &engine, &event).unwrap());
         assert_eq!(overlay.status().unapplied_batches, 1);
         assert!(overlay.status().backpressured);
         assert!(overlay.status().retained_bytes > TAIL_MAX_BYTES);
@@ -10059,6 +11408,13 @@ mod tests {
         assert_eq!(overlay.drain_ready(&mut database, &source, 1).unwrap(), 1);
         assert_eq!(overlay.status().unapplied_batches, 0);
         assert!(database.contains_batch(event.batch_id()).unwrap());
+        let blocks = database
+            .materialized_read()
+            .unwrap()
+            .blocks_on_page(ids.page, 10)
+            .unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert!(blocks.iter().all(|block| block.content == content));
     }
 
     #[test]
@@ -10715,14 +12071,10 @@ mod tests {
                 RebuildSource::new(&accepted_engine, &store).unwrap(),
             )
             .unwrap();
-            if mode == "apply-after" {
-                assert_eq!(reopened.recovery, ProjectionRecovery::OpenedExisting);
-            } else {
-                assert!(matches!(
-                    reopened.recovery,
-                    ProjectionRecovery::RebuiltPreservingEvidence { .. }
-                ));
-            }
+            assert!(matches!(
+                reopened.recovery,
+                ProjectionRecovery::RebuiltPreservingEvidence { .. }
+            ));
             assert_eq!(reopened.database.applied_batch_count().unwrap(), 1);
             assert_eq!(
                 reopened.database.frontier().unwrap(),
@@ -10829,7 +12181,7 @@ mod tests {
                 .unwrap(),
             )
             .unwrap();
-        publish_and_stage(&mut accepted_engine, &store, &child);
+        publish_and_stage_archive(&mut accepted_engine, &store, &child);
         fs::write(&path, b"corrupt before rebuild").unwrap();
         let mut helper = spawn_test_helper(
             "recover",
