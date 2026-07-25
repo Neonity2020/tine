@@ -18295,6 +18295,7 @@ mod validation_tests {
             .unwrap()
             .current_with_binding()
             .unwrap();
+        let prior_history_root = prior_history.1;
         let prior_snapshot = engine.canonical_snapshot().unwrap();
         let prior_page_name_root = engine.page_name_root.clone();
         let prior_page_name_conflicts = engine.page_name_conflicts.clone();
@@ -18399,6 +18400,7 @@ mod validation_tests {
             )
             .unwrap();
         let incomplete_orphan_id = incomplete_orphan.manifest().batch_id();
+        let accepted_looking_orphan_id = update.manifest().batch_id();
         writer.publish_prepared(&update).unwrap();
         writer.publish_prepared(&malformed_orphan).unwrap();
         writer
@@ -18509,8 +18511,13 @@ mod validation_tests {
             if manifest.batch_id() == incomplete_orphan_id {
                 continue;
             }
-            let before = (manifest.batch_id() == malformed_orphan_id)
-                .then(|| observable_engine_state(&reopened));
+            let orphan_requires_no_mutation = matches!(
+                manifest.batch_id(),
+                batch_id
+                    if batch_id == malformed_orphan_id
+                        || batch_id == accepted_looking_orphan_id
+            );
+            let before = orphan_requires_no_mutation.then(|| observable_engine_state(&reopened));
             let outcome = reopened
                 .stage_archive_batch_for_recovery(manifest.batch_id())
                 .unwrap();
@@ -18522,6 +18529,17 @@ mod validation_tests {
                     }
                 ));
                 assert_eq!(observable_engine_state(&reopened), before);
+                assert_eq!(reopened.history_root, prior_history_root);
+                assert_eq!(
+                    reopened
+                        .history_store
+                        .as_ref()
+                        .unwrap()
+                        .current_with_binding()
+                        .unwrap()
+                        .1,
+                    prior_history_root
+                );
             }
         }
         reopened.finish_operational_recovery_replay().unwrap();
