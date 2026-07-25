@@ -30,9 +30,9 @@ use super::portable_path_index::{
 };
 use super::reference_catalog::{
     affected_reference_sources, reference_source_is_org, ReferenceCandidateTargetV2,
-    ReferenceCatalogCandidateV2, ReferenceCatalogDeltaV2, ReferenceCatalogPolicyV1,
-    ReferenceCatalogRootV2, ReferenceCatalogStateV2, ReferenceCatalogStore, ReferenceSourceBlockV1,
-    ReferenceSourcePageV1,
+    ReferenceCatalogCandidateV2, ReferenceCatalogDeltaV2, ReferenceCatalogError,
+    ReferenceCatalogPolicyV1, ReferenceCatalogRootV2, ReferenceCatalogStateV2,
+    ReferenceCatalogStore, ReferenceSourceBlockV1, ReferenceSourcePageV1,
 };
 #[cfg(test)]
 use super::reference_catalog::{
@@ -1949,6 +1949,8 @@ struct HistoryWorkStats {
     external_range_scans: usize,
     external_history_page_reads: usize,
     external_history_blob_reads: usize,
+    recovery_history_record_reads: usize,
+    projection_reconciliation_history_record_reads: usize,
     ancestry_traversals: usize,
     block_claim_validation_nanos: usize,
     block_claim_lookup_nanos: usize,
@@ -2100,6 +2102,8 @@ pub struct EngineInstrumentation {
     pub external_range_scans: usize,
     pub external_history_page_reads: usize,
     pub external_history_blob_reads: usize,
+    pub recovery_history_record_reads: usize,
+    pub projection_reconciliation_history_record_reads: usize,
     pub ancestry_traversals: usize,
     pub scratch_page_reads: usize,
     pub scratch_page_bytes_read: usize,
@@ -2411,9 +2415,13 @@ impl ShardedHotEngine {
         engine
     }
 
-    /// Enroll manifested projection work only after the archive, receipt
-    /// namespace, retained graph capability, endpoint, and durable history all
-    /// agree. The resulting engine owns the work-index capability.
+    /// Open the enrolled projection capabilities without replaying non-empty
+    /// operational history.
+    ///
+    /// A non-empty operational engine remains recovery-gated. Production
+    /// startup should normally use [`Self::open_enrolled_projection`], which
+    /// does not expose the engine until complete immutable history has been
+    /// authenticated and pending projection work has been reconciled.
     pub fn with_enrolled_projection(
         store: ObjectStore,
         lineage_digest: LineageDigest,
@@ -2467,6 +2475,34 @@ impl ShardedHotEngine {
                 EngineError::Archive(error.to_string()),
             ),
         }
+    }
+
+    /// Open an enrolled projection engine and complete its startup recovery.
+    ///
+    /// `committed_manifests` must be the caller's complete current manifest
+    /// enumeration for `store`. Recovery reopens and authenticates every batch
+    /// from the immutable archive; the supplied values select the bounded set
+    /// to replay and do not themselves grant authority. Operational non-empty
+    /// history remains inaccessible until replay coverage, durable bindings,
+    /// and the reference catalog root all validate. Terminal authority is
+    /// restored directly and never enters operational replay.
+    pub fn open_enrolled_projection(
+        store: ObjectStore,
+        lineage_digest: LineageDigest,
+        catalog_document_id: DocumentId,
+        graph: &Graph,
+        receipts: &ProjectionReceiptStore,
+        committed_manifests: &[OperationBatch],
+    ) -> Result<(Self, Vec<StageOutcome>), EngineError> {
+        let mut engine = Self::with_enrolled_projection(
+            store,
+            lineage_digest,
+            catalog_document_id,
+            graph,
+            receipts,
+        );
+        let outcomes = engine.complete_enrolled_projection_recovery(committed_manifests)?;
+        Ok((engine, outcomes))
     }
 
     pub(crate) fn with_archive_store_for_endpoint(
@@ -2713,6 +2749,35 @@ impl ShardedHotEngine {
         engine.history_failure = Some(error);
         engine.durable_authority_mode = DurableAuthorityMode::EnrolledRequired;
         engine
+    }
+
+    fn complete_enrolled_projection_recovery(
+        &mut self,
+        committed_manifests: &[OperationBatch],
+    ) -> Result<Vec<StageOutcome>, EngineError> {
+        if let Some(error) = &self.history_failure {
+            return Err(error.clone());
+        }
+        if !matches!(self.workspace_status(), WorkspaceStatus::Operational) {
+            return Ok(Vec::new());
+        }
+        match self.reference_catalog.ensure_ready() {
+            Ok(()) => return Ok(Vec::new()),
+            Err(ReferenceCatalogError::RecoveryRequired) => {}
+            Err(error) => return Err(EngineError::ReferenceCatalog(error.to_string())),
+        }
+
+        self.prepare_operational_recovery_replay()?;
+        let mut outcomes = Vec::with_capacity(committed_manifests.len());
+        for manifest in committed_manifests {
+            let outcome = self.stage_archive_batch_for_recovery(manifest.batch_id())?;
+            if let Some(error) = &self.history_failure {
+                return Err(error.clone());
+            }
+            outcomes.push(outcome);
+        }
+        self.finish_operational_recovery_replay()?;
+        Ok(outcomes)
     }
 
     /// Reset only reconstructible run-local state before replaying an
@@ -2986,6 +3051,9 @@ impl ShardedHotEngine {
             external_range_scans: work.external_range_scans,
             external_history_page_reads: work.external_history_page_reads,
             external_history_blob_reads: work.external_history_blob_reads,
+            recovery_history_record_reads: work.recovery_history_record_reads,
+            projection_reconciliation_history_record_reads: work
+                .projection_reconciliation_history_record_reads,
             ancestry_traversals: work.ancestry_traversals,
             scratch_page_reads: scratch.page_reads,
             scratch_page_bytes_read: scratch.page_bytes_read,
@@ -5815,7 +5883,7 @@ impl ShardedHotEngine {
     }
 
     fn validate_manifested_base(&self, base: &AnnotatedProjectionBase) -> Result<(), EngineError> {
-        let state = match self.authorize_projection_recovery(
+        let state = match self.authorize_projection_recovery_inner(
             base.source_page_id(),
             base.prior_frontier(),
             base.claim_evidence(),
@@ -6040,6 +6108,13 @@ impl ShardedHotEngine {
         batch_id: BatchId,
         manifest_fingerprint: ContentDigest,
     ) -> Result<(), EngineError> {
+        // Recovery may reconstruct accepted hot state, but it must not publish
+        // pending -> Ready projection authority one batch at a time. Finish
+        // first proves complete durable-history coverage and catalog
+        // readiness, then performs the bounded pending-work reconciliation.
+        if self.authenticated_history_replay {
+            return Ok(());
+        }
         let Some(index) = self.projection_work_index.as_ref() else {
             return Ok(());
         };
@@ -6084,6 +6159,11 @@ impl ShardedHotEngine {
                 .pending_activation_page(cursor.as_ref(), 256)
                 .map_err(|error| EngineError::ProjectionWork(error.to_string()))?;
             for pending in page.pending() {
+                let mut work = self.history_work.get();
+                work.projection_reconciliation_history_record_reads = work
+                    .projection_reconciliation_history_record_reads
+                    .saturating_add(1);
+                self.history_work.set(work);
                 match self.durable_endpoint_history_record_at_live_head(pending.batch_id())? {
                     Some(record) => {
                         if record.manifest_fingerprint != pending.manifest_fingerprint() {
@@ -6127,7 +6207,10 @@ impl ShardedHotEngine {
             }
         }
         index
-            .require_current_history_binding(authority.generation, authority.index_root)
+            .bind_recovered_history_after_pending_reconciliation(
+                authority.generation,
+                authority.index_root,
+            )
             .map_err(|error| EngineError::ProjectionWork(error.to_string()))?;
         Ok(())
     }
@@ -6416,6 +6499,15 @@ impl ShardedHotEngine {
     ) -> Result<ProjectionWriteAuthorization, EngineError> {
         self.begin_point_operation();
         self.ensure_not_blocked()?;
+        self.authorize_projection_recovery_inner(page_id, frontier, expected_claim_evidence)
+    }
+
+    fn authorize_projection_recovery_inner(
+        &self,
+        page_id: PageId,
+        frontier: &FrontierV2,
+        expected_claim_evidence: &[ProjectionClaimEvidence],
+    ) -> Result<ProjectionWriteAuthorization, EngineError> {
         let store = self
             .archive_store
             .as_ref()
@@ -7562,16 +7654,27 @@ impl ShardedHotEngine {
                     .insert(batch_id, Some(existing));
                 return Ok(());
             }
+            if let (
+                ArchiveStatus::Accepted {
+                    no_op: existing, ..
+                },
+                ArchiveStatus::Accepted {
+                    no_op: candidate, ..
+                },
+            ) = (&existing.status, &status)
+            {
+                if existing != candidate {
+                    return Err(EngineError::Archive(format!(
+                        "durable engine history accepted no-op collision for batch {batch_id}: durable={existing}, replayed={candidate}"
+                    )));
+                }
+            }
             let mismatch = if existing.manifest_fingerprint != manifest_fingerprint {
                 Some("manifest fingerprint")
-            } else if existing.status != status {
-                Some("final status")
             } else if existing.portable_path_key_version != super::PORTABLE_PATH_KEY_VERSION {
                 Some("portable-path key version")
             } else if existing.portable_path_root.digest() != binding.portable_path_root {
                 Some("portable-path root")
-            } else if existing.catalog_checkpoint_binding != binding.catalog_checkpoint_binding {
-                Some("catalog checkpoint")
             } else if existing.portable_path_conflicts != binding.portable_path_conflicts {
                 Some("portable-path conflicts")
             } else if existing.terminal_evidence != binding.terminal_evidence {
@@ -7584,6 +7687,18 @@ impl ShardedHotEngine {
                 Some("reference-catalog policy")
             } else if existing.reference_catalog_root != reference_catalog_root {
                 Some("reference-catalog authority")
+            } else if existing.status != status {
+                let replayed = match &status {
+                    ArchiveStatus::Accepted { .. } => "accepted".to_owned(),
+                    ArchiveStatus::Rejected(error) => format!("rejected ({error})"),
+                    ArchiveStatus::Quarantined => "quarantined".to_owned(),
+                    ArchiveStatus::Staged => "staged".to_owned(),
+                };
+                return Err(EngineError::Archive(format!(
+                    "durable engine history final status collision for batch {batch_id}: replayed={replayed}"
+                )));
+            } else if existing.catalog_checkpoint_binding != binding.catalog_checkpoint_binding {
+                Some("catalog checkpoint")
             } else {
                 None
             };
@@ -7639,6 +7754,17 @@ impl ShardedHotEngine {
         if let Some(status) = self.statuses.get(&batch_id) {
             return Ok(Some(status.clone()));
         }
+        // Durable final status is the recovery oracle to authenticate, not a
+        // substitute for replaying dependency state. Until this run has
+        // reproduced and matched a batch, treating its cold Accepted record as
+        // a satisfied dependency could apply a later manifest against
+        // incomplete hot state when caller enumeration order differs from
+        // causal order.
+        if self.authenticated_history_replay
+            && !self.authenticated_replayed_batches.contains(&batch_id)
+        {
+            return Ok(None);
+        }
         Ok(self
             .cold_history_record(batch_id)?
             .map(|record| record.status))
@@ -7670,6 +7796,9 @@ impl ShardedHotEngine {
                 "authenticated recovery has no enrolled durable history store".into(),
             )
         })?;
+        let mut work = self.history_work.get();
+        work.recovery_history_record_reads = work.recovery_history_record_reads.saturating_add(1);
+        self.history_work.set(work);
         let bytes = store
             .lookup(self.history_root, batch_id)
             .map_err(|error| EngineError::Archive(error.to_string()))?;
@@ -19316,6 +19445,40 @@ mod validation_tests {
     }
 
     #[test]
+    fn startup_coordinator_keeps_empty_enrolled_history_ready_without_replay() {
+        let lineage = LineageDigest::of(b"empty-enrolled-startup-needs-no-replay");
+        let (root, writer, engine, catalog) = enrolled_test_engine(89_470, lineage);
+        let workspace = writer.workspace_id();
+        let endpoint = engine.projection_endpoint_binding().unwrap();
+        assert!(writer.committed_manifests().unwrap().is_empty());
+        drop(engine);
+
+        let graph = Graph::open(&root.join("graph"));
+        let receipts =
+            ProjectionReceiptStore::open_for_endpoint(&root.join("receipts"), workspace, endpoint)
+                .unwrap();
+        let (reopened, outcomes) = ShardedHotEngine::open_enrolled_projection(
+            ObjectStore::open(&root.join("archive"), workspace).unwrap(),
+            lineage,
+            catalog,
+            &graph,
+            &receipts,
+            &[],
+        )
+        .unwrap();
+
+        assert!(outcomes.is_empty());
+        assert!(!reopened.authenticated_history_replay);
+        assert_eq!(reopened.instrumentation().recovery_history_record_reads, 0);
+        assert!(reopened.reference_catalog_root().is_ok());
+        assert!(reopened.projection_work_index().is_ok());
+
+        drop(reopened);
+        drop(writer);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn zero_history_draft_cannot_finalize_during_authenticated_replay() {
         let lineage = LineageDigest::of(b"zero-history-draft-replay-gate");
         let (root, writer, mut engine, _catalog) = enrolled_test_engine(89_480, lineage);
@@ -19536,13 +19699,18 @@ mod validation_tests {
         let receipts =
             ProjectionReceiptStore::open_for_endpoint(&root.join("receipts"), workspace, endpoint)
                 .unwrap();
-        let mut reopened = ShardedHotEngine::with_enrolled_projection(
+        let manifests = writer.committed_manifests().unwrap();
+        let (mut reopened, outcomes) = ShardedHotEngine::open_enrolled_projection(
             ObjectStore::open(&root.join("archive"), workspace).unwrap(),
             lineage,
             catalog,
             &graph,
             &receipts,
-        );
+            &manifests,
+        )
+        .unwrap();
+        assert!(outcomes.is_empty());
+        assert!(!reopened.authenticated_history_replay);
         let expected = EngineError::WorkspaceBlocked(
             reopened
                 .fatal_evidence_handle()

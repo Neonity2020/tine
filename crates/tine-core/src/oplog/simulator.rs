@@ -39,9 +39,9 @@ use super::page_name_index::PageNameConflictEvidenceV1;
 use super::{
     AuthorBatch, BatchDisposition, BatchId, BatchInspection, CanonicalSnapshot, CrdtPeerId,
     DeviceId, DocumentId, EngineError, EngineStatus, ImmutableHomeEvidence, LineageDigest,
-    ObjectStore, OperationTransaction, ProjectionEndpointBinding, ProjectionEndpointId,
-    ProjectionReceiptStore, SemanticOperation, SessionId, ShardedHotEngine, StageOutcome,
-    WorkspaceId, WorkspaceStatus,
+    ObjectStore, OperationBatch, OperationTransaction, ProjectionEndpointBinding,
+    ProjectionEndpointId, ProjectionReceiptStore, SemanticOperation, SessionId, ShardedHotEngine,
+    StageOutcome, WorkspaceId, WorkspaceStatus,
 };
 use crate::Graph;
 
@@ -3575,7 +3575,8 @@ impl DeviceRuntime {
         archive_path: &Path,
         device_id: DeviceId,
         workspace: &ScenarioWorkspace,
-    ) -> Result<ShardedHotEngine, ScenarioError> {
+        committed_manifests: &[OperationBatch],
+    ) -> Result<(ShardedHotEngine, Vec<StageOutcome>), ScenarioError> {
         let graph_path = root.join("projection-graph");
         fs::create_dir_all(&graph_path).map_err(|error| ScenarioError::Io(error.to_string()))?;
         let graph = Graph::open(&graph_path);
@@ -3593,13 +3594,15 @@ impl DeviceRuntime {
         .map_err(|error| ScenarioError::Engine(error.to_string()))?;
         let engine_store = ObjectStore::open(archive_path, workspace.workspace_id)
             .map_err(|error| ScenarioError::Store(error.to_string()))?;
-        Ok(ShardedHotEngine::with_enrolled_projection(
+        ShardedHotEngine::open_enrolled_projection(
             engine_store,
             workspace.lineage_digest,
             workspace.catalog_document_id,
             &graph,
             &receipts,
-        ))
+            committed_manifests,
+        )
+        .map_err(|error| ScenarioError::Engine(error.to_string()))
     }
 
     fn open(
@@ -3611,8 +3614,9 @@ impl DeviceRuntime {
         let archive_path = root.join("archive");
         let store = ObjectStore::open(&archive_path, workspace.workspace_id)
             .map_err(|error| ScenarioError::Store(error.to_string()))?;
-        let engine =
-            Self::open_durable_engine(&root, &archive_path, identity.device_id, workspace)?;
+        let (engine, recovery_outcomes) =
+            Self::open_durable_engine(&root, &archive_path, identity.device_id, workspace, &[])?;
+        debug_assert!(recovery_outcomes.is_empty());
         let provider = ProviderRuntime::open(root.join("provider"))?;
         let provider_journal = ProviderRetryJournal::open(root.join("provider-local-journal"))?;
         Ok(Self {
@@ -3675,28 +3679,17 @@ impl DeviceRuntime {
         let manifests = store
             .committed_manifests()
             .map_err(|error| ScenarioError::Store(error.to_string()))?;
-        let mut engine =
-            Self::open_durable_engine(&self.root, &self.archive_path(), self.device_id, workspace)?;
-        let mut outcomes = Vec::new();
         // Terminal state, including typed page-name evidence, is restored
         // solely from authenticated durable history. Operational replicas
-        // still replay their wider CRDT hot state because P2N2 does not own
-        // general document-state recovery.
-        if matches!(engine.status().workspace(), WorkspaceStatus::Operational) {
-            engine
-                .prepare_operational_recovery_replay()
-                .map_err(|error| ScenarioError::Engine(error.to_string()))?;
-            for manifest in manifests {
-                outcomes.push(
-                    engine
-                        .stage_archive_batch_for_recovery(manifest.batch_id())
-                        .map_err(|error| ScenarioError::Engine(error.to_string()))?,
-                );
-            }
-            engine
-                .finish_operational_recovery_replay()
-                .map_err(|error| ScenarioError::Engine(error.to_string()))?;
-        }
+        // replay their wider CRDT hot state through the same atomic startup
+        // coordinator used by production callers.
+        let (engine, outcomes) = Self::open_durable_engine(
+            &self.root,
+            &self.archive_path(),
+            self.device_id,
+            workspace,
+            &manifests,
+        )?;
         self.store = Some(store);
         self.engine = Some(engine);
         self.provider_journal = Some(ProviderRetryJournal::open(

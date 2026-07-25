@@ -1284,6 +1284,38 @@ impl ProjectionWorkIndex {
         })
     }
 
+    /// Seal the final authenticated history binding after startup recovery has
+    /// reconciled every pending activation. This cannot make work Ready and
+    /// refuses to advance authority while pending or executable work remains;
+    /// such work requires an exact existing history binding.
+    pub(crate) fn bind_recovered_history_after_pending_reconciliation(
+        &self,
+        engine_history_generation: u64,
+        engine_history_root: ContentDigest,
+    ) -> Result<(), ProjectionWorkError> {
+        if (engine_history_generation == 0)
+            != (engine_history_root == super::object_store::EngineHistoryStore::empty_root())
+        {
+            return Err(ProjectionWorkError::HistoryBindingMismatch);
+        }
+        self.transition(|index, _, mut root| {
+            if root.engine_history_generation == engine_history_generation
+                && root.engine_history_root == engine_history_root
+            {
+                return Ok(root);
+            }
+            if index.tree_first_after(root.pending_root, None)?.is_some() {
+                return Err(ProjectionWorkError::PendingActivationMismatch);
+            }
+            if index.tree_first_after(root.ready_root, None)?.is_some() {
+                return Err(ProjectionWorkError::HistoryBindingMismatch);
+            }
+            root.engine_history_generation = engine_history_generation;
+            root.engine_history_root = engine_history_root;
+            Ok(root)
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn retire_pending_activation(
         &self,
@@ -3923,6 +3955,48 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn recovery_history_rebind_requires_no_pending_or_executable_work() {
+        let empty = Fixture::new("empty-recovery-history-rebind");
+        let recovered_root = ContentDigest::of(b"empty-recovered-engine-history");
+        empty
+            .index
+            .bind_recovered_history_after_pending_reconciliation(2, recovered_root)
+            .unwrap();
+        empty
+            .index
+            .require_current_history_binding(2, recovered_root)
+            .unwrap();
+
+        let fixture = Fixture::new("gated-recovery-history-rebind");
+        let work = fixture.work(1, "pages/recovery-history-rebind.md");
+        let fingerprint = fixture.prepare(&work);
+        assert!(matches!(
+            fixture
+                .index
+                .bind_recovered_history_after_pending_reconciliation(2, recovered_root),
+            Err(ProjectionWorkError::PendingActivationMismatch)
+        ));
+
+        fixture
+            .index
+            .accept_batch(work.batch_id(), fingerprint)
+            .unwrap();
+        assert!(matches!(
+            fixture
+                .index
+                .bind_recovered_history_after_pending_reconciliation(2, recovered_root),
+            Err(ProjectionWorkError::HistoryBindingMismatch)
+        ));
+        fixture
+            .index
+            .bind_recovered_history_after_pending_reconciliation(
+                1,
+                ContentDigest::of(b"projection-work-test-history-root"),
+            )
+            .unwrap();
     }
 
     #[test]

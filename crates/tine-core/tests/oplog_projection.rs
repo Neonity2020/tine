@@ -3410,18 +3410,117 @@ fn fail_before_projection_crash_windows_recover_without_unauthorized_execution()
     // seal the exact durable pending HEAD it actually observes.
     drop(engine);
     fs::write(&work_head, pending_head.to_string()).unwrap();
-    let recovery_reader = ObjectStore::open(&archive_path, workspace_id).unwrap();
-    let recovery_engine = ShardedHotEngine::with_enrolled_projection(
-        recovery_reader,
+    let recovery_manifests = writer.committed_manifests().unwrap();
+    let target_position = recovery_manifests
+        .iter()
+        .position(|manifest| manifest.batch_id() == batch_id)
+        .unwrap();
+    let latest_dependency_position = recovery_manifests
+        .iter()
+        .position(|manifest| manifest.batch_id() == BatchId::from_uuid(uuid(9_023)))
+        .unwrap();
+    assert!(
+        target_position < latest_dependency_position,
+        "the startup coordinator must not mistake BatchId enumeration order for causal order"
+    );
+
+    // Merely opening the enrolled capabilities must not authorize either the
+    // recovered reference catalog or projection execution. The production
+    // startup coordinator is the only operation below that can cross this
+    // recovery gate.
+    let recovery_gated_reader = ObjectStore::open(&archive_path, workspace_id).unwrap();
+    let mut recovery_gated_engine = ShardedHotEngine::with_enrolled_projection(
+        recovery_gated_reader,
         lineage,
         catalog,
         &graph,
         &receipts,
     );
+    assert!(matches!(
+        recovery_gated_engine.projection_work_index(),
+        Err(EngineError::ReferenceCatalog(_))
+    ));
+    assert!(execute_manifested_projection_work(
+        &graph,
+        &receipts,
+        &mut recovery_gated_engine,
+        &same_engine_work,
+    )
+    .is_err());
+    assert_eq!(
+        fs::read(graph_root.join("pages/manifested.md")).unwrap(),
+        source_target
+    );
+    assert_eq!(
+        fs::read(&work_head).unwrap(),
+        pending_head.to_string().as_bytes()
+    );
+    drop(recovery_gated_engine);
+
+    // An incomplete caller enumeration cannot activate the catalog or seal
+    // the pending work row. Recovery authenticates archive bytes rather than
+    // trusting the supplied manifest values, then rejects incomplete durable
+    // history coverage at finish.
+    let incomplete_archive_path = dir.path().join("incomplete-recovery-archive");
+    copy_directory_tree(&archive_path, &incomplete_archive_path);
+    let incomplete_work_head = incomplete_archive_path
+        .join("projection-work-index-v1")
+        .join(source_endpoint.to_string())
+        .join("projection-work.head");
+    let incomplete_reader = ObjectStore::open(&incomplete_archive_path, workspace_id).unwrap();
+    let incomplete = ShardedHotEngine::open_enrolled_projection(
+        incomplete_reader,
+        lineage,
+        catalog,
+        &graph,
+        &receipts,
+        &recovery_manifests[..recovery_manifests.len() - 1],
+    );
+    assert!(matches!(incomplete, Err(EngineError::Archive(_))));
+    assert_eq!(
+        fs::read(&incomplete_work_head).unwrap(),
+        pending_head.to_string().as_bytes()
+    );
+    let mut incomplete_gated = ShardedHotEngine::with_enrolled_projection(
+        ObjectStore::open(&incomplete_archive_path, workspace_id).unwrap(),
+        lineage,
+        catalog,
+        &graph,
+        &receipts,
+    );
+    assert!(execute_manifested_projection_work(
+        &graph,
+        &receipts,
+        &mut incomplete_gated,
+        &same_engine_work,
+    )
+    .is_err());
+    assert_eq!(
+        fs::read(graph_root.join("pages/manifested.md")).unwrap(),
+        source_target
+    );
+
+    let recovery_reader = ObjectStore::open(&archive_path, workspace_id).unwrap();
+    let (recovery_engine, recovery_outcomes) = ShardedHotEngine::open_enrolled_projection(
+        recovery_reader,
+        lineage,
+        catalog,
+        &graph,
+        &receipts,
+        &recovery_manifests,
+    )
+    .unwrap();
+    assert_eq!(recovery_outcomes.len(), recovery_manifests.len());
     let recovery_work = recovery_engine.instrumentation();
     assert_eq!(recovery_work.projection_pending_entries_read, 1);
-    assert_eq!(recovery_work.store.history_record_reads, 1);
-    assert!(recovery_work.store.history_index_reads <= 33);
+    assert_eq!(
+        recovery_work.recovery_history_record_reads,
+        recovery_manifests.len()
+    );
+    assert_eq!(
+        recovery_work.projection_reconciliation_history_record_reads,
+        1
+    );
     assert_eq!(fs::read(&work_head).unwrap(), accepted_head);
     assert!(recovery_engine
         .projection_work_index()
@@ -3462,8 +3561,17 @@ fn fail_before_projection_crash_windows_recover_without_unauthorized_execution()
     // engine's authenticated durable history does not contain this acceptance.
     fs::write(&history_head, &history_head_before_acceptance).unwrap();
     let unaccepted_reader = ObjectStore::open(&archive_path, workspace_id).unwrap();
-    let mut unaccepted_engine = ShardedHotEngine::with_enrolled_projection(
+    let unaccepted = ShardedHotEngine::open_enrolled_projection(
         unaccepted_reader,
+        lineage,
+        catalog,
+        &graph,
+        &receipts,
+        &recovery_manifests,
+    );
+    assert!(matches!(unaccepted, Err(EngineError::ProjectionWork(_))));
+    let mut unaccepted_engine = ShardedHotEngine::with_enrolled_projection(
+        ObjectStore::open(&archive_path, workspace_id).unwrap(),
         lineage,
         catalog,
         &graph,
@@ -3480,13 +3588,15 @@ fn fail_before_projection_crash_windows_recover_without_unauthorized_execution()
 
     fs::write(&history_head, &accepted_history_head).unwrap();
     let accepted_reader = ObjectStore::open(&archive_path, workspace_id).unwrap();
-    let mut accepted_engine = ShardedHotEngine::with_enrolled_projection(
+    let (mut accepted_engine, _) = ShardedHotEngine::open_enrolled_projection(
         accepted_reader,
         lineage,
         catalog,
         &graph,
         &receipts,
-    );
+        &recovery_manifests,
+    )
+    .unwrap();
     execute_manifested_projection_work(&graph, &receipts, &mut accepted_engine, &work).unwrap();
     assert_eq!(
         fs::read(graph_root.join("pages/manifested.md")).unwrap(),
