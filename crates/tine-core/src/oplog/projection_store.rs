@@ -1207,6 +1207,8 @@ impl ProjectionReceiptStore {
     pub(crate) fn completed_direct_authority(
         &self,
         intent: &ProjectionIntent,
+        engine_history_generation: u64,
+        engine_history_root: super::ContentDigest,
     ) -> Result<ProjectionDirectCompletionAuthority, ProjectionStoreError> {
         let endpoint = self
             .endpoint
@@ -1222,6 +1224,8 @@ impl ProjectionReceiptStore {
                 endpoint.endpoint_id,
                 endpoint.graph_resource_id,
                 self.store_id,
+                engine_history_generation,
+                engine_history_root,
                 intent,
                 &completion,
             ),

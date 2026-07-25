@@ -20,8 +20,8 @@ use super::{
     ImportInventoryState, ImportLocator, LogicalCompletionId, LogicalPageName,
     LogseqIdentityMutation, LogseqUuid, ManagedPath, ManagedTextKind, OperationTransaction, PageId,
     ProjectionCompletedReceipt, ProjectionCompletion, ProjectionIntent, ProjectionReceiptStore,
-    SemanticOperation, ShardedHotEngine, StructuralLocator, StructuralSpan, WorkspaceId,
-    DIFF_SCHEMA_VERSION,
+    ProjectionStoreError, SemanticOperation, ShardedHotEngine, StructuralLocator, StructuralSpan,
+    WorkspaceId, DIFF_SCHEMA_VERSION,
 };
 use crate::doc::Document;
 use crate::model::{path_is_sync_conflict, Graph, PageKind};
@@ -1223,8 +1223,14 @@ fn capture_affected_catalog(
                 receipts
                     .load_completed_receipt(&completed)
                     .map_err(|error| {
+                        let reason =
+                            if matches!(error, ProjectionStoreError::MissingPriorCompletion) {
+                                ImportBlockReason::MissingBase
+                            } else {
+                                ImportBlockReason::CorruptBase
+                            };
                         authority_block(
-                            ImportBlockReason::CorruptBase,
+                            reason,
                             Some(path),
                             format!("durable exact receipt lookup is invalid: {error}"),
                         )

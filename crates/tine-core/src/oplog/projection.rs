@@ -597,7 +597,13 @@ pub fn recover_incomplete_projections(
             Some((Err(error), _)) => return Err(error.into()),
         };
         let completion = store.reconstruct_completion(authority, &intent, plan.target(), &proof)?;
-        record_completed_path(store, engine, intent.page_id(), &intent)?;
+        // Historical recovery remains compatible and preserves its durable
+        // receipt, but a completion that is no longer the current accepted
+        // page state must not replace point-addressable import authority.
+        match record_completed_path(store, engine, intent.page_id(), &intent) {
+            Ok(()) | Err(ProjectionError::RecoveryIntentMismatch) => {}
+            Err(error) => return Err(error),
+        }
         debug_assert_eq!(authorization.state().page.page_id, intent.page_id());
         recovered.push(ProjectionWrite { plan, completion });
     }
@@ -614,6 +620,27 @@ fn record_completed_path(
     page_id: PageId,
     intent: &ProjectionIntent,
 ) -> Result<(), ProjectionError> {
+    // Revalidate the completed intent against the current accepted page before
+    // exposing it as point-addressable authority. Historical recovery is
+    // allowed to inspect an old frontier, but it must never replace the
+    // authority for a newer accepted frontier or a reused path.
+    let current = engine.authorize_projection_write(page_id)?;
+    if current.state().page.path != *intent.path()
+        || current.state().frontier != *intent.frontier()
+        || current.state().claim_evidence != intent.claim_evidence()
+    {
+        return Err(ProjectionError::RecoveryIntentMismatch);
+    }
+    let base = store.load_base(intent)?;
+    let replay = plan_projection(
+        engine.workspace_id(),
+        current.state(),
+        base.as_ref().map(BaseBlob::bytes),
+    )?;
+    if replay.intent() != intent {
+        return Err(ProjectionError::RecoveryIntentMismatch);
+    }
+
     // The compatibility writer still produces a normal enrolled completion.
     // Mirror it into the authenticated completed-path tree when its accepted
     // work row is present, so sparse import never has to fall back to receipt
@@ -640,7 +667,13 @@ fn record_completed_path(
                 .mark_completed(authority)
                 .map_err(|error| ProjectionError::Work(error.to_string()))?;
         } else {
-            let authority = store.completed_direct_authority(intent)?;
+            let (engine_history_generation, engine_history_root) =
+                engine.projection_completion_history_authority()?;
+            let authority = store.completed_direct_authority(
+                intent,
+                engine_history_generation,
+                engine_history_root,
+            )?;
             work_index
                 .mark_direct_completed(authority)
                 .map_err(|error| ProjectionError::Work(error.to_string()))?;

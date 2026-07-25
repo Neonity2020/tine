@@ -6394,6 +6394,20 @@ impl ShardedHotEngine {
         })
     }
 
+    pub(crate) fn projection_completion_history_authority(
+        &self,
+    ) -> Result<(u64, ContentDigest), EngineError> {
+        self.begin_point_operation();
+        self.ensure_not_blocked()?;
+        let authority = self
+            .history_store
+            .as_ref()
+            .ok_or(EngineError::ProjectionAuthorizationUnavailable)?
+            .current_authority()
+            .map_err(|error| EngineError::Archive(error.to_string()))?;
+        Ok((authority.generation, authority.index_root))
+    }
+
     pub(crate) fn authorize_projection_recovery(
         &self,
         page_id: PageId,

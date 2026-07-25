@@ -36,17 +36,17 @@ use super::{
 };
 
 const WORK_SCHEMA_VERSION: u32 = 3;
-// v7 adds the authenticated, exact-path completed-receipt tree used by sparse
-// external import.  It is deliberately separate from the ready-path tree:
-// completed rows must stay point-addressable after they leave the ready queue.
-const INDEX_SCHEMA_VERSION: u32 = 7;
+// v8 makes each authenticated exact-path completion leaf a bounded current
+// authority (or a constant-size ambiguity marker), rather than a lifetime
+// history of every receipt ever completed at that path.
+const INDEX_SCHEMA_VERSION: u32 = 8;
 const MAX_WORK_ROW_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_PREPARED_BATCH_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_INDEX_NODE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_INDEX_KEY_BYTES: usize = 4 * 1024;
 const MAX_READY_PAGE: usize = 256;
 const MAX_PENDING_PAGE: usize = 256;
-const MAX_COMPLETED_PATH_WORKS: usize = 4_096;
+const MAX_COMPLETED_PATH_ROW_BYTES: usize = MAX_WORK_ROW_BYTES as usize;
 const MAX_PREFLIGHT_NODES: usize = 2_000_000;
 const MAX_PREFLIGHT_RECORDS: usize = 2_000_000;
 const MAX_PREFLIGHT_ROOTS: usize = 2_000_000;
@@ -298,6 +298,8 @@ pub(crate) struct ProjectionDirectCompletionAuthority {
     endpoint_id: ProjectionEndpointId,
     graph_resource_id: super::CanonicalGraphResourceId,
     receipt_store_id: super::ProjectionReceiptStoreId,
+    engine_history_generation: u64,
+    engine_history_root: ContentDigest,
     receipt: ProjectionCompletedReceipt,
 }
 
@@ -306,6 +308,8 @@ impl ProjectionDirectCompletionAuthority {
         endpoint_id: ProjectionEndpointId,
         graph_resource_id: super::CanonicalGraphResourceId,
         receipt_store_id: super::ProjectionReceiptStoreId,
+        engine_history_generation: u64,
+        engine_history_root: ContentDigest,
         intent: &super::ProjectionIntent,
         completion: &super::ProjectionCompletion,
     ) -> Self {
@@ -314,6 +318,8 @@ impl ProjectionDirectCompletionAuthority {
             endpoint_id,
             graph_resource_id,
             receipt_store_id,
+            engine_history_generation,
+            engine_history_root,
             receipt: ProjectionCompletedReceipt {
                 page_id: intent.page_id(),
                 path: intent.path().clone(),
@@ -322,6 +328,67 @@ impl ProjectionDirectCompletionAuthority {
                 intent_id: completion.intent_id(),
                 logical_completion_id: completion.logical_completion_id(),
             },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+enum ProjectionCompletedPathSource {
+    Manifested {
+        work_id: ProjectionWorkId,
+    },
+    Direct {
+        engine_history_generation: u64,
+        engine_history_root: ContentDigest,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectionCurrentCompletedPath {
+    receipt: ProjectionCompletedReceipt,
+    source: ProjectionCompletedPathSource,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+enum ProjectionCompletedPathRow {
+    Current(ProjectionCurrentCompletedPath),
+    Ambiguous {
+        page_id: PageId,
+        path: ManagedPath,
+        frontier: FrontierV2,
+        engine_history_generation: u64,
+        engine_history_root: ContentDigest,
+    },
+}
+
+impl ProjectionCompletedPathRow {
+    fn path(&self) -> &ManagedPath {
+        match self {
+            Self::Current(current) => current.receipt.path(),
+            Self::Ambiguous { path, .. } => path,
+        }
+    }
+
+    fn state_matches(&self, receipt: &ProjectionCompletedReceipt) -> bool {
+        match self {
+            Self::Current(current) => {
+                current.receipt.page_id() == receipt.page_id()
+                    && current.receipt.path() == receipt.path()
+                    && current.receipt.frontier() == receipt.frontier()
+            }
+            Self::Ambiguous {
+                page_id,
+                path,
+                frontier,
+                ..
+            } => {
+                *page_id == receipt.page_id()
+                    && path == receipt.path()
+                    && frontier == receipt.frontier()
+            }
         }
     }
 }
@@ -717,7 +784,7 @@ impl ProjectionWorkIndex {
                     pending.push((tree, right));
                     pending.push((tree, left));
                 }
-                IndexNode::Leaf { value, .. } => {
+                IndexNode::Leaf { key, value, .. } => {
                     charge_preflight(&mut stats.records, 1, MAX_PREFLIGHT_RECORDS)?;
                     match tree {
                         PreflightTree::Rows => {
@@ -737,21 +804,7 @@ impl ProjectionWorkIndex {
                             }
                         }
                         PreflightTree::CompletedPaths => {
-                            let receipts: Vec<ProjectionCompletedReceipt> =
-                                decode_canonical(&value)?;
-                            if receipts.len() > MAX_COMPLETED_PATH_WORKS
-                                || !strictly_sorted_by(
-                                    &receipts,
-                                    ProjectionCompletedReceipt::intent_id,
-                                )
-                            {
-                                return Err(ProjectionWorkError::NonCanonical);
-                            }
-                            for receipt in receipts {
-                                if receipt.path().as_str().is_empty() {
-                                    return Err(ProjectionWorkError::BindingMismatch);
-                                }
-                            }
+                            decode_completed_path_row(&key, &value)?;
                         }
                         PreflightTree::Pending => {
                             let activation: ProjectionPendingActivation = decode_canonical(&value)?;
@@ -1103,6 +1156,11 @@ impl ProjectionWorkIndex {
             }
 
             for work in &prepared.work {
+                // Acceptance is the authenticated ordering boundary for a
+                // path. Any prior completion described the superseded
+                // accepted state, including deletion/rename authority.
+                root.completed_paths_root =
+                    index.tree_remove(root.completed_paths_root, &path_key(work.path()))?;
                 if let Some(existing) = index.load_state(&root, work.work_id())? {
                     if existing.work != *work || !matches!(existing.status, StoredWorkStatus::Ready)
                     {
@@ -1386,9 +1444,9 @@ impl ProjectionWorkIndex {
         Ok(work)
     }
 
-    /// Return only the completed work rows recorded for this exact managed
-    /// path.  This is a Patricia point lookup rooted in the enrolled index;
-    /// it never enumerates receipt namespaces or unrelated work rows.
+    /// Return the one unambiguous current completion authority for this exact
+    /// managed path. This is a Patricia point lookup rooted in the enrolled
+    /// index; it never enumerates receipt namespaces or unrelated work rows.
     pub(crate) fn completed_receipts_for_path(
         &self,
         path: &ManagedPath,
@@ -1397,18 +1455,12 @@ impl ProjectionWorkIndex {
         let Some(bytes) = self.tree_lookup(root.completed_paths_root, &path_key(path))? else {
             return Ok(Vec::new());
         };
-        let receipts: Vec<ProjectionCompletedReceipt> = decode_canonical(&bytes)?;
-        if receipts.len() > MAX_COMPLETED_PATH_WORKS
-            || !strictly_sorted_by(&receipts, ProjectionCompletedReceipt::intent_id)
-        {
-            return Err(ProjectionWorkError::NonCanonical);
-        }
-        for receipt in &receipts {
-            if receipt.path() != path {
-                return Err(ProjectionWorkError::BindingMismatch);
+        match decode_completed_path_row(&path_key(path), &bytes)? {
+            ProjectionCompletedPathRow::Current(current) => Ok(vec![current.receipt]),
+            ProjectionCompletedPathRow::Ambiguous { .. } => {
+                Err(ProjectionWorkError::AmbiguousCompletedPath)
             }
         }
-        Ok(receipts)
     }
 
     pub(crate) fn require_accepted_ready(
@@ -1558,34 +1610,42 @@ impl ProjectionWorkIndex {
         }
         self.transition(|index, _, root| {
             let key = path_key(authority.receipt.path());
-            let mut receipts: Vec<ProjectionCompletedReceipt> = index
-                .tree_lookup(root.completed_paths_root, &key)?
-                .map(|bytes| decode_canonical(&bytes))
-                .transpose()?
-                .unwrap_or_default();
-            if receipts.len() > MAX_COMPLETED_PATH_WORKS
-                || !strictly_sorted_by(&receipts, ProjectionCompletedReceipt::intent_id)
+            if root.engine_history_generation != authority.engine_history_generation
+                || root.engine_history_root != authority.engine_history_root
+                || authority.engine_history_generation == 0
+                || authority.engine_history_root
+                    == super::object_store::EngineHistoryStore::empty_root()
             {
-                return Err(ProjectionWorkError::NonCanonical);
+                return Err(ProjectionWorkError::HistoryBindingMismatch);
             }
-            match receipts.binary_search_by_key(
-                &authority.receipt.intent_id,
-                ProjectionCompletedReceipt::intent_id,
-            ) {
-                Ok(index) if receipts[index] == authority.receipt => return Ok(root),
-                Ok(_) => return Err(ProjectionWorkError::BindingMismatch),
-                Err(index_at) => {
-                    if receipts.len() == MAX_COMPLETED_PATH_WORKS {
-                        return Err(ProjectionWorkError::TooLarge(
-                            receipts.len().saturating_add(1),
-                        ));
-                    }
-                    receipts.insert(index_at, authority.receipt);
+            let existing = index
+                .tree_lookup(root.completed_paths_root, &key)?
+                .map(|bytes| decode_completed_path_row(&key, &bytes))
+                .transpose()?;
+            let next_row = match existing {
+                None => direct_completed_path_row(&authority),
+                Some(ProjectionCompletedPathRow::Current(current))
+                    if current.receipt == authority.receipt =>
+                {
+                    return Ok(root);
                 }
-            }
+                Some(existing) if existing.state_matches(&authority.receipt) => {
+                    ProjectionCompletedPathRow::Ambiguous {
+                        page_id: authority.receipt.page_id(),
+                        path: authority.receipt.path().clone(),
+                        frontier: authority.receipt.frontier().clone(),
+                        engine_history_generation: authority.engine_history_generation,
+                        engine_history_root: authority.engine_history_root,
+                    }
+                }
+                Some(_) => direct_completed_path_row(&authority),
+            };
             let mut next = root;
-            next.completed_paths_root =
-                index.tree_insert(next.completed_paths_root, key, encode_canonical(&receipts)?)?;
+            next.completed_paths_root = index.tree_insert(
+                next.completed_paths_root,
+                key,
+                encode_completed_path_row(&next_row)?,
+            )?;
             Ok(next)
         })
     }
@@ -1918,16 +1978,6 @@ impl ProjectionWorkIndex {
         authority: &ProjectionWorkCompletionAuthority,
     ) -> Result<ProjectionRoot, ProjectionWorkError> {
         let key = path_key(work.path());
-        let mut receipts: Vec<ProjectionCompletedReceipt> = self
-            .tree_lookup(root.completed_paths_root, &key)?
-            .map(|bytes| decode_canonical(&bytes))
-            .transpose()?
-            .unwrap_or_default();
-        if receipts.len() > MAX_COMPLETED_PATH_WORKS
-            || !strictly_sorted_by(&receipts, ProjectionCompletedReceipt::intent_id)
-        {
-            return Err(ProjectionWorkError::NonCanonical);
-        }
         let receipt = ProjectionCompletedReceipt {
             page_id: work.page_id(),
             path: work.path().clone(),
@@ -1936,22 +1986,36 @@ impl ProjectionWorkIndex {
             intent_id: authority.intent_id,
             logical_completion_id: authority.logical_completion_id,
         };
-        match receipts
-            .binary_search_by_key(&receipt.intent_id, ProjectionCompletedReceipt::intent_id)
-        {
-            Ok(index) if receipts[index] == receipt => {}
-            Ok(_) => return Err(ProjectionWorkError::BindingMismatch),
-            Err(index) => {
-                if receipts.len() == MAX_COMPLETED_PATH_WORKS {
-                    return Err(ProjectionWorkError::TooLarge(
-                        receipts.len().saturating_add(1),
-                    ));
-                }
-                receipts.insert(index, receipt);
+        let existing = self
+            .tree_lookup(root.completed_paths_root, &key)?
+            .map(|bytes| decode_completed_path_row(&key, &bytes))
+            .transpose()?;
+        let row = match existing {
+            None => ProjectionCompletedPathRow::Current(ProjectionCurrentCompletedPath {
+                receipt,
+                source: ProjectionCompletedPathSource::Manifested {
+                    work_id: work.work_id(),
+                },
+            }),
+            Some(ProjectionCompletedPathRow::Current(current)) if current.receipt == receipt => {
+                return Ok(root);
             }
-        }
-        root.completed_paths_root =
-            self.tree_insert(root.completed_paths_root, key, encode_canonical(&receipts)?)?;
+            Some(existing) if existing.state_matches(&receipt) => {
+                ProjectionCompletedPathRow::Ambiguous {
+                    page_id: receipt.page_id(),
+                    path: receipt.path().clone(),
+                    frontier: receipt.frontier().clone(),
+                    engine_history_generation: root.engine_history_generation,
+                    engine_history_root: root.engine_history_root,
+                }
+            }
+            Some(_) => return Err(ProjectionWorkError::BindingMismatch),
+        };
+        root.completed_paths_root = self.tree_insert(
+            root.completed_paths_root,
+            key,
+            encode_completed_path_row(&row)?,
+        )?;
         Ok(root)
     }
 
@@ -2722,6 +2786,62 @@ fn decode_work_id(bytes: &[u8]) -> Result<ProjectionWorkId, ProjectionWorkError>
     Ok(ProjectionWorkId(bytes))
 }
 
+fn direct_completed_path_row(
+    authority: &ProjectionDirectCompletionAuthority,
+) -> ProjectionCompletedPathRow {
+    ProjectionCompletedPathRow::Current(ProjectionCurrentCompletedPath {
+        receipt: authority.receipt.clone(),
+        source: ProjectionCompletedPathSource::Direct {
+            engine_history_generation: authority.engine_history_generation,
+            engine_history_root: authority.engine_history_root,
+        },
+    })
+}
+
+fn decode_completed_path_row(
+    key: &[u8],
+    bytes: &[u8],
+) -> Result<ProjectionCompletedPathRow, ProjectionWorkError> {
+    if bytes.len() > MAX_COMPLETED_PATH_ROW_BYTES {
+        return Err(ProjectionWorkError::TooLarge(bytes.len()));
+    }
+    let row: ProjectionCompletedPathRow = decode_canonical(bytes)?;
+    if key != path_key(row.path()) {
+        return Err(ProjectionWorkError::BindingMismatch);
+    }
+    match &row {
+        ProjectionCompletedPathRow::Current(ProjectionCurrentCompletedPath {
+            source:
+                ProjectionCompletedPathSource::Direct {
+                    engine_history_generation,
+                    engine_history_root,
+                },
+            ..
+        })
+        | ProjectionCompletedPathRow::Ambiguous {
+            engine_history_generation,
+            engine_history_root,
+            ..
+        } if *engine_history_generation == 0
+            || *engine_history_root == super::object_store::EngineHistoryStore::empty_root() =>
+        {
+            return Err(ProjectionWorkError::BindingMismatch);
+        }
+        ProjectionCompletedPathRow::Current(_) | ProjectionCompletedPathRow::Ambiguous { .. } => {}
+    }
+    Ok(row)
+}
+
+fn encode_completed_path_row(
+    row: &ProjectionCompletedPathRow,
+) -> Result<Vec<u8>, ProjectionWorkError> {
+    let bytes = encode_canonical(row)?;
+    if bytes.len() > MAX_COMPLETED_PATH_ROW_BYTES {
+        return Err(ProjectionWorkError::TooLarge(bytes.len()));
+    }
+    Ok(bytes)
+}
+
 fn prepared_filename(batch_id: BatchId) -> String {
     format!("{batch_id}{PREPARED_SUFFIX}")
 }
@@ -2814,6 +2934,7 @@ pub enum ProjectionWorkError {
     PendingActivationMissing,
     PendingActivationMismatch,
     HistoryBindingMismatch,
+    AmbiguousCompletedPath,
     ConflictingStatus,
     ConcurrentRootTransition,
     InvalidPageLimit(usize),
@@ -2870,6 +2991,9 @@ impl fmt::Display for ProjectionWorkError {
             }
             Self::HistoryBindingMismatch => {
                 f.write_str("projection work root is not bound to current engine history")
+            }
+            Self::AmbiguousCompletedPath => {
+                f.write_str("projection completed-path authority is ambiguous")
             }
             Self::ConflictingStatus => f.write_str("projection work has conflicting status"),
             Self::ConcurrentRootTransition => {
@@ -2975,6 +3099,21 @@ mod tests {
         }
 
         fn work(&self, sequence: u128, path: &str) -> ProjectionWork {
+            self.work_for_page(
+                sequence,
+                path,
+                PageId::from_uuid(Uuid::from_u128(30_000 + sequence)),
+                ProjectionWorkTarget::Present(BlobDescription::of(&sequence.to_be_bytes())),
+            )
+        }
+
+        fn work_for_page(
+            &self,
+            sequence: u128,
+            path: &str,
+            page_id: PageId,
+            target: ProjectionWorkTarget,
+        ) -> ProjectionWork {
             let descriptor = ObjectDescriptor::new(
                 DocumentId::from_uuid(Uuid::from_u128(10_000 + sequence)),
                 ObjectKind::ProjectionIntent,
@@ -2987,12 +3126,12 @@ mod tests {
                 self.endpoint_id,
                 self.graph_resource_id,
                 BatchId::from_uuid(Uuid::from_u128(20_000 + sequence)),
-                PageId::from_uuid(Uuid::from_u128(30_000 + sequence)),
+                page_id,
                 ManagedPath::parse(path).unwrap(),
                 PortablePathIndexRoot::empty(),
                 ManifestObjectRef::from_descriptor(&descriptor),
                 FrontierV2::default(),
-                ProjectionWorkTarget::Present(BlobDescription::of(&sequence.to_be_bytes())),
+                target,
             )
         }
 
@@ -3004,6 +3143,23 @@ mod tests {
                     fingerprint,
                     std::slice::from_ref(work),
                     &[],
+                )
+                .unwrap();
+            fingerprint
+        }
+
+        fn prepare_superseding(
+            &self,
+            work: &ProjectionWork,
+            superseded: &[ProjectionWorkId],
+        ) -> ContentDigest {
+            let fingerprint = ContentDigest::of(work.batch_id().as_uuid().as_bytes());
+            self.index
+                .prepare_batch(
+                    work.batch_id(),
+                    fingerprint,
+                    std::slice::from_ref(work),
+                    superseded,
                 )
                 .unwrap();
             fingerprint
@@ -3029,6 +3185,35 @@ mod tests {
                     "\"{page_bits:032x}{page_bits:032x}\""
                 ))
                 .unwrap(),
+            }
+        }
+
+        fn direct_completion_authority(
+            &self,
+            page_id: PageId,
+            path: &str,
+            seed: u128,
+        ) -> ProjectionDirectCompletionAuthority {
+            let (_, root) = self.index.load_head_root().unwrap();
+            let intent_id = serde_json::from_str(&format!("\"{seed:032x}{seed:032x}\"")).unwrap();
+            ProjectionDirectCompletionAuthority {
+                workspace_id: self.workspace_id,
+                endpoint_id: self.endpoint_id,
+                graph_resource_id: self.graph_resource_id,
+                receipt_store_id: self.index.receipt_store_id(),
+                engine_history_generation: root.engine_history_generation,
+                engine_history_root: root.engine_history_root,
+                receipt: ProjectionCompletedReceipt {
+                    page_id,
+                    path: ManagedPath::parse(path).unwrap(),
+                    frontier: FrontierV2::default(),
+                    target: ProjectionWorkTarget::Present(BlobDescription::of(&seed.to_be_bytes())),
+                    intent_id,
+                    logical_completion_id: serde_json::from_str(&format!(
+                        "\"{seed:032x}{seed:032x}\""
+                    ))
+                    .unwrap(),
+                },
             }
         }
 
@@ -3323,7 +3508,7 @@ mod tests {
         let late_writes = after_late.node_writes - before_late.node_writes;
 
         assert!(
-            late_reads <= early_reads + 64,
+            late_reads <= early_reads + 65,
             "authenticated point work grew with lifetime: early={early_reads}, late={late_reads}"
         );
         assert!(
@@ -3514,6 +3699,377 @@ mod tests {
             .unwrap()
             .open_projection_work_index(fixture.binding())
             .is_err());
+    }
+
+    #[test]
+    fn completed_path_authority_exceeds_the_former_lifetime_limit() {
+        let fixture = Fixture::new("completed-path-lifetime");
+        let page_id = PageId::from_uuid(Uuid::from_u128(80_001));
+        let path = "pages/lifetime.md";
+        let mut latest = None;
+
+        for sequence in 1..=4_097 {
+            let work = fixture.work_for_page(
+                sequence,
+                path,
+                page_id,
+                ProjectionWorkTarget::Present(BlobDescription::of(&sequence.to_be_bytes())),
+            );
+            let fingerprint = fixture.prepare(&work);
+            fixture
+                .index
+                .accept_batch(work.batch_id(), fingerprint)
+                .unwrap();
+            fixture
+                .index
+                .mark_completed(fixture.completion_authority(&work))
+                .unwrap();
+            latest = Some(work);
+        }
+
+        let latest = latest.unwrap();
+        let receipts = fixture
+            .index
+            .completed_receipts_for_path(latest.path())
+            .unwrap();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].page_id(), page_id);
+        assert_eq!(receipts[0].target(), latest.target());
+        let (_, root) = fixture.index.load_head_root().unwrap();
+        let row = fixture
+            .index
+            .tree_lookup(root.completed_paths_root, &path_key(latest.path()))
+            .unwrap()
+            .unwrap();
+        assert!(row.len() < 1_024);
+    }
+
+    #[test]
+    fn accepted_successor_prevents_late_completion_from_regressing_path_authority() {
+        let fixture = Fixture::new("late-completion");
+        let page_id = PageId::from_uuid(Uuid::from_u128(81_001));
+        let path = "pages/late.md";
+        let older = fixture.work_for_page(
+            1,
+            path,
+            page_id,
+            ProjectionWorkTarget::Present(BlobDescription::of(b"older")),
+        );
+        let fingerprint = fixture.prepare(&older);
+        fixture
+            .index
+            .accept_batch(older.batch_id(), fingerprint)
+            .unwrap();
+        let late = fixture.completion_authority(&older);
+
+        let newer = fixture.work_for_page(
+            2,
+            path,
+            page_id,
+            ProjectionWorkTarget::Present(BlobDescription::of(b"newer")),
+        );
+        let fingerprint = fixture.prepare_superseding(&newer, &[older.work_id()]);
+        fixture
+            .index
+            .accept_batch(newer.batch_id(), fingerprint)
+            .unwrap();
+        assert!(matches!(
+            fixture.index.mark_completed(late),
+            Err(ProjectionWorkError::ConflictingStatus)
+        ));
+        fixture
+            .index
+            .mark_completed(fixture.completion_authority(&newer))
+            .unwrap();
+        assert_eq!(
+            fixture
+                .index
+                .completed_receipts_for_path(newer.path())
+                .unwrap()[0]
+                .target(),
+            newer.target()
+        );
+
+        let current = fixture.work_for_page(
+            3,
+            path,
+            page_id,
+            ProjectionWorkTarget::Present(BlobDescription::of(b"current")),
+        );
+        let fingerprint = fixture.prepare(&current);
+        fixture
+            .index
+            .accept_batch(current.batch_id(), fingerprint)
+            .unwrap();
+        fixture
+            .index
+            .mark_completed(fixture.completion_authority(&newer))
+            .unwrap();
+        assert!(fixture
+            .index
+            .completed_receipts_for_path(current.path())
+            .unwrap()
+            .is_empty());
+        fixture
+            .index
+            .mark_completed(fixture.completion_authority(&current))
+            .unwrap();
+        assert_eq!(
+            fixture
+                .index
+                .completed_receipts_for_path(current.path())
+                .unwrap()[0]
+                .target(),
+            current.target()
+        );
+    }
+
+    #[test]
+    fn conflicting_direct_receipts_for_one_frontier_fail_closed_without_growth() {
+        let fixture = Fixture::new("direct-completion-ambiguity");
+        let history_work = fixture.work(1, "pages/history-binding.md");
+        let fingerprint = fixture.prepare(&history_work);
+        fixture
+            .index
+            .accept_batch(history_work.batch_id(), fingerprint)
+            .unwrap();
+        let page_id = PageId::from_uuid(Uuid::from_u128(82_001));
+        let first =
+            fixture.direct_completion_authority(page_id, "pages/direct-ambiguity.md", 82_002);
+        let second =
+            fixture.direct_completion_authority(page_id, "pages/direct-ambiguity.md", 82_003);
+
+        fixture.index.mark_direct_completed(first).unwrap();
+        assert_eq!(
+            fixture
+                .index
+                .completed_receipts_for_path(
+                    &ManagedPath::parse("pages/direct-ambiguity.md").unwrap()
+                )
+                .unwrap()
+                .len(),
+            1
+        );
+        fixture.index.mark_direct_completed(second).unwrap();
+        assert!(matches!(
+            fixture.index.completed_receipts_for_path(
+                &ManagedPath::parse("pages/direct-ambiguity.md").unwrap()
+            ),
+            Err(ProjectionWorkError::AmbiguousCompletedPath)
+        ));
+        let (_, root) = fixture.index.load_head_root().unwrap();
+        let bytes = fixture
+            .index
+            .tree_lookup(
+                root.completed_paths_root,
+                &path_key(&ManagedPath::parse("pages/direct-ambiguity.md").unwrap()),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(bytes.len() < 1_024);
+    }
+
+    #[test]
+    fn stale_direct_completion_history_cannot_overwrite_current_authority() {
+        let fixture = Fixture::new("stale-direct-completion");
+        let first_history = fixture.work(1, "pages/history-one.md");
+        let fingerprint = fixture.prepare(&first_history);
+        fixture
+            .index
+            .accept_batch(first_history.batch_id(), fingerprint)
+            .unwrap();
+        let stale = fixture.direct_completion_authority(
+            PageId::from_uuid(Uuid::from_u128(82_101)),
+            "pages/stale-direct.md",
+            82_102,
+        );
+
+        let second_history = fixture.work(2, "pages/history-two.md");
+        let fingerprint = fixture.prepare(&second_history);
+        let current_history_root = ContentDigest::of(b"newer-engine-history");
+        fixture
+            .index
+            .accept_batch_at_history(
+                second_history.batch_id(),
+                fingerprint,
+                2,
+                current_history_root,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            fixture.index.mark_direct_completed(stale),
+            Err(ProjectionWorkError::HistoryBindingMismatch)
+        ));
+        let path = ManagedPath::parse("pages/stale-direct.md").unwrap();
+        assert!(fixture
+            .index
+            .completed_receipts_for_path(&path)
+            .unwrap()
+            .is_empty());
+        fixture
+            .index
+            .mark_direct_completed(fixture.direct_completion_authority(
+                PageId::from_uuid(Uuid::from_u128(82_101)),
+                path.as_str(),
+                82_103,
+            ))
+            .unwrap();
+        assert_eq!(
+            fixture
+                .index
+                .completed_receipts_for_path(&path)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn completed_path_leaf_key_must_be_derived_from_its_value_path() {
+        let fixture = Fixture::new("completed-path-key-binding");
+        let work = fixture.work(1, "pages/key-source.md");
+        let fingerprint = fixture.prepare(&work);
+        fixture
+            .index
+            .accept_batch(work.batch_id(), fingerprint)
+            .unwrap();
+        fixture
+            .index
+            .mark_completed(fixture.completion_authority(&work))
+            .unwrap();
+        let wrong_path = ManagedPath::parse("pages/key-target.md").unwrap();
+        fixture
+            .index
+            .transition(|index, _, mut root| {
+                let source_key = path_key(work.path());
+                let value = index
+                    .tree_lookup(root.completed_paths_root, &source_key)?
+                    .unwrap();
+                root.completed_paths_root =
+                    index.tree_remove(root.completed_paths_root, &source_key)?;
+                root.completed_paths_root =
+                    index.tree_insert(root.completed_paths_root, path_key(&wrong_path), value)?;
+                Ok(root)
+            })
+            .unwrap();
+
+        assert!(matches!(
+            fixture.index.completed_receipts_for_path(&wrong_path),
+            Err(ProjectionWorkError::BindingMismatch)
+        ));
+        assert!(ObjectStore::open(&fixture.path, fixture.workspace_id)
+            .unwrap()
+            .open_projection_work_index(fixture.binding())
+            .is_err());
+    }
+
+    #[test]
+    fn deletion_rename_and_old_path_reuse_replace_only_current_authority() {
+        let fixture = Fixture::new("completed-path-reuse");
+        let first_page = PageId::from_uuid(Uuid::from_u128(83_001));
+        let reused_page = PageId::from_uuid(Uuid::from_u128(83_002));
+        let old_path = "pages/reused.md";
+        let new_path = "pages/renamed.md";
+
+        let deletion = fixture.work_for_page(1, old_path, first_page, ProjectionWorkTarget::Absent);
+        let fingerprint = fixture.prepare(&deletion);
+        fixture
+            .index
+            .accept_batch(deletion.batch_id(), fingerprint)
+            .unwrap();
+        fixture
+            .index
+            .mark_completed(fixture.completion_authority(&deletion))
+            .unwrap();
+
+        let renamed = fixture.work_for_page(
+            2,
+            new_path,
+            first_page,
+            ProjectionWorkTarget::Present(BlobDescription::of(b"renamed")),
+        );
+        let fingerprint = fixture.prepare(&renamed);
+        fixture
+            .index
+            .accept_batch(renamed.batch_id(), fingerprint)
+            .unwrap();
+        fixture
+            .index
+            .mark_completed(fixture.completion_authority(&renamed))
+            .unwrap();
+        assert_eq!(
+            fixture
+                .index
+                .completed_receipts_for_path(deletion.path())
+                .unwrap()[0]
+                .target(),
+            ProjectionWorkTarget::Absent
+        );
+
+        let reused = fixture.work_for_page(
+            3,
+            old_path,
+            reused_page,
+            ProjectionWorkTarget::Present(BlobDescription::of(b"reused")),
+        );
+        let fingerprint = fixture.prepare(&reused);
+        fixture
+            .index
+            .accept_batch(reused.batch_id(), fingerprint)
+            .unwrap();
+        assert!(fixture
+            .index
+            .completed_receipts_for_path(reused.path())
+            .unwrap()
+            .is_empty());
+        fixture
+            .index
+            .mark_completed(fixture.completion_authority(&reused))
+            .unwrap();
+        let receipts = fixture
+            .index
+            .completed_receipts_for_path(reused.path())
+            .unwrap();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].page_id(), reused_page);
+    }
+
+    #[test]
+    fn completed_path_row_size_is_rejected_before_decode() {
+        let path = ManagedPath::parse("pages/oversized.md").unwrap();
+        let bytes = vec![0; MAX_COMPLETED_PATH_ROW_BYTES + 1];
+        assert!(matches!(
+            decode_completed_path_row(&path_key(&path), &bytes),
+            Err(ProjectionWorkError::TooLarge(length))
+                if length == MAX_COMPLETED_PATH_ROW_BYTES + 1
+        ));
+    }
+
+    #[test]
+    fn prior_v7_claim_fails_closed_as_an_upgrade_without_writes() {
+        let fixture = Fixture::new("prior-v7-claim");
+        let endpoint = fixture
+            .path
+            .join("projection-work-index-v1")
+            .join(fixture.endpoint_id.to_string());
+        let prior_claim = encode_canonical(&ProjectionIndexClaim {
+            schema_version: 7,
+            workspace_id: fixture.workspace_id,
+            endpoint_id: fixture.endpoint_id,
+            graph_resource_id: fixture.graph_resource_id,
+            receipt_store_id: fixture.index.receipt_store_id(),
+        })
+        .unwrap();
+        fs::write(endpoint.join(CLAIM_FILE), prior_claim).unwrap();
+
+        let error = ObjectStore::open(&fixture.path, fixture.workspace_id)
+            .unwrap()
+            .open_projection_work_index(fixture.binding())
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("version 7 requires upgrade to 8"));
     }
 
     #[test]
