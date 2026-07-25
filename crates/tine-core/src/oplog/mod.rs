@@ -117,7 +117,7 @@ pub use receipt::{
 pub use reference_catalog::{
     BlockReferenceFactV1, BlockReferenceKindV1, PageNameReferenceFactV1, PageReferenceKindV1,
     ReferenceCatalogDeltaV2, ReferenceCatalogError, ReferenceCatalogPolicyV1,
-    ReferenceCatalogRootV2, ReferenceFactV1, ReferenceSourceLocatorV1, ReferenceSourcePostingV1,
+    ReferenceCatalogRootV2, ReferenceFactV1, ReferenceSourceLocatorV1, ReferenceSourcePostingV2,
     MAX_REFERENCE_CATALOG_DELTA_BYTES, MAX_REFERENCE_CATALOG_DELTA_SOURCES,
     REFERENCE_CATALOG_EXTRACTOR_VERSION, REFERENCE_CATALOG_POLICY_VERSION,
     REFERENCE_CATALOG_ROOT_SCHEMA_VERSION, REFERENCE_CATALOG_SCHEMA_VERSION,

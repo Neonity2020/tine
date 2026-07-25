@@ -70,7 +70,7 @@ impl ReferenceCatalogPolicyV1 {
         property_page_exclusions.sort_unstable();
         property_page_exclusions.dedup();
         Self {
-            schema_version: REFERENCE_CATALOG_SCHEMA_VERSION,
+            schema_version: REFERENCE_CATALOG_POLICY_VERSION,
             policy_version: REFERENCE_CATALOG_POLICY_VERSION,
             property_pages_enabled: config.property_pages_enabled,
             property_page_exclusions,
@@ -94,7 +94,7 @@ impl ReferenceCatalogPolicyV1 {
         require_version(
             "reference catalog policy schema",
             self.schema_version,
-            REFERENCE_CATALOG_SCHEMA_VERSION,
+            REFERENCE_CATALOG_POLICY_VERSION,
         )?;
         require_version(
             "reference catalog policy",
@@ -190,13 +190,13 @@ pub(crate) enum ReferenceCandidateTargetV2 {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ReferenceSourcePostingV1 {
+pub struct ReferenceSourcePostingV2 {
     schema_version: u32,
     source_page_id: PageId,
     facts: Vec<ReferenceFactV1>,
 }
 
-impl ReferenceSourcePostingV1 {
+impl ReferenceSourcePostingV2 {
     pub fn source_page_id(&self) -> PageId {
         self.source_page_id
     }
@@ -480,7 +480,7 @@ impl ReferenceCatalogRootV2 {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ReferencePostingRefV1 {
+struct ReferencePostingRefV2 {
     source_page_id: PageId,
     digest: ContentDigest,
     encoded_byte_length: u64,
@@ -489,15 +489,15 @@ struct ReferencePostingRefV1 {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ReferenceCatalogReplacementV1 {
+struct ReferenceCatalogReplacementV2 {
     page_id: PageId,
     prior_posting_digest: Option<ContentDigest>,
-    post_posting: Option<ReferencePostingRefV1>,
+    post_posting: Option<ReferencePostingRefV2>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ReferenceTransitionRefV1 {
+struct ReferenceTransitionRefV2 {
     digest: ContentDigest,
     encoded_byte_length: u64,
     replacement_count: u64,
@@ -505,10 +505,10 @@ struct ReferenceTransitionRefV1 {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
-enum ReferenceTransitionBindingV1 {
+enum ReferenceTransitionBindingV2 {
     Empty,
-    Inline(Vec<ReferenceCatalogReplacementV1>),
-    Stored(ReferenceTransitionRefV1),
+    Inline(Vec<ReferenceCatalogReplacementV2>),
+    Stored(ReferenceTransitionRefV2),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -517,7 +517,7 @@ pub struct ReferenceCatalogDeltaV2 {
     schema_version: u32,
     prior_root: ReferenceCatalogRootV2,
     post_root: ReferenceCatalogRootV2,
-    transition: ReferenceTransitionBindingV1,
+    transition: ReferenceTransitionBindingV2,
 }
 
 impl ReferenceCatalogDeltaV2 {
@@ -527,7 +527,7 @@ impl ReferenceCatalogDeltaV2 {
             schema_version: REFERENCE_CATALOG_SCHEMA_VERSION,
             prior_root: root.clone(),
             post_root: root,
-            transition: ReferenceTransitionBindingV1::Empty,
+            transition: ReferenceTransitionBindingV2::Empty,
         }
     }
 
@@ -583,7 +583,7 @@ impl ReferenceCatalogDeltaV2 {
             return Err(ReferenceCatalogError::AuthorityMismatch);
         }
         match &self.transition {
-            ReferenceTransitionBindingV1::Empty => {
+            ReferenceTransitionBindingV2::Empty => {
                 if self.prior_root.source_count != self.post_root.source_count
                     || self.prior_root.source_coverage_root != self.post_root.source_coverage_root
                     || self.prior_root.facts_root != self.post_root.facts_root
@@ -593,10 +593,10 @@ impl ReferenceCatalogDeltaV2 {
                     return Err(ReferenceCatalogError::MalformedTransition);
                 }
             }
-            ReferenceTransitionBindingV1::Inline(replacements) => {
+            ReferenceTransitionBindingV2::Inline(replacements) => {
                 validate_replacements(replacements)?;
             }
-            ReferenceTransitionBindingV1::Stored(reference) => {
+            ReferenceTransitionBindingV2::Stored(reference) => {
                 if reference.encoded_byte_length == 0
                     || reference.encoded_byte_length > MAX_REFERENCE_OBJECT_BYTES
                     || reference.replacement_count == 0
@@ -611,7 +611,7 @@ impl ReferenceCatalogDeltaV2 {
 }
 
 fn validate_replacements(
-    replacements: &[ReferenceCatalogReplacementV1],
+    replacements: &[ReferenceCatalogReplacementV2],
 ) -> Result<(), ReferenceCatalogError> {
     if replacements.len() > MAX_REFERENCE_CATALOG_DELTA_SOURCES
         || replacements
@@ -634,7 +634,7 @@ fn validate_replacements(
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PostingChunkRefV1 {
+struct PostingChunkRefV2 {
     digest: ContentDigest,
     encoded_byte_length: u64,
     fact_count: u64,
@@ -642,18 +642,18 @@ struct PostingChunkRefV1 {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PostingChunkV1 {
+struct PostingChunkV2 {
     schema_version: u32,
     facts: Vec<ReferenceFactV1>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PostingManifestV1 {
+struct PostingManifestV2 {
     schema_version: u32,
     source_page_id: PageId,
     fact_count: u64,
-    chunks: Vec<PostingChunkRefV1>,
+    chunks: Vec<PostingChunkRefV2>,
 }
 
 #[derive(Debug)]
@@ -677,8 +677,8 @@ impl ReferenceCatalogStore {
 
     fn publish_posting(
         &self,
-        posting: &ReferenceSourcePostingV1,
-    ) -> Result<ReferencePostingRefV1, ReferenceCatalogError> {
+        posting: &ReferenceSourcePostingV2,
+    ) -> Result<ReferencePostingRefV2, ReferenceCatalogError> {
         posting.validate()?;
         let mut chunks = Vec::new();
         let mut current = Vec::new();
@@ -699,7 +699,7 @@ impl ReferenceCatalogStore {
         if !current.is_empty() {
             chunks.push(self.publish_chunk(current)?);
         }
-        let manifest = PostingManifestV1 {
+        let manifest = PostingManifestV2 {
             schema_version: REFERENCE_CATALOG_SCHEMA_VERSION,
             source_page_id: posting.source_page_id,
             fact_count: posting.facts.len() as u64,
@@ -715,7 +715,7 @@ impl ReferenceCatalogStore {
             "reference posting manifest",
         )
         .map_err(store_error)?;
-        Ok(ReferencePostingRefV1 {
+        Ok(ReferencePostingRefV2 {
             source_page_id: posting.source_page_id,
             digest,
             encoded_byte_length: bytes.len() as u64,
@@ -726,8 +726,8 @@ impl ReferenceCatalogStore {
     fn publish_chunk(
         &self,
         facts: Vec<ReferenceFactV1>,
-    ) -> Result<PostingChunkRefV1, ReferenceCatalogError> {
-        let chunk = PostingChunkV1 {
+    ) -> Result<PostingChunkRefV2, ReferenceCatalogError> {
+        let chunk = PostingChunkV2 {
             schema_version: REFERENCE_CATALOG_SCHEMA_VERSION,
             facts,
         };
@@ -741,7 +741,7 @@ impl ReferenceCatalogStore {
             "reference posting chunk",
         )
         .map_err(store_error)?;
-        Ok(PostingChunkRefV1 {
+        Ok(PostingChunkRefV2 {
             digest,
             encoded_byte_length: bytes.len() as u64,
             fact_count: chunk.facts.len() as u64,
@@ -750,8 +750,8 @@ impl ReferenceCatalogStore {
 
     fn publish_transition(
         &self,
-        replacements: &[ReferenceCatalogReplacementV1],
-    ) -> Result<ReferenceTransitionRefV1, ReferenceCatalogError> {
+        replacements: &[ReferenceCatalogReplacementV2],
+    ) -> Result<ReferenceTransitionRefV2, ReferenceCatalogError> {
         validate_replacements(replacements)?;
         let bytes = encode_canonical(&replacements)?;
         require_object_size(&bytes)?;
@@ -763,7 +763,7 @@ impl ReferenceCatalogStore {
             "reference catalog transition",
         )
         .map_err(store_error)?;
-        Ok(ReferenceTransitionRefV1 {
+        Ok(ReferenceTransitionRefV2 {
             digest,
             encoded_byte_length: bytes.len() as u64,
             replacement_count: replacements.len() as u64,
@@ -772,15 +772,15 @@ impl ReferenceCatalogStore {
 
     fn read_transition(
         &self,
-        reference: &ReferenceTransitionRefV1,
-    ) -> Result<Vec<ReferenceCatalogReplacementV1>, ReferenceCatalogError> {
+        reference: &ReferenceTransitionRefV2,
+    ) -> Result<Vec<ReferenceCatalogReplacementV2>, ReferenceCatalogError> {
         let bytes = read_content_addressed(
             &self.postings,
             &transition_filename(reference.digest),
             reference.digest,
             reference.encoded_byte_length,
         )?;
-        let replacements: Vec<ReferenceCatalogReplacementV1> = decode_canonical(&bytes)?;
+        let replacements: Vec<ReferenceCatalogReplacementV2> = decode_canonical(&bytes)?;
         validate_replacements(&replacements)?;
         if replacements.len() as u64 != reference.replacement_count {
             return Err(ReferenceCatalogError::MalformedTransition);
@@ -790,15 +790,15 @@ impl ReferenceCatalogStore {
 
     fn read_posting(
         &self,
-        reference: &ReferencePostingRefV1,
-    ) -> Result<ReferenceSourcePostingV1, ReferenceCatalogError> {
+        reference: &ReferencePostingRefV2,
+    ) -> Result<ReferenceSourcePostingV2, ReferenceCatalogError> {
         let bytes = read_content_addressed(
             &self.postings,
             &posting_filename(reference.digest),
             reference.digest,
             reference.encoded_byte_length,
         )?;
-        let manifest: PostingManifestV1 = decode_canonical(&bytes)?;
+        let manifest: PostingManifestV2 = decode_canonical(&bytes)?;
         if manifest.schema_version != REFERENCE_CATALOG_SCHEMA_VERSION
             || manifest.source_page_id != reference.source_page_id
             || manifest.fact_count != reference.fact_count
@@ -832,7 +832,7 @@ impl ReferenceCatalogStore {
                 chunk_ref.digest,
                 chunk_ref.encoded_byte_length,
             )?;
-            let chunk: PostingChunkV1 = decode_canonical(&bytes)?;
+            let chunk: PostingChunkV2 = decode_canonical(&bytes)?;
             if chunk.schema_version != REFERENCE_CATALOG_SCHEMA_VERSION
                 || chunk.facts.len() as u64 != chunk_ref.fact_count
             {
@@ -840,7 +840,7 @@ impl ReferenceCatalogStore {
             }
             facts.extend(chunk.facts);
         }
-        let posting = ReferenceSourcePostingV1 {
+        let posting = ReferenceSourcePostingV2 {
             schema_version: REFERENCE_CATALOG_SCHEMA_VERSION,
             source_page_id: manifest.source_page_id,
             facts,
@@ -856,7 +856,7 @@ impl ReferenceCatalogStore {
         &self,
         source_page_id: PageId,
         digest: ContentDigest,
-    ) -> Result<ReferencePostingRefV1, ReferenceCatalogError> {
+    ) -> Result<ReferencePostingRefV2, ReferenceCatalogError> {
         let filename = posting_filename(digest);
         let bytes =
             read_optional_regular(&self.postings, &filename, MAX_REFERENCE_OBJECT_BYTES, None)
@@ -865,8 +865,8 @@ impl ReferenceCatalogStore {
         if ContentDigest::of(&bytes) != digest {
             return Err(ReferenceCatalogError::ObjectDigestMismatch(digest));
         }
-        let manifest: PostingManifestV1 = decode_canonical(&bytes)?;
-        Ok(ReferencePostingRefV1 {
+        let manifest: PostingManifestV2 = decode_canonical(&bytes)?;
+        Ok(ReferencePostingRefV2 {
             source_page_id,
             digest,
             encoded_byte_length: bytes.len() as u64,
@@ -878,7 +878,7 @@ impl ReferenceCatalogStore {
         &self,
         root: &ReferenceCatalogRootV2,
         page_id: PageId,
-    ) -> Result<Option<ReferenceSourcePostingV1>, ReferenceCatalogError> {
+    ) -> Result<Option<ReferenceSourcePostingV2>, ReferenceCatalogError> {
         let value = self
             .patricia
             .lookup(
@@ -933,9 +933,9 @@ impl ReferenceCatalogStore {
     ) -> Result<(), ReferenceCatalogError> {
         delta.validate()?;
         let replacements = match &delta.transition {
-            ReferenceTransitionBindingV1::Empty => Vec::new(),
-            ReferenceTransitionBindingV1::Inline(replacements) => replacements.clone(),
-            ReferenceTransitionBindingV1::Stored(reference) => self.read_transition(reference)?,
+            ReferenceTransitionBindingV2::Empty => Vec::new(),
+            ReferenceTransitionBindingV2::Inline(replacements) => replacements.clone(),
+            ReferenceTransitionBindingV2::Stored(reference) => self.read_transition(reference)?,
         };
         let mut facts_root = PatriciaIndexRoot::from_digest(delta.prior_root.facts_root);
         let mut coverage_root =
@@ -1155,7 +1155,7 @@ impl ReferenceCatalogCandidateV2 {
 
 #[derive(Clone, Debug, Default)]
 struct MemoryCatalog {
-    postings: BTreeMap<PageId, ReferenceSourcePostingV1>,
+    postings: BTreeMap<PageId, ReferenceSourcePostingV2>,
     facts: BTreeMap<PageId, ContentDigest>,
     coverage: BTreeSet<PageId>,
     reverse_candidates: BTreeSet<Vec<u8>>,
@@ -1256,7 +1256,7 @@ impl ReferenceCatalogStateV2 {
     pub(crate) fn posting(
         &self,
         page_id: PageId,
-    ) -> Result<Option<ReferenceSourcePostingV1>, ReferenceCatalogError> {
+    ) -> Result<Option<ReferenceSourcePostingV2>, ReferenceCatalogError> {
         match &self.backend {
             ReferenceCatalogBackend::Memory(memory) => Ok(memory.postings.get(&page_id).cloned()),
             ReferenceCatalogBackend::Store(store) => store.posting(&self.root, page_id),
@@ -1275,7 +1275,7 @@ impl ReferenceCatalogStateV2 {
         &self,
         root: &ReferenceCatalogRootV2,
         page_id: PageId,
-    ) -> Result<Option<ReferenceSourcePostingV1>, ReferenceCatalogError> {
+    ) -> Result<Option<ReferenceSourcePostingV2>, ReferenceCatalogError> {
         root.validate()?;
         match &self.backend {
             ReferenceCatalogBackend::Store(store) => store.posting(root, page_id),
@@ -1431,7 +1431,7 @@ impl ReferenceCatalogStateV2 {
                     memory.facts.insert(page_id, digest);
                     memory.coverage.insert(page_id);
                     memory.postings.insert(page_id, posting);
-                    Some(ReferencePostingRefV1 {
+                    Some(ReferencePostingRefV2 {
                         source_page_id: page_id,
                         digest,
                         encoded_byte_length: encoded.len() as u64,
@@ -1445,7 +1445,7 @@ impl ReferenceCatalogStateV2 {
                     None
                 }
             };
-            replacements.push(ReferenceCatalogReplacementV1 {
+            replacements.push(ReferenceCatalogReplacementV2 {
                 page_id,
                 prior_posting_digest,
                 post_posting,
@@ -1461,9 +1461,9 @@ impl ReferenceCatalogStateV2 {
             external_uuid_claim_authority_root,
         )?;
         let transition = if replacements.is_empty() {
-            ReferenceTransitionBindingV1::Empty
+            ReferenceTransitionBindingV2::Empty
         } else {
-            ReferenceTransitionBindingV1::Inline(replacements)
+            ReferenceTransitionBindingV2::Inline(replacements)
         };
         let delta = ReferenceCatalogDeltaV2 {
             schema_version: REFERENCE_CATALOG_SCHEMA_VERSION,
@@ -1547,7 +1547,7 @@ impl ReferenceCatalogStateV2 {
                     None
                 }
             };
-            replacements.push(ReferenceCatalogReplacementV1 {
+            replacements.push(ReferenceCatalogReplacementV2 {
                 page_id,
                 prior_posting_digest,
                 post_posting,
@@ -1590,9 +1590,9 @@ impl ReferenceCatalogStateV2 {
             external_uuid_claim_authority_root,
         )?;
         let transition = if replacements.is_empty() {
-            ReferenceTransitionBindingV1::Empty
+            ReferenceTransitionBindingV2::Empty
         } else {
-            ReferenceTransitionBindingV1::Stored(store.publish_transition(&replacements)?)
+            ReferenceTransitionBindingV2::Stored(store.publish_transition(&replacements)?)
         };
         let delta = ReferenceCatalogDeltaV2 {
             schema_version: REFERENCE_CATALOG_SCHEMA_VERSION,
@@ -1642,7 +1642,7 @@ pub(crate) fn reference_source_is_org(path: &ManagedPath) -> bool {
 fn extract_source_posting(
     policy: &ReferenceCatalogPolicyV1,
     source: ReferenceSourcePageV1,
-) -> Result<ReferenceSourcePostingV1, ReferenceCatalogError> {
+) -> Result<ReferenceSourcePostingV2, ReferenceCatalogError> {
     let mut facts = Vec::new();
     if let Some(preamble) = &source.preamble {
         extract_text_facts(
@@ -1665,7 +1665,7 @@ fn extract_source_posting(
             &mut facts,
         )?;
     }
-    ReferenceSourcePostingV1::new(source.page_id, facts)
+    ReferenceSourcePostingV2::new(source.page_id, facts)
 }
 
 fn extract_text_facts(
@@ -1760,7 +1760,7 @@ fn may_contain_reference_evidence(raw: &str) -> bool {
         .any(|byte| matches!(byte, b'[' | b'#' | b'(' | b'{' | b':'))
 }
 
-fn reverse_candidate_keys(posting: &ReferenceSourcePostingV1) -> BTreeSet<Vec<u8>> {
+fn reverse_candidate_keys(posting: &ReferenceSourcePostingV2) -> BTreeSet<Vec<u8>> {
     posting
         .facts
         .iter()
@@ -2526,7 +2526,7 @@ mod tests {
         assert!(catalog.validate_delta(&reverse_root).is_err());
 
         let mut transition = candidate.delta().clone();
-        let ReferenceTransitionBindingV1::Stored(reference) = &mut transition.transition else {
+        let ReferenceTransitionBindingV2::Stored(reference) = &mut transition.transition else {
             panic!("store-backed transition");
         };
         reference.digest = ContentDigest::of(b"tampered");

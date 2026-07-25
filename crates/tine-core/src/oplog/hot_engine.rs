@@ -3571,7 +3571,7 @@ impl ShardedHotEngine {
     pub fn reference_source_posting(
         &self,
         page_id: PageId,
-    ) -> Result<Option<super::ReferenceSourcePostingV1>, EngineError> {
+    ) -> Result<Option<super::ReferenceSourcePostingV2>, EngineError> {
         self.ensure_not_blocked()?;
         self.reference_catalog
             .posting(page_id)
@@ -3586,7 +3586,7 @@ impl ShardedHotEngine {
         &self,
         root: &ReferenceCatalogRootV2,
         page_id: PageId,
-    ) -> Result<Option<super::ReferenceSourcePostingV1>, EngineError> {
+    ) -> Result<Option<super::ReferenceSourcePostingV2>, EngineError> {
         self.ensure_not_blocked()?;
         self.reference_catalog
             .posting_at_root(root, page_id)

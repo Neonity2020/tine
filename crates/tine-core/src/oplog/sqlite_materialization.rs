@@ -49,9 +49,8 @@ const REFERENCE_CATALOG_ALIAS_OVERHEAD_BYTES: usize = 80;
 const REFERENCE_CATALOG_BINDING_OVERHEAD_BYTES: usize = 64;
 const REFERENCE_CATALOG_COVERAGE_OVERHEAD_BYTES: usize = 80;
 // Packet 3 attaches the already-authenticated reference-catalog transition to
-// the same SQL transaction as the ordinary page materialization.  The SQLite
-// schema stays at v9: these are values for its existing v9 tables, not a new
-// user-data format.
+// the same SQL transaction as the ordinary page materialization. The
+// authenticated reverse-candidate contract is persisted as SQLite schema v10.
 const MATERIALIZATION_INPUT_SCHEMA_VERSION: u32 = 4;
 pub(crate) const REFERENCE_EXTRACTOR_DEPENDENCY_STAMP_SCHEMA_VERSION: u32 = 2;
 const REFERENCE_EXTRACTOR_DEPENDENCY_STAMP_DOMAIN: &[u8] =
@@ -261,7 +260,7 @@ pub(crate) const BLOCKS_DDL: &str = "CREATE TABLE blocks (
 ) STRICT";
 // Retained temporarily for active v2 reads/writes. The authenticated catalog
 // migration-cleanup slice removes this legacy target-ID representation only
-// after every call site has moved to the v9 raw-evidence tables below.
+// after every call site has moved to the v10 raw-evidence tables below.
 pub(crate) const REFERENCES_DDL: &str = "CREATE TABLE refs (
     source_type INTEGER NOT NULL CHECK (source_type IN (0, 1)),
     source_id BLOB NOT NULL CHECK (length(source_id) = 16),
@@ -3801,7 +3800,7 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_v9_reference_schema_is_exact_strict_and_checked() {
+    fn sqlite_v10_reference_schema_is_exact_strict_and_checked() {
         let connection = Connection::open_in_memory().unwrap();
         initialize_schema(&connection, ContentDigest::of(b"empty frontier")).unwrap();
         validate_schema(&connection).unwrap();

@@ -1121,7 +1121,7 @@ pub struct FrontierReferenceQuery<'a> {
     database: &'a SqliteFrontier,
     engine: &'a ShardedHotEngine,
     base_catalog_root: super::ReferenceCatalogRootV2,
-    tail_sources: BTreeMap<PageId, Option<super::ReferenceSourcePostingV1>>,
+    tail_sources: BTreeMap<PageId, Option<super::ReferenceSourcePostingV2>>,
     instrumentation: ReferenceQueryInstrumentation,
 }
 
@@ -5704,7 +5704,7 @@ impl FrontierReferenceQuery<'_> {
     fn current_posting(
         &mut self,
         source_page_id: PageId,
-    ) -> Result<super::ReferenceSourcePostingV1, ProjectionError> {
+    ) -> Result<super::ReferenceSourcePostingV2, ProjectionError> {
         let posting = self
             .engine
             .reference_source_posting(source_page_id)
@@ -6103,7 +6103,7 @@ impl FrontierReferenceQuery<'_> {
 }
 
 fn verify_current_page_facts(
-    posting: &super::ReferenceSourcePostingV1,
+    posting: &super::ReferenceSourcePostingV2,
     facts: &[super::PageNameReferenceFactV1],
 ) -> Result<(), ProjectionError> {
     if facts.iter().any(|fact| {
