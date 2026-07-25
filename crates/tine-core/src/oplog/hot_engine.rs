@@ -2782,10 +2782,10 @@ impl ShardedHotEngine {
         self.reference_catalog
             .finish_recovery()
             .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))?;
-        self.authenticated_history_replay = false;
         if self.fatal_handle.is_none() && self.page_name_conflicts.is_empty() {
             self.reconcile_pending_projection_work()?;
         }
+        self.authenticated_history_replay = false;
         Ok(())
     }
 
@@ -2819,8 +2819,11 @@ impl ShardedHotEngine {
         Ok((Arc::clone(archive), Arc::clone(index)))
     }
 
-    pub fn projection_work_index(&self) -> Option<&ProjectionWorkIndex> {
-        self.projection_work_index.as_deref()
+    pub fn projection_work_index(&self) -> Result<&ProjectionWorkIndex, EngineError> {
+        self.ensure_not_blocked()?;
+        self.projection_work_index.as_deref().ok_or_else(|| {
+            EngineError::ProjectionWork("engine has no enrolled projection work index".into())
+        })
     }
 
     pub const fn projection_endpoint_binding(&self) -> Option<ProjectionEndpointBinding> {
@@ -3153,6 +3156,7 @@ impl ShardedHotEngine {
         root: &AcceptedFrontierRoot,
         document_id: DocumentId,
     ) -> Result<Option<DocumentDependencies>, EngineError> {
+        self.ensure_not_blocked()?;
         validate_accepted_frontier_root(root)?;
         let Some(scratch_root) = &root.scratch_root else {
             if root == &self.accepted_frontier_root {
@@ -3187,6 +3191,7 @@ impl ShardedHotEngine {
         batch_id: BatchId,
     ) -> Result<AcceptedBatchEvidence, EngineError> {
         self.begin_point_operation();
+        self.ensure_not_blocked()?;
         let evidence = match self.archive_status(batch_id)? {
             Some(ArchiveStatus::Accepted { evidence, .. }) => evidence,
             _ => return Err(EngineError::MissingDependency(batch_id)),
@@ -3547,16 +3552,19 @@ impl ShardedHotEngine {
         self.fatal_handle
     }
 
-    pub const fn portable_path_index_root(&self) -> PortablePathIndexRoot {
-        self.portable_path_root
+    pub fn portable_path_index_root(&self) -> Result<PortablePathIndexRoot, EngineError> {
+        self.ensure_not_blocked()?;
+        Ok(self.portable_path_root)
     }
 
-    pub const fn page_name_index_root(&self) -> &PageNameOwnershipRootV1 {
-        &self.page_name_root
+    pub fn page_name_index_root(&self) -> Result<&PageNameOwnershipRootV1, EngineError> {
+        self.ensure_not_blocked()?;
+        Ok(&self.page_name_root)
     }
 
-    pub const fn reference_catalog_root(&self) -> &ReferenceCatalogRootV1 {
-        self.reference_catalog.root()
+    pub fn reference_catalog_root(&self) -> Result<&ReferenceCatalogRootV1, EngineError> {
+        self.ensure_not_blocked()?;
+        Ok(self.reference_catalog.root())
     }
 
     pub fn reference_source_posting(
@@ -3709,8 +3717,11 @@ impl ShardedHotEngine {
         })
     }
 
-    pub fn portable_path_conflicts(&self) -> Vec<PortablePathConflict> {
-        self.portable_path_conflicts.values().cloned().collect()
+    pub fn portable_path_conflicts(&self) -> Result<Vec<PortablePathConflict>, EngineError> {
+        if !self.is_blocked() {
+            self.ensure_not_blocked()?;
+        }
+        Ok(self.portable_path_conflicts.values().cloned().collect())
     }
 
     pub fn fatal_evidence_page(
@@ -3826,6 +3837,7 @@ impl ShardedHotEngine {
         batch_id: BatchId,
     ) -> Result<StageOutcome, EngineError> {
         self.begin_point_operation();
+        self.ensure_not_blocked()?;
         if store.workspace_id() != self.workspace_id {
             return Err(EngineError::WorkspaceMismatch {
                 expected: self.workspace_id,
@@ -3858,6 +3870,27 @@ impl ShardedHotEngine {
 
     pub fn stage_archive_batch(&mut self, batch_id: BatchId) -> Result<StageOutcome, EngineError> {
         self.begin_point_operation();
+        self.ensure_not_blocked()?;
+        self.stage_archive_batch_internal(batch_id)
+    }
+
+    pub(crate) fn stage_archive_batch_for_recovery(
+        &mut self,
+        batch_id: BatchId,
+    ) -> Result<StageOutcome, EngineError> {
+        self.begin_point_operation();
+        if !self.authenticated_history_replay {
+            return Err(EngineError::Archive(
+                "recovery archive staging requires an active authenticated history replay".into(),
+            ));
+        }
+        self.stage_archive_batch_internal(batch_id)
+    }
+
+    fn stage_archive_batch_internal(
+        &mut self,
+        batch_id: BatchId,
+    ) -> Result<StageOutcome, EngineError> {
         self.ensure_history_store()?;
         let inspection = self
             .archive_store
@@ -3905,6 +3938,9 @@ impl ShardedHotEngine {
 
     pub fn stage_ready(&mut self, batch: ValidatedBatch) -> StageOutcome {
         let batch_id = batch.manifest().batch_id();
+        if let Err(error) = self.ensure_not_blocked() {
+            return self.outcome(batch_id, BatchDisposition::Rejected { error }, Vec::new());
+        }
         let outcome = self.stage_ready_internal(batch, false);
         self.resolve_pending_author(batch_id, &outcome.disposition);
         outcome
@@ -4463,6 +4499,7 @@ impl ShardedHotEngine {
         source: ProjectionEndpointBinding,
         mut captured_inputs: Vec<CapabilityCapturedProjectionInput>,
     ) -> Result<PreparedBatch, EngineError> {
+        self.ensure_not_blocked()?;
         if source.device_id != draft.author.author_device_id {
             return Err(EngineError::ProjectionManifest(
                 "source endpoint device does not match batch author".into(),
@@ -5811,7 +5848,7 @@ impl ShardedHotEngine {
                 .pending_activation_page(cursor.as_ref(), 256)
                 .map_err(|error| EngineError::ProjectionWork(error.to_string()))?;
             for pending in page.pending() {
-                match self.durable_endpoint_history_record(pending.batch_id())? {
+                match self.durable_endpoint_history_record_at_live_head(pending.batch_id())? {
                     Some(record) => {
                         if record.manifest_fingerprint != pending.manifest_fingerprint() {
                             return Err(EngineError::ProjectionWork(format!(
@@ -6218,10 +6255,13 @@ impl ShardedHotEngine {
         })
     }
 
-    pub fn resolve_logseq_uuid(&self, logseq_uuid: LogseqUuid) -> LogseqUuidResolution {
+    pub fn resolve_logseq_uuid(
+        &self,
+        logseq_uuid: LogseqUuid,
+    ) -> Result<LogseqUuidResolution, EngineError> {
+        self.ensure_not_blocked()?;
         self.resolve_logseq_uuid_current(logseq_uuid)
             .map(|(resolution, _, _)| resolution)
-            .expect("authenticated Logseq claim lookup remains readable")
     }
 
     fn logseq_claim_record(
@@ -7297,6 +7337,11 @@ impl ShardedHotEngine {
                 .insert(batch_id, Some(existing));
             return Ok(());
         }
+        if self.authenticated_history_replay {
+            return Err(EngineError::Archive(format!(
+                "authenticated recovery cannot finalize archive-only batch {batch_id} absent from durable history"
+            )));
+        }
         let next_generation = generation.checked_add(1).ok_or_else(|| {
             EngineError::Archive("durable engine history generation overflow".into())
         })?;
@@ -7321,9 +7366,6 @@ impl ShardedHotEngine {
         }
         self.history_generation = published_generation;
         self.history_root = published_root;
-        if self.authenticated_history_replay {
-            self.authenticated_replayed_batches.insert(batch_id);
-        }
         let mut point_cache = self.status_point_cache.borrow_mut();
         point_cache.clear();
         point_cache.insert(batch_id, Some(record));
@@ -7438,7 +7480,18 @@ impl ShardedHotEngine {
         batch_id: BatchId,
     ) -> Result<Option<ColdHistoryRecord>, EngineError> {
         self.ensure_not_blocked()?;
-        let result = match self.history_store.as_ref().map(Arc::clone) {
+        let result = self.durable_endpoint_history_record_at_live_head(batch_id);
+        if let Err(error) = &result {
+            self.history_failure = Some(error.clone());
+        }
+        result
+    }
+
+    fn durable_endpoint_history_record_at_live_head(
+        &self,
+        batch_id: BatchId,
+    ) -> Result<Option<ColdHistoryRecord>, EngineError> {
+        match self.history_store.as_ref().map(Arc::clone) {
             Some(store) => (|| {
                 let (generation, root) = store
                     .current()
@@ -7463,11 +7516,7 @@ impl ShardedHotEngine {
             None => Err(EngineError::Archive(
                 "projection authorization requires durable endpoint history".into(),
             )),
-        };
-        if let Err(error) = &result {
-            self.history_failure = Some(error.clone());
         }
-        result
     }
 
     fn begin_point_operation(&self) {
@@ -18134,7 +18183,7 @@ mod validation_tests {
         let prior_snapshot = engine.canonical_snapshot().unwrap();
         let prior_page_name_root = engine.page_name_root.clone();
         let prior_page_name_conflicts = engine.page_name_conflicts.clone();
-        let prior_reference_catalog_root = engine.reference_catalog_root().clone();
+        let prior_reference_catalog_root = engine.reference_catalog_root().unwrap().clone();
         let prior_logseq_claim_root = engine.logseq_claim_root;
         let prior_frontier = engine.exact_frontier().unwrap();
         let prior_frontier_root = engine.accepted_frontier_root().unwrap();
@@ -18195,7 +18244,7 @@ mod validation_tests {
         assert_eq!(engine.page_name_root, prior_page_name_root);
         assert_eq!(engine.page_name_conflicts, prior_page_name_conflicts);
         assert_eq!(
-            engine.reference_catalog_root(),
+            engine.reference_catalog.root(),
             &prior_reference_catalog_root
         );
         assert_eq!(engine.logseq_claim_root, prior_logseq_claim_root);
@@ -18223,10 +18272,10 @@ mod validation_tests {
             &graph,
             &receipts,
         );
-        assert_eq!(
+        assert!(matches!(
             reopened.reference_catalog_root(),
-            &prior_reference_catalog_root
-        );
+            Err(EngineError::ReferenceCatalog(_))
+        ));
         assert_eq!(reopened.logseq_claim_root, prior_logseq_claim_root);
         assert_eq!(
             reopened.reference_catalog.policy(),
@@ -18252,9 +18301,15 @@ mod validation_tests {
         ));
         reopened.prepare_operational_recovery_replay().unwrap();
         for manifest in writer.committed_manifests().unwrap() {
-            reopened.stage_archive_batch(manifest.batch_id()).unwrap();
+            reopened
+                .stage_archive_batch_for_recovery(manifest.batch_id())
+                .unwrap();
         }
         reopened.finish_operational_recovery_replay().unwrap();
+        assert_eq!(
+            reopened.reference_catalog_root().unwrap(),
+            &prior_reference_catalog_root
+        );
         assert!(reopened
             .reference_source_posting(PageId::from_uuid(Uuid::from_u128(89_011)))
             .unwrap()
@@ -18307,7 +18362,7 @@ mod validation_tests {
             .current_with_binding()
             .unwrap();
         let prior_page_name_root = engine.page_name_root.clone();
-        let prior_reference_catalog_root = engine.reference_catalog_root().clone();
+        let prior_reference_catalog_root = engine.reference_catalog_root().unwrap().clone();
         let prior_logseq_claim_root = engine.logseq_claim_root;
         let prior_portable_path_root = engine.portable_path_root;
         let prior_frontier_root = engine.accepted_frontier_root.clone();
@@ -18370,7 +18425,7 @@ mod validation_tests {
         );
         assert_eq!(engine.page_name_root, prior_page_name_root);
         assert_eq!(
-            engine.reference_catalog_root(),
+            engine.reference_catalog.root(),
             &prior_reference_catalog_root
         );
         assert_eq!(engine.logseq_claim_root, prior_logseq_claim_root);
@@ -18624,14 +18679,9 @@ mod validation_tests {
             &receipts,
         );
         let before = observable_engine_state(&reopened);
-        let outcome = reopened
-            .stage_archive_batch(second.manifest().batch_id())
-            .unwrap();
         assert!(matches!(
-            outcome.disposition(),
-            BatchDisposition::Rejected {
-                error: EngineError::ReferenceCatalog(_),
-            }
+            reopened.stage_archive_batch(second.manifest().batch_id()),
+            Err(EngineError::ReferenceCatalog(_))
         ));
         assert_eq!(observable_engine_state(&reopened), before);
 
@@ -18695,6 +18745,8 @@ mod validation_tests {
             "unexpected second outcome: {second_outcome:?}"
         );
         assert_eq!(engine.history_generation, 2);
+        let first_batch_id = first.manifest().batch_id();
+        let accepted_root = engine.accepted_frontier_root().unwrap();
         drop(engine);
 
         let graph = Graph::open(&root.join("graph"));
@@ -18714,6 +18766,35 @@ mod validation_tests {
             &graph,
             &receipts,
         );
+        let unclaimed = LogseqUuid::from_uuid(Uuid::from_u128(89_456));
+        assert!(matches!(
+            reopened.resolve_logseq_uuid(unclaimed),
+            Err(EngineError::ReferenceCatalog(_))
+        ));
+        assert!(matches!(
+            reopened.portable_path_index_root(),
+            Err(EngineError::ReferenceCatalog(_))
+        ));
+        assert!(matches!(
+            reopened.page_name_index_root(),
+            Err(EngineError::ReferenceCatalog(_))
+        ));
+        assert!(matches!(
+            reopened.reference_catalog_root(),
+            Err(EngineError::ReferenceCatalog(_))
+        ));
+        assert!(matches!(
+            reopened.projection_work_index(),
+            Err(EngineError::ReferenceCatalog(_))
+        ));
+        assert!(matches!(
+            reopened.accepted_frontier_document(&accepted_root, catalog),
+            Err(EngineError::ReferenceCatalog(_))
+        ));
+        assert!(matches!(
+            reopened.accepted_batch_evidence(first_batch_id),
+            Err(EngineError::ReferenceCatalog(_))
+        ));
         assert!(matches!(
             reopened.reference_source_posting(page_id),
             Err(EngineError::ReferenceCatalog(_))
@@ -18733,6 +18814,30 @@ mod validation_tests {
 
         reopened.prepare_operational_recovery_replay().unwrap();
         assert!(matches!(
+            reopened.resolve_logseq_uuid(unclaimed),
+            Err(EngineError::ReferenceCatalog(_))
+        ));
+        assert!(matches!(
+            reopened.portable_path_index_root(),
+            Err(EngineError::ReferenceCatalog(_))
+        ));
+        assert!(matches!(
+            reopened.page_name_index_root(),
+            Err(EngineError::ReferenceCatalog(_))
+        ));
+        assert!(matches!(
+            reopened.reference_catalog_root(),
+            Err(EngineError::ReferenceCatalog(_))
+        ));
+        assert!(matches!(
+            reopened.projection_work_index(),
+            Err(EngineError::ReferenceCatalog(_))
+        ));
+        assert!(matches!(
+            reopened.stage_archive_batch(first_batch_id),
+            Err(EngineError::ReferenceCatalog(_))
+        ));
+        assert!(matches!(
             reopened.finish_operational_recovery_replay(),
             Err(EngineError::Archive(_))
         ));
@@ -18747,10 +18852,18 @@ mod validation_tests {
 
         assert!(matches!(
             reopened
-                .stage_archive_batch(first.manifest().batch_id())
+                .stage_archive_batch_for_recovery(first_batch_id)
                 .unwrap()
                 .disposition(),
             BatchDisposition::Accepted { no_op: false }
+        ));
+        assert!(matches!(
+            reopened.accepted_frontier_document(&accepted_root, catalog),
+            Err(EngineError::ReferenceCatalog(_))
+        ));
+        assert!(matches!(
+            reopened.accepted_batch_evidence(first_batch_id),
+            Err(EngineError::ReferenceCatalog(_))
         ));
         reopened
             .verify_current_durable_page_name_authority()
@@ -18767,7 +18880,7 @@ mod validation_tests {
 
         assert!(matches!(
             reopened
-                .stage_archive_batch(second.manifest().batch_id())
+                .stage_archive_batch_for_recovery(second.manifest().batch_id())
                 .unwrap()
                 .disposition(),
             BatchDisposition::Rejected {
@@ -18781,6 +18894,117 @@ mod validation_tests {
             .is_some());
 
         drop(reopened);
+        drop(writer);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn zero_history_draft_cannot_finalize_during_authenticated_replay() {
+        let lineage = LineageDigest::of(b"zero-history-draft-replay-gate");
+        let (root, writer, mut engine, _catalog) = enrolled_test_engine(89_480, lineage);
+        let endpoint = engine.projection_endpoint_binding().unwrap();
+        std::fs::create_dir_all(root.join("graph/pages")).unwrap();
+        let graph = Graph::open(&root.join("graph"));
+        let receipts = ProjectionReceiptStore::open_for_endpoint(
+            &root.join("receipts"),
+            writer.workspace_id(),
+            endpoint,
+        )
+        .unwrap();
+        let page_id = PageId::from_uuid(Uuid::from_u128(89_481));
+        let path = ManagedPath::parse("pages/zero-history-draft.md").unwrap();
+        let draft = engine
+            .draft_author_transaction(
+                AuthorBatch {
+                    batch_id: BatchId::from_uuid(Uuid::from_u128(89_482)),
+                    author_device_id: endpoint.device_id,
+                    author_session_id: SessionId::from_uuid(Uuid::from_u128(89_483)),
+                    crdt_peer_id: CrdtPeerId::from_u64(89_484),
+                },
+                BatchOrigin::LocalMutation,
+                &OperationTransaction::new(vec![SemanticOperation::CreatePage {
+                    page_id,
+                    home_document_id: DocumentId::from_uuid(Uuid::from_u128(89_485)),
+                    name: LogicalPageName::parse("Zero History Draft").unwrap(),
+                    path: path.clone(),
+                    kind: ManagedTextKind::Page,
+                }])
+                .unwrap(),
+            )
+            .unwrap();
+        let captured = receipts
+            .capture_projection_input(&graph, endpoint, path, None)
+            .unwrap();
+
+        engine.prepare_operational_recovery_replay().unwrap();
+        assert_eq!(engine.history_generation, 0);
+        assert!(engine.authenticated_history_replay);
+        assert!(matches!(
+            engine.finalize_author_transaction(draft, endpoint, vec![captured]),
+            Err(EngineError::ReferenceCatalog(_))
+        ));
+        assert!(engine.authenticated_history_replay);
+        engine.finish_operational_recovery_replay().unwrap();
+        assert!(!engine.authenticated_history_replay);
+        assert!(engine.portable_path_index_root().is_ok());
+
+        drop(engine);
+        drop(writer);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn projection_reconciliation_failure_keeps_replay_retryable_and_authority_gated() {
+        let lineage = LineageDigest::of(b"projection-reconciliation-retry-gate");
+        let (root, writer, mut engine, _catalog) = enrolled_test_engine(89_490, lineage);
+        let endpoint = engine.projection_endpoint_binding().unwrap();
+        let work_head = root
+            .join("archive")
+            .join("projection-work-index-v1")
+            .join(endpoint.endpoint_id.to_string())
+            .join("projection-work.head");
+        let valid_head = std::fs::read(&work_head).unwrap();
+
+        engine.prepare_operational_recovery_replay().unwrap();
+        std::fs::write(&work_head, b"invalid projection work head").unwrap();
+        assert!(matches!(
+            engine.finish_operational_recovery_replay(),
+            Err(EngineError::ProjectionWork(_))
+        ));
+        assert!(engine.authenticated_history_replay);
+        assert!(matches!(
+            engine.resolve_logseq_uuid(LogseqUuid::from_uuid(Uuid::from_u128(89_491))),
+            Err(EngineError::ReferenceCatalog(_))
+        ));
+        assert!(matches!(
+            engine.portable_path_index_root(),
+            Err(EngineError::ReferenceCatalog(_))
+        ));
+        assert!(matches!(
+            engine.page_name_index_root(),
+            Err(EngineError::ReferenceCatalog(_))
+        ));
+        assert!(matches!(
+            engine.reference_catalog_root(),
+            Err(EngineError::ReferenceCatalog(_))
+        ));
+        assert!(matches!(
+            engine.projection_work_index(),
+            Err(EngineError::ReferenceCatalog(_))
+        ));
+
+        std::fs::write(&work_head, valid_head).unwrap();
+        engine.finish_operational_recovery_replay().unwrap();
+        assert!(!engine.authenticated_history_replay);
+        assert!(engine
+            .resolve_logseq_uuid(LogseqUuid::from_uuid(Uuid::from_u128(89_491)))
+            .is_ok());
+        assert!(engine.portable_path_index_root().is_ok());
+        assert!(engine.page_name_index_root().is_ok());
+        assert!(engine.reference_catalog_root().is_ok());
+        assert!(engine.projection_work_index().is_ok());
+
+        drop(engine);
         drop(writer);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -18934,13 +19158,10 @@ mod validation_tests {
             reopened.configure_reference_catalog_policy(ReferenceCatalogPolicyV1::default()),
             Err(expected.clone())
         );
-        assert_eq!(
-            reopened
-                .stage_archive_batch(mutation.manifest().batch_id())
-                .unwrap()
-                .disposition(),
-            BatchDisposition::Rejected { error: expected }
-        );
+        assert!(matches!(
+            reopened.stage_archive_batch(mutation.manifest().batch_id()),
+            Err(error) if error == expected
+        ));
 
         drop(reopened);
         drop(writer);
@@ -19123,8 +19344,8 @@ mod validation_tests {
                 kind: ManagedTextKind::Page,
             }],
         );
-        let created_name_root = engine.page_name_index_root().clone();
-        let created_path_root = engine.portable_path_index_root();
+        let created_name_root = engine.page_name_index_root().unwrap().clone();
+        let created_path_root = engine.portable_path_index_root().unwrap();
         assert_eq!(created_name_root.entry_count(), 1);
 
         publish(
@@ -19135,9 +19356,12 @@ mod validation_tests {
                 path: ManagedPath::parse("deep/physical/move.md").unwrap(),
             }],
         );
-        assert_eq!(engine.page_name_index_root(), &created_name_root);
-        assert_ne!(engine.portable_path_index_root(), created_path_root);
-        let moved_path_root = engine.portable_path_index_root();
+        assert_eq!(engine.page_name_index_root().unwrap(), &created_name_root);
+        assert_ne!(
+            engine.portable_path_index_root().unwrap(),
+            created_path_root
+        );
+        let moved_path_root = engine.portable_path_index_root().unwrap();
 
         publish(
             &mut engine,
@@ -19152,15 +19376,15 @@ mod validation_tests {
                 page_preamble_rewrites: Vec::new(),
             }],
         );
-        assert_ne!(engine.page_name_index_root(), &created_name_root);
-        assert_eq!(engine.portable_path_index_root(), moved_path_root);
+        assert_ne!(engine.page_name_index_root().unwrap(), &created_name_root);
+        assert_eq!(engine.portable_path_index_root().unwrap(), moved_path_root);
         let renamed_key = LogicalPageName::parse("Renamed").unwrap().key_digest();
         assert_eq!(
             engine
                 .page_name_index
                 .as_ref()
                 .unwrap()
-                .lookup(engine.page_name_index_root(), renamed_key)
+                .lookup(engine.page_name_index_root().unwrap(), renamed_key)
                 .unwrap()
                 .unwrap()
                 .occupied()
@@ -19192,7 +19416,7 @@ mod validation_tests {
                 .page_name_index
                 .as_ref()
                 .unwrap()
-                .lookup(engine.page_name_index_root(), renamed_key)
+                .lookup(engine.page_name_index_root().unwrap(), renamed_key)
                 .unwrap()
                 .unwrap()
                 .occupied()
@@ -19201,7 +19425,7 @@ mod validation_tests {
             second_page
         );
 
-        let authoritative_root = engine.page_name_index_root().clone();
+        let authoritative_root = engine.page_name_index_root().unwrap().clone();
         let carried = engine
             .prepare_bootstrap_transaction(
                 test_author(8_515, 8_510),
@@ -19258,7 +19482,7 @@ mod validation_tests {
                 .unwrap(),
             )
             .is_err());
-        assert_eq!(engine.page_name_index_root(), &authoritative_root);
+        assert_eq!(engine.page_name_root, authoritative_root);
         engine.scratch_roots.external_document_state_root = exact_root;
 
         drop(engine);
@@ -19379,7 +19603,7 @@ mod validation_tests {
                 },
                 "exact-current durable replay must retain one authenticated catalog load"
             );
-            let prior_root = receiver.page_name_index_root().clone();
+            let prior_root = receiver.page_name_index_root().unwrap().clone();
             receiver
                 .catalog_checkpoint_loads
                 .set(CatalogCheckpointLoadStats::default());
@@ -19395,7 +19619,7 @@ mod validation_tests {
                 },
                 "divergent current catalog must retain its authenticated current fallback"
             );
-            assert_eq!(receiver.page_name_index_root(), &prior_root);
+            assert_eq!(receiver.page_name_root, prior_root);
             assert!(matches!(
                 receiver.status().workspace(),
                 WorkspaceStatus::Blocked(_)
@@ -19528,7 +19752,7 @@ mod validation_tests {
         ));
         let prior_conflicts = receiver.page_name_conflicts.clone();
         let prior_page_name_root = receiver.page_name_root.clone();
-        let prior_reference_catalog_root = receiver.reference_catalog_root().clone();
+        let prior_reference_catalog_root = receiver.reference_catalog_root().unwrap().clone();
         let prior_logseq_claim_root = receiver.logseq_claim_root;
         let prior_fatal_handle = receiver.fatal_handle;
         let prior_fatal_evidence = receiver.fatal_evidence.clone();
@@ -19554,7 +19778,7 @@ mod validation_tests {
         assert_eq!(receiver.page_name_conflicts, prior_conflicts);
         assert_eq!(receiver.page_name_root, prior_page_name_root);
         assert_eq!(
-            receiver.reference_catalog_root(),
+            receiver.reference_catalog.root(),
             &prior_reference_catalog_root
         );
         assert_eq!(receiver.logseq_claim_root, prior_logseq_claim_root);
@@ -19647,7 +19871,7 @@ mod validation_tests {
         let prior_accepted = engine.status().accepted_batch_ids().unwrap();
         let prior_roots = engine.scratch_roots.clone();
         let prior_claim_root = engine.block_claim_root;
-        let prior_reference_catalog_root = engine.reference_catalog_root().clone();
+        let prior_reference_catalog_root = engine.reference_catalog_root().unwrap().clone();
         let prior_logseq_claim_root = engine.logseq_claim_root;
         let prior_fatal_handle = engine.fatal_handle;
         let prior_fatal_evidence = engine.fatal_evidence.clone();
@@ -19700,7 +19924,7 @@ mod validation_tests {
         );
         assert_eq!(engine.block_claim_root, prior_claim_root);
         assert_eq!(
-            engine.reference_catalog_root(),
+            engine.reference_catalog.root(),
             &prior_reference_catalog_root
         );
         assert_eq!(engine.logseq_claim_root, prior_logseq_claim_root);
@@ -20462,7 +20686,7 @@ mod replay_benchmark {
         );
         assert!(create_sources.carried_catalog_pages >= 2);
         assert!(create_sources.carried_shards >= 2);
-        let first_root = engine.reference_catalog_root().clone();
+        let first_root = engine.reference_catalog_root().unwrap().clone();
         let mut direct_replay = ShardedHotEngine::with_archive_store(
             ObjectStore::open(&root, workspace).unwrap(),
             LineageDigest::of(b"reference-catalog-lifecycle"),
@@ -20483,7 +20707,7 @@ mod replay_benchmark {
         assert!(replay_sources.carried_catalog_pages >= 2);
         assert!(replay_sources.carried_shards >= 2);
         assert!(replay_sources.carried_new_shards >= 2);
-        assert_eq!(direct_replay.reference_catalog_root(), &first_root);
+        assert_eq!(direct_replay.reference_catalog_root().unwrap(), &first_root);
         drop(direct_replay);
         assert_eq!(first_root.source_count(), 2);
         assert_eq!(engine.reference_catalog.hot_entry_count(), 0);
@@ -20513,7 +20737,7 @@ mod replay_benchmark {
         let evidence = engine.accepted_batch_evidence(create_id).unwrap();
         assert_eq!(
             evidence.reference_catalog_delta().post_root(),
-            engine.reference_catalog_root()
+            engine.reference_catalog_root().unwrap()
         );
         let mut tampered_evidence = evidence.clone();
         tampered_evidence.post_frontier_root.reference_catalog_root = tampered_evidence
@@ -20609,7 +20833,7 @@ mod replay_benchmark {
             })
             .unwrap();
         assert_eq!(engine.resolve_reference_page_name(&dangling).unwrap(), None);
-        assert_ne!(engine.reference_catalog_root(), &first_root);
+        assert_ne!(engine.reference_catalog_root().unwrap(), &first_root);
 
         let recreate = engine
             .prepare_bootstrap_transaction(
@@ -20721,8 +20945,8 @@ mod replay_benchmark {
             .reference_source_posting(source_page)
             .unwrap()
             .is_none());
-        assert_eq!(engine.reference_catalog_root().source_count(), 1);
-        let final_root = engine.reference_catalog_root().clone();
+        assert_eq!(engine.reference_catalog_root().unwrap().source_count(), 1);
+        let final_root = engine.reference_catalog_root().unwrap().clone();
         drop(engine);
 
         let replay_store = ObjectStore::open(&root, workspace).unwrap();
@@ -20740,11 +20964,11 @@ mod replay_benchmark {
         ] {
             replay.stage_archive_batch(batch_id).unwrap();
         }
-        assert_eq!(replay.reference_catalog_root(), &final_root);
+        assert_eq!(replay.reference_catalog_root().unwrap(), &final_root);
         assert_eq!(replay.reference_catalog.hot_entry_count(), 0);
-        let duplicate_root = replay.reference_catalog_root().clone();
+        let duplicate_root = replay.reference_catalog_root().unwrap().clone();
         replay.stage_archive_batch(delete_source_id).unwrap();
-        assert_eq!(replay.reference_catalog_root(), &duplicate_root);
+        assert_eq!(replay.reference_catalog_root().unwrap(), &duplicate_root);
         assert_eq!(replay.reference_catalog.hot_entry_count(), 0);
         drop(replay);
         std::fs::remove_dir_all(root).unwrap();

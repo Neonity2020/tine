@@ -1648,7 +1648,7 @@ fn enrolled_engine_rejects_wrong_graph_before_creating_work_namespace() {
         &wrong_graph,
         &receipts,
     );
-    assert!(rejected.projection_work_index().is_none());
+    assert!(rejected.projection_work_index().is_err());
     assert!(!archive_path.join("projection-work-index-v1").exists());
     drop(rejected);
 
@@ -1659,7 +1659,7 @@ fn enrolled_engine_rejects_wrong_graph_before_creating_work_namespace() {
         &enrolled_graph,
         &receipts,
     );
-    assert!(enrolled.projection_work_index().is_some());
+    assert!(enrolled.projection_work_index().is_ok());
     assert!(archive_path
         .join("projection-work-index-v1")
         .join(binding.endpoint_id().to_string())
@@ -1765,7 +1765,7 @@ fn public_enrolled_open_rejects_synthetic_prior_and_future_history_and_work_with
             &receipts,
         );
         assert!(
-            engine.projection_work_index().is_none(),
+            engine.projection_work_index().is_err(),
             "schema case {label} was accepted"
         );
         assert_eq!(

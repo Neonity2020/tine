@@ -1691,11 +1691,11 @@ fn sparse_uuid_claim_index_converges_and_invalidates_reference_frontiers() {
     );
     assert_eq!(
         ab.resolve_logseq_uuid(duplicate),
-        LogseqUuidResolution::Ambiguous { claim_count: 2 }
+        Ok(LogseqUuidResolution::Ambiguous { claim_count: 2 })
     );
     assert_eq!(
         ba.resolve_logseq_uuid(duplicate),
-        LogseqUuidResolution::Ambiguous { claim_count: 2 }
+        Ok(LogseqUuidResolution::Ambiguous { claim_count: 2 })
     );
     assert_eq!(
         ab.materialize_page(ids.page_a).unwrap().blocks[0].logseq_uuid,
@@ -1792,7 +1792,7 @@ fn sparse_uuid_claim_index_converges_and_invalidates_reference_frontiers() {
     ));
     assert_eq!(
         ab.resolve_logseq_uuid(duplicate),
-        LogseqUuidResolution::Unclaimed
+        Ok(LogseqUuidResolution::Unclaimed)
     );
     let removed_frontier = ab.materialize_page_for_projection(ids.page_c).unwrap();
     let removed_documents: Vec<_> = removed_frontier
@@ -1871,7 +1871,7 @@ fn deleting_page_invalidates_uuid_claim_but_retains_participant_evidence() {
     }
     assert_eq!(
         replay.resolve_logseq_uuid(claimed),
-        LogseqUuidResolution::Unclaimed
+        Ok(LogseqUuidResolution::Unclaimed)
     );
     assert!(matches!(
         replay.materialize_page(ids.page_a),
@@ -1945,7 +1945,7 @@ fn store_backed_uuid_claim_lookup_stays_point_local_and_hot_memory_bounded() {
     let (target_block, target_uuid) = target.unwrap();
     assert!(matches!(
         replay.resolve_logseq_uuid(target_uuid),
-        LogseqUuidResolution::Unique(claim)
+        Ok(LogseqUuidResolution::Unique(claim))
             if claim.block_id == target_block && claim.home_document_id == ids.home_a
     ));
     let after = replay.instrumentation();
@@ -4911,7 +4911,7 @@ fn page_rename_delete_and_path_conflicts_are_deterministic() {
     ));
     assert_eq!(ab.fatal_evidence_handle(), ba.fatal_evidence_handle());
     assert_eq!(ab.portable_path_conflicts(), ba.portable_path_conflicts());
-    let conflicts = ab.portable_path_conflicts();
+    let conflicts = ab.portable_path_conflicts().unwrap();
     assert_eq!(conflicts.len(), 1);
     assert_eq!(conflicts[0].participants().len(), 2);
     assert_eq!(
@@ -4969,7 +4969,7 @@ fn portable_aliases_quarantine_in_both_orders_but_compatibility_only_names_stay_
         ));
         assert_eq!(ab.fatal_evidence_handle(), ba.fatal_evidence_handle());
         assert_eq!(ab.portable_path_conflicts(), ba.portable_path_conflicts());
-        let evidence = ab.portable_path_conflicts();
+        let evidence = ab.portable_path_conflicts().unwrap();
         assert_eq!(evidence.len(), 1);
         assert_eq!(
             evidence[0].key_digest(),
@@ -5009,7 +5009,7 @@ fn portable_aliases_quarantine_in_both_orders_but_compatibility_only_names_stay_
         engine.status().workspace(),
         WorkspaceStatus::Operational
     ));
-    assert!(engine.portable_path_conflicts().is_empty());
+    assert!(engine.portable_path_conflicts().unwrap().is_empty());
     let snapshot = engine.canonical_snapshot().unwrap();
     assert!(snapshot.path_conflicts.is_empty());
 }
@@ -5063,7 +5063,12 @@ fn concurrent_portable_alias_creates_quarantine_with_order_independent_evidence(
     let ba = apply(right, left);
     assert_eq!(ab.fatal_evidence_handle(), ba.fatal_evidence_handle());
     assert_eq!(ab.portable_path_conflicts(), ba.portable_path_conflicts());
-    assert_eq!(ab.portable_path_conflicts()[0].participants().len(), 2);
+    assert_eq!(
+        ab.portable_path_conflicts().unwrap()[0]
+            .participants()
+            .len(),
+        2
+    );
 }
 
 #[test]
@@ -5163,7 +5168,7 @@ fn durable_terminal_portable_latch_blocks_projection_state_after_restart() {
         "{disposition:?}"
     );
     let handle = engine.fatal_evidence_handle().unwrap();
-    let conflicts = engine.portable_path_conflicts();
+    let conflicts = engine.portable_path_conflicts().unwrap();
     drop(engine);
 
     let recovery_reader = ObjectStore::open(&archive_path, ids.workspace).unwrap();
@@ -5175,7 +5180,7 @@ fn durable_terminal_portable_latch_blocks_projection_state_after_restart() {
         &receipts,
     );
     assert_eq!(recovery.fatal_evidence_handle(), Some(handle));
-    assert_eq!(recovery.portable_path_conflicts(), conflicts);
+    assert_eq!(recovery.portable_path_conflicts().unwrap(), conflicts);
     assert!(matches!(
         recovery.status().workspace(),
         WorkspaceStatus::Blocked(found) if *found == handle
@@ -5276,7 +5281,10 @@ fn durable_page_name_latch_restores_typed_evidence_without_legacy_fatal_evidence
             .disposition(),
         BatchDisposition::Quarantined
     ));
-    let root = engine.page_name_index_root().clone();
+    assert!(matches!(
+        engine.page_name_index_root(),
+        Err(EngineError::WorkspaceBlocked(_))
+    ));
     let evidence = engine.page_name_conflicts();
     assert!(!evidence.is_empty());
     assert!(engine.fatal_evidence().is_none());
@@ -5291,7 +5299,10 @@ fn durable_page_name_latch_restores_typed_evidence_without_legacy_fatal_evidence
         &graph,
         &receipts,
     );
-    assert_eq!(recovery.page_name_index_root(), &root);
+    assert!(matches!(
+        recovery.page_name_index_root(),
+        Err(EngineError::WorkspaceBlocked(_))
+    ));
     assert_eq!(recovery.page_name_conflicts(), evidence);
     assert!(matches!(
         recovery.status().workspace(),
@@ -5424,11 +5435,11 @@ fn store_backed_portable_index_is_affected_only_and_missing_root_fails_closed() 
         "one rename must use bounded old/new portable-key point reads"
     );
     assert_ne!(
-        engine.portable_path_index_root(),
+        engine.portable_path_index_root().unwrap(),
         tine_core::oplog::PortablePathIndexRoot::empty()
     );
 
-    let root = engine.portable_path_index_root().digest();
+    let root = engine.portable_path_index_root().unwrap().digest();
     std::fs::remove_file(
         archive_path
             .join("portable-path-index-v1")

@@ -3689,7 +3689,7 @@ impl DeviceRuntime {
             for manifest in manifests {
                 outcomes.push(
                     engine
-                        .stage_archive_batch(manifest.batch_id())
+                        .stage_archive_batch_for_recovery(manifest.batch_id())
                         .map_err(|error| ScenarioError::Engine(error.to_string()))?,
                 );
             }
