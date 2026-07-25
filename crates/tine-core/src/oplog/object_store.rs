@@ -259,6 +259,34 @@ pub(crate) struct EngineHistoryAuthority {
     pub index_root: ContentDigest,
 }
 
+/// Opaque proof that one authenticated durable history is either exact or an
+/// insertion-only prefix of another. Only the history store can mint this
+/// witness; projection authority must not move between raw generation/root
+/// pairs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AuthenticatedEngineHistoryTransition {
+    before: EngineHistoryAuthority,
+    after: EngineHistoryAuthority,
+}
+
+impl AuthenticatedEngineHistoryTransition {
+    pub(crate) const fn before(self) -> EngineHistoryAuthority {
+        self.before
+    }
+
+    pub(crate) const fn after(self) -> EngineHistoryAuthority {
+        self.after
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn for_test(
+        before: EngineHistoryAuthority,
+        after: EngineHistoryAuthority,
+    ) -> Self {
+        Self { before, after }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct EngineHistoryBinding {
@@ -1862,6 +1890,127 @@ impl DurableEngineHistoryStore {
             generation: root.generation,
             index_root: root.index_root,
         })
+    }
+
+    /// Authenticate an insertion-only transition directly from the shared
+    /// immutable radix structure. Equal subtrees terminate immediately, so a
+    /// normal point append is bounded by the changed radix paths rather than
+    /// the lifetime history size.
+    pub(crate) fn authenticate_current_history_extension(
+        &self,
+        before: EngineHistoryAuthority,
+    ) -> Result<AuthenticatedEngineHistoryTransition, StoreError> {
+        let after = self.current_authority()?;
+        if (before.generation == 0) != (before.index_root == EngineHistoryStore::empty_root()) {
+            return Err(StoreError::MalformedHistoryIndex);
+        }
+        let added = self.insertion_only_added_records(before.index_root, after.index_root, 0)?;
+        if before
+            .generation
+            .checked_add(added)
+            .filter(|generation| *generation == after.generation)
+            .is_none()
+        {
+            return Err(StoreError::MalformedHistoryIndex);
+        }
+        Ok(AuthenticatedEngineHistoryTransition { before, after })
+    }
+
+    fn insertion_only_added_records(
+        &self,
+        before: ContentDigest,
+        after: ContentDigest,
+        depth: u8,
+    ) -> Result<u64, StoreError> {
+        if before == after {
+            return Ok(0);
+        }
+        if before == EngineHistoryStore::empty_root() {
+            return self.history_record_count(after, depth);
+        }
+        if after == EngineHistoryStore::empty_root() {
+            return Err(StoreError::MalformedHistoryIndex);
+        }
+        match (self.index.read_node(before)?, self.index.read_node(after)?) {
+            (
+                HistoryIndexNode::Branch {
+                    depth: before_depth,
+                    children: before_children,
+                    ..
+                },
+                HistoryIndexNode::Branch {
+                    depth: after_depth,
+                    children: after_children,
+                    ..
+                },
+            ) if before_depth == depth && after_depth == depth => {
+                let mut added = 0_u64;
+                for (nibble, before_child) in &before_children {
+                    let after_child = after_children
+                        .iter()
+                        .find(|(candidate, _)| *candidate == *nibble)
+                        .map(|(_, digest)| *digest)
+                        .ok_or(StoreError::MalformedHistoryIndex)?;
+                    added = added
+                        .checked_add(self.insertion_only_added_records(
+                            *before_child,
+                            after_child,
+                            depth + 1,
+                        )?)
+                        .ok_or(StoreError::MalformedHistoryIndex)?;
+                }
+                for (nibble, after_child) in after_children {
+                    if !before_children
+                        .iter()
+                        .any(|(candidate, _)| *candidate == nibble)
+                    {
+                        added = added
+                            .checked_add(self.history_record_count(after_child, depth + 1)?)
+                            .ok_or(StoreError::MalformedHistoryIndex)?;
+                    }
+                }
+                Ok(added)
+            }
+            (
+                HistoryIndexNode::Leaf {
+                    batch_id: before_batch,
+                    record: before_record,
+                    ..
+                },
+                HistoryIndexNode::Leaf {
+                    batch_id: after_batch,
+                    record: after_record,
+                    ..
+                },
+            ) if depth == ENGINE_HISTORY_RADIX_DEPTH
+                && before_batch == after_batch
+                && before_record == after_record =>
+            {
+                Ok(0)
+            }
+            _ => Err(StoreError::MalformedHistoryIndex),
+        }
+    }
+
+    fn history_record_count(&self, root: ContentDigest, depth: u8) -> Result<u64, StoreError> {
+        if root == EngineHistoryStore::empty_root() {
+            return Ok(0);
+        }
+        match self.index.read_node(root)? {
+            HistoryIndexNode::Branch {
+                depth: found,
+                children,
+                ..
+            } if found == depth && depth < ENGINE_HISTORY_RADIX_DEPTH => {
+                children.into_iter().try_fold(0_u64, |count, (_, child)| {
+                    count
+                        .checked_add(self.history_record_count(child, depth + 1)?)
+                        .ok_or(StoreError::MalformedHistoryIndex)
+                })
+            }
+            HistoryIndexNode::Leaf { .. } if depth == ENGINE_HISTORY_RADIX_DEPTH => Ok(1),
+            _ => Err(StoreError::MalformedHistoryIndex),
+        }
     }
 
     pub(crate) fn current_with_binding(
@@ -3990,6 +4139,100 @@ mod history_index_tests {
         ));
         drop(history);
         drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn authenticated_history_transition_accepts_only_exact_or_insertion_only_lineage() {
+        let root = test_root("authenticated-transition-lineage");
+        let archive = root.join("archive");
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(45_000));
+        let binding = enrolled_binding(45_010);
+        let store = ObjectStore::open(&archive, workspace).unwrap();
+        let history = store.open_engine_history(binding).unwrap();
+        let control = archive
+            .join(ENGINE_HISTORY_DIR)
+            .join(binding.endpoint.endpoint_id.to_string());
+        let empty_head = std::fs::read(control.join(ENGINE_HISTORY_HEAD_FILE)).unwrap();
+        let empty = history.current_authority().unwrap();
+
+        let exact = history
+            .authenticate_current_history_extension(empty)
+            .unwrap();
+        assert_eq!(exact.before(), empty);
+        assert_eq!(exact.after(), empty);
+
+        let first_batch = BatchId::from_uuid(Uuid::from_u128(45_020));
+        let first_bytes = b"authenticated first record".to_vec();
+        history
+            .publish(first_batch, &first_bytes, EngineHistoryBinding::empty())
+            .unwrap();
+        let first = history.current_authority().unwrap();
+        let extension = history
+            .authenticate_current_history_extension(empty)
+            .unwrap();
+        assert_eq!(extension.before(), empty);
+        assert_eq!(extension.after(), first);
+
+        let second_batch = BatchId::from_uuid(Uuid::from_u128(45_021));
+        let second_bytes = b"authenticated unrelated record".to_vec();
+        history
+            .publish(second_batch, &second_bytes, EngineHistoryBinding::empty())
+            .unwrap();
+        let forward = history.current_authority().unwrap();
+        assert_eq!(
+            history
+                .authenticate_current_history_extension(first)
+                .unwrap()
+                .after(),
+            forward
+        );
+        drop(history);
+        drop(store);
+
+        std::fs::write(control.join(ENGINE_HISTORY_HEAD_FILE), &empty_head).unwrap();
+        let divergent_store = ObjectStore::open(&archive, workspace).unwrap();
+        let divergent_history = divergent_store.open_engine_history(binding).unwrap();
+        let divergent_batch = BatchId::from_uuid(Uuid::from_u128(45_030));
+        divergent_history
+            .publish(
+                divergent_batch,
+                b"equal-generation divergent record",
+                EngineHistoryBinding::empty(),
+            )
+            .unwrap();
+        assert_eq!(divergent_history.current_authority().unwrap().generation, 1);
+        assert!(matches!(
+            divergent_history.authenticate_current_history_extension(first),
+            Err(StoreError::MalformedHistoryIndex)
+        ));
+
+        let divergent_later = BatchId::from_uuid(Uuid::from_u128(45_031));
+        divergent_history
+            .publish(
+                divergent_later,
+                b"higher-generation divergent record",
+                EngineHistoryBinding::empty(),
+            )
+            .unwrap();
+        assert_eq!(divergent_history.current_authority().unwrap().generation, 2);
+        assert!(matches!(
+            divergent_history.authenticate_current_history_extension(first),
+            Err(StoreError::MalformedHistoryIndex)
+        ));
+        drop(divergent_history);
+        drop(divergent_store);
+
+        std::fs::write(control.join(ENGINE_HISTORY_HEAD_FILE), empty_head).unwrap();
+        let rollback_store = ObjectStore::open(&archive, workspace).unwrap();
+        let rollback_history = rollback_store.open_engine_history(binding).unwrap();
+        assert!(matches!(
+            rollback_history.authenticate_current_history_extension(first),
+            Err(StoreError::MalformedHistoryIndex)
+        ));
+
+        drop(rollback_history);
+        drop(rollback_store);
         std::fs::remove_dir_all(root).unwrap();
     }
 

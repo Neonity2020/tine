@@ -3564,6 +3564,7 @@ mod tests {
         receipts: ProjectionReceiptStore,
         engine: ShardedHotEngine,
         intents: Vec<ProjectionIntent>,
+        empty_history_head: Vec<u8>,
     }
 
     impl SnapshotFixture {
@@ -3683,6 +3684,13 @@ mod tests {
                 &graph,
                 &receipts,
             );
+            let empty_history_head = fs::read(
+                archive
+                    .join("engine-history")
+                    .join(endpoint.endpoint_id.to_string())
+                    .join("engine-history.head"),
+            )
+            .unwrap();
             engine.stage_archive_batch(batch_id).unwrap();
             let intents = page_ids
                 .into_iter()
@@ -3701,6 +3709,7 @@ mod tests {
                 receipts,
                 engine,
                 intents,
+                empty_history_head,
             }
         }
 
@@ -4591,6 +4600,44 @@ mod tests {
         );
         assert_eq!(tree.roots, vec![0]);
         assert_eq!(tree.nodes[0].children, vec![1, 2]);
+    }
+
+    #[test]
+    fn completed_direct_receipt_cannot_reach_catalog_capture_after_empty_rollback() {
+        let fixture = SnapshotFixture::new("direct-receipt-empty-rollback", &["pages/a.md"]);
+        let SnapshotFixture {
+            _root,
+            graph,
+            receipts,
+            engine,
+            empty_history_head,
+            ..
+        } = fixture;
+        let workspace = engine.workspace_id();
+        let endpoint = engine.projection_endpoint_binding().unwrap();
+        let archive = _root.path().join("archive");
+        let history_head = archive
+            .join("engine-history")
+            .join(endpoint.endpoint_id.to_string())
+            .join("engine-history.head");
+        drop(engine);
+        fs::write(history_head, empty_history_head).unwrap();
+
+        let reopened = ShardedHotEngine::with_enrolled_projection(
+            ObjectStore::open(&archive, workspace).unwrap(),
+            LineageDigest::of(b"snapshot-test"),
+            DocumentId::from_uuid(Uuid::from_u128(4)),
+            &graph,
+            &receipts,
+        );
+        let mut instrumentation = ImportInstrumentation::default();
+        let requested = vec![ManagedPath::parse("pages/a.md").unwrap()];
+        let block =
+            capture_affected_catalog(&receipts, &reopened, &requested, &mut instrumentation)
+                .unwrap_err();
+        assert_eq!(block.reason, ImportBlockReason::AuthorityUnavailable);
+        assert_eq!(instrumentation.catalog_entries, 0);
+        assert!(block.detail.contains("history") || block.detail.contains("projection"));
     }
 
     #[test]

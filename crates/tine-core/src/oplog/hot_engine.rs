@@ -2205,6 +2205,7 @@ pub struct ShardedHotEngine {
     durable_authority_mode: DurableAuthorityMode,
     authenticated_history_replay: bool,
     authenticated_replayed_batches: BTreeSet<BatchId>,
+    authenticated_replayed_generations: BTreeMap<u64, BatchId>,
     precommit_history_publication_failure: Option<EngineError>,
     archive_fingerprints: BTreeMap<BatchId, ContentDigest>,
     persisted_staged: BTreeSet<BatchId>,
@@ -2319,6 +2320,7 @@ impl ShardedHotEngine {
             durable_authority_mode: DurableAuthorityMode::Ephemeral,
             authenticated_history_replay: false,
             authenticated_replayed_batches: BTreeSet::new(),
+            authenticated_replayed_generations: BTreeMap::new(),
             precommit_history_publication_failure: None,
             archive_fingerprints: BTreeMap::new(),
             persisted_staged: BTreeSet::new(),
@@ -2729,7 +2731,7 @@ impl ShardedHotEngine {
                 && engine.page_name_conflicts.is_empty()
                 && engine.reference_catalog.ensure_ready().is_ok()
             {
-                if let Err(error) = engine.reconcile_pending_projection_work() {
+                if let Err(error) = engine.reconcile_pending_projection_work(None) {
                     engine.history_failure = Some(error);
                 }
             }
@@ -2853,12 +2855,24 @@ impl ShardedHotEngine {
                 self.history_generation
             )));
         }
+        if self
+            .authenticated_replayed_generations
+            .keys()
+            .copied()
+            .ne(1..=self.history_generation)
+        {
+            return Err(EngineError::Archive(
+                "authenticated recovery replay history generations are incomplete or duplicated"
+                    .into(),
+            ));
+        }
         self.verify_current_durable_page_name_authority()?;
+        let history_transition = self.authenticated_projection_history_transition()?;
         self.reference_catalog
             .finish_recovery()
             .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))?;
         if self.fatal_handle.is_none() && self.page_name_conflicts.is_empty() {
-            self.reconcile_pending_projection_work()?;
+            self.reconcile_pending_projection_work(history_transition)?;
         }
         self.authenticated_history_replay = false;
         Ok(())
@@ -2867,6 +2881,15 @@ impl ShardedHotEngine {
     pub(crate) fn enrolled_projection_runtime(
         &self,
     ) -> Result<(Arc<ObjectStore>, Arc<ProjectionWorkIndex>), EngineError> {
+        self.ensure_not_blocked()?;
+        self.reference_catalog
+            .ensure_ready()
+            .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))?;
+        if self.authenticated_history_replay {
+            return Err(EngineError::ProjectionWork(
+                "projection runtime is unavailable during authenticated history replay".into(),
+            ));
+        }
         let archive = self.archive_store.as_ref().ok_or_else(|| {
             EngineError::ProjectionWork("engine has no enrolled projection archive".into())
         })?;
@@ -4354,7 +4377,14 @@ impl ShardedHotEngine {
                     ArchiveStatus::Rejected(_) | ArchiveStatus::Quarantined
                 ) {
                     if self.authenticated_history_replay {
-                        self.authenticated_replayed_batches.insert(offered_batch_id);
+                        if let Err(error) = self.note_authenticated_replayed_record(&existing) {
+                            self.history_failure = Some(error.clone());
+                            return self.outcome(
+                                offered_batch_id,
+                                BatchDisposition::Rejected { error },
+                                Vec::new(),
+                            );
+                        }
                     }
                     return self.outcome(
                         offered_batch_id,
@@ -6118,27 +6148,45 @@ impl ShardedHotEngine {
         let Some(index) = self.projection_work_index.as_ref() else {
             return Ok(());
         };
-        let authority = self
-            .history_store
-            .as_ref()
-            .ok_or_else(|| {
-                EngineError::ProjectionWork(
-                    "projection activation has no durable engine history".into(),
-                )
-            })?
-            .current_authority()
-            .map_err(|error| EngineError::Archive(error.to_string()))?;
+        let transition = self.authenticate_current_projection_history_extension(index)?;
         index
-            .accept_batch_at_history(
-                batch_id,
-                manifest_fingerprint,
-                authority.generation,
-                authority.index_root,
-            )
+            .accept_batch_at_history(batch_id, manifest_fingerprint, transition)
             .map_err(|error| EngineError::ProjectionWork(error.to_string()))
     }
 
-    fn reconcile_pending_projection_work(&mut self) -> Result<(), EngineError> {
+    fn authenticate_current_projection_history_extension(
+        &self,
+        index: &ProjectionWorkIndex,
+    ) -> Result<super::object_store::AuthenticatedEngineHistoryTransition, EngineError> {
+        let before = index
+            .engine_history_authority()
+            .map_err(|error| EngineError::ProjectionWork(error.to_string()))?;
+        self.history_store
+            .as_ref()
+            .ok_or_else(|| {
+                EngineError::ProjectionWork(
+                    "projection history transition has no durable engine history".into(),
+                )
+            })?
+            .authenticate_current_history_extension(before)
+            .map_err(|error| EngineError::ProjectionWork(error.to_string()))
+    }
+
+    fn authenticated_projection_history_transition(
+        &self,
+    ) -> Result<Option<super::object_store::AuthenticatedEngineHistoryTransition>, EngineError>
+    {
+        let Some(index) = self.projection_work_index.as_deref() else {
+            return Ok(None);
+        };
+        self.authenticate_current_projection_history_extension(index)
+            .map(Some)
+    }
+
+    fn reconcile_pending_projection_work(
+        &mut self,
+        transition: Option<super::object_store::AuthenticatedEngineHistoryTransition>,
+    ) -> Result<(), EngineError> {
         let Some(index) = self.projection_work_index.as_ref().map(Arc::clone) else {
             return Ok(());
         };
@@ -6153,6 +6201,15 @@ impl ShardedHotEngine {
             })?
             .current_authority()
             .map_err(|error| EngineError::Archive(error.to_string()))?;
+        let transition = match transition {
+            Some(transition) if transition.after() == authority => transition,
+            Some(_) => {
+                return Err(EngineError::ProjectionWork(
+                    "authenticated projection history transition is not current".into(),
+                ))
+            }
+            None => self.authenticate_current_projection_history_extension(&index)?,
+        };
         let mut cursor = None;
         loop {
             let page = index
@@ -6177,27 +6234,18 @@ impl ShardedHotEngine {
                                 .accept_batch_at_history(
                                     pending.batch_id(),
                                     pending.manifest_fingerprint(),
-                                    authority.generation,
-                                    authority.index_root,
+                                    transition,
                                 )
                                 .map_err(|error| EngineError::ProjectionWork(error.to_string()))?,
                             ArchiveStatus::Rejected(_)
                             | ArchiveStatus::Quarantined
                             | ArchiveStatus::Staged => index
-                                .retire_pending_activation_at_history(
-                                    pending,
-                                    authority.generation,
-                                    authority.index_root,
-                                )
+                                .retire_pending_activation_at_history(pending, transition)
                                 .map_err(|error| EngineError::ProjectionWork(error.to_string()))?,
                         }
                     }
                     None => index
-                        .retire_pending_activation_at_history(
-                            pending,
-                            authority.generation,
-                            authority.index_root,
-                        )
+                        .retire_pending_activation_at_history(pending, transition)
                         .map_err(|error| EngineError::ProjectionWork(error.to_string()))?,
                 }
             }
@@ -6207,10 +6255,7 @@ impl ShardedHotEngine {
             }
         }
         index
-            .bind_recovered_history_after_pending_reconciliation(
-                authority.generation,
-                authority.index_root,
-            )
+            .bind_recovered_history_after_pending_reconciliation(transition)
             .map_err(|error| EngineError::ProjectionWork(error.to_string()))?;
         Ok(())
     }
@@ -7647,7 +7692,7 @@ impl ShardedHotEngine {
                 && existing.reference_catalog_root == reference_catalog_root
             {
                 if self.authenticated_history_replay {
-                    self.authenticated_replayed_batches.insert(batch_id);
+                    self.note_authenticated_replayed_record(&existing)?;
                 }
                 self.status_point_cache
                     .borrow_mut()
@@ -7745,6 +7790,60 @@ impl ShardedHotEngine {
         point_cache.clear();
         point_cache.insert(batch_id, Some(record));
         Ok(())
+    }
+
+    fn note_authenticated_replayed_record(
+        &mut self,
+        record: &ColdHistoryRecord,
+    ) -> Result<(), EngineError> {
+        if !self.authenticated_history_replay || record.generation == 0 {
+            return Err(EngineError::Archive(
+                "authenticated recovery replay record is out of protocol".into(),
+            ));
+        }
+        let batch_replayed = self
+            .authenticated_replayed_batches
+            .contains(&record.batch_id);
+        match (
+            self.authenticated_replayed_generations
+                .get(&record.generation),
+            batch_replayed,
+        ) {
+            (Some(batch_id), true) if *batch_id == record.batch_id => Ok(()),
+            (Some(_), _) => Err(EngineError::Archive(
+                "authenticated recovery replay has duplicate durable generations".into(),
+            )),
+            (None, true) => Err(EngineError::Archive(
+                "authenticated recovery replay has a conflicting duplicate record".into(),
+            )),
+            (None, false) => {
+                self.authenticated_replayed_batches.insert(record.batch_id);
+                self.authenticated_replayed_generations
+                    .insert(record.generation, record.batch_id);
+                Ok(())
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn authenticated_replay_retained_history_payload(&self) -> (usize, usize) {
+        if !self.authenticated_history_replay {
+            return (0, 0);
+        }
+        self.status_point_cache
+            .borrow()
+            .values()
+            .filter_map(Option::as_ref)
+            .fold((0, 0), |(records, bytes), record| {
+                (
+                    records.saturating_add(1),
+                    bytes.saturating_add(
+                        encode_history_record(record)
+                            .expect("authenticated cached history record remains encodable")
+                            .len(),
+                    ),
+                )
+            })
     }
 
     fn archive_status(&self, batch_id: BatchId) -> Result<Option<ArchiveStatus>, EngineError> {
@@ -19433,6 +19532,32 @@ mod validation_tests {
                 error: EngineError::CrdtUpdateBaseMismatch(_)
             }
         ));
+        assert_eq!(reopened.authenticated_replayed_batches.len(), 2);
+        assert_eq!(
+            reopened.authenticated_replayed_generations,
+            BTreeMap::from([(1, first_batch_id), (2, second.manifest().batch_id()),])
+        );
+        let largest_record_bytes = [first_batch_id, second.manifest().batch_id()]
+            .into_iter()
+            .map(|batch_id| {
+                let record = reopened
+                    .authenticated_recovery_history_record(batch_id)
+                    .unwrap()
+                    .unwrap();
+                encode_history_record(&record).unwrap().len()
+            })
+            .max()
+            .unwrap();
+        let (retained_records, retained_payload_bytes) =
+            reopened.authenticated_replay_retained_history_payload();
+        assert!(
+            retained_records <= 1,
+            "recovery retained {retained_records} history record payloads after replaying two records"
+        );
+        assert!(
+            retained_payload_bytes <= largest_record_bytes,
+            "recovery retained payload bytes from more than its bounded point cache"
+        );
         reopened.finish_operational_recovery_replay().unwrap();
         assert!(reopened
             .reference_source_posting(page_id)

@@ -36,10 +36,14 @@ use super::{
 };
 
 const WORK_SCHEMA_VERSION: u32 = 3;
+// v9 requires authenticated insertion-only history transition evidence for
+// every non-exact engine-history binding change. v8 could retain terminal and
+// completed authority across a raw divergent rebind.
+//
 // v8 makes each authenticated exact-path completion leaf a bounded current
 // authority (or a constant-size ambiguity marker), rather than a lifetime
 // history of every receipt ever completed at that path.
-const INDEX_SCHEMA_VERSION: u32 = 8;
+const INDEX_SCHEMA_VERSION: u32 = 9;
 const MAX_WORK_ROW_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_PREPARED_BATCH_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_INDEX_NODE_BYTES: u64 = 8 * 1024 * 1024;
@@ -804,7 +808,8 @@ impl ProjectionWorkIndex {
                             }
                         }
                         PreflightTree::CompletedPaths => {
-                            decode_completed_path_row(&key, &value)?;
+                            let row = decode_completed_path_row(&key, &value)?;
+                            validate_completed_path_row_history_binding(root, &row)?;
                         }
                         PreflightTree::Pending => {
                             let activation: ProjectionPendingActivation = decode_canonical(&value)?;
@@ -1068,9 +1073,11 @@ impl ProjectionWorkIndex {
         &self,
         batch_id: BatchId,
         manifest_fingerprint: ContentDigest,
-        engine_history_generation: u64,
-        engine_history_root: ContentDigest,
+        transition: super::object_store::AuthenticatedEngineHistoryTransition,
     ) -> Result<(), ProjectionWorkError> {
+        let authority = transition.after();
+        let engine_history_generation = authority.generation;
+        let engine_history_root = authority.index_root;
         if engine_history_generation == 0
             || engine_history_root == super::object_store::EngineHistoryStore::empty_root()
         {
@@ -1083,6 +1090,7 @@ impl ProjectionWorkIndex {
         let prepared_bytes = encode_canonical(&prepared)?;
         let prepared_digest = ContentDigest::of(&prepared_bytes);
         self.transition(|index, pending_root_digest, mut root| {
+            require_authenticated_history_transition(&root, transition)?;
             let accepted_key = batch_key(batch_id);
             let expected_pending = ProjectionPendingActivation {
                 schema_version: INDEX_SCHEMA_VERSION,
@@ -1203,11 +1211,33 @@ impl ProjectionWorkIndex {
         batch_id: BatchId,
         manifest_fingerprint: ContentDigest,
     ) -> Result<(), ProjectionWorkError> {
-        self.accept_batch_at_history(
+        self.accept_batch_at_history_for_test(
             batch_id,
             manifest_fingerprint,
             1,
             ContentDigest::of(b"projection-work-test-history-root"),
+        )
+    }
+
+    #[cfg(test)]
+    fn accept_batch_at_history_for_test(
+        &self,
+        batch_id: BatchId,
+        manifest_fingerprint: ContentDigest,
+        engine_history_generation: u64,
+        engine_history_root: ContentDigest,
+    ) -> Result<(), ProjectionWorkError> {
+        let before = self.engine_history_authority()?;
+        self.accept_batch_at_history(
+            batch_id,
+            manifest_fingerprint,
+            super::object_store::AuthenticatedEngineHistoryTransition::for_test(
+                before,
+                super::object_store::EngineHistoryAuthority {
+                    generation: engine_history_generation,
+                    index_root: engine_history_root,
+                },
+            ),
         )
     }
 
@@ -1262,12 +1292,15 @@ impl ProjectionWorkIndex {
     pub(crate) fn retire_pending_activation_at_history(
         &self,
         pending: &ProjectionPendingActivation,
-        engine_history_generation: u64,
-        engine_history_root: ContentDigest,
+        transition: super::object_store::AuthenticatedEngineHistoryTransition,
     ) -> Result<(), ProjectionWorkError> {
+        let authority = transition.after();
+        let engine_history_generation = authority.generation;
+        let engine_history_root = authority.index_root;
         self.require_pending_binding(pending)?;
         self.require_pending_prepared(pending)?;
         self.transition(|index, _, mut root| {
+            require_authenticated_history_transition(&root, transition)?;
             let key = batch_key(pending.batch_id);
             let existing = index
                 .tree_lookup(root.pending_root, &key)?
@@ -1285,20 +1318,19 @@ impl ProjectionWorkIndex {
     }
 
     /// Seal the final authenticated history binding after startup recovery has
-    /// reconciled every pending activation. This cannot make work Ready and
-    /// refuses to advance authority while pending or executable work remains;
-    /// such work requires an exact existing history binding.
+    /// reconciled every pending activation. A non-exact binding requires an
+    /// opaque insertion-only witness minted by the sealed durable history
+    /// store; terminal rows and completed receipts therefore cannot survive a
+    /// rollback or divergent history.
     pub(crate) fn bind_recovered_history_after_pending_reconciliation(
         &self,
-        engine_history_generation: u64,
-        engine_history_root: ContentDigest,
+        transition: super::object_store::AuthenticatedEngineHistoryTransition,
     ) -> Result<(), ProjectionWorkError> {
-        if (engine_history_generation == 0)
-            != (engine_history_root == super::object_store::EngineHistoryStore::empty_root())
-        {
-            return Err(ProjectionWorkError::HistoryBindingMismatch);
-        }
+        let authority = transition.after();
+        let engine_history_generation = authority.generation;
+        let engine_history_root = authority.index_root;
         self.transition(|index, _, mut root| {
+            require_authenticated_history_transition(&root, transition)?;
             if root.engine_history_generation == engine_history_generation
                 && root.engine_history_root == engine_history_root
             {
@@ -1317,15 +1349,63 @@ impl ProjectionWorkIndex {
     }
 
     #[cfg(test)]
+    fn bind_recovered_history_after_pending_reconciliation_for_test(
+        &self,
+        engine_history_generation: u64,
+        engine_history_root: ContentDigest,
+    ) -> Result<(), ProjectionWorkError> {
+        let before = self.engine_history_authority()?;
+        self.bind_recovered_history_after_pending_reconciliation(
+            super::object_store::AuthenticatedEngineHistoryTransition::for_test(
+                before,
+                super::object_store::EngineHistoryAuthority {
+                    generation: engine_history_generation,
+                    index_root: engine_history_root,
+                },
+            ),
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn retire_pending_activation(
         &self,
         pending: &ProjectionPendingActivation,
     ) -> Result<(), ProjectionWorkError> {
-        self.retire_pending_activation_at_history(
+        self.retire_pending_activation_at_history_for_test(
             pending,
             1,
             ContentDigest::of(b"projection-work-test-history-root"),
         )
+    }
+
+    #[cfg(test)]
+    fn retire_pending_activation_at_history_for_test(
+        &self,
+        pending: &ProjectionPendingActivation,
+        engine_history_generation: u64,
+        engine_history_root: ContentDigest,
+    ) -> Result<(), ProjectionWorkError> {
+        let before = self.engine_history_authority()?;
+        self.retire_pending_activation_at_history(
+            pending,
+            super::object_store::AuthenticatedEngineHistoryTransition::for_test(
+                before,
+                super::object_store::EngineHistoryAuthority {
+                    generation: engine_history_generation,
+                    index_root: engine_history_root,
+                },
+            ),
+        )
+    }
+
+    pub(crate) fn engine_history_authority(
+        &self,
+    ) -> Result<super::object_store::EngineHistoryAuthority, ProjectionWorkError> {
+        let (_, root) = self.load_head_root()?;
+        Ok(super::object_store::EngineHistoryAuthority {
+            generation: root.engine_history_generation,
+            index_root: root.engine_history_root,
+        })
     }
 
     pub(crate) fn require_current_history_binding(
@@ -1488,7 +1568,10 @@ impl ProjectionWorkIndex {
             return Ok(Vec::new());
         };
         match decode_completed_path_row(&path_key(path), &bytes)? {
-            ProjectionCompletedPathRow::Current(current) => Ok(vec![current.receipt]),
+            ProjectionCompletedPathRow::Current(current) => {
+                self.require_current_completed_path_source(&root, &current)?;
+                Ok(vec![current.receipt])
+            }
             ProjectionCompletedPathRow::Ambiguous { .. } => {
                 Err(ProjectionWorkError::AmbiguousCompletedPath)
             }
@@ -1982,6 +2065,77 @@ impl ProjectionWorkIndex {
                 Ok(state)
             })
             .transpose()
+    }
+
+    fn require_current_completed_path_source(
+        &self,
+        root: &ProjectionRoot,
+        current: &ProjectionCurrentCompletedPath,
+    ) -> Result<(), ProjectionWorkError> {
+        match current.source {
+            ProjectionCompletedPathSource::Manifested { work_id } => {
+                let state = self
+                    .load_state(root, work_id)?
+                    .ok_or(ProjectionWorkError::MissingWork(work_id))?;
+                if state.work.page_id() != current.receipt.page_id()
+                    || state.work.path() != current.receipt.path()
+                    || state.work.post_frontier() != current.receipt.frontier()
+                    || state.work.target() != current.receipt.target()
+                    || state.status
+                        != (StoredWorkStatus::Completed {
+                            intent_id: current.receipt.intent_id(),
+                            logical_completion_id: current.receipt.logical_completion_id(),
+                        })
+                {
+                    return Err(ProjectionWorkError::AcceptedWitnessMismatch);
+                }
+                let bytes = self
+                    .tree_lookup(root.accepted_root, &batch_key(state.work.batch_id()))?
+                    .ok_or(ProjectionWorkError::AcceptedWitnessMissing)?;
+                let witness: AcceptedBatchWitness = decode_canonical(&bytes)?;
+                if witness.schema_version != INDEX_SCHEMA_VERSION
+                    || witness.workspace_id != self.workspace_id
+                    || witness.endpoint_id != self.endpoint_id
+                    || witness.batch_id != state.work.batch_id()
+                    || witness.work_ids.binary_search(&work_id).is_err()
+                    || !strictly_sorted(&witness.work_ids)
+                {
+                    return Err(ProjectionWorkError::AcceptedWitnessMismatch);
+                }
+                let source_root = self.load_root(witness.pending_root_digest)?;
+                let pending = self
+                    .tree_lookup(source_root.pending_root, &batch_key(witness.batch_id))?
+                    .ok_or(ProjectionWorkError::PendingActivationMissing)?;
+                let pending: ProjectionPendingActivation = decode_canonical(&pending)?;
+                self.require_pending_binding(&pending)?;
+                self.require_pending_prepared(&pending)?;
+                if pending.batch_id != witness.batch_id
+                    || pending.manifest_fingerprint != witness.manifest_fingerprint
+                    || pending.prepared_digest != witness.prepared_digest
+                    || pending.work_ids != witness.work_ids
+                {
+                    return Err(ProjectionWorkError::AcceptedWitnessMismatch);
+                }
+            }
+            ProjectionCompletedPathSource::Direct {
+                engine_history_generation,
+                engine_history_root,
+            } => {
+                // Non-exact root changes are insertion-only and authenticated
+                // at the mutation boundary. Inductively, any retained direct
+                // source is on the current lineage; accepted path work removes
+                // the row before publishing its replacement.
+                if engine_history_generation == 0
+                    || engine_history_generation > root.engine_history_generation
+                    || engine_history_root == super::object_store::EngineHistoryStore::empty_root()
+                    || (engine_history_generation == root.engine_history_generation
+                        && engine_history_root != root.engine_history_root)
+                {
+                    return Err(ProjectionWorkError::HistoryBindingMismatch);
+                }
+            }
+        }
+        Ok(())
     }
 
     fn add_path_work(
@@ -2519,6 +2673,20 @@ fn validate_projection_root_binding(
     Ok(())
 }
 
+fn require_authenticated_history_transition(
+    root: &ProjectionRoot,
+    transition: super::object_store::AuthenticatedEngineHistoryTransition,
+) -> Result<(), ProjectionWorkError> {
+    let current = super::object_store::EngineHistoryAuthority {
+        generation: root.engine_history_generation,
+        index_root: root.engine_history_root,
+    };
+    if current != transition.before() && current != transition.after() {
+        return Err(ProjectionWorkError::HistoryBindingMismatch);
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PreparedBatch {
@@ -2862,6 +3030,42 @@ fn decode_completed_path_row(
         ProjectionCompletedPathRow::Current(_) | ProjectionCompletedPathRow::Ambiguous { .. } => {}
     }
     Ok(row)
+}
+
+fn validate_completed_path_row_history_binding(
+    root: &ProjectionRoot,
+    row: &ProjectionCompletedPathRow,
+) -> Result<(), ProjectionWorkError> {
+    let source = match row {
+        ProjectionCompletedPathRow::Current(ProjectionCurrentCompletedPath {
+            source:
+                ProjectionCompletedPathSource::Direct {
+                    engine_history_generation,
+                    engine_history_root,
+                },
+            ..
+        })
+        | ProjectionCompletedPathRow::Ambiguous {
+            engine_history_generation,
+            engine_history_root,
+            ..
+        } => Some((*engine_history_generation, *engine_history_root)),
+        ProjectionCompletedPathRow::Current(ProjectionCurrentCompletedPath {
+            source: ProjectionCompletedPathSource::Manifested { .. },
+            ..
+        }) => None,
+    };
+    if let Some((generation, history_root)) = source {
+        if generation == 0
+            || generation > root.engine_history_generation
+            || history_root == super::object_store::EngineHistoryStore::empty_root()
+            || (generation == root.engine_history_generation
+                && history_root != root.engine_history_root)
+        {
+            return Err(ProjectionWorkError::HistoryBindingMismatch);
+        }
+    }
+    Ok(())
 }
 
 fn encode_completed_path_row(
@@ -3921,7 +4125,7 @@ mod tests {
         let current_history_root = ContentDigest::of(b"newer-engine-history");
         fixture
             .index
-            .accept_batch_at_history(
+            .accept_batch_at_history_for_test(
                 second_history.batch_id(),
                 fingerprint,
                 2,
@@ -3958,12 +4162,52 @@ mod tests {
     }
 
     #[test]
+    fn direct_completion_survives_an_unrelated_forward_history_extension() {
+        let fixture = Fixture::new("direct-completion-forward-extension");
+        let first_history = fixture.work(1, "pages/history-one.md");
+        let fingerprint = fixture.prepare(&first_history);
+        fixture
+            .index
+            .accept_batch(first_history.batch_id(), fingerprint)
+            .unwrap();
+        let path = ManagedPath::parse("pages/direct-current.md").unwrap();
+        fixture
+            .index
+            .mark_direct_completed(fixture.direct_completion_authority(
+                PageId::from_uuid(Uuid::from_u128(82_151)),
+                path.as_str(),
+                82_152,
+            ))
+            .unwrap();
+
+        let unrelated = fixture.work(2, "pages/unrelated.md");
+        let fingerprint = fixture.prepare(&unrelated);
+        fixture
+            .index
+            .accept_batch_at_history_for_test(
+                unrelated.batch_id(),
+                fingerprint,
+                2,
+                ContentDigest::of(b"authenticated-forward-extension"),
+            )
+            .unwrap();
+        assert_eq!(
+            fixture
+                .index
+                .completed_receipts_for_path(&path)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
     fn recovery_history_rebind_requires_no_pending_or_executable_work() {
         let empty = Fixture::new("empty-recovery-history-rebind");
         let recovered_root = ContentDigest::of(b"empty-recovered-engine-history");
         empty
             .index
-            .bind_recovered_history_after_pending_reconciliation(2, recovered_root)
+            .bind_recovered_history_after_pending_reconciliation_for_test(2, recovered_root)
             .unwrap();
         empty
             .index
@@ -3976,7 +4220,7 @@ mod tests {
         assert!(matches!(
             fixture
                 .index
-                .bind_recovered_history_after_pending_reconciliation(2, recovered_root),
+                .bind_recovered_history_after_pending_reconciliation_for_test(2, recovered_root),
             Err(ProjectionWorkError::PendingActivationMismatch)
         ));
 
@@ -3987,12 +4231,12 @@ mod tests {
         assert!(matches!(
             fixture
                 .index
-                .bind_recovered_history_after_pending_reconciliation(2, recovered_root),
+                .bind_recovered_history_after_pending_reconciliation_for_test(2, recovered_root),
             Err(ProjectionWorkError::HistoryBindingMismatch)
         ));
         fixture
             .index
-            .bind_recovered_history_after_pending_reconciliation(
+            .bind_recovered_history_after_pending_reconciliation_for_test(
                 1,
                 ContentDigest::of(b"projection-work-test-history-root"),
             )
@@ -4036,6 +4280,111 @@ mod tests {
             .unwrap()
             .open_projection_work_index(fixture.binding())
             .is_err());
+    }
+
+    #[test]
+    fn manifested_completed_path_requires_its_accepted_source_batch() {
+        let fixture = Fixture::new("completed-path-accepted-source");
+        let work = fixture.work(1, "pages/manifested-source.md");
+        let fingerprint = fixture.prepare(&work);
+        fixture
+            .index
+            .accept_batch(work.batch_id(), fingerprint)
+            .unwrap();
+        fixture
+            .index
+            .mark_completed(fixture.completion_authority(&work))
+            .unwrap();
+        assert_eq!(
+            fixture
+                .index
+                .completed_receipts_for_path(work.path())
+                .unwrap()
+                .len(),
+            1
+        );
+
+        fixture
+            .index
+            .transition(|index, _, mut root| {
+                root.accepted_root =
+                    index.tree_remove(root.accepted_root, &batch_key(work.batch_id()))?;
+                Ok(root)
+            })
+            .unwrap();
+        assert!(matches!(
+            fixture.index.completed_receipts_for_path(work.path()),
+            Err(ProjectionWorkError::AcceptedWitnessMissing)
+        ));
+    }
+
+    #[test]
+    fn terminal_rows_leave_authority_when_pending_and_ready_trees_are_empty() {
+        let fixture = Fixture::new("terminal-authority-roots");
+
+        let completed = fixture.work(1, "pages/completed.md");
+        let fingerprint = fixture.prepare(&completed);
+        fixture
+            .index
+            .accept_batch(completed.batch_id(), fingerprint)
+            .unwrap();
+        fixture
+            .index
+            .mark_completed(fixture.completion_authority(&completed))
+            .unwrap();
+
+        let blocked = fixture.work(2, "pages/blocked.md");
+        let fingerprint = fixture.prepare(&blocked);
+        fixture
+            .index
+            .accept_batch(blocked.batch_id(), fingerprint)
+            .unwrap();
+        fixture
+            .index
+            .mark_blocked(ProjectionWorkBlockAuthority::guarded_conflict(
+                &blocked,
+                fixture.index.receipt_store_id(),
+                Some(BlobDescription::of(b"conflict")),
+            ))
+            .unwrap();
+
+        let superseded = fixture.work(3, "pages/superseded.md");
+        let fingerprint = fixture.prepare(&superseded);
+        fixture
+            .index
+            .accept_batch(superseded.batch_id(), fingerprint)
+            .unwrap();
+        let replacement = fixture.work(4, "pages/superseded.md");
+        let fingerprint = fixture.prepare_superseding(&replacement, &[superseded.work_id()]);
+        fixture
+            .index
+            .accept_batch(replacement.batch_id(), fingerprint)
+            .unwrap();
+        fixture
+            .index
+            .mark_completed(fixture.completion_authority(&replacement))
+            .unwrap();
+
+        let (_, root) = fixture.index.load_head_root().unwrap();
+        assert_eq!(root.pending_root, empty_tree_root());
+        assert_eq!(root.ready_root, empty_tree_root());
+        assert_ne!(root.rows_root, empty_tree_root());
+        assert_ne!(root.accepted_root, empty_tree_root());
+        assert_ne!(root.completed_paths_root, empty_tree_root());
+        assert_eq!(
+            fixture.index.status(completed.work_id()).unwrap(),
+            Some(ProjectionWorkStatus::Completed)
+        );
+        assert_eq!(
+            fixture.index.status(blocked.work_id()).unwrap(),
+            Some(ProjectionWorkStatus::Blocked)
+        );
+        assert_eq!(
+            fixture.index.status(superseded.work_id()).unwrap(),
+            Some(ProjectionWorkStatus::Superseded {
+                by: replacement.work_id()
+            })
+        );
     }
 
     #[test]
@@ -4121,14 +4470,14 @@ mod tests {
     }
 
     #[test]
-    fn prior_v7_claim_fails_closed_as_an_upgrade_without_writes() {
-        let fixture = Fixture::new("prior-v7-claim");
+    fn rejected_v8_claim_fails_closed_as_an_upgrade_without_writes() {
+        let fixture = Fixture::new("rejected-v8-claim");
         let endpoint = fixture
             .path
             .join("projection-work-index-v1")
             .join(fixture.endpoint_id.to_string());
         let prior_claim = encode_canonical(&ProjectionIndexClaim {
-            schema_version: 7,
+            schema_version: 8,
             workspace_id: fixture.workspace_id,
             endpoint_id: fixture.endpoint_id,
             graph_resource_id: fixture.graph_resource_id,
@@ -4143,7 +4492,7 @@ mod tests {
             .unwrap_err();
         assert!(error
             .to_string()
-            .contains("version 7 requires upgrade to 8"));
+            .contains("version 8 requires upgrade to 9"));
     }
 
     #[test]
