@@ -4146,6 +4146,17 @@ impl ShardedHotEngine {
                     );
                 }
             }
+            Ok(None) if self.authenticated_history_replay => {
+                return self.outcome(
+                    offered_batch_id,
+                    BatchDisposition::Rejected {
+                        error: EngineError::Archive(format!(
+                            "authenticated recovery cannot stage archive-only batch {offered_batch_id} absent from durable history"
+                        )),
+                    },
+                    Vec::new(),
+                );
+            }
             Ok(None) => {}
             Err(error) => {
                 self.history_failure = Some(error.clone());
@@ -18218,7 +18229,60 @@ mod validation_tests {
                 .unwrap(),
             )
             .unwrap();
+        let malformed_base = engine
+            .prepare_bootstrap_transaction(
+                test_author(89_040, 89_040),
+                &OperationTransaction::new(vec![SemanticOperation::CreatePage {
+                    page_id: PageId::from_uuid(Uuid::from_u128(89_041)),
+                    home_document_id: DocumentId::from_uuid(Uuid::from_u128(89_042)),
+                    name: LogicalPageName::parse("Malformed Archive Orphan").unwrap(),
+                    path: ManagedPath::parse("pages/malformed-archive-orphan.md").unwrap(),
+                    kind: ManagedTextKind::Page,
+                }])
+                .unwrap(),
+            )
+            .unwrap();
+        let malformed_payload = b"not a semantic effect".to_vec();
+        let malformed_objects = malformed_base
+            .objects()
+            .iter()
+            .map(|object| {
+                if object.kind() == ObjectKind::SemanticEffect {
+                    OperationObject::new(
+                        object.workspace_id(),
+                        object.document_id(),
+                        object.kind(),
+                        malformed_payload.clone(),
+                    )
+                    .unwrap()
+                } else {
+                    object.clone()
+                }
+            })
+            .collect::<Vec<_>>();
+        let malformed_descriptors = malformed_objects
+            .iter()
+            .map(OperationObject::descriptor)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let malformed_manifest = OperationBatch::new_with_causality(
+            malformed_base.manifest().workspace_id(),
+            malformed_base.manifest().lineage_digest(),
+            malformed_base.manifest().batch_id(),
+            malformed_base.manifest().author_device_id(),
+            malformed_base.manifest().author_session_id(),
+            malformed_base.manifest().origin(),
+            malformed_base.manifest().causal_dot(),
+            malformed_base.manifest().causal_dependency_heads().to_vec(),
+            malformed_base.manifest().dependency_frontier().clone(),
+            SemanticEffectDigest::of(&malformed_payload),
+            malformed_descriptors,
+        )
+        .unwrap();
+        let malformed_orphan = PreparedBatch::new(malformed_manifest, malformed_objects).unwrap();
+        let malformed_orphan_id = malformed_orphan.manifest().batch_id();
         writer.publish_prepared(&update).unwrap();
+        writer.publish_prepared(&malformed_orphan).unwrap();
         let prior_observable = observable_engine_state(&engine);
         super::super::object_store::fail_next_engine_history_head_swap();
         let outcome = engine
@@ -18301,9 +18365,20 @@ mod validation_tests {
         ));
         reopened.prepare_operational_recovery_replay().unwrap();
         for manifest in writer.committed_manifests().unwrap() {
-            reopened
+            let before = (manifest.batch_id() == malformed_orphan_id)
+                .then(|| observable_engine_state(&reopened));
+            let outcome = reopened
                 .stage_archive_batch_for_recovery(manifest.batch_id())
                 .unwrap();
+            if let Some(before) = before {
+                assert!(matches!(
+                    outcome.disposition(),
+                    BatchDisposition::Rejected {
+                        error: EngineError::Archive(_),
+                    }
+                ));
+                assert_eq!(observable_engine_state(&reopened), before);
+            }
         }
         reopened.finish_operational_recovery_replay().unwrap();
         assert_eq!(
