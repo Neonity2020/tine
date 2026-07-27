@@ -25,7 +25,7 @@ use std::os::windows::fs::MetadataExt as _;
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle as _;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use ahash::AHashMap;
@@ -346,6 +346,18 @@ struct StoreCounters {
 pub(crate) struct EngineHistoryStore {
     capability: Dir,
     counters: Arc<StoreCounters>,
+    /// Sticky, process-local evidence that this exact open has already observed
+    /// a durable engine-history storage fault: an index node that is missing,
+    /// oversized, stored under the wrong content address, undecodable,
+    /// non-canonical or structurally invalid, or a durable publication that did
+    /// not complete. It only ever moves from `false` to `true`.
+    ///
+    /// The latch owns one job: while it is set, the store's
+    /// authenticated-transition memo is disarmed, so every proof is decided by
+    /// the complete walk a fresh open would perform. It lives beside the index
+    /// because that is where almost every fault is observed;
+    /// [`DurableEngineHistoryStore::publish`] latches it for the rest.
+    storage_fault: AtomicBool,
 }
 
 #[derive(Debug)]
@@ -372,7 +384,9 @@ pub(crate) struct DurableEngineHistoryStore {
     /// Store-private, process-local memo of insertion-only transitions *this
     /// exact open* already authenticated. See
     /// [`Self::authenticate_current_history_extension`]; it is an accelerator
-    /// for the walk, never an authority of its own.
+    /// for the walk, never an authority of its own, it never shortens the
+    /// live-endpoint checks, and it is discarded permanently once
+    /// [`EngineHistoryStore::storage_fault`] latches.
     authenticated_transitions: Mutex<Vec<AuthenticatedEngineHistoryTransition>>,
 }
 
@@ -1923,6 +1937,7 @@ impl ObjectStore {
             EngineHistoryStore {
                 capability: open_dir_nofollow(&control, ENGINE_HISTORY_NODES_DIR)?,
                 counters: Arc::clone(&self.counters),
+                storage_fault: AtomicBool::new(false),
             },
             open_engine_history_transition_lock(&self.capability)?,
         )
@@ -1949,6 +1964,7 @@ impl ObjectStore {
             EngineHistoryStore {
                 capability: open_dir_nofollow(&control, ENGINE_HISTORY_NODES_DIR)?,
                 counters: Arc::clone(&self.counters),
+                storage_fault: AtomicBool::new(false),
             },
             open_engine_history_transition_lock(&self.capability)?,
         )
@@ -1963,6 +1979,7 @@ impl ObjectStore {
         Ok(EngineHistoryStore {
             capability: open_dir_nofollow(&histories, &run)?,
             counters: Arc::clone(&self.counters),
+            storage_fault: AtomicBool::new(false),
         })
     }
 
@@ -3503,7 +3520,22 @@ impl EngineHistoryStore {
         })
     }
 
+    /// Latch [`Self::storage_fault`]. Monotone, so a plain store is enough and
+    /// the observation can never be lost by racing with another latch.
+    fn note_storage_fault(&self) {
+        self.storage_fault.store(true, Ordering::SeqCst);
+    }
+
+    fn storage_faulted(&self) -> bool {
+        self.storage_fault.load(Ordering::SeqCst)
+    }
+
     fn publish_node(&self, node: &HistoryIndexNode) -> Result<ContentDigest, StoreError> {
+        self.publish_node_checked(node)
+            .inspect_err(|_| self.note_storage_fault())
+    }
+
+    fn publish_node_checked(&self, node: &HistoryIndexNode) -> Result<ContentDigest, StoreError> {
         validate_history_node(node)?;
         let bytes = postcard::to_allocvec(node).map_err(|_| StoreError::MalformedHistoryIndex)?;
         if bytes.len() as u64 > MAX_ENGINE_HISTORY_INDEX_BYTES {
@@ -3526,7 +3558,19 @@ impl EngineHistoryStore {
         Ok(digest)
     }
 
+    /// Read one immutable index node.
+    ///
+    /// Every failure here is a durable storage fault — the node is missing,
+    /// oversized, stored under the wrong content address, undecodable,
+    /// non-canonical or structurally invalid — so every failure latches
+    /// [`Self::storage_fault`]. Structural *lineage* rejections are decided by
+    /// the callers from successfully read nodes and never reach this latch.
     fn read_node(&self, digest: ContentDigest) -> Result<HistoryIndexNode, StoreError> {
+        self.read_node_checked(digest)
+            .inspect_err(|_| self.note_storage_fault())
+    }
+
+    fn read_node_checked(&self, digest: ContentDigest) -> Result<HistoryIndexNode, StoreError> {
         self.counters
             .history_index_reads
             .fetch_add(1, Ordering::Relaxed);
@@ -3688,6 +3732,7 @@ impl DurableEngineHistoryStore {
             index: EngineHistoryStore {
                 capability: nodes,
                 counters,
+                storage_fault: AtomicBool::new(false),
             },
             transition_lock,
             transition: Mutex::new(()),
@@ -3765,6 +3810,17 @@ impl DurableEngineHistoryStore {
     /// the one the uncached walk produces. That is what makes the accelerator
     /// safe rather than merely fast — see
     /// [`Self::compose_cached_history_extension`].
+    ///
+    /// A memo may only shorten the *walk*, never the availability and integrity
+    /// facts the walk establishes about the live endpoints. Before any
+    /// composition can run, [`Self::require_live_history_endpoint_nodes`]
+    /// re-reads and re-authenticates from storage exactly the endpoint nodes
+    /// the direct walk would have read, so a current root that has been
+    /// deleted, truncated, substituted or digest-corrupted since this open
+    /// warmed its memo is rejected identically warm and fresh. Faults *below*
+    /// the endpoints stay a previously authenticated in-memory fact, guarded by
+    /// the storage-fault latch described on [`EngineHistoryStore::storage_fault`]
+    /// — see the residual note on [`Self::compose_cached_history_extension`].
     pub(crate) fn authenticate_current_history_extension(
         &self,
         before: EngineHistoryAuthority,
@@ -3773,24 +3829,77 @@ impl DurableEngineHistoryStore {
         if (before.generation == 0) != (before.index_root == EngineHistoryStore::empty_root()) {
             return Err(StoreError::MalformedHistoryIndex);
         }
-        let proof = match self.compose_cached_history_extension(before, after) {
-            Some(composed) => composed,
-            None => {
-                let added =
-                    self.insertion_only_added_records(before.index_root, after.index_root, 0)?;
-                if before
-                    .generation
-                    .checked_add(added)
-                    .filter(|generation| *generation == after.generation)
-                    .is_none()
-                {
-                    return Err(StoreError::MalformedHistoryIndex);
+        let proof = match self.cached_history_extension(before) {
+            Some(middle) => {
+                self.require_live_history_endpoint_nodes(before.index_root, after.index_root)?;
+                match self.compose_cached_history_extension(before, middle, after) {
+                    Some(composed) => composed,
+                    None => self.walk_history_extension(before, after)?,
                 }
-                AuthenticatedEngineHistoryTransition { before, after }
             }
+            None => self.walk_history_extension(before, after)?,
         };
         self.remember_authenticated_history_extension(proof);
         Ok(proof)
+    }
+
+    /// The complete, unmemoized `before -> current` proof. This is the only
+    /// thing that ever mints a transition out of raw storage, and it is exactly
+    /// what a fresh open performs.
+    fn walk_history_extension(
+        &self,
+        before: EngineHistoryAuthority,
+        after: EngineHistoryAuthority,
+    ) -> Result<AuthenticatedEngineHistoryTransition, StoreError> {
+        let added = self.insertion_only_added_records(before.index_root, after.index_root, 0)?;
+        if before
+            .generation
+            .checked_add(added)
+            .filter(|generation| *generation == after.generation)
+            .is_none()
+        {
+            return Err(StoreError::MalformedHistoryIndex);
+        }
+        Ok(AuthenticatedEngineHistoryTransition { before, after })
+    }
+
+    /// Re-establish, from storage, exactly the depth-0 availability and
+    /// integrity facts [`Self::insertion_only_added_records`] would establish
+    /// for this endpoint pair — no more, so a warm verdict stays byte-for-byte
+    /// the fresh verdict, and no less, so a memo can never inherit them.
+    ///
+    /// The walk reads nothing when the two roots are identical (equal subtrees
+    /// terminate immediately) and rejects a retreat to the empty root without
+    /// reading anything, so those two cases are reproduced by reading nothing.
+    /// Otherwise it reads `before` first and then `after`, requiring each to be
+    /// an available, correctly addressed, canonical depth-0 branch; this
+    /// mirrors the walk's own first step, including which endpoint reports the
+    /// failure and with which error.
+    fn require_live_history_endpoint_nodes(
+        &self,
+        before: ContentDigest,
+        after: ContentDigest,
+    ) -> Result<(), StoreError> {
+        let empty = EngineHistoryStore::empty_root();
+        if before == after || after == empty {
+            return Ok(());
+        }
+        if before != empty {
+            self.require_live_history_branch_root(before)?;
+        }
+        self.require_live_history_branch_root(after)
+    }
+
+    fn require_live_history_branch_root(&self, root: ContentDigest) -> Result<(), StoreError> {
+        match self.index.read_node(root)? {
+            HistoryIndexNode::Branch { depth: 0, .. } => Ok(()),
+            // A node that reads cleanly but is not the radix root it is used as
+            // is a substitution, not a lineage disagreement.
+            _ => {
+                self.index.note_storage_fault();
+                Err(StoreError::MalformedHistoryIndex)
+            }
+        }
     }
 
     /// Compose a memoized `before -> middle` proof with a freshly walked
@@ -3812,24 +3921,50 @@ impl DurableEngineHistoryStore {
     /// rollback, divergence and missing-leaf rejections, which are exactly the
     /// walk's failures on the residual step.
     ///
-    /// Staleness. The memo records a fact about immutable content-addressed
-    /// radix nodes, not a claim about the live head, so it cannot decay: no
-    /// publish, failed publish, head replacement or history failure can make a
-    /// once-true structural containment false. The live `current` is re-read on
-    /// every call and the residual step is always freshly walked and
-    /// digest-verified, so a memo that no longer lies on the live lineage can
-    /// only fail to compose. Returning `None` on any such failure hands the
+    /// Lineage staleness. The memo records a fact about immutable
+    /// content-addressed radix nodes, not a claim about the live head, so the
+    /// *structural* fact cannot decay: no publish, failed publish or head
+    /// replacement can make a once-true containment false. The live `current`
+    /// is re-read on every call and the residual step is always freshly walked
+    /// and digest-verified, so a memo that no longer lies on the live lineage
+    /// can only fail to compose. Returning `None` on any such failure hands the
     /// decision back to the complete walk, so the memo can neither turn a
-    /// rejection into an acceptance nor an acceptance into a rejection. This is
-    /// why correctness needs no invalidation hook on the publish, head-swap or
-    /// reopen paths; a reopened store simply starts with an empty memo and pays
-    /// the full walk once.
+    /// rejection into an acceptance nor an acceptance into a rejection.
+    ///
+    /// Availability. What a memo *can* outlive is the storage the walk read.
+    /// Two mechanisms bound that, because re-reading the whole authenticated
+    /// region on every call is precisely the lifetime-sized work the memo
+    /// exists to remove:
+    ///
+    /// 1. [`Self::require_live_history_endpoint_nodes`] re-reads and
+    ///    re-authenticates the live endpoint nodes on every warm call, so
+    ///    depth-0 loss, truncation, substitution and digest corruption are
+    ///    rejected identically warm and fresh.
+    /// 2. Deeper nodes stay a fact this same open authenticated earlier — every
+    ///    node the direct `before -> current` walk would read was read and
+    ///    digest-verified by this store when the memo entry was minted, by
+    ///    induction over the composition chain. The compensating guarantee is
+    ///    causal: the first operation that re-encounters damage down there —
+    ///    any lookup, replay, rebuild or insertion that descends into it —
+    ///    latches [`EngineHistoryStore::storage_fault`], which permanently
+    ///    disarms this memo, so from that point the store decides exactly like
+    ///    a fresh open. [`Self::publish`] latches it for an incomplete
+    ///    publication too.
+    ///
+    /// The residual this leaves is narrow and deliberate: a node that this open
+    /// already authenticated is destroyed by something outside Tine while Tine
+    /// runs, and nothing touches it again before the next admission. Such an
+    /// admission can extend the history along an undamaged radix path, which a
+    /// fresh open would instead refuse; it cannot surface, project or replay
+    /// the damaged region, because every path that reads it latches the fault
+    /// first. A reopened store starts with an empty memo and pays the full walk
+    /// once, so nothing here survives a restart.
     fn compose_cached_history_extension(
         &self,
         before: EngineHistoryAuthority,
+        middle: EngineHistoryAuthority,
         after: EngineHistoryAuthority,
     ) -> Option<AuthenticatedEngineHistoryTransition> {
-        let middle = self.cached_history_extension(before)?;
         let added = self
             .insertion_only_added_records(middle.index_root, after.index_root, 0)
             .ok()?;
@@ -3843,12 +3978,18 @@ impl DurableEngineHistoryStore {
     /// The furthest endpoint this store proved from exactly this anchor.
     ///
     /// Both anchor fields must match exactly; a substituted generation or index
-    /// root simply misses the memo and is decided by the full walk.
+    /// root simply misses the memo and is decided by the full walk. A latched
+    /// storage fault discards the memo outright and keeps it discarded for the
+    /// rest of this open.
     fn cached_history_extension(
         &self,
         before: EngineHistoryAuthority,
     ) -> Option<EngineHistoryAuthority> {
-        let cache = self.authenticated_transitions.lock().ok()?;
+        let mut cache = self.authenticated_transitions.lock().ok()?;
+        if self.index.storage_faulted() {
+            cache.clear();
+            return None;
+        }
         cache
             .iter()
             .find(|entry| entry.before == before)
@@ -3869,7 +4010,7 @@ impl DurableEngineHistoryStore {
     /// successful proof keeps the repeatedly used one resident. Only a proof
     /// this store just minted is recorded, so a rejected transition can neither
     /// enter the memo nor churn it. A poisoned memo lock degrades to no memo,
-    /// never to a weaker proof.
+    /// never to a weaker proof, and so does a latched storage fault.
     fn remember_authenticated_history_extension(
         &self,
         proof: AuthenticatedEngineHistoryTransition,
@@ -3877,6 +4018,10 @@ impl DurableEngineHistoryStore {
         let Ok(mut cache) = self.authenticated_transitions.lock() else {
             return;
         };
+        if self.index.storage_faulted() {
+            cache.clear();
+            return;
+        }
         cache.retain(|entry| entry.before != proof.before);
         if cache.len() >= MAX_AUTHENTICATED_TRANSITION_ANCHORS {
             cache.remove(0);
@@ -4218,6 +4363,15 @@ impl DurableEngineHistoryStore {
         self.index.note_history_decode();
     }
 
+    /// Extend the durable history by one record.
+    ///
+    /// A publication that starts and does not complete may have failed anywhere
+    /// between the head read and the head swap, including on damaged index or
+    /// root storage. Nothing this open proved earlier may survive such a
+    /// failure as a shortcut, so any outcome other than success or the
+    /// read-only bootstrap refusal — which is decided before any storage is
+    /// touched — latches the storage fault and disarms the
+    /// authenticated-transition memo for the rest of this open.
     pub(crate) fn publish(
         &self,
         batch_id: BatchId,
@@ -4229,6 +4383,22 @@ impl DurableEngineHistoryStore {
             .lock()
             .map_err(|_| StoreError::MalformedHistoryIndex)?;
         let _workspace_guard = AdvisoryTransitionGuard::lock(&self.transition_lock)?;
+        let published = self.publish_locked(batch_id, bytes, binding);
+        if !matches!(published, Ok(_) | Err(StoreError::InactiveBootstrapHistory)) {
+            self.index.note_storage_fault();
+            if let Ok(mut cache) = self.authenticated_transitions.lock() {
+                cache.clear();
+            }
+        }
+        published
+    }
+
+    fn publish_locked(
+        &self,
+        batch_id: BatchId,
+        bytes: &[u8],
+        binding: EngineHistoryBinding,
+    ) -> Result<(u64, ContentDigest), StoreError> {
         let (before_digest, before) = self.load_head_root()?;
         // An inactive bootstrap history is read-only. A promoted open may extend
         // exactly the bootstrap lineage its durable promotion state authorized,
@@ -6666,12 +6836,18 @@ mod history_index_tests {
         ))
     }
 
+    /// The constant live-endpoint revalidation every warm call performs: the
+    /// two radix roots the direct walk itself would read, and never more.
+    const LIVE_ENDPOINT_REVALIDATION_BOUND: usize = 2;
+
     /// One radix insertion touches `ENGINE_HISTORY_RADIX_DEPTH + 1` nodes. A
     /// residual `middle -> current` diff walk reads at most one such path on
     /// each side before it either terminates on an equal subtree or counts the
     /// single newly inserted record, so a memoized incremental step can never
-    /// exceed twice one insertion path — whatever the post-anchor history size.
-    const INCREMENTAL_STEP_BOUND: usize = 2 * (ENGINE_HISTORY_RADIX_DEPTH as usize + 1);
+    /// exceed twice one insertion path plus the constant live-endpoint
+    /// revalidation — whatever the post-anchor history size.
+    const INCREMENTAL_STEP_BOUND: usize =
+        LIVE_ENDPOINT_REVALIDATION_BOUND + 2 * (ENGINE_HISTORY_RADIX_DEPTH as usize + 1);
 
     #[test]
     fn authenticated_history_extension_revalidation_is_bounded_per_step() {
@@ -6719,17 +6895,19 @@ mod history_index_tests {
 
             // The very first proof from the immutable anchor is the one full
             // walk, and at post-anchor size 1 it is literally one radix
-            // insertion path.
+            // insertion path. The memo is cold, so it costs no revalidation.
             assert_eq!(bootstrap_step, ENGINE_HISTORY_RADIX_DEPTH as usize + 1);
 
-            // Re-proving an unchanged head from the same anchor is pure
-            // composition against an already-proved endpoint: no node is read
-            // at all.
+            // Re-proving an unchanged head from the same anchor is composition
+            // against an already-proved endpoint, so the residual walk is
+            // empty. What it still costs — and must cost — is the live current
+            // root, freshly read and authenticated. The anchor here is the
+            // empty authority, which names no node.
             let before = node_reads(&store);
             let repeated = history
                 .authenticate_current_history_extension(anchor)
                 .unwrap();
-            assert_eq!(node_reads(&store) - before, 0);
+            assert_eq!(node_reads(&store) - before, 1);
             assert_eq!(repeated.after().generation, size as u64);
 
             // A fresh open holds no memo and must pay the complete anchor ->
@@ -6753,7 +6931,7 @@ mod history_index_tests {
             reopened
                 .authenticate_current_history_extension(anchor)
                 .unwrap();
-            assert_eq!(node_reads(&reopened_store) - before, 0);
+            assert_eq!(node_reads(&reopened_store) - before, 1);
 
             if size >= 1_000 {
                 assert!(
@@ -6775,6 +6953,343 @@ mod history_index_tests {
             full_walks[2] >= 5 * full_walks[1],
             "full-walk cost {full_walks:?} did not scale with the post-anchor history"
         );
+    }
+
+    /// The accidental single-user damage a live immutable index node has to be
+    /// re-checked against: it vanishes, it is cut short, or it is replaced by
+    /// same-length bytes that no longer hash to the name it is stored under.
+    #[derive(Clone, Copy, Debug)]
+    enum HistoryNodeFault {
+        Deleted,
+        Truncated,
+        DigestCorrupted,
+    }
+
+    fn history_node_path(
+        archive: &Path,
+        binding: crate::oplog::hot_engine::ProjectionStorageBinding,
+        digest: ContentDigest,
+    ) -> PathBuf {
+        archive
+            .join(ENGINE_HISTORY_DIR)
+            .join(binding.endpoint.endpoint_id.to_string())
+            .join(ENGINE_HISTORY_NODES_DIR)
+            .join(history_index_filename(digest))
+    }
+
+    fn damage_history_node(path: &Path, fault: HistoryNodeFault) {
+        let pristine = std::fs::read(path).unwrap();
+        assert!(pristine.len() > 2);
+        match fault {
+            HistoryNodeFault::Deleted => std::fs::remove_file(path).unwrap(),
+            HistoryNodeFault::Truncated => {
+                std::fs::write(path, &pristine[..pristine.len() / 2]).unwrap();
+            }
+            HistoryNodeFault::DigestCorrupted => {
+                let mut substituted = pristine.clone();
+                let last = substituted.len() - 1;
+                substituted[last] ^= 0xFF;
+                assert_eq!(substituted.len(), pristine.len());
+                std::fs::write(path, &substituted).unwrap();
+            }
+        }
+    }
+
+    /// The content address of the leaf `publish` stores for one record, so a
+    /// test can name an individual deep node without walking the index.
+    fn history_leaf_digest(batch_id: BatchId, record: &[u8]) -> ContentDigest {
+        ContentDigest::of(
+            &postcard::to_allocvec(&HistoryIndexNode::Leaf {
+                schema_version: ENGINE_HISTORY_INDEX_SCHEMA_VERSION,
+                batch_id,
+                record: record.to_vec(),
+            })
+            .unwrap(),
+        )
+    }
+
+    /// A memo may shorten the *walk*, never the availability and integrity
+    /// facts the walk establishes about the live current endpoint. Losing the
+    /// node named by `after.index_root` must be rejected identically whether or
+    /// not this open already proved a transition from the same anchor.
+    #[test]
+    fn authenticated_history_extension_revalidates_the_live_current_root() {
+        let root = test_root("live-current-root-revalidation");
+        let archive = root.join("archive");
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(49_000));
+        let binding = enrolled_binding(49_010);
+        let open = || {
+            let store = ObjectStore::open(&archive, workspace).unwrap();
+            let history = store.open_engine_history(binding).unwrap();
+            (store, history)
+        };
+
+        let (store, history) = open();
+        let anchor = history.current_authority().unwrap();
+        for index in 0..4_usize {
+            history
+                .publish(
+                    spread_history_batch_id(index),
+                    b"live current root record",
+                    EngineHistoryBinding::empty(),
+                )
+                .unwrap();
+        }
+        let current = history.current_authority().unwrap();
+        drop(history);
+        drop(store);
+
+        let node = history_node_path(&archive, binding, current.index_root);
+        let pristine = std::fs::read(&node).unwrap();
+
+        for fault in [
+            HistoryNodeFault::Deleted,
+            HistoryNodeFault::Truncated,
+            HistoryNodeFault::DigestCorrupted,
+        ] {
+            // A warm store: the memo already holds `anchor -> current`, so the
+            // residual step is empty and nothing below the head is walked.
+            let (warm_store, warm) = open();
+            warm.authenticate_current_history_extension(anchor).unwrap();
+            warm.authenticate_current_history_extension(anchor).unwrap();
+
+            damage_history_node(&node, fault);
+
+            let warm_error = warm
+                .authenticate_current_history_extension(anchor)
+                .expect_err(&format!("a warm store accepted the {fault:?} current root"));
+            drop(warm);
+            drop(warm_store);
+
+            let (fresh_store, fresh) = open();
+            let fresh_error = fresh
+                .authenticate_current_history_extension(anchor)
+                .expect_err(&format!(
+                    "a fresh store accepted the {fault:?} current root"
+                ));
+            assert_eq!(
+                std::mem::discriminant(&warm_error),
+                std::mem::discriminant(&fresh_error),
+                "the {fault:?} current root was rejected differently warm ({warm_error:?}) and \
+                 fresh ({fresh_error:?})"
+            );
+            drop(fresh);
+            drop(fresh_store);
+
+            // Repairing the exact immutable bytes restores the exact verdict.
+            std::fs::write(&node, &pristine).unwrap();
+            let (repaired_store, repaired) = open();
+            assert_eq!(
+                repaired
+                    .authenticate_current_history_extension(anchor)
+                    .unwrap()
+                    .after(),
+                current
+            );
+            drop(repaired);
+            drop(repaired_store);
+        }
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A publication that failed on a missing index node must not leave behind
+    /// a memo that can authorize a later mutation against that storage.
+    #[test]
+    fn incomplete_publication_on_a_lost_index_node_disarms_the_memo() {
+        let root = test_root("publication-failure-disarms-memo");
+        let archive = root.join("archive");
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(50_000));
+        let binding = enrolled_binding(50_010);
+        let store = ObjectStore::open(&archive, workspace).unwrap();
+        let history = store.open_engine_history(binding).unwrap();
+        let node_reads = || store.instrumentation().history_index_reads;
+
+        let anchor = history.current_authority().unwrap();
+        for index in 0..4_usize {
+            history
+                .publish(
+                    spread_history_batch_id(index),
+                    b"publication failure record",
+                    EngineHistoryBinding::empty(),
+                )
+                .unwrap();
+        }
+        let current = history.current_authority().unwrap();
+        history
+            .authenticate_current_history_extension(anchor)
+            .unwrap();
+        let before = node_reads();
+        history
+            .authenticate_current_history_extension(anchor)
+            .unwrap();
+        let warm_step = node_reads() - before;
+
+        // The publication fails because the live root node is gone, which is
+        // exactly a detected history/index I/O failure.
+        let node = history_node_path(&archive, binding, current.index_root);
+        let pristine = std::fs::read(&node).unwrap();
+        std::fs::remove_file(&node).unwrap();
+        assert!(history
+            .publish(
+                spread_history_batch_id(4),
+                b"never committed",
+                EngineHistoryBinding::empty(),
+            )
+            .is_err());
+
+        // While the damage stands, the warm store must reject exactly like a
+        // fresh one, and it may not authorize anything.
+        assert!(history
+            .authenticate_current_history_extension(anchor)
+            .is_err());
+
+        // Even after the exact immutable bytes come back, nothing this open
+        // proved before the failure may be reused as a shortcut: the proof is
+        // re-derived by the complete walk a fresh open would perform.
+        std::fs::write(&node, &pristine).unwrap();
+        let before = node_reads();
+        assert_eq!(
+            history
+                .authenticate_current_history_extension(anchor)
+                .unwrap()
+                .after(),
+            current
+        );
+        let disarmed_step = node_reads() - before;
+        assert!(
+            disarmed_step > warm_step,
+            "a failed publication left a {disarmed_step}-read shortcut over the {warm_step}-read \
+             warm path instead of disarming the memo"
+        );
+
+        drop(history);
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Deeper immutable nodes stay a *previously authenticated* in-memory fact:
+    /// re-reading them on every call is exactly the lifetime-sized work the
+    /// memo exists to remove. The compensating contract is causal — the first
+    /// operation that re-encounters the damage disarms the memo permanently, so
+    /// from that point the warm store decides exactly like a fresh one.
+    #[test]
+    fn deeper_history_node_loss_disarms_the_memo_when_it_is_re_encountered() {
+        let root = test_root("deep-node-loss");
+        let archive = root.join("archive");
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(51_000));
+        let binding = enrolled_binding(51_010);
+        const RECORD: &[u8] = b"deep node loss record";
+        let open = || {
+            let store = ObjectStore::open(&archive, workspace).unwrap();
+            let history = store.open_engine_history(binding).unwrap();
+            (store, history)
+        };
+
+        let (store, history) = open();
+        let node_reads = || store.instrumentation().history_index_reads;
+        let anchor = history.current_authority().unwrap();
+        for index in 0..4_usize {
+            history
+                .publish(
+                    spread_history_batch_id(index),
+                    RECORD,
+                    EngineHistoryBinding::empty(),
+                )
+                .unwrap();
+        }
+        // Warm the memo on the first four records, then extend once more so the
+        // residual `middle -> current` step provably cannot revisit them.
+        history
+            .authenticate_current_history_extension(anchor)
+            .unwrap();
+        history
+            .publish(
+                spread_history_batch_id(4),
+                RECORD,
+                EngineHistoryBinding::empty(),
+            )
+            .unwrap();
+        history
+            .authenticate_current_history_extension(anchor)
+            .unwrap();
+        let current = history.current_authority().unwrap();
+
+        // A record whose radix path leaves the last insertion's path at the
+        // root, so its leaf is outside the residual step by construction.
+        let last_nibble = history_key_nibble(spread_history_batch_id(4).as_uuid().as_bytes(), 0);
+        let doomed = (0..4_usize)
+            .find(|index| {
+                history_key_nibble(spread_history_batch_id(*index).as_uuid().as_bytes(), 0)
+                    != last_nibble
+            })
+            .expect("a record diverging from the last insertion at the root nibble");
+        let leaf = history_node_path(
+            &archive,
+            binding,
+            history_leaf_digest(spread_history_batch_id(doomed), RECORD),
+        );
+        let pristine = std::fs::read(&leaf).unwrap();
+        std::fs::remove_file(&leaf).unwrap();
+
+        // The warm store still accepts: the missing leaf is a fact this open
+        // authenticated earlier and nothing has re-encountered it yet. This is
+        // the documented, bounded residual, and it costs only the constant
+        // live-endpoint revalidation.
+        let before = node_reads();
+        assert_eq!(
+            history
+                .authenticate_current_history_extension(anchor)
+                .unwrap()
+                .after(),
+            current
+        );
+        let warm_step = node_reads() - before;
+        assert!(
+            warm_step <= 2,
+            "the warm step cost {warm_step} reads instead of the constant endpoint revalidation"
+        );
+
+        // Any replay, rebuild or lookup that reaches the damaged region — the
+        // only way its bytes can reach a user or a projection — fails and
+        // latches the fault.
+        let replay_error = history
+            .materialize(current.index_root)
+            .expect_err("a replay over a missing leaf must fail");
+        let warm_error = history
+            .authenticate_current_history_extension(anchor)
+            .expect_err("a re-encountered fault must disarm the memo");
+
+        // A fresh open walks the whole post-anchor history and rejects the same
+        // way, with no memo involved at all.
+        drop(history);
+        drop(store);
+        let (fresh_store, fresh) = open();
+        let fresh_error = fresh
+            .authenticate_current_history_extension(anchor)
+            .expect_err("a fresh store must reject a history with a missing leaf");
+        assert_eq!(
+            std::mem::discriminant(&warm_error),
+            std::mem::discriminant(&fresh_error),
+            "disarmed warm rejection {warm_error:?} differs from the fresh rejection \
+             {fresh_error:?} (replay reported {replay_error:?})"
+        );
+        drop(fresh);
+        drop(fresh_store);
+
+        std::fs::write(&leaf, &pristine).unwrap();
+        let (repaired_store, repaired) = open();
+        assert_eq!(
+            repaired
+                .authenticate_current_history_extension(anchor)
+                .unwrap()
+                .after(),
+            current
+        );
+        drop(repaired);
+        drop(repaired_store);
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// The projection-work caller re-anchors on the head it just accepted, so
@@ -6877,7 +7392,9 @@ mod history_index_tests {
         assert_eq!(exact.after(), fourth);
 
         // Failed publish, crash cut *before* the head swap: the head does not
-        // move, so the memo stays exactly right and re-proving reads nothing.
+        // move, so the verdict is unchanged — but an incomplete publication
+        // disarms the memo, so the same verdict is re-derived by the complete
+        // walk instead of inherited from anything this open proved earlier.
         fail_next_engine_history_head_swap();
         assert!(history
             .publish(
@@ -6896,7 +7413,10 @@ mod history_index_tests {
                 .after(),
             fourth
         );
-        assert_eq!(node_reads(&store) - before, 0);
+        assert!(
+            node_reads(&store) - before > LIVE_ENDPOINT_REVALIDATION_BOUND,
+            "an incomplete publication left the memo armed"
+        );
         drop(history);
         drop(store);
 
