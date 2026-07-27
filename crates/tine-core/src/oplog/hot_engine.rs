@@ -2,6 +2,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{btree_map::Entry, BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
@@ -1521,6 +1522,121 @@ pub(crate) struct BootstrapRecoveryInstrumentation {
     pub(crate) bootstrap_part_reads: usize,
     pub(crate) bootstrap_object_reads: usize,
     pub(crate) max_live_bootstrap_parts: usize,
+}
+
+/// The shared residency ledger behind [`BootstrapRecoveryInstrumentation`].
+///
+/// What it measures is **payload ownership**, not a staging bracket: a part is
+/// counted from the instant recovery takes ownership of the loaded payload
+/// until the wrapper that owns it is dropped. Every increment happens inside
+/// [`BootstrapResidencyLedger::own`] and the only decrement is
+/// [`BootstrapResidency::drop`], so collecting `N` loaded or prepared parts in
+/// a vector — the preload shape the streaming replay must never take — reports
+/// `max_live_bootstrap_parts == N` rather than one.
+#[derive(Debug, Default)]
+struct BootstrapResidencyLedger {
+    live: AtomicUsize,
+    max_live: AtomicUsize,
+    part_reads: AtomicUsize,
+    object_reads: AtomicUsize,
+}
+
+impl BootstrapResidencyLedger {
+    /// Take counted ownership of one payload, charging `object_count` objects.
+    fn own<T>(self: &Arc<Self>, payload: T, object_count: usize) -> ResidentBootstrapPayload<T> {
+        self.part_reads.fetch_add(1, Ordering::Relaxed);
+        self.object_reads.fetch_add(object_count, Ordering::Relaxed);
+        let live = self.live.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+        self.max_live.fetch_max(live, Ordering::Relaxed);
+        ResidentBootstrapPayload {
+            payload,
+            residency: BootstrapResidency {
+                ledger: Arc::clone(self),
+            },
+        }
+    }
+
+    /// Take counted ownership of one freshly loaded immutable bootstrap part.
+    ///
+    /// This is the single entry point for recovery residency: the loaded
+    /// payload is consumed by value here, so the count begins at the instant
+    /// the archive read hands ownership over rather than at any later bracket.
+    fn own_loaded_part(
+        self: &Arc<Self>,
+        loaded: super::object_store::LoadedBootstrapPartV1,
+    ) -> ResidentBootstrapPayload<super::object_store::LoadedBootstrapPartV1> {
+        let object_count = loaded.objects().len();
+        self.own(loaded, object_count)
+    }
+
+    fn snapshot(&self) -> BootstrapRecoveryInstrumentation {
+        BootstrapRecoveryInstrumentation {
+            bootstrap_part_reads: self.part_reads.load(Ordering::Relaxed),
+            bootstrap_object_reads: self.object_reads.load(Ordering::Relaxed),
+            max_live_bootstrap_parts: self.max_live.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Payloads owned right now. Zero once a replay has released everything.
+    fn live(&self) -> usize {
+        self.live.load(Ordering::Relaxed)
+    }
+}
+
+/// One unit of counted bootstrap-payload residency.
+///
+/// It is only ever created by [`BootstrapResidencyLedger::own`] and only ever
+/// released by this `Drop`, so every `?`, early return, error, and unwind path
+/// decrements without a matching call site to forget.
+#[derive(Debug)]
+struct BootstrapResidency {
+    ledger: Arc<BootstrapResidencyLedger>,
+}
+
+impl Drop for BootstrapResidency {
+    fn drop(&mut self) {
+        self.ledger.live.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// A bootstrap recovery payload whose residency is counted while it is owned.
+///
+/// `try_map` moves the *same* residency unit into the transformed wrapper, so
+/// the `LoadedBootstrapPartV1` → `PreparedBatch` conversion neither
+/// double-counts nor opens a gap in which the payload is owned but uncounted.
+#[derive(Debug)]
+struct ResidentBootstrapPayload<T> {
+    payload: T,
+    residency: BootstrapResidency,
+}
+
+impl<T> ResidentBootstrapPayload<T> {
+    fn get(&self) -> &T {
+        &self.payload
+    }
+
+    /// Transform the owned payload, carrying its one residency unit across.
+    ///
+    /// A failing transform drops the payload and its residency together here.
+    fn try_map<U, E>(
+        self,
+        transform: impl FnOnce(T) -> Result<U, E>,
+    ) -> Result<ResidentBootstrapPayload<U>, E> {
+        let Self { payload, residency } = self;
+        Ok(ResidentBootstrapPayload {
+            payload: transform(payload)?,
+            residency,
+        })
+    }
+
+    /// Hand the payload to its final consumer and release residency only after
+    /// that consumer has returned, so staging is inside the counted window.
+    fn consume<R>(self, consume: impl FnOnce(T) -> R) -> R {
+        let Self { payload, residency } = self;
+        let outcome = consume(payload);
+        drop(residency);
+        outcome
+    }
 }
 
 struct DetachedBootstrapScratchRoot {
@@ -3298,10 +3414,10 @@ pub struct ShardedHotEngine {
     // document reloads for those batches read the right immutable bytes
     // without holding any part payload resident.
     bootstrap_parts: Option<RetainedBootstrapParts>,
-    /// Bootstrap part payloads resident right now, and the observed maximum.
-    /// Recovery streams one part at a time, so the maximum must stay at one.
-    live_bootstrap_recovery_parts: usize,
-    bootstrap_recovery: BootstrapRecoveryInstrumentation,
+    /// Ownership-counted residency of this engine's bootstrap recovery replay.
+    /// Recovery streams one part at a time, so the observed maximum number of
+    /// simultaneously owned part payloads must stay at one.
+    bootstrap_residency: Arc<BootstrapResidencyLedger>,
     /// Authenticated offered batches retained only across bounded slices.
     /// Same-process reconstruction deliberately clears this cache and
     /// reauthenticates once before resuming from the durable queue cursor.
@@ -3431,8 +3547,7 @@ impl ShardedHotEngine {
             archive: BTreeMap::new(),
             detached_accepted_manifests: BTreeMap::new(),
             bootstrap_parts: None,
-            live_bootstrap_recovery_parts: 0,
-            bootstrap_recovery: BootstrapRecoveryInstrumentation::default(),
+            bootstrap_residency: Arc::new(BootstrapResidencyLedger::default()),
             bounded_staging_cache: BTreeMap::new(),
             archive_store: None,
             projection_endpoint: None,
@@ -4156,9 +4271,12 @@ impl ShardedHotEngine {
 
     /// Load, authenticate, stage, and release exactly one bootstrap part.
     ///
-    /// Exactly one part payload is resident for the duration of this call and
-    /// none afterwards: the loaded part is moved into the prepared batch rather
-    /// than cloned beside it, and the prepared batch is consumed by staging.
+    /// Residency is counted from payload ownership, not from a staging bracket:
+    /// [`BootstrapResidencyLedger::own_loaded_part`] consumes the archive read's
+    /// return value directly, `try_map` carries that same residency unit into
+    /// the `PreparedBatch`, and `consume` releases it only after staging has
+    /// returned. So exactly one part payload is owned for the whole span in
+    /// which one exists, and none afterwards, on every return path.
     /// `stage_bootstrap_part_for_recovery` still performs the authenticated
     /// cold-record check, so nothing about the replay's generation proofs, its
     /// bootstrap-namespace separation, or its exact multipart ordering changes.
@@ -4176,46 +4294,27 @@ impl ShardedHotEngine {
                 EngineError::Archive("retained bootstrap publication lost a part ordinal".into())
             })?
             .batch_id();
-        let loaded = plan
-            .store
-            .load_bootstrap_part(&plan.publication, ordinal)
-            .map_err(|error| EngineError::Archive(error.to_string()))?;
-        if loaded.manifest().batch_id() != expected {
+        let loaded = self.bootstrap_residency.own_loaded_part(
+            plan.store
+                .load_bootstrap_part(&plan.publication, ordinal)
+                .map_err(|error| EngineError::Archive(error.to_string()))?,
+        );
+        if loaded.get().manifest().batch_id() != expected {
             return Err(EngineError::Archive(
                 "retained bootstrap part does not carry its aggregate batch identity".into(),
             ));
         }
-        if loaded.manifest().lineage_digest() != self.lineage_digest {
+        if loaded.get().manifest().lineage_digest() != self.lineage_digest {
             return Err(EngineError::LineageMismatch {
                 expected: self.lineage_digest,
-                found: loaded.manifest().lineage_digest(),
+                found: loaded.get().manifest().lineage_digest(),
             });
         }
-        let (manifest, objects) = loaded.into_manifest_and_objects();
-        let object_count = objects.len();
-        let prepared = PreparedBatch::new(manifest, objects)?;
-        self.enter_live_bootstrap_recovery_part(object_count);
-        let outcome = self.stage_bootstrap_part_for_recovery(prepared);
-        self.leave_live_bootstrap_recovery_part();
-        outcome
-    }
-
-    /// Account for one bootstrap part payload becoming resident.
-    fn enter_live_bootstrap_recovery_part(&mut self, object_count: usize) {
-        self.live_bootstrap_recovery_parts = self.live_bootstrap_recovery_parts.saturating_add(1);
-        let mut recovery = self.bootstrap_recovery;
-        recovery.bootstrap_part_reads = recovery.bootstrap_part_reads.saturating_add(1);
-        recovery.bootstrap_object_reads =
-            recovery.bootstrap_object_reads.saturating_add(object_count);
-        recovery.max_live_bootstrap_parts = recovery
-            .max_live_bootstrap_parts
-            .max(self.live_bootstrap_recovery_parts);
-        self.bootstrap_recovery = recovery;
-    }
-
-    /// Account for that part payload being consumed and released.
-    fn leave_live_bootstrap_recovery_part(&mut self) {
-        self.live_bootstrap_recovery_parts = self.live_bootstrap_recovery_parts.saturating_sub(1);
+        let prepared = loaded.try_map(|loaded| {
+            let (manifest, objects) = loaded.into_manifest_and_objects();
+            PreparedBatch::new(manifest, objects)
+        })?;
+        prepared.consume(|prepared| self.stage_bootstrap_part_for_recovery(prepared))
     }
 
     /// Observed bootstrap-part residency of this engine's recovery replay.
@@ -4223,10 +4322,45 @@ impl ShardedHotEngine {
     /// The exact counterpart of [`super::sqlite::BootstrapSqliteRebuildInstrumentation`]
     /// for the engine side of a promoted open, so a regression can assert that
     /// the observed maximum is one part rather than the whole publication.
-    pub(crate) const fn bootstrap_recovery_instrumentation(
+    pub(crate) fn bootstrap_recovery_instrumentation(&self) -> BootstrapRecoveryInstrumentation {
+        self.bootstrap_residency.snapshot()
+    }
+
+    /// Test-only proof that the residency ledger measures payload ownership.
+    ///
+    /// It loads every retained bootstrap part through exactly the production
+    /// `own_loaded_part`/`try_map` wrappers and deliberately holds all of them
+    /// at once — the all-parts preload shape the production replay must never
+    /// take. It uses its own ledger, so the engine's production instrumentation
+    /// is untouched, and it returns that ledger's snapshot while everything was
+    /// held together with the live count after releasing it all.
+    ///
+    /// Production recovery never calls this. It exists so the streaming
+    /// regression's fail-before claim is executable: an instrument that only
+    /// bracketed staging would report one part here too.
+    #[cfg(test)]
+    pub(crate) fn probe_preloaded_bootstrap_part_residency(
         &self,
-    ) -> BootstrapRecoveryInstrumentation {
-        self.bootstrap_recovery
+    ) -> Result<(BootstrapRecoveryInstrumentation, usize), EngineError> {
+        let plan = self.retained_bootstrap_recovery_plan()?.ok_or_else(|| {
+            EngineError::Archive("engine retains no bootstrap publication to preload".into())
+        })?;
+        let ledger = Arc::new(BootstrapResidencyLedger::default());
+        let mut held = Vec::with_capacity(plan.part_count);
+        for ordinal in 0..plan.part_count {
+            let loaded = ledger.own_loaded_part(
+                plan.store
+                    .load_bootstrap_part(&plan.publication, ordinal)
+                    .map_err(|error| EngineError::Archive(error.to_string()))?,
+            );
+            held.push(loaded.try_map(|loaded| {
+                let (manifest, objects) = loaded.into_manifest_and_objects();
+                PreparedBatch::new(manifest, objects)
+            })?);
+        }
+        let preloaded = ledger.snapshot();
+        drop(held);
+        Ok((preloaded, ledger.live()))
     }
 
     /// Rebuild every run-local derived structure from the retained
@@ -4295,7 +4429,7 @@ impl ShardedHotEngine {
         // Telemetry is observational rather than continuation authority; keep
         // cumulative work accounting across the reconstructed journey.
         rebuilt.history_work.set(self.history_work.get());
-        rebuilt.bootstrap_recovery = self.bootstrap_recovery;
+        rebuilt.bootstrap_residency = Arc::clone(&self.bootstrap_residency);
         *self = rebuilt;
         Ok(())
     }

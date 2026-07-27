@@ -346,7 +346,7 @@ impl<'de> Deserialize<'de> for CanonicalGraphResourceId {
     }
 }
 
-const ARCHIVE_INSTANCE_CLAIM_FILE: &str = "archive-instance-v1.claim";
+pub(crate) const ARCHIVE_INSTANCE_CLAIM_FILE: &str = "archive-instance-v1.claim";
 const ARCHIVE_INSTANCE_CLAIM_SCHEMA_VERSION: u32 = 1;
 const MAX_ARCHIVE_INSTANCE_CLAIM_BYTES: usize = 256;
 

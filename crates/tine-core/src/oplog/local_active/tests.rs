@@ -14,6 +14,7 @@ use crate::oplog::enrollment::{
 use crate::oplog::hot_engine::{
     ProjectionEndpointBinding, ProjectionStorageBinding, MAX_EPHEMERAL_BLOCK_CLAIMS,
 };
+use crate::oplog::identity::ARCHIVE_INSTANCE_CLAIM_FILE;
 use crate::oplog::import::{
     force_next_bootstrap_part_operation_limit, prepare_inactive_bootstrap_import,
     publish_install_verify_inactive_bootstrap, reopen_inactive_bootstrap_accepted_authority,
@@ -2938,6 +2939,187 @@ fn a_byte_identical_copy_of_a_promoted_archive_is_refused_at_the_state_boundary(
     fixture.assert_graph_unchanged();
 }
 
+/// The promoted-state boundary authenticates the canonical archive-resource
+/// claim, not only the physical archive directory identity.
+///
+/// `a_byte_identical_copy_of_a_promoted_archive_is_refused_at_the_state_boundary`
+/// moves the archive to a new directory, so it can only exercise the
+/// control-directory half of `require_promoted_state_binding`. This is the
+/// residual half: the archive keeps its exact physical directory identity — no
+/// directory is created, moved, or replaced — while its canonical
+/// archive-resource claim goes missing, becomes corrupt, or is replaced by a
+/// different canonical instance claim. Each case must still fail closed inside
+/// `require_promoted_state_binding`, at the resource-claim check specifically,
+/// before any promoted engine, SQLite projection, or replay is constructed, and
+/// without moving the graph, the enrollment, the durable history, or the
+/// committed promotion state.
+#[test]
+fn a_promoted_archive_with_an_unauthenticated_resource_claim_is_refused_at_the_state_boundary() {
+    // Deleted outright.
+    assert_promoted_reopen_refuses_a_tampered_archive_claim("missing", |path| {
+        fs::remove_file(path).unwrap();
+    });
+    // Present and same-length-bounded, but no longer decodable.
+    assert_promoted_reopen_refuses_a_tampered_archive_claim("corrupt", |path| {
+        let mut bytes = fs::read(path).unwrap();
+        bytes.truncate(bytes.len() / 2);
+        assert!(serde_json::from_slice::<serde_json::Value>(&bytes).is_err());
+        fs::write(path, &bytes).unwrap();
+    });
+    // A perfectly well-formed, canonical claim — for a different instance.
+    assert_promoted_reopen_refuses_a_tampered_archive_claim("divergent", |path| {
+        let divergent = divergent_archive_instance_claim(&fs::read(path).unwrap());
+        fs::write(path, &divergent).unwrap();
+    });
+}
+
+/// Rewrite a canonical archive-instance claim to a different instance id.
+///
+/// Only the UUID text is substituted in place, so the result stays exactly as
+/// canonical and schema-valid as the original: what fails is the derived
+/// resource identity, not the encoding.
+fn divergent_archive_instance_claim(bytes: &[u8]) -> Vec<u8> {
+    let text = std::str::from_utf8(bytes).expect("the archive instance claim is canonical JSON");
+    const MARKER: &str = "\"instance_id\":\"";
+    let start = text.find(MARKER).expect("the claim carries an instance id") + MARKER.len();
+    let end = start + 36;
+    text[start..end]
+        .parse::<Uuid>()
+        .expect("the claimed instance id is a UUID");
+    let replacement = Uuid::new_v4().to_string();
+    assert_eq!(replacement.len(), 36);
+    let divergent = format!("{}{replacement}{}", &text[..start], &text[end..]).into_bytes();
+    assert_ne!(divergent, bytes);
+    assert_eq!(divergent.len(), bytes.len());
+    divergent
+}
+
+/// Durable byte identity of one promoted device-local SQLite projection.
+///
+/// The volatile `-shm` sidecar is deliberately excluded, exactly as
+/// [`durable_sqlite_digests`] does; everything committed lives in the database
+/// file and its write-ahead log.
+fn promoted_projection_digests(database_path: &Path) -> BTreeMap<String, ContentDigest> {
+    let mut digests = BTreeMap::new();
+    for suffix in ["", "-wal"] {
+        let path = PathBuf::from(format!("{}{suffix}", database_path.display()));
+        if let Ok(bytes) = fs::read(&path) {
+            digests.insert(suffix.to_owned(), ContentDigest::of(&bytes));
+        }
+    }
+    digests
+}
+
+/// Promote, prove the untampered reopen works, then tamper only the canonical
+/// archive-resource claim and prove the same reopen fails closed and inert.
+fn assert_promoted_reopen_refuses_a_tampered_archive_claim(
+    label: &str,
+    tamper: impl FnOnce(&Path),
+) {
+    let mut fixture = Fixture::new(
+        &format!("promote-claim-{label}"),
+        None,
+        vec![(
+            format!("pages/{label}.md").into(),
+            format!("- {label} claim\n").into_bytes(),
+        )],
+    );
+    let root = fixture.enrollment_root(&format!("promote-claim-{label}"));
+    let binding = fixture.enrollment_binding();
+    let paths = PromotedPaths::new(&fixture, label);
+    let session = SessionId::new();
+    let (authority, runtime) = promote(&mut fixture, &root, session, &paths);
+    drop(runtime);
+    drop(authority);
+
+    // Necessity gate: this exact reopen succeeds while the claim is intact, so
+    // the refusals below are caused by the tampered claim and nothing else.
+    let (control_authority, control_runtime) =
+        reopen_promoted_local_runtime(&root, &binding, session, &paths.open(&fixture)).unwrap();
+    drop(control_runtime);
+    drop(control_authority);
+
+    let claim_path = fixture.archive_root.join(ARCHIVE_INSTANCE_CLAIM_FILE);
+    assert!(
+        claim_path.is_file(),
+        "a promoted archive must carry its canonical resource claim at {}",
+        claim_path.display()
+    );
+    tamper(&claim_path);
+
+    // Everything the refused reopen must leave exactly as it found it, sampled
+    // after the tamper so only the reopen's own effects can move it.
+    let archive_before = snapshot_file_digests(&fixture.archive_root);
+    let projection_before = promoted_projection_digests(&paths.database_path);
+    assert!(
+        !projection_before.is_empty(),
+        "the promoted projection must exist before the refused reopen"
+    );
+    let enrollment_before = enrollment_head(&root, &binding);
+    let generation_before = enrollment_generation(&root, &binding);
+    let promotion_state_before = fs::read(promotion_state_path(&fixture)).unwrap();
+
+    let error = reopen_promoted_local_runtime(&root, &binding, session, &paths.open(&fixture))
+        .err()
+        .unwrap_or_else(|| {
+            panic!("a {label} archive-resource claim must never authorize a promoted reopen")
+        });
+    // The control-directory check runs first and passed — the directory identity
+    // is genuinely unchanged — so the refusal is the resource-claim check.
+    assert!(
+        matches!(
+            &error,
+            RuntimePromotionError::Store(crate::oplog::StoreError::PromotedRuntimeStateMismatch(
+                message
+            )) if *message == "promoted runtime state archive resource claim does not authenticate"
+        ),
+        "the {label} claim must be refused at the promoted-state resource-claim check: {error}"
+    );
+
+    // Nothing may have moved: not the archive's durable history, not the
+    // committed promotion state, not the enrollment, not the device-local
+    // projection, and not Martin's graph.
+    assert_eq!(
+        snapshot_file_digests(&fixture.archive_root),
+        archive_before,
+        "the refused reopen must leave the {label} archive byte-identical"
+    );
+    assert_eq!(
+        fs::read(promotion_state_path(&fixture)).unwrap(),
+        promotion_state_before,
+        "the committed promotion state must survive the {label} refusal as evidence"
+    );
+    assert_eq!(
+        promoted_projection_digests(&paths.database_path),
+        projection_before
+    );
+    assert_eq!(enrollment_head(&root, &binding), enrollment_before);
+    assert_eq!(enrollment_generation(&root, &binding), generation_before);
+    fixture.assert_graph_unchanged();
+
+    // The refusal precedes construction, not merely mutation: pointed at a
+    // never-used runtime root and database path, the same call still fails and
+    // creates no projection at all.
+    let fresh = PromotedPaths::new(&fixture, &format!("{label}-unbuilt"));
+    let fresh_error =
+        reopen_promoted_local_runtime(&root, &binding, session, &fresh.open(&fixture))
+            .err()
+            .unwrap_or_else(|| {
+                panic!("a {label} archive-resource claim must never build a runtime")
+            });
+    assert!(matches!(
+        fresh_error,
+        RuntimePromotionError::Store(crate::oplog::StoreError::PromotedRuntimeStateMismatch(_))
+    ));
+    assert!(
+        !fresh.database_path.exists(),
+        "no SQLite projection may be constructed for the {label} refusal"
+    );
+    assert_eq!(snapshot_file_digests(&fixture.archive_root), archive_before);
+    assert_eq!(enrollment_head(&root, &binding), enrollment_before);
+    fixture.assert_graph_unchanged();
+}
+
 /// Promoted recovery replays its immutable bootstrap parts one at a time.
 ///
 /// Restart resident memory must be one bootstrap part, not the whole graph, so
@@ -2945,9 +3127,16 @@ fn a_byte_identical_copy_of_a_promoted_archive_is_refused_at_the_state_boundary(
 /// genuinely multi-part publication — on the same-process promoted open and
 /// again on a fresh-process reopen that holds no retained evidence at all.
 ///
+/// The counter measures payload *ownership*, not a staging bracket, and this
+/// test proves that executably rather than by assertion: the test-only preload
+/// probe holds every loaded/prepared part at once through exactly the
+/// production residency wrappers and must observe `max_live == part_count`,
+/// while the production replay of the same publication observes exactly one.
+///
 /// Fail-before: recovery built a `Vec<PreparedBatch>` containing every part and
 /// all of its objects before staging any of them, so the observed maximum was
-/// the whole part count.
+/// the whole part count. The probe reproduces exactly that shape on demand, so
+/// an instrument that could not see it would fail here.
 #[test]
 fn promoted_recovery_streams_exactly_one_bootstrap_part_at_a_time() {
     // Two operations per part over a six-operation graph partitions into
@@ -2994,6 +3183,41 @@ fn promoted_recovery_streams_exactly_one_bootstrap_part_at_a_time() {
         "at most one bootstrap part payload may be resident at a time"
     );
 
+    // The instrument itself is exercised against the forbidden shape. Holding
+    // every loaded/prepared part at once reads the exact same parts and the
+    // exact same objects as the streaming replay — only ownership overlaps
+    // differ — so the residency counter is what separates the two, not the
+    // accounting of reads.
+    let (preloaded, live_after_release) = runtime
+        .engine()
+        .probe_preloaded_bootstrap_part_residency()
+        .unwrap();
+    assert_eq!(
+        preloaded.bootstrap_part_reads, same_process.bootstrap_part_reads,
+        "the preload probe must read exactly the parts the replay reads"
+    );
+    assert_eq!(
+        preloaded.bootstrap_object_reads, same_process.bootstrap_object_reads,
+        "the preload probe must read exactly the objects the replay reads"
+    );
+    assert_eq!(
+        preloaded.max_live_bootstrap_parts, part_count,
+        "holding every prepared part at once must be visible as {part_count} resident parts"
+    );
+    assert!(
+        preloaded.max_live_bootstrap_parts > same_process.max_live_bootstrap_parts,
+        "the streaming replay must own strictly fewer parts at once than a preload"
+    );
+    assert_eq!(
+        live_after_release, 0,
+        "dropping the owned payloads must release every counted residency"
+    );
+    // The probe must not have disturbed the engine's own instrumentation.
+    assert_eq!(
+        runtime.engine().bootstrap_recovery_instrumentation(),
+        same_process
+    );
+
     // A restarted process reconstructs everything from durable state; the same
     // residency bound must hold on that path too.
     drop(runtime);
@@ -3003,6 +3227,16 @@ fn promoted_recovery_streams_exactly_one_bootstrap_part_at_a_time() {
     let fresh_process = reopened.engine().bootstrap_recovery_instrumentation();
     assert_eq!(fresh_process, same_process);
     assert_eq!(fresh_process.max_live_bootstrap_parts, 1);
+    let (fresh_preloaded, fresh_live_after_release) = reopened
+        .engine()
+        .probe_preloaded_bootstrap_part_residency()
+        .unwrap();
+    assert_eq!(fresh_preloaded, preloaded);
+    assert_eq!(fresh_live_after_release, 0);
+    assert_eq!(
+        reopened.engine().bootstrap_recovery_instrumentation(),
+        fresh_process
+    );
     fixture.assert_graph_unchanged();
 }
 
