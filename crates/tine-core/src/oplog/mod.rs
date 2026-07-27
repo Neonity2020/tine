@@ -67,6 +67,11 @@ pub mod simulator;
 pub mod sqlite;
 pub mod sqlite_materialization;
 pub(crate) mod uuid_claim_index;
+// P2N9 W5a owns the graph-text watcher event queue inside the core so its drain
+// becomes provable. It is deliberately not wired to LocalActive, enrollment,
+// startup, or Tauri: this packet only builds the primitive and its proof.
+#[allow(dead_code)]
+pub(crate) mod watcher_queue;
 
 pub use crate::graph_text_scope::{
     GraphTextScopeBinding, GraphTextScopeBindingError, GRAPH_TEXT_SCOPE_BINDING_SCHEMA_VERSION,
