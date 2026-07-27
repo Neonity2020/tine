@@ -369,6 +369,11 @@ pub(crate) struct DurableEngineHistoryStore {
     /// only through [`ObjectStore::seal_promoted_projection`]. While it is
     /// `None`, a bootstrap-bound history stays read-only.
     promoted_lineage: Option<PromotedRuntimeStateV1>,
+    /// Store-private, process-local memo of insertion-only transitions *this
+    /// exact open* already authenticated. See
+    /// [`Self::authenticate_current_history_extension`]; it is an accelerator
+    /// for the walk, never an authority of its own.
+    authenticated_transitions: Mutex<Vec<AuthenticatedEngineHistoryTransition>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -705,6 +710,12 @@ impl AuthenticatedEngineHistoryTransition {
         Self { before, after }
     }
 }
+
+/// How many distinct anchors one open memoizes transitions for. A promoted
+/// runtime revalidates from exactly one immutable bootstrap anchor, so this
+/// only needs headroom for an incidental second caller; the memo must stay a
+/// couple of pointer-sized pairs, not a history cache.
+const MAX_AUTHENTICATED_TRANSITION_ANCHORS: usize = 4;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -3682,6 +3693,7 @@ impl DurableEngineHistoryStore {
             transition: Mutex::new(()),
             authoritative_head: Mutex::new(None),
             promoted_lineage: None,
+            authenticated_transitions: Mutex::new(Vec::new()),
         };
         let (digest, root) = store.read_live_head_root()?;
         store.require_root_binding(&root)?;
@@ -3716,6 +3728,7 @@ impl DurableEngineHistoryStore {
             transition: Mutex::new(()),
             authoritative_head: Mutex::new(None),
             promoted_lineage: None,
+            authenticated_transitions: Mutex::new(Vec::new()),
         };
         store.initialize()?;
         Ok(store)
@@ -3738,6 +3751,20 @@ impl DurableEngineHistoryStore {
     /// immutable radix structure. Equal subtrees terminate immediately, so a
     /// normal point append is bounded by the changed radix paths rather than
     /// the lifetime history size.
+    ///
+    /// A promoted runtime proves every admission from one immutable bootstrap
+    /// anchor, so the anchor falls further behind the head with each batch and
+    /// the walk from that anchor grows with the post-anchor history. This open
+    /// therefore memoizes the transitions it already proved and, when one of
+    /// them starts at exactly this `before`, authenticates only the residual
+    /// `middle -> current` step and composes.
+    ///
+    /// The memo is deliberately *transparent*: composition is attempted first
+    /// and a failed residual step falls through to the complete
+    /// `before -> current` walk, so the accepted/rejected outcome is exactly
+    /// the one the uncached walk produces. That is what makes the accelerator
+    /// safe rather than merely fast — see
+    /// [`Self::compose_cached_history_extension`].
     pub(crate) fn authenticate_current_history_extension(
         &self,
         before: EngineHistoryAuthority,
@@ -3746,16 +3773,115 @@ impl DurableEngineHistoryStore {
         if (before.generation == 0) != (before.index_root == EngineHistoryStore::empty_root()) {
             return Err(StoreError::MalformedHistoryIndex);
         }
-        let added = self.insertion_only_added_records(before.index_root, after.index_root, 0)?;
-        if before
+        let proof = match self.compose_cached_history_extension(before, after) {
+            Some(composed) => composed,
+            None => {
+                let added =
+                    self.insertion_only_added_records(before.index_root, after.index_root, 0)?;
+                if before
+                    .generation
+                    .checked_add(added)
+                    .filter(|generation| *generation == after.generation)
+                    .is_none()
+                {
+                    return Err(StoreError::MalformedHistoryIndex);
+                }
+                AuthenticatedEngineHistoryTransition { before, after }
+            }
+        };
+        self.remember_authenticated_history_extension(proof);
+        Ok(proof)
+    }
+
+    /// Compose a memoized `before -> middle` proof with a freshly walked
+    /// `middle -> current` step.
+    ///
+    /// Soundness. A memo entry is only ever minted by
+    /// [`Self::authenticate_current_history_extension`] on this exact store, so
+    /// it carries this store's own proof that `middle`'s record set contains
+    /// `before`'s with identical leaves on shared keys and that
+    /// `before.generation + (|middle| - |before|) == middle.generation`. The
+    /// residual step proves the same two facts for `middle -> current` with the
+    /// identical walk and the identical exact-generation equality. Structural
+    /// containment with agreeing leaves is transitive, and the two exact
+    /// equalities telescope to
+    /// `before.generation + (|current| - |before|) == current.generation`
+    /// without overflow, because every intermediate sum is bounded by
+    /// `current.generation`. Composition therefore establishes precisely what
+    /// the direct `before -> current` walk establishes — including its
+    /// rollback, divergence and missing-leaf rejections, which are exactly the
+    /// walk's failures on the residual step.
+    ///
+    /// Staleness. The memo records a fact about immutable content-addressed
+    /// radix nodes, not a claim about the live head, so it cannot decay: no
+    /// publish, failed publish, head replacement or history failure can make a
+    /// once-true structural containment false. The live `current` is re-read on
+    /// every call and the residual step is always freshly walked and
+    /// digest-verified, so a memo that no longer lies on the live lineage can
+    /// only fail to compose. Returning `None` on any such failure hands the
+    /// decision back to the complete walk, so the memo can neither turn a
+    /// rejection into an acceptance nor an acceptance into a rejection. This is
+    /// why correctness needs no invalidation hook on the publish, head-swap or
+    /// reopen paths; a reopened store simply starts with an empty memo and pays
+    /// the full walk once.
+    fn compose_cached_history_extension(
+        &self,
+        before: EngineHistoryAuthority,
+        after: EngineHistoryAuthority,
+    ) -> Option<AuthenticatedEngineHistoryTransition> {
+        let middle = self.cached_history_extension(before)?;
+        let added = self
+            .insertion_only_added_records(middle.index_root, after.index_root, 0)
+            .ok()?;
+        middle
             .generation
             .checked_add(added)
-            .filter(|generation| *generation == after.generation)
-            .is_none()
-        {
-            return Err(StoreError::MalformedHistoryIndex);
+            .filter(|generation| *generation == after.generation)?;
+        Some(AuthenticatedEngineHistoryTransition { before, after })
+    }
+
+    /// The furthest endpoint this store proved from exactly this anchor.
+    ///
+    /// Both anchor fields must match exactly; a substituted generation or index
+    /// root simply misses the memo and is decided by the full walk.
+    fn cached_history_extension(
+        &self,
+        before: EngineHistoryAuthority,
+    ) -> Option<EngineHistoryAuthority> {
+        let cache = self.authenticated_transitions.lock().ok()?;
+        cache
+            .iter()
+            .find(|entry| entry.before == before)
+            .map(|entry| entry.after)
+    }
+
+    /// Retain the proof so the next admission from the same anchor only has to
+    /// walk the records published after it.
+    ///
+    /// One entry per anchor and at most
+    /// [`MAX_AUTHENTICATED_TRANSITION_ANCHORS`] anchors, evicted least-recently
+    /// proved first. The recency order matters: the projection-work caller
+    /// re-anchors on the head it just accepted, so it presents a *fresh* anchor
+    /// every batch, while the promoted-runtime caller keeps proving from one
+    /// immutable bootstrap anchor. Plain insertion order would let the moving
+    /// anchor evict the fixed one within a few batches and restore exactly the
+    /// growth this memo exists to remove; re-seating an anchor on every
+    /// successful proof keeps the repeatedly used one resident. Only a proof
+    /// this store just minted is recorded, so a rejected transition can neither
+    /// enter the memo nor churn it. A poisoned memo lock degrades to no memo,
+    /// never to a weaker proof.
+    fn remember_authenticated_history_extension(
+        &self,
+        proof: AuthenticatedEngineHistoryTransition,
+    ) {
+        let Ok(mut cache) = self.authenticated_transitions.lock() else {
+            return;
+        };
+        cache.retain(|entry| entry.before != proof.before);
+        if cache.len() >= MAX_AUTHENTICATED_TRANSITION_ANCHORS {
+            cache.remove(0);
         }
-        Ok(AuthenticatedEngineHistoryTransition { before, after })
+        cache.push(proof);
     }
 
     fn insertion_only_added_records(
@@ -6527,6 +6653,452 @@ mod history_index_tests {
 
         drop(rollback_history);
         drop(rollback_store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Deterministic, well-spread batch identifiers. Multiplying by an odd
+    /// constant is a bijection modulo 2^128, so every index yields a distinct
+    /// key, and the high bits vary so the radix keys branch like real batch
+    /// identifiers instead of sharing one long synthetic prefix.
+    fn spread_history_batch_id(index: usize) -> BatchId {
+        BatchId::from_uuid(Uuid::from_u128(
+            0x9E37_79B9_7F4A_7C15_F39C_C060_5CED_C835_u128.wrapping_mul(index as u128 + 1),
+        ))
+    }
+
+    /// One radix insertion touches `ENGINE_HISTORY_RADIX_DEPTH + 1` nodes. A
+    /// residual `middle -> current` diff walk reads at most one such path on
+    /// each side before it either terminates on an equal subtree or counts the
+    /// single newly inserted record, so a memoized incremental step can never
+    /// exceed twice one insertion path — whatever the post-anchor history size.
+    const INCREMENTAL_STEP_BOUND: usize = 2 * (ENGINE_HISTORY_RADIX_DEPTH as usize + 1);
+
+    #[test]
+    fn authenticated_history_extension_revalidation_is_bounded_per_step() {
+        fn node_reads(store: &ObjectStore) -> usize {
+            store.instrumentation().history_index_reads
+        }
+
+        let mut full_walks = Vec::new();
+        for (run, size) in [1_usize, 1_000, 10_000].into_iter().enumerate() {
+            let root = test_root(&format!("bounded-revalidation-{size}"));
+            let archive = root.join("archive");
+            let workspace = WorkspaceId::from_uuid(Uuid::from_u128(46_000 + run as u128));
+            let binding = enrolled_binding(46_100 + run as u128 * 10);
+            let store = ObjectStore::open(&archive, workspace).unwrap();
+            let history = store.open_engine_history(binding).unwrap();
+            let anchor = history.current_authority().unwrap();
+
+            let mut bootstrap_step = 0_usize;
+            let mut worst_incremental_step = 0_usize;
+            for index in 0..size {
+                history
+                    .publish(
+                        spread_history_batch_id(index),
+                        b"bounded revalidation record",
+                        EngineHistoryBinding::empty(),
+                    )
+                    .unwrap();
+                let before = node_reads(&store);
+                let proof = history
+                    .authenticate_current_history_extension(anchor)
+                    .unwrap();
+                let step = node_reads(&store) - before;
+                assert_eq!(proof.before(), anchor);
+                assert_eq!(proof.after().generation, index as u64 + 1);
+                if index == 0 {
+                    bootstrap_step = step;
+                } else {
+                    worst_incremental_step = worst_incremental_step.max(step);
+                    assert!(
+                        step <= INCREMENTAL_STEP_BOUND,
+                        "post-anchor record {index} of {size} revalidated with {step} node reads"
+                    );
+                }
+            }
+
+            // The very first proof from the immutable anchor is the one full
+            // walk, and at post-anchor size 1 it is literally one radix
+            // insertion path.
+            assert_eq!(bootstrap_step, ENGINE_HISTORY_RADIX_DEPTH as usize + 1);
+
+            // Re-proving an unchanged head from the same anchor is pure
+            // composition against an already-proved endpoint: no node is read
+            // at all.
+            let before = node_reads(&store);
+            let repeated = history
+                .authenticate_current_history_extension(anchor)
+                .unwrap();
+            assert_eq!(node_reads(&store) - before, 0);
+            assert_eq!(repeated.after().generation, size as u64);
+
+            // A fresh open holds no memo and must pay the complete anchor ->
+            // head walk, which visits every post-anchor record.
+            drop(history);
+            drop(store);
+            let reopened_store = ObjectStore::open(&archive, workspace).unwrap();
+            let reopened = reopened_store.open_engine_history(binding).unwrap();
+            let before = node_reads(&reopened_store);
+            let full = reopened
+                .authenticate_current_history_extension(anchor)
+                .unwrap();
+            let full_walk = node_reads(&reopened_store) - before;
+            assert_eq!(full.before(), anchor);
+            assert_eq!(full.after().generation, size as u64);
+            assert!(
+                full_walk >= size,
+                "a fresh full proof of {size} post-anchor records read only {full_walk} nodes"
+            );
+            let before = node_reads(&reopened_store);
+            reopened
+                .authenticate_current_history_extension(anchor)
+                .unwrap();
+            assert_eq!(node_reads(&reopened_store) - before, 0);
+
+            if size >= 1_000 {
+                assert!(
+                    full_walk >= 100 * worst_incremental_step,
+                    "full walk {full_walk} is not dominated by the {worst_incremental_step}-read \
+                     incremental step at size {size}"
+                );
+            }
+            full_walks.push(full_walk);
+
+            drop(reopened);
+            drop(reopened_store);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+
+        // The unmemoized proof cost tracks the post-anchor history — which is
+        // exactly the growth the memo removes from every step above.
+        assert!(
+            full_walks[2] >= 5 * full_walks[1],
+            "full-walk cost {full_walks:?} did not scale with the post-anchor history"
+        );
+    }
+
+    /// The projection-work caller re-anchors on the head it just accepted, so
+    /// it presents a different anchor every batch while the promoted-runtime
+    /// caller keeps proving from one immutable bootstrap anchor. The bounded
+    /// memo must not let the moving anchor evict the fixed one.
+    #[test]
+    fn authenticated_history_extension_memo_keeps_the_reused_anchor_resident() {
+        let root = test_root("memo-anchor-residency");
+        let archive = root.join("archive");
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(48_000));
+        let binding = enrolled_binding(48_010);
+        let store = ObjectStore::open(&archive, workspace).unwrap();
+        let history = store.open_engine_history(binding).unwrap();
+        let node_reads = || store.instrumentation().history_index_reads;
+
+        let fixed_anchor = history.current_authority().unwrap();
+        let mut moving_anchor = fixed_anchor;
+        for index in 0..200_usize {
+            history
+                .publish(
+                    spread_history_batch_id(index),
+                    b"anchor residency record",
+                    EngineHistoryBinding::empty(),
+                )
+                .unwrap();
+            // The moving anchor introduces a brand-new memo entry every batch.
+            history
+                .authenticate_current_history_extension(moving_anchor)
+                .unwrap();
+            moving_anchor = history.current_authority().unwrap();
+
+            let before = node_reads();
+            let fixed = history
+                .authenticate_current_history_extension(fixed_anchor)
+                .unwrap();
+            let step = node_reads() - before;
+            assert_eq!(fixed.after(), moving_anchor);
+            if index > 0 {
+                assert!(
+                    step <= INCREMENTAL_STEP_BOUND,
+                    "the reused anchor was evicted at batch {index}: {step} node reads"
+                );
+            }
+        }
+
+        drop(history);
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn authenticated_history_extension_memo_preserves_every_rejection() {
+        let root = test_root("memo-preserves-rejection");
+        let archive = root.join("archive");
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(47_000));
+        let binding = enrolled_binding(47_010);
+        let head_file = archive
+            .join(ENGINE_HISTORY_DIR)
+            .join(binding.endpoint.endpoint_id.to_string())
+            .join(ENGINE_HISTORY_HEAD_FILE);
+        let read_head = || std::fs::read(&head_file).unwrap();
+        let open = || {
+            let store = ObjectStore::open(&archive, workspace).unwrap();
+            let history = store.open_engine_history(binding).unwrap();
+            (store, history)
+        };
+        let node_reads = |store: &ObjectStore| store.instrumentation().history_index_reads;
+
+        // Lineage A, built on one store whose memo is warmed from two anchors
+        // by the ordinary publish-then-revalidate loop.
+        let (store, history) = open();
+        let empty_head = read_head();
+        let anchor = history.current_authority().unwrap();
+        let mut lineage_a = Vec::new();
+        for index in 0..4_usize {
+            history
+                .publish(
+                    spread_history_batch_id(index),
+                    b"lineage a record",
+                    EngineHistoryBinding::empty(),
+                )
+                .unwrap();
+            lineage_a.push(history.current_authority().unwrap());
+            history
+                .authenticate_current_history_extension(anchor)
+                .unwrap();
+            history
+                .authenticate_current_history_extension(lineage_a[0])
+                .unwrap();
+        }
+        let (first, third, fourth) = (lineage_a[0], lineage_a[2], lineage_a[3]);
+        let head_fourth = read_head();
+
+        // An exact self-transition against a warm memo stays exact.
+        let exact = history
+            .authenticate_current_history_extension(fourth)
+            .unwrap();
+        assert_eq!(exact.before(), fourth);
+        assert_eq!(exact.after(), fourth);
+
+        // Failed publish, crash cut *before* the head swap: the head does not
+        // move, so the memo stays exactly right and re-proving reads nothing.
+        fail_next_engine_history_head_swap();
+        assert!(history
+            .publish(
+                spread_history_batch_id(4),
+                b"never committed",
+                EngineHistoryBinding::empty(),
+            )
+            .is_err());
+        assert_eq!(read_head(), head_fourth);
+        assert_eq!(history.current_authority().unwrap(), fourth);
+        let before = node_reads(&store);
+        assert_eq!(
+            history
+                .authenticate_current_history_extension(first)
+                .unwrap()
+                .after(),
+            fourth
+        );
+        assert_eq!(node_reads(&store) - before, 0);
+        drop(history);
+        drop(store);
+
+        // Failed publish, crash cut *after* the head swap: the record is
+        // durable even though the call returned an error. The next open must
+        // authenticate the advanced head from the same anchor.
+        let (store, history) = open();
+        fail_next_engine_history_after_head_swap();
+        assert!(history
+            .publish(
+                spread_history_batch_id(4),
+                b"committed under a failed publish",
+                EngineHistoryBinding::empty(),
+            )
+            .is_err());
+        let head_fifth = read_head();
+        assert_ne!(head_fifth, head_fourth);
+        drop(history);
+        drop(store);
+
+        let (store, history) = open();
+        let fifth = history.current_authority().unwrap();
+        assert_eq!(fifth.generation, 5);
+        let advanced = history
+            .authenticate_current_history_extension(first)
+            .unwrap();
+        assert_eq!(advanced.before(), first);
+        assert_eq!(advanced.after(), fifth);
+        drop(history);
+        drop(store);
+
+        // A divergent lineage B of the same and then greater length, published
+        // over a head that was replaced back to the empty authority.
+        let (store, history) = open();
+        std::fs::write(&head_file, &empty_head).unwrap();
+        let mut lineage_b = Vec::new();
+        let mut heads_b = Vec::new();
+        for index in 0..6_usize {
+            history
+                .publish(
+                    spread_history_batch_id(1_000 + index),
+                    b"lineage b record",
+                    EngineHistoryBinding::empty(),
+                )
+                .unwrap();
+            lineage_b.push(history.current_authority().unwrap());
+            heads_b.push(read_head());
+        }
+        let divergent_equal = lineage_b[4];
+        let divergent_longer = lineage_b[5];
+        assert_eq!(divergent_equal.generation, fifth.generation);
+        assert_eq!(divergent_longer.generation, fifth.generation + 1);
+        drop(history);
+        drop(store);
+
+        // The adversarial phase runs on one store that never publishes, so it
+        // follows the live head while keeping the memo it warmed.
+        let (store, history) = open();
+        std::fs::write(&head_file, &head_fifth).unwrap();
+        assert_eq!(history.current_authority().unwrap(), fifth);
+        let before = node_reads(&store);
+        assert_eq!(
+            history
+                .authenticate_current_history_extension(first)
+                .unwrap()
+                .after(),
+            fifth
+        );
+        assert!(
+            node_reads(&store) - before > 0,
+            "a fresh open must pay the full walk once"
+        );
+        assert_eq!(
+            history
+                .authenticate_current_history_extension(third)
+                .unwrap()
+                .after(),
+            fifth
+        );
+
+        // Head replacement: rollback. The memo holds `first -> fifth` and
+        // `third -> fifth`, and neither may survive the retreat as a proof
+        // about `fifth` itself.
+        std::fs::write(&head_file, &head_fourth).unwrap();
+        assert!(matches!(
+            history.authenticate_current_history_extension(fifth),
+            Err(StoreError::MalformedHistoryIndex)
+        ));
+        // A still-valid ancestor anchor is still accepted, even though its warm
+        // memo endpoint is now ahead of the live head: a stale memo may only
+        // fail to compose, never turn an acceptance into a rejection.
+        assert_eq!(
+            history
+                .authenticate_current_history_extension(first)
+                .unwrap()
+                .after(),
+            fourth
+        );
+
+        // Head replacement: equal-generation divergence.
+        std::fs::write(&head_file, &heads_b[4]).unwrap();
+        assert_eq!(history.current_authority().unwrap(), divergent_equal);
+        assert!(matches!(
+            history.authenticate_current_history_extension(fifth),
+            Err(StoreError::MalformedHistoryIndex)
+        ));
+        // Cached-middle substitution: `fourth` and `fifth` are exactly the
+        // endpoints the memo holds for `first` and `third`, and they are what
+        // an attacker would want spliced in to reach the divergent head.
+        // Neither composition nor the fallback walk can manufacture that proof.
+        assert!(matches!(
+            history.authenticate_current_history_extension(first),
+            Err(StoreError::MalformedHistoryIndex)
+        ));
+        assert!(matches!(
+            history.authenticate_current_history_extension(third),
+            Err(StoreError::MalformedHistoryIndex)
+        ));
+
+        // Head replacement: higher-generation non-descendant.
+        std::fs::write(&head_file, &heads_b[5]).unwrap();
+        assert_eq!(history.current_authority().unwrap(), divergent_longer);
+        assert!(matches!(
+            history.authenticate_current_history_extension(fifth),
+            Err(StoreError::MalformedHistoryIndex)
+        ));
+        assert!(matches!(
+            history.authenticate_current_history_extension(first),
+            Err(StoreError::MalformedHistoryIndex)
+        ));
+
+        // Substituted anchors — a real generation paired with another real
+        // index root — miss the memo and are rejected by the full walk.
+        for substituted in [
+            EngineHistoryAuthority {
+                generation: third.generation,
+                index_root: first.index_root,
+            },
+            EngineHistoryAuthority {
+                generation: first.generation,
+                index_root: fifth.index_root,
+            },
+            EngineHistoryAuthority {
+                generation: fifth.generation,
+                index_root: lineage_b[0].index_root,
+            },
+        ] {
+            assert!(matches!(
+                history.authenticate_current_history_extension(substituted),
+                Err(StoreError::MalformedHistoryIndex)
+            ));
+        }
+        // A `before` whose generation and root disagree about emptiness is
+        // rejected outright, memo or not.
+        assert!(matches!(
+            history.authenticate_current_history_extension(EngineHistoryAuthority {
+                generation: 0,
+                index_root: first.index_root,
+            }),
+            Err(StoreError::MalformedHistoryIndex)
+        ));
+
+        // Head replacement: rollback below a non-empty anchor.
+        std::fs::write(&head_file, &empty_head).unwrap();
+        assert!(matches!(
+            history.authenticate_current_history_extension(first),
+            Err(StoreError::MalformedHistoryIndex)
+        ));
+        drop(history);
+        drop(store);
+
+        // Fresh store: no memo survives the open, the first proof pays the
+        // complete walk, and every verdict above is reproduced without it.
+        std::fs::write(&head_file, &heads_b[5]).unwrap();
+        let (store, history) = open();
+        let before = node_reads(&store);
+        let fresh = history
+            .authenticate_current_history_extension(lineage_b[0])
+            .unwrap();
+        assert!(node_reads(&store) - before > 0);
+        assert_eq!(fresh.before(), lineage_b[0]);
+        assert_eq!(fresh.after(), divergent_longer);
+        for rejected in [first, third, fourth, fifth] {
+            assert!(matches!(
+                history.authenticate_current_history_extension(rejected),
+                Err(StoreError::MalformedHistoryIndex)
+            ));
+        }
+        drop(history);
+        drop(store);
+
+        std::fs::write(&head_file, &head_fourth).unwrap();
+        let (store, history) = open();
+        let before = node_reads(&store);
+        let reproved = history
+            .authenticate_current_history_extension(first)
+            .unwrap();
+        assert!(node_reads(&store) - before > 0);
+        assert_eq!(reproved.after(), fourth);
+
+        drop(history);
+        drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }
 
