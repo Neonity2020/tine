@@ -17,19 +17,27 @@
 //!   state moves. Epochs additionally carry a process-unique queue identity, so
 //!   a second queue's acknowledgement can never settle this queue's work.
 //! * **Bounded intake.** Exact [`ManagedPath`] hints are retained while they fit
-//!   the configured count and byte limits. Anything that does not fit — and
-//!   every notify error, unknown path, or rescan request — collapses into one
-//!   uncertain full-scan requirement. Work is never dropped; it is only ever
-//!   made coarser.
-//! * **Epochs.** One monotonic sequence counts intake. A drain is stamped with
-//!   the sequence it actually covers, and an acknowledgement is accepted only
-//!   for the exact in-flight work epoch. Anything enqueued during the drain
-//!   lands past that epoch, so acknowledging the drain cannot claim it.
+//!   the configured count and byte limits. An observation batch is consumed
+//!   lazily against those limits, so a watcher that reports a huge batch never
+//!   materializes it here: the moment exact retention would exceed the bound,
+//!   the batch collapses into one uncertain full-scan requirement and the rest
+//!   of the batch stops being polled because a full scan already subsumes it.
+//!   Every notify error, unknown path, or rescan request collapses the batch
+//!   the same way. Work is never dropped; it is only ever made coarser.
+//! * **Epochs.** One monotonic sequence counts intake, allocated with a checked
+//!   add so an epoch is never reused. A drain is stamped with the sequence it
+//!   actually covers, and an acknowledgement is accepted only for the exact
+//!   in-flight work epoch. Anything enqueued during the drain lands past that
+//!   epoch, so acknowledging the drain cannot claim it. If the sequence or the
+//!   process-wide queue identity runs out, the queue closes and construction
+//!   fails rather than aliasing unrelated work.
 //! * **Quiesce.** [`WatcherQueueOwner::begin_quiesce`] bars intake and proves
 //!   the queue empty, un-drained, and fully acknowledged under one lock. The
-//!   returned guard holds the bar until the caller's durable `Safe` commit
-//!   returns. A failed proof, a failed commit, or a plain drop leaves the queue
-//!   live with every epoch and every retained event intact.
+//!   returned guard defers intake; [`WatcherQuiesceGuard::commit_handoff`] then
+//!   raises a stronger exclusive bar, waits for every already-started intake to
+//!   land, re-proves the quiesce, and holds that bar across the caller's durable
+//!   `Safe` commit. A failed proof, a failed commit, or a plain drop leaves the
+//!   queue live with every epoch and every retained event intact.
 //!
 //! The queue has no filesystem authority, holds no [`crate::model::Graph`], and
 //! writes no enrollment or projection state. Its only output is a
@@ -46,7 +54,8 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::mem;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::thread::ThreadId;
 
 use super::hot_engine::ProjectionStorageBinding;
 use super::reconciliation_scan::ReconciliationTrigger;
@@ -104,6 +113,9 @@ pub(crate) enum WatcherUncertainReason {
     NotifyError,
     RescanRequired,
     PathOverflow,
+    /// The intake sequence ran out, so this work could not be given a fresh
+    /// epoch. It is retained as a full scan and the queue is closed.
+    SequenceExhausted,
 }
 
 /// A monotonic point in one queue's intake sequence.
@@ -136,11 +148,18 @@ pub(crate) struct WatcherIntake {
     pub(crate) deferred_by_quiesce: bool,
 }
 
-/// A rejected intake never changes queue state.
+/// A rejected intake never changes queue state, and never consumes a single
+/// observation from the batch it was given.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum WatcherEnqueueError {
     /// The presented binding is not this queue's enrolled binding.
     ForeignBinding,
+    /// This thread is running a durable handoff commit under its own intake
+    /// bar. Intake from any other thread waits for that bar; re-entering from
+    /// the committing thread would wait on itself, so it is refused instead.
+    /// The caller keeps the unobserved work and may retry once the commit
+    /// returns.
+    HandoffBarred,
 }
 
 impl fmt::Display for WatcherEnqueueError {
@@ -149,11 +168,33 @@ impl fmt::Display for WatcherEnqueueError {
             Self::ForeignBinding => {
                 formatter.write_str("watcher intake presented a foreign projection binding")
             }
+            Self::HandoffBarred => formatter
+                .write_str("watcher intake re-entered the durable handoff commit that bars it"),
         }
     }
 }
 
 impl std::error::Error for WatcherEnqueueError {}
+
+/// Construction refused rather than aliasing a live queue identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WatcherQueueIdentityError {
+    /// This process has minted every queue identity it has. A further queue
+    /// would have to reuse a live one, so construction fails closed.
+    QueueIdExhausted,
+}
+
+impl fmt::Display for WatcherQueueIdentityError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::QueueIdExhausted => {
+                formatter.write_str("this process has exhausted its watcher queue identities")
+            }
+        }
+    }
+}
+
+impl std::error::Error for WatcherQueueIdentityError {}
 
 /// A rejected drain never removes retained work.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -192,6 +233,10 @@ pub(crate) enum WatcherSettlementError {
     StaleOrForeignEpoch {
         in_flight: WatcherEpoch,
     },
+    /// The intake sequence ran out, so an epoch no longer identifies one batch
+    /// of work. Nothing may settle: an acknowledgement for an earlier drain at
+    /// the final epoch would otherwise claim work enqueued after it.
+    SequenceExhausted,
 }
 
 impl fmt::Display for WatcherSettlementError {
@@ -203,6 +248,8 @@ impl fmt::Display for WatcherSettlementError {
                 "watcher settlement is not for the in-flight work epoch {}",
                 in_flight.sequence
             ),
+            Self::SequenceExhausted => formatter
+                .write_str("the watcher intake sequence is exhausted, so nothing may settle"),
         }
     }
 }
@@ -234,6 +281,9 @@ pub(crate) enum WatcherQuiesceError {
     },
     /// The guard is no longer the queue's live quiesce.
     GuardReleased,
+    /// The intake sequence ran out. The queue is closed and permanently
+    /// requires a full scan, so it can never be proved quiesced again.
+    SequenceExhausted,
 }
 
 impl fmt::Display for WatcherQuiesceError {
@@ -270,6 +320,8 @@ impl fmt::Display for WatcherQuiesceError {
             Self::GuardReleased => {
                 formatter.write_str("the watcher quiesce guard is no longer live")
             }
+            Self::SequenceExhausted => formatter
+                .write_str("the watcher intake sequence is exhausted, so the queue is closed"),
         }
     }
 }
@@ -367,6 +419,9 @@ pub(crate) struct WatcherQueueStatus {
     pub(crate) pending_requires_full_scan: bool,
     pub(crate) deferred: bool,
     pub(crate) quiescing: bool,
+    /// The intake sequence ran out. The queue is closed: it still retains every
+    /// hint as a full scan, but nothing settles and no quiesce can be proved.
+    pub(crate) sequence_exhausted: bool,
 }
 
 /// Bounded retained intake. Uncertainty subsumes exact paths: once a full scan
@@ -403,29 +458,25 @@ impl PendingWatcherWork {
         }
     }
 
-    /// Retain exact paths within the limits. Returns whether anything
-    /// overflowed; the caller converts that into a full-scan requirement.
-    fn retain_paths(&mut self, paths: BTreeSet<ManagedPath>, limits: WatcherQueueLimits) -> bool {
-        if self.is_uncertain() {
-            // A full scan already covers every path, exact or not.
+    /// Retain one exact path within the limits.
+    ///
+    /// Returns `false` when the path does not fit; the caller turns that into a
+    /// full-scan requirement rather than dropping the path. Retaining into an
+    /// already-uncertain set is a no-op that always "fits": a full scan covers
+    /// every path, exact or not.
+    fn retain_path(&mut self, path: ManagedPath, limits: WatcherQueueLimits) -> bool {
+        if self.is_uncertain() || self.paths.contains(&path) {
+            return true;
+        }
+        let path_bytes = path.as_str().len();
+        if self.paths.len() >= limits.maximum_paths
+            || path_bytes > limits.maximum_path_bytes.saturating_sub(self.path_bytes)
+        {
             return false;
         }
-        let mut overflowed = false;
-        for path in paths {
-            if self.paths.contains(&path) {
-                continue;
-            }
-            let path_bytes = path.as_str().len();
-            if self.paths.len() >= limits.maximum_paths
-                || path_bytes > limits.maximum_path_bytes.saturating_sub(self.path_bytes)
-            {
-                overflowed = true;
-                continue;
-            }
-            self.path_bytes = self.path_bytes.saturating_add(path_bytes);
-            self.paths.insert(path);
-        }
-        overflowed
+        self.path_bytes = self.path_bytes.saturating_add(path_bytes);
+        self.paths.insert(path);
+        true
     }
 
     /// Merge another retained set into this one without losing work.
@@ -436,7 +487,10 @@ impl PendingWatcherWork {
             uncertain_reasons,
             omitted_uncertain_reasons,
         } = other;
-        let overflowed = self.retain_paths(paths, limits);
+        let mut overflowed = false;
+        for path in paths {
+            overflowed |= !self.retain_path(path, limits);
+        }
         for reason in uncertain_reasons {
             self.require_full_scan(reason, limits);
         }
@@ -448,6 +502,45 @@ impl PendingWatcherWork {
         if overflowed {
             self.require_full_scan(WatcherUncertainReason::PathOverflow, limits);
         }
+    }
+
+    /// Consume one watcher batch lazily under the limits.
+    ///
+    /// The batch is never materialized: each observation is retained or folds
+    /// into the full-scan requirement as it arrives, and consumption stops the
+    /// moment the batch has become uncertain, because a full scan already
+    /// subsumes everything the rest of the batch could say. The returned flag
+    /// reports whether the batch observed anything at all — an empty batch must
+    /// not advance the intake epoch.
+    fn stage(
+        observations: impl IntoIterator<Item = WatcherObservation>,
+        limits: WatcherQueueLimits,
+    ) -> (Self, bool) {
+        let mut staged = Self::default();
+        let mut observed = false;
+        for observation in observations {
+            observed = true;
+            match observation {
+                WatcherObservation::ManagedPath(path) => {
+                    if !staged.retain_path(path, limits) {
+                        staged.require_full_scan(WatcherUncertainReason::PathOverflow, limits);
+                    }
+                }
+                WatcherObservation::UnknownPath => {
+                    staged.require_full_scan(WatcherUncertainReason::UnknownPath, limits);
+                }
+                WatcherObservation::NotifyError => {
+                    staged.require_full_scan(WatcherUncertainReason::NotifyError, limits);
+                }
+                WatcherObservation::RescanRequired => {
+                    staged.require_full_scan(WatcherUncertainReason::RescanRequired, limits);
+                }
+            }
+            if staged.is_uncertain() {
+                break;
+            }
+        }
+        (staged, observed)
     }
 
     fn trigger(&self) -> Option<ReconciliationTrigger> {
@@ -474,6 +567,10 @@ struct QuiesceState {
 struct WatcherQueueState {
     /// Monotonic intake counter. One non-empty intake call advances it once.
     sequence: u64,
+    /// The counter can no longer advance without reusing an epoch, so the queue
+    /// is closed: intake is still retained, but as a permanent full-scan
+    /// requirement that nothing may settle and no quiesce may claim.
+    sequence_exhausted: bool,
     /// Highest work epoch a drain acknowledged.
     acknowledged: u64,
     pending: PendingWatcherWork,
@@ -482,15 +579,39 @@ struct WatcherQueueState {
     in_flight: Option<InFlightDrain>,
     quiesce: Option<QuiesceState>,
     last_committed_quiesce: Option<u64>,
+    /// Intake calls that have registered but not yet landed. A durable handoff
+    /// waits for this to reach zero, so a batch that began before the bar is
+    /// counted by the proof instead of slipping past it.
+    active_intake: usize,
+    /// The thread running a durable handoff commit under the exclusive intake
+    /// bar. Intake from any other thread waits; that thread is refused.
+    intake_bar: Option<ThreadId>,
 }
 
 static NEXT_WATCHER_QUEUE_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Allocate one process-unique queue identity.
+///
+/// Checked, not wrapping: two live queues sharing an identity would let one
+/// queue's acknowledgement settle the other's work, which is exactly the
+/// aliasing the identity exists to prevent. Exhaustion fails construction
+/// instead, and a refused allocation does not move the counter.
+fn allocate_queue_id(counter: &AtomicU64) -> Result<u64, WatcherQueueIdentityError> {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .map_err(|_| WatcherQueueIdentityError::QueueIdExhausted)
+}
 
 struct WatcherQueueShared {
     queue_id: u64,
     binding: ProjectionStorageBinding,
     limits: WatcherQueueLimits,
     state: Mutex<WatcherQueueState>,
+    /// Signals that `active_intake` dropped or that the intake bar lifted.
+    /// Both waiters use `notify_all`, so neither predicate can miss a wakeup.
+    intake_settled: Condvar,
 }
 
 impl WatcherQueueShared {
@@ -503,6 +624,15 @@ impl WatcherQueueShared {
     /// is the failure this queue exists to prevent.
     fn lock(&self) -> MutexGuard<'_, WatcherQueueState> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn wait<'a>(
+        &self,
+        state: MutexGuard<'a, WatcherQueueState>,
+    ) -> MutexGuard<'a, WatcherQueueState> {
+        self.intake_settled
+            .wait(state)
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     const fn epoch(&self, sequence: u64) -> WatcherEpoch {
@@ -518,6 +648,11 @@ impl WatcherQueueShared {
         state: &WatcherQueueState,
         expected: u64,
     ) -> Result<(), WatcherQuiesceError> {
+        // A closed queue permanently owes a full scan, whatever the counters
+        // say, so it can never be proved quiesced.
+        if state.sequence_exhausted {
+            return Err(WatcherQuiesceError::SequenceExhausted);
+        }
         // Checked first because it is the strictly more informative diagnosis:
         // a barred arrival also advances the intake epoch, so it would
         // otherwise be reported as a plain unacknowledged epoch.
@@ -578,23 +713,67 @@ impl fmt::Debug for WatcherQueueOwner {
 
 impl WatcherQueueOwner {
     /// Create the queue for exactly one enrolled endpoint/storage binding.
+    ///
+    /// The ergonomic constructor. It panics only where
+    /// [`Self::try_new`] fails: after this process has minted `u64::MAX - 1`
+    /// watcher queues, which no run of Tine reaches. Failing closed is the
+    /// point — the alternative is two live queues sharing one identity.
     pub(crate) fn new(binding: ProjectionStorageBinding, limits: WatcherQueueLimits) -> Self {
-        Self {
+        Self::try_new(binding, limits).expect("watcher queue identities are not exhausted")
+    }
+
+    /// Create the queue, refusing rather than aliasing a live queue identity.
+    pub(crate) fn try_new(
+        binding: ProjectionStorageBinding,
+        limits: WatcherQueueLimits,
+    ) -> Result<Self, WatcherQueueIdentityError> {
+        Self::try_new_in(binding, limits, &NEXT_WATCHER_QUEUE_ID)
+    }
+
+    /// [`Self::try_new`] against an explicit identity allocator, so exhaustion
+    /// is provable without disturbing the process-wide counter.
+    fn try_new_in(
+        binding: ProjectionStorageBinding,
+        limits: WatcherQueueLimits,
+        counter: &AtomicU64,
+    ) -> Result<Self, WatcherQueueIdentityError> {
+        Ok(Self {
             shared: Arc::new(WatcherQueueShared {
-                queue_id: NEXT_WATCHER_QUEUE_ID.fetch_add(1, Ordering::Relaxed),
+                queue_id: allocate_queue_id(counter)?,
                 binding,
                 limits,
                 state: Mutex::new(WatcherQueueState {
                     sequence: 0,
+                    sequence_exhausted: false,
                     acknowledged: 0,
                     pending: PendingWatcherWork::default(),
                     deferred: PendingWatcherWork::default(),
                     in_flight: None,
                     quiesce: None,
                     last_committed_quiesce: None,
+                    active_intake: 0,
+                    intake_bar: None,
                 }),
+                intake_settled: Condvar::new(),
             }),
+        })
+    }
+
+    /// Start the queue at an arbitrary point in its intake sequence, so the
+    /// exhaustion boundary is reachable in a test without 2^64 enqueues.
+    #[cfg(test)]
+    fn new_at_sequence(
+        binding: ProjectionStorageBinding,
+        limits: WatcherQueueLimits,
+        sequence: u64,
+    ) -> Self {
+        let owner = Self::new(binding, limits);
+        {
+            let mut state = owner.shared.lock();
+            state.sequence = sequence;
+            state.acknowledged = sequence;
         }
+        owner
     }
 
     pub(crate) fn binding(&self) -> ProjectionStorageBinding {
@@ -629,6 +808,7 @@ impl WatcherQueueOwner {
             pending_requires_full_scan: state.pending.is_uncertain(),
             deferred: !state.deferred.is_empty(),
             quiescing: state.quiesce.is_some(),
+            sequence_exhausted: state.sequence_exhausted,
         }
     }
 
@@ -674,6 +854,12 @@ impl WatcherQueueOwner {
     /// The epoch must be the one this queue handed out. A stale, ahead, or
     /// foreign epoch is refused and nothing moves — in particular, work that
     /// arrived during the drain keeps the queue unacknowledged.
+    ///
+    /// Once the intake sequence is exhausted an epoch stops identifying one
+    /// batch of work, so nothing settles at all: an acknowledgement replayed
+    /// for an earlier drain at the final epoch would otherwise claim work
+    /// enqueued after it. The work stays owed and drainable, and the caller
+    /// returns it with [`Self::abandon_drain`].
     pub(crate) fn acknowledge_drain(
         &self,
         epoch: WatcherEpoch,
@@ -682,6 +868,9 @@ impl WatcherQueueOwner {
         let in_flight = self.in_flight_epoch(&state)?;
         if epoch != in_flight {
             return Err(WatcherSettlementError::StaleOrForeignEpoch { in_flight });
+        }
+        if state.sequence_exhausted {
+            return Err(WatcherSettlementError::SequenceExhausted);
         }
         state.in_flight = None;
         state.acknowledged = state.acknowledged.max(epoch.sequence);
@@ -764,7 +953,8 @@ impl WatcherQueueOwner {
             return false;
         }
         let state = self.shared.lock();
-        state.last_committed_quiesce == Some(proof.epoch.sequence)
+        !state.sequence_exhausted
+            && state.last_committed_quiesce == Some(proof.epoch.sequence)
             && state.sequence == proof.epoch.sequence
             && state.acknowledged == proof.epoch.sequence
             && state.in_flight.is_none()
@@ -799,9 +989,16 @@ impl WatcherHandle {
     /// Retain one batch of watcher observations.
     ///
     /// Exact managed paths are coalesced while they fit; everything else — and
-    /// any overflow — collapses the batch into a full-scan requirement. Nothing
-    /// is ever dropped. A batch that observes nothing does not advance the
-    /// epoch.
+    /// any overflow — collapses the batch into a full-scan requirement, after
+    /// which the rest of the batch is subsumed and is not consumed. Nothing is
+    /// ever dropped. A batch that observes nothing does not advance the epoch.
+    ///
+    /// The batch is registered as in-progress intake *before* the first
+    /// observation is consumed, so a durable handoff cannot commit past a batch
+    /// that has already started. While such a commit holds the intake bar this
+    /// call waits for it; the committing thread itself is refused with
+    /// [`WatcherEnqueueError::HandoffBarred`] rather than waiting on its own
+    /// bar, and neither outcome consumes an observation.
     pub(crate) fn enqueue(
         &self,
         binding: ProjectionStorageBinding,
@@ -810,28 +1007,15 @@ impl WatcherHandle {
         if binding != self.shared.binding {
             return Err(WatcherEnqueueError::ForeignBinding);
         }
-        let mut paths = BTreeSet::new();
-        let mut reasons = BTreeSet::new();
-        let mut observed = false;
-        for observation in observations {
-            observed = true;
-            match observation {
-                WatcherObservation::ManagedPath(path) => {
-                    paths.insert(path);
-                }
-                WatcherObservation::UnknownPath => {
-                    reasons.insert(WatcherUncertainReason::UnknownPath);
-                }
-                WatcherObservation::NotifyError => {
-                    reasons.insert(WatcherUncertainReason::NotifyError);
-                }
-                WatcherObservation::RescanRequired => {
-                    reasons.insert(WatcherUncertainReason::RescanRequired);
-                }
-            }
-        }
+        // Registration happens first and outlives the consumption below, even
+        // if the watcher's iterator panics.
+        let _active = ActiveIntake::register(&self.shared)?;
 
+        // Consumed without the state lock: the batch is arbitrary caller code,
+        // and it is bounded here rather than materialized.
         let limits = self.shared.limits;
+        let (staged, observed) = PendingWatcherWork::stage(observations, limits);
+
         let mut state = self.shared.lock();
         let quiescing = state.quiesce.is_some();
         if !observed {
@@ -841,19 +1025,24 @@ impl WatcherHandle {
                 deferred_by_quiesce: quiescing,
             });
         }
-        state.sequence = state.sequence.saturating_add(1);
+        // Checked, not saturating: reusing the final epoch would let a drain's
+        // acknowledgement settle work it never covered. The queue closes
+        // instead, and this batch is still retained — as a full scan, because a
+        // closed queue can no longer distinguish epochs of work.
+        match state.sequence.checked_add(1) {
+            Some(next) => state.sequence = next,
+            None => state.sequence_exhausted = true,
+        }
+        let exhausted = state.sequence_exhausted;
         let epoch = self.shared.epoch(state.sequence);
         let retained = if quiescing {
             &mut state.deferred
         } else {
             &mut state.pending
         };
-        let overflowed = retained.retain_paths(paths, limits);
-        for reason in reasons {
-            retained.require_full_scan(reason, limits);
-        }
-        if overflowed {
-            retained.require_full_scan(WatcherUncertainReason::PathOverflow, limits);
+        retained.absorb(staged, limits);
+        if exhausted {
+            retained.require_full_scan(WatcherUncertainReason::SequenceExhausted, limits);
         }
         let retained_uncertain = retained.is_uncertain();
         if let Some(quiesce) = &mut state.quiesce {
@@ -864,6 +1053,47 @@ impl WatcherHandle {
             retained_uncertain,
             deferred_by_quiesce: quiescing,
         })
+    }
+}
+
+/// One in-progress intake call, registered before its batch is consumed.
+///
+/// A durable handoff commit waits for every registration to clear before it
+/// re-proves the quiesce, so an intake that had begun is either counted by that
+/// proof — invalidating it — or has not begun at all. The registration is
+/// released on drop, so a panicking watcher iterator cannot strand a handoff.
+struct ActiveIntake<'a> {
+    shared: &'a WatcherQueueShared,
+}
+
+impl<'a> ActiveIntake<'a> {
+    fn register(shared: &'a WatcherQueueShared) -> Result<Self, WatcherEnqueueError> {
+        let mut state = shared.lock();
+        loop {
+            match state.intake_bar {
+                // Re-entrant intake from the thread running the durable commit
+                // would wait on its own bar forever. Refuse it: the queue is
+                // untouched and the caller still holds its unobserved work.
+                Some(holder) if holder == std::thread::current().id() => {
+                    return Err(WatcherEnqueueError::HandoffBarred);
+                }
+                // Another thread's durable commit is in flight. Wait: this
+                // batch must land strictly after it, never inside it.
+                Some(_) => state = shared.wait(state),
+                None => break,
+            }
+        }
+        state.active_intake += 1;
+        Ok(Self { shared })
+    }
+}
+
+impl Drop for ActiveIntake<'_> {
+    fn drop(&mut self) {
+        let mut state = self.shared.lock();
+        state.active_intake -= 1;
+        drop(state);
+        self.shared.intake_settled.notify_all();
     }
 }
 
@@ -908,26 +1138,106 @@ impl WatcherQuiesceGuard<'_> {
         self.shared.prove_quiesced(&state, self.epoch.sequence)
     }
 
-    /// Run the caller's durable handoff commit while intake stays barred.
+    /// Run the caller's durable handoff commit as one atomic barrier.
     ///
-    /// The quiesce is re-proved first, so a commit never runs against a queue
-    /// that stopped being quiesced. Intake reopens only after `commit` returns,
-    /// and a failed commit leaves the queue live with every epoch and retained
-    /// event intact — no proof is recorded.
+    /// The exclusive intake bar goes up first and stays up until the durable
+    /// record has been written *and* recorded here. Under that bar the call
+    /// waits for every intake that had already begun, then re-proves the
+    /// quiesce, so the sequence is exactly:
+    ///
+    /// 1. bar intake;
+    /// 2. drain the intake that began before the bar — it lands, and a landed
+    ///    batch invalidates the proof;
+    /// 3. re-prove the quiesce, and stop here if anything landed;
+    /// 4. run the caller's durable commit, with intake still barred;
+    /// 5. record the committed proof and release deferred work, still barred;
+    /// 6. lift the bar.
+    ///
+    /// So an enqueue either lands before step 3 and defeats the commit, or is
+    /// held until step 6 and lands after it. New work and a successful `Safe`
+    /// commit cannot both win. A failed proof or a failed commit leaves the
+    /// queue live with every epoch and retained event intact, and records no
+    /// proof.
     pub(crate) fn commit_handoff<T, E>(
         mut self,
         commit: impl FnOnce(&WatcherQuiescedProof) -> Result<T, E>,
     ) -> Result<(T, WatcherQuiescedProof), WatcherHandoffError<E>> {
-        self.revalidate().map_err(WatcherHandoffError::Quiesce)?;
+        let shared = self.shared;
+        let bar = IntakeBar::acquire(shared, self.epoch.sequence)
+            .map_err(WatcherHandoffError::Quiesce)?;
         let proof = WatcherQuiescedProof {
-            binding: self.shared.binding,
+            binding: shared.binding,
             epoch: self.epoch,
         };
-        let committed = commit(&proof).map_err(WatcherHandoffError::Commit)?;
+        let committed = match commit(&proof) {
+            Ok(committed) => committed,
+            Err(error) => {
+                // The guard releases the queue inside the barrier either way,
+                // so a failed commit cannot interleave with intake either. It
+                // simply records nothing.
+                drop(self);
+                drop(bar);
+                return Err(WatcherHandoffError::Commit(error));
+            }
+        };
         // Only now is the durable record real, so only now may the queue record
-        // a committed quiesce. The bar drops with `self` on return.
+        // a committed quiesce. Dropping the guard before the bar keeps that
+        // record, and the release of any deferred work, inside the barrier.
         self.committed = true;
+        drop(self);
+        drop(bar);
         Ok((committed, proof))
+    }
+}
+
+/// The exclusive bar that makes a durable handoff atomic.
+///
+/// Stronger than the quiesce guard's deferral: while it is held, intake from
+/// any other thread waits instead of being retained aside, so nothing at all
+/// changes between the re-proof and the durable write. It is released on drop,
+/// including when the caller's commit panics.
+struct IntakeBar<'a> {
+    shared: &'a Arc<WatcherQueueShared>,
+}
+
+impl<'a> IntakeBar<'a> {
+    /// Raise the bar, wait for intake that began before it, and re-prove the
+    /// quiesce — all without ever releasing the lock between the wait and the
+    /// proof, so no batch can slip between them.
+    fn acquire(
+        shared: &'a Arc<WatcherQueueShared>,
+        sequence: u64,
+    ) -> Result<Self, WatcherQuiesceError> {
+        let mut state = shared.lock();
+        match &state.quiesce {
+            Some(quiesce) if quiesce.sequence == sequence => {}
+            _ => return Err(WatcherQuiesceError::GuardReleased),
+        }
+        debug_assert!(
+            state.intake_bar.is_none(),
+            "one live quiesce guard means at most one intake bar"
+        );
+        state.intake_bar = Some(std::thread::current().id());
+        while state.active_intake > 0 {
+            state = shared.wait(state);
+        }
+        if let Err(error) = shared.prove_quiesced(&state, sequence) {
+            state.intake_bar = None;
+            drop(state);
+            shared.intake_settled.notify_all();
+            return Err(error);
+        }
+        drop(state);
+        Ok(Self { shared })
+    }
+}
+
+impl Drop for IntakeBar<'_> {
+    fn drop(&mut self) {
+        let mut state = self.shared.lock();
+        state.intake_bar = None;
+        drop(state);
+        self.shared.intake_settled.notify_all();
     }
 }
 
@@ -955,6 +1265,7 @@ mod tests {
     use crate::oplog::hot_engine::ProjectionEndpointBinding;
     use crate::oplog::identity::{DeviceId, ProjectionEndpointId};
     use crate::oplog::{CanonicalGraphResourceId, ProjectionReceiptStoreId};
+    use std::sync::mpsc;
     use std::sync::Barrier;
     use uuid::Uuid;
 
@@ -1709,6 +2020,277 @@ mod tests {
                 .copied()
                 .collect::<Vec<_>>(),
             vec![WatcherUncertainReason::PathOverflow]
+        );
+    }
+
+    /// Blocker 1a. An intake that has begun consuming its batch must be part of
+    /// the handoff barrier, not something the barrier can commit past.
+    #[test]
+    fn an_intake_that_began_before_the_quiesce_defeats_the_durable_commit() {
+        let (owner, binding) = queue(0x10d0);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        std::thread::scope(|scope| {
+            let handle = owner.handle();
+            let watcher = scope.spawn(move || {
+                // A lazy watcher batch: the first poll announces that intake
+                // has begun, then blocks until the test releases it.
+                let observations = std::iter::once_with(move || {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    observe("One")
+                });
+                handle.enqueue(binding, observations).unwrap()
+            });
+
+            // Intake has begun and has not landed, so the queue still looks
+            // clean and the quiesce proof is granted at epoch 0.
+            started_rx.recv().unwrap();
+            assert_eq!(owner.status().latest_enqueue.sequence(), 0);
+            let guard = owner.begin_quiesce(binding).unwrap();
+            assert_eq!(guard.quiesced_epoch().sequence(), 0);
+
+            // Release the batch. The commit must wait for it and then refuse:
+            // a `Safe` record at epoch 0 would deny a watcher event that the
+            // queue had already accepted responsibility for.
+            release_tx.send(()).unwrap();
+            let outcome = guard.commit_handoff(|_| -> Result<(), &str> {
+                panic!("an intake that began before the bar must never reach the durable commit")
+            });
+            assert!(
+                matches!(
+                    outcome,
+                    Err(WatcherHandoffError::Quiesce(
+                        WatcherQuiesceError::ArrivedDuringQuiesce { .. }
+                    ))
+                ),
+                "expected the barrier to observe the in-progress intake, got {outcome:?}"
+            );
+            assert_eq!(watcher.join().unwrap().epoch.sequence(), 1);
+        });
+
+        // Nothing was lost, and nothing was committed.
+        let status = owner.status();
+        assert_eq!(status.latest_enqueue.sequence(), 1);
+        assert!(status.last_committed_quiesce.is_none());
+        let drain = owner.begin_drain(binding).unwrap().unwrap();
+        assert_eq!(drained_paths(&drain), vec!["pages/One.md"]);
+    }
+
+    /// Blocker 1b. The forced order is revalidate, then an attempted enqueue,
+    /// then the durable callback — the exact window a non-atomic barrier loses.
+    #[test]
+    fn an_intake_attempted_inside_the_durable_commit_is_barred_and_observes_nothing() {
+        let (owner, binding) = queue(0x10d5);
+        let handle = owner.handle();
+        handle.enqueue(binding, [observe("One")]).unwrap();
+        reconcile(&owner, binding);
+
+        let guard = owner.begin_quiesce(binding).unwrap();
+        let (record, proof) = guard
+            .commit_handoff(|proof| -> Result<&'static str, ()> {
+                // The barrier has already re-proved the quiesce; the durable
+                // write is happening now.
+                assert_eq!(proof.epoch().sequence(), 1);
+                let barred = handle.enqueue(
+                    binding,
+                    std::iter::once_with(|| -> WatcherObservation {
+                        panic!("a barred intake must not consume a single observation")
+                    }),
+                );
+                assert_eq!(barred.unwrap_err(), WatcherEnqueueError::HandoffBarred);
+                let status = owner.status();
+                assert_eq!(status.latest_enqueue.sequence(), 1);
+                assert!(!status.deferred, "a barred intake retains nothing");
+                Ok("safe")
+            })
+            .unwrap();
+
+        assert_eq!(record, "safe");
+        assert!(owner.quiesce_proof_is_current(&proof));
+        // The refused batch was never observed, so it is still the caller's to
+        // retry — and retrying it correctly stales the committed proof.
+        let retry = handle.enqueue(binding, [observe("Two")]).unwrap();
+        assert_eq!(retry.epoch.sequence(), 2);
+        assert!(!owner.quiesce_proof_is_current(&proof));
+    }
+
+    /// The bar must also be released. Another thread's intake waits for the
+    /// durable commit and then lands, rather than being lost or stuck.
+    #[test]
+    fn another_threads_intake_lands_only_after_the_durable_commit() {
+        let (owner, binding) = queue(0x10d8);
+        owner.handle().enqueue(binding, [observe("One")]).unwrap();
+        reconcile(&owner, binding);
+
+        let guard = owner.begin_quiesce(binding).unwrap();
+        let (start_tx, start_rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            let handle = owner.handle();
+            let watcher = scope.spawn(move || {
+                start_rx.recv().unwrap();
+                handle.enqueue(binding, [observe("Two")]).unwrap()
+            });
+
+            let (_, proof) = guard
+                .commit_handoff(|_| -> Result<(), ()> {
+                    start_tx.send(()).unwrap();
+                    // Whatever the watcher thread does from here, it cannot
+                    // advance this queue while the bar is held.
+                    assert_eq!(owner.status().latest_enqueue.sequence(), 1);
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(proof.epoch().sequence(), 1);
+            assert_eq!(watcher.join().unwrap().epoch.sequence(), 2);
+        });
+
+        let status = owner.status();
+        assert_eq!(status.latest_enqueue.sequence(), 2);
+        assert!(status.pending, "the barred intake landed after the commit");
+        assert_eq!(
+            status.last_committed_quiesce.map(|epoch| epoch.sequence()),
+            Some(1)
+        );
+    }
+
+    /// Blocker 2. At the end of the sequence the queue closes rather than
+    /// reusing an epoch, and a replayed acknowledgement settles nothing.
+    #[test]
+    fn sequence_exhaustion_closes_the_queue_instead_of_reusing_an_epoch() {
+        let binding = test_binding(0x10f0);
+        let owner = WatcherQueueOwner::new_at_sequence(
+            binding,
+            WatcherQueueLimits::default(),
+            u64::MAX - 1,
+        );
+        let handle = owner.handle();
+
+        // The last epoch the sequence can mint behaves normally.
+        let last = handle.enqueue(binding, [observe("One")]).unwrap();
+        assert_eq!(last.epoch.sequence(), u64::MAX);
+        assert!(!last.retained_uncertain);
+        let settled = owner.begin_drain(binding).unwrap().unwrap();
+        assert_eq!(settled.epoch(), last.epoch);
+        owner.acknowledge_drain(settled.epoch()).unwrap();
+        drop(owner.begin_quiesce(binding).unwrap());
+
+        // The next batch cannot be given a fresh epoch. It is retained as a
+        // full scan and the queue closes.
+        let overflow = handle.enqueue(binding, [observe("Two")]).unwrap();
+        assert_eq!(
+            overflow.epoch, last.epoch,
+            "the sequence must not mint a fresh epoch it has already used"
+        );
+        assert!(overflow.retained_uncertain);
+        let status = owner.status();
+        assert!(status.sequence_exhausted);
+        assert!(status.pending_requires_full_scan);
+
+        // The later work is drainable at that same, now ambiguous, epoch — so
+        // the acknowledgement replayed from the settled drain must not settle
+        // it, and neither may a fresh one.
+        let reopened = owner.begin_drain(binding).unwrap().unwrap();
+        assert_eq!(reopened.epoch(), settled.epoch());
+        assert!(reopened.requires_full_scan());
+        assert_eq!(
+            reopened
+                .uncertain_reasons()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![WatcherUncertainReason::SequenceExhausted]
+        );
+        assert_eq!(
+            owner.acknowledge_drain(settled.epoch()).unwrap_err(),
+            WatcherSettlementError::SequenceExhausted
+        );
+        assert_eq!(
+            owner.acknowledge_drain(reopened.epoch()).unwrap_err(),
+            WatcherSettlementError::SequenceExhausted
+        );
+        assert_eq!(owner.status().drain_in_flight, Some(reopened.epoch()));
+        assert_eq!(owner.status().acknowledged.sequence(), u64::MAX);
+
+        // And no `Safe` handoff can ever be proved on a closed queue, whatever
+        // the counters happen to say.
+        assert_eq!(
+            owner.begin_quiesce(binding).unwrap_err(),
+            WatcherQuiesceError::SequenceExhausted
+        );
+        owner.abandon_drain(reopened.epoch()).unwrap();
+        assert!(owner.status().pending_requires_full_scan);
+        assert_eq!(
+            owner.begin_quiesce(binding).unwrap_err(),
+            WatcherQuiesceError::SequenceExhausted
+        );
+    }
+
+    /// Blocker 2. A wrapped queue identity would let one queue's drain settle
+    /// another's work, so the last identity is the last queue.
+    #[test]
+    fn queue_identity_exhaustion_refuses_construction_instead_of_aliasing() {
+        let binding = test_binding(0x10f5);
+        let limits = WatcherQueueLimits::default();
+        let counter = AtomicU64::new(u64::MAX - 1);
+
+        let last = WatcherQueueOwner::try_new_in(binding, limits, &counter).unwrap();
+        assert_eq!(last.shared.queue_id, u64::MAX - 1);
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+
+        assert_eq!(
+            WatcherQueueOwner::try_new_in(binding, limits, &counter).unwrap_err(),
+            WatcherQueueIdentityError::QueueIdExhausted
+        );
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            u64::MAX,
+            "a refused construction must not move the allocator"
+        );
+
+        // The live queue owning that last identity is untouched.
+        last.handle().enqueue(binding, [observe("One")]).unwrap();
+        assert_eq!(last.status().latest_enqueue.sequence(), 1);
+    }
+
+    /// Blocker 3. Intake is bounded while it is consumed, not after.
+    #[test]
+    fn exact_path_intake_stops_consuming_once_the_bound_collapses_it() {
+        let limits = WatcherQueueLimits {
+            maximum_paths: 1,
+            ..WatcherQueueLimits::default()
+        };
+        let binding = test_binding(0x10e0);
+        let owner = WatcherQueueOwner::new(binding, limits);
+
+        // An unbounded lazy batch. One path fits; the second distinct path
+        // overflows and collapses the batch into a full scan, which subsumes
+        // everything after it — so nothing after it may be polled.
+        let mut polled = 0_usize;
+        let observations = std::iter::from_fn(move || {
+            polled += 1;
+            Some(match polled {
+                1 => observe("One"),
+                2 => observe("Two"),
+                _ => panic!("a subsumed watcher batch must not be consumed further"),
+            })
+        });
+
+        let intake = owner.handle().enqueue(binding, observations).unwrap();
+        assert_eq!(intake.epoch.sequence(), 1);
+        assert!(intake.retained_uncertain);
+
+        let drain = owner.begin_drain(binding).unwrap().unwrap();
+        assert!(drain.requires_full_scan());
+        assert_eq!(
+            drain
+                .uncertain_reasons()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![WatcherUncertainReason::PathOverflow],
+            "the overflow must be retained as a full scan, not dropped"
         );
     }
 }
