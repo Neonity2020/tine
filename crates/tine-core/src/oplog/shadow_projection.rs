@@ -2697,6 +2697,7 @@ mod tests {
         backup: VerifiedSourceBackup,
         sqlite: OpenProjection,
         sqlite_proof: VerifiedBootstrapSqliteProjection,
+        archive_resource_id: crate::oplog::CanonicalArchiveResourceId,
         original_graph: BTreeMap<String, Vec<u8>>,
     }
 
@@ -2769,6 +2770,10 @@ mod tests {
                 &authority,
             )
             .unwrap();
+            let archive_resource_id = authority
+                .store()
+                .provision_enrolled_archive_resource_id()
+                .unwrap();
             Self {
                 root,
                 graph_root,
@@ -2780,6 +2785,7 @@ mod tests {
                 backup,
                 sqlite,
                 sqlite_proof,
+                archive_resource_id,
                 original_graph,
             }
         }
@@ -2809,6 +2815,13 @@ mod tests {
         }
 
         fn enrollment_binding(&self) -> EnrollmentBindingV1 {
+            self.enrollment_binding_with_archive(self.archive_resource_id)
+        }
+
+        fn enrollment_binding_with_archive(
+            &self,
+            archive_resource_id: crate::oplog::CanonicalArchiveResourceId,
+        ) -> EnrollmentBindingV1 {
             let accepted = self.authority.binding();
             let storage = accepted.storage_binding();
             EnrollmentBindingV1::new(
@@ -2819,10 +2832,7 @@ mod tests {
                 storage.endpoint.device_id(),
                 accepted.graph_resource(),
                 storage.receipt_store_id,
-                crate::oplog::CanonicalArchiveResourceId::from_capability_identity(
-                    b"verified-local-test",
-                    accepted.archive_identity().binding_digest().as_bytes(),
-                ),
+                archive_resource_id,
                 self.graph.graph_text_scope_binding().unwrap(),
             )
             .unwrap()
@@ -3119,6 +3129,16 @@ mod tests {
         }
     }
 
+    fn enrollment_generation(
+        root: &crate::oplog::enrollment::EnrollmentApplicationRoot,
+        binding: &EnrollmentBindingV1,
+    ) -> u64 {
+        match EnrollmentReader::open_existing(root, binding).unwrap() {
+            EnrollmentOpen::Present(reader) => reader.current().generation(),
+            EnrollmentOpen::Absent => panic!("expected enrollment head"),
+        }
+    }
+
     fn enrollment_head_file(
         root: &crate::oplog::enrollment::EnrollmentApplicationRoot,
         binding: &EnrollmentBindingV1,
@@ -3204,6 +3224,80 @@ mod tests {
         assert_eq!(snapshot_files(&first.graph_root), graph_before);
         first.assert_graph_unchanged();
         second.assert_graph_unchanged();
+    }
+
+    #[test]
+    fn verified_local_foreign_archive_resource_id_never_advances_shadow_head() {
+        // Archive A holds the genuine retained proofs and its own provisioned
+        // archive-resource claim; archive B is a second, physically distinct
+        // enrolled archive with its own genuine claim.
+        let archive_a = Fixture::new(
+            "verified-local-archive-a",
+            None,
+            vec![("pages/a.md".into(), b"- archive a\n".to_vec())],
+        );
+        let shadow_a = archive_a.verify().unwrap();
+        let archive_b = Fixture::new(
+            "verified-local-archive-b",
+            None,
+            vec![("pages/b.md".into(), b"- archive b\n".to_vec())],
+        );
+        assert_ne!(
+            archive_a.archive_resource_id, archive_b.archive_resource_id,
+            "two genuinely provisioned archives must have distinct resource ids"
+        );
+
+        // Compose archive A's valid proofs under a binding that carries archive
+        // B's valid CanonicalArchiveResourceId. The composition must fail and
+        // the enrollment head must remain exactly the initial ShadowImport.
+        let mismatched = archive_a.enrollment_binding_with_archive(archive_b.archive_resource_id);
+        let mismatch_root = archive_a.enrollment_root("foreign-archive");
+        let preparation = PreparationId::new();
+        let graph_before = snapshot_files(&archive_a.graph_root);
+
+        assert!(compose_verified_local(
+            &mismatch_root,
+            mismatched.clone(),
+            preparation,
+            &archive_a.proofs(&shadow_a),
+        )
+        .is_err());
+        let shadow_head = enrollment_head(&mismatch_root, &mismatched);
+        assert_eq!(enrollment_generation(&mismatch_root, &mismatched), 1);
+        // A retry does not launder the foreign claim into an advance either.
+        assert!(compose_verified_local(
+            &mismatch_root,
+            mismatched.clone(),
+            preparation,
+            &archive_a.proofs(&shadow_a),
+        )
+        .is_err());
+        assert_eq!(enrollment_head(&mismatch_root, &mismatched), shadow_head);
+        assert_eq!(enrollment_generation(&mismatch_root, &mismatched), 1);
+
+        // Archive A's own binding still composes and reopens cleanly.
+        let valid = archive_a.enrollment_binding();
+        assert_eq!(valid.archive_resource_id(), archive_a.archive_resource_id);
+        let valid_root = archive_a.enrollment_root("own-archive");
+        let evidence = compose_verified_local(
+            &valid_root,
+            valid.clone(),
+            PreparationId::new(),
+            &archive_a.proofs(&shadow_a),
+        )
+        .unwrap();
+        let reopened =
+            reopen_verified_local(&valid_root, &valid, &archive_a.proofs(&shadow_a)).unwrap();
+        assert_eq!(reopened.enrollment_head(), evidence.enrollment_head());
+        assert_eq!(
+            reopened.verification_digest(),
+            evidence.verification_digest()
+        );
+
+        // No path here may write a single byte into either live graph.
+        assert_eq!(snapshot_files(&archive_a.graph_root), graph_before);
+        archive_a.assert_graph_unchanged();
+        archive_b.assert_graph_unchanged();
     }
 
     #[test]

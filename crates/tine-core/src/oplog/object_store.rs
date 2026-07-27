@@ -1645,6 +1645,39 @@ impl ObjectStore {
         control_directory_identity(&self.capability)
     }
 
+    /// Authenticate the exact persisted canonical archive-resource claim
+    /// retained inside this store's archive-root capability.
+    ///
+    /// This opens the already-enrolled archive-instance claim against the
+    /// retained no-follow directory capability and confirms it derives to
+    /// `expected`. It never derives, provisions, repairs, or overwrites the
+    /// claim; a missing, substituted, or mismatched claim fails closed. The
+    /// authenticated physical archive directory only proves its own control
+    /// identity, so the persisted resource claim must be checked separately.
+    pub(crate) fn validate_enrolled_archive_resource_id(
+        &self,
+        expected: super::CanonicalArchiveResourceId,
+    ) -> std::io::Result<()> {
+        super::CanonicalArchiveResourceId::open_enrolled_in_retained_directory(
+            &self.capability,
+            expected,
+        )
+        .map(|_| ())
+    }
+
+    /// Provision this store's canonical archive-resource claim exactly once and
+    /// return its identity.
+    ///
+    /// Used only to stage a genuine archive identity for tests; it goes through
+    /// the same retained no-follow capability that
+    /// [`Self::validate_enrolled_archive_resource_id`] later authenticates.
+    #[cfg(test)]
+    pub(crate) fn provision_enrolled_archive_resource_id(
+        &self,
+    ) -> std::io::Result<super::CanonicalArchiveResourceId> {
+        super::CanonicalArchiveResourceId::provision_in_retained_directory(&self.capability)
+    }
+
     pub(crate) fn start_engine_scratch(
         &self,
     ) -> Result<

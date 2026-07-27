@@ -1783,6 +1783,17 @@ fn freshly_validate_verified_local(
             "fresh accepted authority differs from the supplied retained authority",
         ));
     }
+    // The reopened store above only authenticates the physical archive control
+    // identity. Independently authenticate the persisted archive-resource claim
+    // so a binding carrying another archive's valid resource id cannot advance.
+    fresh_authority
+        .store()
+        .validate_enrolled_archive_resource_id(enrollment_binding.archive_resource_id())
+        .map_err(|error| {
+            VerifiedLocalCompositionError::ProofBinding(format!(
+                "persisted archive resource claim does not authenticate the enrollment binding: {error}"
+            ))
+        })?;
     let fresh_backup =
         verify_migration_source_backup(proofs.roots, proofs.prepared, proofs.verified_publication)?;
     if &fresh_backup != proofs.source_backup {
