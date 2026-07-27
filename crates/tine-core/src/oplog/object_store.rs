@@ -37,6 +37,9 @@ use smallvec::SmallVec;
 use uuid::Uuid;
 
 use super::identity::parse_digest;
+use super::resume_point::{
+    ResumePointError, ResumePointSet, RuntimeResumePointV1, RESUME_POINT_DIR,
+};
 use super::simulator::SimulatorBootstrapFixtureIngress;
 use super::{
     bootstrap_import::{
@@ -625,6 +628,20 @@ impl PromotedRuntimeStateV1 {
             return Err(StoreError::MalformedPromotedRuntimeState);
         }
         Ok(state)
+    }
+
+    /// Digest of this state's exact canonical encoding.
+    ///
+    /// One field a resume point can carry instead of restating thirteen
+    /// identities that could drift apart. Because the state itself is only ever
+    /// read through [`DurableEngineHistoryStore::require_promoted_state_binding`],
+    /// matching this digest transitively binds the endpoint, device, graph
+    /// resource, receipt store, archive resource claim, physical archive control
+    /// identity, lineage, catalog document, bootstrap aggregate and import
+    /// identity, the bootstrap anchor authority, the enrollment
+    /// verification/binding digests, and the promotion session.
+    pub(crate) fn state_digest(&self) -> Result<ContentDigest, StoreError> {
+        Ok(ContentDigest::of(&self.encode()?))
     }
 
     pub(crate) const fn bootstrap(&self) -> BootstrapAggregateHistoryBindingV1 {
@@ -4272,6 +4289,155 @@ impl DurableEngineHistoryStore {
         )
     }
 
+    /// The one resume-point authorization boundary, mirroring
+    /// [`Self::require_promoted_state_binding`].
+    ///
+    /// A resume point must claim this workspace and must carry the digest of
+    /// *this* endpoint's durable promoted-runtime state. The promoted state was
+    /// itself read through `require_promoted_state_binding`, so matching its
+    /// digest transitively proves the point belongs to this endpoint, this
+    /// physical archive directory, this archive resource claim, and this
+    /// bootstrap-anchored lineage. A stale byte-identical copy of another
+    /// archive carries a different control-directory identity and therefore a
+    /// different promoted state, so its resume points cannot bind here.
+    fn require_resume_point_binding(
+        &self,
+        point: &RuntimeResumePointV1,
+        promoted_state_digest: ContentDigest,
+    ) -> Result<(), StoreError> {
+        if point.workspace_id != self.workspace_id {
+            return Err(StoreError::ResumePointBindingMismatch(
+                "runtime resume point is bound to another workspace",
+            ));
+        }
+        if point.promoted_state_digest != promoted_state_digest {
+            return Err(StoreError::ResumePointBindingMismatch(
+                "runtime resume point is bound to another promoted runtime state",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Read the complete validated resume-point set of this endpoint.
+    ///
+    /// Fails closed on any residue and never returns a partial view: an `Err`
+    /// here proves nothing about reachability, so the caller must preserve
+    /// every candidate retained run. An absent directory is the ordinary
+    /// "never published" shape and is not an error.
+    pub(crate) fn read_resume_point_set(&self) -> Result<ResumePointSet, StoreError> {
+        let Some(directory) = open_existing_dir_nofollow(&self.control, RESUME_POINT_DIR)? else {
+            return Ok(ResumePointSet::empty());
+        };
+        let set = ResumePointSet::read(&directory)?;
+        if set.points().is_empty() {
+            return Ok(set);
+        }
+        // A published point without a promoted state is residue, not evidence:
+        // there is nothing that could have authorized it.
+        let promoted =
+            self.read_promoted_runtime_state()?
+                .ok_or(StoreError::ResumePointBindingMismatch(
+                    "a runtime resume point exists without a promoted runtime state",
+                ))?;
+        let promoted_state_digest = promoted.state_digest()?;
+        for point in set.points() {
+            self.require_resume_point_binding(point, promoted_state_digest)?;
+        }
+        Ok(set)
+    }
+
+    /// Publish one resume point, then prune every lower sequence.
+    ///
+    /// Ordering is strictly publish-then-delete: the successor is durable
+    /// before its predecessor is removed, so there is never a durable cut at
+    /// which zero valid resume points exist while a retained run holds the only
+    /// resumable bytes. A crash between the two leaves exactly two points, and
+    /// the next publication (or a startup prune) converges.
+    ///
+    /// The publication is immutable-exact, so repeating the call with
+    /// byte-identical bytes resumes and re-runs the prune, while divergent
+    /// bytes at the same sequence fail closed as
+    /// [`StoreError::ImmutableCollision`]. Under the archive-rooted workspace
+    /// runtime lease that collision is impossible in honest operation, which is
+    /// exactly why it is a corruption signal rather than a retry.
+    ///
+    /// This records evidence only. It grants no write, frontier, projection, or
+    /// import authority, and it deliberately performs no scratch-run
+    /// reclamation: proving a retained run unreachable is a separate step the
+    /// caller takes with [`ResumePointSet::reachable_runs`] after this returns.
+    pub(crate) fn publish_resume_point(
+        &self,
+        point: &RuntimeResumePointV1,
+    ) -> Result<(), StoreError> {
+        let _guard = self
+            .transition
+            .lock()
+            .map_err(|_| StoreError::MalformedHistoryIndex)?;
+        let _workspace_guard = AdvisoryTransitionGuard::lock(&self.transition_lock)?;
+        point.validate()?;
+        let promoted = self
+            .read_promoted_runtime_state()?
+            .ok_or(StoreError::PromotedRuntimeStateAbsent)?;
+        self.require_resume_point_binding(point, promoted.state_digest()?)?;
+
+        // The recorded run-local roots correspond to one exact durable history
+        // authority. Proving that here, from this store's own live head, is
+        // what keeps the history binding real rather than caller-asserted.
+        let (_, root) = self.read_live_head_root()?;
+        if root.generation != point.history_generation
+            || root.index_root != point.history_index_root
+        {
+            return Err(StoreError::ResumePointBindingMismatch(
+                "runtime resume point does not name this endpoint's live durable history",
+            ));
+        }
+
+        let bytes = point.encode()?;
+        let existing = self.read_resume_point_set()?;
+        let next = existing.next_sequence()?;
+        let latest = existing.latest().map(|latest| latest.resume_sequence);
+        // Either the next fresh sequence, or a retry of the last publication
+        // whose byte identity `publish_immutable_exact` then proves.
+        if point.resume_sequence != next && Some(point.resume_sequence) != latest {
+            return Err(StoreError::ResumePointSequenceRegression {
+                expected: next,
+                found: point.resume_sequence,
+            });
+        }
+
+        ensure_directory_nofollow(&self.control, RESUME_POINT_DIR)?;
+        let directory = open_dir_nofollow(&self.control, RESUME_POINT_DIR)?;
+        publish_immutable_exact(
+            &directory,
+            &point.file_name(),
+            &bytes,
+            "runtime resume point",
+        )?;
+        // ---- COMMIT POINT: the new resume point is durable. ----
+        ResumePointSet::prune_below(&directory, point.resume_sequence)?;
+        Ok(())
+    }
+
+    /// Remove every published resume point of this endpoint.
+    ///
+    /// This is the `Unsafe -> Safe` drain step: afterwards no retained scratch
+    /// run is reachable, which is precisely what lets a later reclamation pass
+    /// prove one collectable. It is ordered before the handoff record moves to
+    /// `Safe` on purpose — a crash in between leaves `Unsafe` with no resume
+    /// point, which is the conservative full-replay state, whereas the reverse
+    /// order would leave a `Safe` record pointing at a stale run.
+    pub(crate) fn clear_resume_points(&self) -> Result<usize, StoreError> {
+        let _guard = self
+            .transition
+            .lock()
+            .map_err(|_| StoreError::MalformedHistoryIndex)?;
+        let _workspace_guard = AdvisoryTransitionGuard::lock(&self.transition_lock)?;
+        let Some(directory) = open_existing_dir_nofollow(&self.control, RESUME_POINT_DIR)? else {
+            return Ok(0);
+        };
+        Ok(ResumePointSet::clear(&directory)?)
+    }
+
     /// Turn a durable promoted-runtime state into live write authorization for
     /// this exact bootstrap-anchored lineage.
     ///
@@ -5251,6 +5417,15 @@ pub enum StoreError {
     MalformedPromotedRuntimeState,
     UnsupportedPromotedRuntimeSchema(u32),
     CompetingRuntimePromotion,
+    /// One resume point, or one complete resume-point scan, was refused. Every
+    /// shape means the same thing to a caller: do not adopt, do not prune, do
+    /// not reclaim, preserve every candidate retained run.
+    ResumePoint(String),
+    ResumePointBindingMismatch(&'static str),
+    ResumePointSequenceRegression {
+        expected: u64,
+        found: u64,
+    },
     StoredLengthMismatch {
         path: String,
         expected: u64,
@@ -5412,6 +5587,14 @@ impl fmt::Display for StoreError {
             Self::CompetingRuntimePromotion => f.write_str(
                 "a different promoted runtime state is already committed for this archive",
             ),
+            Self::ResumePoint(error) => write!(f, "{error}"),
+            Self::ResumePointBindingMismatch(reason) => {
+                write!(f, "runtime resume-point binding mismatch: {reason}")
+            }
+            Self::ResumePointSequenceRegression { expected, found } => write!(
+                f,
+                "runtime resume point {found} does not extend the published sequence {expected}"
+            ),
             Self::StoredLengthMismatch {
                 path,
                 expected,
@@ -5457,6 +5640,12 @@ impl From<BatchError> for StoreError {
 impl From<BootstrapImportError> for StoreError {
     fn from(error: BootstrapImportError) -> Self {
         Self::Bootstrap(error.to_string())
+    }
+}
+
+impl From<ResumePointError> for StoreError {
+    fn from(error: ResumePointError) -> Self {
+        Self::ResumePoint(error.to_string())
     }
 }
 
@@ -9566,5 +9755,489 @@ mod bootstrap_store_tests {
                 .as_deref(),
             Some(b"subprocess cold history record".as_slice())
         );
+    }
+}
+
+#[cfg(test)]
+mod resume_point_store_tests {
+    use super::*;
+    use crate::oplog::hot_engine::AcceptedFrontierRoot;
+    use crate::oplog::resume_point::{ResumePointSet, RuntimeResumePointV1};
+    use crate::oplog::scratch_store::{ScratchAuthenticatedCatalogRoot, ScratchRoots};
+    use crate::oplog::{
+        DeviceId, DocumentId, ImportId, ProjectionEndpointBinding, ProjectionEndpointId,
+        ProjectionReceiptStoreId, SessionId,
+    };
+
+    /// One promoted, bootstrap-anchored endpoint: the smallest archive shape in
+    /// which a resume point is admissible at all.
+    ///
+    /// A zero-part bootstrap aggregate installs the anchor binding at
+    /// generation 0 with the empty index root, which is exactly the durable
+    /// history authority a first resume point must name.
+    struct PromotedHistoryFixture {
+        root: PathBuf,
+        archive: PathBuf,
+        workspace: WorkspaceId,
+        binding: crate::oplog::hot_engine::ProjectionStorageBinding,
+        state: PromotedRuntimeStateV1,
+    }
+
+    impl PromotedHistoryFixture {
+        fn new(label: &str) -> Self {
+            let root =
+                std::env::temp_dir().join(format!("tine-resume-point-{label}-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&root).unwrap();
+            let archive = root.join("archive");
+            let workspace = WorkspaceId::from_uuid(Uuid::from_u128(0x8100));
+            let lineage = LineageDigest::from_bytes([0x81; 32]);
+            let import_id = ImportId::from_digest([0x82; 32]);
+            let graph_resource_id =
+                crate::oplog::CanonicalGraphResourceId::from_capability_identity(
+                    b"resume-point-test",
+                    label.as_bytes(),
+                );
+            let aggregate = BootstrapAggregateManifestV1::empty(
+                workspace,
+                lineage,
+                graph_resource_id,
+                import_id,
+            )
+            .unwrap();
+            let binding = crate::oplog::hot_engine::ProjectionStorageBinding {
+                endpoint: ProjectionEndpointBinding {
+                    endpoint_id: ProjectionEndpointId::from_uuid(Uuid::from_u128(0x8200)),
+                    device_id: DeviceId::from_uuid(Uuid::from_u128(0x8201)),
+                    graph_resource_id,
+                },
+                receipt_store_id: ProjectionReceiptStoreId::from_capability_identity(
+                    b"resume-point-test",
+                    label.as_bytes(),
+                ),
+            };
+
+            let store = ObjectStore::open(&archive, workspace).unwrap();
+            store
+                .publish_bootstrap_aggregate_prefix(&aggregate)
+                .unwrap();
+            let publication_id = store.commit_bootstrap_aggregate(&aggregate).unwrap();
+            let publication = store.load_bootstrap_publication(publication_id).unwrap();
+            let history = store.open_engine_history(binding).unwrap();
+            assert_eq!(
+                history
+                    .publish_many_exact(&[], &publication, EngineHistoryBinding::empty())
+                    .unwrap(),
+                (0, EngineHistoryStore::empty_root())
+            );
+            let archive_resource_id = store.provision_enrolled_archive_resource_id().unwrap();
+            let archive_capability = Dir::open_ambient_dir(&archive, ambient_authority()).unwrap();
+            let state = PromotedRuntimeStateV1 {
+                schema_version: PROMOTED_RUNTIME_STATE_SCHEMA_VERSION,
+                lineage_mode: PromotedLineageModeV1::BootstrapAnchoredHomogeneous,
+                workspace_id: workspace,
+                lineage_digest: lineage,
+                catalog_document_id: DocumentId::from_uuid(Uuid::from_u128(0x8300)),
+                endpoint_id: binding.endpoint.endpoint_id,
+                device_id: binding.endpoint.device_id,
+                graph_resource_id,
+                receipt_store_id: binding.receipt_store_id,
+                archive_resource_id,
+                archive_control_binding: control_directory_identity(&archive_capability)
+                    .unwrap()
+                    .binding_digest(),
+                bootstrap: BootstrapAggregateHistoryBindingV1::for_aggregate(&aggregate).unwrap(),
+                bootstrap_import_id: import_id,
+                anchor_history_generation: 0,
+                anchor_history_index_root: EngineHistoryStore::empty_root(),
+                anchor_acceptance_sequence: 0,
+                anchor_accepted_frontier_state_digest: ContentDigest::of(b"anchor frontier"),
+                enrollment_verification_digest: ContentDigest::of(b"enrollment verification"),
+                enrollment_binding_digest: ContentDigest::of(b"enrollment binding"),
+                promotion_session_id: SessionId::from_uuid(Uuid::from_u128(0x8400)),
+            };
+            history.publish_promoted_runtime_state(&state).unwrap();
+            drop(history);
+            drop(store);
+
+            Self {
+                root,
+                archive,
+                workspace,
+                binding,
+                state,
+            }
+        }
+
+        fn history(&self) -> DurableEngineHistoryStore {
+            ObjectStore::open(&self.archive, self.workspace)
+                .unwrap()
+                .open_engine_history(self.binding)
+                .unwrap()
+        }
+
+        fn resume_point_path(&self) -> PathBuf {
+            self.archive
+                .join(ENGINE_HISTORY_DIR)
+                .join(self.binding.endpoint.endpoint_id.to_string())
+                .join(RESUME_POINT_DIR)
+        }
+
+        fn point(&self, sequence: u64, run: u128) -> RuntimeResumePointV1 {
+            RuntimeResumePointV1 {
+                resume_sequence: sequence,
+                workspace_id: self.workspace,
+                promoted_state_digest: self.state.state_digest().unwrap(),
+                history_generation: 0,
+                history_index_root: EngineHistoryStore::empty_root(),
+                enrollment_generation: 4,
+                enrollment_head: ContentDigest::of(b"enrollment head"),
+                unsafe_session_id: SessionId::from_uuid(Uuid::from_u128(0x8500)),
+                scratch_run_id: Uuid::from_u128(run),
+                scratch_binding_digest: ContentDigest::of(b"scratch marker"),
+                scratch_roots: ScratchRoots::default(),
+                block_claim_root: BlockClaimIndexRoot::default(),
+                accepted_frontier_root: AcceptedFrontierRoot::empty(),
+                next_acceptance_sequence: 1,
+                current_path_catalog_root: ScratchAuthenticatedCatalogRoot::default(),
+                current_path_catalog_available: true,
+                current_path_catalog_frontier: AcceptedFrontierRoot::empty(),
+            }
+        }
+
+        /// Exact bytes of the resume-point directory, so a refusal can be shown
+        /// to have changed nothing at all.
+        fn snapshot(&self) -> BTreeMap<String, Vec<u8>> {
+            let directory = self.resume_point_path();
+            if !directory.is_dir() {
+                return BTreeMap::new();
+            }
+            std::fs::read_dir(&directory)
+                .unwrap()
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    (
+                        entry.file_name().to_string_lossy().into_owned(),
+                        std::fs::read(entry.path()).unwrap(),
+                    )
+                })
+                .collect()
+        }
+    }
+
+    impl Drop for PromotedHistoryFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn a_published_resume_point_reads_back_under_its_promoted_state_binding() {
+        let fixture = PromotedHistoryFixture::new("publish-read");
+        let history = fixture.history();
+        assert!(history.read_resume_point_set().unwrap().points().is_empty());
+
+        let point = fixture.point(1, 0x8601);
+        history.publish_resume_point(&point).unwrap();
+
+        let set = history.read_resume_point_set().unwrap();
+        assert_eq!(set.points(), &[point.clone()]);
+        assert_eq!(set.next_sequence().unwrap(), 2);
+        assert!(set.reachable_runs().contains(Uuid::from_u128(0x8601)));
+
+        // A fresh process observes the identical durable evidence.
+        drop(history);
+        assert_eq!(
+            fixture.history().read_resume_point_set().unwrap().points(),
+            &[point]
+        );
+    }
+
+    #[test]
+    fn republishing_identical_bytes_at_the_same_sequence_resumes() {
+        let fixture = PromotedHistoryFixture::new("idempotent");
+        let history = fixture.history();
+        let point = fixture.point(1, 0x8601);
+        history.publish_resume_point(&point).unwrap();
+        let published = fixture.snapshot();
+
+        history.publish_resume_point(&point).unwrap();
+        assert_eq!(fixture.snapshot(), published);
+    }
+
+    #[test]
+    fn divergent_bytes_at_the_same_sequence_fail_closed() {
+        let fixture = PromotedHistoryFixture::new("divergent");
+        let history = fixture.history();
+        history
+            .publish_resume_point(&fixture.point(1, 0x8601))
+            .unwrap();
+        let published = fixture.snapshot();
+
+        assert!(matches!(
+            history.publish_resume_point(&fixture.point(1, 0x8602)),
+            Err(StoreError::ImmutableCollision("runtime resume point"))
+        ));
+        assert_eq!(fixture.snapshot(), published);
+    }
+
+    #[test]
+    fn publication_prunes_only_lower_sequences_after_the_commit_point() {
+        let fixture = PromotedHistoryFixture::new("supersede");
+        let history = fixture.history();
+        let first = fixture.point(1, 0x8601);
+        let second = fixture.point(2, 0x8601);
+        history.publish_resume_point(&first).unwrap();
+        history.publish_resume_point(&second).unwrap();
+
+        assert_eq!(
+            history.read_resume_point_set().unwrap().points(),
+            &[second.clone()]
+        );
+        assert_eq!(
+            fixture.snapshot().keys().cloned().collect::<Vec<_>>(),
+            vec![second.file_name()]
+        );
+    }
+
+    #[test]
+    fn a_crash_between_publish_and_prune_leaves_two_points_and_converges() {
+        let fixture = PromotedHistoryFixture::new("crash-before-prune");
+        let history = fixture.history();
+        let first = fixture.point(1, 0x8601);
+        let second = fixture.point(2, 0x8601);
+        history.publish_resume_point(&first).unwrap();
+
+        // Exactly the durable cut between B4 (the successor is durable) and B5
+        // (the predecessor is removed): the successor is published through the
+        // same immutable-exact primitive, and the process dies before pruning.
+        let directory =
+            Dir::open_ambient_dir(fixture.resume_point_path(), ambient_authority()).unwrap();
+        publish_immutable_exact(
+            &directory,
+            &second.file_name(),
+            &second.encode().unwrap(),
+            "runtime resume point",
+        )
+        .unwrap();
+
+        // The cut is readable, bounded, and still names the retained run.
+        let cut = history.read_resume_point_set().unwrap();
+        assert_eq!(cut.points(), &[first, second.clone()]);
+        assert_eq!(cut.latest().unwrap(), &second);
+        assert_eq!(cut.reachable_runs().len(), 1);
+
+        // Retrying the interrupted publication converges without republishing
+        // divergent bytes.
+        history.publish_resume_point(&second).unwrap();
+        assert_eq!(history.read_resume_point_set().unwrap().points(), &[second]);
+    }
+
+    #[test]
+    fn a_sequence_that_does_not_extend_the_published_set_is_refused() {
+        let fixture = PromotedHistoryFixture::new("sequence-regression");
+        let history = fixture.history();
+        history
+            .publish_resume_point(&fixture.point(1, 0x8601))
+            .unwrap();
+        history
+            .publish_resume_point(&fixture.point(2, 0x8601))
+            .unwrap();
+        let published = fixture.snapshot();
+
+        for sequence in [1_u64, 4] {
+            assert!(
+                matches!(
+                    history.publish_resume_point(&fixture.point(sequence, 0x8601)),
+                    Err(StoreError::ResumePointSequenceRegression {
+                        expected: 3,
+                        found,
+                    }) if found == sequence
+                ),
+                "sequence {sequence} was not refused"
+            );
+        }
+        assert_eq!(fixture.snapshot(), published);
+    }
+
+    #[test]
+    fn a_resume_point_bound_to_another_endpoint_or_workspace_is_refused() {
+        let fixture = PromotedHistoryFixture::new("foreign-binding");
+        let history = fixture.history();
+
+        let mut foreign_workspace = fixture.point(1, 0x8601);
+        foreign_workspace.workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(0x8fff));
+        assert!(matches!(
+            history.publish_resume_point(&foreign_workspace),
+            Err(StoreError::ResumePointBindingMismatch(_))
+        ));
+
+        let mut foreign_state = fixture.point(1, 0x8601);
+        foreign_state.promoted_state_digest = ContentDigest::of(b"another endpoint");
+        assert!(matches!(
+            history.publish_resume_point(&foreign_state),
+            Err(StoreError::ResumePointBindingMismatch(_))
+        ));
+
+        assert!(fixture.snapshot().is_empty());
+    }
+
+    #[test]
+    fn a_resume_point_that_does_not_name_the_live_durable_history_is_refused() {
+        let fixture = PromotedHistoryFixture::new("history-binding");
+        let history = fixture.history();
+
+        let mut ahead = fixture.point(1, 0x8601);
+        ahead.history_generation = 1;
+        assert!(matches!(
+            history.publish_resume_point(&ahead),
+            Err(StoreError::ResumePointBindingMismatch(_))
+        ));
+
+        let mut wrong_root = fixture.point(1, 0x8601);
+        wrong_root.history_index_root = ContentDigest::of(b"another index root");
+        assert!(matches!(
+            history.publish_resume_point(&wrong_root),
+            Err(StoreError::ResumePointBindingMismatch(_))
+        ));
+
+        assert!(fixture.snapshot().is_empty());
+    }
+
+    #[test]
+    fn a_resume_point_without_a_promoted_runtime_state_is_residue() {
+        let fixture = PromotedHistoryFixture::new("no-promotion");
+        let history = fixture.history();
+        let point = fixture.point(1, 0x8601);
+        history.publish_resume_point(&point).unwrap();
+        let published = fixture.snapshot();
+        drop(history);
+
+        // Removing the promoted state models the accidental loss of the only
+        // authority that could have authorized this point.
+        std::fs::remove_file(
+            fixture
+                .archive
+                .join(ENGINE_HISTORY_DIR)
+                .join(fixture.binding.endpoint.endpoint_id.to_string())
+                .join(PROMOTED_RUNTIME_STATE_FILE),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            fixture.history().read_resume_point_set(),
+            Err(StoreError::ResumePointBindingMismatch(_))
+        ));
+        assert_eq!(fixture.snapshot(), published);
+    }
+
+    #[test]
+    fn a_malformed_point_poisons_the_read_and_publishes_or_clears_nothing() {
+        let fixture = PromotedHistoryFixture::new("poison");
+        let history = fixture.history();
+        history
+            .publish_resume_point(&fixture.point(1, 0x8601))
+            .unwrap();
+        std::fs::write(fixture.resume_point_path().join("stray-entry"), b"residue").unwrap();
+        let poisoned = fixture.snapshot();
+
+        assert!(matches!(
+            history.read_resume_point_set(),
+            Err(StoreError::ResumePoint(_))
+        ));
+        assert!(matches!(
+            history.publish_resume_point(&fixture.point(2, 0x8601)),
+            Err(StoreError::ResumePoint(_))
+        ));
+        assert!(matches!(
+            history.clear_resume_points(),
+            Err(StoreError::ResumePoint(_))
+        ));
+        assert_eq!(fixture.snapshot(), poisoned);
+    }
+
+    #[test]
+    fn clearing_removes_every_point_and_is_idempotent() {
+        let fixture = PromotedHistoryFixture::new("clear");
+        let history = fixture.history();
+        history
+            .publish_resume_point(&fixture.point(1, 0x8601))
+            .unwrap();
+
+        assert_eq!(history.clear_resume_points().unwrap(), 1);
+        assert!(history.read_resume_point_set().unwrap().points().is_empty());
+        assert_eq!(
+            history
+                .read_resume_point_set()
+                .unwrap()
+                .reachable_runs()
+                .len(),
+            0
+        );
+        assert_eq!(history.clear_resume_points().unwrap(), 0);
+
+        // Clearing is not a terminal state. The publication sequence is derived
+        // from the durable set rather than from a separate counter file, so a
+        // cleared endpoint legitimately restarts at one; there is nothing on
+        // disk left for it to be ambiguous against. A resurrected stale copy of
+        // the old sequence-one file is still fenced, because immutable-exact
+        // publication refuses divergent bytes under an existing name.
+        let next = fixture.point(1, 0x8602);
+        history.publish_resume_point(&next).unwrap();
+        assert_eq!(
+            history.read_resume_point_set().unwrap().points(),
+            &[next.clone()]
+        );
+        assert!(matches!(
+            history.publish_resume_point(&fixture.point(1, 0x8601)),
+            Err(StoreError::ImmutableCollision("runtime resume point"))
+        ));
+        assert_eq!(history.read_resume_point_set().unwrap().points(), &[next]);
+    }
+
+    #[test]
+    fn a_never_published_endpoint_has_an_empty_set_and_clears_nothing() {
+        let fixture = PromotedHistoryFixture::new("never-published");
+        let history = fixture.history();
+        assert!(history.read_resume_point_set().unwrap().points().is_empty());
+        assert_eq!(history.clear_resume_points().unwrap(), 0);
+        assert!(!fixture.resume_point_path().exists());
+    }
+
+    #[test]
+    fn a_copied_archive_cannot_read_the_original_endpoint_resume_points() {
+        let fixture = PromotedHistoryFixture::new("copied-archive");
+        let history = fixture.history();
+        history
+            .publish_resume_point(&fixture.point(1, 0x8601))
+            .unwrap();
+        drop(history);
+
+        let copy = fixture.root.join("archive-copy");
+        copy_tree(&fixture.archive, &copy);
+        let copied = ObjectStore::open(&copy, fixture.workspace)
+            .unwrap()
+            .open_engine_history(fixture.binding)
+            .unwrap();
+
+        // The copy is byte-identical, so only its physical control-directory
+        // identity distinguishes it. That is exactly what the promoted-state
+        // binding authenticates, and the resume point inherits it.
+        assert!(copied.read_resume_point_set().is_err());
+        assert!(copied
+            .publish_resume_point(&fixture.point(2, 0x8601))
+            .is_err());
+    }
+
+    fn copy_tree(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), target).unwrap();
+            }
+        }
     }
 }
