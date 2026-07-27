@@ -215,6 +215,14 @@ pub(crate) struct EnrolledProjectionOpen {
     work: Option<SealedControl<super::ProjectionWorkIndex>>,
 }
 
+/// One-shot bootstrap installer token. It seals only durable history and never
+/// opens or creates projection-work authority.
+pub(crate) struct HistoryOnlyOpen {
+    store: Option<ObjectStore>,
+    binding: super::hot_engine::ProjectionStorageBinding,
+    history: Option<SealedControl<DurableEngineHistoryStore>>,
+}
+
 enum SealedControl<T> {
     Existing(T),
     Absent(AbsentControlName),
@@ -442,10 +450,28 @@ pub(crate) struct PreparedBootstrapHistoryRecordV1<'a> {
     part: BootstrapPartDescriptorV1,
     bytes: &'a [u8],
     binding: BootstrapAggregateHistoryBindingV1,
+    engine_binding: EngineHistoryBinding,
 }
 
 impl<'a> PreparedBootstrapHistoryRecordV1<'a> {
     pub(crate) fn new(
+        part: BootstrapPartDescriptorV1,
+        bytes: &'a [u8],
+        binding: BootstrapAggregateHistoryBindingV1,
+    ) -> Result<Self, StoreError> {
+        let engine_binding =
+            super::hot_engine::validate_bootstrap_history_record(part, bytes, binding)
+                .map_err(|error| StoreError::Bootstrap(error.to_string()))?;
+        Ok(Self {
+            part,
+            bytes,
+            binding,
+            engine_binding,
+        })
+    }
+
+    #[cfg(test)]
+    fn unchecked_for_history_index_test(
         part: BootstrapPartDescriptorV1,
         bytes: &'a [u8],
         binding: BootstrapAggregateHistoryBindingV1,
@@ -454,8 +480,20 @@ impl<'a> PreparedBootstrapHistoryRecordV1<'a> {
             part,
             bytes,
             binding,
+            engine_binding: EngineHistoryBinding::empty(),
         }
     }
+}
+
+pub(crate) struct ExactBootstrapHistoryBuilderV1<'a> {
+    store: &'a DurableEngineHistoryStore,
+    expected_parts: &'a [BootstrapPartDescriptorV1],
+    binding: BootstrapAggregateHistoryBindingV1,
+    engine_binding: EngineHistoryBinding,
+    index_root: ContentDigest,
+    latest: Option<BatchId>,
+    next_ordinal: usize,
+    batch_ids: std::collections::BTreeSet<BatchId>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1281,6 +1319,13 @@ impl ObjectStore {
             Ok(history) => history,
             Err(error) => return Err((self, error)),
         };
+        if let SealedControl::Existing(history) = &history {
+            match history.current_bootstrap_binding() {
+                Ok(Some(_)) => return Err((self, StoreError::InactiveBootstrapHistory)),
+                Ok(None) => {}
+                Err(error) => return Err((self, error)),
+            }
+        }
         let mut work = match self.seal_existing_projection_work(binding) {
             Ok(work) => work,
             Err(error) => return Err((self, error)),
@@ -1300,6 +1345,27 @@ impl ObjectStore {
             binding,
             history: Some(history),
             work: Some(work),
+        })
+    }
+
+    /// Seal the durable-history control for inactive bootstrap installation.
+    /// This performs the same no-follow, absence, retained-resource, and
+    /// substitution checks as enrolled open without touching projection-work.
+    pub(crate) fn seal_history_only(
+        self,
+        binding: super::hot_engine::ProjectionStorageBinding,
+    ) -> Result<HistoryOnlyOpen, (Self, StoreError)> {
+        let mut history = match self.seal_existing_engine_history(binding) {
+            Ok(history) => history,
+            Err(error) => return Err((self, error)),
+        };
+        if let Err(error) = history.bind_absent_parent(&self.capability) {
+            return Err((self, error));
+        }
+        Ok(HistoryOnlyOpen {
+            store: Some(self),
+            binding,
+            history: Some(history),
         })
     }
 
@@ -2558,6 +2624,55 @@ impl EnrolledProjectionOpen {
     }
 }
 
+impl HistoryOnlyOpen {
+    pub(crate) const fn binding(&self) -> super::hot_engine::ProjectionStorageBinding {
+        self.binding
+    }
+
+    pub(crate) fn into_history(
+        mut self,
+    ) -> Result<(ObjectStore, DurableEngineHistoryStore), (ObjectStore, StoreError)> {
+        enrolled_open_use_hook();
+        if let SealedControl::Existing(history) = self
+            .history
+            .as_ref()
+            .expect("sealed history control is present")
+        {
+            if let Err(error) = history.validate_sealed_open() {
+                return Err((self.store.take().expect("sealed store is present"), error));
+            }
+        }
+        enrolled_open_act_hook();
+
+        let store = self.store.take().expect("sealed store is present");
+        let validation = match self
+            .history
+            .as_ref()
+            .expect("sealed history control is present")
+        {
+            SealedControl::Existing(history) => history.validate_sealed_open(),
+            SealedControl::Absent(absence) => absence.validate_still_absent(&store.capability),
+        };
+        if let Err(error) = validation {
+            return Err((store, error));
+        }
+        let history = match self
+            .history
+            .take()
+            .expect("sealed history control is present")
+        {
+            SealedControl::Existing(history) => history,
+            SealedControl::Absent(absence) => {
+                match store.open_absent_engine_history(absence, self.binding) {
+                    Ok(history) => history,
+                    Err(error) => return Err((store, error)),
+                }
+            }
+        };
+        Ok((store, history))
+    }
+}
+
 impl<T> SealedControl<T> {
     fn bind_absent_parent(&mut self, store_root: &Dir) -> Result<bool, StoreError> {
         let Self::Absent(absence) = self else {
@@ -2932,6 +3047,105 @@ impl EngineHistoryStore {
     }
 }
 
+impl ExactBootstrapHistoryBuilderV1<'_> {
+    /// Consume one exact cold record. The builder retains only radix roots,
+    /// bounded identities, and the final engine binding; record bytes are
+    /// released after their immutable node path is published.
+    pub(crate) fn push(
+        &mut self,
+        record: &PreparedBootstrapHistoryRecordV1<'_>,
+    ) -> Result<(), StoreError> {
+        let expected = self
+            .expected_parts
+            .get(self.next_ordinal)
+            .ok_or(StoreError::MalformedHistoryIndex)?;
+        if record.binding != self.binding
+            || record.part != *expected
+            || record.part.acceptance_sequence() != self.next_ordinal as u32 + 1
+            || record.part.evidence().ordinal() != self.next_ordinal as u32
+            || record.part.evidence().part_count() != self.binding.part_count()
+            || !self.batch_ids.insert(record.part.batch_id())
+        {
+            return Err(StoreError::MalformedHistoryIndex);
+        }
+        if self.next_ordinal + 1 == self.expected_parts.len()
+            && record.engine_binding != self.engine_binding
+        {
+            return Err(StoreError::MalformedHistoryIndex);
+        }
+        let next_root =
+            self.store
+                .index
+                .insert(self.index_root, record.part.batch_id(), record.bytes)?;
+        if next_root == self.index_root {
+            return Err(StoreError::MalformedHistoryIndex);
+        }
+        self.index_root = next_root;
+        self.latest = Some(record.part.batch_id());
+        self.next_ordinal += 1;
+        Ok(())
+    }
+
+    pub(crate) fn finish(self) -> Result<(u64, ContentDigest), StoreError> {
+        if self.next_ordinal != self.expected_parts.len()
+            || self.next_ordinal != self.binding.part_count() as usize
+            || self
+                .expected_parts
+                .last()
+                .map(|part| part.post_frontier())
+                .unwrap_or_else(|| self.binding.final_frontier())
+                != self.binding.final_frontier()
+        {
+            return Err(StoreError::MalformedHistoryIndex);
+        }
+        let generation =
+            u64::try_from(self.next_ordinal).map_err(|_| StoreError::MalformedHistoryIndex)?;
+        let candidate = DurableEngineHistoryRoot {
+            schema_version: ENGINE_HISTORY_ROOT_SCHEMA_VERSION,
+            workspace_id: self.store.workspace_id,
+            endpoint_id: self.store.endpoint_id,
+            graph_resource_id: self.store.graph_resource_id,
+            receipt_store_id: self.store.receipt_store_id,
+            generation,
+            index_root: self.index_root,
+            latest_batch_id: self.latest,
+            binding: DurableEngineHistoryBinding {
+                engine: self.engine_binding,
+                bootstrap: Some(self.binding),
+            },
+        };
+        let candidate_digest = self.store.publish_root(&candidate)?;
+
+        let _guard = self
+            .store
+            .transition
+            .lock()
+            .map_err(|_| StoreError::MalformedHistoryIndex)?;
+        let _workspace_guard = AdvisoryTransitionGuard::lock(&self.store.transition_lock)?;
+        let (before_digest, before) = self.store.read_live_head_root()?;
+        if before_digest == candidate_digest {
+            if before != candidate {
+                return Err(StoreError::MalformedHistoryIndex);
+            }
+            *self
+                .store
+                .authoritative_head
+                .lock()
+                .map_err(|_| StoreError::MalformedHistoryIndex)? = Some(candidate_digest);
+            return Ok((candidate.generation, candidate.index_root));
+        }
+        if before.generation != 0
+            || before.index_root != EngineHistoryStore::empty_root()
+            || before.latest_batch_id.is_some()
+            || before.binding.bootstrap.is_some()
+        {
+            return Err(StoreError::BootstrapHistoryRequiresEmptyAuthority);
+        }
+        self.store.replace_head(before_digest, candidate_digest)?;
+        Ok((candidate.generation, candidate.index_root))
+    }
+}
+
 impl DurableEngineHistoryStore {
     fn open_sealed_existing(
         workspace_id: WorkspaceId,
@@ -3211,6 +3425,9 @@ impl DurableEngineHistoryStore {
             .map_err(|_| StoreError::MalformedHistoryIndex)?;
         let _workspace_guard = AdvisoryTransitionGuard::lock(&self.transition_lock)?;
         let (before_digest, before) = self.load_head_root()?;
+        if before.binding.bootstrap.is_some() {
+            return Err(StoreError::InactiveBootstrapHistory);
+        }
         let index_root = self.index.insert(before.index_root, batch_id, bytes)?;
         if index_root == before.index_root {
             return Ok((before.generation, before.index_root));
@@ -3237,75 +3454,49 @@ impl DurableEngineHistoryStore {
         Ok((after.generation, after.index_root))
     }
 
+    pub(crate) fn begin_publish_many_exact<'a>(
+        &'a self,
+        publication: &'a ValidatedBootstrapPublicationV1,
+        engine_binding: EngineHistoryBinding,
+    ) -> Result<ExactBootstrapHistoryBuilderV1<'a>, StoreError> {
+        let aggregate = publication.aggregate();
+        if aggregate.workspace_id() != self.workspace_id {
+            return Err(StoreError::WorkspaceMismatch {
+                expected: self.workspace_id,
+                found: aggregate.workspace_id(),
+            });
+        }
+        let binding = BootstrapAggregateHistoryBindingV1::for_aggregate(aggregate)?;
+        if aggregate.parts().len() != binding.part_count() as usize {
+            return Err(StoreError::MalformedHistoryIndex);
+        }
+        if aggregate.parts().is_empty() && engine_binding != EngineHistoryBinding::empty() {
+            return Err(StoreError::MalformedHistoryIndex);
+        }
+        Ok(ExactBootstrapHistoryBuilderV1 {
+            store: self,
+            expected_parts: aggregate.parts(),
+            binding,
+            engine_binding,
+            index_root: EngineHistoryStore::empty_root(),
+            latest: None,
+            next_ordinal: 0,
+            batch_ids: std::collections::BTreeSet::new(),
+        })
+    }
+
+    #[cfg(test)]
     pub(crate) fn publish_many_exact(
         &self,
         records: &[PreparedBootstrapHistoryRecordV1<'_>],
-        binding: BootstrapAggregateHistoryBindingV1,
+        publication: &ValidatedBootstrapPublicationV1,
         engine_binding: EngineHistoryBinding,
     ) -> Result<(u64, ContentDigest), StoreError> {
-        if records.len() != binding.part_count() as usize {
-            return Err(StoreError::MalformedHistoryIndex);
+        let mut builder = self.begin_publish_many_exact(publication, engine_binding)?;
+        for record in records {
+            builder.push(record)?;
         }
-        let mut index_root = EngineHistoryStore::empty_root();
-        let mut latest = None;
-        let mut batch_ids = std::collections::BTreeSet::new();
-        for (ordinal, record) in records.iter().enumerate() {
-            if record.binding != binding
-                || record.part.acceptance_sequence() != ordinal as u32 + 1
-                || !batch_ids.insert(record.part.batch_id())
-            {
-                return Err(StoreError::MalformedHistoryIndex);
-            }
-            let next_root = self
-                .index
-                .insert(index_root, record.part.batch_id(), record.bytes)?;
-            if next_root == index_root {
-                return Err(StoreError::MalformedHistoryIndex);
-            }
-            index_root = next_root;
-            latest = Some(record.part.batch_id());
-        }
-        if records
-            .last()
-            .map(|record| record.part.post_frontier())
-            .unwrap_or_else(|| binding.final_frontier())
-            != binding.final_frontier()
-        {
-            return Err(StoreError::MalformedHistoryIndex);
-        }
-        let generation =
-            u64::try_from(records.len()).map_err(|_| StoreError::MalformedHistoryIndex)?;
-        let candidate = DurableEngineHistoryRoot {
-            schema_version: ENGINE_HISTORY_ROOT_SCHEMA_VERSION,
-            workspace_id: self.workspace_id,
-            endpoint_id: self.endpoint_id,
-            graph_resource_id: self.graph_resource_id,
-            receipt_store_id: self.receipt_store_id,
-            generation,
-            index_root,
-            latest_batch_id: latest,
-            binding: DurableEngineHistoryBinding {
-                engine: engine_binding,
-                bootstrap: Some(binding),
-            },
-        };
-        let candidate_digest = self.publish_root(&candidate)?;
-
-        let _guard = self
-            .transition
-            .lock()
-            .map_err(|_| StoreError::MalformedHistoryIndex)?;
-        let _workspace_guard = AdvisoryTransitionGuard::lock(&self.transition_lock)?;
-        let (before_digest, before) = self.read_live_head_root()?;
-        if before.generation != 0
-            || before.index_root != EngineHistoryStore::empty_root()
-            || before.latest_batch_id.is_some()
-            || before.binding.bootstrap.is_some()
-        {
-            return Err(StoreError::BootstrapHistoryRequiresEmptyAuthority);
-        }
-        self.replace_head(before_digest, candidate_digest)?;
-        Ok((candidate.generation, candidate.index_root))
+        builder.finish()
     }
 
     fn initialize(&self) -> Result<(), StoreError> {
@@ -3519,8 +3710,10 @@ fn validate_engine_history_root(
         || root.binding.engine.portable_path_key_version != super::PORTABLE_PATH_KEY_VERSION
         || (root.generation == 0) != root.latest_batch_id.is_none()
         || root.binding.bootstrap.is_some_and(|binding| {
-            u64::from(binding.part_count()) > root.generation
+            u64::from(binding.part_count()) != root.generation
                 || binding.final_frontier().accepted_count() != binding.part_count()
+                || (binding.part_count() == 0
+                    && root.binding.engine != EngineHistoryBinding::empty())
         })
         || root
             .binding
@@ -4054,6 +4247,7 @@ pub enum StoreError {
     MissingBootstrapArtifact(&'static str),
     BootstrapBatchRequiresDirectPublication,
     BootstrapHistoryRequiresEmptyAuthority,
+    InactiveBootstrapHistory,
     StoredLengthMismatch {
         path: String,
         expected: u64,
@@ -4195,6 +4389,9 @@ impl fmt::Display for StoreError {
             }
             Self::BootstrapHistoryRequiresEmptyAuthority => {
                 f.write_str("bootstrap history installation requires empty durable authority")
+            }
+            Self::InactiveBootstrapHistory => {
+                f.write_str("inactive bootstrap history cannot be opened as ordinary runtime")
             }
             Self::StoredLengthMismatch {
                 path,
@@ -6587,7 +6784,7 @@ mod bootstrap_store_tests {
             self.parts
                 .iter()
                 .map(|part| {
-                    PreparedBootstrapHistoryRecordV1::new(
+                    PreparedBootstrapHistoryRecordV1::unchecked_for_history_index_test(
                         part.descriptor,
                         &part.history_record,
                         binding,
@@ -6773,9 +6970,6 @@ mod bootstrap_store_tests {
         let publication_id = store
             .commit_bootstrap_aggregate(&fixture.aggregate)
             .unwrap();
-        store
-            .commit_bootstrap_aggregate(&fixture.aggregate)
-            .unwrap();
         let publication = store.load_bootstrap_publication(publication_id).unwrap();
         assert_eq!(publication.aggregate(), &fixture.aggregate);
         for (ordinal, expected) in fixture.parts.iter().enumerate() {
@@ -6816,9 +7010,6 @@ mod bootstrap_store_tests {
         ));
         assert!(store.committed_manifests().unwrap().is_empty());
         let publication_id = store
-            .commit_bootstrap_aggregate(&fixture.aggregate)
-            .unwrap();
-        store
             .commit_bootstrap_aggregate(&fixture.aggregate)
             .unwrap();
         let loaded = store.load_bootstrap_publication(publication_id).unwrap();
@@ -7090,15 +7281,16 @@ mod bootstrap_store_tests {
     }
 
     #[test]
-    fn zero_part_history_install_is_one_atomic_generation_zero_binding() {
+    fn bootstrap_history_zero_part_install_is_one_atomic_generation_zero_binding() {
         let fixture = EmptyBootstrapFixture::new("zero-history");
         let store = fixture.store();
         store
             .publish_bootstrap_aggregate_prefix(&fixture.aggregate)
             .unwrap();
-        store
+        let publication_id = store
             .commit_bootstrap_aggregate(&fixture.aggregate)
             .unwrap();
+        let publication = store.load_bootstrap_publication(publication_id).unwrap();
         let history = store
             .open_engine_history(fixture.history_binding(0x7400))
             .unwrap();
@@ -7106,7 +7298,7 @@ mod bootstrap_store_tests {
             BootstrapAggregateHistoryBindingV1::for_aggregate(&fixture.aggregate).unwrap();
         assert_eq!(
             history
-                .publish_many_exact(&[], binding, EngineHistoryBinding::empty())
+                .publish_many_exact(&[], &publication, EngineHistoryBinding::empty())
                 .unwrap(),
             (0, EngineHistoryStore::empty_root())
         );
@@ -7126,10 +7318,11 @@ mod bootstrap_store_tests {
     }
 
     #[test]
-    fn multipart_history_install_publishes_every_exact_record_with_one_head_swap() {
+    fn bootstrap_history_multipart_install_publishes_every_exact_record_with_one_head_swap() {
         let fixture = BootstrapFixture::new("multipart-history", 2);
         let store = fixture.store();
-        fixture.publish_committed(&store);
+        let publication_id = fixture.publish_committed(&store);
+        let publication = store.load_bootstrap_publication(publication_id).unwrap();
         let history = store
             .open_engine_history(fixture.history_binding(0x7c00))
             .unwrap();
@@ -7137,7 +7330,7 @@ mod bootstrap_store_tests {
             BootstrapAggregateHistoryBindingV1::for_aggregate(&fixture.aggregate).unwrap();
         let prepared = fixture.prepared_history(binding);
         let (generation, index_root) = history
-            .publish_many_exact(&prepared, binding, EngineHistoryBinding::empty())
+            .publish_many_exact(&prepared, &publication, EngineHistoryBinding::empty())
             .unwrap();
         assert_eq!(generation, fixture.parts.len() as u64);
         assert_ne!(index_root, EngineHistoryStore::empty_root());
@@ -7170,10 +7363,11 @@ mod bootstrap_store_tests {
     }
 
     #[test]
-    fn multipart_history_crashes_on_both_sides_of_head_swap_have_atomic_authority() {
+    fn bootstrap_history_multipart_crashes_on_both_sides_of_head_swap_have_atomic_authority() {
         let fixture = BootstrapFixture::new("multipart-head-cuts", 2);
         let store = fixture.store();
-        fixture.publish_committed(&store);
+        let publication_id = fixture.publish_committed(&store);
+        let publication = store.load_bootstrap_publication(publication_id).unwrap();
         let history = store
             .open_engine_history(fixture.history_binding(0x7c10))
             .unwrap();
@@ -7183,7 +7377,7 @@ mod bootstrap_store_tests {
 
         fail_next_engine_history_head_swap();
         assert!(history
-            .publish_many_exact(&prepared, binding, EngineHistoryBinding::empty())
+            .publish_many_exact(&prepared, &publication, EngineHistoryBinding::empty())
             .is_err());
         assert_eq!(history.current_bootstrap_binding().unwrap(), None);
         assert_eq!(
@@ -7193,7 +7387,7 @@ mod bootstrap_store_tests {
 
         fail_next_engine_history_after_head_swap();
         assert!(history
-            .publish_many_exact(&prepared, binding, EngineHistoryBinding::empty())
+            .publish_many_exact(&prepared, &publication, EngineHistoryBinding::empty())
             .is_err());
         drop(history);
         drop(store);
@@ -7219,6 +7413,14 @@ mod bootstrap_store_tests {
                 Some(part.history_record.as_slice())
             );
         }
+        let prepared = fixture.prepared_history(binding);
+        assert_eq!(
+            history
+                .publish_many_exact(&prepared, &publication, EngineHistoryBinding::empty(),)
+                .unwrap(),
+            (generation, index_root),
+            "fresh reopen must adjudicate an after-swap retry as the exact same install"
+        );
     }
 
     #[test]
@@ -7230,13 +7432,51 @@ mod bootstrap_store_tests {
             .open_engine_history(fixture.history_binding(0x7c20))
             .unwrap();
         let binding = BootstrapAggregateHistoryBindingV1::for_aggregate(&other.aggregate).unwrap();
-        let prepared = vec![PreparedBootstrapHistoryRecordV1::new(
-            fixture.parts[0].descriptor,
-            &fixture.parts[0].history_record,
-            binding,
-        )];
+        let publication = ValidatedBootstrapPublicationV1 {
+            aggregate: other.aggregate.clone(),
+        };
+        let prepared = vec![
+            PreparedBootstrapHistoryRecordV1::unchecked_for_history_index_test(
+                fixture.parts[0].descriptor,
+                &fixture.parts[0].history_record,
+                binding,
+            ),
+        ];
         assert!(matches!(
-            history.publish_many_exact(&prepared, binding, EngineHistoryBinding::empty()),
+            history.publish_many_exact(&prepared, &publication, EngineHistoryBinding::empty()),
+            Err(StoreError::MalformedHistoryIndex)
+        ));
+        assert_eq!(
+            history.current().unwrap(),
+            (0, EngineHistoryStore::empty_root())
+        );
+    }
+
+    #[test]
+    fn publish_many_exact_rejects_duplicate_or_out_of_order_records_without_head_swap() {
+        let fixture = BootstrapFixture::new("history-record-order", 2);
+        let store = fixture.store();
+        let publication_id = fixture.publish_committed(&store);
+        let publication = store.load_bootstrap_publication(publication_id).unwrap();
+        let history = store
+            .open_engine_history(fixture.history_binding(0x7c25))
+            .unwrap();
+        let binding =
+            BootstrapAggregateHistoryBindingV1::for_aggregate(&fixture.aggregate).unwrap();
+        let duplicate = vec![
+            PreparedBootstrapHistoryRecordV1::unchecked_for_history_index_test(
+                fixture.parts[0].descriptor,
+                &fixture.parts[0].history_record,
+                binding,
+            ),
+            PreparedBootstrapHistoryRecordV1::unchecked_for_history_index_test(
+                fixture.parts[0].descriptor,
+                &fixture.parts[0].history_record,
+                binding,
+            ),
+        ];
+        assert!(matches!(
+            history.publish_many_exact(&duplicate, &publication, EngineHistoryBinding::empty(),),
             Err(StoreError::MalformedHistoryIndex)
         ));
         assert_eq!(
@@ -7250,6 +7490,15 @@ mod bootstrap_store_tests {
         let fixture = EmptyBootstrapFixture::new("history-crash-stale");
         let first_store = fixture.store();
         let second_store = fixture.store();
+        first_store
+            .publish_bootstrap_aggregate_prefix(&fixture.aggregate)
+            .unwrap();
+        let publication_id = first_store
+            .commit_bootstrap_aggregate(&fixture.aggregate)
+            .unwrap();
+        let publication = first_store
+            .load_bootstrap_publication(publication_id)
+            .unwrap();
         let first = first_store
             .open_engine_history(fixture.history_binding(0x7500))
             .unwrap();
@@ -7261,15 +7510,162 @@ mod bootstrap_store_tests {
 
         fail_next_engine_history_head_swap();
         assert!(first
-            .publish_many_exact(&[], binding, EngineHistoryBinding::empty())
+            .publish_many_exact(&[], &publication, EngineHistoryBinding::empty())
             .is_err());
         assert_eq!(first.current_bootstrap_binding().unwrap(), None);
         first
-            .publish_many_exact(&[], binding, EngineHistoryBinding::empty())
+            .publish_many_exact(&[], &publication, EngineHistoryBinding::empty())
             .unwrap();
         assert_eq!(first.current_bootstrap_binding().unwrap(), Some(binding));
         assert!(matches!(
-            second.publish_many_exact(&[], binding, EngineHistoryBinding::empty()),
+            second.publish_many_exact(&[], &publication, EngineHistoryBinding::empty()),
+            Ok((0, root)) if root == EngineHistoryStore::empty_root()
+        ));
+    }
+
+    #[test]
+    fn inactive_bootstrap_history_only_open_creates_no_projection_work() {
+        let fixture = EmptyBootstrapFixture::new("history-only-open");
+        let binding = fixture.history_binding(0x7c30);
+        let open = fixture.store().seal_history_only(binding).unwrap();
+        assert_eq!(open.binding(), binding);
+        let (store, history) = open.into_history().unwrap();
+        assert_eq!(
+            history.current().unwrap(),
+            (0, EngineHistoryStore::empty_root())
+        );
+        assert!(
+            fixture
+                .archive
+                .join(PROJECTION_WORK_DIR)
+                .symlink_metadata()
+                .is_err(),
+            "history-only open must not create projection-work"
+        );
+        drop(history);
+        drop(store);
+    }
+
+    #[test]
+    fn inactive_bootstrap_history_only_namespace_substitution_is_rejected_without_adoption() {
+        let fixture = EmptyBootstrapFixture::new("history-only-substitution");
+        let binding = fixture.history_binding(0x7c40);
+        let open = fixture.store().seal_history_only(binding).unwrap();
+        let endpoint = fixture
+            .archive
+            .join(ENGINE_HISTORY_DIR)
+            .join(binding.endpoint.endpoint_id.to_string());
+        set_enrolled_open_act_hook(move || {
+            std::fs::create_dir(&endpoint).unwrap();
+            std::fs::write(endpoint.join("foreign-owner"), b"foreign history").unwrap();
+        });
+        assert!(open.into_history().is_err());
+        assert_eq!(
+            std::fs::read(
+                fixture
+                    .archive
+                    .join(ENGINE_HISTORY_DIR)
+                    .join(binding.endpoint.endpoint_id.to_string())
+                    .join("foreign-owner")
+            )
+            .unwrap(),
+            b"foreign history"
+        );
+        assert!(fixture
+            .archive
+            .join(PROJECTION_WORK_DIR)
+            .symlink_metadata()
+            .is_err());
+    }
+
+    #[test]
+    fn inactive_bootstrap_history_blocks_ordinary_enrolled_open_before_projection_creation() {
+        let fixture = EmptyBootstrapFixture::new("ordinary-open-refusal");
+        let store = fixture.store();
+        store
+            .publish_bootstrap_aggregate_prefix(&fixture.aggregate)
+            .unwrap();
+        let publication_id = store
+            .commit_bootstrap_aggregate(&fixture.aggregate)
+            .unwrap();
+        let publication = store.load_bootstrap_publication(publication_id).unwrap();
+        let storage = fixture.history_binding(0x7c50);
+        let (_, history) = store
+            .seal_history_only(storage)
+            .unwrap()
+            .into_history()
+            .unwrap();
+        history
+            .publish_many_exact(&[], &publication, EngineHistoryBinding::empty())
+            .unwrap();
+        drop(history);
+
+        let error = fixture
+            .store()
+            .seal_enrolled_projection(storage)
+            .err()
+            .expect("inactive authority must fail enrolled open")
+            .1;
+        assert!(matches!(error, StoreError::InactiveBootstrapHistory));
+        assert!(fixture
+            .archive
+            .join(PROJECTION_WORK_DIR)
+            .symlink_metadata()
+            .is_err());
+    }
+
+    #[test]
+    fn bootstrap_history_refuses_different_publication_and_ordinary_nonempty_authority() {
+        let fixture = EmptyBootstrapFixture::new("authority-refusal");
+        let storage = fixture.history_binding(0x7c60);
+        let store = fixture.store();
+        let history = store.open_engine_history(storage).unwrap();
+        history
+            .publish(
+                BatchId::from_uuid(Uuid::from_u128(0x7c61)),
+                b"ordinary history record",
+                EngineHistoryBinding::empty(),
+            )
+            .unwrap();
+        let publication = ValidatedBootstrapPublicationV1 {
+            aggregate: fixture.aggregate.clone(),
+        };
+        assert!(matches!(
+            history.publish_many_exact(&[], &publication, EngineHistoryBinding::empty()),
+            Err(StoreError::BootstrapHistoryRequiresEmptyAuthority)
+        ));
+        assert_eq!(history.current().unwrap().0, 1);
+        drop(history);
+        drop(store);
+
+        let first = EmptyBootstrapFixture::new("different-publication-first");
+        let store = first.store();
+        let history = store.open_engine_history(storage).unwrap();
+        let second_aggregate = BootstrapAggregateManifestV1::empty(
+            first.workspace,
+            first.aggregate.lineage_digest(),
+            crate::oplog::CanonicalGraphResourceId::from_capability_identity(
+                b"bootstrap-history-test",
+                b"different publication",
+            ),
+            ImportId::from_digest([0x99; 32]),
+        )
+        .unwrap();
+        assert_ne!(
+            first.aggregate.publication_id(),
+            second_aggregate.publication_id()
+        );
+        let first_publication = ValidatedBootstrapPublicationV1 {
+            aggregate: first.aggregate.clone(),
+        };
+        let second_publication = ValidatedBootstrapPublicationV1 {
+            aggregate: second_aggregate,
+        };
+        history
+            .publish_many_exact(&[], &first_publication, EngineHistoryBinding::empty())
+            .unwrap();
+        assert!(matches!(
+            history.publish_many_exact(&[], &second_publication, EngineHistoryBinding::empty(),),
             Err(StoreError::BootstrapHistoryRequiresEmptyAuthority)
         ));
     }
