@@ -1537,6 +1537,14 @@ impl DetachedBootstrapCandidate {
     pub(crate) fn accepted_frontier_root(&self) -> Result<AcceptedFrontierRoot, EngineError> {
         self.engine.accepted_frontier_root()
     }
+
+    pub(crate) fn durable_history_binding(&self) -> super::object_store::EngineHistoryBinding {
+        if self.part_count == 0 {
+            super::object_store::EngineHistoryBinding::empty()
+        } else {
+            self.engine.durable_history_binding()
+        }
+    }
 }
 
 /// Inactive, single-use multipart bootstrap author. Every candidate mutation
@@ -1720,11 +1728,11 @@ impl DetachedBootstrapAuthoringSession {
         })
     }
 
-    fn replay_loaded_part(
+    pub(crate) fn replay_prepared_part(
         &mut self,
         descriptor: BootstrapPartDescriptorV1,
-        loaded: super::object_store::LoadedBootstrapPartV1,
-    ) -> Result<(), EngineError> {
+        prepared: PreparedBatch,
+    ) -> Result<DetachedBootstrapAcceptedEngineMaterial, EngineError> {
         let mut candidate = self.candidate.take().ok_or_else(|| {
             EngineError::InvalidTransaction(
                 "detached bootstrap replay session is poisoned or consumed".into(),
@@ -1735,7 +1743,7 @@ impl DetachedBootstrapAuthoringSession {
             if evidence.ordinal() != self.next_ordinal
                 || evidence.predecessor() != self.last_part
                 || descriptor.acceptance_sequence() != self.next_ordinal + 1
-                || loaded.manifest().batch_id() != descriptor.batch_id()
+                || prepared.manifest().batch_id() != descriptor.batch_id()
             {
                 return Err(EngineError::Archive(
                     "direct-loaded bootstrap part is out of aggregate order".into(),
@@ -1751,13 +1759,19 @@ impl DetachedBootstrapAuthoringSession {
                     "direct-loaded bootstrap part changes aggregate continuity".into(),
                 ));
             }
-            let prepared =
-                PreparedBatch::new(loaded.manifest().clone(), loaded.objects().to_vec())?;
-            candidate.advance_detached_bootstrap_candidate(prepared)?;
-            Ok(())
+            let (no_op, accepted_evidence) =
+                candidate.advance_detached_bootstrap_candidate(prepared)?;
+            Ok(DetachedBootstrapAcceptedEngineMaterial {
+                no_op,
+                accepted_evidence,
+                history_binding: candidate.durable_history_binding(),
+                logseq_claim_root: candidate.logseq_claim_root,
+                reference_catalog_policy: candidate.reference_catalog.policy().clone(),
+                reference_catalog_root: candidate.reference_catalog.root().clone(),
+            })
         })();
         match result {
-            Ok(()) => {
+            Ok(material) => {
                 let evidence = descriptor.evidence();
                 self.continuity.get_or_insert(DetachedBootstrapContinuity {
                     import_id: evidence.import_id(),
@@ -1767,10 +1781,19 @@ impl DetachedBootstrapAuthoringSession {
                 self.next_ordinal += 1;
                 self.last_part = Some(descriptor.part_id());
                 self.candidate = Some(candidate);
-                Ok(())
+                Ok(material)
             }
             Err(error) => Err(error),
         }
+    }
+
+    fn replay_loaded_part(
+        &mut self,
+        descriptor: BootstrapPartDescriptorV1,
+        loaded: super::object_store::LoadedBootstrapPartV1,
+    ) -> Result<(), EngineError> {
+        let prepared = PreparedBatch::new(loaded.manifest().clone(), loaded.objects().to_vec())?;
+        self.replay_prepared_part(descriptor, prepared).map(drop)
     }
 }
 

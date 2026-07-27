@@ -32,7 +32,13 @@ use super::external_import::{
 };
 use super::hot_engine::{
     AcceptedFrontierRoot, AuthorBatch, DetachedBootstrapAcceptedEngineMaterial,
-    DetachedBootstrapAuthoringSession, DetachedBootstrapCandidate, MAX_TRANSACTION_OPERATIONS,
+    DetachedBootstrapAuthoringSession, DetachedBootstrapCandidate, DetachedBootstrapReplayIdentity,
+    ProjectionStorageBinding, MAX_TRANSACTION_OPERATIONS,
+};
+use super::identity::BootstrapPartId;
+use super::object_store::{
+    BootstrapAggregateHistoryBindingV1, BootstrapPublicationInspectionV1, ControlDirectoryIdentity,
+    EngineHistoryBinding, ObjectStore, PreparedBootstrapHistoryRecordV1, StoreError,
 };
 use super::receipt::ImportIdDerivation;
 use super::{
@@ -40,10 +46,10 @@ use super::{
     BlockLocation, ContentDigest, CrdtPeerId, CurrentPageAtPath, DeviceId, DocumentId, ImportId,
     ImportInventoryEntry, ImportInventoryState, ImportLocator, LineageDigest, LogicalCompletionId,
     LogicalPageName, LogseqIdentityMutation, LogseqUuid, ManagedPath, ManagedTextKind, ObjectKind,
-    OperationTransaction, PageId, ProjectionCompletedReceipt, ProjectionCompletion,
-    ProjectionIntent, ProjectionReceiptStore, ProjectionStoreError, ReferenceCatalogPolicyV1,
-    SemanticOperation, SessionId, ShardedHotEngine, StructuralLocator, StructuralSpan, WorkspaceId,
-    DIFF_SCHEMA_VERSION,
+    OperationBatch, OperationObject, OperationTransaction, PageId, ProjectionCompletedReceipt,
+    ProjectionCompletion, ProjectionIntent, ProjectionReceiptStore, ProjectionStoreError,
+    ReferenceCatalogPolicyV1, SemanticOperation, SessionId, ShardedHotEngine, StructuralLocator,
+    StructuralSpan, WorkspaceId, DIFF_SCHEMA_VERSION,
 };
 use crate::model::{
     path_is_sync_conflict, BootstrapSourceCapture, BootstrapSourceCaptureInstrumentation,
@@ -56,6 +62,40 @@ thread_local! {
         std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
     static POST_FRONTIER_OVERRIDE:
         std::cell::RefCell<Option<AcceptedFrontierRoot>> = const { std::cell::RefCell::new(None) };
+    static INACTIVE_BOOTSTRAP_ORCHESTRATION_CUT:
+        std::cell::Cell<Option<InactiveBootstrapOrchestrationCut>> =
+            const { std::cell::Cell::new(None) };
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum InactiveBootstrapOrchestrationCut {
+    AfterSourcePublication,
+    AfterOnePart,
+    AfterAggregatePrefix,
+    AfterAggregateCommit,
+    BeforeHistoryHead,
+    AfterHistoryHead,
+}
+
+fn inactive_bootstrap_orchestration_cut(
+    cut: InactiveBootstrapOrchestrationCut,
+) -> Result<(), BootstrapStreamingImportError> {
+    #[cfg(test)]
+    {
+        let inject = INACTIVE_BOOTSTRAP_ORCHESTRATION_CUT
+            .with(|pending| (pending.get() == Some(cut)).then(|| pending.set(None)))
+            .is_some();
+        if inject {
+            return Err(io::Error::other(format!(
+                "injected inactive bootstrap orchestration cut: {cut:?}"
+            ))
+            .into());
+        }
+    }
+    #[cfg(not(test))]
+    let _ = cut;
+    Ok(())
 }
 
 /// The 1M-block program target is expected to fit below these aggregate
@@ -122,6 +162,8 @@ pub(crate) struct BootstrapStreamingImportInstrumentation {
 pub(crate) enum BootstrapStreamingImportError {
     Io(io::Error),
     Protocol(BootstrapImportError),
+    Store(StoreError),
+    Engine(super::hot_engine::EngineError),
     InvalidSource(String),
     InvalidOperation(String),
     ResourceLimit {
@@ -138,6 +180,8 @@ impl fmt::Display for BootstrapStreamingImportError {
         match self {
             Self::Io(error) => error.fmt(formatter),
             Self::Protocol(error) => error.fmt(formatter),
+            Self::Store(error) => error.fmt(formatter),
+            Self::Engine(error) => error.fmt(formatter),
             Self::InvalidSource(detail) | Self::InvalidOperation(detail) => {
                 formatter.write_str(detail)
             }
@@ -176,6 +220,18 @@ impl From<BootstrapImportError> for BootstrapStreamingImportError {
     }
 }
 
+impl From<StoreError> for BootstrapStreamingImportError {
+    fn from(error: StoreError) -> Self {
+        Self::Store(error)
+    }
+}
+
+impl From<super::hot_engine::EngineError> for BootstrapStreamingImportError {
+    fn from(error: super::hot_engine::EngineError) -> Self {
+        Self::Engine(error)
+    }
+}
+
 /// Inactive ownership of a complete, sealed bootstrap preparation. It carries
 /// no object-store, history, graph-writer, projection, SQLite, enrollment, or
 /// runtime capability.
@@ -185,6 +241,8 @@ pub(crate) struct InactiveBootstrapPreparedPublication {
     sealed_directory: PathBuf,
     aggregate: BootstrapAggregateManifestV1,
     commit: BootstrapAggregateCommitV1,
+    catalog_document_id: DocumentId,
+    reference_catalog_policy: ReferenceCatalogPolicyV1,
     candidate: Box<DetachedBootstrapCandidate>,
     engine_materials: Vec<DetachedBootstrapAcceptedEngineMaterial>,
     instrumentation: BootstrapStreamingImportInstrumentation,
@@ -297,6 +355,114 @@ impl InactiveBootstrapPreparedPublication {
     }
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct InactiveBootstrapOrchestrationInstrumentation {
+    pub(crate) source_inventory_pages: u32,
+    pub(crate) source_blob_pages: u32,
+    pub(crate) source_chunks: u64,
+    pub(crate) parts: u32,
+    pub(crate) objects: u64,
+    pub(crate) cold_records: u64,
+    pub(crate) peak_owned_source_chunks: u32,
+    pub(crate) peak_owned_parts: u32,
+    pub(crate) peak_owned_cold_records: u32,
+}
+
+/// Fully reopened proof of one inactive bootstrap installation. It contains
+/// immutable identities and read-only frontier values only.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct InactiveBootstrapVerifiedPublication {
+    workspace_id: WorkspaceId,
+    lineage_digest: LineageDigest,
+    graph_resource: super::CanonicalGraphResourceId,
+    publication_id: super::bootstrap_import::BootstrapPublicationIdV1,
+    aggregate_digest: super::bootstrap_import::BootstrapAggregateDigestV1,
+    import_id: ImportId,
+    part_count: u32,
+    predecessor_terminal: Option<BootstrapPartId>,
+    accepted_frontier: AcceptedFrontierRoot,
+    engine_binding: EngineHistoryBinding,
+    storage_binding: ProjectionStorageBinding,
+    bootstrap_binding: BootstrapAggregateHistoryBindingV1,
+    archive_identity: ControlDirectoryIdentity,
+    history_generation: u64,
+    history_root: ContentDigest,
+    cold_record_count: u64,
+    instrumentation: InactiveBootstrapOrchestrationInstrumentation,
+}
+
+impl InactiveBootstrapVerifiedPublication {
+    pub(crate) const fn workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
+    }
+
+    pub(crate) const fn lineage_digest(&self) -> LineageDigest {
+        self.lineage_digest
+    }
+
+    pub(crate) const fn graph_resource(&self) -> super::CanonicalGraphResourceId {
+        self.graph_resource
+    }
+
+    pub(crate) const fn publication_id(&self) -> super::bootstrap_import::BootstrapPublicationIdV1 {
+        self.publication_id
+    }
+
+    pub(crate) const fn aggregate_digest(
+        &self,
+    ) -> super::bootstrap_import::BootstrapAggregateDigestV1 {
+        self.aggregate_digest
+    }
+
+    pub(crate) const fn import_id(&self) -> ImportId {
+        self.import_id
+    }
+
+    pub(crate) const fn part_count(&self) -> u32 {
+        self.part_count
+    }
+
+    pub(crate) const fn predecessor_terminal(&self) -> Option<BootstrapPartId> {
+        self.predecessor_terminal
+    }
+
+    pub(crate) const fn accepted_frontier(&self) -> &AcceptedFrontierRoot {
+        &self.accepted_frontier
+    }
+
+    pub(crate) const fn engine_binding(&self) -> &EngineHistoryBinding {
+        &self.engine_binding
+    }
+
+    pub(crate) const fn storage_binding(&self) -> ProjectionStorageBinding {
+        self.storage_binding
+    }
+
+    pub(crate) const fn bootstrap_binding(&self) -> BootstrapAggregateHistoryBindingV1 {
+        self.bootstrap_binding
+    }
+
+    pub(crate) const fn archive_identity(&self) -> ControlDirectoryIdentity {
+        self.archive_identity
+    }
+
+    pub(crate) const fn history_generation(&self) -> u64 {
+        self.history_generation
+    }
+
+    pub(crate) const fn history_root(&self) -> ContentDigest {
+        self.history_root
+    }
+
+    pub(crate) const fn cold_record_count(&self) -> u64 {
+        self.cold_record_count
+    }
+
+    pub(crate) const fn instrumentation(&self) -> &InactiveBootstrapOrchestrationInstrumentation {
+        &self.instrumentation
+    }
+}
+
 #[allow(dead_code)]
 pub(crate) struct InactiveBootstrapPreparedPartCursor {
     ordinal: u32,
@@ -333,6 +499,443 @@ impl InactiveBootstrapPreparedPartCursor {
     ) -> Result<Option<Vec<u8>>, BootstrapStreamingImportError> {
         self.objects.next().map_err(Into::into)
     }
+}
+
+fn invalid_bootstrap_orchestration(detail: impl Into<String>) -> BootstrapStreamingImportError {
+    BootstrapStreamingImportError::InvalidOperation(detail.into())
+}
+
+fn validate_inactive_bootstrap_preparation(
+    prepared: &InactiveBootstrapPreparedPublication,
+    store: &ObjectStore,
+    storage_binding: ProjectionStorageBinding,
+) -> Result<
+    (
+        ControlDirectoryIdentity,
+        BootstrapAggregateHistoryBindingV1,
+        AcceptedFrontierRoot,
+        EngineHistoryBinding,
+        u64,
+    ),
+    BootstrapStreamingImportError,
+> {
+    let aggregate_bytes = prepared.aggregate_bytes()?;
+    let sealed_aggregate = BootstrapAggregateManifestV1::decode(&aggregate_bytes)?;
+    if sealed_aggregate != prepared.aggregate {
+        return Err(invalid_bootstrap_orchestration(
+            "sealed aggregate differs from the prepared aggregate",
+        ));
+    }
+    let commit_bytes = prepared.commit_bytes()?;
+    let sealed_commit = BootstrapAggregateCommitV1::decode(&commit_bytes)?;
+    if sealed_commit != prepared.commit {
+        return Err(invalid_bootstrap_orchestration(
+            "sealed commit differs from the prepared commit",
+        ));
+    }
+    sealed_commit.validate_aggregate(&sealed_aggregate)?;
+
+    let aggregate = &prepared.aggregate;
+    if store.workspace_id() != aggregate.workspace_id()
+        || storage_binding.endpoint.graph_resource_id != aggregate.graph_resource()
+        || prepared.source_capture.source_file_count()
+            != u64::from(aggregate.source_inventory_root().source_count())
+        || prepared.source_capture.source_chunk_count()
+            != u64::from(aggregate.source_blob_root().chunk_count())
+        || prepared.candidate.part_count() != aggregate.parts().len() as u32
+        || prepared.candidate.last_part() != aggregate.final_frontier().last_part()
+        || prepared.engine_materials.len() != aggregate.parts().len()
+    {
+        return Err(invalid_bootstrap_orchestration(
+            "workspace, graph, capture, candidate, or aggregate identity mismatch",
+        ));
+    }
+
+    let bootstrap_binding = BootstrapAggregateHistoryBindingV1::for_aggregate(aggregate)?;
+    let accepted_frontier = prepared.candidate.accepted_frontier_root()?;
+    let engine_binding = prepared.candidate.durable_history_binding();
+    let mut object_count = 0_u64;
+    if aggregate.parts().is_empty() {
+        if engine_binding != EngineHistoryBinding::empty() {
+            return Err(invalid_bootstrap_orchestration(
+                "zero-part detached candidate is not canonical empty state",
+            ));
+        }
+    }
+
+    for (ordinal, (descriptor, material)) in aggregate
+        .parts()
+        .iter()
+        .copied()
+        .zip(prepared.engine_materials.iter())
+        .enumerate()
+    {
+        let mut part = prepared.open_part(ordinal as u32)?;
+        let evidence = part.evidence()?;
+        let spans = part.span_index()?;
+        let manifest = OperationBatch::decode(part.manifest_bytes())
+            .map_err(|error| invalid_bootstrap_orchestration(error.to_string()))?;
+        let manifest_digest = ContentDigest::of(part.manifest_bytes());
+        if part.ordinal() != ordinal as u32
+            || evidence != descriptor.evidence()
+            || manifest.origin() != BatchOrigin::BootstrapImport
+            || manifest.workspace_id() != aggregate.workspace_id()
+            || manifest.lineage_digest() != aggregate.lineage_digest()
+            || manifest.batch_id() != descriptor.batch_id()
+            || material.accepted_evidence().batch_id() != descriptor.batch_id()
+            || material.accepted_evidence().acceptance_sequence()
+                != u64::from(descriptor.acceptance_sequence())
+            || material.accepted_evidence().manifest_fingerprint() != manifest_digest
+            || material.reference_catalog_policy() != &prepared.reference_catalog_policy
+        {
+            return Err(invalid_bootstrap_orchestration(
+                "prepared part, manifest, descriptor, or engine material mismatch",
+            ));
+        }
+        spans.validate_part(descriptor.evidence())?;
+        let span_bytes = spans.encode()?;
+        let payload_descriptors = manifest
+            .required_objects()
+            .iter()
+            .map(|object| {
+                PayloadObjectDescriptorV1::new(
+                    object.content_digest(),
+                    object.encoded_byte_length(),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        object_count = object_count
+            .checked_add(manifest.required_objects().len() as u64)
+            .ok_or_else(|| invalid_bootstrap_orchestration("prepared object count overflow"))?;
+        descriptor.validate_loaded_artifacts(
+            BootstrapManifestFingerprintV1::from_bytes(*manifest_digest.as_bytes()),
+            &payload_descriptors,
+            &[FullObjectDescriptorV1::manifest_defined(
+                *ContentDigest::of(&span_bytes).as_bytes(),
+                span_bytes.len() as u64,
+            )?],
+        )?;
+        for expected in manifest.required_objects() {
+            let bytes = part.next_object_bytes()?.ok_or_else(|| {
+                invalid_bootstrap_orchestration("prepared part object stream ended early")
+            })?;
+            let object = OperationObject::decode(&bytes)
+                .map_err(|error| invalid_bootstrap_orchestration(error.to_string()))?;
+            if object
+                .descriptor()
+                .map_err(|error| invalid_bootstrap_orchestration(error.to_string()))?
+                != *expected
+            {
+                return Err(invalid_bootstrap_orchestration(
+                    "prepared part object differs from its manifest descriptor",
+                ));
+            }
+        }
+        if part.next_object_bytes()?.is_some() {
+            return Err(invalid_bootstrap_orchestration(
+                "prepared part object stream has trailing objects",
+            ));
+        }
+
+        let record_bytes = material.encode_history_record(descriptor, bootstrap_binding)?;
+        PreparedBootstrapHistoryRecordV1::new(descriptor, &record_bytes, bootstrap_binding)?;
+    }
+    if let Some(material) = prepared.engine_materials.last() {
+        if material.accepted_evidence().post_frontier_root() != &accepted_frontier
+            || material.history_binding() != &engine_binding
+        {
+            return Err(invalid_bootstrap_orchestration(
+                "terminal engine material differs from the prepared detached candidate",
+            ));
+        }
+    }
+
+    Ok((
+        store.canonical_archive_identity()?,
+        bootstrap_binding,
+        accepted_frontier,
+        engine_binding,
+        object_count,
+    ))
+}
+
+fn publish_inactive_bootstrap_prefix(
+    prepared: &InactiveBootstrapPreparedPublication,
+    store: &ObjectStore,
+    instrumentation: &mut InactiveBootstrapOrchestrationInstrumentation,
+) -> Result<(), BootstrapStreamingImportError> {
+    let aggregate = prepared.aggregate();
+    for ordinal in 0..aggregate.source_inventory_page_count() {
+        let page = prepared.source_inventory_page(ordinal)?;
+        store.publish_bootstrap_source_inventory_page(aggregate.source_inventory_root(), &page)?;
+        instrumentation.source_inventory_pages += 1;
+    }
+    for ordinal in 0..aggregate.source_blob_page_count() {
+        let page = prepared.source_blob_page(ordinal)?;
+        store.publish_bootstrap_source_blob_page(aggregate.source_blob_root(), &page)?;
+        instrumentation.source_blob_pages += 1;
+    }
+    let mut chunks = prepared.source_capture.chunks_cursor()?;
+    while let Some(chunk) = chunks.next()? {
+        let mut reader = prepared.source_capture.open_chunk(&chunk)?;
+        let capacity = usize::try_from(chunk.description().byte_length()).map_err(|_| {
+            invalid_bootstrap_orchestration("source chunk byte length cannot be represented")
+        })?;
+        let mut bytes = Vec::with_capacity(capacity);
+        reader.read_to_end(&mut bytes)?;
+        reader.finish()?;
+        store.publish_bootstrap_source_chunk(
+            SourceBlobChunkDigestV1::from_bytes(*chunk.description().sha256()),
+            &bytes,
+        )?;
+        instrumentation.source_chunks += 1;
+        instrumentation.peak_owned_source_chunks = 1;
+    }
+    inactive_bootstrap_orchestration_cut(
+        InactiveBootstrapOrchestrationCut::AfterSourcePublication,
+    )?;
+
+    for (ordinal, descriptor) in aggregate.parts().iter().copied().enumerate() {
+        let mut part = prepared.open_part(ordinal as u32)?;
+        while let Some(bytes) = part.next_object_bytes()? {
+            store.publish_bootstrap_object_bytes(&bytes)?;
+            instrumentation.objects += 1;
+        }
+        let spans = part.span_index()?;
+        store.publish_bootstrap_part_artifacts(descriptor, part.manifest_bytes(), &spans)?;
+        instrumentation.parts += 1;
+        instrumentation.peak_owned_parts = 1;
+        if ordinal == 0 {
+            inactive_bootstrap_orchestration_cut(InactiveBootstrapOrchestrationCut::AfterOnePart)?;
+        }
+    }
+    store.publish_bootstrap_aggregate_prefix(aggregate)?;
+    inactive_bootstrap_orchestration_cut(InactiveBootstrapOrchestrationCut::AfterAggregatePrefix)
+}
+
+/// Publish, install, freshly reopen, and verify one complete bootstrap while
+/// leaving graph, projection, enrollment, SQLite, and runtime authority
+/// untouched.
+pub(crate) fn publish_install_verify_inactive_bootstrap(
+    prepared: &InactiveBootstrapPreparedPublication,
+    store: ObjectStore,
+    storage_binding: ProjectionStorageBinding,
+) -> Result<InactiveBootstrapVerifiedPublication, BootstrapStreamingImportError> {
+    let (
+        archive_identity,
+        bootstrap_binding,
+        expected_frontier,
+        expected_engine_binding,
+        expected_object_count,
+    ) = validate_inactive_bootstrap_preparation(prepared, &store, storage_binding)?;
+    let aggregate = prepared.aggregate();
+    let archive_path = store.root_path().to_path_buf();
+    let workspace_id = aggregate.workspace_id();
+    let mut instrumentation = InactiveBootstrapOrchestrationInstrumentation::default();
+
+    let was_committed = match store.inspect_bootstrap_aggregate(aggregate) {
+        BootstrapPublicationInspectionV1::Committed(_) => true,
+        BootstrapPublicationInspectionV1::Absent | BootstrapPublicationInspectionV1::Pending => {
+            publish_inactive_bootstrap_prefix(prepared, &store, &mut instrumentation)?;
+            false
+        }
+        BootstrapPublicationInspectionV1::CorruptOrConflicting(error) => {
+            return Err(error.into());
+        }
+    };
+
+    let open = store
+        .seal_history_only(storage_binding)
+        .map_err(|(_store, error)| error)?;
+    if open.binding() != storage_binding {
+        return Err(invalid_bootstrap_orchestration(
+            "sealed history storage binding changed",
+        ));
+    }
+    let (store, history) = open.into_history().map_err(|(_store, error)| error)?;
+    let (existing_generation, existing_root, existing_latest, existing_engine_binding) =
+        history.current_with_binding()?;
+    let existing_record_count = history.current_record_count()?;
+    match history.current_bootstrap_binding()? {
+        None => {
+            if existing_generation != 0
+                || existing_root != super::object_store::EngineHistoryStore::empty_root()
+                || existing_latest.is_some()
+                || existing_engine_binding != EngineHistoryBinding::empty()
+                || existing_record_count != 0
+            {
+                return Err(invalid_bootstrap_orchestration(
+                    "bootstrap installation requires empty ordinary history",
+                ));
+            }
+        }
+        Some(existing) => {
+            if existing != bootstrap_binding
+                || !was_committed
+                || existing_generation != u64::from(bootstrap_binding.part_count())
+                || existing_engine_binding != expected_engine_binding
+                || existing_record_count != u64::from(bootstrap_binding.part_count())
+            {
+                return Err(invalid_bootstrap_orchestration(
+                    "durable history belongs to a different or incomplete bootstrap",
+                ));
+            }
+        }
+    }
+
+    if !was_committed {
+        let publication_id = store.commit_bootstrap_aggregate(aggregate)?;
+        if publication_id != aggregate.publication_id() {
+            return Err(invalid_bootstrap_orchestration(
+                "aggregate commit returned a different publication identity",
+            ));
+        }
+        inactive_bootstrap_orchestration_cut(
+            InactiveBootstrapOrchestrationCut::AfterAggregateCommit,
+        )?;
+    }
+    let publication = store.load_bootstrap_publication(aggregate.publication_id())?;
+    if publication.aggregate() != aggregate {
+        return Err(invalid_bootstrap_orchestration(
+            "direct-loaded committed aggregate differs from preparation",
+        ));
+    }
+
+    let mut builder =
+        history.begin_publish_many_exact(&publication, expected_engine_binding.clone())?;
+    for (descriptor, material) in aggregate
+        .parts()
+        .iter()
+        .copied()
+        .zip(prepared.engine_materials.iter())
+    {
+        let bytes = material.encode_history_record(descriptor, bootstrap_binding)?;
+        let record = PreparedBootstrapHistoryRecordV1::new(descriptor, &bytes, bootstrap_binding)?;
+        builder.push(&record)?;
+        instrumentation.cold_records += 1;
+        instrumentation.peak_owned_cold_records = 1;
+    }
+    inactive_bootstrap_orchestration_cut(InactiveBootstrapOrchestrationCut::BeforeHistoryHead)?;
+    builder.finish()?;
+    inactive_bootstrap_orchestration_cut(InactiveBootstrapOrchestrationCut::AfterHistoryHead)?;
+
+    let replay_identity = DetachedBootstrapReplayIdentity::new(
+        workspace_id,
+        aggregate.lineage_digest(),
+        prepared.catalog_document_id,
+        prepared.reference_catalog_policy.clone(),
+        storage_binding,
+        archive_identity,
+    );
+    drop(history);
+    drop(store);
+
+    let reopened_store = ObjectStore::open(&archive_path, workspace_id)?;
+    if reopened_store.canonical_archive_identity()? != archive_identity {
+        return Err(invalid_bootstrap_orchestration(
+            "fresh archive open changed retained store identity",
+        ));
+    }
+    let reopened_publication =
+        reopened_store.load_bootstrap_publication(aggregate.publication_id())?;
+    if reopened_publication.aggregate() != aggregate {
+        return Err(invalid_bootstrap_orchestration(
+            "fresh direct-loaded aggregate differs from preparation",
+        ));
+    }
+    let open = reopened_store
+        .seal_history_only(storage_binding)
+        .map_err(|(_store, error)| error)?;
+    let (reopened_store, reopened_history) =
+        open.into_history().map_err(|(_store, error)| error)?;
+    let (history_generation, history_root, latest_batch_id, reopened_engine_binding) =
+        reopened_history.current_with_binding()?;
+    let cold_record_count = reopened_history.current_record_count()?;
+    if reopened_history.current_bootstrap_binding()? != Some(bootstrap_binding)
+        || history_generation != u64::from(bootstrap_binding.part_count())
+        || cold_record_count != u64::from(bootstrap_binding.part_count())
+        || reopened_engine_binding != expected_engine_binding
+        || latest_batch_id
+            != aggregate
+                .parts()
+                .last()
+                .map(|descriptor| descriptor.batch_id())
+    {
+        return Err(invalid_bootstrap_orchestration(
+            "fresh durable history differs from prepared bootstrap authority",
+        ));
+    }
+    for (descriptor, material) in aggregate
+        .parts()
+        .iter()
+        .copied()
+        .zip(prepared.engine_materials.iter())
+    {
+        let expected_bytes = material.encode_history_record(descriptor, bootstrap_binding)?;
+        let loaded = reopened_history
+            .lookup(history_root, descriptor.batch_id())?
+            .ok_or_else(|| {
+                invalid_bootstrap_orchestration("fresh history is missing an exact cold record")
+            })?;
+        if loaded != expected_bytes {
+            return Err(invalid_bootstrap_orchestration(
+                "fresh history cold record bytes differ from preparation",
+            ));
+        }
+        PreparedBootstrapHistoryRecordV1::new(descriptor, &loaded, bootstrap_binding)?;
+    }
+    let reopened_candidate = super::hot_engine::replay_direct_loaded_bootstrap(
+        &reopened_store,
+        &reopened_publication,
+        &replay_identity,
+    )?;
+    let reopened_frontier = reopened_candidate.accepted_frontier_root()?;
+    let reopened_candidate_binding = reopened_candidate.durable_history_binding();
+    let part_count_matches = reopened_candidate.part_count() == prepared.candidate.part_count();
+    let terminal_matches = reopened_candidate.last_part() == prepared.candidate.last_part();
+    let frontier_matches = reopened_frontier == expected_frontier;
+    let engine_binding_matches =
+        reopened_candidate_binding.same_replay_authority(&expected_engine_binding);
+    if !part_count_matches || !terminal_matches || !frontier_matches || !engine_binding_matches {
+        return Err(invalid_bootstrap_orchestration(format!(
+            "fresh detached replay differs from prepared candidate \
+             (part_count={part_count_matches}, terminal={terminal_matches}, \
+             frontier={frontier_matches}, engine_binding={engine_binding_matches})"
+        )));
+    }
+    drop(reopened_candidate);
+    drop(reopened_history);
+    drop(reopened_store);
+
+    instrumentation.source_inventory_pages = aggregate.source_inventory_page_count();
+    instrumentation.source_blob_pages = aggregate.source_blob_page_count();
+    instrumentation.source_chunks = prepared.source_capture.source_chunk_count();
+    instrumentation.parts = aggregate.parts().len() as u32;
+    instrumentation.objects = expected_object_count;
+    instrumentation.cold_records = u64::from(bootstrap_binding.part_count());
+    instrumentation.peak_owned_source_chunks = u32::from(instrumentation.source_chunks != 0);
+    instrumentation.peak_owned_parts = u32::from(instrumentation.parts != 0);
+    instrumentation.peak_owned_cold_records = u32::from(instrumentation.cold_records != 0);
+
+    Ok(InactiveBootstrapVerifiedPublication {
+        workspace_id,
+        lineage_digest: aggregate.lineage_digest(),
+        graph_resource: aggregate.graph_resource(),
+        publication_id: aggregate.publication_id(),
+        aggregate_digest: aggregate.aggregate_digest(),
+        import_id: aggregate.import_id(),
+        part_count: aggregate.parts().len() as u32,
+        predecessor_terminal: aggregate.final_frontier().last_part(),
+        accepted_frontier: reopened_frontier,
+        engine_binding: reopened_engine_binding,
+        storage_binding,
+        bootstrap_binding,
+        archive_identity,
+        history_generation,
+        history_root,
+        cold_record_count,
+        instrumentation,
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1641,7 +2244,7 @@ fn author_bootstrap_parts(
         catalog_document_id,
         reference_catalog_policy.clone(),
     )?;
-    let mut authoring = boxed_detached_bootstrap_session(
+    let mut canonical = boxed_detached_bootstrap_session(
         workspace_id,
         lineage_digest,
         catalog_document_id,
@@ -1729,16 +2332,15 @@ fn author_bootstrap_parts(
         let preview_part = preview
             .author_part(author, &transaction, provisional_evidence)
             .map_err(|error| BootstrapStreamingImportError::InvalidOperation(error.to_string()))?;
-        let (preview_prepared, preview_engine_material) = preview_part.into_parts();
+        let (prepared, preview_engine_material) = preview_part.into_parts();
         drop(preview_engine_material);
-        let preview_manifest_bytes = preview_prepared
+        let manifest_bytes = prepared
             .manifest()
             .encode()
             .map_err(|error| BootstrapStreamingImportError::InvalidOperation(error.to_string()))?;
-        let payload_descriptors = prepared_payload_descriptors(&preview_prepared)?;
+        let payload_descriptors = prepared_payload_descriptors(&prepared)?;
         let payload_root = PayloadObjectRootV1::from_objects(&payload_descriptors)?;
-        validate_prepared_part_limits(&preview_prepared, operation_count)?;
-        drop(preview_prepared);
+        validate_prepared_part_limits(&prepared, operation_count)?;
         let evidence = BootstrapImportPartEvidenceV1::new(
             import_id,
             profile_digest,
@@ -1756,36 +2358,25 @@ fn author_bootstrap_parts(
                 "payload commitment changed bootstrap part identity".into(),
             ));
         }
-        let authored = authoring
-            .author_part(author, &transaction, evidence)
-            .map_err(|error| BootstrapStreamingImportError::InvalidOperation(error.to_string()))?;
-        let (prepared, engine_material) = authored.into_parts();
-        let manifest_bytes = prepared
-            .manifest()
-            .encode()
-            .map_err(|error| BootstrapStreamingImportError::InvalidOperation(error.to_string()))?;
-        let actual_payload_descriptors = prepared_payload_descriptors(&prepared)?;
-        if manifest_bytes != preview_manifest_bytes
-            || actual_payload_descriptors != payload_descriptors
-        {
-            return Err(BootstrapStreamingImportError::InvalidOperation(
-                "exact-evidence authoring differs from its bounded preview".into(),
-            ));
-        }
         let manifest_digest = ContentDigest::of(&manifest_bytes);
         let manifest_fingerprint =
             BootstrapManifestFingerprintV1::from_bytes(*manifest_digest.as_bytes());
-        let manifest_objects = [FullObjectDescriptorV1::manifest_defined(
-            *manifest_digest.as_bytes(),
-            manifest_bytes.len() as u64,
+        let span_index = BootstrapPartSpanIndexV1::new(evidence.part_id(), source_spans.clone())?;
+        let span_bytes = span_index.encode()?;
+        let part_artifacts = [FullObjectDescriptorV1::manifest_defined(
+            *ContentDigest::of(&span_bytes).as_bytes(),
+            span_bytes.len() as u64,
         )?];
         let descriptor = BootstrapPartDescriptorV1::accepted(
             evidence,
             manifest_fingerprint,
             &payload_descriptors,
-            &manifest_objects,
+            &part_artifacts,
             archive_frontier,
         )?;
+        let engine_material = canonical
+            .replay_prepared_part(descriptor, prepared.clone())
+            .map_err(|error| BootstrapStreamingImportError::InvalidOperation(error.to_string()))?;
         archive_frontier = descriptor.post_frontier();
         write_prepared_bootstrap_part(
             &parts_directory,
@@ -1819,7 +2410,7 @@ fn author_bootstrap_parts(
         .accepted_frontier_root()
         .map_err(|error| BootstrapStreamingImportError::InvalidOperation(error.to_string()))?;
     drop(preview_candidate);
-    let candidate = finish_boxed_detached_bootstrap_session(authoring)?;
+    let candidate = finish_boxed_detached_bootstrap_session(canonical)?;
     if preview_frontier
         != candidate
             .accepted_frontier_root()
@@ -2039,6 +2630,7 @@ pub(crate) fn prepare_inactive_bootstrap_import(
     // sealed spools and detached engine/scratch capabilities.
     let final_capture = capture.verify_before_inactive_bootstrap_authoring(graph)?;
     record_capture_instrumentation(&mut instrumentation, &final_capture);
+    let retained_reference_catalog_policy = reference_catalog_policy.clone();
     let authored = author_bootstrap_parts(
         workspace_id,
         lineage_digest,
@@ -2107,6 +2699,8 @@ pub(crate) fn prepare_inactive_bootstrap_import(
         sealed_directory,
         aggregate,
         commit,
+        catalog_document_id,
+        reference_catalog_policy: retained_reference_catalog_policy,
         candidate: authored.candidate,
         engine_materials: authored.engine_materials,
         instrumentation,
@@ -5815,7 +6409,14 @@ mod tests {
             .unwrap();
             let lineage = LineageDigest::of(b"snapshot-test");
             let catalog = DocumentId::from_uuid(Uuid::from_u128(4));
-            let author = ShardedHotEngine::new(workspace, lineage, catalog);
+            let archive = root.path().join("archive");
+            let author = ShardedHotEngine::with_enrolled_projection(
+                ObjectStore::open(&archive, workspace).unwrap(),
+                lineage,
+                catalog,
+                &graph,
+                &receipts,
+            );
             let mut operations = Vec::new();
             let mut page_ids = Vec::new();
             for (index, path) in paths.iter().enumerate() {
@@ -5860,18 +6461,22 @@ mod tests {
             }
             let transaction = OperationTransaction::new(operations).unwrap();
             let batch_id = BatchId::from_uuid(Uuid::from_u128(5));
-            let prepared = author
-                .prepare_bootstrap_transaction(
+            let draft = author
+                .draft_author_transaction(
                     AuthorBatch {
                         batch_id,
-                        author_device_id: DeviceId::from_uuid(Uuid::from_u128(6)),
+                        author_device_id: endpoint.device_id,
                         author_session_id: SessionId::from_uuid(Uuid::from_u128(7)),
                         crdt_peer_id: CrdtPeerId::from_u64(8),
                     },
+                    BatchOrigin::LocalMutation,
                     &transaction,
                 )
                 .unwrap();
-            let archive = root.path().join("archive");
+            let prepared = author
+                .finalize_author_transaction(draft, &graph, &receipts, endpoint)
+                .unwrap();
+            drop(author);
             ObjectStore::open(&archive, workspace)
                 .unwrap()
                 .publish_prepared(&prepared)
@@ -7678,5 +8283,405 @@ mod tests {
                 .as_str(),
             "Root.md"
         );
+    }
+
+    fn orchestration_binding(
+        prepared: &InactiveBootstrapPreparedPublication,
+        endpoint: u128,
+    ) -> ProjectionStorageBinding {
+        ProjectionStorageBinding {
+            endpoint: ProjectionEndpointBinding {
+                endpoint_id: ProjectionEndpointId::from_uuid(Uuid::from_u128(endpoint)),
+                device_id: DeviceId::from_uuid(Uuid::from_u128(endpoint + 1)),
+                graph_resource_id: prepared.aggregate().graph_resource(),
+            },
+            receipt_store_id: crate::oplog::ProjectionReceiptStoreId::from_capability_identity(
+                b"inactive-bootstrap-orchestration-test",
+                &(endpoint + 2).to_be_bytes(),
+            ),
+        }
+    }
+
+    fn prepare_existing_bootstrap(
+        root: &TestRoot,
+        label: &str,
+        workspace: WorkspaceId,
+    ) -> InactiveBootstrapPreparedPublication {
+        let graph = Graph::open(&root.path().join("graph"));
+        let capture_scratch = root.path().join(format!("capture-{label}"));
+        let preparation_scratch = root.path().join(format!("preparation-{label}"));
+        fs::create_dir(&capture_scratch).unwrap();
+        fs::create_dir(&preparation_scratch).unwrap();
+        let capture = graph
+            .capture_inactive_bootstrap_sources(&capture_scratch)
+            .unwrap();
+        prepare_inactive_bootstrap_import(
+            &graph,
+            capture,
+            workspace,
+            LineageDigest::of(b"inactive-bootstrap-orchestration-lineage"),
+            DocumentId::from_uuid(Uuid::from_u128(0x6a02)),
+            ReferenceCatalogPolicyV1::default(),
+            &preparation_scratch,
+        )
+        .unwrap()
+    }
+
+    fn rich_orchestration_fixture(
+        label: &str,
+    ) -> (TestRoot, InactiveBootstrapPreparedPublication, WorkspaceId) {
+        let root = TestRoot::new(label);
+        let graph = root.path().join("graph");
+        fs::create_dir_all(graph.join("logseq")).unwrap();
+        fs::write(
+            graph.join("logseq/config.edn"),
+            r#"{:pages-directory "notes"
+                :journals-directory "diary"
+                :file/name-format :triple-lowbar
+                :journal/file-name-format "dd-MM-yyyy"
+                :journal/page-title-format "yyyy-MM-dd"}"#,
+        )
+        .unwrap();
+        fs::create_dir_all(graph.join("notes/arbitrary/nested")).unwrap();
+        fs::create_dir_all(graph.join("notes/深い")).unwrap();
+        fs::create_dir_all(graph.join("diary/nested")).unwrap();
+        fs::write(
+            graph.join("Root.md"),
+            "title:: Root logical name\n\n- root\n",
+        )
+        .unwrap();
+        fs::write(
+            graph.join("notes/arbitrary/nested/Markdown.md"),
+            "title:: Markdown title ☕\n\n- semantic page\n",
+        )
+        .unwrap();
+        fs::write(
+            graph.join("notes/深い/Déjà___計画.markdown"),
+            "- filename-derived page\n",
+        )
+        .unwrap();
+        fs::write(
+            graph.join("diary/nested/25-07-2026.org"),
+            "#+TITLE: Org title ��\n\n* semantic journal\n",
+        )
+        .unwrap();
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(0x6a01));
+        let prepared = prepare_existing_bootstrap(&root, "rich", workspace);
+        (root, prepared, workspace)
+    }
+
+    fn assert_verified_orchestration(
+        prepared: &InactiveBootstrapPreparedPublication,
+        verified: &InactiveBootstrapVerifiedPublication,
+        binding: ProjectionStorageBinding,
+    ) {
+        assert_eq!(verified.workspace_id(), prepared.aggregate().workspace_id());
+        assert_eq!(
+            verified.lineage_digest(),
+            prepared.aggregate().lineage_digest()
+        );
+        assert_eq!(
+            verified.graph_resource(),
+            prepared.aggregate().graph_resource()
+        );
+        assert_eq!(
+            verified.publication_id(),
+            prepared.aggregate().publication_id()
+        );
+        assert_eq!(
+            verified.aggregate_digest(),
+            prepared.aggregate().aggregate_digest()
+        );
+        assert_eq!(verified.import_id(), prepared.aggregate().import_id());
+        assert_eq!(
+            verified.part_count(),
+            prepared.aggregate().parts().len() as u32
+        );
+        assert_eq!(
+            verified.predecessor_terminal(),
+            prepared.aggregate().final_frontier().last_part()
+        );
+        assert_eq!(
+            verified.accepted_frontier(),
+            &prepared.candidate().accepted_frontier_root().unwrap()
+        );
+        assert_eq!(
+            verified.engine_binding(),
+            &prepared.candidate().durable_history_binding()
+        );
+        assert_eq!(verified.storage_binding(), binding);
+        assert_eq!(
+            verified.bootstrap_binding(),
+            BootstrapAggregateHistoryBindingV1::for_aggregate(prepared.aggregate()).unwrap()
+        );
+        assert_eq!(
+            verified.history_generation(),
+            u64::from(verified.part_count())
+        );
+        assert_eq!(
+            verified.cold_record_count(),
+            u64::from(verified.part_count())
+        );
+        assert_ne!(
+            verified.history_root(),
+            ContentDigest::of(b"not-the-history-root")
+        );
+        assert_eq!(
+            verified.archive_identity(),
+            verified.archive_identity(),
+            "archive identity accessor is stable"
+        );
+        assert!(verified.instrumentation().peak_owned_source_chunks <= 1);
+        assert!(verified.instrumentation().peak_owned_parts <= 1);
+        assert!(verified.instrumentation().peak_owned_cold_records <= 1);
+    }
+
+    #[test]
+    fn inactive_bootstrap_orchestration_all_cuts_retry_fresh_and_is_idempotent() {
+        let (root, prepared, workspace) = rich_orchestration_fixture("orchestration-cuts");
+        let binding = orchestration_binding(&prepared, 0x6a10);
+        let graph_root = root.path().join("graph");
+        let graph_before = [
+            "Root.md",
+            "notes/arbitrary/nested/Markdown.md",
+            "notes/深い/Déjà___計画.markdown",
+            "diary/nested/25-07-2026.org",
+            "logseq/config.edn",
+        ]
+        .map(|path| (path, fs::read(graph_root.join(path)).unwrap()));
+        let mut captured_paths = Vec::new();
+        let mut entries = prepared.source_capture().entries_cursor().unwrap();
+        while let Some(entry) = entries.next().unwrap() {
+            captured_paths.push((entry.path().as_str().to_owned(), entry.kind()));
+        }
+        assert!(captured_paths.contains(&("Root.md".into(), ManagedTextKind::Page)));
+        assert!(captured_paths.contains(&(
+            "notes/arbitrary/nested/Markdown.md".into(),
+            ManagedTextKind::Page
+        )));
+        assert!(captured_paths.contains(&(
+            "notes/深い/Déjà___計画.markdown".into(),
+            ManagedTextKind::Page
+        )));
+        assert!(
+            captured_paths.contains(&("diary/nested/25-07-2026.org".into(), ManagedTextKind::Page))
+        );
+
+        let cuts = [
+            InactiveBootstrapOrchestrationCut::AfterSourcePublication,
+            InactiveBootstrapOrchestrationCut::AfterOnePart,
+            InactiveBootstrapOrchestrationCut::AfterAggregatePrefix,
+            InactiveBootstrapOrchestrationCut::AfterAggregateCommit,
+            InactiveBootstrapOrchestrationCut::BeforeHistoryHead,
+            InactiveBootstrapOrchestrationCut::AfterHistoryHead,
+        ];
+        for (index, cut) in cuts.into_iter().enumerate() {
+            let archive = root.path().join(format!("archive-cut-{index}"));
+            INACTIVE_BOOTSTRAP_ORCHESTRATION_CUT.with(|pending| pending.set(Some(cut)));
+            assert!(publish_install_verify_inactive_bootstrap(
+                &prepared,
+                ObjectStore::open(&archive, workspace).unwrap(),
+                binding,
+            )
+            .is_err());
+            if cut == InactiveBootstrapOrchestrationCut::AfterHistoryHead {
+                let store = ObjectStore::open(&archive, workspace).unwrap();
+                let (store, history) = store
+                    .seal_history_only(binding)
+                    .unwrap()
+                    .into_history()
+                    .unwrap();
+                assert_eq!(
+                    history.current_bootstrap_binding().unwrap(),
+                    Some(
+                        BootstrapAggregateHistoryBindingV1::for_aggregate(prepared.aggregate())
+                            .unwrap()
+                    )
+                );
+                drop(history);
+                drop(store);
+            }
+            let verified = publish_install_verify_inactive_bootstrap(
+                &prepared,
+                ObjectStore::open(&archive, workspace).unwrap(),
+                binding,
+            )
+            .unwrap();
+            assert_verified_orchestration(&prepared, &verified, binding);
+            assert!(!archive.join("projection-work").exists());
+        }
+
+        let archive = root.path().join("archive-idempotent");
+        let first = publish_install_verify_inactive_bootstrap(
+            &prepared,
+            ObjectStore::open(&archive, workspace).unwrap(),
+            binding,
+        )
+        .unwrap();
+        let second = publish_install_verify_inactive_bootstrap(
+            &prepared,
+            ObjectStore::open(&archive, workspace).unwrap(),
+            binding,
+        )
+        .unwrap();
+        assert_eq!(first, second);
+        for (path, bytes) in graph_before {
+            assert_eq!(fs::read(graph_root.join(path)).unwrap(), bytes);
+        }
+        assert!(!archive.join("projection-work").exists());
+    }
+
+    #[test]
+    fn inactive_bootstrap_orchestration_zero_and_multipart_are_canonical_and_bounded() {
+        let (zero_root, zero, workspace) = prepare_streaming_bootstrap("orchestration-zero", &[]);
+        let zero_binding = orchestration_binding(&zero, 0x6b10);
+        let zero_verified = publish_install_verify_inactive_bootstrap(
+            &zero,
+            ObjectStore::open(&zero_root.path().join("archive"), workspace).unwrap(),
+            zero_binding,
+        )
+        .unwrap();
+        assert_verified_orchestration(&zero, &zero_verified, zero_binding);
+        assert_eq!(zero_verified.part_count(), 0);
+        assert_eq!(
+            zero_verified.engine_binding(),
+            &EngineHistoryBinding::empty()
+        );
+
+        let mut source = String::new();
+        for ordinal in 0..MAX_OPERATIONS_PER_BOOTSTRAP_PART {
+            source.push_str(&format!("- multipart {ordinal}\n"));
+        }
+        let (multi_root, multi, workspace) = prepare_streaming_bootstrap(
+            "orchestration-multipart",
+            &[("pages/multipart.md", &source)],
+        );
+        assert!(multi.aggregate().parts().len() > 1);
+        let multi_binding = orchestration_binding(&multi, 0x6b20);
+        let verified = publish_install_verify_inactive_bootstrap(
+            &multi,
+            ObjectStore::open(&multi_root.path().join("archive"), workspace).unwrap(),
+            multi_binding,
+        )
+        .unwrap();
+        assert_verified_orchestration(&multi, &verified, multi_binding);
+        assert_eq!(
+            verified.instrumentation().cold_records,
+            u64::from(verified.part_count())
+        );
+        assert_eq!(verified.instrumentation().parts, verified.part_count());
+    }
+
+    #[test]
+    fn inactive_bootstrap_orchestration_refuses_different_publication() {
+        let (root, first, workspace) =
+            rich_orchestration_fixture("orchestration-different-publication");
+        let binding = orchestration_binding(&first, 0x6c10);
+        let archive = root.path().join("archive");
+        let installed = publish_install_verify_inactive_bootstrap(
+            &first,
+            ObjectStore::open(&archive, workspace).unwrap(),
+            binding,
+        )
+        .unwrap();
+        let stale_binding = ProjectionStorageBinding {
+            endpoint: binding.endpoint,
+            receipt_store_id: crate::oplog::ProjectionReceiptStoreId::from_capability_identity(
+                b"inactive-bootstrap-stale-binding",
+                b"different-receipt-store",
+            ),
+        };
+        assert!(publish_install_verify_inactive_bootstrap(
+            &first,
+            ObjectStore::open(&archive, workspace).unwrap(),
+            stale_binding,
+        )
+        .is_err());
+
+        fs::write(
+            root.path().join("graph/Root.md"),
+            "title:: Root logical name\n\n- changed publication\n",
+        )
+        .unwrap();
+        let second = prepare_existing_bootstrap(&root, "different", workspace);
+        assert_ne!(
+            first.aggregate().publication_id(),
+            second.aggregate().publication_id()
+        );
+        assert!(publish_install_verify_inactive_bootstrap(
+            &second,
+            ObjectStore::open(&archive, workspace).unwrap(),
+            binding,
+        )
+        .is_err());
+        let store = ObjectStore::open(&archive, workspace).unwrap();
+        let (store, history) = store
+            .seal_history_only(binding)
+            .unwrap()
+            .into_history()
+            .unwrap();
+        assert_eq!(
+            history.current_bootstrap_binding().unwrap(),
+            Some(installed.bootstrap_binding())
+        );
+        assert_eq!(
+            history.current_with_binding().unwrap().1,
+            installed.history_root()
+        );
+        drop(history);
+        drop(store);
+        assert!(!archive.join("projection-work").exists());
+    }
+
+    #[test]
+    fn inactive_bootstrap_orchestration_refuses_missing_and_truncated_committed_artifacts() {
+        let (root, prepared, workspace) =
+            rich_orchestration_fixture("orchestration-artifact-damage");
+        let binding = orchestration_binding(&prepared, 0x6d10);
+        let part = prepared.aggregate().parts()[0];
+        let part_name = hex_bootstrap_digest(part.part_id().as_bytes());
+
+        let missing_archive = root.path().join("archive-missing");
+        publish_install_verify_inactive_bootstrap(
+            &prepared,
+            ObjectStore::open(&missing_archive, workspace).unwrap(),
+            binding,
+        )
+        .unwrap();
+        fs::remove_file(
+            missing_archive
+                .join("bootstrap-v1/part-spans")
+                .join(&part_name),
+        )
+        .unwrap();
+        assert!(publish_install_verify_inactive_bootstrap(
+            &prepared,
+            ObjectStore::open(&missing_archive, workspace).unwrap(),
+            binding,
+        )
+        .is_err());
+
+        let truncated_archive = root.path().join("archive-truncated");
+        publish_install_verify_inactive_bootstrap(
+            &prepared,
+            ObjectStore::open(&truncated_archive, workspace).unwrap(),
+            binding,
+        )
+        .unwrap();
+        fs::write(
+            truncated_archive
+                .join("bootstrap-v1/parts")
+                .join(&part_name),
+            b"truncated",
+        )
+        .unwrap();
+        assert!(publish_install_verify_inactive_bootstrap(
+            &prepared,
+            ObjectStore::open(&truncated_archive, workspace).unwrap(),
+            binding,
+        )
+        .is_err());
+        assert!(!missing_archive.join("projection-work").exists());
+        assert!(!truncated_archive.join("projection-work").exists());
     }
 }

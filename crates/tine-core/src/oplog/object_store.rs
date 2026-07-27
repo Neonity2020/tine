@@ -580,7 +580,7 @@ impl PageNameDurableBinding {
 }
 
 impl EngineHistoryBinding {
-    fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         Self {
             portable_path_key_version: super::PORTABLE_PATH_KEY_VERSION,
             portable_path_root: super::PortablePathIndexRoot::empty().digest(),
@@ -591,6 +591,18 @@ impl EngineHistoryBinding {
             terminal_evidence: None,
             page_names: PageNameDurableBinding::empty(),
         }
+    }
+
+    /// Compare the replay-stable typed authority. The catalog checkpoint is
+    /// intentionally omitted because it embeds fresh scratch-run page
+    /// references; authenticated recovery applies the same rule while exact
+    /// historical record bytes continue to protect the retained checkpoint.
+    pub(crate) fn same_replay_authority(&self, other: &Self) -> bool {
+        self.portable_path_key_version == other.portable_path_key_version
+            && self.portable_path_root == other.portable_path_root
+            && self.portable_path_conflicts == other.portable_path_conflicts
+            && self.terminal_evidence == other.terminal_evidence
+            && self.page_names == other.page_names
     }
 }
 
@@ -3370,6 +3382,11 @@ impl DurableEngineHistoryStore {
     ) -> Result<Option<BootstrapAggregateHistoryBindingV1>, StoreError> {
         let (_, root) = self.load_head_root()?;
         Ok(root.binding.bootstrap)
+    }
+
+    pub(crate) fn current_record_count(&self) -> Result<u64, StoreError> {
+        let (_, root) = self.load_head_root()?;
+        self.history_record_count(root.index_root, 0)
     }
 
     fn validate_sealed_open(&self) -> Result<(), StoreError> {
