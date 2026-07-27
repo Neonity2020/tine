@@ -74,11 +74,16 @@ thread_local! {
     static SHADOW_BEFORE_FINAL_SOURCE_VERIFY:
         std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> =
         const { std::cell::RefCell::new(None) };
+    static SHADOW_DURABILITY_BARRIERS:
+        std::cell::RefCell<Vec<ShadowProjectionDurabilityBarrier>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[allow(dead_code)]
 pub(crate) enum ShadowProjectionCrashCut {
+    AfterShadowBaseCreation,
+    AfterShadowWorkspaceCreation,
     PartialPayloadWrite,
     AfterPayloadPublication,
     PartialManifestWrite,
@@ -93,6 +98,8 @@ pub(crate) enum ShadowProjectionCrashCut {
 impl ShadowProjectionCrashCut {
     const fn label(self) -> &'static str {
         match self {
+            Self::AfterShadowBaseCreation => "after_shadow_base_creation",
+            Self::AfterShadowWorkspaceCreation => "after_shadow_workspace_creation",
             Self::PartialPayloadWrite => "partial_payload_write",
             Self::AfterPayloadPublication => "after_payload_publication",
             Self::PartialManifestWrite => "partial_manifest_write",
@@ -104,6 +111,13 @@ impl ShadowProjectionCrashCut {
             Self::AfterCommitMarkerPublication => "after_commit_marker_publication",
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShadowProjectionDurabilityBarrier {
+    BackupRootAfterShadowBase,
+    ShadowBaseAfterWorkspace,
+    PublicationParentAfterFinal,
 }
 
 fn take_crash_cut(cut: ShadowProjectionCrashCut) -> bool {
@@ -636,9 +650,12 @@ pub(crate) fn verify_inactive_bootstrap_shadow_projection(
                 "final shadow destination appeared or staged rename failed",
             )
         })?;
-        sync_directory(&paths.parent)?;
         inject_crash_cut(ShadowProjectionCrashCut::AfterStagingRename)?;
     }
+    sync_directory_barrier(
+        &paths.parent,
+        ShadowProjectionDurabilityBarrier::PublicationParentAfterFinal,
+    )?;
 
     let header = manifest_header(
         roots,
@@ -889,7 +906,7 @@ fn summarize_source(
         enforce_limit(
             "source path depth",
             depth as u64,
-            BOOTSTRAP_SOURCE_MAX_DIRECTORY_DEPTH as u64,
+            BOOTSTRAP_SOURCE_MAX_DIRECTORY_DEPTH.saturating_add(1) as u64,
         )?;
         max_depth = max_depth.max(depth);
         let parents = &components[..components.len().saturating_sub(1)];
@@ -1748,14 +1765,28 @@ fn ensure_publication_parent(
     paths: &PublicationPaths,
 ) -> Result<(), ShadowProjectionError> {
     let base = roots.canonical_root().join(SHADOW_ROOT_DIRECTORY);
-    ensure_real_directory_created(&base)?;
+    ensure_real_directory_created_before_parent_sync(
+        &base,
+        ShadowProjectionCrashCut::AfterShadowBaseCreation,
+    )?;
+    sync_directory_barrier(
+        roots.canonical_root(),
+        ShadowProjectionDurabilityBarrier::BackupRootAfterShadowBase,
+    )?;
     let workspace = base.join(authority.workspace_id().to_string());
     if workspace != paths.parent {
         return Err(ShadowProjectionError::BindingMismatch(
             "shadow publication parent is not deterministic",
         ));
     }
-    ensure_real_directory_created(&workspace)
+    ensure_real_directory_created_before_parent_sync(
+        &workspace,
+        ShadowProjectionCrashCut::AfterShadowWorkspaceCreation,
+    )?;
+    sync_directory_barrier(
+        &base,
+        ShadowProjectionDurabilityBarrier::ShadowBaseAfterWorkspace,
+    )
 }
 
 fn hash_file_evidence(
@@ -1830,7 +1861,7 @@ fn validate_managed_path_depth(path: &ManagedPath) -> Result<(), ShadowProjectio
     enforce_limit(
         "managed path depth",
         path.as_str().split('/').count() as u64,
-        BOOTSTRAP_SOURCE_MAX_DIRECTORY_DEPTH as u64,
+        BOOTSTRAP_SOURCE_MAX_DIRECTORY_DEPTH.saturating_add(1) as u64,
     )
 }
 
@@ -2491,6 +2522,20 @@ fn require_real_directory(path: &Path, detail: &'static str) -> Result<(), Shado
 }
 
 fn ensure_real_directory_created(path: &Path) -> Result<(), ShadowProjectionError> {
+    ensure_real_directory_created_inner(path, None)
+}
+
+fn ensure_real_directory_created_before_parent_sync(
+    path: &Path,
+    cut: ShadowProjectionCrashCut,
+) -> Result<(), ShadowProjectionError> {
+    ensure_real_directory_created_inner(path, Some(cut))
+}
+
+fn ensure_real_directory_created_inner(
+    path: &Path,
+    cut_before_parent_sync: Option<ShadowProjectionCrashCut>,
+) -> Result<(), ShadowProjectionError> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata_is_real_directory(&metadata) => Ok(()),
         Ok(_) => Err(ShadowProjectionError::CorruptOrConflicting(
@@ -2501,6 +2546,9 @@ fn ensure_real_directory_created(path: &Path) -> Result<(), ShadowProjectionErro
                 "shadow directory has no parent",
             ))?;
             fs::create_dir(path)?;
+            if let Some(cut) = cut_before_parent_sync {
+                inject_crash_cut(cut)?;
+            }
             sync_directory(parent)
         }
         Err(error) => Err(error.into()),
@@ -2527,6 +2575,18 @@ fn sync_directory(path: &Path) -> Result<(), ShadowProjectionError> {
     let directory = open_directory_nofollow_ambient(path)?;
     sync_dir_required(&directory)
         .map_err(|error| ShadowProjectionError::Io(io::Error::other(error.to_string())))
+}
+
+fn sync_directory_barrier(
+    path: &Path,
+    barrier: ShadowProjectionDurabilityBarrier,
+) -> Result<(), ShadowProjectionError> {
+    sync_directory(path)?;
+    #[cfg(test)]
+    SHADOW_DURABILITY_BARRIERS.with(|barriers| barriers.borrow_mut().push(barrier));
+    #[cfg(not(test))]
+    let _ = barrier;
+    Ok(())
 }
 
 fn hex(bytes: &[u8; 32]) -> String {
@@ -2776,6 +2836,17 @@ mod tests {
         )
     }
 
+    fn source_path_with_directory_depth(depth: usize) -> String {
+        assert!(depth > 0);
+        let mut components = Vec::with_capacity(depth.saturating_add(1));
+        components.push("pages".to_owned());
+        for ordinal in 1..depth {
+            components.push(format!("d{ordinal}"));
+        }
+        components.push("deepest.md".to_owned());
+        components.join("/")
+    }
+
     fn first_payload_file(root: &Path) -> PathBuf {
         let mut stack = vec![root.to_path_buf()];
         while let Some(directory) = stack.pop() {
@@ -2855,6 +2926,100 @@ mod tests {
             page_ids["notes/b/same-copy.org"]
         );
         rich.assert_graph_unchanged();
+    }
+
+    #[test]
+    fn inactive_shadow_projection_accepts_source_maximum_file_path_depth() {
+        let accepted_path = source_path_with_directory_depth(BOOTSTRAP_SOURCE_MAX_DIRECTORY_DEPTH);
+        assert_eq!(
+            accepted_path.split('/').count(),
+            BOOTSTRAP_SOURCE_MAX_DIRECTORY_DEPTH + 1
+        );
+        let accepted = Fixture::new(
+            "maximum-depth",
+            None,
+            vec![(
+                accepted_path.clone(),
+                b"- deepest accepted source\n".to_vec(),
+            )],
+        );
+        assert_eq!(accepted.backup.file_count(), 1);
+        let proof = accepted.verify().unwrap();
+        assert_eq!(
+            fs::read(
+                proof
+                    .directory()
+                    .join(PAYLOAD_DIRECTORY)
+                    .join(&accepted_path)
+            )
+            .unwrap(),
+            b"- deepest accepted source\n"
+        );
+
+        let rejected_root = TestRoot::new("over-maximum-depth");
+        let rejected_graph_root = rejected_root.path().join("graph");
+        let rejected_path =
+            source_path_with_directory_depth(BOOTSTRAP_SOURCE_MAX_DIRECTORY_DEPTH + 1);
+        let rejected_destination = rejected_graph_root.join(rejected_path);
+        fs::create_dir_all(rejected_destination.parent().unwrap()).unwrap();
+        fs::write(rejected_destination, b"- source must reject this depth\n").unwrap();
+        let rejected_graph = Graph::open(&rejected_graph_root);
+        let rejected_capture_root = rejected_root.path().join("capture");
+        fs::create_dir(&rejected_capture_root).unwrap();
+        let error = match rejected_graph.capture_inactive_bootstrap_sources(&rejected_capture_root)
+        {
+            Ok(_) => panic!("source capture accepted one directory beyond its depth cap"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("source directory depth cap exceeded"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn inactive_shadow_projection_retry_reissues_directory_parent_barriers() {
+        let fixture = Fixture::new(
+            "directory-parent-barriers",
+            None,
+            vec![("pages/barriers.md".into(), b"- barriers\n".to_vec())],
+        );
+        let cuts = [
+            (
+                ShadowProjectionCrashCut::AfterShadowBaseCreation,
+                ShadowProjectionDurabilityBarrier::BackupRootAfterShadowBase,
+            ),
+            (
+                ShadowProjectionCrashCut::AfterShadowWorkspaceCreation,
+                ShadowProjectionDurabilityBarrier::ShadowBaseAfterWorkspace,
+            ),
+            (
+                ShadowProjectionCrashCut::AfterStagingRename,
+                ShadowProjectionDurabilityBarrier::PublicationParentAfterFinal,
+            ),
+        ];
+        for (cut, expected_barrier) in cuts {
+            fixture.reset_shadow();
+            SHADOW_PROJECTION_CRASH_CUT.with(|pending| pending.set(Some(cut)));
+            assert!(matches!(
+                fixture.verify(),
+                Err(ShadowProjectionError::InjectedCrashCut(label)) if label == cut.label()
+            ));
+            SHADOW_DURABILITY_BARRIERS.with(|barriers| barriers.borrow_mut().clear());
+            let proof = fixture.verify().unwrap();
+            let barriers = SHADOW_DURABILITY_BARRIERS
+                .with(|barriers| std::mem::take(&mut *barriers.borrow_mut()));
+            assert!(
+                barriers.contains(&expected_barrier),
+                "retry after {cut:?} did not reach {expected_barrier:?}: {barriers:?}"
+            );
+            assert_eq!(
+                fs::read(proof.directory().join("payload/pages/barriers.md")).unwrap(),
+                b"- barriers\n"
+            );
+        }
     }
 
     #[test]
