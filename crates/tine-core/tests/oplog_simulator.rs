@@ -2838,33 +2838,6 @@ fn coordinator_v5_nested_success_and_projection_fault_are_replayable() {
                     device: "alpha".into(),
                     action: CoordinatorAction::Assert {
                         oracle: CoordinatorOracle {
-                            accepted_sequence: Some(2),
-                            sqlite_sequence: Some(2),
-                            frontiers_match: Some(true),
-                            pending_projection_work: Some(0),
-                            handoff: Some(CoordinatorHandoffState::HeldFailedClosed),
-                            read_gate: Some(CoordinatorReadGate::Open),
-                            last_outcome: Some(CoordinatorRunOutcome::FailedClosed {
-                                phase: "ArchiveStage".into(),
-                            }),
-                            ..CoordinatorOracle::default()
-                        },
-                    },
-                },
-            ),
-            event(
-                9,
-                ScheduledActionKind::Coordinator {
-                    device: "alpha".into(),
-                    action: CoordinatorAction::Retry { fault: None },
-                },
-            ),
-            event(
-                10,
-                ScheduledActionKind::Coordinator {
-                    device: "alpha".into(),
-                    action: CoordinatorAction::Assert {
-                        oracle: CoordinatorOracle {
                             accepted_sequence: Some(3),
                             sqlite_sequence: Some(3),
                             frontiers_match: Some(true),
@@ -2880,14 +2853,14 @@ fn coordinator_v5_nested_success_and_projection_fault_are_replayable() {
                 },
             ),
             event(
-                11,
+                9,
                 ScheduledActionKind::Coordinator {
                     device: "alpha".into(),
                     action: CoordinatorAction::Retry { fault: None },
                 },
             ),
             event(
-                12,
+                10,
                 ScheduledActionKind::Coordinator {
                     device: "alpha".into(),
                     action: CoordinatorAction::Assert {
@@ -3216,13 +3189,6 @@ fn coordinator_v5_stale_draft_and_changed_capture_block_before_publication() {
                 14,
                 ScheduledActionKind::Coordinator {
                     device: "alpha".into(),
-                    action: CoordinatorAction::Retry { fault: None },
-                },
-            ),
-            event(
-                15,
-                ScheduledActionKind::Coordinator {
-                    device: "alpha".into(),
                     action: CoordinatorAction::Assert {
                         oracle: CoordinatorOracle {
                             accepted_sequence: Some(3),
@@ -3240,7 +3206,7 @@ fn coordinator_v5_stale_draft_and_changed_capture_block_before_publication() {
                 },
             ),
             event(
-                16,
+                15,
                 ScheduledActionKind::Coordinator {
                     device: "alpha".into(),
                     action: CoordinatorAction::Checkpoint {
@@ -3249,7 +3215,7 @@ fn coordinator_v5_stale_draft_and_changed_capture_block_before_publication() {
                 },
             ),
             event(
-                17,
+                16,
                 ScheduledActionKind::Coordinator {
                     device: "alpha".into(),
                     action: CoordinatorAction::Execute {
@@ -3259,7 +3225,7 @@ fn coordinator_v5_stale_draft_and_changed_capture_block_before_publication() {
                 },
             ),
             event(
-                18,
+                17,
                 ScheduledActionKind::Coordinator {
                     device: "alpha".into(),
                     action: CoordinatorAction::AssertDurableCheckpoint {
@@ -3343,18 +3309,11 @@ fn coordinator_v5_acceptance_sequence_is_not_batch_id_order() {
                 6,
                 ScheduledActionKind::Coordinator {
                     device: "alpha".into(),
-                    action: CoordinatorAction::Retry { fault: None },
-                },
-            ),
-            event(
-                7,
-                ScheduledActionKind::Coordinator {
-                    device: "alpha".into(),
                     action: CoordinatorAction::Assert {
                         oracle: CoordinatorOracle {
                             accepted_sequence: Some(3),
                             accepted_frontier_digest: Some(
-                                "9e7c9b8ff2334ace94a198d3e1c96bd20c4907153c496488fc797352cc316b26"
+                                "84abf48b80a8255fd4bc0bd6787de57e5de81187229fb453c19b47bd1aa83713"
                                     .into(),
                             ),
                             accepted_batches: Some(vec![
@@ -3364,11 +3323,11 @@ fn coordinator_v5_acceptance_sequence_is_not_batch_id_order() {
                             ]),
                             sqlite_sequence: Some(3),
                             sqlite_frontier_digest: Some(
-                                "9e7c9b8ff2334ace94a198d3e1c96bd20c4907153c496488fc797352cc316b26"
+                                "84abf48b80a8255fd4bc0bd6787de57e5de81187229fb453c19b47bd1aa83713"
                                     .into(),
                             ),
                             sqlite_row_digest: Some(
-                                "7bd0f37d5d5084a304f71a78e7299707482fa38e4f9a99a35c1a8e4210ef5552"
+                                "d4d520b0fe4167dc460ade5294b582106d76e9b884a7321447ea788c0eec0355"
                                     .into(),
                             ),
                             frontiers_match: Some(true),
@@ -3384,7 +3343,7 @@ fn coordinator_v5_acceptance_sequence_is_not_batch_id_order() {
                 },
             ),
             event(
-                8,
+                7,
                 ScheduledActionKind::Coordinator {
                     device: "alpha".into(),
                     action: CoordinatorAction::Checkpoint {
@@ -3393,7 +3352,7 @@ fn coordinator_v5_acceptance_sequence_is_not_batch_id_order() {
                 },
             ),
             event(
-                9,
+                8,
                 ScheduledActionKind::Coordinator {
                     device: "alpha".into(),
                     action: CoordinatorAction::Execute {
@@ -3403,7 +3362,7 @@ fn coordinator_v5_acceptance_sequence_is_not_batch_id_order() {
                 },
             ),
             event(
-                10,
+                9,
                 ScheduledActionKind::Coordinator {
                     device: "alpha".into(),
                     action: CoordinatorAction::AssertDurableCheckpoint {
@@ -3432,11 +3391,11 @@ fn coordinator_v5_acceptance_sequence_is_not_batch_id_order() {
     assert!(observed.sqlite_row_digest.is_some());
     assert_eq!(
         observed.accepted_frontier_digest,
-        "9e7c9b8ff2334ace94a198d3e1c96bd20c4907153c496488fc797352cc316b26"
+        "84abf48b80a8255fd4bc0bd6787de57e5de81187229fb453c19b47bd1aa83713"
     );
     assert_eq!(
         observed.sqlite_row_digest.as_deref(),
-        Some("7bd0f37d5d5084a304f71a78e7299707482fa38e4f9a99a35c1a8e4210ef5552")
+        Some("d4d520b0fe4167dc460ade5294b582106d76e9b884a7321447ea788c0eec0355")
     );
     assert_eq!(observed.accepted_batches[0], BatchId::from_uuid(uuid(9)));
     assert_eq!(
@@ -3944,34 +3903,6 @@ fn coordinator_v5_rename_then_deletion_reconciles_exact_managed_paths() {
                     device: "alpha".into(),
                     action: CoordinatorAction::Assert {
                         oracle: CoordinatorOracle {
-                            accepted_sequence: Some(2),
-                            sqlite_sequence: Some(2),
-                            frontiers_match: Some(true),
-                            pending_projection_work: Some(0),
-                            handoff: Some(CoordinatorHandoffState::HeldFailedClosed),
-                            read_gate: Some(CoordinatorReadGate::Open),
-                            last_outcome: Some(CoordinatorRunOutcome::FailedClosed {
-                                phase: "ArchiveStage".into(),
-                            }),
-                            managed_files: Some(Vec::new()),
-                            ..CoordinatorOracle::default()
-                        },
-                    },
-                },
-            ),
-            event(
-                11,
-                ScheduledActionKind::Coordinator {
-                    device: "alpha".into(),
-                    action: CoordinatorAction::Retry { fault: None },
-                },
-            ),
-            event(
-                12,
-                ScheduledActionKind::Coordinator {
-                    device: "alpha".into(),
-                    action: CoordinatorAction::Assert {
-                        oracle: CoordinatorOracle {
                             accepted_sequence: Some(3),
                             sqlite_sequence: Some(3),
                             frontiers_match: Some(true),
@@ -3986,7 +3917,7 @@ fn coordinator_v5_rename_then_deletion_reconciles_exact_managed_paths() {
                 },
             ),
             event(
-                13,
+                11,
                 ScheduledActionKind::Coordinator {
                     device: "alpha".into(),
                     action: CoordinatorAction::Checkpoint {
@@ -3995,7 +3926,7 @@ fn coordinator_v5_rename_then_deletion_reconciles_exact_managed_paths() {
                 },
             ),
             event(
-                14,
+                12,
                 ScheduledActionKind::Coordinator {
                     device: "alpha".into(),
                     action: CoordinatorAction::Execute {
@@ -4005,7 +3936,7 @@ fn coordinator_v5_rename_then_deletion_reconciles_exact_managed_paths() {
                 },
             ),
             event(
-                15,
+                13,
                 ScheduledActionKind::Coordinator {
                     device: "alpha".into(),
                     action: CoordinatorAction::Assert {
@@ -4026,7 +3957,7 @@ fn coordinator_v5_rename_then_deletion_reconciles_exact_managed_paths() {
                 },
             ),
             event(
-                16,
+                14,
                 ScheduledActionKind::Coordinator {
                     device: "alpha".into(),
                     action: CoordinatorAction::AssertDurableCheckpoint {
@@ -4035,7 +3966,7 @@ fn coordinator_v5_rename_then_deletion_reconciles_exact_managed_paths() {
                 },
             ),
             event(
-                17,
+                15,
                 ScheduledActionKind::Coordinator {
                     device: "alpha".into(),
                     action: CoordinatorAction::Checkpoint {
@@ -4044,7 +3975,7 @@ fn coordinator_v5_rename_then_deletion_reconciles_exact_managed_paths() {
                 },
             ),
             event(
-                18,
+                16,
                 ScheduledActionKind::Coordinator {
                     device: "alpha".into(),
                     action: CoordinatorAction::Execute {
@@ -4054,7 +3985,7 @@ fn coordinator_v5_rename_then_deletion_reconciles_exact_managed_paths() {
                 },
             ),
             event(
-                19,
+                17,
                 ScheduledActionKind::Coordinator {
                     device: "alpha".into(),
                     action: CoordinatorAction::AssertCheckpoint {

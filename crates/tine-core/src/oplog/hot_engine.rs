@@ -20589,13 +20589,68 @@ mod validation_tests {
             .archive_store
             .as_ref()
             .unwrap()
-            .publish_prepared(&prepared)
+            .publish_bootstrap_prepared_for_test(&prepared)
             .unwrap();
         assert!(matches!(
             engine.stage_archive_batch(batch_id).unwrap().disposition(),
             BatchDisposition::Accepted { .. }
         ));
         batch_id
+    }
+
+    #[test]
+    fn bootstrap_archive_fixture_requires_test_injector_and_stages_with_bootstrap_semantics() {
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(0x51_000));
+        let lineage = LineageDigest::of(b"bootstrap-archive-fixture-injector");
+        let catalog = DocumentId::from_uuid(Uuid::from_u128(0x51_001));
+        let page = PageId::from_uuid(Uuid::from_u128(0x51_002));
+        let root =
+            std::env::temp_dir().join(format!("tine-bootstrap-archive-fixture-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let archive_path = root.join("archive");
+        let writer = ObjectStore::open(&archive_path, workspace).unwrap();
+        let prepared = ShardedHotEngine::new(workspace, lineage, catalog)
+            .prepare_bootstrap_transaction(
+                test_author(0x51_003, 0x51_003),
+                &OperationTransaction::new(vec![SemanticOperation::CreatePage {
+                    page_id: page,
+                    home_document_id: DocumentId::from_uuid(Uuid::from_u128(0x51_004)),
+                    name: LogicalPageName::parse("Bootstrap Fixture").unwrap(),
+                    path: ManagedPath::parse("pages/bootstrap-fixture.md").unwrap(),
+                    kind: ManagedTextKind::Page,
+                }])
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(prepared.manifest().origin(), BatchOrigin::BootstrapImport);
+        assert!(matches!(
+            writer.publish_prepared(&prepared),
+            Err(super::super::object_store::StoreError::BootstrapBatchRequiresDirectPublication)
+        ));
+        assert!(writer.committed_manifests().unwrap().is_empty());
+
+        writer
+            .publish_bootstrap_prepared_for_test(&prepared)
+            .unwrap();
+        let mut engine = ShardedHotEngine::with_archive_store(
+            ObjectStore::open(&archive_path, workspace).unwrap(),
+            lineage,
+            catalog,
+        );
+        assert!(matches!(
+            engine
+                .stage_archive_batch(prepared.manifest().batch_id())
+                .unwrap()
+                .disposition(),
+            BatchDisposition::Accepted { .. }
+        ));
+        assert_eq!(
+            engine.materialize_page(page).unwrap().name.as_str(),
+            "Bootstrap Fixture"
+        );
+        drop(engine);
+        drop(writer);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn cursor_fixture(
@@ -24410,7 +24465,9 @@ mod validation_tests {
             if index >= BATCHES - 16 {
                 late_manifest_sizes.push(manifest_size);
             }
-            writer.publish_prepared(&prepared).unwrap();
+            writer
+                .publish_bootstrap_prepared_for_test(&prepared)
+                .unwrap();
             let work_before = engine.history_work.get();
             let stage_before = engine.instrumentation();
             assert!(matches!(
@@ -24689,7 +24746,9 @@ mod validation_tests {
                 .unwrap(),
             )
             .unwrap();
-        writer.publish_prepared(&baseline).unwrap();
+        writer
+            .publish_bootstrap_prepared_for_test(&baseline)
+            .unwrap();
         assert!(matches!(
             engine
                 .stage_archive_batch(baseline.manifest().batch_id())
@@ -24810,11 +24869,21 @@ mod validation_tests {
             .unwrap();
         let incomplete_orphan_id = incomplete_orphan.manifest().batch_id();
         let accepted_looking_orphan_id = update.manifest().batch_id();
-        writer.publish_prepared(&update).unwrap();
-        writer.publish_prepared(&malformed_orphan).unwrap();
+        writer.publish_bootstrap_prepared_for_test(&update).unwrap();
         writer
-            .stage_manifest_bytes(&incomplete_orphan.manifest().encode().unwrap())
+            .publish_bootstrap_prepared_for_test(&malformed_orphan)
             .unwrap();
+        let missing_object = incomplete_orphan.objects()[0].descriptor().unwrap();
+        writer
+            .publish_bootstrap_prepared_for_test(&incomplete_orphan)
+            .unwrap();
+        std::fs::remove_file(
+            writer
+                .root_path()
+                .join("objects")
+                .join(format!("{}.object", missing_object.content_digest())),
+        )
+        .unwrap();
         assert!(matches!(
             writer.inspect_batch(incomplete_orphan_id).unwrap(),
             BatchInspection::Staged { .. }
@@ -25042,7 +25111,9 @@ mod validation_tests {
             .unwrap();
         engine.archive_store = archive_runtime;
         assert!(engine.pending_author_documents.borrow().is_some());
-        writer.publish_prepared(&prepared).unwrap();
+        writer
+            .publish_bootstrap_prepared_for_test(&prepared)
+            .unwrap();
         let ready = match writer
             .inspect_batch(prepared.manifest().batch_id())
             .unwrap()
@@ -25147,9 +25218,9 @@ mod validation_tests {
                 ),
             )
             .unwrap();
-        writer.publish_prepared(&seed).unwrap();
-        writer.publish_prepared(&left).unwrap();
-        writer.publish_prepared(&right).unwrap();
+        writer.publish_bootstrap_prepared_for_test(&seed).unwrap();
+        writer.publish_bootstrap_prepared_for_test(&left).unwrap();
+        writer.publish_bootstrap_prepared_for_test(&right).unwrap();
         assert!(matches!(
             engine
                 .stage_archive_batch(seed.manifest().batch_id())
@@ -25296,8 +25367,8 @@ mod validation_tests {
                 ),
             )
             .unwrap();
-        writer.publish_prepared(&first).unwrap();
-        writer.publish_prepared(&second).unwrap();
+        writer.publish_bootstrap_prepared_for_test(&first).unwrap();
+        writer.publish_bootstrap_prepared_for_test(&second).unwrap();
         assert!(matches!(
             engine
                 .stage_archive_batch(first.manifest().batch_id())
@@ -25356,7 +25427,7 @@ mod validation_tests {
                 ),
             )
             .unwrap();
-        writer.publish_prepared(&first).unwrap();
+        writer.publish_bootstrap_prepared_for_test(&first).unwrap();
         assert!(matches!(
             engine
                 .stage_archive_batch(first.manifest().batch_id())
@@ -25377,7 +25448,7 @@ mod validation_tests {
                 .unwrap(),
             )
             .unwrap();
-        writer.publish_prepared(&second).unwrap();
+        writer.publish_bootstrap_prepared_for_test(&second).unwrap();
         let second_outcome = engine
             .stage_archive_batch(second.manifest().batch_id())
             .unwrap();
@@ -25780,10 +25851,12 @@ mod validation_tests {
                 ),
             )
             .unwrap();
-        writer.publish_prepared(&seed).unwrap();
-        writer.publish_prepared(&left).unwrap();
-        writer.publish_prepared(&right).unwrap();
-        writer.publish_prepared(&mutation).unwrap();
+        writer.publish_bootstrap_prepared_for_test(&seed).unwrap();
+        writer.publish_bootstrap_prepared_for_test(&left).unwrap();
+        writer.publish_bootstrap_prepared_for_test(&right).unwrap();
+        writer
+            .publish_bootstrap_prepared_for_test(&mutation)
+            .unwrap();
         assert!(matches!(
             engine
                 .stage_archive_batch(seed.manifest().batch_id())
@@ -26030,7 +26103,9 @@ mod validation_tests {
                     &OperationTransaction::new(operations).unwrap(),
                 )
                 .unwrap();
-            writer.publish_prepared(&prepared).unwrap();
+            writer
+                .publish_bootstrap_prepared_for_test(&prepared)
+                .unwrap();
             assert!(matches!(
                 engine
                     .stage_archive_batch(prepared.manifest().batch_id())
@@ -26150,7 +26225,9 @@ mod validation_tests {
                 .unwrap(),
             )
             .unwrap();
-        writer.publish_prepared(&carried).unwrap();
+        writer
+            .publish_bootstrap_prepared_for_test(&carried)
+            .unwrap();
         let exact_root = engine.scratch_roots.external_document_state_root.clone();
         engine.scratch_roots.external_document_state_root = Default::default();
         engine
@@ -26232,7 +26309,7 @@ mod validation_tests {
                 .unwrap(),
             )
             .unwrap();
-        writer.publish_prepared(&base).unwrap();
+        writer.publish_bootstrap_prepared_for_test(&base).unwrap();
         assert!(matches!(
             base_author
                 .stage_archive_batch(base.manifest().batch_id())
@@ -26279,8 +26356,8 @@ mod validation_tests {
                 .unwrap(),
             )
             .unwrap();
-        writer.publish_prepared(&left).unwrap();
-        writer.publish_prepared(&right).unwrap();
+        writer.publish_bootstrap_prepared_for_test(&left).unwrap();
+        writer.publish_bootstrap_prepared_for_test(&right).unwrap();
 
         let deliver = |first: BatchId, second: BatchId| {
             let mut receiver = ShardedHotEngine::with_archive_store(
@@ -26394,7 +26471,7 @@ mod validation_tests {
                 .unwrap(),
             )
             .unwrap();
-        writer.publish_prepared(&base).unwrap();
+        writer.publish_bootstrap_prepared_for_test(&base).unwrap();
         assert!(matches!(
             left_author
                 .stage_archive_batch(base.manifest().batch_id())
@@ -26435,8 +26512,8 @@ mod validation_tests {
                 .unwrap(),
             )
             .unwrap();
-        writer.publish_prepared(&left).unwrap();
-        writer.publish_prepared(&right).unwrap();
+        writer.publish_bootstrap_prepared_for_test(&left).unwrap();
+        writer.publish_bootstrap_prepared_for_test(&right).unwrap();
 
         let mut receiver = ShardedHotEngine::with_archive_store(
             ObjectStore::open(&archive_path, workspace).unwrap(),
@@ -26571,7 +26648,7 @@ mod validation_tests {
                 .unwrap(),
             )
             .unwrap();
-        writer.publish_prepared(&base).unwrap();
+        writer.publish_bootstrap_prepared_for_test(&base).unwrap();
         author
             .stage_archive_batch(base.manifest().batch_id())
             .unwrap();
@@ -26585,7 +26662,7 @@ mod validation_tests {
                 .unwrap(),
             )
             .unwrap();
-        writer.publish_prepared(&parent).unwrap();
+        writer.publish_bootstrap_prepared_for_test(&parent).unwrap();
         author
             .stage_archive_batch(parent.manifest().batch_id())
             .unwrap();
@@ -26601,7 +26678,9 @@ mod validation_tests {
                     .unwrap(),
                 )
                 .unwrap();
-            writer.publish_prepared(&prepared).unwrap();
+            writer
+                .publish_bootstrap_prepared_for_test(&prepared)
+                .unwrap();
             children.push(prepared.manifest().batch_id());
         }
 
@@ -26778,7 +26857,7 @@ mod validation_tests {
                 &OperationTransaction::new(bootstrap).unwrap(),
             )
             .unwrap();
-        writer.publish_prepared(&base).unwrap();
+        writer.publish_bootstrap_prepared_for_test(&base).unwrap();
         author
             .stage_archive_batch(base.manifest().batch_id())
             .unwrap();
@@ -26796,7 +26875,9 @@ mod validation_tests {
                     .unwrap(),
                 )
                 .unwrap();
-            writer.publish_prepared(&prepared).unwrap();
+            writer
+                .publish_bootstrap_prepared_for_test(&prepared)
+                .unwrap();
             author
                 .stage_archive_batch(prepared.manifest().batch_id())
                 .unwrap();
@@ -26818,7 +26899,7 @@ mod validation_tests {
                 .unwrap(),
             )
             .unwrap();
-        writer.publish_prepared(&wide).unwrap();
+        writer.publish_bootstrap_prepared_for_test(&wide).unwrap();
         let wide_id = wide.manifest().batch_id();
         let dependencies = wide
             .manifest()
@@ -27096,7 +27177,7 @@ mod validation_tests {
                 .unwrap(),
             )
             .unwrap();
-        writer.publish_prepared(&base).unwrap();
+        writer.publish_bootstrap_prepared_for_test(&base).unwrap();
         author
             .stage_archive_batch(base.manifest().batch_id())
             .unwrap();
@@ -27110,7 +27191,7 @@ mod validation_tests {
                 .unwrap(),
             )
             .unwrap();
-        writer.publish_prepared(&parent).unwrap();
+        writer.publish_bootstrap_prepared_for_test(&parent).unwrap();
         author
             .stage_archive_batch(parent.manifest().batch_id())
             .unwrap();
@@ -27126,7 +27207,9 @@ mod validation_tests {
                     .unwrap(),
                 )
                 .unwrap();
-            writer.publish_prepared(&prepared).unwrap();
+            writer
+                .publish_bootstrap_prepared_for_test(&prepared)
+                .unwrap();
             children.push(prepared.manifest().batch_id());
         }
         // One grandchild depends on the first child, so resuming after
@@ -27142,7 +27225,9 @@ mod validation_tests {
                 .unwrap(),
             )
             .unwrap();
-        writer.publish_prepared(&grandchild).unwrap();
+        writer
+            .publish_bootstrap_prepared_for_test(&grandchild)
+            .unwrap();
         let grandchild_id = grandchild.manifest().batch_id();
 
         let mut receiver = ShardedHotEngine::with_archive_store(
@@ -27338,8 +27423,8 @@ mod validation_tests {
         )
         .unwrap();
         let child_id = child.manifest().batch_id();
-        writer.publish_prepared(&parent).unwrap();
-        writer.publish_prepared(&child).unwrap();
+        writer.publish_bootstrap_prepared_for_test(&parent).unwrap();
+        writer.publish_bootstrap_prepared_for_test(&child).unwrap();
 
         for child_first in [false, true] {
             let mut receiver = ShardedHotEngine::with_archive_store(
@@ -27565,7 +27650,9 @@ mod validation_tests {
         .unwrap();
         let child_id = child.manifest().batch_id();
         for prepared in [&rejected_a, &accepted, &rejected_c, &child] {
-            writer.publish_prepared(prepared).unwrap();
+            writer
+                .publish_bootstrap_prepared_for_test(prepared)
+                .unwrap();
         }
 
         let expected_error =
@@ -27781,7 +27868,7 @@ mod validation_tests {
         )
         .unwrap();
         let parent_id = parent.manifest().batch_id();
-        writer.publish_prepared(&parent).unwrap();
+        writer.publish_bootstrap_prepared_for_test(&parent).unwrap();
 
         let mut children = Vec::new();
         for index in 0..CHILDREN {
@@ -27816,7 +27903,7 @@ mod validation_tests {
                 template.objects().to_vec(),
             )
             .unwrap();
-            writer.publish_prepared(&child).unwrap();
+            writer.publish_bootstrap_prepared_for_test(&child).unwrap();
             children.push(child.manifest().batch_id());
         }
 
@@ -27967,9 +28054,9 @@ mod validation_tests {
             )
             .unwrap();
         let right_id = right.manifest().batch_id();
-        writer.publish_prepared(&base).unwrap();
-        writer.publish_prepared(&left).unwrap();
-        writer.publish_prepared(&right).unwrap();
+        writer.publish_bootstrap_prepared_for_test(&base).unwrap();
+        writer.publish_bootstrap_prepared_for_test(&left).unwrap();
+        writer.publish_bootstrap_prepared_for_test(&right).unwrap();
 
         let mut children = Vec::new();
         for index in 0..CHILDREN {
@@ -28003,7 +28090,7 @@ mod validation_tests {
                 )
                 .unwrap();
             assert_eq!(child.manifest().causal_dependency_heads(), &[right_id]);
-            writer.publish_prepared(&child).unwrap();
+            writer.publish_bootstrap_prepared_for_test(&child).unwrap();
             children.push(child.manifest().batch_id());
         }
 
@@ -28127,7 +28214,9 @@ mod validation_tests {
                 .unwrap(),
             )
             .unwrap();
-        writer.publish_prepared(&baseline).unwrap();
+        writer
+            .publish_bootstrap_prepared_for_test(&baseline)
+            .unwrap();
         assert!(matches!(
             engine
                 .stage_archive_batch(baseline.manifest().batch_id())
@@ -28173,7 +28262,9 @@ mod validation_tests {
                 &OperationTransaction::new(operations).unwrap(),
             )
             .unwrap();
-        writer.publish_prepared(&rejected).unwrap();
+        writer
+            .publish_bootstrap_prepared_for_test(&rejected)
+            .unwrap();
         engine.external_publication_failure_index = Some(1);
         let outcome = engine
             .stage_archive_batch(rejected.manifest().batch_id())
@@ -28349,7 +28440,9 @@ mod replay_benchmark {
                     &OperationTransaction::new(operations).unwrap(),
                 )
                 .unwrap();
-            writer.publish_prepared(&prepared).unwrap();
+            writer
+                .publish_bootstrap_prepared_for_test(&prepared)
+                .unwrap();
             assert!(matches!(
                 evolving
                     .stage_archive_batch(author.batch_id)
@@ -28675,7 +28768,9 @@ mod replay_benchmark {
             )
             .unwrap();
         let batch_id = prepared.manifest().batch_id();
-        writer.publish_prepared(&prepared).unwrap();
+        writer
+            .publish_bootstrap_prepared_for_test(&prepared)
+            .unwrap();
         assert!(matches!(
             engine.stage_archive_batch(batch_id).unwrap().disposition(),
             BatchDisposition::Accepted { .. }
@@ -28769,7 +28864,7 @@ mod replay_benchmark {
             )
             .unwrap();
         let base_id = base.manifest().batch_id();
-        writer.publish_prepared(&base).unwrap();
+        writer.publish_bootstrap_prepared_for_test(&base).unwrap();
         assert!(matches!(
             left_author
                 .stage_archive_batch(base_id)
@@ -28818,8 +28913,8 @@ mod replay_benchmark {
             .unwrap();
         let left_id = left.manifest().batch_id();
         let right_id = right.manifest().batch_id();
-        writer.publish_prepared(&left).unwrap();
-        writer.publish_prepared(&right).unwrap();
+        writer.publish_bootstrap_prepared_for_test(&left).unwrap();
+        writer.publish_bootstrap_prepared_for_test(&right).unwrap();
 
         let mut receiver = ShardedHotEngine::with_archive_store(
             ObjectStore::open(&root, workspace).unwrap(),
@@ -28937,7 +29032,7 @@ mod replay_benchmark {
             )
             .unwrap();
         let create_id = create.manifest().batch_id();
-        writer.publish_prepared(&create).unwrap();
+        writer.publish_bootstrap_prepared_for_test(&create).unwrap();
         engine
             .reference_source_observations
             .set(ReferenceSourceObservationStats::default());
@@ -29081,7 +29176,9 @@ mod replay_benchmark {
             )
             .unwrap();
         let delete_target_id = delete_target.manifest().batch_id();
-        writer.publish_prepared(&delete_target).unwrap();
+        writer
+            .publish_bootstrap_prepared_for_test(&delete_target)
+            .unwrap();
         assert!(matches!(
             engine
                 .stage_archive_batch(delete_target_id)
@@ -29119,7 +29216,9 @@ mod replay_benchmark {
             )
             .unwrap();
         let recreate_id = recreate.manifest().batch_id();
-        writer.publish_prepared(&recreate).unwrap();
+        writer
+            .publish_bootstrap_prepared_for_test(&recreate)
+            .unwrap();
         assert!(matches!(
             engine
                 .stage_archive_batch(recreate_id)
@@ -29162,7 +29261,9 @@ mod replay_benchmark {
             )
             .unwrap();
         let move_id = move_block.manifest().batch_id();
-        writer.publish_prepared(&move_block).unwrap();
+        writer
+            .publish_bootstrap_prepared_for_test(&move_block)
+            .unwrap();
         engine
             .reference_source_observations
             .set(ReferenceSourceObservationStats::default());
@@ -29203,7 +29304,9 @@ mod replay_benchmark {
             )
             .unwrap();
         let delete_source_id = delete_source.manifest().batch_id();
-        writer.publish_prepared(&delete_source).unwrap();
+        writer
+            .publish_bootstrap_prepared_for_test(&delete_source)
+            .unwrap();
         assert!(matches!(
             engine
                 .stage_archive_batch(delete_source_id)

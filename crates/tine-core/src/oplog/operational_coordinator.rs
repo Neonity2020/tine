@@ -825,8 +825,8 @@ pub(crate) mod simulator_harness {
     };
     use crate::oplog::{
         write_projection_exact, ApplicationRuntimeRoot, AuthorBatch, BatchDisposition, BatchId,
-        BlockId, BlockLocation, ContentDigest, CrdtPeerId, DeviceId, DocumentId, LogicalPageName,
-        ManagedPath, ObjectStore, OperationTransaction, PageId, ProjectionClaim,
+        BatchOrigin, BlockId, BlockLocation, ContentDigest, CrdtPeerId, DocumentId,
+        LogicalPageName, ManagedPath, ObjectStore, OperationTransaction, PageId, ProjectionClaim,
         ProjectionEndpointBinding, ProjectionEndpointId, ProjectionReceiptStore, RebuildSource,
         SemanticOperation, SessionId, ShardedHotEngine, SqliteFrontier, TailOverlay,
     };
@@ -895,12 +895,17 @@ pub(crate) mod simulator_harness {
             let page_id = PageId::from_uuid(Uuid::from_u128(5));
             let home = DocumentId::from_uuid(Uuid::from_u128(6));
             let block = BlockId::from_uuid(Uuid::from_u128(7));
+            let managed_path = ManagedPath::parse(managed_path).map_err(display)?;
+            let projection_path = graph_root.join(managed_path.as_str());
+            if let Some(parent) = projection_path.parent() {
+                fs::create_dir_all(parent).map_err(io)?;
+            }
             let transaction = OperationTransaction::new(vec![
                 SemanticOperation::CreatePage {
                     page_id,
                     home_document_id: home,
                     name: LogicalPageName::parse("Coordinator Scenario Page").map_err(display)?,
-                    path: ManagedPath::parse(managed_path).map_err(display)?,
+                    path: managed_path,
                     kind: *kind,
                 },
                 SemanticOperation::CreateBlock {
@@ -925,36 +930,37 @@ pub(crate) mod simulator_harness {
                 },
             ])
             .map_err(display)?;
-            let bootstrap_engine = ShardedHotEngine::new(
-                workspace.workspace_id,
-                workspace.lineage_digest,
-                workspace.catalog_document_id,
-            );
-            let bootstrap = bootstrap_engine
-                .prepare_bootstrap_transaction(
-                    AuthorBatch {
-                        batch_id: BatchId::from_uuid(Uuid::from_u128(9)),
-                        author_device_id: DeviceId::from_uuid(Uuid::from_u128(10)),
-                        author_session_id: SessionId::from_uuid(Uuid::from_u128(11)),
-                        crdt_peer_id: CrdtPeerId::from_u64(12),
-                    },
-                    &transaction,
-                )
-                .map_err(display)?;
             let archive_root = root.join("archive");
-            ObjectStore::open(&archive_root, workspace.workspace_id)
-                .map_err(display)?
-                .publish_prepared(&bootstrap)
-                .map_err(display)?;
+            let archive =
+                ObjectStore::open(&archive_root, workspace.workspace_id).map_err(display)?;
             let mut engine = ShardedHotEngine::with_enrolled_projection(
-                ObjectStore::open(&archive_root, workspace.workspace_id).map_err(display)?,
+                archive,
                 workspace.lineage_digest,
                 workspace.catalog_document_id,
                 &graph,
                 &receipts,
             );
+            let draft = engine
+                .draft_author_transaction(
+                    AuthorBatch {
+                        batch_id: BatchId::from_uuid(Uuid::from_u128(9)),
+                        author_device_id: endpoint.device_id(),
+                        author_session_id: SessionId::from_uuid(Uuid::from_u128(11)),
+                        crdt_peer_id: CrdtPeerId::from_u64(12),
+                    },
+                    BatchOrigin::LocalMutation,
+                    &transaction,
+                )
+                .map_err(display)?;
+            let prepared = engine
+                .finalize_author_transaction(draft, &graph, &receipts, endpoint)
+                .map_err(display)?;
+            ObjectStore::open(&archive_root, workspace.workspace_id)
+                .map_err(display)?
+                .publish_prepared(&prepared)
+                .map_err(display)?;
             engine
-                .stage_archive_batch(bootstrap.manifest().batch_id())
+                .stage_archive_batch(prepared.manifest().batch_id())
                 .map_err(display)?;
             write_projection_exact(&graph, &receipts, &engine, page_id, None).map_err(display)?;
             let archive =
@@ -2227,7 +2233,7 @@ mod tests {
             let archive_root = root.path().join("archive");
             ObjectStore::open(&archive_root, workspace_id)
                 .unwrap()
-                .publish_prepared(&bootstrap)
+                .publish_bootstrap_prepared_for_test(&bootstrap)
                 .unwrap();
             let mut engine = ShardedHotEngine::with_enrolled_projection(
                 ObjectStore::open(&archive_root, workspace_id).unwrap(),
@@ -2628,7 +2634,10 @@ mod tests {
                 )
                 .unwrap();
             let batch_id = prepared.manifest().batch_id();
-            fixture.archive.publish_prepared(&prepared).unwrap();
+            fixture
+                .archive
+                .publish_bootstrap_prepared_for_test(&prepared)
+                .unwrap();
             assert!(matches!(
                 fixture
                     .engine
@@ -3073,7 +3082,10 @@ mod tests {
                 .unwrap(),
             )
             .unwrap();
-        fixture.archive.publish_prepared(&first).unwrap();
+        fixture
+            .archive
+            .publish_bootstrap_prepared_for_test(&first)
+            .unwrap();
         fixture
             .engine
             .stage_archive_batch(first.manifest().batch_id())
@@ -3097,7 +3109,10 @@ mod tests {
                 .unwrap(),
             )
             .unwrap();
-        fixture.archive.publish_prepared(&second).unwrap();
+        fixture
+            .archive
+            .publish_bootstrap_prepared_for_test(&second)
+            .unwrap();
         fixture
             .engine
             .stage_archive_batch(second.manifest().batch_id())

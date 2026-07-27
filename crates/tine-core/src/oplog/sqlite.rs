@@ -6959,7 +6959,7 @@ mod tests {
         store: &ObjectStore,
         prepared: &PreparedBatch,
     ) {
-        store.publish_prepared(prepared).unwrap();
+        store.publish_bootstrap_prepared_for_test(prepared).unwrap();
         let outcome = engine
             .stage_from_store(store, prepared.manifest().batch_id())
             .unwrap();
@@ -6974,7 +6974,7 @@ mod tests {
         store: &ObjectStore,
         prepared: &PreparedBatch,
     ) {
-        store.publish_prepared(prepared).unwrap();
+        store.publish_bootstrap_prepared_for_test(prepared).unwrap();
         let outcome = engine
             .stage_archive_batch(prepared.manifest().batch_id())
             .unwrap();
@@ -7029,7 +7029,9 @@ mod tests {
                 &root_transaction(ids, "pages/crash.md", "crash"),
             )
             .unwrap();
-        store.publish_prepared(&prepared).unwrap();
+        store
+            .publish_bootstrap_prepared_for_test(&prepared)
+            .unwrap();
         let engine_store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
         let mut accepted_engine =
             ShardedHotEngine::with_archive_store(engine_store, ids.lineage, ids.catalog);
@@ -7186,7 +7188,9 @@ mod tests {
         )
         .unwrap();
         let prepared = PreparedBatch::new(manifest, objects).unwrap();
-        store.publish_prepared(&prepared).unwrap();
+        store
+            .publish_bootstrap_prepared_for_test(&prepared)
+            .unwrap();
         match store.inspect_batch(batch_id).unwrap() {
             BatchInspection::Ready(validated) => validated,
             other => panic!("expected ready test batch, found {other:?}"),
@@ -10147,8 +10151,12 @@ mod tests {
                 ),
             )
             .unwrap();
-        store.publish_prepared(&left_batch).unwrap();
-        store.publish_prepared(&right_batch).unwrap();
+        store
+            .publish_bootstrap_prepared_for_test(&left_batch)
+            .unwrap();
+        store
+            .publish_bootstrap_prepared_for_test(&right_batch)
+            .unwrap();
         let mut engine = base.engine();
         assert!(matches!(
             engine
@@ -10683,8 +10691,12 @@ mod tests {
                 &root_transaction_named(right, "pages/right.md", "Concurrent Right", "right"),
             )
             .unwrap();
-        store.publish_prepared(&left_batch).unwrap();
-        store.publish_prepared(&right_batch).unwrap();
+        store
+            .publish_bootstrap_prepared_for_test(&left_batch)
+            .unwrap();
+        store
+            .publish_bootstrap_prepared_for_test(&right_batch)
+            .unwrap();
         let mut receiver = base.engine();
         assert!(matches!(
             receiver
@@ -10751,8 +10763,12 @@ mod tests {
             good.manifest().encode().unwrap(),
             evil.manifest().encode().unwrap()
         );
-        good_store.publish_prepared(&good).unwrap();
-        evil_store.publish_prepared(&evil).unwrap();
+        good_store
+            .publish_bootstrap_prepared_for_test(&good)
+            .unwrap();
+        evil_store
+            .publish_bootstrap_prepared_for_test(&evil)
+            .unwrap();
         let mut receiver = ids.engine();
         assert!(matches!(
             receiver
@@ -11022,7 +11038,9 @@ mod tests {
 
         let substitute_store =
             ObjectStore::open(&dir.path().join("substitute-objects"), ids.workspace).unwrap();
-        substitute_store.publish_prepared(&prepared).unwrap();
+        substitute_store
+            .publish_bootstrap_prepared_for_test(&prepared)
+            .unwrap();
         let substitute_engine_store =
             ObjectStore::open(&dir.path().join("substitute-objects"), ids.workspace).unwrap();
         let mut substitute_engine =
@@ -11841,7 +11859,9 @@ mod tests {
         let prepared = author_engine
             .prepare_bootstrap_transaction(author(8_100), &transaction)
             .unwrap();
-        store.publish_prepared(&prepared).unwrap();
+        store
+            .publish_bootstrap_prepared_for_test(&prepared)
+            .unwrap();
         let reader = ObjectStore::open(&store_path, ids.workspace).unwrap();
         let mut engine = ShardedHotEngine::with_archive_store(reader, ids.lineage, ids.catalog);
         assert!(matches!(
@@ -11939,7 +11959,7 @@ mod tests {
                 .unwrap(),
             )
             .unwrap();
-        store.publish_prepared(&create).unwrap();
+        store.publish_bootstrap_prepared_for_test(&create).unwrap();
         let reader = ObjectStore::open(&store_path, ids.workspace).unwrap();
         let mut engine = ShardedHotEngine::with_archive_store(reader, ids.lineage, ids.catalog);
         assert!(matches!(
@@ -11960,7 +11980,7 @@ mod tests {
                 .unwrap(),
             )
             .unwrap();
-        store.publish_prepared(&change).unwrap();
+        store.publish_bootstrap_prepared_for_test(&change).unwrap();
         assert!(matches!(
             engine
                 .stage_archive_batch(change.manifest().batch_id())

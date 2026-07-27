@@ -36,6 +36,7 @@ use smallvec::SmallVec;
 use uuid::Uuid;
 
 use super::identity::parse_digest;
+use super::simulator::SimulatorBootstrapFixtureIngress;
 use super::{
     bootstrap_import::{
         ArchiveLocalFrontierBindingV1, BootstrapAggregateCommitV1, BootstrapAggregateDigestV1,
@@ -841,8 +842,38 @@ impl ObjectStore {
     /// Validate and publish the sole batch commit marker. Missing objects do
     /// not prevent staging the marker and remain invisible until complete.
     pub fn stage_manifest_bytes(&self, bytes: &[u8]) -> Result<BatchId, StoreError> {
+        self.stage_manifest_bytes_impl(bytes, false)
+    }
+
+    /// Stage one canonical historical bootstrap manifest for deterministic
+    /// simulator fixture ingress.
+    ///
+    /// The unforgeable safe-code authority is owned only by the simulator
+    /// module. This is not an app-runtime, migration, provider-reconciliation,
+    /// or enrollment API. It preserves normal decoding, workspace and lineage
+    /// validation, size bounds, and immutable collision checks, and bypasses
+    /// only the public bootstrap-origin admission guard.
+    pub(super) fn stage_simulator_bootstrap_manifest_bytes(
+        &self,
+        _fixture_ingress: &SimulatorBootstrapFixtureIngress,
+        bytes: &[u8],
+    ) -> Result<BatchId, StoreError> {
         let manifest = OperationBatch::decode(bytes)?;
-        if manifest.origin() == BatchOrigin::BootstrapImport {
+        assert_eq!(
+            manifest.origin(),
+            BatchOrigin::BootstrapImport,
+            "simulator bootstrap fixture ingress requires BootstrapImport origin"
+        );
+        self.stage_manifest_bytes_impl(&manifest.encode()?, true)
+    }
+
+    fn stage_manifest_bytes_impl(
+        &self,
+        bytes: &[u8],
+        allow_bootstrap: bool,
+    ) -> Result<BatchId, StoreError> {
+        let manifest = OperationBatch::decode(bytes)?;
+        if !allow_bootstrap && manifest.origin() == BatchOrigin::BootstrapImport {
             return Err(StoreError::BootstrapBatchRequiresDirectPublication);
         }
         if manifest.workspace_id() != self.workspace_id {
@@ -870,6 +901,29 @@ impl ObjectStore {
         if batch.manifest().origin() == BatchOrigin::BootstrapImport {
             return Err(StoreError::BootstrapBatchRequiresDirectPublication);
         }
+        self.publish_prepared_impl(batch, false)
+    }
+
+    /// Seed a bootstrap-origin archive fixture without exposing a production
+    /// publication bypass.
+    #[cfg(test)]
+    pub(crate) fn publish_bootstrap_prepared_for_test(
+        &self,
+        batch: &PreparedBatch,
+    ) -> Result<(), StoreError> {
+        assert_eq!(
+            batch.manifest().origin(),
+            BatchOrigin::BootstrapImport,
+            "bootstrap fixture publication requires BootstrapImport origin"
+        );
+        self.publish_prepared_impl(batch, true)
+    }
+
+    fn publish_prepared_impl(
+        &self,
+        batch: &PreparedBatch,
+        allow_bootstrap: bool,
+    ) -> Result<(), StoreError> {
         if batch.manifest().workspace_id() != self.workspace_id {
             return Err(StoreError::WorkspaceMismatch {
                 expected: self.workspace_id,
@@ -880,7 +934,7 @@ impl ObjectStore {
             self.stage_object_bytes(&object.encode()?)?;
         }
         publish_after_objects_hook()?;
-        self.stage_manifest_bytes(&batch.manifest().encode()?)?;
+        self.stage_manifest_bytes_impl(&batch.manifest().encode()?, allow_bootstrap)?;
         Ok(())
     }
 

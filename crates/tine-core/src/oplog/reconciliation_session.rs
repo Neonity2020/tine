@@ -871,7 +871,7 @@ mod tests {
             let archive_root = root.path().join("archive");
             ObjectStore::open(&archive_root, workspace_id)
                 .unwrap()
-                .publish_prepared(&bootstrap)
+                .publish_bootstrap_prepared_for_test(&bootstrap)
                 .unwrap();
             let mut engine = ShardedHotEngine::with_enrolled_projection(
                 ObjectStore::open(&archive_root, workspace_id).unwrap(),

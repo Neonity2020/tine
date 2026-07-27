@@ -45,6 +45,16 @@ use super::{
 };
 use crate::Graph;
 
+/// Unforgeable safe-code authority for the deterministic simulator's
+/// historical bootstrap fixtures. The field is private to this module, so
+/// other production oplog modules cannot invoke the ObjectStore bypass.
+pub(super) struct SimulatorBootstrapFixtureIngress {
+    _private: (),
+}
+
+const SIMULATOR_BOOTSTRAP_FIXTURE_INGRESS: SimulatorBootstrapFixtureIngress =
+    SimulatorBootstrapFixtureIngress { _private: () };
+
 /// Version 5 adds the operational-coordinator action vocabulary and its
 /// durable-state observations. Versions are deliberately never upgraded on
 /// decode: a fixture describes an exact replay contract.
@@ -5139,7 +5149,10 @@ impl DeterministicSimulator {
                 ProviderItemKind::Manifest => self
                     .device(device)?
                     .store()?
-                    .stage_manifest_bytes(&file.bytes)
+                    .stage_simulator_bootstrap_manifest_bytes(
+                        &SIMULATOR_BOOTSTRAP_FIXTURE_INGRESS,
+                        &file.bytes,
+                    )
                     .map(Some),
             };
             let receipt = IngressReceipt {
@@ -5294,7 +5307,10 @@ impl DeterministicSimulator {
             ProviderItemKind::Manifest => self
                 .device(device)?
                 .store()?
-                .stage_manifest_bytes(&bytes)
+                .stage_simulator_bootstrap_manifest_bytes(
+                    &SIMULATOR_BOOTSTRAP_FIXTURE_INGRESS,
+                    &bytes,
+                )
                 .map(|_| ()),
         };
         let receipt = IngressReceipt {
@@ -9772,6 +9788,91 @@ fn bounded_provider_files(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::oplog::{
+        BatchCausalDot, BatchOrigin, CausalPeerId, FrontierV2, ObjectKind, OperationObject,
+        SemanticEffectDigest,
+    };
+
+    fn fixture_manifest(origin: BatchOrigin, batch_id: BatchId) -> OperationBatch {
+        let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(0x5eed));
+        let payload = b"simulator fixture seam".to_vec();
+        let object = OperationObject::new(
+            workspace_id,
+            DocumentId::from_uuid(Uuid::from_u128(0x5eee)),
+            ObjectKind::SemanticEffect,
+            payload.clone(),
+        )
+        .unwrap();
+        let device_id = DeviceId::from_uuid(Uuid::from_u128(0x5eef));
+        OperationBatch::new_with_causality(
+            workspace_id,
+            LineageDigest::of(b"simulator-fixture-seam-lineage"),
+            batch_id,
+            device_id,
+            SessionId::from_uuid(Uuid::from_u128(0x5ef0)),
+            origin,
+            BatchCausalDot::new(CausalPeerId::from_device_id(device_id), 1).unwrap(),
+            Vec::new(),
+            FrontierV2::new(Vec::new()).unwrap(),
+            SemanticEffectDigest::of(&payload),
+            vec![object.descriptor().unwrap()],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn simulator_fixture_ingress_is_bootstrap_only_and_archives_canonical_bytes() {
+        let root = ScenarioRoot::new().unwrap();
+        let archive = root.0.join("fixture-seam-archive");
+        let store =
+            ObjectStore::open(&archive, WorkspaceId::from_uuid(Uuid::from_u128(0x5eed))).unwrap();
+        let bootstrap = fixture_manifest(
+            BatchOrigin::BootstrapImport,
+            BatchId::from_uuid(Uuid::from_u128(0x5ef1)),
+        );
+        let bootstrap_bytes = bootstrap.encode().unwrap();
+
+        assert!(matches!(
+            store.stage_manifest_bytes(&bootstrap_bytes),
+            Err(super::super::StoreError::BootstrapBatchRequiresDirectPublication)
+        ));
+        assert!(store.committed_manifests().unwrap().is_empty());
+
+        let local = fixture_manifest(
+            BatchOrigin::LocalMutation,
+            BatchId::from_uuid(Uuid::from_u128(0x5ef2)),
+        );
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            store
+                .stage_simulator_bootstrap_manifest_bytes(
+                    &SIMULATOR_BOOTSTRAP_FIXTURE_INGRESS,
+                    &local.encode().unwrap(),
+                )
+                .unwrap();
+        }));
+        assert!(rejected.is_err());
+        assert!(store.committed_manifests().unwrap().is_empty());
+
+        assert_eq!(
+            store
+                .stage_simulator_bootstrap_manifest_bytes(
+                    &SIMULATOR_BOOTSTRAP_FIXTURE_INGRESS,
+                    &bootstrap_bytes,
+                )
+                .unwrap(),
+            bootstrap.batch_id()
+        );
+        assert_eq!(
+            fs::read(
+                store
+                    .root_path()
+                    .join("batches")
+                    .join(format!("{}.manifest", bootstrap.batch_id()))
+            )
+            .unwrap(),
+            bootstrap.encode().unwrap()
+        );
+    }
 
     fn action(event_id: u64, action: ScheduledActionKind) -> ScheduledAction {
         ScheduledAction {
