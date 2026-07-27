@@ -1518,7 +1518,9 @@ impl Drop for DetachedBootstrapScratchRoot {
 /// publication, projection, graph, SQLite, or enrollment capability.
 #[allow(dead_code)]
 pub(crate) struct DetachedBootstrapCandidate {
-    engine: ShardedHotEngine,
+    // Even an empty engine is large in test/debug builds. Heap ownership keeps
+    // nested direct replay and validation stack-bounded at maximum part width.
+    engine: Box<ShardedHotEngine>,
     scratch_root: DetachedBootstrapScratchRoot,
     part_count: u32,
     last_part: Option<BootstrapPartId>,
@@ -1545,6 +1547,14 @@ impl DetachedBootstrapCandidate {
             self.engine.durable_history_binding()
         }
     }
+
+    /// Read-only accepted-history authority for consumers that already hold
+    /// the enclosing inactive-bootstrap capability. The candidate remains
+    /// owned by that capability, so no mutation or projection writer can be
+    /// recovered from this borrow.
+    pub(crate) const fn accepted_engine(&self) -> &ShardedHotEngine {
+        &self.engine
+    }
 }
 
 /// Inactive, single-use multipart bootstrap author. Every candidate mutation
@@ -1552,7 +1562,7 @@ impl DetachedBootstrapCandidate {
 /// part makes every error permanently poison the session.
 #[allow(dead_code)]
 pub(crate) struct DetachedBootstrapAuthoringSession {
-    candidate: Option<ShardedHotEngine>,
+    candidate: Option<Box<ShardedHotEngine>>,
     scratch_root: Option<DetachedBootstrapScratchRoot>,
     continuity: Option<DetachedBootstrapContinuity>,
     next_ordinal: u32,
@@ -1604,8 +1614,11 @@ impl DetachedBootstrapAuthoringSession {
         let scratch_root = DetachedBootstrapScratchRoot::create()?;
         let scratch = ScratchStore::open(&scratch_root.root, workspace_id)
             .map_err(|error| EngineError::Archive(error.to_string()))?;
-        let mut candidate =
-            ShardedHotEngine::new(workspace_id, lineage_digest, catalog_document_id);
+        let mut candidate = Box::new(ShardedHotEngine::new(
+            workspace_id,
+            lineage_digest,
+            catalog_document_id,
+        ));
         candidate.scratch = Some(Arc::new(scratch));
         candidate.configure_reference_catalog_policy(reference_catalog_policy)?;
         Ok(Self {
@@ -1797,11 +1810,18 @@ impl DetachedBootstrapAuthoringSession {
     }
 }
 
-pub(crate) fn replay_direct_loaded_bootstrap(
+fn replay_direct_loaded_bootstrap_with<F>(
     store: &ObjectStore,
     publication: &super::object_store::ValidatedBootstrapPublicationV1,
     preparation: &DetachedBootstrapReplayIdentity,
-) -> Result<DetachedBootstrapCandidate, EngineError> {
+    mut validate_part: F,
+) -> Result<DetachedBootstrapCandidate, EngineError>
+where
+    F: FnMut(
+        BootstrapPartDescriptorV1,
+        &DetachedBootstrapAcceptedEngineMaterial,
+    ) -> Result<(), EngineError>,
+{
     let aggregate = publication.aggregate();
     if store.workspace_id() != preparation.workspace_id
         || aggregate.workspace_id() != preparation.workspace_id
@@ -1825,7 +1845,9 @@ pub(crate) fn replay_direct_loaded_bootstrap(
         let loaded = store
             .load_bootstrap_part(publication, ordinal)
             .map_err(|error| EngineError::Archive(error.to_string()))?;
-        session.replay_loaded_part(descriptor, loaded)?;
+        let prepared = PreparedBatch::new(loaded.manifest().clone(), loaded.objects().to_vec())?;
+        let material = session.replay_prepared_part(descriptor, prepared)?;
+        validate_part(descriptor, &material)?;
     }
     let candidate = session.finish()?;
     if candidate.part_count() != aggregate.parts().len() as u32
@@ -1836,6 +1858,51 @@ pub(crate) fn replay_direct_loaded_bootstrap(
         ));
     }
     Ok(candidate)
+}
+
+pub(crate) fn replay_direct_loaded_bootstrap(
+    store: &ObjectStore,
+    publication: &super::object_store::ValidatedBootstrapPublicationV1,
+    preparation: &DetachedBootstrapReplayIdentity,
+) -> Result<DetachedBootstrapCandidate, EngineError> {
+    replay_direct_loaded_bootstrap_with(store, publication, preparation, |_, _| Ok(()))
+}
+
+pub(crate) fn replay_direct_loaded_bootstrap_validating_history(
+    store: &ObjectStore,
+    publication: &super::object_store::ValidatedBootstrapPublicationV1,
+    preparation: &DetachedBootstrapReplayIdentity,
+    history: &super::object_store::DurableEngineHistoryStore,
+    history_root: ContentDigest,
+    bootstrap: super::object_store::BootstrapAggregateHistoryBindingV1,
+) -> Result<
+    (
+        DetachedBootstrapCandidate,
+        super::object_store::EngineHistoryBinding,
+    ),
+    EngineError,
+> {
+    let mut terminal_history_binding = super::object_store::EngineHistoryBinding::empty();
+    let candidate = replay_direct_loaded_bootstrap_with(
+        store,
+        publication,
+        preparation,
+        |descriptor, material| {
+            let found = history
+                .lookup(history_root, descriptor.batch_id())
+                .map_err(|error| EngineError::Archive(error.to_string()))?
+                .ok_or_else(|| {
+                    EngineError::Archive(
+                        "fresh history is missing an aggregate-bound cold record".into(),
+                    )
+                })?;
+            terminal_history_binding = validate_bootstrap_history_record_against_material(
+                descriptor, &found, bootstrap, material,
+            )?;
+            Ok(())
+        },
+    )?;
+    Ok((candidate, terminal_history_binding))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -16468,6 +16535,29 @@ pub(crate) fn validate_bootstrap_history_record(
         ));
     }
     Ok(history_record_binding(&record))
+}
+
+fn validate_bootstrap_history_record_against_material(
+    part: BootstrapPartDescriptorV1,
+    bytes: &[u8],
+    binding: super::object_store::BootstrapAggregateHistoryBindingV1,
+    material: &DetachedBootstrapAcceptedEngineMaterial,
+) -> Result<super::object_store::EngineHistoryBinding, EngineError> {
+    let record_binding = validate_bootstrap_history_record(part, bytes, binding)?;
+    let mut expected_material = material.clone();
+    // Scratch checkpoint page references are freshly allocated on replay.
+    // The retained checkpoint binding remains authenticated by the exact
+    // verified history root; every replay-stable field is derived from this
+    // descriptor's material before the next descriptor is admitted.
+    expected_material.history_binding.catalog_checkpoint_binding =
+        record_binding.catalog_checkpoint_binding;
+    let expected = expected_material.encode_history_record(part, binding)?;
+    if bytes != expected {
+        return Err(EngineError::Archive(
+            "bootstrap cold record differs from its exact per-part replay authority".into(),
+        ));
+    }
+    Ok(record_binding)
 }
 
 fn validate_history_catalog(

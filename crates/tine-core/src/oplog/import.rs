@@ -39,6 +39,7 @@ use super::identity::BootstrapPartId;
 use super::object_store::{
     BootstrapAggregateHistoryBindingV1, BootstrapPublicationInspectionV1, ControlDirectoryIdentity,
     EngineHistoryBinding, ObjectStore, PreparedBootstrapHistoryRecordV1, StoreError,
+    ValidatedBootstrapPublicationV1,
 };
 use super::receipt::ImportIdDerivation;
 use super::{
@@ -65,6 +66,8 @@ thread_local! {
     static INACTIVE_BOOTSTRAP_ORCHESTRATION_CUT:
         std::cell::Cell<Option<InactiveBootstrapOrchestrationCut>> =
             const { std::cell::Cell::new(None) };
+    static NEXT_BOOTSTRAP_PART_OPERATION_LIMIT:
+        std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -388,6 +391,8 @@ pub(crate) struct InactiveBootstrapVerifiedPublication {
     history_generation: u64,
     history_root: ContentDigest,
     cold_record_count: u64,
+    catalog_document_id: DocumentId,
+    reference_catalog_policy: ReferenceCatalogPolicyV1,
     instrumentation: InactiveBootstrapOrchestrationInstrumentation,
 }
 
@@ -460,6 +465,74 @@ impl InactiveBootstrapVerifiedPublication {
 
     pub(crate) const fn instrumentation(&self) -> &InactiveBootstrapOrchestrationInstrumentation {
         &self.instrumentation
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct InactiveBootstrapAcceptedAuthorityBinding {
+    workspace_id: WorkspaceId,
+    lineage_digest: LineageDigest,
+    graph_resource: super::CanonicalGraphResourceId,
+    publication_id: super::bootstrap_import::BootstrapPublicationIdV1,
+    aggregate_digest: super::bootstrap_import::BootstrapAggregateDigestV1,
+    import_id: ImportId,
+    part_count: u32,
+    predecessor_terminal: Option<BootstrapPartId>,
+    accepted_frontier: AcceptedFrontierRoot,
+    engine_binding: EngineHistoryBinding,
+    storage_binding: ProjectionStorageBinding,
+    bootstrap_binding: BootstrapAggregateHistoryBindingV1,
+    archive_identity: ControlDirectoryIdentity,
+    history_generation: u64,
+    history_root: ContentDigest,
+    cold_record_count: u64,
+}
+
+impl InactiveBootstrapAcceptedAuthorityBinding {
+    pub(crate) const fn workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
+    }
+
+    pub(crate) const fn lineage_digest(&self) -> LineageDigest {
+        self.lineage_digest
+    }
+
+    pub(crate) const fn accepted_frontier(&self) -> &AcceptedFrontierRoot {
+        &self.accepted_frontier
+    }
+
+    pub(crate) const fn part_count(&self) -> u32 {
+        self.part_count
+    }
+}
+
+/// Retained, read-only accepted-history authority for one inactive bootstrap.
+///
+/// All fields are private and the only constructor freshly reopens the exact
+/// archive, publication, durable history, and detached replay. Keeping the
+/// candidate alive also keeps its scratch-backed accepted indexes alive.
+pub(crate) struct InactiveBootstrapAcceptedAuthority {
+    store: ObjectStore,
+    publication: ValidatedBootstrapPublicationV1,
+    candidate: DetachedBootstrapCandidate,
+    binding: InactiveBootstrapAcceptedAuthorityBinding,
+}
+
+impl InactiveBootstrapAcceptedAuthority {
+    pub(crate) const fn store(&self) -> &ObjectStore {
+        &self.store
+    }
+
+    pub(crate) const fn publication(&self) -> &ValidatedBootstrapPublicationV1 {
+        &self.publication
+    }
+
+    pub(crate) const fn accepted_engine(&self) -> &ShardedHotEngine {
+        self.candidate.accepted_engine()
+    }
+
+    pub(crate) const fn binding(&self) -> &InactiveBootstrapAcceptedAuthorityBinding {
+        &self.binding
     }
 }
 
@@ -934,7 +1007,157 @@ pub(crate) fn publish_install_verify_inactive_bootstrap(
         history_generation,
         history_root,
         cold_record_count,
+        catalog_document_id: prepared.catalog_document_id,
+        reference_catalog_policy: prepared.reference_catalog_policy.clone(),
         instrumentation,
+    })
+}
+
+/// Freshly reopen and retain the exact accepted authority described by a
+/// previously minted inactive-bootstrap publication proof.
+pub(crate) fn reopen_inactive_bootstrap_accepted_authority(
+    verified: &InactiveBootstrapVerifiedPublication,
+    store: ObjectStore,
+) -> Result<InactiveBootstrapAcceptedAuthority, BootstrapStreamingImportError> {
+    let archive_identity = store.canonical_archive_identity()?;
+    if store.workspace_id() != verified.workspace_id
+        || archive_identity != verified.archive_identity
+    {
+        return Err(invalid_bootstrap_orchestration(
+            "reopened bootstrap store or archive identity differs from verified publication",
+        ));
+    }
+
+    let publication = store.load_bootstrap_publication(verified.publication_id)?;
+    let aggregate = publication.aggregate();
+    let bootstrap_binding = BootstrapAggregateHistoryBindingV1::for_aggregate(aggregate)?;
+    if aggregate.workspace_id() != verified.workspace_id
+        || aggregate.lineage_digest() != verified.lineage_digest
+        || aggregate.graph_resource() != verified.graph_resource
+        || aggregate.publication_id() != verified.publication_id
+        || aggregate.aggregate_digest() != verified.aggregate_digest
+        || aggregate.import_id() != verified.import_id
+        || aggregate.parts().len() as u32 != verified.part_count
+        || aggregate.final_frontier().last_part() != verified.predecessor_terminal
+        || aggregate.final_frontier().accepted_count() != verified.part_count
+        || bootstrap_binding != verified.bootstrap_binding
+        || verified.storage_binding.endpoint.graph_resource_id != verified.graph_resource
+    {
+        return Err(invalid_bootstrap_orchestration(
+            "direct-loaded aggregate differs from verified inactive publication",
+        ));
+    }
+
+    let open = store
+        .seal_history_only(verified.storage_binding)
+        .map_err(|(_store, error)| error)?;
+    if open.binding() != verified.storage_binding {
+        return Err(invalid_bootstrap_orchestration(
+            "reopened bootstrap history storage binding changed",
+        ));
+    }
+    let (store, history) = open.into_history().map_err(|(_store, error)| error)?;
+    let (history_generation, history_root, latest_batch_id, engine_binding) =
+        history.current_with_binding()?;
+    let cold_record_count = history.current_record_count()?;
+    if history.current_bootstrap_binding()? != Some(bootstrap_binding)
+        || history_generation != verified.history_generation
+        || history_generation != u64::from(verified.part_count)
+        || history_root != verified.history_root
+        || cold_record_count != verified.cold_record_count
+        || cold_record_count != u64::from(verified.part_count)
+        || engine_binding != verified.engine_binding
+        || latest_batch_id
+            != aggregate
+                .parts()
+                .last()
+                .map(|descriptor| descriptor.batch_id())
+    {
+        return Err(invalid_bootstrap_orchestration(
+            "fresh durable history differs from verified inactive publication",
+        ));
+    }
+
+    let replay_identity = DetachedBootstrapReplayIdentity::new(
+        verified.workspace_id,
+        verified.lineage_digest,
+        verified.catalog_document_id,
+        verified.reference_catalog_policy.clone(),
+        verified.storage_binding,
+        archive_identity,
+    );
+    let (candidate, terminal_history_binding) =
+        super::hot_engine::replay_direct_loaded_bootstrap_validating_history(
+            &store,
+            &publication,
+            &replay_identity,
+            &history,
+            history_root,
+            bootstrap_binding,
+        )?;
+    let accepted_frontier = candidate.accepted_frontier_root()?;
+    let candidate_binding = candidate.durable_history_binding();
+    if candidate.part_count() != verified.part_count
+        || candidate.last_part() != verified.predecessor_terminal
+        || accepted_frontier != verified.accepted_frontier
+        || !candidate_binding.same_replay_authority(&verified.engine_binding)
+        || terminal_history_binding != verified.engine_binding
+    {
+        return Err(invalid_bootstrap_orchestration(
+            "fresh detached replay differs from verified inactive publication",
+        ));
+    }
+
+    let mut object_count = 0_u64;
+    for descriptor in aggregate.parts().iter().copied() {
+        object_count = object_count
+            .checked_add(u64::from(
+                descriptor.evidence().payload_object_root().object_count(),
+            ))
+            .ok_or_else(|| invalid_bootstrap_orchestration("bootstrap object count overflow"))?;
+    }
+
+    let instrumentation = InactiveBootstrapOrchestrationInstrumentation {
+        source_inventory_pages: aggregate.source_inventory_page_count(),
+        source_blob_pages: aggregate.source_blob_page_count(),
+        source_chunks: u64::from(aggregate.source_blob_root().chunk_count()),
+        parts: aggregate.parts().len() as u32,
+        objects: object_count,
+        cold_records: cold_record_count,
+        peak_owned_source_chunks: u32::from(aggregate.source_blob_root().chunk_count() != 0),
+        peak_owned_parts: u32::from(!aggregate.parts().is_empty()),
+        peak_owned_cold_records: u32::from(cold_record_count != 0),
+    };
+    if instrumentation != verified.instrumentation {
+        return Err(invalid_bootstrap_orchestration(
+            "reopened bootstrap instrumentation differs from verified publication",
+        ));
+    }
+
+    let binding = InactiveBootstrapAcceptedAuthorityBinding {
+        workspace_id: verified.workspace_id,
+        lineage_digest: verified.lineage_digest,
+        graph_resource: verified.graph_resource,
+        publication_id: verified.publication_id,
+        aggregate_digest: verified.aggregate_digest,
+        import_id: verified.import_id,
+        part_count: verified.part_count,
+        predecessor_terminal: verified.predecessor_terminal,
+        accepted_frontier,
+        engine_binding,
+        storage_binding: verified.storage_binding,
+        bootstrap_binding,
+        archive_identity,
+        history_generation,
+        history_root,
+        cold_record_count,
+    };
+    drop(history);
+    Ok(InactiveBootstrapAcceptedAuthority {
+        store,
+        publication,
+        candidate,
+        binding,
     })
 }
 
@@ -2129,6 +2352,17 @@ fn partition_bootstrap_operation_spool(
     working: &Path,
     instrumentation: &mut BootstrapStreamingImportInstrumentation,
 ) -> Result<u32, BootstrapStreamingImportError> {
+    #[cfg(test)]
+    let max_part_operations = NEXT_BOOTSTRAP_PART_OPERATION_LIMIT
+        .with(|limit| limit.replace(None))
+        .unwrap_or(MAX_OPERATIONS_PER_BOOTSTRAP_PART);
+    #[cfg(not(test))]
+    let max_part_operations = MAX_OPERATIONS_PER_BOOTSTRAP_PART;
+    if max_part_operations == 0 || max_part_operations > MAX_OPERATIONS_PER_BOOTSTRAP_PART {
+        return Err(BootstrapStreamingImportError::InvalidOperation(
+            "bootstrap part operation limit is invalid".into(),
+        ));
+    }
     let path = working.join(BOOTSTRAP_STREAM_BOUNDARY_SPOOL);
     let mut writer = BufWriter::new(create_new_file(&path)?);
     let mut reader = BootstrapOperationSpoolReader::open(&operations.path)?;
@@ -2153,7 +2387,7 @@ fn partition_bootstrap_operation_spool(
         }
         let source_span = operation.source_span()?;
         let adds_span = source_span.is_some_and(|span| !part_spans.contains(&span));
-        let exceeds = part_operations == MAX_OPERATIONS_PER_BOOTSTRAP_PART
+        let exceeds = part_operations == max_part_operations
             || part_semantic_bytes.saturating_add(partition_bytes)
                 > MAX_SEMANTIC_EFFECT_BYTES_PER_BOOTSTRAP_PART
             || (adds_span && part_spans.len() as u32 == MAX_SOURCE_SPANS_PER_BOOTSTRAP_PART);
@@ -6318,14 +6552,16 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
+    use rusqlite::Connection;
     use uuid::Uuid;
 
     use super::*;
     use crate::oplog::{
-        write_projection_exact, AuthorBatch, BatchId, BlockLocation, CrdtPeerId, DeviceId,
-        DocumentId, LineageDigest, ManagedTextKind, ObjectStore, OperationTransaction,
-        PortablePathIndexRoot, ProjectionEndpointBinding, ProjectionEndpointId, SemanticOperation,
-        SessionId,
+        write_projection_exact, ApplicationRuntimeRoot, AuthorBatch, BatchId, BlockLocation,
+        CrdtPeerId, DeviceId, DocumentId, LineageDigest, ManagedTextKind, ObjectStore,
+        OperationTransaction, PortablePathIndexRoot, ProjectionEndpointBinding,
+        ProjectionEndpointId, ProjectionRecovery, RebuildSource, SemanticEffect, SemanticOperation,
+        SessionId, SqliteFrontier, MAX_MATERIALIZATION_QUERY_ROWS,
     };
 
     struct TestRoot(PathBuf);
@@ -8436,6 +8672,124 @@ mod tests {
         assert!(verified.instrumentation().peak_owned_cold_records <= 1);
     }
 
+    fn install_accepted_authority(
+        root: &TestRoot,
+        prepared: &InactiveBootstrapPreparedPublication,
+        workspace: WorkspaceId,
+        endpoint: u128,
+        archive_label: &str,
+    ) -> (
+        PathBuf,
+        InactiveBootstrapVerifiedPublication,
+        InactiveBootstrapAcceptedAuthority,
+    ) {
+        let archive = root.path().join(archive_label);
+        let binding = orchestration_binding(prepared, endpoint);
+        let verified = publish_install_verify_inactive_bootstrap(
+            prepared,
+            ObjectStore::open(&archive, workspace).unwrap(),
+            binding,
+        )
+        .unwrap();
+        let authority = reopen_inactive_bootstrap_accepted_authority(
+            &verified,
+            ObjectStore::open(&archive, workspace).unwrap(),
+        )
+        .unwrap();
+        (archive, verified, authority)
+    }
+
+    fn forced_authority_changing_multipart(
+        label: &str,
+    ) -> (TestRoot, InactiveBootstrapPreparedPublication, WorkspaceId) {
+        NEXT_BOOTSTRAP_PART_OPERATION_LIMIT.with(|limit| limit.set(Some(1)));
+        let (root, prepared, workspace) = prepare_streaming_bootstrap(
+            label,
+            &[
+                (
+                    "pages/a-first.md",
+                    "title:: First Authority\n\n- [[Second Authority]]\n",
+                ),
+                (
+                    "pages/z-second.md",
+                    "title:: Second Authority\n\n- [[First Authority]] distinct reference\n",
+                ),
+            ],
+        );
+        assert!(prepared.aggregate().parts().len() > 2);
+        let mut second_part = prepared.open_part(1).unwrap();
+        let mut second_effect = None;
+        while let Some(bytes) = second_part.next_object_bytes().unwrap() {
+            let object = OperationObject::decode(&bytes).unwrap();
+            if object.kind() == ObjectKind::SemanticEffect {
+                second_effect = Some(SemanticEffect::decode(object.payload()).unwrap());
+            }
+        }
+        let second_effect = second_effect.unwrap();
+        assert_eq!(second_effect.pages().len(), 1);
+        let second_page = second_effect.pages()[0].after.as_ref().unwrap();
+        assert_eq!(second_page.path().unwrap().as_str(), "pages/z-second.md");
+        assert_eq!(second_page.name().as_str(), "Second Authority");
+        let first_material = &prepared.engine_materials[0];
+        let second_material = &prepared.engine_materials[1];
+        assert_ne!(
+            first_material.reference_catalog_root(),
+            second_material.reference_catalog_root()
+        );
+        (root, prepared, workspace)
+    }
+
+    fn cold_history_leaf_path(nodes: &Path, batch_id: BatchId) -> PathBuf {
+        let key = batch_id.as_uuid();
+        let mut matches = fs::read_dir(nodes)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "index")
+            })
+            .filter(|path| {
+                fs::read(path)
+                    .unwrap()
+                    .windows(key.as_bytes().len())
+                    .filter(|window| *window == key.as_bytes())
+                    .count()
+                    > 1
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(matches.len(), 1);
+        matches.pop().unwrap()
+    }
+
+    fn assert_materialized_snapshot_matches(
+        authority: &InactiveBootstrapAcceptedAuthority,
+        database: &SqliteFrontier,
+    ) {
+        let snapshot = authority.accepted_engine().canonical_snapshot().unwrap();
+        let read = database.materialized_read().unwrap();
+        let live_pages = snapshot
+            .pages
+            .iter()
+            .filter(|(_, state)| state.path().is_some())
+            .count();
+        assert_eq!(live_pages, snapshot.pages.len());
+        for (page_id, state) in &snapshot.pages {
+            let row = read.page(*page_id).unwrap().unwrap();
+            assert_eq!(&row.path, state.path().unwrap());
+            let expected_blocks = snapshot
+                .memberships
+                .iter()
+                .filter(|membership| membership.page_id == *page_id)
+                .count();
+            assert_eq!(
+                read.blocks_on_page(*page_id, MAX_MATERIALIZATION_QUERY_ROWS)
+                    .unwrap()
+                    .len(),
+                expected_blocks
+            );
+        }
+    }
+
     #[test]
     fn inactive_bootstrap_orchestration_all_cuts_retry_fresh_and_is_idempotent() {
         let (root, prepared, workspace) = rich_orchestration_fixture("orchestration-cuts");
@@ -8683,5 +9037,555 @@ mod tests {
         .is_err());
         assert!(!missing_archive.join("projection-work").exists());
         assert!(!truncated_archive.join("projection-work").exists());
+    }
+
+    #[test]
+    fn inactive_bootstrap_sqlite_rebuilds_zero_one_and_forced_multipart_exactly() {
+        let (zero_root, zero, workspace) =
+            prepare_streaming_bootstrap("bootstrap-sqlite-zero", &[]);
+        let (zero_archive, _, zero_authority) =
+            install_accepted_authority(&zero_root, &zero, workspace, 0x6e10, "archive");
+        let zero_runtime =
+            ApplicationRuntimeRoot::open_for_test(&zero_root.path().join("runtime")).unwrap();
+        let (zero_opened, zero_proof) = SqliteFrontier::open_or_rebuild_inactive_bootstrap(
+            &zero_root.path().join("zero.sqlite"),
+            &zero_runtime,
+            &zero_authority,
+        )
+        .unwrap();
+        assert_eq!(zero_proof.accepted_batch_count(), 0);
+        assert_eq!(
+            zero_proof.frontier_root(),
+            zero_authority.binding().accepted_frontier()
+        );
+        assert_eq!(zero_proof.bootstrap_rebuild().bootstrap_part_reads, 0);
+        assert_materialized_snapshot_matches(&zero_authority, &zero_opened.database);
+        assert!(!zero_archive.join("projection-work").exists());
+
+        let (one_root, one, workspace) =
+            prepare_streaming_bootstrap("bootstrap-sqlite-one", &[("pages/one.md", "- one\n")]);
+        let (one_archive, _, one_authority) =
+            install_accepted_authority(&one_root, &one, workspace, 0x6e20, "archive");
+        let one_runtime =
+            ApplicationRuntimeRoot::open_for_test(&one_root.path().join("runtime")).unwrap();
+        let (one_opened, one_proof) = SqliteFrontier::open_or_rebuild_inactive_bootstrap(
+            &one_root.path().join("one.sqlite"),
+            &one_runtime,
+            &one_authority,
+        )
+        .unwrap();
+        assert_eq!(one_proof.accepted_batch_count(), 1);
+        assert_eq!(
+            one_proof.claim(),
+            crate::oplog::ProjectionClaim::current(
+                one_authority.binding().workspace_id(),
+                one_authority.binding().lineage_digest(),
+            )
+        );
+        assert_eq!(
+            one_proof.semantic_projection_digest(),
+            one_opened.database.semantic_projection_digest().unwrap()
+        );
+        assert_eq!(
+            one_proof.materialized_row_digest(),
+            one_opened
+                .database
+                .materialized_row_digest_for_harness()
+                .unwrap()
+        );
+        assert_eq!(one_proof.bootstrap_rebuild().bootstrap_part_reads, 1);
+        assert_eq!(one_proof.bootstrap_rebuild().max_live_bootstrap_parts, 1);
+        assert_materialized_snapshot_matches(&one_authority, &one_opened.database);
+        assert!(!one_archive.join("projection-work").exists());
+
+        let mut multipart_source = String::new();
+        for ordinal in 0..MAX_OPERATIONS_PER_BOOTSTRAP_PART {
+            multipart_source.push_str(&format!("- multipart {ordinal}\n"));
+        }
+        let (multi_root, multi, workspace) = prepare_streaming_bootstrap(
+            "bootstrap-sqlite-multipart",
+            &[("pages/multipart.md", &multipart_source)],
+        );
+        assert!(multi.aggregate().parts().len() > 1);
+        let graph_bytes = fs::read(multi_root.path().join("graph/pages/multipart.md")).unwrap();
+        let (multi_archive, _, multi_authority) =
+            install_accepted_authority(&multi_root, &multi, workspace, 0x6e30, "archive");
+        let multi_runtime =
+            ApplicationRuntimeRoot::open_for_test(&multi_root.path().join("runtime")).unwrap();
+        let (multi_opened, multi_proof) = SqliteFrontier::open_or_rebuild_inactive_bootstrap(
+            &multi_root.path().join("multi.sqlite"),
+            &multi_runtime,
+            &multi_authority,
+        )
+        .unwrap();
+        assert_eq!(
+            multi_proof.accepted_batch_count(),
+            multi.aggregate().parts().len() as u64
+        );
+        assert_eq!(
+            multi_proof.frontier_root(),
+            multi_authority.binding().accepted_frontier()
+        );
+        assert_eq!(
+            multi_proof.semantic_projection_digest(),
+            multi_opened.database.semantic_projection_digest().unwrap()
+        );
+        assert_eq!(
+            multi_proof.materialized_row_digest(),
+            multi_opened
+                .database
+                .materialized_row_digest_for_harness()
+                .unwrap()
+        );
+        assert_eq!(
+            multi_proof.bootstrap_rebuild().bootstrap_part_reads,
+            multi.aggregate().parts().len()
+        );
+        assert_eq!(
+            multi_proof.bootstrap_rebuild().bootstrap_object_reads,
+            multi
+                .aggregate()
+                .parts()
+                .iter()
+                .map(|part| { part.evidence().payload_object_root().object_count() as usize })
+                .sum::<usize>()
+        );
+        assert_eq!(multi_opened.rebuild.accepted_events_validated, 2);
+        assert_eq!(multi_opened.rebuild.accepted_events_applied, 2);
+        assert_eq!(multi_opened.rebuild.max_live_events, 1);
+        assert_eq!(multi_opened.rebuild.max_live_evidence_records, 1);
+        assert_eq!(multi_proof.bootstrap_rebuild().max_live_bootstrap_parts, 1);
+        assert_materialized_snapshot_matches(&multi_authority, &multi_opened.database);
+        assert_eq!(
+            fs::read(multi_root.path().join("graph/pages/multipart.md")).unwrap(),
+            graph_bytes
+        );
+        // Destruction is part of the normal-stack regression: both retained
+        // detached candidates and the large materialized projection die here.
+        drop(multi_opened);
+        drop(multi_authority);
+        drop(multi);
+        assert!(!multi_archive.join("projection-work").exists());
+    }
+
+    #[test]
+    fn ordinary_rebuild_source_does_not_fall_back_to_bootstrap_parts() {
+        let (root, prepared, workspace) = prepare_streaming_bootstrap(
+            "ordinary-source-bootstrap-isolation",
+            &[("pages/only-bootstrap.md", "- isolated\n")],
+        );
+        let (_, _, authority) =
+            install_accepted_authority(&root, &prepared, workspace, 0x6f10, "archive");
+        let runtime = ApplicationRuntimeRoot::open_for_test(&root.path().join("runtime")).unwrap();
+        let ordinary = RebuildSource::new(authority.accepted_engine(), authority.store()).unwrap();
+        assert!(SqliteFrontier::open_or_rebuild(
+            &root.path().join("ordinary.sqlite"),
+            &runtime,
+            crate::oplog::ProjectionClaim::current(
+                authority.binding().workspace_id(),
+                authority.binding().lineage_digest(),
+            ),
+            ordinary,
+        )
+        .is_err());
+        SqliteFrontier::open_or_rebuild_inactive_bootstrap(
+            &root.path().join("bootstrap.sqlite"),
+            &runtime,
+            &authority,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn inactive_bootstrap_authority_validates_each_changing_multipart_cold_record() {
+        let (root, prepared, workspace) =
+            forced_authority_changing_multipart("bootstrap-authority-changing-multipart");
+        let (archive, verified, authority) =
+            install_accepted_authority(&root, &prepared, workspace, 0x6f20, "archive");
+        assert_eq!(
+            authority.binding().accepted_frontier(),
+            &prepared.candidate().accepted_frontier_root().unwrap()
+        );
+        drop(authority);
+
+        let nodes = archive
+            .join("engine-history")
+            .join(verified.storage_binding.endpoint.endpoint_id.to_string())
+            .join("nodes");
+        let intermediate =
+            cold_history_leaf_path(&nodes, prepared.aggregate().parts()[0].batch_id());
+        let terminal = cold_history_leaf_path(
+            &nodes,
+            prepared.aggregate().parts().last().unwrap().batch_id(),
+        );
+        fs::write(&intermediate, fs::read(&terminal).unwrap()).unwrap();
+        assert_authority_reopen_rejected(&verified, &archive, workspace);
+    }
+
+    fn assert_authority_reopen_rejected(
+        verified: &InactiveBootstrapVerifiedPublication,
+        archive: &Path,
+        workspace: WorkspaceId,
+    ) {
+        assert!(reopen_inactive_bootstrap_accepted_authority(
+            verified,
+            ObjectStore::open(archive, workspace).unwrap(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn inactive_bootstrap_authority_rejects_substituted_bindings() {
+        let (root, prepared, workspace) = prepare_streaming_bootstrap(
+            "bootstrap-authority-bindings",
+            &[("pages/bindings.md", "- bindings\n")],
+        );
+        let (archive, verified, authority) =
+            install_accepted_authority(&root, &prepared, workspace, 0x7010, "archive");
+        drop(authority);
+
+        let mut wrong = verified.clone();
+        wrong.workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(0x7011));
+        assert_authority_reopen_rejected(&wrong, &archive, workspace);
+
+        let mut wrong = verified.clone();
+        wrong.lineage_digest = LineageDigest::of(b"substituted-lineage");
+        assert_authority_reopen_rejected(&wrong, &archive, workspace);
+
+        let mut wrong = verified.clone();
+        wrong.publication_id =
+            super::super::bootstrap_import::BootstrapPublicationIdV1::from_bytes([0x70; 32]);
+        assert_authority_reopen_rejected(&wrong, &archive, workspace);
+
+        let mut wrong = verified.clone();
+        wrong.aggregate_digest =
+            super::super::bootstrap_import::BootstrapAggregateDigestV1::from_bytes([0x71; 32]);
+        assert_authority_reopen_rejected(&wrong, &archive, workspace);
+
+        let mut wrong = verified.clone();
+        wrong.history_root = ContentDigest::of(b"substituted-history-root");
+        assert_authority_reopen_rejected(&wrong, &archive, workspace);
+
+        let mut wrong = verified.clone();
+        wrong.accepted_frontier = AcceptedFrontierRoot::empty();
+        assert_authority_reopen_rejected(&wrong, &archive, workspace);
+
+        let mut wrong = verified.clone();
+        wrong.engine_binding = EngineHistoryBinding::empty();
+        assert_authority_reopen_rejected(&wrong, &archive, workspace);
+
+        let (_, other_verified, other_authority) =
+            install_accepted_authority(&root, &prepared, workspace, 0x7020, "other-archive");
+        drop(other_authority);
+        let mut wrong = verified.clone();
+        wrong.archive_identity = other_verified.archive_identity;
+        assert_authority_reopen_rejected(&wrong, &archive, workspace);
+
+        assert!(reopen_inactive_bootstrap_accepted_authority(
+            &verified,
+            ObjectStore::open(&archive, WorkspaceId::from_uuid(Uuid::from_u128(0x7021))).unwrap(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn inactive_bootstrap_authority_rejects_missing_objects_and_substituted_cold_history() {
+        let (object_root, object_prepared, workspace) = prepare_streaming_bootstrap(
+            "bootstrap-authority-missing-object",
+            &[("pages/object.md", "- object\n")],
+        );
+        let (object_archive, object_verified, object_authority) = install_accepted_authority(
+            &object_root,
+            &object_prepared,
+            workspace,
+            0x7110,
+            "archive",
+        );
+        drop(object_authority);
+        let mut part = object_prepared.open_part(0).unwrap();
+        let manifest = OperationBatch::decode(part.manifest_bytes()).unwrap();
+        assert!(part.next_object_bytes().unwrap().is_some());
+        let object_name = format!("{}.object", manifest.required_objects()[0].content_digest());
+        fs::remove_file(
+            object_archive
+                .join("bootstrap-v1/objects")
+                .join(object_name),
+        )
+        .unwrap();
+        assert_authority_reopen_rejected(&object_verified, &object_archive, workspace);
+
+        let (history_root, history_prepared, workspace) = prepare_streaming_bootstrap(
+            "bootstrap-authority-cold-history",
+            &[("pages/history.md", "- history\n")],
+        );
+        let (history_archive, history_verified, history_authority) = install_accepted_authority(
+            &history_root,
+            &history_prepared,
+            workspace,
+            0x7120,
+            "archive",
+        );
+        drop(history_authority);
+        let nodes = history_archive
+            .join("engine-history")
+            .join(
+                history_verified
+                    .storage_binding
+                    .endpoint
+                    .endpoint_id
+                    .to_string(),
+            )
+            .join("nodes");
+        let mut indexes = fs::read_dir(&nodes)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "index")
+            })
+            .collect::<Vec<_>>();
+        indexes.sort();
+        assert!(indexes.len() > 1);
+        let substituted = fs::read(&indexes[1]).unwrap();
+        fs::write(&indexes[0], substituted).unwrap();
+        assert_authority_reopen_rejected(&history_verified, &history_archive, workspace);
+    }
+
+    #[test]
+    fn inactive_bootstrap_authority_rejects_corrupt_part() {
+        let (root, prepared, workspace) = prepare_streaming_bootstrap(
+            "bootstrap-authority-corrupt-part",
+            &[("pages/part.md", "- part\n")],
+        );
+        let (archive, verified, authority) =
+            install_accepted_authority(&root, &prepared, workspace, 0x7118, "archive");
+        drop(authority);
+        let part_name = hex_bootstrap_digest(prepared.aggregate().parts()[0].part_id().as_bytes());
+        fs::write(
+            archive.join("bootstrap-v1/parts").join(part_name),
+            b"corrupt bootstrap part",
+        )
+        .unwrap();
+        assert_authority_reopen_rejected(&verified, &archive, workspace);
+    }
+
+    #[test]
+    fn inactive_bootstrap_sqlite_rebuild_is_deterministic_and_retryable() {
+        let (root, prepared, workspace) = prepare_streaming_bootstrap(
+            "bootstrap-sqlite-recovery",
+            &[("pages/recovery.md", "- recovery\n")],
+        );
+        let (_, _, authority) =
+            install_accepted_authority(&root, &prepared, workspace, 0x7210, "archive");
+        let runtime = ApplicationRuntimeRoot::open_for_test(&root.path().join("runtime")).unwrap();
+        let path = root.path().join("frontier.sqlite");
+        let (opened, expected) =
+            SqliteFrontier::open_or_rebuild_inactive_bootstrap(&path, &runtime, &authority)
+                .unwrap();
+        drop(opened);
+
+        let (existing, existing_proof) =
+            SqliteFrontier::open_or_rebuild_inactive_bootstrap(&path, &runtime, &authority)
+                .unwrap();
+        assert_eq!(existing_proof, expected);
+        assert!(matches!(
+            existing.recovery,
+            ProjectionRecovery::RebuiltPreservingEvidence { .. }
+        ));
+        assert_eq!(existing_proof.bootstrap_rebuild().bootstrap_part_reads, 1);
+        drop(existing);
+
+        fs::remove_file(&path).unwrap();
+        let auth_path = PathBuf::from(format!("{}-auth", path.display()));
+        fs::remove_file(&auth_path).unwrap();
+        let (deleted, deleted_proof) =
+            SqliteFrontier::open_or_rebuild_inactive_bootstrap(&path, &runtime, &authority)
+                .unwrap();
+        assert_eq!(deleted_proof, expected);
+        drop(deleted);
+
+        fs::write(&path, b"corrupt sqlite projection").unwrap();
+        let (corrupt, corrupt_proof) =
+            SqliteFrontier::open_or_rebuild_inactive_bootstrap(&path, &runtime, &authority)
+                .unwrap();
+        assert_eq!(corrupt_proof, expected);
+        drop(corrupt);
+
+        let interrupted_path = root.path().join("interrupted.sqlite");
+        crate::oplog::sqlite::fail_next_apply_during_materialization_for_harness();
+        assert!(SqliteFrontier::open_or_rebuild_inactive_bootstrap(
+            &interrupted_path,
+            &runtime,
+            &authority,
+        )
+        .is_err());
+        let (_retried, retried_proof) = SqliteFrontier::open_or_rebuild_inactive_bootstrap(
+            &interrupted_path,
+            &runtime,
+            &authority,
+        )
+        .unwrap();
+        assert_eq!(retried_proof, expected);
+        assert_eq!(retried_proof.bootstrap_rebuild().bootstrap_part_reads, 1);
+    }
+
+    #[test]
+    fn inactive_bootstrap_sqlite_never_proves_retained_internal_rows() {
+        let mut source = "- [[multipart]] retained-reference\n".to_string();
+        for ordinal in 1..MAX_OPERATIONS_PER_BOOTSTRAP_PART {
+            source.push_str(&format!("- retained-row {ordinal}\n"));
+        }
+        let (root, prepared, workspace) = prepare_streaming_bootstrap(
+            "bootstrap-sqlite-internal-corruption",
+            &[("pages/multipart.md", &source)],
+        );
+        assert!(prepared.aggregate().parts().len() > 1);
+        let (_, _, authority) =
+            install_accepted_authority(&root, &prepared, workspace, 0x7220, "archive");
+        let runtime = ApplicationRuntimeRoot::open_for_test(&root.path().join("runtime")).unwrap();
+        let path = root.path().join("frontier.sqlite");
+        let graph_before = [(
+            "pages/multipart.md",
+            fs::read(root.path().join("graph/pages/multipart.md")).unwrap(),
+        )];
+        let (clean, expected) =
+            SqliteFrontier::open_or_rebuild_inactive_bootstrap(&path, &runtime, &authority)
+                .unwrap();
+        let part_count = prepared.aggregate().parts().len();
+        assert!(matches!(
+            clean.recovery,
+            ProjectionRecovery::RebuiltMissing { applied_batches }
+                if applied_batches == part_count
+        ));
+        let claim = expected.claim();
+        drop(clean);
+
+        let corruptions = [
+            (
+                "delete nonterminal accepted row",
+                "DELETE FROM applied_batches WHERE sequence = 1",
+            ),
+            (
+                "change nonterminal accepted row",
+                "UPDATE applied_batches
+                 SET semantic_effect = CAST(semantic_effect || x'00' AS BLOB)
+                 WHERE sequence = 1",
+            ),
+            (
+                "insert extra accepted row",
+                "INSERT INTO applied_batches
+                 SELECT 1000, randomblob(16), manifest_digest, semantic_effect,
+                        semantic_effect_digest, dependency_frontier,
+                        dependency_frontier_digest, prior_frontier_root,
+                        prior_frontier_root_digest, post_frontier_root,
+                        post_frontier_root_digest, affected_documents,
+                        affected_documents_digest, causal_dependency_heads,
+                        causal_peer_id, causal_counter, causal_clock_root_key,
+                        causal_clock_root_digest, 1000, retained_bytes
+                 FROM applied_batches WHERE sequence = 1",
+            ),
+            (
+                "delete authoritative page row",
+                "DELETE FROM pages
+                 WHERE page_id = (SELECT MIN(page_id) FROM pages)",
+            ),
+            (
+                "insert extra page row",
+                "INSERT INTO pages
+                 SELECT randomblob(16), home_document_id, name || ' stale',
+                        name_key || ' stale', path || '.stale', text_kind,
+                        preamble, searchable_text
+                 FROM pages ORDER BY page_id LIMIT 1",
+            ),
+            (
+                "change authoritative block row",
+                "UPDATE blocks SET content = content || ' stale'
+                 WHERE block_id = (SELECT MIN(block_id) FROM blocks)",
+            ),
+            (
+                "change authoritative page-name row",
+                "UPDATE pages
+                 SET name = name || ' stale', name_key = name_key || ' stale'
+                 WHERE page_id = (SELECT MIN(page_id) FROM pages)",
+            ),
+            (
+                "delete authoritative reference posting",
+                "DELETE FROM reference_postings
+                 WHERE (
+                     source_page_id, source_entity_type, source_entity_id,
+                     source_locator, ordinal
+                 ) = (
+                     SELECT source_page_id, source_entity_type, source_entity_id,
+                            source_locator, ordinal
+                     FROM reference_postings LIMIT 1
+                 )",
+            ),
+            (
+                "insert extra reference posting",
+                "INSERT INTO reference_postings
+                 SELECT source_page_id, source_entity_type, source_entity_id,
+                        source_locator, ordinal + 100000, reference_kind,
+                        target_type, raw_name, normalized_name, raw_uuid_claim,
+                        resolved_page_id, resolved_block_id
+                 FROM reference_postings LIMIT 1",
+            ),
+            (
+                "change materialization batch row",
+                "UPDATE materialization_batches SET input_digest = randomblob(32)
+                 WHERE acceptance_sequence = 1",
+            ),
+            (
+                "insert extra materialization batch row",
+                "INSERT INTO materialization_batches
+                 SELECT 1000, randomblob(16), input_digest, event_binding_digest,
+                        prior_frontier_root_digest, post_frontier_root_digest,
+                        prior_catalog_root, prior_catalog_root_digest,
+                        post_catalog_root, post_catalog_root_digest,
+                        catalog_change, catalog_change_digest,
+                        canonical_input_digest
+                 FROM materialization_batches WHERE acceptance_sequence = 1",
+            ),
+        ];
+
+        for (label, sql) in corruptions {
+            let connection = Connection::open(&path).unwrap();
+            assert_ne!(connection.execute(sql, []).unwrap(), 0, "{label}");
+            drop(connection);
+            crate::oplog::sqlite::refresh_projection_checkpoint_for_harness(&path, claim).unwrap();
+
+            let (rebuilt, proof) =
+                SqliteFrontier::open_or_rebuild_inactive_bootstrap(&path, &runtime, &authority)
+                    .unwrap();
+            assert_eq!(proof, expected, "{label}");
+            assert!(
+                matches!(
+                    rebuilt.recovery,
+                    ProjectionRecovery::RebuiltPreservingEvidence { .. }
+                ),
+                "{label}"
+            );
+            assert_eq!(
+                rebuilt.rebuild.accepted_events_validated, part_count,
+                "{label}"
+            );
+            assert_eq!(
+                rebuilt.rebuild.accepted_events_applied, part_count,
+                "{label}"
+            );
+            assert_eq!(
+                proof.bootstrap_rebuild().bootstrap_part_reads,
+                part_count,
+                "{label}"
+            );
+            drop(rebuilt);
+        }
+
+        for (relative, bytes) in graph_before {
+            assert_eq!(
+                fs::read(root.path().join("graph").join(relative)).unwrap(),
+                bytes
+            );
+        }
+        assert!(!root.path().join("archive/projection-work").exists());
     }
 }

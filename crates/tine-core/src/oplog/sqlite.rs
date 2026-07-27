@@ -46,13 +46,17 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::hot_engine::{AcceptedFrontierRoot, EngineAuthority};
+use super::import::{
+    InactiveBootstrapAcceptedAuthority, InactiveBootstrapAcceptedAuthorityBinding,
+};
+use super::object_store::ValidatedBootstrapPublicationV1;
 use super::{
     BatchCausalDot, BatchId, BatchInspection, BlockId, CausalPeerId, ContentDigest,
     DocumentDependencies, DocumentId, FrontierV2, LineageDigest, LogseqUuid, LogseqUuidResolution,
-    ObjectKind, ObjectStore, PageId, ReferenceFactV1, ReferenceSourceLocatorV1, SemanticEffect,
-    SemanticEffectDigest, ShardedHotEngine, ValidatedBatch, WorkspaceId, WorkspaceStatus,
-    MANAGED_ENTITY_SET_VERSION, MANIFEST_ENCODING_VERSION, OBJECT_ENVELOPE_SCHEMA_VERSION,
-    OPERATION_SCHEMA_VERSION, OPLOG_PROTOCOL_VERSION,
+    ObjectKind, ObjectStore, PageId, PreparedBatch, ReferenceFactV1, ReferenceSourceLocatorV1,
+    SemanticEffect, SemanticEffectDigest, ShardedHotEngine, ValidatedBatch, WorkspaceId,
+    WorkspaceStatus, MANAGED_ENTITY_SET_VERSION, MANIFEST_ENCODING_VERSION,
+    OBJECT_ENVELOPE_SCHEMA_VERSION, OPERATION_SCHEMA_VERSION, OPLOG_PROTOCOL_VERSION,
 };
 
 pub const SQLITE_APPLICATION_ID: u32 = 0x5449_4e45;
@@ -674,14 +678,23 @@ fn platform_application_runtime_root() -> Result<PathBuf, ProjectionError> {
 pub struct RebuildSource<'a> {
     engine: &'a ShardedHotEngine,
     store: &'a ObjectStore,
+    loader: RebuildLoader<'a>,
     runtime_authority: EngineAuthority,
     exact_frontier_root: AcceptedFrontierRoot,
     accepted_batch_count: u64,
 }
 
+enum RebuildLoader<'a> {
+    Ordinary,
+    InactiveBootstrap {
+        publication: &'a ValidatedBootstrapPublicationV1,
+    },
+}
+
 struct RebuildCursor<'a> {
     source: &'a RebuildSource<'a>,
     accepted: super::hot_engine::AcceptedBatchCursor<'a>,
+    bootstrap: BootstrapSqliteRebuildInstrumentation,
 }
 
 impl RebuildCursor<'_> {
@@ -693,17 +706,18 @@ impl RebuildCursor<'_> {
         else {
             return Ok(None);
         };
-        let event = match indexed_evidence {
-            Some(evidence) => AcceptedBatchEvent::from_indexed(
-                self.source.engine,
-                self.source.store,
-                batch_id,
-                &evidence,
-            )?,
-            None => {
-                AcceptedBatchEvent::from_accepted(self.source.engine, self.source.store, batch_id)?
-            }
-        };
+        let (event, bootstrap_objects) =
+            self.source
+                .load_event(sequence, batch_id, indexed_evidence.as_ref())?;
+        if let Some(object_count) = bootstrap_objects {
+            self.bootstrap.bootstrap_part_reads += 1;
+            self.bootstrap.bootstrap_object_reads = self
+                .bootstrap
+                .bootstrap_object_reads
+                .saturating_add(object_count);
+            self.bootstrap.max_live_bootstrap_parts =
+                self.bootstrap.max_live_bootstrap_parts.max(1);
+        }
         if event.acceptance_sequence != sequence {
             return Err(ProjectionError::Rebuild(format!(
                 "accepted batch {batch_id} is indexed at sequence {sequence} but carries {}",
@@ -715,6 +729,10 @@ impl RebuildCursor<'_> {
 
     fn page_stats(&self) -> (usize, usize, usize) {
         self.accepted.page_stats()
+    }
+
+    fn bootstrap_instrumentation(&self) -> BootstrapSqliteRebuildInstrumentation {
+        self.bootstrap
     }
 }
 
@@ -732,10 +750,119 @@ impl<'a> RebuildSource<'a> {
         Ok(Self {
             engine,
             store,
+            loader: RebuildLoader::Ordinary,
             runtime_authority: engine.runtime_authority().clone(),
             exact_frontier_root,
             accepted_batch_count,
         })
+    }
+
+    pub(crate) fn from_inactive_bootstrap(
+        authority: &'a InactiveBootstrapAcceptedAuthority,
+    ) -> Result<Self, ProjectionError> {
+        let engine = authority.accepted_engine();
+        let store = authority.store();
+        let binding = authority.binding();
+        let exact_frontier_root = engine
+            .accepted_frontier_root()
+            .map_err(|error| ProjectionError::Rebuild(error.to_string()))?;
+        let accepted_batch_count = engine
+            .accepted_batch_count()
+            .map_err(|error| ProjectionError::Rebuild(error.to_string()))?;
+        if engine.workspace_id() != binding.workspace_id()
+            || engine.lineage_digest() != binding.lineage_digest()
+            || store.workspace_id() != binding.workspace_id()
+            || &exact_frontier_root != binding.accepted_frontier()
+            || accepted_batch_count != u64::from(binding.part_count())
+        {
+            return Err(ProjectionError::Rebuild(
+                "inactive bootstrap authority changed before SQLite rebuild".into(),
+            ));
+        }
+        Ok(Self {
+            engine,
+            store,
+            loader: RebuildLoader::InactiveBootstrap {
+                publication: authority.publication(),
+            },
+            runtime_authority: engine.runtime_authority().clone(),
+            exact_frontier_root,
+            accepted_batch_count,
+        })
+    }
+
+    fn load_event(
+        &self,
+        acceptance_sequence: u64,
+        batch_id: BatchId,
+        indexed_evidence: Option<&super::AcceptedBatchEvidence>,
+    ) -> Result<(AcceptedBatchEvent, Option<usize>), ProjectionError> {
+        match &self.loader {
+            RebuildLoader::Ordinary => {
+                let event = match indexed_evidence {
+                    Some(evidence) => AcceptedBatchEvent::from_indexed(
+                        self.engine,
+                        self.store,
+                        batch_id,
+                        evidence,
+                    )?,
+                    None => AcceptedBatchEvent::from_accepted(self.engine, self.store, batch_id)?,
+                };
+                Ok((event, None))
+            }
+            RebuildLoader::InactiveBootstrap { publication } => {
+                let evidence = indexed_evidence.ok_or_else(|| {
+                    ProjectionError::Rebuild(format!(
+                        "bootstrap batch {batch_id} lacks indexed accepted evidence"
+                    ))
+                })?;
+                let ordinal = acceptance_sequence
+                    .checked_sub(1)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .ok_or_else(|| {
+                        ProjectionError::Rebuild(
+                            "bootstrap acceptance sequence cannot address a part".into(),
+                        )
+                    })?;
+                let descriptor = publication
+                    .aggregate()
+                    .parts()
+                    .get(ordinal)
+                    .copied()
+                    .ok_or_else(|| {
+                        ProjectionError::Rebuild(
+                            "bootstrap accepted sequence exceeds publication parts".into(),
+                        )
+                    })?;
+                if descriptor.acceptance_sequence() as u64 != acceptance_sequence
+                    || descriptor.evidence().ordinal() as usize != ordinal
+                    || descriptor.batch_id() != batch_id
+                    || evidence.batch_id() != batch_id
+                    || evidence.acceptance_sequence() != acceptance_sequence
+                {
+                    return Err(ProjectionError::InvalidAcceptedEvent(format!(
+                        "bootstrap part {ordinal} differs from indexed accepted evidence"
+                    )));
+                }
+                let loaded = self.store.load_bootstrap_part(publication, ordinal)?;
+                let object_count = loaded.objects().len();
+                let prepared =
+                    PreparedBatch::new(loaded.manifest().clone(), loaded.objects().to_vec())
+                        .map_err(|error| {
+                            ProjectionError::InvalidAcceptedEvent(error.to_string())
+                        })?;
+                let validated = ValidatedBatch::new(prepared);
+                if validated.manifest().lineage_digest() != self.engine.lineage_digest() {
+                    return Err(ProjectionError::LineageMismatch {
+                        expected: self.engine.lineage_digest(),
+                        found: validated.manifest().lineage_digest(),
+                    });
+                }
+                let event = AcceptedBatchEvent::from_validated(&validated, evidence)?;
+                authenticate_event_for_engine(self.engine, &event)?;
+                Ok((event, Some(object_count)))
+            }
+        }
     }
 
     pub(crate) fn accepted_event_at(
@@ -751,12 +878,8 @@ impl<'a> RebuildSource<'a> {
                     "accepted history is missing sequence {acceptance_sequence}"
                 ))
             })?;
-        let event = match indexed_evidence {
-            Some(evidence) => {
-                AcceptedBatchEvent::from_indexed(self.engine, self.store, batch_id, &evidence)?
-            }
-            None => AcceptedBatchEvent::from_accepted(self.engine, self.store, batch_id)?,
-        };
+        let (event, _) =
+            self.load_event(acceptance_sequence, batch_id, indexed_evidence.as_ref())?;
         if event.acceptance_sequence != acceptance_sequence {
             return Err(ProjectionError::Rebuild(format!(
                 "accepted batch {batch_id} is indexed at sequence {acceptance_sequence} but carries {}",
@@ -781,6 +904,31 @@ impl<'a> RebuildSource<'a> {
             }
             return Ok(());
         }
+        if matches!(self.loader, RebuildLoader::InactiveBootstrap { .. }) {
+            let (batch_id, evidence) = self
+                .engine
+                .accepted_batch_entry_at(self.accepted_batch_count)
+                .map_err(|error| ProjectionError::Rebuild(error.to_string()))?
+                .ok_or_else(|| {
+                    ProjectionError::Rebuild(
+                        "bootstrap accepted history has no terminal indexed event".into(),
+                    )
+                })?;
+            let evidence = evidence.ok_or_else(|| {
+                ProjectionError::Rebuild(
+                    "bootstrap accepted history terminal lacks indexed evidence".into(),
+                )
+            })?;
+            if evidence.batch_id() != batch_id
+                || evidence.acceptance_sequence() != self.accepted_batch_count
+                || evidence.post_frontier_root() != &self.exact_frontier_root
+            {
+                return Err(ProjectionError::Rebuild(
+                    "bootstrap accepted history tail is not bound to exact frontier".into(),
+                ));
+            }
+            return Ok(());
+        }
         let event = self.accepted_event_at(self.accepted_batch_count)?;
         authenticate_event_for_engine(self.engine, &event)?;
         if event.post_frontier_root() != &self.exact_frontier_root {
@@ -798,6 +946,7 @@ impl<'a> RebuildSource<'a> {
                 .engine
                 .accepted_batch_cursor()
                 .map_err(|error| ProjectionError::Rebuild(error.to_string()))?,
+            bootstrap: BootstrapSqliteRebuildInstrumentation::default(),
         })
     }
 }
@@ -1174,6 +1323,50 @@ pub struct OpenProjection {
     pub database: SqliteFrontier,
     pub recovery: ProjectionRecovery,
     pub rebuild: RebuildInstrumentation,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct VerifiedBootstrapSqliteProjection {
+    claim: ProjectionClaim,
+    frontier_root: AcceptedFrontierRoot,
+    accepted_batch_count: u64,
+    semantic_projection_digest: ContentDigest,
+    materialized_row_digest: ContentDigest,
+    authority_binding: InactiveBootstrapAcceptedAuthorityBinding,
+    bootstrap_rebuild: BootstrapSqliteRebuildInstrumentation,
+}
+
+impl VerifiedBootstrapSqliteProjection {
+    pub(crate) const fn claim(&self) -> ProjectionClaim {
+        self.claim
+    }
+
+    pub(crate) const fn frontier_root(&self) -> &AcceptedFrontierRoot {
+        &self.frontier_root
+    }
+
+    pub(crate) const fn accepted_batch_count(&self) -> u64 {
+        self.accepted_batch_count
+    }
+
+    pub(crate) const fn semantic_projection_digest(&self) -> ContentDigest {
+        self.semantic_projection_digest
+    }
+
+    pub(crate) const fn materialized_row_digest(&self) -> ContentDigest {
+        self.materialized_row_digest
+    }
+
+    pub(crate) const fn bootstrap_rebuild(&self) -> BootstrapSqliteRebuildInstrumentation {
+        self.bootstrap_rebuild
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct BootstrapSqliteRebuildInstrumentation {
+    pub(crate) bootstrap_part_reads: usize,
+    pub(crate) bootstrap_object_reads: usize,
+    pub(crate) max_live_bootstrap_parts: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1836,6 +2029,20 @@ pub(crate) fn fail_next_apply_during_materialization_for_harness() {
     HARNESS_FAIL_DURING_APPLY.with(|fail| fail.set(true));
 }
 
+#[cfg(test)]
+pub(crate) fn refresh_projection_checkpoint_for_harness(
+    path: &Path,
+    claim: ProjectionClaim,
+) -> Result<(), ProjectionError> {
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    let root = read_frontier_root(&connection)?;
+    drop(connection);
+    write_projection_checkpoint(path, claim, &root)
+}
+
 fn fail_during_apply_for_harness() -> Result<(), ProjectionError> {
     HARNESS_FAIL_DURING_APPLY.with(|fail| {
         if fail.replace(false) {
@@ -1847,6 +2054,113 @@ fn fail_during_apply_for_harness() -> Result<(), ProjectionError> {
 }
 
 impl SqliteFrontier {
+    pub(crate) fn open_or_rebuild_inactive_bootstrap(
+        path: &Path,
+        _application_runtime_root: &ApplicationRuntimeRoot,
+        authority: &InactiveBootstrapAcceptedAuthority,
+    ) -> Result<(OpenProjection, VerifiedBootstrapSqliteProjection), ProjectionError> {
+        let binding = authority.binding();
+        let claim = ProjectionClaim::current(binding.workspace_id(), binding.lineage_digest());
+        let source = RebuildSource::from_inactive_bootstrap(authority)?;
+        let (opened, bootstrap_rebuild) =
+            Self::rebuild_fresh_inactive_bootstrap(path, claim, source)?;
+        let frontier_root = opened.database.frontier_root()?;
+        let accepted_batch_count = u64::try_from(opened.database.applied_batch_count()?)
+            .map_err(|_| ProjectionError::Rebuild("SQLite accepted count overflowed".into()))?;
+        if opened.database.claim() != claim
+            || frontier_root != *binding.accepted_frontier()
+            || accepted_batch_count != u64::from(binding.part_count())
+            || opened.database.required_frontier_root != frontier_root
+            || !opened
+                .database
+                .runtime_authority
+                .matches(authority.accepted_engine().runtime_authority())
+        {
+            return Err(ProjectionError::Rebuild(
+                "SQLite projection does not agree with inactive bootstrap authority".into(),
+            ));
+        }
+        let materialized = opened.database.materialized_read()?;
+        if materialized.acceptance_sequence() != accepted_batch_count {
+            return Err(ProjectionError::Rebuild(
+                "SQLite materialization does not agree with inactive bootstrap authority".into(),
+            ));
+        }
+        if accepted_batch_count != 0
+            && opened.database.authenticated_reference_catalog_root()?
+                != *frontier_root.reference_catalog_root()
+        {
+            return Err(ProjectionError::Rebuild(
+                "SQLite reference catalog does not agree with inactive bootstrap authority".into(),
+            ));
+        }
+        let semantic_projection_digest = opened.database.semantic_projection_digest()?;
+        let materialized_row_digest = opened.database.materialized_row_digest_for_harness()?;
+        let proof = VerifiedBootstrapSqliteProjection {
+            claim,
+            frontier_root,
+            accepted_batch_count,
+            semantic_projection_digest,
+            materialized_row_digest,
+            authority_binding: binding.clone(),
+            bootstrap_rebuild,
+        };
+        Ok((opened, proof))
+    }
+
+    fn rebuild_fresh_inactive_bootstrap(
+        path: &Path,
+        claim: ProjectionClaim,
+        source: RebuildSource<'_>,
+    ) -> Result<(OpenProjection, BootstrapSqliteRebuildInstrumentation), ProjectionError> {
+        validate_source(claim, &source)?;
+        source.authenticate_exact_frontier()?;
+        let path = prepare_database_path(path)?;
+        let lease = Arc::new(ProcessLease::acquire(
+            source.store,
+            &path,
+            claim.workspace_id,
+        )?);
+        let mut pending_forensics = resume_pending_forensics(&path)?;
+        let existed = projection_files_exist(&path);
+        if existed {
+            pending_forensics.extend(preserve_forensics(&path)?);
+            maybe_abort_forensic_test("before-rebuild", 0);
+        }
+        let (database, rebuild, bootstrap_rebuild) =
+            Self::build_candidate_and_publish(&path, claim, lease, &source)?;
+        if !pending_forensics.directories.is_empty() {
+            mark_rebuild_complete(&pending_forensics)?;
+            return Ok((
+                OpenProjection {
+                    database,
+                    recovery: ProjectionRecovery::RebuiltPreservingEvidence {
+                        reason: if existed {
+                            "bootstrap verification requires a fresh authority-derived rebuild"
+                                .into()
+                        } else {
+                            "resumed interrupted forensic preservation and bootstrap rebuild".into()
+                        },
+                        evidence: pending_forensics.evidence,
+                        applied_batches: rebuild.accepted_events_applied,
+                    },
+                    rebuild,
+                },
+                bootstrap_rebuild,
+            ));
+        }
+        Ok((
+            OpenProjection {
+                database,
+                recovery: ProjectionRecovery::RebuiltMissing {
+                    applied_batches: rebuild.accepted_events_applied,
+                },
+                rebuild,
+            },
+            bootstrap_rebuild,
+        ))
+    }
+
     pub fn open_or_rebuild(
         path: &Path,
         _application_runtime_root: &ApplicationRuntimeRoot,
@@ -1908,7 +2222,7 @@ impl SqliteFrontier {
                 Err(reason) => {
                     pending_forensics.extend(preserve_forensics(&path)?);
                     maybe_abort_forensic_test("before-rebuild", 0);
-                    let (database, rebuild) =
+                    let (database, rebuild, _) =
                         Self::build_candidate_and_publish(&path, claim, lease, &source)?;
                     mark_rebuild_complete(&pending_forensics)?;
                     return Ok(OpenProjection {
@@ -1924,7 +2238,8 @@ impl SqliteFrontier {
             }
         }
 
-        let (database, rebuild) = Self::build_candidate_and_publish(&path, claim, lease, &source)?;
+        let (database, rebuild, _) =
+            Self::build_candidate_and_publish(&path, claim, lease, &source)?;
         if !pending_forensics.directories.is_empty() {
             mark_rebuild_complete(&pending_forensics)?;
             return Ok(OpenProjection {
@@ -1951,7 +2266,14 @@ impl SqliteFrontier {
         claim: ProjectionClaim,
         lease: Arc<ProcessLease>,
         source: &RebuildSource<'_>,
-    ) -> Result<(Self, RebuildInstrumentation), ProjectionError> {
+    ) -> Result<
+        (
+            Self,
+            RebuildInstrumentation,
+            BootstrapSqliteRebuildInstrumentation,
+        ),
+        ProjectionError,
+    > {
         let candidate_path = candidate_database_path(path)?;
         remove_projection_files(&candidate_path)?;
         let mut candidate = Self::create_new(
@@ -1961,7 +2283,7 @@ impl SqliteFrontier {
             source.runtime_authority.clone(),
         )?;
         candidate.require_frontier(&source.exact_frontier_root)?;
-        let rebuild = match candidate.rebuild_stream(source) {
+        let (rebuild, bootstrap_rebuild) = match candidate.rebuild_stream(source) {
             Ok(rebuild) => rebuild,
             Err(error) => {
                 drop(candidate);
@@ -2005,6 +2327,7 @@ impl SqliteFrontier {
                 _lease: lease,
             },
             rebuild,
+            bootstrap_rebuild,
         ))
     }
 
@@ -2509,7 +2832,13 @@ impl SqliteFrontier {
     fn rebuild_stream(
         &mut self,
         source: &RebuildSource<'_>,
-    ) -> Result<RebuildInstrumentation, ProjectionError> {
+    ) -> Result<
+        (
+            RebuildInstrumentation,
+            BootstrapSqliteRebuildInstrumentation,
+        ),
+        ProjectionError,
+    > {
         let mut instrumentation = RebuildInstrumentation::default();
         let mut cursor = source.cursor()?;
         while let Some(event) = cursor.next_event()? {
@@ -2537,7 +2866,7 @@ impl SqliteFrontier {
                 "rebuild did not reach the engine's accepted event count".into(),
             ));
         }
-        Ok(instrumentation)
+        Ok((instrumentation, cursor.bootstrap_instrumentation()))
     }
 
     #[cfg(test)]
