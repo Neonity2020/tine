@@ -29,6 +29,7 @@ use std::os::unix::fs::MetadataExt as _;
 #[cfg(windows)]
 use std::os::windows::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 #[cfg(windows)]
@@ -2062,10 +2063,13 @@ impl TailOverlay {
 
 /// One leased device-local projection handle.
 ///
-/// The projection's authoritative ObjectStore/workspace lease lives exactly
-/// as long as this value, independent of the app-data root and projection
-/// database's file name.
-/// A clean drop or process termination releases the OS lock; a later process
+/// The projection's database-adjacent applier lock lives exactly as long as
+/// this value, independent of the app-data root and projection database's file
+/// name. On the compatibility entry points the value additionally retains its
+/// own archive-rooted [`WorkspaceRuntimeLease`]; on the session-owned entry
+/// points the caller's retained lease provides that authority instead and
+/// outlives this value by construction (see [`LeasedSqliteFrontier`]).
+/// A clean drop or process termination releases the OS locks; a later process
 /// validates the database before reuse and rebuilds from engine/store evidence
 /// when deletion, stale state, corruption, or an interrupted WAL is observed.
 pub struct SqliteFrontier {
@@ -2075,7 +2079,69 @@ pub struct SqliteFrontier {
     runtime_authority: EngineAuthority,
     required_frontier_root: AcceptedFrontierRoot,
     checkpoint_each_apply: bool,
-    _lease: Arc<ProcessLease>,
+    _lease: Arc<HeldApplierLocks>,
+}
+
+/// A [`SqliteFrontier`] opened under a caller-retained
+/// [`WorkspaceRuntimeLease`], bound to the applier slot that authorized it.
+///
+/// The slot is *moved into* this value, so the database handle can never be
+/// separated from the workspace authority that justified opening it, and the
+/// borrow checker refuses to let either escape the lease. Closing the database
+/// hands the same slot back, which is what makes a bootstrap -> promoted
+/// database handoff possible without ever releasing the workspace lock.
+#[allow(dead_code)] // First non-test caller arrives with LocalActive takeover wiring.
+pub(crate) struct LeasedSqliteFrontier<'lease> {
+    database: SqliteFrontier,
+    slot: SqliteApplierSlot<'lease>,
+}
+
+#[allow(dead_code)] // First non-test caller arrives with LocalActive takeover wiring.
+impl<'lease> LeasedSqliteFrontier<'lease> {
+    pub(crate) const fn database(&self) -> &SqliteFrontier {
+        &self.database
+    }
+
+    pub(crate) fn database_mut(&mut self) -> &mut SqliteFrontier {
+        &mut self.database
+    }
+
+    /// Close the session-owned database and return its applier slot to the same
+    /// retained lease.
+    ///
+    /// The workspace lock is a distinct OS handle owned by the caller's lease
+    /// and is never touched here, so there is no instant between closing this
+    /// database and opening the next one in which another process could acquire
+    /// the workspace lease.
+    pub(crate) fn close_returning_applier_slot(self) -> SqliteApplierSlot<'lease> {
+        let Self { database, slot } = self;
+        drop(database);
+        slot
+    }
+}
+
+/// [`OpenProjection`] for the session-owned entry points.
+#[allow(dead_code)] // First non-test caller arrives with LocalActive takeover wiring.
+pub(crate) struct LeasedOpenProjection<'lease> {
+    pub(crate) database: LeasedSqliteFrontier<'lease>,
+    pub(crate) recovery: ProjectionRecovery,
+    pub(crate) rebuild: RebuildInstrumentation,
+}
+
+impl<'lease> LeasedOpenProjection<'lease> {
+    /// Bind an opened projection to the exact slot that authorized its
+    /// database-adjacent lock. Only the session-owned entry points call this,
+    /// immediately after acquiring the lock through that same slot.
+    fn bind(opened: OpenProjection, slot: SqliteApplierSlot<'lease>) -> Self {
+        Self {
+            database: LeasedSqliteFrontier {
+                database: opened.database,
+                slot,
+            },
+            recovery: opened.recovery,
+            rebuild: opened.rebuild,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2171,16 +2237,59 @@ impl SqliteFrontier {
         Ok(())
     }
 
+    /// Compatibility entry point: acquires a temporary
+    /// [`WorkspaceRuntimeLease`] internally and keeps it inside the returned
+    /// projection, so current callers and behavior are unchanged.
     pub(crate) fn open_or_rebuild_inactive_bootstrap(
+        path: &Path,
+        application_runtime_root: &ApplicationRuntimeRoot,
+        authority: &InactiveBootstrapAcceptedAuthority,
+    ) -> Result<(OpenProjection, VerifiedBootstrapSqliteProjection), ProjectionError> {
+        Self::open_or_rebuild_inactive_bootstrap_authorized(
+            path,
+            application_runtime_root,
+            authority,
+            &ApplierAuthorization::OwnWorkspaceLease,
+        )
+    }
+
+    /// Session-owned entry point: consumes the caller's applier slot and binds
+    /// it to the opened database, so the retained workspace lease is never
+    /// released between this database and the next one opened from the same
+    /// slot.
+    #[allow(dead_code)] // First non-test caller arrives with LocalActive takeover wiring.
+    pub(crate) fn open_or_rebuild_inactive_bootstrap_with_applier_slot<'lease>(
+        path: &Path,
+        application_runtime_root: &ApplicationRuntimeRoot,
+        authority: &InactiveBootstrapAcceptedAuthority,
+        slot: SqliteApplierSlot<'lease>,
+    ) -> Result<
+        (
+            LeasedOpenProjection<'lease>,
+            VerifiedBootstrapSqliteProjection,
+        ),
+        ProjectionError,
+    > {
+        let (opened, proof) = Self::open_or_rebuild_inactive_bootstrap_authorized(
+            path,
+            application_runtime_root,
+            authority,
+            &ApplierAuthorization::Slot(&slot),
+        )?;
+        Ok((LeasedOpenProjection::bind(opened, slot), proof))
+    }
+
+    fn open_or_rebuild_inactive_bootstrap_authorized(
         path: &Path,
         _application_runtime_root: &ApplicationRuntimeRoot,
         authority: &InactiveBootstrapAcceptedAuthority,
+        authorization: &ApplierAuthorization<'_, '_>,
     ) -> Result<(OpenProjection, VerifiedBootstrapSqliteProjection), ProjectionError> {
         let binding = authority.binding();
         let claim = ProjectionClaim::current(binding.workspace_id(), binding.lineage_digest());
         let source = RebuildSource::from_inactive_bootstrap(authority)?;
         let (opened, bootstrap_rebuild) =
-            Self::rebuild_fresh_inactive_bootstrap(path, claim, source)?;
+            Self::rebuild_fresh_inactive_bootstrap(path, claim, source, authorization)?;
         let frontier_root = opened.database.frontier_root()?;
         let accepted_batch_count = u64::try_from(opened.database.applied_batch_count()?)
             .map_err(|_| ProjectionError::Rebuild("SQLite accepted count overflowed".into()))?;
@@ -2229,15 +2338,12 @@ impl SqliteFrontier {
         path: &Path,
         claim: ProjectionClaim,
         source: RebuildSource<'_>,
+        authorization: &ApplierAuthorization<'_, '_>,
     ) -> Result<(OpenProjection, BootstrapSqliteRebuildInstrumentation), ProjectionError> {
         validate_source(claim, &source)?;
         source.authenticate_exact_frontier()?;
         let path = prepare_database_path(path)?;
-        let lease = Arc::new(ProcessLease::acquire(
-            source.store,
-            &path,
-            claim.workspace_id,
-        )?);
+        let lease = authorization.acquire(source.store, &path, claim.workspace_id)?;
         let mut pending_forensics = resume_pending_forensics(&path)?;
         let existed = projection_files_exist(&path);
         if existed {
@@ -2278,20 +2384,57 @@ impl SqliteFrontier {
         ))
     }
 
+    /// Compatibility entry point: acquires a temporary
+    /// [`WorkspaceRuntimeLease`] internally and keeps it inside the returned
+    /// projection, so current callers and behavior are unchanged.
     pub fn open_or_rebuild(
+        path: &Path,
+        application_runtime_root: &ApplicationRuntimeRoot,
+        claim: ProjectionClaim,
+        source: RebuildSource<'_>,
+    ) -> Result<OpenProjection, ProjectionError> {
+        Self::open_or_rebuild_authorized(
+            path,
+            application_runtime_root,
+            claim,
+            source,
+            &ApplierAuthorization::OwnWorkspaceLease,
+        )
+    }
+
+    /// Session-owned entry point: consumes the caller's applier slot and binds
+    /// it to the opened database, so the retained workspace lease is never
+    /// released between this database and the next one opened from the same
+    /// slot.
+    #[allow(dead_code)] // First non-test caller arrives with LocalActive takeover wiring.
+    pub(crate) fn open_or_rebuild_with_applier_slot<'lease>(
+        path: &Path,
+        application_runtime_root: &ApplicationRuntimeRoot,
+        claim: ProjectionClaim,
+        source: RebuildSource<'_>,
+        slot: SqliteApplierSlot<'lease>,
+    ) -> Result<LeasedOpenProjection<'lease>, ProjectionError> {
+        let opened = Self::open_or_rebuild_authorized(
+            path,
+            application_runtime_root,
+            claim,
+            source,
+            &ApplierAuthorization::Slot(&slot),
+        )?;
+        Ok(LeasedOpenProjection::bind(opened, slot))
+    }
+
+    fn open_or_rebuild_authorized(
         path: &Path,
         _application_runtime_root: &ApplicationRuntimeRoot,
         claim: ProjectionClaim,
         source: RebuildSource<'_>,
+        authorization: &ApplierAuthorization<'_, '_>,
     ) -> Result<OpenProjection, ProjectionError> {
         validate_source(claim, &source)?;
         source.authenticate_exact_frontier()?;
         let path = prepare_database_path(path)?;
-        let lease = Arc::new(ProcessLease::acquire(
-            source.store,
-            &path,
-            claim.workspace_id,
-        )?);
+        let lease = authorization.acquire(source.store, &path, claim.workspace_id)?;
         let mut pending_forensics = resume_pending_forensics(&path)?;
         let existed = projection_files_exist(&path);
 
@@ -2381,7 +2524,7 @@ impl SqliteFrontier {
     fn build_candidate_and_publish(
         path: &Path,
         claim: ProjectionClaim,
-        lease: Arc<ProcessLease>,
+        lease: Arc<HeldApplierLocks>,
         source: &RebuildSource<'_>,
     ) -> Result<
         (
@@ -2451,7 +2594,7 @@ impl SqliteFrontier {
     fn create_new(
         path: &Path,
         claim: ProjectionClaim,
-        lease: Arc<ProcessLease>,
+        lease: Arc<HeldApplierLocks>,
         runtime_authority: EngineAuthority,
     ) -> Result<Self, ProjectionError> {
         let connection = open_writable(path)?;
@@ -6028,93 +6171,325 @@ fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
     }
 }
 
-struct ProcessLease {
-    files: Vec<File>,
-}
+/// Sealed construction site for the archive-rooted workspace runtime lease and
+/// its affine SQLite applier slot.
+///
+/// Every value able to create an [`SqliteApplierSlot`] lives inside this
+/// module, so no other code in this file - let alone elsewhere in the crate -
+/// can forge one with a struct literal. The single way to obtain a slot is
+/// [`WorkspaceRuntimeLease::applier_slot`] on a lease that holds the
+/// archive-rooted workspace lock right now.
+mod applier_lease {
+    use fs2::FileExt as _;
 
-impl ProcessLease {
-    fn acquire(
-        store: &ObjectStore,
-        database_path: &Path,
+    use super::super::object_store::sync_dir_required;
+    use super::*;
+
+    /// The archive-rooted workspace runtime lease.
+    ///
+    /// This is the exact lock the SQLite applier has always taken first: the same
+    /// `<archive>/.tine-runtime/sqlite-workspaces/<workspace>/sqlite-applier.lock`
+    /// file, created and opened through the retained no-follow [`ObjectStore`]
+    /// capability, in the same order, with the same ownership, mode, regular-file,
+    /// and link-count validators. Hoisting it out of the combined SQLite applier
+    /// lease introduces no second lock protocol and no durable-format change; it
+    /// only lets one runtime session retain the workspace lock across a
+    /// bootstrap -> promoted database handoff.
+    ///
+    /// The lease is exclusive and non-cloneable. Because its capability is the
+    /// archive directory rather than device-local app data, two processes with
+    /// different XDG, HOME, or Flatpak roots still contend on the same physical
+    /// lock file. A clean drop or process termination releases the OS lock; the
+    /// small lock file itself remains only as diagnostic metadata and never decides
+    /// ownership by its contents.
+    pub(crate) struct WorkspaceRuntimeLease {
+        file: File,
         workspace_id: WorkspaceId,
-    ) -> Result<Self, ProjectionError> {
-        if store.workspace_id() != workspace_id {
-            return Err(ProjectionError::WorkspaceMismatch {
-                expected: workspace_id,
-                found: store.workspace_id(),
-            });
+        archive_root: PathBuf,
+        lease_path: PathBuf,
+        applier_slot_vended: AtomicBool,
+    }
+
+    impl WorkspaceRuntimeLease {
+        pub(crate) fn acquire(
+            store: &ObjectStore,
+            workspace_id: WorkspaceId,
+        ) -> Result<Self, ProjectionError> {
+            if store.workspace_id() != workspace_id {
+                return Err(ProjectionError::WorkspaceMismatch {
+                    expected: workspace_id,
+                    found: store.workspace_id(),
+                });
+            }
+            let store_root = store
+                .workspace_runtime_lease_capability()
+                .map_err(|error| {
+                    ProjectionError::UnsafePath(format!(
+                        "cannot retain ObjectStore lease authority: {error}"
+                    ))
+                })?;
+            let lease_namespace = open_or_create_lease_directory(
+                &store_root,
+                OBJECT_STORE_LEASE_NAMESPACE,
+                "ObjectStore lease namespace",
+            )?;
+            let sqlite_namespace = open_or_create_lease_directory(
+                &lease_namespace,
+                SQLITE_WORKSPACE_LEASE_NAMESPACE,
+                "SQLite workspace lease namespace",
+            )?;
+            let workspace_name = workspace_id.to_string();
+            let workspace_root = open_or_create_lease_directory(
+                &sqlite_namespace,
+                &workspace_name,
+                "SQLite workspace lease directory",
+            )?;
+            let lease_path = store
+                .root_path()
+                .join(OBJECT_STORE_LEASE_NAMESPACE)
+                .join(SQLITE_WORKSPACE_LEASE_NAMESPACE)
+                .join(&workspace_name)
+                .join(SQLITE_APPLIER_LEASE_FILE);
+            let mut file = lock_capability_lease_file(
+                &workspace_root,
+                SQLITE_APPLIER_LEASE_FILE,
+                &lease_path,
+            )?;
+            file.set_len(0)?;
+            file.seek(SeekFrom::Start(0))?;
+            writeln!(
+                file,
+                "workspace={}\npid={}\nplatform={}",
+                workspace_id,
+                std::process::id(),
+                std::env::consts::OS
+            )?;
+            file.sync_all()?;
+            sync_dir_required(&workspace_root)
+                .map_err(|error| ProjectionError::Io(error.to_string()))?;
+            Ok(Self {
+                file,
+                workspace_id,
+                archive_root: store.root_path().to_path_buf(),
+                lease_path,
+                applier_slot_vended: AtomicBool::new(false),
+            })
         }
-        let store_root = store.sqlite_lease_capability().map_err(|error| {
-            ProjectionError::UnsafePath(format!(
-                "cannot retain ObjectStore lease authority: {error}"
-            ))
-        })?;
-        let lease_namespace = open_or_create_lease_directory(
-            &store_root,
-            OBJECT_STORE_LEASE_NAMESPACE,
-            "ObjectStore lease namespace",
-        )?;
-        let sqlite_namespace = open_or_create_lease_directory(
-            &lease_namespace,
-            SQLITE_WORKSPACE_LEASE_NAMESPACE,
-            "SQLite workspace lease namespace",
-        )?;
-        let workspace_name = workspace_id.to_string();
-        let workspace_root = open_or_create_lease_directory(
-            &sqlite_namespace,
-            &workspace_name,
-            "SQLite workspace lease directory",
-        )?;
-        let workspace_lease_path = store
-            .root_path()
-            .join(OBJECT_STORE_LEASE_NAMESPACE)
-            .join(SQLITE_WORKSPACE_LEASE_NAMESPACE)
-            .join(&workspace_name)
-            .join(SQLITE_APPLIER_LEASE_FILE);
-        let mut workspace_file = lock_capability_lease_file(
-            &workspace_root,
-            SQLITE_APPLIER_LEASE_FILE,
-            &workspace_lease_path,
-        )?;
-        workspace_file.set_len(0)?;
-        workspace_file.seek(SeekFrom::Start(0))?;
-        writeln!(
-            workspace_file,
-            "workspace={}\npid={}\nplatform={}",
-            workspace_id,
-            std::process::id(),
-            std::env::consts::OS
-        )?;
-        workspace_file.sync_all()?;
-        super::object_store::sync_dir_required(&workspace_root)
-            .map_err(|error| ProjectionError::Io(error.to_string()))?;
-        let file_name = database_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| ProjectionError::UnsafePath("database file name is not UTF-8".into()))?;
-        let database_lease_path =
-            database_path.with_file_name(format!(".{file_name}.database-applier.lock"));
-        let database_parent = database_lease_path.parent().ok_or_else(|| {
-            ProjectionError::UnsafePath("database lease path has no parent".into())
-        })?;
-        let database_lease_name = database_lease_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| {
-                ProjectionError::UnsafePath("database lease file name is not UTF-8".into())
+
+        /// Vend this lease's single affine SQLite applier slot.
+        ///
+        /// At most one slot is live per lease at a time; dropping the slot returns
+        /// availability to this exact lease. The slot borrows the lease, so it can
+        /// neither outlive it nor be detached from it.
+        pub(crate) fn applier_slot(&self) -> Result<SqliteApplierSlot<'_>, ProjectionError> {
+            if self
+                .applier_slot_vended
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                )
+                .is_err()
+            {
+                return Err(ProjectionError::LeaseContended(self.lease_path.clone()));
+            }
+            Ok(SqliteApplierSlot { lease: self })
+        }
+    }
+
+    impl Drop for WorkspaceRuntimeLease {
+        fn drop(&mut self) {
+            let _ = self.file.unlock();
+        }
+    }
+
+    /// The affine right to run this process's single SQLite applier under one
+    /// [`WorkspaceRuntimeLease`].
+    ///
+    /// The slot has no public constructor, no `Clone`, and no owned state: it is
+    /// only ever the value returned by [`WorkspaceRuntimeLease::applier_slot`], and
+    /// it borrows that lease for its whole life. Holding one is therefore a
+    /// compile-time proof that this process holds the archive-rooted workspace lock
+    /// right now, and a caller cannot forge, copy, or outlive that proof.
+    pub(crate) struct SqliteApplierSlot<'lease> {
+        lease: &'lease WorkspaceRuntimeLease,
+    }
+
+    impl SqliteApplierSlot<'_> {
+        /// Fail closed unless this slot's lease is the archive-rooted workspace
+        /// authority for the exact workspace and exact archive being opened.
+        fn authorize(
+            &self,
+            store: &ObjectStore,
+            workspace_id: WorkspaceId,
+        ) -> Result<(), ProjectionError> {
+            if self.lease.workspace_id != workspace_id {
+                return Err(ProjectionError::WorkspaceMismatch {
+                    expected: workspace_id,
+                    found: self.lease.workspace_id,
+                });
+            }
+            if store.workspace_id() != workspace_id {
+                return Err(ProjectionError::WorkspaceMismatch {
+                    expected: workspace_id,
+                    found: store.workspace_id(),
+                });
+            }
+            if self.lease.archive_root != store.root_path() {
+                return Err(ProjectionError::UnsafePath(format!(
+                    "applier slot is leased from archive {} but the rebuild source archive is {}",
+                    self.lease.archive_root.display(),
+                    store.root_path().display()
+                )));
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for SqliteApplierSlot<'_> {
+        fn drop(&mut self) {
+            self.lease
+                .applier_slot_vended
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    /// The database-adjacent applier lock.
+    ///
+    /// Exactly the second lock the previous combined `ProcessLease` took, with the
+    /// same `.<database>.database-applier.lock` name, the same no-follow open, and
+    /// the same validators, so the one-applier-per-database guarantee is unchanged.
+    /// Acquiring it now requires an [`SqliteApplierSlot`], which is why a database
+    /// applier can exist only under a live archive-rooted workspace lease.
+    struct DatabaseApplierLease {
+        file: File,
+    }
+
+    impl DatabaseApplierLease {
+        fn acquire(
+            slot: &SqliteApplierSlot<'_>,
+            store: &ObjectStore,
+            database_path: &Path,
+            workspace_id: WorkspaceId,
+        ) -> Result<Self, ProjectionError> {
+            slot.authorize(store, workspace_id)?;
+            let file_name = database_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| {
+                    ProjectionError::UnsafePath("database file name is not UTF-8".into())
+                })?;
+            let database_lease_path =
+                database_path.with_file_name(format!(".{file_name}.database-applier.lock"));
+            let database_parent = database_lease_path.parent().ok_or_else(|| {
+                ProjectionError::UnsafePath("database lease path has no parent".into())
             })?;
-        let database_parent = CapDir::open_ambient_dir(database_parent, ambient_authority())
-            .map_err(|error| ProjectionError::Io(error.to_string()))?;
-        let database_file = lock_capability_lease_file(
-            &database_parent,
-            database_lease_name,
-            &database_lease_path,
-        )?;
-        Ok(Self {
-            files: vec![workspace_file, database_file],
-        })
+            let database_lease_name = database_lease_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| {
+                    ProjectionError::UnsafePath("database lease file name is not UTF-8".into())
+                })?;
+            let database_parent = CapDir::open_ambient_dir(database_parent, ambient_authority())
+                .map_err(|error| ProjectionError::Io(error.to_string()))?;
+            let file = lock_capability_lease_file(
+                &database_parent,
+                database_lease_name,
+                &database_lease_path,
+            )?;
+            Ok(Self { file })
+        }
+    }
+
+    impl Drop for DatabaseApplierLease {
+        fn drop(&mut self) {
+            let _ = self.file.unlock();
+        }
+    }
+
+    /// The applier locks retained by one live [`SqliteFrontier`].
+    ///
+    /// `owned_workspace` is populated only by the compatibility entry points, whose
+    /// callers do not yet retain a session [`WorkspaceRuntimeLease`]; those
+    /// frontiers privately own the workspace lock for their whole life, exactly as
+    /// the previous combined `ProcessLease` did. Session-owned frontiers leave it
+    /// `None`, because the caller's retained lease already outlives them: the
+    /// applier slot is moved into [`LeasedSqliteFrontier`], which the borrow
+    /// checker will not let escape that lease.
+    pub(super) struct HeldApplierLocks {
+        _database: DatabaseApplierLease,
+        _owned_workspace: Option<WorkspaceRuntimeLease>,
+    }
+
+    impl HeldApplierLocks {
+        /// Take a private workspace runtime lease, use its one applier slot to take
+        /// the database-adjacent lock in the historical order, then retain the
+        /// workspace lease for the frontier's whole life.
+        ///
+        /// The slot is released back into that private lease, which no other code
+        /// can reach, so the released availability is unobservable and the workspace
+        /// lock stays held by the same OS handle until the frontier drops.
+        fn acquire_owning_workspace(
+            store: &ObjectStore,
+            database_path: &Path,
+            workspace_id: WorkspaceId,
+        ) -> Result<Self, ProjectionError> {
+            let workspace = WorkspaceRuntimeLease::acquire(store, workspace_id)?;
+            let database = {
+                let slot = workspace.applier_slot()?;
+                DatabaseApplierLease::acquire(&slot, store, database_path, workspace_id)?
+            };
+            Ok(Self {
+                _database: database,
+                _owned_workspace: Some(workspace),
+            })
+        }
+
+        fn acquire_from_slot(
+            slot: &SqliteApplierSlot<'_>,
+            store: &ObjectStore,
+            database_path: &Path,
+            workspace_id: WorkspaceId,
+        ) -> Result<Self, ProjectionError> {
+            Ok(Self {
+                _database: DatabaseApplierLease::acquire(slot, store, database_path, workspace_id)?,
+                _owned_workspace: None,
+            })
+        }
+    }
+
+    /// How one open/rebuild call proves it may run this workspace's applier.
+    pub(super) enum ApplierAuthorization<'slot, 'lease> {
+        /// Compatibility path: acquire a temporary workspace runtime lease inside
+        /// the call and keep it inside the returned frontier.
+        OwnWorkspaceLease,
+        /// Session-owned path: the caller retains the workspace runtime lease and
+        /// lends its single applier slot.
+        Slot(&'slot SqliteApplierSlot<'lease>),
+    }
+
+    impl ApplierAuthorization<'_, '_> {
+        pub(super) fn acquire(
+            &self,
+            store: &ObjectStore,
+            database_path: &Path,
+            workspace_id: WorkspaceId,
+        ) -> Result<Arc<HeldApplierLocks>, ProjectionError> {
+            Ok(Arc::new(match self {
+                Self::OwnWorkspaceLease => {
+                    HeldApplierLocks::acquire_owning_workspace(store, database_path, workspace_id)?
+                }
+                Self::Slot(slot) => {
+                    HeldApplierLocks::acquire_from_slot(slot, store, database_path, workspace_id)?
+                }
+            }))
+        }
     }
 }
+
+use applier_lease::{ApplierAuthorization, HeldApplierLocks};
+pub(crate) use applier_lease::{SqliteApplierSlot, WorkspaceRuntimeLease};
 
 fn open_or_create_lease_directory(
     parent: &CapDir,
@@ -6267,14 +6642,6 @@ fn validate_opened_lease_file(file: &File, path: &Path) -> Result<(), Projection
         )));
     }
     Ok(())
-}
-
-impl Drop for ProcessLease {
-    fn drop(&mut self) {
-        for file in &self.files {
-            let _ = file.unlock();
-        }
-    }
 }
 
 fn uuid_blob(uuid: &Uuid) -> Vec<u8> {
@@ -7185,7 +7552,8 @@ fn rewrite_raw_page_targets(
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::process::{Child, Command};
+    use std::io::{BufRead as _, BufReader};
+    use std::process::{Child, Command, Stdio};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -7796,6 +8164,33 @@ mod tests {
             loop {
                 thread::park_timeout(Duration::from_secs(60));
             }
+        }
+
+        if mode == "workspace-lease-probe" {
+            let runtime = ApplicationRuntimeRoot::open().unwrap();
+            let engine = ids.engine();
+            let stdin = std::io::stdin();
+            let mut requests = stdin.lock().lines();
+            let mut answers = std::io::stdout();
+            while let Some(request) = requests.next() {
+                assert_eq!(request.unwrap(), "probe");
+                let answer = match SqliteFrontier::open_or_rebuild(
+                    &root.join("probe/frontier.sqlite"),
+                    &runtime,
+                    ids.claim(),
+                    RebuildSource::new(&engine, &store).unwrap(),
+                ) {
+                    Ok(opened) => {
+                        drop(opened);
+                        "acquired"
+                    }
+                    Err(ProjectionError::LeaseContended(_)) => "contended",
+                    Err(error) => panic!("unexpected workspace lease probe error: {error}"),
+                };
+                writeln!(answers, "{WORKSPACE_LEASE_PROBE_MARKER}{answer}").unwrap();
+                answers.flush().unwrap();
+            }
+            return;
         }
 
         if mode == "injected-runtime-contender" {
@@ -12018,6 +12413,277 @@ mod tests {
     }
 
     #[test]
+    fn one_workspace_runtime_lease_vends_one_applier_slot_at_a_time() {
+        let ids = TestIds::new(8_200);
+        let dir = TestDir::new("workspace-lease-affine-slot");
+        let store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
+        let lease = WorkspaceRuntimeLease::acquire(&store, ids.workspace).unwrap();
+
+        let slot = lease.applier_slot().unwrap();
+        assert!(matches!(
+            lease.applier_slot(),
+            Err(ProjectionError::LeaseContended(_))
+        ));
+        drop(slot);
+        let next = lease.applier_slot().unwrap();
+        assert!(matches!(
+            lease.applier_slot(),
+            Err(ProjectionError::LeaseContended(_))
+        ));
+        drop(next);
+        drop(lease.applier_slot().unwrap());
+
+        // A second lease over the same archive contends on the OS handle, so
+        // slot affinity is a refinement of the workspace lock, not a substitute.
+        assert!(matches!(
+            WorkspaceRuntimeLease::acquire(&store, ids.workspace),
+            Err(ProjectionError::LeaseContended(_))
+        ));
+        drop(lease);
+        drop(WorkspaceRuntimeLease::acquire(&store, ids.workspace).unwrap());
+
+        assert!(matches!(
+            WorkspaceRuntimeLease::acquire(&store, TestIds::new(8_250).workspace),
+            Err(ProjectionError::WorkspaceMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn an_applier_slot_cannot_open_database_authority_for_another_workspace_or_archive() {
+        let ids = TestIds::new(8_300);
+        let foreign = TestIds::new(8_400);
+        let dir = TestDir::new("applier-slot-authority");
+        let store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
+        let foreign_store =
+            ObjectStore::open(&dir.path().join("foreign-objects"), foreign.workspace).unwrap();
+        // The same workspace identity published into a substituted archive.
+        let substituted_store =
+            ObjectStore::open(&dir.path().join("substituted-objects"), ids.workspace).unwrap();
+        let runtime = ApplicationRuntimeRoot::open_for_test(&dir.path().join("runtime")).unwrap();
+        let lease = WorkspaceRuntimeLease::acquire(&store, ids.workspace).unwrap();
+
+        let foreign_engine = foreign.engine();
+        assert!(matches!(
+            SqliteFrontier::open_or_rebuild_with_applier_slot(
+                &dir.path().join("foreign.sqlite"),
+                &runtime,
+                foreign.claim(),
+                RebuildSource::new(&foreign_engine, &foreign_store).unwrap(),
+                lease.applier_slot().unwrap(),
+            ),
+            Err(ProjectionError::WorkspaceMismatch { .. })
+        ));
+
+        let engine = ids.engine();
+        assert!(matches!(
+            SqliteFrontier::open_or_rebuild_with_applier_slot(
+                &dir.path().join("substituted.sqlite"),
+                &runtime,
+                ids.claim(),
+                RebuildSource::new(&engine, &substituted_store).unwrap(),
+                lease.applier_slot().unwrap(),
+            ),
+            Err(ProjectionError::UnsafePath(_))
+        ));
+
+        // Neither rejected open took a database-adjacent lock, and each
+        // returned its slot to the same lease.
+        assert!(!dir
+            .path()
+            .join(".foreign.sqlite.database-applier.lock")
+            .exists());
+        assert!(!dir
+            .path()
+            .join(".substituted.sqlite.database-applier.lock")
+            .exists());
+        let opened = SqliteFrontier::open_or_rebuild_with_applier_slot(
+            &dir.path().join("own.sqlite"),
+            &runtime,
+            ids.claim(),
+            RebuildSource::new(&engine, &store).unwrap(),
+            lease.applier_slot().unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            opened.recovery,
+            ProjectionRecovery::RebuiltMissing { applied_batches: 0 }
+        ));
+    }
+
+    #[test]
+    fn the_database_adjacent_lock_contends_independently_of_the_workspace_lease() {
+        let a = TestIds::new(8_500);
+        let b = TestIds::new(8_600);
+        let dir = TestDir::new("database-adjacent-lock");
+        let store_a = ObjectStore::open(&dir.path().join("objects-a"), a.workspace).unwrap();
+        let store_b = ObjectStore::open(&dir.path().join("objects-b"), b.workspace).unwrap();
+        let runtime = ApplicationRuntimeRoot::open_for_test(&dir.path().join("runtime")).unwrap();
+        // Distinct archives, so both workspace leases are held at once.
+        let lease_a = WorkspaceRuntimeLease::acquire(&store_a, a.workspace).unwrap();
+        let lease_b = WorkspaceRuntimeLease::acquire(&store_b, b.workspace).unwrap();
+        let engine_a = a.engine();
+        let engine_b = b.engine();
+        let shared = dir.path().join("shared.sqlite");
+
+        let opened = SqliteFrontier::open_or_rebuild_with_applier_slot(
+            &shared,
+            &runtime,
+            a.claim(),
+            RebuildSource::new(&engine_a, &store_a).unwrap(),
+            lease_a.applier_slot().unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            SqliteFrontier::open_or_rebuild_with_applier_slot(
+                &shared,
+                &runtime,
+                b.claim(),
+                RebuildSource::new(&engine_b, &store_b).unwrap(),
+                lease_b.applier_slot().unwrap(),
+            ),
+            Err(ProjectionError::LeaseContended(_))
+        ));
+        drop(opened);
+        let recovered = SqliteFrontier::open_or_rebuild_with_applier_slot(
+            &shared,
+            &runtime,
+            b.claim(),
+            RebuildSource::new(&engine_b, &store_b).unwrap(),
+            lease_b.applier_slot().unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            recovered.recovery,
+            ProjectionRecovery::RebuiltPreservingEvidence { .. }
+        ));
+    }
+
+    /// One retained workspace lease closes the inactive-bootstrap database and
+    /// opens the promoted database from the same applier slot. A competing
+    /// process, running under its own XDG/HOME roots, is probed at every step
+    /// and stays blocked until the lease itself is released.
+    #[test]
+    fn a_retained_workspace_lease_hands_the_applier_slot_across_a_database_handoff() {
+        let seed = 8_100;
+        let ids = TestIds::new(seed);
+        let dir = TestDir::new("workspace-lease-handoff");
+        let store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
+        let engine = ids.engine();
+        let runtime = ApplicationRuntimeRoot::open_for_test(&dir.path().join("runtime")).unwrap();
+        let probe_xdg = dir.path().join("probe-profile/xdg");
+        let probe_home = dir.path().join("probe-profile/home");
+        for path in [&probe_xdg, &probe_home] {
+            fs::create_dir_all(path).unwrap();
+        }
+
+        let lease = WorkspaceRuntimeLease::acquire(&store, ids.workspace).unwrap();
+        // Destructured, not partially moved: the borrow checker refuses to drop
+        // the lease while any part of a leased projection is still live, which
+        // is the compile-time half of "the slot cannot outlive its lease".
+        let LeasedOpenProjection {
+            database: bootstrap,
+            recovery: bootstrap_recovery,
+            ..
+        } = SqliteFrontier::open_or_rebuild_with_applier_slot(
+            &dir.path().join("inactive-bootstrap.sqlite"),
+            &runtime,
+            ids.claim(),
+            RebuildSource::new(&engine, &store).unwrap(),
+            lease.applier_slot().unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            bootstrap_recovery,
+            ProjectionRecovery::RebuiltMissing { applied_batches: 0 }
+        ));
+
+        let mut probe = WorkspaceLeaseProbe::spawn(dir.path(), seed, &probe_xdg, &probe_home);
+        assert_eq!(probe.probe(), "contended");
+
+        let slot = bootstrap.close_returning_applier_slot();
+        assert_eq!(probe.probe(), "contended");
+
+        let promoted = SqliteFrontier::open_or_rebuild_with_applier_slot(
+            &dir.path().join("promoted.sqlite"),
+            &runtime,
+            ids.claim(),
+            RebuildSource::new(&engine, &store).unwrap(),
+            slot,
+        )
+        .unwrap();
+        assert!(matches!(
+            promoted.recovery,
+            ProjectionRecovery::RebuiltMissing { applied_batches: 0 }
+        ));
+        assert_eq!(promoted.database.database().claim(), ids.claim());
+        assert_eq!(probe.probe(), "contended");
+
+        drop(promoted);
+        assert_eq!(probe.probe(), "contended");
+        drop(lease);
+        assert_eq!(probe.probe(), "acquired");
+        probe.finish();
+    }
+
+    /// A pipe-coordinated child that reports, on demand, whether it can take
+    /// the archive-rooted workspace lease right now. Every step is caused by a
+    /// request/response exchange, so the test never sleeps or polls.
+    struct WorkspaceLeaseProbe {
+        child: Child,
+        answers: BufReader<std::process::ChildStdout>,
+        requests: std::process::ChildStdin,
+    }
+
+    impl WorkspaceLeaseProbe {
+        fn spawn(root: &Path, seed: u128, xdg: &Path, home: &Path) -> Self {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .arg("--exact")
+                .arg("oplog::sqlite::tests::sqlite_subprocess_helper")
+                .arg("--nocapture")
+                .env("TINE_SQLITE_HELPER_MODE", "workspace-lease-probe")
+                .env("TINE_SQLITE_HELPER_ROOT", root)
+                .env("TINE_SQLITE_HELPER_SEED", seed.to_string())
+                .env("XDG_DATA_HOME", xdg)
+                .env("HOME", home)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped());
+            let mut child = command.spawn().unwrap();
+            let answers = BufReader::new(child.stdout.take().unwrap());
+            let requests = child.stdin.take().unwrap();
+            Self {
+                child,
+                answers,
+                requests,
+            }
+        }
+
+        fn probe(&mut self) -> String {
+            writeln!(self.requests, "probe").unwrap();
+            self.requests.flush().unwrap();
+            loop {
+                let mut line = String::new();
+                assert!(
+                    self.answers.read_line(&mut line).unwrap() != 0,
+                    "workspace lease probe closed its output before answering"
+                );
+                // The child is a libtest binary, so its own harness lines share
+                // this pipe; only the marked answer is protocol.
+                if let Some((_, answer)) = line.rsplit_once(WORKSPACE_LEASE_PROBE_MARKER) {
+                    return answer.trim().to_string();
+                }
+            }
+        }
+
+        fn finish(mut self) {
+            drop(self.requests);
+            assert!(self.child.wait().unwrap().success());
+        }
+    }
+
+    const WORKSPACE_LEASE_PROBE_MARKER: &str = "workspace-lease-probe:";
+
+    #[test]
     fn separate_process_workspace_lease_contends_and_crash_releases() {
         let seed = 7_200;
         let ids = TestIds::new(seed);
@@ -12134,79 +12800,120 @@ mod tests {
         assert!(contender_succeeded);
     }
 
+    /// The exact on-disk substitutions the archive-rooted workspace lock must
+    /// refuse. One table serves both the compatibility wrapper and the hoisted
+    /// [`WorkspaceRuntimeLease`], so the two cannot drift apart.
     #[cfg(unix)]
-    #[test]
-    fn object_store_lease_rejects_symlinked_namespaces_workspace_and_file() {
+    const WORKSPACE_LEASE_CAPABILITY_SUBSTITUTIONS: [&str; 5] = [
+        "lease-object-store-namespace-symlink",
+        "lease-sqlite-namespace-symlink",
+        "lease-workspace-symlink",
+        "lease-file-symlink",
+        "lease-group-writable-namespace",
+    ];
+
+    #[cfg(unix)]
+    fn substitute_workspace_lease_capability(case: &str, store: &Path, workspace: WorkspaceId) {
         use std::os::unix::fs::{symlink, PermissionsExt as _};
 
-        fn rejected(case: &str, prepare: impl FnOnce(&Path, WorkspaceId)) {
-            let ids = TestIds::new(7_700 + case.len() as u128 * 100);
+        match case {
+            "lease-object-store-namespace-symlink" => {
+                fs::create_dir(store.join("redirect")).unwrap();
+                symlink(
+                    store.join("redirect"),
+                    store.join(OBJECT_STORE_LEASE_NAMESPACE),
+                )
+                .unwrap();
+            }
+            "lease-sqlite-namespace-symlink" => {
+                fs::create_dir(store.join(OBJECT_STORE_LEASE_NAMESPACE)).unwrap();
+                fs::create_dir(store.join("redirect")).unwrap();
+                symlink(
+                    store.join("redirect"),
+                    store
+                        .join(OBJECT_STORE_LEASE_NAMESPACE)
+                        .join(SQLITE_WORKSPACE_LEASE_NAMESPACE),
+                )
+                .unwrap();
+            }
+            "lease-workspace-symlink" => {
+                let namespace = store
+                    .join(OBJECT_STORE_LEASE_NAMESPACE)
+                    .join(SQLITE_WORKSPACE_LEASE_NAMESPACE);
+                fs::create_dir_all(&namespace).unwrap();
+                fs::create_dir(store.join("redirect")).unwrap();
+                symlink(
+                    store.join("redirect"),
+                    namespace.join(workspace.to_string()),
+                )
+                .unwrap();
+            }
+            "lease-file-symlink" => {
+                let workspace = store
+                    .join(OBJECT_STORE_LEASE_NAMESPACE)
+                    .join(SQLITE_WORKSPACE_LEASE_NAMESPACE)
+                    .join(workspace.to_string());
+                fs::create_dir_all(&workspace).unwrap();
+                fs::write(store.join("redirect"), b"not a lease").unwrap();
+                symlink(
+                    store.join("redirect"),
+                    workspace.join(SQLITE_APPLIER_LEASE_FILE),
+                )
+                .unwrap();
+            }
+            "lease-group-writable-namespace" => {
+                let namespace = store.join(OBJECT_STORE_LEASE_NAMESPACE);
+                fs::create_dir(&namespace).unwrap();
+                fs::set_permissions(&namespace, fs::Permissions::from_mode(0o770)).unwrap();
+            }
+            other => panic!("unknown workspace lease capability substitution: {other}"),
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_workspace_lease_capability_substitutions_fail_closed(
+        seed_base: u128,
+        mut assert_rejected: impl FnMut(&Path, &ObjectStore, TestIds),
+    ) {
+        for case in WORKSPACE_LEASE_CAPABILITY_SUBSTITUTIONS {
+            let ids = TestIds::new(seed_base + case.len() as u128 * 100);
             let dir = TestDir::new(case);
             let store_path = dir.path().join("objects");
             let store = ObjectStore::open(&store_path, ids.workspace).unwrap();
-            prepare(&store_path, ids.workspace);
-            let runtime =
-                ApplicationRuntimeRoot::open_for_test(&dir.path().join("runtime")).unwrap();
+            substitute_workspace_lease_capability(case, &store_path, ids.workspace);
+            assert_rejected(dir.path(), &store, ids);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn object_store_lease_rejects_symlinked_namespaces_workspace_and_file() {
+        assert_workspace_lease_capability_substitutions_fail_closed(7_700, |dir, store, ids| {
+            let runtime = ApplicationRuntimeRoot::open_for_test(&dir.join("runtime")).unwrap();
             let engine = ids.engine();
             assert!(matches!(
                 SqliteFrontier::open_or_rebuild(
-                    &dir.path().join("frontier.sqlite"),
+                    &dir.join("frontier.sqlite"),
                     &runtime,
                     ids.claim(),
-                    RebuildSource::new(&engine, &store).unwrap(),
+                    RebuildSource::new(&engine, store).unwrap(),
                 ),
                 Err(ProjectionError::UnsafePath(_))
             ));
-        }
+        });
+    }
 
-        rejected("lease-object-store-namespace-symlink", |store, _| {
-            fs::create_dir(store.join("redirect")).unwrap();
-            symlink(
-                store.join("redirect"),
-                store.join(OBJECT_STORE_LEASE_NAMESPACE),
-            )
-            .unwrap();
-        });
-        rejected("lease-sqlite-namespace-symlink", |store, _| {
-            fs::create_dir(store.join(OBJECT_STORE_LEASE_NAMESPACE)).unwrap();
-            fs::create_dir(store.join("redirect")).unwrap();
-            symlink(
-                store.join("redirect"),
-                store
-                    .join(OBJECT_STORE_LEASE_NAMESPACE)
-                    .join(SQLITE_WORKSPACE_LEASE_NAMESPACE),
-            )
-            .unwrap();
-        });
-        rejected("lease-workspace-symlink", |store, workspace| {
-            let namespace = store
-                .join(OBJECT_STORE_LEASE_NAMESPACE)
-                .join(SQLITE_WORKSPACE_LEASE_NAMESPACE);
-            fs::create_dir_all(&namespace).unwrap();
-            fs::create_dir(store.join("redirect")).unwrap();
-            symlink(
-                store.join("redirect"),
-                namespace.join(workspace.to_string()),
-            )
-            .unwrap();
-        });
-        rejected("lease-file-symlink", |store, workspace| {
-            let workspace = store
-                .join(OBJECT_STORE_LEASE_NAMESPACE)
-                .join(SQLITE_WORKSPACE_LEASE_NAMESPACE)
-                .join(workspace.to_string());
-            fs::create_dir_all(&workspace).unwrap();
-            fs::write(store.join("redirect"), b"not a lease").unwrap();
-            symlink(
-                store.join("redirect"),
-                workspace.join(SQLITE_APPLIER_LEASE_FILE),
-            )
-            .unwrap();
-        });
-        rejected("lease-group-writable-namespace", |store, _| {
-            let namespace = store.join(OBJECT_STORE_LEASE_NAMESPACE);
-            fs::create_dir(&namespace).unwrap();
-            fs::set_permissions(&namespace, fs::Permissions::from_mode(0o770)).unwrap();
+    /// The hoisted lease keeps the same no-follow, ownership, and mode
+    /// validators the combined applier lease had, proven against the same
+    /// substitution table rather than a restated copy of it.
+    #[cfg(unix)]
+    #[test]
+    fn workspace_runtime_lease_rejects_symlinked_namespaces_workspace_and_file() {
+        assert_workspace_lease_capability_substitutions_fail_closed(8_700, |_dir, store, ids| {
+            assert!(matches!(
+                WorkspaceRuntimeLease::acquire(store, ids.workspace),
+                Err(ProjectionError::UnsafePath(_))
+            ));
         });
     }
 

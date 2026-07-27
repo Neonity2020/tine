@@ -1101,7 +1101,15 @@ impl ObjectStore {
         self.workspace_id
     }
 
-    pub(crate) fn sqlite_lease_capability(&self) -> std::io::Result<Dir> {
+    /// Duplicate the retained no-follow archive-root capability that roots the
+    /// workspace runtime lease.
+    ///
+    /// The lease is deliberately archive-rooted rather than app-data-rooted:
+    /// the returned handle is the same physical directory resource this store
+    /// already authenticated, so two processes with different XDG, HOME, or
+    /// Flatpak roots still contend on one lock, and renaming the archive
+    /// pathname cannot split it.
+    pub(crate) fn workspace_runtime_lease_capability(&self) -> std::io::Result<Dir> {
         self.capability.try_clone()
     }
 
