@@ -2539,6 +2539,10 @@ mod tests {
                 LineageDigest::of(b"migration-source-backup-test-lineage"),
                 DocumentId::from_uuid(Uuid::from_u128(workspace_value + 1)),
                 ReferenceCatalogPolicyV1::default(),
+                &ObjectStore::open(&root.path().join("archive"), workspace)
+                    .unwrap()
+                    .bootstrap_authoring_capability()
+                    .unwrap(),
                 &preparation_scratch,
             )
             .unwrap();

@@ -1052,6 +1052,31 @@ impl ReferenceCatalogStore {
         Ok(())
     }
 
+    /// Bounded proof that this durable store already holds the authenticated
+    /// root node of every tree a catalog root names.
+    ///
+    /// Bootstrap installation uses this immediately before it publishes the
+    /// cold history records that bind those roots, so no accepted record can
+    /// name a catalog root this archive never received. The complete structural
+    /// validation stays at the promotion boundary, where the catalog becomes
+    /// live runtime authority.
+    pub(crate) fn require_catalog_root_nodes(
+        &self,
+        root: &ReferenceCatalogRootV2,
+    ) -> Result<(), ReferenceCatalogError> {
+        root.validate()?;
+        for digest in [
+            root.facts_root,
+            root.source_coverage_root,
+            root.reverse_candidates_root,
+        ] {
+            self.patricia
+                .validate_root(PatriciaIndexRoot::from_digest(digest))
+                .map_err(store_error)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn validate_catalog_root(
         &self,
         root: &ReferenceCatalogRootV2,

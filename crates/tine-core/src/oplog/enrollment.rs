@@ -294,6 +294,20 @@ impl EnrollmentBindingV1 {
         self.graph_text_scope_binding
     }
 
+    /// Canonical digest of this exact enrollment binding.
+    ///
+    /// Device-local runtime metadata records this instead of copying the
+    /// binding, so a promoted archive cannot be adopted by an enrollment that
+    /// differs in any field.
+    pub(crate) fn binding_digest(&self) -> Result<ContentDigest, EnrollmentError> {
+        let mut hasher = Sha256::new();
+        hasher.update(b"tine/enrollment-binding-digest/v1\0");
+        hasher.update(
+            serde_json::to_vec(self).map_err(|error| EnrollmentError::Encode(error.to_string()))?,
+        );
+        Ok(ContentDigest::from_bytes(hasher.finalize().into()))
+    }
+
     pub(crate) const fn compatibility(&self) -> EnrollmentCompatibilityV1 {
         self.compatibility
     }
@@ -2160,6 +2174,132 @@ pub(crate) fn reopen_local_active_from_durable_state(
                 .accepted_frontier_state_digest,
         },
         committed: reopened_committed,
+    })
+}
+
+/// The original `VerifiedLocal` bootstrap anchor, reconstructed from durable
+/// enrollment state alone.
+///
+/// A promoted runtime has advanced its durable history past the bootstrap, so
+/// [`reopen_local_active_from_durable_state`]'s full proof revalidation is no
+/// longer reconstructible: the shadow projection compares against graph text
+/// the user has since edited, and the inactive accepted authority requires an
+/// unadvanced history head. What *is* still exactly reconstructible is the
+/// anchor itself. The committed `VerifiedLocalV1` record is self-authenticating
+/// — its verification digest is a pure function of its own bytes — and the
+/// enrollment chain is hash-linked, so walking the bounded `LocalActive` handoff
+/// chain back to it and reproducing the committed digest proves the exact
+/// original anchor without reading one graph byte.
+///
+/// This value binds only enrollment state. Binding it to the live archive,
+/// retained immutable bootstrap publication, and authenticated history
+/// transition is [`super::local_active`]'s job; nothing here grants authority.
+pub(crate) struct PromotedBootstrapAnchor {
+    binding: EnrollmentBindingV1,
+    committed: CommittedLocalActive,
+    predecessor_head: ContentDigest,
+    preparation_id: PreparationId,
+    bootstrap_import_id: ContentDigest,
+    bootstrap_part_count: u32,
+    bootstrap_batch_id: Option<BatchId>,
+    accepted_history_record_count: u64,
+    anchor: AcceptedFrontierAnchorV1,
+}
+
+impl PromotedBootstrapAnchor {
+    pub(crate) const fn binding(&self) -> &EnrollmentBindingV1 {
+        &self.binding
+    }
+
+    pub(crate) const fn committed(&self) -> &CommittedLocalActive {
+        &self.committed
+    }
+
+    pub(crate) const fn verification_digest(&self) -> ContentDigest {
+        self.committed.verification_digest
+    }
+
+    pub(crate) const fn bootstrap_import_id(&self) -> ContentDigest {
+        self.bootstrap_import_id
+    }
+
+    pub(crate) const fn bootstrap_part_count(&self) -> u32 {
+        self.bootstrap_part_count
+    }
+
+    pub(crate) const fn accepted_history_record_count(&self) -> u64 {
+        self.accepted_history_record_count
+    }
+
+    pub(crate) const fn acceptance_sequence(&self) -> u64 {
+        self.anchor.acceptance_sequence
+    }
+
+    pub(crate) const fn accepted_frontier_state_digest(&self) -> ContentDigest {
+        self.anchor.accepted_frontier_state_digest
+    }
+
+    pub(crate) const fn history_generation(&self) -> u64 {
+        self.anchor.history_generation
+    }
+
+    pub(crate) const fn history_root(&self) -> ContentDigest {
+        self.anchor.history_root
+    }
+
+    /// Rebuild the exact predecessor [`VerifiedLocalEvidence`] the original
+    /// activation consumed, plus the committed `LocalActive` record.
+    pub(crate) fn into_predecessor_evidence(self) -> (VerifiedLocalEvidence, CommittedLocalActive) {
+        (
+            VerifiedLocalEvidence {
+                enrollment_head: self.predecessor_head,
+                verification_digest: self.committed.verification_digest,
+                binding: self.binding,
+                preparation_id: self.preparation_id,
+                bootstrap_batch_id: self.bootstrap_batch_id,
+                accepted_frontier_state_digest: self.anchor.accepted_frontier_state_digest,
+            },
+            self.committed,
+        )
+    }
+}
+
+/// Bounded fresh-process reconstruction of the committed `LocalActive` record
+/// and its exact original `VerifiedLocal` bootstrap anchor.
+///
+/// Cost is the bounded handoff-chain walk plus one record digest, never the
+/// enrollment lifetime, the graph, the archive, or SQLite. Absent,
+/// `ShadowImport`, `Blocked`, non-`Idle`, malformed, cross-bound, and
+/// changed-digest state all fail closed.
+pub(crate) fn reopen_promoted_bootstrap_anchor(
+    root: &EnrollmentApplicationRoot,
+    binding: &EnrollmentBindingV1,
+) -> Result<PromotedBootstrapAnchor, VerifiedLocalCompositionError> {
+    binding.validate_internal()?;
+    let reader = open_local_active_reader(root, binding)?;
+    let committed = observe_idle_local_active(&reader, binding)?;
+    let (predecessor_head, verified) =
+        find_verified_local_predecessor(&reader, committed.verification_digest)?;
+    drop(reader);
+
+    // The committed VerifiedLocal record commits to itself: reproducing its
+    // digest proves the retained anchor fields are the exact ones the original
+    // activation bound.
+    if verified.verification_digest()? != committed.verification_digest {
+        return Err(VerifiedLocalCompositionError::ProofMismatch(
+            "committed VerifiedLocal record does not reproduce the LocalActive verification digest",
+        ));
+    }
+    Ok(PromotedBootstrapAnchor {
+        binding: binding.clone(),
+        committed,
+        predecessor_head,
+        preparation_id: verified.preparation_id,
+        bootstrap_import_id: verified.bootstrap_import_id,
+        bootstrap_part_count: verified.bootstrap_part_count,
+        bootstrap_batch_id: verified.bootstrap_batch_id,
+        accepted_history_record_count: verified.accepted_history_record_count,
+        anchor: verified.accepted_frontier_anchor,
     })
 }
 

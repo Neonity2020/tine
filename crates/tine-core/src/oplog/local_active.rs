@@ -27,33 +27,69 @@
 //! device-local drain is proved and revalidated; the dependency that this
 //! packet cannot prove inside `tine-core` is named exactly rather than assumed.
 //!
-//! Two runtime dependencies remain outside this packet and are deliberately not
-//! faked:
+//! The graph-text watcher event queue is owned by the Tauri watcher, so
+//! [`SAFE_HANDOFF_MISSING_DEPENDENCY`] blocks the production `Safe` transition
+//! after every core-checkable drain has been proved.
 //!
-//! * The graph-text watcher event queue is owned by the Tauri watcher, so
-//!   [`SAFE_HANDOFF_MISSING_DEPENDENCY`] blocks the production `Safe`
-//!   transition after every core-checkable drain has been proved.
-//! * An inactive-bootstrap archive is still fenced from ordinary runtime
-//!   opening (`"inactive bootstrap history cannot be opened as ordinary
-//!   runtime"`), so the enrolled runtime engine that [`LocalMutationPermit`]
-//!   admits is not yet the engine the bootstrap published. Admission therefore
-//!   authenticates the enrolled workspace/lineage/catalog/endpoint/device/
-//!   receipt-store identity and refuses any engine behind the activated
-//!   accepted frontier, rather than pinning one engine instance.
+//! # Runtime promotion
+//!
+//! [`LocalActiveAuthority`] alone still cannot write: an inactive-bootstrap
+//! archive is fenced from ordinary runtime opening, so the bootstrap's own
+//! engine is read-only. [`PromotedLocalRuntime`] is the boundary that lifts that
+//! fence for exactly one durably bound lineage. Promotion is two phase, because
+//! the device-local SQLite applier lease is one-per-workspace and the retained
+//! inactive bootstrap projection must be released before a promoted one exists:
+//!
+//! 1. [`seal_local_runtime_promotion`] re-proves the live authority, retained
+//!    proof set, inactive accepted authority, bound archive capability and its
+//!    persisted canonical resource claim, enrolled endpoint, and bootstrap
+//!    SQLite projection, then publishes one immutable exact durable promotion
+//!    state.
+//! 2. [`open_promoted_local_runtime`] (same process) or
+//!    [`reopen_promoted_local_runtime`] (restarted process, no retained
+//!    evidence at all) opens and completely recovers the writable enrolled
+//!    engine, projection-work index, reference/catalog authority, SQLite
+//!    projection, and bounded tail, proves the current history is exactly or
+//!    insertion-only descended from the exact bootstrap anchor, and only then
+//!    mints the token.
+//!
+//! The bootstrap stays an immutable historical anchor. Ordinary local batches
+//! extend it by carrying the identical bootstrap aggregate binding forward, so
+//! the promoted history is one homogeneous bootstrap-anchored lineage that the
+//! durable promotion state explicitly authorizes — never a silently
+//! reinterpreted inactive root and never mixed record bindings. Ancestry is
+//! proved by the store-minted [`super::object_store::AuthenticatedEngineHistoryTransition`],
+//! never by raw generation or acceptance sequence.
+//!
+//! Every new-architecture mutation, projection, import, coordinator, and
+//! reconciliation path requires a [`LocalRuntimeAdmission`] whose only
+//! production source is [`PromotedRuntimeAdmission::admission`], which is itself
+//! derived from *both* a live [`LocalActiveAuthority`] and the exact
+//! [`PromotedLocalRuntime`].
 
 use std::fmt;
+use std::path::Path;
 
 use crate::model::Graph;
 
 use super::enrollment::{
     activate_verified_local_record, reopen_local_active_from_durable_state,
-    reopen_local_active_record, transition_local_active_handoff, CommittedLocalActive,
-    EnrollmentApplicationRoot, EnrollmentBindingV1, LocalActiveHandoff, LocalActiveSync,
-    VerifiedLocalCompositionError, VerifiedLocalEvidence, VerifiedLocalProofSet,
+    reopen_local_active_record, reopen_promoted_bootstrap_anchor, transition_local_active_handoff,
+    CommittedLocalActive, EnrollmentApplicationRoot, EnrollmentBindingV1, LocalActiveHandoff,
+    LocalActiveSync, PromotedBootstrapAnchor, VerifiedLocalCompositionError, VerifiedLocalEvidence,
+    VerifiedLocalProofSet,
 };
-use super::hot_engine::ShardedHotEngine;
-use super::sqlite::{OpenProjection, SqliteFrontier, TailOverlay};
-use super::{ContentDigest, ProjectionEndpointBinding, SessionId};
+use super::hot_engine::{EngineError, ShardedHotEngine};
+use super::object_store::{
+    EngineHistoryAuthority, PromotedLineageModeV1, PromotedRuntimeStateV1, StoreError,
+    PROMOTED_RUNTIME_STATE_SCHEMA_VERSION,
+};
+use super::projection_store::ProjectionReceiptStore;
+use super::sqlite::{
+    ApplicationRuntimeRoot, OpenProjection, ProjectionClaim, ProjectionError, RebuildSource,
+    SqliteFrontier, TailOverlay,
+};
+use super::{ContentDigest, ObjectStore, ProjectionEndpointBinding, SessionId};
 
 /// A private seal. Sibling modules can name the sealed types but can never
 /// construct one, because this module is the only place `Seal` is reachable.
@@ -388,13 +424,9 @@ impl LocalActiveAuthority {
         self.handoff = committed.handoff();
     }
 
-    /// Authenticate the live graph and engine against the committed enrollment
-    /// binding. Nothing here reads SQLite rows or projection bytes.
-    fn authenticate_runtime(
-        &self,
-        graph: &Graph,
-        engine: &ShardedHotEngine,
-    ) -> Result<(), LocalActivationError> {
+    /// Authenticate the live graph capability alone against the committed
+    /// enrollment binding.
+    fn authenticate_graph(&self, graph: &Graph) -> Result<(), LocalActivationError> {
         let binding = self.evidence.binding();
         let graph_resource = graph
             .canonical_resource_id()
@@ -412,6 +444,18 @@ impl LocalActiveAuthority {
                 "live graph text scope is not the enrolled scope".into(),
             ));
         }
+        Ok(())
+    }
+
+    /// Authenticate the live graph and engine against the committed enrollment
+    /// binding. Nothing here reads SQLite rows or projection bytes.
+    fn authenticate_runtime(
+        &self,
+        graph: &Graph,
+        engine: &ShardedHotEngine,
+    ) -> Result<(), LocalActivationError> {
+        self.authenticate_graph(graph)?;
+        let binding = self.evidence.binding();
         if engine.workspace_id() != binding.workspace_id()
             || engine.lineage_digest() != binding.lineage_digest()
             || engine.catalog_document_id() != binding.catalog_document_id()
@@ -517,28 +561,22 @@ impl LocalMutationPermit<'_> {
     pub(crate) const fn endpoint(&self) -> ProjectionEndpointBinding {
         self.authority.endpoint
     }
-
-    /// Derive the runtime admission that every new-architecture execution path
-    /// requires.
-    pub(crate) fn admission(&self) -> LocalRuntimeAdmission<'_> {
-        LocalRuntimeAdmission {
-            provenance: AdmissionProvenance::LocalActive(self),
-        }
-    }
 }
 
 /// The value every new-architecture local mutation, projection, import, and
 /// coordinator execution path requires.
 ///
-/// The only production constructor is [`LocalMutationPermit::admission`], so
-/// future Tauri wiring cannot reach a writable runtime without first minting a
-/// [`LocalActiveAuthority`].
+/// The only production constructor is [`PromotedRuntimeAdmission::admission`],
+/// which is itself derived from both a live [`LocalActiveAuthority`] and the
+/// exact [`PromotedLocalRuntime`] token. Future Tauri wiring therefore cannot
+/// reach a writable runtime without first minting an authority *and* opening
+/// the promoted runtime that authority's durable promotion state authorizes.
 pub(crate) struct LocalRuntimeAdmission<'a> {
     provenance: AdmissionProvenance<'a>,
 }
 
 enum AdmissionProvenance<'a> {
-    LocalActive(&'a LocalMutationPermit<'a>),
+    Promoted(&'a PromotedRuntimeAdmission<'a>),
     UnenrolledPreActivation,
 }
 
@@ -549,27 +587,58 @@ impl LocalRuntimeAdmission<'_> {
     /// directly instead of through a bootstrap publication, so no genuine
     /// authority is constructible for them yet.
     ///
-    /// It stays `pub(crate)`, so app startup and Tauri cannot reach it: outside
-    /// this crate the only way to obtain an admission remains a live
-    /// [`LocalActiveAuthority`] permit.
+    /// Two independent fences keep it away from a user's real graph. It stays
+    /// `pub(crate)` — as does [`LocalRuntimeAdmission`] itself — so app startup
+    /// and Tauri cannot name or construct one, and outside this crate the only
+    /// way to obtain an admission remains a live [`LocalActiveAuthority`]
+    /// permit. And [`Self::authorize`] refuses outright when the engine offered
+    /// is a promoted runtime, so even inside the crate this hatch can never
+    /// authorize work over a promoted lineage; that requires the real
+    /// authority-plus-runtime admission.
     pub(crate) const fn unenrolled_pre_activation() -> Self {
         Self {
             provenance: AdmissionProvenance::UnenrolledPreActivation,
         }
     }
 
-    /// Revalidate the live runtime against the enrolled binding immediately
-    /// before work is admitted.
+    /// Revalidate the live runtime immediately before work is admitted.
+    ///
+    /// A promoted admission requires the supplied engine to be the exact
+    /// promoted engine instance, proved by its process-local runtime authority,
+    /// and re-proves the complete promoted binding: archive resource, storage
+    /// binding, authenticated bootstrap-anchor to current-history transition,
+    /// engine and SQLite current frontier, committed enrollment
+    /// verification/session/head, and live graph capability. A same-identity
+    /// engine rebuilt from divergent, rolled-back, or merely
+    /// higher-sequence history is refused here, before any durable or graph
+    /// mutation.
     pub(crate) fn authorize(
         &self,
         graph: &Graph,
         engine: &ShardedHotEngine,
     ) -> Result<(), LocalActivationError> {
         match &self.provenance {
-            AdmissionProvenance::LocalActive(permit) => {
-                permit.authority.authenticate_runtime(graph, engine)
+            AdmissionProvenance::Promoted(admission) => admission
+                .authorize_engine(graph, engine)
+                .map_err(|error| match error {
+                    RuntimePromotionError::Activation(error) => error,
+                    other => LocalActivationError::RuntimeBinding(other.to_string()),
+                }),
+            AdmissionProvenance::UnenrolledPreActivation => {
+                // A promoted engine is a real activated user graph. The
+                // pre-activation hatch exists only for fixtures whose engines
+                // were never enrolled through a bootstrap publication, so
+                // offering it a promoted runtime is always a construction
+                // error, never a fallback.
+                if engine.promoted_lineage().is_some() {
+                    return Err(LocalActivationError::RuntimeBinding(
+                        "the unenrolled pre-activation admission cannot authorize a promoted \
+                         runtime engine"
+                            .into(),
+                    ));
+                }
+                Ok(())
             }
-            AdmissionProvenance::UnenrolledPreActivation => Ok(()),
         }
     }
 }
@@ -904,6 +973,1065 @@ fn authenticate_activation_runtime(
         ));
     }
     Ok(endpoint)
+}
+
+// ---------------------------------------------------------------------------
+// Runtime promotion: inactive bootstrap archive -> writable promoted runtime.
+// ---------------------------------------------------------------------------
+
+/// Why a runtime promotion, promoted open, or promoted admission failed.
+#[derive(Debug)]
+pub(crate) enum RuntimePromotionError {
+    Activation(LocalActivationError),
+    Enrollment(VerifiedLocalCompositionError),
+    Store(StoreError),
+    Engine(EngineError),
+    Sqlite(ProjectionError),
+    /// The durable promotion state, bootstrap anchor, or authenticated history
+    /// transition does not authenticate the live runtime.
+    Anchor(&'static str),
+}
+
+impl fmt::Display for RuntimePromotionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Activation(error) => error.fmt(formatter),
+            Self::Enrollment(error) => error.fmt(formatter),
+            Self::Store(error) => error.fmt(formatter),
+            Self::Engine(error) => error.fmt(formatter),
+            Self::Sqlite(error) => error.fmt(formatter),
+            Self::Anchor(detail) => {
+                write!(formatter, "promoted runtime anchor failed: {detail}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RuntimePromotionError {}
+
+impl From<LocalActivationError> for RuntimePromotionError {
+    fn from(error: LocalActivationError) -> Self {
+        Self::Activation(error)
+    }
+}
+
+impl From<VerifiedLocalCompositionError> for RuntimePromotionError {
+    fn from(error: VerifiedLocalCompositionError) -> Self {
+        Self::Enrollment(error)
+    }
+}
+
+impl From<StoreError> for RuntimePromotionError {
+    fn from(error: StoreError) -> Self {
+        Self::Store(error)
+    }
+}
+
+impl From<EngineError> for RuntimePromotionError {
+    fn from(error: EngineError) -> Self {
+        Self::Engine(error)
+    }
+}
+
+impl From<ProjectionError> for RuntimePromotionError {
+    fn from(error: ProjectionError) -> Self {
+        Self::Sqlite(error)
+    }
+}
+
+/// Proof that exactly one promoted-runtime state is durably committed for one
+/// enrolled archive.
+///
+/// It carries no capability: it is the durable state plus the private seal, and
+/// exists so the two-phase promotion below cannot be entered from anywhere but
+/// [`seal_local_runtime_promotion`]. Two phases are required, not stylistic: the
+/// device-local SQLite applier lease is one-per-workspace, so the retained
+/// inactive bootstrap projection inside the proof set must be released before a
+/// promoted projection can be opened over the same archive.
+pub(crate) struct SealedRuntimePromotion {
+    state: PromotedRuntimeStateV1,
+    _seal: seal::Seal,
+}
+
+impl fmt::Debug for SealedRuntimePromotion {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SealedRuntimePromotion")
+            .field("anchor", &self.state.anchor_authority())
+            .finish_non_exhaustive()
+    }
+}
+
+/// The device-local resources a promoted runtime is opened over.
+pub(crate) struct PromotedRuntimeOpen<'a> {
+    /// The live enrolled graph capability.
+    pub(crate) graph: &'a Graph,
+    /// The enrolled projection receipt namespace.
+    pub(crate) receipts: &'a ProjectionReceiptStore,
+    /// Root of the enrolled canonical archive.
+    pub(crate) archive_root: &'a Path,
+    /// Device-local disposable SQLite projection path.
+    pub(crate) database_path: &'a Path,
+    pub(crate) application_runtime_root: &'a ApplicationRuntimeRoot,
+}
+
+/// Phase one of promotion: durably bind the promoted runtime.
+///
+/// Consumes nothing and writes nothing but one device-local archive metadata
+/// file. It requires, and independently re-proves, the exact live
+/// [`LocalActiveAuthority`], the exact retained [`VerifiedLocalProofSet`] and
+/// inactive accepted authority, the bound archive capability and its persisted
+/// canonical resource claim, the enrolled endpoint/receipt store, and the
+/// retained bootstrap SQLite projection at the verified accepted frontier.
+///
+/// The durable state binds the canonical archive resource and projection
+/// storage binding, the bootstrap aggregate/publication/import identity, the
+/// authenticated bootstrap history generation and radix index root, the
+/// accepted frontier state digest and acceptance sequence, the `LocalActive`
+/// verification digest and enrollment binding digest, the promoting session,
+/// the promotion schema version, and the explicit homogeneous
+/// bootstrap-anchored lineage mode.
+///
+/// It is published as one immutable exact file, so every crash cut reopens as
+/// either the unchanged inactive bootstrap or the one exact resumable promoted
+/// state. Repeating the call with the same inputs resumes; any divergent
+/// competing promotion fails closed and preserves the committed state.
+pub(crate) fn seal_local_runtime_promotion(
+    authority: &LocalActiveAuthority,
+    proofs: &VerifiedLocalProofSet<'_>,
+    runtime: &LocalActiveRuntime<'_>,
+) -> Result<SealedRuntimePromotion, RuntimePromotionError> {
+    // The retained runtime must be the exact retained accepted-authority engine
+    // and the exact verified device-local projection at the verified frontier.
+    authenticate_activation_runtime(&authority.evidence, proofs, runtime)?;
+    // The live graph must still authenticate the committed binding. The
+    // retained engine here is the read-only inactive bootstrap engine, whose
+    // enrolled endpoint lives on the accepted-authority binding rather than on
+    // the engine, so `authenticate_activation_runtime` above owns that half.
+    authority.authenticate_graph(proofs.graph)?;
+
+    let binding = authority.evidence.binding();
+    let committed = authority.reopen_current()?;
+    match committed.handoff() {
+        LocalActiveHandoff::Unsafe { session_id } if session_id == authority.session_id => {}
+        LocalActiveHandoff::Unsafe { .. } => {
+            return Err(RuntimePromotionError::Enrollment(
+                VerifiedLocalCompositionError::CompetingSession,
+            ));
+        }
+        LocalActiveHandoff::Safe => {
+            return Err(RuntimePromotionError::Enrollment(
+                VerifiedLocalCompositionError::WrongLifecycle(
+                    "runtime promotion requires this session's Unsafe LocalActive record",
+                ),
+            ));
+        }
+    }
+    if committed.enrollment_head() != authority.enrollment_head
+        || committed.verification_digest() != authority.verification_digest
+        || committed.binding() != binding
+    {
+        return Err(RuntimePromotionError::Enrollment(
+            VerifiedLocalCompositionError::StaleEvidence(
+                "committed LocalActive record changed before runtime promotion",
+            ),
+        ));
+    }
+
+    // The physical archive only proves its own control identity, so the
+    // persisted canonical archive-resource claim is authenticated separately.
+    let accepted = proofs.accepted_authority.binding();
+    proofs
+        .accepted_authority
+        .store()
+        .validate_enrolled_archive_resource_id(binding.archive_resource_id())
+        .map_err(|error| {
+            RuntimePromotionError::Activation(LocalActivationError::RuntimeBinding(format!(
+                "persisted archive resource claim does not authenticate the enrolled binding: {error}"
+            )))
+        })?;
+
+    let state = PromotedRuntimeStateV1 {
+        schema_version: PROMOTED_RUNTIME_STATE_SCHEMA_VERSION,
+        lineage_mode: PromotedLineageModeV1::BootstrapAnchoredHomogeneous,
+        workspace_id: binding.workspace_id(),
+        lineage_digest: binding.lineage_digest(),
+        catalog_document_id: binding.catalog_document_id(),
+        endpoint_id: binding.endpoint_id(),
+        device_id: binding.device_id(),
+        graph_resource_id: binding.graph_resource_id(),
+        receipt_store_id: binding.receipt_store_id(),
+        archive_resource_id: binding.archive_resource_id(),
+        archive_control_binding: accepted.archive_identity().binding_digest(),
+        bootstrap: accepted.bootstrap_binding(),
+        bootstrap_import_id: accepted.import_id(),
+        anchor_history_generation: accepted.history_generation(),
+        anchor_history_index_root: accepted.history_root(),
+        anchor_acceptance_sequence: accepted.accepted_frontier().acceptance_sequence(),
+        anchor_accepted_frontier_state_digest: accepted.accepted_frontier().state_digest(),
+        enrollment_verification_digest: authority.verification_digest,
+        enrollment_binding_digest: binding
+            .binding_digest()
+            .map_err(VerifiedLocalCompositionError::Enrollment)?,
+        promotion_session_id: authority.session_id,
+    };
+    // The composed state must agree with the anchor the committed VerifiedLocal
+    // record binds, not merely with the live retained authority.
+    if state.anchor_accepted_frontier_state_digest
+        != authority.evidence.accepted_frontier_state_digest()
+    {
+        return Err(RuntimePromotionError::Anchor(
+            "retained accepted frontier is not the verified LocalActive frontier",
+        ));
+    }
+
+    publish_promotion_state(proofs.accepted_authority.store().root_path(), &state)?;
+
+    // Fresh reopen: the committed state must be exactly this one, and the
+    // enrollment head must not have moved while it was published.
+    let reopened = read_promotion_state(proofs.accepted_authority.store().root_path(), &state)?;
+    if reopened != state {
+        return Err(RuntimePromotionError::Anchor(
+            "committed promoted runtime state is not the state this promotion composed",
+        ));
+    }
+    let after = authority.reopen_current()?;
+    if after.enrollment_head() != committed.enrollment_head()
+        || after.handoff() != committed.handoff()
+    {
+        return Err(RuntimePromotionError::Enrollment(
+            VerifiedLocalCompositionError::StaleEvidence(
+                "committed LocalActive record changed during runtime promotion",
+            ),
+        ));
+    }
+    Ok(SealedRuntimePromotion {
+        state,
+        _seal: seal::Seal,
+    })
+}
+
+/// Open the durable history control alone and publish the promotion state.
+fn publish_promotion_state(
+    archive_root: &Path,
+    state: &PromotedRuntimeStateV1,
+) -> Result<(), RuntimePromotionError> {
+    let store = ObjectStore::open(archive_root, state.workspace_id)?;
+    let open = store
+        .seal_history_only(promoted_storage_binding(state))
+        .map_err(|(_store, error)| error)?;
+    let (_store, history) = open.into_history().map_err(|(_store, error)| error)?;
+    history.publish_promoted_runtime_state(state)?;
+    Ok(())
+}
+
+/// Freshly reopen the durable promotion state through a fresh archive open.
+fn read_promotion_state(
+    archive_root: &Path,
+    expected: &PromotedRuntimeStateV1,
+) -> Result<PromotedRuntimeStateV1, RuntimePromotionError> {
+    let store = ObjectStore::open(archive_root, expected.workspace_id)?;
+    let open = store
+        .seal_history_only(promoted_storage_binding(expected))
+        .map_err(|(_store, error)| error)?;
+    let (_store, history) = open.into_history().map_err(|(_store, error)| error)?;
+    history
+        .read_promoted_runtime_state()?
+        .ok_or(RuntimePromotionError::Store(
+            StoreError::PromotedRuntimeStateAbsent,
+        ))
+}
+
+fn promoted_storage_binding(
+    state: &PromotedRuntimeStateV1,
+) -> super::hot_engine::ProjectionStorageBinding {
+    super::hot_engine::ProjectionStorageBinding {
+        endpoint: ProjectionEndpointBinding {
+            endpoint_id: state.endpoint_id,
+            device_id: state.device_id,
+            graph_resource_id: state.graph_resource_id,
+        },
+        receipt_store_id: state.receipt_store_id,
+    }
+}
+
+/// The opaque promoted local runtime.
+///
+/// It owns the writable enrolled engine, the device-local SQLite projection,
+/// and the bounded tail overlay for one enrolled graph. It is not `Clone`, not
+/// `Copy`, neither serializable nor deserializable, has no public constructor,
+/// and no test mint. Exactly two functions produce one:
+/// [`open_promoted_local_runtime`] after a same-process promotion, and
+/// [`reopen_promoted_local_runtime`] for a restarted process holding no
+/// retained evidence at all.
+pub(crate) struct PromotedLocalRuntime {
+    state: PromotedRuntimeStateV1,
+    anchor: EngineHistoryAuthority,
+    session_id: SessionId,
+    verification_digest: ContentDigest,
+    endpoint: ProjectionEndpointBinding,
+    engine: ShardedHotEngine,
+    projection: OpenProjection,
+    tail: TailOverlay,
+    _seal: seal::Seal,
+}
+
+impl fmt::Debug for PromotedLocalRuntime {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PromotedLocalRuntime")
+            .field("anchor", &self.anchor)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PromotedLocalRuntime {
+    pub(crate) const fn engine(&self) -> &ShardedHotEngine {
+        &self.engine
+    }
+
+    pub(crate) const fn database(&self) -> &SqliteFrontier {
+        &self.projection.database
+    }
+
+    pub(crate) const fn projection(&self) -> &OpenProjection {
+        &self.projection
+    }
+
+    pub(crate) const fn tail(&self) -> &TailOverlay {
+        &self.tail
+    }
+
+    pub(crate) const fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    pub(crate) const fn endpoint(&self) -> ProjectionEndpointBinding {
+        self.endpoint
+    }
+
+    /// The authenticated bootstrap anchor every promoted history must descend
+    /// from. Reported for instrumentation and tests, never as authority.
+    pub(crate) const fn bootstrap_anchor(&self) -> EngineHistoryAuthority {
+        self.anchor
+    }
+
+    pub(crate) const fn verification_digest(&self) -> ContentDigest {
+        self.verification_digest
+    }
+
+    /// Admit one short-lived promoted mutation window.
+    ///
+    /// The window is derived from *both* the live [`LocalActiveAuthority`] and
+    /// this exact promoted runtime. Both exclusive borrows are load bearing: no
+    /// second window can exist while this one is live, and the complete
+    /// promoted binding is revalidated before the window opens.
+    pub(crate) fn admit_promoted_mutation<'a>(
+        &'a mut self,
+        authority: &'a mut LocalActiveAuthority,
+        graph: &Graph,
+    ) -> Result<PromotedRuntimeSession<'a>, RuntimePromotionError> {
+        self.revalidate(graph, authority)?;
+        // `admit_local_mutation` durably moves a committed `Safe` handoff back
+        // to `Unsafe { session }` before the permit exists, so no promoted write
+        // is ever accepted while the persisted state claims a clean handoff.
+        let permit = authority.admit_local_mutation(graph, &self.engine)?;
+        let admission = PromotedRuntimeAdmission {
+            permit,
+            state: self.state.clone(),
+            anchor: self.anchor,
+            engine_authority: self.engine.runtime_authority().clone(),
+            _seal: seal::Seal,
+        };
+        Ok(PromotedRuntimeSession {
+            admission,
+            engine: &mut self.engine,
+            database: &mut self.projection.database,
+            tail: &mut self.tail,
+        })
+    }
+
+    /// Re-prove the complete promoted binding, including the device-local
+    /// SQLite frontier, against live durable state.
+    fn revalidate(
+        &self,
+        graph: &Graph,
+        authority: &LocalActiveAuthority,
+    ) -> Result<(), RuntimePromotionError> {
+        if authority.session_id != self.session_id
+            || authority.verification_digest != self.verification_digest
+        {
+            return Err(RuntimePromotionError::Anchor(
+                "live authority is not this promoted runtime's session",
+            ));
+        }
+        let accepted = revalidate_promoted_binding(
+            &self.state,
+            self.anchor,
+            self.engine.runtime_authority(),
+            graph,
+            &self.engine,
+            authority,
+        )?;
+        if self.projection.database.frontier_root()? != accepted {
+            return Err(RuntimePromotionError::Anchor(
+                "promoted SQLite frontier is not the current accepted frontier",
+            ));
+        }
+        if self.endpoint.endpoint_id() != authority.endpoint.endpoint_id()
+            || self.endpoint.device_id() != authority.endpoint.device_id()
+            || self.endpoint.graph_resource_id() != authority.endpoint.graph_resource_id()
+        {
+            return Err(RuntimePromotionError::Anchor(
+                "promoted endpoint binding is not the authority's enrolled endpoint",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Re-prove the complete promoted binding against live durable state, and
+/// return the authenticated current accepted frontier.
+///
+/// Cost is one archive-resource claim read, one archive control-identity stat,
+/// one durable head read, one shared-radix insertion-only walk bounded by the
+/// changed paths, one engine frontier read, and one bounded enrollment head
+/// reopen. Nothing here scans lifetime history, the enrollment chain, or graph
+/// text.
+fn revalidate_promoted_binding(
+    state: &PromotedRuntimeStateV1,
+    anchor: EngineHistoryAuthority,
+    engine_authority: &super::hot_engine::EngineAuthority,
+    graph: &Graph,
+    engine: &ShardedHotEngine,
+    authority: &LocalActiveAuthority,
+) -> Result<super::hot_engine::AcceptedFrontierRoot, RuntimePromotionError> {
+    // The engine offered for work must be the exact promoted engine instance.
+    // A same-identity engine rebuilt from divergent, rolled-back, or merely
+    // higher-sequence history mints a distinct process-local authority and is
+    // refused here, before any durable or graph mutation.
+    if !engine_authority.matches(engine.runtime_authority()) {
+        return Err(RuntimePromotionError::Activation(
+            LocalActivationError::RuntimeBinding(
+                "admitted engine is not the exact promoted runtime engine".into(),
+            ),
+        ));
+    }
+    let binding = authority.evidence.binding();
+    // Enrollment identity: the authority and the durable promotion state must
+    // be the same enrollment and verification digest.
+    if authority.verification_digest != state.enrollment_verification_digest
+        || binding
+            .binding_digest()
+            .map_err(VerifiedLocalCompositionError::Enrollment)?
+            != state.enrollment_binding_digest
+    {
+        return Err(RuntimePromotionError::Anchor(
+            "live authority is not the enrollment this promoted runtime binds",
+        ));
+    }
+    // Live graph capability and enrolled engine binding.
+    authority.authenticate_runtime(graph, engine)?;
+    // Storage binding.
+    match engine.projection_endpoint_binding() {
+        Some(endpoint)
+            if endpoint.endpoint_id() == state.endpoint_id
+                && endpoint.device_id() == state.device_id
+                && endpoint.graph_resource_id() == state.graph_resource_id => {}
+        _ => {
+            return Err(RuntimePromotionError::Anchor(
+                "promoted engine endpoint is not the promoted storage binding",
+            ));
+        }
+    }
+    if engine.projection_receipt_store_id() != Some(state.receipt_store_id) {
+        return Err(RuntimePromotionError::Anchor(
+            "promoted engine receipt store is not the promoted storage binding",
+        ));
+    }
+    // Archive resource claim and physical archive control identity.
+    let archive = engine.archive_store().ok_or(RuntimePromotionError::Anchor(
+        "promoted engine retained no archive capability",
+    ))?;
+    archive
+        .validate_enrolled_archive_resource_id(state.archive_resource_id)
+        .map_err(|error| {
+            RuntimePromotionError::Activation(LocalActivationError::RuntimeBinding(format!(
+                "promoted archive resource claim no longer authenticates: {error}"
+            )))
+        })?;
+    if archive.canonical_archive_identity()?.binding_digest() != state.archive_control_binding {
+        return Err(RuntimePromotionError::Anchor(
+            "promoted archive control directory was substituted",
+        ));
+    }
+    // The live open must still be authorized by exactly this durable state.
+    if engine.promoted_lineage() != Some(state) {
+        return Err(RuntimePromotionError::Anchor(
+            "promoted engine no longer holds this exact promotion authorization",
+        ));
+    }
+    // Authenticated bootstrap anchor -> current history transition. Raw
+    // generation and acceptance sequence are never the proof.
+    let transition = engine.authenticate_history_descends_from(anchor)?;
+    if transition.before() != anchor || transition.after() != engine.durable_history_authority()? {
+        return Err(RuntimePromotionError::Anchor(
+            "current durable history is not an authenticated descendant of the bootstrap anchor",
+        ));
+    }
+    let accepted = engine
+        .accepted_frontier_root()
+        .map_err(RuntimePromotionError::Engine)?;
+    if accepted.acceptance_sequence() < state.anchor_acceptance_sequence {
+        return Err(RuntimePromotionError::Anchor(
+            "promoted engine accepted frontier is behind the bootstrap anchor",
+        ));
+    }
+    // Committed enrollment verification digest, session, and head.
+    let committed = authority.reopen_current()?;
+    if committed.verification_digest() != state.enrollment_verification_digest
+        || committed.binding() != binding
+        || committed.session_id() != Some(authority.session_id)
+        || committed.enrollment_head() != authority.enrollment_head
+    {
+        return Err(RuntimePromotionError::Enrollment(
+            VerifiedLocalCompositionError::StaleEvidence(
+                "committed LocalActive record is not this promoted session's current record",
+            ),
+        ));
+    }
+    Ok(accepted)
+}
+
+/// A short-lived promoted mutation window derived from both a live authority
+/// and the exact promoted runtime token.
+///
+/// The window splits the promoted runtime's exclusive borrow so a caller can
+/// hold the admission *and* mutate the enrolled engine, SQLite frontier, and
+/// tail at the same time, which is what every execution path needs.
+pub(crate) struct PromotedRuntimeSession<'a> {
+    admission: PromotedRuntimeAdmission<'a>,
+    engine: &'a mut ShardedHotEngine,
+    database: &'a mut SqliteFrontier,
+    tail: &'a mut TailOverlay,
+}
+
+impl PromotedRuntimeSession<'_> {
+    pub(crate) const fn session_id(&self) -> SessionId {
+        self.admission.permit.session_id()
+    }
+
+    pub(crate) const fn enrollment_head(&self) -> ContentDigest {
+        self.admission.permit.enrollment_head()
+    }
+
+    /// Derive the runtime admission every new-architecture mutation,
+    /// projection, import, coordinator, and reconciliation path requires.
+    pub(crate) const fn admission(&self) -> LocalRuntimeAdmission<'_> {
+        LocalRuntimeAdmission {
+            provenance: AdmissionProvenance::Promoted(&self.admission),
+        }
+    }
+
+    pub(crate) const fn engine(&mut self) -> &mut ShardedHotEngine {
+        self.engine
+    }
+
+    pub(crate) const fn database(&mut self) -> &mut SqliteFrontier {
+        self.database
+    }
+
+    pub(crate) const fn tail(&mut self) -> &mut TailOverlay {
+        self.tail
+    }
+
+    /// Drain the accepted tail into the device-local SQLite projection.
+    ///
+    /// This is the ordinary bounded [`TailOverlay`] drain every enrolled
+    /// runtime uses. The only promoted-specific part is the rebuild source:
+    /// this lineage's leading acceptance sequences are its retained immutable
+    /// bootstrap parts, which live in the archive's bootstrap namespace rather
+    /// than the ordinary object namespace.
+    ///
+    /// Draining is not a mutation authority. It applies only already-accepted
+    /// authenticated events, in exact acceptance order, and writes nothing to
+    /// the graph.
+    pub(crate) fn drain_projection(
+        &mut self,
+        max_batches: usize,
+    ) -> Result<usize, RuntimePromotionError> {
+        let engine = &*self.engine;
+        let store = engine.archive_store().ok_or(RuntimePromotionError::Anchor(
+            "promoted engine retained no archive capability",
+        ))?;
+        let publication = store
+            .load_bootstrap_publication(self.admission.state.bootstrap.publication_id())
+            .map_err(RuntimePromotionError::Store)?;
+        let source = RebuildSource::from_promoted_runtime(engine, store, &publication)?;
+        self.tail
+            .drain_ready(self.database, &source, max_batches)
+            .map_err(|error| match error {
+                super::sqlite::TailOverlayError::Projection(error) => {
+                    RuntimePromotionError::Sqlite(error)
+                }
+                other => RuntimePromotionError::Activation(LocalActivationError::RuntimeBinding(
+                    other.to_string(),
+                )),
+            })
+    }
+
+    /// The complete admitted runtime, borrowed disjointly.
+    pub(crate) const fn parts(
+        &mut self,
+    ) -> (
+        LocalRuntimeAdmission<'_>,
+        &mut ShardedHotEngine,
+        &mut SqliteFrontier,
+        &mut TailOverlay,
+    ) {
+        (
+            LocalRuntimeAdmission {
+                provenance: AdmissionProvenance::Promoted(&self.admission),
+            },
+            self.engine,
+            self.database,
+            self.tail,
+        )
+    }
+}
+
+/// The non-forgeable evidence one promoted mutation window carries.
+///
+/// It retains the durable promotion state, the bootstrap anchor, the exact
+/// promoted engine identity, and the live authority permit, so authorization
+/// re-proves the whole binding without borrowing the runtime it split.
+pub(crate) struct PromotedRuntimeAdmission<'a> {
+    permit: LocalMutationPermit<'a>,
+    state: PromotedRuntimeStateV1,
+    anchor: EngineHistoryAuthority,
+    engine_authority: super::hot_engine::EngineAuthority,
+    _seal: seal::Seal,
+}
+
+impl PromotedRuntimeAdmission<'_> {
+    fn authorize_engine(
+        &self,
+        graph: &Graph,
+        engine: &ShardedHotEngine,
+    ) -> Result<(), RuntimePromotionError> {
+        revalidate_promoted_binding(
+            &self.state,
+            self.anchor,
+            &self.engine_authority,
+            graph,
+            engine,
+            self.permit.authority,
+        )
+        .map(|_| ())
+    }
+}
+
+/// Phase two of promotion, same process: open the promoted writable runtime.
+///
+/// The caller must have released the retained inactive bootstrap projection
+/// first; the one-per-workspace SQLite applier lease enforces that rather than
+/// trusting it.
+pub(crate) fn open_promoted_local_runtime(
+    sealed: SealedRuntimePromotion,
+    authority: &LocalActiveAuthority,
+    open: &PromotedRuntimeOpen<'_>,
+) -> Result<PromotedLocalRuntime, RuntimePromotionError> {
+    let committed = authority.reopen_current()?;
+    if committed.verification_digest() != sealed.state.enrollment_verification_digest
+        || committed.session_id() != Some(authority.session_id)
+    {
+        return Err(RuntimePromotionError::Enrollment(
+            VerifiedLocalCompositionError::StaleEvidence(
+                "committed LocalActive record is not the promoting session's record",
+            ),
+        ));
+    }
+    mint_promoted_runtime(
+        sealed.state,
+        authority.session_id,
+        authority.verification_digest,
+        authority.endpoint,
+        authority.evidence.binding(),
+        open,
+    )
+}
+
+/// The sole fresh-process promoted-runtime boundary.
+///
+/// A restarted process holds no [`VerifiedLocalEvidence`], no
+/// [`LocalActiveAuthority`], no [`SealedRuntimePromotion`], and no engine
+/// identity: all four are process-local and unserializable. This reconstructs
+/// everything from durable state and the retained immutable bootstrap
+/// publication:
+///
+/// * the committed `LocalActive` record and its exact original `VerifiedLocal`
+///   bootstrap anchor, self-authenticated from the hash-linked enrollment chain
+///   even though the live history head has advanced far past the bootstrap;
+/// * the durable promotion state, which must bind that exact anchor, archive
+///   resource, storage binding, enrollment binding, and verification digest;
+/// * an enrolled `ShardedHotEngine`, its projection-work index, and its
+///   reference/catalog authority, through the ordinary authenticated recovery
+///   replay;
+/// * an authenticated proof that the current history is exactly, or
+///   insertion-only descended from, the bootstrap anchor;
+/// * the device-local SQLite projection and bounded tail at the current
+///   accepted frontier.
+///
+/// The authority is minted only after that complete recovery, and the promoted
+/// token only after the authority. A crash still resumes `Unsafe`; an
+/// `Unsafe { other session }`, `Safe`-without-request, `Blocked`, non-`Idle`,
+/// or absent record fails closed.
+pub(crate) fn reopen_promoted_local_runtime(
+    root: &EnrollmentApplicationRoot,
+    binding: &EnrollmentBindingV1,
+    session_id: SessionId,
+    open: &PromotedRuntimeOpen<'_>,
+) -> Result<(LocalActiveAuthority, PromotedLocalRuntime), RuntimePromotionError> {
+    let anchor = reopen_promoted_bootstrap_anchor(root, binding)?;
+    // A competing session is refused before any archive, engine, SQLite, or
+    // lease work happens, so a losing restart advances and touches nothing.
+    if let LocalActiveHandoff::Unsafe {
+        session_id: committed_session,
+    } = anchor.committed().handoff()
+    {
+        if committed_session != session_id {
+            return Err(RuntimePromotionError::Enrollment(
+                VerifiedLocalCompositionError::CompetingSession,
+            ));
+        }
+    }
+    let state = read_promotion_state_for_anchor(open.archive_root, binding, &anchor)?;
+    let runtime = mint_promoted_runtime(
+        state,
+        session_id,
+        anchor.verification_digest(),
+        promoted_storage_binding_endpoint(binding),
+        binding,
+        open,
+    )?;
+
+    // Only now, with complete recovery proved, may an authority exist. The
+    // durable handoff protocol is the existing one: an `Unsafe { session }`
+    // record reopens only for that exact session, and a clean `Safe` record is
+    // durably moved to `Unsafe { requested session }` and freshly reopened
+    // before any authority is minted.
+    let (evidence, committed) = anchor.into_predecessor_evidence();
+    let reopened = match committed.handoff() {
+        LocalActiveHandoff::Unsafe {
+            session_id: committed_session,
+        } if committed_session == session_id => committed,
+        LocalActiveHandoff::Unsafe { .. } => {
+            return Err(RuntimePromotionError::Enrollment(
+                VerifiedLocalCompositionError::CompetingSession,
+            ));
+        }
+        LocalActiveHandoff::Safe => {
+            transition_local_active_handoff(
+                root,
+                binding,
+                committed.enrollment_head(),
+                evidence.verification_digest(),
+                LocalActiveHandoff::Unsafe { session_id },
+            )?;
+            let fresh = reopen_promoted_bootstrap_anchor(root, binding)?;
+            if fresh.verification_digest() != evidence.verification_digest()
+                || fresh.history_root() != runtime.anchor.index_root
+                || fresh.history_generation() != runtime.anchor.generation
+            {
+                return Err(RuntimePromotionError::Enrollment(
+                    VerifiedLocalCompositionError::StaleEvidence(
+                        "bootstrap anchor changed during the promoted handoff transition",
+                    ),
+                ));
+            }
+            let (_, fresh_committed) = fresh.into_predecessor_evidence();
+            fresh_committed
+        }
+    };
+    if reopened.verification_digest() != evidence.verification_digest()
+        || reopened.sync() != LocalActiveSync::Idle
+        || reopened.handoff() != (LocalActiveHandoff::Unsafe { session_id })
+        || reopened.binding() != evidence.binding()
+    {
+        return Err(RuntimePromotionError::Enrollment(
+            VerifiedLocalCompositionError::StaleEvidence(
+                "reopened LocalActive head is not this session's Unsafe+Idle record",
+            ),
+        ));
+    }
+
+    let authority = LocalActiveAuthority {
+        application_root: root.clone(),
+        verification_digest: reopened.verification_digest(),
+        enrollment_head: reopened.enrollment_head(),
+        handoff: reopened.handoff(),
+        evidence,
+        session_id,
+        endpoint: runtime.endpoint,
+        activation_acceptance_sequence: runtime
+            .engine
+            .accepted_frontier_root()
+            .map_err(RuntimePromotionError::Engine)?
+            .acceptance_sequence(),
+        _seal: seal::Seal,
+    };
+    // Final proof: the freshly minted authority and the promoted runtime must
+    // authenticate each other exactly, with no pre-minted in-memory evidence.
+    runtime.revalidate(open.graph, &authority)?;
+    Ok((authority, runtime))
+}
+
+fn promoted_storage_binding_endpoint(binding: &EnrollmentBindingV1) -> ProjectionEndpointBinding {
+    ProjectionEndpointBinding {
+        endpoint_id: binding.endpoint_id(),
+        device_id: binding.device_id(),
+        graph_resource_id: binding.graph_resource_id(),
+    }
+}
+
+/// Read the durable promotion state and require it to bind exactly the durable
+/// bootstrap anchor and enrollment the committed records prove.
+fn read_promotion_state_for_anchor(
+    archive_root: &Path,
+    binding: &EnrollmentBindingV1,
+    anchor: &PromotedBootstrapAnchor,
+) -> Result<PromotedRuntimeStateV1, RuntimePromotionError> {
+    let store = ObjectStore::open(archive_root, binding.workspace_id())?;
+    let open = store
+        .seal_history_only(super::hot_engine::ProjectionStorageBinding {
+            endpoint: promoted_storage_binding_endpoint(binding),
+            receipt_store_id: binding.receipt_store_id(),
+        })
+        .map_err(|(_store, error)| error)?;
+    let (_store, history) = open.into_history().map_err(|(_store, error)| error)?;
+    let state = history
+        .read_promoted_runtime_state()?
+        .ok_or(RuntimePromotionError::Store(
+            StoreError::PromotedRuntimeStateAbsent,
+        ))?;
+    drop(history);
+    if state.enrollment_verification_digest != anchor.verification_digest()
+        || state.enrollment_binding_digest
+            != binding
+                .binding_digest()
+                .map_err(VerifiedLocalCompositionError::Enrollment)?
+        || state.archive_resource_id != binding.archive_resource_id()
+        || state.workspace_id != binding.workspace_id()
+        || state.lineage_digest != binding.lineage_digest()
+        || state.catalog_document_id != binding.catalog_document_id()
+        || state.endpoint_id != binding.endpoint_id()
+        || state.device_id != binding.device_id()
+        || state.graph_resource_id != binding.graph_resource_id()
+        || state.receipt_store_id != binding.receipt_store_id()
+    {
+        return Err(RuntimePromotionError::Anchor(
+            "durable promotion state is not this enrollment's promotion",
+        ));
+    }
+    if state.anchor_history_generation != anchor.history_generation()
+        || state.anchor_history_index_root != anchor.history_root()
+        || state.anchor_acceptance_sequence != anchor.acceptance_sequence()
+        || state.anchor_accepted_frontier_state_digest != anchor.accepted_frontier_state_digest()
+        || u64::from(state.bootstrap.part_count()) != anchor.accepted_history_record_count()
+        || ContentDigest::from_bytes(*state.bootstrap_import_id.as_bytes())
+            != anchor.bootstrap_import_id()
+        || state.bootstrap.part_count() != anchor.bootstrap_part_count()
+    {
+        return Err(RuntimePromotionError::Anchor(
+            "durable promotion state does not bind the committed VerifiedLocal bootstrap anchor",
+        ));
+    }
+    Ok(state)
+}
+
+/// Prove the promoted lineage's retained immutable publication and durable
+/// reference-catalog authority are both present and exactly this lineage's.
+///
+/// Everything here is derived from the retained cold record and publication,
+/// never from process-local evidence, so a restarted process derives it exactly
+/// the same way.
+fn require_promoted_bootstrap_runtime_authority(
+    archive: &ObjectStore,
+    state: &PromotedRuntimeStateV1,
+) -> Result<(), RuntimePromotionError> {
+    let storage = promoted_storage_binding(state);
+    let sealed = ObjectStore::open(archive.root_path(), state.workspace_id)?
+        .seal_history_only(storage)
+        .map_err(|(_store, error)| error)?;
+    let (store, history) = sealed.into_history().map_err(|(_store, error)| error)?;
+    if history.current_bootstrap_binding()? != Some(state.bootstrap) {
+        return Err(RuntimePromotionError::Anchor(
+            "durable history bootstrap binding is not the promoted lineage",
+        ));
+    }
+    let binding = super::hot_engine::bootstrap_reference_catalog_binding(&history)?;
+    drop(history);
+    let Some((_policy, root)) = binding else {
+        return Ok(());
+    };
+    // The retained immutable publication must still load and be exactly this
+    // lineage's publication before any runtime authority is derived from it.
+    let publication = store.load_bootstrap_publication(state.bootstrap.publication_id())?;
+    if publication.aggregate().aggregate_digest() != state.bootstrap.aggregate_digest()
+        || publication.aggregate().import_id() != state.bootstrap_import_id
+    {
+        return Err(RuntimePromotionError::Anchor(
+            "retained bootstrap publication is not the promoted lineage's publication",
+        ));
+    }
+    super::hot_engine::require_promoted_bootstrap_reference_catalog(&store, &root)
+        .map_err(RuntimePromotionError::Engine)
+}
+
+/// Open, recover, and authenticate every promoted runtime component, then mint
+/// the token. Nothing partial is ever returned.
+fn mint_promoted_runtime(
+    state: PromotedRuntimeStateV1,
+    session_id: SessionId,
+    verification_digest: ContentDigest,
+    expected_endpoint: ProjectionEndpointBinding,
+    binding: &EnrollmentBindingV1,
+    open: &PromotedRuntimeOpen<'_>,
+) -> Result<PromotedLocalRuntime, RuntimePromotionError> {
+    if state.enrollment_verification_digest != verification_digest {
+        return Err(RuntimePromotionError::Anchor(
+            "promotion state does not bind this LocalActive verification digest",
+        ));
+    }
+    let archive = ObjectStore::open(open.archive_root, state.workspace_id)?;
+    archive
+        .validate_enrolled_archive_resource_id(state.archive_resource_id)
+        .map_err(|error| {
+            RuntimePromotionError::Activation(LocalActivationError::RuntimeBinding(format!(
+                "promoted archive resource claim does not authenticate: {error}"
+            )))
+        })?;
+    if archive.canonical_archive_identity()?.binding_digest() != state.archive_control_binding {
+        return Err(RuntimePromotionError::Anchor(
+            "promoted archive control directory identity changed",
+        ));
+    }
+    // The retained immutable publication and the durable reference-catalog
+    // authority the cold record binds must both be present before the enrolled
+    // open recovers from them.
+    require_promoted_bootstrap_runtime_authority(&archive, &state)?;
+
+    // Recovery replays the archive's committed manifests. This is the existing
+    // enrolled-recovery cost and reads no graph text.
+    let committed_manifests = archive.committed_manifests()?;
+    let anchor = state.anchor_authority();
+    let (engine, _outcomes) = ShardedHotEngine::open_promoted_projection(
+        archive,
+        state.lineage_digest,
+        state.catalog_document_id,
+        open.graph,
+        open.receipts,
+        &state,
+        &committed_manifests,
+    )?;
+    if engine.promoted_lineage() != Some(&state) {
+        return Err(RuntimePromotionError::Anchor(
+            "promoted engine did not adopt the exact durable promotion state",
+        ));
+    }
+    if engine.workspace_id() != binding.workspace_id()
+        || engine.lineage_digest() != binding.lineage_digest()
+        || engine.catalog_document_id() != binding.catalog_document_id()
+        || engine.projection_receipt_store_id() != Some(binding.receipt_store_id())
+    {
+        return Err(RuntimePromotionError::Anchor(
+            "promoted engine does not authenticate the enrolled binding",
+        ));
+    }
+    let endpoint = engine
+        .projection_endpoint_binding()
+        .ok_or(RuntimePromotionError::Anchor(
+            "promoted engine has no projection endpoint enrollment",
+        ))?;
+    if endpoint.endpoint_id() != expected_endpoint.endpoint_id()
+        || endpoint.device_id() != expected_endpoint.device_id()
+        || endpoint.graph_resource_id() != expected_endpoint.graph_resource_id()
+        || endpoint.endpoint_id() != binding.endpoint_id()
+        || endpoint.device_id() != binding.device_id()
+        || endpoint.graph_resource_id() != binding.graph_resource_id()
+    {
+        return Err(RuntimePromotionError::Anchor(
+            "promoted engine projection endpoint is not the enrolled endpoint",
+        ));
+    }
+    // The recovered history must be exactly, or insertion-only descended from,
+    // the exact bootstrap anchor.
+    let transition = engine.authenticate_history_descends_from(anchor)?;
+    if transition.before() != anchor || transition.after() != engine.durable_history_authority()? {
+        return Err(RuntimePromotionError::Anchor(
+            "recovered history is not an authenticated descendant of the bootstrap anchor",
+        ));
+    }
+    let accepted = engine
+        .accepted_frontier_root()
+        .map_err(RuntimePromotionError::Engine)?;
+    if accepted.acceptance_sequence() < state.anchor_acceptance_sequence {
+        return Err(RuntimePromotionError::Anchor(
+            "recovered accepted frontier is behind the bootstrap anchor",
+        ));
+    }
+    // The projection-work index and reference/catalog authority must both be
+    // live before the SQLite projection is opened at the current frontier.
+    engine
+        .projection_work_index()
+        .map_err(RuntimePromotionError::Engine)?;
+    engine
+        .reference_catalog_root()
+        .map_err(RuntimePromotionError::Engine)?;
+
+    let store = engine.archive_store().ok_or(RuntimePromotionError::Anchor(
+        "promoted engine retained no archive capability",
+    ))?;
+    let claim = ProjectionClaim::current(state.workspace_id, state.lineage_digest);
+    // A promoted lineage's leading accepted sequences are its retained
+    // immutable bootstrap parts, which live in the archive's bootstrap
+    // namespace rather than the ordinary object namespace. The publication
+    // identity comes from the authorized promotion state.
+    let publication = store
+        .load_bootstrap_publication(state.bootstrap.publication_id())
+        .map_err(RuntimePromotionError::Store)?;
+    let projection = SqliteFrontier::open_or_rebuild(
+        open.database_path,
+        open.application_runtime_root,
+        claim,
+        RebuildSource::from_promoted_runtime(&engine, store, &publication)?,
+    )?;
+    if projection.database.frontier_root()? != accepted {
+        return Err(RuntimePromotionError::Anchor(
+            "promoted SQLite projection is not at the current accepted frontier",
+        ));
+    }
+    let tail = TailOverlay::from_durable(
+        &projection.database,
+        &RebuildSource::from_promoted_runtime(&engine, store, &publication)?,
+    )
+    .map_err(|error| match error {
+        super::sqlite::TailOverlayError::Projection(error) => RuntimePromotionError::Sqlite(error),
+        other => RuntimePromotionError::Activation(LocalActivationError::RuntimeBinding(
+            other.to_string(),
+        )),
+    })?;
+    Ok(PromotedLocalRuntime {
+        state,
+        anchor,
+        session_id,
+        verification_digest,
+        endpoint,
+        engine,
+        projection,
+        tail,
+        _seal: seal::Seal,
+    })
 }
 
 #[cfg(test)]

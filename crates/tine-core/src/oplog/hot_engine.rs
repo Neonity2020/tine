@@ -21,7 +21,9 @@ use super::bootstrap_import::{
 use super::external_import::{ExternalImportObservationEntry, ExternalImportObservationMaterial};
 use super::identity::BootstrapPartId;
 use super::import::ImportExecutionMaterial;
-use super::object_store::{BlockClaimIndexRoot, BlockClaimIndexStore, BlockClaimIndexValue};
+use super::object_store::{
+    BlockClaimIndexRoot, BlockClaimIndexStore, BlockClaimIndexValue, BootstrapAuthoringCapability,
+};
 use super::page_name_index::{
     extract_authenticated_catalog_page_names, extract_authoritative_catalog_page_names,
     extract_validated_catalog_page_names, prepare_ephemeral_page_name_transition,
@@ -1488,6 +1490,16 @@ struct DetachedBootstrapContinuity {
     part_count: u32,
 }
 
+/// The retained immutable bootstrap publication of a promoted lineage, plus the
+/// exact aggregate ordinal of every bootstrap `BatchId`.
+///
+/// Only the validated handle and a bounded ordinal map are held; part payloads
+/// are loaded on demand from the immutable archive and never cached here.
+struct RetainedBootstrapParts {
+    publication: Arc<super::object_store::ValidatedBootstrapPublicationV1>,
+    ordinals: BTreeMap<BatchId, usize>,
+}
+
 struct DetachedBootstrapScratchRoot {
     parent: Dir,
     root: Dir,
@@ -1560,6 +1572,14 @@ impl DetachedBootstrapCandidate {
 /// Inactive, single-use multipart bootstrap author. Every candidate mutation
 /// is isolated in a scratch-backed empty engine. Taking the engine before each
 /// part makes every error permanently poison the session.
+///
+/// Scratch isolation covers the candidate's own disposable state — hot shards,
+/// dependency queue, accepted-frontier working roots — and is destroyed with
+/// the session. The reference catalog is deliberately *not* isolated: its root
+/// is bound into every accepted cold history record, so it must be built in the
+/// same durable authenticated Patricia store the promoted runtime later opens.
+/// The caller therefore supplies an explicit
+/// [`BootstrapAuthoringCapability`] over the target archive.
 #[allow(dead_code)]
 pub(crate) struct DetachedBootstrapAuthoringSession {
     candidate: Option<Box<ShardedHotEngine>>,
@@ -1605,21 +1625,50 @@ impl DetachedBootstrapReplayIdentity {
 
 #[allow(dead_code)]
 impl DetachedBootstrapAuthoringSession {
+    /// `indexes` must be the durable authenticated index capability of the exact
+    /// archive this bootstrap will be installed into and later promoted from.
     pub(crate) fn new(
         workspace_id: WorkspaceId,
         lineage_digest: LineageDigest,
         catalog_document_id: DocumentId,
         reference_catalog_policy: ReferenceCatalogPolicyV1,
+        indexes: &BootstrapAuthoringCapability,
     ) -> Result<Self, EngineError> {
+        if indexes.workspace_id() != workspace_id {
+            return Err(EngineError::Archive(
+                "detached bootstrap authoring capability belongs to another workspace".into(),
+            ));
+        }
         let scratch_root = DetachedBootstrapScratchRoot::create()?;
-        let scratch = ScratchStore::open(&scratch_root.root, workspace_id)
-            .map_err(|error| EngineError::Archive(error.to_string()))?;
+        let scratch = Arc::new(
+            ScratchStore::open(&scratch_root.root, workspace_id)
+                .map_err(|error| EngineError::Archive(error.to_string()))?,
+        );
         let mut candidate = Box::new(ShardedHotEngine::new(
             workspace_id,
             lineage_digest,
             catalog_document_id,
         ));
-        candidate.scratch = Some(Arc::new(scratch));
+        // Run-local derived state stays in the session's own disposable scratch
+        // run — including the block-claim point index, which is scratch-backed
+        // exactly like an enrolled engine's. The bounded in-memory fallback is
+        // a no-store test map whose fixed capacity would cap an importable
+        // graph at a few thousand blocks.
+        candidate.block_claim_index = Some(Arc::new(
+            BlockClaimIndexStore::for_scratch(&scratch)
+                .map_err(|error| EngineError::Archive(error.to_string()))?,
+        ));
+        candidate.scratch = Some(scratch);
+        // Every authenticated root an accepted bootstrap cold record binds is
+        // built here, in the target archive's durable stores. The promoted
+        // runtime opens the identical stores, so there is one construction.
+        candidate.portable_path_index = Some(indexes.portable_path_index());
+        candidate.logseq_claim_index = Some(indexes.logseq_claim_index());
+        candidate.page_name_index = Some(indexes.page_name_index());
+        candidate
+            .reference_catalog
+            .attach_store(indexes.reference_catalog())
+            .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))?;
         candidate.configure_reference_catalog_policy(reference_catalog_policy)?;
         Ok(Self {
             candidate: Some(candidate),
@@ -1835,11 +1884,18 @@ where
             "direct bootstrap replay preparation identity mismatch".into(),
         ));
     }
+    // Replay reproduces the accepted roots the installed cold records bind, so
+    // it must use the same durable construction authoring used: this exact
+    // archive's authenticated Patricia stores.
+    let indexes = store
+        .bootstrap_authoring_capability()
+        .map_err(|error| EngineError::Archive(error.to_string()))?;
     let mut session = DetachedBootstrapAuthoringSession::new(
         preparation.workspace_id,
         preparation.lineage_digest,
         preparation.catalog_document_id,
         preparation.reference_catalog_policy.clone(),
+        &indexes,
     )?;
     for (ordinal, descriptor) in aggregate.parts().iter().copied().enumerate() {
         let loaded = store
@@ -1903,6 +1959,57 @@ pub(crate) fn replay_direct_loaded_bootstrap_validating_history(
         },
     )?;
     Ok((candidate, terminal_history_binding))
+}
+
+/// The reference-catalog policy and root the latest immutable cold record binds.
+///
+/// Returns `None` for an empty history, which binds no record at all.
+pub(crate) fn bootstrap_reference_catalog_binding(
+    history: &super::object_store::DurableEngineHistoryStore,
+) -> Result<Option<(ReferenceCatalogPolicyV1, ReferenceCatalogRootV2)>, EngineError> {
+    let (_, index_root, latest_batch_id, _) = history
+        .current_with_binding()
+        .map_err(|error| EngineError::Archive(error.to_string()))?;
+    let Some(latest_batch_id) = latest_batch_id else {
+        return Ok(None);
+    };
+    let bytes = history
+        .lookup(index_root, latest_batch_id)
+        .map_err(|error| EngineError::Archive(error.to_string()))?
+        .ok_or_else(|| EngineError::Archive("latest durable history record is absent".into()))?;
+    history.note_history_decode();
+    let record = decode_history_record(latest_batch_id, &bytes)?;
+    Ok(Some((
+        record.reference_catalog_policy,
+        record.reference_catalog_root,
+    )))
+}
+
+/// Prove the durable reference catalog a promoted lineage needs is present.
+///
+/// Bootstrap authoring, bootstrap replay, and the promoted enrolled runtime all
+/// build the reference catalog in the same durable authenticated Patricia store
+/// of the same archive, so the catalog root every accepted cold record binds is
+/// openable there by construction. This check is that invariant made explicit
+/// at the promotion boundary: it fully validates the bound root against the
+/// live durable store before any runtime authority is derived from it, and
+/// fails closed on a missing, truncated, or divergent catalog rather than
+/// reinterpreting or rebuilding the root under a different construction.
+pub(crate) fn require_promoted_bootstrap_reference_catalog(
+    store: &ObjectStore,
+    expected_root: &ReferenceCatalogRootV2,
+) -> Result<(), EngineError> {
+    let catalog = store
+        .open_reference_catalog()
+        .map_err(|error| EngineError::Archive(error.to_string()))?;
+    catalog
+        .validate_catalog_root(expected_root)
+        .map_err(|error| {
+            EngineError::ReferenceCatalog(format!(
+                "promoted archive has no durable reference catalog for the catalog root its \
+                 immutable cold record binds: {error}"
+            ))
+        })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2365,6 +2472,40 @@ impl AcceptedFrontierRoot {
 
     pub(crate) const fn has_persistent_point_index(&self) -> bool {
         self.scratch_root.is_some()
+    }
+
+    /// Whether two frontier roots are the same accepted authority.
+    ///
+    /// `scratch_root` locates the run-local scratch LSM page that holds this
+    /// frontier's point index. It is reconstructible derived state whose file
+    /// offset legitimately differs between two runs over the identical accepted
+    /// history — exactly as durable history-record validation already treats
+    /// accepted evidence and the catalog checkpoint. Every authenticated field,
+    /// including `state_digest` and the reference-catalog root, is compared.
+    pub(crate) fn same_accepted_authority(&self, other: &Self) -> bool {
+        let Self {
+            schema_version,
+            acceptance_sequence,
+            document_count,
+            retained_bytes_total,
+            document_map_root_key,
+            document_map_root_digest,
+            batch_map_root_key,
+            batch_map_root_digest,
+            reference_catalog_root,
+            state_digest,
+            scratch_root: _,
+        } = self;
+        *schema_version == other.schema_version
+            && *acceptance_sequence == other.acceptance_sequence
+            && *document_count == other.document_count
+            && *retained_bytes_total == other.retained_bytes_total
+            && *document_map_root_key == other.document_map_root_key
+            && *document_map_root_digest == other.document_map_root_digest
+            && *batch_map_root_key == other.batch_map_root_key
+            && *batch_map_root_digest == other.batch_map_root_digest
+            && *reference_catalog_root == other.reference_catalog_root
+            && *state_digest == other.state_digest
     }
 
     pub(crate) fn validates_transition(
@@ -3127,6 +3268,13 @@ pub struct ShardedHotEngine {
     // after validation. Prior object envelopes live in neither this map nor
     // `archive`; sharded candidate documents are carried by run-local scratch.
     detached_accepted_manifests: BTreeMap<BatchId, OperationBatch>,
+    // A promoted lineage's oldest accepted batches were published in the
+    // archive's immutable bootstrap namespace, not the ordinary object
+    // namespace. This retains only the validated publication handle and the
+    // exact part ordinal of each bootstrap BatchId, so cold manifest and
+    // document reloads for those batches read the right immutable bytes
+    // without holding any part payload resident.
+    bootstrap_parts: Option<RetainedBootstrapParts>,
     /// Authenticated offered batches retained only across bounded slices.
     /// Same-process reconstruction deliberately clears this cache and
     /// reauthenticates once before resuming from the durable queue cursor.
@@ -3255,6 +3403,7 @@ impl ShardedHotEngine {
             catalog_document_id,
             archive: BTreeMap::new(),
             detached_accepted_manifests: BTreeMap::new(),
+            bootstrap_parts: None,
             bounded_staging_cache: BTreeMap::new(),
             archive_store: None,
             projection_endpoint: None,
@@ -3375,6 +3524,47 @@ impl ShardedHotEngine {
         &self.runtime_authority
     }
 
+    /// The live authenticated durable-history authority, or an error when this
+    /// engine has no sealed durable history at all.
+    pub(crate) fn durable_history_authority(
+        &self,
+    ) -> Result<super::object_store::EngineHistoryAuthority, EngineError> {
+        self.history_store
+            .as_ref()
+            .ok_or_else(|| EngineError::Archive("engine has no durable engine history".into()))?
+            .current_authority()
+            .map_err(|error| EngineError::Archive(error.to_string()))
+    }
+
+    /// Prove that this engine's current durable history is exactly, or
+    /// insertion-only descended from, `anchor`.
+    ///
+    /// The store walks the shared immutable radix structure and terminates on
+    /// equal subtrees, so an unchanged or point-extended history costs the
+    /// changed radix paths, never the lifetime record count.
+    pub(crate) fn authenticate_history_descends_from(
+        &self,
+        anchor: super::object_store::EngineHistoryAuthority,
+    ) -> Result<super::object_store::AuthenticatedEngineHistoryTransition, EngineError> {
+        self.history_store
+            .as_ref()
+            .ok_or_else(|| EngineError::Archive("engine has no durable engine history".into()))?
+            .authenticate_current_history_extension(anchor)
+            .map_err(|error| EngineError::Archive(error.to_string()))
+    }
+
+    /// The durable promoted lineage this engine's history open authorized.
+    pub(crate) fn promoted_lineage(&self) -> Option<&super::object_store::PromotedRuntimeStateV1> {
+        self.history_store
+            .as_ref()
+            .and_then(|history| history.promoted_lineage())
+    }
+
+    /// The retained archive capability this engine opened, when it has one.
+    pub(crate) fn archive_store(&self) -> Option<&ObjectStore> {
+        self.archive_store.as_deref()
+    }
+
     /// Open the enrolled projection capabilities without replaying non-empty
     /// operational history.
     ///
@@ -3388,6 +3578,76 @@ impl ShardedHotEngine {
         catalog_document_id: DocumentId,
         graph: &Graph,
         receipts: &ProjectionReceiptStore,
+    ) -> Self {
+        Self::with_enrolled_projection_promoted(
+            store,
+            lineage_digest,
+            catalog_document_id,
+            graph,
+            receipts,
+            None,
+        )
+    }
+
+    /// Open the enrolled projection capabilities for a promoted
+    /// bootstrap-anchored runtime.
+    ///
+    /// Identical to [`Self::with_enrolled_projection`] except that the durable
+    /// history control is sealed through the promoted path, which is the only
+    /// construction that unfences a bootstrap-bound history for writes.
+    pub(crate) fn with_promoted_projection(
+        store: ObjectStore,
+        lineage_digest: LineageDigest,
+        catalog_document_id: DocumentId,
+        graph: &Graph,
+        receipts: &ProjectionReceiptStore,
+        promotion: &super::object_store::PromotedRuntimeStateV1,
+    ) -> Self {
+        Self::with_enrolled_projection_promoted(
+            store,
+            lineage_digest,
+            catalog_document_id,
+            graph,
+            receipts,
+            Some(promotion),
+        )
+    }
+
+    /// Open the enrolled projection capabilities and complete startup recovery
+    /// for a promoted bootstrap-anchored runtime.
+    pub(crate) fn open_promoted_projection(
+        store: ObjectStore,
+        lineage_digest: LineageDigest,
+        catalog_document_id: DocumentId,
+        graph: &Graph,
+        receipts: &ProjectionReceiptStore,
+        promotion: &super::object_store::PromotedRuntimeStateV1,
+        committed_manifests: &[OperationBatch],
+    ) -> Result<(Self, Vec<StageOutcome>), EngineError> {
+        let mut engine = Self::with_promoted_projection(
+            store,
+            lineage_digest,
+            catalog_document_id,
+            graph,
+            receipts,
+            promotion,
+        );
+        if engine.history_failure.is_none() {
+            if let Err(error) = engine.attach_promoted_bootstrap_parts() {
+                engine.history_failure = Some(error);
+            }
+        }
+        let outcomes = engine.complete_enrolled_projection_recovery(committed_manifests)?;
+        Ok((engine, outcomes))
+    }
+
+    fn with_enrolled_projection_promoted(
+        store: ObjectStore,
+        lineage_digest: LineageDigest,
+        catalog_document_id: DocumentId,
+        graph: &Graph,
+        receipts: &ProjectionReceiptStore,
+        promotion: Option<&super::object_store::PromotedRuntimeStateV1>,
     ) -> Self {
         let workspace_id = store.workspace_id();
         let endpoint = receipts.endpoint_binding();
@@ -3424,7 +3684,11 @@ impl ShardedHotEngine {
             endpoint: endpoint.expect("validated enrolled endpoint"),
             receipt_store_id,
         };
-        match store.seal_enrolled_projection(binding) {
+        let sealed = match promotion {
+            Some(promotion) => store.seal_promoted_projection(binding, promotion),
+            None => store.seal_enrolled_projection(binding),
+        };
+        match sealed {
             Ok(open) => {
                 Self::with_archive_store_for_endpoint(open, lineage_digest, catalog_document_id)
             }
@@ -3729,6 +3993,17 @@ impl ShardedHotEngine {
 
         self.prepare_operational_recovery_replay()?;
         let mut outcomes = Vec::with_capacity(committed_manifests.len());
+        // A promoted lineage's oldest durable records are its bootstrap parts,
+        // which live in the immutable bootstrap namespace. They are replayed
+        // first, in exact aggregate order, so the ordinary archived tail
+        // extends the same accepted state the bootstrap published.
+        for prepared in self.retained_bootstrap_recovery_parts()? {
+            let outcome = self.stage_bootstrap_part_for_recovery(prepared)?;
+            if let Some(error) = &self.history_failure {
+                return Err(error.clone());
+            }
+            outcomes.push(outcome);
+        }
         for manifest in committed_manifests {
             let outcome = self.stage_archive_batch_for_recovery(manifest.batch_id())?;
             if let Some(error) = &self.history_failure {
@@ -3738,6 +4013,108 @@ impl ShardedHotEngine {
         }
         self.finish_operational_recovery_replay()?;
         Ok(outcomes)
+    }
+
+    /// Retain this promoted lineage's immutable bootstrap publication and the
+    /// exact aggregate ordinal of every bootstrap `BatchId`.
+    ///
+    /// The publication identity comes from the authorized durable promotion
+    /// state, never from a caller-supplied value, and the loaded aggregate must
+    /// reproduce exactly that identity. An unpromoted engine retains nothing.
+    fn attach_promoted_bootstrap_parts(&mut self) -> Result<(), EngineError> {
+        let Some(promotion) = self.promoted_lineage().cloned() else {
+            return Ok(());
+        };
+        let store = self
+            .archive_store
+            .as_ref()
+            .ok_or_else(|| EngineError::Archive("engine has no immutable archive store".into()))?;
+        let publication = store
+            .load_bootstrap_publication(promotion.bootstrap().publication_id())
+            .map_err(|error| EngineError::Archive(error.to_string()))?;
+        let aggregate = publication.aggregate();
+        if super::object_store::BootstrapAggregateHistoryBindingV1::for_aggregate(aggregate)
+            .map_err(|error| EngineError::Archive(error.to_string()))?
+            != promotion.bootstrap()
+            || aggregate.workspace_id() != self.workspace_id
+            || aggregate.lineage_digest() != self.lineage_digest
+        {
+            return Err(EngineError::Archive(
+                "retained bootstrap publication is not the promoted lineage".into(),
+            ));
+        }
+        let mut ordinals = BTreeMap::new();
+        for (ordinal, descriptor) in aggregate.parts().iter().enumerate() {
+            if ordinals.insert(descriptor.batch_id(), ordinal).is_some() {
+                return Err(EngineError::Archive(
+                    "retained bootstrap publication repeats a batch identity".into(),
+                ));
+            }
+        }
+        self.bootstrap_parts = Some(RetainedBootstrapParts {
+            publication: Arc::new(publication),
+            ordinals,
+        });
+        Ok(())
+    }
+
+    /// Load one retained immutable bootstrap part by its accepted `BatchId`.
+    ///
+    /// Returns `None` for every batch that is not one of this promoted
+    /// lineage's bootstrap parts, so ordinary archived batches keep using the
+    /// ordinary object namespace.
+    fn load_retained_bootstrap_part(
+        &self,
+        batch_id: BatchId,
+    ) -> Result<Option<super::object_store::LoadedBootstrapPartV1>, EngineError> {
+        let Some(retained) = &self.bootstrap_parts else {
+            return Ok(None);
+        };
+        let Some(ordinal) = retained.ordinals.get(&batch_id).copied() else {
+            return Ok(None);
+        };
+        let store = self
+            .archive_store
+            .as_ref()
+            .ok_or(EngineError::MissingDependency(batch_id))?;
+        let loaded = store
+            .load_bootstrap_part(&retained.publication, ordinal)
+            .map_err(|error| EngineError::Archive(error.to_string()))?;
+        if loaded.manifest().batch_id() != batch_id {
+            return Err(EngineError::Archive(
+                "retained bootstrap part does not carry its aggregate batch identity".into(),
+            ));
+        }
+        if loaded.manifest().lineage_digest() != self.lineage_digest {
+            return Err(EngineError::LineageMismatch {
+                expected: self.lineage_digest,
+                found: loaded.manifest().lineage_digest(),
+            });
+        }
+        Ok(Some(loaded))
+    }
+
+    /// This promoted lineage's bootstrap parts, in exact aggregate order.
+    fn retained_bootstrap_recovery_parts(&self) -> Result<Vec<PreparedBatch>, EngineError> {
+        let Some(retained) = &self.bootstrap_parts else {
+            return Ok(Vec::new());
+        };
+        let store = self
+            .archive_store
+            .as_ref()
+            .ok_or_else(|| EngineError::Archive("engine has no immutable archive store".into()))?;
+        let count = retained.publication.aggregate().parts().len();
+        let mut parts = Vec::with_capacity(count);
+        for ordinal in 0..count {
+            let loaded = store
+                .load_bootstrap_part(&retained.publication, ordinal)
+                .map_err(|error| EngineError::Archive(error.to_string()))?;
+            parts.push(PreparedBatch::new(
+                loaded.manifest().clone(),
+                loaded.objects().to_vec(),
+            )?);
+        }
+        Ok(parts)
     }
 
     /// Rebuild every run-local derived structure from the retained
@@ -3778,6 +4155,7 @@ impl ShardedHotEngine {
         // across reconstruction unchanged.
         std::mem::swap(&mut rebuilt.reference_catalog, &mut self.reference_catalog);
         rebuilt.archive_store = self.archive_store.take();
+        rebuilt.bootstrap_parts = self.bootstrap_parts.take();
         rebuilt.projection_endpoint = self.projection_endpoint;
         rebuilt.projection_receipt_store_id = self.projection_receipt_store_id;
         rebuilt.projection_work_index = self.projection_work_index.take();
@@ -3831,6 +4209,7 @@ impl ShardedHotEngine {
         replay.runtime_authority = self.runtime_authority.clone();
         replay.configure_reference_catalog_policy(reference_policy)?;
         replay.archive_store = self.archive_store.take();
+        replay.bootstrap_parts = self.bootstrap_parts.take();
         replay.projection_endpoint = self.projection_endpoint;
         replay.projection_receipt_store_id = self.projection_receipt_store_id;
         replay.projection_work_index = self.projection_work_index.take();
@@ -5748,6 +6127,55 @@ impl ShardedHotEngine {
             ));
         };
         self.stage_archive_batch_internal(batch_id, Some(history_record), None)
+    }
+
+    /// Stage one retained immutable bootstrap part during a promoted runtime's
+    /// authenticated recovery replay.
+    ///
+    /// Bootstrap parts are published in the archive's immutable bootstrap
+    /// namespace rather than the ordinary object/manifest namespace, so
+    /// ordinary archive staging cannot see them. The authority is identical:
+    /// the batch must have an authenticated cold history record at the live
+    /// sealed durable root, and the replayed material is validated against that
+    /// record exactly like any other recovered batch. Nothing here consults the
+    /// caller's copy of the aggregate for authority.
+    pub(crate) fn stage_bootstrap_part_for_recovery(
+        &mut self,
+        prepared: PreparedBatch,
+    ) -> Result<StageOutcome, EngineError> {
+        self.begin_point_operation();
+        if !self.authenticated_history_replay {
+            return Err(EngineError::Archive(
+                "recovery bootstrap staging requires an active authenticated history replay".into(),
+            ));
+        }
+        self.ensure_history_store()?;
+        let batch_id = prepared.manifest().batch_id();
+        if prepared.manifest().origin() != BatchOrigin::BootstrapImport {
+            return Err(EngineError::Archive(
+                "recovery bootstrap staging requires a bootstrap-origin manifest".into(),
+            ));
+        }
+        let Some(history_record) = self.authenticated_recovery_history_record(batch_id)? else {
+            return Ok(self.outcome(
+                batch_id,
+                BatchDisposition::Rejected {
+                    error: EngineError::Archive(format!(
+                        "authenticated recovery cannot stage bootstrap part {batch_id} absent from durable history"
+                    )),
+                },
+                Vec::new(),
+            ));
+        };
+        let outcome = self.stage_ready_internal(
+            ValidatedBatch::new(prepared),
+            true,
+            Some(history_record),
+            None,
+        );
+        self.resolve_pending_author(batch_id, &outcome.disposition);
+        self.prune_persisted_archive_cache();
+        Ok(outcome)
     }
 
     fn stage_archive_batch_internal(
@@ -13679,6 +14107,9 @@ impl ShardedHotEngine {
         if let Some(manifest) = self.detached_accepted_manifests.get(&batch_id) {
             return Ok(manifest.clone());
         }
+        if let Some(loaded) = self.load_retained_bootstrap_part(batch_id)? {
+            return Ok(loaded.manifest().clone());
+        }
         let store = self
             .archive_store
             .as_ref()
@@ -13742,6 +14173,19 @@ impl ShardedHotEngine {
     ) -> Result<OperationObject, EngineError> {
         if let Some(batch) = self.archive.get(&batch_id) {
             return batch
+                .objects()
+                .iter()
+                .find(|object| {
+                    object.kind() == ObjectKind::CrdtUpdate && object.document_id() == document_id
+                })
+                .cloned()
+                .ok_or(EngineError::MissingDocumentUpdate {
+                    document_id,
+                    dependency: batch_id,
+                });
+        }
+        if let Some(loaded) = self.load_retained_bootstrap_part(batch_id)? {
+            return loaded
                 .objects()
                 .iter()
                 .find(|object| {
@@ -18976,6 +19420,43 @@ mod validation_tests {
         )
     }
 
+    /// A disposable durable archive supplying an explicit reference-catalog
+    /// capability to isolated detached-bootstrap unit tests.
+    ///
+    /// Production authoring is always handed the capability of the archive the
+    /// bootstrap will be installed into and promoted from. These unit tests
+    /// exercise the session in isolation, so they use an explicit temporary
+    /// *durable* store; nothing anywhere selects the ephemeral in-memory root
+    /// construction for a bootstrap.
+    struct TemporaryBootstrapCatalog {
+        root: std::path::PathBuf,
+        capability: BootstrapAuthoringCapability,
+    }
+
+    impl TemporaryBootstrapCatalog {
+        fn create(workspace: WorkspaceId, label: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "tine-detached-bootstrap-catalog-{label}-{}",
+                Uuid::new_v4()
+            ));
+            let capability = ObjectStore::open(&root, workspace)
+                .unwrap()
+                .bootstrap_authoring_capability()
+                .unwrap();
+            Self { root, capability }
+        }
+
+        fn capability(&self) -> &BootstrapAuthoringCapability {
+            &self.capability
+        }
+    }
+
+    impl Drop for TemporaryBootstrapCatalog {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
     fn detached_descriptor(
         prepared: &PreparedBatch,
         evidence: BootstrapImportPartEvidenceV1,
@@ -19022,10 +19503,17 @@ mod validation_tests {
             .configure_reference_catalog_policy(policy.clone())
             .unwrap();
 
-        let completed = DetachedBootstrapAuthoringSession::new(workspace, lineage, catalog, policy)
-            .unwrap()
-            .finish()
-            .unwrap();
+        let durable = TemporaryBootstrapCatalog::create(workspace, "zero-part");
+        let completed = DetachedBootstrapAuthoringSession::new(
+            workspace,
+            lineage,
+            catalog,
+            policy,
+            durable.capability(),
+        )
+        .unwrap()
+        .finish()
+        .unwrap();
         assert_eq!(completed.part_count(), 0);
         assert_eq!(completed.last_part(), None);
         assert_eq!(
@@ -19094,11 +19582,13 @@ mod validation_tests {
         )
         .unwrap();
         let prepared = PreparedBatch::new(manifest, vec![object]).unwrap();
+        let durable = TemporaryBootstrapCatalog::create(workspace, "history-schema-12");
         let mut session = DetachedBootstrapAuthoringSession::new(
             workspace,
             lineage,
             catalog,
             ReferenceCatalogPolicyV1::default(),
+            durable.capability(),
         )
         .unwrap();
         let candidate = session.candidate.as_mut().unwrap();
@@ -19220,10 +19710,16 @@ mod validation_tests {
             .prepare_bootstrap_transaction(author, &transaction)
             .unwrap();
 
+        let durable = TemporaryBootstrapCatalog::create(workspace, "one-part");
         let author_once = || {
-            let mut session =
-                DetachedBootstrapAuthoringSession::new(workspace, lineage, catalog, policy.clone())
-                    .unwrap();
+            let mut session = DetachedBootstrapAuthoringSession::new(
+                workspace,
+                lineage,
+                catalog,
+                policy.clone(),
+                durable.capability(),
+            )
+            .unwrap();
             let part = session.author_part(author, &transaction, evidence).unwrap();
             let completed = session.finish().unwrap();
             (encoded_prepared(part.prepared()), completed)
@@ -19294,11 +19790,13 @@ mod validation_tests {
             second_transaction.operations.len() as u32,
         );
 
+        let durable = TemporaryBootstrapCatalog::create(workspace, "multi-part");
         let mut session = DetachedBootstrapAuthoringSession::new(
             workspace,
             lineage,
             catalog,
             ReferenceCatalogPolicyV1::default(),
+            durable.capability(),
         )
         .unwrap();
         let first = session
@@ -19325,11 +19823,14 @@ mod validation_tests {
         );
         let completed = session.finish().unwrap();
         assert_eq!(completed.part_count(), 2);
+        // Deliberately the same durable archive: repeating the authoring must
+        // be byte-identical against the catalog nodes the first pass published.
         let mut repeated = DetachedBootstrapAuthoringSession::new(
             workspace,
             lineage,
             catalog,
             ReferenceCatalogPolicyV1::default(),
+            durable.capability(),
         )
         .unwrap();
         let repeated_first = repeated
@@ -19385,6 +19886,9 @@ mod validation_tests {
             std::fs::create_dir_all(&root).unwrap();
             let archive = root.join("archive");
             let store = ObjectStore::open(&archive, workspace).unwrap();
+            // Authoring binds catalog roots that the replay below must reopen
+            // from this exact archive's durable authenticated store.
+            let catalog_capability = store.bootstrap_authoring_capability().unwrap();
             let profile = BootstrapPartitionProfileV1::v1().digest();
             let initial = ArchiveLocalFrontierBindingV1::initial(import_id, profile);
 
@@ -19456,6 +19960,7 @@ mod validation_tests {
                     lineage,
                     catalog,
                     policy.clone(),
+                    &catalog_capability,
                 )
                 .unwrap();
                 let (first_evidence, first) =
@@ -19541,6 +20046,7 @@ mod validation_tests {
                         lineage,
                         catalog,
                         policy.clone(),
+                        &catalog_capability,
                     )
                     .unwrap()
                     .finish()
@@ -19616,11 +20122,13 @@ mod validation_tests {
             transaction.operations.len() as u32,
         );
 
+        let durable = TemporaryBootstrapCatalog::create(workspace, "rejects-bad-parts");
         let mut wrong_batch = DetachedBootstrapAuthoringSession::new(
             workspace,
             lineage,
             catalog,
             ReferenceCatalogPolicyV1::default(),
+            durable.capability(),
         )
         .unwrap();
         let mut author = detached_author(evidence, 91_045);
@@ -19645,6 +20153,7 @@ mod validation_tests {
             lineage,
             catalog,
             ReferenceCatalogPolicyV1::default(),
+            durable.capability(),
         )
         .unwrap();
         assert!(wrong_ordinal
@@ -19679,6 +20188,7 @@ mod validation_tests {
             lineage,
             catalog,
             ReferenceCatalogPolicyV1::default(),
+            durable.capability(),
         )
         .unwrap();
         assert!(oversized_session
@@ -19694,6 +20204,7 @@ mod validation_tests {
             lineage,
             catalog,
             ReferenceCatalogPolicyV1::default(),
+            durable.capability(),
         )
         .unwrap();
         assert!(invalid_session
@@ -19736,12 +20247,14 @@ mod validation_tests {
             1,
         );
 
+        let durable = TemporaryBootstrapCatalog::create(workspace, "wrong-predecessor");
         let new_session = || {
             DetachedBootstrapAuthoringSession::new(
                 workspace,
                 lineage,
                 catalog,
                 ReferenceCatalogPolicyV1::default(),
+                durable.capability(),
             )
             .unwrap()
         };
@@ -19772,11 +20285,13 @@ mod validation_tests {
         let lineage = LineageDigest::of(b"detached-bootstrap-retention");
         let catalog = DocumentId::from_uuid(Uuid::from_u128(91_061));
         let import_id = ImportId::from_digest([0x47; 32]);
+        let durable = TemporaryBootstrapCatalog::create(workspace, "retention");
         let mut session = DetachedBootstrapAuthoringSession::new(
             workspace,
             lineage,
             catalog,
             ReferenceCatalogPolicyV1::default(),
+            durable.capability(),
         )
         .unwrap();
         let mut predecessor = None;

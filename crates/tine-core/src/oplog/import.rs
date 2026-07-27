@@ -37,9 +37,9 @@ use super::hot_engine::{
 };
 use super::identity::BootstrapPartId;
 use super::object_store::{
-    BootstrapAggregateHistoryBindingV1, BootstrapPublicationInspectionV1, ControlDirectoryIdentity,
-    EngineHistoryBinding, ObjectStore, PreparedBootstrapHistoryRecordV1, StoreError,
-    ValidatedBootstrapPublicationV1,
+    BootstrapAggregateHistoryBindingV1, BootstrapAuthoringCapability,
+    BootstrapPublicationInspectionV1, ControlDirectoryIdentity, EngineHistoryBinding, ObjectStore,
+    PreparedBootstrapHistoryRecordV1, StoreError, ValidatedBootstrapPublicationV1,
 };
 use super::receipt::ImportIdDerivation;
 use super::{
@@ -246,6 +246,10 @@ pub(crate) struct InactiveBootstrapPreparedPublication {
     commit: BootstrapAggregateCommitV1,
     catalog_document_id: DocumentId,
     reference_catalog_policy: ReferenceCatalogPolicyV1,
+    /// The archive whose durable authenticated reference catalog this
+    /// preparation's accepted roots were built in. Installation must target
+    /// exactly that archive.
+    reference_catalog_archive_identity: ControlDirectoryIdentity,
     candidate: Box<DetachedBootstrapCandidate>,
     engine_materials: Vec<DetachedBootstrapAcceptedEngineMaterial>,
     instrumentation: BootstrapStreamingImportInstrumentation,
@@ -681,6 +685,15 @@ fn validate_inactive_bootstrap_preparation(
             "workspace, graph, capture, candidate, or aggregate identity mismatch",
         ));
     }
+    // Every accepted cold record about to be installed binds a reference
+    // catalog root that was built in one exact archive's durable authenticated
+    // store. Installing that history into any other archive would bind a root
+    // that archive cannot open.
+    if store.canonical_archive_identity()? != prepared.reference_catalog_archive_identity {
+        return Err(invalid_bootstrap_orchestration(
+            "bootstrap preparation was authored against a different archive's reference catalog",
+        ));
+    }
 
     let bootstrap_binding = BootstrapAggregateHistoryBindingV1::for_aggregate(aggregate)?;
     let accepted_frontier = prepared.candidate.accepted_frontier_root()?;
@@ -693,6 +706,7 @@ fn validate_inactive_bootstrap_preparation(
             ));
         }
     }
+    let reference_catalog = store.open_reference_catalog()?;
 
     for (ordinal, (descriptor, material)) in aggregate
         .parts()
@@ -723,6 +737,18 @@ fn validate_inactive_bootstrap_preparation(
                 "prepared part, manifest, descriptor, or engine material mismatch",
             ));
         }
+        // This exact record is about to be installed as durable history that
+        // names `reference_catalog_root`. Authoring built that root in this
+        // archive's durable catalog; prove the archive holds it before any
+        // history record can name it.
+        reference_catalog
+            .require_catalog_root_nodes(material.reference_catalog_root())
+            .map_err(|error| {
+                invalid_bootstrap_orchestration(format!(
+                    "archive is missing the durable reference catalog this bootstrap part binds: \
+                     {error}"
+                ))
+            })?;
         spans.validate_part(descriptor.evidence())?;
         let span_bytes = spans.encode()?;
         let payload_descriptors = manifest
@@ -2523,6 +2549,7 @@ fn author_bootstrap_parts(
     lineage_digest: LineageDigest,
     catalog_document_id: DocumentId,
     reference_catalog_policy: ReferenceCatalogPolicyV1,
+    reference_catalog: &BootstrapAuthoringCapability,
     import_id: ImportId,
     operation_spool: &BootstrapOperationSpool,
     part_count: u32,
@@ -2530,17 +2557,23 @@ fn author_bootstrap_parts(
     instrumentation: &mut BootstrapStreamingImportInstrumentation,
 ) -> Result<AuthoredBootstrapParts, BootstrapStreamingImportError> {
     let profile_digest = BootstrapPartitionProfileV1::v1().digest();
+    // Both sessions build against the same durable catalog store. Catalog
+    // postings and Patricia nodes are immutable and content-addressed, so the
+    // preview's authenticated writes are byte-identical to the canonical ones
+    // and the two frontiers stay directly comparable.
     let mut preview = boxed_detached_bootstrap_session(
         workspace_id,
         lineage_digest,
         catalog_document_id,
         reference_catalog_policy.clone(),
+        reference_catalog,
     )?;
     let mut canonical = boxed_detached_bootstrap_session(
         workspace_id,
         lineage_digest,
         catalog_document_id,
         reference_catalog_policy,
+        reference_catalog,
     )?;
     let author_device_id = DeviceId::for_external_import_author(workspace_id);
     let author_session_id = SessionId::for_external_import_author(workspace_id, import_id);
@@ -2726,12 +2759,14 @@ fn boxed_detached_bootstrap_session(
     lineage_digest: LineageDigest,
     catalog_document_id: DocumentId,
     reference_catalog_policy: ReferenceCatalogPolicyV1,
+    reference_catalog: &BootstrapAuthoringCapability,
 ) -> Result<Box<DetachedBootstrapAuthoringSession>, BootstrapStreamingImportError> {
     DetachedBootstrapAuthoringSession::new(
         workspace_id,
         lineage_digest,
         catalog_document_id,
         reference_catalog_policy,
+        reference_catalog,
     )
     .map(Box::new)
     .map_err(|error| BootstrapStreamingImportError::InvalidOperation(error.to_string()))
@@ -2885,6 +2920,13 @@ fn write_prepared_bootstrap_part(
 /// preparation it authorizes. `scratch` is caller-owned disposable storage
 /// outside the graph. Only the final `sealed.commit` file marks a reusable
 /// preparation; all UUID-named work directories are non-authoritative residue.
+///
+/// `reference_catalog` must be the durable capability of the exact archive this
+/// preparation will be installed into. Authoring binds a `reference_catalog_root`
+/// into every accepted cold record; building it anywhere else would produce a
+/// root the installed archive could never open. The preparation retains that
+/// archive's control-directory identity so installation cannot later be pointed
+/// at a different archive.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_inactive_bootstrap_import(
     graph: &Graph,
@@ -2893,8 +2935,14 @@ pub(crate) fn prepare_inactive_bootstrap_import(
     lineage_digest: LineageDigest,
     catalog_document_id: DocumentId,
     reference_catalog_policy: ReferenceCatalogPolicyV1,
+    reference_catalog: &BootstrapAuthoringCapability,
     scratch: &Path,
 ) -> Result<InactiveBootstrapPreparedPublication, BootstrapStreamingImportError> {
+    if reference_catalog.workspace_id() != workspace_id {
+        return Err(invalid_bootstrap_orchestration(
+            "bootstrap reference-catalog capability belongs to another workspace",
+        ));
+    }
     prepare_bootstrap_scratch(graph, scratch)?;
     let root = scratch.join(BOOTSTRAP_STREAM_DIRECTORY);
     create_private_directory(&root)?;
@@ -2928,6 +2976,7 @@ pub(crate) fn prepare_inactive_bootstrap_import(
         lineage_digest,
         catalog_document_id,
         reference_catalog_policy,
+        reference_catalog,
         source.import_id,
         &operations,
         part_count,
@@ -2993,6 +3042,7 @@ pub(crate) fn prepare_inactive_bootstrap_import(
         commit,
         catalog_document_id,
         reference_catalog_policy: retained_reference_catalog_policy,
+        reference_catalog_archive_identity: reference_catalog.archive_identity(),
         candidate: authored.candidate,
         engine_materials: authored.engine_materials,
         instrumentation,
@@ -7994,6 +8044,18 @@ mod tests {
         );
     }
 
+    /// The durable reference-catalog capability of one target archive.
+    ///
+    /// A bootstrap preparation is authored for exactly one archive: its
+    /// accepted cold records bind catalog roots that live in that archive's
+    /// authenticated Patricia store, so installing it elsewhere fails closed.
+    fn target_catalog(archive: &Path, workspace: WorkspaceId) -> BootstrapAuthoringCapability {
+        ObjectStore::open(archive, workspace)
+            .unwrap()
+            .bootstrap_authoring_capability()
+            .unwrap()
+    }
+
     fn prepare_streaming_bootstrap(
         label: &str,
         files: &[(&str, &str)],
@@ -8021,6 +8083,7 @@ mod tests {
             LineageDigest::of(b"inactive-streaming-bootstrap-test"),
             DocumentId::from_uuid(Uuid::from_u128(0x5a02)),
             ReferenceCatalogPolicyV1::default(),
+            &target_catalog(&root.path().join("archive"), workspace),
             &preparation_scratch,
         )
         .unwrap();
@@ -8162,13 +8225,15 @@ mod tests {
             .capture_inactive_bootstrap_sources(&capture_scratch)
             .unwrap();
         fs::write(graph_root.join("pages/mutable.md"), "- after").unwrap();
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(0x5b01));
         assert!(prepare_inactive_bootstrap_import(
             &graph,
             capture,
-            WorkspaceId::from_uuid(Uuid::from_u128(0x5b01)),
+            workspace,
             LineageDigest::of(b"capture-c-mutation"),
             DocumentId::from_uuid(Uuid::from_u128(0x5b02)),
             ReferenceCatalogPolicyV1::default(),
+            &target_catalog(&root.path().join("archive"), workspace),
             &preparation_scratch,
         )
         .is_err());
@@ -8194,6 +8259,7 @@ mod tests {
         fs::create_dir(&capture_scratch).unwrap();
         fs::create_dir(&preparation_scratch).unwrap();
         let workspace = WorkspaceId::from_uuid(Uuid::from_u128(0x5c01));
+        let catalog = target_catalog(&root.path().join("archive"), workspace);
         let prepare_once = || {
             let capture = graph
                 .capture_inactive_bootstrap_sources(&capture_scratch)
@@ -8205,6 +8271,7 @@ mod tests {
                 LineageDigest::of(b"streaming-repeat"),
                 DocumentId::from_uuid(Uuid::from_u128(0x5c02)),
                 ReferenceCatalogPolicyV1::default(),
+                &catalog,
                 &preparation_scratch,
             )
             .unwrap()
@@ -8269,6 +8336,7 @@ mod tests {
         fs::create_dir(&capture_scratch).unwrap();
         fs::create_dir(&preparation_scratch).unwrap();
         let workspace = WorkspaceId::from_uuid(Uuid::from_u128(0x5c11));
+        let catalog = target_catalog(&root.path().join("archive"), workspace);
         let prepare_once = || {
             let capture = graph
                 .capture_inactive_bootstrap_sources(&capture_scratch)
@@ -8280,6 +8348,7 @@ mod tests {
                 LineageDigest::of(b"streaming-conflicting-seal"),
                 DocumentId::from_uuid(Uuid::from_u128(0x5c12)),
                 ReferenceCatalogPolicyV1::default(),
+                &catalog,
                 &preparation_scratch,
             )
         };
@@ -8398,11 +8467,13 @@ mod tests {
         boundaries.flush().unwrap();
         boundaries.get_ref().sync_all().unwrap();
         let mut instrumentation = BootstrapStreamingImportInstrumentation::default();
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(0x5d05));
         let authored = author_bootstrap_parts(
-            WorkspaceId::from_uuid(Uuid::from_u128(0x5d05)),
+            workspace,
             LineageDigest::of(b"cross-part-author"),
             DocumentId::from_uuid(Uuid::from_u128(0x5d06)),
             ReferenceCatalogPolicyV1::default(),
+            &target_catalog(&root.path().join("archive"), workspace),
             ImportId::from_digest([0x63; 32]),
             &BootstrapOperationSpool {
                 path: operation_path,
@@ -8600,6 +8671,7 @@ mod tests {
         root: &TestRoot,
         label: &str,
         workspace: WorkspaceId,
+        archive: &Path,
     ) -> InactiveBootstrapPreparedPublication {
         let graph = Graph::open(&root.path().join("graph"));
         let capture_scratch = root.path().join(format!("capture-{label}"));
@@ -8616,6 +8688,7 @@ mod tests {
             LineageDigest::of(b"inactive-bootstrap-orchestration-lineage"),
             DocumentId::from_uuid(Uuid::from_u128(0x6a02)),
             ReferenceCatalogPolicyV1::default(),
+            &target_catalog(archive, workspace),
             &preparation_scratch,
         )
         .unwrap()
@@ -8660,7 +8733,8 @@ mod tests {
         )
         .unwrap();
         let workspace = WorkspaceId::from_uuid(Uuid::from_u128(0x6a01));
-        let prepared = prepare_existing_bootstrap(&root, "rich", workspace);
+        let archive = root.path().join("archive");
+        let prepared = prepare_existing_bootstrap(&root, "rich", workspace, &archive);
         (root, prepared, workspace)
     }
 
@@ -8887,26 +8961,32 @@ mod tests {
             InactiveBootstrapOrchestrationCut::BeforeHistoryHead,
             InactiveBootstrapOrchestrationCut::AfterHistoryHead,
         ];
+        // Each cut needs its own target archive, and a bootstrap preparation
+        // belongs to exactly one archive: authoring persists the catalog roots
+        // its cold records bind into that archive's durable store.
         for (index, cut) in cuts.into_iter().enumerate() {
             let archive = root.path().join(format!("archive-cut-{index}"));
+            let cut_prepared =
+                prepare_existing_bootstrap(&root, &format!("cut-{index}"), workspace, &archive);
+            let cut_binding = orchestration_binding(&cut_prepared, 0x6a10);
             INACTIVE_BOOTSTRAP_ORCHESTRATION_CUT.with(|pending| pending.set(Some(cut)));
             assert!(publish_install_verify_inactive_bootstrap(
-                &prepared,
+                &cut_prepared,
                 ObjectStore::open(&archive, workspace).unwrap(),
-                binding,
+                cut_binding,
             )
             .is_err());
             if cut == InactiveBootstrapOrchestrationCut::AfterHistoryHead {
                 let store = ObjectStore::open(&archive, workspace).unwrap();
                 let (store, history) = store
-                    .seal_history_only(binding)
+                    .seal_history_only(cut_binding)
                     .unwrap()
                     .into_history()
                     .unwrap();
                 assert_eq!(
                     history.current_bootstrap_binding().unwrap(),
                     Some(
-                        BootstrapAggregateHistoryBindingV1::for_aggregate(prepared.aggregate())
+                        BootstrapAggregateHistoryBindingV1::for_aggregate(cut_prepared.aggregate())
                             .unwrap()
                     )
                 );
@@ -8914,16 +8994,18 @@ mod tests {
                 drop(store);
             }
             let verified = publish_install_verify_inactive_bootstrap(
-                &prepared,
+                &cut_prepared,
                 ObjectStore::open(&archive, workspace).unwrap(),
-                binding,
+                cut_binding,
             )
             .unwrap();
-            assert_verified_orchestration(&prepared, &verified, binding);
+            assert_verified_orchestration(&cut_prepared, &verified, cut_binding);
             assert!(!archive.join("projection-work").exists());
         }
 
-        let archive = root.path().join("archive-idempotent");
+        // The fixture's own preparation installs idempotently into the exact
+        // archive it was authored against.
+        let archive = root.path().join("archive");
         let first = publish_install_verify_inactive_bootstrap(
             &prepared,
             ObjectStore::open(&archive, workspace).unwrap(),
@@ -9015,7 +9097,7 @@ mod tests {
             "title:: Root logical name\n\n- changed publication\n",
         )
         .unwrap();
-        let second = prepare_existing_bootstrap(&root, "different", workspace);
+        let second = prepare_existing_bootstrap(&root, "different", workspace, &archive);
         assert_ne!(
             first.aggregate().publication_id(),
             second.aggregate().publication_id()
@@ -9049,15 +9131,18 @@ mod tests {
     fn inactive_bootstrap_orchestration_refuses_missing_and_truncated_committed_artifacts() {
         let (root, prepared, workspace) =
             rich_orchestration_fixture("orchestration-artifact-damage");
-        let binding = orchestration_binding(&prepared, 0x6d10);
-        let part = prepared.aggregate().parts()[0];
-        let part_name = hex_bootstrap_digest(part.part_id().as_bytes());
+        drop(prepared);
 
         let missing_archive = root.path().join("archive-missing");
+        let missing_prepared =
+            prepare_existing_bootstrap(&root, "missing", workspace, &missing_archive);
+        let missing_binding = orchestration_binding(&missing_prepared, 0x6d10);
+        let part_name =
+            hex_bootstrap_digest(missing_prepared.aggregate().parts()[0].part_id().as_bytes());
         publish_install_verify_inactive_bootstrap(
-            &prepared,
+            &missing_prepared,
             ObjectStore::open(&missing_archive, workspace).unwrap(),
-            binding,
+            missing_binding,
         )
         .unwrap();
         fs::remove_file(
@@ -9067,30 +9152,38 @@ mod tests {
         )
         .unwrap();
         assert!(publish_install_verify_inactive_bootstrap(
-            &prepared,
+            &missing_prepared,
             ObjectStore::open(&missing_archive, workspace).unwrap(),
-            binding,
+            missing_binding,
         )
         .is_err());
 
         let truncated_archive = root.path().join("archive-truncated");
+        let truncated_prepared =
+            prepare_existing_bootstrap(&root, "truncated", workspace, &truncated_archive);
+        let truncated_binding = orchestration_binding(&truncated_prepared, 0x6d10);
+        let truncated_part_name = hex_bootstrap_digest(
+            truncated_prepared.aggregate().parts()[0]
+                .part_id()
+                .as_bytes(),
+        );
         publish_install_verify_inactive_bootstrap(
-            &prepared,
+            &truncated_prepared,
             ObjectStore::open(&truncated_archive, workspace).unwrap(),
-            binding,
+            truncated_binding,
         )
         .unwrap();
         fs::write(
             truncated_archive
                 .join("bootstrap-v1/parts")
-                .join(&part_name),
+                .join(&truncated_part_name),
             b"truncated",
         )
         .unwrap();
         assert!(publish_install_verify_inactive_bootstrap(
-            &prepared,
+            &truncated_prepared,
             ObjectStore::open(&truncated_archive, workspace).unwrap(),
-            binding,
+            truncated_binding,
         )
         .is_err());
         assert!(!missing_archive.join("projection-work").exists());
@@ -9332,8 +9425,13 @@ mod tests {
         wrong.engine_binding = EngineHistoryBinding::empty();
         assert_authority_reopen_rejected(&wrong, &archive, workspace);
 
+        // A second archive requires its own preparation: a bootstrap belongs to
+        // exactly one archive's durable reference catalog.
+        let other_archive = root.path().join("other-archive");
+        let other_prepared =
+            prepare_existing_bootstrap(&root, "other-archive", workspace, &other_archive);
         let (_, other_verified, other_authority) =
-            install_accepted_authority(&root, &prepared, workspace, 0x7020, "other-archive");
+            install_accepted_authority(&root, &other_prepared, workspace, 0x7020, "other-archive");
         drop(other_authority);
         let mut wrong = verified.clone();
         wrong.archive_identity = other_verified.archive_identity;

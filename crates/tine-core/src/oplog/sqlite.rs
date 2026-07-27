@@ -689,6 +689,12 @@ enum RebuildLoader<'a> {
     InactiveBootstrap {
         publication: &'a ValidatedBootstrapPublicationV1,
     },
+    /// A promoted bootstrap-anchored lineage: the leading acceptance sequences
+    /// are the retained immutable bootstrap parts and everything after them is
+    /// an ordinary archived batch.
+    PromotedBootstrapAnchored {
+        publication: &'a ValidatedBootstrapPublicationV1,
+    },
 }
 
 struct RebuildCursor<'a> {
@@ -757,6 +763,44 @@ impl<'a> RebuildSource<'a> {
         })
     }
 
+    /// Rebuild source for a promoted runtime, whose accepted history begins
+    /// with the retained immutable bootstrap parts and continues with ordinary
+    /// archived batches.
+    pub(crate) fn from_promoted_runtime(
+        engine: &'a ShardedHotEngine,
+        store: &'a ObjectStore,
+        publication: &'a ValidatedBootstrapPublicationV1,
+    ) -> Result<Self, ProjectionError> {
+        let aggregate = publication.aggregate();
+        if aggregate.workspace_id() != engine.workspace_id()
+            || aggregate.lineage_digest() != engine.lineage_digest()
+            || store.workspace_id() != engine.workspace_id()
+        {
+            return Err(ProjectionError::Rebuild(
+                "promoted bootstrap publication is not this runtime's lineage".into(),
+            ));
+        }
+        let exact_frontier_root = engine
+            .accepted_frontier_root()
+            .map_err(|error| ProjectionError::Rebuild(error.to_string()))?;
+        let accepted_batch_count = engine
+            .accepted_batch_count()
+            .map_err(|error| ProjectionError::Rebuild(error.to_string()))?;
+        if accepted_batch_count < aggregate.parts().len() as u64 {
+            return Err(ProjectionError::Rebuild(
+                "promoted accepted history is behind its own bootstrap".into(),
+            ));
+        }
+        Ok(Self {
+            engine,
+            store,
+            loader: RebuildLoader::PromotedBootstrapAnchored { publication },
+            runtime_authority: engine.runtime_authority().clone(),
+            exact_frontier_root,
+            accepted_batch_count,
+        })
+    }
+
     pub(crate) fn from_inactive_bootstrap(
         authority: &'a InactiveBootstrapAcceptedAuthority,
     ) -> Result<Self, ProjectionError> {
@@ -810,7 +854,22 @@ impl<'a> RebuildSource<'a> {
                 };
                 Ok((event, None))
             }
-            RebuildLoader::InactiveBootstrap { publication } => {
+            RebuildLoader::PromotedBootstrapAnchored { publication }
+                if acceptance_sequence > publication.aggregate().parts().len() as u64 =>
+            {
+                let event = match indexed_evidence {
+                    Some(evidence) => AcceptedBatchEvent::from_indexed(
+                        self.engine,
+                        self.store,
+                        batch_id,
+                        evidence,
+                    )?,
+                    None => AcceptedBatchEvent::from_accepted(self.engine, self.store, batch_id)?,
+                };
+                Ok((event, None))
+            }
+            RebuildLoader::InactiveBootstrap { publication }
+            | RebuildLoader::PromotedBootstrapAnchored { publication } => {
                 let evidence = indexed_evidence.ok_or_else(|| {
                     ProjectionError::Rebuild(format!(
                         "bootstrap batch {batch_id} lacks indexed accepted evidence"
@@ -1952,7 +2011,19 @@ impl TailOverlay {
         if authenticate_source {
             self.authenticated_source_frontier = Some(source.exact_frontier_root.clone());
         }
+        // `accepted_batch_count` and `retained_bytes_total` are two halves of
+        // the same authenticated source frontier and must advance together.
+        // Raising only the sequence leaves the retained-bytes gauge behind the
+        // events this drain is about to apply, and the first application then
+        // underflows `applied - authoritative` as a false frontier regression.
+        // This is reachable whenever an accepted event was never separately
+        // enqueued — for example a locally authored batch staged straight into
+        // the engine.
         self.authoritative_through = self.authoritative_through.max(source.accepted_batch_count);
+        self.authoritative_retained_bytes_total = self
+            .authoritative_retained_bytes_total
+            .max(source.exact_frontier_root.retained_bytes_total());
+        self.refresh_retained_bytes()?;
         let mut applied = 0;
         while applied < max_batches {
             let expected_sequence =

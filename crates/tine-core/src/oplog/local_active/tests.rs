@@ -36,9 +36,11 @@ use crate::oplog::sqlite::{
     VerifiedBootstrapSqliteProjection,
 };
 use crate::oplog::{
-    CanonicalArchiveResourceId, DeviceId, DocumentId, LineageDigest, ObjectStore, ProjectionClaim,
-    ProjectionEndpointId, ProjectionReceiptStore, ReferenceCatalogPolicyV1, ShardedHotEngine,
-    WorkspaceId,
+    AuthorBatch, BatchDisposition, BatchId, BatchOrigin, BlockId, BlockLocation,
+    CanonicalArchiveResourceId, CrdtPeerId, DeviceId, DocumentId, LineageDigest, LogicalPageName,
+    ManagedPath, ManagedTextKind, ObjectStore, OperationTransaction, PageId, ProjectionClaim,
+    ProjectionEndpointId, ProjectionReceiptStore, ReferenceCatalogPolicyV1, SemanticOperation,
+    ShardedHotEngine, WorkspaceId,
 };
 
 struct TestRoot(PathBuf);
@@ -78,7 +80,9 @@ struct Fixture {
     authority: InactiveBootstrapAcceptedAuthority,
     roots: MigrationBackupRoot,
     backup: VerifiedSourceBackup,
-    sqlite: OpenProjection,
+    /// Released before a promoted runtime opens: the SQLite applier lease is
+    /// one per workspace, and the promoted projection takes it over.
+    sqlite: Option<OpenProjection>,
     sqlite_proof: VerifiedBootstrapSqliteProjection,
     archive_resource_id: CanonicalArchiveResourceId,
     shadow: VerifiedShadowProjection,
@@ -127,6 +131,10 @@ impl Fixture {
         let capture = graph
             .capture_inactive_bootstrap_sources(&capture_root)
             .unwrap();
+        // The bootstrap is authored for exactly this archive: its accepted cold
+        // records bind reference-catalog roots that live in this archive's
+        // durable authenticated store.
+        let archive_root = root.path().join("archive");
         let prepared = prepare_inactive_bootstrap_import(
             &graph,
             capture,
@@ -134,6 +142,10 @@ impl Fixture {
             lineage,
             catalog_document_id,
             ReferenceCatalogPolicyV1::default(),
+            &ObjectStore::open(&archive_root, workspace)
+                .unwrap()
+                .bootstrap_authoring_capability()
+                .unwrap(),
             &preparation_root,
         )
         .unwrap();
@@ -141,7 +153,6 @@ impl Fixture {
             endpoint,
             receipt_store_id: receipts.store_id(),
         };
-        let archive_root = root.path().join("archive");
         let verified = publish_install_verify_inactive_bootstrap(
             &prepared,
             ObjectStore::open(&archive_root, workspace).unwrap(),
@@ -195,13 +206,25 @@ impl Fixture {
             authority,
             roots,
             backup,
-            sqlite,
+            sqlite: Some(sqlite),
             sqlite_proof,
             archive_resource_id,
             shadow,
             preparation: PreparationId::new(),
             original_graph,
         }
+    }
+
+    fn sqlite(&self) -> &OpenProjection {
+        self.sqlite
+            .as_ref()
+            .expect("retained inactive bootstrap projection")
+    }
+
+    /// Drop the retained inactive bootstrap SQLite projection, releasing the
+    /// one-per-workspace applier lease a promoted projection needs.
+    fn release_bootstrap_projection(&mut self) {
+        self.sqlite = None;
     }
 
     fn proofs(&self) -> VerifiedLocalProofSet<'_> {
@@ -212,7 +235,7 @@ impl Fixture {
             verified_publication: &self.verified,
             source_backup: &self.backup,
             accepted_authority: &self.authority,
-            sqlite: &self.sqlite,
+            sqlite: self.sqlite(),
             sqlite_projection: &self.sqlite_proof,
             shadow_projection: &self.shadow,
         }
@@ -248,7 +271,7 @@ impl Fixture {
     fn runtime(&self) -> LocalActiveRuntime<'_> {
         LocalActiveRuntime {
             engine: self.authority.accepted_engine(),
-            projection: &self.sqlite,
+            projection: self.sqlite(),
         }
     }
 
@@ -1030,7 +1053,7 @@ fn restart_reopen_rejects_wrong_state_proofs_bindings_and_runtimes() {
     // A cross-bound runtime and a foreign enrollment binding.
     let foreign_runtime = LocalActiveRuntime {
         engine: other.authority.accepted_engine(),
-        projection: &other.sqlite,
+        projection: other.sqlite(),
     };
     assert!(reopen_local_active_authority(
         &root,
@@ -1273,7 +1296,7 @@ fn activation_rejects_stale_and_cross_bound_evidence_without_advancing() {
     // A runtime component from the other enrollment is also refused.
     let foreign_runtime = LocalActiveRuntime {
         engine: second.authority.accepted_engine(),
-        projection: &second.sqlite,
+        projection: second.sqlite(),
     };
     assert!(activate_verified_local(
         &root,
@@ -1521,8 +1544,9 @@ fn blocked_and_non_verified_lifecycles_never_activate() {
 /// therefore authorize the exact live graph and engine *before* that mutation,
 /// not only later inside the coordinator.
 ///
-/// The refused authority here is a genuine `LocalActiveAuthority` permit minted
-/// for a second, separately enrolled graph, so this is a real wrong-authority
+/// The refused authority here is a genuine promoted admission — a real
+/// `LocalActiveAuthority` plus the real `PromotedLocalRuntime` minted for a
+/// second, separately enrolled graph — so this is a live wrong-authority
 /// dispatch rather than a synthetic admission value.
 #[test]
 fn full_scan_dispatch_with_wrong_authority_never_mutates_the_baseline() {
@@ -1534,23 +1558,21 @@ fn full_scan_dispatch_with_wrong_authority_never_mutates_the_baseline() {
     // The foreign enrollment is deliberately empty so its own live runtime
     // engine is admissible: the refusal under test must come from the graph and
     // engine identity, not from a stale accepted frontier.
-    let foreign = Fixture::new("full-scan-foreign", None, Vec::new());
+    let mut foreign = Fixture::new("full-scan-foreign", None, Vec::new());
 
-    // A genuine live admission that belongs to the *other* enrolled graph.
+    // A genuine live promoted admission that belongs to the *other* graph.
     let foreign_root = foreign.enrollment_root("foreign-admission");
-    let mut foreign_authority = activate_verified_local(
+    let foreign_paths = PromotedPaths::new(&foreign, "foreign-admission");
+    let (mut foreign_authority, mut foreign_runtime) = promote(
+        &mut foreign,
         &foreign_root,
-        foreign.compose(&foreign_root),
         SessionId::new(),
-        &foreign.proofs(),
-        &foreign.runtime(),
-    )
-    .unwrap();
-    let foreign_engine = foreign.runtime_engine("foreign-admission");
-    let foreign_permit = foreign_authority
-        .admit_local_mutation(&foreign.graph, &foreign_engine)
+        &foreign_paths,
+    );
+    let foreign_session = foreign_runtime
+        .admit_promoted_mutation(&mut foreign_authority, &foreign.graph)
         .unwrap();
-    let wrong_admission = foreign_permit.admission();
+    let wrong_admission = foreign_session.admission();
 
     // One coherent live runtime for the graph actually being reconciled.
     let mut engine = fixture.runtime_engine("scan");
@@ -1710,10 +1732,6 @@ fn runtime_mutation_is_denied_without_wrong_or_stale_authority_and_allowed_with_
             .unwrap();
         assert_eq!(permit.session_id(), session);
         assert_eq!(permit.enrollment_head(), enrollment_head(&root, &binding));
-        assert!(permit
-            .admission()
-            .authorize(&fixture.graph, &engine)
-            .is_ok());
     }
 
     // Denied: a foreign graph and a foreign engine.
@@ -1891,6 +1909,842 @@ fn safe_handoff_proves_every_core_drain_and_names_its_missing_dependency() {
         LocalActiveHandoff::Unsafe {
             session_id: session
         }
+    );
+    fixture.assert_graph_unchanged();
+}
+
+// ---------------------------------------------------------------------------
+// P2N8 runtime promotion.
+// ---------------------------------------------------------------------------
+
+/// The device-local paths one promoted runtime is opened over.
+struct PromotedPaths {
+    runtime_root: ApplicationRuntimeRoot,
+    database_path: PathBuf,
+}
+
+impl PromotedPaths {
+    fn new(fixture: &Fixture, label: &str) -> Self {
+        Self {
+            runtime_root: ApplicationRuntimeRoot::open_for_test(
+                &fixture.root.path().join(format!("promoted-rt-{label}")),
+            )
+            .unwrap(),
+            database_path: fixture.root.path().join(format!("promoted-{label}.sqlite")),
+        }
+    }
+
+    fn open<'a>(&'a self, fixture: &'a Fixture) -> PromotedRuntimeOpen<'a> {
+        PromotedRuntimeOpen {
+            graph: &fixture.graph,
+            receipts: &fixture.receipts,
+            archive_root: &fixture.archive_root,
+            database_path: &self.database_path,
+            application_runtime_root: &self.runtime_root,
+        }
+    }
+}
+
+/// Prove the P2N7 fence is still real for this archive: an ordinary enrolled
+/// open of an inactive bootstrap history must fail closed.
+fn assert_ordinary_enrolled_open_is_fenced(fixture: &Fixture) {
+    let storage = ProjectionStorageBinding {
+        endpoint: fixture.authority.binding().storage_binding().endpoint,
+        receipt_store_id: fixture.receipts.store_id(),
+    };
+    let error = fixture
+        .archive()
+        .seal_enrolled_projection(storage)
+        .err()
+        .expect("an inactive bootstrap archive must refuse an ordinary enrolled open")
+        .1;
+    assert!(
+        matches!(
+            error,
+            crate::oplog::StoreError::InactiveBootstrapHistory
+                | crate::oplog::StoreError::PromotedRuntimeStateMismatch(_)
+        ),
+        "unexpected ordinary-open error: {error}"
+    );
+}
+
+/// Activate P2N7 and then complete the P2N8 promotion.
+fn promote(
+    fixture: &mut Fixture,
+    root: &EnrollmentApplicationRoot,
+    session: SessionId,
+    paths: &PromotedPaths,
+) -> (LocalActiveAuthority, PromotedLocalRuntime) {
+    let authority = activate_verified_local(
+        root,
+        fixture.compose(root),
+        session,
+        &fixture.proofs(),
+        &fixture.runtime(),
+    )
+    .unwrap();
+    let sealed =
+        seal_local_runtime_promotion(&authority, &fixture.proofs(), &fixture.runtime()).unwrap();
+    fixture.release_bootstrap_projection();
+    let runtime = open_promoted_local_runtime(sealed, &authority, &paths.open(fixture)).unwrap();
+    (authority, runtime)
+}
+
+/// Author, publish, and accept one ordinary local batch through the promoted
+/// runtime's admitted mutation window.
+fn append_local_batch(
+    fixture: &Fixture,
+    authority: &mut LocalActiveAuthority,
+    runtime: &mut PromotedLocalRuntime,
+    seed: u128,
+) {
+    append_local_batch_at(fixture, authority, runtime, seed, "pages")
+}
+
+/// `page_directory` must be the configured pages directory of `fixture`'s
+/// graph, so the authored projection path is a valid managed path there.
+fn append_local_batch_at(
+    fixture: &Fixture,
+    authority: &mut LocalActiveAuthority,
+    runtime: &mut PromotedLocalRuntime,
+    seed: u128,
+    page_directory: &str,
+) {
+    let endpoint = authority.endpoint();
+    let mut session = runtime
+        .admit_promoted_mutation(authority, &fixture.graph)
+        .unwrap();
+    let transaction = OperationTransaction::new(vec![
+        SemanticOperation::CreatePage {
+            page_id: PageId::from_uuid(Uuid::from_u128(seed)),
+            home_document_id: DocumentId::from_uuid(Uuid::from_u128(seed + 1)),
+            name: LogicalPageName::parse(&format!("Promoted {seed}")).unwrap(),
+            path: ManagedPath::parse(&format!("{page_directory}/promoted-{seed}.md")).unwrap(),
+            kind: ManagedTextKind::Page,
+        },
+        SemanticOperation::CreateBlock {
+            block: BlockLocation {
+                block_id: BlockId::from_uuid(Uuid::from_u128(seed + 2)),
+                home_document_id: DocumentId::from_uuid(Uuid::from_u128(seed + 1)),
+            },
+            page_id: PageId::from_uuid(Uuid::from_u128(seed)),
+            parent: None,
+            order: "a".into(),
+            content: format!("promoted local batch {seed}"),
+        },
+    ])
+    .unwrap();
+
+    let (admission, engine, _database, _tail) = session.parts();
+    // Every mutation path authorizes first; a promoted admission proves the
+    // whole binding, not merely a non-regressing acceptance sequence.
+    admission.authorize(&fixture.graph, engine).unwrap();
+
+    let draft = engine
+        .draft_author_transaction(
+            AuthorBatch {
+                batch_id: BatchId::from_uuid(Uuid::from_u128(seed + 3)),
+                author_device_id: endpoint.device_id(),
+                author_session_id: SessionId::from_uuid(Uuid::from_u128(seed + 4)),
+                crdt_peer_id: CrdtPeerId::from_u64((seed as u64) | 1),
+            },
+            BatchOrigin::LocalMutation,
+            &transaction,
+        )
+        .unwrap();
+    let prepared = engine
+        .finalize_author_transaction(draft, &fixture.graph, &fixture.receipts, endpoint)
+        .unwrap();
+    ObjectStore::open(&fixture.archive_root, fixture.workspace)
+        .unwrap()
+        .publish_prepared(&prepared)
+        .unwrap();
+    let outcome = engine
+        .stage_archive_batch(prepared.manifest().batch_id())
+        .unwrap();
+    assert!(
+        matches!(outcome.disposition, BatchDisposition::Accepted { .. }),
+        "promoted local batch was not accepted: {:?}",
+        outcome.disposition
+    );
+
+    // A promoted admission requires the device-local SQLite projection to be at
+    // the current accepted frontier, so every mutation drains before the next
+    // window opens. This is the ordinary bounded tail drain.
+    let drained = session.drain_projection(16).unwrap();
+    assert_eq!(drained, 1, "exactly the new accepted batch drains");
+}
+
+/// The durable promotion state file for one fixture archive.
+fn promotion_state_path(fixture: &Fixture) -> PathBuf {
+    fixture
+        .archive_root
+        .join("engine-history")
+        .join(
+            fixture
+                .authority
+                .binding()
+                .storage_binding()
+                .endpoint
+                .endpoint_id()
+                .to_string(),
+        )
+        .join("promoted-runtime.state")
+}
+
+/// The whole first-promotion boundary over a rich, nested, Unicode, CRLF,
+/// multipart bootstrap: fenced before, writable after, byte-identical graph,
+/// and an exactly resumable durable state.
+#[test]
+fn inactive_bootstrap_promotes_to_a_writable_runtime_and_resumes_exactly() {
+    let mut fixture = rich_fixture("promote-rich");
+    let root = fixture.enrollment_root("promote-rich");
+    let binding = fixture.enrollment_binding();
+    let paths = PromotedPaths::new(&fixture, "rich");
+    let session = SessionId::new();
+
+    // Fail-before: this archive cannot be opened as an ordinary runtime.
+    assert_ordinary_enrolled_open_is_fenced(&fixture);
+    assert!(!promotion_state_path(&fixture).exists());
+
+    let authority = activate_verified_local(
+        &root,
+        fixture.compose(&root),
+        session,
+        &fixture.proofs(),
+        &fixture.runtime(),
+    )
+    .unwrap();
+    let activated_head = enrollment_head(&root, &binding);
+    let bootstrap_frontier = fixture
+        .authority
+        .accepted_engine()
+        .accepted_frontier_root()
+        .unwrap();
+    let bootstrap_generation = fixture.authority.binding().history_generation();
+    let bootstrap_root = fixture.authority.binding().history_root();
+    assert!(
+        fixture.verified.part_count() >= 1,
+        "rich fixture is nonempty"
+    );
+
+    // Phase one is idempotent: repeating it with the same inputs resumes
+    // against the identical committed bytes.
+    let _first =
+        seal_local_runtime_promotion(&authority, &fixture.proofs(), &fixture.runtime()).unwrap();
+    let state_bytes = fs::read(promotion_state_path(&fixture)).unwrap();
+    let sealed =
+        seal_local_runtime_promotion(&authority, &fixture.proofs(), &fixture.runtime()).unwrap();
+    assert_eq!(
+        fs::read(promotion_state_path(&fixture)).unwrap(),
+        state_bytes,
+        "an idempotent resume must not rewrite the committed promotion state"
+    );
+
+    fixture.release_bootstrap_projection();
+    let runtime = open_promoted_local_runtime(sealed, &authority, &paths.open(&fixture)).unwrap();
+
+    // The promoted runtime is the bootstrap's own lineage at its own frontier.
+    assert_eq!(
+        runtime.bootstrap_anchor().generation,
+        bootstrap_generation,
+        "the promoted anchor must be the exact bootstrap history generation"
+    );
+    assert_eq!(runtime.bootstrap_anchor().index_root, bootstrap_root);
+    // Every authenticated field of the frontier must be reproduced exactly.
+    // `scratch_root` locates the run-local scratch LSM page holding this
+    // frontier's point index; its file offset is reconstructible derived state
+    // that legitimately differs between the inactive and promoted runs.
+    assert!(
+        runtime
+            .engine()
+            .accepted_frontier_root()
+            .unwrap()
+            .same_accepted_authority(&bootstrap_frontier),
+        "promotion must reproduce the exact accepted bootstrap frontier"
+    );
+    assert_eq!(
+        runtime
+            .engine()
+            .accepted_frontier_root()
+            .unwrap()
+            .reference_catalog_root(),
+        bootstrap_frontier.reference_catalog_root(),
+        "the promoted catalog root is the exact bootstrap catalog root"
+    );
+    assert!(runtime
+        .database()
+        .frontier_root()
+        .unwrap()
+        .same_accepted_authority(&bootstrap_frontier));
+    assert_eq!(runtime.session_id(), session);
+    assert_eq!(
+        runtime.verification_digest(),
+        authority.verification_digest()
+    );
+
+    // Promotion advanced no enrollment state and wrote no graph byte.
+    assert_eq!(enrollment_head(&root, &binding), activated_head);
+    fixture.assert_graph_unchanged();
+}
+
+/// A zero-file graph promotes exactly like a populated one: an empty bootstrap
+/// anchor is a legitimate anchor, not a missing one.
+#[test]
+fn a_zero_part_bootstrap_promotes_at_the_empty_anchor() {
+    let mut fixture = Fixture::new("promote-zero", None, Vec::new());
+    let root = fixture.enrollment_root("promote-zero");
+    let paths = PromotedPaths::new(&fixture, "zero");
+    assert_eq!(fixture.verified.part_count(), 0);
+
+    let (_authority, runtime) = promote(&mut fixture, &root, SessionId::new(), &paths);
+    assert_eq!(runtime.bootstrap_anchor().generation, 0);
+    assert_eq!(
+        runtime
+            .engine()
+            .accepted_frontier_root()
+            .unwrap()
+            .acceptance_sequence(),
+        0
+    );
+    fixture.assert_graph_unchanged();
+}
+
+/// Every durable cut of the one-time promotion publication reopens as either
+/// the unchanged inactive bootstrap or the one exact resumable promoted state.
+/// Partial, truncated, and foreign residue fails closed and is preserved.
+#[test]
+fn promotion_state_residue_fails_closed_and_preserves_evidence() {
+    let mut fixture = Fixture::new(
+        "promote-residue",
+        None,
+        vec![("pages/residue.md".into(), b"- residue\n".to_vec())],
+    );
+    let root = fixture.enrollment_root("promote-residue");
+    let paths = PromotedPaths::new(&fixture, "residue");
+    let session = SessionId::new();
+    let authority = activate_verified_local(
+        &root,
+        fixture.compose(&root),
+        session,
+        &fixture.proofs(),
+        &fixture.runtime(),
+    )
+    .unwrap();
+
+    // The pre-publication cut: no state file at all reopens as the unchanged
+    // inactive bootstrap, and a promoted open refuses.
+    let state_path = promotion_state_path(&fixture);
+    assert!(!state_path.exists());
+    let binding = fixture.enrollment_binding();
+    assert!(
+        reopen_promoted_local_runtime(&root, &binding, session, &paths.open(&fixture)).is_err(),
+        "an unpromoted archive must never open a promoted runtime"
+    );
+
+    let sealed =
+        seal_local_runtime_promotion(&authority, &fixture.proofs(), &fixture.runtime()).unwrap();
+    let committed = fs::read(&state_path).unwrap();
+
+    // Truncated residue at every prefix fails closed rather than being
+    // repaired or partially believed.
+    for cut in [0, 1, committed.len() / 2, committed.len() - 1] {
+        fs::write(&state_path, &committed[..cut]).unwrap();
+        assert!(
+            reopen_promoted_local_runtime(&root, &binding, session, &paths.open(&fixture)).is_err(),
+            "a truncated promotion state must fail closed at cut {cut}"
+        );
+        assert!(state_path.exists(), "evidence must be preserved");
+    }
+
+    // A byte-flipped, non-canonical, or foreign claim also fails closed.
+    let mut corrupt = committed.clone();
+    let last = corrupt.len() - 1;
+    corrupt[last] ^= 0xff;
+    fs::write(&state_path, &corrupt).unwrap();
+    assert!(
+        reopen_promoted_local_runtime(&root, &binding, session, &paths.open(&fixture)).is_err()
+    );
+
+    // Restoring the exact committed bytes resumes the one promoted state.
+    fs::write(&state_path, &committed).unwrap();
+    fixture.release_bootstrap_projection();
+    let runtime = open_promoted_local_runtime(sealed, &authority, &paths.open(&fixture)).unwrap();
+    assert_eq!(runtime.session_id(), session);
+    fixture.assert_graph_unchanged();
+}
+
+/// A restarted process holds no evidence, no authority, no sealed promotion,
+/// and no engine identity. It reconstructs everything from durable state.
+#[test]
+fn a_fresh_process_reopens_the_promoted_runtime_with_no_retained_evidence() {
+    let mut fixture = Fixture::new(
+        "promote-restart",
+        None,
+        vec![("pages/restart.md".into(), b"- restart\n".to_vec())],
+    );
+    let root = fixture.enrollment_root("promote-restart");
+    let binding = fixture.enrollment_binding();
+    let paths = PromotedPaths::new(&fixture, "restart");
+    let session = SessionId::new();
+
+    let (authority, runtime) = promote(&mut fixture, &root, session, &paths);
+    let anchor = runtime.bootstrap_anchor();
+    let frontier = runtime.engine().accepted_frontier_root().unwrap();
+    // The previous process is gone: every process-local value dies with it.
+    drop(runtime);
+    drop(authority);
+
+    // A competing session is refused before any archive or lease work.
+    assert!(
+        reopen_promoted_local_runtime(&root, &binding, SessionId::new(), &paths.open(&fixture))
+            .is_err(),
+        "a crash resumes Unsafe for exactly the committed session"
+    );
+
+    let (reopened_authority, reopened) =
+        reopen_promoted_local_runtime(&root, &binding, session, &paths.open(&fixture)).unwrap();
+    assert_eq!(reopened.bootstrap_anchor(), anchor);
+    assert_eq!(
+        reopened.engine().accepted_frontier_root().unwrap(),
+        frontier
+    );
+    assert_eq!(reopened.database().frontier_root().unwrap(), frontier);
+    assert_eq!(
+        reopened_authority.handoff(),
+        LocalActiveHandoff::Unsafe {
+            session_id: session
+        },
+        "a crash remains Unsafe"
+    );
+    assert_eq!(reopened_authority.session_id(), session);
+    fixture.assert_graph_unchanged();
+}
+
+/// Ordinary local batches extend the bootstrap without ever making it
+/// unverifiable. After a restart the exact bootstrap ancestor is still proved,
+/// the current frontier is reopened, and one more mutation is admitted.
+#[test]
+fn local_batches_extend_the_bootstrap_anchor_and_restart_proves_exact_ancestry() {
+    let mut fixture = Fixture::new(
+        "promote-append",
+        None,
+        vec![("pages/seed.md".into(), b"- seed\n".to_vec())],
+    );
+    let root = fixture.enrollment_root("promote-append");
+    let binding = fixture.enrollment_binding();
+    let paths = PromotedPaths::new(&fixture, "append");
+    let session = SessionId::new();
+
+    let (mut authority, mut runtime) = promote(&mut fixture, &root, session, &paths);
+    let anchor = runtime.bootstrap_anchor();
+    let anchor_frontier = runtime.engine().accepted_frontier_root().unwrap();
+
+    append_local_batch(&fixture, &mut authority, &mut runtime, 0x9200);
+    let after_one = runtime.engine().durable_history_authority().unwrap();
+    assert!(
+        after_one.generation > anchor.generation,
+        "an ordinary local batch must extend the durable history"
+    );
+    append_local_batch(&fixture, &mut authority, &mut runtime, 0x9300);
+    append_local_batch(&fixture, &mut authority, &mut runtime, 0x9400);
+    let advanced = runtime.engine().durable_history_authority().unwrap();
+    let advanced_frontier = runtime.engine().accepted_frontier_root().unwrap();
+    assert_eq!(advanced.generation, anchor.generation + 3);
+    assert!(advanced_frontier.acceptance_sequence() > anchor_frontier.acceptance_sequence());
+
+    // The advanced history is still an authenticated descendant of the exact
+    // bootstrap anchor, proved from the shared radix structure.
+    let transition = runtime
+        .engine()
+        .authenticate_history_descends_from(anchor)
+        .unwrap();
+    assert_eq!(transition.before(), anchor);
+    assert_eq!(transition.after(), advanced);
+
+    drop(runtime);
+    drop(authority);
+
+    // Restart: the anchor is reconstructed from durable state alone, the live
+    // history is proved to descend from it, and the current frontier reopens.
+    let (mut authority, mut runtime) =
+        reopen_promoted_local_runtime(&root, &binding, session, &paths.open(&fixture)).unwrap();
+    assert_eq!(
+        runtime.bootstrap_anchor(),
+        anchor,
+        "restart must reconstruct the exact original bootstrap anchor"
+    );
+    assert_eq!(
+        runtime.engine().durable_history_authority().unwrap(),
+        advanced
+    );
+    assert_eq!(
+        runtime.engine().accepted_frontier_root().unwrap(),
+        advanced_frontier
+    );
+    assert_eq!(
+        runtime.database().frontier_root().unwrap(),
+        advanced_frontier
+    );
+
+    // One more mutation is admitted after the restart.
+    append_local_batch(&fixture, &mut authority, &mut runtime, 0x9500);
+    assert_eq!(
+        runtime
+            .engine()
+            .durable_history_authority()
+            .unwrap()
+            .generation,
+        anchor.generation + 4
+    );
+    assert_eq!(
+        enrollment_head(&root, &binding),
+        authority.enrollment_head()
+    );
+    fixture.assert_graph_unchanged();
+}
+
+/// The original `VerifiedLocal` bootstrap proof stays reopenable after the
+/// promoted history advances, and the retained immutable publication is
+/// unchanged.
+#[test]
+fn the_original_bootstrap_anchor_stays_reopenable_after_the_history_advances() {
+    let mut fixture = Fixture::new(
+        "promote-anchor",
+        None,
+        vec![("pages/anchor.md".into(), b"- anchor\n".to_vec())],
+    );
+    let root = fixture.enrollment_root("promote-anchor");
+    let binding = fixture.enrollment_binding();
+    let paths = PromotedPaths::new(&fixture, "anchor");
+    let session = SessionId::new();
+
+    let before = crate::oplog::enrollment::reopen_promoted_bootstrap_anchor(&root, &binding);
+    assert!(
+        before.is_err(),
+        "no LocalActive record exists before activation"
+    );
+
+    let (mut authority, mut runtime) = promote(&mut fixture, &root, session, &paths);
+    let anchor = crate::oplog::enrollment::reopen_promoted_bootstrap_anchor(&root, &binding)
+        .expect("the committed anchor must be reconstructible immediately after promotion");
+    let anchor_generation = anchor.history_generation();
+    let anchor_root = anchor.history_root();
+    let anchor_digest = anchor.verification_digest();
+
+    for seed in [0x9600_u128, 0x9700, 0x9800] {
+        append_local_batch(&fixture, &mut authority, &mut runtime, seed);
+    }
+    assert!(
+        runtime
+            .engine()
+            .durable_history_authority()
+            .unwrap()
+            .generation
+            > anchor_generation
+    );
+
+    let after = crate::oplog::enrollment::reopen_promoted_bootstrap_anchor(&root, &binding)
+        .expect("the bootstrap anchor must stay reopenable after the history advances");
+    assert_eq!(after.history_generation(), anchor_generation);
+    assert_eq!(after.history_root(), anchor_root);
+    assert_eq!(after.verification_digest(), anchor_digest);
+    assert_eq!(
+        after.bootstrap_part_count(),
+        fixture.verified.part_count(),
+        "the retained immutable publication identity is unchanged"
+    );
+    fixture.assert_graph_unchanged();
+}
+
+/// A promoted admission requires *both* the live authority and the exact
+/// promoted runtime. Substituted graphs, engines, and enrollments are refused
+/// before any durable or graph mutation.
+#[test]
+fn a_promoted_admission_rejects_substituted_runtime_components() {
+    let mut fixture = Fixture::new(
+        "promote-substitute",
+        None,
+        vec![("pages/subject.md".into(), b"- subject\n".to_vec())],
+    );
+    let root = fixture.enrollment_root("promote-substitute");
+    let paths = PromotedPaths::new(&fixture, "substitute");
+    let (mut authority, mut runtime) = promote(&mut fixture, &root, SessionId::new(), &paths);
+
+    let mut foreign = Fixture::new(
+        "promote-substitute-foreign",
+        None,
+        vec![("pages/foreign.md".into(), b"- foreign\n".to_vec())],
+    );
+    let foreign_root = foreign.enrollment_root("substitute-foreign");
+    let foreign_paths = PromotedPaths::new(&foreign, "substitute-foreign");
+    let (mut foreign_authority, mut foreign_runtime) = promote(
+        &mut foreign,
+        &foreign_root,
+        SessionId::new(),
+        &foreign_paths,
+    );
+
+    let advanced_before = runtime.engine().durable_history_authority().unwrap();
+    let foreign_before = foreign_runtime
+        .engine()
+        .durable_history_authority()
+        .unwrap();
+
+    // A foreign graph is refused.
+    assert!(runtime
+        .admit_promoted_mutation(&mut authority, &foreign.graph)
+        .is_err());
+    // A foreign authority is refused for this runtime.
+    assert!(runtime
+        .admit_promoted_mutation(&mut foreign_authority, &fixture.graph)
+        .is_err());
+    // A foreign runtime is refused for this authority.
+    assert!(foreign_runtime
+        .admit_promoted_mutation(&mut authority, &foreign.graph)
+        .is_err());
+
+    // A genuine admission refuses a substituted engine, including one built
+    // over the very same enrolled identity.
+    {
+        let session = runtime
+            .admit_promoted_mutation(&mut authority, &fixture.graph)
+            .unwrap();
+        let admission = session.admission();
+        let substitute = fixture.runtime_engine("substitute");
+        assert!(
+            admission.authorize(&fixture.graph, &substitute).is_err(),
+            "a same-identity engine from another history must be refused"
+        );
+        assert!(admission
+            .authorize(&foreign.graph, foreign_runtime.engine())
+            .is_err());
+    }
+
+    assert_eq!(
+        runtime.engine().durable_history_authority().unwrap(),
+        advanced_before,
+        "a refused admission must advance no durable history"
+    );
+    assert_eq!(
+        foreign_runtime
+            .engine()
+            .durable_history_authority()
+            .unwrap(),
+        foreign_before
+    );
+    fixture.assert_graph_unchanged();
+    foreign.assert_graph_unchanged();
+}
+
+/// The bootstrap-anchor ancestry proof is bounded. An unchanged history costs
+/// zero radix node reads, and a point extension costs the changed paths, never
+/// the lifetime record count.
+#[test]
+fn the_bootstrap_ancestry_proof_is_bounded_by_the_changed_radix_paths() {
+    let mut fixture = rich_fixture("promote-bounded");
+    let root = fixture.enrollment_root("promote-bounded");
+    let paths = PromotedPaths::new(&fixture, "bounded");
+    let (mut authority, mut runtime) = promote(&mut fixture, &root, SessionId::new(), &paths);
+    let anchor = runtime.bootstrap_anchor();
+    let archive = runtime
+        .engine()
+        .archive_store()
+        .expect("the promoted engine retains its archive")
+        .instrumentation();
+
+    // Exact, unchanged history: the shared subtree terminates immediately.
+    runtime
+        .engine()
+        .authenticate_history_descends_from(anchor)
+        .unwrap();
+    let unchanged = runtime.engine().archive_store().unwrap().instrumentation();
+    assert_eq!(
+        unchanged.history_index_reads, archive.history_index_reads,
+        "an exact-history proof must read no radix nodes at all"
+    );
+
+    // The rich fixture configures `notes` as its pages directory.
+    append_local_batch_at(&fixture, &mut authority, &mut runtime, 0x9900, "notes");
+    let before_point = runtime
+        .engine()
+        .archive_store()
+        .unwrap()
+        .instrumentation()
+        .history_index_reads;
+    runtime
+        .engine()
+        .authenticate_history_descends_from(anchor)
+        .unwrap();
+    let point = runtime
+        .engine()
+        .archive_store()
+        .unwrap()
+        .instrumentation()
+        .history_index_reads
+        - before_point;
+    // One inserted record touches one root-to-leaf path on each side.
+    assert!(
+        point
+            <= 2 * (u64::from(crate::oplog::object_store::ENGINE_HISTORY_RADIX_DEPTH) + 1) as usize,
+        "a point extension proof read {point} radix nodes"
+    );
+    fixture.assert_graph_unchanged();
+}
+
+/// The construction regression for the promoted reference catalog.
+///
+/// A non-empty inactive bootstrap binds a `reference_catalog_root` into every
+/// accepted cold record. That root has exactly one construction — the target
+/// archive's durable authenticated Patricia store — so every bound root must be
+/// fully openable from a *fresh* archive open that holds no process-local
+/// engine, candidate, or in-memory catalog, both while the bootstrap is still
+/// inactive and after the runtime is promoted and its history has advanced.
+///
+/// Fail-before: authoring the bootstrap against the run-local ephemeral catalog
+/// backend produced flat in-memory digests instead of Patricia roots, so this
+/// validation failed with a missing authenticated node and promotion could
+/// never open a non-empty bootstrap.
+#[test]
+fn a_non_empty_bootstrap_catalog_root_opens_from_a_fresh_archive_before_and_after_promotion() {
+    // A genuinely multipart bootstrap, so more than one accepted cold record
+    // binds a catalog root, over content that produces real reference sources.
+    let mut multipart = String::from("title:: Catalog root\n\n");
+    for ordinal in 0..4096 {
+        // Deliberately syntax-free: the operation count alone forces a second
+        // part, while reference evidence stays on the two pages below so the
+        // catalog walk here is not an accidental 4096-target benchmark.
+        multipart.push_str(&format!("- operation {ordinal:04}\n"));
+    }
+    let mut fixture = Fixture::new(
+        "promote-catalog-root",
+        None,
+        vec![
+            ("pages/multipart.md".into(), multipart.into_bytes()),
+            (
+                "pages/référence.md".into(),
+                "- see [[Catalog root]] and #tag\r\n".as_bytes().to_vec(),
+            ),
+        ],
+    );
+    let root = fixture.enrollment_root("promote-catalog-root");
+    let paths = PromotedPaths::new(&fixture, "catalog-root");
+    assert!(
+        fixture.verified.part_count() >= 2,
+        "the fixture must bind more than one cold record: {}",
+        fixture.verified.part_count()
+    );
+
+    // Every root bound by an accepted cold record, validated completely against
+    // a freshly opened durable catalog.
+    fn assert_every_bound_catalog_root_opens(fixture: &Fixture, label: &str) {
+        let catalog = fixture.archive().open_reference_catalog().unwrap();
+        let materials = fixture.prepared.engine_materials();
+        assert_eq!(materials.len(), fixture.verified.part_count() as usize);
+        let mut covered = 0;
+        for material in materials {
+            let bound = material.reference_catalog_root();
+            catalog
+                .validate_catalog_root(bound)
+                .unwrap_or_else(|error| {
+                    panic!("{label}: a bound bootstrap catalog root is not durable: {error}")
+                });
+            covered = covered.max(bound.source_count());
+        }
+        assert!(
+            covered > 0,
+            "{label}: the bootstrap covers reference sources"
+        );
+    }
+
+    // Before promotion: the inactive bootstrap's own bound roots.
+    assert_every_bound_catalog_root_opens(&fixture, "inactive bootstrap");
+
+    let session = SessionId::new();
+    let (mut authority, mut runtime) = promote(&mut fixture, &root, session, &paths);
+
+    // After promotion, and after the history advances past the bootstrap.
+    for seed in [0xA100_u128, 0xA200] {
+        append_local_batch(&fixture, &mut authority, &mut runtime, seed);
+    }
+    assert!(
+        runtime
+            .engine()
+            .durable_history_authority()
+            .unwrap()
+            .generation
+            > u64::from(fixture.verified.part_count())
+    );
+    let advanced = runtime.engine().reference_catalog_root().unwrap().clone();
+    drop(runtime);
+    drop(authority);
+
+    assert_every_bound_catalog_root_opens(&fixture, "promoted and advanced");
+    // The live advanced catalog root is durable too, from a fresh archive open.
+    fixture
+        .archive()
+        .open_reference_catalog()
+        .unwrap()
+        .validate_catalog_root(&advanced)
+        .expect("the advanced promoted catalog root opens from a fresh archive");
+    fixture.assert_graph_unchanged();
+}
+
+/// The promoted runtime token, its sealed promotion, and its mutation window
+/// are opaque: no clone, no serde, and no way to reconstruct one from bytes.
+#[test]
+fn promoted_runtime_values_cannot_be_cloned_serialized_or_deserialized() {
+    assert!(!Probe::<PromotedLocalRuntime>::CLONEABLE);
+    assert!(!SerdeProbe::<PromotedLocalRuntime>::SERIALIZABLE);
+    assert!(!DeserializeProbe::<PromotedLocalRuntime>::DESERIALIZABLE);
+    assert!(!Probe::<SealedRuntimePromotion>::CLONEABLE);
+    assert!(!SerdeProbe::<SealedRuntimePromotion>::SERIALIZABLE);
+    assert!(!DeserializeProbe::<SealedRuntimePromotion>::DESERIALIZABLE);
+    assert!(!Probe::<LocalRuntimeAdmission<'static>>::CLONEABLE);
+    assert!(!SerdeProbe::<LocalRuntimeAdmission<'static>>::SERIALIZABLE);
+    // The positive control proves the probe actually discriminates.
+    assert!(Probe::<ContentDigest>::CLONEABLE);
+    assert!(SerdeProbe::<ContentDigest>::SERIALIZABLE);
+}
+
+/// The pre-activation escape hatch can never authorize a promoted runtime.
+///
+/// It is `pub(crate)`, so no app or Tauri code can name it at all. This proves
+/// the second, structural fence: even from inside the crate it refuses a
+/// promoted engine, so a real activated user graph is only ever writable
+/// through the authority-plus-runtime admission.
+#[test]
+fn the_pre_activation_admission_refuses_a_promoted_runtime_engine() {
+    let mut fixture = Fixture::new(
+        "promote-hatch",
+        None,
+        vec![("pages/hatch.md".into(), b"- hatch\n".to_vec())],
+    );
+    let root = fixture.enrollment_root("promote-hatch");
+    let paths = PromotedPaths::new(&fixture, "hatch");
+    let (mut authority, mut runtime) = promote(&mut fixture, &root, SessionId::new(), &paths);
+
+    let hatch = LocalRuntimeAdmission::unenrolled_pre_activation();
+    assert!(
+        hatch.authorize(&fixture.graph, runtime.engine()).is_err(),
+        "the pre-activation hatch must never authorize a promoted runtime"
+    );
+
+    // An unpromoted fixture engine still passes, so the refusal is specific.
+    let unpromoted = fixture.runtime_engine("hatch-unpromoted");
+    assert!(hatch.authorize(&fixture.graph, &unpromoted).is_ok());
+
+    // The genuine promoted admission still works, and the refused hatch
+    // advanced no durable history.
+    let before = runtime.engine().durable_history_authority().unwrap();
+    append_local_batch(&fixture, &mut authority, &mut runtime, 0xA300);
+    assert_eq!(
+        runtime
+            .engine()
+            .durable_history_authority()
+            .unwrap()
+            .generation,
+        before.generation + 1
     );
     fixture.assert_graph_unchanged();
 }

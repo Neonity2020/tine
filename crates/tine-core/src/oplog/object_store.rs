@@ -51,9 +51,9 @@ use super::{
         MAX_BOOTSTRAP_PART_EVIDENCE_BYTES, MAX_PART_SPAN_INDEX_BYTES, MAX_SOURCE_BLOB_CHUNK_BYTES,
         MAX_SOURCE_INDEX_PAGE_BYTES,
     },
-    BatchError, BatchId, BatchOrigin, ContentDigest, LineageDigest, ObjectDescriptor,
-    OperationBatch, OperationObject, PreparedBatch, ValidatedBatch, WorkspaceId,
-    MAX_MANIFEST_BYTES, MAX_OBJECT_BYTES,
+    BatchError, BatchId, BatchOrigin, CanonicalArchiveResourceId, ContentDigest, DeviceId,
+    DocumentId, ImportId, LineageDigest, ObjectDescriptor, OperationBatch, OperationObject,
+    PreparedBatch, SessionId, ValidatedBatch, WorkspaceId, MAX_MANIFEST_BYTES, MAX_OBJECT_BYTES,
 };
 
 const OBJECTS_DIR: &str = "objects";
@@ -77,10 +77,18 @@ const ENGINE_HISTORY_HEAD_FILE: &str = "engine-history.head";
 const ENGINE_HISTORY_TRANSITION_LOCK_FILE: &str = "engine-history.transition.lock";
 const ENGINE_HISTORY_ROOT_SUFFIX: &str = ".history-root";
 const ENGINE_HISTORY_ROOT_SCHEMA_VERSION: u32 = 8;
+/// Device-local promoted-runtime state, published beside the endpoint's durable
+/// engine history.
+const PROMOTED_RUNTIME_STATE_FILE: &str = "promoted-runtime.state";
+/// The first honest promoted-runtime state format. No earlier experimental
+/// bytes were ever published, and any other value is rejected rather than
+/// reinterpreted.
+pub(crate) const PROMOTED_RUNTIME_STATE_SCHEMA_VERSION: u32 = 1;
+const MAX_PROMOTED_RUNTIME_STATE_BYTES: u64 = 4096;
 const MAX_ENGINE_HISTORY_RECORD_BYTES: u64 = 1024 * 1024;
 const MAX_ENGINE_HISTORY_INDEX_BYTES: u64 = 2 * 1024 * 1024;
 const ENGINE_HISTORY_INDEX_SCHEMA_VERSION: u32 = 1;
-const ENGINE_HISTORY_RADIX_DEPTH: u8 = 32;
+pub(crate) const ENGINE_HISTORY_RADIX_DEPTH: u8 = 32;
 #[cfg(test)]
 const BLOCK_CLAIM_INDEX_DIR: &str = "block-claim-index";
 const BLOCK_CLAIM_INDEX_FILE: &str = "pages.index";
@@ -352,6 +360,10 @@ pub(crate) struct DurableEngineHistoryStore {
     transition_lock: fs::File,
     transition: Mutex<()>,
     authoritative_head: Mutex<Option<ContentDigest>>,
+    /// Set only by [`Self::authorize_promoted_lineage`], which is reachable
+    /// only through [`ObjectStore::seal_promoted_projection`]. While it is
+    /// `None`, a bootstrap-bound history stays read-only.
+    promoted_lineage: Option<PromotedRuntimeStateV1>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -480,6 +492,128 @@ impl<'de> Deserialize<'de> for BootstrapAggregateHistoryBindingV1 {
             frontier,
         )
         .map_err(serde::de::Error::custom)
+    }
+}
+
+/// How a promoted runtime is authorized to extend one durable history.
+///
+/// Publishing an ordinary local batch onto a promoted history keeps the exact
+/// bootstrap aggregate binding the inactive publication installed, so every
+/// cold and every later record carries the identical binding. That homogeneous
+/// lineage is what this mode names and authorizes: the promoted state never
+/// reinterprets an inactive root as ordinary, and mixed record bindings remain
+/// unrepresentable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) enum PromotedLineageModeV1 {
+    BootstrapAnchoredHomogeneous,
+}
+
+/// The device-local durable promotion state for one enrolled endpoint.
+///
+/// This record is inert evidence, exactly like [`EngineHistoryBinding`]: it
+/// grants nothing by itself. Only [`DurableEngineHistoryStore::authorize_promoted_lineage`]
+/// — reached solely through [`ObjectStore::seal_promoted_projection`] — turns a
+/// durable state that authenticates the live archive, history, bootstrap
+/// aggregate, and enrollment identities into write authorization.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PromotedRuntimeStateV1 {
+    pub(crate) schema_version: u32,
+    pub(crate) lineage_mode: PromotedLineageModeV1,
+    pub(crate) workspace_id: WorkspaceId,
+    pub(crate) lineage_digest: LineageDigest,
+    pub(crate) catalog_document_id: DocumentId,
+    pub(crate) endpoint_id: super::ProjectionEndpointId,
+    pub(crate) device_id: DeviceId,
+    pub(crate) graph_resource_id: super::CanonicalGraphResourceId,
+    pub(crate) receipt_store_id: super::ProjectionReceiptStoreId,
+    /// The canonical archive resource claim `VerifiedLocal` enrolled.
+    pub(crate) archive_resource_id: CanonicalArchiveResourceId,
+    /// Binding digest of the physical archive control directory identity the
+    /// inactive accepted authority observed.
+    pub(crate) archive_control_binding: ContentDigest,
+    /// Exact bootstrap aggregate/publication identity of the anchored lineage.
+    pub(crate) bootstrap: BootstrapAggregateHistoryBindingV1,
+    pub(crate) bootstrap_import_id: ImportId,
+    /// The authenticated bootstrap history generation and radix index root that
+    /// every later promoted history must descend from.
+    pub(crate) anchor_history_generation: u64,
+    pub(crate) anchor_history_index_root: ContentDigest,
+    /// The accepted frontier the bootstrap published.
+    pub(crate) anchor_acceptance_sequence: u64,
+    pub(crate) anchor_accepted_frontier_state_digest: ContentDigest,
+    /// The original `LocalActive` verification digest and its enrollment
+    /// binding, so a promoted archive can never be adopted by another
+    /// enrollment.
+    pub(crate) enrollment_verification_digest: ContentDigest,
+    pub(crate) enrollment_binding_digest: ContentDigest,
+    /// The session that performed the one-time promotion.
+    pub(crate) promotion_session_id: SessionId,
+}
+
+impl PromotedRuntimeStateV1 {
+    pub(crate) fn validate(&self) -> Result<(), StoreError> {
+        if self.schema_version != PROMOTED_RUNTIME_STATE_SCHEMA_VERSION {
+            return Err(StoreError::UnsupportedPromotedRuntimeSchema(
+                self.schema_version,
+            ));
+        }
+        let parts = u64::from(self.bootstrap.part_count());
+        if self.bootstrap.final_frontier().accepted_count() != self.bootstrap.part_count() {
+            return Err(StoreError::PromotedRuntimeStateMismatch(
+                "bootstrap aggregate frontier does not cover its part count",
+            ));
+        }
+        if self.anchor_history_generation != parts || self.anchor_acceptance_sequence != parts {
+            return Err(StoreError::PromotedRuntimeStateMismatch(
+                "anchor generation and acceptance sequence must equal the bootstrap part count",
+            ));
+        }
+        if (self.bootstrap.part_count() == 0)
+            != (self.anchor_history_index_root == EngineHistoryStore::empty_root())
+        {
+            return Err(StoreError::PromotedRuntimeStateMismatch(
+                "anchor index root does not agree with the bootstrap part count",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn encode(&self) -> Result<Vec<u8>, StoreError> {
+        self.validate()?;
+        let bytes =
+            postcard::to_allocvec(self).map_err(|_| StoreError::MalformedPromotedRuntimeState)?;
+        if bytes.len() as u64 > MAX_PROMOTED_RUNTIME_STATE_BYTES {
+            return Err(StoreError::MalformedPromotedRuntimeState);
+        }
+        Ok(bytes)
+    }
+
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, StoreError> {
+        let state = postcard::from_bytes::<Self>(bytes)
+            .map_err(|_| StoreError::MalformedPromotedRuntimeState)?;
+        state.validate()?;
+        // Reject any residue that decodes but is not the exact canonical
+        // encoding of what it decoded to.
+        if postcard::to_allocvec(&state).map_err(|_| StoreError::MalformedPromotedRuntimeState)?
+            != bytes
+        {
+            return Err(StoreError::MalformedPromotedRuntimeState);
+        }
+        Ok(state)
+    }
+
+    pub(crate) const fn bootstrap(&self) -> BootstrapAggregateHistoryBindingV1 {
+        self.bootstrap
+    }
+
+    /// The authenticated bootstrap anchor every promoted history transition is
+    /// proved from.
+    pub(crate) const fn anchor_authority(&self) -> EngineHistoryAuthority {
+        EngineHistoryAuthority {
+            generation: self.anchor_history_generation,
+            index_root: self.anchor_history_index_root,
+        }
     }
 }
 
@@ -657,6 +791,30 @@ pub(crate) struct BlockClaimIndexStore {
     counters: Arc<StoreCounters>,
 }
 
+impl BlockClaimIndexStore {
+    /// A run-local block-claim point index over a caller-owned scratch store.
+    ///
+    /// The block-claim root is reconstructible run-local derived state — no
+    /// accepted cold record binds it — so it belongs in whichever scratch run
+    /// owns the engine. Detached bootstrap authoring owns its own disposable
+    /// scratch run rather than the archive's, and builds its point index the
+    /// same way an enrolled engine does instead of falling back to the bounded
+    /// in-memory test map, whose fixed capacity would otherwise cap an
+    /// importable graph at a few thousand blocks.
+    pub(crate) fn for_scratch(
+        scratch: &super::scratch_store::ScratchStore,
+    ) -> Result<Self, StoreError> {
+        Ok(Self {
+            file: Mutex::new(
+                scratch
+                    .clone_pages_file()
+                    .map_err(|error| StoreError::Scratch(error.to_string()))?,
+            ),
+            counters: Arc::new(StoreCounters::default()),
+        })
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub(crate) struct BlockClaimIndexValue(SmallVec<[u8; 64]>);
@@ -791,6 +949,59 @@ impl LoadedBootstrapPartV1 {
 
     pub(crate) fn spans(&self) -> &BootstrapPartSpanIndexV1 {
         &self.spans
+    }
+}
+
+/// The durable authenticated index capabilities of one exact archive, for
+/// detached bootstrap authoring and replay.
+///
+/// Every accepted bootstrap cold record binds four authenticated roots — the
+/// portable-path root, the page-name ownership root, the external UUID-claim
+/// root, and the reference-catalog root. Each has exactly one construction:
+/// the archive's durable authenticated Patricia stores. A detached session that
+/// used the run-local ephemeral backends instead would bind roots the promoted
+/// runtime's durable stores can never open, so authoring takes this capability
+/// over the archive the bootstrap is installed into and promoted from.
+///
+/// It carries nothing else: no object, manifest, engine-history,
+/// projection-work, enrollment, scratch, or graph authority. Everything it
+/// publishes is immutable and content-addressed, so a discarded preparation
+/// leaves only unreachable nodes, never mutable archive state.
+#[derive(Clone, Debug)]
+pub(crate) struct BootstrapAuthoringCapability {
+    workspace_id: WorkspaceId,
+    archive_identity: ControlDirectoryIdentity,
+    reference_catalog: Arc<super::reference_catalog::ReferenceCatalogStore>,
+    portable_path_index: Arc<super::portable_path_index::PortablePathIndexStore>,
+    logseq_claim_index: Arc<super::uuid_claim_index::LogseqClaimIndexStore>,
+    page_name_index: Arc<super::page_name_index::PageNameOwnershipStore>,
+}
+
+impl BootstrapAuthoringCapability {
+    pub(crate) const fn workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
+    }
+
+    pub(crate) const fn archive_identity(&self) -> ControlDirectoryIdentity {
+        self.archive_identity
+    }
+
+    pub(crate) fn reference_catalog(&self) -> Arc<super::reference_catalog::ReferenceCatalogStore> {
+        Arc::clone(&self.reference_catalog)
+    }
+
+    pub(crate) fn portable_path_index(
+        &self,
+    ) -> Arc<super::portable_path_index::PortablePathIndexStore> {
+        Arc::clone(&self.portable_path_index)
+    }
+
+    pub(crate) fn logseq_claim_index(&self) -> Arc<super::uuid_claim_index::LogseqClaimIndexStore> {
+        Arc::clone(&self.logseq_claim_index)
+    }
+
+    pub(crate) fn page_name_index(&self) -> Arc<super::page_name_index::PageNameOwnershipStore> {
+        Arc::clone(&self.page_name_index)
     }
 }
 
@@ -1417,7 +1628,7 @@ impl ObjectStore {
         self,
         binding: super::hot_engine::ProjectionStorageBinding,
     ) -> Result<EnrolledProjectionOpen, (Self, StoreError)> {
-        let mut history = match self.seal_existing_engine_history(binding) {
+        let history = match self.seal_existing_engine_history(binding) {
             Ok(history) => history,
             Err(error) => return Err((self, error)),
         };
@@ -1427,7 +1638,61 @@ impl ObjectStore {
                 Ok(None) => {}
                 Err(error) => return Err((self, error)),
             }
+            // A promoted archive is never an ordinary enrolled archive. Refusing
+            // here keeps a promoted lineage from being silently reinterpreted as
+            // an unanchored ordinary history.
+            match history.read_promoted_runtime_state() {
+                Ok(None) => {}
+                Ok(Some(_)) => {
+                    return Err((
+                        self,
+                        StoreError::PromotedRuntimeStateMismatch(
+                            "ordinary enrolled open cannot consume a promoted runtime archive",
+                        ),
+                    ));
+                }
+                Err(error) => return Err((self, error)),
+            }
         }
+        self.finish_sealing_projection(binding, history)
+    }
+
+    /// Seal the enrolled projection controls for a promoted bootstrap-anchored
+    /// runtime.
+    ///
+    /// This is the only construction that opens a bootstrap-bound durable
+    /// history as a writable runtime. It requires an already published durable
+    /// promotion state that is byte-equal to `expected`, claims this exact
+    /// endpoint, and still binds the live authoritative root's bootstrap
+    /// aggregate.
+    pub(crate) fn seal_promoted_projection(
+        self,
+        binding: super::hot_engine::ProjectionStorageBinding,
+        expected: &PromotedRuntimeStateV1,
+    ) -> Result<EnrolledProjectionOpen, (Self, StoreError)> {
+        let mut history = match self.seal_existing_engine_history(binding) {
+            Ok(history) => history,
+            Err(error) => return Err((self, error)),
+        };
+        let SealedControl::Existing(existing) = &mut history else {
+            return Err((
+                self,
+                StoreError::PromotedRuntimeStateMismatch(
+                    "promoted runtime open requires an existing durable bootstrap history",
+                ),
+            ));
+        };
+        if let Err(error) = existing.authorize_promoted_lineage(expected) {
+            return Err((self, error));
+        }
+        self.finish_sealing_projection(binding, history)
+    }
+
+    fn finish_sealing_projection(
+        self,
+        binding: super::hot_engine::ProjectionStorageBinding,
+        mut history: SealedControl<DurableEngineHistoryStore>,
+    ) -> Result<EnrolledProjectionOpen, (Self, StoreError)> {
         let mut work = match self.seal_existing_projection_work(binding) {
             Ok(work) => work,
             Err(error) => return Err((self, error)),
@@ -1744,6 +2009,28 @@ impl ObjectStore {
             open_dir_nofollow(&catalog, "nodes")?,
             open_dir_nofollow(&catalog, "postings")?,
         ))
+    }
+
+    /// Mint the durable authenticated index capability detached bootstrap
+    /// authoring and replay build their bound roots against.
+    ///
+    /// The bootstrap is authored detached from every runtime authority, but its
+    /// accepted cold records bind this archive's authenticated portable-path,
+    /// page-name, external UUID-claim, and reference-catalog roots. Handing
+    /// authoring an explicit capability over *this* archive is what makes the
+    /// promoted runtime later able to open the very roots its own bootstrap
+    /// history names.
+    pub(crate) fn bootstrap_authoring_capability(
+        &self,
+    ) -> Result<BootstrapAuthoringCapability, StoreError> {
+        Ok(BootstrapAuthoringCapability {
+            workspace_id: self.workspace_id,
+            archive_identity: self.canonical_archive_identity()?,
+            reference_catalog: Arc::new(self.open_reference_catalog()?),
+            portable_path_index: Arc::new(self.open_portable_path_index()?),
+            logseq_claim_index: Arc::new(self.open_logseq_claim_index()?),
+            page_name_index: Arc::new(self.open_page_name_ownership_index()?),
+        })
     }
 
     #[cfg(test)]
@@ -3318,6 +3605,7 @@ impl DurableEngineHistoryStore {
             transition_lock,
             transition: Mutex::new(()),
             authoritative_head: Mutex::new(None),
+            promoted_lineage: None,
         };
         let (digest, root) = store.read_live_head_root()?;
         store.require_root_binding(&root)?;
@@ -3349,6 +3637,7 @@ impl DurableEngineHistoryStore {
             transition_lock,
             transition: Mutex::new(()),
             authoritative_head: Mutex::new(None),
+            promoted_lineage: None,
         };
         store.initialize()?;
         Ok(store)
@@ -3512,6 +3801,133 @@ impl DurableEngineHistoryStore {
         self.history_record_count(root.index_root, 0)
     }
 
+    /// Read the device-local promoted-runtime state, if one was ever published.
+    ///
+    /// A present state must decode canonically at the supported schema version
+    /// and must claim exactly this endpoint. Truncated, foreign, or divergent
+    /// residue fails closed instead of being repaired.
+    pub(crate) fn read_promoted_runtime_state(
+        &self,
+    ) -> Result<Option<PromotedRuntimeStateV1>, StoreError> {
+        let Some(bytes) = read_optional_regular(
+            &self.control,
+            PROMOTED_RUNTIME_STATE_FILE,
+            MAX_PROMOTED_RUNTIME_STATE_BYTES,
+            None,
+        )?
+        else {
+            return Ok(None);
+        };
+        let state = PromotedRuntimeStateV1::decode(&bytes)?;
+        self.require_promoted_state_endpoint(&state)?;
+        Ok(Some(state))
+    }
+
+    fn require_promoted_state_endpoint(
+        &self,
+        state: &PromotedRuntimeStateV1,
+    ) -> Result<(), StoreError> {
+        if state.workspace_id != self.workspace_id
+            || state.endpoint_id != self.endpoint_id
+            || state.graph_resource_id != self.graph_resource_id
+            || state.receipt_store_id != self.receipt_store_id
+        {
+            return Err(StoreError::PromotedRuntimeStateMismatch(
+                "promoted runtime state is bound to another endpoint",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Publish the one-time promoted-runtime state for this endpoint.
+    ///
+    /// The publication is a single immutable exact file, so every crash cut
+    /// reopens as either the unchanged inactive bootstrap (no file) or the one
+    /// exact resumable promoted state (complete file). Repeating the call with
+    /// byte-identical state resumes; any divergent competing promotion fails
+    /// closed and preserves the committed state as evidence.
+    pub(crate) fn publish_promoted_runtime_state(
+        &self,
+        state: &PromotedRuntimeStateV1,
+    ) -> Result<(), StoreError> {
+        let _guard = self
+            .transition
+            .lock()
+            .map_err(|_| StoreError::MalformedHistoryIndex)?;
+        let _workspace_guard = AdvisoryTransitionGuard::lock(&self.transition_lock)?;
+        state.validate()?;
+        self.require_promoted_state_endpoint(state)?;
+        if let Some(existing) = self.read_promoted_runtime_state()? {
+            return if &existing == state {
+                Ok(())
+            } else {
+                Err(StoreError::CompetingRuntimePromotion)
+            };
+        }
+        let (_, root) = self.read_live_head_root()?;
+        match root.binding.bootstrap {
+            Some(bootstrap) if bootstrap == state.bootstrap => {}
+            _ => {
+                return Err(StoreError::PromotedRuntimeStateMismatch(
+                    "promoted runtime state does not bind this durable history's bootstrap aggregate",
+                ));
+            }
+        }
+        if root.generation != state.anchor_history_generation
+            || root.index_root != state.anchor_history_index_root
+        {
+            return Err(StoreError::PromotedRuntimeStateMismatch(
+                "first promotion requires the exact unadvanced bootstrap history anchor",
+            ));
+        }
+        let bytes = state.encode()?;
+        publish_immutable_exact(
+            &self.control,
+            PROMOTED_RUNTIME_STATE_FILE,
+            &bytes,
+            "promoted runtime state",
+        )
+    }
+
+    /// Turn a durable promoted-runtime state into live write authorization for
+    /// this exact bootstrap-anchored lineage.
+    ///
+    /// This is the only path that unfences a bootstrap-bound durable history.
+    /// It requires the caller's expected state to be byte-equal to the durable
+    /// state, that state to claim this endpoint, and the live authoritative
+    /// root to still carry the exact same bootstrap aggregate binding.
+    pub(crate) fn authorize_promoted_lineage(
+        &mut self,
+        expected: &PromotedRuntimeStateV1,
+    ) -> Result<(), StoreError> {
+        expected.validate()?;
+        self.require_promoted_state_endpoint(expected)?;
+        let durable = self
+            .read_promoted_runtime_state()?
+            .ok_or(StoreError::PromotedRuntimeStateAbsent)?;
+        if &durable != expected {
+            return Err(StoreError::PromotedRuntimeStateMismatch(
+                "durable promoted runtime state is not the authorized state",
+            ));
+        }
+        let (_, root) = self.read_live_head_root()?;
+        match root.binding.bootstrap {
+            Some(bootstrap) if bootstrap == durable.bootstrap => {}
+            _ => {
+                return Err(StoreError::PromotedRuntimeStateMismatch(
+                    "durable history bootstrap binding is not the promoted lineage",
+                ));
+            }
+        }
+        self.promoted_lineage = Some(durable);
+        Ok(())
+    }
+
+    /// The promoted lineage this open authorized, if any.
+    pub(crate) const fn promoted_lineage(&self) -> Option<&PromotedRuntimeStateV1> {
+        self.promoted_lineage.as_ref()
+    }
+
     fn validate_sealed_open(&self) -> Result<(), StoreError> {
         let claim = read_optional_regular(&self.control, ENGINE_HISTORY_CLAIM_FILE, 256, None)?
             .ok_or(StoreError::MalformedHistoryIndex)?;
@@ -3531,7 +3947,26 @@ impl DurableEngineHistoryStore {
         if live != expected {
             return Err(StoreError::MalformedHistoryIndex);
         }
-        self.require_root_binding(&root)
+        self.require_root_binding(&root)?;
+        // A promoted open stays authorized only while the exact durable
+        // promotion state and the exact bootstrap-anchored root binding are
+        // both still committed.
+        if let Some(authorized) = &self.promoted_lineage {
+            match self.read_promoted_runtime_state()? {
+                Some(live_state) if &live_state == authorized => {}
+                _ => {
+                    return Err(StoreError::PromotedRuntimeStateMismatch(
+                        "promoted runtime state changed while the enrolled open was sealed",
+                    ));
+                }
+            }
+            if root.binding.bootstrap != Some(authorized.bootstrap) {
+                return Err(StoreError::PromotedRuntimeStateMismatch(
+                    "promoted durable history is no longer the authorized bootstrap lineage",
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn lookup(
@@ -3565,8 +4000,15 @@ impl DurableEngineHistoryStore {
             .map_err(|_| StoreError::MalformedHistoryIndex)?;
         let _workspace_guard = AdvisoryTransitionGuard::lock(&self.transition_lock)?;
         let (before_digest, before) = self.load_head_root()?;
-        if before.binding.bootstrap.is_some() {
-            return Err(StoreError::InactiveBootstrapHistory);
+        // An inactive bootstrap history is read-only. A promoted open may extend
+        // exactly the bootstrap lineage its durable promotion state authorized,
+        // and the successor below carries that identical binding forward, so the
+        // promoted history stays one homogeneous bootstrap-anchored lineage.
+        if let Some(bootstrap) = before.binding.bootstrap {
+            match &self.promoted_lineage {
+                Some(authorized) if authorized.bootstrap == bootstrap => {}
+                _ => return Err(StoreError::InactiveBootstrapHistory),
+            }
         }
         let index_root = self.index.insert(before.index_root, batch_id, bytes)?;
         if index_root == before.index_root {
@@ -3849,11 +4291,19 @@ fn validate_engine_history_root(
         || root.receipt_store_id != receipt_store_id
         || root.binding.engine.portable_path_key_version != super::PORTABLE_PATH_KEY_VERSION
         || (root.generation == 0) != root.latest_batch_id.is_none()
+        // A bootstrap-anchored root's generation may never be behind the parts
+        // its aggregate installed. It is *equal* while the bootstrap is still
+        // inactive, and grows past it once a promoted runtime extends the same
+        // lineage. Exact-equality remains enforced where it is the actual
+        // requirement: bootstrap installation, inactive accepted-authority
+        // reopen, and the first promotion's unadvanced-anchor gate. Ordinary
+        // enrolled opens refuse every bootstrap-anchored history outright, and
+        // `publish` refuses to extend one without an authorized promoted
+        // lineage, so a relaxed root shape grants no write path.
         || root.binding.bootstrap.is_some_and(|binding| {
-            u64::from(binding.part_count()) != root.generation
+            u64::from(binding.part_count()) > root.generation
                 || binding.final_frontier().accepted_count() != binding.part_count()
-                || (binding.part_count() == 0
-                    && root.binding.engine != EngineHistoryBinding::empty())
+                || (root.generation == 0 && root.binding.engine != EngineHistoryBinding::empty())
         })
         || root
             .binding
@@ -4388,6 +4838,11 @@ pub enum StoreError {
     BootstrapBatchRequiresDirectPublication,
     BootstrapHistoryRequiresEmptyAuthority,
     InactiveBootstrapHistory,
+    PromotedRuntimeStateAbsent,
+    PromotedRuntimeStateMismatch(&'static str),
+    MalformedPromotedRuntimeState,
+    UnsupportedPromotedRuntimeSchema(u32),
+    CompetingRuntimePromotion,
     StoredLengthMismatch {
         path: String,
         expected: u64,
@@ -4533,6 +4988,22 @@ impl fmt::Display for StoreError {
             Self::InactiveBootstrapHistory => {
                 f.write_str("inactive bootstrap history cannot be opened as ordinary runtime")
             }
+            Self::PromotedRuntimeStateAbsent => {
+                f.write_str("no durable promoted runtime state authorizes this archive")
+            }
+            Self::PromotedRuntimeStateMismatch(detail) => {
+                write!(f, "promoted runtime state mismatch: {detail}")
+            }
+            Self::MalformedPromotedRuntimeState => {
+                f.write_str("promoted runtime state is malformed, truncated, or non-canonical")
+            }
+            Self::UnsupportedPromotedRuntimeSchema(version) => write!(
+                f,
+                "unsupported promoted runtime state schema version {version}"
+            ),
+            Self::CompetingRuntimePromotion => f.write_str(
+                "a different promoted runtime state is already committed for this archive",
+            ),
             Self::StoredLengthMismatch {
                 path,
                 expected,

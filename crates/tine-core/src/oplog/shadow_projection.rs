@@ -2732,6 +2732,10 @@ mod tests {
                 LineageDigest::of(b"inactive-shadow-projection-test"),
                 DocumentId::from_uuid(Uuid::from_u128(0x8101)),
                 ReferenceCatalogPolicyV1::default(),
+                &ObjectStore::open(&root.path().join("archive"), workspace)
+                    .unwrap()
+                    .bootstrap_authoring_capability()
+                    .unwrap(),
                 &preparation_root,
             )
             .unwrap();
