@@ -3509,6 +3509,23 @@ pub struct ShardedHotEngine {
     external_publication_failure_index: Option<usize>,
     #[cfg(test)]
     pending_author_fast_path_attempts: usize,
+    #[cfg(test)]
+    author_generation_root_probe: Cell<AuthorGenerationRootProbe>,
+}
+
+/// Deterministic instrumentation for the author staleness token. `calls`
+/// counts invocations, `bytes_hashed` is the exact canonical byte length that
+/// call digested, `folded_fingerprints` is how many archive fingerprints it
+/// serialized, and `resident_fingerprints` is the retained map cardinality.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct AuthorGenerationRootProbe {
+    calls: usize,
+    bytes_hashed: usize,
+    scratch_roots_bytes: usize,
+    document_head_bytes: usize,
+    folded_fingerprints: usize,
+    resident_fingerprints: usize,
 }
 
 impl fmt::Debug for ShardedHotEngine {
@@ -3619,6 +3636,8 @@ impl ShardedHotEngine {
             external_publication_failure_index: None,
             #[cfg(test)]
             pending_author_fast_path_attempts: 0,
+            #[cfg(test)]
+            author_generation_root_probe: Cell::new(AuthorGenerationRootProbe::default()),
         }
     }
 
@@ -8724,6 +8743,8 @@ impl ShardedHotEngine {
     fn author_generation_root(&self) -> Result<ContentDigest, EngineError> {
         let mut bytes = postcard::to_allocvec(&self.scratch_roots)
             .map_err(|error| EngineError::Archive(error.to_string()))?;
+        #[cfg(test)]
+        let scratch_roots_bytes = bytes.len();
         bytes.extend_from_slice(&super::PORTABLE_PATH_KEY_VERSION.to_be_bytes());
         bytes.extend_from_slice(self.portable_path_root.digest().as_bytes());
         bytes.extend_from_slice(
@@ -8742,17 +8763,70 @@ impl ShardedHotEngine {
         );
         bytes.extend_from_slice(&self.history_generation.to_be_bytes());
         bytes.extend_from_slice(self.history_root.as_bytes());
+        #[cfg(test)]
+        let before_heads = bytes.len();
         for (document_id, heads) in &self.visible_document_heads {
             bytes.extend_from_slice(document_id.as_uuid().as_bytes());
             for head in heads {
                 bytes.extend_from_slice(head.as_uuid().as_bytes());
             }
         }
+        #[cfg(test)]
+        let document_head_bytes = bytes.len() - before_heads;
+        // Every accepted BatchId -> manifest/event binding is already committed
+        // by the incrementally maintained authenticated accepted batch map: its
+        // keys are accepted batch ids and its values are causal record digests
+        // that bind each accepted manifest fingerprint. Folding that one root
+        // digest keeps the token complete over accepted state at O(1) cost,
+        // instead of re-serializing every accepted fingerprint on each draft,
+        // capture and finalize.
+        bytes.extend_from_slice(
+            self.accepted_frontier_root
+                .batch_map_root_digest()
+                .as_bytes(),
+        );
+        // Only fingerprints the accepted batch map does not commit still need
+        // an explicit fold. Staged, quarantined and rejected residency is
+        // bounded by the staged/tail limits, so this stays independent of the
+        // total number of accepted batches.
+        #[cfg(test)]
+        let mut folded_fingerprints = 0usize;
         for (batch_id, fingerprint) in &self.archive_fingerprints {
+            if matches!(
+                self.statuses.get(batch_id),
+                Some(ArchiveStatus::Accepted { .. })
+            ) {
+                continue;
+            }
+            #[cfg(test)]
+            {
+                folded_fingerprints += 1;
+            }
             bytes.extend_from_slice(batch_id.as_uuid().as_bytes());
             bytes.extend_from_slice(fingerprint.as_bytes());
         }
+        #[cfg(test)]
+        {
+            let probe = self.author_generation_root_probe.get();
+            self.author_generation_root_probe
+                .set(AuthorGenerationRootProbe {
+                    calls: probe.calls.saturating_add(1),
+                    bytes_hashed: bytes.len(),
+                    scratch_roots_bytes,
+                    document_head_bytes,
+                    folded_fingerprints,
+                    resident_fingerprints: self.archive_fingerprints.len(),
+                });
+        }
         Ok(ContentDigest::of(&bytes))
+    }
+
+    /// Deterministic residency/work counters for the last
+    /// `author_generation_root` call. Cardinality and byte counts only; no
+    /// wall-clock measurement participates in any gate.
+    #[cfg(test)]
+    fn author_generation_root_probe(&self) -> AuthorGenerationRootProbe {
+        self.author_generation_root_probe.get()
     }
 
     fn catalog_checkpoint_binding(&self) -> ContentDigest {
@@ -20861,6 +20935,49 @@ mod validation_tests {
         fn graph_path(&self, path: &ManagedPath) -> std::path::PathBuf {
             self.root.join("graph").join(path.as_str())
         }
+
+        /// Drive one complete ordinary local authoring cycle — draft, capture,
+        /// finalize, publish, accept, project — exactly as the enrolled runtime
+        /// does, and return the accepted batch id.
+        fn author_accepted_round(&mut self, seed: u128, content: &str) -> BatchId {
+            let draft = self.draft_edits(seed, &[(0, content)]);
+            let captured = match self
+                .engine
+                .capture_local_author_transaction(draft, &self.graph, &self.receipts, self.endpoint)
+                .unwrap()
+            {
+                LocalAuthorCapture::Captured(captured) => captured,
+                LocalAuthorCapture::ReconciliationNeeded(_) => {
+                    panic!("undisturbed local round unexpectedly requires reconciliation")
+                }
+            };
+            let prepared = self
+                .engine
+                .finalize_captured_author_transaction(captured, &self.receipts)
+                .unwrap();
+            let batch_id = prepared.manifest().batch_id();
+            self.writer.publish_prepared(&prepared).unwrap();
+            let disposition = self
+                .engine
+                .stage_archive_batch(batch_id)
+                .unwrap()
+                .disposition()
+                .clone();
+            assert!(
+                matches!(disposition, BatchDisposition::Accepted { .. }),
+                "seed {seed} did not accept: {disposition:?}"
+            );
+            let current = std::fs::read(self.graph_path(&self.pages[0].3)).unwrap();
+            crate::oplog::write_projection_exact(
+                &self.graph,
+                &self.receipts,
+                &self.engine,
+                self.pages[0].0,
+                Some(&current),
+            )
+            .unwrap();
+            batch_id
+        }
     }
 
     fn preauthor_gate_fixture(seed: u128) -> PreauthorGateFixture {
@@ -29186,6 +29303,377 @@ mod validation_tests {
                     && matches!(status, BatchDisposition::Rejected { .. })
             }));
         drop(engine);
+        drop(writer);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Accepted fingerprint residency must not enter the author staleness
+    /// token's hashed bytes at any cardinality. The accepted BatchId ->
+    /// manifest/event bindings are committed once by the incremental
+    /// `batch_map_root_digest`, so 1, 1,000 and 10,000 resident accepted
+    /// fingerprints all hash exactly the same number of bytes. The same
+    /// cardinality of *non-accepted* fingerprints must still be folded, which
+    /// is what makes this an exclusion by status rather than a blanket drop.
+    #[test]
+    fn accepted_fingerprint_cardinality_never_changes_author_token_work() {
+        let fixture = preauthor_gate_fixture(97_700);
+        let accepted_batch_id = fixture
+            .writer
+            .committed_manifests()
+            .unwrap()
+            .first()
+            .expect("the fixture published one accepted batch")
+            .batch_id();
+        let accepted_status = ArchiveStatus::Accepted {
+            no_op: false,
+            evidence: fixture
+                .engine
+                .accepted_batch_evidence(accepted_batch_id)
+                .unwrap(),
+        };
+        let workspace = fixture.engine.workspace_id();
+        let lineage = fixture.engine.lineage_digest;
+        let catalog = fixture.engine.catalog_document_id;
+
+        let measure = |size: usize, status: &ArchiveStatus| -> AuthorGenerationRootProbe {
+            let mut engine = ShardedHotEngine::new(workspace, lineage, catalog);
+            for index in 0..size {
+                let batch_id = BatchId::from_uuid(Uuid::from_u128(1_000_000 + index as u128));
+                engine
+                    .archive_fingerprints
+                    .insert(batch_id, ContentDigest::of(&(index as u64).to_be_bytes()));
+                engine.statuses.insert(batch_id, status.clone());
+            }
+            engine.author_generation_root().unwrap();
+            engine.author_generation_root_probe()
+        };
+
+        let empty = measure(0, &accepted_status);
+        assert_eq!(empty.folded_fingerprints, 0);
+        assert_eq!(empty.resident_fingerprints, 0);
+
+        for size in [1usize, 1_000, 10_000] {
+            let accepted = measure(size, &accepted_status);
+            assert_eq!(
+                accepted.resident_fingerprints, size,
+                "{size} accepted fingerprints must stay measurable"
+            );
+            assert_eq!(
+                accepted.folded_fingerprints, 0,
+                "{size} accepted fingerprints must not be folded"
+            );
+            assert_eq!(
+                accepted.bytes_hashed, empty.bytes_hashed,
+                "{size} accepted fingerprints changed the hashed byte count"
+            );
+
+            let staged = measure(size, &ArchiveStatus::Staged);
+            assert_eq!(staged.folded_fingerprints, size);
+            assert_eq!(
+                staged.bytes_hashed,
+                empty.bytes_hashed + size * (16 + ContentDigest::of(b"").as_bytes().len()),
+                "{size} staged fingerprints must still be folded exactly once each"
+            );
+        }
+
+        finish_preauthor_gate_fixture(fixture);
+    }
+
+    /// Ordinary accepted authoring is the hot path. Every accepted batch must
+    /// leave zero retained fingerprint state and must not grow the per-call
+    /// author-token work, while still advancing the token itself so no stale
+    /// draft can survive an acceptance.
+    ///
+    /// The one component this function does not assemble itself is the
+    /// canonical `ScratchRoots` encoding. Its length oscillates with radix
+    /// structure and widens by a varint byte as counters cross a decade; a
+    /// 24-round local run stayed inside a 1,610-byte band with a repeating
+    /// period and no cumulative trend, so it is asserted as bounded rather
+    /// than constant. Everything the token appends after it is exactly flat.
+    #[test]
+    fn ordinary_accepted_authoring_keeps_author_token_work_flat() {
+        const SCRATCH_ROOT_JITTER_BOUND: usize = 2_048;
+        let mut fixture = preauthor_gate_fixture(97_800);
+        let mut probes = Vec::new();
+        let mut tokens = Vec::new();
+        for round in 0..8u128 {
+            let before = fixture.engine.author_generation_root().unwrap();
+            fixture.author_accepted_round(97_900 + round * 100, &format!("flat {round}"));
+            let after = fixture.engine.author_generation_root().unwrap();
+            let probe = fixture.engine.author_generation_root_probe();
+            assert_eq!(
+                probe.resident_fingerprints, 0,
+                "round {round} retained accepted fingerprint state"
+            );
+            assert_eq!(
+                probe.folded_fingerprints, 0,
+                "round {round} folded an accepted fingerprint into the token"
+            );
+            assert_ne!(
+                before, after,
+                "round {round} acceptance did not advance the author staleness token"
+            );
+            probes.push(probe);
+            tokens.push(after);
+        }
+
+        let appended: Vec<usize> = probes
+            .iter()
+            .map(|probe| probe.bytes_hashed - probe.scratch_roots_bytes)
+            .collect();
+        assert!(
+            appended.windows(2).all(|pair| pair[0] == pair[1]),
+            "author token bytes appended per call grew with accepted batches: {appended:?}"
+        );
+        let head_bytes: Vec<usize> = probes
+            .iter()
+            .map(|probe| probe.document_head_bytes)
+            .collect();
+        assert!(
+            head_bytes.windows(2).all(|pair| pair[0] == pair[1]),
+            "visible document head bytes changed across accepted batches: {head_bytes:?}"
+        );
+        let roots: Vec<usize> = probes
+            .iter()
+            .map(|probe| probe.scratch_roots_bytes)
+            .collect();
+        let low = *roots.iter().min().expect("one measured round");
+        let high = *roots.iter().max().expect("one measured round");
+        assert!(
+            high - low <= SCRATCH_ROOT_JITTER_BOUND,
+            "canonical scratch-root bytes are not bounded across accepted batches: {roots:?}"
+        );
+        assert_eq!(
+            tokens.iter().collect::<BTreeSet<_>>().len(),
+            tokens.len(),
+            "each acceptance must produce a distinct staleness token"
+        );
+        finish_preauthor_gate_fixture(fixture);
+    }
+
+    /// A single staged, not-yet-accepted fingerprint is exactly the state the
+    /// accepted batch map does not commit. It must still move the token, stay
+    /// folded and stay retained until it reaches acceptance.
+    #[test]
+    fn one_staged_fingerprint_still_moves_and_is_retained_by_the_author_token() {
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(97_600));
+        let lineage = LineageDigest::of(b"staged-author-token");
+        let catalog = DocumentId::from_uuid(Uuid::from_u128(97_601));
+        let page = PageId::from_uuid(Uuid::from_u128(97_602));
+        let home = DocumentId::from_uuid(Uuid::from_u128(97_603));
+        let block = BlockId::from_uuid(Uuid::from_u128(97_604));
+
+        let mut author = ShardedHotEngine::new(workspace, lineage, catalog);
+        let genesis = author
+            .prepare_bootstrap_transaction(
+                test_author(97_610, 97_610),
+                &OperationTransaction::new(vec![SemanticOperation::CreatePage {
+                    page_id: page,
+                    home_document_id: home,
+                    name: crate::oplog::LogicalPageName::parse("Staged Token").unwrap(),
+                    path: ManagedPath::parse("pages/staged-token.md").unwrap(),
+                    kind: ManagedTextKind::Page,
+                }])
+                .unwrap(),
+            )
+            .unwrap();
+        let genesis = ValidatedBatch::new(genesis);
+        assert!(matches!(
+            author.stage_ready(genesis.clone()).disposition(),
+            BatchDisposition::Accepted { .. }
+        ));
+        let first = author
+            .prepare_bootstrap_transaction(
+                test_author(97_620, 97_620),
+                &OperationTransaction::new(vec![SemanticOperation::CreateBlock {
+                    block: BlockLocation {
+                        block_id: block,
+                        home_document_id: home,
+                    },
+                    page_id: page,
+                    parent: None,
+                    order: "a".into(),
+                    content: "first".into(),
+                }])
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(matches!(
+            author
+                .stage_ready(ValidatedBatch::new(first.clone()))
+                .disposition(),
+            BatchDisposition::Accepted { .. }
+        ));
+        let second = author
+            .prepare_bootstrap_transaction(
+                test_author(97_630, 97_630),
+                &OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
+                    block: BlockLocation {
+                        block_id: block,
+                        home_document_id: home,
+                    },
+                    content: "second".into(),
+                }])
+                .unwrap(),
+            )
+            .unwrap();
+        let second_id = second.manifest().batch_id();
+
+        let mut receiver = ShardedHotEngine::new(workspace, lineage, catalog);
+        assert!(matches!(
+            receiver.stage_ready(genesis).disposition(),
+            BatchDisposition::Accepted { .. }
+        ));
+        let baseline_token = receiver.author_generation_root().unwrap();
+        let baseline = receiver.author_generation_root_probe();
+        assert_eq!(baseline.folded_fingerprints, 0);
+
+        // Out-of-order delivery leaves exactly one staged fingerprint.
+        assert!(matches!(
+            receiver
+                .stage_ready(ValidatedBatch::new(second))
+                .disposition(),
+            BatchDisposition::IncompleteStaged { .. }
+        ));
+        assert!(receiver.archive_fingerprints.contains_key(&second_id));
+        assert!(matches!(
+            receiver.statuses.get(&second_id),
+            Some(ArchiveStatus::Staged)
+        ));
+        let staged_token = receiver.author_generation_root().unwrap();
+        let staged = receiver.author_generation_root_probe();
+        assert_ne!(
+            staged_token, baseline_token,
+            "a staged fingerprint must still move the author staleness token"
+        );
+        assert_eq!(staged.folded_fingerprints, 1);
+        assert_eq!(
+            staged.bytes_hashed,
+            baseline.bytes_hashed + 16 + ContentDigest::of(b"").as_bytes().len()
+        );
+
+        // Delivering the missing dependency accepts it; the fingerprint is now
+        // committed by the accepted batch map instead of folded byte by byte.
+        assert!(matches!(
+            receiver
+                .stage_ready(ValidatedBatch::new(first))
+                .disposition(),
+            BatchDisposition::Accepted { .. }
+        ));
+        assert!(matches!(
+            receiver.archive_status(second_id).unwrap(),
+            Some(ArchiveStatus::Accepted { .. })
+        ));
+        let accepted_token = receiver.author_generation_root().unwrap();
+        let accepted = receiver.author_generation_root_probe();
+        assert_ne!(accepted_token, staged_token);
+        assert_ne!(accepted_token, baseline_token);
+        assert_eq!(accepted.folded_fingerprints, 0);
+        assert_eq!(accepted.bytes_hashed, baseline.bytes_hashed);
+    }
+
+    /// Removing accepted fingerprints from the folded bytes must not weaken
+    /// draft/capture/finalize staleness. An undisturbed cycle still captures
+    /// and finalizes; a draft or capture that spans an acceptance is stale.
+    #[test]
+    fn author_draft_capture_and_finalize_staleness_stays_exact() {
+        let mut fixture = preauthor_gate_fixture(98_200);
+
+        // Undisturbed: no spurious staleness anywhere in the cycle.
+        fixture.author_accepted_round(98_300, "exact-baseline");
+
+        // A draft taken before another acceptance is stale at capture.
+        let stale_draft = fixture.draft_edits(98_400, &[(0, "exact-stale-draft")]);
+        fixture.author_accepted_round(98_500, "exact-intervening-a");
+        assert!(matches!(
+            fixture.engine.capture_local_author_transaction(
+                stale_draft,
+                &fixture.graph,
+                &fixture.receipts,
+                fixture.endpoint,
+            ),
+            Err(EngineError::AuthorDraftStale)
+        ));
+
+        // A capture taken before another acceptance is stale at finalize.
+        let draft = fixture.draft_edits(98_600, &[(0, "exact-stale-capture")]);
+        let captured = match fixture
+            .engine
+            .capture_local_author_transaction(
+                draft,
+                &fixture.graph,
+                &fixture.receipts,
+                fixture.endpoint,
+            )
+            .unwrap()
+        {
+            LocalAuthorCapture::Captured(captured) => captured,
+            LocalAuthorCapture::ReconciliationNeeded(_) => {
+                panic!("undisturbed capture unexpectedly requires reconciliation")
+            }
+        };
+        fixture.author_accepted_round(98_700, "exact-intervening-b");
+        assert!(matches!(
+            fixture
+                .engine
+                .finalize_captured_author_transaction(captured, &fixture.receipts),
+            Err(EngineError::AuthorDraftStale)
+        ));
+
+        // The engine is still authorable after both stale rejections.
+        fixture.author_accepted_round(98_800, "exact-after");
+        finish_preauthor_gate_fixture(fixture);
+    }
+
+    /// Authenticated recovery replays every durable final record. It must not
+    /// rebuild an accepted fingerprint map proportional to that history.
+    #[test]
+    fn authenticated_recovery_repopulates_no_accepted_fingerprint_state() {
+        let mut fixture = preauthor_gate_fixture(99_000);
+        for round in 0..4u128 {
+            fixture.author_accepted_round(99_100 + round * 100, &format!("recovered {round}"));
+        }
+        let PreauthorGateFixture {
+            root,
+            writer,
+            graph,
+            receipts,
+            engine,
+            ..
+        } = fixture;
+        let workspace = engine.workspace_id();
+        let lineage = engine.lineage_digest;
+        let catalog = engine.catalog_document_id;
+        let accepted_before = engine.next_acceptance_sequence;
+        assert!(accepted_before >= 5);
+        drop(engine);
+
+        let manifests = writer.committed_manifests().unwrap();
+        let mut reopened = ShardedHotEngine::with_enrolled_projection(
+            ObjectStore::open(&root.join("archive"), workspace).unwrap(),
+            lineage,
+            catalog,
+            &graph,
+            &receipts,
+        );
+        reopened.prepare_operational_recovery_replay().unwrap();
+        for manifest in &manifests {
+            reopened
+                .stage_archive_batch_for_recovery(manifest.batch_id())
+                .unwrap();
+        }
+        reopened.finish_operational_recovery_replay().unwrap();
+
+        reopened.author_generation_root().unwrap();
+        let probe = reopened.author_generation_root_probe();
+        assert_eq!(
+            probe.resident_fingerprints, 0,
+            "recovery repopulated retained accepted fingerprint state"
+        );
+        assert_eq!(probe.folded_fingerprints, 0);
+        assert_eq!(reopened.next_acceptance_sequence, accepted_before);
+
+        drop(reopened);
         drop(writer);
         std::fs::remove_dir_all(root).unwrap();
     }
