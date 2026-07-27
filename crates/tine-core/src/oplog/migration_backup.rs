@@ -263,6 +263,56 @@ impl MigrationBackupRoot {
     ) -> Result<Self, MigrationBackupError> {
         Self::open(device_local_backup_root, canonical_graph_root)
     }
+
+    pub(crate) fn canonical_root(&self) -> &Path {
+        &self.canonical_root
+    }
+
+    pub(crate) fn canonical_graph_root(&self) -> &Path {
+        &self.canonical_graph_root
+    }
+
+    pub(crate) const fn graph_resource(&self) -> CanonicalGraphResourceId {
+        self.graph_resource
+    }
+
+    pub(crate) const fn root_identity(&self) -> ContentDigest {
+        self.backup_root_identity
+    }
+
+    pub(crate) fn freshly_validate_retained_roots(&self) -> Result<(), MigrationBackupError> {
+        if self.canonical_root == self.canonical_graph_root
+            || self.canonical_root.starts_with(&self.canonical_graph_root)
+            || self.canonical_graph_root.starts_with(&self.canonical_root)
+        {
+            return Err(MigrationBackupError::InvalidRoot(
+                "backup and graph roots are no longer structurally disjoint",
+            ));
+        }
+        let retained_root = control_directory_identity(&self._root_capability)
+            .map_err(|error| MigrationBackupError::Io(io::Error::other(error.to_string())))?;
+        let retained_graph = control_directory_identity(&self._graph_capability)
+            .map_err(|error| MigrationBackupError::Io(io::Error::other(error.to_string())))?;
+        if retained_root == retained_graph
+            || retained_root.migration_backup_root_binding_digest() != self.backup_root_identity
+        {
+            return Err(MigrationBackupError::InvalidRoot(
+                "retained backup and graph directory resources alias or changed identity",
+            ));
+        }
+        let rebound_root = open_directory_nofollow_ambient(&self.canonical_root)?;
+        let rebound_graph = open_directory_nofollow_ambient(&self.canonical_graph_root)?;
+        if control_directory_identity(&rebound_root)
+            .map_err(|error| MigrationBackupError::Io(io::Error::other(error.to_string())))?
+            != retained_root
+            || canonical_graph_resource_id(&rebound_graph)? != self.graph_resource
+        {
+            return Err(MigrationBackupError::InvalidRoot(
+                "backup or graph root path no longer names its retained resource",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Private evidence that can only be constructed by the final committed
@@ -623,41 +673,7 @@ fn validate_bindings(
             "backup root graph capability does not match source provenance",
         ));
     }
-    if roots.canonical_root == roots.canonical_graph_root
-        || roots
-            .canonical_root
-            .starts_with(&roots.canonical_graph_root)
-        || roots
-            .canonical_graph_root
-            .starts_with(&roots.canonical_root)
-    {
-        return Err(MigrationBackupError::InvalidRoot(
-            "backup and graph roots are no longer structurally disjoint",
-        ));
-    }
-    let retained_root = control_directory_identity(&roots._root_capability)
-        .map_err(|error| MigrationBackupError::Io(io::Error::other(error.to_string())))?;
-    let retained_graph = control_directory_identity(&roots._graph_capability)
-        .map_err(|error| MigrationBackupError::Io(io::Error::other(error.to_string())))?;
-    if retained_root == retained_graph
-        || retained_root.migration_backup_root_binding_digest() != roots.backup_root_identity
-    {
-        return Err(MigrationBackupError::InvalidRoot(
-            "retained backup and graph directory resources alias or changed identity",
-        ));
-    }
-    let rebound_root = open_directory_nofollow_ambient(&roots.canonical_root)?;
-    let rebound_graph = open_directory_nofollow_ambient(&roots.canonical_graph_root)?;
-    let rebound_root_identity = control_directory_identity(&rebound_root)
-        .map_err(|error| MigrationBackupError::Io(io::Error::other(error.to_string())))?;
-    if rebound_root_identity != retained_root
-        || canonical_graph_resource_id(&rebound_graph)? != roots.graph_resource
-    {
-        return Err(MigrationBackupError::InvalidRoot(
-            "backup or graph root path no longer names its retained resource",
-        ));
-    }
-    Ok(())
+    roots.freshly_validate_retained_roots()
 }
 
 fn summarize_source(

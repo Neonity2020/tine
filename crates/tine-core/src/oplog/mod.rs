@@ -27,6 +27,8 @@ pub(crate) mod loro_store;
 pub(crate) mod migration_backup;
 pub mod object_store;
 pub(crate) mod operational_coordinator;
+#[allow(dead_code)]
+pub(crate) mod shadow_projection;
 // P2N2 I1-I3 deliberately expose a foundation seam without activating it.
 #[allow(dead_code)]
 pub(crate) mod page_name_index;

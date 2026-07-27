@@ -1360,6 +1360,10 @@ impl VerifiedBootstrapSqliteProjection {
     pub(crate) const fn bootstrap_rebuild(&self) -> BootstrapSqliteRebuildInstrumentation {
         self.bootstrap_rebuild
     }
+
+    pub(crate) const fn authority_binding(&self) -> &InactiveBootstrapAcceptedAuthorityBinding {
+        &self.authority_binding
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -2054,6 +2058,47 @@ fn fail_during_apply_for_harness() -> Result<(), ProjectionError> {
 }
 
 impl SqliteFrontier {
+    pub(crate) fn freshly_verify_inactive_bootstrap(
+        &self,
+        authority: &InactiveBootstrapAcceptedAuthority,
+        proof: &VerifiedBootstrapSqliteProjection,
+    ) -> Result<(), ProjectionError> {
+        let binding = authority.binding();
+        let frontier_root = self.frontier_root()?;
+        let accepted_batch_count = u64::try_from(self.applied_batch_count()?)
+            .map_err(|_| ProjectionError::Rebuild("SQLite accepted count overflowed".into()))?;
+        let materialized = self.materialized_read()?;
+        if proof.authority_binding() != binding
+            || self.claim() != proof.claim()
+            || proof.claim()
+                != ProjectionClaim::current(binding.workspace_id(), binding.lineage_digest())
+            || frontier_root != *proof.frontier_root()
+            || frontier_root != *binding.accepted_frontier()
+            || accepted_batch_count != proof.accepted_batch_count()
+            || accepted_batch_count != u64::from(binding.part_count())
+            || self.required_frontier_root != frontier_root
+            || !self
+                .runtime_authority
+                .matches(authority.accepted_engine().runtime_authority())
+            || materialized.acceptance_sequence() != accepted_batch_count
+            || self.semantic_projection_digest()? != proof.semantic_projection_digest()
+            || self.materialized_row_digest_for_harness()? != proof.materialized_row_digest()
+        {
+            return Err(ProjectionError::Rebuild(
+                "fresh SQLite evidence differs from inactive bootstrap proof".into(),
+            ));
+        }
+        if accepted_batch_count != 0
+            && self.authenticated_reference_catalog_root()?
+                != *frontier_root.reference_catalog_root()
+        {
+            return Err(ProjectionError::Rebuild(
+                "fresh SQLite reference catalog differs from bootstrap authority".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn open_or_rebuild_inactive_bootstrap(
         path: &Path,
         _application_runtime_root: &ApplicationRuntimeRoot,

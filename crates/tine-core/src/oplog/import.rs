@@ -504,6 +504,56 @@ impl InactiveBootstrapAcceptedAuthorityBinding {
     pub(crate) const fn part_count(&self) -> u32 {
         self.part_count
     }
+
+    pub(crate) const fn graph_resource(&self) -> super::CanonicalGraphResourceId {
+        self.graph_resource
+    }
+
+    pub(crate) const fn publication_id(&self) -> super::bootstrap_import::BootstrapPublicationIdV1 {
+        self.publication_id
+    }
+
+    pub(crate) const fn aggregate_digest(
+        &self,
+    ) -> super::bootstrap_import::BootstrapAggregateDigestV1 {
+        self.aggregate_digest
+    }
+
+    pub(crate) const fn import_id(&self) -> ImportId {
+        self.import_id
+    }
+
+    pub(crate) const fn predecessor_terminal(&self) -> Option<BootstrapPartId> {
+        self.predecessor_terminal
+    }
+
+    pub(crate) const fn engine_binding(&self) -> &EngineHistoryBinding {
+        &self.engine_binding
+    }
+
+    pub(crate) const fn storage_binding(&self) -> ProjectionStorageBinding {
+        self.storage_binding
+    }
+
+    pub(crate) const fn bootstrap_binding(&self) -> BootstrapAggregateHistoryBindingV1 {
+        self.bootstrap_binding
+    }
+
+    pub(crate) const fn archive_identity(&self) -> ControlDirectoryIdentity {
+        self.archive_identity
+    }
+
+    pub(crate) const fn history_generation(&self) -> u64 {
+        self.history_generation
+    }
+
+    pub(crate) const fn history_root(&self) -> ContentDigest {
+        self.history_root
+    }
+
+    pub(crate) const fn cold_record_count(&self) -> u64 {
+        self.cold_record_count
+    }
 }
 
 /// Retained, read-only accepted-history authority for one inactive bootstrap.
