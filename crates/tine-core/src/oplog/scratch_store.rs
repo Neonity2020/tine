@@ -49,6 +49,15 @@ pub(crate) const AUTHENTICATED_POINT_MAX_IO_PER_MUTATION: usize =
 const CURRENT_FILTER_WORDS: usize = 16_384;
 const MAX_COVERED_BLOB_DEDUP_ROOTS: usize = 256;
 const MAX_MARKER_BYTES: u64 = 4 * 1024;
+/// Bound on the retained runs one workspace holds after a complete
+/// reachability pass converges.
+///
+/// Publish-then-delete needs a transient overlap of two, and no operation
+/// produces three. This is a theorem about the pass rather than a quota it
+/// enforces: at most two resume points can exist, so at most two distinct runs
+/// can be reachable, and everything else is either provably collectable or
+/// preserved because it could not be classified.
+pub(crate) const MAX_RETAINED_SCRATCH_RUNS: usize = 2;
 const MAX_PAGE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_BLOB_BYTES: usize = 256 * 1024 * 1024;
 
@@ -244,8 +253,10 @@ enum ScratchRetention {
     /// under the exclusive lease proof.
     Ephemeral,
     /// Adoptable run. Drop releases only the lease, and ordinary stale-run
-    /// reclamation never removes it. Until an authenticated runtime-resume-point
-    /// format exists, an orphan retained run is preserved rather than deleted.
+    /// reclamation never removes it. The single pass that may remove one is
+    /// [`reclaim_unreachable_retained_runs`], which requires a complete
+    /// authenticated resume-point reachability proof plus this run's own
+    /// exclusive lease; without such a proof an orphan is preserved.
     Retained,
 }
 
@@ -2890,8 +2901,10 @@ impl ScratchStore {
         validate_run_entries(&run)?;
         if marker.retention == ScratchRetention::Retained {
             // Ordinary reclamation carries no authority to discard adoptable
-            // state. Until an authenticated runtime-resume-point format can
-            // prove a retained run is unreachable, an orphan survives.
+            // state: opening a fresh run proves nothing about which retained
+            // runs a resume point still reaches. Collecting an orphan is
+            // `reclaim_unreachable_retained_runs`, which the caller invokes
+            // with a complete authenticated reachability proof.
             return Ok(StaleRunDisposition::RetainedPreserved);
         }
         let lease = open_regular_read_write_nofollow(&run, LEASE_FILE)?;
@@ -3511,6 +3524,178 @@ fn remove_stale_run(
     Ok(())
 }
 
+/// What one reachability-proof pass proved about one sibling of the scratch
+/// namespace.
+///
+/// Only `Reclaimed` unlinks bytes. It is reachable exclusively from a complete
+/// authentication of that run's own marker and entry set, a proof that no
+/// resume point still names it, and the acquisition of its own exclusive lease.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RetainedRunDisposition {
+    /// Authenticated retained run this workspace's resume points still name.
+    Reachable,
+    /// Authenticated retained run, unreachable and unleased. Its bytes were
+    /// removed.
+    Reclaimed,
+    /// Authenticated retained run whose exclusive lease another owner holds.
+    LivePreserved,
+    /// Authenticated ephemeral run. This pass carries no authority over the
+    /// ordinary reclamation lifecycle, so it is left exactly as found.
+    EphemeralPreserved,
+    /// Could not be authenticated or classified: absent, torn, old-schema,
+    /// foreign, or unreadable marker; incomplete or stray entry set; a
+    /// non-directory, symlinked, special, or non-canonical name; or an ordinary
+    /// per-run I/O error. Its bytes are preserved untouched.
+    Unclassified,
+}
+
+/// The outcome of one retained-run reachability pass.
+///
+/// Every field is a preservation count except `retained_reclaimed`, which is
+/// the only one that describes deleted bytes. A caller that needs to know
+/// whether the population converged reads
+/// [`Self::within_retained_run_bound`]; a caller that needs to know whether the
+/// archive is accumulating residue watches `unclassified_preserved`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RetainedRunReclamation {
+    pub retained_reachable: usize,
+    pub retained_reclaimed: usize,
+    pub retained_live_skipped: usize,
+    pub ephemeral_preserved: usize,
+    pub unclassified_preserved: usize,
+}
+
+impl RetainedRunReclamation {
+    /// Authenticated retained runs of this workspace still on disk afterwards.
+    pub(crate) const fn retained_runs_remaining(&self) -> usize {
+        self.retained_reachable + self.retained_live_skipped
+    }
+
+    /// Whether the retained-run population converged inside its bound.
+    ///
+    /// This is an observation, deliberately not an enforcement. A pass that
+    /// refused to reclaim because the count was already too high would make
+    /// the leak permanent, which is the exact opposite of what the bound is
+    /// for; and a pass that deleted to satisfy a count would be deleting
+    /// evidence it had not proved unreachable.
+    pub(crate) const fn within_retained_run_bound(&self) -> bool {
+        self.retained_runs_remaining() <= MAX_RETAINED_SCRATCH_RUNS
+    }
+}
+
+/// Reclaim every retained scratch run a complete resume-point set no longer
+/// reaches.
+///
+/// This is the pass the `create_retained`/`adopt_retained` TODO was waiting
+/// for: until an authenticated runtime-resume-point format existed, an orphan
+/// retained run had to survive forever, because nothing could prove it was
+/// unreachable. [`ReachableRetainedRuns`] is that proof, and it can only be
+/// minted by a scan that classified and authenticated every entry of the
+/// resume-point directory.
+///
+/// A retained run is deleted only when all of the following hold: its own
+/// durable marker authenticates it as a retained run of exactly this
+/// workspace, its entry set is complete and regular, the supplied complete
+/// proof does not name it, and its own exclusive lease is acquired
+/// non-blocking. The lease is the only liveness oracle that survives `SIGKILL`
+/// and power loss, so it is checked even though the caller is expected to hold
+/// the archive-rooted workspace runtime lease as well.
+///
+/// A free function rather than a method: the pass must run when no
+/// `ScratchStore` for the candidate run exists, which is precisely the orphan
+/// case. It is deliberately *not* wired into `create_run`'s opportunistic
+/// reclamation, which has no reachability proof and must keep preserving every
+/// retained run.
+///
+/// Only a failure to enumerate the namespace itself is returned as an error:
+/// that means nothing was proved about any sibling. A per-sibling failure is
+/// counted as `unclassified_preserved` and never deletes, never aborts the
+/// pass, and never vetoes the reclamation it can prove.
+pub(crate) fn reclaim_unreachable_retained_runs(
+    archive_capability: &Dir,
+    workspace_id: WorkspaceId,
+    reachable: &super::resume_point::ReachableRetainedRuns,
+) -> Result<RetainedRunReclamation, ScratchError> {
+    let mut outcome = RetainedRunReclamation::default();
+    match archive_capability.symlink_metadata(SCRATCH_DIR) {
+        // No scratch namespace was ever opened here. There is nothing to prove
+        // and nothing to create.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(outcome),
+        Err(error) => return Err(error.into()),
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(ScratchError::UnsafeEntry(format!(
+                "{SCRATCH_DIR} is not a real no-follow directory"
+            )));
+        }
+        Ok(_) => {}
+    }
+    let namespace = super::object_store::open_dir_nofollow(archive_capability, SCRATCH_DIR)?;
+    for entry in namespace.entries()? {
+        let disposition = entry
+            .map_err(ScratchError::from)
+            .and_then(|entry| {
+                classify_retained_sibling(&namespace, &entry, workspace_id, reachable)
+            })
+            .unwrap_or(RetainedRunDisposition::Unclassified);
+        let counter = match disposition {
+            RetainedRunDisposition::Reachable => &mut outcome.retained_reachable,
+            RetainedRunDisposition::Reclaimed => &mut outcome.retained_reclaimed,
+            RetainedRunDisposition::LivePreserved => &mut outcome.retained_live_skipped,
+            RetainedRunDisposition::EphemeralPreserved => &mut outcome.ephemeral_preserved,
+            RetainedRunDisposition::Unclassified => &mut outcome.unclassified_preserved,
+        };
+        *counter += 1;
+    }
+    Ok(outcome)
+}
+
+/// Classify exactly one sibling, removing it only when its own bytes and the
+/// supplied complete proof together say that is safe.
+///
+/// Every `Err` here means "not proved safe to touch"; the caller converts it
+/// into [`RetainedRunDisposition::Unclassified`], which preserves the sibling
+/// untouched.
+fn classify_retained_sibling(
+    namespace: &Dir,
+    entry: &cap_std::fs::DirEntry,
+    workspace_id: WorkspaceId,
+    reachable: &super::resume_point::ReachableRetainedRuns,
+) -> Result<RetainedRunDisposition, ScratchError> {
+    let name = entry
+        .file_name()
+        .to_str()
+        .ok_or_else(|| ScratchError::UnsafeEntry("non-UTF-8 scratch run".into()))?
+        .to_owned();
+    let run_id = parse_run_name(&name)?;
+    require_real_directory(entry, &name)?;
+    let run = super::object_store::open_dir_nofollow(namespace, &name)?;
+    let marker_bytes = read_regular_nofollow(&run, MARKER_FILE, MAX_MARKER_BYTES)?;
+    let marker: ScratchRunMarkerV3 = decode_canonical(&marker_bytes)?;
+    if marker.schema_version != SCRATCH_SCHEMA_VERSION
+        || marker.workspace_id != workspace_id
+        || marker.run_id != run_id
+    {
+        return Err(ScratchError::MalformedMarker(name));
+    }
+    validate_run_entries(&run)?;
+    if marker.retention != ScratchRetention::Retained {
+        return Ok(RetainedRunDisposition::EphemeralPreserved);
+    }
+    if reachable.contains(run_id) {
+        return Ok(RetainedRunDisposition::Reachable);
+    }
+    // Unreachable is necessary but not sufficient. Acquiring the run's own
+    // exclusive lease is what proves no live owner is mutating these bytes,
+    // and it is taken only after reachability has already been excluded so a
+    // live reachable run is never even contended.
+    let lease = open_regular_read_write_nofollow(&run, LEASE_FILE)?;
+    if !lock_exclusive_nonblocking(&lease)? {
+        return Ok(RetainedRunDisposition::LivePreserved);
+    }
+    remove_stale_run(namespace, &run, &name, lease)?;
+    Ok(RetainedRunDisposition::Reclaimed)
+}
+
 /// Best-effort removal of exactly the run directory a failed construction
 /// created.
 ///
@@ -3863,8 +4048,11 @@ impl From<super::object_store::StoreError> for ScratchError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::oplog::resume_point::ReachableRetainedRuns;
     use cap_std::ambient_authority;
     use std::collections::BTreeSet;
+    #[cfg(unix)]
+    use std::os::unix::fs::FileTypeExt as _;
     use std::path::{Path, PathBuf};
 
     fn workspace(value: u128) -> WorkspaceId {
@@ -5361,6 +5549,333 @@ mod tests {
         drop(after_release);
 
         assert_eq!(run_snapshot(&path, run_id), baseline);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    // ---- Retained-run reclamation under a complete reachability proof ----
+    //
+    // Ordinary stale-run reclamation deliberately preserves every retained
+    // run forever (`orphan_retained_runs_survive_ordinary_stale_run_reclamation`
+    // asserts exactly that). These tests own the one pass that may delete one,
+    // and every one of them is about what it must refuse to delete.
+
+    fn reachable(run_ids: impl IntoIterator<Item = Uuid>) -> ReachableRetainedRuns {
+        ReachableRetainedRuns::from_run_ids_for_test(run_ids)
+    }
+
+    /// A retained run of another workspace, seeded directly so the pass sees a
+    /// well-formed but foreign marker rather than a torn one.
+    fn seed_foreign_retained_run(root: &Path, workspace_value: u128) -> (Uuid, PathBuf) {
+        let run_id = Uuid::new_v4();
+        let path = namespace_dir(root).join(format!("run-{run_id}"));
+        fs::create_dir(&path).unwrap();
+        fs::write(
+            path.join(MARKER_FILE),
+            encode_canonical(&ScratchRunMarkerV3 {
+                schema_version: SCRATCH_SCHEMA_VERSION,
+                workspace_id: workspace(workspace_value),
+                run_id,
+                retention: ScratchRetention::Retained,
+                random_owner_nonce: [7_u8; 32],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        for name in [LEASE_FILE, PAGES_FILE, BLOBS_FILE] {
+            fs::write(path.join(name), []).unwrap();
+        }
+        (run_id, path)
+    }
+
+    /// The packet's central proof: a retained run's bytes are removed only when
+    /// a complete resume-point set proves nothing still reaches them, and the
+    /// run that is still reachable survives byte-identically and stays
+    /// adoptable.
+    #[test]
+    fn an_orphan_retained_run_is_reclaimed_only_under_a_complete_reachability_proof() {
+        let path = scratch_root("retained-reclaim");
+        let archive = archive(&path);
+        let (kept, root, blob, binding) = seed_retained_run(&archive, workspace(50));
+        let (orphan, _, _, _) = seed_retained_run(&archive, workspace(50));
+        let kept_bytes = run_snapshot(&path, kept);
+
+        let outcome =
+            reclaim_unreachable_retained_runs(&archive, workspace(50), &reachable([kept])).unwrap();
+        assert_eq!(
+            outcome,
+            RetainedRunReclamation {
+                retained_reachable: 1,
+                retained_reclaimed: 1,
+                ..RetainedRunReclamation::default()
+            }
+        );
+
+        assert!(!run_path(&path, orphan).exists());
+        assert_eq!(run_snapshot(&path, kept), kept_bytes);
+        let adopted = ScratchStore::adopt_retained(&archive, workspace(50), kept).unwrap();
+        assert_eq!(adopted.binding_digest().unwrap(), binding);
+        assert_retained_contents(&adopted, &root, &blob);
+        drop(adopted);
+
+        // The pass is idempotent and converges.
+        assert_eq!(
+            reclaim_unreachable_retained_runs(&archive, workspace(50), &reachable([kept])).unwrap(),
+            RetainedRunReclamation {
+                retained_reachable: 1,
+                ..RetainedRunReclamation::default()
+            }
+        );
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    /// The `Unsafe -> Safe` drain: every resume point is cleared first, so the
+    /// complete proof reaches nothing and every retained run is collectable.
+    #[test]
+    fn an_empty_reachable_set_reclaims_every_orphan_retained_run() {
+        let path = scratch_root("retained-drain");
+        let archive = archive(&path);
+        let (first, _, _, _) = seed_retained_run(&archive, workspace(51));
+        let (second, _, _, _) = seed_retained_run(&archive, workspace(51));
+
+        let outcome =
+            reclaim_unreachable_retained_runs(&archive, workspace(51), &reachable([])).unwrap();
+        assert_eq!(outcome.retained_reclaimed, 2);
+        assert_eq!(outcome.retained_runs_remaining(), 0);
+        assert!(outcome.within_retained_run_bound());
+        assert!(!run_path(&path, first).exists());
+        assert!(!run_path(&path, second).exists());
+        assert!(namespace_entry_names(&path).is_empty());
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    /// Ephemeral runs keep their own lifecycle. This pass carries no authority
+    /// over them, reachable or not.
+    #[test]
+    fn an_ephemeral_run_is_never_touched_by_the_reachability_pass() {
+        let path = scratch_root("retained-ephemeral");
+        let archive = archive(&path);
+        let stale = seed_stale_ephemeral_run(&path, 52);
+        let before = dir_snapshot(&stale);
+
+        let outcome =
+            reclaim_unreachable_retained_runs(&archive, workspace(52), &reachable([])).unwrap();
+        assert_eq!(
+            outcome,
+            RetainedRunReclamation {
+                ephemeral_preserved: 1,
+                ..RetainedRunReclamation::default()
+            }
+        );
+        assert_eq!(dir_snapshot(&stale), before);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    /// A run whose exclusive lease is held is live. Reachability alone never
+    /// authorizes deletion: the run's own lease must also be acquired.
+    #[test]
+    fn a_live_retained_run_is_preserved_even_when_it_is_unreachable() {
+        let path = scratch_root("retained-live");
+        let archive = archive(&path);
+        let (run_id, root, blob, _) = seed_retained_run(&archive, workspace(53));
+        let live = ScratchStore::adopt_retained(&archive, workspace(53), run_id).unwrap();
+
+        let outcome =
+            reclaim_unreachable_retained_runs(&archive, workspace(53), &reachable([])).unwrap();
+        assert_eq!(
+            outcome,
+            RetainedRunReclamation {
+                retained_live_skipped: 1,
+                ..RetainedRunReclamation::default()
+            }
+        );
+        assert!(run_path(&path, run_id).is_dir());
+        assert_retained_contents(&live, &root, &blob);
+        drop(live);
+
+        // Once the owner releases it, the same unreachable run is collectable.
+        assert_eq!(
+            reclaim_unreachable_retained_runs(&archive, workspace(53), &reachable([]))
+                .unwrap()
+                .retained_reclaimed,
+            1
+        );
+        assert!(!run_path(&path, run_id).exists());
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    /// Every durable shape the pass cannot authenticate is preserved untouched
+    /// and never suppresses the reclamation it can prove.
+    #[test]
+    fn every_unclassifiable_sibling_is_preserved_and_never_blocks_reclamation() {
+        for kind in UNCLASSIFIABLE_SIBLINGS {
+            let path = scratch_root("retained-unclassifiable");
+            let archive = archive(&path);
+            let sibling = seed_unclassifiable_sibling(&path, 54, kind);
+            let before = dir_snapshot(&sibling);
+            let (orphan, _, _, _) = seed_retained_run(&archive, workspace(54));
+
+            let outcome =
+                reclaim_unreachable_retained_runs(&archive, workspace(54), &reachable([])).unwrap();
+            assert_eq!(outcome.unclassified_preserved, 1, "{kind:?}");
+            assert_eq!(outcome.retained_reclaimed, 1, "{kind:?}");
+            assert!(sibling.exists(), "{kind:?} residue was removed");
+            assert_eq!(dir_snapshot(&sibling), before, "{kind:?} residue changed");
+            assert!(!run_path(&path, orphan).exists(), "{kind:?}");
+            fs::remove_dir_all(path).unwrap();
+        }
+    }
+
+    /// A well-formed retained run of another workspace authenticates as
+    /// foreign, which is not a licence to delete it: this workspace's resume
+    /// points say nothing about it.
+    #[test]
+    fn a_foreign_workspace_retained_run_is_never_reclaimed() {
+        let path = scratch_root("retained-foreign");
+        let archive = archive(&path);
+        let (_, foreign_path) = seed_foreign_retained_run(&path, 1_055);
+        let before = dir_snapshot(&foreign_path);
+
+        let outcome =
+            reclaim_unreachable_retained_runs(&archive, workspace(55), &reachable([])).unwrap();
+        assert_eq!(
+            outcome,
+            RetainedRunReclamation {
+                unclassified_preserved: 1,
+                ..RetainedRunReclamation::default()
+            }
+        );
+        assert_eq!(dir_snapshot(&foreign_path), before);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    /// Deletion is capability-relative and no-follow. A symlinked or special
+    /// entry wearing a run name is never followed and never unlinked.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_or_special_retained_entry_is_never_unlinked() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::symlink;
+
+        let path = scratch_root("retained-special");
+        let archive = archive(&path);
+        let (real, _, _, _) = seed_retained_run(&archive, workspace(56));
+        let namespace = namespace_dir(&path);
+
+        let decoy = path.join("decoy");
+        fs::create_dir(&decoy).unwrap();
+        fs::write(decoy.join("keep"), b"decoy bytes").unwrap();
+        symlink(&decoy, namespace.join(format!("run-{}", Uuid::new_v4()))).unwrap();
+
+        let fifo = namespace.join(format!("run-{}", Uuid::new_v4()));
+        let fifo_c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `fifo_c` is a live NUL-terminated path in this test directory.
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+
+        let outcome =
+            reclaim_unreachable_retained_runs(&archive, workspace(56), &reachable([real])).unwrap();
+        assert_eq!(
+            outcome,
+            RetainedRunReclamation {
+                retained_reachable: 1,
+                unclassified_preserved: 2,
+                ..RetainedRunReclamation::default()
+            }
+        );
+        assert_eq!(
+            fs::read(decoy.join("keep")).unwrap(),
+            b"decoy bytes".to_vec()
+        );
+        assert!(fs::symlink_metadata(&fifo).unwrap().file_type().is_fifo());
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    /// An archive that never opened a scratch namespace proves an empty
+    /// reclamation rather than failing or creating one.
+    #[test]
+    fn an_absent_scratch_namespace_proves_an_empty_reclamation() {
+        let path = scratch_root("retained-absent");
+        let archive = archive(&path);
+        assert_eq!(
+            reclaim_unreachable_retained_runs(&archive, workspace(57), &reachable([])).unwrap(),
+            RetainedRunReclamation::default()
+        );
+        assert!(!path.join(SCRATCH_DIR).exists());
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    /// Publish-then-delete can transiently leave two retained runs; a complete
+    /// pass converges back inside the bound without ever deleting evidence it
+    /// could not classify.
+    #[test]
+    fn a_complete_pass_leaves_the_retained_run_population_within_its_bound() {
+        let path = scratch_root("retained-bound");
+        let archive = archive(&path);
+        let mut runs = Vec::new();
+        for _ in 0..(MAX_RETAINED_SCRATCH_RUNS + 2) {
+            runs.push(seed_retained_run(&archive, workspace(58)).0);
+        }
+        let rotated = runs[runs.len() - 1];
+
+        let outcome =
+            reclaim_unreachable_retained_runs(&archive, workspace(58), &reachable([rotated]))
+                .unwrap();
+        assert_eq!(outcome.retained_reclaimed, MAX_RETAINED_SCRATCH_RUNS + 1);
+        assert_eq!(outcome.retained_runs_remaining(), 1);
+        assert!(outcome.within_retained_run_bound());
+        assert_eq!(
+            namespace_entry_names(&path),
+            BTreeSet::from([format!("run-{rotated}")])
+        );
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    /// The lease is the only liveness oracle that survives SIGKILL, so the
+    /// exclusion has to be proved across real processes, not with a sleep.
+    #[cfg(unix)]
+    #[test]
+    fn a_retained_run_leased_by_another_process_is_never_reclaimed() {
+        let path = scratch_root("retained-forked-reclaim");
+        let archive = archive(&path);
+        let (run_id, root, blob, binding) = seed_retained_run(&archive, workspace(59));
+        let baseline = run_snapshot(&path, run_id);
+
+        // The helper reports adoption before this side proceeds, so ownership
+        // is established by a blocking read rather than by timing.
+        let (mut owner, _reader) = spawn_adoption_helper(&path, 59, run_id);
+        let outcome =
+            reclaim_unreachable_retained_runs(&archive, workspace(59), &reachable([])).unwrap();
+        assert_eq!(
+            outcome,
+            RetainedRunReclamation {
+                retained_live_skipped: 1,
+                ..RetainedRunReclamation::default()
+            }
+        );
+        assert_eq!(run_snapshot(&path, run_id), baseline);
+
+        // Kernel lease release on process death is the whole liveness proof.
+        owner.kill().unwrap();
+        assert!(!owner.wait().unwrap().success());
+
+        // Still reachable: death alone never authorizes deletion.
+        let still_reachable =
+            reclaim_unreachable_retained_runs(&archive, workspace(59), &reachable([run_id]))
+                .unwrap();
+        assert_eq!(still_reachable.retained_reachable, 1);
+        assert_eq!(still_reachable.retained_reclaimed, 0);
+        let adopted = ScratchStore::adopt_retained(&archive, workspace(59), run_id).unwrap();
+        assert_eq!(adopted.binding_digest().unwrap(), binding);
+        assert_retained_contents(&adopted, &root, &blob);
+        drop(adopted);
+
+        assert_eq!(
+            reclaim_unreachable_retained_runs(&archive, workspace(59), &reachable([]))
+                .unwrap()
+                .retained_reclaimed,
+            1
+        );
+        assert!(!run_path(&path, run_id).exists());
         fs::remove_dir_all(path).unwrap();
     }
 }
