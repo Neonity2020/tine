@@ -2068,6 +2068,7 @@ impl SqliteFrontier {
         let accepted_batch_count = u64::try_from(self.applied_batch_count()?)
             .map_err(|_| ProjectionError::Rebuild("SQLite accepted count overflowed".into()))?;
         let materialized = self.materialized_read()?;
+        validate_projection_checkpoint(&self.path, self.claim, &frontier_root)?;
         if proof.authority_binding() != binding
             || self.claim() != proof.claim()
             || proof.claim()

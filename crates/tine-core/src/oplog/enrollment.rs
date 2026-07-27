@@ -48,17 +48,30 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 use super::identity::parse_digest;
+use super::import::{
+    reopen_inactive_bootstrap_accepted_authority, BootstrapStreamingImportError,
+    InactiveBootstrapAcceptedAuthority, InactiveBootstrapAcceptedAuthorityBinding,
+    InactiveBootstrapPreparedPublication, InactiveBootstrapVerifiedPublication,
+};
+use super::migration_backup::{
+    verify_migration_source_backup, MigrationBackupError, MigrationBackupRoot, VerifiedSourceBackup,
+};
 use super::object_store::{ensure_directory_nofollow, open_dir_nofollow, sync_dir_required};
+use super::shadow_projection::{
+    verify_inactive_bootstrap_shadow_projection, ShadowProjectionError, VerifiedShadowProjection,
+};
+use super::sqlite::{OpenProjection, ProjectionError, VerifiedBootstrapSqliteProjection};
 use super::{
-    BatchId, CanonicalArchiveResourceId, CanonicalGraphResourceId, ContentDigest, DeviceId,
-    DocumentId, GraphTextScopeBinding, ImportId, LineageDigest, ProjectionEndpointId,
-    ProjectionReceiptStoreId, SessionId, WorkspaceId, DIFF_SCHEMA_VERSION,
+    BatchId, BlobDescription, CanonicalArchiveResourceId, CanonicalGraphResourceId, ContentDigest,
+    DeviceId, DocumentId, GraphTextScopeBinding, ImportId, LineageDigest, ObjectStore,
+    ProjectionEndpointId, ProjectionReceiptStoreId, SessionId, WorkspaceId, DIFF_SCHEMA_VERSION,
     MANAGED_ENTITY_SET_VERSION, MANIFEST_ENCODING_VERSION, OBJECT_ENVELOPE_SCHEMA_VERSION,
     OPERATION_SCHEMA_VERSION, OPLOG_PROTOCOL_VERSION, PROJECTION_POLICY_VERSION,
     PROJECTION_SCHEMA_VERSION, RECEIPT_SCHEMA_VERSION,
 };
+use crate::model::Graph;
 
-pub(crate) const ENROLLMENT_RECORD_SCHEMA_VERSION: u32 = 3;
+pub(crate) const ENROLLMENT_RECORD_SCHEMA_VERSION: u32 = 4;
 pub(crate) const PUBLISHED_RECOVERY_PACKET_SCHEMA_VERSION: u32 = 1;
 pub(crate) const MAX_ENROLLMENT_RECORD_BYTES: usize = 32 * 1024;
 pub(crate) const MAX_ENROLLMENT_JSON_DEPTH: usize = 16;
@@ -82,7 +95,7 @@ const HEAD_TEMP_PREFIX: &str = ".head-tmp-";
 const RECORD_TEMP_PREFIX: &str = ".record-tmp-";
 const AUTHORITY_TEMP_PREFIX: &str = ".authority-tmp-";
 const ENROLLMENT_AUTHORITY_SCHEMA_VERSION: u32 = 1;
-const ENROLLMENT_CHECKPOINT_SCHEMA_VERSION: u32 = 1;
+const ENROLLMENT_CHECKPOINT_SCHEMA_VERSION: u32 = 2;
 const MAX_ENROLLMENT_AUTHORITY_BYTES: usize = 4 * 1024;
 const ENROLLMENT_AUTHORITY_KEY_BYTES: usize = 32;
 
@@ -122,6 +135,13 @@ impl EnrollmentApplicationRoot {
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
+}
+
+#[cfg(test)]
+pub(crate) fn enrollment_application_root_for_test(
+    path: &Path,
+) -> Result<EnrollmentApplicationRoot, EnrollmentError> {
+    EnrollmentApplicationRoot::open_for_harness(path)
 }
 
 fn prepare_application_root(path: &Path) -> Result<EnrollmentApplicationRoot, EnrollmentError> {
@@ -572,16 +592,64 @@ impl ShadowImportV1 {
 struct VerifiedLocalV1 {
     preparation_id: PreparationId,
     source_inventory_digest: ContentDigest,
-    backup_manifest_digest: ContentDigest,
-    backup_restore_proof_digest: ContentDigest,
-    bootstrap_batch_id: BatchId,
+    source_file_count: u64,
+    source_chunk_count: u64,
+    source_total_bytes: u64,
+    backup_manifest: BlobDescription,
+    backup_restore_proof: BlobDescription,
+    backup_evidence_digest: ContentDigest,
+    bootstrap_import_id: ContentDigest,
+    bootstrap_part_count: u32,
+    bootstrap_terminal_part_id: Option<ContentDigest>,
+    bootstrap_batch_id: Option<BatchId>,
     accepted_frontier_anchor: AcceptedFrontierAnchorV1,
-    staged_projection_manifest_digest: ContentDigest,
+    accepted_history_record_count: u64,
+    catalog_row_count: u64,
+    sqlite_accepted_batch_count: u64,
+    sqlite_semantic_projection_digest: ContentDigest,
+    sqlite_materialized_row_digest: ContentDigest,
+    staged_projection_manifest: BlobDescription,
+    staged_projection_proof: BlobDescription,
+    staged_file_count: u64,
+    staged_total_bytes: u64,
     byte_compare_digest: ContentDigest,
+    shadow_evidence_digest: ContentDigest,
+    proof_binding_digest: ContentDigest,
 }
 
 impl VerifiedLocalV1 {
+    fn validate_fields(&self) -> Result<(), EnrollmentError> {
+        let part_count = u64::from(self.bootstrap_part_count);
+        let zero = self.bootstrap_part_count == 0;
+        if self.bootstrap_batch_id.is_none() != zero
+            || self.bootstrap_terminal_part_id.is_none() != zero
+            || (self.accepted_frontier_anchor.history_root
+                == super::object_store::EngineHistoryStore::empty_root())
+                != zero
+            || self.accepted_frontier_anchor.acceptance_sequence != part_count
+            || self.accepted_frontier_anchor.history_generation != part_count
+            || self.accepted_history_record_count != part_count
+            || self.sqlite_accepted_batch_count != part_count
+            || (self.source_file_count == 0) != zero
+            || (zero && (self.source_chunk_count != 0 || self.source_total_bytes != 0))
+            || self.source_file_count != self.catalog_row_count
+            || self.source_file_count != self.staged_file_count
+            || self.source_total_bytes != self.staged_total_bytes
+        {
+            return Err(EnrollmentError::InvalidVerifiedLocalTerminal);
+        }
+        if self.bootstrap_batch_id
+            == Some(BatchId::for_import(ImportId::from_digest(
+                *self.bootstrap_import_id.as_bytes(),
+            )))
+        {
+            return Err(EnrollmentError::InvalidVerifiedLocalTerminal);
+        }
+        Ok(())
+    }
+
     fn verification_digest(&self) -> Result<ContentDigest, EnrollmentError> {
+        self.validate_fields()?;
         let bytes =
             serde_json::to_vec(self).map_err(|error| EnrollmentError::Encode(error.to_string()))?;
         Ok(ContentDigest::of(&bytes))
@@ -678,7 +746,8 @@ impl EnrollmentLifecycleV1 {
         previous: Option<ContentDigest>,
     ) -> Result<(), EnrollmentError> {
         match self {
-            Self::ShadowImport(_) | Self::VerifiedLocal(_) => Ok(()),
+            Self::ShadowImport(_) => Ok(()),
+            Self::VerifiedLocal(verified) => verified.validate_fields(),
             Self::LocalActive(active) => {
                 if matches!(active.handoff, HandoffV1::Safe)
                     && matches!(active.exclusion, LocalExclusionV1::Published { .. })
@@ -754,7 +823,7 @@ fn checkpoint_message_bytes(
     lifecycle: &EnrollmentLifecycleV1,
 ) -> Result<Vec<u8>, EnrollmentError> {
     serde_json::to_vec(&CheckpointMessageV1 {
-        domain: "tine/enrollment-checkpoint/v1",
+        domain: "tine/enrollment-checkpoint/v2",
         authority_id,
         authority_resource_id,
         generation,
@@ -901,7 +970,7 @@ fn compute_history_accumulator(
     let lifecycle_bytes = serde_json::to_vec(lifecycle)
         .map_err(|error| EnrollmentError::Encode(error.to_string()))?;
     let mut hasher = Sha256::new();
-    hasher.update(b"tine/enrollment-history-accumulator/v1\0");
+    hasher.update(b"tine/enrollment-history-accumulator/v2\0");
     hasher.update(generation.to_be_bytes());
     match previous {
         Some(digest) => {
@@ -1396,7 +1465,7 @@ impl EnrollmentWriter {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CommitCut {
+pub(crate) enum CommitCut {
     None,
     AfterRecordTempCreate,
     AfterRecordWrite,
@@ -1409,6 +1478,571 @@ enum CommitCut {
     AfterHeadFileSync,
     AfterHeadReplace,
     AfterEnrollmentDirectorySync,
+}
+
+/// Exact retained proof set accepted by the sole `ShadowImport ->
+/// VerifiedLocal` composition boundary. None of these types can be constructed
+/// from enrollment digest fields.
+pub(crate) struct VerifiedLocalProofSet<'a> {
+    pub(crate) graph: &'a Graph,
+    pub(crate) roots: &'a MigrationBackupRoot,
+    pub(crate) prepared: &'a InactiveBootstrapPreparedPublication,
+    pub(crate) verified_publication: &'a InactiveBootstrapVerifiedPublication,
+    pub(crate) source_backup: &'a VerifiedSourceBackup,
+    pub(crate) accepted_authority: &'a InactiveBootstrapAcceptedAuthority,
+    pub(crate) sqlite: &'a OpenProjection,
+    pub(crate) sqlite_projection: &'a VerifiedBootstrapSqliteProjection,
+    pub(crate) shadow_projection: &'a VerifiedShadowProjection,
+}
+
+/// Opaque pre-activation authority. It is minted only after the committed
+/// enrollment head and every retained proof have been freshly reopened.
+///
+/// This type deliberately exposes no graph writer, projection writer, watcher,
+/// managed-sync mutation, or `LocalActive` transition.
+pub(crate) struct VerifiedLocalEvidence {
+    enrollment_head: ContentDigest,
+    verification_digest: ContentDigest,
+    binding: EnrollmentBindingV1,
+    bootstrap_batch_id: Option<BatchId>,
+    accepted_frontier_state_digest: ContentDigest,
+}
+
+impl VerifiedLocalEvidence {
+    pub(crate) const fn enrollment_head(&self) -> ContentDigest {
+        self.enrollment_head
+    }
+
+    pub(crate) const fn verification_digest(&self) -> ContentDigest {
+        self.verification_digest
+    }
+
+    pub(crate) const fn binding(&self) -> &EnrollmentBindingV1 {
+        &self.binding
+    }
+
+    pub(crate) const fn bootstrap_batch_id(&self) -> Option<BatchId> {
+        self.bootstrap_batch_id
+    }
+
+    pub(crate) const fn accepted_frontier_state_digest(&self) -> ContentDigest {
+        self.accepted_frontier_state_digest
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum VerifiedLocalCompositionError {
+    Enrollment(EnrollmentError),
+    Bootstrap(BootstrapStreamingImportError),
+    Backup(MigrationBackupError),
+    Sqlite(ProjectionError),
+    Shadow(ShadowProjectionError),
+    ProofBinding(String),
+    ProofMismatch(&'static str),
+    WrongLifecycle(&'static str),
+}
+
+impl fmt::Display for VerifiedLocalCompositionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Enrollment(error) => error.fmt(formatter),
+            Self::Bootstrap(error) => error.fmt(formatter),
+            Self::Backup(error) => error.fmt(formatter),
+            Self::Sqlite(error) => error.fmt(formatter),
+            Self::Shadow(error) => error.fmt(formatter),
+            Self::ProofBinding(detail) => {
+                write!(formatter, "verified-local proof binding failed: {detail}")
+            }
+            Self::ProofMismatch(detail) => {
+                write!(formatter, "verified-local proof mismatch: {detail}")
+            }
+            Self::WrongLifecycle(detail) => {
+                write!(formatter, "verified-local lifecycle mismatch: {detail}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for VerifiedLocalCompositionError {}
+
+impl From<EnrollmentError> for VerifiedLocalCompositionError {
+    fn from(error: EnrollmentError) -> Self {
+        Self::Enrollment(error)
+    }
+}
+
+impl From<BootstrapStreamingImportError> for VerifiedLocalCompositionError {
+    fn from(error: BootstrapStreamingImportError) -> Self {
+        Self::Bootstrap(error)
+    }
+}
+
+impl From<MigrationBackupError> for VerifiedLocalCompositionError {
+    fn from(error: MigrationBackupError) -> Self {
+        Self::Backup(error)
+    }
+}
+
+impl From<ProjectionError> for VerifiedLocalCompositionError {
+    fn from(error: ProjectionError) -> Self {
+        Self::Sqlite(error)
+    }
+}
+
+impl From<ShadowProjectionError> for VerifiedLocalCompositionError {
+    fn from(error: ShadowProjectionError) -> Self {
+        Self::Shadow(error)
+    }
+}
+
+impl From<std::io::Error> for VerifiedLocalCompositionError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Enrollment(EnrollmentError::from(error))
+    }
+}
+
+/// Persist or resume the exact inactive enrollment composition. The only
+/// caller-supplied enrollment datum is the opaque preparation identity; every
+/// digest in `VerifiedLocalV1` is freshly derived from retained proof types.
+pub(crate) fn compose_verified_local(
+    root: &EnrollmentApplicationRoot,
+    binding: EnrollmentBindingV1,
+    preparation_id: PreparationId,
+    proofs: &VerifiedLocalProofSet<'_>,
+) -> Result<VerifiedLocalEvidence, VerifiedLocalCompositionError> {
+    compose_verified_local_at_cut(root, binding, preparation_id, proofs, CommitCut::None)
+}
+
+#[cfg(test)]
+pub(crate) fn compose_verified_local_at_cut_for_test(
+    root: &EnrollmentApplicationRoot,
+    binding: EnrollmentBindingV1,
+    preparation_id: PreparationId,
+    proofs: &VerifiedLocalProofSet<'_>,
+    cut: CommitCut,
+) -> Result<VerifiedLocalEvidence, VerifiedLocalCompositionError> {
+    compose_verified_local_at_cut(root, binding, preparation_id, proofs, cut)
+}
+
+fn compose_verified_local_at_cut(
+    root: &EnrollmentApplicationRoot,
+    binding: EnrollmentBindingV1,
+    preparation_id: PreparationId,
+    proofs: &VerifiedLocalProofSet<'_>,
+    cut: CommitCut,
+) -> Result<VerifiedLocalEvidence, VerifiedLocalCompositionError> {
+    let shadow = ShadowImportV1::new(
+        preparation_id,
+        ContentDigest::from_bytes(
+            *proofs
+                .prepared
+                .source_capture()
+                .inventory_description()
+                .sha256(),
+        ),
+    );
+    let mut writer = match EnrollmentWriter::open_existing(root, &binding)? {
+        EnrollmentOpen::Absent => EnrollmentWriter::create(root, binding.clone(), shadow.clone())?,
+        EnrollmentOpen::Present(writer) => writer,
+    };
+    match writer.current().record.lifecycle() {
+        EnrollmentLifecycleV1::ShadowImport(current) if current == &shadow => {}
+        EnrollmentLifecycleV1::VerifiedLocal(current)
+            if current.preparation_id == shadow.preparation_id
+                && current.source_inventory_digest == shadow.source_inventory_digest => {}
+        EnrollmentLifecycleV1::ShadowImport(_) | EnrollmentLifecycleV1::VerifiedLocal(_) => {
+            return Err(EnrollmentError::InitialPreparationMismatch.into());
+        }
+        EnrollmentLifecycleV1::LocalActive(_) => {
+            return Err(VerifiedLocalCompositionError::WrongLifecycle(
+                "LocalActive cannot be composed or reopened as VerifiedLocal",
+            ));
+        }
+        EnrollmentLifecycleV1::Blocked(_) => {
+            return Err(VerifiedLocalCompositionError::WrongLifecycle(
+                "blocked enrollment cannot advance",
+            ));
+        }
+    }
+
+    let expected = freshly_validate_verified_local(&binding, preparation_id, proofs)?;
+    match writer.current().record.lifecycle() {
+        EnrollmentLifecycleV1::ShadowImport(_) => {
+            let current = writer.current().digest;
+            writer.transition_at_cut(
+                current,
+                EnrollmentLifecycleV1::VerifiedLocal(expected),
+                cut,
+            )?;
+        }
+        EnrollmentLifecycleV1::VerifiedLocal(current) if current == &expected => {}
+        EnrollmentLifecycleV1::VerifiedLocal(_) => {
+            return Err(VerifiedLocalCompositionError::ProofMismatch(
+                "committed VerifiedLocal record differs from freshly validated proofs",
+            ));
+        }
+        EnrollmentLifecycleV1::LocalActive(_) | EnrollmentLifecycleV1::Blocked(_) => {
+            return Err(VerifiedLocalCompositionError::WrongLifecycle(
+                "enrollment changed during VerifiedLocal composition",
+            ));
+        }
+    }
+    drop(writer);
+    reopen_verified_local(root, &binding, proofs)
+}
+
+/// Bounded startup/reopen gate. Enrollment bytes alone never mint authority:
+/// retained backup, accepted history, SQLite, live source, and shadow evidence
+/// are all freshly revalidated, followed by a second enrollment-head reopen.
+pub(crate) fn reopen_verified_local(
+    root: &EnrollmentApplicationRoot,
+    binding: &EnrollmentBindingV1,
+    proofs: &VerifiedLocalProofSet<'_>,
+) -> Result<VerifiedLocalEvidence, VerifiedLocalCompositionError> {
+    let reader = match EnrollmentReader::open_existing(root, binding)? {
+        EnrollmentOpen::Absent => {
+            return Err(VerifiedLocalCompositionError::WrongLifecycle(
+                "VerifiedLocal enrollment is absent",
+            ));
+        }
+        EnrollmentOpen::Present(reader) => reader,
+    };
+    let committed = match reader.current().record.lifecycle() {
+        EnrollmentLifecycleV1::VerifiedLocal(verified) => verified.clone(),
+        EnrollmentLifecycleV1::ShadowImport(_) => {
+            return Err(VerifiedLocalCompositionError::WrongLifecycle(
+                "enrollment remains ShadowImport",
+            ));
+        }
+        EnrollmentLifecycleV1::LocalActive(_) => {
+            return Err(VerifiedLocalCompositionError::WrongLifecycle(
+                "LocalActive is not VerifiedLocal evidence",
+            ));
+        }
+        EnrollmentLifecycleV1::Blocked(_) => {
+            return Err(VerifiedLocalCompositionError::WrongLifecycle(
+                "blocked enrollment has no VerifiedLocal authority",
+            ));
+        }
+    };
+    let expected = freshly_validate_verified_local(binding, committed.preparation_id, proofs)?;
+    if committed != expected {
+        return Err(VerifiedLocalCompositionError::ProofMismatch(
+            "enrollment head does not bind the freshly reopened proofs",
+        ));
+    }
+    let expected_head = reader.current().digest;
+    drop(reader);
+
+    let reopened = match EnrollmentReader::open_existing(root, binding)? {
+        EnrollmentOpen::Absent => {
+            return Err(VerifiedLocalCompositionError::WrongLifecycle(
+                "VerifiedLocal enrollment disappeared during proof validation",
+            ));
+        }
+        EnrollmentOpen::Present(reader) => reader,
+    };
+    let reopened_verified = match reopened.current().record.lifecycle() {
+        EnrollmentLifecycleV1::VerifiedLocal(verified)
+            if reopened.current().digest == expected_head && verified == &expected =>
+        {
+            verified
+        }
+        _ => {
+            return Err(VerifiedLocalCompositionError::ProofMismatch(
+                "enrollment head changed during proof validation",
+            ));
+        }
+    };
+    Ok(VerifiedLocalEvidence {
+        enrollment_head: reopened.current().digest,
+        verification_digest: reopened_verified.verification_digest()?,
+        binding: binding.clone(),
+        bootstrap_batch_id: reopened_verified.bootstrap_batch_id,
+        accepted_frontier_state_digest: reopened_verified
+            .accepted_frontier_anchor
+            .accepted_frontier_state_digest,
+    })
+}
+
+fn freshly_validate_verified_local(
+    enrollment_binding: &EnrollmentBindingV1,
+    preparation_id: PreparationId,
+    proofs: &VerifiedLocalProofSet<'_>,
+) -> Result<VerifiedLocalV1, VerifiedLocalCompositionError> {
+    validate_verified_local_binding(enrollment_binding, proofs)?;
+    let reopened_store = ObjectStore::open(
+        proofs.accepted_authority.store().root_path(),
+        proofs.verified_publication.workspace_id(),
+    )
+    .map_err(BootstrapStreamingImportError::from)?;
+    let fresh_authority =
+        reopen_inactive_bootstrap_accepted_authority(proofs.verified_publication, reopened_store)?;
+    if fresh_authority.binding() != proofs.accepted_authority.binding() {
+        return Err(VerifiedLocalCompositionError::ProofMismatch(
+            "fresh accepted authority differs from the supplied retained authority",
+        ));
+    }
+    let fresh_backup =
+        verify_migration_source_backup(proofs.roots, proofs.prepared, proofs.verified_publication)?;
+    if &fresh_backup != proofs.source_backup {
+        return Err(VerifiedLocalCompositionError::ProofMismatch(
+            "fresh backup differs from the supplied backup proof",
+        ));
+    }
+    proofs
+        .sqlite
+        .database
+        .freshly_verify_inactive_bootstrap(proofs.accepted_authority, proofs.sqlite_projection)?;
+    let fresh_shadow = verify_inactive_bootstrap_shadow_projection(
+        proofs.graph,
+        proofs.roots,
+        proofs.prepared,
+        proofs.verified_publication,
+        &fresh_backup,
+        proofs.accepted_authority,
+        proofs.sqlite,
+        proofs.sqlite_projection,
+    )?;
+    if &fresh_shadow != proofs.shadow_projection {
+        return Err(VerifiedLocalCompositionError::ProofMismatch(
+            "fresh shadow projection differs from the supplied shadow proof",
+        ));
+    }
+
+    let authority = fresh_authority.binding();
+    let frontier = authority.accepted_frontier();
+    let aggregate = fresh_authority.publication().aggregate();
+    let bootstrap_batch_id = aggregate.parts().last().map(|part| part.batch_id());
+    let bootstrap_terminal_part_id = authority
+        .predecessor_terminal()
+        .map(|part| ContentDigest::from_bytes(*part.as_bytes()));
+    let reference_policy_digest = proofs
+        .verified_publication
+        .reference_catalog_policy()
+        .digest()
+        .map_err(|error| VerifiedLocalCompositionError::ProofBinding(error.to_string()))?;
+    let proof_binding_digest = verified_local_proof_binding_digest(
+        enrollment_binding,
+        proofs,
+        &fresh_authority,
+        &fresh_backup,
+        &fresh_shadow,
+        reference_policy_digest,
+        bootstrap_batch_id,
+    )?;
+    let source = proofs.prepared.source_capture();
+    let verified = VerifiedLocalV1 {
+        preparation_id,
+        source_inventory_digest: ContentDigest::from_bytes(
+            *source.inventory_description().sha256(),
+        ),
+        source_file_count: fresh_shadow.file_count(),
+        source_chunk_count: fresh_shadow.chunk_count(),
+        source_total_bytes: fresh_shadow.total_bytes(),
+        backup_manifest: fresh_backup.manifest(),
+        backup_restore_proof: fresh_backup.restore_proof(),
+        backup_evidence_digest: fresh_backup.evidence_digest(),
+        bootstrap_import_id: ContentDigest::from_bytes(*authority.import_id().as_bytes()),
+        bootstrap_part_count: authority.part_count(),
+        bootstrap_terminal_part_id,
+        bootstrap_batch_id,
+        accepted_frontier_anchor: AcceptedFrontierAnchorV1 {
+            acceptance_sequence: frontier.acceptance_sequence(),
+            accepted_frontier_state_digest: frontier.state_digest(),
+            history_generation: authority.history_generation(),
+            history_root: authority.history_root(),
+        },
+        accepted_history_record_count: authority.cold_record_count(),
+        catalog_row_count: fresh_shadow.catalog_binding().catalog_rows(),
+        sqlite_accepted_batch_count: proofs.sqlite_projection.accepted_batch_count(),
+        sqlite_semantic_projection_digest: proofs.sqlite_projection.semantic_projection_digest(),
+        sqlite_materialized_row_digest: proofs.sqlite_projection.materialized_row_digest(),
+        staged_projection_manifest: fresh_shadow.manifest(),
+        staged_projection_proof: fresh_shadow.proof(),
+        staged_file_count: fresh_shadow.staged_file_count(),
+        staged_total_bytes: fresh_shadow.staged_total_bytes(),
+        byte_compare_digest: fresh_shadow.staged_inventory_digest(),
+        shadow_evidence_digest: fresh_shadow.evidence_digest(),
+        proof_binding_digest,
+    };
+    verified.validate_fields()?;
+    Ok(verified)
+}
+
+fn validate_verified_local_binding(
+    enrollment: &EnrollmentBindingV1,
+    proofs: &VerifiedLocalProofSet<'_>,
+) -> Result<(), VerifiedLocalCompositionError> {
+    enrollment.validate_internal()?;
+    let accepted = proofs.accepted_authority.binding();
+    let storage = accepted.storage_binding();
+    let graph_resource = proofs.graph.canonical_resource_id()?;
+    let scope = proofs.graph.graph_text_scope_binding()?;
+    if enrollment.workspace_id != accepted.workspace_id()
+        || enrollment.lineage_digest != accepted.lineage_digest()
+        || enrollment.catalog_document_id != proofs.verified_publication.catalog_document_id()
+        || enrollment.endpoint_id != storage.endpoint.endpoint_id()
+        || enrollment.device_id != storage.endpoint.device_id()
+        || enrollment.graph_resource_id != graph_resource
+        || enrollment.graph_resource_id != accepted.graph_resource()
+        || enrollment.receipt_store_id != storage.receipt_store_id
+        || enrollment.graph_text_scope_binding != scope
+        || proofs.roots.graph_resource() != graph_resource
+        || proofs.source_backup.backup_root_identity() != proofs.roots.root_identity()
+        || proofs.shadow_projection.physical_root_identity() != proofs.roots.root_identity()
+    {
+        return Err(VerifiedLocalCompositionError::ProofMismatch(
+            "enrollment resources do not match the retained proof roots",
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verified_local_proof_binding_digest(
+    enrollment: &EnrollmentBindingV1,
+    proofs: &VerifiedLocalProofSet<'_>,
+    authority: &InactiveBootstrapAcceptedAuthority,
+    backup: &VerifiedSourceBackup,
+    shadow: &VerifiedShadowProjection,
+    reference_policy_digest: ContentDigest,
+    bootstrap_batch_id: Option<BatchId>,
+) -> Result<ContentDigest, VerifiedLocalCompositionError> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"tine/verified-local-proof-binding/v1\0");
+    hash_variable(
+        &mut hasher,
+        &serde_json::to_vec(enrollment)
+            .map_err(|error| VerifiedLocalCompositionError::ProofBinding(error.to_string()))?,
+    );
+    let binding = authority.binding();
+    hash_authority_binding(&mut hasher, binding)?;
+    hasher.update(proofs.roots.root_identity().as_bytes());
+    hasher.update(proofs.graph.canonical_resource_id()?.as_bytes());
+
+    let capture = proofs.prepared.source_capture();
+    hash_description(&mut hasher, capture.capture_identity()?);
+    hash_description(&mut hasher, capture.inventory_description());
+    hash_description(&mut hasher, capture.entries_description());
+    hash_description(&mut hasher, capture.chunks_description());
+    hasher.update(capture.source_file_count().to_be_bytes());
+    hasher.update(capture.source_chunk_count().to_be_bytes());
+
+    hasher.update(backup.backup_root_identity().as_bytes());
+    hasher.update(backup.publication_id());
+    hasher.update(backup.aggregate_digest());
+    hash_description(&mut hasher, backup.source_inventory());
+    hasher.update(backup.file_count().to_be_bytes());
+    hasher.update(backup.total_bytes().to_be_bytes());
+    hash_description(&mut hasher, backup.manifest());
+    hash_description(&mut hasher, backup.restore_proof());
+    hasher.update(backup.evidence_digest().as_bytes());
+
+    let frontier = binding.accepted_frontier();
+    hasher.update(frontier.state_digest().as_bytes());
+    hasher.update(frontier.acceptance_sequence().to_be_bytes());
+    hasher.update(frontier.document_count().to_be_bytes());
+    hasher.update(frontier.retained_bytes_total().to_be_bytes());
+    hasher.update(frontier.document_map_root_digest().as_bytes());
+    hasher.update(frontier.batch_map_root_digest().as_bytes());
+    hasher.update(
+        frontier
+            .reference_catalog_root()
+            .external_digest()
+            .map_err(|error| VerifiedLocalCompositionError::ProofBinding(error.to_string()))?
+            .as_bytes(),
+    );
+    hasher.update(reference_policy_digest.as_bytes());
+
+    let sqlite = proofs.sqlite_projection;
+    hasher.update(sqlite.claim().workspace_id().as_uuid().as_bytes());
+    hasher.update(sqlite.claim().lineage_digest().as_bytes());
+    hasher.update(sqlite.frontier_root().state_digest().as_bytes());
+    hasher.update(sqlite.accepted_batch_count().to_be_bytes());
+    hasher.update(sqlite.semantic_projection_digest().as_bytes());
+    hasher.update(sqlite.materialized_row_digest().as_bytes());
+
+    hasher.update(shadow.physical_root_identity().as_bytes());
+    hasher.update(shadow.publication_id().as_bytes());
+    hash_description(&mut hasher, shadow.source_capture());
+    hasher.update(shadow.file_count().to_be_bytes());
+    hasher.update(shadow.chunk_count().to_be_bytes());
+    hasher.update(shadow.directory_count().to_be_bytes());
+    hasher.update(shadow.total_bytes().to_be_bytes());
+    let catalog = shadow.catalog_binding();
+    hasher.update(catalog.accepted_frontier().as_bytes());
+    hasher.update(catalog.history_generation().to_be_bytes());
+    hasher.update(catalog.history_root().as_bytes());
+    hasher.update(catalog.catalog_root().as_bytes());
+    hasher.update(catalog.catalog_rows().to_be_bytes());
+    hash_description(&mut hasher, shadow.manifest());
+    hash_description(&mut hasher, shadow.proof());
+    hasher.update(shadow.staged_inventory_digest().as_bytes());
+    hasher.update(shadow.staged_file_count().to_be_bytes());
+    hasher.update(shadow.staged_total_bytes().to_be_bytes());
+    hasher.update(shadow.evidence_digest().as_bytes());
+    hasher.update(shadow.schema_binding_digest().as_bytes());
+    match bootstrap_batch_id {
+        Some(batch_id) => {
+            hasher.update([1]);
+            hasher.update(batch_id.as_uuid().as_bytes());
+        }
+        None => hasher.update([0]),
+    }
+    Ok(ContentDigest::from_bytes(hasher.finalize().into()))
+}
+
+fn hash_authority_binding(
+    hasher: &mut Sha256,
+    binding: &InactiveBootstrapAcceptedAuthorityBinding,
+) -> Result<(), VerifiedLocalCompositionError> {
+    hasher.update(binding.workspace_id().as_uuid().as_bytes());
+    hasher.update(binding.lineage_digest().as_bytes());
+    hasher.update(binding.graph_resource().as_bytes());
+    hasher.update(binding.publication_id().as_bytes());
+    hasher.update(binding.aggregate_digest().as_bytes());
+    hasher.update(binding.import_id().as_bytes());
+    hasher.update(binding.part_count().to_be_bytes());
+    match binding.predecessor_terminal() {
+        Some(part) => {
+            hasher.update([1]);
+            hasher.update(part.as_bytes());
+        }
+        None => hasher.update([0]),
+    }
+    hash_variable(
+        hasher,
+        &postcard::to_allocvec(binding.engine_binding())
+            .map_err(|error| VerifiedLocalCompositionError::ProofBinding(error.to_string()))?,
+    );
+    let storage = binding.storage_binding();
+    hasher.update(storage.endpoint.endpoint_id().as_uuid().as_bytes());
+    hasher.update(storage.endpoint.device_id().as_uuid().as_bytes());
+    hasher.update(storage.endpoint.graph_resource_id().as_bytes());
+    hasher.update(storage.receipt_store_id.as_bytes());
+    hasher.update(binding.bootstrap_binding().publication_id().as_bytes());
+    hasher.update(binding.bootstrap_binding().aggregate_digest().as_bytes());
+    hasher.update(binding.bootstrap_binding().part_count().to_be_bytes());
+    hash_variable(
+        hasher,
+        &binding.bootstrap_binding().final_frontier().encode(),
+    );
+    hasher.update(binding.archive_identity().binding_digest().as_bytes());
+    hasher.update(binding.history_generation().to_be_bytes());
+    hasher.update(binding.history_root().as_bytes());
+    hasher.update(binding.cold_record_count().to_be_bytes());
+    Ok(())
+}
+
+fn hash_description(hasher: &mut Sha256, description: BlobDescription) {
+    hasher.update(description.sha256());
+    hasher.update(description.byte_length().to_be_bytes());
+}
+
+fn hash_variable(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update((bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
 }
 
 fn persist_record_and_head(
@@ -3087,6 +3721,7 @@ pub(crate) enum EnrollmentError {
     JsonTokenBoundExceeded,
     BindingMismatch(EnrollmentBindingField),
     PublishedBatchMismatch,
+    InvalidVerifiedLocalTerminal,
     InvalidBlockedReason,
     IllegalLifecycle(&'static str),
     IllegalTransition,
@@ -3205,6 +3840,9 @@ impl fmt::Display for EnrollmentError {
             Self::PublishedBatchMismatch => {
                 formatter.write_str("published packet batch/import identity mismatch")
             }
+            Self::InvalidVerifiedLocalTerminal => formatter.write_str(
+                "verified-local terminal bootstrap identity or proof counts are inconsistent",
+            ),
             Self::InvalidBlockedReason => formatter.write_str("invalid blocked reason code"),
             Self::IllegalLifecycle(detail) => {
                 write!(formatter, "illegal enrollment lifecycle: {detail}")
@@ -3343,13 +3981,50 @@ mod tests {
         VerifiedLocalV1 {
             preparation_id: shadow().preparation_id,
             source_inventory_digest: shadow().source_inventory_digest,
-            backup_manifest_digest: digest(10),
-            backup_restore_proof_digest: digest(11),
-            bootstrap_batch_id: BatchId::from_uuid(Uuid::from_u128(12)),
-            accepted_frontier_anchor: anchor(13),
-            staged_projection_manifest_digest: digest(14),
+            source_file_count: 1,
+            source_chunk_count: 1,
+            source_total_bytes: 1,
+            backup_manifest: BlobDescription::of(b"backup-manifest"),
+            backup_restore_proof: BlobDescription::of(b"backup-restore-proof"),
+            backup_evidence_digest: digest(10),
+            bootstrap_import_id: digest(11),
+            bootstrap_part_count: 1,
+            bootstrap_terminal_part_id: Some(digest(12)),
+            bootstrap_batch_id: Some(BatchId::from_uuid(Uuid::from_u128(12))),
+            accepted_frontier_anchor: anchor(1),
+            accepted_history_record_count: 1,
+            catalog_row_count: 1,
+            sqlite_accepted_batch_count: 1,
+            sqlite_semantic_projection_digest: digest(13),
+            sqlite_materialized_row_digest: digest(14),
+            staged_projection_manifest: BlobDescription::of(b"shadow-manifest"),
+            staged_projection_proof: BlobDescription::of(b"shadow-proof"),
+            staged_file_count: 1,
+            staged_total_bytes: 1,
             byte_compare_digest: digest(15),
+            shadow_evidence_digest: digest(16),
+            proof_binding_digest: digest(17),
         }
+    }
+
+    fn zero_verified() -> VerifiedLocalV1 {
+        let mut value = verified();
+        value.source_file_count = 0;
+        value.source_chunk_count = 0;
+        value.source_total_bytes = 0;
+        value.bootstrap_part_count = 0;
+        value.bootstrap_terminal_part_id = None;
+        value.bootstrap_batch_id = None;
+        value.accepted_frontier_anchor.acceptance_sequence = 0;
+        value.accepted_frontier_anchor.history_generation = 0;
+        value.accepted_frontier_anchor.history_root =
+            super::super::object_store::EngineHistoryStore::empty_root();
+        value.accepted_history_record_count = 0;
+        value.catalog_row_count = 0;
+        value.sqlite_accepted_batch_count = 0;
+        value.staged_file_count = 0;
+        value.staged_total_bytes = 0;
+        value
     }
 
     fn active(handoff: HandoffV1, exclusion: LocalExclusionV1) -> EnrollmentLifecycleV1 {
@@ -3525,6 +4200,89 @@ mod tests {
             decode_record(&serde_json::to_vec(&compatibility).unwrap()),
             Err(EnrollmentError::UnsupportedCompatibility { .. })
         ));
+
+        let mut old: serde_json::Value = serde_json::from_slice(&canonical).unwrap();
+        old["schema_version"] = serde_json::json!(ENROLLMENT_RECORD_SCHEMA_VERSION - 1);
+        assert_eq!(
+            decode_record(&serde_json::to_vec(&old).unwrap()),
+            Err(EnrollmentError::UnsupportedRecordSchema(
+                ENROLLMENT_RECORD_SCHEMA_VERSION - 1
+            ))
+        );
+    }
+
+    #[test]
+    fn verified_local_terminal_identity_is_exact_optional_and_rejects_sentinels() {
+        let zero = zero_verified();
+        zero.validate_fields().unwrap();
+        let zero_json = serde_json::to_value(&zero).unwrap();
+        assert!(zero_json["bootstrap_batch_id"].is_null());
+        assert!(zero_json["bootstrap_terminal_part_id"].is_null());
+
+        let nonzero = verified();
+        nonzero.validate_fields().unwrap();
+        assert_eq!(
+            serde_json::from_value::<VerifiedLocalV1>(serde_json::to_value(&nonzero).unwrap())
+                .unwrap(),
+            nonzero
+        );
+
+        let mut zero_with_batch = zero.clone();
+        zero_with_batch.bootstrap_batch_id = Some(BatchId::from_uuid(Uuid::from_u128(0xfeed)));
+        assert_eq!(
+            zero_with_batch.validate_fields(),
+            Err(EnrollmentError::InvalidVerifiedLocalTerminal)
+        );
+
+        let mut nonzero_without_batch = nonzero.clone();
+        nonzero_without_batch.bootstrap_batch_id = None;
+        assert_eq!(
+            nonzero_without_batch.validate_fields(),
+            Err(EnrollmentError::InvalidVerifiedLocalTerminal)
+        );
+
+        let mut sentinel = nonzero;
+        sentinel.bootstrap_batch_id = Some(BatchId::for_import(ImportId::from_digest(
+            *sentinel.bootstrap_import_id.as_bytes(),
+        )));
+        assert_eq!(
+            sentinel.validate_fields(),
+            Err(EnrollmentError::InvalidVerifiedLocalTerminal)
+        );
+
+        let binding = test_binding();
+        let authority = test_authority(binding.clone(), test_lease_resource());
+        let initial = EnrollmentRecordV1::initial(
+            binding.clone(),
+            shadow(),
+            test_lease_resource(),
+            &authority,
+        )
+        .unwrap();
+        let initial_bytes = canonical_record_bytes(&initial).unwrap();
+        let initial_digest = ContentDigest::of(&initial_bytes);
+        let lifecycle = EnrollmentLifecycleV1::VerifiedLocal(sentinel);
+        let malformed = EnrollmentRecordV1 {
+            schema_version: ENROLLMENT_RECORD_SCHEMA_VERSION,
+            generation: 2,
+            previous: Some(initial_digest),
+            history_accumulator: compute_history_accumulator(
+                2,
+                Some(initial_digest),
+                Some(initial.history_accumulator),
+                &binding,
+                &lifecycle,
+            )
+            .unwrap(),
+            lease_resource_id: test_lease_resource(),
+            binding,
+            lifecycle,
+            checkpoint: None,
+        };
+        assert_eq!(
+            decode_record(&serde_json::to_vec(&malformed).unwrap()),
+            Err(EnrollmentError::InvalidVerifiedLocalTerminal)
+        );
     }
 
     #[test]

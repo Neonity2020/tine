@@ -319,6 +319,9 @@ pub(crate) struct VerifiedShadowProjection {
     source_backup: VerifiedSourceBackup,
     sqlite_projection: VerifiedBootstrapSqliteProjection,
     manifest: BlobDescription,
+    staged_inventory_digest: ContentDigest,
+    staged_file_count: u64,
+    staged_total_bytes: u64,
     proof: BlobDescription,
     evidence_digest: ContentDigest,
     schema: ShadowProjectionSchemaBinding,
@@ -344,6 +347,9 @@ impl PartialEq for VerifiedShadowProjection {
             && self.source_backup == other.source_backup
             && self.sqlite_projection == other.sqlite_projection
             && self.manifest == other.manifest
+            && self.staged_inventory_digest == other.staged_inventory_digest
+            && self.staged_file_count == other.staged_file_count
+            && self.staged_total_bytes == other.staged_total_bytes
             && self.proof == other.proof
             && self.evidence_digest == other.evidence_digest
             && self.schema == other.schema
@@ -381,6 +387,14 @@ impl VerifiedShadowProjection {
         self.file_count
     }
 
+    pub(crate) const fn chunk_count(&self) -> u64 {
+        self.chunk_count
+    }
+
+    pub(crate) const fn directory_count(&self) -> u64 {
+        self.directory_count
+    }
+
     pub(crate) const fn total_bytes(&self) -> u64 {
         self.total_bytes
     }
@@ -405,6 +419,18 @@ impl VerifiedShadowProjection {
         self.manifest
     }
 
+    pub(crate) const fn staged_inventory_digest(&self) -> ContentDigest {
+        self.staged_inventory_digest
+    }
+
+    pub(crate) const fn staged_file_count(&self) -> u64 {
+        self.staged_file_count
+    }
+
+    pub(crate) const fn staged_total_bytes(&self) -> u64 {
+        self.staged_total_bytes
+    }
+
     pub(crate) const fn proof(&self) -> BlobDescription {
         self.proof
     }
@@ -415,6 +441,12 @@ impl VerifiedShadowProjection {
 
     pub(crate) const fn schema(&self) -> ShadowProjectionSchemaBinding {
         self.schema
+    }
+
+    pub(crate) fn schema_binding_digest(&self) -> ContentDigest {
+        let mut bytes = Vec::with_capacity(18 * std::mem::size_of::<u32>());
+        self.schema.write(&mut bytes);
+        ContentDigest::of(&bytes)
     }
 
     pub(crate) const fn instrumentation(&self) -> &ShadowProjectionInstrumentation {
@@ -799,6 +831,9 @@ pub(crate) fn verify_inactive_bootstrap_shadow_projection(
         source_backup: fresh_backup,
         sqlite_projection: sqlite_projection.clone(),
         manifest,
+        staged_inventory_digest: staged.digest,
+        staged_file_count: staged.file_count,
+        staged_total_bytes: staged.total_bytes,
         proof,
         evidence_digest,
         schema: ShadowProjectionSchemaBinding::CURRENT,
@@ -2607,6 +2642,12 @@ mod tests {
 
     use super::*;
     use crate::oplog::bootstrap_import::MAX_OPERATIONS_PER_BOOTSTRAP_PART;
+    use crate::oplog::enrollment::{
+        compose_verified_local, compose_verified_local_at_cut_for_test,
+        enrollment_application_root_for_test, reopen_verified_local, CommitCut,
+        EnrollmentBindingV1, EnrollmentOpen, EnrollmentReader, PreparationId,
+        VerifiedLocalCompositionError, VerifiedLocalProofSet,
+    };
     use crate::oplog::hot_engine::{
         MaterializationStats, MaterializedBlock, MaterializedPage, ProjectionEndpointBinding,
         ProjectionPageState, ProjectionStorageBinding,
@@ -2765,6 +2806,53 @@ mod tests {
 
         fn assert_graph_unchanged(&self) {
             assert_eq!(snapshot_files(&self.graph_root), self.original_graph);
+        }
+
+        fn enrollment_binding(&self) -> EnrollmentBindingV1 {
+            let accepted = self.authority.binding();
+            let storage = accepted.storage_binding();
+            EnrollmentBindingV1::new(
+                accepted.workspace_id(),
+                accepted.lineage_digest(),
+                self.verified.catalog_document_id(),
+                storage.endpoint.endpoint_id(),
+                storage.endpoint.device_id(),
+                accepted.graph_resource(),
+                storage.receipt_store_id,
+                crate::oplog::CanonicalArchiveResourceId::from_capability_identity(
+                    b"verified-local-test",
+                    accepted.archive_identity().binding_digest().as_bytes(),
+                ),
+                self.graph.graph_text_scope_binding().unwrap(),
+            )
+            .unwrap()
+        }
+
+        fn enrollment_root(
+            &self,
+            label: &str,
+        ) -> crate::oplog::enrollment::EnrollmentApplicationRoot {
+            enrollment_application_root_for_test(
+                &self
+                    .root
+                    .path()
+                    .join(format!("enrollment-{}-{label}", Uuid::new_v4())),
+            )
+            .unwrap()
+        }
+
+        fn proofs<'a>(&'a self, shadow: &'a VerifiedShadowProjection) -> VerifiedLocalProofSet<'a> {
+            VerifiedLocalProofSet {
+                graph: &self.graph,
+                roots: &self.roots,
+                prepared: &self.prepared,
+                verified_publication: &self.verified,
+                source_backup: &self.backup,
+                accepted_authority: &self.authority,
+                sqlite: &self.sqlite,
+                sqlite_projection: &self.sqlite_proof,
+                shadow_projection: shadow,
+            }
         }
     }
 
@@ -2926,6 +3014,530 @@ mod tests {
             page_ids["notes/b/same-copy.org"]
         );
         rich.assert_graph_unchanged();
+    }
+
+    #[test]
+    fn verified_local_composes_zero_one_and_multipart_terminal_identity_exactly() {
+        let zero = Fixture::new("verified-local-zero", None, Vec::new());
+        let zero_shadow = zero.verify().unwrap();
+        let zero_root = zero.enrollment_root("zero");
+        let zero_binding = zero.enrollment_binding();
+        let zero_preparation = PreparationId::new();
+        let zero_before = snapshot_files(&zero.graph_root);
+        let zero_evidence = compose_verified_local(
+            &zero_root,
+            zero_binding.clone(),
+            zero_preparation,
+            &zero.proofs(&zero_shadow),
+        )
+        .unwrap();
+        assert_eq!(zero.verified.part_count(), 0);
+        assert_eq!(zero_evidence.bootstrap_batch_id(), None);
+        assert_eq!(snapshot_files(&zero.graph_root), zero_before);
+        let zero_repeat = compose_verified_local(
+            &zero_root,
+            zero_binding.clone(),
+            zero_preparation,
+            &zero.proofs(&zero_shadow),
+        )
+        .unwrap();
+        assert_eq!(
+            zero_repeat.enrollment_head(),
+            zero_evidence.enrollment_head()
+        );
+        assert_eq!(
+            reopen_verified_local(&zero_root, &zero_binding, &zero.proofs(&zero_shadow))
+                .unwrap()
+                .verification_digest(),
+            zero_evidence.verification_digest()
+        );
+
+        let one = Fixture::new(
+            "verified-local-one",
+            None,
+            vec![("pages/one.md".into(), b"- one\n".to_vec())],
+        );
+        let one_shadow = one.verify().unwrap();
+        let one_root = one.enrollment_root("one");
+        let one_binding = one.enrollment_binding();
+        let one_evidence = compose_verified_local(
+            &one_root,
+            one_binding,
+            PreparationId::new(),
+            &one.proofs(&one_shadow),
+        )
+        .unwrap();
+        assert_eq!(one.verified.part_count(), 1);
+        assert_eq!(
+            one_evidence.bootstrap_batch_id(),
+            one.prepared
+                .aggregate()
+                .parts()
+                .last()
+                .map(|part| part.batch_id())
+        );
+        one.assert_graph_unchanged();
+
+        let mut multipart_bytes = Vec::new();
+        for ordinal in 0..4096 {
+            multipart_bytes.extend_from_slice(format!("- operation {ordinal:04}\n").as_bytes());
+        }
+        let multipart = Fixture::new(
+            "verified-local-4096",
+            None,
+            vec![("pages/multipart.md".into(), multipart_bytes)],
+        );
+        let multipart_shadow = multipart.verify().unwrap();
+        assert_eq!(multipart.verified.part_count(), 2);
+        let multipart_root = multipart.enrollment_root("multipart");
+        let multipart_evidence = compose_verified_local(
+            &multipart_root,
+            multipart.enrollment_binding(),
+            PreparationId::new(),
+            &multipart.proofs(&multipart_shadow),
+        )
+        .unwrap();
+        assert_eq!(
+            multipart_evidence.bootstrap_batch_id(),
+            multipart
+                .prepared
+                .aggregate()
+                .parts()
+                .last()
+                .map(|part| part.batch_id())
+        );
+        multipart.assert_graph_unchanged();
+    }
+
+    fn enrollment_head(
+        root: &crate::oplog::enrollment::EnrollmentApplicationRoot,
+        binding: &EnrollmentBindingV1,
+    ) -> ContentDigest {
+        match EnrollmentReader::open_existing(root, binding).unwrap() {
+            EnrollmentOpen::Present(reader) => reader.current().digest(),
+            EnrollmentOpen::Absent => panic!("expected enrollment head"),
+        }
+    }
+
+    fn enrollment_head_file(
+        root: &crate::oplog::enrollment::EnrollmentApplicationRoot,
+        binding: &EnrollmentBindingV1,
+    ) -> PathBuf {
+        root.path()
+            .join("sparse-storage/v2/local")
+            .join(binding.graph_resource_id().to_string())
+            .join("enrollment/head")
+    }
+
+    fn enrollment_record_file(
+        root: &crate::oplog::enrollment::EnrollmentApplicationRoot,
+        binding: &EnrollmentBindingV1,
+        digest: ContentDigest,
+    ) -> PathBuf {
+        enrollment_head_file(root, binding)
+            .parent()
+            .unwrap()
+            .join("records")
+            .join(format!("{digest}.enrollment"))
+    }
+
+    fn find_file_with_prefix(root: &Path, prefix: &str) -> PathBuf {
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(directory) = stack.pop() {
+            for entry in fs::read_dir(directory).unwrap().map(Result::unwrap) {
+                if entry.file_type().unwrap().is_dir() {
+                    stack.push(entry.path());
+                } else if entry.file_name().to_string_lossy().starts_with(prefix) {
+                    return entry.path();
+                }
+            }
+        }
+        panic!("missing file with prefix {prefix}");
+    }
+
+    #[test]
+    fn verified_local_cross_proof_mismatches_never_advance_shadow_head() {
+        let first = rich_fixture("verified-local-cross-first");
+        let first_shadow = first.verify().unwrap();
+        let second = Fixture::new(
+            "verified-local-cross-second",
+            None,
+            vec![("pages/second.md".into(), b"- second\n".to_vec())],
+        );
+        let second_shadow = second.verify().unwrap();
+        let root = first.enrollment_root("cross");
+        let binding = first.enrollment_binding();
+        let preparation = PreparationId::new();
+
+        let wrong_backup = VerifiedLocalProofSet {
+            source_backup: &second.backup,
+            ..first.proofs(&first_shadow)
+        };
+        assert!(
+            compose_verified_local(&root, binding.clone(), preparation, &wrong_backup).is_err()
+        );
+        let shadow_head = enrollment_head(&root, &binding);
+
+        for proofs in [
+            VerifiedLocalProofSet {
+                accepted_authority: &second.authority,
+                ..first.proofs(&first_shadow)
+            },
+            VerifiedLocalProofSet {
+                sqlite_projection: &second.sqlite_proof,
+                ..first.proofs(&first_shadow)
+            },
+            VerifiedLocalProofSet {
+                shadow_projection: &second_shadow,
+                ..first.proofs(&first_shadow)
+            },
+            VerifiedLocalProofSet {
+                roots: &second.roots,
+                ..first.proofs(&first_shadow)
+            },
+        ] {
+            assert!(compose_verified_local(&root, binding.clone(), preparation, &proofs).is_err());
+            assert_eq!(enrollment_head(&root, &binding), shadow_head);
+        }
+        let graph_before = snapshot_files(&first.graph_root);
+        compose_verified_local(&root, binding, preparation, &first.proofs(&first_shadow)).unwrap();
+        assert_eq!(snapshot_files(&first.graph_root), graph_before);
+        first.assert_graph_unchanged();
+        second.assert_graph_unchanged();
+    }
+
+    #[test]
+    fn verified_local_all_enrollment_durability_cuts_resume_one_exact_head() {
+        let fixture = Fixture::new(
+            "verified-local-enrollment-cuts",
+            None,
+            vec![(
+                "pages/cuts.md".into(),
+                b"- enrollment durability\n".to_vec(),
+            )],
+        );
+        let shadow = fixture.verify().unwrap();
+        let binding = fixture.enrollment_binding();
+        let cuts = [
+            CommitCut::AfterRecordTempCreate,
+            CommitCut::AfterRecordWrite,
+            CommitCut::AfterRecordFileSync,
+            CommitCut::AfterRecordLink,
+            CommitCut::AfterRecordInsert,
+            CommitCut::AfterRecordsDirectorySync,
+            CommitCut::AfterHeadTempCreate,
+            CommitCut::AfterHeadWrite,
+            CommitCut::AfterHeadFileSync,
+            CommitCut::AfterHeadReplace,
+            CommitCut::AfterEnrollmentDirectorySync,
+        ];
+        for cut in cuts {
+            let root = fixture.enrollment_root("cut");
+            let preparation = PreparationId::new();
+            assert!(matches!(
+                compose_verified_local_at_cut_for_test(
+                    &root,
+                    binding.clone(),
+                    preparation,
+                    &fixture.proofs(&shadow),
+                    cut,
+                ),
+                Err(VerifiedLocalCompositionError::Enrollment(
+                    crate::oplog::enrollment::EnrollmentError::InjectedCrashCut(_)
+                ))
+            ));
+            let resumed = compose_verified_local(
+                &root,
+                binding.clone(),
+                preparation,
+                &fixture.proofs(&shadow),
+            )
+            .unwrap();
+            let repeated = compose_verified_local(
+                &root,
+                binding.clone(),
+                preparation,
+                &fixture.proofs(&shadow),
+            )
+            .unwrap();
+            assert_eq!(resumed.enrollment_head(), repeated.enrollment_head());
+            assert_eq!(
+                resumed.verification_digest(),
+                repeated.verification_digest()
+            );
+        }
+        fixture.assert_graph_unchanged();
+    }
+
+    #[test]
+    fn verified_local_partial_record_write_stays_explicitly_shadow_import() {
+        let fixture = Fixture::new(
+            "verified-local-partial-record",
+            None,
+            vec![("pages/partial.md".into(), b"- partial\n".to_vec())],
+        );
+        let shadow = fixture.verify().unwrap();
+        let root = fixture.enrollment_root("partial");
+        let binding = fixture.enrollment_binding();
+        let preparation = PreparationId::new();
+        assert!(compose_verified_local_at_cut_for_test(
+            &root,
+            binding.clone(),
+            preparation,
+            &fixture.proofs(&shadow),
+            CommitCut::AfterRecordWrite,
+        )
+        .is_err());
+        let shadow_head = enrollment_head(&root, &binding);
+        let temp = find_file_with_prefix(root.path(), ".record-tmp-");
+        let length = fs::metadata(&temp).unwrap().len();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&temp)
+            .unwrap()
+            .set_len(length / 2)
+            .unwrap();
+        assert!(matches!(
+            compose_verified_local(
+                &root,
+                binding.clone(),
+                preparation,
+                &fixture.proofs(&shadow),
+            ),
+            Err(VerifiedLocalCompositionError::Enrollment(
+                crate::oplog::enrollment::EnrollmentError::AmbiguousRecordPublication
+            ))
+        ));
+        assert_eq!(enrollment_head(&root, &binding), shadow_head);
+
+        let head_root = fixture.enrollment_root("partial-head");
+        let head_preparation = PreparationId::new();
+        assert!(compose_verified_local_at_cut_for_test(
+            &head_root,
+            binding.clone(),
+            head_preparation,
+            &fixture.proofs(&shadow),
+            CommitCut::AfterHeadWrite,
+        )
+        .is_err());
+        let head_temp = find_file_with_prefix(head_root.path(), ".head-tmp-");
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&head_temp)
+            .unwrap()
+            .set_len(7)
+            .unwrap();
+        let resumed = compose_verified_local(
+            &head_root,
+            binding,
+            head_preparation,
+            &fixture.proofs(&shadow),
+        )
+        .unwrap();
+        assert_eq!(
+            reopen_verified_local(&head_root, resumed.binding(), &fixture.proofs(&shadow))
+                .unwrap()
+                .enrollment_head(),
+            resumed.enrollment_head()
+        );
+        fixture.assert_graph_unchanged();
+    }
+
+    #[test]
+    fn verified_local_corrupt_or_missing_proofs_fail_before_head_advance() {
+        let backup_fixture = Fixture::new(
+            "verified-local-corrupt-backup",
+            None,
+            vec![("pages/backup.md".into(), b"- backup\n".to_vec())],
+        );
+        let backup_shadow = backup_fixture.verify().unwrap();
+        let backup_root = backup_fixture.enrollment_root("backup");
+        let backup_binding = backup_fixture.enrollment_binding();
+        let backup_preparation = PreparationId::new();
+        fs::remove_file(backup_fixture.backup.directory().join("manifest.bin")).unwrap();
+        assert!(compose_verified_local(
+            &backup_root,
+            backup_binding.clone(),
+            backup_preparation,
+            &backup_fixture.proofs(&backup_shadow),
+        )
+        .is_err());
+        let backup_head = enrollment_head(&backup_root, &backup_binding);
+        assert_eq!(enrollment_head(&backup_root, &backup_binding), backup_head);
+
+        let sqlite_fixture = Fixture::new(
+            "verified-local-missing-sqlite",
+            None,
+            vec![("pages/sqlite.md".into(), b"- sqlite\n".to_vec())],
+        );
+        let sqlite_shadow = sqlite_fixture.verify().unwrap();
+        let sqlite_root = sqlite_fixture.enrollment_root("sqlite");
+        let sqlite_binding = sqlite_fixture.enrollment_binding();
+        let sqlite_preparation = PreparationId::new();
+        let database_name = sqlite_fixture
+            .sqlite
+            .database
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy();
+        let sqlite_checkpoint = sqlite_fixture
+            .sqlite
+            .database
+            .path()
+            .with_file_name(format!("{database_name}-auth"));
+        fs::remove_file(&sqlite_checkpoint).unwrap();
+        assert!(compose_verified_local(
+            &sqlite_root,
+            sqlite_binding.clone(),
+            sqlite_preparation,
+            &sqlite_fixture.proofs(&sqlite_shadow),
+        )
+        .is_err());
+        let sqlite_head = enrollment_head(&sqlite_root, &sqlite_binding);
+        fs::write(&sqlite_checkpoint, b"corrupt checkpoint").unwrap();
+        assert!(compose_verified_local(
+            &sqlite_root,
+            sqlite_binding.clone(),
+            sqlite_preparation,
+            &sqlite_fixture.proofs(&sqlite_shadow),
+        )
+        .is_err());
+        assert_eq!(enrollment_head(&sqlite_root, &sqlite_binding), sqlite_head);
+
+        let shadow_fixture = Fixture::new(
+            "verified-local-corrupt-shadow",
+            None,
+            vec![("pages/shadow.md".into(), b"- shadow\n".to_vec())],
+        );
+        let shadow_proof = shadow_fixture.verify().unwrap();
+        let shadow_root = shadow_fixture.enrollment_root("shadow");
+        let shadow_binding = shadow_fixture.enrollment_binding();
+        let shadow_preparation = PreparationId::new();
+        fs::write(shadow_proof.directory().join(PROOF_FILE), b"corrupt").unwrap();
+        assert!(compose_verified_local(
+            &shadow_root,
+            shadow_binding.clone(),
+            shadow_preparation,
+            &shadow_fixture.proofs(&shadow_proof),
+        )
+        .is_err());
+        let shadow_head = enrollment_head(&shadow_root, &shadow_binding);
+        assert_eq!(enrollment_head(&shadow_root, &shadow_binding), shadow_head);
+    }
+
+    #[test]
+    fn verified_local_reopen_rejects_enrollment_record_and_head_corruption() {
+        for corrupt_head in [false, true] {
+            let fixture = Fixture::new(
+                if corrupt_head {
+                    "verified-local-head-corruption"
+                } else {
+                    "verified-local-record-corruption"
+                },
+                None,
+                vec![("pages/enrollment.md".into(), b"- enrollment\n".to_vec())],
+            );
+            let shadow = fixture.verify().unwrap();
+            let root = fixture.enrollment_root("enrollment");
+            let binding = fixture.enrollment_binding();
+            let evidence = compose_verified_local(
+                &root,
+                binding.clone(),
+                PreparationId::new(),
+                &fixture.proofs(&shadow),
+            )
+            .unwrap();
+            if corrupt_head {
+                fs::write(enrollment_head_file(&root, &binding), b"corrupt\n").unwrap();
+            } else {
+                let record = enrollment_record_file(&root, &binding, evidence.enrollment_head());
+                let mut bytes = fs::read(&record).unwrap();
+                let last = bytes.len() - 1;
+                bytes[last] ^= 1;
+                fs::write(record, bytes).unwrap();
+            }
+            assert!(reopen_verified_local(&root, &binding, &fixture.proofs(&shadow)).is_err());
+            fixture.assert_graph_unchanged();
+        }
+    }
+
+    #[test]
+    fn verified_local_source_mutation_and_blocked_lifecycle_cannot_advance() {
+        let mutation = Fixture::new(
+            "verified-local-source-mutation",
+            None,
+            vec![("pages/source.md".into(), b"- before\n".to_vec())],
+        );
+        let mutation_shadow = mutation.verify().unwrap();
+        let mutation_root = mutation.enrollment_root("mutation");
+        let mutation_binding = mutation.enrollment_binding();
+        fs::write(
+            mutation.graph_root.join("pages/source.md"),
+            b"- changed before transition\n",
+        )
+        .unwrap();
+        assert!(compose_verified_local(
+            &mutation_root,
+            mutation_binding.clone(),
+            PreparationId::new(),
+            &mutation.proofs(&mutation_shadow),
+        )
+        .is_err());
+        let mutation_head = enrollment_head(&mutation_root, &mutation_binding);
+        assert_eq!(
+            enrollment_head(&mutation_root, &mutation_binding),
+            mutation_head
+        );
+
+        let blocked = Fixture::new(
+            "verified-local-blocked",
+            None,
+            vec![("pages/blocked.md".into(), b"- blocked\n".to_vec())],
+        );
+        let blocked_shadow = blocked.verify().unwrap();
+        let blocked_root = blocked.enrollment_root("blocked");
+        let blocked_binding = blocked.enrollment_binding();
+        let preparation = PreparationId::new();
+        let evidence = compose_verified_local(
+            &blocked_root,
+            blocked_binding.clone(),
+            preparation,
+            &blocked.proofs(&blocked_shadow),
+        )
+        .unwrap();
+        let mut writer = match crate::oplog::enrollment::EnrollmentWriter::open_existing(
+            &blocked_root,
+            &blocked_binding,
+        )
+        .unwrap()
+        {
+            EnrollmentOpen::Present(writer) => writer,
+            EnrollmentOpen::Absent => unreachable!(),
+        };
+        let blocked_head = writer
+            .block_current(
+                evidence.enrollment_head(),
+                "proof.failed".into(),
+                ContentDigest::of(b"blocked evidence"),
+            )
+            .unwrap()
+            .digest();
+        drop(writer);
+        assert!(matches!(
+            compose_verified_local(
+                &blocked_root,
+                blocked_binding.clone(),
+                preparation,
+                &blocked.proofs(&blocked_shadow),
+            ),
+            Err(VerifiedLocalCompositionError::WrongLifecycle(_))
+        ));
+        assert_eq!(
+            enrollment_head(&blocked_root, &blocked_binding),
+            blocked_head
+        );
+        blocked.assert_graph_unchanged();
     }
 
     #[test]

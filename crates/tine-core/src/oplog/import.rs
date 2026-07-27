@@ -466,6 +466,14 @@ impl InactiveBootstrapVerifiedPublication {
     pub(crate) const fn instrumentation(&self) -> &InactiveBootstrapOrchestrationInstrumentation {
         &self.instrumentation
     }
+
+    pub(crate) const fn catalog_document_id(&self) -> DocumentId {
+        self.catalog_document_id
+    }
+
+    pub(crate) const fn reference_catalog_policy(&self) -> &ReferenceCatalogPolicyV1 {
+        &self.reference_catalog_policy
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
