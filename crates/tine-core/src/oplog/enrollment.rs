@@ -104,6 +104,75 @@ thread_local! {
     static ENROLLMENT_RECORD_READS: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
     };
+    static ENROLLMENT_HEAD_READS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+    static ENROLLMENT_NAMESPACE_SCANS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+    static ENROLLMENT_DIRECTORY_OPENS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+    static ENROLLMENT_LEASE_ACQUISITIONS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+    static ENROLLMENT_AUTHORITY_CLAIM_READS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+/// Exact causal accounting for the enrollment journal's filesystem work.
+///
+/// Every field is an operation count, never a duration, so a bounded-admission
+/// assertion is deterministic and machine independent.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct EnrollmentInstrumentation {
+    /// Authenticated content-addressed record reads. This is the record-chain
+    /// walk a per-mutation admission must never perform.
+    pub(crate) record_reads: usize,
+    /// Reads of the tiny fixed-size committed head file.
+    pub(crate) head_reads: usize,
+    /// Enrollment namespace enumerations.
+    pub(crate) namespace_scans: usize,
+    /// Enrollment directory-tree opens.
+    pub(crate) directory_opens: usize,
+    /// OS enrollment-lease acquisitions.
+    pub(crate) lease_acquisitions: usize,
+    /// Authority-claim file reads.
+    pub(crate) authority_claim_reads: usize,
+}
+
+#[cfg(test)]
+impl EnrollmentInstrumentation {
+    pub(crate) fn capture() -> Self {
+        Self {
+            record_reads: ENROLLMENT_RECORD_READS.with(std::cell::Cell::get),
+            head_reads: ENROLLMENT_HEAD_READS.with(std::cell::Cell::get),
+            namespace_scans: ENROLLMENT_NAMESPACE_SCANS.with(std::cell::Cell::get),
+            directory_opens: ENROLLMENT_DIRECTORY_OPENS.with(std::cell::Cell::get),
+            lease_acquisitions: ENROLLMENT_LEASE_ACQUISITIONS.with(std::cell::Cell::get),
+            authority_claim_reads: ENROLLMENT_AUTHORITY_CLAIM_READS.with(std::cell::Cell::get),
+        }
+    }
+
+    /// The work performed since `self` was captured.
+    pub(crate) fn since(self) -> Self {
+        let now = Self::capture();
+        Self {
+            record_reads: now.record_reads - self.record_reads,
+            head_reads: now.head_reads - self.head_reads,
+            namespace_scans: now.namespace_scans - self.namespace_scans,
+            directory_opens: now.directory_opens - self.directory_opens,
+            lease_acquisitions: now.lease_acquisitions - self.lease_acquisitions,
+            authority_claim_reads: now.authority_claim_reads - self.authority_claim_reads,
+        }
+    }
+}
+
+#[cfg(test)]
+fn count(counter: &'static std::thread::LocalKey<std::cell::Cell<usize>>) {
+    counter.with(|value| value.set(value.get().saturating_add(1)));
 }
 
 /// A private application-data root selected by Tine, never a graph path.
@@ -537,6 +606,8 @@ struct EnrollmentAuthority {
 
 impl EnrollmentAuthority {
     fn validate_current(&self) -> Result<(), EnrollmentError> {
+        #[cfg(test)]
+        count(&ENROLLMENT_AUTHORITY_CLAIM_READS);
         validate_authoritative_file(&self.file, "enrollment authority claim")?;
         if authoritative_file_identity(&self.file)? != self.identity {
             return Err(EnrollmentError::AuthorityMismatch);
@@ -1502,6 +1573,42 @@ impl EnrollmentWriter {
 
     pub(crate) fn current(&self) -> &EnrollmentSnapshot {
         self.reader.current()
+    }
+
+    /// Read the committed head digest alone through the retained enrollment
+    /// directory capability.
+    ///
+    /// This is one bounded read of the fixed 65-byte head file, with the same
+    /// no-follow authoritative-file validation `read_head` always performs. It
+    /// enumerates no namespace, reacquires no lease, rereads no authority
+    /// claim, and reads no record.
+    fn committed_head(&self) -> Result<Option<ContentDigest>, EnrollmentError> {
+        read_head(&self.reader.directories.enrollment)
+    }
+
+    /// Repeat the complete authenticated open over the *retained* capabilities.
+    ///
+    /// This is exactly the proof `EnrollmentReader::open_existing` performs —
+    /// namespace validation, lease identity, authority-claim identity and
+    /// bytes, and the bounded authenticated head/checkpoint chain — except that
+    /// it runs against the directory, lease, and authority handles this session
+    /// already holds instead of resolving and reacquiring them. Reopening from
+    /// the pathname would drop and retake the exclusive lease, which is the one
+    /// thing a retained session must never do.
+    fn reauthenticate(&mut self) -> Result<&EnrollmentSnapshot, EnrollmentError> {
+        self.lease.validate_current()?;
+        self.reader.authority.validate_current()?;
+        validate_namespaces(&self.reader.directories)?;
+        let binding = self.reader.current.record.binding.clone();
+        let current = read_head_and_chain(
+            &self.reader.directories,
+            &binding,
+            self.lease.resource_id,
+            &self.reader.authority.material,
+        )?
+        .ok_or(EnrollmentError::MalformedHead)?;
+        self.reader.current = current;
+        Ok(&self.reader.current)
     }
 
     pub(crate) fn audit_chain_page(
@@ -2532,6 +2639,199 @@ fn transition_local_active_handoff_at_cut(
     Ok(reopened)
 }
 
+/// A writable enrollment session retained for one promoted runtime lifetime.
+///
+/// The sparse-oplog runtime used to reopen the whole enrollment journal on
+/// every single admission: resolve and open the directory tree, enumerate the
+/// namespace, stat the lease, read and byte-compare the authority claim, and
+/// walk the authenticated record chain back to its checkpoint — twice, because
+/// the promoted binding proof and the mutation permit each did it. That is
+/// per-keystroke work whose cost is set by the enrollment's checkpoint phase,
+/// not by anything the keystroke changed.
+///
+/// This value acquires the [`EnrollmentLease`] exactly once and retains the
+/// directory, lease, and authority capabilities for the whole promoted runtime.
+/// The documented global lock order is unchanged and is why the session must be
+/// acquired first: enrollment lease, then archive/engine lease, then graph and
+/// process-local locks. Because the lease is exclusive and retained, every
+/// journal mutation in the promoted path must borrow this session; a nested
+/// [`EnrollmentWriter::open_existing`] would contend with its own process.
+///
+/// Admission cost is then split honestly:
+///
+/// * the *cheap* check is [`Self::revalidate`] with an unchanged head — one
+///   bounded read of the fixed-size head file, and nothing else;
+/// * the *full* check is the complete authenticated reopen above, performed
+///   only when the committed head actually changed, and unconditionally at
+///   every open, handoff, and recovery boundary.
+///
+/// An unchanged head is exact authority, not a heuristic: the head names one
+/// content-addressed record whose bytes are verified against that digest on
+/// read, and that record's digest commits to its complete hash-linked ancestry,
+/// its binding, its lease resource, and its authenticated checkpoint. There is
+/// no state the full reopen could observe that an identical head permits to
+/// differ.
+pub(crate) struct RetainedEnrollmentSession {
+    writer: EnrollmentWriter,
+    verification_digest: ContentDigest,
+    committed: CommittedLocalActive,
+    /// Bumped on every full authenticated revalidation and every journal
+    /// mutation. An admission window captures it, so a window minted before a
+    /// lifecycle change can never authorize work after it.
+    binding_generation: u64,
+    #[cfg(test)]
+    full_revalidations: usize,
+}
+
+impl RetainedEnrollmentSession {
+    /// Acquire the exclusive enrollment lease and perform the complete
+    /// authenticated open for one committed `LocalActive` verification digest.
+    ///
+    /// This performs no proof revalidation: it is the runtime enrollment/session
+    /// capability, not the activation gate. It still refuses every lifecycle
+    /// other than `LocalActive`, every non-`Idle` sync state, and every other
+    /// verification digest, so a blocked, published, rolled-back, or foreign
+    /// enrollment can never retain a session.
+    pub(crate) fn open(
+        root: &EnrollmentApplicationRoot,
+        binding: &EnrollmentBindingV1,
+        verification_digest: ContentDigest,
+    ) -> Result<Self, VerifiedLocalCompositionError> {
+        binding.validate_internal()?;
+        let writer = match EnrollmentWriter::open_existing(root, binding)? {
+            EnrollmentOpen::Absent => {
+                return Err(VerifiedLocalCompositionError::WrongLifecycle(
+                    "LocalActive enrollment is absent",
+                ));
+            }
+            EnrollmentOpen::Present(writer) => writer,
+        };
+        let committed = observe_local_active(writer.current(), binding)?;
+        require_session_record(&committed, verification_digest)?;
+        Ok(Self {
+            writer,
+            verification_digest,
+            committed,
+            binding_generation: 0,
+            #[cfg(test)]
+            full_revalidations: 0,
+        })
+    }
+
+    pub(crate) const fn committed(&self) -> &CommittedLocalActive {
+        &self.committed
+    }
+
+    pub(crate) const fn verification_digest(&self) -> ContentDigest {
+        self.verification_digest
+    }
+
+    /// The session-local binding generation. It changes on every full
+    /// authenticated revalidation and every journal mutation.
+    pub(crate) const fn binding_generation(&self) -> u64 {
+        self.binding_generation
+    }
+
+    /// The cheap exact head-digest check: one bounded read of the fixed-size
+    /// committed head file, compared against the retained committed head.
+    pub(crate) fn committed_head_is_unchanged(&self) -> Result<bool, EnrollmentError> {
+        Ok(self.writer.committed_head()? == Some(self.committed.enrollment_head))
+    }
+
+    /// Revalidate the committed record for one admission.
+    ///
+    /// An unchanged head returns the retained record without one namespace
+    /// enumeration, lease reacquisition, authority-claim reread, or record
+    /// read. Any observed change forces the complete authenticated reopen.
+    pub(crate) fn revalidate(
+        &mut self,
+    ) -> Result<&CommittedLocalActive, VerifiedLocalCompositionError> {
+        if self.committed_head_is_unchanged()? {
+            return Ok(&self.committed);
+        }
+        self.reauthenticate()
+    }
+
+    /// The complete authenticated reopen, over the retained capabilities.
+    ///
+    /// Every open, handoff, and recovery boundary calls this unconditionally,
+    /// and so does [`Self::revalidate`] the moment the head is not exactly the
+    /// retained one.
+    pub(crate) fn reauthenticate(
+        &mut self,
+    ) -> Result<&CommittedLocalActive, VerifiedLocalCompositionError> {
+        let committed = {
+            let snapshot = self.writer.reauthenticate()?;
+            let binding = snapshot.record.binding.clone();
+            observe_local_active(snapshot, &binding)?
+        };
+        require_session_record(&committed, self.verification_digest)?;
+        self.committed = committed;
+        self.binding_generation = self.binding_generation.saturating_add(1);
+        #[cfg(test)]
+        {
+            self.full_revalidations = self.full_revalidations.saturating_add(1);
+        }
+        Ok(&self.committed)
+    }
+
+    /// Durably move this session's committed `LocalActive` record between
+    /// handoff states, on the retained lease.
+    ///
+    /// This is the retained-session form of
+    /// [`transition_local_active_handoff`]: same narrow compare-and-swap, same
+    /// carried-through immutable anchor, same fresh committed-head proof — but
+    /// it borrows the session instead of opening a second writer, which would
+    /// contend with the lease this session already holds.
+    ///
+    /// A handoff is a lifecycle boundary, so it is bracketed by full
+    /// authenticated revalidations rather than by the cheap head check.
+    pub(crate) fn transition_handoff(
+        &mut self,
+        target: LocalActiveHandoff,
+    ) -> Result<&CommittedLocalActive, VerifiedLocalCompositionError> {
+        self.reauthenticate()?;
+        if self.committed.handoff == target {
+            return Ok(&self.committed);
+        }
+        let expected_head = self.committed.enrollment_head;
+        let lifecycle =
+            local_active_lifecycle(self.verification_digest, self.committed.anchor, target);
+        self.writer.transition(expected_head, lifecycle)?;
+        self.reauthenticate()?;
+        if self.committed.handoff != target {
+            return Err(VerifiedLocalCompositionError::StaleEvidence(
+                "committed LocalActive handoff state changed during the transition",
+            ));
+        }
+        Ok(&self.committed)
+    }
+
+    /// How many complete authenticated reopens this session has performed.
+    #[cfg(test)]
+    pub(crate) const fn full_revalidations(&self) -> usize {
+        self.full_revalidations
+    }
+}
+
+/// Every invariant a retained runtime session requires of a committed record.
+fn require_session_record(
+    committed: &CommittedLocalActive,
+    verification_digest: ContentDigest,
+) -> Result<(), VerifiedLocalCompositionError> {
+    if committed.verification_digest != verification_digest {
+        return Err(VerifiedLocalCompositionError::ProofMismatch(
+            "committed LocalActive record binds another verification digest",
+        ));
+    }
+    if committed.sync != LocalActiveSync::Idle {
+        return Err(VerifiedLocalCompositionError::WrongLifecycle(
+            "LocalActive runtime authority requires an Idle sync state",
+        ));
+    }
+    Ok(())
+}
+
 /// Persist the exact `Unsafe { session } + Published` exclusion state for one
 /// committed `LocalActive` record.
 ///
@@ -3279,6 +3579,8 @@ fn validate_record_authority(
 }
 
 fn read_head(directory: &Dir) -> Result<Option<ContentDigest>, EnrollmentError> {
+    #[cfg(test)]
+    count(&ENROLLMENT_HEAD_READS);
     let metadata = match directory.symlink_metadata(HEAD_FILE) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
@@ -3640,6 +3942,8 @@ fn reject_unsafe_head_target(directory: &Dir) -> Result<(), EnrollmentError> {
 }
 
 fn validate_namespaces(directories: &EnrollmentDirectories) -> Result<(), EnrollmentError> {
+    #[cfg(test)]
+    count(&ENROLLMENT_NAMESPACE_SCANS);
     validate_private_directory(&directories.enrollment, "enrollment directory")?;
     validate_private_directory(&directories.records, "enrollment records directory")?;
 
@@ -3685,6 +3989,8 @@ fn open_directories(
     graph_resource: CanonicalGraphResourceId,
     create: bool,
 ) -> Result<Option<EnrollmentDirectories>, EnrollmentError> {
+    #[cfg(test)]
+    count(&ENROLLMENT_DIRECTORY_OPENS);
     let root_dir = Dir::open_ambient_dir(root.path(), ambient_authority())?;
     let sparse = open_component(&root_dir, SPARSE_STORAGE_DIRECTORY, create)?;
     let Some(sparse) = sparse else {
@@ -3785,6 +4091,8 @@ fn acquire_lease(
     directories: &EnrollmentDirectories,
     create: bool,
 ) -> Result<EnrollmentLease, EnrollmentError> {
+    #[cfg(test)]
+    count(&ENROLLMENT_LEASE_ACQUISITIONS);
     let file = if create {
         open_regular_readwrite_create(&directories.enrollment, LEASE_FILE)?
     } else {
@@ -4081,6 +4389,8 @@ fn open_enrollment_authority_internal(
     binding: &EnrollmentBindingV1,
     lease_resource_id: ContentDigest,
 ) -> Result<EnrollmentAuthority, EnrollmentError> {
+    #[cfg(test)]
+    count(&ENROLLMENT_AUTHORITY_CLAIM_READS);
     let (bytes, identity) = read_bounded_authoritative_file(
         &directories.enrollment,
         AUTHORITY_FILE,
@@ -7757,5 +8067,357 @@ mod tests {
         );
         assert!(target.exists());
         assert!(foreign.exists());
+    }
+
+    // -----------------------------------------------------------------------
+    // Retained enrollment session: bounded per-mutation admission.
+    // -----------------------------------------------------------------------
+
+    /// The exact session the `handoffs`-long journal built by
+    /// [`local_active_journal`] ends on.
+    fn journal_terminal_session(handoffs: u64) -> SessionId {
+        assert!(handoffs % 2 == 0 && handoffs > 0);
+        SessionId::from_uuid(Uuid::from_u128(u128::from(900 + handoffs)))
+    }
+
+    fn open_retained_session(
+        root: &TestRoot,
+        binding: &EnrollmentBindingV1,
+    ) -> RetainedEnrollmentSession {
+        RetainedEnrollmentSession::open(
+            &root.app(),
+            binding,
+            verified().verification_digest().unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// Per-admission enrollment cost is constant and independent of how long
+    /// the journal is.
+    ///
+    /// The three journal lengths are the packet's 1 / 1,000 / 10,000
+    /// post-bootstrap scale points. At every one of them an unchanged-head
+    /// admission must perform exactly one bounded read of the fixed-size head
+    /// file and nothing else: no namespace enumeration, no lease
+    /// reacquisition, no authority-claim reread, no directory-tree open, and
+    /// no record-chain walk.
+    ///
+    /// Fail-before is executable and in the same test: the parent
+    /// per-admission call, `reopen_committed_local_active_for_session`, is
+    /// measured over the identical journal and must violate every one of those
+    /// bounds. If the assertions could not discriminate, that control would
+    /// pass too.
+    #[test]
+    fn retained_session_admissions_are_constant_cost_at_one_thousand_and_ten_thousand_records() {
+        const ADMISSIONS: usize = 64;
+        let mut measured = Vec::new();
+        for handoffs in [2_u64, 1_000, 10_000] {
+            let root = TestRoot::new(&format!("retained-session-{handoffs}"));
+            let binding = test_binding();
+            let (_verified_digest, head) = local_active_journal(&root, &binding, handoffs);
+
+            let mut session = open_retained_session(&root, &binding);
+            assert_eq!(session.committed().enrollment_head(), head);
+            assert_eq!(
+                session.committed().handoff(),
+                LocalActiveHandoff::Unsafe {
+                    session_id: journal_terminal_session(handoffs)
+                }
+            );
+
+            let before = EnrollmentInstrumentation::capture();
+            for _ in 0..ADMISSIONS {
+                assert_eq!(session.revalidate().unwrap().enrollment_head(), head);
+            }
+            let admission = before.since();
+            assert_eq!(
+                session.full_revalidations(),
+                0,
+                "an unchanged head must never force a full authenticated reopen"
+            );
+            assert_eq!(
+                admission,
+                EnrollmentInstrumentation {
+                    record_reads: 0,
+                    head_reads: ADMISSIONS,
+                    namespace_scans: 0,
+                    directory_opens: 0,
+                    lease_acquisitions: 0,
+                    authority_claim_reads: 0,
+                },
+                "unchanged-head admissions at journal length {handoffs} were not bounded"
+            );
+
+            // Fail-before control: the parent per-admission enrollment call,
+            // measured over this exact journal.
+            let before = EnrollmentInstrumentation::capture();
+            for _ in 0..ADMISSIONS {
+                reopen_committed_local_active_for_session(
+                    &root.app(),
+                    &binding,
+                    verified().verification_digest().unwrap(),
+                )
+                .unwrap();
+            }
+            let parent = before.since();
+            assert_eq!(parent.directory_opens, ADMISSIONS);
+            assert_eq!(parent.namespace_scans, ADMISSIONS);
+            assert!(parent.authority_claim_reads >= ADMISSIONS);
+            assert!(
+                parent.record_reads >= ADMISSIONS,
+                "the parent admission must walk the record chain, not just the head"
+            );
+            measured.push((handoffs, admission, parent));
+        }
+
+        // Constant, and constant across three orders of magnitude of journal.
+        let (_, first_admission, _) = measured[0];
+        for (handoffs, admission, parent) in &measured {
+            assert_eq!(
+                *admission, first_admission,
+                "admission cost changed at journal length {handoffs}"
+            );
+            assert!(
+                parent.record_reads > admission.record_reads
+                    && parent.namespace_scans > admission.namespace_scans
+                    && parent.directory_opens > admission.directory_opens,
+                "the parent shape must fail the new bound at journal length {handoffs}"
+            );
+        }
+    }
+
+    /// The cheap check is exact, not approximate: any observed head change
+    /// forces the complete authenticated reopen, and a head that is missing,
+    /// malformed, or points at a non-`LocalActive` record rejects instead.
+    #[test]
+    fn a_changed_missing_or_divergent_head_forces_full_revalidation_or_rejects() {
+        let root = TestRoot::new("retained-session-change");
+        let binding = test_binding();
+        let (verified_digest, head) = local_active_journal(&root, &binding, 4);
+        let terminal = journal_terminal_session(4);
+
+        // A genuine change: the session itself moves the record. A handoff is a
+        // lifecycle boundary, so it is bracketed by full reauthentications.
+        let mut session = open_retained_session(&root, &binding);
+        assert_eq!(session.full_revalidations(), 0);
+        let generation = session.binding_generation();
+        let safe = session
+            .transition_handoff(LocalActiveHandoff::Safe)
+            .unwrap()
+            .enrollment_head();
+        assert_ne!(safe, head);
+        assert!(session.full_revalidations() >= 2);
+        assert!(session.binding_generation() > generation);
+        assert_eq!(session.committed().handoff(), LocalActiveHandoff::Safe);
+        // Repeating the same target is idempotent and does not advance a head.
+        assert_eq!(
+            session
+                .transition_handoff(LocalActiveHandoff::Safe)
+                .unwrap()
+                .enrollment_head(),
+            safe
+        );
+        let restored = session
+            .transition_handoff(LocalActiveHandoff::Unsafe {
+                session_id: terminal,
+            })
+            .unwrap()
+            .enrollment_head();
+        drop(session);
+
+        // An externally moved head. The retained session holds the exclusive
+        // lease, so this is a deliberately hostile raw write, not a legal
+        // transition; the point is that the cheap check cannot miss it.
+        let mut session = open_retained_session(&root, &binding);
+        let before = session.full_revalidations();
+        write_head(&root, &binding, head);
+        assert_eq!(session.revalidate().unwrap().enrollment_head(), head);
+        assert_eq!(
+            session.full_revalidations(),
+            before + 1,
+            "a moved head must force exactly one full authenticated reopen"
+        );
+        // ...and settles back to cheap checks at the new head.
+        let counted = EnrollmentInstrumentation::capture();
+        session.revalidate().unwrap();
+        assert_eq!(counted.since().record_reads, 0);
+        assert_eq!(session.full_revalidations(), before + 1);
+        write_head(&root, &binding, restored);
+        session.revalidate().unwrap();
+        drop(session);
+
+        // Missing, malformed, and divergent heads all fail closed.
+        let head_path = enrollment_directory(&root, &binding).join(HEAD_FILE);
+        let committed_head_bytes = fs::read(&head_path).unwrap();
+        for (label, mutate) in [
+            (
+                "missing",
+                Box::new(|path: &Path| fs::remove_file(path).unwrap()) as Box<dyn Fn(&Path)>,
+            ),
+            (
+                "truncated",
+                Box::new(|path: &Path| fs::write(path, b"").unwrap()),
+            ),
+            (
+                "malformed",
+                Box::new(|path: &Path| fs::write(path, vec![b'z'; HEAD_BYTES]).unwrap()),
+            ),
+        ] {
+            let mut session = open_retained_session(&root, &binding);
+            mutate(&head_path);
+            assert!(
+                session.revalidate().is_err(),
+                "a {label} head must never admit work"
+            );
+            drop(session);
+            fs::write(&head_path, &committed_head_bytes).unwrap();
+        }
+
+        // A head that names a real, authenticated, but non-`LocalActive`
+        // record is divergent, not adoptable.
+        let mut session = open_retained_session(&root, &binding);
+        write_head(&root, &binding, verified_digest);
+        match session.revalidate() {
+            Err(VerifiedLocalCompositionError::WrongLifecycle(_)) => {}
+            Err(error) => panic!("a divergent head must fail closed: {error}"),
+            Ok(_) => panic!("a divergent head must never be adopted"),
+        }
+        drop(session);
+        fs::write(&head_path, &committed_head_bytes).unwrap();
+
+        // The journal survived every refusal exactly.
+        let reader =
+            expect_present(EnrollmentReader::open_existing(&root.app(), &binding).unwrap());
+        assert_eq!(reader.current().digest, restored);
+    }
+
+    /// Retaining the session takes the exclusive journal lease exactly once;
+    /// dropping it releases the contention exactly.
+    #[test]
+    fn a_second_live_session_cannot_write_the_journal_and_dropping_one_releases_it() {
+        let root = TestRoot::new("retained-session-lease");
+        let binding = test_binding();
+        let (_verified_digest, head) = local_active_journal(&root, &binding, 2);
+        let terminal = journal_terminal_session(2);
+
+        let before = EnrollmentInstrumentation::capture();
+        let mut session = open_retained_session(&root, &binding);
+        assert_eq!(
+            before.since().lease_acquisitions,
+            1,
+            "a retained session acquires the lease exactly once"
+        );
+
+        // No second writer of any shape may exist while this session is live.
+        assert!(matches!(
+            EnrollmentWriter::open_existing(&root.app(), &binding),
+            Err(EnrollmentError::LeaseContended(_))
+        ));
+        assert!(matches!(
+            RetainedEnrollmentSession::open(
+                &root.app(),
+                &binding,
+                verified().verification_digest().unwrap()
+            ),
+            Err(VerifiedLocalCompositionError::Enrollment(
+                EnrollmentError::LeaseContended(_)
+            ))
+        ));
+        assert!(matches!(
+            transition_local_active_handoff(
+                &root.app(),
+                &binding,
+                head,
+                verified().verification_digest().unwrap(),
+                LocalActiveHandoff::Safe,
+            ),
+            Err(VerifiedLocalCompositionError::Enrollment(
+                EnrollmentError::LeaseContended(_)
+            ))
+        ));
+        // Readers never contend, so audit and anchor reopen stay available.
+        assert_eq!(
+            expect_present(EnrollmentReader::open_existing(&root.app(), &binding).unwrap())
+                .current()
+                .digest,
+            head
+        );
+        assert_eq!(
+            reopen_promoted_bootstrap_anchor(&root.app(), &binding)
+                .unwrap()
+                .committed()
+                .enrollment_head(),
+            head
+        );
+
+        // The retained session is the one writer that can still move the
+        // journal, and it does so without reacquiring anything.
+        let before = EnrollmentInstrumentation::capture();
+        let advanced = session
+            .transition_handoff(LocalActiveHandoff::Safe)
+            .unwrap()
+            .enrollment_head();
+        assert_eq!(before.since().lease_acquisitions, 0);
+        assert_ne!(advanced, head);
+
+        drop(session);
+        // Contention is released exactly, with no residue.
+        let mut resumed = open_retained_session(&root, &binding);
+        assert_eq!(resumed.committed().enrollment_head(), advanced);
+        assert_eq!(
+            resumed
+                .transition_handoff(LocalActiveHandoff::Unsafe {
+                    session_id: terminal
+                })
+                .unwrap()
+                .handoff(),
+            LocalActiveHandoff::Unsafe {
+                session_id: terminal
+            }
+        );
+    }
+
+    /// A retained session refuses every lifecycle a runtime authority may not
+    /// be admitted under, and refuses a foreign verification digest.
+    #[test]
+    fn a_retained_session_refuses_blocked_published_and_foreign_enrollments() {
+        let root = TestRoot::new("retained-session-lifecycle");
+        let binding = test_binding();
+        let (_verified_digest, head) = local_active_journal(&root, &binding, 2);
+
+        // A foreign verification digest can never retain a session.
+        assert!(matches!(
+            RetainedEnrollmentSession::open(&root.app(), &binding, digest(200)),
+            Err(VerifiedLocalCompositionError::ProofMismatch(_))
+        ));
+
+        // A published (non-`Idle`) record is refused.
+        let published = publish_local_active_for_test(
+            &root.app(),
+            &binding,
+            head,
+            verified().verification_digest().unwrap(),
+            journal_terminal_session(2),
+        )
+        .unwrap();
+        assert!(matches!(
+            RetainedEnrollmentSession::open(
+                &root.app(),
+                &binding,
+                verified().verification_digest().unwrap()
+            ),
+            Err(VerifiedLocalCompositionError::WrongLifecycle(_))
+        ));
+
+        // So is a blocked one.
+        block_current_for_test(&root.app(), &binding, published, "retained.test".into()).unwrap();
+        assert!(matches!(
+            RetainedEnrollmentSession::open(
+                &root.app(),
+                &binding,
+                verified().verification_digest().unwrap()
+            ),
+            Err(VerifiedLocalCompositionError::WrongLifecycle(_))
+        ));
     }
 }
