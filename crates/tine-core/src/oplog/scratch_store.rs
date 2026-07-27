@@ -25,7 +25,7 @@ const MARKER_FILE: &str = "marker";
 const LEASE_FILE: &str = "lease";
 const PAGES_FILE: &str = "pages.index";
 const BLOBS_FILE: &str = "blobs.data";
-const SCRATCH_SCHEMA_VERSION: u32 = 11;
+const SCRATCH_SCHEMA_VERSION: u32 = 12;
 const SCRATCH_PAGE_SCHEMA_VERSION: u32 = 1;
 const SCRATCH_LSM_LEVELS: usize = 32;
 const ACCEPTED_SEQUENCE_SCHEMA_VERSION: u32 = 1;
@@ -68,6 +68,7 @@ pub(crate) struct ScratchStats {
     pub scratch_syncs: usize,
     pub stale_runs_reclaimed: usize,
     pub live_runs_skipped: usize,
+    pub retained_runs_preserved: usize,
 }
 
 #[derive(Debug, Default)]
@@ -88,22 +89,39 @@ struct ScratchCounters {
     scratch_syncs: AtomicUsize,
     stale_runs_reclaimed: AtomicUsize,
     live_runs_skipped: AtomicUsize,
+    /// Retained runs an ordinary reclamation pass observed and deliberately
+    /// left intact. This is the deterministic counter that proves reclamation
+    /// never silently deletes adoptable state.
+    retained_runs_preserved: AtomicUsize,
 }
 
 #[derive(Debug)]
 struct FixedPointFilter {
     words: Vec<u64>,
+    /// When set, the filter never answers "absent". A run adopted from durable
+    /// bytes did not observe the inserts that produced them, so its run-local
+    /// negative filter would otherwise report false negatives for data that is
+    /// really present.
+    saturated: bool,
 }
 
 impl Default for FixedPointFilter {
     fn default() -> Self {
         Self {
             words: vec![0; CURRENT_FILTER_WORDS],
+            saturated: false,
         }
     }
 }
 
 impl FixedPointFilter {
+    fn saturated() -> Self {
+        Self {
+            saturated: true,
+            ..Self::default()
+        }
+    }
+
     fn insert(&mut self, key: &[u8]) {
         for position in self.positions(key) {
             self.words[position / 64] |= 1_u64 << (position % 64);
@@ -111,9 +129,11 @@ impl FixedPointFilter {
     }
 
     fn might_contain(&self, key: &[u8]) -> bool {
-        self.positions(key)
-            .into_iter()
-            .all(|position| self.words[position / 64] & (1_u64 << (position % 64)) != 0)
+        self.saturated
+            || self
+                .positions(key)
+                .into_iter()
+                .all(|position| self.words[position / 64] & (1_u64 << (position % 64)) != 0)
     }
 
     fn positions(&self, key: &[u8]) -> [usize; 4] {
@@ -199,16 +219,39 @@ impl ScratchCounters {
             scratch_syncs: self.scratch_syncs.load(Ordering::Relaxed),
             stale_runs_reclaimed: self.stale_runs_reclaimed.load(Ordering::Relaxed),
             live_runs_skipped: self.live_runs_skipped.load(Ordering::Relaxed),
+            retained_runs_preserved: self.retained_runs_preserved.load(Ordering::Relaxed),
         }
     }
 }
 
+/// Durable retention mode of one scratch run.
+///
+/// This is authenticated by the run marker itself, so a run's disposition is a
+/// durable property of its own bytes rather than caller-asserted or path-derived
+/// state. It is deliberately not an ambient registry: only the exact directory
+/// capability plus this marker can classify a run.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+enum ScratchRetention {
+    /// Reclaimable run. Drop removes it and a restart reclaims stale instances
+    /// under the exclusive lease proof.
+    Ephemeral,
+    /// Adoptable run. Drop releases only the lease, and ordinary stale-run
+    /// reclamation never removes it. Until an authenticated runtime-resume-point
+    /// format exists, an orphan retained run is preserved rather than deleted.
+    Retained,
+}
+
+/// Schema-12 durable run marker.
+///
+/// There is no legacy decode path: schema-11 bytes are rejected, never migrated.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ScratchRunMarkerV2 {
+struct ScratchRunMarkerV3 {
     schema_version: u32,
     workspace_id: WorkspaceId,
     run_id: Uuid,
+    retention: ScratchRetention,
     random_owner_nonce: [u8; 32],
 }
 
@@ -696,7 +739,7 @@ pub(crate) struct ScratchStore {
     namespace: Dir,
     run: Dir,
     run_name: String,
-    marker: ScratchRunMarkerV2,
+    marker: ScratchRunMarkerV3,
     lease: fs::File,
     pages: Mutex<fs::File>,
     blobs: Mutex<fs::File>,
@@ -719,6 +762,30 @@ impl ScratchStore {
         archive_capability: &Dir,
         workspace_id: WorkspaceId,
     ) -> Result<Self, ScratchError> {
+        Self::create_run(
+            archive_capability,
+            workspace_id,
+            ScratchRetention::Ephemeral,
+        )
+    }
+
+    /// Create a fresh adoptable run beneath the same directory capability.
+    ///
+    /// The only difference from an ordinary run is the durable retention mode
+    /// authenticated by its own marker. Creation, lease acquisition, and stale
+    /// reclamation are the identical construction.
+    pub(crate) fn create_retained(
+        archive_capability: &Dir,
+        workspace_id: WorkspaceId,
+    ) -> Result<Self, ScratchError> {
+        Self::create_run(archive_capability, workspace_id, ScratchRetention::Retained)
+    }
+
+    fn create_run(
+        archive_capability: &Dir,
+        workspace_id: WorkspaceId,
+        retention: ScratchRetention,
+    ) -> Result<Self, ScratchError> {
         super::object_store::ensure_directory_nofollow(archive_capability, SCRATCH_DIR)?;
         let namespace = super::object_store::open_dir_nofollow(archive_capability, SCRATCH_DIR)?;
         let run_id = Uuid::new_v4();
@@ -730,10 +797,11 @@ impl ScratchStore {
         let mut random_owner_nonce = [0_u8; 32];
         random_owner_nonce[..16].copy_from_slice(nonce_a.as_bytes());
         random_owner_nonce[16..].copy_from_slice(nonce_b.as_bytes());
-        let marker = ScratchRunMarkerV2 {
+        let marker = ScratchRunMarkerV3 {
             schema_version: SCRATCH_SCHEMA_VERSION,
             workspace_id,
             run_id,
+            retention,
             random_owner_nonce,
         };
         write_new_regular(&run, MARKER_FILE, &encode_canonical(&marker)?)?;
@@ -758,10 +826,88 @@ impl ScratchStore {
             blob_dedup_filter: Mutex::new(CoveredBlobDedupFilter::default()),
         };
         if let Err(error) = store.reclaim_stale_runs() {
+            // The identity was never returned to a caller and the run holds no
+            // data yet, so removing it cannot orphan adoptable bytes.
             store.cleanup_own_run();
             return Err(error);
         }
         Ok(store)
+    }
+
+    /// Adopt the retained run with exactly this run identity.
+    ///
+    /// Authority is the supplied directory capability plus the run's own durable
+    /// marker; nothing is derived from an ambient path or a global registry.
+    /// Adoption never creates a directory, marker, lease, or data file, so a
+    /// missing, substituted, foreign, or ephemeral run fails closed instead of
+    /// silently becoming a fresh empty run under the requested identity.
+    pub(crate) fn adopt_retained(
+        archive_capability: &Dir,
+        workspace_id: WorkspaceId,
+        run_id: Uuid,
+    ) -> Result<Self, ScratchError> {
+        let namespace = super::object_store::open_dir_nofollow(archive_capability, SCRATCH_DIR)?;
+        let run_name = format!("run-{run_id}");
+        // Reject a non-canonical identity spelling before it can name a
+        // directory; `open_dir_nofollow` then rejects a symlinked alias.
+        if parse_run_name(&run_name)? != run_id {
+            return Err(ScratchError::MalformedMarker(run_name));
+        }
+        let run = super::object_store::open_dir_nofollow(&namespace, &run_name)?;
+
+        // Take the exact existing exclusive run lease first, so every later
+        // validation observes a run no other owner may be mutating. A failed
+        // validation drops this file and releases the lock.
+        let lease = open_regular_read_write_nofollow(&run, LEASE_FILE)?;
+        if !lock_exclusive_nonblocking(&lease)? {
+            return Err(ScratchError::UnsafeEntry(format!(
+                "retained scratch run {run_name:?} is still leased"
+            )));
+        }
+
+        let marker_bytes = read_regular_nofollow(&run, MARKER_FILE, MAX_MARKER_BYTES)?;
+        let marker: ScratchRunMarkerV3 = decode_canonical(&marker_bytes)?;
+        if marker.schema_version != SCRATCH_SCHEMA_VERSION
+            || marker.workspace_id != workspace_id
+            || marker.run_id != run_id
+            || marker.retention != ScratchRetention::Retained
+        {
+            return Err(ScratchError::MalformedMarker(run_name));
+        }
+        validate_run_entries(&run)?;
+
+        // Opened read-write with no create, truncate, or replacement publication:
+        // existing page and blob bytes remain exactly as the previous owner left
+        // them, and later appends land after them.
+        let pages = open_regular_read_write_nofollow(&run, PAGES_FILE)?;
+        let blobs = open_regular_read_write_nofollow(&run, BLOBS_FILE)?;
+
+        // This process never observed the inserts behind the adopted bytes, so
+        // the document-current negative filter must not answer "absent". The
+        // covered blob-dedup filter is already fail-closed for unseen roots: it
+        // recognizes only exact roots reached from a covered parent, and an
+        // adopted root is not one.
+        Ok(Self {
+            namespace,
+            run,
+            run_name,
+            marker,
+            lease,
+            pages: Mutex::new(pages),
+            blobs: Mutex::new(blobs),
+            counters: Arc::new(ScratchCounters::default()),
+            document_current_filter: Mutex::new(FixedPointFilter::saturated()),
+            blob_dedup_filter: Mutex::new(CoveredBlobDedupFilter::default()),
+        })
+    }
+
+    pub(crate) const fn run_id(&self) -> Uuid {
+        self.marker.run_id
+    }
+
+    #[cfg(test)]
+    const fn retention(&self) -> ScratchRetention {
+        self.marker.retention
     }
 
     pub(crate) fn stats(&self) -> ScratchStats {
@@ -2606,7 +2752,7 @@ impl ScratchStore {
             }
             let run = super::object_store::open_dir_nofollow(&self.namespace, &name)?;
             let marker_bytes = read_regular_nofollow(&run, MARKER_FILE, MAX_MARKER_BYTES)?;
-            let marker: ScratchRunMarkerV2 = decode_canonical(&marker_bytes)?;
+            let marker: ScratchRunMarkerV3 = decode_canonical(&marker_bytes)?;
             if marker.schema_version != SCRATCH_SCHEMA_VERSION
                 || marker.workspace_id != self.marker.workspace_id
                 || marker.run_id != run_id
@@ -2614,6 +2760,15 @@ impl ScratchStore {
                 return Err(ScratchError::MalformedMarker(name));
             }
             validate_run_entries(&run)?;
+            if marker.retention == ScratchRetention::Retained {
+                // Ordinary reclamation carries no authority to discard adoptable
+                // state. Until an authenticated runtime-resume-point format can
+                // prove a retained run is unreachable, an orphan survives.
+                self.counters
+                    .retained_runs_preserved
+                    .fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
             let lease = open_regular_read_write_nofollow(&run, LEASE_FILE)?;
             if !lock_exclusive_nonblocking(&lease)? {
                 self.counters
@@ -2641,7 +2796,12 @@ impl ScratchStore {
 
 impl Drop for ScratchStore {
     fn drop(&mut self) {
-        self.cleanup_own_run();
+        match self.marker.retention {
+            ScratchRetention::Ephemeral => self.cleanup_own_run(),
+            // Release only the exclusive lease. Every marker, page, blob, and
+            // index byte stays exactly as written so the run stays adoptable.
+            ScratchRetention::Retained => unlock(&self.lease),
+        }
     }
 }
 
@@ -3252,13 +3412,13 @@ fn open_regular_read_write_nofollow(dir: &Dir, name: &str) -> Result<fs::File, S
     {
         use std::ffi::CString;
         use std::os::fd::AsFd as _;
-        let name = CString::new(name)
+        let path = CString::new(name)
             .map_err(|_| ScratchError::UnsafeEntry("invalid scratch filename".into()))?;
         // SAFETY: the path is a live C string and dirfd is an opened capability.
         let fd = unsafe {
             libc::openat(
                 dir.as_fd().as_raw_fd(),
-                name.as_ptr(),
+                path.as_ptr(),
                 libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW,
             )
         };
@@ -3267,7 +3427,7 @@ fn open_regular_read_write_nofollow(dir: &Dir, name: &str) -> Result<fs::File, S
         }
         // SAFETY: a successful openat returned an owned descriptor.
         let file = unsafe { fs::File::from_raw_fd(fd) };
-        ensure_opened_regular(&file, LEASE_FILE)?;
+        ensure_opened_regular(&file, name)?;
         Ok(file)
     }
     #[cfg(windows)]
@@ -3487,7 +3647,7 @@ impl From<super::object_store::StoreError> for ScratchError {
 mod tests {
     use super::*;
     use cap_std::ambient_authority;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     fn workspace(value: u128) -> WorkspaceId {
         WorkspaceId::from_uuid(Uuid::from_u128(value))
@@ -3496,6 +3656,80 @@ mod tests {
     fn archive(root: &Path) -> Dir {
         fs::create_dir_all(root).unwrap();
         Dir::open_ambient_dir(root, ambient_authority()).unwrap()
+    }
+
+    fn scratch_root(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("tine-scratch-{label}-{}", Uuid::new_v4()))
+    }
+
+    fn run_path(root: &Path, run_id: Uuid) -> PathBuf {
+        root.join(SCRATCH_DIR).join(format!("run-{run_id}"))
+    }
+
+    /// Exact durable bytes of one scratch run. Retention proofs compare these
+    /// snapshots instead of observing timing.
+    fn run_snapshot(root: &Path, run_id: Uuid) -> BTreeMap<&'static str, Vec<u8>> {
+        let run = run_path(root, run_id);
+        [MARKER_FILE, LEASE_FILE, PAGES_FILE, BLOBS_FILE]
+            .into_iter()
+            .map(|name| (name, fs::read(run.join(name)).unwrap()))
+            .collect()
+    }
+
+    fn write_marker(root: &Path, run_id: Uuid, bytes: &[u8]) {
+        fs::write(run_path(root, run_id).join(MARKER_FILE), bytes).unwrap();
+    }
+
+    /// Retained run seeded with one authenticated page record and one blob.
+    fn seed_retained_run(
+        archive: &Dir,
+        workspace_id: WorkspaceId,
+    ) -> (Uuid, ScratchLsmRoot, ScratchBlobRef, ContentDigest) {
+        let store = ScratchStore::create_retained(archive, workspace_id).unwrap();
+        assert_eq!(store.retention(), ScratchRetention::Retained);
+        let root = store
+            .insert_many(
+                &ScratchLsmRoot::default(),
+                ScratchPageKind::DocumentCurrent,
+                &BTreeMap::from([
+                    (b"page-a".to_vec(), Some(b"alpha".to_vec())),
+                    (b"page-b".to_vec(), Some(b"beta".to_vec())),
+                ]),
+            )
+            .unwrap();
+        let blob = store.append_blob(b"retained blob bytes").unwrap();
+        let identity = (store.run_id(), store.binding_digest().unwrap());
+        drop(store);
+        (identity.0, root, blob, identity.1)
+    }
+
+    fn assert_retained_contents(
+        store: &ScratchStore,
+        root: &ScratchLsmRoot,
+        blob: &ScratchBlobRef,
+    ) {
+        assert_eq!(
+            store
+                .lookup(root, ScratchPageKind::DocumentCurrent, b"page-a")
+                .unwrap(),
+            Some(b"alpha".to_vec())
+        );
+        assert_eq!(
+            store
+                .lookup(root, ScratchPageKind::DocumentCurrent, b"page-b")
+                .unwrap(),
+            Some(b"beta".to_vec())
+        );
+        assert_eq!(
+            store
+                .lookup(root, ScratchPageKind::DocumentCurrent, b"page-absent")
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            store.read_blob(blob).unwrap(),
+            b"retained blob bytes".to_vec()
+        );
     }
 
     #[test]
@@ -4063,6 +4297,477 @@ mod tests {
         assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
         assert!(ScratchStore::open(&archive, workspace(6)).is_err());
         assert!(fifo.exists());
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn ephemeral_run_declares_its_mode_and_drop_removes_every_byte() {
+        let path = scratch_root("ephemeral-mode");
+        let archive = archive(&path);
+        let store = ScratchStore::open(&archive, workspace(21)).unwrap();
+        assert_eq!(store.retention(), ScratchRetention::Ephemeral);
+        assert_eq!(store.stats().retained_runs_preserved, 0);
+        let run_id = store.run_id();
+        let run = run_path(&path, run_id);
+        assert!(run.is_dir());
+        assert_eq!(run_snapshot(&path, run_id).len(), 4);
+
+        drop(store);
+
+        assert!(!run.exists());
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn retained_run_survives_drop_and_readopts_with_identical_bytes() {
+        let path = scratch_root("retained-readopt");
+        let archive = archive(&path);
+        let (run_id, root, blob, binding) = seed_retained_run(&archive, workspace(22));
+
+        let after_owner = run_snapshot(&path, run_id);
+        assert!(!after_owner[PAGES_FILE].is_empty());
+        assert!(!after_owner[BLOBS_FILE].is_empty());
+
+        let adopted = ScratchStore::adopt_retained(&archive, workspace(22), run_id).unwrap();
+        assert_eq!(adopted.run_id(), run_id);
+        assert_eq!(adopted.retention(), ScratchRetention::Retained);
+        // The marker is the run's identity; adoption must not mint a new one.
+        assert_eq!(adopted.binding_digest().unwrap(), binding);
+        assert_retained_contents(&adopted, &root, &blob);
+
+        drop(adopted);
+        assert_eq!(run_snapshot(&path, run_id), after_owner);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn adoption_appends_after_existing_bytes_without_rewriting_them() {
+        let path = scratch_root("retained-append");
+        let archive = archive(&path);
+        let (run_id, root, blob, _) = seed_retained_run(&archive, workspace(23));
+        let before = run_snapshot(&path, run_id);
+
+        let adopted = ScratchStore::adopt_retained(&archive, workspace(23), run_id).unwrap();
+        let extended = adopted
+            .insert_many(
+                &root,
+                ScratchPageKind::DocumentCurrent,
+                &BTreeMap::from([(b"page-c".to_vec(), Some(b"gamma".to_vec()))]),
+            )
+            .unwrap();
+        let appended_blob = adopted.append_blob(b"second blob").unwrap();
+        drop(adopted);
+
+        let after = run_snapshot(&path, run_id);
+        assert_eq!(after[MARKER_FILE], before[MARKER_FILE]);
+        for name in [PAGES_FILE, BLOBS_FILE] {
+            assert!(after[name].len() > before[name].len());
+            assert_eq!(&after[name][..before[name].len()], &before[name][..]);
+        }
+
+        // Both the carried root and the extended root remain readable.
+        let reopened = ScratchStore::adopt_retained(&archive, workspace(23), run_id).unwrap();
+        assert_retained_contents(&reopened, &root, &blob);
+        assert_eq!(
+            reopened
+                .lookup(&extended, ScratchPageKind::DocumentCurrent, b"page-c")
+                .unwrap(),
+            Some(b"gamma".to_vec())
+        );
+        assert_eq!(
+            reopened.read_blob(&appended_blob).unwrap(),
+            b"second blob".to_vec()
+        );
+        drop(reopened);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn repeated_adopt_and_drop_never_change_bytes_or_marker_identity() {
+        let path = scratch_root("retained-repeat");
+        let archive = archive(&path);
+        let (run_id, root, blob, binding) = seed_retained_run(&archive, workspace(24));
+        let baseline = run_snapshot(&path, run_id);
+
+        for _ in 0..3 {
+            let adopted = ScratchStore::adopt_retained(&archive, workspace(24), run_id).unwrap();
+            assert_eq!(adopted.run_id(), run_id);
+            assert_eq!(adopted.binding_digest().unwrap(), binding);
+            assert_retained_contents(&adopted, &root, &blob);
+            drop(adopted);
+            assert_eq!(run_snapshot(&path, run_id), baseline);
+        }
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn adoption_fails_while_an_owner_is_live_and_succeeds_after_a_clean_drop() {
+        let path = scratch_root("retained-contention");
+        let archive = archive(&path);
+        let owner = ScratchStore::create_retained(&archive, workspace(25)).unwrap();
+        let run_id = owner.run_id();
+
+        assert!(ScratchStore::adopt_retained(&archive, workspace(25), run_id).is_err());
+        drop(owner);
+
+        let adopted = ScratchStore::adopt_retained(&archive, workspace(25), run_id).unwrap();
+        // The adopting owner now holds the same exclusive lease.
+        assert!(ScratchStore::adopt_retained(&archive, workspace(25), run_id).is_err());
+        drop(adopted);
+
+        let last = ScratchStore::adopt_retained(&archive, workspace(25), run_id).unwrap();
+        assert_eq!(last.run_id(), run_id);
+        drop(last);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn adoption_rejects_a_wrong_workspace_or_a_run_identity_that_does_not_exist() {
+        let path = scratch_root("retained-identity");
+        let archive = archive(&path);
+        let (run_id, root, blob, _) = seed_retained_run(&archive, workspace(26));
+        let absent = Uuid::new_v4();
+
+        assert!(ScratchStore::adopt_retained(&archive, workspace(27), run_id).is_err());
+        assert!(ScratchStore::adopt_retained(&archive, workspace(26), absent).is_err());
+        // A rejected adoption never fabricates a run under the requested identity.
+        assert!(!run_path(&path, absent).exists());
+
+        let adopted = ScratchStore::adopt_retained(&archive, workspace(26), run_id).unwrap();
+        assert_retained_contents(&adopted, &root, &blob);
+        drop(adopted);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn adoption_rejects_marker_schema_workspace_mode_and_identity_tamper() {
+        let path = scratch_root("retained-marker-tamper");
+        let archive = archive(&path);
+        let (run_id, root, blob, _) = seed_retained_run(&archive, workspace(28));
+        let authentic = run_snapshot(&path, run_id)[MARKER_FILE].clone();
+        let marker: ScratchRunMarkerV3 = decode_canonical(&authentic).unwrap();
+
+        let tampered = [
+            ScratchRunMarkerV3 {
+                schema_version: SCRATCH_SCHEMA_VERSION + 1,
+                ..marker.clone()
+            },
+            ScratchRunMarkerV3 {
+                retention: ScratchRetention::Ephemeral,
+                ..marker.clone()
+            },
+            ScratchRunMarkerV3 {
+                workspace_id: workspace(29),
+                ..marker.clone()
+            },
+            ScratchRunMarkerV3 {
+                run_id: Uuid::new_v4(),
+                ..marker.clone()
+            },
+        ];
+        for variant in tampered {
+            write_marker(&path, run_id, &encode_canonical(&variant).unwrap());
+            assert!(
+                ScratchStore::adopt_retained(&archive, workspace(28), run_id).is_err(),
+                "adopted a run with marker {variant:?}"
+            );
+        }
+        write_marker(&path, run_id, b"not a marker at all");
+        assert!(ScratchStore::adopt_retained(&archive, workspace(28), run_id).is_err());
+
+        // The authentic marker still adopts, so the rejections above are causal.
+        write_marker(&path, run_id, &authentic);
+        let adopted = ScratchStore::adopt_retained(&archive, workspace(28), run_id).unwrap();
+        assert_retained_contents(&adopted, &root, &blob);
+        drop(adopted);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    /// Exact schema-11 marker shape. It exists only to prove those bytes are
+    /// rejected; there is no legacy decode or migration path.
+    #[derive(Serialize)]
+    struct LegacyScratchRunMarkerV11 {
+        schema_version: u32,
+        workspace_id: WorkspaceId,
+        run_id: Uuid,
+        random_owner_nonce: [u8; 32],
+    }
+
+    #[test]
+    fn schema_eleven_marker_bytes_are_rejected_and_never_migrated() {
+        let path = scratch_root("retained-schema-11");
+        let archive = archive(&path);
+        let (run_id, _, _, _) = seed_retained_run(&archive, workspace(30));
+        let legacy = encode_canonical(&LegacyScratchRunMarkerV11 {
+            schema_version: 11,
+            workspace_id: workspace(30),
+            run_id,
+            random_owner_nonce: [7_u8; 32],
+        })
+        .unwrap();
+        let authentic = run_snapshot(&path, run_id)[MARKER_FILE].clone();
+        write_marker(&path, run_id, &legacy);
+
+        assert!(ScratchStore::adopt_retained(&archive, workspace(30), run_id).is_err());
+        // Ordinary reclamation also refuses the legacy bytes rather than
+        // rewriting or deleting them.
+        assert!(ScratchStore::open(&archive, workspace(30)).is_err());
+        assert_eq!(run_snapshot(&path, run_id)[MARKER_FILE], legacy);
+
+        write_marker(&path, run_id, &authentic);
+        drop(ScratchStore::adopt_retained(&archive, workspace(30), run_id).unwrap());
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn adoption_rejects_absent_entries_and_partially_created_runs() {
+        // Each damaged shape gets its own namespace: a damaged run legitimately
+        // blocks later reclamation, which would mask the adoption verdict.
+        for missing in [MARKER_FILE, LEASE_FILE, PAGES_FILE, BLOBS_FILE] {
+            let path = scratch_root("retained-partial-missing");
+            let archive = archive(&path);
+            let (run_id, _, _, _) = seed_retained_run(&archive, workspace(31));
+            fs::remove_file(run_path(&path, run_id).join(missing)).unwrap();
+            assert!(
+                ScratchStore::adopt_retained(&archive, workspace(31), run_id).is_err(),
+                "adopted a run missing {missing}"
+            );
+            fs::remove_dir_all(path).unwrap();
+        }
+
+        {
+            let path = scratch_root("retained-partial-stray");
+            let archive = archive(&path);
+            let (run_id, _, _, _) = seed_retained_run(&archive, workspace(31));
+            fs::write(run_path(&path, run_id).join("stray"), b"extra").unwrap();
+            assert!(ScratchStore::adopt_retained(&archive, workspace(31), run_id).is_err());
+            fs::remove_dir_all(path).unwrap();
+        }
+
+        // A bare directory is a partially created run, never an adoptable one.
+        {
+            let path = scratch_root("retained-partial-bare");
+            let archive = archive(&path);
+            drop(ScratchStore::open(&archive, workspace(31)).unwrap());
+            let bare = Uuid::new_v4();
+            fs::create_dir(run_path(&path, bare)).unwrap();
+            assert!(ScratchStore::adopt_retained(&archive, workspace(31), bare).is_err());
+            assert_eq!(fs::read_dir(run_path(&path, bare)).unwrap().count(), 0);
+            fs::remove_dir_all(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn adoption_fails_closed_on_substituted_or_truncated_data() {
+        let path = scratch_root("retained-substitution");
+        let archive = archive(&path);
+
+        let (substituted_id, substituted_root, _, _) = seed_retained_run(&archive, workspace(32));
+        let pages = run_path(&path, substituted_id).join(PAGES_FILE);
+        let mut bytes = fs::read(&pages).unwrap();
+        bytes[0] ^= 0x80;
+        fs::write(&pages, &bytes).unwrap();
+        let adopted =
+            ScratchStore::adopt_retained(&archive, workspace(32), substituted_id).unwrap();
+        assert!(adopted
+            .lookup(
+                &substituted_root,
+                ScratchPageKind::DocumentCurrent,
+                b"page-a"
+            )
+            .is_err());
+        drop(adopted);
+
+        let (truncated_id, truncated_root, truncated_blob, _) =
+            seed_retained_run(&archive, workspace(32));
+        for name in [PAGES_FILE, BLOBS_FILE] {
+            fs::OpenOptions::new()
+                .write(true)
+                .open(run_path(&path, truncated_id).join(name))
+                .unwrap()
+                .set_len(0)
+                .unwrap();
+        }
+        let adopted = ScratchStore::adopt_retained(&archive, workspace(32), truncated_id).unwrap();
+        // Truncation has no durable extent authority in this stage, so it is
+        // caught at the authenticated read rather than silently answering
+        // "absent" or returning replacement bytes.
+        assert!(adopted
+            .lookup(&truncated_root, ScratchPageKind::DocumentCurrent, b"page-a")
+            .is_err());
+        assert!(adopted.read_blob(&truncated_blob).is_err());
+        drop(adopted);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn adoption_refuses_symlinked_entries_and_aliased_run_directories() {
+        use std::os::unix::fs::symlink;
+
+        let path = scratch_root("retained-symlink");
+        let archive = archive(&path);
+        let (run_id, _, _, _) = seed_retained_run(&archive, workspace(33));
+
+        // A stale path alias must never resolve to another run's bytes.
+        let alias = Uuid::new_v4();
+        symlink(run_path(&path, run_id), run_path(&path, alias)).unwrap();
+        assert!(ScratchStore::adopt_retained(&archive, workspace(33), alias).is_err());
+        fs::remove_file(run_path(&path, alias)).unwrap();
+
+        let decoy = path.join("decoy");
+        fs::write(&decoy, b"decoy bytes").unwrap();
+        let pages = run_path(&path, run_id).join(PAGES_FILE);
+        fs::remove_file(&pages).unwrap();
+        symlink(&decoy, &pages).unwrap();
+        assert!(ScratchStore::adopt_retained(&archive, workspace(33), run_id).is_err());
+        assert_eq!(fs::read(&decoy).unwrap(), b"decoy bytes".to_vec());
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn orphan_retained_runs_survive_ordinary_stale_run_reclamation() {
+        let path = scratch_root("retained-orphan");
+        let archive = archive(&path);
+        let (retained_id, root, blob, _) = seed_retained_run(&archive, workspace(34));
+        let retained_bytes = run_snapshot(&path, retained_id);
+
+        // Synthesize a stale ephemeral run exactly as the existing reclamation
+        // regression does.
+        let stale = ScratchStore::open(&archive, workspace(34)).unwrap();
+        let stale_id = stale.run_id();
+        let stale_marker = stale.marker.clone();
+        drop(stale);
+        let stale_path = run_path(&path, stale_id);
+        fs::create_dir(&stale_path).unwrap();
+        fs::write(
+            stale_path.join(MARKER_FILE),
+            encode_canonical(&stale_marker).unwrap(),
+        )
+        .unwrap();
+        for name in [LEASE_FILE, PAGES_FILE, BLOBS_FILE] {
+            fs::write(stale_path.join(name), []).unwrap();
+        }
+
+        let reclaimer = ScratchStore::open(&archive, workspace(34)).unwrap();
+        assert_eq!(reclaimer.stats().stale_runs_reclaimed, 1);
+        assert_eq!(reclaimer.stats().retained_runs_preserved, 1);
+        assert!(!stale_path.exists());
+        assert_eq!(run_snapshot(&path, retained_id), retained_bytes);
+        drop(reclaimer);
+
+        let adopted = ScratchStore::adopt_retained(&archive, workspace(34), retained_id).unwrap();
+        assert_retained_contents(&adopted, &root, &blob);
+        drop(adopted);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    const ADOPT_HELPER_ROOT: &str = "TINE_SCRATCH_ADOPT_HELPER_ROOT";
+    const ADOPT_HELPER_RUN: &str = "TINE_SCRATCH_ADOPT_HELPER_RUN";
+    const ADOPT_HELPER_WORKSPACE: &str = "TINE_SCRATCH_ADOPT_HELPER_WORKSPACE";
+
+    #[test]
+    #[ignore = "subprocess helper invoked by forked_owner_blocks_adoption_until_release"]
+    fn retained_adoption_subprocess_helper() {
+        use std::io::BufRead as _;
+
+        let Ok(root) = std::env::var(ADOPT_HELPER_ROOT) else {
+            return;
+        };
+        let run_id = Uuid::parse_str(&std::env::var(ADOPT_HELPER_RUN).unwrap()).unwrap();
+        let workspace_id = workspace(
+            std::env::var(ADOPT_HELPER_WORKSPACE)
+                .unwrap()
+                .parse()
+                .unwrap(),
+        );
+        let archive = Dir::open_ambient_dir(Path::new(&root), ambient_authority()).unwrap();
+        let store = ScratchStore::adopt_retained(&archive, workspace_id, run_id).unwrap();
+        println!("adopted");
+        std::io::stdout().flush().unwrap();
+        let mut command = String::new();
+        std::io::BufReader::new(std::io::stdin())
+            .read_line(&mut command)
+            .unwrap();
+        drop(store);
+        println!("released");
+        std::io::stdout().flush().unwrap();
+    }
+
+    fn spawn_adoption_helper(
+        root: &Path,
+        workspace_value: u128,
+        run_id: Uuid,
+    ) -> (
+        std::process::Child,
+        std::io::BufReader<std::process::ChildStdout>,
+    ) {
+        use std::io::BufRead as _;
+
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("retained_adoption_subprocess_helper")
+            .arg("--ignored")
+            .arg("--nocapture")
+            .env(ADOPT_HELPER_ROOT, root.as_os_str())
+            .env(ADOPT_HELPER_RUN, run_id.to_string())
+            .env(ADOPT_HELPER_WORKSPACE, workspace_value.to_string())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut reader = std::io::BufReader::new(child.stdout.take().unwrap());
+        // A blocking read, not a timed wait: the helper owns the lease once it
+        // reports adoption.
+        loop {
+            let mut line = String::new();
+            assert_ne!(
+                reader.read_line(&mut line).unwrap(),
+                0,
+                "helper never adopted"
+            );
+            if line.trim() == "adopted" {
+                return (child, reader);
+            }
+        }
+    }
+
+    #[test]
+    fn forked_owner_blocks_adoption_until_release() {
+        use std::io::BufRead as _;
+
+        let path = scratch_root("retained-forked");
+        let archive = archive(&path);
+        let (run_id, root, blob, binding) = seed_retained_run(&archive, workspace(35));
+        let baseline = run_snapshot(&path, run_id);
+
+        // Process death without a clean drop still releases the lease.
+        let (mut killed, _reader) = spawn_adoption_helper(&path, 35, run_id);
+        assert!(ScratchStore::adopt_retained(&archive, workspace(35), run_id).is_err());
+        killed.kill().unwrap();
+        assert!(!killed.wait().unwrap().success());
+        let after_death = ScratchStore::adopt_retained(&archive, workspace(35), run_id).unwrap();
+        assert_eq!(after_death.binding_digest().unwrap(), binding);
+        assert_retained_contents(&after_death, &root, &blob);
+        drop(after_death);
+
+        // A clean drop in the owning process releases it too.
+        let (mut released, mut reader) = spawn_adoption_helper(&path, 35, run_id);
+        assert!(ScratchStore::adopt_retained(&archive, workspace(35), run_id).is_err());
+        released
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"release\n")
+            .unwrap();
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert_eq!(line.trim(), "released");
+        assert!(released.wait().unwrap().success());
+        let after_release = ScratchStore::adopt_retained(&archive, workspace(35), run_id).unwrap();
+        assert_retained_contents(&after_release, &root, &blob);
+        drop(after_release);
+
+        assert_eq!(run_snapshot(&path, run_id), baseline);
         fs::remove_dir_all(path).unwrap();
     }
 }
