@@ -369,7 +369,7 @@ fn assert_live_fixture_pages_semantics(pages: &[SemanticFixturePage]) {
     let archive_path = root.path().join("archive");
     ObjectStore::open(&archive_path, workspace)
         .unwrap()
-        .publish_prepared(&prepared)
+        .publish_bootstrap_prepared_for_test(&prepared)
         .unwrap();
     let mut engine = ShardedHotEngine::with_enrolled_projection(
         ObjectStore::open(&archive_path, workspace).unwrap(),
@@ -971,7 +971,7 @@ fn corpus_authorized_engine(
         .unwrap();
     let archive_path = dir.path().join("archive");
     let writer = ObjectStore::open(&archive_path, workspace_id).unwrap();
-    writer.publish_prepared(&prepared).unwrap();
+    writer.publish_bootstrap_prepared_for_test(&prepared).unwrap();
     drop(writer);
     let reader = ObjectStore::open(&archive_path, workspace_id).unwrap();
     let mut engine = match enrollment {
@@ -1357,7 +1357,7 @@ fn build_forensic_accepted_engine(
             &transaction,
         )
         .unwrap();
-    store.publish_prepared(&prepared).unwrap();
+    store.publish_bootstrap_prepared_for_test(&prepared).unwrap();
     let mut accepted_engine = ids.engine();
     assert!(matches!(
         accepted_engine
