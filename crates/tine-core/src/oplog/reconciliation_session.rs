@@ -10,6 +10,7 @@ use std::collections::BTreeSet;
 use crate::model::Graph;
 
 use super::{
+    local_active::LocalRuntimeAdmission,
     operational_coordinator::{
         FailedClosedOperationalCoordinator, OperationalCoordinator, OperationalCoordinatorState,
     },
@@ -39,6 +40,9 @@ use super::{
 /// not cache a graph, projection receipt, engine, database, tail, scan, or
 /// expected-path source between calls.
 pub(crate) struct ReconciliationSessionDependencies<'a> {
+    /// New-architecture write gate. Every dispatch below runs only after a live
+    /// `LocalActiveAuthority` permit revalidates this exact graph and engine.
+    pub(crate) admission: &'a LocalRuntimeAdmission<'a>,
     pub(crate) graph: &'a Graph,
     pub(crate) receipts: &'a ProjectionReceiptStore,
     pub(crate) engine: &'a mut ShardedHotEngine,
@@ -490,6 +494,7 @@ impl LiveReconciliationSessionDispatch<'_> {
     ) -> ReconciliationSessionDispatchOutcome<FailedClosedOperationalCoordinator> {
         let requested_paths = paths.iter().map(ManagedPath::as_str).collect::<Vec<_>>();
         let ReconciliationSessionDependencies {
+            admission,
             graph,
             receipts,
             engine,
@@ -498,6 +503,7 @@ impl LiveReconciliationSessionDispatch<'_> {
             ..
         } = &mut self.dependencies;
         match OperationalCoordinator::execute(
+            admission,
             graph,
             receipts,
             engine,
@@ -618,6 +624,7 @@ impl LiveReconciliationSessionDispatch<'_> {
             (scan, pending)
         };
         let ReconciliationSessionDependencies {
+            admission,
             graph,
             receipts,
             engine,
@@ -625,24 +632,23 @@ impl LiveReconciliationSessionDispatch<'_> {
             tail,
             ..
         } = &mut self.dependencies;
-        let outcome =
-            match execute_stable_scan_import(scan, graph, receipts, engine, database, tail) {
-                ReconciliationImportOutcome::Noop => ReconciliationSessionDispatchOutcome::Noop,
-                ReconciliationImportOutcome::Complete(_) => {
-                    ReconciliationSessionDispatchOutcome::Complete
-                }
-                ReconciliationImportOutcome::Blocked(blocked) => {
-                    ReconciliationSessionDispatchOutcome::Blocked(import_blocked_observation(
-                        blocked,
-                    ))
-                }
-                ReconciliationImportOutcome::RetryFull(_) => {
-                    ReconciliationSessionDispatchOutcome::RetryFull
-                }
-                ReconciliationImportOutcome::FailedClosed(continuation) => {
-                    ReconciliationSessionDispatchOutcome::FailedClosed(continuation)
-                }
-            };
+        let outcome = match execute_stable_scan_import(
+            scan, admission, graph, receipts, engine, database, tail,
+        ) {
+            ReconciliationImportOutcome::Noop => ReconciliationSessionDispatchOutcome::Noop,
+            ReconciliationImportOutcome::Complete(_) => {
+                ReconciliationSessionDispatchOutcome::Complete
+            }
+            ReconciliationImportOutcome::Blocked(blocked) => {
+                ReconciliationSessionDispatchOutcome::Blocked(import_blocked_observation(blocked))
+            }
+            ReconciliationImportOutcome::RetryFull(_) => {
+                ReconciliationSessionDispatchOutcome::RetryFull
+            }
+            ReconciliationImportOutcome::FailedClosed(continuation) => {
+                ReconciliationSessionDispatchOutcome::FailedClosed(continuation)
+            }
+        };
         ReconciliationSessionDispatchResult {
             outcome,
             baseline: Some(pending_baseline),
@@ -711,6 +717,7 @@ impl ReconciliationSessionDispatch for LiveReconciliationSessionDispatch<'_> {
         continuation: Self::Continuation,
     ) -> ReconciliationSessionDispatchOutcome<Self::Continuation> {
         let ReconciliationSessionDependencies {
+            admission,
             graph,
             receipts,
             engine,
@@ -718,7 +725,7 @@ impl ReconciliationSessionDispatch for LiveReconciliationSessionDispatch<'_> {
             tail,
             ..
         } = &mut self.dependencies;
-        match continuation.retry(graph, receipts, engine, database, tail) {
+        match continuation.retry(admission, graph, receipts, engine, database, tail) {
             OperationalCoordinatorState::Complete(_) => {
                 ReconciliationSessionDispatchOutcome::Complete
             }
@@ -823,6 +830,7 @@ mod tests {
         baseline: ReconciliationBaseline,
         next_timestamp: u64,
         path: String,
+        admission: LocalRuntimeAdmission<'static>,
     }
 
     impl LiveFixture {
@@ -922,6 +930,7 @@ mod tests {
                 tail,
                 baseline,
                 next_timestamp: 0,
+                admission: LocalRuntimeAdmission::unenrolled_pre_activation(),
                 path,
             }
         }
@@ -929,6 +938,7 @@ mod tests {
         fn dependencies(&mut self) -> ReconciliationSessionDependencies<'_> {
             self.next_timestamp += 1;
             ReconciliationSessionDependencies {
+                admission: &self.admission,
                 graph: &self.graph,
                 receipts: &self.receipts,
                 engine: &mut self.engine,
@@ -984,6 +994,7 @@ mod tests {
 
         assert_eq!(
             session.step(ReconciliationSessionDependencies {
+                admission: &fixture.admission,
                 graph: &fixture.graph,
                 receipts: &fixture.receipts,
                 engine: &mut unenrolled,
@@ -1003,6 +1014,7 @@ mod tests {
         assert!(!session.status().pending);
         assert_eq!(
             session.step(ReconciliationSessionDependencies {
+                admission: &fixture.admission,
                 graph: &fixture.graph,
                 receipts: &fixture.receipts,
                 engine: &mut unenrolled,

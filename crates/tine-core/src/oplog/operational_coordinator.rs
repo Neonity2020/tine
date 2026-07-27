@@ -12,6 +12,7 @@ use std::sync::Arc;
 use crate::model::PublishedHandoffLatch;
 use crate::Graph;
 
+use super::local_active::LocalRuntimeAdmission;
 use super::{
     plan_affected_import, AcceptedBatchEvent, AuthorBatch, BatchDisposition, BatchId,
     BatchInspection, BatchOrigin, ContentDigest, CrdtPeerId, ImportId, ImportPlan,
@@ -156,12 +157,18 @@ impl FailedClosedOperationalCoordinator {
 
     pub(crate) fn retry(
         mut self,
+        admission: &LocalRuntimeAdmission<'_>,
         graph: &Graph,
         receipts: &ProjectionReceiptStore,
         engine: &mut ShardedHotEngine,
         database: &mut SqliteFrontier,
         tail: &mut TailOverlay,
     ) -> OperationalCoordinatorState {
+        if let Err(error) = admission.authorize(graph, engine) {
+            self.failure =
+                OperationalCoordinatorError::new(OperationalPhase::Bindings, error.to_string());
+            return OperationalCoordinatorState::FailedClosed(self);
+        }
         match self.resume(graph, receipts, engine, database, tail) {
             Ok(completion) => {
                 self.guard.complete();
@@ -392,7 +399,15 @@ impl FailedClosedOperationalCoordinator {
 pub(crate) struct OperationalCoordinator;
 
 impl OperationalCoordinator {
+    /// Execute one bounded external reconciliation.
+    ///
+    /// `admission` is the new-architecture write gate: it is derived only from a
+    /// live [`LocalActiveAuthority`](super::local_active::LocalActiveAuthority)
+    /// permit, and it revalidates the enrolled graph/endpoint/device binding
+    /// against this exact live graph and engine before any authoritative,
+    /// projection, or SQLite work is admitted.
     pub(crate) fn execute(
+        admission: &LocalRuntimeAdmission<'_>,
         graph: &Graph,
         receipts: &ProjectionReceiptStore,
         engine: &mut ShardedHotEngine,
@@ -400,6 +415,9 @@ impl OperationalCoordinator {
         tail: &mut TailOverlay,
         requested_paths: &[&str],
     ) -> Result<OperationalCoordinatorState, OperationalCoordinatorError> {
+        admission.authorize(graph, engine).map_err(|error| {
+            OperationalCoordinatorError::new(OperationalPhase::Bindings, error.to_string())
+        })?;
         let endpoint = engine.projection_endpoint_binding().ok_or_else(|| {
             OperationalCoordinatorError::new(
                 OperationalPhase::Bindings,
@@ -813,8 +831,8 @@ pub(crate) mod simulator_harness {
     use uuid::Uuid;
 
     use super::{
-        act_once_at, fail_once_at, FailedClosedOperationalCoordinator, OperationalCoordinator,
-        OperationalCoordinatorState, OperationalFaultPoint,
+        act_once_at, fail_once_at, FailedClosedOperationalCoordinator, LocalRuntimeAdmission,
+        OperationalCoordinator, OperationalCoordinatorState, OperationalFaultPoint,
     };
     use crate::oplog::simulator::{
         CoordinatorAction, CoordinatorDurableBoundary, CoordinatorExpectedState,
@@ -1315,7 +1333,13 @@ pub(crate) mod simulator_harness {
             let tail = self.tail.as_mut().ok_or("coordinator tail is closed")?;
             let requested = paths.iter().map(String::as_str).collect::<Vec<_>>();
             match OperationalCoordinator::execute(
-                graph, receipts, engine, database, tail, &requested,
+                &LocalRuntimeAdmission::unenrolled_pre_activation(),
+                graph,
+                receipts,
+                engine,
+                database,
+                tail,
+                &requested,
             ) {
                 Ok(OperationalCoordinatorState::Complete(_)) => {
                     self.last_outcome = Some(CoordinatorRunOutcome::Complete);
@@ -1372,7 +1396,14 @@ pub(crate) mod simulator_harness {
                 .as_ref()
                 .ok_or("coordinator receipts are closed")?;
             let engine = self.engine.as_mut().ok_or("coordinator engine is closed")?;
-            match failed.retry(graph, receipts, engine, database, tail) {
+            match failed.retry(
+                &LocalRuntimeAdmission::unenrolled_pre_activation(),
+                graph,
+                receipts,
+                engine,
+                database,
+                tail,
+            ) {
                 OperationalCoordinatorState::Complete(_) => {
                     self.last_outcome = Some(CoordinatorRunOutcome::Complete);
                     self.durable_boundary = CoordinatorDurableBoundary::Complete;
@@ -2292,6 +2323,7 @@ mod tests {
 
         fn execute(&mut self, paths: &[&str]) -> OperationalCoordinatorState {
             OperationalCoordinator::execute(
+                &LocalRuntimeAdmission::unenrolled_pre_activation(),
                 &self.graph,
                 &self.receipts,
                 &mut self.engine,
@@ -2407,6 +2439,7 @@ mod tests {
             let sqlite = fixture.database.frontier_root().unwrap();
             fail_once_at(point);
             assert!(OperationalCoordinator::execute(
+                &LocalRuntimeAdmission::unenrolled_pre_activation(),
                 &fixture.graph,
                 &fixture.receipts,
                 &mut fixture.engine,
@@ -2435,6 +2468,7 @@ mod tests {
         });
         assert!(matches!(
             OperationalCoordinator::execute(
+                &LocalRuntimeAdmission::unenrolled_pre_activation(),
                 &observation.graph,
                 &observation.receipts,
                 &mut observation.engine,
@@ -2470,6 +2504,7 @@ mod tests {
         });
         assert!(matches!(
             OperationalCoordinator::execute(
+                &LocalRuntimeAdmission::unenrolled_pre_activation(),
                 &receipt.graph,
                 &receipt.receipts,
                 &mut receipt.engine,
@@ -2496,6 +2531,7 @@ mod tests {
         let filler = pressured.tail.reserve_mutation(TAIL_MAX_BYTES).unwrap();
         let accepted = pressured.engine.accepted_frontier_root().unwrap();
         let result = OperationalCoordinator::execute(
+            &LocalRuntimeAdmission::unenrolled_pre_activation(),
             &pressured.graph,
             &pressured.receipts,
             &mut pressured.engine,
@@ -2523,6 +2559,7 @@ mod tests {
         fail_next_publish_after_objects();
         assert!(matches!(
             OperationalCoordinator::execute(
+                &LocalRuntimeAdmission::unenrolled_pre_activation(),
                 &objects.graph,
                 &objects.receipts,
                 &mut objects.engine,
@@ -2575,6 +2612,7 @@ mod tests {
                 );
             }
             let completion = expect_complete(failed.retry(
+                &LocalRuntimeAdmission::unenrolled_pre_activation(),
                 &fixture.graph,
                 &fixture.receipts,
                 &mut fixture.engine,
@@ -2703,6 +2741,7 @@ mod tests {
             );
             assert!(fixture.graph.probe_managed_text_writer().is_err());
             match failed.retry(
+                &LocalRuntimeAdmission::unenrolled_pre_activation(),
                 &fixture.graph,
                 &fixture.receipts,
                 &mut fixture.engine,
@@ -2807,6 +2846,7 @@ mod tests {
         assert_eq!(fixture.graph.handoff_release_count(), releases);
 
         let completion = expect_complete(failed.retry(
+            &LocalRuntimeAdmission::unenrolled_pre_activation(),
             &fixture.graph,
             &fixture.receipts,
             &mut fixture.engine,
@@ -3013,6 +3053,7 @@ mod tests {
         fixture.overwrite(b"- rejected binding\n");
         assert!(matches!(
             OperationalCoordinator::execute(
+                &LocalRuntimeAdmission::unenrolled_pre_activation(),
                 &fixture.graph,
                 &foreign,
                 &mut fixture.engine,
@@ -3041,6 +3082,7 @@ mod tests {
         fs::create_dir_all(&foreign_graph_root).unwrap();
         let foreign_graph = Graph::open(&foreign_graph_root);
         let failed = expect_failed(failed.retry(
+            &LocalRuntimeAdmission::unenrolled_pre_activation(),
             &foreign_graph,
             &fixture.receipts,
             &mut fixture.engine,
@@ -3050,6 +3092,7 @@ mod tests {
         assert_eq!(failed.phase(), OperationalPhase::Bindings);
         assert!(fixture.graph.probe_managed_text_writer().is_err());
         expect_complete(failed.retry(
+            &LocalRuntimeAdmission::unenrolled_pre_activation(),
             &fixture.graph,
             &fixture.receipts,
             &mut fixture.engine,

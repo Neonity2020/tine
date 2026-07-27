@@ -12,6 +12,7 @@ use crate::model::Graph;
 use super::{
     hot_engine::MAX_TRANSACTION_OPERATIONS,
     import::MAX_IMPORT_PATH_BYTES,
+    local_active::LocalRuntimeAdmission,
     operational_coordinator::{
         FailedClosedOperationalCoordinator, OperationalCompletion, OperationalCoordinator,
         OperationalCoordinatorError, OperationalCoordinatorState,
@@ -420,6 +421,7 @@ fn hand_off_once<C: ReconciliationCoordinatorCall>(
 }
 
 struct LiveCoordinatorCall<'a> {
+    admission: &'a LocalRuntimeAdmission<'a>,
     graph: &'a Graph,
     receipts: &'a ProjectionReceiptStore,
     engine: &'a mut ShardedHotEngine,
@@ -439,6 +441,7 @@ impl ReconciliationCoordinatorCall for LiveCoordinatorCall<'_> {
         OperationalCoordinatorError,
     > {
         OperationalCoordinator::execute(
+            self.admission,
             self.graph,
             self.receipts,
             self.engine,
@@ -467,6 +470,7 @@ impl ReconciliationCoordinatorCall for LiveCoordinatorCall<'_> {
 /// failed-closed continuation.
 pub(crate) fn execute_stable_scan_import(
     scan: StableGraphTextScan,
+    admission: &LocalRuntimeAdmission<'_>,
     graph: &Graph,
     receipts: &ProjectionReceiptStore,
     engine: &mut ShardedHotEngine,
@@ -504,6 +508,7 @@ pub(crate) fn execute_stable_scan_import(
     };
 
     let mut coordinator = LiveCoordinatorCall {
+        admission,
         graph,
         receipts,
         engine,

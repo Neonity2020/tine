@@ -3962,6 +3962,15 @@ impl ShardedHotEngine {
         self.projection_receipt_store_id
     }
 
+    /// Whether a prepared author transaction still holds speculative
+    /// prospective documents that no acceptance or eviction has resolved.
+    ///
+    /// A quiesce/mark-safe drain must observe `false`: an unresolved author
+    /// buffer means this engine still owns in-flight author work.
+    pub(crate) fn has_pending_author_work(&self) -> bool {
+        self.pending_author_documents.borrow().is_some()
+    }
+
     pub const fn workspace_id(&self) -> WorkspaceId {
         self.workspace_id
     }

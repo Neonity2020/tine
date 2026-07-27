@@ -22,6 +22,10 @@ pub(crate) mod external_import;
 pub mod hot_engine;
 pub mod identity;
 pub mod import;
+// P2N7 composes the single VerifiedLocal -> LocalActive runtime boundary. It
+// is deliberately not reachable from startup, Tauri, or a watcher yet.
+#[allow(dead_code)]
+pub(crate) mod local_active;
 pub(crate) mod loro_store;
 #[allow(dead_code)]
 pub(crate) mod migration_backup;
