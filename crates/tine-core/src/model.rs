@@ -21688,17 +21688,17 @@ fn reconciliation_scan_unsafe_error(detail: impl Into<String>) -> io::Error {
 // in the graph and not in the object store.  A spool is evidence for a later
 // author; it has no history/publication authority by itself.
 
-const BOOTSTRAP_SOURCE_CAPTURE_SCHEMA: u32 = 1;
-const BOOTSTRAP_SOURCE_CHUNK_BYTES: usize = 1024 * 1024;
-const BOOTSTRAP_SOURCE_MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
-const BOOTSTRAP_SOURCE_MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024 * 1024;
-const BOOTSTRAP_SOURCE_MAX_FILES: u64 = 1_000_000;
+pub(crate) const BOOTSTRAP_SOURCE_CAPTURE_SCHEMA: u32 = 1;
+pub(crate) const BOOTSTRAP_SOURCE_CHUNK_BYTES: usize = 1024 * 1024;
+pub(crate) const BOOTSTRAP_SOURCE_MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const BOOTSTRAP_SOURCE_MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+pub(crate) const BOOTSTRAP_SOURCE_MAX_FILES: u64 = 1_000_000;
 const BOOTSTRAP_SOURCE_MAX_PARSER_NODES: u64 = 1_000_000;
-const BOOTSTRAP_SOURCE_MAX_LOGICAL_NAME_BYTES: u64 = MAX_GRAPH_TEXT_SEMANTIC_NAME_BYTES;
+pub(crate) const BOOTSTRAP_SOURCE_MAX_LOGICAL_NAME_BYTES: u64 = MAX_GRAPH_TEXT_SEMANTIC_NAME_BYTES;
 const BOOTSTRAP_SOURCE_MAX_ALL_ENTRIES: u64 = 2_000_000;
-const BOOTSTRAP_SOURCE_MAX_DIRECTORIES: u64 = 1_000_000;
-const BOOTSTRAP_SOURCE_MAX_DIRECTORY_DEPTH: usize = 256;
-const BOOTSTRAP_SOURCE_MAX_PATH_BYTES: usize = 4096;
+pub(crate) const BOOTSTRAP_SOURCE_MAX_DIRECTORIES: u64 = 1_000_000;
+pub(crate) const BOOTSTRAP_SOURCE_MAX_DIRECTORY_DEPTH: usize = 256;
+pub(crate) const BOOTSTRAP_SOURCE_MAX_PATH_BYTES: usize = 4096;
 const BOOTSTRAP_SOURCE_MAX_AGGREGATE_PATH_BYTES: u64 = 512 * 1024 * 1024;
 const BOOTSTRAP_SOURCE_SORT_BUFFER_BYTES: usize = 1024 * 1024;
 const BOOTSTRAP_SOURCE_MAX_SORT_RUNS: u64 = 4096;
@@ -21750,6 +21750,26 @@ impl BootstrapSourceCapture {
 
     pub(crate) fn source_chunk_count(&self) -> u64 {
         self.source_chunks
+    }
+
+    pub(crate) fn graph_resource(&self) -> CanonicalGraphResourceId {
+        self.binding.graph_resource
+    }
+
+    pub(crate) fn inventory_description(&self) -> BlobDescription {
+        self.inventory
+    }
+
+    pub(crate) fn entries_description(&self) -> BlobDescription {
+        self.entries
+    }
+
+    pub(crate) fn chunks_description(&self) -> BlobDescription {
+        self.chunks
+    }
+
+    pub(crate) fn capture_identity(&self) -> io::Result<BlobDescription> {
+        bootstrap_source_capture_id(self)
     }
 
     /// Final hash-only proof for the later author.  It rereads every source
@@ -26206,7 +26226,7 @@ fn canonical_projection_file_resource_id(file: &fs::File) -> io::Result<ContentD
 }
 
 #[cfg(unix)]
-fn canonical_graph_resource_id(dir: &Dir) -> io::Result<CanonicalGraphResourceId> {
+pub(crate) fn canonical_graph_resource_id(dir: &Dir) -> io::Result<CanonicalGraphResourceId> {
     let (device, inode) = projection_dir_identity(dir)?;
     let mut identity = [0_u8; 16];
     identity[..8].copy_from_slice(&device.to_be_bytes());
@@ -26309,7 +26329,7 @@ fn canonical_projection_file_resource_id(file: &fs::File) -> io::Result<ContentD
 }
 
 #[cfg(windows)]
-fn canonical_graph_resource_id(dir: &Dir) -> io::Result<CanonicalGraphResourceId> {
+pub(crate) fn canonical_graph_resource_id(dir: &Dir) -> io::Result<CanonicalGraphResourceId> {
     let (volume, file_id) = projection_dir_identity(dir)?;
     let mut identity = [0_u8; 24];
     identity[..8].copy_from_slice(&volume.to_be_bytes());
@@ -26353,7 +26373,7 @@ fn canonical_projection_file_resource_id(_file: &fs::File) -> io::Result<Content
 }
 
 #[cfg(not(any(unix, windows)))]
-fn canonical_graph_resource_id(_dir: &Dir) -> io::Result<CanonicalGraphResourceId> {
+pub(crate) fn canonical_graph_resource_id(_dir: &Dir) -> io::Result<CanonicalGraphResourceId> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "canonical graph resource identity is unsupported on this platform",

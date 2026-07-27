@@ -32,6 +32,7 @@ use ahash::AHashMap;
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use smallvec::SmallVec;
 use uuid::Uuid;
 
@@ -253,6 +254,41 @@ pub(crate) struct ControlDirectoryIdentity {
 #[cfg(not(any(unix, windows)))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ControlDirectoryIdentity;
+
+impl ControlDirectoryIdentity {
+    pub(crate) fn binding_digest(self) -> ContentDigest {
+        let mut hasher = Sha256::new();
+        hasher.update(b"tine/control-directory-identity-binding/v1\0");
+        self.hash_platform_identity(&mut hasher);
+        ContentDigest::from_bytes(hasher.finalize().into())
+    }
+
+    pub(crate) fn migration_backup_root_binding_digest(self) -> ContentDigest {
+        let mut hasher = Sha256::new();
+        hasher.update(b"tine/migration-backup-root-resource/v1\0");
+        self.hash_platform_identity(&mut hasher);
+        ContentDigest::from_bytes(hasher.finalize().into())
+    }
+
+    fn hash_platform_identity(self, hasher: &mut Sha256) {
+        #[cfg(unix)]
+        {
+            hasher.update(b"unix-dev-inode\0");
+            hasher.update(self.device.to_be_bytes());
+            hasher.update(self.inode.to_be_bytes());
+        }
+        #[cfg(windows)]
+        {
+            hasher.update(b"windows-volume-file-id\0");
+            hasher.update(self.volume.to_be_bytes());
+            hasher.update(self.file_id);
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            hasher.update(b"unsupported\0");
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct AcceptedReadStats {
