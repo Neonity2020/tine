@@ -71,7 +71,7 @@ use super::{
 };
 use crate::model::Graph;
 
-pub(crate) const ENROLLMENT_RECORD_SCHEMA_VERSION: u32 = 4;
+pub(crate) const ENROLLMENT_RECORD_SCHEMA_VERSION: u32 = 5;
 pub(crate) const PUBLISHED_RECOVERY_PACKET_SCHEMA_VERSION: u32 = 1;
 pub(crate) const MAX_ENROLLMENT_RECORD_BYTES: usize = 32 * 1024;
 pub(crate) const MAX_ENROLLMENT_JSON_DEPTH: usize = 16;
@@ -728,10 +728,84 @@ enum LocalExclusionV1 {
     Published { packet: PublishedRecoveryPacketV1 },
 }
 
+/// The immutable bootstrap anchor every `LocalActive` record carries.
+///
+/// It is derived exactly once, at the sole `VerifiedLocal -> LocalActive`
+/// transition, from the committed predecessor record and that record's own
+/// content digest; every later `LocalActive -> LocalActive` handoff must repeat
+/// it byte-for-byte. It therefore holds the complete durable data needed to
+/// reconstruct and revalidate the original `VerifiedLocal`/bootstrap anchor in
+/// O(1) from the head record alone.
+///
+/// It is authenticated by exactly the mechanism that authenticates the head:
+/// the anchor lives inside `lifecycle`, which the hash-linked record digest, the
+/// history accumulator, and the periodic authority-keyed checkpoint all commit
+/// to. A fresh reopen therefore needs only the existing bounded checkpoint/open
+/// proof — never a backward search for the `VerifiedLocal` record, whose
+/// distance from the head grows without bound over a graph's lifetime.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocalActiveAnchorV1 {
+    verified_local_record_digest: ContentDigest,
+    preparation_id: PreparationId,
+    bootstrap_import_id: ContentDigest,
+    bootstrap_part_count: u32,
+    bootstrap_batch_id: Option<BatchId>,
+    accepted_history_record_count: u64,
+    accepted_frontier_anchor: AcceptedFrontierAnchorV1,
+}
+
+impl LocalActiveAnchorV1 {
+    /// Derive the anchor from the actual committed `VerifiedLocal` predecessor
+    /// and the exact content digest of the record that carries it.
+    const fn from_verified_local(
+        verified: &VerifiedLocalV1,
+        verified_local_record_digest: ContentDigest,
+    ) -> Self {
+        Self {
+            verified_local_record_digest,
+            preparation_id: verified.preparation_id,
+            bootstrap_import_id: verified.bootstrap_import_id,
+            bootstrap_part_count: verified.bootstrap_part_count,
+            bootstrap_batch_id: verified.bootstrap_batch_id,
+            accepted_history_record_count: verified.accepted_history_record_count,
+            accepted_frontier_anchor: verified.accepted_frontier_anchor,
+        }
+    }
+
+    /// The zero/nonzero/multipart bootstrap identity rules
+    /// [`VerifiedLocalV1::validate_fields`] enforces, restated over exactly the
+    /// fields the anchor retains, so an anchor is rejected on its own terms
+    /// without reading the record it names.
+    fn validate(&self) -> Result<(), EnrollmentError> {
+        let part_count = u64::from(self.bootstrap_part_count);
+        let zero = self.bootstrap_part_count == 0;
+        if self.bootstrap_batch_id.is_none() != zero
+            || (self.accepted_frontier_anchor.history_root
+                == super::object_store::EngineHistoryStore::empty_root())
+                != zero
+            || self.accepted_frontier_anchor.acceptance_sequence != part_count
+            || self.accepted_frontier_anchor.history_generation != part_count
+            || self.accepted_history_record_count != part_count
+        {
+            return Err(EnrollmentError::InvalidLocalActiveAnchor);
+        }
+        if self.bootstrap_batch_id
+            == Some(BatchId::for_import(ImportId::from_digest(
+                *self.bootstrap_import_id.as_bytes(),
+            )))
+        {
+            return Err(EnrollmentError::InvalidLocalActiveAnchor);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LocalActiveV1 {
     verification_digest: ContentDigest,
+    anchor: LocalActiveAnchorV1,
     handoff: HandoffV1,
     exclusion: LocalExclusionV1,
 }
@@ -763,6 +837,7 @@ impl EnrollmentLifecycleV1 {
             Self::ShadowImport(_) => Ok(()),
             Self::VerifiedLocal(verified) => verified.validate_fields(),
             Self::LocalActive(active) => {
+                active.anchor.validate()?;
                 if matches!(active.handoff, HandoffV1::Safe)
                     && matches!(active.exclusion, LocalExclusionV1::Published { .. })
                 {
@@ -1069,9 +1144,13 @@ fn validate_transition(
             EnrollmentLifecycleV1::VerifiedLocal(verified),
             EnrollmentLifecycleV1::LocalActive(active),
         ) => {
+            // The anchor is minted here and only here, from the actual
+            // committed predecessor record and its exact content digest.
             verified
                 .verification_digest()
                 .is_ok_and(|digest| digest == active.verification_digest)
+                && active.anchor
+                    == LocalActiveAnchorV1::from_verified_local(verified, current_digest)
                 && matches!(active.handoff, HandoffV1::Unsafe { .. })
                 && matches!(active.exclusion, LocalExclusionV1::Idle)
         }
@@ -1079,7 +1158,11 @@ fn validate_transition(
             blocked.prior_record_digest == current_digest
         }
         (EnrollmentLifecycleV1::LocalActive(current), EnrollmentLifecycleV1::LocalActive(next)) => {
+            // The anchor is immutable for the whole `LocalActive` lifetime:
+            // every handoff, session change, exclusion change and checkpoint
+            // must repeat it exactly.
             current.verification_digest == next.verification_digest
+                && current.anchor == next.anchor
                 && legal_local_active_transition(current, next)
         }
         (EnrollmentLifecycleV1::LocalActive(_), EnrollmentLifecycleV1::Blocked(blocked)) => {
@@ -1819,6 +1902,7 @@ pub(crate) struct CommittedLocalActive {
     enrollment_head: ContentDigest,
     generation: u64,
     verification_digest: ContentDigest,
+    anchor: LocalActiveAnchorV1,
     handoff: LocalActiveHandoff,
     sync: LocalActiveSync,
     binding: EnrollmentBindingV1,
@@ -1855,6 +1939,22 @@ impl CommittedLocalActive {
             LocalActiveHandoff::Safe => None,
         }
     }
+
+    /// Rebuild the exact predecessor [`VerifiedLocalEvidence`] the original
+    /// activation consumed, entirely from this record's immutable anchor.
+    fn predecessor_evidence(&self) -> VerifiedLocalEvidence {
+        VerifiedLocalEvidence {
+            enrollment_head: self.anchor.verified_local_record_digest,
+            verification_digest: self.verification_digest,
+            binding: self.binding.clone(),
+            preparation_id: self.anchor.preparation_id,
+            bootstrap_batch_id: self.anchor.bootstrap_batch_id,
+            accepted_frontier_state_digest: self
+                .anchor
+                .accepted_frontier_anchor
+                .accepted_frontier_state_digest,
+        }
+    }
 }
 
 fn observe_local_active(
@@ -1883,6 +1983,7 @@ fn observe_local_active(
         enrollment_head: snapshot.digest,
         generation: snapshot.record.generation,
         verification_digest: active.verification_digest,
+        anchor: active.anchor,
         handoff: match active.handoff {
             HandoffV1::Safe => LocalActiveHandoff::Safe,
             HandoffV1::Unsafe { session_id } => LocalActiveHandoff::Unsafe { session_id },
@@ -1897,10 +1998,12 @@ fn observe_local_active(
 
 fn local_active_lifecycle(
     verification_digest: ContentDigest,
+    anchor: LocalActiveAnchorV1,
     handoff: LocalActiveHandoff,
 ) -> EnrollmentLifecycleV1 {
     EnrollmentLifecycleV1::LocalActive(LocalActiveV1 {
         verification_digest,
+        anchor,
         handoff: match handoff {
             LocalActiveHandoff::Safe => HandoffV1::Safe,
             LocalActiveHandoff::Unsafe { session_id } => HandoffV1::Unsafe { session_id },
@@ -2001,20 +2104,27 @@ fn activate_verified_local_record_at_cut(
             EnrollmentOpen::Present(writer) => writer,
         };
         let current = writer.current().digest;
-        match writer.current().record.lifecycle() {
+        // The anchor persisted below is derived from the record this writer
+        // just reread, and from that record's own committed content digest, so
+        // it can only ever name the exact `VerifiedLocal` predecessor consumed.
+        let anchor = match writer.current().record.lifecycle() {
             EnrollmentLifecycleV1::VerifiedLocal(verified)
                 if current == fresh.enrollment_head
-                    && verified.verification_digest()? == fresh.verification_digest => {}
+                    && verified.verification_digest()? == fresh.verification_digest =>
+            {
+                LocalActiveAnchorV1::from_verified_local(verified, current)
+            }
             _ => {
                 return Err(VerifiedLocalCompositionError::StaleEvidence(
                     "enrollment head changed between proof revalidation and activation",
                 ));
             }
-        }
+        };
         writer.transition_at_cut(
             current,
             local_active_lifecycle(
                 fresh.verification_digest,
+                anchor,
                 LocalActiveHandoff::Unsafe { session_id },
             ),
             cut,
@@ -2078,12 +2188,6 @@ pub(crate) fn reopen_local_active_record(
     }
 }
 
-/// The committed `LocalActive` handoff chain is walked back one authenticated
-/// audit page at a time. The traversal is bounded by the existing enrollment
-/// chain and audit-page bounds, so a fresh-process reopen can never perform
-/// unbounded work or hold an unbounded frame.
-const MAX_LOCAL_ACTIVE_REOPEN_CHAIN_PAGES: usize = MAX_ENROLLMENT_OPEN_CHAIN_RECORDS;
-
 /// A freshly proof-revalidated fresh-process reopen of a committed
 /// `LocalActive` enrollment.
 ///
@@ -2115,16 +2219,18 @@ impl ReopenedLocalActive {
 /// requires no retained in-memory [`VerifiedLocalEvidence`].
 ///
 /// Enrollment bytes alone still never mint authority. The committed
-/// `LocalActive` head is walked back over its exact handoff chain to the
-/// original `VerifiedLocal` predecessor, the complete retained proof set is
-/// freshly revalidated against that committed predecessor record, and the
-/// freshly derived verification digest must reproduce the digest the committed
+/// `LocalActive` head's immutable anchor names the original `VerifiedLocal`
+/// record by content address, so that record is reread directly, the complete
+/// retained proof set is freshly revalidated against it, and the freshly
+/// derived verification digest must reproduce the digest the committed
 /// `LocalActive` record binds. The head is then reopened a second time, so a
 /// head that moved during the proof pass fails closed.
 ///
-/// The traversal makes no assumption that the committed `LocalActive` record
-/// directly succeeds `VerifiedLocal`: any legal sequence of `Safe`/`Unsafe`
-/// handoff records is accepted.
+/// Cost is independent of the enrollment's lifetime generation: the head's
+/// bounded checkpoint/open proof plus exactly one anchored record read. Nothing
+/// here assumes the committed `LocalActive` record directly succeeds
+/// `VerifiedLocal`; any legal sequence of `Safe`/`Unsafe` handoff records is
+/// accepted, however long.
 pub(crate) fn reopen_local_active_from_durable_state(
     root: &EnrollmentApplicationRoot,
     binding: &EnrollmentBindingV1,
@@ -2133,8 +2239,7 @@ pub(crate) fn reopen_local_active_from_durable_state(
     let reader = open_local_active_reader(root, binding)?;
     let committed = observe_idle_local_active(&reader, binding)?;
     let expected_head = committed.enrollment_head;
-    let (predecessor_head, verified) =
-        find_verified_local_predecessor(&reader, committed.verification_digest)?;
+    let verified = read_anchored_verified_local(&reader, &committed)?;
     drop(reader);
 
     let expected = freshly_validate_verified_local(binding, verified.preparation_id, proofs)?;
@@ -2150,12 +2255,13 @@ pub(crate) fn reopen_local_active_from_durable_state(
     }
 
     // Reopen after the expensive proof pass. The head digest commits to the
-    // whole authenticated hash-linked ancestry, so an unchanged head keeps the
-    // predecessor traversal above exact.
+    // whole authenticated hash-linked ancestry including the immutable anchor,
+    // so an unchanged head keeps the anchored predecessor read above exact.
     let reopened = open_local_active_reader(root, binding)?;
     let reopened_committed = observe_idle_local_active(&reopened, binding)?;
     if reopened_committed.enrollment_head != expected_head
         || reopened_committed.verification_digest != committed.verification_digest
+        || reopened_committed.anchor != committed.anchor
         || reopened_committed.handoff != committed.handoff
     {
         return Err(VerifiedLocalCompositionError::StaleEvidence(
@@ -2163,16 +2269,7 @@ pub(crate) fn reopen_local_active_from_durable_state(
         ));
     }
     Ok(ReopenedLocalActive {
-        predecessor: VerifiedLocalEvidence {
-            enrollment_head: predecessor_head,
-            verification_digest: committed.verification_digest,
-            binding: binding.clone(),
-            preparation_id: verified.preparation_id,
-            bootstrap_batch_id: verified.bootstrap_batch_id,
-            accepted_frontier_state_digest: verified
-                .accepted_frontier_anchor
-                .accepted_frontier_state_digest,
-        },
+        predecessor: reopened_committed.predecessor_evidence(),
         committed: reopened_committed,
     })
 }
@@ -2185,30 +2282,29 @@ pub(crate) fn reopen_local_active_from_durable_state(
 /// longer reconstructible: the shadow projection compares against graph text
 /// the user has since edited, and the inactive accepted authority requires an
 /// unadvanced history head. What *is* still exactly reconstructible is the
-/// anchor itself. The committed `VerifiedLocalV1` record is self-authenticating
+/// anchor itself. Every committed `LocalActive` record carries the immutable
+/// [`LocalActiveAnchorV1`] minted at activation, and the committed
+/// `VerifiedLocalV1` record it names by content address is self-authenticating
 /// — its verification digest is a pure function of its own bytes — and the
-/// enrollment chain is hash-linked, so walking the bounded `LocalActive` handoff
-/// chain back to it and reproducing the committed digest proves the exact
-/// original anchor without reading one graph byte.
+/// enrollment chain is hash-linked, so the head's anchor plus one
+/// content-addressed record read reproduces the committed digest and proves the
+/// exact original anchor, without reading one graph byte and without any
+/// dependence on how many sessions the graph has since had.
 ///
 /// This value binds only enrollment state. Binding it to the live archive,
 /// retained immutable bootstrap publication, and authenticated history
 /// transition is [`super::local_active`]'s job; nothing here grants authority.
 pub(crate) struct PromotedBootstrapAnchor {
-    binding: EnrollmentBindingV1,
     committed: CommittedLocalActive,
-    predecessor_head: ContentDigest,
-    preparation_id: PreparationId,
-    bootstrap_import_id: ContentDigest,
-    bootstrap_part_count: u32,
-    bootstrap_batch_id: Option<BatchId>,
-    accepted_history_record_count: u64,
-    anchor: AcceptedFrontierAnchorV1,
 }
 
 impl PromotedBootstrapAnchor {
+    const fn anchor(&self) -> &LocalActiveAnchorV1 {
+        &self.committed.anchor
+    }
+
     pub(crate) const fn binding(&self) -> &EnrollmentBindingV1 {
-        &self.binding
+        self.committed.binding()
     }
 
     pub(crate) const fn committed(&self) -> &CommittedLocalActive {
@@ -2220,57 +2316,51 @@ impl PromotedBootstrapAnchor {
     }
 
     pub(crate) const fn bootstrap_import_id(&self) -> ContentDigest {
-        self.bootstrap_import_id
+        self.anchor().bootstrap_import_id
     }
 
     pub(crate) const fn bootstrap_part_count(&self) -> u32 {
-        self.bootstrap_part_count
+        self.anchor().bootstrap_part_count
     }
 
     pub(crate) const fn accepted_history_record_count(&self) -> u64 {
-        self.accepted_history_record_count
+        self.anchor().accepted_history_record_count
     }
 
     pub(crate) const fn acceptance_sequence(&self) -> u64 {
-        self.anchor.acceptance_sequence
+        self.anchor().accepted_frontier_anchor.acceptance_sequence
     }
 
     pub(crate) const fn accepted_frontier_state_digest(&self) -> ContentDigest {
-        self.anchor.accepted_frontier_state_digest
+        self.anchor()
+            .accepted_frontier_anchor
+            .accepted_frontier_state_digest
     }
 
     pub(crate) const fn history_generation(&self) -> u64 {
-        self.anchor.history_generation
+        self.anchor().accepted_frontier_anchor.history_generation
     }
 
     pub(crate) const fn history_root(&self) -> ContentDigest {
-        self.anchor.history_root
+        self.anchor().accepted_frontier_anchor.history_root
     }
 
     /// Rebuild the exact predecessor [`VerifiedLocalEvidence`] the original
     /// activation consumed, plus the committed `LocalActive` record.
     pub(crate) fn into_predecessor_evidence(self) -> (VerifiedLocalEvidence, CommittedLocalActive) {
-        (
-            VerifiedLocalEvidence {
-                enrollment_head: self.predecessor_head,
-                verification_digest: self.committed.verification_digest,
-                binding: self.binding,
-                preparation_id: self.preparation_id,
-                bootstrap_batch_id: self.bootstrap_batch_id,
-                accepted_frontier_state_digest: self.anchor.accepted_frontier_state_digest,
-            },
-            self.committed,
-        )
+        let predecessor = self.committed.predecessor_evidence();
+        (predecessor, self.committed)
     }
 }
 
-/// Bounded fresh-process reconstruction of the committed `LocalActive` record
-/// and its exact original `VerifiedLocal` bootstrap anchor.
+/// Fresh-process reconstruction of the committed `LocalActive` record and its
+/// exact original `VerifiedLocal` bootstrap anchor.
 ///
-/// Cost is the bounded handoff-chain walk plus one record digest, never the
-/// enrollment lifetime, the graph, the archive, or SQLite. Absent,
-/// `ShadowImport`, `Blocked`, non-`Idle`, malformed, cross-bound, and
-/// changed-digest state all fail closed.
+/// Cost is the existing bounded checkpoint/open proof plus exactly one
+/// content-addressed record read, never the enrollment lifetime, the graph, the
+/// archive, or SQLite. Absent, `ShadowImport`, `Blocked`, non-`Idle`,
+/// malformed, cross-bound, forged-anchor, and changed-digest state all fail
+/// closed.
 pub(crate) fn reopen_promoted_bootstrap_anchor(
     root: &EnrollmentApplicationRoot,
     binding: &EnrollmentBindingV1,
@@ -2278,29 +2368,55 @@ pub(crate) fn reopen_promoted_bootstrap_anchor(
     binding.validate_internal()?;
     let reader = open_local_active_reader(root, binding)?;
     let committed = observe_idle_local_active(&reader, binding)?;
-    let (predecessor_head, verified) =
-        find_verified_local_predecessor(&reader, committed.verification_digest)?;
+    read_anchored_verified_local(&reader, &committed)?;
     drop(reader);
+    Ok(PromotedBootstrapAnchor { committed })
+}
 
+/// Reread and revalidate the exact original `VerifiedLocal` record the
+/// committed `LocalActive` head anchors.
+///
+/// The head's immutable anchor names that record by content address, so this is
+/// one direct authenticated record read rather than a backward search, and its
+/// cost does not grow with the number of handoff records the enrollment has
+/// accumulated. The original record is never deleted or compacted, so it stays
+/// available both for this revalidation and for forensic audit.
+fn read_anchored_verified_local(
+    reader: &EnrollmentReader,
+    committed: &CommittedLocalActive,
+) -> Result<VerifiedLocalV1, VerifiedLocalCompositionError> {
+    let anchor = committed.anchor;
+    let record = read_record(
+        &reader.directories.records,
+        anchor.verified_local_record_digest,
+    )?;
+    validate_record_authority(
+        &record,
+        &reader.current.record.binding,
+        reader.current.record.lease_resource_id,
+        &reader.authority.material,
+    )?;
+    let EnrollmentLifecycleV1::VerifiedLocal(verified) = record.lifecycle() else {
+        return Err(VerifiedLocalCompositionError::WrongLifecycle(
+            "the anchored enrollment record is not the original VerifiedLocal record",
+        ));
+    };
     // The committed VerifiedLocal record commits to itself: reproducing its
     // digest proves the retained anchor fields are the exact ones the original
     // activation bound.
     if verified.verification_digest()? != committed.verification_digest {
         return Err(VerifiedLocalCompositionError::ProofMismatch(
-            "committed VerifiedLocal record does not reproduce the LocalActive verification digest",
+            "the anchored VerifiedLocal record does not reproduce the committed verification digest",
         ));
     }
-    Ok(PromotedBootstrapAnchor {
-        binding: binding.clone(),
-        committed,
-        predecessor_head,
-        preparation_id: verified.preparation_id,
-        bootstrap_import_id: verified.bootstrap_import_id,
-        bootstrap_part_count: verified.bootstrap_part_count,
-        bootstrap_batch_id: verified.bootstrap_batch_id,
-        accepted_history_record_count: verified.accepted_history_record_count,
-        anchor: verified.accepted_frontier_anchor,
-    })
+    if anchor
+        != LocalActiveAnchorV1::from_verified_local(verified, anchor.verified_local_record_digest)
+    {
+        return Err(VerifiedLocalCompositionError::ProofMismatch(
+            "the committed LocalActive anchor diverges from the original VerifiedLocal record",
+        ));
+    }
+    Ok(verified.clone())
 }
 
 fn open_local_active_reader(
@@ -2326,49 +2442,6 @@ fn observe_idle_local_active(
         ));
     }
     Ok(committed)
-}
-
-/// Walk the committed handoff chain back to the exact `VerifiedLocal` record
-/// the original activation consumed.
-///
-/// Every record from the head down to that predecessor must be a `LocalActive`
-/// record binding the identical verification digest. The reader has already
-/// authenticated each record, its generation, and its link to its successor, so
-/// this pass only classifies lifecycles and enforces the digest.
-fn find_verified_local_predecessor(
-    reader: &EnrollmentReader,
-    verification_digest: ContentDigest,
-) -> Result<(ContentDigest, VerifiedLocalV1), VerifiedLocalCompositionError> {
-    let mut cursor = None;
-    for _ in 0..MAX_LOCAL_ACTIVE_REOPEN_CHAIN_PAGES {
-        let page = reader.audit_chain_page(cursor, MAX_ENROLLMENT_AUDIT_PAGE)?;
-        for snapshot in &page.records {
-            match snapshot.record.lifecycle() {
-                EnrollmentLifecycleV1::LocalActive(active)
-                    if active.verification_digest == verification_digest => {}
-                EnrollmentLifecycleV1::LocalActive(_) => {
-                    return Err(VerifiedLocalCompositionError::ProofMismatch(
-                        "a LocalActive handoff predecessor binds another verification digest",
-                    ));
-                }
-                EnrollmentLifecycleV1::VerifiedLocal(verified) => {
-                    return Ok((snapshot.digest, verified.clone()));
-                }
-                EnrollmentLifecycleV1::ShadowImport(_) | EnrollmentLifecycleV1::Blocked(_) => {
-                    return Err(VerifiedLocalCompositionError::WrongLifecycle(
-                        "the committed LocalActive chain does not descend from VerifiedLocal",
-                    ));
-                }
-            }
-        }
-        match page.next {
-            Some(next) => cursor = Some(next),
-            None => break,
-        }
-    }
-    Err(VerifiedLocalCompositionError::StaleEvidence(
-        "no VerifiedLocal predecessor within the bounded LocalActive handoff chain",
-    ))
 }
 
 /// Durably move one committed `LocalActive` record between handoff states.
@@ -2441,9 +2514,11 @@ fn transition_local_active_handoff_at_cut(
         drop(writer);
         return reopen_committed_local_active(root, binding, expected_head, verification_digest);
     }
+    // The anchor is carried through unchanged from the record this writer just
+    // reread, so a handoff can never restate, advance, or drop it.
     writer.transition_at_cut(
         expected_head,
-        local_active_lifecycle(verification_digest, target),
+        local_active_lifecycle(verification_digest, current.anchor, target),
         cut,
     )?;
     let advanced = writer.current().digest;
@@ -2492,11 +2567,13 @@ pub(crate) fn publish_local_active_for_test(
         }
         EnrollmentOpen::Present(writer) => writer,
     };
+    let anchor = observe_local_active(writer.current(), binding)?.anchor;
     Ok(writer
         .transition(
             expected_head,
             EnrollmentLifecycleV1::LocalActive(LocalActiveV1 {
                 verification_digest,
+                anchor,
                 handoff: HandoffV1::Unsafe { session_id },
                 exclusion: LocalExclusionV1::Published { packet },
             }),
@@ -4547,6 +4624,7 @@ pub(crate) enum EnrollmentError {
     BindingMismatch(EnrollmentBindingField),
     PublishedBatchMismatch,
     InvalidVerifiedLocalTerminal,
+    InvalidLocalActiveAnchor,
     InvalidBlockedReason,
     IllegalLifecycle(&'static str),
     IllegalTransition,
@@ -4667,6 +4745,9 @@ impl fmt::Display for EnrollmentError {
             }
             Self::InvalidVerifiedLocalTerminal => formatter.write_str(
                 "verified-local terminal bootstrap identity or proof counts are inconsistent",
+            ),
+            Self::InvalidLocalActiveAnchor => formatter.write_str(
+                "local-active bootstrap anchor identity or proof counts are inconsistent",
             ),
             Self::InvalidBlockedReason => formatter.write_str("invalid blocked reason code"),
             Self::IllegalLifecycle(detail) => {
@@ -4852,16 +4933,44 @@ mod tests {
         value
     }
 
-    fn active(handoff: HandoffV1, exclusion: LocalExclusionV1) -> EnrollmentLifecycleV1 {
+    fn multipart_verified() -> VerifiedLocalV1 {
+        let mut value = verified();
+        value.source_file_count = 7;
+        value.source_chunk_count = 19;
+        value.source_total_bytes = 4_096;
+        value.bootstrap_part_count = 7;
+        value.accepted_frontier_anchor.acceptance_sequence = 7;
+        value.accepted_frontier_anchor.history_generation = 7;
+        value.accepted_history_record_count = 7;
+        value.catalog_row_count = 7;
+        value.sqlite_accepted_batch_count = 7;
+        value.staged_file_count = 7;
+        value.staged_total_bytes = 4_096;
+        value
+    }
+
+    /// The exact anchor a `VerifiedLocal -> LocalActive` transition out of the
+    /// record at `predecessor` must mint.
+    fn local_anchor(predecessor: ContentDigest) -> LocalActiveAnchorV1 {
+        LocalActiveAnchorV1::from_verified_local(&verified(), predecessor)
+    }
+
+    fn active(
+        predecessor: ContentDigest,
+        handoff: HandoffV1,
+        exclusion: LocalExclusionV1,
+    ) -> EnrollmentLifecycleV1 {
         EnrollmentLifecycleV1::LocalActive(LocalActiveV1 {
             verification_digest: verified().verification_digest().unwrap(),
+            anchor: local_anchor(predecessor),
             handoff,
             exclusion,
         })
     }
 
-    fn unsafe_idle(session: u128) -> EnrollmentLifecycleV1 {
+    fn unsafe_idle(predecessor: ContentDigest, session: u128) -> EnrollmentLifecycleV1 {
         active(
+            predecessor,
             HandoffV1::Unsafe {
                 session_id: SessionId::from_uuid(Uuid::from_u128(session)),
             },
@@ -4869,8 +4978,8 @@ mod tests {
         )
     }
 
-    fn safe_idle() -> EnrollmentLifecycleV1 {
-        active(HandoffV1::Safe, LocalExclusionV1::Idle)
+    fn safe_idle(predecessor: ContentDigest) -> EnrollmentLifecycleV1 {
+        active(predecessor, HandoffV1::Safe, LocalExclusionV1::Idle)
     }
 
     fn packet(archive: CanonicalArchiveResourceId) -> PublishedRecoveryPacketV1 {
@@ -4885,8 +4994,13 @@ mod tests {
         .unwrap()
     }
 
-    fn published(session: u128, archive: CanonicalArchiveResourceId) -> EnrollmentLifecycleV1 {
+    fn published(
+        predecessor: ContentDigest,
+        session: u128,
+        archive: CanonicalArchiveResourceId,
+    ) -> EnrollmentLifecycleV1 {
         active(
+            predecessor,
             HandoffV1::Unsafe {
                 session_id: SessionId::from_uuid(Uuid::from_u128(session)),
             },
@@ -5116,7 +5230,7 @@ mod tests {
         let states = [
             EnrollmentLifecycleV1::ShadowImport(shadow()),
             EnrollmentLifecycleV1::VerifiedLocal(verified()),
-            unsafe_idle(31),
+            unsafe_idle(current_digest, 31),
             blocked(current_digest),
         ];
         for (from_index, from) in states.iter().enumerate() {
@@ -5133,19 +5247,19 @@ mod tests {
             }
         }
 
-        let unsafe_a = match unsafe_idle(40) {
+        let unsafe_a = match unsafe_idle(current_digest, 40) {
             EnrollmentLifecycleV1::LocalActive(value) => value,
             _ => unreachable!(),
         };
-        let unsafe_b = match unsafe_idle(41) {
+        let unsafe_b = match unsafe_idle(current_digest, 41) {
             EnrollmentLifecycleV1::LocalActive(value) => value,
             _ => unreachable!(),
         };
-        let safe = match safe_idle() {
+        let safe = match safe_idle(current_digest) {
             EnrollmentLifecycleV1::LocalActive(value) => value,
             _ => unreachable!(),
         };
-        let published = match published(40, test_binding().archive_resource_id) {
+        let published = match published(current_digest, 40, test_binding().archive_resource_id) {
             EnrollmentLifecycleV1::LocalActive(value) => value,
             _ => unreachable!(),
         };
@@ -5158,6 +5272,39 @@ mod tests {
         assert!(!legal_local_active_transition(&unsafe_b, &published));
         assert!(!legal_local_active_transition(&safe, &published));
         assert!(!legal_local_active_transition(&published, &published));
+
+        // The anchor is part of the LocalActive -> LocalActive contract: an
+        // otherwise legal handoff that restates the anchor is rejected.
+        let mut divergent = unsafe_b.clone();
+        divergent.anchor = local_anchor(digest(39));
+        assert!(legal_local_active_transition(&unsafe_a, &divergent));
+        assert_eq!(
+            validate_transition(
+                &EnrollmentLifecycleV1::LocalActive(unsafe_a.clone()),
+                &EnrollmentLifecycleV1::LocalActive(divergent),
+                current_digest,
+            ),
+            Err(EnrollmentError::IllegalTransition)
+        );
+        assert!(validate_transition(
+            &EnrollmentLifecycleV1::LocalActive(unsafe_a.clone()),
+            &EnrollmentLifecycleV1::LocalActive(unsafe_b),
+            current_digest,
+        )
+        .is_ok());
+
+        // ... and a VerifiedLocal -> LocalActive transition must mint the
+        // anchor from the exact committed predecessor record digest.
+        let mut foreign = unsafe_a;
+        foreign.anchor = local_anchor(digest(38));
+        assert_eq!(
+            validate_transition(
+                &EnrollmentLifecycleV1::VerifiedLocal(verified()),
+                &EnrollmentLifecycleV1::LocalActive(foreign),
+                current_digest,
+            ),
+            Err(EnrollmentError::IllegalTransition)
+        );
     }
 
     #[test]
@@ -5181,31 +5328,34 @@ mod tests {
         let verified = EnrollmentLifecycleV1::VerifiedLocal(verified());
         let digest_verified = writer.transition(stale, verified).unwrap().digest;
         assert_eq!(
-            writer.transition(stale, unsafe_idle(50)),
+            writer.transition(stale, unsafe_idle(digest_verified, 50)),
             Err(EnrollmentError::StaleCompareAndSwap)
         );
         let active_digest = writer
-            .transition(digest_verified, unsafe_idle(50))
+            .transition(digest_verified, unsafe_idle(digest_verified, 50))
             .unwrap()
             .digest;
         let recovered_unclean_digest = writer
-            .transition(active_digest, unsafe_idle(53))
+            .transition(active_digest, unsafe_idle(digest_verified, 53))
             .unwrap()
             .digest;
         let safe_digest = writer
-            .transition(recovered_unclean_digest, safe_idle())
+            .transition(recovered_unclean_digest, safe_idle(digest_verified))
             .unwrap()
             .digest;
         let unsafe_digest = writer
-            .transition(safe_digest, unsafe_idle(51))
+            .transition(safe_digest, unsafe_idle(digest_verified, 51))
             .unwrap()
             .digest;
         let published_digest = writer
-            .transition(unsafe_digest, published(51, binding.archive_resource_id))
+            .transition(
+                unsafe_digest,
+                published(digest_verified, 51, binding.archive_resource_id),
+            )
             .unwrap()
             .digest;
         let recovered_digest = writer
-            .transition(published_digest, unsafe_idle(52))
+            .transition(published_digest, unsafe_idle(digest_verified, 52))
             .unwrap()
             .digest;
         let blocked_digest = writer
@@ -5760,13 +5910,14 @@ mod tests {
         let binding = test_binding();
         let writer = EnrollmentWriter::create(&root.app(), binding.clone(), shadow()).unwrap();
         let mut snapshot = writer.current().clone();
+        let mut verified_digest = snapshot.digest;
         let records = enrollment_directory(&root, &binding).join(RECORDS_DIRECTORY);
         for index in 0..MAX_ENROLLMENT_OPEN_CHAIN_RECORDS {
             let lifecycle = match index {
                 0 => EnrollmentLifecycleV1::VerifiedLocal(verified()),
-                1 => unsafe_idle(200),
-                _ if index % 2 == 0 => safe_idle(),
-                _ => unsafe_idle(200 + index as u128),
+                1 => unsafe_idle(verified_digest, 200),
+                _ if index % 2 == 0 => safe_idle(verified_digest),
+                _ => unsafe_idle(verified_digest, 200 + index as u128),
             };
             let record = EnrollmentRecordV1::successor(
                 &snapshot,
@@ -5777,6 +5928,9 @@ mod tests {
             let bytes = canonical_record_bytes(&record).unwrap();
             let digest = ContentDigest::of(&bytes);
             fs::write(records.join(format!("{digest}{RECORD_SUFFIX}")), bytes).unwrap();
+            if index == 0 {
+                verified_digest = digest;
+            }
             snapshot = EnrollmentSnapshot { digest, record };
         }
         drop(writer);
@@ -5800,14 +5954,14 @@ mod tests {
             .unwrap()
             .digest;
         let mut current = writer
-            .transition(verified_digest, unsafe_idle(700))
+            .transition(verified_digest, unsafe_idle(verified_digest, 700))
             .unwrap()
             .digest;
         for index in 0..2_049_u64 {
             let next = if index % 2 == 0 {
-                safe_idle()
+                safe_idle(verified_digest)
             } else {
-                unsafe_idle(701 + u128::from(index))
+                unsafe_idle(verified_digest, 701 + u128::from(index))
             };
             current = writer.transition(current, next).unwrap().digest;
         }
@@ -5847,6 +6001,704 @@ mod tests {
                 "each resumed page reads exactly one fixed-size successor proof"
             );
         }
+    }
+
+    /// Drive one enrollment to `LocalActive` and then append `handoffs`
+    /// alternating `Safe`/`Unsafe` handoff records. Returns the committed
+    /// `VerifiedLocal` record digest and the resulting head.
+    fn local_active_journal(
+        root: &TestRoot,
+        binding: &EnrollmentBindingV1,
+        handoffs: u64,
+    ) -> (ContentDigest, ContentDigest) {
+        let mut writer = EnrollmentWriter::create(&root.app(), binding.clone(), shadow()).unwrap();
+        let initial = writer.current().digest;
+        let verified_digest = writer
+            .transition(initial, EnrollmentLifecycleV1::VerifiedLocal(verified()))
+            .unwrap()
+            .digest;
+        let mut current = writer
+            .transition(verified_digest, unsafe_idle(verified_digest, 900))
+            .unwrap()
+            .digest;
+        for index in 0..handoffs {
+            let next = if index % 2 == 0 {
+                safe_idle(verified_digest)
+            } else {
+                unsafe_idle(verified_digest, 901 + u128::from(index))
+            };
+            current = writer.transition(current, next).unwrap().digest;
+        }
+        // The journal must end on `Unsafe`+`Idle`, which is the only state a
+        // promoted reopen accepts.
+        assert!(handoffs % 2 == 0 && handoffs > 0);
+        (verified_digest, current)
+    }
+
+    fn measured_promoted_reopen(
+        root: &TestRoot,
+        binding: &EnrollmentBindingV1,
+    ) -> (PromotedBootstrapAnchor, usize) {
+        ENROLLMENT_RECORD_READS.with(|reads| reads.set(0));
+        let anchor = reopen_promoted_bootstrap_anchor(&root.app(), binding).unwrap();
+        (anchor, ENROLLMENT_RECORD_READS.with(std::cell::Cell::get))
+    }
+
+    /// The bounded-lifetime defect this anchor exists to remove: the original
+    /// `VerifiedLocal` record used to be found by walking back at most
+    /// `MAX_ENROLLMENT_OPEN_CHAIN_RECORDS * MAX_ENROLLMENT_AUDIT_PAGE` = 4,096
+    /// records, so a graph became permanently unopenable after roughly that many
+    /// clean sessions.
+    #[test]
+    fn more_than_four_thousand_local_active_handoffs_stay_openable_at_bounded_cost() {
+        let short_root = TestRoot::new("anchor-short");
+        let binding = test_binding();
+        let short_handoffs = 2_u64;
+        let (short_verified, _) = local_active_journal(&short_root, &binding, short_handoffs);
+        let (short_anchor, short_reads) = measured_promoted_reopen(&short_root, &binding);
+        assert_eq!(short_anchor.committed().generation(), short_handoffs + 3);
+
+        // 4,162 = 2 + 65 * 64, so the long head sits at exactly the same
+        // distance from its authenticated checkpoint as the short one. Any
+        // read-count difference is therefore lifetime dependence, not
+        // checkpoint phase.
+        let long_root = TestRoot::new("anchor-long");
+        let handoffs = 4_162_u64;
+        let (long_verified, long_head) = local_active_journal(&long_root, &binding, handoffs);
+        let (long_anchor, long_reads) = measured_promoted_reopen(&long_root, &binding);
+        assert_eq!(long_anchor.committed().generation(), handoffs + 3);
+        assert!(
+            handoffs + 1 > (MAX_ENROLLMENT_OPEN_CHAIN_RECORDS * MAX_ENROLLMENT_AUDIT_PAGE) as u64,
+            "the journal must exceed the removed predecessor-walk limit"
+        );
+        assert_eq!(long_anchor.committed().enrollment_head(), long_head);
+
+        // Reopen cost does not depend on the lifetime generation: the bounded
+        // checkpoint/open proof plus exactly one anchored record read.
+        let expected_reads = |generation: u64| {
+            2 + usize::try_from((generation - 1) % MAX_ENROLLMENT_OPEN_CHAIN_RECORDS as u64)
+                .unwrap()
+        };
+        assert_eq!(
+            short_reads,
+            expected_reads(short_anchor.committed().generation())
+        );
+        assert_eq!(
+            long_reads,
+            expected_reads(long_anchor.committed().generation())
+        );
+        assert_eq!(
+            short_reads,
+            long_reads,
+            "anchored reopen must read the same number of records at generation \
+             {} and generation {}",
+            short_anchor.committed().generation(),
+            long_anchor.committed().generation()
+        );
+        assert!(
+            long_reads <= MAX_ENROLLMENT_OPEN_CHAIN_RECORDS + 1,
+            "anchored reopen read {long_reads} records"
+        );
+
+        // The reconstructed anchor is exactly the original VerifiedLocal one.
+        let expected = verified();
+        for anchor in [&short_anchor, &long_anchor] {
+            assert_eq!(
+                anchor.verification_digest(),
+                expected.verification_digest().unwrap()
+            );
+            assert_eq!(anchor.bootstrap_import_id(), expected.bootstrap_import_id);
+            assert_eq!(anchor.bootstrap_part_count(), expected.bootstrap_part_count);
+            assert_eq!(
+                anchor.accepted_history_record_count(),
+                expected.accepted_history_record_count
+            );
+            assert_eq!(
+                anchor.acceptance_sequence(),
+                expected.accepted_frontier_anchor.acceptance_sequence
+            );
+            assert_eq!(
+                anchor.accepted_frontier_state_digest(),
+                expected
+                    .accepted_frontier_anchor
+                    .accepted_frontier_state_digest
+            );
+            assert_eq!(
+                anchor.history_generation(),
+                expected.accepted_frontier_anchor.history_generation
+            );
+            assert_eq!(
+                anchor.history_root(),
+                expected.accepted_frontier_anchor.history_root
+            );
+            assert_eq!(anchor.binding(), &binding);
+        }
+
+        let (predecessor, committed) = long_anchor.into_predecessor_evidence();
+        assert_eq!(predecessor.enrollment_head(), long_verified);
+        assert_eq!(predecessor.preparation_id(), expected.preparation_id);
+        assert_eq!(
+            predecessor.bootstrap_batch_id(),
+            expected.bootstrap_batch_id
+        );
+        assert_eq!(
+            predecessor.accepted_frontier_state_digest(),
+            expected
+                .accepted_frontier_anchor
+                .accepted_frontier_state_digest
+        );
+        assert_eq!(
+            predecessor.verification_digest(),
+            expected.verification_digest().unwrap()
+        );
+        assert_eq!(committed.enrollment_head(), long_head);
+        assert_ne!(short_verified, long_verified);
+
+        // Forensics: the original VerifiedLocal record is never deleted or
+        // compacted, so it is still on disk and still auditable by walking the
+        // complete chain, however long the journal has grown.
+        assert!(record_path(&long_root, &binding, long_verified).exists());
+        let stored =
+            decode_record(&fs::read(record_path(&long_root, &binding, long_verified)).unwrap())
+                .unwrap();
+        match stored.lifecycle() {
+            EnrollmentLifecycleV1::VerifiedLocal(stored_verified) => {
+                assert_eq!(stored_verified, &expected);
+            }
+            other => panic!("anchored record is not VerifiedLocal: {other:?}"),
+        }
+
+        let reader =
+            expect_present(EnrollmentReader::open_existing(&long_root.app(), &binding).unwrap());
+        let mut cursor = None;
+        let mut audited = 0_u64;
+        let mut found_verified = None;
+        loop {
+            let page = reader
+                .audit_chain_page(cursor, MAX_ENROLLMENT_AUDIT_PAGE)
+                .unwrap();
+            for snapshot in &page.records {
+                audited += 1;
+                if matches!(
+                    snapshot.record.lifecycle(),
+                    EnrollmentLifecycleV1::VerifiedLocal(_)
+                ) {
+                    found_verified = Some(snapshot.digest);
+                }
+            }
+            match page.next {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        assert_eq!(audited, handoffs + 3);
+        assert_eq!(found_verified, Some(long_verified));
+    }
+
+    #[test]
+    fn local_active_anchor_is_immutable_across_handoff_session_and_checkpoint_transitions() {
+        let root = TestRoot::new("anchor-immutable");
+        let binding = test_binding();
+        let mut writer = EnrollmentWriter::create(&root.app(), binding.clone(), shadow()).unwrap();
+        let initial = writer.current().digest;
+        let verified_digest = writer
+            .transition(initial, EnrollmentLifecycleV1::VerifiedLocal(verified()))
+            .unwrap()
+            .digest;
+        let minted = local_anchor(verified_digest);
+        let mut current = writer
+            .transition(verified_digest, unsafe_idle(verified_digest, 1_400))
+            .unwrap()
+            .digest;
+
+        // Safe/Unsafe flips, session changes, a Published exclusion and its
+        // recovery, and at least one authenticated checkpoint boundary.
+        let mut checkpoints = 0_usize;
+        while writer.current().generation() < 70 {
+            let generation = writer.current().generation();
+            let next = match generation % 4 {
+                0 => safe_idle(verified_digest),
+                1 => unsafe_idle(verified_digest, 1_400 + u128::from(generation)),
+                2 => published(
+                    verified_digest,
+                    1_400 + u128::from(generation) - 1,
+                    binding.archive_resource_id,
+                ),
+                _ => unsafe_idle(verified_digest, 1_500 + u128::from(generation)),
+            };
+            current = writer.transition(current, next).unwrap().digest;
+            match writer.current().record.lifecycle() {
+                EnrollmentLifecycleV1::LocalActive(active) => {
+                    assert_eq!(
+                        active.anchor, minted,
+                        "anchor moved at generation {generation}"
+                    );
+                }
+                other => panic!("unexpected lifecycle {other:?}"),
+            }
+            if writer.current().record.checkpoint.is_some() {
+                checkpoints += 1;
+            }
+        }
+        assert!(checkpoints > 0, "the journal must cross a checkpoint");
+
+        // A handoff that restates the anchor is refused even though its
+        // handoff/exclusion move is otherwise legal.
+        let mut restated = match safe_idle(verified_digest) {
+            EnrollmentLifecycleV1::LocalActive(value) => value,
+            other => panic!("unexpected lifecycle {other:?}"),
+        };
+        restated
+            .anchor
+            .accepted_frontier_anchor
+            .accepted_frontier_state_digest = digest(210);
+        assert_eq!(
+            writer.transition(current, EnrollmentLifecycleV1::LocalActive(restated)),
+            Err(EnrollmentError::IllegalTransition)
+        );
+        drop(writer);
+
+        // Every reopen path still reconstructs the originally minted anchor.
+        let reopened = reopen_promoted_bootstrap_anchor(&root.app(), &binding).unwrap();
+        assert_eq!(reopened.committed().anchor, minted);
+        assert_eq!(reopened.committed().enrollment_head(), current);
+        let committed = reopen_committed_local_active_for_session(
+            &root.app(),
+            &binding,
+            verified().verification_digest().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(committed.anchor, minted);
+    }
+
+    #[test]
+    fn local_active_handoff_crash_cuts_preserve_the_exact_anchor() {
+        for (cut, expect_new) in [
+            (CommitCut::AfterRecordTempCreate, Some(false)),
+            (CommitCut::AfterRecordWrite, Some(false)),
+            (CommitCut::AfterRecordFileSync, Some(false)),
+            (CommitCut::AfterRecordLink, Some(false)),
+            (CommitCut::AfterRecordInsert, Some(false)),
+            (CommitCut::AfterRecordsDirectorySync, Some(false)),
+            (CommitCut::AfterHeadTempCreate, Some(false)),
+            (CommitCut::AfterHeadWrite, Some(false)),
+            (CommitCut::AfterHeadFileSync, Some(false)),
+            (CommitCut::AfterHeadReplace, None),
+            (CommitCut::AfterEnrollmentDirectorySync, Some(true)),
+        ] {
+            let root = TestRoot::new("anchor-crash");
+            let binding = test_binding();
+            let mut writer =
+                EnrollmentWriter::create(&root.app(), binding.clone(), shadow()).unwrap();
+            let initial = writer.current().digest;
+            let verified_digest = writer
+                .transition(initial, EnrollmentLifecycleV1::VerifiedLocal(verified()))
+                .unwrap()
+                .digest;
+            let minted = local_anchor(verified_digest);
+            let old = writer
+                .transition(verified_digest, unsafe_idle(verified_digest, 1_600))
+                .unwrap()
+                .digest;
+            let next = EnrollmentRecordV1::successor(
+                writer.current(),
+                safe_idle(verified_digest),
+                &writer.reader.authority.material,
+            )
+            .unwrap();
+            let expected_new = ContentDigest::of(&canonical_record_bytes(&next).unwrap());
+            assert!(matches!(
+                writer.transition_at_cut(old, safe_idle(verified_digest), cut),
+                Err(EnrollmentError::InjectedCrashCut(_))
+            ));
+            drop(writer);
+
+            let reader =
+                expect_present(EnrollmentReader::open_existing(&root.app(), &binding).unwrap());
+            let head = reader.current().digest;
+            match expect_new {
+                Some(true) => assert_eq!(head, expected_new),
+                Some(false) => assert_eq!(head, old),
+                None => assert!(head == old || head == expected_new),
+            }
+            match reader.current().record.lifecycle() {
+                EnrollmentLifecycleV1::LocalActive(active) => assert_eq!(active.anchor, minted),
+                other => panic!("crash cut {cut:?} left lifecycle {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn forged_and_divergent_local_active_anchors_fail_closed() {
+        // 1. A forged anchor naming a foreign predecessor is refused at the
+        //    VerifiedLocal -> LocalActive transition itself.
+        let root = TestRoot::new("anchor-forged-transition");
+        let binding = test_binding();
+        let mut writer = EnrollmentWriter::create(&root.app(), binding.clone(), shadow()).unwrap();
+        let initial = writer.current().digest;
+        let verified_digest = writer
+            .transition(initial, EnrollmentLifecycleV1::VerifiedLocal(verified()))
+            .unwrap()
+            .digest;
+        assert_eq!(
+            writer.transition(verified_digest, unsafe_idle(initial, 1_700)),
+            Err(EnrollmentError::IllegalTransition)
+        );
+        let head = writer
+            .transition(verified_digest, unsafe_idle(verified_digest, 1_700))
+            .unwrap()
+            .digest;
+
+        // 2. An anchor whose retained bootstrap identity is internally
+        //    inconsistent is rejected when the record is decoded, so it cannot
+        //    survive a round trip through the store either.
+        let mut inconsistent = match unsafe_idle(verified_digest, 1_701) {
+            EnrollmentLifecycleV1::LocalActive(value) => value,
+            other => panic!("unexpected lifecycle {other:?}"),
+        };
+        inconsistent.anchor.accepted_history_record_count += 1;
+        assert_eq!(
+            EnrollmentLifecycleV1::LocalActive(inconsistent).validate(&binding, Some(head)),
+            Err(EnrollmentError::InvalidLocalActiveAnchor)
+        );
+
+        // 3. A record that authenticates under the real authority but whose
+        //    anchor names a non-VerifiedLocal record fails the anchored reopen.
+        let forge = |root: &TestRoot,
+                     writer: &EnrollmentWriter,
+                     head: ContentDigest,
+                     anchor: LocalActiveAnchorV1| {
+            let lifecycle = EnrollmentLifecycleV1::LocalActive(LocalActiveV1 {
+                verification_digest: verified().verification_digest().unwrap(),
+                anchor,
+                handoff: HandoffV1::Unsafe {
+                    session_id: SessionId::from_uuid(Uuid::from_u128(1_800)),
+                },
+                exclusion: LocalExclusionV1::Idle,
+            });
+            let mut record = EnrollmentRecordV1 {
+                schema_version: ENROLLMENT_RECORD_SCHEMA_VERSION,
+                generation: 65,
+                previous: Some(head),
+                history_accumulator: compute_history_accumulator(
+                    65,
+                    Some(head),
+                    Some(writer.current().record.history_accumulator),
+                    &writer.current().record.binding,
+                    &lifecycle,
+                )
+                .unwrap(),
+                lease_resource_id: writer.current().record.lease_resource_id,
+                binding: writer.current().record.binding.clone(),
+                lifecycle,
+                checkpoint: None,
+            };
+            record.checkpoint = Some(
+                writer
+                    .reader
+                    .authority
+                    .material
+                    .checkpoint_for(
+                        record.generation,
+                        record.previous,
+                        record.history_accumulator,
+                        record.lease_resource_id,
+                        &record.binding,
+                        &record.lifecycle,
+                    )
+                    .unwrap(),
+            );
+            let bytes = canonical_record_bytes(&record).unwrap();
+            let forged_digest = ContentDigest::of(&bytes);
+            fs::write(
+                record_path(root, &writer.current().record.binding, forged_digest),
+                bytes,
+            )
+            .unwrap();
+            forged_digest
+        };
+
+        let mut shadow_anchor = local_anchor(verified_digest);
+        shadow_anchor.verified_local_record_digest = initial;
+        let shadow_forged = forge(&root, &writer, head, shadow_anchor);
+
+        let mut absent_anchor = local_anchor(verified_digest);
+        absent_anchor.verified_local_record_digest = digest(211);
+        let absent_forged = forge(&root, &writer, head, absent_anchor);
+
+        let mut divergent_anchor = local_anchor(verified_digest);
+        divergent_anchor.bootstrap_import_id = digest(212);
+        let divergent_forged = forge(&root, &writer, head, divergent_anchor);
+        drop(writer);
+
+        write_head(&root, &binding, shadow_forged);
+        assert_eq!(
+            reopen_promoted_bootstrap_anchor(&root.app(), &binding)
+                .err()
+                .map(|error| error.to_string()),
+            Some(
+                VerifiedLocalCompositionError::WrongLifecycle(
+                    "the anchored enrollment record is not the original VerifiedLocal record",
+                )
+                .to_string()
+            )
+        );
+
+        write_head(&root, &binding, absent_forged);
+        assert!(matches!(
+            reopen_promoted_bootstrap_anchor(&root.app(), &binding),
+            Err(VerifiedLocalCompositionError::Enrollment(
+                EnrollmentError::MissingChainRecord(_)
+            ))
+        ));
+
+        write_head(&root, &binding, divergent_forged);
+        assert_eq!(
+            reopen_promoted_bootstrap_anchor(&root.app(), &binding)
+                .err()
+                .map(|error| error.to_string()),
+            Some(
+                VerifiedLocalCompositionError::ProofMismatch(
+                    "the committed LocalActive anchor diverges from the original VerifiedLocal record",
+                )
+                .to_string()
+            )
+        );
+
+        // 4. A forged checkpoint over a tampered anchor fails authentication.
+        write_head(&root, &binding, divergent_forged);
+        let mut tampered =
+            decode_record(&fs::read(record_path(&root, &binding, divergent_forged)).unwrap())
+                .unwrap();
+        tampered.checkpoint.as_mut().unwrap().authentication_tag = digest(213);
+        let bytes = canonical_record_bytes(&tampered).unwrap();
+        let tampered_digest = ContentDigest::of(&bytes);
+        fs::write(record_path(&root, &binding, tampered_digest), bytes).unwrap();
+        write_head(&root, &binding, tampered_digest);
+        assert!(matches!(
+            reopen_promoted_bootstrap_anchor(&root.app(), &binding),
+            Err(VerifiedLocalCompositionError::Enrollment(
+                EnrollmentError::CheckpointAuthenticationFailed
+            ))
+        ));
+    }
+
+    #[test]
+    fn zero_nonzero_and_multipart_bootstrap_anchors_are_exact() {
+        let predecessor = digest(214);
+        for source in [verified(), zero_verified(), multipart_verified()] {
+            source.validate_fields().unwrap();
+            let anchor = LocalActiveAnchorV1::from_verified_local(&source, predecessor);
+            anchor.validate().unwrap();
+            assert_eq!(anchor.verified_local_record_digest, predecessor);
+            assert_eq!(anchor.bootstrap_batch_id, source.bootstrap_batch_id);
+            assert_eq!(
+                anchor.accepted_frontier_anchor,
+                source.accepted_frontier_anchor
+            );
+            let json = serde_json::to_value(anchor).unwrap();
+            assert_eq!(
+                json["bootstrap_batch_id"].is_null(),
+                source.bootstrap_part_count == 0
+            );
+            assert_eq!(
+                serde_json::from_value::<LocalActiveAnchorV1>(json.clone()).unwrap(),
+                anchor
+            );
+            let mut unknown = json;
+            unknown["unexpected"] = serde_json::json!(1);
+            assert!(serde_json::from_value::<LocalActiveAnchorV1>(unknown).is_err());
+        }
+
+        let base = LocalActiveAnchorV1::from_verified_local(&verified(), predecessor);
+        let zero = LocalActiveAnchorV1::from_verified_local(&zero_verified(), predecessor);
+
+        let mut zero_with_batch = zero;
+        zero_with_batch.bootstrap_batch_id = base.bootstrap_batch_id;
+        assert_eq!(
+            zero_with_batch.validate(),
+            Err(EnrollmentError::InvalidLocalActiveAnchor)
+        );
+
+        let mut nonzero_without_batch = base;
+        nonzero_without_batch.bootstrap_batch_id = None;
+        assert_eq!(
+            nonzero_without_batch.validate(),
+            Err(EnrollmentError::InvalidLocalActiveAnchor)
+        );
+
+        let mut skewed = base;
+        skewed.accepted_frontier_anchor.acceptance_sequence += 1;
+        assert_eq!(
+            skewed.validate(),
+            Err(EnrollmentError::InvalidLocalActiveAnchor)
+        );
+
+        let mut skewed_history = base;
+        skewed_history.accepted_frontier_anchor.history_generation += 1;
+        assert_eq!(
+            skewed_history.validate(),
+            Err(EnrollmentError::InvalidLocalActiveAnchor)
+        );
+
+        let mut empty_root = base;
+        empty_root.accepted_frontier_anchor.history_root =
+            super::super::object_store::EngineHistoryStore::empty_root();
+        assert_eq!(
+            empty_root.validate(),
+            Err(EnrollmentError::InvalidLocalActiveAnchor)
+        );
+
+        let mut sentinel = base;
+        sentinel.bootstrap_batch_id = Some(BatchId::for_import(ImportId::from_digest(
+            *sentinel.bootstrap_import_id.as_bytes(),
+        )));
+        assert_eq!(
+            sentinel.validate(),
+            Err(EnrollmentError::InvalidLocalActiveAnchor)
+        );
+    }
+
+    /// A zero-part bootstrap is a legal terminal identity, so it must also
+    /// survive the full persist/reopen path.
+    #[test]
+    fn zero_bootstrap_enrollment_activates_and_reopens_through_its_anchor() {
+        let root = TestRoot::new("anchor-zero-bootstrap");
+        let binding = test_binding();
+        let mut writer = EnrollmentWriter::create(&root.app(), binding.clone(), shadow()).unwrap();
+        let initial = writer.current().digest;
+        let verified_digest = writer
+            .transition(
+                initial,
+                EnrollmentLifecycleV1::VerifiedLocal(zero_verified()),
+            )
+            .unwrap()
+            .digest;
+        let anchor = LocalActiveAnchorV1::from_verified_local(&zero_verified(), verified_digest);
+        let lifecycle = EnrollmentLifecycleV1::LocalActive(LocalActiveV1 {
+            verification_digest: zero_verified().verification_digest().unwrap(),
+            anchor,
+            handoff: HandoffV1::Unsafe {
+                session_id: SessionId::from_uuid(Uuid::from_u128(1_900)),
+            },
+            exclusion: LocalExclusionV1::Idle,
+        });
+        let head = writer
+            .transition(verified_digest, lifecycle)
+            .unwrap()
+            .digest;
+        drop(writer);
+
+        let reopened = reopen_promoted_bootstrap_anchor(&root.app(), &binding).unwrap();
+        assert_eq!(reopened.committed().enrollment_head(), head);
+        assert_eq!(reopened.bootstrap_part_count(), 0);
+        assert_eq!(reopened.accepted_history_record_count(), 0);
+        assert_eq!(reopened.acceptance_sequence(), 0);
+        assert_eq!(
+            reopened.history_root(),
+            super::super::object_store::EngineHistoryStore::empty_root()
+        );
+        let (predecessor, _) = reopened.into_predecessor_evidence();
+        assert_eq!(predecessor.enrollment_head(), verified_digest);
+        assert_eq!(predecessor.bootstrap_batch_id(), None);
+    }
+
+    /// The anchor grows every `LocalActive` record, and
+    /// [`MAX_ENROLLMENT_JSON_TOKENS`] is a hard fail-closed decode bound: a
+    /// record that exceeds it is unreadable, which would be the same class of
+    /// permanent unopenability the anchor exists to remove. Pin the budget so a
+    /// later field addition is a deliberate decision.
+    #[test]
+    fn the_largest_local_active_record_stays_inside_the_decode_budget() {
+        fn json_tokens(bytes: &[u8]) -> usize {
+            let (mut in_string, mut escaped, mut tokens) = (false, false, 0_usize);
+            for byte in bytes.iter().copied() {
+                if in_string {
+                    if escaped {
+                        escaped = false;
+                    } else if byte == b'\\' {
+                        escaped = true;
+                    } else if byte == b'"' {
+                        in_string = false;
+                    }
+                    continue;
+                }
+                match byte {
+                    b'"' => in_string = true,
+                    b'{' | b'[' | b'}' | b']' | b',' | b':' => tokens += 1,
+                    _ => {}
+                }
+            }
+            tokens
+        }
+
+        let root = TestRoot::new("anchor-record-budget");
+        let binding = test_binding();
+        let mut writer = EnrollmentWriter::create(&root.app(), binding.clone(), shadow()).unwrap();
+        let initial = writer.current().digest;
+        let verified_digest = writer
+            .transition(initial, EnrollmentLifecycleV1::VerifiedLocal(verified()))
+            .unwrap()
+            .digest;
+        let mut current = writer
+            .transition(verified_digest, unsafe_idle(verified_digest, 2_000))
+            .unwrap()
+            .digest;
+        // The widest LocalActive record: a Published exclusion carrying a
+        // recovery packet, at a generation that also requires a checkpoint.
+        while writer.current().generation() < 64 {
+            current = writer
+                .transition(
+                    current,
+                    if writer.current().generation() % 2 == 0 {
+                        safe_idle(verified_digest)
+                    } else {
+                        unsafe_idle(
+                            verified_digest,
+                            2_000 + u128::from(writer.current().generation()),
+                        )
+                    },
+                )
+                .unwrap()
+                .digest;
+        }
+        let session = match writer.current().record.lifecycle() {
+            EnrollmentLifecycleV1::LocalActive(LocalActiveV1 {
+                handoff: HandoffV1::Unsafe { session_id },
+                ..
+            }) => *session_id,
+            other => panic!("unexpected lifecycle {other:?}"),
+        };
+        drop(writer);
+        let head = publish_local_active_for_test(
+            &root.app(),
+            &binding,
+            current,
+            verified().verification_digest().unwrap(),
+            session,
+        )
+        .unwrap();
+
+        let bytes = fs::read(record_path(&root, &binding, head)).unwrap();
+        let record = decode_record(&bytes).unwrap();
+        assert_eq!(record.generation(), 65);
+        assert!(record.checkpoint.is_some());
+        assert!(matches!(
+            record.lifecycle(),
+            EnrollmentLifecycleV1::LocalActive(active)
+                if matches!(active.exclusion, LocalExclusionV1::Published { .. })
+        ));
+        let tokens = json_tokens(&bytes);
+        assert!(
+            tokens <= MAX_ENROLLMENT_JSON_TOKENS,
+            "the widest LocalActive record uses {tokens} of {MAX_ENROLLMENT_JSON_TOKENS} tokens"
+        );
+        assert_eq!(
+            tokens, 224,
+            "the LocalActive record token budget moved; confirm it still fits \
+             {MAX_ENROLLMENT_JSON_TOKENS}"
+        );
+        assert!(bytes.len() < MAX_ENROLLMENT_RECORD_BYTES);
     }
 
     #[cfg(unix)]
@@ -6136,7 +6988,7 @@ mod tests {
             ))
         );
 
-        let wrong_archive = published(60, archive_resource(61));
+        let wrong_archive = published(digest(62), 60, archive_resource(61));
         let record = EnrollmentRecordV1 {
             schema_version: ENROLLMENT_RECORD_SCHEMA_VERSION,
             generation: 2,
@@ -6478,7 +7330,7 @@ mod tests {
         let writer = EnrollmentWriter::create(&root.app(), binding.clone(), shadow()).unwrap();
         let initial = writer.current().clone();
         let records = enrollment_directory(&root, &binding).join(RECORDS_DIRECTORY);
-        let illegal_lifecycle = unsafe_idle(900);
+        let illegal_lifecycle = unsafe_idle(initial.digest, 900);
         let illegal_record = EnrollmentRecordV1 {
             schema_version: ENROLLMENT_RECORD_SCHEMA_VERSION,
             generation: 2,
@@ -6505,9 +7357,9 @@ mod tests {
         };
         for index in 0..MAX_ENROLLMENT_OPEN_CHAIN_RECORDS {
             let lifecycle = if index % 2 == 0 {
-                safe_idle()
+                safe_idle(initial.digest)
             } else {
-                unsafe_idle(901 + index as u128)
+                unsafe_idle(initial.digest, 901 + index as u128)
             };
             let forged_authority =
                 test_authority(binding.clone(), initial.record.lease_resource_id);
@@ -6535,14 +7387,17 @@ mod tests {
             .unwrap()
             .digest;
         let mut current = writer
-            .transition(verified_digest, unsafe_idle(1_200))
+            .transition(verified_digest, unsafe_idle(verified_digest, 1_200))
             .unwrap()
             .digest;
         while writer.current().generation() < 65 {
             let next = if writer.current().generation() % 2 == 1 {
-                safe_idle()
+                safe_idle(verified_digest)
             } else {
-                unsafe_idle(1_200 + u128::from(writer.current().generation()))
+                unsafe_idle(
+                    verified_digest,
+                    1_200 + u128::from(writer.current().generation()),
+                )
             };
             current = writer.transition(current, next).unwrap().digest;
         }
@@ -6574,8 +7429,8 @@ mod tests {
             let writer = EnrollmentWriter::create(&root.app(), binding.clone(), shadow()).unwrap();
             let initial = writer.current().clone();
             let records = enrollment_directory(&root, &binding).join(RECORDS_DIRECTORY);
-            let lifecycle = unsafe_idle(1_300);
             let previous = if cycle { digest(203) } else { initial.digest };
+            let lifecycle = unsafe_idle(previous, 1_300);
             let forged_authority =
                 test_authority(binding.clone(), initial.record.lease_resource_id);
             let mut checkpoint_record = EnrollmentRecordV1 {
@@ -6616,9 +7471,9 @@ mod tests {
             };
             for index in 0..63_u128 {
                 let lifecycle = if index % 2 == 0 {
-                    safe_idle()
+                    safe_idle(previous)
                 } else {
-                    unsafe_idle(1_301 + index)
+                    unsafe_idle(previous, 1_301 + index)
                 };
                 let record =
                     EnrollmentRecordV1::successor(&snapshot, lifecycle, &forged_authority).unwrap();
@@ -6735,9 +7590,9 @@ mod tests {
         };
         for index in 0..63_u128 {
             let lifecycle = match index {
-                0 => unsafe_idle(1_000),
-                _ if index % 2 == 1 => safe_idle(),
-                _ => unsafe_idle(1_000 + index),
+                0 => unsafe_idle(digest, 1_000),
+                _ if index % 2 == 1 => safe_idle(digest),
+                _ => unsafe_idle(digest, 1_000 + index),
             };
             let record = EnrollmentRecordV1::successor(
                 &snapshot,
@@ -6787,7 +7642,7 @@ mod tests {
             .unwrap()
             .digest;
         first
-            .transition(verified_digest, unsafe_idle(1_100))
+            .transition(verified_digest, unsafe_idle(verified_digest, 1_100))
             .unwrap();
         let cursor = first.audit_chain_page(None, 1).unwrap().next.unwrap();
 
@@ -6830,7 +7685,9 @@ mod tests {
         );
 
         let current = first.current().digest;
-        first.transition(current, safe_idle()).unwrap();
+        first
+            .transition(current, safe_idle(verified_digest))
+            .unwrap();
         assert_eq!(
             first.audit_chain_page(Some(cursor), 1).err().unwrap(),
             EnrollmentError::InvalidAuditCursor
@@ -6848,7 +7705,7 @@ mod tests {
             .unwrap()
             .digest;
         second
-            .transition(second_verified, unsafe_idle(1_100))
+            .transition(second_verified, unsafe_idle(second_verified, 1_100))
             .unwrap();
         assert_eq!(
             second.audit_chain_page(Some(cursor), 1).err().unwrap(),
