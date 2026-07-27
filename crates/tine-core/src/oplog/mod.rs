@@ -61,6 +61,12 @@ pub(crate) mod reconciliation_scan;
 #[allow(dead_code)]
 pub(crate) mod reconciliation_session;
 pub mod reference_catalog;
+// P2N9 owns the runtime resume-point format, its publication, and the retained
+// scratch-run reclamation it authorizes. It is deliberately inert: nothing in
+// startup, enrollment, the coordinator, or Tauri reads or publishes a resume
+// point yet, and an RRP never authorizes a write, frontier, or projection.
+#[allow(dead_code)]
+pub(crate) mod resume_point;
 pub(crate) mod scratch_store;
 pub mod semantic;
 pub mod simulator;
