@@ -355,6 +355,11 @@ pub(crate) struct DurableEngineHistoryStore {
     graph_resource_id: super::CanonicalGraphResourceId,
     receipt_store_id: super::ProjectionReceiptStoreId,
     control: Dir,
+    /// The retained no-follow capability of the archive root this control
+    /// directory lives in. It is the only thing that can prove a promoted
+    /// runtime state names *this* physical archive, so it is retained here
+    /// rather than re-derived from an ambient pathname by each caller.
+    archive_root: Dir,
     roots: Dir,
     index: EngineHistoryStore,
     transition_lock: fs::File,
@@ -950,6 +955,15 @@ impl LoadedBootstrapPartV1 {
     pub(crate) fn spans(&self) -> &BootstrapPartSpanIndexV1 {
         &self.spans
     }
+
+    /// Consume this loaded part into exactly its manifest and object payload.
+    ///
+    /// Recovery stages one bootstrap part at a time, so it must be able to move
+    /// the payload into the prepared batch instead of cloning it beside the
+    /// still-live loaded part.
+    pub(crate) fn into_manifest_and_objects(self) -> (OperationBatch, Vec<OperationObject>) {
+        (self.manifest, self.objects)
+    }
 }
 
 /// The durable authenticated index capabilities of one exact archive, for
@@ -1064,6 +1078,63 @@ impl ObjectStore {
 
     pub(crate) fn sqlite_lease_capability(&self) -> std::io::Result<Dir> {
         self.capability.try_clone()
+    }
+
+    /// Duplicate this store directly from its retained no-follow archive-root
+    /// capability.
+    ///
+    /// The duplicate is the *same* physical directory resource, never a fresh
+    /// ambient pathname open, so a caller that already authenticated one exact
+    /// archive can hand a consuming API (`seal_history_only`, `seal_enrolled_projection`)
+    /// its own store value without ever reintroducing a pathname race. An
+    /// archive renamed while retained open stays bound to the enrolled archive,
+    /// and a look-alike directory that appears at the old pathname is not
+    /// reachable through the duplicate at all.
+    pub(crate) fn duplicate_retained_capability(&self) -> Result<Self, StoreError> {
+        Ok(Self {
+            root_path: self.root_path.clone(),
+            workspace_id: self.workspace_id,
+            capability: self.capability.try_clone()?,
+            counters: Arc::clone(&self.counters),
+        })
+    }
+
+    /// Prove this store's retained capability and its enrolled archive pathname
+    /// still name one and the same physical directory.
+    ///
+    /// The retained capability remains the authority; this only refuses an
+    /// *ambiguous* archive. If the archive was renamed while it stayed retained
+    /// open and a look-alike directory now occupies the enrolled pathname, then
+    /// two different directories both answer to "the enrolled archive": one by
+    /// resource identity, one by pathname. A one-shot durable publication must
+    /// block there rather than silently pick a winner, because the two
+    /// candidates diverge immediately afterwards.
+    ///
+    /// Nothing is created, repaired, claimed, or written. The check is one
+    /// ambient parent open, one no-follow child open, and one identity stat.
+    pub(crate) fn authenticate_unambiguous_archive_pathname(&self) -> Result<(), StoreError> {
+        let parent = self.root_path.parent().ok_or_else(|| {
+            StoreError::UnsafeEntry("store root must have an existing parent".into())
+        })?;
+        let name = self
+            .root_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                StoreError::UnsafeEntry("store root final component is not UTF-8".into())
+            })?;
+        let parent_capability = Dir::open_ambient_dir(parent, ambient_authority())?;
+        let named = open_existing_dir_nofollow(&parent_capability, name)?.ok_or_else(|| {
+            StoreError::UnsafeEntry(
+                "enrolled archive pathname no longer names a real no-follow directory".into(),
+            )
+        })?;
+        if control_directory_identity(&named)? != self.canonical_archive_identity()? {
+            return Err(StoreError::UnsafeEntry(
+                "enrolled archive pathname no longer names the retained archive capability".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Validate and retain one object independently of any manifest delivery.
@@ -1768,6 +1839,7 @@ impl ObjectStore {
                 binding.endpoint.graph_resource_id,
                 binding.receipt_store_id,
                 control,
+                self.capability.try_clone()?,
                 open_engine_history_transition_lock(&self.capability)?,
                 Arc::clone(&self.counters),
             )
@@ -1835,6 +1907,7 @@ impl ObjectStore {
             endpoint.graph_resource_id,
             binding.receipt_store_id,
             control.try_clone()?,
+            self.capability.try_clone()?,
             open_dir_nofollow(&control, ENGINE_HISTORY_ROOTS_DIR)?,
             EngineHistoryStore {
                 capability: open_dir_nofollow(&control, ENGINE_HISTORY_NODES_DIR)?,
@@ -1860,6 +1933,7 @@ impl ObjectStore {
             binding.endpoint.graph_resource_id,
             binding.receipt_store_id,
             control.try_clone()?,
+            self.capability.try_clone()?,
             open_dir_nofollow(&control, ENGINE_HISTORY_ROOTS_DIR)?,
             EngineHistoryStore {
                 capability: open_dir_nofollow(&control, ENGINE_HISTORY_NODES_DIR)?,
@@ -3575,6 +3649,7 @@ impl DurableEngineHistoryStore {
         graph_resource_id: super::CanonicalGraphResourceId,
         receipt_store_id: super::ProjectionReceiptStoreId,
         control: Dir,
+        archive_root: Dir,
         transition_lock: fs::File,
         counters: Arc<StoreCounters>,
     ) -> Result<Self, StoreError> {
@@ -3597,6 +3672,7 @@ impl DurableEngineHistoryStore {
             graph_resource_id,
             receipt_store_id,
             control,
+            archive_root,
             roots,
             index: EngineHistoryStore {
                 capability: nodes,
@@ -3622,6 +3698,7 @@ impl DurableEngineHistoryStore {
         graph_resource_id: super::CanonicalGraphResourceId,
         receipt_store_id: super::ProjectionReceiptStoreId,
         control: Dir,
+        archive_root: Dir,
         roots: Dir,
         index: EngineHistoryStore,
         transition_lock: fs::File,
@@ -3632,6 +3709,7 @@ impl DurableEngineHistoryStore {
             graph_resource_id,
             receipt_store_id,
             control,
+            archive_root,
             roots,
             index,
             transition_lock,
@@ -3804,8 +3882,9 @@ impl DurableEngineHistoryStore {
     /// Read the device-local promoted-runtime state, if one was ever published.
     ///
     /// A present state must decode canonically at the supported schema version
-    /// and must claim exactly this endpoint. Truncated, foreign, or divergent
-    /// residue fails closed instead of being repaired.
+    /// and must claim exactly this endpoint *and this exact physical archive*.
+    /// Truncated, foreign, or divergent residue fails closed instead of being
+    /// repaired.
     pub(crate) fn read_promoted_runtime_state(
         &self,
     ) -> Result<Option<PromotedRuntimeStateV1>, StoreError> {
@@ -3819,11 +3898,20 @@ impl DurableEngineHistoryStore {
             return Ok(None);
         };
         let state = PromotedRuntimeStateV1::decode(&bytes)?;
-        self.require_promoted_state_endpoint(&state)?;
+        self.require_promoted_state_binding(&state)?;
         Ok(Some(state))
     }
 
-    fn require_promoted_state_endpoint(
+    /// The one promoted-state authorization boundary.
+    ///
+    /// Every promoted-state read, publication, and live authorization goes
+    /// through here, so no caller — present or future — can reach the state
+    /// file of an archive the state does not bind. Endpoint identity alone is
+    /// not enough: a byte-identical stale copy of an archive carries the same
+    /// endpoint claim, the same durable history, and the same canonical
+    /// archive-resource claim bytes, and is distinguishable only by its
+    /// physical control-directory identity.
+    fn require_promoted_state_binding(
         &self,
         state: &PromotedRuntimeStateV1,
     ) -> Result<(), StoreError> {
@@ -3836,6 +3924,22 @@ impl DurableEngineHistoryStore {
                 "promoted runtime state is bound to another endpoint",
             ));
         }
+        if control_directory_identity(&self.archive_root)?.binding_digest()
+            != state.archive_control_binding
+        {
+            return Err(StoreError::PromotedRuntimeStateMismatch(
+                "promoted runtime state is bound to another physical archive directory",
+            ));
+        }
+        super::CanonicalArchiveResourceId::open_enrolled_in_retained_directory(
+            &self.archive_root,
+            state.archive_resource_id,
+        )
+        .map_err(|_| {
+            StoreError::PromotedRuntimeStateMismatch(
+                "promoted runtime state archive resource claim does not authenticate",
+            )
+        })?;
         Ok(())
     }
 
@@ -3856,7 +3960,7 @@ impl DurableEngineHistoryStore {
             .map_err(|_| StoreError::MalformedHistoryIndex)?;
         let _workspace_guard = AdvisoryTransitionGuard::lock(&self.transition_lock)?;
         state.validate()?;
-        self.require_promoted_state_endpoint(state)?;
+        self.require_promoted_state_binding(state)?;
         if let Some(existing) = self.read_promoted_runtime_state()? {
             return if &existing == state {
                 Ok(())
@@ -3901,7 +4005,7 @@ impl DurableEngineHistoryStore {
         expected: &PromotedRuntimeStateV1,
     ) -> Result<(), StoreError> {
         expected.validate()?;
-        self.require_promoted_state_endpoint(expected)?;
+        self.require_promoted_state_binding(expected)?;
         let durable = self
             .read_promoted_runtime_state()?
             .ok_or(StoreError::PromotedRuntimeStateAbsent)?;

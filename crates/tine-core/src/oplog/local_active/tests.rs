@@ -11,11 +11,14 @@ use crate::oplog::enrollment::{
     compose_verified_local, enrollment_application_root_for_test, CommitCut, EnrollmentOpen,
     EnrollmentReader, PreparationId,
 };
-use crate::oplog::hot_engine::{ProjectionEndpointBinding, ProjectionStorageBinding};
+use crate::oplog::hot_engine::{
+    ProjectionEndpointBinding, ProjectionStorageBinding, MAX_EPHEMERAL_BLOCK_CLAIMS,
+};
 use crate::oplog::import::{
-    prepare_inactive_bootstrap_import, publish_install_verify_inactive_bootstrap,
-    reopen_inactive_bootstrap_accepted_authority, InactiveBootstrapAcceptedAuthority,
-    InactiveBootstrapPreparedPublication, InactiveBootstrapVerifiedPublication,
+    force_next_bootstrap_part_operation_limit, prepare_inactive_bootstrap_import,
+    publish_install_verify_inactive_bootstrap, reopen_inactive_bootstrap_accepted_authority,
+    InactiveBootstrapAcceptedAuthority, InactiveBootstrapPreparedPublication,
+    InactiveBootstrapVerifiedPublication,
 };
 use crate::oplog::migration_backup::{
     verify_migration_source_backup, MigrationBackupRoot, VerifiedSourceBackup,
@@ -2075,10 +2078,9 @@ fn append_local_batch_at(
     assert_eq!(drained, 1, "exactly the new accepted batch drains");
 }
 
-/// The durable promotion state file for one fixture archive.
-fn promotion_state_path(fixture: &Fixture) -> PathBuf {
-    fixture
-        .archive_root
+/// The durable promotion state file inside one archive root.
+fn promotion_state_path_in(archive_root: &Path, fixture: &Fixture) -> PathBuf {
+    archive_root
         .join("engine-history")
         .join(
             fixture
@@ -2090,6 +2092,30 @@ fn promotion_state_path(fixture: &Fixture) -> PathBuf {
                 .to_string(),
         )
         .join("promoted-runtime.state")
+}
+
+/// The durable promotion state file for one fixture archive.
+fn promotion_state_path(fixture: &Fixture) -> PathBuf {
+    promotion_state_path_in(&fixture.archive_root, fixture)
+}
+
+/// Recursively copy a directory tree, producing fresh directory inodes.
+///
+/// The copy is byte-identical and structurally identical, but every directory
+/// in it is a distinct filesystem resource from its source. That distinction is
+/// exactly what a retargeting attack cannot forge and what archive identity is
+/// derived from.
+fn copy_tree(source: &Path, destination: &Path) {
+    fs::create_dir_all(destination).unwrap();
+    for entry in fs::read_dir(source).unwrap().map(Result::unwrap) {
+        let from = entry.path();
+        let to = destination.join(entry.file_name());
+        if fs::symlink_metadata(&from).unwrap().is_dir() {
+            copy_tree(&from, &to);
+        } else {
+            fs::copy(&from, &to).unwrap();
+        }
+    }
 }
 
 /// The whole first-promotion boundary over a rich, nested, Unicode, CRLF,
@@ -2745,6 +2771,297 @@ fn the_pre_activation_admission_refuses_a_promoted_runtime_engine() {
             .unwrap()
             .generation,
         before.generation + 1
+    );
+    fixture.assert_graph_unchanged();
+}
+
+/// Promotion publication is bound to the exact retained archive capability,
+/// never to whatever currently answers to the archive's pathname.
+///
+/// The positive control proves the ordinary same-capability seal and its
+/// readback still commit one exact immutable state and resume idempotently. The
+/// negative case is the retargeting cut: an archive renamed while its retained
+/// capability stays open, with a byte-identical recursive copy left at the old
+/// pathname. That copy is a perfect forgery of everything content-addressed —
+/// identical durable history, identical bootstrap publication, identical
+/// canonical archive-resource claim bytes — and differs only in physical
+/// directory identity. Publication must not durably land in either directory.
+#[test]
+fn promotion_publication_binds_the_exact_retained_archive_capability() {
+    // --- positive control: ordinary same-capability seal and readback --------
+    let control = Fixture::new(
+        "promote-capability-control",
+        None,
+        vec![("pages/control.md".into(), b"- control\n".to_vec())],
+    );
+    let control_root = control.enrollment_root("promote-capability-control");
+    let control_binding = control.enrollment_binding();
+    let control_session = SessionId::new();
+    let control_authority = activate_verified_local(
+        &control_root,
+        control.compose(&control_root),
+        control_session,
+        &control.proofs(),
+        &control.runtime(),
+    )
+    .unwrap();
+    let control_state = promotion_state_path(&control);
+    assert!(!control_state.exists());
+
+    let control_head = enrollment_head(&control_root, &control_binding);
+    seal_local_runtime_promotion(&control_authority, &control.proofs(), &control.runtime())
+        .unwrap();
+    let committed = fs::read(&control_state).unwrap();
+    // The readback inside the seal is a genuine fresh durable-history open over
+    // the same retained capability, and repeating phase one resumes against the
+    // identical committed bytes rather than rewriting them.
+    seal_local_runtime_promotion(&control_authority, &control.proofs(), &control.runtime())
+        .unwrap();
+    assert_eq!(fs::read(&control_state).unwrap(), committed);
+    assert_eq!(
+        enrollment_head(&control_root, &control_binding),
+        control_head
+    );
+    control.assert_graph_unchanged();
+    drop(control_authority);
+
+    // --- the retargeting cut -------------------------------------------------
+    let mut fixture = Fixture::new(
+        "promote-retarget",
+        None,
+        vec![("pages/retarget.md".into(), b"- retarget\n".to_vec())],
+    );
+    let root = fixture.enrollment_root("promote-retarget");
+    let binding = fixture.enrollment_binding();
+    let session = SessionId::new();
+    let authority = activate_verified_local(
+        &root,
+        fixture.compose(&root),
+        session,
+        &fixture.proofs(),
+        &fixture.runtime(),
+    )
+    .unwrap();
+    let activated_head = enrollment_head(&root, &binding);
+
+    // Archive A is renamed while every retained capability in the proof set
+    // stays open on it; a byte-identical copy B then takes its old pathname.
+    let retained = fixture.archive_root.clone();
+    let renamed = fixture.root.path().join("archive-renamed");
+    fs::rename(&retained, &renamed).unwrap();
+    copy_tree(&renamed, &retained);
+    assert_eq!(
+        snapshot_file_digests(&renamed),
+        snapshot_file_digests(&retained),
+        "the stale copy must be byte-identical, so only directory identity differs"
+    );
+    fixture.archive_root = renamed.clone();
+
+    let retained_before = snapshot_file_digests(&renamed);
+    let stale_before = snapshot_file_digests(&retained);
+    let error = seal_local_runtime_promotion(&authority, &fixture.proofs(), &fixture.runtime())
+        .err()
+        .expect("an ambiguous archive must block promotion before publication");
+    assert!(
+        matches!(
+            error,
+            RuntimePromotionError::Activation(LocalActivationError::RuntimeBinding(_))
+        ),
+        "unexpected retargeting error: {error}"
+    );
+
+    // Neither archive may gain a promotion-state file, and neither archive's
+    // durable history may have moved at all.
+    assert!(
+        !promotion_state_path_in(&renamed, &fixture).exists(),
+        "the retained archive must not have been published into"
+    );
+    assert!(
+        !promotion_state_path_in(&retained, &fixture).exists(),
+        "the stale look-alike archive must not have been published into"
+    );
+    assert_eq!(snapshot_file_digests(&renamed), retained_before);
+    assert_eq!(snapshot_file_digests(&retained), stale_before);
+    assert_eq!(enrollment_head(&root, &binding), activated_head);
+    fixture.assert_graph_unchanged();
+}
+
+/// The promoted-state authorization boundary itself refuses a foreign archive.
+///
+/// A restarted process holds no retained capability, so it must open the
+/// configured archive pathname. Centralizing the exact archive binding inside
+/// the durable-history control means the refusal happens at the state read —
+/// before any promoted engine, projection-work index, SQLite lease, or replay
+/// exists — rather than only later, at the promoted-runtime mint. A later
+/// caller that reaches promoted state some other way inherits the same refusal.
+#[test]
+fn a_byte_identical_copy_of_a_promoted_archive_is_refused_at_the_state_boundary() {
+    let mut fixture = Fixture::new(
+        "promote-copied-archive",
+        None,
+        vec![("pages/copied.md".into(), b"- copied\n".to_vec())],
+    );
+    let root = fixture.enrollment_root("promote-copied-archive");
+    let binding = fixture.enrollment_binding();
+    let paths = PromotedPaths::new(&fixture, "copied");
+    let session = SessionId::new();
+    let (authority, runtime) = promote(&mut fixture, &root, session, &paths);
+    drop(runtime);
+    drop(authority);
+
+    // A byte-identical recursive copy of the whole promoted archive, including
+    // its committed promotion state. Only directory identity differs.
+    let copy = fixture.root.path().join("archive-copy");
+    copy_tree(&fixture.archive_root, &copy);
+    assert_eq!(
+        snapshot_file_digests(&fixture.archive_root),
+        snapshot_file_digests(&copy)
+    );
+    assert!(promotion_state_path_in(&copy, &fixture).exists());
+
+    let copied_paths = PromotedPaths::new(&fixture, "copied-target");
+    fixture.archive_root = copy.clone();
+    let error =
+        reopen_promoted_local_runtime(&root, &binding, session, &copied_paths.open(&fixture))
+            .err()
+            .expect("a foreign archive must never adopt another archive's promotion state");
+    assert!(
+        matches!(
+            error,
+            RuntimePromotionError::Store(crate::oplog::StoreError::PromotedRuntimeStateMismatch(_))
+        ),
+        "the refusal must come from the promoted-state boundary, not a later mint: {error}"
+    );
+    // The refusal happened before any promoted runtime existed, so the copy
+    // gained no device-local projection at all.
+    assert!(!copied_paths.database_path.exists());
+    fixture.assert_graph_unchanged();
+}
+
+/// Promoted recovery replays its immutable bootstrap parts one at a time.
+///
+/// Restart resident memory must be one bootstrap part, not the whole graph, so
+/// the observed maximum bootstrap-part residency has to be exactly one over a
+/// genuinely multi-part publication — on the same-process promoted open and
+/// again on a fresh-process reopen that holds no retained evidence at all.
+///
+/// Fail-before: recovery built a `Vec<PreparedBatch>` containing every part and
+/// all of its objects before staging any of them, so the observed maximum was
+/// the whole part count.
+#[test]
+fn promoted_recovery_streams_exactly_one_bootstrap_part_at_a_time() {
+    // Two operations per part over a six-operation graph partitions into
+    // exactly three parts, deterministically and without a four-thousand-block
+    // fixture. Only the partition boundary is forced: every part is authored,
+    // published, installed, and replayed through the ordinary path.
+    force_next_bootstrap_part_operation_limit(2);
+    let mut fixture = Fixture::new(
+        "promote-stream-parts",
+        None,
+        vec![
+            (
+                "pages/anchor.md".into(),
+                b"title:: Streamed anchor\n\n- one\n- two\n- three\n".to_vec(),
+            ),
+            // Real reference evidence, so the promoted open performs the
+            // authenticated recovery replay rather than skipping it.
+            (
+                "pages/referrer.md".into(),
+                "- see [[Streamed anchor]] and #tag\n".as_bytes().to_vec(),
+            ),
+        ],
+    );
+    let part_count = fixture.verified.part_count() as usize;
+    assert!(
+        part_count >= 3,
+        "the streaming regression needs a genuinely multi-part bootstrap: {part_count}"
+    );
+
+    let root = fixture.enrollment_root("promote-stream-parts");
+    let binding = fixture.enrollment_binding();
+    let paths = PromotedPaths::new(&fixture, "stream-parts");
+    let session = SessionId::new();
+    let (authority, runtime) = promote(&mut fixture, &root, session, &paths);
+
+    let same_process = runtime.engine().bootstrap_recovery_instrumentation();
+    assert_eq!(
+        same_process.bootstrap_part_reads, part_count,
+        "recovery must read every bootstrap part exactly once"
+    );
+    assert!(same_process.bootstrap_object_reads > 0);
+    assert_eq!(
+        same_process.max_live_bootstrap_parts, 1,
+        "at most one bootstrap part payload may be resident at a time"
+    );
+
+    // A restarted process reconstructs everything from durable state; the same
+    // residency bound must hold on that path too.
+    drop(runtime);
+    drop(authority);
+    let (_reopened_authority, reopened) =
+        reopen_promoted_local_runtime(&root, &binding, session, &paths.open(&fixture)).unwrap();
+    let fresh_process = reopened.engine().bootstrap_recovery_instrumentation();
+    assert_eq!(fresh_process, same_process);
+    assert_eq!(fresh_process.max_live_bootstrap_parts, 1);
+    fixture.assert_graph_unchanged();
+}
+
+/// The scratch-backed detached block-claim index removes the old fixed cap
+/// instead of moving it.
+///
+/// Detached bootstrap authoring used to register block claims in the bounded
+/// no-store in-memory map, which refuses the claim past
+/// `MAX_EPHEMERAL_BLOCK_CLAIMS`. This is the smallest graph that crosses that
+/// exact boundary, carried through the whole real path: preparation,
+/// installation, promotion, and a fresh-process reopen.
+///
+/// Fail-before: preparing this exact fixture failed with "no-store block-claim
+/// test index reached its fixed capacity". The bounded map itself still keeps
+/// its cap — `no_store_block_claim_capacity_rejects_before_candidate_mutation`
+/// covers that — so what changed is that authoring no longer uses it at all.
+#[test]
+fn a_bootstrap_one_block_past_the_old_claim_cap_promotes_and_reopens() {
+    let blocks = MAX_EPHEMERAL_BLOCK_CLAIMS + 1;
+    let mut source = String::new();
+    for ordinal in 0..blocks {
+        source.push_str(&format!("- claim {ordinal:05}\n"));
+    }
+    let mut fixture = Fixture::new(
+        "promote-claim-cap",
+        None,
+        vec![("pages/claims.md".into(), source.into_bytes())],
+    );
+    let root = fixture.enrollment_root("promote-claim-cap");
+    let binding = fixture.enrollment_binding();
+    let paths = PromotedPaths::new(&fixture, "claim-cap");
+    let session = SessionId::new();
+
+    let (authority, runtime) = promote(&mut fixture, &root, session, &paths);
+    let frontier = runtime.engine().accepted_frontier_root().unwrap();
+    // The cap is removed, not raised: the promoted engine holds its claims in
+    // the scratch-backed point index, so the bounded map stays empty.
+    assert_eq!(
+        runtime.engine().instrumentation().block_claim_hot_entries,
+        0,
+        "a store-backed engine must hold no ephemeral block claims"
+    );
+    assert!(runtime
+        .database()
+        .frontier_root()
+        .unwrap()
+        .same_accepted_authority(&frontier));
+    drop(runtime);
+    drop(authority);
+
+    let (_reopened_authority, reopened) =
+        reopen_promoted_local_runtime(&root, &binding, session, &paths.open(&fixture)).unwrap();
+    assert_eq!(
+        reopened.engine().instrumentation().block_claim_hot_entries,
+        0
+    );
+    assert_eq!(
+        reopened.engine().accepted_frontier_root().unwrap(),
+        frontier
     );
     fixture.assert_graph_unchanged();
 }

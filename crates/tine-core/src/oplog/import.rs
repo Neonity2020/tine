@@ -70,6 +70,16 @@ thread_local! {
         std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
 
+/// Force the operations-per-part limit of exactly the next bootstrap
+/// preparation, so a small deterministic fixture can be genuinely multipart.
+///
+/// It changes only how the operation spool is partitioned; every part is
+/// authored, published, installed, and replayed through the ordinary path.
+#[cfg(test)]
+pub(crate) fn force_next_bootstrap_part_operation_limit(operations: u32) {
+    NEXT_BOOTSTRAP_PART_OPERATION_LIMIT.with(|limit| limit.set(Some(operations)));
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[allow(dead_code)]
 pub(crate) enum InactiveBootstrapOrchestrationCut {

@@ -44,7 +44,10 @@
 //!    proof set, inactive accepted authority, bound archive capability and its
 //!    persisted canonical resource claim, enrolled endpoint, and bootstrap
 //!    SQLite projection, then publishes one immutable exact durable promotion
-//!    state.
+//!    state. Publication and its readback run on the exact retained archive
+//!    capability, never on a re-resolved pathname, and an archive whose
+//!    retained capability and enrolled pathname have stopped naming the same
+//!    directory is refused before anything is written.
 //! 2. [`open_promoted_local_runtime`] (same process) or
 //!    [`reopen_promoted_local_runtime`] (restarted process, no retained
 //!    evidence at all) opens and completely recovers the writable enrolled
@@ -1141,13 +1144,26 @@ pub(crate) fn seal_local_runtime_promotion(
     // The physical archive only proves its own control identity, so the
     // persisted canonical archive-resource claim is authenticated separately.
     let accepted = proofs.accepted_authority.binding();
-    proofs
-        .accepted_authority
-        .store()
+    let archive = proofs.accepted_authority.store();
+    archive
         .validate_enrolled_archive_resource_id(binding.archive_resource_id())
         .map_err(|error| {
             RuntimePromotionError::Activation(LocalActivationError::RuntimeBinding(format!(
                 "persisted archive resource claim does not authenticate the enrolled binding: {error}"
+            )))
+        })?;
+    // Publication below runs on this exact retained capability, so a renamed
+    // archive can never hand its promotion state to whatever now sits at the
+    // old pathname. Promotion additionally refuses an *ambiguous* archive: if
+    // the retained capability and the enrolled pathname have stopped naming the
+    // same directory, two directories both answer to "the enrolled archive",
+    // and the one-shot durable publication must fail closed before it writes
+    // rather than silently pick one of them.
+    archive
+        .authenticate_unambiguous_archive_pathname()
+        .map_err(|error| {
+            RuntimePromotionError::Activation(LocalActivationError::RuntimeBinding(format!(
+                "enrolled archive is ambiguous, so runtime promotion cannot publish: {error}"
             )))
         })?;
 
@@ -1185,11 +1201,13 @@ pub(crate) fn seal_local_runtime_promotion(
         ));
     }
 
-    publish_promotion_state(proofs.accepted_authority.store().root_path(), &state)?;
+    publish_promotion_state(archive, &state)?;
 
     // Fresh reopen: the committed state must be exactly this one, and the
-    // enrollment head must not have moved while it was published.
-    let reopened = read_promotion_state(proofs.accepted_authority.store().root_path(), &state)?;
+    // enrollment head must not have moved while it was published. "Fresh" means
+    // a fresh durable-history open over the *same* retained archive capability,
+    // never a fresh ambient pathname open.
+    let reopened = read_promotion_state(archive, &state)?;
     if reopened != state {
         return Err(RuntimePromotionError::Anchor(
             "committed promoted runtime state is not the state this promotion composed",
@@ -1211,35 +1229,49 @@ pub(crate) fn seal_local_runtime_promotion(
     })
 }
 
-/// Open the durable history control alone and publish the promotion state.
+/// Open the durable history control alone, on the exact retained archive
+/// capability, and publish the promotion state.
+///
+/// `archive` is the capability the [`VerifiedLocalProofSet`] already
+/// authenticated. It is duplicated from its retained no-follow directory rather
+/// than reopened from a pathname, because `seal_history_only` consumes a store
+/// value: an ambient reopen here would let a look-alike directory that appeared
+/// at the archive's old pathname receive this archive's promotion state.
 fn publish_promotion_state(
-    archive_root: &Path,
+    archive: &ObjectStore,
     state: &PromotedRuntimeStateV1,
 ) -> Result<(), RuntimePromotionError> {
-    let store = ObjectStore::open(archive_root, state.workspace_id)?;
-    let open = store
-        .seal_history_only(promoted_storage_binding(state))
-        .map_err(|(_store, error)| error)?;
-    let (_store, history) = open.into_history().map_err(|(_store, error)| error)?;
+    let (_store, history) = open_retained_history_control(archive, state)?;
     history.publish_promoted_runtime_state(state)?;
     Ok(())
 }
 
-/// Freshly reopen the durable promotion state through a fresh archive open.
+/// Freshly reopen the durable promotion state through a fresh durable-history
+/// open over the same exact retained archive capability.
 fn read_promotion_state(
-    archive_root: &Path,
+    archive: &ObjectStore,
     expected: &PromotedRuntimeStateV1,
 ) -> Result<PromotedRuntimeStateV1, RuntimePromotionError> {
-    let store = ObjectStore::open(archive_root, expected.workspace_id)?;
-    let open = store
-        .seal_history_only(promoted_storage_binding(expected))
-        .map_err(|(_store, error)| error)?;
-    let (_store, history) = open.into_history().map_err(|(_store, error)| error)?;
+    let (_store, history) = open_retained_history_control(archive, expected)?;
     history
         .read_promoted_runtime_state()?
         .ok_or(RuntimePromotionError::Store(
             StoreError::PromotedRuntimeStateAbsent,
         ))
+}
+
+/// Seal one promoted-storage-bound durable history control over a duplicate of
+/// `archive`'s retained capability.
+fn open_retained_history_control(
+    archive: &ObjectStore,
+    state: &PromotedRuntimeStateV1,
+) -> Result<(ObjectStore, super::object_store::DurableEngineHistoryStore), RuntimePromotionError> {
+    let store = archive.duplicate_retained_capability()?;
+    let open = store
+        .seal_history_only(promoted_storage_binding(state))
+        .map_err(|(_store, error)| error)?;
+    open.into_history()
+        .map_err(|(_store, error)| RuntimePromotionError::Store(error))
 }
 
 fn promoted_storage_binding(
@@ -1796,6 +1828,15 @@ fn promoted_storage_binding_endpoint(binding: &EnrollmentBindingV1) -> Projectio
 
 /// Read the durable promotion state and require it to bind exactly the durable
 /// bootstrap anchor and enrollment the committed records prove.
+///
+/// A restarted process holds no retained capability at all, so this is the one
+/// place where opening the configured archive pathname is unavoidable. The
+/// promoted-state authorization boundary
+/// ([`super::object_store::DurableEngineHistoryStore::read_promoted_runtime_state`])
+/// revalidates the state's exact physical control-directory identity and its
+/// canonical archive-resource claim against the freshly opened archive before it
+/// returns any state, so a look-alike directory at the enrolled pathname is
+/// rejected here rather than adopted.
 fn read_promotion_state_for_anchor(
     archive_root: &Path,
     binding: &EnrollmentBindingV1,
@@ -1859,11 +1900,10 @@ fn require_promoted_bootstrap_runtime_authority(
     archive: &ObjectStore,
     state: &PromotedRuntimeStateV1,
 ) -> Result<(), RuntimePromotionError> {
-    let storage = promoted_storage_binding(state);
-    let sealed = ObjectStore::open(archive.root_path(), state.workspace_id)?
-        .seal_history_only(storage)
-        .map_err(|(_store, error)| error)?;
-    let (store, history) = sealed.into_history().map_err(|(_store, error)| error)?;
+    // Duplicated from the caller's already-authenticated retained capability,
+    // never reopened from `archive.root_path()`: the promoted lineage's runtime
+    // authority must be derived from the exact archive that was authenticated.
+    let (store, history) = open_retained_history_control(archive, state)?;
     if history.current_bootstrap_binding()? != Some(state.bootstrap) {
         return Err(RuntimePromotionError::Anchor(
             "durable history bootstrap binding is not the promoted lineage",

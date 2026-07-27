@@ -89,7 +89,7 @@ const BLOCK_CLAIM_RECORD_SCHEMA_VERSION: u32 = 2;
 const LOGSEQ_CLAIM_RECORD_SCHEMA_VERSION: u32 = 1;
 const ACCEPTED_EVIDENCE_SCHEMA_VERSION: u32 = 6;
 const ACCEPTED_FRONTIER_ROOT_SCHEMA_VERSION: u32 = 5;
-const MAX_EPHEMERAL_BLOCK_CLAIMS: usize = 4_096;
+pub(crate) const MAX_EPHEMERAL_BLOCK_CLAIMS: usize = 4_096;
 const MAX_EPHEMERAL_LOGSEQ_CLAIMS: usize = 4_096;
 const MAX_EPHEMERAL_PORTABLE_PATHS: usize = 4_096;
 
@@ -1498,6 +1498,29 @@ struct DetachedBootstrapContinuity {
 struct RetainedBootstrapParts {
     publication: Arc<super::object_store::ValidatedBootstrapPublicationV1>,
     ordinals: BTreeMap<BatchId, usize>,
+}
+
+/// The bounded, payload-free plan for one promoted recovery replay.
+///
+/// Only refcounted handles the engine already holds and the aggregate part
+/// count live here. It exists so recovery can stage through `&mut self` one
+/// ordinal at a time instead of materializing every bootstrap part first.
+struct BootstrapRecoveryPlan {
+    store: Arc<ObjectStore>,
+    publication: Arc<super::object_store::ValidatedBootstrapPublicationV1>,
+    part_count: usize,
+}
+
+/// Engine-side bootstrap-part residency of a promoted recovery replay.
+///
+/// `max_live_bootstrap_parts` is the engine counterpart of the SQLite rebuild's
+/// identically named counter: it is the greatest number of bootstrap part
+/// payloads that were simultaneously resident, and it must stay at one.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct BootstrapRecoveryInstrumentation {
+    pub(crate) bootstrap_part_reads: usize,
+    pub(crate) bootstrap_object_reads: usize,
+    pub(crate) max_live_bootstrap_parts: usize,
 }
 
 struct DetachedBootstrapScratchRoot {
@@ -3275,6 +3298,10 @@ pub struct ShardedHotEngine {
     // document reloads for those batches read the right immutable bytes
     // without holding any part payload resident.
     bootstrap_parts: Option<RetainedBootstrapParts>,
+    /// Bootstrap part payloads resident right now, and the observed maximum.
+    /// Recovery streams one part at a time, so the maximum must stay at one.
+    live_bootstrap_recovery_parts: usize,
+    bootstrap_recovery: BootstrapRecoveryInstrumentation,
     /// Authenticated offered batches retained only across bounded slices.
     /// Same-process reconstruction deliberately clears this cache and
     /// reauthenticates once before resuming from the durable queue cursor.
@@ -3404,6 +3431,8 @@ impl ShardedHotEngine {
             archive: BTreeMap::new(),
             detached_accepted_manifests: BTreeMap::new(),
             bootstrap_parts: None,
+            live_bootstrap_recovery_parts: 0,
+            bootstrap_recovery: BootstrapRecoveryInstrumentation::default(),
             bounded_staging_cache: BTreeMap::new(),
             archive_store: None,
             projection_endpoint: None,
@@ -3997,12 +4026,20 @@ impl ShardedHotEngine {
         // which live in the immutable bootstrap namespace. They are replayed
         // first, in exact aggregate order, so the ordinary archived tail
         // extends the same accepted state the bootstrap published.
-        for prepared in self.retained_bootstrap_recovery_parts()? {
-            let outcome = self.stage_bootstrap_part_for_recovery(prepared)?;
-            if let Some(error) = &self.history_failure {
-                return Err(error.clone());
+        //
+        // The plan clones only the retained archive/publication handles and the
+        // bounded part count, which is all that is needed to break the borrow
+        // conflict with `&mut self` staging. Each part is then loaded, staged,
+        // and dropped before the next ordinal is read, so restart resident
+        // memory is one bootstrap part rather than the whole graph.
+        if let Some(plan) = self.retained_bootstrap_recovery_plan()? {
+            for ordinal in 0..plan.part_count {
+                let outcome = self.stage_one_retained_bootstrap_part(&plan, ordinal)?;
+                if let Some(error) = &self.history_failure {
+                    return Err(error.clone());
+                }
+                outcomes.push(outcome);
             }
-            outcomes.push(outcome);
         }
         for manifest in committed_manifests {
             let outcome = self.stage_archive_batch_for_recovery(manifest.batch_id())?;
@@ -4094,27 +4131,102 @@ impl ShardedHotEngine {
         Ok(Some(loaded))
     }
 
-    /// This promoted lineage's bootstrap parts, in exact aggregate order.
-    fn retained_bootstrap_recovery_parts(&self) -> Result<Vec<PreparedBatch>, EngineError> {
+    /// The bounded plan for replaying this promoted lineage's bootstrap parts.
+    ///
+    /// It holds no part payload at all: two refcounted handles the engine
+    /// already owns, plus the aggregate part count. That is exactly enough to
+    /// let the caller stage each part through `&mut self` without keeping the
+    /// engine immutably borrowed across the loop.
+    fn retained_bootstrap_recovery_plan(
+        &self,
+    ) -> Result<Option<BootstrapRecoveryPlan>, EngineError> {
         let Some(retained) = &self.bootstrap_parts else {
-            return Ok(Vec::new());
+            return Ok(None);
         };
         let store = self
             .archive_store
             .as_ref()
             .ok_or_else(|| EngineError::Archive("engine has no immutable archive store".into()))?;
-        let count = retained.publication.aggregate().parts().len();
-        let mut parts = Vec::with_capacity(count);
-        for ordinal in 0..count {
-            let loaded = store
-                .load_bootstrap_part(&retained.publication, ordinal)
-                .map_err(|error| EngineError::Archive(error.to_string()))?;
-            parts.push(PreparedBatch::new(
-                loaded.manifest().clone(),
-                loaded.objects().to_vec(),
-            )?);
+        Ok(Some(BootstrapRecoveryPlan {
+            part_count: retained.publication.aggregate().parts().len(),
+            store: Arc::clone(store),
+            publication: Arc::clone(&retained.publication),
+        }))
+    }
+
+    /// Load, authenticate, stage, and release exactly one bootstrap part.
+    ///
+    /// Exactly one part payload is resident for the duration of this call and
+    /// none afterwards: the loaded part is moved into the prepared batch rather
+    /// than cloned beside it, and the prepared batch is consumed by staging.
+    /// `stage_bootstrap_part_for_recovery` still performs the authenticated
+    /// cold-record check, so nothing about the replay's generation proofs, its
+    /// bootstrap-namespace separation, or its exact multipart ordering changes.
+    fn stage_one_retained_bootstrap_part(
+        &mut self,
+        plan: &BootstrapRecoveryPlan,
+        ordinal: usize,
+    ) -> Result<StageOutcome, EngineError> {
+        let expected = plan
+            .publication
+            .aggregate()
+            .parts()
+            .get(ordinal)
+            .ok_or_else(|| {
+                EngineError::Archive("retained bootstrap publication lost a part ordinal".into())
+            })?
+            .batch_id();
+        let loaded = plan
+            .store
+            .load_bootstrap_part(&plan.publication, ordinal)
+            .map_err(|error| EngineError::Archive(error.to_string()))?;
+        if loaded.manifest().batch_id() != expected {
+            return Err(EngineError::Archive(
+                "retained bootstrap part does not carry its aggregate batch identity".into(),
+            ));
         }
-        Ok(parts)
+        if loaded.manifest().lineage_digest() != self.lineage_digest {
+            return Err(EngineError::LineageMismatch {
+                expected: self.lineage_digest,
+                found: loaded.manifest().lineage_digest(),
+            });
+        }
+        let (manifest, objects) = loaded.into_manifest_and_objects();
+        let object_count = objects.len();
+        let prepared = PreparedBatch::new(manifest, objects)?;
+        self.enter_live_bootstrap_recovery_part(object_count);
+        let outcome = self.stage_bootstrap_part_for_recovery(prepared);
+        self.leave_live_bootstrap_recovery_part();
+        outcome
+    }
+
+    /// Account for one bootstrap part payload becoming resident.
+    fn enter_live_bootstrap_recovery_part(&mut self, object_count: usize) {
+        self.live_bootstrap_recovery_parts = self.live_bootstrap_recovery_parts.saturating_add(1);
+        let mut recovery = self.bootstrap_recovery;
+        recovery.bootstrap_part_reads = recovery.bootstrap_part_reads.saturating_add(1);
+        recovery.bootstrap_object_reads =
+            recovery.bootstrap_object_reads.saturating_add(object_count);
+        recovery.max_live_bootstrap_parts = recovery
+            .max_live_bootstrap_parts
+            .max(self.live_bootstrap_recovery_parts);
+        self.bootstrap_recovery = recovery;
+    }
+
+    /// Account for that part payload being consumed and released.
+    fn leave_live_bootstrap_recovery_part(&mut self) {
+        self.live_bootstrap_recovery_parts = self.live_bootstrap_recovery_parts.saturating_sub(1);
+    }
+
+    /// Observed bootstrap-part residency of this engine's recovery replay.
+    ///
+    /// The exact counterpart of [`super::sqlite::BootstrapSqliteRebuildInstrumentation`]
+    /// for the engine side of a promoted open, so a regression can assert that
+    /// the observed maximum is one part rather than the whole publication.
+    pub(crate) const fn bootstrap_recovery_instrumentation(
+        &self,
+    ) -> BootstrapRecoveryInstrumentation {
+        self.bootstrap_recovery
     }
 
     /// Rebuild every run-local derived structure from the retained
@@ -4183,6 +4295,7 @@ impl ShardedHotEngine {
         // Telemetry is observational rather than continuation authority; keep
         // cumulative work accounting across the reconstructed journey.
         rebuilt.history_work.set(self.history_work.get());
+        rebuilt.bootstrap_recovery = self.bootstrap_recovery;
         *self = rebuilt;
         Ok(())
     }
