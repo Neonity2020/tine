@@ -1498,6 +1498,38 @@ impl ReconciliationBaseline {
             .map_err(|error| classify_sql_error(&path, error, "closing blocked signature read"))?;
         Ok(result)
     }
+
+    /// Read-only observation of every retained epoch row, including still
+    /// `Building` and diagnostic epochs that never reached the head.
+    ///
+    /// It exists so a regression can prove that a refused reconciliation
+    /// dispatch left the baseline logically identical, which the head and the
+    /// head path page alone cannot show: `begin_epoch` and the scan row appends
+    /// are visible here long before any epoch is finished.
+    #[cfg(test)]
+    pub(crate) fn epoch_rows_for_test(&self) -> Vec<(i64, i64, i64, i64, i64)> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, state, path_count, directory_count, aggregate_path_bytes
+                 FROM epochs ORDER BY id",
+            )
+            .expect("baseline epochs table is readable");
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .expect("baseline epoch rows are readable")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("baseline epoch rows decode");
+        rows
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

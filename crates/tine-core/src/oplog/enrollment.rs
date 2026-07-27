@@ -2064,6 +2064,173 @@ pub(crate) fn reopen_local_active_record(
     }
 }
 
+/// The committed `LocalActive` handoff chain is walked back one authenticated
+/// audit page at a time. The traversal is bounded by the existing enrollment
+/// chain and audit-page bounds, so a fresh-process reopen can never perform
+/// unbounded work or hold an unbounded frame.
+const MAX_LOCAL_ACTIVE_REOPEN_CHAIN_PAGES: usize = MAX_ENROLLMENT_OPEN_CHAIN_RECORDS;
+
+/// A freshly proof-revalidated fresh-process reopen of a committed
+/// `LocalActive` enrollment.
+///
+/// It carries the reconstructed [`VerifiedLocalEvidence`] for the exact
+/// `VerifiedLocal` predecessor the original activation consumed, so a restarted
+/// process needs no retained in-memory evidence at all. Only this module can
+/// mint one, and only after the complete retained proof set has reproduced the
+/// exact committed verification digest.
+pub(crate) struct ReopenedLocalActive {
+    predecessor: VerifiedLocalEvidence,
+    committed: CommittedLocalActive,
+}
+
+impl ReopenedLocalActive {
+    pub(crate) const fn predecessor_evidence(&self) -> &VerifiedLocalEvidence {
+        &self.predecessor
+    }
+
+    pub(crate) const fn committed(&self) -> &CommittedLocalActive {
+        &self.committed
+    }
+
+    pub(crate) fn into_parts(self) -> (VerifiedLocalEvidence, CommittedLocalActive) {
+        (self.predecessor, self.committed)
+    }
+}
+
+/// Bounded fresh-process reopen of a committed `LocalActive` enrollment that
+/// requires no retained in-memory [`VerifiedLocalEvidence`].
+///
+/// Enrollment bytes alone still never mint authority. The committed
+/// `LocalActive` head is walked back over its exact handoff chain to the
+/// original `VerifiedLocal` predecessor, the complete retained proof set is
+/// freshly revalidated against that committed predecessor record, and the
+/// freshly derived verification digest must reproduce the digest the committed
+/// `LocalActive` record binds. The head is then reopened a second time, so a
+/// head that moved during the proof pass fails closed.
+///
+/// The traversal makes no assumption that the committed `LocalActive` record
+/// directly succeeds `VerifiedLocal`: any legal sequence of `Safe`/`Unsafe`
+/// handoff records is accepted.
+pub(crate) fn reopen_local_active_from_durable_state(
+    root: &EnrollmentApplicationRoot,
+    binding: &EnrollmentBindingV1,
+    proofs: &VerifiedLocalProofSet<'_>,
+) -> Result<ReopenedLocalActive, VerifiedLocalCompositionError> {
+    let reader = open_local_active_reader(root, binding)?;
+    let committed = observe_idle_local_active(&reader, binding)?;
+    let expected_head = committed.enrollment_head;
+    let (predecessor_head, verified) =
+        find_verified_local_predecessor(&reader, committed.verification_digest)?;
+    drop(reader);
+
+    let expected = freshly_validate_verified_local(binding, verified.preparation_id, proofs)?;
+    if expected != verified {
+        return Err(VerifiedLocalCompositionError::ProofMismatch(
+            "committed VerifiedLocal predecessor does not bind the freshly reopened proofs",
+        ));
+    }
+    if expected.verification_digest()? != committed.verification_digest {
+        return Err(VerifiedLocalCompositionError::ProofMismatch(
+            "freshly revalidated proofs do not reproduce the committed verification digest",
+        ));
+    }
+
+    // Reopen after the expensive proof pass. The head digest commits to the
+    // whole authenticated hash-linked ancestry, so an unchanged head keeps the
+    // predecessor traversal above exact.
+    let reopened = open_local_active_reader(root, binding)?;
+    let reopened_committed = observe_idle_local_active(&reopened, binding)?;
+    if reopened_committed.enrollment_head != expected_head
+        || reopened_committed.verification_digest != committed.verification_digest
+        || reopened_committed.handoff != committed.handoff
+    {
+        return Err(VerifiedLocalCompositionError::StaleEvidence(
+            "committed LocalActive head changed during proof revalidation",
+        ));
+    }
+    Ok(ReopenedLocalActive {
+        predecessor: VerifiedLocalEvidence {
+            enrollment_head: predecessor_head,
+            verification_digest: committed.verification_digest,
+            binding: binding.clone(),
+            preparation_id: verified.preparation_id,
+            bootstrap_batch_id: verified.bootstrap_batch_id,
+            accepted_frontier_state_digest: verified
+                .accepted_frontier_anchor
+                .accepted_frontier_state_digest,
+        },
+        committed: reopened_committed,
+    })
+}
+
+fn open_local_active_reader(
+    root: &EnrollmentApplicationRoot,
+    binding: &EnrollmentBindingV1,
+) -> Result<EnrollmentReader, VerifiedLocalCompositionError> {
+    match EnrollmentReader::open_existing(root, binding)? {
+        EnrollmentOpen::Absent => Err(VerifiedLocalCompositionError::WrongLifecycle(
+            "LocalActive enrollment is absent",
+        )),
+        EnrollmentOpen::Present(reader) => Ok(reader),
+    }
+}
+
+fn observe_idle_local_active(
+    reader: &EnrollmentReader,
+    binding: &EnrollmentBindingV1,
+) -> Result<CommittedLocalActive, VerifiedLocalCompositionError> {
+    let committed = observe_local_active(reader.current(), binding)?;
+    if committed.sync != LocalActiveSync::Idle {
+        return Err(VerifiedLocalCompositionError::WrongLifecycle(
+            "LocalActive reopen requires an Idle sync state",
+        ));
+    }
+    Ok(committed)
+}
+
+/// Walk the committed handoff chain back to the exact `VerifiedLocal` record
+/// the original activation consumed.
+///
+/// Every record from the head down to that predecessor must be a `LocalActive`
+/// record binding the identical verification digest. The reader has already
+/// authenticated each record, its generation, and its link to its successor, so
+/// this pass only classifies lifecycles and enforces the digest.
+fn find_verified_local_predecessor(
+    reader: &EnrollmentReader,
+    verification_digest: ContentDigest,
+) -> Result<(ContentDigest, VerifiedLocalV1), VerifiedLocalCompositionError> {
+    let mut cursor = None;
+    for _ in 0..MAX_LOCAL_ACTIVE_REOPEN_CHAIN_PAGES {
+        let page = reader.audit_chain_page(cursor, MAX_ENROLLMENT_AUDIT_PAGE)?;
+        for snapshot in &page.records {
+            match snapshot.record.lifecycle() {
+                EnrollmentLifecycleV1::LocalActive(active)
+                    if active.verification_digest == verification_digest => {}
+                EnrollmentLifecycleV1::LocalActive(_) => {
+                    return Err(VerifiedLocalCompositionError::ProofMismatch(
+                        "a LocalActive handoff predecessor binds another verification digest",
+                    ));
+                }
+                EnrollmentLifecycleV1::VerifiedLocal(verified) => {
+                    return Ok((snapshot.digest, verified.clone()));
+                }
+                EnrollmentLifecycleV1::ShadowImport(_) | EnrollmentLifecycleV1::Blocked(_) => {
+                    return Err(VerifiedLocalCompositionError::WrongLifecycle(
+                        "the committed LocalActive chain does not descend from VerifiedLocal",
+                    ));
+                }
+            }
+        }
+        match page.next {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    Err(VerifiedLocalCompositionError::StaleEvidence(
+        "no VerifiedLocal predecessor within the bounded LocalActive handoff chain",
+    ))
+}
+
 /// Durably move one committed `LocalActive` record between handoff states.
 ///
 /// The compare-and-swap is narrow: the exact expected head, verification
@@ -2148,6 +2315,53 @@ fn transition_local_active_handoff_at_cut(
         ));
     }
     Ok(reopened)
+}
+
+/// Persist the exact `Unsafe { session } + Published` exclusion state for one
+/// committed `LocalActive` record.
+///
+/// Test-only. The recovery packet contents are not what a runtime reopen
+/// authenticates; the non-`Idle` sync state is, and every runtime boundary must
+/// refuse it.
+#[cfg(test)]
+pub(crate) fn publish_local_active_for_test(
+    root: &EnrollmentApplicationRoot,
+    binding: &EnrollmentBindingV1,
+    expected_head: ContentDigest,
+    verification_digest: ContentDigest,
+    session_id: SessionId,
+) -> Result<ContentDigest, VerifiedLocalCompositionError> {
+    let import_id = ImportId::from_digest([31; 32]);
+    let packet = PublishedRecoveryPacketV1::new(
+        BatchId::for_import(import_id),
+        import_id,
+        ContentDigest::of(b"tine/local-active-published-test-manifest"),
+        binding.archive_resource_id,
+        AcceptedFrontierAnchorV1 {
+            acceptance_sequence: 0,
+            accepted_frontier_state_digest: ContentDigest::of(b"tine/published-test-frontier"),
+            history_generation: 0,
+            history_root: ContentDigest::of(b"tine/published-test-history-root"),
+        },
+    )?;
+    let mut writer = match EnrollmentWriter::open_existing(root, binding)? {
+        EnrollmentOpen::Absent => {
+            return Err(VerifiedLocalCompositionError::WrongLifecycle(
+                "LocalActive enrollment is absent",
+            ));
+        }
+        EnrollmentOpen::Present(writer) => writer,
+    };
+    Ok(writer
+        .transition(
+            expected_head,
+            EnrollmentLifecycleV1::LocalActive(LocalActiveV1 {
+                verification_digest,
+                handoff: HandoffV1::Unsafe { session_id },
+                exclusion: LocalExclusionV1::Published { packet },
+            }),
+        )?
+        .digest())
 }
 
 /// Fail the current enrollment closed at an exact prior head.

@@ -539,6 +539,28 @@ impl LiveReconciliationSessionDispatch<'_> {
         FailedClosedOperationalCoordinator,
         PendingStableScanBaseline,
     > {
+        // A full scan owns the first durable mutation of the step: the baseline
+        // adapter begins an epoch and appends scan rows before any coordinator
+        // call. Authorize the exact live graph and engine here, so an
+        // unadmitted, stale, or foreign runtime can never reach `begin_epoch`.
+        // The coordinator authorizes again later as defense in depth.
+        if let Err(error) = self
+            .dependencies
+            .admission
+            .authorize(self.dependencies.graph, self.dependencies.engine)
+        {
+            return ReconciliationSessionDispatchResult {
+                outcome: ReconciliationSessionDispatchOutcome::Blocked(
+                    BaselineBlockedObservation::new(
+                        BaselineBlockedReason::AuthorityUnavailable,
+                        error.to_string(),
+                    ),
+                ),
+                // No pending baseline: a refused scan must leave the baseline
+                // head, generation, epochs, and rows exactly as it found them.
+                baseline: None,
+            };
+        }
         let (scan, pending_baseline) = {
             let ReconciliationSessionDependencies {
                 graph,

@@ -1,17 +1,26 @@
-//! The single `VerifiedLocalEvidence -> LocalActive` runtime boundary.
+//! The two `LocalActive` runtime boundaries: first activation and fresh-process
+//! reopen.
 //!
-//! Activation changes only device-local enrollment and runtime state. It never
-//! writes migration or projection bytes into the live graph, never enables
-//! migration on ordinary startup, and never wires a watcher.
+//! Neither changes anything but device-local enrollment and runtime state. They
+//! never write migration or projection bytes into the live graph, never enable
+//! migration on ordinary startup, and never wire a watcher.
 //!
 //! [`LocalActiveAuthority`] is the only value in the new sparse-oplog
 //! architecture that admits local mutation, projection, import, or coordinator
 //! execution. It has no public constructor, no serialized form, no `Clone`, and
-//! no test mint: the sole way to obtain one is [`activate_verified_local`],
-//! which requires the retained [`VerifiedLocalEvidence`], the exact live
-//! retained proof set, the retained runtime components, and a fresh
-//! committed-head reopen proving the exact verification digest, session,
-//! binding, and `Unsafe`+`Idle` state.
+//! no test mint. Exactly two functions can produce one:
+//!
+//! * [`activate_verified_local`] performs the one-time `VerifiedLocal ->
+//!   LocalActive` transition. It requires the retained
+//!   [`VerifiedLocalEvidence`], the exact live retained proof set, the retained
+//!   runtime components, and a fresh committed-head reopen proving the exact
+//!   verification digest, session, binding, and `Unsafe`+`Idle` state.
+//! * [`reopen_local_active_authority`] serves a restarted process, which has no
+//!   retained evidence and no authority at all. It reconstructs the predecessor
+//!   evidence from the durable, validated enrollment chain, revalidates the same
+//!   complete proof set and runtime components, and mints an authority only for
+//!   the exact committed session (or, from a clean `Safe` handoff, for exactly
+//!   one requested new session).
 //!
 //! Handoff is conservative. Activation always persists `HandoffUnsafe`, so a
 //! crash at any cut resumes unsafe. `Safe` may only be persisted after every
@@ -37,9 +46,10 @@ use std::fmt;
 use crate::model::Graph;
 
 use super::enrollment::{
-    activate_verified_local_record, reopen_local_active_record, transition_local_active_handoff,
-    CommittedLocalActive, EnrollmentApplicationRoot, EnrollmentBindingV1, LocalActiveHandoff,
-    LocalActiveSync, VerifiedLocalCompositionError, VerifiedLocalEvidence, VerifiedLocalProofSet,
+    activate_verified_local_record, reopen_local_active_from_durable_state,
+    reopen_local_active_record, transition_local_active_handoff, CommittedLocalActive,
+    EnrollmentApplicationRoot, EnrollmentBindingV1, LocalActiveHandoff, LocalActiveSync,
+    VerifiedLocalCompositionError, VerifiedLocalEvidence, VerifiedLocalProofSet,
 };
 use super::hot_engine::ShardedHotEngine;
 use super::sqlite::{OpenProjection, SqliteFrontier, TailOverlay};
@@ -661,6 +671,154 @@ fn activate_with_optional_cut(
             ),
         ));
     }
+
+    Ok(LocalActiveAuthority {
+        application_root: root.clone(),
+        verification_digest: reopened.verification_digest(),
+        enrollment_head: reopened.enrollment_head(),
+        handoff: reopened.handoff(),
+        evidence,
+        session_id,
+        endpoint,
+        activation_acceptance_sequence,
+        _seal: seal::Seal,
+    })
+}
+
+/// The sole fresh-process `LocalActive -> LocalActive` reopen boundary.
+///
+/// A restarted process has no [`VerifiedLocalEvidence`] and no
+/// [`LocalActiveAuthority`]: both are process-local, unserializable, and were
+/// destroyed with the previous process. This boundary reconstructs everything
+/// it needs from durable, validated enrollment state plus the retained proof
+/// set and live runtime components, and mints a new authority only after the
+/// complete proof revalidation reproduces the exact committed verification
+/// digest.
+///
+/// Semantics:
+///
+/// * A committed `Unsafe { session }` record reopens only for exactly that
+///   session. Any other requested session fails closed as a competing session
+///   and never advances the durable head.
+/// * A committed `Safe` record is durably moved to `Unsafe { requested
+///   session }` through the existing record/head protocol, and is then freshly
+///   reopened before an authority exists. Every crash cut therefore retains
+///   either the exact `Safe` predecessor or exactly one `Unsafe` successor for
+///   the requested session, which resumes idempotently.
+/// * Absent, `ShadowImport`, `VerifiedLocal`, `Blocked`, non-`Idle`, malformed,
+///   cross-bound, changed-digest, and invalid-chain state all fail closed.
+///
+/// No live graph bytes are written and no enrollment record is written on the
+/// `Unsafe` resume path.
+pub(crate) fn reopen_local_active_authority(
+    root: &EnrollmentApplicationRoot,
+    binding: &EnrollmentBindingV1,
+    session_id: SessionId,
+    proofs: &VerifiedLocalProofSet<'_>,
+    runtime: &LocalActiveRuntime<'_>,
+) -> Result<LocalActiveAuthority, LocalActivationError> {
+    reopen_with_optional_cut(root, binding, session_id, proofs, runtime, None)
+}
+
+#[cfg(test)]
+pub(crate) fn reopen_local_active_authority_at_cut_for_test(
+    root: &EnrollmentApplicationRoot,
+    binding: &EnrollmentBindingV1,
+    session_id: SessionId,
+    proofs: &VerifiedLocalProofSet<'_>,
+    runtime: &LocalActiveRuntime<'_>,
+    cut: super::enrollment::CommitCut,
+) -> Result<LocalActiveAuthority, LocalActivationError> {
+    reopen_with_optional_cut(root, binding, session_id, proofs, runtime, Some(cut))
+}
+
+fn reopen_with_optional_cut(
+    root: &EnrollmentApplicationRoot,
+    binding: &EnrollmentBindingV1,
+    session_id: SessionId,
+    proofs: &VerifiedLocalProofSet<'_>,
+    runtime: &LocalActiveRuntime<'_>,
+    #[allow(unused_variables)] cut: Option<super::enrollment::CommitCut>,
+) -> Result<LocalActiveAuthority, LocalActivationError> {
+    let (evidence, committed) =
+        reopen_local_active_from_durable_state(root, binding, proofs)?.into_parts();
+
+    // The retained proofs and the live runtime components must authenticate the
+    // reconstructed predecessor evidence before any durable transition.
+    let endpoint = authenticate_activation_runtime(&evidence, proofs, runtime)?;
+
+    let reopened = match committed.handoff() {
+        LocalActiveHandoff::Unsafe {
+            session_id: committed_session,
+        } if committed_session == session_id => committed,
+        LocalActiveHandoff::Unsafe { .. } => {
+            return Err(LocalActivationError::Enrollment(
+                VerifiedLocalCompositionError::CompetingSession,
+            ));
+        }
+        LocalActiveHandoff::Safe => {
+            let expected_head = committed.enrollment_head();
+            match cut {
+                #[cfg(test)]
+                Some(cut) => {
+                    super::enrollment::transition_local_active_handoff_at_cut_for_test(
+                        root,
+                        binding,
+                        expected_head,
+                        evidence.verification_digest(),
+                        LocalActiveHandoff::Unsafe { session_id },
+                        cut,
+                    )?;
+                }
+                #[cfg(not(test))]
+                Some(_) => unreachable!("crash cuts are test-only"),
+                None => {
+                    transition_local_active_handoff(
+                        root,
+                        binding,
+                        expected_head,
+                        evidence.verification_digest(),
+                        LocalActiveHandoff::Unsafe { session_id },
+                    )?;
+                }
+            }
+            // Prove the new durable state exactly as a fresh process would,
+            // including the complete proof revalidation, before any authority
+            // exists.
+            let (fresh_evidence, fresh_committed) =
+                reopen_local_active_from_durable_state(root, binding, proofs)?.into_parts();
+            if fresh_evidence.enrollment_head() != evidence.enrollment_head()
+                || fresh_evidence.verification_digest() != evidence.verification_digest()
+                || fresh_evidence.preparation_id() != evidence.preparation_id()
+                || fresh_evidence.binding() != evidence.binding()
+            {
+                return Err(LocalActivationError::Enrollment(
+                    VerifiedLocalCompositionError::StaleEvidence(
+                        "VerifiedLocal predecessor changed during the handoff transition",
+                    ),
+                ));
+            }
+            fresh_committed
+        }
+    };
+
+    if reopened.verification_digest() != evidence.verification_digest()
+        || reopened.sync() != LocalActiveSync::Idle
+        || reopened.handoff() != (LocalActiveHandoff::Unsafe { session_id })
+        || reopened.binding() != evidence.binding()
+    {
+        return Err(LocalActivationError::Enrollment(
+            VerifiedLocalCompositionError::StaleEvidence(
+                "reopened LocalActive head is not this session's Unsafe+Idle record",
+            ),
+        ));
+    }
+
+    let activation_acceptance_sequence = runtime
+        .engine
+        .accepted_frontier_root()
+        .map_err(|error| LocalActivationError::RuntimeBinding(error.to_string()))?
+        .acceptance_sequence();
 
     Ok(LocalActiveAuthority {
         application_root: root.clone(),
