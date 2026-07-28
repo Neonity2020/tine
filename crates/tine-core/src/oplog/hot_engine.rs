@@ -3346,6 +3346,14 @@ pub struct RuntimeResumeObservation {
     pub adopted: bool,
     /// A retained run was offered and refused. Its bytes were left untouched
     /// and it was **not** reclaimed here; reclamation is lifecycle work.
+    ///
+    /// True for **every** refusal class, not only the ones detected after the
+    /// engine exists: an archive-boundary refusal (absent, still leased,
+    /// ephemeral or foreign marker, torn entry set, binding mismatch) sets this
+    /// in `open_enrolled_projection_resuming` before the engine is built, and a
+    /// restore-time refusal sets it in `rotate_to_fresh_retained_scratch`.
+    /// Lifecycle wiring reads this standing signal to bound retained-run
+    /// residue, so a refusal class it could not see would be a silent leak.
     pub refused: bool,
     /// Durable generation covered by the authenticated predecessor state.
     pub replay_base_generation: u64,
@@ -3501,6 +3509,38 @@ fn accepted_frontier_cross_run_facts(
         root.batch_map_root_digest,
         &root.reference_catalog_root,
     )
+}
+
+/// Whether one durable history record is a state an adopted restart is allowed
+/// to resume from.
+///
+/// Checked in both directions on purpose. The restore must check it, because it
+/// is the record every durable-derived root is restored from. The mint checks it
+/// too so that an endpoint whose newest durable record is a rejection or a
+/// quarantine refuses *there*, where the reason is diagnosable, instead of
+/// minting a record that every later restore silently refuses into a full
+/// replay.
+fn record_is_adoptable_predecessor(record: &ColdHistoryRecord) -> bool {
+    record.portable_path_conflicts.is_empty()
+        && record.page_names.conflicts.is_empty()
+        && record.terminal_evidence.is_none()
+        && record.portable_path_key_version == super::PORTABLE_PATH_KEY_VERSION
+        && matches!(record.status, ArchiveStatus::Accepted { .. })
+}
+
+/// Whether one set of run-local scratch roots carries no undrained durable
+/// staging work.
+///
+/// Pure in the roots, so the *recorded* roots of a resume snapshot can be
+/// re-checked at restore by exactly the predicate the live roots are checked by
+/// at mint. Adoption installs `scratch_roots` wholesale, and the dependency
+/// registration, fanout and ready-queue counters live inside them, so a record
+/// that disagreed with its own mint gate would hand the engine phantom pending
+/// work that no batch will ever resolve.
+fn scratch_roots_are_stage_quiescent(roots: &ScratchRoots) -> bool {
+    super::dependency_queue::pending_fanout(roots) == 0
+        && super::dependency_queue::pending_registration(roots) == 0
+        && roots.ready_queue_len == 0
 }
 
 /// The run-local state one adopted run supplies, read back out of that run and
@@ -4128,6 +4168,17 @@ impl ShardedHotEngine {
             promotion,
             Some(retained),
         );
+        // An archive-boundary refusal — absent, leased, ephemeral or foreign
+        // marker, torn entry set, binding mismatch — is a refusal exactly like a
+        // restore-time one. It happens before the engine exists, so it is
+        // recorded here rather than by `rotate_to_fresh_retained_scratch`;
+        // `prepare_operational_recovery_replay` carries the observation into the
+        // replay baseline, so the standing
+        // `EngineInstrumentation::resume.refused` signal reports every refusal
+        // class and not only the post-engine ones.
+        if refusal.is_some() {
+            engine.resume_observation.refused = true;
+        }
         if engine.history_failure.is_none() {
             if let Err(error) = engine.attach_promoted_bootstrap_parts() {
                 engine.history_failure = Some(error);
@@ -4880,12 +4931,19 @@ impl ShardedHotEngine {
     ///   unavailable current-path catalog authority, or a reference catalog
     ///   still in recovery. Every one of these already blocks writes, and their
     ///   evidence maps are unbounded, so excluding them is what keeps the record
-    ///   provably small as well as correct.
+    ///   provably small as well as correct;
+    /// * **not adoptable** — the durable head record this point would name is
+    ///   not itself a clean accepted state (a rejection or a quarantine at the
+    ///   head, conflicts, terminal evidence, a stale portable-path key
+    ///   version). The restore would refuse such a record, so refusing at the
+    ///   mint keeps the reason where it is diagnosable instead of turning it
+    ///   into a silent full replay on every later restart.
     ///
     /// This is a quiescent lifecycle read. It performs one head-root read, one
-    /// canonical marker digest, and a handful of clones of roots the engine
-    /// already holds. It is not on, and must never be moved onto, the
-    /// keystroke, admission, authoring, or acceptance path.
+    /// authenticated lookup of that head record, one canonical marker digest,
+    /// and a handful of clones of roots the engine already holds. Nothing is
+    /// written and no scratch page is touched. It is not on, and must never be
+    /// moved onto, the keystroke, admission, authoring, or acceptance path.
     pub(crate) fn runtime_resume_snapshot(
         &self,
     ) -> Result<Option<RuntimeResumeSnapshot>, EngineError> {
@@ -4923,6 +4981,19 @@ impl ShardedHotEngine {
         if generation == 0
             || generation != self.history_generation
             || index_root != self.history_root
+        {
+            return Ok(None);
+        }
+        // The head record is the one every durable-derived root would be
+        // restored from, so refuse to mint a record no restore could adopt. An
+        // endpoint whose newest durable record is a rejection or a quarantine
+        // reports "nothing to publish this cycle" here, where the reason is
+        // visible, rather than publishing a point that every later restart
+        // silently refuses into a full replay.
+        if !self
+            .sealed_history_record(latest_batch_id)?
+            .as_ref()
+            .is_some_and(record_is_adoptable_predecessor)
         {
             return Ok(None);
         }
@@ -5038,6 +5109,17 @@ impl ShardedHotEngine {
                 "runtime resume snapshot is internally inconsistent".into(),
             ));
         }
+        // The mint refuses a non-quiescent engine, and the restore re-checks
+        // every other derived invariant, so it re-checks this one too: the
+        // recorded roots carry the dependency-registration, fanout and
+        // ready-queue counters, and adoption installs them wholesale. A record
+        // that disagreed with its own mint gate would hand the engine phantom
+        // pending staging work that no batch will ever resolve.
+        if !scratch_roots_are_stage_quiescent(&snapshot.scratch_roots) {
+            return Err(EngineError::Archive(
+                "runtime resume snapshot carries undrained run-local staging work".into(),
+            ));
+        }
 
         // 1. The live sealed history must be exactly, or insertion-only
         //    descended from, the authority the snapshot records. That is what
@@ -5069,18 +5151,17 @@ impl ShardedHotEngine {
                 "runtime resume predecessor record is not at the recorded generation".into(),
             ));
         }
-        if !record.portable_path_conflicts.is_empty()
-            || !record.page_names.conflicts.is_empty()
-            || record.terminal_evidence.is_some()
-            || record.portable_path_key_version != super::PORTABLE_PATH_KEY_VERSION
-        {
+        if !record_is_adoptable_predecessor(&record) {
             return Err(EngineError::Archive(
-                "runtime resume predecessor record is not a clean quiescent state".into(),
+                "runtime resume predecessor record is not a clean accepted quiescent state".into(),
             ));
         }
         // The predecessor's own accepted evidence commits the accepted frontier
         // at that generation. A snapshot whose frontier is ahead of, behind, or
         // simply different from authenticated durable history stops here.
+        // (`record_is_adoptable_predecessor` already required `Accepted`; this
+        // is the binding, expressed as a refusal rather than a panic so the
+        // restore stays fail-closed on every path.)
         let ArchiveStatus::Accepted { evidence, .. } = &record.status else {
             return Err(EngineError::Archive(
                 "runtime resume predecessor record is not an accepted batch".into(),
@@ -7528,9 +7609,7 @@ impl ShardedHotEngine {
     }
 
     fn has_durable_stage_work(&self) -> bool {
-        super::dependency_queue::pending_fanout(&self.scratch_roots) != 0
-            || super::dependency_queue::pending_registration(&self.scratch_roots) != 0
-            || self.scratch_roots.ready_queue_len != 0
+        !scratch_roots_are_stage_quiescent(&self.scratch_roots)
     }
 
     fn ensure_history_store(&mut self) -> Result<(), EngineError> {
@@ -12347,6 +12426,19 @@ impl ShardedHotEngine {
                 "durable recovery history lookup requires active authenticated replay".into(),
             ));
         }
+        self.sealed_history_record(batch_id)
+    }
+
+    /// Read one durable history record at this engine's own sealed history
+    /// root.
+    ///
+    /// Shared by the authenticated recovery path — which additionally requires
+    /// an active replay — and by the quiescent resume-snapshot mint, which has
+    /// no replay but must inspect the head record it is about to name.
+    fn sealed_history_record(
+        &self,
+        batch_id: BatchId,
+    ) -> Result<Option<ColdHistoryRecord>, EngineError> {
         let store = self.history_store.as_ref().ok_or_else(|| {
             EngineError::Archive(
                 "authenticated recovery has no enrolled durable history store".into(),
@@ -22639,6 +22731,19 @@ mod validation_tests {
 
         let receipt = fixture.reopen_resuming(Some(&forged));
         assert!(!receipt.observation.adopted);
+        // The refusal happens at the archive boundary, before the engine
+        // exists. The standing instrumentation signal must still report it:
+        // lifecycle wiring bounds retained-run residue from this flag, so a
+        // refusal class it cannot see is a silent leak.
+        assert!(
+            receipt.observation.refused,
+            "an archive-boundary refusal must set the standing refused signal"
+        );
+        assert_eq!(
+            fixture.engine.instrumentation().resume,
+            receipt.observation,
+            "the receipt and the standing instrumentation must report the same resume"
+        );
         assert_eq!(receipt.refused_run_id, Some(run_id));
         assert_ne!(receipt.engine_run_id, run_id);
         assert_eq!(receipt.observation.replay_base_generation, 0);
@@ -22647,6 +22752,204 @@ mod validation_tests {
             before,
             "a binding-mismatched run must be preserved byte for byte"
         );
+
+        finish_preauthor_gate_fixture(fixture);
+    }
+
+    /// Every refusal class reports itself on the standing resume observation,
+    /// not only the ones detected after the engine is built.
+    ///
+    /// A run whose directory is simply gone — the ordinary consequence of a
+    /// provider-side removal, or of a lifecycle that reclaimed a run a stale
+    /// resume point still names — is refused inside
+    /// `adopt_retained_engine_scratch`, before an engine exists to rotate. That
+    /// is the most common refusal there is, and
+    /// `EngineInstrumentation::resume.refused` is the signal the lifecycle wiring
+    /// reads to bound retained-run residue.
+    #[test]
+    fn an_archive_boundary_refusal_reports_itself_on_the_standing_observation() {
+        let mut fixture = preauthor_gate_fixture_with_retention(710_000, true);
+        fixture.author_accepted_round(710_100, "absent run");
+        let snapshot = fixture
+            .engine
+            .runtime_resume_snapshot()
+            .unwrap()
+            .expect("a quiescent retained enrolled engine is publishable");
+        let absent_run = snapshot.scratch_run_id();
+
+        // Drop the engine's lease, then remove the run the snapshot names.
+        let workspace = fixture.engine.workspace_id();
+        let lineage = fixture.engine.lineage_digest;
+        let catalog = fixture.engine.catalog_document_id;
+        fixture.engine = ShardedHotEngine::new(workspace, lineage, catalog);
+        std::fs::remove_dir_all(
+            fixture
+                .archive_path()
+                .join("engine-scratch-v2")
+                .join(format!("run-{absent_run}")),
+        )
+        .unwrap();
+
+        let receipt = fixture.reopen_resuming(Some(&snapshot));
+        assert!(!receipt.observation.adopted);
+        assert!(
+            receipt.observation.refused,
+            "an absent run is a refusal and must be observable as one"
+        );
+        assert_eq!(receipt.refused_run_id, Some(absent_run));
+        assert!(receipt.refusal.is_some());
+        assert_ne!(receipt.engine_run_id, absent_run);
+        assert_eq!(receipt.observation.replay_base_generation, 0);
+        assert_eq!(
+            receipt.observation.replayed_generations, receipt.observation.live_history_generation,
+            "a refused adoption must replay every durable record"
+        );
+        assert_eq!(
+            fixture.engine.instrumentation().resume,
+            receipt.observation,
+            "the receipt and the standing instrumentation must report the same resume"
+        );
+        // And the engine it produced is a working one.
+        assert_eq!(
+            projection_page_states(&fixture.engine, &fixture_page_ids(&fixture)).len(),
+            3
+        );
+
+        finish_preauthor_gate_fixture(fixture);
+    }
+
+    /// The restore re-checks the snapshot's own run-local quiescence instead of
+    /// installing phantom pending counters.
+    ///
+    /// `scratch_roots` carries the dependency-registration, fanout and
+    /// ready-queue counters, and adoption installs it wholesale. The mint
+    /// refuses a non-quiescent engine; the restore must not be the only step
+    /// that trusts that gate, because the roots it installs are the ones the
+    /// engine will then believe.
+    #[test]
+    fn a_resume_snapshot_with_undrained_staging_work_is_refused() {
+        let mut fixture = preauthor_gate_fixture_with_retention(711_000, true);
+        fixture.author_accepted_round(711_100, "quiescence");
+        let honest = fixture
+            .engine
+            .runtime_resume_snapshot()
+            .unwrap()
+            .expect("a quiescent retained enrolled engine is publishable");
+        assert!(scratch_roots_are_stage_quiescent(honest.scratch_roots()));
+
+        let mut roots = honest.scratch_roots.clone();
+        roots.ready_queue_len = 3;
+        let forged = RuntimeResumeSnapshot {
+            scratch_roots: roots,
+            ..honest.clone()
+        };
+
+        let workspace = fixture.engine.workspace_id();
+        let lineage = fixture.engine.lineage_digest;
+        let catalog = fixture.engine.catalog_document_id;
+        fixture.engine = ShardedHotEngine::new(workspace, lineage, catalog);
+
+        let receipt = fixture.reopen_resuming(Some(&forged));
+        assert!(!receipt.observation.adopted);
+        assert!(receipt.observation.refused);
+        let refusal = receipt
+            .refusal
+            .as_ref()
+            .expect("a refused adoption reports why")
+            .to_string();
+        assert!(
+            refusal.contains("undrained run-local staging work"),
+            "run-local quiescence must be the refusal: {refusal}"
+        );
+        assert!(
+            !fixture.engine.has_durable_stage_work(),
+            "the fallback engine must not have inherited the phantom counters"
+        );
+        assert_eq!(receipt.observation.replay_base_generation, 0);
+
+        // The honest snapshot of the same run is still adoptable, so the
+        // refusal was about the forged counters and not about the run.
+        let resumed = fixture.reopen_resuming(Some(&honest));
+        assert!(resumed.observation.adopted, "{:?}", resumed.refusal);
+
+        finish_preauthor_gate_fixture(fixture);
+    }
+
+    /// A durable head record that no restore could adopt refuses at the mint,
+    /// where the reason is diagnosable, instead of producing a resume point that
+    /// every later restart silently declines into a full replay.
+    ///
+    /// A rejection advances durable history like an acceptance does, so an
+    /// endpoint whose newest durable record is a rejection has a perfectly valid
+    /// history and an unadoptable head. Before this gate the mint happily named
+    /// it and the only symptom was "adoption never works here."
+    #[test]
+    fn a_rejection_at_the_durable_head_refuses_the_resume_snapshot_mint() {
+        let mut fixture = preauthor_gate_fixture_with_retention(712_000, true);
+        fixture.author_accepted_round(712_100, "mint gate");
+        assert!(
+            fixture.engine.runtime_resume_snapshot().unwrap().is_some(),
+            "an accepted head is publishable"
+        );
+        let accepted_generation = fixture.engine.history_generation;
+
+        // An ordinary local round whose external document publication fails is
+        // durably recorded as a rejection, and that rejection becomes the newest
+        // durable record.
+        let draft = fixture.draft_edits(712_200, &[(1, "rejected round")]);
+        let captured = match fixture
+            .engine
+            .capture_local_author_transaction(
+                draft,
+                &fixture.graph,
+                &fixture.receipts,
+                fixture.endpoint,
+            )
+            .unwrap()
+        {
+            LocalAuthorCapture::Captured(captured) => captured,
+            LocalAuthorCapture::ReconciliationNeeded(_) => {
+                panic!("undisturbed local round unexpectedly requires reconciliation")
+            }
+        };
+        let prepared = fixture
+            .engine
+            .finalize_captured_author_transaction(captured, &fixture.receipts)
+            .unwrap();
+        fixture.writer.publish_prepared(&prepared).unwrap();
+        // The edit touches one membership shard, so the injected failure lands
+        // on that document's external publication.
+        fixture.engine.external_publication_failure_index = Some(0);
+        assert!(matches!(
+            fixture
+                .engine
+                .stage_archive_batch(prepared.manifest().batch_id())
+                .unwrap()
+                .disposition(),
+            BatchDisposition::Rejected { .. }
+        ));
+        fixture.engine.external_publication_failure_index = None;
+        assert!(
+            fixture.engine.history_generation > accepted_generation,
+            "a rejection must still advance durable history, or this proves nothing"
+        );
+
+        assert!(
+            fixture.engine.runtime_resume_snapshot().unwrap().is_none(),
+            "a head record no restore could adopt must refuse at the mint, not at every later restart"
+        );
+
+        // The next acceptance restores publishability, and that snapshot really
+        // is adoptable — so the mint gate is about the head record, not about
+        // the endpoint.
+        fixture.author_accepted_round(712_300, "recovered");
+        let snapshot = fixture
+            .engine
+            .runtime_resume_snapshot()
+            .unwrap()
+            .expect("an accepted head after a rejection is publishable again");
+        let resumed = fixture.reopen_resuming(Some(&snapshot));
+        assert!(resumed.observation.adopted, "{:?}", resumed.refusal);
 
         finish_preauthor_gate_fixture(fixture);
     }
