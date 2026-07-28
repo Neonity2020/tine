@@ -37,8 +37,8 @@ use crate::oplog::shadow_projection::{
     verify_inactive_bootstrap_shadow_projection, VerifiedShadowProjection,
 };
 use crate::oplog::sqlite::{
-    ApplicationRuntimeRoot, LeasedWorkspaceProjection, ProjectionError, RebuildSource,
-    SqliteFrontier, TailOverlay, VerifiedBootstrapSqliteProjection, WorkspaceRuntimeLease,
+    ApplicationRuntimeRoot, ProjectionError, RebuildSource, SqliteFrontier, TailOverlay,
+    WorkspaceRuntimeLease,
 };
 use crate::oplog::{
     AuthorBatch, BatchDisposition, BatchId, BatchOrigin, BlockId, BlockLocation,
@@ -85,12 +85,11 @@ struct Fixture {
     authority: InactiveBootstrapAcceptedAuthority,
     roots: MigrationBackupRoot,
     backup: VerifiedSourceBackup,
-    /// The inactive bootstrap database *and* the archive-rooted workspace
-    /// runtime lease it was opened under. The promoted open adopts that exact
-    /// lease, so the bootstrap -> promoted handoff never releases the workspace
-    /// lock — which is what the production wiring must do.
-    sqlite: Option<LeasedWorkspaceProjection>,
-    sqlite_proof: VerifiedBootstrapSqliteProjection,
+    /// The production inactive-bootstrap session: the database *and* the
+    /// archive-rooted workspace runtime lease it was opened under, as one
+    /// value. Phase two of promotion is reachable only through it, so the
+    /// bootstrap -> promoted handoff cannot release the workspace lock.
+    sqlite: Option<InactiveBootstrapRuntimeSession>,
     archive_resource_id: CanonicalArchiveResourceId,
     shadow: VerifiedShadowProjection,
     preparation: PreparationId,
@@ -177,13 +176,14 @@ impl Fixture {
         let roots = MigrationBackupRoot::open(&device_root, &graph_root).unwrap();
         let backup = verify_migration_source_backup(&roots, &prepared, &verified).unwrap();
         let runtime = ApplicationRuntimeRoot::open_for_test(&root.path().join("runtime")).unwrap();
-        let (sqlite, sqlite_proof) = super::open_leased_bootstrap_projection(
+        let sqlite = InactiveBootstrapRuntimeSession::open(
             &archive_root,
             workspace,
             &root.path().join("bootstrap.sqlite"),
             &runtime,
             &authority,
-        );
+        )
+        .expect("inactive bootstrap runtime session");
         let archive_resource_id = authority
             .store()
             .provision_enrolled_archive_resource_id()
@@ -196,7 +196,7 @@ impl Fixture {
             &backup,
             &authority,
             sqlite.projection(),
-            &sqlite_proof,
+            sqlite.sqlite_proof(),
         )
         .unwrap();
 
@@ -215,7 +215,6 @@ impl Fixture {
             roots,
             backup,
             sqlite: Some(sqlite),
-            sqlite_proof,
             archive_resource_id,
             shadow,
             preparation: PreparationId::new(),
@@ -223,28 +222,32 @@ impl Fixture {
         }
     }
 
-    fn sqlite(&self) -> &OpenProjection {
+    fn bootstrap(&self) -> &InactiveBootstrapRuntimeSession {
         self.sqlite
             .as_ref()
             .expect("retained inactive bootstrap projection")
-            .projection()
     }
 
-    /// Drop the retained inactive bootstrap SQLite projection *and* its
-    /// archive-rooted workspace lease, so a promoted open must acquire the
-    /// workspace lease itself.
+    fn sqlite(&self) -> &OpenProjection {
+        self.bootstrap().projection()
+    }
+
+    /// Drop the retained inactive bootstrap session *and* its archive-rooted
+    /// workspace lease, so a promoted open must acquire the workspace lease
+    /// itself.
     fn release_bootstrap_projection(&mut self) {
         self.sqlite = None;
     }
 
-    /// Close the inactive bootstrap database and retain its archive-rooted
-    /// workspace lease for the promoted open to adopt. This is the production
-    /// bootstrap -> promoted handoff: the workspace lock is never released.
-    fn take_bootstrap_workspace_lease(&mut self) -> WorkspaceRuntimeLease {
+    /// Take the production inactive-bootstrap session out of the fixture.
+    ///
+    /// Phase two of promotion runs on the session's own retained lease, so the
+    /// workspace lock is never released between the two databases, and a
+    /// refusal returns that exact lease.
+    fn take_bootstrap_session(&mut self) -> InactiveBootstrapRuntimeSession {
         self.sqlite
             .take()
             .expect("retained inactive bootstrap projection")
-            .close_retaining_lease()
     }
 
     fn proofs(&self) -> VerifiedLocalProofSet<'_> {
@@ -256,7 +259,7 @@ impl Fixture {
             source_backup: &self.backup,
             accepted_authority: &self.authority,
             sqlite: self.sqlite(),
-            sqlite_projection: &self.sqlite_proof,
+            sqlite_projection: self.bootstrap().sqlite_proof(),
             shadow_projection: &self.shadow,
         }
     }
@@ -1042,7 +1045,7 @@ fn restart_reopen_rejects_wrong_state_proofs_bindings_and_runtimes() {
             ..fixture.proofs()
         },
         VerifiedLocalProofSet {
-            sqlite_projection: &other.sqlite_proof,
+            sqlite_projection: other.bootstrap().sqlite_proof(),
             ..fixture.proofs()
         },
         VerifiedLocalProofSet {
@@ -1282,7 +1285,7 @@ fn activation_rejects_stale_and_cross_bound_evidence_without_advancing() {
             ..first.proofs()
         },
         VerifiedLocalProofSet {
-            sqlite_projection: &second.sqlite_proof,
+            sqlite_projection: second.bootstrap().sqlite_proof(),
             ..first.proofs()
         },
         VerifiedLocalProofSet {
@@ -2006,15 +2009,13 @@ fn promote(
     let sealed =
         seal_local_runtime_promotion(&authority, &fixture.proofs(), &fixture.runtime()).unwrap();
     // The bootstrap database closes and the promoted one opens under the exact
-    // same retained workspace lease.
-    let lease = fixture.take_bootstrap_workspace_lease();
-    let runtime = open_promoted_local_runtime(
-        sealed,
-        &authority,
-        &paths.open(fixture),
-        PromotedWorkspaceAuthority::Retained(lease),
-    )
-    .unwrap();
+    // same retained workspace lease. This is the production entry point, not a
+    // hand-assembled twin of it.
+    let bootstrap = fixture.take_bootstrap_session();
+    let runtime = bootstrap
+        .promote(sealed, &authority, &paths.open(fixture))
+        .map_err(|refusal| refusal.into_parts().1)
+        .unwrap();
     (authority, runtime)
 }
 
@@ -2192,14 +2193,11 @@ fn inactive_bootstrap_promotes_to_a_writable_runtime_and_resumes_exactly() {
         "an idempotent resume must not rewrite the committed promotion state"
     );
 
-    let lease = fixture.take_bootstrap_workspace_lease();
-    let runtime = open_promoted_local_runtime(
-        sealed,
-        &authority,
-        &paths.open(&fixture),
-        PromotedWorkspaceAuthority::Retained(lease),
-    )
-    .unwrap();
+    let bootstrap = fixture.take_bootstrap_session();
+    let runtime = bootstrap
+        .promote(sealed, &authority, &paths.open(&fixture))
+        .map_err(|refusal| refusal.into_parts().1)
+        .unwrap();
 
     // The promoted runtime is the bootstrap's own lineage at its own frontier.
     assert_eq!(
@@ -2325,14 +2323,11 @@ fn promotion_state_residue_fails_closed_and_preserves_evidence() {
 
     // Restoring the exact committed bytes resumes the one promoted state.
     fs::write(&state_path, &committed).unwrap();
-    let lease = fixture.take_bootstrap_workspace_lease();
-    let runtime = open_promoted_local_runtime(
-        sealed,
-        &authority,
-        &paths.open(&fixture),
-        PromotedWorkspaceAuthority::Retained(lease),
-    )
-    .unwrap();
+    let bootstrap = fixture.take_bootstrap_session();
+    let runtime = bootstrap
+        .promote(sealed, &authority, &paths.open(&fixture))
+        .map_err(|refusal| refusal.into_parts().1)
+        .unwrap();
     assert_eq!(runtime.session_id(), session);
     fixture.assert_graph_unchanged();
 }
@@ -4365,14 +4360,15 @@ fn the_bootstrap_to_promoted_database_handoff_never_releases_the_workspace_lease
     let foreign_store = ObjectStore::open(&foreign_archive, fixture.workspace).unwrap();
     let foreign_lease = WorkspaceRuntimeLease::acquire(&foreign_store, fixture.workspace).unwrap();
     let before = PromotedRuntimeInstrumentation::capture();
-    let error = open_promoted_local_runtime(
+    let (returned_foreign_lease, error) = open_promoted_local_runtime(
         refused_seal,
         &authority,
         &paths.open(&fixture),
-        PromotedWorkspaceAuthority::Retained(foreign_lease),
+        RetainedWorkspaceLease::new(foreign_lease),
     )
     .err()
-    .expect("a foreign archive's lease must not authorize this promotion");
+    .expect("a foreign archive's lease must not authorize this promotion")
+    .into_parts();
     let refused = before.since();
     assert!(
         matches!(
@@ -4385,18 +4381,22 @@ fn the_bootstrap_to_promoted_database_handoff_never_releases_the_workspace_lease
         refused.archive_identity_reads, 0,
         "a foreign retained lease must be refused before any archive work"
     );
+    // The refusal handed the caller's lease back rather than releasing it: the
+    // foreign archive is still this process's.
+    assert!(matches!(
+        WorkspaceRuntimeLease::acquire(&foreign_store, fixture.workspace),
+        Err(ProjectionError::LeaseContended(_))
+    ));
+    drop(returned_foreign_lease);
+    drop(WorkspaceRuntimeLease::acquire(&foreign_store, fixture.workspace).unwrap());
 
-    // The bootstrap database closes. The workspace lock does not move.
-    let lease = fixture.take_bootstrap_workspace_lease();
-    assert_eq!(profile.ask("acquire"), "contended");
-
-    let runtime = open_promoted_local_runtime(
-        sealed,
-        &authority,
-        &paths.open(&fixture),
-        PromotedWorkspaceAuthority::Retained(lease),
-    )
-    .unwrap();
+    // The bootstrap database closes and the promoted one opens under the exact
+    // same lease. The workspace lock does not move.
+    let bootstrap = fixture.take_bootstrap_session();
+    let runtime = bootstrap
+        .promote(sealed, &authority, &paths.open(&fixture))
+        .map_err(|refusal| refusal.into_parts().1)
+        .unwrap();
     assert_eq!(profile.ask("acquire"), "contended");
     assert_eq!(runtime.recovery(), RuntimeRecoveryState::FirstPromotion);
     assert!(matches!(

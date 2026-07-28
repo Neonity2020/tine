@@ -105,6 +105,7 @@ use super::enrollment::{
     VerifiedLocalCompositionError, VerifiedLocalEvidence, VerifiedLocalProofSet,
 };
 use super::hot_engine::{EngineError, ShardedHotEngine};
+use super::import::InactiveBootstrapAcceptedAuthority;
 use super::object_store::{
     EngineHistoryAuthority, PromotedLineageModeV1, PromotedRuntimeStateV1, StoreError,
     PROMOTED_RUNTIME_STATE_SCHEMA_VERSION,
@@ -112,9 +113,10 @@ use super::object_store::{
 use super::projection_store::ProjectionReceiptStore;
 use super::sqlite::{
     ApplicationRuntimeRoot, LeasedWorkspaceProjection, OpenProjection, ProjectionClaim,
-    ProjectionError, RebuildSource, SqliteFrontier, TailOverlay, WorkspaceRuntimeLease,
+    ProjectionError, RebuildSource, SqliteFrontier, TailOverlay, VerifiedBootstrapSqliteProjection,
+    WorkspaceRuntimeLease,
 };
-use super::{ContentDigest, ObjectStore, ProjectionEndpointBinding, SessionId};
+use super::{ContentDigest, ObjectStore, ProjectionEndpointBinding, SessionId, WorkspaceId};
 
 /// A private seal. Sibling modules can name the sealed types but can never
 /// construct one, because this module is the only place `Seal` is reachable.
@@ -1603,19 +1605,190 @@ impl RuntimeRecoveryState {
     }
 }
 
-/// The archive-rooted workspace authority one promoted open runs under.
+mod promoted_workspace {
+    /// Sealed: the workspace-authority protocol is a closed set of exactly two
+    /// shapes, and both live in this file.
+    pub(crate) trait Sealed {}
+}
+
+/// The archive-rooted workspace authority one promoted open runs under, and
+/// what a refused open owes the caller.
 ///
 /// A promoted runtime holds exactly one of these leases for its entire writable
-/// life. It is either taken here (a fresh or restarted process, which retains
-/// nothing) or handed over by a caller that already holds it (the
-/// bootstrap -> promoted database handoff, where releasing it even for an
-/// instant would let another process claim the archive mid-promotion).
-pub(crate) enum PromotedWorkspaceAuthority {
-    /// Acquire the archive-rooted workspace runtime lease inside the open.
-    Acquire,
-    /// Adopt the caller's already-held lease, which must be this exact
-    /// archive's and this exact workspace's.
-    Retained(WorkspaceRuntimeLease),
+/// life. It is either taken inside the open ([`AcquireWorkspaceLease`] — a fresh
+/// or restarted process, which retains nothing) or handed over by a caller that
+/// already holds it ([`RetainedWorkspaceLease`] — the bootstrap -> promoted
+/// database handoff, where releasing it even for an instant would let another
+/// process claim the archive mid-promotion).
+///
+/// The two differ in their *failure* type, which is why this is a trait rather
+/// than an enum. An acquiring open owns the lease it took, so a failure just
+/// releases it and the caller keeps ordinary `Result<_, RuntimePromotionError>`
+/// ergonomics, `?` included. A retained open does not own the lease, and
+/// [`seal_local_runtime_promotion`] has already durably published the promotion
+/// state by the time it runs — so a failure that silently released the archive
+/// would hand it to another process at precisely the moment this one must keep
+/// holding it. Its failure type therefore carries the lease itself.
+pub(crate) trait PromotedWorkspaceAuthority: promoted_workspace::Sealed + Sized {
+    /// What a refused promotion hands back.
+    type Refusal;
+    /// What survives the lease handover and decides what a later failure does
+    /// with the lease.
+    type Custody: PromotedWorkspaceCustody<Refusal = Self::Refusal>;
+
+    /// Refuse before any lease has been taken or handed over.
+    fn refuse(self, error: RuntimePromotionError) -> Self::Refusal;
+
+    /// Yield the archive-rooted lease for this exact archive and workspace.
+    fn into_lease(
+        self,
+        archive: &ObjectStore,
+        workspace_id: WorkspaceId,
+    ) -> Result<(WorkspaceRuntimeLease, Self::Custody), Self::Refusal>;
+}
+
+/// Refuse once the lease exists, handing it to whoever owns it.
+pub(crate) trait PromotedWorkspaceCustody: promoted_workspace::Sealed {
+    type Refusal;
+
+    fn refuse_returning(
+        self,
+        lease: WorkspaceRuntimeLease,
+        error: RuntimePromotionError,
+    ) -> Self::Refusal;
+}
+
+/// Acquire the archive-rooted workspace runtime lease inside the open.
+pub(crate) struct AcquireWorkspaceLease;
+
+/// A lease this open acquired for itself: a failure releases it, exactly as it
+/// always has.
+pub(crate) struct ReleaseOwnLease;
+
+impl promoted_workspace::Sealed for AcquireWorkspaceLease {}
+impl promoted_workspace::Sealed for ReleaseOwnLease {}
+
+impl PromotedWorkspaceAuthority for AcquireWorkspaceLease {
+    type Refusal = RuntimePromotionError;
+    type Custody = ReleaseOwnLease;
+
+    fn refuse(self, error: RuntimePromotionError) -> Self::Refusal {
+        error
+    }
+
+    fn into_lease(
+        self,
+        archive: &ObjectStore,
+        workspace_id: WorkspaceId,
+    ) -> Result<(WorkspaceRuntimeLease, Self::Custody), Self::Refusal> {
+        Ok((
+            WorkspaceRuntimeLease::acquire(archive, workspace_id)?,
+            ReleaseOwnLease,
+        ))
+    }
+}
+
+impl PromotedWorkspaceCustody for ReleaseOwnLease {
+    type Refusal = RuntimePromotionError;
+
+    fn refuse_returning(
+        self,
+        lease: WorkspaceRuntimeLease,
+        error: RuntimePromotionError,
+    ) -> Self::Refusal {
+        drop(lease);
+        error
+    }
+}
+
+/// Adopt the caller's already-held lease, which must be this exact archive's
+/// and this exact workspace's.
+pub(crate) struct RetainedWorkspaceLease(WorkspaceRuntimeLease);
+
+/// A lease this open only borrowed ownership of: every failure hands the exact
+/// same lease back.
+pub(crate) struct ReturnRetainedLease;
+
+impl promoted_workspace::Sealed for RetainedWorkspaceLease {}
+impl promoted_workspace::Sealed for ReturnRetainedLease {}
+
+impl RetainedWorkspaceLease {
+    pub(crate) const fn new(lease: WorkspaceRuntimeLease) -> Self {
+        Self(lease)
+    }
+}
+
+impl PromotedWorkspaceAuthority for RetainedWorkspaceLease {
+    type Refusal = RetainedPromotionRefusal;
+    type Custody = ReturnRetainedLease;
+
+    fn refuse(self, error: RuntimePromotionError) -> Self::Refusal {
+        RetainedPromotionRefusal {
+            lease: self.0,
+            error,
+        }
+    }
+
+    fn into_lease(
+        self,
+        archive: &ObjectStore,
+        workspace_id: WorkspaceId,
+    ) -> Result<(WorkspaceRuntimeLease, Self::Custody), Self::Refusal> {
+        let authorized = self.0.proof().authorize_archive(archive, workspace_id);
+        match authorized {
+            Ok(()) => Ok((self.0, ReturnRetainedLease)),
+            Err(error) => Err(RetainedPromotionRefusal {
+                lease: self.0,
+                error: error.into(),
+            }),
+        }
+    }
+}
+
+impl PromotedWorkspaceCustody for ReturnRetainedLease {
+    type Refusal = RetainedPromotionRefusal;
+
+    fn refuse_returning(
+        self,
+        lease: WorkspaceRuntimeLease,
+        error: RuntimePromotionError,
+    ) -> Self::Refusal {
+        RetainedPromotionRefusal { lease, error }
+    }
+}
+
+/// A refused promotion that was running under a caller-retained workspace
+/// lease, carrying that exact lease back.
+///
+/// The type is the guarantee. [`Self::into_parts`] is the *only* way to reach
+/// the error, so a caller cannot learn why the promotion failed while silently
+/// letting the archive go; there is deliberately no
+/// `From<RetainedPromotionRefusal> for RuntimePromotionError`, so `?` cannot
+/// perform that conversion either; and `#[must_use]` catches a discarded
+/// result. Releasing the archive after a failed retained promotion remains
+/// possible — the lease has to be droppable — but it can only happen where
+/// someone wrote the drop.
+#[must_use = "a refused retained promotion still owns the caller's workspace lease"]
+pub(crate) struct RetainedPromotionRefusal {
+    lease: WorkspaceRuntimeLease,
+    error: RuntimePromotionError,
+}
+
+impl RetainedPromotionRefusal {
+    /// Take back the exact lease that was lent, together with the reason.
+    pub(crate) fn into_parts(self) -> (WorkspaceRuntimeLease, RuntimePromotionError) {
+        (self.lease, self.error)
+    }
+}
+
+impl fmt::Debug for RetainedPromotionRefusal {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RetainedPromotionRefusal")
+            .field("error", &self.error)
+            .field("returned_lease", &"<retained by the caller>")
+            .finish()
+    }
 }
 
 /// How much of the promoted binding one proof re-derives from durable state.
@@ -2233,36 +2406,42 @@ impl PromotedRuntimeAdmission<'_> {
 ///
 /// `workspace` is how this process proves it owns the archive:
 ///
-/// * [`PromotedWorkspaceAuthority::Retained`] hands over the exact lease the
-///   caller already holds from the inactive bootstrap database, so the
-///   bootstrap -> promoted database handoff never releases the workspace lock;
-/// * [`PromotedWorkspaceAuthority::Acquire`] takes it here, which requires the
+/// * [`RetainedWorkspaceLease`] hands over the exact lease the caller already
+///   holds from the inactive bootstrap database, so the bootstrap -> promoted
+///   database handoff never releases the workspace lock. Its refusal type
+///   returns that exact lease, because this call runs *after* the durable
+///   promotion state has been published;
+/// * [`AcquireWorkspaceLease`] takes the lease here, which requires the
 ///   retained inactive bootstrap projection to have been released first. The
-///   archive-rooted lease enforces that rather than trusting it.
-pub(crate) fn open_promoted_local_runtime(
+///   archive-rooted lease enforces that rather than trusting it, and a refusal
+///   is the ordinary [`RuntimePromotionError`].
+pub(crate) fn open_promoted_local_runtime<W: PromotedWorkspaceAuthority>(
     sealed: SealedRuntimePromotion,
     authority: &LocalActiveAuthority,
     open: &PromotedRuntimeOpen<'_>,
-    workspace: PromotedWorkspaceAuthority,
-) -> Result<PromotedLocalRuntime, RuntimePromotionError> {
+    workspace: W,
+) -> Result<PromotedLocalRuntime, W::Refusal> {
     // The enrollment lease comes first, exactly as the documented global lock
     // order requires: enrollment lease, then archive/engine lease, then graph
     // and process-local locks. The promoted runtime retains this session for
     // its whole lifetime, so it is acquired once, here.
-    let enrollment = RetainedEnrollmentSession::open(
+    let enrollment = match RetainedEnrollmentSession::open(
         &authority.application_root,
         authority.evidence.binding(),
         authority.verification_digest,
-    )?;
+    ) {
+        Ok(enrollment) => enrollment,
+        Err(error) => return Err(workspace.refuse(error.into())),
+    };
     let committed = enrollment.committed();
     if committed.verification_digest() != sealed.state.enrollment_verification_digest
         || committed.session_id() != Some(authority.session_id)
     {
-        return Err(RuntimePromotionError::Enrollment(
+        return Err(workspace.refuse(RuntimePromotionError::Enrollment(
             VerifiedLocalCompositionError::StaleEvidence(
                 "committed LocalActive record is not the promoting session's record",
             ),
-        ));
+        )));
     }
     mint_promoted_runtime(
         sealed.state,
@@ -2475,7 +2654,7 @@ fn reopen_promoted_local_runtime_with_adoption(
         promoted_storage_binding_endpoint(binding),
         binding,
         open,
-        PromotedWorkspaceAuthority::Acquire,
+        AcquireWorkspaceLease,
         recovery,
     )?;
 
@@ -2714,7 +2893,7 @@ fn require_promoted_bootstrap_runtime_authority(
 /// under a different XDG/HOME/app-data root, or a racing newcomer — still owns
 /// the lease, so this call fails here rather than after touching durable state.
 #[allow(clippy::too_many_arguments)]
-fn mint_promoted_runtime(
+fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
     state: PromotedRuntimeStateV1,
     enrollment: RetainedEnrollmentSession,
     session_id: SessionId,
@@ -2722,52 +2901,81 @@ fn mint_promoted_runtime(
     expected_endpoint: ProjectionEndpointBinding,
     binding: &EnrollmentBindingV1,
     open: &PromotedRuntimeOpen<'_>,
-    workspace: PromotedWorkspaceAuthority,
+    workspace: W,
     recovery: RuntimeRecoveryState,
-) -> Result<PromotedLocalRuntime, RuntimePromotionError> {
+) -> Result<PromotedLocalRuntime, W::Refusal> {
+    // Everything below stays in one stack frame on purpose: `PromotedLocalRuntime`
+    // and the recovered engine are tens of kilobytes, so an extra function
+    // boundary would copy them again on a debug-build test stack. The three
+    // macros are the whole error-routing protocol — before the lease exists,
+    // while it is held, and once it lives inside the opened projection.
+    macro_rules! refuse {
+        ($error:expr) => {
+            return Err(workspace.refuse($error))
+        };
+    }
+    macro_rules! try_refuse {
+        ($result:expr) => {
+            match $result {
+                Ok(value) => value,
+                Err(error) => refuse!(RuntimePromotionError::from(error)),
+            }
+        };
+    }
+
     if state.enrollment_verification_digest != verification_digest
         || enrollment.verification_digest() != verification_digest
     {
-        return Err(RuntimePromotionError::Anchor(
+        refuse!(RuntimePromotionError::Anchor(
             "promotion state does not bind this LocalActive verification digest",
         ));
     }
     if enrollment.committed().binding() != binding {
-        return Err(RuntimePromotionError::Anchor(
+        refuse!(RuntimePromotionError::Anchor(
             "the retained enrollment session is not this promotion's enrollment",
         ));
     }
-    let archive = ObjectStore::open(open.archive_root, state.workspace_id)?;
+    let archive = try_refuse!(ObjectStore::open(open.archive_root, state.workspace_id));
     // Workspace ownership, before anything else. A retained lease must be this
     // exact archive's and this exact workspace's; a lease for a look-alike
     // archive at another path can never be laundered into authority here.
-    let workspace_lease = match workspace {
-        PromotedWorkspaceAuthority::Acquire => {
-            WorkspaceRuntimeLease::acquire(&archive, state.workspace_id)?
-        }
-        PromotedWorkspaceAuthority::Retained(lease) => {
-            lease
-                .proof()
-                .authorize_archive(&archive, state.workspace_id)?;
-            lease
-        }
-    };
-    authenticate_archive_identity(
+    let (workspace_lease, custody) = workspace.into_lease(&archive, state.workspace_id)?;
+
+    // From here the lease exists and this function does not own it: every
+    // failure hands it to the custody, which releases it for an acquiring open
+    // and returns it to the caller for a retained one.
+    macro_rules! release {
+        ($error:expr) => {
+            return Err(custody.refuse_returning(workspace_lease, $error))
+        };
+    }
+    macro_rules! try_release {
+        ($result:expr) => {
+            match $result {
+                Ok(value) => value,
+                Err(error) => release!(RuntimePromotionError::from(error)),
+            }
+        };
+    }
+
+    try_release!(authenticate_archive_identity(
         &archive,
         &state,
         "promoted archive resource claim does not authenticate",
         "promoted archive control directory identity changed",
-    )?;
+    ));
     // The retained immutable publication and the durable reference-catalog
     // authority the cold record binds must both be present before the enrolled
     // open recovers from them.
-    require_promoted_bootstrap_runtime_authority(&archive, &state)?;
+    try_release!(require_promoted_bootstrap_runtime_authority(
+        &archive, &state
+    ));
 
     // Recovery replays the archive's committed manifests. This is the existing
     // enrolled-recovery cost and reads no graph text.
-    let committed_manifests = archive.committed_manifests()?;
+    let committed_manifests = try_release!(archive.committed_manifests());
     let anchor = state.anchor_authority();
-    let (engine, _outcomes) = ShardedHotEngine::open_promoted_projection(
+    let (engine, _outcomes) = try_release!(ShardedHotEngine::open_promoted_projection(
         archive,
         state.lineage_digest,
         state.catalog_document_id,
@@ -2775,9 +2983,9 @@ fn mint_promoted_runtime(
         open.receipts,
         &state,
         &committed_manifests,
-    )?;
+    ));
     if engine.promoted_lineage() != Some(&state) {
-        return Err(RuntimePromotionError::Anchor(
+        release!(RuntimePromotionError::Anchor(
             "promoted engine did not adopt the exact durable promotion state",
         ));
     }
@@ -2786,15 +2994,15 @@ fn mint_promoted_runtime(
         || engine.catalog_document_id() != binding.catalog_document_id()
         || engine.projection_receipt_store_id() != Some(binding.receipt_store_id())
     {
-        return Err(RuntimePromotionError::Anchor(
+        release!(RuntimePromotionError::Anchor(
             "promoted engine does not authenticate the enrolled binding",
         ));
     }
-    let endpoint = engine
-        .projection_endpoint_binding()
-        .ok_or(RuntimePromotionError::Anchor(
+    let Some(endpoint) = engine.projection_endpoint_binding() else {
+        release!(RuntimePromotionError::Anchor(
             "promoted engine has no projection endpoint enrollment",
-        ))?;
+        ));
+    };
     if endpoint.endpoint_id() != expected_endpoint.endpoint_id()
         || endpoint.device_id() != expected_endpoint.device_id()
         || endpoint.graph_resource_id() != expected_endpoint.graph_resource_id()
@@ -2802,53 +3010,57 @@ fn mint_promoted_runtime(
         || endpoint.device_id() != binding.device_id()
         || endpoint.graph_resource_id() != binding.graph_resource_id()
     {
-        return Err(RuntimePromotionError::Anchor(
+        release!(RuntimePromotionError::Anchor(
             "promoted engine projection endpoint is not the enrolled endpoint",
         ));
     }
     // The recovered history must be exactly, or insertion-only descended from,
     // the exact bootstrap anchor.
-    let transition = engine.authenticate_history_descends_from(anchor)?;
-    if transition.before() != anchor || transition.after() != engine.durable_history_authority()? {
-        return Err(RuntimePromotionError::Anchor(
+    let transition = try_release!(engine.authenticate_history_descends_from(anchor));
+    let durable_history = try_release!(engine.durable_history_authority());
+    if transition.before() != anchor || transition.after() != durable_history {
+        release!(RuntimePromotionError::Anchor(
             "recovered history is not an authenticated descendant of the bootstrap anchor",
         ));
     }
-    let accepted = engine
+    let accepted = try_release!(engine
         .accepted_frontier_root()
-        .map_err(RuntimePromotionError::Engine)?;
+        .map_err(RuntimePromotionError::Engine));
     if accepted.acceptance_sequence() < state.anchor_acceptance_sequence {
-        return Err(RuntimePromotionError::Anchor(
+        release!(RuntimePromotionError::Anchor(
             "recovered accepted frontier is behind the bootstrap anchor",
         ));
     }
     // The projection-work index and reference/catalog authority must both be
     // live before the SQLite projection is opened at the current frontier.
-    engine
+    try_release!(engine
         .projection_work_index()
-        .map_err(RuntimePromotionError::Engine)?;
-    engine
+        .map_err(RuntimePromotionError::Engine));
+    try_release!(engine
         .reference_catalog_root()
-        .map_err(RuntimePromotionError::Engine)?;
+        .map_err(RuntimePromotionError::Engine));
 
-    let store = engine.archive_store().ok_or(RuntimePromotionError::Anchor(
-        "promoted engine retained no archive capability",
-    ))?;
+    let Some(store) = engine.archive_store() else {
+        release!(RuntimePromotionError::Anchor(
+            "promoted engine retained no archive capability",
+        ));
+    };
     let claim = ProjectionClaim::current(state.workspace_id, state.lineage_digest);
     // A promoted lineage's leading accepted sequences are its retained
     // immutable bootstrap parts, which live in the archive's bootstrap
     // namespace rather than the ordinary object namespace. The publication
     // identity comes from the authorized promotion state.
-    let publication = store
+    let publication = try_release!(store
         .load_bootstrap_publication(state.bootstrap.publication_id())
-        .map_err(RuntimePromotionError::Store)?;
+        .map_err(RuntimePromotionError::Store));
     // The database is opened through the retained workspace lease's single
     // applier slot, never through the compatibility entry point that would take
-    // a second, temporary workspace lease of its own. On any failure the slot
-    // and the lease are both released, which is what makes a failed open
-    // retryable.
-    let (projection, ()) =
-        LeasedWorkspaceProjection::open_under::<(), ProjectionError>(workspace_lease, |slot| {
+    // a second, temporary workspace lease of its own. A failed open returns the
+    // slot *and* the lease, which is what makes it retryable without ever
+    // releasing the archive.
+    let (projection, ()) = match LeasedWorkspaceProjection::open_under::<(), ProjectionError>(
+        workspace_lease,
+        |slot| {
             let source = RebuildSource::from_promoted_runtime(&engine, store, &publication)
                 .map_err(ProjectionError::from)?;
             SqliteFrontier::open_or_rebuild_with_applier_slot(
@@ -2859,26 +3071,48 @@ fn mint_promoted_runtime(
                 slot,
             )
             .map(|opened| (opened, ()))
-        })
-        .map_err(|(_released_lease, error)| RuntimePromotionError::Sqlite(error))?;
+        },
+    ) {
+        Ok(opened) => opened,
+        Err((lease, error)) => {
+            return Err(custody.refuse_returning(lease, RuntimePromotionError::Sqlite(error)))
+        }
+    };
+
+    // The lease now lives inside `projection`, so a failure has to close the
+    // database to get it back — which releases the database-adjacent lock and
+    // nothing else.
+    macro_rules! close_and_release {
+        ($error:expr) => {
+            return Err(custody.refuse_returning(projection.close_retaining_lease(), $error))
+        };
+    }
+
     // SQLite divergence is caught here, at open, and again at every drain. It
     // is deliberately absent from per-mutation admission: the keystroke path
     // must not issue a SQLite statement.
-    if sqlite_frontier_root(projection.database())? != accepted {
-        return Err(RuntimePromotionError::Anchor(
+    let sqlite_root = match sqlite_frontier_root(projection.database()) {
+        Ok(root) => root,
+        Err(error) => close_and_release!(RuntimePromotionError::from(error)),
+    };
+    if sqlite_root != accepted {
+        close_and_release!(RuntimePromotionError::Anchor(
             "promoted SQLite projection is not at the current accepted frontier",
         ));
     }
-    let tail = TailOverlay::from_durable(
-        projection.database(),
-        &RebuildSource::from_promoted_runtime(&engine, store, &publication)?,
-    )
-    .map_err(|error| match error {
-        super::sqlite::TailOverlayError::Projection(error) => RuntimePromotionError::Sqlite(error),
-        other => RuntimePromotionError::Activation(LocalActivationError::RuntimeBinding(
-            other.to_string(),
+    let tail_source = match RebuildSource::from_promoted_runtime(&engine, store, &publication) {
+        Ok(source) => source,
+        Err(error) => close_and_release!(RuntimePromotionError::from(error)),
+    };
+    let tail = match TailOverlay::from_durable(projection.database(), &tail_source) {
+        Ok(tail) => tail,
+        Err(super::sqlite::TailOverlayError::Projection(error)) => {
+            close_and_release!(RuntimePromotionError::Sqlite(error))
+        }
+        Err(other) => close_and_release!(RuntimePromotionError::Activation(
+            LocalActivationError::RuntimeBinding(other.to_string()),
         )),
-    })?;
+    };
     // The archive identity facts above were authenticated for exactly this
     // session binding generation, so an unchanged-head admission may carry
     // them and any change forces the reread again.
@@ -2899,36 +3133,104 @@ fn mint_promoted_runtime(
     })
 }
 
-/// Open one inactive-bootstrap database through a freshly acquired
-/// archive-rooted workspace runtime lease's applier slot.
+/// The device-local inactive-bootstrap projection a local activation runs on,
+/// owned together with the archive-rooted workspace runtime lease that
+/// authorized opening it.
 ///
-/// This is the leased entry point every promotion fixture uses, so the
-/// bootstrap -> promoted database handoff under one retained lease is the shape
-/// the tests exercise, rather than a release-and-reacquire that production must
-/// never perform.
-#[cfg(test)]
-fn open_leased_bootstrap_projection(
-    archive_root: &Path,
-    workspace: super::WorkspaceId,
-    database_path: &Path,
-    application_runtime_root: &ApplicationRuntimeRoot,
-    authority: &super::import::InactiveBootstrapAcceptedAuthority,
-) -> (
-    LeasedWorkspaceProjection,
-    super::sqlite::VerifiedBootstrapSqliteProjection,
-) {
-    let archive = ObjectStore::open(archive_root, workspace).unwrap();
-    let lease = WorkspaceRuntimeLease::acquire(&archive, workspace).unwrap();
-    LeasedWorkspaceProjection::open_under(lease, |slot| {
-        SqliteFrontier::open_or_rebuild_inactive_bootstrap_with_applier_slot(
-            database_path,
-            application_runtime_root,
-            authority,
-            slot,
+/// This is the crate's inactive-bootstrap open. Every other way of opening that
+/// database — [`SqliteFrontier::open_or_rebuild_inactive_bootstrap`] — is the
+/// compatibility entry point, which takes a *temporary* workspace lease of its
+/// own and releases it when the projection drops; the remaining callers of that
+/// entry point are SQLite-level tests that never promote. An activation must
+/// not use it, because the bootstrap database and the promoted database it
+/// becomes have to be authorized by one continuously-held archive lock:
+/// releasing between them is exactly the window in which another process, under
+/// any XDG/HOME/Flatpak root, could take the archive after the promotion state
+/// has already been published.
+///
+/// The type makes that window inexpressible rather than merely discouraged.
+/// [`Self::promote`] consumes the session, and no accessor hands out the lease,
+/// so there is no way to reach phase two of promotion except through the exact
+/// lease this database was opened under.
+///
+/// Scope note: `tine-core`'s oplog stack is still not reachable from
+/// application startup (see `oplog/mod.rs`), so "production" here means the
+/// non-test construction that the activation wiring will call — not a path a
+/// running Tine binary executes today.
+pub(crate) struct InactiveBootstrapRuntimeSession {
+    projection: LeasedWorkspaceProjection,
+    sqlite_proof: VerifiedBootstrapSqliteProjection,
+}
+
+impl InactiveBootstrapRuntimeSession {
+    /// Take the archive-rooted workspace lease and open the inactive bootstrap
+    /// database under its single applier slot.
+    pub(crate) fn open(
+        archive_root: &Path,
+        workspace: WorkspaceId,
+        database_path: &Path,
+        application_runtime_root: &ApplicationRuntimeRoot,
+        authority: &InactiveBootstrapAcceptedAuthority,
+    ) -> Result<Self, ProjectionError> {
+        let archive = ObjectStore::open(archive_root, workspace)?;
+        let lease = WorkspaceRuntimeLease::acquire(&archive, workspace)?;
+        Self::reopen_under(lease, database_path, application_runtime_root, authority)
+            .map_err(|(_released_lease, error)| error)
+    }
+
+    /// Reopen the inactive bootstrap database under a lease this process is
+    /// already holding.
+    ///
+    /// This is the retry path after a refused promotion handed the lease back:
+    /// recovering from that failure must not go through releasing the archive
+    /// either. A failed reopen returns the lease again for the same reason.
+    pub(crate) fn reopen_under(
+        lease: WorkspaceRuntimeLease,
+        database_path: &Path,
+        application_runtime_root: &ApplicationRuntimeRoot,
+        authority: &InactiveBootstrapAcceptedAuthority,
+    ) -> Result<Self, (WorkspaceRuntimeLease, ProjectionError)> {
+        LeasedWorkspaceProjection::open_under::<VerifiedBootstrapSqliteProjection, ProjectionError>(
+            lease,
+            |slot| {
+                SqliteFrontier::open_or_rebuild_inactive_bootstrap_with_applier_slot(
+                    database_path,
+                    application_runtime_root,
+                    authority,
+                    slot,
+                )
+            },
         )
-    })
-    .map_err(|(_released_lease, error)| error)
-    .expect("leased inactive bootstrap projection")
+        .map(|(projection, sqlite_proof)| Self {
+            projection,
+            sqlite_proof,
+        })
+    }
+
+    pub(crate) const fn projection(&self) -> &OpenProjection {
+        self.projection.projection()
+    }
+
+    pub(crate) const fn sqlite_proof(&self) -> &VerifiedBootstrapSqliteProjection {
+        &self.sqlite_proof
+    }
+
+    /// Phase two of promotion, under this session's own retained lease.
+    ///
+    /// Closing the bootstrap database releases the database-adjacent applier
+    /// lock and nothing else: the archive-rooted workspace lock is a distinct OS
+    /// handle owned by the lease, which is moved straight into the promoted
+    /// open. A refusal returns that same lease, so a failed promotion leaves the
+    /// archive exactly as held as it was before the attempt.
+    pub(crate) fn promote(
+        self,
+        sealed: SealedRuntimePromotion,
+        authority: &LocalActiveAuthority,
+        open: &PromotedRuntimeOpen<'_>,
+    ) -> Result<PromotedLocalRuntime, RetainedPromotionRefusal> {
+        let lease = self.projection.close_retaining_lease();
+        open_promoted_local_runtime(sealed, authority, open, RetainedWorkspaceLease::new(lease))
+    }
 }
 
 #[cfg(test)]
@@ -2960,7 +3262,6 @@ mod bounded_admission {
     use crate::oplog::shadow_projection::{
         verify_inactive_bootstrap_shadow_projection, VerifiedShadowProjection,
     };
-    use crate::oplog::sqlite::VerifiedBootstrapSqliteProjection;
     use crate::oplog::{
         AuthorBatch, BatchDisposition, BatchId, BatchOrigin, BlockId, BlockLocation,
         CanonicalArchiveResourceId, CrdtPeerId, DeviceId, DocumentId, LineageDigest,
@@ -3011,8 +3312,7 @@ mod bounded_admission {
         authority: InactiveBootstrapAcceptedAuthority,
         roots: MigrationBackupRoot,
         backup: VerifiedSourceBackup,
-        sqlite: Option<LeasedWorkspaceProjection>,
-        sqlite_proof: VerifiedBootstrapSqliteProjection,
+        sqlite: Option<InactiveBootstrapRuntimeSession>,
         archive_resource_id: CanonicalArchiveResourceId,
         shadow: VerifiedShadowProjection,
         preparation: PreparationId,
@@ -3092,17 +3392,17 @@ mod bounded_admission {
             let backup = verify_migration_source_backup(&roots, &prepared, &verified).unwrap();
             let runtime =
                 ApplicationRuntimeRoot::open_for_test(&root.path().join("runtime")).unwrap();
-            // The inactive bootstrap database is opened through the retained
-            // workspace lease's applier slot, so this fixture's promotion is the
-            // production bootstrap -> promoted handoff rather than a
-            // release-and-reacquire.
-            let (sqlite, sqlite_proof) = open_leased_bootstrap_projection(
+            // The one production inactive-bootstrap open: the workspace lease
+            // and the database it authorized are one value, and the promotion
+            // below can only reach phase two through it.
+            let sqlite = InactiveBootstrapRuntimeSession::open(
                 &archive_root,
                 workspace,
                 &root.path().join("bootstrap.sqlite"),
                 &runtime,
                 &authority,
-            );
+            )
+            .expect("inactive bootstrap runtime session");
             let archive_resource_id = authority
                 .store()
                 .provision_enrolled_archive_resource_id()
@@ -3115,7 +3415,7 @@ mod bounded_admission {
                 &backup,
                 &authority,
                 sqlite.projection(),
-                &sqlite_proof,
+                sqlite.sqlite_proof(),
             )
             .unwrap();
 
@@ -3134,7 +3434,6 @@ mod bounded_admission {
                 roots,
                 backup,
                 sqlite: Some(sqlite),
-                sqlite_proof,
                 archive_resource_id,
                 shadow,
                 preparation: PreparationId::new(),
@@ -3142,20 +3441,23 @@ mod bounded_admission {
             }
         }
 
-        fn sqlite(&self) -> &OpenProjection {
+        fn bootstrap(&self) -> &InactiveBootstrapRuntimeSession {
             self.sqlite
                 .as_ref()
                 .expect("retained inactive bootstrap projection")
-                .projection()
         }
 
-        /// Close the inactive bootstrap database and keep its archive-rooted
-        /// workspace lease, which the promoted open then adopts.
-        fn take_bootstrap_workspace_lease(&mut self) -> WorkspaceRuntimeLease {
+        fn sqlite(&self) -> &OpenProjection {
+            self.bootstrap().projection()
+        }
+
+        /// Take the production inactive-bootstrap session out of the fixture.
+        /// Phase two of promotion runs on its own retained lease, so the
+        /// workspace lock is never released between the two databases.
+        fn take_bootstrap_session(&mut self) -> InactiveBootstrapRuntimeSession {
             self.sqlite
                 .take()
                 .expect("retained inactive bootstrap projection")
-                .close_retaining_lease()
         }
 
         fn proofs(&self) -> VerifiedLocalProofSet<'_> {
@@ -3167,7 +3469,7 @@ mod bounded_admission {
                 source_backup: &self.backup,
                 accepted_authority: &self.authority,
                 sqlite: self.sqlite(),
-                sqlite_projection: &self.sqlite_proof,
+                sqlite_projection: self.bootstrap().sqlite_proof(),
                 shadow_projection: &self.shadow,
             }
         }
@@ -3286,14 +3588,11 @@ mod bounded_admission {
         let sealed =
             seal_local_runtime_promotion(&authority, &fixture.proofs(), &fixture.runtime())
                 .unwrap();
-        let lease = fixture.take_bootstrap_workspace_lease();
-        let runtime = open_promoted_local_runtime(
-            sealed,
-            &authority,
-            &paths.open(fixture),
-            PromotedWorkspaceAuthority::Retained(lease),
-        )
-        .unwrap();
+        let bootstrap = fixture.take_bootstrap_session();
+        let runtime = bootstrap
+            .promote(sealed, &authority, &paths.open(fixture))
+            .map_err(|refusal| refusal.into_parts().1)
+            .unwrap();
         (authority, runtime)
     }
 

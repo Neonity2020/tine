@@ -2095,9 +2095,9 @@ pub(crate) struct LeasedSqliteFrontier<'lease> {
     slot: SqliteApplierSlot<'lease>,
 }
 
-// Both accessors serve the bootstrap-side leased open, whose production caller
-// arrives with the migration/activation wiring; the promotion fixtures and the
-// applier-slot handoff regression exercise them today.
+// The owning `LeasedWorkspaceProjection` is what activation uses; these two
+// accessors serve the borrowed shape, which today only the applier-slot handoff
+// regression exercises directly.
 #[allow(dead_code)]
 impl<'lease> LeasedSqliteFrontier<'lease> {
     pub(crate) const fn database(&self) -> &SqliteFrontier {
@@ -2277,12 +2277,10 @@ impl SqliteFrontier {
     /// it to the opened database, so the retained workspace lease is never
     /// released between this database and the next one opened from the same
     /// slot.
-    // The promoted runtime already opens its own database through the leased
-    // entry point below. This bootstrap-side twin is exercised by the promotion
-    // fixtures, which is what proves the bootstrap -> promoted handoff; its
-    // production caller arrives with the migration/activation wiring that owns
-    // the inactive bootstrap open.
-    #[allow(dead_code)]
+    // This is the entry point `local_active::InactiveBootstrapRuntimeSession`
+    // uses, and therefore the one every activation takes. The compatibility twin
+    // above survives only for SQLite-level tests that open a bootstrap database
+    // and never promote it.
     pub(crate) fn open_or_rebuild_inactive_bootstrap_with_applier_slot<'lease>(
         path: &Path,
         application_runtime_root: &ApplicationRuntimeRoot,
@@ -6204,6 +6202,9 @@ fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
 /// [`WorkspaceRuntimeLease::applier_slot`] on a lease that holds the
 /// archive-rooted workspace lock right now.
 mod applier_lease {
+    // `unlock` resolves to the inherent `std::fs::File` method; the fs2 trait is
+    // only still needed for the test-only contention probe below.
+    #[cfg(test)]
     use fs2::FileExt as _;
 
     use super::super::object_store::sync_dir_required;
@@ -6224,8 +6225,27 @@ mod applier_lease {
     /// archive directory rather than device-local app data, two processes with
     /// different XDG, HOME, or Flatpak roots still contend on the same physical
     /// lock file. A clean drop or process termination releases the OS lock; the
-    /// small lock file itself remains only as diagnostic metadata and never decides
-    /// ownership by its contents.
+    /// lock file itself never decides ownership by its contents.
+    ///
+    /// # Why the lock file is empty and never rewritten
+    ///
+    /// The lease file lives *inside the archive*, which in the supported
+    /// multi-device configuration is a Syncthing/Dropbox-replicated directory.
+    /// The OS lock is an inode-scoped `flock`: if a sync provider replaces the
+    /// file (write-temp-then-rename, conflict resolution, or a restore), a
+    /// later local process opening the same *name* gets a different inode and
+    /// its `flock` succeeds while this process still holds the old one — two
+    /// local runtimes would each believe they own the workspace. Providers
+    /// replace a file only when its bytes change, so this lease writes none:
+    /// the file is created empty through `O_CREAT` without `O_TRUNC` and is
+    /// never truncated, written, or `fsync`ed afterwards. Every device's copy
+    /// is therefore byte-identical and content-stable for the archive's whole
+    /// life, so there is nothing to replicate, no conflict copy to create from
+    /// a content divergence, and no reason for the local inode to be swapped.
+    /// Diagnostics that used to live in these bytes (pid, platform) are exactly
+    /// the device-varying content that made the file replicable, so they are
+    /// deliberately absent. A provider that creates *sibling* conflict files is
+    /// tolerated: this code opens one exact name.
     pub(crate) struct WorkspaceRuntimeLease {
         file: File,
         workspace_id: WorkspaceId,
@@ -6274,7 +6294,7 @@ mod applier_lease {
                 .join(SQLITE_WORKSPACE_LEASE_NAMESPACE)
                 .join(&workspace_name)
                 .join(SQLITE_APPLIER_LEASE_FILE);
-            let mut file = lock_capability_lease_file(
+            let file = lock_capability_lease_file(
                 &workspace_root,
                 SQLITE_APPLIER_LEASE_FILE,
                 &lease_path,
@@ -6282,16 +6302,9 @@ mod applier_lease {
             #[cfg(test)]
             WORKSPACE_RUNTIME_LEASE_ACQUISITIONS
                 .with(|count| count.set(count.get().saturating_add(1)));
-            file.set_len(0)?;
-            file.seek(SeekFrom::Start(0))?;
-            writeln!(
-                file,
-                "workspace={}\npid={}\nplatform={}",
-                workspace_id,
-                std::process::id(),
-                std::env::consts::OS
-            )?;
-            file.sync_all()?;
+            // Deliberately no truncate, no write, no `sync_all`: see the type's
+            // "Why the lock file is empty and never rewritten" section. Only the
+            // directory entry needs to be durable.
             sync_dir_required(&workspace_root)
                 .map_err(|error| ProjectionError::Io(error.to_string()))?;
             Ok(Self {
@@ -6338,6 +6351,82 @@ mod applier_lease {
     impl Drop for WorkspaceRuntimeLease {
         fn drop(&mut self) {
             let _ = self.file.unlock();
+            #[cfg(test)]
+            record_applier_lock_release(|| ApplierLockRelease::Workspace);
+        }
+    }
+
+    /// One observed applier-lock release, in the order it actually happened.
+    ///
+    /// This exists so the declared field order of [`LeasedWorkspaceProjection`]
+    /// has a receipt instead of a comment: an inverted order is observable
+    /// here, and the boolean records the security-relevant fact directly.
+    #[cfg(test)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) enum ApplierLockRelease {
+        /// The database-adjacent applier lock was released.
+        ///
+        /// `workspace_still_contended` is measured at that exact instant, from
+        /// an independent open of the archive lock file: while a database
+        /// applier is being torn down, no other process — under any app-data
+        /// root — may be able to take the archive.
+        Database { workspace_still_contended: bool },
+        /// The archive-rooted workspace lock was released.
+        Workspace,
+    }
+
+    #[cfg(test)]
+    thread_local! {
+        static APPLIER_LOCK_RELEASES: std::cell::RefCell<Option<Vec<ApplierLockRelease>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Run `body` while recording applier-lock releases on this thread.
+    ///
+    /// Recording is per-thread and off by default, so the probe below costs
+    /// nothing outside the tests that ask for it.
+    #[cfg(test)]
+    pub(crate) fn recorded_applier_lock_releases<T>(
+        body: impl FnOnce() -> T,
+    ) -> (T, Vec<ApplierLockRelease>) {
+        APPLIER_LOCK_RELEASES.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
+        let value = body();
+        let releases = APPLIER_LOCK_RELEASES
+            .with(|slot| slot.borrow_mut().take())
+            .unwrap_or_default();
+        (value, releases)
+    }
+
+    #[cfg(test)]
+    fn record_applier_lock_release(event: impl FnOnce() -> ApplierLockRelease) {
+        let recording = APPLIER_LOCK_RELEASES.with(|slot| slot.borrow().is_some());
+        if !recording {
+            return;
+        }
+        let event = event();
+        APPLIER_LOCK_RELEASES.with(|slot| {
+            if let Some(releases) = slot.borrow_mut().as_mut() {
+                releases.push(event);
+            }
+        });
+    }
+
+    /// Is the archive workspace lock held by *someone* right now?
+    ///
+    /// `flock` is scoped to an open file description, so a second open in this
+    /// same process contends with a live lease exactly as another process
+    /// would. A missing file counts as uncontended.
+    #[cfg(test)]
+    pub(crate) fn workspace_lock_is_contended(path: &Path) -> bool {
+        let Ok(file) = File::options().read(true).write(true).open(path) else {
+            return false;
+        };
+        match file.try_lock_exclusive() {
+            Ok(()) => {
+                let _ = file.unlock();
+                false
+            }
+            Err(_) => true,
         }
     }
 
@@ -6401,6 +6490,10 @@ mod applier_lease {
     /// applier can exist only under a live archive-rooted workspace lease.
     struct DatabaseApplierLease {
         file: File,
+        /// The archive lock this database applier was authorized by, so its
+        /// release can be observed against a live workspace lease.
+        #[cfg(test)]
+        workspace_lease_path: PathBuf,
     }
 
     impl DatabaseApplierLease {
@@ -6435,13 +6528,21 @@ mod applier_lease {
                 database_lease_name,
                 &database_lease_path,
             )?;
-            Ok(Self { file })
+            Ok(Self {
+                file,
+                #[cfg(test)]
+                workspace_lease_path: slot.lease.lease_path.clone(),
+            })
         }
     }
 
     impl Drop for DatabaseApplierLease {
         fn drop(&mut self) {
             let _ = self.file.unlock();
+            #[cfg(test)]
+            record_applier_lock_release(|| ApplierLockRelease::Database {
+                workspace_still_contended: workspace_lock_is_contended(&self.workspace_lease_path),
+            });
         }
     }
 
@@ -6542,12 +6643,16 @@ mod applier_lease {
     ///   second database, can ever be vended while a projection is held;
     /// * the declared field order is load bearing: the projection (and its
     ///   database-adjacent lock) drops before the workspace lease, so a drop or an
-    ///   unwind releases the two locks in the same order the acquisition took
-    ///   them;
-    /// * [`Self::close_retaining_lease`] and [`Self::reopen_under_same_lease`]
-    ///   are the only ways to reach the lease again, and both require the
-    ///   projection to be closed first, which is exactly the bootstrap ->
-    ///   promoted database handoff without an instant of released workspace lock.
+    ///   unwind releases the two locks in the reverse of the acquisition order and
+    ///   the archive stays contended for as long as this process still has a
+    ///   database applier alive. That order is not left to a comment:
+    ///   `a_leased_workspace_projection_releases_the_database_lock_before_the_workspace_lease`
+    ///   observes both releases and asserts the archive was still contended at
+    ///   the instant the database lock went away;
+    /// * [`Self::close_retaining_lease`] is the only way to reach the lease
+    ///   again, and it requires the projection to be closed first, which is
+    ///   exactly the bootstrap -> promoted database handoff without an instant
+    ///   of released workspace lock.
     pub(crate) struct LeasedWorkspaceProjection {
         projection: OpenProjection,
         lease: WorkspaceRuntimeLease,
@@ -6590,17 +6695,12 @@ mod applier_lease {
 
         /// Close the database and keep the workspace lease.
         ///
-        // The promoted runtime holds its projection for its whole life, so the
-        // only current caller is the bootstrap -> promoted handoff in the
-        // promotion fixtures; its production caller arrives with the
-        // migration/activation wiring that owns the inactive bootstrap open.
-        ///
         /// The workspace lock is a distinct OS handle from the database-adjacent
         /// lock and is never touched here, so there is no instant between this
         /// database and the next one opened from the returned lease in which
         /// another process — under any app-data or XDG root — could acquire this
-        /// archive's workspace lease.
-        #[allow(dead_code)]
+        /// archive's workspace lease. `local_active::InactiveBootstrapRuntimeSession::promote`
+        /// is the caller: it is the bootstrap -> promoted database handoff.
         pub(crate) fn close_retaining_lease(self) -> WorkspaceRuntimeLease {
             let Self { projection, lease } = self;
             drop(projection);
@@ -6674,6 +6774,10 @@ mod applier_lease {
     }
 }
 
+#[cfg(test)]
+pub(crate) use applier_lease::{
+    recorded_applier_lock_releases, workspace_lock_is_contended, ApplierLockRelease,
+};
 use applier_lease::{ApplierAuthorization, HeldApplierLocks};
 pub(crate) use applier_lease::{
     LeasedWorkspaceProjection, SqliteApplierSlot, WorkspaceRuntimeLease, WorkspaceRuntimeProof,
@@ -12910,6 +13014,214 @@ mod tests {
         ));
         drop(lease);
         drop(WorkspaceRuntimeLease::acquire(&store, ids.workspace).unwrap());
+    }
+
+    fn workspace_lease_path(archive_root: &Path, workspace: WorkspaceId) -> PathBuf {
+        archive_root
+            .join(OBJECT_STORE_LEASE_NAMESPACE)
+            .join(SQLITE_WORKSPACE_LEASE_NAMESPACE)
+            .join(workspace.to_string())
+            .join(SQLITE_APPLIER_LEASE_FILE)
+    }
+
+    fn open_leased_projection(
+        lease: WorkspaceRuntimeLease,
+        database_path: &Path,
+        runtime: &ApplicationRuntimeRoot,
+        ids: TestIds,
+        engine: &ShardedHotEngine,
+        store: &ObjectStore,
+    ) -> LeasedWorkspaceProjection {
+        LeasedWorkspaceProjection::open_under::<(), ProjectionError>(lease, |slot| {
+            SqliteFrontier::open_or_rebuild_with_applier_slot(
+                database_path,
+                runtime,
+                ids.claim(),
+                RebuildSource::new(engine, store).unwrap(),
+                slot,
+            )
+            .map(|opened| (opened, ()))
+        })
+        .map_err(|(_lease, error)| error)
+        .expect("leased projection")
+        .0
+    }
+
+    /// The declared field order of `LeasedWorkspaceProjection` is the whole
+    /// reason a *different* application-data profile cannot take the archive
+    /// while this process still has a live database applier. Assert the two
+    /// releases in the order they happen, and assert directly that the archive
+    /// was still contended at the instant the database lock went away.
+    ///
+    /// Inverting the field order flips both halves of this oracle.
+    #[test]
+    fn a_leased_workspace_projection_releases_the_database_lock_before_the_workspace_lease() {
+        let ids = TestIds::new(8_900);
+        let dir = TestDir::new("leased-projection-drop-order");
+        let store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
+        let runtime = ApplicationRuntimeRoot::open_for_test(&dir.path().join("runtime")).unwrap();
+        let engine = ids.engine();
+
+        let lease = WorkspaceRuntimeLease::acquire(&store, ids.workspace).unwrap();
+        let projection = open_leased_projection(
+            lease,
+            &dir.path().join("own.sqlite"),
+            &runtime,
+            ids,
+            &engine,
+            &store,
+        );
+
+        let ((), releases) = recorded_applier_lock_releases(|| drop(projection));
+        assert_eq!(
+            releases,
+            vec![
+                ApplierLockRelease::Database {
+                    workspace_still_contended: true
+                },
+                ApplierLockRelease::Workspace,
+            ],
+            "the database applier must be torn down while this process still owns the archive"
+        );
+        drop(WorkspaceRuntimeLease::acquire(&store, ids.workspace).unwrap());
+    }
+
+    /// The bootstrap -> promoted database handoff, measured at the lock layer:
+    /// closing the database emits exactly one release — the database-adjacent
+    /// one — and the archive stays contended straight through into the next
+    /// database opened from the same retained lease.
+    #[test]
+    fn closing_a_leased_workspace_projection_retains_workspace_contention_through_the_handoff() {
+        let ids = TestIds::new(9_000);
+        let dir = TestDir::new("leased-projection-handoff-order");
+        let archive_root = dir.path().join("objects");
+        let store = ObjectStore::open(&archive_root, ids.workspace).unwrap();
+        let runtime = ApplicationRuntimeRoot::open_for_test(&dir.path().join("runtime")).unwrap();
+        let engine = ids.engine();
+        let lease_path = workspace_lease_path(&archive_root, ids.workspace);
+
+        let lease = WorkspaceRuntimeLease::acquire(&store, ids.workspace).unwrap();
+        let bootstrap = open_leased_projection(
+            lease,
+            &dir.path().join("bootstrap.sqlite"),
+            &runtime,
+            ids,
+            &engine,
+            &store,
+        );
+
+        let (lease, releases) =
+            recorded_applier_lock_releases(|| bootstrap.close_retaining_lease());
+        assert_eq!(
+            releases,
+            vec![ApplierLockRelease::Database {
+                workspace_still_contended: true
+            }],
+            "closing the bootstrap database must not release the archive"
+        );
+        // The database-adjacent lock really is free now, and the archive really
+        // is not.
+        assert!(workspace_lock_is_contended(&lease_path));
+        assert!(matches!(
+            WorkspaceRuntimeLease::acquire(&store, ids.workspace),
+            Err(ProjectionError::LeaseContended(_))
+        ));
+
+        let promoted = open_leased_projection(
+            lease,
+            &dir.path().join("promoted.sqlite"),
+            &runtime,
+            ids,
+            &engine,
+            &store,
+        );
+        let ((), releases) = recorded_applier_lock_releases(|| drop(promoted));
+        assert_eq!(
+            releases,
+            vec![
+                ApplierLockRelease::Database {
+                    workspace_still_contended: true
+                },
+                ApplierLockRelease::Workspace,
+            ]
+        );
+        assert!(!workspace_lock_is_contended(&lease_path));
+    }
+
+    /// The workspace lease file lives *inside* the archive, which the supported
+    /// multi-device configuration replicates through Syncthing/Dropbox. An
+    /// inode-scoped `flock` survives that only if no provider ever has a reason
+    /// to replace the file, so the file must be created empty and never written
+    /// again — no pid, no platform, no acquisition timestamp.
+    #[test]
+    fn the_workspace_lock_file_is_empty_and_no_acquisition_ever_rewrites_it() {
+        let ids = TestIds::new(9_100);
+        let dir = TestDir::new("workspace-lock-bytes");
+        let archive_root = dir.path().join("objects");
+        let store = ObjectStore::open(&archive_root, ids.workspace).unwrap();
+        let lease_path = workspace_lease_path(&archive_root, ids.workspace);
+
+        let lease = WorkspaceRuntimeLease::acquire(&store, ids.workspace).unwrap();
+        assert!(fs::read(&lease_path).unwrap().is_empty());
+        let first = fs::metadata(&lease_path).unwrap();
+        drop(lease);
+
+        // A second acquisition — the case a provider would see as a change —
+        // leaves the bytes and the modification time exactly as they were, so
+        // there is nothing to replicate and no conflict to resolve.
+        let lease = WorkspaceRuntimeLease::acquire(&store, ids.workspace).unwrap();
+        let second = fs::metadata(&lease_path).unwrap();
+        assert!(fs::read(&lease_path).unwrap().is_empty());
+        assert_eq!(second.len(), 0);
+        assert_eq!(first.len(), second.len());
+        assert_eq!(first.modified().unwrap(), second.modified().unwrap());
+
+        // A provider's conflict copy is a *sibling*; ownership is decided by one
+        // exact name, so the extra file changes nothing.
+        let conflict =
+            lease_path.with_file_name("sqlite-applier.sync-conflict-20260101-000000-AAAAAAA.lock");
+        fs::write(&conflict, b"someone else's copy").unwrap();
+        assert!(matches!(
+            WorkspaceRuntimeLease::acquire(&store, ids.workspace),
+            Err(ProjectionError::LeaseContended(_))
+        ));
+        drop(lease);
+        drop(WorkspaceRuntimeLease::acquire(&store, ids.workspace).unwrap());
+        assert_eq!(fs::read(&conflict).unwrap(), b"someone else's copy");
+    }
+
+    /// Characterization, deliberately asserting the *residual*: if a sync
+    /// provider ever did replace this file, the local lock would split, because
+    /// `flock` follows the inode and not the name. Nothing in this crate can
+    /// prevent that from the outside; what it can do — and
+    /// `the_workspace_lock_file_is_empty_and_no_acquisition_ever_rewrites_it`
+    /// proves it does — is never give a provider a content change to propagate.
+    /// If this test ever starts failing, the lock acquired a replacement
+    /// defense and this residual should be re-stated rather than grandfathered.
+    #[test]
+    fn replacing_the_workspace_lock_file_out_of_band_splits_the_local_lock() {
+        let ids = TestIds::new(9_200);
+        let dir = TestDir::new("workspace-lock-replacement");
+        let archive_root = dir.path().join("objects");
+        let store = ObjectStore::open(&archive_root, ids.workspace).unwrap();
+        let lease_path = workspace_lease_path(&archive_root, ids.workspace);
+
+        let held = WorkspaceRuntimeLease::acquire(&store, ids.workspace).unwrap();
+        assert!(matches!(
+            WorkspaceRuntimeLease::acquire(&store, ids.workspace),
+            Err(ProjectionError::LeaseContended(_))
+        ));
+
+        // Exactly what a provider does when it lands a new version: write a
+        // temporary file beside the target and rename it over the name.
+        let incoming = lease_path.with_extension("lock.incoming");
+        fs::write(&incoming, b"").unwrap();
+        fs::rename(&incoming, &lease_path).unwrap();
+
+        let split = WorkspaceRuntimeLease::acquire(&store, ids.workspace)
+            .expect("the residual this test documents: a replaced inode is a second lock");
+        drop(split);
+        drop(held);
     }
 
     /// A pipe-coordinated child that reports, on demand, whether it can take
