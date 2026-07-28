@@ -2466,13 +2466,21 @@ fn local_batches_extend_the_bootstrap_anchor_and_restart_proves_exact_ancestry()
         runtime.engine().durable_history_authority().unwrap(),
         advanced
     );
-    assert_eq!(
-        runtime.engine().accepted_frontier_root().unwrap(),
-        advanced_frontier
+    assert!(
+        runtime
+            .engine()
+            .accepted_frontier_root()
+            .unwrap()
+            .same_accepted_authority(&advanced_frontier),
+        "an adopted run may relocate the scratch page but must retain the exact accepted authority"
     );
-    assert_eq!(
-        runtime.database().frontier_root().unwrap(),
-        advanced_frontier
+    assert!(
+        runtime
+            .database()
+            .frontier_root()
+            .unwrap()
+            .same_accepted_authority(&advanced_frontier),
+        "SQLite must reopen the exact accepted authority"
     );
 
     // One more mutation is admitted after the restart.
@@ -3283,6 +3291,7 @@ fn promoted_recovery_streams_exactly_one_bootstrap_part_at_a_time() {
     // residency bound must hold on that path too.
     drop(runtime);
     drop(authority);
+    remove_every_resume_point(&fixture.archive_root);
     let (_reopened_authority, reopened) =
         reopen_promoted_local_runtime(&root, &binding, session, &paths.open(&fixture)).unwrap();
     let fresh_process = reopened.engine().bootstrap_recovery_instrumentation();
@@ -3316,49 +3325,51 @@ fn promoted_recovery_streams_exactly_one_bootstrap_part_at_a_time() {
 /// covers that — so what changed is that authoring no longer uses it at all.
 #[test]
 fn a_bootstrap_one_block_past_the_old_claim_cap_promotes_and_reopens() {
-    let blocks = MAX_EPHEMERAL_BLOCK_CLAIMS + 1;
-    let mut source = String::new();
-    for ordinal in 0..blocks {
-        source.push_str(&format!("- claim {ordinal:05}\n"));
-    }
-    let mut fixture = Fixture::new(
-        "promote-claim-cap",
-        None,
-        vec![("pages/claims.md".into(), source.into_bytes())],
-    );
-    let root = fixture.enrollment_root("promote-claim-cap");
-    let binding = fixture.enrollment_binding();
-    let paths = PromotedPaths::new(&fixture, "claim-cap");
-    let session = SessionId::new();
+    on_a_deep_stack(|| {
+        let blocks = MAX_EPHEMERAL_BLOCK_CLAIMS + 1;
+        let mut source = String::new();
+        for ordinal in 0..blocks {
+            source.push_str(&format!("- claim {ordinal:05}\n"));
+        }
+        let mut fixture = Fixture::new(
+            "promote-claim-cap",
+            None,
+            vec![("pages/claims.md".into(), source.into_bytes())],
+        );
+        let root = fixture.enrollment_root("promote-claim-cap");
+        let binding = fixture.enrollment_binding();
+        let paths = PromotedPaths::new(&fixture, "claim-cap");
+        let session = SessionId::new();
 
-    let (authority, runtime) = promote(&mut fixture, &root, session, &paths);
-    let frontier = runtime.engine().accepted_frontier_root().unwrap();
-    // The cap is removed, not raised: the promoted engine holds its claims in
-    // the scratch-backed point index, so the bounded map stays empty.
-    assert_eq!(
-        runtime.engine().instrumentation().block_claim_hot_entries,
-        0,
-        "a store-backed engine must hold no ephemeral block claims"
-    );
-    assert!(runtime
-        .database()
-        .frontier_root()
-        .unwrap()
-        .same_accepted_authority(&frontier));
-    drop(runtime);
-    drop(authority);
+        let (authority, runtime) = promote(&mut fixture, &root, session, &paths);
+        let frontier = runtime.engine().accepted_frontier_root().unwrap();
+        // The cap is removed, not raised: the promoted engine holds its claims in
+        // the scratch-backed point index, so the bounded map stays empty.
+        assert_eq!(
+            runtime.engine().instrumentation().block_claim_hot_entries,
+            0,
+            "a store-backed engine must hold no ephemeral block claims"
+        );
+        assert!(runtime
+            .database()
+            .frontier_root()
+            .unwrap()
+            .same_accepted_authority(&frontier));
+        drop(runtime);
+        drop(authority);
 
-    let (_reopened_authority, reopened) =
-        reopen_promoted_local_runtime(&root, &binding, session, &paths.open(&fixture)).unwrap();
-    assert_eq!(
-        reopened.engine().instrumentation().block_claim_hot_entries,
-        0
-    );
-    assert_eq!(
-        reopened.engine().accepted_frontier_root().unwrap(),
-        frontier
-    );
-    fixture.assert_graph_unchanged();
+        let (_reopened_authority, reopened) =
+            reopen_promoted_local_runtime(&root, &binding, session, &paths.open(&fixture)).unwrap();
+        assert_eq!(
+            reopened.engine().instrumentation().block_claim_hot_entries,
+            0
+        );
+        assert_eq!(
+            reopened.engine().accepted_frontier_root().unwrap(),
+            frontier
+        );
+        fixture.assert_graph_unchanged();
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -4907,6 +4918,72 @@ fn a_transient_lease_identity_check_failure_is_retryable_without_self_healing_re
     fixture.assert_graph_unchanged();
 }
 
+#[test]
+fn a_missing_workspace_lease_path_latches_terminally_after_a_retryable_check_failure() {
+    on_a_deep_stack(|| {
+        let mut fixture = Fixture::new(
+            "lease-missing-sticky",
+            None,
+            vec![("pages/missing.md".into(), b"- missing\n".to_vec())],
+        );
+        let root = fixture.enrollment_root("lease-missing-sticky");
+        let paths = PromotedPaths::new(&fixture, "lease-missing-sticky");
+        let (mut authority, mut runtime) = promote(&mut fixture, &root, SessionId::new(), &paths);
+
+        fail_next_workspace_lease_identity_check();
+        let Err(unavailable) =
+            runtime.admit_promoted_mutation_at_full_depth_for_test(&mut authority, &fixture.graph)
+        else {
+            panic!("the injected inconclusive check must refuse once");
+        };
+        assert!(matches!(
+            unavailable,
+            RuntimePromotionError::WorkspaceAuthorityCheckUnavailable(_)
+        ));
+        assert_eq!(runtime.workspace_authority_revocation(), None);
+
+        let lease_path = workspace_lease_path(&fixture.archive_root, fixture.workspace);
+        fs::remove_file(&lease_path).unwrap();
+        let Err(terminal) =
+            runtime.admit_promoted_mutation_at_full_depth_for_test(&mut authority, &fixture.graph)
+        else {
+            panic!("a missing final lease entry positively proves authority loss");
+        };
+        assert!(matches!(
+            &terminal,
+            RuntimePromotionError::WorkspaceAuthorityRevoked(refusal)
+                if matches!(
+                    refusal.cause(),
+                    ProjectionError::LeaseIdentityReplaced(_)
+                )
+        ));
+        let revocation = runtime
+            .workspace_authority_revocation()
+            .expect("the missing pathname must latch terminal revocation");
+
+        // Neither recreating the final entry nor injecting another transient check
+        // can revive authority carried from before the deletion.
+        fs::write(&lease_path, b"").unwrap();
+        fail_next_workspace_lease_identity_check();
+        for attempt in 0..4 {
+            let Err(error) = runtime.admit_promoted_mutation(&mut authority, &fixture.graph) else {
+                panic!("terminal lease loss must reject every later admission");
+            };
+            assert!(matches!(
+                error,
+                RuntimePromotionError::WorkspaceAuthorityRevoked(refusal)
+                    if refusal.revocation() == Some(&revocation)
+            ));
+            assert_eq!(
+                runtime.workspace_authority_revocation(),
+                Some(revocation.clone()),
+                "attempt {attempt} changed the sticky cause"
+            );
+        }
+        fixture.assert_graph_unchanged();
+    });
+}
+
 /// The immutable published surface of one archive: exactly the batch manifests
 /// and content-addressed objects `publish_prepared` writes.
 ///
@@ -5682,86 +5759,89 @@ fn the_takeover_workspace_and_anchor_guards_each_refuse_directly() {
 /// writable runtime still leaves the new session `Unsafe`.
 #[test]
 fn a_clean_safe_restart_adopts_a_new_session_under_one_retained_lease() {
-    let mut fixture = Fixture::new(
-        "takeover-safe",
-        None,
-        vec![("pages/safe.md".into(), b"- safe\n".to_vec())],
-    );
-    let root = fixture.enrollment_root("takeover-safe");
-    let binding = fixture.enrollment_binding();
-    let paths = PromotedPaths::new(&fixture, "safe");
-    let first = SessionId::new();
-    let (verification_digest, frontier) = {
-        let (mut authority, mut runtime) = promote(&mut fixture, &root, first, &paths);
-        let frontier = runtime.engine().accepted_frontier_root().unwrap();
-        let permit = runtime
-            .quiesce_and_mark_safe_without_watcher_dependency_for_test(
-                &mut authority,
-                &fixture.graph,
-            )
-            .expect("a fully drained promoted runtime records a clean handoff");
-        assert_eq!(permit.session_id(), first);
-        (authority.verification_digest(), frontier)
-    };
-    assert_eq!(
-        committed_handoff(&root, &binding, verification_digest),
-        LocalActiveHandoff::Safe,
-        "a proved drain records a clean handoff"
-    );
-
-    // A crash takeover is not what a clean restart needs, and it must not be
-    // what a clean restart silently performs either.
-    let second = SessionId::new();
-    let before = PromotedRuntimeInstrumentation::capture();
-    {
-        let (mut authority, mut runtime) =
-            reopen_promoted_local_runtime(&root, &binding, second, &paths.open(&fixture)).unwrap();
-        let opened = before.since();
-        assert_eq!(
-            opened.workspace_lease_acquisitions, 1,
-            "one restart takes exactly one archive-rooted workspace lease"
+    on_a_deep_stack(|| {
+        let mut fixture = Fixture::new(
+            "takeover-safe",
+            None,
+            vec![("pages/safe.md".into(), b"- safe\n".to_vec())],
         );
-        assert_eq!(runtime.recovery(), RuntimeRecoveryState::AdoptedSafeHandoff);
-        assert_eq!(
-            runtime.automatic_external_import(),
-            ExternalImportAdmission::Allowed,
-            "only a proved clean handoff may unblock automatic external import"
-        );
-        assert_eq!(runtime.engine().accepted_frontier_root().unwrap(), frontier);
+        let root = fixture.enrollment_root("takeover-safe");
+        let binding = fixture.enrollment_binding();
+        let paths = PromotedPaths::new(&fixture, "safe");
+        let first = SessionId::new();
+        let (verification_digest, frontier) = {
+            let (mut authority, mut runtime) = promote(&mut fixture, &root, first, &paths);
+            let frontier = runtime.engine().accepted_frontier_root().unwrap();
+            let permit = runtime
+                .quiesce_and_mark_safe_without_watcher_dependency_for_test(
+                    &mut authority,
+                    &fixture.graph,
+                )
+                .expect("a fully drained promoted runtime records a clean handoff");
+            assert_eq!(permit.session_id(), first);
+            (authority.verification_digest(), frontier)
+        };
         assert_eq!(
             committed_handoff(&root, &binding, verification_digest),
-            LocalActiveHandoff::Unsafe { session_id: second },
-            "the runtime is unsafe again the moment it is writable"
+            LocalActiveHandoff::Safe,
+            "a proved drain records a clean handoff"
         );
 
-        // Fail-before for the drain proof itself: one accepted local batch
-        // leaves projection work outstanding, and `Safe` is refused for that
-        // exact named drain rather than synthesized.
-        append_local_batch(&fixture, &mut authority, &mut runtime, 0xC700);
-        let error = runtime
-            .quiesce_and_mark_safe_without_watcher_dependency_for_test(
-                &mut authority,
-                &fixture.graph,
-            )
-            .expect_err("an undrained runtime must never record a clean handoff");
-        assert!(
-            matches!(
-                error,
-                SafeHandoffUnavailable::DrainIncomplete {
-                    drain: "projection work",
-                    ..
-                }
-            ),
-            "unexpected drain failure: {error}"
-        );
-    }
+        // A crash takeover is not what a clean restart needs, and it must not be
+        // what a clean restart silently performs either.
+        let second = SessionId::new();
+        let before = PromotedRuntimeInstrumentation::capture();
+        {
+            let (mut authority, mut runtime) =
+                reopen_promoted_local_runtime(&root, &binding, second, &paths.open(&fixture))
+                    .unwrap();
+            let opened = before.since();
+            assert_eq!(
+                opened.workspace_lease_acquisitions, 1,
+                "one restart takes exactly one archive-rooted workspace lease"
+            );
+            assert_eq!(runtime.recovery(), RuntimeRecoveryState::AdoptedSafeHandoff);
+            assert_eq!(
+                runtime.automatic_external_import(),
+                ExternalImportAdmission::Allowed,
+                "only a proved clean handoff may unblock automatic external import"
+            );
+            assert_eq!(runtime.engine().accepted_frontier_root().unwrap(), frontier);
+            assert_eq!(
+                committed_handoff(&root, &binding, verification_digest),
+                LocalActiveHandoff::Unsafe { session_id: second },
+                "the runtime is unsafe again the moment it is writable"
+            );
 
-    // Dropping a writable runtime leaves the new session unsafe.
-    assert_eq!(
-        committed_handoff(&root, &binding, verification_digest),
-        LocalActiveHandoff::Unsafe { session_id: second }
-    );
-    fixture.assert_graph_unchanged();
+            // Fail-before for the drain proof itself: one accepted local batch
+            // leaves projection work outstanding, and `Safe` is refused for that
+            // exact named drain rather than synthesized.
+            append_local_batch(&fixture, &mut authority, &mut runtime, 0xC700);
+            let error = runtime
+                .quiesce_and_mark_safe_without_watcher_dependency_for_test(
+                    &mut authority,
+                    &fixture.graph,
+                )
+                .expect_err("an undrained runtime must never record a clean handoff");
+            assert!(
+                matches!(
+                    error,
+                    SafeHandoffUnavailable::DrainIncomplete {
+                        drain: "projection work",
+                        ..
+                    }
+                ),
+                "unexpected drain failure: {error}"
+            );
+        }
+
+        // Dropping a writable runtime leaves the new session unsafe.
+        assert_eq!(
+            committed_handoff(&root, &binding, verification_digest),
+            LocalActiveHandoff::Unsafe { session_id: second }
+        );
+        fixture.assert_graph_unchanged();
+    });
 }
 
 /// A promoted open that fails after it has taken the workspace lease and the
@@ -5885,6 +5965,15 @@ fn resume_point_bytes(archive_root: &Path) -> BTreeMap<String, Vec<u8>> {
 fn remove_every_resume_point(archive_root: &Path) {
     for name in resume_point_entries(archive_root) {
         fs::remove_file(resume_point_directory(archive_root).join(name)).unwrap();
+    }
+}
+
+fn restore_resume_point_bytes(archive_root: &Path, points: &BTreeMap<String, Vec<u8>>) {
+    remove_every_resume_point(archive_root);
+    let directory = resume_point_directory(archive_root);
+    fs::create_dir_all(&directory).unwrap();
+    for (name, bytes) in points {
+        fs::write(directory.join(name), bytes).unwrap();
     }
 }
 
@@ -6100,14 +6189,18 @@ fn with_taken_over_runtime<T>(
     value
 }
 
-/// Publish this runtime's quiescent resume point and return the sequence plus
-/// the maintenance pass it authorized.
+/// Return this runtime's automatic post-open publication when it succeeded;
+/// otherwise retry through the ordinary later-quiescence publication surface.
 fn publish_expecting_success(
     fixture: &Fixture,
     authority: &LocalActiveAuthority,
     runtime: &mut PromotedLocalRuntime,
 ) -> (u64, RetainedRunMaintenanceReport) {
-    match runtime.publish_quiescent_resume_point(authority, &fixture.graph) {
+    let status = match runtime.resume_publication_status().cloned() {
+        Some(status @ ResumePublicationStatus::Published { .. }) => status,
+        _ => runtime.publish_quiescent_resume_point(authority, &fixture.graph),
+    };
+    match status {
         ResumePublicationStatus::Published {
             resume_sequence,
             maintenance,
@@ -6148,7 +6241,7 @@ fn the_resume_accelerator_publishes_adopts_and_reclaims_across_restarts() {
             &paths,
             session,
             |fixture, authority, runtime| {
-                // (1) Nothing published yet.
+                // (1) The open itself saw no predecessor point and replayed.
                 let opened = runtime.resume_open_status().clone();
                 assert!(
                     opened.retained(),
@@ -6159,10 +6252,13 @@ fn the_resume_accelerator_publishes_adopts_and_reclaims_across_restarts() {
                     opened.unavailable(),
                     Some(&ResumeAcceleratorUnavailable::NeverPublished)
                 );
-                assert_eq!(runtime.resume_publication_status(), None);
-                assert!(resume_point_entries(&fixture.archive_root).is_empty());
-
-                // (2) The quiescent publication.
+                // (2) Before returning the writable runtime, the constructor
+                //     made the report-only quiescent publication unavoidable.
+                assert!(matches!(
+                    runtime.resume_publication_status(),
+                    Some(ResumePublicationStatus::Published { .. })
+                ));
+                assert_eq!(resume_point_entries(&fixture.archive_root).len(), 1);
                 let (sequence, maintenance) =
                     publish_expecting_success(fixture, authority, runtime);
                 assert_eq!(sequence, 1);
@@ -6541,6 +6637,162 @@ fn a_clear_failure_leaves_enrollment_unsafe_and_preserves_the_point_bytes() {
     });
 }
 
+#[test]
+fn lease_replacement_between_initial_safe_validation_and_clear_deletes_nothing() {
+    on_a_deep_stack(|| {
+        let _guard = ResumeLifecycleCutGuard::new();
+        let mut fixture = Fixture::new(
+            "resume-safe-lease-before-clear",
+            None,
+            vec![("pages/before-clear.md".into(), b"- before clear\n".to_vec())],
+        );
+        let root = fixture.enrollment_root("resume-safe-lease-before-clear");
+        let binding = fixture.enrollment_binding();
+        let paths = PromotedPaths::new(&fixture, "resume-safe-lease-before-clear");
+        let session = SessionId::new();
+        let verification_digest = with_promoted_runtime(
+            &mut fixture,
+            &root,
+            &paths,
+            session,
+            |fixture, authority, runtime| {
+                let points_before = resume_point_bytes(&fixture.archive_root);
+                assert_eq!(points_before.len(), 1);
+                let lease_path = workspace_lease_path(&fixture.archive_root, fixture.workspace);
+                act_once_at_resume_lifecycle_cut_for_test(
+                    ResumeLifecycleCut::BeforeSafeClear,
+                    Box::new(move || replace_workspace_lease_file(&lease_path)),
+                );
+                let error = runtime
+                    .quiesce_and_mark_safe(authority, &fixture.graph)
+                    .expect_err("the clear boundary must revalidate the live lease");
+                assert!(matches!(
+                    &error,
+                    SafeHandoffUnavailable::WorkspaceAuthorityRevoked(revocation)
+                        if matches!(
+                            revocation.cause(),
+                            ProjectionError::LeaseIdentityReplaced(_)
+                        )
+                ));
+                assert_eq!(
+                    resume_point_bytes(&fixture.archive_root),
+                    points_before,
+                    "authority loss before clear must delete no point"
+                );
+                assert_eq!(
+                    authority.handoff(),
+                    LocalActiveHandoff::Unsafe {
+                        session_id: session
+                    }
+                );
+                for _ in 0..3 {
+                    let Err(error) = runtime.admit_promoted_mutation(authority, &fixture.graph)
+                    else {
+                        panic!("terminal Safe-boundary loss must reject later admission");
+                    };
+                    assert!(matches!(
+                        error,
+                        RuntimePromotionError::WorkspaceAuthorityRevoked(_)
+                    ));
+                }
+                authority.verification_digest()
+            },
+        );
+        assert_eq!(
+            committed_handoff(&root, &binding, verification_digest),
+            LocalActiveHandoff::Unsafe {
+                session_id: session
+            }
+        );
+        fixture.assert_graph_unchanged();
+    });
+}
+
+#[test]
+fn lease_deletion_after_clear_but_before_safe_stays_unsafe_and_full_replays() {
+    on_a_deep_stack(|| {
+        let _guard = ResumeLifecycleCutGuard::new();
+        let mut fixture = Fixture::new(
+            "resume-safe-lease-after-clear",
+            None,
+            vec![("pages/after-clear.md".into(), b"- after clear\n".to_vec())],
+        );
+        let root = fixture.enrollment_root("resume-safe-lease-after-clear");
+        let binding = fixture.enrollment_binding();
+        let paths = PromotedPaths::new(&fixture, "resume-safe-lease-after-clear");
+        let session = SessionId::new();
+        let verification_digest = with_promoted_runtime(
+            &mut fixture,
+            &root,
+            &paths,
+            session,
+            |fixture, authority, runtime| {
+                assert_eq!(resume_point_entries(&fixture.archive_root).len(), 1);
+                let lease_path = workspace_lease_path(&fixture.archive_root, fixture.workspace);
+                act_once_at_resume_lifecycle_cut_for_test(
+                    ResumeLifecycleCut::AfterSafeClear,
+                    Box::new(move || fs::remove_file(&lease_path).unwrap()),
+                );
+                let error = runtime
+                    .quiesce_and_mark_safe(authority, &fixture.graph)
+                    .expect_err("the durable Safe boundary must revalidate after clear");
+                assert!(matches!(
+                    &error,
+                    SafeHandoffUnavailable::WorkspaceAuthorityRevoked(revocation)
+                        if matches!(
+                            revocation.cause(),
+                            ProjectionError::LeaseIdentityReplaced(_)
+                        )
+                ));
+                assert!(
+                    resume_point_entries(&fixture.archive_root).is_empty(),
+                    "only reconstructible Unsafe points may have been cleared"
+                );
+                assert_eq!(
+                    authority.handoff(),
+                    LocalActiveHandoff::Unsafe {
+                        session_id: session
+                    }
+                );
+                for _ in 0..3 {
+                    let Err(error) = runtime.admit_promoted_mutation(authority, &fixture.graph)
+                    else {
+                        panic!("terminal post-clear loss must reject later admission");
+                    };
+                    assert!(matches!(
+                        error,
+                        RuntimePromotionError::WorkspaceAuthorityRevoked(_)
+                    ));
+                }
+                authority.verification_digest()
+            },
+        );
+        assert_eq!(
+            committed_handoff(&root, &binding, verification_digest),
+            LocalActiveHandoff::Unsafe {
+                session_id: session
+            }
+        );
+
+        with_taken_over_runtime(
+            &fixture,
+            &root,
+            &binding,
+            &paths,
+            SessionId::new(),
+            |_, _, runtime| {
+                assert!(
+                    !runtime.resume_open_status().adopted(),
+                    "clear-before-Safe leaves no point, so recovery must full-replay"
+                );
+                runtime.engine().accepted_frontier_root().unwrap();
+                runtime.database().frontier_root().unwrap();
+            },
+        );
+        fixture.assert_graph_unchanged();
+    });
+}
+
 /// Failures before a Safe point's commit are report-only: the durable Safe
 /// record remains valid, no publication witness exists to authorize
 /// reclamation, and the next clean restart performs an ordinary full replay.
@@ -6793,10 +7045,10 @@ fn safe_transaction_crash_cuts_reopen_only_legal_durable_prefixes() {
     }
 }
 
-/// The facade-facing post-open cut publishes before any mutation admission,
-/// so each crash takeover replaces the predecessor point instead of retaining
-/// another run forever. A later full-replay open can publish from that same
-/// sealed cut and reclaim the now-unreachable predecessor.
+/// Every writable-open constructor publishes before it returns, so no caller
+/// can omit the post-open/pre-first-mutation attempt. Each early crash takeover
+/// therefore replaces the predecessor point instead of retaining another run
+/// forever; the sealed one-shot cut cannot be replayed even after a refusal.
 #[test]
 fn post_open_publication_bounds_crash_takeovers_and_reclaims_the_first_unreachable_run() {
     on_a_deep_stack(|| {
@@ -6816,9 +7068,16 @@ fn post_open_publication_bounds_crash_takeovers_and_reclaims_the_first_unreachab
             SessionId::new(),
             |fixture, authority, runtime| {
                 assert!(matches!(
-                    runtime.publish_post_open_resume_point(authority, &fixture.graph),
-                    ResumePublicationStatus::Published { .. }
+                    runtime.resume_publication_status(),
+                    Some(ResumePublicationStatus::Published { .. })
                 ));
+                assert_eq!(
+                    runtime.publish_post_open_resume_point(authority, &fixture.graph),
+                    ResumePublicationStatus::NotPublished(
+                        ResumePublicationRefusal::EngineNotPublishable
+                    ),
+                    "the constructor must close the one-shot window before returning"
+                );
             },
         );
 
@@ -6835,9 +7094,15 @@ fn post_open_publication_bounds_crash_takeovers_and_reclaims_the_first_unreachab
                         "takeover {attempt} must adopt before its CAS"
                     );
                     assert!(matches!(
-                        runtime.publish_post_open_resume_point(authority, &fixture.graph),
-                        ResumePublicationStatus::Published { .. }
+                        runtime.resume_publication_status(),
+                        Some(ResumePublicationStatus::Published { .. })
                     ));
+                    assert_eq!(
+                        runtime.publish_post_open_resume_point(authority, &fixture.graph),
+                        ResumePublicationStatus::NotPublished(
+                            ResumePublicationRefusal::EngineNotPublishable
+                        )
+                    );
                 },
             );
             assert_eq!(
@@ -6873,8 +7138,21 @@ fn post_open_publication_bounds_crash_takeovers_and_reclaims_the_first_unreachab
                     !runtime.resume_open_status().adopted(),
                     "the torn point must force a fresh retained full replay"
                 );
+                assert!(matches!(
+                    runtime.resume_publication_status(),
+                    Some(ResumePublicationStatus::NotPublished(
+                        ResumePublicationRefusal::Store(_)
+                    ))
+                ));
                 remove_every_resume_point(&fixture.archive_root);
-                let status = runtime.publish_post_open_resume_point(authority, &fixture.graph);
+                assert_eq!(
+                    runtime.publish_post_open_resume_point(authority, &fixture.graph),
+                    ResumePublicationStatus::NotPublished(
+                        ResumePublicationRefusal::EngineNotPublishable
+                    ),
+                    "even a failed automatic attempt permanently closes the one-shot window"
+                );
+                let status = runtime.publish_quiescent_resume_point(authority, &fixture.graph);
                 assert!(
                     matches!(
                         status,
@@ -6998,11 +7276,19 @@ fn a_takeover_publication_supersedes_the_predecessor_point_and_reclaims_its_run(
     on_a_deep_stack(|| {
         let mut world = SupersededPredecessorWorld::new("resume-supersede");
         let predecessor = world.predecessor_run.clone();
-        let (sequence, maintenance) =
-            publish_expecting_success(&world.fixture, &world.authority, &mut world.runtime);
+        let (sequence, maintenance) = match world
+            .runtime
+            .publish_quiescent_resume_point(&world.authority, &world.fixture.graph)
+        {
+            ResumePublicationStatus::Published {
+                resume_sequence,
+                maintenance: Some(maintenance),
+            } => (resume_sequence, maintenance),
+            other => panic!("later quiescence must publish and reclaim: {other:?}"),
+        };
         assert_eq!(
-            sequence, 2,
-            "the successor publication takes the next sequence"
+            sequence, 3,
+            "the later publication follows both automatic post-open attempts"
         );
         assert_eq!(
             maintenance.outcome,
@@ -7056,7 +7342,7 @@ fn losing_the_lease_before_reclamation_deletes_nothing_and_latches() {
         assert_eq!(
             published,
             ResumePublicationStatus::Published {
-                resume_sequence: 2,
+                resume_sequence: 3,
                 maintenance: None,
             },
             "a lost workspace must skip the maintenance pass, not run it"
@@ -7342,6 +7628,14 @@ fn an_injected_publication_failure_never_blocks_the_safe_handoff_and_reclaims_no
             |fixture, authority, runtime| {
                 let runs_before = retained_run_directories(&fixture.archive_root);
                 assert_eq!(runs_before.len(), 1);
+                assert!(
+                    matches!(
+                        runtime.resume_publication_status(),
+                        Some(ResumePublicationStatus::Published { .. })
+                    ),
+                    "the constructor must already have made its report-only attempt"
+                );
+                remove_every_resume_point(&fixture.archive_root);
 
                 // (a) Before the mint: unclassifiable residue makes the endpoint
                 //     binding fail closed. Nothing is published; nothing is removed.
@@ -7541,6 +7835,10 @@ fn ordinary_admissions_do_no_resume_lifecycle_work() {
             |fixture, authority, runtime| {
                 assert!(runtime.resume_open_status().adopted());
                 let opened_before = runtime.resume_open_status().clone();
+                let publication_before = runtime
+                    .resume_publication_status()
+                    .expect("every writable open attempts publication before return")
+                    .clone();
                 let points_before = resume_point_bytes(&fixture.archive_root);
                 let runs_before = retained_run_directories(&fixture.archive_root);
                 let watcher_before = runtime.watcher_status();
@@ -7574,8 +7872,8 @@ fn ordinary_admissions_do_no_resume_lifecycle_work() {
                 );
                 assert_eq!(
                     runtime.resume_publication_status(),
-                    None,
-                    "an admission never publishes"
+                    Some(&publication_before),
+                    "an admission never republishes"
                 );
                 assert_eq!(
                     runtime.watcher_status(),
@@ -7673,11 +7971,12 @@ fn a_crash_takeover_adopts_the_crashed_sessions_published_point() {
 }
 
 /// Candidate selection happens before each takeover CAS, so only the exact
-/// currently crashed predecessor is admissible. Once one takeover commits
-/// without publishing a successor, the older point is refused forever across
-/// later takeover records and every refusal preserves its bytes.
+/// currently crashed predecessor is admissible. Restoring the older recognized
+/// point after each automatic successor publication proves that later
+/// takeovers refuse it at every distance; the unavoidable post-open attempt
+/// then supersedes it only after that refusal and keeps the point set bounded.
 #[test]
-fn a_point_older_than_one_or_more_takeovers_refuses_into_byte_preserving_full_replay() {
+fn a_point_older_than_one_or_more_takeovers_refuses_before_automatic_supersession() {
     on_a_deep_stack(|| {
         let mut fixture = Fixture::new(
             "resume-old-takeover-point",
@@ -7709,11 +8008,20 @@ fn a_point_older_than_one_or_more_takeovers_refuses_into_byte_preserving_full_re
                     runtime.resume_open_status().adopted(),
                     "the exact crashed predecessor remains admissible before the first CAS"
                 );
+                assert!(matches!(
+                    runtime.resume_publication_status(),
+                    Some(ResumePublicationStatus::Published { .. })
+                ));
             },
         );
-        assert_eq!(resume_point_bytes(&fixture.archive_root), original);
+        assert_ne!(
+            resume_point_bytes(&fixture.archive_root),
+            original,
+            "the mandatory attempt publishes the new Unsafe session after adoption"
+        );
 
         for distance in 1..=2 {
+            restore_resume_point_bytes(&fixture.archive_root, &original);
             with_taken_over_runtime(
                 &fixture,
                 &root,
@@ -7725,12 +8033,24 @@ fn a_point_older_than_one_or_more_takeovers_refuses_into_byte_preserving_full_re
                         !runtime.resume_open_status().adopted(),
                         "the point older than {distance} takeover records must full-replay"
                     );
+                    assert!(
+                        matches!(
+                            runtime.resume_publication_status(),
+                            Some(ResumePublicationStatus::Published { .. })
+                        ),
+                        "the refused full replay must still make its automatic report-only attempt"
+                    );
                 },
             );
+            let successor = resume_point_bytes(&fixture.archive_root);
             assert_eq!(
-                resume_point_bytes(&fixture.archive_root),
-                original,
-                "takeover distance {distance} modified refused evidence"
+                successor.len(),
+                1,
+                "automatic publication keeps the point set bounded at distance {distance}"
+            );
+            assert_ne!(
+                successor, original,
+                "only the later automatic publication may supersede the refused evidence"
             );
         }
         fixture.assert_graph_unchanged();
@@ -7738,10 +8058,11 @@ fn a_point_older_than_one_or_more_takeovers_refuses_into_byte_preserving_full_re
 }
 
 /// A Safe-bound point is exact for one clean restart only. After that restart
-/// durably opens its new Unsafe session, the older Safe generation cannot be
-/// reinterpreted as crash evidence and is refused without cleanup side effects.
+/// durably opens and automatically publishes its new Unsafe session, restoring
+/// the older Safe generation proves it cannot be reinterpreted as crash
+/// evidence. The later automatic attempt may supersede it only after refusal.
 #[test]
-fn a_safe_point_older_than_the_clean_restart_refuses_byte_preservingly() {
+fn a_safe_point_older_than_the_clean_restart_refuses_before_automatic_supersession() {
     on_a_deep_stack(|| {
         let mut fixture = Fixture::new(
             "resume-old-safe-point",
@@ -7773,6 +8094,7 @@ fn a_safe_point_older_than_the_clean_restart_refuses_byte_preservingly() {
             SessionId::new(),
             |_, _, runtime| assert!(runtime.resume_open_status().adopted()),
         );
+        restore_resume_point_bytes(&fixture.archive_root, &original);
         with_taken_over_runtime(
             &fixture,
             &root,
@@ -7784,9 +8106,18 @@ fn a_safe_point_older_than_the_clean_restart_refuses_byte_preservingly() {
                     !runtime.resume_open_status().adopted(),
                     "the prior Safe generation is not this crashed Unsafe session"
                 );
+                assert!(matches!(
+                    runtime.resume_publication_status(),
+                    Some(ResumePublicationStatus::Published { .. })
+                ));
             },
         );
-        assert_eq!(resume_point_bytes(&fixture.archive_root), original);
+        let successor = resume_point_bytes(&fixture.archive_root);
+        assert_eq!(successor.len(), 1);
+        assert_ne!(
+            successor, original,
+            "the mandatory attempt publishes only after refusing the stale Safe point"
+        );
         fixture.assert_graph_unchanged();
     });
 }
