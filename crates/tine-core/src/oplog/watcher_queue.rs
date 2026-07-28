@@ -387,12 +387,14 @@ impl WatcherDrain {
     }
 }
 
-/// Proof that one exact queue was barred, empty, and fully acknowledged at one
-/// epoch, and that the caller's durable handoff commit then succeeded.
+/// Affine proof that one exact queue is barred, empty, and fully acknowledged
+/// at one epoch.
 ///
-/// It is not a capability: it authorizes nothing on its own and stays valid only
-/// while [`WatcherQueueOwner::quiesce_proof_is_current`] agrees.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Construction and use are closure-scoped inside
+/// [`WatcherQuiesceGuard::commit_handoff`]. It is deliberately neither `Clone`
+/// nor `Copy`, and the commit never returns it after releasing the intake bar,
+/// so no sibling can replay yesterday's queue fact as deletion authority.
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) struct WatcherQuiescedProof {
     binding: ProjectionStorageBinding,
     epoch: WatcherEpoch,
@@ -948,15 +950,19 @@ impl WatcherQueueOwner {
     ///
     /// Any intake, drain, or later quiesce since the commit makes it stale. This
     /// is the check a `Safe` record's revalidation pass would run.
-    pub(crate) fn quiesce_proof_is_current(&self, proof: &WatcherQuiescedProof) -> bool {
-        if proof.binding != self.shared.binding || proof.epoch.queue_id != self.shared.queue_id {
+    pub(crate) fn committed_quiesce_is_current(
+        &self,
+        binding: ProjectionStorageBinding,
+        epoch: WatcherEpoch,
+    ) -> bool {
+        if binding != self.shared.binding || epoch.queue_id != self.shared.queue_id {
             return false;
         }
         let state = self.shared.lock();
         !state.sequence_exhausted
-            && state.last_committed_quiesce == Some(proof.epoch.sequence)
-            && state.sequence == proof.epoch.sequence
-            && state.acknowledged == proof.epoch.sequence
+            && state.last_committed_quiesce == Some(epoch.sequence)
+            && state.sequence == epoch.sequence
+            && state.acknowledged == epoch.sequence
             && state.in_flight.is_none()
             && state.pending.is_empty()
             && state.deferred.is_empty()
@@ -1161,7 +1167,7 @@ impl WatcherQuiesceGuard {
     pub(crate) fn commit_handoff<T, E>(
         mut self,
         commit: impl FnOnce(&WatcherQuiescedProof) -> Result<T, E>,
-    ) -> Result<(T, WatcherQuiescedProof), WatcherHandoffError<E>> {
+    ) -> Result<T, WatcherHandoffError<E>> {
         let shared = Arc::clone(&self.shared);
         let bar = IntakeBar::acquire(&shared, self.epoch.sequence)
             .map_err(WatcherHandoffError::Quiesce)?;
@@ -1186,7 +1192,7 @@ impl WatcherQuiesceGuard {
         self.committed = true;
         drop(self);
         drop(bar);
-        Ok((committed, proof))
+        Ok(committed)
     }
 }
 
@@ -1759,7 +1765,7 @@ mod tests {
     }
 
     #[test]
-    fn a_committed_handoff_records_a_proof_that_later_intake_invalidates() {
+    fn a_committed_quiesce_epoch_is_diagnostic_only_and_later_intake_stales_it() {
         let (owner, binding) = queue(0x1080);
         let handle = owner.handle();
         handle.enqueue(binding, [observe("One")]).unwrap();
@@ -1767,7 +1773,7 @@ mod tests {
 
         let guard = owner.begin_quiesce(binding).unwrap();
         let mut committed_while_barred = None;
-        let (record, proof) = guard
+        let (record, proof_binding, proof_epoch) = guard
             .commit_handoff(|proof| -> Result<&'static str, ()> {
                 // The durable `Safe` write would happen here. Intake is still
                 // barred at this exact point.
@@ -1775,17 +1781,24 @@ mod tests {
                 assert_eq!(proof.epoch().sequence(), 1);
                 Ok("safe")
             })
+            .map(|record| {
+                (
+                    record,
+                    binding,
+                    owner.status().last_committed_quiesce.unwrap(),
+                )
+            })
             .unwrap();
         assert_eq!(record, "safe");
         assert_eq!(committed_while_barred, Some(true));
-        assert_eq!(proof.binding(), binding);
+        assert_eq!(proof_binding, binding);
         assert!(!owner.status().quiescing, "the bar lifts after the commit");
-        assert_eq!(owner.status().last_committed_quiesce, Some(proof.epoch()));
-        assert!(owner.quiesce_proof_is_current(&proof));
+        assert_eq!(owner.status().last_committed_quiesce, Some(proof_epoch));
+        assert!(owner.committed_quiesce_is_current(proof_binding, proof_epoch));
 
         handle.enqueue(binding, [observe("Two")]).unwrap();
         assert!(
-            !owner.quiesce_proof_is_current(&proof),
+            !owner.committed_quiesce_is_current(proof_binding, proof_epoch),
             "intake after the commit must invalidate the proof"
         );
     }
@@ -1825,25 +1838,25 @@ mod tests {
     #[test]
     fn a_foreign_proof_is_never_current() {
         let (owner, binding) = queue(0x1090);
-        let (_, proof) = owner
+        let epoch = owner
             .begin_quiesce(binding)
             .unwrap()
-            .commit_handoff(|_| -> Result<(), ()> { Ok(()) })
+            .commit_handoff(|proof| -> Result<WatcherEpoch, ()> { Ok(proof.epoch()) })
             .unwrap();
-        assert!(owner.quiesce_proof_is_current(&proof));
+        assert!(owner.committed_quiesce_is_current(binding, epoch));
 
         let (other_owner, other_binding) = queue(0x1091);
-        let (_, other_proof) = other_owner
+        let other_epoch = other_owner
             .begin_quiesce(other_binding)
             .unwrap()
-            .commit_handoff(|_| -> Result<(), ()> { Ok(()) })
+            .commit_handoff(|proof| -> Result<WatcherEpoch, ()> { Ok(proof.epoch()) })
             .unwrap();
-        assert_eq!(other_proof.epoch().sequence(), proof.epoch().sequence());
+        assert_eq!(other_epoch.sequence(), epoch.sequence());
         assert!(
-            !owner.quiesce_proof_is_current(&other_proof),
+            !owner.committed_quiesce_is_current(other_binding, other_epoch),
             "a proof minted by another queue must never be current here"
         );
-        assert!(!other_owner.quiesce_proof_is_current(&proof));
+        assert!(!other_owner.committed_quiesce_is_current(binding, epoch));
     }
 
     #[test]
@@ -2088,7 +2101,7 @@ mod tests {
         reconcile(&owner, binding);
 
         let guard = owner.begin_quiesce(binding).unwrap();
-        let (record, proof) = guard
+        let (record, proof_epoch) = guard
             .commit_handoff(|proof| -> Result<&'static str, ()> {
                 // The barrier has already re-proved the quiesce; the durable
                 // write is happening now.
@@ -2105,15 +2118,16 @@ mod tests {
                 assert!(!status.deferred, "a barred intake retains nothing");
                 Ok("safe")
             })
+            .map(|record| (record, owner.status().last_committed_quiesce.unwrap()))
             .unwrap();
 
         assert_eq!(record, "safe");
-        assert!(owner.quiesce_proof_is_current(&proof));
+        assert!(owner.committed_quiesce_is_current(binding, proof_epoch));
         // The refused batch was never observed, so it is still the caller's to
         // retry — and retrying it correctly stales the committed proof.
         let retry = handle.enqueue(binding, [observe("Two")]).unwrap();
         assert_eq!(retry.epoch.sequence(), 2);
-        assert!(!owner.quiesce_proof_is_current(&proof));
+        assert!(!owner.committed_quiesce_is_current(binding, proof_epoch));
     }
 
     /// The bar must also be released. Another thread's intake waits for the
@@ -2133,7 +2147,7 @@ mod tests {
                 handle.enqueue(binding, [observe("Two")]).unwrap()
             });
 
-            let (_, proof) = guard
+            let proof_epoch = guard
                 .commit_handoff(|_| -> Result<(), ()> {
                     start_tx.send(()).unwrap();
                     // Whatever the watcher thread does from here, it cannot
@@ -2141,8 +2155,9 @@ mod tests {
                     assert_eq!(owner.status().latest_enqueue.sequence(), 1);
                     Ok(())
                 })
+                .map(|()| owner.status().last_committed_quiesce.unwrap())
                 .unwrap();
-            assert_eq!(proof.epoch().sequence(), 1);
+            assert_eq!(proof_epoch.sequence(), 1);
             assert_eq!(watcher.join().unwrap().epoch.sequence(), 2);
         });
 
@@ -2291,6 +2306,40 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![WatcherUncertainReason::PathOverflow],
             "the overflow must be retained as a full scan, not dropped"
+        );
+    }
+
+    #[test]
+    fn watcher_safe_proof_is_affine_closure_scoped_and_not_constructible_by_surface() {
+        const SOURCE: &str = include_str!("watcher_queue.rs");
+        let production = SOURCE
+            .split_once("#[cfg(test)]\nmod tests")
+            .expect("test module boundary must remain explicit")
+            .0;
+        let proof = production
+            .split_once("pub(crate) struct WatcherQuiescedProof")
+            .expect("proof declaration must remain present");
+        let derive_prefix = proof
+            .0
+            .rsplit_once("#[derive(")
+            .expect("proof derive must remain explicit")
+            .1;
+        assert!(!derive_prefix.contains("Clone"));
+        assert!(!derive_prefix.contains("Copy"));
+        assert!(!derive_prefix.contains("Default"));
+        assert!(!derive_prefix.contains("Serialize"));
+        assert!(!derive_prefix.contains("Deserialize"));
+        for trait_name in ["Clone", "Copy", "Default"] {
+            assert!(!production
+                .contains(format!("impl {trait_name} for {}", "WatcherQuiescedProof").as_str()));
+        }
+        assert!(
+            production.contains(") -> Result<T, WatcherHandoffError<E>>"),
+            "commit_handoff must return only the closure result"
+        );
+        assert!(
+            !production.contains(format!("Result<(T, {})", "WatcherQuiescedProof").as_str()),
+            "commit_handoff must never return deletion authority after lifting the intake bar"
         );
     }
 }

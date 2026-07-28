@@ -6440,7 +6440,7 @@ mod applier_lease {
                 &self.workspace_id.to_string(),
                 &self.lease_path,
             )
-            .map_err(|error| ProjectionError::LeaseIdentityUnavailable(error.to_string()))?;
+            .map_err(LeasePathResolutionError::into_projection_error)?;
             if named != self.identity {
                 return Err(ProjectionError::LeaseIdentityReplaced(format!(
                     "the SQLite applier lease {} was replaced while this runtime held it, so this \
@@ -6948,28 +6948,6 @@ mod applier_lease {
         lease: &'lease WorkspaceRuntimeLease,
     }
 
-    /// Exact successful archive-binding and identity revalidation.
-    ///
-    /// Private construction makes this a one-operation witness rather than a
-    /// caller assertion. Safe-transition deletion authority borrows it, so it
-    /// cannot be retained after the lease proof that minted it.
-    pub(crate) struct RevalidatedWorkspaceRuntimeProof<'lease> {
-        workspace_id: WorkspaceId,
-        archive_root: &'lease Path,
-    }
-
-    impl RevalidatedWorkspaceRuntimeProof<'_> {
-        pub(crate) fn authorizes_archive(
-            &self,
-            store: &ObjectStore,
-            workspace_id: WorkspaceId,
-        ) -> bool {
-            self.workspace_id == workspace_id
-                && store.workspace_id() == workspace_id
-                && self.archive_root == store.root_path()
-        }
-    }
-
     impl WorkspaceRuntimeProof<'_> {
         pub(crate) const fn workspace_id(&self) -> WorkspaceId {
             self.lease.workspace_id
@@ -7008,19 +6986,6 @@ mod applier_lease {
             // a foreign lease is still refused without any filesystem work.
             self.lease.revalidate_identity()
         }
-
-        /// Revalidate and bind a one-operation witness to this exact archive.
-        pub(crate) fn revalidate_archive(
-            &self,
-            store: &ObjectStore,
-            workspace_id: WorkspaceId,
-        ) -> Result<RevalidatedWorkspaceRuntimeProof<'_>, ProjectionError> {
-            self.authorize_archive(store, workspace_id)?;
-            Ok(RevalidatedWorkspaceRuntimeProof {
-                workspace_id,
-                archive_root: &self.lease.archive_root,
-            })
-        }
     }
 }
 
@@ -7031,8 +6996,8 @@ pub(crate) use applier_lease::{
 };
 use applier_lease::{ApplierAuthorization, HeldApplierLocks};
 pub(crate) use applier_lease::{
-    LeasedWorkspaceProjection, RevalidatedWorkspaceRuntimeProof, SqliteApplierSlot,
-    WorkspaceLeaseIdentity, WorkspaceRuntimeLease, WorkspaceRuntimeProof,
+    LeasedWorkspaceProjection, SqliteApplierSlot, WorkspaceLeaseIdentity, WorkspaceRuntimeLease,
+    WorkspaceRuntimeProof,
 };
 
 #[cfg(test)]
@@ -7291,19 +7256,71 @@ fn resolve_lease_file_identity(
     archive_capability: &CapDir,
     workspace_name: &str,
     display_path: &Path,
-) -> Result<LeaseFileIdentity, ProjectionError> {
+) -> Result<LeaseFileIdentity, LeasePathResolutionError> {
     let resolve_directory = |parent: &CapDir, name: &str| {
-        super::object_store::open_dir_nofollow(parent, name).map_err(|error| {
-            ProjectionError::UnsafePath(format!(
-                "cannot resolve the SQLite applier lease {} without following links: {error}",
-                display_path.display()
-            ))
-        })
+        super::object_store::open_dir_nofollow(parent, name)
+            .map_err(|error| classify_lease_directory_resolution(parent, name, display_path, error))
     };
     let lease_namespace = resolve_directory(archive_capability, OBJECT_STORE_LEASE_NAMESPACE)?;
     let sqlite_namespace = resolve_directory(&lease_namespace, SQLITE_WORKSPACE_LEASE_NAMESPACE)?;
     let workspace_root = resolve_directory(&sqlite_namespace, workspace_name)?;
     entry_file_identity(&workspace_root, SQLITE_APPLIER_LEASE_FILE, display_path)
+}
+
+/// Structured result of resolving the live pathname of a held workspace lease.
+///
+/// `Replaced` is positive evidence that the exact name can no longer denote the
+/// held regular file: a component or final entry is absent, a component is not
+/// a real directory, or the final entry is not a real regular file. `Unavailable`
+/// is reserved for I/O that does not establish what the name denotes. Keeping
+/// this distinction below the display layer prevents runtime revocation from
+/// depending on platform error strings.
+#[derive(Debug)]
+enum LeasePathResolutionError {
+    Replaced(String),
+    Unavailable(String),
+}
+
+impl LeasePathResolutionError {
+    fn into_projection_error(self) -> ProjectionError {
+        match self {
+            Self::Replaced(error) => ProjectionError::LeaseIdentityReplaced(error),
+            Self::Unavailable(error) => ProjectionError::LeaseIdentityUnavailable(error),
+        }
+    }
+}
+
+fn missing_or_wrong_kind(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        ErrorKind::NotFound | ErrorKind::NotADirectory | ErrorKind::IsADirectory
+    )
+}
+
+fn classify_lease_directory_resolution(
+    parent: &CapDir,
+    name: &str,
+    display_path: &Path,
+    error: super::object_store::StoreError,
+) -> LeasePathResolutionError {
+    let detail = format!(
+        "cannot resolve the SQLite applier lease {} without following component {name}: {error}",
+        display_path.display()
+    );
+    match &error {
+        super::object_store::StoreError::Io(error) if missing_or_wrong_kind(error) => {
+            return LeasePathResolutionError::Replaced(detail);
+        }
+        super::object_store::StoreError::UnsafeEntry(_) => {
+            return LeasePathResolutionError::Replaced(detail);
+        }
+        _ => {}
+    }
+    match parent.symlink_metadata(name) {
+        Ok(metadata) if !metadata.is_dir() => LeasePathResolutionError::Replaced(detail),
+        Err(error) if missing_or_wrong_kind(&error) => LeasePathResolutionError::Replaced(detail),
+        _ => LeasePathResolutionError::Unavailable(detail),
+    }
 }
 
 /// The identity of whatever file `name` resolves to inside `directory` right
@@ -7320,13 +7337,24 @@ fn entry_file_identity(
     directory: &CapDir,
     name: &str,
     display_path: &Path,
-) -> Result<LeaseFileIdentity, ProjectionError> {
+) -> Result<LeaseFileIdentity, LeasePathResolutionError> {
     let metadata = directory.symlink_metadata(name).map_err(|error| {
-        ProjectionError::UnsafePath(format!(
-            "cannot resolve the SQLite applier lease {} without following links: {error}",
+        let detail = format!(
+            "cannot resolve the SQLite applier lease {} without following its final entry: {error}",
             display_path.display()
-        ))
+        );
+        if missing_or_wrong_kind(&error) {
+            LeasePathResolutionError::Replaced(detail)
+        } else {
+            LeasePathResolutionError::Unavailable(detail)
+        }
     })?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(LeasePathResolutionError::Replaced(format!(
+            "the SQLite applier lease {} no longer names a regular non-link file",
+            display_path.display()
+        )));
+    }
     Ok(LeaseFileIdentity {
         device: CapMetadataExt::dev(&metadata),
         inode: CapMetadataExt::ino(&metadata),
@@ -7338,7 +7366,7 @@ fn entry_file_identity(
     directory: &CapDir,
     name: &str,
     display_path: &Path,
-) -> Result<LeaseFileIdentity, ProjectionError> {
+) -> Result<LeaseFileIdentity, LeasePathResolutionError> {
     let mut options = CapOpenOptions::new();
     options
         .read(true)
@@ -7348,13 +7376,53 @@ fn entry_file_identity(
     let file = directory
         .open_with(name, &options)
         .map_err(|error| {
-            ProjectionError::UnsafePath(format!(
-                "cannot resolve the SQLite applier lease {} without following links: {error}",
+            let detail = format!(
+                "cannot resolve the SQLite applier lease {} without following its final entry: \
+                 {error}",
                 display_path.display()
-            ))
+            );
+            if missing_or_wrong_kind(&error) {
+                LeasePathResolutionError::Replaced(detail)
+            } else {
+                match directory.symlink_metadata(name) {
+                    Ok(metadata)
+                        if !metadata.is_file()
+                            || metadata.file_attributes()
+                                & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+                                != 0 =>
+                    {
+                        LeasePathResolutionError::Replaced(detail)
+                    }
+                    Err(metadata_error) if missing_or_wrong_kind(&metadata_error) => {
+                        LeasePathResolutionError::Replaced(detail)
+                    }
+                    _ => LeasePathResolutionError::Unavailable(detail),
+                }
+            }
         })?
         .into_std();
-    held_file_identity(&file, display_path)
+    let metadata = file.metadata().map_err(|error| {
+        LeasePathResolutionError::Unavailable(format!(
+            "cannot inspect the SQLite applier lease {} after resolving it: {error}",
+            display_path.display()
+        ))
+    })?;
+    if !metadata.is_file()
+        || metadata.file_attributes()
+            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+            != 0
+    {
+        return Err(LeasePathResolutionError::Replaced(format!(
+            "the SQLite applier lease {} no longer names a regular non-reparse file",
+            display_path.display()
+        )));
+    }
+    held_file_identity(&file, display_path).map_err(|error| {
+        LeasePathResolutionError::Unavailable(format!(
+            "cannot identify the resolved SQLite applier lease {}: {error}",
+            display_path.display()
+        ))
+    })
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -7362,8 +7430,8 @@ fn entry_file_identity(
     _directory: &CapDir,
     _name: &str,
     display_path: &Path,
-) -> Result<LeaseFileIdentity, ProjectionError> {
-    Err(ProjectionError::UnsafePath(format!(
+) -> Result<LeaseFileIdentity, LeasePathResolutionError> {
+    Err(LeasePathResolutionError::Unavailable(format!(
         "stable lease file identity is unsupported on this target: {}",
         display_path.display()
     )))
@@ -13757,7 +13825,7 @@ mod tests {
             .authorize_archive(&store, ids.workspace)
             .expect_err("a replaced lease path must not keep authorizing this archive");
         assert!(
-            matches!(error, ProjectionError::UnsafePath(_)),
+            matches!(error, ProjectionError::LeaseIdentityReplaced(_)),
             "unexpected replaced-lease error: {error}"
         );
 
@@ -13780,6 +13848,27 @@ mod tests {
         );
         drop(newcomer);
         drop(held);
+    }
+
+    #[test]
+    fn removing_a_workspace_lease_component_is_precise_terminal_identity_loss() {
+        let ids = TestIds::new(9_205);
+        let dir = TestDir::new("workspace-lock-component-missing");
+        let archive_root = dir.path().join("objects");
+        let store = ObjectStore::open(&archive_root, ids.workspace).unwrap();
+        let lease_path = workspace_lease_path(&archive_root, ids.workspace);
+        let lease = WorkspaceRuntimeLease::acquire(&store, ids.workspace).unwrap();
+
+        fs::remove_file(&lease_path).unwrap();
+        fs::remove_dir(lease_path.parent().unwrap()).unwrap();
+        let error = lease
+            .proof()
+            .authorize_archive(&store, ids.workspace)
+            .expect_err("a missing lease-path component positively proves replacement");
+        assert!(
+            matches!(error, ProjectionError::LeaseIdentityReplaced(_)),
+            "unexpected missing-component classification: {error}"
+        );
     }
 
     /// The open-then-lock window inside `WorkspaceRuntimeLease::acquire` is the
@@ -13883,14 +13972,14 @@ mod tests {
             .revalidate_workspace_lease_identity()
             .expect_err("the while-held boundary check must see the replacement");
         assert!(
-            matches!(error, ProjectionError::UnsafePath(_)),
+            matches!(error, ProjectionError::LeaseIdentityReplaced(_)),
             "unexpected while-held error: {error}"
         );
         assert!(matches!(
             projection
                 .workspace_proof()
                 .authorize_archive(&store, ids.workspace),
-            Err(ProjectionError::UnsafePath(_))
+            Err(ProjectionError::LeaseIdentityReplaced(_))
         ));
 
         // The bootstrap -> promoted handoff cannot proceed either: the applier
@@ -13911,7 +14000,7 @@ mod tests {
             .err()
             .expect("a replaced lease path must not authorize a new database");
         assert!(
-            matches!(error, ProjectionError::UnsafePath(_)),
+            matches!(error, ProjectionError::LeaseIdentityReplaced(_)),
             "unexpected applier-slot error: {error}"
         );
 

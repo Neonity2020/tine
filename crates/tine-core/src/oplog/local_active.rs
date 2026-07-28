@@ -288,7 +288,8 @@ use super::import::InactiveBootstrapAcceptedAuthority;
 use super::object_store::{
     EngineHistoryAuthority, EngineScratchRetentionPlan, PromotedLineageModeV1,
     PromotedRuntimeStateV1, ResumeAcceleratorUnavailable, ResumeAdoptionCandidate,
-    RetainedRunMaintenanceReport, StoreError, PROMOTED_RUNTIME_STATE_SCHEMA_VERSION,
+    RetainedRunMaintenanceReport, SafeTransitionCommitError, SafeTransitionError, StoreError,
+    PROMOTED_RUNTIME_STATE_SCHEMA_VERSION,
 };
 use super::projection_store::ProjectionReceiptStore;
 use super::resume_point::{ResumeEnrollmentAdmission, ResumePointMaintenance};
@@ -1827,7 +1828,7 @@ pub(crate) struct PromotedLocalRuntime {
     /// How this runtime came to own the enrollment's handoff state. It decides
     /// whether automatic external import may run at all.
     recovery: RuntimeRecoveryState,
-    engine: ShardedHotEngine,
+    engine: Box<ShardedHotEngine>,
     /// The device-local SQLite projection *and* the archive-rooted workspace
     /// runtime lease that authorized opening it, owned as one inseparable
     /// value. The lease is taken once, before this runtime may mutate enrollment
@@ -2206,22 +2207,28 @@ impl RuntimeRevocationLatch {
         revalidate: impl FnOnce() -> Result<T, ProjectionError>,
     ) -> Result<T, WorkspaceAuthorityRefusal> {
         self.guard(demanded_at)?;
-        revalidate().map_err(|cause| {
-            if matches!(cause, ProjectionError::LeaseIdentityUnavailable(_)) {
-                WorkspaceAuthorityRefusal {
-                    demanded_at,
-                    revocation: None,
-                    cause,
-                }
-            } else {
-                let revocation = self.revoke(demanded_at, cause);
-                WorkspaceAuthorityRefusal {
-                    demanded_at,
-                    cause: revocation.cause.clone(),
-                    revocation: Some(revocation),
-                }
+        revalidate().map_err(|cause| self.refuse_cause(demanded_at, cause))
+    }
+
+    fn refuse_cause(
+        &self,
+        demanded_at: WorkspaceAuthorityBoundary,
+        cause: ProjectionError,
+    ) -> WorkspaceAuthorityRefusal {
+        if matches!(cause, ProjectionError::LeaseIdentityUnavailable(_)) {
+            WorkspaceAuthorityRefusal {
+                demanded_at,
+                revocation: None,
+                cause,
             }
-        })
+        } else {
+            let revocation = self.revoke(demanded_at, cause);
+            WorkspaceAuthorityRefusal {
+                demanded_at,
+                cause: revocation.cause.clone(),
+                revocation: Some(revocation),
+            }
+        }
     }
 }
 
@@ -2437,7 +2444,7 @@ impl fmt::Debug for PromotedLocalRuntime {
 }
 
 impl PromotedLocalRuntime {
-    pub(crate) const fn engine(&self) -> &ShardedHotEngine {
+    pub(crate) fn engine(&self) -> &ShardedHotEngine {
         &self.engine
     }
 
@@ -2664,47 +2671,75 @@ impl PromotedLocalRuntime {
                     "promoted engine retained no archive capability".into(),
                 ));
             };
-            let workspace_proof = self.projection.workspace_proof();
-            let workspace = self
-                .revocation
-                .reprove_with(WorkspaceAuthorityBoundary::SafeHandoff, || {
-                    workspace_proof.revalidate_archive(archive, self.engine.workspace_id())
-                })
-                .map_err(refusal_into_safe)?;
+            let workspace = self.projection.workspace_proof();
             let (_history_capability, history) =
                 open_retained_history_control(archive, &self.state)
                     .map_err(|error| SafeHandoffUnavailable::Store(error.to_string()))?;
-            let safe = history
-                .begin_safe_transition(archive, &workspace, &graph_reservation, watcher_proof)
-                .map_err(|error| SafeHandoffUnavailable::Store(error.to_string()))?;
+            let safe = match history.begin_safe_transition(
+                archive,
+                &workspace,
+                &graph_reservation,
+                watcher_proof,
+            ) {
+                Ok(safe) => safe,
+                Err(SafeTransitionError::Workspace(cause)) => {
+                    return Err(refusal_into_safe(
+                        self.revocation
+                            .refuse_cause(WorkspaceAuthorityBoundary::SafeHandoff, cause),
+                    ))
+                }
+                Err(SafeTransitionError::Store(error)) => {
+                    return Err(SafeHandoffUnavailable::Store(error.to_string()))
+                }
+            };
             // Load-bearing order: a clear failure returns here while enrollment
             // is still exactly Unsafe. Recognized residue is reported and
             // preserved; it does not become deletion authority.
             #[cfg(test)]
             resume_lifecycle_cut_reached(ResumeLifecycleCut::BeforeSafeClear);
-            let cleared = safe
-                .clear_unsafe_resume_points()
-                .map_err(|error| SafeHandoffUnavailable::Store(error.to_string()))?;
+            let cleared = match safe.clear_unsafe_resume_points() {
+                Ok(cleared) => cleared,
+                Err(SafeTransitionError::Workspace(cause)) => {
+                    return Err(refusal_into_safe(
+                        self.revocation
+                            .refuse_cause(WorkspaceAuthorityBoundary::SafeHandoff, cause),
+                    ))
+                }
+                Err(SafeTransitionError::Store(error)) => {
+                    return Err(SafeHandoffUnavailable::Store(error.to_string()))
+                }
+            };
             #[cfg(test)]
             resume_lifecycle_cut_reached(ResumeLifecycleCut::AfterSafeClear);
 
-            let (head, verification_digest, safe_binding) = {
-                let committed = self
-                    .enrollment
-                    .transition_handoff(LocalActiveHandoff::Safe)?;
-                if committed.handoff() != LocalActiveHandoff::Safe
-                    || committed.sync() != LocalActiveSync::Idle
-                {
-                    return Err(SafeHandoffUnavailable::Runtime(
-                        "committed handoff state is not Safe+Idle after the transition".into(),
-                    ));
-                }
-                (
-                    committed.enrollment_head(),
-                    committed.verification_digest(),
-                    committed.resume_point_binding(),
-                )
-            };
+            let (head, verification_digest, safe_binding) =
+                match safe.commit_handoff(|| -> Result<_, SafeHandoffUnavailable> {
+                    let committed = self
+                        .enrollment
+                        .transition_handoff(LocalActiveHandoff::Safe)?;
+                    if committed.handoff() != LocalActiveHandoff::Safe
+                        || committed.sync() != LocalActiveSync::Idle
+                    {
+                        return Err(SafeHandoffUnavailable::Runtime(
+                            "committed handoff state is not Safe+Idle after the transition".into(),
+                        ));
+                    }
+                    Ok((
+                        committed.enrollment_head(),
+                        committed.verification_digest(),
+                        committed.resume_point_binding(),
+                    ))
+                }) {
+                    Ok(committed) => committed,
+                    Err(SafeTransitionCommitError::Workspace(cause)) => {
+                        return Err(refusal_into_safe(
+                            self.revocation
+                                .refuse_cause(WorkspaceAuthorityBoundary::SafeHandoff, cause),
+                        ))
+                    }
+                    Err(SafeTransitionCommitError::Commit(error)) => return Err(error),
+                };
+            drop(safe);
             // Fresh exact readback, still inside both barriers.
             let reopened = self.enrollment.reauthenticate()?;
             if reopened.enrollment_head() != head
@@ -2740,7 +2775,7 @@ impl PromotedLocalRuntime {
             })
         });
         let result = match transaction {
-            Ok((receipt, _proof)) => Ok(receipt),
+            Ok(receipt) => Ok(receipt),
             Err(WatcherHandoffError::Quiesce(error)) => Err(SafeHandoffUnavailable::Watcher(error)),
             Err(WatcherHandoffError::Commit(error)) => Err(error),
         };
@@ -3079,13 +3114,15 @@ impl PromotedLocalRuntime {
         self.watcher.status()
     }
 
-    /// Publish the packet-8 Unsafe-bound point at the sealed post-open,
-    /// pre-first-mutation cut.
+    /// Publish the Unsafe-bound point at the sealed post-open,
+    /// pre-first-mutation cut exactly once.
     ///
-    /// The future facade may invoke this immediately after a successful open.
-    /// Once a mutation is admitted the window is permanently closed; the
-    /// ordinary admission path only flips an in-memory boolean.
-    pub(crate) fn publish_post_open_resume_point(
+    /// Every constructor that can return a writable promoted runtime invokes
+    /// this before returning it. The window closes before the report-only
+    /// attempt begins, so neither a caller nor a failed publication can replay
+    /// it. Once returned, the runtime has either published or recorded why it
+    /// could not; ordinary admission still performs no lifecycle work.
+    fn publish_post_open_resume_point(
         &mut self,
         authority: &LocalActiveAuthority,
         graph: &Graph,
@@ -3097,6 +3134,7 @@ impl PromotedLocalRuntime {
             self.resume_publication = Some(status.clone());
             return status;
         }
+        self.post_open_publication_available = false;
         let status = self.publish_quiescent_resume_point_inner(authority, graph);
         self.resume_publication = Some(status.clone());
         status
@@ -3568,6 +3606,40 @@ impl PromotedRuntimeAdmission<'_> {
     }
 }
 
+fn automatically_publish_post_open(
+    runtime: &mut PromotedLocalRuntime,
+    authority: &LocalActiveAuthority,
+    graph: &Graph,
+) {
+    #[cfg(not(test))]
+    runtime.publish_post_open_resume_point(authority, graph);
+    #[cfg(test)]
+    // Libtest's worker stack is substantially smaller than the application's
+    // main thread. Keep the exact production call but give the large promoted
+    // runtime fixture enough stack for its snapshot frame.
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .name("tine-post-open-publication".into())
+            .stack_size(16 * 1024 * 1024)
+            .spawn_scoped(scope, || {
+                runtime.publish_post_open_resume_point(authority, graph);
+            })
+            .expect("post-open publication test thread must start")
+            .join()
+            .expect("post-open publication test thread must not panic");
+    });
+    // The report-only attempt authenticates the retained enrollment session
+    // again before it derives the Unsafe binding. That full read advances the
+    // session-local generation even though the exclusive session proves no
+    // other writer could have changed the record. The constructor has already
+    // authenticated the archive at this exact record, and publication itself
+    // revalidates the workspace lease before touching the archive, so carry
+    // those facts at the new local generation. Otherwise the first ordinary
+    // admission would spuriously redo archive lifecycle work solely because
+    // the mandatory attempt ran.
+    runtime.archive_authenticated_generation = runtime.enrollment.binding_generation();
+}
+
 /// Phase two of promotion, same process: open the promoted writable runtime.
 ///
 /// `workspace` is how this process proves it owns the archive:
@@ -3619,6 +3691,7 @@ pub(crate) fn open_promoted_local_runtime<W: PromotedWorkspaceAuthority>(
         open,
         workspace,
         RuntimeRecoveryState::FirstPromotion,
+        Some((authority, open.graph)),
     )
 }
 
@@ -3941,6 +4014,7 @@ fn reopen_promoted_local_runtime_with_adoption(
         open,
         AcquireWorkspaceLease,
         recovery,
+        None,
     )?;
 
     // Only now, with complete recovery proved, may an authority exist. The
@@ -4044,6 +4118,7 @@ fn reopen_promoted_local_runtime_with_adoption(
     // authenticate each other exactly, with no pre-minted in-memory evidence.
     // This is a recovery boundary, so it is the unabridged proof.
     runtime.prove_binding(open.graph, &authority, BindingProofDepth::Boundary)?;
+    automatically_publish_post_open(&mut runtime, &authority, open.graph);
     Ok((authority, runtime))
 }
 
@@ -4201,6 +4276,7 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
     open: &PromotedRuntimeOpen<'_>,
     workspace: W,
     recovery: RuntimeRecoveryState,
+    post_open: Option<(&LocalActiveAuthority, &Graph)>,
 ) -> Result<PromotedLocalRuntime, W::Refusal> {
     // Everything below stays in one stack frame on purpose: `PromotedLocalRuntime`
     // and the recovered engine are tens of kilobytes, so an extra function
@@ -4502,7 +4578,7 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
         },
         WatcherQueueLimits::default(),
     );
-    Ok(PromotedLocalRuntime {
+    let mut runtime = Box::new(PromotedLocalRuntime {
         state,
         anchor,
         session_id,
@@ -4511,7 +4587,7 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
         enrollment,
         archive_authenticated_generation,
         recovery,
-        engine,
+        engine: Box::new(engine),
         projection,
         tail,
         watcher,
@@ -4522,7 +4598,11 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
         resume_publication: None,
         post_open_publication_available: true,
         _seal: seal::Seal,
-    })
+    });
+    if let Some((authority, graph)) = post_open {
+        automatically_publish_post_open(&mut runtime, authority, graph);
+    }
+    Ok(*runtime)
 }
 
 /// Which admission a resuming open may offer a published point, derived from
@@ -5137,6 +5217,10 @@ mod bounded_admission {
         let paths = PromotedPaths::new(&fixture, "bounded");
         let (mut authority, mut runtime) = promote(&mut fixture, &root, SessionId::new(), &paths);
         let resume_at_open = runtime.resume_open_status().clone();
+        let publication_at_open = runtime
+            .resume_publication_status()
+            .expect("every writable open attempts post-open publication")
+            .clone();
 
         let bounded = |count: usize| PromotedRuntimeInstrumentation {
             enrollment: super::super::enrollment::EnrollmentInstrumentation {
@@ -5204,10 +5288,13 @@ mod bounded_admission {
             "even the unabridged proof runs on the retained lease"
         );
         // The retained-resume lifecycle is not on this path at any admission
-        // count: the open's observation is never re-derived and no admission
-        // has ever attempted a publication.
+        // count: the open's observation and mandatory publication report are
+        // never re-derived, and no admission attempts another publication.
         assert_eq!(runtime.resume_open_status(), &resume_at_open);
-        assert_eq!(runtime.resume_publication_status(), None);
+        assert_eq!(
+            runtime.resume_publication_status(),
+            Some(&publication_at_open)
+        );
         fixture.assert_graph_unchanged();
     }
 
@@ -5369,14 +5456,21 @@ mod bounded_admission {
             boundary.archive_identity_reads > 0,
             "the open boundary must reread the archive claim and control identity"
         );
-        assert_eq!(
-            reopened.database().frontier_root().unwrap(),
-            frontier,
+        assert!(
+            reopened
+                .database()
+                .frontier_root()
+                .unwrap()
+                .same_accepted_authority(&frontier),
             "a deleted projection must be rebuilt to the exact accepted frontier"
         );
-        assert_eq!(
-            reopened.engine().accepted_frontier_root().unwrap(),
-            frontier
+        assert!(
+            reopened
+                .engine()
+                .accepted_frontier_root()
+                .unwrap()
+                .same_accepted_authority(&frontier),
+            "the reopened engine must retain the exact accepted authority"
         );
         fixture.assert_graph_unchanged();
     }
