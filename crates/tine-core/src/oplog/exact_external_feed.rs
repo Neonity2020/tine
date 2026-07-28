@@ -2,21 +2,21 @@
 //!
 //! This module is the production core seam between normalized platform watcher
 //! observations and the sparse-oplog reconciliation path. It deliberately has
-//! crate visibility only. A later runtime actor may call [`ExactExternalFeedOwner::observe`]
-//! and [`ExactExternalFeedOwner::drain_one`], but it cannot obtain the raw
-//! graph feed lease, watcher queue owner, `LocalActive` authority, promoted
-//! runtime capabilities, reconciliation continuation, or SQLite applier.
+//! crate visibility only. A later runtime actor may own an
+//! [`ExactExternalFeedState`] while retaining the sole promoted runtime,
+//! `LocalActive` authority, and watcher queue for the root.
 //!
-//! One move-only owner binds all of those values to one exact promoted storage
-//! binding. Queue epochs are acknowledged only after admitted reconciliation,
-//! exact Graph feed/cache publication, and any initial catch-up publication
-//! have all reached terminal `Noop` or `Complete`. Every coarser or incomplete
-//! result keeps the epoch owed. Uncertainty rebuilds the complete exact Graph
-//! index at the queue fence before it runs complete reconciliation; it never
-//! guesses a managed path.
+//! The move-only state binds bounded work and continuations to that actor's
+//! exact storage and opaque queue identities. Each step borrows the actor-owned
+//! runtime/authority pair and uses only its watcher intake/drain/ack/abandon
+//! APIs. Queue epochs are acknowledged only after admitted reconciliation,
+//! exact Graph feed/cache publication, and initial catch-up publication reach
+//! terminal `Noop` or `Complete`. Every coarser or incomplete result keeps the
+//! epoch owed. Uncertainty rebuilds the complete exact Graph index at the queue
+//! fence before complete reconciliation; it never guesses a managed path.
 
-use std::collections::BTreeSet;
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeSet;
 use std::fmt;
 
 use crate::model::{
@@ -37,7 +37,7 @@ use super::{
     },
     watcher_queue::{
         WatcherDrainError, WatcherEnqueueError, WatcherEpoch, WatcherObservation,
-        WatcherQueueLimits, WatcherQueueOwner, WatcherSettlementError,
+        WatcherSettlementError,
     },
     ManagedPath, ProjectionReceiptStore,
 };
@@ -75,7 +75,7 @@ impl std::error::Error for ExactExternalFeedOpenError {}
 /// queue's work.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ExactExternalFeedObserveError {
-    ForeignBinding,
+    ForeignActor,
     Terminal,
     Queue(WatcherEnqueueError),
 }
@@ -83,8 +83,8 @@ pub(crate) enum ExactExternalFeedObserveError {
 impl fmt::Display for ExactExternalFeedObserveError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ForeignBinding => {
-                formatter.write_str("exact external feed observation has a foreign binding")
+            Self::ForeignActor => {
+                formatter.write_str("exact external feed observation has a foreign runtime")
             }
             Self::Terminal => formatter.write_str("exact external feed owner is terminal"),
             Self::Queue(error) => error.fmt(formatter),
@@ -115,7 +115,10 @@ impl fmt::Display for ExactExternalFeedTerminal {
                 write!(formatter, "exact external Graph feed is terminal: {detail}")
             }
             Self::Queue(detail) => {
-                write!(formatter, "exact external watcher queue is terminal: {detail}")
+                write!(
+                    formatter,
+                    "exact external watcher queue is terminal: {detail}"
+                )
             }
         }
     }
@@ -125,6 +128,9 @@ impl fmt::Display for ExactExternalFeedTerminal {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ExactExternalFeedDrain {
     Idle,
+    /// The caller did not present the exact actor-owned runtime/authority pair.
+    /// No watcher queue or feed state was touched.
+    ForeignActor,
     /// The promoted runtime did not adopt a clean `Safe` handoff. Work remains
     /// queued; only a fresh runtime reopen/takeover may change this result.
     RecoveryBlocked(&'static str),
@@ -139,8 +145,12 @@ pub(crate) enum ExactExternalFeedDrain {
     Blocked,
     /// A retryable, pre-ack operation failed. The queue epoch remains owed.
     Failed(String),
-    AdmittedNoop { epoch: u64 },
-    AdmittedComplete { epoch: u64 },
+    AdmittedNoop {
+        epoch: u64,
+    },
+    AdmittedComplete {
+        epoch: u64,
+    },
     Terminal(ExactExternalFeedTerminal),
 }
 
@@ -157,18 +167,17 @@ struct ActiveDrain {
     rebase_before_step: bool,
 }
 
-/// The single, move-only owner of one promoted runtime's exact external feed.
+/// Move-only bounded exact-feed state for one actor-owned promoted runtime.
 ///
-/// There is intentionally no `Clone`, no cloneable drain handle, and no
-/// accessor for `authority`, `runtime`, `lease`, `queue`, `reconciliation`, or
-/// `baseline`. Watcher intake is an actor request on this owner, not a second
-/// owner of any of those capabilities.
-pub(crate) struct ExactExternalFeedOwner {
+/// There is intentionally no `Clone`, no runtime/authority/queue constructor,
+/// and no accessor for the feed lease, continuation, or baseline. Watcher
+/// intake and settlement always pass through a borrowed runtime.
+pub(crate) struct ExactExternalFeedState {
     binding: ProjectionStorageBinding,
-    authority: LocalActiveAuthority,
-    runtime: PromotedLocalRuntime,
+    actor_session_id: super::SessionId,
+    actor_verification_digest: super::ContentDigest,
+    watcher_queue_anchor: WatcherEpoch,
     lease: GraphTextExactFeedLease,
-    queue: WatcherQueueOwner,
     reconciliation: ReconciliationSession,
     baseline: ReconciliationBaseline,
     active: Option<ActiveDrain>,
@@ -179,19 +188,18 @@ pub(crate) struct ExactExternalFeedOwner {
     rebase_count: u64,
 }
 
-impl fmt::Debug for ExactExternalFeedOwner {
+impl fmt::Debug for ExactExternalFeedState {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("ExactExternalFeedOwner")
+            .debug_struct("ExactExternalFeedState")
             .field("terminal", &self.terminal)
             .field("feed_sequence", &self.feed_sequence)
             .finish_non_exhaustive()
     }
 }
 
-impl ExactExternalFeedOwner {
-    /// Bind one exact Graph, receipt store, disposable baseline, live
-    /// `LocalActive` authority, and promoted runtime into one owner.
+impl ExactExternalFeedState {
+    /// Bind bounded feed state to one borrowed actor runtime.
     ///
     /// Every fresh owner seeds one uncertainty epoch after building the initial
     /// exact index. Its first admitted drain must therefore rebase and fully
@@ -201,19 +209,10 @@ impl ExactExternalFeedOwner {
     pub(crate) fn open(
         graph: &Graph,
         receipts: &ProjectionReceiptStore,
-        authority: LocalActiveAuthority,
-        runtime: PromotedLocalRuntime,
+        runtime: &PromotedLocalRuntime,
         baseline: ReconciliationBaseline,
     ) -> Result<Self, ExactExternalFeedOpenError> {
-        let binding = validate_open_binding(graph, receipts, &runtime, &baseline)?;
-        let queue = WatcherQueueOwner::new(
-            binding,
-            WatcherQueueLimits {
-                maximum_paths: EXACT_FEED_MAXIMUM_PATHS,
-                maximum_path_bytes: EXACT_FEED_MAXIMUM_PATH_BYTES,
-                maximum_uncertain_reasons: 8,
-            },
-        );
+        let binding = validate_open_binding(graph, receipts, runtime, &baseline)?;
         let lease = graph
             .arm_graph_text_exact_feed(0)
             .map_err(|error| ExactExternalFeedOpenError::new(error.to_string()))?;
@@ -224,17 +223,17 @@ impl ExactExternalFeedOwner {
         // This is not optional bookkeeping. A new process cannot reconstruct
         // the predecessor's in-memory watcher epoch, so it always owes one
         // complete scan before any exact epoch may be acknowledged.
-        queue
-            .handle()
+        let intake = runtime
+            .watcher_handle()
             .enqueue(binding, [WatcherObservation::RescanRequired])
             .map_err(|error| ExactExternalFeedOpenError::new(error.to_string()))?;
 
         Ok(Self {
             binding,
-            authority,
-            runtime,
+            actor_session_id: runtime.session_id(),
+            actor_verification_digest: runtime.verification_digest(),
+            watcher_queue_anchor: intake.epoch,
             lease,
-            queue,
             reconciliation: ReconciliationSession::new(ReconciliationSchedulerLimits {
                 maximum_watcher_paths: EXACT_FEED_MAXIMUM_PATHS,
                 maximum_watcher_path_bytes: EXACT_FEED_MAXIMUM_PATH_BYTES,
@@ -266,14 +265,14 @@ impl ExactExternalFeedOwner {
     pub(crate) fn observe(
         &mut self,
         graph: &Graph,
-        binding: ProjectionStorageBinding,
+        runtime: &PromotedLocalRuntime,
         observations: impl IntoIterator<Item = WatcherObservation>,
     ) -> Result<(), ExactExternalFeedObserveError> {
         if self.terminal.is_some() {
             return Err(ExactExternalFeedObserveError::Terminal);
         }
-        if binding != self.binding {
-            return Err(ExactExternalFeedObserveError::ForeignBinding);
+        if !self.matches_actor_runtime(runtime) {
+            return Err(ExactExternalFeedObserveError::ForeignActor);
         }
         // Classification stays lazy: the watcher queue stops polling as soon
         // as uncertainty or overflow subsumes the rest of the batch. This
@@ -281,8 +280,9 @@ impl ExactExternalFeedOwner {
         // merely to validate it.
         let configuration_mutated = Cell::new(false);
         let classification_error = RefCell::new(None::<String>);
-        let normalized = observations.into_iter().map(|observation| {
-            match observation {
+        let normalized = observations
+            .into_iter()
+            .map(|observation| match observation {
                 WatcherObservation::ManagedPath(path) => {
                     match graph.classify_graph_text_exact_feed_path(path.as_str()) {
                         Ok(GraphTextExactFeedPathClass::RetainedFile) => {
@@ -302,11 +302,9 @@ impl ExactExternalFeedOwner {
                     }
                 }
                 uncertain => uncertain,
-            }
-        });
+            });
         let enqueue = self
-            .queue
-            .handle()
+            .runtime_watcher_handle(runtime)
             .enqueue(self.binding, normalized)
             .map_err(ExactExternalFeedObserveError::Queue);
         if let Some(detail) = classification_error.into_inner() {
@@ -319,8 +317,7 @@ impl ExactExternalFeedOwner {
             return Err(ExactExternalFeedObserveError::Terminal);
         }
         if configuration_mutated.get() {
-            let detail =
-                "graph-text configuration changed; a fresh runtime reopen is required";
+            let detail = "graph-text configuration changed; a fresh runtime reopen is required";
             let _ = graph.poison_graph_text_exact_feed(
                 &self.lease,
                 GraphTextExactFeedFailure::ScopeOrConfigMutation,
@@ -341,29 +338,34 @@ impl ExactExternalFeedOwner {
         &mut self,
         graph: &Graph,
         receipts: &ProjectionReceiptStore,
+        authority: &mut LocalActiveAuthority,
+        runtime: &mut PromotedLocalRuntime,
         observed_at: BaselineTimestamp,
     ) -> ExactExternalFeedDrain {
         if let Some(terminal) = &self.terminal {
             return ExactExternalFeedDrain::Terminal(terminal.clone());
         }
-        if let Some(revocation) = self.runtime.workspace_authority_revocation() {
-            return self.stop_revoked(graph, revocation);
+        if !self.matches_actor_runtime(runtime) || !runtime.owns_local_active_authority(authority) {
+            return ExactExternalFeedDrain::ForeignActor;
         }
-        match self.runtime.automatic_external_import() {
+        if let Some(revocation) = runtime.workspace_authority_revocation() {
+            return self.stop_revoked(graph, runtime, revocation);
+        }
+        match runtime.automatic_external_import() {
             ExternalImportAdmission::Allowed => {}
             ExternalImportAdmission::Blocked(reason) => {
                 return ExactExternalFeedDrain::RecoveryBlocked(reason);
             }
         }
-        if let Err(error) = validate_live_binding(graph, receipts, &self.runtime, self.binding) {
-            return self.stop_runtime(graph, error.detail);
+        if let Err(error) = validate_live_binding(graph, receipts, runtime, self.binding) {
+            return self.stop_runtime(graph, runtime, error.detail);
         }
 
         if self.active.is_none() {
-            let drain = match self.queue.begin_drain(self.binding) {
+            let drain = match runtime.begin_watcher_drain() {
                 Ok(Some(drain)) => drain,
                 Ok(None) => return ExactExternalFeedDrain::Idle,
-                Err(error) => return self.handle_drain_error(graph, error),
+                Err(error) => return self.handle_drain_error(graph, runtime, error),
             };
             let scope = match drain.trigger() {
                 ReconciliationTrigger::WatcherPaths(paths) => {
@@ -373,8 +375,8 @@ impl ExactExternalFeedOwner {
                 _ => {
                     let detail =
                         "watcher queue produced a non-watcher reconciliation trigger".to_owned();
-                    let _ = self.queue.abandon_drain(drain.epoch());
-                    return self.stop_queue(graph, detail);
+                    let _ = runtime.abandon_watcher_drain(drain.epoch());
+                    return self.stop_queue(graph, runtime, detail);
                 }
             };
             self.active = Some(ActiveDrain {
@@ -408,14 +410,15 @@ impl ExactExternalFeedOwner {
                         .rebase_before_step = false;
                 }
                 Err(error) => {
-                    if let Some(revocation) = self.runtime.workspace_authority_revocation() {
-                        return self.stop_revoked(graph, revocation);
+                    if let Some(revocation) = runtime.workspace_authority_revocation() {
+                        return self.stop_revoked(graph, runtime, revocation);
                     }
                     if !self.lease.is_terminal() {
                         return ExactExternalFeedDrain::Failed(error.to_string());
                     }
                     return self.stop_graph(
                         graph,
+                        runtime,
                         GraphTextExactFeedFailure::BackendError,
                         &error.to_string(),
                     );
@@ -429,8 +432,15 @@ impl ExactExternalFeedOwner {
             .is_some_and(|active| active.continuation.is_none())
             && !self.reconciliation.status().active;
         if is_new_job {
-            let trigger = match &self.active.as_ref().expect("active drain disappeared").scope {
-                ActiveDrainScope::Exact(paths) => ReconciliationTrigger::WatcherPaths(paths.clone()),
+            let trigger = match &self
+                .active
+                .as_ref()
+                .expect("active drain disappeared")
+                .scope
+            {
+                ActiveDrainScope::Exact(paths) => {
+                    ReconciliationTrigger::WatcherPaths(paths.clone())
+                }
                 ActiveDrainScope::FullScan => ReconciliationTrigger::WatcherUncertain,
             };
             self.reconciliation.trigger(trigger);
@@ -445,15 +455,17 @@ impl ExactExternalFeedOwner {
         let step = match self.execute_reconciliation(
             graph,
             receipts,
+            authority,
+            runtime,
             observed_at,
             continuation,
         ) {
             Ok(step) => step,
             Err(ExecuteReconciliationError::Revoked(revocation)) => {
-                return self.stop_revoked(graph, revocation);
+                return self.stop_revoked(graph, runtime, revocation);
             }
             Err(ExecuteReconciliationError::Runtime(detail)) => {
-                return self.stop_runtime(graph, detail);
+                return self.stop_runtime(graph, runtime, detail);
             }
         };
         match step {
@@ -476,13 +488,13 @@ impl ExactExternalFeedOwner {
             }
             ReconciliationSessionStep::Blocked => {
                 self.reconciliation.take_terminal_changed_paths();
-                self.abandon_active();
+                self.abandon_active(runtime);
                 ExactExternalFeedDrain::Blocked
             }
             ReconciliationSessionStep::Idle => {
                 let detail =
                     "active exact-feed drain reached an idle reconciliation session".to_owned();
-                self.stop_runtime(graph, detail)
+                self.stop_runtime(graph, runtime, detail)
             }
             ReconciliationSessionStep::Noop | ReconciliationSessionStep::Complete => {
                 let Some(changed_paths) = self.reconciliation.take_terminal_changed_paths() else {
@@ -494,7 +506,7 @@ impl ExactExternalFeedOwner {
                     // or fold a later watcher epoch into this one.
                     return ExactExternalFeedDrain::Recovering;
                 };
-                self.finish_terminal(graph, step, changed_paths)
+                self.finish_terminal(graph, runtime, step, changed_paths)
             }
         }
     }
@@ -502,6 +514,7 @@ impl ExactExternalFeedOwner {
     fn finish_terminal(
         &mut self,
         graph: &Graph,
+        runtime: &PromotedLocalRuntime,
         step: ReconciliationSessionStep,
         changed_paths: ReconciliationTerminalChangedPaths,
     ) -> ExactExternalFeedDrain {
@@ -515,6 +528,7 @@ impl ExactExternalFeedOwner {
                 {
                     return self.stop_runtime(
                         graph,
+                        runtime,
                         "terminal full reconciliation did not match its exact feed fence",
                     );
                 }
@@ -526,6 +540,7 @@ impl ExactExternalFeedOwner {
                     let Some(first_sequence) = self.feed_sequence.checked_add(1) else {
                         return self.stop_graph(
                             graph,
+                            runtime,
                             GraphTextExactFeedFailure::SequenceDiscontinuity,
                             "exact feed sequence exhausted",
                         );
@@ -542,16 +557,17 @@ impl ExactExternalFeedOwner {
                         Err(error) => {
                             return self.stop_graph(
                                 graph,
+                                runtime,
                                 GraphTextExactFeedFailure::UnsupportedOrAmbiguousEvent,
                                 &error.to_string(),
                             );
                         }
                     };
-                    if let Err(error) =
-                        graph.apply_graph_text_exact_feed_batch(&self.lease, batch)
+                    if let Err(error) = graph.apply_graph_text_exact_feed_batch(&self.lease, batch)
                     {
                         return self.stop_graph(
                             graph,
+                            runtime,
                             GraphTextExactFeedFailure::BackendError,
                             &error.to_string(),
                         );
@@ -560,6 +576,7 @@ impl ExactExternalFeedOwner {
                 } else if self.feed_sequence != epoch.sequence() {
                     return self.stop_graph(
                         graph,
+                        runtime,
                         GraphTextExactFeedFailure::SequenceDiscontinuity,
                         "exact queue epoch moved behind the Graph feed",
                     );
@@ -568,17 +585,19 @@ impl ExactExternalFeedOwner {
             _ => {
                 return self.stop_runtime(
                     graph,
+                    runtime,
                     "terminal reconciliation changed-path report differs from its queue epoch",
                 );
             }
         }
 
         if !self.caught_up_published {
-            if let Err(error) = graph
-                .publish_graph_text_exact_feed_caught_up(&self.lease, self.feed_sequence)
+            if let Err(error) =
+                graph.publish_graph_text_exact_feed_caught_up(&self.lease, self.feed_sequence)
             {
                 return self.stop_graph(
                     graph,
+                    runtime,
                     GraphTextExactFeedFailure::BackendError,
                     &error.to_string(),
                 );
@@ -588,48 +607,46 @@ impl ExactExternalFeedOwner {
 
         if let Err(error) = exact_feed_after_terminal_before_ack_hook() {
             let detail = error.to_string();
-            self.abandon_active();
+            self.abandon_active(runtime);
             return ExactExternalFeedDrain::Failed(detail);
         }
 
-        if let Err(error) = self.queue.acknowledge_drain(epoch) {
-            return self.handle_settlement_error(graph, error);
+        if let Err(error) = runtime.acknowledge_watcher_drain(epoch) {
+            return self.handle_settlement_error(graph, runtime, error);
         }
         self.active = None;
         match step {
-            ReconciliationSessionStep::Noop => {
-                ExactExternalFeedDrain::AdmittedNoop {
-                    epoch: epoch.sequence(),
-                }
-            }
-            ReconciliationSessionStep::Complete => {
-                ExactExternalFeedDrain::AdmittedComplete {
-                    epoch: epoch.sequence(),
-                }
-            }
+            ReconciliationSessionStep::Noop => ExactExternalFeedDrain::AdmittedNoop {
+                epoch: epoch.sequence(),
+            },
+            ReconciliationSessionStep::Complete => ExactExternalFeedDrain::AdmittedComplete {
+                epoch: epoch.sequence(),
+            },
             _ => unreachable!("finish_terminal accepts only admitted terminal outcomes"),
         }
     }
 
-    fn abandon_active(&mut self) {
+    fn abandon_active(&mut self, runtime: &PromotedLocalRuntime) {
         let Some(active) = self.active.take() else {
             return;
         };
-        let _ = self.queue.abandon_drain(active.epoch);
+        let _ = runtime.abandon_watcher_drain(active.epoch);
     }
 
     fn handle_drain_error(
         &mut self,
         graph: &Graph,
+        runtime: &PromotedLocalRuntime,
         error: WatcherDrainError,
     ) -> ExactExternalFeedDrain {
         match error {
             WatcherDrainError::DrainInFlight(_) => self.stop_queue(
                 graph,
+                runtime,
                 "watcher queue has an unowned drain in flight".to_owned(),
             ),
             WatcherDrainError::ForeignBinding => {
-                self.stop_queue(graph, "watcher queue binding changed".to_owned())
+                self.stop_queue(graph, runtime, "watcher queue binding changed".to_owned())
             }
             WatcherDrainError::Quiescing => {
                 ExactExternalFeedDrain::Failed("watcher queue is quiescing".to_owned())
@@ -640,10 +657,12 @@ impl ExactExternalFeedOwner {
     fn handle_settlement_error(
         &mut self,
         graph: &Graph,
+        runtime: &PromotedLocalRuntime,
         error: WatcherSettlementError,
     ) -> ExactExternalFeedDrain {
         self.stop_queue(
             graph,
+            runtime,
             format!("terminal queue acknowledgement was refused: {error}"),
         )
     }
@@ -651,9 +670,10 @@ impl ExactExternalFeedOwner {
     fn stop_revoked(
         &mut self,
         graph: &Graph,
+        runtime: &PromotedLocalRuntime,
         revocation: RuntimeRevocation,
     ) -> ExactExternalFeedDrain {
-        self.abandon_active();
+        self.abandon_active(runtime);
         let detail = revocation.to_string();
         let _ = graph.poison_graph_text_exact_feed(
             &self.lease,
@@ -665,8 +685,13 @@ impl ExactExternalFeedOwner {
         ExactExternalFeedDrain::Terminal(terminal)
     }
 
-    fn stop_runtime(&mut self, graph: &Graph, detail: impl Into<String>) -> ExactExternalFeedDrain {
-        self.abandon_active();
+    fn stop_runtime(
+        &mut self,
+        graph: &Graph,
+        runtime: &PromotedLocalRuntime,
+        detail: impl Into<String>,
+    ) -> ExactExternalFeedDrain {
+        self.abandon_active(runtime);
         let detail = detail.into();
         let _ = graph.poison_graph_text_exact_feed(
             &self.lease,
@@ -681,18 +706,24 @@ impl ExactExternalFeedOwner {
     fn stop_graph(
         &mut self,
         graph: &Graph,
+        runtime: &PromotedLocalRuntime,
         reason: GraphTextExactFeedFailure,
         detail: &str,
     ) -> ExactExternalFeedDrain {
-        self.abandon_active();
+        self.abandon_active(runtime);
         let _ = graph.poison_graph_text_exact_feed(&self.lease, reason, detail);
         let terminal = ExactExternalFeedTerminal::GraphFeed(detail.to_owned());
         self.terminal = Some(terminal.clone());
         ExactExternalFeedDrain::Terminal(terminal)
     }
 
-    fn stop_queue(&mut self, graph: &Graph, detail: String) -> ExactExternalFeedDrain {
-        self.abandon_active();
+    fn stop_queue(
+        &mut self,
+        graph: &Graph,
+        runtime: &PromotedLocalRuntime,
+        detail: String,
+    ) -> ExactExternalFeedDrain {
+        self.abandon_active(runtime);
         let _ = graph.poison_graph_text_exact_feed(
             &self.lease,
             GraphTextExactFeedFailure::OverflowOrQueueLoss,
@@ -707,12 +738,12 @@ impl ExactExternalFeedOwner {
         &mut self,
         graph: &Graph,
         receipts: &ProjectionReceiptStore,
+        authority: &mut LocalActiveAuthority,
+        runtime: &mut PromotedLocalRuntime,
         observed_at: BaselineTimestamp,
         continuation: Option<ReconciliationPendingContinuation>,
     ) -> Result<ReconciliationSessionStep, ExecuteReconciliationError> {
         let Self {
-            authority,
-            runtime,
             reconciliation,
             baseline,
             ..
@@ -729,9 +760,11 @@ impl ExactExternalFeedOwner {
         let (admission, engine, database, tail) = match window.parts() {
             Ok(parts) => parts,
             Err(error) => {
-                return Err(ExecuteReconciliationError::Revoked(
-                    error.revocation().clone(),
-                ));
+                return Err(error
+                    .revocation()
+                    .cloned()
+                    .map(ExecuteReconciliationError::Revoked)
+                    .unwrap_or_else(|| ExecuteReconciliationError::Runtime(error.to_string())));
             }
         };
         let dependencies = ReconciliationSessionDependencies {
@@ -753,6 +786,21 @@ impl ExactExternalFeedOwner {
                 "reconciliation session refused its owned action: {error:?}"
             ))
         })
+    }
+
+    fn matches_actor_runtime(&self, runtime: &PromotedLocalRuntime) -> bool {
+        runtime.session_id() == self.actor_session_id
+            && runtime.verification_digest() == self.actor_verification_digest
+            && runtime.endpoint() == self.binding.endpoint
+            && runtime.owns_watcher_epoch(self.watcher_queue_anchor)
+    }
+
+    fn runtime_watcher_handle(
+        &self,
+        runtime: &PromotedLocalRuntime,
+    ) -> super::watcher_queue::WatcherHandle {
+        debug_assert!(self.matches_actor_runtime(runtime));
+        runtime.watcher_handle()
     }
 }
 
@@ -888,10 +936,13 @@ mod tests {
     use crate::oplog::local_active::{
         activate_verified_local, reopen_promoted_local_runtime, seal_local_runtime_promotion,
         take_over_promoted_local_runtime, InactiveBootstrapRuntimeSession, LocalActiveRuntime,
-        PromotedRuntimeOpen, RuntimeRecoveryState,
+        PromotedRuntimeOpen, RuntimeRecoveryState, SafeHandoffUnavailable,
     };
     use crate::oplog::migration_backup::{
         verify_migration_source_backup, MigrationBackupRoot, VerifiedSourceBackup,
+    };
+    use crate::oplog::operational_coordinator::{
+        LocalMutationCoordinatorState, OperationalCoordinator,
     };
     use crate::oplog::reconciliation_baseline::{
         ReconciliationBaselineBinding, TrustedPrivateApplicationRuntimeRoot,
@@ -899,10 +950,12 @@ mod tests {
     use crate::oplog::shadow_projection::{
         verify_inactive_bootstrap_shadow_projection, VerifiedShadowProjection,
     };
+    use crate::oplog::watcher_queue::WatcherQuiesceError;
     use crate::oplog::{
-        ApplicationRuntimeRoot, CanonicalArchiveResourceId, DeviceId, DocumentId, LineageDigest,
-        ObjectStore, OpenProjection, ProjectionEndpointBinding, ProjectionEndpointId,
-        ProjectionReceiptStoreId, ReferenceCatalogPolicyV1, SessionId, WorkspaceId,
+        ApplicationRuntimeRoot, BlockId, BlockLocation, CanonicalArchiveResourceId, DeviceId,
+        DocumentId, LineageDigest, LogicalPageName, ManagedTextKind, ObjectStore, OpenProjection,
+        OperationTransaction, PageId, ProjectionEndpointBinding, ProjectionEndpointId,
+        ReferenceCatalogPolicyV1, SemanticOperation, SessionId, WorkspaceId,
     };
 
     struct TestRoot(PathBuf);
@@ -1139,12 +1192,7 @@ mod tests {
             self.bootstrap.take().unwrap()
         }
 
-        fn baseline(
-            &self,
-            graph: &Graph,
-            label: &str,
-            existing: bool,
-        ) -> ReconciliationBaseline {
+        fn baseline(&self, graph: &Graph, label: &str, existing: bool) -> ReconciliationBaseline {
             let runtime = ApplicationRuntimeRoot::open_for_test(
                 &self.root.path().join(format!("baseline-runtime-{label}")),
             )
@@ -1183,18 +1231,17 @@ mod tests {
         fn new(fixture: &Fixture, label: &str) -> Self {
             Self {
                 runtime_root: ApplicationRuntimeRoot::open_for_test(
-                    &fixture.root.path().join(format!("promoted-runtime-{label}")),
+                    &fixture
+                        .root
+                        .path()
+                        .join(format!("promoted-runtime-{label}")),
                 )
                 .unwrap(),
                 database_path: fixture.root.path().join(format!("promoted-{label}.sqlite")),
             }
         }
 
-        fn open<'a>(
-            &'a self,
-            fixture: &'a Fixture,
-            graph: &'a Graph,
-        ) -> PromotedRuntimeOpen<'a> {
+        fn open<'a>(&'a self, fixture: &'a Fixture, graph: &'a Graph) -> PromotedRuntimeOpen<'a> {
             PromotedRuntimeOpen {
                 graph,
                 receipts: &fixture.receipts,
@@ -1240,8 +1287,7 @@ mod tests {
     ) -> (LocalActiveAuthority, PromotedLocalRuntime) {
         let first = SessionId::new();
         {
-            let (mut authority, mut runtime) =
-                promote(fixture, enrollment_root, first, paths);
+            let (mut authority, mut runtime) = promote(fixture, enrollment_root, first, paths);
             runtime
                 .quiesce_and_mark_safe_without_watcher_dependency_for_test(
                     &mut authority,
@@ -1250,32 +1296,146 @@ mod tests {
                 .unwrap();
         }
         let second = SessionId::new();
-        let reopened = reopen_promoted_local_runtime(
+        let (mut authority, mut runtime) = reopen_promoted_local_runtime(
             enrollment_root,
             &fixture.enrollment_binding(),
             second,
             &paths.open(fixture, &fixture.graph),
         )
         .unwrap();
-        assert_eq!(reopened.1.recovery(), RuntimeRecoveryState::AdoptedSafeHandoff);
+        assert_eq!(runtime.recovery(), RuntimeRecoveryState::AdoptedSafeHandoff);
         assert_eq!(
-            reopened.1.automatic_external_import(),
+            runtime.automatic_external_import(),
             ExternalImportAdmission::Allowed
         );
-        reopened
+        fs::create_dir_all(fixture.graph_root.join("content/nested pages/deep")).unwrap();
+        fs::create_dir_all(fixture.graph_root.join("diary/\u{65e5}\u{8a18}")).unwrap();
+        // The inactive bootstrap carries no ordinary projection completions.
+        // Real actor-authored mutations install authenticated expected-path
+        // authority for the nested/nonstandard paths before exact-feed tests
+        // exercise startup/full-scan behavior.
+        let mut seed_operations = Vec::new();
+        for (seed, path, name, kind, content) in [
+            (
+                0xEFA0_0000,
+                "content/nested pages/deep/Caf\u{e9} note.md",
+                "Café note",
+                ManagedTextKind::Page,
+                "markdown original",
+            ),
+            (
+                0xEFA0_0100,
+                "diary/\u{65e5}\u{8a18}/journal space.org",
+                "Journal space",
+                ManagedTextKind::Journal,
+                "org original",
+            ),
+            (
+                0xEFA0_0200,
+                "content/nested pages/rename old.org",
+                "Rename old",
+                ManagedTextKind::Page,
+                "old",
+            ),
+        ] {
+            seed_operations.extend(local_page_operations(seed, path, name, kind, content));
+        }
+        append_local_operations(fixture, &mut authority, &mut runtime, seed_operations);
+        (authority, runtime)
+    }
+
+    fn local_page_operations(
+        seed: u128,
+        path: &str,
+        name: &str,
+        kind: ManagedTextKind,
+        content: &str,
+    ) -> Vec<SemanticOperation> {
+        vec![
+            SemanticOperation::CreatePage {
+                page_id: PageId::from_uuid(Uuid::from_u128(seed)),
+                home_document_id: DocumentId::from_uuid(Uuid::from_u128(seed + 1)),
+                name: LogicalPageName::parse(name).unwrap(),
+                path: ManagedPath::parse(path).unwrap(),
+                kind,
+            },
+            SemanticOperation::CreateBlock {
+                block: BlockLocation {
+                    block_id: BlockId::from_uuid(Uuid::from_u128(seed + 2)),
+                    home_document_id: DocumentId::from_uuid(Uuid::from_u128(seed + 1)),
+                },
+                page_id: PageId::from_uuid(Uuid::from_u128(seed)),
+                parent: None,
+                order: "a".into(),
+                content: content.to_owned(),
+            },
+        ]
+    }
+
+    fn append_local_operations(
+        fixture: &Fixture,
+        authority: &mut LocalActiveAuthority,
+        runtime: &mut PromotedLocalRuntime,
+        operations: Vec<SemanticOperation>,
+    ) {
+        let mut session = runtime
+            .admit_promoted_mutation(authority, &fixture.graph)
+            .unwrap();
+        let transaction = OperationTransaction::new(operations).unwrap();
+        match OperationalCoordinator::execute_local(
+            &mut session,
+            &fixture.graph,
+            &fixture.receipts,
+            &transaction,
+        ) {
+            LocalMutationCoordinatorState::Active(_) => {}
+            LocalMutationCoordinatorState::Recovering(_) => {
+                panic!("local seed unexpectedly retained recovery work")
+            }
+            LocalMutationCoordinatorState::Blocked(blocked) => {
+                panic!("local seed was blocked: {}", blocked.failure())
+            }
+            LocalMutationCoordinatorState::Revoked(revoked) => {
+                panic!("local seed was revoked: {}", revoked.failure())
+            }
+        }
+    }
+
+    fn append_local_batch(
+        fixture: &Fixture,
+        authority: &mut LocalActiveAuthority,
+        runtime: &mut PromotedLocalRuntime,
+        seed: u128,
+    ) {
+        append_local_operations(
+            fixture,
+            authority,
+            runtime,
+            local_page_operations(
+                seed,
+                &format!("content/nested pages/exact-feed-local-{seed}.md"),
+                &format!("Exact Feed Local {seed}"),
+                ManagedTextKind::Page,
+                &format!("serialized local mutation {seed}"),
+            ),
+        );
     }
 
     fn drive_terminal(
-        owner: &mut ExactExternalFeedOwner,
+        state: &mut ExactExternalFeedState,
         graph: &Graph,
         receipts: &ProjectionReceiptStore,
+        authority: &mut LocalActiveAuthority,
+        runtime: &mut PromotedLocalRuntime,
         clock: &mut u64,
     ) -> ExactExternalFeedDrain {
         for _ in 0..16 {
             *clock += 1;
-            let result = owner.drain_one(
+            let result = state.drain_one(
                 graph,
                 receipts,
+                authority,
+                runtime,
                 BaselineTimestamp::from_millis(*clock).unwrap(),
             );
             match result {
@@ -1303,21 +1463,146 @@ mod tests {
             Some(
                 b"{:pages-directory \"content/nested pages\" :journals-directory \"diary/\xE6\x97\xA5\xE8\xA8\x98\"}\n",
             ),
-            [
-                (
-                    "content/nested pages/deep/Caf\u{e9} note.MD".to_owned(),
-                    b"- markdown original\r\n\t- nested\r\n".to_vec(),
-                ),
-                (
-                    "diary/\u{65e5}\u{8a18}/journal space.ORG".to_owned(),
-                    b"#+title: Journal\r\n* org original\r\n".to_vec(),
-                ),
-                (
-                    "content/nested pages/rename old.org".to_owned(),
-                    b"#+title: Rename\r\n* old\r\n".to_vec(),
-                ),
-            ],
+            [],
         )
+    }
+
+    #[test]
+    fn sole_runtime_queue_blocks_safe_and_settles_the_feed_epoch_exactly_once() {
+        let mut fixture = configured_fixture("sole-runtime-queue");
+        let enrollment = fixture.enrollment_root("sole-runtime-queue");
+        let paths = PromotedPaths::new(&fixture, "sole-runtime-queue");
+        let (mut authority, mut runtime) = promoted_safe_reopen(&mut fixture, &enrollment, &paths);
+        let baseline = fixture.baseline(&fixture.graph, "sole-runtime-queue", false);
+        let mut state =
+            ExactExternalFeedState::open(&fixture.graph, &fixture.receipts, &runtime, baseline)
+                .unwrap();
+
+        let pending = runtime.watcher_status();
+        let epoch = pending.latest_enqueue;
+        assert!(pending.pending_requires_full_scan);
+        let borrowed = runtime.begin_watcher_drain().unwrap().unwrap();
+        assert_eq!(borrowed.epoch(), epoch);
+        runtime.abandon_watcher_drain(borrowed.epoch()).unwrap();
+        assert_eq!(
+            runtime.abandon_watcher_drain(borrowed.epoch()),
+            Err(WatcherSettlementError::NoDrainInFlight)
+        );
+
+        let mut clock = 0;
+        assert_admitted(drive_terminal(
+            &mut state,
+            &fixture.graph,
+            &fixture.receipts,
+            &mut authority,
+            &mut runtime,
+            &mut clock,
+        ));
+        let settled = runtime.watcher_status();
+        assert_eq!(settled.acknowledged, epoch);
+        assert_eq!(settled.latest_enqueue, epoch);
+        assert!(!settled.pending);
+        assert_eq!(
+            runtime.acknowledge_watcher_drain(epoch),
+            Err(WatcherSettlementError::NoDrainInFlight)
+        );
+        assert_eq!(
+            runtime.abandon_watcher_drain(epoch),
+            Err(WatcherSettlementError::NoDrainInFlight)
+        );
+
+        state
+            .observe(
+                &fixture.graph,
+                &runtime,
+                [WatcherObservation::RescanRequired],
+            )
+            .unwrap();
+        let exact_feed_intake = runtime.watcher_status();
+        assert!(exact_feed_intake.pending_requires_full_scan);
+        let refused_safe = runtime.quiesce_and_mark_safe(&mut authority, &fixture.graph);
+        assert!(
+            matches!(
+                &refused_safe,
+                Err(SafeHandoffUnavailable::Watcher(
+                    WatcherQuiesceError::UnacknowledgedEpoch {
+                        latest_enqueue,
+                        acknowledged,
+                    }
+                )) if *latest_enqueue == exact_feed_intake.latest_enqueue
+                    && *acknowledged == settled.acknowledged
+            ),
+            "unexpected Safe refusal: {refused_safe:?}"
+        );
+        assert_admitted(drive_terminal(
+            &mut state,
+            &fixture.graph,
+            &fixture.receipts,
+            &mut authority,
+            &mut runtime,
+            &mut clock,
+        ));
+        assert_eq!(
+            runtime.watcher_status().acknowledged,
+            exact_feed_intake.latest_enqueue
+        );
+        runtime
+            .quiesce_and_mark_safe(&mut authority, &fixture.graph)
+            .unwrap();
+    }
+
+    #[test]
+    fn local_mutation_and_exact_feed_serialize_through_one_actor_pair() {
+        let mut fixture = configured_fixture("serialized-local-and-feed");
+        let enrollment = fixture.enrollment_root("serialized-local-and-feed");
+        let paths = PromotedPaths::new(&fixture, "serialized-local-and-feed");
+        let (mut authority, mut runtime) = promoted_safe_reopen(&mut fixture, &enrollment, &paths);
+        let baseline = fixture.baseline(&fixture.graph, "serialized-local-and-feed", false);
+        let mut state =
+            ExactExternalFeedState::open(&fixture.graph, &fixture.receipts, &runtime, baseline)
+                .unwrap();
+        let mut clock = 0;
+        assert_admitted(drive_terminal(
+            &mut state,
+            &fixture.graph,
+            &fixture.receipts,
+            &mut authority,
+            &mut runtime,
+            &mut clock,
+        ));
+
+        let before_local = fixture.manifest_count();
+        append_local_batch(&fixture, &mut authority, &mut runtime, 0xEFA0_1000);
+        assert_eq!(fixture.manifest_count(), before_local + 1);
+
+        let local_path = format!(
+            "content/nested pages/exact-feed-local-{}.md",
+            0xEFA0_1000_u128
+        );
+        state
+            .observe(
+                &fixture.graph,
+                &runtime,
+                [WatcherObservation::ManagedPath(
+                    ManagedPath::parse(&local_path).unwrap(),
+                )],
+            )
+            .unwrap();
+        let external = drive_terminal(
+            &mut state,
+            &fixture.graph,
+            &fixture.receipts,
+            &mut authority,
+            &mut runtime,
+            &mut clock,
+        );
+        assert!(
+            matches!(external, ExactExternalFeedDrain::AdmittedNoop { .. }),
+            "unexpected post-local exact-feed result: {external:?}"
+        );
+        assert_eq!(fixture.manifest_count(), before_local + 1);
+        let status = runtime.watcher_status();
+        assert_eq!(status.acknowledged, status.latest_enqueue);
     }
 
     #[test]
@@ -1329,40 +1614,38 @@ mod tests {
             let mut fixture = configured_fixture(label);
             let enrollment = fixture.enrollment_root(label);
             let paths = PromotedPaths::new(&fixture, label);
-            let (authority, runtime) =
+            let (mut authority, mut runtime) =
                 promoted_safe_reopen(&mut fixture, &enrollment, &paths);
             let baseline = fixture.baseline(&fixture.graph, label, false);
-            let mut owner = ExactExternalFeedOwner::open(
-                &fixture.graph,
-                &fixture.receipts,
-                authority,
-                runtime,
-                baseline,
-            )
-            .unwrap();
+            let mut owner =
+                ExactExternalFeedState::open(&fixture.graph, &fixture.receipts, &runtime, baseline)
+                    .unwrap();
             let mut clock = 0;
             assert_admitted(drive_terminal(
                 &mut owner,
                 &fixture.graph,
                 &fixture.receipts,
+                &mut authority,
+                &mut runtime,
                 &mut clock,
             ));
 
-            let markdown = "content/nested pages/deep/Caf\u{e9} note.MD";
-            let org = "diary/\u{65e5}\u{8a18}/journal space.ORG";
+            let markdown = "content/nested pages/deep/Caf\u{e9} note.md";
+            let org = "diary/\u{65e5}\u{8a18}/journal space.org";
             let old = "content/nested pages/rename old.org";
-            let new = "content/nested pages/deeper/renamed \u{65e5}.ORG";
+            let new = "content/nested pages/deeper/renamed \u{65e5}.org";
             fs::write(
                 fixture.graph_root.join(markdown),
-                b"- markdown exact edit\r\n\t- nested Unicode\r\n",
+                b"- markdown exact edit\n",
             )
             .unwrap();
             fs::write(
                 fixture.graph_root.join(org),
-                b"#+title: Journal\r\n* org exact edit\r\n",
+                b"#+title: Journal\n* org exact edit\n",
             )
             .unwrap();
             fs::create_dir_all(fixture.graph_root.join("content/nested pages/deeper")).unwrap();
+            let renamed_bytes = fs::read(fixture.graph_root.join(old)).unwrap();
             fs::rename(fixture.graph_root.join(old), fixture.graph_root.join(new)).unwrap();
             let rename = [
                 WatcherObservation::ManagedPath(ManagedPath::parse(old).unwrap()),
@@ -1373,30 +1656,34 @@ mod tests {
                 WatcherObservation::ManagedPath(ManagedPath::parse(org).unwrap()),
                 rename[rename_order[0]].clone(),
                 rename[rename_order[1]].clone(),
+                WatcherObservation::UnknownPath,
             ];
             let before = fixture.manifest_count();
             owner
-                .observe(&fixture.graph, owner.binding, observations)
+                .observe(&fixture.graph, &runtime, observations)
                 .unwrap();
-            let result =
-                drive_terminal(&mut owner, &fixture.graph, &fixture.receipts, &mut clock);
-            assert!(matches!(
-                result,
-                ExactExternalFeedDrain::AdmittedComplete { .. }
-            ));
+            let result = drive_terminal(
+                &mut owner,
+                &fixture.graph,
+                &fixture.receipts,
+                &mut authority,
+                &mut runtime,
+                &mut clock,
+            );
+            assert_admitted(result);
             assert_eq!(fixture.manifest_count(), before + 1);
             assert_eq!(
                 fs::read(fixture.graph_root.join(markdown)).unwrap(),
-                b"- markdown exact edit\r\n\t- nested Unicode\r\n"
+                b"- markdown exact edit\n"
             );
             assert_eq!(
                 fs::read(fixture.graph_root.join(org)).unwrap(),
-                b"#+title: Journal\r\n* org exact edit\r\n"
+                b"#+title: Journal\n* org exact edit\n"
             );
             assert!(!fixture.graph_root.join(old).exists());
             assert_eq!(
                 fs::read(fixture.graph_root.join(new)).unwrap(),
-                b"#+title: Rename\r\n* old\r\n"
+                renamed_bytes
             );
 
             fs::remove_file(fixture.graph_root.join(org)).unwrap();
@@ -1404,19 +1691,23 @@ mod tests {
             owner
                 .observe(
                     &fixture.graph,
-                    owner.binding,
+                    &runtime,
                     [WatcherObservation::ManagedPath(
                         ManagedPath::parse(org).unwrap(),
                     )],
                 )
                 .unwrap();
-            assert!(matches!(
-                drive_terminal(&mut owner, &fixture.graph, &fixture.receipts, &mut clock),
-                ExactExternalFeedDrain::AdmittedComplete { .. }
+            assert_admitted(drive_terminal(
+                &mut owner,
+                &fixture.graph,
+                &fixture.receipts,
+                &mut authority,
+                &mut runtime,
+                &mut clock,
             ));
             assert_eq!(fixture.manifest_count(), before_delete + 1);
             assert!(!fixture.graph_root.join(org).exists());
-            let status = owner.queue.status();
+            let status = runtime.watcher_status();
             assert_eq!(status.acknowledged, status.latest_enqueue);
             assert!(!status.pending);
         }
@@ -1427,21 +1718,18 @@ mod tests {
         let mut fixture = configured_fixture("uncertainty");
         let enrollment = fixture.enrollment_root("uncertainty");
         let paths = PromotedPaths::new(&fixture, "uncertainty");
-        let (authority, runtime) = promoted_safe_reopen(&mut fixture, &enrollment, &paths);
+        let (mut authority, mut runtime) = promoted_safe_reopen(&mut fixture, &enrollment, &paths);
         let baseline = fixture.baseline(&fixture.graph, "uncertainty", false);
-        let mut owner = ExactExternalFeedOwner::open(
-            &fixture.graph,
-            &fixture.receipts,
-            authority,
-            runtime,
-            baseline,
-        )
-        .unwrap();
+        let mut owner =
+            ExactExternalFeedState::open(&fixture.graph, &fixture.receipts, &runtime, baseline)
+                .unwrap();
         let mut clock = 0;
         assert_admitted(drive_terminal(
             &mut owner,
             &fixture.graph,
             &fixture.receipts,
+            &mut authority,
+            &mut runtime,
             &mut clock,
         ));
 
@@ -1452,17 +1740,19 @@ mod tests {
         ] {
             let rebases_before = owner.rebase_count;
             owner
-                .observe(&fixture.graph, owner.binding, [observation])
+                .observe(&fixture.graph, &runtime, [observation])
                 .unwrap();
-            let status = owner.queue.status();
+            let status = runtime.watcher_status();
             assert!(status.pending_requires_full_scan);
             assert_admitted(drive_terminal(
                 &mut owner,
                 &fixture.graph,
                 &fixture.receipts,
+                &mut authority,
+                &mut runtime,
                 &mut clock,
             ));
-            let settled = owner.queue.status();
+            let settled = runtime.watcher_status();
             assert_eq!(settled.acknowledged, settled.latest_enqueue);
             assert_eq!(owner.feed_sequence, settled.acknowledged.sequence());
             assert_eq!(owner.rebase_count, rebases_before + 1);
@@ -1477,18 +1767,20 @@ mod tests {
             })
             .collect::<Vec<_>>();
         owner
-            .observe(&fixture.graph, owner.binding, count_overflow)
+            .observe(&fixture.graph, &runtime, count_overflow)
             .unwrap();
-        assert!(owner.queue.status().pending_requires_full_scan);
-        let count_drain = owner.queue.begin_drain(owner.binding).unwrap().unwrap();
+        assert!(runtime.watcher_status().pending_requires_full_scan);
+        let count_drain = runtime.begin_watcher_drain().unwrap().unwrap();
         assert!(count_drain
             .uncertain_reasons()
             .contains(&super::super::watcher_queue::WatcherUncertainReason::PathOverflow));
-        owner.queue.abandon_drain(count_drain.epoch()).unwrap();
+        runtime.abandon_watcher_drain(count_drain.epoch()).unwrap();
         assert_admitted(drive_terminal(
             &mut owner,
             &fixture.graph,
             &fixture.receipts,
+            &mut authority,
+            &mut runtime,
             &mut clock,
         ));
         assert_eq!(owner.rebase_count, rebases_before_count_overflow + 1);
@@ -1516,21 +1808,23 @@ mod tests {
                 > EXACT_FEED_MAXIMUM_PATH_BYTES
         );
         owner
-            .observe(&fixture.graph, owner.binding, byte_overflow)
+            .observe(&fixture.graph, &runtime, byte_overflow)
             .unwrap();
-        assert!(owner.queue.status().pending_requires_full_scan);
-        let byte_drain = owner.queue.begin_drain(owner.binding).unwrap().unwrap();
+        assert!(runtime.watcher_status().pending_requires_full_scan);
+        let byte_drain = runtime.begin_watcher_drain().unwrap().unwrap();
         assert!(byte_drain
             .uncertain_reasons()
             .contains(&super::super::watcher_queue::WatcherUncertainReason::PathOverflow));
-        owner.queue.abandon_drain(byte_drain.epoch()).unwrap();
+        runtime.abandon_watcher_drain(byte_drain.epoch()).unwrap();
         assert_admitted(drive_terminal(
             &mut owner,
             &fixture.graph,
             &fixture.receipts,
+            &mut authority,
+            &mut runtime,
             &mut clock,
         ));
-        let settled = owner.queue.status();
+        let settled = runtime.watcher_status();
         assert_eq!(settled.acknowledged, settled.latest_enqueue);
         assert_eq!(owner.feed_sequence, settled.acknowledged.sequence());
         assert_eq!(owner.rebase_count, rebases_before_byte_overflow + 1);
@@ -1541,28 +1835,22 @@ mod tests {
         let mut fixture = configured_fixture("recovery-gate");
         let enrollment = fixture.enrollment_root("recovery-gate");
         let paths = PromotedPaths::new(&fixture, "recovery-gate");
-        let (authority, runtime) =
+        let (mut authority, mut runtime) =
             promote(&mut fixture, &enrollment, SessionId::new(), &paths);
         assert_eq!(runtime.recovery(), RuntimeRecoveryState::FirstPromotion);
         let baseline = fixture.baseline(&fixture.graph, "recovery-gate", false);
-        let mut owner = ExactExternalFeedOwner::open(
-            &fixture.graph,
-            &fixture.receipts,
-            authority,
-            runtime,
-            baseline,
-        )
-        .unwrap();
+        let mut owner =
+            ExactExternalFeedState::open(&fixture.graph, &fixture.receipts, &runtime, baseline)
+                .unwrap();
         let result = owner.drain_one(
             &fixture.graph,
             &fixture.receipts,
+            &mut authority,
+            &mut runtime,
             BaselineTimestamp::from_millis(1).unwrap(),
         );
-        assert!(matches!(
-            result,
-            ExactExternalFeedDrain::RecoveryBlocked(_)
-        ));
-        let status = owner.queue.status();
+        assert!(matches!(result, ExactExternalFeedDrain::RecoveryBlocked(_)));
+        let status = runtime.watcher_status();
         assert_eq!(status.latest_enqueue.sequence(), 1);
         assert_eq!(status.acknowledged.sequence(), 0);
         assert!(status.pending_requires_full_scan);
@@ -1575,40 +1863,37 @@ mod tests {
         let enrollment = fixture.enrollment_root("crash-before-ack");
         let binding = fixture.enrollment_binding();
         let paths = PromotedPaths::new(&fixture, "crash-before-ack");
-        let (authority, runtime) = promoted_safe_reopen(&mut fixture, &enrollment, &paths);
+        let (mut authority, mut runtime) = promoted_safe_reopen(&mut fixture, &enrollment, &paths);
         let baseline = fixture.baseline(&fixture.graph, "crash-before-ack", false);
-        let mut owner = ExactExternalFeedOwner::open(
-            &fixture.graph,
-            &fixture.receipts,
-            authority,
-            runtime,
-            baseline,
-        )
-        .unwrap();
+        let mut owner =
+            ExactExternalFeedState::open(&fixture.graph, &fixture.receipts, &runtime, baseline)
+                .unwrap();
         let mut clock = 0;
         assert_admitted(drive_terminal(
             &mut owner,
             &fixture.graph,
             &fixture.receipts,
+            &mut authority,
+            &mut runtime,
             &mut clock,
         ));
 
-        let markdown = "content/nested pages/deep/Caf\u{e9} note.MD";
+        let markdown = "content/nested pages/deep/Caf\u{e9} note.md";
         fs::write(
             fixture.graph_root.join(markdown),
-            b"- admitted exactly once\r\n",
+            b"- admitted exactly once\n",
         )
         .unwrap();
         owner
             .observe(
                 &fixture.graph,
-                owner.binding,
+                &runtime,
                 [WatcherObservation::ManagedPath(
                     ManagedPath::parse(markdown).unwrap(),
                 )],
             )
             .unwrap();
-        let acknowledged_before = owner.queue.status().acknowledged;
+        let acknowledged_before = runtime.watcher_status().acknowledged;
         let manifests_before = fixture.manifest_count();
         EXACT_FEED_AFTER_TERMINAL_BEFORE_ACK_HOOK.with(|hook| {
             *hook.borrow_mut() = Some(Box::new(|| {
@@ -1618,17 +1903,28 @@ mod tests {
                 ))
             }));
         });
-        let failed =
-            drive_terminal(&mut owner, &fixture.graph, &fixture.receipts, &mut clock);
-        assert!(matches!(failed, ExactExternalFeedDrain::Failed(_)));
-        assert_eq!(owner.queue.status().acknowledged, acknowledged_before);
-        assert!(owner.queue.status().pending);
+        let failed = drive_terminal(
+            &mut owner,
+            &fixture.graph,
+            &fixture.receipts,
+            &mut authority,
+            &mut runtime,
+            &mut clock,
+        );
+        assert!(
+            matches!(failed, ExactExternalFeedDrain::Failed(_)),
+            "unexpected crash-cut result: {failed:?}"
+        );
+        assert_eq!(runtime.watcher_status().acknowledged, acknowledged_before);
+        assert!(runtime.watcher_status().pending);
         assert_eq!(fixture.manifest_count(), manifests_before + 1);
         let committed_after_crash = fixture.manifest_count();
 
         // Dropping the process-local owner loses its in-memory epoch. A genuine
         // crash takeover remains recovery-gated and cannot import in place.
         drop(owner);
+        drop(runtime);
+        drop(authority);
         let reopened_graph = Graph::open(&fixture.graph_root);
         let takeover_session = SessionId::new();
         let (mut takeover_authority, mut takeover_runtime) = take_over_promoted_local_runtime(
@@ -1654,7 +1950,7 @@ mod tests {
             .unwrap();
         drop(takeover_runtime);
         drop(takeover_authority);
-        let (authority, runtime) = reopen_promoted_local_runtime(
+        let (mut authority, mut runtime) = reopen_promoted_local_runtime(
             &enrollment,
             &binding,
             SessionId::new(),
@@ -1663,19 +1959,16 @@ mod tests {
         .unwrap();
         assert_eq!(runtime.recovery(), RuntimeRecoveryState::AdoptedSafeHandoff);
         let baseline = fixture.baseline(&reopened_graph, "crash-before-ack", true);
-        let mut reopened = ExactExternalFeedOwner::open(
-            &reopened_graph,
-            &fixture.receipts,
-            authority,
-            runtime,
-            baseline,
-        )
-        .unwrap();
-        assert!(reopened.queue.status().pending_requires_full_scan);
+        let mut reopened =
+            ExactExternalFeedState::open(&reopened_graph, &fixture.receipts, &runtime, baseline)
+                .unwrap();
+        assert!(runtime.watcher_status().pending_requires_full_scan);
         assert_admitted(drive_terminal(
             &mut reopened,
             &reopened_graph,
             &fixture.receipts,
+            &mut authority,
+            &mut runtime,
             &mut clock,
         ));
         assert_eq!(
@@ -1683,7 +1976,7 @@ mod tests {
             committed_after_crash,
             "the fresh forced scan must reuse deterministic import/receipt identity"
         );
-        let status = reopened.queue.status();
+        let status = runtime.watcher_status();
         assert_eq!(status.acknowledged, status.latest_enqueue);
     }
 
@@ -1692,82 +1985,63 @@ mod tests {
         let mut fixture = configured_fixture("terminal-refusal");
         let enrollment = fixture.enrollment_root("terminal-refusal");
         let paths = PromotedPaths::new(&fixture, "terminal-refusal");
-        let (authority, runtime) = promoted_safe_reopen(&mut fixture, &enrollment, &paths);
+        let (mut authority, mut runtime) = promoted_safe_reopen(&mut fixture, &enrollment, &paths);
         let baseline = fixture.baseline(&fixture.graph, "terminal-refusal", false);
-        let mut owner = ExactExternalFeedOwner::open(
-            &fixture.graph,
-            &fixture.receipts,
-            authority,
-            runtime,
-            baseline,
-        )
-        .unwrap();
+        let mut owner =
+            ExactExternalFeedState::open(&fixture.graph, &fixture.receipts, &runtime, baseline)
+                .unwrap();
         let mut clock = 0;
         assert_admitted(drive_terminal(
             &mut owner,
             &fixture.graph,
             &fixture.receipts,
+            &mut authority,
+            &mut runtime,
             &mut clock,
         ));
-        let clean = owner.queue.status();
+        let clean = runtime.watcher_status();
 
-        let foreign = ProjectionStorageBinding {
-            endpoint: owner.binding.endpoint,
-            receipt_store_id: ProjectionReceiptStoreId::from_capability_identity(
-                b"test",
-                b"foreign-exact-feed-receipt-store",
-            ),
-        };
+        let mut foreign_fixture = configured_fixture("terminal-refusal-foreign");
+        let foreign_enrollment = foreign_fixture.enrollment_root("terminal-refusal-foreign");
+        let foreign_paths = PromotedPaths::new(&foreign_fixture, "terminal-refusal-foreign");
+        let (mut foreign_authority, mut foreign_runtime) =
+            promoted_safe_reopen(&mut foreign_fixture, &foreign_enrollment, &foreign_paths);
+        let foreign_clean = foreign_runtime.watcher_status();
         assert_eq!(
             owner.observe(
                 &fixture.graph,
-                foreign,
+                &foreign_runtime,
                 [WatcherObservation::UnknownPath]
             ),
-            Err(ExactExternalFeedObserveError::ForeignBinding)
+            Err(ExactExternalFeedObserveError::ForeignActor)
         );
-        assert_eq!(owner.queue.status(), clean);
+        assert_eq!(runtime.watcher_status(), clean);
+        assert_eq!(foreign_runtime.watcher_status(), foreign_clean);
+        assert_eq!(
+            owner.drain_one(
+                &fixture.graph,
+                &fixture.receipts,
+                &mut foreign_authority,
+                &mut foreign_runtime,
+                BaselineTimestamp::from_millis(clock + 1).unwrap(),
+            ),
+            ExactExternalFeedDrain::ForeignActor
+        );
+        assert_eq!(runtime.watcher_status(), clean);
+        assert_eq!(foreign_runtime.watcher_status(), foreign_clean);
 
-        let markdown = "content/nested pages/deep/Caf\u{e9} note.MD";
+        let markdown = "content/nested pages/deep/Caf\u{e9} note.md";
         fs::write(fixture.graph_root.join(markdown), b"- revoke me\r\n").unwrap();
         owner
             .observe(
                 &fixture.graph,
-                owner.binding,
+                &runtime,
                 [WatcherObservation::ManagedPath(
                     ManagedPath::parse(markdown).unwrap(),
                 )],
             )
             .unwrap();
-        let owned_drain = owner.queue.begin_drain(owner.binding).unwrap().unwrap();
-        assert!(matches!(
-            owner.queue.begin_drain(owner.binding),
-            Err(WatcherDrainError::DrainInFlight(epoch)) if epoch == owned_drain.epoch()
-        ));
-        let foreign_queue = WatcherQueueOwner::new(
-            owner.binding,
-            WatcherQueueLimits {
-                maximum_paths: EXACT_FEED_MAXIMUM_PATHS,
-                maximum_path_bytes: EXACT_FEED_MAXIMUM_PATH_BYTES,
-                maximum_uncertain_reasons: 8,
-            },
-        );
-        foreign_queue
-            .handle()
-            .enqueue(owner.binding, [WatcherObservation::UnknownPath])
-            .unwrap();
-        let foreign_epoch = foreign_queue
-            .begin_drain(owner.binding)
-            .unwrap()
-            .unwrap()
-            .epoch();
-        assert!(matches!(
-            owner.queue.acknowledge_drain(foreign_epoch),
-            Err(WatcherSettlementError::StaleOrForeignEpoch { in_flight })
-                if in_flight == owned_drain.epoch()
-        ));
-        owner.queue.abandon_drain(owned_drain.epoch()).unwrap();
-        let owed = owner.queue.status();
+        let owed = runtime.watcher_status();
         let lease_path = fixture
             .archive_root
             .join(".tine-runtime")
@@ -1781,15 +2055,17 @@ mod tests {
         let revoked = owner.drain_one(
             &fixture.graph,
             &fixture.receipts,
+            &mut authority,
+            &mut runtime,
             BaselineTimestamp::from_millis(clock + 1).unwrap(),
         );
         assert!(matches!(
             revoked,
-            ExactExternalFeedDrain::Terminal(
-                ExactExternalFeedTerminal::WorkspaceAuthorityRevoked(_)
-            )
+            ExactExternalFeedDrain::Terminal(ExactExternalFeedTerminal::WorkspaceAuthorityRevoked(
+                _
+            ))
         ));
-        let after = owner.queue.status();
+        let after = runtime.watcher_status();
         assert_eq!(after.acknowledged, owed.acknowledged);
         assert!(after.pending);
         assert!(owner.terminal().is_some());
@@ -1797,6 +2073,8 @@ mod tests {
             owner.drain_one(
                 &fixture.graph,
                 &fixture.receipts,
+                &mut authority,
+                &mut runtime,
                 BaselineTimestamp::from_millis(clock + 2).unwrap(),
             ),
             ExactExternalFeedDrain::Terminal(_)
@@ -1804,7 +2082,7 @@ mod tests {
         assert_eq!(
             owner.observe(
                 &fixture.graph,
-                owner.binding,
+                &runtime,
                 [WatcherObservation::RescanRequired]
             ),
             Err(ExactExternalFeedObserveError::Terminal)
@@ -1816,46 +2094,75 @@ mod tests {
         let mut fixture = configured_fixture("config-mutation");
         let enrollment = fixture.enrollment_root("config-mutation");
         let paths = PromotedPaths::new(&fixture, "config-mutation");
-        let (authority, runtime) = promoted_safe_reopen(&mut fixture, &enrollment, &paths);
+        let (mut authority, mut runtime) = promoted_safe_reopen(&mut fixture, &enrollment, &paths);
         let baseline = fixture.baseline(&fixture.graph, "config-mutation", false);
-        let mut owner = ExactExternalFeedOwner::open(
-            &fixture.graph,
-            &fixture.receipts,
-            authority,
-            runtime,
-            baseline,
+        let mut owner =
+            ExactExternalFeedState::open(&fixture.graph, &fixture.receipts, &runtime, baseline)
+                .unwrap();
+        fs::write(
+            fixture.graph_root.join("logseq/config.edn"),
+            b"{:pages-directory \"changed-pages\"}\n",
         )
         .unwrap();
-        assert_eq!(
-            owner.observe(
-                &fixture.graph,
-                owner.binding,
-                [WatcherObservation::ManagedPath(
-                    ManagedPath::parse("logseq/config.edn").unwrap(),
-                )],
+        let scope_loss = owner.drain_one(
+            &fixture.graph,
+            &fixture.receipts,
+            &mut authority,
+            &mut runtime,
+            BaselineTimestamp::from_millis(1).unwrap(),
+        );
+        assert!(
+            matches!(
+                scope_loss,
+                ExactExternalFeedDrain::Terminal(ExactExternalFeedTerminal::GraphFeed(_))
             ),
-            Err(ExactExternalFeedObserveError::Terminal)
+            "unexpected scope-loss result: {scope_loss:?}"
         );
         assert!(matches!(
             owner.terminal(),
             Some(ExactExternalFeedTerminal::GraphFeed(_))
         ));
-        assert_eq!(owner.queue.status().acknowledged.sequence(), 0);
+        let terminal_status = runtime.watcher_status();
+        assert_eq!(terminal_status.acknowledged.sequence(), 0);
+        assert_eq!(
+            owner.observe(
+                &fixture.graph,
+                &runtime,
+                [WatcherObservation::RescanRequired],
+            ),
+            Err(ExactExternalFeedObserveError::Terminal)
+        );
+        assert!(matches!(
+            owner.drain_one(
+                &fixture.graph,
+                &fixture.receipts,
+                &mut authority,
+                &mut runtime,
+                BaselineTimestamp::from_millis(2).unwrap(),
+            ),
+            ExactExternalFeedDrain::Terminal(ExactExternalFeedTerminal::GraphFeed(_))
+        ));
+        assert_eq!(runtime.watcher_status(), terminal_status);
     }
 
-    // Keep a structural receipt near the runtime tests: the production owner
-    // owns every move-only capability directly and exposes no cloneable drain,
-    // authority, runtime, queue-owner, or lease accessor. If a future edit adds
-    // `#[derive(Clone)]`, this explicit field census is where review starts.
+    // The state remains move-only, while its constructor type proves the actor
+    // retains ownership of the sole runtime and authority.
     #[test]
-    fn owner_is_one_move_only_capability_bundle() {
+    fn state_is_move_only_and_open_borrows_the_actor_runtime() {
         trait AmbiguousIfClone<Marker> {
             fn assert_not_clone() {}
         }
         impl<T: ?Sized> AmbiguousIfClone<()> for T {}
         impl<T: ?Sized + Clone> AmbiguousIfClone<u8> for T {}
 
-        <ExactExternalFeedOwner as AmbiguousIfClone<_>>::assert_not_clone();
-        assert!(std::mem::needs_drop::<ExactExternalFeedOwner>());
+        <ExactExternalFeedState as AmbiguousIfClone<_>>::assert_not_clone();
+        assert!(std::mem::needs_drop::<ExactExternalFeedState>());
+        let _open: fn(
+            &Graph,
+            &ProjectionReceiptStore,
+            &PromotedLocalRuntime,
+            ReconciliationBaseline,
+        ) -> Result<ExactExternalFeedState, ExactExternalFeedOpenError> =
+            ExactExternalFeedState::open;
     }
 }

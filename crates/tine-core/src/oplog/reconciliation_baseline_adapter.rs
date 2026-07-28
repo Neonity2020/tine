@@ -374,12 +374,22 @@ fn scan_file_row(
         // fabricating a content baseline here would create false authority.
         return Ok(None);
     };
+    if matches!(file.class, GraphTextScanPathClass::Configuration) {
+        // Configuration bytes and metadata are already committed by both
+        // stable-scan pass digests and by the Graph scope binding. They are
+        // not managed content and cannot be represented as a `ManagedPath`;
+        // attempting to do so would make every configured nested root block
+        // before reconciliation can compare its actual managed inventory.
+        return Ok(None);
+    }
     let managed_kind = match file.class {
         GraphTextScanPathClass::EligibleManaged(kind) => Some(kind),
         GraphTextScanPathClass::EligibleUnmanaged
         | GraphTextScanPathClass::ProviderConflictCopy
-        | GraphTextScanPathClass::Configuration
         | GraphTextScanPathClass::RetainedNonText => None,
+        GraphTextScanPathClass::Configuration => {
+            unreachable!("configuration rows return before managed-path parsing")
+        }
     };
     let path = ManagedPath::parse(file.exact_relative.clone())
         .map_err(|error| invalid_evidence(format!("invalid retained path: {error}")))?;

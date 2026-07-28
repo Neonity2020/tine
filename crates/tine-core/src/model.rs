@@ -6177,6 +6177,7 @@ impl Graph {
         last_sequence: u64,
     ) -> io::Result<()> {
         self.ensure_graph_text_exact_feed_lease(lease)?;
+        self.ensure_graph_text_exact_feed_configuration(lease)?;
         let (current, catching_up, next_generation, current_sequence) = {
             let state = self.graph_text_admission.read().unwrap();
             let (index, catching_up) = match &*state {
@@ -6234,6 +6235,7 @@ impl Graph {
         // taking the publication lock and then prove the exact prior pointer
         // and fence again under the lock.
         self.ensure_graph_text_exact_feed_lease(lease)?;
+        self.ensure_graph_text_exact_feed_configuration(lease)?;
         let mut state = self.graph_text_admission.write().unwrap();
         let unchanged = match &*state {
             GraphTextAdmissionState::CatchingUp(index) if catching_up => {
@@ -6663,6 +6665,57 @@ impl Graph {
             let error =
                 graph_text_admission_unavailable("exact feed lease root or scope binding changed");
             self.poison_graph_text_admission(error.to_string());
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn ensure_graph_text_exact_feed_configuration(
+        &self,
+        lease: &GraphTextExactFeedLease,
+    ) -> io::Result<()> {
+        let validate = || {
+            if !self.reconciliation_scan_open_config_utf8 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "exact feed requires a fresh Graph after non-UTF-8 configuration",
+                ));
+            }
+            self.ensure_projection_root_binding()?;
+            let root = self
+                .projection_root
+                .as_ref()
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "graph has no retained no-follow projection capability",
+                    )
+                })?
+                .try_clone()?;
+            let limits = crate::oplog::reconciliation_scan::GraphTextScanLimits::default();
+            let mut aggregate_hashed_bytes = 0;
+            let mut instrumentation =
+                crate::oplog::reconciliation_scan::GraphTextScanPassInstrumentation::default();
+            let observed = reconciliation_scan_current_config_description(
+                &root,
+                &mut aggregate_hashed_bytes,
+                &mut instrumentation,
+                limits,
+            )?;
+            if observed != self.reconciliation_scan_open_config_description {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "graph-text configuration changed; a fresh Graph is required",
+                ));
+            }
+            Ok(())
+        };
+        if let Err(error) = validate() {
+            lease.terminal.store(true, Ordering::Release);
+            self.poison_graph_text_admission(graph_text_exact_feed_failure_cause(
+                GraphTextExactFeedFailure::ScopeOrConfigMutation,
+                &error.to_string(),
+            ));
             return Err(error);
         }
         Ok(())
@@ -34783,11 +34836,7 @@ mod tests {
         .unwrap();
         fs::remove_file(root.join(org)).unwrap();
         let renamed = "diary/\u{65e5}\u{8a18}/renamed space.org";
-        fs::write(
-            root.join(renamed),
-            b"#+title: Renamed\r\n* imported\r\n",
-        )
-        .unwrap();
+        fs::write(root.join(renamed), b"#+title: Renamed\r\n* imported\r\n").unwrap();
 
         graph
             .rebase_graph_text_exact_feed_at_fence(&lease, 1)

@@ -73,6 +73,17 @@ pub(crate) struct WatcherQueueLimits {
     pub(crate) maximum_uncertain_reasons: usize,
 }
 
+impl WatcherQueueLimits {
+    /// Production bounds for the promoted runtime's sole external-feed queue.
+    pub(crate) const fn exact_external_feed() -> Self {
+        Self {
+            maximum_paths: 256,
+            maximum_path_bytes: 64 * 1024,
+            maximum_uncertain_reasons: 8,
+        }
+    }
+}
+
 impl Default for WatcherQueueLimits {
     fn default() -> Self {
         // Deliberately the same shape and magnitude as the watcher fields of
@@ -132,6 +143,14 @@ pub(crate) struct WatcherEpoch {
 impl WatcherEpoch {
     pub(crate) const fn sequence(self) -> u64 {
         self.sequence
+    }
+
+    /// Whether both epochs were minted by the same process-local queue.
+    ///
+    /// The identity stays opaque; a borrower gains no construction, drain,
+    /// settlement, or quiesce authority from this comparison.
+    pub(crate) const fn same_queue(self, other: Self) -> bool {
+        self.queue_id == other.queue_id
     }
 }
 

@@ -3188,6 +3188,21 @@ impl PromotedLocalRuntime {
         self.watcher.status()
     }
 
+    /// Report whether a retained borrower token belongs to this runtime's sole
+    /// watcher queue without exposing the queue owner or its identity.
+    pub(crate) fn owns_watcher_epoch(&self, epoch: WatcherEpoch) -> bool {
+        self.watcher.status().latest_enqueue.same_queue(epoch)
+    }
+
+    /// Whether this exact runtime and live authority form the actor-owned pair.
+    ///
+    /// This is only a cheap process-local preflight. Mutation admission still
+    /// performs the complete durable binding and workspace-lease proof.
+    pub(crate) fn owns_local_active_authority(&self, authority: &LocalActiveAuthority) -> bool {
+        authority.session_id == self.session_id
+            && authority.verification_digest == self.verification_digest
+    }
+
     /// Publish the Unsafe-bound point at the sealed post-open,
     /// pre-first-mutation cut exactly once.
     ///
@@ -4648,7 +4663,7 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
             endpoint,
             receipt_store_id: state.receipt_store_id,
         },
-        WatcherQueueLimits::default(),
+        WatcherQueueLimits::exact_external_feed(),
     );
     let mut runtime = Box::new(PromotedLocalRuntime {
         state,
