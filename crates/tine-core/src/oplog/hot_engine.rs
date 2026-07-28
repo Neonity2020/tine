@@ -9254,7 +9254,9 @@ impl ShardedHotEngine {
                         base.as_ref().map(super::BaseBlob::bytes),
                     )
                     .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
-                    if replay.intent() != &intent {
+                    let replay_matches = replay.intent() == &intent
+                        || (external && intent.matches_replay_except_frontier(replay.intent()));
+                    if !replay_matches {
                         authority_matches = false;
                         None
                     } else {
@@ -9409,6 +9411,8 @@ impl ShardedHotEngine {
             requirement_index,
             mut captured_inputs,
         } = captured;
+        let external_reconciliation =
+            matches!(draft.origin, BatchOrigin::ExternalReconciliation { .. });
         self.ensure_not_blocked()?;
         if receipt_store_id != receipts.store_id()
             || receipts.workspace_id() != self.workspace_id
@@ -9539,9 +9543,10 @@ impl ShardedHotEngine {
                 if prior.intent.workspace_id() != self.workspace_id
                     || prior.intent.page_id() != before.page.page_id
                     || prior.intent.path() != path
-                    || prior.intent.frontier() != &before.frontier
-                    || prior.intent.claim_evidence() != before.claim_evidence
                     || prior.intent.target() != super::BlobDescription::of(&prior.bytes)
+                    || (!external_reconciliation
+                        && (prior.intent.frontier() != &before.frontier
+                            || prior.intent.claim_evidence() != before.claim_evidence))
                 {
                     return Err(EngineError::ProjectionManifest(format!(
                         "captured path {path} completion is not its intended semantic predecessor"
@@ -9553,6 +9558,13 @@ impl ShardedHotEngine {
                     Some(&prior.bytes),
                 )
                 .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
+                if external_reconciliation
+                    && !prior.intent.matches_replay_except_frontier(replay.intent())
+                {
+                    return Err(EngineError::ProjectionManifest(format!(
+                        "captured path {path} completion does not replay the current external semantic predecessor"
+                    )));
+                }
                 if replay.target() != prior.bytes {
                     return Err(EngineError::ProjectionManifest(format!(
                         "captured path {path} prior bytes are not the exact semantic pre-state"

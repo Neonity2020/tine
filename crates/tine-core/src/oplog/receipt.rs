@@ -1190,6 +1190,24 @@ impl ProjectionIntent {
         &self.annotations
     }
 
+    /// Whether two intents name the same exact projection input and rendered
+    /// result, with only their accepted page frontiers allowed to differ.
+    ///
+    /// An external reconciliation may carry a durable base from before an
+    /// unrelated accepted batch advanced the page frontier. Callers must still
+    /// replay the current accepted state and compare through this method before
+    /// using that base; this is not authority to skip the replay.
+    pub(crate) fn matches_replay_except_frontier(&self, replay: &Self) -> bool {
+        self.workspace_id == replay.workspace_id
+            && self.page_id == replay.page_id
+            && self.path == replay.path
+            && self.policy == replay.policy
+            && self.claim_evidence == replay.claim_evidence
+            && self.precondition == replay.precondition
+            && self.target == replay.target
+            && self.annotations == replay.annotations
+    }
+
     fn from_wire(wire: ProjectionIntentWire) -> Result<Self, ReceiptError> {
         let intent = Self {
             receipt_schema_version: wire.receipt_schema_version,

@@ -4596,8 +4596,7 @@ fn capture_import_scope(
         for entry in catalog_entries {
             if entry.intent.workspace_id() != engine.workspace_id()
                 || entry.intent.page_id() != page_id
-                || entry.intent.frontier() != &current.state().frontier
-                || entry.intent.claim_evidence() != current.state().claim_evidence
+                || entry.intent.path() != path
             {
                 continue;
             }
@@ -4641,7 +4640,7 @@ fn capture_import_scope(
                 slot.insert(replay.into_intent_and_target());
             }
             let (replayed_intent, _) = &replay_cache[&base_key];
-            if replayed_intent == &entry.intent {
+            if entry.intent.matches_replay_except_frontier(replayed_intent) {
                 if exact.is_some() {
                     return Err(authority_block(
                         ImportBlockReason::CorruptBase,
