@@ -70,13 +70,56 @@ pub(crate) const RESUME_POINT_SUFFIX: &str = ".resume-point";
 pub(crate) const RESUME_POINT_SCHEMA_VERSION: u32 = 1;
 /// Hard fail-closed ceiling on one sealed record, on both encode and read.
 ///
-/// Every payload member is a constant-size authenticated root, a digest, or a
-/// `u64`; the only variable-length members are the authenticated LSM and point
-/// roots, whose segment references carry bounded key spans. Exceeding the
-/// ceiling is not an error the caller must recover from: it simply means this
-/// engine state is not *publishable*, so the restart pays a full replay. That
-/// is always available and always correct.
-pub(crate) const MAX_RESUME_POINT_BYTES: u64 = 16 * 1024;
+/// **This ceiling must exceed the widest record the format can legitimately
+/// produce.** It exists to bound the work a damaged, forged or provider-restored
+/// file can cost, not to decide which engine states are resumable. If a
+/// legitimate quiescent state can breach it, the breach silently disables
+/// adoption forever on exactly the endpoints that have been running longest —
+/// a capability limit wearing a corruption bound's clothes.
+///
+/// The original 16 KiB was chosen from the wrong scale knob. Measured with
+/// `resume_point_size_measurement` (release, on the reference host):
+///
+/// | shape | blocks | batches | sealed record |
+/// |---|---|---|---|
+/// | empty | 0 | 0 | 3,211 |
+/// | 8 batches x 1 page x 4 blocks | 32 | 8 | 6,979 |
+/// | 8 batches x 64 pages x 100 blocks | 51,200 | 8 | 7,025 |
+/// | 25 batches x 40 pages x 100 blocks | 100,000 | 25 | 11,015 |
+/// | 25 batches x 400 pages x 100 blocks | 1,000,000 | 25 | 11,137 |
+/// | 128 batches x 1 page x 4 blocks | 512 | 128 | 10,461 |
+/// | 300 batches x 1 page x 4 blocks | 1,200 | 300 | 9,939 |
+/// | 600 batches x 1 page x 4 blocks | 2,400 | 600 | 11,713 |
+/// | 1,023 batches x 1 page x 4 blocks | 4,092 | 1,023 | **17,349** |
+///
+/// A 1,600x change in graph size at a fixed batch count costs 46 bytes, and the
+/// release fixture's own million-block shape fits with room to spare. What
+/// actually moves the record is **how much work one retained run has absorbed
+/// over its lifetime**: the run-local LSM levels are a binary counter over
+/// flushes and the block-claim levels a base-32 counter over insertions, so a
+/// run that has absorbed on the order of a thousand accepted batches — an
+/// ordinary week of editing, and a retained run deliberately survives restarts —
+/// breaches 16 KiB.
+///
+/// Both counters are fixed-width arrays, so the record is structurally bounded
+/// rather than open-ended. Using the measured per-unit costs (about 88-118 bytes
+/// per occupied LSM level and about 149 bytes per occupied block-claim segment),
+/// the absolute maximum is roughly:
+///
+/// * 10 LSM roots (8 in `ScratchRoots`, one in each of the two accepted
+///   frontiers) x 32 levels x ~128 B  = ~40 KiB
+/// * 8 block-claim levels x 32 segments x ~176 B                = ~44 KiB
+/// * every constant-size member, from the measured empty record  = ~4 KiB
+///
+/// which is about 88 KiB. 128 KiB clears that with margin for the estimate,
+/// keeps the bound strict and fail-closed on both encode and read, and adds no
+/// per-edit work — nothing on the keystroke, admission or acceptance path
+/// encodes a resume point at all.
+///
+/// Exceeding the ceiling remains "this state is not *publishable*", never an
+/// error the caller must recover from: the restart pays a full replay, which is
+/// always available and always correct.
+pub(crate) const MAX_RESUME_POINT_BYTES: u64 = 128 * 1024;
 /// The bound one *publication* maintains, and the bound the strict adoption
 /// proof requires.
 ///
@@ -1027,11 +1070,14 @@ mod tests {
     /// A record whose run-local roots are all empty already costs ~3.1 KiB,
     /// because every authenticated digest is carried as a 64-character hex
     /// string and `BlockClaimIndexRoot` alone spells out 8 x 32 empty segment
-    /// slots. Populated roots grow from there, and a fully occupied block-claim
-    /// LSM would exceed [`MAX_RESUME_POINT_BYTES`] on its own. That is safe —
-    /// an over-ceiling state is simply not publishable and the restart replays
-    /// — but it is the number the later snapshot packet must measure against
-    /// real graphs before it decides this ceiling is the right one.
+    /// slots. Populated roots grow from there with **run lifetime**, not with
+    /// graph size, and the measurement that settled the ceiling is recorded on
+    /// [`MAX_RESUME_POINT_BYTES`]: at 1,023 accepted batches in one retained run
+    /// the record reaches 17,349 bytes, which the original 16 KiB refused.
+    ///
+    /// The ratio below is the load-bearing part. It fails if the ceiling is ever
+    /// pulled back down to something a legitimate long-lived run can breach,
+    /// which would turn a corruption bound into a silent capability limit.
     #[test]
     fn an_empty_rooted_record_records_its_measured_headroom() {
         let length = point(1).encode().unwrap().len() as u64;
@@ -1039,7 +1085,10 @@ mod tests {
             (3_000..=3_500).contains(&length),
             "empty-root sealed resume point is {length} bytes"
         );
-        assert!(length * 4 < MAX_RESUME_POINT_BYTES);
+        assert!(
+            length * 32 < MAX_RESUME_POINT_BYTES,
+            "the ceiling must stay far above the fixed cost of an empty record"
+        );
     }
 
     #[test]

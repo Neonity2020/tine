@@ -31232,32 +31232,54 @@ mod validation_tests {
         );
     }
 
-    /// R1: pinned absolute sizes, so a format change that inflates the record
-    /// has to be looked at rather than absorbed.
+    /// R1: pinned absolute sizes, and the ratio that keeps the format's own
+    /// ceiling a corruption bound instead of a capability limit.
     ///
-    /// `RESUME_POINT_ORDINARY_CEILING_BYTES` is the measured ordinary band with
-    /// headroom, deliberately far below the format's own fail-closed
-    /// `MAX_RESUME_POINT_BYTES`: the format ceiling exists to bound work on a
-    /// damaged file, while this one exists to notice a real growth regression.
+    /// Measured on the reference host: empty = 3,211 bytes, and an ordinary
+    /// populated state at 8 accepted batches = 7,025 bytes. The bands below sit
+    /// just above those, so an inflation regression has to be looked at rather
+    /// than absorbed.
+    ///
+    /// The last assertion is the one that defends the R1 decision. The record
+    /// grows with how much work one retained run has absorbed, not with graph
+    /// size, and at ~1,000 accepted batches it reaches 17,349 bytes — which the
+    /// original 16 KiB ceiling refused, silently disabling adoption on exactly
+    /// the longest-lived endpoints. Requiring an order of magnitude of headroom
+    /// over an ordinary record keeps that from being reintroduced.
     #[test]
     fn a_resume_point_record_stays_inside_its_measured_band() {
-        const RESUME_POINT_ORDINARY_CEILING_BYTES: usize = 16 * 1024;
+        const EMPTY_BAND_BYTES: usize = 4 * 1024;
+        const ORDINARY_BAND_BYTES: usize = 8 * 1024;
         let empty = resume_size_bytes(700_300, 0, 0, 0);
         let populated = resume_size_bytes(700_400, 8, 64, 100);
         assert!(
-            empty < 4 * 1024,
+            empty < EMPTY_BAND_BYTES,
             "an empty run-local state should encode small: {empty}"
         );
         assert!(
-            populated < RESUME_POINT_ORDINARY_CEILING_BYTES,
+            populated < ORDINARY_BAND_BYTES,
             "an ordinary populated run-local state exceeded its measured band: {populated}"
+        );
+        assert!(
+            populated * 10 < super::super::resume_point::MAX_RESUME_POINT_BYTES as usize,
+            "the resume-point ceiling has lost the headroom a long-lived retained run needs: \
+             ordinary record {populated}, ceiling {}",
+            super::super::resume_point::MAX_RESUME_POINT_BYTES
         );
     }
 
     /// R1 measurement lane. Not a gate: it records the sizes the report cites,
-    /// including the exact 25-batch / 400-page / 100-block shape of the release
-    /// 1M-block replay fixture, and the batch-count scaling that decides the
-    /// format's ceiling.
+    /// separating the two scale knobs so the format's ceiling can be argued
+    /// from the one that actually moves it.
+    ///
+    /// The graph-size knob is flat, so the interesting sweep is *batch count*:
+    /// the run-local LSM levels are a binary counter over flushes and the
+    /// block-claim levels a base-32 counter over insertions, so both grow with
+    /// how much work one retained run has absorbed over its lifetime, not with
+    /// how large the graph is. The 1M-block shape of the release replay fixture
+    /// is measured separately by
+    /// [`resume_point_size_measurement_at_one_million_blocks`], which is far
+    /// more expensive to author and adds nothing to this sweep.
     #[test]
     #[ignore = "runtime resume-point size measurement"]
     fn resume_point_size_measurement() {
@@ -31266,10 +31288,10 @@ mod validation_tests {
             ("8b x 1p x 4bl", 8, 1, 4),
             ("8b x 64p x 100bl", 8, 64, 100),
             ("25b x 40p x 100bl", 25, 40, 100),
-            ("25b x 400p x 100bl (1M)", 25, 400, 100),
+            ("128b x 1p x 4bl", 128, 1, 4),
             ("300b x 1p x 4bl", 300, 1, 4),
+            ("600b x 1p x 4bl", 600, 1, 4),
             ("1023b x 1p x 4bl", 1023, 1, 4),
-            ("2047b x 1p x 4bl", 2047, 1, 4),
         ] {
             let seed = 700_500 + (batches * 1000 + pages_per_batch) as u128;
             let (root, writer, engine) =
@@ -31291,6 +31313,31 @@ mod validation_tests {
             drop(writer);
             std::fs::remove_dir_all(root).unwrap();
         }
+    }
+
+    /// The exact 25-batch / 400-page / 100-block shape of the release 1M-block
+    /// replay fixture, measured on its own because authoring it costs tens of
+    /// minutes and several gigabytes of scratch.
+    ///
+    /// Run with:
+    /// `cargo test --release -p tine-core resume_point_size_measurement_at_one_million_blocks -- --ignored --nocapture`
+    #[test]
+    #[ignore = "one-million-block runtime resume-point size measurement"]
+    fn resume_point_size_measurement_at_one_million_blocks() {
+        let (root, writer, engine) = resume_size_engine(700_900, 25, 400, 100);
+        let record = resume_size_record(&engine);
+        eprintln!(
+            "resume_point_size label=1M blocks=1000000 batches=25 scratch_roots={} block_claim={} accepted_frontier={} record={:?}",
+            postcard::to_allocvec(&engine.scratch_roots).unwrap().len(),
+            postcard::to_allocvec(&engine.block_claim_root).unwrap().len(),
+            postcard::to_allocvec(&engine.accepted_frontier_root)
+                .unwrap()
+                .len(),
+            record.encode().map(|bytes| bytes.len()),
+        );
+        drop(engine);
+        drop(writer);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
 
