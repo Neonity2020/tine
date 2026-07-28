@@ -1289,4 +1289,99 @@ mod tests {
         assert!(!forensic.join("database").exists());
         assert!(!forensic.join("EVIDENCE_COMPLETE").exists());
     }
+
+    /// Drive the feed until the watcher queue settles, reporting every tick so
+    /// an unsettled or blocked drain is visible in the failure message.
+    fn drain_until_settled(handle: &SyncRuntimeHandle) -> Vec<SyncRuntimeTick> {
+        let mut ticks = Vec::new();
+        for _ in 0..32 {
+            let tick = handle.tick().unwrap();
+            let settled = matches!(
+                tick,
+                SyncRuntimeTick::Idle
+                    | SyncRuntimeTick::AdmittedNoop { .. }
+                    | SyncRuntimeTick::AdmittedComplete { .. }
+            );
+            ticks.push(tick);
+            let watcher = handle.status().unwrap().watcher;
+            if settled && !watcher.pending && !watcher.drain_in_flight {
+                break;
+            }
+        }
+        ticks
+    }
+
+    fn admitted_an_epoch(ticks: &[SyncRuntimeTick]) -> bool {
+        ticks.iter().any(|tick| {
+            matches!(
+                tick,
+                SyncRuntimeTick::AdmittedComplete { .. } | SyncRuntimeTick::AdmittedNoop { .. }
+            )
+        })
+    }
+
+    /// One preserved sync-provider conflict copy must not halt startup
+    /// reconciliation for the whole graph.
+    ///
+    /// This is the documented handoff: every device stops, the provider settles,
+    /// conflict copies are preserved, and Tine reopens. A conflict copy is
+    /// explicitly not a page, so it says nothing about any other page. The
+    /// user's ordinary external edit to an unrelated page must still be
+    /// imported, and the session must still be able to publish `HandoffSafe`.
+    #[test]
+    fn preserved_provider_conflict_copy_does_not_block_startup_reconciliation() {
+        let edited = "content/nested pages/rename old.org";
+        let edit = b"* edited in another editor while Tine was closed\n";
+        let conflict =
+            "content/nested pages/deep/Café note.sync-conflict-20260728-120000-ABCDEF.md";
+
+        let control = RuntimeHostFixture::safe("sync-runtime-conflict-control");
+        fs::write(control.graph_root().join(edited), edit).unwrap();
+        let control_manifests = control.manifest_count();
+        let control_handle = active_handle(SyncRuntimeHandle::open(control.request()));
+        let control_ticks = drain_until_settled(&control_handle);
+        assert!(
+            admitted_an_epoch(&control_ticks),
+            "control: startup reconciliation must settle the offline edit: {control_ticks:?}"
+        );
+        assert_eq!(control.manifest_count(), control_manifests + 1);
+        assert!(matches!(
+            control_handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+
+        let fixture = RuntimeHostFixture::safe("sync-runtime-conflict-copy");
+        fs::write(fixture.graph_root().join(conflict), b"- peer device copy\n").unwrap();
+        fs::write(fixture.graph_root().join(edited), edit).unwrap();
+        let manifests_before = fixture.manifest_count();
+        let handle = active_handle(SyncRuntimeHandle::open(fixture.request()));
+
+        let ticks = drain_until_settled(&handle);
+        assert!(
+            admitted_an_epoch(&ticks),
+            "startup reconciliation must still import an unrelated page's ordinary \
+             external edit while a preserved provider conflict copy sits in the \
+             graph, but the drain produced {ticks:?}"
+        );
+        assert_eq!(
+            fixture.manifest_count(),
+            manifests_before + 1,
+            "the unrelated external edit produced no durable batch"
+        );
+        let shutdown = handle.clean_shutdown();
+        assert!(
+            matches!(shutdown, Ok(SyncShutdownOutcome::Safe(_))),
+            "a preserved provider conflict copy must not make clean Safe handoff \
+             unreachable, but shutdown returned {shutdown:?}"
+        );
+        assert!(matches!(
+            fixture.handoff(),
+            EnrollmentDiscoveryHandoff::Safe
+        ));
+        assert_eq!(
+            fs::read(fixture.graph_root().join(conflict)).unwrap(),
+            b"- peer device copy\n",
+            "the conflict copy itself must be preserved byte for byte"
+        );
+    }
 }
