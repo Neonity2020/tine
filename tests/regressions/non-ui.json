@@ -1226,6 +1226,29 @@
         "failBefore": "proven"
       },
       "notes": "At 8f23e6a0, the public runtime journey first failed with 'initial shadow managed paths share one semantic key'. Removing that admission guard exposed the deeper ConflictingLocalTail ImportBlock from plan_affected_import/preflight_desired_page_names, which still denied unrelated reconciliation and Safe handoff."
+    },
+    {
+      "id": "REG-SYNC-EDITOR-INTENT-FRONTIER-001",
+      "title": "Sparse-oplog editor saves use actor-owned identity and ordering and refuse stale or ambiguous page state without a second writer",
+      "family": "sync-data-safety",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/sync_runtime.rs",
+          "crates/tine-core/src/oplog/sqlite_materialization.rs"
+        ],
+        "scenario": "sync.editor-intent-actor-owned-frontier",
+        "failBefore": "source-proven"
+      },
+      "notes": "Covers OG-normalized name-and-kind lookup across nested .md/.markdown/.org paths, duplicate-owner ambiguity, actor-issued revisions, whole-outline edit/insert/move/reorder/delete, configured page and journal creation, pre-enqueue bounds and cycle checks, stale external-edit refusal, and retained-publication retry through the sole operational coordinator."
     }
   ]
 }

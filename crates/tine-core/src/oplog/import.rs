@@ -5587,7 +5587,7 @@ fn build_execution_material(
     })
 }
 
-fn imported_order(sibling_position: u32) -> String {
+pub(crate) fn imported_order(sibling_position: u32) -> String {
     format!("{sibling_position:010}")
 }
 

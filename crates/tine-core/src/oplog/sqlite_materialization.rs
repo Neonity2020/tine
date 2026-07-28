@@ -3296,6 +3296,32 @@ impl<'a> SqliteMaterializedRead<'a> {
         self.pages_by_text_column("name_key", name_key, limit)
     }
 
+    /// Exact OG-compatible logical-name lookup scoped by managed text kind.
+    /// Callers use a limit of two to distinguish one owner from ambiguity
+    /// without scanning or retaining an unbounded duplicate set.
+    pub fn pages_by_name_key_and_kind(
+        &self,
+        name_key: &str,
+        kind: ManagedTextKind,
+        limit: usize,
+    ) -> Result<Vec<MaterializedPageRow>, MaterializationError> {
+        let limit = checked_limit(limit)?;
+        checked_query_text(name_key)?;
+        let mut statement = self.connection.prepare(
+            "SELECT page_id, home_document_id, name, name_key, path,
+                    text_kind, preamble, searchable_text
+             FROM pages
+             WHERE name_key = ?1 AND text_kind = ?2
+             ORDER BY page_id LIMIT ?3",
+        )?;
+        let rows =
+            statement.query_map(params![name_key, text_kind_to_sql(kind), limit], page_row)?;
+        collect_read_rows(
+            rows.map(|row| row.map_err(MaterializationError::from)),
+            page_row_output_bytes,
+        )
+    }
+
     pub fn pages_by_path(
         &self,
         path: &ManagedPath,

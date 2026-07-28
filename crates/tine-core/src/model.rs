@@ -10475,6 +10475,45 @@ impl Graph {
         }
     }
 
+    /// Derive the configured path for a brand-new sparse-oplog page without
+    /// listing or reading graph files. Exact logical-name and path occupancy
+    /// are revalidated against the actor's frontier-stamped materialization
+    /// before this path is allowed into a transaction.
+    pub(crate) fn new_sparse_page_path(
+        &self,
+        name: &str,
+        kind: PageKind,
+    ) -> io::Result<ManagedPath> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "empty page name",
+            ));
+        }
+        let extension = self.preferred_format().ext();
+        let absolute = match kind {
+            PageKind::Page => self.pages_path().join(format!(
+                "{}.{extension}",
+                encode_page_name(name, self.config.file_name_format)
+            )),
+            PageKind::Journal => {
+                let date = self.journal_format.parse(name).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "journal name does not match configured date title",
+                    )
+                })?;
+                self.journals_path().join(format!(
+                    "{}.{extension}",
+                    self.journal_format.file_stem(date)
+                ))
+            }
+        };
+        ManagedPath::parse(self.rel_path(&absolute))
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))
+    }
+
     /// Create a Markdown page file with `content` if that logical page does not
     /// already exist. Used by the explicit guide-copy action:
     /// it is intentionally raw Markdown, not a serialized DTO, so copied guide
