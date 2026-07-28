@@ -1497,7 +1497,7 @@ mod tests {
     }
 
     #[test]
-    fn unsafe_takeover_cannot_run_with_old_owner_and_uses_recovery_gate_after_crash() {
+    fn unsafe_takeover_cannot_run_with_old_owner_and_recovers_before_safe() {
         let mut fixture = RuntimeHostFixture::unsafe_held("sync-runtime-unsafe-owner");
         let request = fixture.request();
         let refused = SyncRuntimeHandle::open(request.clone());
@@ -1513,14 +1513,18 @@ mod tests {
             handle.status().unwrap().recovery,
             Some(SyncRuntimeRecovery::TookOverCrashedUnsafe)
         );
+        let ticks = drain_until_settled(&handle);
+        assert!(
+            admitted_an_epoch(&ticks),
+            "crash takeover must settle its startup full scan before Safe: {ticks:?}"
+        );
         assert!(matches!(
-            handle.tick().unwrap(),
-            SyncRuntimeTick::RecoveryBlocked(_)
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
         ));
-        drop(handle);
         assert!(matches!(
             fixture.handoff(),
-            EnrollmentDiscoveryHandoff::Unsafe { .. }
+            EnrollmentDiscoveryHandoff::Safe
         ));
     }
 
@@ -1656,11 +1660,77 @@ mod tests {
             reopened.status().unwrap().recovery,
             Some(SyncRuntimeRecovery::TookOverCrashedUnsafe)
         );
+        let ticks = drain_until_settled(&reopened);
+        assert!(
+            admitted_an_epoch(&ticks),
+            "crash takeover must reconcile its forced full scan: {ticks:?}"
+        );
         assert!(matches!(
-            reopened.tick().unwrap(),
-            SyncRuntimeTick::RecoveryBlocked(_)
+            reopened.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
         ));
-        drop(reopened);
+        assert!(matches!(
+            fixture.handoff(),
+            EnrollmentDiscoveryHandoff::Safe
+        ));
+    }
+
+    #[test]
+    fn unsafe_crash_takeover_reconciles_closed_interval_edit_and_reaches_safe() {
+        let fixture = RuntimeHostFixture::safe("sync-runtime-crash-recovery-liveness");
+        let request = fixture.request();
+        let handle = active_handle(SyncRuntimeHandle::open(request.clone()));
+        drive_initial_feed(&handle);
+        drop(handle);
+        assert!(matches!(
+            fixture.handoff(),
+            EnrollmentDiscoveryHandoff::Unsafe { .. }
+        ));
+
+        let path = "content/nested pages/changed after crash.md";
+        let bytes = b"- external editor changed this while Tine was down\n";
+        fs::write(fixture.graph_root().join(path), bytes).unwrap();
+        let manifests_before_reopen = fixture.manifest_count();
+
+        let reopened = active_handle(SyncRuntimeHandle::open(request.clone()));
+        assert_eq!(
+            reopened.status().unwrap().recovery,
+            Some(SyncRuntimeRecovery::TookOverCrashedUnsafe)
+        );
+        let ticks = drain_until_settled(&reopened);
+        assert!(
+            admitted_an_epoch(&ticks),
+            "crash takeover must drive its authenticated full reconciliation before Safe: {ticks:?}"
+        );
+        assert_eq!(
+            fs::read(fixture.graph_root().join(path)).unwrap(),
+            bytes,
+            "recovery must not overwrite the unimported projection bytes"
+        );
+        assert_eq!(
+            fixture.manifest_count(),
+            manifests_before_reopen + 1,
+            "the closed-interval external edit must be admitted before Safe"
+        );
+        assert!(matches!(
+            reopened.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+        assert!(matches!(
+            fixture.handoff(),
+            EnrollmentDiscoveryHandoff::Safe
+        ));
+
+        let safe_reopen = active_handle(SyncRuntimeHandle::open(request));
+        assert_eq!(
+            safe_reopen.status().unwrap().recovery,
+            Some(SyncRuntimeRecovery::AdoptedSafeHandoff)
+        );
+        drive_initial_feed(&safe_reopen);
+        assert!(matches!(
+            safe_reopen.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
     }
 
     /// A realistic crashed session has advanced the accepted frontier, so its
@@ -1709,7 +1779,17 @@ mod tests {
             reopened.status().unwrap().recovery,
             Some(SyncRuntimeRecovery::TookOverCrashedUnsafe)
         );
-        drop(reopened);
+        let manifests_after_reopen = fixture.manifest_count();
+        drive_initial_feed(&reopened);
+        assert_eq!(
+            fixture.manifest_count(),
+            manifests_after_reopen,
+            "the accepted pre-crash import must not be duplicated during recovery catch-up"
+        );
+        assert!(matches!(
+            reopened.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
     }
 
     #[test]

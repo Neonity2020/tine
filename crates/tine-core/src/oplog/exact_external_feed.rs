@@ -26,7 +26,8 @@ use crate::model::{
 use super::{
     hot_engine::ProjectionStorageBinding,
     local_active::{
-        ExternalImportAdmission, LocalActiveAuthority, PromotedLocalRuntime, RuntimeRevocation,
+        ExternalImportAdmission, LocalActiveAuthority, PromotedLocalRuntime, RuntimePromotionError,
+        RuntimeRevocation,
     },
     reconciliation_baseline::{BaselineTimestamp, ReconciliationBaseline},
     reconciliation_scan::{ReconciliationSchedulerLimits, ReconciliationTrigger},
@@ -131,8 +132,10 @@ pub(crate) enum ExactExternalFeedDrain {
     /// The caller did not present the exact actor-owned runtime/authority pair.
     /// No watcher queue or feed state was touched.
     ForeignActor,
-    /// The promoted runtime did not adopt a clean `Safe` handoff. Work remains
-    /// queued; only a fresh runtime reopen/takeover may change this result.
+    /// The promoted runtime did not adopt a clean `Safe` handoff and does not
+    /// currently own an in-progress or completed startup full-scan recovery
+    /// catch-up. Work remains queued and no external import authority is
+    /// granted.
     RecoveryBlocked(&'static str),
     /// A durable coordinator continuation or required follow-up full scan is
     /// retained by this owner. The queue epoch remains in flight and unacked.
@@ -363,11 +366,10 @@ impl ExactExternalFeedState {
         if let Some(revocation) = runtime.workspace_authority_revocation() {
             return self.stop_revoked(graph, runtime, revocation);
         }
-        match runtime.automatic_external_import() {
-            ExternalImportAdmission::Allowed => {}
-            ExternalImportAdmission::Blocked(reason) => {
-                return ExactExternalFeedDrain::RecoveryBlocked(reason);
-            }
+        if let Err(result) =
+            self.admit_automatic_external_import_recovery(graph, authority, runtime)
+        {
+            return result;
         }
         if let Err(error) = validate_live_binding(graph, receipts, runtime, self.binding) {
             return self.stop_runtime(graph, runtime, error.detail);
@@ -552,15 +554,55 @@ impl ExactExternalFeedState {
                     // or fold a later watcher epoch into this one.
                     return ExactExternalFeedDrain::Recovering;
                 };
-                self.finish_terminal(graph, runtime, step, changed_paths)
+                self.finish_terminal(graph, authority, runtime, step, changed_paths)
             }
         }
+    }
+
+    fn admit_automatic_external_import_recovery(
+        &mut self,
+        graph: &Graph,
+        authority: &mut LocalActiveAuthority,
+        runtime: &mut PromotedLocalRuntime,
+    ) -> Result<(), ExactExternalFeedDrain> {
+        match runtime.automatic_external_import() {
+            ExternalImportAdmission::Allowed => Ok(()),
+            ExternalImportAdmission::Blocked(_) if self.recovery_catch_up_complete() => runtime
+                .complete_automatic_external_import_recovery(authority, graph)
+                .map_err(Self::recovery_completion_failed),
+            ExternalImportAdmission::Blocked(_) if self.recovery_catch_up_owed_or_in_progress() => {
+                Ok(())
+            }
+            ExternalImportAdmission::Blocked(reason) => {
+                Err(ExactExternalFeedDrain::RecoveryBlocked(reason))
+            }
+        }
+    }
+
+    fn recovery_catch_up_owed_or_in_progress(&self) -> bool {
+        !self.caught_up_published
+            && (self.initial_index_build_pending
+                || self
+                    .active
+                    .as_ref()
+                    .is_some_and(|active| matches!(active.scope, ActiveDrainScope::FullScan)))
+    }
+
+    fn recovery_catch_up_complete(&self) -> bool {
+        self.caught_up_published && !self.initial_index_build_pending && self.active.is_none()
+    }
+
+    fn recovery_completion_failed(error: RuntimePromotionError) -> ExactExternalFeedDrain {
+        ExactExternalFeedDrain::Failed(format!(
+            "automatic external import recovery catch-up could not be authenticated: {error}"
+        ))
     }
 
     fn finish_terminal(
         &mut self,
         graph: &Graph,
-        runtime: &PromotedLocalRuntime,
+        authority: &mut LocalActiveAuthority,
+        runtime: &mut PromotedLocalRuntime,
         step: ReconciliationSessionStep,
         changed_paths: ReconciliationTerminalChangedPaths,
     ) -> ExactExternalFeedDrain {
@@ -661,6 +703,11 @@ impl ExactExternalFeedState {
             return self.handle_settlement_error(graph, runtime, error);
         }
         self.active = None;
+        if let Err(result) =
+            self.admit_automatic_external_import_recovery(graph, authority, runtime)
+        {
+            return result;
+        }
         match step {
             ReconciliationSessionStep::Noop => ExactExternalFeedDrain::AdmittedNoop {
                 epoch: epoch.sequence(),
@@ -1999,30 +2046,44 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn recovery_gate_retains_the_forced_scan_until_a_fresh_safe_reopen() {
+    fn recovery_gate_opens_only_after_the_forced_full_scan_catch_up() {
         let mut fixture = configured_fixture("recovery-gate");
         let enrollment = fixture.enrollment_root("recovery-gate");
         let paths = PromotedPaths::new(&fixture, "recovery-gate");
         let (mut authority, mut runtime) =
             promote(&mut fixture, &enrollment, SessionId::new(), &paths);
         assert_eq!(runtime.recovery(), RuntimeRecoveryState::FirstPromotion);
+        assert!(matches!(
+            runtime.automatic_external_import(),
+            ExternalImportAdmission::Blocked(_)
+        ));
         let baseline = fixture.baseline(&fixture.graph, "recovery-gate", false);
         let mut owner =
             ExactExternalFeedState::open(&fixture.graph, &fixture.receipts, &runtime, baseline)
                 .unwrap();
-        let result = owner.drain_one(
-            &fixture.graph,
-            &fixture.receipts,
-            &mut authority,
-            &mut runtime,
-            BaselineTimestamp::from_millis(1).unwrap(),
-        );
-        assert!(matches!(result, ExactExternalFeedDrain::RecoveryBlocked(_)));
         let status = runtime.watcher_status();
         assert_eq!(status.latest_enqueue.sequence(), 1);
         assert_eq!(status.acknowledged.sequence(), 0);
         assert!(status.pending_requires_full_scan);
-        assert_eq!(owner.feed_sequence, 0);
+
+        let mut clock = 0;
+        assert_admitted(drive_terminal(
+            &mut owner,
+            &fixture.graph,
+            &fixture.receipts,
+            &mut authority,
+            &mut runtime,
+            &mut clock,
+        ));
+        let status = runtime.watcher_status();
+        assert_eq!(status.latest_enqueue.sequence(), 1);
+        assert_eq!(status.acknowledged.sequence(), 1);
+        assert!(!status.pending);
+        assert_eq!(
+            runtime.automatic_external_import(),
+            ExternalImportAdmission::Allowed
+        );
+        assert_eq!(owner.feed_sequence, 1);
     }
 
     #[test]
@@ -2088,8 +2149,9 @@ pub(crate) mod tests {
         assert_eq!(fixture.manifest_count(), manifests_before + 1);
         let committed_after_crash = fixture.manifest_count();
 
-        // Dropping the process-local owner loses its in-memory epoch. A genuine
-        // crash takeover remains recovery-gated and cannot import in place.
+        // Dropping the process-local owner loses its in-memory epoch. The
+        // crash takeover starts recovery-gated and cannot use exact-path import
+        // authority before a full recovery catch-up or a fresh Safe reopen.
         drop(owner);
         drop(runtime);
         drop(authority);
@@ -2107,9 +2169,11 @@ pub(crate) mod tests {
             ExternalImportAdmission::Blocked(_)
         ));
 
-        // The parallel C4 worker is the production owner of the Safe ordering.
-        // Its existing test-only proof boundary lets this packet exercise the
-        // later safe reopen without weakening the production recovery gate.
+        // This fixture's exact-feed owner crashed after terminal reconcile but
+        // before queue acknowledgement, leaving the old graph-feed owner
+        // terminal. Use the existing test-only Safe proof boundary to exercise
+        // the later fresh-safe-reopen deterministic replay neighbor without
+        // broadening this packet into exact-feed lease-drop recovery.
         takeover_runtime
             .quiesce_and_mark_safe_without_watcher_dependency_for_test(
                 &mut takeover_authority,
