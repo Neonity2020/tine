@@ -175,6 +175,8 @@ pub(crate) struct ExactExternalFeedOwner {
     feed_sequence: u64,
     caught_up_published: bool,
     terminal: Option<ExactExternalFeedTerminal>,
+    #[cfg(test)]
+    rebase_count: u64,
 }
 
 impl fmt::Debug for ExactExternalFeedOwner {
@@ -245,6 +247,8 @@ impl ExactExternalFeedOwner {
             feed_sequence: 0,
             caught_up_published: false,
             terminal: None,
+            #[cfg(test)]
+            rebase_count: 0,
         })
     }
 
@@ -394,6 +398,10 @@ impl ExactExternalFeedOwner {
             match graph.rebase_graph_text_exact_feed_at_fence(&self.lease, epoch.sequence()) {
                 Ok(()) => {
                     self.feed_sequence = epoch.sequence();
+                    #[cfg(test)]
+                    {
+                        self.rebase_count += 1;
+                    }
                     self.active
                         .as_mut()
                         .expect("active drain disappeared")
@@ -481,15 +489,9 @@ impl ExactExternalFeedOwner {
                     // A stable full scan may require one post-drain confirmation
                     // scan. The intermediate semantic outcome is not terminal
                     // for the queue epoch and therefore cannot be acknowledged.
-                    if matches!(
-                        self.active.as_ref().map(|active| &active.scope),
-                        Some(ActiveDrainScope::FullScan)
-                    ) {
-                        self.active
-                            .as_mut()
-                            .expect("active drain disappeared")
-                            .rebase_before_step = true;
-                    }
+                    // The exact index was already rebuilt at this epoch's fence;
+                    // the confirmation pass must not publish a second rebuild
+                    // or fold a later watcher epoch into this one.
                     return ExactExternalFeedDrain::Recovering;
                 };
                 self.finish_terminal(graph, step, changed_paths)
@@ -1448,6 +1450,7 @@ mod tests {
             WatcherObservation::NotifyError,
             WatcherObservation::RescanRequired,
         ] {
+            let rebases_before = owner.rebase_count;
             owner
                 .observe(&fixture.graph, owner.binding, [observation])
                 .unwrap();
@@ -1462,8 +1465,10 @@ mod tests {
             let settled = owner.queue.status();
             assert_eq!(settled.acknowledged, settled.latest_enqueue);
             assert_eq!(owner.feed_sequence, settled.acknowledged.sequence());
+            assert_eq!(owner.rebase_count, rebases_before + 1);
         }
 
+        let rebases_before_count_overflow = owner.rebase_count;
         let count_overflow = (0..=EXACT_FEED_MAXIMUM_PATHS)
             .map(|index| {
                 WatcherObservation::ManagedPath(
@@ -1486,7 +1491,9 @@ mod tests {
             &fixture.receipts,
             &mut clock,
         ));
+        assert_eq!(owner.rebase_count, rebases_before_count_overflow + 1);
 
+        let rebases_before_byte_overflow = owner.rebase_count;
         let component = "x".repeat(100);
         let byte_overflow = (0..220)
             .map(|index| {
@@ -1526,6 +1533,7 @@ mod tests {
         let settled = owner.queue.status();
         assert_eq!(settled.acknowledged, settled.latest_enqueue);
         assert_eq!(owner.feed_sequence, settled.acknowledged.sequence());
+        assert_eq!(owner.rebase_count, rebases_before_byte_overflow + 1);
     }
 
     #[test]
