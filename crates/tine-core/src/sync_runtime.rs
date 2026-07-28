@@ -1213,6 +1213,55 @@ mod tests {
         drop(reopened);
     }
 
+    /// A realistic crashed session has advanced the accepted frontier, so its
+    /// disposable projection may need rebuilding during authenticated takeover.
+    #[test]
+    fn crash_after_an_accepted_import_can_still_take_over_its_own_projection() {
+        let fixture = RuntimeHostFixture::safe("sync-runtime-crash-after-import");
+        let request = fixture.request();
+        let page = "content/nested pages/alpha.md";
+        let bytes = b"- imported before the crash\n";
+
+        let handle = active_handle(SyncRuntimeHandle::open(request.clone()));
+        drive_initial_feed(&handle);
+        let manifests_before = fixture.manifest_count();
+        fs::write(fixture.graph_root().join(page), bytes).unwrap();
+        handle
+            .observe_watcher(vec![SyncWatcherObservation::managed_path(page).unwrap()])
+            .unwrap();
+        drive_initial_feed(&handle);
+        assert_eq!(
+            fixture.manifest_count(),
+            manifests_before + 1,
+            "the external edit must be accepted into the oplog before the crash"
+        );
+
+        drop(handle);
+        assert!(matches!(
+            fixture.handoff(),
+            EnrollmentDiscoveryHandoff::Unsafe { .. }
+        ));
+        assert_eq!(
+            fs::read(fixture.graph_root().join(page)).unwrap(),
+            bytes,
+            "the external file is untouched by the crash"
+        );
+
+        let reopened = SyncRuntimeHandle::open(request);
+        assert_eq!(
+            reopened.status,
+            SyncRuntimeOpenStatus::Active,
+            "a crash after an accepted import must still reach the crash-takeover \
+             path; the oplog is intact and SQLite is a disposable materialization"
+        );
+        let reopened = reopened.handle.expect("takeover must return a handle");
+        assert_eq!(
+            reopened.status().unwrap().recovery,
+            Some(SyncRuntimeRecovery::TookOverCrashedUnsafe)
+        );
+        drop(reopened);
+    }
+
     #[test]
     fn revocation_latches_terminal_drops_authority_and_refuses_later_intake() {
         let fixture = RuntimeHostFixture::safe("sync-runtime-revocation");
