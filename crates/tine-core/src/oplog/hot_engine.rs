@@ -3541,6 +3541,35 @@ impl RuntimeResumeSnapshot {
     pub(crate) const fn catalog_checkpoint_binding(&self) -> ContentDigest {
         self.catalog_checkpoint_binding
     }
+
+    /// An empty-rooted snapshot for storage-layer tests that have no engine.
+    ///
+    /// `#[cfg(test)]` on purpose: in production the only mint is
+    /// [`ShardedHotEngine::runtime_resume_snapshot`], and that gate — retained,
+    /// quiescent, conflict-free, non-terminal, live head re-read, head record
+    /// adoptable — is the whole reason a sealed record can be trusted to
+    /// describe a state the engine can honour.
+    #[cfg(test)]
+    pub(crate) fn empty_rooted_for_test(
+        history: (u64, ContentDigest, BatchId),
+        scratch: (Uuid, ContentDigest),
+    ) -> Self {
+        Self {
+            history_generation: history.0,
+            history_index_root: history.1,
+            history_latest_batch_id: history.2,
+            scratch_run_id: scratch.0,
+            scratch_binding_digest: scratch.1,
+            scratch_roots: ScratchRoots::default(),
+            block_claim_root: BlockClaimIndexRoot::default(),
+            accepted_frontier_root: AcceptedFrontierRoot::empty(),
+            next_acceptance_sequence: 1,
+            current_path_catalog_root: ScratchAuthenticatedCatalogRoot::default(),
+            current_path_catalog_available: true,
+            current_path_catalog_frontier: AcceptedFrontierRoot::empty(),
+            catalog_checkpoint_binding: ContentDigest::of(b"resume-point-test-catalog-checkpoint"),
+        }
+    }
 }
 
 /// The members of an accepted frontier that are **not** run-local.
@@ -23296,6 +23325,146 @@ mod validation_tests {
             fixture.author_accepted_round(706_200 + round * 100, &format!("cost {round}"));
         }
         assert_eq!(fixture.engine.instrumentation().resume, authored_before);
+
+        finish_preauthor_gate_fixture(fixture);
+    }
+
+    /// The sealed record/snapshot pair, exercised on a real engine.
+    ///
+    /// `cross_run_engine_facts` and the projection oracle prove that an adopted
+    /// engine *behaves* like a full-replay one; this proves the far cheaper
+    /// property the persistent format has to carry on its own: a record sealed
+    /// from a live engine's snapshot, written to bytes, read back, and re-proved
+    /// against the live open's authority converts to **exactly** the snapshot the
+    /// engine emitted. If it did not, adoption would be resuming from a state no
+    /// engine ever produced, and every downstream proof would be about the wrong
+    /// object.
+    fn resume_point_authority(
+        point: &super::super::resume_point::RuntimeResumePointV1,
+    ) -> super::super::object_store::ResumeAdoptionAuthority {
+        super::super::object_store::ResumeAdoptionAuthority::for_test(
+            point.workspace_id(),
+            super::super::ProjectionEndpointId::from_uuid(Uuid::from_u128(0x5126)),
+            point.promoted_state_digest(),
+            (
+                point.history_generation(),
+                point.history_index_root(),
+                Some(point.history_latest_batch_id()),
+            ),
+            super::super::resume_point::ResumeEnrollmentAdmission::SameSession(point.enrollment()),
+        )
+    }
+
+    fn seal_resume_point(
+        engine: &ShardedHotEngine,
+        snapshot: &RuntimeResumeSnapshot,
+    ) -> super::super::resume_point::RuntimeResumePointV1 {
+        super::super::resume_point::RuntimeResumePointV1::seal(
+            &super::super::object_store::ResumePointEndpointBinding::for_test(
+                engine.workspace_id(),
+                super::super::ProjectionEndpointId::from_uuid(Uuid::from_u128(0x5126)),
+                ContentDigest::of(b"resume-record-promoted-state"),
+                1,
+            ),
+            super::super::resume_point::ResumePointEnrollment {
+                generation: 3,
+                head: ContentDigest::of(b"resume-record-enrollment-head"),
+                unsafe_session_id: SessionId::from_uuid(Uuid::from_u128(0x5127)),
+            },
+            snapshot,
+        )
+        .expect("a quiescent snapshot seals into a resume point")
+    }
+
+    #[test]
+    fn a_sealed_record_reconstructs_the_exact_snapshot_the_engine_emitted() {
+        let mut fixture = preauthor_gate_fixture_with_retention(709_000, true);
+        for round in 0..3u128 {
+            fixture.author_accepted_round(709_100 + round * 100, &format!("record {round}"));
+        }
+        let snapshot = fixture
+            .engine
+            .runtime_resume_snapshot()
+            .unwrap()
+            .expect("a quiescent retained enrolled engine is publishable");
+
+        let point = seal_resume_point(&fixture.engine, &snapshot);
+        // Through the durable bytes, not around them.
+        let durable = super::super::resume_point::RuntimeResumePointV1::decode(
+            &point
+                .encode()
+                .expect("a live engine's state is publishable"),
+        )
+        .expect("the sealed record must read back");
+        assert_eq!(durable, point);
+
+        let authority = resume_point_authority(&durable);
+        let reconstructed = durable
+            .authenticate(&authority)
+            .expect("a record sealed from this open must re-prove its authority")
+            .into_adoption_snapshot();
+        assert_eq!(
+            reconstructed, snapshot,
+            "a valid record must reconstruct the exact snapshot the live engine emitted"
+        );
+
+        // And the reconstructed snapshot is the one the resuming open adopts.
+        let receipt = fixture.reopen_resuming(Some(&reconstructed));
+        assert!(receipt.observation.adopted, "{:?}", receipt.refusal);
+        assert_eq!(
+            receipt.observation.replay_base_generation,
+            snapshot.history_generation()
+        );
+
+        finish_preauthor_gate_fixture(fixture);
+    }
+
+    /// Record work is lifecycle work, and must stay out of the edit path.
+    ///
+    /// The snapshot read already has its own cost regression; this extends it
+    /// over the two operations the lifecycle assembly will actually perform each
+    /// publication cycle — sealing the durable record and encoding it — because
+    /// those are the ones a later refactor is most likely to move next to an
+    /// admission or an acceptance.
+    #[test]
+    fn sealing_a_resume_point_record_costs_no_admission_or_authoring_work() {
+        let mut fixture = preauthor_gate_fixture_with_retention(709_500, true);
+        fixture.author_accepted_round(709_600, "seal cost");
+
+        let before = fixture.engine.instrumentation();
+        let token_before = fixture.engine.author_generation_root().unwrap();
+        let snapshot = fixture.engine.runtime_resume_snapshot().unwrap().unwrap();
+        let first = seal_resume_point(&fixture.engine, &snapshot);
+        let first_bytes = first.encode().unwrap();
+        let second = seal_resume_point(&fixture.engine, &snapshot);
+        let after = fixture.engine.instrumentation();
+
+        assert_eq!(
+            first, second,
+            "sealing a quiescent state must be idempotent"
+        );
+        assert_eq!(first_bytes, second.encode().unwrap());
+        assert_eq!(after.scratch_page_reads, before.scratch_page_reads);
+        assert_eq!(after.scratch_syncs, before.scratch_syncs);
+        assert_eq!(after.state_page_bytes_read, before.state_page_bytes_read);
+        assert_eq!(
+            after.state_page_bytes_written,
+            before.state_page_bytes_written
+        );
+        assert_eq!(after.prepare_transactions, before.prepare_transactions);
+        assert_eq!(after.resume, before.resume);
+        assert_eq!(
+            fixture.engine.author_generation_root().unwrap(),
+            token_before,
+            "sealing a record must not advance the author staleness token"
+        );
+
+        // Ordinary authoring never seals one, so the standing observation is
+        // still exactly its startup value afterwards.
+        for round in 0..3u128 {
+            fixture.author_accepted_round(709_700 + round * 100, &format!("seal cost {round}"));
+        }
+        assert_eq!(fixture.engine.instrumentation().resume, before.resume);
 
         finish_preauthor_gate_fixture(fixture);
     }

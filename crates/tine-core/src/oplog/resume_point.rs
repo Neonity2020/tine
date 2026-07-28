@@ -454,8 +454,13 @@ impl RuntimeResumePointV1 {
     ///   *older* generation than the live head, because the whole purpose of
     ///   adoption is to replay only the durable tail. It may never name a
     ///   generation *ahead* of the live head, and at the live generation it
-    ///   must name the live index root and the live latest record. That is the
-    ///   substituted/stale-binding refusal;
+    ///   must name the live index root, and the live head's record whenever the
+    ///   head names one. That is the substituted/stale-binding refusal. (A head
+    ///   that names no record at all is the unadvanced bootstrap anchor, which
+    ///   no legitimate mint produces a point for — `runtime_resume_snapshot`
+    ///   refuses generation zero and a head with no latest record — so there is
+    ///   nothing to compare against there, and the engine's own restore refuses
+    ///   the unreadable record anyway.);
     /// * **enrollment evidence** — exactly as [`ResumeEnrollmentAdmission`]
     ///   describes.
     ///
@@ -486,7 +491,9 @@ impl RuntimeResumePointV1 {
         }
         if self.history_generation == authority.history_generation()
             && (self.history_index_root != authority.history_index_root()
-                || Some(self.history_latest_batch_id) != authority.history_latest_batch_id())
+                || authority
+                    .history_latest_batch_id()
+                    .is_some_and(|live| live != self.history_latest_batch_id))
         {
             return Err(ResumePointError::BindingRefused(
                 "the point names a substituted durable history authority at the live generation",
@@ -2394,6 +2401,97 @@ mod tests {
         // `ResumePointSet` likewise has no free empty constructor to route
         // around the scan with.
         assert!(!RESUME_POINT_SOURCE.contains(format!("fn empty() -> {}", "Self").as_str()));
+    }
+
+    /// `cf7dbe0b`'s lesson, applied to the RRP surface.
+    ///
+    /// Most of the fence is structural and needs no test: the record's fields
+    /// are private, `ResumePointEndpointBinding` and `ResumeAdoptionAuthority`
+    /// have private fields in `object_store`, `AuthenticatedResumePoint` has a
+    /// private field here, `PublishedResumePoint` is minted only on a successful
+    /// publication, and `DurableEngineHistoryStore::read_resume_point_set` is
+    /// module-private — every one of those is `E0616`/`E0603` for an activation
+    /// caller, not a convention.
+    ///
+    /// What privacy cannot express is the *sibling* case: `local_active` and its
+    /// coordinator/reconciliation neighbours live in `crate::oplog` too, so
+    /// `pub(super)` does not exclude them, and Rust has no "visible to one
+    /// sibling module" visibility. This test is that missing half. It fails when
+    /// the later activation path reaches around the four sealed entry points for
+    /// the raw scan, the raw reachability proof, the raw maintenance functions,
+    /// or a hand-built record.
+    ///
+    /// A failure here means the activation path acquired deletion or authority
+    /// surface it was designed not to have — not that the test is stale.
+    #[test]
+    fn the_activation_path_can_only_reach_the_sealed_resume_entry_points() {
+        const ACTIVATION_SOURCES: [(&str, &str); 3] = [
+            ("local_active.rs", include_str!("local_active.rs")),
+            (
+                "operational_coordinator.rs",
+                include_str!("operational_coordinator.rs"),
+            ),
+            (
+                "reconciliation_session.rs",
+                include_str!("reconciliation_session.rs"),
+            ),
+        ];
+        const OBJECT_STORE_SOURCE: &str = include_str!("object_store.rs");
+
+        // The raw surface the sealed entry points exist to replace.
+        let forbidden = [
+            ("read_resume_point_set", "read_resume_adoption_candidate"),
+            (
+                "reclaim_unreachable_retained_runs",
+                "reclaim_retained_runs_after_publication",
+            ),
+            (
+                "ReachableRetainedRuns",
+                "reclaim_retained_runs_after_publication",
+            ),
+            ("ResumePointSet", "read_resume_adoption_candidate"),
+            ("ResumePointScan", "read_resume_adoption_candidate"),
+            ("prune_resume_points_below", "publish_resume_point"),
+            ("clear_resume_points_in", "clear_resume_points"),
+            ("next_resume_sequence", "mint_resume_point"),
+            ("census_retained_runs", "plan_engine_scratch_retention"),
+            ("RuntimeResumePointV1", "mint_resume_point"),
+            ("AuthenticatedResumePoint", "read_resume_adoption_candidate"),
+            ("ResumePointEndpointBinding", "mint_resume_point"),
+            ("ResumeAdoptionAuthority", "read_resume_adoption_candidate"),
+        ];
+        for (label, source) in ACTIVATION_SOURCES {
+            for (raw, sealed) in forbidden {
+                assert!(
+                    !source.contains(raw),
+                    "{label} names the raw RRP surface {raw}; the activation path must go \
+                     through {sealed} instead"
+                );
+            }
+        }
+
+        // And the sealed entry points still exist under the names this contract
+        // points activation at, so a rename cannot make the test vacuous.
+        for sealed in [
+            "pub(crate) fn mint_resume_point(",
+            "pub(crate) fn publish_resume_point(",
+            "pub(crate) fn read_resume_adoption_candidate(",
+            "pub(crate) fn plan_engine_scratch_retention(",
+            "pub(crate) fn reclaim_retained_runs_after_publication(",
+            "pub(crate) fn clear_resume_points(",
+            "fn read_resume_point_set(",
+        ] {
+            assert!(
+                OBJECT_STORE_SOURCE.contains(sealed),
+                "the sealed entry point {sealed} is gone"
+            );
+        }
+        // The strict proof must stay module-private in `object_store`: a
+        // `pub(crate)` one is exactly the shape this fence removes.
+        assert!(
+            !OBJECT_STORE_SOURCE.contains(&format!("pub(crate) fn read_resume{}", "_point_set(")),
+            "the strict resume-point set escaped back into the crate-wide surface"
+        );
     }
 
     #[test]

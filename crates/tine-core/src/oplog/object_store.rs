@@ -11394,6 +11394,315 @@ mod resume_point_store_tests {
         assert!(!run_path.exists());
     }
 
+    /// Mint one retained run, release its lease, and return its identity.
+    fn retained_run(fixture: &PromotedHistoryFixture) -> (Uuid, PathBuf) {
+        use crate::oplog::scratch_store::{ScratchStore, SCRATCH_DIR};
+
+        let archive_capability =
+            Dir::open_ambient_dir(&fixture.archive, ambient_authority()).unwrap();
+        let retained =
+            ScratchStore::create_retained(&archive_capability, fixture.workspace).unwrap();
+        let run_id = retained.run_id();
+        drop(retained);
+        let path = fixture
+            .archive
+            .join(SCRATCH_DIR)
+            .join(format!("run-{run_id}"));
+        assert!(path.is_dir());
+        (run_id, path)
+    }
+
+    fn adoption_candidate(
+        fixture: &PromotedHistoryFixture,
+        history: &DurableEngineHistoryStore,
+    ) -> ResumeAdoptionCandidate {
+        history.read_resume_adoption_candidate(ResumeEnrollmentAdmission::SameSession(
+            fixture.enrollment(),
+        ))
+    }
+
+    /// The strict latest-point read hands the resuming open exactly the
+    /// snapshot the emitting engine produced.
+    ///
+    /// Sealed, published, re-read from durable bytes in a fresh store, re-proved
+    /// against the live open's authority, and converted back — the round trip is
+    /// an equality, not an approximation, because every member of the snapshot
+    /// has a field of the record and `seal` filled every one of them.
+    #[test]
+    fn the_latest_point_reads_back_as_the_exact_snapshot_it_was_minted_from() {
+        let fixture = PromotedHistoryFixture::new("adoption-candidate");
+        let history = fixture.history();
+        let (run_id, _) = retained_run(&fixture);
+        let snapshot = RuntimeResumeSnapshot::empty_rooted_for_test(
+            fixture.live_history(),
+            (run_id, ContentDigest::of(b"scratch marker")),
+        );
+
+        assert!(matches!(
+            adoption_candidate(&fixture, &history),
+            ResumeAdoptionCandidate::Unavailable(ResumeAcceleratorUnavailable::NeverPublished)
+        ));
+
+        let point = history
+            .mint_resume_point(&snapshot, fixture.enrollment())
+            .unwrap();
+        assert_eq!(point.resume_sequence(), 1);
+        let published = history.publish_resume_point(&point).unwrap();
+        assert_eq!(published.resume_sequence(), 1);
+        assert_eq!(published.scratch_run_id(), run_id);
+
+        // A fresh process reads the identical durable evidence.
+        drop(history);
+        let history = fixture.history();
+        let ResumeAdoptionCandidate::Available(adopted) = adoption_candidate(&fixture, &history)
+        else {
+            panic!("a freshly published point must be adoptable");
+        };
+        assert_eq!(*adopted, snapshot);
+
+        // The successor sequence is derived from the survey, never asserted.
+        assert_eq!(
+            history
+                .mint_resume_point(&snapshot, fixture.enrollment())
+                .unwrap()
+                .resume_sequence(),
+            2
+        );
+    }
+
+    /// A torn candidate costs one full replay and not one byte.
+    ///
+    /// The three shapes are the ones this fault model actually produces: a
+    /// truncated point, a provider conflict copy beside a valid point, and a
+    /// point whose binding no longer matches the live enrollment record. All
+    /// three are `Unavailable`, none is an `Err`, and the directory is
+    /// byte-identical before and after — a refusal must never be a repair.
+    #[test]
+    fn a_torn_or_unbound_candidate_falls_back_without_changing_a_byte() {
+        let fixture = PromotedHistoryFixture::new("candidate-fallback");
+        let history = fixture.history();
+        let (run_id, _) = retained_run(&fixture);
+        let snapshot = RuntimeResumeSnapshot::empty_rooted_for_test(
+            fixture.live_history(),
+            (run_id, ContentDigest::of(b"scratch marker")),
+        );
+        let point = history
+            .mint_resume_point(&snapshot, fixture.enrollment())
+            .unwrap();
+        history.publish_resume_point(&point).unwrap();
+        let intact = fixture.snapshot();
+
+        // 1. Torn bytes.
+        let path = fixture.resume_point_path().join(point.file_name());
+        let whole = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &whole[..whole.len() - 3]).unwrap();
+        let torn = fixture.snapshot();
+        assert!(matches!(
+            adoption_candidate(&fixture, &history),
+            ResumeAdoptionCandidate::Unavailable(ResumeAcceleratorUnavailable::ProofDenied(
+                ResumePointError::Malformed(_)
+            ))
+        ));
+        assert_eq!(fixture.snapshot(), torn, "a refusal must repair nothing");
+        std::fs::write(&path, &whole).unwrap();
+        assert_eq!(fixture.snapshot(), intact);
+
+        // 2. A provider conflict copy carrying genuinely valid point bytes.
+        // Unrecognized residue must never be promoted to authority, and it must
+        // not be silently ignored either: it denies the whole proof.
+        let conflict = fixture
+            .resume_point_path()
+            .join("00000000000000000001.sync-conflict-20260728-120000-ABCDEFG.resume-point");
+        std::fs::write(&conflict, &whole).unwrap();
+        let with_residue = fixture.snapshot();
+        assert!(matches!(
+            adoption_candidate(&fixture, &history),
+            ResumeAdoptionCandidate::Unavailable(ResumeAcceleratorUnavailable::ProofDenied(_))
+        ));
+        assert_eq!(fixture.snapshot(), with_residue);
+        std::fs::remove_file(&conflict).unwrap();
+        assert_eq!(fixture.snapshot(), intact);
+
+        // 3. Enrollment evidence the live record contradicts.
+        let stranger = ResumePointEnrollment {
+            generation: 99,
+            head: ContentDigest::of(b"a different enrollment head"),
+            unsafe_session_id: SessionId::from_uuid(Uuid::from_u128(0x8fff)),
+        };
+        assert!(matches!(
+            history
+                .read_resume_adoption_candidate(ResumeEnrollmentAdmission::SameSession(stranger)),
+            ResumeAdoptionCandidate::Unavailable(ResumeAcceleratorUnavailable::BindingRefused(_))
+        ));
+        assert_eq!(fixture.snapshot(), intact);
+        // And it is still adoptable for the session that actually published it.
+        assert!(matches!(
+            adoption_candidate(&fixture, &history),
+            ResumeAdoptionCandidate::Available(_)
+        ));
+    }
+
+    /// The ordering the whole maintenance design rests on.
+    ///
+    /// A retained run may be collected only once a *replacement* point naming
+    /// its successor is durable — until then the predecessor's run may hold the
+    /// only resumable bytes. The `PublishedResumePoint` witness carries that
+    /// ordering in the type, and this proves the behaviour on both sides of it.
+    #[test]
+    fn a_predecessor_run_is_reclaimed_only_after_its_replacement_is_durable() {
+        let fixture = PromotedHistoryFixture::new("reclaim-after-replacement");
+        let history = fixture.history();
+        let (predecessor, predecessor_path) = retained_run(&fixture);
+
+        let first = history
+            .publish_resume_point(
+                &history
+                    .mint_resume_point(
+                        &RuntimeResumeSnapshot::empty_rooted_for_test(
+                            fixture.live_history(),
+                            (predecessor, ContentDigest::of(b"scratch marker")),
+                        ),
+                        fixture.enrollment(),
+                    )
+                    .unwrap(),
+            )
+            .unwrap();
+
+        // Before the replacement exists, the predecessor is *reachable*: the
+        // pass runs, proves it, and deletes nothing.
+        let held = history.reclaim_retained_runs_after_publication(&first);
+        assert_eq!(held.outcome, RetainedRunMaintenanceOutcome::Reclaimed);
+        assert_eq!(held.reclaimed, 0);
+        assert_eq!(held.retained_runs_remaining, 1);
+        assert!(held.within_retained_run_bound);
+        assert!(predecessor_path.is_dir());
+
+        // The replacement publication prunes the predecessor's point, which is
+        // what makes its run unreachable.
+        let (successor, successor_path) = retained_run(&fixture);
+        let second = history
+            .publish_resume_point(
+                &history
+                    .mint_resume_point(
+                        &RuntimeResumeSnapshot::empty_rooted_for_test(
+                            fixture.live_history(),
+                            (successor, ContentDigest::of(b"scratch marker")),
+                        ),
+                        fixture.enrollment(),
+                    )
+                    .unwrap(),
+            )
+            .unwrap();
+        let collected = history.reclaim_retained_runs_after_publication(&second);
+        assert_eq!(collected.outcome, RetainedRunMaintenanceOutcome::Reclaimed);
+        assert_eq!(collected.reclaimed, 1);
+        assert_eq!(collected.retained_runs_remaining, 1);
+        assert!(collected.within_retained_run_bound);
+        assert!(collected.preserved_resume_residue.is_empty());
+        assert!(!predecessor_path.exists());
+        assert!(successor_path.is_dir(), "the reachable run must survive");
+
+        // A witness whose point has left the complete set proves nothing about
+        // the state the caller published, so the pass preserves everything.
+        assert_eq!(history.clear_resume_points().unwrap().removed, 1);
+        let stale = history.reclaim_retained_runs_after_publication(&second);
+        assert!(matches!(
+            stale.outcome,
+            RetainedRunMaintenanceOutcome::ProofDenied(_)
+        ));
+        assert_eq!(stale.reclaimed, 0);
+        assert!(successor_path.is_dir());
+    }
+
+    /// Residue denies deletion, and at the retained-run bound it must also stop
+    /// authorizing *growth*.
+    ///
+    /// This is the leak bound. One permanent conflict copy in the resume-point
+    /// directory denies the strict proof forever, so without a pre-mint decision
+    /// every restart would mint one more retained run that nothing can ever
+    /// collect. Choosing ephemeral costs exactly one full replay.
+    #[test]
+    fn residue_denies_deletion_and_at_the_bound_chooses_ephemeral() {
+        let fixture = PromotedHistoryFixture::new("bounded-minting");
+        let history = fixture.history();
+        let (first_run, first_path) = retained_run(&fixture);
+        let published = history
+            .publish_resume_point(
+                &history
+                    .mint_resume_point(
+                        &RuntimeResumeSnapshot::empty_rooted_for_test(
+                            fixture.live_history(),
+                            (first_run, ContentDigest::of(b"scratch marker")),
+                        ),
+                        fixture.enrollment(),
+                    )
+                    .unwrap(),
+            )
+            .unwrap();
+
+        // A provable directory authorizes a retained run at any census, because
+        // an unreachable one can always be collected later.
+        assert_eq!(
+            history.plan_engine_scratch_retention(),
+            EngineScratchRetentionPlan::Retained { retained_runs: 1 }
+        );
+
+        let residue = fixture.resume_point_path().join(".DS_Store");
+        std::fs::write(&residue, b"\x00\x01Bud1 desktop residue").unwrap();
+
+        // Unprovable but still below the bound: one more accelerator is an
+        // acceptable trade.
+        assert_eq!(
+            history.plan_engine_scratch_retention(),
+            EngineScratchRetentionPlan::Retained { retained_runs: 1 },
+            "below the bound an unprovable directory still allows one more run"
+        );
+
+        // At the bound it does not.
+        let (_, second_path) = retained_run(&fixture);
+        let EngineScratchRetentionPlan::Ephemeral {
+            retained_runs,
+            reason,
+        } = history.plan_engine_scratch_retention()
+        else {
+            panic!("an unprovable directory at the retained-run bound must choose ephemeral");
+        };
+        assert_eq!(retained_runs, MAX_RETAINED_SCRATCH_RUNS);
+        assert!(matches!(reason, ResumePointError::UnexpectedEntry(_)));
+
+        // Nor does residue authorize deletion. The witness is real — it was
+        // minted by a successful publication — and the pass still preserves
+        // every run, the residue, and the recognized point.
+        let report = history.reclaim_retained_runs_after_publication(&published);
+        assert!(matches!(
+            report.outcome,
+            RetainedRunMaintenanceOutcome::ProofDenied(_)
+        ));
+        assert_eq!(report.reclaimed, 0);
+        assert_eq!(report.retained_runs_remaining, MAX_RETAINED_SCRATCH_RUNS);
+        assert_eq!(
+            report.preserved_resume_residue,
+            vec![".DS_Store".to_owned()]
+        );
+        assert!(first_path.is_dir());
+        assert!(second_path.is_dir());
+        assert!(fixture
+            .resume_point_path()
+            .join("00000000000000000001.resume-point")
+            .exists());
+        assert_eq!(
+            std::fs::read(&residue).unwrap(),
+            b"\x00\x01Bud1 desktop residue"
+        );
+
+        // Removing the residue is what restores both authorities.
+        std::fs::remove_file(&residue).unwrap();
+        assert!(matches!(
+            history.plan_engine_scratch_retention(),
+            EngineScratchRetentionPlan::Retained { .. }
+        ));
+    }
+
     #[test]
     fn clearing_removes_every_point_and_is_idempotent() {
         let fixture = PromotedHistoryFixture::new("clear");

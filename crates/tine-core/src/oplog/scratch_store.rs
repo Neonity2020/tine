@@ -5864,6 +5864,63 @@ mod tests {
         fs::remove_dir_all(path).unwrap();
     }
 
+    /// The census is the *other* half of the bound, and it must be
+    /// read-only.
+    ///
+    /// Its whole job is to let a caller refuse to mint one more retained run
+    /// when reachability cannot be proved. That decision is worthless if taking
+    /// the census can itself delete, contend, or repair anything, so this pins
+    /// byte-for-byte preservation of every class it counts — including a
+    /// foreign-workspace run and an unclassifiable directory, which is the shape
+    /// a provider's replicated conflict copy of a run takes.
+    #[test]
+    fn a_retained_run_census_counts_every_class_and_touches_nothing() {
+        let path = scratch_root("retained-census");
+        let archive = archive(&path);
+        assert_eq!(
+            census_retained_runs(&archive, workspace(70)).unwrap(),
+            RetainedRunCensus::default(),
+            "an archive with no scratch namespace has an empty, complete census"
+        );
+
+        let (first, _, _, _) = seed_retained_run(&archive, workspace(70));
+        let (second, _, _, _) = seed_retained_run(&archive, workspace(70));
+        let ephemeral = ScratchStore::open(&archive, workspace(70)).unwrap();
+        let (foreign, foreign_path) = seed_foreign_retained_run(&path, 71);
+        let conflict = namespace_dir(&path).join(format!("run-{first} (1)"));
+        fs::create_dir(&conflict).unwrap();
+        fs::write(conflict.join("marker"), b"a provider's conflict copy").unwrap();
+
+        let before: Vec<_> = [first, second]
+            .iter()
+            .map(|run| run_snapshot(&path, *run))
+            .collect();
+
+        let census = census_retained_runs(&archive, workspace(70)).unwrap();
+        assert_eq!(census.retained, 2, "the live ephemeral run is not retained");
+        assert_eq!(census.ephemeral, 1);
+        assert_eq!(
+            census.unclassified, 2,
+            "a foreign-workspace run and a conflict copy are both unclassified"
+        );
+        // A leased run still counts: the census is about population, not
+        // liveness, and refusing to count a live run would understate the bound.
+        assert!(census.retained >= MAX_RETAINED_SCRATCH_RUNS);
+
+        // Nothing moved.
+        for (run, bytes) in [first, second].iter().zip(before) {
+            assert_eq!(run_snapshot(&path, *run), bytes);
+        }
+        assert!(foreign_path.is_dir());
+        assert_eq!(
+            fs::read(conflict.join("marker")).unwrap(),
+            b"a provider's conflict copy"
+        );
+        assert!(run_path(&path, foreign).exists());
+        drop(ephemeral);
+        fs::remove_dir_all(path).unwrap();
+    }
+
     /// The `Unsafe -> Safe` drain: every resume point is cleared first, so the
     /// complete proof reaches nothing and every retained run is collectable.
     #[test]
