@@ -19,6 +19,7 @@ mod plugins;
 mod settings;
 mod spellcheck;
 mod state;
+mod sync_runtime;
 mod watcher;
 
 use backup::{get_backup_keep, list_backups, restore_backup, set_backup_keep};
@@ -624,6 +625,7 @@ pub fn run() {
             watch_ctl: Mutex::new(None),
             last_focused: Mutex::new(None),
             capture_graph: Mutex::new(None),
+            sync_runtime: sync_runtime::SyncRuntimeFacade::default(),
             #[cfg(desktop)]
             next_window: AtomicU64::new(1),
         })

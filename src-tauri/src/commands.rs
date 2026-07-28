@@ -1165,6 +1165,7 @@ mod capture_quick_switch_tests {
             watch_ctl: Mutex::new(None),
             last_focused: Mutex::new(Some("main".into())),
             capture_graph: Mutex::new(None),
+            sync_runtime: crate::sync_runtime::SyncRuntimeFacade::default(),
             #[cfg(desktop)]
             next_window: AtomicU64::new(2),
         };

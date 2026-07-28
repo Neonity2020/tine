@@ -136,6 +136,9 @@ pub(crate) struct AppState {
     pub(crate) watch_ctl: Mutex<Option<Sender<()>>>,
     pub(crate) last_focused: Mutex<Option<WindowKey>>,
     pub(crate) capture_graph: Mutex<Option<CaptureGraphBinding>>,
+    /// Explicit, inactive sparse runtime facade. Normal graph loading never
+    /// consults this registry.
+    pub(crate) sync_runtime: crate::sync_runtime::SyncRuntimeFacade,
     #[cfg(desktop)]
     pub(crate) next_window: AtomicU64,
 }
@@ -336,6 +339,7 @@ mod tests {
             watch_ctl: Mutex::new(None),
             last_focused: Mutex::new(Some("graph-1".into())),
             capture_graph: Mutex::new(None),
+            sync_runtime: crate::sync_runtime::SyncRuntimeFacade::default(),
             #[cfg(desktop)]
             next_window: AtomicU64::new(2),
         };
@@ -353,6 +357,7 @@ mod tests {
             watch_ctl: Mutex::new(None),
             last_focused: Mutex::new(Some("main".into())),
             capture_graph: Mutex::new(None),
+            sync_runtime: crate::sync_runtime::SyncRuntimeFacade::default(),
             #[cfg(desktop)]
             next_window: AtomicU64::new(2),
         };
