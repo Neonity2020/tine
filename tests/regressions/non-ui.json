@@ -1081,6 +1081,30 @@
         "scenario": "sync.external-delete-after-unrelated-accepted-rename",
         "failBefore": "proven"
       }
+    },
+    {
+      "id": "REG-SYNC-OUT-OF-SCOPE-NONPORTABLE-001",
+      "title": "A POSIX-legal Markdown filename outside Tine's portable page scope cannot block reconciliation for the whole graph",
+      "family": "availability",
+      "sources": {
+        "issues": [],
+        "commits": [
+          "3e0d5ba8"
+        ]
+      },
+      "platforms": [
+        "linux",
+        "macos"
+      ],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/sync_runtime.rs"
+        ],
+        "scenario": "sync.out-of-scope-nonportable-file-is-retained-nontext",
+        "failBefore": "proven"
+      }
     }
   ]
 }

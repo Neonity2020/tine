@@ -21620,18 +21620,18 @@ fn collect_reconciliation_scan_pass(
             }
 
             let page_like = is_page_file(Path::new(&child_relative));
-            let lexically_managed = if page_like {
+            let is_configuration = child_relative.eq_ignore_ascii_case("logseq/config.edn");
+            let is_conflict = page_like && path_is_sync_conflict(Path::new(&child_relative));
+            let eligible = graph.graph_text_scope.is_eligible(&child_relative);
+            let lexically_managed = if eligible {
                 Some(ManagedPath::parse(child_relative.clone()).map_err(|error| {
                     reconciliation_scan_unsafe_error(format!(
-                        "graph-text-like path is not portable: {error}"
+                        "eligible graph-text path is not portable: {error}"
                     ))
                 })?)
             } else {
                 None
             };
-            let is_configuration = child_relative.eq_ignore_ascii_case("logseq/config.edn");
-            let is_conflict = page_like && path_is_sync_conflict(Path::new(&child_relative));
-            let eligible = graph.graph_text_scope.is_eligible(&child_relative);
             let (class, portable_key) = if is_configuration {
                 (GraphTextScanPathClass::Configuration, None)
             } else if is_conflict {
