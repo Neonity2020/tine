@@ -943,6 +943,29 @@ impl OperationalCoordinator {
         }
     }
 
+    /// Resume one exact published local mutation through the same promoted
+    /// session boundary as initial execution.
+    ///
+    /// Keeping this split here prevents actor facades from acquiring direct
+    /// access to the engine, SQLite applier, tail, or runtime admission.
+    pub(crate) fn retry_local(
+        session: &mut PromotedRuntimeSession<'_>,
+        graph: &Graph,
+        receipts: &ProjectionReceiptStore,
+        continuation: LocalPublishedContinuation,
+    ) -> LocalMutationCoordinatorState {
+        let (admission, engine, database, tail) = match session.parts() {
+            Ok(parts) => parts,
+            Err(refusal) => {
+                let mut continuation = continuation;
+                continuation.core.failure =
+                    OperationalCoordinatorError::revoked(OperationalPhase::Bindings, refusal);
+                return LocalMutationCoordinatorState::from_failed(continuation);
+            }
+        };
+        continuation.retry(&admission, graph, receipts, engine, database, tail)
+    }
+
     /// Raw-author escape hatch for deterministic pre-enrollment fixtures.
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
