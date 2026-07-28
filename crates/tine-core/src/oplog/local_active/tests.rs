@@ -4418,11 +4418,22 @@ fn the_bootstrap_to_promoted_database_handoff_never_releases_the_workspace_lease
 
     // The bootstrap database closes and the promoted one opens under the exact
     // same lease. The workspace lock does not move.
+    //
+    // The helper probes below can only observe the archive at the instants they
+    // are asked, so they cannot by themselves rule out an infinitesimal
+    // release-and-reacquire inside the handoff. The acquisition counter can, and
+    // does: zero new archive-rooted leases across the whole handoff.
+    let across_handoff = PromotedRuntimeInstrumentation::capture();
     let bootstrap = fixture.take_bootstrap_session();
     let runtime = bootstrap
         .promote(sealed, &authority, &paths.open(&fixture))
         .map_err(|refusal| refusal.into_parts().1)
         .unwrap();
+    assert_eq!(
+        across_handoff.since().workspace_lease_acquisitions,
+        0,
+        "the bootstrap -> promoted handoff must reuse the lease, not reacquire it"
+    );
     assert_eq!(profile.ask("acquire"), "contended");
     assert_eq!(runtime.recovery(), RuntimeRecoveryState::FirstPromotion);
     assert!(matches!(
