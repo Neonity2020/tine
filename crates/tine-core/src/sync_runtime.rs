@@ -1160,6 +1160,37 @@ mod tests {
     }
 
     #[test]
+    fn unchanged_safe_reopen_does_not_schedule_graph_wide_reconciliation() {
+        let fixture = RuntimeHostFixture::safe("sync-runtime-unchanged-safe-reopen");
+        let request = fixture.request();
+        let first = active_handle(SyncRuntimeHandle::open(request.clone()));
+        drive_initial_feed(&first);
+        assert!(matches!(
+            first.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+
+        let manifests_before_reopen = fixture.manifest_count();
+        let reopened = active_handle(SyncRuntimeHandle::open(request));
+        let status = reopened.status().unwrap();
+        assert_eq!(
+            status.recovery,
+            Some(SyncRuntimeRecovery::AdoptedSafeHandoff)
+        );
+        assert!(
+            !status.watcher.pending_requires_full_scan,
+            "an unchanged authenticated Safe reopen must resume from its durable frontier \
+             without scheduling routine graph-wide reconciliation: {:?}",
+            status.watcher
+        );
+        assert_eq!(fixture.manifest_count(), manifests_before_reopen);
+        assert!(matches!(
+            reopened.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
     fn dropping_without_shutdown_leaves_unsafe_and_fresh_open_must_take_over() {
         let fixture = RuntimeHostFixture::safe("sync-runtime-crash-drop");
         let request = fixture.request();
