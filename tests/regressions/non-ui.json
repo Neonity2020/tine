@@ -1012,7 +1012,7 @@
     },
     {
       "id": "REG-GRAPH-WIDE-TEXT-SCOPE-246",
-      "title": "Eligible graph documents outside configured page roots remain discoverable and exact-path load/save never expose a blank writable substitute",
+      "title": "Eligible graph documents outside configured page roots and lowercase .markdown files remain discoverable and exact-path load/save never expose a blank writable substitute",
       "family": "data-safety",
       "sources": {
         "issues": [
@@ -1034,7 +1034,7 @@
         "scenario": "filesystem.graph-wide-text-scope",
         "failBefore": "proven"
       },
-      "notes": "GH #246 accepted harm: an eligible non-empty document outside pages/ could appear blank, external add/delete stayed invisible, and editing the blank state could overwrite real bytes. The base reproduction at be54af62 failed because list_pages/find_entry/load_by_path only admitted configured pages/journals roots."
+      "notes": "GH #246 accepted harm: an eligible non-empty document outside pages/ could appear blank, external add/delete stayed invisible, and editing the blank state could overwrite real bytes. The base reproduction at be54af62 failed because list_pages/find_entry/load_by_path only admitted configured pages/journals roots. This row also covers OG-compatible lowercase .markdown through bootstrap/source capture, exact projection, external reconciliation/feed, edit/writeback/delete observation, configured-root rename spelling preservation, and .md/.markdown/.org same-stem twin refusal."
     },
     {
       "id": "REG-SYNC-PROJECTION-CRASH-CORPUS-001",

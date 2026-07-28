@@ -43,7 +43,9 @@ pub enum PageKind {
     Page,
 }
 
-/// On-disk file format of a page. Markdown (`.md`) is the default; Logseq org
+const LOGSEQ_TEXT_EXTENSIONS: [&str; 3] = ["md", "markdown", "org"];
+
+/// On-disk file format of a page. Markdown (`.md`/`.markdown`) is the default; Logseq org
 /// graphs use `.org`. A graph may mix the two — format is decided per file by
 /// extension, never graph-wide (matching OG, which stores `:block/format` per
 /// page). The graph's `:preferred-format` only chooses the extension for NEW
@@ -73,15 +75,31 @@ impl Format {
     }
 }
 
+fn is_logseq_text_extension(extension: &str) -> bool {
+    LOGSEQ_TEXT_EXTENSIONS
+        .iter()
+        .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+}
+
+fn text_extension_from_path(path: &Path) -> Option<&str> {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .filter(|extension| is_logseq_text_extension(extension))
+}
+
+fn split_logseq_text_filename(filename: &str) -> Option<(&str, &str)> {
+    filename
+        .rsplit_once('.')
+        .filter(|(stem, extension)| !stem.is_empty() && is_logseq_text_extension(extension))
+}
+
+fn configured_text_variant_paths(dir: &Path, stem: &str) -> [PathBuf; 3] {
+    LOGSEQ_TEXT_EXTENSIONS.map(|extension| dir.join(format!("{stem}.{extension}")))
+}
+
 /// Whether `path` is a page file Tine reads (markdown or org).
 fn is_page_file(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|extension| {
-            extension.eq_ignore_ascii_case("md")
-                || extension.eq_ignore_ascii_case("markdown")
-                || extension.eq_ignore_ascii_case("org")
-        })
+    text_extension_from_path(path).is_some()
 }
 
 fn slash_path(path: &Path) -> String {
@@ -122,14 +140,14 @@ pub fn path_is_sync_conflict(path: &Path) -> bool {
         .is_some_and(is_sync_conflict)
 }
 
-/// Error for an ambiguous page that exists as both a `.md` and a `.org` file.
+/// Error for an ambiguous page that exists in multiple supported text extensions.
 /// Deliberately NOT the `AlreadyExists`/"conflict" signal, so the UI surfaces it
 /// as a plain error (a toast) instead of a keep-mine/use-disk conflict prompt.
 fn twin_error(name: &str) -> io::Error {
     io::Error::new(
         io::ErrorKind::Other,
         format!(
-            "\"{name}\" exists as both a .md and a .org file — remove one (e.g. in Logseq) to edit it in Tine"
+            "\"{name}\" exists in multiple .md/.markdown/.org files — remove all but one (e.g. in Logseq) to edit it in Tine"
         ),
     )
 }
@@ -238,7 +256,6 @@ struct ProjectionTarget {
     relative_path: String,
     parent_components: Vec<String>,
     filename: String,
-    twin_filename: String,
 }
 
 /// One lexical/scope validation result shared by exact points and feed events.
@@ -4787,10 +4804,8 @@ impl Graph {
             Err(outside) => return self.unmanaged_graph_text_entry(path, outside),
         };
         let filename = path.file_name();
-        let stem = filename
-            .strip_suffix(".md")
-            .or_else(|| filename.strip_suffix(".org"))
-            .filter(|stem| !stem.is_empty())
+        let stem = split_logseq_text_filename(filename)
+            .map(|(stem, _)| stem)
             .ok_or_else(|| ReceiptError::UnsafeManagedPath(path.as_str().to_owned()))?;
         let (name, date_key) = match kind {
             PageKind::Journal => match self.journal_format.parse(stem) {
@@ -4817,7 +4832,7 @@ impl Graph {
         path: &ManagedPath,
         outside: ReceiptError,
     ) -> Result<PageEntry, ReceiptError> {
-        if !matches!(path.extension(), "md" | "org")
+        if !is_logseq_text_extension(path.extension())
             || !self.graph_text_scope.is_eligible(path.as_str())
         {
             return Err(outside);
@@ -4880,10 +4895,13 @@ impl Graph {
         let Some(stem) = stem else {
             return Ok(false);
         };
-        Ok(
-            self.managed_exists(permit, &dir.join(format!("{stem}.org")))?
-                && self.managed_exists(permit, &dir.join(format!("{stem}.md")))?,
-        )
+        let mut variants = 0;
+        for path in configured_text_variant_paths(&dir, &stem) {
+            if self.managed_exists(permit, &path)? {
+                variants += 1;
+            }
+        }
+        Ok(variants > 1)
     }
 
     fn managed_path_for(
@@ -4914,16 +4932,13 @@ impl Graph {
                 if self.managed_exists(permit, &primary)? {
                     return Ok(primary);
                 }
-                let alternate_extension = if preferred == Format::Org {
-                    "md"
-                } else {
-                    "org"
-                };
-                let alternate = self
-                    .pages_path()
-                    .join(format!("{encoded}.{alternate_extension}"));
-                if self.managed_exists(permit, &alternate)? {
-                    return Ok(alternate);
+                for alternate in configured_text_variant_paths(&self.pages_path(), &encoded) {
+                    if alternate == primary {
+                        continue;
+                    }
+                    if self.managed_exists(permit, &alternate)? {
+                        return Ok(alternate);
+                    }
                 }
                 Ok(primary)
             }
@@ -4945,10 +4960,12 @@ impl Graph {
         }
         let canonical = self.journal_format.file_stem(date);
         let directory = self.journals_path();
-        Ok(
-            self.managed_exists(permit, &directory.join(format!("{canonical}.md")))?
-                || self.managed_exists(permit, &directory.join(format!("{canonical}.org")))?,
-        )
+        for path in configured_text_variant_paths(&directory, &canonical) {
+            if self.managed_exists(permit, &path)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn managed_path_is_cacheable(
@@ -9155,10 +9172,8 @@ impl Graph {
             return None;
         }
         let abs = base.join(tail);
-        match abs.extension().and_then(|e| e.to_str()) {
-            Some("md") | Some("org") => Some(abs),
-            _ => None,
-        }
+        text_extension_from_path(&abs).map(|_| ())?;
+        Some(abs)
     }
 
     fn projection_page_target(&self, relative_path: &str) -> io::Result<ProjectionTarget> {
@@ -9205,12 +9220,7 @@ impl Graph {
         let filename = components
             .last()
             .expect("nonempty split has a last element");
-        let (stem, extension) = filename.rsplit_once('.').ok_or_else(bad_path)?;
-        if stem.is_empty() || !matches!(extension, "md" | "org") {
-            return Err(bad_path());
-        }
-        let twin_extension = if extension == "md" { "org" } else { "md" };
-        let twin_filename = format!("{stem}.{twin_extension}");
+        let _ = split_logseq_text_filename(filename).ok_or_else(bad_path)?;
         let parent_components = components[..components.len() - 1]
             .iter()
             .map(|component| (*component).to_owned())
@@ -9220,7 +9230,6 @@ impl Graph {
             relative_path: relative_path.to_owned(),
             parent_components,
             filename: (*filename).to_owned(),
-            twin_filename,
         })
     }
 
@@ -9303,14 +9312,28 @@ impl Graph {
         target: &ProjectionTarget,
     ) -> io::Result<()> {
         projection_optional_regular_metadata(parent.final_dir(), &target.filename)?;
-        match parent.final_dir().symlink_metadata(&target.twin_filename) {
-            Ok(_) => Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "projection page has an .md/.org twin",
-            )),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error),
+        let (target_stem, target_extension) =
+            split_logseq_text_filename(&target.filename).ok_or_else(bad_path)?;
+        for entry in parent.final_dir().entries()? {
+            let entry = entry?;
+            let entry_filename = entry.file_name();
+            let Some(filename) = entry_filename.to_str() else {
+                continue;
+            };
+            if filename == target.filename {
+                continue;
+            }
+            let Some((stem, extension)) = split_logseq_text_filename(filename) else {
+                continue;
+            };
+            if stem == target_stem && !extension.eq_ignore_ascii_case(target_extension) {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "projection page has an .md/.markdown/.org twin",
+                ));
+            }
         }
+        Ok(())
     }
 
     fn ensure_projection_parent_binding(
@@ -9656,11 +9679,9 @@ impl Graph {
     }
 
     fn journal_filename_migration_target(&self, p: &std::path::Path) -> Option<PathBuf> {
-        // Both formats — an org graph's title-named journals are `.org`.
-        let ext = match p.extension().and_then(|x| x.to_str()) {
-            Some(e @ ("md" | "org")) => e,
-            _ => return None,
-        };
+        // Supported text formats — an org graph's title-named journals are `.org`;
+        // OG markdown files may also carry the long `.markdown` spelling.
+        let ext = text_extension_from_path(p)?;
         let stem = p.file_stem().and_then(|s| s.to_str())?;
         if JournalDate::from_file_stem(stem).is_some() {
             return None; // already a plausible date stem (yyyy_MM_dd / yyyy-MM-dd) — leave it
@@ -9799,9 +9820,9 @@ impl Graph {
         let mut by_date: std::collections::BTreeMap<i64, Vec<(String, PathBuf, bool)>> =
             std::collections::BTreeMap::new();
         walk_page_files(&dir, |p| {
-            let ext = match p.extension().and_then(|x| x.to_str()) {
-                Some(x @ ("md" | "org")) => x.to_string(),
-                _ => return,
+            let ext = match text_extension_from_path(&p) {
+                Some(extension) => extension.to_owned(),
+                None => return,
             };
             let Some(stem) = p.file_stem().and_then(|s| s.to_str()) else {
                 return;
@@ -9878,9 +9899,9 @@ impl Graph {
             (self.pages_path(), PageKind::Page),
         ] {
             walk_page_files(&dir, |p| {
-                let ext = match p.extension().and_then(|x| x.to_str()) {
-                    Some(x @ ("md" | "org")) => x,
-                    _ => return,
+                let ext = match text_extension_from_path(&p) {
+                    Some(extension) => extension,
+                    None => return,
                 };
                 let Some(stem) = p.file_stem().and_then(|s| s.to_str()) else {
                     return;
@@ -10298,9 +10319,9 @@ impl Graph {
     /// Turn a stray file into a normal, uniquely-named page by moving it to
     /// `pages/<encoded new_name>.<its ext>` (#21) — the way to rescue a duplicate-day
     /// leftover whose name collides with the canonical day. Refuses if a page for
-    /// `new_name` already exists in EITHER extension (never clobbers) or the name is
-    /// empty. Inbound references are NOT rewritten (a stray rarely has any); the
-    /// file's own content is unchanged.
+    /// `new_name` already exists in any supported text extension (never clobbers)
+    /// or the name is empty. Inbound references are NOT rewritten (a stray rarely
+    /// has any); the file's own content is unchanged.
     pub fn rename_file_to_page(&self, src_rel: &str, new_name: &str) -> io::Result<()> {
         let write = self.admit_managed_text_writer()?;
         let src = self
@@ -10313,19 +10334,18 @@ impl Graph {
                 "empty page name",
             ));
         }
-        let ext = match src.extension().and_then(|e| e.to_str()) {
-            Some(e @ ("md" | "org")) => e.to_string(),
-            _ => return Err(bad_path()),
-        };
+        let ext = text_extension_from_path(&src)
+            .map(|extension| extension.to_owned())
+            .ok_or_else(bad_path)?;
         let enc = encode_page_name(name, self.config.file_name_format);
         let dir = self.pages_path();
-        if self.managed_exists(&write, &dir.join(format!("{enc}.md")))?
-            || self.managed_exists(&write, &dir.join(format!("{enc}.org")))?
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "a page with that name already exists",
-            ));
+        for target in configured_text_variant_paths(&dir, &enc) {
+            if self.managed_exists(&write, &target)? {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "a page with that name already exists",
+                ));
+            }
         }
         self.managed_create_dir_all(&write, &dir)?;
         self.managed_move_noreplace(&write, &src, &dir.join(format!("{enc}.{ext}")))?;
@@ -12141,8 +12161,9 @@ impl Graph {
         let mut content_budget = RetainedContentBudget::new(managed_text_inventory_limits());
         let entries = self.managed_text_entries_with_budget(&write, false, &content_budget)?;
         self.validate_page_mutation_target(&write, &entries, old, PageKind::Page, expected_path)?;
-        // M1: refuse to rename an ambiguous page (both .md and .org on disk) — which
-        // twin moves, and which content is authoritative, is undecidable here.
+        // M1: refuse to rename an ambiguous page (same-stem .md/.markdown/.org on
+        // disk) — which twin moves, and which content is authoritative, is
+        // undecidable here.
         if self.managed_has_twin(&write, old, PageKind::Page)?
             || self.managed_has_twin(&write, new, PageKind::Page)?
         {
@@ -12224,18 +12245,13 @@ impl Graph {
                 let suffix: String = entry.name.chars().skip(skip).collect();
                 format!("{new}{suffix}")
             };
-            // Keep the page's own format on rename (an .org page stays .org).
+            // Keep the page's own physical extension on rename (an .markdown page
+            // stays .markdown; an .org page stays .org).
             let encoded_new = encode_page_name(&new_name, self.config.file_name_format);
-            let entry_format = Format::from_path(&entry.path);
+            let entry_extension = text_extension_from_path(&entry.path).ok_or_else(bad_path)?;
             let new_path = self
                 .pages_path()
-                .join(format!("{encoded_new}.{}", entry_format.ext()));
-            let other_ext = if entry_format == Format::Org {
-                "md"
-            } else {
-                "org"
-            };
-            let other_format_target = self.pages_path().join(format!("{encoded_new}.{other_ext}"));
+                .join(format!("{encoded_new}.{entry_extension}"));
             if entries.iter().any(|other| {
                 other.kind == PageKind::Page
                     && other.path != entry.path
@@ -12252,13 +12268,18 @@ impl Graph {
                     "target page exists",
                 ));
             }
-            if other_format_target != entry.path
-                && self.managed_exists(&write, &other_format_target)?
+            for other_format_target in
+                configured_text_variant_paths(&self.pages_path(), &encoded_new)
             {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "target page exists in the other format",
-                ));
+                if other_format_target != entry.path
+                    && other_format_target != new_path
+                    && self.managed_exists(&write, &other_format_target)?
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "target page exists in another supported text extension",
+                    ));
+                }
             }
             // Recursive graph directories can contain two distinct files with
             // the same basename/page identity. Both would map to the same flat
@@ -12697,8 +12718,8 @@ impl Graph {
         let write = self.admit_managed_text_writer()?;
         self.block_external_scope_mutation(&write, name, kind, expected_path, "delete")?;
         let entries = self.managed_text_entries(&write, false)?;
-        // M1: with both a .md and a .org twin, "which file?" is ambiguous — refuse
-        // rather than trash an arbitrary one.
+        // M1: with same-stem .md/.markdown/.org twins, "which file?" is
+        // ambiguous — refuse rather than trash an arbitrary one.
         if self.managed_has_twin(&write, name, kind)? {
             return Err(twin_error(name));
         }
@@ -19251,11 +19272,7 @@ fn classify_legacy_trash_entry(path: &Path, ft: fs::FileType) -> TrashEntryKind 
     if path_is_sync_conflict(original_path) {
         return TrashEntryKind::Conflict;
     }
-    let ext = original_path
-        .extension()
-        .and_then(|s| s.to_str())
-        .map(|s| s.to_ascii_lowercase());
-    if matches!(ext.as_deref(), Some("md" | "org")) {
+    if text_extension_from_path(original_path).is_some() {
         return original_path
             .file_stem()
             .and_then(|s| s.to_str())
@@ -28253,7 +28270,7 @@ mod tests {
     fn graph_wide_discovery_never_grants_sparse_enrollment_or_id_stamping() {
         let dir = scratch("graph-text-sparse-authority");
         fs::create_dir_all(dir.join("external")).unwrap();
-        let path = dir.join("external/Outside.md");
+        let path = dir.join("external/Outside.markdown");
         fs::write(&path, "- outside\n").unwrap();
         let graph = Graph::open(&dir);
 
@@ -28262,7 +28279,11 @@ mod tests {
             .enable_managed_sync(Uuid::from_u128(246_001), Uuid::from_u128(246_002))
             .unwrap();
 
-        let mut page = graph.load_by_path("external/Outside.md").unwrap().unwrap();
+        let mut page = graph
+            .load_by_path("external/Outside.markdown")
+            .unwrap()
+            .unwrap();
+        assert_eq!(page.path, "external/Outside.markdown");
         page.blocks[0].raw = "edited outside".into();
         graph.save_page(&page, page.rev.as_deref()).unwrap();
         let saved = fs::read_to_string(&path).unwrap();
@@ -28274,7 +28295,7 @@ mod tests {
             .unwrap()
             .as_ref()
             .unwrap()
-            .materialize_page("external/Outside.md")
+            .materialize_page("external/Outside.markdown")
             .unwrap()
             .is_none());
 
@@ -28286,7 +28307,7 @@ mod tests {
             .unwrap()
             .as_ref()
             .unwrap()
-            .materialize_page("external/Outside.md")
+            .materialize_page("external/Outside.markdown")
             .unwrap()
             .is_none());
         fs::remove_file(&path).unwrap();
@@ -28297,7 +28318,7 @@ mod tests {
             .unwrap()
             .as_ref()
             .unwrap()
-            .materialize_page("external/Outside.md")
+            .materialize_page("external/Outside.markdown")
             .unwrap()
             .is_none());
         let _ = fs::remove_dir_all(&dir);
@@ -33735,10 +33756,19 @@ mod tests {
         assert!(graph
             .graph_text_exact_path("archive/client/alias.bin", true)
             .is_err());
-        assert!(graph.projection_page_target("Root.MarkDown").is_err());
-        assert!(graph
-            .projection_page_target("archive/client/Plan.Markdown")
-            .is_err());
+        let root_projection = graph.projection_page_target("Root.markdown").unwrap();
+        assert!(root_projection.parent_components.is_empty());
+        assert_eq!(root_projection.filename, "Root.markdown");
+        assert_eq!(root_projection.absolute_path, root.join("Root.markdown"));
+        let nested_projection = graph
+            .projection_page_target("archive/client/Plan.markdown")
+            .unwrap();
+        assert_eq!(nested_projection.parent_components, ["archive", "client"]);
+        assert_eq!(nested_projection.filename, "Plan.markdown");
+        assert_eq!(
+            nested_projection.absolute_path,
+            root.join("archive/client/Plan.markdown")
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -33752,27 +33782,37 @@ mod tests {
         // so the guarded writer must address the exact nested spelling instead
         // of refusing it or relocating it into a configured root.
         let nested = graph
-            .projection_page_target("archive/2024/client notes/Ünicode Page.md")
+            .projection_page_target("archive/2024/client notes/Ünicode Page.markdown")
             .unwrap();
         assert_eq!(
             nested.relative_path,
-            "archive/2024/client notes/Ünicode Page.md"
+            "archive/2024/client notes/Ünicode Page.markdown"
         );
         assert_eq!(
             nested.parent_components,
             ["archive", "2024", "client notes"]
         );
-        assert_eq!(nested.filename, "Ünicode Page.md");
-        assert_eq!(nested.twin_filename, "Ünicode Page.org");
+        assert_eq!(nested.filename, "Ünicode Page.markdown");
         assert_eq!(
             nested.absolute_path,
-            root.join("archive/2024/client notes/Ünicode Page.md")
+            root.join("archive/2024/client notes/Ünicode Page.markdown")
         );
+        fs::create_dir_all(root.join("archive/2024/client notes")).unwrap();
+        let sibling_twin = root.join("archive/2024/client notes/Ünicode Page.md");
+        fs::write(&sibling_twin, b"- same-stem twin\n").unwrap();
+        let parent = graph.projection_parent(&nested, false).unwrap();
+        let twin = graph
+            .ensure_projection_target_shape(&parent, &nested)
+            .unwrap_err();
+        assert_eq!(twin.kind(), io::ErrorKind::AlreadyExists);
+        fs::remove_file(&sibling_twin).unwrap();
+        graph
+            .ensure_projection_target_shape(&parent, &nested)
+            .unwrap();
 
         let top = graph.projection_page_target("Top Level.org").unwrap();
         assert!(top.parent_components.is_empty());
         assert_eq!(top.filename, "Top Level.org");
-        assert_eq!(top.twin_filename, "Top Level.md");
 
         // Configured roots keep working exactly as before.
         assert!(graph.projection_page_target("pages/Plain.md").is_ok());
@@ -33794,8 +33834,6 @@ mod tests {
             "archive/.hidden/note.md",
             "archive/note.sync-conflict-20260726-120000-ABCDEFG.md",
             "archive/../escape.md",
-            "archive/note.markdown",
-            "archive/note.MD",
             "archive/.md",
         ] {
             assert!(
@@ -36188,7 +36226,7 @@ mod tests {
         fs::create_dir_all(root.join("content/pages/arbitrary/deeper")).unwrap();
         fs::create_dir_all(root.join("content/journals/archive/deeper")).unwrap();
         fs::write(
-            root.join("content/pages/arbitrary/deeper/Project%2FPlan.md"),
+            root.join("content/pages/arbitrary/deeper/Project%2FPlan.markdown"),
             b"- page\n",
         )
         .unwrap();
@@ -36211,7 +36249,7 @@ mod tests {
                     b"* journal\n".as_slice(),
                 ),
                 (
-                    "content/pages/arbitrary/deeper/Project%2FPlan.md",
+                    "content/pages/arbitrary/deeper/Project%2FPlan.markdown",
                     b"- page\n".as_slice(),
                 ),
             ]
@@ -37571,6 +37609,37 @@ mod tests {
         assert_eq!(fs::read_to_string(&old).unwrap(), "* old body\n");
         assert_eq!(fs::read_to_string(&target).unwrap(), "- existing target\n");
         assert!(!dir.join("pages/New.org").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn managed_text_twin_refusal_includes_markdown_extension_variant() {
+        let dir = scratch("managed-markdown-twin");
+        fs::write(dir.join("pages/Twin.md"), "- md body\n").unwrap();
+        fs::write(dir.join("pages/Twin.markdown"), "- markdown body\n").unwrap();
+        let graph = Graph::open(&dir);
+        let write = graph.admit_managed_text_writer().unwrap();
+
+        assert!(graph
+            .managed_has_twin(&write, "Twin", PageKind::Page)
+            .unwrap());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rename_preserves_configured_markdown_extension() {
+        let dir = scratch("rename-preserve-markdown-extension");
+        let old = dir.join("pages/Old.markdown");
+        fs::write(&old, "- old body\n").unwrap();
+        let graph = Graph::open(&dir);
+
+        graph.rename_page("Old", "Renamed").unwrap();
+
+        let renamed = dir.join("pages/Renamed.markdown");
+        assert_eq!(fs::read_to_string(&renamed).unwrap(), "- old body\n");
+        assert!(!old.exists());
+        assert!(!dir.join("pages/Renamed.md").exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
