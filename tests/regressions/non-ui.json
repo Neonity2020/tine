@@ -1034,7 +1034,7 @@
     },
     {
       "id": "REG-GRAPH-WIDE-TEXT-SCOPE-246",
-      "title": "Eligible graph documents outside configured page roots remain discoverable and exact-path load/save never expose a blank writable substitute",
+      "title": "Eligible graph documents outside configured page roots and lowercase .markdown files remain discoverable and exact-path load/save never expose a blank writable substitute",
       "family": "data-safety",
       "sources": {
         "issues": [
@@ -1056,7 +1056,29 @@
         "scenario": "filesystem.graph-wide-text-scope",
         "failBefore": "proven"
       },
-      "notes": "GH #246 accepted harm: an eligible non-empty document outside pages/ could appear blank, external add/delete stayed invisible, and editing the blank state could overwrite real bytes. The base reproduction at be54af62 failed because list_pages/find_entry/load_by_path only admitted configured pages/journals roots."
+      "notes": "GH #246 accepted harm: an eligible non-empty document outside pages/ could appear blank, external add/delete stayed invisible, and editing the blank state could overwrite real bytes. The base reproduction at be54af62 failed because list_pages/find_entry/load_by_path only admitted configured pages/journals roots. This row also covers OG-compatible lowercase .markdown through bootstrap/source capture, exact projection, external reconciliation/feed, edit/writeback/delete observation, configured-root rename spelling preservation, and .md/.markdown/.org same-stem twin refusal."
+    },
+    {
+      "id": "REG-SYNC-PROJECTION-CRASH-CORPUS-001",
+      "title": "Projection crash recovery preserves exact bytes across graph-wide paths and fails closed on foreign edits",
+      "family": "data-safety",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/oplog/projection_crash_corpus_tests.rs"
+        ],
+        "scenario": "sync.projection-crash-corpus-v2",
+        "failBefore": "source-proven"
+      },
+      "notes": "Internal sparse-oplog adversarial corpus: deterministic fixture byte hashes, root and nested Unicode graph text, nonstandard journal and Org layouts, current .md/.org projection cut coverage, .markdown admission-only evidence, and fail-closed foreign-edit recovery."
     },
     {
       "id": "REG-SYNC-WATCHER-OVERSIZE-SAFE-001",
@@ -1127,6 +1149,30 @@
         "scenario": "sync.out-of-scope-nonportable-file-is-retained-nontext",
         "failBefore": "proven"
       }
+    },
+    {
+      "id": "REG-SYNC-SHARED-ENROLLMENT-P3-001",
+      "title": "Sparse-oplog sharing admits exactly one descriptor-bound lineage and blocks incomplete bootstrap, split genesis, dirty tails, and projection/base disagreement without changing projection bytes",
+      "family": "sync-data-safety",
+      "sources": {
+        "issues": [],
+        "commits": [
+          "60d8b3490c4b01927907fdcf86664233716f833c"
+        ]
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/oplog/enrollment.rs"
+        ],
+        "scenario": "sync.shared-enrollment-two-device-fault-matrix",
+        "failBefore": "proven"
+      },
+      "notes": "P3.1 contract test covers LocalActive to SharePrepared to SharedActive for the initiator, LocalActive to Joining to SharedActive for a peer, duplicate/reordered descriptor delivery, malformed partial bootstrap evidence, split-genesis descriptor conflict, dirty unique local tail, projection/base mismatch, and every named enrollment record/head crash cut. P3.2 runtime and UI integration remain intentionally inactive."
     }
   ]
 }
