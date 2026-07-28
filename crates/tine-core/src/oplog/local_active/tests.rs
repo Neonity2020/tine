@@ -232,6 +232,25 @@ impl Fixture {
         self.bootstrap().projection()
     }
 
+    /// Reopen the production inactive-bootstrap session under a lease this
+    /// process is still holding — the retry path after a refused promotion,
+    /// which must not go through releasing the archive either.
+    fn reopen_bootstrap_session(
+        &self,
+        lease: WorkspaceRuntimeLease,
+    ) -> InactiveBootstrapRuntimeSession {
+        let runtime =
+            ApplicationRuntimeRoot::open_for_test(&self.root.path().join("runtime")).unwrap();
+        InactiveBootstrapRuntimeSession::reopen_under(
+            lease,
+            &self.root.path().join("bootstrap.sqlite"),
+            &runtime,
+            &self.authority,
+        )
+        .map_err(|(_returned_lease, error)| error)
+        .expect("reopened inactive bootstrap session")
+    }
+
     /// Drop the retained inactive bootstrap session *and* its archive-rooted
     /// workspace lease, so a promoted open must acquire the workspace lease
     /// itself.
@@ -4317,6 +4336,13 @@ fn takeover_at_every_durability_cut_resumes_exactly_one_unsafe_owner() {
 /// archive-rooted lease. A separate application-data profile is probed at every
 /// step and stays blocked from the inactive bootstrap open until the promoted
 /// runtime is finally dropped.
+///
+/// The handoff here is `InactiveBootstrapRuntimeSession::promote` — the crate's
+/// only route from an inactive bootstrap database to a promoted runtime — not a
+/// hand-assembled equivalent. That makes this a receipt for the construction the
+/// activation wiring will call; it is not a claim that a running Tine binary
+/// executes it today, because no part of this module is reachable from
+/// application startup yet.
 #[test]
 fn the_bootstrap_to_promoted_database_handoff_never_releases_the_workspace_lease() {
     let mut fixture = Fixture::new(
@@ -4410,6 +4436,316 @@ fn the_bootstrap_to_promoted_database_handoff_never_releases_the_workspace_lease
     assert_eq!(profile.ask("acquire"), "acquired");
     assert_eq!(profile.ask("release"), "released");
     profile.finish();
+    fixture.assert_graph_unchanged();
+}
+
+/// Every failure boundary of a retained promotion hands the caller's exact
+/// archive-rooted lease back instead of releasing it.
+///
+/// `seal_local_runtime_promotion` has already published the durable promotion
+/// state by the time phase two runs, so a refusal that quietly released the
+/// archive would offer it to another process at the one moment this one must
+/// keep holding it. The three boundaries below are, in order: before the lease
+/// is inspected at all, after the device-local database has already been opened
+/// under it, and the retry that then succeeds — all under one lease that is
+/// never reacquired.
+#[test]
+fn a_refused_retained_promotion_returns_the_exact_lease_at_every_failure_boundary() {
+    let mut fixture = Fixture::new(
+        "retained-refusal",
+        None,
+        vec![("pages/refuse.md".into(), b"- refuse\n".to_vec())],
+    );
+    let root = fixture.enrollment_root("retained-refusal");
+    let binding = fixture.enrollment_binding();
+    let paths = PromotedPaths::new(&fixture, "retained-refusal");
+    let session = SessionId::new();
+    let archive = ObjectStore::open(&fixture.archive_root, fixture.workspace).unwrap();
+
+    let authority = activate_verified_local(
+        &root,
+        fixture.compose(&root),
+        session,
+        &fixture.proofs(),
+        &fixture.runtime(),
+    )
+    .unwrap();
+    // Sealing is idempotent, so one sealed promotion is spent per boundary.
+    let enrollment_boundary =
+        seal_local_runtime_promotion(&authority, &fixture.proofs(), &fixture.runtime()).unwrap();
+    let post_open_boundary =
+        seal_local_runtime_promotion(&authority, &fixture.proofs(), &fixture.runtime()).unwrap();
+    let sealed =
+        seal_local_runtime_promotion(&authority, &fixture.proofs(), &fixture.runtime()).unwrap();
+
+    let bootstrap = fixture.take_bootstrap_session();
+    let before = PromotedRuntimeInstrumentation::capture();
+
+    // Boundary 1: the very first step, before the lease is even looked at. A
+    // second live enrollment session owns the device-local journal lease.
+    let blocker =
+        RetainedEnrollmentSession::open(&root, &binding, authority.verification_digest()).unwrap();
+    let (lease, error) = bootstrap
+        .promote(enrollment_boundary, &authority, &paths.open(&fixture))
+        .err()
+        .expect("a contended enrollment lease must refuse the promotion")
+        .into_parts();
+    assert!(
+        matches!(error, RuntimePromotionError::Enrollment(_)),
+        "unexpected pre-lease error: {error}"
+    );
+    assert!(
+        matches!(
+            WorkspaceRuntimeLease::acquire(&archive, fixture.workspace),
+            Err(ProjectionError::LeaseContended(_))
+        ),
+        "a pre-lease refusal must hand the archive back, not release it"
+    );
+    drop(blocker);
+
+    // Boundary 2: after the device-local database is open, where the lease can
+    // only be recovered by closing the database it now lives inside.
+    let bootstrap = fixture.reopen_bootstrap_session(lease);
+    fail_next_promotion_after_the_database_opens_for_test();
+    let (lease, error) = bootstrap
+        .promote(post_open_boundary, &authority, &paths.open(&fixture))
+        .err()
+        .expect("the injected post-open fault must refuse the promotion")
+        .into_parts();
+    assert!(
+        matches!(
+            error,
+            RuntimePromotionError::Anchor("injected failure after the promoted database opened")
+        ),
+        "unexpected post-open error: {error}"
+    );
+    // The promoted database really was closed...
+    let promoted_database_lock = paths.database_path.with_file_name(format!(
+        ".{}.database-applier.lock",
+        paths.database_path.file_name().unwrap().to_str().unwrap()
+    ));
+    assert!(
+        !crate::oplog::sqlite::workspace_lock_is_contended(&promoted_database_lock),
+        "the refused promotion must have closed its database"
+    );
+    // ...and the archive really did not move.
+    assert!(
+        matches!(
+            WorkspaceRuntimeLease::acquire(&archive, fixture.workspace),
+            Err(ProjectionError::LeaseContended(_))
+        ),
+        "a post-open refusal must hand the archive back, not release it"
+    );
+
+    // Boundary 3: the retry, on the same lease, succeeds.
+    let bootstrap = fixture.reopen_bootstrap_session(lease);
+    let runtime = bootstrap
+        .promote(sealed, &authority, &paths.open(&fixture))
+        .map_err(|refusal| refusal.into_parts().1)
+        .unwrap();
+    assert_eq!(runtime.recovery(), RuntimeRecoveryState::FirstPromotion);
+    assert_eq!(
+        before.since().workspace_lease_acquisitions,
+        0,
+        "two refusals and a retry must not reacquire the archive even once"
+    );
+
+    drop(runtime);
+    drop(authority);
+    drop(WorkspaceRuntimeLease::acquire(&archive, fixture.workspace).unwrap());
+    fixture.assert_graph_unchanged();
+}
+
+/// `AcquireWorkspaceLease` is the branch a promotion takes when it retains no
+/// inactive bootstrap session, and its documented contract is that the
+/// archive-rooted lease *enforces* the bootstrap release rather than trusting
+/// it. While the bootstrap session is still open the acquiring promotion is
+/// refused as contended; once it is dropped, the same shape opens.
+#[test]
+fn an_acquiring_first_promotion_is_contended_until_the_bootstrap_session_is_released() {
+    let mut fixture = Fixture::new(
+        "acquire-promotion",
+        None,
+        vec![("pages/acquire.md".into(), b"- acquire\n".to_vec())],
+    );
+    let root = fixture.enrollment_root("acquire-promotion");
+    let paths = PromotedPaths::new(&fixture, "acquire-promotion");
+    let session = SessionId::new();
+
+    let authority = activate_verified_local(
+        &root,
+        fixture.compose(&root),
+        session,
+        &fixture.proofs(),
+        &fixture.runtime(),
+    )
+    .unwrap();
+    let contended =
+        seal_local_runtime_promotion(&authority, &fixture.proofs(), &fixture.runtime()).unwrap();
+    let sealed =
+        seal_local_runtime_promotion(&authority, &fixture.proofs(), &fixture.runtime()).unwrap();
+
+    let error = open_promoted_local_runtime(
+        contended,
+        &authority,
+        &paths.open(&fixture),
+        AcquireWorkspaceLease,
+    )
+    .err()
+    .expect("the retained bootstrap session still owns this archive");
+    assert!(
+        matches!(
+            error,
+            RuntimePromotionError::Sqlite(ProjectionError::LeaseContended(_))
+        ),
+        "unexpected acquiring-promotion error: {error}"
+    );
+
+    fixture.release_bootstrap_projection();
+    let before = PromotedRuntimeInstrumentation::capture();
+    let runtime = open_promoted_local_runtime(
+        sealed,
+        &authority,
+        &paths.open(&fixture),
+        AcquireWorkspaceLease,
+    )
+    .unwrap();
+    assert_eq!(
+        before.since().workspace_lease_acquisitions,
+        1,
+        "an acquiring promotion takes exactly one archive-rooted lease"
+    );
+    assert_eq!(runtime.recovery(), RuntimeRecoveryState::FirstPromotion);
+
+    drop(runtime);
+    drop(authority);
+    fixture.assert_graph_unchanged();
+}
+
+/// The two defence-in-depth guards around the crash-takeover swap, driven
+/// directly.
+///
+/// Neither is reachable from an ordinary run — that is what makes them
+/// defence in depth — so each is exercised at its own boundary instead of
+/// through a whole takeover:
+///
+/// * the compare-and-swap refuses an authorization whose archive-rooted lease
+///   belongs to a *different workspace* than this enrollment's binding, even
+///   though that lease is genuine, live, and self-consistent with its own
+///   archive;
+/// * `require_unchanged_bootstrap_anchor` refuses a runtime whose recorded
+///   immutable activation anchor is not the one the enrollment chain still
+///   proves, rereading the chain rather than trusting memory.
+#[test]
+fn the_takeover_workspace_and_anchor_guards_each_refuse_directly() {
+    let mut fixture = Fixture::new(
+        "takeover-guards",
+        None,
+        vec![("pages/guards.md".into(), b"- guards\n".to_vec())],
+    );
+    let root = fixture.enrollment_root("takeover-guards");
+    let binding = fixture.enrollment_binding();
+    let paths = PromotedPaths::new(&fixture, "takeover-guards");
+    let session = SessionId::new();
+    let (authority, mut runtime) = promote(&mut fixture, &root, session, &paths);
+
+    // A freshly promoted runtime commits `Unsafe { session }`, so its own
+    // record is a well-formed takeover predecessor.
+    let anchor = reopen_promoted_bootstrap_anchor(&root, &binding).unwrap();
+    let predecessor =
+        UnsafeHandoffPredecessor::observed_in(&anchor).expect("a promoted runtime commits Unsafe");
+    assert_eq!(predecessor.session_id(), session);
+    let head_before = runtime.enrollment.committed().enrollment_head();
+
+    // A genuine, live workspace lease over a *different* workspace's archive.
+    // It authorizes its own archive perfectly well, which is exactly why the
+    // compare-and-swap has to check it against this enrollment's binding.
+    let other_workspace = WorkspaceId::from_uuid(Uuid::from_u128(0x91FF));
+    let other_store = ObjectStore::open(
+        &fixture.root.path().join("other-workspace-archive"),
+        other_workspace,
+    )
+    .unwrap();
+    let other_lease = WorkspaceRuntimeLease::acquire(&other_store, other_workspace).unwrap();
+    let other_proof = other_lease.proof();
+    let authorization = runtime
+        .enrollment
+        .authenticate_unsafe_predecessor(&other_proof, &other_store, predecessor)
+        .expect("the lease is self-consistent with its own archive");
+    let successor = SessionId::new();
+    let error = runtime
+        .enrollment
+        .take_over_unsafe_handoff(authorization, successor)
+        .map(|_| ())
+        .expect_err("a lease for another workspace must not swap this enrollment's record");
+    assert!(
+        matches!(
+            error,
+            VerifiedLocalCompositionError::ProofMismatch(
+                "the workspace runtime lease is not this enrollment's workspace"
+            )
+        ),
+        "unexpected workspace-proof error: {error}"
+    );
+    assert_eq!(
+        runtime.enrollment.committed().enrollment_head(),
+        head_before,
+        "a refused takeover must write nothing"
+    );
+    assert_eq!(
+        runtime.enrollment.committed().handoff(),
+        LocalActiveHandoff::Unsafe {
+            session_id: session
+        }
+    );
+
+    // A lease rooted at another archive directory does not even mint an
+    // authorization, whatever workspace id it carries.
+    let look_alike = ObjectStore::open(
+        &fixture.root.path().join("look-alike-archive"),
+        fixture.workspace,
+    )
+    .unwrap();
+    let look_alike_lease = WorkspaceRuntimeLease::acquire(&look_alike, fixture.workspace).unwrap();
+    let look_alike_proof = look_alike_lease.proof();
+    let archive = ObjectStore::open(&fixture.archive_root, fixture.workspace).unwrap();
+    let error = runtime
+        .enrollment
+        .authenticate_unsafe_predecessor(&look_alike_proof, &archive, predecessor)
+        .expect_err("a lease rooted at another archive must not authorize this takeover");
+    assert!(
+        matches!(error, VerifiedLocalCompositionError::ProofBinding(_)),
+        "unexpected archive-binding error: {error}"
+    );
+
+    // The post-swap anchor guard, driven directly. The honest pairing passes.
+    let anchor = reopen_promoted_bootstrap_anchor(&root, &binding).unwrap();
+    let (evidence, _committed) = anchor.into_predecessor_evidence();
+    require_unchanged_bootstrap_anchor(&root, &binding, &evidence, &runtime).unwrap();
+
+    // A runtime whose recorded anchor root is not the one the chain proves is
+    // refused, and so is one whose generation moved.
+    let honest_anchor = runtime.anchor;
+    runtime.anchor.index_root = ContentDigest::of(b"not the bootstrap history root");
+    let error = require_unchanged_bootstrap_anchor(&root, &binding, &evidence, &runtime)
+        .expect_err("a moved anchor root must be refused");
+    assert!(
+        matches!(
+            error,
+            RuntimePromotionError::Enrollment(VerifiedLocalCompositionError::StaleEvidence(
+                "bootstrap anchor changed during the promoted handoff transition"
+            ))
+        ),
+        "unexpected anchor error: {error}"
+    );
+    runtime.anchor = honest_anchor;
+    runtime.anchor.generation = honest_anchor.generation.saturating_add(1);
+    assert!(require_unchanged_bootstrap_anchor(&root, &binding, &evidence, &runtime).is_err());
+    runtime.anchor = honest_anchor;
+    require_unchanged_bootstrap_anchor(&root, &binding, &evidence, &runtime).unwrap();
+
+    drop(runtime);
+    drop(authority);
     fixture.assert_graph_unchanged();
 }
 

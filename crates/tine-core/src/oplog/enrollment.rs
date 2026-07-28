@@ -2843,36 +2843,80 @@ impl RetainedEnrollmentSession {
     /// job is the exact enrollment compare-and-swap.
     pub(crate) fn take_over_unsafe_handoff(
         &mut self,
-        workspace: &WorkspaceRuntimeProof<'_>,
-        predecessor: UnsafeHandoffPredecessor,
+        authorization: AuthenticatedUnsafePredecessor<'_>,
         new_session_id: SessionId,
     ) -> Result<&CommittedLocalActive, VerifiedLocalCompositionError> {
-        self.take_over_unsafe_handoff_at_cut(
-            workspace,
-            predecessor,
-            new_session_id,
-            CommitCut::None,
-        )
+        self.take_over_unsafe_handoff_at_cut(authorization, new_session_id, CommitCut::None)
     }
 
     #[cfg(test)]
     pub(crate) fn take_over_unsafe_handoff_at_cut_for_test(
         &mut self,
-        workspace: &WorkspaceRuntimeProof<'_>,
-        predecessor: UnsafeHandoffPredecessor,
+        authorization: AuthenticatedUnsafePredecessor<'_>,
         new_session_id: SessionId,
         cut: CommitCut,
     ) -> Result<&CommittedLocalActive, VerifiedLocalCompositionError> {
-        self.take_over_unsafe_handoff_at_cut(workspace, predecessor, new_session_id, cut)
+        self.take_over_unsafe_handoff_at_cut(authorization, new_session_id, cut)
+    }
+
+    /// Mint the sealed, borrowed authorization one crash-takeover
+    /// compare-and-swap consumes.
+    ///
+    /// This is the only constructor of [`AuthenticatedUnsafePredecessor`], and
+    /// it is deliberately a method on the *retained session*: minting one
+    /// therefore already requires the exclusive device-local enrollment lease,
+    /// a complete authenticated reread of the hash-linked chain, and a live
+    /// archive-rooted workspace lease that authorizes this exact archive
+    /// directory — not merely some lease whose workspace id happens to match.
+    ///
+    /// `observed` cannot widen anything. It can only be the record this process
+    /// already authenticated from the chain (see
+    /// [`UnsafeHandoffPredecessor::observed_in`]), and the freshly reread record
+    /// must still be exactly that, so a newcomer that lost the race to another
+    /// newcomer is refused here, before the swap.
+    pub(crate) fn authenticate_unsafe_predecessor<'lease>(
+        &mut self,
+        workspace: &'lease WorkspaceRuntimeProof<'lease>,
+        archive: &ObjectStore,
+        observed: UnsafeHandoffPredecessor,
+    ) -> Result<AuthenticatedUnsafePredecessor<'lease>, VerifiedLocalCompositionError> {
+        workspace
+            .authorize_archive(archive, archive.workspace_id())
+            .map_err(|error| {
+                VerifiedLocalCompositionError::ProofBinding(format!(
+                    "the workspace runtime lease does not authorize this archive: {error}"
+                ))
+            })?;
+        self.reauthenticate()?;
+        if self.committed.enrollment_head != observed.enrollment_head
+            || self.committed.handoff
+                != (LocalActiveHandoff::Unsafe {
+                    session_id: observed.session_id,
+                })
+        {
+            return Err(VerifiedLocalCompositionError::StaleEvidence(
+                "committed LocalActive record is not the authenticated unsafe predecessor this \
+                 takeover proved",
+            ));
+        }
+        Ok(AuthenticatedUnsafePredecessor {
+            workspace,
+            predecessor: observed,
+        })
     }
 
     fn take_over_unsafe_handoff_at_cut(
         &mut self,
-        workspace: &WorkspaceRuntimeProof<'_>,
-        predecessor: UnsafeHandoffPredecessor,
+        authorization: AuthenticatedUnsafePredecessor<'_>,
         new_session_id: SessionId,
         cut: CommitCut,
     ) -> Result<&CommittedLocalActive, VerifiedLocalCompositionError> {
+        let AuthenticatedUnsafePredecessor {
+            workspace,
+            predecessor,
+        } = authorization;
+        // The authorization proves the lease authorizes its own archive; this
+        // proves that archive is *this enrollment's* workspace.
         if workspace.workspace_id() != self.committed.binding().workspace_id() {
             return Err(VerifiedLocalCompositionError::ProofMismatch(
                 "the workspace runtime lease is not this enrollment's workspace",
@@ -2922,13 +2966,64 @@ impl RetainedEnrollmentSession {
 
 /// The exact committed `Unsafe` record one crash takeover replaces.
 ///
-/// Both fields are authenticated by the newcomer before it is used: the head is
-/// the committed enrollment head it reopened, and the session is the crashed
-/// owner named by that record's handoff state.
+/// Neither field is caller-chosen. [`Self::observed_in`] is the only
+/// constructor, and it reads both out of a [`PromotedBootstrapAnchor`], which
+/// is itself self-authenticated from the hash-linked enrollment chain — so a
+/// caller cannot name a predecessor it did not first authenticate. On its own
+/// this value still authorizes nothing: the compare-and-swap consumes an
+/// [`AuthenticatedUnsafePredecessor`], which only
+/// [`RetainedEnrollmentSession::authenticate_unsafe_predecessor`] can mint.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct UnsafeHandoffPredecessor {
-    pub(crate) enrollment_head: ContentDigest,
-    pub(crate) session_id: SessionId,
+    enrollment_head: ContentDigest,
+    session_id: SessionId,
+}
+
+impl UnsafeHandoffPredecessor {
+    /// The committed `Unsafe` owner this authenticated anchor names, if any.
+    ///
+    /// `None` means the record is `Safe`, which is not a crash predecessor and
+    /// must never be taken over.
+    pub(crate) fn observed_in(anchor: &PromotedBootstrapAnchor) -> Option<Self> {
+        match anchor.committed().handoff() {
+            LocalActiveHandoff::Unsafe { session_id } => Some(Self {
+                enrollment_head: anchor.committed().enrollment_head(),
+                session_id,
+            }),
+            LocalActiveHandoff::Safe => None,
+        }
+    }
+
+    /// The crashed owner this predecessor names.
+    pub(crate) const fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+}
+
+/// Sealed, borrowed authorization for exactly one crash-takeover
+/// compare-and-swap.
+///
+/// It has private fields and no constructor outside
+/// [`RetainedEnrollmentSession::authenticate_unsafe_predecessor`], it is not
+/// `Clone`, and it borrows the workspace proof — which itself borrows the live
+/// archive lease — so it can neither be forged, copied, nor outlive the archive
+/// ownership that justified it. Assembling one from plain identifiers plus any
+/// same-workspace lease is not possible: the mint requires the exclusive
+/// enrollment lease, a fresh authenticated reread, and a lease rooted at this
+/// exact archive directory.
+pub(crate) struct AuthenticatedUnsafePredecessor<'lease> {
+    workspace: &'lease WorkspaceRuntimeProof<'lease>,
+    predecessor: UnsafeHandoffPredecessor,
+}
+
+impl fmt::Debug for AuthenticatedUnsafePredecessor<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AuthenticatedUnsafePredecessor")
+            .field("workspace_id", &self.workspace.workspace_id())
+            .field("predecessor", &self.predecessor)
+            .finish()
+    }
 }
 
 /// Every invariant a retained runtime session requires of a committed record.
