@@ -141,8 +141,9 @@
 //!    [`PromotedRuntimeSession::parts`], which is the shape both the
 //!    operational coordinator and the reconciliation session take.
 //! 8. **Every authority-changing coordinator boundary**: immutable publication,
-//!    tail admission, the SQLite drain, and each manifested Markdown projection
-//!    step, through [`LocalRuntimeAdmission::reprove_workspace_authority`].
+//!    every bounded accepted-history archive-stage slice, tail admission, the
+//!    SQLite drain, and each manifested Markdown projection step, through
+//!    [`LocalRuntimeAdmission::reprove_workspace_authority`].
 //!
 //! It deliberately does **not** run in the per-mutation admission fast path.
 //! Lease identity is a stable session fact of exactly the same class as the
@@ -281,8 +282,8 @@ use super::enrollment::{
     VerifiedLocalCompositionError, VerifiedLocalEvidence, VerifiedLocalProofSet,
 };
 use super::hot_engine::{
-    EngineError, EngineOpenRetention, ProjectionStorageBinding, RuntimeResumeObservation,
-    ShardedHotEngine,
+    EngineError, EngineOpenRetention, LocalAuthorGeneration, ProjectionStorageBinding,
+    RuntimeResumeObservation, ShardedHotEngine,
 };
 use super::import::InactiveBootstrapAcceptedAuthority;
 use super::object_store::{
@@ -303,7 +304,9 @@ use super::watcher_queue::{
     WatcherQueueLimits, WatcherQueueOwner, WatcherQueueStatus, WatcherQuiesceError,
     WatcherSettlementError,
 };
-use super::{ContentDigest, ObjectStore, ProjectionEndpointBinding, SessionId, WorkspaceId};
+use super::{
+    ContentDigest, DeviceId, ObjectStore, ProjectionEndpointBinding, SessionId, WorkspaceId,
+};
 
 /// A private seal. Sibling modules can name the sealed types but can never
 /// construct one, because this module is the only place `Seal` is reachable.
@@ -1043,6 +1046,38 @@ pub(crate) struct LocalRuntimeAdmission<'a> {
     provenance: AdmissionProvenance<'a>,
 }
 
+/// Nonconstructible authority for one promoted runtime/session to draft a
+/// local author transaction at its current author-generation root.
+///
+/// It is intentionally affine and non-serializable. The coordinator mints it
+/// immediately before local drafting and never exposes it to a facade.
+pub(crate) struct AdmittedLocalAuthorAuthority<'a> {
+    workspace_id: WorkspaceId,
+    device_id: DeviceId,
+    session_id: SessionId,
+    generation: LocalAuthorGeneration,
+    _admission: std::marker::PhantomData<&'a LocalRuntimeAdmission<'a>>,
+    _seal: seal::Seal,
+}
+
+impl AdmittedLocalAuthorAuthority<'_> {
+    pub(crate) const fn workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
+    }
+
+    pub(crate) const fn device_id(&self) -> DeviceId {
+        self.device_id
+    }
+
+    pub(crate) const fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    pub(crate) const fn generation(&self) -> &LocalAuthorGeneration {
+        &self.generation
+    }
+}
+
 enum AdmissionProvenance<'a> {
     Promoted(&'a PromotedRuntimeAdmission<'a>),
     UnenrolledPreActivation,
@@ -1108,6 +1143,45 @@ impl LocalRuntimeAdmission<'_> {
                 Ok(())
             }
         }
+    }
+
+    /// Mint exact local-author authority from a live promoted admission.
+    ///
+    /// The pre-activation fixture admission is deliberately refused: raw
+    /// author construction is confined to the coordinator's `cfg(test)` helper
+    /// and the legacy engine fixture helper, which production promoted runtimes
+    /// reject.
+    pub(crate) fn mint_local_author_authority<'a>(
+        &'a self,
+        graph: &Graph,
+        engine: &ShardedHotEngine,
+        endpoint: ProjectionEndpointBinding,
+    ) -> Result<AdmittedLocalAuthorAuthority<'a>, LocalActivationError> {
+        self.authorize(graph, engine)?;
+        let AdmissionProvenance::Promoted(admission) = &self.provenance else {
+            return Err(LocalActivationError::RuntimeBinding(
+                "local author identity requires a live promoted runtime session".into(),
+            ));
+        };
+        if endpoint != admission.permit.endpoint()
+            || endpoint.device_id() != admission.permit.endpoint().device_id()
+            || engine.workspace_id() != admission.state.workspace_id
+        {
+            return Err(LocalActivationError::RuntimeBinding(
+                "promoted local author binding differs from the admitted endpoint or workspace"
+                    .into(),
+            ));
+        }
+        Ok(AdmittedLocalAuthorAuthority {
+            workspace_id: engine.workspace_id(),
+            device_id: endpoint.device_id(),
+            session_id: admission.permit.session_id(),
+            generation: engine
+                .local_author_generation()
+                .map_err(|error| LocalActivationError::RuntimeBinding(error.to_string()))?,
+            _admission: std::marker::PhantomData,
+            _seal: seal::Seal,
+        })
     }
 
     /// Re-derive archive-rooted workspace authority immediately before one
@@ -2036,6 +2110,8 @@ pub(crate) enum WorkspaceAuthorityBoundary {
     ResumeReclamation,
     /// Coordinator: immutable batch publication into the archive.
     Publication,
+    /// Coordinator: one bounded accepted-history/archive staging slice.
+    ArchiveStage,
     /// Coordinator: bounded tail admission of accepted batches.
     TailAdmission,
     /// Coordinator: the SQLite drain/advance.
@@ -2056,6 +2132,7 @@ impl WorkspaceAuthorityBoundary {
             Self::ResumePublication => "quiescent resume-point publication",
             Self::ResumeReclamation => "retained-run reclamation",
             Self::Publication => "coordinator immutable publication",
+            Self::ArchiveStage => "coordinator accepted-history archive staging",
             Self::TailAdmission => "coordinator tail admission",
             Self::SqliteDrain => "coordinator SQLite drain",
             Self::ProjectionDrain => "coordinator manifested projection",

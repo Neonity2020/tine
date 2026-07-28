@@ -140,6 +140,32 @@ impl CrdtPeerId {
             ],
         ))
     }
+
+    /// Derive one candidate for a promoted local mutation.
+    ///
+    /// The batch identity is freshly minted by the admitted runtime path, so
+    /// this domain-separated value is fresh for that mutation while remaining
+    /// reproducible across the bounded collision probe. The authoring engine
+    /// still rejects zero and every peer already present in an affected causal
+    /// document before a draft is returned.
+    pub(crate) fn local_mutation_candidate(
+        workspace_id: WorkspaceId,
+        device_id: DeviceId,
+        session_id: SessionId,
+        batch_id: BatchId,
+        attempt: u64,
+    ) -> Self {
+        Self(derived_u64(
+            b"tine/local-mutation/crdt-peer-id/v1\0",
+            &[
+                workspace_id.as_uuid().as_bytes(),
+                device_id.as_uuid().as_bytes(),
+                session_id.as_uuid().as_bytes(),
+                batch_id.as_uuid().as_bytes(),
+                &attempt.to_be_bytes(),
+            ],
+        ))
+    }
 }
 
 impl fmt::Display for CrdtPeerId {

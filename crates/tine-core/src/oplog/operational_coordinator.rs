@@ -14,7 +14,7 @@ use crate::Graph;
 
 use super::hot_engine::{LocalAuthorCapture, ReconciliationNeeded};
 use super::local_active::{
-    LocalRuntimeAdmission, RuntimeRevocation, WorkspaceAuthorityBoundary,
+    LocalRuntimeAdmission, PromotedRuntimeSession, RuntimeRevocation, WorkspaceAuthorityBoundary,
     WorkspaceAuthorityRefusal,
 };
 use super::{
@@ -75,11 +75,22 @@ pub(crate) enum OperationalPhase {
     ProjectionDrain,
 }
 
+/// Stable post-publication evidence that retrying the exact immutable batch
+/// cannot turn into progress.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum RetainedBlockReason {
+    Rejected(super::EngineError),
+    Quarantined,
+    PublishedAuthentication,
+    StableBinding,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct OperationalCoordinatorError {
     phase: OperationalPhase,
     detail: String,
     revocation: Option<RuntimeRevocation>,
+    retained_block: Option<RetainedBlockReason>,
 }
 
 impl OperationalCoordinatorError {
@@ -88,6 +99,7 @@ impl OperationalCoordinatorError {
             phase,
             detail: detail.into(),
             revocation: None,
+            retained_block: None,
         }
     }
 
@@ -95,7 +107,21 @@ impl OperationalCoordinatorError {
         Self {
             phase,
             detail: refusal.to_string(),
-            revocation: Some(refusal.revocation().clone()),
+            revocation: refusal.revocation().cloned(),
+            retained_block: None,
+        }
+    }
+
+    fn retained_block(
+        phase: OperationalPhase,
+        detail: impl Into<String>,
+        reason: RetainedBlockReason,
+    ) -> Self {
+        Self {
+            phase,
+            detail: detail.into(),
+            revocation: None,
+            retained_block: Some(reason),
         }
     }
 
@@ -114,6 +140,10 @@ impl OperationalCoordinatorError {
     pub(crate) const fn revocation(&self) -> Option<&RuntimeRevocation> {
         self.revocation.as_ref()
     }
+
+    pub(crate) const fn retained_block_reason(&self) -> Option<&RetainedBlockReason> {
+        self.retained_block.as_ref()
+    }
 }
 
 impl fmt::Display for OperationalCoordinatorError {
@@ -127,9 +157,10 @@ impl std::error::Error for OperationalCoordinatorError {}
 /// Re-derive archive-rooted workspace authority immediately before one
 /// authority-changing boundary, and report a refusal as that exact phase.
 ///
-/// The four side-effect call sites below are the coordinator's complete set of boundaries
-/// that take, change, or externalize authority: immutable publication, tail
-/// admission, the SQLite advance, and each manifested Markdown projection step.
+/// The five side-effect call sites below are the coordinator's complete set of
+/// boundaries that take, change, or externalize authority: immutable
+/// publication, accepted-history archive staging, tail admission, the SQLite
+/// advance, and each manifested Markdown projection step.
 /// Every one of them is already an [`OperationalPhase`], so a lost workspace
 /// stays diagnosable by phase rather than collapsing into one generic error.
 ///
@@ -162,7 +193,11 @@ fn authorize_coordinator(
         OperationalPhase::Bindings,
     )?;
     admission.authorize(graph, engine).map_err(|error| {
-        OperationalCoordinatorError::new(OperationalPhase::Bindings, error.to_string())
+        OperationalCoordinatorError::retained_block(
+            OperationalPhase::Bindings,
+            error.to_string(),
+            RetainedBlockReason::StableBinding,
+        )
     })
 }
 
@@ -186,7 +221,7 @@ pub(crate) enum OperationalCoordinatorState {
     Blocked(ImportPlan),
     Noop,
     Complete(OperationalCompletion),
-    FailedClosed(FailedClosedOperationalCoordinator),
+    FailedClosed(ExternalPublishedContinuation),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -207,7 +242,7 @@ pub(crate) enum LocalMutationRecovery {
     ReconciliationRequired(ReconciliationNeeded),
     /// Immutable publication may have happened. This exact continuation must
     /// be retried; redrafting would create a second mutation writer.
-    Published(FailedClosedOperationalCoordinator),
+    Published(LocalPublishedContinuation),
 }
 
 impl LocalMutationRecovery {
@@ -218,18 +253,50 @@ impl LocalMutationRecovery {
         }
     }
 
-    pub(crate) fn published(&self) -> Option<&FailedClosedOperationalCoordinator> {
+    pub(crate) fn published(&self) -> Option<&LocalPublishedContinuation> {
         match self {
             Self::ReconciliationRequired(_) => None,
             Self::Published(continuation) => Some(continuation),
         }
     }
 
-    pub(crate) fn into_published(self) -> Option<FailedClosedOperationalCoordinator> {
+    pub(crate) fn into_published(self) -> Option<LocalPublishedContinuation> {
         match self {
             Self::ReconciliationRequired(_) => None,
             Self::Published(continuation) => Some(continuation),
         }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum LocalMutationBlockReason {
+    Prepublication,
+    Retained(RetainedBlockReason),
+}
+
+/// A prepublication refusal or a stable post-publication block. The latter
+/// retains the exact affine continuation and its immutable evidence.
+pub(crate) struct BlockedLocalMutation {
+    failure: OperationalCoordinatorError,
+    reason: LocalMutationBlockReason,
+    continuation: Option<LocalPublishedContinuation>,
+}
+
+impl BlockedLocalMutation {
+    pub(crate) fn failure(&self) -> &OperationalCoordinatorError {
+        &self.failure
+    }
+
+    pub(crate) fn reason(&self) -> &LocalMutationBlockReason {
+        &self.reason
+    }
+
+    pub(crate) fn continuation(&self) -> Option<&LocalPublishedContinuation> {
+        self.continuation.as_ref()
+    }
+
+    pub(crate) fn into_continuation(self) -> Option<LocalPublishedContinuation> {
+        self.continuation
     }
 }
 
@@ -237,7 +304,7 @@ impl LocalMutationRecovery {
 /// when recovery still owes derived-state drains.
 pub(crate) struct RevokedLocalMutation {
     failure: OperationalCoordinatorError,
-    continuation: Option<FailedClosedOperationalCoordinator>,
+    continuation: Option<LocalPublishedContinuation>,
 }
 
 impl RevokedLocalMutation {
@@ -245,11 +312,11 @@ impl RevokedLocalMutation {
         &self.failure
     }
 
-    pub(crate) fn continuation(&self) -> Option<&FailedClosedOperationalCoordinator> {
+    pub(crate) fn continuation(&self) -> Option<&LocalPublishedContinuation> {
         self.continuation.as_ref()
     }
 
-    pub(crate) fn into_continuation(self) -> Option<FailedClosedOperationalCoordinator> {
+    pub(crate) fn into_continuation(self) -> Option<LocalPublishedContinuation> {
         self.continuation
     }
 }
@@ -261,7 +328,7 @@ impl RevokedLocalMutation {
 pub(crate) enum LocalMutationCoordinatorState {
     Active(LocalMutationCompletion),
     Recovering(LocalMutationRecovery),
-    Blocked(OperationalCoordinatorError),
+    Blocked(BlockedLocalMutation),
     Revoked(RevokedLocalMutation),
 }
 
@@ -273,15 +340,26 @@ impl LocalMutationCoordinatorState {
                 continuation: None,
             })
         } else {
-            Self::Blocked(error)
+            Self::Blocked(BlockedLocalMutation {
+                failure: error,
+                reason: LocalMutationBlockReason::Prepublication,
+                continuation: None,
+            })
         }
     }
 
-    fn from_failed(continuation: FailedClosedOperationalCoordinator) -> Self {
+    fn from_failed(continuation: LocalPublishedContinuation) -> Self {
         if continuation.failure().revocation().is_some() {
             let failure = continuation.failure().clone();
             Self::Revoked(RevokedLocalMutation {
                 failure,
+                continuation: Some(continuation),
+            })
+        } else if let Some(reason) = continuation.failure().retained_block_reason().cloned() {
+            let failure = continuation.failure().clone();
+            Self::Blocked(BlockedLocalMutation {
+                failure,
+                reason: LocalMutationBlockReason::Retained(reason),
                 continuation: Some(continuation),
             })
         } else {
@@ -290,62 +368,23 @@ impl LocalMutationCoordinatorState {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PublishedMutationIdentity {
-    External {
-        batch_id: BatchId,
-        import_id: ImportId,
-    },
-    Local {
-        batch_id: BatchId,
-    },
-}
-
-impl PublishedMutationIdentity {
-    const fn batch_id(self) -> BatchId {
-        match self {
-            Self::External { batch_id, .. } | Self::Local { batch_id } => batch_id,
-        }
-    }
-
-    const fn origin(self) -> BatchOrigin {
-        match self {
-            Self::External { import_id, .. } => BatchOrigin::ExternalReconciliation { import_id },
-            Self::Local { .. } => BatchOrigin::LocalMutation,
-        }
-    }
-
-    const fn import_id(self) -> Option<ImportId> {
-        match self {
-            Self::External { import_id, .. } => Some(import_id),
-            Self::Local { .. } => None,
-        }
-    }
-}
-
 /// Post-manifest retry state. It owns the original graph handoff guard and the
 /// exact immutable publication identity; retry never redrafts or republishes.
-pub(crate) struct FailedClosedOperationalCoordinator {
+struct PublishedContinuationCore {
     guard: PublishedHandoffLatch,
     endpoint: ProjectionEndpointBinding,
     archive: Arc<ObjectStore>,
-    identity: PublishedMutationIdentity,
+    batch_id: BatchId,
+    origin: BatchOrigin,
     manifest_digest: ContentDigest,
     retained_bytes: usize,
     reservation: Option<TailReservation>,
     failure: OperationalCoordinatorError,
 }
 
-impl FailedClosedOperationalCoordinator {
+impl PublishedContinuationCore {
     pub(crate) const fn batch_id(&self) -> BatchId {
-        self.identity.batch_id()
-    }
-
-    pub(crate) const fn import_id(&self) -> ImportId {
-        match self.identity.import_id() {
-            Some(import_id) => import_id,
-            None => panic!("local mutation continuation has no import id"),
-        }
+        self.batch_id
     }
 
     pub(crate) const fn phase(&self) -> OperationalPhase {
@@ -356,69 +395,17 @@ impl FailedClosedOperationalCoordinator {
         &self.failure
     }
 
-    pub(crate) fn retry(
-        mut self,
+    fn authorize(
+        &mut self,
         admission: &LocalRuntimeAdmission<'_>,
         graph: &Graph,
-        receipts: &ProjectionReceiptStore,
-        engine: &mut ShardedHotEngine,
-        database: &mut SqliteFrontier,
-        tail: &mut TailOverlay,
-    ) -> OperationalCoordinatorState {
-        let Some(import_id) = self.identity.import_id() else {
-            self.failure = OperationalCoordinatorError::new(
-                OperationalPhase::Bindings,
-                "local mutation continuation used the external retry entry point",
-            );
-            return OperationalCoordinatorState::FailedClosed(self);
-        };
+        engine: &ShardedHotEngine,
+    ) -> bool {
         if let Err(error) = authorize_coordinator(admission, graph, engine) {
             self.failure = error;
-            return OperationalCoordinatorState::FailedClosed(self);
-        }
-        match self.resume(admission, graph, receipts, engine, database, tail) {
-            Ok(batch_id) => {
-                self.guard.complete();
-                OperationalCoordinatorState::Complete(OperationalCompletion {
-                    batch_id,
-                    import_id,
-                })
-            }
-            Err(error) => {
-                self.failure = error;
-                OperationalCoordinatorState::FailedClosed(self)
-            }
-        }
-    }
-
-    pub(crate) fn retry_local(
-        mut self,
-        admission: &LocalRuntimeAdmission<'_>,
-        graph: &Graph,
-        receipts: &ProjectionReceiptStore,
-        engine: &mut ShardedHotEngine,
-        database: &mut SqliteFrontier,
-        tail: &mut TailOverlay,
-    ) -> LocalMutationCoordinatorState {
-        if self.identity.import_id().is_some() {
-            return LocalMutationCoordinatorState::Blocked(OperationalCoordinatorError::new(
-                OperationalPhase::Bindings,
-                "external reconciliation continuation used the local retry entry point",
-            ));
-        }
-        if let Err(error) = authorize_coordinator(admission, graph, engine) {
-            self.failure = error;
-            return LocalMutationCoordinatorState::from_failed(self);
-        }
-        match self.resume(admission, graph, receipts, engine, database, tail) {
-            Ok(batch_id) => {
-                self.guard.complete();
-                LocalMutationCoordinatorState::Active(LocalMutationCompletion { batch_id })
-            }
-            Err(error) => {
-                self.failure = error;
-                LocalMutationCoordinatorState::from_failed(self)
-            }
+            false
+        } else {
+            true
         }
     }
 
@@ -436,11 +423,16 @@ impl FailedClosedOperationalCoordinator {
         self.guard
             .verify_binding(graph, engine.workspace_id(), self.endpoint)
             .map_err(|error| {
-                OperationalCoordinatorError::new(OperationalPhase::Bindings, error.to_string())
+                OperationalCoordinatorError::retained_block(
+                    OperationalPhase::Bindings,
+                    error.to_string(),
+                    RetainedBlockReason::StableBinding,
+                )
             })?;
         authenticate_published(
             &self.archive,
-            self.identity,
+            self.batch_id,
+            self.origin,
             self.manifest_digest,
             self.retained_bytes,
         )?;
@@ -454,26 +446,19 @@ impl FailedClosedOperationalCoordinator {
         // honest continuation from the projection phase to the SQLite phase
         // while pushing total work for the journey above the 16-unit target.
         let stage_limit = budget.remaining.saturating_sub(1) / 2;
+        reprove_workspace_authority(
+            admission,
+            WorkspaceAuthorityBoundary::ArchiveStage,
+            OperationalPhase::ArchiveStage,
+        )?;
         let stage = engine
-            .stage_archive_batch_bounded(self.identity.batch_id(), stage_limit)
+            .stage_archive_batch_bounded(self.batch_id, stage_limit)
             .map_err(|error| {
                 OperationalCoordinatorError::new(OperationalPhase::ArchiveStage, error.to_string())
             })?;
         budget.consume(stage.work(), OperationalPhase::ArchiveStage)?;
         fault(OperationalFaultPoint::AfterStage)?;
-        if !matches!(
-            stage.outcome().disposition(),
-            BatchDisposition::Accepted { .. } | BatchDisposition::DuplicateAccepted { .. }
-        ) {
-            return Err(OperationalCoordinatorError::new(
-                OperationalPhase::ArchiveStage,
-                format!(
-                    "published reconciliation {} did not accept: {:?}",
-                    self.identity.batch_id(),
-                    stage.outcome().disposition()
-                ),
-            ));
-        }
+        require_accepted_stage_disposition(self.batch_id, &stage.outcome().disposition())?;
 
         let mut events = stage
             .outcome()
@@ -490,31 +475,22 @@ impl FailedClosedOperationalCoordinator {
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        // A live reservation means the published event has not been admitted
-        // yet. Adding it here is what makes the single in-loop retained-byte
-        // check and reserved admission the only such path.
         if self.reservation.is_some()
-            && !events
-                .iter()
-                .any(|event| event.batch_id() == self.identity.batch_id())
+            && !events.iter().any(|event| event.batch_id() == self.batch_id)
         {
             events.push(
-                AcceptedBatchEvent::from_accepted(
-                    engine,
-                    &self.archive,
-                    self.identity.batch_id(),
-                )
-                .map_err(|error| {
+                AcceptedBatchEvent::from_accepted(engine, &self.archive, self.batch_id).map_err(
+                    |error| {
                         OperationalCoordinatorError::new(
                             OperationalPhase::TailAdmission,
                             error.to_string(),
                         )
-                    })?,
+                    },
+                )?,
             );
         }
         events.sort_unstable_by_key(AcceptedBatchEvent::acceptance_sequence);
-        // Boundary: tail admission is a device-local applier write. Reprove
-        // immediately before the first enqueue, not after it.
+        fault(OperationalFaultPoint::BeforeTailAdmission)?;
         reprove_workspace_authority(
             admission,
             WorkspaceAuthorityBoundary::TailAdmission,
@@ -522,11 +498,12 @@ impl FailedClosedOperationalCoordinator {
         )?;
         for event in events {
             budget.consume(1, OperationalPhase::TailAdmission)?;
-            if event.batch_id() == self.identity.batch_id() {
+            if event.batch_id() == self.batch_id {
                 if event.retained_bytes() != self.retained_bytes {
-                    return Err(OperationalCoordinatorError::new(
+                    return Err(OperationalCoordinatorError::retained_block(
                         OperationalPhase::TailAdmission,
                         "published accepted event retained bytes differ from the reserved prepared batch",
+                        RetainedBlockReason::PublishedAuthentication,
                     ));
                 }
                 if let Some(reservation) = self.reservation {
@@ -550,18 +527,13 @@ impl FailedClosedOperationalCoordinator {
                 })?;
         }
         if self.reservation.is_some() {
-            return Err(OperationalCoordinatorError::new(
+            return Err(OperationalCoordinatorError::retained_block(
                 OperationalPhase::TailAdmission,
                 "published reservation survived tail admission of the published event",
+                RetainedBlockReason::PublishedAuthentication,
             ));
         }
         fault(OperationalFaultPoint::AfterTailAdmission)?;
-        // Load-bearing order: newly accepted events and the exact published
-        // reservation are admitted to the tail *before* a staging continuation
-        // is reported. Reversing this would return with the reservation still
-        // live, so the next resume would re-reserve tail capacity that the
-        // published batch already owns. Admission is idempotent per acceptance
-        // sequence, so admitting first and then failing closed is safe.
         if stage.has_more() {
             return Err(OperationalCoordinatorError::new(
                 OperationalPhase::ArchiveStage,
@@ -572,8 +544,6 @@ impl FailedClosedOperationalCoordinator {
             ));
         }
 
-        // Boundary: the SQLite advance is the one-applier-per-workspace write.
-        // Reprove immediately before it, not at journey entry.
         reprove_workspace_authority(
             admission,
             WorkspaceAuthorityBoundary::SqliteDrain,
@@ -632,9 +602,6 @@ impl FailedClosedOperationalCoordinator {
                     "projection bounded slice has ready-work continuation",
                 ));
             }
-            // Boundary: manifested projection writes Markdown into the user's
-            // own graph. Reprove before *each* step, because every one of them
-            // is a separate externally visible write.
             reprove_workspace_authority(
                 admission,
                 WorkspaceAuthorityBoundary::ProjectionDrain,
@@ -657,7 +624,141 @@ impl FailedClosedOperationalCoordinator {
             budget.consume(1, OperationalPhase::ProjectionDrain)?;
             fault(OperationalFaultPoint::AfterProjection)?;
         }
-        Ok(self.identity.batch_id())
+        Ok(self.batch_id)
+    }
+}
+
+fn require_accepted_stage_disposition(
+    batch_id: BatchId,
+    disposition: &BatchDisposition,
+) -> Result<(), OperationalCoordinatorError> {
+    match disposition {
+        BatchDisposition::Accepted { .. } | BatchDisposition::DuplicateAccepted { .. } => Ok(()),
+        BatchDisposition::IncompleteStaged { .. } => Err(OperationalCoordinatorError::new(
+            OperationalPhase::ArchiveStage,
+            format!("bounded staging slice for {batch_id} retains dependency/work continuation"),
+        )),
+        BatchDisposition::Rejected { error } => Err(OperationalCoordinatorError::retained_block(
+            OperationalPhase::ArchiveStage,
+            format!("published mutation {batch_id} was rejected: {error}"),
+            RetainedBlockReason::Rejected(error.clone()),
+        )),
+        BatchDisposition::Quarantined => Err(OperationalCoordinatorError::retained_block(
+            OperationalPhase::ArchiveStage,
+            format!("published mutation {batch_id} was quarantined"),
+            RetainedBlockReason::Quarantined,
+        )),
+    }
+}
+
+/// Affine external-reconciliation continuation. Only this type exposes an
+/// import identity and the external retry API.
+pub(crate) struct ExternalPublishedContinuation {
+    import_id: ImportId,
+    core: PublishedContinuationCore,
+}
+
+/// Compatibility name for the existing external reconciliation session.
+/// Local mutation continuations are a distinct type and cannot enter it.
+pub(crate) type FailedClosedOperationalCoordinator = ExternalPublishedContinuation;
+
+impl ExternalPublishedContinuation {
+    pub(crate) const fn batch_id(&self) -> BatchId {
+        self.core.batch_id()
+    }
+
+    pub(crate) const fn import_id(&self) -> ImportId {
+        self.import_id
+    }
+
+    pub(crate) const fn phase(&self) -> OperationalPhase {
+        self.core.phase()
+    }
+
+    pub(crate) fn failure(&self) -> &OperationalCoordinatorError {
+        self.core.failure()
+    }
+
+    #[cfg(test)]
+    const fn retained_bytes(&self) -> usize {
+        self.core.retained_bytes
+    }
+
+    pub(crate) fn retry(
+        mut self,
+        admission: &LocalRuntimeAdmission<'_>,
+        graph: &Graph,
+        receipts: &ProjectionReceiptStore,
+        engine: &mut ShardedHotEngine,
+        database: &mut SqliteFrontier,
+        tail: &mut TailOverlay,
+    ) -> OperationalCoordinatorState {
+        if !self.core.authorize(admission, graph, engine) {
+            return OperationalCoordinatorState::FailedClosed(self);
+        }
+        match self
+            .core
+            .resume(admission, graph, receipts, engine, database, tail)
+        {
+            Ok(batch_id) => {
+                self.core.guard.complete();
+                OperationalCoordinatorState::Complete(OperationalCompletion {
+                    batch_id,
+                    import_id: self.import_id,
+                })
+            }
+            Err(error) => {
+                self.core.failure = error;
+                OperationalCoordinatorState::FailedClosed(self)
+            }
+        }
+    }
+}
+
+/// Affine admitted-local continuation. It has no import accessor and exposes
+/// only the local retry API.
+pub(crate) struct LocalPublishedContinuation {
+    core: PublishedContinuationCore,
+}
+
+impl LocalPublishedContinuation {
+    pub(crate) const fn batch_id(&self) -> BatchId {
+        self.core.batch_id()
+    }
+
+    pub(crate) const fn phase(&self) -> OperationalPhase {
+        self.core.phase()
+    }
+
+    pub(crate) fn failure(&self) -> &OperationalCoordinatorError {
+        self.core.failure()
+    }
+
+    pub(crate) fn retry(
+        mut self,
+        admission: &LocalRuntimeAdmission<'_>,
+        graph: &Graph,
+        receipts: &ProjectionReceiptStore,
+        engine: &mut ShardedHotEngine,
+        database: &mut SqliteFrontier,
+        tail: &mut TailOverlay,
+    ) -> LocalMutationCoordinatorState {
+        if !self.core.authorize(admission, graph, engine) {
+            return LocalMutationCoordinatorState::from_failed(self);
+        }
+        match self
+            .core
+            .resume(admission, graph, receipts, engine, database, tail)
+        {
+            Ok(batch_id) => {
+                self.core.guard.complete();
+                LocalMutationCoordinatorState::Active(LocalMutationCompletion { batch_id })
+            }
+            Err(error) => {
+                self.core.failure = error;
+                LocalMutationCoordinatorState::from_failed(self)
+            }
+        }
     }
 }
 
@@ -755,10 +856,7 @@ impl OperationalCoordinator {
             ));
         }
         fault(OperationalFaultPoint::AfterFinalize)?;
-        let identity = PublishedMutationIdentity::External {
-            batch_id: author.batch_id,
-            import_id,
-        };
+        let origin = BatchOrigin::ExternalReconciliation { import_id };
         match publish_and_drain(
             admission,
             graph,
@@ -770,28 +868,63 @@ impl OperationalCoordinator {
             archive,
             guard,
             prepared,
-            identity,
+            author.batch_id,
+            origin,
         )? {
-            PublishedPipelineState::Complete(batch_id) => {
-                Ok(OperationalCoordinatorState::Complete(OperationalCompletion {
+            PublishedPipelineState::Complete(batch_id) => Ok(
+                OperationalCoordinatorState::Complete(OperationalCompletion {
                     batch_id,
                     import_id,
-                }))
-            }
-            PublishedPipelineState::FailedClosed(continuation) => {
-                Ok(OperationalCoordinatorState::FailedClosed(continuation))
-            }
+                }),
+            ),
+            PublishedPipelineState::FailedClosed(continuation) => Ok(
+                OperationalCoordinatorState::FailedClosed(ExternalPublishedContinuation {
+                    import_id,
+                    core: continuation,
+                }),
+            ),
         }
     }
 
     /// Execute one already-translated semantic local mutation under the
     /// currently admitted `LocalActive` runtime.
     ///
-    /// The caller supplies identity plus semantic operations, but no authority:
-    /// admission, exact graph capture, publication, SQLite, and projection all
-    /// remain sealed inside the same coordinator transaction.
-    #[allow(clippy::too_many_arguments)]
+    /// The caller supplies semantic operations only. The nonconstructible
+    /// promoted runtime/session mints batch, device, session, and CRDT-peer
+    /// identity inside this boundary.
     pub(crate) fn execute_local(
+        session: &mut PromotedRuntimeSession<'_>,
+        graph: &Graph,
+        receipts: &ProjectionReceiptStore,
+        transaction: &OperationTransaction,
+    ) -> LocalMutationCoordinatorState {
+        let (admission, engine, database, tail) = match session.parts() {
+            Ok(parts) => parts,
+            Err(refusal) => {
+                return LocalMutationCoordinatorState::blocked(
+                    OperationalCoordinatorError::revoked(OperationalPhase::Bindings, refusal),
+                );
+            }
+        };
+        match execute_local_inner(
+            &admission,
+            graph,
+            receipts,
+            engine,
+            database,
+            tail,
+            LocalDraftSource::Promoted,
+            transaction,
+        ) {
+            Ok(state) => state,
+            Err(error) => LocalMutationCoordinatorState::blocked(error),
+        }
+    }
+
+    /// Raw-author escape hatch for deterministic pre-enrollment fixtures.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    fn execute_local_with_author(
         admission: &LocalRuntimeAdmission<'_>,
         graph: &Graph,
         receipts: &ProjectionReceiptStore,
@@ -808,13 +941,19 @@ impl OperationalCoordinator {
             engine,
             database,
             tail,
-            author,
+            LocalDraftSource::Raw(author),
             transaction,
         ) {
             Ok(state) => state,
             Err(error) => LocalMutationCoordinatorState::blocked(error),
         }
     }
+}
+
+enum LocalDraftSource {
+    Promoted,
+    #[cfg(test)]
+    Raw(AuthorBatch),
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -825,7 +964,7 @@ fn execute_local_inner(
     engine: &mut ShardedHotEngine,
     database: &mut SqliteFrontier,
     tail: &mut TailOverlay,
-    author: AuthorBatch,
+    source: LocalDraftSource,
     transaction: &OperationTransaction,
 ) -> Result<LocalMutationCoordinatorState, OperationalCoordinatorError> {
     authorize_coordinator(admission, graph, engine)?;
@@ -835,12 +974,6 @@ fn execute_local_inner(
             "engine has no enrolled projection endpoint",
         )
     })?;
-    if author.author_device_id != endpoint.device_id() {
-        return Err(OperationalCoordinatorError::new(
-            OperationalPhase::Bindings,
-            "local author device does not match the admitted projection endpoint",
-        ));
-    }
     let archive = verify_bindings(graph, receipts, engine, endpoint, None)?;
     let handoff = graph
         .mint_handoff_safe(engine.workspace_id(), endpoint)
@@ -860,11 +993,43 @@ fn execute_local_inner(
             OperationalCoordinatorError::new(OperationalPhase::Bindings, error.to_string())
         })?;
 
-    let draft = engine
-        .draft_author_transaction(author, BatchOrigin::LocalMutation, transaction)
-        .map_err(|error| {
-            OperationalCoordinatorError::new(OperationalPhase::Draft, error.to_string())
-        })?;
+    let (batch_id, author_device_id, author_session_id, draft) = match source {
+        LocalDraftSource::Promoted => {
+            let authority = admission
+                .mint_local_author_authority(graph, engine, endpoint)
+                .map_err(|error| {
+                    OperationalCoordinatorError::new(OperationalPhase::Bindings, error.to_string())
+                })?;
+            let author_device_id = authority.device_id();
+            let author_session_id = authority.session_id();
+            let (batch_id, draft) = engine
+                .draft_admitted_local_author_transaction(&authority, transaction)
+                .map_err(|error| {
+                    OperationalCoordinatorError::new(OperationalPhase::Draft, error.to_string())
+                })?;
+            (batch_id, author_device_id, author_session_id, draft)
+        }
+        #[cfg(test)]
+        LocalDraftSource::Raw(author) => {
+            if author.author_device_id != endpoint.device_id() {
+                return Err(OperationalCoordinatorError::new(
+                    OperationalPhase::Bindings,
+                    "local author device does not match the admitted projection endpoint",
+                ));
+            }
+            let draft = engine
+                .draft_author_transaction(author, BatchOrigin::LocalMutation, transaction)
+                .map_err(|error| {
+                    OperationalCoordinatorError::new(OperationalPhase::Draft, error.to_string())
+                })?;
+            (
+                author.batch_id,
+                author.author_device_id,
+                author.author_session_id,
+                draft,
+            )
+        }
+    };
     fault(OperationalFaultPoint::AfterDraft)?;
     let captured = match engine
         .capture_local_author_transaction(draft, graph, receipts, endpoint)
@@ -886,9 +1051,9 @@ fn execute_local_inner(
             OperationalCoordinatorError::new(OperationalPhase::Finalize, error.to_string())
         })?;
     let manifest = prepared.manifest();
-    if manifest.batch_id() != author.batch_id
-        || manifest.author_device_id() != author.author_device_id
-        || manifest.author_session_id() != author.author_session_id
+    if manifest.batch_id() != batch_id
+        || manifest.author_device_id() != author_device_id
+        || manifest.author_session_id() != author_session_id
         || manifest.origin() != BatchOrigin::LocalMutation
     {
         return Err(OperationalCoordinatorError::new(
@@ -909,22 +1074,23 @@ fn execute_local_inner(
         archive,
         guard,
         prepared,
-        PublishedMutationIdentity::Local {
-            batch_id: author.batch_id,
-        },
+        batch_id,
+        BatchOrigin::LocalMutation,
     )? {
         PublishedPipelineState::Complete(batch_id) => Ok(LocalMutationCoordinatorState::Active(
             LocalMutationCompletion { batch_id },
         )),
         PublishedPipelineState::FailedClosed(continuation) => {
-            Ok(LocalMutationCoordinatorState::from_failed(continuation))
+            Ok(LocalMutationCoordinatorState::from_failed(
+                LocalPublishedContinuation { core: continuation },
+            ))
         }
     }
 }
 
 enum PublishedPipelineState {
     Complete(BatchId),
-    FailedClosed(FailedClosedOperationalCoordinator),
+    FailedClosed(PublishedContinuationCore),
 }
 
 /// The sole terminal commit pipeline for both local semantic mutations and
@@ -942,35 +1108,28 @@ fn publish_and_drain(
     archive: Arc<ObjectStore>,
     guard: HandoffSafeGuard,
     prepared: PreparedBatch,
-    identity: PublishedMutationIdentity,
+    batch_id: BatchId,
+    origin: BatchOrigin,
 ) -> Result<PublishedPipelineState, OperationalCoordinatorError> {
-    if prepared.manifest().batch_id() != identity.batch_id()
-        || prepared.manifest().origin() != identity.origin()
-    {
+    if prepared.manifest().batch_id() != batch_id || prepared.manifest().origin() != origin {
         return Err(OperationalCoordinatorError::new(
             OperationalPhase::Finalize,
             "prepared batch does not match the sealed terminal-pipeline identity",
         ));
     }
     #[cfg(test)]
-    TERMINAL_PIPELINE_ORIGINS.with(|origins| origins.borrow_mut().push(identity.origin()));
+    TERMINAL_PIPELINE_ORIGINS.with(|origins| origins.borrow_mut().push(origin));
     let retained_bytes = prepared.retained_bytes().map_err(|error| {
         OperationalCoordinatorError::new(OperationalPhase::TailReservation, error.to_string())
     })?;
     let reservation = tail
         .reserve_bound_mutation(database, engine, retained_bytes)
         .map_err(|error| {
-            OperationalCoordinatorError::new(
-                OperationalPhase::TailReservation,
-                error.to_string(),
-            )
+            OperationalCoordinatorError::new(OperationalPhase::TailReservation, error.to_string())
         })?;
     if let Err(failure) = fault(OperationalFaultPoint::AfterReservation) {
         tail.cancel_reservation(reservation).map_err(|error| {
-            OperationalCoordinatorError::new(
-                OperationalPhase::TailReservation,
-                error.to_string(),
-            )
+            OperationalCoordinatorError::new(OperationalPhase::TailReservation, error.to_string())
         })?;
         return Err(failure);
     }
@@ -1010,7 +1169,7 @@ fn publish_and_drain(
     let published_latch = guard.into_published_latch();
 
     if let Err(error) = archive.publish_prepared(&prepared) {
-        let publication = archive.inspect_batch(identity.batch_id());
+        let publication = archive.inspect_batch(batch_id);
         if matches!(publication, Ok(BatchInspection::Absent)) {
             published_latch.cancel_prepublication();
             tail.cancel_reservation(reservation).map_err(|cancel| {
@@ -1025,11 +1184,12 @@ fn publish_and_drain(
             ));
         }
         return Ok(PublishedPipelineState::FailedClosed(
-            FailedClosedOperationalCoordinator {
+            PublishedContinuationCore {
                 guard: published_latch,
                 endpoint,
                 archive,
-                identity,
+                batch_id,
+                origin,
                 manifest_digest,
                 retained_bytes,
                 reservation: Some(reservation),
@@ -1041,11 +1201,12 @@ fn publish_and_drain(
         ));
     }
     let boundary = fault(OperationalFaultPoint::AfterManifest);
-    let mut coordinator = FailedClosedOperationalCoordinator {
+    let mut coordinator = PublishedContinuationCore {
         guard: published_latch,
         endpoint,
         archive,
-        identity,
+        batch_id,
+        origin,
         manifest_digest,
         retained_bytes,
         reservation: Some(reservation),
@@ -1126,9 +1287,10 @@ fn verify_bindings(
         || receipts.endpoint_binding() != Some(endpoint)
         || engine.projection_receipt_store_id() != Some(receipts.store_id())
     {
-        return Err(OperationalCoordinatorError::new(
+        return Err(OperationalCoordinatorError::retained_block(
             OperationalPhase::Bindings,
             "graph, engine endpoint, or receipt namespace binding mismatch",
+            RetainedBlockReason::StableBinding,
         ));
     }
     let (archive, index) = engine.enrolled_projection_runtime().map_err(|error| {
@@ -1138,9 +1300,10 @@ fn verify_bindings(
         || index.graph_resource_id() != endpoint.graph_resource_id()
         || index.receipt_store_id() != receipts.store_id()
     {
-        return Err(OperationalCoordinatorError::new(
+        return Err(OperationalCoordinatorError::retained_block(
             OperationalPhase::Bindings,
             "enrolled archive/projection runtime binding changed",
+            RetainedBlockReason::StableBinding,
         ));
     }
     // The retained continuation authenticates the archive by stable workspace
@@ -1156,9 +1319,10 @@ fn verify_bindings(
         if expected.workspace_id() != archive.workspace_id()
             || identity(expected)? != identity(&archive)?
         {
-            return Err(OperationalCoordinatorError::new(
+            return Err(OperationalCoordinatorError::retained_block(
                 OperationalPhase::Bindings,
                 "enrolled archive resource identity changed",
+                RetainedBlockReason::StableBinding,
             ));
         }
     }
@@ -1167,32 +1331,38 @@ fn verify_bindings(
 
 fn authenticate_published(
     archive: &ObjectStore,
-    identity: PublishedMutationIdentity,
+    batch_id: BatchId,
+    origin: BatchOrigin,
     manifest_digest: ContentDigest,
     retained_bytes: usize,
 ) -> Result<(), OperationalCoordinatorError> {
-    let batch_id = identity.batch_id();
     let validated = match archive.inspect_batch(batch_id).map_err(|error| {
         OperationalCoordinatorError::new(OperationalPhase::Publication, error.to_string())
     })? {
         BatchInspection::Ready(validated) => validated,
         BatchInspection::Absent | BatchInspection::Staged { .. } => {
-            return Err(OperationalCoordinatorError::new(
+            return Err(OperationalCoordinatorError::retained_block(
                 OperationalPhase::Publication,
-                "published reconciliation is not a complete immutable batch",
+                "published mutation is not a complete immutable batch",
+                RetainedBlockReason::PublishedAuthentication,
             ));
         }
     };
     let encoded = validated.manifest().encode().map_err(|error| {
-        OperationalCoordinatorError::new(OperationalPhase::Publication, error.to_string())
+        OperationalCoordinatorError::retained_block(
+            OperationalPhase::Publication,
+            error.to_string(),
+            RetainedBlockReason::PublishedAuthentication,
+        )
     })?;
     if validated.manifest().batch_id() != batch_id
-        || validated.manifest().origin() != identity.origin()
+        || validated.manifest().origin() != origin
         || ContentDigest::of(&encoded) != manifest_digest
     {
-        return Err(OperationalCoordinatorError::new(
+        return Err(OperationalCoordinatorError::retained_block(
             OperationalPhase::Publication,
             "durable manifest differs from the failed-closed publication identity",
+            RetainedBlockReason::PublishedAuthentication,
         ));
     }
     let actual = validated
@@ -1202,24 +1372,27 @@ fn authenticate_published(
             object
                 .encode()
                 .map_err(|error| {
-                    OperationalCoordinatorError::new(
+                    OperationalCoordinatorError::retained_block(
                         OperationalPhase::Publication,
                         error.to_string(),
+                        RetainedBlockReason::PublishedAuthentication,
                     )
                 })
                 .and_then(|bytes| {
                     total.checked_add(bytes.len()).ok_or_else(|| {
-                        OperationalCoordinatorError::new(
+                        OperationalCoordinatorError::retained_block(
                             OperationalPhase::Publication,
                             "durable retained-byte count overflowed",
+                            RetainedBlockReason::PublishedAuthentication,
                         )
                     })
                 })
         })?;
     if actual != retained_bytes {
-        return Err(OperationalCoordinatorError::new(
+        return Err(OperationalCoordinatorError::retained_block(
             OperationalPhase::Publication,
             "durable batch bytes differ from the reserved prepared-byte count",
+            RetainedBlockReason::PublishedAuthentication,
         ));
     }
     Ok(())
@@ -1235,6 +1408,7 @@ pub(crate) enum OperationalFaultPoint {
     AfterReservation,
     AfterManifest,
     AfterStage,
+    BeforeTailAdmission,
     AfterTailAdmission,
     AfterSqliteApply,
     BeforeProjection,
@@ -1295,6 +1469,7 @@ fn fault(point: OperationalFaultPoint) -> Result<(), OperationalCoordinatorError
                 OperationalFaultPoint::AfterReservation => OperationalPhase::TailReservation,
                 OperationalFaultPoint::AfterManifest => OperationalPhase::Publication,
                 OperationalFaultPoint::AfterStage => OperationalPhase::ArchiveStage,
+                OperationalFaultPoint::BeforeTailAdmission => OperationalPhase::TailAdmission,
                 OperationalFaultPoint::AfterTailAdmission => OperationalPhase::TailAdmission,
                 OperationalFaultPoint::AfterSqliteApply => OperationalPhase::SqliteDrain,
                 OperationalFaultPoint::BeforeProjection
@@ -1321,7 +1496,7 @@ pub(crate) mod simulator_harness {
     use uuid::Uuid;
 
     use super::{
-        act_once_at, fail_once_at, FailedClosedOperationalCoordinator, LocalRuntimeAdmission,
+        act_once_at, fail_once_at, ExternalPublishedContinuation, LocalRuntimeAdmission,
         OperationalCoordinator, OperationalCoordinatorState, OperationalFaultPoint,
     };
     use crate::oplog::simulator::{
@@ -1333,8 +1508,8 @@ pub(crate) mod simulator_harness {
     };
     use crate::oplog::{
         write_projection_exact, ApplicationRuntimeRoot, AuthorBatch, BatchDisposition, BatchId,
-        BatchOrigin, BlockId, BlockLocation, ContentDigest, CrdtPeerId, DocumentId,
-        LogicalPageName, ManagedPath, ObjectStore, OperationTransaction, PageId, ProjectionClaim,
+        BlockId, BlockLocation, ContentDigest, CrdtPeerId, DocumentId, LogicalPageName,
+        ManagedPath, ObjectStore, OperationTransaction, PageId, ProjectionClaim,
         ProjectionEndpointBinding, ProjectionEndpointId, ProjectionReceiptStore, RebuildSource,
         SemanticOperation, SessionId, ShardedHotEngine, SqliteFrontier, TailOverlay,
     };
@@ -1355,7 +1530,7 @@ pub(crate) mod simulator_harness {
         runtime_root: Option<ApplicationRuntimeRoot>,
         database: Option<SqliteFrontier>,
         tail: Option<TailOverlay>,
-        failed: Option<FailedClosedOperationalCoordinator>,
+        failed: Option<ExternalPublishedContinuation>,
         crashed_observation: Option<CoordinatorObservation>,
         enrollment_pending_unprotected: bool,
         checkpoints: BTreeMap<String, CoordinatorObservation>,
@@ -1448,20 +1623,16 @@ pub(crate) mod simulator_harness {
                 &graph,
                 &receipts,
             );
-            let draft = engine
-                .draft_author_transaction(
+            let prepared = engine
+                .prepare_bootstrap_transaction(
                     AuthorBatch {
                         batch_id: BatchId::from_uuid(Uuid::from_u128(9)),
                         author_device_id: endpoint.device_id(),
                         author_session_id: SessionId::from_uuid(Uuid::from_u128(11)),
                         crdt_peer_id: CrdtPeerId::from_u64(12),
                     },
-                    BatchOrigin::LocalMutation,
                     &transaction,
                 )
-                .map_err(display)?;
-            let prepared = engine
-                .finalize_author_transaction(draft, &graph, &receipts, endpoint)
                 .map_err(display)?;
             ObjectStore::open(&archive_root, workspace.workspace_id)
                 .map_err(display)?
@@ -2611,10 +2782,10 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::model::{
-        projection_graph_test_counters, reset_projection_graph_test_counters,
+    use crate::model::{projection_graph_test_counters, reset_projection_graph_test_counters};
+    use crate::oplog::object_store::{
+        fail_next_engine_history_head_swap, fail_next_publish_after_objects,
     };
-    use crate::oplog::object_store::fail_next_publish_after_objects;
     use crate::oplog::{
         write_projection_exact, AnnotatedProjectionBase, ApplicationRuntimeRoot, BlockId,
         BlockLocation, DeviceId, DocumentId, LineageDigest, LogicalPageName, ManagedPath,
@@ -2845,7 +3016,7 @@ mod tests {
             author: AuthorBatch,
             transaction: &OperationTransaction,
         ) -> LocalMutationCoordinatorState {
-            OperationalCoordinator::execute_local(
+            OperationalCoordinator::execute_local_with_author(
                 &LocalRuntimeAdmission::unenrolled_pre_activation(),
                 &self.graph,
                 &self.receipts,
@@ -2857,11 +3028,7 @@ mod tests {
             )
         }
 
-        fn local_edit(
-            &mut self,
-            seed: u128,
-            content: &str,
-        ) -> LocalMutationCoordinatorState {
+        fn local_edit(&mut self, seed: u128, content: &str) -> LocalMutationCoordinatorState {
             let transaction =
                 OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
                     block: BlockLocation {
@@ -2906,7 +3073,7 @@ mod tests {
         }
     }
 
-    fn expect_failed(state: OperationalCoordinatorState) -> FailedClosedOperationalCoordinator {
+    fn expect_failed(state: OperationalCoordinatorState) -> ExternalPublishedContinuation {
         match state {
             OperationalCoordinatorState::FailedClosed(failed) => failed,
             OperationalCoordinatorState::Blocked(plan) => {
@@ -2929,8 +3096,8 @@ mod tests {
                     panic!("unexpected local continuation: {}", continuation.failure())
                 }
             },
-            LocalMutationCoordinatorState::Blocked(error) => {
-                panic!("unexpected blocked local mutation: {error}")
+            LocalMutationCoordinatorState::Blocked(blocked) => {
+                panic!("unexpected blocked local mutation: {}", blocked.failure())
             }
             LocalMutationCoordinatorState::Revoked(revoked) => {
                 panic!("unexpected revoked local mutation: {}", revoked.failure())
@@ -2940,7 +3107,7 @@ mod tests {
 
     fn expect_local_published_recovery(
         state: LocalMutationCoordinatorState,
-    ) -> FailedClosedOperationalCoordinator {
+    ) -> LocalPublishedContinuation {
         match state {
             LocalMutationCoordinatorState::Recovering(LocalMutationRecovery::Published(
                 continuation,
@@ -2954,8 +3121,8 @@ mod tests {
             LocalMutationCoordinatorState::Active(_) => {
                 panic!("unexpected completed local mutation")
             }
-            LocalMutationCoordinatorState::Blocked(error) => {
-                panic!("unexpected blocked local mutation: {error}")
+            LocalMutationCoordinatorState::Blocked(blocked) => {
+                panic!("unexpected blocked local mutation: {}", blocked.failure())
             }
             LocalMutationCoordinatorState::Revoked(revoked) => {
                 panic!("unexpected revoked local mutation: {}", revoked.failure())
@@ -2983,6 +3150,8 @@ mod tests {
         let path = fixture.path.clone();
         let manifests_before = fixture.archive.committed_manifests().unwrap().len();
         let accepted_before = fixture.engine.accepted_batch_count().unwrap();
+        let sqlite_before = fixture.database.applied_batch_count().unwrap();
+        let releases_before = fixture.graph.handoff_release_count();
         reset_projection_graph_test_counters();
 
         let completion = expect_local_active(fixture.local_edit(40_000, "local semantic edit"));
@@ -2995,7 +3164,20 @@ mod tests {
             fixture.engine.accepted_batch_count().unwrap(),
             accepted_before + 1
         );
-        let batch = match fixture.archive.inspect_batch(completion.batch_id()).unwrap() {
+        assert_eq!(
+            fixture.database.applied_batch_count().unwrap(),
+            sqlite_before + 1,
+            "the local accepted event must be applied to SQLite exactly once"
+        );
+        assert!(fixture
+            .database
+            .contains_batch(completion.batch_id())
+            .unwrap());
+        let batch = match fixture
+            .archive
+            .inspect_batch(completion.batch_id())
+            .unwrap()
+        {
             BatchInspection::Ready(batch) => batch,
             other => panic!("local mutation did not reach authenticated history: {other:?}"),
         };
@@ -3005,6 +3187,11 @@ mod tests {
             fixture.engine.accepted_frontier_root().unwrap()
         );
         assert_eq!(projection_graph_test_counters().write_calls, 1);
+        assert_eq!(
+            fixture.graph.handoff_release_count(),
+            releases_before + 1,
+            "successful completion releases the handoff exactly once"
+        );
         assert_eq!(
             fs::read(fixture.graph_root.join(path)).unwrap(),
             b"- local semantic edit\n\t- child\n"
@@ -3029,12 +3216,18 @@ mod tests {
         else {
             panic!("exact local path drift must request reconciliation");
         };
-        assert_eq!(reconciliation.paths(), &[ManagedPath::parse(&path).unwrap()]);
+        assert_eq!(
+            reconciliation.paths(),
+            &[ManagedPath::parse(&path).unwrap()]
+        );
         assert_eq!(
             snapshot_immutable_publication(&fixture.archive_root),
             immutable_before
         );
-        assert_eq!(fixture.engine.accepted_frontier_root().unwrap(), frontier_before);
+        assert_eq!(
+            fixture.engine.accepted_frontier_root().unwrap(),
+            frontier_before
+        );
         assert_eq!(fixture.database.frontier_root().unwrap(), sqlite_before);
         assert_eq!(projection_graph_test_counters().write_calls, 0);
         assert_eq!(
@@ -3066,18 +3259,17 @@ mod tests {
         let immutable_before = snapshot_immutable_publication(&fixture.archive_root);
         let frontier_before = fixture.engine.accepted_frontier_root().unwrap();
         let sqlite_before = fixture.database.frontier_root().unwrap();
-        let transaction =
-            OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
-                block: BlockLocation {
-                    block_id: fixture.block_id,
-                    home_document_id: fixture.home_document_id,
-                },
-                content: "blocked stale binding".into(),
-            }])
-            .unwrap();
+        let transaction = OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
+            block: BlockLocation {
+                block_id: fixture.block_id,
+                home_document_id: fixture.home_document_id,
+            },
+            content: "blocked stale binding".into(),
+        }])
+        .unwrap();
         let author = fixture.local_author(40_200);
 
-        let state = OperationalCoordinator::execute_local(
+        let state = OperationalCoordinator::execute_local_with_author(
             &LocalRuntimeAdmission::unenrolled_pre_activation(),
             &fixture.graph,
             &foreign_receipts,
@@ -3087,15 +3279,18 @@ mod tests {
             author,
             &transaction,
         );
-        let LocalMutationCoordinatorState::Blocked(error) = state else {
+        let LocalMutationCoordinatorState::Blocked(blocked) = state else {
             panic!("a stale local runtime binding must return Blocked");
         };
-        assert_eq!(error.phase(), OperationalPhase::Bindings);
+        assert_eq!(blocked.failure().phase(), OperationalPhase::Bindings);
         assert_eq!(
             snapshot_immutable_publication(&fixture.archive_root),
             immutable_before
         );
-        assert_eq!(fixture.engine.accepted_frontier_root().unwrap(), frontier_before);
+        assert_eq!(
+            fixture.engine.accepted_frontier_root().unwrap(),
+            frontier_before
+        );
         assert_eq!(fixture.database.frontier_root().unwrap(), sqlite_before);
         fixture.graph.probe_managed_text_writer().unwrap();
     }
@@ -3148,7 +3343,7 @@ mod tests {
             );
             assert!(fixture.graph.probe_managed_text_writer().is_err());
 
-            let completion = expect_local_active(failed.retry_local(
+            let completion = expect_local_active(failed.retry(
                 &LocalRuntimeAdmission::unenrolled_pre_activation(),
                 &fixture.graph,
                 &fixture.receipts,
@@ -3198,12 +3393,282 @@ mod tests {
                 ),
                 kind,
             );
-            expect_local_active(
-                fixture.local_edit(43_000 + index as u128 * 10, "utf local edit"),
-            );
+            expect_local_active(fixture.local_edit(43_000 + index as u128 * 10, "utf local edit"));
             assert_eq!(fs::read(fixture.graph_root.join(path)).unwrap(), expected);
             fixture.assert_drained();
         }
+    }
+
+    #[test]
+    fn production_local_api_owns_author_identity_and_raw_entry_is_test_only() {
+        let source = include_str!("operational_coordinator.rs");
+        let production = source
+            .split_once("\n#[cfg(test)]\nmod tests")
+            .expect("the coordinator test module must remain separated")
+            .0;
+        let signature = production
+            .split_once("pub(crate) fn execute_local(")
+            .expect("the production local entry must exist")
+            .1
+            .split_once(") -> LocalMutationCoordinatorState")
+            .expect("the production local signature must close")
+            .0;
+        assert!(signature.contains("session: &mut PromotedRuntimeSession<'_>"));
+        assert!(signature.contains("transaction: &OperationTransaction"));
+        for forbidden in [
+            "AuthorBatch",
+            "BatchId",
+            "DeviceId",
+            "SessionId",
+            "CrdtPeerId",
+            "LocalRuntimeAdmission",
+            "ShardedHotEngine",
+            "SqliteFrontier",
+            "TailOverlay",
+        ] {
+            assert!(
+                !signature.contains(forbidden),
+                "production local callers can still supply authoritative `{forbidden}`"
+            );
+        }
+        assert!(
+            production.contains(
+                "#[cfg(test)]\n    #[allow(clippy::too_many_arguments)]\n    fn \
+                 execute_local_with_author("
+            ),
+            "the raw-author coordinator entry must stay test-only"
+        );
+
+        let engine = include_str!("hot_engine.rs");
+        let raw_engine = engine
+            .split_once("pub fn draft_author_transaction(")
+            .expect("the legacy raw fixture helper remains named")
+            .1
+            .split_once("self.draft_author_transaction_with_observation")
+            .expect("the raw helper must still delegate to the shared draft core")
+            .0;
+        assert!(raw_engine.contains("#[cfg(not(test))]"));
+        assert!(raw_engine.contains("self.promoted_lineage().is_some()"));
+        assert!(raw_engine.contains("origin == BatchOrigin::LocalMutation"));
+        assert!(
+            raw_engine.contains("raw local author identity is unavailable"),
+            "a production promoted engine must refuse the raw-author fixture helper"
+        );
+    }
+
+    #[test]
+    fn origin_specific_continuations_are_affine_nonserialized_and_panic_free() {
+        let source = include_str!("operational_coordinator.rs");
+        let production = source
+            .split_once("\n#[cfg(test)]\nmod tests")
+            .expect("the coordinator test module must remain separated")
+            .0;
+        assert!(production.contains("pub(crate) struct ExternalPublishedContinuation"));
+        assert!(production.contains("pub(crate) struct LocalPublishedContinuation"));
+        assert!(!production.contains("panic!("));
+
+        for name in [
+            "ExternalPublishedContinuation",
+            "LocalPublishedContinuation",
+        ] {
+            let declaration = format!("pub(crate) struct {name}");
+            let offset = production.find(&declaration).unwrap();
+            let prefix = &production[offset.saturating_sub(120)..offset];
+            assert!(
+                !prefix.contains("#[derive("),
+                "{name} must remain non-cloneable and non-serializable"
+            );
+        }
+        let external = production
+            .split_once("impl ExternalPublishedContinuation {")
+            .unwrap()
+            .1
+            .split_once("/// Affine admitted-local continuation")
+            .unwrap()
+            .0;
+        assert!(external.contains("pub(crate) const fn import_id"));
+        assert!(external.contains("pub(crate) fn retry"));
+        assert!(!external.contains("LocalMutationCoordinatorState"));
+
+        let local = production
+            .split_once("impl LocalPublishedContinuation {")
+            .unwrap()
+            .1
+            .split_once("pub(crate) struct OperationalCoordinator")
+            .unwrap()
+            .0;
+        assert!(local.contains("pub(crate) fn retry"));
+        assert!(!local.contains("import_id"));
+        assert!(!local.contains("OperationalCoordinatorState"));
+    }
+
+    #[test]
+    fn local_continuation_drop_stays_closed_and_completion_releases_once() {
+        let mut dropped = Fixture::new("drop-local-published");
+        let releases = dropped.graph.handoff_release_count();
+        fail_once_at(OperationalFaultPoint::AfterManifest);
+        let continuation =
+            expect_local_published_recovery(dropped.local_edit(43_500, "drop local continuation"));
+        drop(continuation);
+        assert_eq!(dropped.graph.handoff_release_count(), releases);
+        assert!(dropped.graph.probe_managed_text_writer().is_err());
+
+        let mut completed = Fixture::new("complete-local-once");
+        let releases = completed.graph.handoff_release_count();
+        expect_local_active(completed.local_edit(43_510, "complete local once"));
+        assert_eq!(completed.graph.handoff_release_count(), releases + 1);
+        completed.graph.probe_managed_text_writer().unwrap();
+        completed.graph.probe_managed_text_writer().unwrap();
+        assert_eq!(completed.graph.handoff_release_count(), releases + 1);
+    }
+
+    #[test]
+    fn retained_terminal_dispositions_are_blocked_while_progress_is_recovering() {
+        let cases = [
+            (
+                "rejected",
+                BatchDisposition::Rejected {
+                    error: super::super::EngineError::AuthorDraftStale,
+                },
+                Some(RetainedBlockReason::Rejected(
+                    super::super::EngineError::AuthorDraftStale,
+                )),
+            ),
+            (
+                "quarantined",
+                BatchDisposition::Quarantined,
+                Some(RetainedBlockReason::Quarantined),
+            ),
+            (
+                "bounded",
+                BatchDisposition::IncompleteStaged {
+                    missing_objects: 0,
+                    missing_dependencies: Vec::new(),
+                },
+                None,
+            ),
+        ];
+        for (index, (label, disposition, expected_block)) in cases.into_iter().enumerate() {
+            let mut fixture = Fixture::new(&format!("retained-{label}"));
+            fail_once_at(OperationalFaultPoint::AfterManifest);
+            let mut continuation = expect_local_published_recovery(
+                fixture.local_edit(43_600 + index as u128 * 10, "retained classification"),
+            );
+            let manifests = fixture.archive.committed_manifests().unwrap().len();
+            continuation.core.failure =
+                require_accepted_stage_disposition(continuation.batch_id(), &disposition)
+                    .expect_err("the synthetic final/progress disposition must retain work");
+            let state = LocalMutationCoordinatorState::from_failed(continuation);
+            match expected_block {
+                Some(reason) => {
+                    let LocalMutationCoordinatorState::Blocked(blocked) = state else {
+                        panic!("{label} must be a retained typed Blocked outcome");
+                    };
+                    assert_eq!(
+                        blocked.reason(),
+                        &LocalMutationBlockReason::Retained(reason)
+                    );
+                    assert!(blocked.continuation().is_some());
+                }
+                None => {
+                    let LocalMutationCoordinatorState::Recovering(
+                        LocalMutationRecovery::Published(continuation),
+                    ) = state
+                    else {
+                        panic!("bounded staging work must remain Recovering");
+                    };
+                    assert_eq!(continuation.phase(), OperationalPhase::ArchiveStage);
+                }
+            }
+            assert_eq!(
+                fixture.archive.committed_manifests().unwrap().len(),
+                manifests,
+                "classification must not redraft or republish"
+            );
+        }
+
+        let mut fixture = Fixture::new("retained-authentication");
+        fail_once_at(OperationalFaultPoint::AfterManifest);
+        let mut continuation =
+            expect_local_published_recovery(fixture.local_edit(43_700, "stable auth"));
+        continuation.core.failure = OperationalCoordinatorError::retained_block(
+            OperationalPhase::Publication,
+            "stable immutable authentication mismatch",
+            RetainedBlockReason::PublishedAuthentication,
+        );
+        let LocalMutationCoordinatorState::Blocked(blocked) =
+            LocalMutationCoordinatorState::from_failed(continuation)
+        else {
+            panic!("stable authentication failure must be retained Blocked");
+        };
+        assert_eq!(
+            blocked.reason(),
+            &LocalMutationBlockReason::Retained(RetainedBlockReason::PublishedAuthentication)
+        );
+        assert!(blocked.continuation().is_some());
+    }
+
+    #[test]
+    fn rejected_published_local_batch_retains_typed_blocked_evidence() {
+        let mut fixture = Fixture::new("published-rejected-blocked");
+        let accepted_before = fixture.engine.accepted_frontier_root().unwrap();
+        let sqlite_before = fixture.database.frontier_root().unwrap();
+        let manifests_before = fixture.archive.committed_manifests().unwrap().len();
+        act_once_at(OperationalFaultPoint::AfterManifest, || {
+            fail_next_engine_history_head_swap();
+        });
+        let LocalMutationCoordinatorState::Blocked(blocked) =
+            fixture.local_edit(43_800, "history head rejection")
+        else {
+            panic!("durable history rejection must return retained Blocked");
+        };
+        assert!(matches!(
+            blocked.reason(),
+            LocalMutationBlockReason::Retained(RetainedBlockReason::Rejected(_))
+        ));
+        let continuation = blocked
+            .continuation()
+            .expect("the rejected immutable batch retains its continuation/evidence");
+        assert_eq!(continuation.phase(), OperationalPhase::ArchiveStage);
+        assert_eq!(
+            fixture.archive.committed_manifests().unwrap().len(),
+            manifests_before + 1
+        );
+        assert_eq!(
+            fixture.engine.accepted_frontier_root().unwrap(),
+            accepted_before
+        );
+        assert_eq!(fixture.database.frontier_root().unwrap(), sqlite_before);
+        assert!(fixture.graph.probe_managed_text_writer().is_err());
+    }
+
+    #[test]
+    fn stable_postpublication_binding_failure_retains_typed_blocked_continuation() {
+        let mut fixture = Fixture::new("local-stable-postpublication-binding");
+        fail_once_at(OperationalFaultPoint::AfterManifest);
+        let continuation =
+            expect_local_published_recovery(fixture.local_edit(43_900, "stable binding"));
+        let foreign_root = TestRoot::new("local-stable-postpublication-binding-foreign");
+        let foreign_graph_root = foreign_root.path().join("graph");
+        fs::create_dir_all(&foreign_graph_root).unwrap();
+        let foreign_graph = Graph::open(&foreign_graph_root);
+
+        let LocalMutationCoordinatorState::Blocked(blocked) = continuation.retry(
+            &LocalRuntimeAdmission::unenrolled_pre_activation(),
+            &foreign_graph,
+            &fixture.receipts,
+            &mut fixture.engine,
+            &mut fixture.database,
+            &mut fixture.tail,
+        ) else {
+            panic!("stable rebound graph authentication must return retained Blocked");
+        };
+        assert_eq!(
+            blocked.reason(),
+            &LocalMutationBlockReason::Retained(RetainedBlockReason::StableBinding)
+        );
+        assert!(blocked.continuation().is_some());
+        assert!(fixture.graph.probe_managed_text_writer().is_err());
     }
 
     #[test]
@@ -3415,7 +3880,10 @@ mod tests {
             assert_eq!(failed.batch_id(), failed.import_id().batch_id());
             assert!(fixture.graph.probe_managed_text_writer().is_err());
             if point == OperationalFaultPoint::AfterManifest {
-                assert_eq!(fixture.tail.status().retained_bytes, failed.retained_bytes);
+                assert_eq!(
+                    fixture.tail.status().retained_bytes,
+                    failed.retained_bytes()
+                );
             }
             if matches!(
                 point,

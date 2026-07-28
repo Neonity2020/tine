@@ -13,8 +13,8 @@ use crate::oplog::enrollment::{
     EnrollmentReader, PreparationId,
 };
 use crate::oplog::hot_engine::{
-    AcceptedFrontierRoot, ProjectionEndpointBinding, ProjectionStorageBinding,
-    MAX_EPHEMERAL_BLOCK_CLAIMS,
+    take_last_admitted_local_author, AcceptedFrontierRoot, ProjectionEndpointBinding,
+    ProjectionStorageBinding, MAX_EPHEMERAL_BLOCK_CLAIMS,
 };
 use crate::oplog::identity::ARCHIVE_INSTANCE_CLAIM_FILE;
 use crate::oplog::import::{
@@ -31,8 +31,9 @@ use crate::oplog::object_store::{
     RetainedRunMaintenanceOutcome,
 };
 use crate::oplog::operational_coordinator::{
-    act_once_at, OperationalCoordinator, OperationalCoordinatorError, OperationalCoordinatorState,
-    OperationalFaultPoint, OperationalPhase,
+    act_once_at, LocalMutationCoordinatorState, LocalMutationRecovery, OperationalCoordinator,
+    OperationalCoordinatorError, OperationalCoordinatorState, OperationalFaultPoint,
+    OperationalPhase,
 };
 use crate::oplog::projection::write_projection_exact;
 use crate::oplog::reconciliation_baseline::{
@@ -2132,6 +2133,103 @@ fn append_local_batch_at(
     // window opens. This is the ordinary bounded tail drain.
     let drained = session.drain_projection(16).unwrap();
     assert_eq!(drained, 1, "exactly the new accepted batch drains");
+}
+
+#[test]
+fn promoted_local_coordinator_mints_exact_session_device_batch_and_peer_identity() {
+    let mut fixture = Fixture::new(
+        "promoted-local-author-identity",
+        None,
+        vec![("pages/seed.md".into(), b"- seed\n".to_vec())],
+    );
+    let root = fixture.enrollment_root("promoted-local-author-identity");
+    let paths = PromotedPaths::new(&fixture, "promoted-local-author-identity");
+    let runtime_session = SessionId::new();
+    let (mut authority, mut runtime) = promote(&mut fixture, &root, runtime_session, &paths);
+    let endpoint_device = authority.endpoint().device_id();
+    let mut observed = Vec::new();
+
+    for index in 0..2u128 {
+        let seed = 0xA110_0000 + index * 10;
+        let transaction = OperationTransaction::new(vec![
+            SemanticOperation::CreatePage {
+                page_id: PageId::from_uuid(Uuid::from_u128(seed)),
+                home_document_id: DocumentId::from_uuid(Uuid::from_u128(seed + 1)),
+                name: LogicalPageName::parse(&format!("Admitted Local {index}")).unwrap(),
+                path: ManagedPath::parse(&format!("pages/admitted-local-{index}.md")).unwrap(),
+                kind: ManagedTextKind::Page,
+            },
+            SemanticOperation::CreateBlock {
+                block: BlockLocation {
+                    block_id: BlockId::from_uuid(Uuid::from_u128(seed + 2)),
+                    home_document_id: DocumentId::from_uuid(Uuid::from_u128(seed + 1)),
+                },
+                page_id: PageId::from_uuid(Uuid::from_u128(seed)),
+                parent: None,
+                order: "a".into(),
+                content: format!("admitted local {index}"),
+            },
+        ])
+        .unwrap();
+        let mut window = runtime
+            .admit_promoted_mutation(&mut authority, &fixture.graph)
+            .unwrap();
+        let mut state = OperationalCoordinator::execute_local(
+            &mut window,
+            &fixture.graph,
+            &fixture.receipts,
+            &transaction,
+        );
+        let completion = loop {
+            match state {
+                LocalMutationCoordinatorState::Active(completion) => break completion,
+                LocalMutationCoordinatorState::Recovering(LocalMutationRecovery::Published(
+                    continuation,
+                )) => {
+                    let (admission, engine, database, tail) = window.parts().unwrap();
+                    state = continuation.retry(
+                        &admission,
+                        &fixture.graph,
+                        &fixture.receipts,
+                        engine,
+                        database,
+                        tail,
+                    );
+                }
+                LocalMutationCoordinatorState::Recovering(
+                    LocalMutationRecovery::ReconciliationRequired(reconciliation),
+                ) => panic!(
+                    "positive promoted local authoring requested reconciliation: {:?}",
+                    reconciliation.paths()
+                ),
+                LocalMutationCoordinatorState::Blocked(blocked) => {
+                    panic!("promoted local authoring blocked: {}", blocked.failure())
+                }
+                LocalMutationCoordinatorState::Revoked(revoked) => {
+                    panic!("promoted local authoring revoked: {}", revoked.failure())
+                }
+            }
+        };
+        let author =
+            take_last_admitted_local_author().expect("the admitted draft records its test witness");
+        assert_eq!(author.batch_id, completion.batch_id());
+        assert_eq!(author.author_device_id, endpoint_device);
+        assert_eq!(author.author_session_id, runtime_session);
+        assert_ne!(author.crdt_peer_id.as_u64(), 0);
+        drop(window);
+
+        let archive = ObjectStore::open(&fixture.archive_root, fixture.workspace).unwrap();
+        let batch = match archive.inspect_batch(completion.batch_id()).unwrap() {
+            crate::oplog::BatchInspection::Ready(batch) => batch,
+            other => panic!("admitted local batch is not immutable Ready: {other:?}"),
+        };
+        assert_eq!(batch.manifest().author_device_id(), endpoint_device);
+        assert_eq!(batch.manifest().author_session_id(), runtime_session);
+        assert_eq!(batch.manifest().origin(), BatchOrigin::LocalMutation);
+        observed.push(author);
+    }
+    assert_ne!(observed[0].batch_id, observed[1].batch_id);
+    assert_ne!(observed[0].crdt_peer_id, observed[1].crdt_peer_id);
 }
 
 /// The durable promotion state file inside one archive root.
@@ -5374,7 +5472,7 @@ impl PromotedCoordinatorWorld {
     ///
     /// The coordinator's per-pass operation budget is deliberately small, so an
     /// honest journey over a real graph continues through
-    /// `FailedClosedOperationalCoordinator::retry`. Those bounded-slice
+    /// `ExternalPublishedContinuation::retry`. Those bounded-slice
     /// continuations are resumed here; a refusal that names the lost workspace
     /// authority is terminal and is returned to the caller.
     fn reconcile(&mut self) -> Result<OperationalCoordinatorState, OperationalCoordinatorError> {
@@ -5473,13 +5571,67 @@ fn moving_the_lease_between_coordinator_phases_refuses_the_next_phase() {
         "a refused publication boundary must publish nothing"
     );
 
+    // Phase: accepted-history archive staging. The immutable manifest is
+    // already published, but no scratch root, accepted frontier, history head,
+    // accepted tail event, SQLite row, or graph byte may move after the lease
+    // is replaced. The already-published continuation retains its pre-stage
+    // capacity reservation.
+    let mut world = PromotedCoordinatorWorld::new("coordinator-archive-stage");
+    let lease_path = world.lease_path();
+    let accepted_before = world.runtime.engine().accepted_frontier_root().unwrap();
+    let history_before = world.runtime.engine().durable_history_authority().unwrap();
+    let snapshot_before = world.runtime.engine().canonical_snapshot().unwrap();
+    let sqlite_before = world.runtime.database().frontier_root().unwrap();
+    let graph_before = snapshot_files(&world.fixture.graph_root);
+    act_once_at(OperationalFaultPoint::AfterManifest, move || {
+        replace_workspace_lease_file(&lease_path);
+    });
+    let outcome = world.reconcile().unwrap();
+    let OperationalCoordinatorState::FailedClosed(failed) = outcome else {
+        panic!("ArchiveStage authority loss must retain the external continuation");
+    };
+    assert_eq!(failed.phase(), OperationalPhase::ArchiveStage);
+    let revocation = failed
+        .failure()
+        .revocation()
+        .expect("lease replacement must be terminal");
+    assert_eq!(
+        revocation.boundary(),
+        WorkspaceAuthorityBoundary::ArchiveStage
+    );
+    assert_eq!(
+        world.runtime.engine().accepted_frontier_root().unwrap(),
+        accepted_before
+    );
+    assert_eq!(
+        world.runtime.engine().durable_history_authority().unwrap(),
+        history_before
+    );
+    assert_eq!(
+        world.runtime.engine().canonical_snapshot().unwrap(),
+        snapshot_before
+    );
+    assert!(
+        !world
+            .runtime
+            .database()
+            .contains_batch(failed.batch_id())
+            .unwrap(),
+        "the retained capacity reservation is not an admitted/applied event"
+    );
+    assert_eq!(
+        world.runtime.database().frontier_root().unwrap(),
+        sqlite_before
+    );
+    assert_eq!(snapshot_files(&world.fixture.graph_root), graph_before);
+
     // Phase: tail admission. The lease moves at the post-stage boundary, so
     // publication and archive staging have happened and the next durable step
     // is the device-local tail admission.
     let mut world = PromotedCoordinatorWorld::new("coordinator-tail-admission");
     let lease_path = world.lease_path();
     let sqlite_before = promoted_projection_digests(&world.paths.database_path);
-    act_once_at(OperationalFaultPoint::AfterStage, move || {
+    act_once_at(OperationalFaultPoint::BeforeTailAdmission, move || {
         replace_workspace_lease_file(&lease_path);
     });
     let failed = expect_coordinator_failure(world.reconcile());
@@ -5547,6 +5699,62 @@ fn moving_the_lease_between_coordinator_phases_refuses_the_next_phase() {
         sqlite_before
     );
     assert_eq!(snapshot_files(&world.fixture.graph_root), graph_before);
+}
+
+#[test]
+fn inconclusive_archive_stage_reproof_is_retryable_without_revocation() {
+    let mut world = PromotedCoordinatorWorld::new("coordinator-archive-stage-transient");
+    let accepted_before = world.runtime.engine().accepted_frontier_root().unwrap();
+    let history_before = world.runtime.engine().durable_history_authority().unwrap();
+    let sqlite_before = world.runtime.database().frontier_root().unwrap();
+    act_once_at(OperationalFaultPoint::AfterManifest, || {
+        fail_next_workspace_lease_identity_check();
+    });
+    let outcome = world.reconcile().unwrap();
+    let OperationalCoordinatorState::FailedClosed(mut failed) = outcome else {
+        panic!("an inconclusive ArchiveStage proof must retain retryable continuation");
+    };
+    assert_eq!(failed.phase(), OperationalPhase::ArchiveStage);
+    assert_eq!(failed.failure().revocation(), None);
+    assert_eq!(world.runtime.workspace_authority_revocation(), None);
+    assert_eq!(
+        world.runtime.engine().accepted_frontier_root().unwrap(),
+        accepted_before
+    );
+    assert_eq!(
+        world.runtime.engine().durable_history_authority().unwrap(),
+        history_before
+    );
+    assert_eq!(
+        world.runtime.database().frontier_root().unwrap(),
+        sqlite_before
+    );
+
+    let mut window = world
+        .runtime
+        .admit_promoted_mutation(&mut world.authority, &world.fixture.graph)
+        .unwrap();
+    let (admission, engine, database, tail) = window.parts().unwrap();
+    let completion = loop {
+        match failed.retry(
+            &admission,
+            &world.fixture.graph,
+            &world.fixture.receipts,
+            engine,
+            database,
+            tail,
+        ) {
+            OperationalCoordinatorState::Complete(completion) => break completion,
+            OperationalCoordinatorState::FailedClosed(next) => failed = next,
+            other => panic!(
+                "retryable ArchiveStage proof changed outcome class: {}",
+                describe_coordinator_outcome(&Ok(other))
+            ),
+        }
+    };
+    assert_eq!(completion.batch_id(), completion.import_id().batch_id());
+    drop(window);
+    assert_eq!(world.runtime.workspace_authority_revocation(), None);
 }
 
 fn describe_coordinator_outcome(

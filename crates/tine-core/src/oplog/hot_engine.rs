@@ -79,6 +79,7 @@ const SHARD_PAGE_PREAMBLE: &str = "page_preamble";
 const SHARD_PAGE_PREAMBLE_VALUE: &str = "value";
 const TOMBSTONE: &str = "tombstone";
 pub(crate) const MAX_TRANSACTION_OPERATIONS: usize = 100_000;
+const LOCAL_AUTHOR_PEER_PROBE_BUDGET: u64 = 8;
 const MAX_PREAUTHORING_CAPTURE_PATHS: usize = MAX_TRANSACTION_OPERATIONS * 2;
 const MAX_PREAUTHORING_CAPTURE_PATH_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_PREAUTHORING_CAPTURE_BYTES: u64 = 512 * 1024 * 1024;
@@ -1375,6 +1376,24 @@ pub struct AuthorBatch {
     pub author_device_id: DeviceId,
     pub author_session_id: SessionId,
     pub crdt_peer_id: CrdtPeerId,
+}
+
+#[cfg(test)]
+thread_local! {
+    static LAST_ADMITTED_LOCAL_AUTHOR: Cell<Option<AuthorBatch>> = const { Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn take_last_admitted_local_author() -> Option<AuthorBatch> {
+    LAST_ADMITTED_LOCAL_AUTHOR.with(Cell::take)
+}
+
+/// Exact author-generation observation carried only by a promoted local-author
+/// authority. Its fields stay private to the engine so no caller can assert a
+/// current generation/root pair.
+pub(crate) struct LocalAuthorGeneration {
+    generation: u64,
+    root: ContentDigest,
 }
 
 /// Canonical accepted-engine material emitted beside one detached bootstrap
@@ -8891,12 +8910,78 @@ impl ShardedHotEngine {
         Ok((no_op, evidence))
     }
 
+    /// Draft one local mutation using identity minted by the live promoted
+    /// runtime/session authority.
+    ///
+    /// Batch, device, session, and CRDT-peer identity are all internal to this
+    /// boundary. A production caller can supply only semantic operations.
+    pub(crate) fn draft_admitted_local_author_transaction(
+        &self,
+        authority: &super::local_active::AdmittedLocalAuthorAuthority<'_>,
+        transaction: &OperationTransaction,
+    ) -> Result<(BatchId, AuthorTransactionDraft), EngineError> {
+        if authority.workspace_id() != self.workspace_id
+            || authority.generation().generation != self.history_generation
+            || authority.generation().root != self.author_generation_root()?
+        {
+            return Err(EngineError::AuthorDraftStale);
+        }
+        let batch_id = BatchId::new();
+        for attempt in 0..LOCAL_AUTHOR_PEER_PROBE_BUDGET {
+            let crdt_peer_id = CrdtPeerId::local_mutation_candidate(
+                self.workspace_id,
+                authority.device_id(),
+                authority.session_id(),
+                batch_id,
+                attempt,
+            );
+            if crdt_peer_id.as_u64() == 0 {
+                continue;
+            }
+            let author = AuthorBatch {
+                batch_id,
+                author_device_id: authority.device_id(),
+                author_session_id: authority.session_id(),
+                crdt_peer_id,
+            };
+            match self.draft_author_transaction_with_observation(
+                author,
+                BatchOrigin::LocalMutation,
+                transaction,
+                None,
+            ) {
+                Ok(draft) => {
+                    #[cfg(test)]
+                    LAST_ADMITTED_LOCAL_AUTHOR.with(|observed| observed.set(Some(author)));
+                    return Ok((batch_id, draft));
+                }
+                Err(EngineError::CrdtPeerCollision(collision)) if collision == crdt_peer_id => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Err(EngineError::InvalidTransaction(format!(
+            "no collision-free nonzero CRDT peer in the bounded \
+             {LOCAL_AUTHOR_PEER_PROBE_BUDGET}-candidate promoted-local probe"
+        )))
+    }
+
+    /// Raw-author compatibility helper for engine/projection fixtures.
+    ///
+    /// A production build refuses it on every promoted runtime. Admitted local
+    /// authoring must use [`Self::draft_admitted_local_author_transaction`],
+    /// whose identity is minted from the nonconstructible runtime authority.
     pub fn draft_author_transaction(
         &self,
         author: AuthorBatch,
         origin: BatchOrigin,
         transaction: &OperationTransaction,
     ) -> Result<AuthorTransactionDraft, EngineError> {
+        #[cfg(not(test))]
+        if self.promoted_lineage().is_some() && origin == BatchOrigin::LocalMutation {
+            return Err(EngineError::InvalidTransaction(
+                "raw local author identity is unavailable on a promoted production runtime".into(),
+            ));
+        }
         self.draft_author_transaction_with_observation(author, origin, transaction, None)
     }
 
@@ -10119,6 +10204,15 @@ impl ShardedHotEngine {
                 });
         }
         Ok(ContentDigest::of(&bytes))
+    }
+
+    /// Mint the opaque generation/root observation that a promoted admission
+    /// binds into its nonconstructible local-author authority.
+    pub(crate) fn local_author_generation(&self) -> Result<LocalAuthorGeneration, EngineError> {
+        Ok(LocalAuthorGeneration {
+            generation: self.history_generation,
+            root: self.author_generation_root()?,
+        })
     }
 
     /// Deterministic residency/work counters for the last
