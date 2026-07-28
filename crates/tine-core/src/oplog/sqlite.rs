@@ -2090,20 +2090,18 @@ pub struct SqliteFrontier {
 /// borrow checker refuses to let either escape the lease. Closing the database
 /// hands the same slot back, which is what makes a bootstrap -> promoted
 /// database handoff possible without ever releasing the workspace lock.
-#[allow(dead_code)] // First non-test caller arrives with LocalActive takeover wiring.
 pub(crate) struct LeasedSqliteFrontier<'lease> {
     database: SqliteFrontier,
     slot: SqliteApplierSlot<'lease>,
 }
 
-#[allow(dead_code)] // First non-test caller arrives with LocalActive takeover wiring.
+// Both accessors serve the bootstrap-side leased open, whose production caller
+// arrives with the migration/activation wiring; the promotion fixtures and the
+// applier-slot handoff regression exercise them today.
+#[allow(dead_code)]
 impl<'lease> LeasedSqliteFrontier<'lease> {
     pub(crate) const fn database(&self) -> &SqliteFrontier {
         &self.database
-    }
-
-    pub(crate) fn database_mut(&mut self) -> &mut SqliteFrontier {
-        &mut self.database
     }
 
     /// Close the session-owned database and return its applier slot to the same
@@ -2121,7 +2119,6 @@ impl<'lease> LeasedSqliteFrontier<'lease> {
 }
 
 /// [`OpenProjection`] for the session-owned entry points.
-#[allow(dead_code)] // First non-test caller arrives with LocalActive takeover wiring.
 pub(crate) struct LeasedOpenProjection<'lease> {
     pub(crate) database: LeasedSqliteFrontier<'lease>,
     pub(crate) recovery: ProjectionRecovery,
@@ -2141,6 +2138,29 @@ impl<'lease> LeasedOpenProjection<'lease> {
             recovery: opened.recovery,
             rebuild: opened.rebuild,
         }
+    }
+
+    /// Split the leased projection into the plain projection and the applier
+    /// slot that authorized it.
+    ///
+    /// Only [`LeasedWorkspaceProjection::open_under`] calls this, and only to
+    /// move the projection next to the very lease the slot borrows, so the two
+    /// authorities stay inseparable across the split.
+    fn into_parts(self) -> (OpenProjection, SqliteApplierSlot<'lease>) {
+        let Self {
+            database,
+            recovery,
+            rebuild,
+        } = self;
+        let LeasedSqliteFrontier { database, slot } = database;
+        (
+            OpenProjection {
+                database,
+                recovery,
+                rebuild,
+            },
+            slot,
+        )
     }
 }
 
@@ -2257,7 +2277,12 @@ impl SqliteFrontier {
     /// it to the opened database, so the retained workspace lease is never
     /// released between this database and the next one opened from the same
     /// slot.
-    #[allow(dead_code)] // First non-test caller arrives with LocalActive takeover wiring.
+    // The promoted runtime already opens its own database through the leased
+    // entry point below. This bootstrap-side twin is exercised by the promotion
+    // fixtures, which is what proves the bootstrap -> promoted handoff; its
+    // production caller arrives with the migration/activation wiring that owns
+    // the inactive bootstrap open.
+    #[allow(dead_code)]
     pub(crate) fn open_or_rebuild_inactive_bootstrap_with_applier_slot<'lease>(
         path: &Path,
         application_runtime_root: &ApplicationRuntimeRoot,
@@ -2406,7 +2431,6 @@ impl SqliteFrontier {
     /// it to the opened database, so the retained workspace lease is never
     /// released between this database and the next one opened from the same
     /// slot.
-    #[allow(dead_code)] // First non-test caller arrives with LocalActive takeover wiring.
     pub(crate) fn open_or_rebuild_with_applier_slot<'lease>(
         path: &Path,
         application_runtime_root: &ApplicationRuntimeRoot,
@@ -6255,6 +6279,9 @@ mod applier_lease {
                 SQLITE_APPLIER_LEASE_FILE,
                 &lease_path,
             )?;
+            #[cfg(test)]
+            WORKSPACE_RUNTIME_LEASE_ACQUISITIONS
+                .with(|count| count.set(count.get().saturating_add(1)));
             file.set_len(0)?;
             file.seek(SeekFrom::Start(0))?;
             writeln!(
@@ -6295,6 +6322,16 @@ mod applier_lease {
                 return Err(ProjectionError::LeaseContended(self.lease_path.clone()));
             }
             Ok(SqliteApplierSlot { lease: self })
+        }
+
+        /// Borrowed proof that this process holds this exact archive-rooted
+        /// workspace lease right now.
+        ///
+        /// The proof carries no applier slot, so handing one to a durable-state
+        /// mutation proves workspace ownership without granting the right to
+        /// open a database.
+        pub(crate) const fn proof(&self) -> WorkspaceRuntimeProof<'_> {
+            WorkspaceRuntimeProof { lease: self }
         }
     }
 
@@ -6486,10 +6523,176 @@ mod applier_lease {
             }))
         }
     }
+
+    /// One runtime session's inseparable pair: the archive-rooted workspace
+    /// runtime lease, and the single device-local SQLite projection opened under
+    /// that exact lease's applier slot.
+    ///
+    /// This is the owning answer to "a database handle and the lease that
+    /// authorized it must not be able to drift apart". [`LeasedSqliteFrontier`]
+    /// proves it at compile time but borrows the lease, so it cannot be stored
+    /// beside the lease it borrows. This value stores the lease itself and keeps
+    /// the projection next to it:
+    ///
+    /// * every projection here was opened through [`WorkspaceRuntimeLease::applier_slot`]
+    ///   on *this* lease, because [`Self::open_under`] is the only constructor and
+    ///   it vends the slot itself;
+    /// * the lease field is private to this sealed module and no accessor hands
+    ///   out `&WorkspaceRuntimeLease`, so no second applier slot, and therefore no
+    ///   second database, can ever be vended while a projection is held;
+    /// * the declared field order is load bearing: the projection (and its
+    ///   database-adjacent lock) drops before the workspace lease, so a drop or an
+    ///   unwind releases the two locks in the same order the acquisition took
+    ///   them;
+    /// * [`Self::close_retaining_lease`] and [`Self::reopen_under_same_lease`]
+    ///   are the only ways to reach the lease again, and both require the
+    ///   projection to be closed first, which is exactly the bootstrap ->
+    ///   promoted database handoff without an instant of released workspace lock.
+    pub(crate) struct LeasedWorkspaceProjection {
+        projection: OpenProjection,
+        lease: WorkspaceRuntimeLease,
+    }
+
+    impl LeasedWorkspaceProjection {
+        /// Open one database under `lease`'s single applier slot and retain both.
+        ///
+        /// `open` receives the slot and must consume it into the
+        /// [`LeasedOpenProjection`] it returns, which is the compile-time proof
+        /// that the database it produced is the one that slot authorized. On any
+        /// failure the slot is released back into the lease and the lease itself
+        /// is handed back to the caller, which is what makes a failed open
+        /// retryable without leaking the workspace lock.
+        pub(crate) fn open_under<T, E>(
+            lease: WorkspaceRuntimeLease,
+            open: impl for<'lease> FnOnce(
+                SqliteApplierSlot<'lease>,
+            ) -> Result<(LeasedOpenProjection<'lease>, T), E>,
+        ) -> Result<(Self, T), (WorkspaceRuntimeLease, E)>
+        where
+            E: From<ProjectionError>,
+        {
+            // The slot borrows `lease`, so every value derived from it must be
+            // dead before the lease can be moved into `Self` or handed back.
+            let opened: Result<(OpenProjection, T), E> = (|| {
+                let slot = lease.applier_slot().map_err(E::from)?;
+                let (opened, value) = open(slot)?;
+                let (projection, slot) = opened.into_parts();
+                // The slot goes back to this lease, which nothing outside this
+                // value can reach for as long as the projection is held.
+                drop(slot);
+                Ok((projection, value))
+            })();
+            match opened {
+                Ok((projection, value)) => Ok((Self { projection, lease }, value)),
+                Err(error) => Err((lease, error)),
+            }
+        }
+
+        /// Close the database and keep the workspace lease.
+        ///
+        // The promoted runtime holds its projection for its whole life, so the
+        // only current caller is the bootstrap -> promoted handoff in the
+        // promotion fixtures; its production caller arrives with the
+        // migration/activation wiring that owns the inactive bootstrap open.
+        ///
+        /// The workspace lock is a distinct OS handle from the database-adjacent
+        /// lock and is never touched here, so there is no instant between this
+        /// database and the next one opened from the returned lease in which
+        /// another process — under any app-data or XDG root — could acquire this
+        /// archive's workspace lease.
+        #[allow(dead_code)]
+        pub(crate) fn close_retaining_lease(self) -> WorkspaceRuntimeLease {
+            let Self { projection, lease } = self;
+            drop(projection);
+            lease
+        }
+
+        /// Non-forgeable evidence that this process holds the archive-rooted
+        /// workspace runtime lease for one exact workspace and archive right now.
+        pub(crate) const fn workspace_proof(&self) -> WorkspaceRuntimeProof<'_> {
+            WorkspaceRuntimeProof { lease: &self.lease }
+        }
+
+        pub(crate) const fn projection(&self) -> &OpenProjection {
+            &self.projection
+        }
+
+        pub(crate) const fn database(&self) -> &SqliteFrontier {
+            &self.projection.database
+        }
+
+        pub(crate) const fn database_mut(&mut self) -> &mut SqliteFrontier {
+            &mut self.projection.database
+        }
+    }
+
+    /// Borrowed proof of live archive-rooted workspace ownership.
+    ///
+    /// It exposes the lease's identity and its fail-closed authorization check
+    /// and nothing else — in particular no applier slot — so a durable state
+    /// mutation can *require* workspace ownership without gaining the ability to
+    /// open a second database behind the runtime's back. It cannot outlive the
+    /// lease, cannot be cloned into a longer life, and has no constructor
+    /// outside this sealed module.
+    pub(crate) struct WorkspaceRuntimeProof<'lease> {
+        lease: &'lease WorkspaceRuntimeLease,
+    }
+
+    impl WorkspaceRuntimeProof<'_> {
+        pub(crate) const fn workspace_id(&self) -> WorkspaceId {
+            self.lease.workspace_id
+        }
+
+        /// Fail closed unless this proof is the workspace lease for the exact
+        /// workspace and the exact archive named by `store`.
+        pub(crate) fn authorize_archive(
+            &self,
+            store: &ObjectStore,
+            workspace_id: WorkspaceId,
+        ) -> Result<(), ProjectionError> {
+            if self.lease.workspace_id != workspace_id {
+                return Err(ProjectionError::WorkspaceMismatch {
+                    expected: workspace_id,
+                    found: self.lease.workspace_id,
+                });
+            }
+            if store.workspace_id() != workspace_id {
+                return Err(ProjectionError::WorkspaceMismatch {
+                    expected: workspace_id,
+                    found: store.workspace_id(),
+                });
+            }
+            if self.lease.archive_root != store.root_path() {
+                return Err(ProjectionError::UnsafePath(format!(
+                    "workspace runtime lease is rooted at archive {} but the runtime archive is {}",
+                    self.lease.archive_root.display(),
+                    store.root_path().display()
+                )));
+            }
+            Ok(())
+        }
+    }
 }
 
 use applier_lease::{ApplierAuthorization, HeldApplierLocks};
-pub(crate) use applier_lease::{SqliteApplierSlot, WorkspaceRuntimeLease};
+pub(crate) use applier_lease::{
+    LeasedWorkspaceProjection, SqliteApplierSlot, WorkspaceRuntimeLease, WorkspaceRuntimeProof,
+};
+
+#[cfg(test)]
+thread_local! {
+    /// Archive-rooted workspace runtime lease acquisitions performed by this
+    /// thread. A retained runtime must acquire exactly one for its whole life,
+    /// so this counter is what proves the lease is not silently reacquired per
+    /// mutation.
+    static WORKSPACE_RUNTIME_LEASE_ACQUISITIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn workspace_runtime_lease_acquisitions() -> usize {
+    WORKSPACE_RUNTIME_LEASE_ACQUISITIONS.with(std::cell::Cell::get)
+}
 
 fn open_or_create_lease_directory(
     parent: &CapDir,
@@ -12623,6 +12826,90 @@ mod tests {
         drop(lease);
         assert_eq!(probe.probe(), "acquired");
         probe.finish();
+    }
+
+    /// The owning runtime shape: one value that holds the archive-rooted
+    /// workspace runtime lease *and* the single database opened under that
+    /// lease's applier slot, so neither can be detached from the other.
+    ///
+    /// A failed open hands the lease back instead of leaking it, a closed
+    /// database keeps the lease held, and the borrowed workspace proof the value
+    /// vends authorizes exactly its own archive and workspace.
+    #[test]
+    fn a_leased_workspace_projection_owns_its_lease_and_hands_it_back_on_failure() {
+        let ids = TestIds::new(8_700);
+        let foreign = TestIds::new(8_800);
+        let dir = TestDir::new("leased-workspace-projection");
+        let store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
+        let foreign_store =
+            ObjectStore::open(&dir.path().join("foreign-objects"), foreign.workspace).unwrap();
+        let runtime = ApplicationRuntimeRoot::open_for_test(&dir.path().join("runtime")).unwrap();
+        let engine = ids.engine();
+        let foreign_engine = foreign.engine();
+
+        // A failed open returns the lease, so the caller can retry.
+        let lease = WorkspaceRuntimeLease::acquire(&store, ids.workspace).unwrap();
+        let (lease, error) =
+            LeasedWorkspaceProjection::open_under::<(), ProjectionError>(lease, |slot| {
+                SqliteFrontier::open_or_rebuild_with_applier_slot(
+                    &dir.path().join("foreign.sqlite"),
+                    &runtime,
+                    foreign.claim(),
+                    RebuildSource::new(&foreign_engine, &foreign_store).unwrap(),
+                    slot,
+                )
+                .map(|opened| (opened, ()))
+            })
+            .err()
+            .expect("a foreign workspace must not open under this lease");
+        assert!(matches!(error, ProjectionError::WorkspaceMismatch { .. }));
+
+        // The same lease still works, and its single applier slot came back.
+        let (mut projection, ()) =
+            LeasedWorkspaceProjection::open_under::<(), ProjectionError>(lease, |slot| {
+                SqliteFrontier::open_or_rebuild_with_applier_slot(
+                    &dir.path().join("own.sqlite"),
+                    &runtime,
+                    ids.claim(),
+                    RebuildSource::new(&engine, &store).unwrap(),
+                    slot,
+                )
+                .map(|opened| (opened, ()))
+            })
+            .map_err(|(_lease, error)| error)
+            .unwrap();
+        assert_eq!(projection.database().claim(), ids.claim());
+        assert_eq!(
+            projection.database_mut().frontier_root().unwrap(),
+            engine.accepted_frontier_root().unwrap()
+        );
+
+        // The borrowed workspace proof authorizes this archive and workspace,
+        // and refuses a look-alike archive or a foreign workspace.
+        let proof = projection.workspace_proof();
+        assert_eq!(proof.workspace_id(), ids.workspace);
+        proof.authorize_archive(&store, ids.workspace).unwrap();
+        assert!(matches!(
+            proof.authorize_archive(&foreign_store, foreign.workspace),
+            Err(ProjectionError::WorkspaceMismatch { .. })
+        ));
+        let substituted =
+            ObjectStore::open(&dir.path().join("substituted-objects"), ids.workspace).unwrap();
+        assert!(matches!(
+            proof.authorize_archive(&substituted, ids.workspace),
+            Err(ProjectionError::UnsafePath(_))
+        ));
+
+        // Closing the database keeps the workspace lease, which is what makes a
+        // bootstrap -> promoted handoff possible; only dropping it releases the
+        // archive.
+        let lease = projection.close_retaining_lease();
+        assert!(matches!(
+            WorkspaceRuntimeLease::acquire(&store, ids.workspace),
+            Err(ProjectionError::LeaseContended(_))
+        ));
+        drop(lease);
+        drop(WorkspaceRuntimeLease::acquire(&store, ids.workspace).unwrap());
     }
 
     /// A pipe-coordinated child that reports, on demand, whether it can take

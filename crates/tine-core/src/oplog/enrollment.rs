@@ -60,7 +60,9 @@ use super::object_store::{ensure_directory_nofollow, open_dir_nofollow, sync_dir
 use super::shadow_projection::{
     verify_inactive_bootstrap_shadow_projection, ShadowProjectionError, VerifiedShadowProjection,
 };
-use super::sqlite::{OpenProjection, ProjectionError, VerifiedBootstrapSqliteProjection};
+use super::sqlite::{
+    OpenProjection, ProjectionError, VerifiedBootstrapSqliteProjection, WorkspaceRuntimeProof,
+};
 use super::{
     BatchId, BlobDescription, CanonicalArchiveResourceId, CanonicalGraphResourceId, ContentDigest,
     DeviceId, DocumentId, GraphTextScopeBinding, ImportId, LineageDigest, ObjectStore,
@@ -2807,11 +2809,126 @@ impl RetainedEnrollmentSession {
         Ok(&self.committed)
     }
 
+    /// Durably replace one *other* session's committed `Unsafe` handoff with
+    /// this process's own, on the retained lease.
+    ///
+    /// This is the enrollment half of an archive-lease-proved crash takeover.
+    /// It is deliberately narrower than [`Self::transition_handoff`]: that one
+    /// settles this session's own record, while this one adopts a record whose
+    /// owner is a different session, so it must name the predecessor it proved
+    /// and refuse anything else.
+    ///
+    /// The compare-and-swap is exact on *both* the head and the predecessor
+    /// session, and it is bracketed by complete authenticated revalidations:
+    ///
+    /// * the reauthenticated record must still be exactly
+    ///   `Unsafe { predecessor.session_id }` at exactly
+    ///   `predecessor.enrollment_head`, so a newcomer that observed the crashed
+    ///   owner and then lost the race to another newcomer fails here without
+    ///   writing one byte, rather than overwriting the winner;
+    /// * the successor is `Unsafe { new_session_id }` and never `Safe`: a crash
+    ///   takeover recovers an unsafe runtime and may not synthesize a clean
+    ///   handoff;
+    /// * the immutable activation anchor is carried through from the record
+    ///   this session just reread, exactly as an ordinary handoff does.
+    ///
+    /// Ownership of the archive-rooted workspace runtime lease is what proves
+    /// the predecessor process is gone, so `workspace` is required rather than
+    /// documented: [`WorkspaceRuntimeProof`] has no constructor outside the
+    /// sealed lease module, cannot be cloned into a longer life, and cannot
+    /// outlive the lease it borrows. A caller that does not hold the archive
+    /// lease right now cannot call this function at all. Binding that proof to
+    /// this exact archive and workspace is [`super::local_active`]'s job, which
+    /// it does before it recovers one byte of runtime state; this function's own
+    /// job is the exact enrollment compare-and-swap.
+    pub(crate) fn take_over_unsafe_handoff(
+        &mut self,
+        workspace: &WorkspaceRuntimeProof<'_>,
+        predecessor: UnsafeHandoffPredecessor,
+        new_session_id: SessionId,
+    ) -> Result<&CommittedLocalActive, VerifiedLocalCompositionError> {
+        self.take_over_unsafe_handoff_at_cut(
+            workspace,
+            predecessor,
+            new_session_id,
+            CommitCut::None,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_over_unsafe_handoff_at_cut_for_test(
+        &mut self,
+        workspace: &WorkspaceRuntimeProof<'_>,
+        predecessor: UnsafeHandoffPredecessor,
+        new_session_id: SessionId,
+        cut: CommitCut,
+    ) -> Result<&CommittedLocalActive, VerifiedLocalCompositionError> {
+        self.take_over_unsafe_handoff_at_cut(workspace, predecessor, new_session_id, cut)
+    }
+
+    fn take_over_unsafe_handoff_at_cut(
+        &mut self,
+        workspace: &WorkspaceRuntimeProof<'_>,
+        predecessor: UnsafeHandoffPredecessor,
+        new_session_id: SessionId,
+        cut: CommitCut,
+    ) -> Result<&CommittedLocalActive, VerifiedLocalCompositionError> {
+        if workspace.workspace_id() != self.committed.binding().workspace_id() {
+            return Err(VerifiedLocalCompositionError::ProofMismatch(
+                "the workspace runtime lease is not this enrollment's workspace",
+            ));
+        }
+        if predecessor.session_id == new_session_id {
+            return Err(VerifiedLocalCompositionError::WrongLifecycle(
+                "a crash takeover must adopt a session other than the crashed one",
+            ));
+        }
+        let target = LocalActiveHandoff::Unsafe {
+            session_id: new_session_id,
+        };
+        // A takeover is a lifecycle boundary, so it is bracketed by complete
+        // authenticated revalidations rather than by the cheap head check.
+        self.reauthenticate()?;
+        if self.committed.enrollment_head != predecessor.enrollment_head
+            || self.committed.handoff
+                != (LocalActiveHandoff::Unsafe {
+                    session_id: predecessor.session_id,
+                })
+        {
+            return Err(VerifiedLocalCompositionError::StaleEvidence(
+                "committed LocalActive record is not the authenticated unsafe predecessor this \
+                 takeover proved",
+            ));
+        }
+        let lifecycle =
+            local_active_lifecycle(self.verification_digest, self.committed.anchor, target);
+        self.writer
+            .transition_at_cut(predecessor.enrollment_head, lifecycle, cut)?;
+        self.reauthenticate()?;
+        if self.committed.handoff != target {
+            return Err(VerifiedLocalCompositionError::StaleEvidence(
+                "committed LocalActive handoff state changed during the crash takeover",
+            ));
+        }
+        Ok(&self.committed)
+    }
+
     /// How many complete authenticated reopens this session has performed.
     #[cfg(test)]
     pub(crate) const fn full_revalidations(&self) -> usize {
         self.full_revalidations
     }
+}
+
+/// The exact committed `Unsafe` record one crash takeover replaces.
+///
+/// Both fields are authenticated by the newcomer before it is used: the head is
+/// the committed enrollment head it reopened, and the session is the crashed
+/// owner named by that record's handoff state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct UnsafeHandoffPredecessor {
+    pub(crate) enrollment_head: ContentDigest,
+    pub(crate) session_id: SessionId,
 }
 
 /// Every invariant a retained runtime session requires of a committed record.

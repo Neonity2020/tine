@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::{BufRead as _, Write as _};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 
@@ -36,8 +37,8 @@ use crate::oplog::shadow_projection::{
     verify_inactive_bootstrap_shadow_projection, VerifiedShadowProjection,
 };
 use crate::oplog::sqlite::{
-    ApplicationRuntimeRoot, RebuildSource, SqliteFrontier, TailOverlay,
-    VerifiedBootstrapSqliteProjection,
+    ApplicationRuntimeRoot, LeasedWorkspaceProjection, ProjectionError, RebuildSource,
+    SqliteFrontier, TailOverlay, VerifiedBootstrapSqliteProjection, WorkspaceRuntimeLease,
 };
 use crate::oplog::{
     AuthorBatch, BatchDisposition, BatchId, BatchOrigin, BlockId, BlockLocation,
@@ -84,9 +85,11 @@ struct Fixture {
     authority: InactiveBootstrapAcceptedAuthority,
     roots: MigrationBackupRoot,
     backup: VerifiedSourceBackup,
-    /// Released before a promoted runtime opens: the SQLite applier lease is
-    /// one per workspace, and the promoted projection takes it over.
-    sqlite: Option<OpenProjection>,
+    /// The inactive bootstrap database *and* the archive-rooted workspace
+    /// runtime lease it was opened under. The promoted open adopts that exact
+    /// lease, so the bootstrap -> promoted handoff never releases the workspace
+    /// lock — which is what the production wiring must do.
+    sqlite: Option<LeasedWorkspaceProjection>,
     sqlite_proof: VerifiedBootstrapSqliteProjection,
     archive_resource_id: CanonicalArchiveResourceId,
     shadow: VerifiedShadowProjection,
@@ -174,12 +177,13 @@ impl Fixture {
         let roots = MigrationBackupRoot::open(&device_root, &graph_root).unwrap();
         let backup = verify_migration_source_backup(&roots, &prepared, &verified).unwrap();
         let runtime = ApplicationRuntimeRoot::open_for_test(&root.path().join("runtime")).unwrap();
-        let (sqlite, sqlite_proof) = SqliteFrontier::open_or_rebuild_inactive_bootstrap(
+        let (sqlite, sqlite_proof) = super::open_leased_bootstrap_projection(
+            &archive_root,
+            workspace,
             &root.path().join("bootstrap.sqlite"),
             &runtime,
             &authority,
-        )
-        .unwrap();
+        );
         let archive_resource_id = authority
             .store()
             .provision_enrolled_archive_resource_id()
@@ -191,7 +195,7 @@ impl Fixture {
             &verified,
             &backup,
             &authority,
-            &sqlite,
+            sqlite.projection(),
             &sqlite_proof,
         )
         .unwrap();
@@ -223,12 +227,24 @@ impl Fixture {
         self.sqlite
             .as_ref()
             .expect("retained inactive bootstrap projection")
+            .projection()
     }
 
-    /// Drop the retained inactive bootstrap SQLite projection, releasing the
-    /// one-per-workspace applier lease a promoted projection needs.
+    /// Drop the retained inactive bootstrap SQLite projection *and* its
+    /// archive-rooted workspace lease, so a promoted open must acquire the
+    /// workspace lease itself.
     fn release_bootstrap_projection(&mut self) {
         self.sqlite = None;
+    }
+
+    /// Close the inactive bootstrap database and retain its archive-rooted
+    /// workspace lease for the promoted open to adopt. This is the production
+    /// bootstrap -> promoted handoff: the workspace lock is never released.
+    fn take_bootstrap_workspace_lease(&mut self) -> WorkspaceRuntimeLease {
+        self.sqlite
+            .take()
+            .expect("retained inactive bootstrap projection")
+            .close_retaining_lease()
     }
 
     fn proofs(&self) -> VerifiedLocalProofSet<'_> {
@@ -1924,16 +1940,16 @@ fn safe_handoff_proves_every_core_drain_and_names_its_missing_dependency() {
 /// The device-local paths one promoted runtime is opened over.
 struct PromotedPaths {
     runtime_root: ApplicationRuntimeRoot,
+    runtime_root_path: PathBuf,
     database_path: PathBuf,
 }
 
 impl PromotedPaths {
     fn new(fixture: &Fixture, label: &str) -> Self {
+        let runtime_root_path = fixture.root.path().join(format!("promoted-rt-{label}"));
         Self {
-            runtime_root: ApplicationRuntimeRoot::open_for_test(
-                &fixture.root.path().join(format!("promoted-rt-{label}")),
-            )
-            .unwrap(),
+            runtime_root: ApplicationRuntimeRoot::open_for_test(&runtime_root_path).unwrap(),
+            runtime_root_path,
             database_path: fixture.root.path().join(format!("promoted-{label}.sqlite")),
         }
     }
@@ -1989,8 +2005,16 @@ fn promote(
     .unwrap();
     let sealed =
         seal_local_runtime_promotion(&authority, &fixture.proofs(), &fixture.runtime()).unwrap();
-    fixture.release_bootstrap_projection();
-    let runtime = open_promoted_local_runtime(sealed, &authority, &paths.open(fixture)).unwrap();
+    // The bootstrap database closes and the promoted one opens under the exact
+    // same retained workspace lease.
+    let lease = fixture.take_bootstrap_workspace_lease();
+    let runtime = open_promoted_local_runtime(
+        sealed,
+        &authority,
+        &paths.open(fixture),
+        PromotedWorkspaceAuthority::Retained(lease),
+    )
+    .unwrap();
     (authority, runtime)
 }
 
@@ -2168,8 +2192,14 @@ fn inactive_bootstrap_promotes_to_a_writable_runtime_and_resumes_exactly() {
         "an idempotent resume must not rewrite the committed promotion state"
     );
 
-    fixture.release_bootstrap_projection();
-    let runtime = open_promoted_local_runtime(sealed, &authority, &paths.open(&fixture)).unwrap();
+    let lease = fixture.take_bootstrap_workspace_lease();
+    let runtime = open_promoted_local_runtime(
+        sealed,
+        &authority,
+        &paths.open(&fixture),
+        PromotedWorkspaceAuthority::Retained(lease),
+    )
+    .unwrap();
 
     // The promoted runtime is the bootstrap's own lineage at its own frontier.
     assert_eq!(
@@ -2295,8 +2325,14 @@ fn promotion_state_residue_fails_closed_and_preserves_evidence() {
 
     // Restoring the exact committed bytes resumes the one promoted state.
     fs::write(&state_path, &committed).unwrap();
-    fixture.release_bootstrap_projection();
-    let runtime = open_promoted_local_runtime(sealed, &authority, &paths.open(&fixture)).unwrap();
+    let lease = fixture.take_bootstrap_workspace_lease();
+    let runtime = open_promoted_local_runtime(
+        sealed,
+        &authority,
+        &paths.open(&fixture),
+        PromotedWorkspaceAuthority::Retained(lease),
+    )
+    .unwrap();
     assert_eq!(runtime.session_id(), session);
     fixture.assert_graph_unchanged();
 }
@@ -3296,6 +3332,1243 @@ fn a_bootstrap_one_block_past_the_old_claim_cap_promotes_and_reopens() {
     assert_eq!(
         reopened.engine().accepted_frontier_root().unwrap(),
         frontier
+    );
+    fixture.assert_graph_unchanged();
+}
+
+// ---------------------------------------------------------------------------
+// Archive-lease-proved LocalActive crash takeover
+// ---------------------------------------------------------------------------
+//
+// Every scheduling step below is caused by a request/response exchange over a
+// pipe, a process exit, or an injected durability cut. Nothing sleeps, polls, or
+// races on wall-clock time.
+
+const HELPER_MARKER: &str = "local-active-helper:";
+const HELPER_MODE: &str = "TINE_LOCAL_ACTIVE_HELPER_MODE";
+const HELPER_WORLD: &str = "TINE_LOCAL_ACTIVE_HELPER_WORLD";
+
+/// Everything a helper process needs to rebuild one fixture's durable world.
+///
+/// None of it is authority: every field is a path, an identity, or the durable
+/// enrollment binding, and the child reauthenticates all of them from disk
+/// exactly as a restarted Tine would. A process-local `LocalActiveAuthority`,
+/// `PromotedLocalRuntime`, engine identity, or lease is unserializable and
+/// deliberately absent.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct HelperWorld {
+    graph_root: PathBuf,
+    receipt_root: PathBuf,
+    archive_root: PathBuf,
+    enrollment_root: PathBuf,
+    database_path: PathBuf,
+    runtime_root: PathBuf,
+    workspace: WorkspaceId,
+    binding: EnrollmentBindingV1,
+    session: SessionId,
+}
+
+impl HelperWorld {
+    fn new(
+        fixture: &Fixture,
+        root: &EnrollmentApplicationRoot,
+        paths: &PromotedPaths,
+        session: SessionId,
+    ) -> Self {
+        Self {
+            graph_root: fixture.graph_root.clone(),
+            receipt_root: fixture.root.path().join("receipts"),
+            archive_root: fixture.archive_root.clone(),
+            enrollment_root: root.path().to_path_buf(),
+            database_path: paths.database_path.clone(),
+            runtime_root: paths.runtime_root_path.clone(),
+            workspace: fixture.workspace,
+            binding: fixture.enrollment_binding(),
+            session,
+        }
+    }
+
+    /// Reopen the device-local resources a promoted runtime is opened over.
+    fn reopen(&self) -> HelperOpen {
+        let endpoint = ProjectionEndpointBinding {
+            endpoint_id: self.binding.endpoint_id(),
+            device_id: self.binding.device_id(),
+            graph_resource_id: self.binding.graph_resource_id(),
+        };
+        HelperOpen {
+            graph: Graph::open(&self.graph_root),
+            receipts: ProjectionReceiptStore::open_for_endpoint(
+                &self.receipt_root,
+                self.workspace,
+                endpoint,
+            )
+            .unwrap(),
+            archive_root: self.archive_root.clone(),
+            database_path: self.database_path.clone(),
+            runtime_root: ApplicationRuntimeRoot::open_for_test(&self.runtime_root).unwrap(),
+            enrollment_root: enrollment_application_root_for_test(&self.enrollment_root).unwrap(),
+        }
+    }
+}
+
+struct HelperOpen {
+    graph: Graph,
+    receipts: ProjectionReceiptStore,
+    archive_root: PathBuf,
+    database_path: PathBuf,
+    runtime_root: ApplicationRuntimeRoot,
+    enrollment_root: EnrollmentApplicationRoot,
+}
+
+impl HelperOpen {
+    fn open(&self) -> PromotedRuntimeOpen<'_> {
+        PromotedRuntimeOpen {
+            graph: &self.graph,
+            receipts: &self.receipts,
+            archive_root: &self.archive_root,
+            database_path: &self.database_path,
+            application_runtime_root: &self.runtime_root,
+        }
+    }
+}
+
+fn helper_answer(answer: &str) {
+    let mut output = std::io::stdout();
+    writeln!(output, "{HELPER_MARKER}{answer}").unwrap();
+    output.flush().unwrap();
+}
+
+fn helper_request() -> Option<String> {
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).unwrap() == 0 {
+        return None;
+    }
+    Some(line.trim().to_string())
+}
+
+/// The one subprocess entry point. It is an ordinary `#[test]` so the test
+/// binary can re-exec itself, and it returns immediately unless a mode is set.
+#[test]
+fn local_active_subprocess_helper() {
+    let Ok(mode) = std::env::var(HELPER_MODE) else {
+        return;
+    };
+    let world: HelperWorld = serde_json::from_str(&std::env::var(HELPER_WORLD).unwrap()).unwrap();
+    match mode.as_str() {
+        "archive-lease" => helper_archive_lease(&world),
+        "takeover-hold" => helper_takeover_hold(&world),
+        "takeover-loser" => helper_takeover_loser(&world),
+        other => panic!("unknown local-active helper mode {other}"),
+    }
+}
+
+/// A process under its own XDG/HOME roots that, on demand, takes or releases the
+/// archive-rooted workspace runtime lease.
+///
+/// This is the exact lock a promoted open takes first, so this child models both
+/// directions of the contention: another profile blocking us, and us blocking
+/// another profile.
+fn helper_archive_lease(world: &HelperWorld) {
+    let mut held: Option<WorkspaceRuntimeLease> = None;
+    while let Some(request) = helper_request() {
+        match request.as_str() {
+            "acquire" => {
+                let store = ObjectStore::open(&world.archive_root, world.workspace).unwrap();
+                match WorkspaceRuntimeLease::acquire(&store, world.workspace) {
+                    Ok(lease) => {
+                        held = Some(lease);
+                        helper_answer("acquired");
+                    }
+                    Err(ProjectionError::LeaseContended(_)) => helper_answer("contended"),
+                    Err(error) => panic!("unexpected archive lease error: {error}"),
+                }
+            }
+            "release" => helper_answer(if held.take().is_some() {
+                "released"
+            } else {
+                "not-held"
+            }),
+            "exit" => return,
+            other => panic!("unknown archive-lease request {other}"),
+        }
+    }
+}
+
+/// A restarted process that takes over the crashed owner's `Unsafe` handoff and
+/// then holds the whole writable runtime until it is killed or told to exit.
+fn helper_takeover_hold(world: &HelperWorld) {
+    let resources = world.reopen();
+    match take_over_promoted_local_runtime(
+        &resources.enrollment_root,
+        &world.binding,
+        world.session,
+        &resources.open(),
+    ) {
+        Ok((authority, runtime)) => {
+            helper_answer(&format!(
+                "took-over:{}:{}",
+                runtime
+                    .engine()
+                    .accepted_frontier_root()
+                    .unwrap()
+                    .acceptance_sequence(),
+                runtime.database().frontier_root().unwrap().state_digest()
+            ));
+            while let Some(request) = helper_request() {
+                if request == "exit" {
+                    drop(runtime);
+                    drop(authority);
+                    helper_answer("exited");
+                    return;
+                }
+            }
+        }
+        Err(error) => helper_answer(&format!("failed:{error}")),
+    }
+}
+
+/// A newcomer that authenticates the crashed predecessor, is suspended at
+/// exactly that point, and only then continues into the compare-and-swap.
+///
+/// Suspending it there is what makes the two-contender race deterministic: by
+/// the time it resumes, another newcomer has already committed, so its
+/// compare-and-swap must refuse on the exact predecessor it proved.
+fn helper_takeover_loser(world: &HelperWorld) {
+    super::set_takeover_predecessor_observed_hook_for_test(Box::new(|| {
+        helper_answer("observed");
+        assert_eq!(
+            helper_request().expect("the loser was never resumed"),
+            "resume"
+        );
+    }));
+    let resources = world.reopen();
+    match take_over_promoted_local_runtime(
+        &resources.enrollment_root,
+        &world.binding,
+        world.session,
+        &resources.open(),
+    ) {
+        Ok((_authority, _runtime)) => helper_answer("outcome:took-over"),
+        Err(error) => helper_answer(&format!("outcome:failed:{error}")),
+    }
+}
+
+/// A pipe-coordinated helper process.
+///
+/// It kills its child on drop, so a panicking test can never leave a helper
+/// alive holding this run's archive-rooted workspace lease and poison the tests
+/// that follow it.
+struct HelperProcess {
+    child: std::process::Child,
+    answers: std::io::BufReader<std::process::ChildStdout>,
+    requests: Option<std::process::ChildStdin>,
+}
+
+impl HelperProcess {
+    fn spawn(mode: &str, world: &HelperWorld, profile: Option<&Path>) -> Self {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .arg("--exact")
+            .arg("oplog::local_active::tests::local_active_subprocess_helper")
+            .arg("--nocapture")
+            .env(HELPER_MODE, mode)
+            .env(HELPER_WORLD, serde_json::to_string(world).unwrap())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped());
+        if let Some(profile) = profile {
+            // A genuinely distinct application-data profile: different XDG data
+            // home and different HOME. Nothing device-local is shared with this
+            // process; the only thing both can reach is the archive.
+            let xdg = profile.join("xdg");
+            let home = profile.join("home");
+            fs::create_dir_all(&xdg).unwrap();
+            fs::create_dir_all(&home).unwrap();
+            command.env("XDG_DATA_HOME", &xdg).env("HOME", &home);
+        }
+        let mut child = command.spawn().unwrap();
+        let answers = std::io::BufReader::new(child.stdout.take().unwrap());
+        let requests = Some(child.stdin.take().unwrap());
+        Self {
+            child,
+            answers,
+            requests,
+        }
+    }
+
+    fn requests(&mut self) -> &mut std::process::ChildStdin {
+        self.requests.as_mut().expect("the helper's stdin is open")
+    }
+
+    /// Read the next marked answer. The child is a libtest binary, so its own
+    /// harness lines share this pipe; only marked lines are protocol.
+    fn answer(&mut self) -> String {
+        loop {
+            let mut line = String::new();
+            assert!(
+                self.answers.read_line(&mut line).unwrap() != 0,
+                "helper closed its output before answering"
+            );
+            if let Some((_, answer)) = line.rsplit_once(HELPER_MARKER) {
+                return answer.trim().to_string();
+            }
+        }
+    }
+
+    fn ask(&mut self, request: &str) -> String {
+        self.tell(request);
+        self.answer()
+    }
+
+    fn tell(&mut self, request: &str) {
+        let requests = self.requests();
+        writeln!(requests, "{request}").unwrap();
+        requests.flush().unwrap();
+    }
+
+    /// Kill the process outright. No destructor runs, so every lease it holds is
+    /// released by the operating system exactly as it would be after a crash.
+    fn kill(&mut self) {
+        self.child.kill().unwrap();
+        assert!(!self.child.wait().unwrap().success());
+    }
+
+    fn finish(mut self) {
+        self.requests = None;
+        assert!(self.child.wait().unwrap().success());
+    }
+}
+
+impl Drop for HelperProcess {
+    fn drop(&mut self) {
+        self.requests = None;
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Every *authoritative* durable byte a takeover could touch: the enrollment
+/// journal and the archive.
+///
+/// Two things are deliberately outside this set. The archive's `.tine-runtime`
+/// namespace holds the workspace lease file, whose contents are diagnostic
+/// metadata that ownership is never decided by — taking the lease rewrites the
+/// recorded pid. And the device-local SQLite projection is disposable
+/// frontier-stamped materialization that can never authorize a write, so a
+/// recovery legitimately rebuilds it before it has earned the right to change
+/// anything authoritative.
+fn authoritative_world(
+    fixture: &Fixture,
+    root: &EnrollmentApplicationRoot,
+) -> BTreeMap<String, ContentDigest> {
+    let mut digests = BTreeMap::new();
+    for (label, directory) in [
+        ("enrollment", root.path()),
+        ("archive", fixture.archive_root.as_path()),
+    ] {
+        for (path, digest) in snapshot_file_digests(directory) {
+            if path.starts_with(".tine-runtime/") {
+                continue;
+            }
+            digests.insert(format!("{label}/{path}"), digest);
+        }
+    }
+    digests
+}
+
+fn committed_handoff(
+    root: &EnrollmentApplicationRoot,
+    binding: &EnrollmentBindingV1,
+    verification_digest: ContentDigest,
+) -> LocalActiveHandoff {
+    crate::oplog::enrollment::reopen_committed_local_active_for_session(
+        root,
+        binding,
+        verification_digest,
+    )
+    .unwrap()
+    .handoff()
+}
+
+/// Attempt a takeover and keep only its rendered error.
+///
+/// The opened runtime is enormous, so returning it into the caller's frame
+/// would make a table of attempts overflow the test thread's stack. Every
+/// attempt therefore lives and dies in this frame.
+fn takeover_error(
+    root: &EnrollmentApplicationRoot,
+    binding: &EnrollmentBindingV1,
+    session: SessionId,
+    open: &PromotedRuntimeOpen<'_>,
+    expectation: &str,
+) -> String {
+    match take_over_promoted_local_runtime(root, binding, session, open) {
+        Ok(_) => panic!("{expectation}"),
+        Err(error) => error.to_string(),
+    }
+}
+
+/// Take over, keep only the recovery state, and immediately release everything.
+fn takeover_recovery(
+    root: &EnrollmentApplicationRoot,
+    binding: &EnrollmentBindingV1,
+    session: SessionId,
+    open: &PromotedRuntimeOpen<'_>,
+) -> RuntimeRecoveryState {
+    let (authority, runtime) = take_over_promoted_local_runtime(root, binding, session, open)
+        .expect("the takeover must commit");
+    let recovery = runtime.recovery();
+    drop(runtime);
+    drop(authority);
+    recovery
+}
+
+/// Delete one device-local SQLite projection and its sidecars.
+///
+/// The projection is disposable derived state, so removing it forces the next
+/// open to rebuild it from the authoritative oplog — which is where an injected
+/// materialization fault can reach.
+fn remove_device_local_database(database_path: &Path) {
+    for suffix in ["", "-wal", "-shm", "-auth"] {
+        let path = PathBuf::from(format!("{}{suffix}", database_path.display()));
+        if path.exists() {
+            fs::remove_file(&path).unwrap();
+        }
+    }
+}
+
+/// The ready projection work a runtime owes, as an exact ordered fingerprint.
+fn projection_work_fingerprint(runtime: &PromotedLocalRuntime) -> Vec<String> {
+    runtime
+        .engine()
+        .projection_work_index()
+        .unwrap()
+        .ready_page(None, 64)
+        .unwrap()
+        .work()
+        .iter()
+        .map(|work| format!("{work:?}"))
+        .collect()
+}
+
+/// A live promoted runtime owns the archive. Every newcomer — this process's own
+/// restart, and a process running under completely separate XDG/HOME roots — is
+/// refused before one enrollment, archive, SQLite, or history byte moves. The
+/// mirror image holds too: while another profile owns the archive-rooted
+/// workspace lease, a takeover here fails on that lease.
+#[test]
+fn a_live_promoted_runtime_blocks_every_newcomer_before_any_durable_write() {
+    let mut fixture = Fixture::new(
+        "takeover-live",
+        None,
+        vec![("pages/live.md".into(), b"- live\n".to_vec())],
+    );
+    let root = fixture.enrollment_root("takeover-live");
+    let binding = fixture.enrollment_binding();
+    let paths = PromotedPaths::new(&fixture, "live");
+    let owner = SessionId::new();
+    let world = HelperWorld::new(&fixture, &root, &paths, SessionId::new());
+    let mut profile = HelperProcess::spawn(
+        "archive-lease",
+        &world,
+        Some(&fixture.root.path().join("profile-a")),
+    );
+    let verification_digest = {
+        let (mut authority, mut runtime) = promote(&mut fixture, &root, owner, &paths);
+        append_local_batch(&fixture, &mut authority, &mut runtime, 0xC100);
+        let before = authoritative_world(&fixture, &root);
+
+        // A same-profile newcomer: the live runtime retains the exclusive
+        // enrollment lease, so the newcomer cannot even read its way to a
+        // durable write.
+        let error = takeover_error(
+            &root,
+            &binding,
+            SessionId::new(),
+            &paths.open(&fixture),
+            "a live runtime must block a same-profile takeover",
+        );
+        assert!(
+            error.contains("enrollment lease"),
+            "a same-profile newcomer must stop at the retained enrollment lease: {error}"
+        );
+
+        // A separate application-data profile shares nothing device-local with
+        // this process, so only the archive-rooted lease can stop it. It does.
+        assert_eq!(profile.ask("acquire"), "contended");
+        assert_eq!(
+            authoritative_world(&fixture, &root),
+            before,
+            "nothing may move"
+        );
+        authority.verification_digest()
+    };
+
+    // The old process is gone. Its record stays exactly Unsafe { owner }.
+    assert_eq!(
+        committed_handoff(&root, &binding, verification_digest),
+        LocalActiveHandoff::Unsafe { session_id: owner }
+    );
+
+    // Now the other profile owns the archive. This process must fail on that
+    // exact lease, after its own enrollment lease was free, and before writing.
+    assert_eq!(profile.ask("acquire"), "acquired");
+    let contended = authoritative_world(&fixture, &root);
+    let before = PromotedRuntimeInstrumentation::capture();
+    let error = takeover_error(
+        &root,
+        &binding,
+        SessionId::new(),
+        &paths.open(&fixture),
+        "another profile's archive lease must block this takeover",
+    );
+    let refused = before.since();
+    assert!(
+        error.contains("sqlite-applier.lock"),
+        "a cross-profile newcomer must stop at the archive-rooted workspace lease: {error}"
+    );
+    // The lease is taken before anything else this runtime does with the
+    // archive, so the refusal happens before the archive is even authenticated,
+    // let alone before the engine is recovered or SQLite is opened.
+    assert_eq!(
+        refused.archive_identity_reads, 0,
+        "a lease-refused takeover must stop before it authenticates the archive"
+    );
+    assert_eq!(refused.sqlite_frontier_reads, 0);
+    assert_eq!(authoritative_world(&fixture, &root), contended);
+    assert_eq!(
+        committed_handoff(&root, &binding, verification_digest),
+        LocalActiveHandoff::Unsafe { session_id: owner },
+        "a refused takeover leaves the crashed owner authoritative"
+    );
+
+    // Released, the takeover proceeds.
+    assert_eq!(profile.ask("release"), "released");
+    let successor = SessionId::new();
+    assert_eq!(
+        takeover_recovery(&root, &binding, successor, &paths.open(&fixture)),
+        RuntimeRecoveryState::TookOverCrashedUnsafe {
+            previous_session: owner
+        }
+    );
+    assert_eq!(
+        committed_handoff(&root, &binding, verification_digest),
+        LocalActiveHandoff::Unsafe {
+            session_id: successor
+        }
+    );
+    profile.finish();
+    fixture.assert_graph_unchanged();
+}
+
+/// Process death releases the archive-rooted lease. A fresh process then
+/// authenticates the whole crashed runtime, compare-and-swaps
+/// `Unsafe { old } -> Unsafe { new }`, reopens exactly the data the crashed
+/// process had, and admits a new mutation without any whole-history work or a
+/// second lease acquisition.
+#[test]
+fn process_death_releases_the_lease_and_a_fresh_process_takes_over_and_admits_work() {
+    let mut fixture = Fixture::new(
+        "takeover-death",
+        None,
+        vec![("pages/death.md".into(), b"- death\n".to_vec())],
+    );
+    let root = fixture.enrollment_root("takeover-death");
+    let binding = fixture.enrollment_binding();
+    let paths = PromotedPaths::new(&fixture, "death");
+    let first = SessionId::new();
+    let (mut authority, mut runtime) = promote(&mut fixture, &root, first, &paths);
+    append_local_batch(&fixture, &mut authority, &mut runtime, 0xC200);
+    let verification_digest = authority.verification_digest();
+    let anchor = runtime.bootstrap_anchor();
+    let frontier = runtime.engine().accepted_frontier_root().unwrap();
+    let sqlite_frontier = runtime.database().frontier_root().unwrap();
+    let work = projection_work_fingerprint(&runtime);
+    drop(runtime);
+    drop(authority);
+
+    // A separate process takes over and holds the runtime.
+    let second = SessionId::new();
+    let world = HelperWorld::new(&fixture, &root, &paths, second);
+    let mut holder = HelperProcess::spawn("takeover-hold", &world, None);
+    assert_eq!(
+        holder.answer(),
+        format!(
+            "took-over:{}:{}",
+            frontier.acceptance_sequence(),
+            sqlite_frontier.state_digest()
+        ),
+        "the takeover must reopen the crashed process's exact frontier"
+    );
+    assert_eq!(
+        committed_handoff(&root, &binding, verification_digest),
+        LocalActiveHandoff::Unsafe { session_id: second }
+    );
+
+    // While it lives, nobody else can have the archive — not this process, and
+    // not another profile.
+    let mut profile = HelperProcess::spawn(
+        "archive-lease",
+        &world,
+        Some(&fixture.root.path().join("profile-b")),
+    );
+    assert_eq!(profile.ask("acquire"), "contended");
+    let held = authoritative_world(&fixture, &root);
+    takeover_error(
+        &root,
+        &binding,
+        SessionId::new(),
+        &paths.open(&fixture),
+        "a live takeover holder must block every newcomer",
+    );
+    assert_eq!(authoritative_world(&fixture, &root), held);
+
+    // Kill it: no destructor runs, so this is a real crash, and the operating
+    // system is what releases both leases.
+    holder.kill();
+    assert_eq!(profile.ask("acquire"), "acquired");
+    assert_eq!(profile.ask("release"), "released");
+    profile.finish();
+
+    let third = SessionId::new();
+    let before = PromotedRuntimeInstrumentation::capture();
+    let (mut authority, mut runtime) =
+        take_over_promoted_local_runtime(&root, &binding, third, &paths.open(&fixture)).unwrap();
+    let opened = before.since();
+    assert_eq!(
+        opened.workspace_lease_acquisitions, 1,
+        "a promoted open takes exactly one archive-rooted workspace lease"
+    );
+
+    // Exactly the crashed process's data, recovered.
+    assert_eq!(runtime.bootstrap_anchor(), anchor);
+    assert_eq!(runtime.engine().accepted_frontier_root().unwrap(), frontier);
+    assert_eq!(runtime.database().frontier_root().unwrap(), sqlite_frontier);
+    assert_eq!(projection_work_fingerprint(&runtime), work);
+    assert!(!work.is_empty(), "the crashed process owed projection work");
+    assert_eq!(runtime.tail().status().unapplied_batches, 0);
+    assert_eq!(
+        runtime.recovery(),
+        RuntimeRecoveryState::TookOverCrashedUnsafe {
+            previous_session: second
+        }
+    );
+    assert_eq!(
+        runtime.automatic_external_import(),
+        ExternalImportAdmission::Blocked(
+            "this runtime took over a crashed session's Unsafe handoff, whose drain was never \
+             proved"
+        ),
+        "a crash must never authorize an automatic external import"
+    );
+    assert_eq!(
+        committed_handoff(&root, &binding, verification_digest),
+        LocalActiveHandoff::Unsafe { session_id: third }
+    );
+
+    // A new mutation is admitted, and admission stays bounded: no lease is
+    // reacquired, no enrollment chain is rewalked, no SQLite statement is run.
+    let before = PromotedRuntimeInstrumentation::capture();
+    {
+        let _admitted = runtime
+            .admit_promoted_mutation(&mut authority, &fixture.graph)
+            .unwrap();
+    }
+    let admission = before.since();
+    assert_eq!(admission.workspace_lease_acquisitions, 0);
+    assert_eq!(admission.sqlite_frontier_reads, 0);
+    assert_eq!(admission.enrollment.record_reads, 0);
+    assert_eq!(admission.enrollment.lease_acquisitions, 0);
+    assert_eq!(admission.enrollment.namespace_scans, 0);
+
+    append_local_batch(&fixture, &mut authority, &mut runtime, 0xC300);
+    assert!(
+        runtime
+            .engine()
+            .accepted_frontier_root()
+            .unwrap()
+            .acceptance_sequence()
+            > frontier.acceptance_sequence(),
+        "the taken-over runtime accepts new local work"
+    );
+    fixture.assert_graph_unchanged();
+}
+
+/// Two newcomers authenticate the same crashed `Unsafe { old }` record. Exactly
+/// one compare-and-swap commits; the loser reauthenticates, observes the new
+/// owner, and leaves every durable byte untouched.
+#[test]
+fn two_post_crash_contenders_commit_exactly_one_takeover() {
+    let mut fixture = Fixture::new(
+        "takeover-race",
+        None,
+        vec![("pages/race.md".into(), b"- race\n".to_vec())],
+    );
+    let root = fixture.enrollment_root("takeover-race");
+    let binding = fixture.enrollment_binding();
+    let paths = PromotedPaths::new(&fixture, "race");
+    let crashed = SessionId::new();
+    let (authority, runtime) = promote(&mut fixture, &root, crashed, &paths);
+    let verification_digest = authority.verification_digest();
+    drop(runtime);
+    drop(authority);
+
+    // The loser starts first and is suspended the instant it has authenticated
+    // the crashed predecessor, before it takes a single lease.
+    let loser_session = SessionId::new();
+    // The loser is an ordinary restart of the same profile: same enrollment
+    // journal, same device-local database, same archive.
+    let loser_world = HelperWorld::new(&fixture, &root, &paths, loser_session);
+    let mut loser = HelperProcess::spawn("takeover-loser", &loser_world, None);
+    assert_eq!(loser.answer(), "observed");
+
+    // The winner completes its takeover and exits, so the loser will find every
+    // lease free and only the record changed.
+    let winner_session = SessionId::new();
+    let (winner_authority, winner_runtime) =
+        take_over_promoted_local_runtime(&root, &binding, winner_session, &paths.open(&fixture))
+            .unwrap();
+    drop(winner_runtime);
+    drop(winner_authority);
+    let after_winner = authoritative_world(&fixture, &root);
+
+    loser.tell("resume");
+    let outcome = loser.answer();
+    assert!(
+        outcome.starts_with("outcome:failed:"),
+        "the loser must not also win: {outcome}"
+    );
+    assert!(
+        outcome.contains("authenticated unsafe predecessor"),
+        "the loser must fail on its exact compare-and-swap predecessor: {outcome}"
+    );
+    loser.finish();
+
+    assert_eq!(
+        authoritative_world(&fixture, &root),
+        after_winner,
+        "a losing takeover writes nothing"
+    );
+    assert_eq!(
+        committed_handoff(&root, &binding, verification_digest),
+        LocalActiveHandoff::Unsafe {
+            session_id: winner_session
+        },
+        "the winner stays the owner"
+    );
+    fixture.assert_graph_unchanged();
+}
+
+/// Every wrong piece of evidence a takeover must authenticate refuses *before*
+/// the compare-and-swap, leaving the crashed owner's record authoritative and
+/// every authoritative byte untouched.
+///
+/// The rows are the evidence the durable takeover actually depends on: the
+/// workspace and enrollment binding, the physical archive resource identity, the
+/// persisted archive-resource claim, the durable promotion state that binds the
+/// immutable activation anchor, the engine's committed history, the SQLite
+/// authority the recovery must reproduce, and the enrollment lifecycle itself.
+#[test]
+fn a_takeover_refuses_wrong_workspace_archive_anchor_history_and_sqlite_evidence() {
+    let mut fixture = Fixture::new(
+        "takeover-evidence",
+        None,
+        vec![("pages/evidence.md".into(), b"- evidence\n".to_vec())],
+    );
+    let root = fixture.enrollment_root("takeover-evidence");
+    let binding = fixture.enrollment_binding();
+    let paths = PromotedPaths::new(&fixture, "evidence");
+    let crashed = SessionId::new();
+    let verification_digest = {
+        let (mut authority, mut runtime) = promote(&mut fixture, &root, crashed, &paths);
+        append_local_batch(&fixture, &mut authority, &mut runtime, 0xC400);
+        authority.verification_digest()
+    };
+    let unsafe_owner = LocalActiveHandoff::Unsafe {
+        session_id: crashed,
+    };
+
+    let refused = |label: &str, prepare: &mut dyn FnMut() -> Box<dyn FnOnce()>| {
+        let restore = prepare();
+        let before = authoritative_world(&fixture, &root);
+        let error = takeover_error(
+            &root,
+            &binding,
+            SessionId::new(),
+            &paths.open(&fixture),
+            &format!("{label} must not authorize a takeover"),
+        );
+        assert_eq!(
+            authoritative_world(&fixture, &root),
+            before,
+            "{label} wrote authoritative bytes before failing: {error}"
+        );
+        assert_eq!(
+            committed_handoff(&root, &binding, verification_digest),
+            unsafe_owner,
+            "{label} moved the crashed owner's record"
+        );
+        restore();
+        // A refused takeover releases the archive-rooted lease it took, so the
+        // next attempt is not blocked by the last failure.
+        drop(
+            WorkspaceRuntimeLease::acquire(&fixture.archive(), fixture.workspace)
+                .unwrap_or_else(|error| panic!("{label} kept the workspace lease: {error}")),
+        );
+    };
+
+    // A different device: the enrollment binding no longer names this journal.
+    let foreign_binding = EnrollmentBindingV1::new(
+        binding.workspace_id(),
+        binding.lineage_digest(),
+        binding.catalog_document_id(),
+        binding.endpoint_id(),
+        DeviceId::from_uuid(Uuid::from_u128(0xDEAD_BEEF)),
+        binding.graph_resource_id(),
+        binding.receipt_store_id(),
+        binding.archive_resource_id(),
+        fixture.graph.graph_text_scope_binding().unwrap(),
+    )
+    .unwrap();
+    takeover_error(
+        &root,
+        &foreign_binding,
+        SessionId::new(),
+        &paths.open(&fixture),
+        "a foreign device binding must not authorize a takeover",
+    );
+
+    // A byte-identical copy of the archive is a different physical resource.
+    let copied_root = fixture.root.path().join("copied-archive");
+    copy_tree(&fixture.archive_root, &copied_root);
+    let copied_paths = PromotedPaths::new(&fixture, "evidence-copy");
+    let copied_open = PromotedRuntimeOpen {
+        graph: &fixture.graph,
+        receipts: &fixture.receipts,
+        archive_root: &copied_root,
+        database_path: &copied_paths.database_path,
+        application_runtime_root: &copied_paths.runtime_root,
+    };
+    let before = authoritative_world(&fixture, &root);
+    takeover_error(
+        &root,
+        &binding,
+        SessionId::new(),
+        &copied_open,
+        "a look-alike archive must never receive this enrollment's takeover",
+    );
+    assert_eq!(authoritative_world(&fixture, &root), before);
+
+    // The persisted canonical archive-resource claim.
+    let claim_path = fixture.archive_root.join(ARCHIVE_INSTANCE_CLAIM_FILE);
+    refused("a divergent archive instance claim", &mut || {
+        let original = fs::read(&claim_path).unwrap();
+        fs::write(&claim_path, divergent_archive_instance_claim(&original)).unwrap();
+        let path = claim_path.clone();
+        Box::new(move || fs::write(&path, &original).unwrap())
+    });
+
+    // The durable promotion state that binds the immutable activation anchor.
+    let state_path = promotion_state_path(&fixture);
+    refused("a truncated promotion state", &mut || {
+        let original = fs::read(&state_path).unwrap();
+        fs::write(&state_path, &original[..original.len() / 2]).unwrap();
+        let path = state_path.clone();
+        Box::new(move || fs::write(&path, &original).unwrap())
+    });
+    refused("an absent promotion state", &mut || {
+        let original = fs::read(&state_path).unwrap();
+        fs::remove_file(&state_path).unwrap();
+        let path = state_path.clone();
+        Box::new(move || fs::write(&path, &original).unwrap())
+    });
+
+    // The engine's own committed history: one truncated manifest and the
+    // recovery this takeover depends on can no longer be authenticated.
+    let manifest_path = find_file_with_prefix(&fixture.archive_root.join("batches"), "");
+    refused("a truncated committed manifest", &mut || {
+        let original = fs::read(&manifest_path).unwrap();
+        fs::write(&manifest_path, &original[..original.len() / 2]).unwrap();
+        let path = manifest_path.clone();
+        Box::new(move || fs::write(&path, &original).unwrap())
+    });
+
+    // The SQLite authority the recovery must reproduce before it may swap the
+    // handoff. The device-local database is deleted, so recovery must rebuild
+    // it from the authoritative oplog, and that rebuild is interrupted inside
+    // the materialization transaction: an unreproducible SQLite authority is a
+    // failed open, not a takeover.
+    refused("an interrupted SQLite rebuild", &mut || {
+        remove_device_local_database(&paths.database_path);
+        crate::oplog::sqlite::fail_next_apply_during_materialization_for_harness();
+        Box::new(|| ())
+    });
+
+    // With every piece of evidence restored, the takeover commits.
+    let successor = SessionId::new();
+    assert_eq!(
+        takeover_recovery(&root, &binding, successor, &paths.open(&fixture)),
+        RuntimeRecoveryState::TookOverCrashedUnsafe {
+            previous_session: crashed
+        }
+    );
+
+    // A blocked enrollment is the last row: it is the one tampering that is
+    // deliberately irreversible.
+    let head = enrollment_head(&root, &binding);
+    crate::oplog::enrollment::block_current_for_test(
+        &root,
+        &binding,
+        head,
+        "takeover-evidence-blocked".into(),
+    )
+    .unwrap();
+    let blocked = authoritative_world(&fixture, &root);
+    takeover_error(
+        &root,
+        &binding,
+        SessionId::new(),
+        &paths.open(&fixture),
+        "a blocked enrollment must not authorize a takeover",
+    );
+    assert_eq!(authoritative_world(&fixture, &root), blocked);
+    fixture.assert_graph_unchanged();
+}
+
+/// A crash at every durability cut of the takeover publication recovers to
+/// exactly the old or exactly the new `Unsafe` owner — never `Safe`, never a
+/// split owner, and never an unrecoverable state. Each interrupted attempt
+/// stays retryable, so the chain of eleven cuts ends in one exact owner.
+#[test]
+fn takeover_at_every_durability_cut_resumes_exactly_one_unsafe_owner() {
+    let mut fixture = Fixture::new(
+        "takeover-cuts",
+        None,
+        vec![("pages/cuts.md".into(), b"- cuts\n".to_vec())],
+    );
+    let root = fixture.enrollment_root("takeover-cuts");
+    let binding = fixture.enrollment_binding();
+    let paths = PromotedPaths::new(&fixture, "cuts");
+    let mut owner = SessionId::new();
+    let (verification_digest, frontier) = {
+        let (authority, runtime) = promote(&mut fixture, &root, owner, &paths);
+        (
+            authority.verification_digest(),
+            runtime.engine().accepted_frontier_root().unwrap(),
+        )
+    };
+
+    for cut in [
+        CommitCut::AfterRecordTempCreate,
+        CommitCut::AfterRecordWrite,
+        CommitCut::AfterRecordFileSync,
+        CommitCut::AfterRecordLink,
+        CommitCut::AfterRecordInsert,
+        CommitCut::AfterRecordsDirectorySync,
+        CommitCut::AfterHeadTempCreate,
+        CommitCut::AfterHeadWrite,
+        CommitCut::AfterHeadFileSync,
+        CommitCut::AfterHeadReplace,
+        CommitCut::AfterEnrollmentDirectorySync,
+    ] {
+        let successor = SessionId::new();
+        assert!(
+            super::take_over_promoted_local_runtime_at_cut_for_test(
+                &root,
+                &binding,
+                successor,
+                &paths.open(&fixture),
+                cut,
+            )
+            .is_err(),
+            "{cut:?} must not return a runtime"
+        );
+
+        // Whatever the cut left behind, the committed record is exactly one of
+        // the two unsafe owners, still Idle, and never a synthesized Safe.
+        match committed_handoff(&root, &binding, verification_digest) {
+            LocalActiveHandoff::Unsafe { session_id } if session_id == owner => {}
+            LocalActiveHandoff::Unsafe { session_id } if session_id == successor => {
+                owner = successor;
+            }
+            other => panic!("{cut:?} left an unexpected handoff: {other:?}"),
+        }
+
+        // And the interrupted transition is retryable: the runtime reopens for
+        // whichever owner the cut actually left committed.
+        let (_authority, resumed) =
+            reopen_promoted_local_runtime(&root, &binding, owner, &paths.open(&fixture)).unwrap();
+        assert_eq!(resumed.engine().accepted_frontier_root().unwrap(), frontier);
+        assert_eq!(resumed.database().frontier_root().unwrap(), frontier);
+    }
+
+    // One last uninterrupted takeover still commits from the surviving owner.
+    let final_session = SessionId::new();
+    assert_eq!(
+        takeover_recovery(&root, &binding, final_session, &paths.open(&fixture)),
+        RuntimeRecoveryState::TookOverCrashedUnsafe {
+            previous_session: owner
+        }
+    );
+    assert_eq!(
+        committed_handoff(&root, &binding, verification_digest),
+        LocalActiveHandoff::Unsafe {
+            session_id: final_session
+        }
+    );
+    fixture.assert_graph_unchanged();
+}
+
+/// The bootstrap -> promoted database handoff runs under one retained
+/// archive-rooted lease. A separate application-data profile is probed at every
+/// step and stays blocked from the inactive bootstrap open until the promoted
+/// runtime is finally dropped.
+#[test]
+fn the_bootstrap_to_promoted_database_handoff_never_releases_the_workspace_lease() {
+    let mut fixture = Fixture::new(
+        "takeover-handoff",
+        None,
+        vec![("pages/handoff.md".into(), b"- handoff\n".to_vec())],
+    );
+    let root = fixture.enrollment_root("takeover-handoff");
+    let paths = PromotedPaths::new(&fixture, "handoff");
+    let session = SessionId::new();
+    let world = HelperWorld::new(&fixture, &root, &paths, session);
+    let mut profile = HelperProcess::spawn(
+        "archive-lease",
+        &world,
+        Some(&fixture.root.path().join("profile-handoff")),
+    );
+
+    // The fixture already holds the lease: its inactive bootstrap database was
+    // opened through that lease's single applier slot.
+    assert_eq!(profile.ask("acquire"), "contended");
+
+    let authority = activate_verified_local(
+        &root,
+        fixture.compose(&root),
+        session,
+        &fixture.proofs(),
+        &fixture.runtime(),
+    )
+    .unwrap();
+    // Sealing is idempotent, so two identical sealed promotions exist: one is
+    // spent on the foreign-lease refusal below, the other on the real open.
+    let refused_seal =
+        seal_local_runtime_promotion(&authority, &fixture.proofs(), &fixture.runtime()).unwrap();
+    let sealed =
+        seal_local_runtime_promotion(&authority, &fixture.proofs(), &fixture.runtime()).unwrap();
+    assert_eq!(profile.ask("acquire"), "contended");
+
+    // A lease for some *other* archive is not this archive's authority, even
+    // though it is a genuine live workspace runtime lease.
+    let foreign_archive = fixture.root.path().join("foreign-archive");
+    let foreign_store = ObjectStore::open(&foreign_archive, fixture.workspace).unwrap();
+    let foreign_lease = WorkspaceRuntimeLease::acquire(&foreign_store, fixture.workspace).unwrap();
+    let before = PromotedRuntimeInstrumentation::capture();
+    let error = open_promoted_local_runtime(
+        refused_seal,
+        &authority,
+        &paths.open(&fixture),
+        PromotedWorkspaceAuthority::Retained(foreign_lease),
+    )
+    .err()
+    .expect("a foreign archive's lease must not authorize this promotion");
+    let refused = before.since();
+    assert!(
+        matches!(
+            error,
+            RuntimePromotionError::Sqlite(ProjectionError::UnsafePath(_))
+        ),
+        "unexpected foreign-lease error: {error}"
+    );
+    assert_eq!(
+        refused.archive_identity_reads, 0,
+        "a foreign retained lease must be refused before any archive work"
+    );
+
+    // The bootstrap database closes. The workspace lock does not move.
+    let lease = fixture.take_bootstrap_workspace_lease();
+    assert_eq!(profile.ask("acquire"), "contended");
+
+    let runtime = open_promoted_local_runtime(
+        sealed,
+        &authority,
+        &paths.open(&fixture),
+        PromotedWorkspaceAuthority::Retained(lease),
+    )
+    .unwrap();
+    assert_eq!(profile.ask("acquire"), "contended");
+    assert_eq!(runtime.recovery(), RuntimeRecoveryState::FirstPromotion);
+    assert!(matches!(
+        runtime.automatic_external_import(),
+        ExternalImportAdmission::Blocked(_)
+    ));
+    drop(runtime);
+    drop(authority);
+
+    // Only now is the archive free.
+    assert_eq!(profile.ask("acquire"), "acquired");
+    assert_eq!(profile.ask("release"), "released");
+    profile.finish();
+    fixture.assert_graph_unchanged();
+}
+
+/// A clean `Safe` handoff is written only after the complete device-local drain
+/// proof, on the promoted runtime's own retained enrollment session. The
+/// restart then adopts exactly one requested new session under exactly one
+/// archive-rooted lease, and is the only recovery that unblocks automatic
+/// external import. An undrained runtime is still refused, and dropping a
+/// writable runtime still leaves the new session `Unsafe`.
+#[test]
+fn a_clean_safe_restart_adopts_a_new_session_under_one_retained_lease() {
+    let mut fixture = Fixture::new(
+        "takeover-safe",
+        None,
+        vec![("pages/safe.md".into(), b"- safe\n".to_vec())],
+    );
+    let root = fixture.enrollment_root("takeover-safe");
+    let binding = fixture.enrollment_binding();
+    let paths = PromotedPaths::new(&fixture, "safe");
+    let first = SessionId::new();
+    let (verification_digest, frontier) = {
+        let (mut authority, mut runtime) = promote(&mut fixture, &root, first, &paths);
+        let frontier = runtime.engine().accepted_frontier_root().unwrap();
+        let permit = runtime
+            .quiesce_and_mark_safe_without_watcher_dependency_for_test(
+                &mut authority,
+                &fixture.graph,
+            )
+            .expect("a fully drained promoted runtime records a clean handoff");
+        assert_eq!(permit.session_id(), first);
+        (authority.verification_digest(), frontier)
+    };
+    assert_eq!(
+        committed_handoff(&root, &binding, verification_digest),
+        LocalActiveHandoff::Safe,
+        "a proved drain records a clean handoff"
+    );
+
+    // A crash takeover is not what a clean restart needs, and it must not be
+    // what a clean restart silently performs either.
+    let second = SessionId::new();
+    let before = PromotedRuntimeInstrumentation::capture();
+    {
+        let (mut authority, mut runtime) =
+            reopen_promoted_local_runtime(&root, &binding, second, &paths.open(&fixture)).unwrap();
+        let opened = before.since();
+        assert_eq!(
+            opened.workspace_lease_acquisitions, 1,
+            "one restart takes exactly one archive-rooted workspace lease"
+        );
+        assert_eq!(runtime.recovery(), RuntimeRecoveryState::AdoptedSafeHandoff);
+        assert_eq!(
+            runtime.automatic_external_import(),
+            ExternalImportAdmission::Allowed,
+            "only a proved clean handoff may unblock automatic external import"
+        );
+        assert_eq!(runtime.engine().accepted_frontier_root().unwrap(), frontier);
+        assert_eq!(
+            committed_handoff(&root, &binding, verification_digest),
+            LocalActiveHandoff::Unsafe { session_id: second },
+            "the runtime is unsafe again the moment it is writable"
+        );
+
+        // Fail-before for the drain proof itself: one accepted local batch
+        // leaves projection work outstanding, and `Safe` is refused for that
+        // exact named drain rather than synthesized.
+        append_local_batch(&fixture, &mut authority, &mut runtime, 0xC700);
+        let error = runtime
+            .quiesce_and_mark_safe_without_watcher_dependency_for_test(
+                &mut authority,
+                &fixture.graph,
+            )
+            .expect_err("an undrained runtime must never record a clean handoff");
+        assert!(
+            matches!(
+                error,
+                SafeHandoffUnavailable::DrainIncomplete {
+                    drain: "projection work",
+                    ..
+                }
+            ),
+            "unexpected drain failure: {error}"
+        );
+    }
+
+    // Dropping a writable runtime leaves the new session unsafe.
+    assert_eq!(
+        committed_handoff(&root, &binding, verification_digest),
+        LocalActiveHandoff::Unsafe { session_id: second }
+    );
+    fixture.assert_graph_unchanged();
+}
+
+/// A promoted open that fails after it has taken the workspace lease and the
+/// applier slot returns both: the slot goes back to the lease, the lease is
+/// released, the enrollment lease is released, nothing authoritative moved, and
+/// the very next attempt succeeds.
+#[test]
+fn a_failed_promoted_open_releases_every_authority_and_stays_retryable() {
+    let mut fixture = Fixture::new(
+        "takeover-unwind",
+        None,
+        vec![("pages/unwind.md".into(), b"- unwind\n".to_vec())],
+    );
+    let root = fixture.enrollment_root("takeover-unwind");
+    let binding = fixture.enrollment_binding();
+    let paths = PromotedPaths::new(&fixture, "unwind");
+    let crashed = SessionId::new();
+    let verification_digest = {
+        let (mut authority, mut runtime) = promote(&mut fixture, &root, crashed, &paths);
+        append_local_batch(&fixture, &mut authority, &mut runtime, 0xC600);
+        authority.verification_digest()
+    };
+    let world = HelperWorld::new(&fixture, &root, &paths, SessionId::new());
+    let mut profile = HelperProcess::spawn(
+        "archive-lease",
+        &world,
+        Some(&fixture.root.path().join("profile-unwind")),
+    );
+
+    // Fail the SQLite rebuild, which happens after the workspace lease and its
+    // applier slot have been taken.
+    let before = authoritative_world(&fixture, &root);
+    remove_device_local_database(&paths.database_path);
+    crate::oplog::sqlite::fail_next_apply_during_materialization_for_harness();
+    takeover_error(
+        &root,
+        &binding,
+        SessionId::new(),
+        &paths.open(&fixture),
+        "an interrupted materialization must not authorize a takeover",
+    );
+    assert_eq!(authoritative_world(&fixture, &root), before);
+    assert_eq!(
+        committed_handoff(&root, &binding, verification_digest),
+        LocalActiveHandoff::Unsafe {
+            session_id: crashed
+        }
+    );
+
+    // Every authority came back: another profile can take the archive lease...
+    assert_eq!(profile.ask("acquire"), "acquired");
+    assert_eq!(profile.ask("release"), "released");
+    profile.finish();
+
+    // ...and this process can retry immediately, including its enrollment lease
+    // and the same applier slot.
+    let successor = SessionId::new();
+    assert_eq!(
+        takeover_recovery(&root, &binding, successor, &paths.open(&fixture)),
+        RuntimeRecoveryState::TookOverCrashedUnsafe {
+            previous_session: crashed
+        }
+    );
+    assert_eq!(
+        committed_handoff(&root, &binding, verification_digest),
+        LocalActiveHandoff::Unsafe {
+            session_id: successor
+        }
     );
     fixture.assert_graph_unchanged();
 }

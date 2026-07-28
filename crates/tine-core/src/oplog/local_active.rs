@@ -56,6 +56,28 @@
 //!    insertion-only descended from the exact bootstrap anchor, and only then
 //!    mints the token.
 //!
+//! # Workspace ownership and crash takeover
+//!
+//! A promoted runtime holds exactly one archive-rooted
+//! [`super::sqlite::WorkspaceRuntimeLease`] for its entire writable life. It is
+//! taken before the runtime reads or writes any archive, engine, SQLite, or
+//! enrollment-handoff state, and it is owned inseparably from the device-local
+//! database it authorized (see [`super::sqlite::LeasedWorkspaceProjection`]), so
+//! the database handle and the workspace authority cannot drift apart and the
+//! lock is never released across a bootstrap -> promoted database handoff.
+//!
+//! That lease is also the crash proof. An unclean shutdown leaves
+//! `HandoffUnsafe { old session }` committed, and
+//! [`take_over_promoted_local_runtime`] is the only boundary that may replace it
+//! with `HandoffUnsafe { new session }`. It may do so only while it owns the
+//! workspace lease — an `EnrollmentLease` is device-local app data, so a process
+//! under another XDG, HOME, or Flatpak root would not contend for it at all —
+//! and only after it has recovered and authenticated the entire runtime the
+//! crashed process left behind. The replacement is then an exact
+//! compare-and-swap from the authenticated old head and old unsafe session, so
+//! two racing newcomers cannot both win. It never mints `Safe` and never
+//! unblocks automatic external import; only a proved clean drain does that.
+//!
 //! The bootstrap stays an immutable historical anchor. Ordinary local batches
 //! extend it by carrying the identical bootstrap aggregate binding forward, so
 //! the promoted history is one homogeneous bootstrap-anchored lineage that the
@@ -79,7 +101,7 @@ use super::enrollment::{
     activate_verified_local_record, reopen_local_active_from_durable_state,
     reopen_local_active_record, reopen_promoted_bootstrap_anchor, transition_local_active_handoff,
     CommittedLocalActive, EnrollmentApplicationRoot, EnrollmentBindingV1, LocalActiveHandoff,
-    LocalActiveSync, PromotedBootstrapAnchor, RetainedEnrollmentSession,
+    LocalActiveSync, PromotedBootstrapAnchor, RetainedEnrollmentSession, UnsafeHandoffPredecessor,
     VerifiedLocalCompositionError, VerifiedLocalEvidence, VerifiedLocalProofSet,
 };
 use super::hot_engine::{EngineError, ShardedHotEngine};
@@ -89,8 +111,8 @@ use super::object_store::{
 };
 use super::projection_store::ProjectionReceiptStore;
 use super::sqlite::{
-    ApplicationRuntimeRoot, OpenProjection, ProjectionClaim, ProjectionError, RebuildSource,
-    SqliteFrontier, TailOverlay,
+    ApplicationRuntimeRoot, LeasedWorkspaceProjection, OpenProjection, ProjectionClaim,
+    ProjectionError, RebuildSource, SqliteFrontier, TailOverlay, WorkspaceRuntimeLease,
 };
 use super::{ContentDigest, ObjectStore, ProjectionEndpointBinding, SessionId};
 
@@ -127,6 +149,9 @@ pub(crate) struct PromotedRuntimeInstrumentation {
     pub(crate) enrollment: super::enrollment::EnrollmentInstrumentation,
     pub(crate) sqlite_frontier_reads: usize,
     pub(crate) archive_identity_reads: usize,
+    /// Archive-rooted workspace runtime lease acquisitions. A retained runtime
+    /// takes exactly one for its whole writable life.
+    pub(crate) workspace_lease_acquisitions: usize,
 }
 
 #[cfg(test)]
@@ -136,6 +161,7 @@ impl PromotedRuntimeInstrumentation {
             enrollment: super::enrollment::EnrollmentInstrumentation::capture(),
             sqlite_frontier_reads: PROMOTED_SQLITE_FRONTIER_READS.with(std::cell::Cell::get),
             archive_identity_reads: PROMOTED_ARCHIVE_IDENTITY_READS.with(std::cell::Cell::get),
+            workspace_lease_acquisitions: super::sqlite::workspace_runtime_lease_acquisitions(),
         }
     }
 
@@ -146,6 +172,8 @@ impl PromotedRuntimeInstrumentation {
             enrollment: self.enrollment.since(),
             sqlite_frontier_reads: now.sqlite_frontier_reads - self.sqlite_frontier_reads,
             archive_identity_reads: now.archive_identity_reads - self.archive_identity_reads,
+            workspace_lease_acquisitions: now.workspace_lease_acquisitions
+                - self.workspace_lease_acquisitions,
         }
     }
 }
@@ -1505,10 +1533,89 @@ pub(crate) struct PromotedLocalRuntime {
     /// resource claim and physical control-directory identity were last
     /// authenticated. Any change forces the full archive proof again.
     archive_authenticated_generation: u64,
+    /// How this runtime came to own the enrollment's handoff state. It decides
+    /// whether automatic external import may run at all.
+    recovery: RuntimeRecoveryState,
     engine: ShardedHotEngine,
-    projection: OpenProjection,
+    /// The device-local SQLite projection *and* the archive-rooted workspace
+    /// runtime lease that authorized opening it, owned as one inseparable
+    /// value. The lease is taken once, before this runtime may mutate enrollment
+    /// handoff state or admit a graph mutation, and is released only when this
+    /// runtime drops.
+    projection: LeasedWorkspaceProjection,
     tail: TailOverlay,
     _seal: seal::Seal,
+}
+
+/// How one promoted runtime came to own its enrollment's handoff state.
+///
+/// This is recovery *evidence*, not authority: it is derived from the durable
+/// record the runtime authenticated, and its only effect is to keep automatic
+/// external import fenced until a genuinely clean `Safe` handoff has been
+/// observed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeRecoveryState {
+    /// The promoting process opened the runtime it had just activated.
+    FirstPromotion,
+    /// A restart reopened this exact session's committed `Unsafe` record, which
+    /// is what an unclean shutdown always leaves behind.
+    ResumedOwnUnsafe,
+    /// A restart adopted a committed `Safe` handoff, which is only ever written
+    /// after the complete device-local drain proof.
+    AdoptedSafeHandoff,
+    /// A new process took over another session's committed `Unsafe` record after
+    /// proving, by owning the archive-rooted workspace runtime lease, that the
+    /// previous process is gone.
+    TookOverCrashedUnsafe { previous_session: SessionId },
+}
+
+/// Whether this runtime may run automatic external Markdown/Org import.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ExternalImportAdmission {
+    Allowed,
+    Blocked(&'static str),
+}
+
+impl RuntimeRecoveryState {
+    /// Automatic external import stays blocked until a clean `Safe` handoff has
+    /// been observed.
+    ///
+    /// A crashed predecessor left an unproved drain: its graph text, watcher
+    /// obligations, and projection work were never quiesced, so external files
+    /// cannot be assumed to be a faithful projection of the accepted frontier.
+    /// Recovering from that state must never look like a clean handoff, and it
+    /// must never import external Markdown merely because the previous process
+    /// died.
+    pub(crate) const fn automatic_external_import(self) -> ExternalImportAdmission {
+        match self {
+            Self::AdoptedSafeHandoff => ExternalImportAdmission::Allowed,
+            Self::FirstPromotion => ExternalImportAdmission::Blocked(
+                "a freshly promoted runtime has not completed a clean Safe handoff yet",
+            ),
+            Self::ResumedOwnUnsafe => ExternalImportAdmission::Blocked(
+                "the previous run of this session ended without a proved drain (Unsafe handoff)",
+            ),
+            Self::TookOverCrashedUnsafe { .. } => ExternalImportAdmission::Blocked(
+                "this runtime took over a crashed session's Unsafe handoff, whose drain was \
+                 never proved",
+            ),
+        }
+    }
+}
+
+/// The archive-rooted workspace authority one promoted open runs under.
+///
+/// A promoted runtime holds exactly one of these leases for its entire writable
+/// life. It is either taken here (a fresh or restarted process, which retains
+/// nothing) or handed over by a caller that already holds it (the
+/// bootstrap -> promoted database handoff, where releasing it even for an
+/// instant would let another process claim the archive mid-promotion).
+pub(crate) enum PromotedWorkspaceAuthority {
+    /// Acquire the archive-rooted workspace runtime lease inside the open.
+    Acquire,
+    /// Adopt the caller's already-held lease, which must be this exact
+    /// archive's and this exact workspace's.
+    Retained(WorkspaceRuntimeLease),
 }
 
 /// How much of the promoted binding one proof re-derives from durable state.
@@ -1542,11 +1649,22 @@ impl PromotedLocalRuntime {
     }
 
     pub(crate) const fn database(&self) -> &SqliteFrontier {
-        &self.projection.database
+        self.projection.database()
     }
 
     pub(crate) const fn projection(&self) -> &OpenProjection {
-        &self.projection
+        self.projection.projection()
+    }
+
+    /// How this runtime came to own the enrollment's handoff state.
+    pub(crate) const fn recovery(&self) -> RuntimeRecoveryState {
+        self.recovery
+    }
+
+    /// Whether automatic external Markdown/Org import may run under this
+    /// runtime. It stays blocked until a clean `Safe` handoff is observed.
+    pub(crate) const fn automatic_external_import(&self) -> ExternalImportAdmission {
+        self.recovery.automatic_external_import()
     }
 
     pub(crate) const fn tail(&self) -> &TailOverlay {
@@ -1639,8 +1757,100 @@ impl PromotedLocalRuntime {
         Ok(PromotedRuntimeSession {
             admission,
             engine,
-            database: &mut projection.database,
+            database: projection.database_mut(),
             tail,
+        })
+    }
+
+    /// The promoted clean-shutdown transition: prove every device-local drain
+    /// and durably record `Safe`, on the retained enrollment session.
+    ///
+    /// This is [`LocalActiveAuthority::quiesce_and_mark_safe`]'s promoted form.
+    /// The drain proof is the identical one — no new or weakened condition —
+    /// but the journal mutation borrows the session this runtime already holds,
+    /// because a second writer would contend with this process's own exclusive
+    /// enrollment lease.
+    ///
+    /// It carries the same missing-dependency caveat as the pre-promotion form:
+    /// the graph-text watcher event queue is owned by the Tauri watcher, so the
+    /// production entry point still refuses rather than minting a `Safe` state
+    /// that is not true. This test form exercises everything else, which is what
+    /// makes the `Safe -> Unsafe { new session }` restart path provable.
+    #[cfg(test)]
+    pub(crate) fn quiesce_and_mark_safe_without_watcher_dependency_for_test(
+        &mut self,
+        authority: &mut LocalActiveAuthority,
+        graph: &Graph,
+    ) -> Result<SafeHandoffPermit, SafeHandoffUnavailable> {
+        if authority.session_id != self.session_id
+            || authority.verification_digest != self.verification_digest
+        {
+            return Err(SafeHandoffUnavailable::Runtime(
+                "live authority is not this promoted runtime's session".into(),
+            ));
+        }
+        authority
+            .authenticate_runtime(graph, &self.engine)
+            .map_err(|error| SafeHandoffUnavailable::Runtime(error.to_string()))?;
+        let (handoff, head) = {
+            let committed = self.enrollment.reauthenticate()?;
+            (committed.handoff(), committed.enrollment_head())
+        };
+        match handoff {
+            LocalActiveHandoff::Unsafe { session_id } if session_id == self.session_id => {}
+            LocalActiveHandoff::Unsafe { .. } => {
+                return Err(SafeHandoffUnavailable::Enrollment(
+                    VerifiedLocalCompositionError::CompetingSession,
+                ));
+            }
+            LocalActiveHandoff::Safe => {
+                return Err(SafeHandoffUnavailable::Runtime(
+                    "committed handoff is already Safe for another drain".into(),
+                ));
+            }
+        }
+        authority.enrollment_head = head;
+        authority.handoff = handoff;
+
+        // Reserving the graph handoff proves that graph text admission and every
+        // managed writer lease are drained, and holds them drained across the
+        // revalidation pass below.
+        let reservation = graph
+            .mint_handoff_safe(self.engine.workspace_id(), self.endpoint)
+            .map_err(|error| SafeHandoffUnavailable::Runtime(error.to_string()))?;
+        reservation
+            .verify_binding(graph, self.engine.workspace_id(), self.endpoint)
+            .map_err(|error| SafeHandoffUnavailable::Runtime(error.to_string()))?;
+        let outcome = (|| {
+            prove_device_local_drains(&self.engine, self.projection.database(), &self.tail)?;
+            prove_device_local_drains(&self.engine, self.projection.database(), &self.tail)
+        })();
+        reservation.cancel();
+        outcome?;
+
+        let (handoff, head, verification_digest, sync) = {
+            let committed = self
+                .enrollment
+                .transition_handoff(LocalActiveHandoff::Safe)?;
+            (
+                committed.handoff(),
+                committed.enrollment_head(),
+                committed.verification_digest(),
+                committed.sync(),
+            )
+        };
+        if handoff != LocalActiveHandoff::Safe || sync != LocalActiveSync::Idle {
+            return Err(SafeHandoffUnavailable::Runtime(
+                "committed handoff state is not Safe+Idle after the transition".into(),
+            ));
+        }
+        authority.enrollment_head = head;
+        authority.handoff = handoff;
+        Ok(SafeHandoffPermit {
+            enrollment_head: head,
+            verification_digest,
+            session_id: self.session_id,
+            _seal: seal::Seal,
         })
     }
 
@@ -1718,7 +1928,7 @@ impl PromotedLocalRuntime {
             ));
         }
         if depth == BindingProofDepth::Boundary
-            && sqlite_frontier_root(&self.projection.database)? != accepted
+            && sqlite_frontier_root(self.projection.database())? != accepted
         {
             return Err(RuntimePromotionError::Anchor(
                 "promoted SQLite frontier is not the current accepted frontier",
@@ -2021,13 +2231,19 @@ impl PromotedRuntimeAdmission<'_> {
 
 /// Phase two of promotion, same process: open the promoted writable runtime.
 ///
-/// The caller must have released the retained inactive bootstrap projection
-/// first; the one-per-workspace SQLite applier lease enforces that rather than
-/// trusting it.
+/// `workspace` is how this process proves it owns the archive:
+///
+/// * [`PromotedWorkspaceAuthority::Retained`] hands over the exact lease the
+///   caller already holds from the inactive bootstrap database, so the
+///   bootstrap -> promoted database handoff never releases the workspace lock;
+/// * [`PromotedWorkspaceAuthority::Acquire`] takes it here, which requires the
+///   retained inactive bootstrap projection to have been released first. The
+///   archive-rooted lease enforces that rather than trusting it.
 pub(crate) fn open_promoted_local_runtime(
     sealed: SealedRuntimePromotion,
     authority: &LocalActiveAuthority,
     open: &PromotedRuntimeOpen<'_>,
+    workspace: PromotedWorkspaceAuthority,
 ) -> Result<PromotedLocalRuntime, RuntimePromotionError> {
     // The enrollment lease comes first, exactly as the documented global lock
     // order requires: enrollment lease, then archive/engine lease, then graph
@@ -2056,6 +2272,8 @@ pub(crate) fn open_promoted_local_runtime(
         authority.endpoint,
         authority.evidence.binding(),
         open,
+        workspace,
+        RuntimeRecoveryState::FirstPromotion,
     )
 }
 
@@ -2090,25 +2308,165 @@ pub(crate) fn reopen_promoted_local_runtime(
     session_id: SessionId,
     open: &PromotedRuntimeOpen<'_>,
 ) -> Result<(LocalActiveAuthority, PromotedLocalRuntime), RuntimePromotionError> {
-    let anchor = reopen_promoted_bootstrap_anchor(root, binding)?;
-    // A competing session is refused before any archive, engine, SQLite, or
-    // lease work happens, so a losing restart advances and touches nothing.
-    if let LocalActiveHandoff::Unsafe {
-        session_id: committed_session,
-    } = anchor.committed().handoff()
-    {
-        if committed_session != session_id {
-            return Err(RuntimePromotionError::Enrollment(
-                VerifiedLocalCompositionError::CompetingSession,
-            ));
+    reopen_promoted_local_runtime_with_adoption(
+        root,
+        binding,
+        session_id,
+        open,
+        HandoffAdoption::OwnSessionOrSafe,
+        TakeoverPublication::Durable,
+    )
+}
+
+/// The sole archive-lease-proved `LocalActive` crash-takeover boundary.
+///
+/// A new process may adopt a *different* session's committed
+/// `HandoffUnsafe { old }` only by proving the old process is gone, and the only
+/// admissible proof is exclusive ownership of the archive-rooted
+/// [`WorkspaceRuntimeLease`]. An `EnrollmentLease` alone is not sufficient:
+/// it lives in device-local app data, so a second process running under another
+/// XDG, HOME, or Flatpak root would not contend for it at all, while the
+/// workspace lease is a file inside the archive that every such process
+/// contends on.
+///
+/// The sequence is deliberately: authenticate the predecessor, take the
+/// enrollment lease, take the workspace lease, recover and authenticate the
+/// *entire* runtime the predecessor left behind — archive resource and control
+/// identity, promotion state, bootstrap anchor, engine history transition,
+/// accepted frontier, projection-work index, reference/catalog authority, SQLite
+/// authority and frontier, bounded tail — and only then compare-and-swap
+/// `Unsafe { old }` to `Unsafe { new }` from the exact authenticated head and
+/// session. Every failure before that swap leaves the predecessor's record
+/// authoritative and writes nothing.
+///
+/// It never mints `Safe`, and it never imports external Markdown: a crashed
+/// predecessor proved no drain, so [`PromotedLocalRuntime::automatic_external_import`]
+/// stays blocked until a later clean `Safe` handoff.
+pub(crate) fn take_over_promoted_local_runtime(
+    root: &EnrollmentApplicationRoot,
+    binding: &EnrollmentBindingV1,
+    session_id: SessionId,
+    open: &PromotedRuntimeOpen<'_>,
+) -> Result<(LocalActiveAuthority, PromotedLocalRuntime), RuntimePromotionError> {
+    reopen_promoted_local_runtime_with_adoption(
+        root,
+        binding,
+        session_id,
+        open,
+        HandoffAdoption::CrashTakeover,
+        TakeoverPublication::Durable,
+    )
+}
+
+/// The same takeover with its durable publication interrupted at one exact cut.
+#[cfg(test)]
+pub(crate) fn take_over_promoted_local_runtime_at_cut_for_test(
+    root: &EnrollmentApplicationRoot,
+    binding: &EnrollmentBindingV1,
+    session_id: SessionId,
+    open: &PromotedRuntimeOpen<'_>,
+    cut: super::enrollment::CommitCut,
+) -> Result<(LocalActiveAuthority, PromotedLocalRuntime), RuntimePromotionError> {
+    reopen_promoted_local_runtime_with_adoption(
+        root,
+        binding,
+        session_id,
+        open,
+        HandoffAdoption::CrashTakeover,
+        TakeoverPublication::AtCut(cut),
+    )
+}
+
+/// Which committed handoff states a fresh-process open may adopt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HandoffAdoption {
+    /// This exact session's `Unsafe` record, or a clean `Safe` handoff. Another
+    /// session's `Unsafe` record is a competing owner and is refused.
+    OwnSessionOrSafe,
+    /// Additionally: another session's `Unsafe` record, taken over under the
+    /// archive-rooted workspace runtime lease.
+    CrashTakeover,
+}
+
+/// How the takeover compare-and-swap is published.
+enum TakeoverPublication {
+    Durable,
+    /// Interrupt the durable publication at one exact enrollment cut.
+    #[cfg(test)]
+    AtCut(super::enrollment::CommitCut),
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Fires after a takeover has authenticated the crashed predecessor and
+    /// before it takes any lease. A racing newcomer suspended here is exactly
+    /// the loser the compare-and-swap must refuse.
+    static TAKEOVER_PREDECESSOR_OBSERVED: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_takeover_predecessor_observed_hook_for_test(hook: Box<dyn FnMut()>) {
+    TAKEOVER_PREDECESSOR_OBSERVED.with(|slot| *slot.borrow_mut() = Some(hook));
+}
+
+fn takeover_predecessor_observed() {
+    #[cfg(test)]
+    TAKEOVER_PREDECESSOR_OBSERVED.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().as_mut() {
+            hook();
         }
-    }
+    });
+}
+
+fn reopen_promoted_local_runtime_with_adoption(
+    root: &EnrollmentApplicationRoot,
+    binding: &EnrollmentBindingV1,
+    session_id: SessionId,
+    open: &PromotedRuntimeOpen<'_>,
+    adoption: HandoffAdoption,
+    publication: TakeoverPublication,
+) -> Result<(LocalActiveAuthority, PromotedLocalRuntime), RuntimePromotionError> {
+    let anchor = reopen_promoted_bootstrap_anchor(root, binding)?;
+    // The committed record decides which of the three durable predecessors this
+    // open is recovering from. A competing session is refused here, before any
+    // archive, engine, SQLite, or lease work happens, unless this is an explicit
+    // crash takeover — which still writes nothing until the whole runtime below
+    // has been recovered and authenticated.
+    let (predecessor, recovery) = match anchor.committed().handoff() {
+        LocalActiveHandoff::Unsafe {
+            session_id: committed_session,
+        } if committed_session == session_id => (None, RuntimeRecoveryState::ResumedOwnUnsafe),
+        LocalActiveHandoff::Unsafe {
+            session_id: committed_session,
+        } => {
+            if adoption != HandoffAdoption::CrashTakeover {
+                return Err(RuntimePromotionError::Enrollment(
+                    VerifiedLocalCompositionError::CompetingSession,
+                ));
+            }
+            (
+                Some(UnsafeHandoffPredecessor {
+                    enrollment_head: anchor.committed().enrollment_head(),
+                    session_id: committed_session,
+                }),
+                RuntimeRecoveryState::TookOverCrashedUnsafe {
+                    previous_session: committed_session,
+                },
+            )
+        }
+        LocalActiveHandoff::Safe => (None, RuntimeRecoveryState::AdoptedSafeHandoff),
+    };
+    takeover_predecessor_observed();
     // The enrollment lease comes first, before any archive, engine, or SQLite
     // work, exactly as the documented global lock order requires. The promoted
     // runtime retains this session for its whole lifetime, so it is acquired
     // once, here, and every journal mutation below borrows it.
     let enrollment = RetainedEnrollmentSession::open(root, binding, anchor.verification_digest())?;
     let state = read_promotion_state_for_anchor(open.archive_root, binding, &anchor)?;
+    // The archive-rooted workspace runtime lease is taken inside this call,
+    // before any archive, engine, or SQLite state is touched, and is retained
+    // for the whole writable runtime.
     let mut runtime = mint_promoted_runtime(
         state,
         enrollment,
@@ -2117,6 +2475,8 @@ pub(crate) fn reopen_promoted_local_runtime(
         promoted_storage_binding_endpoint(binding),
         binding,
         open,
+        PromotedWorkspaceAuthority::Acquire,
+        recovery,
     )?;
 
     // Only now, with complete recovery proved, may an authority exist. The
@@ -2126,30 +2486,55 @@ pub(crate) fn reopen_promoted_local_runtime(
     // before any authority is minted. The transition runs on the retained
     // session, so it never reacquires the lease this process already holds.
     let (evidence, _committed) = anchor.into_predecessor_evidence();
-    match runtime.enrollment.committed().handoff() {
-        LocalActiveHandoff::Unsafe {
-            session_id: committed_session,
-        } if committed_session == session_id => {}
-        LocalActiveHandoff::Unsafe { .. } => {
+    match (predecessor, runtime.enrollment.committed().handoff()) {
+        // The archive-lease-proved crash takeover. Everything the predecessor's
+        // runtime consisted of has been recovered and authenticated above, and
+        // this process has held the workspace lease throughout, so the crashed
+        // owner cannot still be running.
+        (Some(predecessor), _) => {
+            // The durable compare-and-swap borrows this runtime's own workspace
+            // lease proof. It is not an assertion the caller supplies: it is
+            // minted from the lease this runtime has held continuously since
+            // before it read any archive state, and the borrow checker refuses
+            // to let it outlive that lease.
+            let PromotedLocalRuntime {
+                enrollment,
+                projection,
+                ..
+            } = &mut runtime;
+            let workspace = projection.workspace_proof();
+            match publication {
+                TakeoverPublication::Durable => {
+                    enrollment.take_over_unsafe_handoff(&workspace, predecessor, session_id)?;
+                }
+                #[cfg(test)]
+                TakeoverPublication::AtCut(cut) => {
+                    enrollment.take_over_unsafe_handoff_at_cut_for_test(
+                        &workspace,
+                        predecessor,
+                        session_id,
+                        cut,
+                    )?;
+                }
+            }
+            require_unchanged_bootstrap_anchor(root, binding, &evidence, &runtime)?;
+        }
+        (
+            None,
+            LocalActiveHandoff::Unsafe {
+                session_id: committed_session,
+            },
+        ) if committed_session == session_id => {}
+        (None, LocalActiveHandoff::Unsafe { .. }) => {
             return Err(RuntimePromotionError::Enrollment(
                 VerifiedLocalCompositionError::CompetingSession,
             ));
         }
-        LocalActiveHandoff::Safe => {
+        (None, LocalActiveHandoff::Safe) => {
             runtime
                 .enrollment
                 .transition_handoff(LocalActiveHandoff::Unsafe { session_id })?;
-            let fresh = reopen_promoted_bootstrap_anchor(root, binding)?;
-            if fresh.verification_digest() != evidence.verification_digest()
-                || fresh.history_root() != runtime.anchor.index_root
-                || fresh.history_generation() != runtime.anchor.generation
-            {
-                return Err(RuntimePromotionError::Enrollment(
-                    VerifiedLocalCompositionError::StaleEvidence(
-                        "bootstrap anchor changed during the promoted handoff transition",
-                    ),
-                ));
-            }
+            require_unchanged_bootstrap_anchor(root, binding, &evidence, &runtime)?;
         }
     }
     let reopened = runtime.enrollment.committed();
@@ -2185,6 +2570,28 @@ pub(crate) fn reopen_promoted_local_runtime(
     // This is a recovery boundary, so it is the unabridged proof.
     runtime.prove_binding(open.graph, &authority, BindingProofDepth::Boundary)?;
     Ok((authority, runtime))
+}
+
+/// The immutable activation anchor must not have moved across a durable handoff
+/// transition. It is reread from the enrollment chain, never from memory.
+fn require_unchanged_bootstrap_anchor(
+    root: &EnrollmentApplicationRoot,
+    binding: &EnrollmentBindingV1,
+    evidence: &VerifiedLocalEvidence,
+    runtime: &PromotedLocalRuntime,
+) -> Result<(), RuntimePromotionError> {
+    let fresh = reopen_promoted_bootstrap_anchor(root, binding)?;
+    if fresh.verification_digest() != evidence.verification_digest()
+        || fresh.history_root() != runtime.anchor.index_root
+        || fresh.history_generation() != runtime.anchor.generation
+    {
+        return Err(RuntimePromotionError::Enrollment(
+            VerifiedLocalCompositionError::StaleEvidence(
+                "bootstrap anchor changed during the promoted handoff transition",
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn promoted_storage_binding_endpoint(binding: &EnrollmentBindingV1) -> ProjectionEndpointBinding {
@@ -2299,6 +2706,14 @@ fn require_promoted_bootstrap_runtime_authority(
 
 /// Open, recover, and authenticate every promoted runtime component, then mint
 /// the token. Nothing partial is ever returned.
+///
+/// The archive-rooted workspace runtime lease is taken (or adopted) *first*,
+/// before one byte of archive, engine, SQLite, or enrollment state is read or
+/// written by this runtime. That ordering is the whole crash proof: a live
+/// predecessor — this process's own previous runtime, another profile's process
+/// under a different XDG/HOME/app-data root, or a racing newcomer — still owns
+/// the lease, so this call fails here rather than after touching durable state.
+#[allow(clippy::too_many_arguments)]
 fn mint_promoted_runtime(
     state: PromotedRuntimeStateV1,
     enrollment: RetainedEnrollmentSession,
@@ -2307,6 +2722,8 @@ fn mint_promoted_runtime(
     expected_endpoint: ProjectionEndpointBinding,
     binding: &EnrollmentBindingV1,
     open: &PromotedRuntimeOpen<'_>,
+    workspace: PromotedWorkspaceAuthority,
+    recovery: RuntimeRecoveryState,
 ) -> Result<PromotedLocalRuntime, RuntimePromotionError> {
     if state.enrollment_verification_digest != verification_digest
         || enrollment.verification_digest() != verification_digest
@@ -2321,6 +2738,20 @@ fn mint_promoted_runtime(
         ));
     }
     let archive = ObjectStore::open(open.archive_root, state.workspace_id)?;
+    // Workspace ownership, before anything else. A retained lease must be this
+    // exact archive's and this exact workspace's; a lease for a look-alike
+    // archive at another path can never be laundered into authority here.
+    let workspace_lease = match workspace {
+        PromotedWorkspaceAuthority::Acquire => {
+            WorkspaceRuntimeLease::acquire(&archive, state.workspace_id)?
+        }
+        PromotedWorkspaceAuthority::Retained(lease) => {
+            lease
+                .proof()
+                .authorize_archive(&archive, state.workspace_id)?;
+            lease
+        }
+    };
     authenticate_archive_identity(
         &archive,
         &state,
@@ -2411,22 +2842,35 @@ fn mint_promoted_runtime(
     let publication = store
         .load_bootstrap_publication(state.bootstrap.publication_id())
         .map_err(RuntimePromotionError::Store)?;
-    let projection = SqliteFrontier::open_or_rebuild(
-        open.database_path,
-        open.application_runtime_root,
-        claim,
-        RebuildSource::from_promoted_runtime(&engine, store, &publication)?,
-    )?;
+    // The database is opened through the retained workspace lease's single
+    // applier slot, never through the compatibility entry point that would take
+    // a second, temporary workspace lease of its own. On any failure the slot
+    // and the lease are both released, which is what makes a failed open
+    // retryable.
+    let (projection, ()) =
+        LeasedWorkspaceProjection::open_under::<(), ProjectionError>(workspace_lease, |slot| {
+            let source = RebuildSource::from_promoted_runtime(&engine, store, &publication)
+                .map_err(ProjectionError::from)?;
+            SqliteFrontier::open_or_rebuild_with_applier_slot(
+                open.database_path,
+                open.application_runtime_root,
+                claim,
+                source,
+                slot,
+            )
+            .map(|opened| (opened, ()))
+        })
+        .map_err(|(_released_lease, error)| RuntimePromotionError::Sqlite(error))?;
     // SQLite divergence is caught here, at open, and again at every drain. It
     // is deliberately absent from per-mutation admission: the keystroke path
     // must not issue a SQLite statement.
-    if sqlite_frontier_root(&projection.database)? != accepted {
+    if sqlite_frontier_root(projection.database())? != accepted {
         return Err(RuntimePromotionError::Anchor(
             "promoted SQLite projection is not at the current accepted frontier",
         ));
     }
     let tail = TailOverlay::from_durable(
-        &projection.database,
+        projection.database(),
         &RebuildSource::from_promoted_runtime(&engine, store, &publication)?,
     )
     .map_err(|error| match error {
@@ -2447,11 +2891,44 @@ fn mint_promoted_runtime(
         endpoint,
         enrollment,
         archive_authenticated_generation,
+        recovery,
         engine,
         projection,
         tail,
         _seal: seal::Seal,
     })
+}
+
+/// Open one inactive-bootstrap database through a freshly acquired
+/// archive-rooted workspace runtime lease's applier slot.
+///
+/// This is the leased entry point every promotion fixture uses, so the
+/// bootstrap -> promoted database handoff under one retained lease is the shape
+/// the tests exercise, rather than a release-and-reacquire that production must
+/// never perform.
+#[cfg(test)]
+fn open_leased_bootstrap_projection(
+    archive_root: &Path,
+    workspace: super::WorkspaceId,
+    database_path: &Path,
+    application_runtime_root: &ApplicationRuntimeRoot,
+    authority: &super::import::InactiveBootstrapAcceptedAuthority,
+) -> (
+    LeasedWorkspaceProjection,
+    super::sqlite::VerifiedBootstrapSqliteProjection,
+) {
+    let archive = ObjectStore::open(archive_root, workspace).unwrap();
+    let lease = WorkspaceRuntimeLease::acquire(&archive, workspace).unwrap();
+    LeasedWorkspaceProjection::open_under(lease, |slot| {
+        SqliteFrontier::open_or_rebuild_inactive_bootstrap_with_applier_slot(
+            database_path,
+            application_runtime_root,
+            authority,
+            slot,
+        )
+    })
+    .map_err(|(_released_lease, error)| error)
+    .expect("leased inactive bootstrap projection")
 }
 
 #[cfg(test)]
@@ -2534,7 +3011,7 @@ mod bounded_admission {
         authority: InactiveBootstrapAcceptedAuthority,
         roots: MigrationBackupRoot,
         backup: VerifiedSourceBackup,
-        sqlite: Option<OpenProjection>,
+        sqlite: Option<LeasedWorkspaceProjection>,
         sqlite_proof: VerifiedBootstrapSqliteProjection,
         archive_resource_id: CanonicalArchiveResourceId,
         shadow: VerifiedShadowProjection,
@@ -2615,12 +3092,17 @@ mod bounded_admission {
             let backup = verify_migration_source_backup(&roots, &prepared, &verified).unwrap();
             let runtime =
                 ApplicationRuntimeRoot::open_for_test(&root.path().join("runtime")).unwrap();
-            let (sqlite, sqlite_proof) = SqliteFrontier::open_or_rebuild_inactive_bootstrap(
+            // The inactive bootstrap database is opened through the retained
+            // workspace lease's applier slot, so this fixture's promotion is the
+            // production bootstrap -> promoted handoff rather than a
+            // release-and-reacquire.
+            let (sqlite, sqlite_proof) = open_leased_bootstrap_projection(
+                &archive_root,
+                workspace,
                 &root.path().join("bootstrap.sqlite"),
                 &runtime,
                 &authority,
-            )
-            .unwrap();
+            );
             let archive_resource_id = authority
                 .store()
                 .provision_enrolled_archive_resource_id()
@@ -2632,7 +3114,7 @@ mod bounded_admission {
                 &verified,
                 &backup,
                 &authority,
-                &sqlite,
+                sqlite.projection(),
                 &sqlite_proof,
             )
             .unwrap();
@@ -2664,10 +3146,16 @@ mod bounded_admission {
             self.sqlite
                 .as_ref()
                 .expect("retained inactive bootstrap projection")
+                .projection()
         }
 
-        fn release_bootstrap_projection(&mut self) {
-            self.sqlite = None;
+        /// Close the inactive bootstrap database and keep its archive-rooted
+        /// workspace lease, which the promoted open then adopts.
+        fn take_bootstrap_workspace_lease(&mut self) -> WorkspaceRuntimeLease {
+            self.sqlite
+                .take()
+                .expect("retained inactive bootstrap projection")
+                .close_retaining_lease()
         }
 
         fn proofs(&self) -> VerifiedLocalProofSet<'_> {
@@ -2798,9 +3286,14 @@ mod bounded_admission {
         let sealed =
             seal_local_runtime_promotion(&authority, &fixture.proofs(), &fixture.runtime())
                 .unwrap();
-        fixture.release_bootstrap_projection();
-        let runtime =
-            open_promoted_local_runtime(sealed, &authority, &paths.open(fixture)).unwrap();
+        let lease = fixture.take_bootstrap_workspace_lease();
+        let runtime = open_promoted_local_runtime(
+            sealed,
+            &authority,
+            &paths.open(fixture),
+            PromotedWorkspaceAuthority::Retained(lease),
+        )
+        .unwrap();
         (authority, runtime)
     }
 
@@ -2932,6 +3425,9 @@ mod bounded_admission {
             },
             sqlite_frontier_reads: 0,
             archive_identity_reads: 0,
+            // The archive-rooted workspace runtime lease is retained for the
+            // whole promoted runtime, so no admission ever reacquires it.
+            workspace_lease_acquisitions: 0,
         };
 
         for (label, count) in [
