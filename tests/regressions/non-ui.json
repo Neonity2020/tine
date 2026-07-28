@@ -1127,6 +1127,30 @@
         "scenario": "sync.out-of-scope-nonportable-file-is-retained-nontext",
         "failBefore": "proven"
       }
+    },
+    {
+      "id": "REG-SYNC-SHARED-ENROLLMENT-P3-001",
+      "title": "Sparse-oplog sharing admits exactly one descriptor-bound lineage and blocks incomplete bootstrap, split genesis, dirty tails, and projection/base disagreement without changing projection bytes",
+      "family": "sync-data-safety",
+      "sources": {
+        "issues": [],
+        "commits": [
+          "60d8b3490c4b01927907fdcf86664233716f833c"
+        ]
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/oplog/enrollment.rs"
+        ],
+        "scenario": "sync.shared-enrollment-two-device-fault-matrix",
+        "failBefore": "proven"
+      },
+      "notes": "P3.1 contract test covers LocalActive to SharePrepared to SharedActive for the initiator, LocalActive to Joining to SharedActive for a peer, duplicate/reordered descriptor delivery, malformed partial bootstrap evidence, split-genesis descriptor conflict, dirty unique local tail, projection/base mismatch, and every named enrollment record/head crash cut. P3.2 runtime and UI integration remain intentionally inactive."
     }
   ]
 }
