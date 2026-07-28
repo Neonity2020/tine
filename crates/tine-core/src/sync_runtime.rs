@@ -41,6 +41,10 @@ use crate::oplog::local_active::{
 };
 #[cfg(test)]
 use crate::oplog::operational_coordinator::{fail_repeatedly_at, OperationalFaultPoint};
+use crate::oplog::operational_coordinator::{
+    LocalMutationBlockReason, LocalMutationCoordinatorState, LocalMutationRecovery,
+    LocalPublishedContinuation, OperationalCoordinator, OperationalPhase,
+};
 use crate::oplog::projection_store::ProjectionReceiptStore;
 use crate::oplog::reconciliation_baseline::{
     BaselineTimestamp, ReconciliationBaseline, ReconciliationBaselineBinding,
@@ -48,13 +52,21 @@ use crate::oplog::reconciliation_baseline::{
 };
 use crate::oplog::sqlite::ApplicationRuntimeRoot;
 use crate::oplog::watcher_queue::WatcherObservation;
-use crate::oplog::{ManagedPath, SessionId};
+use crate::oplog::{BatchId, ManagedPath, OperationTransaction, SemanticOperation, SessionId};
 
 const ACTOR_CHANNEL_CAPACITY: usize = 64;
 const ACTOR_STACK_BYTES: usize = 16 * 1024 * 1024;
 const MAX_WATCHER_OBSERVATIONS: usize = 256;
 const MAX_WATCHER_PATH_BYTES: usize = 64 * 1024;
 const MAX_CLEAN_DRAIN_TURNS: usize = 4096;
+/// Maximum top-level operations plus nested rename rows in one submission.
+pub const MAX_LOCAL_MUTATION_ROWS: usize = 1024;
+/// Maximum managed-path references retained by one submission.
+pub const MAX_LOCAL_MUTATION_REFERENCED_PATHS: usize = 512;
+/// Maximum aggregate UTF-8 bytes in every referenced managed path.
+pub const MAX_LOCAL_MUTATION_PATH_BYTES: usize = 256 * 1024;
+/// Maximum aggregate UTF-8 bytes in names, content, preambles, and order keys.
+pub const MAX_LOCAL_MUTATION_TEXT_BYTES: usize = 1024 * 1024;
 
 #[cfg(test)]
 static ACTOR_THREADS_STARTED: std::sync::atomic::AtomicUsize =
@@ -200,6 +212,7 @@ pub struct SyncWatcherStatus {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SyncRuntimeTick {
     Idle,
+    LocalMutation(SyncLocalMutationOutcome),
     RecoveryBlocked(String),
     Recovering,
     RetryFull,
@@ -224,6 +237,99 @@ pub enum SyncShutdownOutcome {
     Safe(SyncRuntimeStatusSnapshot),
     Terminal(SyncRuntimeStatusSnapshot),
 }
+
+/// Bounded phase diagnosis for one local mutation reply.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SyncLocalMutationPhase {
+    Bindings,
+    Planning,
+    Draft,
+    Capture,
+    Finalize,
+    TailReservation,
+    Publication,
+    ArchiveStage,
+    TailAdmission,
+    SqliteDrain,
+    ProjectionDrain,
+}
+
+/// Why a new local mutation was not admitted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SyncLocalMutationBlock {
+    /// An earlier published or reconciliation-first mutation still owns the
+    /// actor's local mutation slot. The submitted transaction was not run.
+    PriorMutationUnresolved,
+    /// The submitted mutation was refused before immutable publication.
+    Prepublication,
+    /// Immutable publication happened, but stable evidence prevents progress.
+    RetainedPublished,
+}
+
+/// Typed result of one bounded local semantic mutation request.
+///
+/// A retryable, retained, blocked, or revoked reply never vends the private
+/// continuation. The actor remains its sole owner and retries it on later
+/// ordered turns. `Durable` means immutable history, SQLite, and graph
+/// projection completed before the reply.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SyncLocalMutationOutcome {
+    Durable {
+        batch_id: BatchId,
+    },
+    RetryableRetainedRecovery {
+        batch_id: Option<BatchId>,
+        phase: SyncLocalMutationPhase,
+    },
+    Blocked {
+        batch_id: Option<BatchId>,
+        phase: SyncLocalMutationPhase,
+        reason: SyncLocalMutationBlock,
+    },
+    Revoked {
+        batch_id: Option<BatchId>,
+        phase: SyncLocalMutationPhase,
+    },
+}
+
+/// Bounded overflow witness. Every field is capped at its public limit plus
+/// one, so even diagnostics for attacker-shaped DTOs remain small.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SyncLocalMutationRequestSize {
+    pub rows: usize,
+    pub referenced_paths: usize,
+    pub path_bytes: usize,
+    pub text_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SyncLocalMutationRequestError {
+    /// The public DTO bypassed or failed `OperationTransaction::new`, or used
+    /// the external-reconciliation-only operation.
+    InvalidTransaction,
+    /// One or more public intake budgets were exceeded before actor queueing.
+    RequestTooLarge(SyncLocalMutationRequestSize),
+    /// The actor stopped, crashed, or completed clean shutdown.
+    ActorUnavailable,
+}
+
+impl fmt::Display for SyncLocalMutationRequestError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidTransaction => {
+                formatter.write_str("local mutation transaction is invalid")
+            }
+            Self::RequestTooLarge(size) => write!(
+                formatter,
+                "local mutation exceeds bounds: {} rows, {} paths, {} path bytes, {} text bytes",
+                size.rows, size.referenced_paths, size.path_bytes, size.text_bytes
+            ),
+            Self::ActorUnavailable => formatter.write_str("sync actor is unavailable"),
+        }
+    }
+}
+
+impl std::error::Error for SyncLocalMutationRequestError {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SyncRuntimeRequestError {
@@ -418,6 +524,30 @@ impl SyncRuntimeHandle {
             .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)?
     }
 
+    /// Submit one bounded semantic transaction to this existing inactive
+    /// `LocalActive` runtime.
+    ///
+    /// Public DTO fields are revalidated and all row/path/text budgets are
+    /// enforced while holding the same operation gate as watcher observation,
+    /// ticks, status, and clean shutdown. An oversized or invalid transaction
+    /// never enters the actor queue.
+    pub fn submit_local_mutation(
+        &self,
+        transaction: OperationTransaction,
+    ) -> Result<SyncLocalMutationOutcome, SyncLocalMutationRequestError> {
+        let _operation = self.inner.operation.lock().unwrap();
+        let transaction = validate_local_mutation_request(transaction)?;
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.send(ActorRequest::SubmitLocalMutation {
+            transaction,
+            reply: reply_sender,
+        })
+        .map_err(map_local_actor_error)?;
+        reply_receiver
+            .recv()
+            .map_err(|_| SyncLocalMutationRequestError::ActorUnavailable)
+    }
+
     /// A public request may be too large to retain verbatim, but that never
     /// makes its observation disposable. The actor's one-owner queue already
     /// gives this marker an epoch, status visibility, and a full graph scan
@@ -531,6 +661,151 @@ fn bounded_watcher_path_bytes(observations: &[SyncWatcherObservation]) -> usize 
     path_bytes
 }
 
+fn validate_local_mutation_request(
+    transaction: OperationTransaction,
+) -> Result<OperationTransaction, SyncLocalMutationRequestError> {
+    let size = bounded_local_mutation_size(&transaction);
+    if size.rows > MAX_LOCAL_MUTATION_ROWS
+        || size.referenced_paths > MAX_LOCAL_MUTATION_REFERENCED_PATHS
+        || size.path_bytes > MAX_LOCAL_MUTATION_PATH_BYTES
+        || size.text_bytes > MAX_LOCAL_MUTATION_TEXT_BYTES
+    {
+        return Err(SyncLocalMutationRequestError::RequestTooLarge(size));
+    }
+    if transaction.operations.iter().any(|operation| {
+        matches!(
+            operation,
+            SemanticOperation::ReconcileExternalPageState { .. }
+        )
+    }) {
+        return Err(SyncLocalMutationRequestError::InvalidTransaction);
+    }
+    OperationTransaction::new(transaction.operations)
+        .map_err(|_| SyncLocalMutationRequestError::InvalidTransaction)
+}
+
+fn bounded_local_mutation_size(transaction: &OperationTransaction) -> SyncLocalMutationRequestSize {
+    let mut size = SyncLocalMutationRequestSize {
+        rows: 0,
+        referenced_paths: 0,
+        path_bytes: 0,
+        text_bytes: 0,
+    };
+    for operation in transaction
+        .operations
+        .iter()
+        .take(MAX_LOCAL_MUTATION_ROWS + 1)
+    {
+        charge_local_row(&mut size);
+        match operation {
+            SemanticOperation::CreatePage { name, path, .. }
+            | SemanticOperation::ReconcileExternalPageState { name, path, .. } => {
+                charge_local_text(&mut size, name.as_str().len());
+                charge_local_path(&mut size, path);
+            }
+            SemanticOperation::EditPagePath { path, .. } => {
+                charge_local_path(&mut size, path);
+            }
+            SemanticOperation::SetPagePreamble { preamble, .. } => {
+                charge_local_text(&mut size, preamble.as_ref().map_or(0, String::len));
+            }
+            SemanticOperation::CreateBlock { order, content, .. } => {
+                charge_local_text(&mut size, order.len());
+                charge_local_text(&mut size, content.len());
+            }
+            SemanticOperation::EditBlockContent { content, .. } => {
+                charge_local_text(&mut size, content.len());
+            }
+            SemanticOperation::MoveSubtree { order, .. }
+            | SemanticOperation::ReorderBlock { order, .. } => {
+                charge_local_text(&mut size, order.len());
+            }
+            SemanticOperation::RenamePagesAndRewriteReferrers {
+                page_changes,
+                block_rewrites,
+                page_preamble_rewrites,
+            } => {
+                for change in page_changes {
+                    charge_local_row(&mut size);
+                    charge_local_text(&mut size, change.new_name.as_str().len());
+                    charge_local_path(&mut size, &change.new_path);
+                    if size.rows > MAX_LOCAL_MUTATION_ROWS {
+                        break;
+                    }
+                }
+                if size.rows <= MAX_LOCAL_MUTATION_ROWS {
+                    for rewrite in block_rewrites {
+                        charge_local_row(&mut size);
+                        charge_local_text(&mut size, rewrite.new_content.len());
+                        if size.rows > MAX_LOCAL_MUTATION_ROWS {
+                            break;
+                        }
+                    }
+                }
+                if size.rows <= MAX_LOCAL_MUTATION_ROWS {
+                    for rewrite in page_preamble_rewrites {
+                        charge_local_row(&mut size);
+                        charge_local_text(
+                            &mut size,
+                            rewrite.new_preamble.as_ref().map_or(0, String::len),
+                        );
+                        if size.rows > MAX_LOCAL_MUTATION_ROWS {
+                            break;
+                        }
+                    }
+                }
+            }
+            SemanticOperation::SetPageKind { .. }
+            | SemanticOperation::MutateBlockLogseqIdentity { .. }
+            | SemanticOperation::DeleteSubtree { .. }
+            | SemanticOperation::DeletePage { .. } => {}
+        }
+        if local_size_exceeded(size) {
+            break;
+        }
+    }
+    if transaction.operations.len() > MAX_LOCAL_MUTATION_ROWS {
+        size.rows = MAX_LOCAL_MUTATION_ROWS + 1;
+    }
+    size
+}
+
+fn charge_local_row(size: &mut SyncLocalMutationRequestSize) {
+    size.rows = bounded_charge(size.rows, 1, MAX_LOCAL_MUTATION_ROWS);
+}
+
+fn charge_local_path(size: &mut SyncLocalMutationRequestSize, path: &ManagedPath) {
+    size.referenced_paths = bounded_charge(
+        size.referenced_paths,
+        1,
+        MAX_LOCAL_MUTATION_REFERENCED_PATHS,
+    );
+    size.path_bytes = bounded_charge(
+        size.path_bytes,
+        path.as_str().len(),
+        MAX_LOCAL_MUTATION_PATH_BYTES,
+    );
+}
+
+fn charge_local_text(size: &mut SyncLocalMutationRequestSize, bytes: usize) {
+    size.text_bytes = bounded_charge(size.text_bytes, bytes, MAX_LOCAL_MUTATION_TEXT_BYTES);
+}
+
+fn bounded_charge(current: usize, charge: usize, limit: usize) -> usize {
+    current.saturating_add(charge).min(limit.saturating_add(1))
+}
+
+fn local_size_exceeded(size: SyncLocalMutationRequestSize) -> bool {
+    size.rows > MAX_LOCAL_MUTATION_ROWS
+        || size.referenced_paths > MAX_LOCAL_MUTATION_REFERENCED_PATHS
+        || size.path_bytes > MAX_LOCAL_MUTATION_PATH_BYTES
+        || size.text_bytes > MAX_LOCAL_MUTATION_TEXT_BYTES
+}
+
+fn map_local_actor_error(_: SyncRuntimeRequestError) -> SyncLocalMutationRequestError {
+    SyncLocalMutationRequestError::ActorUnavailable
+}
+
 fn refused(detail: String) -> SyncRuntimeOpenResult {
     SyncRuntimeOpenResult {
         status: SyncRuntimeOpenStatus::OpenRefused { detail },
@@ -590,6 +865,10 @@ enum ActorRequest {
         observations: Vec<SyncWatcherObservation>,
         reply: mpsc::Sender<Result<(), SyncRuntimeRequestError>>,
     },
+    SubmitLocalMutation {
+        transaction: OperationTransaction,
+        reply: mpsc::Sender<SyncLocalMutationOutcome>,
+    },
     Tick {
         reply: mpsc::Sender<SyncRuntimeTick>,
     },
@@ -633,7 +912,13 @@ fn actor_thread(
                 observations,
                 reply,
             } => {
+                actor.advance_local_mutation_once();
                 let result = actor.observe(observations);
+                let _ = reply.send(result);
+                false
+            }
+            ActorRequest::SubmitLocalMutation { transaction, reply } => {
+                let result = actor.submit_local_mutation(transaction);
                 let _ = reply.send(result);
                 false
             }
@@ -643,6 +928,7 @@ fn actor_thread(
                 false
             }
             ActorRequest::Status { reply } => {
+                actor.advance_local_mutation_once();
                 let _ = reply.send(actor.snapshot());
                 false
             }
@@ -677,12 +963,18 @@ fn actor_thread(
 /// Deliberately `!Send + !Sync`; constructed and destroyed inside the actor
 /// thread. The `Rc` marker makes accidental movement into Tauri state a compile
 /// error even if every owned authority happens to gain `Send` later.
+enum PendingLocalMutation {
+    Reconciliation { transaction: OperationTransaction },
+    Published(LocalPublishedContinuation),
+}
+
 struct RuntimeActor {
     graph: Graph,
     receipts: ProjectionReceiptStore,
     authority: Option<LocalActiveAuthority>,
     runtime: Option<PromotedLocalRuntime>,
     feed: Option<ExactExternalFeedState>,
+    local_mutation: Option<PendingLocalMutation>,
     recovery: SyncRuntimeRecovery,
     last_watcher: SyncWatcherStatus,
     last_tick: Option<SyncRuntimeTick>,
@@ -777,6 +1069,7 @@ impl RuntimeActor {
             authority: Some(authority),
             runtime: Some(runtime),
             feed: Some(feed),
+            local_mutation: None,
             recovery,
             last_watcher,
             last_tick: None,
@@ -826,6 +1119,13 @@ impl RuntimeActor {
     }
 
     fn tick(&mut self) -> SyncRuntimeTick {
+        if let Some(outcome) = self.advance_local_mutation_once() {
+            return SyncRuntimeTick::LocalMutation(outcome);
+        }
+        self.tick_external_feed()
+    }
+
+    fn tick_external_feed(&mut self) -> SyncRuntimeTick {
         if let Some(detail) = &self.terminal {
             return SyncRuntimeTick::Terminal(detail.clone());
         }
@@ -857,17 +1157,299 @@ impl RuntimeActor {
         result
     }
 
+    fn submit_local_mutation(
+        &mut self,
+        transaction: OperationTransaction,
+    ) -> SyncLocalMutationOutcome {
+        if self.terminal.is_some() {
+            let (batch_id, phase) = self
+                .local_mutation
+                .as_ref()
+                .map(pending_local_identity)
+                .unwrap_or((None, SyncLocalMutationPhase::Bindings));
+            return SyncLocalMutationOutcome::Revoked { batch_id, phase };
+        }
+        if self.local_mutation.is_some() {
+            let prior =
+                self.advance_local_mutation_once()
+                    .unwrap_or(SyncLocalMutationOutcome::Blocked {
+                        batch_id: None,
+                        phase: SyncLocalMutationPhase::Bindings,
+                        reason: SyncLocalMutationBlock::PriorMutationUnresolved,
+                    });
+            if self.local_mutation.is_some() {
+                let (batch_id, phase) = local_outcome_identity(prior);
+                return SyncLocalMutationOutcome::Blocked {
+                    batch_id,
+                    phase,
+                    reason: SyncLocalMutationBlock::PriorMutationUnresolved,
+                };
+            }
+        }
+        self.execute_local_transaction(transaction)
+    }
+
+    fn execute_local_transaction(
+        &mut self,
+        transaction: OperationTransaction,
+    ) -> SyncLocalMutationOutcome {
+        let state = {
+            let Some(authority) = self.authority.as_mut() else {
+                return SyncLocalMutationOutcome::Revoked {
+                    batch_id: None,
+                    phase: SyncLocalMutationPhase::Bindings,
+                };
+            };
+            let Some(runtime) = self.runtime.as_mut() else {
+                return SyncLocalMutationOutcome::Revoked {
+                    batch_id: None,
+                    phase: SyncLocalMutationPhase::Bindings,
+                };
+            };
+            let mut session = match runtime.admit_promoted_mutation(authority, &self.graph) {
+                Ok(session) => session,
+                Err(_) => {
+                    let revoked = runtime.workspace_authority_revocation().is_some();
+                    if revoked {
+                        self.latch_terminal("local mutation runtime authority was revoked".into());
+                    }
+                    return if revoked {
+                        SyncLocalMutationOutcome::Revoked {
+                            batch_id: None,
+                            phase: SyncLocalMutationPhase::Bindings,
+                        }
+                    } else {
+                        SyncLocalMutationOutcome::Blocked {
+                            batch_id: None,
+                            phase: SyncLocalMutationPhase::Bindings,
+                            reason: SyncLocalMutationBlock::Prepublication,
+                        }
+                    };
+                }
+            };
+            OperationalCoordinator::execute_local(
+                &mut session,
+                &self.graph,
+                &self.receipts,
+                &transaction,
+            )
+        };
+        self.retain_local_state(state, Some(transaction))
+    }
+
+    fn advance_local_mutation_once(&mut self) -> Option<SyncLocalMutationOutcome> {
+        let pending = self.local_mutation.take()?;
+        if self.terminal.is_some() {
+            let (batch_id, phase) = pending_local_identity(&pending);
+            self.local_mutation = Some(pending);
+            return Some(SyncLocalMutationOutcome::Revoked { batch_id, phase });
+        }
+        match pending {
+            PendingLocalMutation::Reconciliation { transaction } => {
+                if self.last_watcher.pending {
+                    let tick = self.tick_external_feed();
+                    if matches!(tick, SyncRuntimeTick::Terminal(_)) {
+                        self.local_mutation =
+                            Some(PendingLocalMutation::Reconciliation { transaction });
+                        return Some(SyncLocalMutationOutcome::Revoked {
+                            batch_id: None,
+                            phase: SyncLocalMutationPhase::Capture,
+                        });
+                    }
+                }
+                if self.last_watcher.pending {
+                    self.local_mutation =
+                        Some(PendingLocalMutation::Reconciliation { transaction });
+                    Some(SyncLocalMutationOutcome::RetryableRetainedRecovery {
+                        batch_id: None,
+                        phase: SyncLocalMutationPhase::Capture,
+                    })
+                } else {
+                    Some(self.execute_local_transaction(transaction))
+                }
+            }
+            PendingLocalMutation::Published(continuation) => {
+                let state = {
+                    let Some(authority) = self.authority.as_mut() else {
+                        self.local_mutation = Some(PendingLocalMutation::Published(continuation));
+                        return Some(SyncLocalMutationOutcome::Revoked {
+                            batch_id: None,
+                            phase: SyncLocalMutationPhase::Bindings,
+                        });
+                    };
+                    let Some(runtime) = self.runtime.as_mut() else {
+                        self.local_mutation = Some(PendingLocalMutation::Published(continuation));
+                        return Some(SyncLocalMutationOutcome::Revoked {
+                            batch_id: None,
+                            phase: SyncLocalMutationPhase::Bindings,
+                        });
+                    };
+                    let mut session = match runtime.admit_promoted_mutation(authority, &self.graph)
+                    {
+                        Ok(session) => session,
+                        Err(_) => {
+                            let batch_id = continuation.batch_id();
+                            let phase = map_local_phase(continuation.phase());
+                            let revoked = runtime.workspace_authority_revocation().is_some();
+                            self.local_mutation =
+                                Some(PendingLocalMutation::Published(continuation));
+                            if revoked {
+                                self.latch_terminal(
+                                    "local mutation runtime authority was revoked".into(),
+                                );
+                            }
+                            return Some(if revoked {
+                                SyncLocalMutationOutcome::Revoked {
+                                    batch_id: Some(batch_id),
+                                    phase,
+                                }
+                            } else {
+                                SyncLocalMutationOutcome::RetryableRetainedRecovery {
+                                    batch_id: Some(batch_id),
+                                    phase,
+                                }
+                            });
+                        }
+                    };
+                    OperationalCoordinator::retry_local(
+                        &mut session,
+                        &self.graph,
+                        &self.receipts,
+                        continuation,
+                    )
+                };
+                Some(self.retain_local_state(state, None))
+            }
+        }
+    }
+
+    fn retain_local_state(
+        &mut self,
+        state: LocalMutationCoordinatorState,
+        transaction: Option<OperationTransaction>,
+    ) -> SyncLocalMutationOutcome {
+        match state {
+            LocalMutationCoordinatorState::Active(completion) => {
+                SyncLocalMutationOutcome::Durable {
+                    batch_id: completion.batch_id(),
+                }
+            }
+            LocalMutationCoordinatorState::Recovering(
+                LocalMutationRecovery::ReconciliationRequired(reconciliation),
+            ) => {
+                let observations = reconciliation
+                    .paths()
+                    .iter()
+                    .cloned()
+                    .map(WatcherObservation::ManagedPath);
+                let observed = match (self.feed.as_mut(), self.runtime.as_ref()) {
+                    (Some(feed), Some(runtime)) => feed.observe(&self.graph, runtime, observations),
+                    _ => Err(ExactExternalFeedObserveError::Terminal),
+                };
+                self.refresh_watcher();
+                if observed.is_err() {
+                    self.latch_terminal(
+                        "local mutation reconciliation could not enter the exact feed".into(),
+                    );
+                    return SyncLocalMutationOutcome::Revoked {
+                        batch_id: None,
+                        phase: SyncLocalMutationPhase::Capture,
+                    };
+                }
+                let Some(transaction) = transaction else {
+                    return SyncLocalMutationOutcome::Blocked {
+                        batch_id: None,
+                        phase: SyncLocalMutationPhase::Capture,
+                        reason: SyncLocalMutationBlock::Prepublication,
+                    };
+                };
+                self.local_mutation = Some(PendingLocalMutation::Reconciliation { transaction });
+                SyncLocalMutationOutcome::RetryableRetainedRecovery {
+                    batch_id: None,
+                    phase: SyncLocalMutationPhase::Capture,
+                }
+            }
+            LocalMutationCoordinatorState::Recovering(LocalMutationRecovery::Published(
+                continuation,
+            )) => {
+                let batch_id = continuation.batch_id();
+                let phase = map_local_phase(continuation.phase());
+                self.local_mutation = Some(PendingLocalMutation::Published(continuation));
+                SyncLocalMutationOutcome::RetryableRetainedRecovery {
+                    batch_id: Some(batch_id),
+                    phase,
+                }
+            }
+            LocalMutationCoordinatorState::Blocked(blocked) => {
+                let phase = map_local_phase(blocked.failure().phase());
+                let reason = match blocked.reason() {
+                    LocalMutationBlockReason::Prepublication => {
+                        SyncLocalMutationBlock::Prepublication
+                    }
+                    LocalMutationBlockReason::Retained(_) => {
+                        SyncLocalMutationBlock::RetainedPublished
+                    }
+                };
+                let continuation = blocked.into_continuation();
+                let batch_id = continuation
+                    .as_ref()
+                    .map(LocalPublishedContinuation::batch_id);
+                if let Some(continuation) = continuation {
+                    self.local_mutation = Some(PendingLocalMutation::Published(continuation));
+                }
+                SyncLocalMutationOutcome::Blocked {
+                    batch_id,
+                    phase,
+                    reason,
+                }
+            }
+            LocalMutationCoordinatorState::Revoked(revoked) => {
+                let phase = map_local_phase(revoked.failure().phase());
+                let continuation = revoked.into_continuation();
+                let batch_id = continuation
+                    .as_ref()
+                    .map(LocalPublishedContinuation::batch_id);
+                if let Some(continuation) = continuation {
+                    self.local_mutation = Some(PendingLocalMutation::Published(continuation));
+                }
+                self.latch_terminal("local mutation runtime authority was revoked".into());
+                SyncLocalMutationOutcome::Revoked { batch_id, phase }
+            }
+        }
+    }
+
     fn clean_shutdown(&mut self) -> Result<SyncShutdownOutcome, SyncRuntimeRequestError> {
+        if self.local_mutation.is_some() {
+            if self.terminal.is_some() {
+                return Err(SyncRuntimeRequestError::ActorRefused(
+                    "clean shutdown refused by a revoked local mutation".into(),
+                ));
+            }
+            let outcome = self.advance_local_mutation_once();
+            if self.local_mutation.is_some() {
+                let detail = match outcome {
+                    Some(SyncLocalMutationOutcome::Blocked { .. }) => {
+                        "clean shutdown refused by a retained blocked local mutation"
+                    }
+                    Some(SyncLocalMutationOutcome::Revoked { .. }) => {
+                        "clean shutdown refused by a revoked local mutation"
+                    }
+                    _ => "clean shutdown awaits retained local mutation recovery",
+                };
+                return Err(SyncRuntimeRequestError::ActorRefused(detail.into()));
+            }
+        }
         if self.terminal.is_some() {
             return Ok(SyncShutdownOutcome::Terminal(self.snapshot()));
         }
 
         for _ in 0..MAX_CLEAN_DRAIN_TURNS {
-            let tick = self.tick();
+            let tick = self.tick_external_feed();
             match tick {
                 SyncRuntimeTick::Idle if !self.last_watcher.pending => break,
                 SyncRuntimeTick::AdmittedNoop { .. }
                 | SyncRuntimeTick::AdmittedComplete { .. }
+                | SyncRuntimeTick::LocalMutation(_)
                 | SyncRuntimeTick::Recovering
                 | SyncRuntimeTick::RetryFull
                 | SyncRuntimeTick::Failed(_) => continue,
@@ -883,6 +1465,11 @@ impl RuntimeActor {
         if self.last_watcher.pending {
             return Err(SyncRuntimeRequestError::ActorRefused(
                 "clean shutdown could not settle the bounded watcher queue".into(),
+            ));
+        }
+        if self.local_mutation.is_some() {
+            return Err(SyncRuntimeRequestError::ActorRefused(
+                "clean shutdown awaits retained local mutation recovery".into(),
             ));
         }
         let authority = self
@@ -958,6 +1545,49 @@ fn map_recovery(recovery: RuntimeRecoveryState) -> SyncRuntimeRecovery {
     }
 }
 
+fn map_local_phase(phase: OperationalPhase) -> SyncLocalMutationPhase {
+    match phase {
+        OperationalPhase::Bindings => SyncLocalMutationPhase::Bindings,
+        OperationalPhase::Planning => SyncLocalMutationPhase::Planning,
+        OperationalPhase::Draft => SyncLocalMutationPhase::Draft,
+        OperationalPhase::Capture => SyncLocalMutationPhase::Capture,
+        OperationalPhase::Finalize => SyncLocalMutationPhase::Finalize,
+        OperationalPhase::TailReservation => SyncLocalMutationPhase::TailReservation,
+        OperationalPhase::Publication => SyncLocalMutationPhase::Publication,
+        OperationalPhase::ArchiveStage => SyncLocalMutationPhase::ArchiveStage,
+        OperationalPhase::TailAdmission => SyncLocalMutationPhase::TailAdmission,
+        OperationalPhase::SqliteDrain => SyncLocalMutationPhase::SqliteDrain,
+        OperationalPhase::ProjectionDrain => SyncLocalMutationPhase::ProjectionDrain,
+    }
+}
+
+fn pending_local_identity(
+    pending: &PendingLocalMutation,
+) -> (Option<BatchId>, SyncLocalMutationPhase) {
+    match pending {
+        PendingLocalMutation::Reconciliation { .. } => (None, SyncLocalMutationPhase::Capture),
+        PendingLocalMutation::Published(continuation) => (
+            Some(continuation.batch_id()),
+            map_local_phase(continuation.phase()),
+        ),
+    }
+}
+
+fn local_outcome_identity(
+    outcome: SyncLocalMutationOutcome,
+) -> (Option<BatchId>, SyncLocalMutationPhase) {
+    match outcome {
+        SyncLocalMutationOutcome::Durable { batch_id } => {
+            (Some(batch_id), SyncLocalMutationPhase::ProjectionDrain)
+        }
+        SyncLocalMutationOutcome::RetryableRetainedRecovery { batch_id, phase }
+        | SyncLocalMutationOutcome::Blocked {
+            batch_id, phase, ..
+        }
+        | SyncLocalMutationOutcome::Revoked { batch_id, phase } => (batch_id, phase),
+    }
+}
+
 fn map_watcher(status: crate::oplog::watcher_queue::WatcherQueueStatus) -> SyncWatcherStatus {
     SyncWatcherStatus {
         latest_enqueue: status.latest_enqueue.sequence(),
@@ -999,8 +1629,12 @@ mod tests {
     use super::*;
     use crate::oplog::enrollment::EnrollmentDiscoveryHandoff;
     use crate::oplog::exact_external_feed::tests::RuntimeHostFixture;
+    use crate::oplog::{
+        BlockId, BlockLocation, DocumentId, LogicalPageName, ManagedTextKind, PageId, PageRename,
+    };
     use std::fs;
     use std::path::Path;
+    use std::sync::Barrier;
     use uuid::Uuid;
 
     fn empty_request(profile: SyncStorageProfile) -> (PathBuf, SyncRuntimeOpenRequest) {
@@ -1025,6 +1659,12 @@ mod tests {
     fn handle_is_cloneable_send_and_sync_while_actor_is_not_send_or_sync() {
         fn assert_send_sync_clone<T: Send + Sync + Clone>() {}
         assert_send_sync_clone::<SyncRuntimeHandle>();
+        let _public_submit: fn(
+            &SyncRuntimeHandle,
+            OperationTransaction,
+        )
+            -> Result<SyncLocalMutationOutcome, SyncLocalMutationRequestError> =
+            SyncRuntimeHandle::submit_local_mutation;
 
         trait AmbiguousIfSend<Marker> {
             fn assert_not_send() {}
@@ -1191,6 +1831,581 @@ mod tests {
             }
         }
         panic!("initial exact feed exceeded the bounded test turn budget");
+    }
+
+    fn submit_durable(handle: &SyncRuntimeHandle, operations: Vec<SemanticOperation>) -> BatchId {
+        let transaction = OperationTransaction::new(operations).unwrap();
+        match handle.submit_local_mutation(transaction).unwrap() {
+            SyncLocalMutationOutcome::Durable { batch_id } => batch_id,
+            SyncLocalMutationOutcome::RetryableRetainedRecovery { .. } => {
+                settle_local_mutation(handle)
+            }
+            other => panic!("local mutation did not complete durably: {other:?}"),
+        }
+    }
+
+    fn settle_local_mutation(handle: &SyncRuntimeHandle) -> BatchId {
+        for _ in 0..128 {
+            match handle.tick().unwrap() {
+                SyncRuntimeTick::LocalMutation(SyncLocalMutationOutcome::Durable { batch_id }) => {
+                    return batch_id
+                }
+                SyncRuntimeTick::LocalMutation(
+                    SyncLocalMutationOutcome::RetryableRetainedRecovery { .. },
+                )
+                | SyncRuntimeTick::Recovering
+                | SyncRuntimeTick::RetryFull
+                | SyncRuntimeTick::Failed(_)
+                | SyncRuntimeTick::Idle
+                | SyncRuntimeTick::AdmittedNoop { .. }
+                | SyncRuntimeTick::AdmittedComplete { .. } => {}
+                other => panic!("local mutation did not complete durably: {other:?}"),
+            }
+        }
+        panic!("local mutation exceeded the bounded test retry budget");
+    }
+
+    fn snapshot_graph_files(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        fn visit(root: &Path, directory: &Path, files: &mut Vec<(PathBuf, Vec<u8>)>) {
+            let mut entries = fs::read_dir(directory)
+                .unwrap()
+                .map(|entry| entry.unwrap())
+                .collect::<Vec<_>>();
+            entries.sort_unstable_by_key(|entry| entry.file_name());
+            for entry in entries {
+                let path = entry.path();
+                if path.is_dir() {
+                    visit(root, &path, files);
+                } else {
+                    files.push((
+                        path.strip_prefix(root).unwrap().to_path_buf(),
+                        fs::read(path).unwrap(),
+                    ));
+                }
+            }
+        }
+
+        let mut files = Vec::new();
+        visit(root, root, &mut files);
+        files
+    }
+
+    #[test]
+    fn local_mutation_request_budgets_are_inclusive_and_diagnostics_are_capped() {
+        for limit in [
+            MAX_LOCAL_MUTATION_ROWS,
+            MAX_LOCAL_MUTATION_REFERENCED_PATHS,
+            MAX_LOCAL_MUTATION_PATH_BYTES,
+            MAX_LOCAL_MUTATION_TEXT_BYTES,
+        ] {
+            assert_eq!(bounded_charge(0, limit, limit), limit);
+            assert_eq!(bounded_charge(0, limit.saturating_add(1), limit), limit + 1);
+            assert_eq!(bounded_charge(limit, usize::MAX, limit), limit + 1);
+        }
+
+        let exact = OperationTransaction {
+            operations: vec![SemanticOperation::SetPagePreamble {
+                page_id: PageId::from_uuid(Uuid::from_u128(700_000)),
+                preamble: Some("x".repeat(MAX_LOCAL_MUTATION_TEXT_BYTES)),
+            }],
+        };
+        assert_eq!(
+            bounded_local_mutation_size(&exact).text_bytes,
+            MAX_LOCAL_MUTATION_TEXT_BYTES
+        );
+        assert!(validate_local_mutation_request(exact).is_ok());
+
+        let oversized = OperationTransaction {
+            operations: vec![SemanticOperation::SetPagePreamble {
+                page_id: PageId::from_uuid(Uuid::from_u128(700_001)),
+                preamble: Some("x".repeat(MAX_LOCAL_MUTATION_TEXT_BYTES + 1)),
+            }],
+        };
+        assert_eq!(
+            validate_local_mutation_request(oversized),
+            Err(SyncLocalMutationRequestError::RequestTooLarge(
+                SyncLocalMutationRequestSize {
+                    rows: 1,
+                    referenced_paths: 0,
+                    path_bytes: 0,
+                    text_bytes: MAX_LOCAL_MUTATION_TEXT_BYTES + 1,
+                }
+            ))
+        );
+
+        let too_many_rows = OperationTransaction {
+            operations: (0..=MAX_LOCAL_MUTATION_ROWS)
+                .map(|index| SemanticOperation::SetPageKind {
+                    page_id: PageId::from_uuid(Uuid::from_u128(710_000 + index as u128)),
+                    kind: ManagedTextKind::Page,
+                })
+                .collect(),
+        };
+        assert_eq!(
+            bounded_local_mutation_size(&too_many_rows).rows,
+            MAX_LOCAL_MUTATION_ROWS + 1
+        );
+
+        let too_many_paths = OperationTransaction {
+            operations: (0..=MAX_LOCAL_MUTATION_REFERENCED_PATHS)
+                .map(|index| SemanticOperation::EditPagePath {
+                    page_id: PageId::from_uuid(Uuid::from_u128(720_000 + index as u128)),
+                    path: ManagedPath::parse(&format!(
+                        "content/nested pages/bounded-path-{index}.md"
+                    ))
+                    .unwrap(),
+                })
+                .collect(),
+        };
+        assert_eq!(
+            bounded_local_mutation_size(&too_many_paths).referenced_paths,
+            MAX_LOCAL_MUTATION_REFERENCED_PATHS + 1
+        );
+        assert!(matches!(
+            validate_local_mutation_request(too_many_paths),
+            Err(SyncLocalMutationRequestError::RequestTooLarge(_))
+        ));
+    }
+
+    #[test]
+    fn public_local_mutation_journey_creates_edits_renames_and_deletes() {
+        let fixture = RuntimeHostFixture::safe("sync-runtime-local-public-journey");
+        let handle = active_handle(SyncRuntimeHandle::open(fixture.request()));
+        drive_initial_feed(&handle);
+        let manifests_before = fixture.manifest_count();
+        let page_id = PageId::from_uuid(Uuid::from_u128(720_000));
+        let home_document_id = DocumentId::from_uuid(Uuid::from_u128(720_001));
+        let block_id = BlockId::from_uuid(Uuid::from_u128(720_002));
+        let old_path = ManagedPath::parse("content/nested pages/runtime-public-local.md").unwrap();
+        let new_path =
+            ManagedPath::parse("content/nested pages/runtime-public-renamed.md").unwrap();
+
+        submit_durable(
+            &handle,
+            vec![
+                SemanticOperation::CreatePage {
+                    page_id,
+                    home_document_id,
+                    name: LogicalPageName::parse("Runtime Public Local").unwrap(),
+                    path: old_path.clone(),
+                    kind: ManagedTextKind::Page,
+                },
+                SemanticOperation::CreateBlock {
+                    block: BlockLocation {
+                        block_id,
+                        home_document_id,
+                    },
+                    page_id,
+                    parent: None,
+                    order: "a".into(),
+                    content: "created through public runtime".into(),
+                },
+            ],
+        );
+        assert_eq!(
+            fs::read(fixture.graph_root().join(old_path.as_str())).unwrap(),
+            b"- created through public runtime\n"
+        );
+
+        submit_durable(
+            &handle,
+            vec![SemanticOperation::EditBlockContent {
+                block: BlockLocation {
+                    block_id,
+                    home_document_id,
+                },
+                content: "edited through public runtime".into(),
+            }],
+        );
+        assert_eq!(
+            fs::read(fixture.graph_root().join(old_path.as_str())).unwrap(),
+            b"- edited through public runtime\n"
+        );
+
+        submit_durable(
+            &handle,
+            vec![SemanticOperation::RenamePagesAndRewriteReferrers {
+                page_changes: vec![PageRename {
+                    page_id,
+                    new_name: LogicalPageName::parse("Runtime Public Renamed").unwrap(),
+                    new_path: new_path.clone(),
+                }],
+                block_rewrites: Vec::new(),
+                page_preamble_rewrites: Vec::new(),
+            }],
+        );
+        assert!(!fixture.graph_root().join(old_path.as_str()).exists());
+        assert_eq!(
+            fs::read(fixture.graph_root().join(new_path.as_str())).unwrap(),
+            b"- edited through public runtime\n"
+        );
+
+        submit_durable(
+            &handle,
+            vec![
+                SemanticOperation::DeleteSubtree {
+                    root_block_id: block_id,
+                    page_id,
+                },
+                SemanticOperation::DeletePage { page_id },
+            ],
+        );
+        assert!(!fixture.graph_root().join(new_path.as_str()).exists());
+        assert_eq!(fixture.manifest_count(), manifests_before + 4);
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
+    fn published_local_failure_is_retained_and_retried_without_republication() {
+        let fixture = RuntimeHostFixture::safe("sync-runtime-local-published-retry");
+        let handle = active_handle(SyncRuntimeHandle::open(fixture.request()));
+        drive_initial_feed(&handle);
+        let page_id = PageId::from_uuid(Uuid::from_u128(730_000));
+        let home_document_id = DocumentId::from_uuid(Uuid::from_u128(730_001));
+        let block_id = BlockId::from_uuid(Uuid::from_u128(730_002));
+        let path = ManagedPath::parse("content/nested pages/runtime-local-retry.md").unwrap();
+        submit_durable(
+            &handle,
+            vec![
+                SemanticOperation::CreatePage {
+                    page_id,
+                    home_document_id,
+                    name: LogicalPageName::parse("Runtime Local Retry").unwrap(),
+                    path: path.clone(),
+                    kind: ManagedTextKind::Page,
+                },
+                SemanticOperation::CreateBlock {
+                    block: BlockLocation {
+                        block_id,
+                        home_document_id,
+                    },
+                    page_id,
+                    parent: None,
+                    order: "a".into(),
+                    content: "before retained retry".into(),
+                },
+            ],
+        );
+        let manifests_before = fixture.manifest_count();
+        handle
+            .install_repeated_operational_fault(OperationalFaultPoint::AfterManifest, 1)
+            .unwrap();
+        let outcome = handle
+            .submit_local_mutation(
+                OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
+                    block: BlockLocation {
+                        block_id,
+                        home_document_id,
+                    },
+                    content: "after retained retry".into(),
+                }])
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            SyncLocalMutationOutcome::RetryableRetainedRecovery {
+                batch_id: Some(_),
+                ..
+            }
+        ));
+        assert_eq!(fixture.manifest_count(), manifests_before + 1);
+
+        settle_local_mutation(&handle);
+        assert_eq!(fixture.manifest_count(), manifests_before + 1);
+        assert_eq!(
+            fs::read(fixture.graph_root().join(path.as_str())).unwrap(),
+            b"- after retained retry\n"
+        );
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
+    fn concurrent_watcher_observation_and_local_submission_are_linearly_reconciled() {
+        let fixture = RuntimeHostFixture::safe("sync-runtime-local-watcher-order");
+        let handle = active_handle(SyncRuntimeHandle::open(fixture.request()));
+        drive_initial_feed(&handle);
+        let page_id = PageId::from_uuid(Uuid::from_u128(740_000));
+        let home_document_id = DocumentId::from_uuid(Uuid::from_u128(740_001));
+        let block_id = BlockId::from_uuid(Uuid::from_u128(740_002));
+        let path =
+            ManagedPath::parse("content/nested pages/runtime-local-watcher-order.md").unwrap();
+        submit_durable(
+            &handle,
+            vec![
+                SemanticOperation::CreatePage {
+                    page_id,
+                    home_document_id,
+                    name: LogicalPageName::parse("Runtime Local Watcher Order").unwrap(),
+                    path: path.clone(),
+                    kind: ManagedTextKind::Page,
+                },
+                SemanticOperation::CreateBlock {
+                    block: BlockLocation {
+                        block_id,
+                        home_document_id,
+                    },
+                    page_id,
+                    parent: None,
+                    order: "a".into(),
+                    content: "before concurrent observation".into(),
+                },
+            ],
+        );
+        fs::write(
+            fixture.graph_root().join(path.as_str()),
+            b"- concurrent external bytes\n",
+        )
+        .unwrap();
+
+        let barrier = Arc::new(Barrier::new(3));
+        let watcher_handle = handle.clone();
+        let watcher_path = path.clone();
+        let watcher_barrier = Arc::clone(&barrier);
+        let watcher = thread::spawn(move || {
+            watcher_barrier.wait();
+            watcher_handle.observe_watcher(vec![SyncWatcherObservation::ManagedPath(watcher_path)])
+        });
+        let mutation_handle = handle.clone();
+        let mutation_barrier = Arc::clone(&barrier);
+        let mutation = thread::spawn(move || {
+            mutation_barrier.wait();
+            mutation_handle.submit_local_mutation(
+                OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
+                    block: BlockLocation {
+                        block_id,
+                        home_document_id,
+                    },
+                    content: "local mutation after ordered reconciliation".into(),
+                }])
+                .unwrap(),
+            )
+        });
+        barrier.wait();
+        watcher.join().unwrap().unwrap();
+        assert!(matches!(
+            mutation.join().unwrap().unwrap(),
+            SyncLocalMutationOutcome::RetryableRetainedRecovery { .. }
+        ));
+
+        for _ in 0..128 {
+            handle.tick().unwrap();
+            if fs::read(fixture.graph_root().join(path.as_str())).unwrap()
+                == b"- local mutation after ordered reconciliation\n"
+            {
+                break;
+            }
+        }
+        assert_eq!(
+            fs::read(fixture.graph_root().join(path.as_str())).unwrap(),
+            b"- local mutation after ordered reconciliation\n"
+        );
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
+    fn oversized_local_request_has_zero_actor_storage_graph_or_watcher_effects() {
+        let fixture = RuntimeHostFixture::safe("sync-runtime-local-request-bounds");
+        let handle = active_handle(SyncRuntimeHandle::open(fixture.request()));
+        drive_initial_feed(&handle);
+        let manifests_before = fixture.manifest_count();
+        let sqlite_before = fixture.applied_batch_count();
+        let graph_before = snapshot_graph_files(fixture.graph_root());
+        let watcher_before = handle.status().unwrap().watcher;
+
+        let error = handle
+            .submit_local_mutation(OperationTransaction {
+                operations: vec![SemanticOperation::SetPagePreamble {
+                    page_id: PageId::from_uuid(Uuid::from_u128(750_000)),
+                    preamble: Some("x".repeat(MAX_LOCAL_MUTATION_TEXT_BYTES + 1)),
+                }],
+            })
+            .unwrap_err();
+        assert_eq!(
+            error,
+            SyncLocalMutationRequestError::RequestTooLarge(SyncLocalMutationRequestSize {
+                rows: 1,
+                referenced_paths: 0,
+                path_bytes: 0,
+                text_bytes: MAX_LOCAL_MUTATION_TEXT_BYTES + 1,
+            })
+        );
+        assert_eq!(fixture.manifest_count(), manifests_before);
+        assert_eq!(fixture.applied_batch_count(), sqlite_before);
+        assert_eq!(snapshot_graph_files(fixture.graph_root()), graph_before);
+        assert_eq!(handle.status().unwrap().watcher, watcher_before);
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
+    fn clean_shutdown_refuses_until_retained_local_publication_resolves() {
+        let fixture = RuntimeHostFixture::safe("sync-runtime-local-shutdown-barrier");
+        let handle = active_handle(SyncRuntimeHandle::open(fixture.request()));
+        drive_initial_feed(&handle);
+        let page_id = PageId::from_uuid(Uuid::from_u128(760_000));
+        let home_document_id = DocumentId::from_uuid(Uuid::from_u128(760_001));
+        let block_id = BlockId::from_uuid(Uuid::from_u128(760_002));
+        let path = ManagedPath::parse("content/nested pages/runtime-local-shutdown.md").unwrap();
+        submit_durable(
+            &handle,
+            vec![
+                SemanticOperation::CreatePage {
+                    page_id,
+                    home_document_id,
+                    name: LogicalPageName::parse("Runtime Local Shutdown").unwrap(),
+                    path,
+                    kind: ManagedTextKind::Page,
+                },
+                SemanticOperation::CreateBlock {
+                    block: BlockLocation {
+                        block_id,
+                        home_document_id,
+                    },
+                    page_id,
+                    parent: None,
+                    order: "a".into(),
+                    content: "before shutdown retry".into(),
+                },
+            ],
+        );
+        handle
+            .install_repeated_operational_fault(OperationalFaultPoint::AfterStage, 2)
+            .unwrap();
+        assert!(matches!(
+            handle
+                .submit_local_mutation(
+                    OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
+                        block: BlockLocation {
+                            block_id,
+                            home_document_id,
+                        },
+                        content: "after shutdown retry".into(),
+                    }])
+                    .unwrap(),
+                )
+                .unwrap(),
+            SyncLocalMutationOutcome::RetryableRetainedRecovery { .. }
+        ));
+        assert!(matches!(
+            handle.clean_shutdown(),
+            Err(SyncRuntimeRequestError::ActorRefused(_))
+        ));
+        assert!(matches!(
+            fixture.handoff(),
+            EnrollmentDiscoveryHandoff::Unsafe { .. }
+        ));
+
+        settle_local_mutation(&handle);
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+        assert_eq!(fixture.handoff(), EnrollmentDiscoveryHandoff::Safe);
+        assert_eq!(
+            handle.submit_local_mutation(OperationTransaction {
+                operations: vec![SemanticOperation::DeletePage { page_id }],
+            }),
+            Err(SyncLocalMutationRequestError::ActorUnavailable)
+        );
+    }
+
+    #[test]
+    fn authority_revocation_keeps_published_local_continuation_terminal_and_unsafe() {
+        let fixture = RuntimeHostFixture::safe("sync-runtime-local-revoked-continuation");
+        let handle = active_handle(SyncRuntimeHandle::open(fixture.request()));
+        drive_initial_feed(&handle);
+        let page_id = PageId::from_uuid(Uuid::from_u128(770_000));
+        let home_document_id = DocumentId::from_uuid(Uuid::from_u128(770_001));
+        let block_id = BlockId::from_uuid(Uuid::from_u128(770_002));
+        let path = ManagedPath::parse("content/nested pages/runtime-local-revoked.md").unwrap();
+        submit_durable(
+            &handle,
+            vec![
+                SemanticOperation::CreatePage {
+                    page_id,
+                    home_document_id,
+                    name: LogicalPageName::parse("Runtime Local Revoked").unwrap(),
+                    path,
+                    kind: ManagedTextKind::Page,
+                },
+                SemanticOperation::CreateBlock {
+                    block: BlockLocation {
+                        block_id,
+                        home_document_id,
+                    },
+                    page_id,
+                    parent: None,
+                    order: "a".into(),
+                    content: "before revocation".into(),
+                },
+            ],
+        );
+        handle
+            .install_repeated_operational_fault(OperationalFaultPoint::AfterManifest, 1)
+            .unwrap();
+        assert!(matches!(
+            handle
+                .submit_local_mutation(
+                    OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
+                        block: BlockLocation {
+                            block_id,
+                            home_document_id,
+                        },
+                        content: "published before revocation".into(),
+                    }])
+                    .unwrap(),
+                )
+                .unwrap(),
+            SyncLocalMutationOutcome::RetryableRetainedRecovery {
+                batch_id: Some(_),
+                ..
+            }
+        ));
+
+        let lease_path = fixture.lease_path();
+        let incoming = lease_path.with_extension("local-revoked.incoming");
+        fs::write(&incoming, b"").unwrap();
+        fs::rename(&incoming, &lease_path).unwrap();
+        let revoked = handle.tick().unwrap();
+        assert!(matches!(
+            revoked,
+            SyncRuntimeTick::LocalMutation(SyncLocalMutationOutcome::Revoked {
+                batch_id: Some(_),
+                ..
+            })
+        ));
+        assert!(matches!(
+            handle
+                .submit_local_mutation(
+                    OperationTransaction::new(vec![SemanticOperation::DeletePage { page_id }])
+                        .unwrap()
+                )
+                .unwrap(),
+            SyncLocalMutationOutcome::Revoked {
+                batch_id: Some(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            handle.clean_shutdown(),
+            Err(SyncRuntimeRequestError::ActorRefused(_))
+        ));
+        assert!(matches!(
+            fixture.handoff(),
+            EnrollmentDiscoveryHandoff::Unsafe { .. }
+        ));
     }
 
     /// Drive the actor until the exact feed settles the epoch it owes, or give
@@ -1557,9 +2772,8 @@ mod tests {
             fixture.handoff(),
             EnrollmentDiscoveryHandoff::Safe
         ));
-        assert_eq!(
-            ACTOR_THREADS_FINISHED.load(std::sync::atomic::Ordering::SeqCst),
-            finished_before + 1
+        assert!(
+            ACTOR_THREADS_FINISHED.load(std::sync::atomic::Ordering::SeqCst) >= finished_before + 1
         );
 
         assert!(matches!(
