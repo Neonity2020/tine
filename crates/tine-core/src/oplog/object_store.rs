@@ -38,7 +38,9 @@ use uuid::Uuid;
 
 use super::identity::parse_digest;
 use super::resume_point::{
-    ResumePointError, ResumePointSet, RuntimeResumePointV1, RESUME_POINT_DIR,
+    clear_resume_points_in, next_resume_sequence, prune_resume_points_below, ResumePointError,
+    ResumePointMaintenance, ResumePointScan, ResumePointSet, RuntimeResumePointV1,
+    MAX_RETAINED_RESUME_POINTS, RESUME_POINT_DIR,
 };
 use super::simulator::SimulatorBootstrapFixtureIngress;
 use super::{
@@ -4318,19 +4320,16 @@ impl DurableEngineHistoryStore {
         Ok(())
     }
 
-    /// Read the complete validated resume-point set of this endpoint.
+    /// Survey this endpoint's resume-point directory and authenticate every
+    /// point it recognized.
     ///
-    /// Fails closed on any residue and never returns a partial view: an `Err`
-    /// here proves nothing about reachability, so the caller must preserve
-    /// every candidate retained run. An absent directory is the ordinary
-    /// "never published" shape and is not an error.
-    pub(crate) fn read_resume_point_set(&self) -> Result<ResumePointSet, StoreError> {
-        let Some(directory) = open_existing_dir_nofollow(&self.control, RESUME_POINT_DIR)? else {
-            return Ok(ResumePointSet::empty());
-        };
-        let set = ResumePointSet::read(&directory)?;
-        if set.points().is_empty() {
-            return Ok(set);
+    /// This is the shared substrate of the strict proof and of publication.
+    /// Unrecognizable residue is *carried*, not raised: the caller decides
+    /// whether its own operation may proceed beside it.
+    fn scan_resume_points(&self) -> Result<ResumePointScan, StoreError> {
+        let scan = ResumePointScan::survey(&self.control)?;
+        if scan.points().is_empty() {
+            return Ok(scan);
         }
         // A published point without a promoted state is residue, not evidence:
         // there is nothing that could have authorized it.
@@ -4340,19 +4339,45 @@ impl DurableEngineHistoryStore {
                     "a runtime resume point exists without a promoted runtime state",
                 ))?;
         let promoted_state_digest = promoted.state_digest()?;
-        for point in set.points() {
+        for point in scan.points() {
             self.require_resume_point_binding(point, promoted_state_digest)?;
         }
-        Ok(set)
+        Ok(scan)
     }
 
-    /// Publish one resume point, then prune every lower sequence.
+    /// Read the complete validated resume-point set of this endpoint.
     ///
-    /// Ordering is strictly publish-then-delete: the successor is durable
-    /// before its predecessor is removed, so there is never a durable cut at
-    /// which zero valid resume points exist while a retained run holds the only
-    /// resumable bytes. A crash between the two leaves exactly two points, and
-    /// the next publication (or a startup prune) converges.
+    /// This is the strict adoption/reclamation proof. It fails closed on any
+    /// residue and on a point surplus, and never returns a partial view: an
+    /// `Err` here proves nothing about reachability, so the caller must
+    /// preserve every candidate retained run. An absent directory is the
+    /// ordinary "never published" shape and is not an error.
+    pub(crate) fn read_resume_point_set(&self) -> Result<ResumePointSet, StoreError> {
+        Ok(self.scan_resume_points()?.into_set()?)
+    }
+
+    /// Publish one resume point, keeping the durable set bounded at every cut.
+    ///
+    /// The ordering rule is that **no cut may have zero valid points while a
+    /// retained run holds the only resumable bytes**, and the shape that
+    /// satisfies it is a bounded three-step sequence:
+    ///
+    /// 1. if the recognized set has already reached
+    ///    [`MAX_RETAINED_RESUME_POINTS`], durably prune every recognized point
+    ///    *below the current latest*. A crash here still leaves that latest
+    ///    point, which is durable, valid, and already the newest evidence, so
+    ///    nothing that was resumable stops being resumable;
+    /// 2. publish the successor. This is the commit point;
+    /// 3. prune every recognized point below the successor.
+    ///
+    /// Step 1 is what makes the bound self-restoring instead of a trap. Without
+    /// it, one crash between steps 2 and 3 left `{n, n+1}` on disk, and the
+    /// next honest publication — which after a crash takeover is a *different*
+    /// session at a *later* enrollment generation, so it can never be a
+    /// byte-identical retry of `n+1` — committed a third point and then failed
+    /// its own prune, permanently bricking read, publish and clear. With it,
+    /// the widest durable cut is two points and any pre-existing surplus
+    /// converges on the next publication.
     ///
     /// The publication is immutable-exact, so repeating the call with
     /// byte-identical bytes resumes and re-runs the prune, while divergent
@@ -4393,9 +4418,17 @@ impl DurableEngineHistoryStore {
         }
 
         let bytes = point.encode()?;
-        let existing = self.read_resume_point_set()?;
-        let next = existing.next_sequence()?;
-        let latest = existing.latest().map(|latest| latest.resume_sequence);
+        // Publication is bound-tolerant but poison-intolerant. A surplus of
+        // recognized points is a state this call converges; an unrecognizable
+        // entry means the directory is not fully understood, and publishing
+        // beside it could mistake a provider conflict copy for authority, so it
+        // fails closed to a full replay. Maintenance stays available either
+        // way, so failing closed here can never make clearing impossible.
+        let scan = self.scan_resume_points()?;
+        scan.require_recognizable()?;
+        let recognized = scan.points();
+        let next = next_resume_sequence(recognized)?;
+        let latest = recognized.last().map(|latest| latest.resume_sequence);
         // Either the next fresh sequence, or a retry of the last publication
         // whose byte identity `publish_immutable_exact` then proves.
         if point.resume_sequence != next && Some(point.resume_sequence) != latest {
@@ -4407,6 +4440,12 @@ impl DurableEngineHistoryStore {
 
         ensure_directory_nofollow(&self.control, RESUME_POINT_DIR)?;
         let directory = open_dir_nofollow(&self.control, RESUME_POINT_DIR)?;
+        // ---- Step 1: make room, without ever dropping the latest point. ----
+        if recognized.len() >= MAX_RETAINED_RESUME_POINTS {
+            if let Some(latest) = latest {
+                prune_resume_points_below(&directory, latest)?;
+            }
+        }
         publish_immutable_exact(
             &directory,
             &point.file_name(),
@@ -4414,28 +4453,38 @@ impl DurableEngineHistoryStore {
             "runtime resume point",
         )?;
         // ---- COMMIT POINT: the new resume point is durable. ----
-        ResumePointSet::prune_below(&directory, point.resume_sequence)?;
+        prune_resume_points_below(&directory, point.resume_sequence)?;
         Ok(())
     }
 
-    /// Remove every published resume point of this endpoint.
+    /// Remove every recognized resume point of this endpoint.
     ///
-    /// This is the `Unsafe -> Safe` drain step: afterwards no retained scratch
-    /// run is reachable, which is precisely what lets a later reclamation pass
-    /// prove one collectable. It is ordered before the handoff record moves to
-    /// `Safe` on purpose — a crash in between leaves `Unsafe` with no resume
-    /// point, which is the conservative full-replay state, whereas the reverse
-    /// order would leave a `Safe` record pointing at a stale run.
-    pub(crate) fn clear_resume_points(&self) -> Result<usize, StoreError> {
+    /// This is the `Unsafe -> Safe` drain step: afterwards no recognized point
+    /// names a retained scratch run. It is ordered before the handoff record
+    /// moves to `Safe` on purpose — a crash in between leaves `Unsafe` with no
+    /// resume point, which is the conservative full-replay state, whereas the
+    /// reverse order would leave a `Safe` record pointing at a stale run.
+    ///
+    /// It is deliberately **conservative rather than strict**. A `.DS_Store`, a
+    /// Syncthing conflict copy, a Dropbox duplicate, an editor backup or a torn
+    /// point must not be deleted as if it were authoritative — but it must also
+    /// not make the drain permanently impossible, which would pin the endpoint
+    /// at `HandoffUnsafe` forever and visibly block handing the graph back to
+    /// OG Logseq. So this removes what it fully recognized, preserves every
+    /// other byte, and reports the residue in
+    /// [`ResumePointMaintenance::preserved`]. While that residue exists no
+    /// [`ResumePointSet`] can be minted, so no retained run is reclaimed: the
+    /// run leaks, which is the correct trade.
+    pub(crate) fn clear_resume_points(&self) -> Result<ResumePointMaintenance, StoreError> {
         let _guard = self
             .transition
             .lock()
             .map_err(|_| StoreError::MalformedHistoryIndex)?;
         let _workspace_guard = AdvisoryTransitionGuard::lock(&self.transition_lock)?;
         let Some(directory) = open_existing_dir_nofollow(&self.control, RESUME_POINT_DIR)? else {
-            return Ok(0);
+            return Ok(ResumePointMaintenance::default());
         };
-        Ok(ResumePointSet::clear(&directory)?)
+        Ok(clear_resume_points_in(&directory)?)
     }
 
     /// Turn a durable promoted-runtime state into live write authorization for
@@ -5709,7 +5758,10 @@ fn validate_engine_history_claim(
     Err(StoreError::MalformedHistoryIndex)
 }
 
-fn open_existing_dir_nofollow(root: &Dir, name: &str) -> Result<Option<Dir>, StoreError> {
+pub(crate) fn open_existing_dir_nofollow(
+    root: &Dir,
+    name: &str,
+) -> Result<Option<Dir>, StoreError> {
     match root.symlink_metadata(name) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => Err(
             StoreError::UnsafeEntry(format!("{name} is not a real no-follow directory")),
@@ -9999,8 +10051,22 @@ mod resume_point_store_tests {
         );
     }
 
+    /// Cut the process exactly between the commit point and the prune, the way
+    /// a power loss does.
+    fn cut_before_prune(fixture: &PromotedHistoryFixture, point: &RuntimeResumePointV1) {
+        let directory =
+            Dir::open_ambient_dir(fixture.resume_point_path(), ambient_authority()).unwrap();
+        publish_immutable_exact(
+            &directory,
+            &point.file_name(),
+            &point.encode().unwrap(),
+            "runtime resume point",
+        )
+        .unwrap();
+    }
+
     #[test]
-    fn a_crash_between_publish_and_prune_leaves_two_points_and_converges() {
+    fn a_crash_between_publish_and_prune_leaves_two_points_and_a_retry_converges() {
         let fixture = PromotedHistoryFixture::new("crash-before-prune");
         let history = fixture.history();
         let first = fixture.point(1, 0x8601);
@@ -10010,15 +10076,7 @@ mod resume_point_store_tests {
         // Exactly the durable cut between B4 (the successor is durable) and B5
         // (the predecessor is removed): the successor is published through the
         // same immutable-exact primitive, and the process dies before pruning.
-        let directory =
-            Dir::open_ambient_dir(fixture.resume_point_path(), ambient_authority()).unwrap();
-        publish_immutable_exact(
-            &directory,
-            &second.file_name(),
-            &second.encode().unwrap(),
-            "runtime resume point",
-        )
-        .unwrap();
+        cut_before_prune(&fixture, &second);
 
         // The cut is readable, bounded, and still names the retained run.
         let cut = history.read_resume_point_set().unwrap();
@@ -10027,9 +10085,153 @@ mod resume_point_store_tests {
         assert_eq!(cut.reachable_runs().len(), 1);
 
         // Retrying the interrupted publication converges without republishing
-        // divergent bytes.
+        // divergent bytes. This is the route the *same* session can take; the
+        // takeover route is the next test, and it is the one that matters.
         history.publish_resume_point(&second).unwrap();
         assert_eq!(history.read_resume_point_set().unwrap().points(), &[second]);
+    }
+
+    /// The causal B1 regression: the crash-takeover restart.
+    ///
+    /// After a crash the endpoint is reopened by a *different* session at a
+    /// *later* enrollment generation, so its resume point can never be a
+    /// byte-identical retry of the interrupted one — `publish_immutable_exact`
+    /// refuses it as an `ImmutableCollision`, and the store additionally
+    /// refuses any point that does not name the live durable history. The only
+    /// available route is the next fresh sequence, and it must converge the cut
+    /// instead of committing a third point that nothing can ever remove.
+    #[test]
+    fn a_takeover_session_converges_the_two_point_cut() {
+        let fixture = PromotedHistoryFixture::new("takeover-convergence");
+        let history = fixture.history();
+        history
+            .publish_resume_point(&fixture.point(1, 0x8601))
+            .unwrap();
+        let interrupted = fixture.point(2, 0x8601);
+        cut_before_prune(&fixture, &interrupted);
+
+        let takeover = |sequence: u64| {
+            let mut point = fixture.point(sequence, 0x8601);
+            point.enrollment_generation = 5;
+            point.unsafe_session_id = SessionId::from_uuid(Uuid::from_u128(0x8501));
+            point
+        };
+        // The byte-identical retry is genuinely unavailable to this session.
+        assert!(matches!(
+            history.publish_resume_point(&takeover(2)),
+            Err(StoreError::ImmutableCollision("runtime resume point"))
+        ));
+
+        let third = takeover(3);
+        history.publish_resume_point(&third).unwrap();
+        assert_eq!(
+            fixture.snapshot().keys().cloned().collect::<Vec<_>>(),
+            vec![third.file_name()]
+        );
+        assert_eq!(
+            history.read_resume_point_set().unwrap().points(),
+            &[third.clone()]
+        );
+        // Every downstream capability is still available afterwards.
+        assert_eq!(
+            history
+                .read_resume_point_set()
+                .unwrap()
+                .next_sequence()
+                .unwrap(),
+            4
+        );
+        history.publish_resume_point(&takeover(4)).unwrap();
+        assert_eq!(history.clear_resume_points().unwrap().removed, 1);
+        assert!(history.read_resume_point_set().unwrap().points().is_empty());
+    }
+
+    /// Repeated crashes and restarts stay convergent and bounded.
+    ///
+    /// Each round crashes between the commit point and the prune, then restarts
+    /// as a fresh takeover session. The durable set is never empty and never
+    /// exceeds the publication bound at any observed cut.
+    #[test]
+    fn repeated_crash_takeover_rounds_stay_bounded_and_convergent() {
+        let fixture = PromotedHistoryFixture::new("repeated-crash");
+        let history = fixture.history();
+        history
+            .publish_resume_point(&fixture.point(1, 0x8601))
+            .unwrap();
+
+        let mut sequence = 1_u64;
+        for round in 0..6_u64 {
+            // Crash cut: the successor is durable, the prune never ran.
+            sequence += 1;
+            let mut interrupted = fixture.point(sequence, 0x8601);
+            interrupted.enrollment_generation = 10 + round;
+            interrupted.unsafe_session_id =
+                SessionId::from_uuid(Uuid::from_u128(0x8600 + u128::from(round)));
+            cut_before_prune(&fixture, &interrupted);
+            assert_eq!(
+                fixture.snapshot().len(),
+                2,
+                "round {round}: the crash cut must hold exactly the two-point overlap"
+            );
+
+            // Restart as a takeover session: new session, later generation.
+            sequence += 1;
+            let mut restarted = fixture.point(sequence, 0x8601);
+            restarted.enrollment_generation = 100 + round;
+            restarted.unsafe_session_id =
+                SessionId::from_uuid(Uuid::from_u128(0x8700 + u128::from(round)));
+            history.publish_resume_point(&restarted).unwrap();
+
+            let set = history.read_resume_point_set().unwrap();
+            assert_eq!(set.points(), &[restarted], "round {round} did not converge");
+            assert_eq!(set.reachable_runs().len(), 1);
+        }
+        assert_eq!(history.clear_resume_points().unwrap().removed, 1);
+    }
+
+    /// A directory an older build already bricked — three recognized canonical
+    /// points — must converge rather than stay unreadable forever.
+    #[test]
+    fn a_pre_existing_point_surplus_converges_on_the_next_publication() {
+        let fixture = PromotedHistoryFixture::new("legacy-surplus");
+        let history = fixture.history();
+        history
+            .publish_resume_point(&fixture.point(1, 0x8601))
+            .unwrap();
+        for sequence in [2_u64, 3] {
+            cut_before_prune(&fixture, &fixture.point(sequence, 0x8601));
+        }
+        assert_eq!(fixture.snapshot().len(), 3);
+        // The strict proof correctly refuses a surplus: nothing may be
+        // reclaimed on the strength of a set that a prune never finished.
+        assert!(matches!(
+            history.read_resume_point_set(),
+            Err(StoreError::ResumePoint(_))
+        ));
+
+        let fourth = fixture.point(4, 0x8601);
+        history.publish_resume_point(&fourth).unwrap();
+        assert_eq!(
+            fixture.snapshot().keys().cloned().collect::<Vec<_>>(),
+            vec![fourth.file_name()]
+        );
+        assert_eq!(history.read_resume_point_set().unwrap().points(), &[fourth]);
+    }
+
+    /// The same surplus is drainable without publishing anything at all.
+    #[test]
+    fn a_pre_existing_point_surplus_is_clearable() {
+        let fixture = PromotedHistoryFixture::new("legacy-surplus-clear");
+        let history = fixture.history();
+        history
+            .publish_resume_point(&fixture.point(1, 0x8601))
+            .unwrap();
+        for sequence in [2_u64, 3] {
+            cut_before_prune(&fixture, &fixture.point(sequence, 0x8601));
+        }
+        assert!(history.read_resume_point_set().is_err());
+        assert_eq!(history.clear_resume_points().unwrap().removed, 3);
+        assert!(history.read_resume_point_set().unwrap().points().is_empty());
     }
 
     #[test]
@@ -10131,7 +10333,7 @@ mod resume_point_store_tests {
     }
 
     #[test]
-    fn a_malformed_point_poisons_the_read_and_publishes_or_clears_nothing() {
+    fn a_malformed_point_poisons_the_read_and_publishes_nothing() {
         let fixture = PromotedHistoryFixture::new("poison");
         let history = fixture.history();
         history
@@ -10140,6 +10342,9 @@ mod resume_point_store_tests {
         std::fs::write(fixture.resume_point_path().join("stray-entry"), b"residue").unwrap();
         let poisoned = fixture.snapshot();
 
+        // Adoption refuses, and publication fails closed to a full replay: a
+        // directory that is not fully understood must not gain new authority,
+        // and a conflict copy must never be mistaken for the canonical latest.
         assert!(matches!(
             history.read_resume_point_set(),
             Err(StoreError::ResumePoint(_))
@@ -10148,11 +10353,132 @@ mod resume_point_store_tests {
             history.publish_resume_point(&fixture.point(2, 0x8601)),
             Err(StoreError::ResumePoint(_))
         ));
-        assert!(matches!(
-            history.clear_resume_points(),
-            Err(StoreError::ResumePoint(_))
-        ));
+        // Neither refusal changed a single byte.
         assert_eq!(fixture.snapshot(), poisoned);
+    }
+
+    /// The causal B3 regression, at the store boundary.
+    ///
+    /// Every one of these is an ordinary accident of a filesystem sync provider
+    /// or a desktop shell. None of them may be deleted as if it were
+    /// authoritative, none of them may mint a reachability proof, and none of
+    /// them may make the `Unsafe -> Safe` drain permanently impossible.
+    #[test]
+    fn provider_residue_never_blocks_the_safe_drain_or_mints_authority() {
+        let canonical_name = "00000000000000000001.resume-point";
+        for (label, stranger, bytes) in [
+            ("desktop", ".DS_Store", b"\x00\x01Bud1 residue".to_vec()),
+            (
+                "backup",
+                "00000000000000000001.resume-point.bak",
+                Vec::new(),
+            ),
+            (
+                "syncthing",
+                "00000000000000000001.sync-conflict-20260728-120000-ABCDEFG.resume-point",
+                Vec::new(),
+            ),
+            (
+                "dropbox",
+                "00000000000000000001 (1).resume-point",
+                Vec::new(),
+            ),
+            ("torn", "00000000000000000002.resume-point", Vec::new()),
+            ("unknown", "stray-entry", b"residue".to_vec()),
+        ] {
+            let fixture = PromotedHistoryFixture::new(&format!("drain-{label}"));
+            let history = fixture.history();
+            let point = fixture.point(1, 0x8601);
+            history.publish_resume_point(&point).unwrap();
+            assert_eq!(point.file_name(), canonical_name);
+
+            // A copy of the real point under a residue name for the provider
+            // shapes; a truncated one for `torn`; opaque bytes otherwise.
+            let published = point.encode().unwrap();
+            let residue_bytes = match label {
+                "torn" => published[..published.len() - 3].to_vec(),
+                _ if bytes.is_empty() => published.clone(),
+                _ => bytes,
+            };
+            let residue_path = fixture.resume_point_path().join(stranger);
+            std::fs::write(&residue_path, &residue_bytes).unwrap();
+
+            // No proof, therefore no deletion authority over any retained run.
+            assert!(
+                history.read_resume_point_set().is_err(),
+                "{label}: residue must not mint a reachability proof"
+            );
+
+            // The drain still progresses, removing only what it recognized.
+            let maintenance = history.clear_resume_points().unwrap();
+            assert_eq!(maintenance.removed, 1, "{label}");
+            assert_eq!(maintenance.preserved, vec![stranger.to_owned()], "{label}");
+            assert!(
+                !fixture.resume_point_path().join(canonical_name).exists(),
+                "{label}: the canonical point was not cleared"
+            );
+            assert_eq!(
+                std::fs::read(&residue_path).unwrap(),
+                residue_bytes,
+                "{label}: residue was not preserved byte-for-byte"
+            );
+            // And it is still poison afterwards, so reclamation stays refused.
+            assert!(
+                history.read_resume_point_set().is_err(),
+                "{label}: residue must still deny the proof after the drain"
+            );
+        }
+    }
+
+    /// The end-to-end consequence of B3's scoping: under poison the drain
+    /// completes, the retained run is *not* reclaimed, and removing the residue
+    /// is what restores deletion authority.
+    #[test]
+    fn a_retained_run_is_never_reclaimed_while_residue_denies_the_proof() {
+        use crate::oplog::scratch_store::{
+            reclaim_unreachable_retained_runs, ScratchStore, SCRATCH_DIR,
+        };
+
+        let fixture = PromotedHistoryFixture::new("residue-retains-run");
+        let archive_capability =
+            Dir::open_ambient_dir(&fixture.archive, ambient_authority()).unwrap();
+        let retained =
+            ScratchStore::create_retained(&archive_capability, fixture.workspace).unwrap();
+        let run_id = retained.run_id();
+        drop(retained);
+        let run_path = fixture
+            .archive
+            .join(SCRATCH_DIR)
+            .join(format!("run-{run_id}"));
+        assert!(run_path.is_dir());
+
+        let history = fixture.history();
+        history
+            .publish_resume_point(&fixture.point(1, run_id.as_u128()))
+            .unwrap();
+        let residue_path = fixture.resume_point_path().join(".DS_Store");
+        std::fs::write(&residue_path, b"\x00\x01Bud1 residue").unwrap();
+
+        // The drain progresses so the handoff can reach `Safe` ...
+        assert_eq!(history.clear_resume_points().unwrap().removed, 1);
+        // ... but the residue still denies the proof, so the composition the
+        // lifecycle caller must use cannot even produce an argument for
+        // reclamation, and the run's bytes survive.
+        assert!(history
+            .read_resume_point_set()
+            .map(|set| set.reachable_runs())
+            .is_err());
+        assert!(run_path.is_dir());
+
+        // Removing the residue is what restores deletion authority.
+        std::fs::remove_file(&residue_path).unwrap();
+        let reachable = history.read_resume_point_set().unwrap().reachable_runs();
+        assert_eq!(reachable.len(), 0);
+        let outcome =
+            reclaim_unreachable_retained_runs(&archive_capability, fixture.workspace, &reachable)
+                .unwrap();
+        assert_eq!(outcome.retained_reclaimed, 1);
+        assert!(!run_path.exists());
     }
 
     #[test]
@@ -10163,7 +10489,7 @@ mod resume_point_store_tests {
             .publish_resume_point(&fixture.point(1, 0x8601))
             .unwrap();
 
-        assert_eq!(history.clear_resume_points().unwrap(), 1);
+        assert_eq!(history.clear_resume_points().unwrap().removed, 1);
         assert!(history.read_resume_point_set().unwrap().points().is_empty());
         assert_eq!(
             history
@@ -10173,7 +10499,7 @@ mod resume_point_store_tests {
                 .len(),
             0
         );
-        assert_eq!(history.clear_resume_points().unwrap(), 0);
+        assert_eq!(history.clear_resume_points().unwrap().removed, 0);
 
         // Clearing is not a terminal state. The publication sequence is derived
         // from the durable set rather than from a separate counter file, so a
@@ -10199,7 +10525,10 @@ mod resume_point_store_tests {
         let fixture = PromotedHistoryFixture::new("never-published");
         let history = fixture.history();
         assert!(history.read_resume_point_set().unwrap().points().is_empty());
-        assert_eq!(history.clear_resume_points().unwrap(), 0);
+        assert_eq!(
+            history.clear_resume_points().unwrap(),
+            ResumePointMaintenance::default()
+        );
         assert!(!fixture.resume_point_path().exists());
     }
 

@@ -12,15 +12,30 @@
 //!
 //! * one bounded, canonically encoded, digest-sealed record
 //!   ([`RuntimeResumePointV1`]);
-//! * one *complete* poison-checked directory scan ([`ResumePointSet`]) whose
-//!   answer to "which retained runs are still reachable" is total or absent,
-//!   never partial.
+//! * one directory survey ([`ResumePointScan`]) that separates *recognized
+//!   canonical points* from *preserved unrecognizable residue*;
+//! * one strict proof ([`ResumePointSet`]) minted only from a survey that
+//!   recognized every entry, whose answer to "which retained runs are still
+//!   reachable" is total or absent, never partial.
 //!
-//! The poison rule is the single most important property here. An unreadable
-//! pointer must never be read as "points to nothing": if any entry of the
-//! resume-point directory cannot be classified and authenticated, the whole
-//! scan fails and the caller preserves every candidate retained run. A leaked
-//! run costs disk; a prematurely deleted run costs the only resumable bytes.
+//! **The poison rule is the single most important property here, and it is
+//! scoped to deletion authority over retained runs.** An unreadable pointer
+//! must never be read as "points to nothing": if any entry of the resume-point
+//! directory cannot be classified and authenticated, no [`ResumePointSet`]
+//! exists, so no [`ReachableRetainedRuns`] can be minted, so no retained run is
+//! reclaimed. A leaked run costs disk; a prematurely deleted run costs the only
+//! resumable bytes.
+//!
+//! **Maintenance is deliberately *not* gated on that proof.** Removing
+//! resume points never deletes user data or run bytes — it only makes the
+//! restart replay, which is always correct. Refusing to prune or clear because
+//! the directory also holds a `.DS_Store`, a Syncthing `.sync-conflict-*` copy,
+//! a Dropbox ` (1)` duplicate, an editor `.bak`, or a torn point would make the
+//! `Unsafe -> Safe` handoff drain permanently impossible for an ordinary
+//! desktop accident. So [`prune_resume_points_below`] and
+//! [`clear_resume_points_in`] remove exactly the points they fully recognized,
+//! preserve every other byte untouched, report what they preserved, and leave
+//! the reachability proof unmintable while that residue exists.
 //!
 //! Fault model: single user, multiple honest devices, fallible filesystem sync
 //! providers (`specs/notes/2026-07-22-sparse-oplog-storage-execution.md` §0.1).
@@ -40,7 +55,8 @@ use uuid::Uuid;
 
 use super::hot_engine::AcceptedFrontierRoot;
 use super::object_store::{
-    read_optional_regular, sync_dir_required, BlockClaimIndexRoot, StoreError,
+    open_existing_dir_nofollow, read_optional_regular, sync_dir_required, BlockClaimIndexRoot,
+    StoreError,
 };
 use super::scratch_store::{ScratchAuthenticatedCatalogRoot, ScratchRoots};
 use super::{ContentDigest, SessionId, WorkspaceId};
@@ -61,10 +77,21 @@ pub(crate) const RESUME_POINT_SCHEMA_VERSION: u32 = 1;
 /// engine state is not *publishable*, so the restart pays a full replay. That
 /// is always available and always correct.
 pub(crate) const MAX_RESUME_POINT_BYTES: u64 = 16 * 1024;
-/// Publish-then-delete leaves at most one superseded point at any crash cut,
-/// so two is the exact steady-state and transient bound. Three means a prune
-/// never ran, which is a fail-closed corruption signal, not a state to repair
-/// by deleting evidence.
+/// The bound one *publication* maintains, and the bound the strict adoption
+/// proof requires.
+///
+/// `publish_resume_point` prunes below the durable latest *before* it publishes
+/// whenever the recognized set has already reached this bound, so the widest
+/// durable cut it can produce is `{latest, successor}`. That makes two the
+/// steady-state and transient bound of the publication path — an invariant it
+/// enforces, **not** a theorem about whatever is on disk. A directory can still
+/// hold more, because an older build published without the pre-prune, or
+/// because a provider restored a file.
+///
+/// A surplus is therefore a *recoverable* condition, not a brick: it fails the
+/// strict [`ResumePointSet`] proof (so nothing is reclaimed), while
+/// [`prune_resume_points_below`], [`clear_resume_points_in`] and the next
+/// publication all still converge it.
 pub(crate) const MAX_RETAINED_RESUME_POINTS: usize = 2;
 /// Fixed-width zero-padded decimal, so lexicographic order is numeric order
 /// and "highest valid" needs no parsing ambiguity. `u64::MAX` is exactly 20
@@ -76,12 +103,14 @@ const RESUME_POINT_SEQUENCE_DIGITS: usize = 20;
 /// scan rather than treated as an unclassifiable stranger.
 const PUBLICATION_TEMP_PREFIX: &str = ".tmp-";
 
-/// Why one resume point, or one complete resume-point scan, was refused.
+/// Why one resume point, or one strict resume-point proof, was refused.
 ///
-/// Every variant means the same thing to a caller: **do not adopt, do not
-/// prune, do not reclaim, preserve every candidate retained run**. The
-/// variants exist so the refusal is diagnosable, not so a caller can decide
-/// that some of them are recoverable.
+/// Every variant means the same thing to the *proof* callers: **do not adopt,
+/// do not reclaim, preserve every candidate retained run**. The variants exist
+/// so the refusal is diagnosable, not so a caller can decide that some of them
+/// are recoverable. Conservative maintenance is a separate surface
+/// ([`prune_resume_points_below`], [`clear_resume_points_in`]) that carries the
+/// same bytes as *preserved residue* instead of as a refusal.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ResumePointError {
     /// A sealed record at an unsupported schema version. Never migrated.
@@ -100,7 +129,8 @@ pub(crate) enum ResumePointError {
         length: u64,
         limit: u64,
     },
-    /// More published points than publish-then-delete can produce.
+    /// More recognized points than a publication leaves at any durable cut.
+    /// Adoption and reclamation refuse; maintenance still converges it.
     TooManyPoints(usize),
     /// An entry in the resume-point directory that is not a published point
     /// and not this repository's own publication residue.
@@ -321,7 +351,7 @@ impl RuntimeResumePointV1 {
 /// Reclamation consumes this type rather than a bare identity set so the
 /// "complete proof" precondition is carried by the type system: the only
 /// non-test way to obtain one is [`ResumePointSet::reachable_runs`], and a
-/// `ResumePointSet` can only be minted by a scan that classified and
+/// `ResumePointSet` can only be minted by a survey that recognized and
 /// authenticated every entry it saw.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ReachableRetainedRuns(BTreeSet<Uuid>);
@@ -343,11 +373,161 @@ impl ReachableRetainedRuns {
     }
 }
 
+/// One directory entry that is not a recognized canonical resume point.
+///
+/// Residue is *preserved and reported*, never deleted and never interpreted.
+/// The shapes this fault model expects are all ordinary accidents: a macOS
+/// `.DS_Store`, an editor or backup `.bak`, a Syncthing
+/// `<base>.sync-conflict-<stamp>-<device>.resume-point` copy, a Dropbox
+/// `<base> (1).resume-point` duplicate, a torn or half-copied point, a name
+/// that is not exactly twenty digits plus the suffix, or a symlink, FIFO or
+/// directory wearing a point name.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct UnrecognizedResumePointEntry {
+    pub(crate) name: String,
+    pub(crate) reason: ResumePointError,
+}
+
+/// What one conservative maintenance pass removed, and what it refused to
+/// touch.
+///
+/// `preserved` is the whole point of the type: a caller that drains resume
+/// points still has to be able to see that the directory is accumulating
+/// provider residue, because that residue is also what keeps the reachability
+/// proof — and therefore retained-run reclamation — unavailable.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ResumePointMaintenance {
+    /// Recognized canonical points that were unlinked and durably synced.
+    pub(crate) removed: usize,
+    /// Names of the entries this pass deliberately left byte-for-byte intact.
+    pub(crate) preserved: Vec<String>,
+}
+
+impl ResumePointMaintenance {
+    pub(crate) fn preserved_residue(&self) -> bool {
+        !self.preserved.is_empty()
+    }
+}
+
+/// One complete survey of a resume-point directory.
+///
+/// The survey itself never fails on content: it *classifies*. Every entry is
+/// either a recognized canonical point, this repository's own publication temp
+/// residue (ignored, since no point was ever committed under that name), or
+/// unrecognizable residue that is recorded and left alone. Only a failure to
+/// enumerate the directory at all is an error, because that proves nothing
+/// about anything.
+///
+/// Deciding what a survey *authorizes* is the caller's job, and the two answers
+/// are deliberately different: [`Self::into_set`] is the strict proof used for
+/// adoption and reclamation, while the maintenance functions act on
+/// [`Self::points`] alone.
+#[derive(Debug)]
+pub(crate) struct ResumePointScan {
+    /// Ascending by `resume_sequence`.
+    points: Vec<RuntimeResumePointV1>,
+    /// Ascending by name.
+    residue: Vec<UnrecognizedResumePointEntry>,
+}
+
+impl ResumePointScan {
+    /// Survey the resume-point directory beneath one endpoint's control
+    /// directory.
+    ///
+    /// An absent directory is the ordinary "never published" shape and yields
+    /// an empty survey, which is a genuine complete answer rather than a
+    /// fabricated one: it still requires the control-directory capability, and
+    /// a directory that is present but is not a real no-follow directory is an
+    /// error. (An *accidentally deleted* directory therefore does read as
+    /// "nothing is reachable". That is the one place where absence is trusted;
+    /// it costs at most reconstructible accelerator bytes, and the live run is
+    /// still protected by its own exclusive lease.)
+    pub(crate) fn survey(control: &Dir) -> Result<Self, ResumePointError> {
+        let Some(directory) = open_existing_dir_nofollow(control, RESUME_POINT_DIR)? else {
+            return Ok(Self {
+                points: Vec::new(),
+                residue: Vec::new(),
+            });
+        };
+        Self::survey_directory(&directory)
+    }
+
+    /// Survey one already-opened resume-point directory.
+    pub(crate) fn survey_directory(dir: &Dir) -> Result<Self, ResumePointError> {
+        let mut points = Vec::new();
+        let mut residue: Vec<UnrecognizedResumePointEntry> = Vec::new();
+        for entry in dir.entries()? {
+            // Failing to enumerate an entry is the one hard error: it is not a
+            // classification, so nothing at all has been proved or preserved.
+            let entry = entry?;
+            let raw_name = entry.file_name();
+            let Some(name) = raw_name.to_str().map(str::to_owned) else {
+                let lossy = raw_name.to_string_lossy().into_owned();
+                residue.push(UnrecognizedResumePointEntry {
+                    reason: ResumePointError::UnexpectedEntry(lossy.clone()),
+                    name: lossy,
+                });
+                continue;
+            };
+            if name.starts_with(PUBLICATION_TEMP_PREFIX) {
+                // Residue of this repository's own immutable publication: the
+                // rename never happened, so no point was ever committed here.
+                continue;
+            }
+            match recognize_point_entry(dir, &entry, &name) {
+                Ok(point) => points.push(point),
+                Err(reason) => residue.push(UnrecognizedResumePointEntry { name, reason }),
+            }
+        }
+        points.sort_by_key(|point| point.resume_sequence);
+        residue.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(Self { points, residue })
+    }
+
+    /// Recognized canonical points, ascending by sequence.
+    pub(crate) fn points(&self) -> &[RuntimeResumePointV1] {
+        &self.points
+    }
+
+    pub(crate) fn residue(&self) -> &[UnrecognizedResumePointEntry] {
+        &self.residue
+    }
+
+    /// Refuse unless every entry was recognized.
+    ///
+    /// The returned error is the first residue entry's own reason, so a
+    /// truncated point still reports `Malformed`, an oversize one `TooLarge`,
+    /// and a copied one `NameMismatch` — the refusal stays as diagnosable as it
+    /// was when the scan aborted on the first stranger.
+    pub(crate) fn require_recognizable(&self) -> Result<(), ResumePointError> {
+        match self.residue.first() {
+            None => Ok(()),
+            Some(entry) => Err(entry.reason.clone()),
+        }
+    }
+
+    /// The strict proof: every entry recognized, and no more points than a
+    /// publication leaves at a durable cut.
+    ///
+    /// A caller that gets an `Err` here has proved nothing about reachability
+    /// and must preserve every candidate retained run.
+    pub(crate) fn into_set(self) -> Result<ResumePointSet, ResumePointError> {
+        self.require_recognizable()?;
+        if self.points.len() > MAX_RETAINED_RESUME_POINTS {
+            return Err(ResumePointError::TooManyPoints(self.points.len()));
+        }
+        Ok(ResumePointSet {
+            points: self.points,
+        })
+    }
+}
+
 /// The complete validated resume-point set of one endpoint.
 ///
-/// Minted only by a full, poison-checked directory scan, so
+/// Minted only by a survey that recognized every entry, so
 /// [`Self::reachable_runs`] is a *total* reachability answer and never a
-/// partial one.
+/// partial one. It has no other constructor, in particular no empty one: the
+/// "never published" value comes from an actual survey of an actual capability.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ResumePointSet {
     /// Ascending by `resume_sequence`.
@@ -355,56 +535,9 @@ pub(crate) struct ResumePointSet {
 }
 
 impl ResumePointSet {
-    /// The set of an endpoint that has never published a resume point. This is
-    /// the ordinary, non-error shape for an absent directory.
-    pub(crate) const fn empty() -> Self {
-        Self { points: Vec::new() }
-    }
-
-    /// Read and validate every entry of one resume-point directory.
-    ///
-    /// Any deviation aborts the whole scan: an unknown or non-regular entry, a
-    /// name that is not a canonical fixed-width sequence, bytes that exceed the
-    /// ceiling or fail to decode canonically, a payload digest that does not
-    /// cover the bytes, a payload sequence that disagrees with its file name,
-    /// or more points than publish-then-delete can produce. A caller that gets
-    /// an `Err` here has proved nothing about reachability and must preserve
-    /// every candidate retained run.
+    /// Strictly read and validate every entry of one resume-point directory.
     pub(crate) fn read(dir: &Dir) -> Result<Self, ResumePointError> {
-        let mut points = Vec::new();
-        for entry in dir.entries()? {
-            let entry = entry?;
-            let name = entry
-                .file_name()
-                .to_str()
-                .ok_or_else(|| {
-                    ResumePointError::UnexpectedEntry("non-UTF-8 resume-point entry".into())
-                })?
-                .to_owned();
-            if name.starts_with(PUBLICATION_TEMP_PREFIX) {
-                // Residue of this repository's own immutable publication: the
-                // rename never happened, so no point was ever committed here.
-                continue;
-            }
-            let sequence = parse_resume_point_name(&name)
-                .ok_or_else(|| ResumePointError::UnexpectedEntry(name.clone()))?;
-            require_regular_point_entry(&entry, &name)?;
-            let bytes = read_optional_regular(dir, &name, MAX_RESUME_POINT_BYTES, None)?
-                .ok_or_else(|| ResumePointError::UnexpectedEntry(name.clone()))?;
-            let point = RuntimeResumePointV1::decode(&bytes)?;
-            if point.resume_sequence != sequence {
-                return Err(ResumePointError::NameMismatch {
-                    named: sequence,
-                    payload: point.resume_sequence,
-                });
-            }
-            points.push(point);
-        }
-        points.sort_by_key(|point| point.resume_sequence);
-        if points.len() > MAX_RETAINED_RESUME_POINTS {
-            return Err(ResumePointError::TooManyPoints(points.len()));
-        }
-        Ok(Self { points })
+        ResumePointScan::survey_directory(dir)?.into_set()
     }
 
     pub(crate) fn points(&self) -> &[RuntimeResumePointV1] {
@@ -418,17 +551,7 @@ impl ResumePointSet {
 
     /// The sequence one publication would use next.
     pub(crate) fn next_sequence(&self) -> Result<u64, ResumePointError> {
-        match self.latest() {
-            None => Ok(1),
-            Some(latest) => {
-                latest
-                    .resume_sequence
-                    .checked_add(1)
-                    .ok_or(ResumePointError::Malformed(
-                        "resume sequence space is exhausted",
-                    ))
-            }
-        }
+        next_resume_sequence(&self.points)
     }
 
     /// Every retained scratch run this complete set still reaches.
@@ -440,41 +563,106 @@ impl ResumePointSet {
                 .collect(),
         )
     }
+}
 
-    /// Remove every published point below `keep`, then make the removal
-    /// durable.
-    ///
-    /// The directory is rescanned under the same poison rule first, so a pass
-    /// that cannot classify every entry removes nothing at all.
-    pub(crate) fn prune_below(dir: &Dir, keep: u64) -> Result<usize, ResumePointError> {
-        Self::remove_matching(dir, |point| point.resume_sequence < keep)
+/// The sequence one publication would use next, given the recognized points.
+pub(crate) fn next_resume_sequence(
+    points: &[RuntimeResumePointV1],
+) -> Result<u64, ResumePointError> {
+    match points.last() {
+        None => Ok(1),
+        Some(latest) => latest
+            .resume_sequence
+            .checked_add(1)
+            .ok_or(ResumePointError::Malformed(
+                "resume sequence space is exhausted",
+            )),
     }
+}
 
-    /// Remove every published point, then make the removal durable.
-    ///
-    /// This is the `Unsafe -> Safe` drain: afterwards no retained run is
-    /// reachable, which is exactly what lets reclamation collect it. The same
-    /// poison rule applies, so a directory this pass cannot fully classify
-    /// fails the drain instead of silently half-clearing it.
-    pub(crate) fn clear(dir: &Dir) -> Result<usize, ResumePointError> {
-        Self::remove_matching(dir, |_| true)
-    }
+/// Remove every *recognized* point below `keep`, then make the removal durable.
+///
+/// Deliberately independent of the strict adoption bound and of the poison
+/// rule. Pruning is the operation that *restores* the bound, so refusing to
+/// prune because the bound is exceeded is exactly backwards; and residue in the
+/// directory is preserved and reported rather than allowed to veto the removal
+/// of points that were fully recognized.
+pub(crate) fn prune_resume_points_below(
+    dir: &Dir,
+    keep: u64,
+) -> Result<ResumePointMaintenance, ResumePointError> {
+    remove_matching_points(dir, |point| point.resume_sequence < keep)
+}
 
-    fn remove_matching(
-        dir: &Dir,
-        select: impl Fn(&RuntimeResumePointV1) -> bool,
-    ) -> Result<usize, ResumePointError> {
-        let set = Self::read(dir)?;
-        let mut removed = 0;
-        for point in set.points.iter().filter(|point| select(point)) {
-            dir.remove_file(point.file_name())?;
-            removed += 1;
+/// Remove every *recognized* point, then make the removal durable.
+///
+/// This is the `Unsafe -> Safe` drain. Afterwards no recognized point names a
+/// retained run, which is what would let reclamation collect one — but only if
+/// the directory was also residue-free, because reclamation needs the strict
+/// [`ResumePointSet`] proof and residue still denies it. A drain that leaves
+/// residue therefore leaks retained runs, which is the correct trade: the
+/// handoff proceeds and no unproven bytes are deleted.
+pub(crate) fn clear_resume_points_in(
+    dir: &Dir,
+) -> Result<ResumePointMaintenance, ResumePointError> {
+    remove_matching_points(dir, |_| true)
+}
+
+fn remove_matching_points(
+    dir: &Dir,
+    select: impl Fn(&RuntimeResumePointV1) -> bool,
+) -> Result<ResumePointMaintenance, ResumePointError> {
+    let scan = ResumePointScan::survey_directory(dir)?;
+    let mut removed = 0;
+    let mut failure = None;
+    for point in scan.points.iter().filter(|point| select(point)) {
+        if let Err(error) = dir.remove_file(point.file_name()) {
+            failure = Some(ResumePointError::from(error));
+            break;
         }
-        if removed > 0 {
-            sync_dir_required(dir)?;
-        }
-        Ok(removed)
+        removed += 1;
     }
+    // Durability before reporting, including on the partial-failure path: a
+    // caller that saw this fail must not be able to lose the removals that did
+    // happen to a later power cut and see them resurrect.
+    if removed > 0 {
+        sync_dir_required(dir)?;
+    }
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    Ok(ResumePointMaintenance {
+        removed,
+        preserved: scan
+            .residue
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// Recognize exactly one directory entry as a canonical resume point.
+///
+/// Every `Err` means "this is not a point of mine", and the caller records it
+/// as preserved residue rather than acting on it.
+fn recognize_point_entry(
+    dir: &Dir,
+    entry: &cap_std::fs::DirEntry,
+    name: &str,
+) -> Result<RuntimeResumePointV1, ResumePointError> {
+    let sequence = parse_resume_point_name(name)
+        .ok_or_else(|| ResumePointError::UnexpectedEntry(name.to_owned()))?;
+    require_regular_point_entry(entry, name)?;
+    let bytes = read_optional_regular(dir, name, MAX_RESUME_POINT_BYTES, None)?
+        .ok_or_else(|| ResumePointError::UnexpectedEntry(name.to_owned()))?;
+    let point = RuntimeResumePointV1::decode(&bytes)?;
+    if point.resume_sequence != sequence {
+        return Err(ResumePointError::NameMismatch {
+            named: sequence,
+            payload: point.resume_sequence,
+        });
+    }
+    Ok(point)
 }
 
 /// Parse one canonical resume-point file name.
@@ -952,46 +1140,194 @@ mod tests {
     }
 
     #[test]
-    fn more_than_two_points_is_fail_closed() {
+    fn more_than_two_points_fails_the_strict_proof_but_maintenance_converges_it() {
         let root = resume_root("too-many");
         let dir = open_root(&root);
         for sequence in 1..=(MAX_RETAINED_RESUME_POINTS as u64 + 1) {
             publish(&root, &point(sequence));
         }
+        // Adoption and reclamation refuse: a surplus means a prune never ran,
+        // so nothing here may authorize deleting a retained run.
         assert_eq!(
             ResumePointSet::read(&dir),
             Err(ResumePointError::TooManyPoints(
                 MAX_RETAINED_RESUME_POINTS + 1
             ))
         );
+        // Maintenance is not gated on that bound, so the surplus is a state the
+        // endpoint recovers from rather than a permanent brick.
+        assert_eq!(
+            prune_resume_points_below(&dir, MAX_RETAINED_RESUME_POINTS as u64 + 1).unwrap(),
+            ResumePointMaintenance {
+                removed: MAX_RETAINED_RESUME_POINTS,
+                preserved: Vec::new(),
+            }
+        );
+        assert_eq!(
+            ResumePointSet::read(&dir).unwrap().points(),
+            &[point(MAX_RETAINED_RESUME_POINTS as u64 + 1)]
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn a_torn_point_poisons_the_scan_and_prunes_nothing() {
+    fn a_surplus_of_points_is_fully_clearable() {
+        let root = resume_root("too-many-clear");
+        let dir = open_root(&root);
+        for sequence in 1..=(MAX_RETAINED_RESUME_POINTS as u64 + 3) {
+            publish(&root, &point(sequence));
+        }
+        assert!(ResumePointSet::read(&dir).is_err());
+        assert_eq!(
+            clear_resume_points_in(&dir).unwrap().removed,
+            MAX_RETAINED_RESUME_POINTS + 3
+        );
+        assert!(ResumePointSet::read(&dir).unwrap().points().is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_torn_point_is_preserved_residue_that_never_becomes_authority() {
         let root = resume_root("torn");
         let dir = open_root(&root);
         let intact = point(1);
         publish(&root, &intact);
         let torn = point(2);
         let torn_bytes = torn.encode().unwrap();
-        std::fs::write(
-            root.join(torn.file_name()),
-            &torn_bytes[..torn_bytes.len() - 3],
-        )
-        .unwrap();
+        let torn_prefix = torn_bytes[..torn_bytes.len() - 3].to_vec();
+        std::fs::write(root.join(torn.file_name()), &torn_prefix).unwrap();
 
-        assert!(ResumePointSet::read(&dir).is_err());
-        assert!(ResumePointSet::prune_below(&dir, 2).is_err());
-        assert!(ResumePointSet::clear(&dir).is_err());
+        // The strict proof still fails closed, with the same diagnosis it gave
+        // when the whole scan aborted on the first stranger.
+        assert!(matches!(
+            ResumePointSet::read(&dir),
+            Err(ResumePointError::Malformed(_))
+        ));
+        let scan = ResumePointScan::survey_directory(&dir).unwrap();
+        assert_eq!(scan.points(), &[intact.clone()]);
+        assert_eq!(scan.residue().len(), 1);
+        assert_eq!(scan.residue()[0].name, torn.file_name());
+
+        // Maintenance drains what it recognized and never touches the rest.
         assert_eq!(
-            std::fs::read(root.join(intact.file_name())).unwrap(),
-            intact.encode().unwrap()
+            clear_resume_points_in(&dir).unwrap(),
+            ResumePointMaintenance {
+                removed: 1,
+                preserved: vec![torn.file_name()],
+            }
         );
+        assert!(!root.join(intact.file_name()).exists());
         assert_eq!(
             std::fs::read(root.join(torn.file_name())).unwrap(),
-            torn_bytes[..torn_bytes.len() - 3].to_vec()
+            torn_prefix
         );
+        // And the torn bytes still deny the reachability proof afterwards, so
+        // no retained run can be reclaimed on their account.
+        assert!(ResumePointSet::read(&dir).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The exact sync-provider and desktop residue family from the campaign's
+    /// in-scope fault list. Every shape must be preserved byte-for-byte, must
+    /// keep the reachability proof unmintable, and must not stop the drain.
+    #[test]
+    fn provider_and_desktop_residue_is_preserved_and_never_blocks_the_drain() {
+        let canonical = point(1);
+        let valid_bytes = canonical.encode().unwrap();
+        // Deliberately *valid point bytes* under a residue name: a conflict
+        // copy must never be silently promoted to canonical authority.
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            (".DS_Store", b"\x00\x01Bud1 desktop residue".to_vec()),
+            ("00000000000000000001.resume-point.bak", valid_bytes.clone()),
+            (
+                "00000000000000000001.sync-conflict-20260728-120000-ABCDEFG.resume-point",
+                valid_bytes.clone(),
+            ),
+            ("00000000000000000001 (1).resume-point", valid_bytes.clone()),
+            ("Icon\r", b"desktop database".to_vec()),
+            ("00000000000000000009.resume-point", valid_bytes.clone()),
+        ];
+
+        for (index, (stranger, bytes)) in cases.into_iter().enumerate() {
+            let root = resume_root(&format!("residue-{index}"));
+            let dir = open_root(&root);
+            publish(&root, &canonical);
+            std::fs::write(root.join(stranger), &bytes).unwrap();
+
+            assert!(
+                ResumePointSet::read(&dir).is_err(),
+                "{stranger} must not mint a reachability proof"
+            );
+            let maintenance = clear_resume_points_in(&dir).unwrap();
+            assert_eq!(
+                maintenance,
+                ResumePointMaintenance {
+                    removed: 1,
+                    preserved: vec![stranger.to_owned()],
+                },
+                "{stranger}"
+            );
+            assert!(maintenance.preserved_residue());
+            assert!(!root.join(canonical.file_name()).exists(), "{stranger}");
+            assert_eq!(
+                std::fs::read(root.join(stranger)).unwrap(),
+                bytes,
+                "{stranger}"
+            );
+            assert!(
+                ResumePointSet::read(&dir).is_err(),
+                "{stranger} must still deny the proof after the drain"
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    /// A symlink, FIFO or directory wearing a canonical point name is residue
+    /// too — and the drain must never `remove_file` it or follow it.
+    #[test]
+    fn special_entries_wearing_a_point_name_are_preserved_by_the_drain() {
+        let root = resume_root("residue-special");
+        let dir = open_root(&root);
+        let canonical = point(1);
+        publish(&root, &canonical);
+
+        let elsewhere = root.join("decoy-target");
+        std::fs::write(&elsewhere, b"a file the drain must not unlink").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&elsewhere, root.join(point(2).file_name())).unwrap();
+        std::fs::create_dir(root.join(point(3).file_name())).unwrap();
+        #[cfg(unix)]
+        {
+            use std::ffi::CString;
+            use std::os::unix::ffi::OsStrExt as _;
+            let fifo = root.join(point(4).file_name());
+            let fifo_c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+            // SAFETY: `fifo_c` is a live NUL-terminated path in this test root.
+            assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        }
+
+        assert!(ResumePointSet::read(&dir).is_err());
+        let maintenance = clear_resume_points_in(&dir).unwrap();
+        assert_eq!(maintenance.removed, 1);
+        assert!(!root.join(canonical.file_name()).exists());
+        // `decoy-target` is itself an unrecognized name, so it is preserved too.
+        assert!(maintenance.preserved.contains(&"decoy-target".to_owned()));
+        assert!(maintenance.preserved.contains(&point(3).file_name()));
+        #[cfg(unix)]
+        {
+            assert!(maintenance.preserved.contains(&point(2).file_name()));
+            assert!(maintenance.preserved.contains(&point(4).file_name()));
+            assert!(root.join(point(4).file_name()).exists());
+            assert!(std::fs::symlink_metadata(root.join(point(2).file_name()))
+                .unwrap()
+                .file_type()
+                .is_symlink());
+        }
+        assert_eq!(
+            std::fs::read(&elsewhere).unwrap(),
+            b"a file the drain must not unlink"
+        );
+        assert!(root.join(point(3).file_name()).is_dir());
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1023,11 +1359,11 @@ mod tests {
         publish(&root, &older);
         publish(&root, &newer);
 
-        assert_eq!(ResumePointSet::prune_below(&dir, 2).unwrap(), 1);
+        assert_eq!(prune_resume_points_below(&dir, 2).unwrap().removed, 1);
         assert!(!root.join(older.file_name()).exists());
         assert_eq!(ResumePointSet::read(&dir).unwrap().points(), &[newer]);
         // Idempotent: a repeated prune at the same watermark removes nothing.
-        assert_eq!(ResumePointSet::prune_below(&dir, 2).unwrap(), 0);
+        assert_eq!(prune_resume_points_below(&dir, 2).unwrap().removed, 0);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1037,9 +1373,34 @@ mod tests {
         let dir = open_root(&root);
         publish(&root, &point(1));
         publish(&root, &point(2));
-        assert_eq!(ResumePointSet::clear(&dir).unwrap(), 2);
+        assert_eq!(clear_resume_points_in(&dir).unwrap().removed, 2);
         assert!(ResumePointSet::read(&dir).unwrap().points().is_empty());
-        assert_eq!(ResumePointSet::clear(&dir).unwrap(), 0);
+        assert_eq!(clear_resume_points_in(&dir).unwrap().removed, 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The publication temp class stays ignored rather than becoming residue:
+    /// nothing was ever committed under that name, so it neither denies the
+    /// proof nor gets reported as something the operator must clean up.
+    #[test]
+    fn publication_temp_residue_is_neither_a_point_nor_residue() {
+        let root = resume_root("temp-not-residue");
+        let dir = open_root(&root);
+        publish(&root, &point(1));
+        let temp = format!(".tmp-{}", Uuid::new_v4());
+        std::fs::write(root.join(&temp), b"torn").unwrap();
+
+        let scan = ResumePointScan::survey_directory(&dir).unwrap();
+        assert_eq!(scan.points().len(), 1);
+        assert!(scan.residue().is_empty());
+        assert_eq!(
+            clear_resume_points_in(&dir).unwrap(),
+            ResumePointMaintenance {
+                removed: 1,
+                preserved: Vec::new(),
+            }
+        );
+        assert!(root.join(&temp).exists());
         std::fs::remove_dir_all(root).unwrap();
     }
 }

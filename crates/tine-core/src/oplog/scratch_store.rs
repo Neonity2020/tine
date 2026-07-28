@@ -49,14 +49,17 @@ pub(crate) const AUTHENTICATED_POINT_MAX_IO_PER_MUTATION: usize =
 const CURRENT_FILTER_WORDS: usize = 16_384;
 const MAX_COVERED_BLOB_DEDUP_ROOTS: usize = 256;
 const MAX_MARKER_BYTES: u64 = 4 * 1024;
-/// Bound on the retained runs one workspace holds after a complete
+/// Expected bound on the retained runs one workspace holds after a complete
 /// reachability pass converges.
 ///
-/// Publish-then-delete needs a transient overlap of two, and no operation
-/// produces three. This is a theorem about the pass rather than a quota it
-/// enforces: at most two resume points can exist, so at most two distinct runs
-/// can be reachable, and everything else is either provably collectable or
-/// preserved because it could not be classified.
+/// Publication keeps at most two resume points at any durable cut, so at most
+/// two distinct runs can be reachable. This is an **observation**, not a quota
+/// and not a theorem about the disk: it holds only when the strict resume-point
+/// proof was available at all, and the pass deliberately reports
+/// `unclassified_preserved` runs it could not authenticate rather than counting
+/// them. A pass that refused to reclaim *because* the count was already too
+/// high would make the leak permanent, and a pass that deleted to satisfy a
+/// count would be deleting evidence it had not proved unreachable.
 pub(crate) const MAX_RETAINED_SCRATCH_RUNS: usize = 2;
 const MAX_PAGE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_BLOB_BYTES: usize = 256 * 1024 * 1024;
