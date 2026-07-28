@@ -1198,7 +1198,11 @@ impl ProjectionIntent {
     /// replay the current accepted state and compare through this method before
     /// using that base; this is not authority to skip the replay.
     pub(crate) fn matches_replay_except_frontier(&self, replay: &Self) -> bool {
-        self.workspace_id == replay.workspace_id
+        self.receipt_schema_version == replay.receipt_schema_version
+            && self.projection_schema_version == replay.projection_schema_version
+            && self.projection_policy_version == replay.projection_policy_version
+            && self.managed_entity_set_version == replay.managed_entity_set_version
+            && self.workspace_id == replay.workspace_id
             && self.page_id == replay.page_id
             && self.path == replay.path
             && self.policy == replay.policy
@@ -2000,6 +2004,47 @@ mod tests {
             derivation.push_inventory(entry)?;
         }
         derivation.finish()
+    }
+
+    #[test]
+    fn projection_replay_equivalence_relaxes_only_the_frontier() {
+        let base = ProjectionIntent::new(
+            workspace(),
+            PageId::from_uuid(Uuid::from_u128(2)),
+            ManagedPath::parse("pages/base.md").unwrap(),
+            FrontierV2::default(),
+            Vec::new(),
+            ProjectionPrecondition::Base(BlobDescription::of(b"- base\n")),
+            BlobDescription::of(b"- target\n"),
+            Vec::new(),
+        )
+        .unwrap();
+        let mut later_frontier = base.clone();
+        later_frontier.frontier = FrontierV2::new(vec![DocumentDependencies::new(
+            DocumentId::from_uuid(Uuid::from_u128(3)),
+            Vec::new(),
+            vec![BatchId::from_uuid(Uuid::from_u128(4))],
+        )
+        .unwrap()])
+        .unwrap();
+        assert!(base.matches_replay_except_frontier(&later_frontier));
+
+        let mut mutations: Vec<Box<dyn Fn(&mut ProjectionIntent)>> = vec![
+            Box::new(|intent| intent.receipt_schema_version += 1),
+            Box::new(|intent| intent.projection_schema_version += 1),
+            Box::new(|intent| intent.projection_policy_version += 1),
+            Box::new(|intent| intent.managed_entity_set_version += 1),
+            Box::new(|intent| intent.workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(5))),
+            Box::new(|intent| intent.page_id = PageId::from_uuid(Uuid::from_u128(6))),
+            Box::new(|intent| intent.path = ManagedPath::parse("pages/other.md").unwrap()),
+            Box::new(|intent| intent.precondition = ProjectionPrecondition::Absent),
+            Box::new(|intent| intent.target = BlobDescription::of(b"- other target\n")),
+        ];
+        for mutate in mutations.drain(..) {
+            let mut changed = later_frontier.clone();
+            mutate(&mut changed);
+            assert!(!base.matches_replay_except_frontier(&changed));
+        }
     }
 
     /// Frozen test-only reproduction of the ImportId v2 wire contract that

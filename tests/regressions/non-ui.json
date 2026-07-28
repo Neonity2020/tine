@@ -1056,6 +1056,31 @@
         "scenario": "sync.watcher-oversize-refusal-retains-full-scan-before-safe",
         "failBefore": "proven"
       }
+    },
+    {
+      "id": "REG-SYNC-DELETE-STALE-GLOBAL-FRONTIER-001",
+      "title": "An unrelated accepted rename cannot invalidate the exact durable base for a later external page delete",
+      "family": "data-safety",
+      "sources": {
+        "issues": [],
+        "commits": [
+          "8c03b84c",
+          "5c49cac0"
+        ]
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/sync_runtime.rs",
+          "crates/tine-core/src/oplog/receipt.rs"
+        ],
+        "scenario": "sync.external-delete-after-unrelated-accepted-rename",
+        "failBefore": "proven"
+      }
     }
   ]
 }
