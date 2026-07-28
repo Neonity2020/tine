@@ -53,13 +53,13 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::hot_engine::AcceptedFrontierRoot;
+use super::hot_engine::{AcceptedFrontierRoot, RuntimeResumeSnapshot};
 use super::object_store::{
     open_existing_dir_nofollow, read_optional_regular, sync_dir_required, BlockClaimIndexRoot,
-    StoreError,
+    ResumeAdoptionAuthority, ResumePointEndpointBinding, StoreError,
 };
 use super::scratch_store::{ScratchAuthenticatedCatalogRoot, ScratchRoots};
-use super::{ContentDigest, SessionId, WorkspaceId};
+use super::{BatchId, ContentDigest, SessionId, WorkspaceId};
 
 /// Directory of published resume points, beneath one endpoint's durable
 /// engine-history control directory.
@@ -112,8 +112,11 @@ pub(crate) const RESUME_POINT_SCHEMA_VERSION: u32 = 1;
 /// format admits — every LSM level and every block-claim segment occupied, key
 /// spans at the widest key any carried lane stores, and every scalar at its
 /// widest *encodable* value so offsets and generations cost full 10-byte
-/// varints no real run reaches — and encodes it. It is **117,713 bytes** against
-/// this 131,072-byte ceiling.
+/// varints no real run reaches — and encodes it. It is **117,795 bytes** against
+/// this 131,072-byte ceiling. (117,713 before the two lifecycle members
+/// `history_latest_batch_id` and `catalog_checkpoint_binding` were added; both
+/// are fixed-size, so they cost a flat 82 bytes at every shape — see
+/// `the_lifecycle_fields_cost_a_constant_and_keep_the_record_bounded`.)
 ///
 /// That margin is about 10%, materially tighter than the ~88 KiB the ceiling
 /// was first derived from, which is exactly why the test asserts a band in both
@@ -185,6 +188,15 @@ pub(crate) enum ResumePointError {
     /// An entry in the resume-point directory that is not a published point
     /// and not this repository's own publication residue.
     UnexpectedEntry(String),
+    /// A point that decodes and validates as a record, but does not bind the
+    /// live open: another workspace, another endpoint's promoted runtime
+    /// state, an enrollment record or session the live evidence contradicts,
+    /// or a durable history authority the live head substitutes.
+    ///
+    /// This is an *accelerator-unavailable* verdict, never a corruption claim
+    /// and never authority: the bytes stay exactly where they are and the
+    /// restart pays a full replay.
+    BindingRefused(&'static str),
     Io(String),
 }
 
@@ -208,6 +220,9 @@ impl std::fmt::Display for ResumePointError {
             }
             Self::UnexpectedEntry(name) => {
                 write!(f, "unexpected runtime resume-point entry {name:?}")
+            }
+            Self::BindingRefused(reason) => {
+                write!(f, "runtime resume point does not bind this open: {reason}")
             }
             Self::Io(error) => write!(f, "runtime resume-point I/O failed: {error}"),
         }
@@ -254,6 +269,41 @@ struct SealedResumePointV1 {
     payload_digest: ContentDigest,
 }
 
+/// The authenticated `LocalActive` evidence one publication records.
+///
+/// Supplied by the caller because nothing in this module can read the
+/// enrollment chain. It is deliberately *evidence*, not authority: the liveness
+/// oracle is the archive-rooted workspace runtime lease, never a recorded
+/// session identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ResumePointEnrollment {
+    /// `EnrollmentRecordV1.generation` — the only real ordering counter in the
+    /// system.
+    pub(crate) generation: u64,
+    pub(crate) head: ContentDigest,
+    pub(crate) unsafe_session_id: SessionId,
+}
+
+/// How a resuming open compares a published point's recorded `LocalActive`
+/// evidence with the enrollment record it has just authenticated.
+///
+/// Both arms are legitimate, and getting the distinction wrong in either
+/// direction is a real fault: requiring an exact match would refuse every
+/// post-takeover adoption (the run-local roots are bound to durable history,
+/// not to a session), while accepting anything would let a point published by
+/// a *superseded* generation claim the live one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ResumeEnrollmentAdmission {
+    /// The ordinary same-lineage reopen: the point must name exactly this
+    /// enrollment record and this session.
+    SameSession(ResumePointEnrollment),
+    /// A crash takeover minted a new session at a strictly later enrollment
+    /// generation, so the point legitimately predates the live record: it must
+    /// name an earlier generation and must claim neither the live head nor the
+    /// live session.
+    SupersededBy(ResumePointEnrollment),
+}
+
 /// One durable runtime resume point.
 ///
 /// Field selection: the durable `ColdHistoryRecord` already commits, per
@@ -263,6 +313,14 @@ struct SealedResumePointV1 {
 /// binding. Comparing that against the state a run-local reconstruction must
 /// carry leaves exactly the members below. Everything else is a reopened
 /// capability, a process-local mint, or observational telemetry.
+///
+/// **Every field is private, and that is the packet's main fence.** A record is
+/// assembled only by [`Self::seal`], from a [`RuntimeResumeSnapshot`] that only
+/// a quiescent retained engine mints plus a [`ResumePointEndpointBinding`] that
+/// only the durable history store mints. There is deliberately no open
+/// field-by-field constructor for the lifecycle caller to fill in partially, so
+/// "the publisher forgot a fact" is a compile error rather than a record that
+/// silently under-binds.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RuntimeResumePointV1 {
@@ -270,47 +328,404 @@ pub(crate) struct RuntimeResumePointV1 {
     /// file name so a copied, renamed, or provider-restored file fails closed.
     /// Sequence zero is never published, so "no point" and "sequence 0" cannot
     /// be confused.
-    pub(crate) resume_sequence: u64,
+    resume_sequence: u64,
 
     // ---- authenticated binding ----
-    pub(crate) workspace_id: WorkspaceId,
+    workspace_id: WorkspaceId,
     /// `ContentDigest::of(&PromotedRuntimeStateV1::encode())`. This transitively
     /// binds the endpoint, device, graph resource, receipt store, archive
     /// resource claim, archive control identity, lineage, catalog document,
     /// bootstrap aggregate/import identity, the bootstrap anchor authority, the
     /// enrollment verification/binding digests, and the promotion session — one
     /// field instead of thirteen restatements that could drift apart.
-    pub(crate) promoted_state_digest: ContentDigest,
+    promoted_state_digest: ContentDigest,
 
     // ---- durable-history authority the run-local roots correspond to ----
-    pub(crate) history_generation: u64,
-    pub(crate) history_index_root: ContentDigest,
+    history_generation: u64,
+    history_index_root: ContentDigest,
+    /// The durable record at exactly `history_generation`.
+    ///
+    /// Load-bearing, not diagnostic. `prepare_operational_recovery_replay`
+    /// discards every durable-derived root, and the values a fresh open
+    /// installed are the ones at the *live* head rather than at this point's
+    /// base generation. Adoption therefore re-reads this exact record at the
+    /// live sealed root and restores those roots *from it*, re-validating each
+    /// against the archive's own authenticated indexes. Sixteen bytes buy an
+    /// authenticated restore instead of a transported one.
+    history_latest_batch_id: BatchId,
 
     // ---- LocalActive lifecycle evidence ----
     /// `EnrollmentRecordV1.generation` of the record whose lifecycle carries
-    /// `HandoffV1::Unsafe`. Diagnostic and generation-ordering evidence only:
-    /// the liveness oracle is the archive-rooted workspace runtime lease, never
-    /// a recorded session identity. After a crash takeover the recorded head
-    /// and session deliberately differ from the live ones.
-    pub(crate) enrollment_generation: u64,
-    pub(crate) enrollment_head: ContentDigest,
-    pub(crate) unsafe_session_id: SessionId,
+    /// `HandoffV1::Unsafe`. Ordering evidence, re-proved at adoption against
+    /// [`ResumeEnrollmentAdmission`]: the liveness oracle is the archive-rooted
+    /// workspace runtime lease, never a recorded session identity. After a
+    /// crash takeover the recorded head and session deliberately differ from
+    /// the live ones.
+    enrollment_generation: u64,
+    enrollment_head: ContentDigest,
+    unsafe_session_id: SessionId,
 
     // ---- the retained run ----
-    pub(crate) scratch_run_id: Uuid,
+    scratch_run_id: Uuid,
     /// `ScratchStore::binding_digest()`, i.e. the digest of the run's own
     /// canonical marker. This catches a run whose owner nonce was replaced —
     /// a re-created run reusing the same UUID.
-    pub(crate) scratch_binding_digest: ContentDigest,
+    scratch_binding_digest: ContentDigest,
 
     // ---- run-local roots not derivable from the durable history record ----
-    pub(crate) scratch_roots: ScratchRoots,
-    pub(crate) block_claim_root: BlockClaimIndexRoot,
-    pub(crate) accepted_frontier_root: AcceptedFrontierRoot,
-    pub(crate) next_acceptance_sequence: u64,
-    pub(crate) current_path_catalog_root: ScratchAuthenticatedCatalogRoot,
-    pub(crate) current_path_catalog_available: bool,
-    pub(crate) current_path_catalog_frontier: AcceptedFrontierRoot,
+    scratch_roots: ScratchRoots,
+    block_claim_root: BlockClaimIndexRoot,
+    accepted_frontier_root: AcceptedFrontierRoot,
+    next_acceptance_sequence: u64,
+    current_path_catalog_root: ScratchAuthenticatedCatalogRoot,
+    current_path_catalog_available: bool,
+    current_path_catalog_frontier: AcceptedFrontierRoot,
+    /// The catalog checkpoint binding the snapshotting engine computed from
+    /// exactly these `scratch_roots` and its own catalog document heads.
+    ///
+    /// Also load-bearing. The catalog document's direct heads are run-local and
+    /// feed `catalog_checkpoint_binding`, which every accepted batch's
+    /// `EngineHistoryBinding` must reproduce; adoption re-derives them from the
+    /// adopted run's own authenticated document lane, and this digest is what
+    /// binds that derivation to these roots. A run whose document lane and LSM
+    /// roots have drifted apart is refused instead of resumed.
+    catalog_checkpoint_binding: ContentDigest,
+}
+
+impl RuntimeResumePointV1 {
+    /// Seal one record from a quiescent live engine plus the store's own
+    /// endpoint binding.
+    ///
+    /// This is the whole construction surface. `snapshot` can only come from
+    /// `ShardedHotEngine::runtime_resume_snapshot`, which refuses every
+    /// non-retained, non-quiescent, non-clean or non-adoptable engine, and
+    /// `binding` can only come from the durable history store, which reads this
+    /// endpoint's promoted runtime state through its own authorization boundary
+    /// and derives the next sequence from an actual survey. The caller supplies
+    /// only the one thing neither of them can see: the enrollment evidence it
+    /// has authenticated itself.
+    pub(crate) fn seal(
+        binding: &ResumePointEndpointBinding,
+        enrollment: ResumePointEnrollment,
+        snapshot: &RuntimeResumeSnapshot,
+    ) -> Result<Self, ResumePointError> {
+        let point = Self {
+            resume_sequence: binding.next_sequence(),
+            workspace_id: binding.workspace_id(),
+            promoted_state_digest: binding.promoted_state_digest(),
+            history_generation: snapshot.history_generation(),
+            history_index_root: snapshot.history_index_root(),
+            history_latest_batch_id: snapshot.history_latest_batch_id(),
+            enrollment_generation: enrollment.generation,
+            enrollment_head: enrollment.head,
+            unsafe_session_id: enrollment.unsafe_session_id,
+            scratch_run_id: snapshot.scratch_run_id(),
+            scratch_binding_digest: snapshot.scratch_binding_digest(),
+            scratch_roots: snapshot.scratch_roots().clone(),
+            block_claim_root: *snapshot.block_claim_root(),
+            accepted_frontier_root: snapshot.accepted_frontier_root().clone(),
+            next_acceptance_sequence: snapshot.next_acceptance_sequence(),
+            current_path_catalog_root: snapshot.current_path_catalog_root().clone(),
+            current_path_catalog_available: snapshot.current_path_catalog_available(),
+            current_path_catalog_frontier: snapshot.current_path_catalog_frontier().clone(),
+            catalog_checkpoint_binding: snapshot.catalog_checkpoint_binding(),
+        };
+        point.validate()?;
+        Ok(point)
+    }
+
+    /// Re-prove every authority of the live open against this record.
+    ///
+    /// The refusals are the whole point, and each is an
+    /// *accelerator-unavailable* verdict rather than a corruption claim: the
+    /// bytes are left exactly as they are and the restart pays a full replay,
+    /// which is always available and always correct.
+    ///
+    /// What is proved here:
+    ///
+    /// * **workspace and endpoint** — the workspace id directly, and the
+    ///   endpoint transitively through `promoted_state_digest`, because the
+    ///   authority's digest is derived from the durable promoted runtime state
+    ///   that `require_promoted_state_binding` already proved names *this*
+    ///   endpoint and *this* physical archive directory. A stale byte-identical
+    ///   copy of another archive carries a different control-directory identity
+    ///   and therefore a different digest, so its points cannot bind here;
+    /// * **durable history binding** — a point may legitimately name an
+    ///   *older* generation than the live head, because the whole purpose of
+    ///   adoption is to replay only the durable tail. It may never name a
+    ///   generation *ahead* of the live head, and at the live generation it
+    ///   must name the live index root and the live latest record. That is the
+    ///   substituted/stale-binding refusal;
+    /// * **enrollment evidence** — exactly as [`ResumeEnrollmentAdmission`]
+    ///   describes.
+    ///
+    /// Everything the record says about the retained run and the run-local
+    /// roots is carried into the snapshot and re-proved *again* by the engine,
+    /// against the run's own bytes and against the sealed history. Nothing here
+    /// is authority; this is the gate that decides whether the accelerator is
+    /// even offered.
+    pub(crate) fn authenticate<'a>(
+        &'a self,
+        authority: &ResumeAdoptionAuthority,
+    ) -> Result<AuthenticatedResumePoint<'a>, ResumePointError> {
+        self.validate()?;
+        if self.workspace_id != authority.workspace_id() {
+            return Err(ResumePointError::BindingRefused(
+                "the point is bound to another workspace",
+            ));
+        }
+        if self.promoted_state_digest != authority.promoted_state_digest() {
+            return Err(ResumePointError::BindingRefused(
+                "the point is bound to another endpoint's promoted runtime state",
+            ));
+        }
+        if self.history_generation > authority.history_generation() {
+            return Err(ResumePointError::BindingRefused(
+                "the point names a durable history generation ahead of the live head",
+            ));
+        }
+        if self.history_generation == authority.history_generation()
+            && (self.history_index_root != authority.history_index_root()
+                || Some(self.history_latest_batch_id) != authority.history_latest_batch_id())
+        {
+            return Err(ResumePointError::BindingRefused(
+                "the point names a substituted durable history authority at the live generation",
+            ));
+        }
+        match authority.enrollment() {
+            ResumeEnrollmentAdmission::SameSession(live) => {
+                if self.enrollment_generation != live.generation
+                    || self.enrollment_head != live.head
+                    || self.unsafe_session_id != live.unsafe_session_id
+                {
+                    return Err(ResumePointError::BindingRefused(
+                        "the point does not name the live enrollment record and session",
+                    ));
+                }
+            }
+            ResumeEnrollmentAdmission::SupersededBy(live) => {
+                if self.enrollment_generation >= live.generation
+                    || self.enrollment_head == live.head
+                    || self.unsafe_session_id == live.unsafe_session_id
+                {
+                    return Err(ResumePointError::BindingRefused(
+                        "the point does not predate the enrollment record that superseded it",
+                    ));
+                }
+            }
+        }
+        Ok(AuthenticatedResumePoint::seal(self))
+    }
+
+    pub(crate) const fn resume_sequence(&self) -> u64 {
+        self.resume_sequence
+    }
+
+    pub(crate) const fn workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
+    }
+
+    pub(crate) const fn promoted_state_digest(&self) -> ContentDigest {
+        self.promoted_state_digest
+    }
+
+    pub(crate) const fn history_generation(&self) -> u64 {
+        self.history_generation
+    }
+
+    pub(crate) const fn history_index_root(&self) -> ContentDigest {
+        self.history_index_root
+    }
+
+    pub(crate) const fn history_latest_batch_id(&self) -> BatchId {
+        self.history_latest_batch_id
+    }
+
+    pub(crate) const fn enrollment(&self) -> ResumePointEnrollment {
+        ResumePointEnrollment {
+            generation: self.enrollment_generation,
+            head: self.enrollment_head,
+            unsafe_session_id: self.unsafe_session_id,
+        }
+    }
+
+    pub(crate) const fn scratch_run_id(&self) -> Uuid {
+        self.scratch_run_id
+    }
+
+    pub(crate) const fn scratch_binding_digest(&self) -> ContentDigest {
+        self.scratch_binding_digest
+    }
+
+    pub(crate) const fn scratch_roots(&self) -> &ScratchRoots {
+        &self.scratch_roots
+    }
+
+    pub(crate) const fn block_claim_root(&self) -> &BlockClaimIndexRoot {
+        &self.block_claim_root
+    }
+
+    pub(crate) const fn accepted_frontier_root(&self) -> &AcceptedFrontierRoot {
+        &self.accepted_frontier_root
+    }
+
+    pub(crate) const fn next_acceptance_sequence(&self) -> u64 {
+        self.next_acceptance_sequence
+    }
+
+    pub(crate) const fn current_path_catalog_root(&self) -> &ScratchAuthenticatedCatalogRoot {
+        &self.current_path_catalog_root
+    }
+
+    pub(crate) const fn current_path_catalog_available(&self) -> bool {
+        self.current_path_catalog_available
+    }
+
+    pub(crate) const fn current_path_catalog_frontier(&self) -> &AcceptedFrontierRoot {
+        &self.current_path_catalog_frontier
+    }
+
+    pub(crate) const fn catalog_checkpoint_binding(&self) -> ContentDigest {
+        self.catalog_checkpoint_binding
+    }
+}
+
+/// The format-level derivation surface, `#[cfg(test)]` on purpose.
+///
+/// Storage-layer and format tests need records that no live engine would
+/// produce — a foreign workspace, a substituted history root, a superseded
+/// session. Production has exactly one construction route
+/// ([`RuntimeResumePointV1::seal`]), and keeping these behind `cfg(test)` is
+/// what stops "a test needed a mutable field" from turning back into the open
+/// constructor the fence exists to remove.
+#[cfg(test)]
+impl RuntimeResumePointV1 {
+    /// One empty-rooted record, for tests with no live engine to snapshot.
+    pub(crate) fn empty_rooted_for_test(
+        binding: &ResumePointEndpointBinding,
+        enrollment: ResumePointEnrollment,
+        history: (u64, ContentDigest, BatchId),
+        scratch: (Uuid, ContentDigest),
+    ) -> Self {
+        Self {
+            resume_sequence: binding.next_sequence(),
+            workspace_id: binding.workspace_id(),
+            promoted_state_digest: binding.promoted_state_digest(),
+            history_generation: history.0,
+            history_index_root: history.1,
+            history_latest_batch_id: history.2,
+            enrollment_generation: enrollment.generation,
+            enrollment_head: enrollment.head,
+            unsafe_session_id: enrollment.unsafe_session_id,
+            scratch_run_id: scratch.0,
+            scratch_binding_digest: scratch.1,
+            scratch_roots: ScratchRoots::default(),
+            block_claim_root: BlockClaimIndexRoot::default(),
+            accepted_frontier_root: AcceptedFrontierRoot::empty(),
+            next_acceptance_sequence: 1,
+            current_path_catalog_root: ScratchAuthenticatedCatalogRoot::default(),
+            current_path_catalog_available: true,
+            current_path_catalog_frontier: AcceptedFrontierRoot::empty(),
+            catalog_checkpoint_binding: ContentDigest::of(b"resume-point-test-catalog-checkpoint"),
+        }
+    }
+
+    pub(crate) fn with_resume_sequence_for_test(mut self, sequence: u64) -> Self {
+        self.resume_sequence = sequence;
+        self
+    }
+
+    pub(crate) fn with_workspace_id_for_test(mut self, workspace_id: WorkspaceId) -> Self {
+        self.workspace_id = workspace_id;
+        self
+    }
+
+    pub(crate) fn with_promoted_state_digest_for_test(mut self, digest: ContentDigest) -> Self {
+        self.promoted_state_digest = digest;
+        self
+    }
+
+    pub(crate) fn with_history_for_test(
+        mut self,
+        generation: u64,
+        index_root: ContentDigest,
+        latest_batch_id: BatchId,
+    ) -> Self {
+        self.history_generation = generation;
+        self.history_index_root = index_root;
+        self.history_latest_batch_id = latest_batch_id;
+        self
+    }
+
+    pub(crate) fn with_enrollment_for_test(mut self, enrollment: ResumePointEnrollment) -> Self {
+        self.enrollment_generation = enrollment.generation;
+        self.enrollment_head = enrollment.head;
+        self.unsafe_session_id = enrollment.unsafe_session_id;
+        self
+    }
+
+    pub(crate) fn with_scratch_run_for_test(
+        mut self,
+        run_id: Uuid,
+        binding_digest: ContentDigest,
+    ) -> Self {
+        self.scratch_run_id = run_id;
+        self.scratch_binding_digest = binding_digest;
+        self
+    }
+
+    pub(crate) fn with_catalog_checkpoint_binding_for_test(
+        mut self,
+        digest: ContentDigest,
+    ) -> Self {
+        self.catalog_checkpoint_binding = digest;
+        self
+    }
+}
+
+pub(crate) use authenticated::AuthenticatedResumePoint;
+
+/// The entire privacy scope of the adoption witness.
+///
+/// Same discipline as [`reachability`], for the same reason: the type is the
+/// authority boundary, so the surface that can mint one has to be small enough
+/// to review in one screen. The tuple field is private to this module, so the
+/// only route to a witness is [`RuntimeResumePointV1::authenticate`] — anything
+/// else is `E0616`, a compile error, not a convention.
+mod authenticated {
+    use super::*;
+
+    /// A resume point that re-proved every authority of one live open.
+    ///
+    /// It borrows the point rather than owning it, so a witness can never
+    /// outlive, or be re-bound to, the record it was proved against. Holding
+    /// one still authorizes nothing on its own: the only thing it unlocks is
+    /// the sealed conversion back into the engine snapshot, and the engine then
+    /// re-proves the run, the durable descent and every run-local root from
+    /// bytes before it reuses anything.
+    pub(crate) struct AuthenticatedResumePoint<'a>(&'a RuntimeResumePointV1);
+
+    impl<'a> AuthenticatedResumePoint<'a> {
+        pub(super) const fn seal(point: &'a RuntimeResumePointV1) -> Self {
+            Self(point)
+        }
+
+        pub(crate) const fn point(&self) -> &RuntimeResumePointV1 {
+            self.0
+        }
+
+        /// Reconstruct the exact snapshot the live engine emitted.
+        ///
+        /// The conversion is total and lossless by construction: every member
+        /// of `RuntimeResumeSnapshot` has a field of this record, and
+        /// [`RuntimeResumePointV1::seal`] filled every one of them from the
+        /// emitting engine's own snapshot. That is what makes "a valid record
+        /// reconstructs the snapshot the engine emitted" an equality rather
+        /// than an approximation.
+        pub(crate) fn into_adoption_snapshot(self) -> RuntimeResumeSnapshot {
+            RuntimeResumeSnapshot::from_authenticated_resume_point(&self)
+        }
+    }
 }
 
 impl RuntimeResumePointV1 {
@@ -856,6 +1271,7 @@ fn decode_canonical<T: DeserializeOwned + Serialize>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::oplog::object_store::ResumeAdoptionAuthority;
     use cap_std::ambient_authority;
     use std::path::{Path, PathBuf};
 
@@ -908,6 +1324,8 @@ mod tests {
             current_path_catalog_root: ScratchAuthenticatedCatalogRoot::default(),
             current_path_catalog_available: true,
             current_path_catalog_frontier: AcceptedFrontierRoot::empty(),
+            history_latest_batch_id: BatchId::from_uuid(Uuid::from_u128(0x9004)),
+            catalog_checkpoint_binding: digest(0x55),
         }
     }
 
@@ -960,6 +1378,12 @@ mod tests {
         with("current_path_catalog_frontier", |p| {
             p.current_path_catalog_frontier = tweaked(&p.current_path_catalog_frontier, 1, 4);
         });
+        with("history_latest_batch_id", |p| {
+            p.history_latest_batch_id = BatchId::from_uuid(Uuid::from_u128(0x9104));
+        });
+        with("catalog_checkpoint_binding", |p| {
+            p.catalog_checkpoint_binding = digest(0x56);
+        });
         mutations
     }
 
@@ -999,6 +1423,345 @@ mod tests {
             );
             assert_eq!(RuntimeResumePointV1::decode(&bytes).unwrap(), mutated);
         }
+    }
+
+    /// The two lifecycle members the persistent format was missing.
+    ///
+    /// Both are load-bearing rather than diagnostic — without them a published
+    /// point cannot be turned back into an adoptable snapshot at all — so this
+    /// pins three separate things: that they survive a round trip, that they
+    /// are inside the sealed payload digest, and that they are *fixed-size*, so
+    /// the record's structural bound is unchanged in kind and moved only by a
+    /// constant.
+    #[test]
+    fn the_lifecycle_fields_cost_a_constant_and_keep_the_record_bounded() {
+        let original = point(1);
+        let bytes = original.encode().unwrap();
+        let decoded = RuntimeResumePointV1::decode(&bytes).unwrap();
+        assert_eq!(
+            decoded.history_latest_batch_id(),
+            original.history_latest_batch_id()
+        );
+        assert_eq!(
+            decoded.catalog_checkpoint_binding(),
+            original.catalog_checkpoint_binding()
+        );
+        assert_eq!(decoded, original);
+
+        // Fixed-size: every value of either member costs the same bytes, so
+        // neither can smuggle per-page, per-block or per-batch state into a
+        // record whose ceiling is argued structurally.
+        let widened = original
+            .clone()
+            .with_history_for_test(
+                original.history_generation(),
+                original.history_index_root(),
+                BatchId::from_uuid(Uuid::max()),
+            )
+            .with_catalog_checkpoint_binding_for_test(ContentDigest::of(&[0xff_u8; 4096]));
+        assert_eq!(widened.encode().unwrap().len(), bytes.len());
+        assert_ne!(widened, original);
+        assert!(bytes.len() as u64 <= MAX_RESUME_POINT_BYTES);
+    }
+
+    /// The authority a live open re-proves a point against. Built from the
+    /// point itself so each refusal test perturbs exactly one fact.
+    fn adoption_authority(point: &RuntimeResumePointV1) -> ResumeAdoptionAuthority {
+        ResumeAdoptionAuthority::for_test(
+            point.workspace_id(),
+            crate::oplog::ProjectionEndpointId::from_uuid(Uuid::from_u128(0x9500)),
+            point.promoted_state_digest(),
+            (
+                point.history_generation(),
+                point.history_index_root(),
+                Some(point.history_latest_batch_id()),
+            ),
+            ResumeEnrollmentAdmission::SameSession(point.enrollment()),
+        )
+    }
+
+    fn refusal(point: &RuntimeResumePointV1, authority: &ResumeAdoptionAuthority) -> &'static str {
+        match point.authenticate(authority) {
+            Ok(_) => panic!("the conversion accepted a point it must refuse"),
+            Err(ResumePointError::BindingRefused(reason)) => reason,
+            Err(other) => panic!("expected a binding refusal, got {other:?}"),
+        }
+    }
+
+    /// Every authority a published point must re-prove before it may become an
+    /// adoption candidate.
+    ///
+    /// The endpoint is deliberately not a field of its own: it is bound
+    /// transitively through `promoted_state_digest`, because that digest covers
+    /// the durable promoted runtime state, which the store only ever reads
+    /// through a boundary proving it names this endpoint *and* this physical
+    /// archive directory. A stale byte-identical copy of another archive
+    /// therefore carries a different digest, which is the `foreign endpoint`
+    /// case below.
+    #[test]
+    fn the_conversion_refuses_every_authority_it_cannot_reprove() {
+        let point = point(7);
+        let authority = adoption_authority(&point);
+        assert!(point.authenticate(&authority).is_ok());
+
+        let foreign_workspace = ResumeAdoptionAuthority::for_test(
+            WorkspaceId::from_uuid(Uuid::from_u128(0x9999)),
+            authority.endpoint_id(),
+            authority.promoted_state_digest(),
+            (
+                authority.history_generation(),
+                authority.history_index_root(),
+                authority.history_latest_batch_id(),
+            ),
+            authority.enrollment(),
+        );
+        assert_eq!(
+            refusal(&point, &foreign_workspace),
+            "the point is bound to another workspace"
+        );
+
+        let foreign_endpoint = ResumeAdoptionAuthority::for_test(
+            authority.workspace_id(),
+            crate::oplog::ProjectionEndpointId::from_uuid(Uuid::from_u128(0x9501)),
+            ContentDigest::of(b"another endpoint's promoted runtime state"),
+            (
+                authority.history_generation(),
+                authority.history_index_root(),
+                authority.history_latest_batch_id(),
+            ),
+            authority.enrollment(),
+        );
+        assert_eq!(
+            refusal(&point, &foreign_endpoint),
+            "the point is bound to another endpoint's promoted runtime state"
+        );
+
+        // Stale history authority, both shapes. A point *behind* the live head
+        // is legitimate — replaying only the durable tail is the entire purpose
+        // — so the refusals are "ahead of the head" and "substituted at the
+        // head", never "not exactly the head".
+        let behind = ResumeAdoptionAuthority::for_test(
+            authority.workspace_id(),
+            authority.endpoint_id(),
+            authority.promoted_state_digest(),
+            (
+                point.history_generation() + 4,
+                digest(0xa1),
+                Some(BatchId::from_uuid(Uuid::from_u128(0x9502))),
+            ),
+            authority.enrollment(),
+        );
+        assert!(
+            point.authenticate(&behind).is_ok(),
+            "an older point must stay adoptable, or adoption can never skip a tail"
+        );
+
+        let ahead = ResumeAdoptionAuthority::for_test(
+            authority.workspace_id(),
+            authority.endpoint_id(),
+            authority.promoted_state_digest(),
+            (
+                point.history_generation() - 1,
+                authority.history_index_root(),
+                authority.history_latest_batch_id(),
+            ),
+            authority.enrollment(),
+        );
+        assert_eq!(
+            refusal(&point, &ahead),
+            "the point names a durable history generation ahead of the live head"
+        );
+
+        let substituted_root = ResumeAdoptionAuthority::for_test(
+            authority.workspace_id(),
+            authority.endpoint_id(),
+            authority.promoted_state_digest(),
+            (
+                point.history_generation(),
+                digest(0xa2),
+                authority.history_latest_batch_id(),
+            ),
+            authority.enrollment(),
+        );
+        assert_eq!(
+            refusal(&point, &substituted_root),
+            "the point names a substituted durable history authority at the live generation"
+        );
+
+        let substituted_record = ResumeAdoptionAuthority::for_test(
+            authority.workspace_id(),
+            authority.endpoint_id(),
+            authority.promoted_state_digest(),
+            (
+                point.history_generation(),
+                authority.history_index_root(),
+                Some(BatchId::from_uuid(Uuid::from_u128(0x9503))),
+            ),
+            authority.enrollment(),
+        );
+        assert_eq!(
+            refusal(&point, &substituted_record),
+            "the point names a substituted durable history authority at the live generation"
+        );
+    }
+
+    /// Enrollment evidence, in both admissible directions.
+    ///
+    /// Getting either direction wrong is a real fault: requiring an exact match
+    /// would refuse every post-takeover adoption, and accepting anything would
+    /// let a point published by a superseded generation claim the live one.
+    #[test]
+    fn the_conversion_refuses_enrollment_evidence_the_live_record_contradicts() {
+        let point = point(7);
+        let live = point.enrollment();
+        let with = |enrollment| {
+            ResumeAdoptionAuthority::for_test(
+                point.workspace_id(),
+                crate::oplog::ProjectionEndpointId::from_uuid(Uuid::from_u128(0x9500)),
+                point.promoted_state_digest(),
+                (
+                    point.history_generation(),
+                    point.history_index_root(),
+                    Some(point.history_latest_batch_id()),
+                ),
+                enrollment,
+            )
+        };
+
+        // Same-session: every member must match exactly.
+        assert!(point
+            .authenticate(&with(ResumeEnrollmentAdmission::SameSession(live)))
+            .is_ok());
+        for wrong in [
+            ResumePointEnrollment {
+                generation: live.generation + 1,
+                ..live
+            },
+            ResumePointEnrollment {
+                head: digest(0xb1),
+                ..live
+            },
+            ResumePointEnrollment {
+                unsafe_session_id: SessionId::from_uuid(Uuid::from_u128(0x9601)),
+                ..live
+            },
+        ] {
+            assert_eq!(
+                refusal(&point, &with(ResumeEnrollmentAdmission::SameSession(wrong))),
+                "the point does not name the live enrollment record and session"
+            );
+        }
+
+        // Takeover: the point must strictly predate the successor record and
+        // must claim neither its head nor its session.
+        let successor = ResumePointEnrollment {
+            generation: live.generation + 1,
+            head: digest(0xb2),
+            unsafe_session_id: SessionId::from_uuid(Uuid::from_u128(0x9602)),
+        };
+        assert!(point
+            .authenticate(&with(ResumeEnrollmentAdmission::SupersededBy(successor)))
+            .is_ok());
+        for not_superseded in [
+            // Same generation: nothing superseded anything.
+            ResumePointEnrollment {
+                generation: live.generation,
+                ..successor
+            },
+            // A successor that claims the point's own head or session is not a
+            // successor at all.
+            ResumePointEnrollment {
+                head: live.head,
+                ..successor
+            },
+            ResumePointEnrollment {
+                unsafe_session_id: live.unsafe_session_id,
+                ..successor
+            },
+        ] {
+            assert_eq!(
+                refusal(
+                    &point,
+                    &with(ResumeEnrollmentAdmission::SupersededBy(not_superseded))
+                ),
+                "the point does not predate the enrollment record that superseded it"
+            );
+        }
+    }
+
+    /// Nested and non-ASCII directory names are ordinary on a real graph, and
+    /// they must be invisible to this format.
+    ///
+    /// Two properties, both load-bearing. The record must be **byte-identical**
+    /// regardless of where its directory lives — no payload member is
+    /// path-derived, which is the same reason the record does not scale with
+    /// graph size — and every binding, scan and reachability semantic must be
+    /// unchanged. If a path ever leaked into the payload, the ceiling argument
+    /// and the cross-device binding argument would both stop holding.
+    #[test]
+    fn nested_and_utf8_directories_change_neither_record_size_nor_binding() {
+        let plain_root = resume_root("path-plain");
+        let plain = open_root(&plain_root);
+        let nested_root = resume_root("path-nested")
+            .join("résumé")
+            .join("日本語のフォルダ")
+            .join("a b/c-d")
+            .join("emoji-🗂️")
+            .join("deeply/nested/enough/to/matter");
+        let nested = open_root(&nested_root);
+
+        let record = point(3);
+        let bytes = record.encode().unwrap();
+        publish(&plain_root, &record);
+        publish(&nested_root, &record);
+        assert_eq!(
+            std::fs::read(plain_root.join(record.file_name())).unwrap(),
+            std::fs::read(nested_root.join(record.file_name())).unwrap(),
+            "the same record must encode to the same bytes at any path"
+        );
+        // A sentinel, not a contract: the load-bearing claim is the
+        // byte-equality above. This catches a payload member that started
+        // carrying path- or name-derived state, which would move the size at
+        // one of the two roots and not the other.
+        assert_eq!(bytes.len(), 3_293, "the empty-rooted record's size moved");
+
+        for (label, dir) in [("plain", &plain), ("nested", &nested)] {
+            let set = ResumePointSet::read(dir).unwrap();
+            assert_eq!(set.points(), &[record.clone()], "{label}");
+            assert_eq!(set.next_sequence().unwrap(), 4, "{label}");
+            assert!(
+                set.reachable_runs().contains(record.scratch_run_id()),
+                "{label}"
+            );
+        }
+
+        // Residue semantics are path-independent too: a conflict copy beside a
+        // UTF-8 path still denies the proof and still survives the drain.
+        std::fs::write(
+            nested_root
+                .join("00000000000000000003.sync-conflict-20260728-120000-ÜBER.resume-point"),
+            &bytes,
+        )
+        .unwrap();
+        assert!(ResumePointSet::read(&nested).is_err());
+        let maintenance = clear_resume_points_in(&nested).unwrap();
+        assert_eq!(maintenance.removed, 1);
+        assert!(maintenance.preserved_residue());
+
+        std::fs::remove_dir_all(plain_root).unwrap();
+        std::fs::remove_dir_all(resume_root_parent(&nested_root)).unwrap();
+    }
+
+    /// The outermost directory `resume_root` created for a nested case.
+    fn resume_root_parent(nested: &Path) -> PathBuf {
+        let mut current = nested.to_path_buf();
+        while current
+            .parent()
+            .is_some_and(|parent| parent != std::env::temp_dir())
+        {
+            current = current.parent().unwrap().to_path_buf();
+        }
+        current
     }
 
     #[test]
@@ -1141,7 +1904,7 @@ mod tests {
             length < MAX_RESUME_POINT_BYTES,
             "the widest encodable resume point is {length} bytes, at or over its {MAX_RESUME_POINT_BYTES}-byte ceiling"
         );
-        // Measured: 117,713 bytes against a 131,072-byte ceiling, so the real
+        // Measured: 117,795 bytes against a 131,072-byte ceiling, so the real
         // structural margin is about 10% — materially tighter than the ~88 KiB
         // the ceiling was originally derived from. The band is asserted in both
         // directions: a member that stopped saturating would silently weaken

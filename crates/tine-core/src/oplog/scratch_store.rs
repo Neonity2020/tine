@@ -3762,25 +3762,17 @@ impl RetainedRunReclamation {
 /// that means nothing was proved about any sibling. A per-sibling failure is
 /// counted as `unclassified_preserved` and never deletes, never aborts the
 /// pass, and never vetoes the reclamation it can prove.
-pub(crate) fn reclaim_unreachable_retained_runs(
+pub(super) fn reclaim_unreachable_retained_runs(
     archive_capability: &Dir,
     workspace_id: WorkspaceId,
     reachable: &super::resume_point::ReachableRetainedRuns,
 ) -> Result<RetainedRunReclamation, ScratchError> {
     let mut outcome = RetainedRunReclamation::default();
-    match archive_capability.symlink_metadata(SCRATCH_DIR) {
+    let Some(namespace) = open_scratch_namespace(archive_capability)? else {
         // No scratch namespace was ever opened here. There is nothing to prove
         // and nothing to create.
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(outcome),
-        Err(error) => return Err(error.into()),
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-            return Err(ScratchError::UnsafeEntry(format!(
-                "{SCRATCH_DIR} is not a real no-follow directory"
-            )));
-        }
-        Ok(_) => {}
-    }
-    let namespace = super::object_store::open_dir_nofollow(archive_capability, SCRATCH_DIR)?;
+        return Ok(outcome);
+    };
     for entry in namespace.entries()? {
         let disposition = entry
             .map_err(ScratchError::from)
@@ -3800,18 +3792,49 @@ pub(crate) fn reclaim_unreachable_retained_runs(
     Ok(outcome)
 }
 
-/// Classify exactly one sibling, removing it only when its own bytes and the
-/// supplied complete proof together say that is safe.
+/// Open the scratch namespace of one archive, or prove there is not one.
 ///
-/// Every `Err` here means "not proved safe to touch"; the caller converts it
-/// into [`RetainedRunDisposition::Unclassified`], which preserves the sibling
-/// untouched.
-fn classify_retained_sibling(
+/// A present entry that is not a real no-follow directory is an error rather
+/// than an absence: absence means "nothing was ever created here", and a
+/// symlink or file wearing the namespace name proves nothing of the sort.
+fn open_scratch_namespace(archive_capability: &Dir) -> Result<Option<Dir>, ScratchError> {
+    match archive_capability.symlink_metadata(SCRATCH_DIR) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(ScratchError::UnsafeEntry(format!(
+                "{SCRATCH_DIR} is not a real no-follow directory"
+            )));
+        }
+        Ok(_) => {}
+    }
+    Ok(Some(super::object_store::open_dir_nofollow(
+        archive_capability,
+        SCRATCH_DIR,
+    )?))
+}
+
+/// What one sibling of the scratch namespace authenticates as, read-only.
+///
+/// Deliberately carries **no** deletion authority and takes no lease: it is the
+/// shared substrate of the reachability pass and of the census, and separating
+/// it is what lets the census count a population without acquiring, mutating,
+/// or contending anything.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AuthenticatedScratchSibling {
+    Retained(Uuid),
+    Ephemeral,
+}
+
+/// Authenticate exactly one sibling from its own durable bytes.
+///
+/// Every `Err` means "not classified", which both callers turn into a
+/// preserved-untouched outcome.
+fn authenticate_scratch_sibling(
     namespace: &Dir,
     entry: &cap_std::fs::DirEntry,
     workspace_id: WorkspaceId,
-    reachable: &super::resume_point::ReachableRetainedRuns,
-) -> Result<RetainedRunDisposition, ScratchError> {
+) -> Result<(String, AuthenticatedScratchSibling), ScratchError> {
     let name = entry
         .file_name()
         .to_str()
@@ -3829,12 +3852,74 @@ fn classify_retained_sibling(
         return Err(ScratchError::MalformedMarker(name));
     }
     validate_run_entries(&run)?;
-    if marker.retention != ScratchRetention::Retained {
-        return Ok(RetainedRunDisposition::EphemeralPreserved);
+    let kind = if marker.retention == ScratchRetention::Retained {
+        AuthenticatedScratchSibling::Retained(run_id)
+    } else {
+        AuthenticatedScratchSibling::Ephemeral
+    };
+    Ok((name, kind))
+}
+
+/// A read-only population count of one archive's scratch namespace.
+///
+/// This exists so a caller can bound retained-run *minting* when the strict
+/// reachability proof is unavailable. It never opens a lease, never writes and
+/// never deletes, so it is safe to take while other owners are live: a
+/// concurrently-held run simply counts as retained.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RetainedRunCensus {
+    pub(crate) retained: usize,
+    pub(crate) ephemeral: usize,
+    /// Siblings that could not be authenticated — including a provider's
+    /// replicated conflict copy of a run directory. Counted, never touched.
+    pub(crate) unclassified: usize,
+}
+
+/// Count the authenticated retained runs of one workspace, deleting nothing.
+///
+/// Only a failure to enumerate the namespace itself is an error, for the same
+/// reason as the reachability pass: that proves nothing about any sibling.
+pub(super) fn census_retained_runs(
+    archive_capability: &Dir,
+    workspace_id: WorkspaceId,
+) -> Result<RetainedRunCensus, ScratchError> {
+    let mut census = RetainedRunCensus::default();
+    let Some(namespace) = open_scratch_namespace(archive_capability)? else {
+        return Ok(census);
+    };
+    for entry in namespace.entries()? {
+        match entry
+            .map_err(ScratchError::from)
+            .and_then(|entry| authenticate_scratch_sibling(&namespace, &entry, workspace_id))
+        {
+            Ok((_, AuthenticatedScratchSibling::Retained(_))) => census.retained += 1,
+            Ok((_, AuthenticatedScratchSibling::Ephemeral)) => census.ephemeral += 1,
+            Err(_) => census.unclassified += 1,
+        }
     }
+    Ok(census)
+}
+
+/// Classify exactly one sibling, removing it only when its own bytes and the
+/// supplied complete proof together say that is safe.
+///
+/// Every `Err` here means "not proved safe to touch"; the caller converts it
+/// into [`RetainedRunDisposition::Unclassified`], which preserves the sibling
+/// untouched.
+fn classify_retained_sibling(
+    namespace: &Dir,
+    entry: &cap_std::fs::DirEntry,
+    workspace_id: WorkspaceId,
+    reachable: &super::resume_point::ReachableRetainedRuns,
+) -> Result<RetainedRunDisposition, ScratchError> {
+    let (name, sibling) = authenticate_scratch_sibling(namespace, entry, workspace_id)?;
+    let AuthenticatedScratchSibling::Retained(run_id) = sibling else {
+        return Ok(RetainedRunDisposition::EphemeralPreserved);
+    };
     if reachable.contains(run_id) {
         return Ok(RetainedRunDisposition::Reachable);
     }
+    let run = super::object_store::open_dir_nofollow(namespace, &name)?;
     // Unreachable is necessary but not sufficient. Acquiring the run's own
     // exclusive lease is what proves no live owner is mutating these bytes,
     // and it is taken only after reachability has already been excluded so a

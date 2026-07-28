@@ -36,12 +36,15 @@ use sha2::{Digest, Sha256};
 use smallvec::SmallVec;
 use uuid::Uuid;
 
+use super::hot_engine::RuntimeResumeSnapshot;
 use super::identity::parse_digest;
 use super::resume_point::{
-    clear_resume_points_in, next_resume_sequence, prune_resume_points_below, ResumePointError,
-    ResumePointMaintenance, ResumePointScan, ResumePointSet, RuntimeResumePointV1,
-    MAX_RETAINED_RESUME_POINTS, RESUME_POINT_DIR,
+    clear_resume_points_in, next_resume_sequence, prune_resume_points_below,
+    ResumeEnrollmentAdmission, ResumePointEnrollment, ResumePointError, ResumePointMaintenance,
+    ResumePointScan, ResumePointSet, RuntimeResumePointV1, MAX_RETAINED_RESUME_POINTS,
+    RESUME_POINT_DIR,
 };
+use super::scratch_store::MAX_RETAINED_SCRATCH_RUNS;
 use super::simulator::SimulatorBootstrapFixtureIngress;
 use super::{
     bootstrap_import::{
@@ -3903,6 +3906,249 @@ impl ExactBootstrapHistoryBuilderV1<'_> {
     }
 }
 
+/// The authenticated endpoint facts one resume-point publication is sealed
+/// against.
+///
+/// Every field is private to this module, so the only route to a value is
+/// [`DurableEngineHistoryStore::resume_point_endpoint_binding`]. That method
+/// reads this endpoint's *durable* promoted runtime state through
+/// [`DurableEngineHistoryStore::read_promoted_runtime_state`] — itself gated by
+/// `require_promoted_state_binding`, which proves the state names this
+/// workspace, this endpoint, this graph resource, this receipt store and this
+/// exact physical archive directory — and derives the next sequence from an
+/// actual survey rather than from a caller's belief.
+///
+/// This is the compile-time half of "the lifecycle caller cannot omit facts":
+/// `RuntimeResumePointV1::seal` needs one of these, and nothing outside this
+/// module can build one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ResumePointEndpointBinding {
+    workspace_id: WorkspaceId,
+    endpoint_id: super::ProjectionEndpointId,
+    promoted_state_digest: ContentDigest,
+    next_sequence: u64,
+}
+
+impl ResumePointEndpointBinding {
+    pub(crate) const fn workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
+    }
+
+    pub(crate) const fn endpoint_id(&self) -> super::ProjectionEndpointId {
+        self.endpoint_id
+    }
+
+    pub(crate) const fn promoted_state_digest(&self) -> ContentDigest {
+        self.promoted_state_digest
+    }
+
+    pub(crate) const fn next_sequence(&self) -> u64 {
+        self.next_sequence
+    }
+
+    /// Hand-built binding for format-level tests that have no live endpoint.
+    #[cfg(test)]
+    pub(crate) const fn for_test(
+        workspace_id: WorkspaceId,
+        endpoint_id: super::ProjectionEndpointId,
+        promoted_state_digest: ContentDigest,
+        next_sequence: u64,
+    ) -> Self {
+        Self {
+            workspace_id,
+            endpoint_id,
+            promoted_state_digest,
+            next_sequence,
+        }
+    }
+}
+
+/// The live-open authority a published point must re-prove before it may be
+/// offered to the engine as an adoption candidate.
+///
+/// Sealed for the same reason as [`ResumePointEndpointBinding`]: the digest, the
+/// endpoint and the durable head all come from this store's own reads, so a
+/// caller cannot weaken the comparison by supplying values it wishes were true.
+/// The one caller-supplied member is the enrollment admission, because nothing
+/// here can read the enrollment chain.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ResumeAdoptionAuthority {
+    workspace_id: WorkspaceId,
+    endpoint_id: super::ProjectionEndpointId,
+    promoted_state_digest: ContentDigest,
+    history_generation: u64,
+    history_index_root: ContentDigest,
+    history_latest_batch_id: Option<BatchId>,
+    enrollment: ResumeEnrollmentAdmission,
+}
+
+impl ResumeAdoptionAuthority {
+    pub(crate) const fn workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
+    }
+
+    pub(crate) const fn endpoint_id(&self) -> super::ProjectionEndpointId {
+        self.endpoint_id
+    }
+
+    pub(crate) const fn promoted_state_digest(&self) -> ContentDigest {
+        self.promoted_state_digest
+    }
+
+    pub(crate) const fn history_generation(&self) -> u64 {
+        self.history_generation
+    }
+
+    pub(crate) const fn history_index_root(&self) -> ContentDigest {
+        self.history_index_root
+    }
+
+    pub(crate) const fn history_latest_batch_id(&self) -> Option<BatchId> {
+        self.history_latest_batch_id
+    }
+
+    pub(crate) const fn enrollment(&self) -> ResumeEnrollmentAdmission {
+        self.enrollment
+    }
+
+    /// Hand-built authority for format-level tests that have no live endpoint.
+    #[cfg(test)]
+    pub(crate) const fn for_test(
+        workspace_id: WorkspaceId,
+        endpoint_id: super::ProjectionEndpointId,
+        promoted_state_digest: ContentDigest,
+        history: (u64, ContentDigest, Option<BatchId>),
+        enrollment: ResumeEnrollmentAdmission,
+    ) -> Self {
+        Self {
+            workspace_id,
+            endpoint_id,
+            promoted_state_digest,
+            history_generation: history.0,
+            history_index_root: history.1,
+            history_latest_batch_id: history.2,
+            enrollment,
+        }
+    }
+}
+
+/// Proof that one exact replacement resume point reached durability.
+///
+/// Minted only by [`DurableEngineHistoryStore::publish_resume_point`], on its
+/// success path. Retained-run reclamation consumes one, which is how "reclaim
+/// only *after* a successful replacement publication" becomes a fact the type
+/// system carries instead of a comment a later caller can reorder past: until
+/// the replacement point is durable, the run a predecessor point names may still
+/// hold the only resumable bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PublishedResumePoint {
+    workspace_id: WorkspaceId,
+    resume_sequence: u64,
+    scratch_run_id: Uuid,
+}
+
+impl PublishedResumePoint {
+    pub(crate) const fn resume_sequence(&self) -> u64 {
+        self.resume_sequence
+    }
+
+    pub(crate) const fn scratch_run_id(&self) -> Uuid {
+        self.scratch_run_id
+    }
+}
+
+/// The adoption input one resuming open consumes.
+///
+/// `Unavailable` is never an error the caller has to recover from: it means
+/// "reuse nothing, replay everything", which is always available and always
+/// correct. It is carried as a value rather than an `Err` precisely so that a
+/// caller cannot accidentally propagate it into a startup failure with `?`.
+#[derive(Debug)]
+pub(crate) enum ResumeAdoptionCandidate {
+    /// Hand this to `ShardedHotEngine::open_enrolled_projection_resuming`. The
+    /// engine still re-proves the run, the durable descent and every run-local
+    /// root before it reuses a single byte.
+    Available(Box<RuntimeResumeSnapshot>),
+    Unavailable(ResumeAcceleratorUnavailable),
+}
+
+/// Why this open gets no accelerator. Diagnosable, never actionable.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ResumeAcceleratorUnavailable {
+    /// No point has ever been published for this endpoint.
+    NeverPublished,
+    /// The strict complete-set proof was denied: unrecognizable provider or
+    /// desktop residue, a surplus over the publication bound, a torn, renamed
+    /// or oversize point, or an entry that could not be classified at all.
+    /// Nothing was proved about reachability, so nothing is reclaimed either.
+    ProofDenied(ResumePointError),
+    /// The latest point decoded and validated but did not re-prove the live
+    /// open's authority.
+    BindingRefused(ResumePointError),
+    /// The store could not be read, or the published set does not bind this
+    /// endpoint at all.
+    Unavailable(String),
+}
+
+/// What retention the next engine scratch run may use.
+///
+/// The `Ephemeral` arm is the leak bound. Once retention is flipped on, a
+/// resuming open mints one retained run per restart, and the only pass that can
+/// collect one needs the strict resume-point proof. A directory holding one
+/// permanent `.sync-conflict-*` copy denies that proof *forever*, so without
+/// this decision every restart would leak one archive directory, silently.
+/// Choosing an ephemeral run costs exactly one full replay — always available,
+/// always correct — and converts an unbounded disk leak into a bounded loss of
+/// an accelerator.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum EngineScratchRetentionPlan {
+    /// A retained run may be minted or adopted: either reachability is
+    /// provable, so an unreachable predecessor can be collected later, or the
+    /// census is still inside [`MAX_RETAINED_SCRATCH_RUNS`].
+    Retained { retained_runs: usize },
+    /// Reachability cannot be proved *and* the census is already at its bound.
+    Ephemeral {
+        retained_runs: usize,
+        reason: ResumePointError,
+    },
+}
+
+/// What one bounded retained-run maintenance pass proved, reclaimed and
+/// preserved.
+///
+/// Maintenance is diagnosable but never a correctness or startup failure, so
+/// this type has no `Err` sibling: every failure mode is a variant of
+/// [`RetainedRunMaintenanceOutcome`] carried alongside the counts that are
+/// still known.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RetainedRunMaintenanceReport {
+    /// Retained runs whose bytes this pass removed. The only member that
+    /// describes deletion.
+    pub(crate) reclaimed: usize,
+    /// Authenticated retained runs of this workspace still on disk afterwards.
+    pub(crate) retained_runs_remaining: usize,
+    pub(crate) within_retained_run_bound: bool,
+    /// Scratch siblings that could not be authenticated or classified —
+    /// including a replicated conflict copy of a run directory. Preserved
+    /// untouched, forever, by design.
+    pub(crate) unclassified_preserved: usize,
+    /// Resume-point directory entries this pass refused to interpret or
+    /// remove. Non-empty means the strict proof is denied and retained runs are
+    /// leaking, which is the only place that becomes visible.
+    pub(crate) preserved_resume_residue: Vec<String>,
+    pub(crate) outcome: RetainedRunMaintenanceOutcome,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum RetainedRunMaintenanceOutcome {
+    /// A complete strict proof authorized the pass and it ran.
+    Reclaimed,
+    /// The strict proof was denied. Every retained run was preserved.
+    ProofDenied(ResumePointError),
+    /// The pass could not run at all.
+    Unavailable(String),
+}
+
 impl DurableEngineHistoryStore {
     fn open_sealed_existing(
         workspace_id: WorkspaceId,
@@ -4486,12 +4732,12 @@ impl DurableEngineHistoryStore {
         point: &RuntimeResumePointV1,
         promoted_state_digest: ContentDigest,
     ) -> Result<(), StoreError> {
-        if point.workspace_id != self.workspace_id {
+        if point.workspace_id() != self.workspace_id {
             return Err(StoreError::ResumePointBindingMismatch(
                 "runtime resume point is bound to another workspace",
             ));
         }
-        if point.promoted_state_digest != promoted_state_digest {
+        if point.promoted_state_digest() != promoted_state_digest {
             return Err(StoreError::ResumePointBindingMismatch(
                 "runtime resume point is bound to another promoted runtime state",
             ));
@@ -4531,8 +4777,286 @@ impl DurableEngineHistoryStore {
     /// `Err` here proves nothing about reachability, so the caller must
     /// preserve every candidate retained run. An absent directory is the
     /// ordinary "never published" shape and is not an error.
-    pub(crate) fn read_resume_point_set(&self) -> Result<ResumePointSet, StoreError> {
+    ///
+    /// **Deliberately private.** It used to be the crate-wide entry point, and
+    /// that is exactly the shape `cf7dbe0b` teaches to remove: a `ResumePointSet`
+    /// in a lifecycle caller's hands is one `.reachable_runs()` away from
+    /// deletion authority that was never ordered behind a publication. The
+    /// three sealed entry points below —
+    /// [`Self::read_resume_adoption_candidate`],
+    /// [`Self::plan_engine_scratch_retention`] and
+    /// [`Self::reclaim_retained_runs_after_publication`] — are the whole
+    /// supported surface, and none of them hands the strict proof out.
+    fn read_resume_point_set(&self) -> Result<ResumePointSet, StoreError> {
         Ok(self.scan_resume_points()?.into_set()?)
+    }
+
+    /// The sealed endpoint binding one publication is minted against.
+    ///
+    /// Fails closed when this endpoint has no durable promoted runtime state
+    /// (nothing could have authorized a point) or when the directory holds
+    /// residue the survey could not classify (publishing beside an
+    /// unrecognizable entry risks mistaking a provider conflict copy for
+    /// authority).
+    fn resume_point_endpoint_binding(&self) -> Result<ResumePointEndpointBinding, StoreError> {
+        let promoted = self
+            .read_promoted_runtime_state()?
+            .ok_or(StoreError::PromotedRuntimeStateAbsent)?;
+        let scan = self.scan_resume_points()?;
+        scan.require_recognizable()?;
+        Ok(ResumePointEndpointBinding {
+            workspace_id: self.workspace_id,
+            endpoint_id: self.endpoint_id,
+            promoted_state_digest: promoted.state_digest()?,
+            next_sequence: next_resume_sequence(scan.points())?,
+        })
+    }
+
+    /// Build this endpoint's next resume point from a quiescent live engine.
+    ///
+    /// This is the one construction API. The run-local facts can only come from
+    /// `snapshot`, which `ShardedHotEngine::runtime_resume_snapshot` mints only
+    /// for a retained, quiescent, conflict-free, non-terminal engine whose
+    /// durable head it re-read and whose head record is itself adoptable; the
+    /// identity facts can only come from this store. The caller supplies just
+    /// the enrollment evidence it authenticated, which is the one thing neither
+    /// side can see.
+    ///
+    /// Record construction is a quiescent lifecycle read plus one encode. It is
+    /// not on, and must never be moved onto, the keystroke, admission,
+    /// authoring or acceptance path.
+    pub(crate) fn mint_resume_point(
+        &self,
+        snapshot: &RuntimeResumeSnapshot,
+        enrollment: ResumePointEnrollment,
+    ) -> Result<RuntimeResumePointV1, StoreError> {
+        let binding = self.resume_point_endpoint_binding()?;
+        Ok(RuntimeResumePointV1::seal(&binding, enrollment, snapshot)?)
+    }
+
+    /// The sealed authority a published point must re-prove at a resuming open.
+    fn resume_adoption_authority(
+        &self,
+        enrollment: ResumeEnrollmentAdmission,
+    ) -> Result<ResumeAdoptionAuthority, StoreError> {
+        let promoted = self
+            .read_promoted_runtime_state()?
+            .ok_or(StoreError::PromotedRuntimeStateAbsent)?;
+        let (_, root) = self.read_live_head_root()?;
+        Ok(ResumeAdoptionAuthority {
+            workspace_id: self.workspace_id,
+            endpoint_id: self.endpoint_id,
+            promoted_state_digest: promoted.state_digest()?,
+            history_generation: root.generation,
+            history_index_root: root.index_root,
+            history_latest_batch_id: root.latest_batch_id,
+            enrollment,
+        })
+    }
+
+    /// The strict latest-point read a resuming open consumes.
+    ///
+    /// The smallest surface that does the whole job: survey the directory,
+    /// authenticate every recognized point against this endpoint's promoted
+    /// state, mint the strict complete-set proof, take its highest sequence,
+    /// re-prove the live open's authority against it, and hand back the exact
+    /// snapshot the emitting engine produced.
+    ///
+    /// It never returns `Err`, never writes, and never removes a byte. Every
+    /// doubt — an absent directory, unrecognizable provider residue, a surplus
+    /// over the publication bound, a torn/renamed/oversize point, a foreign
+    /// workspace or endpoint, a substituted durable history authority, or
+    /// enrollment evidence the live record contradicts — becomes
+    /// [`ResumeAdoptionCandidate::Unavailable`], i.e. a fresh retained run and
+    /// a full replay. A *still-leased* run is refused one layer further in, by
+    /// `adopt_retained_engine_scratch`, which is where the exclusive lease
+    /// lives; that refusal likewise costs one full replay and leaves the
+    /// candidate's bytes untouched.
+    pub(crate) fn read_resume_adoption_candidate(
+        &self,
+        enrollment: ResumeEnrollmentAdmission,
+    ) -> ResumeAdoptionCandidate {
+        let scan = match self.scan_resume_points() {
+            Ok(scan) => scan,
+            Err(error) => {
+                return ResumeAdoptionCandidate::Unavailable(
+                    ResumeAcceleratorUnavailable::Unavailable(error.to_string()),
+                );
+            }
+        };
+        let set = match scan.into_set() {
+            Ok(set) => set,
+            Err(reason) => {
+                return ResumeAdoptionCandidate::Unavailable(
+                    ResumeAcceleratorUnavailable::ProofDenied(reason),
+                );
+            }
+        };
+        let Some(point) = set.latest() else {
+            return ResumeAdoptionCandidate::Unavailable(
+                ResumeAcceleratorUnavailable::NeverPublished,
+            );
+        };
+        let authority = match self.resume_adoption_authority(enrollment) {
+            Ok(authority) => authority,
+            Err(error) => {
+                return ResumeAdoptionCandidate::Unavailable(
+                    ResumeAcceleratorUnavailable::Unavailable(error.to_string()),
+                );
+            }
+        };
+        match point.authenticate(&authority) {
+            Ok(authenticated) => {
+                ResumeAdoptionCandidate::Available(Box::new(authenticated.into_adoption_snapshot()))
+            }
+            Err(reason) => ResumeAdoptionCandidate::Unavailable(
+                ResumeAcceleratorUnavailable::BindingRefused(reason),
+            ),
+        }
+    }
+
+    /// Decide, before a run is minted, whether this open may take a retained
+    /// run at all.
+    ///
+    /// A retained run is safe to mint whenever it can later be *proved*
+    /// unreachable — that is, whenever the strict set is available. When it is
+    /// not, the census decides: below the bound, one more retained run is an
+    /// acceptable accelerator; at or above it, minting another would add one
+    /// permanently uncollectable directory per restart, so this returns
+    /// [`EngineScratchRetentionPlan::Ephemeral`] and the open pays a full
+    /// replay instead.
+    ///
+    /// A census that cannot be taken is treated as "at the bound" for the same
+    /// reason: an unknown population must not authorize growth.
+    pub(crate) fn plan_engine_scratch_retention(&self) -> EngineScratchRetentionPlan {
+        let census =
+            super::scratch_store::census_retained_runs(&self.archive_root, self.workspace_id);
+        let reason = match self
+            .scan_resume_points()
+            .map_err(|error| ResumePointError::Io(error.to_string()))
+            .and_then(ResumePointScan::into_set)
+        {
+            Ok(_) => {
+                return EngineScratchRetentionPlan::Retained {
+                    retained_runs: census.map(|census| census.retained).unwrap_or_default(),
+                };
+            }
+            Err(reason) => reason,
+        };
+        // An uncountable namespace must not authorize growth either.
+        let Ok(census) = census else {
+            return EngineScratchRetentionPlan::Ephemeral {
+                retained_runs: MAX_RETAINED_SCRATCH_RUNS,
+                reason,
+            };
+        };
+        if census.retained >= MAX_RETAINED_SCRATCH_RUNS {
+            EngineScratchRetentionPlan::Ephemeral {
+                retained_runs: census.retained,
+                reason,
+            }
+        } else {
+            EngineScratchRetentionPlan::Retained {
+                retained_runs: census.retained,
+            }
+        }
+    }
+
+    /// Reclaim every retained run the published point set no longer reaches.
+    ///
+    /// The [`PublishedResumePoint`] witness is the ordering fence, and this
+    /// method adds the one check the witness cannot carry: the published point
+    /// must still be present in the strict set it is about to derive
+    /// reachability from. A replacement that is durable but not in the proof
+    /// means the proof is not describing the state the caller published, so the
+    /// pass preserves everything.
+    ///
+    /// Nothing here is fatal. A denied proof, an unreadable namespace, or a
+    /// per-sibling I/O error all preserve bytes and report; unclassified
+    /// residue — including a replicated conflict copy of a run directory — is
+    /// never deleted, and neither is a run whose own exclusive lease is held.
+    pub(crate) fn reclaim_retained_runs_after_publication(
+        &self,
+        published: &PublishedResumePoint,
+    ) -> RetainedRunMaintenanceReport {
+        if published.workspace_id != self.workspace_id {
+            return self.preserving_report(RetainedRunMaintenanceOutcome::Unavailable(
+                "the published resume point belongs to another workspace".to_owned(),
+            ));
+        }
+        let scan = match self.scan_resume_points() {
+            Ok(scan) => scan,
+            Err(error) => {
+                return self.preserving_report(RetainedRunMaintenanceOutcome::Unavailable(
+                    error.to_string(),
+                ));
+            }
+        };
+        let residue: Vec<String> = scan
+            .residue()
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect();
+        let set = match scan.into_set() {
+            Ok(set) => set,
+            Err(reason) => {
+                let mut report =
+                    self.preserving_report(RetainedRunMaintenanceOutcome::ProofDenied(reason));
+                report.preserved_resume_residue = residue;
+                return report;
+            }
+        };
+        if !set.points().iter().any(|point| {
+            point.resume_sequence() == published.resume_sequence
+                && point.scratch_run_id() == published.scratch_run_id
+        }) {
+            return self.preserving_report(RetainedRunMaintenanceOutcome::ProofDenied(
+                ResumePointError::Malformed(
+                    "the published replacement resume point is not in the complete set",
+                ),
+            ));
+        }
+        let reachable = set.reachable_runs();
+        match super::scratch_store::reclaim_unreachable_retained_runs(
+            &self.archive_root,
+            self.workspace_id,
+            &reachable,
+        ) {
+            Ok(reclamation) => RetainedRunMaintenanceReport {
+                reclaimed: reclamation.retained_reclaimed,
+                retained_runs_remaining: reclamation.retained_runs_remaining(),
+                within_retained_run_bound: reclamation.within_retained_run_bound(),
+                unclassified_preserved: reclamation.unclassified_preserved,
+                preserved_resume_residue: residue,
+                outcome: RetainedRunMaintenanceOutcome::Reclaimed,
+            },
+            Err(error) => {
+                let mut report = self.preserving_report(
+                    RetainedRunMaintenanceOutcome::Unavailable(error.to_string()),
+                );
+                report.preserved_resume_residue = residue;
+                report
+            }
+        }
+    }
+
+    /// A report for a pass that deleted nothing, with whatever census is still
+    /// obtainable so the caller can still see an accumulating population.
+    fn preserving_report(
+        &self,
+        outcome: RetainedRunMaintenanceOutcome,
+    ) -> RetainedRunMaintenanceReport {
+        let census =
+            super::scratch_store::census_retained_runs(&self.archive_root, self.workspace_id)
+                .unwrap_or_default();
+        RetainedRunMaintenanceReport {
+            reclaimed: 0,
+            retained_runs_remaining: census.retained,
+            within_retained_run_bound: census.retained <= MAX_RETAINED_SCRATCH_RUNS,
+            unclassified_preserved: census.unclassified,
+            preserved_resume_residue: Vec::new(),
+            outcome,
+        }
     }
 
     /// Publish one resume point, keeping the durable set bounded at every cut.
@@ -4573,11 +5097,12 @@ impl DurableEngineHistoryStore {
     /// This records evidence only. It grants no write, frontier, projection, or
     /// import authority, and it deliberately performs no scratch-run
     /// reclamation: proving a retained run unreachable is a separate step the
-    /// caller takes with [`ResumePointSet::reachable_runs`] after this returns.
+    /// caller takes with [`Self::reclaim_retained_runs_after_publication`],
+    /// which consumes the [`PublishedResumePoint`] this returns.
     pub(crate) fn publish_resume_point(
         &self,
         point: &RuntimeResumePointV1,
-    ) -> Result<(), StoreError> {
+    ) -> Result<PublishedResumePoint, StoreError> {
         let _guard = self
             .transition
             .lock()
@@ -4593,8 +5118,8 @@ impl DurableEngineHistoryStore {
         // authority. Proving that here, from this store's own live head, is
         // what keeps the history binding real rather than caller-asserted.
         let (_, root) = self.read_live_head_root()?;
-        if root.generation != point.history_generation
-            || root.index_root != point.history_index_root
+        if root.generation != point.history_generation()
+            || root.index_root != point.history_index_root()
         {
             return Err(StoreError::ResumePointBindingMismatch(
                 "runtime resume point does not name this endpoint's live durable history",
@@ -4612,13 +5137,13 @@ impl DurableEngineHistoryStore {
         scan.require_recognizable()?;
         let recognized = scan.points();
         let next = next_resume_sequence(recognized)?;
-        let latest = recognized.last().map(|latest| latest.resume_sequence);
+        let latest = recognized.last().map(|latest| latest.resume_sequence());
         // Either the next fresh sequence, or a retry of the last publication
         // whose byte identity `publish_immutable_exact` then proves.
-        if point.resume_sequence != next && Some(point.resume_sequence) != latest {
+        if point.resume_sequence() != next && Some(point.resume_sequence()) != latest {
             return Err(StoreError::ResumePointSequenceRegression {
                 expected: next,
-                found: point.resume_sequence,
+                found: point.resume_sequence(),
             });
         }
 
@@ -4641,8 +5166,12 @@ impl DurableEngineHistoryStore {
         // ---- COMMIT POINT: the new resume point is durable. ----
         #[cfg(test)]
         inject_resume_publish_fault(ResumePublishBoundary::AfterCommit)?;
-        prune_resume_points_below(&directory, point.resume_sequence)?;
-        Ok(())
+        prune_resume_points_below(&directory, point.resume_sequence())?;
+        Ok(PublishedResumePoint {
+            workspace_id: self.workspace_id,
+            resume_sequence: point.resume_sequence(),
+            scratch_run_id: point.scratch_run_id(),
+        })
     }
 
     /// Remove every recognized resume point of this endpoint.
@@ -10062,9 +10591,7 @@ mod bootstrap_store_tests {
 #[cfg(test)]
 mod resume_point_store_tests {
     use super::*;
-    use crate::oplog::hot_engine::AcceptedFrontierRoot;
-    use crate::oplog::resume_point::{ResumePointSet, RuntimeResumePointV1};
-    use crate::oplog::scratch_store::{ScratchAuthenticatedCatalogRoot, ScratchRoots};
+    use crate::oplog::resume_point::RuntimeResumePointV1;
     use crate::oplog::{
         DeviceId, DocumentId, ImportId, ProjectionEndpointBinding, ProjectionEndpointId,
         ProjectionReceiptStoreId, SessionId,
@@ -10183,26 +10710,40 @@ mod resume_point_store_tests {
                 .join(RESUME_POINT_DIR)
         }
 
-        fn point(&self, sequence: u64, run: u128) -> RuntimeResumePointV1 {
-            RuntimeResumePointV1 {
-                resume_sequence: sequence,
-                workspace_id: self.workspace,
-                promoted_state_digest: self.state.state_digest().unwrap(),
-                history_generation: 0,
-                history_index_root: EngineHistoryStore::empty_root(),
-                enrollment_generation: 4,
-                enrollment_head: ContentDigest::of(b"enrollment head"),
+        fn binding(&self, sequence: u64) -> ResumePointEndpointBinding {
+            ResumePointEndpointBinding::for_test(
+                self.workspace,
+                self.binding.endpoint.endpoint_id,
+                self.state.state_digest().unwrap(),
+                sequence,
+            )
+        }
+
+        fn enrollment(&self) -> ResumePointEnrollment {
+            ResumePointEnrollment {
+                generation: 4,
+                head: ContentDigest::of(b"enrollment head"),
                 unsafe_session_id: SessionId::from_uuid(Uuid::from_u128(0x8500)),
-                scratch_run_id: Uuid::from_u128(run),
-                scratch_binding_digest: ContentDigest::of(b"scratch marker"),
-                scratch_roots: ScratchRoots::default(),
-                block_claim_root: BlockClaimIndexRoot::default(),
-                accepted_frontier_root: AcceptedFrontierRoot::empty(),
-                next_acceptance_sequence: 1,
-                current_path_catalog_root: ScratchAuthenticatedCatalogRoot::default(),
-                current_path_catalog_available: true,
-                current_path_catalog_frontier: AcceptedFrontierRoot::empty(),
             }
+        }
+
+        /// The live durable head of this fixture: an unadvanced bootstrap
+        /// anchor, so the fixture's points name generation zero.
+        fn live_history(&self) -> (u64, ContentDigest, BatchId) {
+            (
+                0,
+                EngineHistoryStore::empty_root(),
+                BatchId::from_uuid(Uuid::from_u128(0x8550)),
+            )
+        }
+
+        fn point(&self, sequence: u64, run: u128) -> RuntimeResumePointV1 {
+            RuntimeResumePointV1::empty_rooted_for_test(
+                &self.binding(sequence),
+                self.enrollment(),
+                self.live_history(),
+                (Uuid::from_u128(run), ContentDigest::of(b"scratch marker")),
+            )
         }
 
         /// Exact bytes of the resume-point directory, so a refusal can be shown
@@ -10360,10 +10901,13 @@ mod resume_point_store_tests {
         cut_before_prune(&fixture, &interrupted);
 
         let takeover = |sequence: u64| {
-            let mut point = fixture.point(sequence, 0x8601);
-            point.enrollment_generation = 5;
-            point.unsafe_session_id = SessionId::from_uuid(Uuid::from_u128(0x8501));
-            point
+            fixture
+                .point(sequence, 0x8601)
+                .with_enrollment_for_test(ResumePointEnrollment {
+                    generation: 5,
+                    head: ContentDigest::of(b"takeover enrollment head"),
+                    unsafe_session_id: SessionId::from_uuid(Uuid::from_u128(0x8501)),
+                })
         };
         // The byte-identical retry is genuinely unavailable to this session.
         assert!(matches!(
@@ -10412,10 +10956,16 @@ mod resume_point_store_tests {
         for round in 0..6_u64 {
             // Crash cut: the successor is durable, the prune never ran.
             sequence += 1;
-            let mut interrupted = fixture.point(sequence, 0x8601);
-            interrupted.enrollment_generation = 10 + round;
-            interrupted.unsafe_session_id =
-                SessionId::from_uuid(Uuid::from_u128(0x8600 + u128::from(round)));
+            let interrupted =
+                fixture
+                    .point(sequence, 0x8601)
+                    .with_enrollment_for_test(ResumePointEnrollment {
+                        generation: 10 + round,
+                        head: ContentDigest::of(b"interrupted enrollment head"),
+                        unsafe_session_id: SessionId::from_uuid(Uuid::from_u128(
+                            0x8600 + u128::from(round),
+                        )),
+                    });
             cut_before_prune(&fixture, &interrupted);
             assert_eq!(
                 fixture.snapshot().len(),
@@ -10425,10 +10975,16 @@ mod resume_point_store_tests {
 
             // Restart as a takeover session: new session, later generation.
             sequence += 1;
-            let mut restarted = fixture.point(sequence, 0x8601);
-            restarted.enrollment_generation = 100 + round;
-            restarted.unsafe_session_id =
-                SessionId::from_uuid(Uuid::from_u128(0x8700 + u128::from(round)));
+            let restarted =
+                fixture
+                    .point(sequence, 0x8601)
+                    .with_enrollment_for_test(ResumePointEnrollment {
+                        generation: 100 + round,
+                        head: ContentDigest::of(b"restarted enrollment head"),
+                        unsafe_session_id: SessionId::from_uuid(Uuid::from_u128(
+                            0x8700 + u128::from(round),
+                        )),
+                    });
             history.publish_resume_point(&restarted).unwrap();
 
             let set = history.read_resume_point_set().unwrap();
@@ -10471,10 +11027,13 @@ mod resume_point_store_tests {
             // generation — so no byte-identical retry is available to it and
             // the publication really has to run the pre-prune.
             let takeover = |sequence: u64| {
-                let mut point = fixture.point(sequence, 0x8601);
-                point.enrollment_generation = 5;
-                point.unsafe_session_id = SessionId::from_uuid(Uuid::from_u128(0x8501));
-                point
+                fixture
+                    .point(sequence, 0x8601)
+                    .with_enrollment_for_test(ResumePointEnrollment {
+                        generation: 5,
+                        head: ContentDigest::of(b"takeover enrollment head"),
+                        unsafe_session_id: SessionId::from_uuid(Uuid::from_u128(0x8501)),
+                    })
             };
 
             fail_next_resume_publication_at(boundary);
@@ -10613,15 +11172,17 @@ mod resume_point_store_tests {
         let fixture = PromotedHistoryFixture::new("foreign-binding");
         let history = fixture.history();
 
-        let mut foreign_workspace = fixture.point(1, 0x8601);
-        foreign_workspace.workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(0x8fff));
+        let foreign_workspace = fixture
+            .point(1, 0x8601)
+            .with_workspace_id_for_test(WorkspaceId::from_uuid(Uuid::from_u128(0x8fff)));
         assert!(matches!(
             history.publish_resume_point(&foreign_workspace),
             Err(StoreError::ResumePointBindingMismatch(_))
         ));
 
-        let mut foreign_state = fixture.point(1, 0x8601);
-        foreign_state.promoted_state_digest = ContentDigest::of(b"another endpoint");
+        let foreign_state = fixture
+            .point(1, 0x8601)
+            .with_promoted_state_digest_for_test(ContentDigest::of(b"another endpoint"));
         assert!(matches!(
             history.publish_resume_point(&foreign_state),
             Err(StoreError::ResumePointBindingMismatch(_))
@@ -10635,15 +11196,20 @@ mod resume_point_store_tests {
         let fixture = PromotedHistoryFixture::new("history-binding");
         let history = fixture.history();
 
-        let mut ahead = fixture.point(1, 0x8601);
-        ahead.history_generation = 1;
+        let (_, live_root, live_batch) = fixture.live_history();
+        let ahead = fixture
+            .point(1, 0x8601)
+            .with_history_for_test(1, live_root, live_batch);
         assert!(matches!(
             history.publish_resume_point(&ahead),
             Err(StoreError::ResumePointBindingMismatch(_))
         ));
 
-        let mut wrong_root = fixture.point(1, 0x8601);
-        wrong_root.history_index_root = ContentDigest::of(b"another index root");
+        let wrong_root = fixture.point(1, 0x8601).with_history_for_test(
+            0,
+            ContentDigest::of(b"another index root"),
+            live_batch,
+        );
         assert!(matches!(
             history.publish_resume_point(&wrong_root),
             Err(StoreError::ResumePointBindingMismatch(_))

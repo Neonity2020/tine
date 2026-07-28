@@ -3455,6 +3455,41 @@ pub(crate) struct RuntimeResumeSnapshot {
 }
 
 impl RuntimeResumeSnapshot {
+    /// Reconstruct the snapshot a live engine emitted, from a durable resume
+    /// point that already re-proved every authority of this open.
+    ///
+    /// Sealed on purpose: the argument is
+    /// [`super::resume_point::AuthenticatedResumePoint`], whose only mint is
+    /// `RuntimeResumePointV1::authenticate`. A lifecycle caller therefore
+    /// cannot hand the resuming open a snapshot assembled from a record whose
+    /// workspace, endpoint, promoted state, durable-history binding or
+    /// enrollment evidence was never checked.
+    ///
+    /// The conversion itself proves nothing further, and deliberately so.
+    /// Everything it carries is re-proved by
+    /// [`Self::restore_adopted_predecessor_state`] against the run's own bytes
+    /// and the sealed history, and any doubt there refuses into a full replay.
+    pub(super) fn from_authenticated_resume_point(
+        authenticated: &super::resume_point::AuthenticatedResumePoint<'_>,
+    ) -> Self {
+        let point = authenticated.point();
+        Self {
+            history_generation: point.history_generation(),
+            history_index_root: point.history_index_root(),
+            history_latest_batch_id: point.history_latest_batch_id(),
+            scratch_run_id: point.scratch_run_id(),
+            scratch_binding_digest: point.scratch_binding_digest(),
+            scratch_roots: point.scratch_roots().clone(),
+            block_claim_root: *point.block_claim_root(),
+            accepted_frontier_root: point.accepted_frontier_root().clone(),
+            next_acceptance_sequence: point.next_acceptance_sequence(),
+            current_path_catalog_root: point.current_path_catalog_root().clone(),
+            current_path_catalog_available: point.current_path_catalog_available(),
+            current_path_catalog_frontier: point.current_path_catalog_frontier().clone(),
+            catalog_checkpoint_binding: point.catalog_checkpoint_binding(),
+        }
+    }
+
     pub(crate) const fn history_generation(&self) -> u64 {
         self.history_generation
     }
@@ -31969,15 +32004,10 @@ mod validation_tests {
     fn resume_size_record(
         engine: &ShardedHotEngine,
     ) -> super::super::resume_point::RuntimeResumePointV1 {
-        super::super::resume_point::RuntimeResumePointV1 {
-            resume_sequence: 1,
-            workspace_id: engine.workspace_id,
-            promoted_state_digest: ContentDigest::of(b"resume-size-promoted-state"),
+        let snapshot = RuntimeResumeSnapshot {
             history_generation: engine.history_generation,
             history_index_root: engine.history_root,
-            enrollment_generation: 1,
-            enrollment_head: ContentDigest::of(b"resume-size-enrollment-head"),
-            unsafe_session_id: SessionId::from_uuid(Uuid::from_u128(0x5123)),
+            history_latest_batch_id: BatchId::from_uuid(Uuid::from_u128(0x5125)),
             scratch_run_id: Uuid::from_u128(0x5124),
             scratch_binding_digest: ContentDigest::of(b"resume-size-binding"),
             scratch_roots: engine.scratch_roots.clone(),
@@ -31990,7 +32020,23 @@ mod validation_tests {
                 .current_path_catalog
                 .accepted_frontier_root
                 .clone(),
-        }
+            catalog_checkpoint_binding: ContentDigest::of(b"resume-size-catalog-checkpoint"),
+        };
+        super::super::resume_point::RuntimeResumePointV1::seal(
+            &super::super::object_store::ResumePointEndpointBinding::for_test(
+                engine.workspace_id,
+                super::super::ProjectionEndpointId::from_uuid(Uuid::from_u128(0x5126)),
+                ContentDigest::of(b"resume-size-promoted-state"),
+                1,
+            ),
+            super::super::resume_point::ResumePointEnrollment {
+                generation: 1,
+                head: ContentDigest::of(b"resume-size-enrollment-head"),
+                unsafe_session_id: SessionId::from_uuid(Uuid::from_u128(0x5123)),
+            },
+            &snapshot,
+        )
+        .expect("a quiescent run-local state seals into a resume point")
     }
 
     fn resume_size_bytes(seed: u128, batches: usize, pages: usize, blocks: usize) -> usize {
