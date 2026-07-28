@@ -6659,6 +6659,7 @@ impl Graph {
             || scope_binding != lease.binding.scope_binding
             || scope_binding.graph_resource_id() != graph_resource
         {
+            lease.terminal.store(true, Ordering::Release);
             let error =
                 graph_text_admission_unavailable("exact feed lease root or scope binding changed");
             self.poison_graph_text_admission(error.to_string());
@@ -34893,6 +34894,34 @@ mod tests {
         ));
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn held_exact_feed_scope_loss_latches_the_lease_terminal() {
+        let root = scratch("held-exact-feed-scope-loss");
+        fs::write(root.join("Page.md"), b"- original\n").unwrap();
+        let graph = Graph::open(&root);
+        let mut lease = staged_exact_feed_build(&graph, 0);
+
+        let foreign_root = scratch("held-exact-feed-foreign-scope");
+        fs::write(foreign_root.join("Other.md"), b"- foreign\n").unwrap();
+        let foreign = Graph::open(&foreign_root);
+        lease.binding.scope_binding = foreign.graph_text_scope_binding().unwrap();
+
+        assert!(graph
+            .rebase_graph_text_exact_feed_at_fence(&lease, 1)
+            .is_err());
+        assert!(lease.is_terminal());
+        assert!(graph
+            .rebase_graph_text_exact_feed_at_fence(&lease, 1)
+            .is_err());
+        assert!(matches!(
+            &*graph.graph_text_admission.read().unwrap(),
+            GraphTextAdmissionState::Poisoned { .. }
+        ));
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(foreign_root);
     }
 
     #[test]
