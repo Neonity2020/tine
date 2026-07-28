@@ -9544,9 +9544,8 @@ impl ShardedHotEngine {
                     || prior.intent.page_id() != before.page.page_id
                     || prior.intent.path() != path
                     || prior.intent.target() != super::BlobDescription::of(&prior.bytes)
-                    || (!external_reconciliation
-                        && (prior.intent.frontier() != &before.frontier
-                            || prior.intent.claim_evidence() != before.claim_evidence))
+                    || prior.intent.claim_evidence() != before.claim_evidence
+                    || (!external_reconciliation && prior.intent.frontier() != &before.frontier)
                 {
                     return Err(EngineError::ProjectionManifest(format!(
                         "captured path {path} completion is not its intended semantic predecessor"
@@ -9558,13 +9557,6 @@ impl ShardedHotEngine {
                     Some(&prior.bytes),
                 )
                 .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
-                if external_reconciliation
-                    && !prior.intent.matches_replay_except_frontier(replay.intent())
-                {
-                    return Err(EngineError::ProjectionManifest(format!(
-                        "captured path {path} completion does not replay the current external semantic predecessor"
-                    )));
-                }
                 if replay.target() != prior.bytes {
                     return Err(EngineError::ProjectionManifest(format!(
                         "captured path {path} prior bytes are not the exact semantic pre-state"
