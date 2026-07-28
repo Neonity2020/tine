@@ -864,6 +864,91 @@ impl BlockClaimIndexStore {
     }
 }
 
+/// One run-local engine scratch pair over a **retained** scratch run.
+///
+/// This type is the retention capability. It is minted only by
+/// [`ObjectStore::create_retained_engine_scratch`] and
+/// [`ObjectStore::adopt_retained_engine_scratch`], has no public constructor,
+/// no `Default`, and no `Clone`, so an engine that holds one can treat "this
+/// run survives my death and may be named by a durable resume point" as a
+/// structural fact rather than a re-read marker byte.
+pub(crate) struct RetainedEngineScratch {
+    scratch: Arc<super::scratch_store::ScratchStore>,
+    claim_index: BlockClaimIndexStore,
+    run_id: Uuid,
+    binding_digest: ContentDigest,
+}
+
+impl fmt::Debug for RetainedEngineScratch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RetainedEngineScratch")
+            .field("run_id", &self.run_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RetainedEngineScratch {
+    fn seal(
+        store: &ObjectStore,
+        scratch: super::scratch_store::ScratchStore,
+    ) -> Result<Self, StoreError> {
+        let claim_index = store.engine_claim_index(&scratch)?;
+        let run_id = scratch.run_id();
+        let binding_digest = scratch
+            .binding_digest()
+            .map_err(|error| StoreError::Scratch(error.to_string()))?;
+        Ok(Self {
+            scratch: Arc::new(scratch),
+            claim_index,
+            run_id,
+            binding_digest,
+        })
+    }
+
+    pub(crate) const fn run_id(&self) -> Uuid {
+        self.run_id
+    }
+
+    pub(crate) const fn binding_digest(&self) -> ContentDigest {
+        self.binding_digest
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        Arc<super::scratch_store::ScratchStore>,
+        BlockClaimIndexStore,
+        RetainedScratchIdentity,
+    ) {
+        let identity = RetainedScratchIdentity {
+            run_id: self.run_id,
+            binding_digest: self.binding_digest,
+        };
+        (self.scratch, self.claim_index, identity)
+    }
+}
+
+/// The durable identity of the retained run an engine is running on.
+///
+/// Carried by the engine so a later quiescent snapshot can name its own run
+/// without re-deriving retention, and so observability can report which run a
+/// restart adopted or refused.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RetainedScratchIdentity {
+    run_id: Uuid,
+    binding_digest: ContentDigest,
+}
+
+impl RetainedScratchIdentity {
+    pub(crate) const fn run_id(&self) -> Uuid {
+        self.run_id
+    }
+
+    pub(crate) const fn binding_digest(&self) -> ContentDigest {
+        self.binding_digest
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub(crate) struct BlockClaimIndexValue(SmallVec<[u8; 64]>);
@@ -2085,15 +2170,82 @@ impl ObjectStore {
             super::scratch_store::ScratchStore::open(&self.capability, self.workspace_id)
                 .map_err(|error| StoreError::Scratch(error.to_string()))?,
         );
-        let claim_index = BlockClaimIndexStore {
+        Ok((Arc::clone(&scratch), self.engine_claim_index(&scratch)?))
+    }
+
+    fn engine_claim_index(
+        &self,
+        scratch: &super::scratch_store::ScratchStore,
+    ) -> Result<BlockClaimIndexStore, StoreError> {
+        Ok(BlockClaimIndexStore {
             file: Mutex::new(
                 scratch
                     .clone_pages_file()
                     .map_err(|error| StoreError::Scratch(error.to_string()))?,
             ),
             counters: Arc::clone(&self.counters),
-        };
-        Ok((scratch, claim_index))
+        })
+    }
+
+    /// Mint a fresh **retained** engine scratch pair beneath this archive.
+    ///
+    /// The only difference from [`Self::start_engine_scratch`] is the run's own
+    /// durable retention marker, which makes the run survive its owner's death
+    /// instead of being reclaimed as disposable sibling state. Because
+    /// [`RetainedEngineScratch`] can be minted only here and by
+    /// [`Self::adopt_retained_engine_scratch`], holding one is itself the proof
+    /// that the run is retained — the engine never has to re-derive retention
+    /// from an ambient marker read.
+    pub(crate) fn create_retained_engine_scratch(
+        &self,
+    ) -> Result<RetainedEngineScratch, StoreError> {
+        let scratch = super::scratch_store::ScratchStore::create_retained(
+            &self.capability,
+            self.workspace_id,
+        )
+        .map_err(|error| StoreError::Scratch(error.to_string()))?;
+        RetainedEngineScratch::seal(self, scratch)
+    }
+
+    /// Adopt exactly one already-published retained run.
+    ///
+    /// Four independent facts must hold before this returns, and every one of
+    /// them is read from the run's own durable bytes rather than asserted by the
+    /// caller:
+    ///
+    /// 1. the run directory is reachable no-follow under *this* archive
+    ///    capability's scratch namespace, under the canonical `run-<uuid>`
+    ///    spelling of `run_id`;
+    /// 2. its own exclusive lease is acquired, so no live owner is mutating it;
+    /// 3. its marker authenticates as schema-current, retained, owned by this
+    ///    workspace, and carrying exactly `run_id`, with a complete regular
+    ///    entry set — all inside [`ScratchStore::adopt_retained`];
+    /// 4. its canonical marker digest equals `binding_digest`, which is what
+    ///    catches a *re-created* run that reused the same UUID: the owner nonce
+    ///    is fresh, so the digest cannot match.
+    ///
+    /// Any failure is returned as an ordinary error and **changes nothing**: no
+    /// directory, marker, lease, or data file is created, truncated, or
+    /// replaced, so the candidate run's bytes are exactly as they were. The
+    /// caller's correct response is a fresh retained run plus a full replay,
+    /// never a repair. Adoption authorizes reuse of reconstructible bytes and
+    /// nothing else.
+    pub(crate) fn adopt_retained_engine_scratch(
+        &self,
+        run_id: Uuid,
+        binding_digest: ContentDigest,
+    ) -> Result<RetainedEngineScratch, StoreError> {
+        let scratch = super::scratch_store::ScratchStore::adopt_retained(
+            &self.capability,
+            self.workspace_id,
+            run_id,
+        )
+        .map_err(|error| StoreError::Scratch(error.to_string()))?;
+        let sealed = RetainedEngineScratch::seal(self, scratch)?;
+        if sealed.run_id != run_id || sealed.binding_digest != binding_digest {
+            return Err(StoreError::RetainedScratchBindingMismatch);
+        }
+        Ok(sealed)
     }
 
     pub(crate) fn open_logseq_claim_index(
@@ -5537,6 +5689,11 @@ pub enum StoreError {
         expected: u64,
         found: u64,
     },
+    /// An adopted retained run authenticated as a real retained run of this
+    /// workspace, but is not the exact run the caller named: its canonical
+    /// marker digest differs, which is what a re-created run reusing the same
+    /// UUID looks like. Nothing was changed; the caller must replay instead.
+    RetainedScratchBindingMismatch,
     StoredLengthMismatch {
         path: String,
         expected: u64,
@@ -5705,6 +5862,9 @@ impl fmt::Display for StoreError {
             Self::ResumePointSequenceRegression { expected, found } => write!(
                 f,
                 "runtime resume point {found} does not extend the published sequence {expected}"
+            ),
+            Self::RetainedScratchBindingMismatch => f.write_str(
+                "retained scratch run does not carry the named canonical marker binding",
             ),
             Self::StoredLengthMismatch {
                 path,
