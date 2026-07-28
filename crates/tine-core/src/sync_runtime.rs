@@ -1377,6 +1377,91 @@ mod tests {
         );
     }
 
+    /// An external delete is authorized from the deleted page's own completed
+    /// projection, not from an unrelated page's most recent global frontier.
+    ///
+    /// This deliberately drives only the public runtime handle.  The two
+    /// pages first acquire independent durable completions, then an external
+    /// rename advances the accepted frontier for `advanced`, and an
+    /// ordinary external delete of `deleted` must still reconcile and permit a
+    /// clean Safe handoff.
+    #[test]
+    fn external_delete_after_unrelated_accepted_rename_settles_and_reaches_safe() {
+        let fixture = RuntimeHostFixture::safe("sync-runtime-delete-frontier");
+        let handle = active_handle(SyncRuntimeHandle::open(fixture.request()));
+        drive_initial_feed(&handle);
+
+        let advanced = "content/nested pages/advanced.md";
+        let advanced_renamed = "content/nested pages/advanced renamed.md";
+        let deleted = "content/nested pages/deleted.md";
+        fs::write(fixture.graph_root().join(advanced), b"- advance 0\n").unwrap();
+        fs::write(fixture.graph_root().join(deleted), b"- delete me\n").unwrap();
+        handle
+            .observe_watcher(vec![
+                SyncWatcherObservation::managed_path(advanced).unwrap(),
+                SyncWatcherObservation::managed_path(deleted).unwrap(),
+            ])
+            .unwrap();
+        let created = settle_exact_feed(&handle)
+            .unwrap_or_else(|stuck| panic!("initial external pages did not settle: {stuck:?}"));
+        assert!(
+            matches!(
+                created,
+                SyncRuntimeTick::AdmittedNoop { .. } | SyncRuntimeTick::AdmittedComplete { .. }
+            ),
+            "initial external pages must be admitted: {created:?}"
+        );
+
+        fs::rename(
+            fixture.graph_root().join(advanced),
+            fixture.graph_root().join(advanced_renamed),
+        )
+        .unwrap();
+        handle
+            .observe_watcher(vec![
+                SyncWatcherObservation::managed_path(advanced).unwrap(),
+                SyncWatcherObservation::managed_path(advanced_renamed).unwrap(),
+            ])
+            .unwrap();
+        let renamed_tick = settle_exact_feed(&handle).unwrap_or_else(|stuck| {
+            panic!("the unrelated accepted rename did not settle: {stuck:?}")
+        });
+        assert!(
+            matches!(
+                renamed_tick,
+                SyncRuntimeTick::AdmittedNoop { .. } | SyncRuntimeTick::AdmittedComplete { .. }
+            ),
+            "the unrelated external rename must be admitted: {renamed_tick:?}"
+        );
+
+        fs::remove_file(fixture.graph_root().join(deleted)).unwrap();
+        handle
+            .observe_watcher(vec![SyncWatcherObservation::managed_path(deleted).unwrap()])
+            .unwrap();
+        let deleted_tick = settle_exact_feed(&handle).unwrap_or_else(|stuck| {
+            panic!(
+                "an ordinary delete after an unrelated accepted frontier advance must settle, \
+                 but the runtime returned {stuck:?} with status {:?}",
+                handle.status().unwrap()
+            )
+        });
+        assert!(
+            matches!(
+                deleted_tick,
+                SyncRuntimeTick::AdmittedNoop { .. } | SyncRuntimeTick::AdmittedComplete { .. }
+            ),
+            "the external delete must be admitted: {deleted_tick:?}"
+        );
+        assert!(
+            matches!(handle.clean_shutdown(), Ok(SyncShutdownOutcome::Safe(_))),
+            "a successfully reconciled external delete must allow Safe handoff"
+        );
+        assert!(matches!(
+            fixture.handoff(),
+            EnrollmentDiscoveryHandoff::Safe
+        ));
+    }
+
     #[test]
     fn existing_safe_opens_one_owner_and_duplicate_or_foreign_binding_gets_no_authority() {
         let fixture = RuntimeHostFixture::safe("sync-runtime-safe-owner");
