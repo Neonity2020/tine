@@ -12,7 +12,9 @@ use std::sync::Arc;
 use crate::model::PublishedHandoffLatch;
 use crate::Graph;
 
-use super::local_active::LocalRuntimeAdmission;
+use super::local_active::{
+    LocalRuntimeAdmission, WorkspaceAuthorityBoundary, WorkspaceAuthorityRefusal,
+};
 use super::{
     plan_affected_import, AcceptedBatchEvent, AuthorBatch, BatchDisposition, BatchId,
     BatchInspection, BatchOrigin, ContentDigest, CrdtPeerId, ImportId, ImportPlan,
@@ -101,6 +103,32 @@ impl fmt::Display for OperationalCoordinatorError {
 
 impl std::error::Error for OperationalCoordinatorError {}
 
+/// Re-derive archive-rooted workspace authority immediately before one
+/// authority-changing boundary, and report a refusal as that exact phase.
+///
+/// The four call sites below are the coordinator's complete set of boundaries
+/// that take, change, or externalize authority: immutable publication, tail
+/// admission, the SQLite advance, and each manifested Markdown projection step.
+/// Every one of them is already an [`OperationalPhase`], so a lost workspace
+/// stays diagnosable by phase rather than collapsing into one generic error.
+///
+/// The proof is one held-handle stat plus one no-follow resolution of the lease
+/// pathname — a few per external reconciliation, and none on the keystroke
+/// path. A failure latches the promoted runtime's terminal revocation, so the
+/// journey cannot continue at any later boundary and no later admission,
+/// window, or coordinator run can start either.
+fn reprove_workspace_authority(
+    admission: &LocalRuntimeAdmission<'_>,
+    boundary: WorkspaceAuthorityBoundary,
+    phase: OperationalPhase,
+) -> Result<(), OperationalCoordinatorError> {
+    admission
+        .reprove_workspace_authority(boundary)
+        .map_err(|refusal: WorkspaceAuthorityRefusal| {
+            OperationalCoordinatorError::new(phase, refusal.to_string())
+        })
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct OperationalCompletion {
     batch_id: BatchId,
@@ -169,7 +197,7 @@ impl FailedClosedOperationalCoordinator {
                 OperationalCoordinatorError::new(OperationalPhase::Bindings, error.to_string());
             return OperationalCoordinatorState::FailedClosed(self);
         }
-        match self.resume(graph, receipts, engine, database, tail) {
+        match self.resume(admission, graph, receipts, engine, database, tail) {
             Ok(completion) => {
                 self.guard.complete();
                 OperationalCoordinatorState::Complete(completion)
@@ -183,6 +211,7 @@ impl FailedClosedOperationalCoordinator {
 
     fn resume(
         &mut self,
+        admission: &LocalRuntimeAdmission<'_>,
         graph: &Graph,
         receipts: &ProjectionReceiptStore,
         engine: &mut ShardedHotEngine,
@@ -267,6 +296,13 @@ impl FailedClosedOperationalCoordinator {
             );
         }
         events.sort_unstable_by_key(AcceptedBatchEvent::acceptance_sequence);
+        // Boundary: tail admission is a device-local applier write. Reprove
+        // immediately before the first enqueue, not after it.
+        reprove_workspace_authority(
+            admission,
+            WorkspaceAuthorityBoundary::TailAdmission,
+            OperationalPhase::TailAdmission,
+        )?;
         for event in events {
             budget.consume(1, OperationalPhase::TailAdmission)?;
             if event.batch_id() == self.batch_id {
@@ -319,6 +355,13 @@ impl FailedClosedOperationalCoordinator {
             ));
         }
 
+        // Boundary: the SQLite advance is the one-applier-per-workspace write.
+        // Reprove immediately before it, not at journey entry.
+        reprove_workspace_authority(
+            admission,
+            WorkspaceAuthorityBoundary::SqliteDrain,
+            OperationalPhase::SqliteDrain,
+        )?;
         let source = RebuildSource::new(engine, &self.archive).map_err(|error| {
             OperationalCoordinatorError::new(OperationalPhase::SqliteDrain, error.to_string())
         })?;
@@ -372,6 +415,14 @@ impl FailedClosedOperationalCoordinator {
                     "projection bounded slice has ready-work continuation",
                 ));
             }
+            // Boundary: manifested projection writes Markdown into the user's
+            // own graph. Reprove before *each* step, because every one of them
+            // is a separate externally visible write.
+            reprove_workspace_authority(
+                admission,
+                WorkspaceAuthorityBoundary::ProjectionDrain,
+                OperationalPhase::ProjectionDrain,
+            )?;
             fault(OperationalFaultPoint::BeforeProjection)?;
             super::projection::execute_manifested_projection_work_under_handoff(
                 graph,
@@ -528,6 +579,28 @@ impl OperationalCoordinator {
             }
         };
         let manifest_digest = ContentDigest::of(&manifest_bytes);
+
+        // Boundary: publication is the first irreversible step of the journey
+        // and the point after which every later phase is a durable advance.
+        // Reprove before it, while the reservation is still cancellable and the
+        // publisher guard has not yet been consumed.
+        if let Err(failure) = reprove_workspace_authority(
+            admission,
+            WorkspaceAuthorityBoundary::Publication,
+            OperationalPhase::Publication,
+        ) {
+            // The publisher guard has not crossed the publication boundary, so
+            // dropping it releases the managed-text gate exactly as any other
+            // pre-publication abort does.
+            drop(guard);
+            tail.cancel_reservation(reservation).map_err(|cancel| {
+                OperationalCoordinatorError::new(
+                    OperationalPhase::TailReservation,
+                    format!("{failure}; reservation cancellation failed: {cancel}"),
+                )
+            })?;
+            return Err(failure);
+        }
         let published_latch = guard.into_published_latch();
 
         if let Err(error) = archive.publish_prepared(&prepared) {
@@ -582,7 +655,7 @@ impl OperationalCoordinator {
             coordinator.failure = failure;
             return Ok(OperationalCoordinatorState::FailedClosed(coordinator));
         }
-        match coordinator.resume(graph, receipts, engine, database, tail) {
+        match coordinator.resume(admission, graph, receipts, engine, database, tail) {
             Ok(completion) => {
                 coordinator.guard.complete();
                 Ok(OperationalCoordinatorState::Complete(completion))

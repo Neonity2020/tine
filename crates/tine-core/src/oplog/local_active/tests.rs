@@ -25,6 +25,11 @@ use crate::oplog::import::{
 use crate::oplog::migration_backup::{
     verify_migration_source_backup, MigrationBackupRoot, VerifiedSourceBackup,
 };
+use crate::oplog::operational_coordinator::{
+    act_once_at, OperationalCoordinator, OperationalCoordinatorError, OperationalCoordinatorState,
+    OperationalFaultPoint, OperationalPhase,
+};
+use crate::oplog::projection::write_projection_exact;
 use crate::oplog::reconciliation_baseline::{
     BaselineTimestamp, ReconciliationBaseline, ReconciliationBaselineBinding,
     TrustedPrivateApplicationRuntimeRoot,
@@ -2083,7 +2088,7 @@ fn append_local_batch_at(
     ])
     .unwrap();
 
-    let (admission, engine, _database, _tail) = session.parts();
+    let (admission, engine, _database, _tail) = session.parts().unwrap();
     // Every mutation path authorizes first; a promoted admission proves the
     // whole binding, not merely a non-regressing acceptance sequence.
     admission.authorize(&fixture.graph, engine).unwrap();
@@ -4700,11 +4705,14 @@ fn a_replaced_workspace_lease_path_fails_promoted_authority_closed_without_mutat
     fs::write(&incoming, b"").unwrap();
     fs::rename(&incoming, &lease_path).unwrap();
 
-    // A per-mutation admission window still opens. That is deliberate and
-    // documented: lease identity is a stable session fact carried exactly like
-    // the archive control-directory identity, so an unchanged-head admission
-    // performs no filesystem work for it. Everything the lease actually gates
-    // is below.
+    // A per-mutation admission window still opens *before* any boundary has
+    // observed the loss. That is deliberate and documented: lease identity is a
+    // stable session fact carried exactly like the archive control-directory
+    // identity, so an unchanged-head admission performs no filesystem work for
+    // it. Everything the lease actually gates is below — and the first boundary
+    // that observes the loss revokes this runtime for good, which
+    // `a_boundary_that_loses_the_workspace_lease_revokes_the_runtime_terminally`
+    // drives on its own.
     let mut window = runtime
         .admit_promoted_mutation(&mut authority, &fixture.graph)
         .unwrap();
@@ -4715,15 +4723,19 @@ fn a_replaced_workspace_lease_path_fails_promoted_authority_closed_without_mutat
         .expect_err("a drain under a replaced lease path must fail closed");
     assert!(
         matches!(
-            error,
-            RuntimePromotionError::Sqlite(ProjectionError::UnsafePath(_))
+            &error,
+            RuntimePromotionError::WorkspaceAuthorityRevoked(refusal)
+                if refusal.demanded_at() == WorkspaceAuthorityBoundary::ProjectionTailDrain
+                    && matches!(refusal.cause(), ProjectionError::UnsafePath(_))
         ),
         "unexpected drain error: {error}"
     );
     drop(window);
 
     // Boundary: the unabridged binding proof, which is the one every promoted
-    // open, handoff, and recovery boundary runs.
+    // open, handoff, and recovery boundary runs. It is now refused from the
+    // latch the drain set, which is the whole point: it must never re-derive
+    // authority from facts carried before the replacement.
     let Err(error) =
         runtime.admit_promoted_mutation_at_full_depth_for_test(&mut authority, &fixture.graph)
     else {
@@ -4731,8 +4743,10 @@ fn a_replaced_workspace_lease_path_fails_promoted_authority_closed_without_mutat
     };
     assert!(
         matches!(
-            error,
-            RuntimePromotionError::Sqlite(ProjectionError::UnsafePath(_))
+            &error,
+            RuntimePromotionError::WorkspaceAuthorityRevoked(refusal)
+                if refusal.revocation().boundary() == WorkspaceAuthorityBoundary::ProjectionTailDrain
+                    && matches!(refusal.cause(), ProjectionError::UnsafePath(_))
         ),
         "unexpected boundary-proof error: {error}"
     );
@@ -4804,6 +4818,637 @@ fn a_replaced_workspace_lease_path_fails_promoted_authority_closed_without_mutat
         .workspace_proof()
         .authorize_archive(&archive, fixture.workspace)
         .is_err());
+}
+
+/// The immutable published surface of one archive: exactly the batch manifests
+/// and content-addressed objects `publish_prepared` writes.
+///
+/// Deliberately narrower than the whole archive tree, because authoring a draft
+/// legitimately writes engine scratch and index namespaces that also live under
+/// the archive root. What must not move when a publication boundary refuses is
+/// the immutable batch itself.
+fn published_immutable_digests(archive_root: &Path) -> BTreeMap<String, ContentDigest> {
+    snapshot_file_digests(archive_root)
+        .into_iter()
+        .filter(|(path, _)| path.starts_with("batches/") || path.starts_with("objects/"))
+        .collect()
+}
+
+/// Replace the exact lease pathname with a byte-identical file of a different
+/// identity. Nothing an observer of contents, length, or name could notice.
+fn replace_workspace_lease_file(lease_path: &Path) {
+    let incoming = lease_path.with_extension("lock.incoming");
+    fs::write(&incoming, b"").unwrap();
+    fs::rename(&incoming, lease_path).unwrap();
+}
+
+/// Losing the workspace lease at *one* boundary must kill the runtime at
+/// *every* boundary, forever.
+///
+/// The hole this closes is specific. The unabridged binding proof rereads the
+/// lease identity; an ordinary admission does not, because the archive identity
+/// facts authenticated at the current enrollment binding generation are carried
+/// (`ArchiveAuthentication::Carried`). A failed boundary proof does not advance
+/// that generation, so without a terminal latch the very next unchanged-head
+/// admission would take the carried branch, issue no filesystem call for the
+/// lease at all, and succeed — handing out a mutation window over a workspace
+/// another process now legitimately owns.
+///
+/// So: prove a boundary *successfully* first, replace the lease path, watch the
+/// next boundary fail, and then require every later admission, window
+/// authorization, mutable-part handout, drain, and `Safe` handoff to refuse.
+#[test]
+fn a_boundary_that_loses_the_workspace_lease_revokes_the_runtime_terminally() {
+    let mut fixture = Fixture::new(
+        "sticky-revocation",
+        None,
+        vec![("pages/sticky.md".into(), b"- sticky\n".to_vec())],
+    );
+    let root = fixture.enrollment_root("sticky-revocation");
+    let binding = fixture.enrollment_binding();
+    let paths = PromotedPaths::new(&fixture, "sticky-revocation");
+    let (mut authority, mut runtime) = promote(&mut fixture, &root, SessionId::new(), &paths);
+    append_local_batch(&fixture, &mut authority, &mut runtime, 0xD200);
+
+    // A *successful* boundary proof first, so the failure below is a genuine
+    // transition rather than a runtime that was never authority.
+    runtime
+        .admit_promoted_mutation_at_full_depth_for_test(&mut authority, &fixture.graph)
+        .expect("the boundary proof must succeed while this runtime owns the lease");
+    assert_eq!(runtime.workspace_authority_revocation(), None);
+
+    let verification_digest = authority.verification_digest();
+    let lease_path = workspace_lease_path(&fixture.archive_root, fixture.workspace);
+    let archive_before = archive_digests_outside_the_lease_namespace(&fixture.archive_root);
+    let sqlite_before = promoted_projection_digests(&paths.database_path);
+    let graph_before = snapshot_files(&fixture.graph_root);
+    let head_before = enrollment_head(&root, &binding);
+    let generation_before = enrollment_generation(&root, &binding);
+    let handoff_before = committed_handoff(&root, &binding, verification_digest);
+    let history_before = runtime.engine().durable_history_authority().unwrap();
+    let frontier_before = runtime.engine().accepted_frontier_root().unwrap();
+
+    replace_workspace_lease_file(&lease_path);
+
+    // The next boundary proof observes the loss and latches it.
+    let Err(error) =
+        runtime.admit_promoted_mutation_at_full_depth_for_test(&mut authority, &fixture.graph)
+    else {
+        panic!("the boundary proof must fail closed under a replaced lease path");
+    };
+    assert!(
+        matches!(
+            &error,
+            RuntimePromotionError::WorkspaceAuthorityRevoked(refusal)
+                if refusal.demanded_at() == WorkspaceAuthorityBoundary::BindingProof
+                    && matches!(refusal.cause(), ProjectionError::UnsafePath(_))
+        ),
+        "unexpected boundary-proof error: {error}"
+    );
+    let revocation = runtime
+        .workspace_authority_revocation()
+        .expect("a failed boundary proof must latch terminal revocation");
+    assert_eq!(
+        revocation.boundary(),
+        WorkspaceAuthorityBoundary::BindingProof
+    );
+
+    // The load-bearing assertion: several *ordinary* admissions, which are
+    // exactly the ones that would otherwise carry the pre-replacement archive
+    // facts and perform no filesystem work at all. None of them may open.
+    for attempt in 0..8 {
+        let Err(error) = runtime.admit_promoted_mutation(&mut authority, &fixture.graph) else {
+            panic!("ordinary admission {attempt} opened a window over a revoked runtime");
+        };
+        assert!(
+            matches!(
+                &error,
+                RuntimePromotionError::WorkspaceAuthorityRevoked(refusal)
+                    if refusal.demanded_at() == WorkspaceAuthorityBoundary::Admission
+                        && refusal.revocation() == &revocation
+            ),
+            "admission {attempt} refused for the wrong reason: {error}"
+        );
+    }
+
+    // The promoted `Safe` handoff, which is a durable claim that this process
+    // drained everything it owned.
+    let Err(error) = runtime
+        .quiesce_and_mark_safe_without_watcher_dependency_for_test(&mut authority, &fixture.graph)
+    else {
+        panic!("a revoked runtime must not publish a Safe handoff");
+    };
+    assert!(
+        matches!(error, SafeHandoffUnavailable::Runtime(_)),
+        "unexpected Safe-handoff error: {error}"
+    );
+
+    // Nothing moved: not the graph, not the authoritative archive, not the
+    // enrollment chain, not the engine's durable history, not SQLite.
+    assert_eq!(snapshot_files(&fixture.graph_root), graph_before);
+    fixture.assert_graph_unchanged();
+    assert_eq!(
+        archive_digests_outside_the_lease_namespace(&fixture.archive_root),
+        archive_before
+    );
+    assert_eq!(
+        promoted_projection_digests(&paths.database_path),
+        sqlite_before
+    );
+    assert_eq!(enrollment_head(&root, &binding), head_before);
+    assert_eq!(enrollment_generation(&root, &binding), generation_before);
+    assert_eq!(
+        committed_handoff(&root, &binding, verification_digest),
+        handoff_before
+    );
+    assert_eq!(
+        runtime.engine().durable_history_authority().unwrap(),
+        history_before
+    );
+    assert_eq!(
+        runtime.engine().accepted_frontier_root().unwrap(),
+        frontier_before
+    );
+}
+
+/// Revocation is terminal, not a transient observation that heals when the
+/// filesystem looks right again.
+///
+/// This is the case the "sticky" requirement exists for: the provider restores
+/// the original file at the original pathname a moment later, so the identity
+/// check would pass again. It must not matter. Between the loss and the
+/// restore another process could legitimately have taken the archive, so a
+/// runtime that healed itself here would be the second applier. Recovery is a
+/// fresh reopen or crash takeover — which the end of this test performs, and
+/// which does work.
+#[test]
+fn restoring_the_original_lease_file_never_un_revokes_the_runtime() {
+    let mut fixture = Fixture::new(
+        "sticky-restore",
+        None,
+        vec![("pages/restore.md".into(), b"- restore\n".to_vec())],
+    );
+    let root = fixture.enrollment_root("sticky-restore");
+    let paths = PromotedPaths::new(&fixture, "sticky-restore");
+    let session = SessionId::new();
+    let (mut authority, mut runtime) = promote(&mut fixture, &root, session, &paths);
+    append_local_batch(&fixture, &mut authority, &mut runtime, 0xD300);
+
+    let lease_path = workspace_lease_path(&fixture.archive_root, fixture.workspace);
+    // A hard link preserves the *inode* the running lease is locked on, so the
+    // restore below puts back the exact file identity — not merely a file with
+    // the same name and bytes. This is the strongest form of the restore.
+    let preserved = lease_path.with_extension("lock.preserved");
+    fs::hard_link(&lease_path, &preserved).unwrap();
+
+    replace_workspace_lease_file(&lease_path);
+
+    // Fail exactly once.
+    let mut window = runtime
+        .admit_promoted_mutation(&mut authority, &fixture.graph)
+        .expect("the carried admission still opens before any boundary observes the loss");
+    assert!(window.drain_projection(16).is_err());
+    drop(window);
+    let revocation = runtime
+        .workspace_authority_revocation()
+        .expect("the drain must latch terminal revocation");
+
+    // Put the original identity back at the original pathname.
+    fs::remove_file(&lease_path).unwrap();
+    fs::rename(&preserved, &lease_path).unwrap();
+    // The raw identity check itself now passes again, which is exactly what
+    // makes this test meaningful: the refusals below are the latch, not the
+    // filesystem.
+    runtime
+        .projection
+        .revalidate_workspace_lease_identity()
+        .expect("the restored file is the exact identity this lease is locked on");
+
+    // Every boundary still refuses, and still names the original loss.
+    for attempt in 0..4 {
+        let Err(error) = runtime.admit_promoted_mutation(&mut authority, &fixture.graph) else {
+            panic!("admission {attempt} self-healed after a restored lease file");
+        };
+        assert!(
+            matches!(
+                &error,
+                RuntimePromotionError::WorkspaceAuthorityRevoked(refusal)
+                    if refusal.revocation() == &revocation
+            ),
+            "admission {attempt} refused for the wrong reason: {error}"
+        );
+    }
+    assert!(runtime
+        .admit_promoted_mutation_at_full_depth_for_test(&mut authority, &fixture.graph)
+        .is_err());
+    assert!(runtime
+        .quiesce_and_mark_safe_without_watcher_dependency_for_test(&mut authority, &fixture.graph)
+        .is_err());
+    assert_eq!(
+        runtime.workspace_authority_revocation().as_ref(),
+        Some(&revocation),
+        "the latched revocation must never be replaced or cleared"
+    );
+
+    // And the documented recovery: drop this runtime and reopen. A fresh
+    // process contends for the lease honestly and becomes authority again.
+    drop(runtime);
+    drop(authority);
+    let binding = fixture.enrollment_binding();
+    let (mut reopened_authority, mut reopened) =
+        reopen_promoted_local_runtime(&root, &binding, session, &paths.open(&fixture))
+            .expect("a fresh reopen is the recovery path, and it must work");
+    assert_eq!(reopened.workspace_authority_revocation(), None);
+    reopened
+        .admit_promoted_mutation(&mut reopened_authority, &fixture.graph)
+        .expect("the reopened runtime is authority again");
+    fixture.assert_graph_unchanged();
+}
+
+/// `parts()` is the shape both real consumers take — the operational
+/// coordinator and the reconciliation session — so handing out
+/// `&mut SqliteFrontier` and `&mut TailOverlay` *is* handing out the
+/// one-applier-per-workspace write. It must therefore be an authority boundary,
+/// not an accessor.
+///
+/// The window here opened legitimately, before the replacement, which is
+/// precisely the dangerous case: without this gate the caller would receive the
+/// applier handle on the strength of a proof taken before another process could
+/// have claimed the archive.
+#[test]
+fn parts_refuses_to_vend_the_sqlite_applier_and_tail_after_a_lease_replacement() {
+    let mut fixture = Fixture::new(
+        "parts-authority",
+        None,
+        vec![("pages/parts.md".into(), b"- parts\n".to_vec())],
+    );
+    let root = fixture.enrollment_root("parts-authority");
+    let paths = PromotedPaths::new(&fixture, "parts-authority");
+    let (mut authority, mut runtime) = promote(&mut fixture, &root, SessionId::new(), &paths);
+    append_local_batch(&fixture, &mut authority, &mut runtime, 0xD400);
+
+    let lease_path = workspace_lease_path(&fixture.archive_root, fixture.workspace);
+    let sqlite_before = promoted_projection_digests(&paths.database_path);
+
+    let mut window = runtime
+        .admit_promoted_mutation(&mut authority, &fixture.graph)
+        .unwrap();
+    // The control: while this runtime owns the lease, the same call vends.
+    window.parts().expect("an owned workspace vends its parts");
+
+    replace_workspace_lease_file(&lease_path);
+
+    let refusal = window
+        .parts()
+        .err()
+        .expect("parts must not vend the applier under a replaced lease path");
+    assert_eq!(
+        refusal.demanded_at(),
+        WorkspaceAuthorityBoundary::MutableParts
+    );
+    assert!(matches!(refusal.cause(), ProjectionError::UnsafePath(_)));
+    // Repeated attempts stay refused from the latch, not from a fresh stat that
+    // could one day pass again.
+    for attempt in 0..4 {
+        let refusal = window
+            .parts()
+            .err()
+            .unwrap_or_else(|| panic!("parts attempt {attempt} vended a revoked runtime"));
+        assert_eq!(
+            refusal.revocation().boundary(),
+            WorkspaceAuthorityBoundary::MutableParts
+        );
+    }
+    // The engine alone is memory rather than the applier, but a revoked runtime
+    // must not author into it either.
+    assert!(window.engine().is_err());
+    drop(window);
+
+    assert!(runtime
+        .admit_promoted_mutation(&mut authority, &fixture.graph)
+        .is_err());
+    assert_eq!(
+        promoted_projection_digests(&paths.database_path),
+        sqlite_before,
+        "no SQLite byte may move once the applier handout is refused"
+    );
+    fixture.assert_graph_unchanged();
+}
+
+/// A real promoted runtime whose graph carries a projected page and one
+/// external edit to it, so the production operational coordinator has a genuine
+/// external reconciliation to execute.
+struct PromotedCoordinatorWorld {
+    fixture: Fixture,
+    paths: PromotedPaths,
+    authority: LocalActiveAuthority,
+    runtime: PromotedLocalRuntime,
+    page_path: String,
+}
+
+impl PromotedCoordinatorWorld {
+    fn new(label: &str) -> Self {
+        let mut fixture = Fixture::new(
+            label,
+            None,
+            vec![("pages/seed.md".into(), b"- seed\n".to_vec())],
+        );
+        let root = fixture.enrollment_root(label);
+        let paths = PromotedPaths::new(&fixture, label);
+        let (mut authority, mut runtime) = promote(&mut fixture, &root, SessionId::new(), &paths);
+
+        const SEED: u128 = 0xC0FFEE;
+        append_local_batch(&fixture, &mut authority, &mut runtime, SEED);
+        let page_path = format!("pages/promoted-{SEED}.md");
+        // Project the authored page through the production projection writer,
+        // so the receipt namespace records an expected exact head. Without it
+        // an external edit is an unknown path rather than a reconcile.
+        write_projection_exact(
+            &fixture.graph,
+            &fixture.receipts,
+            runtime.engine(),
+            PageId::from_uuid(Uuid::from_u128(SEED)),
+            None,
+        )
+        .expect("the promoted runtime projects its own authored page");
+        // The external edit an honest user makes in another editor, or that a
+        // provider delivers.
+        fs::write(
+            fixture.graph_root.join(&page_path),
+            b"- externally edited\n",
+        )
+        .unwrap();
+
+        Self {
+            fixture,
+            paths,
+            authority,
+            runtime,
+            page_path,
+        }
+    }
+
+    fn lease_path(&self) -> PathBuf {
+        workspace_lease_path(&self.fixture.archive_root, self.fixture.workspace)
+    }
+
+    fn page_bytes(&self) -> Vec<u8> {
+        fs::read(self.fixture.graph_root.join(&self.page_path)).unwrap()
+    }
+
+    /// One complete coordinator journey through the promoted runtime's own
+    /// admitted window, exactly as an activation caller would drive it.
+    ///
+    /// The coordinator's per-pass operation budget is deliberately small, so an
+    /// honest journey over a real graph continues through
+    /// `FailedClosedOperationalCoordinator::retry`. Those bounded-slice
+    /// continuations are resumed here; a refusal that names the lost workspace
+    /// authority is terminal and is returned to the caller.
+    fn reconcile(&mut self) -> Result<OperationalCoordinatorState, OperationalCoordinatorError> {
+        let Self {
+            fixture,
+            authority,
+            runtime,
+            page_path,
+            ..
+        } = self;
+        let requested = [page_path.as_str()];
+        let mut window = runtime
+            .admit_promoted_mutation(authority, &fixture.graph)
+            .expect("the window opens while this runtime owns the workspace");
+        let (admission, engine, database, tail) = window
+            .parts()
+            .expect("the parts handout is authorized while the lease is owned");
+        let mut state = OperationalCoordinator::execute(
+            &admission,
+            &fixture.graph,
+            &fixture.receipts,
+            engine,
+            database,
+            tail,
+            &requested,
+        )?;
+        for _ in 0..16 {
+            match state {
+                OperationalCoordinatorState::FailedClosed(failed)
+                    if !failed.failure().detail().contains("workspace authority") =>
+                {
+                    state = failed.retry(
+                        &admission,
+                        &fixture.graph,
+                        &fixture.receipts,
+                        engine,
+                        database,
+                        tail,
+                    );
+                }
+                terminal => return Ok(terminal),
+            }
+        }
+        panic!("the bounded coordinator journey never converged");
+    }
+}
+
+/// The coordinator's authority-changing boundaries each re-prove archive-rooted
+/// workspace ownership immediately before their own side effect.
+///
+/// `execute` authorizes the admission once at entry and then runs the whole
+/// journey — publication, tail admission, the SQLite advance, and manifested
+/// Markdown projection — so a lease replacement anywhere inside it would
+/// otherwise be invisible until the next journey. Every one of those four is a
+/// write another process may now legitimately own.
+///
+/// Each case below moves the lease at the durability boundary *just before* a
+/// phase and requires that exact phase to refuse. The phase is asserted
+/// specifically, not merely "some failure", because a gate that collapsed every
+/// loss into one generic error would make the journey undiagnosable.
+#[test]
+fn moving_the_lease_between_coordinator_phases_refuses_the_next_phase() {
+    // Control: with the lease held throughout, the identical journey completes.
+    let mut control = PromotedCoordinatorWorld::new("coordinator-control");
+    let completion = match control.reconcile() {
+        Ok(OperationalCoordinatorState::Complete(completion)) => completion,
+        other => panic!(
+            "the control journey must complete: {}",
+            describe_coordinator_outcome(&other)
+        ),
+    };
+    assert_eq!(completion.batch_id(), completion.import_id().batch_id());
+    assert_eq!(
+        control.page_bytes(),
+        b"- externally edited\n",
+        "a completed reconciliation keeps the user's external bytes"
+    );
+    assert_eq!(control.runtime.workspace_authority_revocation(), None);
+
+    // Phase: publication. The lease moves at the tail-reservation boundary,
+    // which is the last step before the first irreversible one, so the
+    // publication gate must refuse before an immutable batch is written into
+    // the shared archive. (A loss that happens *before* the journey is caught
+    // earlier still, by `parts()`.)
+    let mut world = PromotedCoordinatorWorld::new("coordinator-publication");
+    let lease_path = world.lease_path();
+    let archive_before = published_immutable_digests(&world.fixture.archive_root);
+    act_once_at(OperationalFaultPoint::AfterReservation, move || {
+        replace_workspace_lease_file(&lease_path);
+    });
+    let failed = expect_coordinator_failure(world.reconcile());
+    assert_eq!(failed, OperationalPhase::Publication);
+    assert_eq!(
+        published_immutable_digests(&world.fixture.archive_root),
+        archive_before,
+        "a refused publication boundary must publish nothing"
+    );
+
+    // Phase: tail admission. The lease moves at the post-stage boundary, so
+    // publication and archive staging have happened and the next durable step
+    // is the device-local tail admission.
+    let mut world = PromotedCoordinatorWorld::new("coordinator-tail-admission");
+    let lease_path = world.lease_path();
+    let sqlite_before = promoted_projection_digests(&world.paths.database_path);
+    act_once_at(OperationalFaultPoint::AfterStage, move || {
+        replace_workspace_lease_file(&lease_path);
+    });
+    let failed = expect_coordinator_failure(world.reconcile());
+    assert_eq!(failed, OperationalPhase::TailAdmission);
+    assert_eq!(
+        promoted_projection_digests(&world.paths.database_path),
+        sqlite_before,
+        "a refused tail-admission boundary must not touch the applier database"
+    );
+
+    // Phase: the SQLite advance.
+    let mut world = PromotedCoordinatorWorld::new("coordinator-sqlite-drain");
+    let lease_path = world.lease_path();
+    let frontier_before = world.runtime.database().frontier_root().unwrap();
+    act_once_at(OperationalFaultPoint::AfterTailAdmission, move || {
+        replace_workspace_lease_file(&lease_path);
+    });
+    let failed = expect_coordinator_failure(world.reconcile());
+    assert_eq!(failed, OperationalPhase::SqliteDrain);
+    assert_eq!(
+        world.runtime.database().frontier_root().unwrap(),
+        frontier_before,
+        "a refused SQLite boundary must not advance the accepted frontier"
+    );
+
+    // Phase: manifested Markdown projection, which writes the user's own graph.
+    let mut world = PromotedCoordinatorWorld::new("coordinator-projection");
+    let lease_path = world.lease_path();
+    let graph_before = snapshot_files(&world.fixture.graph_root);
+    act_once_at(OperationalFaultPoint::AfterSqliteApply, move || {
+        replace_workspace_lease_file(&lease_path);
+    });
+    let failed = expect_coordinator_failure(world.reconcile());
+    assert_eq!(failed, OperationalPhase::ProjectionDrain);
+    assert_eq!(
+        snapshot_files(&world.fixture.graph_root),
+        graph_before,
+        "a refused projection boundary must not write graph text"
+    );
+
+    // And every one of them revoked the runtime terminally, so no later journey
+    // can even open its window: repeated attempts publish nothing, touch no
+    // SQLite byte, and write no graph text.
+    assert!(world.runtime.workspace_authority_revocation().is_some());
+    let published_before = published_immutable_digests(&world.fixture.archive_root);
+    let sqlite_before = promoted_projection_digests(&world.paths.database_path);
+    for attempt in 0..8 {
+        let Err(error) = world
+            .runtime
+            .admit_promoted_mutation(&mut world.authority, &world.fixture.graph)
+        else {
+            panic!("coordinator attempt {attempt} opened a window over a revoked runtime");
+        };
+        assert!(
+            matches!(error, RuntimePromotionError::WorkspaceAuthorityRevoked(_)),
+            "coordinator attempt {attempt} refused for the wrong reason: {error}"
+        );
+    }
+    assert_eq!(
+        published_immutable_digests(&world.fixture.archive_root),
+        published_before
+    );
+    assert_eq!(
+        promoted_projection_digests(&world.paths.database_path),
+        sqlite_before
+    );
+    assert_eq!(snapshot_files(&world.fixture.graph_root), graph_before);
+}
+
+fn describe_coordinator_outcome(
+    outcome: &Result<OperationalCoordinatorState, OperationalCoordinatorError>,
+) -> String {
+    match outcome {
+        Err(error) => format!("errored: {error}"),
+        Ok(OperationalCoordinatorState::Blocked(_)) => "blocked".into(),
+        Ok(OperationalCoordinatorState::Noop) => "no-op".into(),
+        Ok(OperationalCoordinatorState::Complete(_)) => "complete".into(),
+        Ok(OperationalCoordinatorState::FailedClosed(failed)) => {
+            format!("failed closed: {}", failed.failure())
+        }
+    }
+}
+
+/// The phase a lost-workspace refusal named, from either shape the coordinator
+/// can report it in: a pre-publication error, or a post-publication
+/// failed-closed continuation.
+fn expect_coordinator_failure(
+    outcome: Result<OperationalCoordinatorState, OperationalCoordinatorError>,
+) -> OperationalPhase {
+    let (phase, detail) = match &outcome {
+        Err(error) => (error.phase(), error.detail().to_owned()),
+        Ok(OperationalCoordinatorState::FailedClosed(failed)) => {
+            (failed.phase(), failed.failure().detail().to_owned())
+        }
+        other => panic!(
+            "the coordinator must fail closed at its authority boundary, got {}",
+            describe_coordinator_outcome(other)
+        ),
+    };
+    assert!(
+        detail.contains("workspace authority"),
+        "the refusal must name the lost workspace authority: {detail}"
+    );
+    phase
+}
+
+/// The SQLite applier handle and the bounded tail must stay unreachable from
+/// the promoted window except through the one call that proves the lease.
+///
+/// This is a self-policing source assertion in the same class as
+/// `resume_point`'s one-production-mint grep and `page_name_index`'s own
+/// `#[cfg(test)]` assertion: **if it fails, the invariant moved, not the test.**
+/// Re-adding a `database()`/`tail()` accessor on the promoted window — in any
+/// form, `#[cfg(test)]` included, because that is one deletion away from
+/// production — restores exactly the gap this packet closed: a caller receiving
+/// the one-applier-per-workspace write on the strength of a proof taken before
+/// the archive could have been claimed by another process.
+#[test]
+fn the_promoted_window_vends_no_infallible_applier_handle() {
+    let source = include_str!("../local_active.rs");
+    let window = source
+        .split_once("impl PromotedRuntimeSession<'_> {")
+        .expect("the promoted window impl block must still exist")
+        .1
+        .split_once("\n}\n")
+        .expect("the promoted window impl block must still close")
+        .0;
+
+    for forbidden in ["fn database(", "fn tail(", "fn parts(&mut self) -> ("] {
+        assert!(
+            !window.contains(forbidden),
+            "`{forbidden}` reintroduces an unproved applier handout on the promoted window"
+        );
+    }
+    assert!(
+        window.contains("pub(crate) fn parts(\n        &mut self,\n    ) -> Result<"),
+        "the production handout must stay fallible"
+    );
+    assert!(
+        window.contains("reprove(WorkspaceAuthorityBoundary::MutableParts)?"),
+        "the production handout must re-derive the lease identity before it splits"
+    );
 }
 
 /// The two defence-in-depth guards around the crash-takeover swap, driven

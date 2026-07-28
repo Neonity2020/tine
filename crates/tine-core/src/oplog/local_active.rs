@@ -137,6 +137,13 @@
 //! 5. **Every SQLite advance.** [`PromotedRuntimeSession::drain_projection`].
 //! 6. **The promoted `Safe` handoff**, before the drain proof is believed.
 //!
+//! 7. **Every handout of the mutable SQLite/tail parts.**
+//!    [`PromotedRuntimeSession::parts`], which is the shape both the
+//!    operational coordinator and the reconciliation session take.
+//! 8. **Every authority-changing coordinator boundary**: immutable publication,
+//!    tail admission, the SQLite drain, and each manifested Markdown projection
+//!    step, through [`LocalRuntimeAdmission::reprove_workspace_authority`].
+//!
 //! It deliberately does **not** run in the per-mutation admission fast path.
 //! Lease identity is a stable session fact of exactly the same class as the
 //! archive control-directory identity, and it is carried under the identical
@@ -146,12 +153,33 @@
 //! it, which `bounded_admission`'s zero-cost table asserts at 1, 1,000, and
 //! 10,000 admissions.
 //!
+//! ## Revocation is terminal, and deliberately not self-healing
+//!
+//! The first failed revalidation at *any* of those boundaries latches
+//! [`RuntimeRevocation`] on the runtime, one way and forever. Every later
+//! admission, mutation window, projection drain, mutable-part handout, window
+//! authorization, coordinator phase proof, and `Safe` handoff then refuses
+//! from the latch, without reusing a proof this runtime carried from before the
+//! replacement — which is exactly the hole a carried
+//! [`ArchiveAuthentication::Carried`] admission would otherwise leave open
+//! after a failed boundary proof.
+//!
+//! It is deliberately not recoverable in place. A replaced lease pathname means
+//! another process may legitimately own the archive now, so "recovering" would
+//! mean two appliers. Recovery is a fresh reopen or crash takeover, which
+//! contends for the lease honestly through
+//! [`reopen_promoted_local_runtime`]/[`take_over_promoted_local_runtime`].
+//!
 //! The honest residual: one batch authored inside an already-open mutation
 //! window can still be *published* to the archive after a replacement, because
 //! immutable content-addressed publication is not lease-gated at all (honest
-//! peers on other devices publish into the same archive by design). What the
-//! lease gates — opening a device-local database, advancing SQLite, swapping a
-//! crash-takeover handoff record, and publishing `Safe` — all fail closed first.
+//! peers on other devices publish into the same archive by design). The
+//! coordinator's own publication boundary reproves first, so the *coordinator*
+//! cannot publish after a replacement; a hand-rolled caller holding a live
+//! window still can. What the lease gates — opening a device-local database,
+//! advancing SQLite, admitting to the tail, writing manifested Markdown,
+//! swapping a crash-takeover handoff record, and publishing `Safe` — all fail
+//! closed first.
 //!
 //! ## Lock order, and why it is safe to invert it without blocking
 //!
@@ -968,6 +996,31 @@ impl LocalRuntimeAdmission<'_> {
             }
         }
     }
+
+    /// Re-derive archive-rooted workspace authority immediately before one
+    /// authority-changing boundary.
+    ///
+    /// This is the coordinator's phase gate. It is deliberately reachable only
+    /// through the admission every phase already holds, so a caller cannot
+    /// execute a boundary without the capability that proves it — there is no
+    /// separate probe value to forget to pass, and Tauri and unrelated crate
+    /// modules cannot construct either one.
+    ///
+    /// A failure latches the promoted runtime's terminal revocation, so it also
+    /// prevents every later boundary, later window, and later admission.
+    ///
+    /// The pre-activation hatch has no workspace lease at all and
+    /// [`Self::authorize`] already refuses it a promoted lineage, so it has no
+    /// workspace authority to re-derive and reports `Ok`.
+    pub(crate) fn reprove_workspace_authority(
+        &self,
+        boundary: WorkspaceAuthorityBoundary,
+    ) -> Result<(), WorkspaceAuthorityRefusal> {
+        match &self.provenance {
+            AdmissionProvenance::Promoted(admission) => admission.reprove(boundary),
+            AdmissionProvenance::UnenrolledPreActivation => Ok(()),
+        }
+    }
 }
 
 /// Proof that a durable `Safe` handoff was committed and freshly reopened.
@@ -1317,6 +1370,10 @@ pub(crate) enum RuntimePromotionError {
     /// The durable promotion state, bootstrap anchor, or authenticated history
     /// transition does not authenticate the live runtime.
     Anchor(&'static str),
+    /// This runtime no longer owns the archive-rooted workspace lease and has
+    /// latched [`RuntimeRevocation`]. Terminal: recovery is a fresh reopen or
+    /// crash takeover, never this runtime.
+    WorkspaceAuthorityRevoked(WorkspaceAuthorityRefusal),
 }
 
 impl fmt::Display for RuntimePromotionError {
@@ -1330,11 +1387,18 @@ impl fmt::Display for RuntimePromotionError {
             Self::Anchor(detail) => {
                 write!(formatter, "promoted runtime anchor failed: {detail}")
             }
+            Self::WorkspaceAuthorityRevoked(refusal) => refusal.fmt(formatter),
         }
     }
 }
 
 impl std::error::Error for RuntimePromotionError {}
+
+impl From<WorkspaceAuthorityRefusal> for RuntimePromotionError {
+    fn from(refusal: WorkspaceAuthorityRefusal) -> Self {
+        Self::WorkspaceAuthorityRevoked(refusal)
+    }
+}
 
 impl From<LocalActivationError> for RuntimePromotionError {
     fn from(error: LocalActivationError) -> Self {
@@ -1651,6 +1715,12 @@ pub(crate) struct PromotedLocalRuntime {
     /// runtime drops.
     projection: LeasedWorkspaceProjection,
     tail: TailOverlay,
+    /// Terminal, one-way. The first failed workspace-lease identity
+    /// revalidation at any boundary latches here, and every later admission,
+    /// window authorization, mutable-part handout, drain, coordinator phase
+    /// proof, and `Safe` handoff then refuses from it rather than reusing a
+    /// proof this runtime carried from before the loss.
+    revocation: RuntimeRevocationLatch,
     _seal: seal::Seal,
 }
 
@@ -1707,6 +1777,189 @@ impl RuntimeRecoveryState {
                  never proved",
             ),
         }
+    }
+}
+
+/// The boundary at which archive-rooted workspace authority was demanded.
+///
+/// Every variant is a place this runtime is about to change authority, take
+/// authority, or hand out the ability to change it. The variant is carried into
+/// every refusal so a diagnosis names the exact phase rather than "the lease
+/// moved".
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WorkspaceAuthorityBoundary {
+    /// Opening a promoted mutation window (`admit_promoted_mutation`).
+    Admission,
+    /// The unabridged promoted binding proof.
+    BindingProof,
+    /// Authorizing an already-open window's engine.
+    WindowAuthorization,
+    /// Handing out the mutable engine/SQLite/tail parts.
+    MutableParts,
+    /// The promoted runtime's own bounded tail -> SQLite drain.
+    ProjectionTailDrain,
+    /// The promoted `Safe` handoff.
+    SafeHandoff,
+    /// Coordinator: immutable batch publication into the archive.
+    Publication,
+    /// Coordinator: bounded tail admission of accepted batches.
+    TailAdmission,
+    /// Coordinator: the SQLite drain/advance.
+    SqliteDrain,
+    /// Coordinator: one manifested Markdown projection step.
+    ProjectionDrain,
+}
+
+impl WorkspaceAuthorityBoundary {
+    pub(crate) const fn describe(self) -> &'static str {
+        match self {
+            Self::Admission => "promoted mutation admission",
+            Self::BindingProof => "promoted binding proof",
+            Self::WindowAuthorization => "promoted window authorization",
+            Self::MutableParts => "mutable runtime parts handout",
+            Self::ProjectionTailDrain => "promoted tail -> SQLite drain",
+            Self::SafeHandoff => "promoted Safe handoff",
+            Self::Publication => "coordinator immutable publication",
+            Self::TailAdmission => "coordinator tail admission",
+            Self::SqliteDrain => "coordinator SQLite drain",
+            Self::ProjectionDrain => "coordinator manifested projection",
+        }
+    }
+}
+
+/// The terminal state one promoted runtime latches the first time its retained
+/// archive-rooted workspace lease stops naming its own lease file.
+///
+/// It is one way. It records where the loss was first observed and the exact
+/// [`ProjectionError`] that observed it, and nothing clears it: the runtime is
+/// dead for every purpose from that instant.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeRevocation {
+    boundary: WorkspaceAuthorityBoundary,
+    cause: ProjectionError,
+}
+
+impl RuntimeRevocation {
+    /// Where the loss of workspace authority was first observed.
+    pub(crate) const fn boundary(&self) -> WorkspaceAuthorityBoundary {
+        self.boundary
+    }
+
+    /// The exact revalidation failure that revoked this runtime.
+    pub(crate) const fn cause(&self) -> &ProjectionError {
+        &self.cause
+    }
+}
+
+impl fmt::Display for RuntimeRevocation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "workspace authority was revoked at the {}: {}",
+            self.boundary.describe(),
+            self.cause
+        )
+    }
+}
+
+/// One refused workspace-authority reproof.
+///
+/// It names both the boundary that demanded the proof *now* and the terminal
+/// revocation the runtime is carrying, so a phase failure after the fact stays
+/// distinguishable from the phase that lost the lease.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct WorkspaceAuthorityRefusal {
+    demanded_at: WorkspaceAuthorityBoundary,
+    revocation: RuntimeRevocation,
+}
+
+impl WorkspaceAuthorityRefusal {
+    pub(crate) const fn demanded_at(&self) -> WorkspaceAuthorityBoundary {
+        self.demanded_at
+    }
+
+    pub(crate) const fn revocation(&self) -> &RuntimeRevocation {
+        &self.revocation
+    }
+
+    pub(crate) const fn cause(&self) -> &ProjectionError {
+        self.revocation.cause()
+    }
+}
+
+impl fmt::Display for WorkspaceAuthorityRefusal {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "the {} refused: {}",
+            self.demanded_at.describe(),
+            self.revocation
+        )
+    }
+}
+
+impl std::error::Error for WorkspaceAuthorityRefusal {}
+
+/// One promoted runtime's terminal revocation latch.
+///
+/// It is interior-mutable on purpose. A live mutation window hands the
+/// coordinator an immutably borrowed [`LocalRuntimeAdmission`] while the engine,
+/// database, and tail are exclusively borrowed elsewhere, so the phase boundary
+/// that discovers the loss can only reach the latch through a shared reference.
+/// `Cell`-style latching is what lets that discovery still be terminal for the
+/// runtime rather than local to one call.
+#[derive(Debug, Default)]
+struct RuntimeRevocationLatch {
+    revoked: std::cell::RefCell<Option<RuntimeRevocation>>,
+}
+
+impl RuntimeRevocationLatch {
+    fn latched(&self) -> Option<RuntimeRevocation> {
+        self.revoked.borrow().clone()
+    }
+
+    /// Latch the first observed loss. A later loss never replaces it, so the
+    /// recorded boundary stays the one that actually lost the workspace.
+    fn revoke(
+        &self,
+        boundary: WorkspaceAuthorityBoundary,
+        cause: ProjectionError,
+    ) -> RuntimeRevocation {
+        self.revoked
+            .borrow_mut()
+            .get_or_insert(RuntimeRevocation { boundary, cause })
+            .clone()
+    }
+
+    /// Refuse `demanded_at` outright if this runtime is already revoked.
+    ///
+    /// Pure memory: this is what the per-mutation admission path runs, so it
+    /// adds no filesystem work at any admission count.
+    fn guard(
+        &self,
+        demanded_at: WorkspaceAuthorityBoundary,
+    ) -> Result<(), WorkspaceAuthorityRefusal> {
+        match self.latched() {
+            Some(revocation) => Err(WorkspaceAuthorityRefusal {
+                demanded_at,
+                revocation,
+            }),
+            None => Ok(()),
+        }
+    }
+
+    /// The one authority-changing shape: refuse if already revoked, otherwise
+    /// re-derive the lease identity and latch terminally the moment it fails.
+    fn reprove_with(
+        &self,
+        demanded_at: WorkspaceAuthorityBoundary,
+        revalidate: impl FnOnce() -> Result<(), ProjectionError>,
+    ) -> Result<(), WorkspaceAuthorityRefusal> {
+        self.guard(demanded_at)?;
+        revalidate().map_err(|cause| WorkspaceAuthorityRefusal {
+            demanded_at,
+            revocation: self.revoke(demanded_at, cause),
+        })
     }
 }
 
@@ -1967,6 +2220,14 @@ impl PromotedLocalRuntime {
         self.verification_digest
     }
 
+    /// The terminal revocation this runtime has latched, if any.
+    ///
+    /// Reported for diagnosis and tests. It is never authority: every boundary
+    /// consults the latch itself rather than trusting a caller's copy.
+    pub(crate) fn workspace_authority_revocation(&self) -> Option<RuntimeRevocation> {
+        self.revocation.latched()
+    }
+
     /// Admit one short-lived promoted mutation window.
     ///
     /// The window is derived from *both* the live [`LocalActiveAuthority`] and
@@ -1987,6 +2248,11 @@ impl PromotedLocalRuntime {
         graph: &Graph,
         depth: BindingProofDepth,
     ) -> Result<PromotedRuntimeSession<'a>, RuntimePromotionError> {
+        // Terminal first, before anything else is read or touched. A revoked
+        // runtime never admits again, and in particular never reuses the
+        // archive identity facts it carried from before the loss.
+        self.revocation
+            .guard(WorkspaceAuthorityBoundary::Admission)?;
         // The live authority must be this promoted runtime's session before any
         // durable state is read or touched at all.
         if authority.session_id != self.session_id
@@ -2014,8 +2280,10 @@ impl PromotedLocalRuntime {
             engine,
             projection,
             tail,
+            revocation,
             ..
         } = self;
+        let revocation = &*revocation;
         // Every enrollment invariant `admit_local_mutation` proves has just been
         // proved by `reconcile_promoted_handoff` on the retained session, and
         // this permit cannot be constructed anywhere outside this module.
@@ -2023,6 +2291,7 @@ impl PromotedLocalRuntime {
             authority: &*authority,
             _seal: seal::Seal,
         };
+        let (database, workspace) = projection.database_and_lease_identity();
         let admission = PromotedRuntimeAdmission {
             permit,
             state: state.clone(),
@@ -2030,14 +2299,14 @@ impl PromotedLocalRuntime {
             engine_authority: engine.runtime_authority().clone(),
             binding_generation: enrollment.binding_generation(),
             enrollment: &*enrollment,
+            workspace,
+            revocation,
             _seal: seal::Seal,
         };
-        let (database, workspace) = projection.database_and_lease_identity();
         Ok(PromotedRuntimeSession {
             admission,
             engine,
             database,
-            workspace,
             tail,
         })
     }
@@ -2062,6 +2331,9 @@ impl PromotedLocalRuntime {
         authority: &mut LocalActiveAuthority,
         graph: &Graph,
     ) -> Result<SafeHandoffPermit, SafeHandoffUnavailable> {
+        self.revocation
+            .guard(WorkspaceAuthorityBoundary::SafeHandoff)
+            .map_err(|refusal| SafeHandoffUnavailable::Runtime(refusal.to_string()))?;
         if authority.session_id != self.session_id
             || authority.verification_digest != self.verification_digest
         {
@@ -2077,9 +2349,12 @@ impl PromotedLocalRuntime {
         // lock stopped naming its own lease pathname no longer owns the
         // workspace and must not publish that claim. The real promoted `Safe`
         // transition, when the watcher dependency lands, must keep this check.
-        self.projection
-            .revalidate_workspace_lease_identity()
-            .map_err(|error| SafeHandoffUnavailable::Runtime(error.to_string()))?;
+        let projection = &self.projection;
+        self.revocation
+            .reprove_with(WorkspaceAuthorityBoundary::SafeHandoff, || {
+                projection.revalidate_workspace_lease_identity()
+            })
+            .map_err(|refusal| SafeHandoffUnavailable::Runtime(refusal.to_string()))?;
         let (handoff, head) = {
             let committed = self.enrollment.reauthenticate()?;
             (committed.handoff(), committed.enrollment_head())
@@ -2179,6 +2454,8 @@ impl PromotedLocalRuntime {
         authority: &LocalActiveAuthority,
         depth: BindingProofDepth,
     ) -> Result<(), RuntimePromotionError> {
+        self.revocation
+            .guard(WorkspaceAuthorityBoundary::BindingProof)?;
         if authority.session_id != self.session_id
             || authority.verification_digest != self.verification_digest
         {
@@ -2204,8 +2481,16 @@ impl PromotedLocalRuntime {
         // reread at every boundary and at every observed enrollment-head change,
         // carried by an unchanged-head admission. See the module documentation's
         // "Workspace lease identity" section.
+        // A failure here is terminal, not merely this proof's failure. Without
+        // the latch the very next unchanged-head admission would take the
+        // `Carried` branch, issue no filesystem call for the lease at all, and
+        // succeed on facts authenticated before the replacement.
         if archive == ArchiveAuthentication::Reread {
-            self.projection.revalidate_workspace_lease_identity()?;
+            let projection = &self.projection;
+            self.revocation
+                .reprove_with(WorkspaceAuthorityBoundary::BindingProof, || {
+                    projection.revalidate_workspace_lease_identity()
+                })?;
         }
         let accepted = revalidate_promoted_binding(
             &self.state,
@@ -2378,10 +2663,6 @@ pub(crate) struct PromotedRuntimeSession<'a> {
     admission: PromotedRuntimeAdmission<'a>,
     engine: &'a mut ShardedHotEngine,
     database: &'a mut SqliteFrontier,
-    /// The while-held identity check for the archive-rooted workspace lease
-    /// that authorized `database`, borrowed disjointly from it so the drain
-    /// boundary can still re-prove workspace ownership.
-    workspace: WorkspaceLeaseIdentity<'a>,
     tail: &'a mut TailOverlay,
 }
 
@@ -2402,17 +2683,26 @@ impl PromotedRuntimeSession<'_> {
         }
     }
 
-    pub(crate) const fn engine(&mut self) -> &mut ShardedHotEngine {
-        self.engine
+    /// The enrolled engine alone.
+    ///
+    /// The engine is process memory, not the one-applier-per-workspace write
+    /// authority, so this is deliberately not a lease boundary. It still
+    /// refuses a revoked runtime, because a revoked runtime must not be able to
+    /// author into an engine whose acceptance another process now owns.
+    pub(crate) fn engine(&mut self) -> Result<&mut ShardedHotEngine, WorkspaceAuthorityRefusal> {
+        self.admission
+            .revocation
+            .guard(WorkspaceAuthorityBoundary::MutableParts)?;
+        Ok(self.engine)
     }
 
-    pub(crate) const fn database(&mut self) -> &mut SqliteFrontier {
-        self.database
-    }
-
-    pub(crate) const fn tail(&mut self) -> &mut TailOverlay {
-        self.tail
-    }
+    // There is deliberately no `database()` or `tail()` here, in any form. The
+    // SQLite applier handle and the bounded tail are the
+    // one-applier-per-workspace write, so the only way to reach them is
+    // [`Self::parts`], which proves the archive-rooted lease immediately first.
+    // `the_promoted_window_vends_no_infallible_applier_handle` keeps it that
+    // way; a test-only escape hatch would be one `#[cfg(test)]` deletion away
+    // from being the production hole again.
 
     /// Drain the accepted tail into the device-local SQLite projection.
     ///
@@ -2433,10 +2723,10 @@ impl PromotedRuntimeSession<'_> {
         // The device-local database lock alone does not prove it, because a
         // process under another XDG/HOME/Flatpak root has its own; only the
         // archive-rooted lease does, and only while that lock is still on the
-        // file the lease pathname names.
-        self.workspace
-            .revalidate()
-            .map_err(RuntimePromotionError::Sqlite)?;
+        // file the lease pathname names. A loss observed here revokes the whole
+        // runtime, terminally.
+        self.admission
+            .reprove(WorkspaceAuthorityBoundary::ProjectionTailDrain)?;
         let engine = &*self.engine;
         let store = engine.archive_store().ok_or(RuntimePromotionError::Anchor(
             "promoted engine retained no archive capability",
@@ -2458,22 +2748,39 @@ impl PromotedRuntimeSession<'_> {
     }
 
     /// The complete admitted runtime, borrowed disjointly.
-    pub(crate) const fn parts(
+    ///
+    /// This is the shape both real consumers take — [`super::operational_coordinator::OperationalCoordinator::execute`]
+    /// and [`super::reconciliation_session::ReconciliationSessionDependencies`] —
+    /// so it is an authority boundary, not an accessor: handing out
+    /// `&mut SqliteFrontier` and `&mut TailOverlay` is handing out the
+    /// one-applier-per-workspace write. It therefore re-derives the lease
+    /// identity first and latches terminal revocation on failure, exactly as
+    /// the drain does.
+    ///
+    /// The returned [`LocalRuntimeAdmission`] carries the same probe forward, so
+    /// the coordinator can reprove at each of its own authority-changing
+    /// boundaries without a second capability.
+    pub(crate) fn parts(
         &mut self,
-    ) -> (
-        LocalRuntimeAdmission<'_>,
-        &mut ShardedHotEngine,
-        &mut SqliteFrontier,
-        &mut TailOverlay,
-    ) {
+    ) -> Result<
         (
+            LocalRuntimeAdmission<'_>,
+            &mut ShardedHotEngine,
+            &mut SqliteFrontier,
+            &mut TailOverlay,
+        ),
+        WorkspaceAuthorityRefusal,
+    > {
+        self.admission
+            .reprove(WorkspaceAuthorityBoundary::MutableParts)?;
+        Ok((
             LocalRuntimeAdmission {
                 provenance: AdmissionProvenance::Promoted(&self.admission),
             },
             self.engine,
             self.database,
             self.tail,
-        )
+        ))
     }
 }
 
@@ -2491,15 +2798,41 @@ pub(crate) struct PromotedRuntimeAdmission<'a> {
     binding_generation: u64,
     /// The exact retained enrollment session this window was admitted through.
     enrollment: &'a RetainedEnrollmentSession,
+    /// The while-held identity check for the archive-rooted workspace lease
+    /// that authorized this runtime's database, borrowed disjointly from it so
+    /// every authority-changing boundary can still re-prove ownership while the
+    /// database and tail are exclusively borrowed elsewhere.
+    workspace: WorkspaceLeaseIdentity<'a>,
+    /// This runtime's terminal revocation latch, shared so a boundary that only
+    /// holds the admission can still kill the whole runtime.
+    revocation: &'a RuntimeRevocationLatch,
     _seal: seal::Seal,
 }
 
 impl PromotedRuntimeAdmission<'_> {
+    /// Re-derive archive-rooted workspace authority immediately before one
+    /// authority-changing boundary, latching terminal revocation on failure.
+    ///
+    /// One held-handle stat plus one no-follow resolution of the exact lease
+    /// pathname. It is never on the per-mutation admission path.
+    fn reprove(
+        &self,
+        boundary: WorkspaceAuthorityBoundary,
+    ) -> Result<(), WorkspaceAuthorityRefusal> {
+        self.revocation
+            .reprove_with(boundary, || self.workspace.revalidate())
+    }
+
     fn authorize_engine(
         &self,
         graph: &Graph,
         engine: &ShardedHotEngine,
     ) -> Result<(), RuntimePromotionError> {
+        // Terminal first: a window whose runtime was revoked while it was live
+        // authorizes nothing, and in particular does not re-derive authority
+        // from the `Carried` archive facts it was minted with.
+        self.revocation
+            .guard(WorkspaceAuthorityBoundary::WindowAuthorization)?;
         // A window is authorized only at the exact session-local binding
         // generation it was minted at. Any full revalidation or journal
         // mutation moves that generation, so a window that outlived a lifecycle
@@ -3324,6 +3657,9 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
         engine,
         projection,
         tail,
+        // A freshly minted runtime has just proved the lease it holds, so it
+        // starts un-revoked. Nothing ever puts it back here.
+        revocation: RuntimeRevocationLatch::default(),
         _seal: seal::Seal,
     })
 }
@@ -3823,7 +4159,7 @@ mod bounded_admission {
         ])
         .unwrap();
 
-        let (admission, engine, _database, _tail) = session.parts();
+        let (admission, engine, _database, _tail) = session.parts().unwrap();
         admission.authorize(&fixture.graph, engine).unwrap();
         let draft = engine
             .draft_author_transaction(
@@ -3972,6 +4308,70 @@ mod bounded_admission {
             full.enrollment.lease_acquisitions, 0,
             "even the unabridged proof runs on the retained lease"
         );
+        fixture.assert_graph_unchanged();
+    }
+
+    /// The lease boundaries pay a filesystem cost and the keystroke path does
+    /// not — and the same instrument sees both.
+    ///
+    /// A zero-cost table alone cannot distinguish "the fast path is free" from
+    /// "the counter is broken". This pins the exact split: an ordinary
+    /// admission plus its window authorization is 0 lease revalidations, while
+    /// the same window's mutable-part handout and its drain are 1 each,
+    /// measured on the identical counter.
+    #[test]
+    fn only_the_authority_boundaries_pay_for_lease_identity() {
+        let mut fixture = Fixture::new(
+            "lease-cost",
+            vec![("pages/cost.md".into(), b"- cost\n".to_vec())],
+        );
+        let root = fixture.enrollment_root("lease-cost");
+        let paths = PromotedPaths::new(&fixture, "lease-cost");
+        let (mut authority, mut runtime) = promote(&mut fixture, &root, SessionId::new(), &paths);
+
+        // The keystroke path: admission plus authorization, repeatedly.
+        let before = PromotedRuntimeInstrumentation::capture();
+        for _ in 0..64 {
+            let session = runtime
+                .admit_promoted_mutation(&mut authority, &fixture.graph)
+                .unwrap();
+            session
+                .admission()
+                .authorize(&fixture.graph, runtime_engine_of(&session))
+                .unwrap();
+        }
+        assert_eq!(
+            before.since().workspace_lease_identity_revalidations,
+            0,
+            "no admission or window authorization may re-derive the lease identity"
+        );
+
+        // One mutable-part handout: exactly one held-handle stat plus one
+        // no-follow resolution of the lease pathname.
+        let mut session = runtime
+            .admit_promoted_mutation(&mut authority, &fixture.graph)
+            .unwrap();
+        let before = PromotedRuntimeInstrumentation::capture();
+        session.parts().unwrap();
+        assert_eq!(
+            before.since().workspace_lease_identity_revalidations,
+            1,
+            "vending the SQLite applier and tail must re-derive the lease identity exactly once"
+        );
+
+        // And repeated handouts inside one window each pay for themselves,
+        // because each is a fresh opportunity for the archive to have moved.
+        let before = PromotedRuntimeInstrumentation::capture();
+        session.parts().unwrap();
+        session.parts().unwrap();
+        session.parts().unwrap();
+        assert_eq!(before.since().workspace_lease_identity_revalidations, 3);
+
+        // The drain boundary is likewise exactly one.
+        let before = PromotedRuntimeInstrumentation::capture();
+        session.drain_projection(16).unwrap();
+        assert_eq!(before.since().workspace_lease_identity_revalidations, 1);
+
         fixture.assert_graph_unchanged();
     }
 
