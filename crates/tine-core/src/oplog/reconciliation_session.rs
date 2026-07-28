@@ -464,6 +464,20 @@ impl ReconciliationSession<FailedClosedOperationalCoordinator> {
         self.step_with(&mut dispatch)
     }
 
+    #[cfg(test)]
+    pub(crate) fn step_with_before_second_scan_pass<'a>(
+        &mut self,
+        dependencies: ReconciliationSessionDependencies<'a>,
+        before_second_scan_pass: impl FnMut() + 'a,
+    ) -> Result<ReconciliationSessionStep, ReconciliationSessionError> {
+        let mut dispatch = LiveReconciliationSessionDispatch {
+            dependencies,
+            before_second_scan_pass: Some(Box::new(before_second_scan_pass)),
+            arrival_before_dispatch: None,
+        };
+        self.step_with(&mut dispatch)
+    }
+
     /// Resume the exact retained post-publication continuation once.
     pub(crate) fn resume(
         &mut self,

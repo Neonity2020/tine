@@ -186,6 +186,8 @@ pub(crate) struct ExactExternalFeedState {
     terminal: Option<ExactExternalFeedTerminal>,
     #[cfg(test)]
     rebase_count: u64,
+    #[cfg(test)]
+    before_second_scan_pass: Option<Box<dyn FnMut()>>,
 }
 
 impl fmt::Debug for ExactExternalFeedState {
@@ -248,6 +250,8 @@ impl ExactExternalFeedState {
             terminal: None,
             #[cfg(test)]
             rebase_count: 0,
+            #[cfg(test)]
+            before_second_scan_pass: None,
         })
     }
 
@@ -478,12 +482,15 @@ impl ExactExternalFeedState {
             }
             ReconciliationSessionStep::RetryFull => {
                 let active = self.active.as_mut().expect("active drain disappeared");
-                // A targeted scan which asks for RetryFull has made its exact
-                // hint insufficient. Collapse this same queue epoch to one
-                // full rebase; never preserve the targeted shape and later
-                // publish an incomplete exact batch.
-                active.scope = ActiveDrainScope::FullScan;
-                active.rebase_before_step = true;
+                if matches!(active.scope, ActiveDrainScope::Exact(_)) {
+                    // A targeted scan which asks for RetryFull has made its
+                    // exact hint insufficient. Collapse this same queue epoch
+                    // to its one full rebase. An already-full unstable scan
+                    // retries behind the existing fence without rebasing the
+                    // unchanged epoch again.
+                    active.scope = ActiveDrainScope::FullScan;
+                    active.rebase_before_step = true;
+                }
                 ExactExternalFeedDrain::RetryFull
             }
             ReconciliationSessionStep::Blocked => {
@@ -743,6 +750,8 @@ impl ExactExternalFeedState {
         observed_at: BaselineTimestamp,
         continuation: Option<ReconciliationPendingContinuation>,
     ) -> Result<ReconciliationSessionStep, ExecuteReconciliationError> {
+        #[cfg(test)]
+        let before_second_scan_pass = self.before_second_scan_pass.take();
         let Self {
             reconciliation,
             baseline,
@@ -779,7 +788,20 @@ impl ExactExternalFeedState {
         };
         match continuation {
             Some(token) => reconciliation.resume(token, dependencies),
-            None => reconciliation.step(dependencies),
+            None => {
+                #[cfg(test)]
+                {
+                    if let Some(hook) = before_second_scan_pass {
+                        reconciliation.step_with_before_second_scan_pass(dependencies, hook)
+                    } else {
+                        reconciliation.step(dependencies)
+                    }
+                }
+                #[cfg(not(test))]
+                {
+                    reconciliation.step(dependencies)
+                }
+            }
         }
         .map_err(|error| {
             ExecuteReconciliationError::Runtime(format!(
@@ -1828,6 +1850,71 @@ mod tests {
         assert_eq!(settled.acknowledged, settled.latest_enqueue);
         assert_eq!(owner.feed_sequence, settled.acknowledged.sequence());
         assert_eq!(owner.rebase_count, rebases_before_byte_overflow + 1);
+    }
+
+    #[test]
+    fn unstable_full_scan_retries_behind_the_same_epoch_fence() {
+        let mut fixture = configured_fixture("unstable-full-scan");
+        let enrollment = fixture.enrollment_root("unstable-full-scan");
+        let paths = PromotedPaths::new(&fixture, "unstable-full-scan");
+        let (mut authority, mut runtime) = promoted_safe_reopen(&mut fixture, &enrollment, &paths);
+        let baseline = fixture.baseline(&fixture.graph, "unstable-full-scan", false);
+        let mut owner =
+            ExactExternalFeedState::open(&fixture.graph, &fixture.receipts, &runtime, baseline)
+                .unwrap();
+        let mut clock = 0;
+        assert_admitted(drive_terminal(
+            &mut owner,
+            &fixture.graph,
+            &fixture.receipts,
+            &mut authority,
+            &mut runtime,
+            &mut clock,
+        ));
+
+        let rebases_before = owner.rebase_count;
+        owner
+            .observe(
+                &fixture.graph,
+                &runtime,
+                [WatcherObservation::RescanRequired],
+            )
+            .unwrap();
+        let graph_root = fixture.graph_root.clone();
+        owner.before_second_scan_pass = Some(Box::new(move || {
+            let changed = graph_root.join("content/nested pages/raced.md");
+            fs::create_dir_all(changed.parent().unwrap()).unwrap();
+            fs::write(changed, b"- arrived between scan passes\n").unwrap();
+        }));
+
+        clock += 1;
+        assert_eq!(
+            owner.drain_one(
+                &fixture.graph,
+                &fixture.receipts,
+                &mut authority,
+                &mut runtime,
+                BaselineTimestamp::from_millis(clock).unwrap(),
+            ),
+            ExactExternalFeedDrain::RetryFull
+        );
+        assert_eq!(owner.rebase_count, rebases_before + 1);
+        assert_admitted(drive_terminal(
+            &mut owner,
+            &fixture.graph,
+            &fixture.receipts,
+            &mut authority,
+            &mut runtime,
+            &mut clock,
+        ));
+        assert_eq!(
+            owner.rebase_count,
+            rebases_before + 1,
+            "an unstable full scan must retry behind its existing queue fence"
+        );
+        let settled = runtime.watcher_status();
+        assert_eq!(settled.acknowledged, settled.latest_enqueue);
+        assert!(!settled.pending);
     }
 
     #[test]
