@@ -2573,6 +2573,30 @@ impl AcceptedFrontierRoot {
         empty_accepted_frontier_root()
     }
 
+    /// Test-only saturation for the resume-point byte ceiling proof.
+    ///
+    /// Every member is fixed-size except `scratch_root`, which is one more
+    /// [`super::scratch_store::ScratchLsmRoot`]; a resume point carries two of
+    /// these frontiers, so they contribute two of the format's ten LSM roots.
+    #[cfg(test)]
+    pub(crate) fn saturated_for_test(key_bytes: usize) -> Self {
+        Self {
+            schema_version: u32::MAX,
+            acceptance_sequence: u64::MAX,
+            document_count: u64::MAX,
+            retained_bytes_total: u64::MAX,
+            document_map_root_key: Some([0xff; 16]),
+            document_map_root_digest: ContentDigest::of(b"saturated document map"),
+            batch_map_root_key: Some([0xff; 16]),
+            batch_map_root_digest: ContentDigest::of(b"saturated batch map"),
+            reference_catalog_root: empty_accepted_frontier_root().reference_catalog_root,
+            state_digest: ContentDigest::of(b"saturated frontier state"),
+            scratch_root: Some(super::scratch_store::ScratchLsmRoot::saturated_for_test(
+                key_bytes,
+            )),
+        }
+    }
+
     pub const fn acceptance_sequence(&self) -> u64 {
         self.acceptance_sequence
     }

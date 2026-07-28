@@ -723,6 +723,154 @@ impl Default for ScratchLsmRoot {
     }
 }
 
+/// The widest key any lane carried by a runtime resume point actually stores.
+///
+/// The LSM lanes in [`ScratchRoots`] are keyed by fixed-width identities and
+/// digests, never by page names or paths: `document_state`'s widest key is one
+/// lane tag plus a `DocumentId` plus a `DocumentCausalDigest`, and the point,
+/// map and catalog roots are keyed by a 16-byte identity or a digest. Nothing in
+/// these lanes scales with graph size, which is why a resume point does not
+/// either.
+#[cfg(test)]
+pub(crate) const MAX_CARRIED_SCRATCH_KEY_BYTES: usize = 1 + 16 + 32;
+
+/// Test-only builders that saturate every variable-length member of a run-local
+/// root, so the resume-point byte ceiling can be proved by encoding the widest
+/// record the format admits instead of extrapolated from measured samples.
+///
+/// These deliberately use the widest *encodable* field values (`u64::MAX`
+/// offsets and generations encode as full 10-byte varints), not the widest
+/// reachable ones. A fail-closed byte ceiling has to bound every record that
+/// can be encoded, so over-approximating is the point.
+#[cfg(test)]
+impl ScratchPageRef {
+    pub(crate) fn saturated_for_test(key_bytes: usize) -> Self {
+        Self {
+            offset: u64::MAX,
+            encoded_len: u32::MAX,
+            digest: ContentDigest::of(b"saturated scratch page"),
+            kind: ScratchPageKind::DocumentExternalExact,
+            key_min: vec![0xff; key_bytes],
+            key_max: vec![0xff; key_bytes],
+        }
+    }
+}
+
+#[cfg(test)]
+impl ScratchLsmRoot {
+    /// Every one of the format's fixed [`SCRATCH_LSM_LEVELS`] levels occupied.
+    ///
+    /// The levels are a binary counter over flushes, so all 32 occupied at once
+    /// is the counter's maximum — representable by construction and the only
+    /// state this root's width can reach.
+    pub(crate) fn saturated_for_test(key_bytes: usize) -> Self {
+        Self {
+            next_generation: u64::MAX,
+            levels: vec![
+                Some(ScratchSegmentRef {
+                    generation: u64::MAX,
+                    entry_count: u64::MAX,
+                    page_ref: ScratchPageRef::saturated_for_test(key_bytes),
+                });
+                SCRATCH_LSM_LEVELS
+            ],
+        }
+    }
+}
+
+#[cfg(test)]
+impl ScratchAuthenticatedPointRoot {
+    pub(crate) fn saturated_for_test(key_bytes: usize) -> Self {
+        Self {
+            schema_version: u32::MAX,
+            count: u64::MAX,
+            root_key_digest: Some(ContentDigest::of(b"saturated point key")),
+            root_digest: ContentDigest::of(b"saturated point root"),
+            root: Some(ScratchPageRef::saturated_for_test(key_bytes)),
+        }
+    }
+}
+
+#[cfg(test)]
+impl ScratchAuthenticatedMapRoot {
+    pub(crate) fn saturated_for_test(key_bytes: usize) -> Self {
+        Self {
+            schema_version: u32::MAX,
+            count: u64::MAX,
+            root_key: Some([0xff; 16]),
+            root_digest: ContentDigest::of(b"saturated map root"),
+            root: Some(ScratchPageRef::saturated_for_test(key_bytes)),
+        }
+    }
+}
+
+#[cfg(test)]
+impl ScratchAuthenticatedCatalogRoot {
+    pub(crate) fn saturated_for_test(key_bytes: usize) -> Self {
+        Self {
+            schema_version: u32::MAX,
+            count: u64::MAX,
+            root_key: Some([0xff; 16]),
+            root_digest: ContentDigest::of(b"saturated catalog root"),
+            root: Some(ScratchPageRef::saturated_for_test(key_bytes)),
+        }
+    }
+}
+
+#[cfg(test)]
+impl ScratchAcceptedSequenceRoot {
+    pub(crate) fn saturated_for_test(key_bytes: usize) -> Self {
+        Self {
+            schema_version: u32::MAX,
+            len: u64::MAX,
+            height: u8::MAX,
+            root: Some(ScratchPageRef::saturated_for_test(key_bytes)),
+        }
+    }
+}
+
+#[cfg(test)]
+impl ScratchRoots {
+    /// Every member of the run-local root set at its widest encodable value.
+    ///
+    /// Exhaustive by construction: it names every field, so a member added to
+    /// `ScratchRoots` without a saturation is a compile error rather than a
+    /// silently unbounded term in the ceiling proof.
+    pub(crate) fn saturated_for_test(key_bytes: usize) -> Self {
+        let point = || ScratchAuthenticatedPointRoot::saturated_for_test(key_bytes);
+        let lsm = || ScratchLsmRoot::saturated_for_test(key_bytes);
+        Self {
+            batch_status_root: point(),
+            dependency_root: point(),
+            unresolved_dependency_root: point(),
+            wait_root: point(),
+            wait_progress_root: point(),
+            fanout_root: point(),
+            fanout_head: u64::MAX,
+            fanout_tail: u64::MAX,
+            fanout_work_remaining: Some(u64::MAX),
+            registering_len: u64::MAX,
+            ready_queue_root: point(),
+            ready_queue_len: u64::MAX,
+            causal_root: point(),
+            causal_dot_root: point(),
+            causal_peer_root: point(),
+            causal_clock_len_root: point(),
+            document_current_root: lsm(),
+            document_state_root: lsm(),
+            document_after_batch_root: lsm(),
+            blob_dedup_root: lsm(),
+            conflict_root: lsm(),
+            external_document_current_root: lsm(),
+            external_document_state_root: lsm(),
+            accepted_frontier_root: lsm(),
+            accepted_sequence_root: ScratchAcceptedSequenceRoot::saturated_for_test(key_bytes),
+            accepted_document_map_root: ScratchAuthenticatedMapRoot::saturated_for_test(key_bytes),
+            accepted_batch_map_root: ScratchAuthenticatedMapRoot::saturated_for_test(key_bytes),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ScratchRoots {

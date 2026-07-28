@@ -834,6 +834,33 @@ pub(crate) struct BlockClaimIndexRoot {
         [[Option<BlockClaimSegmentRef>; BLOCK_CLAIM_SEGMENTS_PER_LEVEL]; BLOCK_CLAIM_INDEX_LEVELS],
 }
 
+/// Test-only saturation of the block-claim root, for the resume-point byte
+/// ceiling proof.
+///
+/// Every member here is fixed-size — `BlockClaimPageRef` carries no key span —
+/// so the whole root's width is decided by the two fixed array dimensions and
+/// the widest encodable field values.
+#[cfg(test)]
+impl BlockClaimIndexRoot {
+    pub(crate) fn saturated_for_test() -> Self {
+        let page_ref = BlockClaimPageRef {
+            offset: u64::MAX,
+            encoded_len: u32::MAX,
+            digest: ContentDigest::of(b"saturated block claim page"),
+        };
+        Self {
+            next_generation: u64::MAX,
+            global_filter: Some(page_ref),
+            levels: [[Some(BlockClaimSegmentRef {
+                generation: u64::MAX,
+                entry_count: u64::MAX,
+                page_ref,
+                filter_ref: page_ref,
+            }); BLOCK_CLAIM_SEGMENTS_PER_LEVEL]; BLOCK_CLAIM_INDEX_LEVELS],
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct BlockClaimIndexStore {
     file: Mutex<fs::File>,

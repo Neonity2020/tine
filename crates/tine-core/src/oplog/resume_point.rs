@@ -102,19 +102,26 @@ pub(crate) const RESUME_POINT_SCHEMA_VERSION: u32 = 1;
 /// breaches 16 KiB.
 ///
 /// Both counters are fixed-width arrays, so the record is structurally bounded
-/// rather than open-ended. Using the measured per-unit costs (about 88-118 bytes
-/// per occupied LSM level and about 149 bytes per occupied block-claim segment),
-/// the absolute maximum is roughly:
+/// rather than open-ended: every payload member is fixed-size except ten
+/// `ScratchLsmRoot`s (eight in `ScratchRoots`, one in each of the two accepted
+/// frontiers), whose `levels` is validated at exactly 32, and
+/// `BlockClaimIndexRoot`'s `[[Option<_>; 32]; 8]`.
 ///
-/// * 10 LSM roots (8 in `ScratchRoots`, one in each of the two accepted
-///   frontiers) x 32 levels x ~128 B  = ~40 KiB
-/// * 8 block-claim levels x 32 segments x ~176 B                = ~44 KiB
-/// * every constant-size member, from the measured empty record  = ~4 KiB
+/// **That bound is executable, not estimated.**
+/// `the_widest_encodable_record_fits_the_ceiling` builds the widest record the
+/// format admits — every LSM level and every block-claim segment occupied, key
+/// spans at the widest key any carried lane stores, and every scalar at its
+/// widest *encodable* value so offsets and generations cost full 10-byte
+/// varints no real run reaches — and encodes it. It is **117,713 bytes** against
+/// this 131,072-byte ceiling.
 ///
-/// which is about 88 KiB. 128 KiB clears that with margin for the estimate,
-/// keeps the bound strict and fail-closed on both encode and read, and adds no
-/// per-edit work — nothing on the keystroke, admission or acceptance path
-/// encodes a resume point at all.
+/// That margin is about 10%, materially tighter than the ~88 KiB the ceiling
+/// was first derived from, which is exactly why the test asserts a band in both
+/// directions rather than a one-sided inequality: a new payload member eats
+/// visible margin here instead of silently disabling adoption later. The bound
+/// stays strict and fail-closed on both encode and read, and adds no per-edit
+/// work — nothing on the keystroke, admission or acceptance path encodes a
+/// resume point at all.
 ///
 /// Exceeding the ceiling remains "this state is not *publishable*", never an
 /// error the caller must recover from: the restart pays a full replay, which is
@@ -1089,6 +1096,65 @@ mod tests {
             length * 32 < MAX_RESUME_POINT_BYTES,
             "the ceiling must stay far above the fixed cost of an empty record"
         );
+    }
+
+    /// The structural argument for [`MAX_RESUME_POINT_BYTES`], made executable.
+    ///
+    /// The measured table in that constant's doc is a sample: it says what real
+    /// engines produced, not what the format can produce. The claim the ceiling
+    /// actually rests on is structural — every payload member is fixed-size
+    /// except ten `ScratchLsmRoot`s, whose `levels` is validated at exactly 32,
+    /// and `BlockClaimIndexRoot`'s `[[Option<_>; 32]; 8]` — and until now that
+    /// claim was arithmetic on measured per-unit costs, which is exactly the kind
+    /// of estimate that drifts when a field is added.
+    ///
+    /// This encodes the widest record the format admits and asserts it fits.
+    /// Saturation is a deliberate over-approximation of every reachable state:
+    /// all 32 LSM levels occupied at once (the flush counter's maximum), all
+    /// 8 x 32 block-claim segments occupied, and every scalar at its widest
+    /// *encodable* value, so offsets and generations cost full 10-byte varints
+    /// no real run will ever reach. A fail-closed byte ceiling has to bound
+    /// every record that can be encoded, so proving the over-approximation fits
+    /// proves the ceiling.
+    ///
+    /// The saturation builders name every field of `ScratchRoots`, so a member
+    /// added without a saturation is a compile error rather than a silently
+    /// unbounded term in this proof.
+    #[test]
+    fn the_widest_encodable_record_fits_the_ceiling() {
+        let key_bytes = crate::oplog::scratch_store::MAX_CARRIED_SCRATCH_KEY_BYTES;
+        let saturated = RuntimeResumePointV1 {
+            scratch_roots: ScratchRoots::saturated_for_test(key_bytes),
+            block_claim_root: BlockClaimIndexRoot::saturated_for_test(),
+            accepted_frontier_root: AcceptedFrontierRoot::saturated_for_test(key_bytes),
+            current_path_catalog_root: ScratchAuthenticatedCatalogRoot::saturated_for_test(
+                key_bytes,
+            ),
+            current_path_catalog_frontier: AcceptedFrontierRoot::saturated_for_test(key_bytes),
+            ..point(u64::MAX)
+        };
+        let bytes = saturated
+            .encode()
+            .expect("the widest encodable record must stay inside the ceiling");
+        let length = bytes.len() as u64;
+        assert!(
+            length < MAX_RESUME_POINT_BYTES,
+            "the widest encodable resume point is {length} bytes, at or over its {MAX_RESUME_POINT_BYTES}-byte ceiling"
+        );
+        // Measured: 117,713 bytes against a 131,072-byte ceiling, so the real
+        // structural margin is about 10% — materially tighter than the ~88 KiB
+        // the ceiling was originally derived from. The band is asserted in both
+        // directions: a member that stopped saturating would silently weaken
+        // this proof, and a member that grew would eat the remaining margin
+        // where a reviewer can see it rather than in a later silent refusal.
+        assert!(
+            (100_000..=125_000).contains(&length),
+            "the widest encodable resume point is {length} bytes; the ceiling proof's measured band moved"
+        );
+        // Read is bounded by the same constant, so the widest record the writer
+        // can produce is also readable — otherwise the ceiling would be a
+        // write/read asymmetry that strands a legitimate point on disk.
+        assert_eq!(RuntimeResumePointV1::decode(&bytes).unwrap(), saturated);
     }
 
     #[test]
