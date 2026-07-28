@@ -3304,6 +3304,37 @@ impl<'a> SqliteMaterializedRead<'a> {
         self.pages_by_text_column("path", path.as_str(), limit)
     }
 
+    /// Bounded stable page listing for application-facing exact queries. This
+    /// only reads the stamped materialization captured on construction; it is
+    /// intentionally not a filesystem or graph-tree enumeration.
+    pub fn pages(
+        &self,
+        kind: Option<ManagedTextKind>,
+        limit: usize,
+    ) -> Result<Vec<MaterializedPageRow>, MaterializationError> {
+        let limit = checked_limit(limit)?;
+        let (sql, args): (&str, Vec<rusqlite::types::Value>) = match kind {
+            Some(kind) => (
+                "SELECT page_id, home_document_id, name, name_key, path,
+                        text_kind, preamble, searchable_text
+                 FROM pages WHERE text_kind = ?1 ORDER BY path, page_id LIMIT ?2",
+                vec![text_kind_to_sql(kind).into(), limit.into()],
+            ),
+            None => (
+                "SELECT page_id, home_document_id, name, name_key, path,
+                        text_kind, preamble, searchable_text
+                 FROM pages ORDER BY path, page_id LIMIT ?1",
+                vec![limit.into()],
+            ),
+        };
+        let mut statement = self.connection.prepare(sql)?;
+        let rows = statement.query_map(rusqlite::params_from_iter(args), page_row)?;
+        collect_read_rows(
+            rows.map(|row| row.map_err(MaterializationError::from)),
+            page_row_output_bytes,
+        )
+    }
+
     fn pages_by_text_column(
         &self,
         column: &str,

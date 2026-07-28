@@ -22,6 +22,8 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
+
 use crate::model::Graph;
 use crate::oplog::discovery::{
     discover_startup, AmbiguousEvidence, DiscoveryClassification, DiscoveryComponent,
@@ -52,7 +54,13 @@ use crate::oplog::reconciliation_baseline::{
 };
 use crate::oplog::sqlite::ApplicationRuntimeRoot;
 use crate::oplog::watcher_queue::WatcherObservation;
-use crate::oplog::{BatchId, ManagedPath, OperationTransaction, SemanticOperation, SessionId};
+use crate::oplog::{
+    BatchId, BlockId, FrontierReferenceHit, LogseqUuid, ManagedPath, ManagedTextKind,
+    MaterializedBlockRow, MaterializedEntityId, MaterializedPageRow, MaterializedPropertyRow,
+    MaterializedSearchHit, MaterializedTagRow, MaterializedTaskRow, OperationTransaction, PageId,
+    ReferenceFactV1, ReferenceSourceLocatorV1, SemanticOperation, SessionId,
+    MAX_MATERIALIZATION_QUERY_BYTES, MAX_MATERIALIZATION_QUERY_ROWS,
+};
 
 const ACTOR_CHANNEL_CAPACITY: usize = 64;
 const ACTOR_STACK_BYTES: usize = 16 * 1024 * 1024;
@@ -67,6 +75,12 @@ pub const MAX_LOCAL_MUTATION_REFERENCED_PATHS: usize = 512;
 pub const MAX_LOCAL_MUTATION_PATH_BYTES: usize = 256 * 1024;
 /// Maximum aggregate UTF-8 bytes in names, content, preambles, and order keys.
 pub const MAX_LOCAL_MUTATION_TEXT_BYTES: usize = 1024 * 1024;
+/// The public boundary uses the materialization's proven row cap. Every query
+/// validates this before it is placed on the actor queue.
+pub const MAX_SYNC_RUNTIME_QUERY_ROWS: usize = MAX_MATERIALIZATION_QUERY_ROWS;
+/// Bound aggregate request retention independently of any individual SQLite
+/// predicate. This also bounds multi-field requests such as property filters.
+pub const MAX_SYNC_RUNTIME_QUERY_BYTES: usize = MAX_MATERIALIZATION_QUERY_BYTES;
 
 #[cfg(test)]
 static ACTOR_THREADS_STARTED: std::sync::atomic::AtomicUsize =
@@ -232,6 +246,207 @@ pub struct SyncRuntimeStatusSnapshot {
     pub detail: Option<String>,
 }
 
+/// Serializable exact text kind at the application boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncPageKind {
+    Page,
+    Journal,
+}
+
+impl From<ManagedTextKind> for SyncPageKind {
+    fn from(value: ManagedTextKind) -> Self {
+        match value {
+            ManagedTextKind::Page => Self::Page,
+            ManagedTextKind::Journal => Self::Journal,
+        }
+    }
+}
+
+impl From<SyncPageKind> for ManagedTextKind {
+    fn from(value: SyncPageKind) -> Self {
+        match value {
+            SyncPageKind::Page => Self::Page,
+            SyncPageKind::Journal => Self::Journal,
+        }
+    }
+}
+
+/// Public identity keeps opaque engine page/block IDs separate from optional
+/// Logseq UUIDs. UUID strings are never accepted as a substitute BlockId.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "entity_type", content = "id", rename_all = "snake_case")]
+pub enum SyncEntityId {
+    Page(String),
+    Block(String),
+}
+
+impl From<MaterializedEntityId> for SyncEntityId {
+    fn from(value: MaterializedEntityId) -> Self {
+        match value {
+            MaterializedEntityId::Page(id) => Self::Page(id.to_string()),
+            MaterializedEntityId::Block(id) => Self::Block(id.to_string()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SyncPageDto {
+    pub page_id: String,
+    pub home_document_id: String,
+    pub name: String,
+    pub path: String,
+    pub kind: SyncPageKind,
+    pub preamble: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SyncBlockDto {
+    /// Opaque sparse-oplog identity. It is intentionally not a Logseq UUID.
+    pub block_id: String,
+    pub page_id: String,
+    pub home_document_id: String,
+    pub parent_block_id: Option<String>,
+    pub order: String,
+    pub content: String,
+    pub heading_level: Option<u8>,
+    pub collapsed: bool,
+    pub logseq_uuid: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SyncPageWithBlocksDto {
+    pub page: SyncPageDto,
+    /// Ordered, parent-linked blocks. `parent_block_id` describes the tree
+    /// without forcing duplicate child retention across the Tauri boundary.
+    pub blocks: Vec<SyncBlockDto>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SyncPropertyDto {
+    pub owner: SyncEntityId,
+    pub page_id: String,
+    pub name: String,
+    pub value: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SyncTagDto {
+    pub owner: SyncEntityId,
+    pub page_id: String,
+    pub tag: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SyncTaskDto {
+    pub block_id: String,
+    pub page_id: String,
+    pub marker: String,
+    pub priority: Option<String>,
+    pub scheduled: Option<String>,
+    pub deadline: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SyncSearchHitDto {
+    pub entity: SyncEntityId,
+    pub page_id: String,
+    pub text: String,
+    pub rank: f64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "source_type", rename_all = "snake_case")]
+pub enum SyncReferenceSourceDto {
+    Preamble,
+    Block {
+        block_id: String,
+        home_document_id: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SyncReferenceHitDto {
+    pub source_page_id: String,
+    pub source: SyncReferenceSourceDto,
+    pub kind: String,
+    pub raw_target: String,
+    pub byte_start: u32,
+    pub byte_end: u32,
+    pub resolved_page_id: Option<String>,
+    pub resolved_block_id: Option<String>,
+}
+
+/// The bounded public query envelope. All page predicates are exact; there is
+/// no graph walk, path glob, or filesystem enumeration branch.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SyncRuntimeQueryRequest {
+    ResolvePage {
+        path: String,
+        name: String,
+        page_kind: SyncPageKind,
+    },
+    ListPages {
+        page_kind: Option<SyncPageKind>,
+        limit: usize,
+    },
+    LoadPage {
+        page_id: String,
+        block_limit: usize,
+    },
+    Search {
+        query: String,
+        limit: usize,
+    },
+    PropertiesForOwner {
+        owner: SyncEntityId,
+        limit: usize,
+    },
+    PropertiesNamed {
+        name: String,
+        value: Option<String>,
+        limit: usize,
+    },
+    Tags {
+        tag: String,
+        limit: usize,
+    },
+    Tasks {
+        marker: Option<String>,
+        limit: usize,
+    },
+    ReferencesToPageName {
+        name: String,
+        limit: usize,
+    },
+    ReferencesToLogseqUuid {
+        logseq_uuid: String,
+        limit: usize,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SyncRuntimeQueryReply {
+    Page(Option<SyncPageDto>),
+    Pages(Vec<SyncPageDto>),
+    PageWithBlocks(Option<SyncPageWithBlocksDto>),
+    Search(Vec<SyncSearchHitDto>),
+    Properties(Vec<SyncPropertyDto>),
+    Tags(Vec<SyncTagDto>),
+    Tasks(Vec<SyncTaskDto>),
+    References(Vec<SyncReferenceHitDto>),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SyncShutdownOutcome {
     Safe(SyncRuntimeStatusSnapshot),
@@ -334,6 +549,10 @@ impl std::error::Error for SyncLocalMutationRequestError {}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SyncRuntimeRequestError {
     InvalidRequest(String),
+    QueryTooLarge {
+        limit: usize,
+        request_bytes: usize,
+    },
     RequestTooLarge {
         observations: usize,
         /// Exact while under the byte cap; otherwise a bounded overflow diagnostic.
@@ -347,6 +566,13 @@ impl fmt::Display for SyncRuntimeRequestError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidRequest(detail) => write!(formatter, "invalid sync request: {detail}"),
+            Self::QueryTooLarge {
+                limit,
+                request_bytes,
+            } => write!(
+                formatter,
+                "sync query exceeds bounds: limit {limit}, {request_bytes} request bytes"
+            ),
             Self::RequestTooLarge {
                 observations,
                 path_bytes,
@@ -546,6 +772,26 @@ impl SyncRuntimeHandle {
         reply_receiver
             .recv()
             .map_err(|_| SyncLocalMutationRequestError::ActorUnavailable)
+    }
+
+    /// Execute one bounded, read-only query on the private actor.
+    ///
+    /// The operation gate places this read in the same total public order as
+    /// watcher observations, local mutations, ticks, status, and shutdown.
+    pub fn query(
+        &self,
+        request: SyncRuntimeQueryRequest,
+    ) -> Result<SyncRuntimeQueryReply, SyncRuntimeRequestError> {
+        let _operation = self.inner.operation.lock().unwrap();
+        validate_query_request(&request)?;
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.send(ActorRequest::Query {
+            request,
+            reply: reply_sender,
+        })?;
+        reply_receiver
+            .recv()
+            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)?
     }
 
     /// A public request may be too large to retain verbatim, but that never
@@ -806,6 +1052,80 @@ fn map_local_actor_error(_: SyncRuntimeRequestError) -> SyncLocalMutationRequest
     SyncLocalMutationRequestError::ActorUnavailable
 }
 
+fn check_query_limit(limit: usize, request_bytes: usize) -> Result<(), SyncRuntimeRequestError> {
+    if limit == 0 || limit > MAX_SYNC_RUNTIME_QUERY_ROWS {
+        return Err(SyncRuntimeRequestError::QueryTooLarge {
+            limit,
+            request_bytes,
+        });
+    }
+    Ok(())
+}
+
+fn validate_query_request(
+    request: &SyncRuntimeQueryRequest,
+) -> Result<(), SyncRuntimeRequestError> {
+    let mut bytes = 0_usize;
+    let mut add = |value: &str| {
+        bytes = bytes.saturating_add(value.len());
+    };
+    let limit = match request {
+        SyncRuntimeQueryRequest::ResolvePage { path, name, .. } => {
+            add(path);
+            add(name);
+            1
+        }
+        SyncRuntimeQueryRequest::ListPages { limit, .. }
+        | SyncRuntimeQueryRequest::Search { limit, .. }
+        | SyncRuntimeQueryRequest::PropertiesForOwner { limit, .. }
+        | SyncRuntimeQueryRequest::PropertiesNamed { limit, .. }
+        | SyncRuntimeQueryRequest::Tags { limit, .. }
+        | SyncRuntimeQueryRequest::Tasks { limit, .. }
+        | SyncRuntimeQueryRequest::ReferencesToPageName { limit, .. }
+        | SyncRuntimeQueryRequest::ReferencesToLogseqUuid { limit, .. } => {
+            match request {
+                SyncRuntimeQueryRequest::Search { query, .. } => add(query),
+                SyncRuntimeQueryRequest::PropertiesNamed { name, value, .. } => {
+                    add(name);
+                    if let Some(value) = value {
+                        add(value);
+                    }
+                }
+                SyncRuntimeQueryRequest::Tags { tag, .. } => add(tag),
+                SyncRuntimeQueryRequest::Tasks { marker, .. } => {
+                    if let Some(marker) = marker {
+                        add(marker);
+                    }
+                }
+                SyncRuntimeQueryRequest::ReferencesToPageName { name, .. } => add(name),
+                SyncRuntimeQueryRequest::ReferencesToLogseqUuid { logseq_uuid, .. } => {
+                    add(logseq_uuid)
+                }
+                SyncRuntimeQueryRequest::ListPages { .. } => {}
+                SyncRuntimeQueryRequest::PropertiesForOwner { owner, .. } => match owner {
+                    SyncEntityId::Page(id) | SyncEntityId::Block(id) => add(id),
+                },
+                _ => unreachable!("all query request variants are covered"),
+            }
+            *limit
+        }
+        SyncRuntimeQueryRequest::LoadPage {
+            page_id,
+            block_limit,
+        } => {
+            add(page_id);
+            *block_limit
+        }
+    };
+    if bytes > MAX_SYNC_RUNTIME_QUERY_BYTES {
+        return Err(SyncRuntimeRequestError::QueryTooLarge {
+            limit,
+            request_bytes: bytes,
+        });
+    }
+    check_query_limit(limit, bytes)
+}
+
 fn refused(detail: String) -> SyncRuntimeOpenResult {
     SyncRuntimeOpenResult {
         status: SyncRuntimeOpenStatus::OpenRefused { detail },
@@ -861,6 +1181,10 @@ fn map_component(component: DiscoveryComponent) -> SyncRuntimeComponent {
 }
 
 enum ActorRequest {
+    Query {
+        request: SyncRuntimeQueryRequest,
+        reply: mpsc::Sender<Result<SyncRuntimeQueryReply, SyncRuntimeRequestError>>,
+    },
     Observe {
         observations: Vec<SyncWatcherObservation>,
         reply: mpsc::Sender<Result<(), SyncRuntimeRequestError>>,
@@ -908,6 +1232,11 @@ fn actor_thread(
 
     while let Ok(request) = receiver.recv() {
         let should_stop = match request {
+            ActorRequest::Query { request, reply } => {
+                let result = actor.query(request);
+                let _ = reply.send(result);
+                false
+            }
             ActorRequest::Observe {
                 observations,
                 reply,
@@ -1115,6 +1444,155 @@ impl RuntimeActor {
                 Err(SyncRuntimeRequestError::ActorRefused(detail))
             }
             Err(error) => Err(SyncRuntimeRequestError::ActorRefused(error.to_string())),
+        }
+    }
+
+    fn query(
+        &mut self,
+        request: SyncRuntimeQueryRequest,
+    ) -> Result<SyncRuntimeQueryReply, SyncRuntimeRequestError> {
+        if let Some(detail) = &self.terminal {
+            return Err(SyncRuntimeRequestError::ActorRefused(detail.clone()));
+        }
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or(SyncRuntimeRequestError::ActorUnavailable)?;
+        let read = runtime
+            .database()
+            .materialized_read()
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        match request {
+            SyncRuntimeQueryRequest::ResolvePage {
+                path,
+                name,
+                page_kind,
+            } => {
+                let path = ManagedPath::parse(path)
+                    .map_err(|error| SyncRuntimeRequestError::InvalidRequest(error.to_string()))?;
+                let page = read
+                    .pages_by_path(&path, 1)
+                    .map_err(materialized_query_error)?
+                    .into_iter()
+                    .find(|page| page.name == name && SyncPageKind::from(page.kind) == page_kind)
+                    .map(sync_page);
+                Ok(SyncRuntimeQueryReply::Page(page))
+            }
+            SyncRuntimeQueryRequest::ListPages { page_kind, limit } => {
+                let pages = read
+                    .pages(page_kind.map(Into::into), limit)
+                    .map_err(materialized_query_error)?
+                    .into_iter()
+                    .map(sync_page)
+                    .collect();
+                Ok(SyncRuntimeQueryReply::Pages(pages))
+            }
+            SyncRuntimeQueryRequest::LoadPage {
+                page_id,
+                block_limit,
+            } => {
+                let page_id = parse_page_id(&page_id)?;
+                let Some(page) = read.page(page_id).map_err(materialized_query_error)? else {
+                    return Ok(SyncRuntimeQueryReply::PageWithBlocks(None));
+                };
+                let blocks = read
+                    .blocks_on_page(page_id, block_limit)
+                    .map_err(materialized_query_error)?
+                    .into_iter()
+                    .map(sync_block)
+                    .collect();
+                Ok(SyncRuntimeQueryReply::PageWithBlocks(Some(
+                    SyncPageWithBlocksDto {
+                        page: sync_page(page),
+                        blocks,
+                    },
+                )))
+            }
+            SyncRuntimeQueryRequest::Search { query, limit } => Ok(SyncRuntimeQueryReply::Search(
+                read.search(&query, limit)
+                    .map_err(materialized_query_error)?
+                    .into_iter()
+                    .map(sync_search_hit)
+                    .collect(),
+            )),
+            SyncRuntimeQueryRequest::PropertiesForOwner { owner, limit } => {
+                let owner = parse_entity_id(owner)?;
+                Ok(SyncRuntimeQueryReply::Properties(
+                    read.properties(owner, limit)
+                        .map_err(materialized_query_error)?
+                        .into_iter()
+                        .map(sync_property)
+                        .collect(),
+                ))
+            }
+            SyncRuntimeQueryRequest::PropertiesNamed { name, value, limit } => {
+                Ok(SyncRuntimeQueryReply::Properties(
+                    read.properties_named(&name, value.as_deref(), limit)
+                        .map_err(materialized_query_error)?
+                        .into_iter()
+                        .map(sync_property)
+                        .collect(),
+                ))
+            }
+            SyncRuntimeQueryRequest::Tags { tag, limit } => Ok(SyncRuntimeQueryReply::Tags(
+                read.tags(&tag, limit)
+                    .map_err(materialized_query_error)?
+                    .into_iter()
+                    .map(sync_tag)
+                    .collect(),
+            )),
+            SyncRuntimeQueryRequest::Tasks { marker, limit } => Ok(SyncRuntimeQueryReply::Tasks(
+                read.tasks(marker.as_deref(), limit)
+                    .map_err(materialized_query_error)?
+                    .into_iter()
+                    .map(sync_task)
+                    .collect(),
+            )),
+            SyncRuntimeQueryRequest::ReferencesToPageName { name, limit } => {
+                let name = crate::oplog::LogicalPageName::parse(name)
+                    .map_err(|error| SyncRuntimeRequestError::InvalidRequest(error.to_string()))?;
+                let store = runtime.engine().archive_store().ok_or_else(|| {
+                    SyncRuntimeRequestError::ActorRefused(
+                        "promoted runtime has no retained archive capability".into(),
+                    )
+                })?;
+                let mut query = runtime
+                    .database()
+                    .frontier_reference_query(runtime.engine(), store)
+                    .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+                Ok(SyncRuntimeQueryReply::References(
+                    query
+                        .references_to_page_name(&name, limit)
+                        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
+                        .hits
+                        .into_iter()
+                        .map(sync_reference_hit)
+                        .collect(),
+                ))
+            }
+            SyncRuntimeQueryRequest::ReferencesToLogseqUuid { logseq_uuid, limit } => {
+                let uuid = uuid::Uuid::parse_str(&logseq_uuid)
+                    .map(LogseqUuid::from_uuid)
+                    .map_err(|error| SyncRuntimeRequestError::InvalidRequest(error.to_string()))?;
+                let store = runtime.engine().archive_store().ok_or_else(|| {
+                    SyncRuntimeRequestError::ActorRefused(
+                        "promoted runtime has no retained archive capability".into(),
+                    )
+                })?;
+                let mut query = runtime
+                    .database()
+                    .frontier_reference_query(runtime.engine(), store)
+                    .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+                Ok(SyncRuntimeQueryReply::References(
+                    query
+                        .references_to_logseq_uuid(uuid, limit)
+                        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
+                        .hits
+                        .into_iter()
+                        .map(sync_reference_hit)
+                        .collect(),
+                ))
+            }
         }
     }
 
@@ -1517,6 +1995,133 @@ impl RuntimeActor {
             last_tick: self.last_tick.clone(),
             detail: self.terminal.clone(),
         }
+    }
+}
+
+fn materialized_query_error(error: impl fmt::Display) -> SyncRuntimeRequestError {
+    SyncRuntimeRequestError::ActorRefused(error.to_string())
+}
+
+fn parse_page_id(value: &str) -> Result<PageId, SyncRuntimeRequestError> {
+    uuid::Uuid::parse_str(value)
+        .map(PageId::from_uuid)
+        .map_err(|error| SyncRuntimeRequestError::InvalidRequest(error.to_string()))
+}
+
+fn parse_block_id(value: &str) -> Result<BlockId, SyncRuntimeRequestError> {
+    uuid::Uuid::parse_str(value)
+        .map(BlockId::from_uuid)
+        .map_err(|error| SyncRuntimeRequestError::InvalidRequest(error.to_string()))
+}
+
+fn parse_entity_id(value: SyncEntityId) -> Result<MaterializedEntityId, SyncRuntimeRequestError> {
+    match value {
+        SyncEntityId::Page(value) => parse_page_id(&value).map(MaterializedEntityId::Page),
+        SyncEntityId::Block(value) => parse_block_id(&value).map(MaterializedEntityId::Block),
+    }
+}
+
+fn sync_page(row: MaterializedPageRow) -> SyncPageDto {
+    SyncPageDto {
+        page_id: row.page_id.to_string(),
+        home_document_id: row.home_document_id.to_string(),
+        name: row.name,
+        path: row.path.to_string(),
+        kind: row.kind.into(),
+        preamble: row.preamble,
+    }
+}
+
+fn sync_block(row: MaterializedBlockRow) -> SyncBlockDto {
+    SyncBlockDto {
+        block_id: row.block_id.to_string(),
+        page_id: row.page_id.to_string(),
+        home_document_id: row.home_document_id.to_string(),
+        parent_block_id: row.parent.map(|id| id.to_string()),
+        order: row.order,
+        content: row.content,
+        heading_level: row.heading_level,
+        collapsed: row.collapsed,
+        logseq_uuid: row.logseq_uuid.map(|id| id.to_string()),
+    }
+}
+
+fn sync_property(row: MaterializedPropertyRow) -> SyncPropertyDto {
+    SyncPropertyDto {
+        owner: row.owner.into(),
+        page_id: row.page_id.to_string(),
+        name: row.name,
+        value: row.value,
+    }
+}
+
+fn sync_tag(row: MaterializedTagRow) -> SyncTagDto {
+    SyncTagDto {
+        owner: row.owner.into(),
+        page_id: row.page_id.to_string(),
+        tag: row.tag,
+    }
+}
+
+fn sync_task(row: MaterializedTaskRow) -> SyncTaskDto {
+    SyncTaskDto {
+        block_id: row.block_id.to_string(),
+        page_id: row.page_id.to_string(),
+        marker: row.marker,
+        priority: row.priority,
+        scheduled: row.scheduled,
+        deadline: row.deadline,
+    }
+}
+
+fn sync_search_hit(row: MaterializedSearchHit) -> SyncSearchHitDto {
+    SyncSearchHitDto {
+        entity: row.entity.into(),
+        page_id: row.page_id.to_string(),
+        text: row.text,
+        rank: row.rank,
+    }
+}
+
+fn sync_reference_source(source: ReferenceSourceLocatorV1) -> SyncReferenceSourceDto {
+    match source {
+        ReferenceSourceLocatorV1::Preamble => SyncReferenceSourceDto::Preamble,
+        ReferenceSourceLocatorV1::Block {
+            block_id,
+            home_document_id,
+        } => SyncReferenceSourceDto::Block {
+            block_id: block_id.to_string(),
+            home_document_id: home_document_id.to_string(),
+        },
+    }
+}
+
+fn sync_reference_hit(hit: FrontierReferenceHit) -> SyncReferenceHitDto {
+    let (source, kind, raw_target, byte_start, byte_end) = match hit.fact {
+        ReferenceFactV1::PageName(fact) => (
+            sync_reference_source(fact.source),
+            format!("{:?}", fact.kind).to_lowercase(),
+            fact.raw_target,
+            fact.byte_start,
+            fact.byte_end,
+        ),
+        ReferenceFactV1::Block(fact) => (
+            sync_reference_source(fact.source),
+            format!("{:?}", fact.kind).to_lowercase(),
+            fact.raw_claim,
+            fact.byte_start,
+            fact.byte_end,
+        ),
+    };
+    SyncReferenceHitDto {
+        source_page_id: hit.source_page_id.to_string(),
+        source,
+        kind,
+        raw_target,
+        byte_start,
+        byte_end,
+        resolved_page_id: hit.resolved_page_id.map(|id| id.to_string()),
+        resolved_block_id: hit.resolved_block_id.map(|id| id.to_string()),
     }
 }
 
@@ -2408,6 +3013,147 @@ mod tests {
         ));
     }
 
+    fn admit_external_page(
+        handle: &SyncRuntimeHandle,
+        fixture: &RuntimeHostFixture,
+        path: &str,
+        body: &[u8],
+    ) {
+        let file = fixture.graph_root().join(path);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(file, body).unwrap();
+        handle
+            .observe_watcher(vec![SyncWatcherObservation::managed_path(path).unwrap()])
+            .unwrap();
+        settle_exact_feed(handle)
+            .unwrap_or_else(|state| panic!("external page did not settle: {state:?}"));
+    }
+
+    #[test]
+    fn public_queries_are_bounded_serialized_and_read_the_exact_materialized_frontier() {
+        let fixture = RuntimeHostFixture::safe("sync-runtime-public-query");
+        let handle = active_handle(SyncRuntimeHandle::open(fixture.request()));
+        drive_initial_feed(&handle);
+        let path = "content/nested pages/Résumé 日本語.md";
+        admit_external_page(
+            &handle,
+            &fixture,
+            path,
+            "title:: Résumé 日本語\ntags:: alpha\n\n- TODO Needle #alpha\n  custom:: value\n  - child [[Résumé 日本語]]\n".as_bytes(),
+        );
+
+        let pages = handle
+            .query(SyncRuntimeQueryRequest::ListPages {
+                page_kind: Some(SyncPageKind::Page),
+                limit: 16,
+            })
+            .unwrap();
+        let SyncRuntimeQueryReply::Pages(pages) = pages else {
+            panic!("page list returned the wrong reply variant");
+        };
+        let page = pages
+            .into_iter()
+            .find(|page| page.path == path)
+            .expect("nested Unicode page must be materialized from SQLite");
+
+        let resolved = handle
+            .query(SyncRuntimeQueryRequest::ResolvePage {
+                path: path.into(),
+                name: page.name.clone(),
+                page_kind: page.kind,
+            })
+            .unwrap();
+        assert_eq!(resolved, SyncRuntimeQueryReply::Page(Some(page.clone())));
+
+        let loaded = handle
+            .query(SyncRuntimeQueryRequest::LoadPage {
+                page_id: page.page_id.clone(),
+                block_limit: 16,
+            })
+            .unwrap();
+        let SyncRuntimeQueryReply::PageWithBlocks(Some(loaded)) = loaded else {
+            panic!("page load must return the exact page and its blocks");
+        };
+        assert_eq!(loaded.page, page);
+        assert!(loaded.blocks.len() >= 2);
+        assert!(loaded
+            .blocks
+            .iter()
+            .any(|block| block.parent_block_id.is_some()));
+        assert!(loaded.blocks.iter().all(|block| !block.block_id.is_empty()));
+        assert!(loaded
+            .blocks
+            .iter()
+            .all(|block| block.logseq_uuid.is_none()));
+
+        let search = handle
+            .query(SyncRuntimeQueryRequest::Search {
+                query: "Needle".into(),
+                limit: 8,
+            })
+            .unwrap();
+        assert!(matches!(search, SyncRuntimeQueryReply::Search(hits) if !hits.is_empty()));
+        let properties = handle
+            .query(SyncRuntimeQueryRequest::PropertiesNamed {
+                name: "custom".into(),
+                value: Some("value".into()),
+                limit: 8,
+            })
+            .unwrap();
+        assert!(matches!(properties, SyncRuntimeQueryReply::Properties(rows) if !rows.is_empty()));
+        let tags = handle
+            .query(SyncRuntimeQueryRequest::Tags {
+                tag: "alpha".into(),
+                limit: 8,
+            })
+            .unwrap();
+        assert!(matches!(tags, SyncRuntimeQueryReply::Tags(rows) if !rows.is_empty()));
+        let tasks = handle
+            .query(SyncRuntimeQueryRequest::Tasks {
+                marker: Some("TODO".into()),
+                limit: 8,
+            })
+            .unwrap();
+        assert!(matches!(tasks, SyncRuntimeQueryReply::Tasks(rows) if !rows.is_empty()));
+        let references = handle
+            .query(SyncRuntimeQueryRequest::ReferencesToPageName {
+                name: page.name,
+                limit: 8,
+            })
+            .unwrap();
+        assert!(matches!(references, SyncRuntimeQueryReply::References(rows) if !rows.is_empty()));
+
+        let encoded = serde_json::to_string(&SyncRuntimeQueryRequest::ListPages {
+            page_kind: Some(SyncPageKind::Page),
+            limit: 2,
+        })
+        .unwrap();
+        assert!(encoded.contains("list_pages"));
+    }
+
+    #[test]
+    fn query_rejects_over_limit_before_actor_queue_or_filesystem_work() {
+        let fixture = RuntimeHostFixture::safe("sync-runtime-query-bounds");
+        let handle = active_handle(SyncRuntimeHandle::open(fixture.request()));
+        let before = handle.status().unwrap();
+        assert!(matches!(
+            handle.query(SyncRuntimeQueryRequest::ListPages {
+                page_kind: None,
+                limit: MAX_SYNC_RUNTIME_QUERY_ROWS + 1,
+            }),
+            Err(SyncRuntimeRequestError::QueryTooLarge { .. })
+        ));
+        assert_eq!(handle.status().unwrap(), before);
+
+        let source = include_str!("sync_runtime.rs");
+        let production = source
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("the runtime source has its test boundary");
+        assert!(!production.contains("read_dir"));
+        assert!(!production.contains("read_to_string"));
+    }
+
     /// Drive the actor until the exact feed settles the epoch it owes, or give
     /// up. `Err` carries the last observed turn for a useful failure capsule.
     fn settle_exact_feed(handle: &SyncRuntimeHandle) -> Result<SyncRuntimeTick, SyncRuntimeTick> {
@@ -2712,7 +3458,7 @@ mod tests {
     }
 
     #[test]
-    fn unsafe_takeover_cannot_run_with_old_owner_and_uses_recovery_gate_after_crash() {
+    fn unsafe_takeover_cannot_run_with_old_owner_and_recovers_before_safe() {
         let mut fixture = RuntimeHostFixture::unsafe_held("sync-runtime-unsafe-owner");
         let request = fixture.request();
         let refused = SyncRuntimeHandle::open(request.clone());
@@ -2728,14 +3474,18 @@ mod tests {
             handle.status().unwrap().recovery,
             Some(SyncRuntimeRecovery::TookOverCrashedUnsafe)
         );
+        let ticks = drain_until_settled(&handle);
+        assert!(
+            admitted_an_epoch(&ticks),
+            "crash takeover must settle its startup full scan before Safe: {ticks:?}"
+        );
         assert!(matches!(
-            handle.tick().unwrap(),
-            SyncRuntimeTick::RecoveryBlocked(_)
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
         ));
-        drop(handle);
         assert!(matches!(
             fixture.handoff(),
-            EnrollmentDiscoveryHandoff::Unsafe { .. }
+            EnrollmentDiscoveryHandoff::Safe
         ));
     }
 
@@ -2870,11 +3620,77 @@ mod tests {
             reopened.status().unwrap().recovery,
             Some(SyncRuntimeRecovery::TookOverCrashedUnsafe)
         );
+        let ticks = drain_until_settled(&reopened);
+        assert!(
+            admitted_an_epoch(&ticks),
+            "crash takeover must reconcile its forced full scan: {ticks:?}"
+        );
         assert!(matches!(
-            reopened.tick().unwrap(),
-            SyncRuntimeTick::RecoveryBlocked(_)
+            reopened.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
         ));
-        drop(reopened);
+        assert!(matches!(
+            fixture.handoff(),
+            EnrollmentDiscoveryHandoff::Safe
+        ));
+    }
+
+    #[test]
+    fn unsafe_crash_takeover_reconciles_closed_interval_edit_and_reaches_safe() {
+        let fixture = RuntimeHostFixture::safe("sync-runtime-crash-recovery-liveness");
+        let request = fixture.request();
+        let handle = active_handle(SyncRuntimeHandle::open(request.clone()));
+        drive_initial_feed(&handle);
+        drop(handle);
+        assert!(matches!(
+            fixture.handoff(),
+            EnrollmentDiscoveryHandoff::Unsafe { .. }
+        ));
+
+        let path = "content/nested pages/changed after crash.md";
+        let bytes = b"- external editor changed this while Tine was down\n";
+        fs::write(fixture.graph_root().join(path), bytes).unwrap();
+        let manifests_before_reopen = fixture.manifest_count();
+
+        let reopened = active_handle(SyncRuntimeHandle::open(request.clone()));
+        assert_eq!(
+            reopened.status().unwrap().recovery,
+            Some(SyncRuntimeRecovery::TookOverCrashedUnsafe)
+        );
+        let ticks = drain_until_settled(&reopened);
+        assert!(
+            admitted_an_epoch(&ticks),
+            "crash takeover must drive its authenticated full reconciliation before Safe: {ticks:?}"
+        );
+        assert_eq!(
+            fs::read(fixture.graph_root().join(path)).unwrap(),
+            bytes,
+            "recovery must not overwrite the unimported projection bytes"
+        );
+        assert_eq!(
+            fixture.manifest_count(),
+            manifests_before_reopen + 1,
+            "the closed-interval external edit must be admitted before Safe"
+        );
+        assert!(matches!(
+            reopened.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+        assert!(matches!(
+            fixture.handoff(),
+            EnrollmentDiscoveryHandoff::Safe
+        ));
+
+        let safe_reopen = active_handle(SyncRuntimeHandle::open(request));
+        assert_eq!(
+            safe_reopen.status().unwrap().recovery,
+            Some(SyncRuntimeRecovery::AdoptedSafeHandoff)
+        );
+        drive_initial_feed(&safe_reopen);
+        assert!(matches!(
+            safe_reopen.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
     }
 
     /// A realistic crashed session has advanced the accepted frontier, so its
@@ -2923,7 +3739,17 @@ mod tests {
             reopened.status().unwrap().recovery,
             Some(SyncRuntimeRecovery::TookOverCrashedUnsafe)
         );
-        drop(reopened);
+        let manifests_after_reopen = fixture.manifest_count();
+        drive_initial_feed(&reopened);
+        assert_eq!(
+            fixture.manifest_count(),
+            manifests_after_reopen,
+            "the accepted pre-crash import must not be duplicated during recovery catch-up"
+        );
+        assert!(matches!(
+            reopened.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
     }
 
     #[test]

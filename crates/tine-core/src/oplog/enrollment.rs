@@ -75,9 +75,15 @@ use crate::model::Graph;
 
 pub(crate) const ENROLLMENT_RECORD_SCHEMA_VERSION: u32 = 5;
 pub(crate) const PUBLISHED_RECOVERY_PACKET_SCHEMA_VERSION: u32 = 1;
+pub(crate) const SHARED_ENROLLMENT_DESCRIPTOR_SCHEMA_VERSION: u32 = 1;
+pub(crate) const JOINER_WORKSPACE_ARCHIVE_SCHEMA_VERSION: u32 = 1;
 pub(crate) const MAX_ENROLLMENT_RECORD_BYTES: usize = 32 * 1024;
 pub(crate) const MAX_ENROLLMENT_JSON_DEPTH: usize = 16;
-pub(crate) const MAX_ENROLLMENT_JSON_TOKENS: usize = 256;
+/// All lifecycle records remain bounded and read with a single fixed parser
+/// budget.  Shared enrollment carries one exact descriptor plus local archive
+/// proof, so its authenticated record is intentionally larger than the legacy
+/// LocalActive handoff record while still far below the 32 KiB byte ceiling.
+pub(crate) const MAX_ENROLLMENT_JSON_TOKENS: usize = 768;
 pub(crate) const MAX_ENROLLMENT_OPEN_CHAIN_RECORDS: usize = 64;
 pub(crate) const MAX_ENROLLMENT_AUDIT_PAGE: usize = 64;
 pub(crate) const MAX_ENROLLMENT_NAMESPACE_ENTRIES: usize = 2048;
@@ -906,6 +912,246 @@ struct LocalActiveV1 {
     exclusion: LocalExclusionV1,
 }
 
+/// Exact bootstrap and projection/base facts that two honest local enrollments
+/// must share before they can enter one shared lineage.  This deliberately
+/// excludes device-local paths and resource identities: those are separately
+/// bound by each enrollment record and cannot be compared across devices.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SharedProjectionBaseEvidenceV1 {
+    source_inventory_digest: ContentDigest,
+    bootstrap_import_id: ContentDigest,
+    bootstrap_part_count: u32,
+    bootstrap_terminal_part_id: Option<ContentDigest>,
+    accepted_frontier_anchor: AcceptedFrontierAnchorV1,
+    accepted_history_record_count: u64,
+    staged_projection_manifest: BlobDescription,
+    staged_projection_proof: BlobDescription,
+    staged_file_count: u64,
+    staged_total_bytes: u64,
+    byte_compare_digest: ContentDigest,
+}
+
+impl SharedProjectionBaseEvidenceV1 {
+    fn from_verified_local(verified: &VerifiedLocalV1) -> Self {
+        Self {
+            source_inventory_digest: verified.source_inventory_digest,
+            bootstrap_import_id: verified.bootstrap_import_id,
+            bootstrap_part_count: verified.bootstrap_part_count,
+            bootstrap_terminal_part_id: verified.bootstrap_terminal_part_id,
+            accepted_frontier_anchor: verified.accepted_frontier_anchor,
+            accepted_history_record_count: verified.accepted_history_record_count,
+            staged_projection_manifest: verified.staged_projection_manifest.clone(),
+            staged_projection_proof: verified.staged_projection_proof.clone(),
+            staged_file_count: verified.staged_file_count,
+            staged_total_bytes: verified.staged_total_bytes,
+            byte_compare_digest: verified.byte_compare_digest,
+        }
+    }
+
+    fn validate(&self) -> Result<(), EnrollmentError> {
+        let part_count = u64::from(self.bootstrap_part_count);
+        let zero = self.bootstrap_part_count == 0;
+        if self.bootstrap_terminal_part_id.is_none() != zero
+            || (self.accepted_frontier_anchor.history_root
+                == super::object_store::EngineHistoryStore::empty_root())
+                != zero
+            || self.accepted_frontier_anchor.acceptance_sequence != part_count
+            || self.accepted_frontier_anchor.history_generation != part_count
+            || self.accepted_history_record_count != part_count
+        {
+            return Err(EnrollmentError::InvalidSharedProjectionBaseEvidence);
+        }
+        Ok(())
+    }
+}
+
+/// The one portable, commit-last enrollment descriptor an initiator may hand
+/// to a peer.  Its digest is its identity; there is intentionally no mutable
+/// descriptor registry or descriptor discovery scan.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SharedEnrollmentDescriptorV1 {
+    schema_version: u32,
+    compatibility: EnrollmentCompatibilityV1,
+    workspace_id: WorkspaceId,
+    lineage_digest: LineageDigest,
+    initiator_graph_resource_id: CanonicalGraphResourceId,
+    initiator_device_id: DeviceId,
+    object_store_namespace: ContentDigest,
+    initiator_local_active_head: ContentDigest,
+    initiator_verification_digest: ContentDigest,
+    initiator_handoff: HandoffV1,
+    projection_base: SharedProjectionBaseEvidenceV1,
+}
+
+impl SharedEnrollmentDescriptorV1 {
+    fn from_local_active(
+        binding: &EnrollmentBindingV1,
+        committed: &CommittedLocalActive,
+        verified: &VerifiedLocalV1,
+        object_store_namespace: ContentDigest,
+    ) -> Result<Self, EnrollmentError> {
+        let descriptor = Self {
+            schema_version: SHARED_ENROLLMENT_DESCRIPTOR_SCHEMA_VERSION,
+            compatibility: binding.compatibility,
+            workspace_id: binding.workspace_id,
+            lineage_digest: binding.lineage_digest,
+            initiator_graph_resource_id: binding.graph_resource_id,
+            initiator_device_id: binding.device_id,
+            object_store_namespace,
+            initiator_local_active_head: committed.enrollment_head,
+            initiator_verification_digest: committed.verification_digest,
+            initiator_handoff: HandoffV1::Safe,
+            projection_base: SharedProjectionBaseEvidenceV1::from_verified_local(verified),
+        };
+        descriptor.validate()?;
+        Ok(descriptor)
+    }
+
+    pub(crate) fn digest(&self) -> Result<ContentDigest, EnrollmentError> {
+        self.validate()?;
+        let bytes =
+            serde_json::to_vec(self).map_err(|error| EnrollmentError::Encode(error.to_string()))?;
+        Ok(ContentDigest::of(
+            &[b"tine/shared-enrollment-descriptor/v1\0".as_slice(), &bytes].concat(),
+        ))
+    }
+
+    fn validate(&self) -> Result<(), EnrollmentError> {
+        if self.schema_version != SHARED_ENROLLMENT_DESCRIPTOR_SCHEMA_VERSION {
+            return Err(
+                EnrollmentError::UnsupportedSharedEnrollmentDescriptorSchema(self.schema_version),
+            );
+        }
+        self.compatibility.validate_current()?;
+        if !matches!(self.initiator_handoff, HandoffV1::Safe) {
+            return Err(EnrollmentError::UnsafeSharedEnrollmentHandoff);
+        }
+        self.projection_base.validate()
+    }
+
+    fn is_compatible_with(&self, binding: &EnrollmentBindingV1) -> bool {
+        self.workspace_id == binding.workspace_id
+            && self.lineage_digest == binding.lineage_digest
+            && self.compatibility == binding.compatibility
+    }
+}
+
+/// Durable evidence that a joining device retired its former local workspace
+/// only after proving it had no unique operation that was not projected.  The
+/// archive bytes are retained by the caller's existing backup/archive path;
+/// the journal stores the exact digest and pre-archive LocalActive witness.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JoinerWorkspaceArchiveV1 {
+    schema_version: u32,
+    archived_workspace_digest: ContentDigest,
+    source_local_active_head: ContentDigest,
+    source_verification_digest: ContentDigest,
+    unique_unprojected_operation_count: u64,
+    projection_base: SharedProjectionBaseEvidenceV1,
+}
+
+impl JoinerWorkspaceArchiveV1 {
+    fn validate(&self) -> Result<(), EnrollmentError> {
+        if self.schema_version != JOINER_WORKSPACE_ARCHIVE_SCHEMA_VERSION {
+            return Err(EnrollmentError::UnsupportedJoinerWorkspaceArchiveSchema(
+                self.schema_version,
+            ));
+        }
+        if self.unique_unprojected_operation_count != 0 {
+            return Err(EnrollmentError::DirtyUniqueLocalTail);
+        }
+        self.projection_base.validate()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SharedEnrollmentRoleV1 {
+    Initiator,
+    Joiner,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SharePreparedV1 {
+    descriptor: SharedEnrollmentDescriptorV1,
+    descriptor_digest: ContentDigest,
+}
+
+impl SharePreparedV1 {
+    fn validate(&self, binding: &EnrollmentBindingV1) -> Result<(), EnrollmentError> {
+        self.descriptor.validate()?;
+        if !self.descriptor.is_compatible_with(binding)
+            || self.descriptor.initiator_graph_resource_id != binding.graph_resource_id
+            || self.descriptor.initiator_device_id != binding.device_id
+        {
+            return Err(EnrollmentError::SharedEnrollmentBindingMismatch);
+        }
+        if self.descriptor.digest()? != self.descriptor_digest {
+            return Err(EnrollmentError::SharedEnrollmentDescriptorDigestMismatch);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JoiningV1 {
+    descriptor: SharedEnrollmentDescriptorV1,
+    descriptor_digest: ContentDigest,
+    archived_local_workspace: JoinerWorkspaceArchiveV1,
+}
+
+impl JoiningV1 {
+    fn validate(&self, binding: &EnrollmentBindingV1) -> Result<(), EnrollmentError> {
+        self.descriptor.validate()?;
+        self.archived_local_workspace.validate()?;
+        if !self.descriptor.is_compatible_with(binding)
+            || self.descriptor.digest()? != self.descriptor_digest
+            || self.archived_local_workspace.projection_base != self.descriptor.projection_base
+        {
+            return Err(EnrollmentError::SharedEnrollmentBindingMismatch);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SharedActiveV1 {
+    descriptor: SharedEnrollmentDescriptorV1,
+    descriptor_digest: ContentDigest,
+    role: SharedEnrollmentRoleV1,
+    archived_local_workspace: Option<JoinerWorkspaceArchiveV1>,
+}
+
+impl SharedActiveV1 {
+    fn validate(&self, binding: &EnrollmentBindingV1) -> Result<(), EnrollmentError> {
+        self.descriptor.validate()?;
+        if self.descriptor.digest()? != self.descriptor_digest
+            || !self.descriptor.is_compatible_with(binding)
+        {
+            return Err(EnrollmentError::SharedEnrollmentBindingMismatch);
+        }
+        match (self.role, &self.archived_local_workspace) {
+            (SharedEnrollmentRoleV1::Initiator, None) => Ok(()),
+            (SharedEnrollmentRoleV1::Joiner, Some(archive)) => {
+                archive.validate()?;
+                if archive.projection_base != self.descriptor.projection_base {
+                    return Err(EnrollmentError::SharedEnrollmentBindingMismatch);
+                }
+                Ok(())
+            }
+            _ => Err(EnrollmentError::IllegalLifecycle(
+                "shared enrollment role and joiner archive evidence disagree",
+            )),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BlockedV1 {
@@ -920,6 +1166,9 @@ enum EnrollmentLifecycleV1 {
     ShadowImport(ShadowImportV1),
     VerifiedLocal(VerifiedLocalV1),
     LocalActive(LocalActiveV1),
+    SharePrepared(SharePreparedV1),
+    Joining(JoiningV1),
+    SharedActive(SharedActiveV1),
     Blocked(BlockedV1),
 }
 
@@ -951,6 +1200,9 @@ impl EnrollmentLifecycleV1 {
                 }
                 Ok(())
             }
+            Self::SharePrepared(prepared) => prepared.validate(binding),
+            Self::Joining(joining) => joining.validate(binding),
+            Self::SharedActive(active) => active.validate(binding),
             Self::Blocked(blocked) => {
                 if Some(blocked.prior_record_digest) != previous {
                     return Err(EnrollmentError::IllegalLifecycle(
@@ -1264,6 +1516,42 @@ fn validate_transition(
         (EnrollmentLifecycleV1::LocalActive(_), EnrollmentLifecycleV1::Blocked(blocked)) => {
             blocked.prior_record_digest == current_digest
         }
+        (
+            EnrollmentLifecycleV1::LocalActive(current),
+            EnrollmentLifecycleV1::SharePrepared(prepared),
+        ) => {
+            matches!(current.handoff, HandoffV1::Safe)
+                && matches!(current.exclusion, LocalExclusionV1::Idle)
+                && prepared.descriptor.initiator_verification_digest == current.verification_digest
+        }
+        (EnrollmentLifecycleV1::LocalActive(current), EnrollmentLifecycleV1::Joining(joining)) => {
+            matches!(current.handoff, HandoffV1::Safe)
+                && matches!(current.exclusion, LocalExclusionV1::Idle)
+                && joining.archived_local_workspace.source_local_active_head == current_digest
+                && joining.archived_local_workspace.source_verification_digest
+                    == current.verification_digest
+        }
+        (
+            EnrollmentLifecycleV1::SharePrepared(prepared),
+            EnrollmentLifecycleV1::SharedActive(active),
+        ) => {
+            active.role == SharedEnrollmentRoleV1::Initiator
+                && active.archived_local_workspace.is_none()
+                && active.descriptor == prepared.descriptor
+                && active.descriptor_digest == prepared.descriptor_digest
+        }
+        (EnrollmentLifecycleV1::SharePrepared(_), EnrollmentLifecycleV1::Blocked(blocked))
+        | (EnrollmentLifecycleV1::Joining(_), EnrollmentLifecycleV1::Blocked(blocked))
+        | (EnrollmentLifecycleV1::SharedActive(_), EnrollmentLifecycleV1::Blocked(blocked)) => {
+            blocked.prior_record_digest == current_digest
+        }
+        (EnrollmentLifecycleV1::Joining(joining), EnrollmentLifecycleV1::SharedActive(active)) => {
+            active.role == SharedEnrollmentRoleV1::Joiner
+                && active.descriptor == joining.descriptor
+                && active.descriptor_digest == joining.descriptor_digest
+                && active.archived_local_workspace.as_ref()
+                    == Some(&joining.archived_local_workspace)
+        }
         _ => false,
     };
     if !legal {
@@ -1463,6 +1751,18 @@ pub(crate) fn inspect_existing_enrollment_at(
                 },
             })
         }
+        EnrollmentLifecycleV1::SharePrepared(prepared) => EnrollmentDiscoveryLifecycle::Blocked {
+            reason_code: "shared.inactive-share-prepared".into(),
+            evidence_digest: prepared.descriptor_digest,
+        },
+        EnrollmentLifecycleV1::Joining(joining) => EnrollmentDiscoveryLifecycle::Blocked {
+            reason_code: "shared.inactive-joining".into(),
+            evidence_digest: joining.descriptor_digest,
+        },
+        EnrollmentLifecycleV1::SharedActive(active) => EnrollmentDiscoveryLifecycle::Blocked {
+            reason_code: "shared.inactive-shared-active".into(),
+            evidence_digest: active.descriptor_digest,
+        },
         EnrollmentLifecycleV1::Blocked(blocked) => EnrollmentDiscoveryLifecycle::Blocked {
             reason_code: blocked.reason_code.clone(),
             evidence_digest: blocked.evidence_digest,
@@ -2196,9 +2496,12 @@ fn compose_verified_local_at_cut(
         EnrollmentLifecycleV1::ShadowImport(_) | EnrollmentLifecycleV1::VerifiedLocal(_) => {
             return Err(EnrollmentError::InitialPreparationMismatch.into());
         }
-        EnrollmentLifecycleV1::LocalActive(_) => {
+        EnrollmentLifecycleV1::LocalActive(_)
+        | EnrollmentLifecycleV1::SharePrepared(_)
+        | EnrollmentLifecycleV1::Joining(_)
+        | EnrollmentLifecycleV1::SharedActive(_) => {
             return Err(VerifiedLocalCompositionError::WrongLifecycle(
-                "LocalActive cannot be composed or reopened as VerifiedLocal",
+                "active or shared enrollment cannot be composed or reopened as VerifiedLocal",
             ));
         }
         EnrollmentLifecycleV1::Blocked(_) => {
@@ -2224,7 +2527,11 @@ fn compose_verified_local_at_cut(
                 "committed VerifiedLocal record differs from freshly validated proofs",
             ));
         }
-        EnrollmentLifecycleV1::LocalActive(_) | EnrollmentLifecycleV1::Blocked(_) => {
+        EnrollmentLifecycleV1::LocalActive(_)
+        | EnrollmentLifecycleV1::SharePrepared(_)
+        | EnrollmentLifecycleV1::Joining(_)
+        | EnrollmentLifecycleV1::SharedActive(_)
+        | EnrollmentLifecycleV1::Blocked(_) => {
             return Err(VerifiedLocalCompositionError::WrongLifecycle(
                 "enrollment changed during VerifiedLocal composition",
             ));
@@ -2257,9 +2564,12 @@ pub(crate) fn reopen_verified_local(
                 "enrollment remains ShadowImport",
             ));
         }
-        EnrollmentLifecycleV1::LocalActive(_) => {
+        EnrollmentLifecycleV1::LocalActive(_)
+        | EnrollmentLifecycleV1::SharePrepared(_)
+        | EnrollmentLifecycleV1::Joining(_)
+        | EnrollmentLifecycleV1::SharedActive(_) => {
             return Err(VerifiedLocalCompositionError::WrongLifecycle(
-                "LocalActive is not VerifiedLocal evidence",
+                "active or shared enrollment is not VerifiedLocal evidence",
             ));
         }
         EnrollmentLifecycleV1::Blocked(_) => {
@@ -2488,6 +2798,21 @@ fn observe_local_active(
                 "enrollment remains VerifiedLocal",
             ));
         }
+        EnrollmentLifecycleV1::SharePrepared(_) => {
+            return Err(VerifiedLocalCompositionError::WrongLifecycle(
+                "enrollment is SharePrepared and intentionally has no LocalActive authority",
+            ));
+        }
+        EnrollmentLifecycleV1::Joining(_) => {
+            return Err(VerifiedLocalCompositionError::WrongLifecycle(
+                "enrollment is Joining and intentionally has no LocalActive authority",
+            ));
+        }
+        EnrollmentLifecycleV1::SharedActive(_) => {
+            return Err(VerifiedLocalCompositionError::WrongLifecycle(
+                "SharedActive is inactive until explicit P3.2 runtime integration",
+            ));
+        }
         EnrollmentLifecycleV1::Blocked(_) => {
             return Err(VerifiedLocalCompositionError::WrongLifecycle(
                 "blocked enrollment has no LocalActive authority",
@@ -2525,6 +2850,521 @@ fn local_active_lifecycle(
         },
         exclusion: LocalExclusionV1::Idle,
     })
+}
+
+/// The only externally observable core states for the still-inactive sharing
+/// packet.  There is deliberately no runtime writer authority for either
+/// `SharePrepared` or `SharedActive`; P3.2 must explicitly wire that later.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SharedEnrollmentPhase {
+    SharePrepared,
+    Joining,
+    SharedActiveInitiator,
+    SharedActiveJoiner,
+}
+
+/// Read the durable sharing phase without creating an enrollment namespace or
+/// acquiring a writer lease.  This is useful to a future inactive UI/runtime
+/// facade, but does not enable any default flow.
+pub(crate) fn inspect_shared_enrollment_phase(
+    root: &EnrollmentApplicationRoot,
+    binding: &EnrollmentBindingV1,
+) -> Result<Option<SharedEnrollmentPhase>, EnrollmentError> {
+    let EnrollmentOpen::Present(reader) = EnrollmentReader::open_existing(root, binding)? else {
+        return Ok(None);
+    };
+    let phase = match reader.current().record.lifecycle() {
+        EnrollmentLifecycleV1::SharePrepared(_) => Some(SharedEnrollmentPhase::SharePrepared),
+        EnrollmentLifecycleV1::Joining(_) => Some(SharedEnrollmentPhase::Joining),
+        EnrollmentLifecycleV1::SharedActive(active) => Some(match active.role {
+            SharedEnrollmentRoleV1::Initiator => SharedEnrollmentPhase::SharedActiveInitiator,
+            SharedEnrollmentRoleV1::Joiner => SharedEnrollmentPhase::SharedActiveJoiner,
+        }),
+        EnrollmentLifecycleV1::ShadowImport(_)
+        | EnrollmentLifecycleV1::VerifiedLocal(_)
+        | EnrollmentLifecycleV1::LocalActive(_)
+        | EnrollmentLifecycleV1::Blocked(_) => None,
+    };
+    Ok(phase)
+}
+
+fn shared_descriptor_evidence_digest(descriptor: &SharedEnrollmentDescriptorV1) -> ContentDigest {
+    // Evidence attribution must remain available even when the descriptor is
+    // malformed or from a future protocol, so it intentionally does not call
+    // `descriptor.validate()`.
+    match serde_json::to_vec(descriptor) {
+        Ok(bytes) => ContentDigest::of(&bytes),
+        Err(_) => ContentDigest::of(b"shared-enrollment-descriptor-encode-failure"),
+    }
+}
+
+fn block_shared_enrollment(
+    writer: &mut EnrollmentWriter,
+    reason_code: &str,
+    evidence_digest: ContentDigest,
+    error: EnrollmentError,
+) -> Result<(), EnrollmentError> {
+    let current = writer.current().digest;
+    writer.block_current(current, reason_code.into(), evidence_digest)?;
+    Err(error)
+}
+
+fn current_local_active_for_shared_enrollment(
+    writer: &EnrollmentWriter,
+) -> Result<CommittedLocalActive, EnrollmentError> {
+    observe_local_active(writer.current(), writer.current().record.binding()).map_err(|error| {
+        EnrollmentError::IllegalLifecycle(match error {
+            VerifiedLocalCompositionError::WrongLifecycle(detail) => detail,
+            _ => "LocalActive state could not be authenticated for shared enrollment",
+        })
+    })
+}
+
+fn require_safe_idle_shared_local_active(
+    active: &CommittedLocalActive,
+) -> Result<(), EnrollmentError> {
+    if active.handoff != LocalActiveHandoff::Safe {
+        return Err(EnrollmentError::UnsafeSharedEnrollmentHandoff);
+    }
+    if active.sync != LocalActiveSync::Idle {
+        return Err(EnrollmentError::IllegalLifecycle(
+            "shared enrollment requires an idle LocalActive record",
+        ));
+    }
+    Ok(())
+}
+
+/// Persist the initiator's commit-last `LocalActive -> SharePrepared` record
+/// and return the one exact descriptor a peer may use.  Repeating the call
+/// after any enrollment commit cut returns the same descriptor; a changed
+/// object-store namespace becomes a durable conflict rather than a second
+/// genesis.
+pub(crate) fn prepare_shared_enrollment(
+    root: &EnrollmentApplicationRoot,
+    binding: &EnrollmentBindingV1,
+    object_store_namespace: ContentDigest,
+) -> Result<SharedEnrollmentDescriptorV1, EnrollmentError> {
+    prepare_shared_enrollment_at_cut(root, binding, object_store_namespace, CommitCut::None)
+}
+
+#[cfg(test)]
+fn prepare_shared_enrollment_at_cut_for_test(
+    root: &EnrollmentApplicationRoot,
+    binding: &EnrollmentBindingV1,
+    object_store_namespace: ContentDigest,
+    cut: CommitCut,
+) -> Result<SharedEnrollmentDescriptorV1, EnrollmentError> {
+    prepare_shared_enrollment_at_cut(root, binding, object_store_namespace, cut)
+}
+
+fn prepare_shared_enrollment_at_cut(
+    root: &EnrollmentApplicationRoot,
+    binding: &EnrollmentBindingV1,
+    object_store_namespace: ContentDigest,
+    cut: CommitCut,
+) -> Result<SharedEnrollmentDescriptorV1, EnrollmentError> {
+    let EnrollmentOpen::Present(mut writer) = EnrollmentWriter::open_existing(root, binding)?
+    else {
+        return Err(EnrollmentError::IllegalLifecycle(
+            "shared enrollment requires an existing LocalActive enrollment",
+        ));
+    };
+    match writer.current().record.lifecycle() {
+        EnrollmentLifecycleV1::LocalActive(_) => {
+            let active = current_local_active_for_shared_enrollment(&writer)?;
+            if let Err(error) = require_safe_idle_shared_local_active(&active) {
+                return block_shared_enrollment(
+                    &mut writer,
+                    "shared.unsafe-handoff",
+                    active.enrollment_head,
+                    error,
+                )
+                .and(Err(EnrollmentError::IllegalTransition));
+            }
+            let verified = match read_anchored_verified_local(&writer.reader, &active) {
+                Ok(verified) => verified,
+                Err(error) => {
+                    return block_shared_enrollment(
+                        &mut writer,
+                        "shared.local-proof-mismatch",
+                        active.enrollment_head,
+                        EnrollmentError::IllegalLifecycle(match error {
+                            VerifiedLocalCompositionError::WrongLifecycle(detail) => detail,
+                            _ => "LocalActive anchor could not prove shared enrollment evidence",
+                        }),
+                    )
+                    .and(Err(EnrollmentError::IllegalTransition));
+                }
+            };
+            let descriptor = match SharedEnrollmentDescriptorV1::from_local_active(
+                binding,
+                &active,
+                &verified,
+                object_store_namespace,
+            ) {
+                Ok(descriptor) => descriptor,
+                Err(error) => {
+                    return block_shared_enrollment(
+                        &mut writer,
+                        "shared.incompatible-descriptor",
+                        active.enrollment_head,
+                        error,
+                    )
+                    .and(Err(EnrollmentError::IllegalTransition));
+                }
+            };
+            let prepared = SharePreparedV1 {
+                descriptor: descriptor.clone(),
+                descriptor_digest: descriptor.digest()?,
+            };
+            let expected = writer.current().digest;
+            writer.transition_at_cut(
+                expected,
+                EnrollmentLifecycleV1::SharePrepared(prepared),
+                cut,
+            )?;
+            Ok(descriptor)
+        }
+        EnrollmentLifecycleV1::SharePrepared(prepared) => {
+            let existing = prepared.clone();
+            if existing.descriptor.object_store_namespace == object_store_namespace {
+                Ok(existing.descriptor)
+            } else {
+                block_shared_enrollment(
+                    &mut writer,
+                    "shared.descriptor-conflict",
+                    existing.descriptor_digest,
+                    EnrollmentError::SharedEnrollmentBindingMismatch,
+                )
+                .and(Err(EnrollmentError::IllegalTransition))
+            }
+        }
+        EnrollmentLifecycleV1::SharedActive(active)
+            if active.role == SharedEnrollmentRoleV1::Initiator
+                && active.descriptor.object_store_namespace == object_store_namespace =>
+        {
+            Ok(active.descriptor.clone())
+        }
+        EnrollmentLifecycleV1::SharedActive(_) => block_shared_enrollment(
+            &mut writer,
+            "shared.descriptor-conflict",
+            ContentDigest::of(b"shared-initiator-namespace-conflict"),
+            EnrollmentError::SharedEnrollmentBindingMismatch,
+        )
+        .and(Err(EnrollmentError::IllegalTransition)),
+        EnrollmentLifecycleV1::Joining(_)
+        | EnrollmentLifecycleV1::ShadowImport(_)
+        | EnrollmentLifecycleV1::VerifiedLocal(_)
+        | EnrollmentLifecycleV1::Blocked(_) => Err(EnrollmentError::IllegalLifecycle(
+            "enrollment cannot prepare an initiator descriptor from its current state",
+        )),
+    }
+}
+
+/// Commit the initiator side of `SharePrepared -> SharedActive`.  The only
+/// data written is the authenticated enrollment journal; no graph or
+/// projection bytes are opened or changed by this core boundary.
+pub(crate) fn activate_shared_initiator(
+    root: &EnrollmentApplicationRoot,
+    binding: &EnrollmentBindingV1,
+    descriptor: &SharedEnrollmentDescriptorV1,
+) -> Result<(), EnrollmentError> {
+    activate_shared_initiator_at_cut(root, binding, descriptor, CommitCut::None)
+}
+
+#[cfg(test)]
+fn activate_shared_initiator_at_cut_for_test(
+    root: &EnrollmentApplicationRoot,
+    binding: &EnrollmentBindingV1,
+    descriptor: &SharedEnrollmentDescriptorV1,
+    cut: CommitCut,
+) -> Result<(), EnrollmentError> {
+    activate_shared_initiator_at_cut(root, binding, descriptor, cut)
+}
+
+fn activate_shared_initiator_at_cut(
+    root: &EnrollmentApplicationRoot,
+    binding: &EnrollmentBindingV1,
+    descriptor: &SharedEnrollmentDescriptorV1,
+    cut: CommitCut,
+) -> Result<(), EnrollmentError> {
+    let evidence = shared_descriptor_evidence_digest(descriptor);
+    let EnrollmentOpen::Present(mut writer) = EnrollmentWriter::open_existing(root, binding)?
+    else {
+        return Err(EnrollmentError::IllegalLifecycle(
+            "shared initiator enrollment is absent",
+        ));
+    };
+    if let Err(error) = descriptor.validate() {
+        return block_shared_enrollment(
+            &mut writer,
+            "shared.incompatible-descriptor",
+            evidence,
+            error,
+        )
+        .and(Err(EnrollmentError::IllegalTransition));
+    }
+    match writer.current().record.lifecycle() {
+        EnrollmentLifecycleV1::SharePrepared(prepared) if prepared.descriptor == *descriptor => {
+            let expected = writer.current().digest;
+            writer.transition_at_cut(
+                expected,
+                EnrollmentLifecycleV1::SharedActive(SharedActiveV1 {
+                    descriptor: descriptor.clone(),
+                    descriptor_digest: prepared.descriptor_digest,
+                    role: SharedEnrollmentRoleV1::Initiator,
+                    archived_local_workspace: None,
+                }),
+                cut,
+            )?;
+            Ok(())
+        }
+        EnrollmentLifecycleV1::SharedActive(active)
+            if active.role == SharedEnrollmentRoleV1::Initiator
+                && active.descriptor == *descriptor =>
+        {
+            Ok(())
+        }
+        EnrollmentLifecycleV1::SharePrepared(_) | EnrollmentLifecycleV1::SharedActive(_) => {
+            block_shared_enrollment(
+                &mut writer,
+                "shared.descriptor-conflict",
+                evidence,
+                EnrollmentError::SharedEnrollmentBindingMismatch,
+            )
+            .and(Err(EnrollmentError::IllegalTransition))
+        }
+        _ => Err(EnrollmentError::IllegalLifecycle(
+            "shared initiator activation requires SharePrepared",
+        )),
+    }
+}
+
+/// Commit `LocalActive -> Joining` after the caller has archived the joiner's
+/// former local workspace.  The `unique_unprojected_operation_count` is a
+/// deliberately explicit proof input: anything nonzero blocks *before* the
+/// archive witness can be persisted, so a dirty unique tail cannot be
+/// discarded or silently merged.
+pub(crate) fn prepare_shared_join(
+    root: &EnrollmentApplicationRoot,
+    binding: &EnrollmentBindingV1,
+    descriptor: &SharedEnrollmentDescriptorV1,
+    archived_workspace_digest: ContentDigest,
+    unique_unprojected_operation_count: u64,
+) -> Result<(), EnrollmentError> {
+    prepare_shared_join_at_cut(
+        root,
+        binding,
+        descriptor,
+        archived_workspace_digest,
+        unique_unprojected_operation_count,
+        CommitCut::None,
+    )
+}
+
+#[cfg(test)]
+fn prepare_shared_join_at_cut_for_test(
+    root: &EnrollmentApplicationRoot,
+    binding: &EnrollmentBindingV1,
+    descriptor: &SharedEnrollmentDescriptorV1,
+    archived_workspace_digest: ContentDigest,
+    unique_unprojected_operation_count: u64,
+    cut: CommitCut,
+) -> Result<(), EnrollmentError> {
+    prepare_shared_join_at_cut(
+        root,
+        binding,
+        descriptor,
+        archived_workspace_digest,
+        unique_unprojected_operation_count,
+        cut,
+    )
+}
+
+fn prepare_shared_join_at_cut(
+    root: &EnrollmentApplicationRoot,
+    binding: &EnrollmentBindingV1,
+    descriptor: &SharedEnrollmentDescriptorV1,
+    archived_workspace_digest: ContentDigest,
+    unique_unprojected_operation_count: u64,
+    cut: CommitCut,
+) -> Result<(), EnrollmentError> {
+    let evidence = shared_descriptor_evidence_digest(descriptor);
+    let EnrollmentOpen::Present(mut writer) = EnrollmentWriter::open_existing(root, binding)?
+    else {
+        return Err(EnrollmentError::IllegalLifecycle(
+            "shared join enrollment is absent",
+        ));
+    };
+    if let Err(error) = descriptor.validate() {
+        return block_shared_enrollment(
+            &mut writer,
+            "shared.incompatible-descriptor",
+            evidence,
+            error,
+        )
+        .and(Err(EnrollmentError::IllegalTransition));
+    }
+    match writer.current().record.lifecycle() {
+        EnrollmentLifecycleV1::LocalActive(_) => {
+            let active = current_local_active_for_shared_enrollment(&writer)?;
+            if let Err(error) = require_safe_idle_shared_local_active(&active) {
+                return block_shared_enrollment(
+                    &mut writer,
+                    "shared.unsafe-handoff",
+                    active.enrollment_head,
+                    error,
+                )
+                .and(Err(EnrollmentError::IllegalTransition));
+            }
+            let verified = match read_anchored_verified_local(&writer.reader, &active) {
+                Ok(verified) => verified,
+                Err(_) => {
+                    return block_shared_enrollment(
+                        &mut writer,
+                        "shared.local-proof-mismatch",
+                        active.enrollment_head,
+                        EnrollmentError::SharedEnrollmentBindingMismatch,
+                    )
+                    .and(Err(EnrollmentError::IllegalTransition));
+                }
+            };
+            let archive = JoinerWorkspaceArchiveV1 {
+                schema_version: JOINER_WORKSPACE_ARCHIVE_SCHEMA_VERSION,
+                archived_workspace_digest,
+                source_local_active_head: active.enrollment_head,
+                source_verification_digest: active.verification_digest,
+                unique_unprojected_operation_count,
+                projection_base: SharedProjectionBaseEvidenceV1::from_verified_local(&verified),
+            };
+            if let Err(error) = archive.validate() {
+                return block_shared_enrollment(
+                    &mut writer,
+                    "shared.dirty-unique-tail",
+                    archived_workspace_digest,
+                    error,
+                )
+                .and(Err(EnrollmentError::IllegalTransition));
+            }
+            if !descriptor.is_compatible_with(binding)
+                || archive.projection_base != descriptor.projection_base
+            {
+                return block_shared_enrollment(
+                    &mut writer,
+                    "shared.projection-base-mismatch",
+                    evidence,
+                    EnrollmentError::SharedEnrollmentBindingMismatch,
+                )
+                .and(Err(EnrollmentError::IllegalTransition));
+            }
+            let joining = JoiningV1 {
+                descriptor: descriptor.clone(),
+                descriptor_digest: descriptor.digest()?,
+                archived_local_workspace: archive,
+            };
+            let expected = writer.current().digest;
+            writer.transition_at_cut(expected, EnrollmentLifecycleV1::Joining(joining), cut)?;
+            Ok(())
+        }
+        EnrollmentLifecycleV1::Joining(joining) if joining.descriptor == *descriptor => Ok(()),
+        EnrollmentLifecycleV1::SharedActive(active)
+            if active.role == SharedEnrollmentRoleV1::Joiner
+                && active.descriptor == *descriptor =>
+        {
+            Ok(())
+        }
+        EnrollmentLifecycleV1::Joining(_) | EnrollmentLifecycleV1::SharedActive(_) => {
+            block_shared_enrollment(
+                &mut writer,
+                "shared.descriptor-conflict",
+                evidence,
+                EnrollmentError::SharedEnrollmentBindingMismatch,
+            )
+            .and(Err(EnrollmentError::IllegalTransition))
+        }
+        _ => Err(EnrollmentError::IllegalLifecycle(
+            "shared join requires LocalActive or its exact resumable state",
+        )),
+    }
+}
+
+/// Commit the peer side of `Joining -> SharedActive`.  Retrying with the same
+/// descriptor is idempotent; another descriptor is a durable split-genesis
+/// conflict, never an automatic merge.
+pub(crate) fn activate_shared_joiner(
+    root: &EnrollmentApplicationRoot,
+    binding: &EnrollmentBindingV1,
+    descriptor: &SharedEnrollmentDescriptorV1,
+) -> Result<(), EnrollmentError> {
+    activate_shared_joiner_at_cut(root, binding, descriptor, CommitCut::None)
+}
+
+#[cfg(test)]
+fn activate_shared_joiner_at_cut_for_test(
+    root: &EnrollmentApplicationRoot,
+    binding: &EnrollmentBindingV1,
+    descriptor: &SharedEnrollmentDescriptorV1,
+    cut: CommitCut,
+) -> Result<(), EnrollmentError> {
+    activate_shared_joiner_at_cut(root, binding, descriptor, cut)
+}
+
+fn activate_shared_joiner_at_cut(
+    root: &EnrollmentApplicationRoot,
+    binding: &EnrollmentBindingV1,
+    descriptor: &SharedEnrollmentDescriptorV1,
+    cut: CommitCut,
+) -> Result<(), EnrollmentError> {
+    let evidence = shared_descriptor_evidence_digest(descriptor);
+    let EnrollmentOpen::Present(mut writer) = EnrollmentWriter::open_existing(root, binding)?
+    else {
+        return Err(EnrollmentError::IllegalLifecycle(
+            "shared join enrollment is absent",
+        ));
+    };
+    if let Err(error) = descriptor.validate() {
+        return block_shared_enrollment(
+            &mut writer,
+            "shared.incompatible-descriptor",
+            evidence,
+            error,
+        )
+        .and(Err(EnrollmentError::IllegalTransition));
+    }
+    match writer.current().record.lifecycle() {
+        EnrollmentLifecycleV1::Joining(joining) if joining.descriptor == *descriptor => {
+            let expected = writer.current().digest;
+            writer.transition_at_cut(
+                expected,
+                EnrollmentLifecycleV1::SharedActive(SharedActiveV1 {
+                    descriptor: descriptor.clone(),
+                    descriptor_digest: joining.descriptor_digest,
+                    role: SharedEnrollmentRoleV1::Joiner,
+                    archived_local_workspace: Some(joining.archived_local_workspace.clone()),
+                }),
+                cut,
+            )?;
+            Ok(())
+        }
+        EnrollmentLifecycleV1::SharedActive(active)
+            if active.role == SharedEnrollmentRoleV1::Joiner
+                && active.descriptor == *descriptor =>
+        {
+            Ok(())
+        }
+        EnrollmentLifecycleV1::Joining(_) | EnrollmentLifecycleV1::SharedActive(_) => {
+            block_shared_enrollment(
+                &mut writer,
+                "shared.descriptor-conflict",
+                evidence,
+                EnrollmentError::SharedEnrollmentBindingMismatch,
+            )
+            .and(Err(EnrollmentError::IllegalTransition))
+        }
+        _ => Err(EnrollmentError::IllegalLifecycle(
+            "shared join activation requires Joining",
+        )),
+    }
 }
 
 /// Persist or idempotently resume the exact `VerifiedLocal -> LocalActive`
@@ -2582,6 +3422,13 @@ fn activate_verified_local_record_at_cut(
                 false
             }
             EnrollmentLifecycleV1::LocalActive(_) => true,
+            EnrollmentLifecycleV1::SharePrepared(_)
+            | EnrollmentLifecycleV1::Joining(_)
+            | EnrollmentLifecycleV1::SharedActive(_) => {
+                return Err(VerifiedLocalCompositionError::WrongLifecycle(
+                    "shared enrollment cannot activate a LocalActive runtime",
+                ));
+            }
             EnrollmentLifecycleV1::ShadowImport(_) => {
                 return Err(VerifiedLocalCompositionError::WrongLifecycle(
                     "enrollment remains ShadowImport",
@@ -3965,7 +4812,13 @@ fn decode_record(bytes: &[u8]) -> Result<EnrollmentRecordV1, EnrollmentError> {
         .ok_or_else(|| EnrollmentError::Decode("record lifecycle state is missing".into()))?;
     if !matches!(
         lifecycle_state,
-        "shadow_import" | "verified_local" | "local_active" | "blocked"
+        "shadow_import"
+            | "verified_local"
+            | "local_active"
+            | "share_prepared"
+            | "joining"
+            | "shared_active"
+            | "blocked"
     ) {
         return Err(EnrollmentError::FutureUnsupportedLifecycle(
             lifecycle_state.to_owned(),
@@ -5601,6 +6454,13 @@ pub(crate) enum EnrollmentError {
     PublishedBatchMismatch,
     InvalidVerifiedLocalTerminal,
     InvalidLocalActiveAnchor,
+    InvalidSharedProjectionBaseEvidence,
+    UnsupportedSharedEnrollmentDescriptorSchema(u32),
+    UnsupportedJoinerWorkspaceArchiveSchema(u32),
+    UnsafeSharedEnrollmentHandoff,
+    SharedEnrollmentBindingMismatch,
+    SharedEnrollmentDescriptorDigestMismatch,
+    DirtyUniqueLocalTail,
     InvalidBlockedReason,
     IllegalLifecycle(&'static str),
     IllegalTransition,
@@ -5725,6 +6585,32 @@ impl fmt::Display for EnrollmentError {
             Self::InvalidLocalActiveAnchor => formatter.write_str(
                 "local-active bootstrap anchor identity or proof counts are inconsistent",
             ),
+            Self::InvalidSharedProjectionBaseEvidence => {
+                formatter.write_str("shared enrollment projection/base evidence is inconsistent")
+            }
+            Self::UnsupportedSharedEnrollmentDescriptorSchema(schema) => {
+                write!(
+                    formatter,
+                    "unsupported shared enrollment descriptor schema {schema}"
+                )
+            }
+            Self::UnsupportedJoinerWorkspaceArchiveSchema(schema) => {
+                write!(
+                    formatter,
+                    "unsupported joiner workspace archive schema {schema}"
+                )
+            }
+            Self::UnsafeSharedEnrollmentHandoff => {
+                formatter.write_str("shared enrollment requires a safe handoff")
+            }
+            Self::SharedEnrollmentBindingMismatch => formatter
+                .write_str("shared enrollment binding or projection/base evidence mismatch"),
+            Self::SharedEnrollmentDescriptorDigestMismatch => {
+                formatter.write_str("shared enrollment descriptor digest mismatch")
+            }
+            Self::DirtyUniqueLocalTail => {
+                formatter.write_str("joiner has unique unprojected local operations")
+            }
             Self::InvalidBlockedReason => formatter.write_str("invalid blocked reason code"),
             Self::IllegalLifecycle(detail) => {
                 write!(formatter, "illegal enrollment lifecycle: {detail}")
@@ -5841,6 +6727,43 @@ mod tests {
             GraphTextScope::new(&[], false).bind_graph_resource(graph),
         )
         .unwrap()
+    }
+
+    fn shared_test_binding(device: u128, graph: u8, archive: u8) -> EnrollmentBindingV1 {
+        let graph_resource = graph_resource(graph);
+        EnrollmentBindingV1::new(
+            WorkspaceId::from_uuid(Uuid::from_u128(1)),
+            LineageDigest::from_bytes([2; 32]),
+            DocumentId::from_uuid(Uuid::from_u128(3)),
+            ProjectionEndpointId::from_uuid(Uuid::from_u128(0x7000 + device)),
+            DeviceId::from_uuid(Uuid::from_u128(device)),
+            graph_resource,
+            receipt_store(0x40 + graph),
+            archive_resource(archive),
+            GraphTextScope::new(&[], false).bind_graph_resource(graph_resource),
+        )
+        .unwrap()
+    }
+
+    fn local_active_safe_for_shared_test(root: &TestRoot, binding: EnrollmentBindingV1) {
+        create_discovery_enrollment_for_test(
+            &root.path,
+            binding,
+            EnrollmentDiscoveryFixtureLifecycle::LocalActiveSafe,
+        )
+        .unwrap();
+    }
+
+    fn assert_shared_blocked(root: &TestRoot, binding: &EnrollmentBindingV1) {
+        let inspection =
+            inspect_existing_enrollment_at(&root.path, binding.graph_resource_id()).unwrap();
+        assert!(matches!(
+            inspection,
+            EnrollmentDiscoveryInspection::Present(EnrollmentDiscoveryEvidence {
+                lifecycle: EnrollmentDiscoveryLifecycle::Blocked { .. },
+                ..
+            })
+        ));
     }
 
     fn shadow() -> ShadowImportV1 {
@@ -6105,11 +7028,11 @@ mod tests {
         );
 
         let mut future: serde_json::Value = serde_json::from_slice(&canonical).unwrap();
-        future["lifecycle"]["state"] = serde_json::json!("shared_active");
+        future["lifecycle"]["state"] = serde_json::json!("future_shared_active");
         assert_eq!(
             decode_record(&serde_json::to_vec(&future).unwrap()),
             Err(EnrollmentError::FutureUnsupportedLifecycle(
-                "shared_active".into()
+                "future_shared_active".into()
             ))
         );
 
@@ -8018,12 +8941,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        for state in [
-            "shared_active",
-            "joining",
-            "share_prepared",
-            "future_active",
-        ] {
+        for state in ["future_shared_active", "future_joining", "future_active"] {
             let mut value: serde_json::Value = serde_json::from_slice(&canonical).unwrap();
             value["lifecycle"]["state"] = serde_json::json!(state);
             assert_eq!(
@@ -9109,5 +10027,289 @@ mod tests {
             ),
             Err(VerifiedLocalCompositionError::WrongLifecycle(_))
         ));
+    }
+
+    /// Contract/fail-before: before P3.1 these two proven LocalActive journals
+    /// had no legal shared path at all.  The smallest added path must retain
+    /// the existing local proofs, keep the graph bytes untouched, and reach
+    /// exactly one descriptor-bound shared lineage on both devices.
+    #[test]
+    fn shared_enrollment_clean_two_device_join_is_descriptor_bound_and_inactive() {
+        fn token_count(bytes: &[u8]) -> usize {
+            let (mut in_string, mut escaped, mut tokens) = (false, false, 0_usize);
+            for byte in bytes.iter().copied() {
+                if in_string {
+                    if escaped {
+                        escaped = false;
+                    } else if byte == b'\\' {
+                        escaped = true;
+                    } else if byte == b'"' {
+                        in_string = false;
+                    }
+                } else {
+                    match byte {
+                        b'"' => in_string = true,
+                        b'{' | b'[' | b'}' | b']' | b',' | b':' => tokens += 1,
+                        _ => {}
+                    }
+                }
+            }
+            tokens
+        }
+
+        let initiator = TestRoot::new("shared-clean-initiator");
+        let joiner = TestRoot::new("shared-clean-joiner");
+        let initiator_binding = shared_test_binding(0x801, 31, 41);
+        let joiner_binding = shared_test_binding(0x802, 32, 42);
+        local_active_safe_for_shared_test(&initiator, initiator_binding.clone());
+        local_active_safe_for_shared_test(&joiner, joiner_binding.clone());
+
+        let projection = initiator.path.join("projection-bytes.md");
+        fs::write(&projection, b"- must not be touched by core enrollment\n").unwrap();
+        let projection_before = fs::read(&projection).unwrap();
+
+        let descriptor =
+            prepare_shared_enrollment(&initiator.app(), &initiator_binding, digest(0xa1)).unwrap();
+        assert_eq!(
+            inspect_shared_enrollment_phase(&initiator.app(), &initiator_binding).unwrap(),
+            Some(SharedEnrollmentPhase::SharePrepared)
+        );
+        activate_shared_initiator(&initiator.app(), &initiator_binding, &descriptor).unwrap();
+        prepare_shared_join(&joiner.app(), &joiner_binding, &descriptor, digest(0xa2), 0).unwrap();
+        assert_eq!(
+            inspect_shared_enrollment_phase(&joiner.app(), &joiner_binding).unwrap(),
+            Some(SharedEnrollmentPhase::Joining)
+        );
+        activate_shared_joiner(&joiner.app(), &joiner_binding, &descriptor).unwrap();
+
+        assert_eq!(
+            inspect_shared_enrollment_phase(&initiator.app(), &initiator_binding).unwrap(),
+            Some(SharedEnrollmentPhase::SharedActiveInitiator)
+        );
+        assert_eq!(
+            inspect_shared_enrollment_phase(&joiner.app(), &joiner_binding).unwrap(),
+            Some(SharedEnrollmentPhase::SharedActiveJoiner)
+        );
+        assert_eq!(fs::read(&projection).unwrap(), projection_before);
+        for (root, binding) in [(&initiator, &initiator_binding), (&joiner, &joiner_binding)] {
+            let reader =
+                expect_present(EnrollmentReader::open_existing(&root.app(), binding).unwrap());
+            let bytes = fs::read(record_path(root, binding, reader.current().digest)).unwrap();
+            assert!(bytes.len() < MAX_ENROLLMENT_RECORD_BYTES);
+            assert!(
+                token_count(&bytes) <= MAX_ENROLLMENT_JSON_TOKENS,
+                "shared record exceeded its fixed bounded-open token budget"
+            );
+        }
+
+        // The existing runtime discovery boundary must fail closed: P3.1 does
+        // not silently grant SharedActive a LocalActive runtime or UI path.
+        assert_shared_blocked(&initiator, &initiator_binding);
+        assert_shared_blocked(&joiner, &joiner_binding);
+    }
+
+    #[test]
+    fn shared_join_reordering_and_duplicate_descriptor_are_idempotent() {
+        let initiator = TestRoot::new("shared-duplicate-initiator");
+        let joiner = TestRoot::new("shared-duplicate-joiner");
+        let initiator_binding = shared_test_binding(0x811, 33, 43);
+        let joiner_binding = shared_test_binding(0x812, 34, 44);
+        local_active_safe_for_shared_test(&initiator, initiator_binding.clone());
+        local_active_safe_for_shared_test(&joiner, joiner_binding.clone());
+        let descriptor =
+            prepare_shared_enrollment(&initiator.app(), &initiator_binding, digest(0xb1)).unwrap();
+
+        // Delivery may be reordered.  Completing an absent join is refused
+        // without advancing the peer or touching projection bytes.
+        assert!(activate_shared_joiner(&joiner.app(), &joiner_binding, &descriptor).is_err());
+        assert_eq!(
+            inspect_shared_enrollment_phase(&joiner.app(), &joiner_binding).unwrap(),
+            None
+        );
+        prepare_shared_join(&joiner.app(), &joiner_binding, &descriptor, digest(0xb2), 0).unwrap();
+        // Duplicate provider delivery repeats no state transition.
+        prepare_shared_join(&joiner.app(), &joiner_binding, &descriptor, digest(0xb2), 0).unwrap();
+        activate_shared_joiner(&joiner.app(), &joiner_binding, &descriptor).unwrap();
+        activate_shared_joiner(&joiner.app(), &joiner_binding, &descriptor).unwrap();
+        assert_eq!(
+            inspect_shared_enrollment_phase(&joiner.app(), &joiner_binding).unwrap(),
+            Some(SharedEnrollmentPhase::SharedActiveJoiner)
+        );
+    }
+
+    #[test]
+    fn shared_join_blocks_partial_bootstrap_split_genesis_dirty_tail_and_base_mismatch() {
+        let initiator = TestRoot::new("shared-refusal-initiator");
+        let initiator_binding = shared_test_binding(0x821, 35, 45);
+        local_active_safe_for_shared_test(&initiator, initiator_binding.clone());
+        let descriptor =
+            prepare_shared_enrollment(&initiator.app(), &initiator_binding, digest(0xc1)).unwrap();
+
+        let partial = TestRoot::new("shared-refusal-partial");
+        let partial_binding = shared_test_binding(0x822, 36, 46);
+        local_active_safe_for_shared_test(&partial, partial_binding.clone());
+        let mut incomplete = descriptor.clone();
+        incomplete.projection_base.accepted_history_record_count = 1;
+        assert!(prepare_shared_join(
+            &partial.app(),
+            &partial_binding,
+            &incomplete,
+            digest(0xc2),
+            0,
+        )
+        .is_err());
+        assert_shared_blocked(&partial, &partial_binding);
+
+        let dirty = TestRoot::new("shared-refusal-dirty-tail");
+        let dirty_binding = shared_test_binding(0x823, 37, 47);
+        local_active_safe_for_shared_test(&dirty, dirty_binding.clone());
+        let bytes = dirty.path.join("local-projection.md");
+        fs::write(&bytes, b"- untouched dirty-tail projection\n").unwrap();
+        let before = fs::read(&bytes).unwrap();
+        assert!(
+            prepare_shared_join(&dirty.app(), &dirty_binding, &descriptor, digest(0xc3), 1,)
+                .is_err()
+        );
+        assert_eq!(fs::read(&bytes).unwrap(), before);
+        assert_shared_blocked(&dirty, &dirty_binding);
+
+        let conflict = TestRoot::new("shared-refusal-conflicting-descriptor");
+        let conflict_binding = shared_test_binding(0x824, 38, 48);
+        local_active_safe_for_shared_test(&conflict, conflict_binding.clone());
+        prepare_shared_join(
+            &conflict.app(),
+            &conflict_binding,
+            &descriptor,
+            digest(0xc4),
+            0,
+        )
+        .unwrap();
+        let mut competing = descriptor.clone();
+        competing.object_store_namespace = digest(0xc5);
+        assert!(prepare_shared_join(
+            &conflict.app(),
+            &conflict_binding,
+            &competing,
+            digest(0xc4),
+            0,
+        )
+        .is_err());
+        assert_shared_blocked(&conflict, &conflict_binding);
+
+        let base_mismatch = TestRoot::new("shared-refusal-base-mismatch");
+        let base_mismatch_binding = shared_test_binding(0x825, 39, 49);
+        local_active_safe_for_shared_test(&base_mismatch, base_mismatch_binding.clone());
+        let mut incompatible = descriptor.clone();
+        incompatible.projection_base.byte_compare_digest = digest(0xc6);
+        assert!(prepare_shared_join(
+            &base_mismatch.app(),
+            &base_mismatch_binding,
+            &incompatible,
+            digest(0xc7),
+            0,
+        )
+        .is_err());
+        assert_shared_blocked(&base_mismatch, &base_mismatch_binding);
+
+        let incompatible = TestRoot::new("shared-refusal-incompatible-version");
+        let incompatible_binding = shared_test_binding(0x826, 40, 50);
+        local_active_safe_for_shared_test(&incompatible, incompatible_binding.clone());
+        let mut future_protocol = descriptor.clone();
+        future_protocol.compatibility.oplog_protocol_version = future_protocol
+            .compatibility
+            .oplog_protocol_version
+            .saturating_add(1);
+        assert!(prepare_shared_join(
+            &incompatible.app(),
+            &incompatible_binding,
+            &future_protocol,
+            digest(0xc8),
+            0,
+        )
+        .is_err());
+        assert_shared_blocked(&incompatible, &incompatible_binding);
+    }
+
+    #[test]
+    fn shared_enrollment_named_crash_cuts_resume_two_device_state_machine() {
+        let cuts = [
+            CommitCut::AfterRecordTempCreate,
+            CommitCut::AfterRecordWrite,
+            CommitCut::AfterRecordFileSync,
+            CommitCut::AfterRecordLink,
+            CommitCut::AfterRecordInsert,
+            CommitCut::AfterRecordsDirectorySync,
+            CommitCut::AfterHeadTempCreate,
+            CommitCut::AfterHeadWrite,
+            CommitCut::AfterHeadFileSync,
+            CommitCut::AfterHeadReplace,
+            CommitCut::AfterEnrollmentDirectorySync,
+        ];
+
+        for (index, cut) in cuts.into_iter().enumerate() {
+            let initiator = TestRoot::new(&format!("shared-crash-initiator-{index}"));
+            let joiner = TestRoot::new(&format!("shared-crash-joiner-{index}"));
+            let initiator_binding = shared_test_binding(0x900 + index as u128, 50, 60);
+            let joiner_binding = shared_test_binding(0xa00 + index as u128, 51, 61);
+            local_active_safe_for_shared_test(&initiator, initiator_binding.clone());
+            local_active_safe_for_shared_test(&joiner, joiner_binding.clone());
+
+            assert!(matches!(
+                prepare_shared_enrollment_at_cut_for_test(
+                    &initiator.app(),
+                    &initiator_binding,
+                    digest(0xd1),
+                    cut,
+                ),
+                Err(EnrollmentError::InjectedCrashCut(_))
+            ));
+            let descriptor =
+                prepare_shared_enrollment(&initiator.app(), &initiator_binding, digest(0xd1))
+                    .unwrap();
+
+            assert!(matches!(
+                activate_shared_initiator_at_cut_for_test(
+                    &initiator.app(),
+                    &initiator_binding,
+                    &descriptor,
+                    cut,
+                ),
+                Err(EnrollmentError::InjectedCrashCut(_))
+            ));
+            activate_shared_initiator(&initiator.app(), &initiator_binding, &descriptor).unwrap();
+
+            assert!(matches!(
+                prepare_shared_join_at_cut_for_test(
+                    &joiner.app(),
+                    &joiner_binding,
+                    &descriptor,
+                    digest(0xd2),
+                    0,
+                    cut,
+                ),
+                Err(EnrollmentError::InjectedCrashCut(_))
+            ));
+            prepare_shared_join(&joiner.app(), &joiner_binding, &descriptor, digest(0xd2), 0)
+                .unwrap();
+
+            assert!(matches!(
+                activate_shared_joiner_at_cut_for_test(
+                    &joiner.app(),
+                    &joiner_binding,
+                    &descriptor,
+                    cut,
+                ),
+                Err(EnrollmentError::InjectedCrashCut(_))
+            ));
+            activate_shared_joiner(&joiner.app(), &joiner_binding, &descriptor).unwrap();
+            assert_eq!(
+                inspect_shared_enrollment_phase(&initiator.app(), &initiator_binding).unwrap(),
+                Some(SharedEnrollmentPhase::SharedActiveInitiator)
+            );
+            assert_eq!(
+                inspect_shared_enrollment_phase(&joiner.app(), &joiner_binding).unwrap(),
+                Some(SharedEnrollmentPhase::SharedActiveJoiner)
+            );
+        }
     }
 }

@@ -1600,6 +1600,24 @@ pub struct FrontierReferenceResults {
     pub instrumentation: ReferenceQueryInstrumentation,
 }
 
+fn retain_reference_hit_bounded(
+    retained_bytes: &mut usize,
+    hit: &FrontierReferenceHit,
+) -> Result<(), ProjectionError> {
+    let raw_bytes = match &hit.fact {
+        ReferenceFactV1::PageName(fact) => fact.raw_target.len(),
+        ReferenceFactV1::Block(fact) => fact.raw_claim.len(),
+    };
+    let bytes = 128_usize.saturating_add(raw_bytes);
+    *retained_bytes = retained_bytes.saturating_add(bytes);
+    if *retained_bytes > super::MAX_MATERIALIZATION_READ_BYTES {
+        return Err(ProjectionError::Materialization(
+            "reference query output exceeds the materialization read bound".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Bounded rename candidate plan.  The caller still supplies projection
 /// captures to `ShardedHotEngine::finalize_author_transaction`; this plan only
 /// carries an already revalidated semantic transaction.
@@ -8238,6 +8256,7 @@ impl FrontierReferenceQuery<'_> {
             .sqlite_candidate_sources
             .saturating_add(sqlite_candidates);
         let mut hits = Vec::new();
+        let mut output_bytes = 0_usize;
         'sources: for source_page_id in candidates {
             let posting = self.current_posting(source_page_id)?;
             for fact in posting.facts() {
@@ -8264,12 +8283,14 @@ impl FrontierReferenceQuery<'_> {
                     }
                     break 'sources;
                 }
-                hits.push(FrontierReferenceHit {
+                let hit = FrontierReferenceHit {
                     source_page_id,
                     fact: ReferenceFactV1::PageName(fact.clone()),
                     resolved_page_id,
                     resolved_block_id: None,
-                });
+                };
+                retain_reference_hit_bounded(&mut output_bytes, &hit)?;
+                hits.push(hit);
             }
         }
         hits.sort_unstable_by(|left, right| {
@@ -8325,6 +8346,7 @@ impl FrontierReferenceQuery<'_> {
             .sqlite_candidate_sources
             .saturating_add(sqlite_candidates);
         let mut hits = Vec::new();
+        let mut output_bytes = 0_usize;
         'sources: for source_page_id in candidates {
             let posting = self.current_posting(source_page_id)?;
             for fact in posting.facts() {
@@ -8337,12 +8359,14 @@ impl FrontierReferenceQuery<'_> {
                 if hits.len() == limit {
                     break 'sources;
                 }
-                hits.push(FrontierReferenceHit {
+                let hit = FrontierReferenceHit {
                     source_page_id,
                     fact: ReferenceFactV1::Block(fact.clone()),
                     resolved_page_id: None,
                     resolved_block_id,
-                });
+                };
+                retain_reference_hit_bounded(&mut output_bytes, &hit)?;
+                hits.push(hit);
             }
         }
         hits.sort_unstable_by(|left, right| {
