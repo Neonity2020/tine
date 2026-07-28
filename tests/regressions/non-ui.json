@@ -1048,13 +1048,13 @@
         "all"
       ],
       "layer": "core-native",
-      "status": "fixing",
+      "status": "covered",
       "coverage": {
         "tests": [
           "crates/tine-core/src/sync_runtime.rs"
         ],
         "scenario": "sync.watcher-oversize-refusal-retains-full-scan-before-safe",
-        "failBefore": "pending"
+        "failBefore": "proven"
       }
     }
   ]

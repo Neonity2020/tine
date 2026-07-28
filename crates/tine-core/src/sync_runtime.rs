@@ -230,6 +230,7 @@ pub enum SyncRuntimeRequestError {
     InvalidRequest(String),
     RequestTooLarge {
         observations: usize,
+        /// Exact for a count-valid batch; otherwise a bounded prefix diagnostic.
         path_bytes: usize,
     },
     ActorRefused(String),
@@ -393,20 +394,38 @@ impl SyncRuntimeHandle {
         &self,
         observations: Vec<SyncWatcherObservation>,
     ) -> Result<(), SyncRuntimeRequestError> {
-        let path_bytes = observations
-            .iter()
-            .map(SyncWatcherObservation::retained_path_bytes)
-            .sum::<usize>();
+        // This gate is also the observation linearization point relative to
+        // `clean_shutdown`. A rejected callback is still an observed external
+        // change, so retain one bounded full-scan obligation before reporting
+        // the refusal. Otherwise Safe could commit between rejection and a
+        // caller retry while denying work the runtime has already seen.
+        let _operation = self.inner.operation.lock().unwrap();
+        let path_bytes = bounded_watcher_path_bytes(&observations);
         if observations.len() > MAX_WATCHER_OBSERVATIONS || path_bytes > MAX_WATCHER_PATH_BYTES {
+            self.retain_rejected_watcher_work()?;
             return Err(SyncRuntimeRequestError::RequestTooLarge {
                 observations: observations.len(),
                 path_bytes,
             });
         }
-        let _operation = self.inner.operation.lock().unwrap();
         let (reply_sender, reply_receiver) = mpsc::channel();
         self.send(ActorRequest::Observe {
             observations,
+            reply: reply_sender,
+        })?;
+        reply_receiver
+            .recv()
+            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)?
+    }
+
+    /// A public request may be too large to retain verbatim, but that never
+    /// makes its observation disposable. The actor's one-owner queue already
+    /// gives this marker an epoch, status visibility, and a full graph scan
+    /// before the Safe handoff barrier can pass.
+    fn retain_rejected_watcher_work(&self) -> Result<(), SyncRuntimeRequestError> {
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.send(ActorRequest::Observe {
+            observations: vec![SyncWatcherObservation::RescanRequired],
             reply: reply_sender,
         })?;
         reply_receiver
@@ -495,6 +514,20 @@ impl SyncRuntimeHandle {
             .send(request)
             .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)
     }
+}
+
+/// Bound public request validation as well as actor intake. A batch above the
+/// count cap is already known to require a full scan, so only inspect a fixed
+/// prefix; for a count-valid batch this is its exact path-byte total.
+fn bounded_watcher_path_bytes(observations: &[SyncWatcherObservation]) -> usize {
+    let mut path_bytes = 0_usize;
+    for observation in observations.iter().take(MAX_WATCHER_OBSERVATIONS) {
+        path_bytes = path_bytes.saturating_add(observation.retained_path_bytes());
+        if path_bytes > MAX_WATCHER_PATH_BYTES {
+            break;
+        }
+    }
+    path_bytes
 }
 
 fn refused(detail: String) -> SyncRuntimeOpenResult {
@@ -1042,13 +1075,14 @@ mod tests {
         let before = handle.status().unwrap();
         let path = "content/nested pages/oversize watcher batch.md";
         let file = fixture.graph_root().join(path);
-        fs::write(&file, b"- external edit hidden behind an oversized callback\n").unwrap();
+        fs::write(
+            &file,
+            b"- external edit hidden behind an oversized callback\n",
+        )
+        .unwrap();
         let manifests_before = fixture.manifest_count();
         let observations = std::iter::once(SyncWatcherObservation::managed_path(path).unwrap())
-            .chain(
-                (0..MAX_WATCHER_OBSERVATIONS)
-                    .map(|_| SyncWatcherObservation::UnknownPath),
-            )
+            .chain((0..MAX_WATCHER_OBSERVATIONS).map(|_| SyncWatcherObservation::UnknownPath))
             .collect::<Vec<_>>();
         assert!(matches!(
             handle.observe_watcher(observations),
@@ -1071,7 +1105,10 @@ mod tests {
             manifests_before + 1,
             "Safe may be published only after the refused callback's full scan admits its edit"
         );
-        assert!(matches!(fixture.handoff(), EnrollmentDiscoveryHandoff::Safe));
+        assert!(matches!(
+            fixture.handoff(),
+            EnrollmentDiscoveryHandoff::Safe
+        ));
     }
 
     #[test]
@@ -1094,6 +1131,38 @@ mod tests {
             handle.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(snapshot) if !snapshot.watcher.pending
         ));
+    }
+
+    #[test]
+    fn watcher_request_path_byte_overflow_is_retained() {
+        let overflow_path = managed_path_with_bytes(MAX_WATCHER_PATH_BYTES + 1);
+        let rejected_fixture = RuntimeHostFixture::safe("sync-runtime-watcher-path-overflow");
+        let rejected = active_handle(SyncRuntimeHandle::open(rejected_fixture.request()));
+        drive_initial_feed(&rejected);
+        assert!(matches!(
+            rejected.observe_watcher(vec![SyncWatcherObservation::managed_path(overflow_path).unwrap()]),
+            Err(SyncRuntimeRequestError::RequestTooLarge {
+                observations: 1,
+                path_bytes,
+            }) if path_bytes == MAX_WATCHER_PATH_BYTES + 1
+        ));
+        let status = rejected.status().unwrap();
+        assert!(status.watcher.pending);
+        assert!(status.watcher.pending_requires_full_scan);
+        assert!(matches!(
+            rejected.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(snapshot) if !snapshot.watcher.pending
+        ));
+    }
+
+    fn managed_path_with_bytes(path_bytes: usize) -> String {
+        const PREFIX: &str = "pages/";
+        const SUFFIX: &str = ".md";
+        assert!(path_bytes >= PREFIX.len() + SUFFIX.len());
+        format!(
+            "{PREFIX}{}{SUFFIX}",
+            "a".repeat(path_bytes - PREFIX.len() - SUFFIX.len())
+        )
     }
 
     fn active_handle(opened: SyncRuntimeOpenResult) -> SyncRuntimeHandle {
