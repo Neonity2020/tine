@@ -11,7 +11,7 @@
 //! This module is the pure format and set layer:
 //!
 //! * one bounded, canonically encoded, digest-sealed record
-//!   ([`RuntimeResumePointV1`]);
+//!   ([`RuntimeResumePointV2`]);
 //! * one directory survey ([`ResumePointScan`]) that separates *recognized
 //!   canonical points* from *preserved unrecognizable residue*;
 //! * one strict proof ([`ResumePointSet`]) minted only from a survey that
@@ -32,10 +32,10 @@
 //! the directory also holds a `.DS_Store`, a Syncthing `.sync-conflict-*` copy,
 //! a Dropbox ` (1)` duplicate, an editor `.bak`, or a torn point would make the
 //! `Unsafe -> Safe` handoff drain permanently impossible for an ordinary
-//! desktop accident. So [`prune_resume_points_below`] and
-//! [`clear_resume_points_in`] remove exactly the points they fully recognized,
-//! preserve every other byte untouched, report what they preserved, and leave
-//! the reachability proof unmintable while that residue exists.
+//! desktop accident. So [`prune_resume_points_below`] removes only recognized
+//! points below its watermark and [`clear_resume_points_in`] removes only
+//! recognized Unsafe-bound points. Both preserve every unrecognized byte,
+//! report it, and leave the reachability proof unmintable while residue exists.
 //!
 //! Fault model: single user, multiple honest devices, fallible filesystem sync
 //! providers (`specs/notes/2026-07-22-sparse-oplog-storage-execution.md` §0.1).
@@ -53,6 +53,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use super::enrollment::ResumePointEnrollmentBinding;
 use super::hot_engine::{AcceptedFrontierRoot, RuntimeResumeSnapshot};
 use super::object_store::{
     open_existing_dir_nofollow, read_optional_regular, sync_dir_required, BlockClaimIndexRoot,
@@ -65,9 +66,12 @@ use super::{BatchId, ContentDigest, SessionId, WorkspaceId};
 /// engine-history control directory.
 pub(crate) const RESUME_POINT_DIR: &str = "resume-points";
 pub(crate) const RESUME_POINT_SUFFIX: &str = ".resume-point";
-/// The first honest resume-point format. No earlier bytes were ever published,
-/// and any other value is rejected rather than reinterpreted or migrated.
-pub(crate) const RESUME_POINT_SCHEMA_VERSION: u32 = 1;
+/// The first lifecycle-tagged resume-point format.
+///
+/// Schema 1 encoded only an Unsafe session. Schema 2 adds an explicit
+/// Unsafe/Safe lifecycle tag, and old bytes fail closed rather than being
+/// reinterpreted or migrated.
+pub(crate) const RESUME_POINT_SCHEMA_VERSION: u32 = 2;
 /// Hard fail-closed ceiling on one sealed record, on both encode and read.
 ///
 /// **This ceiling must exceed the widest record the format can legitimately
@@ -262,7 +266,7 @@ impl From<StoreError> for ResumePointError {
 /// inside the payload would create.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct SealedResumePointV1 {
+struct SealedResumePointV2 {
     schema_version: u32,
     payload: Vec<u8>,
     /// Digest over the canonical encoding of the complete payload. Canonical
@@ -273,39 +277,43 @@ struct SealedResumePointV1 {
     payload_digest: ContentDigest,
 }
 
-/// The authenticated `LocalActive` evidence one publication records.
-///
-/// Supplied by the caller because nothing in this module can read the
-/// enrollment chain. It is deliberately *evidence*, not authority: the liveness
-/// oracle is the archive-rooted workspace runtime lease, never a recorded
-/// session identity.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ResumePointEnrollment {
-    /// `EnrollmentRecordV1.generation` — the only real ordering counter in the
-    /// system.
-    pub(crate) generation: u64,
-    pub(crate) head: ContentDigest,
-    pub(crate) unsafe_session_id: SessionId,
-}
-
 /// How a resuming open compares a published point's recorded `LocalActive`
 /// evidence with the enrollment record it has just authenticated.
 ///
-/// Both arms are legitimate, and getting the distinction wrong in either
-/// direction is a real fault: requiring an exact match would refuse every
-/// post-takeover adoption (the run-local roots are bound to durable history,
-/// not to a session), while accepting anything would let a point published by
-/// a *superseded* generation claim the live one.
+/// Exact Unsafe and exact Safe are the production opener shapes. The retained
+/// supersession arm is lower-level only: packet-9 candidate selection happens
+/// before a takeover CAS and therefore never uses it to reinterpret an old
+/// point.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ResumeEnrollmentAdmission {
     /// The ordinary same-lineage reopen: the point must name exactly this
     /// enrollment record and this session.
-    SameSession(ResumePointEnrollment),
-    /// A crash takeover minted a new session at a strictly later enrollment
-    /// generation, so the point legitimately predates the live record: it must
-    /// name an earlier generation and must claim neither the live head nor the
-    /// live session.
-    SupersededBy(ResumePointEnrollment),
+    SameSession(ResumePointEnrollmentBinding),
+    /// A clean restart: the point must name exactly the authenticated Safe
+    /// generation and head. Safe carries no session identity.
+    SameSafe(ResumePointEnrollmentBinding),
+    /// Lower-level compatibility shape for a caller that separately proved a
+    /// successor CAS and reads only afterwards. The packet-9 open never selects
+    /// this arm.
+    SupersededBy(ResumePointEnrollmentBinding),
+}
+
+/// Exact lifecycle evidence encoded in schema 2.
+///
+/// The tag is load-bearing. `Safe` has no session member, so it cannot be
+/// confused with `Unsafe` through a sentinel [`SessionId`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+enum ResumePointLifecycleV2 {
+    Unsafe {
+        enrollment_generation: u64,
+        enrollment_head: ContentDigest,
+        session_id: SessionId,
+    },
+    Safe {
+        enrollment_generation: u64,
+        enrollment_head: ContentDigest,
+    },
 }
 
 /// One durable runtime resume point.
@@ -327,7 +335,7 @@ pub(crate) enum ResumeEnrollmentAdmission {
 /// silently under-binds.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct RuntimeResumePointV1 {
+pub(crate) struct RuntimeResumePointV2 {
     /// Monotone per-endpoint publication sequence, cross-checked against the
     /// file name so a copied, renamed, or provider-restored file fails closed.
     /// Sequence zero is never published, so "no point" and "sequence 0" cannot
@@ -359,15 +367,7 @@ pub(crate) struct RuntimeResumePointV1 {
     history_latest_batch_id: BatchId,
 
     // ---- LocalActive lifecycle evidence ----
-    /// `EnrollmentRecordV1.generation` of the record whose lifecycle carries
-    /// `HandoffV1::Unsafe`. Ordering evidence, re-proved at adoption against
-    /// [`ResumeEnrollmentAdmission`]: the liveness oracle is the archive-rooted
-    /// workspace runtime lease, never a recorded session identity. After a
-    /// crash takeover the recorded head and session deliberately differ from
-    /// the live ones.
-    enrollment_generation: u64,
-    enrollment_head: ContentDigest,
-    unsafe_session_id: SessionId,
+    lifecycle: ResumePointLifecycleV2,
 
     // ---- the retained run ----
     scratch_run_id: Uuid,
@@ -396,7 +396,7 @@ pub(crate) struct RuntimeResumePointV1 {
     catalog_checkpoint_binding: ContentDigest,
 }
 
-impl RuntimeResumePointV1 {
+impl RuntimeResumePointV2 {
     /// Seal one record from a quiescent live engine plus the store's own
     /// endpoint binding.
     ///
@@ -410,9 +410,25 @@ impl RuntimeResumePointV1 {
     /// has authenticated itself.
     pub(crate) fn seal(
         binding: &ResumePointEndpointBinding,
-        enrollment: ResumePointEnrollment,
+        enrollment: ResumePointEnrollmentBinding,
         snapshot: &RuntimeResumeSnapshot,
     ) -> Result<Self, ResumePointError> {
+        let lifecycle = match enrollment.unsafe_session_id() {
+            Some(session_id) => ResumePointLifecycleV2::Unsafe {
+                enrollment_generation: enrollment.generation(),
+                enrollment_head: enrollment.head(),
+                session_id,
+            },
+            None if enrollment.is_safe() => ResumePointLifecycleV2::Safe {
+                enrollment_generation: enrollment.generation(),
+                enrollment_head: enrollment.head(),
+            },
+            None => {
+                return Err(ResumePointError::Malformed(
+                    "resume-point enrollment lifecycle is neither Unsafe nor Safe",
+                ))
+            }
+        };
         let point = Self {
             resume_sequence: binding.next_sequence(),
             workspace_id: binding.workspace_id(),
@@ -420,9 +436,7 @@ impl RuntimeResumePointV1 {
             history_generation: snapshot.history_generation(),
             history_index_root: snapshot.history_index_root(),
             history_latest_batch_id: snapshot.history_latest_batch_id(),
-            enrollment_generation: enrollment.generation,
-            enrollment_head: enrollment.head,
-            unsafe_session_id: enrollment.unsafe_session_id,
+            lifecycle,
             scratch_run_id: snapshot.scratch_run_id(),
             scratch_binding_digest: snapshot.scratch_binding_digest(),
             scratch_roots: snapshot.scratch_roots().clone(),
@@ -505,19 +519,52 @@ impl RuntimeResumePointV1 {
         }
         match authority.enrollment() {
             ResumeEnrollmentAdmission::SameSession(live) => {
-                if self.enrollment_generation != live.generation
-                    || self.enrollment_head != live.head
-                    || self.unsafe_session_id != live.unsafe_session_id
-                {
+                let expected = match live.unsafe_session_id() {
+                    Some(session_id) => ResumePointLifecycleV2::Unsafe {
+                        enrollment_generation: live.generation(),
+                        enrollment_head: live.head(),
+                        session_id,
+                    },
+                    None => {
+                        return Err(ResumePointError::BindingRefused(
+                            "same-session admission did not carry an Unsafe enrollment",
+                        ))
+                    }
+                };
+                if self.lifecycle != expected {
                     return Err(ResumePointError::BindingRefused(
                         "the point does not name the live enrollment record and session",
                     ));
                 }
             }
+            ResumeEnrollmentAdmission::SameSafe(live) => {
+                if !live.is_safe()
+                    || self.lifecycle
+                        != (ResumePointLifecycleV2::Safe {
+                            enrollment_generation: live.generation(),
+                            enrollment_head: live.head(),
+                        })
+                {
+                    return Err(ResumePointError::BindingRefused(
+                        "the point does not name the live Safe enrollment record",
+                    ));
+                }
+            }
             ResumeEnrollmentAdmission::SupersededBy(live) => {
-                if self.enrollment_generation >= live.generation
-                    || self.enrollment_head == live.head
-                    || self.unsafe_session_id == live.unsafe_session_id
+                let (generation, head, session) = match self.lifecycle {
+                    ResumePointLifecycleV2::Unsafe {
+                        enrollment_generation,
+                        enrollment_head,
+                        session_id,
+                    } => (enrollment_generation, enrollment_head, Some(session_id)),
+                    ResumePointLifecycleV2::Safe {
+                        enrollment_generation,
+                        enrollment_head,
+                    } => (enrollment_generation, enrollment_head, None),
+                };
+                if generation >= live.generation()
+                    || head == live.head()
+                    || session.is_some_and(|session| live.unsafe_session_id() == Some(session))
                 {
                     return Err(ResumePointError::BindingRefused(
                         "the point does not predate the enrollment record that superseded it",
@@ -552,11 +599,28 @@ impl RuntimeResumePointV1 {
         self.history_latest_batch_id
     }
 
-    pub(crate) const fn enrollment(&self) -> ResumePointEnrollment {
-        ResumePointEnrollment {
-            generation: self.enrollment_generation,
-            head: self.enrollment_head,
-            unsafe_session_id: self.unsafe_session_id,
+    pub(crate) const fn is_unsafe_bound(&self) -> bool {
+        matches!(self.lifecycle, ResumePointLifecycleV2::Unsafe { .. })
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn enrollment(&self) -> ResumePointEnrollmentBinding {
+        match self.lifecycle {
+            ResumePointLifecycleV2::Unsafe {
+                enrollment_generation,
+                enrollment_head,
+                session_id,
+            } => ResumePointEnrollmentBinding::unsafe_for_test(
+                enrollment_generation,
+                enrollment_head,
+                session_id,
+            ),
+            ResumePointLifecycleV2::Safe {
+                enrollment_generation,
+                enrollment_head,
+            } => {
+                ResumePointEnrollmentBinding::safe_for_test(enrollment_generation, enrollment_head)
+            }
         }
     }
 
@@ -606,15 +670,15 @@ impl RuntimeResumePointV1 {
 /// Storage-layer and format tests need records that no live engine would
 /// produce — a foreign workspace, a substituted history root, a superseded
 /// session. Production has exactly one construction route
-/// ([`RuntimeResumePointV1::seal`]), and keeping these behind `cfg(test)` is
+/// ([`RuntimeResumePointV2::seal`]), and keeping these behind `cfg(test)` is
 /// what stops "a test needed a mutable field" from turning back into the open
 /// constructor the fence exists to remove.
 #[cfg(test)]
-impl RuntimeResumePointV1 {
+impl RuntimeResumePointV2 {
     /// One empty-rooted record, for tests with no live engine to snapshot.
     pub(crate) fn empty_rooted_for_test(
         binding: &ResumePointEndpointBinding,
-        enrollment: ResumePointEnrollment,
+        enrollment: ResumePointEnrollmentBinding,
         history: (u64, ContentDigest, BatchId),
         scratch: (Uuid, ContentDigest),
     ) -> Self {
@@ -625,9 +689,17 @@ impl RuntimeResumePointV1 {
             history_generation: history.0,
             history_index_root: history.1,
             history_latest_batch_id: history.2,
-            enrollment_generation: enrollment.generation,
-            enrollment_head: enrollment.head,
-            unsafe_session_id: enrollment.unsafe_session_id,
+            lifecycle: match enrollment.unsafe_session_id() {
+                Some(session_id) => ResumePointLifecycleV2::Unsafe {
+                    enrollment_generation: enrollment.generation(),
+                    enrollment_head: enrollment.head(),
+                    session_id,
+                },
+                None => ResumePointLifecycleV2::Safe {
+                    enrollment_generation: enrollment.generation(),
+                    enrollment_head: enrollment.head(),
+                },
+            },
             scratch_run_id: scratch.0,
             scratch_binding_digest: scratch.1,
             scratch_roots: ScratchRoots::default(),
@@ -668,10 +740,21 @@ impl RuntimeResumePointV1 {
         self
     }
 
-    pub(crate) fn with_enrollment_for_test(mut self, enrollment: ResumePointEnrollment) -> Self {
-        self.enrollment_generation = enrollment.generation;
-        self.enrollment_head = enrollment.head;
-        self.unsafe_session_id = enrollment.unsafe_session_id;
+    pub(crate) fn with_enrollment_for_test(
+        mut self,
+        enrollment: ResumePointEnrollmentBinding,
+    ) -> Self {
+        self.lifecycle = match enrollment.unsafe_session_id() {
+            Some(session_id) => ResumePointLifecycleV2::Unsafe {
+                enrollment_generation: enrollment.generation(),
+                enrollment_head: enrollment.head(),
+                session_id,
+            },
+            None => ResumePointLifecycleV2::Safe {
+                enrollment_generation: enrollment.generation(),
+                enrollment_head: enrollment.head(),
+            },
+        };
         self
     }
 
@@ -701,7 +784,7 @@ pub(crate) use authenticated::AuthenticatedResumePoint;
 /// Same discipline as [`reachability`], for the same reason: the type is the
 /// authority boundary, so the surface that can mint one has to be small enough
 /// to review in one screen. The tuple field is private to this module, so the
-/// only route to a witness is [`RuntimeResumePointV1::authenticate`] — anything
+/// only route to a witness is [`RuntimeResumePointV2::authenticate`] — anything
 /// else is `E0616`, a compile error, not a convention.
 mod authenticated {
     use super::*;
@@ -714,14 +797,14 @@ mod authenticated {
     /// the sealed conversion back into the engine snapshot, and the engine then
     /// re-proves the run, the durable descent and every run-local root from
     /// bytes before it reuses anything.
-    pub(crate) struct AuthenticatedResumePoint<'a>(&'a RuntimeResumePointV1);
+    pub(crate) struct AuthenticatedResumePoint<'a>(&'a RuntimeResumePointV2);
 
     impl<'a> AuthenticatedResumePoint<'a> {
-        pub(super) const fn seal(point: &'a RuntimeResumePointV1) -> Self {
+        pub(super) const fn seal(point: &'a RuntimeResumePointV2) -> Self {
             Self(point)
         }
 
-        pub(crate) const fn point(&self) -> &RuntimeResumePointV1 {
+        pub(crate) const fn point(&self) -> &RuntimeResumePointV2 {
             self.0
         }
 
@@ -729,7 +812,7 @@ mod authenticated {
         ///
         /// The conversion is total and lossless by construction: every member
         /// of `RuntimeResumeSnapshot` has a field of this record, and
-        /// [`RuntimeResumePointV1::seal`] filled every one of them from the
+        /// [`RuntimeResumePointV2::seal`] filled every one of them from the
         /// emitting engine's own snapshot. That is what makes "a valid record
         /// reconstructs the snapshot the engine emitted" an equality rather
         /// than an approximation.
@@ -739,7 +822,7 @@ mod authenticated {
     }
 }
 
-impl RuntimeResumePointV1 {
+impl RuntimeResumePointV2 {
     /// Representation invariants that hold independently of any archive.
     pub(crate) fn validate(&self) -> Result<(), ResumePointError> {
         if self.resume_sequence == 0 {
@@ -769,7 +852,7 @@ impl RuntimeResumePointV1 {
     fn encode_bounded(&self, limit: u64) -> Result<Vec<u8>, ResumePointError> {
         self.validate()?;
         let payload = encode_canonical(self)?;
-        let sealed = SealedResumePointV1 {
+        let sealed = SealedResumePointV2 {
             schema_version: RESUME_POINT_SCHEMA_VERSION,
             payload_digest: ContentDigest::of(&payload),
             payload,
@@ -790,7 +873,7 @@ impl RuntimeResumePointV1 {
                 limit: MAX_RESUME_POINT_BYTES,
             });
         }
-        let sealed: SealedResumePointV1 = decode_canonical(
+        let sealed: SealedResumePointV2 = decode_canonical(
             bytes,
             "sealed resume-point envelope does not decode",
             "sealed resume-point envelope is not canonical",
@@ -989,7 +1072,7 @@ impl ResumePointMaintenance {
 #[derive(Debug)]
 pub(crate) struct ResumePointScan {
     /// Ascending by `resume_sequence`.
-    points: Vec<RuntimeResumePointV1>,
+    points: Vec<RuntimeResumePointV2>,
     /// Ascending by name.
     residue: Vec<UnrecognizedResumePointEntry>,
 }
@@ -1049,7 +1132,7 @@ impl ResumePointScan {
     }
 
     /// Recognized canonical points, ascending by sequence.
-    pub(crate) fn points(&self) -> &[RuntimeResumePointV1] {
+    pub(crate) fn points(&self) -> &[RuntimeResumePointV2] {
         &self.points
     }
 
@@ -1095,7 +1178,7 @@ impl ResumePointScan {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ResumePointSet {
     /// Ascending by `resume_sequence`.
-    points: Vec<RuntimeResumePointV1>,
+    points: Vec<RuntimeResumePointV2>,
 }
 
 impl ResumePointSet {
@@ -1104,12 +1187,12 @@ impl ResumePointSet {
         ResumePointScan::survey_directory(dir)?.into_set()
     }
 
-    pub(crate) fn points(&self) -> &[RuntimeResumePointV1] {
+    pub(crate) fn points(&self) -> &[RuntimeResumePointV2] {
         &self.points
     }
 
     /// The highest-sequence validated point, if any.
-    pub(crate) fn latest(&self) -> Option<&RuntimeResumePointV1> {
+    pub(crate) fn latest(&self) -> Option<&RuntimeResumePointV2> {
         self.points.last()
     }
 
@@ -1126,7 +1209,7 @@ impl ResumePointSet {
 
 /// The sequence one publication would use next, given the recognized points.
 pub(crate) fn next_resume_sequence(
-    points: &[RuntimeResumePointV1],
+    points: &[RuntimeResumePointV2],
 ) -> Result<u64, ResumePointError> {
     match points.last() {
         None => Ok(1),
@@ -1153,23 +1236,22 @@ pub(crate) fn prune_resume_points_below(
     remove_matching_points(dir, |point| point.resume_sequence < keep)
 }
 
-/// Remove every *recognized* point, then make the removal durable.
+/// Remove every *recognized Unsafe-bound* point, then make the removal durable.
 ///
-/// This is the `Unsafe -> Safe` drain. Afterwards no recognized point names a
-/// retained run, which is what would let reclamation collect one — but only if
-/// the directory was also residue-free, because reclamation needs the strict
-/// [`ResumePointSet`] proof and residue still denies it. A drain that leaves
-/// residue therefore leaks retained runs, which is the correct trade: the
-/// handoff proceeds and no unproven bytes are deleted.
+/// This is the `Unsafe -> Safe` drain. A Safe-bound point from a prior clean
+/// lifecycle remains recognized evidence, but it cannot authenticate against
+/// the new exact Safe enrollment head. Unrecognized residue is also preserved
+/// and still denies the strict [`ResumePointSet`] proof, so no unproved
+/// reachability can authorize reclamation.
 pub(crate) fn clear_resume_points_in(
     dir: &Dir,
 ) -> Result<ResumePointMaintenance, ResumePointError> {
-    remove_matching_points(dir, |_| true)
+    remove_matching_points(dir, RuntimeResumePointV2::is_unsafe_bound)
 }
 
 fn remove_matching_points(
     dir: &Dir,
-    select: impl Fn(&RuntimeResumePointV1) -> bool,
+    select: impl Fn(&RuntimeResumePointV2) -> bool,
 ) -> Result<ResumePointMaintenance, ResumePointError> {
     let scan = ResumePointScan::survey_directory(dir)?;
     let mut removed = 0;
@@ -1208,13 +1290,13 @@ fn recognize_point_entry(
     dir: &Dir,
     entry: &cap_std::fs::DirEntry,
     name: &str,
-) -> Result<RuntimeResumePointV1, ResumePointError> {
+) -> Result<RuntimeResumePointV2, ResumePointError> {
     let sequence = parse_resume_point_name(name)
         .ok_or_else(|| ResumePointError::UnexpectedEntry(name.to_owned()))?;
     require_regular_point_entry(entry, name)?;
     let bytes = read_optional_regular(dir, name, MAX_RESUME_POINT_BYTES, None)?
         .ok_or_else(|| ResumePointError::UnexpectedEntry(name.to_owned()))?;
-    let point = RuntimeResumePointV1::decode(&bytes)?;
+    let point = RuntimeResumePointV2::decode(&bytes)?;
     if point.resume_sequence != sequence {
         return Err(ResumePointError::NameMismatch {
             named: sequence,
@@ -1316,16 +1398,18 @@ mod tests {
         rebuilt
     }
 
-    fn point(sequence: u64) -> RuntimeResumePointV1 {
-        RuntimeResumePointV1 {
+    fn point(sequence: u64) -> RuntimeResumePointV2 {
+        RuntimeResumePointV2 {
             resume_sequence: sequence,
             workspace_id: WorkspaceId::from_uuid(Uuid::from_u128(0x9001)),
             promoted_state_digest: digest(0x11),
             history_generation: 7,
             history_index_root: digest(0x22),
-            enrollment_generation: 3,
-            enrollment_head: digest(0x33),
-            unsafe_session_id: SessionId::from_uuid(Uuid::from_u128(0x9002)),
+            lifecycle: ResumePointLifecycleV2::Unsafe {
+                enrollment_generation: 3,
+                enrollment_head: digest(0x33),
+                session_id: SessionId::from_uuid(Uuid::from_u128(0x9002)),
+            },
             scratch_run_id: Uuid::from_u128(0x9003),
             scratch_binding_digest: digest(0x44),
             scratch_roots: ScratchRoots::default(),
@@ -1341,9 +1425,9 @@ mod tests {
     }
 
     /// One single-field mutation of the reference point, per payload field.
-    fn field_mutations() -> Vec<(&'static str, RuntimeResumePointV1)> {
+    fn field_mutations() -> Vec<(&'static str, RuntimeResumePointV2)> {
         let mut mutations = Vec::new();
-        let mut with = |label: &'static str, mutate: fn(&mut RuntimeResumePointV1)| {
+        let mut with = |label: &'static str, mutate: fn(&mut RuntimeResumePointV2)| {
             let mut mutated = point(1);
             mutate(&mut mutated);
             mutations.push((label, mutated));
@@ -1359,10 +1443,32 @@ mod tests {
         with("history_index_root", |p| {
             p.history_index_root = digest(0x23)
         });
-        with("enrollment_generation", |p| p.enrollment_generation = 4);
-        with("enrollment_head", |p| p.enrollment_head = digest(0x34));
-        with("unsafe_session_id", |p| {
-            p.unsafe_session_id = SessionId::from_uuid(Uuid::from_u128(0x9102));
+        with("lifecycle_generation", |p| {
+            p.lifecycle = ResumePointLifecycleV2::Unsafe {
+                enrollment_generation: 4,
+                enrollment_head: digest(0x33),
+                session_id: SessionId::from_uuid(Uuid::from_u128(0x9002)),
+            };
+        });
+        with("lifecycle_head", |p| {
+            p.lifecycle = ResumePointLifecycleV2::Unsafe {
+                enrollment_generation: 3,
+                enrollment_head: digest(0x34),
+                session_id: SessionId::from_uuid(Uuid::from_u128(0x9002)),
+            };
+        });
+        with("lifecycle_session", |p| {
+            p.lifecycle = ResumePointLifecycleV2::Unsafe {
+                enrollment_generation: 3,
+                enrollment_head: digest(0x33),
+                session_id: SessionId::from_uuid(Uuid::from_u128(0x9102)),
+            };
+        });
+        with("lifecycle_tag", |p| {
+            p.lifecycle = ResumePointLifecycleV2::Safe {
+                enrollment_generation: 3,
+                enrollment_head: digest(0x33),
+            };
         });
         with("scratch_run_id", |p| {
             p.scratch_run_id = Uuid::from_u128(0x9103);
@@ -1398,15 +1504,15 @@ mod tests {
         mutations
     }
 
-    fn seal(bytes: &[u8]) -> SealedResumePointV1 {
+    fn seal(bytes: &[u8]) -> SealedResumePointV2 {
         postcard::from_bytes(bytes).unwrap()
     }
 
-    fn reseal(sealed: &SealedResumePointV1) -> Vec<u8> {
+    fn reseal(sealed: &SealedResumePointV2) -> Vec<u8> {
         postcard::to_allocvec(sealed).unwrap()
     }
 
-    fn publish(dir: &Path, point: &RuntimeResumePointV1) {
+    fn publish(dir: &Path, point: &RuntimeResumePointV2) {
         std::fs::write(dir.join(point.file_name()), point.encode().unwrap()).unwrap();
     }
 
@@ -1414,7 +1520,7 @@ mod tests {
     fn canonical_encoding_round_trips_every_field() {
         let original = point(1);
         let bytes = original.encode().unwrap();
-        let decoded = RuntimeResumePointV1::decode(&bytes).unwrap();
+        let decoded = RuntimeResumePointV2::decode(&bytes).unwrap();
         assert_eq!(decoded, original);
         assert_eq!(decoded.encode().unwrap(), bytes);
     }
@@ -1432,7 +1538,7 @@ mod tests {
                 reference_digest,
                 "{label} is outside the payload digest"
             );
-            assert_eq!(RuntimeResumePointV1::decode(&bytes).unwrap(), mutated);
+            assert_eq!(RuntimeResumePointV2::decode(&bytes).unwrap(), mutated);
         }
     }
 
@@ -1448,7 +1554,7 @@ mod tests {
     fn the_lifecycle_fields_cost_a_constant_and_keep_the_record_bounded() {
         let original = point(1);
         let bytes = original.encode().unwrap();
-        let decoded = RuntimeResumePointV1::decode(&bytes).unwrap();
+        let decoded = RuntimeResumePointV2::decode(&bytes).unwrap();
         assert_eq!(
             decoded.history_latest_batch_id(),
             original.history_latest_batch_id()
@@ -1477,7 +1583,7 @@ mod tests {
 
     /// The authority a live open re-proves a point against. Built from the
     /// point itself so each refusal test perturbs exactly one fact.
-    fn adoption_authority(point: &RuntimeResumePointV1) -> ResumeAdoptionAuthority {
+    fn adoption_authority(point: &RuntimeResumePointV2) -> ResumeAdoptionAuthority {
         ResumeAdoptionAuthority::for_test(
             point.workspace_id(),
             crate::oplog::ProjectionEndpointId::from_uuid(Uuid::from_u128(0x9500)),
@@ -1491,7 +1597,7 @@ mod tests {
         )
     }
 
-    fn refusal(point: &RuntimeResumePointV1, authority: &ResumeAdoptionAuthority) -> &'static str {
+    fn refusal(point: &RuntimeResumePointV2, authority: &ResumeAdoptionAuthority) -> &'static str {
         match point.authenticate(authority) {
             Ok(_) => panic!("the conversion accepted a point it must refuse"),
             Err(ResumePointError::BindingRefused(reason)) => reason,
@@ -1616,7 +1722,8 @@ mod tests {
         );
     }
 
-    /// Enrollment evidence, in both admissible directions.
+    /// Enrollment evidence, for exact Unsafe, exact Safe, and the retained
+    /// lower-level supersession shape.
     ///
     /// Getting either direction wrong is a real fault: requiring an exact match
     /// would refuse every post-takeover adoption, and accepting anything would
@@ -1644,18 +1751,21 @@ mod tests {
             .authenticate(&with(ResumeEnrollmentAdmission::SameSession(live)))
             .is_ok());
         for wrong in [
-            ResumePointEnrollment {
-                generation: live.generation + 1,
-                ..live
-            },
-            ResumePointEnrollment {
-                head: digest(0xb1),
-                ..live
-            },
-            ResumePointEnrollment {
-                unsafe_session_id: SessionId::from_uuid(Uuid::from_u128(0x9601)),
-                ..live
-            },
+            ResumePointEnrollmentBinding::unsafe_for_test(
+                live.generation() + 1,
+                live.head(),
+                live.unsafe_session_id().unwrap(),
+            ),
+            ResumePointEnrollmentBinding::unsafe_for_test(
+                live.generation(),
+                digest(0xb1),
+                live.unsafe_session_id().unwrap(),
+            ),
+            ResumePointEnrollmentBinding::unsafe_for_test(
+                live.generation(),
+                live.head(),
+                SessionId::from_uuid(Uuid::from_u128(0x9601)),
+            ),
         ] {
             assert_eq!(
                 refusal(&point, &with(ResumeEnrollmentAdmission::SameSession(wrong))),
@@ -1663,32 +1773,66 @@ mod tests {
             );
         }
 
+        // Clean restart: Safe is explicitly tagged, carries no session, and
+        // must match generation and head exactly.
+        let safe_binding =
+            ResumePointEnrollmentBinding::safe_for_test(live.generation() + 1, digest(0xb0));
+        let safe_point = point.clone().with_enrollment_for_test(safe_binding);
+        assert!(safe_point
+            .authenticate(&with(ResumeEnrollmentAdmission::SameSafe(safe_binding)))
+            .is_ok());
+        for wrong in [
+            ResumePointEnrollmentBinding::safe_for_test(
+                safe_binding.generation() + 1,
+                safe_binding.head(),
+            ),
+            ResumePointEnrollmentBinding::safe_for_test(safe_binding.generation(), digest(0xb9)),
+        ] {
+            assert_eq!(
+                refusal(
+                    &safe_point,
+                    &with(ResumeEnrollmentAdmission::SameSafe(wrong))
+                ),
+                "the point does not name the live Safe enrollment record"
+            );
+        }
+        assert_eq!(
+            refusal(
+                &point,
+                &with(ResumeEnrollmentAdmission::SameSafe(safe_binding))
+            ),
+            "the point does not name the live Safe enrollment record"
+        );
+
         // Takeover: the point must strictly predate the successor record and
         // must claim neither its head nor its session.
-        let successor = ResumePointEnrollment {
-            generation: live.generation + 1,
-            head: digest(0xb2),
-            unsafe_session_id: SessionId::from_uuid(Uuid::from_u128(0x9602)),
-        };
+        let successor = ResumePointEnrollmentBinding::unsafe_for_test(
+            live.generation() + 1,
+            digest(0xb2),
+            SessionId::from_uuid(Uuid::from_u128(0x9602)),
+        );
         assert!(point
             .authenticate(&with(ResumeEnrollmentAdmission::SupersededBy(successor)))
             .is_ok());
         for not_superseded in [
             // Same generation: nothing superseded anything.
-            ResumePointEnrollment {
-                generation: live.generation,
-                ..successor
-            },
+            ResumePointEnrollmentBinding::unsafe_for_test(
+                live.generation(),
+                successor.head(),
+                successor.unsafe_session_id().unwrap(),
+            ),
             // A successor that claims the point's own head or session is not a
             // successor at all.
-            ResumePointEnrollment {
-                head: live.head,
-                ..successor
-            },
-            ResumePointEnrollment {
-                unsafe_session_id: live.unsafe_session_id,
-                ..successor
-            },
+            ResumePointEnrollmentBinding::unsafe_for_test(
+                successor.generation(),
+                live.head(),
+                successor.unsafe_session_id().unwrap(),
+            ),
+            ResumePointEnrollmentBinding::unsafe_for_test(
+                successor.generation(),
+                successor.head(),
+                live.unsafe_session_id().unwrap(),
+            ),
         ] {
             assert_eq!(
                 refusal(
@@ -1734,7 +1878,7 @@ mod tests {
         // byte-equality above. This catches a payload member that started
         // carrying path- or name-derived state, which would move the size at
         // one of the two roots and not the other.
-        assert_eq!(bytes.len(), 3_293, "the empty-rooted record's size moved");
+        assert_eq!(bytes.len(), 3_294, "the empty-rooted record's size moved");
 
         for (label, dir) in [("plain", &plain), ("nested", &nested)] {
             let set = ResumePointSet::read(dir).unwrap();
@@ -1781,7 +1925,7 @@ mod tests {
         let mut sealed = seal(&bytes);
         sealed.payload_digest = digest(0xff);
         assert!(matches!(
-            RuntimeResumePointV1::decode(&reseal(&sealed)),
+            RuntimeResumePointV2::decode(&reseal(&sealed)),
             Err(ResumePointError::Malformed(_))
         ));
     }
@@ -1792,10 +1936,21 @@ mod tests {
         let mut sealed = seal(&bytes);
         sealed.schema_version = RESUME_POINT_SCHEMA_VERSION + 1;
         assert_eq!(
-            RuntimeResumePointV1::decode(&reseal(&sealed)),
+            RuntimeResumePointV2::decode(&reseal(&sealed)),
             Err(ResumePointError::UnsupportedSchema(
                 RESUME_POINT_SCHEMA_VERSION + 1
             ))
+        );
+    }
+
+    #[test]
+    fn the_schema_one_unsafe_only_record_is_fenced_instead_of_reinterpreted() {
+        let bytes = point(1).encode().unwrap();
+        let mut sealed = seal(&bytes);
+        sealed.schema_version = 1;
+        assert_eq!(
+            RuntimeResumePointV2::decode(&reseal(&sealed)),
+            Err(ResumePointError::UnsupportedSchema(1))
         );
     }
 
@@ -1806,7 +1961,7 @@ mod tests {
         sealed.payload.push(0);
         sealed.payload_digest = ContentDigest::of(&sealed.payload);
         assert!(matches!(
-            RuntimeResumePointV1::decode(&reseal(&sealed)),
+            RuntimeResumePointV2::decode(&reseal(&sealed)),
             Err(ResumePointError::Malformed(_))
         ));
     }
@@ -1816,7 +1971,7 @@ mod tests {
         let mut bytes = point(1).encode().unwrap();
         bytes.push(0);
         assert!(matches!(
-            RuntimeResumePointV1::decode(&bytes),
+            RuntimeResumePointV2::decode(&bytes),
             Err(ResumePointError::Malformed(_))
         ));
     }
@@ -1826,7 +1981,7 @@ mod tests {
         let bytes = point(1).encode().unwrap();
         for cut in [0, 1, bytes.len() / 2, bytes.len() - 1] {
             assert!(
-                RuntimeResumePointV1::decode(&bytes[..cut]).is_err(),
+                RuntimeResumePointV2::decode(&bytes[..cut]).is_err(),
                 "a {cut}-byte prefix decoded"
             );
         }
@@ -1897,7 +2052,7 @@ mod tests {
     #[test]
     fn the_widest_encodable_record_fits_the_ceiling() {
         let key_bytes = crate::oplog::scratch_store::MAX_CARRIED_SCRATCH_KEY_BYTES;
-        let saturated = RuntimeResumePointV1 {
+        let saturated = RuntimeResumePointV2 {
             scratch_roots: ScratchRoots::saturated_for_test(key_bytes),
             block_claim_root: BlockClaimIndexRoot::saturated_for_test(),
             accepted_frontier_root: AcceptedFrontierRoot::saturated_for_test(key_bytes),
@@ -1928,7 +2083,7 @@ mod tests {
         // Read is bounded by the same constant, so the widest record the writer
         // can produce is also readable — otherwise the ceiling would be a
         // write/read asymmetry that strands a legitimate point on disk.
-        assert_eq!(RuntimeResumePointV1::decode(&bytes).unwrap(), saturated);
+        assert_eq!(RuntimeResumePointV2::decode(&bytes).unwrap(), saturated);
     }
 
     #[test]
@@ -2459,7 +2614,7 @@ mod tests {
             ("clear_resume_points_in", "clear_resume_points"),
             ("next_resume_sequence", "mint_resume_point"),
             ("census_retained_runs", "plan_engine_scratch_retention"),
-            ("RuntimeResumePointV1", "mint_resume_point"),
+            ("RuntimeResumePointV2", "mint_resume_point"),
             ("AuthenticatedResumePoint", "read_resume_adoption_candidate"),
             ("ResumePointEndpointBinding", "mint_resume_point"),
             ("ResumeAdoptionAuthority", "read_resume_adoption_candidate"),
@@ -2482,7 +2637,8 @@ mod tests {
             "pub(crate) fn read_resume_adoption_candidate(",
             "pub(crate) fn plan_engine_scratch_retention(",
             "pub(crate) fn reclaim_retained_runs_after_publication(",
-            "pub(crate) fn clear_resume_points(",
+            "pub(crate) fn begin_safe_transition",
+            "pub(crate) fn clear_unsafe_resume_points(",
             "fn read_resume_point_set(",
         ] {
             assert!(
@@ -2535,13 +2691,15 @@ mod tests {
     }
 
     #[test]
-    fn clear_removes_every_point() {
+    fn clear_removes_only_recognized_unsafe_points_and_preserves_safe_evidence() {
         let root = resume_root("clear");
         let dir = open_root(&root);
         publish(&root, &point(1));
-        publish(&root, &point(2));
-        assert_eq!(clear_resume_points_in(&dir).unwrap().removed, 2);
-        assert!(ResumePointSet::read(&dir).unwrap().points().is_empty());
+        let safe = point(2)
+            .with_enrollment_for_test(ResumePointEnrollmentBinding::safe_for_test(8, digest(0xc1)));
+        publish(&root, &safe);
+        assert_eq!(clear_resume_points_in(&dir).unwrap().removed, 1);
+        assert_eq!(ResumePointSet::read(&dir).unwrap().points(), &[safe]);
         assert_eq!(clear_resume_points_in(&dir).unwrap().removed, 0);
         std::fs::remove_dir_all(root).unwrap();
     }

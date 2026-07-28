@@ -2002,6 +2002,69 @@ pub(crate) enum LocalActiveSync {
     Published,
 }
 
+/// Exact, freshly authenticated enrollment evidence carried by one runtime
+/// resume point.
+///
+/// The fields and lifecycle representation are private to this module. A
+/// lifecycle caller can obtain the value only from a [`CommittedLocalActive`]
+/// that this module minted after an authenticated readback; it cannot invent a
+/// generation, head, session, or a synthetic session for `Safe`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ResumePointEnrollmentBinding {
+    generation: u64,
+    head: ContentDigest,
+    lifecycle: ResumePointEnrollmentLifecycle,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResumePointEnrollmentLifecycle {
+    Unsafe { session_id: SessionId },
+    Safe,
+}
+
+impl ResumePointEnrollmentBinding {
+    pub(crate) const fn generation(self) -> u64 {
+        self.generation
+    }
+
+    pub(crate) const fn head(self) -> ContentDigest {
+        self.head
+    }
+
+    pub(crate) const fn unsafe_session_id(self) -> Option<SessionId> {
+        match self.lifecycle {
+            ResumePointEnrollmentLifecycle::Unsafe { session_id } => Some(session_id),
+            ResumePointEnrollmentLifecycle::Safe => None,
+        }
+    }
+
+    pub(crate) const fn is_safe(self) -> bool {
+        matches!(self.lifecycle, ResumePointEnrollmentLifecycle::Safe)
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn unsafe_for_test(
+        generation: u64,
+        head: ContentDigest,
+        session_id: SessionId,
+    ) -> Self {
+        Self {
+            generation,
+            head,
+            lifecycle: ResumePointEnrollmentLifecycle::Unsafe { session_id },
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn safe_for_test(generation: u64, head: ContentDigest) -> Self {
+        Self {
+            generation,
+            head,
+            lifecycle: ResumePointEnrollmentLifecycle::Safe,
+        }
+    }
+}
+
 /// Freshly reopened committed `LocalActive` enrollment state.
 ///
 /// This type is minted only by this module, only after reading the committed
@@ -2046,6 +2109,24 @@ impl CommittedLocalActive {
         match self.handoff {
             LocalActiveHandoff::Unsafe { session_id } => Some(session_id),
             LocalActiveHandoff::Safe => None,
+        }
+    }
+
+    /// Bind a resume point to this exact authenticated lifecycle record.
+    ///
+    /// `Safe` has no session identity. Keeping the construction here prevents
+    /// a caller from encoding it with a sentinel or otherwise hand-building
+    /// lifecycle evidence.
+    pub(crate) const fn resume_point_binding(&self) -> ResumePointEnrollmentBinding {
+        ResumePointEnrollmentBinding {
+            generation: self.generation,
+            head: self.enrollment_head,
+            lifecycle: match self.handoff {
+                LocalActiveHandoff::Unsafe { session_id } => {
+                    ResumePointEnrollmentLifecycle::Unsafe { session_id }
+                }
+                LocalActiveHandoff::Safe => ResumePointEnrollmentLifecycle::Safe,
+            },
         }
     }
 

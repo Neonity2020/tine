@@ -215,7 +215,7 @@
 //!
 //! A promoted open may reuse the run-local engine state a previous session left
 //! behind instead of replaying the whole authenticated history. The entire
-//! lifecycle lives inside this module's two boundaries, and every step of it is
+//! lifecycle lives inside this module's sealed boundaries, and every step is
 //! dominated by the one archive-rooted workspace lease this runtime holds:
 //!
 //! 1. **Open.** [`mint_promoted_runtime`] takes the lease, authenticates the
@@ -232,12 +232,15 @@
 //!    startup and without changing one candidate byte. An `Ephemeral` retention
 //!    plan means the archive cannot currently prove a retained run collectable,
 //!    so this open takes a disposable run and adds nothing to the population.
-//! 3. **Publication.** [`PromotedLocalRuntime::publish_quiescent_resume_point`]
-//!    is the only mint. It runs the same device-local drain proof the `Safe`
-//!    handoff runs, reproves the lease immediately before the snapshot, and then
-//!    goes `runtime_resume_snapshot -> mint_resume_point -> publish_resume_point`
-//!    in that order.
-//! 4. **Reclamation.** Only the sealed `PublishedResumePoint` a successful
+//! 3. **Unsafe publication.**
+//!    [`PromotedLocalRuntime::publish_quiescent_resume_point`] and the narrower
+//!    post-open/pre-first-mutation operation mint exact Unsafe-bound evidence.
+//!    They run the same device-local drain proof as the Safe transaction and
+//!    reprove the lease immediately before the snapshot.
+//! 4. **Safe transaction.** [`PromotedLocalRuntime::quiesce_and_mark_safe`]
+//!    holds graph and watcher barriers through drain proof, clear-before-Safe,
+//!    durable Safe commit/readback, and report-only Safe-bound publication.
+//! 5. **Reclamation.** Only the sealed `PublishedResumePoint` a successful
 //!    publication mints authorizes deletion, and the pass reproves the lease
 //!    once more first. This is the only boundary in this module that can delete
 //!    archive bytes.
@@ -252,13 +255,12 @@
 //! surface, and neither is read by any admission path: the accelerator is
 //! absent from the keystroke, authoring, and acceptance paths entirely.
 //!
-//! **Required packet-9 neighbour.** A latched
-//! [`RuntimeRevocation`] is terminal by design, and the resume boundaries latch
-//! it exactly like every other. The typed result is deliberately sufficient for
-//! a startup/UI layer to react — [`PromotedLocalRuntime::workspace_authority_revocation`]
-//! names the boundary and the exact cause — but nothing in `tine-core` reopens
-//! or takes over automatically. The wiring packet must offer that reopen rather
-//! than the latch being weakened here.
+//! A proven pathname/file-identity replacement latches a terminal
+//! [`RuntimeRevocation`]; inability to perform an identity check refuses only
+//! that operation and remains retryable. Typed refusals distinguish the two,
+//! and [`PromotedLocalRuntime::workspace_authority_revocation`] gives a future
+//! startup/UI facade the terminal boundary and cause needed to reopen/take over
+//! automatically. Core deliberately does not implement that facade.
 //!
 //! Every new-architecture mutation, projection, import, coordinator, and
 //! reconciliation path requires a [`LocalRuntimeAdmission`] whose only
@@ -279,7 +281,8 @@ use super::enrollment::{
     VerifiedLocalCompositionError, VerifiedLocalEvidence, VerifiedLocalProofSet,
 };
 use super::hot_engine::{
-    EngineError, EngineOpenRetention, RuntimeResumeObservation, ShardedHotEngine,
+    EngineError, EngineOpenRetention, ProjectionStorageBinding, RuntimeResumeObservation,
+    ShardedHotEngine,
 };
 use super::import::InactiveBootstrapAcceptedAuthority;
 use super::object_store::{
@@ -288,11 +291,16 @@ use super::object_store::{
     RetainedRunMaintenanceReport, StoreError, PROMOTED_RUNTIME_STATE_SCHEMA_VERSION,
 };
 use super::projection_store::ProjectionReceiptStore;
-use super::resume_point::{ResumeEnrollmentAdmission, ResumePointEnrollment};
+use super::resume_point::{ResumeEnrollmentAdmission, ResumePointMaintenance};
 use super::sqlite::{
     ApplicationRuntimeRoot, LeasedWorkspaceProjection, OpenProjection, ProjectionClaim,
     ProjectionError, RebuildSource, SqliteFrontier, TailOverlay, VerifiedBootstrapSqliteProjection,
     WorkspaceLeaseIdentity, WorkspaceRuntimeLease,
+};
+use super::watcher_queue::{
+    WatcherDrain, WatcherDrainError, WatcherEpoch, WatcherHandle, WatcherHandoffError,
+    WatcherQueueLimits, WatcherQueueOwner, WatcherQueueStatus, WatcherQuiesceError,
+    WatcherSettlementError,
 };
 use super::{ContentDigest, ObjectStore, ProjectionEndpointBinding, SessionId, WorkspaceId};
 
@@ -457,6 +465,10 @@ impl From<VerifiedLocalCompositionError> for LocalActivationError {
 pub(crate) enum SafeHandoffUnavailable {
     Enrollment(VerifiedLocalCompositionError),
     Runtime(String),
+    WorkspaceAuthorityRevoked(RuntimeRevocation),
+    WorkspaceAuthorityCheckUnavailable(WorkspaceAuthorityRefusal),
+    Watcher(WatcherQuiesceError),
+    Store(String),
     /// A named device-local drain has outstanding work.
     DrainIncomplete {
         drain: &'static str,
@@ -473,6 +485,10 @@ impl fmt::Display for SafeHandoffUnavailable {
         match self {
             Self::Enrollment(error) => error.fmt(formatter),
             Self::Runtime(detail) => write!(formatter, "safe-handoff runtime error: {detail}"),
+            Self::WorkspaceAuthorityRevoked(revocation) => revocation.fmt(formatter),
+            Self::WorkspaceAuthorityCheckUnavailable(refusal) => refusal.fmt(formatter),
+            Self::Watcher(error) => write!(formatter, "safe-handoff watcher error: {error}"),
+            Self::Store(error) => write!(formatter, "safe-handoff resume-store error: {error}"),
             Self::DrainIncomplete { drain, detail } => {
                 write!(formatter, "{drain} drain is incomplete: {detail}")
             }
@@ -489,6 +505,32 @@ impl std::error::Error for SafeHandoffUnavailable {}
 impl From<VerifiedLocalCompositionError> for SafeHandoffUnavailable {
     fn from(error: VerifiedLocalCompositionError) -> Self {
         Self::Enrollment(error)
+    }
+}
+
+/// Durable result of the production Safe transaction.
+///
+/// `publication` is report-only. Once this value exists, `permit` proves Safe
+/// was committed and freshly reopened even when minting or publishing the
+/// accelerator failed; that failure costs only a full replay.
+#[derive(Debug)]
+pub(crate) struct SafeHandoffReceipt {
+    permit: SafeHandoffPermit,
+    cleared: ResumePointMaintenance,
+    publication: ResumePublicationStatus,
+}
+
+impl SafeHandoffReceipt {
+    pub(crate) const fn permit(&self) -> &SafeHandoffPermit {
+        &self.permit
+    }
+
+    pub(crate) const fn cleared(&self) -> &ResumePointMaintenance {
+        &self.cleared
+    }
+
+    pub(crate) const fn publication(&self) -> &ResumePublicationStatus {
+        &self.publication
     }
 }
 
@@ -904,7 +946,17 @@ impl LocalActiveAuthority {
 /// status. The revocation is carried structurally so a diagnosis names the
 /// boundary that first lost the workspace rather than a rendered string.
 fn refusal_into_publication(refusal: WorkspaceAuthorityRefusal) -> ResumePublicationRefusal {
-    ResumePublicationRefusal::WorkspaceAuthorityRevoked(refusal.revocation().clone())
+    match refusal.revocation() {
+        Some(revocation) => ResumePublicationRefusal::WorkspaceAuthorityRevoked(revocation.clone()),
+        None => ResumePublicationRefusal::WorkspaceAuthorityCheckUnavailable(refusal),
+    }
+}
+
+fn refusal_into_safe(refusal: WorkspaceAuthorityRefusal) -> SafeHandoffUnavailable {
+    match refusal.revocation() {
+        Some(revocation) => SafeHandoffUnavailable::WorkspaceAuthorityRevoked(revocation.clone()),
+        None => SafeHandoffUnavailable::WorkspaceAuthorityCheckUnavailable(refusal),
+    }
 }
 
 fn prove_device_local_drains(
@@ -1434,6 +1486,9 @@ pub(crate) enum RuntimePromotionError {
     /// latched [`RuntimeRevocation`]. Terminal: recovery is a fresh reopen or
     /// crash takeover, never this runtime.
     WorkspaceAuthorityRevoked(WorkspaceAuthorityRefusal),
+    /// The current operation could not perform the identity check. Retryable on
+    /// this runtime because no replacement was proved and no latch was set.
+    WorkspaceAuthorityCheckUnavailable(WorkspaceAuthorityRefusal),
 }
 
 impl fmt::Display for RuntimePromotionError {
@@ -1448,6 +1503,7 @@ impl fmt::Display for RuntimePromotionError {
                 write!(formatter, "promoted runtime anchor failed: {detail}")
             }
             Self::WorkspaceAuthorityRevoked(refusal) => refusal.fmt(formatter),
+            Self::WorkspaceAuthorityCheckUnavailable(refusal) => refusal.fmt(formatter),
         }
     }
 }
@@ -1456,7 +1512,11 @@ impl std::error::Error for RuntimePromotionError {}
 
 impl From<WorkspaceAuthorityRefusal> for RuntimePromotionError {
     fn from(refusal: WorkspaceAuthorityRefusal) -> Self {
-        Self::WorkspaceAuthorityRevoked(refusal)
+        if refusal.is_terminal() {
+            Self::WorkspaceAuthorityRevoked(refusal)
+        } else {
+            Self::WorkspaceAuthorityCheckUnavailable(refusal)
+        }
     }
 }
 
@@ -1775,6 +1835,10 @@ pub(crate) struct PromotedLocalRuntime {
     /// runtime drops.
     projection: LeasedWorkspaceProjection,
     tail: TailOverlay,
+    /// Core-owned watcher intake for this exact endpoint. Only a cloneable
+    /// intake handle escapes; the quiesce owner stays inseparable from the
+    /// runtime whose Safe transition it gates.
+    watcher: WatcherQueueOwner,
     /// Terminal, one-way. The first failed workspace-lease identity
     /// revalidation at any boundary latches here, and every later admission,
     /// window authorization, mutable-part handout, drain, coordinator phase
@@ -1787,6 +1851,8 @@ pub(crate) struct PromotedLocalRuntime {
     /// deletion surface, and neither is consulted by any admission path.
     resume_open: RuntimeResumeOpenStatus,
     resume_publication: Option<ResumePublicationStatus>,
+    /// Sealed post-open/pre-first-mutation publication window.
+    post_open_publication_available: bool,
     _seal: seal::Seal,
 }
 
@@ -1893,6 +1959,9 @@ pub(crate) enum ResumePublicationRefusal {
     /// The runtime has latched terminal workspace-authority revocation, or the
     /// lease reproof immediately before the publication failed and latched it.
     WorkspaceAuthorityRevoked(RuntimeRevocation),
+    /// The current operation could not perform the identity check. No
+    /// replacement was proved, so the runtime remains valid for a later retry.
+    WorkspaceAuthorityCheckUnavailable(WorkspaceAuthorityRefusal),
     /// The live authority, graph capability, or enrolled engine identity is not
     /// this runtime's.
     Runtime(String),
@@ -2030,13 +2099,14 @@ impl fmt::Display for RuntimeRevocation {
 
 /// One refused workspace-authority reproof.
 ///
-/// It names both the boundary that demanded the proof *now* and the terminal
-/// revocation the runtime is carrying, so a phase failure after the fact stays
-/// distinguishable from the phase that lost the lease.
+/// It names the boundary that demanded the proof *now*, the exact cause, and,
+/// only for a proven identity replacement, the terminal revocation the runtime
+/// carries. A transient inability to check has no revocation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct WorkspaceAuthorityRefusal {
     demanded_at: WorkspaceAuthorityBoundary,
-    revocation: RuntimeRevocation,
+    revocation: Option<RuntimeRevocation>,
+    cause: ProjectionError,
 }
 
 impl WorkspaceAuthorityRefusal {
@@ -2044,23 +2114,35 @@ impl WorkspaceAuthorityRefusal {
         self.demanded_at
     }
 
-    pub(crate) const fn revocation(&self) -> &RuntimeRevocation {
-        &self.revocation
+    pub(crate) const fn revocation(&self) -> Option<&RuntimeRevocation> {
+        self.revocation.as_ref()
     }
 
     pub(crate) const fn cause(&self) -> &ProjectionError {
-        self.revocation.cause()
+        &self.cause
+    }
+
+    pub(crate) const fn is_terminal(&self) -> bool {
+        self.revocation.is_some()
     }
 }
 
 impl fmt::Display for WorkspaceAuthorityRefusal {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "the {} refused: {}",
-            self.demanded_at.describe(),
-            self.revocation
-        )
+        match &self.revocation {
+            Some(revocation) => write!(
+                formatter,
+                "the {} refused: {}",
+                self.demanded_at.describe(),
+                revocation
+            ),
+            None => write!(
+                formatter,
+                "the {} could not revalidate workspace authority for this operation: {}",
+                self.demanded_at.describe(),
+                self.cause
+            ),
+        }
     }
 }
 
@@ -2108,23 +2190,37 @@ impl RuntimeRevocationLatch {
         match self.latched() {
             Some(revocation) => Err(WorkspaceAuthorityRefusal {
                 demanded_at,
-                revocation,
+                cause: revocation.cause.clone(),
+                revocation: Some(revocation),
             }),
             None => Ok(()),
         }
     }
 
     /// The one authority-changing shape: refuse if already revoked, otherwise
-    /// re-derive the lease identity and latch terminally the moment it fails.
-    fn reprove_with(
+    /// re-derive lease identity. A proven replacement latches terminally;
+    /// inability to perform the check refuses this operation without latching.
+    fn reprove_with<T>(
         &self,
         demanded_at: WorkspaceAuthorityBoundary,
-        revalidate: impl FnOnce() -> Result<(), ProjectionError>,
-    ) -> Result<(), WorkspaceAuthorityRefusal> {
+        revalidate: impl FnOnce() -> Result<T, ProjectionError>,
+    ) -> Result<T, WorkspaceAuthorityRefusal> {
         self.guard(demanded_at)?;
-        revalidate().map_err(|cause| WorkspaceAuthorityRefusal {
-            demanded_at,
-            revocation: self.revoke(demanded_at, cause),
+        revalidate().map_err(|cause| {
+            if matches!(cause, ProjectionError::LeaseIdentityUnavailable(_)) {
+                WorkspaceAuthorityRefusal {
+                    demanded_at,
+                    revocation: None,
+                    cause,
+                }
+            } else {
+                let revocation = self.revoke(demanded_at, cause);
+                WorkspaceAuthorityRefusal {
+                    demanded_at,
+                    cause: revocation.cause.clone(),
+                    revocation: Some(revocation),
+                }
+            }
         })
     }
 }
@@ -2438,6 +2534,10 @@ impl PromotedLocalRuntime {
         authority.reconcile_promoted_handoff(&mut self.enrollment)?;
         // The complete promoted binding, over the settled enrollment record.
         self.prove_binding(graph, authority, depth)?;
+        // The first admitted mutation closes the distinct post-open quiescent
+        // publication window. Ordinary admission still performs no watcher,
+        // resume-point, or filesystem work for this flag.
+        self.post_open_publication_available = false;
 
         let Self {
             state,
@@ -2475,6 +2575,179 @@ impl PromotedLocalRuntime {
             database,
             tail,
         })
+    }
+
+    /// Production Safe transaction over the graph and core-owned watcher
+    /// barriers.
+    ///
+    /// The graph reservation and watcher intake bar are continuous across the
+    /// drain proofs, workspace-lease reproof, clear-before-Safe, durable Safe
+    /// commit/readback, Safe-bound point publication, and witness-authorized
+    /// reclamation. No caller supplies lifecycle evidence or deletion proof.
+    pub(crate) fn quiesce_and_mark_safe(
+        &mut self,
+        authority: &mut LocalActiveAuthority,
+        graph: &Graph,
+    ) -> Result<SafeHandoffReceipt, SafeHandoffUnavailable> {
+        self.revocation
+            .guard(WorkspaceAuthorityBoundary::SafeHandoff)
+            .map_err(refusal_into_safe)?;
+        if authority.session_id != self.session_id
+            || authority.verification_digest != self.verification_digest
+        {
+            return Err(SafeHandoffUnavailable::Runtime(
+                "live authority is not this promoted runtime's session".into(),
+            ));
+        }
+        authority
+            .authenticate_runtime(graph, &self.engine)
+            .map_err(|error| SafeHandoffUnavailable::Runtime(error.to_string()))?;
+
+        // Exact barrier order: graph first, watcher second.
+        let graph_reservation = graph
+            .mint_handoff_safe(self.engine.workspace_id(), self.endpoint)
+            .map_err(|error| SafeHandoffUnavailable::Runtime(error.to_string()))?;
+        graph_reservation
+            .verify_binding(graph, self.engine.workspace_id(), self.endpoint)
+            .map_err(|error| SafeHandoffUnavailable::Runtime(error.to_string()))?;
+        let storage = ProjectionStorageBinding {
+            endpoint: self.endpoint,
+            receipt_store_id: self.state.receipt_store_id,
+        };
+        let watcher_guard = self
+            .watcher
+            .begin_quiesce(storage)
+            .map_err(SafeHandoffUnavailable::Watcher)?;
+        #[cfg(test)]
+        resume_lifecycle_cut_reached(ResumeLifecycleCut::AfterWatcherQuiesce);
+
+        let transaction = watcher_guard.commit_handoff(|watcher_proof| {
+            graph_reservation
+                .verify_binding(graph, self.engine.workspace_id(), self.endpoint)
+                .map_err(|error| SafeHandoffUnavailable::Runtime(error.to_string()))?;
+            prove_device_local_drains(&self.engine, self.projection.database(), &self.tail)?;
+            watcher_proof
+                .binding()
+                .eq(&storage)
+                .then_some(())
+                .ok_or_else(|| {
+                    SafeHandoffUnavailable::Runtime(
+                        "watcher quiesce proof changed endpoint binding".into(),
+                    )
+                })?;
+            prove_device_local_drains(&self.engine, self.projection.database(), &self.tail)?;
+
+            // Sticky workspace authority immediately before the first durable
+            // mutation of the transaction.
+            let (handoff, head) = {
+                let committed = self.enrollment.reauthenticate()?;
+                (committed.handoff(), committed.enrollment_head())
+            };
+            match handoff {
+                LocalActiveHandoff::Unsafe { session_id } if session_id == self.session_id => {}
+                LocalActiveHandoff::Unsafe { .. } => {
+                    return Err(SafeHandoffUnavailable::Enrollment(
+                        VerifiedLocalCompositionError::CompetingSession,
+                    ))
+                }
+                LocalActiveHandoff::Safe => {
+                    return Err(SafeHandoffUnavailable::Runtime(
+                        "committed handoff is already Safe for another drain".into(),
+                    ))
+                }
+            }
+            authority.enrollment_head = head;
+            authority.handoff = handoff;
+
+            let Some(archive) = self.engine.archive_store() else {
+                return Err(SafeHandoffUnavailable::Runtime(
+                    "promoted engine retained no archive capability".into(),
+                ));
+            };
+            let workspace_proof = self.projection.workspace_proof();
+            let workspace = self
+                .revocation
+                .reprove_with(WorkspaceAuthorityBoundary::SafeHandoff, || {
+                    workspace_proof.revalidate_archive(archive, self.engine.workspace_id())
+                })
+                .map_err(refusal_into_safe)?;
+            let (_history_capability, history) =
+                open_retained_history_control(archive, &self.state)
+                    .map_err(|error| SafeHandoffUnavailable::Store(error.to_string()))?;
+            let safe = history
+                .begin_safe_transition(archive, &workspace, &graph_reservation, watcher_proof)
+                .map_err(|error| SafeHandoffUnavailable::Store(error.to_string()))?;
+            // Load-bearing order: a clear failure returns here while enrollment
+            // is still exactly Unsafe. Recognized residue is reported and
+            // preserved; it does not become deletion authority.
+            #[cfg(test)]
+            resume_lifecycle_cut_reached(ResumeLifecycleCut::BeforeSafeClear);
+            let cleared = safe
+                .clear_unsafe_resume_points()
+                .map_err(|error| SafeHandoffUnavailable::Store(error.to_string()))?;
+            #[cfg(test)]
+            resume_lifecycle_cut_reached(ResumeLifecycleCut::AfterSafeClear);
+
+            let (head, verification_digest, safe_binding) = {
+                let committed = self
+                    .enrollment
+                    .transition_handoff(LocalActiveHandoff::Safe)?;
+                if committed.handoff() != LocalActiveHandoff::Safe
+                    || committed.sync() != LocalActiveSync::Idle
+                {
+                    return Err(SafeHandoffUnavailable::Runtime(
+                        "committed handoff state is not Safe+Idle after the transition".into(),
+                    ));
+                }
+                (
+                    committed.enrollment_head(),
+                    committed.verification_digest(),
+                    committed.resume_point_binding(),
+                )
+            };
+            // Fresh exact readback, still inside both barriers.
+            let reopened = self.enrollment.reauthenticate()?;
+            if reopened.enrollment_head() != head
+                || reopened.handoff() != LocalActiveHandoff::Safe
+                || reopened.resume_point_binding() != safe_binding
+            {
+                return Err(SafeHandoffUnavailable::Runtime(
+                    "freshly reopened enrollment is not the exact Safe record just committed"
+                        .into(),
+                ));
+            }
+            authority.enrollment_head = head;
+            authority.handoff = LocalActiveHandoff::Safe;
+            #[cfg(test)]
+            {
+                probe_graph_writer_while_safe(graph);
+                resume_lifecycle_cut_reached(ResumeLifecycleCut::AfterSafeCommit);
+            }
+
+            // Report-only after the Safe commit. Every failure below keeps Safe
+            // valid and merely removes the accelerator for the next restart.
+            let publication = self.publish_bound_resume_point(safe_binding);
+            self.resume_publication = Some(publication.clone());
+            Ok(SafeHandoffReceipt {
+                permit: SafeHandoffPermit {
+                    enrollment_head: head,
+                    verification_digest,
+                    session_id: self.session_id,
+                    _seal: seal::Seal,
+                },
+                cleared,
+                publication,
+            })
+        });
+        let result = match transaction {
+            Ok((receipt, _proof)) => Ok(receipt),
+            Err(WatcherHandoffError::Quiesce(error)) => Err(SafeHandoffUnavailable::Watcher(error)),
+            Err(WatcherHandoffError::Commit(error)) => Err(error),
+        };
+        // The watcher bar has been released by `commit_handoff`; only now may
+        // the graph reservation be released.
+        graph_reservation.cancel();
+        result
     }
 
     /// The promoted clean-shutdown transition: prove every device-local drain
@@ -2683,11 +2956,7 @@ impl PromotedLocalRuntime {
                             .to_owned()
                     ));
                 }
-                ResumePointEnrollment {
-                    generation: committed.generation(),
-                    head: committed.enrollment_head(),
-                    unsafe_session_id: self.session_id,
-                }
+                committed.resume_point_binding()
             }
             Err(error) => refuse!(ResumePublicationRefusal::Enrollment(error.to_string())),
         };
@@ -2697,6 +2966,25 @@ impl PromotedLocalRuntime {
             prove_device_local_drains(&self.engine, self.projection.database(), &self.tail)
         {
             refuse!(ResumePublicationRefusal::DrainIncomplete(error.to_string()));
+        }
+        self.publish_bound_resume_point(enrollment)
+    }
+
+    /// Snapshot, mint, publish and conditionally reclaim one exact
+    /// lifecycle-bound point.
+    ///
+    /// The enrollment binding has already been derived from a freshly
+    /// authenticated committed record. This helper is shared by Unsafe
+    /// quiescent publication and the post-Safe half of the production
+    /// transaction; it never accepts caller-assembled enrollment fields.
+    fn publish_bound_resume_point(
+        &mut self,
+        enrollment: super::enrollment::ResumePointEnrollmentBinding,
+    ) -> ResumePublicationStatus {
+        macro_rules! refuse {
+            ($refusal:expr) => {
+                return ResumePublicationStatus::NotPublished($refusal)
+            };
         }
         // Authority boundary, immediately before the snapshot and the archive
         // mutation it leads to.
@@ -2757,6 +3045,61 @@ impl PromotedLocalRuntime {
             resume_sequence,
             maintenance: Some(history.reclaim_retained_runs_after_publication(&published)),
         }
+    }
+
+    /// The cloneable intake-only watcher surface for the future facade.
+    pub(crate) fn watcher_handle(&self) -> WatcherHandle {
+        self.watcher.handle()
+    }
+
+    /// Take the next watcher epoch for reconciliation without exposing the
+    /// queue owner or asking the facade to reconstruct its endpoint binding.
+    pub(crate) fn begin_watcher_drain(&self) -> Result<Option<WatcherDrain>, WatcherDrainError> {
+        self.watcher.begin_drain(self.watcher.binding())
+    }
+
+    /// Settle exactly the watcher epoch the facade successfully reconciled.
+    pub(crate) fn acknowledge_watcher_drain(
+        &self,
+        epoch: WatcherEpoch,
+    ) -> Result<(), WatcherSettlementError> {
+        self.watcher.acknowledge_drain(epoch)
+    }
+
+    /// Return an unsuccessful watcher epoch to retained work.
+    pub(crate) fn abandon_watcher_drain(
+        &self,
+        epoch: WatcherEpoch,
+    ) -> Result<(), WatcherSettlementError> {
+        self.watcher.abandon_drain(epoch)
+    }
+
+    /// Compact report-only state for the future facade and causal tests.
+    pub(crate) fn watcher_status(&self) -> WatcherQueueStatus {
+        self.watcher.status()
+    }
+
+    /// Publish the packet-8 Unsafe-bound point at the sealed post-open,
+    /// pre-first-mutation cut.
+    ///
+    /// The future facade may invoke this immediately after a successful open.
+    /// Once a mutation is admitted the window is permanently closed; the
+    /// ordinary admission path only flips an in-memory boolean.
+    pub(crate) fn publish_post_open_resume_point(
+        &mut self,
+        authority: &LocalActiveAuthority,
+        graph: &Graph,
+    ) -> ResumePublicationStatus {
+        if !self.post_open_publication_available {
+            let status = ResumePublicationStatus::NotPublished(
+                ResumePublicationRefusal::EngineNotPublishable,
+            );
+            self.resume_publication = Some(status.clone());
+            return status;
+        }
+        let status = self.publish_quiescent_resume_point_inner(authority, graph);
+        self.resume_publication = Some(status.clone());
+        status
     }
 
     /// What this open decided about the resume accelerator.
@@ -2833,10 +3176,10 @@ impl PromotedLocalRuntime {
         // reread at every boundary and at every observed enrollment-head change,
         // carried by an unchanged-head admission. See the module documentation's
         // "Workspace lease identity" section.
-        // A failure here is terminal, not merely this proof's failure. Without
-        // the latch the very next unchanged-head admission would take the
-        // `Carried` branch, issue no filesystem call for the lease at all, and
-        // succeed on facts authenticated before the replacement.
+        // A proven replacement is terminal. Without the latch the next
+        // unchanged-head admission would take the `Carried` branch and succeed
+        // on pre-replacement facts. Inability to perform this check refuses
+        // only this proof and remains retryable.
         if archive == ArchiveAuthentication::Reread {
             let projection = &self.projection;
             self.revocation
@@ -3106,8 +3449,8 @@ impl PromotedRuntimeSession<'_> {
     /// so it is an authority boundary, not an accessor: handing out
     /// `&mut SqliteFrontier` and `&mut TailOverlay` is handing out the
     /// one-applier-per-workspace write. It therefore re-derives the lease
-    /// identity first and latches terminal revocation on failure, exactly as
-    /// the drain does.
+    /// identity first; proven replacement latches terminal revocation, while
+    /// inability to perform the check refuses only this call.
     ///
     /// The returned [`LocalRuntimeAdmission`] carries the same probe forward, so
     /// the coordinator can reprove at each of its own authority-changing
@@ -3163,7 +3506,8 @@ pub(crate) struct PromotedRuntimeAdmission<'a> {
 
 impl PromotedRuntimeAdmission<'_> {
     /// Re-derive archive-rooted workspace authority immediately before one
-    /// authority-changing boundary, latching terminal revocation on failure.
+    /// authority-changing boundary. Proven replacement latches terminal
+    /// revocation; a check that cannot be performed remains retryable.
     ///
     /// One held-handle stat plus one no-follow resolution of the exact lease
     /// pathname. It is never on the per-mutation admission path.
@@ -3449,12 +3793,20 @@ fn fail_after_promoted_database_open() -> bool {
 pub(crate) enum ResumeLifecycleCut {
     BeforeCandidateRead,
     BeforeReclamation,
+    AfterWatcherQuiesce,
+    BeforeSafeClear,
+    AfterSafeClear,
+    AfterSafeCommit,
 }
 
 #[cfg(test)]
 thread_local! {
     static RESUME_LIFECYCLE_CUT: std::cell::RefCell<Option<(ResumeLifecycleCut, Box<dyn FnOnce()>)>> =
         const { std::cell::RefCell::new(None) };
+    static SAFE_GRAPH_WRITER_PROBE_ARMED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    static SAFE_GRAPH_WRITER_PROBE_RESULT: std::cell::Cell<Option<std::io::ErrorKind>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// Run `action` exactly once, the next time `cut` is reached. Per-thread, armed
@@ -3470,6 +3822,31 @@ pub(crate) fn act_once_at_resume_lifecycle_cut_for_test(
 #[cfg(test)]
 pub(crate) fn clear_resume_lifecycle_cut_for_test() {
     RESUME_LIFECYCLE_CUT.with(|slot| *slot.borrow_mut() = None);
+    SAFE_GRAPH_WRITER_PROBE_ARMED.with(|armed| armed.set(false));
+    SAFE_GRAPH_WRITER_PROBE_RESULT.with(|result| result.set(None));
+}
+
+#[cfg(test)]
+pub(crate) fn arm_safe_graph_writer_probe_for_test() {
+    SAFE_GRAPH_WRITER_PROBE_ARMED.with(|armed| armed.set(true));
+    SAFE_GRAPH_WRITER_PROBE_RESULT.with(|result| result.set(None));
+}
+
+#[cfg(test)]
+pub(crate) fn take_safe_graph_writer_probe_for_test() -> Option<std::io::ErrorKind> {
+    SAFE_GRAPH_WRITER_PROBE_RESULT.with(|result| result.take())
+}
+
+#[cfg(test)]
+fn probe_graph_writer_while_safe(graph: &Graph) {
+    if !SAFE_GRAPH_WRITER_PROBE_ARMED.with(|armed| armed.replace(false)) {
+        return;
+    }
+    let outcome = match graph.probe_managed_text_writer() {
+        Ok(()) => None,
+        Err(error) => Some(error.kind()),
+    };
+    SAFE_GRAPH_WRITER_PROBE_RESULT.with(|result| result.set(outcome));
 }
 
 #[cfg(test)]
@@ -4118,6 +4495,13 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
     // session binding generation, so an unchanged-head admission may carry
     // them and any change forces the reread again.
     let archive_authenticated_generation = enrollment.binding_generation();
+    let watcher = WatcherQueueOwner::new(
+        ProjectionStorageBinding {
+            endpoint,
+            receipt_store_id: state.receipt_store_id,
+        },
+        WatcherQueueLimits::default(),
+    );
     Ok(PromotedLocalRuntime {
         state,
         anchor,
@@ -4130,11 +4514,13 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
         engine,
         projection,
         tail,
+        watcher,
         // A freshly minted runtime has just proved the lease it holds, so it
         // starts un-revoked. Nothing ever puts it back here.
         revocation: RuntimeRevocationLatch::default(),
         resume_open,
         resume_publication: None,
+        post_open_publication_available: true,
         _seal: seal::Seal,
     })
 }
@@ -4151,29 +4537,24 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
 ///   publishing session held, because the takeover's compare-and-swap has not
 ///   run yet at this point in the open. So the strictest arm is the correct
 ///   one, and a point that names anything else is refused;
-/// * `Safe` — a clean handoff. The `Unsafe -> Safe` drain clears this
-///   endpoint's recognized points *before* the record moves, so a survivor is
-///   residue-preserved evidence from a strictly earlier generation. It is
-///   admitted only as superseded: it must predate the live record and may claim
-///   neither the live head nor the session this open is about to take.
+/// * `Safe` — a clean handoff. The point must name that exact Safe generation
+///   and head. Candidate selection happens before the open durably moves Safe
+///   to the new Unsafe session, so no successor interpretation is needed.
 ///
 /// Both possible mis-derivations fail toward a full replay, never toward
 /// authority: a point that cannot re-prove the arm it is offered is simply not
 /// offered to the engine.
 fn resume_enrollment_admission(
     committed: &CommittedLocalActive,
-    session_id: SessionId,
+    _session_id: SessionId,
 ) -> ResumeEnrollmentAdmission {
-    let live = |unsafe_session_id| ResumePointEnrollment {
-        generation: committed.generation(),
-        head: committed.enrollment_head(),
-        unsafe_session_id,
-    };
     match committed.handoff() {
-        LocalActiveHandoff::Unsafe {
-            session_id: committed_session,
-        } => ResumeEnrollmentAdmission::SameSession(live(committed_session)),
-        LocalActiveHandoff::Safe => ResumeEnrollmentAdmission::SupersededBy(live(session_id)),
+        LocalActiveHandoff::Unsafe { .. } => {
+            ResumeEnrollmentAdmission::SameSession(committed.resume_point_binding())
+        }
+        LocalActiveHandoff::Safe => {
+            ResumeEnrollmentAdmission::SameSafe(committed.resume_point_binding())
+        }
     }
 }
 

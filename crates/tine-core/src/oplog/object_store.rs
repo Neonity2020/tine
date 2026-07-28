@@ -36,16 +36,20 @@ use sha2::{Digest, Sha256};
 use smallvec::SmallVec;
 use uuid::Uuid;
 
+use crate::model::HandoffSafe;
+
+use super::enrollment::ResumePointEnrollmentBinding;
 use super::hot_engine::RuntimeResumeSnapshot;
 use super::identity::parse_digest;
 use super::resume_point::{
     clear_resume_points_in, next_resume_sequence, prune_resume_points_below,
-    ResumeEnrollmentAdmission, ResumePointEnrollment, ResumePointError, ResumePointMaintenance,
-    ResumePointScan, ResumePointSet, RuntimeResumePointV1, MAX_RETAINED_RESUME_POINTS,
-    RESUME_POINT_DIR,
+    ResumeEnrollmentAdmission, ResumePointError, ResumePointMaintenance, ResumePointScan,
+    ResumePointSet, RuntimeResumePointV2, MAX_RETAINED_RESUME_POINTS, RESUME_POINT_DIR,
 };
 use super::scratch_store::MAX_RETAINED_SCRATCH_RUNS;
 use super::simulator::SimulatorBootstrapFixtureIngress;
+use super::sqlite::RevalidatedWorkspaceRuntimeProof;
+use super::watcher_queue::WatcherQuiescedProof;
 use super::{
     bootstrap_import::{
         ArchiveLocalFrontierBindingV1, BootstrapAggregateCommitV1, BootstrapAggregateDigestV1,
@@ -3919,7 +3923,7 @@ impl ExactBootstrapHistoryBuilderV1<'_> {
 /// actual survey rather than from a caller's belief.
 ///
 /// This is the compile-time half of "the lifecycle caller cannot omit facts":
-/// `RuntimeResumePointV1::seal` needs one of these, and nothing outside this
+/// `RuntimeResumePointV2::seal` needs one of these, and nothing outside this
 /// module can build one.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ResumePointEndpointBinding {
@@ -4045,6 +4049,28 @@ pub(crate) struct PublishedResumePoint {
     workspace_id: WorkspaceId,
     resume_sequence: u64,
     scratch_run_id: Uuid,
+}
+
+/// Sealed authority for the clear-before-Safe step.
+///
+/// This value can exist only while the exact graph reservation, watcher
+/// quiesce proof, and archive-rooted workspace lease are all borrowed. The
+/// lifecycle caller cannot construct one, and the clear operation cannot
+/// outlive any of those barriers.
+pub(crate) struct SafeTransitionCapability<'barriers, 'lease> {
+    history: &'barriers DurableEngineHistoryStore,
+    _graph: &'barriers HandoffSafe,
+    _watcher: &'barriers WatcherQuiescedProof,
+    _workspace: &'barriers RevalidatedWorkspaceRuntimeProof<'lease>,
+}
+
+impl SafeTransitionCapability<'_, '_> {
+    /// Remove exactly the recognized Unsafe-bound points. Safe-bound evidence
+    /// from an older lifecycle is preserved until a successfully published
+    /// Safe successor makes it unreachable.
+    pub(crate) fn clear_unsafe_resume_points(&self) -> Result<ResumePointMaintenance, StoreError> {
+        self.history.clear_unsafe_resume_points()
+    }
 }
 
 impl PublishedResumePoint {
@@ -4729,7 +4755,7 @@ impl DurableEngineHistoryStore {
     /// different promoted state, so its resume points cannot bind here.
     fn require_resume_point_binding(
         &self,
-        point: &RuntimeResumePointV1,
+        point: &RuntimeResumePointV2,
         promoted_state_digest: ContentDigest,
     ) -> Result<(), StoreError> {
         if point.workspace_id() != self.workspace_id {
@@ -4828,10 +4854,10 @@ impl DurableEngineHistoryStore {
     pub(crate) fn mint_resume_point(
         &self,
         snapshot: &RuntimeResumeSnapshot,
-        enrollment: ResumePointEnrollment,
-    ) -> Result<RuntimeResumePointV1, StoreError> {
+        enrollment: ResumePointEnrollmentBinding,
+    ) -> Result<RuntimeResumePointV2, StoreError> {
         let binding = self.resume_point_endpoint_binding()?;
-        Ok(RuntimeResumePointV1::seal(&binding, enrollment, snapshot)?)
+        Ok(RuntimeResumePointV2::seal(&binding, enrollment, snapshot)?)
     }
 
     /// The sealed authority a published point must re-prove at a resuming open.
@@ -5101,7 +5127,7 @@ impl DurableEngineHistoryStore {
     /// which consumes the [`PublishedResumePoint`] this returns.
     pub(crate) fn publish_resume_point(
         &self,
-        point: &RuntimeResumePointV1,
+        point: &RuntimeResumePointV2,
     ) -> Result<PublishedResumePoint, StoreError> {
         let _guard = self
             .transition
@@ -5174,7 +5200,49 @@ impl DurableEngineHistoryStore {
         })
     }
 
-    /// Remove every recognized resume point of this endpoint.
+    /// Mint the only capability that may clear points for a Safe transition.
+    ///
+    /// All three authorities are checked against this exact sealed endpoint.
+    /// Borrowing them into the result makes dropping either barrier before the
+    /// clear a compile error.
+    pub(crate) fn begin_safe_transition<'barriers, 'lease>(
+        &'barriers self,
+        archive: &'barriers ObjectStore,
+        workspace: &'barriers RevalidatedWorkspaceRuntimeProof<'lease>,
+        graph: &'barriers HandoffSafe,
+        watcher: &'barriers WatcherQuiescedProof,
+    ) -> Result<SafeTransitionCapability<'barriers, 'lease>, StoreError> {
+        if !workspace.authorizes_archive(archive, self.workspace_id) {
+            return Err(StoreError::ResumePointBindingMismatch(
+                "Safe transition workspace lease does not authorize this archive",
+            ));
+        }
+        let graph_binding = graph.binding();
+        if graph_binding.workspace_id() != self.workspace_id
+            || graph_binding.endpoint().endpoint_id() != self.endpoint_id
+            || graph_binding.graph_resource_id() != self.graph_resource_id
+        {
+            return Err(StoreError::ResumePointBindingMismatch(
+                "Safe transition graph reservation is bound to another endpoint",
+            ));
+        }
+        let watcher_binding = watcher.binding();
+        if watcher_binding.endpoint != graph_binding.endpoint()
+            || watcher_binding.receipt_store_id != self.receipt_store_id
+        {
+            return Err(StoreError::ResumePointBindingMismatch(
+                "Safe transition watcher proof is bound to another endpoint",
+            ));
+        }
+        Ok(SafeTransitionCapability {
+            history: self,
+            _graph: graph,
+            _watcher: watcher,
+            _workspace: workspace,
+        })
+    }
+
+    /// Remove every recognized Unsafe-bound resume point of this endpoint.
     ///
     /// This is the `Unsafe -> Safe` drain step: afterwards no recognized point
     /// names a retained scratch run. It is ordered before the handoff record
@@ -5192,16 +5260,25 @@ impl DurableEngineHistoryStore {
     /// [`ResumePointMaintenance::preserved`]. While that residue exists no
     /// [`ResumePointSet`] can be minted, so no retained run is reclaimed: the
     /// run leaks, which is the correct trade.
-    pub(crate) fn clear_resume_points(&self) -> Result<ResumePointMaintenance, StoreError> {
+    fn clear_unsafe_resume_points(&self) -> Result<ResumePointMaintenance, StoreError> {
         let _guard = self
             .transition
             .lock()
             .map_err(|_| StoreError::MalformedHistoryIndex)?;
         let _workspace_guard = AdvisoryTransitionGuard::lock(&self.transition_lock)?;
+        #[cfg(test)]
+        inject_resume_clear_fault()?;
         let Some(directory) = open_existing_dir_nofollow(&self.control, RESUME_POINT_DIR)? else {
             return Ok(ResumePointMaintenance::default());
         };
         Ok(clear_resume_points_in(&directory)?)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_resume_points_for_test(
+        &self,
+    ) -> Result<ResumePointMaintenance, StoreError> {
+        self.clear_unsafe_resume_points()
     }
 
     /// Turn a durable promoted-runtime state into live write authorization for
@@ -5643,6 +5720,29 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn fail_next_resume_publication_at(boundary: ResumePublishBoundary) {
     RESUME_PUBLISH_FAULT.with(|fault| fault.set(Some(boundary)));
+}
+
+#[cfg(test)]
+thread_local! {
+    static RESUME_CLEAR_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_resume_clear() {
+    RESUME_CLEAR_FAULT.with(|fault| fault.set(true));
+}
+
+#[cfg(test)]
+fn inject_resume_clear_fault() -> Result<(), StoreError> {
+    RESUME_CLEAR_FAULT.with(|fault| {
+        if fault.replace(false) {
+            Err(StoreError::Io(std::io::Error::other(
+                "injected resume-point clear failure before the first removal",
+            )))
+        } else {
+            Ok(())
+        }
+    })
 }
 
 #[cfg(test)]
@@ -10591,7 +10691,7 @@ mod bootstrap_store_tests {
 #[cfg(test)]
 mod resume_point_store_tests {
     use super::*;
-    use crate::oplog::resume_point::RuntimeResumePointV1;
+    use crate::oplog::resume_point::RuntimeResumePointV2;
     use crate::oplog::{
         DeviceId, DocumentId, ImportId, ProjectionEndpointBinding, ProjectionEndpointId,
         ProjectionReceiptStoreId, SessionId,
@@ -10719,12 +10819,12 @@ mod resume_point_store_tests {
             )
         }
 
-        fn enrollment(&self) -> ResumePointEnrollment {
-            ResumePointEnrollment {
-                generation: 4,
-                head: ContentDigest::of(b"enrollment head"),
-                unsafe_session_id: SessionId::from_uuid(Uuid::from_u128(0x8500)),
-            }
+        fn enrollment(&self) -> ResumePointEnrollmentBinding {
+            ResumePointEnrollmentBinding::unsafe_for_test(
+                4,
+                ContentDigest::of(b"enrollment head"),
+                SessionId::from_uuid(Uuid::from_u128(0x8500)),
+            )
         }
 
         /// The live durable head of this fixture: an unadvanced bootstrap
@@ -10737,8 +10837,8 @@ mod resume_point_store_tests {
             )
         }
 
-        fn point(&self, sequence: u64, run: u128) -> RuntimeResumePointV1 {
-            RuntimeResumePointV1::empty_rooted_for_test(
+        fn point(&self, sequence: u64, run: u128) -> RuntimeResumePointV2 {
+            RuntimeResumePointV2::empty_rooted_for_test(
                 &self.binding(sequence),
                 self.enrollment(),
                 self.live_history(),
@@ -10843,7 +10943,7 @@ mod resume_point_store_tests {
 
     /// Cut the process exactly between the commit point and the prune, the way
     /// a power loss does.
-    fn cut_before_prune(fixture: &PromotedHistoryFixture, point: &RuntimeResumePointV1) {
+    fn cut_before_prune(fixture: &PromotedHistoryFixture, point: &RuntimeResumePointV2) {
         let directory =
             Dir::open_ambient_dir(fixture.resume_point_path(), ambient_authority()).unwrap();
         publish_immutable_exact(
@@ -10901,13 +11001,13 @@ mod resume_point_store_tests {
         cut_before_prune(&fixture, &interrupted);
 
         let takeover = |sequence: u64| {
-            fixture
-                .point(sequence, 0x8601)
-                .with_enrollment_for_test(ResumePointEnrollment {
-                    generation: 5,
-                    head: ContentDigest::of(b"takeover enrollment head"),
-                    unsafe_session_id: SessionId::from_uuid(Uuid::from_u128(0x8501)),
-                })
+            fixture.point(sequence, 0x8601).with_enrollment_for_test(
+                ResumePointEnrollmentBinding::unsafe_for_test(
+                    5,
+                    ContentDigest::of(b"takeover enrollment head"),
+                    SessionId::from_uuid(Uuid::from_u128(0x8501)),
+                ),
+            )
         };
         // The byte-identical retry is genuinely unavailable to this session.
         assert!(matches!(
@@ -10935,7 +11035,7 @@ mod resume_point_store_tests {
             4
         );
         history.publish_resume_point(&takeover(4)).unwrap();
-        assert_eq!(history.clear_resume_points().unwrap().removed, 1);
+        assert_eq!(history.clear_resume_points_for_test().unwrap().removed, 1);
         assert!(history.read_resume_point_set().unwrap().points().is_empty());
     }
 
@@ -10956,16 +11056,13 @@ mod resume_point_store_tests {
         for round in 0..6_u64 {
             // Crash cut: the successor is durable, the prune never ran.
             sequence += 1;
-            let interrupted =
-                fixture
-                    .point(sequence, 0x8601)
-                    .with_enrollment_for_test(ResumePointEnrollment {
-                        generation: 10 + round,
-                        head: ContentDigest::of(b"interrupted enrollment head"),
-                        unsafe_session_id: SessionId::from_uuid(Uuid::from_u128(
-                            0x8600 + u128::from(round),
-                        )),
-                    });
+            let interrupted = fixture.point(sequence, 0x8601).with_enrollment_for_test(
+                ResumePointEnrollmentBinding::unsafe_for_test(
+                    10 + round,
+                    ContentDigest::of(b"interrupted enrollment head"),
+                    SessionId::from_uuid(Uuid::from_u128(0x8600 + u128::from(round))),
+                ),
+            );
             cut_before_prune(&fixture, &interrupted);
             assert_eq!(
                 fixture.snapshot().len(),
@@ -10975,23 +11072,20 @@ mod resume_point_store_tests {
 
             // Restart as a takeover session: new session, later generation.
             sequence += 1;
-            let restarted =
-                fixture
-                    .point(sequence, 0x8601)
-                    .with_enrollment_for_test(ResumePointEnrollment {
-                        generation: 100 + round,
-                        head: ContentDigest::of(b"restarted enrollment head"),
-                        unsafe_session_id: SessionId::from_uuid(Uuid::from_u128(
-                            0x8700 + u128::from(round),
-                        )),
-                    });
+            let restarted = fixture.point(sequence, 0x8601).with_enrollment_for_test(
+                ResumePointEnrollmentBinding::unsafe_for_test(
+                    100 + round,
+                    ContentDigest::of(b"restarted enrollment head"),
+                    SessionId::from_uuid(Uuid::from_u128(0x8700 + u128::from(round))),
+                ),
+            );
             history.publish_resume_point(&restarted).unwrap();
 
             let set = history.read_resume_point_set().unwrap();
             assert_eq!(set.points(), &[restarted], "round {round} did not converge");
             assert_eq!(set.reachable_runs().len(), 1);
         }
-        assert_eq!(history.clear_resume_points().unwrap().removed, 1);
+        assert_eq!(history.clear_resume_points_for_test().unwrap().removed, 1);
     }
 
     /// A fault at **every** durable boundary of one publication leaves at least
@@ -11027,13 +11121,13 @@ mod resume_point_store_tests {
             // generation — so no byte-identical retry is available to it and
             // the publication really has to run the pre-prune.
             let takeover = |sequence: u64| {
-                fixture
-                    .point(sequence, 0x8601)
-                    .with_enrollment_for_test(ResumePointEnrollment {
-                        generation: 5,
-                        head: ContentDigest::of(b"takeover enrollment head"),
-                        unsafe_session_id: SessionId::from_uuid(Uuid::from_u128(0x8501)),
-                    })
+                fixture.point(sequence, 0x8601).with_enrollment_for_test(
+                    ResumePointEnrollmentBinding::unsafe_for_test(
+                        5,
+                        ContentDigest::of(b"takeover enrollment head"),
+                        SessionId::from_uuid(Uuid::from_u128(0x8501)),
+                    ),
+                )
             };
 
             fail_next_resume_publication_at(boundary);
@@ -11050,10 +11144,10 @@ mod resume_point_store_tests {
                 !cut.is_empty(),
                 "boundary {boundary:?}: the cut has zero durable files"
             );
-            let durable: Vec<RuntimeResumePointV1> = cut
+            let durable: Vec<RuntimeResumePointV2> = cut
                 .iter()
                 .map(|(name, bytes)| {
-                    let point = RuntimeResumePointV1::decode(bytes).unwrap_or_else(|error| {
+                    let point = RuntimeResumePointV2::decode(bytes).unwrap_or_else(|error| {
                         panic!("boundary {boundary:?}: {name} is not a valid point: {error}")
                     });
                     assert_eq!(
@@ -11090,7 +11184,7 @@ mod resume_point_store_tests {
             let converged = history.read_resume_point_set().unwrap();
             assert_eq!(converged.points(), &[resumed]);
             assert!(converged.reachable_runs().contains(run));
-            assert_eq!(history.clear_resume_points().unwrap().removed, 1);
+            assert_eq!(history.clear_resume_points_for_test().unwrap().removed, 1);
             assert!(history.read_resume_point_set().unwrap().points().is_empty());
         }
     }
@@ -11136,7 +11230,7 @@ mod resume_point_store_tests {
             cut_before_prune(&fixture, &fixture.point(sequence, 0x8601));
         }
         assert!(history.read_resume_point_set().is_err());
-        assert_eq!(history.clear_resume_points().unwrap().removed, 3);
+        assert_eq!(history.clear_resume_points_for_test().unwrap().removed, 3);
         assert!(history.read_resume_point_set().unwrap().points().is_empty());
     }
 
@@ -11323,7 +11417,7 @@ mod resume_point_store_tests {
             );
 
             // The drain still progresses, removing only what it recognized.
-            let maintenance = history.clear_resume_points().unwrap();
+            let maintenance = history.clear_resume_points_for_test().unwrap();
             assert_eq!(maintenance.removed, 1, "{label}");
             assert_eq!(maintenance.preserved, vec![stranger.to_owned()], "{label}");
             assert!(
@@ -11373,7 +11467,7 @@ mod resume_point_store_tests {
         std::fs::write(&residue_path, b"\x00\x01Bud1 residue").unwrap();
 
         // The drain progresses so the handoff can reach `Safe` ...
-        assert_eq!(history.clear_resume_points().unwrap().removed, 1);
+        assert_eq!(history.clear_resume_points_for_test().unwrap().removed, 1);
         // ... but the residue still denies the proof, so the composition the
         // lifecycle caller must use cannot even produce an argument for
         // reclamation, and the run's bytes survive.
@@ -11524,11 +11618,11 @@ mod resume_point_store_tests {
         assert_eq!(fixture.snapshot(), intact);
 
         // 3. Enrollment evidence the live record contradicts.
-        let stranger = ResumePointEnrollment {
-            generation: 99,
-            head: ContentDigest::of(b"a different enrollment head"),
-            unsafe_session_id: SessionId::from_uuid(Uuid::from_u128(0x8fff)),
-        };
+        let stranger = ResumePointEnrollmentBinding::unsafe_for_test(
+            99,
+            ContentDigest::of(b"a different enrollment head"),
+            SessionId::from_uuid(Uuid::from_u128(0x8fff)),
+        );
         assert!(matches!(
             history
                 .read_resume_adoption_candidate(ResumeEnrollmentAdmission::SameSession(stranger)),
@@ -11604,7 +11698,7 @@ mod resume_point_store_tests {
 
         // A witness whose point has left the complete set proves nothing about
         // the state the caller published, so the pass preserves everything.
-        assert_eq!(history.clear_resume_points().unwrap().removed, 1);
+        assert_eq!(history.clear_resume_points_for_test().unwrap().removed, 1);
         let stale = history.reclaim_retained_runs_after_publication(&second);
         assert!(matches!(
             stale.outcome,
@@ -11704,14 +11798,14 @@ mod resume_point_store_tests {
     }
 
     #[test]
-    fn clearing_removes_every_point_and_is_idempotent() {
+    fn clearing_removes_every_unsafe_point_and_is_idempotent() {
         let fixture = PromotedHistoryFixture::new("clear");
         let history = fixture.history();
         history
             .publish_resume_point(&fixture.point(1, 0x8601))
             .unwrap();
 
-        assert_eq!(history.clear_resume_points().unwrap().removed, 1);
+        assert_eq!(history.clear_resume_points_for_test().unwrap().removed, 1);
         assert!(history.read_resume_point_set().unwrap().points().is_empty());
         assert_eq!(
             history
@@ -11721,7 +11815,7 @@ mod resume_point_store_tests {
                 .len(),
             0
         );
-        assert_eq!(history.clear_resume_points().unwrap().removed, 0);
+        assert_eq!(history.clear_resume_points_for_test().unwrap().removed, 0);
 
         // Clearing is not a terminal state. The publication sequence is derived
         // from the durable set rather than from a separate counter file, so a
@@ -11748,7 +11842,7 @@ mod resume_point_store_tests {
         let history = fixture.history();
         assert!(history.read_resume_point_set().unwrap().points().is_empty());
         assert_eq!(
-            history.clear_resume_points().unwrap(),
+            history.clear_resume_points_for_test().unwrap(),
             ResumePointMaintenance::default()
         );
         assert!(!fixture.resume_point_path().exists());

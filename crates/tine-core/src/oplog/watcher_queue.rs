@@ -919,7 +919,7 @@ impl WatcherQueueOwner {
     pub(crate) fn begin_quiesce(
         &self,
         binding: ProjectionStorageBinding,
-    ) -> Result<WatcherQuiesceGuard<'_>, WatcherQuiesceError> {
+    ) -> Result<WatcherQuiesceGuard, WatcherQuiesceError> {
         if binding != self.shared.binding {
             return Err(WatcherQuiesceError::ForeignBinding);
         }
@@ -938,7 +938,7 @@ impl WatcherQueueOwner {
         }
         drop(state);
         Ok(WatcherQuiesceGuard {
-            shared: &self.shared,
+            shared: Arc::clone(&self.shared),
             epoch: self.shared.epoch(sequence),
             committed: false,
         })
@@ -1103,13 +1103,13 @@ impl Drop for ActiveIntake<'_> {
 /// durable `Safe` record while holding it and know that no watcher event became
 /// drainable in between. Dropping the guard — committed or not — reopens intake
 /// and releases everything that arrived while it was held.
-pub(crate) struct WatcherQuiesceGuard<'a> {
-    shared: &'a Arc<WatcherQueueShared>,
+pub(crate) struct WatcherQuiesceGuard {
+    shared: Arc<WatcherQueueShared>,
     epoch: WatcherEpoch,
     committed: bool,
 }
 
-impl fmt::Debug for WatcherQuiesceGuard<'_> {
+impl fmt::Debug for WatcherQuiesceGuard {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("WatcherQuiesceGuard")
@@ -1118,7 +1118,7 @@ impl fmt::Debug for WatcherQuiesceGuard<'_> {
     }
 }
 
-impl WatcherQuiesceGuard<'_> {
+impl WatcherQuiesceGuard {
     pub(crate) const fn quiesced_epoch(&self) -> WatcherEpoch {
         self.epoch
     }
@@ -1162,8 +1162,8 @@ impl WatcherQuiesceGuard<'_> {
         mut self,
         commit: impl FnOnce(&WatcherQuiescedProof) -> Result<T, E>,
     ) -> Result<(T, WatcherQuiescedProof), WatcherHandoffError<E>> {
-        let shared = self.shared;
-        let bar = IntakeBar::acquire(shared, self.epoch.sequence)
+        let shared = Arc::clone(&self.shared);
+        let bar = IntakeBar::acquire(&shared, self.epoch.sequence)
             .map_err(WatcherHandoffError::Quiesce)?;
         let proof = WatcherQuiescedProof {
             binding: shared.binding,
@@ -1241,7 +1241,7 @@ impl Drop for IntakeBar<'_> {
     }
 }
 
-impl Drop for WatcherQuiesceGuard<'_> {
+impl Drop for WatcherQuiesceGuard {
     fn drop(&mut self) {
         let limits = self.shared.limits;
         let mut state = self.shared.lock();

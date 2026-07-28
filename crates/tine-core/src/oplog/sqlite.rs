@@ -6421,9 +6421,16 @@ mod applier_lease {
             #[cfg(test)]
             WORKSPACE_LEASE_IDENTITY_REVALIDATIONS
                 .with(|count| count.set(count.get().saturating_add(1)));
-            let held = held_file_identity(&self.file, &self.lease_path)?;
+            #[cfg(test)]
+            if FAIL_NEXT_WORKSPACE_LEASE_IDENTITY_CHECK.with(|fail| fail.replace(false)) {
+                return Err(ProjectionError::LeaseIdentityUnavailable(
+                    "injected transient workspace-lease identity-check failure".into(),
+                ));
+            }
+            let held = held_file_identity(&self.file, &self.lease_path)
+                .map_err(|error| ProjectionError::LeaseIdentityUnavailable(error.to_string()))?;
             if held != self.identity {
-                return Err(ProjectionError::UnsafePath(format!(
+                return Err(ProjectionError::LeaseIdentityReplaced(format!(
                     "the held SQLite applier lease handle {} is no longer the file it locked",
                     self.lease_path.display()
                 )));
@@ -6432,9 +6439,10 @@ mod applier_lease {
                 &self.archive_capability,
                 &self.workspace_id.to_string(),
                 &self.lease_path,
-            )?;
+            )
+            .map_err(|error| ProjectionError::LeaseIdentityUnavailable(error.to_string()))?;
             if named != self.identity {
-                return Err(ProjectionError::UnsafePath(format!(
+                return Err(ProjectionError::LeaseIdentityReplaced(format!(
                     "the SQLite applier lease {} was replaced while this runtime held it, so this \
                      lock no longer proves workspace ownership",
                     self.lease_path.display()
@@ -6940,6 +6948,28 @@ mod applier_lease {
         lease: &'lease WorkspaceRuntimeLease,
     }
 
+    /// Exact successful archive-binding and identity revalidation.
+    ///
+    /// Private construction makes this a one-operation witness rather than a
+    /// caller assertion. Safe-transition deletion authority borrows it, so it
+    /// cannot be retained after the lease proof that minted it.
+    pub(crate) struct RevalidatedWorkspaceRuntimeProof<'lease> {
+        workspace_id: WorkspaceId,
+        archive_root: &'lease Path,
+    }
+
+    impl RevalidatedWorkspaceRuntimeProof<'_> {
+        pub(crate) fn authorizes_archive(
+            &self,
+            store: &ObjectStore,
+            workspace_id: WorkspaceId,
+        ) -> bool {
+            self.workspace_id == workspace_id
+                && store.workspace_id() == workspace_id
+                && self.archive_root == store.root_path()
+        }
+    }
+
     impl WorkspaceRuntimeProof<'_> {
         pub(crate) const fn workspace_id(&self) -> WorkspaceId {
             self.lease.workspace_id
@@ -6978,6 +7008,19 @@ mod applier_lease {
             // a foreign lease is still refused without any filesystem work.
             self.lease.revalidate_identity()
         }
+
+        /// Revalidate and bind a one-operation witness to this exact archive.
+        pub(crate) fn revalidate_archive(
+            &self,
+            store: &ObjectStore,
+            workspace_id: WorkspaceId,
+        ) -> Result<RevalidatedWorkspaceRuntimeProof<'_>, ProjectionError> {
+            self.authorize_archive(store, workspace_id)?;
+            Ok(RevalidatedWorkspaceRuntimeProof {
+                workspace_id,
+                archive_root: &self.lease.archive_root,
+            })
+        }
     }
 }
 
@@ -6988,8 +7031,8 @@ pub(crate) use applier_lease::{
 };
 use applier_lease::{ApplierAuthorization, HeldApplierLocks};
 pub(crate) use applier_lease::{
-    LeasedWorkspaceProjection, SqliteApplierSlot, WorkspaceLeaseIdentity, WorkspaceRuntimeLease,
-    WorkspaceRuntimeProof,
+    LeasedWorkspaceProjection, RevalidatedWorkspaceRuntimeProof, SqliteApplierSlot,
+    WorkspaceLeaseIdentity, WorkspaceRuntimeLease, WorkspaceRuntimeProof,
 };
 
 #[cfg(test)]
@@ -7013,6 +7056,8 @@ thread_local! {
     /// asserts it stays at zero across 1, 1,000, and 10,000 admissions.
     static WORKSPACE_LEASE_IDENTITY_REVALIDATIONS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    static FAIL_NEXT_WORKSPACE_LEASE_IDENTITY_CHECK: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
@@ -7023,6 +7068,11 @@ pub(crate) fn workspace_runtime_lease_acquisitions() -> usize {
 #[cfg(test)]
 pub(crate) fn workspace_lease_identity_revalidations() -> usize {
     WORKSPACE_LEASE_IDENTITY_REVALIDATIONS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_workspace_lease_identity_check() {
+    FAIL_NEXT_WORKSPACE_LEASE_IDENTITY_CHECK.with(|fail| fail.set(true));
 }
 
 fn open_or_create_lease_directory(
@@ -7449,6 +7499,12 @@ pub enum ProjectionError {
     Sqlite(String),
     Io(String),
     UnsafePath(String),
+    /// The retained lease pathname or held handle was proved to name a
+    /// different file. Terminal for the runtime; never self-healed in place.
+    LeaseIdentityReplaced(String),
+    /// The identity check could not be performed. The current operation fails
+    /// closed, but a later proof may retry on the same runtime.
+    LeaseIdentityUnavailable(String),
     LeaseContended(PathBuf),
     AuthorityMismatch,
     WorkspaceMismatch {
@@ -7492,6 +7548,15 @@ impl fmt::Display for ProjectionError {
             Self::Sqlite(error) => write!(f, "SQLite projection error: {error}"),
             Self::Io(error) => write!(f, "SQLite projection I/O error: {error}"),
             Self::UnsafePath(error) => write!(f, "unsafe SQLite projection path: {error}"),
+            Self::LeaseIdentityReplaced(error) => {
+                write!(f, "SQLite workspace lease identity was replaced: {error}")
+            }
+            Self::LeaseIdentityUnavailable(error) => {
+                write!(
+                    f,
+                    "SQLite workspace lease identity check is unavailable: {error}"
+                )
+            }
             Self::LeaseContended(path) => {
                 write!(f, "SQLite applier lease is held: {}", path.display())
             }

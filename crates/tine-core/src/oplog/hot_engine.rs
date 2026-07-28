@@ -3460,7 +3460,7 @@ impl RuntimeResumeSnapshot {
     ///
     /// Sealed on purpose: the argument is
     /// [`super::resume_point::AuthenticatedResumePoint`], whose only mint is
-    /// `RuntimeResumePointV1::authenticate`. A lifecycle caller therefore
+    /// `RuntimeResumePointV2::authenticate`. A lifecycle caller therefore
     /// cannot hand the resuming open a snapshot assembled from a record whose
     /// workspace, endpoint, promoted state, durable-history binding or
     /// enrollment evidence was never checked.
@@ -23399,7 +23399,7 @@ mod validation_tests {
     /// engine ever produced, and every downstream proof would be about the wrong
     /// object.
     fn resume_point_authority(
-        point: &super::super::resume_point::RuntimeResumePointV1,
+        point: &super::super::resume_point::RuntimeResumePointV2,
     ) -> super::super::object_store::ResumeAdoptionAuthority {
         super::super::object_store::ResumeAdoptionAuthority::for_test(
             point.workspace_id(),
@@ -23417,19 +23417,19 @@ mod validation_tests {
     fn seal_resume_point(
         engine: &ShardedHotEngine,
         snapshot: &RuntimeResumeSnapshot,
-    ) -> super::super::resume_point::RuntimeResumePointV1 {
-        super::super::resume_point::RuntimeResumePointV1::seal(
+    ) -> super::super::resume_point::RuntimeResumePointV2 {
+        super::super::resume_point::RuntimeResumePointV2::seal(
             &super::super::object_store::ResumePointEndpointBinding::for_test(
                 engine.workspace_id(),
                 super::super::ProjectionEndpointId::from_uuid(Uuid::from_u128(0x5126)),
                 ContentDigest::of(b"resume-record-promoted-state"),
                 1,
             ),
-            super::super::resume_point::ResumePointEnrollment {
-                generation: 3,
-                head: ContentDigest::of(b"resume-record-enrollment-head"),
-                unsafe_session_id: SessionId::from_uuid(Uuid::from_u128(0x5127)),
-            },
+            super::super::enrollment::ResumePointEnrollmentBinding::unsafe_for_test(
+                3,
+                ContentDigest::of(b"resume-record-enrollment-head"),
+                SessionId::from_uuid(Uuid::from_u128(0x5127)),
+            ),
             snapshot,
         )
         .expect("a quiescent snapshot seals into a resume point")
@@ -23449,7 +23449,7 @@ mod validation_tests {
 
         let point = seal_resume_point(&fixture.engine, &snapshot);
         // Through the durable bytes, not around them.
-        let durable = super::super::resume_point::RuntimeResumePointV1::decode(
+        let durable = super::super::resume_point::RuntimeResumePointV2::decode(
             &point
                 .encode()
                 .expect("a live engine's state is publishable"),
@@ -32231,7 +32231,7 @@ mod validation_tests {
     /// so they contribute a fixed offset and cannot participate in scaling.
     fn resume_size_record(
         engine: &ShardedHotEngine,
-    ) -> super::super::resume_point::RuntimeResumePointV1 {
+    ) -> super::super::resume_point::RuntimeResumePointV2 {
         let snapshot = RuntimeResumeSnapshot {
             history_generation: engine.history_generation,
             history_index_root: engine.history_root,
@@ -32250,18 +32250,18 @@ mod validation_tests {
                 .clone(),
             catalog_checkpoint_binding: ContentDigest::of(b"resume-size-catalog-checkpoint"),
         };
-        super::super::resume_point::RuntimeResumePointV1::seal(
+        super::super::resume_point::RuntimeResumePointV2::seal(
             &super::super::object_store::ResumePointEndpointBinding::for_test(
                 engine.workspace_id,
                 super::super::ProjectionEndpointId::from_uuid(Uuid::from_u128(0x5126)),
                 ContentDigest::of(b"resume-size-promoted-state"),
                 1,
             ),
-            super::super::resume_point::ResumePointEnrollment {
-                generation: 1,
-                head: ContentDigest::of(b"resume-size-enrollment-head"),
-                unsafe_session_id: SessionId::from_uuid(Uuid::from_u128(0x5123)),
-            },
+            super::super::enrollment::ResumePointEnrollmentBinding::unsafe_for_test(
+                1,
+                ContentDigest::of(b"resume-size-enrollment-head"),
+                SessionId::from_uuid(Uuid::from_u128(0x5123)),
+            ),
             &snapshot,
         )
         .expect("a quiescent run-local state seals into a resume point")
