@@ -1105,6 +1105,34 @@
         "scenario": "sync.out-of-scope-nonportable-file-is-retained-nontext",
         "failBefore": "proven"
       }
+    },
+    {
+      "id": "REG-SYNC-DUPLICATE-COLLISION-AUTHORITY-001",
+      "title": "Sparse sync retains duplicate graph-text files as exact evidence while only one deterministic member receives logical and projection authority",
+      "family": "data-safety",
+      "sources": {
+        "issues": [],
+        "commits": [
+          "8f23e6a0"
+        ]
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/model.rs",
+          "crates/tine-core/src/oplog/import.rs",
+          "crates/tine-core/src/oplog/reconciliation_scan.rs",
+          "crates/tine-core/src/oplog/shadow_projection.rs",
+          "crates/tine-core/src/sync_runtime.rs"
+        ],
+        "scenario": "sync.duplicate-graph-text-retained-nonauthoritative-loser",
+        "failBefore": "proven"
+      },
+      "notes": "At 8f23e6a0, the public runtime journey first failed with 'initial shadow managed paths share one semantic key'. Removing that admission guard exposed the deeper ConflictingLocalTail ImportBlock from plan_affected_import/preflight_desired_page_names, which still denied unrelated reconciliation and Safe handoff."
     }
   ]
 }

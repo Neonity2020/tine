@@ -5075,15 +5075,36 @@ impl Graph {
         }))
     }
 
-    /// Apply the one current graph-scope collision authority used by editor and
-    /// sparse-projection mutation. Discovery may retain portable aliases and
-    /// same-resource aliases for recovery, but no member may publish or delete
-    /// while the collision is present.
+    /// Apply strict current graph-scope collision policy to editor/name-only
+    /// mutation. Portable aliases remain readable, but an editor mutation
+    /// cannot choose one without authenticated exact logical authority.
+    fn validate_current_graph_text_collision_strict(
+        &self,
+        permit: &ManagedTextWritePermit,
+        target: &Path,
+        target_identity: Option<ContentDigest>,
+    ) -> io::Result<Vec<PageEntry>> {
+        self.validate_current_graph_text_collision_policy(permit, target, target_identity, true)
+    }
+
+    /// Validate an exact sparse-projection target. Its durable mutation
+    /// authority binds one accepted engine page to this exact path, so a
+    /// portable sibling is retained but cannot redirect the operation.
     fn validate_current_graph_text_collision(
         &self,
         permit: &ManagedTextWritePermit,
         target: &Path,
         target_identity: Option<ContentDigest>,
+    ) -> io::Result<Vec<PageEntry>> {
+        self.validate_current_graph_text_collision_policy(permit, target, target_identity, false)
+    }
+
+    fn validate_current_graph_text_collision_policy(
+        &self,
+        permit: &ManagedTextWritePermit,
+        target: &Path,
+        target_identity: Option<ContentDigest>,
+        reject_portable_sibling: bool,
     ) -> io::Result<Vec<PageEntry>> {
         let target_relative = self.rel_path(target);
         let target_portable = self.graph_text_scope.portable_path_key(&target_relative);
@@ -5092,7 +5113,8 @@ impl Graph {
             if entry.path == target {
                 continue;
             }
-            if target_portable.is_some()
+            if reject_portable_sibling
+                && target_portable.is_some()
                 && self.graph_text_scope.portable_path_key(&entry.rel_path) == target_portable
             {
                 return Err(io::Error::new(
@@ -5377,7 +5399,7 @@ impl Graph {
         requested_identity: Option<(PageKind, &str)>,
     ) -> io::Result<ExactGraphValidation> {
         let loaded_target = self.load_validated_graph_text_target(permit, target)?;
-        let entries = self.validate_current_graph_text_collision(
+        let entries = self.validate_current_graph_text_collision_strict(
             permit,
             target,
             loaded_target.as_ref().map(|loaded| loaded.file_identity),
@@ -5596,7 +5618,7 @@ impl Graph {
         projection_optional_regular_metadata(target.parent(), &target.filename)?;
         let temp = create_projection_temp(target.parent(), &target.filename, bytes)?;
         managed_write_before_mutation_hook()?;
-        if let Err(error) = self.validate_current_graph_text_collision(
+        if let Err(error) = self.validate_current_graph_text_collision_strict(
             permit,
             path,
             self.managed_optional_file_identity(permit, path)?,
@@ -5658,7 +5680,7 @@ impl Graph {
             // final byte reread and after force-save's final retained-identity
             // validation, but before the first live-name mutation.
             managed_write_before_mutation_hook()?;
-            self.validate_current_graph_text_collision(
+            self.validate_current_graph_text_collision_strict(
                 permit,
                 path,
                 self.managed_optional_file_identity(permit, path)?,
@@ -5680,12 +5702,16 @@ impl Graph {
                 ));
             }
             managed_write_after_retire_hook()?;
-            self.validate_current_graph_text_collision(permit, path, Some(retired_identity))?;
+            self.validate_current_graph_text_collision_strict(
+                permit,
+                path,
+                Some(retired_identity),
+            )?;
 
             rename_projection_noreplace(target.parent(), &temp, &target.filename)?;
             published = true;
             sync_projection_chain_required(&target.chain)?;
-            self.validate_current_graph_text_collision(
+            self.validate_current_graph_text_collision_strict(
                 permit,
                 path,
                 self.managed_optional_file_identity(permit, path)?,
@@ -5703,7 +5729,7 @@ impl Graph {
             Err(primary) => {
                 if retired && !published {
                     let restore = managed_write_before_restore_hook().and_then(|()| {
-                        self.validate_current_graph_text_collision(
+                        self.validate_current_graph_text_collision_strict(
                             permit,
                             path,
                             Some(expected_identity),
@@ -6009,6 +6035,74 @@ impl Graph {
         require_projection_platform()?;
         let permit = self.admit_retained_managed_text_writer()?;
         collect_reconciliation_scan_pass(self, &permit, limits)
+    }
+
+    /// Join a complete physical scan to the already-built semantic admission
+    /// snapshot without rereading or reparsing any file. Direct foundation
+    /// scans may run before admission exists; live reconciliation always calls
+    /// this while its queue-fenced index is `CatchingUp` or `Complete`.
+    fn attach_reconciliation_scan_semantic_keys(
+        &self,
+        files: &mut [crate::oplog::reconciliation_scan::GraphTextScanFileFingerprint],
+    ) -> io::Result<()> {
+        use crate::oplog::reconciliation_scan::GraphTextScanPathClass;
+
+        let index = {
+            let state = self.graph_text_admission.read().unwrap();
+            match &*state {
+                GraphTextAdmissionState::SnapshotComplete(index)
+                | GraphTextAdmissionState::CatchingUp(index)
+                | GraphTextAdmissionState::Complete(index) => Some(Arc::clone(index)),
+                GraphTextAdmissionState::Poisoned { cause, .. } => {
+                    return Err(graph_text_admission_unavailable(cause));
+                }
+                GraphTextAdmissionState::Unbuilt
+                | GraphTextAdmissionState::Armed(_)
+                | GraphTextAdmissionState::Building { .. } => None,
+            }
+        };
+        let Some(index) = index else {
+            return Ok(());
+        };
+
+        for file in files {
+            if !matches!(
+                file.class,
+                GraphTextScanPathClass::EligibleManaged(_)
+                    | GraphTextScanPathClass::EligibleUnmanaged
+            ) {
+                continue;
+            }
+            let path = ManagedPath::parse(file.exact_relative.clone()).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("eligible scan path lost managed identity: {error}"),
+                )
+            })?;
+            let record = index.files_by_exact_path.get(&path).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    format!(
+                        "queue-fenced semantic admission lacks scanned path {}",
+                        file.exact_relative
+                    ),
+                )
+            })?;
+            if file.description != Some(record.description)
+                || file.file_resource_id != record.file_resource_id
+                || file.link_count != record.link_count
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    format!(
+                        "queue-fenced semantic admission differs from scanned path {}",
+                        file.exact_relative
+                    ),
+                ));
+            }
+            file.semantic_key = Some(graph_text_semantic_key_digest(&record.semantic));
+        }
+        Ok(())
     }
 
     fn begin_graph_text_admission_build(
@@ -6963,15 +7057,6 @@ impl Graph {
         }
         let Some(record) = index.files_by_exact_path.get(path).cloned() else {
             let absent = match (|| {
-                if index
-                    .paths_by_portable_key
-                    .get(&path.portable_key())
-                    .is_some_and(|members| !members.is_empty())
-                {
-                    return Err(graph_text_admission_unavailable(
-                        "absent graph-text spelling has a retained portable collision",
-                    ));
-                }
                 let first_parent = self.graph_text_event_parent(&target)?;
                 validate_graph_text_event_parent(&index, &target, &first_parent)?;
                 match first_parent.final_dir().symlink_metadata(&target.filename) {
@@ -7052,11 +7137,9 @@ impl Graph {
             .cloned()
             .unwrap_or_default();
         if record.link_count != 1
-            || portable_members.len() != 1
             || !portable_members.contains(path)
             || resource_members.len() != 1
             || !resource_members.contains(path.as_str())
-            || semantic_members.len() != 1
             || !semantic_members.contains(path)
             || index
                 .file_resource_by_exact_relative
@@ -9303,14 +9386,10 @@ impl Graph {
         target: &ProjectionTarget,
     ) -> io::Result<()> {
         projection_optional_regular_metadata(parent.final_dir(), &target.filename)?;
-        match parent.final_dir().symlink_metadata(&target.twin_filename) {
-            Ok(_) => Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "projection page has an .md/.org twin",
-            )),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error),
-        }
+        // An authenticated exact projection may coexist with an independent
+        // regular .md/.org twin. Validate its shape without granting it any
+        // authority over the target path.
+        projection_optional_regular_metadata(parent.final_dir(), &target.twin_filename)
     }
 
     fn ensure_projection_parent_binding(
@@ -21461,7 +21540,6 @@ fn collect_reconciliation_scan_pass(
     let mut directory_resources = std::collections::BTreeMap::new();
     directory_resources.insert(root_directory_resource, String::new());
     let mut file_resources = std::collections::BTreeMap::new();
-    let mut portable_paths = std::collections::BTreeMap::new();
     let mut files = Vec::new();
     let mut pending = vec![PendingDirectory {
         directory: root,
@@ -21623,6 +21701,22 @@ fn collect_reconciliation_scan_pass(
             let is_configuration = child_relative.eq_ignore_ascii_case("logseq/config.edn");
             let is_conflict = page_like && path_is_sync_conflict(Path::new(&child_relative));
             let eligible = graph.graph_text_scope.is_eligible(&child_relative);
+            let under_configured_root = [&graph.config.pages_dir, &graph.config.journals_dir]
+                .into_iter()
+                .any(|root| {
+                    child_relative
+                        .strip_prefix(root)
+                        .is_some_and(|tail| tail.starts_with('/'))
+                });
+            if page_like
+                && under_configured_root
+                && !eligible
+                && ManagedPath::parse(child_relative.clone()).is_err()
+            {
+                return Err(reconciliation_scan_unsafe_error(format!(
+                    "configured graph-text path is not portable: {child_relative}"
+                )));
+            }
             let lexically_managed = if eligible {
                 Some(ManagedPath::parse(child_relative.clone()).map_err(|error| {
                     reconciliation_scan_unsafe_error(format!(
@@ -21640,13 +21734,6 @@ fn collect_reconciliation_scan_pass(
                 let path = lexically_managed
                     .expect("eligible graph-text files have recognized text extensions");
                 let portable_key = path.portable_key();
-                if let Some(first) =
-                    portable_paths.insert(portable_key.clone(), child_relative.clone())
-                {
-                    return Err(reconciliation_scan_unsafe_error(format!(
-                        "scan graph-text paths collide portably: {first} and {child_relative}"
-                    )));
-                }
                 let class = match graph.classify_managed_text_path(&path) {
                     Ok(kind) => GraphTextScanPathClass::EligibleManaged(kind),
                     Err(_) => GraphTextScanPathClass::EligibleUnmanaged,
@@ -21697,6 +21784,7 @@ fn collect_reconciliation_scan_pass(
                 exact_relative: child_relative,
                 class,
                 portable_key,
+                semantic_key: None,
                 description,
                 file_resource_id,
                 link_count,
@@ -21721,6 +21809,7 @@ fn collect_reconciliation_scan_pass(
             "scan contains duplicate exact regular-file paths",
         ));
     }
+    graph.attach_reconciliation_scan_semantic_keys(&mut files)?;
     graph.ensure_projection_root_binding().map_err(|error| {
         io::Error::new(
             io::ErrorKind::Interrupted,
@@ -22702,9 +22791,6 @@ fn collect_bootstrap_source_pass(
         sort_bootstrap_source_spool(&paths, kind, &mut state.instrumentation)?;
     }
     validate_bootstrap_source_unique_aliases(&paths.sorted(BootstrapSourceSpoolKind::Aliases))?;
-    validate_bootstrap_source_unique_portable_paths(
-        &paths.sorted(BootstrapSourceSpoolKind::Portable),
-    )?;
     validate_bootstrap_source_sorted_entries(
         &paths.sorted(BootstrapSourceSpoolKind::Entries),
         state.source_files,
@@ -23766,23 +23852,6 @@ fn validate_bootstrap_source_unique_aliases(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn validate_bootstrap_source_unique_portable_paths(path: &Path) -> io::Result<()> {
-    let mut reader = BootstrapSourceFrameReader::open(path)?;
-    let mut previous: Option<(String, String)> = None;
-    while let Some(frame) = reader.next()? {
-        let (key, exact) = bootstrap_source_portable_key(&frame)?;
-        if let Some((previous_key, previous_exact)) = &previous {
-            if previous_key == key && previous_exact != exact {
-                return Err(bootstrap_source_capture_error(format!(
-                    "source paths collide under the portable graph-text key: {previous_exact} and {exact}"
-                )));
-            }
-        }
-        previous = Some((key.to_owned(), exact.to_owned()));
-    }
-    Ok(())
-}
-
 fn validate_bootstrap_source_sorted_entries(path: &Path, expected_count: u64) -> io::Result<()> {
     let mut cursor = BootstrapSourceEntryCursor::open(path.to_path_buf())?;
     let mut count = 0_u64;
@@ -24571,6 +24640,15 @@ fn graph_text_semantic_key(entry: &PageEntry) -> (u8, String) {
     (kind, crate::refs::page_key(&entry.name))
 }
 
+fn graph_text_semantic_key_digest(entry: &PageEntry) -> ContentDigest {
+    let key = crate::refs::page_key(&entry.name);
+    let mut hasher = Sha256::new();
+    hasher.update(b"tine/graph-text-semantic-collision-key/v1\0");
+    hasher.update((key.len() as u64).to_be_bytes());
+    hasher.update(key.as_bytes());
+    ContentDigest::from_bytes(hasher.finalize().into())
+}
+
 fn initial_shadow_captures_match(
     first: &InitialShadowCapture,
     second: &InitialShadowCapture,
@@ -25309,26 +25387,6 @@ fn initial_shadow_global_collision(index: &CompleteGraphTextAdmissionIndex) -> O
             "managed files alias one retained resource",
         ));
     }
-    if index
-        .paths_by_portable_key
-        .values()
-        .any(|members| members.len() > 1)
-    {
-        return Some(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "initial shadow managed paths share one portable key",
-        ));
-    }
-    if index
-        .paths_by_semantic_key
-        .values()
-        .any(|members| members.len() > 1)
-    {
-        return Some(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "initial shadow managed paths share one semantic key",
-        ));
-    }
     None
 }
 
@@ -25558,11 +25616,9 @@ fn validate_graph_text_admission_delta(
         if resource != Some(&record.file_resource_id)
             || link_count != Some(&record.link_count)
             || record.link_count != 1
-            || portable.len() != 1
             || !portable.contains(&path)
             || resources.len() != 1
             || !resources.contains(relative)
-            || semantic.len() != 1
             || !semantic.contains(&path)
             || index.tombstones_by_exact_path.contains_key(&path)
             || is_graph_text != Some(true)
@@ -31911,37 +31967,26 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn projection_late_write_remove_and_restore_collisions_preserve_every_version() {
-        // A portable alias introduced after the previous scan but before
-        // retirement blocks the write with no mutation or cache advancement.
+        // A portable loser introduced after the previous scan cannot redirect
+        // exact projection authority or block the accepted target.
         let dir = scratch("projection-controllable-write-window");
         let target = dir.join("pages/LateWrite.md");
         let alias = dir.join("pages/latewrite.md");
         fs::write(&target, b"- base\n").unwrap();
         let graph = Graph::open(&dir);
         graph.warm_cache();
-        let generation = graph.cache_generation();
-        let revisions = graph.disk_revs.read().unwrap().clone();
         PROJECTION_LATE_COLLISION.with(|hook| {
             let alias = alias.clone();
             *hook.borrow_mut() = Some(Box::new(move || fs::write(alias, b"- alias\n")));
         });
-        assert_eq!(
-            graph
-                .write_projection_exact("pages/LateWrite.md", Some(b"- base\n"), b"- target\n")
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::AlreadyExists
-        );
-        assert_eq!(fs::read(&target).unwrap(), b"- base\n");
-        assert_eq!(fs::read(&alias).unwrap(), b"- alias\n");
-        assert!(projection_recovery_paths(target.parent().unwrap()).is_empty());
-        assert_eq!(graph.cache_generation(), generation);
-        assert_eq!(*graph.disk_revs.read().unwrap(), revisions);
-        fs::remove_file(&alias).unwrap();
         graph
             .write_projection_exact("pages/LateWrite.md", Some(b"- base\n"), b"- target\n")
             .unwrap();
         assert_eq!(fs::read(&target).unwrap(), b"- target\n");
+        assert_eq!(fs::read(&alias).unwrap(), b"- alias\n");
+        assert!(projection_recovery_bytes(target.parent().unwrap())
+            .iter()
+            .any(|bytes| bytes == b"- base\n"));
         let _ = fs::remove_dir_all(&dir);
 
         // A same-inode alias introduced in the corresponding removal window
@@ -32047,43 +32092,28 @@ mod tests {
             .unwrap();
         let _ = fs::remove_dir_all(&dir);
 
-        // A portable alias appearing after publication withdraws the just-
-        // published inode and retains both base and target bytes; no cache/proof
-        // advances. Once disambiguated, the durable retirement can be resumed.
+        // A portable loser appearing after publication remains untouched while
+        // the exact accepted target completes normally.
         let dir = scratch("projection-controllable-post-publish-window");
         let target = dir.join("pages/LatePublished.md");
         let alias = dir.join("pages/latepublished.md");
         fs::write(&target, b"- base\n").unwrap();
         let graph = Graph::open(&dir);
         graph.warm_cache();
-        let generation = graph.cache_generation();
-        let revisions = graph.disk_revs.read().unwrap().clone();
         PROJECTION_POST_PUBLISH_COLLISION.with(|hook| {
             let alias = alias.clone();
             *hook.borrow_mut() = Some(Box::new(move || fs::write(alias, b"- alias\n")));
         });
-        assert_eq!(
-            graph
-                .write_projection_exact("pages/LatePublished.md", Some(b"- base\n"), b"- target\n",)
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::AlreadyExists
-        );
-        assert!(!target.exists());
+        graph
+            .write_projection_exact("pages/LatePublished.md", Some(b"- base\n"), b"- target\n")
+            .unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"- target\n");
         assert_eq!(fs::read(&alias).unwrap(), b"- alias\n");
         let retained = projection_recovery_paths(target.parent().unwrap())
             .into_iter()
             .map(|path| fs::read(path).unwrap())
             .collect::<Vec<_>>();
         assert!(retained.iter().any(|bytes| bytes == b"- base\n"));
-        assert!(retained.iter().any(|bytes| bytes == b"- target\n"));
-        assert_eq!(graph.cache_generation(), generation);
-        assert_eq!(*graph.disk_revs.read().unwrap(), revisions);
-        fs::remove_file(&alias).unwrap();
-        graph
-            .write_projection_exact("pages/LatePublished.md", Some(b"- base\n"), b"- target\n")
-            .unwrap();
-        assert_eq!(fs::read(&target).unwrap(), b"- target\n");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -32563,9 +32593,8 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn every_projection_mutation_rechecks_late_graph_scope_collisions() {
-        // Write: a portable-fold alias arriving after Graph open must prevent
-        // even parent creation, then the unaffected exact path remains usable.
+    fn exact_projection_authority_ignores_portable_losers_but_rejects_resource_aliases() {
+        // Exact creation grants no authority over the portable loser.
         let dir = scratch("projection-late-collision-write");
         let graph = Graph::open(&dir);
         graph.warm_cache();
@@ -32573,22 +32602,12 @@ mod tests {
         let alias = dir.join("pages/nested/projectionwrite.md");
         fs::create_dir_all(alias.parent().unwrap()).unwrap();
         fs::write(&alias, b"- alias\n").unwrap();
-        let generation = graph.cache_generation();
-        let disk_revs = graph.disk_revs.read().unwrap().clone();
-        let error = graph
-            .write_projection_exact("pages/nested/ProjectionWrite.md", None, b"- projected\n")
-            .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
-        assert!(!target.exists());
-        assert_eq!(fs::read(&alias).unwrap(), b"- alias\n");
-        assert!(projection_recovery_bytes(alias.parent().unwrap()).is_empty());
-        assert_eq!(graph.cache_generation(), generation);
-        assert_eq!(*graph.disk_revs.read().unwrap(), disk_revs);
-        fs::remove_file(&alias).unwrap();
         graph
             .write_projection_exact("pages/nested/ProjectionWrite.md", None, b"- projected\n")
             .unwrap();
         assert_eq!(fs::read(&target).unwrap(), b"- projected\n");
+        assert_eq!(fs::read(&alias).unwrap(), b"- alias\n");
+        assert!(projection_recovery_bytes(alias.parent().unwrap()).is_empty());
         let _ = fs::remove_dir_all(&dir);
 
         // Removal: a newly-created hard link is a late same-resource alias.
@@ -32617,8 +32636,7 @@ mod tests {
         assert!(!target.exists());
         let _ = fs::remove_dir_all(&dir);
 
-        // Present-target recovery: a late portable alias blocks proof/cache
-        // publication without touching either file.
+        // Present-target recovery proves only the accepted exact path.
         let dir = scratch("projection-late-collision-recovery");
         let graph = Graph::open(&dir);
         graph
@@ -32627,24 +32645,14 @@ mod tests {
         let target = dir.join("pages/ProjectionRecover.md");
         let alias = dir.join("pages/projectionrecover.md");
         fs::write(&alias, b"- alias\n").unwrap();
-        let generation = graph.cache_generation();
-        let disk_revs = graph.disk_revs.read().unwrap().clone();
-        let error = graph
-            .recover_projection_exact("pages/ProjectionRecover.md", b"- target\n")
-            .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
-        assert_eq!(fs::read(&target).unwrap(), b"- target\n");
-        assert_eq!(fs::read(&alias).unwrap(), b"- alias\n");
-        assert_eq!(graph.cache_generation(), generation);
-        assert_eq!(*graph.disk_revs.read().unwrap(), disk_revs);
-        fs::remove_file(&alias).unwrap();
         graph
             .recover_projection_exact("pages/ProjectionRecover.md", b"- target\n")
             .unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"- target\n");
+        assert_eq!(fs::read(&alias).unwrap(), b"- alias\n");
         let _ = fs::remove_dir_all(&dir);
 
-        // Recovered removal: absence and retained evidence do not authorize
-        // proof while another portable owner has appeared.
+        // Recovered removal proves exact absence without deleting the loser.
         let dir = scratch("projection-late-collision-removed-recovery");
         let target = dir.join("pages/ProjectionRemoved.md");
         fs::write(&target, b"- base\n").unwrap();
@@ -32654,42 +32662,27 @@ mod tests {
             .unwrap();
         let alias = dir.join("pages/projectionremoved.md");
         fs::write(&alias, b"- alias\n").unwrap();
-        let generation = graph.cache_generation();
         let evidence = projection_recovery_bytes(target.parent().unwrap());
-        let error = graph
+        graph
             .recover_removed_projection_exact("pages/ProjectionRemoved.md", b"- base\n")
-            .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+            .unwrap();
         assert!(!target.exists());
         assert_eq!(fs::read(&alias).unwrap(), b"- alias\n");
         assert_eq!(
             projection_recovery_bytes(target.parent().unwrap()),
             evidence
         );
-        assert_eq!(graph.cache_generation(), generation);
-        fs::remove_file(&alias).unwrap();
-        graph
-            .recover_removed_projection_exact("pages/ProjectionRemoved.md", b"- base\n")
-            .unwrap();
         let _ = fs::remove_dir_all(&dir);
 
-        // Removal confirmation carries deletion authority too, so the same
-        // current collision rule applies even though the target is absent.
+        // Removal confirmation likewise cannot delete a portable loser.
         let dir = scratch("projection-late-collision-confirmation");
         let graph = Graph::open(&dir);
         let alias = dir.join("pages/projectionconfirm.md");
         fs::write(&alias, b"- alias\n").unwrap();
-        let generation = graph.cache_generation();
-        let error = graph
-            .confirm_removed_projection_exact("pages/ProjectionConfirm.md")
-            .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
-        assert_eq!(fs::read(&alias).unwrap(), b"- alias\n");
-        assert_eq!(graph.cache_generation(), generation);
-        fs::remove_file(&alias).unwrap();
         graph
             .confirm_removed_projection_exact("pages/ProjectionConfirm.md")
             .unwrap();
+        assert_eq!(fs::read(&alias).unwrap(), b"- alias\n");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -33607,7 +33600,7 @@ mod tests {
         )
         .unwrap();
         let graph = Graph::open(&portable);
-        assert!(graph.initial_shadow_raw_managed_text_inventory().is_err());
+        graph.initial_shadow_raw_managed_text_inventory().unwrap();
         let state = graph.graph_text_admission.read().unwrap();
         let GraphTextAdmissionState::SnapshotComplete(index) = &*state else {
             panic!("collision evidence must remain in the private snapshot");
@@ -33628,7 +33621,7 @@ mod tests {
         fs::write(semantic.join("a/One.md"), b"title:: Shared\n\n- one\n").unwrap();
         fs::write(semantic.join("b/Two.org"), b"#+title: Shared\n* two\n").unwrap();
         let graph = Graph::open(&semantic);
-        assert!(graph.initial_shadow_raw_managed_text_inventory().is_err());
+        graph.initial_shadow_raw_managed_text_inventory().unwrap();
         let state = graph.graph_text_admission.read().unwrap();
         let GraphTextAdmissionState::SnapshotComplete(index) = &*state else {
             panic!("unarmed semantic collision remains diagnostic-only");
@@ -34203,7 +34196,7 @@ mod tests {
     }
 
     #[test]
-    fn admission_event_collision_rejects_with_bounded_payload_work() {
+    fn admission_event_collision_is_retained_with_bounded_payload_work() {
         let root = scratch("admission-event-bounded-collision");
         fs::write(root.join("One.md"), b"title:: One\n").unwrap();
         fs::write(root.join("Two.md"), b"title:: Two\n").unwrap();
@@ -34213,7 +34206,7 @@ mod tests {
         fs::write(root.join("Two.md"), b"title:: One\n").unwrap();
 
         reset_graph_text_admission_test_counters();
-        assert!(graph
+        graph
             .apply_graph_text_admission_event(
                 &token,
                 1,
@@ -34221,19 +34214,25 @@ mod tests {
                     relative: "Two.md".to_owned(),
                 },
             )
-            .is_err());
+            .unwrap();
         let counters = graph_text_admission_test_counters();
         assert_eq!(counters.builder_enumerations, 0);
         assert_eq!(counters.parser_invocations, 1);
         assert!(
             counters.persistent_payload_members <= 20,
-            "a collision-free complete index bounds every touched old/new group: {counters:?}"
+            "one touched collision group stays bounded: {counters:?}"
         );
         assert!(counters.persistent_node_allocations < 256);
         assert!(matches!(
             &*graph.graph_text_admission.read().unwrap(),
-            GraphTextAdmissionState::Poisoned { .. }
+            GraphTextAdmissionState::Complete(_)
         ));
+        let epoch = graph.graph_text_admission_epoch().unwrap();
+        let observation = graph
+            .graph_text_admission_exact(&epoch, &ManagedPath::parse("Two.md").unwrap())
+            .unwrap()
+            .into_present();
+        assert_eq!(observation.semantic_members.len(), 2);
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -34297,7 +34296,7 @@ mod tests {
 
         let graph = Graph::open(&root);
         reset_graph_text_admission_test_counters();
-        assert!(graph.initial_shadow_raw_managed_text_inventory().is_err());
+        graph.initial_shadow_raw_managed_text_inventory().unwrap();
         let counters = graph_text_admission_test_counters();
         assert_eq!(
             counters.persistent_payload_members,
@@ -34952,7 +34951,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn armed_collision_builds_poison_and_complete_collision_points_still_block() {
+    fn armed_semantic_and_portable_collisions_retain_exact_evidence() {
         let portable = scratch("admission-armed-portable-collision");
         fs::write(portable.join("Caf\u{e9}.md"), b"title:: One\n").unwrap();
         fs::write(portable.join("Cafe\u{301}.MD"), b"title:: Two\n").unwrap();
@@ -34967,11 +34966,28 @@ mod tests {
         fs::write(semantic.join("a/One.md"), b"title:: Shared\n").unwrap();
         fs::write(semantic.join("b/Two.org"), b"#+title: Shared\n").unwrap();
 
-        for (root, member) in [
-            (&portable, "Caf\u{e9}.md"),
-            (&resource, "Page.md"),
-            (&semantic, "a/One.md"),
-        ] {
+        for (root, member, group_len) in
+            [(&portable, "Caf\u{e9}.md", 2), (&semantic, "a/One.md", 2)]
+        {
+            let graph = Graph::open(root);
+            let _lease = graph.arm_graph_text_admission_feed(0).unwrap();
+            graph.initial_shadow_raw_managed_text_inventory().unwrap();
+            assert!(matches!(
+                &*graph.graph_text_admission.read().unwrap(),
+                GraphTextAdmissionState::Complete(_)
+            ));
+            let epoch = graph.graph_text_admission_epoch().unwrap();
+            let observation = graph
+                .graph_text_admission_exact(&epoch, &ManagedPath::parse(member).unwrap())
+                .unwrap()
+                .into_present();
+            assert!(
+                observation.portable_members.len() == group_len
+                    || observation.semantic_members.len() == group_len
+            );
+        }
+
+        for (root, member) in [(&resource, "Page.md")] {
             let graph = Graph::open(root);
             let _lease = graph.arm_graph_text_admission_feed(0).unwrap();
             assert!(graph.initial_shadow_raw_managed_text_inventory().is_err());
@@ -35011,7 +35027,7 @@ mod tests {
         fs::write(defensive.join("a/One.md"), b"title:: Shared\n").unwrap();
         fs::write(defensive.join("b/Two.md"), b"title:: Shared\n").unwrap();
         let graph = Graph::open(&defensive);
-        assert!(graph.initial_shadow_raw_managed_text_inventory().is_err());
+        graph.initial_shadow_raw_managed_text_inventory().unwrap();
         {
             let mut state = graph.graph_text_admission.write().unwrap();
             let GraphTextAdmissionState::SnapshotComplete(index) = &*state else {
@@ -35023,9 +35039,11 @@ mod tests {
         }
         let epoch = graph.graph_text_admission_epoch().unwrap();
         reset_graph_text_admission_test_counters();
-        assert!(graph
-            .graph_text_admission_exact(&epoch, &ManagedPath::parse("a/One.md").unwrap(),)
-            .is_err());
+        let observation = graph
+            .graph_text_admission_exact(&epoch, &ManagedPath::parse("a/One.md").unwrap())
+            .unwrap()
+            .into_present();
+        assert_eq!(observation.semantic_members.len(), 2);
         assert_eq!(graph_text_admission_test_counters().builder_enumerations, 0);
 
         let _ = fs::remove_dir_all(&portable);
@@ -35603,34 +35621,60 @@ mod tests {
     }
 
     #[test]
-    fn staged_exact_feed_batch_collisions_are_atomic_and_terminal() {
+    fn staged_exact_feed_retains_logical_collisions_but_rejects_aliases() {
         let portable_root = scratch("staged-exact-feed-portable-collision");
         let portable = Graph::open(&portable_root);
         let lease = staged_exact_feed_build(&portable, 0);
         fs::write(portable_root.join("A.md"), b"- upper\n").unwrap();
         fs::write(portable_root.join("a.MD"), b"- lower\n").unwrap();
-        assert!(portable
+        portable
             .apply_graph_text_exact_feed_batch(
                 &lease,
                 lease
                     .batch(1, 2, vec!["A.md".to_owned(), "a.MD".to_owned()])
-                    .unwrap()
+                    .unwrap(),
             )
-            .is_err());
+            .unwrap();
+        portable
+            .publish_graph_text_exact_feed_caught_up(&lease, 2)
+            .unwrap();
+        let epoch = portable.graph_text_admission_epoch().unwrap();
+        assert_eq!(
+            portable
+                .graph_text_admission_exact(&epoch, &ManagedPath::parse("A.md").unwrap())
+                .unwrap()
+                .into_present()
+                .portable_members
+                .len(),
+            2
+        );
 
         let semantic_root = scratch("staged-exact-feed-semantic-collision");
         let semantic = Graph::open(&semantic_root);
         let lease = staged_exact_feed_build(&semantic, 0);
         fs::write(semantic_root.join("One.md"), b"title:: Shared\n- one\n").unwrap();
         fs::write(semantic_root.join("Two.org"), b"#+title: Shared\n* two\n").unwrap();
-        assert!(semantic
+        semantic
             .apply_graph_text_exact_feed_batch(
                 &lease,
                 lease
                     .batch(1, 2, vec!["One.md".to_owned(), "Two.org".to_owned()])
-                    .unwrap()
+                    .unwrap(),
             )
-            .is_err());
+            .unwrap();
+        semantic
+            .publish_graph_text_exact_feed_caught_up(&lease, 2)
+            .unwrap();
+        let epoch = semantic.graph_text_admission_epoch().unwrap();
+        assert_eq!(
+            semantic
+                .graph_text_admission_exact(&epoch, &ManagedPath::parse("One.md").unwrap())
+                .unwrap()
+                .into_present()
+                .semantic_members
+                .len(),
+            2
+        );
 
         let resource_root = scratch("staged-exact-feed-resource-collision");
         let resource = Graph::open(&resource_root);
@@ -35650,13 +35694,18 @@ mod tests {
             )
             .is_err());
 
-        for graph in [&portable, &semantic, &resource] {
-            assert!(graph.graph_text_admission_epoch().is_err());
+        for graph in [&portable, &semantic] {
+            assert!(graph.graph_text_admission_epoch().is_ok());
             assert!(matches!(
                 &*graph.graph_text_admission.read().unwrap(),
-                GraphTextAdmissionState::Poisoned { .. }
+                GraphTextAdmissionState::Complete(_)
             ));
         }
+        assert!(resource.graph_text_admission_epoch().is_err());
+        assert!(matches!(
+            &*resource.graph_text_admission.read().unwrap(),
+            GraphTextAdmissionState::Poisoned { .. }
+        ));
         for root in [portable_root, semantic_root, resource_root] {
             let _ = fs::remove_dir_all(root);
         }
@@ -36442,7 +36491,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn initial_shadow_rejects_file_aliases_and_portable_path_collisions() {
+    fn initial_shadow_rejects_file_aliases_but_retains_portable_collisions() {
         let aliases = scratch("initial-shadow-hardlink");
         fs::write(aliases.join("pages/a.md"), b"- a\n").unwrap();
         fs::hard_link(aliases.join("pages/a.md"), aliases.join("pages/alias.tmp")).unwrap();
@@ -36453,7 +36502,19 @@ mod tests {
         fs::write(portable.join("pages/Foo.md"), b"- upper\n").unwrap();
         fs::write(portable.join("pages/foo.md"), b"- lower\n").unwrap();
         let graph = Graph::open(&portable);
-        assert!(graph.initial_shadow_raw_managed_text_inventory().is_err());
+        graph.initial_shadow_raw_managed_text_inventory().unwrap();
+        let state = graph.graph_text_admission.read().unwrap();
+        let GraphTextAdmissionState::SnapshotComplete(index) = &*state else {
+            panic!("portable collision must remain exact evidence");
+        };
+        assert_eq!(
+            index
+                .paths_by_portable_key
+                .get(&ManagedPath::parse("pages/Foo.md").unwrap().portable_key())
+                .unwrap()
+                .len(),
+            2
+        );
 
         let _ = fs::remove_dir_all(&aliases);
         let _ = fs::remove_dir_all(&portable);

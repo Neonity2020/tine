@@ -3,7 +3,7 @@
 //! This module plans reconciliation only. It does not publish semantic
 //! operations, write a graph, consult SQLite, or activate managed sync.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
@@ -1878,8 +1878,6 @@ fn prepare_bootstrap_source_protocol(
     let name_receipt = names_sort.finish(&names_sorted)?;
     record_sort_receipt(instrumentation, blob_receipt);
     record_sort_receipt(instrumentation, name_receipt);
-    validate_unique_logical_names(&names_sorted)?;
-
     let blob_root = build_source_blob_root(&blob_sorted)?;
     let inventory_pages = working.join(BOOTSTRAP_STREAM_INVENTORY_PAGES);
     let blob_pages = working.join(BOOTSTRAP_STREAM_BLOB_PAGES);
@@ -1916,22 +1914,33 @@ fn record_sort_receipt(
         .max(receipt.peak_buffer_bytes);
 }
 
-fn validate_unique_logical_names(path: &Path) -> Result<(), BootstrapStreamingImportError> {
-    let mut reader = SortRecordReader::open(path)?;
-    let mut previous: Option<(Vec<u8>, Vec<u8>)> = None;
-    while let Some(record) = reader.next()? {
-        if let Some((key, first_path)) = &previous {
-            if *key == record.key {
-                return Err(BootstrapStreamingImportError::InvalidSource(format!(
-                    "captured paths {:?} and {:?} decode to the same logical page name",
-                    String::from_utf8_lossy(first_path),
-                    String::from_utf8_lossy(&record.value)
-                )));
-            }
+/// Select the deterministic bootstrap page set while retaining the capture's
+/// complete exact source inventory and blob evidence.
+///
+/// Entries are sealed in exact-path order. The first member that does not
+/// collide with an already selected effective name or portable path wins,
+/// matching graph discovery's deterministic path ordering. Later members stay
+/// in the authenticated source protocol but acquire no semantic operations.
+pub(crate) fn bootstrap_authoritative_source_paths(
+    capture: &BootstrapSourceCapture,
+) -> Result<HashSet<ManagedPath>, BootstrapStreamingImportError> {
+    let mut logical_names = HashSet::new();
+    let mut portable_paths = HashSet::new();
+    let mut authoritative = HashSet::new();
+    let mut entries = capture.entries_cursor()?;
+    while let Some(entry) = entries.next()? {
+        let logical_name = LogicalPageName::parse(entry.logical_name().to_owned())
+            .map_err(|error| BootstrapStreamingImportError::InvalidSource(error.to_string()))?;
+        let logical_key = logical_name.key_digest();
+        let portable_key = entry.path().portable_key();
+        if logical_names.contains(&logical_key) || portable_paths.contains(&portable_key) {
+            continue;
         }
-        previous = Some((record.key, record.value));
+        logical_names.insert(logical_key);
+        portable_paths.insert(portable_key);
+        authoritative.insert(entry.path().clone());
     }
-    Ok(())
+    Ok(authoritative)
 }
 
 fn build_source_blob_root(
@@ -2172,6 +2181,7 @@ fn spool_bootstrap_operations(
     working: &Path,
     instrumentation: &mut BootstrapStreamingImportInstrumentation,
 ) -> Result<BootstrapOperationSpool, BootstrapStreamingImportError> {
+    let authoritative_paths = bootstrap_authoritative_source_paths(capture)?;
     let page_path = working.join("phase-page.sorted");
     let block_path = working.join("phase-block.sorted");
     let identity_candidates_path = working.join("identity-candidates.sorted");
@@ -2187,6 +2197,9 @@ fn spool_bootstrap_operations(
 
     while let Some(entry) = entries.next()? {
         let bytes = source_reader.read_entry(&entry, instrumentation)?;
+        if !authoritative_paths.contains(entry.path()) {
+            continue;
+        }
         let text = std::str::from_utf8(&bytes).map_err(|_| {
             BootstrapStreamingImportError::InvalidSource(format!(
                 "captured source {} is not UTF-8",

@@ -2198,16 +2198,16 @@ mod tests {
     }
 
     /// Reopen one already-`LocalActive` runtime over a graph that gained an
-    /// archived copy of a page while Tine was closed, and report what the
+    /// physical copy of a page while Tine was closed, and report what the
     /// public handle did with an unrelated ordinary offline edit.
-    fn reopen_with_archived_copy(
+    fn reopen_with_physical_copy(
         fixture: &RuntimeHostFixture,
-        archived_name: &str,
+        copy_path: &str,
     ) -> (bool, Vec<SyncRuntimeTick>, String) {
         let graph_root = fixture.graph_root().to_path_buf();
-        fs::create_dir_all(graph_root.join("archive/2026")).unwrap();
+        fs::create_dir_all(graph_root.join(copy_path).parent().unwrap()).unwrap();
         let page = "content/nested pages/Meeting notes.md";
-        let archived = format!("archive/2026/{archived_name}");
+        let archived = copy_path.to_owned();
         fs::write(graph_root.join(page), b"- current\n").unwrap();
         fs::write(graph_root.join(&archived), b"- archived\n").unwrap();
 
@@ -2263,7 +2263,7 @@ mod tests {
     fn duplicate_effective_page_name_does_not_deny_the_whole_graph() {
         let control = RuntimeHostFixture::safe("sync-runtime-duplicate-name-control");
         let (control_ok, control_ticks, control_shutdown) =
-            reopen_with_archived_copy(&control, "Meeting notes 2025.md");
+            reopen_with_physical_copy(&control, "archive/2026/Meeting notes 2025.md");
         assert!(
             control_ok,
             "control: an archived copy under a distinct page name must reconcile, \
@@ -2271,12 +2271,23 @@ mod tests {
         );
 
         let fixture = RuntimeHostFixture::safe("sync-runtime-duplicate-name");
-        let (ok, ticks, shutdown) = reopen_with_archived_copy(&fixture, "Meeting notes.md");
+        let (ok, ticks, shutdown) =
+            reopen_with_physical_copy(&fixture, "archive/2026/Meeting notes.md");
         assert!(
             ok,
             "one duplicate effective page name must not stop startup reconciliation \
              for the whole graph or make clean Safe handoff unreachable, but the \
              drain produced {ticks:?} and shutdown {shutdown}"
+        );
+
+        let portable = RuntimeHostFixture::safe("sync-runtime-portable-duplicate-name");
+        let (ok, ticks, shutdown) =
+            reopen_with_physical_copy(&portable, "content/nested pages/meeting NOTES.MD");
+        assert!(
+            ok,
+            "a case-and-extension-only portable collision must retain the accepted exact owner, \
+             import the unrelated edit, and reach Safe, but the drain produced {ticks:?} \
+             and shutdown {shutdown}"
         );
     }
 }
