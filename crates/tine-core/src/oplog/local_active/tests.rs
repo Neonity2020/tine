@@ -7070,3 +7070,78 @@ fn ordinary_admissions_do_no_resume_lifecycle_work() {
         fixture.assert_graph_unchanged();
     });
 }
+
+/// A crash takeover adopts the crashed session's published point.
+///
+/// This is the common crash-recovery shape, and it is the reason the enrollment
+/// admission is derived from the *committed record* rather than from the
+/// recovery classification: at the instant the candidate is read the takeover's
+/// compare-and-swap has not run, so the live durable record is still exactly the
+/// record the crashed session published under.
+#[test]
+fn a_crash_takeover_adopts_the_crashed_sessions_published_point() {
+    on_a_deep_stack(|| {
+        let mut fixture = Fixture::new(
+            "resume-takeover-adopt",
+            None,
+            vec![("pages/takeover.md".into(), b"- takeover\n".to_vec())],
+        );
+        let root = fixture.enrollment_root("resume-takeover-adopt");
+        let binding = fixture.enrollment_binding();
+        let paths = PromotedPaths::new(&fixture, "resume-takeover-adopt");
+        let crashed = SessionId::new();
+
+        with_promoted_runtime(
+            &mut fixture,
+            &root,
+            &paths,
+            crashed,
+            |fixture, authority, runtime| {
+                publish_expecting_success(fixture, authority, runtime);
+                // Durable work after the point, then the process dies without a
+                // drain: the classic `Unsafe` crash.
+                append_local_batch(fixture, authority, runtime, 0xE800);
+            },
+        );
+        let runs = retained_run_directories(&fixture.archive_root);
+        assert_eq!(runs.len(), 1);
+
+        with_taken_over_runtime(
+            &fixture,
+            &root,
+            &binding,
+            &paths,
+            SessionId::new(),
+            |fixture, _, runtime| {
+                assert_eq!(
+                    runtime.recovery(),
+                    RuntimeRecoveryState::TookOverCrashedUnsafe {
+                        previous_session: crashed
+                    }
+                );
+                let opened = runtime.resume_open_status().clone();
+                assert!(
+                    opened.adopted(),
+                    "a takeover must be able to adopt its predecessor's point: {opened:?}"
+                );
+                assert!(!opened.observation().refused);
+                assert!(opened.observation().replay_base_generation > 0);
+                assert_eq!(
+                    retained_run_directories(&fixture.archive_root),
+                    runs,
+                    "adoption reuses the crashed session's run"
+                );
+                // Automatic external import stays blocked: adopting a
+                // predecessor's *scratch state* says nothing about its drain.
+                assert_eq!(
+                    runtime.automatic_external_import(),
+                    ExternalImportAdmission::Blocked(
+                        "this runtime took over a crashed session's Unsafe handoff, whose drain \
+                         was never proved"
+                    )
+                );
+            },
+        );
+        fixture.assert_graph_unchanged();
+    });
+}
