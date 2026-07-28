@@ -2549,6 +2549,13 @@ pub(crate) mod tests {
             self.fixture.manifest_count()
         }
 
+        pub(crate) fn applied_batch_count(&self) -> usize {
+            rusqlite::Connection::open(&self.paths.database_path)
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM applied_batches", [], |row| row.get(0))
+                .unwrap()
+        }
+
         pub(crate) fn handoff(&self) -> EnrollmentDiscoveryHandoff {
             let graph_resource_id = self.fixture.graph.canonical_resource_id().unwrap();
             let classification = crate::oplog::discovery::discover_startup(
