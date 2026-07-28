@@ -1035,6 +1035,27 @@
         "failBefore": "proven"
       },
       "notes": "GH #246 accepted harm: an eligible non-empty document outside pages/ could appear blank, external add/delete stayed invisible, and editing the blank state could overwrite real bytes. The base reproduction at be54af62 failed because list_pages/find_entry/load_by_path only admitted configured pages/journals roots."
+    },
+    {
+      "id": "REG-SYNC-WATCHER-OVERSIZE-SAFE-001",
+      "title": "An oversized watcher callback cannot be refused and then allow Safe to omit its external edits",
+      "family": "data-safety",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "core-native",
+      "status": "fixing",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/sync_runtime.rs"
+        ],
+        "scenario": "sync.watcher-oversize-refusal-retains-full-scan-before-safe",
+        "failBefore": "pending"
+      }
     }
   ]
 }

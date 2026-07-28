@@ -1035,29 +1035,64 @@ mod tests {
     }
 
     #[test]
-    fn watcher_requests_are_bounded_before_channel_intake() {
+    fn oversized_watcher_refusal_retains_a_full_scan_before_safe_shutdown() {
         let fixture = RuntimeHostFixture::safe("sync-runtime-watcher-request-bounds");
         let handle = active_handle(SyncRuntimeHandle::open(fixture.request()));
         drive_initial_feed(&handle);
         let before = handle.status().unwrap();
-        let observations = (0..=MAX_WATCHER_OBSERVATIONS)
-            .map(|_| SyncWatcherObservation::UnknownPath)
+        let path = "content/nested pages/oversize watcher batch.md";
+        let file = fixture.graph_root().join(path);
+        fs::write(&file, b"- external edit hidden behind an oversized callback\n").unwrap();
+        let manifests_before = fixture.manifest_count();
+        let observations = std::iter::once(SyncWatcherObservation::managed_path(path).unwrap())
+            .chain(
+                (0..MAX_WATCHER_OBSERVATIONS)
+                    .map(|_| SyncWatcherObservation::UnknownPath),
+            )
             .collect::<Vec<_>>();
         assert!(matches!(
             handle.observe_watcher(observations),
             Err(SyncRuntimeRequestError::RequestTooLarge {
                 observations,
-                path_bytes: 0,
-            }) if observations == MAX_WATCHER_OBSERVATIONS + 1
+                path_bytes,
+            }) if observations == MAX_WATCHER_OBSERVATIONS + 1 && path_bytes == path.len()
         ));
-        assert_eq!(
-            handle.status().unwrap().watcher,
-            before.watcher,
-            "a rejected oversized request must never reach actor intake"
+        let rejected = handle.status().unwrap();
+        assert!(rejected.watcher.pending);
+        assert!(rejected.watcher.pending_requires_full_scan);
+        assert!(
+            rejected.watcher.latest_enqueue > before.watcher.latest_enqueue,
+            "the rejection must retain exactly one runtime-owned full-scan obligation"
         );
+        let outcome = handle.clean_shutdown().unwrap();
+        assert!(matches!(outcome, SyncShutdownOutcome::Safe(_)));
+        assert_eq!(
+            fixture.manifest_count(),
+            manifests_before + 1,
+            "Safe may be published only after the refused callback's full scan admits its edit"
+        );
+        assert!(matches!(fixture.handoff(), EnrollmentDiscoveryHandoff::Safe));
+    }
+
+    #[test]
+    fn watcher_request_count_boundary_is_accepted_and_drained() {
+        let fixture = RuntimeHostFixture::safe("sync-runtime-watcher-request-count-boundary");
+        let handle = active_handle(SyncRuntimeHandle::open(fixture.request()));
+        drive_initial_feed(&handle);
+
+        handle
+            .observe_watcher(
+                (0..MAX_WATCHER_OBSERVATIONS)
+                    .map(|_| SyncWatcherObservation::UnknownPath)
+                    .collect(),
+            )
+            .unwrap();
+        let pending = handle.status().unwrap();
+        assert!(pending.watcher.pending);
+        assert!(pending.watcher.pending_requires_full_scan);
         assert!(matches!(
             handle.clean_shutdown().unwrap(),
-            SyncShutdownOutcome::Safe(_)
+            SyncShutdownOutcome::Safe(snapshot) if !snapshot.watcher.pending
         ));
     }
 
