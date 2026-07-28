@@ -257,10 +257,10 @@ impl OpLog {
             .validate_text_coverage(text_containers, arena_container_count)
     }
 
-    pub(crate) fn validate_external_metadata_semantics(&self) -> LoroResult<()> {
+    pub(crate) fn validate_external_metadata_semantics(&mut self) -> LoroResult<()> {
         let baseline = self
             .external_import_baseline
-            .as_ref()
+            .as_mut()
             .ok_or_else(|| LoroError::DecodeError("external import baseline is missing".into()))?;
         baseline.validate_authentication(&self.arena)?;
         match self.external_open_causal_snapshot.as_ref() {

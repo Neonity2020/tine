@@ -466,11 +466,20 @@ impl ExternalImportBaseline {
     }
 
     pub(crate) fn validate_authentication(
-        &self,
+        &mut self,
         arena: &crate::arena::SharedArena,
     ) -> LoroResult<()> {
-        for (&owner_idx, state) in &self.text_trackers {
-            let owner = arena.get_container_id(owner_idx).ok_or_else(|| {
+        let mut resolved_indices = Vec::with_capacity(self.text_trackers.len());
+        let mut claimed_indices = BTreeSet::new();
+        for (&stored_idx, state) in &self.text_trackers {
+            let ExternalTextTracker::Authenticated { snapshot, .. } = state else {
+                return Err(external_baseline_error(
+                    "text tracker authentication is missing",
+                ));
+            };
+            let owner = ContainerID::try_from_bytes(&snapshot.owner)
+                .map_err(|_| external_baseline_error("text tracker owner is invalid"))?;
+            let owner_idx = arena.id_to_idx(&owner).ok_or_else(|| {
                 external_baseline_error("text tracker owner is absent from the restored arena")
             })?;
             if owner.container_type() != crate::ContainerType::Text {
@@ -478,17 +487,30 @@ impl ExternalImportBaseline {
                     "text tracker owner is not a text container",
                 ));
             }
-            let ExternalTextTracker::Authenticated { snapshot, .. } = state else {
+            if !claimed_indices.insert(owner_idx) {
                 return Err(external_baseline_error(
-                    "text tracker authentication is missing",
+                    "multiple text trackers claim the same restored container",
                 ));
-            };
-            if snapshot.owner.as_ref() != owner.to_bytes() {
+            }
+            if arena.get_container_id(owner_idx).as_ref() != Some(&owner) {
                 return Err(external_baseline_error(
                     "text tracker owner or commitment does not match the restored container",
                 ));
             }
+            resolved_indices.push((stored_idx, owner_idx));
         }
+
+        let mut stored_trackers = std::mem::take(&mut self.text_trackers);
+        let mut resolved_trackers = BTreeMap::new();
+        for (stored_idx, owner_idx) in resolved_indices {
+            let state = stored_trackers
+                .remove(&stored_idx)
+                .expect("validated text tracker must still be present");
+            resolved_trackers.insert(owner_idx, state);
+        }
+        debug_assert!(stored_trackers.is_empty());
+        self.text_containers = resolved_trackers.keys().copied().collect();
+        self.text_trackers = resolved_trackers;
         Ok(())
     }
 

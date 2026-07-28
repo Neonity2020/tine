@@ -1284,7 +1284,7 @@ fn two_text_checkpoint(with_delete: bool) -> (FaultStore, Vec<u8>) {
 }
 
 #[test]
-fn swapping_complete_trackers_between_text_containers_is_rejected_without_deletes() {
+fn swapping_tracker_payloads_between_authenticated_owners_is_rejected_without_deletes() {
     let (store_control, checkpoint) = two_text_checkpoint(false);
     let mut parts = decode_xm(&store_control.raw_get(b"xm").unwrap());
     let mut entries = decode_baseline_tracker_blobs(&parts.baseline);
@@ -1294,9 +1294,9 @@ fn swapping_complete_trackers_between_text_containers_is_rejected_without_delete
         assert!(tracker.deletes.is_empty());
         assert!(!tracker.spans.is_empty());
     }
-    let first = entries[0].1.clone();
-    entries[0].1 = entries[1].1.clone();
-    entries[1].1 = first;
+    let first_tracker = entries[0].1.tracker.clone();
+    entries[0].1.tracker = entries[1].1.tracker.clone();
+    entries[1].1.tracker = first_tracker;
     parts.baseline = encode_baseline_tracker_blobs(&parts.baseline, &entries);
 
     let forged_xm = encode_xm(&parts);
@@ -1307,8 +1307,8 @@ fn swapping_complete_trackers_between_text_containers_is_rejected_without_delete
     assert!(
         error
             .to_string()
-            .contains("text tracker owner or commitment does not match"),
-        "whole-tracker transplant was rejected for the wrong reason: {error}"
+            .contains("text tracker commitment is invalid"),
+        "tracker payload substitution was rejected for the wrong reason: {error}"
     );
 }
 
@@ -1978,6 +1978,38 @@ fn text_container_created_after_baseline_gets_a_new_tracker() {
     let reopened = LoroDoc::from_external_store(Some(&checkpoint), store).unwrap();
     assert_eq!(reopened.get_text("later").to_string(), "post-baseline");
     assert!(store_control.raw_get(b"xm").is_some());
+}
+
+#[test]
+fn mixed_existing_edit_and_new_text_survives_restore_registration_order_change() {
+    let (_store_control, store) = FaultStore::new();
+    let external = LoroDoc::from_external_store(None, store.clone()).unwrap();
+    external.set_peer_id(1).unwrap();
+    external.get_text("z-existing").insert(0, "before").unwrap();
+    external.commit();
+    let base_vv = external.oplog_vv();
+    let base_updates = external.export(ExportMode::all_updates()).unwrap();
+    let checkpoint = external.flush_external_store().unwrap();
+    drop(external);
+
+    let branch = LoroDoc::new();
+    branch.import(&base_updates).unwrap();
+    branch.set_peer_id(2).unwrap();
+    branch.get_text("z-existing").insert(6, "-edited").unwrap();
+    branch.get_text("a-created").insert(0, "new").unwrap();
+    branch.commit();
+    let mixed_update = branch.export(ExportMode::updates(&base_vv)).unwrap();
+
+    let reopened = LoroDoc::from_external_store(Some(&checkpoint), store.clone()).unwrap();
+    assert!(reopened.import(&mixed_update).unwrap().pending.is_none());
+    assert_eq!(reopened.get_text("z-existing").to_string(), "before-edited");
+    assert_eq!(reopened.get_text("a-created").to_string(), "new");
+    let merged_checkpoint = reopened.flush_external_store().unwrap();
+    drop(reopened);
+
+    let reopened = LoroDoc::from_external_store(Some(&merged_checkpoint), store).unwrap();
+    assert_eq!(reopened.get_text("z-existing").to_string(), "before-edited");
+    assert_eq!(reopened.get_text("a-created").to_string(), "new");
 }
 
 #[test]

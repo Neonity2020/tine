@@ -202,8 +202,8 @@ impl LoroDoc {
             .iter_all_containers_mut()
             .filter_map(|(idx, _)| (idx.get_type() == ContainerType::Text).then_some(idx))
             .collect();
-        oplog.validate_external_import_baseline_coverage(&text_containers)?;
         oplog.validate_external_metadata_semantics()?;
+        oplog.validate_external_import_baseline_coverage(&text_containers)?;
         drop(state);
         drop(oplog);
 
