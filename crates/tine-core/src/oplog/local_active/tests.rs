@@ -13,7 +13,8 @@ use crate::oplog::enrollment::{
     EnrollmentReader, PreparationId,
 };
 use crate::oplog::hot_engine::{
-    ProjectionEndpointBinding, ProjectionStorageBinding, MAX_EPHEMERAL_BLOCK_CLAIMS,
+    AcceptedFrontierRoot, ProjectionEndpointBinding, ProjectionStorageBinding,
+    MAX_EPHEMERAL_BLOCK_CLAIMS,
 };
 use crate::oplog::identity::ARCHIVE_INSTANCE_CLAIM_FILE;
 use crate::oplog::import::{
@@ -24,6 +25,9 @@ use crate::oplog::import::{
 };
 use crate::oplog::migration_backup::{
     verify_migration_source_backup, MigrationBackupRoot, VerifiedSourceBackup,
+};
+use crate::oplog::object_store::{
+    fail_next_resume_publication_at, ResumePublishBoundary, RetainedRunMaintenanceOutcome,
 };
 use crate::oplog::operational_coordinator::{
     act_once_at, OperationalCoordinator, OperationalCoordinatorError, OperationalCoordinatorState,
@@ -3668,13 +3672,19 @@ impl Drop for HelperProcess {
 /// Every *authoritative* durable byte a takeover could touch: the enrollment
 /// journal and the archive.
 ///
-/// Two things are deliberately outside this set. The archive's `.tine-runtime`
-/// namespace holds the workspace lease file, whose contents are diagnostic
-/// metadata that ownership is never decided by — taking the lease rewrites the
-/// recorded pid. And the device-local SQLite projection is disposable
+/// Three things are deliberately outside this set. The archive's
+/// `.tine-runtime` namespace holds the workspace lease file, whose contents are
+/// diagnostic metadata that ownership is never decided by — taking the lease
+/// rewrites the recorded pid. The device-local SQLite projection is disposable
 /// frontier-stamped materialization that can never authorize a write, so a
 /// recovery legitimately rebuilds it before it has earned the right to change
-/// anything authoritative.
+/// anything authoritative. And the engine scratch namespace holds run-local
+/// reconstructible state: a retained run is an accelerator whose every root is
+/// re-proved against the sealed durable history before one byte of it is
+/// reused, and an open that refuses one simply replays. Since P2N10 a refused
+/// or failed open legitimately leaves a fresh retained run behind, which is
+/// exactly the population `retained_run_directories` asserts on directly in the
+/// resume-lifecycle tests rather than smuggling into "authoritative".
 fn authoritative_world(
     fixture: &Fixture,
     root: &EnrollmentApplicationRoot,
@@ -3685,7 +3695,7 @@ fn authoritative_world(
         ("archive", fixture.archive_root.as_path()),
     ] {
         for (path, digest) in snapshot_file_digests(directory) {
-            if path.starts_with(".tine-runtime/") {
+            if path.starts_with(".tine-runtime/") || path.starts_with("engine-scratch-v2/") {
                 continue;
             }
             digests.insert(format!("{label}/{path}"), digest);
@@ -5736,4 +5746,1327 @@ fn a_failed_promoted_open_releases_every_authority_and_stays_retryable() {
         }
     );
     fixture.assert_graph_unchanged();
+}
+
+// ---------------------------------------------------------------------------
+// P2N10 retained-resume lifecycle.
+// ---------------------------------------------------------------------------
+
+/// This endpoint's durable resume-point directory inside one archive.
+///
+/// Resolved by reading the single durable engine-history endpoint rather than
+/// by hard-coding an id, so the test observes exactly the directory production
+/// publishes into.
+fn resume_point_directory(archive_root: &Path) -> PathBuf {
+    let history = archive_root.join("engine-history");
+    let mut endpoints: Vec<PathBuf> = fs::read_dir(&history)
+        .unwrap_or_else(|error| panic!("a promoted archive has durable history: {error}"))
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.is_dir())
+        .collect();
+    endpoints.sort();
+    assert_eq!(
+        endpoints.len(),
+        1,
+        "a promoted archive has exactly one durable engine-history endpoint"
+    );
+    endpoints.pop().unwrap().join("resume-points")
+}
+
+/// Every entry name in the resume-point directory, recognized or not.
+fn resume_point_entries(archive_root: &Path) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(resume_point_directory(archive_root)) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// Exact bytes of the resume-point directory, for the "not one candidate byte
+/// changed" assertions.
+fn resume_point_bytes(archive_root: &Path) -> BTreeMap<String, Vec<u8>> {
+    let directory = resume_point_directory(archive_root);
+    if directory.is_dir() {
+        snapshot_files(&directory)
+    } else {
+        BTreeMap::new()
+    }
+}
+
+fn remove_every_resume_point(archive_root: &Path) {
+    for name in resume_point_entries(archive_root) {
+        fs::remove_file(resume_point_directory(archive_root).join(name)).unwrap();
+    }
+}
+
+/// The engine scratch namespace of one archive.
+fn scratch_namespace(archive_root: &Path) -> PathBuf {
+    archive_root.join("engine-scratch-v2")
+}
+
+/// Every scratch run directory currently on disk, sorted.
+///
+/// Ephemeral runs are removed when their owner drops, so once a runtime has
+/// been released this is exactly the retained population.
+fn retained_run_directories(archive_root: &Path) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(scratch_namespace(archive_root)) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("run-"))
+        .collect();
+    names.sort();
+    names
+}
+
+/// Exact bytes of one scratch run directory.
+fn run_directory_bytes(archive_root: &Path, run: &str) -> BTreeMap<String, Vec<u8>> {
+    snapshot_files(&scratch_namespace(archive_root).join(run))
+}
+
+/// Take one retained run's own exclusive lease, exactly as a live owner holds
+/// it. The returned file must stay alive for as long as the lease is wanted.
+fn hold_retained_run_lease(archive_root: &Path, run: &str) -> fs::File {
+    let path = scratch_namespace(archive_root).join(run).join("lease");
+    let held = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap_or_else(|error| panic!("a retained run has its own lease file: {error}"));
+    fs2::FileExt::try_lock_exclusive(&held).expect("the run's exclusive lease is free");
+    held
+}
+
+/// Everything a caller can observe about one promoted runtime through its
+/// public surface.
+///
+/// Deliberately *not* private-struct equality: the canonical semantic snapshot
+/// is the versioned convergence observable, the accepted frontier and durable
+/// history authority are what every write path authorizes against, the SQLite
+/// projection's applied semantic effects are the user data every query reads,
+/// and the ready projection-work queue is what the graph-text writer acts on.
+#[derive(Debug)]
+struct PublicRuntimeObservation {
+    snapshot: crate::oplog::CanonicalSnapshot,
+    accepted: AcceptedFrontierRoot,
+    history: String,
+    sqlite_accepted: AcceptedFrontierRoot,
+    sqlite_effects: Vec<String>,
+    projection_work: Vec<String>,
+}
+
+fn public_runtime_observation(runtime: &PromotedLocalRuntime) -> PublicRuntimeObservation {
+    PublicRuntimeObservation {
+        snapshot: runtime.engine().canonical_snapshot().unwrap(),
+        accepted: runtime.engine().accepted_frontier_root().unwrap(),
+        history: format!(
+            "{:?}",
+            runtime.engine().durable_history_authority().unwrap()
+        ),
+        sqlite_accepted: runtime.database().frontier_root().unwrap(),
+        sqlite_effects: runtime
+            .database()
+            .applied_semantic_effects_for_test()
+            .unwrap()
+            .iter()
+            .map(|effect| format!("{effect:?}"))
+            .collect(),
+        projection_work: projection_work_fingerprint(runtime),
+    }
+}
+
+/// Two runtimes are publicly indistinguishable.
+///
+/// The two accepted-frontier roots are compared with the engine's own
+/// `same_accepted_authority`, not with `==`. `AcceptedFrontierRoot::scratch_root`
+/// locates the run-local scratch LSM page holding that frontier's point index,
+/// and its *file offset* legitimately differs between a run that appended to an
+/// adopted file and a run that replayed into a fresh one. Every authenticated
+/// field — including `state_digest` and the reference-catalog root — is
+/// compared, which is exactly the distinction that makes adoption an
+/// accelerator rather than a second truth.
+fn assert_publicly_indistinguishable(
+    adopted: &PublicRuntimeObservation,
+    replayed: &PublicRuntimeObservation,
+    what: &str,
+) {
+    assert_eq!(
+        adopted.snapshot, replayed.snapshot,
+        "{what}: canonical snapshot"
+    );
+    assert!(
+        adopted.accepted.same_accepted_authority(&replayed.accepted),
+        "{what}: accepted authority\n adopted: {:?}\nreplayed: {:?}",
+        adopted.accepted,
+        replayed.accepted
+    );
+    assert_eq!(
+        adopted.accepted.acceptance_sequence(),
+        replayed.accepted.acceptance_sequence(),
+        "{what}: acceptance sequence"
+    );
+    assert_eq!(adopted.history, replayed.history, "{what}: durable history");
+    assert!(
+        adopted
+            .sqlite_accepted
+            .same_accepted_authority(&replayed.sqlite_accepted),
+        "{what}: SQLite accepted authority"
+    );
+    assert_eq!(
+        adopted.sqlite_effects, replayed.sqlite_effects,
+        "{what}: applied SQLite semantic effects"
+    );
+    assert_eq!(
+        adopted.projection_work, replayed.projection_work,
+        "{what}: ready projection work"
+    );
+}
+
+/// Run one lifecycle test body on a thread with a deliberately deep stack.
+///
+/// A promoted open is a single very large frame by design (see
+/// `mint_promoted_runtime`), and these tests open several runtimes in sequence.
+/// libtest's worker threads are much smaller than the process main thread every
+/// production open actually runs on, so the harness — not the production path —
+/// is the constraint here. No assertion changes; only where the body runs does.
+fn on_a_deep_stack(body: impl FnOnce() + Send + 'static) {
+    std::thread::Builder::new()
+        .stack_size(32 * 1024 * 1024)
+        .spawn(body)
+        .expect("the deep-stack lifecycle test thread spawns")
+        .join()
+        .expect("the lifecycle test body must not panic");
+}
+
+/// Clears the resume-lifecycle cut on entry *and* on drop, including during a
+/// panic unwind, so a hook a failing test armed cannot leak into the next test
+/// on the same libtest worker thread.
+struct ResumeLifecycleCutGuard;
+
+impl ResumeLifecycleCutGuard {
+    fn new() -> Self {
+        clear_resume_lifecycle_cut_for_test();
+        Self
+    }
+}
+
+impl Drop for ResumeLifecycleCutGuard {
+    fn drop(&mut self) {
+        clear_resume_lifecycle_cut_for_test();
+    }
+}
+
+// A promoted runtime is enormous, so every one of the three openers below lives
+// and dies in its own frame and returns only a compact value. Holding two of
+// them in one test frame overflows the libtest worker thread's stack — the same
+// reason `mint_promoted_runtime` and `takeover_error` are written the way they
+// are.
+
+fn with_promoted_runtime<T>(
+    fixture: &mut Fixture,
+    root: &EnrollmentApplicationRoot,
+    paths: &PromotedPaths,
+    session: SessionId,
+    body: impl FnOnce(&Fixture, &mut LocalActiveAuthority, &mut PromotedLocalRuntime) -> T,
+) -> T {
+    let (mut authority, mut runtime) = promote(fixture, root, session, paths);
+    let value = body(&*fixture, &mut authority, &mut runtime);
+    drop(runtime);
+    drop(authority);
+    value
+}
+
+fn with_reopened_runtime<T>(
+    fixture: &Fixture,
+    root: &EnrollmentApplicationRoot,
+    binding: &EnrollmentBindingV1,
+    paths: &PromotedPaths,
+    session: SessionId,
+    body: impl FnOnce(&Fixture, &mut LocalActiveAuthority, &mut PromotedLocalRuntime) -> T,
+) -> T {
+    let (mut authority, mut runtime) =
+        reopen_promoted_local_runtime(root, binding, session, &paths.open(fixture))
+            .expect("the reopen must succeed");
+    let value = body(fixture, &mut authority, &mut runtime);
+    drop(runtime);
+    drop(authority);
+    value
+}
+
+fn with_taken_over_runtime<T>(
+    fixture: &Fixture,
+    root: &EnrollmentApplicationRoot,
+    binding: &EnrollmentBindingV1,
+    paths: &PromotedPaths,
+    session: SessionId,
+    body: impl FnOnce(&Fixture, &mut LocalActiveAuthority, &mut PromotedLocalRuntime) -> T,
+) -> T {
+    let (mut authority, mut runtime) =
+        take_over_promoted_local_runtime(root, binding, session, &paths.open(fixture))
+            .expect("the takeover must commit");
+    let value = body(fixture, &mut authority, &mut runtime);
+    drop(runtime);
+    drop(authority);
+    value
+}
+
+/// Publish this runtime's quiescent resume point and return the sequence plus
+/// the maintenance pass it authorized.
+fn publish_expecting_success(
+    fixture: &Fixture,
+    authority: &LocalActiveAuthority,
+    runtime: &mut PromotedLocalRuntime,
+) -> (u64, RetainedRunMaintenanceReport) {
+    match runtime.publish_quiescent_resume_point(authority, &fixture.graph) {
+        ResumePublicationStatus::Published {
+            resume_sequence,
+            maintenance,
+        } => (
+            resume_sequence,
+            maintenance.expect("a successful publication authorizes the maintenance pass"),
+        ),
+        other => panic!("a quiescent promoted runtime must publish, got {other:?}"),
+    }
+}
+
+/// The complete retained-resume lifecycle, in the exact order production runs
+/// it, and the equivalence that makes it safe.
+///
+/// 1. Nothing published: a retained run and a complete authenticated replay.
+/// 2. The quiescent publication — the only place a resume point is ever minted
+///    — plus the bounded reclamation its witness authorizes.
+/// 3. A restart adopts the published point and replays only the durable tail
+///    the point does not already cover, on the *same* retained run.
+/// 4. Everything a caller can observe about the adopted runtime equals a fresh
+///    full replay of the identical bytes at the identical paths.
+#[test]
+fn the_resume_accelerator_publishes_adopts_and_reclaims_across_restarts() {
+    on_a_deep_stack(|| {
+        let mut fixture = Fixture::new(
+            "resume-lifecycle",
+            None,
+            vec![("pages/resume.md".into(), b"- resume\n".to_vec())],
+        );
+        let root = fixture.enrollment_root("resume-lifecycle");
+        let binding = fixture.enrollment_binding();
+        let paths = PromotedPaths::new(&fixture, "resume-lifecycle");
+        let session = SessionId::new();
+
+        with_promoted_runtime(
+            &mut fixture,
+            &root,
+            &paths,
+            session,
+            |fixture, authority, runtime| {
+                // (1) Nothing published yet.
+                let opened = runtime.resume_open_status().clone();
+                assert!(
+                    opened.retained(),
+                    "a provable resume-point directory authorizes a retained run: {opened:?}"
+                );
+                assert!(!opened.adopted());
+                assert_eq!(
+                    opened.unavailable(),
+                    Some(&ResumeAcceleratorUnavailable::NeverPublished)
+                );
+                assert_eq!(runtime.resume_publication_status(), None);
+                assert!(resume_point_entries(&fixture.archive_root).is_empty());
+
+                // (2) The quiescent publication.
+                let (sequence, maintenance) =
+                    publish_expecting_success(fixture, authority, runtime);
+                assert_eq!(sequence, 1);
+                assert_eq!(
+                    maintenance.outcome,
+                    RetainedRunMaintenanceOutcome::Reclaimed
+                );
+                assert_eq!(
+                    maintenance.reclaimed, 0,
+                    "the only retained run is the live one, which the new point reaches"
+                );
+                assert_eq!(maintenance.retained_runs_remaining, 1);
+                assert!(maintenance.within_retained_run_bound);
+                assert!(maintenance.preserved_resume_residue.is_empty());
+                assert_eq!(resume_point_entries(&fixture.archive_root).len(), 1);
+
+                // Real durable work *after* the point, so the next open genuinely
+                // replays a tail rather than nothing at all.
+                append_local_batch(fixture, authority, runtime, 0xE100);
+                append_local_batch(fixture, authority, runtime, 0xE200);
+
+                // And this is no longer a quiescent cut: an accepted batch
+                // leaves ready projection work, so the run-local roots a point
+                // would record are still moving. The publication says so rather
+                // than recording a state the engine cannot honour.
+                let refused = runtime.publish_quiescent_resume_point(authority, &fixture.graph);
+                assert!(
+                    matches!(
+                        refused,
+                        ResumePublicationStatus::NotPublished(
+                            ResumePublicationRefusal::DrainIncomplete(_)
+                        )
+                    ),
+                    "a moving engine must not publish: {refused:?}"
+                );
+                assert_eq!(
+                    resume_point_entries(&fixture.archive_root).len(),
+                    1,
+                    "the refused publication left the previous point exactly as it was"
+                );
+            },
+        );
+        let first_run = retained_run_directories(&fixture.archive_root);
+        assert_eq!(first_run.len(), 1, "one session mints exactly one run");
+
+        // (3) Restart: adopt, and replay only the tail.
+        let adopted_observation = with_reopened_runtime(
+            &fixture,
+            &root,
+            &binding,
+            &paths,
+            session,
+            |fixture, _, runtime| {
+                let opened = runtime.resume_open_status().clone();
+                assert!(
+                    opened.adopted(),
+                    "a valid point must be adopted: {opened:?}"
+                );
+                assert_eq!(opened.unavailable(), None);
+                let observation = opened.observation();
+                assert!(!observation.refused);
+                assert!(
+                    observation.replay_base_generation > 0
+                        && observation.replay_base_generation < observation.live_history_generation,
+                    "the adopted base must be a real earlier generation: {observation:?}"
+                );
+                assert_eq!(
+                    observation.replayed_generations,
+                    observation.live_history_generation - observation.replay_base_generation,
+                    "an adopted restart replays exactly the durable tail"
+                );
+                assert_eq!(
+                    retained_run_directories(&fixture.archive_root),
+                    first_run,
+                    "adoption reuses the published run instead of adding one"
+                );
+                public_runtime_observation(runtime)
+            },
+        );
+
+        // (4) Exact observable equivalence with a fresh full replay of the same
+        //     bytes at the same paths: only the accelerator is removed.
+        remove_every_resume_point(&fixture.archive_root);
+        let replayed_observation = with_reopened_runtime(
+            &fixture,
+            &root,
+            &binding,
+            &paths,
+            session,
+            |_, _, runtime| {
+                let opened = runtime.resume_open_status().clone();
+                assert!(!opened.adopted());
+                assert_eq!(
+                    opened.unavailable(),
+                    Some(&ResumeAcceleratorUnavailable::NeverPublished)
+                );
+                assert_eq!(opened.observation().replay_base_generation, 0);
+                public_runtime_observation(runtime)
+            },
+        );
+        assert_publicly_indistinguishable(
+            &adopted_observation,
+            &replayed_observation,
+            "an adopted restart must be publicly indistinguishable from a full replay",
+        );
+        fixture.assert_graph_unchanged();
+    });
+}
+
+/// Build one published world, damage exactly one thing about it, and require
+/// the next open to be an ordinary full replay that changes no byte.
+fn assert_damaged_candidate_replays_in_full(
+    label: &str,
+    expect_engine_refusal: bool,
+    damage: impl FnOnce(&Fixture, &str) -> Option<fs::File>,
+) {
+    let mut fixture = Fixture::new(
+        label,
+        None,
+        vec![("pages/candidate.md".into(), b"- candidate\n".to_vec())],
+    );
+    let root = fixture.enrollment_root(label);
+    let binding = fixture.enrollment_binding();
+    let paths = PromotedPaths::new(&fixture, label);
+    let session = SessionId::new();
+
+    with_promoted_runtime(
+        &mut fixture,
+        &root,
+        &paths,
+        session,
+        |fixture, authority, runtime| {
+            publish_expecting_success(fixture, authority, runtime);
+            append_local_batch(fixture, authority, runtime, 0xE300);
+        },
+    );
+    let runs = retained_run_directories(&fixture.archive_root);
+    assert_eq!(runs.len(), 1);
+    let run = runs.into_iter().next().unwrap();
+
+    let held = damage(&fixture, &run);
+    let points_before = resume_point_bytes(&fixture.archive_root);
+    let run_before = run_directory_bytes(&fixture.archive_root, &run);
+    let graph_before = snapshot_files(&fixture.graph_root);
+
+    with_reopened_runtime(
+        &fixture,
+        &root,
+        &binding,
+        &paths,
+        session,
+        |_, _, runtime| {
+            let opened = runtime.resume_open_status().clone();
+            assert!(
+                !opened.adopted(),
+                "{label}: an unusable candidate must not be adopted: {opened:?}"
+            );
+            assert_eq!(
+                opened.observation().replay_base_generation,
+                0,
+                "{label}: a refusal costs exactly one full replay"
+            );
+            assert_eq!(
+                opened.observation().refused,
+                expect_engine_refusal,
+                "{label}: unexpected engine-side refusal signal: {opened:?}"
+            );
+            // The runtime is genuinely usable, not merely constructed.
+            runtime.engine().accepted_frontier_root().unwrap();
+            runtime.database().frontier_root().unwrap();
+        },
+    );
+    drop(held);
+
+    assert_eq!(
+        resume_point_bytes(&fixture.archive_root),
+        points_before,
+        "{label}: a refusal must not change one candidate byte"
+    );
+    assert_eq!(
+        run_directory_bytes(&fixture.archive_root, &run),
+        run_before,
+        "{label}: the refused run must be left byte-for-byte intact"
+    );
+    assert_eq!(snapshot_files(&fixture.graph_root), graph_before);
+    fixture.assert_graph_unchanged();
+}
+
+/// A torn point, a provider conflict copy beside it, and a run whose exclusive
+/// lease is still held all open as ordinary full replays: none fails startup,
+/// and none changes a byte.
+#[test]
+fn a_torn_conflicted_or_leased_candidate_replays_in_full_without_changing_a_byte() {
+    on_a_deep_stack(|| {
+        // Torn: the point file itself is truncated. It stops being recognizable, so
+        // the strict complete-set proof is denied.
+        assert_damaged_candidate_replays_in_full("candidate-torn", false, |fixture, _run| {
+            let directory = resume_point_directory(&fixture.archive_root);
+            let name = resume_point_entries(&fixture.archive_root)
+                .into_iter()
+                .next()
+                .unwrap();
+            let path = directory.join(name);
+            let bytes = fs::read(&path).unwrap();
+            fs::write(&path, &bytes[..bytes.len() / 2]).unwrap();
+            None
+        });
+
+        // Conflicted: a Syncthing conflict copy carrying *valid* point bytes — the
+        // shape most tempting to promote. It is unrecognizable residue, so the whole
+        // proof is denied rather than the copy being quietly ignored.
+        assert_damaged_candidate_replays_in_full("candidate-conflict", false, |fixture, _run| {
+            let directory = resume_point_directory(&fixture.archive_root);
+            let name = resume_point_entries(&fixture.archive_root)
+                .into_iter()
+                .next()
+                .unwrap();
+            let bytes = fs::read(directory.join(&name)).unwrap();
+            fs::write(
+                directory.join(format!("{name}.sync-conflict-20260728-120000-ÜBER")),
+                bytes,
+            )
+            .unwrap();
+            None
+        });
+
+        // Leased: the run the point names is still exclusively held, so the archive
+        // boundary refuses the adoption before the engine exists.
+        assert_damaged_candidate_replays_in_full("candidate-leased", true, |fixture, run| {
+            Some(hold_retained_run_lease(&fixture.archive_root, run))
+        });
+    });
+}
+
+/// A clean `Safe` handoff advances the enrollment record past the point that
+/// was published under the previous one, so a restart reusing the same session
+/// id is offered a candidate the live record contradicts.
+///
+/// This is the `SupersededBy` arm's refusal direction, reached through the real
+/// lifecycle rather than by hand-built evidence: the point predates the live
+/// record but claims the very session the restart is taking, so it is refused
+/// and the restart pays a full replay.
+#[test]
+fn a_clean_safe_restart_that_reuses_its_session_refuses_the_superseded_point() {
+    on_a_deep_stack(|| {
+        let mut fixture = Fixture::new(
+            "resume-safe-superseded",
+            None,
+            vec![("pages/safe.md".into(), b"- safe\n".to_vec())],
+        );
+        let root = fixture.enrollment_root("resume-safe-superseded");
+        let binding = fixture.enrollment_binding();
+        let paths = PromotedPaths::new(&fixture, "resume-safe-superseded");
+        let session = SessionId::new();
+
+        let verification_digest = with_promoted_runtime(
+            &mut fixture,
+            &root,
+            &paths,
+            session,
+            |fixture, authority, runtime| {
+                publish_expecting_success(fixture, authority, runtime);
+                runtime
+                    .quiesce_and_mark_safe_without_watcher_dependency_for_test(
+                        authority,
+                        &fixture.graph,
+                    )
+                    .expect("a drained runtime records a clean handoff");
+                authority.verification_digest()
+            },
+        );
+        assert_eq!(
+            committed_handoff(&root, &binding, verification_digest),
+            LocalActiveHandoff::Safe
+        );
+        let points_before = resume_point_bytes(&fixture.archive_root);
+        assert_eq!(points_before.len(), 1);
+
+        with_reopened_runtime(
+            &fixture,
+            &root,
+            &binding,
+            &paths,
+            session,
+            |_, _, runtime| {
+                assert_eq!(runtime.recovery(), RuntimeRecoveryState::AdoptedSafeHandoff);
+                let opened = runtime.resume_open_status().clone();
+                assert!(!opened.adopted(), "{opened:?}");
+                assert!(
+                    matches!(
+                        opened.unavailable(),
+                        Some(ResumeAcceleratorUnavailable::BindingRefused(_))
+                    ),
+                    "the live record must contradict the point: {opened:?}"
+                );
+            },
+        );
+        assert_eq!(
+            resume_point_bytes(&fixture.archive_root),
+            points_before,
+            "a refused candidate is never rewritten or removed"
+        );
+        fixture.assert_graph_unchanged();
+    });
+}
+
+/// One promoted world whose archive holds an *unreachable* retained predecessor
+/// run.
+///
+/// Session one published a point naming run A and then crashed. The takeover
+/// could not adopt A — its exclusive run lease was held at the instant of the
+/// open, exactly as a live predecessor or a torn run would present — so it
+/// replayed in full into a fresh run B. A now exists, is retained, and is named
+/// only by a point the next publication supersedes.
+struct SupersededPredecessorWorld {
+    fixture: Fixture,
+    root: EnrollmentApplicationRoot,
+    binding: EnrollmentBindingV1,
+    paths: PromotedPaths,
+    authority: LocalActiveAuthority,
+    runtime: PromotedLocalRuntime,
+    predecessor_run: String,
+}
+
+impl SupersededPredecessorWorld {
+    fn new(label: &str) -> Self {
+        let mut fixture = Fixture::new(
+            label,
+            None,
+            vec![("pages/superseded.md".into(), b"- superseded\n".to_vec())],
+        );
+        let root = fixture.enrollment_root(label);
+        let binding = fixture.enrollment_binding();
+        let paths = PromotedPaths::new(&fixture, label);
+        let crashed = SessionId::new();
+
+        // Deliberately no local batch after the publication: this world exists
+        // to be *published from* after the takeover, and an accepted batch
+        // leaves ready projection work, which is not a quiescent cut.
+        with_promoted_runtime(
+            &mut fixture,
+            &root,
+            &paths,
+            crashed,
+            |fixture, authority, runtime| {
+                publish_expecting_success(fixture, authority, runtime);
+            },
+        );
+        let runs = retained_run_directories(&fixture.archive_root);
+        assert_eq!(runs.len(), 1);
+        let predecessor_run = runs.into_iter().next().unwrap();
+
+        // Hold the predecessor run's exclusive lease across the takeover open
+        // only. Releasing it afterwards is what makes the run reclaimable once
+        // a replacement point exists.
+        let held = hold_retained_run_lease(&fixture.archive_root, &predecessor_run);
+        let (authority, runtime) = take_over_promoted_local_runtime(
+            &root,
+            &binding,
+            SessionId::new(),
+            &paths.open(&fixture),
+        )
+        .expect("a crash takeover succeeds whether or not the accelerator is usable");
+        fs2::FileExt::unlock(&held).unwrap();
+        drop(held);
+
+        assert!(matches!(
+            runtime.recovery(),
+            RuntimeRecoveryState::TookOverCrashedUnsafe { .. }
+        ));
+        let opened = runtime.resume_open_status().clone();
+        assert!(
+            !opened.adopted(),
+            "the leased run must be refused: {opened:?}"
+        );
+        assert!(opened.observation().refused);
+        let runs = retained_run_directories(&fixture.archive_root);
+        assert_eq!(
+            runs.len(),
+            2,
+            "a refused adoption replays into a fresh retained run"
+        );
+        assert!(runs.contains(&predecessor_run));
+
+        Self {
+            fixture,
+            root,
+            binding,
+            paths,
+            authority,
+            runtime,
+            predecessor_run,
+        }
+    }
+}
+
+/// A crash takeover's own quiescent publication supersedes the predecessor's
+/// point and immediately reclaims the run that point was the only reference to.
+///
+/// This is the self-healing property: a crash-heavy sequence of refused
+/// adoptions cannot accumulate archive directories forever, because the first
+/// clean quiescence both replaces the evidence and collects what the
+/// replacement no longer reaches.
+#[test]
+fn a_takeover_publication_supersedes_the_predecessor_point_and_reclaims_its_run() {
+    on_a_deep_stack(|| {
+        let mut world = SupersededPredecessorWorld::new("resume-supersede");
+        let predecessor = world.predecessor_run.clone();
+        let (sequence, maintenance) =
+            publish_expecting_success(&world.fixture, &world.authority, &mut world.runtime);
+        assert_eq!(
+            sequence, 2,
+            "the successor publication takes the next sequence"
+        );
+        assert_eq!(
+            maintenance.outcome,
+            RetainedRunMaintenanceOutcome::Reclaimed
+        );
+        assert_eq!(
+            maintenance.reclaimed, 1,
+            "exactly the unreachable predecessor"
+        );
+        assert_eq!(maintenance.retained_runs_remaining, 1);
+        assert!(maintenance.within_retained_run_bound);
+        assert_eq!(maintenance.unclassified_preserved, 0);
+
+        let runs = retained_run_directories(&world.fixture.archive_root);
+        assert_eq!(runs.len(), 1);
+        assert!(
+            !runs.contains(&predecessor),
+            "the reclaimed predecessor must be gone: {runs:?}"
+        );
+        assert_eq!(
+            resume_point_entries(&world.fixture.archive_root).len(),
+            1,
+            "publication keeps the durable point set bounded"
+        );
+        world.fixture.assert_graph_unchanged();
+    });
+}
+
+/// Losing the workspace between a committed publication and the maintenance
+/// pass it authorized deletes nothing and latches terminal revocation.
+///
+/// Reclamation is the only boundary in this module that can delete archive
+/// bytes, so it reproves ownership on its own rather than inheriting the
+/// publication's proof.
+#[test]
+fn losing_the_lease_before_reclamation_deletes_nothing_and_latches() {
+    on_a_deep_stack(|| {
+        let _guard = ResumeLifecycleCutGuard::new();
+        let mut world = SupersededPredecessorWorld::new("resume-lease-reclaim");
+        let predecessor = world.predecessor_run.clone();
+        let lease_path = workspace_lease_path(&world.fixture.archive_root, world.fixture.workspace);
+
+        let replaced = lease_path.clone();
+        act_once_at_resume_lifecycle_cut_for_test(
+            ResumeLifecycleCut::BeforeReclamation,
+            Box::new(move || replace_workspace_lease_file(&replaced)),
+        );
+        let published = world
+            .runtime
+            .publish_quiescent_resume_point(&world.authority, &world.fixture.graph);
+        assert_eq!(
+            published,
+            ResumePublicationStatus::Published {
+                resume_sequence: 2,
+                maintenance: None,
+            },
+            "a lost workspace must skip the maintenance pass, not run it"
+        );
+        let revocation = world
+            .runtime
+            .workspace_authority_revocation()
+            .expect("the reclamation boundary must latch terminal revocation");
+        assert_eq!(
+            revocation.boundary(),
+            WorkspaceAuthorityBoundary::ResumeReclamation
+        );
+        let runs = retained_run_directories(&world.fixture.archive_root);
+        assert_eq!(runs.len(), 2, "nothing may be deleted without the proof");
+        assert!(runs.contains(&predecessor));
+
+        // The latch is terminal: a second attempt refuses before it reads anything.
+        assert_eq!(
+            world
+                .runtime
+                .publish_quiescent_resume_point(&world.authority, &world.fixture.graph),
+            ResumePublicationStatus::NotPublished(
+                ResumePublicationRefusal::WorkspaceAuthorityRevoked(revocation)
+            )
+        );
+        assert_eq!(retained_run_directories(&world.fixture.archive_root), runs);
+        world.fixture.assert_graph_unchanged();
+    });
+}
+
+/// Losing the workspace immediately before the snapshot/mint/publication
+/// refuses the publication, latches terminal revocation, and writes nothing.
+#[test]
+fn losing_the_lease_before_publication_publishes_nothing_and_latches() {
+    on_a_deep_stack(|| {
+        let mut fixture = Fixture::new(
+            "resume-lease-publication",
+            None,
+            vec![("pages/publish.md".into(), b"- publish\n".to_vec())],
+        );
+        let root = fixture.enrollment_root("resume-lease-publication");
+        let paths = PromotedPaths::new(&fixture, "resume-lease-publication");
+        let lease_path = workspace_lease_path(&fixture.archive_root, fixture.workspace);
+
+        with_promoted_runtime(
+            &mut fixture,
+            &root,
+            &paths,
+            SessionId::new(),
+            |fixture, authority, runtime| {
+                let points_before = resume_point_bytes(&fixture.archive_root);
+                let runs_before = retained_run_directories(&fixture.archive_root);
+                let archive_before =
+                    archive_digests_outside_the_lease_namespace(&fixture.archive_root);
+                let sqlite_before = promoted_projection_digests(&paths.database_path);
+                let graph_before = snapshot_files(&fixture.graph_root);
+
+                replace_workspace_lease_file(&lease_path);
+                let refused = runtime.publish_quiescent_resume_point(authority, &fixture.graph);
+                let ResumePublicationStatus::NotPublished(
+                    ResumePublicationRefusal::WorkspaceAuthorityRevoked(revocation),
+                ) = &refused
+                else {
+                    panic!("a replaced lease must refuse the publication: {refused:?}");
+                };
+                assert_eq!(
+                    revocation.boundary(),
+                    WorkspaceAuthorityBoundary::ResumePublication
+                );
+
+                assert_eq!(resume_point_bytes(&fixture.archive_root), points_before);
+                assert_eq!(retained_run_directories(&fixture.archive_root), runs_before);
+                assert_eq!(
+                    archive_digests_outside_the_lease_namespace(&fixture.archive_root),
+                    archive_before
+                );
+                assert_eq!(
+                    promoted_projection_digests(&paths.database_path),
+                    sqlite_before
+                );
+                assert_eq!(snapshot_files(&fixture.graph_root), graph_before);
+            },
+        );
+        fixture.assert_graph_unchanged();
+    });
+}
+
+/// Losing the workspace immediately before a published candidate is read fails
+/// the whole open closed.
+///
+/// There is no runtime to latch yet — the lease is this open's one-applier
+/// proof, so the honest outcome is that the open does not happen at all, and
+/// every authoritative byte stays where it was.
+#[test]
+fn losing_the_lease_before_the_candidate_read_fails_the_open_closed() {
+    on_a_deep_stack(|| {
+        let _guard = ResumeLifecycleCutGuard::new();
+        let mut fixture = Fixture::new(
+            "resume-lease-candidate",
+            None,
+            vec![("pages/candidate.md".into(), b"- candidate\n".to_vec())],
+        );
+        let root = fixture.enrollment_root("resume-lease-candidate");
+        let binding = fixture.enrollment_binding();
+        let paths = PromotedPaths::new(&fixture, "resume-lease-candidate");
+        let session = SessionId::new();
+        let lease_path = workspace_lease_path(&fixture.archive_root, fixture.workspace);
+
+        with_promoted_runtime(
+            &mut fixture,
+            &root,
+            &paths,
+            session,
+            |fixture, authority, runtime| {
+                publish_expecting_success(fixture, authority, runtime);
+                append_local_batch(fixture, authority, runtime, 0xE700);
+            },
+        );
+
+        let world_before = authoritative_world(&fixture, &root);
+        let points_before = resume_point_bytes(&fixture.archive_root);
+        let runs_before = retained_run_directories(&fixture.archive_root);
+        // The exact bytes of the run the surviving point names. This is the
+        // load-bearing half: a process that no longer owns the workspace must
+        // not reach the point at all, let alone take the run it names and
+        // append a replayed tail into it.
+        let run_before = run_directory_bytes(&fixture.archive_root, &runs_before[0]);
+        let graph_before = snapshot_files(&fixture.graph_root);
+
+        let replaced = lease_path.clone();
+        act_once_at_resume_lifecycle_cut_for_test(
+            ResumeLifecycleCut::BeforeCandidateRead,
+            Box::new(move || replace_workspace_lease_file(&replaced)),
+        );
+        let error = reopen_promoted_local_runtime(&root, &binding, session, &paths.open(&fixture))
+            .err()
+            .expect("a workspace lost before the candidate read must fail the open closed");
+        assert!(
+            error.to_string().contains("workspace"),
+            "unexpected refusal: {error}"
+        );
+
+        assert_eq!(authoritative_world(&fixture, &root), world_before);
+        assert_eq!(resume_point_bytes(&fixture.archive_root), points_before);
+        assert_eq!(retained_run_directories(&fixture.archive_root), runs_before);
+        assert_eq!(
+            run_directory_bytes(&fixture.archive_root, &runs_before[0]),
+            run_before,
+            "the candidate's retained run must not be opened, adopted, or appended to"
+        );
+        assert_eq!(snapshot_files(&fixture.graph_root), graph_before);
+
+        // And the very next honest open still works.
+        with_reopened_runtime(
+            &fixture,
+            &root,
+            &binding,
+            &paths,
+            session,
+            |_, _, runtime| {
+                runtime.engine().accepted_frontier_root().unwrap();
+            },
+        );
+        fixture.assert_graph_unchanged();
+    });
+}
+
+/// Reaching the retained-run bound beside residue nothing can classify makes
+/// the next open ephemeral: a full replay, and **no** new retained run.
+///
+/// Without this the flip to retained runs would leak one permanently
+/// uncollectable archive directory per restart, because a single conflict copy
+/// in the resume-point directory denies the reachability proof forever.
+#[test]
+fn the_retained_run_bound_beside_residue_opens_ephemeral_and_adds_no_run() {
+    on_a_deep_stack(|| {
+        let mut fixture = Fixture::new(
+            "resume-bound",
+            None,
+            vec![("pages/bound.md".into(), b"- bound\n".to_vec())],
+        );
+        let root = fixture.enrollment_root("resume-bound");
+        let binding = fixture.enrollment_binding();
+        let paths = PromotedPaths::new(&fixture, "resume-bound");
+        let session = SessionId::new();
+
+        with_promoted_runtime(
+            &mut fixture,
+            &root,
+            &paths,
+            session,
+            |fixture, authority, runtime| {
+                publish_expecting_success(fixture, authority, runtime);
+                append_local_batch(fixture, authority, runtime, 0xE500);
+            },
+        );
+        // A provider removes the point — a receive-only revert, a `.stversions`
+        // restore of an older tree. The next open has nothing to adopt and mints a
+        // second retained run.
+        remove_every_resume_point(&fixture.archive_root);
+        with_reopened_runtime(
+            &fixture,
+            &root,
+            &binding,
+            &paths,
+            session,
+            |_, _, runtime| {
+                assert!(runtime.resume_open_status().retained());
+            },
+        );
+        let at_bound = retained_run_directories(&fixture.archive_root);
+        assert_eq!(at_bound.len(), 2, "the population is now at the bound");
+
+        // Now the directory becomes permanently unprovable.
+        fs::create_dir_all(resume_point_directory(&fixture.archive_root)).unwrap();
+        fs::write(
+            resume_point_directory(&fixture.archive_root).join(".DS_Store"),
+            b"desktop residue",
+        )
+        .unwrap();
+
+        let observation = with_reopened_runtime(
+            &fixture,
+            &root,
+            &binding,
+            &paths,
+            session,
+            |fixture, authority, runtime| {
+                let opened = runtime.resume_open_status().clone();
+                assert!(
+                    matches!(opened.plan(), EngineScratchRetentionPlan::Ephemeral { .. }),
+                    "an unprovable directory at the bound must not authorize growth: {opened:?}"
+                );
+                assert!(!opened.retained());
+                assert!(!opened.adopted());
+                // An ephemeral engine has nothing a resume point could name, and
+                // says so rather than attempting a publication.
+                assert_eq!(
+                    runtime.publish_quiescent_resume_point(authority, &fixture.graph),
+                    ResumePublicationStatus::NotPublished(
+                        ResumePublicationRefusal::EngineNotPublishable
+                    )
+                );
+                public_runtime_observation(runtime)
+            },
+        );
+
+        assert_eq!(
+            retained_run_directories(&fixture.archive_root),
+            at_bound,
+            "an ephemeral open must add no retained run and remove none"
+        );
+        assert!(
+            resume_point_entries(&fixture.archive_root).contains(&".DS_Store".to_owned()),
+            "residue is reported, never deleted"
+        );
+        // And the ephemeral engine is a completely ordinary full replay.
+        assert_eq!(observation.projection_work.len(), 1);
+        fixture.assert_graph_unchanged();
+    });
+}
+
+/// A publication that fails before, at, or after its commit point never blocks
+/// an otherwise valid `Unsafe -> Safe` handoff, and never reclaims a byte.
+#[test]
+fn an_injected_publication_failure_never_blocks_the_safe_handoff_and_reclaims_nothing() {
+    on_a_deep_stack(|| {
+        let mut fixture = Fixture::new(
+            "resume-publication-faults",
+            None,
+            vec![("pages/faults.md".into(), b"- faults\n".to_vec())],
+        );
+        let root = fixture.enrollment_root("resume-publication-faults");
+        let binding = fixture.enrollment_binding();
+        let paths = PromotedPaths::new(&fixture, "resume-publication-faults");
+        let session = SessionId::new();
+
+        let verification_digest = with_promoted_runtime(
+            &mut fixture,
+            &root,
+            &paths,
+            session,
+            |fixture, authority, runtime| {
+                let runs_before = retained_run_directories(&fixture.archive_root);
+                assert_eq!(runs_before.len(), 1);
+
+                // (a) Before the mint: unclassifiable residue makes the endpoint
+                //     binding fail closed. Nothing is published; nothing is removed.
+                fs::create_dir_all(resume_point_directory(&fixture.archive_root)).unwrap();
+                let residue = resume_point_directory(&fixture.archive_root).join(".DS_Store");
+                fs::write(&residue, b"desktop residue").unwrap();
+                let refused = runtime.publish_quiescent_resume_point(authority, &fixture.graph);
+                assert!(
+                    matches!(
+                        refused,
+                        ResumePublicationStatus::NotPublished(ResumePublicationRefusal::Store(_))
+                    ),
+                    "residue must fail the mint closed rather than publish beside it: {refused:?}"
+                );
+                assert_eq!(
+                    resume_point_entries(&fixture.archive_root),
+                    vec![".DS_Store".to_owned()]
+                );
+                fs::remove_file(&residue).unwrap();
+
+                // (b) At the pre-prune cut, before the commit point.
+                fail_next_resume_publication_at(ResumePublishBoundary::AfterPrePrune);
+                let refused = runtime.publish_quiescent_resume_point(authority, &fixture.graph);
+                assert!(
+                    matches!(
+                        refused,
+                        ResumePublicationStatus::NotPublished(ResumePublicationRefusal::Store(_))
+                    ),
+                    "{refused:?}"
+                );
+                assert!(
+                    resume_point_entries(&fixture.archive_root).is_empty(),
+                    "an interrupted publication before its commit point leaves nothing"
+                );
+                assert_eq!(retained_run_directories(&fixture.archive_root), runs_before);
+
+                // (c) After the commit point: the point is durable, but the call
+                //     reports a failure, so the reclamation it would otherwise have
+                //     authorized never runs.
+                fail_next_resume_publication_at(ResumePublishBoundary::AfterCommit);
+                let refused = runtime.publish_quiescent_resume_point(authority, &fixture.graph);
+                assert!(
+                    matches!(
+                        refused,
+                        ResumePublicationStatus::NotPublished(ResumePublicationRefusal::Store(_))
+                    ),
+                    "{refused:?}"
+                );
+                assert_eq!(
+                    resume_point_entries(&fixture.archive_root).len(),
+                    1,
+                    "the commit point is durable even though the call reported a failure"
+                );
+                assert_eq!(
+                    retained_run_directories(&fixture.archive_root),
+                    runs_before,
+                    "no maintenance pass may run without a successful publication witness"
+                );
+
+                // The handoff is untouched by every one of those.
+                let permit = runtime
+                    .quiesce_and_mark_safe_without_watcher_dependency_for_test(
+                        authority,
+                        &fixture.graph,
+                    )
+                    .expect("a publication failure must never block a valid Safe handoff");
+                assert_eq!(permit.session_id(), session);
+                authority.verification_digest()
+            },
+        );
+        assert_eq!(
+            committed_handoff(&root, &binding, verification_digest),
+            LocalActiveHandoff::Safe
+        );
+
+        // And the durable cut the interrupted publication left behind reopens.
+        with_reopened_runtime(
+            &fixture,
+            &root,
+            &binding,
+            &paths,
+            SessionId::new(),
+            |_, _, runtime| {
+                runtime.engine().accepted_frontier_root().unwrap();
+            },
+        );
+        fixture.assert_graph_unchanged();
+    });
+}
+
+/// The whole lifecycle over nested, non-ASCII graph, archive, and
+/// application-runtime paths.
+///
+/// No resume-point payload member is path-derived, so this proves the binding,
+/// the adoption and the reclamation are all independent of how the user's
+/// directories are spelled.
+#[test]
+fn the_resume_lifecycle_works_over_nested_and_utf8_paths() {
+    on_a_deep_stack(|| {
+        let label = "résumé-日本語-a b-🗂️";
+        let mut fixture = Fixture::new(
+            label,
+            None,
+            vec![(
+                "pages/journaux/日本語/a b/c-d/emoji-🗂️/nested résumé.md".into(),
+                "- nested résumé 日本語\n".as_bytes().to_vec(),
+            )],
+        );
+        let root = fixture.enrollment_root(label);
+        let binding = fixture.enrollment_binding();
+        let paths = PromotedPaths::new(&fixture, label);
+        let session = SessionId::new();
+
+        with_promoted_runtime(
+            &mut fixture,
+            &root,
+            &paths,
+            session,
+            |fixture, authority, runtime| {
+                let (sequence, maintenance) =
+                    publish_expecting_success(fixture, authority, runtime);
+                assert_eq!(sequence, 1);
+                assert_eq!(
+                    maintenance.outcome,
+                    RetainedRunMaintenanceOutcome::Reclaimed
+                );
+                append_local_batch_at(fixture, authority, runtime, 0xE600, "pages/journaux/日本語");
+            },
+        );
+        let adopted = with_reopened_runtime(
+            &fixture,
+            &root,
+            &binding,
+            &paths,
+            session,
+            |_, _, runtime| {
+                let opened = runtime.resume_open_status().clone();
+                assert!(opened.adopted(), "{opened:?}");
+                public_runtime_observation(runtime)
+            },
+        );
+        remove_every_resume_point(&fixture.archive_root);
+        let replayed = with_reopened_runtime(
+            &fixture,
+            &root,
+            &binding,
+            &paths,
+            session,
+            |_, _, runtime| {
+                assert!(!runtime.resume_open_status().adopted());
+                public_runtime_observation(runtime)
+            },
+        );
+        assert_publicly_indistinguishable(
+            &adopted,
+            &replayed,
+            "nested/UTF-8 paths must not change what an adopted restart observes",
+        );
+        fixture.assert_graph_unchanged();
+    });
+}
+
+/// The resume lifecycle is absent from the keystroke path.
+///
+/// An adopted runtime admitting ordinary mutation windows performs zero archive
+/// identity reads, zero workspace-lease revalidations, and zero SQLite
+/// statements, and neither the resume observation nor the durable resume-point
+/// and retained-run populations move.
+#[test]
+fn ordinary_admissions_do_no_resume_lifecycle_work() {
+    on_a_deep_stack(|| {
+        let mut fixture = Fixture::new(
+            "resume-admission-cost",
+            None,
+            vec![("pages/cost.md".into(), b"- cost\n".to_vec())],
+        );
+        let root = fixture.enrollment_root("resume-admission-cost");
+        let binding = fixture.enrollment_binding();
+        let paths = PromotedPaths::new(&fixture, "resume-admission-cost");
+        let session = SessionId::new();
+        with_promoted_runtime(
+            &mut fixture,
+            &root,
+            &paths,
+            session,
+            |fixture, authority, runtime| {
+                publish_expecting_success(fixture, authority, runtime);
+            },
+        );
+
+        with_reopened_runtime(
+            &fixture,
+            &root,
+            &binding,
+            &paths,
+            session,
+            |fixture, authority, runtime| {
+                assert!(runtime.resume_open_status().adopted());
+                let opened_before = runtime.resume_open_status().clone();
+                let points_before = resume_point_bytes(&fixture.archive_root);
+                let runs_before = retained_run_directories(&fixture.archive_root);
+
+                for count in [1_usize, 1_000] {
+                    let before = PromotedRuntimeInstrumentation::capture();
+                    for _ in 0..count {
+                        let window = runtime
+                            .admit_promoted_mutation(authority, &fixture.graph)
+                            .unwrap();
+                        window
+                            .admission()
+                            .authorize(&fixture.graph, window.engine)
+                            .unwrap();
+                    }
+                    let measured = before.since();
+                    assert_eq!(measured.archive_identity_reads, 0, "{count} admissions");
+                    assert_eq!(
+                        measured.workspace_lease_identity_revalidations, 0,
+                        "{count} admissions"
+                    );
+                    assert_eq!(measured.sqlite_frontier_reads, 0, "{count} admissions");
+                    assert_eq!(measured.workspace_lease_acquisitions, 0);
+                    assert_eq!(measured.enrollment.namespace_scans, 0);
+                }
+
+                assert_eq!(
+                    runtime.resume_open_status(),
+                    &opened_before,
+                    "an admission never re-derives the resume observation"
+                );
+                assert_eq!(
+                    runtime.resume_publication_status(),
+                    None,
+                    "an admission never publishes"
+                );
+                assert_eq!(resume_point_bytes(&fixture.archive_root), points_before);
+                assert_eq!(retained_run_directories(&fixture.archive_root), runs_before);
+            },
+        );
+        fixture.assert_graph_unchanged();
+    });
 }
