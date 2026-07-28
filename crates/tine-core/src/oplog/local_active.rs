@@ -404,18 +404,14 @@ fn sqlite_frontier_root(
 fn authenticate_archive_identity(
     archive: &ObjectStore,
     state: &PromotedRuntimeStateV1,
-    claim_detail: &'static str,
     control_detail: &'static str,
 ) -> Result<(), RuntimePromotionError> {
     #[cfg(test)]
     count(&PROMOTED_ARCHIVE_IDENTITY_READS);
     archive
         .validate_enrolled_archive_resource_id(state.archive_resource_id)
-        .map_err(|error| {
-            RuntimePromotionError::Activation(LocalActivationError::RuntimeBinding(format!(
-                "{claim_detail}: {error}"
-            )))
-        })?;
+        .map_err(StoreError::Io)
+        .map_err(RuntimePromotionError::Store)?;
     if archive.canonical_archive_identity()?.binding_digest() != state.archive_control_binding {
         return Err(RuntimePromotionError::Anchor(control_detail));
     }
@@ -1119,14 +1115,9 @@ impl LocalRuntimeAdmission<'_> {
         &self,
         graph: &Graph,
         engine: &ShardedHotEngine,
-    ) -> Result<(), LocalActivationError> {
+    ) -> Result<(), RuntimePromotionError> {
         match &self.provenance {
-            AdmissionProvenance::Promoted(admission) => admission
-                .authorize_engine(graph, engine)
-                .map_err(|error| match error {
-                    RuntimePromotionError::Activation(error) => error,
-                    other => LocalActivationError::RuntimeBinding(other.to_string()),
-                }),
+            AdmissionProvenance::Promoted(admission) => admission.authorize_engine(graph, engine),
             AdmissionProvenance::UnenrolledPreActivation => {
                 // A promoted engine is a real activated user graph. The
                 // pre-activation hatch exists only for fixtures whose engines
@@ -1134,10 +1125,12 @@ impl LocalRuntimeAdmission<'_> {
                 // offering it a promoted runtime is always a construction
                 // error, never a fallback.
                 if engine.promoted_lineage().is_some() {
-                    return Err(LocalActivationError::RuntimeBinding(
-                        "the unenrolled pre-activation admission cannot authorize a promoted \
-                         runtime engine"
-                            .into(),
+                    return Err(RuntimePromotionError::Activation(
+                        LocalActivationError::RuntimeBinding(
+                            "the unenrolled pre-activation admission cannot authorize a promoted \
+                             runtime engine"
+                                .into(),
+                        ),
                     ));
                 }
                 Ok(())
@@ -1156,20 +1149,24 @@ impl LocalRuntimeAdmission<'_> {
         graph: &Graph,
         engine: &ShardedHotEngine,
         endpoint: ProjectionEndpointBinding,
-    ) -> Result<AdmittedLocalAuthorAuthority<'a>, LocalActivationError> {
+    ) -> Result<AdmittedLocalAuthorAuthority<'a>, RuntimePromotionError> {
         self.authorize(graph, engine)?;
         let AdmissionProvenance::Promoted(admission) = &self.provenance else {
-            return Err(LocalActivationError::RuntimeBinding(
-                "local author identity requires a live promoted runtime session".into(),
+            return Err(RuntimePromotionError::Activation(
+                LocalActivationError::RuntimeBinding(
+                    "local author identity requires a live promoted runtime session".into(),
+                ),
             ));
         };
         if endpoint != admission.permit.endpoint()
             || endpoint.device_id() != admission.permit.endpoint().device_id()
             || engine.workspace_id() != admission.state.workspace_id
         {
-            return Err(LocalActivationError::RuntimeBinding(
-                "promoted local author binding differs from the admitted endpoint or workspace"
-                    .into(),
+            return Err(RuntimePromotionError::Activation(
+                LocalActivationError::RuntimeBinding(
+                    "promoted local author binding differs from the admitted endpoint or workspace"
+                        .into(),
+                ),
             ));
         }
         Ok(AdmittedLocalAuthorAuthority {
@@ -1178,7 +1175,7 @@ impl LocalRuntimeAdmission<'_> {
             session_id: admission.permit.session_id(),
             generation: engine
                 .local_author_generation()
-                .map_err(|error| LocalActivationError::RuntimeBinding(error.to_string()))?,
+                .map_err(RuntimePromotionError::Engine)?,
             _admission: std::marker::PhantomData,
             _seal: seal::Seal,
         })
@@ -3420,7 +3417,6 @@ fn revalidate_promoted_binding(
         authenticate_archive_identity(
             archive,
             state,
-            "promoted archive resource claim no longer authenticates",
             "promoted archive control directory was substituted",
         )?;
     }
@@ -4412,7 +4408,6 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
     try_release!(authenticate_archive_identity(
         &archive,
         &state,
-        "promoted archive resource claim does not authenticate",
         "promoted archive control directory identity changed",
     ));
     // The retained immutable publication and the durable reference-catalog

@@ -121,6 +121,14 @@ thread_local! {
     static ENROLLMENT_AUTHORITY_CLAIM_READS: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
     };
+    static FAIL_NEXT_ENROLLMENT_HEAD_READ: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_enrollment_head_read() {
+    FAIL_NEXT_ENROLLMENT_HEAD_READ.with(|fault| fault.set(true));
 }
 
 /// Exact causal accounting for the enrollment journal's filesystem work.
@@ -3874,6 +3882,12 @@ fn validate_record_authority(
 fn read_head(directory: &Dir) -> Result<Option<ContentDigest>, EnrollmentError> {
     #[cfg(test)]
     count(&ENROLLMENT_HEAD_READS);
+    #[cfg(test)]
+    if FAIL_NEXT_ENROLLMENT_HEAD_READ.with(|fault| fault.replace(false)) {
+        return Err(EnrollmentError::Io(
+            "injected transient enrollment head read failure".into(),
+        ));
+    }
     let metadata = match directory.symlink_metadata(HEAD_FILE) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),

@@ -12,10 +12,11 @@ use std::sync::Arc;
 use crate::model::{HandoffSafeGuard, PublishedHandoffLatch};
 use crate::Graph;
 
+use super::enrollment::{EnrollmentError, VerifiedLocalCompositionError};
 use super::hot_engine::{LocalAuthorCapture, ReconciliationNeeded};
 use super::local_active::{
-    LocalRuntimeAdmission, PromotedRuntimeSession, RuntimeRevocation, WorkspaceAuthorityBoundary,
-    WorkspaceAuthorityRefusal,
+    LocalRuntimeAdmission, PromotedRuntimeSession, RuntimePromotionError, RuntimeRevocation,
+    WorkspaceAuthorityBoundary, WorkspaceAuthorityRefusal,
 };
 use super::{
     plan_affected_import, AcceptedBatchEvent, AuthorBatch, BatchDisposition, BatchId,
@@ -192,13 +193,34 @@ fn authorize_coordinator(
         WorkspaceAuthorityBoundary::WindowAuthorization,
         OperationalPhase::Bindings,
     )?;
-    admission.authorize(graph, engine).map_err(|error| {
-        OperationalCoordinatorError::retained_block(
+    admission
+        .authorize(graph, engine)
+        .map_err(classify_authorization_failure)
+}
+
+fn classify_authorization_failure(error: RuntimePromotionError) -> OperationalCoordinatorError {
+    match error {
+        RuntimePromotionError::WorkspaceAuthorityRevoked(refusal) => {
+            OperationalCoordinatorError::revoked(OperationalPhase::Bindings, refusal)
+        }
+        RuntimePromotionError::WorkspaceAuthorityCheckUnavailable(refusal) => {
+            OperationalCoordinatorError::new(OperationalPhase::Bindings, refusal.to_string())
+        }
+        RuntimePromotionError::Enrollment(VerifiedLocalCompositionError::Enrollment(
+            EnrollmentError::Io(detail),
+        )) => OperationalCoordinatorError::new(
             OperationalPhase::Bindings,
-            error.to_string(),
+            EnrollmentError::Io(detail).to_string(),
+        ),
+        RuntimePromotionError::Store(super::StoreError::Io(error)) => {
+            OperationalCoordinatorError::new(OperationalPhase::Bindings, error.to_string())
+        }
+        stable => OperationalCoordinatorError::retained_block(
+            OperationalPhase::Bindings,
+            stable.to_string(),
             RetainedBlockReason::StableBinding,
-        )
-    })
+        ),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -997,9 +1019,7 @@ fn execute_local_inner(
         LocalDraftSource::Promoted => {
             let authority = admission
                 .mint_local_author_authority(graph, engine, endpoint)
-                .map_err(|error| {
-                    OperationalCoordinatorError::new(OperationalPhase::Bindings, error.to_string())
-                })?;
+                .map_err(classify_authorization_failure)?;
             let author_device_id = authority.device_id();
             let author_session_id = authority.session_id();
             let (batch_id, draft) = engine
@@ -1336,9 +1356,19 @@ fn authenticate_published(
     manifest_digest: ContentDigest,
     retained_bytes: usize,
 ) -> Result<(), OperationalCoordinatorError> {
-    let validated = match archive.inspect_batch(batch_id).map_err(|error| {
-        OperationalCoordinatorError::new(OperationalPhase::Publication, error.to_string())
-    })? {
+    let inspection = archive
+        .inspect_batch(batch_id)
+        .map_err(|error| match error {
+            super::StoreError::Io(error) => {
+                OperationalCoordinatorError::new(OperationalPhase::Publication, error.to_string())
+            }
+            stable => OperationalCoordinatorError::retained_block(
+                OperationalPhase::Publication,
+                stable.to_string(),
+                RetainedBlockReason::PublishedAuthentication,
+            ),
+        })?;
+    let validated = match inspection {
         BatchInspection::Ready(validated) => validated,
         BatchInspection::Absent | BatchInspection::Staged { .. } => {
             return Err(OperationalCoordinatorError::retained_block(

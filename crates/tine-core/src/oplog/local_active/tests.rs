@@ -9,8 +9,8 @@ use uuid::Uuid;
 use super::*;
 use crate::model::Graph;
 use crate::oplog::enrollment::{
-    compose_verified_local, enrollment_application_root_for_test, CommitCut, EnrollmentOpen,
-    EnrollmentReader, PreparationId,
+    compose_verified_local, enrollment_application_root_for_test, fail_next_enrollment_head_read,
+    CommitCut, EnrollmentOpen, EnrollmentReader, PreparationId,
 };
 use crate::oplog::hot_engine::{
     take_last_admitted_local_author, AcceptedFrontierRoot, ProjectionEndpointBinding,
@@ -31,9 +31,9 @@ use crate::oplog::object_store::{
     RetainedRunMaintenanceOutcome,
 };
 use crate::oplog::operational_coordinator::{
-    act_once_at, LocalMutationCoordinatorState, LocalMutationRecovery, OperationalCoordinator,
-    OperationalCoordinatorError, OperationalCoordinatorState, OperationalFaultPoint,
-    OperationalPhase,
+    act_once_at, fail_once_at, LocalMutationBlockReason, LocalMutationCoordinatorState,
+    LocalMutationRecovery, OperationalCoordinator, OperationalCoordinatorError,
+    OperationalCoordinatorState, OperationalFaultPoint, OperationalPhase, RetainedBlockReason,
 };
 use crate::oplog::projection::write_projection_exact;
 use crate::oplog::reconciliation_baseline::{
@@ -2230,6 +2230,252 @@ fn promoted_local_coordinator_mints_exact_session_device_batch_and_peer_identity
     }
     assert_ne!(observed[0].batch_id, observed[1].batch_id);
     assert_ne!(observed[0].crdt_peer_id, observed[1].crdt_peer_id);
+}
+
+fn promoted_local_create_page(seed: u128, label: &str) -> OperationTransaction {
+    OperationTransaction::new(vec![
+        SemanticOperation::CreatePage {
+            page_id: PageId::from_uuid(Uuid::from_u128(seed)),
+            home_document_id: DocumentId::from_uuid(Uuid::from_u128(seed + 1)),
+            name: LogicalPageName::parse(label).unwrap(),
+            path: ManagedPath::parse(&format!("pages/{label}.md")).unwrap(),
+            kind: ManagedTextKind::Page,
+        },
+        SemanticOperation::CreateBlock {
+            block: BlockLocation {
+                block_id: BlockId::from_uuid(Uuid::from_u128(seed + 2)),
+                home_document_id: DocumentId::from_uuid(Uuid::from_u128(seed + 1)),
+            },
+            page_id: PageId::from_uuid(Uuid::from_u128(seed)),
+            parent: None,
+            order: "a".into(),
+            content: label.into(),
+        },
+    ])
+    .unwrap()
+}
+
+#[test]
+fn deterministic_published_local_authentication_damage_retains_typed_blocked_state() {
+    let mut fixture = Fixture::new(
+        "published-local-authentication-damage",
+        None,
+        vec![("pages/seed.md".into(), b"- seed\n".to_vec())],
+    );
+    let root = fixture.enrollment_root("published-local-authentication-damage");
+    let paths = PromotedPaths::new(&fixture, "published-local-authentication-damage");
+    let (mut authority, mut runtime) = promote(&mut fixture, &root, SessionId::new(), &paths);
+    let transaction = promoted_local_create_page(0xAB40_0000, "published-auth-damage");
+
+    let accepted_before = runtime.engine().accepted_frontier_root().unwrap();
+    let history_before = runtime.engine().durable_history_authority().unwrap();
+    let sqlite_before = runtime.database().frontier_root().unwrap();
+    let projection_before = promoted_projection_digests(&paths.database_path);
+    let graph_before = snapshot_files(&fixture.graph_root);
+    let publications_before = published_immutable_digests(&fixture.archive_root);
+    let releases_before = fixture.graph.handoff_release_count();
+
+    fail_once_at(OperationalFaultPoint::AfterManifest);
+    let mut window = runtime
+        .admit_promoted_mutation(&mut authority, &fixture.graph)
+        .unwrap();
+    let LocalMutationCoordinatorState::Recovering(LocalMutationRecovery::Published(continuation)) =
+        OperationalCoordinator::execute_local(
+            &mut window,
+            &fixture.graph,
+            &fixture.receipts,
+            &transaction,
+        )
+    else {
+        panic!("AfterManifest must return the genuine admitted-local continuation");
+    };
+    let batch_id = continuation.batch_id();
+    let drafted =
+        take_last_admitted_local_author().expect("the production local path drafted exactly once");
+    assert_eq!(drafted.batch_id, batch_id);
+    assert_ne!(
+        published_immutable_digests(&fixture.archive_root),
+        publications_before,
+        "the failpoint must occur after immutable publication"
+    );
+
+    let manifest_path = fixture
+        .archive_root
+        .join("batches")
+        .join(format!("{batch_id}.manifest"));
+    fs::write(&manifest_path, b"{").unwrap();
+    let damaged_publication = published_immutable_digests(&fixture.archive_root);
+
+    let (admission, engine, database, tail) = window.parts().unwrap();
+    let LocalMutationCoordinatorState::Blocked(blocked) = continuation.retry(
+        &admission,
+        &fixture.graph,
+        &fixture.receipts,
+        engine,
+        database,
+        tail,
+    ) else {
+        panic!("deterministic immutable decode damage must retain typed Blocked state");
+    };
+    assert_eq!(
+        blocked.reason(),
+        &LocalMutationBlockReason::Retained(RetainedBlockReason::PublishedAuthentication)
+    );
+    assert_eq!(
+        blocked
+            .continuation()
+            .expect("the exact damaged publication remains retained")
+            .batch_id(),
+        batch_id
+    );
+    assert_eq!(engine.accepted_frontier_root().unwrap(), accepted_before);
+    assert_eq!(engine.durable_history_authority().unwrap(), history_before);
+    assert_eq!(database.frontier_root().unwrap(), sqlite_before);
+    assert_eq!(
+        promoted_projection_digests(&paths.database_path),
+        projection_before
+    );
+    assert_eq!(snapshot_files(&fixture.graph_root), graph_before);
+    assert_eq!(
+        published_immutable_digests(&fixture.archive_root),
+        damaged_publication,
+        "authentication retry must neither redraft nor republish"
+    );
+    assert!(
+        take_last_admitted_local_author().is_none(),
+        "authentication retry must not enter the local draft path"
+    );
+    assert_eq!(fixture.graph.handoff_release_count(), releases_before);
+    assert!(
+        fixture.graph.probe_managed_text_writer().is_err(),
+        "the retained blocked continuation must keep the handoff latch closed"
+    );
+}
+
+#[test]
+fn transient_enrollment_read_keeps_published_local_recovery_exactly_resumable() {
+    let mut fixture = Fixture::new(
+        "published-local-transient-enrollment-read",
+        None,
+        vec![("pages/seed.md".into(), b"- seed\n".to_vec())],
+    );
+    let root = fixture.enrollment_root("published-local-transient-enrollment-read");
+    let paths = PromotedPaths::new(&fixture, "published-local-transient-enrollment-read");
+    let (mut authority, mut runtime) = promote(&mut fixture, &root, SessionId::new(), &paths);
+    let transaction = promoted_local_create_page(0xAB40_1000, "transient-enrollment-read");
+
+    let accepted_before = runtime.engine().accepted_frontier_root().unwrap();
+    let history_before = runtime.engine().durable_history_authority().unwrap();
+    let sqlite_before = runtime.database().frontier_root().unwrap();
+    let projection_before = promoted_projection_digests(&paths.database_path);
+    let graph_before = snapshot_files(&fixture.graph_root);
+    let releases_before = fixture.graph.handoff_release_count();
+
+    fail_once_at(OperationalFaultPoint::AfterManifest);
+    let mut window = runtime
+        .admit_promoted_mutation(&mut authority, &fixture.graph)
+        .unwrap();
+    let LocalMutationCoordinatorState::Recovering(LocalMutationRecovery::Published(continuation)) =
+        OperationalCoordinator::execute_local(
+            &mut window,
+            &fixture.graph,
+            &fixture.receipts,
+            &transaction,
+        )
+    else {
+        panic!("AfterManifest must return the genuine admitted-local continuation");
+    };
+    let batch_id = continuation.batch_id();
+    let drafted =
+        take_last_admitted_local_author().expect("the production local path drafted exactly once");
+    assert_eq!(drafted.batch_id, batch_id);
+    let publication = published_immutable_digests(&fixture.archive_root);
+
+    let (admission, engine, database, tail) = window.parts().unwrap();
+    fail_next_enrollment_head_read();
+    let LocalMutationCoordinatorState::Recovering(LocalMutationRecovery::Published(continuation)) =
+        continuation.retry(
+            &admission,
+            &fixture.graph,
+            &fixture.receipts,
+            engine,
+            database,
+            tail,
+        )
+    else {
+        panic!("a transient enrollment read must remain Recovering");
+    };
+    assert_eq!(continuation.batch_id(), batch_id);
+    assert_eq!(continuation.phase(), OperationalPhase::Bindings);
+    assert_eq!(continuation.failure().retained_block_reason(), None);
+    assert_eq!(engine.accepted_frontier_root().unwrap(), accepted_before);
+    assert_eq!(engine.durable_history_authority().unwrap(), history_before);
+    assert_eq!(database.frontier_root().unwrap(), sqlite_before);
+    assert_eq!(
+        promoted_projection_digests(&paths.database_path),
+        projection_before
+    );
+    assert_eq!(snapshot_files(&fixture.graph_root), graph_before);
+    assert_eq!(
+        published_immutable_digests(&fixture.archive_root),
+        publication
+    );
+    assert_eq!(fixture.graph.handoff_release_count(), releases_before);
+    assert!(fixture.graph.probe_managed_text_writer().is_err());
+    assert!(take_last_admitted_local_author().is_none());
+
+    let mut state = continuation.retry(
+        &admission,
+        &fixture.graph,
+        &fixture.receipts,
+        engine,
+        database,
+        tail,
+    );
+    let completion = loop {
+        match state {
+            LocalMutationCoordinatorState::Active(completion) => break completion,
+            LocalMutationCoordinatorState::Recovering(LocalMutationRecovery::Published(
+                continuation,
+            )) => {
+                state = continuation.retry(
+                    &admission,
+                    &fixture.graph,
+                    &fixture.receipts,
+                    engine,
+                    database,
+                    tail,
+                );
+            }
+            LocalMutationCoordinatorState::Recovering(
+                LocalMutationRecovery::ReconciliationRequired(reconciliation),
+            ) => panic!(
+                "exact continuation requested redraft reconciliation: {:?}",
+                reconciliation.paths()
+            ),
+            LocalMutationCoordinatorState::Blocked(blocked) => {
+                panic!(
+                    "transient continuation became blocked: {}",
+                    blocked.failure()
+                )
+            }
+            LocalMutationCoordinatorState::Revoked(revoked) => {
+                panic!(
+                    "transient continuation became revoked: {}",
+                    revoked.failure()
+                )
+            }
+        }
+    };
+    assert_eq!(completion.batch_id(), batch_id);
+    assert_eq!(
+        published_immutable_digests(&fixture.archive_root),
+        publication,
+        "exact-continuation completion must not republish"
+    );
+    assert!(take_last_admitted_local_author().is_none());
+    assert_eq!(fixture.graph.handoff_release_count(), releases_before + 1);
+    fixture.graph.probe_managed_text_writer().unwrap();
 }
 
 /// The durable promotion state file inside one archive root.
