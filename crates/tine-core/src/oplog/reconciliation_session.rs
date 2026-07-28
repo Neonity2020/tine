@@ -34,6 +34,11 @@ use super::{
     TailOverlay,
 };
 
+/// A published reconciliation gets a small number of fresh actor turns for
+/// transient post-publication failures. Exhaustion retains the exact
+/// continuation and failure evidence as a stable blocked state.
+pub(crate) const MAX_PUBLISHED_CONTINUATION_RETRIES: u8 = 3;
+
 /// Exact enrolled dependencies supplied for one synchronous session step.
 ///
 /// The session never retains any of these references. In particular, it does
@@ -70,6 +75,7 @@ pub(crate) enum ReconciliationSessionStep {
     Noop,
     Complete,
     Blocked,
+    PublishedBlocked(ReconciliationPendingContinuation),
     RetryFull,
     Pending(ReconciliationPendingContinuation),
 }
@@ -123,6 +129,8 @@ struct PendingContinuation<C, B> {
     continuation: C,
     baseline: Option<B>,
     changed_paths: ReconciliationTerminalChangedPaths,
+    retry_attempts: u8,
+    blocked: Option<BaselineBlockedObservation>,
 }
 
 /// One headless reconciliation session for exactly one enrolled endpoint.
@@ -174,6 +182,20 @@ impl<C, B> ReconciliationSession<C, B> {
         self.terminal_changed_paths.take()
     }
 
+    /// Return the exact stable refusal for an exhausted published
+    /// continuation. The token check prevents a caller from reading evidence
+    /// for a stale or foreign continuation.
+    pub(crate) fn published_blocked_detail(
+        &self,
+        continuation: ReconciliationPendingContinuation,
+    ) -> Option<&str> {
+        self.pending
+            .as_ref()
+            .filter(|pending| pending.token == continuation)
+            .and_then(|pending| pending.blocked.as_ref())
+            .map(|blocked| blocked.detail.as_str())
+    }
+
     fn step_with<D>(
         &mut self,
         dispatch: &mut D,
@@ -221,15 +243,30 @@ impl<C, B> ReconciliationSession<C, B> {
         if pending.token != continuation {
             return Err(ReconciliationSessionError::StaleOrForeignContinuation);
         }
+        if pending.blocked.is_some() {
+            return Ok(ReconciliationSessionStep::PublishedBlocked(continuation));
+        }
         let pending = self
             .pending
             .take()
             .expect("checked reconciliation continuation disappeared");
-        let outcome = dispatch.resume(pending.continuation);
+        let PendingContinuation {
+            token,
+            continuation,
+            baseline,
+            changed_paths,
+            retry_attempts,
+            blocked: None,
+        } = pending
+        else {
+            unreachable!("blocked reconciliation continuation passed the stable-state guard")
+        };
+        let outcome = dispatch.resume(continuation);
         self.settle_continuation(
-            pending.token,
-            pending.baseline,
-            pending.changed_paths,
+            token,
+            baseline,
+            changed_paths,
+            retry_attempts,
             outcome,
             dispatch,
         )
@@ -252,6 +289,8 @@ impl<C, B> ReconciliationSession<C, B> {
                     continuation,
                     result.baseline,
                     changed_paths,
+                    0,
+                    None,
                 );
                 Ok(ReconciliationSessionStep::Pending(token))
             }
@@ -270,6 +309,7 @@ impl<C, B> ReconciliationSession<C, B> {
         token: ReconciliationPendingContinuation,
         baseline: Option<B>,
         changed_paths: ReconciliationTerminalChangedPaths,
+        retry_attempts: u8,
         outcome: ReconciliationSessionDispatchOutcome<C>,
         dispatch: &mut D,
     ) -> Result<ReconciliationSessionStep, ReconciliationSessionError>
@@ -278,9 +318,24 @@ impl<C, B> ReconciliationSession<C, B> {
     {
         match outcome {
             ReconciliationSessionDispatchOutcome::FailedClosed(continuation) => {
-                let next =
-                    self.retain_continuation(token.lease, continuation, baseline, changed_paths);
-                Ok(ReconciliationSessionStep::Pending(next))
+                let retry_attempts = retry_attempts
+                    .checked_add(1)
+                    .expect("published reconciliation retry count exhausted");
+                let blocked = (retry_attempts >= MAX_PUBLISHED_CONTINUATION_RETRIES)
+                    .then(|| dispatch.failed_closed_observation(&continuation, retry_attempts));
+                let next = self.retain_continuation(
+                    token.lease,
+                    continuation,
+                    baseline,
+                    changed_paths,
+                    retry_attempts,
+                    blocked,
+                );
+                if retry_attempts >= MAX_PUBLISHED_CONTINUATION_RETRIES {
+                    Ok(ReconciliationSessionStep::PublishedBlocked(next))
+                } else {
+                    Ok(ReconciliationSessionStep::Pending(next))
+                }
             }
             outcome => self.finish_baseline_and_settle_lease(
                 token.lease,
@@ -298,6 +353,8 @@ impl<C, B> ReconciliationSession<C, B> {
         continuation: C,
         baseline: Option<B>,
         changed_paths: ReconciliationTerminalChangedPaths,
+        retry_attempts: u8,
+        blocked: Option<BaselineBlockedObservation>,
     ) -> ReconciliationPendingContinuation {
         self.next_continuation_sequence = self
             .next_continuation_sequence
@@ -312,6 +369,8 @@ impl<C, B> ReconciliationSession<C, B> {
             continuation,
             baseline,
             changed_paths,
+            retry_attempts,
+            blocked,
         });
         token
     }
@@ -568,6 +627,12 @@ trait ReconciliationSessionDispatch {
         &mut self,
         continuation: Self::Continuation,
     ) -> ReconciliationSessionDispatchOutcome<Self::Continuation>;
+
+    fn failed_closed_observation(
+        &self,
+        continuation: &Self::Continuation,
+        retry_attempts: u8,
+    ) -> BaselineBlockedObservation;
 
     fn finish_baseline(
         &mut self,
@@ -860,6 +925,23 @@ impl ReconciliationSessionDispatch for LiveReconciliationSessionDispatch<'_> {
                 ))
             }
         }
+    }
+
+    fn failed_closed_observation(
+        &self,
+        continuation: &Self::Continuation,
+        retry_attempts: u8,
+    ) -> BaselineBlockedObservation {
+        BaselineBlockedObservation::new(
+            BaselineBlockedReason::ReconciliationFailed,
+            format!(
+                "published external reconciliation for import {:?}, batch {:?}, remained \
+                 failed after {retry_attempts} retries; exact retained failure: {}",
+                continuation.import_id(),
+                continuation.batch_id(),
+                continuation.failure()
+            ),
+        )
     }
 
     fn finish_baseline(
@@ -1444,6 +1526,20 @@ mod tests {
             }
         }
 
+        fn failed_closed_observation(
+            &self,
+            continuation: &Self::Continuation,
+            retry_attempts: u8,
+        ) -> BaselineBlockedObservation {
+            BaselineBlockedObservation::new(
+                BaselineBlockedReason::ReconciliationFailed,
+                format!(
+                    "fake continuation {} remained failed after {retry_attempts} retries",
+                    continuation.0
+                ),
+            )
+        }
+
         fn finish_baseline(
             &mut self,
             pending: Self::PendingBaseline,
@@ -1832,6 +1928,106 @@ mod tests {
             assert!(session.status().active);
             assert!(dispatch.finished_baselines.is_empty());
         }
+    }
+
+    #[test]
+    fn final_retry_can_complete_before_the_published_continuation_budget_exhausts() {
+        let mut session = session();
+        session.trigger(ReconciliationTrigger::Explicit);
+        let mut dispatch = FakeDispatch::with_dispatch([FakeDispatchResult::FailedClosed(41)]);
+        dispatch.resume_results.extend([
+            FakeResumeResult::FailedClosed(41),
+            FakeResumeResult::FailedClosed(41),
+            FakeResumeResult::Complete,
+        ]);
+
+        let Ok(ReconciliationSessionStep::Pending(mut token)) = session.step_with(&mut dispatch)
+        else {
+            panic!("expected retained published continuation");
+        };
+        for _ in 1..MAX_PUBLISHED_CONTINUATION_RETRIES {
+            let Ok(ReconciliationSessionStep::Pending(next)) =
+                session.resume_with(token, &mut dispatch)
+            else {
+                panic!("a transient failure inside the retry budget must remain pending");
+            };
+            token = next;
+        }
+        assert_eq!(
+            session.resume_with(token, &mut dispatch),
+            Ok(ReconciliationSessionStep::Complete)
+        );
+        assert_eq!(
+            dispatch.resumed,
+            vec![41; usize::from(MAX_PUBLISHED_CONTINUATION_RETRIES)]
+        );
+        assert!(!session.status().active);
+    }
+
+    #[test]
+    fn exhausted_published_continuation_is_stably_blocked_with_exact_evidence() {
+        let mut session = session();
+        session.trigger(ReconciliationTrigger::Explicit);
+        let mut dispatch =
+            FakeDispatch::with_dispatch([FakeDispatchResult::FailedClosedWithBaseline {
+                continuation: 41,
+                baseline: 701,
+            }]);
+        dispatch.resume_results.extend(std::iter::repeat_n(
+            FakeResumeResult::FailedClosed(41),
+            usize::from(MAX_PUBLISHED_CONTINUATION_RETRIES),
+        ));
+
+        let Ok(ReconciliationSessionStep::Pending(mut token)) = session.step_with(&mut dispatch)
+        else {
+            panic!("expected retained published continuation");
+        };
+        session.trigger(ReconciliationTrigger::WatcherPaths(paths(&[
+            "pages/later.md",
+        ])));
+        for retry in 1..MAX_PUBLISHED_CONTINUATION_RETRIES {
+            let Ok(ReconciliationSessionStep::Pending(next)) =
+                session.resume_with(token, &mut dispatch)
+            else {
+                panic!("retry {retry} must remain pending inside the explicit budget");
+            };
+            token = next;
+        }
+        let Ok(ReconciliationSessionStep::PublishedBlocked(blocked_token)) =
+            session.resume_with(token, &mut dispatch)
+        else {
+            panic!("the final failed retry must become a stable published block");
+        };
+        let detail = session
+            .published_blocked_detail(blocked_token)
+            .expect("blocked continuation must retain exact failure evidence");
+        assert_eq!(
+            detail,
+            "fake continuation 41 remained failed after 3 retries"
+        );
+        assert_eq!(
+            dispatch.resumed,
+            vec![41; usize::from(MAX_PUBLISHED_CONTINUATION_RETRIES)]
+        );
+        assert_eq!(
+            session.resume_with(blocked_token, &mut dispatch),
+            Ok(ReconciliationSessionStep::PublishedBlocked(blocked_token))
+        );
+        assert_eq!(
+            dispatch.resumed,
+            vec![41; usize::from(MAX_PUBLISHED_CONTINUATION_RETRIES)],
+            "stable blocked polls must not execute the continuation again"
+        );
+        let pending = session
+            .pending
+            .as_ref()
+            .expect("stable block must retain the affine continuation");
+        assert_eq!(pending.continuation, FakeContinuation(41));
+        assert_eq!(pending.baseline, Some(FakePendingBaseline(701)));
+        assert!(pending.blocked.is_some());
+        assert!(session.status().active);
+        assert!(session.status().pending);
+        assert!(dispatch.finished_baselines.is_empty());
     }
 
     #[test]

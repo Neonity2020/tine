@@ -39,6 +39,8 @@ use crate::oplog::local_active::{
     take_over_promoted_local_runtime_recovering_projection, LocalActiveAuthority,
     PromotedLocalRuntime, PromotedRuntimeOpen, RuntimeRecoveryState,
 };
+#[cfg(test)]
+use crate::oplog::operational_coordinator::{fail_repeatedly_at, OperationalFaultPoint};
 use crate::oplog::projection_store::ProjectionReceiptStore;
 use crate::oplog::reconciliation_baseline::{
     BaselineTimestamp, ReconciliationBaseline, ReconciliationBaselineBinding,
@@ -201,7 +203,7 @@ pub enum SyncRuntimeTick {
     RecoveryBlocked(String),
     Recovering,
     RetryFull,
-    Blocked,
+    Blocked(String),
     Failed(String),
     AdmittedNoop { epoch: u64 },
     AdmittedComplete { epoch: u64 },
@@ -465,6 +467,24 @@ impl SyncRuntimeHandle {
         Ok(outcome)
     }
 
+    #[cfg(test)]
+    fn install_repeated_operational_fault(
+        &self,
+        point: OperationalFaultPoint,
+        failures: u8,
+    ) -> Result<(), SyncRuntimeRequestError> {
+        let _operation = self.inner.operation.lock().unwrap();
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.send(ActorRequest::InstallRepeatedOperationalFault {
+            point,
+            failures,
+            reply: reply_sender,
+        })?;
+        reply_receiver
+            .recv()
+            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)
+    }
+
     fn send(&self, request: ActorRequest) -> Result<(), SyncRuntimeRequestError> {
         self.inner
             .sender
@@ -542,6 +562,12 @@ enum ActorRequest {
     Status {
         reply: mpsc::Sender<SyncRuntimeStatusSnapshot>,
     },
+    #[cfg(test)]
+    InstallRepeatedOperationalFault {
+        point: OperationalFaultPoint,
+        failures: u8,
+        reply: mpsc::Sender<()>,
+    },
     CleanShutdown {
         reply: mpsc::Sender<Result<SyncShutdownOutcome, SyncRuntimeRequestError>>,
     },
@@ -584,6 +610,16 @@ fn actor_thread(
             }
             ActorRequest::Status { reply } => {
                 let _ = reply.send(actor.snapshot());
+                false
+            }
+            #[cfg(test)]
+            ActorRequest::InstallRepeatedOperationalFault {
+                point,
+                failures,
+                reply,
+            } => {
+                fail_repeatedly_at(point, failures);
+                let _ = reply.send(());
                 false
             }
             ActorRequest::CleanShutdown { reply } => match actor.clean_shutdown() {
@@ -805,10 +841,8 @@ impl RuntimeActor {
                 SyncRuntimeTick::RecoveryBlocked(detail) | SyncRuntimeTick::Terminal(detail) => {
                     return Err(SyncRuntimeRequestError::ActorRefused(detail));
                 }
-                SyncRuntimeTick::Blocked => {
-                    return Err(SyncRuntimeRequestError::ActorRefused(
-                        "exact external reconciliation is blocked".into(),
-                    ));
+                SyncRuntimeTick::Blocked(detail) => {
+                    return Err(SyncRuntimeRequestError::ActorRefused(detail));
                 }
             }
         }
@@ -914,7 +948,7 @@ fn map_tick(drain: ExactExternalFeedDrain) -> SyncRuntimeTick {
         }
         ExactExternalFeedDrain::Recovering => SyncRuntimeTick::Recovering,
         ExactExternalFeedDrain::RetryFull => SyncRuntimeTick::RetryFull,
-        ExactExternalFeedDrain::Blocked => SyncRuntimeTick::Blocked,
+        ExactExternalFeedDrain::Blocked(detail) => SyncRuntimeTick::Blocked(detail),
         ExactExternalFeedDrain::Failed(detail) => SyncRuntimeTick::Failed(detail),
         ExactExternalFeedDrain::AdmittedNoop { epoch } => SyncRuntimeTick::AdmittedNoop { epoch },
         ExactExternalFeedDrain::AdmittedComplete { epoch } => {
@@ -1076,10 +1110,12 @@ mod tests {
         Err(last)
     }
 
-    /// An ordinary external editor must be able to create a page and then
-    /// repeatedly change existing blocks while appending new blocks.
+    /// A deterministic post-publication failure must not turn an ordinary
+    /// edit into an absorbing `Recovering` loop. The published batch remains
+    /// truth, its exact continuation and failure stay retained, later watcher
+    /// work queues behind it, and shutdown returns that refusal immediately.
     #[test]
-    fn ordinary_external_edit_settles_its_epoch_and_still_reaches_a_safe_handoff() {
+    fn deterministic_published_failure_blocks_without_losing_published_work() {
         let fixture = RuntimeHostFixture::safe("sync-runtime-external-edit");
         let handle = active_handle(SyncRuntimeHandle::open(fixture.request()));
         drive_initial_feed(&handle);
@@ -1104,39 +1140,70 @@ mod tests {
             "external page creation must be admitted: {created:?}"
         );
 
-        for revision in 1..=3 {
-            let body = (0..=revision)
-                .map(|line| format!("- line {line} rev {revision}\n"))
-                .collect::<String>();
-            fs::write(&file, body.as_bytes()).unwrap();
-            observe();
-            let edited = settle_exact_feed(&handle).unwrap_or_else(|stuck| {
-                panic!(
-                    "external save {revision}, which retypes the existing bullets and appends \
-                     one more, never settles its watcher epoch; the actor keeps returning \
-                     {stuck:?} with status {:?}",
-                    handle.status().unwrap()
-                )
-            });
-            assert!(
-                matches!(
-                    edited,
-                    SyncRuntimeTick::AdmittedNoop { .. } | SyncRuntimeTick::AdmittedComplete { .. }
-                ),
-                "external save {revision} must be admitted: {edited:?}"
-            );
-        }
-
-        let outcome = handle.clean_shutdown().unwrap_or_else(|error| {
-            panic!("clean shutdown after an ordinary external edit was refused: {error}")
-        });
+        let acknowledged_before_edit = handle.status().unwrap().watcher.acknowledged;
+        let manifests_before_edit = fixture.manifest_count();
+        handle
+            .install_repeated_operational_fault(
+                OperationalFaultPoint::AfterStage,
+                crate::oplog::reconciliation_session::MAX_PUBLISHED_CONTINUATION_RETRIES + 1,
+            )
+            .unwrap();
+        fs::write(&file, b"- line 0 rev 1\n- line 1 rev 1\n").unwrap();
+        observe();
+        let blocked = settle_exact_feed(&handle)
+            .expect_err("the deterministic continuation failure must block");
+        let SyncRuntimeTick::Blocked(detail) = blocked else {
+            panic!("the unretriable continuation must become explicitly blocked: {blocked:?}");
+        };
         assert!(
-            matches!(outcome, SyncShutdownOutcome::Safe(_)),
-            "clean shutdown after an ordinary external edit must publish Safe: {outcome:?}"
+            detail.contains("remained failed after 3 retries")
+                && detail.contains(
+                    "exact retained failure: ArchiveStage: deterministic operational fault"
+                ),
+            "the stable refusal must preserve the exact retry count, phase, and failure: {detail}"
+        );
+        assert_eq!(
+            fixture.manifest_count(),
+            manifests_before_edit + 1,
+            "the already-published authoritative batch must remain in the immutable archive"
+        );
+
+        let blocked_status = handle.status().unwrap();
+        assert!(blocked_status.watcher.drain_in_flight);
+        assert_eq!(
+            blocked_status.watcher.acknowledged, acknowledged_before_edit,
+            "the failed external-edit epoch must not be acknowledged"
+        );
+
+        fs::write(
+            &file,
+            b"- later watcher work stays queued behind the published block\n",
+        )
+        .unwrap();
+        observe();
+        let queued_status = handle.status().unwrap();
+        assert!(queued_status.watcher.latest_enqueue > blocked_status.watcher.latest_enqueue);
+        assert_eq!(
+            queued_status.watcher.acknowledged,
+            blocked_status.watcher.acknowledged
+        );
+        assert!(queued_status.watcher.drain_in_flight);
+        assert!(queued_status.watcher.pending);
+        assert_eq!(
+            handle.tick().unwrap(),
+            SyncRuntimeTick::Blocked(detail.clone()),
+            "a blocked poll must be stable and must not retry or replace its evidence"
+        );
+
+        let shutdown = handle.clean_shutdown();
+        assert_eq!(
+            shutdown,
+            Err(SyncRuntimeRequestError::ActorRefused(detail)),
+            "clean shutdown must return the specific retained refusal on its first blocked turn"
         );
         assert!(
-            matches!(fixture.handoff(), EnrollmentDiscoveryHandoff::Safe),
-            "a refused drain must not strand the durable handoff Unsafe"
+            matches!(fixture.handoff(), EnrollmentDiscoveryHandoff::Unsafe { .. }),
+            "a blocked drain must not falsely publish a clean Safe handoff"
         );
     }
 

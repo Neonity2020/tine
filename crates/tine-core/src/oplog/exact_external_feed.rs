@@ -140,9 +140,10 @@ pub(crate) enum ExactExternalFeedDrain {
     /// The complete scan could not yet reach one stable admitted result. The
     /// same queue epoch remains in flight and unacked.
     RetryFull,
-    /// Reconciliation reached a terminal blocked result. The queue epoch was
-    /// abandoned back to the queue, not acknowledged.
-    Blocked,
+    /// Reconciliation reached a stable blocked result. The queue epoch remains
+    /// unacknowledged, and a published continuation remains retained when the
+    /// detail names retry exhaustion.
+    Blocked(String),
     /// A retryable, pre-ack operation failed. The queue epoch remains owed.
     Failed(String),
     AdmittedNoop {
@@ -480,6 +481,18 @@ impl ExactExternalFeedState {
                     .continuation = Some(continuation);
                 ExactExternalFeedDrain::Recovering
             }
+            ReconciliationSessionStep::PublishedBlocked(continuation) => {
+                let detail = self
+                    .reconciliation
+                    .published_blocked_detail(continuation)
+                    .expect("published blocked step must retain exact failure evidence")
+                    .to_owned();
+                self.active
+                    .as_mut()
+                    .expect("active drain disappeared")
+                    .continuation = Some(continuation);
+                ExactExternalFeedDrain::Blocked(detail)
+            }
             ReconciliationSessionStep::RetryFull => {
                 let active = self.active.as_mut().expect("active drain disappeared");
                 if matches!(active.scope, ActiveDrainScope::Exact(_)) {
@@ -496,7 +509,9 @@ impl ExactExternalFeedState {
             ReconciliationSessionStep::Blocked => {
                 self.reconciliation.take_terminal_changed_paths();
                 self.abandon_active(runtime);
-                ExactExternalFeedDrain::Blocked
+                ExactExternalFeedDrain::Blocked(
+                    "exact external reconciliation is blocked".to_owned(),
+                )
             }
             ReconciliationSessionStep::Idle => {
                 let detail =

@@ -1448,6 +1448,10 @@ pub(crate) enum OperationalFaultPoint {
 thread_local! {
     static OPERATIONAL_FAULT: std::cell::Cell<Option<OperationalFaultPoint>> =
         const { std::cell::Cell::new(None) };
+    #[cfg(test)]
+    static OPERATIONAL_REPEATED_FAULT:
+        std::cell::Cell<Option<(OperationalFaultPoint, u8)>> =
+        const { std::cell::Cell::new(None) };
     static OPERATIONAL_ACTION: std::cell::RefCell<
         Option<(OperationalFaultPoint, Box<dyn FnOnce()>)>,
     > = std::cell::RefCell::new(None);
@@ -1470,6 +1474,12 @@ pub(crate) fn fail_once_at(point: OperationalFaultPoint) {
     OPERATIONAL_FAULT.set(Some(point));
 }
 
+#[cfg(test)]
+pub(crate) fn fail_repeatedly_at(point: OperationalFaultPoint, failures: u8) {
+    assert!(failures > 0, "a repeated operational fault needs work");
+    OPERATIONAL_REPEATED_FAULT.set(Some((point, failures)));
+}
+
 pub(crate) fn act_once_at(point: OperationalFaultPoint, action: impl FnOnce() + 'static) {
     OPERATIONAL_ACTION.with(|slot| {
         *slot.borrow_mut() = Some((point, Box::new(action)));
@@ -1487,28 +1497,45 @@ fn fault(point: OperationalFaultPoint) -> Result<(), OperationalCoordinatorError
             action();
         }
     });
+    #[cfg(test)]
+    if let Some((scheduled, failures)) = OPERATIONAL_REPEATED_FAULT.get() {
+        if scheduled == point {
+            OPERATIONAL_REPEATED_FAULT.set(
+                failures
+                    .checked_sub(1)
+                    .filter(|remaining| *remaining > 0)
+                    .map(|remaining| (scheduled, remaining)),
+            );
+            return Err(operational_fault_error(point));
+        }
+    }
     if OPERATIONAL_FAULT.get() == Some(point) {
         OPERATIONAL_FAULT.set(None);
-        return Err(OperationalCoordinatorError::new(
-            match point {
-                OperationalFaultPoint::AfterHandoff => OperationalPhase::Bindings,
-                OperationalFaultPoint::AfterPlan => OperationalPhase::Planning,
-                OperationalFaultPoint::AfterDraft => OperationalPhase::Draft,
-                OperationalFaultPoint::AfterCapture => OperationalPhase::Capture,
-                OperationalFaultPoint::AfterFinalize => OperationalPhase::Finalize,
-                OperationalFaultPoint::AfterReservation => OperationalPhase::TailReservation,
-                OperationalFaultPoint::AfterManifest => OperationalPhase::Publication,
-                OperationalFaultPoint::AfterStage => OperationalPhase::ArchiveStage,
-                OperationalFaultPoint::BeforeTailAdmission => OperationalPhase::TailAdmission,
-                OperationalFaultPoint::AfterTailAdmission => OperationalPhase::TailAdmission,
-                OperationalFaultPoint::AfterSqliteApply => OperationalPhase::SqliteDrain,
-                OperationalFaultPoint::BeforeProjection
-                | OperationalFaultPoint::AfterProjection => OperationalPhase::ProjectionDrain,
-            },
-            "deterministic operational fault",
-        ));
+        return Err(operational_fault_error(point));
     }
     Ok(())
+}
+
+fn operational_fault_error(point: OperationalFaultPoint) -> OperationalCoordinatorError {
+    OperationalCoordinatorError::new(
+        match point {
+            OperationalFaultPoint::AfterHandoff => OperationalPhase::Bindings,
+            OperationalFaultPoint::AfterPlan => OperationalPhase::Planning,
+            OperationalFaultPoint::AfterDraft => OperationalPhase::Draft,
+            OperationalFaultPoint::AfterCapture => OperationalPhase::Capture,
+            OperationalFaultPoint::AfterFinalize => OperationalPhase::Finalize,
+            OperationalFaultPoint::AfterReservation => OperationalPhase::TailReservation,
+            OperationalFaultPoint::AfterManifest => OperationalPhase::Publication,
+            OperationalFaultPoint::AfterStage => OperationalPhase::ArchiveStage,
+            OperationalFaultPoint::BeforeTailAdmission => OperationalPhase::TailAdmission,
+            OperationalFaultPoint::AfterTailAdmission => OperationalPhase::TailAdmission,
+            OperationalFaultPoint::AfterSqliteApply => OperationalPhase::SqliteDrain,
+            OperationalFaultPoint::BeforeProjection | OperationalFaultPoint::AfterProjection => {
+                OperationalPhase::ProjectionDrain
+            }
+        },
+        "deterministic operational fault",
+    )
 }
 
 /// Real-storage adapter used only by the deterministic scenario corpus. It
