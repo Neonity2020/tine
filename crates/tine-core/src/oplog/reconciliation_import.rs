@@ -59,7 +59,6 @@ pub(crate) enum ReconciliationImportEvidenceKind {
     UnsupportedExtension,
     OutsideConfiguredRoots,
     ExpectedKindChanged,
-    ProviderConflictCopy,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -251,6 +250,16 @@ fn unsupported_extension(path: &ManagedPath) -> Option<ReconciliationImportEvide
     }
 }
 
+fn blocking_diagnostic_evidence(
+    kind: GraphTextScanDiagnosticKind,
+) -> Option<ReconciliationImportEvidenceKind> {
+    match kind {
+        // Conflict copies remain committed diagnostics, but are deliberately
+        // excluded from page candidates and carry no import authority.
+        GraphTextScanDiagnosticKind::ProviderConflictCopy => None,
+    }
+}
+
 fn validate_candidate<A: ReconciliationImportAuthority>(
     authority: &A,
     candidate: &GraphTextScanCandidate,
@@ -349,11 +358,8 @@ fn prepare_stable_scan<A: ReconciliationImportAuthority>(
         validate_candidate(authority, candidate, &mut evidence);
     }
     for diagnostic in &scan.diagnostics {
-        match diagnostic.kind {
-            GraphTextScanDiagnosticKind::ProviderConflictCopy => evidence.push(
-                ReconciliationImportEvidenceKind::ProviderConflictCopy,
-                &diagnostic.path,
-            ),
+        if let Some(kind) = blocking_diagnostic_evidence(diagnostic.kind) {
+            evidence.push(kind, &diagnostic.path);
         }
     }
     if !evidence.is_empty() {
@@ -952,9 +958,47 @@ mod tests {
             blocked.reason,
             ReconciliationImportBlockReason::UnsupportedDiscovery
         );
-        assert_eq!(blocked.evidence.len(), 4);
+        assert_eq!(blocked.evidence.len(), 3);
         assert_eq!(blocked.omitted_evidence, 0);
         assert_eq!(coordinator.calls, 0);
+    }
+
+    #[test]
+    fn reconciliation_import_provider_conflict_diagnostic_is_informational() {
+        let binding = binding(None);
+        let candidate = candidate(
+            "pages/edit.md",
+            GraphTextCandidateKind::Edit,
+            Some(ManagedTextKind::Page),
+            &binding,
+        );
+        let authority = FixtureAuthority {
+            binding: binding.clone(),
+            kinds: [(candidate.path.clone(), ManagedTextKind::Page)]
+                .into_iter()
+                .collect(),
+            revalidation: Ok(()),
+        };
+        let diagnostics = vec![GraphTextScanDiagnostic {
+            path: "pages/note.sync-conflict-20260726.md".to_owned(),
+            kind: GraphTextScanDiagnosticKind::ProviderConflictCopy,
+            file_resource_id: ContentDigest::of(b"conflict"),
+            link_count: 1,
+        }];
+        let scan = scan(binding, vec![candidate], diagnostics);
+        let mut coordinator = CountingCoordinator::new(FakeDisposition::Noop);
+
+        let outcome = execute_fixture(
+            &scan,
+            &authority,
+            &mut coordinator,
+            PreparationLimits::default(),
+        )
+        .unwrap();
+
+        assert!(matches!(outcome, CoordinatorHandoff::Noop));
+        assert_eq!(coordinator.calls, 1);
+        assert_eq!(coordinator.received, vec![vec!["pages/edit.md".to_owned()]]);
     }
 
     #[test]
