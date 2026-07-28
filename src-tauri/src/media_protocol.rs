@@ -96,7 +96,10 @@ pub(crate) fn respond<R: Runtime>(
     if slot.binding_generation != binding {
         return response(StatusCode::FORBIDDEN, Vec::new());
     }
-    let Ok(path) = slot.graph.stream_asset_path(name) else {
+    let Ok(graph) = slot.legacy_graph() else {
+        return response(StatusCode::FORBIDDEN, Vec::new());
+    };
+    let Ok(path) = graph.stream_asset_path(name) else {
         return response(StatusCode::NOT_FOUND, Vec::new());
     };
     let Ok(mut file) = File::open(path) else {

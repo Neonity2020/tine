@@ -264,7 +264,7 @@ pub(crate) fn load_graph_for_label(
         if owner == window_label {
             let slot = slot_for_window(&state, &owner)?;
             return Ok(LoadGraphResult::AlreadyCurrent {
-                meta: slot.graph.meta(),
+                meta: slot.legacy_graph()?.meta(),
                 binding_generation: slot.binding_generation,
             });
         }
@@ -324,7 +324,7 @@ pub(crate) fn load_graph_for_label(
     state.note_focused(window_label);
     poke_watcher(&state);
     if !launch_backup_done {
-        backup_async(app.clone(), slot.clone());
+        backup_async(app.clone(), slot.clone())?;
     }
     remember_graph(app, &meta.root)?;
     if let Some(window) = app.get_webview_window(window_label) {
@@ -335,7 +335,7 @@ pub(crate) fn load_graph_for_label(
         let _ = window.set_title(&format!("Tine — {name}"));
     }
     let binding_generation = slot.binding_generation;
-    warm_cache_async(app.clone(), window_label.to_string(), slot, warm_generation);
+    warm_cache_async(app.clone(), window_label.to_string(), slot, warm_generation)?;
     Ok(LoadGraphResult::Loaded {
         meta,
         binding_generation,
@@ -495,7 +495,8 @@ pub(crate) fn warm_cache_async(
     window_label: String,
     slot: Arc<GraphSlot>,
     warm_generation: u64,
-) {
+) -> Result<(), String> {
+    let graph = slot.legacy_graph_cloned()?;
     std::thread::spawn(move || {
         // Brief delay so the first journal paint (which only needs a few pages)
         // grabs the lock first; then build the whole-graph cache in the
@@ -520,7 +521,7 @@ pub(crate) fn warm_cache_async(
         {
             return;
         }
-        let completed = slot.graph.warm_cache_cancellable(|| {
+        let completed = graph.warm_cache_cancellable(|| {
             slot.background_cancelled.load(Ordering::Acquire)
                 || slot.warm_generation.load(Ordering::Acquire) != warm_generation
         });
@@ -538,6 +539,7 @@ pub(crate) fn warm_cache_async(
             let _ = app.emit_to(&window_label, "warm-cache-done", ());
         }
     });
+    Ok(())
 }
 
 /// "Have the whole-graph derived caches finished warming for the current graph?"

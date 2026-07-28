@@ -22,6 +22,16 @@ struct Pending {
     need_full: bool,
 }
 
+/// Resolve the filesystem watcher inputs for an existing legacy binding.
+/// Sparse-v2 bindings must later use their actor; they never fall back to a
+/// second legacy `Graph` or direct file watcher here.
+fn legacy_watch_paths(slot: &GraphSlot) -> Result<(Arc<Graph>, [PathBuf; 2], PathBuf), String> {
+    let graph = slot.legacy_graph_cloned()?;
+    let dirs = [graph.journals_path(), graph.pages_path()];
+    let sync_dir = graph.managed_sync_store_path();
+    Ok((graph, dirs, sync_dir))
+}
+
 impl Pending {
     fn add_event(&mut self, event: notify::Event) {
         // Managed-sync chunks and receipts use their own reconcile lane. A pull
@@ -446,7 +456,7 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
     }
     std::thread::spawn(move || {
         struct WatchedGraph {
-            slot: Arc<GraphSlot>,
+            legacy_graph: Arc<Graph>,
             dirs: [PathBuf; 2],
             sync_dir: PathBuf,
             snap: HashMap<PathBuf, FileStamp>,
@@ -464,17 +474,21 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
             let live: HashSet<String> = entries.iter().map(|(label, _)| label.clone()).collect();
             graphs.retain(|label, _| live.contains(label));
             for (label, slot) in entries {
-                let dirs = [slot.graph.journals_path(), slot.graph.pages_path()];
-                let sync_dir = slot.graph.managed_sync_store_path();
+                let Ok((legacy_graph, dirs, sync_dir)) = legacy_watch_paths(&slot) else {
+                    // Sparse-v2 owns its actor in the slot. This legacy watcher
+                    // must not retain or reopen a Graph for it.
+                    graphs.remove(&label);
+                    continue;
+                };
                 match graphs.get_mut(&label) {
                     Some(current) if current.dirs == dirs && current.sync_dir == sync_dir => {
-                        current.slot = slot
+                        current.legacy_graph = legacy_graph;
                     }
                     _ => {
                         graphs.insert(
                             label,
                             WatchedGraph {
-                                slot,
+                                legacy_graph,
                                 dirs,
                                 sync_dir,
                                 snap: HashMap::new(),
@@ -565,7 +579,7 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                 let mut attempted = false;
                 if sync_dirty && graph.sync_dir.is_dir() {
                     attempted = true;
-                    match graph.slot.graph.pull_managed_sync() {
+                    match graph.legacy_graph.pull_managed_sync() {
                         Ok(pull) => {
                             graph.last_sync_error = None;
                             for change in pull.changes {
@@ -595,7 +609,7 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                 if need_full || !owned.is_empty() {
                     attempted = true;
                     let (changes, conflicts_dirty, _, errors) = reconcile_pending(
-                        &graph.slot.graph,
+                        &graph.legacy_graph,
                         &graph.dirs,
                         &mut graph.snap,
                         &owned,
@@ -853,6 +867,17 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[test]
+    fn legacy_watch_paths_keep_existing_graph_paths() {
+        let temp = TempGraph::new("legacy-authority");
+        let slot = GraphSlot::new(Graph::open(&temp.root), temp.root.clone());
+
+        let (graph, dirs, sync_dir) = legacy_watch_paths(&slot).unwrap();
+        assert_eq!(graph.root, temp.root);
+        assert_eq!(dirs, graph_dirs(&graph));
+        assert_eq!(sync_dir, graph.managed_sync_store_path());
     }
 
     fn graph_dirs(graph: &Graph) -> [PathBuf; 2] {

@@ -632,7 +632,7 @@ pub(crate) async fn get_backlinks(
     name: String,
     state: GraphContext<'_>,
 ) -> Result<Arc<Vec<RefGroup>>, String> {
-    let graph = Arc::clone(&slot_for_context(&state)?.graph);
+    let graph = slot_for_context(&state)?.legacy_graph_cloned()?;
     tauri::async_runtime::spawn_blocking(move || {
         bounded_groups_or_error(graph.backlinks_bounded(
             &name,
@@ -656,7 +656,7 @@ pub(crate) async fn get_backlink_filter_context(
             targets.len()
         ));
     }
-    let graph = Arc::clone(&slot_for_context(&state)?.graph);
+    let graph = slot_for_context(&state)?.legacy_graph_cloned()?;
     tauri::async_runtime::spawn_blocking(move || {
         Ok(tine_core::query::backlink_filter_context(
             &graph, &name, &targets,
@@ -671,7 +671,7 @@ pub(crate) async fn get_unlinked_refs(
     name: String,
     state: GraphContext<'_>,
 ) -> Result<Arc<Vec<RefGroup>>, String> {
-    let graph = Arc::clone(&slot_for_context(&state)?.graph);
+    let graph = slot_for_context(&state)?.legacy_graph_cloned()?;
     tauri::async_runtime::spawn_blocking(move || {
         bounded_groups_or_error(graph.unlinked_refs_bounded(
             &name,
@@ -690,7 +690,7 @@ pub(crate) async fn get_unlinked_refs(
 pub(crate) async fn block_ref_counts(
     state: GraphContext<'_>,
 ) -> Result<Arc<std::collections::HashMap<String, usize>>, String> {
-    let graph = Arc::clone(&slot_for_context(&state)?.graph);
+    let graph = slot_for_context(&state)?.legacy_graph_cloned()?;
     tauri::async_runtime::spawn_blocking(move || graph.block_ref_counts())
         .await
         .map_err(|error| error.to_string())?
@@ -733,7 +733,7 @@ pub(crate) async fn rename_page(
     expected_path: Option<String>,
     state: GraphContext<'_>,
 ) -> Result<(), String> {
-    let graph = Arc::clone(&slot_for_context(&state)?.graph);
+    let graph = slot_for_context(&state)?.legacy_graph_cloned()?;
     tauri::async_runtime::spawn_blocking(move || {
         graph
             .rename_page_expected(&old, &new, expected_path.as_deref())
@@ -866,7 +866,7 @@ pub(crate) async fn run_graph_search(
     scope: Option<tine_core::query_plan::QueryPageScope>,
     state: GraphContext<'_>,
 ) -> Result<tine_core::query_plan::QueryExecution, String> {
-    let graph = Arc::clone(&slot_for_context(&state)?.graph);
+    let graph = slot_for_context(&state)?.legacy_graph_cloned()?;
     let page_limit = page_limit.min(RESULT_BRIDGE_MAX_ROWS);
     let block_limit = block_limit.min(RESULT_BRIDGE_MAX_ROWS - page_limit);
     // QueryExecution carries backward-defaulted per-category `has_more` bits;
@@ -1085,7 +1085,7 @@ pub(crate) async fn search(
     lane: Option<String>,
     state: GraphContext<'_>,
 ) -> Result<Vec<RefGroup>, String> {
-    let graph = Arc::clone(&slot_for_context(&state)?.graph);
+    let graph = slot_for_context(&state)?.legacy_graph_cloned()?;
     let limit = limit.min(RESULT_BRIDGE_MAX_ROWS);
     let groups = tauri::async_runtime::spawn_blocking(move || match lane.as_deref() {
         Some(lane) => graph.search_latest(lane, &query, limit),
@@ -1114,7 +1114,7 @@ fn capture_quick_switch_for(
     limit: usize,
 ) -> Result<Vec<PageEntry>, String> {
     let slot = capture_quick_switch_slot(state, caller, binding_generation)?;
-    Ok(slot.graph.quick_switch(query, limit.min(8)))
+    Ok(slot.legacy_graph()?.quick_switch(query, limit.min(8)))
 }
 
 /// The sole graph-backed capability exposed to Quick Capture. It is deliberately
@@ -1346,7 +1346,7 @@ pub(crate) fn read_asset(
 #[tauri::command]
 pub(crate) fn stream_asset_path(name: String, state: GraphContext<'_>) -> Result<String, String> {
     let slot = slot_for_context(&state)?;
-    slot.graph
+    slot.legacy_graph()?
         .stream_asset_path(&name)
         .map_err(|e| e.to_string())?;
     Ok(format!("{}/{}", slot.binding_generation, name))
