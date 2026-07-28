@@ -652,7 +652,7 @@ pub fn run() {
                 let state = app.state::<AppState>();
                 graph::load_graph_for_label(root, app.handle(), "main", &state)?;
                 let slot = state::slot_for_window(&state, "main")?;
-                let g = &slot.graph;
+                let g = slot.legacy_graph()?;
                 // These diagnostics enumerate dirs AND force a whole-graph cache
                 // build (journals_desc()/list_pages()) — on the cold-cache critical
                 // path to first paint, before warm_cache_async. The format! args

@@ -20,8 +20,8 @@ const BACKUP_KEEP_DEFAULT: usize = 12;
 const ASSET_RESTORE_RECOVERY_DIR: &str = ".tine-restore-recovery";
 static BACKUP_WORK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
 
-pub(crate) fn backup_async(app: tauri::AppHandle, slot: Arc<GraphSlot>) {
-    let source = BackupSource::from_graph(&slot.graph);
+pub(crate) fn backup_async(app: tauri::AppHandle, slot: Arc<GraphSlot>) -> Result<(), String> {
+    let source = BackupSource::from_graph(slot.legacy_graph()?);
     std::thread::spawn(move || {
         // Defer the launch snapshot ~1s so its whole-graph file copy doesn't
         // contend for disk I/O with first-journal paint and the warm-cache parse
@@ -46,6 +46,7 @@ pub(crate) fn backup_async(app: tauri::AppHandle, slot: Arc<GraphSlot>) {
             slot.background_cancelled.load(Ordering::Acquire)
         }); // launch snapshot is best-effort
     });
+    Ok(())
 }
 
 pub(crate) fn backup_graph_now(
@@ -383,7 +384,7 @@ pub(crate) fn set_backup_keep(
     })?;
     // Apply the new (possibly lower) cap to the current graph's snapshots now.
     let slot = slot_for_context(&state)?;
-    if let Some(base) = backup_base(&app, &slot.graph) {
+    if let Some(base) = backup_base(&app, slot.legacy_graph()?) {
         prune_backups(&base, keep);
     }
     Ok(())
@@ -404,7 +405,7 @@ pub(crate) async fn list_backups(
     app: tauri::AppHandle,
     state: GraphContext<'_>,
 ) -> Result<Vec<BackupInfo>, String> {
-    let root = slot_for_context(&state)?.graph.root.clone();
+    let root = slot_for_context(&state)?.legacy_graph()?.root.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let Some(base) = backup_base_for_root(&app, &root) else {
             return Vec::new();
@@ -507,11 +508,12 @@ pub(crate) async fn restore_backup(
         return Err("invalid backup id".into());
     }
     let slot = slot_for_context(&state)?;
-    let source = BackupSource::from_graph(&slot.graph);
+    let graph = slot.legacy_graph_cloned()?;
+    let source = BackupSource::from_graph(&graph);
     let restore_app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let base = backup_base_for_root(&restore_app, &source.root).ok_or("no app-data dir")?;
-        restore_from_backup_source(&stamp, &base, source, Some(&slot.graph), |source| {
+        restore_from_backup_source(&stamp, &base, source, Some(&graph), |source| {
             do_backup_source(&restore_app, source.clone(), "pre-restore")
         })
     })
