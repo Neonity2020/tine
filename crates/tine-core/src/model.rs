@@ -6073,8 +6073,12 @@ impl Graph {
         };
     }
 
-    /// Inert crate-private legacy test seam. No platform adapter may activate
-    /// this process-local feed as continuing filesystem authority.
+    /// Arm one crate-private exact feed for a core-owned runtime actor.
+    ///
+    /// The returned move-only lease is continuing process-local authority for
+    /// this exact `Graph`, retained root, and graph-text scope. It is never
+    /// exposed to a platform adapter: the core actor owns it and accepts only
+    /// normalized watcher observations through its bounded queue.
     pub(crate) fn arm_graph_text_exact_feed(
         &self,
         last_sequence: u64,
@@ -6133,7 +6137,7 @@ impl Graph {
         }
     }
 
-    /// Build the bounded graph-wide admission snapshot for an inert test feed.
+    /// Build the bounded graph-wide admission snapshot for an exact feed.
     ///
     /// Success publishes `CatchingUp`; it never creates complete authority.
     pub(crate) fn build_graph_text_exact_feed(
@@ -6145,7 +6149,117 @@ impl Graph {
             .map(drop)
     }
 
-    /// Classify one exact inert-feed test path without duplicating scope policy.
+    /// Rebuild the complete exact-feed index at one held queue fence.
+    ///
+    /// The old index remains authoritative while the bounded two-pass capture
+    /// is constructed. Publication is one pointer swap only after the retained
+    /// graph/root/scope, lease, prior generation, and prior feed fence are
+    /// re-proved unchanged. A transient scan failure therefore leaves the old
+    /// index intact and retryable. The peak budget includes both the old
+    /// retained index and the replacement under construction.
+    ///
+    /// `last_sequence` may equal the current fence for a retry, but may never
+    /// move backwards. A successful rebase preserves `CatchingUp` versus
+    /// `Complete`; only [`Self::publish_graph_text_exact_feed_caught_up`] may
+    /// cross the initial catch-up publication boundary.
+    pub(crate) fn rebase_graph_text_exact_feed_at_fence(
+        &self,
+        lease: &GraphTextExactFeedLease,
+        last_sequence: u64,
+    ) -> io::Result<()> {
+        self.ensure_graph_text_exact_feed_lease(lease)?;
+        let (current, catching_up, next_generation, current_sequence) = {
+            let state = self.graph_text_admission.read().unwrap();
+            let (index, catching_up) = match &*state {
+                GraphTextAdmissionState::CatchingUp(index) => (Arc::clone(index), true),
+                GraphTextAdmissionState::Complete(index) => (Arc::clone(index), false),
+                GraphTextAdmissionState::Poisoned { cause, .. } => {
+                    return Err(graph_text_admission_unavailable(cause));
+                }
+                _ => {
+                    return Err(graph_text_admission_unavailable(
+                        "exact-feed rebase requires CatchingUp or Complete",
+                    ));
+                }
+            };
+            if !graph_text_exact_feed_index_matches_lease(&index, lease) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "exact-feed rebase lease belongs to a different Graph, root, or scope",
+                ));
+            }
+            let current_sequence = index
+                .feed
+                .as_ref()
+                .expect("exact-feed indexes retain a fence")
+                .last_sequence;
+            if last_sequence < current_sequence {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "exact-feed rebase fence moved backwards",
+                ));
+            }
+            let next_generation = index.generation.checked_add(1).ok_or_else(|| {
+                graph_text_admission_unavailable("graph-text admission generation overflow")
+            })?;
+            (index, catching_up, next_generation, current_sequence)
+        };
+
+        let (capture, combined_capture_bytes) =
+            self.capture_initial_shadow_with_limits(INITIAL_SHADOW_LIMITS)?;
+        let replacement_peak_base =
+            checked_add_bytes(combined_capture_bytes, current.permanent_bytes)?;
+        let mut replacement = build_graph_text_admission_index(
+            self,
+            &capture,
+            Some(GraphTextAdmissionFeedFence { last_sequence }),
+            INITIAL_SHADOW_LIMITS,
+            replacement_peak_base,
+        )?;
+        if let Some(error) = initial_shadow_global_collision(&replacement) {
+            return Err(error);
+        }
+        replacement.generation = next_generation;
+
+        // Binding checks may perform retained-capability IO, so run them before
+        // taking the publication lock and then prove the exact prior pointer
+        // and fence again under the lock.
+        self.ensure_graph_text_exact_feed_lease(lease)?;
+        let mut state = self.graph_text_admission.write().unwrap();
+        let unchanged = match &*state {
+            GraphTextAdmissionState::CatchingUp(index) if catching_up => {
+                Arc::ptr_eq(index, &current)
+                    && graph_text_exact_feed_index_matches_lease(index, lease)
+                    && index
+                        .feed
+                        .as_ref()
+                        .is_some_and(|feed| feed.last_sequence == current_sequence)
+            }
+            GraphTextAdmissionState::Complete(index) if !catching_up => {
+                Arc::ptr_eq(index, &current)
+                    && graph_text_exact_feed_index_matches_lease(index, lease)
+                    && index
+                        .feed
+                        .as_ref()
+                        .is_some_and(|feed| feed.last_sequence == current_sequence)
+            }
+            _ => false,
+        };
+        if !unchanged {
+            return Err(graph_text_admission_unavailable(
+                "graph-text admission authority changed during exact-feed rebase",
+            ));
+        }
+        let replacement = Arc::new(replacement);
+        *state = if catching_up {
+            GraphTextAdmissionState::CatchingUp(replacement)
+        } else {
+            GraphTextAdmissionState::Complete(replacement)
+        };
+        Ok(())
+    }
+
+    /// Classify one exact feed path without duplicating scope policy.
     pub(crate) fn classify_graph_text_exact_feed_path(
         &self,
         relative: &str,
@@ -6168,7 +6282,7 @@ impl Graph {
         Ok(GraphTextExactFeedPathClass::RetainedFile)
     }
 
-    /// Exercise one bounded atomic final-state batch in crate-private tests.
+    /// Apply one bounded atomic final-state batch from the core-owned feed.
     pub(crate) fn apply_graph_text_exact_feed_batch(
         &self,
         lease: &GraphTextExactFeedLease,
@@ -6438,7 +6552,7 @@ impl Graph {
         Ok(())
     }
 
-    /// Seal the inert test index at its exact synthetic queue fence.
+    /// Seal the initial index at its exact queue fence.
     pub(crate) fn publish_graph_text_exact_feed_caught_up(
         &self,
         lease: &GraphTextExactFeedLease,
@@ -6483,7 +6597,7 @@ impl Graph {
         Ok(())
     }
 
-    /// Terminally poison/disconnect the inert crate-private test feed.
+    /// Terminally poison/disconnect the crate-private exact feed.
     pub(crate) fn poison_graph_text_exact_feed(
         &self,
         lease: &GraphTextExactFeedLease,
@@ -34631,6 +34745,144 @@ mod tests {
             &*clean.graph_text_admission.read().unwrap(),
             GraphTextAdmissionState::Complete(_)
         ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn held_exact_feed_full_rebase_replaces_the_complete_configured_inventory_at_one_fence() {
+        let root = scratch("held-exact-feed-full-rebase");
+        fs::create_dir_all(root.join("logseq")).unwrap();
+        fs::write(
+            root.join("logseq/config.edn"),
+            "{:pages-directory \"content/nested pages\" :journals-directory \"diary/\u{65e5}\u{8a18}\"}\n",
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("content/nested pages/deep")).unwrap();
+        fs::create_dir_all(root.join("diary/\u{65e5}\u{8a18}")).unwrap();
+        let markdown = "content/nested pages/deep/Caf\u{e9} note.MD";
+        let org = "diary/\u{65e5}\u{8a18}/2026_07_28.ORG";
+        fs::write(root.join(markdown), b"- original\r\n\t- nested\r\n").unwrap();
+        fs::write(root.join(org), b"#+title: Journal\r\n* original\r\n").unwrap();
+
+        let graph = Graph::open(&root);
+        let lease = staged_exact_feed_build(&graph, 0);
+        fs::write(
+            root.join(markdown),
+            b"- externally edited\r\n\t- CRLF stays\r\n",
+        )
+        .unwrap();
+        fs::remove_file(root.join(org)).unwrap();
+        let renamed = "diary/\u{65e5}\u{8a18}/renamed space.org";
+        fs::write(
+            root.join(renamed),
+            b"#+title: Renamed\r\n* imported\r\n",
+        )
+        .unwrap();
+
+        graph
+            .rebase_graph_text_exact_feed_at_fence(&lease, 1)
+            .unwrap();
+        {
+            let state = graph.graph_text_admission.read().unwrap();
+            let GraphTextAdmissionState::CatchingUp(index) = &*state else {
+                panic!("held rebase must preserve initial catch-up state");
+            };
+            assert_eq!(index.generation, 2);
+            assert_eq!(index.feed.as_ref().unwrap().last_sequence, 1);
+            assert!(index
+                .files_by_exact_path
+                .contains_key(&ManagedPath::parse(markdown).unwrap()));
+            assert!(!index
+                .files_by_exact_path
+                .contains_key(&ManagedPath::parse(org).unwrap()));
+            assert!(index
+                .files_by_exact_path
+                .contains_key(&ManagedPath::parse(renamed).unwrap()));
+        }
+        graph
+            .publish_graph_text_exact_feed_caught_up(&lease, 1)
+            .unwrap();
+        let epoch = graph.graph_text_admission_epoch().unwrap();
+        assert_eq!(epoch.feed_sequence, 1);
+        let markdown_observation = graph
+            .graph_text_admission_exact(&epoch, &ManagedPath::parse(markdown).unwrap())
+            .unwrap()
+            .into_present();
+        assert_eq!(
+            markdown_observation.current.bytes,
+            b"- externally edited\r\n\t- CRLF stays\r\n"
+        );
+        assert!(matches!(
+            graph
+                .graph_text_admission_exact(&epoch, &ManagedPath::parse(org).unwrap())
+                .unwrap(),
+            GraphTextAdmissionExactObservation::AbsentUnowned { .. }
+        ));
+        let renamed_observation = graph
+            .graph_text_admission_exact(&epoch, &ManagedPath::parse(renamed).unwrap())
+            .unwrap()
+            .into_present();
+        assert_eq!(
+            renamed_observation.current.bytes,
+            b"#+title: Renamed\r\n* imported\r\n"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn failed_held_exact_feed_rebase_keeps_the_prior_index_retryable_and_never_moves_backwards() {
+        let root = scratch("held-exact-feed-rebase-retry");
+        fs::write(root.join("Page.md"), b"- original\n").unwrap();
+        let graph = Graph::open(&root);
+        let lease = staged_exact_feed_build(&graph, 0);
+        graph
+            .publish_graph_text_exact_feed_caught_up(&lease, 0)
+            .unwrap();
+        let before = {
+            let state = graph.graph_text_admission.read().unwrap();
+            let GraphTextAdmissionState::Complete(index) = &*state else {
+                panic!("feed must be complete before the retry proof");
+            };
+            Arc::clone(index)
+        };
+
+        INITIAL_SHADOW_REVALIDATION_RACE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|| {
+                Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "injected unstable held rebase",
+                ))
+            }));
+        });
+        assert!(graph
+            .rebase_graph_text_exact_feed_at_fence(&lease, 1)
+            .is_err());
+        {
+            let state = graph.graph_text_admission.read().unwrap();
+            let GraphTextAdmissionState::Complete(index) = &*state else {
+                panic!("failed held rebase must preserve complete authority");
+            };
+            assert!(Arc::ptr_eq(index, &before));
+            assert_eq!(index.feed.as_ref().unwrap().last_sequence, 0);
+        }
+
+        fs::write(root.join("Page.md"), b"- retry succeeds\n").unwrap();
+        graph
+            .rebase_graph_text_exact_feed_at_fence(&lease, 1)
+            .unwrap();
+        let after = graph.graph_text_admission_epoch().unwrap();
+        assert_eq!(after.feed_sequence, 1);
+        assert!(graph
+            .rebase_graph_text_exact_feed_at_fence(&lease, 0)
+            .is_err());
+        let still_after = graph.graph_text_admission_epoch().unwrap();
+        assert_eq!(still_after.feed_sequence, 1);
+        assert!(matches!(
+            &*graph.graph_text_admission.read().unwrap(),
+            GraphTextAdmissionState::Complete(_)
+        ));
+
         let _ = fs::remove_dir_all(root);
     }
 

@@ -81,10 +81,48 @@ pub(crate) enum ReconciliationSessionError {
     StaleOrForeignContinuation,
 }
 
+/// The bounded graph-text scope of one terminal admitted reconciliation.
+///
+/// A full scan is reported as one bit rather than by retaining its potentially
+/// graph-wide path set. Targeted work retains only the scheduler-bounded exact
+/// managed paths. Blocked, retrying, and failed-closed work never produces this
+/// report, so a caller cannot mistake attempted work for a publishable cache
+/// delta.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ReconciliationTerminalChangedPaths {
+    exact_paths: BTreeSet<ManagedPath>,
+    complete_scan: bool,
+}
+
+impl ReconciliationTerminalChangedPaths {
+    pub(crate) const fn exact_paths(&self) -> &BTreeSet<ManagedPath> {
+        &self.exact_paths
+    }
+
+    pub(crate) const fn complete_scan(&self) -> bool {
+        self.complete_scan
+    }
+
+    fn from_work(work: &ReconciliationWork) -> Self {
+        match work {
+            ReconciliationWork::ProjectionPreconditionMismatch { paths }
+            | ReconciliationWork::WatcherPaths { paths } => Self {
+                exact_paths: paths.clone(),
+                complete_scan: false,
+            },
+            ReconciliationWork::FullScan(_) => Self {
+                exact_paths: BTreeSet::new(),
+                complete_scan: true,
+            },
+        }
+    }
+}
+
 struct PendingContinuation<C, B> {
     token: ReconciliationPendingContinuation,
     continuation: C,
     baseline: Option<B>,
+    changed_paths: ReconciliationTerminalChangedPaths,
 }
 
 /// One headless reconciliation session for exactly one enrolled endpoint.
@@ -100,6 +138,7 @@ pub(crate) struct ReconciliationSession<
     pending: Option<PendingContinuation<C, B>>,
     confirmation_lease: Option<ReconciliationLease>,
     next_continuation_sequence: u64,
+    terminal_changed_paths: Option<ReconciliationTerminalChangedPaths>,
 }
 
 impl<C, B> ReconciliationSession<C, B> {
@@ -109,6 +148,7 @@ impl<C, B> ReconciliationSession<C, B> {
             pending: None,
             confirmation_lease: None,
             next_continuation_sequence: 0,
+            terminal_changed_paths: None,
         }
     }
 
@@ -122,6 +162,18 @@ impl<C, B> ReconciliationSession<C, B> {
         self.scheduler.status()
     }
 
+    /// Consume the changed-path report from the immediately preceding terminal
+    /// admitted `Noop` or `Complete`.
+    ///
+    /// The report is deliberately one-shot. A later owner must couple it to
+    /// the exact queue epoch it just executed instead of reusing stale paths
+    /// after another scheduler action.
+    pub(crate) fn take_terminal_changed_paths(
+        &mut self,
+    ) -> Option<ReconciliationTerminalChangedPaths> {
+        self.terminal_changed_paths.take()
+    }
+
     fn step_with<D>(
         &mut self,
         dispatch: &mut D,
@@ -129,6 +181,7 @@ impl<C, B> ReconciliationSession<C, B> {
     where
         D: ReconciliationSessionDispatch<Continuation = C, PendingBaseline = B>,
     {
+        self.terminal_changed_paths = None;
         if let Some(pending) = &self.pending {
             return Err(ReconciliationSessionError::PendingContinuation(
                 pending.token,
@@ -145,11 +198,12 @@ impl<C, B> ReconciliationSession<C, B> {
             };
             job
         };
+        let changed_paths = ReconciliationTerminalChangedPaths::from_work(job.work());
         let outcome = {
             let mut arrive = |trigger| self.scheduler.trigger(trigger);
             dispatch.dispatch(job.work(), &mut arrive)
         };
-        self.settle_job(job, outcome, dispatch)
+        self.settle_job(job, outcome, changed_paths, dispatch)
     }
 
     fn resume_with<D>(
@@ -160,6 +214,7 @@ impl<C, B> ReconciliationSession<C, B> {
     where
         D: ReconciliationSessionDispatch<Continuation = C, PendingBaseline = B>,
     {
+        self.terminal_changed_paths = None;
         let Some(pending) = self.pending.as_ref() else {
             return Err(ReconciliationSessionError::StaleOrForeignContinuation);
         };
@@ -171,13 +226,20 @@ impl<C, B> ReconciliationSession<C, B> {
             .take()
             .expect("checked reconciliation continuation disappeared");
         let outcome = dispatch.resume(pending.continuation);
-        self.settle_continuation(pending.token, pending.baseline, outcome, dispatch)
+        self.settle_continuation(
+            pending.token,
+            pending.baseline,
+            pending.changed_paths,
+            outcome,
+            dispatch,
+        )
     }
 
     fn settle_job<D>(
         &mut self,
         job: ReconciliationJob,
         result: ReconciliationSessionDispatchResult<C, B>,
+        changed_paths: ReconciliationTerminalChangedPaths,
         dispatch: &mut D,
     ) -> Result<ReconciliationSessionStep, ReconciliationSessionError>
     where
@@ -185,12 +247,18 @@ impl<C, B> ReconciliationSession<C, B> {
     {
         match result.outcome {
             ReconciliationSessionDispatchOutcome::FailedClosed(continuation) => {
-                let token = self.retain_continuation(job.lease(), continuation, result.baseline);
+                let token = self.retain_continuation(
+                    job.lease(),
+                    continuation,
+                    result.baseline,
+                    changed_paths,
+                );
                 Ok(ReconciliationSessionStep::Pending(token))
             }
             outcome => self.finish_baseline_and_settle_lease(
                 job.lease(),
                 result.baseline,
+                changed_paths,
                 outcome,
                 dispatch,
             ),
@@ -201,6 +269,7 @@ impl<C, B> ReconciliationSession<C, B> {
         &mut self,
         token: ReconciliationPendingContinuation,
         baseline: Option<B>,
+        changed_paths: ReconciliationTerminalChangedPaths,
         outcome: ReconciliationSessionDispatchOutcome<C>,
         dispatch: &mut D,
     ) -> Result<ReconciliationSessionStep, ReconciliationSessionError>
@@ -209,12 +278,17 @@ impl<C, B> ReconciliationSession<C, B> {
     {
         match outcome {
             ReconciliationSessionDispatchOutcome::FailedClosed(continuation) => {
-                let next = self.retain_continuation(token.lease, continuation, baseline);
+                let next =
+                    self.retain_continuation(token.lease, continuation, baseline, changed_paths);
                 Ok(ReconciliationSessionStep::Pending(next))
             }
-            outcome => {
-                self.finish_baseline_and_settle_lease(token.lease, baseline, outcome, dispatch)
-            }
+            outcome => self.finish_baseline_and_settle_lease(
+                token.lease,
+                baseline,
+                changed_paths,
+                outcome,
+                dispatch,
+            ),
         }
     }
 
@@ -223,6 +297,7 @@ impl<C, B> ReconciliationSession<C, B> {
         lease: ReconciliationLease,
         continuation: C,
         baseline: Option<B>,
+        changed_paths: ReconciliationTerminalChangedPaths,
     ) -> ReconciliationPendingContinuation {
         self.next_continuation_sequence = self
             .next_continuation_sequence
@@ -236,6 +311,7 @@ impl<C, B> ReconciliationSession<C, B> {
             token,
             continuation,
             baseline,
+            changed_paths,
         });
         token
     }
@@ -244,6 +320,7 @@ impl<C, B> ReconciliationSession<C, B> {
         &mut self,
         lease: ReconciliationLease,
         baseline: Option<B>,
+        changed_paths: ReconciliationTerminalChangedPaths,
         mut outcome: ReconciliationSessionDispatchOutcome<C>,
         dispatch: &mut D,
     ) -> Result<ReconciliationSessionStep, ReconciliationSessionError>
@@ -310,7 +387,7 @@ impl<C, B> ReconciliationSession<C, B> {
                 }
             }
         }
-        self.settle_lease(lease, outcome)
+        self.settle_lease(lease, changed_paths, outcome)
     }
 
     fn step_for_intermediate_outcome(
@@ -330,6 +407,7 @@ impl<C, B> ReconciliationSession<C, B> {
     fn settle_lease(
         &mut self,
         lease: ReconciliationLease,
+        changed_paths: ReconciliationTerminalChangedPaths,
         outcome: ReconciliationSessionDispatchOutcome<C>,
     ) -> Result<ReconciliationSessionStep, ReconciliationSessionError> {
         let (completion, step) = match outcome {
@@ -358,6 +436,11 @@ impl<C, B> ReconciliationSession<C, B> {
         self.scheduler
             .complete(lease, completion)
             .expect("session owns the exact active reconciliation lease");
+        self.terminal_changed_paths = matches!(
+            step,
+            ReconciliationSessionStep::Noop | ReconciliationSessionStep::Complete
+        )
+        .then_some(changed_paths);
         if self.confirmation_lease == Some(lease) {
             self.confirmation_lease = None;
         }
@@ -1207,6 +1290,7 @@ mod tests {
         Noop,
         NoopWithBaseline(u64),
         Complete,
+        CompleteWithBaseline(u64),
         Blocked,
         BlockedWithBaseline(u64),
         RetryFull,
@@ -1287,6 +1371,10 @@ mod tests {
                 FakeDispatchResult::Complete => {
                     (ReconciliationSessionDispatchOutcome::Complete, None)
                 }
+                FakeDispatchResult::CompleteWithBaseline(identity) => (
+                    ReconciliationSessionDispatchOutcome::Complete,
+                    Some(FakePendingBaseline(identity)),
+                ),
                 FakeDispatchResult::Blocked => (
                     ReconciliationSessionDispatchOutcome::Blocked(BaselineBlockedObservation::new(
                         BaselineBlockedReason::ReconciliationFailed,
@@ -1387,8 +1475,9 @@ mod tests {
     #[test]
     fn session_dispatches_targeted_work_exactly_once() {
         let mut session = session();
+        let expected_paths = paths(&["managed/nested/a.md", "journals/nonstandard/b.org"]);
         session.trigger(ReconciliationTrigger::ProjectionPreconditionMismatch(
-            paths(&["managed/nested/a.md", "journals/nonstandard/b.org"]),
+            expected_paths.clone(),
         ));
         let mut dispatch = FakeDispatch::with_dispatch([FakeDispatchResult::Complete]);
 
@@ -1407,6 +1496,14 @@ mod tests {
             session.status().last_completion,
             Some(ReconciliationCompletionOutcome::Complete)
         );
+        assert_eq!(
+            session.take_terminal_changed_paths(),
+            Some(ReconciliationTerminalChangedPaths {
+                exact_paths: expected_paths,
+                complete_scan: false,
+            })
+        );
+        assert_eq!(session.take_terminal_changed_paths(), None);
     }
 
     #[test]
@@ -1421,6 +1518,90 @@ mod tests {
         );
         assert_eq!(dispatch.calls.len(), 1);
         assert!(matches!(dispatch.calls[0], ReconciliationWork::FullScan(_)));
+        assert_eq!(
+            session.take_terminal_changed_paths(),
+            Some(ReconciliationTerminalChangedPaths {
+                exact_paths: BTreeSet::new(),
+                complete_scan: true,
+            })
+        );
+    }
+
+    #[test]
+    fn terminal_changed_paths_never_report_attempted_or_intermediate_work() {
+        for result in [
+            FakeDispatchResult::Blocked,
+            FakeDispatchResult::RetryFull,
+            FakeDispatchResult::FailedClosed(41),
+        ] {
+            let mut session = session();
+            session.trigger(ReconciliationTrigger::WatcherPaths(paths(&[
+                "pages/not-terminal.md",
+            ])));
+            let mut dispatch = FakeDispatch::with_dispatch([result]);
+            let step = session.step_with(&mut dispatch).unwrap();
+            assert!(matches!(
+                step,
+                ReconciliationSessionStep::Blocked
+                    | ReconciliationSessionStep::RetryFull
+                    | ReconciliationSessionStep::Pending(_)
+            ));
+            assert_eq!(session.take_terminal_changed_paths(), None);
+        }
+
+        let mut session = session();
+        session.trigger(ReconciliationTrigger::Explicit);
+        let mut dispatch = FakeDispatch::with_dispatch([
+            FakeDispatchResult::CompleteWithBaseline(701),
+            FakeDispatchResult::NoopWithBaseline(702),
+        ]);
+        dispatch.baseline_finish_results.extend([
+            FakeBaselineFinishResult::NeedPostDrainFullScan,
+            FakeBaselineFinishResult::Clean,
+        ]);
+        assert_eq!(
+            session.step_with(&mut dispatch),
+            Ok(ReconciliationSessionStep::Complete)
+        );
+        assert_eq!(session.take_terminal_changed_paths(), None);
+        assert_eq!(
+            session.step_with(&mut dispatch),
+            Ok(ReconciliationSessionStep::Noop)
+        );
+        assert_eq!(
+            session.take_terminal_changed_paths(),
+            Some(ReconciliationTerminalChangedPaths {
+                exact_paths: BTreeSet::new(),
+                complete_scan: true,
+            })
+        );
+    }
+
+    #[test]
+    fn failed_closed_resume_reports_the_original_bounded_target_only_after_completion() {
+        let expected = paths(&["pages/space name.md", "journals/\u{65e5}\u{8a18}.org"]);
+        let mut session = session();
+        session.trigger(ReconciliationTrigger::WatcherPaths(expected.clone()));
+        let mut dispatch = FakeDispatch::with_dispatch([FakeDispatchResult::FailedClosed(41)]);
+        dispatch
+            .resume_results
+            .push_back(FakeResumeResult::Complete);
+
+        let Ok(ReconciliationSessionStep::Pending(token)) = session.step_with(&mut dispatch) else {
+            panic!("expected a retained continuation");
+        };
+        assert_eq!(session.take_terminal_changed_paths(), None);
+        assert_eq!(
+            session.resume_with(token, &mut dispatch),
+            Ok(ReconciliationSessionStep::Complete)
+        );
+        assert_eq!(
+            session.take_terminal_changed_paths(),
+            Some(ReconciliationTerminalChangedPaths {
+                exact_paths: expected,
+                complete_scan: false,
+            })
+        );
     }
 
     #[test]
