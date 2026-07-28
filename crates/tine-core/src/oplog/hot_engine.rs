@@ -3382,19 +3382,22 @@ pub struct RuntimeResumeObservation {
 ///   they belong to (`history_latest_batch_id` at `history_generation`) and
 ///   adoption re-reads them from the sealed history at the live root;
 /// * process-local or observational — the runtime authority mint, hot archive
-///   caches, visible documents, point caches, work counters. These are
-///   deliberately discarded, exactly as the same-process seam discards them.
+///   caches, point caches, work counters. These are deliberately discarded,
+///   exactly as the same-process seam discards them.
 ///
 /// `fatal_evidence` is the one run-local member deliberately absent: a snapshot
 /// is minted only from a quiescent, conflict-free, non-terminal engine, so it
 /// is provably `None` and its unbounded conflict map can never enter the
 /// record.
 ///
-/// The catalog document's direct heads are also run-local *and* load-bearing
-/// for the durable catalog-checkpoint binding, but they are not carried either:
-/// adoption re-derives them from the adopted run's own authenticated
-/// document-state lane, which is a read of exactly the bytes whose integrity
-/// adoption must establish anyway.
+/// The catalog document and its direct heads are a fourth class: run-local,
+/// load-bearing for projection, authoring and the durable catalog-checkpoint
+/// binding, and **not** carried here. Adoption re-derives both from the adopted
+/// run's own authenticated visible document lane — a read of exactly the bytes
+/// whose integrity adoption must establish anyway — and
+/// `catalog_checkpoint_binding` binds that derivation to these roots. The
+/// same-process seam re-derives them the same way, through the same
+/// `load_run_local_catalog_hot_state` reader.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RuntimeResumeSnapshot {
     // ---- durable-history authority the run-local roots correspond to ----
@@ -3543,22 +3546,43 @@ fn scratch_roots_are_stage_quiescent(roots: &ScratchRoots) -> bool {
         && roots.ready_queue_len == 0
 }
 
-/// The run-local state one adopted run supplies, read back out of that run and
-/// proved against the snapshot's recorded roots before anything is installed.
+/// The run-local hot state that a scratch run can reproduce but that no engine
+/// rebuild recomputes on its own.
 ///
-/// Both members are run-local, are deliberately **not** carried by
-/// [`RuntimeResumeSnapshot`], and are re-derived from the adopted run's own
-/// authenticated visible document lane. `catalog_checkpoint_binding` is what
-/// binds that derivation to the recorded roots.
-struct AdoptedRunLocalState {
+/// Both members are run-local and are re-derived from the run's authenticated
+/// visible document lane rather than carried across any boundary. Every engine
+/// seam that discards hot state and keeps the run — cross-process adoption and
+/// the same-process reconstruction — needs both back, because the projection
+/// and authoring paths resolve them out of hot state with no lazy load.
+struct RunLocalCatalogHotState {
     /// The catalog document's authenticated direct heads. Load-bearing for the
     /// durable catalog-checkpoint binding of every later accepted batch.
     catalog_heads: BTreeSet<BatchId>,
     /// The catalog document itself, which a full replay would have staged into
-    /// hot state and which the projection and authoring paths resolve out of
-    /// hot state with no lazy load. `None` only when the run's visible lane has
-    /// no catalog checkpoint at all.
+    /// hot state. `None` only when the run's visible lane has no catalog
+    /// checkpoint at all.
     catalog_document: Option<LoroDoc>,
+}
+
+impl RunLocalCatalogHotState {
+    /// Install this state into a freshly rebuilt engine.
+    ///
+    /// Empty heads and an absent document are left absent rather than inserted
+    /// as empty values, so a run that never published a catalog checkpoint
+    /// reconstructs to exactly the state a fresh engine has.
+    fn install(self, engine: &mut ShardedHotEngine) {
+        let catalog_document_id = engine.catalog_document_id;
+        if !self.catalog_heads.is_empty() {
+            engine
+                .visible_document_heads
+                .insert(catalog_document_id, self.catalog_heads);
+        }
+        if let Some(catalog) = self.catalog_document {
+            engine
+                .visible_documents
+                .insert(catalog_document_id, catalog);
+        }
+    }
 }
 
 /// What one resuming open actually did, including why it refused.
@@ -5244,19 +5268,12 @@ impl ShardedHotEngine {
             available: snapshot.current_path_catalog_available,
             accepted_frontier_root: snapshot.current_path_catalog_frontier.clone(),
         };
-        if !run_local.catalog_heads.is_empty() {
-            self.visible_document_heads
-                .insert(self.catalog_document_id, run_local.catalog_heads);
-        }
-        // The hot catalog document a full replay would have staged. Without it
+        // The hot catalog state a full replay would have staged. Without it
         // every projection read of an adopted engine returns `PageNotFound`,
         // `canonical_snapshot` silently returns an empty graph, and the first
         // local authoring round is diverted into external reconciliation
         // against a `None` semantic pre-state.
-        if let Some(catalog) = run_local.catalog_document {
-            self.visible_documents
-                .insert(self.catalog_document_id, catalog);
-        }
+        run_local.install(self);
         self.replay_base_generation = snapshot.history_generation;
         self.resume_observation.adopted = true;
         Ok(())
@@ -5299,7 +5316,7 @@ impl ShardedHotEngine {
         &self,
         snapshot: &RuntimeResumeSnapshot,
         record: &ColdHistoryRecord,
-    ) -> Result<AdoptedRunLocalState, EngineError> {
+    ) -> Result<RunLocalCatalogHotState, EngineError> {
         let scratch = self.scratch.as_ref().ok_or_else(|| {
             EngineError::Archive("runtime resume restore requires a run-local scratch".into())
         })?;
@@ -5330,29 +5347,9 @@ impl ShardedHotEngine {
         // state a full replay would have staged, and reading it here is what
         // lets the restore stay all-or-nothing — the install happens only after
         // every proof below has succeeded.
-        let (catalog_heads, catalog_document) = match super::document_state::load_external_current(
-            scratch,
-            &snapshot.scratch_roots,
-            super::document_state::DocumentLane::Visible,
-            self.catalog_document_id,
-        )
-        .map_err(|error| EngineError::Archive(error.to_string()))?
-        {
-            Some((state, document, state_work)) => {
-                self.record_document_state_work(state_work);
-                // Exactly the authentication an ordinary hot read of this lane
-                // performs: the checkpoint's latest update must be the object
-                // the immutable archive published for its source batch.
-                self.validate_external_record_anchor(self.catalog_document_id, &state)?;
-                let document = document.into_document();
-                document.set_peer_id(1).map_err(loro_error)?;
-                (
-                    state.exact_direct_heads().iter().copied().collect(),
-                    Some(document),
-                )
-            }
-            None => (BTreeSet::new(), None),
-        };
+        let hot_state = self.load_run_local_catalog_hot_state(&snapshot.scratch_roots)?;
+        let catalog_heads = hot_state.catalog_heads;
+        let catalog_document = hot_state.catalog_document;
         // The snapshot's own catalog checkpoint binding commits the two external
         // document lanes together with these heads, so reproducing it is one
         // O(1) equality that covers all three at once — and it is what makes the
@@ -5425,9 +5422,57 @@ impl ShardedHotEngine {
             })?
             .lookup_many(snapshot.block_claim_root, &[[0_u8; 16]])
             .map_err(|error| EngineError::Archive(error.to_string()))?;
-        Ok(AdoptedRunLocalState {
+        Ok(RunLocalCatalogHotState {
             catalog_heads,
             catalog_document,
+        })
+    }
+
+    /// Re-derive the catalog document and its authenticated direct heads from
+    /// one set of run-local scratch roots.
+    ///
+    /// The single reader for both engine seams that discard hot state and keep
+    /// the run: cross-process adoption and the same-process
+    /// [`Self::reconstruct_run_local_state`]. Both need it because
+    /// `materialize_page_inner`, `canonical_snapshot` and
+    /// `resolve_logseq_uuid_current` resolve the catalog document out of hot
+    /// state with no lazy load, and `prospective_catalog_heads` reads the heads
+    /// straight out of `visible_document_heads` to build the durable
+    /// catalog-checkpoint binding of the next accepted batch.
+    ///
+    /// This is a read, not a transport: the bytes come from the run's own
+    /// authenticated visible document lane, and the checkpoint record is
+    /// anchor-validated against the immutable archive exactly as an ordinary hot
+    /// read would validate it.
+    fn load_run_local_catalog_hot_state(
+        &self,
+        roots: &ScratchRoots,
+    ) -> Result<RunLocalCatalogHotState, EngineError> {
+        let scratch = self.scratch.as_ref().ok_or_else(|| {
+            EngineError::Archive(
+                "run-local catalog hot state requires an authenticated scratch".into(),
+            )
+        })?;
+        let Some((state, document, state_work)) = super::document_state::load_external_current(
+            scratch,
+            roots,
+            super::document_state::DocumentLane::Visible,
+            self.catalog_document_id,
+        )
+        .map_err(|error| EngineError::Archive(error.to_string()))?
+        else {
+            return Ok(RunLocalCatalogHotState {
+                catalog_heads: BTreeSet::new(),
+                catalog_document: None,
+            });
+        };
+        self.record_document_state_work(state_work);
+        self.validate_external_record_anchor(self.catalog_document_id, &state)?;
+        let document = document.into_document();
+        document.set_peer_id(1).map_err(loro_error)?;
+        Ok(RunLocalCatalogHotState {
+            catalog_heads: state.exact_direct_heads().iter().copied().collect(),
+            catalog_document: Some(document),
         })
     }
 
@@ -5440,6 +5485,19 @@ impl ShardedHotEngine {
     /// the retained capabilities and their authenticated roots survive — in
     /// particular the scratch roots, which are the sole continuation authority
     /// for point-paged dependency registration and dependent fanout.
+    ///
+    /// One piece of hot state is **re-derived** rather than discarded, for the
+    /// same reason cross-process adoption re-derives it: the catalog document
+    /// and its authenticated direct heads are resolved out of hot state with no
+    /// lazy load by `materialize_page_inner`, `canonical_snapshot`,
+    /// `resolve_logseq_uuid_current` and `prospective_catalog_heads`. Discarding
+    /// them leaves a reconstructed engine that cannot project any page and whose
+    /// next accepted batch computes its durable catalog-checkpoint binding from
+    /// empty heads. The bytes come from the run's own authenticated visible
+    /// document lane through [`Self::load_run_local_catalog_hot_state`], so this
+    /// is a re-derivation from the retained run, not a carried-across cache.
+    /// It is read *before* anything moves, so a failure leaves this engine
+    /// untouched.
     ///
     /// The runtime authority is carried so a retained same-process `Graph`
     /// handoff, tail overlay, and SQLite frontier keep their exact enrollment
@@ -5458,6 +5516,16 @@ impl ShardedHotEngine {
                 "engine reconstruction cannot interrupt an authenticated history replay".into(),
             ));
         }
+        // Read before anything moves, so a failure here leaves this engine
+        // exactly as it was. A blocked engine keeps its catalog in the terminal
+        // lane and every reader of `visible_documents` is already refused by
+        // `ensure_not_blocked`, so re-deriving the visible lane for one would
+        // install state the pre-reconstruction engine did not hold.
+        let catalog_hot_state = if self.is_blocked() {
+            None
+        } else {
+            Some(self.load_run_local_catalog_hot_state(&self.scratch_roots)?)
+        };
         let mut rebuilt = Self::new(
             self.workspace_id,
             self.lineage_digest,
@@ -5500,6 +5568,9 @@ impl ShardedHotEngine {
         rebuilt.history_work.set(self.history_work.get());
         rebuilt.resume_observation = self.resume_observation;
         rebuilt.bootstrap_residency = Arc::clone(&self.bootstrap_residency);
+        if let Some(catalog_hot_state) = catalog_hot_state {
+            catalog_hot_state.install(&mut rebuilt);
+        }
         *self = rebuilt;
         Ok(())
     }
@@ -22638,6 +22709,66 @@ mod validation_tests {
             projection_observation_boundary(&fixture.engine, &fixture_page_ids(&fixture)),
             control_state,
             "adoption must reach exactly the accepted closure a full replay reaches, at the projection and snapshot boundary as well as at the roots"
+        );
+
+        finish_preauthor_gate_fixture(fixture);
+    }
+
+    /// The same-process reconstruction seam re-derives the same run-local
+    /// catalog hot state that cross-process adoption does.
+    ///
+    /// `reconstruct_run_local_state` discards hot state and keeps the run, which
+    /// is structurally the same situation adoption is in. Without the
+    /// re-derivation a reconstructed engine cannot project any page, silently
+    /// reports an empty canonical snapshot, and computes the durable
+    /// catalog-checkpoint binding of its next accepted batch from empty heads.
+    /// The seam has no production caller yet, so this is the assertion that
+    /// keeps it from being activated with the defect intact.
+    #[test]
+    fn same_process_reconstruction_keeps_the_run_local_catalog_hot_state() {
+        let mut fixture = preauthor_gate_fixture_with_retention(713_000, true);
+        for round in 0..2u128 {
+            fixture.author_accepted_round(713_100 + round * 100, &format!("reconstruct {round}"));
+        }
+        let pages = fixture_page_ids(&fixture);
+        let before = projection_observation_boundary(&fixture.engine, &pages);
+        let catalog_heads_before = fixture
+            .engine
+            .visible_document_heads
+            .get(&fixture.engine.catalog_document_id)
+            .cloned()
+            .expect("an accepted engine holds the catalog's direct heads");
+        assert!(!catalog_heads_before.is_empty());
+
+        fixture.engine.reconstruct_run_local_state().unwrap();
+
+        assert_eq!(
+            fixture
+                .engine
+                .visible_document_heads
+                .get(&fixture.engine.catalog_document_id),
+            Some(&catalog_heads_before),
+            "reconstruction must keep the catalog's direct heads, which the next accepted batch's durable checkpoint binding is computed from"
+        );
+        assert_eq!(
+            projection_observation_boundary(&fixture.engine, &pages),
+            before,
+            "a reconstructed engine must project exactly what it projected before"
+        );
+
+        // And it can still author: the catalog-checkpoint binding of the next
+        // accepted batch is built from those heads.
+        fixture.author_accepted_round(713_400, "after reconstruction");
+        let after = projection_observation_boundary(&fixture.engine, &pages);
+        let replay = fixture.reopen_resuming(None);
+        assert_eq!(
+            replay.observation.replayed_generations,
+            replay.observation.live_history_generation
+        );
+        assert_eq!(
+            projection_observation_boundary(&fixture.engine, &pages),
+            after,
+            "work authored after a reconstruction must reproduce under a full replay"
         );
 
         finish_preauthor_gate_fixture(fixture);
