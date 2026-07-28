@@ -230,7 +230,7 @@ pub enum SyncRuntimeRequestError {
     InvalidRequest(String),
     RequestTooLarge {
         observations: usize,
-        /// Exact for a count-valid batch; otherwise a bounded prefix diagnostic.
+        /// Exact while under the byte cap; otherwise a bounded overflow diagnostic.
         path_bytes: usize,
     },
     ActorRefused(String),
@@ -518,7 +518,8 @@ impl SyncRuntimeHandle {
 
 /// Bound public request validation as well as actor intake. A batch above the
 /// count cap is already known to require a full scan, so only inspect a fixed
-/// prefix; for a count-valid batch this is its exact path-byte total.
+/// prefix. The result is exact while it remains within the byte cap; once the
+/// cap is crossed it is merely a bounded overflow witness.
 fn bounded_watcher_path_bytes(observations: &[SyncWatcherObservation]) -> usize {
     let mut path_bytes = 0_usize;
     for observation in observations.iter().take(MAX_WATCHER_OBSERVATIONS) {
