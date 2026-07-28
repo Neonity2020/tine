@@ -96,8 +96,10 @@
 //! and only after it has recovered and authenticated the entire runtime the
 //! crashed process left behind. The replacement is then an exact
 //! compare-and-swap from the authenticated old head and old unsafe session, so
-//! two racing newcomers cannot both win. It never mints `Safe` and never
-//! unblocks automatic external import; only a proved clean drain does that.
+//! two racing newcomers cannot both win. It never mints `Safe`. Automatic
+//! external import remains fenced until the actor-owned exact feed completes
+//! and revalidates one full recovery catch-up, or until a later clean `Safe`
+//! handoff is adopted.
 //!
 //! ## Workspace lease identity
 //!
@@ -1896,9 +1898,14 @@ pub(crate) struct PromotedLocalRuntime {
     /// resource claim and physical control-directory identity were last
     /// authenticated. Any change forces the full archive proof again.
     archive_authenticated_generation: u64,
-    /// How this runtime came to own the enrollment's handoff state. It decides
-    /// whether automatic external import may run at all.
+    /// How this runtime came to own the enrollment's handoff state. It is
+    /// durable recovery evidence and never changes during the live session.
     recovery: RuntimeRecoveryState,
+    /// Live-session admission for automatic external import. A clean Safe open
+    /// starts allowed. Crash/Unsafe opens start fenced until the actor-owned
+    /// exact feed completes one authenticated full reconciliation/catch-up and
+    /// revalidates this runtime's durable binding and device-local drains.
+    external_import_recovery_completed: bool,
     engine: Box<ShardedHotEngine>,
     /// The device-local SQLite projection *and* the archive-rooted workspace
     /// runtime lease that authorized opening it, owned as one inseparable
@@ -2054,15 +2061,17 @@ pub(crate) enum ResumePublicationRefusal {
 }
 
 impl RuntimeRecoveryState {
-    /// Automatic external import stays blocked until a clean `Safe` handoff has
-    /// been observed.
+    /// Initial automatic external-import admission from durable recovery
+    /// evidence alone.
     ///
     /// A crashed predecessor left an unproved drain: its graph text, watcher
     /// obligations, and projection work were never quiesced, so external files
     /// cannot be assumed to be a faithful projection of the accepted frontier.
     /// Recovering from that state must never look like a clean handoff, and it
     /// must never import external Markdown merely because the previous process
-    /// died.
+    /// died. A live runtime may later clear this initial block only after the
+    /// exact-feed owner completes an authenticated full catch-up and revalidates
+    /// the promoted runtime boundary.
     pub(crate) const fn automatic_external_import(self) -> ExternalImportAdmission {
         match self {
             Self::AdoptedSafeHandoff => ExternalImportAdmission::Allowed,
@@ -2536,9 +2545,48 @@ impl PromotedLocalRuntime {
     }
 
     /// Whether automatic external Markdown/Org import may run under this
-    /// runtime. It stays blocked until a clean `Safe` handoff is observed.
-    pub(crate) const fn automatic_external_import(&self) -> ExternalImportAdmission {
-        self.recovery.automatic_external_import()
+    /// runtime. Unsafe/crash recovery starts blocked, then becomes live-session
+    /// allowed only after the exact-feed owner completes and revalidates the
+    /// startup full reconciliation/catch-up. This does not change the durable
+    /// handoff record and does not publish `Safe`.
+    pub(crate) fn automatic_external_import(&self) -> ExternalImportAdmission {
+        if self.external_import_recovery_completed {
+            ExternalImportAdmission::Allowed
+        } else {
+            self.recovery.automatic_external_import()
+        }
+    }
+
+    /// Mark automatic external import recovered for this live runtime after
+    /// the exact-feed startup full scan has published caught-up authority and
+    /// acknowledged its queue epoch.
+    ///
+    /// The exact-feed owner proves the graph-text catch-up. This boundary
+    /// revalidates the promoted runtime itself: retained enrollment session,
+    /// archive/resource binding, workspace lease identity, SQLite accepted
+    /// frontier, tail, and projection work. It deliberately mutates only this
+    /// process-local latch. The durable enrollment handoff remains `Unsafe`
+    /// until the existing Safe handoff transaction succeeds.
+    pub(crate) fn complete_automatic_external_import_recovery(
+        &mut self,
+        authority: &mut LocalActiveAuthority,
+        graph: &Graph,
+    ) -> Result<(), RuntimePromotionError> {
+        if self.external_import_recovery_completed {
+            return Ok(());
+        }
+        authority.reconcile_promoted_handoff(&mut self.enrollment)?;
+        self.prove_binding(graph, authority, BindingProofDepth::Boundary)?;
+        prove_device_local_drains(&self.engine, self.projection.database(), &self.tail).map_err(
+            |error| {
+                RuntimePromotionError::Activation(LocalActivationError::RuntimeBinding(format!(
+                    "automatic external import recovery did not quiesce device-local drains: \
+                     {error}"
+                )))
+            },
+        )?;
+        self.external_import_recovery_completed = true;
+        Ok(())
     }
 
     pub(crate) const fn tail(&self) -> &TailOverlay {
@@ -3866,9 +3914,11 @@ pub(crate) fn reopen_promoted_local_runtime_existing_projection(
 /// session. Every failure before that swap leaves the predecessor's record
 /// authoritative and writes nothing.
 ///
-/// It never mints `Safe`, and it never imports external Markdown: a crashed
-/// predecessor proved no drain, so [`PromotedLocalRuntime::automatic_external_import`]
-/// stays blocked until a later clean `Safe` handoff.
+/// It never mints `Safe`, and the takeover itself never imports external
+/// Markdown: a crashed predecessor proved no drain, so
+/// [`PromotedLocalRuntime::automatic_external_import`] stays blocked until the
+/// exact-feed owner completes an authenticated full recovery catch-up, or until
+/// a later clean `Safe` handoff.
 pub(crate) fn take_over_promoted_local_runtime(
     root: &EnrollmentApplicationRoot,
     binding: &EnrollmentBindingV1,
@@ -4738,6 +4788,10 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
         enrollment,
         archive_authenticated_generation,
         recovery,
+        external_import_recovery_completed: matches!(
+            recovery,
+            RuntimeRecoveryState::AdoptedSafeHandoff
+        ),
         engine: Box::new(engine),
         projection,
         tail,

@@ -2,6 +2,28 @@
   "schemaVersion": 1,
   "entries": [
     {
+      "id": "REG-SYNC-UNSAFE-CRASH-RECOVERY-LIVENESS-001",
+      "title": "Sparse-oplog crash takeover reconciles closed-interval external edits and can reach a Safe handoff",
+      "family": "sync-data-safety",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/sync_runtime.rs",
+          "crates/tine-core/src/oplog/exact_external_feed.rs"
+        ],
+        "scenario": "sync.unsafe-crash-recovery-liveness",
+        "failBefore": "proven"
+      }
+    },
+    {
       "id": "REG-QUERY-OG-MEMBERSHIP-BOUNDS-001",
       "title": "Simple query page terms unquoted search and date ranges match OG membership and bounds across presentations",
       "family": "query-correctness",

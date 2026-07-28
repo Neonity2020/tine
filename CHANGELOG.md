@@ -29,6 +29,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   ordinary backup restore is operation-first and crash-resumable. This first version
   manages page and journal text; assets, PDF sidecars, and configuration remain
   ordinary provider-synchronized files. (Experimental, opt-in.)
+- **Sparse-oplog crash takeover can recover to a clean handoff.** A restarted
+  experimental runtime that takes over an `Unsafe` predecessor now performs an
+  authenticated full external-file reconciliation before admitting automatic imports
+  or publishing `Safe`, preserving unimported projection bytes.
 
 ## [0.6.5] - 2026-07-22
 
