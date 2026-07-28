@@ -2105,4 +2105,95 @@ mod tests {
             );
         }
     }
+
+    /// One graph file whose POSIX-legal name is outside the portable path
+    /// alphabet must not stop the whole graph's reconciliation.
+    ///
+    /// `Meeting: notes.md` is not graph text by this build's own definition:
+    /// `GraphTextScope::is_eligible` rejects it because `:` is outside
+    /// `managed_component_is_portable`, `Graph::list_pages` never lists it, and
+    /// `inventory_initial_shadow` never captures it. Every other layer treats
+    /// such a path as ordinary retained non-text and ignores it, and unsupported
+    /// graph text that *is* in scope (`.markdown`, `.MD`, excluded containers)
+    /// is reported as named per-path reconciliation-import evidence.
+    ///
+    /// `collect_reconciliation_scan_pass` instead gates a mandatory
+    /// `ManagedPath::parse` on `is_page_file` alone — an extension-only test
+    /// that says nothing about scope — and turns its failure into an
+    /// unrecoverable whole-scan error before the very next line computes the
+    /// eligibility that would have classified the same path `RetainedNonText`.
+    /// The user's unrelated offline edit therefore never imports, every tick
+    /// repeats the same full graph walk, no surfaced evidence names the file,
+    /// and clean `Safe` handoff becomes unreachable.
+    ///
+    /// The two controls pin the defect exactly: the identical name with a
+    /// non-page extension, and the identical `.md` name inside a hidden
+    /// container the scan never descends into, both reconcile normally.
+    #[test]
+    fn out_of_scope_non_portable_graph_text_name_does_not_block_the_graph() {
+        let fixture = RuntimeHostFixture::safe("sync-runtime-nonportable-name");
+        let graph_root = fixture.graph_root().to_path_buf();
+        fs::create_dir_all(graph_root.join("archive/.private")).unwrap();
+
+        // Controls: same non-portable name, but out of the page-file extension
+        // set, and inside a hidden container. Neither is graph text either.
+        fs::write(graph_root.join("archive/Meeting: notes.txt"), b"plain\n").unwrap();
+        fs::write(
+            graph_root.join("archive/.private/Meeting: notes.md"),
+            b"- hidden\n",
+        )
+        .unwrap();
+
+        // The file under test: written by another editor or delivered by a
+        // filesystem sync provider into an ordinary graph folder.
+        let stray = "archive/Meeting: notes.md";
+        fs::write(graph_root.join(stray), b"- not a Tine page\n").unwrap();
+
+        // This build itself refuses to call it graph text.
+        let probe = crate::Graph::open(&graph_root);
+        assert!(
+            !probe
+                .list_pages()
+                .iter()
+                .any(|entry| entry.rel_path == stray),
+            "the fixture no longer treats {stray} as out-of-scope graph text"
+        );
+        drop(probe);
+
+        // The user's ordinary offline edit to a real page in a configured root.
+        let edited = "content/nested pages/rename old.org";
+        let edit = b"* edited in another editor while Tine was closed\n";
+        fs::write(graph_root.join(edited), edit).unwrap();
+
+        let before = fixture.manifest_count();
+        let handle = active_handle(SyncRuntimeHandle::open(fixture.request()));
+        let ticks = drain_until_settled(&handle);
+        assert!(
+            admitted_an_epoch(&ticks),
+            "one out-of-scope non-portable file name must not stop startup \
+             reconciliation for the whole graph, but the drain produced {ticks:?}"
+        );
+        assert!(
+            fixture.manifest_count() > before,
+            "the unrelated offline edit produced no durable batch"
+        );
+        assert_eq!(fs::read(graph_root.join(edited)).unwrap(), edit);
+
+        let shutdown = handle.clean_shutdown();
+        assert!(
+            matches!(shutdown, Ok(SyncShutdownOutcome::Safe(_))),
+            "an out-of-scope non-portable file name must not make clean Safe \
+             handoff unreachable, but shutdown returned {shutdown:?}"
+        );
+        assert!(matches!(
+            fixture.handoff(),
+            EnrollmentDiscoveryHandoff::Safe
+        ));
+
+        // Nothing was moved, rewritten, or removed to achieve that.
+        assert_eq!(
+            fs::read(graph_root.join(stray)).unwrap(),
+            b"- not a Tine page\n"
+        );
+    }
 }
