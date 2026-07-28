@@ -1001,14 +1001,29 @@ mod tests {
 
     #[test]
     fn watcher_requests_are_bounded_before_channel_intake() {
+        let fixture = RuntimeHostFixture::safe("sync-runtime-watcher-request-bounds");
+        let handle = active_handle(SyncRuntimeHandle::open(fixture.request()));
+        drive_initial_feed(&handle);
+        let before = handle.status().unwrap();
         let observations = (0..=MAX_WATCHER_OBSERVATIONS)
             .map(|_| SyncWatcherObservation::UnknownPath)
             .collect::<Vec<_>>();
-        assert!(observations.len() > MAX_WATCHER_OBSERVATIONS);
-        let unicode =
-            SyncWatcherObservation::managed_path("nested/nonstandard pages/日記 and café note.org")
-                .unwrap();
-        assert!(matches!(unicode, SyncWatcherObservation::ManagedPath(_)));
+        assert!(matches!(
+            handle.observe_watcher(observations),
+            Err(SyncRuntimeRequestError::RequestTooLarge {
+                observations,
+                path_bytes: 0,
+            }) if observations == MAX_WATCHER_OBSERVATIONS + 1
+        ));
+        assert_eq!(
+            handle.status().unwrap().watcher,
+            before.watcher,
+            "a rejected oversized request must never reach actor intake"
+        );
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
     }
 
     fn active_handle(opened: SyncRuntimeOpenResult) -> SyncRuntimeHandle {
