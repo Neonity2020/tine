@@ -1863,6 +1863,15 @@ impl std::fmt::Debug for GraphTextExactFeedLease {
 }
 
 impl GraphTextExactFeedLease {
+    /// Whether this move-only lease has permanently lost feed authority.
+    ///
+    /// The core owner uses this only to distinguish a retryable held-rebuild
+    /// failure from root/scope/sequence loss that requires a fresh Graph and
+    /// runtime owner. It exposes no binding, fence, or feed capability.
+    pub(crate) fn is_terminal(&self) -> bool {
+        self.terminal.load(Ordering::Acquire)
+    }
+
     /// Construct one bounded batch for this live lease.
     ///
     /// Any malformed range/path set is terminal because the platform can no

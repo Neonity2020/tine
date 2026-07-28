@@ -18,6 +18,8 @@ pub(crate) mod document_state;
 #[allow(dead_code)]
 pub(crate) mod enrollment;
 pub(crate) mod evidence_index;
+#[allow(dead_code)]
+pub(crate) mod exact_external_feed;
 pub(crate) mod external_import;
 pub mod hot_engine;
 pub mod identity;
