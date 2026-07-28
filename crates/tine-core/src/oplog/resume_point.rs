@@ -92,6 +92,10 @@ pub(crate) const RESUME_POINT_SCHEMA_VERSION: u32 = 1;
 /// | 600 batches x 1 page x 4 blocks | 2,400 | 600 | 11,713 |
 /// | 1,023 batches x 1 page x 4 blocks | 4,092 | 1,023 | **17,349** |
 ///
+/// (Measured before `history_latest_batch_id` and `catalog_checkpoint_binding`
+/// were added. Both are fixed-size, so every row above is 82 bytes larger today
+/// and none of the scaling conclusions moves.)
+///
 /// A 1,600x change in graph size at a fixed batch count costs 46 bytes, and the
 /// release fixture's own million-block shape fits with room to spare. What
 /// actually moves the record is **how much work one retained run has absorbed
