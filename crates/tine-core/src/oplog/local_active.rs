@@ -211,6 +211,55 @@
 //! proved by the store-minted [`super::object_store::AuthenticatedEngineHistoryTransition`],
 //! never by raw generation or acceptance sequence.
 //!
+//! # The retained-resume accelerator
+//!
+//! A promoted open may reuse the run-local engine state a previous session left
+//! behind instead of replaying the whole authenticated history. The entire
+//! lifecycle lives inside this module's two boundaries, and every step of it is
+//! dominated by the one archive-rooted workspace lease this runtime holds:
+//!
+//! 1. **Open.** [`mint_promoted_runtime`] takes the lease, authenticates the
+//!    archive, then — before anything is adopted — reproves the lease, asks the
+//!    durable history store for a retention plan, and reads at most one
+//!    published candidate through a duplicate of the *retained* archive
+//!    capability. The enrollment evidence that read is admitted against is
+//!    derived here from the retained authenticated session
+//!    ([`resume_enrollment_admission`]), never supplied by a caller.
+//! 2. **Selection.** Only a valid `ResumeAdoptionCandidate::Available` is
+//!    offered to the engine. Never published, proof denied by residue or
+//!    surplus, torn, stale, conflicted, binding-refused, still-leased — every
+//!    other shape opens exactly as a fresh full replay would, without failing
+//!    startup and without changing one candidate byte. An `Ephemeral` retention
+//!    plan means the archive cannot currently prove a retained run collectable,
+//!    so this open takes a disposable run and adds nothing to the population.
+//! 3. **Publication.** [`PromotedLocalRuntime::publish_quiescent_resume_point`]
+//!    is the only mint. It runs the same device-local drain proof the `Safe`
+//!    handoff runs, reproves the lease immediately before the snapshot, and then
+//!    goes `runtime_resume_snapshot -> mint_resume_point -> publish_resume_point`
+//!    in that order.
+//! 4. **Reclamation.** Only the sealed `PublishedResumePoint` a successful
+//!    publication mints authorizes deletion, and the pass reproves the lease
+//!    once more first. This is the only boundary in this module that can delete
+//!    archive bytes.
+//!
+//! The whole thing is an accelerator, so it has no `Err` reaching a caller's
+//! control flow: [`ResumePublicationStatus`] and [`RuntimeResumeOpenStatus`] are
+//! typed, diagnosable status. A full replay is always available and always
+//! correct, and a publication or maintenance failure must never block an
+//! otherwise valid `Unsafe -> Safe` handoff.
+//!
+//! Neither status vends a scan, a reachability proof, a record, or any deletion
+//! surface, and neither is read by any admission path: the accelerator is
+//! absent from the keystroke, authoring, and acceptance paths entirely.
+//!
+//! **Required packet-9 neighbour.** A latched
+//! [`RuntimeRevocation`] is terminal by design, and the resume boundaries latch
+//! it exactly like every other. The typed result is deliberately sufficient for
+//! a startup/UI layer to react — [`PromotedLocalRuntime::workspace_authority_revocation`]
+//! names the boundary and the exact cause — but nothing in `tine-core` reopens
+//! or takes over automatically. The wiring packet must offer that reopen rather
+//! than the latch being weakened here.
+//!
 //! Every new-architecture mutation, projection, import, coordinator, and
 //! reconciliation path requires a [`LocalRuntimeAdmission`] whose only
 //! production source is [`PromotedRuntimeAdmission::admission`], which is itself
@@ -229,13 +278,17 @@ use super::enrollment::{
     LocalActiveSync, PromotedBootstrapAnchor, RetainedEnrollmentSession, UnsafeHandoffPredecessor,
     VerifiedLocalCompositionError, VerifiedLocalEvidence, VerifiedLocalProofSet,
 };
-use super::hot_engine::{EngineError, ShardedHotEngine};
+use super::hot_engine::{
+    EngineError, EngineOpenRetention, RuntimeResumeObservation, ShardedHotEngine,
+};
 use super::import::InactiveBootstrapAcceptedAuthority;
 use super::object_store::{
-    EngineHistoryAuthority, PromotedLineageModeV1, PromotedRuntimeStateV1, StoreError,
-    PROMOTED_RUNTIME_STATE_SCHEMA_VERSION,
+    EngineHistoryAuthority, EngineScratchRetentionPlan, PromotedLineageModeV1,
+    PromotedRuntimeStateV1, ResumeAcceleratorUnavailable, ResumeAdoptionCandidate,
+    RetainedRunMaintenanceReport, StoreError, PROMOTED_RUNTIME_STATE_SCHEMA_VERSION,
 };
 use super::projection_store::ProjectionReceiptStore;
+use super::resume_point::{ResumeEnrollmentAdmission, ResumePointEnrollment};
 use super::sqlite::{
     ApplicationRuntimeRoot, LeasedWorkspaceProjection, OpenProjection, ProjectionClaim,
     ProjectionError, RebuildSource, SqliteFrontier, TailOverlay, VerifiedBootstrapSqliteProjection,
@@ -845,6 +898,13 @@ impl LocalActiveAuthority {
         }
         Ok(())
     }
+}
+
+/// A latched or freshly latched workspace-authority loss, as a publication
+/// status. The revocation is carried structurally so a diagnosis names the
+/// boundary that first lost the workspace rather than a rendered string.
+fn refusal_into_publication(refusal: WorkspaceAuthorityRefusal) -> ResumePublicationRefusal {
+    ResumePublicationRefusal::WorkspaceAuthorityRevoked(refusal.revocation().clone())
 }
 
 fn prove_device_local_drains(
@@ -1721,6 +1781,12 @@ pub(crate) struct PromotedLocalRuntime {
     /// proof, and `Safe` handoff then refuses from it rather than reusing a
     /// proof this runtime carried from before the loss.
     revocation: RuntimeRevocationLatch,
+    /// What this open decided about the resume accelerator, and the last
+    /// publication attempt's status. Both are typed diagnostics: neither is
+    /// authority, neither vends a scan, a reachability proof, a record, or any
+    /// deletion surface, and neither is consulted by any admission path.
+    resume_open: RuntimeResumeOpenStatus,
+    resume_publication: Option<ResumePublicationStatus>,
     _seal: seal::Seal,
 }
 
@@ -1751,6 +1817,99 @@ pub(crate) enum RuntimeRecoveryState {
 pub(crate) enum ExternalImportAdmission {
     Allowed,
     Blocked(&'static str),
+}
+
+/// What one promoted open decided about the resume accelerator.
+///
+/// Diagnostics only, and deliberately the *minimum* a diagnosis needs: a
+/// retention decision, why no candidate was offered when none was, and the
+/// engine's own standing resume observation. It carries no scan, no
+/// reachability proof, no record, and no deletion authority, so holding one
+/// grants nothing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeResumeOpenStatus {
+    /// The pre-mint retention decision, taken before any run was created or
+    /// adopted. `Ephemeral` means this engine runs on a disposable run and
+    /// replayed in full, and that no new retained run was added.
+    plan: EngineScratchRetentionPlan,
+    /// `None` means a published candidate was offered to the engine. `Some`
+    /// records why the accelerator was not even offered.
+    unavailable: Option<ResumeAcceleratorUnavailable>,
+    /// The engine's own account of what it did with the offer.
+    observation: RuntimeResumeObservation,
+}
+
+impl RuntimeResumeOpenStatus {
+    pub(crate) const fn plan(&self) -> &EngineScratchRetentionPlan {
+        &self.plan
+    }
+
+    pub(crate) const fn unavailable(&self) -> Option<&ResumeAcceleratorUnavailable> {
+        self.unavailable.as_ref()
+    }
+
+    pub(crate) const fn observation(&self) -> RuntimeResumeObservation {
+        self.observation
+    }
+
+    /// Whether this open reused a published retained run instead of replaying
+    /// the whole authenticated history.
+    pub(crate) const fn adopted(&self) -> bool {
+        self.observation.adopted
+    }
+
+    /// Whether this open runs on a retained run at all. An ephemeral run cannot
+    /// be published, so it is also the answer to "may this session publish?".
+    pub(crate) const fn retained(&self) -> bool {
+        matches!(self.plan, EngineScratchRetentionPlan::Retained { .. })
+    }
+}
+
+/// What one quiescent resume-accelerator publication attempt did.
+///
+/// There is no `Err` sibling on purpose. Publication is an accelerator: every
+/// failure mode is a variant here, none of them blocks an otherwise valid
+/// `Unsafe -> Safe` handoff, and none of them deletes a byte.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ResumePublicationStatus {
+    /// A replacement point reached durability. `maintenance` is the bounded
+    /// reclamation pass its witness authorized, or `None` when the reclamation
+    /// boundary itself refused — in which case nothing was deleted.
+    Published {
+        resume_sequence: u64,
+        maintenance: Option<RetainedRunMaintenanceReport>,
+    },
+    /// Nothing was published and nothing was deleted.
+    NotPublished(ResumePublicationRefusal),
+}
+
+/// Why one quiescent publication attempt published nothing.
+///
+/// Every arm is a *status*, never an error the caller must recover from: the
+/// bytes on disk are exactly as they were, and the next restart pays a full
+/// replay, which is always available and always correct.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ResumePublicationRefusal {
+    /// The runtime has latched terminal workspace-authority revocation, or the
+    /// lease reproof immediately before the publication failed and latched it.
+    WorkspaceAuthorityRevoked(RuntimeRevocation),
+    /// The live authority, graph capability, or enrolled engine identity is not
+    /// this runtime's.
+    Runtime(String),
+    /// The committed enrollment record is not this session's `Unsafe`+`Idle`
+    /// record, so there is no authenticated evidence to record.
+    Enrollment(String),
+    /// A device-local drain is still outstanding, so this is not a quiescent
+    /// cut and the run-local roots are still moving.
+    DrainIncomplete(String),
+    /// The engine is ephemeral, still moving, conflicted, or its durable head
+    /// record is not itself adoptable. There is nothing publishable to name.
+    EngineNotPublishable,
+    /// The engine could not produce a snapshot at all.
+    Engine(String),
+    /// The durable history store refused the mint or the publication — an
+    /// unrecognizable resume-point directory, a moved live head, or I/O.
+    Store(String),
 }
 
 impl RuntimeRecoveryState {
@@ -1800,6 +1959,11 @@ pub(crate) enum WorkspaceAuthorityBoundary {
     ProjectionTailDrain,
     /// The promoted `Safe` handoff.
     SafeHandoff,
+    /// Minting and publishing this endpoint's quiescent resume point.
+    ResumePublication,
+    /// The bounded retained-run reclamation pass one publication authorized.
+    /// It is the only boundary in this module that can delete archive bytes.
+    ResumeReclamation,
     /// Coordinator: immutable batch publication into the archive.
     Publication,
     /// Coordinator: bounded tail admission of accepted batches.
@@ -1819,6 +1983,8 @@ impl WorkspaceAuthorityBoundary {
             Self::MutableParts => "mutable runtime parts handout",
             Self::ProjectionTailDrain => "promoted tail -> SQLite drain",
             Self::SafeHandoff => "promoted Safe handoff",
+            Self::ResumePublication => "quiescent resume-point publication",
+            Self::ResumeReclamation => "retained-run reclamation",
             Self::Publication => "coordinator immutable publication",
             Self::TailAdmission => "coordinator tail admission",
             Self::SqliteDrain => "coordinator SQLite drain",
@@ -2415,6 +2581,192 @@ impl PromotedLocalRuntime {
             session_id: self.session_id,
             _seal: seal::Seal,
         })
+    }
+
+    /// Publish this endpoint's quiescent resume accelerator, then reclaim the
+    /// retained runs the replacement made unreachable.
+    ///
+    /// # Where this belongs in the lifecycle
+    ///
+    /// After the device-local drain/quiescence proof and immediately before the
+    /// `Unsafe -> Safe` handoff. That position is not a convention here: this
+    /// method re-runs the identical [`prove_device_local_drains`] proof the
+    /// `Safe` transition runs and reports `DrainIncomplete` if it does not hold,
+    /// so a caller cannot publish a record naming run-local roots that are still
+    /// moving. (The production `Safe` transition itself remains blocked on the
+    /// watcher-queue dependency and is deliberately not implemented here.)
+    ///
+    /// # Why it can never fail anything
+    ///
+    /// A resume point is a cache. There is no `Err` on this signature and every
+    /// failure is a [`ResumePublicationStatus`] variant, so publication cannot
+    /// be propagated with `?` into a startup, a mutation, or a handoff failure.
+    /// A benign `.DS_Store` or a Syncthing conflict copy in the endpoint's
+    /// resume-point directory legitimately makes the mint fail closed; that must
+    /// stay a diagnosable status, because pinning the endpoint at `HandoffUnsafe`
+    /// over residue would visibly block handing the graph back to OG Logseq.
+    ///
+    /// # What it may delete, and under what proof
+    ///
+    /// Only [`super::object_store::DurableEngineHistoryStore::reclaim_retained_runs_after_publication`]
+    /// deletes, it consumes the sealed `PublishedResumePoint` this call's own
+    /// successful publication minted, and it re-derives reachability from the
+    /// strict complete-set proof. A denied proof, unclassifiable residue, or a
+    /// still-leased run preserves every byte. The reclamation boundary reproves
+    /// the workspace lease first, so a runtime that lost the archive between its
+    /// publication and its maintenance pass deletes nothing.
+    ///
+    /// # Ordering
+    ///
+    /// `runtime_resume_snapshot -> mint_resume_point -> publish_resume_point ->
+    /// reclaim_retained_runs_after_publication`, explicitly, in that order. The
+    /// snapshot is the only source of run-local facts, the store is the only
+    /// source of identity facts, the enrollment evidence is derived here from
+    /// the retained authenticated session, and only a successful publication
+    /// authorizes the reclamation.
+    pub(crate) fn publish_quiescent_resume_point(
+        &mut self,
+        authority: &LocalActiveAuthority,
+        graph: &Graph,
+    ) -> ResumePublicationStatus {
+        let status = self.publish_quiescent_resume_point_inner(authority, graph);
+        self.resume_publication = Some(status.clone());
+        status
+    }
+
+    fn publish_quiescent_resume_point_inner(
+        &mut self,
+        authority: &LocalActiveAuthority,
+        graph: &Graph,
+    ) -> ResumePublicationStatus {
+        macro_rules! refuse {
+            ($refusal:expr) => {
+                return ResumePublicationStatus::NotPublished($refusal)
+            };
+        }
+        // Terminal first. A revoked runtime publishes nothing and deletes
+        // nothing, ever.
+        if let Err(refusal) = self
+            .revocation
+            .guard(WorkspaceAuthorityBoundary::ResumePublication)
+        {
+            refuse!(refusal_into_publication(refusal));
+        }
+        if authority.session_id != self.session_id
+            || authority.verification_digest != self.verification_digest
+        {
+            refuse!(ResumePublicationRefusal::Runtime(
+                "live authority is not this promoted runtime's session".to_owned()
+            ));
+        }
+        if let Err(error) = authority.authenticate_runtime(graph, &self.engine) {
+            refuse!(ResumePublicationRefusal::Runtime(error.to_string()));
+        }
+        // An ephemeral engine owns no retained run, so there is nothing a point
+        // could name. Reported, never attempted.
+        if !self.resume_open.retained() {
+            refuse!(ResumePublicationRefusal::EngineNotPublishable);
+        }
+        // The enrollment evidence the record carries is derived here, from the
+        // retained authenticated session — never handed in by a caller — and it
+        // must be exactly this session's live `Unsafe`+`Idle` record.
+        let enrollment = match self.enrollment.reauthenticate() {
+            Ok(committed) => {
+                if committed.sync() != LocalActiveSync::Idle
+                    || committed.handoff()
+                        != (LocalActiveHandoff::Unsafe {
+                            session_id: self.session_id,
+                        })
+                {
+                    refuse!(ResumePublicationRefusal::Enrollment(
+                        "committed enrollment record is not this session's Unsafe+Idle record"
+                            .to_owned()
+                    ));
+                }
+                ResumePointEnrollment {
+                    generation: committed.generation(),
+                    head: committed.enrollment_head(),
+                    unsafe_session_id: self.session_id,
+                }
+            }
+            Err(error) => refuse!(ResumePublicationRefusal::Enrollment(error.to_string())),
+        };
+        // Quiescence: the identical device-local drain proof the `Safe` handoff
+        // runs. A moving engine must not have its run-local roots recorded.
+        if let Err(error) =
+            prove_device_local_drains(&self.engine, self.projection.database(), &self.tail)
+        {
+            refuse!(ResumePublicationRefusal::DrainIncomplete(error.to_string()));
+        }
+        // Authority boundary, immediately before the snapshot and the archive
+        // mutation it leads to.
+        let projection = &self.projection;
+        if let Err(refusal) = self
+            .revocation
+            .reprove_with(WorkspaceAuthorityBoundary::ResumePublication, || {
+                projection.revalidate_workspace_lease_identity()
+            })
+        {
+            refuse!(refusal_into_publication(refusal));
+        }
+        let snapshot = match self.engine.runtime_resume_snapshot() {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => refuse!(ResumePublicationRefusal::EngineNotPublishable),
+            Err(error) => refuse!(ResumePublicationRefusal::Engine(error.to_string())),
+        };
+        let Some(archive) = self.engine.archive_store() else {
+            refuse!(ResumePublicationRefusal::EngineNotPublishable);
+        };
+        // The durable history control is sealed over a duplicate of the engine's
+        // own retained archive capability, so no pathname is re-resolved after
+        // the lease.
+        let (_history_capability, history) =
+            match open_retained_history_control(archive, &self.state) {
+                Ok(opened) => opened,
+                Err(error) => refuse!(ResumePublicationRefusal::Store(error.to_string())),
+            };
+        let point = match history.mint_resume_point(&snapshot, enrollment) {
+            Ok(point) => point,
+            Err(error) => refuse!(ResumePublicationRefusal::Store(error.to_string())),
+        };
+        let published = match history.publish_resume_point(&point) {
+            Ok(published) => published,
+            Err(error) => refuse!(ResumePublicationRefusal::Store(error.to_string())),
+        };
+        let resume_sequence = published.resume_sequence();
+        // ---- Past the commit point. Nothing below may report "not published".
+        //
+        // Reclamation is the only deletion boundary in this module, so it gets
+        // its own lease reproof: a runtime that lost the archive between its
+        // publication and its maintenance pass must delete nothing.
+        #[cfg(test)]
+        resume_lifecycle_cut_reached(ResumeLifecycleCut::BeforeReclamation);
+        if self
+            .revocation
+            .reprove_with(WorkspaceAuthorityBoundary::ResumeReclamation, || {
+                projection.revalidate_workspace_lease_identity()
+            })
+            .is_err()
+        {
+            return ResumePublicationStatus::Published {
+                resume_sequence,
+                maintenance: None,
+            };
+        }
+        ResumePublicationStatus::Published {
+            resume_sequence,
+            maintenance: Some(history.reclaim_retained_runs_after_publication(&published)),
+        }
+    }
+
+    /// What this open decided about the resume accelerator.
+    pub(crate) const fn resume_open_status(&self) -> &RuntimeResumeOpenStatus {
+        &self.resume_open
+    }
+
+    /// The last quiescent publication attempt's status, if one has run.
+    pub(crate) const fn resume_publication_status(&self) -> Option<&ResumePublicationStatus> {
+        self.resume_publication.as_ref()
     }
 
     /// The same admission with the bounded fast path selectively disabled.
@@ -3087,6 +3439,53 @@ fn fail_after_promoted_database_open() -> bool {
     }
 }
 
+/// The two resume-lifecycle boundaries a deterministic fault has to reach from
+/// outside, because neither is a durability cut any existing hook covers: the
+/// instant after this open took the workspace lease and before it reads a
+/// published candidate, and the instant after a publication committed and
+/// before the reclamation pass it authorized.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ResumeLifecycleCut {
+    BeforeCandidateRead,
+    BeforeReclamation,
+}
+
+#[cfg(test)]
+thread_local! {
+    static RESUME_LIFECYCLE_CUT: std::cell::RefCell<Option<(ResumeLifecycleCut, Box<dyn FnOnce()>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `action` exactly once, the next time `cut` is reached. Per-thread, armed
+/// explicitly, and self-clearing when it fires.
+#[cfg(test)]
+pub(crate) fn act_once_at_resume_lifecycle_cut_for_test(
+    cut: ResumeLifecycleCut,
+    action: Box<dyn FnOnce()>,
+) {
+    RESUME_LIFECYCLE_CUT.with(|slot| *slot.borrow_mut() = Some((cut, action)));
+}
+
+#[cfg(test)]
+pub(crate) fn clear_resume_lifecycle_cut_for_test() {
+    RESUME_LIFECYCLE_CUT.with(|slot| *slot.borrow_mut() = None);
+}
+
+#[cfg(test)]
+fn resume_lifecycle_cut_reached(cut: ResumeLifecycleCut) {
+    let armed = RESUME_LIFECYCLE_CUT.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        match slot.as_ref() {
+            Some((armed, _)) if *armed == cut => slot.take().map(|(_, action)| action),
+            _ => None,
+        }
+    });
+    if let Some(action) = armed {
+        action();
+    }
+}
+
 fn takeover_predecessor_observed() {
     #[cfg(test)]
     TAKEOVER_PREDECESSOR_OBSERVED.with(|slot| {
@@ -3493,19 +3892,93 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
         &archive, &state
     ));
 
+    // ---- Resume accelerator selection, under the retained workspace lease. ----
+    //
+    // Authority boundary. A published resume point names a retained scratch run
+    // this open is about to take an exclusive lease on and reuse bytes from, so
+    // the archive-rooted workspace lease must still name its own lease file
+    // *before* the candidate is read, let alone trusted. A replacement here
+    // fails the whole open closed: the lease is the one-applier proof, and this
+    // runtime does not exist yet, so there is nothing to latch and nothing has
+    // been written.
+    #[cfg(test)]
+    resume_lifecycle_cut_reached(ResumeLifecycleCut::BeforeCandidateRead);
+    try_release!(workspace_lease.revalidate_identity());
+    // Both reads go through a duplicate of the *retained* archive capability —
+    // never a re-resolved pathname — so the same physical directory the lease
+    // was proved against is the one that answers.
+    let (retention_plan, candidate) = {
+        let (_history_capability, history) =
+            try_release!(open_retained_history_control(&archive, &state));
+        // The retention decision comes first and is unconditional: it is what
+        // stops an unprovable resume-point directory from authorizing one more
+        // permanently uncollectable retained run per restart.
+        let plan = history.plan_engine_scratch_retention();
+        // A caller cannot hand-build the enrollment evidence: it is derived here
+        // from the retained authenticated session's committed record.
+        let candidate = match plan {
+            EngineScratchRetentionPlan::Ephemeral { .. } => None,
+            EngineScratchRetentionPlan::Retained { .. } => Some(
+                history.read_resume_adoption_candidate(resume_enrollment_admission(
+                    enrollment.committed(),
+                    session_id,
+                )),
+            ),
+        };
+        (plan, candidate)
+    };
+
     // Recovery replays the archive's committed manifests. This is the existing
     // enrolled-recovery cost and reads no graph text.
     let committed_manifests = try_release!(archive.committed_manifests());
     let anchor = state.anchor_authority();
-    let (engine, _outcomes) = try_release!(ShardedHotEngine::open_promoted_projection(
-        archive,
-        state.lineage_digest,
-        state.catalog_document_id,
-        open.graph,
-        open.receipts,
-        &state,
-        &committed_manifests,
-    ));
+    // Strict selection with an unconditional fallback: only an `Available`
+    // candidate is offered, and every other shape — never published, proof
+    // denied by residue or surplus, torn, stale, conflicted, binding-refused —
+    // opens exactly as a fresh full replay would, without failing startup and
+    // without changing one candidate byte. An `Ephemeral` plan takes a
+    // disposable run, so no second retained run is created at all.
+    //
+    // The retention choice is carried *into* the one construction path rather
+    // than selected between two sibling entry points here: this function is
+    // deliberately one stack frame (see above), and a second engine-sized
+    // result slot in it overflows a debug test thread's stack.
+    let (snapshot, unavailable) = match (&retention_plan, candidate) {
+        (EngineScratchRetentionPlan::Ephemeral { reason, .. }, _) => (
+            None,
+            Some(ResumeAcceleratorUnavailable::ProofDenied(reason.clone())),
+        ),
+        (_, Some(ResumeAdoptionCandidate::Available(snapshot))) => (Some(snapshot), None),
+        (_, Some(ResumeAdoptionCandidate::Unavailable(reason))) => (None, Some(reason)),
+        (_, None) => (
+            None,
+            Some(ResumeAcceleratorUnavailable::Unavailable(
+                "no adoption candidate was read for this open".to_owned(),
+            )),
+        ),
+    };
+    let retention = match retention_plan {
+        EngineScratchRetentionPlan::Ephemeral { .. } => EngineOpenRetention::Ephemeral,
+        EngineScratchRetentionPlan::Retained { .. } => EngineOpenRetention::Retained {
+            resume: snapshot.as_deref(),
+        },
+    };
+    let (engine, _receipt, _outcomes) =
+        try_release!(ShardedHotEngine::open_enrolled_projection_with_retention(
+            archive,
+            state.lineage_digest,
+            state.catalog_document_id,
+            open.graph,
+            open.receipts,
+            Some(&state),
+            &committed_manifests,
+            retention,
+        ));
+    let resume_open = RuntimeResumeOpenStatus {
+        plan: retention_plan,
+        unavailable,
+        observation: engine.runtime_resume_observation(),
+    };
     if engine.promoted_lineage() != Some(&state) {
         release!(RuntimePromotionError::Anchor(
             "promoted engine did not adopt the exact durable promotion state",
@@ -3660,8 +4133,48 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
         // A freshly minted runtime has just proved the lease it holds, so it
         // starts un-revoked. Nothing ever puts it back here.
         revocation: RuntimeRevocationLatch::default(),
+        resume_open,
+        resume_publication: None,
         _seal: seal::Seal,
     })
+}
+
+/// Which admission a resuming open may offer a published point, derived from
+/// the enrollment record this process authenticated.
+///
+/// It is deliberately a function of the *committed* record rather than of the
+/// recovery classification, because the record is what any adoptable point was
+/// published under:
+///
+/// * `Unsafe { session }` — the ordinary same-session reopen *and* the crash
+///   takeover. In both cases the live durable record is exactly the record the
+///   publishing session held, because the takeover's compare-and-swap has not
+///   run yet at this point in the open. So the strictest arm is the correct
+///   one, and a point that names anything else is refused;
+/// * `Safe` — a clean handoff. The `Unsafe -> Safe` drain clears this
+///   endpoint's recognized points *before* the record moves, so a survivor is
+///   residue-preserved evidence from a strictly earlier generation. It is
+///   admitted only as superseded: it must predate the live record and may claim
+///   neither the live head nor the session this open is about to take.
+///
+/// Both possible mis-derivations fail toward a full replay, never toward
+/// authority: a point that cannot re-prove the arm it is offered is simply not
+/// offered to the engine.
+fn resume_enrollment_admission(
+    committed: &CommittedLocalActive,
+    session_id: SessionId,
+) -> ResumeEnrollmentAdmission {
+    let live = |unsafe_session_id| ResumePointEnrollment {
+        generation: committed.generation(),
+        head: committed.enrollment_head(),
+        unsafe_session_id,
+    };
+    match committed.handoff() {
+        LocalActiveHandoff::Unsafe {
+            session_id: committed_session,
+        } => ResumeEnrollmentAdmission::SameSession(live(committed_session)),
+        LocalActiveHandoff::Safe => ResumeEnrollmentAdmission::SupersededBy(live(session_id)),
+    }
 }
 
 /// The device-local inactive-bootstrap projection a local activation runs on,
@@ -4242,6 +4755,7 @@ mod bounded_admission {
         let root = fixture.enrollment_root("bounded");
         let paths = PromotedPaths::new(&fixture, "bounded");
         let (mut authority, mut runtime) = promote(&mut fixture, &root, SessionId::new(), &paths);
+        let resume_at_open = runtime.resume_open_status().clone();
 
         let bounded = |count: usize| PromotedRuntimeInstrumentation {
             enrollment: super::super::enrollment::EnrollmentInstrumentation {
@@ -4308,6 +4822,11 @@ mod bounded_admission {
             full.enrollment.lease_acquisitions, 0,
             "even the unabridged proof runs on the retained lease"
         );
+        // The retained-resume lifecycle is not on this path at any admission
+        // count: the open's observation is never re-derived and no admission
+        // has ever attempted a publication.
+        assert_eq!(runtime.resume_open_status(), &resume_at_open);
+        assert_eq!(runtime.resume_publication_status(), None);
         fixture.assert_graph_unchanged();
     }
 

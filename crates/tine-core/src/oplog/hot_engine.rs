@@ -3673,6 +3673,24 @@ impl RunLocalCatalogHotState {
     }
 }
 
+/// Which scratch run one enrolled open runs on.
+///
+/// The choice is the caller's because it is a *lifecycle* decision, not an
+/// engine one: only the lifecycle can see whether another retained run could
+/// later be proved unreachable, and an engine that mints one it can never
+/// collect is a permanent archive leak.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum EngineOpenRetention<'a> {
+    /// A disposable run and a full replay. Nothing is retained, so this engine
+    /// can neither be resumed from nor publish a resume point.
+    Ephemeral,
+    /// A retained run, resuming from `resume` when every authority that
+    /// snapshot records still holds. `None` is a fresh retained run.
+    Retained {
+        resume: Option<&'a RuntimeResumeSnapshot>,
+    },
+}
+
 /// What one resuming open actually did, including why it refused.
 ///
 /// A refusal is never an error: adoption is a pure accelerator, so the only
@@ -4241,31 +4259,72 @@ impl ShardedHotEngine {
         committed_manifests: &[OperationBatch],
         resume: Option<&RuntimeResumeSnapshot>,
     ) -> Result<(Self, RuntimeResumeReceipt, Vec<StageOutcome>), EngineError> {
+        Self::open_enrolled_projection_with_retention(
+            store,
+            lineage_digest,
+            catalog_document_id,
+            graph,
+            receipts,
+            promotion,
+            committed_manifests,
+            EngineOpenRetention::Retained { resume },
+        )
+    }
+
+    /// The same open, with the retention decision made by the caller.
+    ///
+    /// This exists because the lifecycle open has to choose between a retained
+    /// and an ephemeral run *from one call site*. Selecting between the two
+    /// sibling entry points at the caller materialises a second engine-sized
+    /// result slot in the caller's frame, and `mint_promoted_runtime` is
+    /// deliberately a single-frame function for exactly that reason (a debug
+    /// build overflows the test thread's stack). Carrying the choice into the
+    /// one construction path keeps the caller at exactly one engine value.
+    ///
+    /// [`EngineOpenRetention::Ephemeral`] is byte-for-byte the pre-adoption
+    /// behaviour: a disposable run and a full replay, with `resume` unreachable
+    /// by construction. It is what an open takes when retaining another run
+    /// would grow a population nothing can later prove unreachable.
+    pub(crate) fn open_enrolled_projection_with_retention(
+        store: ObjectStore,
+        lineage_digest: LineageDigest,
+        catalog_document_id: DocumentId,
+        graph: &Graph,
+        receipts: &ProjectionReceiptStore,
+        promotion: Option<&super::object_store::PromotedRuntimeStateV1>,
+        committed_manifests: &[OperationBatch],
+        retention: EngineOpenRetention<'_>,
+    ) -> Result<(Self, RuntimeResumeReceipt, Vec<StageOutcome>), EngineError> {
         // Stage one: try to take the named run, on the still-borrowed archive
         // capability, before anything is moved into an engine. A refusal here
         // is a plain fallback, so the fresh run is minted from the same
         // capability and the candidate's bytes are never opened for writing.
-        let (retained, adopted, mut refused_run_id, mut refusal) = match resume {
-            Some(snapshot) => {
-                match store.adopt_retained_engine_scratch(
-                    snapshot.scratch_run_id,
-                    snapshot.scratch_binding_digest,
-                ) {
-                    Ok(retained) => (retained, Some(snapshot), None, None),
-                    Err(error) => (
+        let (retained, adopted, mut refused_run_id, mut refusal) = match retention {
+            EngineOpenRetention::Ephemeral => (None, None, None, None),
+            EngineOpenRetention::Retained {
+                resume: Some(snapshot),
+            } => match store.adopt_retained_engine_scratch(
+                snapshot.scratch_run_id,
+                snapshot.scratch_binding_digest,
+            ) {
+                Ok(retained) => (Some(retained), Some(snapshot), None, None),
+                Err(error) => (
+                    Some(
                         store
                             .create_retained_engine_scratch()
                             .map_err(|error| EngineError::Archive(error.to_string()))?,
-                        None,
-                        Some(snapshot.scratch_run_id),
-                        Some(EngineError::Archive(error.to_string())),
                     ),
-                }
-            }
-            None => (
-                store
-                    .create_retained_engine_scratch()
-                    .map_err(|error| EngineError::Archive(error.to_string()))?,
+                    None,
+                    Some(snapshot.scratch_run_id),
+                    Some(EngineError::Archive(error.to_string())),
+                ),
+            },
+            EngineOpenRetention::Retained { resume: None } => (
+                Some(
+                    store
+                        .create_retained_engine_scratch()
+                        .map_err(|error| EngineError::Archive(error.to_string()))?,
+                ),
                 None,
                 None,
                 None,
@@ -4278,7 +4337,7 @@ impl ShardedHotEngine {
             graph,
             receipts,
             promotion,
-            Some(retained),
+            retained,
         );
         // An archive-boundary refusal — absent, leased, ephemeral or foreign
         // marker, torn entry set, binding mismatch — is a refusal exactly like a
