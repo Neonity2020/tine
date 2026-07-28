@@ -3503,6 +3503,24 @@ fn accepted_frontier_cross_run_facts(
     )
 }
 
+/// The run-local state one adopted run supplies, read back out of that run and
+/// proved against the snapshot's recorded roots before anything is installed.
+///
+/// Both members are run-local, are deliberately **not** carried by
+/// [`RuntimeResumeSnapshot`], and are re-derived from the adopted run's own
+/// authenticated visible document lane. `catalog_checkpoint_binding` is what
+/// binds that derivation to the recorded roots.
+struct AdoptedRunLocalState {
+    /// The catalog document's authenticated direct heads. Load-bearing for the
+    /// durable catalog-checkpoint binding of every later accepted batch.
+    catalog_heads: BTreeSet<BatchId>,
+    /// The catalog document itself, which a full replay would have staged into
+    /// hot state and which the projection and authoring paths resolve out of
+    /// hot state with no lazy load. `None` only when the run's visible lane has
+    /// no catalog checkpoint at all.
+    catalog_document: Option<LoroDoc>,
+}
+
 /// What one resuming open actually did, including why it refused.
 ///
 /// A refusal is never an error: adoption is a pure accelerator, so the only
@@ -4968,9 +4986,26 @@ impl ShardedHotEngine {
     ///   authorize state;
     /// * the two scratch document lanes and the catalog document's direct heads
     ///   must reproduce the recorded catalog checkpoint binding;
-    /// * every remaining root is read through its own authenticated reader
-    ///   against the adopted run, so a truncated or tampered `pages.index`
-    ///   fails here rather than at some later hot read.
+    /// * a bounded, constant-count set of the remaining roots is read through
+    ///   its own authenticated reader against the adopted run
+    ///   ([`Self::probe_adopted_run_local_roots`] documents exactly which), so a
+    ///   truncated or tampered `pages.index` fails here rather than at some
+    ///   later hot read.
+    ///
+    /// **Hot state, not only roots.** Restoring the roots is not sufficient. A
+    /// full replay leaves the catalog document resident in `visible_documents`,
+    /// and `materialize_page_inner`, `canonical_snapshot` and
+    /// `resolve_logseq_uuid_current` resolve it out of hot state with no lazy
+    /// load; an adopted replay stages only the tail, and an ordinary
+    /// content-edit tail never touches the catalog. So the catalog document is
+    /// restored here too, from the adopted run's own authenticated visible
+    /// document lane — the same bytes and the same reader ordinary hot reads
+    /// use. Every other hot member is either reloaded from the run on demand
+    /// (`clone_visible_document`, `document_dependency_heads`) or provably
+    /// empty while a scratch run is attached (`accepted_frontier`,
+    /// `accepted_sequence`, every `ephemeral_*` map), so the catalog document is
+    /// the whole gap between an adopted engine and the engine a full replay
+    /// produces.
     fn restore_adopted_predecessor_state(
         &mut self,
         snapshot: &RuntimeResumeSnapshot,
@@ -5108,7 +5143,9 @@ impl ShardedHotEngine {
         // 4. Read the run-local roots back out of the adopted run. This is the
         //    step a truncated or tampered `pages.index` cannot survive: every
         //    read below is digest- and kind-checked against the recorded root.
-        let catalog_heads = self.probe_adopted_run_local_roots(snapshot, &record)?;
+        //    It also returns the run-local hot state the restore installs, so
+        //    that state is read under exactly the same all-or-nothing proof.
+        let run_local = self.probe_adopted_run_local_roots(snapshot, &record)?;
 
         // 5. Everything is proved. Install.
         self.page_name_root = record.page_names.ownership_root.clone();
@@ -5126,30 +5163,62 @@ impl ShardedHotEngine {
             available: snapshot.current_path_catalog_available,
             accepted_frontier_root: snapshot.current_path_catalog_frontier.clone(),
         };
-        if !catalog_heads.is_empty() {
+        if !run_local.catalog_heads.is_empty() {
             self.visible_document_heads
-                .insert(self.catalog_document_id, catalog_heads);
+                .insert(self.catalog_document_id, run_local.catalog_heads);
+        }
+        // The hot catalog document a full replay would have staged. Without it
+        // every projection read of an adopted engine returns `PageNotFound`,
+        // `canonical_snapshot` silently returns an empty graph, and the first
+        // local authoring round is diverted into external reconciliation
+        // against a `None` semantic pre-state.
+        if let Some(catalog) = run_local.catalog_document {
+            self.visible_documents
+                .insert(self.catalog_document_id, catalog);
         }
         self.replay_base_generation = snapshot.history_generation;
         self.resume_observation.adopted = true;
         Ok(())
     }
 
-    /// Read every recorded run-local root back out of the adopted run and prove
-    /// it reproduces the predecessor record's durable bindings.
-    ///
-    /// Returns the catalog document's authenticated direct heads, which are
-    /// run-local, are not carried by the snapshot, and are load-bearing for the
-    /// durable catalog-checkpoint binding of every later accepted batch.
+    /// Read the adopted run through a **bounded, constant-count** set of its
+    /// recorded roots, prove each reproduces the predecessor record's durable
+    /// bindings, and return the run-local hot state the restore installs.
     ///
     /// This deliberately reads through the *recorded* roots rather than the
     /// engine's current (baseline-empty) ones, so it exercises exactly the bytes
     /// adoption is about to trust.
+    ///
+    /// **Exactly what is read, and what is not.** This is a fixed number of
+    /// authenticated point reads — it is deliberately *not* a scan, so its cost
+    /// does not grow with the graph or with the run's history:
+    ///
+    /// * the two external document lanes, through
+    ///   `document_state::load_external_current` for the catalog document, whose
+    ///   record is then anchor-validated against the immutable archive exactly
+    ///   as an ordinary hot read would;
+    /// * `accepted_batch_map_root` — cardinality only;
+    /// * `batch_status_root`, through `dependency_queue::lookup` of the
+    ///   predecessor batch;
+    /// * `accepted_sequence_root`, at the recorded frontier;
+    /// * `current_path_catalog_root`, through one authenticated trie lookup;
+    /// * `block_claim_root`, through one authenticated multi-key lookup.
+    ///
+    /// The remaining members of [`ScratchRoots`] — `document_current_root`,
+    /// `document_state_root`, `document_after_batch_root`, `blob_dedup_root`,
+    /// `conflict_root`, the accepted-frontier LSM root and the remaining point
+    /// roots — are installed **unread**. That is deliberate and it is safe
+    /// rather than complete: every later read of those roots is digest- and
+    /// kind-checked against the root it was reached through, so damage there
+    /// still fails closed; it simply surfaces during a user operation rather
+    /// than at adoption, where the consequence is a refusal into a full replay.
+    /// Widening this into a scan of every root would make startup cost grow with
+    /// the graph, which is exactly what adoption exists to avoid.
     fn probe_adopted_run_local_roots(
         &self,
         snapshot: &RuntimeResumeSnapshot,
         record: &ColdHistoryRecord,
-    ) -> Result<BTreeSet<BatchId>, EngineError> {
+    ) -> Result<AdoptedRunLocalState, EngineError> {
         let scratch = self.scratch.as_ref().ok_or_else(|| {
             EngineError::Archive("runtime resume restore requires a run-local scratch".into())
         })?;
@@ -5172,9 +5241,15 @@ impl ShardedHotEngine {
                 "adopted accepted batch map does not carry the recorded acceptance sequence".into(),
             ));
         }
-        // The catalog document's own authenticated state record. A zeroed or
-        // rewritten `pages.index` fails here first.
-        let catalog_heads = match super::document_state::load_external_current(
+        // The catalog document's own authenticated state record, and the
+        // document it addresses. A zeroed or rewritten `pages.index` fails here
+        // first.
+        //
+        // The decoded document is kept, not discarded: it is the run-local hot
+        // state a full replay would have staged, and reading it here is what
+        // lets the restore stay all-or-nothing — the install happens only after
+        // every proof below has succeeded.
+        let (catalog_heads, catalog_document) = match super::document_state::load_external_current(
             scratch,
             &snapshot.scratch_roots,
             super::document_state::DocumentLane::Visible,
@@ -5182,8 +5257,20 @@ impl ShardedHotEngine {
         )
         .map_err(|error| EngineError::Archive(error.to_string()))?
         {
-            Some((state, _, _)) => state.exact_direct_heads().iter().copied().collect(),
-            None => BTreeSet::new(),
+            Some((state, document, state_work)) => {
+                self.record_document_state_work(state_work);
+                // Exactly the authentication an ordinary hot read of this lane
+                // performs: the checkpoint's latest update must be the object
+                // the immutable archive published for its source batch.
+                self.validate_external_record_anchor(self.catalog_document_id, &state)?;
+                let document = document.into_document();
+                document.set_peer_id(1).map_err(loro_error)?;
+                (
+                    state.exact_direct_heads().iter().copied().collect(),
+                    Some(document),
+                )
+            }
+            None => (BTreeSet::new(), None),
         };
         // The snapshot's own catalog checkpoint binding commits the two external
         // document lanes together with these heads, so reproducing it is one
@@ -5257,7 +5344,10 @@ impl ShardedHotEngine {
             })?
             .lookup_many(snapshot.block_claim_root, &[[0_u8; 16]])
             .map_err(|error| EngineError::Archive(error.to_string()))?;
-        Ok(catalog_heads)
+        Ok(AdoptedRunLocalState {
+            catalog_heads,
+            catalog_document,
+        })
     }
 
     /// Rebuild every run-local derived structure from the retained
@@ -22072,12 +22162,17 @@ mod validation_tests {
         }
     }
 
-    /// The engine facts two runs that reached the same accepted closure must
-    /// agree on. Deliberately excludes every run-local member: two scratch runs
-    /// legitimately disagree about page offsets and retained byte totals.
-    fn cross_run_engine_facts(
-        engine: &ShardedHotEngine,
-    ) -> (
+    type AcceptedFrontierCrossRunFacts = (
+        u64,
+        u64,
+        Option<[u8; 16]>,
+        ContentDigest,
+        Option<[u8; 16]>,
+        ContentDigest,
+        ReferenceCatalogRootV2,
+    );
+
+    type CrossRunEngineFacts = (
         u64,
         ContentDigest,
         u64,
@@ -22085,16 +22180,18 @@ mod validation_tests {
         ContentDigest,
         ContentDigest,
         ReferenceCatalogRootV2,
-        (
-            u64,
-            u64,
-            Option<[u8; 16]>,
-            ContentDigest,
-            Option<[u8; 16]>,
-            ContentDigest,
-            ReferenceCatalogRootV2,
-        ),
-    ) {
+        AcceptedFrontierCrossRunFacts,
+    );
+
+    /// The engine facts two runs that reached the same accepted closure must
+    /// agree on. Deliberately excludes every run-local member: two scratch runs
+    /// legitimately disagree about page offsets and retained byte totals.
+    ///
+    /// This is an authenticated-root comparison and nothing more. It is
+    /// necessary but **not** sufficient for engine equivalence: run-local hot
+    /// state can be missing with every root here equal. Pair it with
+    /// [`projection_observation_boundary`] wherever equivalence is the claim.
+    fn cross_run_engine_facts(engine: &ShardedHotEngine) -> CrossRunEngineFacts {
         let frontier = accepted_frontier_cross_run_facts(&engine.accepted_frontier_root);
         (
             engine.history_generation,
@@ -22131,6 +22228,249 @@ mod validation_tests {
                 )
             })
             .collect()
+    }
+
+    /// Every fixture page's complete projection state, with only the physical
+    /// read counters normalised away.
+    ///
+    /// Those two counters measure archive cache warmth, which two runs that
+    /// reached the same accepted closure legitimately disagree about. Everything
+    /// else — page identity, home shard, name, path, kind, preamble, the ordered
+    /// block list with its content and Logseq identity, the projection frontier
+    /// and the claim evidence — is semantic and must be identical.
+    fn projection_page_states(
+        engine: &ShardedHotEngine,
+        pages: &[PageId],
+    ) -> Vec<ProjectionPageState> {
+        pages
+            .iter()
+            .map(|page_id| {
+                let mut state = engine
+                    .materialize_page_for_projection(*page_id)
+                    .unwrap_or_else(|error| {
+                        panic!("page {page_id} must materialize for projection: {error:?}")
+                    });
+                state.page.stats.physical_manifest_reads = 0;
+                state.page.stats.physical_object_reads = 0;
+                state
+            })
+            .collect()
+    }
+
+    /// The complete observation-boundary state of one engine: the authenticated
+    /// cross-run roots *and* what a projector and a canonical-snapshot reader
+    /// actually see.
+    ///
+    /// The roots alone are not an equivalence oracle. Run-local hot state that
+    /// adoption fails to reconstitute leaves every root equal while every page
+    /// stops materializing, so an equivalence gate that stops at the roots
+    /// cannot observe the thing adoption exists to reconstitute.
+    fn projection_observation_boundary(
+        engine: &ShardedHotEngine,
+        pages: &[PageId],
+    ) -> (
+        CrossRunEngineFacts,
+        Vec<ProjectionPageState>,
+        crate::oplog::CanonicalSnapshot,
+    ) {
+        (
+            cross_run_engine_facts(engine),
+            projection_page_states(engine, pages),
+            engine
+                .canonical_snapshot()
+                .expect("an operational engine must produce a canonical snapshot"),
+        )
+    }
+
+    fn fixture_page_ids(fixture: &PreauthorGateFixture) -> Vec<PageId> {
+        fixture.pages.iter().map(|(page_id, ..)| *page_id).collect()
+    }
+
+    /// After an adopted restart every page of the graph must materialize, and
+    /// must materialize to exactly what a full replay of the same history
+    /// produces.
+    ///
+    /// This is the assertion `cross_run_engine_facts` structurally cannot make.
+    /// Restoring the adopted run's durable-derived and run-local *roots* without
+    /// restoring the run-local hot state those roots address leaves every root
+    /// equal and every projection read broken, because `materialize_page_inner`
+    /// resolves the catalog document out of hot state and has no lazy load for
+    /// it. Removing the restored catalog document from
+    /// `restore_adopted_predecessor_state` reds this on `PageNotFound` for the
+    /// first page and on an empty canonical snapshot.
+    #[test]
+    fn an_adopted_restart_projects_every_page_exactly_as_a_full_replay() {
+        let mut fixture = preauthor_gate_fixture_with_retention(707_000, true);
+        for round in 0..3u128 {
+            fixture.author_accepted_round(707_100 + round * 100, &format!("project {round}"));
+        }
+        let snapshot = fixture
+            .engine
+            .runtime_resume_snapshot()
+            .unwrap()
+            .expect("a quiescent retained enrolled engine is publishable");
+        // An ordinary tail: content edits only. This is the shape that never
+        // touches the catalog document, so nothing in the tail replay can
+        // accidentally rehydrate what adoption failed to restore.
+        for round in 0..2u128 {
+            fixture.author_accepted_round(707_500 + round * 100, &format!("project tail {round}"));
+        }
+        let pages = fixture_page_ids(&fixture);
+
+        let control = fixture.reopen_resuming(None);
+        assert!(!control.observation.adopted);
+        let (control_facts, control_pages, control_snapshot) =
+            projection_observation_boundary(&fixture.engine, &pages);
+        assert_eq!(
+            control_snapshot.pages.len(),
+            pages.len(),
+            "the control must actually see the whole graph"
+        );
+
+        let resumed = fixture.reopen_resuming(Some(&snapshot));
+        assert!(resumed.observation.adopted, "{:?}", resumed.refusal);
+        assert!(
+            resumed.observation.replayed_generations < resumed.observation.live_history_generation,
+            "the adopted restart must have skipped durable records, or this proves nothing"
+        );
+        let (adopted_facts, adopted_pages, adopted_snapshot) =
+            projection_observation_boundary(&fixture.engine, &pages);
+        assert_eq!(adopted_facts, control_facts);
+        assert_eq!(
+            adopted_pages, control_pages,
+            "every page must project after an adopted restart exactly as the full-replay control does"
+        );
+        assert_eq!(
+            adopted_snapshot, control_snapshot,
+            "an adopted restart must observe the same canonical semantic snapshot"
+        );
+
+        finish_preauthor_gate_fixture(fixture);
+    }
+
+    /// The first ordinary local authoring round after an adopted restart must be
+    /// `Captured`, and the work it accepts must reproduce under a later full
+    /// replay.
+    ///
+    /// This is the user-visible half of the same defect and it is *not*
+    /// fail-closed: `draft_author_transaction` swallows `PageNotFound` into a
+    /// `None` semantic pre-state, so a missing catalog document silently diverts
+    /// the user's first post-restart edit into external reconciliation instead
+    /// of refusing. `author_accepted_round` panics on
+    /// `LocalAuthorCapture::ReconciliationNeeded`, so that divergence is the
+    /// failure this test reports.
+    #[test]
+    fn an_authored_round_after_an_adopted_restart_is_captured_and_replays() {
+        let mut fixture = preauthor_gate_fixture_with_retention(708_000, true);
+        for round in 0..3u128 {
+            fixture.author_accepted_round(708_100 + round * 100, &format!("author {round}"));
+        }
+        let snapshot = fixture
+            .engine
+            .runtime_resume_snapshot()
+            .unwrap()
+            .expect("a quiescent retained enrolled engine is publishable");
+        for round in 0..2u128 {
+            fixture.author_accepted_round(708_500 + round * 100, &format!("author tail {round}"));
+        }
+        let pages = fixture_page_ids(&fixture);
+
+        let resumed = fixture.reopen_resuming(Some(&snapshot));
+        assert!(resumed.observation.adopted, "{:?}", resumed.refusal);
+        let live_before = resumed.observation.live_history_generation;
+
+        // The ordinary first round after the restart. Nothing external touched
+        // the graph, so this is the plain authoring path, not reconciliation.
+        let authored = fixture.author_accepted_round(708_700, "after adoption");
+        assert_eq!(
+            fixture.engine.history_generation,
+            live_before + 1,
+            "the post-adoption round must have advanced durable history"
+        );
+        assert!(fixture
+            .writer
+            .committed_manifests()
+            .unwrap()
+            .iter()
+            .any(|manifest| manifest.batch_id() == authored));
+        let after_adoption = projection_observation_boundary(&fixture.engine, &pages);
+
+        // A later full replay of the complete history — including the round
+        // authored on top of the adopted state — must reproduce it exactly.
+        let replay = fixture.reopen_resuming(None);
+        assert!(!replay.observation.adopted);
+        assert_eq!(
+            replay.observation.replayed_generations, replay.observation.live_history_generation,
+            "the control must be a complete replay"
+        );
+        assert_eq!(
+            projection_observation_boundary(&fixture.engine, &pages),
+            after_adoption,
+            "work authored after an adopted restart must reproduce under a full replay"
+        );
+
+        finish_preauthor_gate_fixture(fixture);
+    }
+
+    /// Repeated crash/adopt cycles on one retained run stay semantically
+    /// equivalent to a single full replay of everything they accepted.
+    ///
+    /// A retained run deliberately survives restarts, so adoption compounds:
+    /// each cycle adopts state that a previous adoption installed. This is the
+    /// path where a hot-state omission that a lucky tail masked once would
+    /// accumulate.
+    #[test]
+    fn chained_crash_and_adopt_cycles_stay_semantically_equivalent() {
+        let mut fixture = preauthor_gate_fixture_with_retention(709_000, true);
+        fixture.author_accepted_round(709_100, "chain seed");
+        let pages = fixture_page_ids(&fixture);
+        let run = fixture
+            .engine
+            .retained_scratch_run_id()
+            .expect("a retained enrolled engine owns a run");
+
+        for cycle in 0..3u128 {
+            let snapshot = fixture
+                .engine
+                .runtime_resume_snapshot()
+                .unwrap()
+                .unwrap_or_else(|| panic!("cycle {cycle}: a quiescent engine is publishable"));
+            let receipt = fixture.reopen_resuming(Some(&snapshot));
+            assert!(
+                receipt.observation.adopted,
+                "cycle {cycle}: {:?}",
+                receipt.refusal
+            );
+            assert_eq!(
+                receipt.engine_run_id, run,
+                "cycle {cycle}: chained adoption must stay on the same retained run"
+            );
+            assert_eq!(
+                receipt.observation.replayed_generations, 0,
+                "cycle {cycle}: adopting an up-to-date snapshot leaves no durable tail"
+            );
+            // Every cycle both reads and writes through the adopted state.
+            assert_eq!(
+                projection_page_states(&fixture.engine, &pages).len(),
+                pages.len()
+            );
+            fixture.author_accepted_round(709_200 + cycle * 100, &format!("chain {cycle}"));
+        }
+        let chained = projection_observation_boundary(&fixture.engine, &pages);
+
+        let replay = fixture.reopen_resuming(None);
+        assert!(!replay.observation.adopted);
+        assert_eq!(
+            replay.observation.replayed_generations,
+            replay.observation.live_history_generation
+        );
+        assert_eq!(
+            projection_observation_boundary(&fixture.engine, &pages),
+            chained,
+            "chained crash/adopt cycles must be equivalent to one full replay"
+        );
+
+        finish_preauthor_gate_fixture(fixture);
     }
 
     /// The flagship causal proof: an adopted restart replays only the durable
@@ -22178,7 +22518,8 @@ mod validation_tests {
             "a full replay must cover every durable record"
         );
         assert_ne!(control.engine_run_id, snapshot.scratch_run_id());
-        let control_facts = cross_run_engine_facts(&fixture.engine);
+        let control_state =
+            projection_observation_boundary(&fixture.engine, &fixture_page_ids(&fixture));
 
         // Restart adopting the retained run the snapshot names.
         let resumed = fixture.reopen_resuming(Some(&snapshot));
@@ -22202,9 +22543,9 @@ mod validation_tests {
             "the receipt and the standing instrumentation must report the same resume"
         );
         assert_eq!(
-            cross_run_engine_facts(&fixture.engine),
-            control_facts,
-            "adoption must reach exactly the accepted closure a full replay reaches"
+            projection_observation_boundary(&fixture.engine, &fixture_page_ids(&fixture)),
+            control_state,
+            "adoption must reach exactly the accepted closure a full replay reaches, at the projection and snapshot boundary as well as at the roots"
         );
 
         finish_preauthor_gate_fixture(fixture);
