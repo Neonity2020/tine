@@ -1484,7 +1484,7 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_safe_reopen_does_not_schedule_graph_wide_reconciliation() {
+    fn safe_reopen_honestly_reports_its_deferred_full_scan_catch_up() {
         let fixture = RuntimeHostFixture::safe("sync-runtime-unchanged-safe-reopen");
         let request = fixture.request();
         let first = active_handle(SyncRuntimeHandle::open(request.clone()));
@@ -1502,12 +1502,53 @@ mod tests {
             Some(SyncRuntimeRecovery::AdoptedSafeHandoff)
         );
         assert!(
-            !status.watcher.pending_requires_full_scan,
-            "an unchanged authenticated Safe reopen must resume from its durable frontier \
-             without scheduling routine graph-wide reconciliation: {:?}",
+            status.watcher.pending && status.watcher.pending_requires_full_scan,
+            "a Safe handoff proves a prior clean Tine stop, not that Logseq or Syncthing \
+             made no closed-interval edit: {:?}",
             status.watcher
         );
         assert_eq!(fixture.manifest_count(), manifests_before_reopen);
+        drive_initial_feed(&reopened);
+        assert!(
+            !reopened.status().unwrap().watcher.pending,
+            "the first actor drain must settle the exact owed catch-up before Safe"
+        );
+        assert!(matches!(
+            reopened.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
+    fn closed_interval_edit_is_discovered_by_safe_reopen_before_next_safe() {
+        let fixture = RuntimeHostFixture::safe("sync-runtime-closed-interval-edit");
+        let request = fixture.request();
+        let first = active_handle(SyncRuntimeHandle::open(request.clone()));
+        drive_initial_feed(&first);
+        assert!(matches!(
+            first.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+
+        let path = "content/nested pages/changed while closed.md";
+        fs::write(
+            fixture.graph_root().join(path),
+            b"- external Logseq or Syncthing edit while Tine was closed\n",
+        )
+        .unwrap();
+        let manifests_before_reopen = fixture.manifest_count();
+
+        let reopened = active_handle(SyncRuntimeHandle::open(request));
+        assert!(
+            reopened.status().unwrap().watcher.pending_requires_full_scan,
+            "the closed interval is intentionally uncertain even after an authenticated Safe handoff"
+        );
+        drive_initial_feed(&reopened);
+        assert_eq!(
+            fixture.manifest_count(),
+            manifests_before_reopen + 1,
+            "the deferred full scan must admit the closed-interval external edit before Safe"
+        );
         assert!(matches!(
             reopened.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(_)

@@ -182,9 +182,14 @@ pub(crate) struct ExactExternalFeedState {
     reconciliation: ReconciliationSession,
     baseline: ReconciliationBaseline,
     active: Option<ActiveDrain>,
+    /// The lease is armed during fast runtime open, but its graph-wide index is
+    /// intentionally not built until the first held uncertainty epoch.
+    initial_index_build_pending: bool,
     feed_sequence: u64,
     caught_up_published: bool,
     terminal: Option<ExactExternalFeedTerminal>,
+    #[cfg(test)]
+    initial_build_count: u64,
     #[cfg(test)]
     rebase_count: u64,
     #[cfg(test)]
@@ -204,11 +209,13 @@ impl fmt::Debug for ExactExternalFeedState {
 impl ExactExternalFeedState {
     /// Bind bounded feed state to one borrowed actor runtime.
     ///
-    /// Every fresh owner seeds one uncertainty epoch after building the initial
-    /// exact index. Its first admitted drain must therefore rebase and fully
-    /// reconcile even when no watcher callback arrived. This closes both the
-    /// initial-build/watch-install race and the process-crash loss of an
-    /// in-memory queue.
+    /// Every fresh owner arms its exact feed and seeds one uncertainty epoch,
+    /// but does no graph-wide enumeration during runtime open. Its first
+    /// admitted drain builds the initial index at that held epoch's fence and
+    /// fully reconciles before it can publish caught-up authority or acknowledge
+    /// the queue. This closes both the initial-build/watch-install race and the
+    /// process-crash loss of an in-memory queue without treating a prior `Safe`
+    /// handoff as proof that the closed graph was unchanged.
     pub(crate) fn open(
         graph: &Graph,
         receipts: &ProjectionReceiptStore,
@@ -218,9 +225,6 @@ impl ExactExternalFeedState {
         let binding = validate_open_binding(graph, receipts, runtime, &baseline)?;
         let lease = graph
             .arm_graph_text_exact_feed(0)
-            .map_err(|error| ExactExternalFeedOpenError::new(error.to_string()))?;
-        graph
-            .build_graph_text_exact_feed(&lease)
             .map_err(|error| ExactExternalFeedOpenError::new(error.to_string()))?;
 
         // This is not optional bookkeeping. A new process cannot reconstruct
@@ -246,9 +250,12 @@ impl ExactExternalFeedState {
             }),
             baseline,
             active: None,
+            initial_index_build_pending: true,
             feed_sequence: 0,
             caught_up_published: false,
             terminal: None,
+            #[cfg(test)]
+            initial_build_count: 0,
             #[cfg(test)]
             rebase_count: 0,
             #[cfg(test)]
@@ -384,6 +391,12 @@ impl ExactExternalFeedState {
                     return self.stop_queue(graph, runtime, detail);
                 }
             };
+            if self.initial_index_build_pending && !matches!(scope, ActiveDrainScope::FullScan) {
+                let detail =
+                    "initial exact-feed catch-up lost its owed full-scan uncertainty".to_owned();
+                let _ = runtime.abandon_watcher_drain(drain.epoch());
+                return self.stop_queue(graph, runtime, detail);
+            }
             self.active = Some(ActiveDrain {
                 epoch: drain.epoch(),
                 rebase_before_step: matches!(scope, ActiveDrainScope::FullScan),
@@ -402,12 +415,23 @@ impl ExactExternalFeedState {
                 .as_ref()
                 .expect("active drain disappeared")
                 .epoch;
-            match graph.rebase_graph_text_exact_feed_at_fence(&self.lease, epoch.sequence()) {
+            let initial_build = self.initial_index_build_pending;
+            let rebuilt = if initial_build {
+                graph.build_graph_text_exact_feed_at_fence(&self.lease, epoch.sequence())
+            } else {
+                graph.rebase_graph_text_exact_feed_at_fence(&self.lease, epoch.sequence())
+            };
+            match rebuilt {
                 Ok(()) => {
                     self.feed_sequence = epoch.sequence();
+                    self.initial_index_build_pending = false;
                     #[cfg(test)]
                     {
-                        self.rebase_count += 1;
+                        if initial_build {
+                            self.initial_build_count += 1;
+                        } else {
+                            self.rebase_count += 1;
+                        }
                     }
                     self.active
                         .as_mut()
@@ -1506,16 +1530,47 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn sole_runtime_queue_blocks_safe_and_settles_the_feed_epoch_exactly_once() {
+    fn deferred_initial_catch_up_uses_the_sole_queue_and_one_fenced_graph_build() {
         let mut fixture = configured_fixture("sole-runtime-queue");
         let enrollment = fixture.enrollment_root("sole-runtime-queue");
         let paths = PromotedPaths::new(&fixture, "sole-runtime-queue");
         let (mut authority, mut runtime) = promoted_safe_reopen(&mut fixture, &enrollment, &paths);
         let baseline = fixture.baseline(&fixture.graph, "sole-runtime-queue", false);
+        crate::model::reset_graph_text_admission_builder_counter_for_runtime_test();
         let mut state =
             ExactExternalFeedState::open(&fixture.graph, &fixture.receipts, &runtime, baseline)
                 .unwrap();
 
+        assert_eq!(
+            crate::model::graph_text_admission_builder_enumerations_for_runtime_test(),
+            0,
+            "fast exact-feed open must only arm and retain its owed uncertainty"
+        );
+        assert_eq!(state.initial_build_count, 0);
+        assert_eq!(state.rebase_count, 0);
+        let pending = runtime.watcher_status();
+        assert!(pending.pending);
+        assert!(pending.pending_requires_full_scan);
+
+        // A normalized observer may arrive after the feed was armed but before
+        // the actor starts its first drain. It stays behind the same owed
+        // uncertainty and is discovered by that first fenced catch-up.
+        let arrived_before_catch_up = "content/nested pages/arrived before catch up.md";
+        fs::write(
+            fixture.graph_root.join(arrived_before_catch_up),
+            b"- arrived before the first drain\n",
+        )
+        .unwrap();
+        let manifests_before_catch_up = fixture.manifest_count();
+        state
+            .observe(
+                &fixture.graph,
+                &runtime,
+                [WatcherObservation::ManagedPath(
+                    ManagedPath::parse(arrived_before_catch_up).unwrap(),
+                )],
+            )
+            .unwrap();
         let pending = runtime.watcher_status();
         let epoch = pending.latest_enqueue;
         assert!(pending.pending_requires_full_scan);
@@ -1536,6 +1591,16 @@ pub(crate) mod tests {
             &mut runtime,
             &mut clock,
         ));
+        assert_eq!(fixture.manifest_count(), manifests_before_catch_up + 1);
+        assert_eq!(state.initial_build_count, 1);
+        assert_eq!(
+            state.rebase_count, 0,
+            "the first catch-up must build once at its held fence, not build then rebase"
+        );
+        assert!(
+            crate::model::graph_text_admission_builder_enumerations_for_runtime_test() > 0,
+            "the first drain, rather than open, must perform the graph-wide enumeration"
+        );
         let settled = runtime.watcher_status();
         assert_eq!(settled.acknowledged, epoch);
         assert_eq!(settled.latest_enqueue, epoch);

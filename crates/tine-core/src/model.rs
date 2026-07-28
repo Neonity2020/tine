@@ -3074,6 +3074,18 @@ pub(crate) fn reset_graph_text_parser_counter_for_scan_test() {
     reset_graph_text_admission_test_counters();
 }
 
+/// Test-only work proof for runtime-open paths.  A graph-wide exact-feed build
+/// visits retained directories through this counter; arming a feed must not.
+#[cfg(test)]
+pub(crate) fn reset_graph_text_admission_builder_counter_for_runtime_test() {
+    reset_graph_text_admission_test_counters();
+}
+
+#[cfg(test)]
+pub(crate) fn graph_text_admission_builder_enumerations_for_runtime_test() -> usize {
+    graph_text_admission_test_counters().builder_enumerations
+}
+
 #[cfg(test)]
 pub(crate) fn graph_text_parser_invocations_for_scan_test() -> usize {
     graph_text_admission_test_counters().parser_invocations
@@ -6198,6 +6210,44 @@ impl Graph {
         lease: &GraphTextExactFeedLease,
     ) -> io::Result<()> {
         self.ensure_graph_text_exact_feed_lease(lease)?;
+        self.build_graph_text_admission_with_limits(INITIAL_SHADOW_LIMITS)
+            .map(drop)
+    }
+
+    /// Build an armed exact-feed index directly at a held watcher-queue fence.
+    ///
+    /// An actor intentionally arms the feed during fast runtime open, then
+    /// holds one uncertainty epoch before doing any graph-wide work.  The
+    /// first drain calls this method once: its bounded two-pass snapshot and
+    /// its initial feed fence are published together as `CatchingUp`.  This
+    /// avoids a stale open-time snapshot followed by a second full rebuild,
+    /// while retaining the ordinary build-time race checks.
+    pub(crate) fn build_graph_text_exact_feed_at_fence(
+        &self,
+        lease: &GraphTextExactFeedLease,
+        last_sequence: u64,
+    ) -> io::Result<()> {
+        self.ensure_graph_text_exact_feed_lease(lease)?;
+        self.ensure_graph_text_exact_feed_configuration(lease)?;
+        {
+            let mut state = self.graph_text_admission.write().unwrap();
+            let GraphTextAdmissionState::Armed(binding) = &mut *state else {
+                let cause = match &*state {
+                    GraphTextAdmissionState::Poisoned { cause, .. } => cause.clone(),
+                    _ => "exact-feed fenced initial build requires the Armed state".to_owned(),
+                };
+                if !matches!(&*state, GraphTextAdmissionState::Poisoned { .. }) {
+                    poison_graph_text_admission_state(&mut state, cause.clone());
+                }
+                return Err(graph_text_admission_unavailable(&cause));
+            };
+            if last_sequence < binding.fence.last_sequence {
+                let cause = "exact-feed fenced initial build moved the fence backwards";
+                poison_graph_text_admission_state(&mut state, cause.to_owned());
+                return Err(graph_text_admission_unavailable(cause));
+            }
+            binding.fence.last_sequence = last_sequence;
+        }
         self.build_graph_text_admission_with_limits(INITIAL_SHADOW_LIMITS)
             .map(drop)
     }
