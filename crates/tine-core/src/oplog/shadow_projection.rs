@@ -5,6 +5,7 @@
 //! and publishes only below a retained device-local root that is physically
 //! and structurally disjoint from the live graph.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -23,8 +24,9 @@ use super::hot_engine::{
     CurrentPathCatalogBinding, CurrentPathCatalogRow, MAX_CURRENT_PATH_CURSOR_PAGE_ROWS,
 };
 use super::import::{
-    InactiveBootstrapAcceptedAuthority, InactiveBootstrapAcceptedAuthorityBinding,
-    InactiveBootstrapPreparedPublication, InactiveBootstrapVerifiedPublication,
+    bootstrap_authoritative_source_paths, InactiveBootstrapAcceptedAuthority,
+    InactiveBootstrapAcceptedAuthorityBinding, InactiveBootstrapPreparedPublication,
+    InactiveBootstrapVerifiedPublication,
 };
 use super::migration_backup::{
     verify_migration_source_backup, MigrationBackupError, MigrationBackupRoot, VerifiedSourceBackup,
@@ -598,8 +600,13 @@ pub(crate) fn verify_inactive_bootstrap_shadow_projection(
         sqlite_projection,
     )?;
     let capture = prepared.source_capture();
-    let summary = summarize_source(capture)?;
-    let catalog_binding = traverse_complete_catalog(authority, summary.file_count)?;
+    let authoritative_paths = bootstrap_authoritative_source_paths(capture).map_err(|_| {
+        ShadowProjectionError::CorruptOrConflicting(
+            "source collision-authority selection is invalid",
+        )
+    })?;
+    let summary = summarize_source(capture, &authoritative_paths)?;
+    let catalog_binding = traverse_complete_catalog(authority, &authoritative_paths)?;
     let publication_id = shadow_publication_id(
         roots,
         prepared,
@@ -765,7 +772,7 @@ pub(crate) fn verify_inactive_bootstrap_shadow_projection(
         .freshly_verify_inactive_bootstrap(authority, sqlite_projection)
         .map_err(|error| ShadowProjectionError::Projection(error.to_string()))?;
     roots.freshly_validate_retained_roots()?;
-    let final_catalog = traverse_complete_catalog(authority, summary.file_count)?;
+    let final_catalog = traverse_complete_catalog(authority, &authoritative_paths)?;
     if final_catalog != catalog_binding {
         return Err(ShadowProjectionError::BindingMismatch(
             "accepted current-path catalog changed during shadow projection",
@@ -911,10 +918,13 @@ fn validate_bindings(
 
 fn summarize_source(
     capture: &BootstrapSourceCapture,
+    authoritative: &HashSet<ManagedPath>,
 ) -> Result<SourceSummary, ShadowProjectionError> {
     let mut entries = capture.entries_cursor()?;
     let mut file_count = 0_u64;
     let mut chunk_count = 0_u64;
+    let mut captured_file_count = 0_u64;
+    let mut captured_chunk_count = 0_u64;
     let mut directory_count = 0_u64;
     let mut total_bytes = 0_u64;
     let mut max_path_bytes = 0_u64;
@@ -922,6 +932,15 @@ fn summarize_source(
     let mut previous_parents = Vec::<String>::new();
     while let Some(entry) = entries.next()? {
         validate_source_entry(&entry)?;
+        captured_file_count = checked_add(captured_file_count, 1, "captured source files")?;
+        captured_chunk_count = checked_add(
+            captured_chunk_count,
+            u64::from(entry.chunk_count()),
+            "captured source chunks",
+        )?;
+        if !authoritative.contains(entry.path()) {
+            continue;
+        }
         file_count = checked_add(file_count, 1, "source files")?;
         chunk_count = checked_add(chunk_count, u64::from(entry.chunk_count()), "source chunks")?;
         total_bytes = checked_add(
@@ -963,7 +982,9 @@ fn summarize_source(
         previous_parents.clear();
         previous_parents.extend(parents.iter().map(|value| (*value).to_owned()));
     }
-    if file_count != capture.source_file_count() || chunk_count != capture.source_chunk_count() {
+    if captured_file_count != capture.source_file_count()
+        || captured_chunk_count != capture.source_chunk_count()
+    {
         return Err(ShadowProjectionError::CorruptOrConflicting(
             "source cursor counts differ from sealed capture",
         ));
@@ -980,7 +1001,7 @@ fn summarize_source(
 
 fn traverse_complete_catalog(
     authority: &InactiveBootstrapAcceptedAuthority,
-    source_files: u64,
+    authoritative_paths: &HashSet<ManagedPath>,
 ) -> Result<CurrentPathCatalogBinding, ShadowProjectionError> {
     let engine = authority.accepted_engine();
     let binding = engine
@@ -992,6 +1013,7 @@ fn traverse_complete_catalog(
             .map_err(|error| ShadowProjectionError::Projection(error.to_string()))?,
     );
     let mut count = 0_u64;
+    let mut seen = HashSet::new();
     while let Some(token) = cursor.take() {
         let page = engine
             .current_path_cursor_page(
@@ -1001,6 +1023,13 @@ fn traverse_complete_catalog(
             .map_err(|error| ShadowProjectionError::Projection(error.to_string()))?;
         let (rows, next) = page.into_parts();
         count = checked_add(count, rows.len() as u64, "current-path catalog rows")?;
+        for row in rows {
+            if !authoritative_paths.contains(row.path()) || !seen.insert(row.path().clone()) {
+                return Err(ShadowProjectionError::BindingMismatch(
+                    "current-path catalog grants authority outside the selected source winners",
+                ));
+            }
+        }
         cursor = next;
     }
     let current = engine
@@ -1011,7 +1040,10 @@ fn traverse_complete_catalog(
             "current-path catalog binding changed during complete traversal",
         ));
     }
-    if count != binding.catalog_rows() || count != source_files {
+    if count != binding.catalog_rows()
+        || count != authoritative_paths.len() as u64
+        || seen != *authoritative_paths
+    {
         return Err(ShadowProjectionError::BindingMismatch(
             "complete current-path catalog does not exactly cover the source capture",
         ));
@@ -1093,10 +1125,11 @@ fn read_source_file(
 fn plan_exact_source(
     authority: &InactiveBootstrapAcceptedAuthority,
     catalog_binding: CurrentPathCatalogBinding,
+    authoritative_paths: &HashSet<ManagedPath>,
     entry: &BootstrapSourceEntry,
     source: &[u8],
     instrumentation: &mut ShadowProjectionInstrumentation,
-) -> Result<(CurrentPathCatalogRow, ProjectionIntent), ShadowProjectionError> {
+) -> Result<Option<(CurrentPathCatalogRow, ProjectionIntent)>, ShadowProjectionError> {
     let engine = authority.accepted_engine();
     if engine
         .current_path_catalog_binding()
@@ -1107,12 +1140,19 @@ fn plan_exact_source(
             "accepted catalog changed during per-file projection",
         ));
     }
+    let selected = authoritative_paths.contains(entry.path());
+    if !selected {
+        // The complete catalog traversal proves no skipped path has authority.
+        return Ok(None);
+    }
     let row = engine
         .current_path_catalog_row_at_path(entry.path())
-        .map_err(|error| ShadowProjectionError::Projection(error.to_string()))?
-        .ok_or(ShadowProjectionError::BindingMismatch(
-            "source path is missing from accepted current-path catalog",
-        ))?;
+        .map_err(|error| ShadowProjectionError::Projection(error.to_string()))?;
+    let Some(row) = row else {
+        return Err(ShadowProjectionError::BindingMismatch(
+            "authoritative source path is missing from accepted current-path catalog",
+        ));
+    };
     if row.path() != entry.path() || row.kind() != entry.kind() {
         return Err(ShadowProjectionError::BindingMismatch(
             "source path kind differs from accepted catalog",
@@ -1142,7 +1182,7 @@ fn plan_exact_source(
         entry.path(),
         entry.description(),
     )?;
-    Ok((row, plan.intent().clone()))
+    Ok(Some((row, plan.intent().clone())))
 }
 
 fn binding_workspace(binding: CurrentPathCatalogBinding) -> WorkspaceId {
@@ -1178,12 +1218,28 @@ fn publish_payloads(
     instrumentation: &mut ShadowProjectionInstrumentation,
 ) -> Result<(), ShadowProjectionError> {
     let capture = prepared.source_capture();
+    let authoritative_paths = bootstrap_authoritative_source_paths(capture).map_err(|_| {
+        ShadowProjectionError::CorruptOrConflicting(
+            "source collision-authority selection is invalid",
+        )
+    })?;
     let mut entries = capture.entries_cursor()?;
     let mut chunks = capture.chunks_cursor()?;
     let mut first_write = true;
     while let Some(entry) = entries.next()? {
         let source = read_source_file(capture, &entry, &mut chunks, instrumentation)?;
-        let _ = plan_exact_source(authority, catalog_binding, &entry, &source, instrumentation)?;
+        if plan_exact_source(
+            authority,
+            catalog_binding,
+            &authoritative_paths,
+            &entry,
+            &source,
+            instrumentation,
+        )?
+        .is_none()
+        {
+            continue;
+        }
         let destination = payload_path(payload, entry.path())?;
         ensure_managed_parent_directories(payload, entry.path())?;
         let mut output = ResumableExactFile::open(
@@ -1267,12 +1323,26 @@ fn publish_manifest(
         )
     })?;
     let capture = prepared.source_capture();
+    let authoritative_paths = bootstrap_authoritative_source_paths(capture).map_err(|_| {
+        ShadowProjectionError::CorruptOrConflicting(
+            "source collision-authority selection is invalid",
+        )
+    })?;
     let mut entries = capture.entries_cursor()?;
     let mut chunks = capture.chunks_cursor()?;
     while let Some(entry) = entries.next()? {
         let source = read_source_file(capture, &entry, &mut chunks, instrumentation)?;
-        let (row, intent) =
-            plan_exact_source(authority, catalog_binding, &entry, &source, instrumentation)?;
+        let Some((row, intent)) = plan_exact_source(
+            authority,
+            catalog_binding,
+            &authoritative_paths,
+            &entry,
+            &source,
+            instrumentation,
+        )?
+        else {
+            continue;
+        };
         emit_manifest_entry(&mut output, &entry, row.page_id(), &intent)?;
         instrumentation.manifest_entries =
             checked_add(instrumentation.manifest_entries, 1, "manifest entries")?;
@@ -1346,6 +1416,11 @@ fn verify_projection_directory(
     let manifest = describe_regular_file(&manifest_path, MAX_MANIFEST_BYTES)?;
     let mut reader = ManifestReader::open(&manifest_path, summary.file_count, header.to_vec())?;
     let capture = prepared.source_capture();
+    let authoritative_paths = bootstrap_authoritative_source_paths(capture).map_err(|_| {
+        ShadowProjectionError::CorruptOrConflicting(
+            "source collision-authority selection is invalid",
+        )
+    })?;
     let mut entries = capture.entries_cursor()?;
     let mut chunks = capture.chunks_cursor()?;
     let mut inventory = Sha256::new();
@@ -1354,8 +1429,17 @@ fn verify_projection_directory(
     let mut total_bytes = 0_u64;
     while let Some(entry) = entries.next()? {
         let source = read_source_file(capture, &entry, &mut chunks, instrumentation)?;
-        let (row, expected_intent) =
-            plan_exact_source(authority, catalog_binding, &entry, &source, instrumentation)?;
+        let Some((row, expected_intent)) = plan_exact_source(
+            authority,
+            catalog_binding,
+            &authoritative_paths,
+            &entry,
+            &source,
+            instrumentation,
+        )?
+        else {
+            continue;
+        };
         let actual = reader
             .next()?
             .ok_or(ShadowProjectionError::CorruptOrConflicting(
@@ -3028,6 +3112,81 @@ mod tests {
             page_ids["notes/b/same-copy.org"]
         );
         rich.assert_graph_unchanged();
+    }
+
+    #[test]
+    fn inactive_shadow_projection_skips_collision_losers_and_preserves_all_source_bytes() {
+        let fixture = Fixture::new(
+            "collision-losers",
+            None,
+            vec![
+                ("a/One.md".into(), b"title:: Shared\n\n- first\n".to_vec()),
+                ("b/Two.org".into(), b"#+title: Shared\n\n* later\n".to_vec()),
+                (
+                    "pages/Foo.md".into(),
+                    b"title:: Upper\n\n- upper\n".to_vec(),
+                ),
+                (
+                    "pages/foo.MD".into(),
+                    b"title:: Lower\n\n- lower\n".to_vec(),
+                ),
+                ("twins/Twin.markdown".into(), b"- markdown\n".to_vec()),
+                ("twins/Twin.md".into(), b"- md\n".to_vec()),
+                ("twins/Twin.org".into(), b"* org\n".to_vec()),
+                (
+                    "notes/Cafe\u{301}.MD".into(),
+                    b"title:: Decomposed\n\n- nfd\n".to_vec(),
+                ),
+                (
+                    "notes/Caf\u{e9}.md".into(),
+                    b"title:: Composed\n\n- nfc\n".to_vec(),
+                ),
+                ("unrelated/Elsewhere.md".into(), b"- unrelated\n".to_vec()),
+            ],
+        );
+        assert_eq!(fixture.prepared.source_capture().source_file_count(), 10);
+        let selected =
+            bootstrap_authoritative_source_paths(fixture.prepared.source_capture()).unwrap();
+        let mut selected_paths = selected
+            .iter()
+            .map(|path| path.as_str())
+            .collect::<Vec<_>>();
+        selected_paths.sort_unstable();
+        assert_eq!(
+            selected_paths,
+            vec![
+                "a/One.md",
+                "notes/Cafe\u{301}.MD",
+                "pages/Foo.md",
+                "twins/Twin.markdown",
+                "unrelated/Elsewhere.md",
+            ]
+        );
+
+        let proof = fixture.verify().unwrap();
+        assert_eq!(proof.file_count(), 5);
+        assert_eq!(proof.catalog_binding().catalog_rows(), 5);
+        assert!(
+            proof.total_bytes() < fixture.backup.total_bytes(),
+            "the backup retains every physical source while projection grants only winner authority"
+        );
+        let payload = proof.directory().join(PAYLOAD_DIRECTORY);
+        for path in &selected {
+            assert_eq!(
+                fs::read(payload.join(path.as_str())).unwrap(),
+                fs::read(fixture.graph_root.join(path.as_str())).unwrap()
+            );
+        }
+        for loser in [
+            "b/Two.org",
+            "notes/Caf\u{e9}.md",
+            "pages/foo.MD",
+            "twins/Twin.md",
+            "twins/Twin.org",
+        ] {
+            assert!(!payload.join(loser).exists());
+        }
+        fixture.assert_graph_unchanged();
     }
 
     #[test]

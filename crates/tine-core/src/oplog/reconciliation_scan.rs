@@ -19,7 +19,7 @@ use super::{
 use crate::graph_text_scope::GraphTextScopeBinding;
 use crate::model::Graph;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::io;
 use std::mem;
@@ -534,6 +534,10 @@ pub(crate) struct GraphTextScanFileFingerprint {
     pub(crate) exact_relative: String,
     pub(crate) class: GraphTextScanPathClass,
     pub(crate) portable_key: Option<PortablePathKey>,
+    /// Fixed-width effective identity from the process-local admission
+    /// snapshot. Every exact physical row remains in the scan; this key only
+    /// selects which member may acquire import/projection authority.
+    pub(crate) semantic_key: Option<ContentDigest>,
     pub(crate) description: Option<BlobDescription>,
     pub(crate) file_resource_id: ContentDigest,
     pub(crate) link_count: u64,
@@ -575,7 +579,7 @@ impl GraphTextScanPass {
 
 pub(crate) fn graph_text_scan_pass_digest(pass: &GraphTextScanPass) -> ContentDigest {
     let mut hasher = Sha256::new();
-    hasher.update(b"tine/reconciliation/stable-graph-text-pass/v1\0");
+    hasher.update(b"tine/reconciliation/stable-graph-text-pass/v2\0");
     hasher.update(pass.graph_resource.as_bytes());
     hasher.update(pass.scope_binding.canonical_bytes());
     hasher.update((pass.directories_by_exact_relative.len() as u64).to_be_bytes());
@@ -594,6 +598,7 @@ pub(crate) fn graph_text_scan_pass_digest(pass: &GraphTextScanPass) -> ContentDi
             }
             None => hasher.update([0]),
         }
+        hash_optional_digest(&mut hasher, file.semantic_key);
         match file.description {
             Some(description) => {
                 hasher.update([1]);
@@ -1282,12 +1287,15 @@ pub(crate) struct GraphTextScanCandidate {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum GraphTextScanDiagnosticKind {
     ProviderConflictCopy,
+    SemanticCollisionLoser,
+    PortableCollisionLoser,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct GraphTextScanDiagnostic {
     pub(crate) path: String,
     pub(crate) kind: GraphTextScanDiagnosticKind,
+    pub(crate) authority_path: Option<String>,
     pub(crate) file_resource_id: ContentDigest,
     pub(crate) link_count: u64,
 }
@@ -1440,26 +1448,84 @@ impl StableGraphTextScan {
             }
             previous_candidate = Some(&candidate.path);
         }
-        let mut diagnostics = self.diagnostics.iter();
-        for file in self
+        let mut previous_diagnostic = None;
+        let mut diagnostic_file_index = 0_usize;
+        let mut provider_diagnostic_count = 0_usize;
+        for diagnostic in &self.diagnostics {
+            if previous_diagnostic
+                .is_some_and(|previous: &str| previous >= diagnostic.path.as_str())
+            {
+                return Err("scan diagnostics are not in strict exact-path order");
+            }
+            previous_diagnostic = Some(diagnostic.path.as_str());
+            while self
+                .baseline_pass
+                .files
+                .get(diagnostic_file_index)
+                .is_some_and(|file| file.exact_relative.as_str() < diagnostic.path.as_str())
+            {
+                diagnostic_file_index = diagnostic_file_index.saturating_add(1);
+            }
+            let file = self
+                .baseline_pass
+                .files
+                .get(diagnostic_file_index)
+                .filter(|file| file.exact_relative == diagnostic.path)
+                .ok_or("scan diagnostic path is absent from the retained pass")?;
+            if diagnostic.file_resource_id != file.file_resource_id
+                || diagnostic.link_count != file.link_count
+            {
+                return Err("scan diagnostic metadata differs from its retained exact row");
+            }
+            match diagnostic.kind {
+                GraphTextScanDiagnosticKind::ProviderConflictCopy => {
+                    if file.class != GraphTextScanPathClass::ProviderConflictCopy
+                        || diagnostic.authority_path.is_some()
+                    {
+                        return Err("provider-conflict diagnostic has invalid authority evidence");
+                    }
+                    provider_diagnostic_count = provider_diagnostic_count.saturating_add(1);
+                }
+                GraphTextScanDiagnosticKind::SemanticCollisionLoser
+                | GraphTextScanDiagnosticKind::PortableCollisionLoser => {
+                    if !file.class.is_eligible() {
+                        return Err("collision diagnostic does not name eligible graph text");
+                    }
+                    let authority_path = diagnostic
+                        .authority_path
+                        .as_deref()
+                        .ok_or("collision diagnostic lacks its authority path")?;
+                    if authority_path == diagnostic.path {
+                        return Err("collision diagnostic selects itself as loser and authority");
+                    }
+                    let authority =
+                        eligible_file_at_path(&self.baseline_pass.files, authority_path)
+                            .ok_or("collision authority path is absent from the retained pass")?;
+                    let same_group = match diagnostic.kind {
+                        GraphTextScanDiagnosticKind::SemanticCollisionLoser => {
+                            file.semantic_key.is_some()
+                                && file.semantic_key == authority.semantic_key
+                        }
+                        GraphTextScanDiagnosticKind::PortableCollisionLoser => {
+                            file.portable_key.is_some()
+                                && file.portable_key == authority.portable_key
+                        }
+                        GraphTextScanDiagnosticKind::ProviderConflictCopy => unreachable!(),
+                    };
+                    if !same_group {
+                        return Err("collision diagnostic members do not share its named key");
+                    }
+                }
+            }
+        }
+        let provider_file_count = self
             .baseline_pass
             .files
             .iter()
             .filter(|file| file.class == GraphTextScanPathClass::ProviderConflictCopy)
-        {
-            let Some(diagnostic) = diagnostics.next() else {
-                return Err("retained provider-conflict evidence lacks its scan diagnostic");
-            };
-            if diagnostic.path != file.exact_relative
-                || diagnostic.kind != GraphTextScanDiagnosticKind::ProviderConflictCopy
-                || diagnostic.file_resource_id != file.file_resource_id
-                || diagnostic.link_count != file.link_count
-            {
-                return Err("scan diagnostic does not match retained provider-conflict evidence");
-            }
-        }
-        if diagnostics.next().is_some() {
-            return Err("scan diagnostics contain evidence absent from the retained pass");
+            .count();
+        if provider_file_count != provider_diagnostic_count {
+            return Err("retained provider-conflict evidence lacks its scan diagnostic");
         }
 
         let mut identity = StableGraphTextBaselineIdentity {
@@ -1644,7 +1710,7 @@ where
     }
     drop(first);
 
-    let (expected_stream, plan) = plan_candidate_merge(
+    let (expected_stream, collision_authority) = select_collision_authority(
         source,
         &second,
         expected_binding,
@@ -1652,6 +1718,23 @@ where
         started,
         &mut instrumentation,
     )?;
+    let (walked_expected_stream, plan) = plan_candidate_merge(
+        source,
+        &second,
+        expected_stream,
+        &collision_authority,
+        limits,
+        started,
+        &mut instrumentation,
+    )?;
+    if walked_expected_stream != expected_stream {
+        return Err(expected_source_failure(
+            started,
+            instrumentation,
+            ExpectedPathSourceFailure::Corrupt,
+            "reopened expected stream changed during collision selection".to_owned(),
+        ));
+    }
     let scan_epoch_digest = scan_epoch_digest(&second, expected_stream);
     let binding = GraphTextCandidateBinding {
         graph_resource: second.graph_resource,
@@ -1671,8 +1754,14 @@ where
         .ok_or_else(|| scan_bound_failure(started, instrumentation, "candidate byte"))?;
     observe_live_memory(
         &mut instrumentation,
-        second.instrumentation.peak_retained_rows,
-        second.instrumentation.peak_retained_bytes,
+        second
+            .instrumentation
+            .peak_retained_rows
+            .saturating_add(collision_authority.retained_rows),
+        second
+            .instrumentation
+            .peak_retained_bytes
+            .saturating_add(collision_authority.retained_bytes),
         output_rows as u64,
         output_bytes,
         limits,
@@ -1683,6 +1772,7 @@ where
         &second,
         expected_stream,
         &plan,
+        &collision_authority,
         &binding,
         limits,
         started,
@@ -1853,7 +1943,7 @@ pub(crate) fn scan_epoch_digest_from_commitments(
     expected_rows_commitment: ContentDigest,
 ) -> ContentDigest {
     let mut hasher = Sha256::new();
-    hasher.update(b"tine/test-only/reconciliation-scan-epoch/v1\0");
+    hasher.update(b"tine/test-only/reconciliation-scan-epoch/v2\0");
     hasher.update(pass.graph_resource.as_bytes());
     hasher.update(pass.scope_binding.canonical_bytes());
     hasher.update(expected_binding.accepted_frontier.as_bytes());
@@ -1871,6 +1961,7 @@ pub(crate) fn scan_epoch_digest_from_commitments(
         hasher.update([file.class.tag()]);
         hasher.update(file.file_resource_id.as_bytes());
         hasher.update(file.link_count.to_be_bytes());
+        hash_optional_digest(&mut hasher, file.semantic_key);
         if let Some(description) = file.description {
             hasher.update([1]);
             hash_description(&mut hasher, description);
@@ -1908,13 +1999,22 @@ fn stable_graph_text_candidate_digest(candidates: &[GraphTextScanCandidate]) -> 
 
 fn stable_graph_text_diagnostic_digest(diagnostics: &[GraphTextScanDiagnostic]) -> ContentDigest {
     let mut hasher = Sha256::new();
-    hasher.update(b"tine/reconciliation/stable-graph-text-diagnostics/v1\0");
+    hasher.update(b"tine/reconciliation/stable-graph-text-diagnostics/v2\0");
     hasher.update((diagnostics.len() as u64).to_be_bytes());
     for diagnostic in diagnostics {
         hash_len_bytes(&mut hasher, diagnostic.path.as_bytes());
         hasher.update([match diagnostic.kind {
             GraphTextScanDiagnosticKind::ProviderConflictCopy => 1,
+            GraphTextScanDiagnosticKind::SemanticCollisionLoser => 2,
+            GraphTextScanDiagnosticKind::PortableCollisionLoser => 3,
         }]);
+        match &diagnostic.authority_path {
+            Some(path) => {
+                hasher.update([1]);
+                hash_len_bytes(&mut hasher, path.as_bytes());
+            }
+            None => hasher.update([0]),
+        }
         hasher.update(diagnostic.file_resource_id.as_bytes());
         hasher.update(diagnostic.link_count.to_be_bytes());
     }
@@ -2036,10 +2136,139 @@ struct WalkedExpectedPathStream {
     rows_commitment: ContentDigest,
 }
 
-fn plan_candidate_merge<S: AuthenticatedExpectedPathSource>(
+#[derive(Clone, Debug)]
+struct CollisionLoser {
+    kind: GraphTextScanDiagnosticKind,
+    authority_path: String,
+}
+
+#[derive(Clone, Debug, Default)]
+struct CollisionAuthority {
+    losers: HashMap<String, CollisionLoser>,
+    retained_rows: u64,
+    retained_bytes: u64,
+}
+
+impl CollisionAuthority {
+    fn admits(&self, path: &str) -> bool {
+        !self.losers.contains_key(path)
+    }
+}
+
+fn select_collision_authority<S: AuthenticatedExpectedPathSource>(
     source: &S,
     pass: &GraphTextScanPass,
     expected_binding: ExpectedPathBinding,
+    limits: GraphTextScanLimits,
+    started: Instant,
+    instrumentation: &mut GraphTextScanInstrumentation,
+) -> Result<(WalkedExpectedPathStream, CollisionAuthority), GraphTextScanFailure> {
+    let mut preferred = HashSet::new();
+    let mut preferred_rows = 0_u64;
+    let mut preferred_bytes = 0_u64;
+    let mut pass_index = 0_usize;
+    let stream = walk_expected_stream(
+        source,
+        expected_binding,
+        None,
+        pass,
+        limits,
+        0,
+        0,
+        started,
+        instrumentation,
+        |row| {
+            while pass
+                .files
+                .get(pass_index)
+                .is_some_and(|file| file.exact_relative.as_str() < row.path.as_str())
+            {
+                pass_index = pass_index.saturating_add(1);
+            }
+            if pass.files.get(pass_index).is_some_and(|file| {
+                file.exact_relative == row.path.as_str() && file.class.is_eligible()
+            }) {
+                if preferred.insert(row.path.as_str().to_owned()) {
+                    preferred_rows = preferred_rows.saturating_add(1);
+                    preferred_bytes = preferred_bytes
+                        .saturating_add(row.path.as_str().len() as u64)
+                        .saturating_add(128);
+                }
+            }
+            Ok(())
+        },
+    )?;
+
+    let mut semantic_owners = HashMap::<ContentDigest, String>::new();
+    let mut portable_owners = HashMap::<PortablePathKey, String>::new();
+    let mut authority = CollisionAuthority::default();
+    for preferred_phase in [true, false] {
+        for file in pass.files.iter().filter(|file| file.class.is_eligible()) {
+            if preferred.contains(&file.exact_relative) != preferred_phase {
+                continue;
+            }
+            let portable_owner = file
+                .portable_key
+                .as_ref()
+                .and_then(|key| portable_owners.get(key));
+            let semantic_owner = file
+                .semantic_key
+                .as_ref()
+                .and_then(|key| semantic_owners.get(key));
+            if let Some(owner) = portable_owner.or(semantic_owner) {
+                let kind = if portable_owner.is_some() {
+                    GraphTextScanDiagnosticKind::PortableCollisionLoser
+                } else {
+                    GraphTextScanDiagnosticKind::SemanticCollisionLoser
+                };
+                authority.retained_rows = authority.retained_rows.saturating_add(1);
+                authority.retained_bytes = authority
+                    .retained_bytes
+                    .saturating_add(file.exact_relative.len() as u64)
+                    .saturating_add(owner.len() as u64)
+                    .saturating_add(mem::size_of::<CollisionLoser>() as u64)
+                    .saturating_add(128);
+                authority.losers.insert(
+                    file.exact_relative.clone(),
+                    CollisionLoser {
+                        kind,
+                        authority_path: owner.clone(),
+                    },
+                );
+                continue;
+            }
+            if let Some(key) = &file.portable_key {
+                portable_owners.insert(key.clone(), file.exact_relative.clone());
+            }
+            if let Some(key) = file.semantic_key {
+                semantic_owners.insert(key, file.exact_relative.clone());
+            }
+            authority.retained_rows = authority.retained_rows.saturating_add(2);
+            authority.retained_bytes = authority
+                .retained_bytes
+                .saturating_add((file.exact_relative.len() as u64).saturating_mul(2))
+                .saturating_add(256);
+        }
+    }
+    authority.retained_rows = authority.retained_rows.saturating_add(preferred_rows);
+    authority.retained_bytes = authority.retained_bytes.saturating_add(preferred_bytes);
+    observe_live_memory(
+        instrumentation,
+        pass.instrumentation.peak_retained_rows,
+        pass.instrumentation.peak_retained_bytes,
+        authority.retained_rows,
+        authority.retained_bytes,
+        limits,
+        started,
+    )?;
+    Ok((stream, authority))
+}
+
+fn plan_candidate_merge<S: AuthenticatedExpectedPathSource>(
+    source: &S,
+    pass: &GraphTextScanPass,
+    expected_stream: WalkedExpectedPathStream,
+    authority: &CollisionAuthority,
     limits: GraphTextScanLimits,
     started: Instant,
     instrumentation: &mut GraphTextScanInstrumentation,
@@ -2057,10 +2286,25 @@ fn plan_candidate_merge<S: AuthenticatedExpectedPathSource>(
                 .ok_or_else(|| scan_bound_failure(started, *instrumentation, "diagnostic byte"))?;
         }
     }
+    for file in pass.files.iter().filter(|file| file.class.is_eligible()) {
+        let path = &file.exact_relative;
+        let Some(loser) = authority.losers.get(path) else {
+            continue;
+        };
+        plan.diagnostic_count = plan
+            .diagnostic_count
+            .checked_add(1)
+            .ok_or_else(|| scan_bound_failure(started, *instrumentation, "diagnostic row"))?;
+        plan.diagnostic_path_bytes = plan
+            .diagnostic_path_bytes
+            .checked_add(path.len() as u64)
+            .and_then(|bytes| bytes.checked_add(loser.authority_path.len() as u64))
+            .ok_or_else(|| scan_bound_failure(started, *instrumentation, "diagnostic byte"))?;
+    }
     let stream = walk_expected_stream(
         source,
-        expected_binding,
-        None,
+        expected_stream.header.binding,
+        Some(expected_stream),
         pass,
         limits,
         0,
@@ -2069,10 +2313,14 @@ fn plan_candidate_merge<S: AuthenticatedExpectedPathSource>(
         instrumentation,
         |row| match eligible_file_at_path(&pass.files, row.path.as_str()) {
             Some(file) if file.description == Some(row.description) => Ok(()),
+            Some(_) if !authority.admits(row.path.as_str()) => Ok(()),
             Some(_) | None => plan.add_candidate_path(row.path.as_str()),
         },
     )?;
     for file in pass.files.iter().filter(|file| file.class.is_eligible()) {
+        if !authority.admits(&file.exact_relative) {
+            continue;
+        }
         let path = ManagedPath::parse(file.exact_relative.clone())
             .expect("eligible scan rows retain validated managed paths");
         let point_bytes = expected_point_retained_bytes(&path);
@@ -2097,7 +2345,12 @@ fn plan_candidate_merge<S: AuthenticatedExpectedPathSource>(
                 )?,
             )
             .map_err(|failure| {
-                expected_source_failure(started, *instrumentation, failure, failure.to_string())
+                expected_source_failure(
+                    started,
+                    *instrumentation,
+                    failure,
+                    format!("expected point {}: {failure}", path.as_str()),
+                )
             })?;
         if expected.is_none() {
             plan.add_candidate_path(&file.exact_relative)
@@ -2113,6 +2366,7 @@ fn derive_candidates<S: AuthenticatedExpectedPathSource>(
     pass: &GraphTextScanPass,
     expected_stream: WalkedExpectedPathStream,
     plan: &CandidateMergePlan,
+    authority: &CollisionAuthority,
     binding: &GraphTextCandidateBinding,
     limits: GraphTextScanLimits,
     started: Instant,
@@ -2121,13 +2375,28 @@ fn derive_candidates<S: AuthenticatedExpectedPathSource>(
     let mut candidates = Vec::with_capacity(plan.candidate_count);
     let mut diagnostics = Vec::with_capacity(plan.diagnostic_count);
     for file in &pass.files {
-        if file.class == GraphTextScanPathClass::ProviderConflictCopy {
-            diagnostics.push(GraphTextScanDiagnostic {
-                path: file.exact_relative.clone(),
-                kind: GraphTextScanDiagnosticKind::ProviderConflictCopy,
-                file_resource_id: file.file_resource_id,
-                link_count: file.link_count,
-            });
+        match file.class {
+            GraphTextScanPathClass::ProviderConflictCopy => {
+                diagnostics.push(GraphTextScanDiagnostic {
+                    path: file.exact_relative.clone(),
+                    kind: GraphTextScanDiagnosticKind::ProviderConflictCopy,
+                    authority_path: None,
+                    file_resource_id: file.file_resource_id,
+                    link_count: file.link_count,
+                });
+            }
+            _ => {
+                let Some(loser) = authority.losers.get(&file.exact_relative) else {
+                    continue;
+                };
+                diagnostics.push(GraphTextScanDiagnostic {
+                    path: file.exact_relative.clone(),
+                    kind: loser.kind,
+                    authority_path: Some(loser.authority_path.clone()),
+                    file_resource_id: file.file_resource_id,
+                    link_count: file.link_count,
+                });
+            }
         }
     }
     let output_rows = plan.candidate_count + plan.diagnostic_count;
@@ -2148,6 +2417,9 @@ fn derive_candidates<S: AuthenticatedExpectedPathSource>(
         |row| {
             let observed = eligible_file_at_path(&pass.files, row.path.as_str());
             if observed.is_some_and(|file| file.description == Some(row.description)) {
+                return Ok(());
+            }
+            if observed.is_some() && !authority.admits(row.path.as_str()) {
                 return Ok(());
             }
             candidates.push(expected_candidate(
@@ -2172,6 +2444,9 @@ fn derive_candidates<S: AuthenticatedExpectedPathSource>(
         ));
     }
     for file in pass.files.iter().filter(|file| file.class.is_eligible()) {
+        if !authority.admits(&file.exact_relative) {
+            continue;
+        }
         let path = ManagedPath::parse(file.exact_relative.clone())
             .expect("eligible scan rows retain validated managed paths");
         let base_rows = pass
@@ -2198,7 +2473,12 @@ fn derive_candidates<S: AuthenticatedExpectedPathSource>(
                 expected_point_request(base_rows, base_bytes, limits, started, *instrumentation)?,
             )
             .map_err(|failure| {
-                expected_source_failure(started, *instrumentation, failure, failure.to_string())
+                expected_source_failure(
+                    started,
+                    *instrumentation,
+                    failure,
+                    format!("expected point {}: {failure}", path.as_str()),
+                )
             })?;
         if expected.is_none() {
             candidates.push(creation_candidate(file, binding));
@@ -3259,19 +3539,87 @@ mod tests {
     }
 
     #[test]
-    fn reconciliation_scan_rejects_portable_disk_path_collisions() {
+    fn reconciliation_scan_retains_portable_collision_losers_without_authority() {
         let temp = TempGraph::new(None);
         temp.write("pages/Page.md", b"one");
         temp.write("pages/page.MD", b"two");
-        assert_failure(
-            scan_graph_text(
-                &temp.graph(),
-                &FixtureExpectedSource::empty(),
-                GraphTextScanLimits::default(),
-            ),
-            GraphTextScanFailureClass::Blocked,
-            GraphTextScanFailureReason::UnsafeFilesystem,
+        let scan = scan_graph_text(
+            &temp.graph(),
+            &FixtureExpectedSource::empty(),
+            GraphTextScanLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            candidate_signature(&scan),
+            vec![(
+                "pages/Page.md".into(),
+                GraphTextCandidateKind::Creation,
+                None
+            )]
         );
+        assert_eq!(
+            scan.diagnostics,
+            vec![GraphTextScanDiagnostic {
+                path: "pages/page.MD".into(),
+                kind: GraphTextScanDiagnosticKind::PortableCollisionLoser,
+                authority_path: Some("pages/Page.md".into()),
+                file_resource_id: scan.baseline_pass.files[1].file_resource_id,
+                link_count: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn reconciliation_scan_prefers_existing_semantic_owner_then_promotes_after_fresh_scan() {
+        let temp = TempGraph::new(None);
+        let first = "a/One.md";
+        let retained_owner = "b/Two.org";
+        let first_bytes = b"title:: Shared\n\n- first\n";
+        let owner_bytes = b"#+title: Shared\n\n* owner\n";
+        temp.write(first, first_bytes);
+        temp.write(retained_owner, owner_bytes);
+        let graph = temp.graph();
+        let lease = graph.arm_graph_text_exact_feed(0).unwrap();
+        graph
+            .build_graph_text_exact_feed_at_fence(&lease, 0)
+            .unwrap();
+        let source = FixtureExpectedSource::with_rows(vec![expected_row(
+            retained_owner,
+            ManagedTextKind::Page,
+            owner_bytes,
+        )]);
+
+        let scan = scan_graph_text(&graph, &source, GraphTextScanLimits::default()).unwrap();
+        assert!(scan.candidates.is_empty());
+        assert_eq!(
+            scan.diagnostics,
+            vec![GraphTextScanDiagnostic {
+                path: first.into(),
+                kind: GraphTextScanDiagnosticKind::SemanticCollisionLoser,
+                authority_path: Some(retained_owner.into()),
+                file_resource_id: scan.baseline_pass.files[0].file_resource_id,
+                link_count: 1,
+            }]
+        );
+
+        fs::remove_file(temp.root.join(retained_owner)).unwrap();
+        graph
+            .rebase_graph_text_exact_feed_at_fence(&lease, 1)
+            .unwrap();
+        let promoted = scan_graph_text(&graph, &source, GraphTextScanLimits::default()).unwrap();
+        assert_eq!(
+            candidate_signature(&promoted),
+            vec![
+                (first.into(), GraphTextCandidateKind::Creation, None),
+                (
+                    retained_owner.into(),
+                    GraphTextCandidateKind::Absence,
+                    Some(ManagedTextKind::Page)
+                ),
+            ]
+        );
+        assert!(promoted.diagnostics.is_empty());
+        assert_eq!(fs::read(temp.root.join(first)).unwrap(), first_bytes);
     }
 
     #[test]
@@ -3381,7 +3729,11 @@ mod tests {
         let scan = scan_graph_text(&temp.graph(), &source, limits).unwrap();
 
         assert_eq!(scan.candidates.len(), 600);
-        assert_eq!(source.open_calls.get(), 2);
+        assert_eq!(
+            source.open_calls.get(),
+            3,
+            "authority selection, candidate planning, and derivation each stream once"
+        );
         assert!(source.maximum_page_rows_seen.get() <= 17);
         assert!(source.maximum_page_bytes_seen.get() <= 4096);
         assert!(scan.instrumentation.expected_pages > 2);

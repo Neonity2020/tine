@@ -257,9 +257,12 @@ fn blocking_diagnostic_evidence(
     kind: GraphTextScanDiagnosticKind,
 ) -> Option<ReconciliationImportEvidenceKind> {
     match kind {
-        // Conflict copies remain committed diagnostics, but are deliberately
-        // excluded from page candidates and carry no import authority.
-        GraphTextScanDiagnosticKind::ProviderConflictCopy => None,
+        // Conflict copies and logical collision losers remain committed
+        // diagnostics, but are deliberately excluded from page candidates and
+        // carry no import authority.
+        GraphTextScanDiagnosticKind::ProviderConflictCopy
+        | GraphTextScanDiagnosticKind::SemanticCollisionLoser
+        | GraphTextScanDiagnosticKind::PortableCollisionLoser => None,
     }
 }
 
@@ -1091,6 +1094,7 @@ mod tests {
         let diagnostics = vec![GraphTextScanDiagnostic {
             path: "pages/note.sync-conflict-20260726.md".to_owned(),
             kind: GraphTextScanDiagnosticKind::ProviderConflictCopy,
+            authority_path: None,
             file_resource_id: ContentDigest::of(b"conflict"),
             link_count: 1,
         }];
@@ -1136,6 +1140,7 @@ mod tests {
         let diagnostics = vec![GraphTextScanDiagnostic {
             path: "pages/note.sync-conflict-20260726.md".to_owned(),
             kind: GraphTextScanDiagnosticKind::ProviderConflictCopy,
+            authority_path: None,
             file_resource_id: ContentDigest::of(b"conflict"),
             link_count: 1,
         }];

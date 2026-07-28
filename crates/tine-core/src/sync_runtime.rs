@@ -4236,4 +4236,98 @@ mod tests {
             b"- not a Tine page\n"
         );
     }
+
+    /// Reopen one already-`LocalActive` runtime over a graph that gained an
+    /// physical copy of a page while Tine was closed, and report what the
+    /// public handle did with an unrelated ordinary offline edit.
+    fn reopen_with_physical_copy(
+        fixture: &RuntimeHostFixture,
+        copy_path: &str,
+    ) -> (bool, Vec<SyncRuntimeTick>, String) {
+        let graph_root = fixture.graph_root().to_path_buf();
+        fs::create_dir_all(graph_root.join(copy_path).parent().unwrap()).unwrap();
+        let page = "content/nested pages/Meeting notes.md";
+        let archived = copy_path.to_owned();
+        fs::write(graph_root.join(page), b"- current\n").unwrap();
+        fs::write(graph_root.join(&archived), b"- archived\n").unwrap();
+
+        // The user's unrelated ordinary offline edit to a real page.
+        let edited = "content/nested pages/rename old.org";
+        let edit = b"* edited in another editor while Tine was closed\n";
+        fs::write(graph_root.join(edited), edit).unwrap();
+
+        let before = fixture.manifest_count();
+        let handle = active_handle(SyncRuntimeHandle::open(fixture.request()));
+        let ticks = drain_until_settled(&handle);
+        let imported = admitted_an_epoch(&ticks) && fixture.manifest_count() > before;
+        let shutdown = handle.clean_shutdown();
+        let reached_safe = matches!(shutdown, Ok(SyncShutdownOutcome::Safe(_)))
+            && matches!(fixture.handoff(), EnrollmentDiscoveryHandoff::Safe);
+        let shutdown = format!("{shutdown:?}");
+
+        // Neither copy may be moved or rewritten to reach either outcome.
+        assert_eq!(fs::read(graph_root.join(page)).unwrap(), b"- current\n");
+        assert_eq!(
+            fs::read(graph_root.join(&archived)).unwrap(),
+            b"- archived\n"
+        );
+        (imported && reached_safe, ticks, shutdown)
+    }
+
+    /// Two eligible graph-text files that share one effective page name at two
+    /// distinct physical paths must not deny reconciliation for the whole graph.
+    ///
+    /// Since graph-wide page layouts landed, every eligible `.md`/`.org` file
+    /// anywhere under the graph is graph text, and its page name comes from the
+    /// final path component alone. An honest offline backup — copying
+    /// `content/nested pages/Meeting notes.md` to `archive/2026/` with any
+    /// ordinary tool — therefore produces two documents with one effective
+    /// name. OG tolerates exactly this: it keeps both files, retains the first
+    /// effective name, and skips the later collision with a warning
+    /// (`frontend.handler.repo/parse-files-and-load-to-db!`). The accepted
+    /// duplicate-identity contract is the same — retain every exact physical
+    /// path, block only an ambiguous name-only mutation — precisely so one
+    /// duplicate group cannot become graph-wide denial.
+    ///
+    /// `initial_shadow_global_collision` instead rejects the whole admission
+    /// index whenever any `paths_by_semantic_key` group holds more than one
+    /// member, and `finish_graph_text_admission_build` turns that rejection into
+    /// a `Poisoned` graph-text admission state for an armed exact feed. Every
+    /// later tick then returns `graph-text admission authority unavailable`, the
+    /// user's unrelated offline edit never imports, and clean `Safe` handoff
+    /// becomes unreachable — so the next launch is a crashed-Unsafe takeover.
+    ///
+    /// The control pins the cause exactly: the identical shape, layout, and
+    /// byte sequence with a distinct archived name reconciles normally.
+    #[test]
+    fn duplicate_effective_page_name_does_not_deny_the_whole_graph() {
+        let control = RuntimeHostFixture::safe("sync-runtime-duplicate-name-control");
+        let (control_ok, control_ticks, control_shutdown) =
+            reopen_with_physical_copy(&control, "archive/2026/Meeting notes 2025.md");
+        assert!(
+            control_ok,
+            "control: an archived copy under a distinct page name must reconcile, \
+             but the drain produced {control_ticks:?} and shutdown {control_shutdown}"
+        );
+
+        let fixture = RuntimeHostFixture::safe("sync-runtime-duplicate-name");
+        let (ok, ticks, shutdown) =
+            reopen_with_physical_copy(&fixture, "archive/2026/Meeting notes.md");
+        assert!(
+            ok,
+            "one duplicate effective page name must not stop startup reconciliation \
+             for the whole graph or make clean Safe handoff unreachable, but the \
+             drain produced {ticks:?} and shutdown {shutdown}"
+        );
+
+        let portable = RuntimeHostFixture::safe("sync-runtime-portable-duplicate-name");
+        let (ok, ticks, shutdown) =
+            reopen_with_physical_copy(&portable, "content/nested pages/meeting NOTES.MD");
+        assert!(
+            ok,
+            "a case-and-extension-only portable collision must retain the accepted exact owner, \
+             import the unrelated edit, and reach Safe, but the drain produced {ticks:?} \
+             and shutdown {shutdown}"
+        );
+    }
 }

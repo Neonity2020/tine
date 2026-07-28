@@ -229,6 +229,16 @@ pub(crate) fn append_stable_scan_to_baseline<S: AuthenticatedExpectedPathSource>
     flush_paths(baseline, epoch, &mut path_page, &mut instrumentation)?;
 
     for diagnostic in &scan.diagnostics {
+        if matches!(
+            diagnostic.kind,
+            super::reconciliation_scan::GraphTextScanDiagnosticKind::SemanticCollisionLoser
+                | super::reconciliation_scan::GraphTextScanDiagnosticKind::PortableCollisionLoser
+        ) {
+            // Collision losers are already authenticated by the exact census
+            // rows and scan diagnostic commitment. They are informational, not
+            // an unsafe-filesystem blocked signature.
+            continue;
+        }
         baseline.record_blocked(
             scan_diagnostic_digest(diagnostic),
             BaselineBlockedReason::UnsafeFilesystem,
@@ -504,12 +514,22 @@ fn baseline_scan_instrumentation(scan: &StableGraphTextScan) -> BaselineScanInst
 
 fn scan_diagnostic_digest(diagnostic: &GraphTextScanDiagnostic) -> ContentDigest {
     let mut hasher = Sha256::new();
-    hasher.update(b"tine/reconciliation/baseline-blocked-scan-diagnostic/v1\0");
+    hasher.update(b"tine/reconciliation/baseline-blocked-scan-diagnostic/v2\0");
     hasher.update([match diagnostic.kind {
         super::reconciliation_scan::GraphTextScanDiagnosticKind::ProviderConflictCopy => 1,
+        super::reconciliation_scan::GraphTextScanDiagnosticKind::SemanticCollisionLoser => 2,
+        super::reconciliation_scan::GraphTextScanDiagnosticKind::PortableCollisionLoser => 3,
     }]);
     hasher.update((diagnostic.path.len() as u64).to_be_bytes());
     hasher.update(diagnostic.path.as_bytes());
+    match &diagnostic.authority_path {
+        Some(path) => {
+            hasher.update([1]);
+            hasher.update((path.len() as u64).to_be_bytes());
+            hasher.update(path.as_bytes());
+        }
+        None => hasher.update([0]),
+    }
     hasher.update(diagnostic.file_resource_id.as_bytes());
     hasher.update(diagnostic.link_count.to_be_bytes());
     ContentDigest::from_bytes(hasher.finalize().into())
@@ -717,6 +737,7 @@ mod tests {
                     exact_relative,
                     class,
                     portable_key: None,
+                    semantic_key: None,
                     link_count: 1,
                 }
             })
@@ -773,6 +794,7 @@ mod tests {
                 GraphTextScanDiagnostic {
                     path: file.exact_relative.clone(),
                     kind: GraphTextScanDiagnosticKind::ProviderConflictCopy,
+                    authority_path: None,
                     file_resource_id: file.file_resource_id,
                     link_count: file.link_count,
                 }
