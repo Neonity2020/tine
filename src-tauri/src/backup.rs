@@ -21,7 +21,9 @@ const ASSET_RESTORE_RECOVERY_DIR: &str = ".tine-restore-recovery";
 static BACKUP_WORK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
 
 pub(crate) fn backup_async(app: tauri::AppHandle, slot: Arc<GraphSlot>) -> Result<(), String> {
-    let source = BackupSource::from_graph(slot.legacy_graph()?);
+    let graph = slot.legacy_graph()?;
+    let source = BackupSource::from_graph(&graph);
+    drop(graph);
     std::thread::spawn(move || {
         // Defer the launch snapshot ~1s so its whole-graph file copy doesn't
         // contend for disk I/O with first-journal paint and the warm-cache parse
@@ -384,7 +386,8 @@ pub(crate) fn set_backup_keep(
     })?;
     // Apply the new (possibly lower) cap to the current graph's snapshots now.
     let slot = slot_for_context(&state)?;
-    if let Some(base) = backup_base(&app, slot.legacy_graph()?) {
+    let graph = slot.legacy_graph()?;
+    if let Some(base) = backup_base(&app, &graph) {
         prune_backups(&base, keep);
     }
     Ok(())

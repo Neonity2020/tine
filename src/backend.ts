@@ -25,6 +25,13 @@ import type {
   ManagedSyncStatus,
   SyncIdentityPlan,
   ManagedSyncEnableResult,
+  SparseV2Status,
+  SparseV2Tick,
+  SparseV2QueryRequest,
+  SparseV2QueryReply,
+  SparseV2EditorLoadRequest,
+  SparseV2EditorSaveRequest,
+  SparseV2EditorOutcome,
   PdfState,
   QueryExecution,
   QueryPageScope,
@@ -225,6 +232,13 @@ export interface Backend {
   managedSyncStatus(): Promise<ManagedSyncStatus | null>;
   managedSyncIdentityPlan(): Promise<SyncIdentityPlan>;
   enableManagedSync(): Promise<ManagedSyncEnableResult>;
+  sparseV2Status(): Promise<SparseV2Status>;
+  activateSparseV2(): Promise<SparseV2Status>;
+  sparseV2Query(request: SparseV2QueryRequest): Promise<SparseV2QueryReply>;
+  sparseV2EditorLoad(request: SparseV2EditorLoadRequest): Promise<SparseV2EditorOutcome>;
+  sparseV2EditorSave(request: SparseV2EditorSaveRequest): Promise<SparseV2EditorOutcome>;
+  sparseV2Tick(): Promise<SparseV2Tick>;
+  sparseV2CleanShutdown(): Promise<import("./types").SparseV2RuntimeStatus>;
   /** Bundled read-only Guide pages, compiled from the same templates as the demo graph. */
   guidePages(): Promise<GuidePage[]>;
   /** Copy the bundled Guide into the real graph under `tine-guide/`. */
@@ -675,6 +689,29 @@ class TauriBackend implements Backend {
   }
   enableManagedSync() {
     return this.call<ManagedSyncEnableResult>("enable_managed_sync");
+  }
+  sparseV2Status() {
+    return this.call<SparseV2Status>("sparse_v2_status");
+  }
+  async activateSparseV2() {
+    const result = await this.call<SparseV2Status>("activate_sparse_v2");
+    this.bindingGeneration = result.binding_generation;
+    return result;
+  }
+  sparseV2Query(request: SparseV2QueryRequest) {
+    return this.call<SparseV2QueryReply>("sparse_v2_query", { request });
+  }
+  sparseV2EditorLoad(request: SparseV2EditorLoadRequest) {
+    return this.call<SparseV2EditorOutcome>("sparse_v2_editor_load", { request });
+  }
+  sparseV2EditorSave(request: SparseV2EditorSaveRequest) {
+    return this.call<SparseV2EditorOutcome>("sparse_v2_editor_save", { request });
+  }
+  sparseV2Tick() {
+    return this.call<SparseV2Tick>("sparse_v2_tick");
+  }
+  sparseV2CleanShutdown() {
+    return this.call<import("./types").SparseV2RuntimeStatus>("sparse_v2_clean_shutdown");
   }
   guidePages() {
     return this.call<GuidePage[]>("guide_pages");

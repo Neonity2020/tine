@@ -10,6 +10,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Changed
 
+- **Experimental sparse-v2 storage now has an explicit per-graph application
+  boundary.** Opt-in retires and drains the legacy graph authority before
+  publishing the durable binding, then routes bounded queries, editor intents,
+  whole-root external-file observations, recovery status, and clean shutdown
+  through one actor. Startup never enables it implicitly or falls back to a
+  legacy writer after opt-in.
 - **The disconnected experimental v2 oplog engine now uses one leased,
   authenticated run-local scratch store.** Exact causal clocks, compact
   store-backed batch status/waits, shallow document checkpoints with

@@ -1249,6 +1249,32 @@
         "failBefore": "source-proven"
       },
       "notes": "Covers OG-normalized name-and-kind lookup across nested .md/.markdown/.org paths, duplicate-owner ambiguity, actor-issued revisions, whole-outline edit/insert/move/reorder/delete, configured page and journal creation, pre-enqueue bounds and cycle checks, stale external-edit refusal, and retained-publication retry through the sole operational coordinator."
+    },
+    {
+      "id": "REG-SYNC-SPARSE-V2-APP-AUTHORITY-001",
+      "title": "Explicit sparse-v2 app activation drains legacy authority, routes whole-root watcher input through one actor, and refuses unproven clean shutdown",
+      "family": "sync-data-safety",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "native-app",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/sync_runtime.rs",
+          "src-tauri/src/state.rs",
+          "src-tauri/src/watcher.rs",
+          "src-tauri/src/sync_runtime.rs",
+          "src/sparseV2Boundary.test.ts"
+        ],
+        "scenario": "sync.sparse-v2-explicit-app-authority-vertical-slice",
+        "failBefore": "source-proven"
+      },
+      "notes": "The app persists stable caller-owned activation identities only after every tracked legacy Graph lease drains, while graph refresh and migration share the same transition lock, then publishes exactly one sparse actor or a visible retryable/blocked binding. The recursive root watcher closes its installation interval with one full reconciliation, keeps nested and case-variant Markdown/Org events incremental, and ignores explicit unmanaged file events. The journey activates a pre-populated nested Unicode graph without rewriting its bytes, confirms exact bootstrap receipts, authors and queries through the exact adjacent-tagged actor wire, imports an external edit through the watcher queue, reaches Safe shutdown, exposes stopped runtime as retryable, reopens authenticated LocalActive state, and proves legacy routes remain refused. Focused core cuts prove one-time receipt confirmation resumes before actor publication and a later missing private completion blocks reconciliation without changing externally edited graph bytes."
     }
   ]
 }

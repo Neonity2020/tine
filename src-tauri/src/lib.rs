@@ -67,6 +67,10 @@ use state::AppState;
 #[cfg(desktop)]
 use std::sync::atomic::AtomicU64;
 use std::sync::{Mutex, RwLock};
+use sync_runtime::{
+    activate_sparse_v2, sparse_v2_clean_shutdown, sparse_v2_editor_load, sparse_v2_editor_save,
+    sparse_v2_query, sparse_v2_status, sparse_v2_tick,
+};
 #[cfg(desktop)]
 use tauri::Emitter;
 use tauri::Manager;
@@ -652,13 +656,13 @@ pub fn run() {
                 let state = app.state::<AppState>();
                 graph::load_graph_for_label(root, app.handle(), "main", &state)?;
                 let slot = state::slot_for_window(&state, "main")?;
-                let g = slot.legacy_graph()?;
                 // These diagnostics enumerate dirs AND force a whole-graph cache
                 // build (journals_desc()/list_pages()) — on the cold-cache critical
                 // path to first paint, before warm_cache_async. The format! args
                 // are evaluated regardless of whether diag() ends up writing, so
                 // gate the whole block on debug to keep it off the 99% hot launch.
-                if debug_enabled() {
+                if debug_enabled() && !slot.is_sparse_v2() {
+                    let g = slot.legacy_graph()?;
                     let meta = g.meta();
                     let jdir = g.journals_path();
                     let pdir = g.pages_path();
@@ -756,6 +760,13 @@ pub fn run() {
             managed_sync_status,
             managed_sync_identity_plan,
             enable_managed_sync,
+            sparse_v2_status,
+            activate_sparse_v2,
+            sparse_v2_query,
+            sparse_v2_editor_load,
+            sparse_v2_editor_save,
+            sparse_v2_tick,
+            sparse_v2_clean_shutdown,
             guide_pages,
             copy_guide_into_graph,
             get_backlink_filter_context,

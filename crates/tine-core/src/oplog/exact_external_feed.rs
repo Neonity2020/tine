@@ -534,10 +534,12 @@ impl ExactExternalFeedState {
             }
             ReconciliationSessionStep::Blocked => {
                 self.reconciliation.take_terminal_changed_paths();
+                let detail = self
+                    .reconciliation
+                    .take_terminal_blocked_detail()
+                    .unwrap_or_else(|| "exact external reconciliation is blocked".to_owned());
                 self.abandon_active(runtime);
-                ExactExternalFeedDrain::Blocked(
-                    "exact external reconciliation is blocked".to_owned(),
-                )
+                ExactExternalFeedDrain::Blocked(detail)
             }
             ReconciliationSessionStep::Idle => {
                 let detail =

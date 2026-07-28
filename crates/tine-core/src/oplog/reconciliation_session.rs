@@ -147,6 +147,7 @@ pub(crate) struct ReconciliationSession<
     confirmation_lease: Option<ReconciliationLease>,
     next_continuation_sequence: u64,
     terminal_changed_paths: Option<ReconciliationTerminalChangedPaths>,
+    terminal_blocked_detail: Option<String>,
 }
 
 impl<C, B> ReconciliationSession<C, B> {
@@ -157,6 +158,7 @@ impl<C, B> ReconciliationSession<C, B> {
             confirmation_lease: None,
             next_continuation_sequence: 0,
             terminal_changed_paths: None,
+            terminal_blocked_detail: None,
         }
     }
 
@@ -182,6 +184,12 @@ impl<C, B> ReconciliationSession<C, B> {
         self.terminal_changed_paths.take()
     }
 
+    /// Consume the exact refusal from the immediately preceding terminal
+    /// blocked step.
+    pub(crate) fn take_terminal_blocked_detail(&mut self) -> Option<String> {
+        self.terminal_blocked_detail.take()
+    }
+
     /// Return the exact stable refusal for an exhausted published
     /// continuation. The token check prevents a caller from reading evidence
     /// for a stale or foreign continuation.
@@ -204,6 +212,7 @@ impl<C, B> ReconciliationSession<C, B> {
         D: ReconciliationSessionDispatch<Continuation = C, PendingBaseline = B>,
     {
         self.terminal_changed_paths = None;
+        self.terminal_blocked_detail = None;
         if let Some(pending) = &self.pending {
             return Err(ReconciliationSessionError::PendingContinuation(
                 pending.token,
@@ -237,6 +246,7 @@ impl<C, B> ReconciliationSession<C, B> {
         D: ReconciliationSessionDispatch<Continuation = C, PendingBaseline = B>,
     {
         self.terminal_changed_paths = None;
+        self.terminal_blocked_detail = None;
         let Some(pending) = self.pending.as_ref() else {
             return Err(ReconciliationSessionError::StaleOrForeignContinuation);
         };
@@ -469,24 +479,28 @@ impl<C, B> ReconciliationSession<C, B> {
         changed_paths: ReconciliationTerminalChangedPaths,
         outcome: ReconciliationSessionDispatchOutcome<C>,
     ) -> Result<ReconciliationSessionStep, ReconciliationSessionError> {
-        let (completion, step) = match outcome {
+        let (completion, step, blocked_detail) = match outcome {
             ReconciliationSessionDispatchOutcome::Noop => (
                 ReconciliationCompletionOutcome::Noop,
                 ReconciliationSessionStep::Noop,
+                None,
             ),
             ReconciliationSessionDispatchOutcome::Complete => (
                 ReconciliationCompletionOutcome::Complete,
                 ReconciliationSessionStep::Complete,
+                None,
             ),
             // An ordinary coordinator error is deliberately classified as
             // blocked, never as a clean no-op or completion.
-            ReconciliationSessionDispatchOutcome::Blocked(_) => (
+            ReconciliationSessionDispatchOutcome::Blocked(blocked) => (
                 ReconciliationCompletionOutcome::Blocked,
                 ReconciliationSessionStep::Blocked,
+                Some(blocked.detail),
             ),
             ReconciliationSessionDispatchOutcome::RetryFull => (
                 ReconciliationCompletionOutcome::Retry,
                 ReconciliationSessionStep::RetryFull,
+                None,
             ),
             ReconciliationSessionDispatchOutcome::FailedClosed(_) => {
                 unreachable!("failed-closed continuations are retained before lease settlement")
@@ -500,6 +514,7 @@ impl<C, B> ReconciliationSession<C, B> {
             ReconciliationSessionStep::Noop | ReconciliationSessionStep::Complete
         )
         .then_some(changed_paths);
+        self.terminal_blocked_detail = blocked_detail;
         if self.confirmation_lease == Some(lease) {
             self.confirmation_lease = None;
         }
@@ -677,10 +692,15 @@ impl LiveReconciliationSessionDispatch<'_> {
             Ok(OperationalCoordinatorState::Complete(_)) => {
                 ReconciliationSessionDispatchOutcome::Complete
             }
-            Ok(OperationalCoordinatorState::Blocked(_)) => {
+            Ok(OperationalCoordinatorState::Blocked(plan)) => {
+                let detail = plan
+                    .blocks()
+                    .first()
+                    .map(|blocked| blocked.detail.clone())
+                    .unwrap_or_else(|| "targeted reconciliation coordinator blocked".to_owned());
                 ReconciliationSessionDispatchOutcome::Blocked(BaselineBlockedObservation::new(
                     BaselineBlockedReason::ReconciliationFailed,
-                    "targeted reconciliation coordinator blocked",
+                    detail,
                 ))
             }
             Err(error) => {

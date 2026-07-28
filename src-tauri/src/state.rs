@@ -1,13 +1,14 @@
 use std::collections::HashMap;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::time::{Duration, Instant};
 use tauri::ipc::{CommandArg, CommandItem, InvokeBody, InvokeError};
 use tauri::{Manager, Runtime, State, WebviewWindow};
 use tine_core::crdt::ManagedSyncStoreState;
 use tine_core::model::Graph;
-use tine_core::sync_runtime::SyncRuntimeHandle;
 
 pub(crate) type WindowKey = String;
 pub(crate) const SPARSE_V2_UNSUPPORTED: &str = "unsupported in sparse v2";
@@ -25,12 +26,12 @@ pub(crate) struct CaptureGraphBinding {
 
 /// The single write authority retained for one graph/window binding.
 ///
-/// Sparse v2 is deliberately not routed through the legacy Tauri surfaces yet.
-/// Keeping the variants mutually exclusive prevents a binding from retaining both
-/// a legacy `Graph` writer and a sparse runtime actor.
+/// Sparse v2 has its own bounded commands and is never routed through legacy
+/// Tauri graph surfaces. Keeping the variants mutually exclusive prevents a
+/// binding from retaining both a legacy `Graph` writer and a sparse actor.
 pub(crate) enum GraphAuthority {
     Legacy(Arc<Graph>),
-    SparseV2(SyncRuntimeHandle),
+    SparseV2(crate::sync_runtime::SparseV2Binding),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -54,14 +55,6 @@ impl GraphAuthority {
         }
     }
 
-    fn legacy_graph(&self) -> Result<&Graph, String> {
-        require_legacy_authority(self.kind())?;
-        match self {
-            Self::Legacy(graph) => Ok(graph),
-            Self::SparseV2(_) => unreachable!("sparse authority was rejected above"),
-        }
-    }
-
     fn legacy_graph_cloned(&self) -> Result<Arc<Graph>, String> {
         require_legacy_authority(self.kind())?;
         match self {
@@ -75,8 +68,53 @@ impl GraphAuthority {
     }
 }
 
+#[derive(Default)]
+struct LegacyLeaseState {
+    retiring: bool,
+    active: usize,
+}
+
+#[derive(Default)]
+struct LegacyLeaseTracker {
+    state: Mutex<LegacyLeaseState>,
+    drained: Condvar,
+}
+
+/// A tracked use of the legacy graph authority.
+///
+/// Promotion first prevents new leases and removes the graph slot, then waits
+/// for every instance of this type to drop. Watcher/background/async clones all
+/// use the same tracker, including clones retained across a same-root refresh.
+pub(crate) struct LegacyGraphLease {
+    graph: Arc<Graph>,
+    tracker: Arc<LegacyLeaseTracker>,
+}
+
+impl Deref for LegacyGraphLease {
+    type Target = Graph;
+
+    fn deref(&self) -> &Self::Target {
+        &self.graph
+    }
+}
+
+impl Drop for LegacyGraphLease {
+    fn drop(&mut self) {
+        let mut state = self.tracker.state.lock().unwrap();
+        state.active = state
+            .active
+            .checked_sub(1)
+            .expect("legacy graph lease count underflow");
+        if state.active == 0 {
+            self.tracker.drained.notify_all();
+        }
+    }
+}
+
 pub(crate) struct GraphSlot {
     authority: GraphAuthority,
+    legacy_leases: Option<Arc<LegacyLeaseTracker>>,
+    graph_meta: tine_core::model::GraphMeta,
     pub(crate) root_key: PathBuf,
     /// Unique lease for this exact window→graph binding. Frontend mutations carry
     /// it so an IPC queued before an in-place graph switch cannot execute against
@@ -86,57 +124,145 @@ pub(crate) struct GraphSlot {
     pub(crate) warm_generation: AtomicU64,
     /// Revoked as soon as this exact window→graph binding is replaced/removed.
     /// Detached warm/backup workers check it before and during graph-sized work.
-    pub(crate) background_cancelled: AtomicBool,
+    pub(crate) background_cancelled: Arc<AtomicBool>,
 }
 
 impl GraphSlot {
     pub(crate) fn new(graph: Graph, root_key: PathBuf) -> Self {
+        let graph_meta = graph.meta();
         Self {
             authority: GraphAuthority::Legacy(Arc::new(graph)),
+            legacy_leases: Some(Arc::new(LegacyLeaseTracker::default())),
+            graph_meta,
             root_key,
             binding_generation: NEXT_BINDING.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             warm_done: AtomicBool::new(false),
             warm_generation: AtomicU64::new(0),
-            background_cancelled: AtomicBool::new(false),
+            background_cancelled: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    /// Construct the future sparse-v2 binding by transferring an already-open
-    /// actor handle into the slot. This is intentionally not reachable from a
-    /// command or normal graph loading; the slot contains no legacy `Graph`.
-    pub(crate) fn from_sparse_v2(handle: SyncRuntimeHandle, root_key: PathBuf) -> Self {
+    /// Transfer one active or visibly unavailable sparse-v2 binding into the
+    /// graph slot. The slot contains no legacy `Graph`.
+    pub(crate) fn from_sparse_v2(
+        binding: crate::sync_runtime::SparseV2Binding,
+        root_key: PathBuf,
+        graph_meta: tine_core::model::GraphMeta,
+    ) -> Self {
         Self {
-            authority: GraphAuthority::SparseV2(handle),
+            authority: GraphAuthority::SparseV2(binding),
+            legacy_leases: None,
+            graph_meta,
             root_key,
             binding_generation: NEXT_BINDING.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             warm_done: AtomicBool::new(false),
             warm_generation: AtomicU64::new(0),
-            background_cancelled: AtomicBool::new(false),
+            background_cancelled: Arc::new(AtomicBool::new(false)),
         }
     }
 
     /// The legacy-only authority gate used by all existing Tauri graph paths.
-    pub(crate) fn legacy_graph(&self) -> Result<&Graph, String> {
-        self.authority.legacy_graph()
+    pub(crate) fn legacy_graph(&self) -> Result<LegacyGraphLease, String> {
+        let graph = self.authority.legacy_graph_cloned()?;
+        let tracker = self
+            .legacy_leases
+            .as_ref()
+            .expect("legacy authority always has a lease tracker");
+        let mut state = tracker.state.lock().unwrap();
+        if state.retiring {
+            return Err("legacy graph authority is retiring".into());
+        }
+        state.active = state
+            .active
+            .checked_add(1)
+            .ok_or("legacy graph lease count exhausted")?;
+        drop(state);
+        Ok(LegacyGraphLease {
+            graph,
+            tracker: Arc::clone(tracker),
+        })
     }
 
     /// Clone the legacy writer only after the authority gate has admitted it.
-    pub(crate) fn legacy_graph_cloned(&self) -> Result<Arc<Graph>, String> {
-        self.authority.legacy_graph_cloned()
+    pub(crate) fn legacy_graph_cloned(&self) -> Result<LegacyGraphLease, String> {
+        self.legacy_graph()
     }
 
     pub(crate) fn is_sparse_v2(&self) -> bool {
         self.authority.is_sparse_v2()
     }
 
-    /// Borrow the actor only through the slot that owns it. No sparse command
-    /// routing exists in this packet; a later integration boundary can forward
-    /// actor requests through this borrow without creating a second registry.
-    pub(crate) fn sparse_runtime(&self) -> Option<&SyncRuntimeHandle> {
+    pub(crate) fn graph_meta(&self) -> tine_core::model::GraphMeta {
+        self.graph_meta.clone()
+    }
+
+    /// Borrow the actor only through the graph slot that owns it.
+    pub(crate) fn sparse_runtime(&self) -> Option<&tine_core::sync_runtime::SyncRuntimeHandle> {
         match &self.authority {
             GraphAuthority::Legacy(_) => None,
-            GraphAuthority::SparseV2(handle) => Some(handle),
+            GraphAuthority::SparseV2(binding) => binding.handle(),
         }
+    }
+
+    pub(crate) fn sparse_binding(&self) -> Option<&crate::sync_runtime::SparseV2Binding> {
+        match &self.authority {
+            GraphAuthority::Legacy(_) => None,
+            GraphAuthority::SparseV2(binding) => Some(binding),
+        }
+    }
+
+    /// Prevent new legacy work before the registry binding is removed.
+    pub(crate) fn begin_legacy_retirement(&self) -> Result<(), String> {
+        require_legacy_authority(self.authority.kind())?;
+        let tracker = self
+            .legacy_leases
+            .as_ref()
+            .expect("legacy authority always has a lease tracker");
+        tracker.state.lock().unwrap().retiring = true;
+        self.background_cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    /// Bounded proof that no watcher, background task, or command can still use
+    /// this legacy `Graph`.
+    pub(crate) fn wait_for_legacy_drain(&self, timeout: Duration) -> Result<(), String> {
+        let tracker = self
+            .legacy_leases
+            .as_ref()
+            .ok_or_else(|| SPARSE_V2_UNSUPPORTED.to_string())?;
+        let deadline = Instant::now() + timeout;
+        let mut state = tracker.state.lock().unwrap();
+        while state.active != 0 {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(format!(
+                    "legacy graph authority did not drain {} retained lease(s)",
+                    state.active
+                ));
+            }
+            let (next, wait) = tracker.drained.wait_timeout(state, remaining).unwrap();
+            state = next;
+            if wait.timed_out() && state.active != 0 {
+                return Err(format!(
+                    "legacy graph authority did not drain {} retained lease(s)",
+                    state.active
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn cancel_legacy_retirement(&self) -> Result<(), String> {
+        require_legacy_authority(self.authority.kind())?;
+        let tracker = self
+            .legacy_leases
+            .as_ref()
+            .expect("legacy authority always has a lease tracker");
+        tracker.state.lock().unwrap().retiring = false;
+        self.background_cancelled
+            .store(false, std::sync::atomic::Ordering::Release);
+        Ok(())
     }
 
     /// Re-open the graph object for the same window/root without revoking the
@@ -147,9 +273,13 @@ impl GraphSlot {
     fn refreshed(graph: Graph, old: &GraphSlot) -> Result<Self, String> {
         // Refresh is a legacy whole-graph reopen. Refuse before replacing the
         // slot so a sparse actor remains the sole authority for its binding.
-        old.legacy_graph()?;
+        let old_graph = old.legacy_graph()?;
+        drop(old_graph);
+        let graph_meta = graph.meta();
         Ok(Self {
             authority: GraphAuthority::Legacy(Arc::new(graph)),
+            legacy_leases: old.legacy_leases.clone(),
+            graph_meta,
             root_key: old.root_key.clone(),
             binding_generation: old.binding_generation,
             warm_done: AtomicBool::new(old.warm_done.load(std::sync::atomic::Ordering::Acquire)),
@@ -157,7 +287,7 @@ impl GraphSlot {
                 old.warm_generation
                     .load(std::sync::atomic::Ordering::Acquire),
             ),
-            background_cancelled: AtomicBool::new(false),
+            background_cancelled: Arc::clone(&old.background_cancelled),
         })
     }
 }
@@ -234,8 +364,8 @@ pub(crate) struct AppState {
     pub(crate) watch_ctl: Mutex<Option<Sender<()>>>,
     pub(crate) last_focused: Mutex<Option<WindowKey>>,
     pub(crate) capture_graph: Mutex<Option<CaptureGraphBinding>>,
-    /// Explicit, inactive sparse runtime opener. Normal graph loading never
-    /// consults it, and it retains no runtime handle.
+    /// Stateless sparse runtime composition. It retains no runtime handle;
+    /// active authority lives only in the corresponding graph slot.
     pub(crate) sync_runtime: crate::sync_runtime::SyncRuntimeFacade,
     #[cfg(desktop)]
     pub(crate) next_window: AtomicU64,
@@ -375,11 +505,16 @@ pub(crate) fn with_graph<T>(
     f: impl FnOnce(&Graph) -> Result<T, String>,
 ) -> Result<T, String> {
     let slot = slot_for_context(ctx)?;
-    f(slot.legacy_graph()?)
+    let graph = slot.legacy_graph()?;
+    f(&graph)
 }
 
 pub(crate) fn refresh_graph(ctx: &GraphContext<'_>) -> Result<(), String> {
     let label = ctx.window.label().to_string();
+    // Refresh may migrate graph files before publishing its replacement slot.
+    // Serialize the whole operation with graph loads and sparse-v2 promotion so
+    // no legacy writer can be reopened after authority retirement begins.
+    let _transition = ctx.state.graph_load.lock().unwrap();
     let old = slot_for_window(&ctx.state, &label)?;
     old.legacy_graph()?;
     let approved =
@@ -443,10 +578,10 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<GraphAuthority>();
         assert_send_sync::<GraphSlot>();
-        let _sparse_constructor: fn(SyncRuntimeHandle, PathBuf) -> GraphSlot =
-            GraphSlot::from_sparse_v2;
-        let _sparse_runtime: for<'a> fn(&'a GraphSlot) -> Option<&'a SyncRuntimeHandle> =
-            GraphSlot::sparse_runtime;
+        let _sparse_runtime: for<'a> fn(
+            &'a GraphSlot,
+        )
+            -> Option<&'a tine_core::sync_runtime::SyncRuntimeHandle> = GraphSlot::sparse_runtime;
 
         let _ = std::fs::remove_dir_all(base);
     }
@@ -461,15 +596,14 @@ mod tests {
 
         // `GraphSlot::refreshed` starts with the same legacy-only gate before
         // it can construct a replacement, so a sparse binding cannot be
-        // replaced/revoked by config refresh. An active public sparse fixture
-        // is intentionally unavailable to this crate at this boundary.
+        // replaced/revoked by config refresh.
         let source = include_str!("state.rs");
-        assert!(source.contains("old.legacy_graph()?;"));
+        assert!(source.contains("old.legacy_graph()?"));
+        assert!(source.contains("wait_for_legacy_drain"));
         let public_graph_field = ["pub(crate) graph", ": Arc<Graph>"].concat();
         assert!(!source.contains(&public_graph_field));
-        assert!(!include_str!("graph.rs").contains("from_sparse_v2"));
         assert!(!include_str!("commands.rs").contains("from_sparse_v2"));
-        assert!(!include_str!("lib.rs").contains("from_sparse_v2"));
+        assert!(include_str!("graph.rs").contains("from_sparse_v2"));
     }
 
     #[test]
@@ -543,6 +677,28 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Acquire),
             7
         );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn legacy_retirement_refuses_new_work_and_proves_every_retained_lease_drained() {
+        let base = std::env::temp_dir().join(format!("tine-slot-drain-{}", uuid::Uuid::new_v4()));
+        let slot = graph(&base);
+        let retained = slot.legacy_graph_cloned().unwrap();
+
+        slot.begin_legacy_retirement().unwrap();
+        assert_eq!(
+            slot.legacy_graph().err().as_deref(),
+            Some("legacy graph authority is retiring")
+        );
+        assert!(slot
+            .wait_for_legacy_drain(Duration::from_millis(1))
+            .is_err());
+
+        drop(retained);
+        slot.wait_for_legacy_drain(Duration::from_secs(1)).unwrap();
+        slot.cancel_legacy_retirement().unwrap();
+        assert!(slot.legacy_graph().is_ok());
         let _ = std::fs::remove_dir_all(base);
     }
 

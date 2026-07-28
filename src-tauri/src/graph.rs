@@ -154,6 +154,20 @@ struct LoadedGraph {
     launch_backup_done: bool,
 }
 
+fn refuse_unclaimed_sparse_archive(root: &Path) -> Result<(), String> {
+    let archive = root.join(".tine-sync/v2");
+    match std::fs::symlink_metadata(&archive) {
+        Ok(_) => Err(
+            "sparse-v2 archive exists without its private app-data binding; legacy graph open refused"
+                .into(),
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "couldn't inspect sparse-v2 archive before legacy graph open: {error}"
+        )),
+    }
+}
+
 fn open_graph_for_load(
     root: &str,
     approved_assets: Option<&Path>,
@@ -264,7 +278,7 @@ pub(crate) fn load_graph_for_label(
         if owner == window_label {
             let slot = slot_for_window(&state, &owner)?;
             return Ok(LoadGraphResult::AlreadyCurrent {
-                meta: slot.legacy_graph()?.meta(),
+                meta: slot.graph_meta(),
                 binding_generation: slot.binding_generation,
             });
         }
@@ -287,6 +301,35 @@ pub(crate) fn load_graph_for_label(
             window_label: owner,
         });
     }
+    if let Some(record) = state.sync_runtime.binding_record(app, &root_key)? {
+        let meta = crate::sync_runtime::SyncRuntimeFacade::graph_meta(&record);
+        let binding = state.sync_runtime.open_record(app, &record)?;
+        let slot = Arc::new(GraphSlot::from_sparse_v2(
+            binding,
+            root_key.clone(),
+            meta.clone(),
+        ));
+        state
+            .graphs
+            .write()
+            .unwrap()
+            .bind(window_label.to_string(), Arc::clone(&slot))?;
+        state.note_focused(window_label);
+        poke_watcher(state);
+        remember_graph(app, &meta.root)?;
+        if let Some(window) = app.get_webview_window(window_label) {
+            let name = Path::new(&meta.root)
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("Graph");
+            let _ = window.set_title(&format!("Tine — {name}"));
+        }
+        return Ok(LoadGraphResult::Loaded {
+            meta,
+            binding_generation: slot.binding_generation,
+        });
+    }
+    refuse_unclaimed_sparse_archive(&root_key)?;
     let root = root_key.display().to_string();
     let approved_assets = approved_external_assets(app, &root_key);
     let LoadedGraph {
@@ -594,6 +637,18 @@ mod tests {
             }
         }
         (copied, !failed)
+    }
+
+    #[test]
+    fn unclaimed_sparse_archive_refuses_legacy_graph_open() {
+        let dir = scratch("unclaimed-sparse");
+        assert_eq!(refuse_unclaimed_sparse_archive(&dir), Ok(()));
+        std::fs::create_dir_all(dir.join(".tine-sync/v2")).unwrap();
+        assert_eq!(
+            refuse_unclaimed_sparse_archive(&dir).unwrap_err(),
+            "sparse-v2 archive exists without its private app-data binding; legacy graph open refused"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

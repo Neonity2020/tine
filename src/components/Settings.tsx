@@ -107,7 +107,7 @@ import { ShortcutsSettingsPane } from "./HelpShortcuts";
 import { switchGraph, loadGraphPath } from "../graph";
 import { flushAll } from "../store";
 import { backend, isTauri, type BackupInfo } from "../backend";
-import type { AssetInfo, TrashStats, JournalFile, SyncConflict, SyncConflictDiff, DiffRow, MergeDecision, ManagedSyncStatus } from "../types";
+import type { AssetInfo, TrashStats, JournalFile, SyncConflict, SyncConflictDiff, DiffRow, MergeDecision, SparseV2Status } from "../types";
 import { formatJournal } from "../journal";
 import { installedPlugins, pluginManager, type ManagedPlugin } from "../plugins/manager";
 import {
@@ -208,6 +208,7 @@ const SETTING_SEARCH: SettingSearchEntry[] = [
   { tab: "files", label: "Diagram editors", description: "drawio Excalidraw commands", level: "advanced" },
   { tab: "backups", label: "Snapshots to keep", description: "recovery retention conflicts" },
   { tab: "graph", label: "Graph", description: "folder export publish" },
+  { tab: "graph", label: "Managed sync", description: "experimental sparse v2 operation log recovery" },
   { tab: "improve", label: "Help improve Tine", description: "diagnostics divergences anonymize" },
   { tab: "shortcuts", label: "Keyboard shortcuts", description: "key bindings commands remap" },
   { tab: "about", label: "About", description: "version licenses updates" },
@@ -1879,16 +1880,28 @@ function GraphTab(props: { publishMsg: string; doPublish: () => void }): JSX.Ele
 }
 
 function ManagedSyncPanel(): JSX.Element {
-  const [status, setStatus] = createSignal<ManagedSyncStatus | null>(null);
+  const [status, setStatus] = createSignal<SparseV2Status | null>(null);
   const [loading, setLoading] = createSignal(true);
   const [enabling, setEnabling] = createSignal(false);
+  const retryable = () => {
+    const value = status();
+    return value?.state === "retryable" ? value : null;
+  };
+  const blocked = () => {
+    const value = status();
+    return value?.state === "blocked" ? value : null;
+  };
+  const refused = () => {
+    const value = status();
+    return value?.state === "refused" ? value : null;
+  };
 
   const refresh = async () => {
     setLoading(true);
     try {
-      setStatus(await backend().managedSyncStatus());
+      setStatus(await backend().sparseV2Status());
     } catch (error) {
-      pushToast(`Couldn't read managed sync status: ${String(error)}`, "error");
+      pushToast(`Couldn't read sparse-v2 status: ${String(error)}`, "error");
     } finally {
       setLoading(false);
     }
@@ -1900,26 +1913,28 @@ function ManagedSyncPanel(): JSX.Element {
     setGraphTransitioning(true);
     try {
       if (!(await flushAll())) {
-        pushToast("Resolve pending save conflicts before enabling managed sync.", "error");
+        pushToast("Resolve pending save conflicts before enabling sparse v2.", "error");
         return;
       }
-      const plan = await backend().managedSyncIdentityPlan();
       const confirmed = await backend().confirm(
-        `Enable experimental managed sync for this graph?\n\n` +
-          `Tine will first make a local safety snapshot, then add durable IDs to ` +
-          `${plan.blocks} block${plan.blocks === 1 ? "" : "s"} across ` +
-          `${plan.pages} page${plan.pages === 1 ? "" : "s"}. ` +
-          `Your existing Syncthing or Dropbox folder remains usable by Logseq and other tools.`
+        `Enable experimental sparse-v2 storage for this graph?\n\n` +
+          `Tine will create and verify a private app-data operation log, SQLite projection, ` +
+          `and restore proof before changing authority. Existing Markdown/Org bytes stay in place. ` +
+          `Only the immutable archive namespace .tine-sync/v2 is created inside the graph. ` +
+          `This explicit opt-in will be resumed on later starts and legacy writer routes will be refused.`
       );
       if (!confirmed) return;
-      const result = await backend().enableManagedSync();
-      setStatus(result.status);
-      pushToast(
-        `Managed sync enabled for ${result.status.page_count} page${result.status.page_count === 1 ? "" : "s"}.`,
-        "success"
-      );
+      const result = await backend().activateSparseV2();
+      setStatus(result);
+      if (result.state === "active") {
+        pushToast("Sparse-v2 operation-log authority is active.", "success");
+      } else if (result.state === "retryable") {
+        pushToast(`Sparse-v2 activation can be retried from ${result.stage}.`, "error");
+      } else {
+        pushToast("Sparse-v2 activation is blocked; the graph was not returned to legacy writes.", "error");
+      }
     } catch (error) {
-      pushToast(`Managed sync was not enabled: ${String(error)}`, "error");
+      pushToast(`Sparse v2 was not enabled: ${String(error)}`, "error");
     } finally {
       setGraphTransitioning(false);
       setEnabling(false);
@@ -1936,28 +1951,65 @@ function ManagedSyncPanel(): JSX.Element {
         <Show
           when={status()}
           fallback={
-            <div class="settings-row">
-              <span class="settings-label">Operation log</span>
-              <div>
-                <button class="settings-btn" disabled={enabling()} onClick={() => void enable()}>
-                  {enabling() ? "Enabling…" : "Enable managed sync…"}
-                </button>
-                <div class="settings-hint" style={{ "margin-top": "6px" }}>
-                  Experimental · keeps the Markdown graph shared beside <code>.tine-sync/</code>
-                </div>
-              </div>
-            </div>
+            <div class="settings-hint settings-block">Sparse-v2 status is unavailable.</div>
           }
         >
-          {(active) => (
+          {(current) => (
             <div class="settings-row">
               <span class="settings-label">Operation log</span>
               <div>
-                <span class="settings-value">Active</span>
-                <div class="settings-hint" style={{ "margin-top": "4px" }}>
-                  {active().page_count} pages · {active().imported_chunks} immutable updates
+                <Show when={current().state === "legacy_default"}>
+                  <button class="settings-btn" disabled={enabling()} onClick={() => void enable()}>
+                    {enabling() ? "Enabling…" : "Enable sparse v2…"}
+                  </button>
+                </Show>
+                <Show when={retryable()}>
+                  <button class="settings-btn" disabled={enabling()} onClick={() => void enable()}>
+                    {enabling() ? "Retrying…" : "Retry sparse-v2 activation"}
+                  </button>
+                </Show>
+                <Show when={current().state === "active"}>
+                  <span class="settings-value">Active · sparse v2</span>
+                </Show>
+                <Show when={blocked()}>
+                  {(value) => (
+                    <span class="settings-value">Blocked · {value().reason_code}</span>
+                  )}
+                </Show>
+                <Show when={refused()}>
+                  {(value) => (
+                    <span class="settings-value">Refused · {value().reason_code}</span>
+                  )}
+                </Show>
+                <Show when={retryable()}>
+                  {(value) => (
+                    <div class="settings-hint" style={{ "margin-top": "4px" }}>
+                      Resume point: {value().stage} · {value().detail}
+                    </div>
+                  )}
+                </Show>
+                <Show when={current().runtime}>
+                  {(runtime) => (
+                    <>
+                      <div class="settings-hint" style={{ "margin-top": "4px" }}>
+                        Runtime: {runtime().lifecycle}
+                        {runtime().recovery ? ` · recovery: ${runtime().recovery}` : ""}
+                      </div>
+                      <Show when={runtime().watcher.pending || runtime().watcher.deferred}>
+                        <div class="settings-hint">
+                          External changes pending
+                          {runtime().watcher.pending_requires_full_scan ? " · recovery scan required" : ""}
+                        </div>
+                      </Show>
+                      <Show when={runtime().detail}>
+                        <div class="settings-hint">{runtime().detail}</div>
+                      </Show>
+                    </>
+                  )}
+                </Show>
+                <div class="settings-hint" style={{ "margin-top": "6px" }}>
+                  Experimental · explicit per graph · private app-data state · never default-enabled
                 </div>
-                <div class="settings-hint mono">{active().store_root}</div>
               </div>
             </div>
           )}

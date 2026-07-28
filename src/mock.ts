@@ -3,7 +3,7 @@
 // backend's shape so the UI behaves identically.
 
 import type { Backend, GpuEnv, DebugInfo, InstalledPluginRecord, PluginRegistryCacheEnvelope } from "./backend";
-import type { BacklinkFilterContext, BacklinkFilterTarget, BlockDto, BlockPreview, GuideCopyResult, GuidePage, Highlight, ManagedSyncStatus, PageDto, PageEntry, PdfState, QueryExecution, QueryExportBatch, QueryExportSpec, RefGroup } from "./types";
+import type { BacklinkFilterContext, BacklinkFilterTarget, BlockDto, BlockPreview, GuideCopyResult, GuidePage, Highlight, ManagedSyncStatus, PageDto, PageEntry, PdfState, QueryExecution, QueryExportBatch, QueryExportSpec, RefGroup, SparseV2Status } from "./types";
 import { SAMPLE_PDF_B64 } from "./sample-pdf";
 import { hlsPageName } from "./pdf";
 import { MARKER_RE } from "./markers";
@@ -632,6 +632,13 @@ function cloneGuideBlockForCopy(block: BlockDto, copied: Map<string, string>): B
 export function mockBackend(): Backend {
   const all = [...PAGES, ...NAMED];
   let managedSync: ManagedSyncStatus | null = null;
+  let sparseV2: SparseV2Status = {
+    state: "legacy_default",
+    runtime: null,
+    can_activate: true,
+    can_retry: false,
+    binding_generation: 1,
+  };
   const find = (name: string) =>
     all.find((p) => p.name.toLowerCase() === name.toLowerCase()) ?? null;
 
@@ -875,6 +882,55 @@ export function mockBackend(): Backend {
         migration: { pages_changed: all.length, blocks_changed: 42 },
         status: managedSync,
       };
+    },
+    async sparseV2Status() {
+      return sparseV2;
+    },
+    async activateSparseV2() {
+      sparseV2 = {
+        state: "active",
+        runtime: {
+          lifecycle: "active",
+          recovery: "first_promotion",
+          watcher: {
+            latest_enqueue: 0,
+            acknowledged: 0,
+            drain_in_flight: false,
+            pending: false,
+            pending_requires_full_scan: false,
+            deferred: false,
+            quiescing: false,
+            sequence_exhausted: false,
+          },
+          last_tick: null,
+          detail: null,
+        },
+        can_activate: false,
+        can_retry: false,
+        binding_generation: sparseV2.binding_generation + 1,
+      };
+      return sparseV2;
+    },
+    async sparseV2Query() {
+      return { kind: "pages", value: [] };
+    },
+    async sparseV2EditorLoad() {
+      return { status: "missing_page" };
+    },
+    async sparseV2EditorSave() {
+      return { status: "conflict", reason: "missing_page" };
+    },
+    async sparseV2Tick() {
+      return { state: "idle", detail: null, epoch: null };
+    },
+    async sparseV2CleanShutdown() {
+      if (!sparseV2.runtime) throw new Error("sparse v2 is not active");
+      const runtime = { ...sparseV2.runtime, lifecycle: "stopped_safe" as const };
+      sparseV2 = {
+        ...sparseV2,
+        runtime,
+      };
+      return runtime;
     },
     async guidePages(): Promise<GuidePage[]> {
       return mockGuidePages().map((g) => ({ ...g, page: clonePage(g.page) }));

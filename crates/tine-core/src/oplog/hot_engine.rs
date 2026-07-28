@@ -11319,15 +11319,19 @@ impl ShardedHotEngine {
         for document in state.frontier.documents() {
             for batch_id in document.direct_dependency_heads() {
                 accepted_heads = accepted_heads.saturating_add(1);
-                if !matches!(
+                let accepted = matches!(
                     self.archive_status(*batch_id)?,
                     Some(ArchiveStatus::Accepted { .. })
-                ) || !matches!(
+                );
+                let ordinary_ready = matches!(
                     store
                         .inspect_batch(*batch_id)
                         .map_err(|error| EngineError::Archive(error.to_string()))?,
                     BatchInspection::Ready(_)
-                ) {
+                );
+                let bootstrap_ready =
+                    !ordinary_ready && self.load_retained_bootstrap_part(*batch_id)?.is_some();
+                if !accepted || (!ordinary_ready && !bootstrap_ready) {
                     return Err(EngineError::ProjectionFrontierNotDurable(*batch_id));
                 }
             }
@@ -11335,6 +11339,49 @@ impl ShardedHotEngine {
         if accepted_heads == 0 {
             return Err(EngineError::ProjectionAuthorizationUnavailable);
         }
+        Ok(ProjectionWriteAuthorization {
+            state,
+            claim_root: self.logseq_claim_root,
+        })
+    }
+
+    /// Authorize read-only receipt confirmation for a page admitted by the
+    /// immutable bootstrap publication.
+    ///
+    /// Bootstrap batches live in their own archive namespace, so the ordinary
+    /// projection writer's per-batch `inspect_batch` check cannot recognize
+    /// them. This narrower authority requires a promoted lineage and an exact
+    /// current-catalog owner; callers still have to prove the graph bytes
+    /// unchanged before publishing a receipt.
+    pub(crate) fn authorize_bootstrap_projection_confirmation(
+        &self,
+        page_id: PageId,
+    ) -> Result<ProjectionWriteAuthorization, EngineError> {
+        self.begin_point_operation();
+        self.ensure_not_blocked()?;
+        if self.promoted_lineage().is_none() || self.archive_store.is_none() {
+            return Err(EngineError::ProjectionAuthorizationUnavailable);
+        }
+        let state = self.materialize_page_for_projection(page_id)?;
+        let owner = self
+            .current_path_catalog_row_at_path(&state.page.path)?
+            .ok_or(EngineError::ProjectionAuthorizationUnavailable)?;
+        if owner.page_id() != page_id {
+            return Err(EngineError::ProjectionAuthorizationUnavailable);
+        }
+        let mut bootstrap_heads = 0_usize;
+        for document in state.frontier.documents() {
+            for batch_id in document.direct_dependency_heads() {
+                bootstrap_heads = bootstrap_heads.saturating_add(1);
+                if self.load_retained_bootstrap_part(*batch_id)?.is_none() {
+                    return Err(EngineError::ProjectionAuthorizationUnavailable);
+                }
+            }
+        }
+        if bootstrap_heads == 0 {
+            return Err(EngineError::ProjectionAuthorizationUnavailable);
+        }
+        self.projection_completion_history_authority()?;
         Ok(ProjectionWriteAuthorization {
             state,
             claim_root: self.logseq_claim_root,

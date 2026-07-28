@@ -64,6 +64,7 @@ use crate::oplog::operational_coordinator::{
     LocalMutationBlockReason, LocalMutationCoordinatorState, LocalMutationRecovery,
     LocalPublishedContinuation, OperationalCoordinator, OperationalPhase,
 };
+use crate::oplog::projection::confirm_existing_projection_exact;
 use crate::oplog::projection_store::ProjectionReceiptStore;
 use crate::oplog::reconciliation_baseline::{
     BaselineTimestamp, ReconciliationBaseline, ReconciliationBaselineBinding,
@@ -112,6 +113,10 @@ pub const MAX_SYNC_EDITOR_TEMP_KEY_BYTES: usize = 256;
 /// Aggregate retained editor request bytes, independently of per-field caps.
 pub const MAX_SYNC_EDITOR_REQUEST_BYTES: usize = MAX_LOCAL_MUTATION_TEXT_BYTES;
 const MAX_EDITOR_SETTLE_TURNS: usize = 64;
+const BOOTSTRAP_RECEIPT_MARKER_SCHEMA_VERSION: u32 = 1;
+const BOOTSTRAP_RECEIPT_MARKER_FILE: &str = "bootstrap-projection-receipts-v1.json";
+const MAX_BOOTSTRAP_RECEIPT_MARKER_BYTES: u64 = 4096;
+static BOOTSTRAP_RECEIPT_MARKER_LOCK: Mutex<()> = Mutex::new(());
 
 #[cfg(test)]
 static ACTOR_THREADS_STARTED: std::sync::atomic::AtomicUsize =
@@ -127,6 +132,22 @@ thread_local! {
     };
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BootstrapReceiptMarker {
+    schema_version: u32,
+    enrollment_binding_digest: ContentDigest,
+}
+
+impl BootstrapReceiptMarker {
+    fn for_binding(binding: &EnrollmentBindingV1) -> Result<Self, String> {
+        Ok(Self {
+            schema_version: BOOTSTRAP_RECEIPT_MARKER_SCHEMA_VERSION,
+            enrollment_binding_digest: binding.binding_digest().map_err(display)?,
+        })
+    }
+}
+
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ActivationTestCut {
@@ -134,6 +155,7 @@ enum ActivationTestCut {
     AfterArchiveClaimBeforeEnrollmentHead,
     AfterShadowImport,
     AfterVerifiedLocal,
+    AfterBootstrapReceipt,
 }
 
 #[cfg(test)]
@@ -151,6 +173,7 @@ fn activation_cut(cut: &'static str) -> Result<(), String> {
             }
             "after_shadow_import" => ActivationTestCut::AfterShadowImport,
             "after_verified_local" => ActivationTestCut::AfterVerifiedLocal,
+            "after_bootstrap_receipt" => ActivationTestCut::AfterBootstrapReceipt,
             _ => return Ok(()),
         };
         if ACTIVATION_TEST_CUT.with(|pending| {
@@ -802,7 +825,12 @@ pub enum SyncRuntimeQueryRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(
+    tag = "kind",
+    content = "value",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 pub enum SyncRuntimeQueryReply {
     Page(Option<SyncPageDto>),
     PageName(SyncPageNameResolutionDto),
@@ -1905,6 +1933,14 @@ fn activate_non_active_local(
             error.to_string()
         })?;
 
+    confirm_bootstrap_projection_receipts(
+        graph,
+        &receipts,
+        promoted.engine(),
+        &application_runtime_root,
+        &binding,
+    )?;
+
     // The actor will reopen this exact database. Creating or validating the
     // baseline before that handout makes reconciliation a proven prerequisite
     // of the retained public handle rather than a deferred first-tick action.
@@ -1915,6 +1951,119 @@ fn activate_non_active_local(
     drop(promoted);
     drop(authority);
     Ok(())
+}
+
+fn confirm_bootstrap_projection_receipts(
+    graph: &Graph,
+    receipts: &ProjectionReceiptStore,
+    engine: &crate::oplog::ShardedHotEngine,
+    runtime_root: &ApplicationRuntimeRoot,
+    binding: &EnrollmentBindingV1,
+) -> Result<(), String> {
+    const PAGE_ROWS: usize = 32;
+    let marker = BootstrapReceiptMarker::for_binding(binding)?;
+    let marker_path = runtime_root.path().join(BOOTSTRAP_RECEIPT_MARKER_FILE);
+    if bootstrap_receipt_marker_matches(&marker_path, &marker)? {
+        return Ok(());
+    }
+    let binding = engine.current_path_catalog_binding().map_err(display)?;
+    let mut remaining = binding.catalog_rows();
+    let mut cursor = (remaining != 0)
+        .then(|| engine.begin_current_path_cursor())
+        .transpose()
+        .map_err(display)?;
+    while let Some(current) = cursor {
+        let page = engine
+            .current_path_cursor_page(current, PAGE_ROWS)
+            .map_err(display)?;
+        let (rows, next) = page.into_parts();
+        let row_count = u64::try_from(rows.len())
+            .map_err(|_| "bootstrap receipt page length exceeds u64".to_owned())?;
+        remaining = remaining.checked_sub(row_count).ok_or_else(|| {
+            "bootstrap receipt cursor exceeded authenticated row count".to_owned()
+        })?;
+        for row in rows {
+            let completed = engine
+                .projection_work_index()
+                .map_err(display)?
+                .completed_receipts_for_path(row.path())
+                .map_err(display)?;
+            if completed.is_empty() {
+                confirm_existing_projection_exact(graph, receipts, engine, row.page_id())
+                    .map_err(display)?;
+                activation_cut("after_bootstrap_receipt")?;
+            }
+        }
+        cursor = next;
+    }
+    if remaining != 0 {
+        return Err(format!(
+            "bootstrap receipt cursor ended with {remaining} authenticated rows missing"
+        ));
+    }
+    persist_bootstrap_receipt_marker(&marker_path, &marker)?;
+    Ok(())
+}
+
+fn bootstrap_receipt_marker_matches(
+    path: &Path,
+    expected: &BootstrapReceiptMarker,
+) -> Result<bool, String> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(format!(
+                "cannot inspect bootstrap receipt completion marker: {error}"
+            ));
+        }
+    };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > MAX_BOOTSTRAP_RECEIPT_MARKER_BYTES
+    {
+        return Err("bootstrap receipt completion marker has unsafe shape".into());
+    }
+    let bytes = fs::read(path)
+        .map_err(|error| format!("cannot read bootstrap receipt completion marker: {error}"))?;
+    let marker: BootstrapReceiptMarker = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("bootstrap receipt completion marker is corrupt: {error}"))?;
+    let canonical = serde_json::to_vec(&marker)
+        .map_err(|error| format!("cannot encode bootstrap receipt completion marker: {error}"))?;
+    if canonical != bytes {
+        return Err("bootstrap receipt completion marker is not canonical".into());
+    }
+    if &marker != expected {
+        return Err("bootstrap receipt completion marker names another enrollment".into());
+    }
+    Ok(true)
+}
+
+fn persist_bootstrap_receipt_marker(
+    path: &Path,
+    marker: &BootstrapReceiptMarker,
+) -> Result<(), String> {
+    let encoded = serde_json::to_string(marker)
+        .map_err(|error| format!("cannot encode bootstrap receipt completion marker: {error}"))?;
+    crate::model::atomic_update(path, &BOOTSTRAP_RECEIPT_MARKER_LOCK, |content| {
+        if content != "{}\n" {
+            let existing: BootstrapReceiptMarker =
+                serde_json::from_str(content).map_err(|error| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("bootstrap receipt completion marker is corrupt: {error}"),
+                    )
+                })?;
+            if &existing != marker {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "bootstrap receipt completion marker names another enrollment",
+                ));
+            }
+        }
+        Ok(encoded.clone())
+    })
+    .map_err(|error| format!("cannot persist bootstrap receipt completion marker: {error}"))
 }
 
 fn activation_open_runtime(request: SyncLocalActivationRequest) -> SyncLocalActivationResult {
@@ -2703,6 +2852,13 @@ impl RuntimeActor {
             }
         }
         .map_err(display)?;
+        confirm_bootstrap_projection_receipts(
+            &graph,
+            &receipts,
+            runtime.engine(),
+            &application_runtime_root,
+            &advisory.binding,
+        )?;
         let recovery = map_recovery(runtime.recovery());
         let feed =
             ExactExternalFeedState::open(&graph, &receipts, &runtime, baseline).map_err(display)?;
@@ -7244,7 +7400,16 @@ mod tests {
             before,
             "activation may create only the shared .tine-sync/v2 namespace, never rewrite graph bytes"
         );
-        drop(handle);
+        drive_initial_feed(&handle);
+        assert_eq!(
+            user_graph_bytes(&fixture.graph_root),
+            before,
+            "bootstrap receipt confirmation and the initial exact feed must remain read-only"
+        );
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
     }
 
     fn assert_public_activation_cut_resumes(
@@ -7313,6 +7478,155 @@ mod tests {
             SyncLocalActivationStage::VerifiedLocal,
             0xa500,
         );
+    }
+
+    #[test]
+    fn partial_bootstrap_receipt_confirmation_resumes_before_actor_publication() {
+        let fixture = ActivationFixture::nested_unicode("partial-bootstrap-receipts", 0xa550);
+        let before = user_graph_bytes(&fixture.graph_root);
+        fail_once_at_activation_cut(ActivationTestCut::AfterBootstrapReceipt);
+        let interrupted = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert!(matches!(
+            interrupted.status,
+            SyncLocalActivationStatus::Retryable {
+                durable_stage: SyncLocalActivationStage::LocalActive,
+                ..
+            }
+        ));
+        assert!(interrupted.handle.is_none());
+        assert_eq!(user_graph_bytes(&fixture.graph_root), before);
+
+        let resumed = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(resumed.status, SyncLocalActivationStatus::Active);
+        let handle = resumed
+            .handle
+            .expect("actor startup must resume exact bootstrap receipt confirmation");
+        drive_initial_feed(&handle);
+        assert_eq!(user_graph_bytes(&fixture.graph_root), before);
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
+    fn bootstrap_marker_never_authorizes_reconciliation_with_a_missing_required_completion() {
+        let fixture = ActivationFixture::nested_unicode("missing-bootstrap-completion", 0xa575);
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("activation must retain an actor");
+        drive_initial_feed(&handle);
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+
+        let marker = fixture
+            .request
+            .application_runtime_root
+            .join(BOOTSTRAP_RECEIPT_MARKER_FILE);
+        assert!(
+            marker.is_file(),
+            "the regression requires the O(1) bootstrap marker fast path"
+        );
+
+        let graph = Graph::open_checked(&fixture.graph_root).unwrap();
+        let endpoint = ProjectionEndpointBinding {
+            endpoint_id: fixture.request.identities.endpoint_id,
+            device_id: fixture.request.identities.device_id,
+            graph_resource_id: graph.canonical_resource_id().unwrap(),
+        };
+        drop(graph);
+        let receipts = ProjectionReceiptStore::open_for_endpoint(
+            &fixture.request.receipt_root,
+            fixture.request.identities.workspace_id,
+            endpoint,
+        )
+        .unwrap();
+        let catalog = receipts.validated_catalog().unwrap();
+        let required = catalog
+            .iter()
+            .find(|entry| entry.completion.is_some())
+            .expect("bootstrap must publish at least one required completion");
+        let target = fixture.graph_root.join(required.intent.path().as_str());
+        let completion = fixture
+            .request
+            .receipt_root
+            .join("completions")
+            .join(format!("{}.completion", required.intent.id().unwrap()));
+        assert!(completion.is_file());
+        fs::remove_file(&completion).unwrap();
+
+        let external = b"- external bytes must survive missing receipt evidence\n";
+        fs::write(&target, external).unwrap();
+        let graph_after_external_edit = user_graph_bytes(&fixture.graph_root);
+        #[cfg(unix)]
+        let target_identity_after_external_edit = {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = fs::metadata(&target).unwrap();
+            (
+                metadata.dev(),
+                metadata.ino(),
+                metadata.mtime(),
+                metadata.mtime_nsec(),
+            )
+        };
+
+        let reopened = SyncRuntimeHandle::open(SyncRuntimeOpenRequest {
+            profile: SyncStorageProfile::ExperimentalLocal,
+            graph_root: fixture.request.graph_root.clone(),
+            archive_root: fixture.request.archive_root.clone(),
+            enrollment_root: fixture.request.enrollment_root.clone(),
+            receipt_root: fixture.request.receipt_root.clone(),
+            database_path: fixture.request.database_path.clone(),
+            application_runtime_root: fixture.request.application_runtime_root.clone(),
+        });
+        assert_eq!(
+            reopened.status,
+            SyncRuntimeOpenStatus::Active,
+            "the marker intentionally keeps actor open O(1)"
+        );
+        let reopened = reopened.handle.expect("active reopen must retain an actor");
+        let failure = (0..64).find_map(|_| match reopened.tick().unwrap() {
+            SyncRuntimeTick::Failed(detail)
+            | SyncRuntimeTick::Blocked(detail)
+            | SyncRuntimeTick::Terminal(detail) => Some(detail),
+            SyncRuntimeTick::Idle
+            | SyncRuntimeTick::Recovering
+            | SyncRuntimeTick::RetryFull
+            | SyncRuntimeTick::RecoveryBlocked(_)
+            | SyncRuntimeTick::LocalMutation(_) => None,
+            SyncRuntimeTick::AdmittedNoop { .. } | SyncRuntimeTick::AdmittedComplete { .. } => {
+                panic!("missing required completion was admitted")
+            }
+        });
+        let failure = failure.expect("missing completion must fail closed during reconciliation");
+        assert!(
+            failure.contains("reconciliation coordinator blocked"),
+            "missing receipt did not block at the reconciliation boundary: {failure}"
+        );
+        assert_eq!(fs::read(&target).unwrap(), external);
+        assert_eq!(
+            user_graph_bytes(&fixture.graph_root),
+            graph_after_external_edit,
+            "receipt failure must happen before any Tine graph write"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = fs::metadata(&target).unwrap();
+            assert_eq!(
+                (
+                    metadata.dev(),
+                    metadata.ino(),
+                    metadata.mtime(),
+                    metadata.mtime_nsec(),
+                ),
+                target_identity_after_external_edit,
+                "the guarded temp-and-rename writer must not run before receipt failure"
+            );
+        }
+        drop(reopened);
     }
 
     #[test]

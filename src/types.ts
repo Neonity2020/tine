@@ -194,6 +194,179 @@ export interface ManagedSyncEnableResult {
   status: ManagedSyncStatus;
 }
 
+export interface SparseV2WatcherStatus {
+  latest_enqueue: number;
+  acknowledged: number;
+  drain_in_flight: boolean;
+  pending: boolean;
+  pending_requires_full_scan: boolean;
+  deferred: boolean;
+  quiescing: boolean;
+  sequence_exhausted: boolean;
+}
+
+export interface SparseV2Tick {
+  state: string;
+  detail: string | null;
+  epoch: number | null;
+}
+
+export interface SparseV2RuntimeStatus {
+  lifecycle: "active" | "terminal" | "stopped_safe" | "stopped_crashed";
+  recovery: "first_promotion" | "resumed_own_unsafe" | "adopted_safe_handoff" | "took_over_crashed_unsafe" | null;
+  watcher: SparseV2WatcherStatus;
+  last_tick: SparseV2Tick | null;
+  detail: string | null;
+}
+
+export type SparseV2Availability =
+  | { state: "legacy_default" }
+  | { state: "active" }
+  | { state: "retryable"; stage: "absent" | "shadow_import" | "verified_local" | "local_active"; detail: string }
+  | { state: "blocked"; reason_code: string }
+  | { state: "refused"; reason_code: string; detail: string | null };
+
+export type SparseV2Status = SparseV2Availability & {
+  runtime: SparseV2RuntimeStatus | null;
+  can_activate: boolean;
+  can_retry: boolean;
+  binding_generation: number;
+};
+
+export type SparseV2EntityId =
+  | { entity_type: "page"; id: string }
+  | { entity_type: "block"; id: string };
+
+export type SparseV2QueryRequest =
+  | { kind: "resolve_page"; path: string; name: string; page_kind: PageKind }
+  | { kind: "resolve_page_by_name"; name: string; page_kind: PageKind }
+  | { kind: "list_pages"; page_kind: PageKind | null; limit: number }
+  | { kind: "load_page"; page_id: string; block_limit: number }
+  | { kind: "search"; query: string; limit: number }
+  | { kind: "properties_for_owner"; owner: SparseV2EntityId; limit: number }
+  | { kind: "properties_named"; name: string; value: string | null; limit: number }
+  | { kind: "tags"; tag: string; limit: number }
+  | { kind: "tasks"; marker: string | null; limit: number }
+  | { kind: "references_to_page_name"; name: string; limit: number }
+  | { kind: "references_to_logseq_uuid"; logseq_uuid: string; limit: number };
+
+export interface SparseV2Page {
+  page_id: string;
+  home_document_id: string;
+  name: string;
+  path: string;
+  kind: PageKind;
+  preamble: string | null;
+}
+
+export interface SparseV2Block {
+  block_id: string;
+  page_id: string;
+  home_document_id: string;
+  parent_block_id: string | null;
+  order: string;
+  content: string;
+  heading_level: number | null;
+  collapsed: boolean;
+  logseq_uuid: string | null;
+}
+
+export interface SparseV2PageWithBlocks {
+  page: SparseV2Page;
+  blocks: SparseV2Block[];
+}
+
+export type SparseV2PageNameResolution =
+  | { status: "missing" }
+  | { status: "exact"; page: SparseV2Page }
+  | { status: "ambiguous" };
+
+export interface SparseV2SearchHit {
+  entity: SparseV2EntityId;
+  page_id: string;
+  text: string;
+  rank: number;
+}
+
+export interface SparseV2Property {
+  owner: SparseV2EntityId;
+  page_id: string;
+  name: string;
+  value: string;
+}
+
+export interface SparseV2Tag {
+  owner: SparseV2EntityId;
+  page_id: string;
+  tag: string;
+}
+
+export interface SparseV2Task {
+  block_id: string;
+  page_id: string;
+  marker: string;
+  priority: string | null;
+  scheduled: string | null;
+  deadline: string | null;
+}
+
+export type SparseV2ReferenceSource =
+  | { source_type: "preamble" }
+  | { source_type: "block"; block_id: string; home_document_id: string };
+
+export interface SparseV2ReferenceHit {
+  source_page_id: string;
+  source: SparseV2ReferenceSource;
+  kind: string;
+  raw_target: string;
+  byte_start: number;
+  byte_end: number;
+  resolved_page_id: string | null;
+  resolved_block_id: string | null;
+}
+
+/** Exact adjacent-tagged Serde wire shape: `{ kind, value }`. */
+export type SparseV2QueryReply =
+  | { kind: "page"; value: SparseV2Page | null }
+  | { kind: "page_name"; value: SparseV2PageNameResolution }
+  | { kind: "pages"; value: SparseV2Page[] }
+  | { kind: "page_with_blocks"; value: SparseV2PageWithBlocks | null }
+  | { kind: "search"; value: SparseV2SearchHit[] }
+  | { kind: "properties"; value: SparseV2Property[] }
+  | { kind: "tags"; value: SparseV2Tag[] }
+  | { kind: "tasks"; value: SparseV2Task[] }
+  | { kind: "references"; value: SparseV2ReferenceHit[] };
+
+export type SparseV2EditorPageSelector =
+  | { selector: "page_id"; page_id: string }
+  | { selector: "name"; name: string; page_kind: PageKind };
+
+export interface SparseV2EditorLoadRequest {
+  page: SparseV2EditorPageSelector;
+}
+
+export type SparseV2EditorBlockKey =
+  | { key_type: "existing"; value: string }
+  | { key_type: "temporary"; value: string };
+
+export interface SparseV2EditorBlock {
+  key: SparseV2EditorBlockKey;
+  parent: SparseV2EditorBlockKey | null;
+  content: string;
+}
+
+export type SparseV2EditorSaveTarget =
+  | { target: "existing"; page_id: string; revision: string }
+  | { target: "new"; name: string; page_kind: PageKind; revision: string };
+
+export interface SparseV2EditorSaveRequest {
+  target: SparseV2EditorSaveTarget;
+  preamble: string | null;
+  blocks: SparseV2EditorBlock[];
+}
+
+export type SparseV2EditorOutcome = { status: string; [key: string]: unknown };
+
 /** How one aligned block differs between the winner and the conflict copy. */
 export type RowKind = "unchanged" | "modified" | "added" | "removed";
 

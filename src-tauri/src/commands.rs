@@ -1359,10 +1359,18 @@ pub(crate) fn stream_asset_path(name: String, state: GraphContext<'_>) -> Result
 /// edits. Then hand off to Tauri's normal exit (the main process still tears down
 /// the way it always has — no dump there). On non-Linux this is just `app.exit(0)`.
 #[tauri::command]
-pub(crate) fn tine_quit(app: tauri::AppHandle) {
+pub(crate) fn tine_quit(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, crate::state::AppState>,
+) -> Result<(), String> {
+    for (_, slot) in state.graphs.read().unwrap().entries() {
+        crate::sync_runtime::clean_shutdown_slot(&slot)
+            .map_err(|error| format!("sparse-v2-shutdown-refused: {error}"))?;
+    }
     #[cfg(target_os = "linux")]
     crate::platform::kill_webkit_children();
     app.exit(0);
+    Ok(())
 }
 
 /// Close only the calling graph window. The final graph window still performs
@@ -1374,6 +1382,9 @@ pub(crate) fn close_graph_window(
     app: tauri::AppHandle,
     state: tauri::State<'_, crate::state::AppState>,
 ) -> Result<(), String> {
+    let slot = crate::state::slot_for_window(&state, window.label())?;
+    crate::sync_runtime::clean_shutdown_slot(&slot)
+        .map_err(|error| format!("sparse-v2-shutdown-refused: {error}"))?;
     if state.graphs.read().unwrap().len() <= 1 {
         #[cfg(target_os = "linux")]
         crate::platform::kill_webkit_children();

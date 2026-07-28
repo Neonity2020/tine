@@ -1,10 +1,11 @@
 use crate::settings::{settings_path, update_settings};
-use crate::state::{AppState, GraphSlot};
+use crate::state::{AppState, GraphSlot, LegacyGraphLease};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use tauri::{Emitter, Manager, State};
+use tine_core::sync_runtime::{SyncRuntimeHandle, SyncRuntimeTick, SyncWatcherObservation};
 use tine_core::{model::PageKind, Graph};
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
@@ -20,12 +21,15 @@ struct Pending {
     paths: HashSet<PathBuf>,
     full_paths: HashSet<PathBuf>,
     need_full: bool,
+    notify_error: bool,
 }
 
 /// Resolve the filesystem watcher inputs for an existing legacy binding.
 /// Sparse-v2 bindings must later use their actor; they never fall back to a
 /// second legacy `Graph` or direct file watcher here.
-fn legacy_watch_paths(slot: &GraphSlot) -> Result<(Arc<Graph>, [PathBuf; 2], PathBuf), String> {
+fn legacy_watch_paths(
+    slot: &GraphSlot,
+) -> Result<(LegacyGraphLease, [PathBuf; 2], PathBuf), String> {
     let graph = slot.legacy_graph_cloned()?;
     let dirs = [graph.journals_path(), graph.pages_path()];
     let sync_dir = graph.managed_sync_store_path();
@@ -63,6 +67,11 @@ impl Pending {
             // diff only for the graph that owns its reported path.
             self.full_paths.extend(event.paths);
         }
+    }
+
+    fn add_notify_error(&mut self) {
+        self.need_full = true;
+        self.notify_error = true;
     }
 }
 
@@ -108,10 +117,13 @@ impl RetrySchedule {
 }
 
 fn is_page_file_path(path: &Path) -> bool {
-    matches!(
-        path.extension().and_then(|x| x.to_str()),
-        Some("md") | Some("org")
-    )
+    path.extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("md")
+                || extension.eq_ignore_ascii_case("markdown")
+                || extension.eq_ignore_ascii_case("org")
+        })
 }
 
 fn path_is_existing_dir(path: &Path) -> bool {
@@ -143,23 +155,32 @@ fn is_tine_atomic_page_temp_path(path: &Path) -> bool {
 fn incremental_page_paths(event: &notify::Event) -> Option<Vec<PathBuf>> {
     use notify::event::{CreateKind, EventKind, ModifyKind, RemoveKind, RenameMode};
 
-    let supported = matches!(
+    let explicit_file_event = matches!(
         event.kind,
         EventKind::Create(CreateKind::File)
             | EventKind::Modify(ModifyKind::Data(_))
             | EventKind::Modify(ModifyKind::Metadata(_))
-            | EventKind::Modify(ModifyKind::Name(
-                RenameMode::From | RenameMode::To | RenameMode::Both
-            ))
             | EventKind::Remove(RemoveKind::File)
     );
+    let supported = explicit_file_event
+        || matches!(
+            event.kind,
+            EventKind::Modify(ModifyKind::Name(
+                RenameMode::From | RenameMode::To | RenameMode::Both
+            ))
+        );
     if !supported || event.paths.is_empty() {
         return None;
     }
-    if event.paths.iter().any(|path| {
-        (!is_page_file_path(path) || path_is_existing_dir(path))
-            && !is_tine_atomic_page_temp_path(path)
-    }) {
+    if event.paths.iter().any(|path| path_is_existing_dir(path)) {
+        return None;
+    }
+    let all_text_or_temp = event
+        .paths
+        .iter()
+        .all(|path| is_page_file_path(path) || is_tine_atomic_page_temp_path(path));
+    if !all_text_or_temp && !explicit_file_event {
+        // A rename without a file-kind witness may denote a directory subtree.
         return None;
     }
     Some(
@@ -232,10 +253,7 @@ fn collect_page_files(dir: &std::path::Path, out: &mut HashMap<PathBuf, FileStam
             let Ok(file_type) = e.file_type() else {
                 continue;
             };
-            if matches!(
-                p.extension().and_then(|x| x.to_str()),
-                Some("md") | Some("org")
-            ) {
+            if is_page_file_path(&p) {
                 // Never follow a page-looking symlink. Besides cycles, a
                 // `secret.md` symlink could otherwise expose outside bytes.
                 if file_type.is_file() {
@@ -431,6 +449,51 @@ fn pending_for_graph(paths: &HashSet<PathBuf>, dirs: &[PathBuf; 2]) -> HashSet<P
         .collect()
 }
 
+fn sparse_observations(
+    root: &Path,
+    paths: &HashSet<PathBuf>,
+    full_paths: &HashSet<PathBuf>,
+    need_full: bool,
+    notify_error: bool,
+    inotify: bool,
+) -> Vec<SyncWatcherObservation> {
+    let mut observations = Vec::new();
+    let mut unknown = false;
+    for path in paths.iter().chain(full_paths.iter()) {
+        if !path.starts_with(root) {
+            continue;
+        }
+        let Ok(relative) = path.strip_prefix(root) else {
+            continue;
+        };
+        if relative
+            .components()
+            .next()
+            .is_some_and(|component| component.as_os_str() == ".tine-sync")
+        {
+            continue;
+        }
+        let observation = relative
+            .to_str()
+            .map(|relative| relative.replace(std::path::MAIN_SEPARATOR, "/"))
+            .and_then(|relative| SyncWatcherObservation::managed_path(relative).ok());
+        match observation {
+            Some(observation) => observations.push(observation),
+            None => unknown = true,
+        }
+    }
+    if unknown {
+        observations.push(SyncWatcherObservation::UnknownPath);
+    }
+    if need_full || !inotify {
+        observations.push(SyncWatcherObservation::RescanRequired);
+    }
+    if notify_error {
+        observations.push(SyncWatcherObservation::NotifyError);
+    }
+    observations
+}
+
 /// Watch the graph dirs for external changes (Logseq, Syncthing) and reconcile
 /// them into the cache, emitting `graph-changed` so the UI can reload. Two
 /// mechanisms, switchable at runtime via the device-local `watch_mode` setting:
@@ -456,7 +519,7 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
     }
     std::thread::spawn(move || {
         struct WatchedGraph {
-            legacy_graph: Arc<Graph>,
+            legacy_graph: LegacyGraphLease,
             dirs: [PathBuf; 2],
             sync_dir: PathBuf,
             snap: HashMap<PathBuf, FileStamp>,
@@ -465,7 +528,16 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
             retry: RetrySchedule,
         }
 
+        struct WatchedSparse {
+            handle: SyncRuntimeHandle,
+            root: PathBuf,
+            last_error: Option<String>,
+            retry: RetrySchedule,
+            initial_tick: bool,
+        }
+
         let mut graphs: HashMap<String, WatchedGraph> = HashMap::new();
+        let mut sparse_graphs: HashMap<String, WatchedSparse> = HashMap::new();
         let mut watcher: Option<notify::RecommendedWatcher> = None;
         let mut watched: HashSet<PathBuf> = HashSet::new();
         loop {
@@ -473,7 +545,30 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
             let entries = app.state::<AppState>().graphs.read().unwrap().entries();
             let live: HashSet<String> = entries.iter().map(|(label, _)| label.clone()).collect();
             graphs.retain(|label, _| live.contains(label));
+            sparse_graphs.retain(|label, _| live.contains(label));
             for (label, slot) in entries {
+                if let Some(handle) = slot.sparse_runtime().cloned() {
+                    graphs.remove(&label);
+                    match sparse_graphs.get_mut(&label) {
+                        Some(current) if current.root == slot.root_key => {
+                            current.handle = handle;
+                        }
+                        _ => {
+                            sparse_graphs.insert(
+                                label,
+                                WatchedSparse {
+                                    handle,
+                                    root: slot.root_key.clone(),
+                                    last_error: None,
+                                    retry: RetrySchedule::default(),
+                                    initial_tick: true,
+                                },
+                            );
+                        }
+                    }
+                    continue;
+                }
+                sparse_graphs.remove(&label);
                 let Ok((legacy_graph, dirs, sync_dir)) = legacy_watch_paths(&slot) else {
                     // Sparse-v2 owns its actor in the slot. This legacy watcher
                     // must not retain or reopen a Graph for it.
@@ -510,6 +605,7 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                         .cloned()
                         .chain(graph.sync_dir.is_dir().then(|| graph.sync_dir.clone()))
                 })
+                .chain(sparse_graphs.values().map(|graph| graph.root.clone()))
                 .collect();
 
             // Bring the OS watcher in line with the current mode + dirs.
@@ -522,7 +618,7 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                             if let Ok(mut p) = pendingc.lock() {
                                 match res {
                                     Ok(event) => p.add_event(event),
-                                    Err(_) => p.need_full = true,
+                                    Err(_) => p.add_notify_error(),
                                 }
                             }
                             let _ = txc.send(());
@@ -548,18 +644,20 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
             }
 
             // --- reconcile (identical in both modes) ---
-            let (paths, full_paths, event_need_full) = if inotify {
+            let (paths, full_paths, event_need_full, notify_error) = if inotify {
                 if let Ok(mut p) = pending.lock() {
                     let paths = std::mem::take(&mut p.paths);
                     let full_paths = std::mem::take(&mut p.full_paths);
                     let need_full = p.need_full;
+                    let notify_error = p.notify_error;
                     p.need_full = false;
-                    (paths, full_paths, need_full)
+                    p.notify_error = false;
+                    (paths, full_paths, need_full, notify_error)
                 } else {
-                    (HashSet::new(), HashSet::new(), true)
+                    (HashSet::new(), HashSet::new(), true, true)
                 }
             } else {
-                (HashSet::new(), HashSet::new(), true)
+                (HashSet::new(), HashSet::new(), true, false)
             };
             for (label, graph) in graphs.iter_mut() {
                 let initial_cycle = !graph.baseline;
@@ -639,6 +737,91 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                     graph.last_sync_error = None;
                 }
             }
+            for (label, graph) in sparse_graphs.iter_mut() {
+                let retry_due = graph.retry.take_due(Instant::now());
+                let initial_tick = std::mem::take(&mut graph.initial_tick);
+                // The actor's startup scan can finish before this thread has
+                // replaced the legacy directory watches with the recursive
+                // graph-root watch. One scan after watch installation closes
+                // that handoff interval; later steady-state events stay exact.
+                let observations = sparse_observations(
+                    &graph.root,
+                    &paths,
+                    &full_paths,
+                    event_need_full || initial_tick,
+                    notify_error,
+                    inotify,
+                );
+                if observations.is_empty() && !retry_due && !initial_tick {
+                    continue;
+                }
+
+                let result = if observations.is_empty() {
+                    graph.handle.tick()
+                } else {
+                    graph
+                        .handle
+                        .observe_watcher(observations)
+                        .and_then(|()| graph.handle.tick())
+                };
+                match result {
+                    Ok(tick) => {
+                        let completed = matches!(
+                            tick,
+                            SyncRuntimeTick::AdmittedNoop { .. }
+                                | SyncRuntimeTick::AdmittedComplete { .. }
+                        );
+                        let retryable = matches!(
+                            tick,
+                            SyncRuntimeTick::LocalMutation(_)
+                                | SyncRuntimeTick::RecoveryBlocked(_)
+                                | SyncRuntimeTick::Recovering
+                                | SyncRuntimeTick::RetryFull
+                                | SyncRuntimeTick::Failed(_)
+                        );
+                        if retryable {
+                            graph.retry.failed(Instant::now());
+                        } else {
+                            graph.retry.succeeded();
+                        }
+                        if matches!(
+                            tick,
+                            SyncRuntimeTick::Blocked(_) | SyncRuntimeTick::Terminal(_)
+                        ) {
+                            let message = format!("{tick:?}");
+                            if graph.last_error.as_deref() != Some(&message) {
+                                let _ = app.emit_to(label, "sparse-v2-error", &message);
+                                graph.last_error = Some(message);
+                            }
+                        } else {
+                            graph.last_error = None;
+                        }
+                        let _ = app.emit_to(
+                            label,
+                            "sparse-v2-tick",
+                            crate::sync_runtime::tick_dto(tick),
+                        );
+                        if completed {
+                            let _ = app.emit_to(label, "sparse-v2-changed", ());
+                        }
+                        if let Ok(status) = graph.handle.status() {
+                            let _ = app.emit_to(
+                                label,
+                                "sparse-v2-status",
+                                crate::sync_runtime::runtime_status(status),
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        graph.retry.failed(Instant::now());
+                        let message = error.to_string();
+                        if graph.last_error.as_deref() != Some(&message) {
+                            let _ = app.emit_to(label, "sparse-v2-error", &message);
+                            graph.last_error = Some(message);
+                        }
+                    }
+                }
+            }
 
             // --- wait for the next cycle ---
             if inotify && !watched.is_empty() {
@@ -648,6 +831,11 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                 let retry_wait = graphs
                     .values()
                     .filter_map(|graph| graph.retry.remaining(now))
+                    .chain(
+                        sparse_graphs
+                            .values()
+                            .filter_map(|graph| graph.retry.remaining(now)),
+                    )
                     .min();
                 let woke_for_event = match retry_wait {
                     Some(wait) => rx.recv_timeout(wait).is_ok(),
@@ -752,6 +940,52 @@ mod tests {
     }
 
     #[test]
+    fn explicit_unmanaged_file_events_do_not_schedule_graph_scans() {
+        use notify::event::{CreateKind, EventKind, RemoveKind};
+
+        for (kind, path) in [
+            (
+                EventKind::Create(CreateKind::File),
+                PathBuf::from("/graphs/a/assets/image.png"),
+            ),
+            (
+                EventKind::Remove(RemoveKind::File),
+                PathBuf::from("/graphs/a/logseq/config.edn"),
+            ),
+        ] {
+            let mut pending = Pending::default();
+            pending.add_event(notify::Event {
+                kind,
+                paths: vec![path],
+                attrs: Default::default(),
+            });
+            assert!(!pending.need_full);
+            assert!(pending.full_paths.is_empty());
+            assert!(pending.paths.is_empty());
+        }
+    }
+
+    #[test]
+    fn markdown_and_case_variant_text_events_stay_incremental() {
+        use notify::event::{CreateKind, EventKind};
+
+        let paths = vec![
+            PathBuf::from("/graphs/a/archive/one.markdown"),
+            PathBuf::from("/graphs/a/archive/two.MD"),
+            PathBuf::from("/graphs/a/archive/three.ORG"),
+        ];
+        let mut pending = Pending::default();
+        pending.add_event(notify::Event {
+            kind: EventKind::Create(CreateKind::File),
+            paths: paths.clone(),
+            attrs: Default::default(),
+        });
+        assert_eq!(pending.paths, paths.into_iter().collect());
+        assert!(pending.full_paths.is_empty());
+        assert!(!pending.need_full);
+    }
+
+    #[test]
     fn managed_sync_store_events_use_the_dedicated_incremental_lane() {
         use notify::event::{CreateKind, EventKind};
 
@@ -767,6 +1001,66 @@ mod tests {
         assert!(!pending.need_full);
         assert!(pending.full_paths.is_empty());
         assert_eq!(pending.paths, HashSet::from([chunk]));
+    }
+
+    #[test]
+    fn sparse_watcher_routes_nested_unicode_nonstandard_text_and_fault_observations() {
+        let root = PathBuf::from("/graphs/研究");
+        let nested = root.join("archive/層/計画.markdown");
+        let org = root.join("nonstandard/deep/日記.org");
+        let unknown = root.join("config.edn");
+        let outside = PathBuf::from("/graphs/other/pages/ignored.md");
+        let paths = HashSet::from([nested, org, outside]);
+        let full_paths = HashSet::from([unknown]);
+
+        let observations = sparse_observations(&root, &paths, &full_paths, true, true, true);
+        assert!(observations
+            .contains(&SyncWatcherObservation::managed_path("archive/層/計画.markdown").unwrap()));
+        assert!(observations
+            .contains(&SyncWatcherObservation::managed_path("nonstandard/deep/日記.org").unwrap()));
+        assert!(observations.contains(&SyncWatcherObservation::UnknownPath));
+        assert!(observations.contains(&SyncWatcherObservation::RescanRequired));
+        assert!(observations.contains(&SyncWatcherObservation::NotifyError));
+        assert_eq!(
+            observations
+                .iter()
+                .filter(|observation| matches!(observation, SyncWatcherObservation::ManagedPath(_)))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn notify_failures_remain_distinct_from_rescan_obligations() {
+        let mut pending = Pending::default();
+        pending.add_notify_error();
+        assert!(pending.need_full);
+        assert!(pending.notify_error);
+
+        let observations = sparse_observations(
+            Path::new("/graph"),
+            &HashSet::new(),
+            &HashSet::new(),
+            pending.need_full,
+            pending.notify_error,
+            true,
+        );
+        assert_eq!(
+            observations,
+            vec![
+                SyncWatcherObservation::RescanRequired,
+                SyncWatcherObservation::NotifyError
+            ]
+        );
+    }
+
+    #[test]
+    fn sparse_watcher_does_not_reimport_its_private_archive_writes() {
+        let root = PathBuf::from("/graph");
+        let paths = HashSet::from([root.join(".tine-sync/v2/objects/immutable")]);
+        assert!(
+            sparse_observations(&root, &paths, &HashSet::new(), false, false, true,).is_empty()
+        );
     }
 
     #[test]

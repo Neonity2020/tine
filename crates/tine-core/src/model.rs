@@ -14098,6 +14098,92 @@ impl Graph {
         })
     }
 
+    /// Confirm an already-visible bootstrap projection without rewriting it.
+    ///
+    /// This is enrollment-only evidence: the durable mutation reservation is
+    /// still consumed exactly once, while the retained graph capability
+    /// freshly syncs and rereads the exact target before minting the ordinary
+    /// completion proof used by the receipt store.
+    pub(crate) fn confirm_existing_page_projection(
+        &self,
+        relative_path: &str,
+        expected_target: &[u8],
+        authority: &mut ProjectionMutationAuthority,
+    ) -> io::Result<ProjectionWriteProof> {
+        let write = self.admit_retained_managed_text_writer()?;
+        authority.consume_write_evidence(relative_path, |reservation, _| {
+            require_projection_platform()?;
+            if usize_to_u64(expected_target.len())? > MAX_PROJECTION_EVIDENCE_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "projection target exceeds the evidence reload bound",
+                ));
+            }
+            let expected_text = std::str::from_utf8(expected_target).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "projection target is not valid UTF-8",
+                )
+            })?;
+            let target = self.projection_page_target(relative_path)?;
+            validate_projection_attempt(&target, reservation)?;
+            let lock = self.page_lock(&target.absolute_path);
+            let _guard = lock.lock().unwrap();
+            let parent = self.projection_parent(&target, false)?;
+            preflight_projection_chain(&parent.chain)?;
+            self.ensure_projection_target_shape(&parent, &target)?;
+            self.validate_current_graph_text_collision(
+                &write,
+                &target.absolute_path,
+                self.managed_optional_file_identity(&write, &target.absolute_path)?,
+            )?;
+            let (file, current) =
+                open_and_read_projection_regular(parent.final_dir(), &target.filename)?;
+            if current != expected_target {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "bootstrap projection target changed before confirmation",
+                ));
+            }
+            let document = parse_doc(&target.absolute_path, expected_text);
+            let (_, guarded) =
+                self.serialize_page_document(document, &target.absolute_path, Some(expected_text))?;
+            if guarded.as_bytes() != expected_target {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "bootstrap projection differs from guarded page serialization",
+                ));
+            }
+            file.sync_all()?;
+            sync_projection_chain_required(&parent.chain)?;
+            self.ensure_projection_parent_binding(&parent, &target)?;
+            self.ensure_projection_target_shape(&parent, &target)?;
+            self.validate_current_graph_text_collision(
+                &write,
+                &target.absolute_path,
+                self.managed_optional_file_identity(&write, &target.absolute_path)?,
+            )?;
+            let reread = read_projection_optional(parent.final_dir(), &target.filename)?
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "bootstrap projection disappeared during confirmation",
+                    )
+                })?;
+            if reread != expected_target {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "bootstrap projection changed during confirmation",
+                ));
+            }
+            Ok(ProjectionWriteProof::new(
+                target.relative_path,
+                reread,
+                Vec::new(),
+            ))
+        })
+    }
+
     fn write_page_projection_with_attempts(
         &self,
         write: &ManagedTextWritePermit,

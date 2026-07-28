@@ -678,8 +678,19 @@ export function App(): JSX.Element {
         try {
           await backend().closeGraphWindow();
           return;
-        } catch {
-          // fall through to the direct close below
+        } catch (error) {
+          if (String(error).includes("sparse-v2-shutdown-refused")) {
+            allowClose = false;
+            safeClose.reset();
+            closeInProgress = false;
+            pushToast(
+              "Sparse-v2 shutdown could not prove a clean handoff. The window remains open so you can retry or inspect recovery status.",
+              "error"
+            );
+            return;
+          }
+          // Non-sparse native window failures retain the established direct
+          // close fallback below.
         }
         try {
           await w.destroy();
