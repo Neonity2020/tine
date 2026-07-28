@@ -1322,6 +1322,308 @@ impl EnrollmentSnapshot {
     }
 }
 
+/// Bounded, inert evidence from one authenticated enrollment head.
+///
+/// This value deliberately contains no directory capability, authority key,
+/// lease handle, reader, writer, or transition method. A later runtime open
+/// must independently reopen and authenticate the enrollment and acquire its
+/// writer lease.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct EnrollmentDiscoveryEvidence {
+    pub(crate) binding: EnrollmentBindingV1,
+    pub(crate) head_digest: ContentDigest,
+    pub(crate) generation: u64,
+    pub(crate) lifecycle: EnrollmentDiscoveryLifecycle,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum EnrollmentDiscoveryLifecycle {
+    ShadowImport,
+    VerifiedLocal,
+    LocalActive(EnrollmentDiscoveryLocalActive),
+    Blocked {
+        reason_code: String,
+        evidence_digest: ContentDigest,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct EnrollmentDiscoveryLocalActive {
+    pub(crate) verification_digest: ContentDigest,
+    pub(crate) bootstrap_import_id: ContentDigest,
+    pub(crate) bootstrap_part_count: u32,
+    pub(crate) anchor_history_generation: u64,
+    pub(crate) anchor_history_index_root: ContentDigest,
+    pub(crate) anchor_acceptance_sequence: u64,
+    pub(crate) anchor_accepted_frontier_state_digest: ContentDigest,
+    pub(crate) handoff: EnrollmentDiscoveryHandoff,
+    pub(crate) exclusion: EnrollmentDiscoveryExclusion,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EnrollmentDiscoveryHandoff {
+    Safe,
+    Unsafe { session_id: SessionId },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EnrollmentDiscoveryExclusion {
+    Idle,
+    Published,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum EnrollmentDiscoveryInspection {
+    Absent,
+    Residue,
+    Present(EnrollmentDiscoveryEvidence),
+}
+
+/// Inspect one explicit device-local application root without creating or
+/// repairing any enrollment state.
+///
+/// The path is opened as an existing no-follow directory. A present head is
+/// decoded through the canonical authority-claim and record decoders and
+/// authenticated through the same bounded checkpoint/chain validation as
+/// [`EnrollmentReader::open_existing`]. The lease file is read only for its
+/// physical identity and is never locked.
+pub(crate) fn inspect_existing_enrollment_at(
+    root_path: &Path,
+    expected_graph_resource: CanonicalGraphResourceId,
+) -> Result<EnrollmentDiscoveryInspection, EnrollmentError> {
+    let Some(root) = open_existing_application_root(root_path)? else {
+        return Ok(EnrollmentDiscoveryInspection::Absent);
+    };
+    let Some(directories) = open_directories(&root, expected_graph_resource, false)? else {
+        return Ok(EnrollmentDiscoveryInspection::Absent);
+    };
+    validate_namespaces(&directories)?;
+    let lease_resource_id = inspect_lease_resource_id(&directories)?;
+    if read_head(&directories.enrollment)?.is_none() {
+        return Ok(EnrollmentDiscoveryInspection::Residue);
+    }
+    let authority = open_discovered_enrollment_authority(
+        &directories,
+        expected_graph_resource,
+        lease_resource_id,
+    )?;
+    let binding = authority.material.claim.binding.clone();
+    let current = read_head_and_chain(
+        &directories,
+        &binding,
+        lease_resource_id,
+        &authority.material,
+    )?
+    .ok_or(EnrollmentError::MalformedHead)?;
+    let lifecycle = match current.record.lifecycle() {
+        EnrollmentLifecycleV1::ShadowImport(_) => EnrollmentDiscoveryLifecycle::ShadowImport,
+        EnrollmentLifecycleV1::VerifiedLocal(_) => EnrollmentDiscoveryLifecycle::VerifiedLocal,
+        EnrollmentLifecycleV1::LocalActive(active) => {
+            EnrollmentDiscoveryLifecycle::LocalActive(EnrollmentDiscoveryLocalActive {
+                verification_digest: active.verification_digest,
+                bootstrap_import_id: active.anchor.bootstrap_import_id,
+                bootstrap_part_count: active.anchor.bootstrap_part_count,
+                anchor_history_generation: active
+                    .anchor
+                    .accepted_frontier_anchor
+                    .history_generation,
+                anchor_history_index_root: active.anchor.accepted_frontier_anchor.history_root,
+                anchor_acceptance_sequence: active
+                    .anchor
+                    .accepted_frontier_anchor
+                    .acceptance_sequence,
+                anchor_accepted_frontier_state_digest: active
+                    .anchor
+                    .accepted_frontier_anchor
+                    .accepted_frontier_state_digest,
+                handoff: match active.handoff {
+                    HandoffV1::Safe => EnrollmentDiscoveryHandoff::Safe,
+                    HandoffV1::Unsafe { session_id } => {
+                        EnrollmentDiscoveryHandoff::Unsafe { session_id }
+                    }
+                },
+                exclusion: match active.exclusion {
+                    LocalExclusionV1::Idle => EnrollmentDiscoveryExclusion::Idle,
+                    LocalExclusionV1::Published { .. } => EnrollmentDiscoveryExclusion::Published,
+                },
+            })
+        }
+        EnrollmentLifecycleV1::Blocked(blocked) => EnrollmentDiscoveryLifecycle::Blocked {
+            reason_code: blocked.reason_code.clone(),
+            evidence_digest: blocked.evidence_digest,
+        },
+    };
+    Ok(EnrollmentDiscoveryInspection::Present(
+        EnrollmentDiscoveryEvidence {
+            binding,
+            head_digest: current.digest,
+            generation: current.record.generation,
+            lifecycle,
+        },
+    ))
+}
+
+fn open_existing_application_root(
+    path: &Path,
+) -> Result<Option<EnrollmentApplicationRoot>, EnrollmentError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(EnrollmentError::UnsafeNamespace(
+            "private enrollment application root is not a real no-follow directory".into(),
+        ));
+    }
+    let name = path.file_name().ok_or_else(|| {
+        EnrollmentError::UnsafeNamespace(
+            "private enrollment application root has no final component".into(),
+        )
+    })?;
+    if !matches!(
+        path.components().next_back(),
+        Some(std::path::Component::Normal(_))
+    ) {
+        return Err(EnrollmentError::UnsafeNamespace(
+            "private enrollment application root must end in a normal path component".into(),
+        ));
+    }
+    let name = name.to_str().ok_or_else(|| {
+        EnrollmentError::UnsafeNamespace(
+            "private enrollment application root final component is not UTF-8".into(),
+        )
+    })?;
+    let parent = path.parent().ok_or_else(|| {
+        EnrollmentError::UnsafeNamespace(
+            "private enrollment application root has no existing parent".into(),
+        )
+    })?;
+    let canonical_parent = fs::canonicalize(parent)?;
+    let parent = Dir::open_ambient_dir(&canonical_parent, ambient_authority())?;
+    let Some(directory) = open_component(&parent, name, false)? else {
+        return Ok(None);
+    };
+    validate_private_directory(&directory, "private enrollment application root")?;
+    Ok(Some(EnrollmentApplicationRoot {
+        path: canonical_parent.join(name),
+    }))
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EnrollmentDiscoveryFixtureLifecycle {
+    ShadowImport,
+    VerifiedLocal,
+    LocalActiveSafe,
+    LocalActiveUnsafe { session_id: SessionId },
+    Blocked,
+}
+
+/// Build the smallest valid authenticated enrollment used by the read-only
+/// discovery tests. Production callers cannot reach this writer seam.
+#[cfg(test)]
+pub(crate) fn create_discovery_enrollment_for_test(
+    root_path: &Path,
+    binding: EnrollmentBindingV1,
+    lifecycle: EnrollmentDiscoveryFixtureLifecycle,
+) -> Result<EnrollmentDiscoveryEvidence, EnrollmentError> {
+    let root = prepare_application_root(root_path)?;
+    let preparation_id = PreparationId::from_uuid(Uuid::from_u128(0xd150));
+    let source_inventory_digest = ContentDigest::of(b"discovery-fixture-source");
+    let shadow = ShadowImportV1::new(preparation_id, source_inventory_digest);
+    let mut writer = EnrollmentWriter::create(&root, binding.clone(), shadow)?;
+    if lifecycle == EnrollmentDiscoveryFixtureLifecycle::ShadowImport {
+        drop(writer);
+    } else if lifecycle == EnrollmentDiscoveryFixtureLifecycle::Blocked {
+        let current = writer.current().digest;
+        writer.block_current(
+            current,
+            "discovery.blocked".into(),
+            ContentDigest::of(b"discovery-fixture-blocked"),
+        )?;
+        drop(writer);
+    } else {
+        let verified = VerifiedLocalV1 {
+            preparation_id,
+            source_inventory_digest,
+            source_file_count: 0,
+            source_chunk_count: 0,
+            source_total_bytes: 0,
+            backup_manifest: BlobDescription::of(b"discovery-backup-manifest"),
+            backup_restore_proof: BlobDescription::of(b"discovery-backup-restore"),
+            backup_evidence_digest: ContentDigest::of(b"discovery-backup-evidence"),
+            bootstrap_import_id: ContentDigest::of(b"discovery-bootstrap-import"),
+            bootstrap_part_count: 0,
+            bootstrap_terminal_part_id: None,
+            bootstrap_batch_id: None,
+            accepted_frontier_anchor: AcceptedFrontierAnchorV1 {
+                acceptance_sequence: 0,
+                accepted_frontier_state_digest: ContentDigest::of(b"discovery-accepted-frontier"),
+                history_generation: 0,
+                history_root: super::object_store::EngineHistoryStore::empty_root(),
+            },
+            accepted_history_record_count: 0,
+            catalog_row_count: 0,
+            sqlite_accepted_batch_count: 0,
+            sqlite_semantic_projection_digest: ContentDigest::of(b"discovery-sqlite-semantic"),
+            sqlite_materialized_row_digest: ContentDigest::of(b"discovery-sqlite-materialized"),
+            staged_projection_manifest: BlobDescription::of(b"discovery-staged-manifest"),
+            staged_projection_proof: BlobDescription::of(b"discovery-staged-proof"),
+            staged_file_count: 0,
+            staged_total_bytes: 0,
+            byte_compare_digest: ContentDigest::of(b"discovery-byte-compare"),
+            shadow_evidence_digest: ContentDigest::of(b"discovery-shadow-evidence"),
+            proof_binding_digest: ContentDigest::of(b"discovery-proof-binding"),
+        };
+        let shadow_head = writer.current().digest;
+        writer.transition(
+            shadow_head,
+            EnrollmentLifecycleV1::VerifiedLocal(verified.clone()),
+        )?;
+        if lifecycle == EnrollmentDiscoveryFixtureLifecycle::VerifiedLocal {
+            drop(writer);
+        } else {
+            let verified_head = writer.current().digest;
+            let session_id = match lifecycle {
+                EnrollmentDiscoveryFixtureLifecycle::LocalActiveUnsafe { session_id } => session_id,
+                EnrollmentDiscoveryFixtureLifecycle::LocalActiveSafe => {
+                    SessionId::from_uuid(Uuid::from_u128(0xd151))
+                }
+                _ => unreachable!("non-active fixture states returned above"),
+            };
+            let anchor = LocalActiveAnchorV1::from_verified_local(&verified, verified_head);
+            let active = LocalActiveV1 {
+                verification_digest: verified.verification_digest()?,
+                anchor,
+                handoff: HandoffV1::Unsafe { session_id },
+                exclusion: LocalExclusionV1::Idle,
+            };
+            writer.transition(
+                verified_head,
+                EnrollmentLifecycleV1::LocalActive(active.clone()),
+            )?;
+            if lifecycle == EnrollmentDiscoveryFixtureLifecycle::LocalActiveSafe {
+                let active_head = writer.current().digest;
+                writer.transition(
+                    active_head,
+                    EnrollmentLifecycleV1::LocalActive(LocalActiveV1 {
+                        handoff: HandoffV1::Safe,
+                        ..active
+                    }),
+                )?;
+            }
+            drop(writer);
+        }
+    }
+    match inspect_existing_enrollment_at(root_path, binding.graph_resource_id())? {
+        EnrollmentDiscoveryInspection::Present(evidence) => Ok(evidence),
+        EnrollmentDiscoveryInspection::Absent | EnrollmentDiscoveryInspection::Residue => {
+            Err(EnrollmentError::MalformedHead)
+        }
+    }
+}
+
 #[derive(Debug)]
 struct EnrollmentDirectories {
     enrollment: Dir,
@@ -4661,6 +4963,48 @@ fn open_enrollment_authority(
     Ok(authority)
 }
 
+fn open_discovered_enrollment_authority(
+    directories: &EnrollmentDirectories,
+    expected_graph_resource: CanonicalGraphResourceId,
+    lease_resource_id: ContentDigest,
+) -> Result<EnrollmentAuthority, EnrollmentError> {
+    #[cfg(test)]
+    count(&ENROLLMENT_AUTHORITY_CLAIM_READS);
+    let (bytes, identity) = read_bounded_authoritative_file(
+        &directories.enrollment,
+        AUTHORITY_FILE,
+        MAX_ENROLLMENT_AUTHORITY_BYTES,
+        "enrollment authority claim",
+        false,
+    )?;
+    let file = open_regular_readonly(&directories.enrollment, AUTHORITY_FILE)?;
+    validate_authoritative_file(&file, "enrollment authority claim")?;
+    if authoritative_file_identity(&file)? != identity {
+        return Err(EnrollmentError::AuthorityMismatch);
+    }
+    let claim = decode_authority_claim(&bytes)?;
+    if claim.binding.graph_resource_id != expected_graph_resource {
+        return Err(EnrollmentError::BindingMismatch(
+            EnrollmentBindingField::GraphResource,
+        ));
+    }
+    let binding = claim.binding.clone();
+    let material = EnrollmentAuthorityMaterial::from_claim(
+        claim,
+        authority_resource_id(&identity),
+        &binding,
+        lease_resource_id,
+    )?;
+    let authority = EnrollmentAuthority {
+        material,
+        file,
+        directory: directories.enrollment.try_clone()?,
+        identity,
+    };
+    authority.validate_current()?;
+    Ok(authority)
+}
+
 fn open_enrollment_authority_for_recovery(
     directories: &EnrollmentDirectories,
     binding: &EnrollmentBindingV1,
@@ -5691,6 +6035,30 @@ mod tests {
                 .unwrap(),
             format!("{}{RECORD_SUFFIX}", snapshot.digest)
         );
+    }
+
+    #[test]
+    fn explicit_root_discovery_authenticates_without_taking_the_writer_lease() {
+        let root = TestRoot::new("readonly-discovery");
+        let binding = test_binding();
+        let writer = EnrollmentWriter::create(&root.app(), binding.clone(), shadow()).unwrap();
+        let expected_head = writer.current().digest();
+        drop(writer);
+
+        let before = EnrollmentInstrumentation::capture();
+        let inspection =
+            inspect_existing_enrollment_at(&root.path, binding.graph_resource_id()).unwrap();
+        let work = before.since();
+        let EnrollmentDiscoveryInspection::Present(evidence) = inspection else {
+            panic!("the authenticated enrollment should be discovered");
+        };
+        assert_eq!(evidence.head_digest, expected_head);
+        assert_eq!(evidence.binding, binding);
+        assert_eq!(
+            evidence.lifecycle,
+            EnrollmentDiscoveryLifecycle::ShadowImport
+        );
+        assert_eq!(work.lease_acquisitions, 0);
     }
 
     #[test]

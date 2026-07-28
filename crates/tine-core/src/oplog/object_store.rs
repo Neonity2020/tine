@@ -38,7 +38,7 @@ use uuid::Uuid;
 
 use crate::model::HandoffSafe;
 
-use super::enrollment::ResumePointEnrollmentBinding;
+use super::enrollment::{EnrollmentBindingV1, ResumePointEnrollmentBinding};
 use super::hot_engine::RuntimeResumeSnapshot;
 use super::identity::parse_digest;
 use super::resume_point::{
@@ -664,6 +664,289 @@ impl PromotedRuntimeStateV1 {
             generation: self.anchor_history_generation,
             index_root: self.anchor_history_index_root,
         }
+    }
+}
+
+/// Bounded inert evidence from an existing promoted archive.
+///
+/// It carries no archive capability, store, history handle, transition lock,
+/// lease, or publication method. A later runtime open must independently
+/// reopen and authenticate all archive state before acquiring writer authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ArchiveDiscoveryEvidence {
+    pub(crate) bootstrap_import_id: ImportId,
+    pub(crate) anchor_history_generation: u64,
+    pub(crate) anchor_history_index_root: ContentDigest,
+    pub(crate) anchor_acceptance_sequence: u64,
+    pub(crate) anchor_accepted_frontier_state_digest: ContentDigest,
+    pub(crate) enrollment_verification_digest: ContentDigest,
+    pub(crate) promotion_session_id: SessionId,
+    pub(crate) state_digest: ContentDigest,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ArchiveDiscoveryInspection {
+    Absent,
+    Residue,
+    Present(ArchiveDiscoveryEvidence),
+}
+
+/// Inspect one explicit existing archive root without constructing an
+/// [`ObjectStore`] or any writer/runtime authority.
+///
+/// With no expected enrollment binding this is intentionally only a presence
+/// probe, used to distinguish true absence from unexplained archive residue.
+/// With a binding it opens the exact existing engine-history control no-follow,
+/// validates its canonical claim and live root, strictly decodes the promoted
+/// state, and checks the graph/archive/resource/control identities.
+pub(crate) fn inspect_existing_archive_at(
+    archive_root: &Path,
+    expected_binding: Option<&EnrollmentBindingV1>,
+) -> Result<ArchiveDiscoveryInspection, StoreError> {
+    let Some(archive) = open_existing_archive_root_nofollow(archive_root)? else {
+        return Ok(ArchiveDiscoveryInspection::Absent);
+    };
+    let Some(binding) = expected_binding else {
+        return Ok(ArchiveDiscoveryInspection::Residue);
+    };
+
+    CanonicalArchiveResourceId::open_enrolled_in_retained_directory(
+        &archive,
+        binding.archive_resource_id(),
+    )
+    .map_err(|_| {
+        StoreError::PromotedRuntimeStateMismatch(
+            "archive resource claim does not authenticate the enrollment binding",
+        )
+    })?;
+    for name in [OBJECTS_DIR, BATCHES_DIR] {
+        open_existing_dir_nofollow(&archive, name)?.ok_or(StoreError::MalformedHistoryIndex)?;
+    }
+    let lineage = read_optional_regular(&archive, LINEAGE_CLAIM_FILE, 32, Some(32))?
+        .ok_or(StoreError::MalformedHistoryIndex)?;
+    require_lineage_bytes(binding.lineage_digest(), &lineage)?;
+
+    let Some(histories) = open_existing_dir_nofollow(&archive, ENGINE_HISTORY_DIR)? else {
+        return Ok(ArchiveDiscoveryInspection::Residue);
+    };
+    let endpoint_name = binding.endpoint_id().to_string();
+    let Some(control) = open_existing_dir_nofollow(&histories, &endpoint_name)? else {
+        return Ok(ArchiveDiscoveryInspection::Residue);
+    };
+    let head = read_optional_regular(&control, ENGINE_HISTORY_HEAD_FILE, 64, None)?;
+    let claim = read_optional_regular(&control, ENGINE_HISTORY_CLAIM_FILE, 256, None)?;
+    let (head, claim) = match (head, claim) {
+        (None, None) => return Ok(ArchiveDiscoveryInspection::Residue),
+        (Some(head), Some(claim)) => (head, claim),
+        _ => return Err(StoreError::MalformedHistoryIndex),
+    };
+    validate_engine_history_claim(
+        &claim,
+        binding.workspace_id(),
+        binding.endpoint_id(),
+        binding.graph_resource_id(),
+        binding.receipt_store_id(),
+    )?;
+    open_existing_dir_nofollow(&control, ENGINE_HISTORY_NODES_DIR)?
+        .ok_or(StoreError::MalformedHistoryIndex)?;
+    let roots = open_existing_dir_nofollow(&control, ENGINE_HISTORY_ROOTS_DIR)?
+        .ok_or(StoreError::MalformedHistoryIndex)?;
+    let head_text = std::str::from_utf8(&head).map_err(|_| StoreError::MalformedHistoryIndex)?;
+    let head_digest = parse_digest(head_text)
+        .map(ContentDigest::from_bytes)
+        .map_err(|_| StoreError::MalformedHistoryIndex)?;
+    if head_digest.to_string().as_bytes() != head {
+        return Err(StoreError::MalformedHistoryIndex);
+    }
+    let root_bytes = read_optional_regular(
+        &roots,
+        &engine_history_root_filename(head_digest),
+        MAX_ENGINE_HISTORY_INDEX_BYTES,
+        None,
+    )?
+    .ok_or(StoreError::MalformedHistoryIndex)?;
+    if ContentDigest::of(&root_bytes) != head_digest {
+        return Err(StoreError::HistoryIndexPathMismatch(head_digest));
+    }
+    let root: DurableEngineHistoryRoot =
+        postcard::from_bytes(&root_bytes).map_err(|_| StoreError::MalformedHistoryIndex)?;
+    if postcard::to_allocvec(&root).map_err(|_| StoreError::MalformedHistoryIndex)? != root_bytes {
+        return Err(StoreError::MalformedHistoryIndex);
+    }
+    validate_engine_history_root(
+        &root,
+        binding.workspace_id(),
+        binding.endpoint_id(),
+        binding.graph_resource_id(),
+        binding.receipt_store_id(),
+    )?;
+
+    let Some(state_bytes) = read_optional_regular(
+        &control,
+        PROMOTED_RUNTIME_STATE_FILE,
+        MAX_PROMOTED_RUNTIME_STATE_BYTES,
+        None,
+    )?
+    else {
+        return Ok(ArchiveDiscoveryInspection::Residue);
+    };
+    let state = PromotedRuntimeStateV1::decode(&state_bytes)?;
+    let expected_binding_digest = binding
+        .binding_digest()
+        .map_err(|_| StoreError::MalformedPromotedRuntimeState)?;
+    if state.workspace_id != binding.workspace_id()
+        || state.lineage_digest != binding.lineage_digest()
+        || state.catalog_document_id != binding.catalog_document_id()
+        || state.endpoint_id != binding.endpoint_id()
+        || state.device_id != binding.device_id()
+        || state.graph_resource_id != binding.graph_resource_id()
+        || state.receipt_store_id != binding.receipt_store_id()
+        || state.archive_resource_id != binding.archive_resource_id()
+        || state.enrollment_binding_digest != expected_binding_digest
+    {
+        return Err(StoreError::PromotedRuntimeStateMismatch(
+            "promoted runtime state is bound to another enrollment",
+        ));
+    }
+    if state.archive_control_binding != control_directory_identity(&archive)?.binding_digest() {
+        return Err(StoreError::PromotedRuntimeStateMismatch(
+            "promoted runtime state is bound to another physical archive directory",
+        ));
+    }
+    if root.binding.bootstrap != Some(state.bootstrap) {
+        return Err(StoreError::PromotedRuntimeStateMismatch(
+            "durable history bootstrap binding is not the promoted lineage",
+        ));
+    }
+    Ok(ArchiveDiscoveryInspection::Present(
+        ArchiveDiscoveryEvidence {
+            bootstrap_import_id: state.bootstrap_import_id,
+            anchor_history_generation: state.anchor_history_generation,
+            anchor_history_index_root: state.anchor_history_index_root,
+            anchor_acceptance_sequence: state.anchor_acceptance_sequence,
+            anchor_accepted_frontier_state_digest: state.anchor_accepted_frontier_state_digest,
+            enrollment_verification_digest: state.enrollment_verification_digest,
+            promotion_session_id: state.promotion_session_id,
+            state_digest: state.state_digest()?,
+        },
+    ))
+}
+
+fn open_existing_archive_root_nofollow(root: &Path) -> Result<Option<Dir>, StoreError> {
+    let metadata = match fs::symlink_metadata(root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(StoreError::UnsafeEntry(
+            "archive root is not a real no-follow directory".into(),
+        ));
+    }
+    let name = root
+        .file_name()
+        .ok_or_else(|| StoreError::UnsafeEntry("archive root has no final component".into()))?;
+    if !matches!(root.components().next_back(), Some(Component::Normal(_))) {
+        return Err(StoreError::UnsafeEntry(
+            "archive root must end in a normal path component".into(),
+        ));
+    }
+    let name = name.to_str().ok_or_else(|| {
+        StoreError::UnsafeEntry("archive root final component is not UTF-8".into())
+    })?;
+    let parent = root.parent().ok_or_else(|| {
+        StoreError::UnsafeEntry("archive root must have an existing parent".into())
+    })?;
+    let canonical_parent = fs::canonicalize(parent)?;
+    let parent = Dir::open_ambient_dir(&canonical_parent, ambient_authority())?;
+    open_existing_dir_nofollow(&parent, name)
+}
+
+/// Publish the smallest valid zero-part promoted archive used by discovery
+/// tests. Production callers cannot reach this writer seam.
+#[cfg(test)]
+pub(crate) fn create_discovery_promoted_archive_for_test(
+    archive_root: &Path,
+    binding: &EnrollmentBindingV1,
+    active: &super::enrollment::EnrollmentDiscoveryLocalActive,
+    promotion_session_id: SessionId,
+) -> Result<ContentDigest, StoreError> {
+    let store = ObjectStore::open(archive_root, binding.workspace_id())?;
+    store
+        .validate_enrolled_archive_resource_id(binding.archive_resource_id())
+        .map_err(StoreError::Io)?;
+    let bootstrap_import_id = ImportId::from_digest(*active.bootstrap_import_id.as_bytes());
+    let aggregate = BootstrapAggregateManifestV1::empty(
+        binding.workspace_id(),
+        binding.lineage_digest(),
+        binding.graph_resource_id(),
+        bootstrap_import_id,
+    )
+    .map_err(|error| StoreError::Bootstrap(error.to_string()))?;
+    store.publish_bootstrap_aggregate_prefix(&aggregate)?;
+    let publication_id = store.commit_bootstrap_aggregate(&aggregate)?;
+    let publication = store.load_bootstrap_publication(publication_id)?;
+    let history_binding = super::hot_engine::ProjectionStorageBinding {
+        endpoint: super::ProjectionEndpointBinding {
+            endpoint_id: binding.endpoint_id(),
+            device_id: binding.device_id(),
+            graph_resource_id: binding.graph_resource_id(),
+        },
+        receipt_store_id: binding.receipt_store_id(),
+    };
+    let history = store.open_engine_history(history_binding)?;
+    history.publish_many_exact(&[], &publication, EngineHistoryBinding::empty())?;
+    let state = PromotedRuntimeStateV1 {
+        schema_version: PROMOTED_RUNTIME_STATE_SCHEMA_VERSION,
+        lineage_mode: PromotedLineageModeV1::BootstrapAnchoredHomogeneous,
+        workspace_id: binding.workspace_id(),
+        lineage_digest: binding.lineage_digest(),
+        catalog_document_id: binding.catalog_document_id(),
+        endpoint_id: binding.endpoint_id(),
+        device_id: binding.device_id(),
+        graph_resource_id: binding.graph_resource_id(),
+        receipt_store_id: binding.receipt_store_id(),
+        archive_resource_id: binding.archive_resource_id(),
+        archive_control_binding: control_directory_identity(&store.capability)?.binding_digest(),
+        bootstrap: BootstrapAggregateHistoryBindingV1::for_aggregate(&aggregate)?,
+        bootstrap_import_id,
+        anchor_history_generation: active.anchor_history_generation,
+        anchor_history_index_root: active.anchor_history_index_root,
+        anchor_acceptance_sequence: active.anchor_acceptance_sequence,
+        anchor_accepted_frontier_state_digest: active.anchor_accepted_frontier_state_digest,
+        enrollment_verification_digest: active.verification_digest,
+        enrollment_binding_digest: binding
+            .binding_digest()
+            .map_err(|_| StoreError::MalformedPromotedRuntimeState)?,
+        promotion_session_id,
+    };
+    history.publish_promoted_runtime_state(&state)?;
+    state.state_digest()
+}
+
+#[cfg(test)]
+mod discovery_inspector_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_archive_presence_probe_creates_nothing() {
+        let parent =
+            std::env::temp_dir().join(format!("tine-archive-discovery-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&parent).unwrap();
+        let archive = parent.join("archive");
+        assert_eq!(
+            inspect_existing_archive_at(&archive, None).unwrap(),
+            ArchiveDiscoveryInspection::Absent
+        );
+        assert!(!archive.exists());
+
+        std::fs::create_dir(&archive).unwrap();
+        assert_eq!(
+            inspect_existing_archive_at(&archive, None).unwrap(),
+            ArchiveDiscoveryInspection::Residue
+        );
+        assert!(std::fs::read_dir(&archive).unwrap().next().is_none());
+        std::fs::remove_dir_all(parent).unwrap();
     }
 }
 
