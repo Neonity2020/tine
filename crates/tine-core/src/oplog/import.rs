@@ -923,32 +923,34 @@ pub(crate) fn publish_install_verify_inactive_bootstrap(
     let (existing_generation, existing_root, existing_latest, existing_engine_binding) =
         history.current_with_binding()?;
     let existing_record_count = history.current_record_count()?;
-    match history.current_bootstrap_binding()? {
-        None => {
-            if existing_generation != 0
-                || existing_root != super::object_store::EngineHistoryStore::empty_root()
-                || existing_latest.is_some()
-                || existing_engine_binding != EngineHistoryBinding::empty()
-                || existing_record_count != 0
-            {
-                return Err(invalid_bootstrap_orchestration(
-                    "bootstrap installation requires empty ordinary history",
-                ));
+    let (history_already_installed, effective_engine_binding) =
+        match history.current_bootstrap_binding()? {
+            None => {
+                if existing_generation != 0
+                    || existing_root != super::object_store::EngineHistoryStore::empty_root()
+                    || existing_latest.is_some()
+                    || existing_engine_binding != EngineHistoryBinding::empty()
+                    || existing_record_count != 0
+                {
+                    return Err(invalid_bootstrap_orchestration(
+                        "bootstrap installation requires empty ordinary history",
+                    ));
+                }
+                (false, expected_engine_binding.clone())
             }
-        }
-        Some(existing) => {
-            if existing != bootstrap_binding
-                || !was_committed
-                || existing_generation != u64::from(bootstrap_binding.part_count())
-                || existing_engine_binding != expected_engine_binding
-                || existing_record_count != u64::from(bootstrap_binding.part_count())
-            {
-                return Err(invalid_bootstrap_orchestration(
-                    "durable history belongs to a different or incomplete bootstrap",
-                ));
+            Some(existing) => {
+                if existing != bootstrap_binding
+                    || !was_committed
+                    || existing_generation != u64::from(bootstrap_binding.part_count())
+                    || existing_record_count != u64::from(bootstrap_binding.part_count())
+                {
+                    return Err(invalid_bootstrap_orchestration(
+                        "durable history belongs to a different or incomplete bootstrap",
+                    ));
+                }
+                (true, existing_engine_binding)
             }
-        }
-    }
+        };
 
     if !was_committed {
         let publication_id = store.commit_bootstrap_aggregate(aggregate)?;
@@ -968,23 +970,26 @@ pub(crate) fn publish_install_verify_inactive_bootstrap(
         ));
     }
 
-    let mut builder =
-        history.begin_publish_many_exact(&publication, expected_engine_binding.clone())?;
-    for (descriptor, material) in aggregate
-        .parts()
-        .iter()
-        .copied()
-        .zip(prepared.engine_materials.iter())
-    {
-        let bytes = material.encode_history_record(descriptor, bootstrap_binding)?;
-        let record = PreparedBootstrapHistoryRecordV1::new(descriptor, &bytes, bootstrap_binding)?;
-        builder.push(&record)?;
-        instrumentation.cold_records += 1;
-        instrumentation.peak_owned_cold_records = 1;
+    if !history_already_installed {
+        let mut builder =
+            history.begin_publish_many_exact(&publication, effective_engine_binding.clone())?;
+        for (descriptor, material) in aggregate
+            .parts()
+            .iter()
+            .copied()
+            .zip(prepared.engine_materials.iter())
+        {
+            let bytes = material.encode_history_record(descriptor, bootstrap_binding)?;
+            let record =
+                PreparedBootstrapHistoryRecordV1::new(descriptor, &bytes, bootstrap_binding)?;
+            builder.push(&record)?;
+            instrumentation.cold_records += 1;
+            instrumentation.peak_owned_cold_records = 1;
+        }
+        inactive_bootstrap_orchestration_cut(InactiveBootstrapOrchestrationCut::BeforeHistoryHead)?;
+        builder.finish()?;
+        inactive_bootstrap_orchestration_cut(InactiveBootstrapOrchestrationCut::AfterHistoryHead)?;
     }
-    inactive_bootstrap_orchestration_cut(InactiveBootstrapOrchestrationCut::BeforeHistoryHead)?;
-    builder.finish()?;
-    inactive_bootstrap_orchestration_cut(InactiveBootstrapOrchestrationCut::AfterHistoryHead)?;
 
     let replay_identity = DetachedBootstrapReplayIdentity::new(
         workspace_id,
@@ -1021,7 +1026,7 @@ pub(crate) fn publish_install_verify_inactive_bootstrap(
     if reopened_history.current_bootstrap_binding()? != Some(bootstrap_binding)
         || history_generation != u64::from(bootstrap_binding.part_count())
         || cold_record_count != u64::from(bootstrap_binding.part_count())
-        || reopened_engine_binding != expected_engine_binding
+        || reopened_engine_binding != effective_engine_binding
         || latest_batch_id
             != aggregate
                 .parts()
@@ -1038,13 +1043,14 @@ pub(crate) fn publish_install_verify_inactive_bootstrap(
         .copied()
         .zip(prepared.engine_materials.iter())
     {
-        let expected_bytes = material.encode_history_record(descriptor, bootstrap_binding)?;
         let loaded = reopened_history
             .lookup(history_root, descriptor.batch_id())?
             .ok_or_else(|| {
                 invalid_bootstrap_orchestration("fresh history is missing an exact cold record")
             })?;
-        if loaded != expected_bytes {
+        if !history_already_installed
+            && loaded != material.encode_history_record(descriptor, bootstrap_binding)?
+        {
             return Err(invalid_bootstrap_orchestration(
                 "fresh history cold record bytes differ from preparation",
             ));
@@ -1062,7 +1068,7 @@ pub(crate) fn publish_install_verify_inactive_bootstrap(
     let terminal_matches = reopened_candidate.last_part() == prepared.candidate.last_part();
     let frontier_matches = reopened_frontier == expected_frontier;
     let engine_binding_matches =
-        reopened_candidate_binding.same_replay_authority(&expected_engine_binding);
+        reopened_candidate_binding.same_replay_authority(&effective_engine_binding);
     if !part_count_matches || !terminal_matches || !frontier_matches || !engine_binding_matches {
         return Err(invalid_bootstrap_orchestration(format!(
             "fresh detached replay differs from prepared candidate \

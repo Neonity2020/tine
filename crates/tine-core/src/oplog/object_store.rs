@@ -40,7 +40,7 @@ use crate::model::HandoffSafe;
 
 use super::enrollment::{EnrollmentBindingV1, ResumePointEnrollmentBinding};
 use super::hot_engine::RuntimeResumeSnapshot;
-use super::identity::parse_digest;
+use super::identity::{parse_digest, ARCHIVE_INSTANCE_CLAIM_FILE};
 use super::resume_point::{
     clear_resume_points_in, next_resume_sequence, prune_resume_points_below,
     ResumeEnrollmentAdmission, ResumePointError, ResumePointMaintenance, ResumePointScan,
@@ -2464,14 +2464,39 @@ impl ObjectStore {
     /// Provision this store's canonical archive-resource claim exactly once and
     /// return its identity.
     ///
-    /// Used only to stage a genuine archive identity for tests; it goes through
-    /// the same retained no-follow capability that
+    /// The explicit local activation path uses this once to bind a newly
+    /// created v2 archive to its enrollment. It goes through the same retained
+    /// no-follow capability that
     /// [`Self::validate_enrolled_archive_resource_id`] later authenticates.
-    #[cfg(test)]
     pub(crate) fn provision_enrolled_archive_resource_id(
         &self,
     ) -> std::io::Result<super::CanonicalArchiveResourceId> {
         super::CanonicalArchiveResourceId::provision_in_retained_directory(&self.capability)
+    }
+
+    /// Publish or reopen the exact archive claim reserved in private
+    /// application data before graph-local archive construction began.
+    ///
+    /// Publication uses the object store's immutable temp+sync+no-replace
+    /// primitive. A crash may leave only a disposable temp, while retry always
+    /// republishes the same canonical claim and refuses any different final
+    /// claim instead of minting or adopting a replacement.
+    pub(crate) fn provision_or_resume_local_activation_archive_resource_id(
+        &self,
+        instance_id: Uuid,
+    ) -> Result<super::CanonicalArchiveResourceId, StoreError> {
+        let claim = super::CanonicalArchiveResourceId::claim_bytes(instance_id)?;
+        publish_immutable_exact(
+            &self.capability,
+            ARCHIVE_INSTANCE_CLAIM_FILE,
+            &claim,
+            "local activation archive claim",
+        )?;
+        super::CanonicalArchiveResourceId::open_exact_claim_in_retained_directory(
+            &self.capability,
+            &claim,
+        )
+        .map_err(StoreError::from)
     }
 
     pub(crate) fn start_engine_scratch(
@@ -7040,6 +7065,30 @@ pub(crate) fn ensure_directory_nofollow(root: &Dir, name: &str) -> Result<(), St
     }
     root.create_dir(name)?;
     sync_dir_required(root)
+}
+
+/// Create only the immediate parent of an explicitly bound object-store root.
+/// The grandparent must already exist; the final parent component is opened
+/// no-follow and its creation is durability-synced before store construction.
+pub(crate) fn prepare_object_store_parent_nofollow(root: &Path) -> Result<(), StoreError> {
+    let parent = root
+        .parent()
+        .ok_or_else(|| StoreError::UnsafeEntry("store root has no parent".into()))?;
+    let name = parent
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| StoreError::UnsafeEntry("store parent is not UTF-8".into()))?;
+    if !matches!(parent.components().next_back(), Some(Component::Normal(_))) {
+        return Err(StoreError::UnsafeEntry(
+            "store parent must end in a normal path component".into(),
+        ));
+    }
+    let grandparent = parent
+        .parent()
+        .ok_or_else(|| StoreError::UnsafeEntry("store parent has no grandparent".into()))?;
+    let canonical_grandparent = fs::canonicalize(grandparent)?;
+    let grandparent = Dir::open_ambient_dir(&canonical_grandparent, ambient_authority())?;
+    ensure_directory_nofollow(&grandparent, name)
 }
 
 fn ensure_directory(root: &Dir, name: &str) -> Result<(), StoreError> {

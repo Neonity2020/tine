@@ -56,7 +56,9 @@ use super::import::{
 use super::migration_backup::{
     verify_migration_source_backup, MigrationBackupError, MigrationBackupRoot, VerifiedSourceBackup,
 };
-use super::object_store::{ensure_directory_nofollow, open_dir_nofollow, sync_dir_required};
+use super::object_store::{
+    ensure_directory_nofollow, open_dir_nofollow, publish_immutable_exact, sync_dir_required,
+};
 use super::shadow_projection::{
     verify_inactive_bootstrap_shadow_projection, ShadowProjectionError, VerifiedShadowProjection,
 };
@@ -77,6 +79,7 @@ pub(crate) const ENROLLMENT_RECORD_SCHEMA_VERSION: u32 = 5;
 pub(crate) const PUBLISHED_RECOVERY_PACKET_SCHEMA_VERSION: u32 = 1;
 pub(crate) const SHARED_ENROLLMENT_DESCRIPTOR_SCHEMA_VERSION: u32 = 1;
 pub(crate) const JOINER_WORKSPACE_ARCHIVE_SCHEMA_VERSION: u32 = 1;
+pub(crate) const LOCAL_ACTIVATION_RESERVATION_SCHEMA_VERSION: u32 = 1;
 pub(crate) const MAX_ENROLLMENT_RECORD_BYTES: usize = 32 * 1024;
 pub(crate) const MAX_ENROLLMENT_JSON_DEPTH: usize = 16;
 /// All lifecycle records remain bounded and read with a single fixed parser
@@ -102,6 +105,8 @@ const HEAD_BYTES: usize = 65;
 const HEAD_TEMP_PREFIX: &str = ".head-tmp-";
 const RECORD_TEMP_PREFIX: &str = ".record-tmp-";
 const AUTHORITY_TEMP_PREFIX: &str = ".authority-tmp-";
+const LOCAL_ACTIVATION_RESERVATION_FILE: &str = "local-activation-v1.reservation";
+const MAX_LOCAL_ACTIVATION_RESERVATION_BYTES: usize = 4 * 1024;
 const ENROLLMENT_AUTHORITY_SCHEMA_VERSION: u32 = 1;
 const ENROLLMENT_CHECKPOINT_SCHEMA_VERSION: u32 = 2;
 const MAX_ENROLLMENT_AUTHORITY_BYTES: usize = 4 * 1024;
@@ -217,6 +222,15 @@ impl EnrollmentApplicationRoot {
         prepare_application_root(path)
     }
 
+    /// Open an explicitly supplied, already caller-bound private application
+    /// root for the one-shot local activation path.  The public activation
+    /// facade validates that this path is outside the graph before reaching
+    /// this constructor; this layer retains the no-follow/private-directory
+    /// checks at the filesystem boundary.
+    pub(crate) fn open_explicit_private(path: &Path) -> Result<Self, EnrollmentError> {
+        prepare_application_root(path)
+    }
+
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
@@ -268,10 +282,194 @@ impl PreparationId {
         Self(Uuid::new_v4())
     }
 
-    #[cfg(test)]
-    const fn from_uuid(value: Uuid) -> Self {
+    pub(crate) const fn from_uuid(value: Uuid) -> Self {
         Self(value)
     }
+}
+
+/// Exact caller identities fixed before any graph-local archive namespace is
+/// opened. This private reservation identity is deliberately stricter than the
+/// eventual runtime binding: an honest crash resume must use the same
+/// preparation and activation session as the call that first reserved it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LocalActivationIdentityV1 {
+    workspace_id: WorkspaceId,
+    lineage_digest: LineageDigest,
+    catalog_document_id: DocumentId,
+    endpoint_id: ProjectionEndpointId,
+    device_id: DeviceId,
+    graph_resource_id: CanonicalGraphResourceId,
+    preparation_id: PreparationId,
+    session_id: SessionId,
+}
+
+impl LocalActivationIdentityV1 {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) const fn new(
+        workspace_id: WorkspaceId,
+        lineage_digest: LineageDigest,
+        catalog_document_id: DocumentId,
+        endpoint_id: ProjectionEndpointId,
+        device_id: DeviceId,
+        graph_resource_id: CanonicalGraphResourceId,
+        preparation_id: PreparationId,
+        session_id: SessionId,
+    ) -> Self {
+        Self {
+            workspace_id,
+            lineage_digest,
+            catalog_document_id,
+            endpoint_id,
+            device_id,
+            graph_resource_id,
+            preparation_id,
+            session_id,
+        }
+    }
+}
+
+/// Complete private pre-enrollment reservation binding. Receipt-store,
+/// graph-scope, and source-inventory evidence are freshly derived before this
+/// is published, so archive construction never relies on a pathname-only
+/// assertion.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LocalActivationReservationBindingV1 {
+    identity: LocalActivationIdentityV1,
+    receipt_store_id: ProjectionReceiptStoreId,
+    graph_text_scope_binding: GraphTextScopeBinding,
+    source_inventory_digest: ContentDigest,
+}
+
+impl LocalActivationReservationBindingV1 {
+    pub(crate) const fn new(
+        identity: LocalActivationIdentityV1,
+        receipt_store_id: ProjectionReceiptStoreId,
+        graph_text_scope_binding: GraphTextScopeBinding,
+        source_inventory_digest: ContentDigest,
+    ) -> Self {
+        Self {
+            identity,
+            receipt_store_id,
+            graph_text_scope_binding,
+            source_inventory_digest,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocalActivationReservationV1 {
+    schema_version: u32,
+    binding: LocalActivationReservationBindingV1,
+    archive_instance_id: Uuid,
+}
+
+/// Authenticated-by-private-root, bounded evidence that makes an archive
+/// construction crash explicitly resumable before ShadowImport exists.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LocalActivationReservation {
+    record: LocalActivationReservationV1,
+}
+
+impl LocalActivationReservation {
+    pub(crate) const fn identity(&self) -> &LocalActivationIdentityV1 {
+        &self.record.binding.identity
+    }
+
+    pub(crate) const fn archive_instance_id(&self) -> Uuid {
+        self.record.archive_instance_id
+    }
+}
+
+/// Read one existing private reservation without creating the application
+/// root, enrollment namespace, archive, or writer lease.
+pub(crate) fn inspect_local_activation_reservation_at(
+    root_path: &Path,
+) -> Result<Option<LocalActivationReservation>, EnrollmentError> {
+    let Some(root) = open_existing_application_root(root_path)? else {
+        return Ok(None);
+    };
+    open_local_activation_reservation(&root)
+}
+
+/// Publish or resume the exact private reservation before archive creation.
+/// Immutable publication is head-last/no-replace; any abandoned temp remains
+/// outside the graph and grants no authority.
+pub(crate) fn begin_or_resume_local_activation_reservation(
+    root: &EnrollmentApplicationRoot,
+    binding: LocalActivationReservationBindingV1,
+) -> Result<LocalActivationReservation, EnrollmentError> {
+    if let Some(existing) = open_local_activation_reservation(root)? {
+        if existing.record.binding != binding {
+            return Err(EnrollmentError::LocalActivationReservationMismatch);
+        }
+        return Ok(existing);
+    }
+    let record = LocalActivationReservationV1 {
+        schema_version: LOCAL_ACTIVATION_RESERVATION_SCHEMA_VERSION,
+        binding,
+        archive_instance_id: Uuid::new_v4(),
+    };
+    let bytes =
+        serde_json::to_vec(&record).map_err(|error| EnrollmentError::Encode(error.to_string()))?;
+    if bytes.len() > MAX_LOCAL_ACTIVATION_RESERVATION_BYTES {
+        return Err(EnrollmentError::LocalActivationReservationTooLarge(
+            bytes.len(),
+        ));
+    }
+    let directory = Dir::open_ambient_dir(root.path(), ambient_authority())?;
+    publish_immutable_exact(
+        &directory,
+        LOCAL_ACTIVATION_RESERVATION_FILE,
+        &bytes,
+        "local activation reservation",
+    )
+    .map_err(|error| EnrollmentError::Durability(error.to_string()))?;
+    let published = open_local_activation_reservation(root)?.ok_or_else(|| {
+        EnrollmentError::Io("published local activation reservation is absent".into())
+    })?;
+    if published.record != record {
+        return Err(EnrollmentError::LocalActivationReservationMismatch);
+    }
+    Ok(published)
+}
+
+fn open_local_activation_reservation(
+    root: &EnrollmentApplicationRoot,
+) -> Result<Option<LocalActivationReservation>, EnrollmentError> {
+    let directory = Dir::open_ambient_dir(root.path(), ambient_authority())?;
+    match directory.symlink_metadata(LOCAL_ACTIVATION_RESERVATION_FILE) {
+        Ok(metadata) if !cap_metadata_is_authoritative_file(&metadata) => {
+            return Err(EnrollmentError::UnsafeNamespace(
+                "local activation reservation is not a regular no-follow file".into(),
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+    let (bytes, _) = read_bounded_authoritative_file(
+        &directory,
+        LOCAL_ACTIVATION_RESERVATION_FILE,
+        MAX_LOCAL_ACTIVATION_RESERVATION_BYTES,
+        "local activation reservation",
+        true,
+    )?;
+    let record: LocalActivationReservationV1 = serde_json::from_slice(&bytes)
+        .map_err(|error| EnrollmentError::Decode(error.to_string()))?;
+    if record.schema_version != LOCAL_ACTIVATION_RESERVATION_SCHEMA_VERSION {
+        return Err(
+            EnrollmentError::UnsupportedLocalActivationReservationSchema(record.schema_version),
+        );
+    }
+    let canonical =
+        serde_json::to_vec(&record).map_err(|error| EnrollmentError::Encode(error.to_string()))?;
+    if canonical != bytes {
+        return Err(EnrollmentError::NonCanonicalLocalActivationReservation);
+    }
+    Ok(Some(LocalActivationReservation { record }))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2454,6 +2652,47 @@ pub(crate) fn compose_verified_local(
     proofs: &VerifiedLocalProofSet<'_>,
 ) -> Result<VerifiedLocalEvidence, VerifiedLocalCompositionError> {
     compose_verified_local_at_cut(root, binding, preparation_id, proofs, CommitCut::None)
+}
+
+/// Persist or resume only the durable `ShadowImport` predecessor of the
+/// verified-local composition.  This is the first resumable marker the public
+/// activation facade writes after it has captured exact source inventory
+/// evidence.  It deliberately grants no graph, projection, or mutation
+/// authority.
+pub(crate) fn begin_or_resume_shadow_import(
+    root: &EnrollmentApplicationRoot,
+    binding: EnrollmentBindingV1,
+    preparation_id: PreparationId,
+    source_inventory_digest: ContentDigest,
+) -> Result<(), VerifiedLocalCompositionError> {
+    let shadow = ShadowImportV1::new(preparation_id, source_inventory_digest);
+    let writer = match EnrollmentWriter::open_existing(root, &binding)? {
+        EnrollmentOpen::Absent => EnrollmentWriter::create(root, binding, shadow.clone())?,
+        EnrollmentOpen::Present(writer) => writer,
+    };
+    match writer.current().record.lifecycle() {
+        EnrollmentLifecycleV1::ShadowImport(current) if current == &shadow => Ok(()),
+        EnrollmentLifecycleV1::VerifiedLocal(current)
+            if current.preparation_id == shadow.preparation_id
+                && current.source_inventory_digest == shadow.source_inventory_digest =>
+        {
+            Ok(())
+        }
+        EnrollmentLifecycleV1::ShadowImport(_) | EnrollmentLifecycleV1::VerifiedLocal(_) => {
+            Err(EnrollmentError::InitialPreparationMismatch.into())
+        }
+        EnrollmentLifecycleV1::LocalActive(_)
+        | EnrollmentLifecycleV1::SharePrepared(_)
+        | EnrollmentLifecycleV1::Joining(_)
+        | EnrollmentLifecycleV1::SharedActive(_) => {
+            Err(VerifiedLocalCompositionError::WrongLifecycle(
+                "active or shared enrollment cannot be resumed as ShadowImport",
+            ))
+        }
+        EnrollmentLifecycleV1::Blocked(_) => Err(VerifiedLocalCompositionError::WrongLifecycle(
+            "blocked enrollment cannot resume ShadowImport",
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -6431,6 +6670,10 @@ pub(crate) enum EnrollmentError {
     AuthorityClaimTooLarge(usize),
     NonCanonicalAuthorityClaim,
     UnsupportedAuthoritySchema(u32),
+    LocalActivationReservationMismatch,
+    LocalActivationReservationTooLarge(usize),
+    NonCanonicalLocalActivationReservation,
+    UnsupportedLocalActivationReservationSchema(u32),
     UnsupportedCheckpointSchema(u32),
     MissingAuthenticatedCheckpoint,
     CheckpointAuthenticationFailed,
@@ -6530,6 +6773,24 @@ impl fmt::Display for EnrollmentError {
                 write!(
                     formatter,
                     "unsupported enrollment authority schema {schema}"
+                )
+            }
+            Self::LocalActivationReservationMismatch => {
+                formatter.write_str("local activation reservation binding mismatch")
+            }
+            Self::LocalActivationReservationTooLarge(bytes) => {
+                write!(
+                    formatter,
+                    "local activation reservation is too large: {bytes} bytes"
+                )
+            }
+            Self::NonCanonicalLocalActivationReservation => {
+                formatter.write_str("local activation reservation is not canonical")
+            }
+            Self::UnsupportedLocalActivationReservationSchema(schema) => {
+                write!(
+                    formatter,
+                    "unsupported local activation reservation schema {schema}"
                 )
             }
             Self::UnsupportedCheckpointSchema(schema) => {

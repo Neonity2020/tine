@@ -244,11 +244,16 @@ impl ReconciliationBaselineBinding {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ReconciliationBaselineError {
+    Missing,
     BaselineUnavailable { detail: String },
     RebuildRequired { path: PathBuf, detail: String },
 }
 
 impl ReconciliationBaselineError {
+    pub(crate) const fn is_missing(&self) -> bool {
+        matches!(self, Self::Missing)
+    }
+
     pub(crate) const fn requires_rebuild(&self) -> bool {
         matches!(self, Self::RebuildRequired { .. })
     }
@@ -257,6 +262,7 @@ impl ReconciliationBaselineError {
 impl fmt::Display for ReconciliationBaselineError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Missing => formatter.write_str("reconciliation baseline does not exist"),
             Self::BaselineUnavailable { detail } => {
                 write!(formatter, "reconciliation baseline unavailable: {detail}")
             }
@@ -2763,7 +2769,7 @@ fn open_existing_directory(parent: &Dir, name: &str) -> Result<Dir, Reconciliati
         }
         Ok(_) => {}
         Err(error) if error.kind() == ErrorKind::NotFound => {
-            return Err(unavailable("reconciliation baseline does not exist"));
+            return Err(ReconciliationBaselineError::Missing);
         }
         Err(error) => {
             return Err(unavailable(format!(
@@ -2846,7 +2852,7 @@ fn require_existing_regular(parent: &Dir, path: &Path) -> Result<(), Reconciliat
         ),
         Ok(_) => Ok(()),
         Err(error) if error.kind() == ErrorKind::NotFound => {
-            Err(unavailable("reconciliation baseline does not exist"))
+            Err(ReconciliationBaselineError::Missing)
         }
         Err(error) => Err(unavailable(format!(
             "cannot inspect reconciliation baseline: {error}"

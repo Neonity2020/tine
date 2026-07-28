@@ -1151,6 +1151,31 @@
       }
     },
     {
+      "id": "REG-SYNC-LOCAL-ACTIVATION-PREHEAD-001",
+      "title": "A crash after creating the sparse archive but before publishing ShadowImport cannot permanently wedge local activation",
+      "family": "sync-data-safety",
+      "sources": {
+        "issues": [],
+        "commits": [
+          "2843d37b",
+          "e26067aa"
+        ]
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/sync_runtime.rs"
+        ],
+        "scenario": "sync.local-activation-private-reservation-and-archive-claim-crash-cuts",
+        "failBefore": "proven"
+      },
+      "notes": "The explicit public activation journey cuts before archive creation, after immutable archive namespace/claim publication but before the enrollment head, after ShadowImport, and after VerifiedLocal. Exact identities resume to Active with byte-identical graph text; mismatched identities and unrelated v2 residue remain refused."
+    },
+    {
       "id": "REG-SYNC-SHARED-ENROLLMENT-P3-001",
       "title": "Sparse-oplog sharing admits exactly one descriptor-bound lineage and blocks incomplete bootstrap, split genesis, dirty tails, and projection/base disagreement without changing projection bytes",
       "family": "sync-data-safety",

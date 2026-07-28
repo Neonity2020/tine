@@ -656,7 +656,10 @@ fn validate_bindings(
         || aggregate.parts().len() as u32 != verified.part_count()
         || aggregate.final_frontier().last_part() != verified.predecessor_terminal()
         || &expected_frontier != verified.accepted_frontier()
-        || prepared.candidate().durable_history_binding() != *verified.engine_binding()
+        || !prepared
+            .candidate()
+            .durable_history_binding()
+            .same_replay_authority(verified.engine_binding())
         || bootstrap_binding != verified.bootstrap_binding()
         || verified.storage_binding().endpoint.graph_resource_id() != verified.graph_resource()
         || verified.history_generation() != u64::from(verified.part_count())

@@ -81,7 +81,7 @@ fn test_manifest(
         batch_id,
         author_device_id,
         author_session_id,
-        BatchOrigin::BootstrapImport,
+        BatchOrigin::LocalMutation,
         BatchCausalDot::new(CausalPeerId::from_device_id(author_device_id), 1).unwrap(),
         causal_dependency_heads,
         dependency_frontier,

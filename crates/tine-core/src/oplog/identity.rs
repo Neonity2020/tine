@@ -413,18 +413,34 @@ impl CanonicalArchiveResourceId {
     pub(crate) fn provision_in_retained_directory(
         directory: &cap_std::fs::Dir,
     ) -> std::io::Result<Self> {
-        let claim = ArchiveInstanceClaimV1 {
-            schema_version: ARCHIVE_INSTANCE_CLAIM_SCHEMA_VERSION,
-            instance_id: Uuid::new_v4(),
-        };
-        let bytes = serde_json::to_vec(&claim)
-            .map_err(|error| std::io::Error::new(ErrorKind::InvalidData, error))?;
+        let bytes = Self::claim_bytes(Uuid::new_v4())?;
         let mut file = create_new_archive_claim(directory)?;
         validate_archive_claim_handle(&file)?;
         file.write_all(&bytes)?;
         file.sync_all()?;
         sync_dir_required(directory).map_err(|error| std::io::Error::other(error.to_string()))?;
         derive_archive_resource_id(directory, &bytes)
+    }
+
+    /// Canonical claim bytes for one private local-activation reservation.
+    /// Keeping the instance identity outside the graph before archive creation
+    /// lets an honest crash retry publish the same archive claim head-last.
+    pub(crate) fn claim_bytes(instance_id: Uuid) -> std::io::Result<Vec<u8>> {
+        serde_json::to_vec(&ArchiveInstanceClaimV1 {
+            schema_version: ARCHIVE_INSTANCE_CLAIM_SCHEMA_VERSION,
+            instance_id,
+        })
+        .map_err(|error| std::io::Error::new(ErrorKind::InvalidData, error))
+    }
+
+    /// Open the claim published for one exact private activation reservation.
+    /// A different, partial, or non-canonical claim is never adopted.
+    pub(crate) fn open_exact_claim_in_retained_directory(
+        directory: &cap_std::fs::Dir,
+        expected_claim: &[u8],
+    ) -> std::io::Result<Self> {
+        let expected = derive_archive_resource_id(directory, expected_claim)?;
+        Self::open_enrolled_in_retained_directory(directory, expected)
     }
 
     /// Open an already-enrolled archive using its exact persisted claim.

@@ -661,6 +661,15 @@ impl ApplicationRuntimeRoot {
         Ok(Self { path })
     }
 
+    /// Open an explicitly supplied private application-runtime root for the
+    /// opt-in activation API.  Its caller has already established that the
+    /// path is outside the graph; this constructor preserves the runtime
+    /// root's own no-follow and ownership checks.
+    pub(crate) fn open_explicit_private(path: &Path) -> Result<Self, ProjectionError> {
+        let path = prepare_application_runtime_root(path)?;
+        Ok(Self { path })
+    }
+
     /// Retain an already-existing private runtime root without creating it.
     pub(crate) fn open_existing_for_runtime_host(path: &Path) -> Result<Self, ProjectionError> {
         let direct_metadata = fs::symlink_metadata(path)?;

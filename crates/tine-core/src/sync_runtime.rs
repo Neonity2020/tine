@@ -1,4 +1,4 @@
-//! Inactive single-owner host for an existing sparse-oplog local runtime.
+//! Explicit local-activation and single-owner host for a sparse-oplog runtime.
 //!
 //! The only public capability is [`SyncRuntimeHandle`]. It is cloneable,
 //! `Send + Sync`, and forwards bounded typed requests to one dedicated actor
@@ -7,15 +7,19 @@
 //! baseline, watcher owner, SQLite applier, and every continuation on that
 //! thread. None of those capabilities can cross this module's public boundary.
 //!
-//! This module does not activate a graph, create an enrollment, repair state,
-//! select itself during normal graph loading, or route legacy mutations. Only
-//! an explicit [`SyncStorageProfile::ExperimentalLocal`] request whose
-//! read-only discovery result is an authenticated existing `LocalActive` may
-//! start an actor.
+//! Ordinary startup does not activate a graph, create an enrollment, repair
+//! state, select itself during normal graph loading, or route legacy
+//! mutations. [`SyncRuntimeHandle::activate_or_resume_local`] is the one
+//! explicit opt-in composition path: it accepts fully bound paths and
+//! identities, resumes only `ShadowImport`/`VerifiedLocal`, and returns this
+//! handle only after a proven `LocalActive` runtime and reconciliation baseline
+//! exist. [`SyncRuntimeHandle::open`] otherwise remains an existing-active-only
+//! read/discovery boundary.
 
 use std::fmt;
+use std::fs;
 use std::marker::PhantomData;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, RwLock};
@@ -30,17 +34,28 @@ use crate::oplog::discovery::{
     DiscoveryRequest, LocalActiveAdvisory, NonActiveStage, StartupStorageProfile,
 };
 use crate::oplog::enrollment::{
-    open_existing_enrollment_application_root, EnrollmentDiscoveryHandoff,
+    begin_or_resume_local_activation_reservation, begin_or_resume_shadow_import,
+    compose_verified_local, inspect_local_activation_reservation_at,
+    open_existing_enrollment_application_root, EnrollmentApplicationRoot, EnrollmentBindingV1,
+    EnrollmentDiscoveryHandoff, LocalActivationIdentityV1, LocalActivationReservationBindingV1,
+    PreparationId, VerifiedLocalProofSet,
 };
 use crate::oplog::exact_external_feed::{
     ExactExternalFeedDrain, ExactExternalFeedObserveError, ExactExternalFeedState,
 };
-use crate::oplog::hot_engine::ProjectionEndpointBinding;
+use crate::oplog::hot_engine::{ProjectionEndpointBinding, ProjectionStorageBinding};
+use crate::oplog::import::{
+    prepare_inactive_bootstrap_import, publish_install_verify_inactive_bootstrap,
+    reopen_inactive_bootstrap_accepted_authority,
+};
 use crate::oplog::local_active::{
-    reopen_promoted_local_runtime_existing_projection,
-    take_over_promoted_local_runtime_recovering_projection, LocalActiveAuthority,
+    activate_verified_local, reopen_promoted_local_runtime_existing_projection,
+    seal_local_runtime_promotion, take_over_promoted_local_runtime_recovering_projection,
+    InactiveBootstrapRuntimeSession, LocalActiveAuthority, LocalActiveRuntime,
     PromotedLocalRuntime, PromotedRuntimeOpen, RuntimeRecoveryState,
 };
+use crate::oplog::migration_backup::{verify_migration_source_backup, MigrationBackupRoot};
+use crate::oplog::object_store::{prepare_object_store_parent_nofollow, ObjectStore};
 #[cfg(test)]
 use crate::oplog::operational_coordinator::{fail_repeatedly_at, OperationalFaultPoint};
 use crate::oplog::operational_coordinator::{
@@ -52,15 +67,18 @@ use crate::oplog::reconciliation_baseline::{
     BaselineTimestamp, ReconciliationBaseline, ReconciliationBaselineBinding,
     TrustedPrivateApplicationRuntimeRoot,
 };
+use crate::oplog::shadow_projection::verify_inactive_bootstrap_shadow_projection;
 use crate::oplog::sqlite::ApplicationRuntimeRoot;
 use crate::oplog::watcher_queue::WatcherObservation;
 use crate::oplog::{
-    BatchId, BlockId, FrontierReferenceHit, LogseqUuid, ManagedPath, ManagedTextKind,
-    MaterializedBlockRow, MaterializedEntityId, MaterializedPageRow, MaterializedPropertyRow,
-    MaterializedSearchHit, MaterializedTagRow, MaterializedTaskRow, OperationTransaction, PageId,
-    ReferenceFactV1, ReferenceSourceLocatorV1, SemanticOperation, SessionId,
-    MAX_MATERIALIZATION_QUERY_BYTES, MAX_MATERIALIZATION_QUERY_ROWS,
+    BatchId, BlockId, ContentDigest, DeviceId, DocumentId, FrontierReferenceHit, LineageDigest,
+    LogseqUuid, ManagedPath, ManagedTextKind, MaterializedBlockRow, MaterializedEntityId,
+    MaterializedPageRow, MaterializedPropertyRow, MaterializedSearchHit, MaterializedTagRow,
+    MaterializedTaskRow, OperationTransaction, PageId, ProjectionEndpointId,
+    ReferenceCatalogPolicyV1, ReferenceFactV1, ReferenceSourceLocatorV1, SemanticOperation,
+    SessionId, WorkspaceId, MAX_MATERIALIZATION_QUERY_BYTES, MAX_MATERIALIZATION_QUERY_ROWS,
 };
+use uuid::Uuid;
 
 const ACTOR_CHANNEL_CAPACITY: usize = 64;
 const ACTOR_STACK_BYTES: usize = 16 * 1024 * 1024;
@@ -89,6 +107,51 @@ static ACTOR_THREADS_STARTED: std::sync::atomic::AtomicUsize =
 static ACTOR_THREADS_FINISHED: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+#[cfg(test)]
+thread_local! {
+    static ACTIVATION_TEST_CUT: std::cell::Cell<Option<ActivationTestCut>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActivationTestCut {
+    BeforeArchiveCreation,
+    AfterArchiveClaimBeforeEnrollmentHead,
+    AfterShadowImport,
+    AfterVerifiedLocal,
+}
+
+#[cfg(test)]
+fn fail_once_at_activation_cut(cut: ActivationTestCut) {
+    ACTIVATION_TEST_CUT.with(|pending| pending.set(Some(cut)));
+}
+
+fn activation_cut(cut: &'static str) -> Result<(), String> {
+    #[cfg(test)]
+    {
+        let expected = match cut {
+            "before_archive_creation" => ActivationTestCut::BeforeArchiveCreation,
+            "after_archive_claim_before_enrollment_head" => {
+                ActivationTestCut::AfterArchiveClaimBeforeEnrollmentHead
+            }
+            "after_shadow_import" => ActivationTestCut::AfterShadowImport,
+            "after_verified_local" => ActivationTestCut::AfterVerifiedLocal,
+            _ => return Ok(()),
+        };
+        if ACTIVATION_TEST_CUT.with(|pending| {
+            (pending.get() == Some(expected))
+                .then(|| pending.set(None))
+                .is_some()
+        }) {
+            return Err(format!("injected activation crash cut: {cut}"));
+        }
+    }
+    let _ = cut;
+    Ok(())
+}
+
 /// Storage selection at the inactive facade boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SyncStorageProfile {
@@ -108,6 +171,91 @@ pub struct SyncRuntimeOpenRequest {
     pub receipt_root: PathBuf,
     pub database_path: PathBuf,
     pub application_runtime_root: PathBuf,
+}
+
+/// Every caller-provided identity bound into one explicit local activation.
+///
+/// The public API never generates these values: callers persist them alongside
+/// the activation request and pass the same values again to resume an
+/// interrupted `ShadowImport` or `VerifiedLocal` attempt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SyncLocalActivationIdentities {
+    pub workspace_id: WorkspaceId,
+    pub lineage_digest: LineageDigest,
+    pub catalog_document_id: DocumentId,
+    pub endpoint_id: ProjectionEndpointId,
+    pub device_id: DeviceId,
+    pub preparation_id: Uuid,
+    pub session_id: SessionId,
+}
+
+/// Explicit opt-in input for the bounded local sparse-oplog activation path.
+///
+/// `archive_root` must be exactly `<graph>/.tine-sync/v2`: it is the only
+/// activation artifact permitted inside the graph. Every other supplied path
+/// is checked before use and must remain outside the graph's canonical root.
+/// No normal startup path constructs this request or calls the activation API.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SyncLocalActivationRequest {
+    pub graph_root: PathBuf,
+    pub archive_root: PathBuf,
+    pub enrollment_root: PathBuf,
+    pub receipt_root: PathBuf,
+    pub database_path: PathBuf,
+    pub application_runtime_root: PathBuf,
+    pub migration_backup_root: PathBuf,
+    pub capture_root: PathBuf,
+    pub preparation_root: PathBuf,
+    pub identities: SyncLocalActivationIdentities,
+}
+
+/// The only durable activation states the public composition can resume.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SyncLocalActivationStage {
+    Absent,
+    ShadowImport,
+    VerifiedLocal,
+    LocalActive,
+}
+
+/// Typed result of an explicit local activation/resume attempt.
+///
+/// `Retryable` always reports the durable lifecycle last observed after the
+/// failure; `Blocked` preserves the enrollment's durable reason code. A handle
+/// is returned only for `Active`, after bootstrap, backup, shadow proof,
+/// `VerifiedLocal`, promotion, SQLite proof, and reconciliation-baseline open
+/// have all completed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SyncLocalActivationStatus {
+    Active,
+    Retryable {
+        durable_stage: SyncLocalActivationStage,
+        detail: String,
+    },
+    Blocked {
+        reason_code: String,
+    },
+    LegacyV1Refused,
+    UnsupportedOrIncompatible(SyncRuntimeComponent),
+    CorruptOrUnreadable(SyncRuntimeComponent),
+    AmbiguousOrForeignResidue(SyncAmbiguousEvidence),
+}
+
+/// Activation result, split from the retained runtime capability so callers
+/// can persist or display failures without accidentally acquiring authority.
+pub struct SyncLocalActivationResult {
+    pub status: SyncLocalActivationStatus,
+    pub handle: Option<SyncRuntimeHandle>,
+}
+
+impl fmt::Debug for SyncLocalActivationResult {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SyncLocalActivationResult")
+            .field("status", &self.status)
+            .field("has_handle", &self.handle.is_some())
+            .finish()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -482,11 +630,6 @@ pub enum SyncLocalMutationBlock {
 }
 
 /// Typed result of one bounded local semantic mutation request.
-///
-/// A retryable, retained, blocked, or revoked reply never vends the private
-/// continuation. The actor remains its sole owner and retries it on later
-/// ordered turns. `Durable` means immutable history, SQLite, and graph
-/// projection completed before the reply.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SyncLocalMutationOutcome {
     Durable {
@@ -519,12 +662,8 @@ pub struct SyncLocalMutationRequestSize {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SyncLocalMutationRequestError {
-    /// The public DTO bypassed or failed `OperationTransaction::new`, or used
-    /// the external-reconciliation-only operation.
     InvalidTransaction,
-    /// One or more public intake budgets were exceeded before actor queueing.
     RequestTooLarge(SyncLocalMutationRequestSize),
-    /// The actor stopped, crashed, or completed clean shutdown.
     ActorUnavailable,
 }
 
@@ -623,6 +762,16 @@ impl SyncRuntimeHandle {
     /// Read-only discovery first; actor construction only for authenticated
     /// existing `LocalActive` evidence.
     pub fn open(request: SyncRuntimeOpenRequest) -> SyncRuntimeOpenResult {
+        Self::open_with_session(request, SessionId::new())
+    }
+
+    /// The existing-only actor open with the handoff identity supplied by the
+    /// explicit activation boundary. Ordinary public reopen keeps using
+    /// [`Self::open`], which has its established fresh-session behavior.
+    fn open_with_session(
+        request: SyncRuntimeOpenRequest,
+        session_id: SessionId,
+    ) -> SyncRuntimeOpenResult {
         if request.profile == SyncStorageProfile::LegacyDefault {
             return SyncRuntimeOpenResult {
                 status: SyncRuntimeOpenStatus::LegacyDefault,
@@ -676,7 +825,14 @@ impl SyncRuntimeHandle {
                 #[cfg(test)]
                 ACTOR_THREADS_STARTED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    actor_thread(request, advisory, receiver, started_sender, &actor_status)
+                    actor_thread(
+                        request,
+                        advisory,
+                        session_id,
+                        receiver,
+                        started_sender,
+                        &actor_status,
+                    )
                 }));
                 if result.is_err() {
                     *actor_status.write().unwrap() = SyncRuntimeStatusSnapshot {
@@ -722,6 +878,152 @@ impl SyncRuntimeHandle {
         }
     }
 
+    /// Explicitly activate or resume one bounded local sparse-oplog runtime.
+    ///
+    /// This is intentionally separate from [`Self::open`]: ordinary startup
+    /// remains read-only discovery, while this opt-in call alone may create an
+    /// `Absent -> ShadowImport -> VerifiedLocal -> LocalActive` enrollment.
+    /// The method never opens or interprets `.tine-sync/v1`, never enables a
+    /// default graph, and deliberately does not implement `SharedActive`.
+    pub fn activate_or_resume_local(
+        request: SyncLocalActivationRequest,
+    ) -> SyncLocalActivationResult {
+        let graph = match Graph::open_checked(&request.graph_root) {
+            Ok(graph) => graph,
+            Err(error) => {
+                return activation_retryable(
+                    SyncLocalActivationStage::Absent,
+                    format!("cannot retain graph for activation: {error}"),
+                );
+            }
+        };
+        let graph_resource_id = match graph.canonical_resource_id() {
+            Ok(resource) => resource,
+            Err(error) => {
+                return activation_retryable(
+                    SyncLocalActivationStage::Absent,
+                    format!("cannot identify graph for activation: {error}"),
+                );
+            }
+        };
+        if legacy_v1_namespace_present(&request.graph_root) {
+            return SyncLocalActivationResult {
+                status: SyncLocalActivationStatus::LegacyV1Refused,
+                handle: None,
+            };
+        }
+        if let Err(detail) = validate_activation_paths(&request, &request.graph_root) {
+            return activation_retryable(SyncLocalActivationStage::Absent, detail);
+        }
+        let activation_identity = local_activation_identity(&request, graph_resource_id);
+        let reservation = match inspect_local_activation_reservation_at(&request.enrollment_root) {
+            Ok(reservation) => reservation,
+            Err(_) => {
+                return SyncLocalActivationResult {
+                    status: SyncLocalActivationStatus::CorruptOrUnreadable(
+                        SyncRuntimeComponent::Enrollment,
+                    ),
+                    handle: None,
+                };
+            }
+        };
+        if reservation
+            .as_ref()
+            .is_some_and(|reservation| reservation.identity() != &activation_identity)
+        {
+            return activation_blocked("explicit_identity_binding_mismatch");
+        }
+
+        let discovery = discover_startup(&DiscoveryRequest {
+            profile: StartupStorageProfile::ExperimentalSparse,
+            graph_resource_id,
+            runtime_root: &request.enrollment_root,
+            archive_root: &request.archive_root,
+        });
+        match discovery {
+            DiscoveryClassification::ExistingLocalActive(advisory) => {
+                if !identities_match_binding(&request.identities, &advisory.binding) {
+                    return activation_blocked("explicit_identity_binding_mismatch");
+                }
+                if let Err(detail) =
+                    ensure_reconciliation_baseline(&request, &graph, &advisory.binding)
+                {
+                    return activation_retryable(SyncLocalActivationStage::LocalActive, detail);
+                }
+                return activation_open_runtime(request);
+            }
+            DiscoveryClassification::Blocked(advisory) => {
+                return activation_blocked(advisory.reason_code);
+            }
+            DiscoveryClassification::UnsupportedOrIncompatible(component) => {
+                return SyncLocalActivationResult {
+                    status: SyncLocalActivationStatus::UnsupportedOrIncompatible(map_component(
+                        component,
+                    )),
+                    handle: None,
+                };
+            }
+            DiscoveryClassification::CorruptOrUnreadable(component) => {
+                return SyncLocalActivationResult {
+                    status: SyncLocalActivationStatus::CorruptOrUnreadable(map_component(
+                        component,
+                    )),
+                    handle: None,
+                };
+            }
+            DiscoveryClassification::AmbiguousOrForeignResidue(evidence) => {
+                if evidence == AmbiguousEvidence::ArchiveResidue && reservation.is_some() {
+                    // The private exact reservation predates every archive
+                    // write and authenticates the sole resumable construction.
+                    // Normal discovery remains strict and still refuses this
+                    // state without the explicit activation identities.
+                } else {
+                    return SyncLocalActivationResult {
+                        status: SyncLocalActivationStatus::AmbiguousOrForeignResidue(
+                            map_ambiguous_evidence(evidence),
+                        ),
+                        handle: None,
+                    };
+                }
+            }
+            DiscoveryClassification::LegacyDefault => {
+                return activation_retryable(
+                    SyncLocalActivationStage::Absent,
+                    "experimental activation unexpectedly resolved to LegacyDefault".into(),
+                );
+            }
+            DiscoveryClassification::Absent | DiscoveryClassification::ExistingNonActive(_) => {}
+        }
+
+        let (existing_binding, initial_stage) = match discovery {
+            DiscoveryClassification::ExistingNonActive(advisory) => {
+                if !identities_match_binding(&request.identities, &advisory.binding) {
+                    return activation_blocked("explicit_identity_binding_mismatch");
+                }
+                (
+                    Some(advisory.binding),
+                    match advisory.stage {
+                        NonActiveStage::ShadowImport => SyncLocalActivationStage::ShadowImport,
+                        NonActiveStage::VerifiedLocal => SyncLocalActivationStage::VerifiedLocal,
+                    },
+                )
+            }
+            DiscoveryClassification::Absent => (None, SyncLocalActivationStage::Absent),
+            DiscoveryClassification::AmbiguousOrForeignResidue(
+                AmbiguousEvidence::ArchiveResidue,
+            ) if reservation.is_some() => (None, SyncLocalActivationStage::Absent),
+            _ => unreachable!("activation discovery branch already returned"),
+        };
+
+        let result = activate_non_active_local(&request, &graph, existing_binding);
+        match result {
+            Ok(()) => activation_open_runtime(request),
+            Err(detail) => {
+                activation_failure_after(&request, graph_resource_id, initial_stage, detail)
+            }
+        }
+    }
+
     pub fn observe_watcher(
         &self,
         observations: Vec<SyncWatcherObservation>,
@@ -752,11 +1054,6 @@ impl SyncRuntimeHandle {
 
     /// Submit one bounded semantic transaction to this existing inactive
     /// `LocalActive` runtime.
-    ///
-    /// Public DTO fields are revalidated and all row/path/text budgets are
-    /// enforced while holding the same operation gate as watcher observation,
-    /// ticks, status, and clean shutdown. An oversized or invalid transaction
-    /// never enters the actor queue.
     pub fn submit_local_mutation(
         &self,
         transaction: OperationTransaction,
@@ -774,15 +1071,14 @@ impl SyncRuntimeHandle {
             .map_err(|_| SyncLocalMutationRequestError::ActorUnavailable)
     }
 
-    /// Execute one bounded, read-only query on the private actor.
-    ///
-    /// The operation gate places this read in the same total public order as
-    /// watcher observations, local mutations, ticks, status, and shutdown.
+    /// Execute one bounded, read-only query on the private actor. Unlike
+    /// watcher mutation and shutdown, this does not take `operation`: the
+    /// actor queue itself establishes its order relative to mutations while
+    /// avoiding an unnecessary public operation-gate dependency for reads.
     pub fn query(
         &self,
         request: SyncRuntimeQueryRequest,
     ) -> Result<SyncRuntimeQueryReply, SyncRuntimeRequestError> {
-        let _operation = self.inner.operation.lock().unwrap();
         validate_query_request(&request)?;
         let (reply_sender, reply_receiver) = mpsc::channel();
         self.send(ActorRequest::Query {
@@ -911,11 +1207,7 @@ fn validate_local_mutation_request(
     transaction: OperationTransaction,
 ) -> Result<OperationTransaction, SyncLocalMutationRequestError> {
     let size = bounded_local_mutation_size(&transaction);
-    if size.rows > MAX_LOCAL_MUTATION_ROWS
-        || size.referenced_paths > MAX_LOCAL_MUTATION_REFERENCED_PATHS
-        || size.path_bytes > MAX_LOCAL_MUTATION_PATH_BYTES
-        || size.text_bytes > MAX_LOCAL_MUTATION_TEXT_BYTES
-    {
+    if local_size_exceeded(size) {
         return Err(SyncLocalMutationRequestError::RequestTooLarge(size));
     }
     if transaction.operations.iter().any(|operation| {
@@ -1126,6 +1418,532 @@ fn validate_query_request(
     check_query_limit(limit, bytes)
 }
 
+/// Compose the already-proven inactive primitives without exposing any of
+/// their proof-bearing capabilities outside this module.  Every operation
+/// before the final actor open is explicitly requested by
+/// `SyncLocalActivationRequest`; normal graph startup cannot reach here.
+fn activate_non_active_local(
+    request: &SyncLocalActivationRequest,
+    graph: &Graph,
+    existing_binding: Option<EnrollmentBindingV1>,
+) -> Result<(), String> {
+    prepare_activation_private_paths(request)?;
+    let enrollment = EnrollmentApplicationRoot::open_explicit_private(&request.enrollment_root)
+        .map_err(display)?;
+    let application_runtime_root =
+        ApplicationRuntimeRoot::open_explicit_private(&request.application_runtime_root)
+            .map_err(display)?;
+
+    let endpoint = ProjectionEndpointBinding::enroll_graph(
+        graph,
+        request.identities.endpoint_id,
+        request.identities.device_id,
+    )
+    .map_err(display)?;
+    let receipts = match existing_binding.as_ref() {
+        Some(binding) => ProjectionReceiptStore::open_existing_for_endpoint(
+            &request.receipt_root,
+            binding.workspace_id(),
+            endpoint,
+            binding.receipt_store_id(),
+        )
+        .map_err(display)?,
+        None => ProjectionReceiptStore::open_for_endpoint(
+            &request.receipt_root,
+            request.identities.workspace_id,
+            endpoint,
+        )
+        .map_err(display)?,
+    };
+
+    // Capture precedes every graph-local sparse archive write. The capture is
+    // read-only and revalidated internally before bootstrap authoring.
+    let capture = graph
+        .capture_inactive_bootstrap_sources(&request.capture_root)
+        .map_err(display)?;
+    let source_inventory_digest =
+        ContentDigest::from_bytes(*capture.inventory_description().sha256());
+    let graph_resource_id = graph.canonical_resource_id().map_err(display)?;
+    let graph_text_scope_binding = graph.graph_text_scope_binding().map_err(display)?;
+    let reservation = if existing_binding.is_none() {
+        Some(
+            begin_or_resume_local_activation_reservation(
+                &enrollment,
+                LocalActivationReservationBindingV1::new(
+                    local_activation_identity(request, graph_resource_id),
+                    receipts.store_id(),
+                    graph_text_scope_binding,
+                    source_inventory_digest,
+                ),
+            )
+            .map_err(display)?,
+        )
+    } else {
+        None
+    };
+    activation_cut("before_archive_creation")?;
+
+    prepare_object_store_parent_nofollow(&request.archive_root).map_err(display)?;
+    let archive = ObjectStore::open(&request.archive_root, request.identities.workspace_id)
+        .map_err(display)?;
+    let binding = match existing_binding {
+        Some(binding) => {
+            archive
+                .validate_enrolled_archive_resource_id(binding.archive_resource_id())
+                .map_err(display)?;
+            binding
+        }
+        None => {
+            let archive_resource_id = archive
+                .provision_or_resume_local_activation_archive_resource_id(
+                    reservation
+                        .as_ref()
+                        .expect("absent enrollment must have an activation reservation")
+                        .archive_instance_id(),
+                )
+                .map_err(display)?;
+            EnrollmentBindingV1::new(
+                request.identities.workspace_id,
+                request.identities.lineage_digest,
+                request.identities.catalog_document_id,
+                request.identities.endpoint_id,
+                request.identities.device_id,
+                graph_resource_id,
+                receipts.store_id(),
+                archive_resource_id,
+                graph_text_scope_binding,
+            )
+            .map_err(display)?
+        }
+    };
+    if !identities_match_binding(&request.identities, &binding) {
+        return Err("explicit activation identities do not match the enrollment binding".into());
+    }
+    drop(archive);
+    activation_cut("after_archive_claim_before_enrollment_head")?;
+
+    let preparation_id = PreparationId::from_uuid(request.identities.preparation_id);
+    begin_or_resume_shadow_import(
+        &enrollment,
+        binding.clone(),
+        preparation_id,
+        source_inventory_digest,
+    )
+    .map_err(display)?;
+    activation_cut("after_shadow_import")?;
+
+    let authoring_store =
+        ObjectStore::open(&request.archive_root, binding.workspace_id()).map_err(display)?;
+    let authoring_capability = authoring_store
+        .bootstrap_authoring_capability()
+        .map_err(display)?;
+    let prepared = prepare_inactive_bootstrap_import(
+        graph,
+        capture,
+        binding.workspace_id(),
+        binding.lineage_digest(),
+        binding.catalog_document_id(),
+        ReferenceCatalogPolicyV1::default(),
+        &authoring_capability,
+        &request.preparation_root,
+    )
+    .map_err(display)?;
+    drop(authoring_capability);
+    drop(authoring_store);
+
+    let storage_binding = ProjectionStorageBinding {
+        endpoint,
+        receipt_store_id: receipts.store_id(),
+    };
+    let verified = publish_install_verify_inactive_bootstrap(
+        &prepared,
+        ObjectStore::open(&request.archive_root, binding.workspace_id()).map_err(display)?,
+        storage_binding,
+    )
+    .map_err(display)?;
+    let accepted_authority = reopen_inactive_bootstrap_accepted_authority(
+        &verified,
+        ObjectStore::open(&request.archive_root, binding.workspace_id()).map_err(display)?,
+    )
+    .map_err(display)?;
+
+    let backup_root =
+        MigrationBackupRoot::open(&request.migration_backup_root, &request.graph_root)
+            .map_err(display)?;
+    let source_backup =
+        verify_migration_source_backup(&backup_root, &prepared, &verified).map_err(display)?;
+    let inactive = InactiveBootstrapRuntimeSession::open(
+        &request.archive_root,
+        binding.workspace_id(),
+        &request.database_path,
+        &application_runtime_root,
+        &accepted_authority,
+    )
+    .map_err(display)?;
+    let shadow = verify_inactive_bootstrap_shadow_projection(
+        graph,
+        &backup_root,
+        &prepared,
+        &verified,
+        &source_backup,
+        &accepted_authority,
+        inactive.projection(),
+        inactive.sqlite_proof(),
+    )
+    .map_err(display)?;
+    let proofs = VerifiedLocalProofSet {
+        graph,
+        roots: &backup_root,
+        prepared: &prepared,
+        verified_publication: &verified,
+        source_backup: &source_backup,
+        accepted_authority: &accepted_authority,
+        sqlite: inactive.projection(),
+        sqlite_projection: inactive.sqlite_proof(),
+        shadow_projection: &shadow,
+    };
+    let verified_local =
+        compose_verified_local(&enrollment, binding.clone(), preparation_id, &proofs)
+            .map_err(display)?;
+    activation_cut("after_verified_local")?;
+    let local_runtime = LocalActiveRuntime {
+        engine: accepted_authority.accepted_engine(),
+        projection: inactive.projection(),
+    };
+    let mut authority = activate_verified_local(
+        &enrollment,
+        verified_local,
+        request.identities.session_id,
+        &proofs,
+        &local_runtime,
+    )
+    .map_err(display)?;
+    let sealed =
+        seal_local_runtime_promotion(&authority, &proofs, &local_runtime).map_err(display)?;
+    drop(local_runtime);
+    drop(proofs);
+
+    let promoted_open = PromotedRuntimeOpen {
+        graph,
+        receipts: &receipts,
+        archive_root: &request.archive_root,
+        database_path: &request.database_path,
+        application_runtime_root: &application_runtime_root,
+    };
+    let mut promoted = inactive
+        .promote(sealed, &authority, &promoted_open)
+        .map_err(|refusal| {
+            let (_returned_lease, error) = refusal.into_parts();
+            error.to_string()
+        })?;
+
+    // The actor will reopen this exact database. Creating or validating the
+    // baseline before that handout makes reconciliation a proven prerequisite
+    // of the retained public handle rather than a deferred first-tick action.
+    ensure_reconciliation_baseline_with_runtime(&application_runtime_root, graph, &binding)?;
+    promoted
+        .quiesce_and_mark_safe(&mut authority, graph)
+        .map_err(display)?;
+    drop(promoted);
+    drop(authority);
+    Ok(())
+}
+
+fn activation_open_runtime(request: SyncLocalActivationRequest) -> SyncLocalActivationResult {
+    let session_id = request.identities.session_id;
+    let opened = SyncRuntimeHandle::open_with_session(
+        SyncRuntimeOpenRequest {
+            profile: SyncStorageProfile::ExperimentalLocal,
+            graph_root: request.graph_root,
+            enrollment_root: request.enrollment_root,
+            archive_root: request.archive_root,
+            receipt_root: request.receipt_root,
+            database_path: request.database_path,
+            application_runtime_root: request.application_runtime_root,
+        },
+        session_id,
+    );
+    match opened {
+        SyncRuntimeOpenResult {
+            status: SyncRuntimeOpenStatus::Active,
+            handle: Some(handle),
+        } => SyncLocalActivationResult {
+            status: SyncLocalActivationStatus::Active,
+            handle: Some(handle),
+        },
+        SyncRuntimeOpenResult { status, .. } => activation_retryable(
+            SyncLocalActivationStage::LocalActive,
+            format!("LocalActive runtime reopen refused after proof: {status:?}"),
+        ),
+    }
+}
+
+fn activation_failure_after(
+    request: &SyncLocalActivationRequest,
+    graph_resource_id: crate::oplog::CanonicalGraphResourceId,
+    fallback_stage: SyncLocalActivationStage,
+    detail: String,
+) -> SyncLocalActivationResult {
+    let reservation = match inspect_local_activation_reservation_at(&request.enrollment_root) {
+        Ok(reservation) => reservation,
+        Err(_) => {
+            return SyncLocalActivationResult {
+                status: SyncLocalActivationStatus::CorruptOrUnreadable(
+                    SyncRuntimeComponent::Enrollment,
+                ),
+                handle: None,
+            };
+        }
+    };
+    let matching_reservation = reservation.as_ref().is_some_and(|reservation| {
+        reservation.identity() == &local_activation_identity(request, graph_resource_id)
+    });
+    match discover_startup(&DiscoveryRequest {
+        profile: StartupStorageProfile::ExperimentalSparse,
+        graph_resource_id,
+        runtime_root: &request.enrollment_root,
+        archive_root: &request.archive_root,
+    }) {
+        DiscoveryClassification::Blocked(advisory) => activation_blocked(advisory.reason_code),
+        DiscoveryClassification::ExistingNonActive(advisory) => activation_retryable(
+            match advisory.stage {
+                NonActiveStage::ShadowImport => SyncLocalActivationStage::ShadowImport,
+                NonActiveStage::VerifiedLocal => SyncLocalActivationStage::VerifiedLocal,
+            },
+            detail,
+        ),
+        DiscoveryClassification::ExistingLocalActive(_) => {
+            activation_retryable(SyncLocalActivationStage::LocalActive, detail)
+        }
+        DiscoveryClassification::UnsupportedOrIncompatible(component) => {
+            SyncLocalActivationResult {
+                status: SyncLocalActivationStatus::UnsupportedOrIncompatible(map_component(
+                    component,
+                )),
+                handle: None,
+            }
+        }
+        DiscoveryClassification::CorruptOrUnreadable(component) => SyncLocalActivationResult {
+            status: SyncLocalActivationStatus::CorruptOrUnreadable(map_component(component)),
+            handle: None,
+        },
+        DiscoveryClassification::AmbiguousOrForeignResidue(AmbiguousEvidence::ArchiveResidue)
+            if matching_reservation =>
+        {
+            activation_retryable(fallback_stage, detail)
+        }
+        DiscoveryClassification::AmbiguousOrForeignResidue(evidence) => SyncLocalActivationResult {
+            status: SyncLocalActivationStatus::AmbiguousOrForeignResidue(map_ambiguous_evidence(
+                evidence,
+            )),
+            handle: None,
+        },
+        DiscoveryClassification::Absent | DiscoveryClassification::LegacyDefault => {
+            activation_retryable(fallback_stage, detail)
+        }
+    }
+}
+
+fn activation_retryable(
+    durable_stage: SyncLocalActivationStage,
+    detail: String,
+) -> SyncLocalActivationResult {
+    SyncLocalActivationResult {
+        status: SyncLocalActivationStatus::Retryable {
+            durable_stage,
+            detail,
+        },
+        handle: None,
+    }
+}
+
+fn activation_blocked(reason_code: impl Into<String>) -> SyncLocalActivationResult {
+    SyncLocalActivationResult {
+        status: SyncLocalActivationStatus::Blocked {
+            reason_code: reason_code.into(),
+        },
+        handle: None,
+    }
+}
+
+fn identities_match_binding(
+    identities: &SyncLocalActivationIdentities,
+    binding: &EnrollmentBindingV1,
+) -> bool {
+    identities.workspace_id == binding.workspace_id()
+        && identities.lineage_digest == binding.lineage_digest()
+        && identities.catalog_document_id == binding.catalog_document_id()
+        && identities.endpoint_id == binding.endpoint_id()
+        && identities.device_id == binding.device_id()
+}
+
+fn local_activation_identity(
+    request: &SyncLocalActivationRequest,
+    graph_resource_id: crate::oplog::CanonicalGraphResourceId,
+) -> LocalActivationIdentityV1 {
+    LocalActivationIdentityV1::new(
+        request.identities.workspace_id,
+        request.identities.lineage_digest,
+        request.identities.catalog_document_id,
+        request.identities.endpoint_id,
+        request.identities.device_id,
+        graph_resource_id,
+        PreparationId::from_uuid(request.identities.preparation_id),
+        request.identities.session_id,
+    )
+}
+
+fn ensure_reconciliation_baseline(
+    request: &SyncLocalActivationRequest,
+    graph: &Graph,
+    binding: &EnrollmentBindingV1,
+) -> Result<(), String> {
+    let runtime = ApplicationRuntimeRoot::open_explicit_private(&request.application_runtime_root)
+        .map_err(display)?;
+    ensure_reconciliation_baseline_with_runtime(&runtime, graph, binding)
+}
+
+fn ensure_reconciliation_baseline_with_runtime(
+    runtime: &ApplicationRuntimeRoot,
+    graph: &Graph,
+    binding: &EnrollmentBindingV1,
+) -> Result<(), String> {
+    let trusted = TrustedPrivateApplicationRuntimeRoot::from_application_runtime_root(runtime);
+    let baseline_binding = ReconciliationBaselineBinding::new(
+        binding.workspace_id(),
+        binding.endpoint_id(),
+        graph.canonical_resource_id().map_err(display)?,
+        graph.graph_text_scope_binding().map_err(display)?,
+    )
+    .map_err(display)?;
+    match ReconciliationBaseline::open_existing(&trusted, baseline_binding.clone()) {
+        Ok(baseline) => drop(baseline),
+        Err(error) if error.is_missing() => {
+            ReconciliationBaseline::create_fresh(&trusted, baseline_binding).map_err(display)?;
+        }
+        Err(error) => return Err(display(error)),
+    }
+    Ok(())
+}
+
+fn legacy_v1_namespace_present(graph_root: &Path) -> bool {
+    fs::symlink_metadata(graph_root.join(".tine-sync").join("v1")).is_ok()
+}
+
+fn validate_activation_paths(
+    request: &SyncLocalActivationRequest,
+    graph_root: &Path,
+) -> Result<(), String> {
+    let canonical_graph = fs::canonicalize(graph_root)
+        .map_err(|error| format!("cannot canonicalize graph root for activation: {error}"))?;
+    let expected_archive = canonical_graph.join(".tine-sync").join("v2");
+    if normalize_absolute(&request.archive_root)? != expected_archive {
+        return Err(
+            "archive_root must be exactly the graph's .tine-sync/v2 sparse-oplog namespace".into(),
+        );
+    }
+
+    let private_paths = [
+        (&request.enrollment_root, "enrollment_root"),
+        (&request.receipt_root, "receipt_root"),
+        (
+            &request.application_runtime_root,
+            "application_runtime_root",
+        ),
+        (&request.migration_backup_root, "migration_backup_root"),
+        (&request.capture_root, "capture_root"),
+        (&request.preparation_root, "preparation_root"),
+    ];
+    for (path, label) in private_paths {
+        require_private_path_outside_graph(path, label, &canonical_graph)?;
+    }
+    let database_parent = request
+        .database_path
+        .parent()
+        .ok_or_else(|| "database_path has no parent directory".to_owned())?;
+    require_private_path_outside_graph(database_parent, "database_path", &canonical_graph)?;
+    Ok(())
+}
+
+fn prepare_activation_private_paths(request: &SyncLocalActivationRequest) -> Result<(), String> {
+    for path in [
+        &request.capture_root,
+        &request.preparation_root,
+        &request.migration_backup_root,
+    ] {
+        fs::create_dir_all(path)
+            .map_err(|error| format!("cannot create private activation directory: {error}"))?;
+        let metadata = fs::symlink_metadata(path)
+            .map_err(|error| format!("cannot inspect private activation directory: {error}"))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err("private activation path is not a real directory".into());
+        }
+    }
+    let database_parent = request
+        .database_path
+        .parent()
+        .ok_or_else(|| "database_path has no parent directory".to_owned())?;
+    fs::create_dir_all(database_parent)
+        .map_err(|error| format!("cannot create private database parent: {error}"))?;
+    Ok(())
+}
+
+fn require_private_path_outside_graph(
+    path: &Path,
+    label: &str,
+    graph_root: &Path,
+) -> Result<(), String> {
+    let normalized = normalize_absolute(path)?;
+    if normalized == graph_root || normalized.starts_with(graph_root) {
+        return Err(format!("{label} must be outside the graph root"));
+    }
+    let mut existing = normalized.clone();
+    loop {
+        match fs::symlink_metadata(&existing) {
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if !existing.pop() {
+                    return Err(format!("{label} has no existing ancestor"));
+                }
+            }
+            Err(error) => {
+                return Err(format!("cannot inspect {label} ancestor: {error}"));
+            }
+        }
+    }
+    let canonical_existing = fs::canonicalize(&existing)
+        .map_err(|error| format!("cannot canonicalize {label} ancestor: {error}"))?;
+    if canonical_existing == graph_root || canonical_existing.starts_with(graph_root) {
+        return Err(format!("{label} resolves inside the graph root"));
+    }
+    Ok(())
+}
+
+fn normalize_absolute(path: &Path) -> Result<PathBuf, String> {
+    let input = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| format!("cannot determine current directory: {error}"))?
+            .join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in input.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return Err("activation path escapes its root".into());
+                }
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    Ok(normalized)
+}
+
 fn refused(detail: String) -> SyncRuntimeOpenResult {
     SyncRuntimeOpenResult {
         status: SyncRuntimeOpenStatus::OpenRefused { detail },
@@ -1154,22 +1972,20 @@ fn map_discovery(classification: DiscoveryClassification) -> SyncRuntimeOpenStat
             SyncRuntimeOpenStatus::CorruptOrUnreadable(map_component(component))
         }
         DiscoveryClassification::AmbiguousOrForeignResidue(evidence) => {
-            SyncRuntimeOpenStatus::AmbiguousOrForeignResidue(match evidence {
-                AmbiguousEvidence::EnrollmentResidue => SyncAmbiguousEvidence::EnrollmentResidue,
-                AmbiguousEvidence::EnrollmentNamespace => {
-                    SyncAmbiguousEvidence::EnrollmentNamespace
-                }
-                AmbiguousEvidence::EnrollmentGraphBinding => {
-                    SyncAmbiguousEvidence::EnrollmentGraphBinding
-                }
-                AmbiguousEvidence::ArchiveResidue => SyncAmbiguousEvidence::ArchiveResidue,
-                AmbiguousEvidence::ArchiveNamespace => SyncAmbiguousEvidence::ArchiveNamespace,
-                AmbiguousEvidence::ArchiveBinding => SyncAmbiguousEvidence::ArchiveBinding,
-                AmbiguousEvidence::ActiveArchiveMismatch => {
-                    SyncAmbiguousEvidence::ActiveArchiveMismatch
-                }
-            })
+            SyncRuntimeOpenStatus::AmbiguousOrForeignResidue(map_ambiguous_evidence(evidence))
         }
+    }
+}
+
+fn map_ambiguous_evidence(evidence: AmbiguousEvidence) -> SyncAmbiguousEvidence {
+    match evidence {
+        AmbiguousEvidence::EnrollmentResidue => SyncAmbiguousEvidence::EnrollmentResidue,
+        AmbiguousEvidence::EnrollmentNamespace => SyncAmbiguousEvidence::EnrollmentNamespace,
+        AmbiguousEvidence::EnrollmentGraphBinding => SyncAmbiguousEvidence::EnrollmentGraphBinding,
+        AmbiguousEvidence::ArchiveResidue => SyncAmbiguousEvidence::ArchiveResidue,
+        AmbiguousEvidence::ArchiveNamespace => SyncAmbiguousEvidence::ArchiveNamespace,
+        AmbiguousEvidence::ArchiveBinding => SyncAmbiguousEvidence::ArchiveBinding,
+        AmbiguousEvidence::ActiveArchiveMismatch => SyncAmbiguousEvidence::ActiveArchiveMismatch,
     }
 }
 
@@ -1213,11 +2029,12 @@ enum ActorRequest {
 fn actor_thread(
     request: SyncRuntimeOpenRequest,
     advisory: LocalActiveAdvisory,
+    session_id: SessionId,
     receiver: Receiver<ActorRequest>,
     started: SyncSender<Result<SyncRuntimeStatusSnapshot, String>>,
     shared_status: &RwLock<SyncRuntimeStatusSnapshot>,
 ) {
-    let mut actor = match RuntimeActor::open(request, advisory) {
+    let mut actor = match RuntimeActor::open(request, advisory, session_id) {
         Ok(actor) => actor,
         Err(error) => {
             let _ = started.send(Err(error));
@@ -1316,6 +2133,7 @@ impl RuntimeActor {
     fn open(
         request: SyncRuntimeOpenRequest,
         advisory: LocalActiveAdvisory,
+        session_id: SessionId,
     ) -> Result<Self, String> {
         let graph = Graph::open_checked(&request.graph_root).map_err(display)?;
         let graph_resource_id = graph.canonical_resource_id().map_err(display)?;
@@ -1370,7 +2188,6 @@ impl RuntimeActor {
             database_path: &request.database_path,
             application_runtime_root: &application_runtime_root,
         };
-        let session_id = SessionId::new();
         let (authority, runtime) = match advisory.handoff {
             EnrollmentDiscoveryHandoff::Safe => reopen_promoted_local_runtime_existing_projection(
                 &enrollment_root,
@@ -2234,11 +3051,10 @@ mod tests {
     use super::*;
     use crate::oplog::enrollment::EnrollmentDiscoveryHandoff;
     use crate::oplog::exact_external_feed::tests::RuntimeHostFixture;
-    use crate::oplog::{
-        BlockId, BlockLocation, DocumentId, LogicalPageName, ManagedTextKind, PageId, PageRename,
-    };
+    use crate::oplog::{BlockLocation, LogicalPageName, PageRename};
+    use std::collections::BTreeMap;
     use std::fs;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::Barrier;
     use uuid::Uuid;
 
@@ -3522,8 +4338,9 @@ mod tests {
             fixture.handoff(),
             EnrollmentDiscoveryHandoff::Safe
         ));
-        assert!(
-            ACTOR_THREADS_FINISHED.load(std::sync::atomic::Ordering::SeqCst) >= finished_before + 1
+        assert_eq!(
+            ACTOR_THREADS_FINISHED.load(std::sync::atomic::Ordering::SeqCst),
+            finished_before + 1
         );
 
         assert!(matches!(
@@ -3636,66 +4453,6 @@ mod tests {
     }
 
     #[test]
-    fn unsafe_crash_takeover_reconciles_closed_interval_edit_and_reaches_safe() {
-        let fixture = RuntimeHostFixture::safe("sync-runtime-crash-recovery-liveness");
-        let request = fixture.request();
-        let handle = active_handle(SyncRuntimeHandle::open(request.clone()));
-        drive_initial_feed(&handle);
-        drop(handle);
-        assert!(matches!(
-            fixture.handoff(),
-            EnrollmentDiscoveryHandoff::Unsafe { .. }
-        ));
-
-        let path = "content/nested pages/changed after crash.md";
-        let bytes = b"- external editor changed this while Tine was down\n";
-        fs::write(fixture.graph_root().join(path), bytes).unwrap();
-        let manifests_before_reopen = fixture.manifest_count();
-
-        let reopened = active_handle(SyncRuntimeHandle::open(request.clone()));
-        assert_eq!(
-            reopened.status().unwrap().recovery,
-            Some(SyncRuntimeRecovery::TookOverCrashedUnsafe)
-        );
-        let ticks = drain_until_settled(&reopened);
-        assert!(
-            admitted_an_epoch(&ticks),
-            "crash takeover must drive its authenticated full reconciliation before Safe: {ticks:?}"
-        );
-        assert_eq!(
-            fs::read(fixture.graph_root().join(path)).unwrap(),
-            bytes,
-            "recovery must not overwrite the unimported projection bytes"
-        );
-        assert_eq!(
-            fixture.manifest_count(),
-            manifests_before_reopen + 1,
-            "the closed-interval external edit must be admitted before Safe"
-        );
-        assert!(matches!(
-            reopened.clean_shutdown().unwrap(),
-            SyncShutdownOutcome::Safe(_)
-        ));
-        assert!(matches!(
-            fixture.handoff(),
-            EnrollmentDiscoveryHandoff::Safe
-        ));
-
-        let safe_reopen = active_handle(SyncRuntimeHandle::open(request));
-        assert_eq!(
-            safe_reopen.status().unwrap().recovery,
-            Some(SyncRuntimeRecovery::AdoptedSafeHandoff)
-        );
-        drive_initial_feed(&safe_reopen);
-        assert!(matches!(
-            safe_reopen.clean_shutdown().unwrap(),
-            SyncShutdownOutcome::Safe(_)
-        ));
-    }
-
-    /// A realistic crashed session has advanced the accepted frontier, so its
-    /// disposable projection may need rebuilding during authenticated takeover.
-    #[test]
     fn crash_after_an_accepted_import_can_still_take_over_its_own_projection() {
         let fixture = RuntimeHostFixture::safe("sync-runtime-crash-after-import");
         let request = fixture.request();
@@ -3739,17 +4496,7 @@ mod tests {
             reopened.status().unwrap().recovery,
             Some(SyncRuntimeRecovery::TookOverCrashedUnsafe)
         );
-        let manifests_after_reopen = fixture.manifest_count();
-        drive_initial_feed(&reopened);
-        assert_eq!(
-            fixture.manifest_count(),
-            manifests_after_reopen,
-            "the accepted pre-crash import must not be duplicated during recovery catch-up"
-        );
-        assert!(matches!(
-            reopened.clean_shutdown().unwrap(),
-            SyncShutdownOutcome::Safe(_)
-        ));
+        drop(reopened);
     }
 
     #[test]
@@ -4328,6 +5075,299 @@ mod tests {
             "a case-and-extension-only portable collision must retain the accepted exact owner, \
              import the unrelated edit, and reach Safe, but the drain produced {ticks:?} \
              and shutdown {shutdown}"
+        );
+    }
+
+    struct ActivationFixture {
+        root: PathBuf,
+        graph_root: PathBuf,
+        request: SyncLocalActivationRequest,
+    }
+
+    impl ActivationFixture {
+        fn nested_unicode(label: &str, seed: u128) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "tine-sync-local-activation-{label}-{}",
+                Uuid::new_v4()
+            ));
+            let graph_root = root.join("graph");
+            fs::create_dir_all(graph_root.join("logseq")).unwrap();
+            fs::write(
+                graph_root.join("logseq/config.edn"),
+                br#"{:pages-directory "notes"
+                    :journals-directory "diary"
+                    :file/name-format :triple-lowbar
+                    :journal/file-name-format "dd-MM-yyyy"
+                    :journal/page-title-format "yyyy-MM-dd"}"#,
+            )
+            .unwrap();
+            fs::write(
+                graph_root.join("Root.md"),
+                b"title:: Root logical\r\n\r\n- exact CRLF bytes\r\n",
+            )
+            .unwrap();
+            fs::create_dir_all(
+                graph_root.join("notes/層/\u{017e}lu\u{0165}ou\u{010d}k\u{00fd}/nested"),
+            )
+            .unwrap();
+            fs::write(
+                graph_root.join("notes/層/\u{017e}lu\u{0165}ou\u{010d}k\u{00fd}/nested/D\u{00e9}j\u{00e0} \u{8a08}\u{753b}.md"),
+                "\u{feff}- Unicode caf\u{00e9}\r\n".as_bytes(),
+            )
+            .unwrap();
+            fs::create_dir_all(graph_root.join("diary/nested")).unwrap();
+            fs::write(
+                graph_root.join("diary/nested/25-07-2026.org"),
+                b"* journal\n",
+            )
+            .unwrap();
+
+            let private = root.join("private");
+            let request = SyncLocalActivationRequest {
+                archive_root: graph_root.join(".tine-sync/v2"),
+                graph_root: graph_root.clone(),
+                enrollment_root: private.join("enrollment"),
+                receipt_root: private.join("receipts"),
+                database_path: private.join("projection/bootstrap.sqlite"),
+                application_runtime_root: private.join("runtime"),
+                migration_backup_root: private.join("backups"),
+                capture_root: private.join("capture"),
+                preparation_root: private.join("preparation"),
+                identities: SyncLocalActivationIdentities {
+                    workspace_id: WorkspaceId::from_uuid(Uuid::from_u128(seed)),
+                    lineage_digest: LineageDigest::of(format!("lineage-{seed}").as_bytes()),
+                    catalog_document_id: DocumentId::from_uuid(Uuid::from_u128(seed + 1)),
+                    endpoint_id: ProjectionEndpointId::from_uuid(Uuid::from_u128(seed + 2)),
+                    device_id: DeviceId::from_uuid(Uuid::from_u128(seed + 3)),
+                    preparation_id: Uuid::from_u128(seed + 4),
+                    session_id: SessionId::from_uuid(Uuid::from_u128(seed + 5)),
+                },
+            };
+            Self {
+                root,
+                graph_root,
+                request,
+            }
+        }
+    }
+
+    impl Drop for ActivationFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn user_graph_bytes(root: &Path) -> BTreeMap<String, Vec<u8>> {
+        let mut files = BTreeMap::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            let mut entries = fs::read_dir(directory)
+                .unwrap()
+                .map(Result::unwrap)
+                .collect::<Vec<_>>();
+            entries.sort_by_key(std::fs::DirEntry::file_name);
+            for entry in entries {
+                if entry.file_name() == ".tine-sync" {
+                    continue;
+                }
+                if entry.file_type().unwrap().is_dir() {
+                    pending.push(entry.path());
+                } else {
+                    let relative = entry
+                        .path()
+                        .strip_prefix(root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    files.insert(relative, fs::read(entry.path()).unwrap());
+                }
+            }
+        }
+        files
+    }
+
+    fn tree_has_file_named(root: &Path, name: &str) -> bool {
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            for entry in fs::read_dir(directory).unwrap().map(Result::unwrap) {
+                if entry.file_type().unwrap().is_dir() {
+                    pending.push(entry.path());
+                } else if entry.file_name() == name {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn explicit_local_activation_preserves_nested_unicode_graph_bytes_and_proves_backup_sqlite() {
+        let fixture = ActivationFixture::nested_unicode("journey", 0xa100);
+        let before = user_graph_bytes(&fixture.graph_root);
+
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated
+            .handle
+            .expect("activation must retain the runtime handle");
+        assert!(fixture.request.database_path.is_file());
+        assert!(tree_has_file_named(
+            &fixture.request.migration_backup_root,
+            "restore-proof.bin"
+        ));
+        assert!(tree_has_file_named(
+            &fixture.request.migration_backup_root,
+            "committed.bin"
+        ));
+        assert_eq!(
+            user_graph_bytes(&fixture.graph_root),
+            before,
+            "activation may create only the shared .tine-sync/v2 namespace, never rewrite graph bytes"
+        );
+        drop(handle);
+    }
+
+    fn assert_public_activation_cut_resumes(
+        label: &str,
+        cut: ActivationTestCut,
+        expected_stage: SyncLocalActivationStage,
+        seed: u128,
+    ) {
+        let fixture = ActivationFixture::nested_unicode(label, seed);
+        let before = user_graph_bytes(&fixture.graph_root);
+        fail_once_at_activation_cut(cut);
+        let interrupted = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert!(matches!(
+            interrupted.status,
+            SyncLocalActivationStatus::Retryable { durable_stage, .. }
+                if durable_stage == expected_stage
+        ));
+        assert!(interrupted.handle.is_none());
+        assert_eq!(user_graph_bytes(&fixture.graph_root), before);
+
+        let resumed = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(resumed.status, SyncLocalActivationStatus::Active);
+        let handle = resumed
+            .handle
+            .expect("resumed activation must become active");
+        assert_eq!(user_graph_bytes(&fixture.graph_root), before);
+        drop(handle);
+    }
+
+    #[test]
+    fn public_activation_cut_before_archive_creation_resumes_exact_identities_without_graph_rewrites(
+    ) {
+        assert_public_activation_cut_resumes(
+            "before-archive",
+            ActivationTestCut::BeforeArchiveCreation,
+            SyncLocalActivationStage::Absent,
+            0xa200,
+        );
+    }
+
+    #[test]
+    fn public_activation_cut_after_archive_claim_before_enrollment_head_resumes_exact_identities() {
+        assert_public_activation_cut_resumes(
+            "after-archive-claim",
+            ActivationTestCut::AfterArchiveClaimBeforeEnrollmentHead,
+            SyncLocalActivationStage::Absent,
+            0xa300,
+        );
+    }
+
+    #[test]
+    fn public_activation_cut_after_shadow_import_publication_resumes_without_graph_rewrites() {
+        assert_public_activation_cut_resumes(
+            "after-shadow",
+            ActivationTestCut::AfterShadowImport,
+            SyncLocalActivationStage::ShadowImport,
+            0xa400,
+        );
+    }
+
+    #[test]
+    fn public_activation_cut_after_verified_local_publication_resumes_without_graph_rewrites() {
+        assert_public_activation_cut_resumes(
+            "after-verified",
+            ActivationTestCut::AfterVerifiedLocal,
+            SyncLocalActivationStage::VerifiedLocal,
+            0xa500,
+        );
+    }
+
+    #[test]
+    fn pre_enrollment_archive_residue_refuses_mismatched_identities_but_exact_resume_reaches_active(
+    ) {
+        let fixture = ActivationFixture::nested_unicode("identity-refusal", 0xa600);
+        let before = user_graph_bytes(&fixture.graph_root);
+        fail_once_at_activation_cut(ActivationTestCut::AfterArchiveClaimBeforeEnrollmentHead);
+        let interrupted = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert!(matches!(
+            interrupted.status,
+            SyncLocalActivationStatus::Retryable {
+                durable_stage: SyncLocalActivationStage::Absent,
+                ..
+            }
+        ));
+
+        let mut mismatched = fixture.request.clone();
+        mismatched.identities.session_id = SessionId::from_uuid(Uuid::from_u128(0xdead));
+        assert!(matches!(
+            SyncRuntimeHandle::activate_or_resume_local(mismatched).status,
+            SyncLocalActivationStatus::Blocked { ref reason_code }
+                if reason_code == "explicit_identity_binding_mismatch"
+        ));
+        assert_eq!(user_graph_bytes(&fixture.graph_root), before);
+
+        let resumed = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(resumed.status, SyncLocalActivationStatus::Active);
+        let handle = resumed.handle.expect("exact identities must resume");
+        assert_eq!(user_graph_bytes(&fixture.graph_root), before);
+        drop(handle);
+    }
+
+    #[test]
+    fn genuinely_foreign_v2_residue_remains_refused_without_private_reservation() {
+        let fixture = ActivationFixture::nested_unicode("foreign-v2", 0xa700);
+        fs::create_dir_all(&fixture.request.archive_root).unwrap();
+        let foreign = fixture.request.archive_root.join("foreign.bin");
+        fs::write(&foreign, b"foreign sparse archive residue").unwrap();
+
+        let result = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(
+            result.status,
+            SyncLocalActivationStatus::AmbiguousOrForeignResidue(
+                SyncAmbiguousEvidence::ArchiveResidue
+            )
+        );
+        assert!(result.handle.is_none());
+        assert_eq!(
+            fs::read(foreign).unwrap(),
+            b"foreign sparse archive residue"
+        );
+    }
+
+    #[test]
+    fn explicit_local_activation_refuses_legacy_v1_without_opening_or_rewriting_it() {
+        let fixture = ActivationFixture::nested_unicode("legacy-v1", 0xa800);
+        let legacy = fixture.graph_root.join(".tine-sync/v1");
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(
+            legacy.join("experimental.bin"),
+            b"legacy experimental bytes",
+        )
+        .unwrap();
+
+        let result = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(result.status, SyncLocalActivationStatus::LegacyV1Refused);
+        assert!(result.handle.is_none());
+        assert_eq!(
+            fs::read(legacy.join("experimental.bin")).unwrap(),
+            b"legacy experimental bytes"
+        );
+        assert!(
+            !fixture.request.archive_root.exists(),
+            "v2 archive must not be created while legacy v1 evidence is present"
         );
     }
 }

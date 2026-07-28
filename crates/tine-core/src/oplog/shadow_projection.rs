@@ -877,7 +877,10 @@ fn validate_bindings(
             .accepted_frontier_root()
             .map_err(|error| ShadowProjectionError::Projection(error.to_string()))?
             != *binding.accepted_frontier()
-        || prepared.candidate().durable_history_binding() != *binding.engine_binding()
+        || !prepared
+            .candidate()
+            .durable_history_binding()
+            .same_replay_authority(binding.engine_binding())
         || verified.workspace_id() != binding.workspace_id()
         || verified.lineage_digest() != binding.lineage_digest()
         || verified.graph_resource() != binding.graph_resource()
