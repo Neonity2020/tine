@@ -4633,6 +4633,179 @@ fn an_acquiring_first_promotion_is_contended_until_the_bootstrap_session_is_rele
     fixture.assert_graph_unchanged();
 }
 
+/// The archive-rooted workspace lock file, as a pathname.
+fn workspace_lease_path(archive_root: &Path, workspace: WorkspaceId) -> PathBuf {
+    archive_root
+        .join(".tine-runtime")
+        .join("sqlite-workspaces")
+        .join(workspace.to_string())
+        .join("sqlite-applier.lock")
+}
+
+/// Byte identity of one archive, excluding the device-local runtime lease
+/// namespace whose file this test deliberately replaces.
+fn archive_digests_outside_the_lease_namespace(
+    archive_root: &Path,
+) -> BTreeMap<String, ContentDigest> {
+    snapshot_file_digests(archive_root)
+        .into_iter()
+        .filter(|(path, _)| !path.starts_with(".tine-runtime/"))
+        .collect()
+}
+
+/// The workspace lock file lives *inside* the replicated archive, so an
+/// out-of-band replacement of its path — a Syncthing receive-only revert, a
+/// folder reset/re-add, a delete-then-restore, a `.stversions` restore, or a
+/// user deleting `.tine-runtime` by hand — leaves this runtime holding a lock
+/// on a file no pathname reaches, while another process legitimately locks the
+/// file that is now at the name.
+///
+/// A promoted runtime must stop being authority at that moment. This drives
+/// every boundary in the module documentation's "Workspace lease identity"
+/// census that a live promoted runtime can reach, and asserts at each one that
+/// the refusal happens *before* the graph, the archive, the durable enrollment
+/// chain, the engine's durable history, or the device-local SQLite projection
+/// moves.
+#[test]
+fn a_replaced_workspace_lease_path_fails_promoted_authority_closed_without_mutating_anything() {
+    let mut fixture = Fixture::new(
+        "lease-replacement",
+        None,
+        vec![("pages/lease.md".into(), b"- lease\n".to_vec())],
+    );
+    let root = fixture.enrollment_root("lease-replacement");
+    let binding = fixture.enrollment_binding();
+    let paths = PromotedPaths::new(&fixture, "lease-replacement");
+    let session = SessionId::new();
+    let (mut authority, mut runtime) = promote(&mut fixture, &root, session, &paths);
+    // Real post-bootstrap history, so every boundary below has something it
+    // could get wrong.
+    append_local_batch(&fixture, &mut authority, &mut runtime, 0xD100);
+
+    let verification_digest = authority.verification_digest();
+    let lease_path = workspace_lease_path(&fixture.archive_root, fixture.workspace);
+    let archive_before = archive_digests_outside_the_lease_namespace(&fixture.archive_root);
+    let sqlite_before = promoted_projection_digests(&paths.database_path);
+    let graph_before = snapshot_files(&fixture.graph_root);
+    let head_before = enrollment_head(&root, &binding);
+    let generation_before = enrollment_generation(&root, &binding);
+    let handoff_before = committed_handoff(&root, &binding, verification_digest);
+    let history_before = runtime.engine().durable_history_authority().unwrap();
+    let frontier_before = runtime.engine().accepted_frontier_root().unwrap();
+
+    // The replacement itself: a byte-identical file renamed over the exact
+    // lease pathname. Nothing an observer of the file's contents, length, or
+    // name could notice — only its identity changes.
+    let incoming = lease_path.with_extension("lock.incoming");
+    fs::write(&incoming, b"").unwrap();
+    fs::rename(&incoming, &lease_path).unwrap();
+
+    // A per-mutation admission window still opens. That is deliberate and
+    // documented: lease identity is a stable session fact carried exactly like
+    // the archive control-directory identity, so an unchanged-head admission
+    // performs no filesystem work for it. Everything the lease actually gates
+    // is below.
+    let mut window = runtime
+        .admit_promoted_mutation(&mut authority, &fixture.graph)
+        .unwrap();
+
+    // Boundary: the SQLite advance.
+    let error = window
+        .drain_projection(16)
+        .expect_err("a drain under a replaced lease path must fail closed");
+    assert!(
+        matches!(
+            error,
+            RuntimePromotionError::Sqlite(ProjectionError::UnsafePath(_))
+        ),
+        "unexpected drain error: {error}"
+    );
+    drop(window);
+
+    // Boundary: the unabridged binding proof, which is the one every promoted
+    // open, handoff, and recovery boundary runs.
+    let Err(error) =
+        runtime.admit_promoted_mutation_at_full_depth_for_test(&mut authority, &fixture.graph)
+    else {
+        panic!("the boundary binding proof must fail closed under a replaced lease path");
+    };
+    assert!(
+        matches!(
+            error,
+            RuntimePromotionError::Sqlite(ProjectionError::UnsafePath(_))
+        ),
+        "unexpected boundary-proof error: {error}"
+    );
+
+    // Boundary: the workspace proof itself — what the bootstrap -> promoted
+    // lease handover and the crash-takeover compare-and-swap consume.
+    let archive = ObjectStore::open(&fixture.archive_root, fixture.workspace).unwrap();
+    assert!(
+        matches!(
+            runtime
+                .projection
+                .workspace_proof()
+                .authorize_archive(&archive, fixture.workspace),
+            Err(ProjectionError::UnsafePath(_))
+        ),
+        "the takeover compare-and-swap's own gate must refuse a replaced lease path"
+    );
+
+    // Boundary: the promoted `Safe` handoff, which is a durable claim that this
+    // process drained everything it owned.
+    let Err(error) = runtime
+        .quiesce_and_mark_safe_without_watcher_dependency_for_test(&mut authority, &fixture.graph)
+    else {
+        panic!("a Safe handoff must not be published under a replaced lease path");
+    };
+    assert!(
+        matches!(error, SafeHandoffUnavailable::Runtime(_)),
+        "unexpected Safe-handoff error: {error}"
+    );
+
+    // Nothing moved: not the graph, not the authoritative archive, not the
+    // enrollment chain, not the engine's durable history, not SQLite.
+    assert_eq!(snapshot_files(&fixture.graph_root), graph_before);
+    fixture.assert_graph_unchanged();
+    assert_eq!(
+        archive_digests_outside_the_lease_namespace(&fixture.archive_root),
+        archive_before
+    );
+    assert_eq!(
+        promoted_projection_digests(&paths.database_path),
+        sqlite_before
+    );
+    assert_eq!(enrollment_head(&root, &binding), head_before);
+    assert_eq!(enrollment_generation(&root, &binding), generation_before);
+    assert_eq!(
+        committed_handoff(&root, &binding, verification_digest),
+        handoff_before
+    );
+    assert_eq!(
+        runtime.engine().durable_history_authority().unwrap(),
+        history_before
+    );
+    assert_eq!(
+        runtime.engine().accepted_frontier_root().unwrap(),
+        frontier_before
+    );
+
+    // And the other half of the invariant, at the runtime level: the process
+    // that legitimately owns the replacement file is authority, and this one is
+    // not. They are never both.
+    let newcomer = WorkspaceRuntimeLease::acquire(&archive, fixture.workspace)
+        .expect("the replacement file is unlocked, so another runtime may take it");
+    newcomer
+        .proof()
+        .authorize_archive(&archive, fixture.workspace)
+        .unwrap();
+    assert!(runtime
+        .projection
+        .workspace_proof()
+        .authorize_archive(&archive, fixture.workspace)
+        .is_err());
+}
+
 /// The two defence-in-depth guards around the crash-takeover swap, driven
 /// directly.
 ///

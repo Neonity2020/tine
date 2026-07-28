@@ -13,8 +13,12 @@
 //!
 //! The lease uses the platform's advisory file-lock primitive through `fs2`.
 //! Dropping the applier or terminating its process releases the lock on Linux,
-//! macOS, Windows, and Android. The small lock file remains as diagnostic
-//! metadata, but never decides ownership by its contents.
+//! macOS, Windows, and Android. The lock file is created empty and is never
+//! written, so it never decides ownership by its contents. Ownership is decided
+//! by the OS lock on one exact *stable file identity*, which the lease captures
+//! at acquisition and revalidates at every authority-bearing boundary: a lock
+//! file replaced out of band inside the replicated archive would otherwise let
+//! the old holder and a new opener both believe they own the workspace.
 
 use std::collections::{BTreeMap, BTreeSet};
 #[cfg(unix)]
@@ -6246,13 +6250,65 @@ mod applier_lease {
     /// the device-varying content that made the file replicable, so they are
     /// deliberately absent. A provider that creates *sibling* conflict files is
     /// tolerated: this code opens one exact name.
+    ///
+    /// # Why the lock file's identity is checked, not just its name
+    ///
+    /// Stable empty bytes remove every reason Tine could *give* a provider to
+    /// replace this file, but they cannot remove the replacements Tine does not
+    /// cause: a Syncthing receive-only "Revert local changes", a folder
+    /// reset/re-add, a delete-then-restore, a `.stversions` restore, or the user
+    /// deleting `.tine-runtime` by hand. Any of those unlinks the locked inode
+    /// and puts a new file at the same name, and an inode-scoped `flock` follows
+    /// the inode: the old holder still owns a lock on a file nobody can reach by
+    /// name, while a newcomer opening the name locks the new file and succeeds.
+    /// Two runtimes would then each hold "the" workspace lease.
+    ///
+    /// That is closed by binding the lease to one [`LeaseFileIdentity`] —
+    /// `(st_dev, st_ino)` on Unix, `FILE_ID_INFO` on Windows — taken from the
+    /// held handle *and* from a fresh no-follow lookup of the exact lease
+    /// pathname, and by requiring the two to stay equal:
+    ///
+    /// * at acquisition ([`Self::acquire`]), which closes the open/lock/check
+    ///   race with a small bounded number of explicit retries and then fails
+    ///   closed as [`ProjectionError::LeaseContended`]. There is deliberately no
+    ///   blocking and no unbounded retry here — see the lock-order note in
+    ///   `local_active`'s module documentation;
+    /// * at every authority-bearing use of the lease while it is held
+    ///   ([`Self::revalidate_identity`]).
+    ///
+    /// A replacement therefore makes exactly one of the two candidates authority:
+    /// the newcomer, whose handle and name still agree. The old holder's
+    /// authority becomes visibly unavailable before it can open a database,
+    /// advance SQLite, swap a crash-takeover handoff record, or publish a `Safe`
+    /// handoff.
     pub(crate) struct WorkspaceRuntimeLease {
         file: File,
         workspace_id: WorkspaceId,
         archive_root: PathBuf,
         lease_path: PathBuf,
+        /// The exact file this lease locked, as the OS identifies it.
+        identity: LeaseFileIdentity,
+        /// The retained no-follow archive-root capability, kept so the exact
+        /// lease pathname can be resolved again the way a newcomer would
+        /// resolve it: component by component, no-follow at each step. The
+        /// archive root itself is the trust anchor — an `ObjectStore` is a
+        /// retained directory capability whose directory cannot be swapped
+        /// underneath it, and a substituted archive root is refused by
+        /// `authenticate_archive_identity` at every runtime boundary.
+        archive_capability: CapDir,
         applier_slot_vended: AtomicBool,
     }
+
+    /// How many times an acquisition may lose the open/lock/check race to an
+    /// out-of-band replacement before it fails closed.
+    ///
+    /// Small, explicit, and finite on purpose. A replacement that keeps winning
+    /// is a filesystem that is actively being rewritten underneath this process,
+    /// which is a fail-closed condition, not something to wait out: this lease
+    /// is acquired while the device-local enrollment lease may already be held,
+    /// so blocking or retrying without a bound here would turn a deliberate
+    /// non-blocking lock-order inversion into a real one.
+    pub(super) const WORKSPACE_LEASE_IDENTITY_ATTEMPTS: usize = 3;
 
     impl WorkspaceRuntimeLease {
         pub(crate) fn acquire(
@@ -6272,48 +6328,108 @@ mod applier_lease {
                         "cannot retain ObjectStore lease authority: {error}"
                     ))
                 })?;
-            let lease_namespace = open_or_create_lease_directory(
-                &store_root,
-                OBJECT_STORE_LEASE_NAMESPACE,
-                "ObjectStore lease namespace",
-            )?;
-            let sqlite_namespace = open_or_create_lease_directory(
-                &lease_namespace,
-                SQLITE_WORKSPACE_LEASE_NAMESPACE,
-                "SQLite workspace lease namespace",
-            )?;
             let workspace_name = workspace_id.to_string();
-            let workspace_root = open_or_create_lease_directory(
-                &sqlite_namespace,
-                &workspace_name,
-                "SQLite workspace lease directory",
-            )?;
             let lease_path = store
                 .root_path()
                 .join(OBJECT_STORE_LEASE_NAMESPACE)
                 .join(SQLITE_WORKSPACE_LEASE_NAMESPACE)
                 .join(&workspace_name)
                 .join(SQLITE_APPLIER_LEASE_FILE);
-            let file = lock_capability_lease_file(
-                &workspace_root,
-                SQLITE_APPLIER_LEASE_FILE,
-                &lease_path,
-            )?;
+
+            // The whole open/lock/identity sequence retries, not just the
+            // identity check: a replacement that reached the lease file may
+            // equally have replaced a directory above it, so the next attempt
+            // re-resolves every component from the retained archive capability.
+            for attempt in 0..WORKSPACE_LEASE_IDENTITY_ATTEMPTS {
+                let lease_namespace = open_or_create_lease_directory(
+                    &store_root,
+                    OBJECT_STORE_LEASE_NAMESPACE,
+                    "ObjectStore lease namespace",
+                )?;
+                let sqlite_namespace = open_or_create_lease_directory(
+                    &lease_namespace,
+                    SQLITE_WORKSPACE_LEASE_NAMESPACE,
+                    "SQLite workspace lease namespace",
+                )?;
+                let workspace_root = open_or_create_lease_directory(
+                    &sqlite_namespace,
+                    &workspace_name,
+                    "SQLite workspace lease directory",
+                )?;
+                let file = lock_workspace_lease_file(
+                    &workspace_root,
+                    SQLITE_APPLIER_LEASE_FILE,
+                    &lease_path,
+                )?;
+                // The locked handle's own identity, and the identity the exact
+                // pathname resolves to right now. If a replacement raced the
+                // open, the lock this attempt holds is on an unreachable file
+                // and grants nothing.
+                let held = held_file_identity(&file, &lease_path)?;
+                let named = resolve_lease_file_identity(&store_root, &workspace_name, &lease_path);
+                if named.is_ok_and(|named| named == held) {
+                    // Ownership, regular-file, and link validators run on the
+                    // file just proved to be the one this pathname names.
+                    validate_opened_lease_file(&file, &lease_path)?;
+                    #[cfg(test)]
+                    WORKSPACE_RUNTIME_LEASE_ACQUISITIONS
+                        .with(|count| count.set(count.get().saturating_add(1)));
+                    // Deliberately no truncate, no write, no `sync_all`: see the
+                    // type's "Why the lock file is empty and never rewritten"
+                    // section. Only the directory entry needs to be durable.
+                    sync_dir_required(&workspace_root)
+                        .map_err(|error| ProjectionError::Io(error.to_string()))?;
+                    return Ok(Self {
+                        file,
+                        workspace_id,
+                        archive_root: store.root_path().to_path_buf(),
+                        lease_path,
+                        identity: held,
+                        archive_capability: store_root,
+                        applier_slot_vended: AtomicBool::new(false),
+                    });
+                }
+                // Release the lock on the file that is no longer this pathname
+                // before trying again, so a bounded retry cannot self-contend.
+                drop(file);
+                let _ = attempt;
+            }
+            Err(ProjectionError::LeaseContended(lease_path))
+        }
+
+        /// Fail closed unless the file this lease locked is still the file the
+        /// exact lease pathname resolves to.
+        ///
+        /// This is the while-held half of the identity contract. It is called
+        /// from the authority-bearing boundaries enumerated in `local_active`'s
+        /// "Workspace lease identity" documentation, never from the per-mutation
+        /// admission fast path: an admission carries this session fact exactly as
+        /// it carries the archive control-directory identity, and re-derives it
+        /// the moment the enrollment binding generation moves.
+        pub(crate) fn revalidate_identity(&self) -> Result<(), ProjectionError> {
             #[cfg(test)]
-            WORKSPACE_RUNTIME_LEASE_ACQUISITIONS
+            WORKSPACE_LEASE_IDENTITY_REVALIDATIONS
                 .with(|count| count.set(count.get().saturating_add(1)));
-            // Deliberately no truncate, no write, no `sync_all`: see the type's
-            // "Why the lock file is empty and never rewritten" section. Only the
-            // directory entry needs to be durable.
-            sync_dir_required(&workspace_root)
-                .map_err(|error| ProjectionError::Io(error.to_string()))?;
-            Ok(Self {
-                file,
-                workspace_id,
-                archive_root: store.root_path().to_path_buf(),
-                lease_path,
-                applier_slot_vended: AtomicBool::new(false),
-            })
+            let held = held_file_identity(&self.file, &self.lease_path)?;
+            if held != self.identity {
+                return Err(ProjectionError::UnsafePath(format!(
+                    "the held SQLite applier lease handle {} is no longer the file it locked",
+                    self.lease_path.display()
+                )));
+            }
+            let named = resolve_lease_file_identity(
+                &self.archive_capability,
+                &self.workspace_id.to_string(),
+                &self.lease_path,
+            )?;
+            if named != self.identity {
+                return Err(ProjectionError::UnsafePath(format!(
+                    "the SQLite applier lease {} was replaced while this runtime held it, so this \
+                     lock no longer proves workspace ownership",
+                    self.lease_path.display()
+                )));
+            }
+            Ok(())
         }
 
         /// Vend this lease's single affine SQLite applier slot.
@@ -6411,6 +6527,36 @@ mod applier_lease {
         });
     }
 
+    #[cfg(test)]
+    thread_local! {
+        /// Runs inside [`WorkspaceRuntimeLease::acquire`], after the lease file
+        /// has been opened and before it is locked and identity-checked. This is
+        /// the one window a regression cannot otherwise reach.
+        static INTERPOSE_WORKSPACE_LEASE_OPEN: std::cell::RefCell<Option<Box<dyn FnMut(&Path)>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Install the open-before-lock interposition used by the replacement
+    /// regressions. Per-thread and off by default.
+    #[cfg(test)]
+    pub(crate) fn set_workspace_lease_open_hook_for_test(hook: Box<dyn FnMut(&Path)>) {
+        INTERPOSE_WORKSPACE_LEASE_OPEN.with(|slot| *slot.borrow_mut() = Some(hook));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_workspace_lease_open_hook_for_test() {
+        INTERPOSE_WORKSPACE_LEASE_OPEN.with(|slot| *slot.borrow_mut() = None);
+    }
+
+    #[cfg(test)]
+    pub(super) fn interpose_workspace_lease_open_for_test(path: &Path) {
+        INTERPOSE_WORKSPACE_LEASE_OPEN.with(|slot| {
+            if let Some(hook) = slot.borrow_mut().as_mut() {
+                hook(path);
+            }
+        });
+    }
+
     /// Is the archive workspace lock held by *someone* right now?
     ///
     /// `flock` is scoped to an open file description, so a second open in this
@@ -6469,7 +6615,12 @@ mod applier_lease {
                     store.root_path().display()
                 )));
             }
-            Ok(())
+            // Authority boundary: opening a database under this slot is the act
+            // the workspace lock exists to make exclusive, so the lock must
+            // still be on the file this archive's lease pathname names. The
+            // cheap identity comparisons run first, so a lease that is not this
+            // archive's is refused without any filesystem work.
+            self.lease.revalidate_identity()
         }
     }
 
@@ -6713,6 +6864,17 @@ mod applier_lease {
             WorkspaceRuntimeProof { lease: &self.lease }
         }
 
+        /// Fail closed unless the retained workspace lock is still on the file
+        /// this archive's lease pathname names.
+        ///
+        /// This is the hook the promoted runtime's own authority boundaries use
+        /// (see `local_active`'s "Workspace lease identity" documentation); it
+        /// asks nothing about the archive, because those boundaries have already
+        /// proved the archive by other means.
+        pub(crate) fn revalidate_workspace_lease_identity(&self) -> Result<(), ProjectionError> {
+            self.lease.revalidate_identity()
+        }
+
         pub(crate) const fn projection(&self) -> &OpenProjection {
             &self.projection
         }
@@ -6721,8 +6883,37 @@ mod applier_lease {
             &self.projection.database
         }
 
-        pub(crate) const fn database_mut(&mut self) -> &mut SqliteFrontier {
-            &mut self.projection.database
+        /// Split this value into the mutable database handle and the borrowed
+        /// while-held identity check for the lease that authorized it.
+        ///
+        /// The two borrows are disjoint fields, which is what lets a promoted
+        /// runtime hand a caller `&mut SqliteFrontier` *and* still re-prove
+        /// workspace ownership at its own drain boundary. The identity check
+        /// vends no lease and no applier slot, so this does not reopen the
+        /// second-database hole the private `lease` field exists to close.
+        pub(crate) const fn database_and_lease_identity(
+            &mut self,
+        ) -> (&mut SqliteFrontier, WorkspaceLeaseIdentity<'_>) {
+            (
+                &mut self.projection.database,
+                WorkspaceLeaseIdentity { lease: &self.lease },
+            )
+        }
+    }
+
+    /// The while-held workspace-lease identity check, borrowed on its own.
+    ///
+    /// It exposes exactly one operation and no identity, no archive, no applier
+    /// slot, and no lease. It exists so a runtime that has already split its
+    /// leased projection into a mutable database handle can still fail closed
+    /// when the lock it holds stops being the lock on its own lease pathname.
+    pub(crate) struct WorkspaceLeaseIdentity<'lease> {
+        lease: &'lease WorkspaceRuntimeLease,
+    }
+
+    impl WorkspaceLeaseIdentity<'_> {
+        pub(crate) fn revalidate(&self) -> Result<(), ProjectionError> {
+            self.lease.revalidate_identity()
         }
     }
 
@@ -6769,18 +6960,25 @@ mod applier_lease {
                     store.root_path().display()
                 )));
             }
-            Ok(())
+            // Authority boundary: this proof is what the bootstrap -> promoted
+            // lease handover and the crash-takeover compare-and-swap consume, so
+            // a lock that no longer refers to the file this pathname names must
+            // not authorize either. The cheap identity comparisons run first, so
+            // a foreign lease is still refused without any filesystem work.
+            self.lease.revalidate_identity()
         }
     }
 }
 
 #[cfg(test)]
 pub(crate) use applier_lease::{
-    recorded_applier_lock_releases, workspace_lock_is_contended, ApplierLockRelease,
+    clear_workspace_lease_open_hook_for_test, recorded_applier_lock_releases,
+    set_workspace_lease_open_hook_for_test, workspace_lock_is_contended, ApplierLockRelease,
 };
 use applier_lease::{ApplierAuthorization, HeldApplierLocks};
 pub(crate) use applier_lease::{
-    LeasedWorkspaceProjection, SqliteApplierSlot, WorkspaceRuntimeLease, WorkspaceRuntimeProof,
+    LeasedWorkspaceProjection, SqliteApplierSlot, WorkspaceLeaseIdentity, WorkspaceRuntimeLease,
+    WorkspaceRuntimeProof,
 };
 
 #[cfg(test)]
@@ -6789,13 +6987,31 @@ thread_local! {
     /// thread. A retained runtime must acquire exactly one for its whole life,
     /// so this counter is what proves the lease is not silently reacquired per
     /// mutation.
+    ///
+    /// Incremented once per *successful* acquisition — after the lock and after
+    /// the stable-identity check agree — so neither a contended attempt nor a
+    /// bounded identity retry can inflate it.
     static WORKSPACE_RUNTIME_LEASE_ACQUISITIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    /// While-held workspace-lease identity revalidations performed by this
+    /// thread: one `lstat`-equivalent of the held handle plus one no-follow
+    /// resolution of the exact lease pathname each.
+    ///
+    /// This is the instrument that proves the correction added no
+    /// keystroke-proportional filesystem work: the bounded-admission table
+    /// asserts it stays at zero across 1, 1,000, and 10,000 admissions.
+    static WORKSPACE_LEASE_IDENTITY_REVALIDATIONS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
 pub(crate) fn workspace_runtime_lease_acquisitions() -> usize {
     WORKSPACE_RUNTIME_LEASE_ACQUISITIONS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn workspace_lease_identity_revalidations() -> usize {
+    WORKSPACE_LEASE_IDENTITY_REVALIDATIONS.with(std::cell::Cell::get)
 }
 
 fn open_or_create_lease_directory(
@@ -6862,6 +7078,43 @@ fn lock_capability_lease_file(
             display_path.display()
         ))
     })?;
+    let file = lock_opened_lease_file(file, display_path)?;
+    validate_opened_lease_file(&file, display_path)?;
+    Ok(file)
+}
+
+/// The archive-rooted workspace lease's own open-then-lock.
+///
+/// It differs from [`lock_capability_lease_file`] in two ways, both because
+/// this lease's file lives inside a replicated archive and can be replaced
+/// underneath it:
+///
+/// * it stops after the lock and leaves [`validate_opened_lease_file`] to the
+///   caller, so the ownership/link validators run on the file the caller has
+///   already *proved* is the one the lease pathname names. A replaced file's
+///   old handle has `nlink == 0`, which would otherwise surface as an
+///   unrecoverable unsafe-path error instead of a retryable lost race;
+/// * it carries one test-only interposition point between the open and the
+///   lock. That gap is exactly the window an out-of-band replacement could win,
+///   so the regression proving the window is closed has to be able to act
+///   inside it.
+fn lock_workspace_lease_file(
+    directory: &CapDir,
+    name: &str,
+    display_path: &Path,
+) -> Result<File, ProjectionError> {
+    let file = open_capability_lease_file(directory, name).map_err(|error| {
+        ProjectionError::UnsafePath(format!(
+            "cannot open SQLite applier lease {} without following links: {error}",
+            display_path.display()
+        ))
+    })?;
+    #[cfg(test)]
+    applier_lease::interpose_workspace_lease_open_for_test(display_path);
+    lock_opened_lease_file(file, display_path)
+}
+
+fn lock_opened_lease_file(file: File, display_path: &Path) -> Result<File, ProjectionError> {
     if let Err(error) = file.try_lock_exclusive() {
         if matches!(
             error.kind(),
@@ -6871,8 +7124,188 @@ fn lock_capability_lease_file(
         }
         return Err(error.into());
     }
-    validate_opened_lease_file(&file, display_path)?;
     Ok(file)
+}
+
+/// One file's stable platform identity.
+///
+/// This is the value that decides whether an OS lock still refers to the file a
+/// pathname resolves to. It is deliberately platform native: a path, a length,
+/// or a modification time would all be identical across the replacement this
+/// exists to detect, because the replacement's whole point is that the lease
+/// file's *bytes* never change.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct LeaseFileIdentity {
+    /// `st_dev`.
+    device: u64,
+    /// `st_ino`.
+    inode: u64,
+}
+
+/// One file's stable platform identity.
+///
+/// `FILE_ID_INFO` is the Windows equivalent of `(st_dev, st_ino)`: a volume
+/// serial number plus a 128-bit file id that is stable on NTFS and ReFS. It is
+/// read from an open handle, so it identifies the file the handle refers to,
+/// not the name it was opened by.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct LeaseFileIdentity {
+    /// `FILE_ID_INFO::VolumeSerialNumber`.
+    volume: u64,
+    /// `FILE_ID_INFO::FileId`.
+    file_id: [u8; 16],
+}
+
+/// Targets without an atomic no-follow lease open never reach this type: the
+/// lease open itself already fails as unsupported.
+#[cfg(not(any(unix, windows)))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct LeaseFileIdentity(());
+
+/// The identity of the file this *held handle* refers to.
+#[cfg(unix)]
+fn held_file_identity(file: &File, path: &Path) -> Result<LeaseFileIdentity, ProjectionError> {
+    let metadata = file.metadata().map_err(|error| {
+        ProjectionError::UnsafePath(format!(
+            "cannot read the held SQLite applier lease {}: {error}",
+            path.display()
+        ))
+    })?;
+    Ok(LeaseFileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(windows)]
+fn held_file_identity(file: &File, path: &Path) -> Result<LeaseFileIdentity, ProjectionError> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileIdInfo, GetFileInformationByHandleEx, FILE_ID_INFO,
+    };
+
+    let mut information = FILE_ID_INFO::default();
+    // SAFETY: `file` owns a live handle for the whole call, and `information`
+    // is a live, correctly sized out-parameter of the requested class.
+    let result = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileIdInfo,
+            (&mut information as *mut FILE_ID_INFO).cast(),
+            std::mem::size_of::<FILE_ID_INFO>() as u32,
+        )
+    };
+    if result == 0 {
+        return Err(ProjectionError::UnsafePath(format!(
+            "cannot read the held SQLite applier lease {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(LeaseFileIdentity {
+        volume: information.VolumeSerialNumber,
+        file_id: information.FileId.Identifier,
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn held_file_identity(_file: &File, path: &Path) -> Result<LeaseFileIdentity, ProjectionError> {
+    Err(ProjectionError::UnsafePath(format!(
+        "stable lease file identity is unsupported on this target: {}",
+        path.display()
+    )))
+}
+
+/// Resolve the exact workspace-lease pathname again — the way another process
+/// opening that pathname would — and report the identity of the file it names
+/// right now.
+///
+/// The walk starts at the retained no-follow archive-root capability and opens
+/// every component with no-follow, so it observes a replaced *directory* as
+/// well as a replaced lease file, while remaining immune to a substituted
+/// archive root (which the runtime's archive-identity proof owns).
+fn resolve_lease_file_identity(
+    archive_capability: &CapDir,
+    workspace_name: &str,
+    display_path: &Path,
+) -> Result<LeaseFileIdentity, ProjectionError> {
+    let resolve_directory = |parent: &CapDir, name: &str| {
+        super::object_store::open_dir_nofollow(parent, name).map_err(|error| {
+            ProjectionError::UnsafePath(format!(
+                "cannot resolve the SQLite applier lease {} without following links: {error}",
+                display_path.display()
+            ))
+        })
+    };
+    let lease_namespace = resolve_directory(archive_capability, OBJECT_STORE_LEASE_NAMESPACE)?;
+    let sqlite_namespace = resolve_directory(&lease_namespace, SQLITE_WORKSPACE_LEASE_NAMESPACE)?;
+    let workspace_root = resolve_directory(&sqlite_namespace, workspace_name)?;
+    entry_file_identity(&workspace_root, SQLITE_APPLIER_LEASE_FILE, display_path)
+}
+
+/// The identity of whatever file `name` resolves to inside `directory` right
+/// now, resolved without following a final-component link.
+///
+/// On Unix this is an `lstat` relative to the retained directory capability. On
+/// Windows it opens an exact-path handle with the same default sharing mode the
+/// live lease handle was opened with (`FILE_SHARE_READ | FILE_SHARE_WRITE |
+/// FILE_SHARE_DELETE`), so the probe is compatible with the live byte-range
+/// lock rather than contending with it, and reads the identity from that
+/// handle.
+#[cfg(unix)]
+fn entry_file_identity(
+    directory: &CapDir,
+    name: &str,
+    display_path: &Path,
+) -> Result<LeaseFileIdentity, ProjectionError> {
+    let metadata = directory.symlink_metadata(name).map_err(|error| {
+        ProjectionError::UnsafePath(format!(
+            "cannot resolve the SQLite applier lease {} without following links: {error}",
+            display_path.display()
+        ))
+    })?;
+    Ok(LeaseFileIdentity {
+        device: CapMetadataExt::dev(&metadata),
+        inode: CapMetadataExt::ino(&metadata),
+    })
+}
+
+#[cfg(windows)]
+fn entry_file_identity(
+    directory: &CapDir,
+    name: &str,
+    display_path: &Path,
+) -> Result<LeaseFileIdentity, ProjectionError> {
+    let mut options = CapOpenOptions::new();
+    options
+        .read(true)
+        .create(false)
+        .truncate(false)
+        .follow(FollowSymlinks::No);
+    let file = directory
+        .open_with(name, &options)
+        .map_err(|error| {
+            ProjectionError::UnsafePath(format!(
+                "cannot resolve the SQLite applier lease {} without following links: {error}",
+                display_path.display()
+            ))
+        })?
+        .into_std();
+    held_file_identity(&file, display_path)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn entry_file_identity(
+    _directory: &CapDir,
+    _name: &str,
+    display_path: &Path,
+) -> Result<LeaseFileIdentity, ProjectionError> {
+    Err(ProjectionError::UnsafePath(format!(
+        "stable lease file identity is unsupported on this target: {}",
+        display_path.display()
+    )))
 }
 
 #[cfg(unix)]
@@ -12983,10 +13416,14 @@ mod tests {
             .map_err(|(_lease, error)| error)
             .unwrap();
         assert_eq!(projection.database().claim(), ids.claim());
+        // The production split: the mutable database handle and the borrowed
+        // while-held lease-identity check, disjointly.
+        let (database, workspace) = projection.database_and_lease_identity();
         assert_eq!(
-            projection.database_mut().frontier_root().unwrap(),
+            database.frontier_root().unwrap(),
             engine.accepted_frontier_root().unwrap()
         );
+        workspace.revalidate().unwrap();
 
         // The borrowed workspace proof authorizes this archive and workspace,
         // and refuses a look-alike archive or a foreign workspace.
@@ -13190,16 +13627,35 @@ mod tests {
         assert_eq!(fs::read(&conflict).unwrap(), b"someone else's copy");
     }
 
-    /// Characterization, deliberately asserting the *residual*: if a sync
-    /// provider ever did replace this file, the local lock would split, because
-    /// `flock` follows the inode and not the name. Nothing in this crate can
-    /// prevent that from the outside; what it can do — and
-    /// `the_workspace_lock_file_is_empty_and_no_acquisition_ever_rewrites_it`
-    /// proves it does — is never give a provider a content change to propagate.
-    /// If this test ever starts failing, the lock acquired a replacement
-    /// defense and this residual should be re-stated rather than grandfathered.
+    /// Replace the workspace lock file with a byte-identical new file, exactly
+    /// the way an out-of-band action lands one: write a temporary file beside
+    /// the target and rename it over the name.
+    ///
+    /// The bytes are already identical on both sides — that is the point. This
+    /// is what a Syncthing receive-only "Revert local changes", a folder
+    /// reset/re-add, a delete-then-restore, a `.stversions` restore, or a user
+    /// removing `.tine-runtime` by hand does to the locked file: it changes the
+    /// file's *identity* while changing nothing an observer of its contents,
+    /// length, or name could see.
+    fn replace_workspace_lock_file(path: &Path) {
+        let incoming = path.with_extension("lock.incoming");
+        fs::write(&incoming, b"").unwrap();
+        fs::rename(&incoming, path).unwrap();
+    }
+
+    /// Replacing the workspace lock file out of band used to split the local
+    /// lock: `flock` follows the file, not the name, so the old holder kept a
+    /// lock nobody could reach by name while a newcomer opening the same name
+    /// locked the new file and also succeeded. Two runtimes, one workspace.
+    ///
+    /// This is the fail-closed regression for that. The replacement itself
+    /// cannot be prevented from inside this crate — and the newcomer is not
+    /// wrong, its handle and its name agree — so the invariant is the weaker,
+    /// achievable one: **the old holder and a replacement opener can never both
+    /// be valid authority**. The old holder's lock stops proving anything the
+    /// moment it stops naming the file it locked.
     #[test]
-    fn replacing_the_workspace_lock_file_out_of_band_splits_the_local_lock() {
+    fn replacing_the_workspace_lock_file_out_of_band_fails_closed_instead_of_splitting_the_lock() {
         let ids = TestIds::new(9_200);
         let dir = TestDir::new("workspace-lock-replacement");
         let archive_root = dir.path().join("objects");
@@ -13207,21 +13663,193 @@ mod tests {
         let lease_path = workspace_lease_path(&archive_root, ids.workspace);
 
         let held = WorkspaceRuntimeLease::acquire(&store, ids.workspace).unwrap();
+        held.proof()
+            .authorize_archive(&store, ids.workspace)
+            .unwrap();
         assert!(matches!(
             WorkspaceRuntimeLease::acquire(&store, ids.workspace),
             Err(ProjectionError::LeaseContended(_))
         ));
 
-        // Exactly what a provider does when it lands a new version: write a
-        // temporary file beside the target and rename it over the name.
-        let incoming = lease_path.with_extension("lock.incoming");
-        fs::write(&incoming, b"").unwrap();
-        fs::rename(&incoming, &lease_path).unwrap();
+        // The cut: replaced after a successful acquisition, while held.
+        replace_workspace_lock_file(&lease_path);
 
-        let split = WorkspaceRuntimeLease::acquire(&store, ids.workspace)
-            .expect("the residual this test documents: a replaced inode is a second lock");
-        drop(split);
+        // The old holder is no longer authority, and says so in a way every
+        // caller already routes as fail-closed.
+        let error = held
+            .proof()
+            .authorize_archive(&store, ids.workspace)
+            .expect_err("a replaced lease path must not keep authorizing this archive");
+        assert!(
+            matches!(error, ProjectionError::UnsafePath(_)),
+            "unexpected replaced-lease error: {error}"
+        );
+
+        // A newcomer legitimately takes the file that is now at the name: it is
+        // a fresh, unlocked file and its handle and name agree. That is the
+        // half this crate cannot and should not refuse.
+        let newcomer = WorkspaceRuntimeLease::acquire(&store, ids.workspace)
+            .expect("the replacement file is unlocked, so a newcomer may take it");
+        newcomer
+            .proof()
+            .authorize_archive(&store, ids.workspace)
+            .unwrap();
+
+        // The invariant: exactly one of the two is authority, never both.
+        assert!(
+            held.proof()
+                .authorize_archive(&store, ids.workspace)
+                .is_err(),
+            "the old holder and the replacement opener must not both be authority"
+        );
+        drop(newcomer);
         drop(held);
+    }
+
+    /// The open-then-lock window inside `WorkspaceRuntimeLease::acquire` is the
+    /// other cut: the file is open, the lock is not taken yet, and a replacement
+    /// landing in that instant would hand this process a lock on a file no
+    /// pathname reaches.
+    ///
+    /// Driven directly through the acquisition's test interposition point. A
+    /// race that keeps winning must exhaust a small explicit number of attempts
+    /// and fail closed as the ordinary contended-lease error — never block,
+    /// never retry unboundedly, and never return a lock that proves nothing.
+    #[test]
+    fn a_workspace_lease_losing_the_open_lock_race_retries_boundedly_then_fails_closed() {
+        let ids = TestIds::new(9_210);
+        let dir = TestDir::new("workspace-lock-open-race");
+        let archive_root = dir.path().join("objects");
+        let store = ObjectStore::open(&archive_root, ids.workspace).unwrap();
+        let lease_path = workspace_lease_path(&archive_root, ids.workspace);
+
+        // Every attempt loses the race.
+        let opens = std::rc::Rc::new(std::cell::Cell::new(0_usize));
+        let counter = std::rc::Rc::clone(&opens);
+        set_workspace_lease_open_hook_for_test(Box::new(move |path| {
+            counter.set(counter.get() + 1);
+            replace_workspace_lock_file(path);
+        }));
+        let Err(error) = WorkspaceRuntimeLease::acquire(&store, ids.workspace) else {
+            panic!("an acquisition that never wins the race must fail closed");
+        };
+        clear_workspace_lease_open_hook_for_test();
+        assert!(
+            matches!(&error, ProjectionError::LeaseContended(path) if path == &lease_path),
+            "unexpected exhausted-retry error: {error}"
+        );
+        assert_eq!(
+            opens.get(),
+            applier_lease::WORKSPACE_LEASE_IDENTITY_ATTEMPTS,
+            "the retry must be bounded by one small explicit constant"
+        );
+        // Every losing attempt released the lock it took, so nothing is stranded.
+        assert!(!workspace_lock_is_contended(&lease_path));
+
+        // One lost race is survivable: the next attempt takes the file that is
+        // actually at the name, and is authority.
+        let opens = std::rc::Rc::new(std::cell::Cell::new(0_usize));
+        let counter = std::rc::Rc::clone(&opens);
+        set_workspace_lease_open_hook_for_test(Box::new(move |path| {
+            counter.set(counter.get() + 1);
+            if counter.get() == 1 {
+                replace_workspace_lock_file(path);
+            }
+        }));
+        let lease = WorkspaceRuntimeLease::acquire(&store, ids.workspace).unwrap();
+        clear_workspace_lease_open_hook_for_test();
+        assert_eq!(opens.get(), 2, "exactly one retry was needed");
+        lease
+            .proof()
+            .authorize_archive(&store, ids.workspace)
+            .unwrap();
+        assert!(matches!(
+            WorkspaceRuntimeLease::acquire(&store, ids.workspace),
+            Err(ProjectionError::LeaseContended(_))
+        ));
+    }
+
+    /// The third cut: the replacement lands immediately before an authority
+    /// revalidation on a lease that is already carrying a live database.
+    ///
+    /// Every way that lease can still be spent is refused — the proof the
+    /// bootstrap -> promoted handover and the crash-takeover compare-and-swap
+    /// consume, the standalone while-held check the promoted runtime's
+    /// boundaries use, and the applier slot that authorizes the next database.
+    #[test]
+    fn a_leased_projection_whose_lease_path_was_replaced_refuses_at_every_authority_boundary() {
+        let ids = TestIds::new(9_220);
+        let dir = TestDir::new("workspace-lock-replacement-held");
+        let archive_root = dir.path().join("objects");
+        let store = ObjectStore::open(&archive_root, ids.workspace).unwrap();
+        let runtime = ApplicationRuntimeRoot::open_for_test(&dir.path().join("runtime")).unwrap();
+        let engine = ids.engine();
+        let lease_path = workspace_lease_path(&archive_root, ids.workspace);
+
+        let lease = WorkspaceRuntimeLease::acquire(&store, ids.workspace).unwrap();
+        let projection = open_leased_projection(
+            lease,
+            &dir.path().join("bootstrap.sqlite"),
+            &runtime,
+            ids,
+            &engine,
+            &store,
+        );
+        projection
+            .workspace_proof()
+            .authorize_archive(&store, ids.workspace)
+            .unwrap();
+        projection.revalidate_workspace_lease_identity().unwrap();
+
+        replace_workspace_lock_file(&lease_path);
+
+        let error = projection
+            .revalidate_workspace_lease_identity()
+            .expect_err("the while-held boundary check must see the replacement");
+        assert!(
+            matches!(error, ProjectionError::UnsafePath(_)),
+            "unexpected while-held error: {error}"
+        );
+        assert!(matches!(
+            projection
+                .workspace_proof()
+                .authorize_archive(&store, ids.workspace),
+            Err(ProjectionError::UnsafePath(_))
+        ));
+
+        // The bootstrap -> promoted handoff cannot proceed either: the applier
+        // slot refuses before a second database is opened, and the refusal hands
+        // the exact lease back rather than releasing it.
+        let lease = projection.close_retaining_lease();
+        let (returned, error) =
+            LeasedWorkspaceProjection::open_under::<(), ProjectionError>(lease, |slot| {
+                SqliteFrontier::open_or_rebuild_with_applier_slot(
+                    &dir.path().join("promoted.sqlite"),
+                    &runtime,
+                    ids.claim(),
+                    RebuildSource::new(&engine, &store).unwrap(),
+                    slot,
+                )
+                .map(|opened| (opened, ()))
+            })
+            .err()
+            .expect("a replaced lease path must not authorize a new database");
+        assert!(
+            matches!(error, ProjectionError::UnsafePath(_)),
+            "unexpected applier-slot error: {error}"
+        );
+
+        // And again: a newcomer owns the replacement, the old holder owns
+        // nothing, and the two are never both authority.
+        let newcomer = WorkspaceRuntimeLease::acquire(&store, ids.workspace).unwrap();
+        newcomer
+            .proof()
+            .authorize_archive(&store, ids.workspace)
+            .unwrap();
+        assert!(returned
+            .proof()
+            .authorize_archive(&store, ids.workspace)
+            .is_err());
     }
 
     /// A pipe-coordinated child that reports, on demand, whether it can take

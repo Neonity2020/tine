@@ -99,6 +99,82 @@
 //! two racing newcomers cannot both win. It never mints `Safe` and never
 //! unblocks automatic external import; only a proved clean drain does that.
 //!
+//! ## Workspace lease identity
+//!
+//! Holding the lock is not by itself proof of ownership, because the lock file
+//! lives inside the replicated archive. A provider or user action that replaces
+//! `<archive>/.tine-runtime/sqlite-workspaces/<workspace>/sqlite-applier.lock`
+//! — a receive-only revert, a folder reset/re-add, a delete-then-restore, a
+//! `.stversions` restore, `rm -rf .tine-runtime` — unlinks the locked file and
+//! puts a new one at the same name. The old holder keeps a lock nobody can
+//! reach by name; a newcomer opening the name locks the new file and succeeds.
+//!
+//! [`super::sqlite::WorkspaceRuntimeLease`] therefore binds itself to one
+//! platform-native stable file identity at acquisition and revalidates it
+//! while held. This is the exact, and deliberately smallest, set of places that
+//! revalidation happens; every one of them is a boundary this runtime already
+//! re-derives archive, enrollment, or head authority at:
+//!
+//! 1. **Acquisition.** `WorkspaceRuntimeLease::acquire` compares the locked
+//!    handle against a fresh no-follow resolution of the exact pathname, with a
+//!    small bounded number of explicit retries, then fails closed as
+//!    `LeaseContended`.
+//! 2. **Every database opened under the lease.** `SqliteApplierSlot::authorize`,
+//!    reached from `DatabaseApplierLease::acquire` — so the inactive bootstrap
+//!    open, its retry [`InactiveBootstrapRuntimeSession::reopen_under`], and the
+//!    promoted open inside [`mint_promoted_runtime`] all revalidate.
+//! 3. **Every use of the lease as a proof.**
+//!    `WorkspaceRuntimeProof::authorize_archive`, which is what
+//!    [`RetainedWorkspaceLease::into_lease`] consumes at the bootstrap ->
+//!    promoted handover and what
+//!    `RetainedEnrollmentSession::authenticate_unsafe_predecessor` consumes
+//!    before the crash-takeover compare-and-swap.
+//! 4. **Every archive-identity reread.** [`PromotedLocalRuntime::prove_binding`]
+//!    revalidates exactly when it rereads the archive's canonical resource claim
+//!    and control-directory identity — that is, at every
+//!    [`BindingProofDepth::Boundary`] proof (the promoted-open/recovery final
+//!    proof) and at every admission whose enrollment binding generation moved.
+//! 5. **Every SQLite advance.** [`PromotedRuntimeSession::drain_projection`].
+//! 6. **The promoted `Safe` handoff**, before the drain proof is believed.
+//!
+//! It deliberately does **not** run in the per-mutation admission fast path.
+//! Lease identity is a stable session fact of exactly the same class as the
+//! archive control-directory identity, and it is carried under the identical
+//! rule: [`ArchiveAuthentication::Carried`] carries it, any observed
+//! enrollment-head change escalates to [`ArchiveAuthentication::Reread`] and
+//! re-derives it. So an unchanged-head admission issues no filesystem call for
+//! it, which `bounded_admission`'s zero-cost table asserts at 1, 1,000, and
+//! 10,000 admissions.
+//!
+//! The honest residual: one batch authored inside an already-open mutation
+//! window can still be *published* to the archive after a replacement, because
+//! immutable content-addressed publication is not lease-gated at all (honest
+//! peers on other devices publish into the same archive by design). What the
+//! lease gates — opening a device-local database, advancing SQLite, swapping a
+//! crash-takeover handoff record, and publishing `Safe` — all fail closed first.
+//!
+//! ## Lock order, and why it is safe to invert it without blocking
+//!
+//! The global order is enrollment lease, then archive-rooted workspace lease.
+//! [`reopen_promoted_local_runtime`] and [`take_over_promoted_local_runtime`]
+//! take it in that order. The bootstrap path deliberately **inverts** it:
+//! [`InactiveBootstrapRuntimeSession::open`] takes the workspace lease first and
+//! [`InactiveBootstrapRuntimeSession::promote`] takes the enrollment lease
+//! afterwards, because the workspace lease has to be continuously held across
+//! the database handoff.
+//!
+//! That inversion cannot deadlock for exactly one reason: **both acquisitions
+//! are non-blocking.** `fs2::try_lock_exclusive` under `WorkspaceRuntimeLease`
+//! and under `EnrollmentLease` both return immediately, and contention becomes
+//! an immediate refusal rather than a wait. The identity retry added above is
+//! bounded and explicit for the same reason, and it releases the lock it took
+//! before retrying.
+//!
+//! This is a standing contract for the activation, watcher, and Tauri phases:
+//! **no future code may block, spin, or retry unboundedly while holding either
+//! lease and waiting for the other.** If a retry is ever genuinely needed, bound
+//! it explicitly and release the already-held lease first.
+//!
 //! The bootstrap stays an immutable historical anchor. Ordinary local batches
 //! extend it by carrying the identical bootstrap aggregate binding forward, so
 //! the promoted history is one homogeneous bootstrap-anchored lineage that the
@@ -135,7 +211,7 @@ use super::projection_store::ProjectionReceiptStore;
 use super::sqlite::{
     ApplicationRuntimeRoot, LeasedWorkspaceProjection, OpenProjection, ProjectionClaim,
     ProjectionError, RebuildSource, SqliteFrontier, TailOverlay, VerifiedBootstrapSqliteProjection,
-    WorkspaceRuntimeLease,
+    WorkspaceLeaseIdentity, WorkspaceRuntimeLease,
 };
 use super::{ContentDigest, ObjectStore, ProjectionEndpointBinding, SessionId, WorkspaceId};
 
@@ -175,6 +251,10 @@ pub(crate) struct PromotedRuntimeInstrumentation {
     /// Archive-rooted workspace runtime lease acquisitions. A retained runtime
     /// takes exactly one for its whole writable life.
     pub(crate) workspace_lease_acquisitions: usize,
+    /// While-held workspace-lease identity revalidations: one held-handle stat
+    /// plus one no-follow resolution of the exact lease pathname each. It is a
+    /// boundary fact, so an unchanged-head admission must perform none.
+    pub(crate) workspace_lease_identity_revalidations: usize,
 }
 
 #[cfg(test)]
@@ -185,6 +265,8 @@ impl PromotedRuntimeInstrumentation {
             sqlite_frontier_reads: PROMOTED_SQLITE_FRONTIER_READS.with(std::cell::Cell::get),
             archive_identity_reads: PROMOTED_ARCHIVE_IDENTITY_READS.with(std::cell::Cell::get),
             workspace_lease_acquisitions: super::sqlite::workspace_runtime_lease_acquisitions(),
+            workspace_lease_identity_revalidations:
+                super::sqlite::workspace_lease_identity_revalidations(),
         }
     }
 
@@ -197,6 +279,8 @@ impl PromotedRuntimeInstrumentation {
             archive_identity_reads: now.archive_identity_reads - self.archive_identity_reads,
             workspace_lease_acquisitions: now.workspace_lease_acquisitions
                 - self.workspace_lease_acquisitions,
+            workspace_lease_identity_revalidations: now.workspace_lease_identity_revalidations
+                - self.workspace_lease_identity_revalidations,
         }
     }
 }
@@ -1948,10 +2032,12 @@ impl PromotedLocalRuntime {
             enrollment: &*enrollment,
             _seal: seal::Seal,
         };
+        let (database, workspace) = projection.database_and_lease_identity();
         Ok(PromotedRuntimeSession {
             admission,
             engine,
-            database: projection.database_mut(),
+            database,
+            workspace,
             tail,
         })
     }
@@ -1985,6 +2071,14 @@ impl PromotedLocalRuntime {
         }
         authority
             .authenticate_runtime(graph, &self.engine)
+            .map_err(|error| SafeHandoffUnavailable::Runtime(error.to_string()))?;
+        // Authority boundary: a `Safe` handoff is a durable claim that this
+        // process drained everything it owned. A runtime whose archive-rooted
+        // lock stopped naming its own lease pathname no longer owns the
+        // workspace and must not publish that claim. The real promoted `Safe`
+        // transition, when the watcher dependency lands, must keep this check.
+        self.projection
+            .revalidate_workspace_lease_identity()
             .map_err(|error| SafeHandoffUnavailable::Runtime(error.to_string()))?;
         let (handoff, head) = {
             let committed = self.enrollment.reauthenticate()?;
@@ -2103,6 +2197,16 @@ impl PromotedLocalRuntime {
         } else {
             ArchiveAuthentication::Reread
         };
+        // The archive-rooted workspace lock proves ownership only while it is
+        // still the lock on the file this archive's lease pathname names. That
+        // is a stable session fact of the same class as the archive's control
+        // directory identity, so it is re-derived under exactly the same rule:
+        // reread at every boundary and at every observed enrollment-head change,
+        // carried by an unchanged-head admission. See the module documentation's
+        // "Workspace lease identity" section.
+        if archive == ArchiveAuthentication::Reread {
+            self.projection.revalidate_workspace_lease_identity()?;
+        }
         let accepted = revalidate_promoted_binding(
             &self.state,
             self.anchor,
@@ -2274,6 +2378,10 @@ pub(crate) struct PromotedRuntimeSession<'a> {
     admission: PromotedRuntimeAdmission<'a>,
     engine: &'a mut ShardedHotEngine,
     database: &'a mut SqliteFrontier,
+    /// The while-held identity check for the archive-rooted workspace lease
+    /// that authorized `database`, borrowed disjointly from it so the drain
+    /// boundary can still re-prove workspace ownership.
+    workspace: WorkspaceLeaseIdentity<'a>,
     tail: &'a mut TailOverlay,
 }
 
@@ -2321,6 +2429,14 @@ impl PromotedRuntimeSession<'_> {
         &mut self,
         max_batches: usize,
     ) -> Result<usize, RuntimePromotionError> {
+        // Authority boundary: a drain is the one-applier-per-workspace write.
+        // The device-local database lock alone does not prove it, because a
+        // process under another XDG/HOME/Flatpak root has its own; only the
+        // archive-rooted lease does, and only while that lock is still on the
+        // file the lease pathname names.
+        self.workspace
+            .revalidate()
+            .map_err(RuntimePromotionError::Sqlite)?;
         let engine = &*self.engine;
         let store = engine.archive_store().ok_or(RuntimePromotionError::Anchor(
             "promoted engine retained no archive capability",
@@ -3806,6 +3922,11 @@ mod bounded_admission {
             // The archive-rooted workspace runtime lease is retained for the
             // whole promoted runtime, so no admission ever reacquires it.
             workspace_lease_acquisitions: 0,
+            // Nor does an admission re-derive the lease's stable file identity.
+            // That is a boundary fact carried exactly like the archive control
+            // identity above, so the replacement defence adds no filesystem work
+            // to the keystroke path at any admission count.
+            workspace_lease_identity_revalidations: 0,
         };
 
         for (label, count) in [
