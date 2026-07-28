@@ -345,74 +345,119 @@ impl RuntimeResumePointV1 {
     }
 }
 
-/// A retained-run reachability answer derived from a *complete*, poison-checked
-/// resume-point scan.
+pub(crate) use reachability::ReachableRetainedRuns;
+
+/// The entire privacy scope of the reachability proof's identity set.
 ///
-/// Reclamation consumes this type rather than a bare identity set so the
-/// "complete proof" precondition is carried by the type system.
-/// [`ResumePointSet::reachable_runs`] is the **only** way to obtain one outside
-/// `#[cfg(test)]`, and a `ResumePointSet` can only be minted by a survey that
-/// recognized and authenticated every entry it saw.
-///
-/// The absent constructions are load-bearing, not an oversight, and the
-/// `const _` surface guard below keeps them absent:
-///
-/// * no `Default` — the default of a set is the *empty* set, i.e. "nothing is
-///   reachable", which is the single most destructive value this type can hold
-///   and exactly what the poison rule exists to prevent. It also makes
-///   `…map(ResumePointSet::reachable_runs).unwrap_or_default()` compile, which
-///   silently converts a failed or poisoned scan into "delete everything";
-/// * no `Clone` — nothing needs to copy a proof, and a copy is one refactor
-///   away from a mutated one;
-/// * no `From<BTreeSet<Uuid>>` and no `Deserialize` — either would let a bare
-///   or transported identity set become deletion authority.
-///
-/// What this type proves is **completeness**, never **currency**: a survey of a
-/// stale or provider-damaged directory yields a complete-but-wrong answer. The
-/// live run is protected against that by its own exclusive lease, which
-/// `reclaim_unreachable_retained_runs` acquires before it unlinks anything.
-#[derive(Debug, Eq, PartialEq)]
-pub(crate) struct ReachableRetainedRuns(BTreeSet<Uuid>);
+/// Type privacy is the authority boundary, and this module is what makes that
+/// boundary *small*. `ReachableRetainedRuns`' tuple field is private to this
+/// module, so no `impl From<..>`, no `impl FromIterator<..>` and no second
+/// inherent `impl` written anywhere else — in this file or in any other — can
+/// construct the proof at all: that is `E0616`, a compile error, not a
+/// convention. Reviewing the mint surface therefore means reviewing these few
+/// lines rather than the whole crate, and the source contract in this module's
+/// tests keeps *this* region honest.
+mod reachability {
+    use super::*;
 
-/// Compile-level surface guard for the reachability proof.
-///
-/// Each blanket implementation below overlaps its concrete twin exactly when
-/// [`ReachableRetainedRuns`] gains that blanket construction route. Re-deriving
-/// `Default` or `Clone`, adding `From<BTreeSet<Uuid>>`, or making the type
-/// deserializable therefore stops the crate compiling with a conflicting-impl
-/// error, instead of quietly restoring a forgeable proof.
-const _: () = {
-    trait NoDefaultMint {}
-    impl<T: Default> NoDefaultMint for T {}
-    impl NoDefaultMint for ReachableRetainedRuns {}
+    /// A retained-run reachability answer derived from a *complete*,
+    /// poison-checked resume-point scan.
+    ///
+    /// Reclamation consumes this type rather than a bare identity set so the
+    /// "complete proof" precondition is carried by the type system.
+    /// [`ResumePointSet::reachable_runs`] is the **only** way to obtain one
+    /// outside `#[cfg(test)]`, and a `ResumePointSet` can only be minted by a
+    /// survey that recognized and authenticated every entry it saw.
+    ///
+    /// The absent constructions are load-bearing, not an oversight, and the
+    /// `const _` surface guard below keeps them absent:
+    ///
+    /// * no `Default` — the default of a set is the *empty* set, i.e. "nothing
+    ///   is reachable", which is the single most destructive value this type
+    ///   can hold and exactly what the poison rule exists to prevent. It also
+    ///   makes `…map(ResumePointSet::reachable_runs).unwrap_or_default()`
+    ///   compile, which silently converts a failed or poisoned scan into
+    ///   "delete everything";
+    /// * no `Clone` — nothing needs to copy a proof, and a copy is one refactor
+    ///   away from a mutated one;
+    /// * no `From<BTreeSet<Uuid>>`, no `From<Vec<Uuid>>`, no
+    ///   `FromIterator<Uuid>` and no `Deserialize` — each would let a bare,
+    ///   collected or transported identity set become deletion authority.
+    ///
+    /// What this type proves is **completeness**, never **currency**: a survey
+    /// of a stale or provider-damaged directory yields a complete-but-wrong
+    /// answer. The live run is protected against that by its own exclusive
+    /// lease, which `reclaim_unreachable_retained_runs` acquires before it
+    /// unlinks anything.
+    #[derive(Debug, Eq, PartialEq)]
+    pub(crate) struct ReachableRetainedRuns(BTreeSet<Uuid>);
 
-    trait NoCloneMint {}
-    impl<T: Clone> NoCloneMint for T {}
-    impl NoCloneMint for ReachableRetainedRuns {}
+    /// Compile-level surface guard for the reachability proof.
+    ///
+    /// Each blanket implementation below overlaps its concrete twin exactly
+    /// when [`ReachableRetainedRuns`] gains that blanket construction route.
+    /// Re-deriving `Default` or `Clone`, adding a `From`/`FromIterator`
+    /// conversion from an identity collection, or making the type
+    /// deserializable therefore stops the crate compiling with a
+    /// conflicting-impl error, instead of quietly restoring a forgeable proof.
+    /// These fire even for an impl written inside this module, which is the
+    /// half that privacy alone cannot cover.
+    const _: () = {
+        trait NoDefaultMint {}
+        impl<T: Default> NoDefaultMint for T {}
+        impl NoDefaultMint for ReachableRetainedRuns {}
 
-    trait NoBareSetMint {}
-    impl<T: From<BTreeSet<Uuid>>> NoBareSetMint for T {}
-    impl NoBareSetMint for ReachableRetainedRuns {}
+        trait NoCloneMint {}
+        impl<T: Clone> NoCloneMint for T {}
+        impl NoCloneMint for ReachableRetainedRuns {}
 
-    trait NoDecodedMint {}
-    impl<T: DeserializeOwned> NoDecodedMint for T {}
-    impl NoDecodedMint for ReachableRetainedRuns {}
-};
+        trait NoBareSetMint {}
+        impl<T: From<BTreeSet<Uuid>>> NoBareSetMint for T {}
+        impl NoBareSetMint for ReachableRetainedRuns {}
 
-impl ReachableRetainedRuns {
-    pub(crate) fn contains(&self, run_id: Uuid) -> bool {
-        self.0.contains(&run_id)
-    }
+        trait NoOwnedSetMint {}
+        impl<T: From<Vec<Uuid>>> NoOwnedSetMint for T {}
+        impl NoOwnedSetMint for ReachableRetainedRuns {}
 
-    pub(crate) fn len(&self) -> usize {
-        self.0.len()
-    }
+        trait NoIteratorMint {}
+        impl<T: FromIterator<Uuid>> NoIteratorMint for T {}
+        impl NoIteratorMint for ReachableRetainedRuns {}
 
-    /// Hand-built reachability for reclamation tests. Deliberately test-only:
-    /// production callers must derive the set from a complete scan.
-    #[cfg(test)]
-    pub(crate) fn from_run_ids_for_test(run_ids: impl IntoIterator<Item = Uuid>) -> Self {
-        Self(run_ids.into_iter().collect())
+        trait NoDecodedMint {}
+        impl<T: DeserializeOwned> NoDecodedMint for T {}
+        impl NoDecodedMint for ReachableRetainedRuns {}
+    };
+
+    impl ReachableRetainedRuns {
+        /// The single production mint.
+        ///
+        /// It takes the strict proof itself rather than run identities, so
+        /// there is no signature here through which a bare, collected or
+        /// transported identity set could become deletion authority.
+        pub(super) fn of_complete_set(set: &ResumePointSet) -> Self {
+            Self(
+                set.points()
+                    .iter()
+                    .map(|point| point.scratch_run_id)
+                    .collect(),
+            )
+        }
+
+        pub(crate) fn contains(&self, run_id: Uuid) -> bool {
+            self.0.contains(&run_id)
+        }
+
+        pub(crate) fn len(&self) -> usize {
+            self.0.len()
+        }
+
+        /// Hand-built reachability for reclamation tests. Deliberately
+        /// test-only: production callers must derive the set from a complete
+        /// scan.
+        #[cfg(test)]
+        pub(crate) fn from_run_ids_for_test(run_ids: impl IntoIterator<Item = Uuid>) -> Self {
+            Self(run_ids.into_iter().collect())
+        }
     }
 }
 
@@ -599,12 +644,7 @@ impl ResumePointSet {
 
     /// Every retained scratch run this complete set still reaches.
     pub(crate) fn reachable_runs(&self) -> ReachableRetainedRuns {
-        ReachableRetainedRuns(
-            self.points
-                .iter()
-                .map(|point| point.scratch_run_id)
-                .collect(),
-        )
+        ReachableRetainedRuns::of_complete_set(self)
     }
 }
 
@@ -1376,11 +1416,18 @@ mod tests {
 
     /// The reachability proof must stay non-forgeable.
     ///
-    /// The blanket-overlap guards beside the type already make re-deriving
-    /// `Default`/`Clone`, adding `From<BTreeSet<Uuid>>`, or making it
-    /// deserializable a compile error. This adds the part a type system cannot
-    /// state: that no *other* module in the packet's write set constructs one
-    /// outside `#[cfg(test)]`, and that the only inherent mint stays the scan's.
+    /// Type privacy is the authority boundary and it does the heavy lifting:
+    /// the tuple field lives in `mod reachability`, so every route that
+    /// constructs the proof — a second inherent `impl`, an `impl From<..>`, an
+    /// `impl FromIterator<..>` — has to be *inside that module* or it does not
+    /// compile. The blanket-overlap guards beside the type then close the
+    /// named conversion traits even inside it.
+    ///
+    /// This test adds the one part neither mechanism can state: that within the
+    /// module's whole body — not merely its first `impl` block — the only mints
+    /// are the scan's and the `#[cfg(test)]` fixture, that the guards are all
+    /// still present, and that no other file in the packet's write set
+    /// constructs or defaults one.
     #[test]
     fn the_reachability_proof_has_exactly_one_production_mint() {
         const RESUME_POINT_SOURCE: &str = include_str!("resume_point.rs");
@@ -1391,33 +1438,65 @@ mod tests {
         // source and quietly inflate the counts it is checking.
         let proof = "ReachableRetainedRuns";
         let mint = format!("{proof}(");
-        let declaration = format!("#[derive(Debug, Eq, PartialEq)]\npub(crate) struct {mint}");
-
-        // The tuple constructor appears exactly twice: the declaration, and the
-        // single mint inside `ResumePointSet::reachable_runs`.
-        assert_eq!(
-            RESUME_POINT_SOURCE.matches(mint.as_str()).count(),
-            2,
-            "a new {proof} construction appeared"
-        );
-        assert!(RESUME_POINT_SOURCE.contains(declaration.as_str()));
-
-        // Inside its own inherent impl, `Self(..)` is reachable only from the
-        // `#[cfg(test)]` fixture.
         let self_mint = format!("Self{}", "(");
-        let inherent = RESUME_POINT_SOURCE
-            .split_once(format!("impl {proof} {}", "{").as_str())
-            .expect("the inherent impl block")
+        let open = "{";
+
+        // The complete privacy scope of the tuple field: everything from the
+        // module header to the column-0 brace that closes it.
+        let module = RESUME_POINT_SOURCE
+            .split_once(format!("mod reachability {open}").as_str())
+            .expect("the private reachability module")
             .1
             .split_once("\n}\n")
-            .expect("the end of the inherent impl block")
+            .expect("the end of the private reachability module")
             .0;
-        assert_eq!(inherent.matches(self_mint.as_str()).count(), 1);
-        let (before_mint, _) = inherent.split_once(self_mint.as_str()).unwrap();
-        assert!(
-            before_mint.contains("#[cfg(test)]"),
-            "the only inherent mint left the #[cfg(test)] fixture"
+        assert!(module.contains(format!("pub(crate) struct {mint}BTreeSet<Uuid>);").as_str()));
+
+        // The named spelling appears exactly once in the whole file — the
+        // declaration — and it is inside the module. Anything else, anywhere,
+        // is a new construction route.
+        assert_eq!(
+            RESUME_POINT_SOURCE.matches(mint.as_str()).count(),
+            1,
+            "a new {proof} construction appeared"
         );
+        assert_eq!(module.matches(mint.as_str()).count(), 1);
+
+        // `Self(..)` appears exactly twice in the module, in this order: the
+        // production mint, then the `#[cfg(test)]` fixture. Scanning the whole
+        // module rather than one `impl` block is what makes a *second* inherent
+        // impl, or a conversion impl, visible here.
+        let mints: Vec<&str> = module.split(self_mint.as_str()).collect();
+        assert_eq!(mints.len(), 3, "the module's {self_mint}..) count changed");
+        assert!(
+            mints[0].contains("pub(super) fn of_complete_set(set: &ResumePointSet) -> Self"),
+            "the first mint is no longer the complete-scan mint"
+        );
+        let inherent_prefix = mints[0]
+            .rsplit_once(format!("impl {proof} {open}").as_str())
+            .expect("the inherent impl block")
+            .1;
+        assert!(
+            !inherent_prefix.contains("#[cfg(test)]"),
+            "the production mint moved behind #[cfg(test)]"
+        );
+        assert!(
+            mints[1].contains("#[cfg(test)]"),
+            "the second mint left the #[cfg(test)] fixture"
+        );
+
+        // Every blanket surface guard is still declared. Deleting one is how a
+        // forgeable route returns without any other line changing.
+        for guard in [
+            "impl<T: Default> NoDefaultMint for T {}",
+            "impl<T: Clone> NoCloneMint for T {}",
+            "impl<T: From<BTreeSet<Uuid>>> NoBareSetMint for T {}",
+            "impl<T: From<Vec<Uuid>>> NoOwnedSetMint for T {}",
+            "impl<T: FromIterator<Uuid>> NoIteratorMint for T {}",
+            "impl<T: DeserializeOwned> NoDecodedMint for T {}",
+        ] {
+            assert!(module.contains(guard), "the surface guard {guard} is gone");
+        }
 
         // No other file in the packet's write set constructs or defaults one.
         let default_mint = format!("{proof}::default");

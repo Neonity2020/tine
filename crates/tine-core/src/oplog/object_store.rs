@@ -4379,6 +4379,11 @@ impl DurableEngineHistoryStore {
     /// the widest durable cut is two points and any pre-existing surplus
     /// converges on the next publication.
     ///
+    /// Step 1 is also the only place in this packet that deletes a durable
+    /// point *before* committing its replacement, so both of its cuts are named
+    /// in [`ResumePublishBoundary`] and driven by deterministic fault injection
+    /// rather than left to the doc claim above.
+    ///
     /// The publication is immutable-exact, so repeating the call with
     /// byte-identical bytes resumes and re-runs the prune, while divergent
     /// bytes at the same sequence fail closed as
@@ -4446,6 +4451,8 @@ impl DurableEngineHistoryStore {
                 prune_resume_points_below(&directory, latest)?;
             }
         }
+        #[cfg(test)]
+        inject_resume_publish_fault(ResumePublishBoundary::AfterPrePrune)?;
         publish_immutable_exact(
             &directory,
             &point.file_name(),
@@ -4453,6 +4460,8 @@ impl DurableEngineHistoryStore {
             "runtime resume point",
         )?;
         // ---- COMMIT POINT: the new resume point is durable. ----
+        #[cfg(test)]
+        inject_resume_publish_fault(ResumePublishBoundary::AfterCommit)?;
         prune_resume_points_below(&directory, point.resume_sequence)?;
         Ok(())
     }
@@ -4886,6 +4895,59 @@ impl DurableEngineHistoryStore {
             .map_err(|_| StoreError::MalformedHistoryIndex)? = Some(replacement);
         Ok(())
     }
+}
+
+/// Named durable boundaries of one resume-point publication, after the
+/// resume-point directory exists.
+///
+/// These are the two cuts [`DurableEngineHistoryStore::publish_resume_point`]
+/// can leave behind that no other test route can reach: the survey/publish
+/// primitives are callable directly, but the *pre-prune* is only ever executed
+/// from inside the publication, so a crash between it and the commit point —
+/// the only window in which this packet deletes a durable point *before*
+/// committing its replacement — is otherwise unobservable. Deterministic
+/// injection at each of them proves at least one fully valid point survives
+/// every cut.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ResumePublishBoundary {
+    /// After step 1's pre-prune, before the immutable commit point.
+    AfterPrePrune,
+    /// After the commit point, before step 3's prune.
+    AfterCommit,
+}
+
+#[cfg(test)]
+impl ResumePublishBoundary {
+    /// Every durable boundary of the publication, in publication order.
+    pub(crate) const ALL: [Self; 2] = [Self::AfterPrePrune, Self::AfterCommit];
+}
+
+#[cfg(test)]
+thread_local! {
+    /// One-shot publication fault. Thread-local and deterministic: no
+    /// process-global resource limit or signal is involved, so parallel tests
+    /// in other threads are unaffected.
+    static RESUME_PUBLISH_FAULT: std::cell::Cell<Option<ResumePublishBoundary>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_resume_publication_at(boundary: ResumePublishBoundary) {
+    RESUME_PUBLISH_FAULT.with(|fault| fault.set(Some(boundary)));
+}
+
+#[cfg(test)]
+fn inject_resume_publish_fault(boundary: ResumePublishBoundary) -> Result<(), StoreError> {
+    RESUME_PUBLISH_FAULT.with(|fault| {
+        if fault.get() == Some(boundary) {
+            fault.set(None);
+            return Err(StoreError::Io(std::io::Error::other(format!(
+                "injected resume-point publication failure at {boundary:?}"
+            ))));
+        }
+        Ok(())
+    })
 }
 
 fn validate_engine_history_root(
@@ -10187,6 +10249,104 @@ mod resume_point_store_tests {
             assert_eq!(set.reachable_runs().len(), 1);
         }
         assert_eq!(history.clear_resume_points().unwrap().removed, 1);
+    }
+
+    /// A fault at **every** durable boundary of one publication leaves at least
+    /// one fully valid point, keeps the retained run provably reachable, and
+    /// lets the restart converge.
+    ///
+    /// The starting shape is the valid two-point crash cut `{n, n+1}` on
+    /// purpose: it is the widest set a publication may leave, and the only
+    /// shape in which step 1's pre-prune actually deletes anything. That
+    /// pre-prune is this packet's sole deletion *before* a commit point, and
+    /// its whole safety argument rests on its watermark being the durable
+    /// `latest` rather than the successor being published. Nothing else in the
+    /// suite can observe that: at a retry the two watermarks are numerically
+    /// identical, and the mid-call cut is unreachable from any black-box call
+    /// sequence. Hence the named boundaries.
+    #[test]
+    fn a_fault_at_every_publication_boundary_leaves_a_valid_durable_point() {
+        for boundary in ResumePublishBoundary::ALL {
+            let fixture = PromotedHistoryFixture::new("publication-boundary");
+            let history = fixture.history();
+            let run = Uuid::from_u128(0x8601);
+            history
+                .publish_resume_point(&fixture.point(1, 0x8601))
+                .unwrap();
+            cut_before_prune(&fixture, &fixture.point(2, 0x8601));
+            assert_eq!(
+                fixture.snapshot().len(),
+                2,
+                "boundary {boundary:?}: the starting cut must hold both points"
+            );
+
+            // The restart is a takeover — different session, later enrollment
+            // generation — so no byte-identical retry is available to it and
+            // the publication really has to run the pre-prune.
+            let takeover = |sequence: u64| {
+                let mut point = fixture.point(sequence, 0x8601);
+                point.enrollment_generation = 5;
+                point.unsafe_session_id = SessionId::from_uuid(Uuid::from_u128(0x8501));
+                point
+            };
+
+            fail_next_resume_publication_at(boundary);
+            let error = history.publish_resume_point(&takeover(3)).unwrap_err();
+            assert!(
+                error.to_string().contains(&format!("{boundary:?}")),
+                "boundary {boundary:?} produced an unrelated error: {error}"
+            );
+
+            // Independently of the store: every surviving file decodes as a
+            // sealed point bound to its own name, and at least one exists.
+            let cut = fixture.snapshot();
+            assert!(
+                !cut.is_empty(),
+                "boundary {boundary:?}: the cut has zero durable files"
+            );
+            let durable: Vec<RuntimeResumePointV1> = cut
+                .iter()
+                .map(|(name, bytes)| {
+                    let point = RuntimeResumePointV1::decode(bytes).unwrap_or_else(|error| {
+                        panic!("boundary {boundary:?}: {name} is not a valid point: {error}")
+                    });
+                    assert_eq!(
+                        &point.file_name(),
+                        name,
+                        "boundary {boundary:?}: {name} is not bound to its payload"
+                    );
+                    point
+                })
+                .collect();
+
+            // Authority remains valid: the strict proof still mints, so the
+            // retained run is still provably reachable and unreclaimable.
+            let set = history.read_resume_point_set().unwrap();
+            assert_eq!(
+                set.points(),
+                durable.as_slice(),
+                "boundary {boundary:?}: the store and the raw bytes disagree"
+            );
+            assert!(
+                set.reachable_runs().contains(run),
+                "boundary {boundary:?} lost the retained run's reachability"
+            );
+
+            // Restart/retry converges to exactly one point, and the drain is
+            // still available afterwards.
+            let resumed = takeover(set.next_sequence().unwrap());
+            history.publish_resume_point(&resumed).unwrap();
+            assert_eq!(
+                fixture.snapshot().keys().cloned().collect::<Vec<_>>(),
+                vec![resumed.file_name()],
+                "boundary {boundary:?} did not converge on restart"
+            );
+            let converged = history.read_resume_point_set().unwrap();
+            assert_eq!(converged.points(), &[resumed]);
+            assert!(converged.reachable_runs().contains(run));
+            assert_eq!(history.clear_resume_points().unwrap().removed, 1);
+            assert!(history.read_resume_point_set().unwrap().points().is_empty());
+        }
     }
 
     /// A directory an older build already bricked — three recognized canonical
