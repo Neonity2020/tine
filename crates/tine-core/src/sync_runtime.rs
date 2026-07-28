@@ -36,7 +36,7 @@ use crate::oplog::exact_external_feed::{
 use crate::oplog::hot_engine::ProjectionEndpointBinding;
 use crate::oplog::local_active::{
     reopen_promoted_local_runtime_existing_projection,
-    take_over_promoted_local_runtime_existing_projection, LocalActiveAuthority,
+    take_over_promoted_local_runtime_recovering_projection, LocalActiveAuthority,
     PromotedLocalRuntime, PromotedRuntimeOpen, RuntimeRecoveryState,
 };
 use crate::oplog::projection_store::ProjectionReceiptStore;
@@ -688,7 +688,7 @@ impl RuntimeActor {
                 &open,
             ),
             EnrollmentDiscoveryHandoff::Unsafe { .. } => {
-                take_over_promoted_local_runtime_existing_projection(
+                take_over_promoted_local_runtime_recovering_projection(
                     &enrollment_root,
                     &advisory.binding,
                     session_id,

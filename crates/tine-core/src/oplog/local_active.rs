@@ -3886,9 +3886,9 @@ pub(crate) fn take_over_promoted_local_runtime(
     )
 }
 
-/// Runtime-host crash takeover with the identical archive-lease proof and an
-/// existing-only device-local projection open.
-pub(crate) fn take_over_promoted_local_runtime_existing_projection(
+/// Runtime-host crash takeover with the identical archive-lease proof and
+/// forensic-preserving recovery of its disposable device-local projection.
+pub(crate) fn take_over_promoted_local_runtime_recovering_projection(
     root: &EnrollmentApplicationRoot,
     binding: &EnrollmentBindingV1,
     session_id: SessionId,
@@ -3901,7 +3901,7 @@ pub(crate) fn take_over_promoted_local_runtime_existing_projection(
         open,
         HandoffAdoption::CrashTakeover,
         TakeoverPublication::Durable,
-        PromotedProjectionOpen::ExistingOnly,
+        PromotedProjectionOpen::AllowRebuild,
     )
 }
 
