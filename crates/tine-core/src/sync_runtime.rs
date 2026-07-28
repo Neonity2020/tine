@@ -1207,6 +1207,70 @@ mod tests {
         );
     }
 
+    /// An ordinary external editor must be able to create a page and then
+    /// repeatedly change existing blocks while appending new blocks.
+    #[test]
+    fn ordinary_external_edit_settles_its_epoch_and_still_reaches_a_safe_handoff() {
+        let fixture = RuntimeHostFixture::safe("sync-runtime-external-edit-success");
+        let handle = active_handle(SyncRuntimeHandle::open(fixture.request()));
+        drive_initial_feed(&handle);
+
+        let path = "content/nested pages/Alpha.md";
+        let file = fixture.graph_root().join(path);
+        let observe = || {
+            handle
+                .observe_watcher(vec![SyncWatcherObservation::managed_path(path).unwrap()])
+                .unwrap();
+        };
+
+        fs::write(&file, b"- line 0 rev 0\n").unwrap();
+        observe();
+        let created = settle_exact_feed(&handle)
+            .unwrap_or_else(|stuck| panic!("external page creation did not settle: {stuck:?}"));
+        assert!(
+            matches!(
+                created,
+                SyncRuntimeTick::AdmittedNoop { .. } | SyncRuntimeTick::AdmittedComplete { .. }
+            ),
+            "external page creation must be admitted: {created:?}"
+        );
+
+        for revision in 1..=3 {
+            let body = (0..=revision)
+                .map(|line| format!("- line {line} rev {revision}\n"))
+                .collect::<String>();
+            fs::write(&file, body.as_bytes()).unwrap();
+            observe();
+            let edited = settle_exact_feed(&handle).unwrap_or_else(|stuck| {
+                panic!(
+                    "external save {revision}, which retypes the existing bullets and appends \
+                     one more, never settles its watcher epoch; the actor keeps returning \
+                     {stuck:?} with status {:?}",
+                    handle.status().unwrap()
+                )
+            });
+            assert!(
+                matches!(
+                    edited,
+                    SyncRuntimeTick::AdmittedNoop { .. } | SyncRuntimeTick::AdmittedComplete { .. }
+                ),
+                "external save {revision} must be admitted: {edited:?}"
+            );
+        }
+
+        let outcome = handle.clean_shutdown().unwrap_or_else(|error| {
+            panic!("clean shutdown after an ordinary external edit was refused: {error}")
+        });
+        assert!(
+            matches!(outcome, SyncShutdownOutcome::Safe(_)),
+            "clean shutdown after an ordinary external edit must publish Safe: {outcome:?}"
+        );
+        assert!(
+            matches!(fixture.handoff(), EnrollmentDiscoveryHandoff::Safe),
+            "a refused drain must not strand the durable handoff Unsafe"
+        );
+    }
+
     #[test]
     fn existing_safe_opens_one_owner_and_duplicate_or_foreign_binding_gets_no_authority() {
         let fixture = RuntimeHostFixture::safe("sync-runtime-safe-owner");
