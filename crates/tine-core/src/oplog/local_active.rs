@@ -3332,13 +3332,12 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
 /// owned together with the archive-rooted workspace runtime lease that
 /// authorized opening it.
 ///
-/// This is the crate's inactive-bootstrap open. Every other way of opening that
-/// database — [`SqliteFrontier::open_or_rebuild_inactive_bootstrap`] — is the
-/// compatibility entry point, which takes a *temporary* workspace lease of its
-/// own and releases it when the projection drops; the remaining callers of that
-/// entry point are SQLite-level tests that never promote. An activation must
-/// not use it, because the bootstrap database and the promoted database it
-/// becomes have to be authorized by one continuously-held archive lock:
+/// This is the crate's *only* inactive-bootstrap open. The other shape —
+/// `SqliteFrontier::open_or_rebuild_inactive_bootstrap`, which takes a
+/// *temporary* workspace lease of its own and releases it when the projection
+/// drops — is now `#[cfg(test)]`, so an activation cannot use it even by
+/// mistake. That gate matters: the bootstrap database and the promoted database
+/// it becomes have to be authorized by one continuously-held archive lock, and
 /// releasing between them is exactly the window in which another process, under
 /// any XDG/HOME/Flatpak root, could take the archive after the promotion state
 /// has already been published.

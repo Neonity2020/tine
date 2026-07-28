@@ -2261,9 +2261,21 @@ impl SqliteFrontier {
         Ok(())
     }
 
-    /// Compatibility entry point: acquires a temporary
-    /// [`WorkspaceRuntimeLease`] internally and keeps it inside the returned
-    /// projection, so current callers and behavior are unchanged.
+    /// Test-only entry point: acquires a temporary [`WorkspaceRuntimeLease`]
+    /// internally and keeps it inside the returned projection.
+    ///
+    /// It is `#[cfg(test)]` deliberately, and the gate is load bearing rather
+    /// than tidy-up. This shape releases the workspace lock when the projection
+    /// drops, so an activation that used it would have to release and reacquire
+    /// the archive across the bootstrap -> promoted database handoff — exactly
+    /// the window `local_active::InactiveBootstrapRuntimeSession` exists to make
+    /// inexpressible. Its non-test call census is zero (every caller is inside
+    /// `import`'s and `shadow_projection`'s `#[cfg(test)] mod tests`, and none
+    /// promotes), so the gate turns "do not call this from activation code" from
+    /// a convention into a compile error. Production activation wiring must use
+    /// [`Self::open_or_rebuild_inactive_bootstrap_with_applier_slot`] through
+    /// `InactiveBootstrapRuntimeSession`.
+    #[cfg(test)]
     pub(crate) fn open_or_rebuild_inactive_bootstrap(
         path: &Path,
         application_runtime_root: &ApplicationRuntimeRoot,
@@ -6340,7 +6352,7 @@ mod applier_lease {
             // identity check: a replacement that reached the lease file may
             // equally have replaced a directory above it, so the next attempt
             // re-resolves every component from the retained archive capability.
-            for attempt in 0..WORKSPACE_LEASE_IDENTITY_ATTEMPTS {
+            for _ in 0..WORKSPACE_LEASE_IDENTITY_ATTEMPTS {
                 let lease_namespace = open_or_create_lease_directory(
                     &store_root,
                     OBJECT_STORE_LEASE_NAMESPACE,
@@ -6392,7 +6404,6 @@ mod applier_lease {
                 // Release the lock on the file that is no longer this pathname
                 // before trying again, so a bounded retry cannot self-contend.
                 drop(file);
-                let _ = attempt;
             }
             Err(ProjectionError::LeaseContended(lease_path))
         }
