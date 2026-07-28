@@ -4752,16 +4752,27 @@ impl Graph {
         Ok((semantic, format, graph_text_document_node_count(&document)?))
     }
 
-    /// Interpret one already-validated configured-root managed path exactly as
-    /// existing import and managed-inventory callers expect. This authority
-    /// input deliberately remains separate from the inert graph-wide decoder.
+    /// Interpret one already-validated managed path exactly as existing import
+    /// and managed-inventory callers expect.
+    ///
+    /// A path under a configured `pages/`/`journals/` root keeps the exact
+    /// configured-root interpretation this authority has always produced.
+    /// Ordinary graph text outside those roots is decoded from its file name
+    /// alone through the same graph-wide decoder `Graph::list_pages` already
+    /// uses, because that is what OG does: `logseq.common.graph/get-files`
+    /// walks the whole graph directory, `graph-parser.extract/get-page-name`
+    /// takes only the last path component, and
+    /// `graph-parser.block/convert-page-if-journal` decides journal-ness by
+    /// parsing that title as a date. The containing directory therefore never
+    /// chooses Page versus Journal, and the exact nested spelling is retained.
     pub(crate) fn managed_entry_for_managed_path(
         &self,
         path: &ManagedPath,
     ) -> Result<PageEntry, ReceiptError> {
-        let kind = match self.classify_managed_text_path(path)? {
-            ManagedTextKind::Page => PageKind::Page,
-            ManagedTextKind::Journal => PageKind::Journal,
+        let kind = match self.classify_managed_text_path(path) {
+            Ok(ManagedTextKind::Page) => PageKind::Page,
+            Ok(ManagedTextKind::Journal) => PageKind::Journal,
+            Err(outside) => return self.unmanaged_graph_text_entry(path, outside),
         };
         let filename = path.file_name();
         let stem = filename
@@ -4782,6 +4793,36 @@ impl Graph {
             date_key,
             rel_path: path.as_str().to_owned(),
             path: self.root.join(path.as_str()),
+        })
+    }
+
+    /// OG-compatible decode for supported graph text that no configured root
+    /// owns. Containers OG itself skips, hidden paths, provider conflict copies
+    /// and spellings the guarded sparse writer cannot address keep the original
+    /// configured-root rejection instead of gaining new authority here.
+    fn unmanaged_graph_text_entry(
+        &self,
+        path: &ManagedPath,
+        outside: ReceiptError,
+    ) -> Result<PageEntry, ReceiptError> {
+        if !matches!(path.extension(), "md" | "org")
+            || !self.graph_text_scope.is_eligible(path.as_str())
+        {
+            return Err(outside);
+        }
+        self.graph_entry_for_relative_path(path.as_str())
+            .map_err(|_| ReceiptError::UnsafeManagedPath(path.as_str().to_owned()))
+    }
+
+    /// Managed text kind for one exact path, under the same OG-compatible
+    /// loading semantics that decode its entry.
+    pub(crate) fn managed_text_kind_for_managed_path(
+        &self,
+        path: &ManagedPath,
+    ) -> Result<ManagedTextKind, ReceiptError> {
+        Ok(match self.managed_entry_for_managed_path(path)?.kind {
+            PageKind::Page => ManagedTextKind::Page,
+            PageKind::Journal => ManagedTextKind::Journal,
         })
     }
 
@@ -5739,8 +5780,11 @@ impl Graph {
 
     /// Configured managed roots visible to the sparse importer.
     ///
-    /// The first sparse receipt schema names only `pages/` and `journals/`.
-    /// Import rejects any other layout instead of reinterpreting its paths.
+    /// These roots decide Page versus Journal for the paths they own and are
+    /// where a page with no file yet is created. They are not the boundary of
+    /// what the importer accepts: ordinary graph text elsewhere in the graph is
+    /// decoded by `managed_entry_for_managed_path` from its file name, exactly
+    /// as OG's whole-directory walk does.
     pub(crate) fn raw_managed_text_layout(&self) -> (&str, &str) {
         (&self.config.pages_dir, &self.config.journals_dir)
     }
@@ -9089,15 +9133,28 @@ impl Graph {
                 .then_some(root_components.len())
             })
             .max();
-        if components.len() < 2
-            || components
-                .iter()
-                .any(|component| !projection_component_is_portable(component))
-            || configured_root_len.is_none()
+        if components
+            .iter()
+            .any(|component| !projection_component_is_portable(component))
         {
             return Err(bad_path());
         }
-        let filename = components.last().expect("checked component count");
+        // A configured root keeps its existing acceptance verbatim. Ordinary
+        // graph text that no configured root owns is addressable too, because
+        // OG reads and rewrites a page wherever it already lives: its recursive
+        // `logseq.common.graph/get-files` walk has no root restriction, and
+        // `frontend.modules.file.core/save-tree-aux!` writes back to the exact
+        // recorded `:file/path` (only a page with no file at all gets a fresh
+        // path under a configured directory). The graph-text scope supplies the
+        // containers OG itself skips, so nothing here may address `assets/`,
+        // `logseq/bak/`, hidden directories or other excluded state.
+        let within_configured_root = components.len() >= 2 && configured_root_len.is_some();
+        if !within_configured_root && !self.graph_text_scope.is_eligible(relative_path) {
+            return Err(bad_path());
+        }
+        let filename = components
+            .last()
+            .expect("nonempty split has a last element");
         let (stem, extension) = filename.rsplit_once('.').ok_or_else(bad_path)?;
         if stem.is_empty() || !matches!(extension, "md" | "org") {
             return Err(bad_path());
@@ -32632,16 +32689,27 @@ mod tests {
     }
 
     #[test]
-    fn root_projection_admission_returns_an_error_without_panicking() {
+    fn root_projection_admission_writes_the_exact_root_path_without_panicking() {
         let dir = scratch("projection-root-admission");
         let graph = Graph::open(&dir);
 
-        let error = graph
+        // OG's recursive `get-files` walk starts at the graph root itself, so a
+        // graph-root page is ordinary graph text. Its projection target has no
+        // parent components at all; admitting it must neither panic nor move it
+        // into `pages/`.
+        let projected = graph
             .write_projection_exact("Root.md", None, b"- target\n")
-            .unwrap_err();
+            .unwrap();
+        assert_eq!(projected.path(), "Root.md");
+        assert_eq!(fs::read(dir.join("Root.md")).unwrap(), b"- target\n");
+        assert!(!dir.join("pages/Root.md").exists());
 
+        // A root-level name outside the graph-text scope still fails closed.
+        let error = graph
+            .write_projection_exact(".Hidden.md", None, b"- target\n")
+            .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-        assert!(!dir.join("Root.md").exists());
+        assert!(!dir.join(".Hidden.md").exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -33076,12 +33144,34 @@ mod tests {
             fs::read(dir.join("archive/journals/2026/07/23.org")).unwrap(),
             b"* nested journal\n"
         );
-        assert!(graph
-            .write_projection_exact("archive/pagesish/Wrong.md", None, b"- wrong\n")
-            .is_err());
-        assert!(graph
-            .write_projection_exact("pages/Wrong.md", None, b"- wrong\n")
-            .is_err());
+        // No configured root owns these, but OG walks the whole graph directory
+        // and rewrites a page wherever it already lives, so they are ordinary
+        // graph text addressed at their exact spelling — never relocated under
+        // `archive/pages`.
+        for outside in ["archive/pagesish/Sibling.md", "pages/Default named.md"] {
+            let projected = graph
+                .write_projection_exact(outside, None, b"- outside\n")
+                .unwrap();
+            assert_eq!(projected.path(), outside);
+            assert_eq!(fs::read(dir.join(outside)).unwrap(), b"- outside\n");
+        }
+        assert!(!dir.join("archive/pages/Sibling.md").exists());
+        assert!(!dir.join("archive/pages/Default named.md").exists());
+
+        // Containers outside the graph-text scope stay unaddressable.
+        for refused in [
+            "assets/Wrong.md",
+            "logseq/bak/pages/Wrong.md",
+            ".hidden/Wrong.md",
+        ] {
+            assert!(
+                graph
+                    .write_projection_exact(refused, None, b"- wrong\n")
+                    .is_err(),
+                "accepted {refused}"
+            );
+            assert!(!dir.join(refused).exists());
+        }
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -33325,6 +33415,73 @@ mod tests {
     }
 
     #[test]
+    fn managed_entry_decoder_uses_og_filename_semantics_outside_configured_roots() {
+        let root = scratch("managed-entry-nonstandard-layout");
+        fs::create_dir_all(root.join("logseq")).unwrap();
+        fs::write(
+            root.join("logseq/config.edn"),
+            "{:journal/file-name-format \"dd-MM-yyyy\"\n\
+              :journal/page-title-format \"yyyy-MM-dd\"}\n",
+        )
+        .unwrap();
+        let graph = Graph::open(&root);
+
+        // OG walks the whole graph directory and derives the page title from the
+        // last path component only, so a nested page outside the configured
+        // roots keeps its exact nested spelling and its file-name title.
+        let nested = ManagedPath::parse("archive/2024/client notes/Ünicode Page.md").unwrap();
+        let entry = graph.managed_entry_for_managed_path(&nested).unwrap();
+        assert_eq!(entry.kind, PageKind::Page);
+        assert_eq!(entry.name, "Ünicode Page");
+        assert_eq!(entry.date_key, None);
+        assert_eq!(entry.rel_path, "archive/2024/client notes/Ünicode Page.md");
+        assert_eq!(
+            entry.path,
+            root.join("archive/2024/client notes/Ünicode Page.md")
+        );
+
+        // OG decides journal-ness by parsing that title as a date, never by the
+        // containing directory.
+        let journal = ManagedPath::parse("archive/2024/25-07-2026.org").unwrap();
+        let entry = graph.managed_entry_for_managed_path(&journal).unwrap();
+        assert_eq!(entry.kind, PageKind::Journal);
+        assert_eq!(entry.name, "2026-07-25");
+        assert!(entry.date_key.is_some());
+        assert_eq!(entry.rel_path, "archive/2024/25-07-2026.org");
+
+        // A graph-root file is equally ordinary graph text for OG.
+        let top = ManagedPath::parse("Top Level.md").unwrap();
+        let entry = graph.managed_entry_for_managed_path(&top).unwrap();
+        assert_eq!(entry.kind, PageKind::Page);
+        assert_eq!(entry.name, "Top Level");
+
+        // Containers OG itself ignores, hidden paths, provider conflict copies,
+        // and spellings the guarded sparse writer cannot project stay refused.
+        for refused in [
+            "assets/note.md",
+            "publish/note.md",
+            ".tine-sync/note.md",
+            "logseq/bak/pages/note.md",
+            "logseq/version-files/note.md",
+            "node_modules/pkg/readme.md",
+            ".hidden/note.md",
+            "archive/.hidden/note.md",
+            "archive/note.sync-conflict-20260726-120000-ABCDEFG.md",
+            "archive/note.markdown",
+            "archive/note.MD",
+        ] {
+            assert!(
+                graph
+                    .managed_entry_for_managed_path(&ManagedPath::parse(refused).unwrap())
+                    .is_err(),
+                "accepted {refused}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn admission_snapshot_excludes_reserved_paths_and_poisoned_builds_have_no_authority() {
         let root = scratch("admission-exclusions");
         fs::create_dir_all(root.join("logseq")).unwrap();
@@ -33532,6 +33689,70 @@ mod tests {
         assert!(graph
             .projection_page_target("archive/client/Plan.Markdown")
             .is_err());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn projection_target_accepts_supported_graph_text_outside_configured_roots() {
+        let root = scratch("projection-target-nonstandard-layout");
+        let graph = Graph::open(&root);
+
+        // OG reads and rewrites ordinary graph text wherever it already lives,
+        // so the guarded writer must address the exact nested spelling instead
+        // of refusing it or relocating it into a configured root.
+        let nested = graph
+            .projection_page_target("archive/2024/client notes/Ünicode Page.md")
+            .unwrap();
+        assert_eq!(
+            nested.relative_path,
+            "archive/2024/client notes/Ünicode Page.md"
+        );
+        assert_eq!(
+            nested.parent_components,
+            ["archive", "2024", "client notes"]
+        );
+        assert_eq!(nested.filename, "Ünicode Page.md");
+        assert_eq!(nested.twin_filename, "Ünicode Page.org");
+        assert_eq!(
+            nested.absolute_path,
+            root.join("archive/2024/client notes/Ünicode Page.md")
+        );
+
+        let top = graph.projection_page_target("Top Level.org").unwrap();
+        assert!(top.parent_components.is_empty());
+        assert_eq!(top.filename, "Top Level.org");
+        assert_eq!(top.twin_filename, "Top Level.md");
+
+        // Configured roots keep working exactly as before.
+        assert!(graph.projection_page_target("pages/Plain.md").is_ok());
+        assert!(graph
+            .projection_page_target("journals/2026_07_25.md")
+            .is_ok());
+
+        // Containers outside the graph-text scope, traversals and unsupported
+        // spellings stay refused.
+        for refused in [
+            "assets/note.md",
+            "publish/note.md",
+            ".tine-sync/note.md",
+            "logseq/.recycle/note.md",
+            "logseq/bak/pages/note.md",
+            "logseq/.tine-trash/note.md",
+            "node_modules/pkg/readme.md",
+            ".hidden/note.md",
+            "archive/.hidden/note.md",
+            "archive/note.sync-conflict-20260726-120000-ABCDEFG.md",
+            "archive/../escape.md",
+            "archive/note.markdown",
+            "archive/note.MD",
+            "archive/.md",
+        ] {
+            assert!(
+                graph.projection_page_target(refused).is_err(),
+                "accepted {refused}"
+            );
+        }
 
         let _ = fs::remove_dir_all(&root);
     }

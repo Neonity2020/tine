@@ -57,7 +57,11 @@ pub(crate) enum ReconciliationImportEvidenceKind {
     UnsupportedMarkdown,
     MixedCaseExtension,
     UnsupportedExtension,
-    OutsideConfiguredRoots,
+    /// The path is not ordinary graph text this graph can load: it names a
+    /// container OG itself skips, a hidden path, or a spelling the guarded
+    /// writer cannot address. Merely living outside the configured
+    /// `pages/`/`journals/` roots is not by itself a reason to block.
+    UndecodableGraphTextPath,
     ExpectedKindChanged,
 }
 
@@ -177,9 +181,8 @@ impl ReconciliationImportAuthority for LiveReconciliationImportAuthority<'_, '_>
 
     fn managed_kind(&self, path: &ManagedPath) -> Result<ManagedTextKind, ()> {
         self.graph
-            .managed_entry_for_managed_path(path)
-            .map_err(|_| ())?;
-        self.graph.classify_managed_text_path(path).map_err(|_| ())
+            .managed_text_kind_for_managed_path(path)
+            .map_err(|_| ())
     }
 }
 
@@ -271,7 +274,7 @@ fn validate_candidate<A: ReconciliationImportAuthority>(
     }
     let Ok(current_kind) = authority.managed_kind(&candidate.path) else {
         evidence.push(
-            ReconciliationImportEvidenceKind::OutsideConfiguredRoots,
+            ReconciliationImportEvidenceKind::UndecodableGraphTextPath,
             candidate.path.as_str(),
         );
         return;
@@ -667,9 +670,8 @@ mod tests {
 
         fn managed_kind(&self, path: &ManagedPath) -> Result<ManagedTextKind, ()> {
             self.graph
-                .managed_entry_for_managed_path(path)
-                .map_err(|_| ())?;
-            self.graph.classify_managed_text_path(path).map_err(|_| ())
+                .managed_text_kind_for_managed_path(path)
+                .map_err(|_| ())
         }
     }
 
@@ -904,6 +906,158 @@ mod tests {
                 "managed/text/projects/client/plan.md",
             ]
         );
+    }
+
+    #[test]
+    fn reconciliation_import_accepts_supported_paths_outside_configured_roots() {
+        let temp = TempGraph::new(Some(
+            "{:journal/file-name-format \"dd-MM-yyyy\"\n\
+              :journal/page-title-format \"yyyy-MM-dd\"}\n",
+        ));
+        let graph = Graph::open(temp.path());
+        let binding = binding(Some(&graph));
+        // OG discovers ordinary graph text by walking the whole graph directory,
+        // so an existing nested page outside `pages/`/`journals/` must reach the
+        // coordinator with its exact spelling instead of blocking the epoch.
+        let candidates = vec![
+            candidate(
+                "Top Level.md",
+                GraphTextCandidateKind::Creation,
+                None,
+                &binding,
+            ),
+            // OG parses the file-name title as a date to decide journal-ness,
+            // so the retained kind for a date-named non-journal-root file is
+            // Journal and an unchanged expected row must not look changed.
+            candidate(
+                "archive/2024/25-07-2026.org",
+                GraphTextCandidateKind::Edit,
+                Some(ManagedTextKind::Journal),
+                &binding,
+            ),
+            candidate(
+                "archive/2024/client notes/Ünicode Page.md",
+                GraphTextCandidateKind::Edit,
+                Some(ManagedTextKind::Page),
+                &binding,
+            ),
+        ];
+        let scan = scan(binding.clone(), candidates, Vec::new());
+        let authority = GraphFixtureAuthority {
+            graph: &graph,
+            binding,
+        };
+        let mut coordinator = CountingCoordinator::new(FakeDisposition::Noop);
+
+        let outcome = execute_fixture(
+            &scan,
+            &authority,
+            &mut coordinator,
+            PreparationLimits::default(),
+        )
+        .unwrap();
+
+        assert!(matches!(outcome, CoordinatorHandoff::Noop));
+        assert_eq!(coordinator.calls, 1);
+        assert_eq!(
+            coordinator.received[0],
+            vec![
+                "Top Level.md",
+                "archive/2024/25-07-2026.org",
+                "archive/2024/client notes/Ünicode Page.md",
+            ]
+        );
+    }
+
+    #[test]
+    fn reconciliation_import_still_blocks_excluded_and_unsupported_nonstandard_paths() {
+        let temp = TempGraph::new(None);
+        let graph = Graph::open(temp.path());
+        let binding = binding(Some(&graph));
+        let candidates = vec![
+            candidate(
+                "archive/note.MD",
+                GraphTextCandidateKind::Creation,
+                None,
+                &binding,
+            ),
+            candidate(
+                "archive/note.markdown",
+                GraphTextCandidateKind::Creation,
+                None,
+                &binding,
+            ),
+            candidate(
+                "assets/note.md",
+                GraphTextCandidateKind::Creation,
+                None,
+                &binding,
+            ),
+            candidate(
+                "logseq/bak/pages/note.md",
+                GraphTextCandidateKind::Creation,
+                None,
+                &binding,
+            ),
+            candidate(
+                "node_modules/pkg/readme.md",
+                GraphTextCandidateKind::Creation,
+                None,
+                &binding,
+            ),
+        ];
+        let scan = scan(binding.clone(), candidates, Vec::new());
+        let authority = GraphFixtureAuthority {
+            graph: &graph,
+            binding,
+        };
+        let mut coordinator = CountingCoordinator::new(FakeDisposition::Noop);
+
+        let failure = execute_fixture(
+            &scan,
+            &authority,
+            &mut coordinator,
+            PreparationLimits::default(),
+        )
+        .expect_err("excluded and unsupported nonstandard paths must block");
+
+        let PreparationFailure::Blocked(blocked) = failure else {
+            panic!("excluded evidence should be blocked");
+        };
+        assert_eq!(
+            blocked.reason,
+            ReconciliationImportBlockReason::UnsupportedDiscovery
+        );
+        assert_eq!(
+            blocked
+                .evidence
+                .iter()
+                .map(|evidence| (evidence.kind, evidence.path.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    ReconciliationImportEvidenceKind::MixedCaseExtension,
+                    "archive/note.MD"
+                ),
+                (
+                    ReconciliationImportEvidenceKind::UnsupportedMarkdown,
+                    "archive/note.markdown"
+                ),
+                (
+                    ReconciliationImportEvidenceKind::UndecodableGraphTextPath,
+                    "assets/note.md"
+                ),
+                (
+                    ReconciliationImportEvidenceKind::UndecodableGraphTextPath,
+                    "logseq/bak/pages/note.md"
+                ),
+                (
+                    ReconciliationImportEvidenceKind::UndecodableGraphTextPath,
+                    "node_modules/pkg/readme.md"
+                ),
+            ]
+        );
+        assert_eq!(coordinator.calls, 0);
     }
 
     #[test]

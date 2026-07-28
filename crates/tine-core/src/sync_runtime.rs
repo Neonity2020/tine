@@ -966,6 +966,7 @@ mod tests {
     use crate::oplog::enrollment::EnrollmentDiscoveryHandoff;
     use crate::oplog::exact_external_feed::tests::RuntimeHostFixture;
     use std::fs;
+    use std::path::Path;
     use uuid::Uuid;
 
     fn empty_request(profile: SyncStorageProfile) -> (PathBuf, SyncRuntimeOpenRequest) {
@@ -1650,5 +1651,227 @@ mod tests {
             b"- peer device copy\n",
             "the conflict copy itself must be preserved byte for byte"
         );
+    }
+
+    /// Every graph-relative regular file under `root`, sorted, for proving that
+    /// a configured root gained nothing while nonstandard paths were imported.
+    fn relative_files(root: &Path) -> Vec<String> {
+        fn walk(base: &Path, current: &Path, out: &mut Vec<String>) {
+            let Ok(entries) = fs::read_dir(current) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(base, &path, out);
+                } else {
+                    out.push(
+                        path.strip_prefix(base)
+                            .unwrap()
+                            .to_string_lossy()
+                            .replace('\\', "/"),
+                    );
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(root, root, &mut out);
+        out.sort();
+        out
+    }
+
+    /// An OG graph whose page files live outside the configured `pages/` and
+    /// `journals/` roots stays a live two-way Markdown bridge.
+    ///
+    /// OG discovers graph text by walking the whole graph directory
+    /// (`logseq.common.graph/get-files`), takes the page title from the last
+    /// path component only (`graph-parser.extract/get-page-name`), decides
+    /// journal-ness by parsing that title as a date
+    /// (`graph-parser.block/convert-page-if-journal`), and rewrites an existing
+    /// page at its exact recorded `:file/path`
+    /// (`frontend.modules.file.core/save-tree-aux!`). External create, edit,
+    /// rename and delete at such paths must therefore reconcile without
+    /// blocking the epoch and without moving anything into a configured root.
+    #[test]
+    fn external_changes_outside_configured_roots_reconcile_without_flattening() {
+        let fixture = RuntimeHostFixture::safe("sync-runtime-nonstandard-layout");
+        let graph_root = fixture.graph_root().to_path_buf();
+        // Neither directory is under the fixture's configured
+        // `content/nested pages` / `diary/日記` roots.
+        let nested = graph_root.join("archive/2026/client notes");
+        fs::create_dir_all(&nested).unwrap();
+        let page = "archive/2026/client notes/Ünicode outside.md";
+        let journal = "archive/2026/client notes/2026_07_04.md";
+        let renamed = "archive/2026/client notes/Ünicode renamed.md";
+        let configured_roots = [
+            graph_root.join("content/nested pages"),
+            graph_root.join("diary/日記"),
+        ];
+        let configured_before = configured_roots
+            .iter()
+            .map(|root| relative_files(root))
+            .collect::<Vec<_>>();
+
+        let handle = active_handle(SyncRuntimeHandle::open(fixture.request()));
+        drive_initial_feed(&handle);
+
+        // External create: an ordinary page plus a date-titled file that OG
+        // classifies as a journal even though it is nowhere near `journals/`.
+        let created = "- created by another editor\n".as_bytes();
+        let day = "- july fourth\n".as_bytes();
+        fs::write(graph_root.join(page), created).unwrap();
+        fs::write(graph_root.join(journal), day).unwrap();
+        let before = fixture.manifest_count();
+        handle
+            .observe_watcher(vec![
+                SyncWatcherObservation::managed_path(page).unwrap(),
+                SyncWatcherObservation::managed_path(journal).unwrap(),
+            ])
+            .unwrap();
+        let ticks = drain_until_settled(&handle);
+        assert!(
+            admitted_an_epoch(&ticks),
+            "an external create outside the configured roots must reconcile, \
+             but the drain produced {ticks:?}"
+        );
+        assert!(
+            fixture.manifest_count() > before,
+            "the external create produced no durable batch"
+        );
+        assert_eq!(fs::read(graph_root.join(page)).unwrap(), created);
+        assert_eq!(fs::read(graph_root.join(journal)).unwrap(), day);
+
+        // External edit of the nested page.
+        let edited = "- edited by another editor\n".as_bytes();
+        fs::write(graph_root.join(page), edited).unwrap();
+        let before = fixture.manifest_count();
+        handle
+            .observe_watcher(vec![SyncWatcherObservation::managed_path(page).unwrap()])
+            .unwrap();
+        let ticks = drain_until_settled(&handle);
+        assert!(
+            admitted_an_epoch(&ticks),
+            "an external edit outside the configured roots must reconcile, \
+             but the drain produced {ticks:?}"
+        );
+        assert!(fixture.manifest_count() > before);
+        assert_eq!(fs::read(graph_root.join(page)).unwrap(), edited);
+
+        // External rename inside the same nonstandard directory, exactly as OG
+        // renames a page (`compute-new-file-path` keeps the parent components).
+        fs::rename(graph_root.join(page), graph_root.join(renamed)).unwrap();
+        let before = fixture.manifest_count();
+        handle
+            .observe_watcher(vec![
+                SyncWatcherObservation::managed_path(page).unwrap(),
+                SyncWatcherObservation::managed_path(renamed).unwrap(),
+            ])
+            .unwrap();
+        let ticks = drain_until_settled(&handle);
+        assert!(
+            admitted_an_epoch(&ticks),
+            "an external rename outside the configured roots must reconcile, \
+             but the drain produced {ticks:?}"
+        );
+        assert!(fixture.manifest_count() > before);
+        assert!(!graph_root.join(page).exists());
+        assert_eq!(fs::read(graph_root.join(renamed)).unwrap(), edited);
+
+        let shutdown = handle.clean_shutdown();
+        assert!(
+            matches!(shutdown, Ok(SyncShutdownOutcome::Safe(_))),
+            "nonstandard graph text must not make clean Safe handoff unreachable, \
+             but shutdown returned {shutdown:?}"
+        );
+        assert!(matches!(
+            fixture.handoff(),
+            EnrollmentDiscoveryHandoff::Safe
+        ));
+
+        // Nothing was flattened or copied into a configured root, and both
+        // surviving files still sit at their exact nested spelling.
+        for (root, expected) in configured_roots.iter().zip(&configured_before) {
+            assert_eq!(
+                &relative_files(root),
+                expected,
+                "a configured root changed while only nonstandard paths were edited"
+            );
+        }
+        assert_eq!(
+            relative_files(&nested),
+            vec!["2026_07_04.md".to_owned(), "Ünicode renamed.md".to_owned()]
+        );
+    }
+
+    /// The other destructive half of the same bridge: an external delete at a
+    /// nonstandard path.
+    ///
+    /// This runs on its own runtime because an absence import whose affected
+    /// frontier was already advanced by another page's rename or deletion
+    /// blocks on `ConflictingLocalTail`. That wedge is layout-independent — the
+    /// identical sequence inside `content/nested pages` / `diary/日記` blocks
+    /// the same way — so it is deliberately not entangled with this contract.
+    #[test]
+    fn external_deletes_outside_configured_roots_reconcile_without_flattening() {
+        let fixture = RuntimeHostFixture::safe("sync-runtime-nonstandard-delete");
+        let graph_root = fixture.graph_root().to_path_buf();
+        let nested = graph_root.join("archive/2026/client notes");
+        fs::create_dir_all(&nested).unwrap();
+        let page = "archive/2026/client notes/Ünicode outside.md";
+        let journal = "archive/2026/client notes/2026_07_04.md";
+        let configured_roots = [
+            graph_root.join("content/nested pages"),
+            graph_root.join("diary/日記"),
+        ];
+        let configured_before = configured_roots
+            .iter()
+            .map(|root| relative_files(root))
+            .collect::<Vec<_>>();
+
+        let handle = active_handle(SyncRuntimeHandle::open(fixture.request()));
+        drive_initial_feed(&handle);
+
+        fs::write(graph_root.join(page), b"- created by another editor\n").unwrap();
+        fs::write(graph_root.join(journal), b"- july fourth\n").unwrap();
+        handle
+            .observe_watcher(vec![
+                SyncWatcherObservation::managed_path(page).unwrap(),
+                SyncWatcherObservation::managed_path(journal).unwrap(),
+            ])
+            .unwrap();
+        let ticks = drain_until_settled(&handle);
+        assert!(admitted_an_epoch(&ticks), "create: {ticks:?}");
+
+        fs::remove_file(graph_root.join(page)).unwrap();
+        fs::remove_file(graph_root.join(journal)).unwrap();
+        let before = fixture.manifest_count();
+        handle
+            .observe_watcher(vec![
+                SyncWatcherObservation::managed_path(page).unwrap(),
+                SyncWatcherObservation::managed_path(journal).unwrap(),
+            ])
+            .unwrap();
+        let ticks = drain_until_settled(&handle);
+        assert!(
+            admitted_an_epoch(&ticks),
+            "an external delete outside the configured roots must reconcile, \
+             but the drain produced {ticks:?}"
+        );
+        assert!(fixture.manifest_count() > before);
+        assert!(relative_files(&nested).is_empty());
+
+        let shutdown = handle.clean_shutdown();
+        assert!(
+            matches!(shutdown, Ok(SyncShutdownOutcome::Safe(_))),
+            "an external delete outside the configured roots must not make clean \
+             Safe handoff unreachable, but shutdown returned {shutdown:?}"
+        );
+        for (root, expected) in configured_roots.iter().zip(&configured_before) {
+            assert_eq!(
+                &relative_files(root),
+                expected,
+                "a configured root changed while only nonstandard paths were deleted"
+            );
+        }
     }
 }

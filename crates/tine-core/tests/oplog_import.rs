@@ -901,7 +901,7 @@ fn completed_release_allows_exact_recreation_as_new_but_blocks_portable_neighbor
 }
 
 #[test]
-fn affected_scope_avoids_unrelated_entries_and_accepts_only_configured_roots() {
+fn affected_scope_avoids_unrelated_entries_and_accepts_supported_graph_text() {
     let custom = TestDir::new("custom-layout");
     fs::create_dir_all(custom.path().join("logseq")).unwrap();
     fs::write(
@@ -914,6 +914,10 @@ fn affected_scope_avoids_unrelated_entries_and_accepts_only_configured_roots() {
     write(custom.path(), affected_page, b"- affected page\n");
     write(custom.path(), affected_journal, b"- affected journal\n");
     write(custom.path(), "notes/unrelated.md", b"- unrelated\n");
+    // OG walks the whole graph directory, so this is ordinary graph text even
+    // though neither configured root owns it.
+    let outside = "archive/2026/outside.md";
+    write(custom.path(), outside, b"- outside\n");
     let graph = Graph::open(custom.path());
 
     let inventory = inventory_affected(&graph, &[affected_page, affected_journal]).unwrap();
@@ -943,7 +947,28 @@ fn affected_scope_avoids_unrelated_entries_and_accepts_only_configured_roots() {
         assert_eq!(kind, expected_kind, "configured path {path}");
     }
 
-    assert!(inventory_affected(&graph, &["pages/page.md"]).is_err());
+    // A supported path no configured root owns is inventoried at its exact
+    // spelling, and its kind comes from the file-name title exactly as OG's
+    // `convert-page-if-journal` decides it.
+    let nonstandard = inventory_affected(&graph, &[outside]).unwrap();
+    assert_eq!(
+        nonstandard
+            .entries()
+            .keys()
+            .map(ManagedPath::as_str)
+            .collect::<Vec<_>>(),
+        vec![outside]
+    );
+    assert_eq!(
+        graph
+            .entry_for_path(&custom.path().join(outside))
+            .unwrap()
+            .kind,
+        tine_core::PageKind::Page
+    );
+    // Containers OG itself skips remain unreadable evidence.
+    assert!(inventory_affected(&graph, &["assets/note.md"]).is_err());
+
     let initial = inventory_initial_shadow(&graph).unwrap();
     assert_eq!(
         initial
@@ -951,7 +976,12 @@ fn affected_scope_avoids_unrelated_entries_and_accepts_only_configured_roots() {
             .keys()
             .map(ManagedPath::as_str)
             .collect::<Vec<_>>(),
-        vec![affected_journal, affected_page, "notes/unrelated.md"]
+        vec![
+            outside,
+            affected_journal,
+            affected_page,
+            "notes/unrelated.md"
+        ]
     );
 }
 
