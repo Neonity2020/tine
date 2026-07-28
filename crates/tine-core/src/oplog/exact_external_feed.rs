@@ -567,10 +567,14 @@ impl ExactExternalFeedState {
     ) -> Result<(), ExactExternalFeedDrain> {
         match runtime.automatic_external_import() {
             ExternalImportAdmission::Allowed => Ok(()),
-            ExternalImportAdmission::Blocked(_) if self.recovery_catch_up_complete() => runtime
-                .complete_automatic_external_import_recovery(authority, graph)
-                .map_err(Self::recovery_completion_failed),
-            ExternalImportAdmission::Blocked(_) if self.recovery_catch_up_owed_or_in_progress() => {
+            ExternalImportAdmission::Blocked(_) if self.recovery_catch_up_complete(runtime) => {
+                runtime
+                    .complete_automatic_external_import_recovery(authority, graph)
+                    .map_err(Self::recovery_completion_failed)
+            }
+            ExternalImportAdmission::Blocked(_)
+                if self.recovery_catch_up_owed_or_in_progress(runtime) =>
+            {
                 Ok(())
             }
             ExternalImportAdmission::Blocked(reason) => {
@@ -579,17 +583,25 @@ impl ExactExternalFeedState {
         }
     }
 
-    fn recovery_catch_up_owed_or_in_progress(&self) -> bool {
-        !self.caught_up_published
-            && (self.initial_index_build_pending
-                || self
-                    .active
-                    .as_ref()
-                    .is_some_and(|active| matches!(active.scope, ActiveDrainScope::FullScan)))
+    fn recovery_catch_up_owed_or_in_progress(&self, runtime: &PromotedLocalRuntime) -> bool {
+        !self.recovery_catch_up_complete(runtime)
     }
 
-    fn recovery_catch_up_complete(&self) -> bool {
-        self.caught_up_published && !self.initial_index_build_pending && self.active.is_none()
+    fn recovery_catch_up_complete(&self, runtime: &PromotedLocalRuntime) -> bool {
+        let queue = runtime.watcher_status();
+        self.caught_up_published
+            && !self.initial_index_build_pending
+            && self.active.is_none()
+            // Caught-up publication is not recovery completion on its own: an
+            // after-terminal-before-ack failure leaves this held startup epoch
+            // owed even though publication succeeded.
+            && queue.acknowledged.sequence() >= self.watcher_queue_anchor.sequence()
+            // Do not open automatic import while any later watcher work is
+            // still retained, in flight, or deferred behind this actor turn.
+            && !queue.pending
+            && queue.drain_in_flight.is_none()
+            && !queue.deferred
+            && !queue.sequence_exhausted
     }
 
     fn recovery_completion_failed(error: RuntimePromotionError) -> ExactExternalFeedDrain {
@@ -2084,6 +2096,81 @@ pub(crate) mod tests {
             ExternalImportAdmission::Allowed
         );
         assert_eq!(owner.feed_sequence, 1);
+    }
+
+    #[test]
+    fn recovery_gate_stays_blocked_after_terminal_before_ack_until_retry_acknowledges() {
+        let mut fixture = configured_fixture("recovery-gate-before-ack");
+        let enrollment = fixture.enrollment_root("recovery-gate-before-ack");
+        let paths = PromotedPaths::new(&fixture, "recovery-gate-before-ack");
+        let (mut authority, mut runtime) =
+            promote(&mut fixture, &enrollment, SessionId::new(), &paths);
+        assert!(matches!(
+            runtime.automatic_external_import(),
+            ExternalImportAdmission::Blocked(_)
+        ));
+        let baseline = fixture.baseline(&fixture.graph, "recovery-gate-before-ack", false);
+        let mut owner =
+            ExactExternalFeedState::open(&fixture.graph, &fixture.receipts, &runtime, baseline)
+                .unwrap();
+        let startup_epoch = owner.watcher_queue_anchor;
+        let mut clock = 0;
+        EXACT_FEED_AFTER_TERMINAL_BEFORE_ACK_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|| {
+                Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "injected crash after terminal reconcile before ack",
+                ))
+            }));
+        });
+        let failed = drive_terminal(
+            &mut owner,
+            &fixture.graph,
+            &fixture.receipts,
+            &mut authority,
+            &mut runtime,
+            &mut clock,
+        );
+        assert!(matches!(failed, ExactExternalFeedDrain::Failed(_)));
+        let pending = runtime.watcher_status();
+        assert_eq!(pending.acknowledged.sequence(), 0);
+        assert_eq!(pending.latest_enqueue, startup_epoch);
+        assert!(pending.pending);
+        assert!(
+            !owner.recovery_catch_up_complete(&runtime),
+            "caught-up publication must not open recovery before its startup epoch is acknowledged"
+        );
+        assert!(matches!(
+            runtime.automatic_external_import(),
+            ExternalImportAdmission::Blocked(_)
+        ));
+        assert!(matches!(
+            runtime.quiesce_and_mark_safe(&mut authority, &fixture.graph),
+            Err(SafeHandoffUnavailable::Watcher(
+                WatcherQuiesceError::UnacknowledgedEpoch { .. }
+            ))
+        ));
+
+        assert_admitted(drive_terminal(
+            &mut owner,
+            &fixture.graph,
+            &fixture.receipts,
+            &mut authority,
+            &mut runtime,
+            &mut clock,
+        ));
+        let settled = runtime.watcher_status();
+        assert_eq!(settled.acknowledged, startup_epoch);
+        assert_eq!(settled.acknowledged, settled.latest_enqueue);
+        assert!(!settled.pending);
+        assert!(owner.recovery_catch_up_complete(&runtime));
+        assert_eq!(
+            runtime.automatic_external_import(),
+            ExternalImportAdmission::Allowed
+        );
+        runtime
+            .quiesce_and_mark_safe(&mut authority, &fixture.graph)
+            .unwrap();
     }
 
     #[test]
