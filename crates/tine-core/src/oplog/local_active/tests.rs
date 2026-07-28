@@ -27,7 +27,8 @@ use crate::oplog::migration_backup::{
     verify_migration_source_backup, MigrationBackupRoot, VerifiedSourceBackup,
 };
 use crate::oplog::object_store::{
-    fail_next_resume_publication_at, ResumePublishBoundary, RetainedRunMaintenanceOutcome,
+    fail_next_resume_clear, fail_next_resume_publication_at, ResumePublishBoundary,
+    RetainedRunMaintenanceOutcome,
 };
 use crate::oplog::operational_coordinator::{
     act_once_at, OperationalCoordinator, OperationalCoordinatorError, OperationalCoordinatorState,
@@ -46,9 +47,10 @@ use crate::oplog::shadow_projection::{
     verify_inactive_bootstrap_shadow_projection, VerifiedShadowProjection,
 };
 use crate::oplog::sqlite::{
-    ApplicationRuntimeRoot, ProjectionError, RebuildSource, SqliteFrontier, TailOverlay,
-    WorkspaceRuntimeLease,
+    fail_next_workspace_lease_identity_check, ApplicationRuntimeRoot, ProjectionError,
+    RebuildSource, SqliteFrontier, TailOverlay, WorkspaceRuntimeLease,
 };
+use crate::oplog::watcher_queue::WatcherObservation;
 use crate::oplog::{
     AuthorBatch, BatchDisposition, BatchId, BatchOrigin, BlockId, BlockLocation,
     CanonicalArchiveResourceId, CrdtPeerId, DeviceId, DocumentId, LineageDigest, LogicalPageName,
@@ -4736,7 +4738,10 @@ fn a_replaced_workspace_lease_path_fails_promoted_authority_closed_without_mutat
             &error,
             RuntimePromotionError::WorkspaceAuthorityRevoked(refusal)
                 if refusal.demanded_at() == WorkspaceAuthorityBoundary::ProjectionTailDrain
-                    && matches!(refusal.cause(), ProjectionError::UnsafePath(_))
+                    && matches!(
+                        refusal.cause(),
+                        ProjectionError::LeaseIdentityReplaced(_)
+                    )
         ),
         "unexpected drain error: {error}"
     );
@@ -4755,8 +4760,15 @@ fn a_replaced_workspace_lease_path_fails_promoted_authority_closed_without_mutat
         matches!(
             &error,
             RuntimePromotionError::WorkspaceAuthorityRevoked(refusal)
-                if refusal.revocation().boundary() == WorkspaceAuthorityBoundary::ProjectionTailDrain
-                    && matches!(refusal.cause(), ProjectionError::UnsafePath(_))
+                if refusal
+                    .revocation()
+                    .expect("terminal refusal must retain its revocation")
+                    .boundary()
+                    == WorkspaceAuthorityBoundary::ProjectionTailDrain
+                    && matches!(
+                        refusal.cause(),
+                        ProjectionError::LeaseIdentityReplaced(_)
+                    )
         ),
         "unexpected boundary-proof error: {error}"
     );
@@ -4770,7 +4782,7 @@ fn a_replaced_workspace_lease_path_fails_promoted_authority_closed_without_mutat
                 .projection
                 .workspace_proof()
                 .authorize_archive(&archive, fixture.workspace),
-            Err(ProjectionError::UnsafePath(_))
+            Err(ProjectionError::LeaseIdentityReplaced(_))
         ),
         "the takeover compare-and-swap's own gate must refuse a replaced lease path"
     );
@@ -4828,6 +4840,71 @@ fn a_replaced_workspace_lease_path_fails_promoted_authority_closed_without_mutat
         .workspace_proof()
         .authorize_archive(&archive, fixture.workspace)
         .is_err());
+}
+
+/// Failure to perform the identity check is a one-operation refusal, not proof
+/// that the lease pathname was replaced. A later exact proof on the same
+/// runtime succeeds; no reopen is required and no terminal latch is installed.
+#[test]
+fn a_transient_lease_identity_check_failure_is_retryable_without_self_healing_replacement() {
+    let mut fixture = Fixture::new(
+        "lease-transient-check",
+        None,
+        vec![("pages/transient.md".into(), b"- transient\n".to_vec())],
+    );
+    let root = fixture.enrollment_root("lease-transient-check");
+    let paths = PromotedPaths::new(&fixture, "lease-transient-check");
+    let (mut authority, mut runtime) = promote(&mut fixture, &root, SessionId::new(), &paths);
+
+    fail_next_workspace_lease_identity_check();
+    let error = match runtime
+        .admit_promoted_mutation_at_full_depth_for_test(&mut authority, &fixture.graph)
+    {
+        Ok(_) => panic!("the injected check failure must refuse this operation"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(
+            &error,
+            RuntimePromotionError::WorkspaceAuthorityCheckUnavailable(refusal)
+                if refusal.demanded_at() == WorkspaceAuthorityBoundary::BindingProof
+                    && !refusal.is_terminal()
+                    && matches!(
+                        refusal.cause(),
+                        ProjectionError::LeaseIdentityUnavailable(_)
+                    )
+        ),
+        "unexpected transient refusal: {error}"
+    );
+    assert_eq!(
+        runtime.workspace_authority_revocation(),
+        None,
+        "an unavailable check must not permanently poison the runtime"
+    );
+
+    runtime
+        .admit_promoted_mutation_at_full_depth_for_test(&mut authority, &fixture.graph)
+        .expect("a later exact proof on the same lease must succeed");
+    assert_eq!(runtime.workspace_authority_revocation(), None);
+
+    fail_next_workspace_lease_identity_check();
+    let error = runtime
+        .quiesce_and_mark_safe(&mut authority, &fixture.graph)
+        .expect_err("the Safe operation must fail closed when its proof is unavailable");
+    assert!(
+        matches!(
+            &error,
+            SafeHandoffUnavailable::WorkspaceAuthorityCheckUnavailable(refusal)
+                if !refusal.is_terminal()
+                    && refusal.demanded_at() == WorkspaceAuthorityBoundary::SafeHandoff
+        ),
+        "unexpected transient Safe refusal: {error}"
+    );
+    assert_eq!(runtime.workspace_authority_revocation(), None);
+    runtime
+        .quiesce_and_mark_safe(&mut authority, &fixture.graph)
+        .expect("a later valid Safe proof succeeds without reopening");
+    fixture.assert_graph_unchanged();
 }
 
 /// The immutable published surface of one archive: exactly the batch manifests
@@ -4911,7 +4988,10 @@ fn a_boundary_that_loses_the_workspace_lease_revokes_the_runtime_terminally() {
             &error,
             RuntimePromotionError::WorkspaceAuthorityRevoked(refusal)
                 if refusal.demanded_at() == WorkspaceAuthorityBoundary::BindingProof
-                    && matches!(refusal.cause(), ProjectionError::UnsafePath(_))
+                    && matches!(
+                        refusal.cause(),
+                        ProjectionError::LeaseIdentityReplaced(_)
+                    )
         ),
         "unexpected boundary-proof error: {error}"
     );
@@ -4935,7 +5015,7 @@ fn a_boundary_that_loses_the_workspace_lease_revokes_the_runtime_terminally() {
                 &error,
                 RuntimePromotionError::WorkspaceAuthorityRevoked(refusal)
                     if refusal.demanded_at() == WorkspaceAuthorityBoundary::Admission
-                        && refusal.revocation() == &revocation
+                        && refusal.revocation() == Some(&revocation)
             ),
             "admission {attempt} refused for the wrong reason: {error}"
         );
@@ -5043,7 +5123,7 @@ fn restoring_the_original_lease_file_never_un_revokes_the_runtime() {
             matches!(
                 &error,
                 RuntimePromotionError::WorkspaceAuthorityRevoked(refusal)
-                    if refusal.revocation() == &revocation
+                    if refusal.revocation() == Some(&revocation)
             ),
             "admission {attempt} refused for the wrong reason: {error}"
         );
@@ -5116,7 +5196,10 @@ fn parts_refuses_to_vend_the_sqlite_applier_and_tail_after_a_lease_replacement()
         refusal.demanded_at(),
         WorkspaceAuthorityBoundary::MutableParts
     );
-    assert!(matches!(refusal.cause(), ProjectionError::UnsafePath(_)));
+    assert!(matches!(
+        refusal.cause(),
+        ProjectionError::LeaseIdentityReplaced(_)
+    ));
     // Repeated attempts stay refused from the latch, not from a fresh stat that
     // could one day pass again.
     for attempt in 0..4 {
@@ -5125,7 +5208,10 @@ fn parts_refuses_to_vend_the_sqlite_applier_and_tail_after_a_lease_replacement()
             .err()
             .unwrap_or_else(|| panic!("parts attempt {attempt} vended a revoked runtime"));
         assert_eq!(
-            refusal.revocation().boundary(),
+            refusal
+                .revocation()
+                .expect("terminal refusal must retain its revocation")
+                .boundary(),
             WorkspaceAuthorityBoundary::MutableParts
         );
     }
@@ -6311,16 +6397,12 @@ fn a_torn_conflicted_or_leased_candidate_replays_in_full_without_changing_a_byte
     });
 }
 
-/// A clean `Safe` handoff advances the enrollment record past the point that
-/// was published under the previous one, so a restart reusing the same session
-/// id is offered a candidate the live record contradicts.
-///
-/// This is the `SupersededBy` arm's refusal direction, reached through the real
-/// lifecycle rather than by hand-built evidence: the point predates the live
-/// record but claims the very session the restart is taking, so it is refused
-/// and the restart pays a full replay.
+/// The production Safe transaction clears its Unsafe point, commits and
+/// freshly reopens Safe, publishes an exactly Safe-bound successor, and a
+/// fresh-session clean restart adopts it with observations equal to full
+/// replay.
 #[test]
-fn a_clean_safe_restart_that_reuses_its_session_refuses_the_superseded_point() {
+fn a_clean_safe_restart_adopts_the_exact_safe_bound_point() {
     on_a_deep_stack(|| {
         let mut fixture = Fixture::new(
             "resume-safe-superseded",
@@ -6339,12 +6421,18 @@ fn a_clean_safe_restart_that_reuses_its_session_refuses_the_superseded_point() {
             session,
             |fixture, authority, runtime| {
                 publish_expecting_success(fixture, authority, runtime);
-                runtime
-                    .quiesce_and_mark_safe_without_watcher_dependency_for_test(
-                        authority,
-                        &fixture.graph,
-                    )
-                    .expect("a drained runtime records a clean handoff");
+                let receipt = runtime
+                    .quiesce_and_mark_safe(authority, &fixture.graph)
+                    .expect("the production transaction records a clean handoff");
+                assert_eq!(
+                    receipt.cleared().removed,
+                    1,
+                    "the recognized Unsafe point is cleared before Safe"
+                );
+                assert!(matches!(
+                    receipt.publication(),
+                    ResumePublicationStatus::Published { .. }
+                ));
                 authority.verification_digest()
             },
         );
@@ -6355,30 +6443,455 @@ fn a_clean_safe_restart_that_reuses_its_session_refuses_the_superseded_point() {
         let points_before = resume_point_bytes(&fixture.archive_root);
         assert_eq!(points_before.len(), 1);
 
-        with_reopened_runtime(
+        let fresh_session = SessionId::new();
+        let adopted = with_reopened_runtime(
             &fixture,
             &root,
             &binding,
             &paths,
-            session,
+            fresh_session,
             |_, _, runtime| {
                 assert_eq!(runtime.recovery(), RuntimeRecoveryState::AdoptedSafeHandoff);
                 let opened = runtime.resume_open_status().clone();
-                assert!(!opened.adopted(), "{opened:?}");
+                assert!(opened.adopted(), "{opened:?}");
+                assert_eq!(opened.unavailable(), None);
+                public_runtime_observation(runtime)
+            },
+        );
+
+        remove_every_resume_point(&fixture.archive_root);
+        let replayed = with_taken_over_runtime(
+            &fixture,
+            &root,
+            &binding,
+            &paths,
+            SessionId::new(),
+            |_, _, runtime| {
+                assert!(!runtime.resume_open_status().adopted());
+                public_runtime_observation(runtime)
+            },
+        );
+        assert_publicly_indistinguishable(
+            &adopted,
+            &replayed,
+            "Safe-bound adoption must equal a full replay",
+        );
+        assert_eq!(
+            points_before.len(),
+            1,
+            "the Safe transaction leaves exactly its Safe successor"
+        );
+        fixture.assert_graph_unchanged();
+    });
+}
+
+/// Clear is the last fallible deletion step before the durable Safe commit.
+/// Its failure removes nothing and leaves the exact committed enrollment
+/// Unsafe, so a later retry or crash takeover still has honest evidence.
+#[test]
+fn a_clear_failure_leaves_enrollment_unsafe_and_preserves_the_point_bytes() {
+    on_a_deep_stack(|| {
+        let mut fixture = Fixture::new(
+            "resume-safe-clear-failure",
+            None,
+            vec![("pages/clear.md".into(), b"- clear\n".to_vec())],
+        );
+        let root = fixture.enrollment_root("resume-safe-clear-failure");
+        let binding = fixture.enrollment_binding();
+        let paths = PromotedPaths::new(&fixture, "resume-safe-clear-failure");
+        let session = SessionId::new();
+
+        let verification_digest = with_promoted_runtime(
+            &mut fixture,
+            &root,
+            &paths,
+            session,
+            |fixture, authority, runtime| {
+                publish_expecting_success(fixture, authority, runtime);
+                let before = resume_point_bytes(&fixture.archive_root);
+                fail_next_resume_clear();
+                let error = runtime
+                    .quiesce_and_mark_safe(authority, &fixture.graph)
+                    .expect_err("the injected clear failure must abort before Safe");
                 assert!(
-                    matches!(
-                        opened.unavailable(),
-                        Some(ResumeAcceleratorUnavailable::BindingRefused(_))
-                    ),
-                    "the live record must contradict the point: {opened:?}"
+                    matches!(error, SafeHandoffUnavailable::Store(_)),
+                    "unexpected clear refusal: {error}"
                 );
+                assert_eq!(
+                    resume_point_bytes(&fixture.archive_root),
+                    before,
+                    "a failed clear must preserve every candidate byte"
+                );
+                assert_eq!(
+                    authority.handoff(),
+                    LocalActiveHandoff::Unsafe {
+                        session_id: session
+                    }
+                );
+                authority.verification_digest()
             },
         );
         assert_eq!(
-            resume_point_bytes(&fixture.archive_root),
-            points_before,
-            "a refused candidate is never rewritten or removed"
+            committed_handoff(&root, &binding, verification_digest),
+            LocalActiveHandoff::Unsafe {
+                session_id: session
+            }
         );
+        fixture.assert_graph_unchanged();
+    });
+}
+
+/// Failures before a Safe point's commit are report-only: the durable Safe
+/// record remains valid, no publication witness exists to authorize
+/// reclamation, and the next clean restart performs an ordinary full replay.
+#[test]
+fn post_safe_mint_and_precommit_publication_failures_full_replay_without_reclamation() {
+    for (label, residue) in [("mint", true), ("precommit", false)] {
+        on_a_deep_stack(move || {
+            let mut fixture = Fixture::new(
+                &format!("resume-safe-publish-{label}"),
+                None,
+                vec![("pages/publish.md".into(), b"- publish\n".to_vec())],
+            );
+            let root = fixture.enrollment_root(&format!("resume-safe-publish-{label}"));
+            let binding = fixture.enrollment_binding();
+            let paths = PromotedPaths::new(&fixture, &format!("resume-safe-publish-{label}"));
+            let verification_digest = with_promoted_runtime(
+                &mut fixture,
+                &root,
+                &paths,
+                SessionId::new(),
+                |fixture, authority, runtime| {
+                    if residue {
+                        fs::create_dir_all(resume_point_directory(&fixture.archive_root)).unwrap();
+                        fs::write(
+                            resume_point_directory(&fixture.archive_root).join(".DS_Store"),
+                            b"preserved residue",
+                        )
+                        .unwrap();
+                    } else {
+                        fail_next_resume_publication_at(ResumePublishBoundary::AfterPrePrune);
+                    }
+                    let runs_before = retained_run_directories(&fixture.archive_root);
+                    let receipt = runtime
+                        .quiesce_and_mark_safe(authority, &fixture.graph)
+                        .expect("post-Safe accelerator failure cannot fail the handoff");
+                    assert!(
+                        matches!(
+                            receipt.publication(),
+                            ResumePublicationStatus::NotPublished(ResumePublicationRefusal::Store(
+                                _
+                            ))
+                        ),
+                        "{label}: unexpected publication status: {:?}",
+                        receipt.publication()
+                    );
+                    assert_eq!(
+                        retained_run_directories(&fixture.archive_root),
+                        runs_before,
+                        "{label}: no publication witness may authorize reclamation"
+                    );
+                    authority.verification_digest()
+                },
+            );
+            assert_eq!(
+                committed_handoff(&root, &binding, verification_digest),
+                LocalActiveHandoff::Safe,
+                "{label}"
+            );
+
+            with_reopened_runtime(
+                &fixture,
+                &root,
+                &binding,
+                &paths,
+                SessionId::new(),
+                |_, _, runtime| {
+                    assert!(
+                        !runtime.resume_open_status().adopted(),
+                        "{label}: a failed Safe publication must full-replay"
+                    );
+                },
+            );
+            fixture.assert_graph_unchanged();
+        });
+    }
+}
+
+/// Intake that lands after the watcher quiesce begins invalidates the durable
+/// Safe proof. Releasing the failed barrier promotes that deferred event into
+/// ordinary later work; after the facade drains and acknowledges it, the exact
+/// same production transaction succeeds.
+#[test]
+fn watcher_intake_racing_quiesce_prevents_safe_and_becomes_later_work() {
+    on_a_deep_stack(|| {
+        let _guard = ResumeLifecycleCutGuard::new();
+        let mut fixture = Fixture::new(
+            "resume-safe-watcher-race",
+            None,
+            vec![("pages/watcher.md".into(), b"- watcher\n".to_vec())],
+        );
+        let root = fixture.enrollment_root("resume-safe-watcher-race");
+        let paths = PromotedPaths::new(&fixture, "resume-safe-watcher-race");
+
+        with_promoted_runtime(
+            &mut fixture,
+            &root,
+            &paths,
+            SessionId::new(),
+            |fixture, authority, runtime| {
+                let handle = runtime.watcher_handle();
+                let binding = handle.binding();
+                act_once_at_resume_lifecycle_cut_for_test(
+                    ResumeLifecycleCut::AfterWatcherQuiesce,
+                    Box::new(move || {
+                        let intake = handle
+                            .enqueue(binding, [WatcherObservation::NotifyError])
+                            .expect("intake during the soft quiesce is retained");
+                        assert!(intake.deferred_by_quiesce);
+                    }),
+                );
+                let error = runtime
+                    .quiesce_and_mark_safe(authority, &fixture.graph)
+                    .expect_err("racing watcher intake must defeat Safe");
+                assert!(
+                    matches!(
+                        error,
+                        SafeHandoffUnavailable::Watcher(
+                            WatcherQuiesceError::ArrivedDuringQuiesce { .. }
+                        )
+                    ),
+                    "unexpected watcher race outcome: {error}"
+                );
+                assert!(runtime.watcher_status().pending);
+                assert!(!runtime.watcher_status().deferred);
+
+                let drain = runtime
+                    .begin_watcher_drain()
+                    .unwrap()
+                    .expect("the deferred event becomes later drainable work");
+                runtime.acknowledge_watcher_drain(drain.epoch()).unwrap();
+                assert!(!runtime.watcher_status().pending);
+                runtime
+                    .quiesce_and_mark_safe(authority, &fixture.graph)
+                    .expect("Safe succeeds after the later watcher work is settled");
+            },
+        );
+        fixture.assert_graph_unchanged();
+    });
+}
+
+/// The graph reservation is still live after the enrollment record has become
+/// durably Safe and before Safe-point publication starts. A writer admission
+/// at that exact cut is refused by the real graph gate.
+#[test]
+fn graph_writer_cannot_cross_handoff_safe_before_safe_publication() {
+    on_a_deep_stack(|| {
+        let _guard = ResumeLifecycleCutGuard::new();
+        let mut fixture = Fixture::new(
+            "resume-safe-graph-barrier",
+            None,
+            vec![("pages/barrier.md".into(), b"- barrier\n".to_vec())],
+        );
+        let root = fixture.enrollment_root("resume-safe-graph-barrier");
+        let paths = PromotedPaths::new(&fixture, "resume-safe-graph-barrier");
+        with_promoted_runtime(
+            &mut fixture,
+            &root,
+            &paths,
+            SessionId::new(),
+            |fixture, authority, runtime| {
+                arm_safe_graph_writer_probe_for_test();
+                runtime
+                    .quiesce_and_mark_safe(authority, &fixture.graph)
+                    .expect("the production Safe transaction succeeds");
+                assert_eq!(
+                    take_safe_graph_writer_probe_for_test(),
+                    Some(std::io::ErrorKind::WouldBlock),
+                    "the graph writer gate must remain closed after Safe commit"
+                );
+            },
+        );
+        fixture.assert_graph_unchanged();
+    });
+}
+
+/// Durable crash cuts around clear and Safe preserve the one legal prefix at
+/// each boundary: before clear the Unsafe point survives; after clear the
+/// enrollment is still Unsafe with no point; after the Safe commit the record
+/// is Safe and point publication remains optional.
+#[test]
+fn safe_transaction_crash_cuts_reopen_only_legal_durable_prefixes() {
+    for (label, cut, expected_handoff, expected_points) in [
+        (
+            "before-clear",
+            ResumeLifecycleCut::BeforeSafeClear,
+            0_u8,
+            1_usize,
+        ),
+        (
+            "after-clear",
+            ResumeLifecycleCut::AfterSafeClear,
+            0_u8,
+            0_usize,
+        ),
+        (
+            "after-safe",
+            ResumeLifecycleCut::AfterSafeCommit,
+            1_u8,
+            0_usize,
+        ),
+    ] {
+        on_a_deep_stack(move || {
+            let _guard = ResumeLifecycleCutGuard::new();
+            let mut fixture = Fixture::new(
+                &format!("resume-safe-crash-{label}"),
+                None,
+                vec![("pages/crash.md".into(), b"- crash\n".to_vec())],
+            );
+            let root = fixture.enrollment_root(&format!("resume-safe-crash-{label}"));
+            let binding = fixture.enrollment_binding();
+            let paths = PromotedPaths::new(&fixture, &format!("resume-safe-crash-{label}"));
+            let session = SessionId::new();
+            let verification_digest = with_promoted_runtime(
+                &mut fixture,
+                &root,
+                &paths,
+                session,
+                |fixture, authority, runtime| {
+                    publish_expecting_success(fixture, authority, runtime);
+                    act_once_at_resume_lifecycle_cut_for_test(
+                        cut,
+                        Box::new(|| panic!("injected Safe transaction crash cut")),
+                    );
+                    let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let _ = runtime.quiesce_and_mark_safe(authority, &fixture.graph);
+                    }));
+                    assert!(crashed.is_err(), "{label}: the cut did not fire");
+                    authority.verification_digest()
+                },
+            );
+            let durable = committed_handoff(&root, &binding, verification_digest);
+            if expected_handoff == 0 {
+                assert_eq!(
+                    durable,
+                    LocalActiveHandoff::Unsafe {
+                        session_id: session
+                    },
+                    "{label}"
+                );
+            } else {
+                assert_eq!(durable, LocalActiveHandoff::Safe, "{label}");
+            }
+            assert_eq!(
+                resume_point_entries(&fixture.archive_root).len(),
+                expected_points,
+                "{label}"
+            );
+            fixture.assert_graph_unchanged();
+        });
+    }
+}
+
+/// The facade-facing post-open cut publishes before any mutation admission,
+/// so each crash takeover replaces the predecessor point instead of retaining
+/// another run forever. A later full-replay open can publish from that same
+/// sealed cut and reclaim the now-unreachable predecessor.
+#[test]
+fn post_open_publication_bounds_crash_takeovers_and_reclaims_the_first_unreachable_run() {
+    on_a_deep_stack(|| {
+        let mut fixture = Fixture::new(
+            "resume-post-open-bounded",
+            None,
+            vec![("pages/post-open.md".into(), b"- post open\n".to_vec())],
+        );
+        let root = fixture.enrollment_root("resume-post-open-bounded");
+        let binding = fixture.enrollment_binding();
+        let paths = PromotedPaths::new(&fixture, "resume-post-open-bounded");
+
+        with_promoted_runtime(
+            &mut fixture,
+            &root,
+            &paths,
+            SessionId::new(),
+            |fixture, authority, runtime| {
+                assert!(matches!(
+                    runtime.publish_post_open_resume_point(authority, &fixture.graph),
+                    ResumePublicationStatus::Published { .. }
+                ));
+            },
+        );
+
+        for attempt in 0..4 {
+            with_taken_over_runtime(
+                &fixture,
+                &root,
+                &binding,
+                &paths,
+                SessionId::new(),
+                |fixture, authority, runtime| {
+                    assert!(
+                        runtime.resume_open_status().adopted(),
+                        "takeover {attempt} must adopt before its CAS"
+                    );
+                    assert!(matches!(
+                        runtime.publish_post_open_resume_point(authority, &fixture.graph),
+                        ResumePublicationStatus::Published { .. }
+                    ));
+                },
+            );
+            assert_eq!(
+                retained_run_directories(&fixture.archive_root).len(),
+                1,
+                "post-open publication must bound takeover {attempt}"
+            );
+            assert_eq!(resume_point_entries(&fixture.archive_root).len(), 1);
+        }
+
+        let predecessor = retained_run_directories(&fixture.archive_root)
+            .into_iter()
+            .next()
+            .unwrap();
+        let point_path = {
+            let name = resume_point_entries(&fixture.archive_root)
+                .into_iter()
+                .next()
+                .unwrap();
+            resume_point_directory(&fixture.archive_root).join(name)
+        };
+        let bytes = fs::read(&point_path).unwrap();
+        fs::write(&point_path, &bytes[..bytes.len() / 2]).unwrap();
+
+        with_taken_over_runtime(
+            &fixture,
+            &root,
+            &binding,
+            &paths,
+            SessionId::new(),
+            |fixture, authority, runtime| {
+                assert!(
+                    !runtime.resume_open_status().adopted(),
+                    "the torn point must force a fresh retained full replay"
+                );
+                remove_every_resume_point(&fixture.archive_root);
+                let status = runtime.publish_post_open_resume_point(authority, &fixture.graph);
+                assert!(
+                    matches!(
+                        status,
+                        ResumePublicationStatus::Published {
+                            maintenance: Some(_),
+                            ..
+                        }
+                    ),
+                    "the first clean post-open publication must carry maintenance: {status:?}"
+                );
+            },
+        );
+        assert!(
+            !retained_run_directories(&fixture.archive_root).contains(&predecessor),
+            "the successfully witnessed publication must reclaim the unreachable predecessor"
+        );
+        assert_eq!(retained_run_directories(&fixture.archive_root).len(), 1);
         fixture.assert_graph_unchanged();
     });
 }
@@ -7030,6 +7543,7 @@ fn ordinary_admissions_do_no_resume_lifecycle_work() {
                 let opened_before = runtime.resume_open_status().clone();
                 let points_before = resume_point_bytes(&fixture.archive_root);
                 let runs_before = retained_run_directories(&fixture.archive_root);
+                let watcher_before = runtime.watcher_status();
 
                 for count in [1_usize, 1_000] {
                     let before = PromotedRuntimeInstrumentation::capture();
@@ -7063,8 +7577,20 @@ fn ordinary_admissions_do_no_resume_lifecycle_work() {
                     None,
                     "an admission never publishes"
                 );
+                assert_eq!(
+                    runtime.watcher_status(),
+                    watcher_before,
+                    "an admission never touches watcher queue state"
+                );
                 assert_eq!(resume_point_bytes(&fixture.archive_root), points_before);
                 assert_eq!(retained_run_directories(&fixture.archive_root), runs_before);
+                assert_eq!(
+                    runtime.publish_post_open_resume_point(authority, &fixture.graph),
+                    ResumePublicationStatus::NotPublished(
+                        ResumePublicationRefusal::EngineNotPublishable
+                    ),
+                    "the first admitted mutation permanently seals the post-open cut"
+                );
             },
         );
         fixture.assert_graph_unchanged();
@@ -7142,6 +7668,125 @@ fn a_crash_takeover_adopts_the_crashed_sessions_published_point() {
                 );
             },
         );
+        fixture.assert_graph_unchanged();
+    });
+}
+
+/// Candidate selection happens before each takeover CAS, so only the exact
+/// currently crashed predecessor is admissible. Once one takeover commits
+/// without publishing a successor, the older point is refused forever across
+/// later takeover records and every refusal preserves its bytes.
+#[test]
+fn a_point_older_than_one_or_more_takeovers_refuses_into_byte_preserving_full_replay() {
+    on_a_deep_stack(|| {
+        let mut fixture = Fixture::new(
+            "resume-old-takeover-point",
+            None,
+            vec![("pages/old.md".into(), b"- old\n".to_vec())],
+        );
+        let root = fixture.enrollment_root("resume-old-takeover-point");
+        let binding = fixture.enrollment_binding();
+        let paths = PromotedPaths::new(&fixture, "resume-old-takeover-point");
+        with_promoted_runtime(
+            &mut fixture,
+            &root,
+            &paths,
+            SessionId::new(),
+            |fixture, authority, runtime| {
+                publish_expecting_success(fixture, authority, runtime);
+            },
+        );
+        let original = resume_point_bytes(&fixture.archive_root);
+
+        with_taken_over_runtime(
+            &fixture,
+            &root,
+            &binding,
+            &paths,
+            SessionId::new(),
+            |_, _, runtime| {
+                assert!(
+                    runtime.resume_open_status().adopted(),
+                    "the exact crashed predecessor remains admissible before the first CAS"
+                );
+            },
+        );
+        assert_eq!(resume_point_bytes(&fixture.archive_root), original);
+
+        for distance in 1..=2 {
+            with_taken_over_runtime(
+                &fixture,
+                &root,
+                &binding,
+                &paths,
+                SessionId::new(),
+                |_, _, runtime| {
+                    assert!(
+                        !runtime.resume_open_status().adopted(),
+                        "the point older than {distance} takeover records must full-replay"
+                    );
+                },
+            );
+            assert_eq!(
+                resume_point_bytes(&fixture.archive_root),
+                original,
+                "takeover distance {distance} modified refused evidence"
+            );
+        }
+        fixture.assert_graph_unchanged();
+    });
+}
+
+/// A Safe-bound point is exact for one clean restart only. After that restart
+/// durably opens its new Unsafe session, the older Safe generation cannot be
+/// reinterpreted as crash evidence and is refused without cleanup side effects.
+#[test]
+fn a_safe_point_older_than_the_clean_restart_refuses_byte_preservingly() {
+    on_a_deep_stack(|| {
+        let mut fixture = Fixture::new(
+            "resume-old-safe-point",
+            None,
+            vec![("pages/old-safe.md".into(), b"- old safe\n".to_vec())],
+        );
+        let root = fixture.enrollment_root("resume-old-safe-point");
+        let binding = fixture.enrollment_binding();
+        let paths = PromotedPaths::new(&fixture, "resume-old-safe-point");
+        with_promoted_runtime(
+            &mut fixture,
+            &root,
+            &paths,
+            SessionId::new(),
+            |fixture, authority, runtime| {
+                runtime
+                    .quiesce_and_mark_safe(authority, &fixture.graph)
+                    .expect("Safe publication succeeds");
+            },
+        );
+        let original = resume_point_bytes(&fixture.archive_root);
+        assert_eq!(original.len(), 1);
+
+        with_reopened_runtime(
+            &fixture,
+            &root,
+            &binding,
+            &paths,
+            SessionId::new(),
+            |_, _, runtime| assert!(runtime.resume_open_status().adopted()),
+        );
+        with_taken_over_runtime(
+            &fixture,
+            &root,
+            &binding,
+            &paths,
+            SessionId::new(),
+            |_, _, runtime| {
+                assert!(
+                    !runtime.resume_open_status().adopted(),
+                    "the prior Safe generation is not this crashed Unsafe session"
+                );
+            },
+        );
+        assert_eq!(resume_point_bytes(&fixture.archive_root), original);
         fixture.assert_graph_unchanged();
     });
 }
