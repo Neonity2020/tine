@@ -1037,6 +1037,28 @@
       "notes": "GH #246 accepted harm: an eligible non-empty document outside pages/ could appear blank, external add/delete stayed invisible, and editing the blank state could overwrite real bytes. The base reproduction at be54af62 failed because list_pages/find_entry/load_by_path only admitted configured pages/journals roots."
     },
     {
+      "id": "REG-SYNC-PROJECTION-CRASH-CORPUS-001",
+      "title": "Projection crash recovery preserves exact bytes across graph-wide paths and fails closed on foreign edits",
+      "family": "data-safety",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/oplog/projection_crash_corpus_tests.rs"
+        ],
+        "scenario": "sync.projection-crash-corpus-v2",
+        "failBefore": "source-proven"
+      },
+      "notes": "Internal sparse-oplog adversarial corpus: deterministic fixture byte hashes, root and nested Unicode graph text, nonstandard journal and Org layouts, current .md/.org projection cut coverage, .markdown admission-only evidence, and fail-closed foreign-edit recovery."
+    },
+    {
       "id": "REG-SYNC-WATCHER-OVERSIZE-SAFE-001",
       "title": "An oversized watcher callback cannot be refused and then allow Safe to omit its external edits",
       "family": "data-safety",

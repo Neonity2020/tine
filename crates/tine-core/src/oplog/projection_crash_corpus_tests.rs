@@ -13,6 +13,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::model::Graph;
@@ -59,6 +60,7 @@ struct SemanticFixturePage {
     path: String,
     format: String,
     bytes: String,
+    sha256: String,
     preamble: Option<String>,
     sparse_ids: Vec<String>,
     deleted: bool,
@@ -217,10 +219,31 @@ fn capture_graph_measurements(measured: &mut Measurements) {
 
 fn fixture_document(page: &SemanticFixturePage) -> crate::doc::Document {
     match page.format.as_str() {
-        "markdown" if page.path.ends_with(".md") => crate::doc::parse(&page.bytes),
+        "markdown" if page.path.ends_with(".md") || page.path.ends_with(".markdown") => {
+            crate::doc::parse(&page.bytes)
+        }
         "org" if page.path.ends_with(".org") => crate::org::parse_org(&page.bytes),
         other => panic!("fixture format/path mismatch for {}: {other}", page.path),
     }
+}
+
+fn assert_fixture_page_hash(page: &SemanticFixturePage) {
+    assert_eq!(
+        format!("{:x}", Sha256::digest(page.bytes.as_bytes())),
+        page.sha256,
+        "fixture byte hash drifted for {}",
+        page.path
+    );
+}
+
+fn projection_writer_supports(path: &ManagedPath) -> bool {
+    path.as_str().ends_with(".md") || path.as_str().ends_with(".org")
+}
+
+fn write_fixture_file(root: &Path, page: &SemanticFixturePage) {
+    let destination = root.join(&page.path);
+    fs::create_dir_all(destination.parent().unwrap()).unwrap();
+    fs::write(destination, page.bytes.as_bytes()).unwrap();
 }
 
 fn distinct_crlf_base(target: &[u8]) -> Vec<u8> {
@@ -229,7 +252,15 @@ fn distinct_crlf_base(target: &[u8]) -> Vec<u8> {
         target.contains("\r\n"),
         "CRLF fixture target lost its CRLF line endings"
     );
-    let base = target.replacen("retain line endings", "external CRLF baseline", 1);
+    let base = if target.contains("retain line endings") {
+        target.replacen("retain line endings", "external CRLF baseline", 1)
+    } else {
+        target.replacen(
+            "retain graph-wide CRLF",
+            "external graph-wide CRLF baseline",
+            1,
+        )
+    };
     assert_ne!(base, target, "CRLF base must differ from the projected target");
     assert!(
         base.contains("\r\n"),
@@ -283,6 +314,46 @@ fn parsed_sparse_ids(blocks: &[crate::doc::DocBlock]) -> BTreeSet<String> {
 }
 
 fn assert_live_fixture_pages_semantics(pages: &[SemanticFixturePage]) {
+    let admission_root = CorpusDir::new("semantic-fixture-admission");
+    let admission_graph_root = admission_root.path().join("graph");
+    fs::create_dir_all(admission_graph_root.join("pages")).unwrap();
+    fs::create_dir_all(admission_graph_root.join("journals")).unwrap();
+    for page in pages.iter().filter(|page| !page.deleted) {
+        assert_fixture_page_hash(page);
+        write_fixture_file(&admission_graph_root, page);
+    }
+    let admission_graph = Graph::open(&admission_graph_root);
+    fs::create_dir_all(admission_root.path().join("capture")).unwrap();
+    let capture = admission_graph
+        .capture_inactive_bootstrap_sources(&admission_root.path().join("capture"))
+        .unwrap();
+    let mut entries = capture.entries_cursor().unwrap();
+    let mut captured = Vec::new();
+    while let Some(entry) = entries.next().unwrap() {
+        captured.push((
+            entry.path().as_str().to_owned(),
+            entry.kind(),
+            entry.description(),
+        ));
+    }
+    captured.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut expected_capture = pages
+        .iter()
+        .filter(|page| !page.deleted)
+        .map(|page| {
+            (
+                page.path.clone(),
+                page.kind.managed_kind(),
+                BlobDescription::of(page.bytes.as_bytes()),
+            )
+        })
+        .collect::<Vec<_>>();
+    expected_capture.sort_by(|left, right| left.0.cmp(&right.0));
+    assert_eq!(
+        captured, expected_capture,
+        "graph-wide fixture admission drifted"
+    );
+
     let root = CorpusDir::new("semantic-fixtures");
     let graph_root = root.path().join("graph");
     fs::create_dir_all(graph_root.join("pages")).unwrap();
@@ -307,11 +378,7 @@ fn assert_live_fixture_pages_semantics(pages: &[SemanticFixturePage]) {
     for (index, page) in pages.iter().enumerate() {
         let path = ManagedPath::parse(&page.path).unwrap();
         assert!(paths.insert(path.clone()), "duplicate fixture path {path}");
-        assert_eq!(
-            graph.classify_managed_text_path(&path).unwrap(),
-            page.kind.managed_kind(),
-            "managed path kind drift for {path}"
-        );
+        assert_fixture_page_hash(page);
         if page.deleted {
             continue;
         }
@@ -388,6 +455,10 @@ fn assert_live_fixture_pages_semantics(pages: &[SemanticFixturePage]) {
         let state = engine.materialize_page_for_projection(*page_id).unwrap();
         assert_eq!(state.page.path, *path);
         assert_eq!(state.page.preamble.as_deref(), page.preamble.as_deref());
+        if !projection_writer_supports(path) {
+            write_fixture_file(&graph_root, page);
+            continue;
+        }
         let has_crlf = page.bytes.contains("\r\n");
         let expected_base = has_crlf.then(|| {
             let base = distinct_crlf_base(page.bytes.as_bytes());
@@ -458,6 +529,7 @@ fn assert_live_fixture_pages_semantics(pages: &[SemanticFixturePage]) {
     }
     let requested = live
         .iter()
+        .filter(|(_, _, path)| projection_writer_supports(path))
         .map(|(_, _, path)| path.as_str())
         .collect::<Vec<_>>();
     let import = plan_affected_import(&graph, &receipts, &engine, &requested);
@@ -468,9 +540,12 @@ fn assert_live_fixture_pages_semantics(pages: &[SemanticFixturePage]) {
     );
     let inventory = import.inventory().unwrap();
     let matches = import.matches().unwrap();
-    assert_eq!(matches.pages().len(), live.len());
+    assert_eq!(matches.pages().len(), requested.len());
     assert!(matches.rejected_raw_ids().is_empty());
     for (index, _, path) in &live {
+        if !projection_writer_supports(path) {
+            continue;
+        }
         let page = &pages[*index];
         assert_eq!(inventory.present(path.as_str()).unwrap().bytes(), page.bytes.as_bytes());
         if !page.sparse_ids.is_empty() {
@@ -536,6 +611,10 @@ fn case_spec(id: &str) -> (&'static str, &'static str) {
         "sigkill_attempt_publication" => (
             "ProjectionReceiptStore::begin_mutation",
             "after publish_immutable_exact(attempt reservation), parent SIGKILL",
+        ),
+        "graph_wide_foreign_edit_rejection" => (
+            "recover_incomplete_projections",
+            "after graph-wide projection intent before recovery with foreign bytes present",
         ),
         other => panic!("unknown crash corpus case {other}"),
     }
@@ -1764,6 +1843,75 @@ fn run_sigkill_attempt_publication(case: &CorpusCase) -> CaseReceipt {
     panic!("{} requires Unix SIGKILL support", case.id)
 }
 
+fn run_graph_wide_foreign_edit_rejection(case: &CorpusCase) -> CaseReceipt {
+    const PATH: &str = "archive/客户/Πλάνο Καφέ.md";
+    const EXTERNAL: &[u8] = b"- foreign external edit\n";
+    const TARGET_HASH: &str = "616bcb42e0737ee9ea0c0a3ac930ae0f25f08d0599a9aa88b6c6df5fbc32f9b5";
+    const EXTERNAL_HASH: &str =
+        "02b3eb6c70a8b6a26ac2e094f912dff84d81bf95883e21fe5a9f1e0ad9188bfe";
+
+    assert_eq!(format!("{:x}", Sha256::digest(EXTERNAL)), EXTERNAL_HASH);
+    let dir = CorpusDir::new("graph-wide-foreign-edit");
+    let graph_root = dir.path().join("graph");
+    fs::create_dir_all(graph_root.join("pages")).unwrap();
+    fs::create_dir_all(graph_root.join("journals")).unwrap();
+    let graph = Graph::open(&graph_root);
+    let binding = corpus_binding(&graph, 73_000);
+    let receipts = crate::oplog::ProjectionReceiptStore::open_for_endpoint(
+        &dir.path().join("receipts"),
+        corpus_workspace(1),
+        binding,
+    )
+    .unwrap();
+    let (engine, page_id) = corpus_authorized_engine(
+        &dir,
+        PATH,
+        "should not land",
+        Some((&graph, &receipts)),
+    );
+    let authorization = engine.authorize_projection_write(page_id).unwrap();
+    let plan = plan_projection(corpus_workspace(1), authorization.state(), None).unwrap();
+    assert_eq!(
+        format!("{:x}", Sha256::digest(plan.target())),
+        TARGET_HASH,
+        "graph-wide target hash drifted"
+    );
+    receipts.publish_intent(plan.intent(), None).unwrap();
+    let target = graph_root.join(PATH);
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::write(&target, EXTERNAL).unwrap();
+
+    reset_projection_store_test_counters();
+    reset_projection_graph_test_counters();
+    let recovered = recover_incomplete_projections(&graph, &receipts, &engine);
+    assert!(
+        recovered.is_err(),
+        "foreign graph-wide edit must fail closed"
+    );
+    assert_eq!(fs::read(&target).unwrap(), EXTERNAL);
+    assert!(receipts.load_completion(plan.intent()).unwrap().is_none());
+
+    let mut measured = Measurements::default();
+    capture_graph_measurements(&mut measured);
+    capture_scan_measurements(&mut measured);
+    let before = format!("path={PATH},foreign_sha256={EXTERNAL_HASH}");
+    let after = "completion=false,foreign-bytes=preserved".to_owned();
+    assert!(
+        measured.projection_write_calls <= 1
+            && measured.projection_remove_calls == 0
+            && measured.projection_recovery_calls == 1,
+        "{}",
+        assertion_receipt(case, &before, &after, measured)
+    );
+    CaseReceipt {
+        id: case.id.clone(),
+        cut: case.cut.clone(),
+        before,
+        after,
+        measured,
+    }
+}
+
 #[test]
 fn crash_corpus_subprocess_worker() {
     let _state = CrashCorpusTestStateGuard::new();
@@ -1798,6 +1946,7 @@ fn run_portable_case(case: &CorpusCase) -> CaseReceipt {
         "interrupted_recovery_slot_reuse" => run_interrupted_recovery_slot_reuse(case),
         "completion_retained_slot" => run_completion_retained_slot(case),
         "forensic_salvage_rebuild" => run_forensic_salvage_rebuild(case),
+        "graph_wide_foreign_edit_rejection" => run_graph_wide_foreign_edit_rejection(case),
         other => panic!("unknown portable crash-corpus case {other}"),
     }
 }
@@ -1818,6 +1967,8 @@ fn minimal_semantic_fixture_pages() -> Vec<SemanticFixturePage> {
         path: "pages/guard.md".to_owned(),
         format: "markdown".to_owned(),
         bytes: "- guard\n".to_owned(),
+        sha256: "d1d5678890fd91bc04b349d9d45fff8420e43620131f2b0646266a68c1422022"
+            .to_owned(),
         preamble: None,
         sparse_ids: Vec::new(),
         deleted: false,
