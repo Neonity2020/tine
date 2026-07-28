@@ -9312,25 +9312,21 @@ impl Graph {
         target: &ProjectionTarget,
     ) -> io::Result<()> {
         projection_optional_regular_metadata(parent.final_dir(), &target.filename)?;
-        let (target_stem, target_extension) =
-            split_logseq_text_filename(&target.filename).ok_or_else(bad_path)?;
-        for entry in parent.final_dir().entries()? {
-            let entry = entry?;
-            let entry_filename = entry.file_name();
-            let Some(filename) = entry_filename.to_str() else {
-                continue;
-            };
-            if filename == target.filename {
+        let (target_stem, _) = split_logseq_text_filename(&target.filename).ok_or_else(bad_path)?;
+        for extension in LOGSEQ_TEXT_EXTENSIONS {
+            let sibling = format!("{target_stem}.{extension}");
+            if sibling == target.filename {
                 continue;
             }
-            let Some((stem, extension)) = split_logseq_text_filename(filename) else {
-                continue;
-            };
-            if stem == target_stem && !extension.eq_ignore_ascii_case(target_extension) {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "projection page has an .md/.markdown/.org twin",
-                ));
+            match parent.final_dir().symlink_metadata(&sibling) {
+                Ok(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "projection page has an .md/.markdown/.org twin",
+                    ));
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
             }
         }
         Ok(())
@@ -28270,13 +28266,67 @@ mod tests {
     fn graph_wide_discovery_never_grants_sparse_enrollment_or_id_stamping() {
         let dir = scratch("graph-text-sparse-authority");
         fs::create_dir_all(dir.join("external")).unwrap();
-        let path = dir.join("external/Outside.markdown");
+        let path = dir.join("external/Outside.md");
         fs::write(&path, "- outside\n").unwrap();
         let graph = Graph::open(&dir);
 
         assert_eq!(graph.sync_identity_plan().unwrap().pages, 0);
         graph
             .enable_managed_sync(Uuid::from_u128(246_001), Uuid::from_u128(246_002))
+            .unwrap();
+
+        let mut page = graph.load_by_path("external/Outside.md").unwrap().unwrap();
+        page.blocks[0].raw = "edited outside".into();
+        graph.save_page(&page, page.rev.as_deref()).unwrap();
+        let saved = fs::read_to_string(&path).unwrap();
+        assert_eq!(saved, "- edited outside\n");
+        assert!(!saved.contains("id::"));
+        assert!(graph
+            .managed_sync
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .materialize_page("external/Outside.md")
+            .unwrap()
+            .is_none());
+
+        fs::write(&path, "- watcher outside\n").unwrap();
+        graph.sync_file_checked(&path).unwrap();
+        assert!(graph
+            .managed_sync
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .materialize_page("external/Outside.md")
+            .unwrap()
+            .is_none());
+        fs::remove_file(&path).unwrap();
+        graph.sync_deleted_file(&path).unwrap();
+        assert!(graph
+            .managed_sync
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .materialize_page("external/Outside.md")
+            .unwrap()
+            .is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn graph_wide_markdown_discovery_remains_outside_sparse_authority() {
+        let dir = scratch("graph-text-markdown-sparse-authority");
+        fs::create_dir_all(dir.join("external")).unwrap();
+        let path = dir.join("external/Outside.markdown");
+        fs::write(&path, "- outside\n").unwrap();
+        let graph = Graph::open(&dir);
+
+        assert_eq!(graph.sync_identity_plan().unwrap().pages, 0);
+        graph
+            .enable_managed_sync(Uuid::from_u128(246_003), Uuid::from_u128(246_004))
             .unwrap();
 
         let mut page = graph
@@ -28299,28 +28349,6 @@ mod tests {
             .unwrap()
             .is_none());
 
-        fs::write(&path, "- watcher outside\n").unwrap();
-        graph.sync_file_checked(&path).unwrap();
-        assert!(graph
-            .managed_sync
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .materialize_page("external/Outside.markdown")
-            .unwrap()
-            .is_none());
-        fs::remove_file(&path).unwrap();
-        graph.sync_deleted_file(&path).unwrap();
-        assert!(graph
-            .managed_sync
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .materialize_page("external/Outside.markdown")
-            .unwrap()
-            .is_none());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -33782,33 +33810,21 @@ mod tests {
         // so the guarded writer must address the exact nested spelling instead
         // of refusing it or relocating it into a configured root.
         let nested = graph
-            .projection_page_target("archive/2024/client notes/Ünicode Page.markdown")
+            .projection_page_target("archive/2024/client notes/Ünicode Page.md")
             .unwrap();
         assert_eq!(
             nested.relative_path,
-            "archive/2024/client notes/Ünicode Page.markdown"
+            "archive/2024/client notes/Ünicode Page.md"
         );
         assert_eq!(
             nested.parent_components,
             ["archive", "2024", "client notes"]
         );
-        assert_eq!(nested.filename, "Ünicode Page.markdown");
+        assert_eq!(nested.filename, "Ünicode Page.md");
         assert_eq!(
             nested.absolute_path,
-            root.join("archive/2024/client notes/Ünicode Page.markdown")
+            root.join("archive/2024/client notes/Ünicode Page.md")
         );
-        fs::create_dir_all(root.join("archive/2024/client notes")).unwrap();
-        let sibling_twin = root.join("archive/2024/client notes/Ünicode Page.md");
-        fs::write(&sibling_twin, b"- same-stem twin\n").unwrap();
-        let parent = graph.projection_parent(&nested, false).unwrap();
-        let twin = graph
-            .ensure_projection_target_shape(&parent, &nested)
-            .unwrap_err();
-        assert_eq!(twin.kind(), io::ErrorKind::AlreadyExists);
-        fs::remove_file(&sibling_twin).unwrap();
-        graph
-            .ensure_projection_target_shape(&parent, &nested)
-            .unwrap();
 
         let top = graph.projection_page_target("Top Level.org").unwrap();
         assert!(top.parent_components.is_empty());
@@ -33840,6 +33856,54 @@ mod tests {
                 graph.projection_page_target(refused).is_err(),
                 "accepted {refused}"
             );
+        }
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn projection_twin_check_uses_only_bounded_direct_metadata_lookups() {
+        let source = include_str!("model.rs");
+        let shape = source
+            .split_once("    fn ensure_projection_target_shape(")
+            .expect("projection target-shape function")
+            .1
+            .split_once("\n    fn ensure_projection_parent_binding(")
+            .expect("next projection function")
+            .0;
+
+        assert!(!shape.contains(".entries("));
+        assert!(shape.contains("for extension in LOGSEQ_TEXT_EXTENSIONS"));
+        assert!(shape.contains("parent.final_dir().symlink_metadata(&sibling)"));
+    }
+
+    #[test]
+    fn projection_twin_check_covers_all_supported_extensions_and_preserves_files() {
+        let root = scratch("projection-lowercase-twins");
+        let graph = Graph::open(&root);
+
+        for (stem, target_extension, twin_extension) in [
+            ("MdMarkdown", "md", "markdown"),
+            ("MarkdownOrg", "markdown", "org"),
+            ("OrgMd", "org", "md"),
+        ] {
+            let target_relative = format!("pages/{stem}.{target_extension}");
+            let target_path = root.join(&target_relative);
+            let twin_path = root.join(format!("pages/{stem}.{twin_extension}"));
+            let target_bytes = format!("- {target_extension} target\n").into_bytes();
+            let twin_bytes = format!("- {twin_extension} twin\n").into_bytes();
+            fs::write(&target_path, &target_bytes).unwrap();
+            fs::write(&twin_path, &twin_bytes).unwrap();
+
+            let target = graph.projection_page_target(&target_relative).unwrap();
+            let parent = graph.projection_parent(&target, false).unwrap();
+            let error = graph
+                .ensure_projection_target_shape(&parent, &target)
+                .unwrap_err();
+
+            assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+            assert_eq!(fs::read(&target_path).unwrap(), target_bytes);
+            assert_eq!(fs::read(&twin_path).unwrap(), twin_bytes);
         }
 
         let _ = fs::remove_dir_all(&root);
@@ -36226,7 +36290,7 @@ mod tests {
         fs::create_dir_all(root.join("content/pages/arbitrary/deeper")).unwrap();
         fs::create_dir_all(root.join("content/journals/archive/deeper")).unwrap();
         fs::write(
-            root.join("content/pages/arbitrary/deeper/Project%2FPlan.markdown"),
+            root.join("content/pages/arbitrary/deeper/Project%2FPlan.md"),
             b"- page\n",
         )
         .unwrap();
@@ -36249,7 +36313,7 @@ mod tests {
                     b"* journal\n".as_slice(),
                 ),
                 (
-                    "content/pages/arbitrary/deeper/Project%2FPlan.markdown",
+                    "content/pages/arbitrary/deeper/Project%2FPlan.md",
                     b"- page\n".as_slice(),
                 ),
             ]
@@ -36261,6 +36325,36 @@ mod tests {
         assert_eq!(journal.name, "2026-07-25");
         let page = graph
             .managed_entry_for_managed_path(&inventory[1].0)
+            .unwrap();
+        assert_eq!(page.kind, PageKind::Page);
+        assert_eq!(page.name, "Project/Plan");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn initial_shadow_accepts_markdown_in_a_configured_nested_page_root() {
+        let root = scratch("initial-shadow-configured-markdown");
+        fs::create_dir_all(root.join("logseq")).unwrap();
+        fs::write(
+            root.join("logseq/config.edn"),
+            "{:pages-directory \"content/pages\"}\n",
+        )
+        .unwrap();
+        let path = root.join("content/pages/arbitrary/deeper/Project%2FPlan.markdown");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"- markdown page\n").unwrap();
+
+        let graph = Graph::open(&root);
+        let inventory = graph.initial_shadow_raw_managed_text_inventory().unwrap();
+        assert_eq!(inventory.len(), 1);
+        assert_eq!(
+            inventory[0].0.as_str(),
+            "content/pages/arbitrary/deeper/Project%2FPlan.markdown"
+        );
+        assert_eq!(inventory[0].1, b"- markdown page\n");
+        let page = graph
+            .managed_entry_for_managed_path(&inventory[0].0)
             .unwrap();
         assert_eq!(page.kind, PageKind::Page);
         assert_eq!(page.name, "Project/Plan");
