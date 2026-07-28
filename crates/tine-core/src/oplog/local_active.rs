@@ -3780,6 +3780,7 @@ pub(crate) fn open_promoted_local_runtime<W: PromotedWorkspaceAuthority>(
         workspace,
         RuntimeRecoveryState::FirstPromotion,
         Some((authority, open.graph)),
+        PromotedProjectionOpen::AllowRebuild,
     )
 }
 
@@ -3821,6 +3822,26 @@ pub(crate) fn reopen_promoted_local_runtime(
         open,
         HandoffAdoption::OwnSessionOrSafe,
         TakeoverPublication::Durable,
+        PromotedProjectionOpen::AllowRebuild,
+    )
+}
+
+/// Runtime-host reopen which refuses a missing or invalid disposable
+/// projection instead of repairing it during startup.
+pub(crate) fn reopen_promoted_local_runtime_existing_projection(
+    root: &EnrollmentApplicationRoot,
+    binding: &EnrollmentBindingV1,
+    session_id: SessionId,
+    open: &PromotedRuntimeOpen<'_>,
+) -> Result<(LocalActiveAuthority, PromotedLocalRuntime), RuntimePromotionError> {
+    reopen_promoted_local_runtime_with_adoption(
+        root,
+        binding,
+        session_id,
+        open,
+        HandoffAdoption::OwnSessionOrSafe,
+        TakeoverPublication::Durable,
+        PromotedProjectionOpen::ExistingOnly,
     )
 }
 
@@ -3861,6 +3882,26 @@ pub(crate) fn take_over_promoted_local_runtime(
         open,
         HandoffAdoption::CrashTakeover,
         TakeoverPublication::Durable,
+        PromotedProjectionOpen::AllowRebuild,
+    )
+}
+
+/// Runtime-host crash takeover with the identical archive-lease proof and an
+/// existing-only device-local projection open.
+pub(crate) fn take_over_promoted_local_runtime_existing_projection(
+    root: &EnrollmentApplicationRoot,
+    binding: &EnrollmentBindingV1,
+    session_id: SessionId,
+    open: &PromotedRuntimeOpen<'_>,
+) -> Result<(LocalActiveAuthority, PromotedLocalRuntime), RuntimePromotionError> {
+    reopen_promoted_local_runtime_with_adoption(
+        root,
+        binding,
+        session_id,
+        open,
+        HandoffAdoption::CrashTakeover,
+        TakeoverPublication::Durable,
+        PromotedProjectionOpen::ExistingOnly,
     )
 }
 
@@ -3880,6 +3921,7 @@ pub(crate) fn take_over_promoted_local_runtime_at_cut_for_test(
         open,
         HandoffAdoption::CrashTakeover,
         TakeoverPublication::AtCut(cut),
+        PromotedProjectionOpen::AllowRebuild,
     )
 }
 
@@ -3900,6 +3942,12 @@ enum TakeoverPublication {
     /// Interrupt the durable publication at one exact enrollment cut.
     #[cfg(test)]
     AtCut(super::enrollment::CommitCut),
+}
+
+#[derive(Clone, Copy)]
+enum PromotedProjectionOpen {
+    AllowRebuild,
+    ExistingOnly,
 }
 
 #[cfg(test)]
@@ -4040,6 +4088,7 @@ fn reopen_promoted_local_runtime_with_adoption(
     open: &PromotedRuntimeOpen<'_>,
     adoption: HandoffAdoption,
     publication: TakeoverPublication,
+    projection_open: PromotedProjectionOpen,
 ) -> Result<(LocalActiveAuthority, PromotedLocalRuntime), RuntimePromotionError> {
     let anchor = reopen_promoted_bootstrap_anchor(root, binding)?;
     // The committed record decides which of the three durable predecessors this
@@ -4103,6 +4152,7 @@ fn reopen_promoted_local_runtime_with_adoption(
         AcquireWorkspaceLease,
         recovery,
         None,
+        projection_open,
     )?;
 
     // Only now, with complete recovery proved, may an authority exist. The
@@ -4365,6 +4415,7 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
     workspace: W,
     recovery: RuntimeRecoveryState,
     post_open: Option<(&LocalActiveAuthority, &Graph)>,
+    projection_open: PromotedProjectionOpen,
 ) -> Result<PromotedLocalRuntime, W::Refusal> {
     // Everything below stays in one stack frame on purpose: `PromotedLocalRuntime`
     // and the recovered engine are tens of kilobytes, so an extra function
@@ -4598,13 +4649,26 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
         |slot| {
             let source = RebuildSource::from_promoted_runtime(&engine, store, &publication)
                 .map_err(ProjectionError::from)?;
-            SqliteFrontier::open_or_rebuild_with_applier_slot(
-                open.database_path,
-                open.application_runtime_root,
-                claim,
-                source,
-                slot,
-            )
+            match projection_open {
+                PromotedProjectionOpen::AllowRebuild => {
+                    SqliteFrontier::open_or_rebuild_with_applier_slot(
+                        open.database_path,
+                        open.application_runtime_root,
+                        claim,
+                        source,
+                        slot,
+                    )
+                }
+                PromotedProjectionOpen::ExistingOnly => {
+                    SqliteFrontier::open_existing_with_applier_slot(
+                        open.database_path,
+                        open.application_runtime_root,
+                        claim,
+                        source,
+                        slot,
+                    )
+                }
+            }
             .map(|opened| (opened, ()))
         },
     ) {

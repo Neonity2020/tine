@@ -516,6 +516,59 @@ impl ProjectionReceiptStore {
         Self::open_with_binding(root, workspace_id, Some(endpoint))
     }
 
+    /// Open an enrolled receipt namespace without creating its root, claim, or
+    /// child namespaces.
+    ///
+    /// This is the runtime-host reopen boundary. The expected physical store
+    /// identity comes from the authenticated enrollment, so replacing a
+    /// missing store with a newly initialized directory cannot silently become
+    /// authority.
+    pub(crate) fn open_existing_for_endpoint(
+        root: &Path,
+        workspace_id: WorkspaceId,
+        endpoint: ProjectionEndpointBinding,
+        expected_store_id: ProjectionReceiptStoreId,
+    ) -> Result<Self, ProjectionStoreError> {
+        let name = root
+            .file_name()
+            .ok_or_else(|| ProjectionStoreError::UnsafeEntry("store root has no name".into()))?;
+        if !matches!(root.components().next_back(), Some(Component::Normal(_))) {
+            return Err(ProjectionStoreError::UnsafeEntry(
+                "store root must end in a normal path component".into(),
+            ));
+        }
+        let name = name.to_str().ok_or_else(|| {
+            ProjectionStoreError::UnsafeEntry("store root name is not UTF-8".into())
+        })?;
+        let parent = root.parent().ok_or_else(|| {
+            ProjectionStoreError::UnsafeEntry("store root has no existing parent".into())
+        })?;
+        let canonical_parent = std::fs::canonicalize(parent)?;
+        let parent_capability = Dir::open_ambient_dir(&canonical_parent, ambient_authority())?;
+        let capability = open_dir_nofollow(&parent_capability, name)?;
+        let store_id = canonical_receipt_store_id(&capability)?;
+        if store_id != expected_store_id {
+            return Err(ProjectionStoreError::EndpointBindingMismatch);
+        }
+        let bytes = read_optional_regular(&capability, STORE_CLAIM_FILE, 512, None)?
+            .ok_or(ProjectionStoreError::MalformedStoreClaim)?;
+        let expected = validate_claim(&bytes, store_id, workspace_id, Some(endpoint))?;
+        let namespaces = open_receipt_namespaces(&capability)?;
+        if namespaces.identities() != expected {
+            return Err(ProjectionStoreError::NamespaceSubstitution(
+                "top-level receipt namespace".into(),
+            ));
+        }
+        Ok(Self {
+            root_path: canonical_parent.join(name),
+            store_id,
+            workspace_id,
+            endpoint: Some(endpoint),
+            capability,
+            namespaces,
+        })
+    }
+
     fn open_with_binding(
         root: &Path,
         workspace_id: WorkspaceId,

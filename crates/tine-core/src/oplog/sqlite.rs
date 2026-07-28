@@ -661,6 +661,31 @@ impl ApplicationRuntimeRoot {
         Ok(Self { path })
     }
 
+    /// Retain an already-existing private runtime root without creating it.
+    pub(crate) fn open_existing_for_runtime_host(path: &Path) -> Result<Self, ProjectionError> {
+        let direct_metadata = fs::symlink_metadata(path)?;
+        if direct_metadata.file_type().is_symlink() || !direct_metadata.is_dir() {
+            return Err(ProjectionError::UnsafePath(
+                "application runtime root is not a no-follow directory".into(),
+            ));
+        }
+        let path = fs::canonicalize(path)?;
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(ProjectionError::UnsafePath(
+                "application runtime root is not a real directory".into(),
+            ));
+        }
+        #[cfg(unix)]
+        // SAFETY: `geteuid` takes no arguments and has no memory-safety preconditions.
+        if metadata.uid() != unsafe { libc::geteuid() } {
+            return Err(ProjectionError::UnsafePath(
+                "application runtime root is not owned by the current user".into(),
+            ));
+        }
+        Ok(Self { path })
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -2460,6 +2485,47 @@ impl SqliteFrontier {
             &ApplierAuthorization::Slot(&slot),
         )?;
         Ok(LeasedOpenProjection::bind(opened, slot))
+    }
+
+    /// Runtime-host reopen of one exact existing projection.
+    ///
+    /// Missing, invalid, divergent, or forensic-interrupted state is refused.
+    /// This boundary never preserves, deletes, publishes, or rebuilds files.
+    pub(crate) fn open_existing_with_applier_slot<'lease>(
+        path: &Path,
+        _application_runtime_root: &ApplicationRuntimeRoot,
+        claim: ProjectionClaim,
+        source: RebuildSource<'_>,
+        slot: SqliteApplierSlot<'lease>,
+    ) -> Result<LeasedOpenProjection<'lease>, ProjectionError> {
+        validate_source(claim, &source)?;
+        source.authenticate_exact_frontier()?;
+        let path = require_existing_database_path(path)?;
+        let lease =
+            ApplierAuthorization::Slot(&slot).acquire(source.store, &path, claim.workspace_id)?;
+        if incomplete_forensic_recovery_exists(&path)? {
+            return Err(ProjectionError::Corrupt(
+                "existing projection has interrupted forensic recovery".into(),
+            ));
+        }
+        validate_existing(&path, claim, &source).map_err(ProjectionError::Corrupt)?;
+        let connection = open_writable(&path)?;
+        Ok(LeasedOpenProjection::bind(
+            OpenProjection {
+                database: Self {
+                    path,
+                    claim,
+                    connection,
+                    runtime_authority: source.runtime_authority.clone(),
+                    required_frontier_root: source.exact_frontier_root.clone(),
+                    checkpoint_each_apply: true,
+                    _lease: lease,
+                },
+                recovery: ProjectionRecovery::OpenedExisting,
+                rebuild: RebuildInstrumentation::default(),
+            },
+            slot,
+        ))
     }
 
     fn open_or_rebuild_authorized(
@@ -5959,6 +6025,70 @@ fn prepare_database_path(path: &Path) -> Result<PathBuf, ProjectionError> {
         }
     }
     Ok(canonical_path)
+}
+
+fn require_existing_database_path(path: &Path) -> Result<PathBuf, ProjectionError> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| ProjectionError::UnsafePath("database path has no file name".into()))?;
+    if name.is_empty() {
+        return Err(ProjectionError::UnsafePath(
+            "database path has an empty file name".into(),
+        ));
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| ProjectionError::UnsafePath("database path has no parent".into()))?;
+    let canonical_parent = fs::canonicalize(parent)?;
+    let canonical_path = canonical_parent.join(name);
+    let metadata = fs::symlink_metadata(&canonical_path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(ProjectionError::UnsafePath(
+            "database path is not an existing regular no-follow file".into(),
+        ));
+    }
+    Ok(canonical_path)
+}
+
+fn incomplete_forensic_recovery_exists(path: &Path) -> Result<bool, ProjectionError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| ProjectionError::UnsafePath("database path has no parent".into()))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| ProjectionError::UnsafePath("database file name is not UTF-8".into()))?;
+    let prefix = format!("{file_name}.forensic-");
+    for entry in fs::read_dir(parent)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with(&prefix) {
+            continue;
+        }
+        let directory = entry.path();
+        let metadata = fs::symlink_metadata(&directory)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(ProjectionError::UnsafePath(format!(
+                "forensic evidence {} is not a regular directory",
+                directory.display()
+            )));
+        }
+        match fs::symlink_metadata(directory.join("REBUILD_COMPLETE")) {
+            Ok(marker) if marker.file_type().is_symlink() || !marker.is_file() => {
+                return Err(ProjectionError::UnsafePath(format!(
+                    "forensic completion marker in {} is not a regular file",
+                    directory.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(true),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(false)
 }
 
 fn prepare_application_runtime_root(path: &Path) -> Result<PathBuf, ProjectionError> {

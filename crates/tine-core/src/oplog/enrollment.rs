@@ -216,6 +216,21 @@ impl EnrollmentApplicationRoot {
     }
 }
 
+/// Retain one already-existing enrollment application root without creating
+/// or repairing any namespace below it.
+///
+/// Runtime discovery has already classified this path, but the actor uses this
+/// fresh capability so no advisory path value itself becomes writer authority.
+pub(crate) fn open_existing_enrollment_application_root(
+    path: &Path,
+) -> Result<EnrollmentApplicationRoot, EnrollmentError> {
+    open_existing_application_root(path)?.ok_or_else(|| {
+        EnrollmentError::UnsafeNamespace(
+            "discovered enrollment application root no longer exists".into(),
+        )
+    })
+}
+
 #[cfg(test)]
 pub(crate) fn enrollment_application_root_for_test(
     path: &Path,

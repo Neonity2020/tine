@@ -14,8 +14,8 @@ pub mod batch;
 pub(crate) mod bootstrap_import;
 pub(crate) mod causal_index;
 pub(crate) mod dependency_queue;
-// P2.N11 is a read-only startup advisory. It is deliberately not wired to
-// runtime selection, activation, Tauri, migration, or any writer authority.
+// P2.N11 discovery remains read-only and is consumed only by the explicit,
+// inactive `sync_runtime` host.
 #[allow(dead_code)]
 pub(crate) mod discovery;
 pub(crate) mod document_state;

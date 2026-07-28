@@ -938,7 +938,7 @@ fn exact_feed_after_terminal_before_ack_hook() -> std::io::Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::fs;
     use std::io;
     use std::path::{Path, PathBuf};
@@ -948,7 +948,8 @@ mod tests {
     use super::*;
     use crate::oplog::enrollment::{
         compose_verified_local, enrollment_application_root_for_test, EnrollmentApplicationRoot,
-        EnrollmentBindingV1, PreparationId, VerifiedLocalEvidence, VerifiedLocalProofSet,
+        EnrollmentBindingV1, EnrollmentDiscoveryHandoff, PreparationId, VerifiedLocalEvidence,
+        VerifiedLocalProofSet,
     };
     use crate::oplog::import::{
         prepare_inactive_bootstrap_import, publish_install_verify_inactive_bootstrap,
@@ -2230,6 +2231,124 @@ mod tests {
             ExactExternalFeedDrain::Terminal(ExactExternalFeedTerminal::GraphFeed(_))
         ));
         assert_eq!(runtime.watcher_status(), terminal_status);
+    }
+
+    /// Existing production-authority fixture retained for the runtime-host
+    /// tests. Construction uses the same inactive bootstrap, enrollment,
+    /// promotion, SQLite, receipt, and Safe/takeover boundaries as this module's
+    /// causal tests; no authority is manufactured for the host.
+    pub(crate) struct RuntimeHostFixture {
+        fixture: Fixture,
+        enrollment_path: PathBuf,
+        paths: PromotedPaths,
+        held_owner: Option<(LocalActiveAuthority, PromotedLocalRuntime)>,
+    }
+
+    impl RuntimeHostFixture {
+        pub(crate) fn safe(label: &str) -> Self {
+            let mut fixture = configured_fixture(label);
+            let enrollment = fixture.enrollment_root(label);
+            let enrollment_path = enrollment.path().to_path_buf();
+            let paths = PromotedPaths::new(&fixture, label);
+            let (mut authority, mut runtime) =
+                promoted_safe_reopen(&mut fixture, &enrollment, &paths);
+            runtime
+                .quiesce_and_mark_safe(&mut authority, &fixture.graph)
+                .unwrap();
+            drop(runtime);
+            drop(authority);
+            create_runtime_host_baseline(&fixture, &paths);
+            Self {
+                fixture,
+                enrollment_path,
+                paths,
+                held_owner: None,
+            }
+        }
+
+        pub(crate) fn unsafe_held(label: &str) -> Self {
+            Self::unsafe_inner(label, true)
+        }
+
+        fn unsafe_inner(label: &str, retain_owner: bool) -> Self {
+            let mut fixture = configured_fixture(label);
+            let enrollment = fixture.enrollment_root(label);
+            let enrollment_path = enrollment.path().to_path_buf();
+            let paths = PromotedPaths::new(&fixture, label);
+            let owner = promote(&mut fixture, &enrollment, SessionId::new(), &paths);
+            create_runtime_host_baseline(&fixture, &paths);
+            Self {
+                fixture,
+                enrollment_path,
+                paths,
+                held_owner: retain_owner.then_some(owner),
+            }
+        }
+
+        pub(crate) fn release_held_owner(&mut self) {
+            self.held_owner.take();
+        }
+
+        pub(crate) fn request(&self) -> crate::sync_runtime::SyncRuntimeOpenRequest {
+            crate::sync_runtime::SyncRuntimeOpenRequest {
+                profile: crate::sync_runtime::SyncStorageProfile::ExperimentalLocal,
+                graph_root: self.fixture.graph_root.clone(),
+                enrollment_root: self.enrollment_path.clone(),
+                archive_root: self.fixture.archive_root.clone(),
+                receipt_root: self.fixture.receipts.root_path().to_path_buf(),
+                database_path: self.paths.database_path.clone(),
+                application_runtime_root: self.paths.runtime_root.path().to_path_buf(),
+            }
+        }
+
+        pub(crate) fn graph_root(&self) -> &Path {
+            &self.fixture.graph_root
+        }
+
+        pub(crate) fn lease_path(&self) -> PathBuf {
+            self.fixture
+                .archive_root
+                .join(".tine-runtime")
+                .join("sqlite-workspaces")
+                .join(self.fixture.workspace.to_string())
+                .join("sqlite-applier.lock")
+        }
+
+        pub(crate) fn manifest_count(&self) -> usize {
+            self.fixture.manifest_count()
+        }
+
+        pub(crate) fn handoff(&self) -> EnrollmentDiscoveryHandoff {
+            let graph_resource_id = self.fixture.graph.canonical_resource_id().unwrap();
+            let classification = crate::oplog::discovery::discover_startup(
+                &crate::oplog::discovery::DiscoveryRequest {
+                    profile: crate::oplog::discovery::StartupStorageProfile::ExperimentalSparse,
+                    graph_resource_id,
+                    runtime_root: &self.enrollment_path,
+                    archive_root: &self.fixture.archive_root,
+                },
+            );
+            let crate::oplog::discovery::DiscoveryClassification::ExistingLocalActive(advisory) =
+                classification
+            else {
+                panic!("runtime-host fixture no longer classifies LocalActive");
+            };
+            advisory.handoff
+        }
+    }
+
+    fn create_runtime_host_baseline(fixture: &Fixture, paths: &PromotedPaths) {
+        let trusted = TrustedPrivateApplicationRuntimeRoot::from_application_runtime_root(
+            &paths.runtime_root,
+        );
+        let binding = ReconciliationBaselineBinding::new(
+            fixture.workspace,
+            fixture.receipts.endpoint_binding().unwrap().endpoint_id(),
+            fixture.graph.canonical_resource_id().unwrap(),
+            fixture.graph.graph_text_scope_binding().unwrap(),
+        )
+        .unwrap();
+        ReconciliationBaseline::create_fresh(&trusted, binding).unwrap();
     }
 
     // The state remains move-only, while its constructor type proves the actor
