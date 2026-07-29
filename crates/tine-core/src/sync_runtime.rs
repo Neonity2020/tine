@@ -11152,6 +11152,23 @@ mod tests {
         }
     }
 
+    fn replicate_provider_file_event(from: &Path, to: &Path, relative: &Path) {
+        let source = from.join(relative);
+        let destination = to.join(relative);
+        if source.is_file() {
+            fs::create_dir_all(destination.parent().unwrap()).unwrap();
+            fs::copy(source, destination).unwrap();
+        } else {
+            assert!(
+                !source.exists(),
+                "provider event helper only supports regular files or exact deletions"
+            );
+            if destination.is_file() {
+                fs::remove_file(destination).unwrap();
+            }
+        }
+    }
+
     fn reopen_request(request: &SyncLocalActivationRequest) -> SyncRuntimeOpenRequest {
         SyncRuntimeOpenRequest {
             profile: SyncStorageProfile::ExperimentalLocal,
@@ -13838,6 +13855,264 @@ mod tests {
     }
 
     #[test]
+    fn peer_retired_publication_intent_settles_and_later_delivery_reaches_safe() {
+        let (author, peer, author_handle, peer_handle) =
+            joined_shared_pair("provider-peer-retired-intent", 0xed00);
+        let (first_batch, ..) = submit_shared_page(
+            &author_handle,
+            0xed20,
+            "Peer Retired Intent",
+            "notes/peer-retired-intent.md",
+            "published before the author's covering head",
+        );
+        publish_shared_batch(&author_handle, &author, first_batch);
+
+        let author_intents = author
+            .request
+            .provider_root
+            .join("outbox")
+            .join(SHARED_PROVIDER_PUBLICATION_INTENTS_NAMESPACE);
+        let intent_entry = fs::read_dir(&author_intents)
+            .unwrap()
+            .map(Result::unwrap)
+            .next()
+            .expect("author publication intent");
+        assert_eq!(
+            fs::read_dir(&author_intents).unwrap().count(),
+            1,
+            "fixture must retain exactly the newly published intent"
+        );
+        let intent_relative = format!(
+            "{SHARED_PROVIDER_PUBLICATION_INTENTS_NAMESPACE}/{}",
+            intent_entry.file_name().to_string_lossy()
+        );
+
+        copy_provider_tree(&author.request.provider_root, &peer.request.provider_root);
+        peer_handle
+            .observe_provider_paths(
+                vec![
+                    intent_relative.clone(),
+                    format!("manifests/{first_batch}.manifest"),
+                ],
+                false,
+            )
+            .unwrap();
+        settle_shared_provider(&peer_handle);
+        assert!(
+            !peer
+                .request
+                .provider_root
+                .join("outbox")
+                .join(&intent_relative)
+                .exists(),
+            "peer did not retire the foreign intent after publishing a covering head"
+        );
+
+        replicate_provider_file_event(
+            &peer.request.provider_root,
+            &author.request.provider_root,
+            Path::new("outbox").join(&intent_relative).as_path(),
+        );
+        assert!(
+            !author
+                .request
+                .provider_root
+                .join("outbox")
+                .join(&intent_relative)
+                .exists(),
+            "provider deletion did not replicate back to the author"
+        );
+
+        let (later_batch, ..) = submit_shared_page(
+            &peer_handle,
+            0xed40,
+            "Later Peer Delivery",
+            "notes/later-peer-delivery.md",
+            "must not starve behind converged retirement",
+        );
+        publish_shared_batch(&peer_handle, &peer, later_batch);
+        settle_shared_provider(&peer_handle);
+        copy_provider_tree(&peer.request.provider_root, &author.request.provider_root);
+        author_handle
+            .observe_provider_paths(vec![format!("manifests/{later_batch}.manifest")], false)
+            .unwrap();
+
+        let mut blocked_ticks = 0;
+        for _ in 0..512 {
+            let tick = author_handle.tick().unwrap();
+            if matches!(tick, SyncRuntimeTick::RecoveryBlocked(_)) {
+                blocked_ticks += 1;
+            }
+            if matches!(tick, SyncRuntimeTick::Idle)
+                && author_handle.status().unwrap().provider_pending == 0
+            {
+                break;
+            }
+        }
+        assert_eq!(
+            blocked_ticks, 0,
+            "an already-absent retirement target permanently blocked provider progress"
+        );
+        assert!(
+            author
+                .graph_root
+                .join("notes/later-peer-delivery.md")
+                .is_file(),
+            "later peer delivery starved behind the settled retirement"
+        );
+
+        let descriptor_bytes = fs::read(
+            author
+                .request
+                .provider_root
+                .join("outbox")
+                .join(SHARED_ENROLLMENT_DESCRIPTOR_PATH),
+        )
+        .unwrap();
+        let descriptor = SharedEnrollmentDescriptorV1::decode(&descriptor_bytes).unwrap();
+        let manifest_bytes = fs::read(
+            author
+                .request
+                .provider_root
+                .join(format!("outbox/manifests/{later_batch}.manifest")),
+        )
+        .unwrap();
+        let manifest = OperationBatch::decode(&manifest_bytes).unwrap();
+        let replayed_intent = SharedProviderPublicationIntentV1::new(
+            descriptor.workspace_id(),
+            descriptor.lineage_digest(),
+            descriptor.digest().unwrap(),
+            peer.request.identities.device_id,
+            manifest.author_device_id(),
+            later_batch,
+            ContentDigest::of(&manifest_bytes),
+        )
+        .unwrap();
+        let replayed_intent_path = replayed_intent.path().unwrap();
+        fs::write(
+            author
+                .request
+                .provider_root
+                .join("outbox")
+                .join(&replayed_intent_path),
+            replayed_intent.encode().unwrap(),
+        )
+        .unwrap();
+        author_handle
+            .observe_provider_paths(vec![replayed_intent_path.clone()], false)
+            .unwrap();
+        assert!(matches!(
+            author_handle.tick().unwrap(),
+            SyncRuntimeTick::Recovering
+        ));
+        fs::remove_file(
+            author
+                .request
+                .provider_root
+                .join("outbox")
+                .join(&replayed_intent_path),
+        )
+        .unwrap();
+        assert!(
+            !matches!(
+                author_handle.tick().unwrap(),
+                SyncRuntimeTick::RecoveryBlocked(_)
+            ),
+            "queued replayed-intent retirement did not settle after provider deletion"
+        );
+        settle_shared_provider(&author_handle);
+        assert!(matches!(
+            author_handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(snapshot)) if snapshot.provider_pending == 0
+        ));
+    }
+
+    #[test]
+    fn absent_superseded_head_settles_and_reappeared_head_retires_again() {
+        let fixture = make_shared_fixture("provider-idempotent-head-retirement", 0xeda0);
+        let _descriptor = activate_and_prepare_shared(&fixture);
+        let handle = active_handle(SyncRuntimeHandle::open(reopen_request(&fixture.request)));
+        settle_shared_provider(&handle);
+
+        let heads = fixture
+            .request
+            .provider_root
+            .join("outbox")
+            .join(SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE);
+        let old_entry = fs::read_dir(&heads).unwrap().next().unwrap().unwrap();
+        let old_name = old_entry.file_name();
+        let old_path = old_entry.path();
+        let old_bytes = fs::read(&old_path).unwrap();
+        let old_relative = format!(
+            "{SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE}/{}",
+            old_name.to_string_lossy()
+        );
+
+        let (batch_id, ..) = submit_shared_page(
+            &handle,
+            0xedc0,
+            "Idempotent Head Retirement",
+            "notes/idempotent-head-retirement.md",
+            "publish the replacement before retiring the old head",
+        );
+        publish_shared_batch(&handle, &fixture, batch_id);
+        for _ in 0..64 {
+            if fs::read_dir(&heads).unwrap().count() == 2 {
+                break;
+            }
+            let tick = handle.tick().unwrap();
+            assert!(
+                !matches!(tick, SyncRuntimeTick::RecoveryBlocked(_)),
+                "replacement head publication blocked: {tick:?}"
+            );
+        }
+        assert_eq!(
+            fs::read_dir(&heads).unwrap().count(),
+            2,
+            "fixture did not stop between replacement publication and old-head retirement"
+        );
+
+        fs::remove_file(&old_path).unwrap();
+        settle_shared_provider(&handle);
+        assert_eq!(
+            fs::read_dir(&heads).unwrap().count(),
+            1,
+            "an already-absent superseded head did not settle"
+        );
+
+        fs::write(&old_path, &old_bytes).unwrap();
+        handle
+            .observe_provider_paths(vec![old_relative.clone()], false)
+            .unwrap();
+        settle_shared_provider(&handle);
+        assert!(
+            !old_path.exists(),
+            "redelivered superseded head was not retired"
+        );
+
+        let removed = fixture.request.provider_root.join("outbox").join("removed");
+        let retired_old = fs::read_dir(&removed)
+            .unwrap()
+            .map(Result::unwrap)
+            .find(|entry| fs::read(entry.path()).is_ok_and(|bytes| bytes == old_bytes))
+            .expect("completed old-head retirement diagnostic");
+        fs::remove_file(retired_old.path()).unwrap();
+        fs::write(&old_path, &old_bytes).unwrap();
+        handle
+            .observe_provider_paths(vec![old_relative], false)
+            .unwrap();
+        settle_shared_provider(&handle);
+        assert!(
+            !old_path.exists(),
+            "reappeared head was not retired again after completed-retirement evidence loss"
+        );
+        assert!(matches!(
+            handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(snapshot)) if snapshot.provider_pending == 0
+        ));
+    }
+
+    #[test]
     fn two_offline_devices_union_reordered_frontier_heads_without_history_scan() {
         let (first, second, first_handle, second_handle) =
             joined_shared_pair("provider-two-offline-heads", 0xb2a0);
@@ -15151,6 +15426,27 @@ mod tests {
             user_graph_bytes(&fixture.graph_root),
             graph_before,
             "ambiguous provider evidence authorized graph writes"
+        );
+
+        let provider = SharedProviderTransport::open(
+            &fixture.request.provider_root,
+            &fixture.request.provider_journal_root,
+        )
+        .unwrap();
+        let absent_name = "shared-enrollment-v1.sync-conflict-20260729-120001-HIJKLMN.json";
+        let error = provider
+            .remove_identical_generated_conflict(
+                &format!("enrollment/{absent_name}"),
+                SHARED_ENROLLMENT_DESCRIPTOR_PATH,
+            )
+            .expect_err("an absent conflict target must still require exact source proof");
+        assert!(
+            error.to_string().contains("unknown provider path"),
+            "absent conflict removal changed its strict failure: {error}"
+        );
+        assert!(
+            canonical.is_file(),
+            "absent conflict removal changed the canonical provider file"
         );
     }
 

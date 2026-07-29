@@ -3042,6 +3042,7 @@ impl SharedProviderTransport {
             ProviderTree::Outbox,
             path,
             None,
+            ProviderRemoveMissingSourcePolicy::SettleIfAbsent,
         )
     }
 
@@ -3066,6 +3067,7 @@ impl SharedProviderTransport {
             ProviderTree::Outbox,
             path,
             None,
+            ProviderRemoveMissingSourcePolicy::SettleIfAbsent,
         )
     }
 
@@ -3188,6 +3190,7 @@ impl SharedProviderTransport {
             ProviderTree::Outbox,
             conflict_path,
             Some(canonical_path),
+            ProviderRemoveMissingSourcePolicy::RequirePresent,
         )
     }
 
@@ -8060,7 +8063,18 @@ fn run_provider_remove(
         tree,
         path,
         None,
+        ProviderRemoveMissingSourcePolicy::RequirePresent,
     )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProviderRemoveMissingSourcePolicy {
+    /// Generic scheduled removes and proof-bound conflict cleanup must observe
+    /// the source they are authorized to remove.
+    RequirePresent,
+    /// Retirement owns the exact path already; provider-side convergence may
+    /// have completed the removal before this device starts its local journal.
+    SettleIfAbsent,
 }
 
 fn run_provider_remove_with(
@@ -8071,6 +8085,7 @@ fn run_provider_remove_with(
     tree: ProviderTree,
     path: &str,
     identical_canonical_path: Option<&str>,
+    missing_source_policy: ProviderRemoveMissingSourcePolicy,
 ) -> Result<(), ScenarioError> {
     let gate = journal.acquire_transaction_gate()?;
     reject_provider_temporary_path(path)?;
@@ -8122,9 +8137,16 @@ fn run_provider_remove_with(
     )? {
         Some(record) => record,
         None => {
-            let source =
+            let Some(source) =
                 open_provider_regular_optional(&parent, &name, MAX_PROVIDER_RESCAN_BYTES, path)?
-                    .ok_or_else(|| ScenarioError::UnknownProviderPath(path.into()))?;
+            else {
+                return match missing_source_policy {
+                    ProviderRemoveMissingSourcePolicy::RequirePresent => {
+                        Err(ScenarioError::UnknownProviderPath(path.into()))
+                    }
+                    ProviderRemoveMissingSourcePolicy::SettleIfAbsent => Ok(()),
+                };
+            };
             if canonical_bytes
                 .as_ref()
                 .is_some_and(|canonical| canonical != &source.bytes)
@@ -11166,6 +11188,38 @@ mod tests {
             serde_json::Value::String(ContentDigest::of(b"different manifest").to_string());
         let reordered = serde_json::to_vec(&reordered).unwrap();
         assert!(SharedProviderPublicationIntentV1::decode(&path, &reordered).is_err());
+    }
+
+    #[test]
+    fn absent_retirement_targets_settle_without_creating_local_journal_evidence() {
+        let root = ScenarioRoot::new().unwrap();
+        let provider_root = root.0.join("provider");
+        let journal_root = root.0.join("private/device/journal");
+        let provider = SharedProviderTransport::open(&provider_root, &journal_root).unwrap();
+
+        provider
+            .retire_frontier_head(&format!(
+                "{SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE}/already-retired.head"
+            ))
+            .unwrap();
+        provider
+            .retire_publication_intent(&format!(
+                "{SHARED_PROVIDER_PUBLICATION_INTENTS_NAMESPACE}/already-retired.intent"
+            ))
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_dir(journal_root.join("records"))
+                .unwrap()
+                .count(),
+            0
+        );
+        assert_eq!(
+            std::fs::read_dir(journal_root.join("completed"))
+                .unwrap()
+                .count(),
+            0
+        );
     }
 
     #[test]
