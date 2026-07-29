@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::fmt;
 use std::fs::File;
-use std::io::{self, ErrorKind, Read as _};
+use std::io::{self, ErrorKind, Read as _, Write as _};
 #[cfg(unix)]
 use std::os::fd::{AsFd as _, AsRawFd as _, FromRawFd as _};
 #[cfg(unix)]
@@ -11,13 +11,12 @@ use std::os::unix::fs::MetadataExt as _;
 #[cfg(windows)]
 use std::os::windows::fs::MetadataExt as _;
 use std::path::{Component, Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(windows)]
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
 use cap_std::ambient_authority;
-use cap_std::fs::Dir;
-#[cfg(windows)]
-use cap_std::fs::OpenOptions as CapOpenOptions;
+use cap_std::fs::{Dir, OpenOptions as CapOpenOptions};
 use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -29,13 +28,15 @@ use super::object_store::{
 };
 use super::{
     BaseBlob, BlobDescription, CapabilityCapturedProjectionInput,
-    CapabilityCapturedProjectionState, ManagedPath, ProjectionCompletedReceipt,
+    CapabilityCapturedProjectionState, ContentDigest, ManagedPath, ProjectionCompletedReceipt,
     ProjectionCompletion, ProjectionDirectCompletionAuthority, ProjectionEndpointBinding,
     ProjectionIntent, ProjectionIntentId, ProjectionPrecondition, ProjectionReceiptStoreId,
     ProjectionWork, ProjectionWorkCompletionAuthority, ProjectionWorkTarget, ReceiptError,
     WorkspaceId,
 };
-use crate::model::{Graph, ProjectionWriteProof};
+#[cfg(test)]
+use crate::model::ProjectionRecoveryCleanup;
+use crate::model::{Graph, ProjectionRecoveryEvidence, ProjectionWriteProof};
 
 const STORE_CLAIM_FILE: &str = "projection-receipts.claim";
 const BASES_DIR: &str = "bases";
@@ -56,7 +57,19 @@ pub(crate) const MAX_PROJECTION_CATALOG_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_PROJECTION_CATALOG_ROWS: usize = 2_000_000;
 const MAX_PROJECTION_CATALOG_DIRECTORY_ENTRIES: usize = 4_000_000;
 const LOCAL_ATTEMPT_SCHEMA_VERSION: u32 = 1;
-const LOCAL_FORENSIC_SCHEMA_VERSION: u32 = 1;
+const LOCAL_FORENSIC_SCHEMA_VERSION: u32 = 2;
+const PRIOR_LOCAL_FORENSIC_SCHEMA_VERSION: u32 = 1;
+const PENDING_CLEANUP_SUFFIX: &str = ".projection-cleanup";
+const PENDING_CLEANUP_DIR: &str = ".pending-cleanup";
+const PENDING_CLEANUP_AUTHORITY: &str = ".pending-cleanup.authority";
+const PENDING_CLEANUP_ROUND_STATE: &str = "round-robin.state";
+const PENDING_CLEANUP_ROUND_DIRS: [&str; 2] = ["round-0", "round-1"];
+const PENDING_CLEANUP_ROUND_STATE_SCHEMA_VERSION: u32 = 1;
+const MAX_PENDING_CLEANUP_ROUND_STATE_BYTES: u64 = 4 * 1024;
+const PENDING_CLEANUP_MARKER_SCHEMA_VERSION: u32 = 1;
+const PENDING_CLEANUP_OBSERVATION_SCHEMA_VERSION: u32 = 1;
+pub(crate) const PROJECTION_RECOVERY_GRACE_SECONDS: u64 = 24 * 60 * 60;
+pub(crate) const MAX_PENDING_PROJECTION_CLEANUP_PER_PASS: usize = 64;
 const INTENT_NAMESPACE_SCHEMA_VERSION: u32 = 1;
 const MUTATION_AUTHORITY_SCHEMA_VERSION: u32 = 1;
 const INTENT_NAMESPACE_RESERVATION_SUFFIX: &str = ".namespace-reservation";
@@ -90,6 +103,12 @@ thread_local! {
         std::cell::RefCell::new(None);
     static RECEIPT_SCAN_COUNTERS: std::cell::Cell<ProjectionStoreTestCounters> =
         std::cell::Cell::new(ProjectionStoreTestCounters::ZERO);
+    static PROJECTION_CLEANUP_TIME: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+    static FAIL_BEFORE_PROJECTION_CLEANUP_MARKER_SWAP: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    static FAIL_AFTER_PROJECTION_CLEANUP_MARKER_SWAP: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
@@ -97,6 +116,7 @@ thread_local! {
 pub(crate) struct ProjectionStoreTestCounters {
     pub completion_lookups: usize,
     pub catalog_directory_entries: usize,
+    pub pending_cleanup_entries: usize,
 }
 
 #[cfg(test)]
@@ -104,6 +124,7 @@ impl ProjectionStoreTestCounters {
     const ZERO: Self = Self {
         completion_lookups: 0,
         catalog_directory_entries: 0,
+        pending_cleanup_entries: 0,
     };
 }
 
@@ -219,6 +240,15 @@ fn count_catalog_directory_entry() {
 }
 
 #[cfg(test)]
+fn count_pending_cleanup_entry() {
+    RECEIPT_SCAN_COUNTERS.with(|counters| {
+        let mut value = counters.get();
+        value.pending_cleanup_entries += 1;
+        counters.set(value);
+    });
+}
+
+#[cfg(test)]
 pub(crate) fn reset_projection_store_test_counters() {
     RECEIPT_SCAN_COUNTERS.with(|counters| counters.set(ProjectionStoreTestCounters::ZERO));
 }
@@ -234,6 +264,24 @@ pub(crate) fn reset_projection_store_test_hooks() {
     COMPLETION_PUBLICATION_HOOK.with(|hook| drop(hook.borrow_mut().take()));
     COMPLETION_PUBLICATION_ACT_HOOK.with(|hook| drop(hook.borrow_mut().take()));
     COMPLETION_RETAINED_SLOT_HOOK.with(|hook| drop(hook.borrow_mut().take()));
+    PROJECTION_CLEANUP_TIME.with(|time| time.set(None));
+    FAIL_BEFORE_PROJECTION_CLEANUP_MARKER_SWAP.with(|fail| fail.set(false));
+    FAIL_AFTER_PROJECTION_CLEANUP_MARKER_SWAP.with(|fail| fail.set(false));
+}
+
+#[cfg(test)]
+pub(crate) fn set_projection_cleanup_time_for_test(unix_seconds: Option<u64>) {
+    PROJECTION_CLEANUP_TIME.with(|time| time.set(unix_seconds));
+}
+
+#[cfg(test)]
+fn fail_before_projection_cleanup_marker_swap_for_test() {
+    FAIL_BEFORE_PROJECTION_CLEANUP_MARKER_SWAP.with(|fail| fail.set(true));
+}
+
+#[cfg(test)]
+fn fail_after_projection_cleanup_marker_swap_for_test() {
+    FAIL_AFTER_PROJECTION_CLEANUP_MARKER_SWAP.with(|fail| fail.set(true));
 }
 
 #[cfg(test)]
@@ -254,6 +302,31 @@ struct ReceiptNamespaces {
     completions: BoundNamespace,
     attempts: BoundNamespace,
     forensics: BoundNamespace,
+    pending_cleanup: BoundNamespace,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PendingCleanupNamespaceAuthority {
+    schema_version: u32,
+    store_id: ProjectionReceiptStoreId,
+    directory_identity: DirectoryIdentity,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PendingCleanupRoundState {
+    schema_version: u32,
+    store_id: ProjectionReceiptStoreId,
+    namespace_identity: DirectoryIdentity,
+    round_identities: [DirectoryIdentity; 2],
+    active_round: u8,
+}
+
+struct OpenPendingCleanupRounds {
+    state: PendingCleanupRoundState,
+    state_bytes: Vec<u8>,
+    rounds: [Dir; 2],
 }
 
 impl ReceiptNamespaces {
@@ -416,6 +489,8 @@ pub struct LocalProjectionEvidenceRecord {
     target_path: ManagedPath,
     recovery_relative_path: String,
     recovery_filename: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recovery_resource_id: Option<ContentDigest>,
     observed: BlobDescription,
 }
 
@@ -436,8 +511,77 @@ impl LocalProjectionEvidenceRecord {
         &self.recovery_filename
     }
 
+    pub const fn recovery_resource_id(&self) -> Option<ContentDigest> {
+        self.recovery_resource_id
+    }
+
     pub const fn observed(&self) -> BlobDescription {
         self.observed
+    }
+
+    pub const fn is_cleanup_bound(&self) -> bool {
+        self.schema_version == LOCAL_FORENSIC_SCHEMA_VERSION && self.recovery_resource_id.is_some()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PendingProjectionCleanupObservation {
+    schema_version: u32,
+    evidence_digest: [u8; 32],
+    session_id: Uuid,
+    observed_unix_seconds: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PendingProjectionCleanupMarker {
+    schema_version: u32,
+    evidence: LocalProjectionEvidenceRecord,
+    observation: Option<PendingProjectionCleanupObservation>,
+}
+
+impl PendingProjectionCleanupMarker {
+    fn new(evidence: LocalProjectionEvidenceRecord) -> Self {
+        Self {
+            schema_version: PENDING_CLEANUP_MARKER_SCHEMA_VERSION,
+            evidence,
+            observation: None,
+        }
+    }
+
+    fn validate(&self) -> Result<(), ProjectionStoreError> {
+        let evidence_digest = local_forensic_record_digest(&self.evidence)?;
+        if self.schema_version != PENDING_CLEANUP_MARKER_SCHEMA_VERSION
+            || !self.evidence.is_cleanup_bound()
+            || self.observation.as_ref().is_some_and(|observation| {
+                observation.schema_version != PENDING_CLEANUP_OBSERVATION_SCHEMA_VERSION
+                    || observation.evidence_digest != evidence_digest
+            })
+        {
+            return Err(ProjectionStoreError::ForensicBindingMismatch);
+        }
+        Ok(())
+    }
+}
+
+pub(crate) struct ProjectionCleanupRetirementAuthority {
+    evidence_digest: [u8; 32],
+}
+
+impl ProjectionCleanupRetirementAuthority {
+    pub(crate) fn permits(
+        &self,
+        record: &LocalProjectionEvidenceRecord,
+    ) -> Result<bool, ProjectionStoreError> {
+        Ok(self.evidence_digest == local_forensic_record_digest(record)?)
+    }
+
+    #[cfg(test)]
+    fn for_test(record: &LocalProjectionEvidenceRecord) -> Self {
+        Self {
+            evidence_digest: local_forensic_record_digest(record).unwrap(),
+        }
     }
 }
 
@@ -451,6 +595,7 @@ pub struct ProjectionReceiptStore {
     store_id: ProjectionReceiptStoreId,
     workspace_id: WorkspaceId,
     endpoint: Option<ProjectionEndpointBinding>,
+    cleanup_session_id: Uuid,
     capability: Dir,
     namespaces: ReceiptNamespaces,
 }
@@ -471,12 +616,70 @@ pub(crate) struct ProjectionMutationAuthority {
     attempts: Dir,
     forensics_parent: Dir,
     forensics: Dir,
+    pending_cleanup: Dir,
     completions: Dir,
     reservations: Vec<ProjectionAttemptReservation>,
     active: Option<ProjectionAttemptReservation>,
     created_durable_record: bool,
     graph_operation_consumed: bool,
     completion_published: bool,
+}
+
+pub(crate) struct ProjectionRecoveryEvidencePublisher<'a> {
+    pending_cleanup: &'a Dir,
+    forensics: &'a Dir,
+    store_id: ProjectionReceiptStoreId,
+    intent_id: ProjectionIntentId,
+    target_path: &'a ManagedPath,
+    reservation: &'a ProjectionAttemptReservation,
+}
+
+impl ProjectionRecoveryEvidencePublisher<'_> {
+    pub(crate) fn publish(&self, evidence: &ProjectionRecoveryEvidence) -> io::Result<()> {
+        let expected_relative_path = self
+            .target_path
+            .join_sibling(evidence.filename())
+            .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "invalid recovery evidence"))?;
+        if self.reservation.recovery_filename() != evidence.filename()
+            || expected_relative_path != evidence.path()
+            || evidence.resource_id().is_none()
+        {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "recovery evidence is not bound to the active displaced handle",
+            ));
+        }
+        let record = LocalProjectionEvidenceRecord {
+            schema_version: LOCAL_FORENSIC_SCHEMA_VERSION,
+            intent_id: self.intent_id,
+            attempt_id: self.reservation.attempt_id(),
+            target_path: self.target_path.clone(),
+            recovery_relative_path: evidence.path().to_owned(),
+            recovery_filename: evidence.filename().to_owned(),
+            recovery_resource_id: evidence.resource_id(),
+            observed: BlobDescription::from_parts(*evidence.digest(), evidence.len()),
+        };
+        let bytes = serde_json::to_vec(&record)
+            .map_err(|error| io::Error::new(ErrorKind::InvalidData, error.to_string()))?;
+        let pending_bytes =
+            encode_pending_cleanup_marker(&PendingProjectionCleanupMarker::new(record.clone()))
+                .map_err(|error| io::Error::new(ErrorKind::InvalidData, error.to_string()))?;
+        publish_pending_cleanup_marker(
+            self.pending_cleanup,
+            self.store_id,
+            &record,
+            &pending_bytes,
+        )
+        .map_err(|error| io::Error::other(error.to_string()))?;
+        let digest: [u8; 32] = Sha256::digest(&bytes).into();
+        publish_immutable_exact(
+            self.forensics,
+            &format!("{}.evidence", hex(&digest)),
+            &bytes,
+            "local projection forensic evidence",
+        )
+        .map_err(|error| io::Error::other(error.to_string()))
+    }
 }
 
 impl fmt::Debug for ProjectionMutationAuthority {
@@ -553,7 +756,7 @@ impl ProjectionReceiptStore {
         let bytes = read_optional_regular(&capability, STORE_CLAIM_FILE, 512, None)?
             .ok_or(ProjectionStoreError::MalformedStoreClaim)?;
         let expected = validate_claim(&bytes, store_id, workspace_id, Some(endpoint))?;
-        let namespaces = open_receipt_namespaces(&capability)?;
+        let namespaces = open_receipt_namespaces(&capability, store_id)?;
         if namespaces.identities() != expected {
             return Err(ProjectionStoreError::NamespaceSubstitution(
                 "top-level receipt namespace".into(),
@@ -564,6 +767,7 @@ impl ProjectionReceiptStore {
             store_id,
             workspace_id,
             endpoint: Some(endpoint),
+            cleanup_session_id: Uuid::new_v4(),
             capability,
             namespaces,
         })
@@ -600,6 +804,7 @@ impl ProjectionReceiptStore {
             store_id,
             workspace_id,
             endpoint,
+            cleanup_session_id: Uuid::new_v4(),
             capability,
             namespaces,
         })
@@ -1103,6 +1308,7 @@ impl ProjectionReceiptStore {
             attempts,
             forensics_parent,
             forensics,
+            pending_cleanup: self.namespaces.pending_cleanup.capability.try_clone()?,
             completions,
             reservations,
             active: authority_active,
@@ -1141,11 +1347,23 @@ impl ProjectionReceiptStore {
                     target_path: intent.path().clone(),
                     recovery_relative_path: evidence.path().to_owned(),
                     recovery_filename: evidence.filename().to_owned(),
+                    recovery_resource_id: evidence.resource_id(),
                     observed: BlobDescription::from_parts(*evidence.digest(), evidence.len()),
                 };
                 self.validate_forensic_record_with_reservation(intent, &record, reservation)?;
                 let record_bytes = serde_json::to_vec(&record)
                     .map_err(|error| ProjectionStoreError::Encode(error.to_string()))?;
+                if record.is_cleanup_bound() {
+                    let pending_bytes = encode_pending_cleanup_marker(
+                        &PendingProjectionCleanupMarker::new(record.clone()),
+                    )?;
+                    publish_pending_cleanup_marker(
+                        &authority.pending_cleanup,
+                        self.store_id,
+                        &record,
+                        &pending_bytes,
+                    )?;
+                }
                 let digest: [u8; 32] = Sha256::digest(&record_bytes).into();
                 publish_immutable_exact(
                     &authority.forensics,
@@ -1198,6 +1416,28 @@ impl ProjectionReceiptStore {
         Ok(Some(completion))
     }
 
+    fn load_intent_by_id(
+        &self,
+        intent_id: ProjectionIntentId,
+    ) -> Result<ProjectionIntent, ProjectionStoreError> {
+        let intents = self.namespace(INTENTS_DIR)?;
+        let filename = intent_filename(intent_id);
+        let bytes =
+            read_optional_regular(&intents, &filename, MAX_PROJECTION_EVIDENCE_BYTES, None)?
+                .ok_or(ProjectionStoreError::MissingIntent(intent_id))?;
+        let intent = ProjectionIntent::decode(&bytes)?;
+        self.require_workspace(&intent)?;
+        if intent.encode()? != bytes
+            || intent.id()? != intent_id
+            || filename != intent_filename(intent.id()?)
+        {
+            return Err(ProjectionStoreError::PathBindingMismatch(
+                "projection intent",
+            ));
+        }
+        Ok(intent)
+    }
+
     /// Load one completed receipt through an authenticated work-index row.
     /// This performs direct immutable intent/completion reads only; it never
     /// enumerates a receipt namespace.
@@ -1205,21 +1445,14 @@ impl ProjectionReceiptStore {
         &self,
         completed: &ProjectionCompletedReceipt,
     ) -> Result<(ProjectionIntent, ProjectionCompletion), ProjectionStoreError> {
-        let intents = self.namespace(INTENTS_DIR)?;
-        let filename = intent_filename(completed.intent_id());
-        let bytes =
-            read_optional_regular(&intents, &filename, MAX_PROJECTION_EVIDENCE_BYTES, None)?
-                .ok_or(ProjectionStoreError::MissingPriorCompletion)?;
-        let intent = ProjectionIntent::decode(&bytes)?;
-        self.require_workspace(&intent)?;
-        if intent.encode()? != bytes
-            || intent.id()? != completed.intent_id()
-            || filename != intent_filename(intent.id()?)
-        {
-            return Err(ProjectionStoreError::PathBindingMismatch(
-                "projection intent",
-            ));
-        }
+        let intent =
+            self.load_intent_by_id(completed.intent_id())
+                .map_err(|error| match error {
+                    ProjectionStoreError::MissingIntent(_) => {
+                        ProjectionStoreError::MissingPriorCompletion
+                    }
+                    error => error,
+                })?;
         let target_matches = match completed.target() {
             ProjectionWorkTarget::Absent => intent.target() == BlobDescription::of(&[]),
             ProjectionWorkTarget::Present(target) => intent.target() == target,
@@ -1331,8 +1564,7 @@ impl ProjectionReceiptStore {
                             "forensic evidence disappeared during enumeration: {name}"
                         ))
                     })?;
-            let record: LocalProjectionEvidenceRecord = serde_json::from_slice(&bytes)
-                .map_err(|error| ProjectionStoreError::Decode(error.to_string()))?;
+            let record = decode_local_forensic_record(&bytes)?;
             let digest: [u8; 32] = Sha256::digest(&bytes).into();
             if name != format!("{}.evidence", hex(&digest)) {
                 return Err(ProjectionStoreError::ForensicBindingMismatch);
@@ -1342,6 +1574,255 @@ impl ProjectionReceiptStore {
         }
         records.sort_unstable_by_key(LocalProjectionEvidenceRecord::attempt_id);
         Ok(records)
+    }
+
+    /// Load only live, exact cleanup markers. Historical completions and their
+    /// forensic namespaces are never enumerated by this restart index.
+    #[cfg(test)]
+    pub(crate) fn pending_projection_cleanup(
+        &self,
+    ) -> Result<Vec<(ProjectionIntent, LocalProjectionEvidenceRecord)>, ProjectionStoreError> {
+        let queue = open_pending_cleanup_rounds(
+            &self.namespaces.pending_cleanup.capability,
+            self.store_id,
+            self.namespaces.pending_cleanup.identity,
+        )?;
+        let mut pending = Vec::new();
+        for round in &queue.rounds {
+            for entry in round.entries()? {
+                let entry = entry?;
+                count_pending_cleanup_entry();
+                let name = entry.file_name();
+                let name = name.to_str().ok_or_else(|| {
+                    ProjectionStoreError::UnsafeEntry(
+                        "non-UTF-8 pending projection cleanup entry".into(),
+                    )
+                })?;
+                if is_temp_name(name) {
+                    continue;
+                }
+                if !name.ends_with(PENDING_CLEANUP_SUFFIX) {
+                    return Err(ProjectionStoreError::UnsafeEntry(format!(
+                        "unknown pending projection cleanup entry: {name}"
+                    )));
+                }
+                require_regular_entry(&entry.file_type()?, name)?;
+                let bytes =
+                    read_optional_mutation_authority(round, name, None)?.ok_or_else(|| {
+                        ProjectionStoreError::UnsafeEntry(format!(
+                            "pending projection cleanup disappeared during enumeration: {name}"
+                        ))
+                    })?;
+                let marker = decode_pending_cleanup_marker(&bytes)?;
+                let record = marker.evidence;
+                if !record.is_cleanup_bound() || pending_cleanup_filename(&record) != name {
+                    return Err(ProjectionStoreError::ForensicBindingMismatch);
+                }
+                let intent = self.load_intent_by_id(record.intent_id())?;
+                self.validate_forensic_record(&intent, &record)?;
+                pending.push((intent, record));
+            }
+        }
+        pending.sort_unstable_by_key(|(_, record)| (record.intent_id(), record.attempt_id()));
+        Ok(pending)
+    }
+
+    /// Rotate at most `max_entries` out of the current round. Retained markers
+    /// move to the other authenticated round before they are returned, while
+    /// new markers are appended to that same inactive round. The active round
+    /// flips only after it is empty, so no retained prefix can be revisited
+    /// until every marker that shared its round has received a bounded visit.
+    pub(crate) fn pending_projection_cleanup_bounded(
+        &self,
+        max_entries: usize,
+    ) -> Result<Vec<(ProjectionIntent, LocalProjectionEvidenceRecord)>, ProjectionStoreError> {
+        if max_entries == 0 {
+            return Ok(Vec::new());
+        }
+        let namespace = &self.namespaces.pending_cleanup.capability;
+        let mut queue = open_pending_cleanup_rounds(
+            namespace,
+            self.store_id,
+            self.namespaces.pending_cleanup.identity,
+        )?;
+        let mut active = usize::from(queue.state.active_round);
+        let mut entries = queue.rounds[active].entries()?;
+        let mut first = entries.next().transpose()?;
+        if first.is_none() {
+            drop(entries);
+            flip_pending_cleanup_round(namespace, &queue)?;
+            queue = open_pending_cleanup_rounds(
+                namespace,
+                self.store_id,
+                self.namespaces.pending_cleanup.identity,
+            )?;
+            active = usize::from(queue.state.active_round);
+            entries = queue.rounds[active].entries()?;
+            first = entries.next().transpose()?;
+        }
+        let Some(first) = first else {
+            return Ok(Vec::new());
+        };
+        let inactive = 1usize - active;
+        let mut pending = Vec::new();
+        let mut removed_temporary = false;
+        let mut rotated = false;
+        for entry in std::iter::once(Ok(first)).chain(entries).take(max_entries) {
+            let entry = entry?;
+            #[cfg(test)]
+            count_pending_cleanup_entry();
+            let name = entry.file_name();
+            let name = name.to_str().ok_or_else(|| {
+                ProjectionStoreError::UnsafeEntry(
+                    "non-UTF-8 pending projection cleanup entry".into(),
+                )
+            })?;
+            if is_temp_name(name) {
+                require_regular_entry(&entry.file_type()?, name)?;
+                queue.rounds[active].remove_file(name)?;
+                removed_temporary = true;
+                continue;
+            }
+            if !name.ends_with(PENDING_CLEANUP_SUFFIX) {
+                return Err(ProjectionStoreError::UnsafeEntry(format!(
+                    "unknown pending projection cleanup entry: {name}"
+                )));
+            }
+            require_regular_entry(&entry.file_type()?, name)?;
+            let bytes = read_optional_mutation_authority(&queue.rounds[active], name, None)?
+                .ok_or_else(|| {
+                    ProjectionStoreError::UnsafeEntry(format!(
+                        "pending projection cleanup disappeared during enumeration: {name}"
+                    ))
+                })?;
+            let marker = decode_pending_cleanup_marker(&bytes)?;
+            let record = marker.evidence;
+            if !record.is_cleanup_bound() || pending_cleanup_filename(&record) != name {
+                return Err(ProjectionStoreError::ForensicBindingMismatch);
+            }
+            let intent = self.load_intent_by_id(record.intent_id())?;
+            self.validate_forensic_record(&intent, &record)?;
+            if read_optional_mutation_authority(&queue.rounds[inactive], name, None)?.is_some() {
+                return Err(ProjectionStoreError::ForensicBindingMismatch);
+            }
+            move_pending_cleanup_marker_noreplace(
+                &queue.rounds[active],
+                &queue.rounds[inactive],
+                name,
+            )?;
+            rotated = true;
+            pending.push((intent, record));
+        }
+        if removed_temporary || rotated {
+            sync_dir_required(&queue.rounds[active])?;
+        }
+        if rotated {
+            sync_dir_required(&queue.rounds[inactive])?;
+        }
+        pending.sort_unstable_by_key(|(_, record)| (record.intent_id(), record.attempt_id()));
+        Ok(pending)
+    }
+
+    /// Persist one exact unchanged-quarantine observation. Retirement is
+    /// authorized only after a different store-open session observes the same
+    /// marker at least one grace interval later. A backward wall-clock step
+    /// starts settlement over from the current session and time.
+    pub(crate) fn projection_cleanup_grace_elapsed(
+        &self,
+        record: &LocalProjectionEvidenceRecord,
+    ) -> Result<Option<ProjectionCleanupRetirementAuthority>, ProjectionStoreError> {
+        if !record.is_cleanup_bound() {
+            return Err(ProjectionStoreError::ForensicBindingMismatch);
+        }
+        let name = pending_cleanup_filename(record);
+        let (round, current_bytes) = read_pending_cleanup_marker(
+            &self.namespaces.pending_cleanup.capability,
+            self.store_id,
+            self.namespaces.pending_cleanup.identity,
+            &name,
+        )?;
+        let mut marker = decode_pending_cleanup_marker(&current_bytes)?;
+        if marker.evidence != *record {
+            return Err(ProjectionStoreError::ForensicBindingMismatch);
+        }
+        let now = projection_cleanup_unix_seconds()?;
+        let evidence_digest = local_forensic_record_digest(record)?;
+        let restart_and_grace = marker.observation.as_ref().is_some_and(|observation| {
+            observation.evidence_digest == evidence_digest
+                && observation.session_id != self.cleanup_session_id
+                && now >= observation.observed_unix_seconds
+                && now - observation.observed_unix_seconds >= PROJECTION_RECOVERY_GRACE_SECONDS
+        });
+        if restart_and_grace {
+            return Ok(Some(ProjectionCleanupRetirementAuthority {
+                evidence_digest,
+            }));
+        }
+
+        let must_reset = marker.observation.as_ref().is_none_or(|observation| {
+            observation.evidence_digest != evidence_digest
+                || now < observation.observed_unix_seconds
+        });
+        if must_reset {
+            marker.observation = Some(PendingProjectionCleanupObservation {
+                schema_version: PENDING_CLEANUP_OBSERVATION_SCHEMA_VERSION,
+                evidence_digest,
+                session_id: self.cleanup_session_id,
+                observed_unix_seconds: now,
+            });
+            let replacement = encode_pending_cleanup_marker(&marker)?;
+            replace_mutation_authority_if_exact(&round, &name, &current_bytes, &replacement)?;
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn reset_projection_cleanup_grace(
+        &self,
+        record: &LocalProjectionEvidenceRecord,
+    ) -> Result<(), ProjectionStoreError> {
+        if !record.is_cleanup_bound() {
+            return Err(ProjectionStoreError::ForensicBindingMismatch);
+        }
+        let name = pending_cleanup_filename(record);
+        let (round, current_bytes) = read_pending_cleanup_marker(
+            &self.namespaces.pending_cleanup.capability,
+            self.store_id,
+            self.namespaces.pending_cleanup.identity,
+            &name,
+        )?;
+        let mut marker = decode_pending_cleanup_marker(&current_bytes)?;
+        if marker.evidence != *record {
+            return Err(ProjectionStoreError::ForensicBindingMismatch);
+        }
+        marker.observation = Some(PendingProjectionCleanupObservation {
+            schema_version: PENDING_CLEANUP_OBSERVATION_SCHEMA_VERSION,
+            evidence_digest: local_forensic_record_digest(record)?,
+            session_id: self.cleanup_session_id,
+            observed_unix_seconds: projection_cleanup_unix_seconds()?,
+        });
+        let replacement = encode_pending_cleanup_marker(&marker)?;
+        replace_mutation_authority_if_exact(&round, &name, &current_bytes, &replacement)
+    }
+
+    pub(crate) fn retire_pending_projection_cleanup(
+        &self,
+        record: &LocalProjectionEvidenceRecord,
+    ) -> Result<(), ProjectionStoreError> {
+        if !record.is_cleanup_bound() {
+            return Err(ProjectionStoreError::ForensicBindingMismatch);
+        }
+        let name = pending_cleanup_filename(record);
+        let (round, expected) = read_pending_cleanup_marker(
+            &self.namespaces.pending_cleanup.capability,
+            self.store_id,
+            self.namespaces.pending_cleanup.identity,
+            &name,
+        )?;
+        let marker = decode_pending_cleanup_marker(&expected)?;
+        if marker.evidence != *record {
+            return Err(ProjectionStoreError::ForensicBindingMismatch);
+        }
+        remove_mutation_authority_if_exact(&round, &name, &expected)
     }
 
     /// Enumerate every durably published intent that has no valid completion.
@@ -1529,7 +2010,7 @@ impl ProjectionReceiptStore {
         let existing = read_optional_regular(capability, STORE_CLAIM_FILE, 512, None)?;
         if let Some(bytes) = existing {
             let expected = validate_claim(&bytes, store_id, workspace_id, endpoint)?;
-            let namespaces = open_receipt_namespaces(capability)?;
+            let namespaces = open_receipt_namespaces(capability, store_id)?;
             if namespaces.identities() != expected {
                 return Err(ProjectionStoreError::NamespaceSubstitution(
                     "top-level receipt namespace".into(),
@@ -1568,7 +2049,7 @@ impl ProjectionReceiptStore {
             ensure_directory_nofollow(capability, namespace)?;
         }
         require_incomplete_store_is_empty(capability)?;
-        let namespaces = open_receipt_namespaces(capability)?;
+        let namespaces = open_receipt_namespaces(capability, store_id)?;
         let claim = claim_bytes(store_id, workspace_id, endpoint, &namespaces.identities());
         publish_immutable_exact(
             capability,
@@ -1746,7 +2227,7 @@ impl ProjectionReceiptStore {
         intent: &ProjectionIntent,
         record: &LocalProjectionEvidenceRecord,
     ) -> Result<(), ProjectionStoreError> {
-        if record.schema_version != LOCAL_FORENSIC_SCHEMA_VERSION
+        if !valid_local_forensic_version(record)
             || record.intent_id != intent.id()?
             || record.target_path != *intent.path()
         {
@@ -1771,7 +2252,7 @@ impl ProjectionReceiptStore {
         record: &LocalProjectionEvidenceRecord,
         reservation: &ProjectionAttemptReservation,
     ) -> Result<(), ProjectionStoreError> {
-        if record.schema_version != LOCAL_FORENSIC_SCHEMA_VERSION
+        if !valid_local_forensic_version(record)
             || record.intent_id != intent.id()?
             || record.target_path != *intent.path()
             || reservation.attempt_id() != record.attempt_id
@@ -2015,6 +2496,7 @@ impl ProjectionMutationAuthority {
         operation: impl FnOnce(
             &ProjectionAttemptReservation,
             &[ProjectionAttemptReservation],
+            &ProjectionRecoveryEvidencePublisher<'_>,
         ) -> io::Result<T>,
     ) -> io::Result<T> {
         mutation_authority_act_hook();
@@ -2025,7 +2507,15 @@ impl ProjectionMutationAuthority {
                 "projection mutation authority has no active reserved attempt",
             )
         })?;
-        operation(active, &self.reservations)
+        let publisher = ProjectionRecoveryEvidencePublisher {
+            pending_cleanup: &self.pending_cleanup,
+            forensics: &self.forensics,
+            store_id: self.durable.store_id,
+            intent_id: self.durable.intent_id,
+            target_path: active.target_path(),
+            reservation: active,
+        };
+        operation(active, &self.reservations, &publisher)
     }
 
     pub(crate) fn consume_recovery_evidence<T>(
@@ -2186,6 +2676,13 @@ impl ProjectionMutationAuthority {
                 != self.durable.namespace_identities[4]
             || canonical_directory_identity(&self.attempts)? != self.durable.attempts_identity
             || canonical_directory_identity(&self.forensics)? != self.durable.forensics_identity
+        {
+            return Err(ProjectionStoreError::MutationAuthorityMismatch);
+        }
+        let live_pending = open_dir_nofollow(&self.forensics_parent, PENDING_CLEANUP_DIR)
+            .map_err(|_| ProjectionStoreError::MutationAuthorityMismatch)?;
+        if canonical_directory_identity(&live_pending)?
+            != canonical_directory_identity(&self.pending_cleanup)?
         {
             return Err(ProjectionStoreError::MutationAuthorityMismatch);
         }
@@ -2669,13 +3166,228 @@ fn validate_claim(
     Ok(identities)
 }
 
-fn open_receipt_namespaces(capability: &Dir) -> Result<ReceiptNamespaces, ProjectionStoreError> {
+fn open_receipt_namespaces(
+    capability: &Dir,
+    store_id: ProjectionReceiptStoreId,
+) -> Result<ReceiptNamespaces, ProjectionStoreError> {
+    let forensics = open_bound_namespace(capability, FORENSICS_DIR)?;
+    let pending_cleanup = open_pending_cleanup_namespace(&forensics.capability, store_id)?;
     Ok(ReceiptNamespaces {
         bases: open_bound_namespace(capability, BASES_DIR)?,
         intents: open_bound_namespace(capability, INTENTS_DIR)?,
         completions: open_bound_namespace(capability, COMPLETIONS_DIR)?,
         attempts: open_bound_namespace(capability, ATTEMPTS_DIR)?,
-        forensics: open_bound_namespace(capability, FORENSICS_DIR)?,
+        forensics,
+        pending_cleanup,
+    })
+}
+
+fn open_pending_cleanup_namespace(
+    forensics: &Dir,
+    store_id: ProjectionReceiptStoreId,
+) -> Result<BoundNamespace, ProjectionStoreError> {
+    let existing = read_optional_regular(forensics, PENDING_CLEANUP_AUTHORITY, 1024, None)?;
+    let initializing = existing.is_none();
+    if initializing {
+        match open_dir_nofollow(forensics, PENDING_CLEANUP_DIR) {
+            Ok(_) => {}
+            Err(StoreError::Io(error)) if error.kind() == ErrorKind::NotFound => {
+                ensure_directory_nofollow(forensics, PENDING_CLEANUP_DIR)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let directory = open_dir_nofollow(forensics, PENDING_CLEANUP_DIR)?;
+    let identity = canonical_directory_identity(&directory)?;
+    let authority = PendingCleanupNamespaceAuthority {
+        schema_version: INTENT_NAMESPACE_SCHEMA_VERSION,
+        store_id,
+        directory_identity: identity,
+    };
+    let expected = serde_json::to_vec(&authority)
+        .map_err(|error| ProjectionStoreError::Encode(error.to_string()))?;
+    match &existing {
+        Some(bytes) if *bytes != expected => {
+            return Err(ProjectionStoreError::NamespaceSubstitution(
+                PENDING_CLEANUP_DIR.into(),
+            ))
+        }
+        Some(_) => {}
+        None => {}
+    }
+    initialize_pending_cleanup_rounds(&directory, store_id, identity, initializing)?;
+    if initializing {
+        publish_immutable_exact(
+            forensics,
+            PENDING_CLEANUP_AUTHORITY,
+            &expected,
+            "pending projection cleanup namespace authority",
+        )?;
+    }
+    Ok(BoundNamespace {
+        capability: directory,
+        identity,
+    })
+}
+
+fn initialize_pending_cleanup_rounds(
+    namespace: &Dir,
+    store_id: ProjectionReceiptStoreId,
+    namespace_identity: DirectoryIdentity,
+    allow_initialization: bool,
+) -> Result<(), ProjectionStoreError> {
+    let existing = read_optional_mutation_authority_bounded(
+        namespace,
+        PENDING_CLEANUP_ROUND_STATE,
+        MAX_PENDING_CLEANUP_ROUND_STATE_BYTES,
+        None,
+    )?;
+    if existing.is_none() {
+        if !allow_initialization {
+            return Err(ProjectionStoreError::NamespaceSubstitution(
+                PENDING_CLEANUP_ROUND_STATE.into(),
+            ));
+        }
+        validate_pending_cleanup_round_root(namespace, false)?;
+        for name in PENDING_CLEANUP_ROUND_DIRS {
+            match open_dir_nofollow(namespace, name) {
+                Ok(_) => {}
+                Err(StoreError::Io(error)) if error.kind() == ErrorKind::NotFound => {
+                    ensure_directory_nofollow(namespace, name)?;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let rounds = [
+            open_dir_nofollow(namespace, PENDING_CLEANUP_ROUND_DIRS[0])?,
+            open_dir_nofollow(namespace, PENDING_CLEANUP_ROUND_DIRS[1])?,
+        ];
+        let state = PendingCleanupRoundState {
+            schema_version: PENDING_CLEANUP_ROUND_STATE_SCHEMA_VERSION,
+            store_id,
+            namespace_identity,
+            round_identities: [
+                canonical_directory_identity(&rounds[0])?,
+                canonical_directory_identity(&rounds[1])?,
+            ],
+            active_round: 0,
+        };
+        let bytes = encode_pending_cleanup_round_state(&state)?;
+        publish_immutable_exact(
+            namespace,
+            PENDING_CLEANUP_ROUND_STATE,
+            &bytes,
+            "pending projection cleanup round state",
+        )?;
+    }
+    let _ = open_pending_cleanup_rounds(namespace, store_id, namespace_identity)?;
+    Ok(())
+}
+
+fn validate_pending_cleanup_round_root(
+    namespace: &Dir,
+    require_state: bool,
+) -> Result<(), ProjectionStoreError> {
+    let mut seen_state = false;
+    let mut seen_rounds = [false; 2];
+    let mut removed_temporary = false;
+    let mut count = 0usize;
+    for entry in namespace.entries()? {
+        count += 1;
+        if count > 4 {
+            return Err(ProjectionStoreError::UnsafeEntry(
+                "pending projection cleanup round root has too many entries".into(),
+            ));
+        }
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_str().ok_or_else(|| {
+            ProjectionStoreError::UnsafeEntry(
+                "non-UTF-8 pending projection cleanup round entry".into(),
+            )
+        })?;
+        if is_temp_name(name) {
+            require_regular_entry(&entry.file_type()?, name)?;
+            namespace.remove_file(name)?;
+            removed_temporary = true;
+            continue;
+        }
+        if name == PENDING_CLEANUP_ROUND_STATE {
+            require_regular_entry(&entry.file_type()?, name)?;
+            if seen_state {
+                return Err(ProjectionStoreError::UnsafeEntry(
+                    "duplicate pending projection cleanup round state".into(),
+                ));
+            }
+            seen_state = true;
+            continue;
+        }
+        let Some(round) = PENDING_CLEANUP_ROUND_DIRS
+            .iter()
+            .position(|candidate| *candidate == name)
+        else {
+            return Err(ProjectionStoreError::UnsafeEntry(format!(
+                "unknown pending projection cleanup round entry: {name}"
+            )));
+        };
+        if !entry.file_type()?.is_dir() || seen_rounds[round] {
+            return Err(ProjectionStoreError::NamespaceSubstitution(name.into()));
+        }
+        seen_rounds[round] = true;
+    }
+    if removed_temporary {
+        sync_dir_required(namespace)?;
+    }
+    if require_state && (!seen_state || seen_rounds.iter().any(|seen| !seen)) {
+        return Err(ProjectionStoreError::NamespaceSubstitution(
+            PENDING_CLEANUP_DIR.into(),
+        ));
+    }
+    if !require_state && seen_state {
+        return Err(ProjectionStoreError::NamespaceSubstitution(
+            PENDING_CLEANUP_ROUND_STATE.into(),
+        ));
+    }
+    Ok(())
+}
+
+fn open_pending_cleanup_rounds(
+    namespace: &Dir,
+    store_id: ProjectionReceiptStoreId,
+    namespace_identity: DirectoryIdentity,
+) -> Result<OpenPendingCleanupRounds, ProjectionStoreError> {
+    validate_pending_cleanup_round_root(namespace, true)?;
+    let state_bytes = read_optional_mutation_authority_bounded(
+        namespace,
+        PENDING_CLEANUP_ROUND_STATE,
+        MAX_PENDING_CLEANUP_ROUND_STATE_BYTES,
+        None,
+    )?
+    .ok_or_else(|| {
+        ProjectionStoreError::NamespaceSubstitution(PENDING_CLEANUP_ROUND_STATE.into())
+    })?;
+    let state = decode_pending_cleanup_round_state(&state_bytes)?;
+    let rounds = [
+        open_dir_nofollow(namespace, PENDING_CLEANUP_ROUND_DIRS[0])?,
+        open_dir_nofollow(namespace, PENDING_CLEANUP_ROUND_DIRS[1])?,
+    ];
+    let round_identities = [
+        canonical_directory_identity(&rounds[0])?,
+        canonical_directory_identity(&rounds[1])?,
+    ];
+    if state.store_id != store_id
+        || state.namespace_identity != namespace_identity
+        || state.round_identities != round_identities
+        || state.active_round > 1
+    {
+        return Err(ProjectionStoreError::NamespaceSubstitution(
+            PENDING_CLEANUP_ROUND_STATE.into(),
+        ));
+    }
+    Ok(OpenPendingCleanupRounds {
+        state,
+        state_bytes,
+        rounds,
     })
 }
 
@@ -2907,6 +3619,20 @@ fn read_optional_mutation_authority(
     name: &str,
     expected_length: Option<u64>,
 ) -> Result<Option<Vec<u8>>, ProjectionStoreError> {
+    read_optional_mutation_authority_bounded(
+        directory,
+        name,
+        MAX_MUTATION_AUTHORITY_BYTES as u64,
+        expected_length,
+    )
+}
+
+fn read_optional_mutation_authority_bounded(
+    directory: &Dir,
+    name: &str,
+    max_length: u64,
+    expected_length: Option<u64>,
+) -> Result<Option<Vec<u8>>, ProjectionStoreError> {
     let mut file = match open_mutation_authority_file(directory, name) {
         Ok(file) => file,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
@@ -2938,9 +3664,7 @@ fn read_optional_mutation_authority(
         )));
     }
     let length = metadata.len();
-    if length > MAX_MUTATION_AUTHORITY_BYTES as u64
-        || expected_length.is_some_and(|expected| expected != length)
-    {
+    if length > max_length || expected_length.is_some_and(|expected| expected != length) {
         return Err(ProjectionStoreError::MutationAuthorityMismatch);
     }
     let mut bytes = Vec::with_capacity(length as usize);
@@ -2966,6 +3690,79 @@ fn remove_mutation_authority_if_exact(
     }
     directory.remove_file(name)?;
     sync_dir_required(directory)?;
+    Ok(())
+}
+
+fn replace_mutation_authority_if_exact(
+    directory: &Dir,
+    name: &str,
+    expected: &[u8],
+    replacement: &[u8],
+) -> Result<(), ProjectionStoreError> {
+    replace_mutation_authority_if_exact_inner(directory, name, expected, replacement, true)
+}
+
+fn replace_mutation_authority_if_exact_inner(
+    directory: &Dir,
+    name: &str,
+    expected: &[u8],
+    replacement: &[u8],
+    inject_cleanup_marker_failures: bool,
+) -> Result<(), ProjectionStoreError> {
+    #[cfg(not(test))]
+    let _ = inject_cleanup_marker_failures;
+    let current = read_optional_mutation_authority(directory, name, Some(expected.len() as u64))?
+        .ok_or(ProjectionStoreError::MutationAuthorityMismatch)?;
+    if current != expected || replacement.len() > MAX_MUTATION_AUTHORITY_BYTES {
+        return Err(ProjectionStoreError::MutationAuthorityMismatch);
+    }
+    let temp_name = format!(".tmp-{}", Uuid::new_v4());
+    let mut options = CapOpenOptions::new();
+    options.write(true).create_new(true);
+    let mut temp = directory.open_with(&temp_name, &options)?;
+    let result = (|| {
+        temp.write_all(replacement)?;
+        temp.sync_all()?;
+        drop(temp);
+        #[cfg(test)]
+        if inject_cleanup_marker_failures {
+            FAIL_BEFORE_PROJECTION_CLEANUP_MARKER_SWAP.with(|fail| {
+                if fail.replace(false) {
+                    return Err(ProjectionStoreError::Io(io::Error::new(
+                        ErrorKind::Interrupted,
+                        "injected failure before projection cleanup marker swap",
+                    )));
+                }
+                Ok(())
+            })?;
+        }
+        directory.rename(&temp_name, directory, name)?;
+        #[cfg(test)]
+        if inject_cleanup_marker_failures {
+            FAIL_AFTER_PROJECTION_CLEANUP_MARKER_SWAP.with(|fail| {
+                if fail.replace(false) {
+                    return Err(ProjectionStoreError::Io(io::Error::new(
+                        ErrorKind::Interrupted,
+                        "injected failure after projection cleanup marker swap",
+                    )));
+                }
+                Ok(())
+            })?;
+        }
+        sync_dir_required(directory)?;
+        Ok::<_, ProjectionStoreError>(())
+    })();
+    let cleanup = directory.remove_file(&temp_name);
+    if let Err(error) = result {
+        let _ = cleanup;
+        return Err(error);
+    }
+    if cleanup
+        .as_ref()
+        .is_err_and(|error| error.kind() != ErrorKind::NotFound)
+    {
+        cleanup?;
+    }
     Ok(())
 }
 
@@ -3049,6 +3846,245 @@ fn attempt_filename(attempt_id: Uuid) -> String {
     format!("{}.attempt", attempt_id.simple())
 }
 
+fn pending_cleanup_filename(record: &LocalProjectionEvidenceRecord) -> String {
+    format!(
+        "{}.{}{}",
+        hex(record.intent_id().as_bytes()),
+        record.attempt_id().simple(),
+        PENDING_CLEANUP_SUFFIX
+    )
+}
+
+fn encode_pending_cleanup_round_state(
+    state: &PendingCleanupRoundState,
+) -> Result<Vec<u8>, ProjectionStoreError> {
+    if state.schema_version != PENDING_CLEANUP_ROUND_STATE_SCHEMA_VERSION || state.active_round > 1
+    {
+        return Err(ProjectionStoreError::ForensicBindingMismatch);
+    }
+    serde_json::to_vec(state).map_err(|error| ProjectionStoreError::Encode(error.to_string()))
+}
+
+fn decode_pending_cleanup_round_state(
+    bytes: &[u8],
+) -> Result<PendingCleanupRoundState, ProjectionStoreError> {
+    let state: PendingCleanupRoundState = serde_json::from_slice(bytes)
+        .map_err(|error| ProjectionStoreError::Decode(error.to_string()))?;
+    if encode_pending_cleanup_round_state(&state)? != bytes {
+        return Err(ProjectionStoreError::ForensicBindingMismatch);
+    }
+    Ok(state)
+}
+
+fn publish_pending_cleanup_marker(
+    namespace: &Dir,
+    store_id: ProjectionReceiptStoreId,
+    record: &LocalProjectionEvidenceRecord,
+    bytes: &[u8],
+) -> Result<(), ProjectionStoreError> {
+    let namespace_identity = canonical_directory_identity(namespace)?;
+    let queue = open_pending_cleanup_rounds(namespace, store_id, namespace_identity)?;
+    let name = pending_cleanup_filename(record);
+    let existing = [
+        read_optional_mutation_authority(&queue.rounds[0], &name, None)?,
+        read_optional_mutation_authority(&queue.rounds[1], &name, None)?,
+    ];
+    match (&existing[0], &existing[1]) {
+        (Some(_), Some(_)) => {
+            return Err(ProjectionStoreError::ForensicBindingMismatch);
+        }
+        (Some(existing), None) | (None, Some(existing)) => {
+            if existing != bytes {
+                return Err(ProjectionStoreError::ForensicBindingMismatch);
+            }
+            return Ok(());
+        }
+        (None, None) => {}
+    }
+    let inactive = 1usize - usize::from(queue.state.active_round);
+    publish_immutable_exact(
+        &queue.rounds[inactive],
+        &name,
+        bytes,
+        "pending projection cleanup",
+    )?;
+    Ok(())
+}
+
+fn read_pending_cleanup_marker(
+    namespace: &Dir,
+    store_id: ProjectionReceiptStoreId,
+    namespace_identity: DirectoryIdentity,
+    name: &str,
+) -> Result<(Dir, Vec<u8>), ProjectionStoreError> {
+    let queue = open_pending_cleanup_rounds(namespace, store_id, namespace_identity)?;
+    let first = read_optional_mutation_authority(&queue.rounds[0], name, None)?;
+    let second = read_optional_mutation_authority(&queue.rounds[1], name, None)?;
+    match (first, second) {
+        (Some(bytes), None) => Ok((queue.rounds[0].try_clone()?, bytes)),
+        (None, Some(bytes)) => Ok((queue.rounds[1].try_clone()?, bytes)),
+        (Some(_), Some(_)) => Err(ProjectionStoreError::ForensicBindingMismatch),
+        (None, None) => Err(ProjectionStoreError::ForensicBindingMismatch),
+    }
+}
+
+fn flip_pending_cleanup_round(
+    namespace: &Dir,
+    queue: &OpenPendingCleanupRounds,
+) -> Result<(), ProjectionStoreError> {
+    let mut replacement = queue.state.clone();
+    replacement.active_round = 1 - replacement.active_round;
+    let replacement = encode_pending_cleanup_round_state(&replacement)?;
+    replace_mutation_authority_if_exact_inner(
+        namespace,
+        PENDING_CLEANUP_ROUND_STATE,
+        &queue.state_bytes,
+        &replacement,
+        false,
+    )
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn move_pending_cleanup_marker_noreplace(
+    source: &Dir,
+    destination: &Dir,
+    name: &str,
+) -> io::Result<()> {
+    let name = CString::new(name)
+        .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "invalid cleanup marker name"))?;
+    // SAFETY: both retained directory descriptors and the NUL-terminated leaf
+    // name remain live for the duration of this capability-relative syscall.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            source.as_fd().as_raw_fd(),
+            name.as_ptr(),
+            destination.as_fd().as_raw_fd(),
+            name.as_ptr(),
+            libc::RENAME_NOREPLACE as libc::c_uint,
+        )
+    };
+    (result == 0)
+        .then_some(())
+        .ok_or_else(io::Error::last_os_error)
+}
+
+#[cfg(target_os = "macos")]
+fn move_pending_cleanup_marker_noreplace(
+    source: &Dir,
+    destination: &Dir,
+    name: &str,
+) -> io::Result<()> {
+    let name = CString::new(name)
+        .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "invalid cleanup marker name"))?;
+    // SAFETY: both retained directory descriptors and the NUL-terminated leaf
+    // name remain live for the duration of this capability-relative syscall.
+    let result = unsafe {
+        libc::renameatx_np(
+            source.as_fd().as_raw_fd(),
+            name.as_ptr(),
+            destination.as_fd().as_raw_fd(),
+            name.as_ptr(),
+            libc::RENAME_EXCL as libc::c_uint,
+        )
+    };
+    (result == 0)
+        .then_some(())
+        .ok_or_else(io::Error::last_os_error)
+}
+
+#[cfg(windows)]
+fn move_pending_cleanup_marker_noreplace(
+    source: &Dir,
+    destination: &Dir,
+    name: &str,
+) -> io::Result<()> {
+    source.rename(name, destination, name)
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "android",
+    windows
+)))]
+fn move_pending_cleanup_marker_noreplace(
+    _source: &Dir,
+    _destination: &Dir,
+    _name: &str,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        ErrorKind::Unsupported,
+        "atomic capability-relative cleanup queue rotation is unsupported",
+    ))
+}
+
+fn local_forensic_record_digest(
+    record: &LocalProjectionEvidenceRecord,
+) -> Result<[u8; 32], ProjectionStoreError> {
+    let bytes = serde_json::to_vec(record)
+        .map_err(|error| ProjectionStoreError::Encode(error.to_string()))?;
+    Ok(Sha256::digest(&bytes).into())
+}
+
+fn encode_pending_cleanup_marker(
+    marker: &PendingProjectionCleanupMarker,
+) -> Result<Vec<u8>, ProjectionStoreError> {
+    marker.validate()?;
+    serde_json::to_vec(marker).map_err(|error| ProjectionStoreError::Encode(error.to_string()))
+}
+
+fn decode_pending_cleanup_marker(
+    bytes: &[u8],
+) -> Result<PendingProjectionCleanupMarker, ProjectionStoreError> {
+    let marker: PendingProjectionCleanupMarker = serde_json::from_slice(bytes)
+        .map_err(|error| ProjectionStoreError::Decode(error.to_string()))?;
+    marker.validate()?;
+    if encode_pending_cleanup_marker(&marker)? != bytes {
+        return Err(ProjectionStoreError::ForensicBindingMismatch);
+    }
+    Ok(marker)
+}
+
+fn projection_cleanup_unix_seconds() -> Result<u64, ProjectionStoreError> {
+    #[cfg(test)]
+    if let Some(seconds) = PROJECTION_CLEANUP_TIME.with(std::cell::Cell::get) {
+        return Ok(seconds);
+    }
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .map_err(|_| {
+            ProjectionStoreError::Io(io::Error::new(
+                ErrorKind::InvalidData,
+                "system clock is before the Unix epoch",
+            ))
+        })
+}
+
+fn valid_local_forensic_version(record: &LocalProjectionEvidenceRecord) -> bool {
+    match record.schema_version {
+        PRIOR_LOCAL_FORENSIC_SCHEMA_VERSION => record.recovery_resource_id.is_none(),
+        LOCAL_FORENSIC_SCHEMA_VERSION => true,
+        _ => false,
+    }
+}
+
+fn decode_local_forensic_record(
+    bytes: &[u8],
+) -> Result<LocalProjectionEvidenceRecord, ProjectionStoreError> {
+    let record: LocalProjectionEvidenceRecord = serde_json::from_slice(bytes)
+        .map_err(|error| ProjectionStoreError::Decode(error.to_string()))?;
+    if !valid_local_forensic_version(&record)
+        || serde_json::to_vec(&record)
+            .map_err(|error| ProjectionStoreError::Encode(error.to_string()))?
+            != bytes
+    {
+        return Err(ProjectionStoreError::ForensicBindingMismatch);
+    }
+    Ok(record)
+}
+
 fn parse_attempt_filename(name: &str) -> Result<Uuid, ProjectionStoreError> {
     let value = name
         .strip_suffix(".attempt")
@@ -3115,8 +4151,13 @@ fn endpoint_binding_bytes(binding: ProjectionEndpointBinding) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::collections::BTreeMap;
     use std::fs;
+    use std::io::{Read as _, Seek as _, Write as _};
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt as _;
+    use std::rc::Rc;
 
     use crate::oplog::{FrontierV2, PageId};
 
@@ -3136,13 +4177,26 @@ mod tests {
             Self::new_at(label, "pages/authority.md")
         }
 
+        fn new_replacement(label: &str) -> Self {
+            Self::new_at_with_base(label, "pages/authority.md", Some(b"- base\n"))
+        }
+
         fn new_at(label: &str, target_path: &str) -> Self {
+            Self::new_at_with_base(label, target_path, None)
+        }
+
+        fn new_at_with_base(label: &str, target_path: &str, base: Option<&[u8]>) -> Self {
             let root = std::env::temp_dir()
                 .join(format!("tine-receipt-authority-{label}-{}", Uuid::new_v4()));
             fs::create_dir(&root).unwrap();
             let graph_root = root.join("graph");
             fs::create_dir(&graph_root).unwrap();
             fs::create_dir(graph_root.join("pages")).unwrap();
+            if let Some(base) = base {
+                let target = graph_root.join(target_path);
+                fs::create_dir_all(target.parent().unwrap()).unwrap();
+                fs::write(target, base).unwrap();
+            }
             let graph = Graph::open(&graph_root);
             let store = ProjectionReceiptStore::open(
                 &root.join("receipts"),
@@ -3156,12 +4210,14 @@ mod tests {
                 ManagedPath::parse(target_path).unwrap(),
                 FrontierV2::default(),
                 Vec::new(),
-                ProjectionPrecondition::Absent,
+                base.map_or(ProjectionPrecondition::Absent, |base| {
+                    ProjectionPrecondition::Base(BlobDescription::of(base))
+                }),
                 BlobDescription::of(&target),
                 Vec::new(),
             )
             .unwrap();
-            store.publish_intent(&intent, None).unwrap();
+            store.publish_intent(&intent, base).unwrap();
             Self {
                 root,
                 graph_root,
@@ -3170,6 +4226,40 @@ mod tests {
                 intent,
                 target,
             }
+        }
+
+        fn complete_replacement(
+            &self,
+        ) -> (
+            ProjectionAttemptReservation,
+            PathBuf,
+            Vec<LocalProjectionEvidenceRecord>,
+        ) {
+            let reservation = self.store.reserve_attempt(&self.intent).unwrap();
+            let recovery_path = self
+                .graph_root
+                .join(self.intent.path().as_str())
+                .parent()
+                .unwrap()
+                .join(reservation.recovery_filename());
+            let mut authority = self
+                .store
+                .begin_mutation(&self.intent, Some(&reservation))
+                .unwrap();
+            let proof = self
+                .graph
+                .write_page_projection(
+                    self.intent.path().as_str(),
+                    Some(b"- base\n"),
+                    &self.target,
+                    &mut authority,
+                )
+                .unwrap();
+            self.store
+                .publish_completion(authority, &self.intent, &proof)
+                .unwrap();
+            let records = self.store.local_forensic_evidence(&self.intent).unwrap();
+            (reservation, recovery_path, records)
         }
 
         fn snapshot_graph(&self) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
@@ -3282,6 +4372,18 @@ mod tests {
         }
     }
 
+    fn retirement_quarantine_path(
+        recovery_path: &Path,
+        record: &LocalProjectionEvidenceRecord,
+    ) -> PathBuf {
+        let resource_id = record.recovery_resource_id().unwrap();
+        recovery_path.parent().unwrap().join(format!(
+            "Tine-recovery-{}-{}.projection-quarantine",
+            record.attempt_id().simple(),
+            hex(resource_id.as_bytes())
+        ))
+    }
+
     #[test]
     fn root_attempt_reservation_uses_the_target_filename_without_panicking() {
         let fixture = Fixture::new_at("root-attempt-reservation", "Root.md");
@@ -3326,6 +4428,7 @@ mod tests {
                 target_path: fixture.intent.path().clone(),
                 recovery_relative_path: expected_relative_path.clone(),
                 recovery_filename: expected_filename.clone(),
+                recovery_resource_id: Some(ContentDigest::from_bytes([7; 32])),
                 observed: BlobDescription::of(b"- displaced\n"),
             };
             fixture
@@ -4343,6 +5446,1376 @@ mod tests {
                 0
             );
         }
+    }
+
+    #[test]
+    fn completed_recovery_retirement_preserves_same_byte_replacement() {
+        let fixture = Fixture::new_replacement("completed-recovery-retirement-binding");
+        let base = b"- base\n";
+        let (_, recovery_path, _) = fixture.complete_replacement();
+        let displaced = recovery_path.with_extension("provider-retained");
+        fs::rename(&recovery_path, &displaced).unwrap();
+        fs::write(&recovery_path, base).unwrap();
+        let reopened =
+            ProjectionReceiptStore::open(fixture.store.root_path(), fixture.store.workspace_id())
+                .unwrap();
+        let records = reopened.local_forensic_evidence(&fixture.intent).unwrap();
+        let conflict = fixture
+            .graph
+            .retire_completed_projection_recovery(fixture.intent.path().as_str(), &records, None)
+            .unwrap();
+        let ProjectionRecoveryCleanup::ConflictRetained { relative_path } = conflict else {
+            panic!("same-byte replacement did not become a recoverable conflict: {conflict:?}");
+        };
+        assert!(!recovery_path.exists());
+        assert_eq!(
+            fs::read(fixture.graph_root.join(relative_path)).unwrap(),
+            base
+        );
+        assert_eq!(fs::read(&displaced).unwrap(), base);
+    }
+
+    #[test]
+    fn pre_evidence_publication_same_byte_rebind_never_gains_cleanup_authority() {
+        let fixture = Fixture::new_replacement("pre-evidence-same-byte-rebind");
+        let reservation = fixture.store.reserve_attempt(&fixture.intent).unwrap();
+        let recovery_path = fixture
+            .graph_root
+            .join(fixture.intent.path().as_str())
+            .parent()
+            .unwrap()
+            .join(reservation.recovery_filename());
+        let original = recovery_path.with_extension("original-displaced");
+        let raced_recovery = recovery_path.clone();
+        let raced_original = original.clone();
+        crate::model::set_projection_after_retire_collision_hook_for_test(move || {
+            fs::rename(&raced_recovery, &raced_original)?;
+            fs::write(&raced_recovery, b"- base\n")
+        });
+        let mut authority = fixture
+            .store
+            .begin_mutation(&fixture.intent, Some(&reservation))
+            .unwrap();
+        assert!(fixture
+            .graph
+            .write_page_projection(
+                fixture.intent.path().as_str(),
+                Some(b"- base\n"),
+                &fixture.target,
+                &mut authority,
+            )
+            .is_err());
+        drop(authority);
+
+        let (_, marker) = fixture
+            .store
+            .pending_projection_cleanup()
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert!(matches!(
+            fixture.graph.retire_completed_projection_recovery(
+                fixture.intent.path().as_str(),
+                std::slice::from_ref(&marker),
+                None,
+            ),
+            Ok(ProjectionRecoveryCleanup::ConflictRetained { .. })
+        ));
+        assert!(!recovery_path.exists());
+        assert_eq!(fs::read(original).unwrap(), b"- base\n");
+    }
+
+    #[test]
+    fn same_byte_rebind_after_handle_capture_never_publishes_cleanup_authority() {
+        let fixture = Fixture::new_replacement("same-byte-rebind-after-handle-capture");
+        let reservation = fixture.store.reserve_attempt(&fixture.intent).unwrap();
+        let target_path = fixture.graph_root.join(fixture.intent.path().as_str());
+        let original = target_path.with_extension("original-provider-inode");
+        let raced_target = target_path.clone();
+        let raced_original = original.clone();
+        crate::model::set_projection_recovery_after_bound_capture_hook_for_test(move || {
+            fs::rename(&raced_target, &raced_original)?;
+            fs::write(&raced_target, b"- base\n")
+        });
+        let mut authority = fixture
+            .store
+            .begin_mutation(&fixture.intent, Some(&reservation))
+            .unwrap();
+        assert!(fixture
+            .graph
+            .write_page_projection(
+                fixture.intent.path().as_str(),
+                Some(b"- base\n"),
+                &fixture.target,
+                &mut authority,
+            )
+            .is_err());
+        drop(authority);
+
+        let recovery_path = target_path
+            .parent()
+            .unwrap()
+            .join(reservation.recovery_filename());
+        assert_eq!(fs::read(original).unwrap(), b"- base\n");
+        assert_eq!(fs::read(recovery_path).unwrap(), b"- base\n");
+        assert!(
+            fixture
+                .store
+                .pending_projection_cleanup()
+                .unwrap()
+                .is_empty(),
+            "same-byte replacement was promoted into cleanup authority"
+        );
+    }
+
+    #[test]
+    fn canonical_v1_forensic_evidence_decodes_but_never_authorizes_cleanup() {
+        let fixture = Fixture::new_replacement("v1-forensic-compatibility");
+        let reservation = fixture.store.reserve_attempt(&fixture.intent).unwrap();
+        let record = LocalProjectionEvidenceRecord {
+            schema_version: PRIOR_LOCAL_FORENSIC_SCHEMA_VERSION,
+            intent_id: fixture.intent.id().unwrap(),
+            attempt_id: reservation.attempt_id(),
+            target_path: fixture.intent.path().clone(),
+            recovery_relative_path: fixture
+                .intent
+                .path()
+                .join_sibling(reservation.recovery_filename())
+                .unwrap(),
+            recovery_filename: reservation.recovery_filename().to_owned(),
+            recovery_resource_id: None,
+            observed: BlobDescription::of(b"- base\n"),
+        };
+        let bytes = serde_json::to_vec(&record).unwrap();
+        assert!(
+            !std::str::from_utf8(&bytes)
+                .unwrap()
+                .contains("recovery_resource_id"),
+            "v1 canonical bytes must retain their historical field set"
+        );
+        let forensics = fixture
+            .store
+            .required_intent_namespace(FORENSICS_DIR, fixture.intent.id().unwrap())
+            .unwrap();
+        let digest: [u8; 32] = Sha256::digest(&bytes).into();
+        publish_immutable_exact(
+            &forensics,
+            &format!("{}.evidence", hex(&digest)),
+            &bytes,
+            "v1 compatibility evidence",
+        )
+        .unwrap();
+
+        let loaded = fixture
+            .store
+            .local_forensic_evidence(&fixture.intent)
+            .unwrap();
+        assert_eq!(loaded, vec![record]);
+        assert!(!loaded[0].is_cleanup_bound());
+        assert!(fixture
+            .store
+            .pending_projection_cleanup()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn pending_cleanup_namespace_substitution_denies_before_graph_mutation() {
+        let fixture = Fixture::new_replacement("pending-cleanup-namespace-substitution");
+        let reservation = fixture.store.reserve_attempt(&fixture.intent).unwrap();
+        let mut authority = fixture
+            .store
+            .begin_mutation(&fixture.intent, Some(&reservation))
+            .unwrap();
+        let pending = fixture
+            .store
+            .root_path()
+            .join(FORENSICS_DIR)
+            .join(PENDING_CLEANUP_DIR);
+        let retained = pending.with_extension("retained");
+        fs::rename(&pending, &retained).unwrap();
+        fs::create_dir(&pending).unwrap();
+
+        assert!(fixture
+            .graph
+            .write_page_projection(
+                fixture.intent.path().as_str(),
+                Some(b"- base\n"),
+                &fixture.target,
+                &mut authority,
+            )
+            .is_err());
+        assert_eq!(
+            fs::read(fixture.graph_root.join(fixture.intent.path().as_str())).unwrap(),
+            b"- base\n"
+        );
+        let retained_entries = fs::read_dir(retained)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            retained_entries,
+            [
+                std::ffi::OsString::from(PENDING_CLEANUP_ROUND_STATE),
+                std::ffi::OsString::from(PENDING_CLEANUP_ROUND_DIRS[0]),
+                std::ffi::OsString::from(PENDING_CLEANUP_ROUND_DIRS[1]),
+            ]
+            .into_iter()
+            .collect()
+        );
+    }
+
+    #[test]
+    fn pending_cleanup_round_state_and_identity_fail_closed() {
+        let interrupted = Fixture::new("pending-cleanup-round-state-interrupted-swap");
+        let interrupted_root = interrupted
+            .store
+            .root_path()
+            .join(FORENSICS_DIR)
+            .join(PENDING_CLEANUP_DIR);
+        let temp = interrupted_root.join(format!(".tmp-{}", Uuid::new_v4()));
+        fs::write(&temp, b"incomplete cursor replacement").unwrap();
+        let reopened = interrupted.reopen_store();
+        assert!(!temp.exists());
+        let queue = open_pending_cleanup_rounds(
+            &reopened.namespaces.pending_cleanup.capability,
+            reopened.store_id,
+            reopened.namespaces.pending_cleanup.identity,
+        )
+        .unwrap();
+        assert_eq!(queue.state.active_round, 0);
+
+        let deleted = Fixture::new("pending-cleanup-round-state-deleted");
+        let deleted_root = deleted
+            .store
+            .root_path()
+            .join(FORENSICS_DIR)
+            .join(PENDING_CLEANUP_DIR);
+        fs::remove_file(deleted_root.join(PENDING_CLEANUP_ROUND_STATE)).unwrap();
+        assert!(matches!(
+            deleted
+                .store
+                .pending_projection_cleanup_bounded(1)
+                .unwrap_err(),
+            ProjectionStoreError::NamespaceSubstitution(_)
+        ));
+        assert!(ProjectionReceiptStore::open(
+            deleted.store.root_path(),
+            deleted.store.workspace_id()
+        )
+        .is_err());
+
+        let substituted = Fixture::new("pending-cleanup-round-identity-substituted");
+        let substituted_root = substituted
+            .store
+            .root_path()
+            .join(FORENSICS_DIR)
+            .join(PENDING_CLEANUP_DIR);
+        let round = substituted_root.join(PENDING_CLEANUP_ROUND_DIRS[0]);
+        let retained = substituted_root
+            .parent()
+            .unwrap()
+            .join("retained-pending-cleanup-round-0");
+        fs::rename(&round, &retained).unwrap();
+        fs::create_dir(&round).unwrap();
+        assert!(matches!(
+            substituted
+                .store
+                .pending_projection_cleanup_bounded(1)
+                .unwrap_err(),
+            ProjectionStoreError::NamespaceSubstitution(_)
+        ));
+        assert!(ProjectionReceiptStore::open(
+            substituted.store.root_path(),
+            substituted.store.workspace_id()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn pending_cleanup_round_temp_is_bounded_and_unicode_unknown_fails_closed() {
+        let fixture = Fixture::new("pending-cleanup-round-temp-unicode");
+        let round = fixture
+            .store
+            .root_path()
+            .join(FORENSICS_DIR)
+            .join(PENDING_CLEANUP_DIR)
+            .join(PENDING_CLEANUP_ROUND_DIRS[0]);
+        let temp = round.join(format!(".tmp-{}", Uuid::new_v4()));
+        fs::write(&temp, b"incomplete replacement").unwrap();
+        reset_projection_store_test_counters();
+        assert!(fixture
+            .store
+            .pending_projection_cleanup_bounded(1)
+            .unwrap()
+            .is_empty());
+        assert_eq!(projection_store_test_counters().pending_cleanup_entries, 1);
+        assert!(!temp.exists());
+
+        let unknown = round.join("未認証.projection-cleanup");
+        fs::write(&unknown, b"not a canonical marker").unwrap();
+        reset_projection_store_test_counters();
+        assert!(fixture.store.pending_projection_cleanup_bounded(1).is_err());
+        assert_eq!(projection_store_test_counters().pending_cleanup_entries, 1);
+        assert_eq!(fs::read(unknown).unwrap(), b"not a canonical marker");
+    }
+
+    #[test]
+    fn pending_cleanup_index_visits_only_live_attempts_after_historical_completions() {
+        let fixture = Fixture::new("bounded-pending-cleanup-index");
+        for index in 0_u128..33 {
+            let path = ManagedPath::parse(format!("pages/history-{index}.md")).unwrap();
+            let absolute = fixture.graph_root.join(path.as_str());
+            fs::write(&absolute, b"- base\n").unwrap();
+            let target = format!("- target {index}\n").into_bytes();
+            let intent = ProjectionIntent::new(
+                fixture.store.workspace_id(),
+                PageId::from_uuid(Uuid::from_u128(10_000 + index)),
+                path,
+                FrontierV2::default(),
+                Vec::new(),
+                ProjectionPrecondition::Base(BlobDescription::of(b"- base\n")),
+                BlobDescription::of(&target),
+                Vec::new(),
+            )
+            .unwrap();
+            fixture
+                .store
+                .publish_intent(&intent, Some(b"- base\n"))
+                .unwrap();
+            let reservation = fixture.store.reserve_attempt(&intent).unwrap();
+            let mut authority = fixture
+                .store
+                .begin_mutation(&intent, Some(&reservation))
+                .unwrap();
+            let proof = fixture
+                .graph
+                .write_page_projection(
+                    intent.path().as_str(),
+                    Some(b"- base\n"),
+                    &target,
+                    &mut authority,
+                )
+                .unwrap();
+            fixture
+                .store
+                .publish_completion(authority, &intent, &proof)
+                .unwrap();
+            if index != 32 {
+                let (_, record) = fixture
+                    .store
+                    .pending_projection_cleanup()
+                    .unwrap()
+                    .into_iter()
+                    .find(|(candidate, _)| candidate == &intent)
+                    .unwrap();
+                assert_eq!(
+                    fixture
+                        .graph
+                        .retire_completed_projection_recovery(
+                            intent.path().as_str(),
+                            std::slice::from_ref(&record),
+                            None,
+                        )
+                        .unwrap(),
+                    ProjectionRecoveryCleanup::Quarantined
+                );
+                assert_eq!(
+                    fixture
+                        .graph
+                        .retire_completed_projection_recovery(
+                            intent.path().as_str(),
+                            std::slice::from_ref(&record),
+                            Some(&ProjectionCleanupRetirementAuthority::for_test(&record)),
+                        )
+                        .unwrap(),
+                    ProjectionRecoveryCleanup::Retired
+                );
+                fixture
+                    .store
+                    .retire_pending_projection_cleanup(&record)
+                    .unwrap();
+            }
+        }
+
+        reset_projection_store_test_counters();
+        let pending = fixture.store.pending_projection_cleanup().unwrap();
+        let counters = projection_store_test_counters();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(counters.pending_cleanup_entries, 1);
+        assert_eq!(counters.catalog_directory_entries, 0);
+        assert_eq!(counters.completion_lookups, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn graph_local_retirement_succeeds_when_receipts_are_on_another_filesystem() {
+        let shared_memory = Path::new("/dev/shm");
+        if !shared_memory.is_dir() {
+            return;
+        }
+        let graph_parent =
+            std::env::temp_dir().join(format!("tine-exdev-graph-{}", Uuid::new_v4()));
+        let receipt_parent = shared_memory.join(format!("tine-exdev-receipts-{}", Uuid::new_v4()));
+        fs::create_dir(&graph_parent).unwrap();
+        if fs::create_dir(&receipt_parent).is_err() {
+            let _ = fs::remove_dir(&graph_parent);
+            return;
+        }
+        if fs::metadata(&graph_parent).unwrap().dev()
+            == fs::metadata(&receipt_parent).unwrap().dev()
+        {
+            let _ = fs::remove_dir(&graph_parent);
+            let _ = fs::remove_dir(&receipt_parent);
+            return;
+        }
+        set_projection_cleanup_time_for_test(Some(50_000));
+        let graph_root = graph_parent.join("graph");
+        fs::create_dir(&graph_root).unwrap();
+        fs::create_dir(graph_root.join("pages")).unwrap();
+        let path = ManagedPath::parse("pages/external-volume.md").unwrap();
+        fs::write(graph_root.join(path.as_str()), b"- base\n").unwrap();
+        let graph = Graph::open(&graph_root);
+        let store = ProjectionReceiptStore::open(
+            &receipt_parent.join("receipts"),
+            WorkspaceId::from_uuid(Uuid::from_u128(1)),
+        )
+        .unwrap();
+        let target = b"- target\n";
+        let intent = ProjectionIntent::new(
+            store.workspace_id(),
+            PageId::from_uuid(Uuid::from_u128(2)),
+            path,
+            FrontierV2::default(),
+            Vec::new(),
+            ProjectionPrecondition::Base(BlobDescription::of(b"- base\n")),
+            BlobDescription::of(target),
+            Vec::new(),
+        )
+        .unwrap();
+        store.publish_intent(&intent, Some(b"- base\n")).unwrap();
+        let reservation = store.reserve_attempt(&intent).unwrap();
+        let recovery_path = graph_root
+            .join("pages")
+            .join(reservation.recovery_filename());
+        let mut authority = store.begin_mutation(&intent, Some(&reservation)).unwrap();
+        let proof = graph
+            .write_page_projection(
+                intent.path().as_str(),
+                Some(b"- base\n"),
+                target,
+                &mut authority,
+            )
+            .unwrap();
+        store
+            .publish_completion(authority, &intent, &proof)
+            .unwrap();
+        let (_, record) = store
+            .pending_projection_cleanup()
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(
+            graph
+                .retire_completed_projection_recovery(
+                    intent.path().as_str(),
+                    std::slice::from_ref(&record),
+                    None,
+                )
+                .unwrap(),
+            ProjectionRecoveryCleanup::Quarantined
+        );
+        assert!(store
+            .projection_cleanup_grace_elapsed(&record)
+            .unwrap()
+            .is_none());
+        set_projection_cleanup_time_for_test(Some(50_000 + PROJECTION_RECOVERY_GRACE_SECONDS + 1));
+        let reopened =
+            ProjectionReceiptStore::open(store.root_path(), store.workspace_id()).unwrap();
+        let retirement = reopened
+            .projection_cleanup_grace_elapsed(&record)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            graph
+                .retire_completed_projection_recovery(
+                    intent.path().as_str(),
+                    std::slice::from_ref(&record),
+                    Some(&retirement),
+                )
+                .unwrap(),
+            ProjectionRecoveryCleanup::Retired
+        );
+        reopened.retire_pending_projection_cleanup(&record).unwrap();
+        assert!(!recovery_path.exists());
+        assert!(store.pending_projection_cleanup().unwrap().is_empty());
+        drop(store);
+        drop(reopened);
+        drop(graph);
+        fs::remove_dir_all(&graph_parent).unwrap();
+        fs::remove_dir_all(&receipt_parent).unwrap();
+        set_projection_cleanup_time_for_test(None);
+    }
+
+    #[test]
+    fn completed_recovery_retirement_quarantines_final_race_winner() {
+        let fixture = Fixture::new_replacement("completed-recovery-retirement-final-race");
+        let base = b"- base\n";
+        let (_reservation, recovery_path, records) = fixture.complete_replacement();
+        let displaced = recovery_path.with_extension("provider-retained");
+        let raced_recovery = recovery_path.clone();
+        let raced_displaced = displaced.clone();
+        crate::model::set_projection_recovery_retirement_hook_for_test(move || {
+            fs::rename(&raced_recovery, &raced_displaced)?;
+            fs::write(&raced_recovery, base)
+        });
+
+        let conflict = fixture
+            .graph
+            .retire_completed_projection_recovery(fixture.intent.path().as_str(), &records, None)
+            .unwrap();
+        let ProjectionRecoveryCleanup::ConflictRetained { relative_path } = conflict else {
+            panic!("final race did not become a recoverable conflict: {conflict:?}");
+        };
+        assert!(!recovery_path.exists());
+        let quarantine = retirement_quarantine_path(&recovery_path, &records[0]);
+        assert!(!quarantine.exists());
+        assert_eq!(
+            fs::read(fixture.graph_root.join(relative_path)).unwrap(),
+            base
+        );
+        assert_eq!(fs::read(&displaced).unwrap(), base);
+    }
+
+    #[test]
+    fn completed_recovery_retirement_retains_stale_handle_write_at_final_boundary() {
+        let fixture = Fixture::new_replacement("completed-recovery-stale-handle");
+        let (_reservation, recovery_path, records) = fixture.complete_replacement();
+        let mut stale = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&recovery_path)
+            .unwrap();
+        super::super::projection::retire_one_projection_recovery(
+            &fixture.graph,
+            &fixture.store,
+            &fixture.intent,
+            &records[0],
+        )
+        .unwrap();
+        crate::model::set_projection_recovery_final_retirement_hook_for_test(move || {
+            stale.seek(io::SeekFrom::Start(0))?;
+            stale.write_all(b"- stale writer changed this inode\n")?;
+            stale.set_len(b"- stale writer changed this inode\n".len() as u64)?;
+            stale.sync_all()
+        });
+
+        let conflict = fixture
+            .graph
+            .retire_completed_projection_recovery(
+                fixture.intent.path().as_str(),
+                &records,
+                Some(&ProjectionCleanupRetirementAuthority::for_test(&records[0])),
+            )
+            .unwrap();
+        let ProjectionRecoveryCleanup::ConflictRetained { relative_path } = conflict else {
+            panic!("stale handle change did not become a recoverable conflict: {conflict:?}");
+        };
+        let quarantine = retirement_quarantine_path(&recovery_path, &records[0]);
+        assert!(!quarantine.exists());
+        assert_eq!(
+            fs::read(fixture.graph_root.join(relative_path)).unwrap(),
+            b"- stale writer changed this inode\n"
+        );
+        assert_eq!(fixture.store.pending_projection_cleanup().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn settled_stale_descriptor_write_after_final_reread_documents_handoff_residual() {
+        set_projection_cleanup_time_for_test(Some(10_000));
+        let fixture = Fixture::new_replacement("settled-stale-descriptor-after-final-reread");
+        let target_path = fixture.graph_root.join(fixture.intent.path().as_str());
+        let stale = Rc::new(RefCell::new(
+            fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&target_path)
+                .unwrap(),
+        ));
+        let (_reservation, recovery_path, records) = fixture.complete_replacement();
+        let record = &records[0];
+        super::super::projection::retire_one_projection_recovery(
+            &fixture.graph,
+            &fixture.store,
+            &fixture.intent,
+            record,
+        )
+        .unwrap();
+        let quarantine = retirement_quarantine_path(&recovery_path, record);
+        // Necessity gate: the prior immediate-delete construction fails here
+        // because it removed the recovery name before any durable observation.
+        assert_eq!(fs::read(&quarantine).unwrap(), b"- base\n");
+
+        let name = pending_cleanup_filename(record);
+        let (_, marker_bytes) = read_pending_cleanup_marker(
+            &fixture.store.namespaces.pending_cleanup.capability,
+            fixture.store.store_id,
+            fixture.store.namespaces.pending_cleanup.identity,
+            &name,
+        )
+        .unwrap();
+        let marker = decode_pending_cleanup_marker(&marker_bytes).unwrap();
+        let observation = marker
+            .observation
+            .expect("first pass must durably observe the quarantine");
+        assert_eq!(observation.session_id, fixture.store.cleanup_session_id);
+        assert_eq!(observation.observed_unix_seconds, 10_000);
+
+        set_projection_cleanup_time_for_test(Some(10_000 + PROJECTION_RECOVERY_GRACE_SECONDS + 1));
+        let reopened = fixture.reopen_store();
+        assert_ne!(
+            reopened.cleanup_session_id,
+            fixture.store.cleanup_session_id
+        );
+        assert!(
+            reopened
+                .projection_cleanup_grace_elapsed(record)
+                .unwrap()
+                .is_some(),
+            "settled retirement requires a different session and elapsed grace"
+        );
+
+        let changed = b"- autosaved after Tine's final settled reread\n";
+        let hook_stale = Rc::clone(&stale);
+        crate::model::set_projection_recovery_after_final_reread_hook_for_test(move || {
+            let mut stale = hook_stale.borrow_mut();
+            stale.seek(io::SeekFrom::Start(0))?;
+            stale.write_all(changed)?;
+            stale.set_len(changed.len() as u64)?;
+            stale.sync_all()
+        });
+
+        super::super::projection::retire_one_projection_recovery(
+            &fixture.graph,
+            &reopened,
+            &fixture.intent,
+            record,
+        )
+        .unwrap();
+        assert!(!quarantine.exists());
+        assert!(reopened.pending_projection_cleanup().unwrap().is_empty());
+
+        // Portable filesystems cannot revoke a writable descriptor held across
+        // restart plus the full grace interval. At the exact post-reread cut,
+        // cleanup therefore accepts the clean-handoff contract and unlinks the
+        // name. The retained descriptor proves the finite-grace residual rather
+        // than claiming that these out-of-contract bytes remain recoverable.
+        let mut anonymous = stale.borrow_mut();
+        anonymous.seek(io::SeekFrom::Start(0)).unwrap();
+        let mut observed = Vec::new();
+        anonymous.read_to_end(&mut observed).unwrap();
+        assert_eq!(
+            observed, changed,
+            "the exact accepted residual must remain observable through the held descriptor"
+        );
+        set_projection_cleanup_time_for_test(None);
+    }
+
+    #[test]
+    fn unchanged_quarantine_requires_restart_and_meaningful_grace() {
+        set_projection_cleanup_time_for_test(Some(10_000));
+        let fixture = Fixture::new_replacement("cleanup-restart-and-grace");
+        let (_, recovery_path, records) = fixture.complete_replacement();
+        let record = &records[0];
+        assert_eq!(
+            fixture
+                .graph
+                .retire_completed_projection_recovery(
+                    fixture.intent.path().as_str(),
+                    std::slice::from_ref(record),
+                    None,
+                )
+                .unwrap(),
+            ProjectionRecoveryCleanup::Quarantined
+        );
+        assert!(fixture
+            .store
+            .projection_cleanup_grace_elapsed(record)
+            .unwrap()
+            .is_none());
+
+        set_projection_cleanup_time_for_test(Some(10_000 + PROJECTION_RECOVERY_GRACE_SECONDS + 1));
+        assert!(
+            fixture
+                .store
+                .projection_cleanup_grace_elapsed(record)
+                .unwrap()
+                .is_none(),
+            "elapsed wall time in the creating session authorized retirement"
+        );
+        let reopened = fixture.reopen_store();
+        let retirement = reopened
+            .projection_cleanup_grace_elapsed(record)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fixture
+                .graph
+                .retire_completed_projection_recovery(
+                    fixture.intent.path().as_str(),
+                    std::slice::from_ref(record),
+                    Some(&retirement),
+                )
+                .unwrap(),
+            ProjectionRecoveryCleanup::Retired
+        );
+        reopened.retire_pending_projection_cleanup(record).unwrap();
+        assert!(!recovery_path.exists());
+        assert!(reopened.pending_projection_cleanup().unwrap().is_empty());
+        set_projection_cleanup_time_for_test(None);
+    }
+
+    #[test]
+    fn restart_before_grace_retains_quarantine_and_clock_rollback_restarts_settlement() {
+        set_projection_cleanup_time_for_test(Some(20_000));
+        let fixture = Fixture::new_replacement("cleanup-clock-rollback");
+        let (_reservation, recovery_path, records) = fixture.complete_replacement();
+        let record = &records[0];
+        assert_eq!(
+            fixture
+                .graph
+                .retire_completed_projection_recovery(
+                    fixture.intent.path().as_str(),
+                    std::slice::from_ref(record),
+                    None,
+                )
+                .unwrap(),
+            ProjectionRecoveryCleanup::Quarantined
+        );
+        assert!(fixture
+            .store
+            .projection_cleanup_grace_elapsed(record)
+            .unwrap()
+            .is_none());
+
+        set_projection_cleanup_time_for_test(Some(20_000 + PROJECTION_RECOVERY_GRACE_SECONDS - 1));
+        let pre_grace = fixture.reopen_store();
+        assert!(pre_grace
+            .projection_cleanup_grace_elapsed(record)
+            .unwrap()
+            .is_none());
+
+        set_projection_cleanup_time_for_test(Some(19_000));
+        let rollback = fixture.reopen_store();
+        assert!(rollback
+            .projection_cleanup_grace_elapsed(record)
+            .unwrap()
+            .is_none());
+        set_projection_cleanup_time_for_test(Some(19_000 + PROJECTION_RECOVERY_GRACE_SECONDS + 1));
+        assert!(
+            rollback
+                .projection_cleanup_grace_elapsed(record)
+                .unwrap()
+                .is_none(),
+            "rollback-reset observation retired in the same session"
+        );
+        let settled = fixture.reopen_store();
+        assert!(settled
+            .projection_cleanup_grace_elapsed(record)
+            .unwrap()
+            .is_some());
+
+        let quarantine = retirement_quarantine_path(&recovery_path, record);
+        assert_eq!(fs::read(quarantine).unwrap(), b"- base\n");
+        set_projection_cleanup_time_for_test(None);
+    }
+
+    #[test]
+    fn cleanup_observation_crash_cuts_retain_or_publish_conservative_state() {
+        set_projection_cleanup_time_for_test(Some(25_000));
+        let fixture = Fixture::new_replacement("cleanup-observation-crash-cuts");
+        let (_, _, records) = fixture.complete_replacement();
+        let record = &records[0];
+        assert_eq!(
+            fixture
+                .graph
+                .retire_completed_projection_recovery(
+                    fixture.intent.path().as_str(),
+                    std::slice::from_ref(record),
+                    None,
+                )
+                .unwrap(),
+            ProjectionRecoveryCleanup::Quarantined
+        );
+
+        fail_before_projection_cleanup_marker_swap_for_test();
+        assert!(fixture
+            .store
+            .projection_cleanup_grace_elapsed(record)
+            .is_err());
+        let reopened = fixture.reopen_store();
+        assert!(
+            reopened
+                .projection_cleanup_grace_elapsed(record)
+                .unwrap()
+                .is_none(),
+            "pre-swap crash lost the pending marker or invented settlement"
+        );
+
+        set_projection_cleanup_time_for_test(Some(24_000));
+        fail_after_projection_cleanup_marker_swap_for_test();
+        assert!(reopened.projection_cleanup_grace_elapsed(record).is_err());
+        set_projection_cleanup_time_for_test(Some(24_000 + PROJECTION_RECOVERY_GRACE_SECONDS + 1));
+        let after_crash = fixture.reopen_store();
+        assert!(
+            after_crash
+                .projection_cleanup_grace_elapsed(record)
+                .unwrap()
+                .is_some(),
+            "post-swap crash did not preserve the conservative rollback-reset observation"
+        );
+        set_projection_cleanup_time_for_test(None);
+    }
+
+    #[test]
+    fn changed_quarantine_becomes_visible_conflict_without_blocking_cleanup_queue() {
+        set_projection_cleanup_time_for_test(Some(30_000));
+        let fixture = Fixture::new_replacement("changed-quarantine-conflict");
+        let (_reservation, recovery_path, records) = fixture.complete_replacement();
+        let record = &records[0];
+        assert_eq!(
+            fixture
+                .graph
+                .retire_completed_projection_recovery(
+                    fixture.intent.path().as_str(),
+                    std::slice::from_ref(record),
+                    None,
+                )
+                .unwrap(),
+            ProjectionRecoveryCleanup::Quarantined
+        );
+        assert!(fixture
+            .store
+            .projection_cleanup_grace_elapsed(record)
+            .unwrap()
+            .is_none());
+        let quarantine = retirement_quarantine_path(&recovery_path, record);
+        let changed = b"- external editor's newer recoverable bytes\n";
+        fs::write(&quarantine, changed).unwrap();
+
+        let outcome = fixture
+            .graph
+            .retire_completed_projection_recovery(
+                fixture.intent.path().as_str(),
+                std::slice::from_ref(record),
+                None,
+            )
+            .unwrap();
+        let ProjectionRecoveryCleanup::ConflictRetained { relative_path } = outcome else {
+            panic!("changed quarantine was not surfaced as a conflict: {outcome:?}");
+        };
+        assert!(!quarantine.exists());
+        let conflict = fixture.graph_root.join(relative_path);
+        assert!(
+            !conflict
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with('.'),
+            "recoverable conflict remained hidden"
+        );
+        assert_eq!(fs::read(conflict).unwrap(), changed);
+        fixture
+            .store
+            .retire_pending_projection_cleanup(record)
+            .unwrap();
+        assert!(fixture
+            .store
+            .pending_projection_cleanup()
+            .unwrap()
+            .is_empty());
+        set_projection_cleanup_time_for_test(None);
+    }
+
+    #[test]
+    fn oversized_changed_quarantine_is_renamed_visible_without_loading_it() {
+        let fixture = Fixture::new_replacement("oversized-changed-quarantine");
+        let (_reservation, recovery_path, records) = fixture.complete_replacement();
+        let record = &records[0];
+        assert_eq!(
+            fixture
+                .graph
+                .retire_completed_projection_recovery(
+                    fixture.intent.path().as_str(),
+                    std::slice::from_ref(record),
+                    None,
+                )
+                .unwrap(),
+            ProjectionRecoveryCleanup::Quarantined
+        );
+        let quarantine = retirement_quarantine_path(&recovery_path, record);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&quarantine)
+            .unwrap()
+            .set_len(MAX_PROJECTION_EVIDENCE_BYTES + 1)
+            .unwrap();
+        let outcome = fixture
+            .graph
+            .retire_completed_projection_recovery(
+                fixture.intent.path().as_str(),
+                std::slice::from_ref(record),
+                None,
+            )
+            .unwrap();
+        let ProjectionRecoveryCleanup::ConflictRetained { relative_path } = outcome else {
+            panic!("oversized changed quarantine was not retained visibly: {outcome:?}");
+        };
+        assert!(!quarantine.exists());
+        assert_eq!(
+            fs::metadata(fixture.graph_root.join(relative_path))
+                .unwrap()
+                .len(),
+            MAX_PROJECTION_EVIDENCE_BYTES + 1
+        );
+    }
+
+    #[test]
+    fn settled_cleanup_queue_drains_in_bounded_passes_without_history_growth() {
+        set_projection_cleanup_time_for_test(Some(40_000));
+        let fixture = Fixture::new("bounded-settled-cleanup");
+        for index in 0_u128..70 {
+            let path = ManagedPath::parse(format!("pages/settled-{index}.md")).unwrap();
+            fs::write(fixture.graph_root.join(path.as_str()), b"- base\n").unwrap();
+            let target = format!("- target {index}\n").into_bytes();
+            let intent = ProjectionIntent::new(
+                fixture.store.workspace_id(),
+                PageId::from_uuid(Uuid::from_u128(50_000 + index)),
+                path,
+                FrontierV2::default(),
+                Vec::new(),
+                ProjectionPrecondition::Base(BlobDescription::of(b"- base\n")),
+                BlobDescription::of(&target),
+                Vec::new(),
+            )
+            .unwrap();
+            fixture
+                .store
+                .publish_intent(&intent, Some(b"- base\n"))
+                .unwrap();
+            let reservation = fixture.store.reserve_attempt(&intent).unwrap();
+            let mut authority = fixture
+                .store
+                .begin_mutation(&intent, Some(&reservation))
+                .unwrap();
+            let proof = fixture
+                .graph
+                .write_page_projection(
+                    intent.path().as_str(),
+                    Some(b"- base\n"),
+                    &target,
+                    &mut authority,
+                )
+                .unwrap();
+            fixture
+                .store
+                .publish_completion(authority, &intent, &proof)
+                .unwrap();
+        }
+
+        reset_projection_store_test_counters();
+        let first_pass = fixture
+            .store
+            .pending_projection_cleanup_bounded(MAX_PENDING_PROJECTION_CLEANUP_PER_PASS)
+            .unwrap();
+        assert_eq!(first_pass.len(), MAX_PENDING_PROJECTION_CLEANUP_PER_PASS);
+        assert_eq!(
+            projection_store_test_counters().pending_cleanup_entries,
+            MAX_PENDING_PROJECTION_CLEANUP_PER_PASS
+        );
+
+        for (intent, record) in fixture.store.pending_projection_cleanup().unwrap() {
+            assert_eq!(
+                fixture
+                    .graph
+                    .retire_completed_projection_recovery(
+                        intent.path().as_str(),
+                        std::slice::from_ref(&record),
+                        None,
+                    )
+                    .unwrap(),
+                ProjectionRecoveryCleanup::Quarantined
+            );
+            assert!(fixture
+                .store
+                .projection_cleanup_grace_elapsed(&record)
+                .unwrap()
+                .is_none());
+        }
+
+        set_projection_cleanup_time_for_test(Some(40_000 + PROJECTION_RECOVERY_GRACE_SECONDS + 1));
+        let reopened = fixture.reopen_store();
+        let mut pass_sizes = Vec::new();
+        loop {
+            let pass = reopened
+                .pending_projection_cleanup_bounded(MAX_PENDING_PROJECTION_CLEANUP_PER_PASS)
+                .unwrap();
+            if pass.is_empty() {
+                break;
+            }
+            pass_sizes.push(pass.len());
+            for (intent, record) in pass {
+                let retirement = reopened
+                    .projection_cleanup_grace_elapsed(&record)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    fixture
+                        .graph
+                        .retire_completed_projection_recovery(
+                            intent.path().as_str(),
+                            std::slice::from_ref(&record),
+                            Some(&retirement),
+                        )
+                        .unwrap(),
+                    ProjectionRecoveryCleanup::Retired
+                );
+                reopened.retire_pending_projection_cleanup(&record).unwrap();
+            }
+        }
+        assert_eq!(pass_sizes.iter().sum::<usize>(), 70);
+        assert_eq!(pass_sizes.len(), 2);
+        assert!(pass_sizes
+            .iter()
+            .all(|size| *size <= MAX_PENDING_PROJECTION_CLEANUP_PER_PASS));
+        assert!(reopened.pending_projection_cleanup().unwrap().is_empty());
+        assert!(fs::read_dir(fixture.graph_root.join("pages"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .all(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                !name.ends_with(".projection.recovery") && !name.ends_with(".projection-quarantine")
+            }));
+        set_projection_cleanup_time_for_test(None);
+    }
+
+    #[test]
+    fn blocked_cleanup_round_cannot_starve_later_changed_sidecar() {
+        let fixture = Fixture::new("fair-cleanup-blocked-prefix");
+        for index in 0_u128..MAX_PENDING_PROJECTION_CLEANUP_PER_PASS as u128 {
+            let path = ManagedPath::parse(format!("pages/incomplete-{index}.md")).unwrap();
+            fs::write(fixture.graph_root.join(path.as_str()), b"- base\n").unwrap();
+            let target = format!("- incomplete target {index}\n").into_bytes();
+            let intent = ProjectionIntent::new(
+                fixture.store.workspace_id(),
+                PageId::from_uuid(Uuid::from_u128(80_000 + index)),
+                path,
+                FrontierV2::default(),
+                Vec::new(),
+                ProjectionPrecondition::Base(BlobDescription::of(b"- base\n")),
+                BlobDescription::of(&target),
+                Vec::new(),
+            )
+            .unwrap();
+            fixture
+                .store
+                .publish_intent(&intent, Some(b"- base\n"))
+                .unwrap();
+            let reservation = fixture.store.reserve_attempt(&intent).unwrap();
+            let mut authority = fixture
+                .store
+                .begin_mutation(&intent, Some(&reservation))
+                .unwrap();
+            fixture
+                .graph
+                .write_page_projection(
+                    intent.path().as_str(),
+                    Some(b"- base\n"),
+                    &target,
+                    &mut authority,
+                )
+                .unwrap();
+            drop(authority);
+        }
+
+        // Rotate the 64 incomplete markers into round 0, then durably finish
+        // the empty-round transition without visiting round 0. This is the
+        // exact crash/restart state in which a later insertion belongs to the
+        // inactive round behind a full retained prefix.
+        assert_eq!(
+            fixture
+                .store
+                .pending_projection_cleanup_bounded(MAX_PENDING_PROJECTION_CLEANUP_PER_PASS)
+                .unwrap()
+                .len(),
+            MAX_PENDING_PROJECTION_CLEANUP_PER_PASS
+        );
+        let namespace = &fixture.store.namespaces.pending_cleanup;
+        let queue = open_pending_cleanup_rounds(
+            &namespace.capability,
+            fixture.store.store_id,
+            namespace.identity,
+        )
+        .unwrap();
+        assert_eq!(queue.state.active_round, 1);
+        assert!(queue.rounds[1].entries().unwrap().next().is_none());
+        flip_pending_cleanup_round(&namespace.capability, &queue).unwrap();
+        let restarted = fixture.reopen_store();
+
+        let later_path = ManagedPath::parse("pages/later-changed.md").unwrap();
+        fs::write(
+            fixture.graph_root.join(later_path.as_str()),
+            b"- later base\n",
+        )
+        .unwrap();
+        let later_target = b"- later target\n";
+        let later_intent = ProjectionIntent::new(
+            restarted.workspace_id(),
+            PageId::from_uuid(Uuid::from_u128(90_000)),
+            later_path,
+            FrontierV2::default(),
+            Vec::new(),
+            ProjectionPrecondition::Base(BlobDescription::of(b"- later base\n")),
+            BlobDescription::of(later_target),
+            Vec::new(),
+        )
+        .unwrap();
+        restarted
+            .publish_intent(&later_intent, Some(b"- later base\n"))
+            .unwrap();
+        let reservation = restarted.reserve_attempt(&later_intent).unwrap();
+        let recovery_path = fixture
+            .graph_root
+            .join(later_intent.path().as_str())
+            .parent()
+            .unwrap()
+            .join(reservation.recovery_filename());
+        let mut authority = restarted
+            .begin_mutation(&later_intent, Some(&reservation))
+            .unwrap();
+        let proof = fixture
+            .graph
+            .write_page_projection(
+                later_intent.path().as_str(),
+                Some(b"- later base\n"),
+                later_target,
+                &mut authority,
+            )
+            .unwrap();
+        restarted
+            .publish_completion(authority, &later_intent, &proof)
+            .unwrap();
+        let changed = b"- provider changed the later retained sidecar\n";
+        fs::write(&recovery_path, changed).unwrap();
+
+        reset_projection_store_test_counters();
+        super::super::projection::retire_pending_projection_recovery(&fixture.graph, &restarted)
+            .unwrap();
+        assert_eq!(
+            projection_store_test_counters().pending_cleanup_entries,
+            MAX_PENDING_PROJECTION_CLEANUP_PER_PASS
+        );
+        assert_eq!(fs::read(&recovery_path).unwrap(), changed);
+
+        // The next active round contains the same 64 retained markers plus the
+        // later insertion. Since every visit rotates a marker away, two more
+        // capped passes are a hard upper bound independent of directory order.
+        let mut later_pass_visits = Vec::new();
+        for _ in 0..2 {
+            reset_projection_store_test_counters();
+            super::super::projection::retire_pending_projection_recovery(
+                &fixture.graph,
+                &restarted,
+            )
+            .unwrap();
+            let visits = projection_store_test_counters().pending_cleanup_entries;
+            assert!(visits <= MAX_PENDING_PROJECTION_CLEANUP_PER_PASS);
+            later_pass_visits.push(visits);
+            if !recovery_path.exists() {
+                break;
+            }
+        }
+        assert!(
+            !recovery_path.exists(),
+            "a full retained prefix starved the later changed sidecar"
+        );
+        assert!(later_pass_visits.len() <= 2);
+        let conflicts = fs::read_dir(fixture.graph_root.join("pages"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                name.starts_with("Tine-recovered-") && name.ends_with(".projection-conflict")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(fs::read(conflicts[0].path()).unwrap(), changed);
+    }
+
+    #[test]
+    fn final_quarantine_same_byte_rebind_preserves_both_resources() {
+        let fixture = Fixture::new_replacement("final-quarantine-same-byte-rebind");
+        let (_reservation, recovery_path, records) = fixture.complete_replacement();
+        assert_eq!(
+            fixture
+                .graph
+                .retire_completed_projection_recovery(
+                    fixture.intent.path().as_str(),
+                    &records,
+                    None,
+                )
+                .unwrap(),
+            ProjectionRecoveryCleanup::Quarantined
+        );
+        let quarantine = retirement_quarantine_path(&recovery_path, &records[0]);
+        let retained = quarantine.with_extension("retained-provider-inode");
+        let raced_quarantine = quarantine.clone();
+        let raced_retained = retained.clone();
+        crate::model::set_projection_recovery_final_retirement_hook_for_test(move || {
+            fs::rename(&raced_quarantine, &raced_retained)?;
+            fs::write(&raced_quarantine, b"- base\n")
+        });
+
+        assert_eq!(
+            fixture
+                .graph
+                .retire_completed_projection_recovery(
+                    fixture.intent.path().as_str(),
+                    &records,
+                    Some(&ProjectionCleanupRetirementAuthority::for_test(&records[0])),
+                )
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(fs::read(quarantine).unwrap(), b"- base\n");
+        assert_eq!(fs::read(retained).unwrap(), b"- base\n");
+        assert_eq!(fixture.store.pending_projection_cleanup().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn cleanup_crash_cuts_resume_quarantine_and_marker_retirement_idempotently() {
+        let fixture = Fixture::new_replacement("cleanup-crash-cuts");
+        let (_reservation, recovery_path, records) = fixture.complete_replacement();
+        assert_eq!(
+            fixture
+                .graph
+                .retire_completed_projection_recovery(
+                    fixture.intent.path().as_str(),
+                    &records,
+                    None,
+                )
+                .unwrap(),
+            ProjectionRecoveryCleanup::Quarantined
+        );
+        crate::model::set_projection_recovery_final_retirement_hook_for_test(|| {
+            Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "crash after graph-local quarantine",
+            ))
+        });
+        assert_eq!(
+            fixture
+                .graph
+                .retire_completed_projection_recovery(
+                    fixture.intent.path().as_str(),
+                    &records,
+                    Some(&ProjectionCleanupRetirementAuthority::for_test(&records[0])),
+                )
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Interrupted
+        );
+        let quarantine = retirement_quarantine_path(&recovery_path, &records[0]);
+        assert!(!recovery_path.exists());
+        assert_eq!(fs::read(&quarantine).unwrap(), b"- base\n");
+        assert_eq!(fixture.store.pending_projection_cleanup().unwrap().len(), 1);
+
+        let reopened = fixture.reopen_store();
+        let (_, record) = reopened
+            .pending_projection_cleanup()
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        fixture
+            .graph
+            .retire_completed_projection_recovery(
+                fixture.intent.path().as_str(),
+                std::slice::from_ref(&record),
+                Some(&ProjectionCleanupRetirementAuthority::for_test(&record)),
+            )
+            .unwrap();
+        assert!(!quarantine.exists());
+        // Crash before retiring the durable marker. The next reopen observes
+        // exact absence and retires only that one still-pending attempt.
+        let reopened = fixture.reopen_store();
+        let (_, record) = reopened
+            .pending_projection_cleanup()
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        fixture
+            .graph
+            .retire_completed_projection_recovery(
+                fixture.intent.path().as_str(),
+                std::slice::from_ref(&record),
+                Some(&ProjectionCleanupRetirementAuthority::for_test(&record)),
+            )
+            .unwrap();
+        reopened.retire_pending_projection_cleanup(&record).unwrap();
+        assert!(fixture
+            .reopen_store()
+            .pending_projection_cleanup()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn completed_recovery_retirement_preserves_parent_rebind_and_original_quarantine() {
+        let fixture = Fixture::new_at_with_base(
+            "completed-recovery-retirement-parent-rebind",
+            "pages/深い/authority ☕.md",
+            Some(b"- base\n"),
+        );
+        let (_reservation, recovery_path, records) = fixture.complete_replacement();
+        let parent = recovery_path.parent().unwrap().to_path_buf();
+        let moved_parent = parent.with_file_name("深い-retained");
+        let retained_parent = moved_parent.clone();
+        let replacement_path = recovery_path.clone();
+        crate::model::set_projection_recovery_retirement_hook_for_test(move || {
+            fs::rename(&parent, &moved_parent)?;
+            fs::create_dir(&parent)?;
+            fs::write(&replacement_path, b"- base\n")
+        });
+
+        assert_eq!(
+            fixture
+                .graph
+                .retire_completed_projection_recovery(
+                    fixture.intent.path().as_str(),
+                    &records,
+                    None,
+                )
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(fs::read(&recovery_path).unwrap(), b"- base\n");
+        let quarantine_name = retirement_quarantine_path(&recovery_path, &records[0])
+            .file_name()
+            .unwrap()
+            .to_owned();
+        assert_eq!(
+            fs::read(retained_parent.join(quarantine_name)).unwrap(),
+            b"- base\n"
+        );
     }
 
     #[test]

@@ -24,6 +24,8 @@ use super::{
     ReceiptError, ShardedHotEngine, StructuralLocator, StructuralSpan, WorkspaceId,
 };
 use crate::doc::{DocBlock, Document, SerializeOpts};
+use crate::model::ProjectionRecoveryCleanup;
+use crate::oplog::projection_store::MAX_PENDING_PROJECTION_CLEANUP_PER_PASS;
 use crate::Graph;
 
 thread_local! {
@@ -280,6 +282,7 @@ pub(crate) fn execute_receiver_local_projection_under_handoff(
     allow_mutation: bool,
 ) -> Result<Option<bool>, ProjectionError> {
     require_endpoint_authority(graph, receipts, engine)?;
+    retire_pending_projection_recovery(graph, receipts)?;
     let endpoint = engine
         .projection_endpoint_binding()
         .ok_or(ProjectionError::EndpointBindingMismatch)?;
@@ -391,6 +394,7 @@ pub(crate) fn execute_receiver_local_projection_under_handoff(
         };
         receipts.publish_completion(authority, plan.intent(), &proof)?;
     }
+    retire_completed_projection_recovery(graph, receipts, plan.intent())?;
     record_completed_path(receipts, engine, source.page_id(), plan.intent())?;
     Ok(Some(!already_complete))
 }
@@ -459,6 +463,7 @@ fn execute_manifested_projection_work_with_runtime(
     if graph.canonical_resource_id()? != endpoint.graph_resource_id {
         return Err(ProjectionError::EndpointBindingMismatch);
     }
+    retire_pending_projection_recovery(graph, receipts)?;
     engine
         .authorize_projection_work(work_index, work)
         .map_err(ProjectionError::Engine)?;
@@ -549,6 +554,7 @@ fn execute_manifested_projection_work_with_runtime(
         expected_base.as_ref().map(AnnotatedProjectionBase::bytes),
     )?;
     if receipts.load_completion(&local_attempt_intent)?.is_some() {
+        retire_completed_projection_recovery(graph, receipts, &local_attempt_intent)?;
         let authority = receipts.completed_work_authority(work, &local_attempt_intent)?;
         work_index
             .mark_completed(authority)
@@ -718,6 +724,7 @@ fn execute_manifested_projection_work_with_runtime(
         }
     };
     receipts.publish_completion(authority, &local_attempt_intent, &proof)?;
+    retire_completed_projection_recovery(graph, receipts, &local_attempt_intent)?;
     let authority = receipts.completed_work_authority(work, &local_attempt_intent)?;
     work_index
         .mark_completed(authority)
@@ -735,6 +742,7 @@ pub fn write_projection_exact(
     expected_base: Option<&[u8]>,
 ) -> Result<ProjectionWrite, ProjectionError> {
     require_endpoint_authority(graph, store, engine)?;
+    retire_pending_projection_recovery(graph, store)?;
     let authorization = engine.authorize_projection_write(page_id)?;
     let plan = plan_projection(engine.workspace_id(), authorization.state(), expected_base)?;
     store.publish_intent(plan.intent(), plan.base().map(BaseBlob::bytes))?;
@@ -747,6 +755,7 @@ pub fn write_projection_exact(
         &mut authority,
     )?;
     let completion = store.publish_completion(authority, plan.intent(), &proof)?;
+    retire_completed_projection_recovery(graph, store, plan.intent())?;
     record_completed_path(store, engine, page_id, plan.intent())?;
     debug_assert_eq!(authorization.state().page.page_id, page_id);
     Ok(ProjectionWrite { plan, completion })
@@ -765,6 +774,7 @@ pub(crate) fn confirm_existing_projection_exact(
     page_id: PageId,
 ) -> Result<(), ProjectionError> {
     require_endpoint_authority(graph, store, engine)?;
+    retire_pending_projection_recovery(graph, store)?;
     let authorization = engine.authorize_bootstrap_projection_confirmation(page_id)?;
     let current = graph
         .read_projection_input(&authorization.state().page.path)?
@@ -795,6 +805,7 @@ pub(crate) fn confirm_existing_projection_exact(
         )?;
         store.publish_completion(authority, plan.intent(), &proof)?;
     }
+    retire_completed_projection_recovery(graph, store, plan.intent())?;
     record_bootstrap_completed_path(store, engine, page_id, plan.intent())?;
     Ok(())
 }
@@ -808,6 +819,7 @@ pub fn recover_incomplete_projections(
 ) -> Result<Vec<ProjectionWrite>, ProjectionError> {
     require_endpoint_authority(graph, store, engine)?;
     let mut recovered = Vec::new();
+    retire_pending_projection_recovery(graph, store)?;
     for intent in store.incomplete_intents()? {
         let authorization = engine.authorize_projection_recovery(
             intent.page_id(),
@@ -885,6 +897,7 @@ pub fn recover_incomplete_projections(
             Some((Err(error), _)) => return Err(error.into()),
         };
         let completion = store.reconstruct_completion(authority, &intent, plan.target(), &proof)?;
+        retire_completed_projection_recovery(graph, store, &intent)?;
         // Historical recovery remains compatible and preserves its durable
         // receipt, but a completion that is no longer the current accepted
         // page state must not replace point-addressable import authority.
@@ -896,6 +909,81 @@ pub fn recover_incomplete_projections(
         recovered.push(ProjectionWrite { plan, completion });
     }
     Ok(recovered)
+}
+
+fn retire_completed_projection_recovery(
+    graph: &Graph,
+    store: &ProjectionReceiptStore,
+    intent: &ProjectionIntent,
+) -> Result<(), ProjectionError> {
+    let intent_id = intent.id()?;
+    for (pending_intent, record) in
+        store.pending_projection_cleanup_bounded(MAX_PENDING_PROJECTION_CLEANUP_PER_PASS)?
+    {
+        if pending_intent.id()? != intent_id {
+            continue;
+        }
+        if store.load_completion(&pending_intent)?.is_none() {
+            continue;
+        }
+        retire_one_projection_recovery(graph, store, &pending_intent, &record)?;
+    }
+    Ok(())
+}
+
+pub(super) fn retire_pending_projection_recovery(
+    graph: &Graph,
+    store: &ProjectionReceiptStore,
+) -> Result<(), ProjectionError> {
+    for (intent, record) in
+        store.pending_projection_cleanup_bounded(MAX_PENDING_PROJECTION_CLEANUP_PER_PASS)?
+    {
+        if store.load_completion(&intent)?.is_none() {
+            continue;
+        }
+        retire_one_projection_recovery(graph, store, &intent, &record)?;
+    }
+    Ok(())
+}
+
+pub(super) fn retire_one_projection_recovery(
+    graph: &Graph,
+    store: &ProjectionReceiptStore,
+    intent: &ProjectionIntent,
+    record: &super::LocalProjectionEvidenceRecord,
+) -> Result<(), ProjectionError> {
+    let observation = graph.retire_completed_projection_recovery(
+        intent.path().as_str(),
+        std::slice::from_ref(record),
+        None,
+    )?;
+    match observation {
+        ProjectionRecoveryCleanup::Missing
+        | ProjectionRecoveryCleanup::Retired
+        | ProjectionRecoveryCleanup::ConflictRetained { .. } => {
+            store.retire_pending_projection_cleanup(record)?;
+        }
+        ProjectionRecoveryCleanup::Quarantined => {
+            let Some(retirement) = store.projection_cleanup_grace_elapsed(record)? else {
+                return Ok(());
+            };
+            match graph.retire_completed_projection_recovery(
+                intent.path().as_str(),
+                std::slice::from_ref(record),
+                Some(&retirement),
+            )? {
+                ProjectionRecoveryCleanup::Missing
+                | ProjectionRecoveryCleanup::Retired
+                | ProjectionRecoveryCleanup::ConflictRetained { .. } => {
+                    store.retire_pending_projection_cleanup(record)?;
+                }
+                ProjectionRecoveryCleanup::Quarantined => {
+                    store.reset_projection_cleanup_grace(record)?;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Make every durable completion visible through the enrolled authenticated

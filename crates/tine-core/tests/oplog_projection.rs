@@ -75,6 +75,25 @@ fn copy_directory_tree(source: &Path, destination: &Path) {
     }
 }
 
+fn projection_recovery_paths(root: &Path) -> Vec<PathBuf> {
+    let mut recoveries = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(directory).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                pending.push(entry.path());
+            } else if entry.file_name().to_str().is_some_and(|name| {
+                name.ends_with(".projection.recovery") || name.ends_with(".projection-quarantine")
+            }) {
+                recoveries.push(entry.path());
+            }
+        }
+    }
+    recoveries.sort();
+    recoveries
+}
+
 #[derive(Debug, Eq, PartialEq)]
 enum TreeSnapshotEntry {
     Directory { readonly: bool },
@@ -1367,7 +1386,7 @@ fn graph_bridge_publishes_completion_only_after_exact_reread() {
 }
 
 #[test]
-fn normal_replacement_catalogs_local_evidence_outside_stable_completion() {
+fn normal_replacement_catalogs_local_evidence_and_quarantines_recent_sidecar() {
     let engine_dir = TestDir::new("replacement-engine");
     let graph_dir = TestDir::new("replacement-graph");
     fs::create_dir_all(graph_dir.path().join("pages")).unwrap();
@@ -1400,10 +1419,20 @@ fn normal_replacement_catalogs_local_evidence_outside_stable_completion() {
     assert!(displacement
         .recovery_filename()
         .ends_with(".projection.recovery"));
-    assert_eq!(
-        fs::read(graph_dir.path().join(displacement.recovery_relative_path())).unwrap(),
-        base
+    assert!(
+        !graph_dir
+            .path()
+            .join(displacement.recovery_relative_path())
+            .exists(),
+        "the exact displaced graph copy must move into quarantine"
     );
+    let retained = projection_recovery_paths(graph_dir.path());
+    assert_eq!(retained.len(), 1);
+    assert!(retained[0]
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .ends_with(".projection-quarantine"));
     let completion_json: Value =
         serde_json::from_slice(&written.completion.encode().unwrap()).unwrap();
     assert!(completion_json.get("displacements").is_none());
@@ -1411,6 +1440,171 @@ fn normal_replacement_catalogs_local_evidence_outside_stable_completion() {
         store.load_completion(written.plan.intent()).unwrap(),
         Some(written.completion)
     );
+}
+
+#[test]
+fn repeated_projection_replacements_and_reopen_retain_recent_recovery_sidecars() {
+    let path = "pages/深い/Projection ☕.md";
+    let dir = TestDir::new("replacement-recovery-gc");
+    let graph_root = dir.path().join("graph");
+    let receipts_root = dir.path().join("receipts");
+    fs::create_dir_all(graph_root.join("pages/深い")).unwrap();
+    let graph = Graph::open(&graph_root);
+    let binding = projection_binding(&graph, 60_025);
+    let receipts =
+        ProjectionReceiptStore::open_for_endpoint(&receipts_root, workspace(1), binding).unwrap();
+    let archive_path = dir.path().join("archive");
+    let writer = ObjectStore::open(&archive_path, workspace(1)).unwrap();
+    let mut engine = ShardedHotEngine::with_enrolled_projection(
+        ObjectStore::open(&archive_path, workspace(1)).unwrap(),
+        LineageDigest::of(b"projection-recovery-gc"),
+        DocumentId::from_uuid(uuid(60_025_001)),
+        &graph,
+        &receipts,
+    );
+    let page_id = PageId::from_uuid(uuid(60_025_002));
+    let home_document_id = DocumentId::from_uuid(uuid(60_025_003));
+    let block_id = BlockId::from_uuid(uuid(60_025_004));
+    let create_batch_id = BatchId::from_uuid(uuid(60_025_005));
+    let create = engine
+        .draft_author_transaction(
+            AuthorBatch {
+                batch_id: create_batch_id,
+                author_device_id: binding.device_id(),
+                author_session_id: SessionId::from_uuid(uuid(60_025_006)),
+                crdt_peer_id: CrdtPeerId::from_u64(60_025_007),
+            },
+            BatchOrigin::LocalMutation,
+            &OperationTransaction::new(vec![
+                SemanticOperation::CreatePage {
+                    page_id,
+                    home_document_id,
+                    name: tine_core::oplog::LogicalPageName::parse("Projection Recovery GC")
+                        .unwrap(),
+                    path: ManagedPath::parse(path).unwrap(),
+                    kind: ManagedTextKind::Page,
+                },
+                SemanticOperation::CreateBlock {
+                    block: BlockLocation {
+                        block_id,
+                        home_document_id,
+                    },
+                    page_id,
+                    parent: None,
+                    order: "a".into(),
+                    content: "version 0".into(),
+                },
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+    let create = engine
+        .finalize_author_transaction(create, &graph, &receipts, binding)
+        .unwrap();
+    writer.publish_prepared(&create).unwrap();
+    assert!(matches!(
+        engine
+            .stage_archive_batch(create_batch_id)
+            .unwrap()
+            .disposition(),
+        BatchDisposition::Accepted { .. }
+    ));
+    let create_work = engine
+        .projection_work_index()
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+    execute_manifested_projection_work(&graph, &receipts, &mut engine, &create_work).unwrap();
+
+    let target = graph_root.join(path);
+    let mut graph = graph;
+    let mut receipts = receipts;
+
+    for sequence in 1_u128..=8 {
+        if sequence == 5 {
+            drop(graph);
+            drop(receipts);
+            graph = Graph::open(&graph_root);
+            receipts =
+                ProjectionReceiptStore::open_for_endpoint(&receipts_root, workspace(1), binding)
+                    .unwrap();
+        }
+
+        let base = fs::read(&target).unwrap();
+        let batch_id = BatchId::from_uuid(uuid(60_025_100 + sequence));
+        let draft = engine
+            .draft_author_transaction(
+                AuthorBatch {
+                    batch_id,
+                    author_device_id: binding.device_id(),
+                    author_session_id: SessionId::from_uuid(uuid(60_025_200 + sequence)),
+                    crdt_peer_id: CrdtPeerId::from_u64(60_025_300 + sequence as u64),
+                },
+                BatchOrigin::LocalMutation,
+                &OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
+                    block: BlockLocation {
+                        block_id,
+                        home_document_id,
+                    },
+                    content: format!("version {sequence}"),
+                }])
+                .unwrap(),
+            )
+            .unwrap();
+        let prepared = engine
+            .finalize_author_transaction(draft, &graph, &receipts, binding)
+            .unwrap();
+        writer.publish_prepared(&prepared).unwrap();
+        assert!(matches!(
+            engine.stage_archive_batch(batch_id).unwrap().disposition(),
+            BatchDisposition::Accepted { .. }
+        ));
+        let expected = plan_projection(
+            workspace(1),
+            &engine.materialize_page_for_projection(page_id).unwrap(),
+            Some(&base),
+        )
+        .unwrap();
+        let work = engine
+            .projection_work_index()
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        execute_manifested_projection_work(&graph, &receipts, &mut engine, &work).unwrap();
+
+        assert_eq!(fs::read(&target).unwrap(), expected.target());
+        assert_eq!(
+            projection_recovery_paths(&graph_root).len(),
+            sequence as usize,
+            "recent recoveries must remain named across immediate repeats and reopen"
+        );
+        assert_eq!(
+            ["round-0", "round-1"]
+                .into_iter()
+                .map(|round| {
+                    fs::read_dir(
+                        receipts_root
+                            .join("forensics")
+                            .join(".pending-cleanup")
+                            .join(round),
+                    )
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .filter(|entry| {
+                        entry
+                            .file_name()
+                            .to_str()
+                            .is_some_and(|name| name.ends_with(".projection-cleanup"))
+                    })
+                    .count()
+                })
+                .sum::<usize>(),
+            sequence as usize,
+            "recent recovery {sequence} lost or duplicated its private pending marker"
+        );
+    }
 }
 
 #[test]
@@ -2488,6 +2682,11 @@ fn manifested_absence_recovers_from_retained_base_across_both_publication_cuts()
     fs::set_permissions(&work_dir, fs::Permissions::from_mode(work_mode)).unwrap();
     assert!(second.is_err());
     assert!(receipts.incomplete_intents().unwrap().is_empty());
+    assert_eq!(
+        projection_recovery_paths(&dir.path().join("graph")).len(),
+        1,
+        "recently deleted page text must remain recoverable through restart/grace"
+    );
     assert_eq!(
         engine
             .projection_work_index()

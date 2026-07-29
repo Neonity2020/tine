@@ -15,11 +15,14 @@ use crate::crdt::{
 use crate::date::{JournalDate, JournalFormat};
 use crate::doc::{self, DocBlock, Document};
 use crate::graph_text_scope::{GraphTextScope, GraphTextScopeBinding};
-use crate::oplog::projection_store::{ProjectionMutationAuthority, MAX_PROJECTION_EVIDENCE_BYTES};
+use crate::oplog::projection_store::{
+    ProjectionCleanupRetirementAuthority, ProjectionMutationAuthority,
+    ProjectionRecoveryEvidencePublisher, MAX_PROJECTION_EVIDENCE_BYTES,
+};
 use crate::oplog::{
     managed_component_is_portable, BlobDescription, CanonicalGraphResourceId, ContentDigest,
-    ManagedPath, ManagedTextKind, PortablePathKey, ProjectionAttemptReservation,
-    ProjectionEndpointBinding, ReceiptError, WorkspaceId,
+    LocalProjectionEvidenceRecord, ManagedPath, ManagedTextKind, PortablePathKey,
+    ProjectionAttemptReservation, ProjectionEndpointBinding, ReceiptError, WorkspaceId,
 };
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions as CapOpenOptions};
@@ -169,14 +172,23 @@ pub(crate) struct ProjectionWriteProof {
 }
 
 /// Durable identity and freshly-synced observation of the inode displaced by
-/// an existing-file projection. The inode is retained without GC in the first
-/// rollout so a writer holding its old handle can still be detected later.
-#[derive(Debug)]
+/// an existing-file projection. The receipt store persists this evidence
+/// before completion so the exact sidecar can be retired after completion.
+#[derive(Clone, Debug)]
 pub(crate) struct ProjectionRecoveryEvidence {
     relative_path: String,
     filename: String,
+    resource_id: Option<ContentDigest>,
     digest: [u8; 32],
     len: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ProjectionRecoveryCleanup {
+    Missing,
+    Quarantined,
+    Retired,
+    ConflictRetained { relative_path: String },
 }
 
 fn projection_recovery_relative_path(
@@ -189,11 +201,30 @@ fn projection_recovery_relative_path(
 }
 
 impl ProjectionRecoveryEvidence {
-    fn new(target_relative_path: &str, filename: String, bytes: &[u8]) -> io::Result<Self> {
+    fn new_bound(
+        target_relative_path: &str,
+        filename: String,
+        resource_id: ContentDigest,
+        bytes: &[u8],
+    ) -> io::Result<Self> {
+        Self::new(target_relative_path, filename, Some(resource_id), bytes)
+    }
+
+    fn new_unbound(target_relative_path: &str, filename: String, bytes: &[u8]) -> io::Result<Self> {
+        Self::new(target_relative_path, filename, None, bytes)
+    }
+
+    fn new(
+        target_relative_path: &str,
+        filename: String,
+        resource_id: Option<ContentDigest>,
+        bytes: &[u8],
+    ) -> io::Result<Self> {
         let relative_path = projection_recovery_relative_path(target_relative_path, &filename)?;
         Ok(Self {
             relative_path,
             filename,
+            resource_id,
             digest: Sha256::digest(bytes).into(),
             len: bytes.len() as u64,
         })
@@ -205,6 +236,10 @@ impl ProjectionRecoveryEvidence {
 
     pub(crate) fn filename(&self) -> &str {
         &self.filename
+    }
+
+    pub(crate) const fn resource_id(&self) -> Option<ContentDigest> {
+        self.resource_id
     }
 
     pub(crate) fn digest(&self) -> &[u8; 32] {
@@ -249,6 +284,14 @@ impl ProjectionWriteProof {
     pub(crate) fn recovery_evidence(&self) -> &[ProjectionRecoveryEvidence] {
         &self.recovery_evidence
     }
+}
+
+fn retain_exactly_captured_recovery_evidence(
+    evidence: &mut Vec<ProjectionRecoveryEvidence>,
+    captured: &ProjectionRecoveryEvidence,
+) {
+    evidence.retain(|candidate| candidate.filename != captured.filename);
+    evidence.push(captured.clone());
 }
 
 struct ProjectionTarget {
@@ -988,7 +1031,7 @@ impl HandoffSafeGuard {
         #[cfg(test)]
         count_projection_write_call();
         let write = self.admit_projection_writer(graph)?;
-        authority.consume_write_evidence(relative_path, |reservation, known_attempts| {
+        authority.consume_write_evidence(relative_path, |reservation, known_attempts, publisher| {
             graph.write_page_projection_with_attempts(
                 &write,
                 relative_path,
@@ -996,6 +1039,7 @@ impl HandoffSafeGuard {
                 target,
                 reservation,
                 known_attempts,
+                Some(publisher),
             )
         })
     }
@@ -1010,13 +1054,14 @@ impl HandoffSafeGuard {
         #[cfg(test)]
         count_projection_remove_call();
         let write = self.admit_projection_writer(graph)?;
-        authority.consume_write_evidence(relative_path, |reservation, known_attempts| {
+        authority.consume_write_evidence(relative_path, |reservation, known_attempts, publisher| {
             graph.remove_page_projection_with_attempts(
                 &write,
                 relative_path,
                 expected_base,
                 reservation,
                 known_attempts,
+                Some(publisher),
             )
         })
     }
@@ -1072,7 +1117,7 @@ impl HandoffSafeGuard {
         #[cfg(test)]
         count_projection_recovery_call();
         let write = self.admit_projection_writer(graph)?;
-        authority.consume_write_evidence(relative_path, |reservation, known_attempts| {
+        authority.consume_write_evidence(relative_path, |reservation, known_attempts, _| {
             graph.confirm_removed_page_projection_with_attempts(
                 &write,
                 relative_path,
@@ -1166,7 +1211,7 @@ impl PublishedHandoffLatch {
         #[cfg(test)]
         count_projection_write_call();
         let write = self.admit_projection_writer(graph)?;
-        authority.consume_write_evidence(relative_path, |reservation, known_attempts| {
+        authority.consume_write_evidence(relative_path, |reservation, known_attempts, publisher| {
             graph.write_page_projection_with_attempts(
                 &write,
                 relative_path,
@@ -1174,6 +1219,7 @@ impl PublishedHandoffLatch {
                 target,
                 reservation,
                 known_attempts,
+                Some(publisher),
             )
         })
     }
@@ -1188,13 +1234,14 @@ impl PublishedHandoffLatch {
         #[cfg(test)]
         count_projection_remove_call();
         let write = self.admit_projection_writer(graph)?;
-        authority.consume_write_evidence(relative_path, |reservation, known_attempts| {
+        authority.consume_write_evidence(relative_path, |reservation, known_attempts, publisher| {
             graph.remove_page_projection_with_attempts(
                 &write,
                 relative_path,
                 expected_base,
                 reservation,
                 known_attempts,
+                Some(publisher),
             )
         })
     }
@@ -1250,7 +1297,7 @@ impl PublishedHandoffLatch {
         #[cfg(test)]
         count_projection_recovery_call();
         let write = self.admit_projection_writer(graph)?;
-        authority.consume_write_evidence(relative_path, |reservation, known_attempts| {
+        authority.consume_write_evidence(relative_path, |reservation, known_attempts, _| {
             graph.confirm_removed_page_projection_with_attempts(
                 &write,
                 relative_path,
@@ -2986,6 +3033,10 @@ thread_local! {
     static PROJECTION_AFTER_RETIRE_COLLISION: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static PROJECTION_POST_PUBLISH_COLLISION: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static PROJECTION_BEFORE_RESTORE: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
+    static PROJECTION_RECOVERY_AFTER_BOUND_CAPTURE: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
+    static PROJECTION_RECOVERY_RETIREMENT_AFTER_VALIDATION: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
+    static PROJECTION_RECOVERY_FINAL_RETIREMENT: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
+    static PROJECTION_RECOVERY_AFTER_FINAL_REREAD: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static PROJECTION_PARENT_RETARGET: std::cell::RefCell<Option<ProjectionParentRetarget>> = const { std::cell::RefCell::new(None) };
     static FAIL_NEXT_PROJECTION_DIRECTORY_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static TEST_PROJECTION_ATTEMPTS: std::cell::RefCell<std::collections::BTreeMap<String, Vec<ProjectionAttemptReservation>>> = const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
@@ -3282,6 +3333,10 @@ pub(crate) fn reset_projection_graph_test_hooks() {
     PROJECTION_AFTER_RETIRE_COLLISION.with(|hook| drop(hook.borrow_mut().take()));
     PROJECTION_POST_PUBLISH_COLLISION.with(|hook| drop(hook.borrow_mut().take()));
     PROJECTION_BEFORE_RESTORE.with(|hook| drop(hook.borrow_mut().take()));
+    PROJECTION_RECOVERY_AFTER_BOUND_CAPTURE.with(|hook| drop(hook.borrow_mut().take()));
+    PROJECTION_RECOVERY_RETIREMENT_AFTER_VALIDATION.with(|hook| drop(hook.borrow_mut().take()));
+    PROJECTION_RECOVERY_FINAL_RETIREMENT.with(|hook| drop(hook.borrow_mut().take()));
+    PROJECTION_RECOVERY_AFTER_FINAL_REREAD.with(|hook| drop(hook.borrow_mut().take()));
     PROJECTION_PARENT_RETARGET.with(|retarget| drop(retarget.borrow_mut().take()));
     FAIL_NEXT_PROJECTION_DIRECTORY_SYNC.with(|fail| fail.set(false));
     TEST_PROJECTION_ATTEMPTS.with(|catalog| catalog.borrow_mut().clear());
@@ -3538,6 +3593,115 @@ fn projection_before_restore_hook() -> io::Result<()> {
 
 #[cfg(not(test))]
 fn projection_before_restore_hook() -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn set_projection_recovery_after_bound_capture_hook_for_test(
+    hook: impl FnOnce() -> io::Result<()> + 'static,
+) {
+    PROJECTION_RECOVERY_AFTER_BOUND_CAPTURE.with(|slot| {
+        let replaced = slot.borrow_mut().replace(Box::new(hook));
+        assert!(
+            replaced.is_none(),
+            "projection bound-capture hook already armed"
+        );
+    });
+}
+
+#[cfg(test)]
+fn projection_recovery_after_bound_capture_hook() -> io::Result<()> {
+    PROJECTION_RECOVERY_AFTER_BOUND_CAPTURE
+        .with(|hook| hook.borrow_mut().take().map_or(Ok(()), |hook| hook()))
+}
+
+#[cfg(not(test))]
+fn projection_recovery_after_bound_capture_hook() -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn set_projection_recovery_retirement_hook_for_test(
+    hook: impl FnOnce() -> io::Result<()> + 'static,
+) {
+    PROJECTION_RECOVERY_RETIREMENT_AFTER_VALIDATION.with(|slot| {
+        let replaced = slot.borrow_mut().replace(Box::new(hook));
+        assert!(
+            replaced.is_none(),
+            "projection retirement hook already armed"
+        );
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn set_projection_after_retire_collision_hook_for_test(
+    hook: impl FnOnce() -> io::Result<()> + 'static,
+) {
+    PROJECTION_AFTER_RETIRE_COLLISION.with(|slot| {
+        let replaced = slot.borrow_mut().replace(Box::new(hook));
+        assert!(
+            replaced.is_none(),
+            "projection after-retire collision hook already armed"
+        );
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn set_projection_recovery_final_retirement_hook_for_test(
+    hook: impl FnOnce() -> io::Result<()> + 'static,
+) {
+    PROJECTION_RECOVERY_FINAL_RETIREMENT.with(|slot| {
+        let replaced = slot.borrow_mut().replace(Box::new(hook));
+        assert!(
+            replaced.is_none(),
+            "projection final retirement hook already armed"
+        );
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn set_projection_recovery_after_final_reread_hook_for_test(
+    hook: impl FnOnce() -> io::Result<()> + 'static,
+) {
+    PROJECTION_RECOVERY_AFTER_FINAL_REREAD.with(|slot| {
+        let replaced = slot.borrow_mut().replace(Box::new(hook));
+        assert!(
+            replaced.is_none(),
+            "projection after-final-reread hook already armed"
+        );
+    });
+}
+
+#[cfg(test)]
+fn projection_recovery_retirement_after_validation_hook() -> io::Result<()> {
+    PROJECTION_RECOVERY_RETIREMENT_AFTER_VALIDATION
+        .with(|hook| hook.borrow_mut().take().map_or(Ok(()), |hook| hook()))
+}
+
+#[cfg(not(test))]
+fn projection_recovery_retirement_after_validation_hook() -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+fn projection_recovery_final_retirement_hook() -> io::Result<()> {
+    PROJECTION_RECOVERY_FINAL_RETIREMENT
+        .with(|hook| hook.borrow_mut().take().map_or(Ok(()), |hook| hook()))
+}
+
+#[cfg(not(test))]
+fn projection_recovery_final_retirement_hook() -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+fn projection_recovery_after_final_reread_hook() -> io::Result<()> {
+    PROJECTION_RECOVERY_AFTER_FINAL_REREAD
+        .with(|hook| hook.borrow_mut().take().map_or(Ok(()), |hook| hook()))
+}
+
+#[cfg(not(test))]
+fn projection_recovery_after_final_reread_hook() -> io::Result<()> {
     Ok(())
 }
 
@@ -14086,7 +14250,7 @@ impl Graph {
         #[cfg(test)]
         count_projection_write_call();
         let write = self.admit_retained_managed_text_writer()?;
-        authority.consume_write_evidence(relative_path, |reservation, known_attempts| {
+        authority.consume_write_evidence(relative_path, |reservation, known_attempts, publisher| {
             self.write_page_projection_with_attempts(
                 &write,
                 relative_path,
@@ -14094,6 +14258,7 @@ impl Graph {
                 target,
                 reservation,
                 known_attempts,
+                Some(publisher),
             )
         })
     }
@@ -14111,7 +14276,7 @@ impl Graph {
         authority: &mut ProjectionMutationAuthority,
     ) -> io::Result<ProjectionWriteProof> {
         let write = self.admit_retained_managed_text_writer()?;
-        authority.consume_write_evidence(relative_path, |reservation, _| {
+        authority.consume_write_evidence(relative_path, |reservation, _, _| {
             require_projection_platform()?;
             if usize_to_u64(expected_target.len())? > MAX_PROJECTION_EVIDENCE_BYTES {
                 return Err(io::Error::new(
@@ -14192,6 +14357,7 @@ impl Graph {
         target: &[u8],
         reservation: &ProjectionAttemptReservation,
         known_attempts: &[ProjectionAttemptReservation],
+        evidence_publisher: Option<&ProjectionRecoveryEvidencePublisher<'_>>,
     ) -> io::Result<ProjectionWriteProof> {
         require_projection_platform()?;
         if usize_to_u64(target.len())? > MAX_PROJECTION_EVIDENCE_BYTES {
@@ -14349,6 +14515,26 @@ impl Graph {
                         )?;
                         if let Some(expected_base) = expected_base.filter(|_| !resumed_retirement) {
                             let retired = reservation.recovery_filename().to_owned();
+                            let (displaced_file, displaced) = open_and_read_projection_regular(
+                                parent.final_dir(),
+                                &target_path.filename,
+                            )?;
+                            let displaced_identity =
+                                canonical_projection_file_resource_id(&displaced_file)?;
+                            if displaced != expected_base {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::AlreadyExists,
+                                    "projection precondition changed before displacement",
+                                ));
+                            }
+                            displaced_file.sync_all()?;
+                            let captured = ProjectionRecoveryEvidence::new_bound(
+                                &target_path.relative_path,
+                                retired.clone(),
+                                displaced_identity,
+                                &displaced,
+                            )?;
+                            projection_recovery_after_bound_capture_hook()?;
                             retire_projection_target(
                                 parent.final_dir(),
                                 &target_path.filename,
@@ -14356,17 +14542,27 @@ impl Graph {
                             )?;
                             mutated = true;
                             recovery_name = Some(retired.clone());
-                            let (displaced_file, displaced) =
-                                open_and_read_projection_regular(parent.final_dir(), &retired)?;
-                            let displaced_identity =
-                                canonical_projection_file_resource_id(&displaced_file)?;
-                            displaced_file.sync_all()?;
-                            recovery_expected = Some((displaced.clone(), displaced_identity));
-                            preflight_projection_chain(&parent.chain)?;
+                            recovery_expected =
+                                Some((displaced.clone(), displaced_identity, captured));
+                            validate_projection_recovery_object_exact(
+                                &parent,
+                                &retired,
+                                &displaced,
+                                displaced_identity,
+                            )?;
+                            if let Some(publisher) = evidence_publisher {
+                                publisher.publish(
+                                    &recovery_expected
+                                        .as_ref()
+                                        .expect("captured recovery evidence")
+                                        .2,
+                                )?;
+                            }
                             let hooks = combine_projection_hook_results(
                                 projection_after_retire_hook(&target_path.absolute_path),
                                 projection_after_retire_collision_hook(),
                             );
+                            preflight_projection_chain(&parent.chain)?;
                             let validation = (|| {
                                 self.ensure_projection_parent_binding(&parent, &target_path)?;
                                 self.ensure_projection_target_shape(&parent, &target_path)?;
@@ -14448,11 +14644,17 @@ impl Graph {
                         }
                         combine_projection_hook_validation(hooks, validation)?;
 
-                        let recovery_evidence = self.projection_recovery_evidence_exact(
+                        let mut recovery_evidence = self.projection_recovery_evidence_exact(
                             &parent,
                             &target_path,
                             known_attempts,
                         )?;
+                        if let Some((_, _, captured)) = recovery_expected.as_ref() {
+                            retain_exactly_captured_recovery_evidence(
+                                &mut recovery_evidence,
+                                captured,
+                            );
+                        }
 
                         self.ensure_projection_parent_binding(&parent, &target_path)?;
                         self.ensure_projection_target_shape(&parent, &target_path)?;
@@ -14539,7 +14741,7 @@ impl Graph {
                             ));
                         }
                     }
-                    if let (Some(retired), Some((expected, expected_identity))) =
+                    if let (Some(retired), Some((expected, expected_identity, _))) =
                         (recovery_name.as_deref(), recovery_expected.as_ref())
                     {
                         if let Err(recovery_error) = preserve_and_restore_projection_recovery(
@@ -14593,13 +14795,14 @@ impl Graph {
         #[cfg(test)]
         count_projection_remove_call();
         let write = self.admit_retained_managed_text_writer()?;
-        authority.consume_write_evidence(relative_path, |reservation, known_attempts| {
+        authority.consume_write_evidence(relative_path, |reservation, known_attempts, publisher| {
             self.remove_page_projection_with_attempts(
                 &write,
                 relative_path,
                 expected_base,
                 reservation,
                 known_attempts,
+                Some(publisher),
             )
         })
     }
@@ -14611,6 +14814,7 @@ impl Graph {
         expected_base: &[u8],
         reservation: &ProjectionAttemptReservation,
         known_attempts: &[ProjectionAttemptReservation],
+        evidence_publisher: Option<&ProjectionRecoveryEvidencePublisher<'_>>,
     ) -> io::Result<ProjectionWriteProof> {
         require_projection_platform()?;
         std::str::from_utf8(expected_base).map_err(|_| {
@@ -14704,18 +14908,45 @@ impl Graph {
             validate_retirement_boundary()?;
             projection_late_collision_hook()?;
             validate_retirement_boundary()?;
+            let (displaced_file, displaced) =
+                open_and_read_projection_regular(parent.final_dir(), &target.filename)?;
+            let displaced_identity = canonical_projection_file_resource_id(&displaced_file)?;
+            if displaced != expected_base {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "projection removal precondition changed before displacement",
+                ));
+            }
+            displaced_file.sync_all()?;
+            let captured = ProjectionRecoveryEvidence::new_bound(
+                &target.relative_path,
+                retired.clone(),
+                displaced_identity,
+                &displaced,
+            )?;
+            projection_recovery_after_bound_capture_hook()?;
             retire_projection_target(parent.final_dir(), &target.filename, &retired)?;
             retirement_occurred = true;
-            let (displaced_file, displaced) =
-                open_and_read_projection_regular(parent.final_dir(), &retired)?;
-            let displaced_identity = canonical_projection_file_resource_id(&displaced_file)?;
-            recovery_expected = Some((displaced.clone(), displaced_identity));
-            displaced_file.sync_all()?;
+            recovery_expected = Some((displaced.clone(), displaced_identity, captured));
+            validate_projection_recovery_object_exact(
+                &parent,
+                &retired,
+                &displaced,
+                displaced_identity,
+            )?;
+            if let Some(publisher) = evidence_publisher {
+                publisher.publish(
+                    &recovery_expected
+                        .as_ref()
+                        .expect("captured recovery evidence")
+                        .2,
+                )?;
+            }
+            let hooks = combine_projection_hook_results(
+                projection_after_retire_hook(&target.absolute_path),
+                projection_after_retire_collision_hook(),
+            );
             (|| {
-                let hooks = combine_projection_hook_results(
-                    projection_after_retire_hook(&target.absolute_path),
-                    projection_after_retire_collision_hook(),
-                );
                 let validation = (|| {
                     self.ensure_projection_parent_binding(&parent, &target)?;
                     self.ensure_projection_target_shape(&parent, &target)?;
@@ -14769,8 +15000,11 @@ impl Graph {
                         "projection removal recovery evidence changed before proof",
                     ));
                 }
-                let recovery_evidence =
+                let mut recovery_evidence =
                     self.projection_recovery_evidence_exact(&parent, &target, known_attempts)?;
+                if let Some((_, _, captured)) = recovery_expected.as_ref() {
+                    retain_exactly_captured_recovery_evidence(&mut recovery_evidence, captured);
+                }
                 self.ensure_projection_parent_binding(&parent, &target)?;
                 self.ensure_projection_target_shape(&parent, &target)?;
                 self.validate_current_graph_text_collision(
@@ -14828,7 +15062,7 @@ impl Graph {
                     ));
                 }
                 Ok(()) => {
-                    if let Some((expected, expected_identity)) = recovery_expected.as_ref() {
+                    if let Some((expected, expected_identity, _)) = recovery_expected.as_ref() {
                         if let Err(recovery_error) = preserve_and_restore_projection_recovery(
                             self,
                             write,
@@ -14945,6 +15179,7 @@ impl Graph {
             target,
             &reservation,
             &attempts,
+            None,
         )
     }
 
@@ -14969,6 +15204,7 @@ impl Graph {
             expected_base,
             &reservation,
             &attempts,
+            None,
         )
     }
 
@@ -15092,6 +15328,255 @@ impl Graph {
         Ok(bytes)
     }
 
+    /// Quarantine or retire one exact recovery sidecar named by durable local
+    /// evidence. A newly created quarantine is never unlinked by this call.
+    /// Retirement authority is minted only by persisted cross-session/grace
+    /// evidence; changed resources become visible graph-local conflicts.
+    pub(crate) fn retire_completed_projection_recovery(
+        &self,
+        target_relative_path: &str,
+        records: &[LocalProjectionEvidenceRecord],
+        retirement: Option<&ProjectionCleanupRetirementAuthority>,
+    ) -> io::Result<ProjectionRecoveryCleanup> {
+        require_projection_platform()?;
+        if records.is_empty() {
+            return Ok(ProjectionRecoveryCleanup::Missing);
+        }
+        if records.len() != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "projection recovery cleanup requires one exact record",
+            ));
+        }
+        let target = self.projection_page_target(target_relative_path)?;
+        let expected_prefix = format!(".{}.", target.filename);
+        for record in records {
+            if !record.is_cleanup_bound() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "unbound projection recovery evidence cannot authorize cleanup",
+                ));
+            }
+            let expected_path = projection_recovery_relative_path(
+                &target.relative_path,
+                record.recovery_filename(),
+            )?;
+            if record.recovery_relative_path() != expected_path
+                || !record.recovery_filename().starts_with(&expected_prefix)
+                || !record.recovery_filename().ends_with(".projection.recovery")
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "completed projection recovery evidence is not bound to its target",
+                ));
+            }
+        }
+
+        let lock = self.page_lock(&target.absolute_path);
+        let _guard = lock.lock().unwrap();
+        let parent = match self.projection_parent(&target, false) {
+            Ok(parent) => parent,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(ProjectionRecoveryCleanup::Missing);
+            }
+            Err(error) => return Err(error),
+        };
+        preflight_projection_chain(&parent.chain)?;
+        self.ensure_projection_parent_binding(&parent, &target)?;
+
+        let record = &records[0];
+        let allow_retirement = match retirement {
+            None => false,
+            Some(authority)
+                if authority.permits(record).map_err(|error| {
+                    io::Error::new(io::ErrorKind::InvalidInput, error.to_string())
+                })? =>
+            {
+                true
+            }
+            Some(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "projection cleanup retirement authority is bound to different evidence",
+                ));
+            }
+        };
+        let resource_id = record.recovery_resource_id().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "projection cleanup evidence has no exact resource identity",
+            )
+        })?;
+        let quarantine_name = format!(
+            "Tine-recovery-{}-{}.projection-quarantine",
+            record.attempt_id().simple(),
+            hex_digest(resource_id.as_bytes())
+        );
+        let quarantine =
+            match open_projection_retirement_optional(parent.final_dir(), &quarantine_name)? {
+                ProjectionCleanupResource::Missing => None,
+                ProjectionCleanupResource::Readable(file, bytes) => Some((file, bytes)),
+                ProjectionCleanupResource::Oversized(file) => {
+                    let relative_path = retain_projection_recovery_conflict(
+                        &target,
+                        &parent,
+                        &quarantine_name,
+                        &file,
+                        record,
+                    )?;
+                    return Ok(ProjectionRecoveryCleanup::ConflictRetained { relative_path });
+                }
+            };
+        if let Some((quarantined, bytes)) = quarantine {
+            match open_projection_retirement_optional(
+                parent.final_dir(),
+                record.recovery_filename(),
+            )? {
+                ProjectionCleanupResource::Missing => {}
+                ProjectionCleanupResource::Readable(source, _)
+                | ProjectionCleanupResource::Oversized(source) => {
+                    let _ = retain_projection_recovery_conflict(
+                        &target,
+                        &parent,
+                        record.recovery_filename(),
+                        &source,
+                        record,
+                    )?;
+                }
+            }
+            if !projection_recovery_matches_record(&quarantined, &bytes, record)? {
+                let relative_path = retain_projection_recovery_conflict(
+                    &target,
+                    &parent,
+                    &quarantine_name,
+                    &quarantined,
+                    record,
+                )?;
+                return Ok(ProjectionRecoveryCleanup::ConflictRetained { relative_path });
+            }
+            preflight_projection_chain(&parent.chain)?;
+            self.ensure_projection_parent_binding(&parent, &target)?;
+            if !allow_retirement {
+                let final_name =
+                    open_projection_file_nofollow(parent.final_dir(), &quarantine_name)?;
+                if canonical_projection_file_resource_id(&final_name)?
+                    != canonical_projection_file_resource_id(&quarantined)?
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!("projection recovery name rebound; retained as {quarantine_name}"),
+                    ));
+                }
+                return Ok(ProjectionRecoveryCleanup::Quarantined);
+            }
+            match retire_stable_projection_quarantine(
+                parent.final_dir(),
+                &quarantine_name,
+                quarantined,
+                record,
+                &parent.chain,
+            )? {
+                StableProjectionQuarantineRetirement::Retired => {
+                    return Ok(ProjectionRecoveryCleanup::Retired);
+                }
+                StableProjectionQuarantineRetirement::Changed => {
+                    let changed = match open_projection_retirement_optional(
+                        parent.final_dir(),
+                        &quarantine_name,
+                    )? {
+                        ProjectionCleanupResource::Readable(file, _)
+                        | ProjectionCleanupResource::Oversized(file) => file,
+                        ProjectionCleanupResource::Missing => {
+                            return Ok(ProjectionRecoveryCleanup::Missing);
+                        }
+                    };
+                    let relative_path = retain_projection_recovery_conflict(
+                        &target,
+                        &parent,
+                        &quarantine_name,
+                        &changed,
+                        record,
+                    )?;
+                    return Ok(ProjectionRecoveryCleanup::ConflictRetained { relative_path });
+                }
+            }
+        }
+
+        let (opened, bytes) = match open_projection_retirement_optional(
+            parent.final_dir(),
+            record.recovery_filename(),
+        )? {
+            ProjectionCleanupResource::Missing => {
+                return Ok(ProjectionRecoveryCleanup::Missing);
+            }
+            ProjectionCleanupResource::Readable(file, bytes) => (file, bytes),
+            ProjectionCleanupResource::Oversized(file) => {
+                let relative_path = retain_projection_recovery_conflict(
+                    &target,
+                    &parent,
+                    record.recovery_filename(),
+                    &file,
+                    record,
+                )?;
+                return Ok(ProjectionRecoveryCleanup::ConflictRetained { relative_path });
+            }
+        };
+        opened.sync_all()?;
+        if !projection_recovery_matches_record(&opened, &bytes, record)? {
+            let relative_path = retain_projection_recovery_conflict(
+                &target,
+                &parent,
+                record.recovery_filename(),
+                &opened,
+                record,
+            )?;
+            return Ok(ProjectionRecoveryCleanup::ConflictRetained { relative_path });
+        }
+
+        preflight_projection_chain(&parent.chain)?;
+        self.ensure_projection_parent_binding(&parent, &target)?;
+        projection_recovery_retirement_after_validation_hook()?;
+        rename_projection_noreplace(
+            parent.final_dir(),
+            record.recovery_filename(),
+            &quarantine_name,
+        )?;
+        sync_projection_chain_required(&parent.chain)?;
+
+        let (quarantined, quarantine_bytes) =
+            open_and_read_projection_regular(parent.final_dir(), &quarantine_name)?;
+        if !projection_recovery_matches_record(&quarantined, &quarantine_bytes, record)? {
+            let relative_path = retain_projection_recovery_conflict(
+                &target,
+                &parent,
+                &quarantine_name,
+                &quarantined,
+                record,
+            )?;
+            return Ok(ProjectionRecoveryCleanup::ConflictRetained { relative_path });
+        }
+        if let Err(error) = self.ensure_projection_parent_binding(&parent, &target) {
+            return Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "projection parent changed during retirement; exact recovery remains \
+                    quarantined as {quarantine_name}: {error}"
+                ),
+            ));
+        }
+        let final_name = open_projection_file_nofollow(parent.final_dir(), &quarantine_name)?;
+        if canonical_projection_file_resource_id(&final_name)?
+            != canonical_projection_file_resource_id(&quarantined)?
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("projection recovery name rebound; retained as {quarantine_name}"),
+            ));
+        }
+        drop(quarantined);
+        Ok(ProjectionRecoveryCleanup::Quarantined)
+    }
+
     fn projection_recovery_evidence_exact(
         &self,
         parent: &ProjectionParent,
@@ -15106,12 +15591,14 @@ impl Graph {
             if !seen.insert(filename) {
                 continue;
             }
-            let bytes = match sync_and_read_projection_regular(parent.final_dir(), filename) {
-                Ok(bytes) => bytes,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error),
-            };
-            evidence.push(ProjectionRecoveryEvidence::new(
+            let (file, bytes) =
+                match sync_open_and_read_projection_regular(parent.final_dir(), filename) {
+                    Ok(observed) => observed,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error),
+                };
+            let _ = canonical_projection_file_resource_id(&file)?;
+            evidence.push(ProjectionRecoveryEvidence::new_unbound(
                 &target.relative_path,
                 filename.to_owned(),
                 &bytes,
@@ -15144,13 +15631,18 @@ impl Graph {
                 if !seen.insert(filename.clone()) {
                     continue;
                 }
-                let bytes = match sync_and_read_projection_regular(parent.final_dir(), &filename) {
-                    Ok(bytes) => bytes,
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                    Err(error) => return Err(error),
-                };
-                let retained =
-                    ProjectionRecoveryEvidence::new(&target.relative_path, filename, &bytes)?;
+                let (file, bytes) =
+                    match sync_open_and_read_projection_regular(parent.final_dir(), &filename) {
+                        Ok(observed) => observed,
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                        Err(error) => return Err(error),
+                    };
+                let _ = canonical_projection_file_resource_id(&file)?;
+                let retained = ProjectionRecoveryEvidence::new_unbound(
+                    &target.relative_path,
+                    filename,
+                    &bytes,
+                )?;
                 if retained.len != expected_len || retained.digest != expected_digest {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -19969,6 +20461,134 @@ fn open_and_read_projection_regular_with_limit(
     Ok((file, bytes))
 }
 
+enum ProjectionCleanupResource {
+    Missing,
+    Readable(fs::File, Vec<u8>),
+    Oversized(fs::File),
+}
+
+fn open_projection_retirement_optional(
+    quarantine: &Dir,
+    name: &str,
+) -> io::Result<ProjectionCleanupResource> {
+    let mut file = match open_projection_file_nofollow(quarantine, name) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(ProjectionCleanupResource::Missing);
+        }
+        Err(error) => return Err(error),
+    };
+    let len = file.metadata()?.len();
+    if len > MAX_PROJECTION_EVIDENCE_BYTES {
+        return Ok(ProjectionCleanupResource::Oversized(file));
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(len).map_err(|_| allocation_overflow())?);
+    (&mut file)
+        .take(MAX_PROJECTION_EVIDENCE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_PROJECTION_EVIDENCE_BYTES {
+        return Ok(ProjectionCleanupResource::Oversized(file));
+    }
+    Ok(ProjectionCleanupResource::Readable(file, bytes))
+}
+
+fn projection_recovery_matches_record(
+    file: &fs::File,
+    bytes: &[u8],
+    record: &LocalProjectionEvidenceRecord,
+) -> io::Result<bool> {
+    let Some(resource_id) = record.recovery_resource_id() else {
+        return Ok(false);
+    };
+    Ok(canonical_projection_file_resource_id(file)? == resource_id
+        && BlobDescription::of(bytes) == record.observed())
+}
+
+fn retain_projection_recovery_conflict(
+    target: &ProjectionTarget,
+    parent: &ProjectionParent,
+    source_name: &str,
+    source: &fs::File,
+    record: &LocalProjectionEvidenceRecord,
+) -> io::Result<String> {
+    let resource_id = canonical_projection_file_resource_id(source)?;
+    let conflict_name = format!(
+        "Tine-recovered-{}-{}.projection-conflict",
+        record.attempt_id().simple(),
+        hex_digest(resource_id.as_bytes())
+    );
+    preflight_projection_chain(&parent.chain)?;
+    let live_source = open_projection_file_nofollow(parent.final_dir(), source_name)?;
+    if canonical_projection_file_resource_id(&live_source)? != resource_id {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "projection recovery changed identity while preserving a conflict",
+        ));
+    }
+    rename_projection_noreplace(parent.final_dir(), source_name, &conflict_name)?;
+    sync_projection_chain_required(&parent.chain)?;
+    projection_recovery_relative_path(&target.relative_path, &conflict_name)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StableProjectionQuarantineRetirement {
+    Retired,
+    Changed,
+}
+
+fn sync_and_reread_retained_projection_file(file: &mut fs::File) -> io::Result<Vec<u8>> {
+    file.sync_all()?;
+    file.seek(std::io::SeekFrom::Start(0))?;
+    let length = file.metadata()?.len();
+    if length > MAX_PROJECTION_EVIDENCE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "changed projection recovery exceeds the evidence bound",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(length).map_err(|_| allocation_overflow())?);
+    file.take(MAX_PROJECTION_EVIDENCE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn retire_stable_projection_quarantine(
+    parent: &Dir,
+    quarantine_name: &str,
+    mut quarantined: fs::File,
+    record: &LocalProjectionEvidenceRecord,
+    projection_chain: &[Dir],
+) -> io::Result<StableProjectionQuarantineRetirement> {
+    projection_recovery_final_retirement_hook()?;
+    let bytes = sync_and_reread_retained_projection_file(&mut quarantined)?;
+    if !projection_recovery_matches_record(&quarantined, &bytes, record)? {
+        return Ok(StableProjectionQuarantineRetirement::Changed);
+    }
+    // Bind the final pathname check to the same inode validated through the
+    // retained handle. This closes deterministic same-name replacement hooks.
+    // Cross-platform filesystems do not expose a portable primitive that can
+    // revoke every pre-existing writable handle. The second reread below
+    // catches writes through this check; only a write after that reread and
+    // before unlink remains outside the clean-handoff guarantee.
+    let final_name = open_projection_file_nofollow(parent, quarantine_name)?;
+    if canonical_projection_file_resource_id(&final_name)?
+        != canonical_projection_file_resource_id(&quarantined)?
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("projection recovery name rebound; retained as {quarantine_name}"),
+        ));
+    }
+    let final_bytes = sync_and_reread_retained_projection_file(&mut quarantined)?;
+    if !projection_recovery_matches_record(&quarantined, &final_bytes, record)? {
+        return Ok(StableProjectionQuarantineRetirement::Changed);
+    }
+    projection_recovery_after_final_reread_hook()?;
+    parent.remove_file(quarantine_name)?;
+    sync_projection_chain_required(projection_chain)?;
+    Ok(StableProjectionQuarantineRetirement::Retired)
+}
+
 /// Read a managed body while reserving each retained byte before it enters the
 /// returned vector. The chunked path closes the metadata/read growth gap: a
 /// file that grows after metadata cannot make the preparation allocation exceed
@@ -20025,6 +20645,10 @@ fn open_and_read_projection_regular_with_budget(
 }
 
 fn sync_and_read_projection_regular(dir: &Dir, name: &str) -> io::Result<Vec<u8>> {
+    sync_open_and_read_projection_regular(dir, name).map(|(_, bytes)| bytes)
+}
+
+fn sync_open_and_read_projection_regular(dir: &Dir, name: &str) -> io::Result<(fs::File, Vec<u8>)> {
     let mut file = open_projection_file_nofollow(dir, name)?;
     let len = file.metadata()?.len();
     if len > MAX_PROJECTION_EVIDENCE_BYTES {
@@ -20051,7 +20675,7 @@ fn sync_and_read_projection_regular(dir: &Dir, name: &str) -> io::Result<Vec<u8>
             "projection evidence grew beyond the reload bound",
         ));
     }
-    Ok(bytes)
+    Ok((file, bytes))
 }
 
 fn read_projection_optional(dir: &Dir, name: &str) -> io::Result<Option<Vec<u8>>> {
@@ -26415,6 +27039,16 @@ fn rename_projection_noreplace(dir: &Dir, from: &str, to: &str) -> io::Result<()
 
 #[cfg(windows)]
 fn rename_projection_noreplace(dir: &Dir, from: &str, to: &str) -> io::Result<()> {
+    rename_projection_between_noreplace(dir, from, dir, to)
+}
+
+#[cfg(windows)]
+fn rename_projection_between_noreplace(
+    source_dir: &Dir,
+    from: &str,
+    destination_dir: &Dir,
+    to: &str,
+) -> io::Result<()> {
     use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
     use cap_std::fs::OpenOptionsExt as _;
     use std::ffi::OsStr;
@@ -26448,7 +27082,7 @@ fn rename_projection_noreplace(dir: &Dir, from: &str, to: &str) -> io::Result<()
         .access_mode(DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    let source = dir.open_with(from, &options)?.into_std();
+    let source = source_dir.open_with(from, &options)?.into_std();
     let metadata = source.metadata()?;
     if !metadata.is_file()
         || metadata.file_attributes()
@@ -26472,7 +27106,7 @@ fn rename_projection_noreplace(dir: &Dir, from: &str, to: &str) -> io::Result<()
     let words = information_length.div_ceil(std::mem::size_of::<usize>());
     let mut storage = vec![0_usize; words];
     let information = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
-    let root = dir.try_clone()?.into_std_file();
+    let root = destination_dir.try_clone()?.into_std_file();
 
     // FileRenameInfoEx with a zero Flags field omits every replacement mode.
     // Windows therefore atomically fails when the destination name is occupied.
@@ -32932,8 +33566,13 @@ mod tests {
     fn projection_recovery_evidence_paths_are_root_safe_and_forgery_fails_closed() {
         let root_filename =
             ".Root.md.00000000000000000000000000000001.projection.recovery".to_owned();
-        let root =
-            ProjectionRecoveryEvidence::new("Root.md", root_filename.clone(), b"- root\n").unwrap();
+        let root = ProjectionRecoveryEvidence::new(
+            "Root.md",
+            root_filename.clone(),
+            Some(ContentDigest::from_bytes([1; 32])),
+            b"- root\n",
+        )
+        .unwrap();
         assert_eq!(root.path(), root_filename);
 
         let nested_filename =
@@ -32941,6 +33580,7 @@ mod tests {
         let nested = ProjectionRecoveryEvidence::new(
             "pages/deep/Target.md",
             nested_filename.clone(),
+            Some(ContentDigest::from_bytes([2; 32])),
             b"- nested\n",
         )
         .unwrap();
@@ -32950,6 +33590,7 @@ mod tests {
             let error = ProjectionRecoveryEvidence::new(
                 invalid_target,
                 ".Target.md.00000000000000000000000000000003.projection.recovery".to_owned(),
+                Some(ContentDigest::from_bytes([3; 32])),
                 b"- invalid\n",
             )
             .unwrap_err();
@@ -32964,12 +33605,14 @@ mod tests {
             ProjectionRecoveryEvidence {
                 relative_path: format!("/pages/{valid_filename}"),
                 filename: valid_filename.clone(),
+                resource_id: Some(ContentDigest::from_bytes([4; 32])),
                 digest: [0; 32],
                 len: 0,
             },
             ProjectionRecoveryEvidence {
                 relative_path: format!("journals/{valid_filename}"),
                 filename: valid_filename.clone(),
+                resource_id: Some(ContentDigest::from_bytes([4; 32])),
                 digest: [0; 32],
                 len: 0,
             },
@@ -32979,6 +33622,7 @@ mod tests {
                         .to_owned(),
                 filename: ".Wrong.md.00000000000000000000000000000004.projection.recovery"
                     .to_owned(),
+                resource_id: Some(ContentDigest::from_bytes([4; 32])),
                 digest: [0; 32],
                 len: 0,
             },
@@ -32994,7 +33638,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn projection_replacement_retains_and_records_late_stale_handle_writes() {
+    fn projection_replacement_binds_original_identity_and_rediscovers_late_stale_writes() {
         let dir = scratch("projection-stale-handle-evidence");
         let path = dir.join("pages/Projection.md");
         fs::write(&path, b"- base\n").unwrap();
@@ -33013,10 +33657,10 @@ mod tests {
             .expect("replacement must retain its displaced inode");
 
         assert_eq!(fs::read(&path).unwrap(), b"- target\n");
-        assert_eq!(evidence.len(), b"- late stale handle\n".len() as u64);
+        assert_eq!(evidence.len(), b"- base\n".len() as u64);
         assert_eq!(
             evidence.digest(),
-            &<[u8; 32]>::from(Sha256::digest(b"- late stale handle\n"))
+            &<[u8; 32]>::from(Sha256::digest(b"- base\n"))
         );
         assert_eq!(
             graph
@@ -33031,8 +33675,11 @@ mod tests {
             .iter()
             .find(|candidate| candidate.filename() == evidence.filename())
             .expect("retained evidence must be discoverable after proof");
-        assert_eq!(rediscovered.digest(), evidence.digest());
-        assert_eq!(rediscovered.len(), evidence.len());
+        assert_eq!(
+            rediscovered.digest(),
+            &<[u8; 32]>::from(Sha256::digest(b"- late stale handle\n"))
+        );
+        assert_eq!(rediscovered.len(), b"- late stale handle\n".len() as u64);
         assert!(dir.join(evidence.path()).exists());
 
         let _ = fs::remove_dir_all(&dir);
@@ -33126,9 +33773,10 @@ mod tests {
             .write_projection_exact("pages/Projection.md", Some(b"- base\n"), b"- target\n")
             .is_err());
         assert_eq!(fs::read(&path).unwrap(), b"- external race\n");
-        assert!(projection_recovery_bytes(&dir.join("pages"))
-            .iter()
-            .any(|bytes| bytes == b"- external race\n"));
+        assert!(
+            projection_recovery_bytes(&dir.join("pages")).is_empty(),
+            "pre-displacement race created recovery authority for an uncaptured inode"
+        );
         assert!(!graph.recent_writes.lock().unwrap().contains_key(&path));
 
         fs::write(&path, b"- base again\n").unwrap();
@@ -33167,7 +33815,7 @@ mod tests {
     }
 
     #[test]
-    fn projection_boundary_race_preserves_displaced_and_newer_external_versions() {
+    fn projection_boundary_race_is_rejected_before_displacement() {
         let dir = scratch("projection-boundary-race-evidence");
         let path = dir.join("pages/Projection.md");
         fs::write(&path, b"- base\n").unwrap();
@@ -33183,16 +33831,14 @@ mod tests {
             graph.write_projection_exact("pages/Projection.md", Some(b"- base\n"), b"- target\n");
 
         assert!(result.is_err(), "a raced publication returned write proof");
-        assert_eq!(fs::read(&path).unwrap(), b"- newer external\n");
-        assert!(projection_recovery_bytes(&dir.join("pages"))
-            .iter()
-            .any(|bytes| bytes == b"- displaced external\n"));
-        assert!(graph
-            .projection_recovery_evidence("pages/Projection.md")
-            .unwrap()
-            .iter()
-            .any(|evidence| evidence.digest()
-                == &<[u8; 32]>::from(Sha256::digest(b"- displaced external\n"))));
+        assert_eq!(fs::read(&path).unwrap(), b"- displaced external\n");
+        assert!(projection_recovery_bytes(&dir.join("pages")).is_empty());
+        PROJECTION_AFTER_RETIRE_REPLACEMENT.with(|replacement| {
+            assert_eq!(
+                replacement.borrow_mut().take(),
+                Some(b"- newer external\n".to_vec())
+            );
+        });
         assert!(!graph.recent_writes.lock().unwrap().contains_key(&path));
 
         let _ = fs::remove_dir_all(&dir);
@@ -37029,6 +37675,7 @@ mod tests {
                 b"- target\n",
                 &reservation,
                 std::slice::from_ref(&reservation),
+                None,
             )
             .is_err());
         assert_eq!(fs::read(&path).unwrap(), b"- base\n");

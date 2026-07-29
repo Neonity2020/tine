@@ -27,10 +27,11 @@ use crate::oplog::{
     ProjectionRecovery, ProjectionWorkStatus, RebuildSource, SemanticOperation, SessionId,
     ShardedHotEngine, SqliteFrontier, WorkspaceId,
 };
+use crate::oplog::projection_store::ProjectionCleanupRetirementAuthority;
 use crate::model::{
     fail_next_projection_directory_sync_for_test, projection_graph_test_counters,
     reset_projection_graph_test_counters, reset_projection_graph_test_hooks,
-    ProjectionGraphTestCounters,
+    ProjectionGraphTestCounters, ProjectionRecoveryCleanup,
 };
 
 use super::super::{
@@ -624,6 +625,7 @@ fn capture_scan_measurements(measured: &mut Measurements) {
     let ProjectionStoreTestCounters {
         completion_lookups,
         catalog_directory_entries,
+        ..
     } = projection_store_test_counters();
     measured.completion_lookups = completion_lookups;
     measured.catalog_directory_entries = catalog_directory_entries;
@@ -812,8 +814,13 @@ fn run_pregraph_drop_retry(case: &CorpusCase) -> CaseReceipt {
 }
 
 fn run_interrupted_recovery_slot_reuse(case: &CorpusCase) -> CaseReceipt {
-    let fixture = Fixture::new("crash-corpus-interrupted-recovery");
+    let fixture = Fixture::new_replacement("crash-corpus-interrupted-recovery");
+    let base = b"- base\n";
     let reservation = fixture.store.reserve_attempt(&fixture.intent).unwrap();
+    let recovery_path = fixture
+        .graph_root
+        .join("pages")
+        .join(reservation.recovery_filename());
     let mut authority = fixture
         .store
         .begin_mutation(&fixture.intent, Some(&reservation))
@@ -822,12 +829,23 @@ fn run_interrupted_recovery_slot_reuse(case: &CorpusCase) -> CaseReceipt {
         .graph
         .write_page_projection(
             fixture.intent.path().as_str(),
-            None,
+            Some(base),
             &fixture.target,
             &mut authority,
         )
         .unwrap();
     drop(authority);
+    assert_eq!(fs::read(&recovery_path).unwrap(), base);
+    assert_eq!(
+        fixture.store.pending_projection_cleanup().unwrap().len(),
+        1,
+        "exact handle-bound cleanup marker was not durable before completion"
+    );
+    assert!(fixture
+        .store
+        .load_completion(&fixture.intent)
+        .unwrap()
+        .is_none());
     let authority_path = fixture.authority_path(&fixture.intent);
     let stable_authority = fs::read(&authority_path).unwrap();
     let stable_stats = fixture.authority_stats();
@@ -843,12 +861,17 @@ fn run_interrupted_recovery_slot_reuse(case: &CorpusCase) -> CaseReceipt {
             .graph
             .recover_page_projection(
                 fixture.intent.path().as_str(),
-                None,
+                Some(base),
                 &fixture.target,
                 &mut recovery,
             )
             .unwrap();
         drop(recovery);
+        assert_eq!(
+            fs::read(&recovery_path).unwrap(),
+            base,
+            "interrupted attempt retired recovery evidence before completion"
+        );
         assert_eq!(fixture.authority_stats(), stable_stats);
         assert_eq!(fixture.attempt_stats(&fixture.intent), stable_attempts);
         assert_eq!(fs::read(&authority_path).unwrap(), stable_authority);
@@ -859,13 +882,48 @@ fn run_interrupted_recovery_slot_reuse(case: &CorpusCase) -> CaseReceipt {
         .graph
         .recover_page_projection(
             fixture.intent.path().as_str(),
-            None,
+            Some(base),
             &fixture.target,
             &mut recovery,
         )
         .unwrap();
     reopened
         .publish_completion(recovery, &fixture.intent, &proof)
+        .unwrap();
+    let (_, record) = reopened
+        .pending_projection_cleanup()
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(
+        fixture
+            .graph
+            .retire_completed_projection_recovery(
+                fixture.intent.path().as_str(),
+                std::slice::from_ref(&record),
+                None,
+            )
+            .unwrap(),
+        ProjectionRecoveryCleanup::Quarantined
+    );
+    assert!(
+        !recovery_path.exists(),
+        "durably completed attempt retained its displaced source"
+    );
+    assert_eq!(
+        fixture
+            .graph
+            .retire_completed_projection_recovery(
+                fixture.intent.path().as_str(),
+                std::slice::from_ref(&record),
+                Some(&ProjectionCleanupRetirementAuthority::for_test(&record)),
+            )
+            .unwrap(),
+        ProjectionRecoveryCleanup::Retired
+    );
+    reopened
+        .retire_pending_projection_cleanup(&record)
         .unwrap();
     let measured = Measurements {
         authority_slots: fixture.authority_stats().0,
@@ -902,9 +960,14 @@ fn run_interrupted_recovery_slot_reuse(case: &CorpusCase) -> CaseReceipt {
 }
 
 fn run_completion_retained_slot(case: &CorpusCase) -> CaseReceipt {
-    let fixture = Fixture::new("crash-corpus-completion-retained-slot");
+    let fixture = Fixture::new_replacement("crash-corpus-completion-retained-slot");
+    let base = b"- base\n";
     reset_projection_graph_test_counters();
     let reservation = fixture.store.reserve_attempt(&fixture.intent).unwrap();
+    let recovery_path = fixture
+        .graph_root
+        .join("pages")
+        .join(reservation.recovery_filename());
     let mut authority = fixture
         .store
         .begin_mutation(&fixture.intent, Some(&reservation))
@@ -913,7 +976,7 @@ fn run_completion_retained_slot(case: &CorpusCase) -> CaseReceipt {
         .graph
         .write_page_projection(
             fixture.intent.path().as_str(),
-            None,
+            Some(base),
             &fixture.target,
             &mut authority,
         )
@@ -937,6 +1000,11 @@ fn run_completion_retained_slot(case: &CorpusCase) -> CaseReceipt {
         .join(completion_filename(fixture.intent.id().unwrap()));
     let authority_path = fixture.authority_path(&fixture.intent);
     assert!(completion_path.exists() && authority_path.exists());
+    assert_eq!(
+        fs::read(&recovery_path).unwrap(),
+        base,
+        "completion cut lost recovery evidence before restart reconciliation"
+    );
     let before = format!(
         "completion_bytes={},authority={:?}",
         fs::metadata(&completion_path).unwrap().len(),
@@ -949,6 +1017,41 @@ fn run_completion_retained_slot(case: &CorpusCase) -> CaseReceipt {
     assert!(
         !authority_path.exists(),
         "reopen did not reconcile retained authority slot"
+    );
+    let (_, record) = reopened
+        .pending_projection_cleanup()
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(
+        fixture
+            .graph
+            .retire_completed_projection_recovery(
+                fixture.intent.path().as_str(),
+                std::slice::from_ref(&record),
+                None,
+            )
+            .unwrap(),
+        ProjectionRecoveryCleanup::Quarantined
+    );
+    assert_eq!(
+        fixture
+            .graph
+            .retire_completed_projection_recovery(
+                fixture.intent.path().as_str(),
+                std::slice::from_ref(&record),
+                Some(&ProjectionCleanupRetirementAuthority::for_test(&record)),
+            )
+            .unwrap(),
+        ProjectionRecoveryCleanup::Retired
+    );
+    reopened
+        .retire_pending_projection_cleanup(&record)
+        .unwrap();
+    assert!(
+        !recovery_path.exists(),
+        "restart did not retire completed-attempt recovery evidence"
     );
     assert!(reopened.load_completion(&fixture.intent).unwrap().is_some());
     let catalog = reopened.validated_catalog().unwrap();
@@ -1269,7 +1372,7 @@ fn run_deletion_completion_publication(case: &CorpusCase) -> CaseReceipt {
         measured.projection_write_calls == 0
             && measured.projection_remove_calls == 0
             && measured.projection_recovery_calls == 1
-            && measured.completion_lookups == 2
+            && measured.completion_lookups == 4
             && measured.catalog_directory_entries == 4,
         "{}",
         assertion_receipt(case, &before, &after, measured)
@@ -1342,7 +1445,7 @@ fn run_deletion_catalog_publication(case: &CorpusCase) -> CaseReceipt {
         measured.projection_write_calls == 0
             && measured.projection_remove_calls == 0
             && measured.projection_recovery_calls == 0
-            && measured.completion_lookups == 2
+            && measured.completion_lookups == 4
             && measured.catalog_directory_entries == 8,
         "{}",
         assertion_receipt(case, &before, &after, measured)

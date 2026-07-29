@@ -2,6 +2,47 @@
   "schemaVersion": 1,
   "entries": [
     {
+      "id": "REG-PROJECTION-RECOVERY-SIDECAR-GC-001",
+      "title": "Projection recovery sidecars retire fairly only after durable restart-and-grace evidence under clean one-app handoff, with changed bytes retained visibly",
+      "family": "sync-data-safety",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/tests/oplog_projection.rs::repeated_projection_replacements_and_reopen_retain_recent_recovery_sidecars",
+          "crates/tine-core/src/oplog/projection_store.rs::tests::same_byte_rebind_after_handle_capture_never_publishes_cleanup_authority",
+          "crates/tine-core/src/oplog/projection_store.rs::tests::canonical_v1_forensic_evidence_decodes_but_never_authorizes_cleanup",
+          "crates/tine-core/src/oplog/projection_store.rs::tests::graph_local_retirement_succeeds_when_receipts_are_on_another_filesystem",
+          "crates/tine-core/src/oplog/projection_store.rs::tests::completed_recovery_retirement_preserves_same_byte_replacement",
+          "crates/tine-core/src/oplog/projection_store.rs::tests::completed_recovery_retirement_retains_stale_handle_write_at_final_boundary",
+          "crates/tine-core/src/oplog/projection_store.rs::tests::settled_stale_descriptor_write_after_final_reread_documents_handoff_residual",
+          "crates/tine-core/src/oplog/projection_store.rs::tests::unchanged_quarantine_requires_restart_and_meaningful_grace",
+          "crates/tine-core/src/oplog/projection_store.rs::tests::restart_before_grace_retains_quarantine_and_clock_rollback_restarts_settlement",
+          "crates/tine-core/src/oplog/projection_store.rs::tests::changed_quarantine_becomes_visible_conflict_without_blocking_cleanup_queue",
+          "crates/tine-core/src/oplog/projection_store.rs::tests::oversized_changed_quarantine_is_renamed_visible_without_loading_it",
+          "crates/tine-core/src/oplog/projection_store.rs::tests::settled_cleanup_queue_drains_in_bounded_passes_without_history_growth",
+          "crates/tine-core/src/oplog/projection_store.rs::tests::blocked_cleanup_round_cannot_starve_later_changed_sidecar",
+          "crates/tine-core/src/oplog/projection_store.rs::tests::pending_cleanup_round_state_and_identity_fail_closed",
+          "crates/tine-core/src/oplog/projection_store.rs::tests::pending_cleanup_round_temp_is_bounded_and_unicode_unknown_fails_closed",
+          "crates/tine-core/src/oplog/projection_store.rs::tests::cleanup_observation_crash_cuts_retain_or_publish_conservative_state",
+          "crates/tine-core/src/oplog/projection_store.rs::tests::final_quarantine_same_byte_rebind_preserves_both_resources",
+          "crates/tine-core/src/oplog/projection_store.rs::tests::completed_recovery_retirement_preserves_parent_rebind_and_original_quarantine",
+          "crates/tine-core/src/oplog/projection_store.rs::tests::pending_cleanup_index_visits_only_live_attempts_after_historical_completions",
+          "crates/tine-core/src/oplog/projection_store.rs::tests::cleanup_crash_cuts_resume_quarantine_and_marker_retirement_idempotently",
+          "crates/tine-core/src/oplog/projection_crash_corpus_tests.rs::crash_corpus_v2_executes_every_declared_cut"
+        ],
+        "scenario": "projection.recovery-sidecar-settlement-and-retirement",
+        "failBefore": "proven"
+      }
+    },
+    {
       "id": "REG-SYNC-PROVIDER-OBSERVATION-ORDERING-001",
       "title": "Shared provider callbacks retain rejected and overlapping scans while observed local edits remain authoritative",
       "family": "sync-data-safety",
