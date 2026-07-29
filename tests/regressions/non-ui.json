@@ -1367,6 +1367,118 @@
       "notes": "Covers commit-last prepare-share and crash-resume from SharePrepared, incremental clean join beyond 4,096 provider entries and 8 MiB, both SharedActive roles across restart, reopening more than 64 settled manifests without historical replay, crash-resumable dependency-closed publication including unsafe local-manifest repair after private pending-marker creation failure, independent poll-mode provider delivery, coalesced incomplete-manifest rechecks after adversely reordered exact object delivery, nested nonstandard Unicode Markdown/Org paths, reordered and duplicate delivery, partial bootstrap and split-genesis refusal, dirty unique local-tail refusal, partition/rejoin, receiver-local projection, superseded-frontier rollback refusal, and convergence. A canonical generated Syncthing or Dropbox conflict copy is removed only after exact path, canonical-content, byte-equality, and no-follow retirement proof; differing, absent-target, malformed, or ambiguous evidence remains byte-exact and visibly blocks without graph writes. Continuously unstable full-scan epochs retain their fence and yield to retry backoff after one retry rebase. Tauri exposes bounded explicit prepare/join actions only inside the experimental sparse-v2 Settings flow, keeps provider polling separate from graph-wide reconciliation, and replaces stopped handles with retryable reopen slots after a transient post-transition reopen failure."
     },
     {
+      "id": "REG-SYNC-SHARED-PROVIDER-R6-TRANSIENT-INGRESS-001",
+      "title": "Provider staging siblings and vanished callbacks cannot wedge later inbound work or Safe shutdown",
+      "family": "sync-data-safety",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/oplog/simulator.rs",
+          "crates/tine-core/src/sync_runtime.rs"
+        ],
+        "scenario": "sync.shared-provider-r6-transient-ingress",
+        "failBefore": "proven"
+      },
+      "notes": "Exact safety/interoperability contract: only direct-child Syncthing staging siblings with the documented Unix/macOS .syncthing.<payload>.tmp or Windows ~syncthing~<payload>.tmp shape are non-authoritative in both full scans and exact callbacks; invented Dropbox sibling names and malformed canonical names remain visible and fail-closed. An exact path that is absent when processed settles idempotently. Authenticated restart/full reconciliation also pages the complete accepted sequence: every ordinary accepted batch must retain an exact local manifest, exact provider manifest, or digest-bound recovery mirror before Safe, including non-tip A in A→B→C. Recoverable local authority is republished idempotently; deleting canonical provider, recovery link/blob, and local manifest refuses reopen/Safe until local recovery evidence returns, after which the bounded audit repairs provider authority."
+    },
+    {
+      "id": "REG-SYNC-SHARED-PROVIDER-R6-ACCEPTED-AUDIT-RETRY-001",
+      "title": "Accepted-history audits retain exact progress across transient provider failures",
+      "family": "sync-data-safety",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/sync_runtime.rs"
+        ],
+        "scenario": "sync.shared-provider-r6-accepted-audit-retry",
+        "failBefore": "proven"
+      },
+      "notes": "A bounded accepted-sequence audit owns an exact retry cursor until it validates the current acceptance root. One-shot provider-read and repair-publication failures at accepted non-tip A in A→B→C fail closed as RecoveryBlocked, remain visible as provider work, and resume in the same live actor. The cursor advances only after the current entry is validated or durably repaired; recovered ticks restore canonical manifest plus digest-bound recovery evidence and reach Idle/Safe without a restart, full provider scan, or manifest/object directory enumeration."
+    },
+    {
+      "id": "REG-SYNC-SHARED-ENROLLMENT-R6-STABLE-PROVIDER-CUT-001",
+      "title": "Joining cannot irreversibly block on a provider manifest that is only temporarily absent",
+      "family": "sync-data-safety",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/oplog/enrollment.rs",
+          "crates/tine-core/src/sync_runtime.rs"
+        ],
+        "scenario": "sync.shared-enrollment-r6-stable-provider-cut",
+        "failBefore": "proven"
+      },
+      "notes": "Exact data-safety contract: Blocked shared.dirty-unique-tail requires a private durable local-authorship receipt written only after LocalMutation acceptance. The canonical receipt digest binds batch/manifest fingerprint, accepted event and prior/post frontier, workspace, lineage, device, endpoint, graph resource, authoring session, and promoted LocalActive runtime. Stable provider absence is never provenance: provider-staged/foreign archive evidence and missing, corrupt, or tampered receipts remain retryable LocalActive state without enrollment mutation across same-process retry and restart. A genuinely locally authored independent tail retains its receipt across restart and still enters terminal Blocked without changing graph bytes."
+    },
+    {
+      "id": "REG-SYNC-SHARED-ENROLLMENT-R6-OPERATION-OWNERSHIP-001",
+      "title": "One enrollment operation owns incremental join state while ordinary actor work interleaves",
+      "family": "sync-data-safety",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/sync_runtime.rs"
+        ],
+        "scenario": "sync.shared-enrollment-r6-operation-ownership",
+        "failBefore": "source-proven"
+      },
+      "notes": "Deterministic barriers pause a multi-turn join after it releases ordinary operation ownership. A conflicting descriptor and prepare_shared both reach the dedicated enrollment mutex and remain serialized until the owning join completes; the exact two-pass traversal proves the conflicting call cannot clear and restart PendingSharedJoin. A status request still acquires ordinary operation ownership and completes during the between-turn pause without changing the join outcome."
+    },
+    {
+      "id": "REG-SYNC-SHARED-ENROLLMENT-R6-BOUNDED-CUT-001",
+      "title": "Large shared-enrollment cuts retain constant state and perform only linear streaming checks",
+      "family": "sync-data-safety",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/sync_runtime.rs"
+        ],
+        "scenario": "sync.shared-enrollment-r6-bounded-stable-cut",
+        "failBefore": "proven"
+      },
+      "notes": "The deterministic join fixture retains more than 4,096 valid immutable provider objects and 8 MiB. Instrumentation requires exactly two complete provider-entry passes, one provider-cut comparison, one constant-size recovery-summary comparison, zero history-proportional entries retained by PendingSharedJoin, at most one recovery relation accumulation per streamed provider entry, and at most one exact recovery-link membership read per streamed local entry. Provider and local cuts use domain-separated cryptographic count/XOR summaries with filesystem-unique path and manifest set semantics; public operation authority is released between incremental cursor turns."
+    },
+    {
       "id": "REG-SYNC-SHARED-PROVIDER-R6-001",
       "title": "Reverse-delivered provider histories use dependency-indexed readiness work while retaining every blocked batch",
       "family": "sync-data-safety",

@@ -3019,6 +3019,10 @@ impl SharedProviderTransport {
             {
                 return Err(ScenarioError::UnsafeProviderEntry(path));
             }
+            if provider_transient_path(&path) {
+                cursor.observed_entries = cursor.observed_entries.saturating_add(1);
+                return Ok(SharedProviderObservation::Path(path));
+            }
             let file = open_provider_file_nofollow(
                 &open_provider_directory(self.runtime.tree(ProviderTree::Outbox), namespace)?,
                 &name,
@@ -8842,6 +8846,37 @@ const PROVIDER_TEMP_NAMESPACE: &str = ".part";
 const PROVIDER_REMOVED_NAMESPACE: &str = "removed";
 const PROVIDER_RENAME_EVIDENCE_NAMESPACE: &str = "rename-evidence";
 
+/// Recognized provider-owned staging siblings carry no protocol authority.
+///
+/// Keep this deliberately narrow: only direct children of an authoritative
+/// shared-provider namespace and the documented hidden staging shapes qualify.
+/// Malformed canonical protocol names and every other unknown entry continue
+/// through ordinary fail-closed classification.
+pub(crate) fn provider_transient_path(path: &str) -> bool {
+    let Some((namespace, name)) = path.split_once('/') else {
+        return false;
+    };
+    if name.contains('/')
+        || ![
+            PROVIDER_ENROLLMENT_NAMESPACE,
+            PROVIDER_MANIFESTS_NAMESPACE,
+            PROVIDER_OBJECTS_NAMESPACE,
+            SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE,
+            SHARED_PROVIDER_PUBLICATION_INTENTS_NAMESPACE,
+            SHARED_PROVIDER_MANIFEST_RECOVERY_LINKS_NAMESPACE,
+            SHARED_PROVIDER_MANIFEST_RECOVERY_BLOBS_NAMESPACE,
+        ]
+        .contains(&namespace)
+    {
+        return false;
+    }
+    [".syncthing.", "~syncthing~"].into_iter().any(|prefix| {
+        name.strip_prefix(prefix)
+            .and_then(|rest| rest.strip_suffix(".tmp"))
+            .is_some_and(|payload| !payload.is_empty())
+    })
+}
+
 fn valid_provider_user_path(path: &str) -> bool {
     valid_provider_path(path)
         && path.split('/').next().is_some_and(|namespace| {
@@ -11341,6 +11376,37 @@ mod tests {
         observed.sort();
         expected.sort();
         assert_eq!(observed, expected);
+    }
+
+    #[test]
+    fn provider_transient_classification_is_narrow_and_namespace_bound() {
+        for path in [
+            // Syncthing's documented Unix/macOS temporary sibling shape.
+            "objects/.syncthing.0123456789.tmp",
+            // Syncthing's documented Windows temporary sibling shape. A
+            // shared provider can expose either shape to any receiving OS.
+            "manifests/~syncthing~publication.tmp",
+            "enrollment/.syncthing.descriptor.tmp",
+            "frontier-heads-v1/~syncthing~head.tmp",
+        ] {
+            assert!(provider_transient_path(path), "{path}");
+        }
+        for path in [
+            "objects/.syncthing..tmp",
+            "objects/~syncthing~.tmp",
+            "objects/.syncthing.batch.object",
+            "objects/~syncthing~batch.object",
+            "objects/.dropbox.tmp",
+            "objects/.dropbox.publication.tmp",
+            "objects/not-a-digest.object",
+            "manifests/not-a-batch.manifest",
+            "unknown/.syncthing.residue.tmp",
+            "unknown/~syncthing~residue.tmp",
+            "objects/nested/.syncthing.residue.tmp",
+            "objects/nested/~syncthing~residue.tmp",
+        ] {
+            assert!(!provider_transient_path(path), "{path}");
+        }
     }
 
     #[test]
