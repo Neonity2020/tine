@@ -3313,7 +3313,7 @@ fn coordinator_v5_acceptance_sequence_is_not_batch_id_order() {
                         oracle: CoordinatorOracle {
                             accepted_sequence: Some(3),
                             accepted_frontier_digest: Some(
-                                "84abf48b80a8255fd4bc0bd6787de57e5de81187229fb453c19b47bd1aa83713"
+                                "f6581038cda46e35aaec5e8172157b12266d9d7dafef7fd7c3b013124cf6f50f"
                                     .into(),
                             ),
                             accepted_batches: Some(vec![
@@ -3323,11 +3323,11 @@ fn coordinator_v5_acceptance_sequence_is_not_batch_id_order() {
                             ]),
                             sqlite_sequence: Some(3),
                             sqlite_frontier_digest: Some(
-                                "84abf48b80a8255fd4bc0bd6787de57e5de81187229fb453c19b47bd1aa83713"
+                                "f6581038cda46e35aaec5e8172157b12266d9d7dafef7fd7c3b013124cf6f50f"
                                     .into(),
                             ),
                             sqlite_row_digest: Some(
-                                "d4d520b0fe4167dc460ade5294b582106d76e9b884a7321447ea788c0eec0355"
+                                "3b707d9d349169a27b8421ca22669f00a9ff70620c8dd3e8946ba61d89391fc3"
                                     .into(),
                             ),
                             frontiers_match: Some(true),
@@ -3391,11 +3391,11 @@ fn coordinator_v5_acceptance_sequence_is_not_batch_id_order() {
     assert!(observed.sqlite_row_digest.is_some());
     assert_eq!(
         observed.accepted_frontier_digest,
-        "84abf48b80a8255fd4bc0bd6787de57e5de81187229fb453c19b47bd1aa83713"
+        "f6581038cda46e35aaec5e8172157b12266d9d7dafef7fd7c3b013124cf6f50f"
     );
     assert_eq!(
         observed.sqlite_row_digest.as_deref(),
-        Some("d4d520b0fe4167dc460ade5294b582106d76e9b884a7321447ea788c0eec0355")
+        Some("3b707d9d349169a27b8421ca22669f00a9ff70620c8dd3e8946ba61d89391fc3")
     );
     assert_eq!(observed.accepted_batches[0], BatchId::from_uuid(uuid(9)));
     assert_eq!(

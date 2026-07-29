@@ -39,9 +39,9 @@ use super::page_name_index::PageNameConflictEvidenceV1;
 use super::{
     AuthorBatch, BatchDisposition, BatchId, BatchInspection, CanonicalSnapshot, CrdtPeerId,
     DeviceId, DocumentId, EngineError, EngineStatus, ImmutableHomeEvidence, LineageDigest,
-    ManagedTextKind, ObjectStore, OperationBatch, OperationTransaction, ProjectionEndpointBinding,
-    ProjectionEndpointId, ProjectionReceiptStore, SemanticOperation, SessionId, ShardedHotEngine,
-    StageOutcome, WorkspaceId, WorkspaceStatus,
+    ManagedTextKind, ObjectStore, OperationBatch, OperationTransaction, PreparedBatch,
+    ProjectionEndpointBinding, ProjectionEndpointId, ProjectionReceiptStore, SemanticOperation,
+    SessionId, ShardedHotEngine, StageOutcome, WorkspaceId, WorkspaceStatus,
 };
 use crate::Graph;
 
@@ -54,6 +54,17 @@ pub(super) struct SimulatorBootstrapFixtureIngress {
 
 const SIMULATOR_BOOTSTRAP_FIXTURE_INGRESS: SimulatorBootstrapFixtureIngress =
     SimulatorBootstrapFixtureIngress { _private: () };
+
+/// Publish one prepared bootstrap fixture for the deterministic simulator.
+///
+/// The authority remains private to this module, so callers can use this
+/// narrow fixture bridge but cannot invoke ObjectStore's bootstrap bypass.
+pub(super) fn publish_bootstrap_prepared_for_simulator_fixture(
+    store: &ObjectStore,
+    batch: &PreparedBatch,
+) -> Result<(), super::StoreError> {
+    store.publish_simulator_bootstrap_prepared(&SIMULATOR_BOOTSTRAP_FIXTURE_INGRESS, batch)
+}
 
 /// Version 5 adds the operational-coordinator action vocabulary and its
 /// durable-state observations. Versions are deliberately never upgraded on

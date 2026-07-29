@@ -1713,6 +1713,16 @@ impl ObjectStore {
         self.publish_prepared_impl(batch, false)
     }
 
+    /// Seed a bootstrap-origin archive fixture through the deterministic
+    /// simulator's unforgeable ingress authority.
+    pub(super) fn publish_simulator_bootstrap_prepared(
+        &self,
+        _fixture_ingress: &SimulatorBootstrapFixtureIngress,
+        batch: &PreparedBatch,
+    ) -> Result<(), StoreError> {
+        self.publish_bootstrap_prepared_fixture(batch)
+    }
+
     /// Seed a bootstrap-origin archive fixture without exposing a production
     /// publication bypass.
     #[cfg(test)]
@@ -1720,6 +1730,10 @@ impl ObjectStore {
         &self,
         batch: &PreparedBatch,
     ) -> Result<(), StoreError> {
+        self.publish_bootstrap_prepared_fixture(batch)
+    }
+
+    fn publish_bootstrap_prepared_fixture(&self, batch: &PreparedBatch) -> Result<(), StoreError> {
         assert_eq!(
             batch.manifest().origin(),
             BatchOrigin::BootstrapImport,

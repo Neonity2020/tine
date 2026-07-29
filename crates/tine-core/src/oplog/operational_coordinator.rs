@@ -1807,11 +1807,11 @@ pub(crate) mod simulator_harness {
         OperationalCoordinator, OperationalCoordinatorState, OperationalFaultPoint,
     };
     use crate::oplog::simulator::{
-        CoordinatorAction, CoordinatorDurableBoundary, CoordinatorExpectedState,
-        CoordinatorFailureWitness, CoordinatorFault, CoordinatorHandoffState,
-        CoordinatorObservation, CoordinatorOracle, CoordinatorReadGate, CoordinatorRunOutcome,
-        CoordinatorSqliteMutation, ExternalFileFixture, ScenarioDevice, ScenarioWorkspace,
-        WireBytes,
+        publish_bootstrap_prepared_for_simulator_fixture, CoordinatorAction,
+        CoordinatorDurableBoundary, CoordinatorExpectedState, CoordinatorFailureWitness,
+        CoordinatorFault, CoordinatorHandoffState, CoordinatorObservation, CoordinatorOracle,
+        CoordinatorReadGate, CoordinatorRunOutcome, CoordinatorSqliteMutation, ExternalFileFixture,
+        ScenarioDevice, ScenarioWorkspace, WireBytes,
     };
     use crate::oplog::{
         write_projection_exact, ApplicationRuntimeRoot, AuthorBatch, BatchDisposition, BatchId,
@@ -1941,9 +1941,9 @@ pub(crate) mod simulator_harness {
                     &transaction,
                 )
                 .map_err(display)?;
-            ObjectStore::open(&archive_root, workspace.workspace_id)
-                .map_err(display)?
-                .publish_prepared(&prepared)
+            let archive =
+                ObjectStore::open(&archive_root, workspace.workspace_id).map_err(display)?;
+            publish_bootstrap_prepared_for_simulator_fixture(&archive, &prepared)
                 .map_err(display)?;
             engine
                 .stage_archive_batch(prepared.manifest().batch_id())
