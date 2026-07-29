@@ -7631,13 +7631,16 @@ mod tests {
             .unwrap()
             .publish_prepared(&prepared)
             .unwrap();
-            assert!(matches!(
-                self.engine
-                    .stage_archive_batch(batch_id)
-                    .unwrap()
-                    .disposition(),
-                BatchDisposition::Accepted { .. }
-            ));
+            let disposition = self
+                .engine
+                .stage_archive_batch(batch_id)
+                .unwrap()
+                .disposition()
+                .clone();
+            assert!(
+                matches!(disposition, BatchDisposition::Accepted { .. }),
+                "{disposition:?}"
+            );
             batch_id
         }
     }
@@ -11065,6 +11068,107 @@ mod tests {
         for (index, case) in cases.into_iter().enumerate() {
             run_external_semantic_differential(case, index as u128);
         }
+    }
+
+    #[test]
+    fn fresh_attack_anchored_crlf_move_projects_and_stabilizes() {
+        run_external_semantic_differential(
+            ExternalSemanticDifferentialCase {
+                label: "fresh-attack-anchored-crlf-move",
+                initial_config: None,
+                current_config: None,
+                initial: vec![DifferentialInitialDocument {
+                    path: "pages/old.md",
+                    name: "old",
+                    content: "body\nid:: 00000000-0000-0000-0000-00000005300a",
+                    preamble: None,
+                }],
+                current: vec![DifferentialCurrentDocument {
+                    path: "pages/new.md",
+                    bytes: "- body\r\n  id:: 00000000-0000-0000-0000-00000005300a\r\n",
+                    graph_name: "new",
+                    accepted_name: "new",
+                    kind: ManagedTextKind::Page,
+                }],
+                affected: vec!["pages/old.md", "pages/new.md"],
+                initial_uuid: Some(LogseqUuid::from_uuid(Uuid::from_u128(0x5300a))),
+                retained_initial: vec![("pages/new.md", 0)],
+                unchanged_bytes: vec![],
+                collision: false,
+            },
+            0x5300a,
+        );
+    }
+
+    #[test]
+    fn fresh_attack_anchored_crlf_markdown_to_org_move_projects_and_stabilizes() {
+        run_external_semantic_differential(
+            ExternalSemanticDifferentialCase {
+                label: "fresh-attack-anchored-crlf-markdown-to-org-move",
+                initial_config: None,
+                current_config: None,
+                initial: vec![DifferentialInitialDocument {
+                    path: "pages/old.md",
+                    name: "old",
+                    content: "body\nid:: 00000000-0000-0000-0000-00000005300b",
+                    preamble: None,
+                }],
+                current: vec![DifferentialCurrentDocument {
+                    path: "pages/new.org",
+                    bytes: "* body\r\n:PROPERTIES:\r\n:id: 00000000-0000-0000-0000-00000005300b\r\n:END:\r\n",
+                    graph_name: "new",
+                    accepted_name: "new",
+                    kind: ManagedTextKind::Page,
+                }],
+                affected: vec!["pages/old.md", "pages/new.org"],
+                initial_uuid: Some(LogseqUuid::from_uuid(Uuid::from_u128(0x5300b))),
+                retained_initial: vec![("pages/new.org", 0)],
+                unchanged_bytes: vec![],
+                collision: false,
+            },
+            0x5300b,
+        );
+    }
+
+    #[test]
+    fn fresh_attack_move_destination_changed_after_observation_refuses_without_overwrite() {
+        let fixture = SnapshotFixture::new_with_initial_uuid(
+            "fresh-attack-move-destination-stale",
+            &["pages/old.md"],
+            Some(LogseqUuid::from_uuid(Uuid::from_u128(0x5300c))),
+        );
+        let destination = fixture.graph_root.join("pages/new.md");
+        fs::rename(fixture.graph_root.join("pages/old.md"), &destination).unwrap();
+        let plan = fixture.plan(&["pages/old.md", "pages/new.md"]);
+        assert_eq!(plan.status(), ImportPlanStatus::Reconcile);
+        let material = plan.into_execution_material().unwrap();
+        let endpoint = fixture.engine.projection_endpoint_binding().unwrap();
+        let draft = fixture
+            .engine
+            .draft_external_import_transaction(
+                AuthorBatch {
+                    batch_id: material.batch_id(),
+                    author_device_id: endpoint.device_id,
+                    author_session_id: SessionId::from_uuid(Uuid::from_u128(0x5300d)),
+                    crdt_peer_id: CrdtPeerId::from_u64(0x5300e),
+                },
+                material,
+            )
+            .unwrap();
+        let changed = b"- changed after observation\r\n".to_vec();
+        fs::write(&destination, &changed).unwrap();
+
+        assert!(matches!(
+            fixture.engine.capture_external_author_transaction(
+                draft,
+                &fixture.graph,
+                &fixture.receipts,
+                endpoint,
+            ),
+            Err(crate::oplog::EngineError::ProjectionManifest(message))
+                if message.contains("observation") && message.contains("stale")
+        ));
+        assert_eq!(fs::read(destination).unwrap(), changed);
     }
 
     #[test]

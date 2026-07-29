@@ -2290,6 +2290,34 @@ enum CapabilityCapturedProjectionMaterial {
     },
 }
 
+#[derive(Clone, Copy, Debug)]
+enum MoveProjectionRenderLayout<'a> {
+    DestinationObservation {
+        base: &'a AnnotatedProjectionBase,
+    },
+    PriorSemanticProjection {
+        reference: &'a ManifestObjectRef,
+        base: &'a AnnotatedProjectionBase,
+    },
+}
+
+impl<'a> MoveProjectionRenderLayout<'a> {
+    fn manifest_render_base(self) -> Option<ManifestObjectRef> {
+        match self {
+            Self::DestinationObservation { .. } => None,
+            Self::PriorSemanticProjection { reference, .. } => Some(reference.clone()),
+        }
+    }
+
+    const fn base(self) -> &'a AnnotatedProjectionBase {
+        match self {
+            Self::DestinationObservation { base } | Self::PriorSemanticProjection { base, .. } => {
+                base
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CapabilityCapturedProjectionInput {
     path: ManagedPath,
@@ -9656,7 +9684,13 @@ impl ShardedHotEngine {
                         "captured path {path} prior bytes are not the exact semantic pre-state"
                     )));
                 }
-                if roles.render_base_owner.is_some() {
+                let prior_semantic_layout_required = roles.render_base_owner.is_some_and(|owner| {
+                    matches!(
+                        inputs[&draft.requirements[owner].path],
+                        CapabilityCapturedProjectionMaterial::Absent { .. }
+                    )
+                });
+                if prior_semantic_layout_required {
                     let base = AnnotatedProjectionBase::new(
                         self.workspace_id,
                         source.endpoint_id,
@@ -9754,20 +9788,46 @@ impl ShardedHotEngine {
                     }
                 }
             };
-            let render_base = requirement
+            let move_render_layout = requirement
                 .render_base_path
                 .as_ref()
-                .map(|path| {
-                    render_bases
+                .map(|path| match &inputs[&requirement.path] {
+                    CapabilityCapturedProjectionMaterial::Present { .. }
+                        if external_reconciliation =>
+                    {
+                        observed_bases
+                            .get(&requirement.path)
+                            .map(
+                                |(_, base)| MoveProjectionRenderLayout::DestinationObservation {
+                                    base,
+                                },
+                            )
+                            .ok_or_else(|| {
+                                EngineError::ProjectionManifest(
+                                    "external move destination observation was not captured".into(),
+                                )
+                            })
+                    }
+                    CapabilityCapturedProjectionMaterial::Absent { .. } => render_bases
                         .get(path)
-                        .map(|(reference, _)| reference.clone())
+                        .map(|(reference, base)| {
+                            MoveProjectionRenderLayout::PriorSemanticProjection { reference, base }
+                        })
                         .ok_or_else(|| {
                             EngineError::ProjectionManifest(
-                                "required rename render base was not captured".into(),
+                                "required prior-semantic rename render base was not captured"
+                                    .into(),
                             )
-                        })
+                        }),
+                    CapabilityCapturedProjectionMaterial::Present { .. } => {
+                        Err(EngineError::ProjectionManifest(
+                            "local move destination unexpectedly became present".into(),
+                        ))
+                    }
                 })
                 .transpose()?;
+            let render_base =
+                move_render_layout.and_then(MoveProjectionRenderLayout::manifest_render_base);
             let target = match requirement.target {
                 ProjectionRequirementState::Absent => ManifestProjectionTarget::Absent,
                 ProjectionRequirementState::Present => {
@@ -9776,11 +9836,9 @@ impl ShardedHotEngine {
                             "Present requirement has no semantic post-state".into(),
                         )
                     })?;
-                    let (render_bytes, render_annotations) = requirement
-                        .render_base_path
-                        .as_ref()
-                        .and_then(|path| render_bases.get(path))
-                        .map(|(_, base)| (Some(base.bytes()), Some(base.annotations())))
+                    let (render_bytes, render_annotations) = move_render_layout
+                        .map(MoveProjectionRenderLayout::base)
+                        .map(|base| (Some(base.bytes()), Some(base.annotations())))
                         .unwrap_or_else(|| match &inputs[&requirement.path] {
                             CapabilityCapturedProjectionMaterial::Present {
                                 bytes,
@@ -18373,7 +18431,12 @@ fn validate_intent_directions(
                         Some(after),
                         ProjectionRequirementState::Absent,
                         ProjectionRequirementState::Present,
-                    ) && intent.render_base().is_some()
+                    ) && (intent.render_base().is_some()
+                        || (fresh_external_preconditions
+                            && matches!(
+                                intent.precondition(),
+                                ManifestProjectionPrecondition::Present { .. }
+                            )))
                 })
             {
                 return Err(EngineError::ProjectionManifest(
@@ -24480,6 +24543,74 @@ mod validation_tests {
         assert_eq!(
             reconciliation.paths(),
             &[fixture.pages[0].3.clone(), new_path]
+        );
+        finish_preauthor_gate_fixture(fixture);
+    }
+
+    #[test]
+    fn preauthor_gate_local_move_to_absent_destination_uses_prior_semantic_layout() {
+        let fixture = preauthor_gate_fixture(92_500);
+        let old_path = fixture.pages[0].3.clone();
+        let prior_bytes = std::fs::read(fixture.graph_path(&old_path)).unwrap();
+        let new_path = ManagedPath::parse("pages/gate-local-moved.md").unwrap();
+        assert!(!fixture.graph_path(&new_path).exists());
+        let draft = fixture
+            .engine
+            .draft_author_transaction(
+                AuthorBatch {
+                    batch_id: BatchId::from_uuid(Uuid::from_u128(92_600)),
+                    author_device_id: fixture.endpoint.device_id,
+                    author_session_id: SessionId::from_uuid(Uuid::from_u128(92_601)),
+                    crdt_peer_id: CrdtPeerId::from_u64(92_602),
+                },
+                BatchOrigin::LocalMutation,
+                &OperationTransaction::new(vec![SemanticOperation::EditPagePath {
+                    page_id: fixture.pages[0].0,
+                    path: new_path.clone(),
+                }])
+                .unwrap(),
+            )
+            .unwrap();
+        let captured = match fixture
+            .engine
+            .capture_local_author_transaction(
+                draft,
+                &fixture.graph,
+                &fixture.receipts,
+                fixture.endpoint,
+            )
+            .unwrap()
+        {
+            LocalAuthorCapture::Captured(captured) => captured,
+            LocalAuthorCapture::ReconciliationNeeded(_) => {
+                panic!("absent local move destination unexpectedly required reconciliation")
+            }
+        };
+        let prepared = fixture
+            .engine
+            .finalize_captured_author_transaction(captured, &fixture.receipts)
+            .unwrap();
+        let destination = prepared
+            .objects()
+            .iter()
+            .filter(|object| object.kind() == ObjectKind::ProjectionIntent)
+            .map(|object| ManifestedProjectionIntent::decode(object.payload()).unwrap())
+            .find(|intent| intent.path() == &new_path)
+            .expect("local move must manifest its destination");
+        assert!(matches!(
+            destination.precondition(),
+            ManifestProjectionPrecondition::Absent
+        ));
+        assert!(
+            destination.render_base().is_some(),
+            "an absent local destination must retain the prior-semantic render base"
+        );
+        let ManifestProjectionTarget::Present { bytes, .. } = destination.target() else {
+            panic!("local move destination must be present");
+        };
+        assert_eq!(
+            bytes, &prior_bytes,
+            "an absent local destination must render from authenticated prior semantics"
         );
         finish_preauthor_gate_fixture(fixture);
     }
