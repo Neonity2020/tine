@@ -1933,6 +1933,8 @@ impl ProviderRuntime {
                 PROVIDER_ENROLLMENT_NAMESPACE,
                 SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE,
                 SHARED_PROVIDER_PUBLICATION_INTENTS_NAMESPACE,
+                SHARED_PROVIDER_MANIFEST_RECOVERY_LINKS_NAMESPACE,
+                SHARED_PROVIDER_MANIFEST_RECOVERY_BLOBS_NAMESPACE,
                 PROVIDER_TEMP_NAMESPACE,
                 PROVIDER_REMOVED_NAMESPACE,
                 PROVIDER_RENAME_EVIDENCE_NAMESPACE,
@@ -2269,11 +2271,22 @@ impl ProviderRuntime {
 pub(crate) const SHARED_ENROLLMENT_DESCRIPTOR_PATH: &str = "enrollment/shared-enrollment-v1.json";
 pub(crate) const SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE: &str = "frontier-heads-v1";
 pub(crate) const SHARED_PROVIDER_PUBLICATION_INTENTS_NAMESPACE: &str = "publication-intents-v1";
+pub(crate) const SHARED_PROVIDER_MANIFEST_RECOVERY_LINKS_NAMESPACE: &str =
+    "manifest-recovery-links-v1";
+pub(crate) const SHARED_PROVIDER_MANIFEST_RECOVERY_BLOBS_NAMESPACE: &str =
+    "manifest-recovery-blobs-v1";
+pub(crate) const SHARED_PROVIDER_MANIFEST_RECOVERY_FORMAT_VERSION: u32 = 1;
 const SHARED_PROVIDER_FRONTIER_HEAD_SCHEMA_VERSION: u32 = 1;
 const MAX_SHARED_PROVIDER_FRONTIER_HEAD_BYTES: usize = 256 * 1024;
 const MAX_SHARED_PROVIDER_FRONTIER_TIPS: usize = 4_096;
 const SHARED_PROVIDER_PUBLICATION_INTENT_SCHEMA_VERSION: u32 = 1;
 const MAX_SHARED_PROVIDER_PUBLICATION_INTENT_BYTES: usize = 4 * 1024;
+const SHARED_PROVIDER_MANIFEST_RECOVERY_LINK_SCHEMA_VERSION: u32 = 1;
+const MAX_SHARED_PROVIDER_MANIFEST_RECOVERY_LINK_BYTES: usize = 4 * 1024;
+
+const fn zero_u32(value: &u32) -> bool {
+    *value == 0
+}
 
 /// Immutable, content-addressed discovery hint for one device's accepted
 /// causal frontier. A validated record can select exact immutable manifests
@@ -2290,6 +2303,10 @@ pub(crate) struct SharedProviderFrontierHeadV1 {
     accepted_generation: u64,
     accepted_frontier_root: super::ContentDigest,
     frontier_tips: Vec<BatchId>,
+    #[serde(default, skip_serializing_if = "zero_u32")]
+    manifest_recovery_format_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    manifest_recovery_coverage_root: Option<super::ContentDigest>,
 }
 
 impl SharedProviderFrontierHeadV1 {
@@ -2301,6 +2318,7 @@ impl SharedProviderFrontierHeadV1 {
         accepted_generation: u64,
         accepted_frontier_root: super::ContentDigest,
         mut frontier_tips: Vec<BatchId>,
+        manifest_recovery_coverage_root: Option<super::ContentDigest>,
     ) -> Result<Self, ScenarioError> {
         frontier_tips.sort_unstable();
         frontier_tips.dedup();
@@ -2314,6 +2332,9 @@ impl SharedProviderFrontierHeadV1 {
             accepted_generation,
             accepted_frontier_root,
             frontier_tips,
+            manifest_recovery_format_version: manifest_recovery_coverage_root
+                .map_or(0, |_| SHARED_PROVIDER_MANIFEST_RECOVERY_FORMAT_VERSION),
+            manifest_recovery_coverage_root,
         };
         record.validate()?;
         Ok(record)
@@ -2379,11 +2400,145 @@ impl SharedProviderFrontierHeadV1 {
         &self.frontier_tips
     }
 
+    pub(crate) const fn manifest_recovery_coverage_root(&self) -> Option<super::ContentDigest> {
+        self.manifest_recovery_coverage_root
+    }
+
+    pub(crate) fn has_current_manifest_recovery_coverage(&self) -> bool {
+        self.manifest_recovery_format_version == SHARED_PROVIDER_MANIFEST_RECOVERY_FORMAT_VERSION
+            && self.manifest_recovery_coverage_root == Some(self.accepted_frontier_root)
+    }
+
     fn validate(&self) -> Result<(), ScenarioError> {
         if self.schema_version != SHARED_PROVIDER_FRONTIER_HEAD_SCHEMA_VERSION
             || self.oplog_protocol_version != super::OPLOG_PROTOCOL_VERSION
             || self.frontier_tips.len() > MAX_SHARED_PROVIDER_FRONTIER_TIPS
             || self.frontier_tips.windows(2).any(|pair| pair[0] >= pair[1])
+            || !matches!(
+                (
+                    self.manifest_recovery_format_version,
+                    self.manifest_recovery_coverage_root,
+                ),
+                (0, None)
+            ) && !(self.manifest_recovery_format_version
+                == SHARED_PROVIDER_MANIFEST_RECOVERY_FORMAT_VERSION
+                && self.manifest_recovery_coverage_root == Some(self.accepted_frontier_root))
+        {
+            return Err(ScenarioError::NonCanonical);
+        }
+        Ok(())
+    }
+}
+
+/// Exact locator for one immutable digest-addressed manifest recovery copy.
+///
+/// The batch-keyed link is immutable and binds the active shared namespace,
+/// descriptor, author, and canonical manifest digest. The linked bytes live
+/// under a digest path, so a missing canonical manifest can be reconstructed
+/// without namespace enumeration or author return.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SharedProviderManifestRecoveryLinkV1 {
+    schema_version: u32,
+    recovery_format_version: u32,
+    workspace_id: WorkspaceId,
+    lineage_digest: LineageDigest,
+    descriptor_digest: super::ContentDigest,
+    oplog_protocol_version: u32,
+    batch_id: BatchId,
+    manifest_author_device_id: DeviceId,
+    manifest_digest: super::ContentDigest,
+}
+
+impl SharedProviderManifestRecoveryLinkV1 {
+    pub(crate) fn new(
+        workspace_id: WorkspaceId,
+        lineage_digest: LineageDigest,
+        descriptor_digest: super::ContentDigest,
+        batch_id: BatchId,
+        manifest_author_device_id: DeviceId,
+        manifest_digest: super::ContentDigest,
+    ) -> Result<Self, ScenarioError> {
+        let link = Self {
+            schema_version: SHARED_PROVIDER_MANIFEST_RECOVERY_LINK_SCHEMA_VERSION,
+            recovery_format_version: SHARED_PROVIDER_MANIFEST_RECOVERY_FORMAT_VERSION,
+            workspace_id,
+            lineage_digest,
+            descriptor_digest,
+            oplog_protocol_version: super::OPLOG_PROTOCOL_VERSION,
+            batch_id,
+            manifest_author_device_id,
+            manifest_digest,
+        };
+        link.validate()?;
+        Ok(link)
+    }
+
+    pub(crate) fn encode(&self) -> Result<Vec<u8>, ScenarioError> {
+        self.validate()?;
+        let bytes =
+            serde_json::to_vec(self).map_err(|error| ScenarioError::Encode(error.to_string()))?;
+        if bytes.len() > MAX_SHARED_PROVIDER_MANIFEST_RECOVERY_LINK_BYTES {
+            return Err(ScenarioError::TooLarge(bytes.len()));
+        }
+        Ok(bytes)
+    }
+
+    pub(crate) fn decode(path: &str, bytes: &[u8]) -> Result<Self, ScenarioError> {
+        if bytes.len() > MAX_SHARED_PROVIDER_MANIFEST_RECOVERY_LINK_BYTES {
+            return Err(ScenarioError::TooLarge(bytes.len()));
+        }
+        let link: Self = serde_json::from_slice(bytes)
+            .map_err(|error| ScenarioError::Decode(error.to_string()))?;
+        link.validate()?;
+        if link.encode()? != bytes || link.path() != path {
+            return Err(ScenarioError::NonCanonical);
+        }
+        Ok(link)
+    }
+
+    pub(crate) fn path(&self) -> String {
+        format!(
+            "{SHARED_PROVIDER_MANIFEST_RECOVERY_LINKS_NAMESPACE}/{}.link",
+            self.batch_id
+        )
+    }
+
+    pub(crate) fn blob_path(&self) -> String {
+        format!(
+            "{SHARED_PROVIDER_MANIFEST_RECOVERY_BLOBS_NAMESPACE}/{}.manifest",
+            self.manifest_digest
+        )
+    }
+
+    pub(crate) const fn workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
+    }
+
+    pub(crate) const fn lineage_digest(&self) -> LineageDigest {
+        self.lineage_digest
+    }
+
+    pub(crate) const fn descriptor_digest(&self) -> super::ContentDigest {
+        self.descriptor_digest
+    }
+
+    pub(crate) const fn batch_id(&self) -> BatchId {
+        self.batch_id
+    }
+
+    pub(crate) const fn manifest_author_device_id(&self) -> DeviceId {
+        self.manifest_author_device_id
+    }
+
+    pub(crate) const fn manifest_digest(&self) -> super::ContentDigest {
+        self.manifest_digest
+    }
+
+    fn validate(&self) -> Result<(), ScenarioError> {
+        if self.schema_version != SHARED_PROVIDER_MANIFEST_RECOVERY_LINK_SCHEMA_VERSION
+            || self.recovery_format_version != SHARED_PROVIDER_MANIFEST_RECOVERY_FORMAT_VERSION
+            || self.oplog_protocol_version != super::OPLOG_PROTOCOL_VERSION
         {
             return Err(ScenarioError::NonCanonical);
         }
@@ -2616,6 +2771,33 @@ impl SharedProviderTransport {
         )
     }
 
+    pub(crate) fn publish_manifest_recovery(
+        &mut self,
+        link: &SharedProviderManifestRecoveryLinkV1,
+        manifest_bytes: &[u8],
+    ) -> Result<(), ScenarioError> {
+        if super::ContentDigest::of(manifest_bytes) != link.manifest_digest() {
+            return Err(ScenarioError::ProviderConflictingBytes(link.blob_path()));
+        }
+        let blob_path = link.blob_path();
+        if let Some(existing) = self.read_exact(&blob_path)? {
+            if existing != manifest_bytes {
+                return Err(ScenarioError::ProviderConflictingBytes(blob_path));
+            }
+        } else {
+            self.publish(&blob_path, manifest_bytes)?;
+        }
+        let link_bytes = link.encode()?;
+        let link_path = link.path();
+        if let Some(existing) = self.read_exact(&link_path)? {
+            if existing == link_bytes {
+                return Ok(());
+            }
+            return Err(ScenarioError::ProviderConflictingBytes(link_path));
+        }
+        self.publish(&link_path, &link_bytes)
+    }
+
     pub(crate) fn publish_frontier_head(
         &mut self,
         record: &SharedProviderFrontierHeadV1,
@@ -2692,6 +2874,18 @@ impl SharedProviderTransport {
             {
                 MAX_SHARED_PROVIDER_PUBLICATION_INTENT_BYTES
             }
+            None if path.starts_with(&format!(
+                "{SHARED_PROVIDER_MANIFEST_RECOVERY_LINKS_NAMESPACE}/"
+            )) =>
+            {
+                MAX_SHARED_PROVIDER_MANIFEST_RECOVERY_LINK_BYTES
+            }
+            None if path.starts_with(&format!(
+                "{SHARED_PROVIDER_MANIFEST_RECOVERY_BLOBS_NAMESPACE}/"
+            )) =>
+            {
+                super::MAX_MANIFEST_BYTES
+            }
             None => MAX_PROVIDER_RESCAN_BYTES,
         };
         let (parent, name) = self
@@ -2761,6 +2955,8 @@ impl SharedProviderTransport {
                         | PROVIDER_OBJECTS_NAMESPACE
                         | SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE
                         | SHARED_PROVIDER_PUBLICATION_INTENTS_NAMESPACE
+                        | SHARED_PROVIDER_MANIFEST_RECOVERY_LINKS_NAMESPACE
+                        | SHARED_PROVIDER_MANIFEST_RECOVERY_BLOBS_NAMESPACE
                         | PROVIDER_TEMP_NAMESPACE
                         | PROVIDER_REMOVED_NAMESPACE
                         | PROVIDER_RENAME_EVIDENCE_NAMESPACE
@@ -2778,8 +2974,10 @@ impl SharedProviderTransport {
                 (_, 1) => PROVIDER_ENROLLMENT_NAMESPACE,
                 (_, 2) => SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE,
                 (_, 3) => SHARED_PROVIDER_PUBLICATION_INTENTS_NAMESPACE,
-                (true, 4) => PROVIDER_MANIFESTS_NAMESPACE,
-                (true, 5) => PROVIDER_OBJECTS_NAMESPACE,
+                (true, 4) => SHARED_PROVIDER_MANIFEST_RECOVERY_LINKS_NAMESPACE,
+                (true, 5) => SHARED_PROVIDER_MANIFEST_RECOVERY_BLOBS_NAMESPACE,
+                (true, 6) => PROVIDER_MANIFESTS_NAMESPACE,
+                (true, 7) => PROVIDER_OBJECTS_NAMESPACE,
                 _ => return Ok(SharedProviderObservation::Complete),
             };
             if cursor.entries.is_none() {
@@ -10876,9 +11074,11 @@ mod tests {
             17,
             ContentDigest::of(b"accepted frontier root"),
             vec![second, first, second],
+            None,
         )
         .unwrap();
         assert_eq!(head.frontier_tips(), &[first, second]);
+        assert!(!head.has_current_manifest_recovery_coverage());
         let bytes = head.encode().unwrap();
         assert!(bytes.len() <= MAX_SHARED_PROVIDER_FRONTIER_HEAD_BYTES);
         let path = head.path().unwrap();
@@ -10902,6 +11102,24 @@ mod tests {
         let mut differing = bytes;
         differing.extend_from_slice(b" ");
         assert!(SharedProviderFrontierHeadV1::decode(&path, &differing).is_err());
+
+        let accepted_root = ContentDigest::of(b"covered accepted frontier root");
+        let covered = SharedProviderFrontierHeadV1::new(
+            workspace_id,
+            lineage_digest,
+            descriptor_digest,
+            device_id,
+            18,
+            accepted_root,
+            vec![second],
+            Some(accepted_root),
+        )
+        .unwrap();
+        assert!(covered.has_current_manifest_recovery_coverage());
+        assert_eq!(
+            covered.manifest_recovery_coverage_root(),
+            Some(accepted_root)
+        );
     }
 
     #[test]
@@ -10948,6 +11166,58 @@ mod tests {
             serde_json::Value::String(ContentDigest::of(b"different manifest").to_string());
         let reordered = serde_json::to_vec(&reordered).unwrap();
         assert!(SharedProviderPublicationIntentV1::decode(&path, &reordered).is_err());
+    }
+
+    #[test]
+    fn shared_provider_manifest_recovery_is_exact_immutable_and_idempotent() {
+        let root = ScenarioRoot::new().unwrap();
+        let provider_root = root.0.join("provider");
+        let journal_root = root.0.join("private/device/journal");
+        let mut provider = SharedProviderTransport::open(&provider_root, &journal_root).unwrap();
+        let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(0x5f14));
+        let lineage_digest = LineageDigest::of(b"manifest-recovery-lineage");
+        let descriptor_digest = ContentDigest::of(b"manifest-recovery-descriptor");
+        let batch_id = BatchId::from_uuid(Uuid::from_u128(0x5f15));
+        let author = DeviceId::from_uuid(Uuid::from_u128(0x5f16));
+        let manifest_bytes = b"canonical manifest recovery bytes";
+        let link = SharedProviderManifestRecoveryLinkV1::new(
+            workspace_id,
+            lineage_digest,
+            descriptor_digest,
+            batch_id,
+            author,
+            ContentDigest::of(manifest_bytes),
+        )
+        .unwrap();
+        provider
+            .publish_manifest_recovery(&link, manifest_bytes)
+            .unwrap();
+        provider
+            .publish_manifest_recovery(&link, manifest_bytes)
+            .unwrap();
+        assert_eq!(
+            provider.read_exact(&link.path()).unwrap().unwrap(),
+            link.encode().unwrap()
+        );
+        assert_eq!(
+            provider.read_exact(&link.blob_path()).unwrap().unwrap(),
+            manifest_bytes
+        );
+
+        let conflicting_bytes = b"different manifest recovery bytes";
+        let conflicting = SharedProviderManifestRecoveryLinkV1::new(
+            workspace_id,
+            lineage_digest,
+            descriptor_digest,
+            batch_id,
+            author,
+            ContentDigest::of(conflicting_bytes),
+        )
+        .unwrap();
+        assert!(matches!(
+            provider.publish_manifest_recovery(&conflicting, conflicting_bytes),
+            Err(ScenarioError::ProviderConflictingBytes(path)) if path == link.path()
+        ));
     }
 
     #[test]

@@ -533,6 +533,8 @@ fn sparse_provider_observations(
                 "enrollment"
                     | "frontier-heads-v1"
                     | "publication-intents-v1"
+                    | "manifest-recovery-links-v1"
+                    | "manifest-recovery-blobs-v1"
                     | "manifests"
                     | "objects"
             )
@@ -1151,6 +1153,27 @@ mod tests {
         assert_eq!(
             provider_paths,
             vec!["manifests/12345678-1234-1234-1234-123456789abc.manifest".to_owned()]
+        );
+        assert!(!imprecise);
+
+        let recovery = HashSet::from([
+            root.join(
+                ".tine-sync/v2/shared/outbox/manifest-recovery-links-v1/12345678-1234-1234-1234-123456789abc.link",
+            ),
+            root.join(
+                ".tine-sync/v2/shared/outbox/manifest-recovery-blobs-v1/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.manifest",
+            ),
+        ]);
+        let (provider_paths, imprecise) =
+            sparse_provider_observations(&root, &recovery, &HashSet::new());
+        assert_eq!(
+            provider_paths,
+            vec![
+                "manifest-recovery-blobs-v1/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.manifest"
+                    .to_owned(),
+                "manifest-recovery-links-v1/12345678-1234-1234-1234-123456789abc.link"
+                    .to_owned(),
+            ]
         );
         assert!(!imprecise);
 

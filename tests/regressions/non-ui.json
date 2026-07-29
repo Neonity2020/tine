@@ -1369,7 +1369,29 @@
         "scenario": "sync.shared-provider-r6-frontier-head-startup",
         "failBefore": "proven"
       },
-      "notes": "A genuine Safe reopen over more than 64 settled manifests enumerates one device head and zero historical manifest/object paths. Unseen device tips walk exact immutable manifests and digest-addressed objects through the dependency index; empty prototype namespaces fall back once and migrate automatically. Complete namespace repair publishes a durable authenticated covering head before chunked historical republishing and retires each exact manifest-bound intent before the next chunk. The permanent regression uses an isolated test-only head-scan cap of 8 over 12 accepted historical batches, including a crash after head durability; the production cap remains 4,096. Crash cuts before head publication and before old-head retirement, unsafe reopen, duplicate/reordered device heads, generated conflict copies, malformed evidence, and deleted own heads remain bounded and cannot let Safe outrun durable discovery publication."
+      "notes": "A genuine Safe reopen over more than 64 settled manifests enumerates one device head, authenticates only the exact manifests selected by that bounded head payload, and reads zero provider objects or broad historical manifest paths. Unseen device tips walk exact immutable manifests and digest-addressed objects through the dependency index; empty prototype namespaces fall back once and migrate automatically. Complete namespace repair withholds every head and Safe until bounded recovery-mirror backfill plus canonical manifest/object closure repair settle, while retiring each exact manifest-bound crash-ordering intent after that batch's durable repair. The permanent regression uses an isolated test-only head-scan cap of 8 over 12 accepted historical batches and a mirror-before-canonical crash cut; the production cap remains 4,096. Crash cuts before head publication and before old-head retirement, unsafe reopen, duplicate/reordered device heads, generated conflict copies, malformed evidence, and deleted own heads remain bounded and cannot let Safe outrun durable discovery publication."
+    },
+    {
+      "id": "REG-SYNC-SHARED-PROVIDER-R6-RETAINED-EVIDENCE-001",
+      "title": "Recovery-covered provider heads preserve missing canonical ancestor availability for stale peers",
+      "family": "sync-data-safety",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/sync_runtime.rs"
+        ],
+        "scenario": "sync.shared-provider-r6-retained-head-evidence-repair",
+        "failBefore": "proven"
+      },
+      "notes": "Every ordinary manifest publication durably writes an exact batch link and immutable digest-addressed recovery copy before canonical manifest visibility. Recovery authority is bound to the exact accepted-frontier acceptance sequence and state digest: each newly accepted local or provider batch invalidates the prior authority and enters a bounded exact mirror queue, while uncovered legacy state uses bounded cursor backfill. Only a durable current-root covered head can initialize authority on reopen, and no covered head or Safe can outrun mirror, canonical manifest, required object, or dependency-closure repair. Normal intact reopen authenticates only bounded head-selected tips and reads no recovery copies or historical namespace. Permanent same-document regressions cover a missing middle canonical ancestor and the stronger reordered case where a previously covered receiver accepts canonical/object bytes without the mirror, authors a child, crashes, and cannot publish a covered child head or reach Safe before local mirror backfill. After restart and queue settlement, deleting only the middle canonical still lets a stale third peer reconstruct and converge from duplicate/reordered child, head, link, and blob delivery without either author returning. Crash cuts before recovery and after recovery but before canonical, generated conflicts, corruption, and deletion of both exact copies block visibly."
     },
     {
       "id": "REG-SYNC-SHARED-PROVIDER-R6-PUBLICATION-INTENTS-001",
