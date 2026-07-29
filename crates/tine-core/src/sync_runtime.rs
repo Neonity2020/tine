@@ -93,8 +93,9 @@ use crate::oplog::sqlite::ApplicationRuntimeRoot;
 use crate::oplog::watcher_queue::WatcherObservation;
 use crate::oplog::{
     BatchId, BatchOrigin, BlockId, BlockLocation, CanonicalGraphResourceId, ContentDigest,
-    DeviceId, DocumentId, FrontierReferenceHit, LineageDigest, LogicalPageName, LogseqUuid,
-    ManagedPath, ManagedTextKind, MaterializedBlockRow, MaterializedEntityId, MaterializedPageRow,
+    CurrentPageAtPath, DeviceId, DocumentId, EngineError, FrontierReferenceHit, LineageDigest,
+    LogicalPageName, LogseqUuid, ManagedPath, ManagedTextKind, MaterializedBlock,
+    MaterializedBlockRow, MaterializedEntityId, MaterializedPage, MaterializedPageRow,
     MaterializedPropertyRow, MaterializedSearchHit, MaterializedTagRow, MaterializedTaskRow,
     OperationBatch, OperationObject, OperationTransaction, PageId, ProjectionEndpointId,
     ReferenceCatalogPolicyV1, ReferenceFactV1, ReferenceSourceLocatorV1, SemanticOperation,
@@ -4160,8 +4161,8 @@ enum EditorTurnReadiness {
 }
 
 struct EditorCurrentPage {
-    page: MaterializedPageRow,
-    blocks: Vec<MaterializedBlockRow>,
+    page: MaterializedPage,
+    blocks: Vec<MaterializedBlock>,
     dto: SyncEditablePageDto,
 }
 
@@ -9040,28 +9041,20 @@ fn editor_name_state(
     let name = LogicalPageName::parse(name).map_err(|_| {
         SyncEditorRequestError::InvalidRequest(SyncEditorInvalidRequest::InvalidName)
     })?;
-    let read = runtime
-        .database()
-        .materialized_read()
-        .map_err(|_| SyncEditorRequestError::ActorRefused)?;
-    ensure_editor_frontier(runtime, read.acceptance_sequence())?;
     let authenticated_owner = runtime
         .engine()
-        .resolve_logical_page_name(&name)
+        .current_page_for_logical_name(&name)
         .map_err(|_| SyncEditorRequestError::ActorRefused)?;
-    let pages = read
-        .pages_by_name_key_and_kind(&name.canonical_key(), page_kind.into(), 2)
-        .map_err(|_| SyncEditorRequestError::ActorRefused)?;
-    match pages.as_slice() {
-        [page] if authenticated_owner == Some(page.page_id) => {
-            return Ok(EditorNameState::Exact(page.page_id))
-        }
-        [_] => return Ok(EditorNameState::Ambiguous),
-        [_, _, ..] => return Ok(EditorNameState::Ambiguous),
-        [] => {}
-    }
-    if authenticated_owner.is_some() {
-        return Ok(EditorNameState::Ambiguous);
+    if let Some(page_id) = authenticated_owner {
+        let page = runtime
+            .engine()
+            .materialize_page(page_id)
+            .map_err(|_| SyncEditorRequestError::ActorRefused)?;
+        return Ok(if page.kind == page_kind.into() {
+            EditorNameState::Exact(page_id)
+        } else {
+            EditorNameState::Ambiguous
+        });
     }
     let path = graph
         .new_sparse_page_path(name.as_str(), sync_model_page_kind(page_kind))
@@ -9071,12 +9064,17 @@ fn editor_name_state(
     if path.as_str().len() > MAX_LOCAL_MUTATION_PATH_BYTES {
         return Err(editor_too_large(0, 0, 0, path.as_str().len()));
     }
-    if !read
-        .pages_by_path(&path, 1)
+    match runtime
+        .engine()
+        .current_page_at_path(&path)
         .map_err(|_| SyncEditorRequestError::ActorRefused)?
-        .is_empty()
     {
-        return Ok(EditorNameState::PathOccupied);
+        CurrentPageAtPath::Unowned | CurrentPageAtPath::Released(_) => {}
+        CurrentPageAtPath::ExactOwner(_)
+        | CurrentPageAtPath::PortableCollision(_)
+        | CurrentPageAtPath::ReleasedPortableCollision(_) => {
+            return Ok(EditorNameState::PathOccupied)
+        }
     }
     let revision = new_editor_revision(runtime, &name, &path, page_kind)?;
     Ok(EditorNameState::Missing {
@@ -9095,30 +9093,82 @@ fn load_current_editor_page(
         .materialized_read()
         .map_err(|_| SyncEditorRequestError::ActorRefused)?;
     ensure_editor_frontier(runtime, read.acceptance_sequence())?;
-    let Some(page) = read
-        .page(page_id)
-        .map_err(|_| SyncEditorRequestError::ActorRefused)?
-    else {
-        return Ok(None);
+    let authoritative = match runtime.engine().materialize_page(page_id) {
+        Ok(page) => Some(page),
+        Err(EngineError::PageNotFound(_) | EngineError::PageDeleted(_)) => None,
+        Err(_) => return Err(SyncEditorRequestError::ActorRefused),
     };
-    let blocks = read
+    let page = read
+        .page(page_id)
+        .map_err(|_| SyncEditorRequestError::ActorRefused)?;
+    let projected_blocks = read
         .blocks_on_page(page_id, MAX_SYNC_EDITOR_BLOCKS + 1)
         .map_err(|_| SyncEditorRequestError::ActorRefused)?;
-    if blocks.len() > MAX_SYNC_EDITOR_BLOCKS {
-        return Err(editor_too_large(blocks.len(), 0, 0, 0));
+    if projected_blocks.len() > MAX_SYNC_EDITOR_BLOCKS {
+        return Err(editor_too_large(projected_blocks.len(), 0, 0, 0));
     }
-    let ordered = ordered_editor_blocks(&blocks)?;
+    let Some(authoritative) = authoritative else {
+        return if page.is_none() && projected_blocks.is_empty() {
+            Ok(None)
+        } else {
+            Err(SyncEditorRequestError::ActorRefused)
+        };
+    };
+    if authoritative.blocks.len() > MAX_SYNC_EDITOR_BLOCKS {
+        return Err(editor_too_large(authoritative.blocks.len(), 0, 0, 0));
+    }
+    let Some(projected_page) = page else {
+        return Err(SyncEditorRequestError::ActorRefused);
+    };
+    if !editor_projection_matches(&authoritative, &projected_page, &projected_blocks) {
+        return Err(SyncEditorRequestError::ActorRefused);
+    }
+    let ordered = ordered_editor_blocks(&authoritative.blocks)?;
     let mut dto = SyncEditablePageDto {
-        page_id: page.page_id.to_string(),
-        name: page.name.clone(),
-        path: page.path.to_string(),
-        page_kind: page.kind.into(),
-        preamble: page.preamble.clone(),
+        page_id: authoritative.page_id.to_string(),
+        name: authoritative.name.as_str().to_owned(),
+        path: authoritative.path.to_string(),
+        page_kind: authoritative.kind.into(),
+        preamble: authoritative.preamble.clone(),
         blocks: ordered,
         revision: String::new(),
     };
     dto.revision = existing_editor_revision(runtime, &dto)?;
-    Ok(Some(EditorCurrentPage { page, blocks, dto }))
+    let blocks = authoritative.blocks.clone();
+    Ok(Some(EditorCurrentPage {
+        page: authoritative,
+        blocks,
+        dto,
+    }))
+}
+
+fn editor_projection_matches(
+    authoritative: &MaterializedPage,
+    page: &MaterializedPageRow,
+    blocks: &[MaterializedBlockRow],
+) -> bool {
+    page.page_id == authoritative.page_id
+        && page.home_document_id == authoritative.home_document_id
+        && page.name == authoritative.name.as_str()
+        && page.name_key == authoritative.name.canonical_key()
+        && page.path == authoritative.path
+        && page.kind == authoritative.kind
+        && page.preamble == authoritative.preamble
+        && blocks.len() == authoritative.blocks.len()
+        && authoritative
+            .blocks
+            .iter()
+            .zip(blocks)
+            .all(|(authoritative, block)| {
+                block.block_id == authoritative.block_id
+                    && block.page_id == page.page_id
+                    && block.home_document_id == authoritative.home_document_id
+                    && block.parent == authoritative.parent
+                    && block.order == authoritative.order
+                    && block.content == authoritative.content
+                    && block.logseq_uuid == authoritative.logseq_uuid
+                    && block.logseq_identity_origin == authoritative.logseq_identity_origin
+            })
 }
 
 fn ensure_editor_frontier(
@@ -9136,7 +9186,7 @@ fn ensure_editor_frontier(
 }
 
 fn ordered_editor_blocks(
-    blocks: &[MaterializedBlockRow],
+    blocks: &[MaterializedBlock],
 ) -> Result<Vec<SyncEditorBlockDto>, SyncEditorRequestError> {
     let mut indexes = HashMap::with_capacity(blocks.len());
     for (index, block) in blocks.iter().enumerate() {
@@ -10667,6 +10717,112 @@ mod tests {
     }
 
     #[test]
+    fn editor_projection_match_covers_every_existing_mutation_base() {
+        let page_id = PageId::from_uuid(Uuid::new_v4());
+        let home_document_id = DocumentId::from_uuid(Uuid::new_v4());
+        let first = BlockId::from_uuid(Uuid::new_v4());
+        let second = BlockId::from_uuid(Uuid::new_v4());
+        let authoritative = MaterializedPage {
+            page_id,
+            home_document_id,
+            name: LogicalPageName::parse("Authority bases").unwrap(),
+            path: ManagedPath::parse("pages/authority-bases.md").unwrap(),
+            kind: ManagedTextKind::Page,
+            preamble: Some("title:: Authority bases".into()),
+            blocks: vec![
+                MaterializedBlock {
+                    block_id: first,
+                    home_document_id,
+                    parent: None,
+                    order: "a".into(),
+                    logseq_uuid: None,
+                    logseq_identity_origin: None,
+                    content: "first".into(),
+                },
+                MaterializedBlock {
+                    block_id: second,
+                    home_document_id,
+                    parent: Some(first),
+                    order: "b".into(),
+                    logseq_uuid: None,
+                    logseq_identity_origin: None,
+                    content: "second".into(),
+                },
+            ],
+            stats: crate::oplog::MaterializationStats {
+                catalog_documents_loaded: 1,
+                membership_documents_loaded: 1,
+                home_documents_loaded: 1,
+                distinct_home_documents: vec![home_document_id],
+                physical_manifest_reads: 0,
+                physical_object_reads: 0,
+            },
+        };
+        let page = MaterializedPageRow {
+            page_id,
+            home_document_id,
+            name: authoritative.name.as_str().into(),
+            name_key: authoritative.name.canonical_key(),
+            path: authoritative.path.clone(),
+            kind: authoritative.kind,
+            preamble: authoritative.preamble.clone(),
+            searchable_text: "Authority bases".into(),
+        };
+        let blocks = authoritative
+            .blocks
+            .iter()
+            .map(|block| MaterializedBlockRow {
+                block_id: block.block_id,
+                page_id,
+                home_document_id: block.home_document_id,
+                parent: block.parent,
+                order: block.order.clone(),
+                content: block.content.clone(),
+                searchable_text: block.content.clone(),
+                heading_level: None,
+                collapsed: false,
+                logseq_uuid: block.logseq_uuid,
+                logseq_identity_origin: block.logseq_identity_origin,
+            })
+            .collect::<Vec<_>>();
+        assert!(editor_projection_matches(&authoritative, &page, &blocks));
+
+        let mut corrupted_page = page.clone();
+        corrupted_page.preamble = Some("counterfeit preamble".into());
+        assert!(!editor_projection_matches(
+            &authoritative,
+            &corrupted_page,
+            &blocks
+        ));
+        let mut corrupted_blocks = blocks.clone();
+        corrupted_blocks[0].content = "counterfeit content".into();
+        assert!(!editor_projection_matches(
+            &authoritative,
+            &page,
+            &corrupted_blocks
+        ));
+        let mut corrupted_blocks = blocks.clone();
+        corrupted_blocks[1].parent = None;
+        assert!(!editor_projection_matches(
+            &authoritative,
+            &page,
+            &corrupted_blocks
+        ));
+        let mut corrupted_blocks = blocks.clone();
+        corrupted_blocks[1].order = "counterfeit order".into();
+        assert!(!editor_projection_matches(
+            &authoritative,
+            &page,
+            &corrupted_blocks
+        ));
+        assert!(!editor_projection_matches(
+            &authoritative,
+            &page,
+            &blocks[..1]
+        ));
+    }
+
+    #[test]
     fn public_name_lookup_matches_og_names_across_nested_supported_extensions() {
         let fixture = RuntimeHostFixture::safe("sync-runtime-name-query");
         let handle = active_handle(SyncRuntimeHandle::open(fixture.request()));
@@ -10725,7 +10881,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_logical_name_query_and_editor_load_refuse_ambiguity() {
+    fn sqlite_name_counterfeit_cannot_authorize_or_block_editor_name_mutations() {
         let fixture = RuntimeHostFixture::safe("sync-runtime-name-ambiguity");
         let request = fixture.request();
         let database_path = request.database_path.clone();
@@ -10764,17 +10920,9 @@ mod tests {
                 .unwrap(),
             SyncRuntimeQueryReply::PageName(SyncPageNameResolutionDto::Ambiguous)
         );
-        assert_eq!(
-            handle
-                .load_editor_page(SyncEditorLoadRequest {
-                    page: SyncEditorPageSelector::Name {
-                        name: "Duplicate Owner".into(),
-                        page_kind: SyncPageKind::Page,
-                    },
-                })
-                .unwrap(),
-            SyncEditorLoadOutcome::AmbiguousPageName
-        );
+        let loaded = load_editor_named(&handle, "Duplicate Owner", SyncPageKind::Page);
+        assert_eq!(loaded.path, path);
+        assert_eq!(loaded.blocks[0].content, "first owner");
         let manifests_before = fixture.manifest_count();
         let applied_before = fixture.applied_batch_count();
         let files_before = snapshot_graph_files(fixture.graph_root());
@@ -10792,7 +10940,7 @@ mod tests {
                 })
                 .unwrap(),
             SyncEditorSaveOutcome::Conflict {
-                reason: SyncEditorConflict::AmbiguousPageName
+                reason: SyncEditorConflict::PageAlreadyExists
             }
         );
         assert_eq!(fixture.manifest_count(), manifests_before);
@@ -10804,6 +10952,97 @@ mod tests {
             .execute(
                 "DELETE FROM pages WHERE page_id = ?1",
                 rusqlite::params![duplicate_page.as_bytes().as_slice()],
+            )
+            .unwrap();
+        drop(connection);
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
+    fn authenticated_path_owner_blocks_new_editor_page_when_sqlite_hides_it() {
+        let fixture = RuntimeHostFixture::safe("sync-runtime-editor-path-authority");
+        let request = fixture.request();
+        let database_path = request.database_path.clone();
+        let handle = active_handle(SyncRuntimeHandle::open(request));
+        drive_initial_feed(&handle);
+
+        let draft = match handle
+            .load_editor_page(SyncEditorLoadRequest {
+                page: SyncEditorPageSelector::Name {
+                    name: "Derived Occupied".into(),
+                    page_kind: SyncPageKind::Page,
+                },
+            })
+            .unwrap()
+        {
+            SyncEditorLoadOutcome::NewPage { draft } => draft,
+            other => panic!("missing name did not produce an editor draft: {other:?}"),
+        };
+        let derived_path = Graph::open(fixture.graph_root())
+            .new_sparse_page_path("Derived Occupied", PageKind::Page)
+            .unwrap();
+        admit_external_page(
+            &handle,
+            &fixture,
+            derived_path.as_str(),
+            b"title:: Different Owner\n\n- path owner\n",
+        );
+        let owner = load_editor_named(&handle, "Different Owner", SyncPageKind::Page);
+        assert_eq!(owner.path, derived_path.as_str());
+
+        let connection = rusqlite::Connection::open(&database_path).unwrap();
+        connection
+            .execute(
+                "UPDATE pages SET path = ?1 WHERE page_id = ?2",
+                rusqlite::params![
+                    "counterfeit/hidden-owner.md",
+                    Uuid::parse_str(&owner.page_id)
+                        .unwrap()
+                        .as_bytes()
+                        .as_slice(),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            handle
+                .load_editor_page(SyncEditorLoadRequest {
+                    page: SyncEditorPageSelector::Name {
+                        name: draft.name.clone(),
+                        page_kind: draft.page_kind,
+                    },
+                })
+                .unwrap(),
+            SyncEditorLoadOutcome::AmbiguousPageName
+        );
+        assert_eq!(
+            handle
+                .save_editor_page(SyncEditorSaveRequest {
+                    target: SyncEditorSaveTarget::New {
+                        name: draft.name,
+                        page_kind: draft.page_kind,
+                        revision: draft.revision,
+                    },
+                    preamble: None,
+                    blocks: Vec::new(),
+                })
+                .unwrap(),
+            SyncEditorSaveOutcome::Conflict {
+                reason: SyncEditorConflict::DerivedPathOccupied
+            }
+        );
+        connection
+            .execute(
+                "UPDATE pages SET path = ?1 WHERE page_id = ?2",
+                rusqlite::params![
+                    derived_path.as_str(),
+                    Uuid::parse_str(&owner.page_id)
+                        .unwrap()
+                        .as_bytes()
+                        .as_slice(),
+                ],
             )
             .unwrap();
         drop(connection);
@@ -10998,6 +11237,201 @@ mod tests {
             handle.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(_)
         ));
+    }
+
+    #[test]
+    fn interior_sqlite_counterfeit_cannot_become_durable_editor_truth() {
+        const BLOCK_COUNT: usize = 128;
+        const ORIGINAL: &[u8] = b"authoritative-row";
+        const COUNTERFEIT: &[u8] = b"counterfeited-row";
+
+        let fixture = RuntimeHostFixture::safe("sync-runtime-editor-interior-corruption");
+        let request = fixture.request();
+        let first = active_handle(SyncRuntimeHandle::open(request.clone()));
+        drive_initial_feed(&first);
+        let draft = match first
+            .load_editor_page(SyncEditorLoadRequest {
+                page: SyncEditorPageSelector::Name {
+                    name: "Editor corruption authority".into(),
+                    page_kind: SyncPageKind::Page,
+                },
+            })
+            .unwrap()
+        {
+            SyncEditorLoadOutcome::NewPage { draft } => draft,
+            other => panic!("corruption fixture did not produce a new-page draft: {other:?}"),
+        };
+        let created = first
+            .save_editor_page(SyncEditorSaveRequest {
+                target: SyncEditorSaveTarget::New {
+                    name: draft.name,
+                    page_kind: draft.page_kind,
+                    revision: draft.revision,
+                },
+                preamble: Some("authority:: oplog".into()),
+                blocks: (0..BLOCK_COUNT)
+                    .map(|index| SyncEditorBlockDto {
+                        key: SyncEditorBlockKey::Temporary(format!("block-{index}")),
+                        parent: None,
+                        content: format!("authoritative-row-{index:04}-{}", "x".repeat(192)),
+                    })
+                    .collect(),
+            })
+            .unwrap();
+        let created = match created {
+            SyncEditorSaveOutcome::Durable { page, .. } => page,
+            SyncEditorSaveOutcome::Deferred {
+                state: SyncEditorDeferred::RetryableRetainedPublication { .. },
+                ..
+            } => {
+                settle_local_mutation(&first);
+                load_editor_named(&first, "Editor corruption authority", SyncPageKind::Page)
+            }
+            other => panic!("large corruption fixture was not durable: {other:?}"),
+        };
+        let page_id = parse_editor_page_id(&created.page_id).unwrap();
+        let page_path = created.path.clone();
+        assert!(matches!(
+            first.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+
+        let patched = crate::oplog::sqlite::corrupt_equal_length_interior_block_payload(
+            &request.database_path,
+            ORIGINAL,
+            COUNTERFEIT,
+        );
+        assert!(patched > 0);
+        let reopened = active_handle(SyncRuntimeHandle::open(request.clone()));
+        drive_initial_feed(&reopened);
+        let manifests_before_refusal = fixture.manifest_count();
+        let load = reopened.load_editor_page(SyncEditorLoadRequest {
+            page: SyncEditorPageSelector::PageId {
+                page_id: page_id.to_string(),
+            },
+        });
+
+        if let Ok(SyncEditorLoadOutcome::Loaded { mut page }) = load {
+            let counterfeit = page
+                .blocks
+                .iter_mut()
+                .find(|block| block.content.starts_with("counterfeited-row-"))
+                .expect("vulnerable editor load did not expose the counterfeit row");
+            counterfeit.content.push_str(" honest-editor-suffix");
+            let outcome = reopened
+                .save_editor_page(SyncEditorSaveRequest {
+                    target: SyncEditorSaveTarget::Existing {
+                        page_id: page.page_id,
+                        revision: page.revision,
+                    },
+                    preamble: page.preamble,
+                    blocks: page.blocks,
+                })
+                .unwrap();
+            match outcome {
+                SyncEditorSaveOutcome::Durable { .. } => {}
+                SyncEditorSaveOutcome::Deferred {
+                    state: SyncEditorDeferred::RetryableRetainedPublication { .. },
+                    ..
+                } => {
+                    settle_local_mutation(&reopened);
+                }
+                other => panic!("vulnerable editor did not retain or save: {other:?}"),
+            }
+            assert!(matches!(
+                reopened.clean_shutdown().unwrap(),
+                SyncShutdownOutcome::Safe(_)
+            ));
+            let replayed = fixture.replay_materialized_page(page_id);
+            assert!(
+                replayed.blocks.iter().any(|block| {
+                    block.content.starts_with("counterfeited-row-")
+                        && block.content.ends_with(" honest-editor-suffix")
+                }),
+                "vulnerable save did not enter clean oplog replay: {replayed:?}"
+            );
+            panic!("SQLite counterfeit crossed the public editor mutation boundary");
+        }
+        assert_eq!(load, Err(SyncEditorRequestError::ActorRefused));
+        assert_eq!(fixture.manifest_count(), manifests_before_refusal);
+
+        let file = fixture.graph_root().join(&page_path);
+        let mut honest_graph = fs::read_to_string(&file).unwrap();
+        honest_graph.push_str("- accepted affected-page rebuild\n");
+        fs::write(&file, honest_graph).unwrap();
+        reopened
+            .observe_watcher(vec![
+                SyncWatcherObservation::managed_path(&page_path).unwrap()
+            ])
+            .unwrap();
+        settle_exact_feed(&reopened)
+            .unwrap_or_else(|state| panic!("affected-page rebuild did not settle: {state:?}"));
+
+        let mut repaired =
+            load_editor_named(&reopened, "Editor corruption authority", SyncPageKind::Page);
+        assert!(repaired
+            .blocks
+            .iter()
+            .all(|block| !block.content.starts_with("counterfeited-row-")));
+        let edited = repaired
+            .blocks
+            .iter_mut()
+            .find(|block| block.content.starts_with("authoritative-row-0064-"))
+            .expect("repaired page lost the target editor block");
+        edited.content.push_str(" honest-editor-suffix");
+        let saved = reopened
+            .save_editor_page(SyncEditorSaveRequest {
+                target: SyncEditorSaveTarget::Existing {
+                    page_id: repaired.page_id.clone(),
+                    revision: repaired.revision,
+                },
+                preamble: repaired.preamble,
+                blocks: repaired.blocks,
+            })
+            .unwrap();
+        let saved = match saved {
+            SyncEditorSaveOutcome::Durable { page, .. } => page,
+            SyncEditorSaveOutcome::Deferred {
+                state: SyncEditorDeferred::RetryableRetainedPublication { .. },
+                ..
+            } => {
+                settle_local_mutation(&reopened);
+                load_editor_named(&reopened, "Editor corruption authority", SyncPageKind::Page)
+            }
+            other => panic!("repaired editor save was not durable: {other:?}"),
+        };
+        assert!(matches!(
+            reopened.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+
+        let replayed = fixture.replay_materialized_page(page_id);
+        assert_eq!(replayed.stats.catalog_documents_loaded, 1);
+        assert_eq!(replayed.stats.membership_documents_loaded, 1);
+        assert_eq!(replayed.stats.home_documents_loaded, 1);
+        assert!(replayed
+            .blocks
+            .iter()
+            .all(|block| !block.content.starts_with("counterfeited-row-")));
+        assert!(replayed
+            .blocks
+            .iter()
+            .any(|block| block.content.ends_with(" honest-editor-suffix")));
+        let projected = rusqlite::Connection::open(&request.database_path)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM blocks
+                 WHERE page_id = ?1 AND content LIKE 'counterfeited-row-%'",
+                rusqlite::params![page_id.as_uuid().as_bytes().as_slice()],
+                |row| row.get::<_, usize>(0),
+            )
+            .unwrap();
+        assert_eq!(projected, 0);
+        let graph = fs::read_to_string(file).unwrap();
+        assert!(graph.contains("accepted affected-page rebuild"));
+        assert!(graph.contains("honest-editor-suffix"));
+        assert!(!graph.contains("counterfeited-row-"));
+        assert_eq!(saved.page_id, page_id.to_string());
     }
 
     #[test]

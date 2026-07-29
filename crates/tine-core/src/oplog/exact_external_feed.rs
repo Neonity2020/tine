@@ -2679,6 +2679,28 @@ pub(crate) mod tests {
                 .unwrap()
         }
 
+        pub(crate) fn replay_materialized_page(
+            &self,
+            page_id: PageId,
+        ) -> crate::oplog::MaterializedPage {
+            let enrollment = enrollment_application_root_for_test(&self.enrollment_path).unwrap();
+            let (mut authority, mut runtime) = reopen_promoted_local_runtime(
+                &enrollment,
+                &self.fixture.enrollment_binding(),
+                SessionId::new(),
+                &self.paths.open(&self.fixture, &self.fixture.graph),
+            )
+            .unwrap();
+            let page = runtime.engine().materialize_page(page_id).unwrap();
+            runtime
+                .quiesce_and_mark_safe_without_watcher_dependency_for_test(
+                    &mut authority,
+                    &self.fixture.graph,
+                )
+                .unwrap();
+            page
+        }
+
         pub(crate) fn handoff(&self) -> EnrollmentDiscoveryHandoff {
             let graph_resource_id = self.fixture.graph.canonical_resource_id().unwrap();
             let classification = crate::oplog::discovery::discover_startup(

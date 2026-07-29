@@ -8597,6 +8597,71 @@ fn rewrite_raw_page_targets(
 }
 
 #[cfg(test)]
+pub(crate) fn corrupt_equal_length_interior_block_payload(
+    database_path: &Path,
+    original: &[u8],
+    counterfeit: &[u8],
+) -> usize {
+    assert_eq!(
+        original.len(),
+        counterfeit.len(),
+        "interior corruption helper requires an equal-length replacement"
+    );
+    assert!(
+        !original.is_empty(),
+        "interior corruption helper requires a non-empty payload"
+    );
+    let connection = Connection::open(database_path).unwrap();
+    connection
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .unwrap();
+    let page_size: usize = connection
+        .query_row("PRAGMA page_size", [], |row| row.get::<_, usize>(0))
+        .unwrap();
+    let block_pages = {
+        let mut statement = connection
+            .prepare("SELECT pageno FROM dbstat WHERE name = 'blocks' ORDER BY pageno")
+            .unwrap();
+        statement
+            .query_map([], |row| row.get::<_, usize>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    drop(connection);
+
+    let mut bytes = fs::read(database_path).unwrap();
+    assert!(
+        bytes.len() > PROJECTION_FINGERPRINT_CHUNK_BYTES * 2,
+        "fixture database is too small to have an unauthenticated interior"
+    );
+    let interior_end = bytes.len() - PROJECTION_FINGERPRINT_CHUNK_BYTES;
+    let mut patched = 0;
+    for page in block_pages {
+        let page_start = page.saturating_sub(1).saturating_mul(page_size);
+        let start = page_start.max(PROJECTION_FINGERPRINT_CHUNK_BYTES);
+        let end = page_start
+            .saturating_add(page_size)
+            .min(interior_end)
+            .saturating_sub(original.len());
+        if start <= end {
+            for offset in start..=end {
+                if &bytes[offset..offset + original.len()] == original {
+                    bytes[offset..offset + counterfeit.len()].copy_from_slice(counterfeit);
+                    patched += 1;
+                }
+            }
+        }
+    }
+    assert!(
+        patched > 0,
+        "fixture found no block-table payload in the unauthenticated database interior"
+    );
+    fs::write(database_path, bytes).unwrap();
+    patched
+}
+
+#[cfg(test)]
 mod tests {
     use std::fs;
     use std::io::{BufRead as _, BufReader};
