@@ -57,7 +57,9 @@ const MAX_PENDING_PAGE: usize = 256;
 const MAX_COMPLETED_PATH_ROW_BYTES: usize = MAX_WORK_ROW_BYTES as usize;
 const MAX_PREFLIGHT_NODES: usize = 2_000_000;
 const MAX_PREFLIGHT_RECORDS: usize = 2_000_000;
-const MAX_PREFLIGHT_ROOTS: usize = 2_000_000;
+// Sealed open authenticates exactly the current head root. Historical source
+// roots are loaded by bounded exact lookup outside preflight when work is used.
+const MAX_PREFLIGHT_ROOTS: usize = 1;
 const MAX_PREFLIGHT_BYTES: usize = 512 * 1024 * 1024;
 // The bounded joined read keeps the encoded input live while postcard decodes
 // heap-backed fields and re-encodes once to prove canonicality. For the
@@ -829,11 +831,8 @@ struct ProjectionWorkPreflightStats {
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum PreflightTree {
-    Rows,
     Ready,
     Paths,
-    CompletedPaths,
-    Accepted,
     Pending,
 }
 
@@ -1006,32 +1005,34 @@ impl ProjectionWorkIndex {
             .store(stats.bytes, Ordering::Relaxed);
     }
 
-    /// Validate exactly the records reachable from the current authenticated
-    /// root. Complexity is O(reachable nodes + reachable records + referenced
-    /// pending-source roots/prepared batches); unrelated archived roots and
-    /// prepared files are never enumerated.
+    /// Validate the current activation working set rooted in the authenticated
+    /// head. The insert-only accepted, row, and completed-path trees are
+    /// authenticated by their root digests but are point-validated only when
+    /// an affected work item or completion is recovered/used.
+    ///
+    /// Complexity is O(current pending tree + current ready/path trees +
+    /// fixed-depth exact row lookups + current prepared bytes), independent of
+    /// completed or accepted lifetime history. The fixed preflight limits
+    /// therefore cap the current recovery working set, not store age.
     fn preflight_reachable(
         &self,
         root: &ProjectionRoot,
     ) -> Result<ProjectionWorkPreflightStats, ProjectionWorkError> {
-        let mut stats = ProjectionWorkPreflightStats {
-            roots: 1,
-            ..ProjectionWorkPreflightStats::default()
-        };
+        let mut stats = ProjectionWorkPreflightStats::default();
+        charge_preflight(&mut stats.roots, 1, MAX_PREFLIGHT_ROOTS)?;
         charge_preflight(
             &mut stats.bytes,
             encode_canonical(root)?.len(),
             MAX_PREFLIGHT_BYTES,
         )?;
         let mut pending = vec![
-            (PreflightTree::Rows, root.rows_root),
             (PreflightTree::Ready, root.ready_root),
             (PreflightTree::Paths, root.paths_root),
-            (PreflightTree::CompletedPaths, root.completed_paths_root),
-            (PreflightTree::Accepted, root.accepted_root),
             (PreflightTree::Pending, root.pending_root),
         ];
         let mut visited = std::collections::BTreeSet::new();
+        let mut ready_work = std::collections::BTreeMap::new();
+        let mut path_work = std::collections::BTreeMap::new();
         while let Some((tree, digest)) = pending.pop() {
             if digest == empty_tree_root() || !visited.insert((tree, digest)) {
                 continue;
@@ -1045,37 +1046,59 @@ impl ProjectionWorkIndex {
                 IndexNode::Leaf { key, value, .. } => {
                     charge_preflight(&mut stats.records, 1, MAX_PREFLIGHT_RECORDS)?;
                     match tree {
-                        PreflightTree::Rows => {
-                            let state: StoredWork = decode_canonical(&value)?;
-                            if state.schema_version != INDEX_SCHEMA_VERSION {
-                                return Err(ProjectionWorkError::BindingMismatch);
-                            }
-                            self.require_binding(&state.work)?;
-                        }
                         PreflightTree::Ready => {
-                            decode_work_id(&value)?;
-                        }
-                        PreflightTree::Paths => {
-                            let ids: Vec<ProjectionWorkId> = decode_canonical(&value)?;
-                            if !strictly_sorted(&ids) {
+                            let work_id = decode_work_id(&value)?;
+                            if ready_work.insert(work_id, key).is_some() {
                                 return Err(ProjectionWorkError::NonCanonical);
                             }
                         }
-                        PreflightTree::CompletedPaths => {
-                            let row = decode_completed_path_row(&key, &value)?;
-                            validate_completed_path_row_history_binding(root, &row)?;
+                        PreflightTree::Paths => {
+                            let ids: Vec<ProjectionWorkId> = decode_canonical(&value)?;
+                            if ids.is_empty() || !strictly_sorted(&ids) {
+                                return Err(ProjectionWorkError::NonCanonical);
+                            }
+                            for work_id in ids {
+                                charge_preflight(&mut stats.records, 1, MAX_PREFLIGHT_RECORDS)?;
+                                if path_work.insert(work_id, key.clone()).is_some() {
+                                    return Err(ProjectionWorkError::NonCanonical);
+                                }
+                            }
                         }
                         PreflightTree::Pending => {
                             let activation: ProjectionPendingActivation = decode_canonical(&value)?;
+                            if batch_key(activation.batch_id) != key {
+                                return Err(ProjectionWorkError::PendingActivationMismatch);
+                            }
                             self.require_pending_binding(&activation)?;
                             self.preflight_prepared(&activation, &mut stats)?;
                         }
-                        PreflightTree::Accepted => {
-                            let witness: AcceptedBatchWitness = decode_canonical(&value)?;
-                            self.preflight_accepted(&witness, &mut stats)?;
-                        }
                     }
                 }
+            }
+        }
+        if !ready_work.keys().eq(path_work.keys()) {
+            return Err(ProjectionWorkError::MissingReadyRow);
+        }
+        for (work_id, stored_ready_key) in ready_work {
+            charge_preflight(&mut stats.records, 1, MAX_PREFLIGHT_RECORDS)?;
+            let value = self
+                .preflight_lookup(root.rows_root, &work_key(work_id), &mut stats)?
+                .ok_or(ProjectionWorkError::MissingReadyRow)?;
+            let state: StoredWork = decode_canonical(&value)?;
+            if state.schema_version != INDEX_SCHEMA_VERSION
+                || state.work.work_id() != work_id
+                || !matches!(state.status, StoredWorkStatus::Ready)
+            {
+                return Err(ProjectionWorkError::MissingReadyRow);
+            }
+            self.require_binding(&state.work)?;
+            if ready_key(&state.work)? != stored_ready_key
+                || path_key(state.work.path())
+                    != *path_work
+                        .get(&work_id)
+                        .ok_or(ProjectionWorkError::MissingReadyRow)?
+            {
+                return Err(ProjectionWorkError::MissingReadyRow);
             }
         }
         Ok(stats)
@@ -1124,44 +1147,6 @@ impl ProjectionWorkIndex {
             return Err(ProjectionWorkError::PendingActivationMismatch);
         }
         Ok(())
-    }
-
-    fn preflight_accepted(
-        &self,
-        witness: &AcceptedBatchWitness,
-        stats: &mut ProjectionWorkPreflightStats,
-    ) -> Result<(), ProjectionWorkError> {
-        if witness.schema_version != INDEX_SCHEMA_VERSION
-            || witness.workspace_id != self.workspace_id
-            || witness.endpoint_id != self.endpoint_id
-            || !strictly_sorted(&witness.work_ids)
-        {
-            return Err(ProjectionWorkError::AcceptedWitnessMismatch);
-        }
-        charge_preflight(&mut stats.roots, 1, MAX_PREFLIGHT_ROOTS)?;
-        let source_root = self.load_root(witness.pending_root_digest)?;
-        charge_preflight(
-            &mut stats.bytes,
-            encode_canonical(&source_root)?.len(),
-            MAX_PREFLIGHT_BYTES,
-        )?;
-        let value = self
-            .preflight_lookup(
-                source_root.pending_root,
-                &batch_key(witness.batch_id),
-                stats,
-            )?
-            .ok_or(ProjectionWorkError::PendingActivationMissing)?;
-        let pending: ProjectionPendingActivation = decode_canonical(&value)?;
-        self.require_pending_binding(&pending)?;
-        if witness.batch_id != pending.batch_id
-            || witness.manifest_fingerprint != pending.manifest_fingerprint
-            || witness.prepared_digest != pending.prepared_digest
-            || witness.work_ids != pending.work_ids
-        {
-            return Err(ProjectionWorkError::AcceptedWitnessMismatch);
-        }
-        self.preflight_prepared(&pending, stats)
     }
 
     fn preflight_lookup(
@@ -1706,13 +1691,8 @@ impl ProjectionWorkIndex {
             .tree_lookup(root.accepted_root, &batch_key(batch_id))?
             .ok_or(ProjectionWorkError::AcceptedWitnessMissing)?;
         let witness: AcceptedBatchWitness = decode_canonical(&bytes)?;
-        if witness.schema_version != INDEX_SCHEMA_VERSION
-            || witness.workspace_id != self.workspace_id
-            || witness.endpoint_id != self.endpoint_id
-            || witness.batch_id != batch_id
-            || witness.manifest_fingerprint != manifest_fingerprint
-            || !strictly_sorted(&witness.work_ids)
-        {
+        self.require_accepted_source(&witness)?;
+        if witness.batch_id != batch_id || witness.manifest_fingerprint != manifest_fingerprint {
             return Err(ProjectionWorkError::AcceptedWitnessMismatch);
         }
         let mut found = None;
@@ -3035,6 +3015,34 @@ impl ProjectionWorkIndex {
         Ok(())
     }
 
+    fn require_accepted_source(
+        &self,
+        witness: &AcceptedBatchWitness,
+    ) -> Result<(), ProjectionWorkError> {
+        if witness.schema_version != INDEX_SCHEMA_VERSION
+            || witness.workspace_id != self.workspace_id
+            || witness.endpoint_id != self.endpoint_id
+            || !strictly_sorted(&witness.work_ids)
+        {
+            return Err(ProjectionWorkError::AcceptedWitnessMismatch);
+        }
+        let source_root = self.load_root(witness.pending_root_digest)?;
+        let source = self
+            .tree_lookup(source_root.pending_root, &batch_key(witness.batch_id))?
+            .ok_or(ProjectionWorkError::PendingActivationMissing)?;
+        let source: ProjectionPendingActivation = decode_canonical(&source)?;
+        self.require_pending_binding(&source)?;
+        self.require_pending_prepared(&source)?;
+        if source.batch_id != witness.batch_id
+            || source.manifest_fingerprint != witness.manifest_fingerprint
+            || source.prepared_digest != witness.prepared_digest
+            || source.work_ids != witness.work_ids
+        {
+            return Err(ProjectionWorkError::AcceptedWitnessMismatch);
+        }
+        Ok(())
+    }
+
     fn tree_lookup(
         &self,
         root: ContentDigest,
@@ -3899,42 +3907,6 @@ fn decode_completed_path_row_bounded(
     Ok(row)
 }
 
-fn validate_completed_path_row_history_binding(
-    root: &ProjectionRoot,
-    row: &ProjectionCompletedPathRow,
-) -> Result<(), ProjectionWorkError> {
-    let source = match row {
-        ProjectionCompletedPathRow::Current(ProjectionCurrentCompletedPath {
-            source:
-                ProjectionCompletedPathSource::Direct {
-                    engine_history_generation,
-                    engine_history_root,
-                },
-            ..
-        })
-        | ProjectionCompletedPathRow::Ambiguous {
-            engine_history_generation,
-            engine_history_root,
-            ..
-        } => Some((*engine_history_generation, *engine_history_root)),
-        ProjectionCompletedPathRow::Current(ProjectionCurrentCompletedPath {
-            source: ProjectionCompletedPathSource::Manifested { .. },
-            ..
-        }) => None,
-    };
-    if let Some((generation, history_root)) = source {
-        if generation == 0
-            || generation > root.engine_history_generation
-            || history_root == super::object_store::EngineHistoryStore::empty_root()
-            || (generation == root.engine_history_generation
-                && history_root != root.engine_history_root)
-        {
-            return Err(ProjectionWorkError::HistoryBindingMismatch);
-        }
-    }
-    Ok(())
-}
-
 fn encode_completed_path_row(
     row: &ProjectionCompletedPathRow,
 ) -> Result<Vec<u8>, ProjectionWorkError> {
@@ -4334,6 +4306,17 @@ mod tests {
                 receipt_store_id: self.index.receipt_store_id(),
             }
         }
+
+        fn reopen_index(&self) -> ProjectionWorkIndex {
+            ProjectionWorkIndex::open_sealed_existing(
+                self.index.control.try_clone().unwrap(),
+                self.workspace_id,
+                self.endpoint_id,
+                self.graph_resource_id,
+                self.index.receipt_store_id(),
+            )
+            .unwrap()
+        }
     }
 
     impl Drop for Fixture {
@@ -4366,7 +4349,7 @@ mod tests {
     }
 
     #[test]
-    fn enrolled_seal_rejects_reachable_future_prepared_work_without_mutation() {
+    fn enrolled_seal_rejects_current_pending_prepared_corruption_without_mutation() {
         let fixture = Fixture::new("future-prepared-preflight");
         let work = fixture.work(1, "pages/future-prepared.md");
         fixture.prepare(&work);
@@ -4562,6 +4545,76 @@ mod tests {
     }
 
     #[test]
+    fn accepted_source_history_is_point_loaded_only_when_ready_work_is_used() {
+        let fixture = Fixture::new("accepted-source-deferred");
+        let work = fixture.work(1, "pages/deferred.md");
+        let fingerprint = fixture.prepare(&work);
+        fixture
+            .index
+            .accept_batch(work.batch_id(), fingerprint)
+            .unwrap();
+
+        let reopened = fixture.reopen_index();
+        let after_open = reopened.stats();
+        assert_eq!(after_open.root_reads, 0);
+        assert_eq!(after_open.prepared_reads, 0);
+        assert_eq!(reopened.next().unwrap(), Some(work.clone()));
+
+        let before_use = reopened.stats();
+        reopened.require_accepted_ready(&work, fingerprint).unwrap();
+        let after_use = reopened.stats();
+        // One current-head root plus the one historical pending-source root;
+        // no other accepted witness is replayed.
+        assert_eq!(after_use.root_reads - before_use.root_reads, 2);
+        assert_eq!(after_use.prepared_reads - before_use.prepared_reads, 1);
+    }
+
+    #[test]
+    fn sealed_restart_preserves_prepare_accept_and_blocked_crash_cuts() {
+        let fixture = Fixture::new("sealed-restart-cuts");
+        let work = fixture.work(1, "pages/restart-cuts.md");
+        let fingerprint = fixture.prepare(&work);
+
+        let after_prepare = fixture.reopen_index();
+        let pending = after_prepare
+            .pending_activation_page(None, 8)
+            .unwrap()
+            .pending()
+            .to_vec();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].batch_id(), work.batch_id());
+        assert!(after_prepare.next().unwrap().is_none());
+
+        after_prepare
+            .accept_batch(work.batch_id(), fingerprint)
+            .unwrap();
+        let after_accept = fixture.reopen_index();
+        assert!(after_accept
+            .pending_activation_page(None, 8)
+            .unwrap()
+            .pending()
+            .is_empty());
+        assert_eq!(after_accept.next().unwrap(), Some(work.clone()));
+        after_accept
+            .require_accepted_ready(&work, fingerprint)
+            .unwrap();
+
+        after_accept
+            .mark_blocked(ProjectionWorkBlockAuthority::guarded_conflict(
+                &work,
+                after_accept.receipt_store_id(),
+                Some(BlobDescription::of(b"foreign edit")),
+            ))
+            .unwrap();
+        let after_block = fixture.reopen_index();
+        assert!(after_block.next().unwrap().is_none());
+        assert_eq!(
+            after_block.status(work.work_id()).unwrap(),
+            Some(ProjectionWorkStatus::Blocked)
+        );
+    }
+
+    #[test]
     fn ready_and_path_indexes_remain_affected_only_over_lifetime() {
         let fixture = Fixture::new("lifetime");
 
@@ -4654,6 +4707,66 @@ mod tests {
     }
 
     #[test]
+    fn sealed_open_cost_is_bounded_by_current_pending_state_not_accepted_history() {
+        const HISTORICAL_BATCHES: u128 = 256;
+
+        let baseline = Fixture::new("sealed-open-bounded-baseline");
+        baseline.prepare(&baseline.work(HISTORICAL_BATCHES + 1, "pages/current-pending.md"));
+        let baseline_reopened = baseline.reopen_index();
+        let baseline_stats = baseline_reopened.stats();
+
+        let lifetime = Fixture::new("sealed-open-bounded-lifetime");
+        for sequence in 1..=HISTORICAL_BATCHES {
+            let historical = lifetime.work(sequence, "pages/lifetime-history.md");
+            let fingerprint = lifetime.prepare(&historical);
+            lifetime
+                .index
+                .accept_batch(historical.batch_id(), fingerprint)
+                .unwrap();
+            lifetime
+                .index
+                .mark_completed(lifetime.completion_authority(&historical))
+                .unwrap();
+        }
+        lifetime.prepare(&lifetime.work(HISTORICAL_BATCHES + 1, "pages/current-pending.md"));
+        let lifetime_reopened = lifetime.reopen_index();
+        let lifetime_stats = lifetime_reopened.stats();
+
+        assert_eq!(baseline_stats.preflight_roots, 1);
+        assert_eq!(baseline_stats.preflight_nodes, 1);
+        assert_eq!(baseline_stats.preflight_records, 1);
+        assert_eq!(baseline_stats.prepared_reads, 1);
+        assert_eq!(baseline_stats.root_reads, 0);
+        assert_eq!(
+            (
+                lifetime_stats.preflight_roots,
+                lifetime_stats.preflight_nodes,
+                lifetime_stats.preflight_records,
+                lifetime_stats.prepared_reads,
+                lifetime_stats.root_reads,
+            ),
+            (
+                baseline_stats.preflight_roots,
+                baseline_stats.preflight_nodes,
+                baseline_stats.preflight_records,
+                baseline_stats.prepared_reads,
+                baseline_stats.root_reads,
+            ),
+            "sealed-open counters grew across {HISTORICAL_BATCHES} immutable accepted batches: \
+             baseline={baseline_stats:?}, lifetime={lifetime_stats:?}"
+        );
+        // The authenticated root has two postcard-varint u64 generations.
+        // Their encodings can grow by at most 18 bytes combined over the
+        // store's entire lifetime; no historical node, root, row, or prepared
+        // byte may enter this counter.
+        assert!(
+            lifetime_stats.preflight_bytes <= baseline_stats.preflight_bytes + 18,
+            "sealed-open bytes grew beyond the fixed root-generation encoding bound: \
+             baseline={baseline_stats:?}, lifetime={lifetime_stats:?}"
+        );
+    }
+
+    #[test]
     fn missing_pending_prepared_file_fails_closed() {
         let fixture = Fixture::new("missing-pending-prepared");
         let work = fixture.work(1, "pages/missing.md");
@@ -4705,8 +4818,12 @@ mod tests {
             .join(root_filename(source_root));
         fs::remove_file(root_path).unwrap();
 
+        let reopened = fixture.reopen_index();
+        let after_open = reopened.stats();
+        assert_eq!(after_open.root_reads, 0);
+        assert_eq!(after_open.prepared_reads, 0);
         assert!(matches!(
-            fixture.index.require_accepted_ready(&work, fingerprint),
+            reopened.require_accepted_ready(&work, fingerprint),
             Err(ProjectionWorkError::MissingRoot(found)) if found == source_root
         ));
     }
@@ -5360,10 +5477,11 @@ mod tests {
             fixture.index.completed_receipts_for_path(&wrong_path),
             Err(ProjectionWorkError::BindingMismatch)
         ));
-        assert!(ObjectStore::open(&fixture.path, fixture.workspace_id)
-            .unwrap()
-            .open_projection_work_index(fixture.binding())
-            .is_err());
+        let reopened = fixture.reopen_index();
+        assert!(matches!(
+            reopened.completed_receipts_for_path(&wrong_path),
+            Err(ProjectionWorkError::BindingMismatch)
+        ));
     }
 
     #[test]

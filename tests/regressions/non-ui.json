@@ -1550,6 +1550,28 @@
       "notes": "The permanent local regression creates a Markdown page and renames it A→B→A→B, proving every round reaches durable projection instead of retrying against the original A frontier. Historical projection reuse is bound to the current portable-path owner and acquisition batch, and any existing local completion must uniquely match that lifecycle and target. The neighboring unrelated-frontier external-delete regression remains covered so the correction does not weaken intentional delete authority."
     },
     {
+      "id": "REG-SYNC-PROJECTION-R6-BOUNDED-SEALED-OPEN-001",
+      "title": "Sealed projection-work startup stays bounded by current recovery state instead of lifetime accepted history",
+      "family": "sync-data-safety",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/oplog/projection_work_index.rs"
+        ],
+        "scenario": "sync.projection-r6-bounded-sealed-open",
+        "failBefore": "proven"
+      },
+      "notes": "Literal fail-before at d691664e with one current pending activation: the no-history control charged roots/nodes/records/prepared/bytes = 1/1/1/1/1,483, while 256 accepted-and-completed historical batches charged 257/1,280/514/257/730,276. Pass-after is 1/1/1/1 for both and 1,483 versus 1,484 bytes (only the bounded current-root generation encoding differs). Sealed open authenticates the current head and validates only current pending plus ready/path recovery indexes and exact ready rows. Pending prepared corruption still blocks open; prepare, accept, and blocked crash cuts survive restart; historical accepted pending roots and prepared bytes are not read on open but exact authorization/completion lookups load the one affected witness and fail closed if its immutable source evidence is missing or corrupt."
+    },
+    {
       "id": "REG-SYNC-SHARED-PROVIDER-R6-ACCEPTED-NOOP-001",
       "title": "Accepted headless no-op dependencies remain authenticated scheduler members after restart",
       "family": "sync-data-safety",
