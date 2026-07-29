@@ -1952,6 +1952,20 @@ impl SyncRuntimeHandle {
             .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)
     }
 
+    #[cfg(test)]
+    fn engine_instrumentation(
+        &self,
+    ) -> Result<crate::oplog::hot_engine::EngineInstrumentation, SyncRuntimeRequestError> {
+        let _operation = self.inner.operation.lock().unwrap();
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.send(ActorRequest::EngineInstrumentation {
+            reply: reply_sender,
+        })?;
+        reply_receiver
+            .recv()
+            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)
+    }
+
     /// Drain the exact feed, execute the production Safe transaction once, and
     /// join the actor. A pre-Safe refusal leaves the actor available for an
     /// explicit retry or crash-style drop.
@@ -3981,6 +3995,10 @@ enum ActorRequest {
         reply: mpsc::Sender<SyncRuntimeStatusSnapshot>,
     },
     #[cfg(test)]
+    EngineInstrumentation {
+        reply: mpsc::Sender<crate::oplog::hot_engine::EngineInstrumentation>,
+    },
+    #[cfg(test)]
     InstallRepeatedOperationalFault {
         point: OperationalFaultPoint,
         failures: u8,
@@ -4081,6 +4099,17 @@ fn actor_thread(
             ActorRequest::Status { reply } => {
                 actor.advance_local_mutation_once();
                 let _ = reply.send(actor.snapshot());
+                false
+            }
+            #[cfg(test)]
+            ActorRequest::EngineInstrumentation { reply } => {
+                let instrumentation = actor
+                    .runtime
+                    .as_ref()
+                    .expect("active test actor retains its promoted runtime")
+                    .engine()
+                    .instrumentation();
+                let _ = reply.send(instrumentation);
                 false
             }
             #[cfg(test)]
@@ -4426,7 +4455,6 @@ struct RuntimeActor {
     session_id: SessionId,
     promotion_session_id: SessionId,
     promoted_state_digest: ContentDigest,
-    archive_root: PathBuf,
     provider_root: PathBuf,
     provider_journal_root: PathBuf,
     provider: Option<SharedProviderTransport>,
@@ -4636,7 +4664,6 @@ impl RuntimeActor {
             promotion_session_id: advisory.promotion_session_id,
             promoted_state_digest: advisory.promoted_state_digest,
             binding: advisory.binding,
-            archive_root: request.archive_root,
             provider_root: request.provider_root,
             provider_journal_root: request.provider_journal_root,
             provider,
@@ -5369,6 +5396,30 @@ impl RuntimeActor {
         has_work
     }
 
+    /// Clone only the archive capability retained by this authenticated active
+    /// runtime. Startup, activation, and crash recovery still go through
+    /// `ObjectStore::open`; routine provider work cannot manufacture a store
+    /// from the configured pathname.
+    fn retained_archive_store(&self) -> Result<Arc<ObjectStore>, SyncRuntimeRequestError> {
+        let store = self
+            .runtime
+            .as_ref()
+            .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
+            .engine()
+            .archive_store_capability()
+            .ok_or_else(|| {
+                SyncRuntimeRequestError::ActorRefused(
+                    "active runtime has no retained authenticated archive capability".into(),
+                )
+            })?;
+        if store.workspace_id() != self.binding.workspace_id() {
+            return Err(SyncRuntimeRequestError::ActorRefused(
+                "active runtime retained an archive capability for another workspace".into(),
+            ));
+        }
+        Ok(store)
+    }
+
     fn tick_provider(&mut self) -> SyncRuntimeTick {
         if let Some(detail) = &self.terminal {
             return SyncRuntimeTick::Terminal(detail.clone());
@@ -5376,7 +5427,7 @@ impl RuntimeActor {
         if self.shared_phase != Some(SyncSharedPhase::Active) {
             return SyncRuntimeTick::Idle;
         }
-        let store = match ObjectStore::open(&self.archive_root, self.binding.workspace_id()) {
+        let store = match self.retained_archive_store() {
             Ok(store) => store,
             Err(error) => return SyncRuntimeTick::Failed(error.to_string()),
         };
@@ -6321,8 +6372,7 @@ impl RuntimeActor {
         &self,
         batch_id: BatchId,
     ) -> Result<(), SyncRuntimeRequestError> {
-        let store = ObjectStore::open(&self.archive_root, self.binding.workspace_id())
-            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        let store = self.retained_archive_store()?;
         let manifest = match store
             .inspect_batch(batch_id)
             .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
@@ -8108,8 +8158,7 @@ impl RuntimeActor {
         if self.shared_phase != Some(SyncSharedPhase::Active) {
             return Ok(());
         }
-        let store = ObjectStore::open(&self.archive_root, self.binding.workspace_id())
-            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        let store = self.retained_archive_store()?;
         let descriptor = self
             .shared_descriptor
             .as_ref()
@@ -8315,11 +8364,10 @@ impl RuntimeActor {
                     .collect::<Vec<_>>(),
             )
         };
+        let store = self.retained_archive_store()?;
         self.feed.take();
         self.runtime.take();
         self.authority.take();
-        let store = ObjectStore::open(&self.archive_root, self.binding.workspace_id())
-            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
         let namespace = shared_namespace_digest(self.binding.workspace_id());
         let descriptor = prepare_shared_enrollment(&self.enrollment_root, &self.binding, namespace)
             .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
@@ -8367,8 +8415,7 @@ impl RuntimeActor {
         &mut self,
         descriptor: SharedEnrollmentDescriptorV1,
     ) -> Result<SharedJoinStep, SyncRuntimeRequestError> {
-        let store = ObjectStore::open(&self.archive_root, self.binding.workspace_id())
-            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        let store = self.retained_archive_store()?;
         if self.pending_join.is_none() {
             let expected = inspect_shared_provider_descriptor(&self.provider_root)
                 .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
@@ -16906,6 +16953,164 @@ mod tests {
                 .windows(b"tail tip".len())
                 .any(|window| window == b"tail tip"),
             "the exact causal dependency walk did not converge the latest tail"
+        );
+    }
+
+    #[test]
+    fn provider_turns_reuse_retained_store_and_charge_only_exact_ingress() {
+        const HISTORY_BATCHES: usize = 12;
+        let (author, receiver, author_handle, receiver_handle) =
+            joined_shared_pair("provider-retained-store", 0xc600);
+        for index in 0..HISTORY_BATCHES {
+            let seed = 0xc700 + (index as u128) * 4;
+            submit_shared_page(
+                &author_handle,
+                seed,
+                &format!("Retained Store History {index}"),
+                &format!("notes/retained-store-history-{index}.md"),
+                &format!("retained store history payload {index}"),
+            );
+        }
+        settle_shared_provider(&author_handle);
+        copy_provider_tree(
+            &author.request.provider_root,
+            &receiver.request.provider_root,
+        );
+        receiver_handle.observe_provider().unwrap();
+        settle_shared_provider(&receiver_handle);
+
+        let lifetime_archive_bytes = ["objects", "batches"]
+            .into_iter()
+            .map(|namespace| {
+                fs::read_dir(receiver.request.archive_root.join(namespace))
+                    .unwrap()
+                    .map(|entry| entry.unwrap().metadata().unwrap().len() as usize)
+                    .sum::<usize>()
+            })
+            .sum::<usize>();
+
+        let (ingress_batch, ..) = submit_shared_page(
+            &author_handle,
+            0xc800,
+            "Retained Store Exact Ingress",
+            "notes/retained-store-exact-ingress.md",
+            "only this exact provider batch should be inspected",
+        );
+        publish_shared_batch(&author_handle, &author, ingress_batch);
+        settle_shared_provider(&author_handle);
+        let delivered = copy_provider_batch(
+            &author,
+            &receiver,
+            ingress_batch,
+            ProviderBatchDelivery::Complete,
+        );
+        let exact_ingress_bytes = delivered
+            .iter()
+            .map(|path| {
+                fs::metadata(receiver.request.provider_root.join("outbox").join(path))
+                    .unwrap()
+                    .len() as usize
+            })
+            .sum::<usize>();
+
+        let before = receiver_handle.engine_instrumentation().unwrap();
+        receiver_handle
+            .observe_provider_paths(delivered.clone(), false)
+            .unwrap();
+        let mut provider_turns = 0_usize;
+        for _ in 0..512 {
+            let tick = receiver_handle.tick().unwrap();
+            provider_turns += 1;
+            assert!(
+                !matches!(
+                    tick,
+                    SyncRuntimeTick::RecoveryBlocked(_)
+                        | SyncRuntimeTick::Blocked(_)
+                        | SyncRuntimeTick::Terminal(_)
+                        | SyncRuntimeTick::Failed(_)
+                ),
+                "exact provider ingress failed: {tick:?}"
+            );
+            if matches!(tick, SyncRuntimeTick::Idle)
+                && receiver_handle.status().unwrap().provider_pending == 0
+            {
+                break;
+            }
+        }
+        assert_eq!(receiver_handle.status().unwrap().provider_pending, 0);
+        assert!(
+            receiver
+                .graph_root
+                .join("notes/retained-store-exact-ingress.md")
+                .is_file(),
+            "the exact incoming manifest/object set was not admitted and projected"
+        );
+
+        let after = receiver_handle.engine_instrumentation().unwrap();
+        let directory_enumerations =
+            after.store.directory_enumerations - before.store.directory_enumerations;
+        let inspected_manifest_operations =
+            after.store.inspected_manifest_operations - before.store.inspected_manifest_operations;
+        let inspected_object_operations =
+            after.store.inspected_object_operations - before.store.inspected_object_operations;
+        let inspected_bytes = after.store.inspected_manifest_bytes
+            + after.store.inspected_object_bytes
+            - before.store.inspected_manifest_bytes
+            - before.store.inspected_object_bytes;
+        let old_reopen_directory_enumerations = provider_turns * 2;
+        let old_reopen_minimum_archive_bytes =
+            provider_turns.checked_mul(lifetime_archive_bytes).unwrap();
+
+        eprintln!(
+            "provider retained-store counters: turns={provider_turns}, \
+             lifetime_archive_bytes={lifetime_archive_bytes}, \
+             old_directory_enumerations={old_reopen_directory_enumerations}, \
+             old_minimum_archive_bytes={old_reopen_minimum_archive_bytes}, \
+             new_directory_enumerations={directory_enumerations}, \
+             exact_ingress_bytes={exact_ingress_bytes}, \
+             inspected_manifest_operations={inspected_manifest_operations}, \
+             inspected_object_operations={inspected_object_operations}, \
+             inspected_bytes={inspected_bytes}"
+        );
+        assert!(
+            provider_turns >= delivered.len(),
+            "fixture did not retain many independently bounded provider turns"
+        );
+        assert_eq!(
+            directory_enumerations, 0,
+            "routine provider work enumerated the lifetime object-store namespace"
+        );
+        assert_eq!(
+            inspected_manifest_operations, 18,
+            "exact ingress and accepted-history audit did not charge every manifest validation \
+             to the retained store"
+        );
+        assert_eq!(
+            inspected_object_operations, 72,
+            "exact ingress and accepted-history audit did not charge every object validation \
+             to the retained store"
+        );
+        assert!(
+            inspected_bytes >= exact_ingress_bytes,
+            "exact ingress validation charged fewer bytes than the delivered closed object set"
+        );
+        assert!(
+            inspected_bytes
+                <= exact_ingress_bytes
+                    .saturating_mul(provider_turns)
+                    .saturating_mul(2),
+            "provider work inspected {inspected_bytes} bytes for {exact_ingress_bytes} exact \
+             ingress bytes across {provider_turns} bounded turns"
+        );
+        assert!(
+            lifetime_archive_bytes > exact_ingress_bytes.saturating_mul(8),
+            "fixture archive is not large relative to exact ingress: lifetime \
+             {lifetime_archive_bytes}, exact {exact_ingress_bytes}"
+        );
+        assert!(
+            old_reopen_minimum_archive_bytes > inspected_bytes.saturating_mul(4),
+            "fixture does not distinguish lifetime history from exact ingress: old minimum \
+             {old_reopen_minimum_archive_bytes}, exact inspected {inspected_bytes}"
         );
     }
 

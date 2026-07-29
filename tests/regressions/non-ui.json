@@ -1501,6 +1501,28 @@
       "notes": "The fail-before/pass-after stress receipt used a 96-batch linear history delivered newest-first: the indexed scheduler converged with exactly 96 manifest registrations while the prior pending-deque scan performed 9,216 readiness inspections. The always-on 24-batch regression preserves the same quadratic discriminator without adding a four-minute suite cost. A focused index neighbor covers multiple parents, an already-active synthetic base head, duplicate registration, unrelated acceptance, exact edge work, and deterministic sibling wake order. Existing shared-provider journeys continue to cover duplicate exact delivery, incomplete manifests becoming complete, restart reconstruction, publication repair, status visibility, and Safe-shutdown refusal while inbound evidence remains blocked."
     },
     {
+      "id": "REG-SYNC-SHARED-PROVIDER-R6-RETAINED-STORE-001",
+      "title": "Routine provider work stays bounded to exact ingress instead of re-auditing lifetime archive history",
+      "family": "performance-data-safety",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/sync_runtime.rs"
+        ],
+        "scenario": "sync.shared-provider-r6-retained-authenticated-store",
+        "failBefore": "proven"
+      },
+      "notes": "At d691664e each provider-work turn reopened ObjectStore and validate_namespace enumerated objects plus batches, then fully decoded and canonically validated every lifetime object and manifest. The fail-before regression could not satisfy the retained-counter bound. The pass-after fixture runs nine bounded provider turns over a twelve-batch historical archive: the old path models exactly 18 whole-namespace enumerations and at least 539,199 historical bytes, while the retained Arc path adds zero enumerations and charges 17 manifest inspections, 68 object inspections, and 92,524 bytes to exact ingress/admission in the final recorded release-mode run. Exact byte totals are fixture-derived rather than hard-coded because runtime identities may vary; the test enforces the invariant ratios and successful projection. Authenticated activation/restart keeps the complete ObjectStore namespace validation."
+    },
+    {
       "id": "REG-SYNC-SHARED-PROVIDER-R6-FRONTIER-HEADS-001",
       "title": "SharedActive startup discovers immutable device frontiers without replaying settled provider history",
       "family": "sync-data-safety",

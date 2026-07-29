@@ -4178,6 +4178,18 @@ impl ShardedHotEngine {
         self.archive_store.as_deref()
     }
 
+    /// Clone the engine-owned authenticated archive capability for work that
+    /// must outlive an immutable borrow of the engine.
+    ///
+    /// This is an `Arc` clone of the exact store accepted at runtime open: it
+    /// performs no ambient pathname lookup, creates no authority, and shares
+    /// the store's validation counters. Callers may therefore keep routine
+    /// active-runtime work borrow-clean without reopening and revalidating the
+    /// lifetime namespace.
+    pub(crate) fn archive_store_capability(&self) -> Option<Arc<ObjectStore>> {
+        self.archive_store.as_ref().map(Arc::clone)
+    }
+
     /// Open the enrolled projection capabilities without replaying non-empty
     /// operational history.
     ///
