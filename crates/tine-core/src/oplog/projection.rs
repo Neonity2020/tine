@@ -1645,118 +1645,593 @@ mod tests {
     struct CanonicalBlock {
         visible: String,
         properties: Vec<(String, String)>,
+        marker: Option<String>,
+        tags: Vec<String>,
+        page_refs: Vec<String>,
+        block_refs: Vec<String>,
+        scheduled: Option<String>,
+        deadline: Option<String>,
         children: Vec<CanonicalBlock>,
     }
 
+    #[derive(Debug)]
+    struct DenseOnlyAnchor {
+        locator: Vec<usize>,
+        logseq_uuid: LogseqUuid,
+    }
+
+    struct DenseSparseCorpusCase {
+        name: &'static str,
+        state: ProjectionPageState,
+        base: Option<&'static [u8]>,
+        expected: CanonicalDocument,
+        dense_only_anchors: Vec<DenseOnlyAnchor>,
+        sparse_generated_anchors: Vec<(BlockId, LogseqUuid)>,
+        ordinary_idless_locators: Vec<Vec<usize>>,
+        user_authored_byte_fragments: Vec<String>,
+        expect_crlf: bool,
+    }
+
     fn canonical_semantics(
+        format: ProjectionFormat,
         bytes: &[u8],
-        instrumentation_generated_id: Option<LogseqUuid>,
+        dense_only_anchors: &[DenseOnlyAnchor],
     ) -> CanonicalDocument {
-        let instrumentation_generated_id =
-            instrumentation_generated_id.map(|uuid| uuid.to_string());
-        let document = crate::doc::parse(std::str::from_utf8(bytes).unwrap());
+        let text = std::str::from_utf8(bytes).unwrap();
+        let document = match format {
+            ProjectionFormat::Markdown => crate::doc::parse(text),
+            ProjectionFormat::Org => crate::org::parse_org(text),
+        };
         CanonicalDocument {
             preamble: document.pre_block,
-            roots: canonical_blocks(&document.roots, instrumentation_generated_id.as_deref()),
+            roots: canonical_blocks(&document.roots, &mut Vec::new(), dense_only_anchors),
         }
     }
 
     fn canonical_blocks(
         blocks: &[crate::doc::DocBlock],
-        instrumentation_generated_id: Option<&str>,
+        locator: &mut Vec<usize>,
+        dense_only_anchors: &[DenseOnlyAnchor],
     ) -> Vec<CanonicalBlock> {
         blocks
             .iter()
-            .map(|block| CanonicalBlock {
-                visible: block.projection().visible.clone(),
-                properties: block
-                    .projection()
-                    .properties
+            .enumerate()
+            .map(|(position, block)| {
+                locator.push(position);
+                let dense_only_uuid = dense_only_anchors
                     .iter()
-                    .filter(|(key, value)| {
-                        !key.eq_ignore_ascii_case("id")
-                            || instrumentation_generated_id != Some(value.trim())
-                    })
-                    .cloned()
-                    .collect(),
-                children: canonical_blocks(&block.children, instrumentation_generated_id),
+                    .find(|anchor| anchor.locator == *locator)
+                    .map(|anchor| anchor.logseq_uuid.to_string());
+                let projection = block.projection();
+                let canonical = CanonicalBlock {
+                    visible: projection.visible.clone(),
+                    properties: projection
+                        .properties
+                        .iter()
+                        .filter(|(key, value)| {
+                            !key.eq_ignore_ascii_case("id")
+                                || dense_only_uuid.as_deref() != Some(value.trim())
+                        })
+                        .cloned()
+                        .collect(),
+                    marker: projection.marker.clone(),
+                    tags: projection.tags.clone(),
+                    page_refs: projection.refs_page.clone(),
+                    block_refs: projection.block_refs.clone(),
+                    scheduled: projection.scheduled.clone(),
+                    deadline: projection.deadline.clone(),
+                    children: canonical_blocks(&block.children, locator, dense_only_anchors),
+                };
+                locator.pop();
+                canonical
             })
             .collect()
     }
 
+    fn expected_block(
+        visible: &str,
+        properties: &[(&str, &str)],
+        marker: Option<&str>,
+        tags: &[&str],
+        page_refs: &[&str],
+        block_refs: &[&str],
+        scheduled: Option<&str>,
+        deadline: Option<&str>,
+        children: Vec<CanonicalBlock>,
+    ) -> CanonicalBlock {
+        CanonicalBlock {
+            visible: visible.into(),
+            properties: properties
+                .iter()
+                .map(|(key, value)| ((*key).into(), (*value).into()))
+                .collect(),
+            marker: marker.map(Into::into),
+            tags: tags.iter().map(|tag| (*tag).into()).collect(),
+            page_refs: page_refs.iter().map(|page| (*page).into()).collect(),
+            block_refs: block_refs.iter().map(|block| (*block).into()).collect(),
+            scheduled: scheduled.map(Into::into),
+            deadline: deadline.map(Into::into),
+            children,
+        }
+    }
+
+    fn block_at<'a>(roots: &'a [CanonicalBlock], locator: &[usize]) -> &'a CanonicalBlock {
+        let (first, rest) = locator.split_first().expect("corpus locator is non-empty");
+        let block = &roots[*first];
+        if rest.is_empty() {
+            block
+        } else {
+            block_at(&block.children, rest)
+        }
+    }
+
+    fn has_id(block: &CanonicalBlock, uuid: LogseqUuid) -> bool {
+        block
+            .properties
+            .iter()
+            .any(|(key, value)| key.eq_ignore_ascii_case("id") && value.trim() == uuid.to_string())
+    }
+
+    fn assert_expected_line_endings(name: &str, bytes: &[u8], expect_crlf: bool) {
+        if expect_crlf {
+            assert!(
+                bytes.iter().enumerate().all(|(index, byte)| {
+                    *byte != b'\n' || index > 0 && bytes[index - 1] == b'\r'
+                }),
+                "{name} must retain CRLF line endings"
+            );
+        } else {
+            assert!(
+                !bytes.contains(&b'\r'),
+                "{name} must use canonical LF line endings"
+            );
+        }
+    }
+
     #[test]
     fn dense_bytes_and_sparse_projection_differ_only_by_fixture_generated_anchor() {
-        let block_id = BlockId::from_uuid(Uuid::from_u128(1));
-        let user_block_id = BlockId::from_uuid(Uuid::from_u128(4));
-        let user_authored_id = LogseqUuid::from_uuid(Uuid::from_u128(5));
-        let state = ProjectionPageState {
-            page: MaterializedPage {
-                page_id: PageId::from_uuid(Uuid::from_u128(2)),
-                home_document_id: DocumentId::from_uuid(Uuid::from_u128(3)),
-                name: crate::oplog::LogicalPageName::parse("Policy").unwrap(),
-                path: ManagedPath::parse("pages/policy.md").unwrap(),
-                kind: crate::oplog::ManagedTextKind::Page,
-                preamble: None,
-                blocks: vec![
-                    MaterializedBlock {
-                        block_id,
-                        home_document_id: DocumentId::from_uuid(Uuid::from_u128(3)),
-                        parent: None,
-                        order: "a".into(),
-                        logseq_uuid: None,
-                        logseq_identity_origin: None,
-                        content: "ordinary content".into(),
+        let markdown = {
+            let home_document_id = DocumentId::from_uuid(Uuid::from_u128(1_000));
+            let parent = BlockId::from_uuid(Uuid::from_u128(101));
+            let duplicate_first = BlockId::from_uuid(Uuid::from_u128(102));
+            let generated_sparse = BlockId::from_uuid(Uuid::from_u128(103));
+            let grandchild = BlockId::from_uuid(Uuid::from_u128(104));
+            let duplicate_second = BlockId::from_uuid(Uuid::from_u128(105));
+            let user_authored = BlockId::from_uuid(Uuid::from_u128(106));
+            let sparse_policy_id = LogseqUuid::from_uuid(Uuid::from_u128(151));
+            let user_authored_id = LogseqUuid::from_uuid(Uuid::from_u128(152));
+            let block_ref = LogseqUuid::from_uuid(Uuid::from_u128(153));
+
+            DenseSparseCorpusCase {
+                name: "markdown nested CRLF corpus",
+                state: ProjectionPageState {
+                    page: MaterializedPage {
+                        page_id: PageId::from_uuid(Uuid::from_u128(1_001)),
+                        home_document_id,
+                        name: crate::oplog::LogicalPageName::parse("Dense Corpus").unwrap(),
+                        path: ManagedPath::parse("pages/研究/Δ corpus.md").unwrap(),
+                        kind: crate::oplog::ManagedTextKind::Page,
+                        preamble: Some("title:: Dense Corpus\nalias:: policy corpus".into()),
+                        blocks: vec![
+                            MaterializedBlock {
+                                block_id: user_authored,
+                                home_document_id,
+                                parent: None,
+                                order: "z".into(),
+                                logseq_uuid: Some(user_authored_id),
+                                logseq_identity_origin: Some(LogseqIdentityOrigin::ExternalImported),
+                                content: format!(
+                                    "DONE User-owned #review [[Other Page]]\nowner:: María\nstatus:: approved\nid:: {user_authored_id}"
+                                ),
+                            },
+                            MaterializedBlock {
+                                block_id: generated_sparse,
+                                home_document_id,
+                                parent: Some(parent),
+                                order: "b".into(),
+                                logseq_uuid: Some(sparse_policy_id),
+                                logseq_identity_origin: Some(LogseqIdentityOrigin::PolicyGenerated {
+                                    reason: crate::oplog::PolicyGeneratedAnchorReason::BlockReference,
+                                }),
+                                content: "DOING generated sparse #keep [[Policy Page]]\npolicy:: retained".into(),
+                            },
+                            MaterializedBlock {
+                                block_id: parent,
+                                home_document_id,
+                                parent: None,
+                                order: "a".into(),
+                                logseq_uuid: None,
+                                logseq_identity_origin: None,
+                                content: format!(
+                                    "TODO Parent 東京 #work [[Project Alpha]] (({block_ref}))\ncontinued 🧪 line\ncustom:: keep md\nview:: table"
+                                ),
+                            },
+                            MaterializedBlock {
+                                block_id: grandchild,
+                                home_document_id,
+                                parent: Some(duplicate_first),
+                                order: "a".into(),
+                                logseq_uuid: None,
+                                logseq_identity_origin: None,
+                                content: "Grandchild line one\nline two [[Nested Page]]".into(),
+                            },
+                            MaterializedBlock {
+                                block_id: duplicate_second,
+                                home_document_id,
+                                parent: Some(parent),
+                                order: "c".into(),
+                                logseq_uuid: None,
+                                logseq_identity_origin: None,
+                                content: "Duplicate sibling 🧩".into(),
+                            },
+                            MaterializedBlock {
+                                block_id: duplicate_first,
+                                home_document_id,
+                                parent: Some(parent),
+                                order: "a".into(),
+                                logseq_uuid: None,
+                                logseq_identity_origin: None,
+                                content: "Duplicate sibling 🧩".into(),
+                            },
+                        ],
+                        stats: MaterializationStats::default(),
                     },
-                    MaterializedBlock {
-                        block_id: user_block_id,
-                        home_document_id: DocumentId::from_uuid(Uuid::from_u128(3)),
-                        parent: None,
-                        order: "b".into(),
-                        logseq_uuid: Some(user_authored_id),
-                        logseq_identity_origin: Some(LogseqIdentityOrigin::ExternalImported),
-                        content: format!("user-authored\nid:: {user_authored_id}"),
+                    frontier: FrontierV2::default(),
+                    claim_evidence: Vec::new(),
+                },
+                base: Some(b"previous projection\r\n"),
+                expected: CanonicalDocument {
+                    preamble: Some("title:: Dense Corpus\nalias:: policy corpus".into()),
+                    roots: vec![
+                        expected_block(
+                            "TODO Parent 東京 #work [[Project Alpha]] ((00000000-0000-0000-0000-000000000099))\ncontinued 🧪 line",
+                            &[("custom", "keep md"), ("view", "table")],
+                            Some("TODO"),
+                            &["work"],
+                            &["Project Alpha", "work"],
+                            &["00000000-0000-0000-0000-000000000099"],
+                            None,
+                            None,
+                            vec![
+                                expected_block(
+                                    "Duplicate sibling 🧩",
+                                    &[],
+                                    None,
+                                    &[],
+                                    &[],
+                                    &[],
+                                    None,
+                                    None,
+                                    vec![expected_block(
+                                        "Grandchild line one\nline two [[Nested Page]]",
+                                        &[],
+                                        None,
+                                        &[],
+                                        &["Nested Page"],
+                                        &[],
+                                        None,
+                                        None,
+                                        Vec::new(),
+                                    )],
+                                ),
+                                expected_block(
+                                    "DOING generated sparse #keep [[Policy Page]]",
+                                    &[
+                                        ("policy", "retained"),
+                                        ("id", "00000000-0000-0000-0000-000000000097"),
+                                    ],
+                                    Some("DOING"),
+                                    &["keep"],
+                                    &["Policy Page", "keep"],
+                                    &[],
+                                    None,
+                                    None,
+                                    Vec::new(),
+                                ),
+                                expected_block(
+                                    "Duplicate sibling 🧩",
+                                    &[],
+                                    None,
+                                    &[],
+                                    &[],
+                                    &[],
+                                    None,
+                                    None,
+                                    Vec::new(),
+                                ),
+                            ],
+                        ),
+                        expected_block(
+                            "DONE User-owned #review [[Other Page]]",
+                            &[
+                                ("owner", "María"),
+                                ("status", "approved"),
+                                ("id", "00000000-0000-0000-0000-000000000098"),
+                            ],
+                            Some("DONE"),
+                            &["review"],
+                            &["Other Page", "review"],
+                            &[],
+                            None,
+                            None,
+                            Vec::new(),
+                        ),
+                    ],
+                },
+                dense_only_anchors: vec![
+                    DenseOnlyAnchor {
+                        locator: vec![0],
+                        logseq_uuid: LogseqUuid::from_uuid(parent.as_uuid()),
+                    },
+                    DenseOnlyAnchor {
+                        locator: vec![0, 0],
+                        logseq_uuid: LogseqUuid::from_uuid(duplicate_first.as_uuid()),
+                    },
+                    DenseOnlyAnchor {
+                        locator: vec![0, 0, 0],
+                        logseq_uuid: LogseqUuid::from_uuid(grandchild.as_uuid()),
+                    },
+                    DenseOnlyAnchor {
+                        locator: vec![0, 2],
+                        logseq_uuid: LogseqUuid::from_uuid(duplicate_second.as_uuid()),
                     },
                 ],
-                stats: MaterializationStats::default(),
-            },
-            frontier: FrontierV2::default(),
-            claim_evidence: Vec::new(),
+                sparse_generated_anchors: vec![(generated_sparse, sparse_policy_id)],
+                ordinary_idless_locators: vec![vec![0], vec![0, 0], vec![0, 0, 0], vec![0, 2]],
+                user_authored_byte_fragments: vec![
+                    "owner:: María".into(),
+                    "status:: approved".into(),
+                    format!("id:: {user_authored_id}"),
+                ],
+                expect_crlf: true,
+            }
         };
 
-        let sparse = render_projection(&state, None).unwrap();
-        let dense: Vec<u8> = render_dense_projection_bytes(&state, None).unwrap();
-        let expected_instrumentation_id = LogseqUuid::from_uuid(block_id.as_uuid());
-        let sparse_document = crate::doc::parse(std::str::from_utf8(&sparse.target).unwrap());
-        let sparse_semantics = canonical_semantics(&sparse.target, None);
-        let dense_semantics = canonical_semantics(&dense, Some(expected_instrumentation_id));
+        let org = {
+            let home_document_id = DocumentId::from_uuid(Uuid::from_u128(2_000));
+            let parent = BlockId::from_uuid(Uuid::from_u128(201));
+            let duplicate_first = BlockId::from_uuid(Uuid::from_u128(202));
+            let grandchild = BlockId::from_uuid(Uuid::from_u128(203));
+            let duplicate_second = BlockId::from_uuid(Uuid::from_u128(204));
+            let user_authored = BlockId::from_uuid(Uuid::from_u128(205));
+            let user_authored_id = LogseqUuid::from_uuid(Uuid::from_u128(251));
+            let block_ref = LogseqUuid::from_uuid(Uuid::from_u128(252));
 
-        assert_eq!(sparse.generated_anchors, []);
-        assert!(sparse_document.roots[0]
-            .projection()
-            .properties
-            .iter()
-            .all(|(key, _)| !key.eq_ignore_ascii_case("id")));
-        assert_eq!(sparse_semantics, dense_semantics);
-        assert!(sparse_semantics.roots[1]
-            .properties
-            .iter()
-            .any(|(key, value)| key.eq_ignore_ascii_case("id")
-                && value.trim() == user_authored_id.to_string()));
-        assert!(std::str::from_utf8(&sparse.target)
-            .unwrap()
-            .contains("ordinary content"));
-        assert!(std::str::from_utf8(&dense)
-            .unwrap()
-            .contains("ordinary content"));
-        assert!(!std::str::from_utf8(&sparse.target)
-            .unwrap()
-            .contains(&expected_instrumentation_id.to_string()));
-        assert!(std::str::from_utf8(&dense)
-            .unwrap()
-            .contains(&format!("id:: {expected_instrumentation_id}")));
-        assert!(std::str::from_utf8(&dense)
-            .unwrap()
-            .contains(&format!("id:: {user_authored_id}")));
+            DenseSparseCorpusCase {
+                name: "org nested LF corpus",
+                state: ProjectionPageState {
+                    page: MaterializedPage {
+                        page_id: PageId::from_uuid(Uuid::from_u128(2_001)),
+                        home_document_id,
+                        name: crate::oplog::LogicalPageName::parse("Org Corpus").unwrap(),
+                        path: ManagedPath::parse("journals/研究/Δ corpus.org").unwrap(),
+                        kind: crate::oplog::ManagedTextKind::Page,
+                        preamble: Some("#+TITLE: Org corpus\n#+PROPERTY: CATEGORY research".into()),
+                        blocks: vec![
+                            MaterializedBlock {
+                                block_id: duplicate_second,
+                                home_document_id,
+                                parent: Some(parent),
+                                order: "c".into(),
+                                logseq_uuid: None,
+                                logseq_identity_origin: None,
+                                content: "Duplicate Org sibling 🧩".into(),
+                            },
+                            MaterializedBlock {
+                                block_id: user_authored,
+                                home_document_id,
+                                parent: None,
+                                order: "z".into(),
+                                logseq_uuid: Some(user_authored_id),
+                                logseq_identity_origin: Some(LogseqIdentityOrigin::ExternalImported),
+                                content: format!(
+                                    "DONE User org :review:\n:PROPERTIES:\n:owner: Κατερίνα\n:state: retained\n:id: {user_authored_id}\n:END:\nbody [[Other Org]]"
+                                ),
+                            },
+                            MaterializedBlock {
+                                block_id: parent,
+                                home_document_id,
+                                parent: None,
+                                order: "a".into(),
+                                logseq_uuid: None,
+                                logseq_identity_origin: None,
+                                content: format!(
+                                    "TODO Org parent :orgtag:\nSCHEDULED: <2026-08-01 Sat>\n:PROPERTIES:\n:custom: αβ\n:END:\nmultiline 日本語 [[Linked Page][alias]] (({block_ref}))"
+                                ),
+                            },
+                            MaterializedBlock {
+                                block_id: grandchild,
+                                home_document_id,
+                                parent: Some(duplicate_first),
+                                order: "a".into(),
+                                logseq_uuid: None,
+                                logseq_identity_origin: None,
+                                content: "Org grandchild\ncontinued [[Nested Org]]".into(),
+                            },
+                            MaterializedBlock {
+                                block_id: duplicate_first,
+                                home_document_id,
+                                parent: Some(parent),
+                                order: "a".into(),
+                                logseq_uuid: None,
+                                logseq_identity_origin: None,
+                                content: "Duplicate Org sibling 🧩".into(),
+                            },
+                        ],
+                        stats: MaterializationStats::default(),
+                    },
+                    frontier: FrontierV2::default(),
+                    claim_evidence: Vec::new(),
+                },
+                base: None,
+                expected: CanonicalDocument {
+                    preamble: Some("#+TITLE: Org corpus\n#+PROPERTY: CATEGORY research".into()),
+                    roots: vec![
+                        expected_block(
+                            "TODO Org parent :orgtag:\nSCHEDULED: <2026-08-01 Sat>\nmultiline 日本語 [[Linked Page][alias]] ((00000000-0000-0000-0000-0000000000fc))",
+                            &[("custom", "αβ")],
+                            Some("TODO"),
+                            &["orgtag"],
+                            &["Linked Page"],
+                            &["00000000-0000-0000-0000-0000000000fc"],
+                            Some("2026-08-01 Sat"),
+                            None,
+                            vec![
+                                expected_block(
+                                    "Duplicate Org sibling 🧩",
+                                    &[],
+                                    None,
+                                    &[],
+                                    &[],
+                                    &[],
+                                    None,
+                                    None,
+                                    vec![expected_block(
+                                        "Org grandchild\ncontinued [[Nested Org]]",
+                                        &[],
+                                        None,
+                                        &[],
+                                        &["Nested Org"],
+                                        &[],
+                                        None,
+                                        None,
+                                        Vec::new(),
+                                    )],
+                                ),
+                                expected_block(
+                                    "Duplicate Org sibling 🧩",
+                                    &[],
+                                    None,
+                                    &[],
+                                    &[],
+                                    &[],
+                                    None,
+                                    None,
+                                    Vec::new(),
+                                ),
+                            ],
+                        ),
+                        expected_block(
+                            "DONE User org :review:\nbody [[Other Org]]",
+                            &[
+                                ("owner", "Κατερίνα"),
+                                ("state", "retained"),
+                                ("id", "00000000-0000-0000-0000-0000000000fb"),
+                            ],
+                            Some("DONE"),
+                            &["review"],
+                            &["Other Org"],
+                            &[],
+                            None,
+                            None,
+                            Vec::new(),
+                        ),
+                    ],
+                },
+                dense_only_anchors: vec![
+                    DenseOnlyAnchor {
+                        locator: vec![0],
+                        logseq_uuid: LogseqUuid::from_uuid(parent.as_uuid()),
+                    },
+                    DenseOnlyAnchor {
+                        locator: vec![0, 0],
+                        logseq_uuid: LogseqUuid::from_uuid(duplicate_first.as_uuid()),
+                    },
+                    DenseOnlyAnchor {
+                        locator: vec![0, 0, 0],
+                        logseq_uuid: LogseqUuid::from_uuid(grandchild.as_uuid()),
+                    },
+                    DenseOnlyAnchor {
+                        locator: vec![0, 1],
+                        logseq_uuid: LogseqUuid::from_uuid(duplicate_second.as_uuid()),
+                    },
+                ],
+                sparse_generated_anchors: Vec::new(),
+                ordinary_idless_locators: vec![vec![0], vec![0, 0], vec![0, 0, 0], vec![0, 1]],
+                user_authored_byte_fragments: vec![
+                    ":owner: Κατερίνα".into(),
+                    ":state: retained".into(),
+                    format!(":id: {user_authored_id}"),
+                ],
+                expect_crlf: false,
+            }
+        };
+
+        for case in [markdown, org] {
+            let format = format_for_page(&case.state.page).unwrap();
+            let sparse = render_projection(&case.state, case.base).unwrap();
+            let dense = render_dense_projection_bytes(&case.state, case.base).unwrap();
+            let sparse_text = std::str::from_utf8(&sparse.target).unwrap();
+            let dense_text = std::str::from_utf8(&dense).unwrap();
+            let sparse_semantics = canonical_semantics(format, &sparse.target, &[]);
+            let dense_unfiltered = canonical_semantics(format, &dense, &[]);
+            let dense_semantics = canonical_semantics(format, &dense, &case.dense_only_anchors);
+            let generated_sparse: Vec<_> = sparse
+                .generated_anchors
+                .iter()
+                .map(|anchor| (anchor.block_id(), anchor.logseq_uuid()))
+                .collect();
+
+            assert_eq!(
+                generated_sparse, case.sparse_generated_anchors,
+                "{} reports exactly its sparse policy-generated anchors",
+                case.name
+            );
+            assert_eq!(
+                sparse_semantics, case.expected,
+                "{} sparse output must meet the explicit semantic fixture",
+                case.name
+            );
+            assert_eq!(
+                dense_semantics, case.expected,
+                "{} dense output must meet the explicit semantic fixture after removing only listed dense anchors",
+                case.name
+            );
+            assert_eq!(
+                sparse_semantics, dense_semantics,
+                "{} dense and sparse semantics must agree after the narrow normalization",
+                case.name
+            );
+            for anchor in &case.dense_only_anchors {
+                assert!(
+                    has_id(
+                        block_at(&dense_unfiltered.roots, &anchor.locator),
+                        anchor.logseq_uuid
+                    ),
+                    "{} dense output must contain its listed fixture-only anchor at {:?}",
+                    case.name,
+                    anchor.locator
+                );
+                assert!(
+                    !has_id(
+                        block_at(&sparse_semantics.roots, &anchor.locator),
+                        anchor.logseq_uuid
+                    ),
+                    "{} sparse output must not inherit its fixture-only anchor at {:?}",
+                    case.name,
+                    anchor.locator
+                );
+            }
+            for locator in &case.ordinary_idless_locators {
+                assert!(
+                    !block_at(&sparse_semantics.roots, locator)
+                        .properties
+                        .iter()
+                        .any(|(key, _)| key.eq_ignore_ascii_case("id")),
+                    "{} sparse output must leave the ordinary ID-less block at {locator:?} unstamped",
+                    case.name
+                );
+            }
+            for fragment in &case.user_authored_byte_fragments {
+                assert!(
+                    sparse_text.contains(fragment) && dense_text.contains(fragment),
+                    "{} must preserve user-authored bytes {fragment:?}",
+                    case.name
+                );
+            }
+            assert_expected_line_endings(case.name, &sparse.target, case.expect_crlf);
+            assert_expected_line_endings(case.name, &dense, case.expect_crlf);
+        }
     }
 
     #[test]
