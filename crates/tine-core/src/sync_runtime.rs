@@ -7846,6 +7846,68 @@ mod tests {
     }
 
     #[test]
+    fn repeated_local_page_rename_round_trip_reaches_durable() {
+        let fixture = RuntimeHostFixture::safe("sync-runtime-local-rename-round-trip");
+        let handle = active_handle(SyncRuntimeHandle::open(fixture.request()));
+        drive_initial_feed(&handle);
+        let page_id = PageId::from_uuid(Uuid::from_u128(725_000));
+        let home_document_id = DocumentId::from_uuid(Uuid::from_u128(725_001));
+        let block_id = BlockId::from_uuid(Uuid::from_u128(725_002));
+        let original =
+            ManagedPath::parse("content/nested pages/runtime-rename-round-trip.md").unwrap();
+        let alternate =
+            ManagedPath::parse("content/nested pages/runtime-rename-round-trip-away.md").unwrap();
+
+        submit_durable(
+            &handle,
+            vec![
+                SemanticOperation::CreatePage {
+                    page_id,
+                    home_document_id,
+                    name: LogicalPageName::parse("Runtime Rename Round Trip").unwrap(),
+                    path: original.clone(),
+                    kind: ManagedTextKind::Page,
+                },
+                SemanticOperation::CreateBlock {
+                    block: BlockLocation {
+                        block_id,
+                        home_document_id,
+                    },
+                    page_id,
+                    parent: None,
+                    order: "a".into(),
+                    content: "rename round trip".into(),
+                },
+            ],
+        );
+
+        for (name, path) in [
+            ("Runtime Rename Round Trip Away", alternate.clone()),
+            ("Runtime Rename Round Trip", original.clone()),
+            ("Runtime Rename Round Trip Away", alternate.clone()),
+        ] {
+            submit_durable(
+                &handle,
+                vec![SemanticOperation::RenamePagesAndRewriteReferrers {
+                    page_changes: vec![PageRename {
+                        page_id,
+                        new_name: LogicalPageName::parse(name).unwrap(),
+                        new_path: path,
+                    }],
+                    block_rewrites: Vec::new(),
+                    page_preamble_rewrites: Vec::new(),
+                }],
+            );
+        }
+
+        assert!(!fixture.graph_root().join(original.as_str()).exists());
+        assert_eq!(
+            fs::read(fixture.graph_root().join(alternate.as_str())).unwrap(),
+            b"- rename round trip\n"
+        );
+    }
+
+    #[test]
     fn published_local_failure_is_retained_and_retried_without_republication() {
         let fixture = RuntimeHostFixture::safe("sync-runtime-local-published-retry");
         let handle = active_handle(SyncRuntimeHandle::open(fixture.request()));
@@ -12116,6 +12178,260 @@ mod tests {
              the acceptance ceiling is {} plus separately bounded dependency-edge checks",
             BATCH_COUNT * 3,
         );
+    }
+
+    #[test]
+    fn restarted_provider_child_accepts_manifestless_no_op_dependency_after_duplicate_reordering() {
+        let (initiator, receiver, initiator_handle, receiver_handle) =
+            joined_shared_pair("provider-no-op-dependency", 0xd400);
+        let mut observer = make_shared_fixture("provider-no-op-dependency-observer", 0xd400);
+        observer.request.identities.endpoint_id =
+            ProjectionEndpointId::from_uuid(Uuid::from_u128(0xd430));
+        observer.request.identities.device_id = DeviceId::from_uuid(Uuid::from_u128(0xd431));
+        observer.request.identities.session_id = SessionId::from_uuid(Uuid::from_u128(0xd432));
+        copy_provider_tree(
+            &initiator.request.provider_root,
+            &observer.request.provider_root,
+        );
+        let descriptor = inspect_shared_enrollment(&observer.request.provider_root)
+            .unwrap()
+            .unwrap();
+        let observer_active = SyncRuntimeHandle::activate_or_resume_local(observer.request.clone());
+        let observer_joining = observer_active.handle.expect("observer LocalActive");
+        drive_initial_feed(&observer_joining);
+        observer_joining
+            .join_shared(descriptor)
+            .expect("observer SharedActive");
+        drop(observer_joining);
+        let observer_handle =
+            active_handle(SyncRuntimeHandle::open(reopen_request(&observer.request)));
+        settle_shared_provider(&observer_handle);
+
+        let (base_batch, page_id, _, _) = submit_shared_page(
+            &initiator_handle,
+            0xd420,
+            "No Op Dependency Base",
+            "notes/no-op-dependency-base.md",
+            "stable dependency bytes",
+        );
+        publish_shared_batch(&initiator_handle, &initiator, base_batch);
+        settle_shared_provider(&initiator_handle);
+        copy_provider_tree(
+            &initiator.request.provider_root,
+            &receiver.request.provider_root,
+        );
+        copy_provider_tree(
+            &initiator.request.provider_root,
+            &observer.request.provider_root,
+        );
+        receiver_handle
+            .observe_provider_paths(vec![format!("manifests/{base_batch}.manifest")], false)
+            .unwrap();
+        observer_handle
+            .observe_provider_paths(vec![format!("manifests/{base_batch}.manifest")], false)
+            .unwrap();
+        settle_shared_provider(&receiver_handle);
+        settle_shared_provider(&observer_handle);
+
+        let initiator_store = ObjectStore::open(
+            &initiator.request.archive_root,
+            initiator.request.identities.workspace_id,
+        )
+        .unwrap();
+        let base_manifest =
+            OperationBatch::decode(&initiator_store.read_manifest_bytes(base_batch).unwrap())
+                .unwrap();
+        let semantic_document = base_manifest
+            .required_objects()
+            .iter()
+            .find(|object| object.kind() == crate::oplog::ObjectKind::SemanticEffect)
+            .expect("base batch has a semantic object")
+            .document_id();
+        let empty_effect =
+            crate::oplog::SemanticEffect::new(Vec::new(), Vec::new(), Vec::new()).unwrap();
+        let empty_effect_bytes = empty_effect.encode().unwrap();
+        let empty_effect_object = OperationObject::new(
+            base_manifest.workspace_id(),
+            semantic_document,
+            crate::oplog::ObjectKind::SemanticEffect,
+            empty_effect_bytes.clone(),
+        )
+        .unwrap();
+        let no_op_batch = BatchId::from_uuid(Uuid::from_u128(0xd425));
+        let headless_no_op_manifest = OperationBatch::new_with_causality(
+            base_manifest.workspace_id(),
+            base_manifest.lineage_digest(),
+            no_op_batch,
+            base_manifest.author_device_id(),
+            base_manifest.author_session_id(),
+            base_manifest.origin(),
+            crate::oplog::BatchCausalDot::new(
+                base_manifest.causal_dot().peer_id(),
+                base_manifest.causal_dot().counter().checked_add(1).unwrap(),
+            )
+            .unwrap(),
+            vec![base_batch],
+            crate::oplog::FrontierV2::new(Vec::new()).unwrap(),
+            crate::oplog::SemanticEffectDigest::of(&empty_effect_bytes),
+            vec![empty_effect_object.descriptor().unwrap()],
+        )
+        .unwrap();
+        assert!(
+            headless_no_op_manifest
+                .required_objects()
+                .iter()
+                .all(|object| object.kind() != crate::oplog::ObjectKind::CrdtUpdate),
+            "fixture no-op unexpectedly acquired a document head"
+        );
+        let mut manual_provider = SharedProviderTransport::open(
+            &initiator.request.provider_root,
+            &initiator.request.provider_journal_root,
+        )
+        .unwrap();
+        let empty_effect_descriptor = empty_effect_object.descriptor().unwrap();
+        manual_provider
+            .publish_object(
+                empty_effect_descriptor.content_digest(),
+                &empty_effect_object.encode().unwrap(),
+            )
+            .unwrap();
+        manual_provider
+            .publish_manifest(no_op_batch, &headless_no_op_manifest.encode().unwrap())
+            .unwrap();
+        copy_provider_tree(
+            &initiator.request.provider_root,
+            &receiver.request.provider_root,
+        );
+        copy_provider_tree(
+            &initiator.request.provider_root,
+            &observer.request.provider_root,
+        );
+        let mut no_op_delivery = headless_no_op_manifest
+            .required_objects()
+            .iter()
+            .map(|object| format!("objects/{}.object", object.content_digest()))
+            .collect::<Vec<_>>();
+        no_op_delivery.push(format!("manifests/{no_op_batch}.manifest"));
+        receiver_handle
+            .observe_provider_paths(no_op_delivery.clone(), false)
+            .unwrap();
+        observer_handle
+            .observe_provider_paths(no_op_delivery, false)
+            .unwrap();
+        settle_shared_provider(&receiver_handle);
+        settle_shared_provider(&observer_handle);
+        assert!(matches!(
+            observer_handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+
+        let child_batch = submit_durable(
+            &receiver_handle,
+            vec![SemanticOperation::SetPagePreamble {
+                page_id,
+                preamble: Some("child delivered after restart".into()),
+            }],
+        );
+        let receiver_store = ObjectStore::open(
+            &receiver.request.archive_root,
+            receiver.request.identities.workspace_id,
+        )
+        .unwrap();
+        let locally_authored_child_manifest =
+            OperationBatch::decode(&receiver_store.read_manifest_bytes(child_batch).unwrap())
+                .unwrap();
+        let child_manifest = OperationBatch::new_with_causality(
+            locally_authored_child_manifest.workspace_id(),
+            locally_authored_child_manifest.lineage_digest(),
+            locally_authored_child_manifest.batch_id(),
+            locally_authored_child_manifest.author_device_id(),
+            locally_authored_child_manifest.author_session_id(),
+            locally_authored_child_manifest.origin(),
+            locally_authored_child_manifest.causal_dot(),
+            vec![no_op_batch],
+            locally_authored_child_manifest
+                .dependency_frontier()
+                .clone(),
+            locally_authored_child_manifest.semantic_effect_digest(),
+            locally_authored_child_manifest.required_objects().to_vec(),
+        )
+        .unwrap();
+        assert_eq!(
+            child_manifest.causal_dependency_heads(),
+            &[no_op_batch],
+            "fixture child must depend directly on the accepted no-op"
+        );
+        let mut receiver_provider = SharedProviderTransport::open(
+            &receiver.request.provider_root,
+            &receiver.request.provider_journal_root,
+        )
+        .unwrap();
+        for object in child_manifest.required_objects() {
+            receiver_provider
+                .publish_object(
+                    object.content_digest(),
+                    &receiver_store
+                        .read_object_bytes(object.content_digest())
+                        .unwrap(),
+                )
+                .unwrap();
+        }
+        receiver_provider
+            .publish_manifest(child_batch, &child_manifest.encode().unwrap())
+            .unwrap();
+        copy_provider_tree(
+            &receiver.request.provider_root,
+            &observer.request.provider_root,
+        );
+        for tree in ["inbox", "outbox"] {
+            let parent_manifest = observer
+                .request
+                .provider_root
+                .join(tree)
+                .join(format!("manifests/{no_op_batch}.manifest"));
+            if parent_manifest.is_file() {
+                fs::remove_file(parent_manifest).unwrap();
+            }
+        }
+        let observer_provider = SharedProviderTransport::open(
+            &observer.request.provider_root,
+            &observer.request.provider_journal_root,
+        )
+        .unwrap();
+        assert!(
+            observer_provider
+                .read_exact(&format!("manifests/{no_op_batch}.manifest"))
+                .unwrap()
+                .is_none(),
+            "the scheduler proof must not rely on the no-op manifest being present"
+        );
+
+        let child_path = format!("manifests/{child_batch}.manifest");
+        let mut reordered_duplicate_delivery = child_manifest
+            .required_objects()
+            .iter()
+            .rev()
+            .map(|object| format!("objects/{}.object", object.content_digest()))
+            .collect::<Vec<_>>();
+        reordered_duplicate_delivery.insert(0, child_path.clone());
+        reordered_duplicate_delivery.push(child_path);
+        let restarted = active_handle(SyncRuntimeHandle::open(reopen_request(&observer.request)));
+        restarted
+            .observe_provider_paths(reordered_duplicate_delivery, false)
+            .unwrap();
+        settle_shared_provider(&restarted);
+        assert_eq!(restarted.status().unwrap().provider_pending, 0);
+        assert!(
+            fs::read(observer.graph_root.join("notes/no-op-dependency-base.md"))
+                .unwrap()
+                .windows(b"child delivered after restart".len())
+                .any(|window| window == b"child delivered after restart"),
+            "provider child did not settle through its accepted manifest-less no-op dependency"
+        );
+        assert!(matches!(
+            restarted.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
     }
 
     #[test]

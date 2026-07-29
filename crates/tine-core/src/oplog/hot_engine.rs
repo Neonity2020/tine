@@ -12100,6 +12100,48 @@ impl ShardedHotEngine {
         current: &FrontierV2,
         claim_evidence: &[ProjectionClaimEvidence],
     ) -> Result<Option<FrontierV2>, EngineError> {
+        let path_key = page.path.portable_key().digest();
+        let Some(occupied) = self
+            .portable_path_records_many(&[path_key])?
+            .remove(&path_key)
+            .and_then(|record| record.occupied().cloned())
+            .filter(|occupied| {
+                occupied.page_id() == page.page_id && occupied.exact_path() == &page.path
+            })
+        else {
+            return Ok(None);
+        };
+        let Some(index) = self.projection_work_index.as_ref() else {
+            return Ok(None);
+        };
+        let completed = index
+            .completed_receipts_for_path(&page.path)
+            .map_err(|error| EngineError::ProjectionWork(error.to_string()))?;
+        // A remote page may not have a local completion yet; that is the
+        // first-projection case, not evidence of an external delete. Once this
+        // endpoint has completed the path, however, only the unique completion
+        // in the current acquisition lifecycle can authorize historical reuse.
+        let mut lifecycle_completion = None;
+        for completion in &completed {
+            if completion.page_id() != page.page_id || completion.path() != &page.path {
+                continue;
+            }
+            let ProjectionWorkTarget::Present(completed_target) = completion.target() else {
+                continue;
+            };
+            if !self.projection_frontier_contains_path_acquisition(
+                completion.frontier(),
+                occupied.acquisition_batch(),
+            )? {
+                continue;
+            }
+            if lifecycle_completion
+                .replace((completion.frontier(), completed_target))
+                .is_some()
+            {
+                return Ok(None);
+            }
+        }
         let mut candidate_batches = BTreeSet::new();
         for document in current
             .documents()
@@ -12120,11 +12162,25 @@ impl ShardedHotEngine {
         let mut stable = None;
         for batch_id in candidate_batches {
             for intent in self.load_accepted_projection_intents(batch_id)? {
+                // The portable-path acquisition is the lifecycle identity.
+                // A prior A projection after A -> B -> A cannot authorize the
+                // next A acquisition because its causal frontier cannot contain
+                // that later acquisition batch.
                 if intent.page_id() != page.page_id
                     || intent.path() != &page.path
                     || intent.claim_evidence() != claim_evidence
                     || !matches!(intent.target(), ManifestProjectionTarget::Present { .. })
+                    || !self.projection_frontier_contains_path_acquisition(
+                        intent.post_frontier(),
+                        occupied.acquisition_batch(),
+                    )?
                 {
+                    continue;
+                }
+                if lifecycle_completion.is_some_and(|(frontier, target)| {
+                    intent.post_frontier() != frontier
+                        || intent.target().description() != Some(target)
+                }) {
                     continue;
                 }
                 let candidate_non_catalog = intent
@@ -12175,6 +12231,43 @@ impl ShardedHotEngine {
             }
         }
         Ok(stable)
+    }
+
+    fn projection_frontier_contains_path_acquisition(
+        &self,
+        frontier: &FrontierV2,
+        acquisition_batch: BatchId,
+    ) -> Result<bool, EngineError> {
+        let heads = declared_batch_heads(frontier);
+        if heads.contains(&acquisition_batch) {
+            return Ok(true);
+        }
+        let Some(store) = self.scratch.as_ref() else {
+            return Ok(false);
+        };
+        let Some(acquisition) =
+            super::causal_index::batch_record(store, &self.scratch_roots, acquisition_batch)
+                .map_err(|error| EngineError::Archive(error.to_string()))?
+        else {
+            return Ok(false);
+        };
+        for head in heads {
+            let record = super::causal_index::batch_record(store, &self.scratch_roots, head)
+                .map_err(|error| EngineError::Archive(error.to_string()))?
+                .ok_or_else(|| {
+                    EngineError::Archive(format!(
+                        "projection frontier head {head} has no authenticated causal record"
+                    ))
+                })?;
+            if acquisition
+                .clock()
+                .iter()
+                .all(|(peer, counter)| record.counter(*peer) >= *counter)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub fn canonical_snapshot(&self) -> Result<super::CanonicalSnapshot, EngineError> {
@@ -12940,17 +13033,17 @@ impl ShardedHotEngine {
         ))
     }
 
-    /// Prove that the current authenticated accepted frontier contains a
-    /// dependency's effects, even when that dependency is no longer a direct
-    /// head or has no manifest in this endpoint's archive.
+    /// Prove that the current authenticated accepted history contains a
+    /// dependency's effects, even when that dependency has no document head or
+    /// publishable manifest in this endpoint's archive.
     ///
-    /// Provider dependency scheduling cannot use archive presence as the
-    /// oracle: bootstrap/adoption may leave a synthetic accepted head whose
-    /// causal record and effects are authenticated by current engine state but
-    /// which deliberately has no publishable manifest. A current direct head
-    /// proves containment itself. A transitive ancestor is proven by its
-    /// authenticated causal record and a current accepted head whose
-    /// authenticated sparse clock contains the ancestor's causal dot.
+    /// Acceptance is monotonic in this engine: every accepted batch appends one
+    /// immutable sequence entry and one accepted-batch map entry before the
+    /// current accepted authority advances, and neither structure has a delete
+    /// transition. Exact accepted status is therefore sufficient only after it
+    /// is cross-checked against that current append-only sequence and authority.
+    /// This remains a constant-count point proof; it never materializes the
+    /// document frontier or walks causal history.
     pub(crate) fn accepted_frontier_contains_batch_effects(
         &self,
         batch_id: BatchId,
@@ -12959,62 +13052,56 @@ impl ShardedHotEngine {
         if let Some(error) = &self.history_failure {
             return Err(error.clone());
         }
-        // Recovery itself needs this proof for manifest-less synthetic
-        // dependencies, before `ensure_not_blocked` can declare authenticated
-        // replay complete. Read the same authenticated accepted-frontier root
-        // directly; do not weaken ordinary public engine readiness checks.
-        let frontier = if let Some(store) = &self.scratch {
-            materialize_accepted_frontier(store, &self.scratch_roots.accepted_frontier_root)?
-        } else {
-            FrontierV2::new(self.accepted_frontier.values().cloned().collect())?
+        let Some(ArchiveStatus::Accepted { evidence, .. }) = self.archive_status(batch_id)? else {
+            return Ok(false);
         };
-        let heads = declared_batch_heads(&frontier);
-        if heads.contains(&batch_id) {
-            return Ok(true);
+        if evidence.batch_id() != batch_id
+            || evidence.acceptance_sequence() == 0
+            || evidence.acceptance_sequence() > self.next_acceptance_sequence
+            || self.accepted_frontier_root.acceptance_sequence() != self.next_acceptance_sequence
+        {
+            return Err(EngineError::Archive(
+                "accepted status is not bound to the current accepted authority".into(),
+            ));
         }
         if let Some(store) = &self.scratch {
-            let Some(dependency) =
-                super::causal_index::batch_record(store, &self.scratch_roots, batch_id)
-                    .map_err(|error| EngineError::Archive(error.to_string()))?
-            else {
-                return Ok(false);
-            };
-            for head in heads {
-                let record = super::causal_index::batch_record(store, &self.scratch_roots, head)
-                    .map_err(|error| EngineError::Archive(error.to_string()))?
-                    .ok_or_else(|| {
-                        EngineError::Archive(format!(
-                            "accepted frontier head {head} has no authenticated causal record"
-                        ))
-                    })?;
-                if dependency
-                    .clock()
-                    .iter()
-                    .all(|(peer, counter)| record.counter(*peer) >= *counter)
-                {
-                    return Ok(true);
-                }
+            let batch_map_root = &self.scratch_roots.accepted_batch_map_root;
+            if batch_map_root.count() != self.next_acceptance_sequence
+                || batch_map_root.root_key() != self.accepted_frontier_root.batch_map_root_key()
+                || batch_map_root.root_digest()
+                    != self.accepted_frontier_root.batch_map_root_digest()
+            {
+                return Err(EngineError::Archive(
+                    "accepted batch map is not bound to the current accepted authority".into(),
+                ));
             }
-            return Ok(false);
+            let entry = store
+                .lookup_accepted_sequence(
+                    &self.scratch_roots.accepted_sequence_root,
+                    evidence.acceptance_sequence(),
+                )
+                .map_err(|error| EngineError::Archive(error.to_string()))?
+                .ok_or_else(|| {
+                    EngineError::Archive(
+                        "accepted status has no authenticated accepted-sequence entry".into(),
+                    )
+                })?;
+            let sequence_evidence = decode_accepted_evidence(&entry.evidence)?;
+            if entry.batch_id != batch_id || sequence_evidence != evidence {
+                return Err(EngineError::Archive(
+                    "accepted status and accepted-sequence membership disagree".into(),
+                ));
+            }
+        } else if self.accepted_sequence.get(&evidence.acceptance_sequence()) != Some(&batch_id)
+            || !self
+                .ephemeral_accepted_batch_entries
+                .contains_key(&batch_id)
+        {
+            return Err(EngineError::Archive(
+                "inline accepted status has no current accepted membership".into(),
+            ));
         }
-        let Some(dependency_dot) = self
-            .archive
-            .get(&batch_id)
-            .map(|batch| batch.manifest().causal_dot())
-        else {
-            return Ok(false);
-        };
-        Ok(heads.into_iter().any(|head| {
-            self.ephemeral_causal_clocks
-                .get(&head)
-                .and_then(|clock| {
-                    clock
-                        .binary_search_by_key(&dependency_dot.peer_id(), |(peer, _)| *peer)
-                        .ok()
-                        .map(|index| clock[index].1)
-                })
-                .is_some_and(|counter| counter >= dependency_dot.counter())
-        }))
+        Ok(true)
     }
 
     fn validate_record_catalog_transition(
@@ -21695,6 +21782,25 @@ mod validation_tests {
         let (no_op, accepted_evidence) = candidate
             .advance_detached_bootstrap_candidate(prepared.clone())
             .unwrap();
+        let membership_reads_before = candidate.scratch.as_ref().unwrap().stats();
+        assert!(
+            candidate
+                .accepted_frontier_contains_batch_effects(evidence.batch_id())
+                .unwrap(),
+            "accepted no-op bootstrap head vanished from dependency containment"
+        );
+        let membership_reads_after = candidate.scratch.as_ref().unwrap().stats();
+        assert_eq!(
+            membership_reads_after.range_reads, membership_reads_before.range_reads,
+            "accepted membership must not scan accepted documents or history"
+        );
+        assert!(
+            membership_reads_after
+                .page_reads
+                .saturating_sub(membership_reads_before.page_reads)
+                <= 8,
+            "accepted membership exceeded its point-bounded page-read ceiling"
+        );
         let descriptor = detached_descriptor(
             &prepared,
             evidence,

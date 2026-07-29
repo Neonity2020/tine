@@ -1417,6 +1417,52 @@
         "failBefore": "proven"
       },
       "notes": "The permanent regression authors two page batches offline from the same synthetic accepted base, unions both immutable device heads, and requires both endpoints to accept and project both branches without returning either author first. Provider dependency registration and blocked rechecks use authenticated accepted-frontier containment, including manifest-less synthetic and transitive accepted ancestors; page-specific projection authority preserves the exact stale-write fence across unrelated concurrent catalog heads."
+    },
+    {
+      "id": "REG-SYNC-PROJECTION-R6-PATH-REACQUISITION-001",
+      "title": "Historical projection frontiers cannot authorize a later portable-path reacquisition",
+      "family": "sync-data-safety",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/oplog/hot_engine.rs",
+          "crates/tine-core/src/sync_runtime.rs"
+        ],
+        "scenario": "sync.projection-r6-portable-path-reacquisition",
+        "failBefore": "proven"
+      },
+      "notes": "The permanent local regression creates a Markdown page and renames it A→B→A→B, proving every round reaches durable projection instead of retrying against the original A frontier. Historical projection reuse is bound to the current portable-path owner and acquisition batch, and any existing local completion must uniquely match that lifecycle and target. The neighboring unrelated-frontier external-delete regression remains covered so the correction does not weaken intentional delete authority."
+    },
+    {
+      "id": "REG-SYNC-SHARED-PROVIDER-R6-ACCEPTED-NOOP-001",
+      "title": "Accepted headless no-op dependencies remain authenticated scheduler members after restart",
+      "family": "sync-data-safety",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/oplog/hot_engine.rs",
+          "crates/tine-core/src/sync_runtime.rs"
+        ],
+        "scenario": "sync.shared-provider-r6-accepted-noop-membership",
+        "failBefore": "proven"
+      },
+      "notes": "The engine proof retains an accepted bootstrap no-op that has no document head and bounds membership to authenticated point reads over exact accepted status, append-only accepted sequence, accepted-batch map, and current accepted authority. The provider regression accepts a synthetic headless dependency, removes its provider manifest, restarts the receiver, duplicates and reorders a real CRDT child's delivery, and requires the child to settle without an absent-manifest shortcut."
     }
   ]
 }
