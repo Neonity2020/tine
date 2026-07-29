@@ -12768,6 +12768,17 @@ impl ShardedHotEngine {
             .map(|record| record.status))
     }
 
+    /// Whether this run has already authenticated the accepted effects of a
+    /// batch. Provider scans are duplicate-prone; replaying finalization
+    /// against a later catalog checkpoint would be both unnecessary and
+    /// incorrect, while projection receipts may still need to drain.
+    pub(crate) fn accepted_batch_is_active(&self, batch_id: BatchId) -> Result<bool, EngineError> {
+        Ok(matches!(
+            self.archive_status(batch_id)?,
+            Some(ArchiveStatus::Accepted { .. })
+        ))
+    }
+
     fn validate_record_catalog_transition(
         &self,
         record: &ColdHistoryRecord,

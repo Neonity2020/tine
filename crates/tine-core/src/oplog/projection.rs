@@ -267,6 +267,134 @@ pub fn derive_receiver_local_projection(
     )
 }
 
+/// Derive and execute a receiver-local projection from one accepted foreign
+/// endpoint intent. The foreign target bytes grant no authority: rendering is
+/// repeated from accepted semantic state and the receiver's exact current
+/// bytes, then committed through the receiver's private receipt store.
+pub(crate) fn execute_receiver_local_projection_under_handoff(
+    graph: &Graph,
+    receipts: &ProjectionReceiptStore,
+    engine: &ShardedHotEngine,
+    source: &ManifestedProjectionIntent,
+    handoff: &crate::model::PublishedHandoffLatch,
+    allow_mutation: bool,
+) -> Result<Option<bool>, ProjectionError> {
+    require_endpoint_authority(graph, receipts, engine)?;
+    let endpoint = engine
+        .projection_endpoint_binding()
+        .ok_or(ProjectionError::EndpointBindingMismatch)?;
+    let current = engine.authorize_projection_write(source.page_id())?;
+    if current.state().page.path != *source.path()
+        || current.state().frontier != *source.post_frontier()
+        || current.state().claim_evidence != source.claim_evidence()
+    {
+        // A later accepted frontier has superseded this immutable provider
+        // intent. Historical bytes remain evidence, but they may not roll the
+        // receiver's graph back.
+        return Ok(Some(false));
+    }
+    let local_base = graph.read_projection_input(source.path())?;
+    let source_absent = matches!(source.target(), ManifestProjectionTarget::Absent);
+    let plan = if source_absent {
+        if source.source_endpoint_id() == endpoint.endpoint_id {
+            return Err(ProjectionError::ReceiverEndpointIsSource);
+        }
+        engine.authorize_projection_recovery(
+            source.page_id(),
+            source.post_frontier(),
+            source.claim_evidence(),
+        )?;
+        let base = local_base.clone().map(BaseBlob::new);
+        let intent = ProjectionIntent::new(
+            engine.workspace_id(),
+            source.page_id(),
+            source.path().clone(),
+            source.post_frontier().clone(),
+            source.claim_evidence().to_vec(),
+            base.as_ref()
+                .map_or(ProjectionPrecondition::Absent, |base| {
+                    ProjectionPrecondition::Base(base.description())
+                }),
+            super::BlobDescription::of(&[]),
+            Vec::new(),
+        )?;
+        ProjectionPlan {
+            intent,
+            base,
+            target: Vec::new(),
+            generated_anchors: Vec::new(),
+        }
+    } else {
+        derive_receiver_local_projection(
+            engine,
+            source,
+            endpoint.endpoint_id,
+            local_base.as_deref(),
+        )?
+    };
+    receipts.publish_intent(plan.intent(), plan.base().map(BaseBlob::bytes))?;
+    let already_complete = receipts.load_completion(plan.intent())?.is_some();
+    if !already_complete && !allow_mutation {
+        return Ok(None);
+    }
+    if !already_complete {
+        let attempts = receipts.load_attempt_reservations(plan.intent())?;
+        let has_attempts = !attempts.is_empty();
+        let mut authority = if !has_attempts {
+            let reservation = receipts.reserve_attempt(plan.intent())?;
+            receipts.begin_mutation(plan.intent(), Some(&reservation))?
+        } else {
+            receipts.begin_mutation(plan.intent(), None)?
+        };
+        let target_is_already_exact =
+            !source_absent && local_base.as_deref() == Some(plan.target());
+        let proof = if target_is_already_exact || has_attempts {
+            if source_absent {
+                let base = plan.base().ok_or(ProjectionError::ReceiverSourceAbsent)?;
+                handoff.recover_removed_page_projection(
+                    graph,
+                    plan.intent().path().as_str(),
+                    base.bytes(),
+                    &mut authority,
+                )?
+            } else {
+                handoff.recover_page_projection(
+                    graph,
+                    plan.intent().path().as_str(),
+                    plan.base().map(BaseBlob::bytes),
+                    plan.target(),
+                    &mut authority,
+                )?
+            }
+        } else if source_absent {
+            match local_base.as_deref() {
+                Some(base) => handoff.remove_page_projection(
+                    graph,
+                    plan.intent().path().as_str(),
+                    base,
+                    &mut authority,
+                )?,
+                None => handoff.confirm_removed_page_projection(
+                    graph,
+                    plan.intent().path().as_str(),
+                    &mut authority,
+                )?,
+            }
+        } else {
+            handoff.write_page_projection(
+                graph,
+                plan.intent().path().as_str(),
+                local_base.as_deref(),
+                plan.target(),
+                &mut authority,
+            )?
+        };
+        receipts.publish_completion(authority, plan.intent(), &proof)?;
+    }
+    record_completed_path(receipts, engine, source.page_id(), plan.intent())?;
+    Ok(Some(!already_complete))
+}
+
 /// Execute one source-endpoint manifested work row. Recovery reloads immutable
 /// target/base objects through the batch locator; no local intent or target
 /// copy is published. Device-local attempt reservations remain forensic, while

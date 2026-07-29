@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex};
 
 use ahash::AHashMap;
 use cap_std::ambient_authority;
-use cap_std::fs::{Dir, OpenOptions};
+use cap_std::fs::{Dir, OpenOptions, ReadDir};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use smallvec::SmallVec;
@@ -88,6 +88,15 @@ const ENGINE_HISTORY_CLAIM_FILE: &str = "engine-history.claim";
 const ENGINE_HISTORY_HEAD_FILE: &str = "engine-history.head";
 const ENGINE_HISTORY_TRANSITION_LOCK_FILE: &str = "engine-history.transition.lock";
 const ENGINE_HISTORY_ROOT_SUFFIX: &str = ".history-root";
+
+/// Retained, O(1)-memory enumeration of immutable manifest commit markers.
+///
+/// The cursor deliberately preserves the filesystem iterator instead of
+/// materializing and sorting the complete archive. Callers which need a full
+/// audit continue to use [`ObjectStore::committed_manifests`].
+pub(crate) struct ObjectStoreManifestCursor {
+    entries: ReadDir,
+}
 const ENGINE_HISTORY_ROOT_SCHEMA_VERSION: u32 = 8;
 /// Device-local promoted-runtime state, published beside the endpoint's durable
 /// engine history.
@@ -1617,6 +1626,34 @@ impl ObjectStore {
         self.stage_manifest_bytes_impl(bytes, false)
     }
 
+    /// Receive a manifest through one exact shared-enrollment descriptor.
+    ///
+    /// Historical bootstrap manifests are admitted only on this path. The
+    /// descriptor authority is checked independently of the manifest before
+    /// the ordinary immutable collision and lineage validation runs.
+    pub(crate) fn stage_shared_provider_manifest_bytes(
+        &self,
+        ingress: &super::enrollment::SharedProviderIngressAuthority,
+        bytes: &[u8],
+    ) -> Result<BatchId, StoreError> {
+        let manifest = OperationBatch::decode(bytes)?;
+        if ingress.workspace_id() != self.workspace_id
+            || manifest.workspace_id() != ingress.workspace_id()
+        {
+            return Err(StoreError::WorkspaceMismatch {
+                expected: self.workspace_id,
+                found: manifest.workspace_id(),
+            });
+        }
+        if manifest.lineage_digest() != ingress.lineage_digest() {
+            return Err(StoreError::LineageMismatch {
+                expected: ingress.lineage_digest(),
+                found: manifest.lineage_digest(),
+            });
+        }
+        self.stage_manifest_bytes_impl(bytes, true)
+    }
+
     /// Stage one canonical historical bootstrap manifest for deterministic
     /// simulator fixture ingress.
     ///
@@ -2860,6 +2897,75 @@ impl ObjectStore {
         Ok(manifests)
     }
 
+    /// Begin an incremental manifest enumeration without opening any manifest
+    /// or object bytes.
+    pub(crate) fn manifest_cursor(&self) -> Result<ObjectStoreManifestCursor, StoreError> {
+        self.counters
+            .directory_enumerations
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(ObjectStoreManifestCursor {
+            entries: self.open_namespace(BATCHES_DIR)?.entries()?,
+        })
+    }
+
+    /// Visit at most one immutable manifest from a retained cursor.
+    ///
+    /// Temporary publication names are validated and skipped. A returned
+    /// manifest is decoded and workspace-bound, but its objects are not opened.
+    pub(crate) fn next_manifest(
+        &self,
+        cursor: &mut ObjectStoreManifestCursor,
+    ) -> Result<Option<OperationBatch>, StoreError> {
+        loop {
+            let Some(entry) = cursor.entries.next() else {
+                return Ok(None);
+            };
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name
+                .to_str()
+                .ok_or_else(|| StoreError::MalformedPath("non-UTF-8 batch entry".into()))?;
+            require_regular_entry(&entry.file_type()?, name)?;
+            if is_temp_name(name) {
+                continue;
+            }
+            let batch_id = parse_manifest_filename(name)?;
+            let bytes = self.read_manifest_bytes(batch_id)?;
+            let manifest = OperationBatch::decode(&bytes)?;
+            if manifest.batch_id() != batch_id {
+                return Err(StoreError::ManifestPathMismatch {
+                    expected: batch_id,
+                    found: manifest.batch_id(),
+                });
+            }
+            return Ok(Some(manifest));
+        }
+    }
+
+    pub(crate) fn read_manifest_bytes(&self, batch_id: BatchId) -> Result<Vec<u8>, StoreError> {
+        let batches = self.open_namespace(BATCHES_DIR)?;
+        let bytes = read_required_regular(
+            &batches,
+            &manifest_filename(batch_id),
+            MAX_MANIFEST_BYTES as u64,
+            None,
+        )?;
+        let manifest = OperationBatch::decode(&bytes)?;
+        if manifest.batch_id() != batch_id {
+            return Err(StoreError::ManifestPathMismatch {
+                expected: batch_id,
+                found: manifest.batch_id(),
+            });
+        }
+        if manifest.workspace_id() != self.workspace_id {
+            return Err(StoreError::WorkspaceMismatch {
+                expected: self.workspace_id,
+                found: manifest.workspace_id(),
+            });
+        }
+        Ok(bytes)
+    }
+
     pub fn contains_object(&self, digest: ContentDigest) -> Result<bool, StoreError> {
         let objects = self.open_namespace(OBJECTS_DIR)?;
         let Some(bytes) = read_optional_regular(
@@ -2882,6 +2988,27 @@ impl ObjectStore {
             });
         }
         Ok(true)
+    }
+
+    pub(crate) fn read_object_bytes(&self, digest: ContentDigest) -> Result<Vec<u8>, StoreError> {
+        let objects = self.open_namespace(OBJECTS_DIR)?;
+        let bytes = read_required_regular(
+            &objects,
+            &object_filename(digest),
+            MAX_OBJECT_BYTES as u64,
+            None,
+        )?;
+        if ContentDigest::of(&bytes) != digest {
+            return Err(StoreError::ObjectPathMismatch(digest));
+        }
+        let object = OperationObject::decode(&bytes)?;
+        if object.workspace_id() != self.workspace_id {
+            return Err(StoreError::WorkspaceMismatch {
+                expected: self.workspace_id,
+                found: object.workspace_id(),
+            });
+        }
+        Ok(bytes)
     }
 
     fn validate_namespace(&self) -> Result<(), StoreError> {

@@ -1197,7 +1197,7 @@
         "scenario": "sync.shared-enrollment-two-device-fault-matrix",
         "failBefore": "proven"
       },
-      "notes": "P3.1 contract test covers LocalActive to SharePrepared to SharedActive for the initiator, LocalActive to Joining to SharedActive for a peer, duplicate/reordered descriptor delivery, malformed partial bootstrap evidence, split-genesis descriptor conflict, dirty unique local tail, projection/base mismatch, and every named enrollment record/head crash cut. P3.2 runtime and UI integration remain intentionally inactive."
+      "notes": "P3.1 contract tests cover LocalActive to SharePrepared to SharedActive for the initiator, LocalActive to Joining to SharedActive for a peer, duplicate/reordered descriptor delivery, malformed partial bootstrap evidence, split-genesis descriptor conflict, dirty unique local tail, portable projection/base mismatch, and every named enrollment record/head crash cut. R5 connects these authorities to the bounded P3.2 runtime and explicit Settings boundary without changing their refusal rules."
     },
     {
       "id": "REG-SYNC-DUPLICATE-COLLISION-AUTHORITY-001",
@@ -1275,6 +1275,33 @@
         "failBefore": "source-proven"
       },
       "notes": "The app persists stable caller-owned activation identities only after every tracked legacy Graph lease drains, while graph refresh and migration share the same transition lock, then publishes exactly one sparse actor or a visible retryable/blocked binding. The recursive root watcher closes its installation interval with one full reconciliation, keeps nested and case-variant Markdown/Org events incremental, and ignores explicit unmanaged file events. The journey activates a pre-populated nested Unicode graph without rewriting its bytes, confirms exact bootstrap receipts, authors and queries through the exact adjacent-tagged actor wire, imports an external edit through the watcher queue, reaches Safe shutdown, exposes stopped runtime as retryable, reopens authenticated LocalActive state, and proves legacy routes remain refused. Focused core cuts prove one-time receipt confirmation resumes before actor publication and a later missing private completion blocks reconciliation without changing externally edited graph bytes."
+    },
+    {
+      "id": "REG-SYNC-SHARED-PROVIDER-R5-001",
+      "title": "Two sparse-v2 devices explicitly share one descriptor-bound lineage and converge bounded filesystem-provider delivery without authorizing partial or conflicting evidence",
+      "family": "sync-data-safety",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "native-app",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/oplog/enrollment.rs",
+          "crates/tine-core/src/oplog/simulator.rs",
+          "crates/tine-core/src/sync_runtime.rs",
+          "src-tauri/src/sync_runtime.rs",
+          "src-tauri/src/watcher.rs",
+          "src/sparseV2Boundary.test.ts"
+        ],
+        "scenario": "sync.shared-provider-r5-two-device-journeys",
+        "failBefore": "source-proven"
+      },
+      "notes": "Covers commit-last prepare-share and crash-resume from SharePrepared, incremental clean join beyond 4,096 provider entries and 8 MiB, both SharedActive roles across restart, reopening more than 64 settled manifests without historical replay, crash-resumable dependency-closed publication including unsafe local-manifest repair after private pending-marker creation failure, independent poll-mode provider delivery, coalesced incomplete-manifest rechecks after adversely reordered exact object delivery, nested nonstandard Unicode Markdown/Org paths, reordered and duplicate delivery, partial bootstrap and split-genesis refusal, dirty unique local-tail refusal, partition/rejoin, receiver-local projection, superseded-frontier rollback refusal, and convergence. A canonical generated Syncthing or Dropbox conflict copy is removed only after exact path, canonical-content, byte-equality, and no-follow retirement proof; differing, absent-target, malformed, or ambiguous evidence remains byte-exact and visibly blocks without graph writes. Continuously unstable full-scan epochs retain their fence and yield to retry backoff after one retry rebase. Tauri exposes bounded explicit prepare/join actions only inside the experimental sparse-v2 Settings flow, keeps provider polling separate from graph-wide reconciliation, and replaces stopped handles with retryable reopen slots after a transient post-transition reopen failure."
     }
   ]
 }

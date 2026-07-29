@@ -20,6 +20,8 @@ describe("experimental sparse-v2 app boundary", () => {
     for (const command of [
       "sparse_v2_status",
       "activate_sparse_v2",
+      "prepare_sparse_v2_share",
+      "join_sparse_v2_shared",
       "sparse_v2_query",
       "sparse_v2_editor_load",
       "sparse_v2_editor_save",
@@ -28,6 +30,10 @@ describe("experimental sparse-v2 app boundary", () => {
     ]) {
       expect(native).toContain(command);
     }
+    expect(settings).toContain("Prepare sharing…");
+    expect(settings).toContain("Join shared sparse v2…");
+    expect(settings).toContain("single enrollment descriptor last");
+    expect(settings).toContain("Independent or dirty local history is never auto-merged");
   });
 
   it("models the adjacent-tagged query reply wire shape", () => {

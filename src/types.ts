@@ -217,10 +217,14 @@ export interface SparseV2RuntimeStatus {
   watcher: SparseV2WatcherStatus;
   last_tick: SparseV2Tick | null;
   detail: string | null;
+  shared_role: "initiator" | "joiner" | null;
+  shared_phase: "share_prepared" | "joining" | "active" | null;
+  provider_pending: number;
 }
 
 export type SparseV2Availability =
   | { state: "legacy_default" }
+  | { state: "joinable"; descriptor_digest: string }
   | { state: "active" }
   | { state: "retryable"; stage: "absent" | "shadow_import" | "verified_local" | "local_active"; detail: string }
   | { state: "blocked"; reason_code: string }

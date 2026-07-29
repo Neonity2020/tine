@@ -10,6 +10,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Changed
 
+- **Experimental sparse-v2 storage can explicitly enroll two honest devices
+  through a shared filesystem provider.** A Safe, idle initiator publishes
+  immutable archive objects and manifests before one descriptor; a second
+  device joins only the exact shared lineage and projection base. Both roles
+  reconcile exact paths or retained incremental cursors through the one actor,
+  without whole-provider archive caps or historical-manifest replay. Durable
+  pending-publication markers resume accepted local and external-import batches
+  after a crash, poll mode observes provider delivery independently of graph
+  polling, and `SharePrepared` resumes before descriptor publication. Exact
+  byte-identical generated conflict copies are retired with no-follow proof;
+  differing or ambiguous evidence remains visible and blocks without graph
+  writes. The Settings actions remain explicit and experimental.
 - **Experimental sparse-v2 storage now has an explicit per-graph application
   boundary.** Opt-in retires and drains the legacy graph authority before
   publishing the durable binding, then routes bounded queries, editor intents,

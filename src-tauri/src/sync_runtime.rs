@@ -14,15 +14,17 @@ use tine_core::oplog::{
     DeviceId, DocumentId, LineageDigest, ProjectionEndpointId, SessionId, WorkspaceId,
 };
 use tine_core::sync_runtime::{
-    SyncAmbiguousEvidence, SyncLocalActivationIdentities, SyncLocalActivationRequest,
-    SyncLocalActivationResult, SyncLocalActivationStage, SyncLocalActivationStatus,
-    SyncNonActiveStage, SyncRuntimeComponent, SyncRuntimeHandle, SyncRuntimeLifecycle,
-    SyncRuntimeOpenRequest, SyncRuntimeOpenResult, SyncRuntimeOpenStatus, SyncRuntimeRecovery,
-    SyncRuntimeStatusSnapshot, SyncRuntimeTick, SyncShutdownOutcome, SyncStorageProfile,
+    inspect_shared_enrollment, SyncAmbiguousEvidence, SyncLocalActivationIdentities,
+    SyncLocalActivationRequest, SyncLocalActivationResult, SyncLocalActivationStage,
+    SyncLocalActivationStatus, SyncNonActiveStage, SyncRuntimeComponent, SyncRuntimeHandle,
+    SyncRuntimeLifecycle, SyncRuntimeOpenRequest, SyncRuntimeOpenResult, SyncRuntimeOpenStatus,
+    SyncRuntimeRecovery, SyncRuntimeStatusSnapshot, SyncRuntimeTick,
+    SyncSharedEnrollmentDescriptor, SyncSharedPhase, SyncSharedRole, SyncShutdownOutcome,
+    SyncStorageProfile,
 };
 use uuid::Uuid;
 
-const BINDING_SCHEMA_VERSION: u32 = 1;
+const BINDING_SCHEMA_VERSION: u32 = 2;
 const SPARSE_BINDING_DIR: &str = "sparse-v2";
 const SPARSE_BINDING_FILE: &str = "binding.json";
 static BINDING_WRITE: Mutex<()> = Mutex::new(());
@@ -59,6 +61,26 @@ impl SparseV2ActivationRecord {
         }
     }
 
+    fn from_shared(
+        graph_root: &Path,
+        graph_meta: GraphMeta,
+        device_id: DeviceId,
+        descriptor: &SyncSharedEnrollmentDescriptor,
+    ) -> Self {
+        Self {
+            schema_version: BINDING_SCHEMA_VERSION,
+            graph_root: graph_root.display().to_string(),
+            graph_meta,
+            workspace_id: descriptor.workspace_id,
+            lineage_digest: descriptor.lineage_digest,
+            catalog_document_id: descriptor.catalog_document_id,
+            endpoint_id: ProjectionEndpointId::new(),
+            device_id,
+            preparation_id: Uuid::new_v4(),
+            activation_session_id: SessionId::new(),
+        }
+    }
+
     fn validate_for(&self, graph_root: &Path) -> Result<(), String> {
         if self.schema_version != BINDING_SCHEMA_VERSION {
             return Err(format!(
@@ -83,11 +105,13 @@ impl SparseV2ActivationRecord {
         Ok(SyncRuntimeOpenRequest {
             profile: SyncStorageProfile::ExperimentalLocal,
             graph_root: PathBuf::from(&self.graph_root),
-            archive_root: PathBuf::from(&self.graph_root).join(".tine-sync/v2"),
+            archive_root: private.join("archive"),
             enrollment_root: private.join("enrollment"),
             receipt_root: private.join("receipts"),
             database_path: private.join("projection/materialization.sqlite"),
             application_runtime_root: private.join("runtime"),
+            provider_root: PathBuf::from(&self.graph_root).join(".tine-sync/v2/shared"),
+            provider_journal_root: private.join("provider/device/journal"),
         })
     }
 
@@ -98,7 +122,7 @@ impl SparseV2ActivationRecord {
         let private = self.private_root(app)?;
         Ok(SyncLocalActivationRequest {
             graph_root: PathBuf::from(&self.graph_root),
-            archive_root: PathBuf::from(&self.graph_root).join(".tine-sync/v2"),
+            archive_root: private.join("archive"),
             enrollment_root: private.join("enrollment"),
             receipt_root: private.join("receipts"),
             database_path: private.join("projection/materialization.sqlite"),
@@ -106,6 +130,8 @@ impl SparseV2ActivationRecord {
             migration_backup_root: private.join("migration-backup"),
             capture_root: private.join("capture"),
             preparation_root: private.join("preparation"),
+            provider_root: PathBuf::from(&self.graph_root).join(".tine-sync/v2/shared"),
+            provider_journal_root: private.join("provider/device/journal"),
             identities: SyncLocalActivationIdentities {
                 workspace_id: self.workspace_id,
                 lineage_digest: self.lineage_digest,
@@ -186,6 +212,9 @@ fn persist_binding_at(path: &Path, record: &SparseV2ActivationRecord) -> Result<
 #[serde(tag = "state", rename_all = "snake_case")]
 pub(crate) enum SparseV2Availability {
     LegacyDefault,
+    Joinable {
+        descriptor_digest: String,
+    },
     Active,
     Retryable {
         stage: String,
@@ -356,13 +385,27 @@ impl SparseV2Binding {
                 .unwrap_or(SparseV2BindingAction::ReopenActive),
             None if matches!(
                 &self.availability,
-                SparseV2Availability::Retryable { stage, .. } if stage == "local_active"
+                SparseV2Availability::Retryable { stage, .. }
+                    if matches!(
+                        stage.as_str(),
+                        "local_active" | "share_prepared" | "joining" | "shared_active"
+                    )
             ) =>
             {
                 SparseV2BindingAction::ReopenActive
             }
             None => SparseV2BindingAction::ActivateOrResume,
         }
+    }
+}
+
+fn retryable_binding(stage: &str, detail: String) -> SparseV2Binding {
+    SparseV2Binding {
+        availability: SparseV2Availability::Retryable {
+            stage: stage.into(),
+            detail,
+        },
+        handle: None,
     }
 }
 
@@ -392,6 +435,9 @@ pub(crate) struct SparseV2RuntimeStatusDto {
     watcher: SparseV2WatcherStatusDto,
     last_tick: Option<SparseV2TickDto>,
     detail: Option<String>,
+    shared_role: Option<String>,
+    shared_phase: Option<String>,
+    provider_pending: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
@@ -410,6 +456,21 @@ impl SparseV2StatusDto {
             availability: SparseV2Availability::LegacyDefault,
             runtime: None,
             can_activate: true,
+            can_retry: false,
+            binding_generation,
+        }
+    }
+
+    pub(crate) fn joinable(
+        binding_generation: u64,
+        descriptor: &SyncSharedEnrollmentDescriptor,
+    ) -> Self {
+        Self {
+            availability: SparseV2Availability::Joinable {
+                descriptor_digest: descriptor.descriptor_digest.clone(),
+            },
+            runtime: None,
+            can_activate: false,
             can_retry: false,
             binding_generation,
         }
@@ -482,6 +543,16 @@ pub(crate) fn runtime_status(snapshot: SyncRuntimeStatusSnapshot) -> SparseV2Run
         },
         last_tick: snapshot.last_tick.map(tick_dto),
         detail: snapshot.detail,
+        shared_role: snapshot.shared_role.map(|role| match role {
+            SyncSharedRole::Initiator => "initiator".into(),
+            SyncSharedRole::Joiner => "joiner".into(),
+        }),
+        shared_phase: snapshot.shared_phase.map(|phase| match phase {
+            SyncSharedPhase::SharePrepared => "share_prepared".into(),
+            SyncSharedPhase::Joining => "joining".into(),
+            SyncSharedPhase::Active => "active".into(),
+        }),
+        provider_pending: snapshot.provider_pending,
     }
 }
 
@@ -614,7 +685,10 @@ pub(crate) fn sparse_v2_status(
     let slot = crate::state::slot_for_context(&state)?;
     Ok(match slot.sparse_binding() {
         Some(binding) => SparseV2StatusDto::from_binding(binding, slot.binding_generation),
-        None => SparseV2StatusDto::legacy(slot.binding_generation),
+        None => match inspect_shared_enrollment(&slot.root_key.join(".tine-sync/v2/shared"))? {
+            Some(descriptor) => SparseV2StatusDto::joinable(slot.binding_generation, &descriptor),
+            None => SparseV2StatusDto::legacy(slot.binding_generation),
+        },
     })
 }
 
@@ -745,6 +819,262 @@ pub(crate) fn activate_sparse_v2(
     ))
 }
 
+/// Publish the already-safe local archive into the single shared v2
+/// namespace, then reopen the same private device binding as SharedActive.
+#[tauri::command]
+pub(crate) fn prepare_sparse_v2_share(
+    app: tauri::AppHandle,
+    state: crate::state::GraphContext<'_>,
+) -> Result<SparseV2StatusDto, String> {
+    let label = state.window.label().to_string();
+    let _transition = state.state.graph_load.lock().unwrap();
+    let slot = crate::state::slot_for_context(&state)?;
+    let record = state
+        .state
+        .sync_runtime
+        .binding_record(&app, &slot.root_key)?
+        .ok_or("sparse-v2 opt-in binding is missing")?;
+    active_handle(&slot)?
+        .prepare_shared()
+        .map_err(|error| error.to_string())?;
+    let binding = match state.state.sync_runtime.open_record(&app, &record) {
+        Ok(binding) => binding,
+        Err(error) => {
+            let replacement = Arc::new(crate::state::GraphSlot::from_sparse_v2(
+                retryable_binding("share_prepared", error.clone()),
+                slot.root_key.clone(),
+                SyncRuntimeFacade::graph_meta(&record),
+            ));
+            state
+                .state
+                .graphs
+                .write()
+                .unwrap()
+                .bind(label, replacement)?;
+            crate::state::poke_watcher(&state.state);
+            return Err(error);
+        }
+    };
+    let replacement = Arc::new(crate::state::GraphSlot::from_sparse_v2(
+        binding,
+        slot.root_key.clone(),
+        SyncRuntimeFacade::graph_meta(&record),
+    ));
+    state
+        .state
+        .graphs
+        .write()
+        .unwrap()
+        .bind(label, Arc::clone(&replacement))?;
+    crate::state::poke_watcher(&state.state);
+    Ok(SparseV2StatusDto::from_binding(
+        replacement
+            .sparse_binding()
+            .expect("replacement is sparse v2"),
+        replacement.binding_generation,
+    ))
+}
+
+/// Explicitly retire the second device's legacy reader/watcher, derive its
+/// private identity from exact provider descriptor evidence, and join.
+#[tauri::command]
+pub(crate) fn join_sparse_v2_shared(
+    app: tauri::AppHandle,
+    state: crate::state::GraphContext<'_>,
+) -> Result<SparseV2StatusDto, String> {
+    let label = state.window.label().to_string();
+    let _transition = state.state.graph_load.lock().unwrap();
+    let slot = crate::state::slot_for_context(&state)?;
+    let descriptor = inspect_shared_enrollment(&slot.root_key.join(".tine-sync/v2/shared"))?
+        .ok_or("the shared enrollment descriptor is not provider-visible")?;
+    if slot.sparse_binding().is_some() {
+        let record = state
+            .state
+            .sync_runtime
+            .binding_record(&app, &slot.root_key)?
+            .ok_or("sparse-v2 opt-in binding is missing")?;
+        active_handle(&slot)?
+            .join_shared(descriptor)
+            .map_err(|error| error.to_string())?;
+        let reopened = match state.state.sync_runtime.open_record(&app, &record) {
+            Ok(binding) => binding,
+            Err(error) => {
+                let replacement = Arc::new(crate::state::GraphSlot::from_sparse_v2(
+                    retryable_binding("shared_active", error.clone()),
+                    slot.root_key.clone(),
+                    SyncRuntimeFacade::graph_meta(&record),
+                ));
+                state
+                    .state
+                    .graphs
+                    .write()
+                    .unwrap()
+                    .bind(label, replacement)?;
+                crate::state::poke_watcher(&state.state);
+                return Err(error);
+            }
+        };
+        let replacement = Arc::new(crate::state::GraphSlot::from_sparse_v2(
+            reopened,
+            slot.root_key.clone(),
+            SyncRuntimeFacade::graph_meta(&record),
+        ));
+        state
+            .state
+            .graphs
+            .write()
+            .unwrap()
+            .bind(label, Arc::clone(&replacement))?;
+        crate::state::poke_watcher(&state.state);
+        return Ok(SparseV2StatusDto::from_binding(
+            replacement
+                .sparse_binding()
+                .expect("replacement is sparse v2"),
+            replacement.binding_generation,
+        ));
+    }
+    let graph = slot.legacy_graph()?;
+    let graph_meta = graph.meta();
+    drop(graph);
+    let record = SparseV2ActivationRecord::from_shared(
+        &slot.root_key,
+        graph_meta.clone(),
+        DeviceId::from_uuid(crate::settings::managed_sync_device_id(&app)?),
+        &descriptor,
+    );
+
+    slot.begin_legacy_retirement()?;
+    let removed = state.state.graphs.write().unwrap().remove(&label);
+    if removed
+        .as_ref()
+        .is_none_or(|removed| removed.binding_generation != slot.binding_generation)
+    {
+        slot.cancel_legacy_retirement()?;
+        return Err("graph binding changed during sparse-v2 join handoff".into());
+    }
+    crate::state::poke_watcher(&state.state);
+    if let Err(error) = slot.wait_for_legacy_drain(LEGACY_DRAIN_TIMEOUT) {
+        slot.cancel_legacy_retirement()?;
+        state
+            .state
+            .graphs
+            .write()
+            .unwrap()
+            .bind(label, Arc::clone(&slot))?;
+        crate::state::poke_watcher(&state.state);
+        return Err(format!("sparse-v2 join handoff is retryable: {error}"));
+    }
+    if let Err(error) = state
+        .state
+        .sync_runtime
+        .persist_binding_record(&app, &record)
+    {
+        slot.cancel_legacy_retirement()?;
+        state
+            .state
+            .graphs
+            .write()
+            .unwrap()
+            .bind(label, Arc::clone(&slot))?;
+        crate::state::poke_watcher(&state.state);
+        return Err(error);
+    }
+    let activated = match state.state.sync_runtime.activate_record(&app, &record) {
+        Ok(activated) => activated,
+        Err(error) => {
+            let replacement = Arc::new(crate::state::GraphSlot::from_sparse_v2(
+                SparseV2Binding {
+                    availability: SparseV2Availability::Retryable {
+                        stage: "activation_request".into(),
+                        detail: error.clone(),
+                    },
+                    handle: None,
+                },
+                slot.root_key.clone(),
+                graph_meta,
+            ));
+            state
+                .state
+                .graphs
+                .write()
+                .unwrap()
+                .bind(label, replacement)?;
+            crate::state::poke_watcher(&state.state);
+            return Err(error);
+        }
+    };
+    let Some(handle) = activated.handle() else {
+        let detail = format!(
+            "join bootstrap did not reach LocalActive: {:?}",
+            activated.availability()
+        );
+        let replacement = Arc::new(crate::state::GraphSlot::from_sparse_v2(
+            activated,
+            slot.root_key.clone(),
+            graph_meta,
+        ));
+        state
+            .state
+            .graphs
+            .write()
+            .unwrap()
+            .bind(label, replacement)?;
+        crate::state::poke_watcher(&state.state);
+        return Err(detail);
+    };
+    if let Err(error) = handle.join_shared(descriptor) {
+        let replacement = Arc::new(crate::state::GraphSlot::from_sparse_v2(
+            activated,
+            slot.root_key.clone(),
+            graph_meta,
+        ));
+        state
+            .state
+            .graphs
+            .write()
+            .unwrap()
+            .bind(label, replacement)?;
+        crate::state::poke_watcher(&state.state);
+        return Err(error.to_string());
+    }
+    let binding = match state.state.sync_runtime.open_record(&app, &record) {
+        Ok(binding) => binding,
+        Err(error) => {
+            let replacement = Arc::new(crate::state::GraphSlot::from_sparse_v2(
+                retryable_binding("shared_active", error.clone()),
+                slot.root_key.clone(),
+                SyncRuntimeFacade::graph_meta(&record),
+            ));
+            state
+                .state
+                .graphs
+                .write()
+                .unwrap()
+                .bind(label, replacement)?;
+            crate::state::poke_watcher(&state.state);
+            return Err(error);
+        }
+    };
+    let replacement = Arc::new(crate::state::GraphSlot::from_sparse_v2(
+        binding,
+        slot.root_key.clone(),
+        graph_meta,
+    ));
+    state
+        .state
+        .graphs
+        .write()
+        .unwrap()
+        .bind(label, Arc::clone(&replacement))?;
+    crate::state::poke_watcher(&state.state);
+    Ok(SparseV2StatusDto::from_binding(
+        replacement
+            .sparse_binding()
+            .expect("replacement is sparse v2"),
+        replacement.binding_generation,
+    ))
+}
+
 #[tauri::command]
 pub(crate) fn sparse_v2_query(
     request: tine_core::sync_runtime::SyncRuntimeQueryRequest,
@@ -839,6 +1169,8 @@ mod tests {
             receipt_root: root.join("missing-receipts"),
             database_path: root.join("missing.sqlite"),
             application_runtime_root: root.join("missing-runtime"),
+            provider_root: root.join("missing-provider"),
+            provider_journal_root: root.join("missing-provider-journal/device/journal"),
         });
         assert_eq!(opened.status, SyncRuntimeOpenStatus::LegacyDefault);
         assert!(opened.handle.is_none());
@@ -909,6 +1241,13 @@ mod tests {
             action_for_runtime_lifecycle(&SyncRuntimeLifecycle::Terminal),
             SparseV2BindingAction::ReturnRetained
         );
+        for stage in ["local_active", "share_prepared", "joining", "shared_active"] {
+            assert_eq!(
+                retryable_binding(stage, "transient reopen failure".into()).action(),
+                SparseV2BindingAction::ReopenActive,
+                "{stage} must not strand a stopped Tauri slot"
+            );
+        }
     }
 
     #[test]
@@ -992,7 +1331,7 @@ mod tests {
         let record = SparseV2ActivationRecord::new(&graph_root, meta.clone(), DeviceId::new());
         let request = SyncLocalActivationRequest {
             graph_root: graph_root.clone(),
-            archive_root: graph_root.join(".tine-sync/v2"),
+            archive_root: private.join("archive"),
             enrollment_root: private.join("enrollment"),
             receipt_root: private.join("receipts"),
             database_path: private.join("projection/materialization.sqlite"),
@@ -1000,6 +1339,8 @@ mod tests {
             migration_backup_root: private.join("migration-backup"),
             capture_root: private.join("capture"),
             preparation_root: private.join("preparation"),
+            provider_root: graph_root.join(".tine-sync/v2/shared"),
+            provider_journal_root: private.join("provider/device/journal"),
             identities: SyncLocalActivationIdentities {
                 workspace_id: record.workspace_id,
                 lineage_digest: record.lineage_digest,
@@ -1018,6 +1359,8 @@ mod tests {
             receipt_root: request.receipt_root.clone(),
             database_path: request.database_path.clone(),
             application_runtime_root: request.application_runtime_root.clone(),
+            provider_root: request.provider_root.clone(),
+            provider_journal_root: request.provider_journal_root.clone(),
         };
 
         let activated = SyncRuntimeHandle::activate_or_resume_local(request);

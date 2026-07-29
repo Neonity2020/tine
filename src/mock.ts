@@ -904,10 +904,37 @@ export function mockBackend(): Backend {
           },
           last_tick: null,
           detail: null,
+          shared_role: null,
+          shared_phase: null,
+          provider_pending: 0,
         },
         can_activate: false,
         can_retry: false,
         binding_generation: sparseV2.binding_generation + 1,
+      };
+      return sparseV2;
+    },
+    async prepareSparseV2Share() {
+      if (!sparseV2.runtime) throw new Error("sparse v2 is not active");
+      sparseV2 = {
+        ...sparseV2,
+        runtime: {
+          ...sparseV2.runtime,
+          shared_role: "initiator",
+          shared_phase: "active",
+        },
+      };
+      return sparseV2;
+    },
+    async joinSparseV2Shared() {
+      if (!sparseV2.runtime) throw new Error("sparse v2 is not active");
+      sparseV2 = {
+        ...sparseV2,
+        runtime: {
+          ...sparseV2.runtime,
+          shared_role: "joiner",
+          shared_phase: "active",
+        },
       };
       return sparseV2;
     },

@@ -234,6 +234,8 @@ export interface Backend {
   enableManagedSync(): Promise<ManagedSyncEnableResult>;
   sparseV2Status(): Promise<SparseV2Status>;
   activateSparseV2(): Promise<SparseV2Status>;
+  prepareSparseV2Share(): Promise<SparseV2Status>;
+  joinSparseV2Shared(): Promise<SparseV2Status>;
   sparseV2Query(request: SparseV2QueryRequest): Promise<SparseV2QueryReply>;
   sparseV2EditorLoad(request: SparseV2EditorLoadRequest): Promise<SparseV2EditorOutcome>;
   sparseV2EditorSave(request: SparseV2EditorSaveRequest): Promise<SparseV2EditorOutcome>;
@@ -695,6 +697,16 @@ class TauriBackend implements Backend {
   }
   async activateSparseV2() {
     const result = await this.call<SparseV2Status>("activate_sparse_v2");
+    this.bindingGeneration = result.binding_generation;
+    return result;
+  }
+  async prepareSparseV2Share() {
+    const result = await this.call<SparseV2Status>("prepare_sparse_v2_share");
+    this.bindingGeneration = result.binding_generation;
+    return result;
+  }
+  async joinSparseV2Shared() {
+    const result = await this.call<SparseV2Status>("join_sparse_v2_shared");
     this.bindingGeneration = result.binding_generation;
     return result;
   }

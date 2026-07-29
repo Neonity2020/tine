@@ -1883,6 +1883,7 @@ function ManagedSyncPanel(): JSX.Element {
   const [status, setStatus] = createSignal<SparseV2Status | null>(null);
   const [loading, setLoading] = createSignal(true);
   const [enabling, setEnabling] = createSignal(false);
+  const [sharing, setSharing] = createSignal(false);
   const retryable = () => {
     const value = status();
     return value?.state === "retryable" ? value : null;
@@ -1941,6 +1942,58 @@ function ManagedSyncPanel(): JSX.Element {
     }
   };
 
+  const prepareShare = async () => {
+    setSharing(true);
+    setGraphTransitioning(true);
+    try {
+      if (!(await flushAll())) {
+        pushToast("Resolve pending save conflicts before preparing sharing.", "error");
+        return;
+      }
+      if (!(await backend().confirm(
+        "Prepare this sparse-v2 graph for another Tine device?\n\n" +
+          "Tine will publish immutable archive objects first and the single enrollment descriptor last under .tine-sync/v2/shared. This remains experimental."
+      ))) return;
+      const result = await backend().prepareSparseV2Share();
+      setStatus(result);
+      pushToast(
+        result.state === "active" ? "Shared sparse-v2 enrollment is active." : "Shared enrollment remains retryable.",
+        result.state === "active" ? "success" : "error"
+      );
+    } catch (error) {
+      pushToast(`Couldn't prepare shared enrollment: ${String(error)}`, "error");
+    } finally {
+      setGraphTransitioning(false);
+      setSharing(false);
+    }
+  };
+
+  const joinShare = async () => {
+    setSharing(true);
+    setGraphTransitioning(true);
+    try {
+      if (!(await flushAll())) {
+        pushToast("Resolve pending save conflicts before joining.", "error");
+        return;
+      }
+      if (!(await backend().confirm(
+        "Join the shared sparse-v2 enrollment visible in this graph?\n\n" +
+          "Tine will verify the exact shared lineage and bootstrap before creating this device's private binding. Independent or dirty local history is never auto-merged."
+      ))) return;
+      const result = await backend().joinSparseV2Shared();
+      setStatus(result);
+      pushToast(
+        result.state === "active" ? "This device joined the shared sparse-v2 graph." : "Shared join remains retryable.",
+        result.state === "active" ? "success" : "error"
+      );
+    } catch (error) {
+      pushToast(`Couldn't join shared enrollment: ${String(error)}`, "error");
+    } finally {
+      setGraphTransitioning(false);
+      setSharing(false);
+    }
+  };
+
   return (
     <>
       <div class="settings-section">Managed sync</div>
@@ -1963,13 +2016,41 @@ function ManagedSyncPanel(): JSX.Element {
                     {enabling() ? "Enabling…" : "Enable sparse v2…"}
                   </button>
                 </Show>
+                <Show when={current().state === "joinable"}>
+                  <button class="settings-btn" disabled={sharing()} onClick={() => void joinShare()}>
+                    {sharing() ? "Joining…" : "Join shared sparse v2…"}
+                  </button>
+                </Show>
                 <Show when={retryable()}>
                   <button class="settings-btn" disabled={enabling()} onClick={() => void enable()}>
                     {enabling() ? "Retrying…" : "Retry sparse-v2 activation"}
                   </button>
                 </Show>
                 <Show when={current().state === "active"}>
-                  <span class="settings-value">Active · sparse v2</span>
+                  <span class="settings-value">
+                    Active · sparse v2
+                    {current().runtime?.shared_phase === "active" && current().runtime?.shared_role
+                      ? ` · shared ${current().runtime?.shared_role}`
+                      : ""}
+                  </span>
+                  <Show when={!current().runtime?.shared_phase || current().runtime?.shared_phase === "share_prepared"}>
+                    <div style={{ "margin-top": "6px" }}>
+                      <button class="settings-btn" disabled={sharing()} onClick={() => void prepareShare()}>
+                        {sharing()
+                          ? "Preparing…"
+                          : current().runtime?.shared_phase === "share_prepared"
+                            ? "Resume preparing sharing"
+                            : "Prepare sharing…"}
+                      </button>
+                    </div>
+                  </Show>
+                  <Show when={current().runtime?.shared_phase === "joining"}>
+                    <div style={{ "margin-top": "6px" }}>
+                      <button class="settings-btn" disabled={sharing()} onClick={() => void joinShare()}>
+                        {sharing() ? "Joining…" : "Resume shared join"}
+                      </button>
+                    </div>
+                  </Show>
                 </Show>
                 <Show when={blocked()}>
                   {(value) => (
@@ -1999,6 +2080,11 @@ function ManagedSyncPanel(): JSX.Element {
                         <div class="settings-hint">
                           External changes pending
                           {runtime().watcher.pending_requires_full_scan ? " · recovery scan required" : ""}
+                        </div>
+                      </Show>
+                      <Show when={runtime().provider_pending > 0}>
+                        <div class="settings-hint">
+                          Provider reconciliation pending · {runtime().provider_pending}
                         </div>
                       </Show>
                       <Show when={runtime().detail}>

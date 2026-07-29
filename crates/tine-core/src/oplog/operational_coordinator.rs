@@ -401,6 +401,7 @@ struct PublishedContinuationCore {
     manifest_digest: ContentDigest,
     retained_bytes: usize,
     reservation: Option<TailReservation>,
+    provider_ingress: bool,
     failure: OperationalCoordinatorError,
 }
 
@@ -467,36 +468,51 @@ impl PublishedContinuationCore {
         // run ahead of SQLite catch-up, so reserving one would only move an
         // honest continuation from the projection phase to the SQLite phase
         // while pushing total work for the journey above the 16-unit target.
-        let stage_limit = budget.remaining.saturating_sub(1) / 2;
-        reprove_workspace_authority(
-            admission,
-            WorkspaceAuthorityBoundary::ArchiveStage,
-            OperationalPhase::ArchiveStage,
-        )?;
-        let stage = engine
-            .stage_archive_batch_bounded(self.batch_id, stage_limit)
-            .map_err(|error| {
-                OperationalCoordinatorError::new(OperationalPhase::ArchiveStage, error.to_string())
-            })?;
-        budget.consume(stage.work(), OperationalPhase::ArchiveStage)?;
-        fault(OperationalFaultPoint::AfterStage)?;
-        require_accepted_stage_disposition(self.batch_id, &stage.outcome().disposition())?;
-
-        let mut events = stage
-            .outcome()
-            .newly_accepted()
-            .iter()
-            .map(|accepted| {
-                AcceptedBatchEvent::from_accepted(engine, &self.archive, accepted.batch_id).map_err(
-                    |error| {
-                        OperationalCoordinatorError::new(
-                            OperationalPhase::TailAdmission,
-                            error.to_string(),
-                        )
-                    },
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let already_accepted = self.provider_ingress
+            && engine
+                .accepted_batch_is_active(self.batch_id)
+                .map_err(|error| {
+                    OperationalCoordinatorError::new(
+                        OperationalPhase::ArchiveStage,
+                        error.to_string(),
+                    )
+                })?;
+        let (mut events, stage_has_more) = if already_accepted {
+            (Vec::new(), false)
+        } else {
+            let stage_limit = budget.remaining.saturating_sub(1) / 2;
+            reprove_workspace_authority(
+                admission,
+                WorkspaceAuthorityBoundary::ArchiveStage,
+                OperationalPhase::ArchiveStage,
+            )?;
+            let stage = engine
+                .stage_archive_batch_bounded(self.batch_id, stage_limit)
+                .map_err(|error| {
+                    OperationalCoordinatorError::new(
+                        OperationalPhase::ArchiveStage,
+                        error.to_string(),
+                    )
+                })?;
+            budget.consume(stage.work(), OperationalPhase::ArchiveStage)?;
+            fault(OperationalFaultPoint::AfterStage)?;
+            require_accepted_stage_disposition(self.batch_id, &stage.outcome().disposition())?;
+            let events = stage
+                .outcome()
+                .newly_accepted()
+                .iter()
+                .map(|accepted| {
+                    AcceptedBatchEvent::from_accepted(engine, &self.archive, accepted.batch_id)
+                        .map_err(|error| {
+                            OperationalCoordinatorError::new(
+                                OperationalPhase::TailAdmission,
+                                error.to_string(),
+                            )
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            (events, stage.has_more())
+        };
         if self.reservation.is_some()
             && !events.iter().any(|event| event.batch_id() == self.batch_id)
         {
@@ -556,13 +572,10 @@ impl PublishedContinuationCore {
             ));
         }
         fault(OperationalFaultPoint::AfterTailAdmission)?;
-        if stage.has_more() {
+        if stage_has_more {
             return Err(OperationalCoordinatorError::new(
                 OperationalPhase::ArchiveStage,
-                format!(
-                    "bounded staging slice consumed {} operations and has durable ready/fanout continuation",
-                    stage.work()
-                ),
+                "bounded staging slice has durable ready/fanout continuation",
             ));
         }
 
@@ -645,6 +658,68 @@ impl PublishedContinuationCore {
             })?;
             budget.consume(1, OperationalPhase::ProjectionDrain)?;
             fault(OperationalFaultPoint::AfterProjection)?;
+        }
+
+        let receiver_endpoint = engine
+            .projection_endpoint_binding()
+            .ok_or_else(|| {
+                OperationalCoordinatorError::new(
+                    OperationalPhase::ProjectionDrain,
+                    "provider receiver has no enrolled projection endpoint",
+                )
+            })?
+            .endpoint_id();
+        let batch = match self.archive.inspect_batch(self.batch_id).map_err(|error| {
+            OperationalCoordinatorError::new(OperationalPhase::ProjectionDrain, error.to_string())
+        })? {
+            BatchInspection::Ready(batch) => batch,
+            BatchInspection::Absent | BatchInspection::Staged { .. } => {
+                return Err(OperationalCoordinatorError::new(
+                    OperationalPhase::ProjectionDrain,
+                    "provider ingress batch became partial before receiver projection",
+                ));
+            }
+        };
+        let projection = super::projection_manifest::validate_projection_object_set(
+            batch.manifest(),
+            batch.objects(),
+        )
+        .map_err(|error| {
+            OperationalCoordinatorError::new(OperationalPhase::ProjectionDrain, error.to_string())
+        })?;
+        for source in projection
+            .intents()
+            .iter()
+            .filter(|source| source.source_endpoint_id() != receiver_endpoint)
+        {
+            reprove_workspace_authority(
+                admission,
+                WorkspaceAuthorityBoundary::ProjectionDrain,
+                OperationalPhase::ProjectionDrain,
+            )?;
+            let consumed = super::projection::execute_receiver_local_projection_under_handoff(
+                graph,
+                receipts,
+                engine,
+                source,
+                &self.guard,
+                budget.remaining > 0,
+            )
+            .map_err(|error| {
+                OperationalCoordinatorError::new(
+                    OperationalPhase::ProjectionDrain,
+                    error.to_string(),
+                )
+            })?;
+            let Some(consumed) = consumed else {
+                return Err(OperationalCoordinatorError::new(
+                    OperationalPhase::ProjectionDrain,
+                    "bounded receiver-local provider projection has durable continuation",
+                ));
+            };
+            if consumed {
+                budget.consume(1, OperationalPhase::ProjectionDrain)?;
+            }
         }
         Ok(self.batch_id)
     }
@@ -786,7 +861,157 @@ impl LocalPublishedContinuation {
 
 pub(crate) struct OperationalCoordinator;
 
+pub(crate) enum ProviderArchiveIngress {
+    Complete,
+    Pending(ProviderArchiveContinuation),
+}
+
+pub(crate) struct ProviderArchiveContinuation {
+    core: PublishedContinuationCore,
+}
+
+impl ProviderArchiveContinuation {
+    pub(crate) const fn batch_id(&self) -> BatchId {
+        self.core.batch_id()
+    }
+
+    pub(crate) fn failure(&self) -> &OperationalCoordinatorError {
+        self.core.failure()
+    }
+}
+
 impl OperationalCoordinator {
+    /// Admit one immutable provider-delivered archive batch through the same
+    /// promoted authority, accepted-history, SQLite, and graph-projection
+    /// boundaries used by authored work.
+    ///
+    /// Provider transport can stage bytes, but it cannot authorize them. This
+    /// method is the production bridge from exact retained bytes to the
+    /// one-actor runtime. Its affine continuation retains the graph handoff
+    /// across every post-manifest retry.
+    pub(crate) fn ingest_archive_batch(
+        session: &mut PromotedRuntimeSession<'_>,
+        graph: &Graph,
+        receipts: &ProjectionReceiptStore,
+        batch_id: BatchId,
+    ) -> Result<ProviderArchiveIngress, OperationalCoordinatorError> {
+        let (admission, engine, database, tail) = session.parts().map_err(|refusal| {
+            OperationalCoordinatorError::revoked(OperationalPhase::Bindings, refusal)
+        })?;
+        authorize_coordinator(&admission, graph, engine)?;
+        let endpoint = engine.projection_endpoint_binding().ok_or_else(|| {
+            OperationalCoordinatorError::new(
+                OperationalPhase::Bindings,
+                "engine has no enrolled projection endpoint",
+            )
+        })?;
+        let archive = verify_bindings(graph, receipts, engine, endpoint, None)?;
+        let validated = match archive.inspect_batch(batch_id).map_err(|error| {
+            OperationalCoordinatorError::new(OperationalPhase::Publication, error.to_string())
+        })? {
+            BatchInspection::Ready(validated) => validated,
+            BatchInspection::Absent | BatchInspection::Staged { .. } => {
+                return Err(OperationalCoordinatorError::new(
+                    OperationalPhase::Publication,
+                    "provider ingress batch is not complete",
+                ));
+            }
+        };
+        let manifest_bytes = validated.manifest().encode().map_err(|error| {
+            OperationalCoordinatorError::new(OperationalPhase::Publication, error.to_string())
+        })?;
+        let retained_bytes =
+            validated
+                .objects()
+                .iter()
+                .try_fold(manifest_bytes.len(), |total, object| {
+                    object
+                        .encode()
+                        .map_err(|error| {
+                            OperationalCoordinatorError::new(
+                                OperationalPhase::Publication,
+                                error.to_string(),
+                            )
+                        })
+                        .and_then(|bytes| {
+                            total.checked_add(bytes.len()).ok_or_else(|| {
+                                OperationalCoordinatorError::new(
+                                    OperationalPhase::Publication,
+                                    "provider ingress retained-byte count overflowed",
+                                )
+                            })
+                        })
+                })?;
+        let origin = validated.manifest().origin();
+        let handoff = graph
+            .mint_handoff_safe(engine.workspace_id(), endpoint)
+            .map_err(|error| {
+                OperationalCoordinatorError::new(OperationalPhase::Bindings, error.to_string())
+            })?;
+        let guard = handoff.into_publisher_guard();
+        guard
+            .verify_binding(graph, engine.workspace_id(), endpoint)
+            .map_err(|error| {
+                OperationalCoordinatorError::new(OperationalPhase::Bindings, error.to_string())
+            })?;
+        let mut core = PublishedContinuationCore {
+            guard: guard.into_published_latch(),
+            endpoint,
+            archive,
+            batch_id,
+            origin,
+            manifest_digest: ContentDigest::of(&manifest_bytes),
+            retained_bytes,
+            reservation: None,
+            provider_ingress: true,
+            failure: OperationalCoordinatorError::new(
+                OperationalPhase::ArchiveStage,
+                "provider ingress has not completed its first bounded slice",
+            ),
+        };
+        match core.resume(&admission, graph, receipts, engine, database, tail) {
+            Ok(_) => {
+                core.guard.complete();
+                Ok(ProviderArchiveIngress::Complete)
+            }
+            Err(error) => {
+                core.failure = error;
+                Ok(ProviderArchiveIngress::Pending(
+                    ProviderArchiveContinuation { core },
+                ))
+            }
+        }
+    }
+
+    pub(crate) fn retry_archive_batch(
+        session: &mut PromotedRuntimeSession<'_>,
+        graph: &Graph,
+        receipts: &ProjectionReceiptStore,
+        mut continuation: ProviderArchiveContinuation,
+    ) -> ProviderArchiveIngress {
+        let (admission, engine, database, tail) = match session.parts() {
+            Ok(parts) => parts,
+            Err(refusal) => {
+                continuation.core.failure =
+                    OperationalCoordinatorError::revoked(OperationalPhase::Bindings, refusal);
+                return ProviderArchiveIngress::Pending(continuation);
+            }
+        };
+        match continuation
+            .core
+            .resume(&admission, graph, receipts, engine, database, tail)
+        {
+            Ok(_) => {
+                continuation.core.guard.complete();
+                ProviderArchiveIngress::Complete
+            }
+            Err(error) => {
+                continuation.core.failure = error;
+                ProviderArchiveIngress::Pending(continuation)
+            }
+        }
+    }
+
     /// Execute one bounded external reconciliation.
     ///
     /// `admission` is the new-architecture write gate: it is derived only from a
@@ -1236,6 +1461,7 @@ fn publish_and_drain(
                 manifest_digest,
                 retained_bytes,
                 reservation: Some(reservation),
+                provider_ingress: false,
                 failure: OperationalCoordinatorError::new(
                     OperationalPhase::Publication,
                     error.to_string(),
@@ -1253,6 +1479,7 @@ fn publish_and_drain(
         manifest_digest,
         retained_bytes,
         reservation: Some(reservation),
+        provider_ingress: false,
         failure: boundary.clone().err().unwrap_or_else(|| {
             OperationalCoordinatorError::new(
                 OperationalPhase::ArchiveStage,

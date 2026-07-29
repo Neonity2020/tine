@@ -68,8 +68,9 @@ use state::AppState;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Mutex, RwLock};
 use sync_runtime::{
-    activate_sparse_v2, sparse_v2_clean_shutdown, sparse_v2_editor_load, sparse_v2_editor_save,
-    sparse_v2_query, sparse_v2_status, sparse_v2_tick,
+    activate_sparse_v2, join_sparse_v2_shared, prepare_sparse_v2_share, sparse_v2_clean_shutdown,
+    sparse_v2_editor_load, sparse_v2_editor_save, sparse_v2_query, sparse_v2_status,
+    sparse_v2_tick,
 };
 #[cfg(desktop)]
 use tauri::Emitter;
@@ -762,6 +763,8 @@ pub fn run() {
             enable_managed_sync,
             sparse_v2_status,
             activate_sparse_v2,
+            prepare_sparse_v2_share,
+            join_sparse_v2_shared,
             sparse_v2_query,
             sparse_v2_editor_load,
             sparse_v2_editor_save,

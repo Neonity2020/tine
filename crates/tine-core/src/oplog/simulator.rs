@@ -29,7 +29,7 @@ use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
 use cap_std::ambient_authority;
 #[cfg(windows)]
 use cap_std::fs::OpenOptionsExt as _;
-use cap_std::fs::{Dir, OpenOptions};
+use cap_std::fs::{Dir, OpenOptions, ReadDir};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -1919,6 +1919,7 @@ impl ProviderRuntime {
             for namespace in [
                 PROVIDER_OBJECTS_NAMESPACE,
                 PROVIDER_MANIFESTS_NAMESPACE,
+                PROVIDER_ENROLLMENT_NAMESPACE,
                 PROVIDER_TEMP_NAMESPACE,
                 PROVIDER_REMOVED_NAMESPACE,
                 PROVIDER_RENAME_EVIDENCE_NAMESPACE,
@@ -2250,6 +2251,397 @@ impl ProviderRuntime {
             entries,
         })
     }
+}
+
+pub(crate) const SHARED_ENROLLMENT_DESCRIPTOR_PATH: &str = "enrollment/shared-enrollment-v1.json";
+
+pub(crate) struct SharedProviderFile {
+    pub(crate) path: String,
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) kind: Option<ProviderItemKind>,
+}
+
+pub(crate) struct SharedProviderScan {
+    pub(crate) files: Vec<SharedProviderFile>,
+}
+
+const PROVIDER_PENDING_PUBLICATION_NAMESPACE: &str = "pending-publication-v1";
+const PROVIDER_PENDING_PUBLICATION_BYTES: usize = 64;
+
+pub(crate) struct SharedProviderObservationCursor {
+    phase: u8,
+    entries: Option<ReadDir>,
+}
+
+pub(crate) struct SharedProviderPublicationCursor {
+    entries: ReadDir,
+}
+
+/// Production-facing composition over the exact filesystem transport used by
+/// deterministic provider scenarios. The transport retains its destination
+/// directory and authenticated retry journal. Normal runtime work uses exact
+/// paths and retained incremental cursors; `scan` remains a simulator audit.
+pub(crate) struct SharedProviderTransport {
+    runtime: ProviderRuntime,
+    journal: ProviderRetryJournal,
+    pending_publication: Dir,
+}
+
+impl SharedProviderTransport {
+    pub(crate) fn open(
+        provider_root: &Path,
+        private_journal_root: &Path,
+    ) -> Result<Self, ScenarioError> {
+        let provider_parent = provider_root.parent().ok_or_else(|| {
+            ScenarioError::UnsafeProviderEntry(provider_root.display().to_string())
+        })?;
+        fs::create_dir_all(provider_parent)
+            .map_err(|error| ScenarioError::Io(error.to_string()))?;
+        let journal_device = private_journal_root.parent().ok_or_else(|| {
+            ScenarioError::UnsafeProviderJournal(private_journal_root.display().to_string())
+        })?;
+        fs::create_dir_all(journal_device).map_err(|error| ScenarioError::Io(error.to_string()))?;
+        let journal = ProviderRetryJournal::open(private_journal_root.to_path_buf())?;
+        let canonical_journal_device = fs::canonicalize(journal_device)
+            .map_err(|error| ScenarioError::Io(error.to_string()))?;
+        let journal_device = Dir::open_ambient_dir(&canonical_journal_device, ambient_authority())
+            .map_err(|error| ScenarioError::Io(error.to_string()))?;
+        ensure_provider_directory(&journal_device, PROVIDER_PENDING_PUBLICATION_NAMESPACE)?;
+        let pending_publication =
+            open_provider_directory(&journal_device, PROVIDER_PENDING_PUBLICATION_NAMESPACE)?;
+        Ok(Self {
+            runtime: ProviderRuntime::open(provider_root.to_path_buf())?,
+            journal,
+            pending_publication,
+        })
+    }
+
+    pub(crate) fn publish_descriptor(&mut self, bytes: &[u8]) -> Result<(), ScenarioError> {
+        self.publish(SHARED_ENROLLMENT_DESCRIPTOR_PATH, bytes)
+    }
+
+    pub(crate) fn publish_object(
+        &mut self,
+        digest: super::ContentDigest,
+        bytes: &[u8],
+    ) -> Result<(), ScenarioError> {
+        self.publish(
+            &format!("{PROVIDER_OBJECTS_NAMESPACE}/{digest}.object"),
+            bytes,
+        )
+    }
+
+    pub(crate) fn publish_manifest(
+        &mut self,
+        batch_id: super::BatchId,
+        bytes: &[u8],
+    ) -> Result<(), ScenarioError> {
+        self.publish(
+            &format!("{PROVIDER_MANIFESTS_NAMESPACE}/{batch_id}.manifest"),
+            bytes,
+        )
+    }
+
+    fn publish(&mut self, path: &str, bytes: &[u8]) -> Result<(), ScenarioError> {
+        let gate = self.journal.acquire_transaction_gate()?;
+        let source = format!("generated:{}", provider_digest(bytes));
+        self.runtime.put_complete(
+            &self.journal,
+            &gate,
+            &source,
+            &source,
+            &ProviderLocation {
+                device: "local".into(),
+                tree: ProviderTree::Outbox,
+                path: path.into(),
+            },
+            bytes,
+            None,
+            None,
+        )
+    }
+
+    pub(crate) fn read_exact(&self, path: &str) -> Result<Option<Vec<u8>>, ScenarioError> {
+        reject_provider_temporary_path(path)?;
+        let limit = match provider_item_kind(path) {
+            Some(ProviderItemKind::Object) => super::MAX_OBJECT_BYTES,
+            Some(ProviderItemKind::Manifest) => super::MAX_MANIFEST_BYTES,
+            None if path == SHARED_ENROLLMENT_DESCRIPTOR_PATH => {
+                super::enrollment::MAX_ENROLLMENT_RECORD_BYTES
+            }
+            None => MAX_PROVIDER_RESCAN_BYTES,
+        };
+        let (parent, name) = self
+            .runtime
+            .parent_and_name(ProviderTree::Outbox, path, false)?;
+        open_provider_regular_optional(&parent, &name, limit, path)
+            .map(|opened| opened.map(|opened| opened.bytes))
+    }
+
+    pub(crate) fn observation_cursor(
+        &self,
+    ) -> Result<SharedProviderObservationCursor, ScenarioError> {
+        Ok(SharedProviderObservationCursor {
+            phase: 0,
+            entries: None,
+        })
+    }
+
+    /// Return one provider-visible path without opening its bytes.
+    ///
+    /// The cursor visits enrollment and manifests before immutable objects, so
+    /// ingress can remain manifest-driven while still eventually surfacing a
+    /// pre-existing generated-object conflict copy.
+    pub(crate) fn next_observed_path(
+        &self,
+        cursor: &mut SharedProviderObservationCursor,
+    ) -> Result<Option<String>, ScenarioError> {
+        loop {
+            if cursor.phase == 0 {
+                if cursor.entries.is_none() {
+                    cursor.entries = Some(
+                        self.runtime
+                            .tree(ProviderTree::Outbox)
+                            .entries()
+                            .map_err(|error| ScenarioError::Io(error.to_string()))?,
+                    );
+                }
+                let Some(entry) = cursor.entries.as_mut().expect("cursor opened").next() else {
+                    cursor.entries = None;
+                    cursor.phase = 1;
+                    continue;
+                };
+                let entry = entry.map_err(|error| ScenarioError::Io(error.to_string()))?;
+                let name = entry
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| ScenarioError::UnsafeProviderEntry("outbox/non-UTF-8".into()))?;
+                let known_namespace = matches!(
+                    name.as_str(),
+                    PROVIDER_ENROLLMENT_NAMESPACE
+                        | PROVIDER_MANIFESTS_NAMESPACE
+                        | PROVIDER_OBJECTS_NAMESPACE
+                        | PROVIDER_TEMP_NAMESPACE
+                        | PROVIDER_REMOVED_NAMESPACE
+                        | PROVIDER_RENAME_EVIDENCE_NAMESPACE
+                );
+                let is_directory = entry
+                    .file_type()
+                    .map_err(|error| ScenarioError::Io(error.to_string()))?
+                    .is_dir();
+                if !known_namespace || !is_directory {
+                    return Err(ScenarioError::UnsafeProviderEntry(name));
+                }
+                continue;
+            }
+            let namespace = match cursor.phase {
+                1 => PROVIDER_ENROLLMENT_NAMESPACE,
+                2 => PROVIDER_MANIFESTS_NAMESPACE,
+                3 => PROVIDER_OBJECTS_NAMESPACE,
+                _ => return Ok(None),
+            };
+            if cursor.entries.is_none() {
+                cursor.entries = Some(
+                    open_provider_directory(self.runtime.tree(ProviderTree::Outbox), namespace)?
+                        .entries()
+                        .map_err(|error| ScenarioError::Io(error.to_string()))?,
+                );
+            }
+            let Some(entry) = cursor.entries.as_mut().expect("cursor opened").next() else {
+                cursor.entries = None;
+                cursor.phase = cursor.phase.saturating_add(1);
+                continue;
+            };
+            let entry = entry.map_err(|error| ScenarioError::Io(error.to_string()))?;
+            let name = entry.file_name().into_string().map_err(|_| {
+                ScenarioError::UnsafeProviderEntry(format!("{namespace}/non-UTF-8"))
+            })?;
+            let path = format!("{namespace}/{name}");
+            if path.len() > MAX_PROVIDER_PATH_BYTES || !valid_provider_path(&path) {
+                return Err(ScenarioError::UnsafeProviderEntry(path));
+            }
+            if !entry
+                .file_type()
+                .map_err(|error| ScenarioError::Io(error.to_string()))?
+                .is_file()
+            {
+                return Err(ScenarioError::UnsafeProviderEntry(path));
+            }
+            let file = open_provider_file_nofollow(
+                &open_provider_directory(self.runtime.tree(ProviderTree::Outbox), namespace)?,
+                &name,
+            )
+            .map_err(|error| ScenarioError::UnsafeProviderEntry(error.to_string()))?;
+            validate_provider_regular_file(&file, &path)?;
+            return Ok(Some(path));
+        }
+    }
+
+    pub(crate) fn record_pending_publication(
+        &self,
+        batch_id: super::BatchId,
+    ) -> Result<(), ScenarioError> {
+        let gate = self.journal.acquire_transaction_gate()?;
+        self.journal.require_transaction_gate(&gate)?;
+        let name = format!("{batch_id}.pending");
+        let bytes = batch_id.to_string().into_bytes();
+        if let Some(mut existing) = open_provider_regular_optional(
+            &self.pending_publication,
+            &name,
+            PROVIDER_PENDING_PUBLICATION_BYTES,
+            &name,
+        )? {
+            return validate_local_file_bytes(&mut existing.file, &bytes, &name);
+        }
+        pending_publication_marker_creation_hook()?;
+        let mut file = create_local_file_exclusive(&self.pending_publication, &name)?;
+        file.write_all(&bytes)
+            .map_err(|error| ScenarioError::Io(error.to_string()))?;
+        file.sync_all()
+            .map_err(|error| ScenarioError::Io(error.to_string()))?;
+        validate_local_file_bytes(&mut file, &bytes, &name)?;
+        sync_provider_directory(&self.pending_publication)
+    }
+
+    pub(crate) fn pending_publication_cursor(
+        &self,
+    ) -> Result<SharedProviderPublicationCursor, ScenarioError> {
+        Ok(SharedProviderPublicationCursor {
+            entries: self
+                .pending_publication
+                .entries()
+                .map_err(|error| ScenarioError::Io(error.to_string()))?,
+        })
+    }
+
+    pub(crate) fn next_pending_publication(
+        &self,
+        cursor: &mut SharedProviderPublicationCursor,
+    ) -> Result<Option<super::BatchId>, ScenarioError> {
+        let Some(entry) = cursor.entries.next() else {
+            return Ok(None);
+        };
+        let entry = entry.map_err(|error| ScenarioError::Io(error.to_string()))?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| ScenarioError::UnsafeProviderJournal("non-UTF-8 publication".into()))?;
+        let id = name
+            .strip_suffix(".pending")
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .map(super::BatchId::from_uuid)
+            .ok_or_else(|| ScenarioError::UnsafeProviderJournal(name.clone()))?;
+        let bytes = id.to_string().into_bytes();
+        let mut opened = open_provider_regular_optional(
+            &self.pending_publication,
+            &name,
+            PROVIDER_PENDING_PUBLICATION_BYTES,
+            &name,
+        )?
+        .ok_or_else(|| ScenarioError::UnsafeProviderJournal(name.clone()))?;
+        validate_local_file_bytes(&mut opened.file, &bytes, &name)?;
+        Ok(Some(id))
+    }
+
+    pub(crate) fn complete_pending_publication(
+        &self,
+        batch_id: super::BatchId,
+    ) -> Result<(), ScenarioError> {
+        let gate = self.journal.acquire_transaction_gate()?;
+        self.journal.require_transaction_gate(&gate)?;
+        let name = format!("{batch_id}.pending");
+        let bytes = batch_id.to_string().into_bytes();
+        let Some(mut opened) = open_provider_regular_optional(
+            &self.pending_publication,
+            &name,
+            PROVIDER_PENDING_PUBLICATION_BYTES,
+            &name,
+        )?
+        else {
+            return Ok(());
+        };
+        validate_local_file_bytes(&mut opened.file, &bytes, &name)?;
+        self.pending_publication
+            .remove_file(&name)
+            .map_err(|error| ScenarioError::Io(error.to_string()))?;
+        sync_provider_directory(&self.pending_publication)
+    }
+
+    /// Remove one provider-generated conflict name only after the retained
+    /// transaction proves it is byte-identical to one exact canonical path.
+    ///
+    /// The ordinary crash-recovery retirement journal performs the actual
+    /// no-follow removal, so a pathname replacement cannot redirect deletion.
+    pub(crate) fn remove_identical_generated_conflict(
+        &self,
+        conflict_path: &str,
+        canonical_path: &str,
+    ) -> Result<(), ScenarioError> {
+        let digest = Sha256::digest(
+            [
+                b"tine/provider-generated-conflict-removal/v1\0".as_slice(),
+                conflict_path.as_bytes(),
+                b"\0",
+                canonical_path.as_bytes(),
+            ]
+            .concat(),
+        );
+        let mut event = [0_u8; 8];
+        event.copy_from_slice(&digest[..8]);
+        run_provider_remove_with(
+            &self.runtime,
+            &self.journal,
+            "local",
+            u64::from_be_bytes(event),
+            ProviderTree::Outbox,
+            conflict_path,
+            Some(canonical_path),
+        )
+    }
+
+    pub(crate) fn scan(&self) -> Result<SharedProviderScan, ScenarioError> {
+        let files = bounded_provider_files(
+            self.runtime.tree(ProviderTree::Outbox),
+            false,
+            MAX_PROVIDER_RESCAN_ENTRIES,
+            MAX_PROVIDER_RESCAN_BYTES,
+        )?
+        .into_iter()
+        .map(|file| SharedProviderFile {
+            kind: provider_item_kind(&file.path),
+            path: file.path,
+            bytes: file.bytes,
+        })
+        .collect();
+        Ok(SharedProviderScan { files })
+    }
+}
+
+pub(crate) fn inspect_shared_provider_descriptor(
+    provider_root: &Path,
+) -> Result<Option<Vec<u8>>, ScenarioError> {
+    let metadata = match fs::symlink_metadata(provider_root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(ScenarioError::Io(error.to_string())),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(ScenarioError::UnsafeProviderEntry(
+            provider_root.display().to_string(),
+        ));
+    }
+    let root = Dir::open_ambient_dir(provider_root, ambient_authority())
+        .map_err(|error| ScenarioError::Io(error.to_string()))?;
+    validate_provider_directory_owner(&root, "shared provider root")?;
+    let outbox = open_provider_directory(&root, "outbox")?;
+    let enrollment = open_provider_directory(&outbox, PROVIDER_ENROLLMENT_NAMESPACE)?;
+    open_provider_regular_optional(
+        &enrollment,
+        "shared-enrollment-v1.json",
+        super::enrollment::MAX_ENROLLMENT_RECORD_BYTES,
+        SHARED_ENROLLMENT_DESCRIPTOR_PATH,
+    )
+    .map(|opened| opened.map(|opened| opened.bytes))
 }
 
 impl ProviderRetryJournal {
@@ -6896,16 +7288,50 @@ fn run_provider_remove(
         .provider_journal
         .as_ref()
         .ok_or_else(|| ScenarioError::DeviceCrashed(runtime.name.clone()))?;
+    run_provider_remove_with(
+        &runtime.provider,
+        journal,
+        &runtime.name,
+        event_id,
+        tree,
+        path,
+        None,
+    )
+}
+
+fn run_provider_remove_with(
+    provider: &ProviderRuntime,
+    journal: &ProviderRetryJournal,
+    provider_name: &str,
+    event_id: u64,
+    tree: ProviderTree,
+    path: &str,
+    identical_canonical_path: Option<&str>,
+) -> Result<(), ScenarioError> {
     let gate = journal.acquire_transaction_gate()?;
     reject_provider_temporary_path(path)?;
-    let (parent, name) = runtime.provider.parent_and_name(tree, path, false)?;
+    let canonical_bytes = identical_canonical_path
+        .map(|canonical_path| {
+            reject_provider_temporary_path(canonical_path)?;
+            let (parent, name) = provider.parent_and_name(tree, canonical_path, false)?;
+            open_provider_regular_optional(
+                &parent,
+                &name,
+                MAX_PROVIDER_RESCAN_BYTES,
+                canonical_path,
+            )?
+            .map(|opened| opened.bytes)
+            .ok_or_else(|| ScenarioError::ProviderConflictingBytes(path.into()))
+        })
+        .transpose()?;
+    let (parent, name) = provider.parent_and_name(tree, path, false)?;
     let operation_binding = format!(
         "event:{event_id}:remove:{}:{path}",
         provider_tree_name(tree)
     );
     let source_provenance = format!(
         "provider:{}:{}:{path}",
-        runtime.name,
+        provider_name,
         provider_tree_name(tree)
     );
     let mut record = match journal.load(
@@ -6922,6 +7348,12 @@ fn run_provider_remove(
             let source =
                 open_provider_regular_optional(&parent, &name, MAX_PROVIDER_RESCAN_BYTES, path)?
                     .ok_or_else(|| ScenarioError::UnknownProviderPath(path.into()))?;
+            if canonical_bytes
+                .as_ref()
+                .is_some_and(|canonical| canonical != &source.bytes)
+            {
+                return Err(ScenarioError::ProviderConflictingBytes(path.into()));
+            }
             let operation_id = ProviderRetryJournal::operation_id(
                 ProviderJournalOperation::Remove,
                 &operation_binding,
@@ -6963,13 +7395,17 @@ fn run_provider_remove(
             record
         }
     };
-    let removed = open_provider_directory(runtime.provider.tree(tree), PROVIDER_REMOVED_NAMESPACE)?;
-    let retirement_evidence = open_provider_directory(
-        runtime.provider.tree(tree),
-        PROVIDER_RENAME_EVIDENCE_NAMESPACE,
-    )?;
+    if canonical_bytes.as_ref().is_some_and(|canonical| {
+        record.source_digest != provider_digest(canonical)
+            || u64::try_from(canonical.len()).ok() != Some(record.source_len)
+    }) {
+        return Err(ScenarioError::ProviderConflictingBytes(path.into()));
+    }
+    let removed = open_provider_directory(provider.tree(tree), PROVIDER_REMOVED_NAMESPACE)?;
+    let retirement_evidence =
+        open_provider_directory(provider.tree(tree), PROVIDER_RENAME_EVIDENCE_NAMESPACE)?;
     if record.phase == ProviderJournalPhase::Cleanup {
-        validate_retired_source(&runtime.provider, &record)?;
+        validate_retired_source(provider, &record)?;
         return journal.complete(&gate, &record);
     }
     if record.phase == ProviderJournalPhase::Prepared {
@@ -6997,7 +7433,7 @@ fn run_provider_remove(
         journal.store(&gate, &record)?;
         provider_journal_after_phase_hook(ProviderJournalPhase::Retired)?;
     }
-    validate_retired_source(&runtime.provider, &record)?;
+    validate_retired_source(provider, &record)?;
     journal.complete(&gate, &record)
 }
 
@@ -7593,6 +8029,7 @@ fn valid_provider_journal_id(value: &str) -> bool {
 
 const PROVIDER_OBJECTS_NAMESPACE: &str = "objects";
 const PROVIDER_MANIFESTS_NAMESPACE: &str = "manifests";
+const PROVIDER_ENROLLMENT_NAMESPACE: &str = "enrollment";
 const PROVIDER_TEMP_NAMESPACE: &str = ".part";
 const PROVIDER_REMOVED_NAMESPACE: &str = "removed";
 const PROVIDER_RENAME_EVIDENCE_NAMESPACE: &str = "rename-evidence";
@@ -9045,6 +9482,7 @@ std::thread_local! {
     static PROVIDER_FINISH_AFTER_GATE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static FAIL_PROVIDER_JOURNAL_AFTER_PHASE: std::cell::RefCell<Option<ProviderJournalPhase>> = const { std::cell::RefCell::new(None) };
     static FAIL_PROVIDER_JOURNAL_BOUNDARY: std::cell::RefCell<Option<ProviderJournalBoundary>> = const { std::cell::RefCell::new(None) };
+    static FAIL_PENDING_PUBLICATION_MARKER_CREATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static PROVIDER_SCAN_ENTRY_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static PROVIDER_SOURCE_INSPECTION_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -9059,6 +9497,27 @@ enum ProviderStagingMode {
 #[cfg(all(test, any(target_os = "linux", target_os = "android")))]
 std::thread_local! {
     static PROVIDER_STAGING_MODE: std::cell::Cell<ProviderStagingMode> = const { std::cell::Cell::new(ProviderStagingMode::Automatic) };
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_pending_publication_marker_creation() {
+    FAIL_PENDING_PUBLICATION_MARKER_CREATION.with(|fail| fail.set(true));
+}
+
+#[cfg(test)]
+fn pending_publication_marker_creation_hook() -> Result<(), ScenarioError> {
+    if FAIL_PENDING_PUBLICATION_MARKER_CREATION.with(|fail| fail.replace(false)) {
+        Err(ScenarioError::Io(
+            "injected pending publication marker creation failure".into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(test))]
+fn pending_publication_marker_creation_hook() -> Result<(), ScenarioError> {
+    Ok(())
 }
 
 fn provider_finish_after_gate_hook() {

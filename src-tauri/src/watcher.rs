@@ -102,6 +102,11 @@ impl RetrySchedule {
         self.due = None;
     }
 
+    fn progressed(&mut self, now: Instant) {
+        self.failures = 0;
+        self.due = Some(now + Duration::from_millis(10));
+    }
+
     fn take_due(&mut self, now: Instant) -> bool {
         if self.due.is_some_and(|due| due <= now) {
             self.due = None;
@@ -455,7 +460,6 @@ fn sparse_observations(
     full_paths: &HashSet<PathBuf>,
     need_full: bool,
     notify_error: bool,
-    inotify: bool,
 ) -> Vec<SyncWatcherObservation> {
     let mut observations = Vec::new();
     let mut unknown = false;
@@ -485,13 +489,58 @@ fn sparse_observations(
     if unknown {
         observations.push(SyncWatcherObservation::UnknownPath);
     }
-    if need_full || !inotify {
+    if need_full {
         observations.push(SyncWatcherObservation::RescanRequired);
     }
     if notify_error {
         observations.push(SyncWatcherObservation::NotifyError);
     }
     observations
+}
+
+fn sparse_provider_observations(
+    root: &Path,
+    paths: &HashSet<PathBuf>,
+    full_paths: &HashSet<PathBuf>,
+) -> (Vec<String>, bool) {
+    let provider = root.join(".tine-sync/v2/shared");
+    let outbox = provider.join("outbox");
+    let mut exact = Vec::new();
+    let mut imprecise = full_paths.iter().any(|path| path.starts_with(&provider));
+    for path in paths.iter().filter(|path| path.starts_with(&provider)) {
+        let Ok(relative) = path.strip_prefix(&outbox) else {
+            imprecise = true;
+            continue;
+        };
+        let Some(relative) = relative.to_str() else {
+            imprecise = true;
+            continue;
+        };
+        let relative = relative.replace(std::path::MAIN_SEPARATOR, "/");
+        let namespace = relative.split('/').next().unwrap_or_default();
+        if matches!(namespace, ".part" | "removed" | "rename-evidence") {
+            // These are transport-owned retry/retirement namespaces. Their
+            // exact churn is not provider ingress and must not turn a local
+            // commit-last rename into graph-wide reconciliation.
+            continue;
+        }
+        if relative.is_empty()
+            || !relative.contains('/')
+            || relative.starts_with('/')
+            || relative.contains('\\')
+            || !matches!(namespace, "enrollment" | "manifests" | "objects")
+            || relative
+                .split('/')
+                .any(|component| component.is_empty() || component == "." || component == "..")
+        {
+            imprecise = true;
+        } else {
+            exact.push(relative);
+        }
+    }
+    exact.sort();
+    exact.dedup();
+    (exact, imprecise)
 }
 
 /// Watch the graph dirs for external changes (Logseq, Syncthing) and reconcile
@@ -657,7 +706,7 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                     (HashSet::new(), HashSet::new(), true, true)
                 }
             } else {
-                (HashSet::new(), HashSet::new(), true, false)
+                (HashSet::new(), HashSet::new(), false, false)
             };
             for (label, graph) in graphs.iter_mut() {
                 let initial_cycle = !graph.baseline;
@@ -740,6 +789,7 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
             for (label, graph) in sparse_graphs.iter_mut() {
                 let retry_due = graph.retry.take_due(Instant::now());
                 let initial_tick = std::mem::take(&mut graph.initial_tick);
+                let poll_cycle = !inotify && !retry_due;
                 // The actor's startup scan can finish before this thread has
                 // replaced the legacy directory watches with the recursive
                 // graph-root watch. One scan after watch installation closes
@@ -748,22 +798,34 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                     &graph.root,
                     &paths,
                     &full_paths,
-                    event_need_full || initial_tick,
+                    event_need_full || initial_tick || poll_cycle,
                     notify_error,
-                    inotify,
                 );
-                if observations.is_empty() && !retry_due && !initial_tick {
+                let (provider_paths, provider_imprecise) =
+                    sparse_provider_observations(&graph.root, &paths, &full_paths);
+                let provider_poll = poll_cycle;
+                if observations.is_empty()
+                    && provider_paths.is_empty()
+                    && !provider_imprecise
+                    && !provider_poll
+                    && !retry_due
+                    && !initial_tick
+                {
                     continue;
                 }
 
-                let result = if observations.is_empty() {
+                let result = (|| {
+                    if !provider_paths.is_empty() || provider_imprecise || provider_poll {
+                        graph.handle.observe_provider_paths(
+                            provider_paths,
+                            provider_imprecise || provider_poll,
+                        )?;
+                    }
+                    if !observations.is_empty() {
+                        graph.handle.observe_watcher(observations)?;
+                    }
                     graph.handle.tick()
-                } else {
-                    graph
-                        .handle
-                        .observe_watcher(observations)
-                        .and_then(|()| graph.handle.tick())
-                };
+                })();
                 match result {
                     Ok(tick) => {
                         let completed = matches!(
@@ -771,22 +833,21 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                             SyncRuntimeTick::AdmittedNoop { .. }
                                 | SyncRuntimeTick::AdmittedComplete { .. }
                         );
-                        let retryable = matches!(
-                            tick,
+                        match &tick {
                             SyncRuntimeTick::LocalMutation(_)
-                                | SyncRuntimeTick::RecoveryBlocked(_)
-                                | SyncRuntimeTick::Recovering
-                                | SyncRuntimeTick::RetryFull
-                                | SyncRuntimeTick::Failed(_)
-                        );
-                        if retryable {
-                            graph.retry.failed(Instant::now());
-                        } else {
-                            graph.retry.succeeded();
+                            | SyncRuntimeTick::Recovering
+                            | SyncRuntimeTick::RetryFull => graph.retry.progressed(Instant::now()),
+                            SyncRuntimeTick::RecoveryBlocked(_) | SyncRuntimeTick::Failed(_) => {
+                                graph.retry.failed(Instant::now())
+                            }
+                            _ => graph.retry.succeeded(),
                         }
                         if matches!(
                             tick,
-                            SyncRuntimeTick::Blocked(_) | SyncRuntimeTick::Terminal(_)
+                            SyncRuntimeTick::RecoveryBlocked(_)
+                                | SyncRuntimeTick::Blocked(_)
+                                | SyncRuntimeTick::Terminal(_)
+                                | SyncRuntimeTick::Failed(_)
                         ) {
                             let message = format!("{tick:?}");
                             if graph.last_error.as_deref() != Some(&message) {
@@ -846,7 +907,14 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                     while rx.try_recv().is_ok() {}
                 }
             } else {
-                std::thread::sleep(Duration::from_secs(3));
+                let now = Instant::now();
+                let retry_wait = sparse_graphs
+                    .values()
+                    .filter_map(|graph| graph.retry.remaining(now))
+                    .min()
+                    .unwrap_or(Duration::from_secs(3))
+                    .min(Duration::from_secs(3));
+                let _ = rx.recv_timeout(retry_wait);
                 while rx.try_recv().is_ok() {}
             }
         }
@@ -1013,7 +1081,7 @@ mod tests {
         let paths = HashSet::from([nested, org, outside]);
         let full_paths = HashSet::from([unknown]);
 
-        let observations = sparse_observations(&root, &paths, &full_paths, true, true, true);
+        let observations = sparse_observations(&root, &paths, &full_paths, true, true);
         assert!(observations
             .contains(&SyncWatcherObservation::managed_path("archive/層/計画.markdown").unwrap()));
         assert!(observations
@@ -1043,7 +1111,6 @@ mod tests {
             &HashSet::new(),
             pending.need_full,
             pending.notify_error,
-            true,
         );
         assert_eq!(
             observations,
@@ -1058,9 +1125,44 @@ mod tests {
     fn sparse_watcher_does_not_reimport_its_private_archive_writes() {
         let root = PathBuf::from("/graph");
         let paths = HashSet::from([root.join(".tine-sync/v2/objects/immutable")]);
-        assert!(
-            sparse_observations(&root, &paths, &HashSet::new(), false, false, true,).is_empty()
+        assert!(sparse_observations(&root, &paths, &HashSet::new(), false, false).is_empty());
+    }
+
+    #[test]
+    fn sparse_provider_poll_and_exact_events_stay_out_of_graph_reconciliation() {
+        let root = PathBuf::from("/graphs/研究");
+        let manifest = root.join(
+            ".tine-sync/v2/shared/outbox/manifests/12345678-1234-1234-1234-123456789abc.manifest",
         );
+        let paths = HashSet::from([manifest]);
+        assert!(
+            sparse_observations(&root, &paths, &HashSet::new(), false, false).is_empty(),
+            "provider polling must not trigger graph-wide reconciliation"
+        );
+        let (provider_paths, imprecise) =
+            sparse_provider_observations(&root, &paths, &HashSet::new());
+        assert_eq!(
+            provider_paths,
+            vec!["manifests/12345678-1234-1234-1234-123456789abc.manifest".to_owned()]
+        );
+        assert!(!imprecise);
+
+        let internal = HashSet::from([
+            root.join(".tine-sync/v2/shared/outbox/.part/local-write"),
+            root.join(".tine-sync/v2/shared/outbox/removed/retired"),
+        ]);
+        let (provider_paths, imprecise) =
+            sparse_provider_observations(&root, &internal, &HashSet::new());
+        assert!(provider_paths.is_empty());
+        assert!(!imprecise);
+
+        // Poll mode has no filesystem paths; its caller independently sets
+        // provider_imprecise=true while requesting a graph rescan only on the
+        // ordinary three-second graph poll.
+        let (provider_paths, imprecise) =
+            sparse_provider_observations(&root, &HashSet::new(), &HashSet::new());
+        assert!(provider_paths.is_empty());
+        assert!(!imprecise);
     }
 
     #[test]
@@ -1091,6 +1193,17 @@ mod tests {
             retry.remaining(start + Duration::from_secs(19)),
             Some(*RETRY_BACKOFF.last().unwrap())
         );
+    }
+
+    #[test]
+    fn recovering_progress_retries_promptly_without_failure_backoff() {
+        let start = Instant::now();
+        let mut retry = RetrySchedule::default();
+        retry.failed(start);
+        retry.progressed(start);
+        assert_eq!(retry.failures, 0);
+        assert!(!retry.take_due(start));
+        assert!(retry.take_due(start + Duration::from_millis(10)));
     }
 
     #[test]

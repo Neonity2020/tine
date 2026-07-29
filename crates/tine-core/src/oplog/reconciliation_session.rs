@@ -30,7 +30,7 @@ use super::{
         ReconciliationScheduler, ReconciliationSchedulerLimits, ReconciliationSchedulerStatus,
         ReconciliationTrigger, ReconciliationWork,
     },
-    ContentDigest, ManagedPath, ProjectionReceiptStore, ShardedHotEngine, SqliteFrontier,
+    BatchId, ContentDigest, ManagedPath, ProjectionReceiptStore, ShardedHotEngine, SqliteFrontier,
     TailOverlay,
 };
 
@@ -148,6 +148,7 @@ pub(crate) struct ReconciliationSession<
     next_continuation_sequence: u64,
     terminal_changed_paths: Option<ReconciliationTerminalChangedPaths>,
     terminal_blocked_detail: Option<String>,
+    completed_batch: Option<BatchId>,
 }
 
 impl<C, B> ReconciliationSession<C, B> {
@@ -159,6 +160,7 @@ impl<C, B> ReconciliationSession<C, B> {
             next_continuation_sequence: 0,
             terminal_changed_paths: None,
             terminal_blocked_detail: None,
+            completed_batch: None,
         }
     }
 
@@ -188,6 +190,10 @@ impl<C, B> ReconciliationSession<C, B> {
     /// blocked step.
     pub(crate) fn take_terminal_blocked_detail(&mut self) -> Option<String> {
         self.terminal_blocked_detail.take()
+    }
+
+    pub(crate) fn take_completed_batch(&mut self) -> Option<BatchId> {
+        self.completed_batch.take()
     }
 
     /// Return the exact stable refusal for an exhausted published
@@ -396,6 +402,12 @@ impl<C, B> ReconciliationSession<C, B> {
     where
         D: ReconciliationSessionDispatch<Continuation = C, PendingBaseline = B>,
     {
+        if let ReconciliationSessionDispatchOutcome::Complete {
+            batch_id: Some(batch_id),
+        } = &outcome
+        {
+            self.completed_batch = Some(*batch_id);
+        }
         let baseline_finish = if let Some(baseline) = baseline {
             let terminal = outcome
                 .baseline_terminal_outcome()
@@ -440,7 +452,7 @@ impl<C, B> ReconciliationSession<C, B> {
                 (ReconciliationSessionDispatchOutcome::Blocked(_), _)
                 | (
                     ReconciliationSessionDispatchOutcome::Noop
-                    | ReconciliationSessionDispatchOutcome::Complete
+                    | ReconciliationSessionDispatchOutcome::Complete { .. }
                     | ReconciliationSessionDispatchOutcome::RetryFull,
                     _,
                 ) => {
@@ -464,7 +476,9 @@ impl<C, B> ReconciliationSession<C, B> {
     ) -> ReconciliationSessionStep {
         match outcome {
             ReconciliationSessionDispatchOutcome::Noop => ReconciliationSessionStep::Noop,
-            ReconciliationSessionDispatchOutcome::Complete => ReconciliationSessionStep::Complete,
+            ReconciliationSessionDispatchOutcome::Complete { .. } => {
+                ReconciliationSessionStep::Complete
+            }
             ReconciliationSessionDispatchOutcome::Blocked(_) => ReconciliationSessionStep::Blocked,
             ReconciliationSessionDispatchOutcome::RetryFull => ReconciliationSessionStep::RetryFull,
             ReconciliationSessionDispatchOutcome::FailedClosed(_) => {
@@ -485,7 +499,7 @@ impl<C, B> ReconciliationSession<C, B> {
                 ReconciliationSessionStep::Noop,
                 None,
             ),
-            ReconciliationSessionDispatchOutcome::Complete => (
+            ReconciliationSessionDispatchOutcome::Complete { .. } => (
                 ReconciliationCompletionOutcome::Complete,
                 ReconciliationSessionStep::Complete,
                 None,
@@ -576,7 +590,7 @@ struct ReconciliationSessionDispatchResult<C, B> {
 
 enum ReconciliationSessionDispatchOutcome<C> {
     Noop,
-    Complete,
+    Complete { batch_id: Option<BatchId> },
     Blocked(BaselineBlockedObservation),
     RetryFull,
     FailedClosed(C),
@@ -586,7 +600,7 @@ impl<C> ReconciliationSessionDispatchOutcome<C> {
     fn baseline_terminal_outcome(&self) -> Option<BaselineTerminalOutcome<'_>> {
         match self {
             Self::Noop => Some(BaselineTerminalOutcome::Noop),
-            Self::Complete => Some(BaselineTerminalOutcome::Complete),
+            Self::Complete { .. } => Some(BaselineTerminalOutcome::Complete),
             Self::Blocked(blocked) => Some(BaselineTerminalOutcome::Blocked(
                 BaselineBlockedRegistration {
                     observation_digest: blocked.observation_digest,
@@ -689,8 +703,10 @@ impl LiveReconciliationSessionDispatch<'_> {
             &requested_paths,
         ) {
             Ok(OperationalCoordinatorState::Noop) => ReconciliationSessionDispatchOutcome::Noop,
-            Ok(OperationalCoordinatorState::Complete(_)) => {
-                ReconciliationSessionDispatchOutcome::Complete
+            Ok(OperationalCoordinatorState::Complete(completion)) => {
+                ReconciliationSessionDispatchOutcome::Complete {
+                    batch_id: Some(completion.batch_id()),
+                }
             }
             Ok(OperationalCoordinatorState::Blocked(plan)) => {
                 let detail = plan
@@ -840,8 +856,10 @@ impl LiveReconciliationSessionDispatch<'_> {
             scan, admission, graph, receipts, engine, database, tail,
         ) {
             ReconciliationImportOutcome::Noop => ReconciliationSessionDispatchOutcome::Noop,
-            ReconciliationImportOutcome::Complete(_) => {
-                ReconciliationSessionDispatchOutcome::Complete
+            ReconciliationImportOutcome::Complete(completion) => {
+                ReconciliationSessionDispatchOutcome::Complete {
+                    batch_id: Some(completion.batch_id()),
+                }
             }
             ReconciliationImportOutcome::Blocked(blocked) => {
                 ReconciliationSessionDispatchOutcome::Blocked(import_blocked_observation(blocked))
@@ -930,8 +948,10 @@ impl ReconciliationSessionDispatch for LiveReconciliationSessionDispatch<'_> {
             ..
         } = &mut self.dependencies;
         match continuation.retry(admission, graph, receipts, engine, database, tail) {
-            OperationalCoordinatorState::Complete(_) => {
-                ReconciliationSessionDispatchOutcome::Complete
+            OperationalCoordinatorState::Complete(completion) => {
+                ReconciliationSessionDispatchOutcome::Complete {
+                    batch_id: Some(completion.batch_id()),
+                }
             }
             OperationalCoordinatorState::FailedClosed(continuation) => {
                 ReconciliationSessionDispatchOutcome::FailedClosed(continuation)
@@ -1484,11 +1504,12 @@ mod tests {
                     ReconciliationSessionDispatchOutcome::Noop,
                     Some(FakePendingBaseline(identity)),
                 ),
-                FakeDispatchResult::Complete => {
-                    (ReconciliationSessionDispatchOutcome::Complete, None)
-                }
+                FakeDispatchResult::Complete => (
+                    ReconciliationSessionDispatchOutcome::Complete { batch_id: None },
+                    None,
+                ),
                 FakeDispatchResult::CompleteWithBaseline(identity) => (
-                    ReconciliationSessionDispatchOutcome::Complete,
+                    ReconciliationSessionDispatchOutcome::Complete { batch_id: None },
                     Some(FakePendingBaseline(identity)),
                 ),
                 FakeDispatchResult::Blocked => (
@@ -1539,7 +1560,9 @@ mod tests {
                 .pop_front()
                 .expect("fixture must supply a resume result")
             {
-                FakeResumeResult::Complete => ReconciliationSessionDispatchOutcome::Complete,
+                FakeResumeResult::Complete => {
+                    ReconciliationSessionDispatchOutcome::Complete { batch_id: None }
+                }
                 FakeResumeResult::FailedClosed(identity) => {
                     ReconciliationSessionDispatchOutcome::FailedClosed(FakeContinuation(identity))
                 }

@@ -154,6 +154,7 @@ pub(crate) enum ExactExternalFeedDrain {
     },
     AdmittedComplete {
         epoch: u64,
+        batch_id: Option<super::BatchId>,
     },
     Terminal(ExactExternalFeedTerminal),
 }
@@ -169,6 +170,8 @@ struct ActiveDrain {
     scope: ActiveDrainScope,
     continuation: Option<ReconciliationPendingContinuation>,
     rebase_before_step: bool,
+    retry_rebase: bool,
+    retry_rebases: u8,
 }
 
 /// Move-only bounded exact-feed state for one actor-owned promoted runtime.
@@ -402,6 +405,8 @@ impl ExactExternalFeedState {
             self.active = Some(ActiveDrain {
                 epoch: drain.epoch(),
                 rebase_before_step: matches!(scope, ActiveDrainScope::FullScan),
+                retry_rebase: false,
+                retry_rebases: 0,
                 scope,
                 continuation: None,
             });
@@ -435,10 +440,12 @@ impl ExactExternalFeedState {
                             self.rebase_count += 1;
                         }
                     }
-                    self.active
-                        .as_mut()
-                        .expect("active drain disappeared")
-                        .rebase_before_step = false;
+                    let active = self.active.as_mut().expect("active drain disappeared");
+                    active.rebase_before_step = false;
+                    if active.retry_rebase {
+                        active.retry_rebases = active.retry_rebases.saturating_add(1);
+                        active.retry_rebase = false;
+                    }
                 }
                 Err(error) => {
                     if let Some(revocation) = runtime.workspace_authority_revocation() {
@@ -524,11 +531,28 @@ impl ExactExternalFeedState {
                 if matches!(active.scope, ActiveDrainScope::Exact(_)) {
                     // A targeted scan which asks for RetryFull has made its
                     // exact hint insufficient. Collapse this same queue epoch
-                    // to its one full rebase. An already-full unstable scan
-                    // retries behind the existing fence without rebasing the
-                    // unchanged epoch again.
+                    // to a full rebase.
                     active.scope = ActiveDrainScope::FullScan;
                     active.rebase_before_step = true;
+                    active.retry_rebase = true;
+                } else if active.retry_rebases == 0 {
+                    // Refresh once for the two-pass race. Further instability
+                    // gets a bounded retry cycle below instead of repeatedly
+                    // rebuilding the complete graph-wide index in one watcher
+                    // turn.
+                    active.rebase_before_step = true;
+                    active.retry_rebase = true;
+                } else {
+                    // Retain and re-arm this exact fenced epoch, but yield a
+                    // failed cycle so the platform retry schedule applies
+                    // backoff before another graph-wide rebase. No epoch is
+                    // acknowledged and no late-path race is discarded.
+                    active.rebase_before_step = true;
+                    active.retry_rebase = false;
+                    active.retry_rebases = 0;
+                    return ExactExternalFeedDrain::Failed(
+                        "continuously unstable full-scan epoch retained for bounded retry".into(),
+                    );
                 }
                 ExactExternalFeedDrain::RetryFull
             }
@@ -722,12 +746,20 @@ impl ExactExternalFeedState {
         {
             return result;
         }
+        let completed_batch = self.reconciliation.take_completed_batch();
         match step {
+            ReconciliationSessionStep::Noop if completed_batch.is_some() => {
+                ExactExternalFeedDrain::AdmittedComplete {
+                    epoch: epoch.sequence(),
+                    batch_id: completed_batch,
+                }
+            }
             ReconciliationSessionStep::Noop => ExactExternalFeedDrain::AdmittedNoop {
                 epoch: epoch.sequence(),
             },
             ReconciliationSessionStep::Complete => ExactExternalFeedDrain::AdmittedComplete {
                 epoch: epoch.sequence(),
+                batch_id: completed_batch,
             },
             _ => unreachable!("finish_terminal accepts only admitted terminal outcomes"),
         }
@@ -2051,9 +2083,92 @@ pub(crate) mod tests {
         ));
         assert_eq!(
             owner.rebase_count,
-            rebases_before + 1,
-            "an unstable full scan must retry behind its existing queue fence"
+            rebases_before + 2,
+            "an unstable full scan must refresh the exact index behind its existing queue fence"
         );
+        let settled = runtime.watcher_status();
+        assert_eq!(settled.acknowledged, settled.latest_enqueue);
+        assert!(!settled.pending);
+    }
+
+    #[test]
+    fn continuously_unstable_epoch_bounds_graph_wide_rebases_and_still_converges() {
+        let mut fixture = configured_fixture("bounded-unstable-full-scan");
+        let enrollment = fixture.enrollment_root("bounded-unstable-full-scan");
+        let paths = PromotedPaths::new(&fixture, "bounded-unstable-full-scan");
+        let (mut authority, mut runtime) = promoted_safe_reopen(&mut fixture, &enrollment, &paths);
+        let baseline = fixture.baseline(&fixture.graph, "bounded-unstable-full-scan", false);
+        let mut owner =
+            ExactExternalFeedState::open(&fixture.graph, &fixture.receipts, &runtime, baseline)
+                .unwrap();
+        let mut clock = 0;
+        assert_admitted(drive_terminal(
+            &mut owner,
+            &fixture.graph,
+            &fixture.receipts,
+            &mut authority,
+            &mut runtime,
+            &mut clock,
+        ));
+        let rebases_before = owner.rebase_count;
+        owner
+            .observe(
+                &fixture.graph,
+                &runtime,
+                [WatcherObservation::RescanRequired],
+            )
+            .unwrap();
+
+        for race in 0..4 {
+            let graph_root = fixture.graph_root.clone();
+            owner.before_second_scan_pass = Some(Box::new(move || {
+                let changed = graph_root.join(format!("content/nested pages/raced-{race}.md"));
+                fs::create_dir_all(changed.parent().unwrap()).unwrap();
+                fs::write(changed, format!("- race {race}\n")).unwrap();
+            }));
+            clock += 1;
+            let result = owner.drain_one(
+                &fixture.graph,
+                &fixture.receipts,
+                &mut authority,
+                &mut runtime,
+                BaselineTimestamp::from_millis(clock).unwrap(),
+            );
+            if race % 2 == 0 {
+                assert_eq!(result, ExactExternalFeedDrain::RetryFull);
+            } else {
+                assert!(matches!(
+                    result,
+                    ExactExternalFeedDrain::Failed(ref detail)
+                        if detail.contains("retained for bounded retry")
+                ));
+            }
+            assert_eq!(
+                owner.rebase_count,
+                rebases_before + race + 1,
+                "one watcher retry cycle may perform only its initial and one retry rebase"
+            );
+        }
+        let mut terminal = None;
+        for _ in 0..64 {
+            clock += 1;
+            let result = owner.drain_one(
+                &fixture.graph,
+                &fixture.receipts,
+                &mut authority,
+                &mut runtime,
+                BaselineTimestamp::from_millis(clock).unwrap(),
+            );
+            if !matches!(
+                result,
+                ExactExternalFeedDrain::Recovering | ExactExternalFeedDrain::RetryFull
+            ) {
+                terminal = Some(result);
+                break;
+            }
+        }
+        assert_admitted(terminal.expect("bounded unstable epoch did not converge"));
+        assert_eq!(owner.rebase_count, rebases_before + 5);
         let settled = runtime.watcher_status();
         assert_eq!(settled.acknowledged, settled.latest_enqueue);
         assert!(!settled.pending);
@@ -2531,6 +2646,12 @@ pub(crate) mod tests {
                 receipt_root: self.fixture.receipts.root_path().to_path_buf(),
                 database_path: self.paths.database_path.clone(),
                 application_runtime_root: self.paths.runtime_root.path().to_path_buf(),
+                provider_root: self.fixture.graph_root.join(".tine-sync/v2/shared"),
+                provider_journal_root: self
+                    .paths
+                    .runtime_root
+                    .path()
+                    .join("provider/device/journal"),
             }
         }
 
