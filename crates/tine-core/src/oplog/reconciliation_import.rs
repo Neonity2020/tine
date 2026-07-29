@@ -54,8 +54,6 @@ pub(crate) enum ReconciliationImportEvidenceKind {
     CandidateBindingMismatch,
     CandidateOrderOrExactCollision,
     PortablePathCollision,
-    UnsupportedMarkdown,
-    MixedCaseExtension,
     UnsupportedExtension,
     /// The path is not ordinary graph text this graph can load: it names a
     /// container OG itself skips, a hidden path, or a spelling the guarded
@@ -239,17 +237,10 @@ impl EvidenceBuilder {
 }
 
 fn unsupported_extension(path: &ManagedPath) -> Option<ReconciliationImportEvidenceKind> {
-    match path.extension() {
-        "md" | "org" => None,
-        "markdown" => Some(ReconciliationImportEvidenceKind::UnsupportedMarkdown),
-        extension
-            if extension.eq_ignore_ascii_case("md")
-                || extension.eq_ignore_ascii_case("org")
-                || extension.eq_ignore_ascii_case("markdown") =>
-        {
-            Some(ReconciliationImportEvidenceKind::MixedCaseExtension)
-        }
-        _ => Some(ReconciliationImportEvidenceKind::UnsupportedExtension),
+    if path.is_markdown() || path.is_org() {
+        None
+    } else {
+        Some(ReconciliationImportEvidenceKind::UnsupportedExtension)
     }
 }
 
@@ -973,23 +964,56 @@ mod tests {
     }
 
     #[test]
-    fn reconciliation_import_still_blocks_excluded_and_unsupported_nonstandard_paths() {
+    fn reconciliation_import_accepts_canonical_extension_spelling_and_case_variants() {
+        let temp = TempGraph::new(None);
+        let graph = Graph::open(temp.path());
+        let binding = binding(Some(&graph));
+        let paths = [
+            "archive/extensions/lower.md",
+            "archive/extensions/upper.MD",
+            "archive/extensions/mixed.mD",
+            "archive/extensions/lower.markdown",
+            "archive/extensions/upper.MARKDOWN",
+            "archive/extensions/mixed.MarkDown",
+            "archive/extensions/lower.org",
+            "archive/extensions/upper.ORG",
+            "archive/extensions/mixed.Org",
+        ];
+        let mut candidates = paths
+            .iter()
+            .map(|path| candidate(path, GraphTextCandidateKind::Creation, None, &binding))
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| left.path.cmp(&right.path));
+        let expected = candidates
+            .iter()
+            .map(|candidate| candidate.path.as_str().to_owned())
+            .collect::<Vec<_>>();
+        let scan = scan(binding.clone(), candidates, Vec::new());
+        let authority = GraphFixtureAuthority {
+            graph: &graph,
+            binding,
+        };
+        let mut coordinator = CountingCoordinator::new(FakeDisposition::Noop);
+
+        let outcome = execute_fixture(
+            &scan,
+            &authority,
+            &mut coordinator,
+            PreparationLimits::default(),
+        )
+        .unwrap();
+
+        assert!(matches!(outcome, CoordinatorHandoff::Noop));
+        assert_eq!(coordinator.calls, 1);
+        assert_eq!(coordinator.received, vec![expected]);
+    }
+
+    #[test]
+    fn reconciliation_import_still_blocks_excluded_containers_and_non_text_extensions() {
         let temp = TempGraph::new(None);
         let graph = Graph::open(temp.path());
         let binding = binding(Some(&graph));
         let candidates = vec![
-            candidate(
-                "archive/note.MD",
-                GraphTextCandidateKind::Creation,
-                None,
-                &binding,
-            ),
-            candidate(
-                "archive/note.markdown",
-                GraphTextCandidateKind::Creation,
-                None,
-                &binding,
-            ),
             candidate(
                 "assets/note.md",
                 GraphTextCandidateKind::Creation,
@@ -1022,7 +1046,7 @@ mod tests {
             &mut coordinator,
             PreparationLimits::default(),
         )
-        .expect_err("excluded and unsupported nonstandard paths must block");
+        .expect_err("excluded graph-text containers must block");
 
         let PreparationFailure::Blocked(blocked) = failure else {
             panic!("excluded evidence should be blocked");
@@ -1039,14 +1063,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 (
-                    ReconciliationImportEvidenceKind::MixedCaseExtension,
-                    "archive/note.MD"
-                ),
-                (
-                    ReconciliationImportEvidenceKind::UnsupportedMarkdown,
-                    "archive/note.markdown"
-                ),
-                (
                     ReconciliationImportEvidenceKind::UndecodableGraphTextPath,
                     "assets/note.md"
                 ),
@@ -1061,64 +1077,10 @@ mod tests {
             ]
         );
         assert_eq!(coordinator.calls, 0);
-    }
-
-    #[test]
-    fn reconciliation_import_unsupported_graph_wide_evidence_blocks_without_handoff() {
-        let binding = binding(None);
-        let candidates = vec![
-            candidate(
-                "archive/outside.md",
-                GraphTextCandidateKind::Creation,
-                None,
-                &binding,
-            ),
-            candidate(
-                "pages/mixed.MD",
-                GraphTextCandidateKind::Creation,
-                None,
-                &binding,
-            ),
-            candidate(
-                "pages/unsupported.markdown",
-                GraphTextCandidateKind::Creation,
-                None,
-                &binding,
-            ),
-        ];
-        let authority = FixtureAuthority {
-            binding: binding.clone(),
-            kinds: BTreeMap::new(),
-            revalidation: Ok(()),
-        };
-        let diagnostics = vec![GraphTextScanDiagnostic {
-            path: "pages/note.sync-conflict-20260726.md".to_owned(),
-            kind: GraphTextScanDiagnosticKind::ProviderConflictCopy,
-            authority_path: None,
-            file_resource_id: ContentDigest::of(b"conflict"),
-            link_count: 1,
-        }];
-        let scan = scan(binding, candidates, diagnostics);
-        let mut coordinator = CountingCoordinator::new(FakeDisposition::Noop);
-
-        let failure = execute_fixture(
-            &scan,
-            &authority,
-            &mut coordinator,
-            PreparationLimits::default(),
-        )
-        .expect_err("unsupported graph-wide evidence must block");
-
-        let PreparationFailure::Blocked(blocked) = failure else {
-            panic!("unsupported evidence should be blocked");
-        };
-        assert_eq!(
-            blocked.reason,
-            ReconciliationImportBlockReason::UnsupportedDiscovery
+        assert!(
+            ManagedPath::parse("archive/note.txt").is_err(),
+            "a genuinely unsupported extension must not become a reconciliation candidate"
         );
-        assert_eq!(blocked.evidence.len(), 3);
-        assert_eq!(blocked.omitted_evidence, 0);
-        assert_eq!(coordinator.calls, 0);
     }
 
     #[test]

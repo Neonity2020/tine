@@ -9990,6 +9990,143 @@ mod tests {
         );
     }
 
+    /// Every graph-text spelling admitted by discovery and `ManagedPath` must
+    /// cross the same external-reconciliation bridge. In particular, a nested
+    /// Unicode `.markdown` file is ordinary Markdown rather than unsupported
+    /// discovery evidence.
+    #[test]
+    fn nested_unicode_markdown_external_edit_materializes_reaches_safe_and_reopens() {
+        const PATH: &str = "archive/2026/顧客/Café 橋渡し.markdown";
+        const CREATED: &str =
+            "title:: Café 橋渡し\n\n- 初版 from external editor\n  - nested child\n";
+        const EDITED: &str =
+            "title:: Café 橋渡し\n\n- 改訂 from external editor\n  - nested child edited\n- appended\n";
+
+        fn load_materialized(handle: &SyncRuntimeHandle, path: &str) -> SyncPageWithBlocksDto {
+            let SyncRuntimeQueryReply::Pages(pages) = handle
+                .query(SyncRuntimeQueryRequest::ListPages {
+                    page_kind: Some(SyncPageKind::Page),
+                    limit: 32,
+                })
+                .unwrap()
+            else {
+                panic!("page list returned the wrong reply variant");
+            };
+            let page = pages
+                .into_iter()
+                .find(|page| page.path == path)
+                .unwrap_or_else(|| panic!("{path} was not materialized in SQLite"));
+            let SyncRuntimeQueryReply::PageWithBlocks(Some(loaded)) = handle
+                .query(SyncRuntimeQueryRequest::LoadPage {
+                    page_id: page.page_id.clone(),
+                    block_limit: 16,
+                })
+                .unwrap()
+            else {
+                panic!("{path} did not load with its materialized blocks");
+            };
+            assert_eq!(loaded.page, page);
+            loaded
+        }
+
+        fn assert_block_contents(page: &SyncPageWithBlocksDto, expected: &[&str]) {
+            let mut actual = page
+                .blocks
+                .iter()
+                .map(|block| block.content.as_str())
+                .collect::<Vec<_>>();
+            actual.sort_unstable();
+            let mut expected = expected.to_vec();
+            expected.sort_unstable();
+            assert_eq!(actual, expected);
+        }
+
+        let fixture = RuntimeHostFixture::safe("sync-runtime-markdown-bridge");
+        let request = fixture.request();
+        let file = fixture.graph_root().join(PATH);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let manifests_before = fixture.manifest_count();
+        let applied_before = fixture.applied_batch_count();
+
+        // The creation lands while Tine is closed, so the owed startup full
+        // scan must pass it through reconciliation before this runtime can
+        // ever publish another Safe handoff.
+        fs::write(&file, CREATED.as_bytes()).unwrap();
+        let handle = active_handle(SyncRuntimeHandle::open(request.clone()));
+        let created = drain_until_settled(&handle);
+        assert!(
+            created
+                .iter()
+                .any(|tick| matches!(tick, SyncRuntimeTick::AdmittedComplete { .. })),
+            "the startup .markdown creation did not reach coordinator completion: {created:?}"
+        );
+        assert_eq!(fs::read(&file).unwrap(), CREATED.as_bytes());
+        let created_page = load_materialized(&handle, PATH);
+        assert_block_contents(
+            &created_page,
+            &["初版 from external editor", "nested child"],
+        );
+
+        fs::write(&file, EDITED.as_bytes()).unwrap();
+        handle
+            .observe_watcher(vec![SyncWatcherObservation::managed_path(PATH).unwrap()])
+            .unwrap();
+        let edited = drain_until_settled(&handle);
+        assert!(
+            edited
+                .iter()
+                .any(|tick| matches!(tick, SyncRuntimeTick::AdmittedComplete { .. })),
+            "the exact .markdown edit did not reach coordinator completion: {edited:?}"
+        );
+        assert_eq!(fixture.manifest_count(), manifests_before + 2);
+        assert_eq!(fixture.applied_batch_count(), applied_before + 2);
+        assert_eq!(fs::read(&file).unwrap(), EDITED.as_bytes());
+        let edited_page = load_materialized(&handle, PATH);
+        assert_block_contents(
+            &edited_page,
+            &[
+                "改訂 from external editor",
+                "nested child edited",
+                "appended",
+            ],
+        );
+        let settled = handle.status().unwrap();
+        assert!(!settled.watcher.pending);
+        assert!(!settled.watcher.drain_in_flight);
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(snapshot) if !snapshot.watcher.pending
+        ));
+        assert!(matches!(
+            fixture.handoff(),
+            EnrollmentDiscoveryHandoff::Safe
+        ));
+
+        let manifests_before_reopen = fixture.manifest_count();
+        let applied_before_reopen = fixture.applied_batch_count();
+        let reopened = active_handle(SyncRuntimeHandle::open(request));
+        drive_initial_feed(&reopened);
+        let reopened_page = load_materialized(&reopened, PATH);
+        assert_block_contents(
+            &reopened_page,
+            &[
+                "改訂 from external editor",
+                "nested child edited",
+                "appended",
+            ],
+        );
+        assert_eq!(fs::read(&file).unwrap(), EDITED.as_bytes());
+        assert_eq!(fixture.manifest_count(), manifests_before_reopen);
+        assert_eq!(fixture.applied_batch_count(), applied_before_reopen);
+        let reopened_status = reopened.status().unwrap();
+        assert!(!reopened_status.watcher.pending);
+        assert!(!reopened_status.watcher.drain_in_flight);
+        assert!(matches!(
+            reopened.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(snapshot) if !snapshot.watcher.pending
+        ));
+    }
+
     /// An external delete is authorized from the deleted page's own completed
     /// projection, not from an unrelated page's most recent global frontier.
     ///
@@ -10736,9 +10873,9 @@ mod tests {
     /// `GraphTextScope::is_eligible` rejects it because `:` is outside
     /// `managed_component_is_portable`, `Graph::list_pages` never lists it, and
     /// `inventory_initial_shadow` never captures it. Every other layer treats
-    /// such a path as ordinary retained non-text and ignores it, and unsupported
-    /// graph text that *is* in scope (`.markdown`, `.MD`, excluded containers)
-    /// is reported as named per-path reconciliation-import evidence.
+    /// such a path as ordinary retained non-text and ignores it. Canonical
+    /// Markdown/Org spelling and case variants stay supported, while excluded
+    /// containers and paths outside `ManagedPath` remain without import authority.
     ///
     /// `collect_reconciliation_scan_pass` instead gates a mandatory
     /// `ManagedPath::parse` on `is_page_file` alone — an extension-only test
