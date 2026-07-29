@@ -8374,8 +8374,26 @@ impl ShardedHotEngine {
             // corresponding point insert / wait-edge append. That sequencing
             // is what makes an observed Pending edge discoverable and makes an
             // observed Final(Rejected) parent edge-free.
-            let classification = match self.archive_status(dependency) {
-                Ok(Some(ArchiveStatus::Accepted { .. } | ArchiveStatus::Quarantined)) => {
+            let dependency_status = self.archive_status(dependency);
+            let effects_contained = match &dependency_status {
+                Ok(Some(ArchiveStatus::Accepted { .. } | ArchiveStatus::Quarantined)) => true,
+                Ok(Some(ArchiveStatus::Staged) | None) => {
+                    match self.accepted_frontier_contains_batch_effects(dependency) {
+                        Ok(contained) => contained,
+                        Err(error) => {
+                            self.history_failure = Some(error.clone());
+                            return self.outcome(
+                                offered_batch_id,
+                                BatchDisposition::Rejected { error },
+                                Vec::new(),
+                            );
+                        }
+                    }
+                }
+                Ok(Some(ArchiveStatus::Rejected(_))) | Err(_) => false,
+            };
+            let classification = match (dependency_status, effects_contained) {
+                (Ok(_), true) => {
                     let clock_len = match super::causal_index::batch_clock_len(
                         &store,
                         &self.scratch_roots,
@@ -8470,7 +8488,7 @@ impl ShardedHotEngine {
                         causal_clock: parent.clock().to_vec(),
                     }
                 }
-                Ok(Some(ArchiveStatus::Rejected(_))) => {
+                (Ok(Some(ArchiveStatus::Rejected(_))), false) => {
                     if let Some(budget) = budget.as_deref_mut() {
                         if !budget.consume_one() {
                             break;
@@ -8478,7 +8496,7 @@ impl ShardedHotEngine {
                     }
                     super::dependency_queue::DependencyClassification::Rejected
                 }
-                Ok(Some(ArchiveStatus::Staged) | None) => {
+                (Ok(Some(ArchiveStatus::Staged) | None), false) => {
                     if let Some(budget) = budget.as_deref_mut() {
                         if !budget.consume_one() {
                             break;
@@ -8486,13 +8504,16 @@ impl ShardedHotEngine {
                     }
                     super::dependency_queue::DependencyClassification::Pending
                 }
-                Err(error) => {
+                (Err(error), _) => {
                     self.history_failure = Some(error.clone());
                     return self.outcome(
                         offered_batch_id,
                         BatchDisposition::Rejected { error },
                         Vec::new(),
                     );
+                }
+                (Ok(Some(ArchiveStatus::Accepted { .. } | ArchiveStatus::Quarantined)), false) => {
+                    unreachable!("accepted dependency effects are contained")
                 }
             };
             let satisfied_points = match &classification {
@@ -10709,7 +10730,8 @@ impl ShardedHotEngine {
     fn validate_manifested_portable_path_binding(
         &self,
         batch_id: BatchId,
-        candidate_root: PortablePathIndexRoot,
+        frontier: &FrontierV2,
+        candidate: &PortablePathPublicationCandidate,
         terminal_conflict: bool,
     ) -> Result<(), EngineError> {
         let batch = &self.archive[&batch_id];
@@ -10718,17 +10740,68 @@ impl ShardedHotEngine {
             batch.objects(),
         )
         .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
+        let mut manifested_root = None;
         for intent in projection.intents() {
             if intent.portable_path_key_version() != super::PORTABLE_PATH_KEY_VERSION
                 || intent.portable_path_key_digest() != intent.path().portable_key().digest()
-                || (!terminal_conflict && intent.portable_path_index_root() != candidate_root)
             {
                 return Err(EngineError::ProjectionManifest(
                     "projection intent portable-path index binding mismatch".into(),
                 ));
             }
+            match manifested_root {
+                Some(root) if root != intent.portable_path_index_root() => {
+                    return Err(EngineError::ProjectionManifest(
+                        "projection intents disagree on their portable-path index binding".into(),
+                    ));
+                }
+                Some(_) => {}
+                None => manifested_root = Some(intent.portable_path_index_root()),
+            }
         }
-        Ok(())
+        if terminal_conflict || manifested_root.is_none() {
+            return Ok(());
+        }
+        let manifested_root = manifested_root.expect("checked manifested portable-path root");
+        if manifested_root == candidate.root {
+            return Ok(());
+        }
+        let Some(index) = &self.portable_path_index else {
+            return Err(EngineError::ProjectionManifest(
+                "projection intent portable-path index binding mismatch".into(),
+            ));
+        };
+        let changed = candidate
+            .changed
+            .iter()
+            .cloned()
+            .collect::<BTreeMap<_, _>>();
+        let mut bases = Vec::new();
+        for head in declared_batch_heads(frontier) {
+            if let Some(record) = self.sealed_history_record(head)? {
+                if matches!(
+                    record.status,
+                    ArchiveStatus::Accepted { .. } | ArchiveStatus::Quarantined
+                ) && !bases.contains(&record.portable_path_root)
+                {
+                    bases.push(record.portable_path_root);
+                }
+            }
+        }
+        for base in bases {
+            index
+                .validate_root(base)
+                .map_err(|error| EngineError::Archive(error.to_string()))?;
+            let reconstructed = index
+                .insert_many(base, &changed)
+                .map_err(|error| EngineError::Archive(error.to_string()))?;
+            if reconstructed == manifested_root {
+                return Ok(());
+            }
+        }
+        Err(EngineError::ProjectionManifest(
+            "projection intent portable-path index binding mismatch".into(),
+        ))
     }
 
     fn validate_manifested_base(&self, base: &AnnotatedProjectionBase) -> Result<(), EngineError> {
@@ -11139,7 +11212,6 @@ impl ShardedHotEngine {
             self.portable_path_root = record.portable_path_root;
         }
         if record.portable_path_key_version != super::PORTABLE_PATH_KEY_VERSION
-            || record.portable_path_root != work.portable_path_index_root()
             || work.portable_path_key_version() != super::PORTABLE_PATH_KEY_VERSION
             || work.portable_path_key_digest() != work.path().portable_key().digest()
         {
@@ -11147,9 +11219,8 @@ impl ShardedHotEngine {
                 "projection work portable-path history binding mismatch".into(),
             ));
         }
-        let current = self
-            .portable_path_records_many(&[work.portable_path_key_digest()])?
-            .remove(&work.portable_path_key_digest());
+        let key = work.portable_path_key_digest();
+        let current = self.portable_path_records_many(&[key])?.remove(&key);
         let currently_owned = current.as_ref().and_then(PortablePathRecord::occupied);
         match work.target() {
             ProjectionWorkTarget::Present(_)
@@ -12013,7 +12084,97 @@ impl ShardedHotEngine {
         let frontier = include_frontier
             .then(|| FrontierV2::new(frontier_documents.into_values().collect()))
             .transpose()?;
+        let frontier = match frontier {
+            Some(frontier) => Some(
+                self.page_stable_projection_frontier(&page, &frontier, &claim_evidence)?
+                    .unwrap_or(frontier),
+            ),
+            None => None,
+        };
         Ok((page, frontier, claim_evidence))
+    }
+
+    fn page_stable_projection_frontier(
+        &self,
+        page: &MaterializedPage,
+        current: &FrontierV2,
+        claim_evidence: &[ProjectionClaimEvidence],
+    ) -> Result<Option<FrontierV2>, EngineError> {
+        let mut candidate_batches = BTreeSet::new();
+        for document in current
+            .documents()
+            .iter()
+            .filter(|document| document.document_id() != self.catalog_document_id)
+        {
+            candidate_batches.extend(document.direct_dependency_heads().iter().copied());
+        }
+        let current_non_catalog = current
+            .documents()
+            .iter()
+            .filter(|document| document.document_id() != self.catalog_document_id)
+            .collect::<Vec<_>>();
+        let current_catalog = current
+            .documents()
+            .iter()
+            .find(|document| document.document_id() == self.catalog_document_id);
+        let mut stable = None;
+        for batch_id in candidate_batches {
+            for intent in self.load_accepted_projection_intents(batch_id)? {
+                if intent.page_id() != page.page_id
+                    || intent.path() != &page.path
+                    || intent.claim_evidence() != claim_evidence
+                    || !matches!(intent.target(), ManifestProjectionTarget::Present { .. })
+                {
+                    continue;
+                }
+                let candidate_non_catalog = intent
+                    .post_frontier()
+                    .documents()
+                    .iter()
+                    .filter(|document| document.document_id() != self.catalog_document_id)
+                    .collect::<Vec<_>>();
+                if candidate_non_catalog != current_non_catalog {
+                    continue;
+                }
+                let Some(candidate_catalog) = intent
+                    .post_frontier()
+                    .documents()
+                    .iter()
+                    .find(|document| document.document_id() == self.catalog_document_id)
+                else {
+                    continue;
+                };
+                let Some(current_catalog) = current_catalog else {
+                    continue;
+                };
+                let current_catalog_frontier = FrontierV2::new(vec![current_catalog.clone()])?;
+                let candidate_catalog_frontier = FrontierV2::new(vec![candidate_catalog.clone()])?;
+                if !self.projection_frontier_dominates(
+                    &current_catalog_frontier,
+                    &candidate_catalog_frontier,
+                )? {
+                    continue;
+                }
+                let state = ProjectionPageState {
+                    page: page.clone(),
+                    frontier: intent.post_frontier().clone(),
+                    claim_evidence: claim_evidence.to_vec(),
+                };
+                let target = intent.target().bytes();
+                let rendered =
+                    super::projection::plan_projection(self.workspace_id, &state, target)
+                        .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
+                if rendered.target() != target.expect("Present target has bytes") {
+                    continue;
+                }
+                match &stable {
+                    Some(existing) if existing != intent.post_frontier() => return Ok(None),
+                    Some(_) => {}
+                    None => stable = Some(intent.post_frontier().clone()),
+                }
+            }
+        }
+        Ok(stable)
     }
 
     pub fn canonical_snapshot(&self) -> Result<super::CanonicalSnapshot, EngineError> {
@@ -12777,6 +12938,83 @@ impl ShardedHotEngine {
             self.archive_status(batch_id)?,
             Some(ArchiveStatus::Accepted { .. })
         ))
+    }
+
+    /// Prove that the current authenticated accepted frontier contains a
+    /// dependency's effects, even when that dependency is no longer a direct
+    /// head or has no manifest in this endpoint's archive.
+    ///
+    /// Provider dependency scheduling cannot use archive presence as the
+    /// oracle: bootstrap/adoption may leave a synthetic accepted head whose
+    /// causal record and effects are authenticated by current engine state but
+    /// which deliberately has no publishable manifest. A current direct head
+    /// proves containment itself. A transitive ancestor is proven by its
+    /// authenticated causal record and a current accepted head whose
+    /// authenticated sparse clock contains the ancestor's causal dot.
+    pub(crate) fn accepted_frontier_contains_batch_effects(
+        &self,
+        batch_id: BatchId,
+    ) -> Result<bool, EngineError> {
+        self.begin_point_operation();
+        if let Some(error) = &self.history_failure {
+            return Err(error.clone());
+        }
+        // Recovery itself needs this proof for manifest-less synthetic
+        // dependencies, before `ensure_not_blocked` can declare authenticated
+        // replay complete. Read the same authenticated accepted-frontier root
+        // directly; do not weaken ordinary public engine readiness checks.
+        let frontier = if let Some(store) = &self.scratch {
+            materialize_accepted_frontier(store, &self.scratch_roots.accepted_frontier_root)?
+        } else {
+            FrontierV2::new(self.accepted_frontier.values().cloned().collect())?
+        };
+        let heads = declared_batch_heads(&frontier);
+        if heads.contains(&batch_id) {
+            return Ok(true);
+        }
+        if let Some(store) = &self.scratch {
+            let Some(dependency) =
+                super::causal_index::batch_record(store, &self.scratch_roots, batch_id)
+                    .map_err(|error| EngineError::Archive(error.to_string()))?
+            else {
+                return Ok(false);
+            };
+            for head in heads {
+                let record = super::causal_index::batch_record(store, &self.scratch_roots, head)
+                    .map_err(|error| EngineError::Archive(error.to_string()))?
+                    .ok_or_else(|| {
+                        EngineError::Archive(format!(
+                            "accepted frontier head {head} has no authenticated causal record"
+                        ))
+                    })?;
+                if dependency
+                    .clock()
+                    .iter()
+                    .all(|(peer, counter)| record.counter(*peer) >= *counter)
+                {
+                    return Ok(true);
+                }
+            }
+            return Ok(false);
+        }
+        let Some(dependency_dot) = self
+            .archive
+            .get(&batch_id)
+            .map(|batch| batch.manifest().causal_dot())
+        else {
+            return Ok(false);
+        };
+        Ok(heads.into_iter().any(|head| {
+            self.ephemeral_causal_clocks
+                .get(&head)
+                .and_then(|clock| {
+                    clock
+                        .binary_search_by_key(&dependency_dot.peer_id(), |(peer, _)| *peer)
+                        .ok()
+                        .map(|index| clock[index].1)
+                })
+                .is_some_and(|counter| counter >= dependency_dot.counter())
+        }))
     }
 
     fn validate_record_catalog_transition(
@@ -13926,7 +14164,8 @@ impl ShardedHotEngine {
         let identity_binding_started = Instant::now();
         self.validate_manifested_portable_path_binding(
             batch_id,
-            portable_paths.root,
+            &frontier,
+            &portable_paths,
             !portable_paths.conflicts.is_empty(),
         )?;
         #[cfg(test)]
@@ -15189,7 +15428,8 @@ impl ShardedHotEngine {
         };
         self.validate_manifested_portable_path_binding(
             batch_id,
-            portable_paths.root,
+            frontier,
+            &portable_paths,
             !portable_paths.conflicts.is_empty(),
         )?;
         let dependencies = if self.scratch.is_none()
@@ -16008,6 +16248,62 @@ impl ShardedHotEngine {
         store
             .reload_accepted_document_object(manifest, document_id)
             .map_err(|error| EngineError::Archive(error.to_string()))
+    }
+
+    fn load_accepted_projection_intents(
+        &self,
+        batch_id: BatchId,
+    ) -> Result<Vec<ManifestedProjectionIntent>, EngineError> {
+        if !matches!(
+            self.archive_status(batch_id)?,
+            Some(ArchiveStatus::Accepted { .. })
+        ) {
+            return Ok(Vec::new());
+        }
+        if let Some(batch) = self.archive.get(&batch_id) {
+            return batch
+                .objects()
+                .iter()
+                .filter(|object| object.kind() == ObjectKind::ProjectionIntent)
+                .map(|object| {
+                    ManifestedProjectionIntent::decode(object.payload())
+                        .map_err(|error| EngineError::ProjectionManifest(error.to_string()))
+                })
+                .collect();
+        }
+        if let Some(loaded) = self.load_retained_bootstrap_part(batch_id)? {
+            return loaded
+                .objects()
+                .iter()
+                .filter(|object| object.kind() == ObjectKind::ProjectionIntent)
+                .map(|object| {
+                    ManifestedProjectionIntent::decode(object.payload())
+                        .map_err(|error| EngineError::ProjectionManifest(error.to_string()))
+                })
+                .collect();
+        }
+        let manifest = self.load_observed_manifest(batch_id)?;
+        let Some(store) = self.archive_store.as_ref() else {
+            return Ok(Vec::new());
+        };
+        manifest
+            .required_objects()
+            .iter()
+            .filter(|descriptor| descriptor.kind() == ObjectKind::ProjectionIntent)
+            .map(|descriptor| {
+                let bytes = store
+                    .read_object_bytes(descriptor.content_digest())
+                    .map_err(|error| EngineError::Archive(error.to_string()))?;
+                let object = OperationObject::decode(&bytes)?;
+                if object.descriptor()? != *descriptor {
+                    return Err(EngineError::Archive(
+                        "accepted projection object descriptor mismatch".into(),
+                    ));
+                }
+                ManifestedProjectionIntent::decode(object.payload())
+                    .map_err(|error| EngineError::ProjectionManifest(error.to_string()))
+            })
+            .collect()
     }
 
     fn reconstruct_document_from_heads(

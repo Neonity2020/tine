@@ -530,7 +530,11 @@ fn sparse_provider_observations(
             || relative.contains('\\')
             || !matches!(
                 namespace,
-                "enrollment" | "frontier-heads-v1" | "manifests" | "objects"
+                "enrollment"
+                    | "frontier-heads-v1"
+                    | "publication-intents-v1"
+                    | "manifests"
+                    | "objects"
             )
             || relative
                 .split('/')

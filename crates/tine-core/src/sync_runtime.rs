@@ -80,9 +80,10 @@ use crate::oplog::shadow_projection::verify_inactive_bootstrap_shadow_projection
 #[cfg(test)]
 use crate::oplog::simulator::fail_next_pending_publication_marker_creation;
 use crate::oplog::simulator::{
-    inspect_shared_provider_descriptor, SharedProviderFrontierHeadV1,
-    SharedProviderObservationCursor, SharedProviderPublicationCursor, SharedProviderTransport,
-    SHARED_ENROLLMENT_DESCRIPTOR_PATH, SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE,
+    inspect_shared_provider_descriptor, SharedProviderFrontierHeadV1, SharedProviderObservation,
+    SharedProviderObservationCursor, SharedProviderPublicationCursor,
+    SharedProviderPublicationIntentV1, SharedProviderTransport, SHARED_ENROLLMENT_DESCRIPTOR_PATH,
+    SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE, SHARED_PROVIDER_PUBLICATION_INTENTS_NAMESPACE,
 };
 use crate::oplog::sqlite::ApplicationRuntimeRoot;
 use crate::oplog::watcher_queue::WatcherObservation;
@@ -105,6 +106,7 @@ const MAX_CLEAN_DRAIN_TURNS: usize = 64;
 const MAX_PROVIDER_EXACT_PATHS: usize = 256;
 const MAX_PROVIDER_EXACT_PATH_BYTES: usize = 64 * 1024;
 const MAX_PROVIDER_PUBLICATION_REPAIR_PROBES_PER_TICK: usize = 16;
+const MAX_PROVIDER_INTENT_RETIREMENT_PROBES_PER_TICK: usize = 16;
 /// Maximum top-level operations plus nested rename rows in one submission.
 pub const MAX_LOCAL_MUTATION_ROWS: usize = 1024;
 /// Maximum managed-path references retained by one submission.
@@ -150,11 +152,17 @@ static PROVIDER_MANIFEST_READINESS_INSPECTIONS: Mutex<BTreeMap<WorkspaceId, usiz
 static PROVIDER_TRAVERSAL_INSTRUMENTATION: Mutex<
     BTreeMap<WorkspaceId, ProviderTraversalInstrumentation>,
 > = Mutex::new(BTreeMap::new());
+#[cfg(test)]
+static PROVIDER_HEAD_SCAN_LIMIT_OVERRIDES: Mutex<BTreeMap<WorkspaceId, usize>> =
+    Mutex::new(BTreeMap::new());
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct ProviderTraversalInstrumentation {
     head_entries: usize,
+    intent_entries: usize,
+    head_scan_chunk_boundaries: usize,
+    head_scan_completions: usize,
     exact_manifests: usize,
     exact_objects: usize,
     full_scan_entries: usize,
@@ -2820,7 +2828,9 @@ fn shared_namespace_digest(workspace_id: WorkspaceId) -> ContentDigest {
 fn publish_complete_archive(
     store: &ObjectStore,
     provider: &mut SharedProviderTransport,
-) -> Result<(), SyncRuntimeRequestError> {
+    descriptor: &SharedEnrollmentDescriptorV1,
+    publisher_device_id: DeviceId,
+) -> Result<Vec<(String, SharedProviderPublicationIntentV1)>, SyncRuntimeRequestError> {
     let manifests = store
         .committed_manifests()
         .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
@@ -2834,24 +2844,41 @@ fn publish_complete_archive(
                 .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
         }
     }
+    let mut intents = Vec::with_capacity(manifests.len());
     for manifest in manifests {
-        provider
-            .publish_manifest(
-                manifest.batch_id(),
-                &manifest
-                    .encode()
-                    .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?,
-            )
+        let manifest_bytes = manifest
+            .encode()
             .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        let intent = SharedProviderPublicationIntentV1::new(
+            descriptor.workspace_id(),
+            descriptor.lineage_digest(),
+            descriptor
+                .digest()
+                .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?,
+            publisher_device_id,
+            manifest.author_device_id(),
+            manifest.batch_id(),
+            ContentDigest::of(&manifest_bytes),
+        )
+        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        let path = provider
+            .publish_publication_intent(&intent)
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        provider
+            .publish_manifest(manifest.batch_id(), &manifest_bytes)
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        intents.push((path, intent));
     }
-    Ok(())
+    Ok(intents)
 }
 
 fn publish_archive_batch(
     store: &ObjectStore,
     provider: &mut SharedProviderTransport,
+    descriptor: &SharedEnrollmentDescriptorV1,
+    publisher_device_id: DeviceId,
     batch_id: BatchId,
-) -> Result<(), SyncRuntimeRequestError> {
+) -> Result<(String, SharedProviderPublicationIntentV1), SyncRuntimeRequestError> {
     let manifest = match store
         .inspect_batch(batch_id)
         .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
@@ -2876,14 +2903,28 @@ fn publish_archive_batch(
             .publish_object(object.content_digest(), &bytes)
             .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
     }
+    let manifest_bytes = store
+        .read_manifest_bytes(batch_id)
+        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+    let intent = SharedProviderPublicationIntentV1::new(
+        descriptor.workspace_id(),
+        descriptor.lineage_digest(),
+        descriptor
+            .digest()
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?,
+        publisher_device_id,
+        manifest.author_device_id(),
+        batch_id,
+        ContentDigest::of(&manifest_bytes),
+    )
+    .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+    let path = provider
+        .publish_publication_intent(&intent)
+        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
     provider
-        .publish_manifest(
-            batch_id,
-            &store
-                .read_manifest_bytes(batch_id)
-                .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?,
-        )
-        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))
+        .publish_manifest(batch_id, &manifest_bytes)
+        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+    Ok((path, intent))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2918,6 +2959,28 @@ fn provider_frontier_head_path(path: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+fn provider_publication_intent_path(path: &str) -> bool {
+    let Some(name) = path
+        .strip_prefix(SHARED_PROVIDER_PUBLICATION_INTENTS_NAMESPACE)
+        .and_then(|path| path.strip_prefix('/'))
+        .and_then(|name| name.strip_suffix(".intent"))
+    else {
+        return false;
+    };
+    let Some((identity, digest)) = name.rsplit_once('-') else {
+        return false;
+    };
+    if identity.len() != 73 || identity.as_bytes().get(36) != Some(&b'-') {
+        return false;
+    }
+    Uuid::parse_str(&identity[..36]).is_ok()
+        && Uuid::parse_str(&identity[37..]).is_ok()
+        && digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 fn canonical_generated_provider_conflict(path: &str) -> Option<String> {
     let (directory, filename) = path.rsplit_once('/')?;
     let (stem, extension) = filename.rsplit_once('.')?;
@@ -2936,6 +2999,11 @@ fn canonical_generated_provider_conflict(path: &str) -> Option<String> {
         ("enrollment", "json") if canonical == SHARED_ENROLLMENT_DESCRIPTOR_PATH => Some(canonical),
         (SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE, "head")
             if provider_frontier_head_path(&canonical) =>
+        {
+            Some(canonical)
+        }
+        (SHARED_PROVIDER_PUBLICATION_INTENTS_NAMESPACE, "intent")
+            if provider_publication_intent_path(&canonical) =>
         {
             Some(canonical)
         }
@@ -2994,6 +3062,16 @@ fn reconcile_generated_provider_conflict(
                     && descriptor
                         .digest()
                         .is_ok_and(|digest| head.descriptor_digest() == digest)
+            })
+            .unwrap_or(false)
+    } else if provider_publication_intent_path(&canonical) {
+        SharedProviderPublicationIntentV1::decode(&canonical, &canonical_bytes)
+            .map(|intent| {
+                intent.workspace_id() == descriptor.workspace_id()
+                    && intent.lineage_digest() == descriptor.lineage_digest()
+                    && descriptor
+                        .digest()
+                        .is_ok_and(|digest| intent.descriptor_digest() == digest)
             })
             .unwrap_or(false)
     } else {
@@ -3424,7 +3502,24 @@ impl ProviderDependencyIndex {
         self.pending
             .remove(&accepted)
             .expect("ready provider batch is registered");
-        let Some(dependents) = self.blocked_by.remove(&accepted) else {
+        self.satisfy_dependency(accepted);
+    }
+
+    fn recheck_satisfied<E>(
+        &mut self,
+        mut dependency_is_satisfied: impl FnMut(BatchId) -> Result<bool, E>,
+    ) -> Result<(), E> {
+        let dependencies = self.blocked_by.keys().copied().collect::<Vec<_>>();
+        for dependency in dependencies {
+            if dependency_is_satisfied(dependency)? {
+                self.satisfy_dependency(dependency);
+            }
+        }
+        Ok(())
+    }
+
+    fn satisfy_dependency(&mut self, satisfied: BatchId) {
+        let Some(dependents) = self.blocked_by.remove(&satisfied) else {
             return;
         };
         for dependent in dependents {
@@ -3432,7 +3527,7 @@ impl ProviderDependencyIndex {
                 .pending
                 .get_mut(&dependent)
                 .expect("blocked provider dependent is registered");
-            debug_assert!(pending.causal_dependencies.contains(&accepted));
+            debug_assert!(pending.causal_dependencies.contains(&satisfied));
             pending.unmet_dependencies = pending
                 .unmet_dependencies
                 .checked_sub(1)
@@ -3487,7 +3582,12 @@ struct RuntimeActor {
     provider_head_dirty: bool,
     provider_current_head: Option<String>,
     provider_head_retirement: VecDeque<String>,
+    provider_intents: BTreeMap<String, SharedProviderPublicationIntentV1>,
+    provider_intent_retirement: VecDeque<String>,
+    provider_intent_retirement_scan_active: bool,
+    provider_intent_retirement_scan_after: Option<String>,
     provider_pending: ProviderDependencyIndex,
+    provider_dependency_recheck_frontier: Option<ContentDigest>,
     provider_continuation: Option<ProviderArchiveContinuation>,
     provider_incomplete: BTreeSet<BatchId>,
     provider_incomplete_recheck: VecDeque<BatchId>,
@@ -3496,6 +3596,7 @@ struct RuntimeActor {
     provider_publication_cursor: Option<SharedProviderPublicationCursor>,
     provider_publication_forced: VecDeque<BatchId>,
     provider_descriptor_repair_requested: bool,
+    provider_namespace_repair_active: bool,
     provider_publication_repair_requested: bool,
     provider_publication_repair_cursor: Option<ObjectStoreManifestCursor>,
     pending_join: Option<PendingSharedJoin>,
@@ -3654,7 +3755,7 @@ impl RuntimeActor {
             provider_exact: VecDeque::new(),
             provider_rescan_requested: shared_phase == Some(SyncSharedPhase::Active),
             provider_rescan_required_for_safe: false,
-            provider_full_scan_requested: false,
+            provider_full_scan_requested: provider_descriptor_repair_requested || unsafe_reopen,
             provider_observation_cursor: None,
             provider_observation_full: false,
             provider_scan_valid_heads: 0,
@@ -3667,7 +3768,12 @@ impl RuntimeActor {
             provider_head_dirty: shared_phase == Some(SyncSharedPhase::Active),
             provider_current_head: None,
             provider_head_retirement: VecDeque::new(),
+            provider_intents: BTreeMap::new(),
+            provider_intent_retirement: VecDeque::new(),
+            provider_intent_retirement_scan_active: false,
+            provider_intent_retirement_scan_after: None,
             provider_pending: ProviderDependencyIndex::default(),
+            provider_dependency_recheck_frontier: None,
             provider_continuation: None,
             provider_incomplete: BTreeSet::new(),
             provider_incomplete_recheck: VecDeque::new(),
@@ -3676,6 +3782,7 @@ impl RuntimeActor {
             provider_publication_cursor: None,
             provider_publication_forced: VecDeque::new(),
             provider_descriptor_repair_requested,
+            provider_namespace_repair_active: provider_descriptor_repair_requested,
             provider_publication_repair_requested: (unsafe_reopen
                 || provider_descriptor_repair_requested)
                 && shared_phase == Some(SyncSharedPhase::Active),
@@ -4340,7 +4447,9 @@ impl RuntimeActor {
             || self.provider_publication_repair_requested
             || self.provider_publication_repair_cursor.is_some()
             || self.provider_head_dirty
-            || !self.provider_head_retirement.is_empty();
+            || !self.provider_head_retirement.is_empty()
+            || !self.provider_intent_retirement.is_empty()
+            || self.provider_intent_retirement_scan_active;
         has_work
     }
 
@@ -4401,12 +4510,26 @@ impl RuntimeActor {
                     Ok(cursor) => cursor,
                     Err(error) => return SyncRuntimeTick::RecoveryBlocked(error.to_string()),
                 };
+                #[cfg(test)]
+                let mut cursor = cursor;
+                #[cfg(test)]
+                if !full {
+                    if let Some(entry_limit) = PROVIDER_HEAD_SCAN_LIMIT_OVERRIDES
+                        .lock()
+                        .unwrap()
+                        .get(&self.binding.workspace_id())
+                        .copied()
+                    {
+                        cursor.set_entry_limit_for_test(entry_limit);
+                    }
+                }
                 self.provider_observation_cursor = Some(cursor);
                 self.provider_observation_full = full;
                 self.provider_scan_valid_heads = 0;
                 self.provider_scan_invalid_head = false;
                 self.provider_head_generations.clear();
                 self.provider_own_heads.clear();
+                self.provider_intents.clear();
                 if full {
                     self.provider_full_scan_requested = false;
                 } else {
@@ -4417,7 +4540,7 @@ impl RuntimeActor {
                 // exactly one subsequent scan.
             }
             if let Some(cursor) = self.provider_observation_cursor.as_mut() {
-                let path = match self
+                let observation = match self
                     .provider
                     .as_ref()
                     .ok_or(SyncRuntimeRequestError::ActorUnavailable)
@@ -4426,10 +4549,10 @@ impl RuntimeActor {
                             SyncRuntimeRequestError::ActorRefused(error.to_string())
                         })
                     }) {
-                    Ok(path) => path,
+                    Ok(observation) => observation,
                     Err(error) => return SyncRuntimeTick::RecoveryBlocked(error.to_string()),
                 };
-                if let Some(path) = path {
+                if let SharedProviderObservation::Path(path) = observation {
                     #[cfg(test)]
                     {
                         let mut instrumentation =
@@ -4445,6 +4568,12 @@ impl RuntimeActor {
                                 .is_some_and(|canonical| provider_frontier_head_path(&canonical))
                         {
                             counters.head_entries = counters.head_entries.saturating_add(1);
+                        } else if provider_publication_intent_path(&path)
+                            || canonical_generated_provider_conflict(&path).is_some_and(
+                                |canonical| provider_publication_intent_path(&canonical),
+                            )
+                        {
+                            counters.intent_entries = counters.intent_entries.saturating_add(1);
                         }
                     }
                     match self.process_provider_path(&store, &descriptor, &path) {
@@ -4458,6 +4587,19 @@ impl RuntimeActor {
                             return SyncRuntimeTick::RecoveryBlocked(error.to_string());
                         }
                     }
+                } else if observation == SharedProviderObservation::ChunkBoundary {
+                    cursor.begin_next_chunk();
+                    self.provider_discovery_scan_complete = false;
+                    #[cfg(test)]
+                    {
+                        PROVIDER_TRAVERSAL_INSTRUMENTATION
+                            .lock()
+                            .unwrap()
+                            .entry(self.binding.workspace_id())
+                            .or_default()
+                            .head_scan_chunk_boundaries += 1;
+                    }
+                    return SyncRuntimeTick::Recovering;
                 } else {
                     self.provider_observation_cursor = None;
                     if self.provider_observation_full {
@@ -4469,8 +4611,40 @@ impl RuntimeActor {
                     } else {
                         self.provider_discovery_scan_complete = true;
                     }
+                    #[cfg(test)]
+                    if !self.provider_observation_full {
+                        PROVIDER_TRAVERSAL_INSTRUMENTATION
+                            .lock()
+                            .unwrap()
+                            .entry(self.binding.workspace_id())
+                            .or_default()
+                            .head_scan_completions += 1;
+                    }
                     if !self.provider_rescan_requested && !self.provider_full_scan_requested {
                         self.provider_rescan_required_for_safe = false;
+                    }
+                    if self.provider_namespace_repair_active
+                        && self.provider_discovery_scan_complete
+                        && !self.provider_publication_repair_requested
+                        && self.provider_publication_repair_cursor.is_none()
+                    {
+                        self.provider_namespace_repair_active = false;
+                    }
+                    if let Some((current_path, current_generation)) =
+                        self.provider_current_head.as_ref().and_then(|path| {
+                            self.provider_own_heads
+                                .get(path)
+                                .map(|head| (path.clone(), head.accepted_generation()))
+                        })
+                    {
+                        for (path, head) in &self.provider_own_heads {
+                            if path != &current_path
+                                && head.accepted_generation() <= current_generation
+                                && !self.provider_head_retirement.contains(path)
+                            {
+                                self.provider_head_retirement.push_back(path.clone());
+                            }
+                        }
                     }
                     observed_provider_progress = true;
                 }
@@ -4552,6 +4726,9 @@ impl RuntimeActor {
             };
         }
 
+        if let Err(error) = self.recheck_provider_dependencies() {
+            return SyncRuntimeTick::RecoveryBlocked(error.to_string());
+        }
         let Some(batch_id) = self.provider_pending.ready_front() else {
             return if observed_provider_progress {
                 SyncRuntimeTick::Recovering
@@ -4626,7 +4803,7 @@ impl RuntimeActor {
                 .register(batch_id, causal_dependencies, |dependency| {
                     runtime
                         .engine()
-                        .accepted_batch_is_active(dependency)
+                        .accepted_frontier_contains_batch_effects(dependency)
                         .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))
                 })?;
         #[cfg(test)]
@@ -4639,6 +4816,32 @@ impl RuntimeActor {
         }
         #[cfg(not(test))]
         let _ = registered;
+        Ok(())
+    }
+
+    fn recheck_provider_dependencies(&mut self) -> Result<(), SyncRuntimeRequestError> {
+        if self.provider_pending.blocked_by.is_empty() {
+            return Ok(());
+        }
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or(SyncRuntimeRequestError::ActorUnavailable)?;
+        let frontier = runtime
+            .engine()
+            .accepted_frontier_root()
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
+            .state_digest();
+        if self.provider_dependency_recheck_frontier == Some(frontier) {
+            return Ok(());
+        }
+        self.provider_pending.recheck_satisfied(|dependency| {
+            runtime
+                .engine()
+                .accepted_frontier_contains_batch_effects(dependency)
+                .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))
+        })?;
+        self.provider_dependency_recheck_frontier = Some(frontier);
         Ok(())
     }
 
@@ -4687,7 +4890,7 @@ impl RuntimeActor {
                 .as_ref()
                 .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
                 .engine()
-                .accepted_batch_is_active(batch_id)
+                .accepted_frontier_contains_batch_effects(batch_id)
                 .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
         {
             return Ok(());
@@ -4750,11 +4953,161 @@ impl RuntimeActor {
         }
         self.provider_scan_valid_heads = self.provider_scan_valid_heads.saturating_add(1);
         if head.author_device_id() == self.binding.device_id() {
+            if self.provider_current_head.as_ref().is_some_and(|current| {
+                current != path
+                    && self
+                        .provider_own_heads
+                        .get(current)
+                        .is_some_and(|covering| {
+                            head.accepted_generation() <= covering.accepted_generation()
+                        })
+            }) && !self.provider_head_retirement.iter().any(|old| old == path)
+            {
+                self.provider_head_retirement.push_back(path.to_owned());
+            }
             self.provider_own_heads
                 .insert(path.to_owned(), head.clone());
         }
         for tip in head.frontier_tips() {
             self.queue_provider_direct_manifest(*tip)?;
+        }
+        Ok(())
+    }
+
+    fn process_provider_publication_intent(
+        &mut self,
+        store: &ObjectStore,
+        descriptor: &SharedEnrollmentDescriptorV1,
+        path: &str,
+    ) -> Result<(), SyncRuntimeRequestError> {
+        let Some(bytes) = self
+            .provider
+            .as_ref()
+            .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
+            .read_exact(path)
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
+        else {
+            self.provider_intents.remove(path);
+            self.provider_intent_retirement
+                .retain(|candidate| candidate != path);
+            return Ok(());
+        };
+        let intent = SharedProviderPublicationIntentV1::decode(path, &bytes)
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        if intent.workspace_id() != descriptor.workspace_id()
+            || intent.lineage_digest() != descriptor.lineage_digest()
+            || !descriptor
+                .digest()
+                .is_ok_and(|digest| intent.descriptor_digest() == digest)
+        {
+            return Err(SyncRuntimeRequestError::ActorRefused(format!(
+                "provider publication intent is outside the active namespace at {path}"
+            )));
+        }
+        if self.provider_intents.values().any(|existing| {
+            existing.batch_id() == intent.batch_id()
+                && (existing.manifest_digest() != intent.manifest_digest()
+                    || existing.manifest_author_device_id() != intent.manifest_author_device_id())
+        }) {
+            return Err(SyncRuntimeRequestError::ActorRefused(format!(
+                "provider publication intents conflict for batch {}",
+                intent.batch_id()
+            )));
+        }
+        let batch_id = intent.batch_id();
+        let manifest_path = format!("manifests/{batch_id}.manifest");
+        let manifest_bytes = self
+            .provider
+            .as_ref()
+            .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
+            .read_exact(&manifest_path)
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        if let Some(manifest_bytes) = manifest_bytes {
+            let manifest = OperationBatch::decode(&manifest_bytes)
+                .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+            if manifest.batch_id() != batch_id
+                || manifest.workspace_id() != descriptor.workspace_id()
+                || manifest.lineage_digest() != descriptor.lineage_digest()
+                || manifest.author_device_id() != intent.manifest_author_device_id()
+                || ContentDigest::of(&manifest_bytes) != intent.manifest_digest()
+            {
+                return Err(SyncRuntimeRequestError::ActorRefused(format!(
+                    "provider publication intent does not bind manifest {batch_id}"
+                )));
+            }
+            if !self
+                .runtime
+                .as_ref()
+                .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
+                .engine()
+                .accepted_frontier_contains_batch_effects(batch_id)
+                .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
+            {
+                self.queue_provider_direct_manifest(batch_id)?;
+            } else {
+                self.provider_incomplete.remove(&batch_id);
+            }
+        } else {
+            self.provider_incomplete.insert(batch_id);
+            if intent.publisher_device_id() == self.binding.device_id()
+                && matches!(
+                    store.inspect_batch(batch_id).map_err(|error| {
+                        SyncRuntimeRequestError::ActorRefused(error.to_string())
+                    })?,
+                    crate::oplog::BatchInspection::Ready(_)
+                )
+            {
+                self.record_provider_publication(batch_id)?;
+            }
+        }
+        if intent.publisher_device_id() == self.binding.device_id() {
+            self.provider_head_dirty = true;
+        }
+        self.provider_intents.insert(path.to_owned(), intent);
+        self.queue_provider_intent_retirement_if_covered(descriptor, path)?;
+        Ok(())
+    }
+
+    fn validate_provider_manifest_intents(
+        &self,
+        descriptor: &SharedEnrollmentDescriptorV1,
+        batch_id: BatchId,
+    ) -> Result<(), SyncRuntimeRequestError> {
+        let intents = self
+            .provider_intents
+            .values()
+            .filter(|intent| intent.batch_id() == batch_id)
+            .collect::<Vec<_>>();
+        if intents.is_empty() {
+            return Ok(());
+        }
+        let path = format!("manifests/{batch_id}.manifest");
+        let Some(bytes) = self
+            .provider
+            .as_ref()
+            .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
+            .read_exact(&path)
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
+        else {
+            // The intent is the retryable discovery record for this crash
+            // cut. Manifest absence is handled by the ordinary exact-path
+            // repair/incomplete state below and must not terminally poison the
+            // scan that will later observe the repaired manifest.
+            return Ok(());
+        };
+        let manifest = OperationBatch::decode(&bytes)
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        if manifest.batch_id() != batch_id
+            || manifest.workspace_id() != descriptor.workspace_id()
+            || manifest.lineage_digest() != descriptor.lineage_digest()
+            || intents.iter().any(|intent| {
+                intent.manifest_author_device_id() != manifest.author_device_id()
+                    || intent.manifest_digest() != ContentDigest::of(&bytes)
+            })
+        {
+            return Err(SyncRuntimeRequestError::ActorRefused(format!(
+                "provider manifest conflicts with immutable publication intent {batch_id}"
+            )));
         }
         Ok(())
     }
@@ -4775,24 +5128,7 @@ impl RuntimeActor {
             || !self.provider_incomplete_recheck.is_empty()
             || self.provider_objects_changed;
         if self.provider_head_dirty && !discovery_pending {
-            let head = self.current_provider_head(descriptor)?;
-            let current_path = self
-                .provider
-                .as_mut()
-                .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
-                .publish_frontier_head(&head)
-                .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
-            self.provider_current_head = Some(current_path.clone());
-            self.provider_head_dirty = false;
-            for (path, old) in &self.provider_own_heads {
-                if path != &current_path
-                    && old.accepted_generation() <= head.accepted_generation()
-                    && !self.provider_head_retirement.contains(path)
-                {
-                    self.provider_head_retirement.push_back(path.clone());
-                }
-            }
-            self.provider_own_heads.insert(current_path, head);
+            self.publish_current_provider_head(descriptor)?;
             return Ok(Some(SyncRuntimeTick::Recovering));
         }
         if !self.provider_head_dirty {
@@ -4808,6 +5144,194 @@ impl RuntimeActor {
             }
         }
         Ok(None)
+    }
+
+    fn publish_current_provider_head(
+        &mut self,
+        descriptor: &SharedEnrollmentDescriptorV1,
+    ) -> Result<(), SyncRuntimeRequestError> {
+        let head = self.current_provider_head(descriptor)?;
+        let current_path = self
+            .provider
+            .as_mut()
+            .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
+            .publish_frontier_head(&head)
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        self.provider_current_head = Some(current_path.clone());
+        self.provider_head_dirty = false;
+        for (path, old) in &self.provider_own_heads {
+            if path != &current_path
+                && old.accepted_generation() <= head.accepted_generation()
+                && !self.provider_head_retirement.contains(path)
+            {
+                self.provider_head_retirement.push_back(path.clone());
+            }
+        }
+        self.provider_own_heads.insert(current_path, head);
+        self.provider_intent_retirement_scan_active = true;
+        self.provider_intent_retirement_scan_after = None;
+        Ok(())
+    }
+
+    fn durable_current_provider_head_matches_frontier(
+        &self,
+        descriptor: &SharedEnrollmentDescriptorV1,
+    ) -> Result<bool, SyncRuntimeRequestError> {
+        let Some(current_path) = self.provider_current_head.as_ref() else {
+            return Ok(false);
+        };
+        let Some(head_bytes) = self
+            .provider
+            .as_ref()
+            .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
+            .read_exact(current_path)
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
+        else {
+            return Ok(false);
+        };
+        let head = SharedProviderFrontierHeadV1::decode(current_path, &head_bytes)
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        if head.workspace_id() != descriptor.workspace_id()
+            || head.lineage_digest() != descriptor.lineage_digest()
+            || head.author_device_id() != self.binding.device_id()
+            || !descriptor
+                .digest()
+                .is_ok_and(|digest| head.descriptor_digest() == digest)
+        {
+            return Ok(false);
+        }
+        let engine = self
+            .runtime
+            .as_ref()
+            .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
+            .engine();
+        let root = engine
+            .accepted_frontier_root()
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        Ok(head.accepted_generation() == root.acceptance_sequence()
+            && head.accepted_frontier_root() == root.state_digest())
+    }
+
+    fn provider_intent_is_covered_by_durable_head(
+        &self,
+        descriptor: &SharedEnrollmentDescriptorV1,
+        intent: &SharedProviderPublicationIntentV1,
+    ) -> Result<bool, SyncRuntimeRequestError> {
+        if !self.durable_current_provider_head_matches_frontier(descriptor)? {
+            return Ok(false);
+        }
+        if !self
+            .runtime
+            .as_ref()
+            .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
+            .engine()
+            .accepted_frontier_contains_batch_effects(intent.batch_id())
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
+        {
+            return Ok(false);
+        }
+        let manifest_path = format!("manifests/{}.manifest", intent.batch_id());
+        let Some(manifest_bytes) = self
+            .provider
+            .as_ref()
+            .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
+            .read_exact(&manifest_path)
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
+        else {
+            return Ok(false);
+        };
+        let manifest = OperationBatch::decode(&manifest_bytes)
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        Ok(manifest.workspace_id() == descriptor.workspace_id()
+            && manifest.lineage_digest() == descriptor.lineage_digest()
+            && manifest.batch_id() == intent.batch_id()
+            && manifest.author_device_id() == intent.manifest_author_device_id()
+            && ContentDigest::of(&manifest_bytes) == intent.manifest_digest())
+    }
+
+    fn queue_provider_intent_retirement_if_covered(
+        &mut self,
+        descriptor: &SharedEnrollmentDescriptorV1,
+        path: &str,
+    ) -> Result<(), SyncRuntimeRequestError> {
+        if self
+            .provider_intent_retirement
+            .iter()
+            .any(|queued| queued == path)
+        {
+            return Ok(());
+        }
+        let Some(intent) = self.provider_intents.get(path).cloned() else {
+            return Ok(());
+        };
+        if self.provider_intent_is_covered_by_durable_head(descriptor, &intent)? {
+            self.provider_intent_retirement.push_back(path.to_owned());
+        }
+        Ok(())
+    }
+
+    fn tick_provider_intent_retirement(
+        &mut self,
+        descriptor: &SharedEnrollmentDescriptorV1,
+    ) -> Result<bool, SyncRuntimeRequestError> {
+        let mut progressed = false;
+        for _ in 0..MAX_PROVIDER_INTENT_RETIREMENT_PROBES_PER_TICK {
+            if let Some(path) = self.provider_intent_retirement.front().cloned() {
+                let covered = self
+                    .provider_intents
+                    .get(&path)
+                    .cloned()
+                    .map(|intent| {
+                        self.provider_intent_is_covered_by_durable_head(descriptor, &intent)
+                    })
+                    .transpose()?
+                    .unwrap_or(false);
+                if !covered {
+                    self.provider_intent_retirement.pop_front();
+                    progressed = true;
+                    continue;
+                }
+                self.provider
+                    .as_ref()
+                    .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
+                    .retire_publication_intent(&path)
+                    .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+                self.provider_intent_retirement.pop_front();
+                self.provider_intents.remove(&path);
+                progressed = true;
+                continue;
+            }
+            if !self.provider_intent_retirement_scan_active || self.provider_head_dirty {
+                break;
+            }
+            let next = if let Some(after) = self.provider_intent_retirement_scan_after.as_ref() {
+                self.provider_intents
+                    .range((
+                        std::ops::Bound::Excluded(after.clone()),
+                        std::ops::Bound::Unbounded,
+                    ))
+                    .next()
+            } else {
+                self.provider_intents.iter().next()
+            }
+            .map(|(path, intent)| (path.clone(), intent.clone()));
+            let Some((path, intent)) = next else {
+                self.provider_intent_retirement_scan_active = false;
+                self.provider_intent_retirement_scan_after = None;
+                break;
+            };
+            if self.provider_intent_is_covered_by_durable_head(descriptor, &intent)? {
+                self.provider
+                    .as_ref()
+                    .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
+                    .retire_publication_intent(&path)
+                    .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+                self.provider_intents.remove(&path);
+            }
+            self.provider_intent_retirement_scan_after = Some(path);
+            progressed = true;
+        }
+        Ok(progressed)
     }
 
     fn tick_provider_publication(
@@ -4828,6 +5352,27 @@ impl RuntimeActor {
             self.provider_descriptor_repair_requested = false;
             self.provider_publication_repair_requested = true;
             return Ok(Some(SyncRuntimeTick::Recovering));
+        }
+        if self.provider_namespace_repair_active
+            && !self.durable_current_provider_head_matches_frontier(descriptor)?
+        {
+            self.publish_current_provider_head(descriptor)?;
+            return Ok(Some(SyncRuntimeTick::Recovering));
+        }
+        if self.tick_provider_intent_retirement(descriptor)? {
+            return Ok(Some(SyncRuntimeTick::Recovering));
+        }
+        if self.provider_publication_forced.is_empty()
+            && (self.provider_publication_repair_requested
+                || self.provider_publication_repair_cursor.is_some())
+            && !self.durable_current_provider_head_matches_frontier(descriptor)?
+        {
+            // On a crash after namespace head repair but before archive
+            // draining, rediscover and authenticate provider work before
+            // minting another covering head. Exact forced repair discovered
+            // from an intent remains allowed so a missing manifest cannot
+            // deadlock head publication.
+            return self.tick_provider_head_publication(descriptor);
         }
         if self.provider_publication_forced.is_empty() {
             if self.provider_publication_cursor.is_none() && self.provider_publication_probe {
@@ -4995,13 +5540,17 @@ impl RuntimeActor {
                 }
             }
         }
-        publish_archive_batch(
+        let (intent_path, intent) = publish_archive_batch(
             store,
             self.provider
                 .as_mut()
                 .ok_or(SyncRuntimeRequestError::ActorUnavailable)?,
+            descriptor,
+            self.binding.device_id(),
             batch_id,
         )?;
+        self.provider_intents.insert(intent_path.clone(), intent);
+        self.queue_provider_intent_retirement_if_covered(descriptor, &intent_path)?;
         self.provider
             .as_ref()
             .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
@@ -5074,7 +5623,11 @@ impl RuntimeActor {
         if provider_frontier_head_path(path) {
             return self.process_provider_frontier_head(descriptor, path);
         }
+        if provider_publication_intent_path(path) {
+            return self.process_provider_publication_intent(store, descriptor, path);
+        }
         if let Some(batch_id) = provider_manifest_id(path) {
+            self.validate_provider_manifest_intents(descriptor, batch_id)?;
             if self.provider_pending.contains(batch_id) {
                 self.provider_incomplete.remove(&batch_id);
                 return Ok(());
@@ -5603,6 +6156,26 @@ impl RuntimeActor {
         if self.shared_phase != Some(SyncSharedPhase::Active) {
             return Ok(());
         }
+        // A long local publication burst can leave an older discovery cursor
+        // poised to enumerate every newly created own intent. Publish the
+        // current authenticated local frontier first. Intent retirement still
+        // requires an exact durable manifest and proof that this durable head
+        // covers its effects. The pending discovery cursor must finish before
+        // Safe, and any subsequently accepted remote work publishes a newer
+        // union head.
+        if self.provider_head_dirty
+            && self
+                .provider_intents
+                .values()
+                .any(|intent| intent.publisher_device_id() == self.binding.device_id())
+        {
+            let descriptor = self
+                .shared_descriptor
+                .as_ref()
+                .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
+                .clone();
+            self.publish_current_provider_head(&descriptor)?;
+        }
         for _ in 0..MAX_CLEAN_DRAIN_TURNS {
             if self.provider_exact.is_empty()
                 && self.provider_direct_manifests.is_empty()
@@ -5624,6 +6197,9 @@ impl RuntimeActor {
                 && self.provider_discovery_scan_complete
                 && !self.provider_head_dirty
                 && self.provider_head_retirement.is_empty()
+                && self.provider_intent_retirement.is_empty()
+                && !self.provider_intent_retirement_scan_active
+                && self.provider_intents.is_empty()
             {
                 return Ok(());
             }
@@ -5669,7 +6245,10 @@ impl RuntimeActor {
                 + usize::from(self.provider_publication_repair_requested)
                 + usize::from(self.provider_publication_repair_cursor.is_some())
                 + usize::from(self.provider_head_dirty)
-                + self.provider_head_retirement.len(),
+                + self.provider_head_retirement.len()
+                + self.provider_intent_retirement.len()
+                + usize::from(self.provider_intent_retirement_scan_active)
+                + self.provider_intents.len(),
             continuation,
         )))
     }
@@ -5712,7 +6291,8 @@ impl RuntimeActor {
         let mut provider =
             SharedProviderTransport::open(&self.provider_root, &self.provider_journal_root)
                 .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
-        publish_complete_archive(&store, &mut provider)?;
+        let publication_intents =
+            publish_complete_archive(&store, &mut provider, &descriptor, self.binding.device_id())?;
         provider
             .publish_descriptor(
                 &descriptor
@@ -5735,6 +6315,11 @@ impl RuntimeActor {
         provider
             .publish_frontier_head(&head)
             .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        for (path, _) in publication_intents {
+            provider
+                .retire_publication_intent(&path)
+                .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        }
         activate_shared_initiator(&self.enrollment_root, &self.binding, &descriptor)
             .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
         SyncSharedEnrollmentDescriptor::from_core(descriptor)
@@ -5800,13 +6385,13 @@ impl RuntimeActor {
             .ok_or(SyncRuntimeRequestError::ActorUnavailable)?;
         match &mut pending.phase {
             SharedJoinPhase::Provider(cursor) => {
-                let path = self
+                let observation = self
                     .provider
                     .as_ref()
                     .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
                     .next_observed_path(cursor)
                     .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
-                if let Some(path) = path {
+                if let SharedProviderObservation::Path(path) = observation {
                     if canonical_generated_provider_conflict(&path).is_some() {
                         reconcile_generated_provider_conflict(
                             self.provider
@@ -5864,6 +6449,62 @@ impl RuntimeActor {
                                 "provider frontier head changed during join".into(),
                             ));
                         }
+                    } else if provider_publication_intent_path(&path) {
+                        let bytes = self
+                            .provider
+                            .as_ref()
+                            .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
+                            .read_exact(&path)
+                            .map_err(|error| {
+                                SyncRuntimeRequestError::ActorRefused(error.to_string())
+                            })?
+                            .ok_or_else(|| {
+                                SyncRuntimeRequestError::ActorRefused(format!(
+                                    "provider publication intent disappeared during join at {path}"
+                                ))
+                            })?;
+                        let intent = SharedProviderPublicationIntentV1::decode(&path, &bytes)
+                            .map_err(|error| {
+                                SyncRuntimeRequestError::ActorRefused(error.to_string())
+                            })?;
+                        if intent.workspace_id() != descriptor.workspace_id()
+                            || intent.lineage_digest() != descriptor.lineage_digest()
+                            || !descriptor
+                                .digest()
+                                .is_ok_and(|digest| intent.descriptor_digest() == digest)
+                        {
+                            return Err(SyncRuntimeRequestError::ActorRefused(
+                                "provider publication intent changed during join".into(),
+                            ));
+                        }
+                        let manifest_path = format!("manifests/{}.manifest", intent.batch_id());
+                        let manifest_bytes = self
+                            .provider
+                            .as_ref()
+                            .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
+                            .read_exact(&manifest_path)
+                            .map_err(|error| {
+                                SyncRuntimeRequestError::ActorRefused(error.to_string())
+                            })?
+                            .ok_or_else(|| {
+                                SyncRuntimeRequestError::ActorRefused(format!(
+                                    "provider publication intent awaits manifest {}",
+                                    intent.batch_id()
+                                ))
+                            })?;
+                        let manifest =
+                            OperationBatch::decode(&manifest_bytes).map_err(|error| {
+                                SyncRuntimeRequestError::ActorRefused(error.to_string())
+                            })?;
+                        if manifest.batch_id() != intent.batch_id()
+                            || manifest.author_device_id() != intent.manifest_author_device_id()
+                            || ContentDigest::of(&manifest_bytes) != intent.manifest_digest()
+                        {
+                            return Err(SyncRuntimeRequestError::ActorRefused(format!(
+                                "provider publication intent does not bind manifest {}",
+                                intent.batch_id()
+                            )));
+                        }
                     } else if provider_manifest_id(&path).is_some() {
                         let _ = stage_provider_manifest_exact(
                             &store,
@@ -5889,6 +6530,10 @@ impl RuntimeActor {
                             "unknown shared provider evidence retained at {path}"
                         )));
                     }
+                    return Ok(SharedJoinStep::Pending);
+                }
+                if observation == SharedProviderObservation::ChunkBoundary {
+                    cursor.begin_next_chunk();
                     return Ok(SharedJoinStep::Pending);
                 }
                 pending.phase =
@@ -6010,7 +6655,10 @@ impl RuntimeActor {
                 + usize::from(self.provider_rescan_requested)
                 + usize::from(self.provider_full_scan_requested)
                 + usize::from(self.provider_head_dirty)
-                + self.provider_head_retirement.len(),
+                + self.provider_head_retirement.len()
+                + self.provider_intent_retirement.len()
+                + usize::from(self.provider_intent_retirement_scan_active)
+                + self.provider_intents.len(),
         }
     }
 }
@@ -9809,6 +10457,20 @@ mod tests {
         ActivationFixture::nested_unicode(label, seed)
     }
 
+    fn activation_fixture_handoff(fixture: &ActivationFixture) -> EnrollmentDiscoveryHandoff {
+        let graph = Graph::open_checked(&fixture.graph_root).unwrap();
+        let classification = discover_startup(&DiscoveryRequest {
+            profile: StartupStorageProfile::ExperimentalSparse,
+            graph_resource_id: graph.canonical_resource_id().unwrap(),
+            runtime_root: &fixture.request.enrollment_root,
+            archive_root: &fixture.request.archive_root,
+        });
+        let DiscoveryClassification::ExistingLocalActive(advisory) = classification else {
+            panic!("activation fixture no longer classifies LocalActive");
+        };
+        advisory.handoff
+    }
+
     fn activate_and_prepare_shared(fixture: &ActivationFixture) -> SyncSharedEnrollmentDescriptor {
         let active = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
         let handle = active.handle.expect("fixture LocalActive");
@@ -10317,6 +10979,185 @@ mod tests {
     }
 
     #[test]
+    fn complete_namespace_loss_repair_above_head_scan_cap_is_chunked() {
+        const TEST_HEAD_SCAN_LIMIT: usize = 8;
+        const HISTORICAL_BATCHES: usize = TEST_HEAD_SCAN_LIMIT + 4;
+
+        let fixture = make_shared_fixture("provider-namespace-repair-above-cap", 0xea00);
+        let _descriptor = activate_and_prepare_shared(&fixture);
+        let handle = active_handle(SyncRuntimeHandle::open(reopen_request(&fixture.request)));
+        settle_shared_provider(&handle);
+        for index in 0..HISTORICAL_BATCHES {
+            submit_shared_page(
+                &handle,
+                0xea20 + (index as u128) * 4,
+                &format!("Namespace Repair History {index}"),
+                &format!("notes/namespace-repair-history-{index}.md"),
+                "cheap lower-cap repair fixture",
+            );
+        }
+        settle_shared_provider(&handle);
+        assert!(matches!(
+            handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+        let manifest_count_before =
+            fs::read_dir(fixture.request.provider_root.join("outbox/manifests"))
+                .unwrap()
+                .count();
+        assert!(
+            manifest_count_before > TEST_HEAD_SCAN_LIMIT,
+            "fixture did not exceed its isolated head-scan cap"
+        );
+
+        fs::remove_dir_all(&fixture.request.provider_root).unwrap();
+        PROVIDER_HEAD_SCAN_LIMIT_OVERRIDES.lock().unwrap().insert(
+            fixture.request.identities.workspace_id,
+            TEST_HEAD_SCAN_LIMIT,
+        );
+        reset_provider_traversal_instrumentation(fixture.request.identities.workspace_id);
+        let repaired = active_handle(SyncRuntimeHandle::open(reopen_request(&fixture.request)));
+
+        for _ in 0..64 {
+            let tick = repaired.tick().unwrap();
+            assert!(
+                !matches!(
+                    tick,
+                    SyncRuntimeTick::RecoveryBlocked(_)
+                        | SyncRuntimeTick::Blocked(_)
+                        | SyncRuntimeTick::Terminal(_)
+                        | SyncRuntimeTick::Failed(_)
+                ),
+                "descriptor repair failed: {tick:?}"
+            );
+            if fixture
+                .request
+                .provider_root
+                .join("outbox")
+                .join(SHARED_ENROLLMENT_DESCRIPTOR_PATH)
+                .is_file()
+            {
+                break;
+            }
+        }
+        assert_eq!(
+            fs::read_dir(
+                fixture
+                    .request
+                    .provider_root
+                    .join("outbox")
+                    .join(SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE)
+            )
+            .unwrap()
+            .count(),
+            0,
+            "descriptor repair unexpectedly published a head in the same tick"
+        );
+        for _ in 0..64 {
+            let tick = repaired.tick().unwrap();
+            assert!(
+                !matches!(
+                    tick,
+                    SyncRuntimeTick::RecoveryBlocked(_)
+                        | SyncRuntimeTick::Blocked(_)
+                        | SyncRuntimeTick::Terminal(_)
+                        | SyncRuntimeTick::Failed(_)
+                ),
+                "covering head repair failed: {tick:?}"
+            );
+            if fs::read_dir(
+                fixture
+                    .request
+                    .provider_root
+                    .join("outbox")
+                    .join(SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE),
+            )
+            .unwrap()
+            .count()
+                == 1
+            {
+                break;
+            }
+        }
+        assert_eq!(
+            fs::read_dir(
+                fixture
+                    .request
+                    .provider_root
+                    .join("outbox")
+                    .join(SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE)
+            )
+            .unwrap()
+            .count(),
+            1,
+            "explicit namespace repair did not durably publish its covering head first"
+        );
+        assert_eq!(
+            fs::read_dir(fixture.request.provider_root.join("outbox/manifests"))
+                .unwrap()
+                .count(),
+            0,
+            "historical manifests became visible before the covering head"
+        );
+        drop(repaired);
+        let repaired = active_handle(SyncRuntimeHandle::open(reopen_request(&fixture.request)));
+
+        let intents = fixture
+            .request
+            .provider_root
+            .join("outbox")
+            .join(SHARED_PROVIDER_PUBLICATION_INTENTS_NAMESPACE);
+        let mut max_visible_intents = 0;
+        let mut settled = false;
+        for _ in 0..4_096 {
+            let tick = repaired.tick().unwrap();
+            assert!(
+                !matches!(
+                    tick,
+                    SyncRuntimeTick::RecoveryBlocked(_)
+                        | SyncRuntimeTick::Blocked(_)
+                        | SyncRuntimeTick::Terminal(_)
+                        | SyncRuntimeTick::Failed(_)
+                ),
+                "bounded namespace repair failed: {tick:?}"
+            );
+            max_visible_intents = max_visible_intents.max(fs::read_dir(&intents).unwrap().count());
+            if matches!(tick, SyncRuntimeTick::Idle)
+                && repaired.status().unwrap().provider_pending == 0
+            {
+                settled = true;
+                break;
+            }
+        }
+        PROVIDER_HEAD_SCAN_LIMIT_OVERRIDES
+            .lock()
+            .unwrap()
+            .remove(&fixture.request.identities.workspace_id);
+
+        assert!(settled, "bounded namespace repair did not settle");
+        assert!(
+            max_visible_intents <= 1,
+            "repair accumulated {max_visible_intents} intents instead of retiring each chunk"
+        );
+        assert_eq!(fs::read_dir(&intents).unwrap().count(), 0);
+        assert_eq!(
+            fs::read_dir(fixture.request.provider_root.join("outbox/manifests"),)
+                .unwrap()
+                .count(),
+            manifest_count_before
+        );
+        let traversal = provider_traversal_instrumentation(fixture.request.identities.workspace_id);
+        assert!(
+            traversal.full_scan_entries >= 2 && traversal.head_entries <= TEST_HEAD_SCAN_LIMIT,
+            "the crash-reopen fallback was not resumable and bounded: {traversal:?}"
+        );
+        assert!(matches!(
+            repaired.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(snapshot)) if snapshot.provider_pending == 0
+        ));
+    }
+
+    #[test]
     fn exact_deletion_of_an_accepted_manifest_republishes_from_local_archive() {
         let fixture = make_shared_fixture("provider-exact-manifest-delete", 0xbb00);
         let _descriptor = activate_and_prepare_shared(&fixture);
@@ -10594,6 +11435,371 @@ mod tests {
     }
 
     #[test]
+    fn startup_discovers_manifest_stranded_beyond_an_older_valid_frontier_head() {
+        let (author, receiver, author_handle, receiver_handle) =
+            joined_shared_pair("provider-stranded-manifest", 0xb270);
+        assert!(matches!(
+            receiver_handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+        drop(receiver_handle);
+
+        let author_heads = author
+            .request
+            .provider_root
+            .join("outbox")
+            .join(SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE);
+        let older_heads = fs::read_dir(&author_heads)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (entry.file_name(), fs::read(entry.path()).unwrap())
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert!(!older_heads.is_empty());
+
+        let (stranded_batch, ..) = submit_shared_page(
+            &author_handle,
+            0xb280,
+            "Stranded Provider Manifest",
+            "notes/stranded-provider-manifest.md",
+            "published without a newer frontier head",
+        );
+        publish_shared_batch(&author_handle, &author, stranded_batch);
+        let provider_manifest = author
+            .request
+            .provider_root
+            .join(format!("outbox/manifests/{stranded_batch}.manifest"));
+        let manifest = OperationBatch::decode(&fs::read(&provider_manifest).unwrap()).unwrap();
+        assert_eq!(manifest.batch_id(), stranded_batch);
+        for object in manifest.required_objects() {
+            assert!(
+                author
+                    .request
+                    .provider_root
+                    .join(format!("outbox/objects/{}.object", object.content_digest()))
+                    .is_file(),
+                "manifest became visible before all of its immutable objects"
+            );
+        }
+        let heads_at_crash = fs::read_dir(&author_heads)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (entry.file_name(), fs::read(entry.path()).unwrap())
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            heads_at_crash, older_heads,
+            "the crash cut must retain only the older valid frontier head"
+        );
+        drop(author_handle);
+
+        let receiver_manifest = receiver
+            .request
+            .provider_root
+            .join(format!("outbox/manifests/{stranded_batch}.manifest"));
+        assert!(!receiver_manifest.exists());
+        copy_provider_tree(
+            &author.request.provider_root,
+            &receiver.request.provider_root,
+        );
+        assert!(receiver_manifest.is_file());
+        assert!(!receiver
+            .graph_root
+            .join("notes/stranded-provider-manifest.md")
+            .exists());
+
+        reset_provider_traversal_instrumentation(receiver.request.identities.workspace_id);
+        let receiver_startup =
+            active_handle(SyncRuntimeHandle::open(reopen_request(&receiver.request)));
+        settle_shared_provider(&receiver_startup);
+        let traversal =
+            provider_traversal_instrumentation(receiver.request.identities.workspace_id);
+        assert!(
+            receiver
+                .graph_root
+                .join("notes/stranded-provider-manifest.md")
+                .is_file(),
+            "normal startup did not discover the fully published stranded manifest: {traversal:?}"
+        );
+        let receiver_heads = receiver
+            .request
+            .provider_root
+            .join("outbox")
+            .join(SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE);
+        assert!(
+            fs::read_dir(&receiver_heads).unwrap().any(|entry| {
+                let entry = entry.unwrap();
+                let path = format!(
+                    "{SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE}/{}",
+                    entry.file_name().to_string_lossy()
+                );
+                SharedProviderFrontierHeadV1::decode(&path, &fs::read(entry.path()).unwrap())
+                    .is_ok_and(|head| {
+                        head.author_device_id() == receiver.request.identities.device_id
+                            && head.frontier_tips().contains(&stranded_batch)
+                    })
+            }),
+            "receiver did not durably publish a covering authenticated head"
+        );
+        let receiver_intents = receiver
+            .request
+            .provider_root
+            .join("outbox")
+            .join(SHARED_PROVIDER_PUBLICATION_INTENTS_NAMESPACE);
+        assert_eq!(
+            fs::read_dir(&receiver_intents).unwrap().count(),
+            0,
+            "receiver's covering head did not retire the foreign stranded intent"
+        );
+        assert!(matches!(
+            receiver_startup.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(snapshot)) if snapshot.provider_pending == 0
+        ));
+    }
+
+    #[test]
+    fn normal_startup_chunks_every_foreign_intent_before_head_publication_and_safe() {
+        const TEST_HEAD_SCAN_LIMIT: usize = 4;
+        const STRANDED_BATCHES: usize = TEST_HEAD_SCAN_LIMIT + 2;
+
+        let (author, receiver, author_handle, receiver_handle) =
+            joined_shared_pair("provider-chunked-stranded-intents", 0xeb00);
+        assert!(matches!(
+            receiver_handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+        drop(receiver_handle);
+
+        let author_heads = author
+            .request
+            .provider_root
+            .join("outbox")
+            .join(SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE);
+        let older_heads = fs::read_dir(&author_heads)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (entry.file_name(), fs::read(entry.path()).unwrap())
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert!(!older_heads.is_empty());
+
+        let mut stranded = Vec::with_capacity(STRANDED_BATCHES);
+        for index in 0..STRANDED_BATCHES {
+            let path = format!("notes/chunked-stranded-intent-{index}.md");
+            let (batch_id, ..) = submit_shared_page(
+                &author_handle,
+                0xeb20 + (index as u128) * 4,
+                &format!("Chunked Stranded Intent {index}"),
+                &path,
+                "published without a newer frontier head",
+            );
+            publish_shared_batch(&author_handle, &author, batch_id);
+            stranded.push((batch_id, path));
+        }
+        let heads_at_crash = fs::read_dir(&author_heads)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (entry.file_name(), fs::read(entry.path()).unwrap())
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            heads_at_crash, older_heads,
+            "the fixture must retain only the older valid frontier head"
+        );
+        drop(author_handle);
+
+        copy_provider_tree(
+            &author.request.provider_root,
+            &receiver.request.provider_root,
+        );
+        let intent_root = receiver
+            .request
+            .provider_root
+            .join("outbox")
+            .join(SHARED_PROVIDER_PUBLICATION_INTENTS_NAMESPACE);
+        let intent_entries = fs::read_dir(&intent_root)
+            .unwrap()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>();
+        assert_eq!(intent_entries.len(), STRANDED_BATCHES);
+        for entry in intent_entries {
+            let relative = format!(
+                "{SHARED_PROVIDER_PUBLICATION_INTENTS_NAMESPACE}/{}",
+                entry.file_name().to_string_lossy()
+            );
+            let intent = SharedProviderPublicationIntentV1::decode(
+                &relative,
+                &fs::read(entry.path()).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                intent.publisher_device_id(),
+                author.request.identities.device_id
+            );
+            let manifest_path = receiver
+                .request
+                .provider_root
+                .join(format!("outbox/manifests/{}.manifest", intent.batch_id()));
+            let manifest_bytes = fs::read(&manifest_path).unwrap();
+            assert_eq!(ContentDigest::of(&manifest_bytes), intent.manifest_digest());
+            let manifest = OperationBatch::decode(&manifest_bytes).unwrap();
+            assert_eq!(manifest.batch_id(), intent.batch_id());
+            for object in manifest.required_objects() {
+                assert!(
+                    receiver
+                        .request
+                        .provider_root
+                        .join(format!("outbox/objects/{}.object", object.content_digest()))
+                        .is_file(),
+                    "intent {} lacks a matching immutable object",
+                    intent.batch_id()
+                );
+            }
+        }
+
+        let receiver_heads = receiver
+            .request
+            .provider_root
+            .join("outbox")
+            .join(SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE);
+        let heads_before_startup = fs::read_dir(&receiver_heads)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (entry.file_name(), fs::read(entry.path()).unwrap())
+            })
+            .collect::<BTreeMap<_, _>>();
+        PROVIDER_HEAD_SCAN_LIMIT_OVERRIDES.lock().unwrap().insert(
+            receiver.request.identities.workspace_id,
+            TEST_HEAD_SCAN_LIMIT,
+        );
+        reset_provider_traversal_instrumentation(receiver.request.identities.workspace_id);
+        let receiver_startup =
+            active_handle(SyncRuntimeHandle::open(reopen_request(&receiver.request)));
+
+        for _ in 0..64 {
+            let tick = receiver_startup.tick().unwrap();
+            assert!(
+                !matches!(
+                    tick,
+                    SyncRuntimeTick::RecoveryBlocked(_)
+                        | SyncRuntimeTick::Blocked(_)
+                        | SyncRuntimeTick::Terminal(_)
+                        | SyncRuntimeTick::Failed(_)
+                ),
+                "chunked normal-startup discovery failed: {tick:?}"
+            );
+            if provider_traversal_instrumentation(receiver.request.identities.workspace_id)
+                .head_scan_chunk_boundaries
+                == 1
+            {
+                break;
+            }
+        }
+
+        let first_boundary =
+            provider_traversal_instrumentation(receiver.request.identities.workspace_id);
+        assert_eq!(
+            first_boundary.head_scan_chunk_boundaries, 1,
+            "normal startup did not reach the isolated chunk boundary: {first_boundary:?}"
+        );
+        assert_eq!(
+            first_boundary.head_scan_completions, 0,
+            "a chunk boundary was mistaken for discovery EOF: {first_boundary:?}"
+        );
+        assert!(
+            first_boundary.intent_entries > 0 && first_boundary.intent_entries < STRANDED_BATCHES,
+            "the first chunk did not split the foreign intent namespace: {first_boundary:?}"
+        );
+        assert_eq!(
+            first_boundary.full_scan_entries, 0,
+            "a valid multi-chunk head+intent scan triggered a broad fallback"
+        );
+        assert!(
+            receiver_startup.status().unwrap().provider_pending > 0,
+            "the first chunk did not retain its observed intent work"
+        );
+        let heads_at_first_boundary = fs::read_dir(&receiver_heads)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (entry.file_name(), fs::read(entry.path()).unwrap())
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            heads_at_first_boundary, heads_before_startup,
+            "head publication outran incomplete multi-chunk discovery"
+        );
+        assert!(
+            matches!(
+                activation_fixture_handoff(&receiver),
+                EnrollmentDiscoveryHandoff::Unsafe { .. }
+            ),
+            "the first chunk boundary falsely published Safe"
+        );
+
+        settle_shared_provider(&receiver_startup);
+        PROVIDER_HEAD_SCAN_LIMIT_OVERRIDES
+            .lock()
+            .unwrap()
+            .remove(&receiver.request.identities.workspace_id);
+        let completed =
+            provider_traversal_instrumentation(receiver.request.identities.workspace_id);
+        assert_eq!(
+            completed.intent_entries, STRANDED_BATCHES,
+            "one or more foreign intents were skipped across chunk boundaries: {completed:?}"
+        );
+        assert!(
+            completed.head_scan_chunk_boundaries >= 2 && completed.head_scan_completions >= 1,
+            "discovery did not resume through every chunk to actual EOF: {completed:?}"
+        );
+        assert_eq!(
+            completed.full_scan_entries, 0,
+            "valid multi-chunk discovery triggered a broad manifest/object scan"
+        );
+        for (batch_id, path) in &stranded {
+            assert!(
+                receiver.graph_root.join(path).is_file(),
+                "observed intent batch {batch_id} did not converge"
+            );
+        }
+        assert_eq!(receiver_startup.status().unwrap().provider_pending, 0);
+        assert_eq!(
+            fs::read_dir(&intent_root).unwrap().count(),
+            0,
+            "covering head publication did not retire every foreign intent"
+        );
+        let last_batch = stranded.last().unwrap().0;
+        assert!(
+            fs::read_dir(&receiver_heads).unwrap().any(|entry| {
+                let entry = entry.unwrap();
+                let path = format!(
+                    "{SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE}/{}",
+                    entry.file_name().to_string_lossy()
+                );
+                SharedProviderFrontierHeadV1::decode(&path, &fs::read(entry.path()).unwrap())
+                    .is_ok_and(|head| {
+                        head.author_device_id() == receiver.request.identities.device_id
+                            && head.frontier_tips().contains(&last_batch)
+                    })
+            }),
+            "receiver did not publish an authenticated head covering the final foreign batch"
+        );
+        assert!(matches!(
+            receiver_startup.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(snapshot)) if snapshot.provider_pending == 0
+        ));
+        assert_eq!(
+            activation_fixture_handoff(&receiver),
+            EnrollmentDiscoveryHandoff::Safe
+        );
+    }
+
+    #[test]
     fn two_offline_devices_union_reordered_frontier_heads_without_history_scan() {
         let (first, second, first_handle, second_handle) =
             joined_shared_pair("provider-two-offline-heads", 0xb2a0);
@@ -10644,6 +11850,116 @@ mod tests {
             second_traversal.head_entries >= 2,
             "both offline devices' reordered head records were not unioned: {second_traversal:?}"
         );
+    }
+
+    #[test]
+    fn two_offline_authors_union_frontier_heads_converge_without_return_first() {
+        let (first, second, first_handle, second_handle) =
+            joined_shared_pair("provider-two-offline-authors", 0xe400);
+        assert!(matches!(
+            first_handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+        assert!(matches!(
+            second_handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+
+        let first_offline = active_handle(SyncRuntimeHandle::open(reopen_request(&first.request)));
+        let (first_batch, ..) = submit_shared_page(
+            &first_offline,
+            0xe420,
+            "First Offline Page",
+            "notes/first-offline-page.md",
+            "first offline device",
+        );
+        publish_shared_batch(&first_offline, &first, first_batch);
+        settle_shared_provider(&first_offline);
+        assert!(matches!(
+            first_offline.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+
+        let second_offline =
+            active_handle(SyncRuntimeHandle::open(reopen_request(&second.request)));
+        let (second_batch, ..) = submit_shared_page(
+            &second_offline,
+            0xe430,
+            "Second Offline Page",
+            "notes/second-offline-page.md",
+            "second offline device",
+        );
+        publish_shared_batch(&second_offline, &second, second_batch);
+        settle_shared_provider(&second_offline);
+        assert!(matches!(
+            second_offline.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+
+        let first_manifest = OperationBatch::decode(
+            &fs::read(
+                first
+                    .request
+                    .provider_root
+                    .join(format!("outbox/manifests/{first_batch}.manifest")),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let second_manifest = OperationBatch::decode(
+            &fs::read(
+                second
+                    .request
+                    .provider_root
+                    .join(format!("outbox/manifests/{second_batch}.manifest")),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            first_manifest.causal_dependency_heads(),
+            second_manifest.causal_dependency_heads(),
+            "both offline authors must branch from the same durable base"
+        );
+        assert_eq!(first_manifest.causal_dependency_heads().len(), 1);
+
+        copy_provider_tree(&first.request.provider_root, &second.request.provider_root);
+        copy_provider_tree(&second.request.provider_root, &first.request.provider_root);
+        let first_merged = active_handle(SyncRuntimeHandle::open(reopen_request(&first.request)));
+        let second_merged = active_handle(SyncRuntimeHandle::open(reopen_request(&second.request)));
+        for _ in 0..1_024 {
+            let first_tick = first_merged.tick().unwrap();
+            let second_tick = second_merged.tick().unwrap();
+            if matches!(first_tick, SyncRuntimeTick::Idle)
+                && matches!(second_tick, SyncRuntimeTick::Idle)
+                && first_merged.status().unwrap().provider_pending == 0
+                && second_merged.status().unwrap().provider_pending == 0
+            {
+                break;
+            }
+        }
+        assert_eq!(
+            first_merged.status().unwrap().provider_pending,
+            0,
+            "first author did not settle the unioned offline branches"
+        );
+        assert_eq!(
+            second_merged.status().unwrap().provider_pending,
+            0,
+            "second author did not settle the unioned offline branches"
+        );
+        for graph_root in [&first.graph_root, &second.graph_root] {
+            assert!(graph_root.join("notes/first-offline-page.md").is_file());
+            assert!(graph_root.join("notes/second-offline-page.md").is_file());
+        }
+        assert!(matches!(
+            first_merged.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+        assert!(matches!(
+            second_merged.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
     }
 
     #[test]
@@ -10870,6 +12186,34 @@ mod tests {
             vec![second_parent, active_base, first_parent, second_parent],
             "each declared dependency edge must be inspected exactly once"
         );
+    }
+
+    #[test]
+    fn provider_dependency_index_rechecks_authenticated_frontier_ancestors() {
+        let direct = BatchId::from_uuid(Uuid::from_u128(0xd820));
+        let transitive = BatchId::from_uuid(Uuid::from_u128(0xd821));
+        let missing = BatchId::from_uuid(Uuid::from_u128(0xd822));
+        let child = BatchId::from_uuid(Uuid::from_u128(0xd823));
+        let mut index = ProviderDependencyIndex::default();
+        index
+            .register(child, vec![direct, transitive, missing], |dependency| {
+                Ok::<_, ()>(dependency == direct)
+            })
+            .unwrap();
+        assert_eq!(index.pending[&child].unmet_dependencies, 2);
+
+        index
+            .recheck_satisfied(|dependency| Ok::<_, ()>(dependency == transitive))
+            .unwrap();
+        assert_eq!(index.pending[&child].unmet_dependencies, 1);
+        assert_eq!(index.ready_front(), None);
+
+        index
+            .recheck_satisfied(|dependency| Ok::<_, ()>(dependency == missing))
+            .unwrap();
+        assert_eq!(index.ready_front(), Some(child));
+        index.accept_ready(child);
+        assert!(index.is_empty());
     }
 
     #[test]

@@ -1932,6 +1932,7 @@ impl ProviderRuntime {
                 PROVIDER_MANIFESTS_NAMESPACE,
                 PROVIDER_ENROLLMENT_NAMESPACE,
                 SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE,
+                SHARED_PROVIDER_PUBLICATION_INTENTS_NAMESPACE,
                 PROVIDER_TEMP_NAMESPACE,
                 PROVIDER_REMOVED_NAMESPACE,
                 PROVIDER_RENAME_EVIDENCE_NAMESPACE,
@@ -2267,9 +2268,12 @@ impl ProviderRuntime {
 
 pub(crate) const SHARED_ENROLLMENT_DESCRIPTOR_PATH: &str = "enrollment/shared-enrollment-v1.json";
 pub(crate) const SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE: &str = "frontier-heads-v1";
+pub(crate) const SHARED_PROVIDER_PUBLICATION_INTENTS_NAMESPACE: &str = "publication-intents-v1";
 const SHARED_PROVIDER_FRONTIER_HEAD_SCHEMA_VERSION: u32 = 1;
 const MAX_SHARED_PROVIDER_FRONTIER_HEAD_BYTES: usize = 256 * 1024;
 const MAX_SHARED_PROVIDER_FRONTIER_TIPS: usize = 4_096;
+const SHARED_PROVIDER_PUBLICATION_INTENT_SCHEMA_VERSION: u32 = 1;
+const MAX_SHARED_PROVIDER_PUBLICATION_INTENT_BYTES: usize = 4 * 1024;
 
 /// Immutable, content-addressed discovery hint for one device's accepted
 /// causal frontier. A validated record can select exact immutable manifests
@@ -2387,6 +2391,122 @@ impl SharedProviderFrontierHeadV1 {
     }
 }
 
+/// Immutable provider-visible commit-discovery evidence for one manifest.
+///
+/// Publication is objects, then this intent, then the immutable manifest, then
+/// a covering frontier head. The content-addressed path makes duplicate and
+/// reordered delivery deterministic while retaining a retryable discovery
+/// path when the manifest has not arrived yet.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SharedProviderPublicationIntentV1 {
+    schema_version: u32,
+    workspace_id: WorkspaceId,
+    lineage_digest: LineageDigest,
+    descriptor_digest: super::ContentDigest,
+    oplog_protocol_version: u32,
+    publisher_device_id: DeviceId,
+    manifest_author_device_id: DeviceId,
+    batch_id: BatchId,
+    manifest_digest: super::ContentDigest,
+}
+
+impl SharedProviderPublicationIntentV1 {
+    pub(crate) fn new(
+        workspace_id: WorkspaceId,
+        lineage_digest: LineageDigest,
+        descriptor_digest: super::ContentDigest,
+        publisher_device_id: DeviceId,
+        manifest_author_device_id: DeviceId,
+        batch_id: BatchId,
+        manifest_digest: super::ContentDigest,
+    ) -> Result<Self, ScenarioError> {
+        let intent = Self {
+            schema_version: SHARED_PROVIDER_PUBLICATION_INTENT_SCHEMA_VERSION,
+            workspace_id,
+            lineage_digest,
+            descriptor_digest,
+            oplog_protocol_version: super::OPLOG_PROTOCOL_VERSION,
+            publisher_device_id,
+            manifest_author_device_id,
+            batch_id,
+            manifest_digest,
+        };
+        intent.validate()?;
+        Ok(intent)
+    }
+
+    pub(crate) fn encode(&self) -> Result<Vec<u8>, ScenarioError> {
+        self.validate()?;
+        let bytes =
+            serde_json::to_vec(self).map_err(|error| ScenarioError::Encode(error.to_string()))?;
+        if bytes.len() > MAX_SHARED_PROVIDER_PUBLICATION_INTENT_BYTES {
+            return Err(ScenarioError::TooLarge(bytes.len()));
+        }
+        Ok(bytes)
+    }
+
+    pub(crate) fn decode(path: &str, bytes: &[u8]) -> Result<Self, ScenarioError> {
+        if bytes.len() > MAX_SHARED_PROVIDER_PUBLICATION_INTENT_BYTES {
+            return Err(ScenarioError::TooLarge(bytes.len()));
+        }
+        let intent: Self = serde_json::from_slice(bytes)
+            .map_err(|error| ScenarioError::Decode(error.to_string()))?;
+        intent.validate()?;
+        if intent.encode()? != bytes || intent.path()? != path {
+            return Err(ScenarioError::NonCanonical);
+        }
+        Ok(intent)
+    }
+
+    pub(crate) fn path(&self) -> Result<String, ScenarioError> {
+        let bytes = self.encode()?;
+        Ok(format!(
+            "{SHARED_PROVIDER_PUBLICATION_INTENTS_NAMESPACE}/{}-{}-{}.intent",
+            self.publisher_device_id,
+            self.batch_id,
+            super::ContentDigest::of(&bytes)
+        ))
+    }
+
+    pub(crate) const fn workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
+    }
+
+    pub(crate) const fn lineage_digest(&self) -> LineageDigest {
+        self.lineage_digest
+    }
+
+    pub(crate) const fn descriptor_digest(&self) -> super::ContentDigest {
+        self.descriptor_digest
+    }
+
+    pub(crate) const fn publisher_device_id(&self) -> DeviceId {
+        self.publisher_device_id
+    }
+
+    pub(crate) const fn manifest_author_device_id(&self) -> DeviceId {
+        self.manifest_author_device_id
+    }
+
+    pub(crate) const fn batch_id(&self) -> BatchId {
+        self.batch_id
+    }
+
+    pub(crate) const fn manifest_digest(&self) -> super::ContentDigest {
+        self.manifest_digest
+    }
+
+    fn validate(&self) -> Result<(), ScenarioError> {
+        if self.schema_version != SHARED_PROVIDER_PUBLICATION_INTENT_SCHEMA_VERSION
+            || self.oplog_protocol_version != super::OPLOG_PROTOCOL_VERSION
+        {
+            return Err(ScenarioError::NonCanonical);
+        }
+        Ok(())
+    }
+}
+
 pub(crate) struct SharedProviderFile {
     pub(crate) path: String,
     pub(crate) bytes: Vec<u8>,
@@ -2397,6 +2517,13 @@ pub(crate) struct SharedProviderScan {
     pub(crate) files: Vec<SharedProviderFile>,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum SharedProviderObservation {
+    Path(String),
+    ChunkBoundary,
+    Complete,
+}
+
 const PROVIDER_PENDING_PUBLICATION_NAMESPACE: &str = "pending-publication-v1";
 const PROVIDER_PENDING_PUBLICATION_BYTES: usize = 64;
 
@@ -2405,6 +2532,19 @@ pub(crate) struct SharedProviderObservationCursor {
     entries: Option<ReadDir>,
     full: bool,
     observed_entries: usize,
+    entry_limit: usize,
+}
+
+impl SharedProviderObservationCursor {
+    pub(crate) fn begin_next_chunk(&mut self) {
+        self.observed_entries = 0;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_entry_limit_for_test(&mut self, entry_limit: usize) {
+        assert!(entry_limit > 0);
+        self.entry_limit = entry_limit;
+    }
 }
 
 pub(crate) struct SharedProviderPublicationCursor {
@@ -2492,6 +2632,22 @@ impl SharedProviderTransport {
         Ok(path)
     }
 
+    pub(crate) fn publish_publication_intent(
+        &mut self,
+        intent: &SharedProviderPublicationIntentV1,
+    ) -> Result<String, ScenarioError> {
+        let bytes = intent.encode()?;
+        let path = intent.path()?;
+        if let Some(existing) = self.read_exact(&path)? {
+            if existing == bytes {
+                return Ok(path);
+            }
+            return Err(ScenarioError::ProviderConflictingBytes(path));
+        }
+        self.publish(&path, &bytes)?;
+        Ok(path)
+    }
+
     fn publish(&mut self, path: &str, bytes: &[u8]) -> Result<(), ScenarioError> {
         let gate = self.journal.acquire_transaction_gate()?;
         let source = format!("generated:{}", provider_digest(bytes));
@@ -2531,6 +2687,11 @@ impl SharedProviderTransport {
             None if path.starts_with(&format!("{SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE}/")) => {
                 MAX_SHARED_PROVIDER_FRONTIER_HEAD_BYTES
             }
+            None if path
+                .starts_with(&format!("{SHARED_PROVIDER_PUBLICATION_INTENTS_NAMESPACE}/")) =>
+            {
+                MAX_SHARED_PROVIDER_PUBLICATION_INTENT_BYTES
+            }
             None => MAX_PROVIDER_RESCAN_BYTES,
         };
         let (parent, name) = self
@@ -2548,6 +2709,7 @@ impl SharedProviderTransport {
             entries: None,
             full: false,
             observed_entries: 0,
+            entry_limit: MAX_PROVIDER_RESCAN_ENTRIES,
         })
     }
 
@@ -2559,6 +2721,7 @@ impl SharedProviderTransport {
             entries: None,
             full: true,
             observed_entries: 0,
+            entry_limit: MAX_PROVIDER_RESCAN_ENTRIES,
         })
     }
 
@@ -2570,7 +2733,7 @@ impl SharedProviderTransport {
     pub(crate) fn next_observed_path(
         &self,
         cursor: &mut SharedProviderObservationCursor,
-    ) -> Result<Option<String>, ScenarioError> {
+    ) -> Result<SharedProviderObservation, ScenarioError> {
         loop {
             if cursor.phase == 0 {
                 if cursor.entries.is_none() {
@@ -2597,6 +2760,7 @@ impl SharedProviderTransport {
                         | PROVIDER_MANIFESTS_NAMESPACE
                         | PROVIDER_OBJECTS_NAMESPACE
                         | SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE
+                        | SHARED_PROVIDER_PUBLICATION_INTENTS_NAMESPACE
                         | PROVIDER_TEMP_NAMESPACE
                         | PROVIDER_REMOVED_NAMESPACE
                         | PROVIDER_RENAME_EVIDENCE_NAMESPACE
@@ -2613,9 +2777,10 @@ impl SharedProviderTransport {
             let namespace = match (cursor.full, cursor.phase) {
                 (_, 1) => PROVIDER_ENROLLMENT_NAMESPACE,
                 (_, 2) => SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE,
-                (true, 3) => PROVIDER_MANIFESTS_NAMESPACE,
-                (true, 4) => PROVIDER_OBJECTS_NAMESPACE,
-                _ => return Ok(None),
+                (_, 3) => SHARED_PROVIDER_PUBLICATION_INTENTS_NAMESPACE,
+                (true, 4) => PROVIDER_MANIFESTS_NAMESPACE,
+                (true, 5) => PROVIDER_OBJECTS_NAMESPACE,
+                _ => return Ok(SharedProviderObservation::Complete),
             };
             if cursor.entries.is_none() {
                 cursor.entries = Some(
@@ -2623,6 +2788,9 @@ impl SharedProviderTransport {
                         .entries()
                         .map_err(|error| ScenarioError::Io(error.to_string()))?,
                 );
+            }
+            if !cursor.full && cursor.observed_entries >= cursor.entry_limit {
+                return Ok(SharedProviderObservation::ChunkBoundary);
             }
             let Some(entry) = cursor.entries.as_mut().expect("cursor opened").next() else {
                 cursor.entries = None;
@@ -2651,10 +2819,7 @@ impl SharedProviderTransport {
             .map_err(|error| ScenarioError::UnsafeProviderEntry(error.to_string()))?;
             validate_provider_regular_file(&file, &path)?;
             cursor.observed_entries = cursor.observed_entries.saturating_add(1);
-            if !cursor.full && cursor.observed_entries > MAX_PROVIDER_RESCAN_ENTRIES {
-                return Err(ScenarioError::ProviderRescanLimit);
-            }
-            return Ok(Some(path));
+            return Ok(SharedProviderObservation::Path(path));
         }
     }
 
@@ -2665,6 +2830,30 @@ impl SharedProviderTransport {
         let digest = Sha256::digest(
             [
                 b"tine/provider-frontier-head-retirement/v1\0".as_slice(),
+                path.as_bytes(),
+            ]
+            .concat(),
+        );
+        let mut event = [0_u8; 8];
+        event.copy_from_slice(&digest[..8]);
+        run_provider_remove_with(
+            &self.runtime,
+            &self.journal,
+            "local",
+            u64::from_be_bytes(event),
+            ProviderTree::Outbox,
+            path,
+            None,
+        )
+    }
+
+    pub(crate) fn retire_publication_intent(&self, path: &str) -> Result<(), ScenarioError> {
+        if !path.starts_with(&format!("{SHARED_PROVIDER_PUBLICATION_INTENTS_NAMESPACE}/")) {
+            return Err(ScenarioError::InvalidProviderPath(path.into()));
+        }
+        let digest = Sha256::digest(
+            [
+                b"tine/provider-publication-intent-retirement/v1\0".as_slice(),
                 path.as_bytes(),
             ]
             .concat(),
@@ -4297,6 +4486,93 @@ impl ProviderRetryJournal {
         // A crash may leave the same authenticated Cleanup record in both
         // pending and completed directories. Preserve both copies for the
         // normal retry validator instead of discarding its completion proof.
+        if open_provider_regular_optional(
+            &self.records,
+            &record_name,
+            MAX_PROVIDER_JOURNAL_RECORD_BYTES,
+            &record_name,
+        )
+        .map_err(|_| ScenarioError::UnsafeProviderJournal(record_name.clone()))?
+        .is_some()
+        {
+            return Ok(());
+        }
+        self.completed
+            .remove_file(&record_name)
+            .map_err(|error| ScenarioError::Io(error.to_string()))?;
+        sync_provider_directory(&self.completed)
+    }
+
+    /// Recycle an exact completed remove only when complete provider namespace
+    /// loss erased its authenticated diagnostic and the same canonical source
+    /// bytes were subsequently republished. The new removal must capture the
+    /// new file identity; the vanished old identity cannot authorize it.
+    fn recycle_completed_remove_for_reappeared_source(
+        &self,
+        gate: &ProviderTransactionGate,
+        operation_binding: &str,
+        source_provenance: &str,
+        provider: &ProviderRuntime,
+        tree: ProviderTree,
+        path: &str,
+        bytes: &[u8],
+    ) -> Result<(), ScenarioError> {
+        self.require_transaction_gate(gate)?;
+        let source_len =
+            u64::try_from(bytes.len()).map_err(|_| ScenarioError::ProviderJournalLimit)?;
+        let source_digest = provider_digest(bytes);
+        let operation_id = Self::operation_id(
+            ProviderJournalOperation::Remove,
+            operation_binding,
+            source_provenance,
+            tree,
+            path,
+            None,
+            source_len,
+            &source_digest,
+        );
+        let record_name = Self::record_name(&operation_id);
+        let Some(opened) = open_provider_regular_optional(
+            &self.completed,
+            &record_name,
+            MAX_PROVIDER_JOURNAL_RECORD_BYTES,
+            &record_name,
+        )
+        .map_err(|_| ScenarioError::UnsafeProviderJournal(record_name.clone()))?
+        else {
+            return Ok(());
+        };
+        let record = self.decode_record(&opened.bytes, &record_name)?;
+        self.validate_record_shape(gate, &record, false)?;
+        if record.operation_id != operation_id
+            || record.operation != ProviderJournalOperation::Remove
+            || record.operation_binding != operation_binding
+            || record.source_provenance != source_provenance
+            || record.tree != tree
+            || record.from_path != path
+            || record.to_path.is_some()
+            || record.source_len != source_len
+            || record.source_digest != source_digest
+            || record.phase != ProviderJournalPhase::Cleanup
+        {
+            return Err(ScenarioError::UnsafeProviderJournal(record_name));
+        }
+        let diagnostic = record
+            .diagnostic_path
+            .as_deref()
+            .ok_or_else(|| ScenarioError::UnsafeProviderJournal(record_name.clone()))?;
+        let (diagnostic_dir, diagnostic_name) =
+            provider.parent_and_name(tree, diagnostic, false)?;
+        if open_provider_regular_optional(
+            &diagnostic_dir,
+            &diagnostic_name,
+            MAX_PROVIDER_RESCAN_BYTES,
+            diagnostic,
+        )?
+        .is_some()
+        {
+            return Ok(());
+        }
         if open_provider_regular_optional(
             &self.records,
             &record_name,
@@ -7624,6 +7900,19 @@ fn run_provider_remove_with(
         provider_name,
         provider_tree_name(tree)
     );
+    if let Some(source) =
+        open_provider_regular_optional(&parent, &name, MAX_PROVIDER_RESCAN_BYTES, path)?
+    {
+        journal.recycle_completed_remove_for_reappeared_source(
+            &gate,
+            &operation_binding,
+            &source_provenance,
+            provider,
+            tree,
+            path,
+            &source.bytes,
+        )?;
+    }
     let mut record = match journal.load(
         &gate,
         ProviderJournalOperation::Remove,
@@ -10484,6 +10773,7 @@ fn bounded_provider_files(
                         PROVIDER_OBJECTS_NAMESPACE,
                         PROVIDER_MANIFESTS_NAMESPACE,
                         SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE,
+                        SHARED_PROVIDER_PUBLICATION_INTENTS_NAMESPACE,
                         PROVIDER_TEMP_NAMESPACE,
                         PROVIDER_REMOVED_NAMESPACE,
                         PROVIDER_RENAME_EVIDENCE_NAMESPACE,
@@ -10612,6 +10902,112 @@ mod tests {
         let mut differing = bytes;
         differing.extend_from_slice(b" ");
         assert!(SharedProviderFrontierHeadV1::decode(&path, &differing).is_err());
+    }
+
+    #[test]
+    fn shared_provider_publication_intent_is_canonical_content_addressed_and_bound() {
+        let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(0x5f10));
+        let lineage_digest = LineageDigest::of(b"publication-intent-lineage");
+        let descriptor_digest = ContentDigest::of(b"publication-intent-descriptor");
+        let publisher = DeviceId::from_uuid(Uuid::from_u128(0x5f11));
+        let author = DeviceId::from_uuid(Uuid::from_u128(0x5f12));
+        let batch_id = BatchId::from_uuid(Uuid::from_u128(0x5f13));
+        let manifest_digest = ContentDigest::of(b"publication-intent-manifest");
+        let intent = SharedProviderPublicationIntentV1::new(
+            workspace_id,
+            lineage_digest,
+            descriptor_digest,
+            publisher,
+            author,
+            batch_id,
+            manifest_digest,
+        )
+        .unwrap();
+        let bytes = intent.encode().unwrap();
+        assert!(bytes.len() <= MAX_SHARED_PROVIDER_PUBLICATION_INTENT_BYTES);
+        let path = intent.path().unwrap();
+        assert!(path.starts_with(&format!(
+            "{SHARED_PROVIDER_PUBLICATION_INTENTS_NAMESPACE}/{publisher}-{batch_id}-"
+        )));
+        assert!(path.ends_with(".intent"));
+        assert_eq!(
+            SharedProviderPublicationIntentV1::decode(&path, &bytes).unwrap(),
+            intent
+        );
+        assert!(SharedProviderPublicationIntentV1::decode(
+            &format!(
+                "{SHARED_PROVIDER_PUBLICATION_INTENTS_NAMESPACE}/{publisher}-{batch_id}-{}.intent",
+                "0".repeat(64)
+            ),
+            &bytes,
+        )
+        .is_err());
+
+        let mut reordered: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        reordered["manifest_digest"] =
+            serde_json::Value::String(ContentDigest::of(b"different manifest").to_string());
+        let reordered = serde_json::to_vec(&reordered).unwrap();
+        assert!(SharedProviderPublicationIntentV1::decode(&path, &reordered).is_err());
+    }
+
+    #[test]
+    fn shared_provider_observation_chunk_boundary_preserves_the_next_path() {
+        let root = ScenarioRoot::new().unwrap();
+        let provider_root = root.0.join("provider");
+        let journal_root = root.0.join("private/device/journal");
+        let mut provider = SharedProviderTransport::open(&provider_root, &journal_root).unwrap();
+        provider.publish_descriptor(b"descriptor").unwrap();
+
+        let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(0x5f20));
+        let lineage_digest = LineageDigest::of(b"chunk-boundary-lineage");
+        let descriptor_digest = ContentDigest::of(b"chunk-boundary-descriptor");
+        let publisher = DeviceId::from_uuid(Uuid::from_u128(0x5f21));
+        for index in 0_u128..3 {
+            let intent = SharedProviderPublicationIntentV1::new(
+                workspace_id,
+                lineage_digest,
+                descriptor_digest,
+                publisher,
+                DeviceId::from_uuid(Uuid::from_u128(0x5f22 + index)),
+                BatchId::from_uuid(Uuid::from_u128(0x5f30 + index)),
+                ContentDigest::of(&index.to_be_bytes()),
+            )
+            .unwrap();
+            provider.publish_publication_intent(&intent).unwrap();
+        }
+
+        let mut expected = Vec::new();
+        let mut full = provider.full_observation_cursor().unwrap();
+        loop {
+            match provider.next_observed_path(&mut full).unwrap() {
+                SharedProviderObservation::Path(path) => expected.push(path),
+                SharedProviderObservation::Complete => break,
+                SharedProviderObservation::ChunkBoundary => {
+                    panic!("a full observation cursor cannot yield a chunk boundary")
+                }
+            }
+        }
+
+        let mut observed = Vec::new();
+        let mut boundaries = 0;
+        let mut chunked = provider.head_observation_cursor().unwrap();
+        chunked.set_entry_limit_for_test(2);
+        loop {
+            match provider.next_observed_path(&mut chunked).unwrap() {
+                SharedProviderObservation::Path(path) => observed.push(path),
+                SharedProviderObservation::ChunkBoundary => {
+                    boundaries += 1;
+                    chunked.begin_next_chunk();
+                }
+                SharedProviderObservation::Complete => break,
+            }
+        }
+
+        assert_eq!(boundaries, 2);
+        assert_eq!(observed.len(), expected.len());
+        observed.sort();
+        expected.sort();
+        assert_eq!(observed, expected);
     }
 
     #[test]
