@@ -619,33 +619,42 @@ fn receiver_tombstone_plan(
         }
         None => None,
     };
-    if local_base
-        .zip(prior_description)
-        .is_some_and(|(bytes, description)| super::BlobDescription::of(bytes) != description)
-        || (local_base.is_some() && prior_description.is_none())
-    {
-        return Err(ProjectionError::ReceiverBaseMismatch);
-    }
-    let precondition = prior_description.map_or(ProjectionPrecondition::Absent, |description| {
-        ProjectionPrecondition::Base(description)
-    });
-    let intent = ProjectionIntent::new(
-        engine.workspace_id(),
-        authorization.page_id(),
-        authorization.path().clone(),
-        authorization.frontier().clone(),
-        Vec::new(),
-        precondition,
-        super::BlobDescription::of(&[]),
-        Vec::new(),
-    )?;
-    let base = match (prior_description, local_base) {
-        (Some(_), Some(bytes)) => Some(BaseBlob::new(bytes.to_vec())),
-        (Some(_), None) => store
-            .load_base(&intent)?
-            .ok_or(ProjectionError::ReceiverBaseMismatch)
-            .map(Some)?,
-        (None, None) => None,
+    let make_intent = |precondition| {
+        ProjectionIntent::new(
+            engine.workspace_id(),
+            authorization.page_id(),
+            authorization.path().clone(),
+            authorization.frontier().clone(),
+            Vec::new(),
+            precondition,
+            super::BlobDescription::of(&[]),
+            Vec::new(),
+        )
+    };
+    let (intent, base) = match (prior_description, local_base) {
+        (Some(description), Some(bytes)) => {
+            if super::BlobDescription::of(bytes) != description {
+                return Err(ProjectionError::ReceiverBaseMismatch);
+            }
+            (
+                make_intent(ProjectionPrecondition::Base(description))?,
+                Some(BaseBlob::new(bytes.to_vec())),
+            )
+        }
+        (Some(description), None) => {
+            let base_intent = make_intent(ProjectionPrecondition::Base(description))?;
+            match store.load_intent(base_intent.id()?)? {
+                Some(intent) if intent == base_intent => {
+                    let base = store
+                        .load_base(&intent)?
+                        .ok_or(ProjectionError::ReceiverBaseMismatch)?;
+                    (intent, Some(base))
+                }
+                Some(_) => return Err(ProjectionError::ReceiverBaseMismatch),
+                None => (make_intent(ProjectionPrecondition::Absent)?, None),
+            }
+        }
+        (None, None) => (make_intent(ProjectionPrecondition::Absent)?, None),
         (None, Some(_)) => return Err(ProjectionError::ReceiverBaseMismatch),
     };
     Ok(ProjectionPlan {

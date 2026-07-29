@@ -763,6 +763,149 @@ fn projected_receiver_bytes_are_removed_by_foreign_deletion() {
 }
 
 #[test]
+fn prior_present_receipt_with_already_absent_receiver_completes_foreign_deletion() {
+    let manifest = corpus_manifest();
+    let deleted = deleted_fixture_page(&manifest);
+    let (dir, source_graph, source_receipts, writer, source_engine, _, work) =
+        corpus_manifested_deletion_fixture("receiver-prior-present-already-absent", deleted);
+    let source = manifested_intent_for_work(&writer, &work);
+    drop(source_engine);
+    drop(source_receipts);
+    drop(source_graph);
+    let receiver = corpus_provider_receiver(
+        &dir,
+        &source,
+        work.batch_id(),
+        ReceiverInitialTarget::ProjectedThenRemoved,
+    );
+    assert!(
+        receiver
+            .graph
+            .read_projection_input(source.path())
+            .unwrap()
+            .is_none(),
+        "receiver file must be absent before the foreign tombstone is accepted"
+    );
+    let before = receiver
+        .engine
+        .projection_work_index()
+        .unwrap()
+        .completed_receipts_for_path(source.path())
+        .unwrap();
+    let [prior] = before.as_slice() else {
+        panic!("receiver must retain exactly one prior Present completion");
+    };
+    assert!(matches!(
+        prior.target(),
+        ProjectionWorkTarget::Present(_)
+    ));
+    let (prior_intent, _) = receiver.receipts.load_completed_receipt(prior).unwrap();
+    assert_eq!(
+        prior_intent.precondition(),
+        &ProjectionPrecondition::Absent,
+        "the prior Present projection must not imply retained base bytes"
+    );
+    assert!(receiver.receipts.load_base(&prior_intent).unwrap().is_none());
+    assert!(
+        receiver
+            .receipts
+            .incomplete_intents()
+            .unwrap()
+            .iter()
+            .all(|intent| {
+                intent.page_id() != source.page_id()
+                    || intent.path() != source.path()
+                    || intent.frontier() != source.post_frontier()
+            }),
+        "removing the receiver file must not create a tombstone attempt"
+    );
+
+    let handoff = receiver
+        .graph
+        .mint_handoff_safe(corpus_workspace(1), receiver.binding)
+        .unwrap()
+        .into_publisher_guard()
+        .into_published_latch();
+    assert_eq!(
+        execute_receiver_local_projection_under_handoff(
+            &receiver.graph,
+            &receiver.receipts,
+            &receiver.engine,
+            &source,
+            &handoff,
+            true,
+        )
+        .unwrap(),
+        Some(true)
+    );
+    assert!(
+        receiver
+            .graph
+            .read_projection_input(source.path())
+            .unwrap()
+            .is_none(),
+        "accepted tombstone completion must preserve the already-absent target"
+    );
+
+    let receipt_root = receiver.receipts.root_path().to_path_buf();
+    let CorpusProviderReceiver {
+        graph_root,
+        graph,
+        receipts,
+        engine,
+        binding,
+    } = receiver;
+    drop(handoff);
+    drop(receipts);
+    drop(graph);
+    let graph = Graph::open(&graph_root);
+    let receipts = crate::oplog::ProjectionReceiptStore::open_for_endpoint(
+        &receipt_root,
+        corpus_workspace(1),
+        binding,
+    )
+    .unwrap();
+    let handoff = graph
+        .mint_handoff_safe(corpus_workspace(1), binding)
+        .unwrap()
+        .into_publisher_guard()
+        .into_published_latch();
+    assert_eq!(
+        execute_receiver_local_projection_under_handoff(
+            &graph, &receipts, &engine, &source, &handoff, true,
+        )
+        .unwrap(),
+        Some(false),
+        "restart retry must recognize the exact completed tombstone"
+    );
+    assert!(graph
+        .read_projection_input(source.path())
+        .unwrap()
+        .is_none());
+    let completed = engine
+        .projection_work_index()
+        .unwrap()
+        .completed_receipts_for_path(source.path())
+        .unwrap();
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0].target(), ProjectionWorkTarget::Absent);
+    let (completed_intent, _) = receipts.load_completed_receipt(&completed[0]).unwrap();
+    assert_eq!(
+        completed_intent.precondition(),
+        &ProjectionPrecondition::Absent,
+        "live absence may authorize only the already-absent confirmation path"
+    );
+    assert!(receipts.load_base(&completed_intent).unwrap().is_none());
+    let import = plan_affected_import(&graph, &receipts, &engine, &[source.path().as_str()]);
+    assert_eq!(import.status(), ImportPlanStatus::Noop);
+    assert!(import
+        .inventory()
+        .unwrap()
+        .present(source.path().as_str())
+        .is_none());
+}
+
+#[test]
 fn changed_receiver_bytes_refuse_foreign_deletion_and_preserve_evidence() {
     let manifest = corpus_manifest();
     let deleted = deleted_fixture_page(&manifest);
@@ -1950,6 +2093,7 @@ fn corpus_manifested_deletion_fixture(
 enum ReceiverInitialTarget {
     Absent,
     Projected,
+    ProjectedThenRemoved,
 }
 
 struct CorpusProviderReceiver {
@@ -1994,6 +2138,7 @@ fn corpus_provider_receiver(
         match initial_target {
             ReceiverInitialTarget::Absent => "absent",
             ReceiverInitialTarget::Projected => "projected",
+            ReceiverInitialTarget::ProjectedThenRemoved => "projected-then-removed",
         }
     ));
     drop(ObjectStore::open(&archive_root, workspace).unwrap());
@@ -2015,6 +2160,7 @@ fn corpus_provider_receiver(
         match initial_target {
             ReceiverInitialTarget::Absent => "absent",
             ReceiverInitialTarget::Projected => "projected",
+            ReceiverInitialTarget::ProjectedThenRemoved => "projected-then-removed",
         }
     ));
     fs::create_dir_all(graph_root.join("pages")).unwrap();
@@ -2033,6 +2179,7 @@ fn corpus_provider_receiver(
         match initial_target {
             ReceiverInitialTarget::Absent => 75_000,
             ReceiverInitialTarget::Projected => 76_000,
+            ReceiverInitialTarget::ProjectedThenRemoved => 77_000,
         },
     );
     assert_ne!(binding.endpoint_id(), source.source_endpoint_id());
@@ -2042,6 +2189,7 @@ fn corpus_provider_receiver(
             match initial_target {
                 ReceiverInitialTarget::Absent => "absent",
                 ReceiverInitialTarget::Projected => "projected",
+                ReceiverInitialTarget::ProjectedThenRemoved => "projected-then-removed",
             }
         )),
         workspace,
@@ -2062,7 +2210,10 @@ fn corpus_provider_receiver(
             .disposition(),
         BatchDisposition::Accepted { .. }
     ));
-    if matches!(initial_target, ReceiverInitialTarget::Projected) {
+    if matches!(
+        initial_target,
+        ReceiverInitialTarget::Projected | ReceiverInitialTarget::ProjectedThenRemoved
+    ) {
         crate::oplog::write_projection_exact(
             &graph,
             &receipts,
@@ -2071,6 +2222,9 @@ fn corpus_provider_receiver(
             None,
         )
         .unwrap();
+    }
+    if matches!(initial_target, ReceiverInitialTarget::ProjectedThenRemoved) {
+        fs::remove_file(graph_root.join(source.path().as_str())).unwrap();
     }
     assert!(matches!(
         engine
