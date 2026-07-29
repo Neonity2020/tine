@@ -1414,21 +1414,40 @@ impl SyncRuntimeHandle {
         paths: Vec<String>,
         imprecise: bool,
     ) -> Result<(), SyncRuntimeRequestError> {
+        // This gate is the provider observation linearization point relative
+        // to `clean_shutdown`, including callbacks too large to retain
+        // exactly.
+        let _operation = self.inner.operation.lock().unwrap();
         let path_bytes = paths
             .iter()
             .try_fold(0_usize, |total, path| total.checked_add(path.len()))
             .unwrap_or(MAX_PROVIDER_EXACT_PATH_BYTES.saturating_add(1));
         if paths.len() > MAX_PROVIDER_EXACT_PATHS || path_bytes > MAX_PROVIDER_EXACT_PATH_BYTES {
+            self.retain_rejected_provider_work()?;
             return Err(SyncRuntimeRequestError::RequestTooLarge {
                 observations: paths.len(),
                 path_bytes,
             });
         }
-        let _operation = self.inner.operation.lock().unwrap();
         let (reply_sender, reply_receiver) = mpsc::channel();
         self.send(ActorRequest::ObserveProvider {
             paths,
             imprecise,
+            reply: reply_sender,
+        })?;
+        reply_receiver
+            .recv()
+            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)?
+    }
+
+    /// A provider callback may be too large to retain exactly after its source
+    /// has drained it. Preserve one bounded incremental rescan obligation in
+    /// the actor queue before reporting the refusal.
+    fn retain_rejected_provider_work(&self) -> Result<(), SyncRuntimeRequestError> {
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.send(ActorRequest::ObserveProvider {
+            paths: Vec::new(),
+            imprecise: true,
             reply: reply_sender,
         })?;
         reply_receiver
@@ -3301,7 +3320,14 @@ struct RuntimeActor {
     shared_role: Option<SyncSharedRole>,
     shared_phase: Option<SyncSharedPhase>,
     provider_exact: VecDeque<String>,
+    /// One incremental scan requested after the currently active cursor, if
+    /// any. Starting a cursor consumes this bit; an observation linearized
+    /// during that cursor sets it again.
     provider_rescan_requested: bool,
+    /// At least one imprecise provider callback was observed after the last
+    /// completed callback-required scan. Background startup scans do not make
+    /// clean shutdown replay settled provider history.
+    provider_rescan_required_for_safe: bool,
     provider_observation_cursor: Option<SharedProviderObservationCursor>,
     provider_pending: VecDeque<BatchId>,
     provider_continuation: Option<ProviderArchiveContinuation>,
@@ -3311,6 +3337,7 @@ struct RuntimeActor {
     provider_publication_probe: bool,
     provider_publication_cursor: Option<SharedProviderPublicationCursor>,
     provider_publication_forced: VecDeque<BatchId>,
+    provider_descriptor_repair_requested: bool,
     provider_publication_repair_requested: bool,
     provider_publication_repair_cursor: Option<ObjectStoreManifestCursor>,
     pending_join: Option<PendingSharedJoin>,
@@ -3434,6 +3461,17 @@ impl RuntimeActor {
         } else {
             None
         };
+        let provider_descriptor_repair_requested = if shared_phase == Some(SyncSharedPhase::Active)
+        {
+            provider
+                .as_ref()
+                .ok_or_else(|| "SharedActive runtime has no provider transport".to_owned())?
+                .read_exact(SHARED_ENROLLMENT_DESCRIPTOR_PATH)
+                .map_err(display)?
+                .is_none()
+        } else {
+            false
+        };
         Ok(Self {
             graph,
             receipts,
@@ -3457,6 +3495,7 @@ impl RuntimeActor {
             shared_phase,
             provider_exact: VecDeque::new(),
             provider_rescan_requested: shared_phase == Some(SyncSharedPhase::Active),
+            provider_rescan_required_for_safe: false,
             provider_observation_cursor: None,
             provider_pending: VecDeque::new(),
             provider_continuation: None,
@@ -3466,7 +3505,9 @@ impl RuntimeActor {
             provider_publication_probe: shared_phase == Some(SyncSharedPhase::Active),
             provider_publication_cursor: None,
             provider_publication_forced: VecDeque::new(),
-            provider_publication_repair_requested: unsafe_reopen
+            provider_descriptor_repair_requested,
+            provider_publication_repair_requested: (unsafe_reopen
+                || provider_descriptor_repair_requested)
                 && shared_phase == Some(SyncSharedPhase::Active),
             provider_publication_repair_cursor: None,
             pending_join: None,
@@ -3544,6 +3585,7 @@ impl RuntimeActor {
         }
         if imprecise {
             self.provider_rescan_requested = true;
+            self.provider_rescan_required_for_safe = true;
         }
         Ok(())
     }
@@ -4099,6 +4141,12 @@ impl RuntimeActor {
         if let Some(outcome) = self.advance_local_mutation_once() {
             return SyncRuntimeTick::LocalMutation(outcome);
         }
+        // Once the watcher callback is admitted, its on-disk bytes are the
+        // authoritative local observation. Capture them before provider
+        // projection can use or replace the same file as a remote base.
+        if self.last_watcher.pending {
+            return self.tick_external_feed();
+        }
         if self.shared_phase == Some(SyncSharedPhase::Active) && self.provider_has_work() {
             return self.tick_provider();
         }
@@ -4116,6 +4164,7 @@ impl RuntimeActor {
             || self.provider_publication_probe
             || self.provider_publication_cursor.is_some()
             || !self.provider_publication_forced.is_empty()
+            || self.provider_descriptor_repair_requested
             || self.provider_publication_repair_requested
             || self.provider_publication_repair_cursor.is_some()
     }
@@ -4172,6 +4221,10 @@ impl RuntimeActor {
                     Err(error) => return SyncRuntimeTick::RecoveryBlocked(error.to_string()),
                 };
                 self.provider_observation_cursor = Some(cursor);
+                // The cursor now owns the consumed generation. An imprecise
+                // callback arriving while it is active will set this bit for
+                // exactly one subsequent scan.
+                self.provider_rescan_requested = false;
             }
             if let Some(cursor) = self.provider_observation_cursor.as_mut() {
                 let path = match self
@@ -4200,7 +4253,9 @@ impl RuntimeActor {
                     }
                 } else {
                     self.provider_observation_cursor = None;
-                    self.provider_rescan_requested = false;
+                    if !self.provider_rescan_requested {
+                        self.provider_rescan_required_for_safe = false;
+                    }
                     observed_provider_progress = true;
                 }
             }
@@ -4350,6 +4405,20 @@ impl RuntimeActor {
         store: &ObjectStore,
         descriptor: &SharedEnrollmentDescriptorV1,
     ) -> Result<Option<SyncRuntimeTick>, SyncRuntimeRequestError> {
+        if self.provider_descriptor_repair_requested {
+            self.provider
+                .as_mut()
+                .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
+                .publish_descriptor(
+                    &descriptor.encode().map_err(|error| {
+                        SyncRuntimeRequestError::ActorRefused(error.to_string())
+                    })?,
+                )
+                .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+            self.provider_descriptor_repair_requested = false;
+            self.provider_publication_repair_requested = true;
+            return Ok(Some(SyncRuntimeTick::Recovering));
+        }
         if self.provider_publication_forced.is_empty() {
             if self.provider_publication_cursor.is_none() && self.provider_publication_probe {
                 self.provider_publication_cursor = Some(
@@ -4598,9 +4667,21 @@ impl RuntimeActor {
                     descriptor,
                     batch_id,
                 )? {
-                    return Err(SyncRuntimeRequestError::ActorRefused(format!(
-                        "accepted provider manifest is absent at {path}"
-                    )));
+                    match store
+                        .inspect_batch(batch_id)
+                        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
+                    {
+                        crate::oplog::BatchInspection::Ready(_) => {
+                            self.record_provider_publication(batch_id)?;
+                            return Ok(());
+                        }
+                        crate::oplog::BatchInspection::Absent
+                        | crate::oplog::BatchInspection::Staged { .. } => {
+                            return Err(SyncRuntimeRequestError::ActorRefused(format!(
+                                "accepted provider manifest is absent at {path}"
+                            )));
+                        }
+                    }
                 }
                 self.provider_incomplete.remove(&batch_id);
                 return Ok(());
@@ -5095,8 +5176,10 @@ impl RuntimeActor {
                 && !self.provider_publication_probe
                 && self.provider_publication_cursor.is_none()
                 && self.provider_publication_forced.is_empty()
+                && !self.provider_descriptor_repair_requested
                 && !self.provider_publication_repair_requested
                 && self.provider_publication_repair_cursor.is_none()
+                && !self.provider_rescan_required_for_safe
             {
                 return Ok(());
             }
@@ -5138,6 +5221,7 @@ impl RuntimeActor {
             usize::from(self.provider_publication_probe)
                 + usize::from(self.provider_publication_cursor.is_some())
                 + self.provider_publication_forced.len()
+                + usize::from(self.provider_descriptor_repair_requested)
                 + usize::from(self.provider_publication_repair_requested)
                 + usize::from(self.provider_publication_repair_cursor.is_some()),
             continuation,
@@ -5407,8 +5491,10 @@ impl RuntimeActor {
                 + usize::from(self.provider_publication_probe)
                 + usize::from(self.provider_publication_cursor.is_some())
                 + self.provider_publication_forced.len()
+                + usize::from(self.provider_descriptor_repair_requested)
                 + usize::from(self.provider_publication_repair_requested)
                 + usize::from(self.provider_publication_repair_cursor.is_some())
+                + usize::from(self.provider_rescan_required_for_safe)
                 + usize::from(self.provider_observation_cursor.is_some()),
         }
     }
@@ -9202,6 +9288,508 @@ mod tests {
         let handle = active.handle.expect("fixture LocalActive");
         drive_initial_feed(&handle);
         handle.prepare_shared().expect("fixture SharedActive")
+    }
+
+    fn settle_shared_provider(handle: &SyncRuntimeHandle) {
+        for _ in 0..1_024 {
+            let tick = handle.tick().unwrap();
+            assert!(
+                !matches!(
+                    tick,
+                    SyncRuntimeTick::RecoveryBlocked(_)
+                        | SyncRuntimeTick::Blocked(_)
+                        | SyncRuntimeTick::Terminal(_)
+                        | SyncRuntimeTick::Failed(_)
+                ),
+                "shared provider did not settle: {tick:?}"
+            );
+            if matches!(tick, SyncRuntimeTick::Idle)
+                && handle.status().unwrap().provider_pending == 0
+            {
+                return;
+            }
+        }
+        panic!(
+            "shared provider exceeded the bounded test turn budget: {:?}",
+            handle.status().unwrap()
+        );
+    }
+
+    fn joined_shared_pair(
+        label: &str,
+        seed: u128,
+    ) -> (
+        ActivationFixture,
+        ActivationFixture,
+        SyncRuntimeHandle,
+        SyncRuntimeHandle,
+    ) {
+        let initiator = make_shared_fixture(&format!("{label}-initiator"), seed);
+        let mut receiver = make_shared_fixture(&format!("{label}-receiver"), seed);
+        receiver.request.identities.endpoint_id =
+            ProjectionEndpointId::from_uuid(Uuid::from_u128(seed + 0x10));
+        receiver.request.identities.device_id = DeviceId::from_uuid(Uuid::from_u128(seed + 0x11));
+        receiver.request.identities.session_id = SessionId::from_uuid(Uuid::from_u128(seed + 0x12));
+        let descriptor = activate_and_prepare_shared(&initiator);
+        copy_provider_tree(
+            &initiator.request.provider_root,
+            &receiver.request.provider_root,
+        );
+        let receiver_active = SyncRuntimeHandle::activate_or_resume_local(receiver.request.clone());
+        let receiver_joining = receiver_active.handle.expect("receiver LocalActive");
+        drive_initial_feed(&receiver_joining);
+        receiver_joining
+            .join_shared(descriptor)
+            .expect("receiver SharedActive");
+        drop(receiver_joining);
+
+        let initiator_handle =
+            active_handle(SyncRuntimeHandle::open(reopen_request(&initiator.request)));
+        let receiver_handle =
+            active_handle(SyncRuntimeHandle::open(reopen_request(&receiver.request)));
+        settle_shared_provider(&initiator_handle);
+        settle_shared_provider(&receiver_handle);
+        (initiator, receiver, initiator_handle, receiver_handle)
+    }
+
+    fn submit_shared_page(
+        handle: &SyncRuntimeHandle,
+        seed: u128,
+        name: &str,
+        path: &str,
+        content: &str,
+    ) -> (BatchId, PageId, BlockId, DocumentId) {
+        let page_id = PageId::from_uuid(Uuid::from_u128(seed));
+        let block_id = BlockId::from_uuid(Uuid::from_u128(seed + 1));
+        let document_id = DocumentId::from_uuid(Uuid::from_u128(seed + 2));
+        let batch_id = submit_durable(
+            handle,
+            vec![
+                SemanticOperation::CreatePage {
+                    page_id,
+                    home_document_id: document_id,
+                    name: LogicalPageName::parse(name).unwrap(),
+                    path: ManagedPath::parse(path).unwrap(),
+                    kind: ManagedTextKind::Page,
+                },
+                SemanticOperation::CreateBlock {
+                    block: BlockLocation {
+                        block_id,
+                        home_document_id: document_id,
+                    },
+                    page_id,
+                    parent: None,
+                    order: "a".into(),
+                    content: content.into(),
+                },
+            ],
+        );
+        (batch_id, page_id, block_id, document_id)
+    }
+
+    fn publish_shared_batch(
+        handle: &SyncRuntimeHandle,
+        fixture: &ActivationFixture,
+        batch_id: BatchId,
+    ) {
+        let manifest = fixture
+            .request
+            .provider_root
+            .join(format!("outbox/manifests/{batch_id}.manifest"));
+        for _ in 0..256 {
+            if manifest.is_file() {
+                return;
+            }
+            let tick = handle.tick().unwrap();
+            assert!(
+                !matches!(
+                    tick,
+                    SyncRuntimeTick::RecoveryBlocked(_)
+                        | SyncRuntimeTick::Blocked(_)
+                        | SyncRuntimeTick::Terminal(_)
+                        | SyncRuntimeTick::Failed(_)
+                ),
+                "shared batch publication failed: {tick:?}"
+            );
+        }
+        panic!("shared batch {batch_id} was not published");
+    }
+
+    fn archive_contains_payload(fixture: &ActivationFixture, expected: &[u8]) -> bool {
+        let store = ObjectStore::open(
+            &fixture.request.archive_root,
+            fixture.request.identities.workspace_id,
+        )
+        .unwrap();
+        store.committed_manifests().unwrap().iter().any(|manifest| {
+            manifest.required_objects().iter().any(|descriptor| {
+                let bytes = store
+                    .read_object_bytes(descriptor.content_digest())
+                    .unwrap();
+                let object = OperationObject::decode(&bytes).unwrap();
+                object
+                    .payload()
+                    .windows(expected.len())
+                    .any(|window| window == expected)
+            })
+        })
+    }
+
+    fn oversized_provider_paths() -> Vec<String> {
+        (0..=MAX_PROVIDER_EXACT_PATHS)
+            .map(|index| format!("objects/{index:064x}.object"))
+            .collect()
+    }
+
+    #[test]
+    fn oversized_provider_callback_retains_scan_and_safe_shutdown_drains_it() {
+        let (initiator, receiver, initiator_handle, receiver_handle) =
+            joined_shared_pair("provider-oversized-callback", 0xb600);
+        let (first_batch, ..) = submit_shared_page(
+            &initiator_handle,
+            0xb620,
+            "Oversized Provider First",
+            "notes/oversized-provider-first.md",
+            "first retained delivery",
+        );
+        publish_shared_batch(&initiator_handle, &initiator, first_batch);
+        copy_provider_tree(
+            &initiator.request.provider_root,
+            &receiver.request.provider_root,
+        );
+
+        let oversized = oversized_provider_paths();
+        assert!(matches!(
+            receiver_handle.observe_provider_paths(oversized.clone(), false),
+            Err(SyncRuntimeRequestError::RequestTooLarge {
+                observations,
+                ..
+            }) if observations == MAX_PROVIDER_EXACT_PATHS + 1
+        ));
+        assert!(
+            receiver_handle.status().unwrap().provider_pending > 0,
+            "the rejected callback must retain one visible rescan obligation"
+        );
+        settle_shared_provider(&receiver_handle);
+        assert!(
+            receiver
+                .graph_root
+                .join("notes/oversized-provider-first.md")
+                .is_file(),
+            "a later tick did not perform the retained provider scan"
+        );
+
+        let (second_batch, ..) = submit_shared_page(
+            &initiator_handle,
+            0xb630,
+            "Oversized Provider Shutdown",
+            "notes/oversized-provider-shutdown.md",
+            "shutdown-retained delivery",
+        );
+        publish_shared_batch(&initiator_handle, &initiator, second_batch);
+        copy_provider_tree(
+            &initiator.request.provider_root,
+            &receiver.request.provider_root,
+        );
+        assert!(matches!(
+            receiver_handle.observe_provider_paths(oversized, false),
+            Err(SyncRuntimeRequestError::RequestTooLarge { .. })
+        ));
+        assert!(matches!(
+            receiver_handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(snapshot))
+                if snapshot.provider_pending == 0 && !snapshot.watcher.pending
+        ));
+        assert!(
+            receiver
+                .graph_root
+                .join("notes/oversized-provider-shutdown.md")
+                .is_file(),
+            "Safe was published before rejected provider work converged"
+        );
+    }
+
+    #[test]
+    fn imprecise_observation_during_provider_cursor_forces_a_second_scan() {
+        let (initiator, receiver, initiator_handle, receiver_handle) =
+            joined_shared_pair("provider-rescan-generation", 0xb700);
+        let (batch_id, ..) = submit_shared_page(
+            &initiator_handle,
+            0xb720,
+            "Provider Rescan Generation",
+            "notes/provider-rescan-generation.md",
+            "created behind first cursor",
+        );
+        publish_shared_batch(&initiator_handle, &initiator, batch_id);
+
+        let receiver_outbox = receiver.request.provider_root.join("outbox");
+        let padding = OperationObject::new(
+            receiver.request.identities.workspace_id,
+            DocumentId::from_uuid(Uuid::from_u128(0xb72f)),
+            crate::oplog::ObjectKind::AnnotatedBaseBlob,
+            b"keep the first provider cursor in its object phase".to_vec(),
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+        let padding_digest = ContentDigest::of(&padding);
+        fs::write(
+            receiver_outbox
+                .join("objects")
+                .join(format!("{padding_digest}.object")),
+            padding,
+        )
+        .unwrap();
+        let manifest_count = fs::read_dir(receiver_outbox.join("manifests"))
+            .unwrap()
+            .count();
+        assert!(
+            fs::read_dir(receiver_outbox.join("objects"))
+                .unwrap()
+                .next()
+                .is_some(),
+            "the test needs an object phase after the manifest cursor"
+        );
+        receiver_handle.observe_provider().unwrap();
+        // Consume the descriptor, every manifest that existed when the first
+        // cursor opened, and one object. The manifest phase is now behind this
+        // still-active cursor.
+        for _ in 0..(manifest_count + 2) {
+            let tick = receiver_handle.tick().unwrap();
+            assert!(
+                !matches!(
+                    tick,
+                    SyncRuntimeTick::RecoveryBlocked(_)
+                        | SyncRuntimeTick::Blocked(_)
+                        | SyncRuntimeTick::Terminal(_)
+                        | SyncRuntimeTick::Failed(_)
+                ),
+                "first provider cursor failed: {tick:?}"
+            );
+        }
+        assert!(receiver_handle.status().unwrap().provider_pending > 0);
+
+        copy_provider_tree(
+            &initiator.request.provider_root,
+            &receiver.request.provider_root,
+        );
+        receiver_handle.observe_provider().unwrap();
+        settle_shared_provider(&receiver_handle);
+        assert!(
+            receiver
+                .graph_root
+                .join("notes/provider-rescan-generation.md")
+                .is_file(),
+            "the observation linearized during the first cursor was erased at its completion"
+        );
+    }
+
+    #[derive(Clone, Copy)]
+    enum ProviderWatcherDeliveryOrder {
+        ProviderThenWatcher,
+        WatcherThenProvider,
+    }
+
+    fn receiver_external_edit_precedes_remote_delete(
+        label: &str,
+        seed: u128,
+        order: ProviderWatcherDeliveryOrder,
+    ) {
+        let (initiator, receiver, initiator_handle, receiver_handle) =
+            joined_shared_pair(label, seed);
+        let path = "notes/receiver-external-before-delete.md";
+        let (create_batch, page_id, block_id, _) = submit_shared_page(
+            &initiator_handle,
+            seed + 0x20,
+            "Receiver External Before Delete",
+            path,
+            "shared base",
+        );
+        publish_shared_batch(&initiator_handle, &initiator, create_batch);
+        copy_provider_tree(
+            &initiator.request.provider_root,
+            &receiver.request.provider_root,
+        );
+        receiver_handle.observe_provider().unwrap();
+        settle_shared_provider(&receiver_handle);
+        assert_eq!(
+            fs::read(receiver.graph_root.join(path)).unwrap(),
+            b"- shared base\n"
+        );
+
+        let delete_batch = submit_durable(
+            &initiator_handle,
+            vec![
+                SemanticOperation::DeleteSubtree {
+                    root_block_id: block_id,
+                    page_id,
+                },
+                SemanticOperation::DeletePage { page_id },
+            ],
+        );
+        publish_shared_batch(&initiator_handle, &initiator, delete_batch);
+        copy_provider_tree(
+            &initiator.request.provider_root,
+            &receiver.request.provider_root,
+        );
+
+        let sentinel = format!("receiver external bytes {seed:x}");
+        fs::write(
+            receiver.graph_root.join(path),
+            format!("- {sentinel}\n").as_bytes(),
+        )
+        .unwrap();
+        let provider_path = format!("manifests/{delete_batch}.manifest");
+        match order {
+            ProviderWatcherDeliveryOrder::ProviderThenWatcher => {
+                receiver_handle
+                    .observe_provider_paths(vec![provider_path], false)
+                    .unwrap();
+                receiver_handle
+                    .observe_watcher(vec![SyncWatcherObservation::managed_path(path).unwrap()])
+                    .unwrap();
+            }
+            ProviderWatcherDeliveryOrder::WatcherThenProvider => {
+                receiver_handle
+                    .observe_watcher(vec![SyncWatcherObservation::managed_path(path).unwrap()])
+                    .unwrap();
+                receiver_handle
+                    .observe_provider_paths(vec![provider_path], false)
+                    .unwrap();
+            }
+        }
+
+        while receiver_handle.status().unwrap().watcher.pending {
+            let tick = receiver_handle.tick().unwrap();
+            assert!(
+                !matches!(
+                    tick,
+                    SyncRuntimeTick::RecoveryBlocked(_)
+                        | SyncRuntimeTick::Blocked(_)
+                        | SyncRuntimeTick::Terminal(_)
+                ),
+                "the observed local watcher epoch did not settle safely: {tick:?}"
+            );
+        }
+        assert!(
+            archive_contains_payload(&receiver, sentinel.as_bytes()),
+            "the receiver's external bytes were not captured in immutable local history"
+        );
+        for _ in 0..256 {
+            let tick = receiver_handle.tick().unwrap();
+            match tick {
+                SyncRuntimeTick::RecoveryBlocked(_) => break,
+                SyncRuntimeTick::Idle
+                    if receiver_handle.status().unwrap().provider_pending == 0 =>
+                {
+                    break;
+                }
+                SyncRuntimeTick::Recovering
+                | SyncRuntimeTick::Idle
+                | SyncRuntimeTick::AdmittedNoop { .. }
+                | SyncRuntimeTick::AdmittedComplete { .. }
+                | SyncRuntimeTick::RetryFull => {}
+                other => panic!("remote deletion reached an unsafe outcome: {other:?}"),
+            }
+        }
+        assert!(
+            archive_contains_payload(&receiver, sentinel.as_bytes()),
+            "remote deletion discarded the already-captured receiver bytes"
+        );
+        if receiver.graph_root.join(path).is_file() {
+            assert_eq!(
+                fs::read(receiver.graph_root.join(path)).unwrap(),
+                format!("- {sentinel}\n").as_bytes(),
+                "a blocked remote deletion rewrote the receiver's external bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn observed_receiver_external_edit_precedes_remote_delete_in_both_callback_orders() {
+        receiver_external_edit_precedes_remote_delete(
+            "provider-first-before-watcher",
+            0xb800,
+            ProviderWatcherDeliveryOrder::ProviderThenWatcher,
+        );
+        receiver_external_edit_precedes_remote_delete(
+            "watcher-first-before-provider",
+            0xb900,
+            ProviderWatcherDeliveryOrder::WatcherThenProvider,
+        );
+    }
+
+    #[test]
+    fn safe_reopen_repairs_a_completely_lost_provider_namespace() {
+        let fixture = make_shared_fixture("provider-safe-namespace-repair", 0xba00);
+        let _descriptor = activate_and_prepare_shared(&fixture);
+        let handle = active_handle(SyncRuntimeHandle::open(reopen_request(&fixture.request)));
+        settle_shared_provider(&handle);
+        let (batch_id, ..) = submit_shared_page(
+            &handle,
+            0xba20,
+            "Safe Namespace Repair",
+            "notes/safe-namespace-repair.md",
+            "accepted before provider loss",
+        );
+        publish_shared_batch(&handle, &fixture, batch_id);
+        assert!(matches!(
+            handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+        let manifest_names = fs::read_dir(fixture.request.provider_root.join("outbox/manifests"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert!(!manifest_names.is_empty());
+
+        fs::remove_dir_all(&fixture.request.provider_root).unwrap();
+        let repaired = active_handle(SyncRuntimeHandle::open(reopen_request(&fixture.request)));
+        settle_shared_provider(&repaired);
+        assert!(
+            inspect_shared_enrollment(&fixture.request.provider_root)
+                .unwrap()
+                .is_some(),
+            "safe reopen did not restore the private descriptor"
+        );
+        for name in manifest_names {
+            assert!(
+                fixture
+                    .request
+                    .provider_root
+                    .join("outbox/manifests")
+                    .join(name)
+                    .is_file(),
+                "safe reopen did not republish an accepted manifest"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_deletion_of_an_accepted_manifest_republishes_from_local_archive() {
+        let fixture = make_shared_fixture("provider-exact-manifest-delete", 0xbb00);
+        let _descriptor = activate_and_prepare_shared(&fixture);
+        let handle = active_handle(SyncRuntimeHandle::open(reopen_request(&fixture.request)));
+        settle_shared_provider(&handle);
+        let (batch_id, ..) = submit_shared_page(
+            &handle,
+            0xbb20,
+            "Accepted Manifest Delete",
+            "notes/accepted-manifest-delete.md",
+            "republish accepted manifest",
+        );
+        publish_shared_batch(&handle, &fixture, batch_id);
+        let relative = format!("manifests/{batch_id}.manifest");
+        let manifest = fixture.request.provider_root.join("outbox").join(&relative);
+        fs::remove_file(&manifest).unwrap();
+        handle
+            .observe_provider_paths(vec![relative], false)
+            .unwrap();
+        settle_shared_provider(&handle);
+        assert!(
+            manifest.is_file(),
+            "accepted exact manifest deletion was not repaired from local archive"
+        );
     }
 
     #[test]

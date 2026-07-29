@@ -2356,16 +2356,25 @@ impl SharedProviderTransport {
     fn publish(&mut self, path: &str, bytes: &[u8]) -> Result<(), ScenarioError> {
         let gate = self.journal.acquire_transaction_gate()?;
         let source = format!("generated:{}", provider_digest(bytes));
+        let location = ProviderLocation {
+            device: "local".into(),
+            tree: ProviderTree::Outbox,
+            path: path.into(),
+        };
+        self.journal.recycle_completed_put_for_absent_destination(
+            &gate,
+            &source,
+            &source,
+            &self.runtime,
+            &location,
+            bytes,
+        )?;
         self.runtime.put_complete(
             &self.journal,
             &gate,
             &source,
             &source,
-            &ProviderLocation {
-                device: "local".into(),
-                tree: ProviderTree::Outbox,
-                path: path.into(),
-            },
+            &location,
             bytes,
             None,
             None,
@@ -4033,6 +4042,91 @@ impl ProviderRetryJournal {
             }
         }
         Ok(found)
+    }
+
+    /// Recycle an exact completed generated-put receipt only after its bound
+    /// destination name has disappeared. The completed receipt authenticates
+    /// the bytes but retains the identity of the old provider file, which
+    /// cannot authorize a legitimate republish after complete namespace loss.
+    fn recycle_completed_put_for_absent_destination(
+        &self,
+        gate: &ProviderTransactionGate,
+        operation_binding: &str,
+        source_provenance: &str,
+        runtime: &ProviderRuntime,
+        location: &ProviderLocation,
+        bytes: &[u8],
+    ) -> Result<(), ScenarioError> {
+        self.require_transaction_gate(gate)?;
+        let source_len =
+            u64::try_from(bytes.len()).map_err(|_| ScenarioError::ProviderJournalLimit)?;
+        let source_digest = provider_digest(bytes);
+        let operation_id = Self::operation_id(
+            ProviderJournalOperation::Put,
+            operation_binding,
+            source_provenance,
+            location.tree,
+            &location.path,
+            None,
+            source_len,
+            &source_digest,
+        );
+        let record_name = Self::record_name(&operation_id);
+        let Some(opened) = open_provider_regular_optional(
+            &self.completed,
+            &record_name,
+            MAX_PROVIDER_JOURNAL_RECORD_BYTES,
+            &record_name,
+        )
+        .map_err(|_| ScenarioError::UnsafeProviderJournal(record_name.clone()))?
+        else {
+            return Ok(());
+        };
+        let record = self.decode_record(&opened.bytes, &record_name)?;
+        self.validate_record_shape(gate, &record, false)?;
+        if record.operation_id != operation_id
+            || record.operation != ProviderJournalOperation::Put
+            || record.operation_binding != operation_binding
+            || record.source_provenance != source_provenance
+            || record.tree != location.tree
+            || record.from_path != location.path
+            || record.to_path.is_some()
+            || record.source_len != source_len
+            || record.source_digest != source_digest
+            || record.phase != ProviderJournalPhase::Cleanup
+        {
+            return Err(ScenarioError::UnsafeProviderJournal(record_name));
+        }
+        let (destination_dir, destination_name) =
+            runtime.parent_and_name(location.tree, &location.path, true)?;
+        if open_provider_regular_optional(
+            &destination_dir,
+            &destination_name,
+            MAX_PROVIDER_RESCAN_BYTES,
+            &location.path,
+        )?
+        .is_some()
+        {
+            return Ok(());
+        }
+        // A crash may leave the same authenticated Cleanup record in both
+        // pending and completed directories. Preserve both copies for the
+        // normal retry validator instead of discarding its completion proof.
+        if open_provider_regular_optional(
+            &self.records,
+            &record_name,
+            MAX_PROVIDER_JOURNAL_RECORD_BYTES,
+            &record_name,
+        )
+        .map_err(|_| ScenarioError::UnsafeProviderJournal(record_name.clone()))?
+        .is_some()
+        {
+            return Ok(());
+        }
+        self.completed
+            .remove_file(&record_name)
+            .map_err(|error| ScenarioError::Io(error.to_string()))?;
+        sync_provider_directory(&self.completed)
     }
 
     fn load_put_for_binding(

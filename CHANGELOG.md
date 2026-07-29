@@ -8,6 +8,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+### Fixed
+
+- **Experimental shared-provider sync no longer loses oversized or overlapping
+  delivery callbacks or preempts an already-observed local file edit.** Rejected
+  callbacks retain a bounded rescan before `Safe`, observations arriving during
+  an active cursor force a subsequent scan, and watcher-captured bytes take
+  priority over remote ingestion. Safe reopen also republishes a completely
+  missing provider namespace, and exact deletion of an accepted manifest repairs
+  from authenticated local archive bytes.
+
 ### Changed
 
 - **Experimental sparse-v2 storage can explicitly enroll two honest devices
