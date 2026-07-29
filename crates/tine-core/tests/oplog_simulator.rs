@@ -3313,21 +3313,21 @@ fn coordinator_v5_acceptance_sequence_is_not_batch_id_order() {
                         oracle: CoordinatorOracle {
                             accepted_sequence: Some(3),
                             accepted_frontier_digest: Some(
-                                "f6581038cda46e35aaec5e8172157b12266d9d7dafef7fd7c3b013124cf6f50f"
+                                "f4e9daa9ad75c377fcbec60caab03e54f2e7b0ec12f45530e57caeafc416c5eb"
                                     .into(),
                             ),
                             accepted_batches: Some(vec![
                                 BatchId::from_uuid(uuid(9)),
                                 "e27bbc37-3fe4-846c-962b-07dea4588cf3".parse().unwrap(),
-                                "490f9f16-e6ce-8f5b-8ab0-8e4a364ec8a6".parse().unwrap(),
+                                "9a15fe85-3f07-84d4-b2ce-ecd935482734".parse().unwrap(),
                             ]),
                             sqlite_sequence: Some(3),
                             sqlite_frontier_digest: Some(
-                                "f6581038cda46e35aaec5e8172157b12266d9d7dafef7fd7c3b013124cf6f50f"
+                                "f4e9daa9ad75c377fcbec60caab03e54f2e7b0ec12f45530e57caeafc416c5eb"
                                     .into(),
                             ),
                             sqlite_row_digest: Some(
-                                "3b707d9d349169a27b8421ca22669f00a9ff70620c8dd3e8946ba61d89391fc3"
+                                "2a1a1ff1932715c46683ffe77412f515eef1bf88878e9996ef6c48634c35bb29"
                                     .into(),
                             ),
                             frontiers_match: Some(true),
@@ -3391,11 +3391,11 @@ fn coordinator_v5_acceptance_sequence_is_not_batch_id_order() {
     assert!(observed.sqlite_row_digest.is_some());
     assert_eq!(
         observed.accepted_frontier_digest,
-        "f6581038cda46e35aaec5e8172157b12266d9d7dafef7fd7c3b013124cf6f50f"
+        "f4e9daa9ad75c377fcbec60caab03e54f2e7b0ec12f45530e57caeafc416c5eb"
     );
     assert_eq!(
         observed.sqlite_row_digest.as_deref(),
-        Some("3b707d9d349169a27b8421ca22669f00a9ff70620c8dd3e8946ba61d89391fc3")
+        Some("2a1a1ff1932715c46683ffe77412f515eef1bf88878e9996ef6c48634c35bb29")
     );
     assert_eq!(observed.accepted_batches[0], BatchId::from_uuid(uuid(9)));
     assert_eq!(
@@ -3403,7 +3403,7 @@ fn coordinator_v5_acceptance_sequence_is_not_batch_id_order() {
         vec![
             BatchId::from_uuid(uuid(9)),
             "e27bbc37-3fe4-846c-962b-07dea4588cf3".parse().unwrap(),
-            "490f9f16-e6ce-8f5b-8ab0-8e4a364ec8a6".parse().unwrap(),
+            "9a15fe85-3f07-84d4-b2ce-ecd935482734".parse().unwrap(),
         ]
     );
     assert!(
