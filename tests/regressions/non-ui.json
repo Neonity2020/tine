@@ -1418,6 +1418,51 @@
       "notes": "The permanent crash cut publishes immutable objects, canonical descriptor-bound intents, and matching manifests, then stops before a covering frontier head or watcher callback. A normal-startup receiver with an older valid head uses an isolated cap of 4 to discover 6 foreign intents across explicit cursor-preserving chunks. The regression proves the first boundary is neither EOF nor Safe and cannot publish a head, every intent and batch converges without a broad manifest/object scan, and only an actual EOF plus a covering receiver head permits complete foreign-intent retirement and genuine Safe. A two-device deletion-replication regression additionally proves that when a peer retires the author's intent first, the author's later covered retirement settles without a local journal record, accepts a subsequent peer page, and reaches Safe instead of starving inbound work. Missing or mismatched manifests and uncovered intents remain retryable, and the production per-chunk cap remains 4,096."
     },
     {
+      "id": "REG-SYNC-SHARED-PROVIDER-R6-SHUTDOWN-DISCOVERY-CUT-001",
+      "title": "Clean shutdown cannot publish an own head ahead of paused imprecise frontier discovery",
+      "family": "sync-data-safety",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/oplog/simulator.rs",
+          "crates/tine-core/src/sync_runtime.rs"
+        ],
+        "scenario": "sync.shared-provider-r6-shutdown-discovery-cut",
+        "failBefore": "proven"
+      },
+      "notes": "A deterministic post-publication crash cut pauses an imprecise head cursor after descriptor discovery, installs a previously unseen foreign recovery-covered head and its complete batch, then recovers a concurrent local publication before requesting shutdown. The durable own head at the cut must already cover both local and foreign tips and current manifest recovery; descriptor/head/intent discovery remains bounded and does not enter manifest/object full-scan history. After the cut, own intent retirement settles and genuine Safe remains bounded. The provider-head oracle rejects tips without current manifest recovery coverage."
+    },
+    {
+      "id": "REG-SYNC-SHARED-PROVIDER-R6-FOREIGN-INCOMPLETE-FRONTIER-001",
+      "title": "Incomplete foreign delivery neither strands local publication nor gets outrun after its objects arrive",
+      "family": "sync-data-safety",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/sync_runtime.rs"
+        ],
+        "scenario": "sync.shared-provider-r6-foreign-incomplete-frontier-decoupling",
+        "failBefore": "proven"
+      },
+      "notes": "Realistic two-device helpers deliver manifests independently from immutable objects. The complete-delivery control converges and reaches Safe. In the frontier-decoupling attack arm, one device retains the foreign manifest as visible inbound work while publishing four unrelated local pages: every accepted local frontier gets a durable recovery-covered device head and its covered publication intent retires instead of accumulating. Safe remains refused while foreign objects are absent; restart restores the pending manifest, and late exact object delivery converges it. A second deterministic arm gives foreign and local no-op batches the identical content-addressed object set. The foreign manifest is staged first without that object; local admission then writes the shared object without a provider callback. A post-head crash cut proves the foreign batch is admitted and recovery-covered before the own head becomes durable. At exact base 6ae78827, the first arm failed with no advanced own head and intent counts [1, 2, 3, 4]; against the rejected frontier-decoupling patch before the arrival fix, the second arm failed because the own head omitted the now-Ready foreign batch."
+    },
+    {
       "id": "REG-SYNC-SHARED-PROVIDER-R6-CONCURRENT-FRONTIER-001",
       "title": "Two offline authors union concurrent frontier heads without either branch returning through the other endpoint first",
       "family": "sync-data-safety",

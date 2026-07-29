@@ -83,8 +83,9 @@ use crate::oplog::simulator::{
     inspect_shared_provider_descriptor, SharedProviderFrontierHeadV1,
     SharedProviderManifestRecoveryLinkV1, SharedProviderObservation,
     SharedProviderObservationCursor, SharedProviderPublicationCursor,
-    SharedProviderPublicationIntentV1, SharedProviderTransport, SHARED_ENROLLMENT_DESCRIPTOR_PATH,
-    SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE, SHARED_PROVIDER_MANIFEST_RECOVERY_BLOBS_NAMESPACE,
+    SharedProviderPublicationIntentV1, SharedProviderTransport, MAX_PROVIDER_RESCAN_ENTRIES,
+    SHARED_ENROLLMENT_DESCRIPTOR_PATH, SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE,
+    SHARED_PROVIDER_MANIFEST_RECOVERY_BLOBS_NAMESPACE,
     SHARED_PROVIDER_MANIFEST_RECOVERY_LINKS_NAMESPACE,
     SHARED_PROVIDER_PUBLICATION_INTENTS_NAMESPACE,
 };
@@ -181,6 +182,9 @@ static PROVIDER_RECOVERY_BACKFILL_LIMIT_OVERRIDES: Mutex<BTreeMap<WorkspaceId, u
 static PROVIDER_RECOVERY_PUBLICATION_TEST_CUTS: Mutex<
     BTreeMap<WorkspaceId, ProviderRecoveryPublicationTestCut>,
 > = Mutex::new(BTreeMap::new());
+#[cfg(test)]
+static PROVIDER_HEAD_PUBLICATION_TEST_CUTS: Mutex<BTreeSet<WorkspaceId>> =
+    Mutex::new(BTreeSet::new());
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -244,6 +248,29 @@ fn provider_recovery_publication_cut(
         }
     }
     let _ = (workspace_id, cut);
+    Ok(())
+}
+
+#[cfg(test)]
+fn fail_once_after_provider_head_publication(workspace_id: WorkspaceId) {
+    PROVIDER_HEAD_PUBLICATION_TEST_CUTS
+        .lock()
+        .unwrap()
+        .insert(workspace_id);
+}
+
+fn provider_head_publication_cut(workspace_id: WorkspaceId) -> Result<(), SyncRuntimeRequestError> {
+    #[cfg(test)]
+    if PROVIDER_HEAD_PUBLICATION_TEST_CUTS
+        .lock()
+        .unwrap()
+        .remove(&workspace_id)
+    {
+        return Err(SyncRuntimeRequestError::ActorRefused(
+            "injected cut after durable provider head publication".into(),
+        ));
+    }
+    let _ = workspace_id;
     Ok(())
 }
 
@@ -3335,7 +3362,7 @@ fn stage_provider_manifest_exact(
     provider: &SharedProviderTransport,
     descriptor: &SharedEnrollmentDescriptorV1,
     path: &str,
-) -> Result<ProviderManifestIngress, SyncRuntimeRequestError> {
+) -> Result<(ProviderManifestIngress, bool), SyncRuntimeRequestError> {
     let batch_id = provider_manifest_id(path).ok_or_else(|| {
         SyncRuntimeRequestError::ActorRefused(format!(
             "unknown shared provider evidence retained at {path}"
@@ -3345,7 +3372,7 @@ fn stage_provider_manifest_exact(
         .read_exact(path)
         .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
     else {
-        return Ok(ProviderManifestIngress::Absent(batch_id));
+        return Ok((ProviderManifestIngress::Absent(batch_id), false));
     };
     let manifest = OperationBatch::decode(&bytes)
         .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
@@ -3364,28 +3391,38 @@ fn stage_provider_manifest_exact(
     store
         .stage_shared_provider_manifest_bytes(&ingress, &bytes)
         .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+    let mut object_arrived = false;
     for object in manifest.required_objects() {
         let object_path = format!("objects/{}.object", object.content_digest());
         let Some(object_bytes) = provider
             .read_exact(&object_path)
             .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
         else {
-            return Ok(ProviderManifestIngress::Incomplete(manifest));
+            return Ok((
+                ProviderManifestIngress::Incomplete(manifest),
+                object_arrived,
+            ));
         };
+        let digest = ContentDigest::of(&object_bytes);
+        let already_present = store
+            .contains_object(digest)
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
         store
             .stage_object_bytes(&object_bytes)
             .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        object_arrived |= !already_present;
     }
-    match store
+    let ingress = match store
         .inspect_batch(batch_id)
         .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
     {
-        crate::oplog::BatchInspection::Ready(_) => Ok(ProviderManifestIngress::Ready(manifest)),
+        crate::oplog::BatchInspection::Ready(_) => ProviderManifestIngress::Ready(manifest),
         crate::oplog::BatchInspection::Staged { .. } => {
-            Ok(ProviderManifestIngress::Incomplete(manifest))
+            ProviderManifestIngress::Incomplete(manifest)
         }
-        crate::oplog::BatchInspection::Absent => Ok(ProviderManifestIngress::Incomplete(manifest)),
-    }
+        crate::oplog::BatchInspection::Absent => ProviderManifestIngress::Incomplete(manifest),
+    };
+    Ok((ingress, object_arrived))
 }
 
 fn provider_manifest_present(
@@ -4857,6 +4894,12 @@ impl RuntimeActor {
                     }
                     return SyncRuntimeTick::Recovering;
                 } else {
+                    if !cursor.has_completed_authority_discovery() {
+                        return SyncRuntimeTick::RecoveryBlocked(
+                            "provider observation completed before authority discovery was exhausted"
+                                .into(),
+                        );
+                    }
                     self.provider_observation_cursor = None;
                     if self.provider_observation_full {
                         self.provider_discovery_scan_complete = true;
@@ -4972,9 +5015,6 @@ impl RuntimeActor {
                                 }
                             }
                         }
-                        if !self.provider_incomplete.is_empty() {
-                            self.provider_objects_changed = true;
-                        }
                         #[cfg(test)]
                         if let Ok(crate::oplog::BatchInspection::Ready(batch)) =
                             store.inspect_batch(batch_id)
@@ -5070,9 +5110,7 @@ impl RuntimeActor {
                     return SyncRuntimeTick::RecoveryBlocked(error.to_string());
                 }
                 self.provider_head_dirty = true;
-                if !self.provider_incomplete.is_empty() {
-                    self.provider_objects_changed = true;
-                }
+                self.schedule_provider_incomplete_recheck_after_object_arrival();
                 SyncRuntimeTick::Recovering
             }
             Ok(ProviderArchiveIngress::Pending(continuation)) => {
@@ -5158,6 +5196,48 @@ impl RuntimeActor {
         Ok(self.provider_recovery_coverage_root == Some(self.current_provider_recovery_root()?))
     }
 
+    fn own_provider_frontier_has_durable_authority(&self) -> Result<bool, SyncRuntimeRequestError> {
+        // A device head speaks only for the runtime's already accepted
+        // frontier. Ready ingress, outbound publication, namespace repair, and
+        // exact recovery coverage are therefore strict prerequisites.
+        //
+        // Foreign manifests that have already been discovered but are waiting
+        // only for immutable objects are intentionally absent from this
+        // predicate. They have not changed accepted authority. Ready manifests,
+        // dependency admission, and an object-arrival recheck remain blockers;
+        // if any of those advances authority, the exact recovery-root
+        // comparison below withholds the next head until its mirror is durable.
+        // The incomplete set remains separate convergence work and continues
+        // to block Safe shutdown.
+        Ok(self.provider_direct_manifests.is_empty()
+            && self.provider_pending.is_empty()
+            && self.provider_continuation.is_none()
+            && self.provider_incomplete_recheck.is_empty()
+            && !self.provider_objects_changed
+            && !self.provider_publication_probe
+            && self.provider_publication_cursor.is_none()
+            && self.provider_publication_forced.is_empty()
+            && !self.provider_descriptor_repair_requested
+            && !self.provider_publication_repair_requested
+            && self.provider_publication_repair_cursor.is_none()
+            && self.provider_recovery_exact.is_empty()
+            && !self.provider_recovery_backfill_requested
+            && self.provider_recovery_backfill_cursor.is_none()
+            && self.provider_recovery_coverage_matches_current_frontier()?)
+    }
+
+    fn own_provider_frontier_is_publishable(&self) -> Result<bool, SyncRuntimeRequestError> {
+        // Both background and bounded shutdown publication wait for complete
+        // discovery so a chunk boundary, pending rescan, or exact callback
+        // cannot hide another durable head or authority-changing intent.
+        Ok(self.provider_discovery_scan_complete
+            && !self.provider_rescan_requested
+            && !self.provider_full_scan_requested
+            && self.provider_observation_cursor.is_none()
+            && self.provider_exact.is_empty()
+            && self.own_provider_frontier_has_durable_authority()?)
+    }
+
     fn queue_provider_recovery_exact(&mut self, batch_id: BatchId) {
         if self.provider_recovery_backfill_requested
             || self.provider_recovery_backfill_cursor.is_some()
@@ -5181,6 +5261,16 @@ impl RuntimeActor {
             self.provider_recovery_exact.clear();
             self.provider_recovery_backfill_requested = true;
             self.provider_recovery_backfill_cursor = None;
+        }
+    }
+
+    fn schedule_provider_incomplete_recheck_after_object_arrival(&mut self) {
+        // Coalesce any number of archive-object arrivals into one bounded pass
+        // over only manifests already known to be incomplete. If another new
+        // object is staged while that pass is active, retain one later wave so
+        // entries visited earlier can observe it without a history scan.
+        if !self.provider_incomplete.is_empty() {
+            self.provider_objects_changed = true;
         }
     }
 
@@ -5617,28 +5707,7 @@ impl RuntimeActor {
         &mut self,
         descriptor: &SharedEnrollmentDescriptorV1,
     ) -> Result<Option<SyncRuntimeTick>, SyncRuntimeRequestError> {
-        let discovery_pending = !self.provider_discovery_scan_complete
-            || self.provider_rescan_requested
-            || self.provider_full_scan_requested
-            || self.provider_observation_cursor.is_some()
-            || !self.provider_exact.is_empty()
-            || !self.provider_direct_manifests.is_empty()
-            || !self.provider_pending.is_empty()
-            || self.provider_continuation.is_some()
-            || !self.provider_incomplete.is_empty()
-            || !self.provider_incomplete_recheck.is_empty()
-            || self.provider_objects_changed
-            || self.provider_publication_probe
-            || self.provider_publication_cursor.is_some()
-            || !self.provider_publication_forced.is_empty()
-            || self.provider_descriptor_repair_requested
-            || self.provider_publication_repair_requested
-            || self.provider_publication_repair_cursor.is_some()
-            || !self.provider_recovery_exact.is_empty()
-            || self.provider_recovery_backfill_requested
-            || self.provider_recovery_backfill_cursor.is_some()
-            || !self.provider_recovery_coverage_matches_current_frontier()?;
-        if self.provider_head_dirty && !discovery_pending {
+        if self.provider_head_dirty && self.own_provider_frontier_is_publishable()? {
             self.publish_current_provider_head(descriptor)?;
             return Ok(Some(SyncRuntimeTick::Recovering));
         }
@@ -5668,6 +5737,7 @@ impl RuntimeActor {
             .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
             .publish_frontier_head(&head)
             .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        provider_head_publication_cut(self.binding.workspace_id())?;
         self.provider_current_head = Some(current_path.clone());
         self.provider_head_dirty = false;
         for (path, old) in &self.provider_own_heads {
@@ -6388,14 +6458,18 @@ impl RuntimeActor {
                 self.provider_incomplete.remove(&batch_id);
                 return Ok(());
             }
-            match stage_provider_manifest_exact(
+            let (ingress, object_arrived) = stage_provider_manifest_exact(
                 store,
                 self.provider
                     .as_ref()
                     .ok_or(SyncRuntimeRequestError::ActorUnavailable)?,
                 descriptor,
                 path,
-            )? {
+            )?;
+            if object_arrived {
+                self.schedule_provider_incomplete_recheck_after_object_arrival();
+            }
+            match ingress {
                 ProviderManifestIngress::Ready(manifest) => {
                     let batch_id = manifest.batch_id();
                     self.provider_incomplete.remove(&batch_id);
@@ -6453,11 +6527,7 @@ impl RuntimeActor {
                     "conflicting provider object retained at {path}"
                 )));
             }
-            // Coalesce object-arrival progress into a bounded pass over only
-            // the manifests already known to be incomplete. The pass begins
-            // after exact delivery drains; another object observed during the
-            // pass retains just one further wave.
-            self.provider_objects_changed = true;
+            self.schedule_provider_incomplete_recheck_after_object_arrival();
             return Ok(());
         }
         Err(SyncRuntimeRequestError::ActorRefused(format!(
@@ -6783,6 +6853,10 @@ impl RuntimeActor {
         if self.shared_phase != Some(SyncSharedPhase::Active) {
             return Ok(());
         }
+        // Local publication has already durably admitted its complete object
+        // set. Those content-addressed objects may also complete a staged
+        // foreign manifest even though no provider object callback occurs.
+        self.schedule_provider_incomplete_recheck_after_object_arrival();
         self.note_accepted_batch_requires_recovery(batch_id)?;
         let recorded = self
             .provider
@@ -6910,32 +6984,21 @@ impl RuntimeActor {
             {
                 continue;
             }
-            // A long local publication burst can leave an older discovery
-            // cursor poised over every newly created own intent. Once all
-            // accepted archives, canonical/object publication, and exact
-            // recovery coverage are settled, publish the current covered head
-            // without waiting for that stale cursor. The cursor and intent
-            // retirement still drain before Safe. Namespace/publication repair
-            // and any mirror gap remain strict blockers.
-            if self.provider_head_dirty
-                && self.provider_exact.is_empty()
-                && self.provider_direct_manifests.is_empty()
-                && self.provider_pending.is_empty()
-                && self.provider_continuation.is_none()
-                && self.provider_incomplete.is_empty()
-                && self.provider_incomplete_recheck.is_empty()
-                && !self.provider_objects_changed
-                && !self.provider_publication_probe
-                && self.provider_publication_cursor.is_none()
-                && self.provider_publication_forced.is_empty()
-                && !self.provider_descriptor_repair_requested
-                && !self.provider_publication_repair_requested
-                && self.provider_publication_repair_cursor.is_none()
-                && self.provider_recovery_exact.is_empty()
-                && !self.provider_recovery_backfill_requested
-                && self.provider_recovery_backfill_cursor.is_none()
-                && self.provider_recovery_coverage_matches_current_frontier()?
-            {
+            // A local publication burst can leave the small head cursor parked
+            // ahead of many own intents. Drain one bounded head-cursor chunk
+            // per shutdown turn so descriptor, every durable frontier head,
+            // and every authority-revealing intent are exhausted without
+            // replaying manifest/object history. A full scan and exact
+            // callbacks remain on the ordinary path.
+            if self.provider_head_dirty {
+                self.drain_provider_authority_discovery_for_shutdown()?;
+            }
+            // Publication now uses the same completed-discovery proof as the
+            // ordinary background path. Known manifest-only ingress may remain
+            // incomplete, but no ready admission, object recheck, rescan, full
+            // scan, exact callback, or active observation cursor can be
+            // bypassed. The remaining shortcut is only head/intent retirement.
+            if self.provider_head_dirty && self.own_provider_frontier_is_publishable()? {
                 self.publish_current_provider_head(&descriptor)?;
             }
             if self.provider_exact.is_empty()
@@ -7029,6 +7092,48 @@ impl RuntimeActor {
             self.provider_intents.len(),
             continuation,
         )))
+    }
+
+    fn drain_provider_authority_discovery_for_shutdown(
+        &mut self,
+    ) -> Result<(), SyncRuntimeRequestError> {
+        // The transport cursor's monotonic phase proof is consumed when
+        // `tick_provider` observes Complete. Batch only the narrow head cursor;
+        // full discovery can expose manifests or objects and must retain its
+        // ordinary incremental behavior.
+        for _ in 0..MAX_PROVIDER_RESCAN_ENTRIES.saturating_add(4) {
+            if !self.provider_exact.is_empty()
+                || self.provider_full_scan_requested
+                || self
+                    .provider_observation_cursor
+                    .as_ref()
+                    .is_some_and(|_| self.provider_observation_full)
+                || (self.provider_discovery_scan_complete
+                    && !self.provider_rescan_requested
+                    && self.provider_observation_cursor.is_none())
+            {
+                return Ok(());
+            }
+            match self.tick_provider() {
+                SyncRuntimeTick::Idle | SyncRuntimeTick::Recovering => {}
+                SyncRuntimeTick::RecoveryBlocked(detail)
+                | SyncRuntimeTick::Blocked(detail)
+                | SyncRuntimeTick::Terminal(detail)
+                | SyncRuntimeTick::Failed(detail) => {
+                    return Err(SyncRuntimeRequestError::ActorRefused(detail));
+                }
+                SyncRuntimeTick::AdmittedNoop { .. }
+                | SyncRuntimeTick::AdmittedComplete { .. }
+                | SyncRuntimeTick::LocalMutation(_)
+                | SyncRuntimeTick::RetryFull => {
+                    return Err(SyncRuntimeRequestError::ActorRefused(
+                        "shared provider authority drain returned an unrelated runtime outcome"
+                            .into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn prepare_shared(
@@ -11167,6 +11272,146 @@ mod tests {
                 fs::remove_file(destination).unwrap();
             }
         }
+    }
+
+    #[derive(Clone, Copy)]
+    enum ProviderBatchDelivery {
+        ManifestOnly,
+        ObjectsOnly,
+        Complete,
+    }
+
+    fn copy_provider_batch(
+        from: &ActivationFixture,
+        to: &ActivationFixture,
+        batch_id: BatchId,
+        delivery: ProviderBatchDelivery,
+    ) -> Vec<String> {
+        let source_outbox = from.request.provider_root.join("outbox");
+        let target_outbox = to.request.provider_root.join("outbox");
+        let manifest_path = format!("manifests/{batch_id}.manifest");
+        let mut delivered = Vec::new();
+        if matches!(
+            delivery,
+            ProviderBatchDelivery::ManifestOnly | ProviderBatchDelivery::Complete
+        ) {
+            fs::create_dir_all(target_outbox.join("manifests")).unwrap();
+            fs::copy(
+                source_outbox.join(&manifest_path),
+                target_outbox.join(&manifest_path),
+            )
+            .unwrap();
+            delivered.push(manifest_path);
+        }
+        if matches!(
+            delivery,
+            ProviderBatchDelivery::ObjectsOnly | ProviderBatchDelivery::Complete
+        ) {
+            fs::create_dir_all(target_outbox.join("objects")).unwrap();
+            let manifest = OperationBatch::decode(
+                &fs::read(source_outbox.join(format!("manifests/{batch_id}.manifest"))).unwrap(),
+            )
+            .unwrap();
+            let mut copied = HashSet::new();
+            for object in manifest.required_objects() {
+                let object_path = format!("objects/{}.object", object.content_digest());
+                if copied.insert(object_path.clone()) {
+                    fs::copy(
+                        source_outbox.join(&object_path),
+                        target_outbox.join(&object_path),
+                    )
+                    .unwrap();
+                    delivered.push(object_path);
+                }
+            }
+        }
+        delivered
+    }
+
+    fn copy_provider_head_covering(
+        from: &ActivationFixture,
+        to: &ActivationFixture,
+        author_device_id: DeviceId,
+        batch_id: BatchId,
+    ) -> String {
+        let source_heads = from
+            .request
+            .provider_root
+            .join("outbox")
+            .join(SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE);
+        let entry = fs::read_dir(source_heads)
+            .unwrap()
+            .map(Result::unwrap)
+            .find(|entry| {
+                let path = format!(
+                    "{SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE}/{}",
+                    entry.file_name().to_string_lossy()
+                );
+                SharedProviderFrontierHeadV1::decode(&path, &fs::read(entry.path()).unwrap())
+                    .is_ok_and(|head| {
+                        head.author_device_id() == author_device_id
+                            && head.frontier_tips().contains(&batch_id)
+                            && head.has_current_manifest_recovery_coverage()
+                    })
+            })
+            .expect("source provider lacks a recovery-covered frontier head");
+        let relative = format!(
+            "{SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE}/{}",
+            entry.file_name().to_string_lossy()
+        );
+        let target = to.request.provider_root.join("outbox").join(&relative);
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::copy(entry.path(), target).unwrap();
+        relative
+    }
+
+    fn provider_head_covers(
+        fixture: &ActivationFixture,
+        author_device_id: DeviceId,
+        batch_id: BatchId,
+    ) -> bool {
+        let heads = fixture
+            .request
+            .provider_root
+            .join("outbox")
+            .join(SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE);
+        fs::read_dir(heads).unwrap().any(|entry| {
+            let entry = entry.unwrap();
+            let path = format!(
+                "{SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE}/{}",
+                entry.file_name().to_string_lossy()
+            );
+            SharedProviderFrontierHeadV1::decode(&path, &fs::read(entry.path()).unwrap()).is_ok_and(
+                |head| {
+                    head.author_device_id() == author_device_id
+                        && head.frontier_tips().contains(&batch_id)
+                        && head.has_current_manifest_recovery_coverage()
+                },
+            )
+        })
+    }
+
+    fn provider_intent_count_for(
+        fixture: &ActivationFixture,
+        publisher_device_id: DeviceId,
+    ) -> usize {
+        let intents = fixture
+            .request
+            .provider_root
+            .join("outbox")
+            .join(SHARED_PROVIDER_PUBLICATION_INTENTS_NAMESPACE);
+        fs::read_dir(intents)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                let path = format!(
+                    "{SHARED_PROVIDER_PUBLICATION_INTENTS_NAMESPACE}/{}",
+                    entry.file_name().to_string_lossy()
+                );
+                SharedProviderPublicationIntentV1::decode(&path, &fs::read(entry.path()).unwrap())
+                    .is_ok_and(|intent| intent.publisher_device_id() == publisher_device_id)
+            })
+            .count()
     }
 
     fn reopen_request(request: &SyncLocalActivationRequest) -> SyncRuntimeOpenRequest {
@@ -15323,6 +15568,294 @@ mod tests {
     }
 
     #[test]
+    fn locally_admitted_shared_object_precedes_own_frontier_publication() {
+        let (local, foreign, local_handle, foreign_handle) =
+            joined_shared_pair("provider-local-shared-object", 0xb2c0);
+        let (base_batch, page_id, ..) = submit_shared_page(
+            &local_handle,
+            0xb2d0,
+            "Shared Object Base",
+            "notes/shared-object-base.md",
+            "common base",
+        );
+        publish_shared_batch(&local_handle, &local, base_batch);
+        settle_shared_provider(&local_handle);
+        let base_delivery = copy_provider_batch(
+            &local,
+            &foreign,
+            base_batch,
+            ProviderBatchDelivery::Complete,
+        );
+        foreign_handle
+            .observe_provider_paths(base_delivery, false)
+            .unwrap();
+        settle_shared_provider(&foreign_handle);
+
+        let repeated_noop = || {
+            vec![SemanticOperation::SetPagePreamble {
+                page_id,
+                preamble: None,
+            }]
+        };
+        let foreign_batch = submit_durable(&foreign_handle, repeated_noop());
+        publish_shared_batch(&foreign_handle, &foreign, foreign_batch);
+        settle_shared_provider(&foreign_handle);
+        let manifest_only = copy_provider_batch(
+            &foreign,
+            &local,
+            foreign_batch,
+            ProviderBatchDelivery::ManifestOnly,
+        );
+        local_handle
+            .observe_provider_paths(manifest_only, false)
+            .unwrap();
+        for _ in 0..32 {
+            let _ = local_handle.tick().unwrap();
+            if local_handle.status().unwrap().provider_pending > 0 {
+                break;
+            }
+        }
+        assert!(
+            local_handle.status().unwrap().provider_pending > 0,
+            "foreign manifest did not remain incomplete before local object admission"
+        );
+
+        let local_batch = submit_durable(&local_handle, repeated_noop());
+        let local_store = ObjectStore::open(
+            &local.request.archive_root,
+            local.request.identities.workspace_id,
+        )
+        .unwrap();
+        let foreign_manifest =
+            OperationBatch::decode(&local_store.read_manifest_bytes(foreign_batch).unwrap())
+                .unwrap();
+        let local_manifest =
+            OperationBatch::decode(&local_store.read_manifest_bytes(local_batch).unwrap()).unwrap();
+        assert_eq!(
+            foreign_manifest.required_objects(),
+            local_manifest.required_objects(),
+            "the local admission did not provide the foreign manifest's exact shared object set"
+        );
+
+        fail_once_after_provider_head_publication(local.request.identities.workspace_id);
+        let cut = local_handle.clean_shutdown();
+        assert!(
+            matches!(
+                cut,
+                Err(SyncRuntimeRequestError::ActorRefused(ref detail))
+                    if detail.contains("after durable provider head publication")
+            ),
+            "shutdown did not reach the deterministic post-publication cut: {cut:?}"
+        );
+        assert!(
+            local
+                .request
+                .provider_root
+                .join("outbox")
+                .join(SHARED_PROVIDER_MANIFEST_RECOVERY_LINKS_NAMESPACE)
+                .join(format!("{foreign_batch}.link"))
+                .is_file(),
+            "own head publication outran durable recovery for the foreign manifest \
+             completed by local object admission; status={:?}",
+            local_handle.status().unwrap()
+        );
+        assert!(matches!(
+            local_handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(snapshot)) if snapshot.provider_pending == 0
+        ));
+        assert!(matches!(
+            foreign_handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+    }
+
+    #[test]
+    fn foreign_incomplete_manifest_does_not_block_own_frontier_or_intent_retirement() {
+        let (control, peer, control_handle, peer_handle) =
+            joined_shared_pair("provider-incomplete-frontier-control", 0xb300);
+        let (control_batch, ..) = submit_shared_page(
+            &control_handle,
+            0xb310,
+            "Control Independent",
+            "notes/control-independent.md",
+            "control device",
+        );
+        let (peer_batch, ..) = submit_shared_page(
+            &peer_handle,
+            0xb320,
+            "Control Peer Independent",
+            "notes/control-peer-independent.md",
+            "control peer",
+        );
+        publish_shared_batch(&control_handle, &control, control_batch);
+        publish_shared_batch(&peer_handle, &peer, peer_batch);
+        settle_shared_provider(&control_handle);
+        settle_shared_provider(&peer_handle);
+        let complete_delivery =
+            copy_provider_batch(&peer, &control, peer_batch, ProviderBatchDelivery::Complete);
+        control_handle
+            .observe_provider_paths(complete_delivery, false)
+            .unwrap();
+        settle_shared_provider(&control_handle);
+        assert!(
+            control
+                .graph_root
+                .join("notes/control-peer-independent.md")
+                .is_file(),
+            "control delivery did not converge"
+        );
+        assert!(matches!(
+            control_handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(snapshot)) if snapshot.provider_pending == 0
+        ));
+        assert!(matches!(
+            peer_handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+
+        let (author, delayed_peer, author_handle, delayed_peer_handle) =
+            joined_shared_pair("provider-incomplete-frontier-attack", 0xb340);
+        let (author_base, ..) = submit_shared_page(
+            &author_handle,
+            0xb350,
+            "Attack Independent",
+            "notes/attack-independent.md",
+            "author device",
+        );
+        let (delayed_batch, ..) = submit_shared_page(
+            &delayed_peer_handle,
+            0xb360,
+            "Delayed Peer Independent",
+            "notes/delayed-peer-independent.md",
+            "delayed peer",
+        );
+        publish_shared_batch(&author_handle, &author, author_base);
+        publish_shared_batch(&delayed_peer_handle, &delayed_peer, delayed_batch);
+        settle_shared_provider(&author_handle);
+        settle_shared_provider(&delayed_peer_handle);
+        let manifest_only = copy_provider_batch(
+            &delayed_peer,
+            &author,
+            delayed_batch,
+            ProviderBatchDelivery::ManifestOnly,
+        );
+        author_handle
+            .observe_provider_paths(manifest_only, false)
+            .unwrap();
+        for _ in 0..32 {
+            let _ = author_handle.tick().unwrap();
+            if author_handle.status().unwrap().provider_pending > 0 {
+                break;
+            }
+        }
+        assert!(
+            author_handle.status().unwrap().provider_pending > 0,
+            "manifest-only delivery did not remain visibly incomplete"
+        );
+
+        let mut local_batches = Vec::new();
+        let mut intent_counts = Vec::new();
+        for index in 0..4_u128 {
+            let path = format!("notes/withheld-unrelated-{index}.md");
+            let (batch_id, ..) = submit_shared_page(
+                &author_handle,
+                0xb370 + index * 4,
+                &format!("Withheld Unrelated {index}"),
+                &path,
+                "unrelated local publication",
+            );
+            publish_shared_batch(&author_handle, &author, batch_id);
+            for _ in 0..256 {
+                let _ = author_handle.tick().unwrap();
+                if provider_head_covers(&author, author.request.identities.device_id, batch_id)
+                    && provider_intent_count_for(&author, author.request.identities.device_id) == 0
+                {
+                    break;
+                }
+            }
+            local_batches.push(batch_id);
+            intent_counts.push(provider_intent_count_for(
+                &author,
+                author.request.identities.device_id,
+            ));
+        }
+        let latest_local = *local_batches.last().unwrap();
+        assert!(
+            provider_head_covers(&author, author.request.identities.device_id, latest_local,),
+            "own durable frontier did not advance while foreign objects were withheld; \
+             covered own intent counts after each publication were {intent_counts:?}"
+        );
+        assert!(
+            intent_counts.iter().all(|count| *count == 0),
+            "covered own intents accumulated while foreign objects were withheld: {intent_counts:?}"
+        );
+        assert!(
+            author_handle.status().unwrap().provider_pending > 0,
+            "own publication incorrectly erased pending foreign convergence"
+        );
+        assert!(
+            author_handle.clean_shutdown().is_err(),
+            "Safe must remain blocked while authenticated foreign delivery is incomplete"
+        );
+
+        drop(author_handle);
+        let restarted = active_handle(SyncRuntimeHandle::open(reopen_request(&author.request)));
+        assert!(
+            provider_head_covers(&author, author.request.identities.device_id, latest_local,),
+            "restart lost the durable own frontier published during foreign delay"
+        );
+        let mut restarted_incomplete = false;
+        for _ in 0..1_024 {
+            let tick = restarted.tick().unwrap();
+            assert!(
+                !matches!(
+                    tick,
+                    SyncRuntimeTick::RecoveryBlocked(_)
+                        | SyncRuntimeTick::Blocked(_)
+                        | SyncRuntimeTick::Terminal(_)
+                        | SyncRuntimeTick::Failed(_)
+                ),
+                "restart could not recover the withheld foreign manifest: {tick:?}"
+            );
+            if matches!(tick, SyncRuntimeTick::Idle)
+                && restarted.status().unwrap().provider_pending > 0
+            {
+                restarted_incomplete = true;
+                break;
+            }
+        }
+        assert!(
+            restarted_incomplete,
+            "restart forgot the visibly incomplete foreign manifest"
+        );
+        let late_delivery = copy_provider_batch(
+            &delayed_peer,
+            &author,
+            delayed_batch,
+            ProviderBatchDelivery::ObjectsOnly,
+        );
+        restarted
+            .observe_provider_paths(late_delivery, false)
+            .unwrap();
+        settle_shared_provider(&restarted);
+        assert!(
+            author
+                .graph_root
+                .join("notes/delayed-peer-independent.md")
+                .is_file(),
+            "late foreign objects did not converge after restart"
+        );
+        assert!(matches!(
+            restarted.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(snapshot)) if snapshot.provider_pending == 0
+        ));
+        assert!(matches!(
+            delayed_peer_handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+    }
+
+    #[test]
     fn share_prepared_crash_resumes_descriptor_publication() {
         let fixture = make_shared_fixture("share-prepared-resume", 0xb300);
         let active = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
@@ -15514,6 +16047,124 @@ mod tests {
         assert_eq!(fs::read(&malformed).unwrap(), b"{");
         assert!(matches!(
             handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+    }
+
+    #[test]
+    fn clean_shutdown_waits_for_imprecise_discovery_before_publishing_own_head() {
+        let (observer, foreign, observer_handle, foreign_handle) =
+            joined_shared_pair("provider-shutdown-discovery-cut", 0xb520);
+        let (foreign_batch, ..) = submit_shared_page(
+            &foreign_handle,
+            0xb540,
+            "Shutdown Cut Foreign",
+            "notes/shutdown-cut-foreign.md",
+            "foreign authority hidden behind the paused cursor",
+        );
+        publish_shared_batch(&foreign_handle, &foreign, foreign_batch);
+        settle_shared_provider(&foreign_handle);
+        assert!(provider_head_covers(
+            &foreign,
+            foreign.request.identities.device_id,
+            foreign_batch,
+        ));
+
+        reset_provider_traversal_instrumentation(observer.request.identities.workspace_id);
+        observer_handle.observe_provider().unwrap();
+        let first_tick = observer_handle.tick().unwrap();
+        assert!(
+            !matches!(
+                first_tick,
+                SyncRuntimeTick::RecoveryBlocked(_)
+                    | SyncRuntimeTick::Blocked(_)
+                    | SyncRuntimeTick::Terminal(_)
+                    | SyncRuntimeTick::Failed(_)
+            ),
+            "imprecise discovery failed before its deterministic pause: {first_tick:?}"
+        );
+        assert_eq!(
+            provider_traversal_instrumentation(observer.request.identities.workspace_id)
+                .head_entries,
+            0,
+            "the cursor advanced into frontier heads before the test pause"
+        );
+
+        copy_provider_batch(
+            &foreign,
+            &observer,
+            foreign_batch,
+            ProviderBatchDelivery::Complete,
+        );
+        copy_provider_head_covering(
+            &foreign,
+            &observer,
+            foreign.request.identities.device_id,
+            foreign_batch,
+        );
+        let (local_batch, ..) = submit_shared_page(
+            &observer_handle,
+            0xb550,
+            "Shutdown Cut Local",
+            "notes/shutdown-cut-local.md",
+            "local publication recovered while discovery is paused",
+        );
+        publish_shared_batch(&observer_handle, &observer, local_batch);
+        assert_eq!(
+            provider_traversal_instrumentation(observer.request.identities.workspace_id)
+                .head_entries,
+            0,
+            "local publication unexpectedly consumed the unseen foreign head"
+        );
+        assert!(!provider_head_covers(
+            &observer,
+            observer.request.identities.device_id,
+            foreign_batch,
+        ));
+
+        fail_once_after_provider_head_publication(observer.request.identities.workspace_id);
+        let cut = observer_handle.clean_shutdown();
+        assert!(
+            matches!(
+                cut,
+                Err(SyncRuntimeRequestError::ActorRefused(ref detail))
+                    if detail.contains("after durable provider head publication")
+            ),
+            "shutdown did not reach the deterministic post-publication cut: {cut:?}"
+        );
+        assert!(
+            observer
+                .graph_root
+                .join("notes/shutdown-cut-foreign.md")
+                .is_file(),
+            "shutdown published before importing the foreign head"
+        );
+        assert!(provider_head_covers(
+            &observer,
+            observer.request.identities.device_id,
+            foreign_batch,
+        ));
+        assert!(provider_head_covers(
+            &observer,
+            observer.request.identities.device_id,
+            local_batch,
+        ));
+        let traversal =
+            provider_traversal_instrumentation(observer.request.identities.workspace_id);
+        assert!(traversal.head_entries > 0, "{traversal:?}");
+        assert_eq!(traversal.full_scan_entries, 0, "{traversal:?}");
+
+        assert!(matches!(
+            observer_handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+        assert_eq!(
+            provider_intent_count_for(&observer, observer.request.identities.device_id),
+            0,
+            "completed head discovery did not retain bounded own-intent settlement"
+        );
+        assert!(matches!(
+            foreign_handle.clean_shutdown(),
             Ok(SyncShutdownOutcome::Safe(_))
         ));
     }

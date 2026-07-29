@@ -2695,6 +2695,15 @@ impl SharedProviderObservationCursor {
         self.observed_entries = 0;
     }
 
+    pub(crate) fn has_completed_authority_discovery(&self) -> bool {
+        // A head cursor is authoritative only after descriptor, frontier-head,
+        // and publication-intent discovery. A full cursor must additionally
+        // exhaust recovery evidence plus canonical manifests and objects:
+        // those later namespaces can reveal ingress that changes accepted
+        // authority.
+        self.phase > if self.full { 7 } else { 3 }
+    }
+
     #[cfg(test)]
     pub(crate) fn set_entry_limit_for_test(&mut self, entry_limit: usize) {
         assert!(entry_limit > 0);
