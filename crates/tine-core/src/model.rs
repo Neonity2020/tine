@@ -15153,6 +15153,27 @@ impl Graph {
         Ok(proof)
     }
 
+    /// Confirm an already absent projection through the same guarded mutation
+    /// authority used by removal, without inventing base bytes for an external
+    /// `Absent -> Absent` observation.
+    pub(crate) fn confirm_removed_page_projection(
+        &self,
+        relative_path: &str,
+        authority: &mut ProjectionMutationAuthority,
+    ) -> io::Result<ProjectionWriteProof> {
+        #[cfg(test)]
+        count_projection_recovery_call();
+        let write = self.admit_retained_managed_text_writer()?;
+        authority.consume_write_evidence(relative_path, |reservation, known_attempts, _| {
+            self.confirm_removed_page_projection_with_attempts(
+                &write,
+                relative_path,
+                reservation,
+                known_attempts,
+            )
+        })
+    }
+
     /// Oplog entry into the singular guarded removal boundary. The exact
     /// source bytes are retained under the durable attempt reservation before
     /// absence can be reported as complete.

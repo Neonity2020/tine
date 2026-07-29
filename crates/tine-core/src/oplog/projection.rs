@@ -844,14 +844,18 @@ fn execute_manifested_projection_work_with_runtime(
                         &mut authority,
                     ),
                 }
-            } else if target.is_none() && current.is_none() && handoff.is_some() {
-                handoff
-                    .expect("checked handoff")
-                    .confirm_removed_page_projection(
+            } else if target.is_none() && current.is_none() {
+                match handoff {
+                    Some(handoff) => handoff.confirm_removed_page_projection(
                         graph,
                         manifested.path().as_str(),
                         &mut authority,
-                    )
+                    ),
+                    None => graph.confirm_removed_page_projection(
+                        manifested.path().as_str(),
+                        &mut authority,
+                    ),
+                }
             } else {
                 match (handoff, target) {
                     (Some(handoff), Some(target)) => handoff.write_page_projection_with_layout(

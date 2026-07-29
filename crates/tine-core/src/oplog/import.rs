@@ -3733,6 +3733,13 @@ pub struct ImportInstrumentation {
     pub exact_bucket_lookups: usize,
     pub ordered_alignment_visits: usize,
     pub retained_block_matches: usize,
+    pub anchored_page_match_set_inserts: usize,
+    pub anchored_page_match_set_lookups: usize,
+    pub anchored_page_owner_inserts: usize,
+    pub anchored_page_owner_lookups: usize,
+    pub anchored_page_uuid_owner_inserts: usize,
+    pub anchored_page_uuid_owner_lookups: usize,
+    pub anchored_page_edge_inserts: usize,
     pub rejected_raw_id_occurrences: usize,
 }
 
@@ -3768,6 +3775,13 @@ impl ImportInstrumentation {
             .saturating_add(self.exact_bucket_lookups)
             .saturating_add(self.ordered_alignment_visits)
             .saturating_add(self.retained_block_matches)
+            .saturating_add(self.anchored_page_match_set_inserts)
+            .saturating_add(self.anchored_page_match_set_lookups)
+            .saturating_add(self.anchored_page_owner_inserts)
+            .saturating_add(self.anchored_page_owner_lookups)
+            .saturating_add(self.anchored_page_uuid_owner_inserts)
+            .saturating_add(self.anchored_page_uuid_owner_lookups)
+            .saturating_add(self.anchored_page_edge_inserts)
             .saturating_add(self.rejected_raw_id_occurrences)
     }
 }
@@ -3776,7 +3790,7 @@ impl ImportInstrumentation {
 pub enum PageMatchBasis {
     SamePathCompletion,
     ReceiptBackedExactRename,
-    ReceiptBackedStructuralRename,
+    ReceiptBackedAnchoredRename,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4935,7 +4949,7 @@ fn plan_import(
         }
     };
     if let Err(block) =
-        match_structural_page_moves(&inventory, &completed, &parsed_documents, &mut matches)
+        match_anchored_page_moves(&inventory, &completed, &mut matches, &mut instrumentation)
     {
         return blocked_authority_error(Some(inventory), block, instrumentation);
     }
@@ -6140,27 +6154,19 @@ struct ParsedImportDocuments {
     base: BTreeMap<ManagedPath, ParsedExternalTree>,
 }
 
-fn same_external_tree(left: &ParsedTree, right: &ParsedTree) -> bool {
-    left.roots == right.roots
-        && left.nodes.len() == right.nodes.len()
-        && left.nodes.iter().zip(&right.nodes).all(|(left, right)| {
-            left.parent == right.parent
-                && left.sibling_position == right.sibling_position
-                && left.children == right.children
-                && left.raw == right.raw
-        })
-}
-
-/// A title/preamble edit may accompany one otherwise exact external move.
-/// Preserve the receipt-backed PageId only when the parsed block tree gives a
-/// one-to-one source/destination relation; repeated equal trees remain
-/// conservative and block as ambiguous destructive movement.
-fn match_structural_page_moves(
+/// Preserve a moved page's receipt-backed identity after block matching only
+/// when a unique Logseq UUID joins an absent source to an unmatched present
+/// destination. Content similarity is deliberately not page-move evidence:
+/// it cannot distinguish a move from an unrelated delete/create.
+fn match_anchored_page_moves(
     inventory: &RawInventory,
     completed: &[&ReceiptBackedPage],
-    parsed: &ParsedImportDocuments,
     matches: &mut ImportMatches,
+    instrumentation: &mut ImportInstrumentation,
 ) -> Result<(), ImportBlock> {
+    instrumentation.anchored_page_match_set_inserts = instrumentation
+        .anchored_page_match_set_inserts
+        .saturating_add(matches.pages.len().saturating_mul(2));
     let matched_sources = matches
         .pages
         .iter()
@@ -6171,60 +6177,174 @@ fn match_structural_page_moves(
         .iter()
         .map(|matched| matched.path.clone())
         .collect::<BTreeSet<_>>();
-    let candidate_destinations = inventory
-        .entries()
-        .iter()
-        .filter_map(|(path, observation)| {
-            (matches!(observation, RawObservation::Present(_))
-                && !matched_destinations.contains(path))
-            .then_some(path)
-        })
-        .collect::<Vec<_>>();
 
-    let mut source_candidates = BTreeMap::<ManagedPath, Vec<ManagedPath>>::new();
-    let mut destination_sources = BTreeMap::<ManagedPath, Vec<&ReceiptBackedPage>>::new();
+    let mut block_owners = BTreeMap::<BlockId, Vec<&ReceiptBackedPage>>::new();
+    let mut uuid_owners = BTreeMap::<LogseqUuid, Vec<&ReceiptBackedPage>>::new();
     for page in completed {
-        if matched_sources.contains(page.path())
+        for annotation in page.annotations() {
+            instrumentation.anchored_page_owner_inserts = instrumentation
+                .anchored_page_owner_inserts
+                .saturating_add(1);
+            block_owners
+                .entry(annotation.block_id())
+                .or_default()
+                .push(page);
+            if let Some(uuid) = annotation.logseq_uuid() {
+                instrumentation.anchored_page_uuid_owner_inserts = instrumentation
+                    .anchored_page_uuid_owner_inserts
+                    .saturating_add(1);
+                uuid_owners.entry(uuid).or_default().push(page);
+            }
+        }
+    }
+
+    for rejected in matches
+        .rejected_raw_ids
+        .iter()
+        .filter(|rejected| rejected.reason == RejectedRawIdReason::Duplicate)
+    {
+        let Ok(uuid) = LogseqUuid::parse(rejected.raw_value.trim()) else {
+            continue;
+        };
+        instrumentation.anchored_page_uuid_owner_lookups = instrumentation
+            .anchored_page_uuid_owner_lookups
+            .saturating_add(1);
+        let Some(owners) = uuid_owners.get(&uuid) else {
+            continue;
+        };
+        let destructive_owners = owners
+            .iter()
+            .copied()
+            .filter(|page| {
+                instrumentation.anchored_page_match_set_lookups = instrumentation
+                    .anchored_page_match_set_lookups
+                    .saturating_add(2);
+                instrumentation.inventory_path_lookups =
+                    instrumentation.inventory_path_lookups.saturating_add(2);
+                page.path() != &rejected.path
+                    && !matched_sources.contains(page.path())
+                    && !matched_destinations.contains(&rejected.path)
+                    && matches!(
+                        inventory.entries().get(page.path()),
+                        Some(RawObservation::Absent)
+                    )
+                    && matches!(
+                        inventory.entries().get(&rejected.path),
+                        Some(RawObservation::Present(_))
+                    )
+            })
+            .collect::<Vec<_>>();
+        if !destructive_owners.is_empty() {
+            return Err(ImportBlock {
+                reason: ImportBlockReason::AmbiguousDestructiveMatch,
+                paths: destructive_owners
+                    .iter()
+                    .map(|page| page.path().as_str().to_owned())
+                    .chain(std::iter::once(rejected.path.as_str().to_owned()))
+                    .collect(),
+                logical_completion_ids: destructive_owners
+                    .iter()
+                    .map(|page| page.logical_completion_id())
+                    .collect(),
+                observation: inventory_observation(inventory, rejected.path.as_str()),
+                detail: format!(
+                    "duplicate UUID {uuid} is ambiguous destructive page-move evidence"
+                ),
+            });
+        }
+    }
+
+    let mut source_destinations =
+        BTreeMap::<ManagedPath, (PageId, LogicalCompletionId, BTreeSet<ManagedPath>)>::new();
+    let mut destination_sources =
+        BTreeMap::<ManagedPath, BTreeSet<(ManagedPath, PageId, LogicalCompletionId)>>::new();
+    for block_match in matches
+        .blocks
+        .iter()
+        .filter(|matched| matched.basis == BlockMatchBasis::UniqueLogseqUuid)
+    {
+        instrumentation.anchored_page_owner_lookups = instrumentation
+            .anchored_page_owner_lookups
+            .saturating_add(1);
+        let Some(owners) = block_owners.get(&block_match.block_id) else {
+            continue;
+        };
+        if owners.len() != 1 {
+            return Err(ImportBlock {
+                reason: ImportBlockReason::DuplicateAnchorDependent,
+                paths: owners
+                    .iter()
+                    .map(|page| page.path().as_str().to_owned())
+                    .collect(),
+                logical_completion_ids: owners
+                    .iter()
+                    .map(|page| page.logical_completion_id())
+                    .collect(),
+                observation: inventory_observation(inventory, block_match.path.as_str()),
+                detail: format!(
+                    "block {} has multiple receipt-backed page owners",
+                    block_match.block_id
+                ),
+            });
+        }
+        let page = owners[0];
+        let source = page.path();
+        let destination = &block_match.path;
+        instrumentation.anchored_page_match_set_lookups = instrumentation
+            .anchored_page_match_set_lookups
+            .saturating_add(2);
+        instrumentation.inventory_path_lookups =
+            instrumentation.inventory_path_lookups.saturating_add(2);
+        if source == destination
+            || matched_sources.contains(source)
+            || matched_destinations.contains(destination)
             || !matches!(
-                inventory.entries().get(page.path()),
+                inventory.entries().get(source),
                 Some(RawObservation::Absent)
+            )
+            || !matches!(
+                inventory.entries().get(destination),
+                Some(RawObservation::Present(_))
             )
         {
             continue;
         }
-        let Some(base) = parsed.base.get(page.path()) else {
-            continue;
-        };
-        let candidates = candidate_destinations
-            .iter()
-            .filter(|path| {
-                parsed
-                    .current
-                    .get(*path)
-                    .is_some_and(|current| same_external_tree(base, current))
+        instrumentation.anchored_page_edge_inserts =
+            instrumentation.anchored_page_edge_inserts.saturating_add(2);
+        source_destinations
+            .entry(source.clone())
+            .or_insert_with(|| {
+                (
+                    page.page_id(),
+                    page.logical_completion_id(),
+                    BTreeSet::new(),
+                )
             })
-            .map(|path| (*path).clone())
-            .collect::<Vec<_>>();
-        if candidates.len() > 1 {
-            return Err(ImportBlock {
-                reason: ImportBlockReason::AmbiguousDestructiveMatch,
-                paths: std::iter::once(page.path().as_str().to_owned())
-                    .chain(candidates.iter().map(|path| path.as_str().to_owned()))
-                    .collect(),
-                logical_completion_ids: vec![page.logical_completion_id()],
-                observation: inventory_observation(inventory, page.path().as_str()),
-                detail:
-                    "one absent receipt path has multiple structurally identical new-path candidates"
-                        .into(),
-            });
-        }
-        if let Some(destination) = candidates.first() {
-            source_candidates.insert(page.path().clone(), candidates.clone());
-            destination_sources
-                .entry(destination.clone())
-                .or_default()
-                .push(page);
-        }
+            .2
+            .insert(destination.clone());
+        destination_sources
+            .entry(destination.clone())
+            .or_default()
+            .insert((source.clone(), page.page_id(), page.logical_completion_id()));
+    }
+
+    if let Some((source, (_, completion_id, destinations))) = source_destinations
+        .iter()
+        .find(|(_, (_, _, destinations))| destinations.len() > 1)
+    {
+        return Err(ImportBlock {
+            reason: ImportBlockReason::AmbiguousDestructiveMatch,
+            paths: std::iter::once(source.as_str().to_owned())
+                .chain(
+                    destinations
+                        .iter()
+                        .map(|destination| destination.as_str().to_owned()),
+                )
+                .collect(),
+            logical_completion_ids: vec![*completion_id],
+            observation: inventory_observation(inventory, source.as_str()),
+            detail: "one absent receipt page anchors to multiple present destinations".into(),
+        });
     }
     if let Some((destination, sources)) = destination_sources
         .iter()
@@ -6234,31 +6354,28 @@ fn match_structural_page_moves(
             reason: ImportBlockReason::AmbiguousDestructiveMatch,
             paths: sources
                 .iter()
-                .map(|page| page.path().as_str().to_owned())
+                .map(|(source, _, _)| source.as_str().to_owned())
                 .chain(std::iter::once(destination.as_str().to_owned()))
                 .collect(),
             logical_completion_ids: sources
                 .iter()
-                .map(|page| page.logical_completion_id())
+                .map(|(_, _, completion_id)| *completion_id)
                 .collect(),
             observation: inventory_observation(inventory, destination.as_str()),
-            detail:
-                "multiple absent receipt paths claim one structurally identical new destination"
-                    .into(),
+            detail: "multiple absent receipt pages anchor to one present destination".into(),
         });
     }
-    for page in completed {
-        let Some(destination) = source_candidates
-            .get(page.path())
-            .and_then(|candidates| candidates.first())
-        else {
-            continue;
-        };
+
+    for (source, (page_id, _, destinations)) in source_destinations {
+        let destination = destinations
+            .into_iter()
+            .next()
+            .expect("empty anchor sets are never inserted");
         matches.pages.push(PageImportMatch {
-            path: destination.clone(),
-            previous_path: page.path().clone(),
-            page_id: page.page_id(),
-            basis: PageMatchBasis::ReceiptBackedStructuralRename,
+            path: destination,
+            previous_path: source,
+            page_id,
+            basis: PageMatchBasis::ReceiptBackedAnchoredRename,
         });
     }
     matches
@@ -7169,8 +7286,8 @@ mod tests {
         execute_manifested_projection_work, write_projection_exact, ApplicationRuntimeRoot,
         AuthorBatch, BatchDisposition, BatchId, BlockLocation, CrdtPeerId, DeviceId, DocumentId,
         LineageDigest, ManagedTextKind, ObjectStore, OperationTransaction, PortablePathIndexRoot,
-        ProjectionEndpointBinding, ProjectionEndpointId, ProjectionRecovery, RebuildSource,
-        SemanticEffect, SemanticOperation, SessionId, SqliteFrontier,
+        ProjectionClaim, ProjectionEndpointBinding, ProjectionEndpointId, ProjectionRecovery,
+        RebuildSource, SemanticEffect, SemanticOperation, SessionId, SqliteFrontier,
         MAX_MATERIALIZATION_QUERY_ROWS,
     };
 
@@ -9146,8 +9263,20 @@ mod tests {
         label: &str,
         files: &[(&str, &str)],
     ) -> (TestRoot, InactiveBootstrapPreparedPublication, WorkspaceId) {
+        prepare_streaming_bootstrap_with_config(label, None, files)
+    }
+
+    fn prepare_streaming_bootstrap_with_config(
+        label: &str,
+        config: Option<&str>,
+        files: &[(&str, &str)],
+    ) -> (TestRoot, InactiveBootstrapPreparedPublication, WorkspaceId) {
         let root = TestRoot::new(label);
         let graph_root = root.path().join("graph");
+        if let Some(config) = config {
+            fs::create_dir_all(graph_root.join("logseq")).unwrap();
+            fs::write(graph_root.join("logseq/config.edn"), config).unwrap();
+        }
         for (path, contents) in files {
             let target = graph_root.join(path);
             fs::create_dir_all(target.parent().unwrap()).unwrap();
@@ -10069,6 +10198,872 @@ mod tests {
                     .len(),
                 expected_blocks
             );
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct DifferentialInitialDocument {
+        path: &'static str,
+        name: &'static str,
+        content: &'static str,
+        preamble: Option<&'static str>,
+    }
+
+    #[derive(Clone, Copy)]
+    struct DifferentialCurrentDocument {
+        path: &'static str,
+        bytes: &'static str,
+        graph_name: &'static str,
+        accepted_name: &'static str,
+        kind: ManagedTextKind,
+    }
+
+    struct ExternalSemanticDifferentialCase {
+        label: &'static str,
+        initial_config: Option<&'static str>,
+        current_config: Option<&'static str>,
+        initial: Vec<DifferentialInitialDocument>,
+        current: Vec<DifferentialCurrentDocument>,
+        affected: Vec<&'static str>,
+        initial_uuid: Option<LogseqUuid>,
+        retained_initial: Vec<(&'static str, usize)>,
+        unchanged_bytes: Vec<&'static str>,
+        collision: bool,
+    }
+
+    fn graph_kind(kind: crate::PageKind) -> ManagedTextKind {
+        match kind {
+            crate::PageKind::Page => ManagedTextKind::Page,
+            crate::PageKind::Journal => ManagedTextKind::Journal,
+        }
+    }
+
+    fn flatten_graph_blocks(
+        blocks: &[crate::BlockDto],
+        parent: Option<usize>,
+        flattened: &mut Vec<(Option<usize>, String)>,
+    ) {
+        for block in blocks {
+            let index = flattened.len();
+            flattened.push((parent, block.raw.clone()));
+            flatten_graph_blocks(&block.children, Some(index), flattened);
+        }
+    }
+
+    fn assert_external_semantic_observation(
+        label: &str,
+        graph: &Graph,
+        engine: &ShardedHotEngine,
+        database: &SqliteFrontier,
+        expected: DifferentialCurrentDocument,
+        bootstrap: bool,
+    ) -> PageId {
+        let graph_page = graph.load_by_path(expected.path).unwrap().unwrap();
+        assert_eq!(graph_page.name, expected.graph_name, "{label}: Graph name");
+        assert_eq!(
+            graph_kind(graph_page.kind),
+            expected.kind,
+            "{label}: Graph kind"
+        );
+        let accepted_name = if bootstrap {
+            expected.graph_name
+        } else {
+            expected.accepted_name
+        };
+        let snapshot = engine.canonical_snapshot().unwrap();
+        let page_id = snapshot
+            .pages
+            .iter()
+            .find_map(|(page_id, state)| {
+                state
+                    .path()
+                    .is_some_and(|path| path.as_str() == expected.path)
+                    .then_some(*page_id)
+            })
+            .unwrap_or_else(|| panic!("{label}: accepted engine has no {}", expected.path));
+        let materialized = engine.materialize_page(page_id).unwrap();
+        assert_eq!(
+            materialized.name.as_str(),
+            accepted_name,
+            "{label}: engine name"
+        );
+        assert_eq!(materialized.kind, expected.kind, "{label}: engine kind");
+        assert_eq!(
+            materialized.preamble, graph_page.pre_block,
+            "{label}: engine/Graph preamble"
+        );
+
+        let mut graph_blocks = Vec::new();
+        flatten_graph_blocks(&graph_page.blocks, None, &mut graph_blocks);
+        let engine_indexes = materialized
+            .blocks
+            .iter()
+            .enumerate()
+            .map(|(index, block)| (block.block_id, index))
+            .collect::<BTreeMap<_, _>>();
+        let engine_blocks = materialized
+            .blocks
+            .iter()
+            .map(|block| {
+                (
+                    block.parent.map(|parent| engine_indexes[&parent]),
+                    block.content.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(engine_blocks, graph_blocks, "{label}: engine/Graph tree");
+
+        let read = database.materialized_read().unwrap();
+        let sqlite_page = read.page(page_id).unwrap().unwrap();
+        assert_eq!(sqlite_page.name, accepted_name, "{label}: SQLite name");
+        assert_eq!(sqlite_page.kind, expected.kind, "{label}: SQLite kind");
+        assert_eq!(
+            sqlite_page.preamble, graph_page.pre_block,
+            "{label}: SQLite/Graph preamble"
+        );
+        let by_name = read
+            .pages_by_name_key_and_kind(
+                &LogicalPageName::parse(accepted_name)
+                    .unwrap()
+                    .canonical_key(),
+                expected.kind,
+                2,
+            )
+            .unwrap();
+        assert_eq!(by_name.len(), 1, "{label}: SQLite logical-name owner");
+        assert_eq!(by_name[0].page_id, page_id);
+        let sqlite_blocks = read
+            .blocks_on_page(page_id, MAX_MATERIALIZATION_QUERY_ROWS)
+            .unwrap();
+        let sqlite_indexes = sqlite_blocks
+            .iter()
+            .enumerate()
+            .map(|(index, block)| (block.block_id, index))
+            .collect::<BTreeMap<_, _>>();
+        let sqlite_tree = sqlite_blocks
+            .iter()
+            .map(|block| {
+                (
+                    block.parent.map(|parent| sqlite_indexes[&parent]),
+                    block.content.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(sqlite_tree, graph_blocks, "{label}: SQLite/Graph tree");
+        page_id
+    }
+
+    fn write_differential_current(
+        graph_root: &Path,
+        config: Option<&str>,
+        current: &[DifferentialCurrentDocument],
+        affected: &[&str],
+    ) {
+        let config_path = graph_root.join("logseq/config.edn");
+        match config {
+            Some(config) => {
+                fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+                fs::write(&config_path, config).unwrap();
+            }
+            None if config_path.exists() => fs::remove_file(&config_path).unwrap(),
+            None => {}
+        }
+        for path in affected {
+            if !current.iter().any(|document| document.path == *path) {
+                let target = graph_root.join(path);
+                if target.exists() {
+                    fs::remove_file(target).unwrap();
+                }
+            }
+        }
+        for document in current {
+            let target = graph_root.join(document.path);
+            fs::create_dir_all(target.parent().unwrap()).unwrap();
+            fs::write(target, document.bytes).unwrap();
+        }
+    }
+
+    fn run_external_semantic_differential(case: ExternalSemanticDifferentialCase, seed: u128) {
+        let initial_paths = case
+            .initial
+            .iter()
+            .map(|document| document.path)
+            .collect::<Vec<_>>();
+        let initial_names = case
+            .initial
+            .iter()
+            .map(|document| document.name)
+            .collect::<Vec<_>>();
+        let initial_contents = case
+            .initial
+            .iter()
+            .map(|document| document.content)
+            .collect::<Vec<_>>();
+        let initial_preambles = case
+            .initial
+            .iter()
+            .map(|document| document.preamble)
+            .collect::<Vec<_>>();
+        assert!(
+            initial_preambles.iter().all(Option::is_some)
+                || initial_preambles.iter().all(Option::is_none),
+            "{}: SnapshotFixture requires uniform initial preamble presence",
+            case.label
+        );
+        let preambles = initial_preambles.iter().all(Option::is_some).then(|| {
+            initial_preambles
+                .iter()
+                .map(|preamble| preamble.unwrap())
+                .collect::<Vec<_>>()
+        });
+        let fixture = SnapshotFixture::new_with_initial_uuid_and_config(
+            case.label,
+            &initial_paths,
+            case.initial_uuid,
+            case.initial_config,
+            Some(&initial_names),
+            Some(&initial_contents),
+            preambles.as_deref(),
+        );
+        let retained = case
+            .retained_initial
+            .iter()
+            .map(|(path, index)| (*path, fixture.intents[*index].page_id()))
+            .collect::<Vec<_>>();
+        let unchanged = case
+            .unchanged_bytes
+            .iter()
+            .map(|path| (*path, fs::read(fixture.graph_root.join(path)).unwrap()))
+            .collect::<Vec<_>>();
+        write_differential_current(
+            &fixture.graph_root,
+            case.current_config,
+            &case.current,
+            &case.affected,
+        );
+        let mut fixture = fixture.reopen_after_config_change();
+
+        let bootstrap_files = case
+            .current
+            .iter()
+            .map(|document| (document.path, document.bytes))
+            .collect::<Vec<_>>();
+        if case.collision {
+            let collision_root = TestRoot::new(&format!("{}-bootstrap-collision", case.label));
+            write_differential_current(
+                &collision_root.path().join("graph"),
+                case.current_config,
+                &case.current,
+                &case.affected,
+            );
+            let graph = Graph::open(&collision_root.path().join("graph"));
+            for document in &case.current {
+                let page = graph.load_by_path(document.path).unwrap().unwrap();
+                assert_eq!(page.name, document.graph_name);
+            }
+            let capture_scratch = collision_root.path().join("capture");
+            let preparation_scratch = collision_root.path().join("preparation");
+            fs::create_dir(&capture_scratch).unwrap();
+            fs::create_dir(&preparation_scratch).unwrap();
+            let capture = graph
+                .capture_inactive_bootstrap_sources(&capture_scratch)
+                .unwrap();
+            let workspace = WorkspaceId::from_uuid(Uuid::from_u128(0x5a01));
+            let prepared = prepare_inactive_bootstrap_import(
+                &graph,
+                capture,
+                workspace,
+                LineageDigest::of(b"inactive-streaming-bootstrap-test"),
+                DocumentId::from_uuid(Uuid::from_u128(0x5a02)),
+                ReferenceCatalogPolicyV1::default(),
+                &target_catalog(&collision_root.path().join("archive"), workspace),
+                &preparation_scratch,
+            )
+            .unwrap();
+            let mut captured = prepared.source_capture().entries_cursor().unwrap();
+            let mut captured_names = Vec::new();
+            while let Some(entry) = captured.next().unwrap() {
+                captured_names.push((
+                    entry.path().as_str().to_owned(),
+                    entry.logical_name().to_owned(),
+                ));
+            }
+            assert_eq!(
+                captured_names,
+                vec![
+                    ("pages/first.md".into(), "Shared Explicit".into()),
+                    ("pages/second.md".into(), "Shared Explicit".into()),
+                ]
+            );
+            let plan = fixture.plan(&case.affected);
+            assert_eq!(plan.status(), ImportPlanStatus::Blocked, "{plan:?}");
+            assert!(plan
+                .blocks()
+                .iter()
+                .any(|block| block.reason == ImportBlockReason::ConflictingLocalTail));
+            return;
+        }
+
+        let (bootstrap_root, prepared, workspace) = prepare_streaming_bootstrap_with_config(
+            &format!("{}-bootstrap", case.label),
+            case.current_config,
+            &bootstrap_files,
+        );
+        let (_, _, bootstrap_authority) = install_accepted_authority(
+            &bootstrap_root,
+            &prepared,
+            workspace,
+            0x7900 + seed,
+            "archive",
+        );
+        let bootstrap_runtime =
+            ApplicationRuntimeRoot::open_for_test(&bootstrap_root.path().join("bootstrap-runtime"))
+                .unwrap();
+        let (bootstrap_sqlite, _) = SqliteFrontier::open_or_rebuild_inactive_bootstrap(
+            &bootstrap_root.path().join("bootstrap.sqlite"),
+            &bootstrap_runtime,
+            &bootstrap_authority,
+        )
+        .unwrap();
+        let bootstrap_graph = Graph::open(&bootstrap_root.path().join("graph"));
+        for document in case.current.iter().copied() {
+            assert_external_semantic_observation(
+                case.label,
+                &bootstrap_graph,
+                bootstrap_authority.accepted_engine(),
+                &bootstrap_sqlite.database,
+                document,
+                true,
+            );
+        }
+
+        let plan = fixture.plan(&case.affected);
+        assert_eq!(plan.status(), ImportPlanStatus::Reconcile, "{plan:?}");
+        fixture.apply_external_plan(plan, 0x7a00 + seed);
+        loop {
+            let Some(work) = fixture
+                .engine
+                .projection_work_index()
+                .unwrap()
+                .next()
+                .unwrap()
+            else {
+                break;
+            };
+            execute_manifested_projection_work(
+                &fixture.graph,
+                &fixture.receipts,
+                &mut fixture.engine,
+                &work,
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{}: projection failed: {error:?}; work={work:#?}",
+                    case.label
+                )
+            });
+        }
+        for document in &case.current {
+            if case.affected.contains(&document.path) {
+                assert_eq!(
+                    fs::read(fixture.graph_root.join(document.path)).unwrap(),
+                    document.bytes.as_bytes(),
+                    "{}: projection changed accepted source bytes",
+                    case.label
+                );
+            }
+        }
+        for (path, bytes) in unchanged {
+            assert_eq!(
+                fs::read(fixture.graph_root.join(path)).unwrap(),
+                bytes,
+                "{}: unrelated referrer bytes changed",
+                case.label
+            );
+        }
+
+        let fixture = fixture.reopen_after_config_change();
+        let runtime =
+            ApplicationRuntimeRoot::open_for_test(&fixture._root.path().join("steady-runtime"))
+                .unwrap();
+        let claim = ProjectionClaim::current(
+            fixture.engine.workspace_id(),
+            fixture.engine.lineage_digest(),
+        );
+        let source =
+            RebuildSource::new(&fixture.engine, fixture.engine.archive_store().unwrap()).unwrap();
+        let sqlite_path = fixture._root.path().join("steady.sqlite");
+        let opened =
+            SqliteFrontier::open_or_rebuild(&sqlite_path, &runtime, claim, source).unwrap();
+        for document in case.current.iter().copied() {
+            let page_id = assert_external_semantic_observation(
+                case.label,
+                &Graph::open(&fixture.graph_root),
+                &fixture.engine,
+                &opened.database,
+                document,
+                false,
+            );
+            if let Some((_, retained_page_id)) =
+                retained.iter().find(|(path, _)| *path == document.path)
+            {
+                assert_eq!(page_id, *retained_page_id, "{}: PageId changed", case.label);
+            }
+        }
+        drop(opened);
+        let reopened = SqliteFrontier::open_or_rebuild(
+            &sqlite_path,
+            &runtime,
+            claim,
+            RebuildSource::new(&fixture.engine, fixture.engine.archive_store().unwrap()).unwrap(),
+        )
+        .unwrap();
+        for document in case.current.iter().copied() {
+            assert_external_semantic_observation(
+                case.label,
+                &Graph::open(&fixture.graph_root),
+                &fixture.engine,
+                &reopened.database,
+                document,
+                false,
+            );
+        }
+        drop(reopened);
+        let reimport = fixture.plan(&case.affected);
+        assert_eq!(
+            reimport.status(),
+            ImportPlanStatus::Noop,
+            "{}: projection/reimport oscillated: {reimport:#?}",
+            case.label,
+        );
+    }
+
+    #[test]
+    fn external_document_semantic_cases_share_bootstrap_steady_sqlite_and_restart_oracles() {
+        const LEGACY: &str = "{:file/name-format :legacy}\n";
+        const TRIPLE: &str = "{:file/name-format :triple-lowbar}\n";
+        const JOURNAL_OLD: &str = "{:journal/file-name-format \"dd-MM-yyyy\"\n\
+             :journal/page-title-format \"yyyy-MM-dd\"}\n";
+        const JOURNAL_NEW: &str = "{:journal/file-name-format \"dd-MM-yyyy\"\n\
+             :journal/page-title-format \"EEEE, dd-MM-yyyy\"}\n";
+        const NESTED: &str = r#"{:pages-directory "notes"
+            :journals-directory "diary"
+            :file/name-format :triple-lowbar
+            :journal/file-name-format "dd-MM-yyyy"
+            :journal/page-title-format "yyyy-MM-dd"}"#;
+        let seed = DifferentialInitialDocument {
+            path: "pages/seed.md",
+            name: "Seed",
+            content: "seed",
+            preamble: None,
+        };
+        let cases = vec![
+            ExternalSemanticDifferentialCase {
+                label: "matrix-new-markdown-title",
+                initial_config: None,
+                current_config: None,
+                initial: vec![seed],
+                current: vec![DifferentialCurrentDocument {
+                    path: "pages/physical.md",
+                    bytes: "title:: Logical Title\n\n- external\n",
+                    graph_name: "Logical Title",
+                    accepted_name: "Logical Title",
+                    kind: ManagedTextKind::Page,
+                }],
+                affected: vec!["pages/physical.md"],
+                initial_uuid: None,
+                retained_initial: vec![],
+                unchanged_bytes: vec![],
+                collision: false,
+            },
+            ExternalSemanticDifferentialCase {
+                label: "matrix-org-lower",
+                initial_config: None,
+                current_config: None,
+                initial: vec![seed],
+                current: vec![DifferentialCurrentDocument {
+                    path: "pages/lower.org",
+                    bytes: "#+title: Lower Title\n\n* external\n",
+                    graph_name: "Lower Title",
+                    accepted_name: "Lower Title",
+                    kind: ManagedTextKind::Page,
+                }],
+                affected: vec!["pages/lower.org"],
+                initial_uuid: None,
+                retained_initial: vec![],
+                unchanged_bytes: vec![],
+                collision: false,
+            },
+            ExternalSemanticDifferentialCase {
+                label: "matrix-org-upper",
+                initial_config: None,
+                current_config: None,
+                initial: vec![seed],
+                current: vec![DifferentialCurrentDocument {
+                    path: "pages/upper.org",
+                    bytes: "#+TITLE: Upper Title\n\n* external\n",
+                    graph_name: "Upper Title",
+                    accepted_name: "Upper Title",
+                    kind: ManagedTextKind::Page,
+                }],
+                affected: vec!["pages/upper.org"],
+                initial_uuid: None,
+                retained_initial: vec![],
+                unchanged_bytes: vec![],
+                collision: false,
+            },
+            ExternalSemanticDifferentialCase {
+                label: "matrix-org-mixed",
+                initial_config: None,
+                current_config: None,
+                initial: vec![seed],
+                current: vec![DifferentialCurrentDocument {
+                    path: "pages/mixed.org",
+                    bytes: "#+TiTlE: Mixed Title\n\n* external\n",
+                    graph_name: "Mixed Title",
+                    accepted_name: "Mixed Title",
+                    kind: ManagedTextKind::Page,
+                }],
+                affected: vec!["pages/mixed.org"],
+                initial_uuid: None,
+                retained_initial: vec![],
+                unchanged_bytes: vec![],
+                collision: false,
+            },
+            ExternalSemanticDifferentialCase {
+                label: "matrix-org-drawer",
+                initial_config: None,
+                current_config: None,
+                initial: vec![seed],
+                current: vec![DifferentialCurrentDocument {
+                    path: "pages/drawer.org",
+                    bytes: ":PROPERTIES:\n:TiTlE: Drawer Title\n:END:\n\n* external\n",
+                    graph_name: "Drawer Title",
+                    accepted_name: "Drawer Title",
+                    kind: ManagedTextKind::Page,
+                }],
+                affected: vec!["pages/drawer.org"],
+                initial_uuid: None,
+                retained_initial: vec![],
+                unchanged_bytes: vec![],
+                collision: false,
+            },
+            ExternalSemanticDifferentialCase {
+                label: "matrix-exact-title-add",
+                initial_config: None,
+                current_config: None,
+                initial: vec![DifferentialInitialDocument {
+                    path: "pages/physical.md",
+                    name: "physical",
+                    content: "body",
+                    preamble: None,
+                }],
+                current: vec![DifferentialCurrentDocument {
+                    path: "pages/physical.md",
+                    bytes: "title:: Added Logical\n\n- body\n",
+                    graph_name: "Added Logical",
+                    accepted_name: "Added Logical",
+                    kind: ManagedTextKind::Page,
+                }],
+                affected: vec!["pages/physical.md"],
+                initial_uuid: None,
+                retained_initial: vec![("pages/physical.md", 0)],
+                unchanged_bytes: vec![],
+                collision: false,
+            },
+            ExternalSemanticDifferentialCase {
+                label: "matrix-exact-title-change",
+                initial_config: None,
+                current_config: None,
+                initial: vec![DifferentialInitialDocument {
+                    path: "pages/physical.md",
+                    name: "Old Logical",
+                    content: "body",
+                    preamble: Some("title:: Old Logical"),
+                }],
+                current: vec![DifferentialCurrentDocument {
+                    path: "pages/physical.md",
+                    bytes: "title:: New Logical\n\n- body\n",
+                    graph_name: "New Logical",
+                    accepted_name: "New Logical",
+                    kind: ManagedTextKind::Page,
+                }],
+                affected: vec!["pages/physical.md"],
+                initial_uuid: None,
+                retained_initial: vec![("pages/physical.md", 0)],
+                unchanged_bytes: vec![],
+                collision: false,
+            },
+            ExternalSemanticDifferentialCase {
+                label: "matrix-exact-title-removal",
+                initial_config: None,
+                current_config: None,
+                initial: vec![DifferentialInitialDocument {
+                    path: "pages/physical.md",
+                    name: "Old Logical",
+                    content: "body",
+                    preamble: Some("title:: Old Logical"),
+                }],
+                current: vec![DifferentialCurrentDocument {
+                    path: "pages/physical.md",
+                    bytes: "- body\n",
+                    graph_name: "physical",
+                    accepted_name: "physical",
+                    kind: ManagedTextKind::Page,
+                }],
+                affected: vec!["pages/physical.md"],
+                initial_uuid: None,
+                retained_initial: vec![("pages/physical.md", 0)],
+                unchanged_bytes: vec![],
+                collision: false,
+            },
+            ExternalSemanticDifferentialCase {
+                label: "matrix-formatting-only-title",
+                initial_config: None,
+                current_config: None,
+                initial: vec![DifferentialInitialDocument {
+                    path: "pages/physical.md",
+                    name: "Logical",
+                    content: "body",
+                    preamble: Some("title:: Logical"),
+                }],
+                current: vec![DifferentialCurrentDocument {
+                    path: "pages/physical.md",
+                    bytes: "title::   Logical  \nsubtitle:: retained\n\n- body\n",
+                    graph_name: "Logical",
+                    accepted_name: "Logical",
+                    kind: ManagedTextKind::Page,
+                }],
+                affected: vec!["pages/physical.md"],
+                initial_uuid: None,
+                retained_initial: vec![("pages/physical.md", 0)],
+                unchanged_bytes: vec![],
+                collision: false,
+            },
+            ExternalSemanticDifferentialCase {
+                label: "matrix-policy-only-body-edit",
+                initial_config: Some(LEGACY),
+                current_config: Some(TRIPLE),
+                initial: vec![DifferentialInitialDocument {
+                    path: "pages/A.B.md",
+                    name: "A/B",
+                    content: "old",
+                    preamble: None,
+                }],
+                current: vec![DifferentialCurrentDocument {
+                    path: "pages/A.B.md",
+                    bytes: "- changed\n",
+                    graph_name: "A.B",
+                    accepted_name: "A/B",
+                    kind: ManagedTextKind::Page,
+                }],
+                affected: vec!["pages/A.B.md"],
+                initial_uuid: None,
+                retained_initial: vec![("pages/A.B.md", 0)],
+                unchanged_bytes: vec![],
+                collision: false,
+            },
+            ExternalSemanticDifferentialCase {
+                label: "matrix-new-after-policy-change",
+                initial_config: Some(LEGACY),
+                current_config: Some(TRIPLE),
+                initial: vec![seed],
+                current: vec![DifferentialCurrentDocument {
+                    path: "pages/Team___Planning.md",
+                    bytes: "- new\n",
+                    graph_name: "Team/Planning",
+                    accepted_name: "Team/Planning",
+                    kind: ManagedTextKind::Page,
+                }],
+                affected: vec!["pages/Team___Planning.md"],
+                initial_uuid: None,
+                retained_initial: vec![],
+                unchanged_bytes: vec![],
+                collision: false,
+            },
+            ExternalSemanticDifferentialCase {
+                label: "matrix-explicit-date-policy-change",
+                initial_config: Some(JOURNAL_OLD),
+                current_config: Some(JOURNAL_NEW),
+                initial: vec![DifferentialInitialDocument {
+                    path: "journals/physical.md",
+                    name: "2026-07-25",
+                    content: "old journal",
+                    preamble: Some("title:: 25-07-2026"),
+                }],
+                current: vec![DifferentialCurrentDocument {
+                    path: "journals/physical.md",
+                    bytes: "title:: 25-07-2026\n\n- changed journal\n",
+                    graph_name: "Saturday, 25-07-2026",
+                    accepted_name: "2026-07-25",
+                    kind: ManagedTextKind::Journal,
+                }],
+                affected: vec!["journals/physical.md"],
+                initial_uuid: None,
+                retained_initial: vec![("journals/physical.md", 0)],
+                unchanged_bytes: vec![],
+                collision: false,
+            },
+            ExternalSemanticDifferentialCase {
+                label: "matrix-title-edited-anchored-move",
+                initial_config: None,
+                current_config: None,
+                initial: vec![DifferentialInitialDocument {
+                    path: "pages/old.md",
+                    name: "Old",
+                    content: "old body\nid:: 00000000-0000-0000-0000-000000053009",
+                    preamble: Some("title:: Old"),
+                }],
+                current: vec![DifferentialCurrentDocument {
+                    path: "pages/new.md",
+                    bytes:
+                        "title:: New\n\n- moved body\n  id:: 00000000-0000-0000-0000-000000053009\n",
+                    graph_name: "New",
+                    accepted_name: "New",
+                    kind: ManagedTextKind::Page,
+                }],
+                affected: vec!["pages/old.md", "pages/new.md"],
+                initial_uuid: Some(LogseqUuid::from_uuid(Uuid::from_u128(0x53009))),
+                retained_initial: vec![("pages/new.md", 0)],
+                unchanged_bytes: vec![],
+                collision: false,
+            },
+            ExternalSemanticDifferentialCase {
+                label: "matrix-exact-byte-unanchored-move",
+                initial_config: None,
+                current_config: None,
+                initial: vec![DifferentialInitialDocument {
+                    path: "pages/old.md",
+                    name: "Old",
+                    content: "exact",
+                    preamble: None,
+                }],
+                current: vec![DifferentialCurrentDocument {
+                    path: "pages/new.md",
+                    bytes: "- exact\n",
+                    graph_name: "new",
+                    accepted_name: "new",
+                    kind: ManagedTextKind::Page,
+                }],
+                affected: vec!["pages/old.md", "pages/new.md"],
+                initial_uuid: None,
+                retained_initial: vec![("pages/new.md", 0)],
+                unchanged_bytes: vec![],
+                collision: false,
+            },
+            ExternalSemanticDifferentialCase {
+                label: "matrix-date-nondate-nested-layouts",
+                initial_config: Some(NESTED),
+                current_config: Some(NESTED),
+                initial: vec![DifferentialInitialDocument {
+                    path: "notes/seed.md",
+                    name: "Seed",
+                    content: "seed",
+                    preamble: None,
+                }],
+                current: vec![
+                    DifferentialCurrentDocument {
+                        path: "notes/nested/not-a-date.md",
+                        bytes: "title:: 25-07-2026\n\n- date title\n",
+                        graph_name: "2026-07-25",
+                        accepted_name: "2026-07-25",
+                        kind: ManagedTextKind::Journal,
+                    },
+                    DifferentialCurrentDocument {
+                        path: "diary/nested/25-07-2026.md",
+                        bytes: "title:: Ordinary Page\n\n- non-date title\n",
+                        graph_name: "Ordinary Page",
+                        accepted_name: "Ordinary Page",
+                        kind: ManagedTextKind::Page,
+                    },
+                    DifferentialCurrentDocument {
+                        path: "archive/deep/physical.org",
+                        bytes: "#+TiTlE: 26-07-2026\n\n* date title\n",
+                        graph_name: "2026-07-26",
+                        accepted_name: "2026-07-26",
+                        kind: ManagedTextKind::Journal,
+                    },
+                ],
+                affected: vec![
+                    "notes/nested/not-a-date.md",
+                    "diary/nested/25-07-2026.md",
+                    "archive/deep/physical.org",
+                ],
+                initial_uuid: None,
+                retained_initial: vec![],
+                unchanged_bytes: vec![],
+                collision: false,
+            },
+            ExternalSemanticDifferentialCase {
+                label: "matrix-referrer-unchanged-restart",
+                initial_config: None,
+                current_config: None,
+                initial: vec![
+                    DifferentialInitialDocument {
+                        path: "pages/physical.md",
+                        name: "Old Logical",
+                        content: "target body",
+                        preamble: None,
+                    },
+                    DifferentialInitialDocument {
+                        path: "pages/referrer.md",
+                        name: "Referrer",
+                        content: "see [[Old Logical]] and [[New Logical]]",
+                        preamble: None,
+                    },
+                ],
+                current: vec![
+                    DifferentialCurrentDocument {
+                        path: "pages/physical.md",
+                        bytes: "title:: New Logical\n\n- target body\n",
+                        graph_name: "New Logical",
+                        accepted_name: "New Logical",
+                        kind: ManagedTextKind::Page,
+                    },
+                    DifferentialCurrentDocument {
+                        path: "pages/referrer.md",
+                        bytes: "- see [[Old Logical]] and [[New Logical]]\n",
+                        graph_name: "referrer",
+                        accepted_name: "Referrer",
+                        kind: ManagedTextKind::Page,
+                    },
+                ],
+                affected: vec!["pages/physical.md"],
+                initial_uuid: None,
+                retained_initial: vec![("pages/physical.md", 0)],
+                unchanged_bytes: vec!["pages/referrer.md"],
+                collision: false,
+            },
+            ExternalSemanticDifferentialCase {
+                label: "matrix-explicit-title-collision",
+                initial_config: None,
+                current_config: None,
+                initial: vec![seed],
+                current: vec![
+                    DifferentialCurrentDocument {
+                        path: "pages/first.md",
+                        bytes: "title:: Shared Explicit\n\n- first\n",
+                        graph_name: "Shared Explicit",
+                        accepted_name: "Shared Explicit",
+                        kind: ManagedTextKind::Page,
+                    },
+                    DifferentialCurrentDocument {
+                        path: "pages/second.md",
+                        bytes: "title:: Shared Explicit\n\n- second\n",
+                        graph_name: "Shared Explicit",
+                        accepted_name: "Shared Explicit",
+                        kind: ManagedTextKind::Page,
+                    },
+                ],
+                affected: vec!["pages/first.md", "pages/second.md"],
+                initial_uuid: None,
+                retained_initial: vec![],
+                unchanged_bytes: vec![],
+                collision: true,
+            },
+        ];
+        for (index, case) in cases.into_iter().enumerate() {
+            run_external_semantic_differential(case, index as u128);
         }
     }
 

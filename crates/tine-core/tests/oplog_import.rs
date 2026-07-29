@@ -1098,6 +1098,59 @@ fn exact_rename_and_copy_before_delete_preserve_conservative_page_identity() {
 }
 
 #[test]
+fn unrelated_zero_block_delete_create_does_not_retain_page_identity() {
+    let fixture = AuthorityFixture::one_titled_page(
+        "unrelated-zero-block-delete-create",
+        "pages/old.md",
+        "Old",
+        "title:: Old\nowner:: A",
+        Vec::new(),
+    );
+    let old_page_id = fixture.pages[0].page_id;
+    fs::remove_file(fixture.graph_root.join("pages/old.md")).unwrap();
+    fixture.overwrite("pages/new.md", b"title:: Unrelated\nowner:: B\n");
+
+    let plan = fixture.plan(&["pages/old.md", "pages/new.md"]);
+    assert_eq!(plan.status(), ImportPlanStatus::Reconcile, "{plan:?}");
+    assert!(
+        plan.matches()
+            .unwrap()
+            .pages()
+            .iter()
+            .all(|matched| matched.page_id() != old_page_id),
+        "unrelated empty block trees are not move evidence: {plan:#?}"
+    );
+}
+
+#[test]
+fn unrelated_common_block_delete_create_does_not_retain_page_identity() {
+    let fixture = AuthorityFixture::one_titled_page(
+        "unrelated-common-block-delete-create",
+        "pages/old.md",
+        "Old",
+        "title:: Old\nowner:: A",
+        vec![BlockSpec::root("generic", "a")],
+    );
+    let old_page_id = fixture.pages[0].page_id;
+    fs::remove_file(fixture.graph_root.join("pages/old.md")).unwrap();
+    fixture.overwrite(
+        "pages/new.md",
+        b"title:: Unrelated\nowner:: B\n\n- generic\n",
+    );
+
+    let plan = fixture.plan(&["pages/old.md", "pages/new.md"]);
+    assert_eq!(plan.status(), ImportPlanStatus::Reconcile, "{plan:?}");
+    assert!(
+        plan.matches()
+            .unwrap()
+            .pages()
+            .iter()
+            .all(|matched| matched.page_id() != old_page_id),
+        "a common generic block is not move evidence: {plan:#?}"
+    );
+}
+
+#[test]
 fn completed_release_allows_exact_recreation_as_new_but_blocks_portable_neighbor() {
     let mut fixture = AuthorityFixture::one_page(
         "released-recreation",
@@ -1326,11 +1379,12 @@ fn explicit_titles_precede_directory_and_filename_kind_before_journal_conversion
 }
 
 #[test]
-fn attack_unambiguous_rename_with_preamble_edit_retains_page_identity() {
+fn title_edited_move_with_unique_uuid_retains_page_identity() {
+    let anchor = LogseqUuid::from_uuid(uuid(53_001));
     let fixture = AuthorityFixture::one_page(
         "attack-rename-preamble-identity",
         "pages/old.md",
-        vec![BlockSpec::root("base", "a")],
+        vec![BlockSpec::root("base", "a").with_uuid(anchor)],
     );
     let page_id = fixture.pages[0].page_id;
     fs::rename(
@@ -1338,7 +1392,10 @@ fn attack_unambiguous_rename_with_preamble_edit_retains_page_identity() {
         fixture.graph_root.join("pages/new.md"),
     )
     .unwrap();
-    fixture.overwrite("pages/new.md", b"title:: New\n\n- base\n");
+    fixture.overwrite(
+        "pages/new.md",
+        format!("title:: New\n\n- edited\n  id:: {anchor}\n").as_bytes(),
+    );
 
     let plan = fixture.plan(&["pages/old.md", "pages/new.md"]);
     assert_eq!(plan.status(), ImportPlanStatus::Reconcile, "{plan:?}");
@@ -1346,16 +1403,17 @@ fn attack_unambiguous_rename_with_preamble_edit_retains_page_identity() {
         matched.page_id() == page_id
             && matched.previous_path().as_str() == "pages/old.md"
             && matched.path().as_str() == "pages/new.md"
-            && matched.basis() == PageMatchBasis::ReceiptBackedStructuralRename
+            && matched.basis() == PageMatchBasis::ReceiptBackedAnchoredRename
     }));
 }
 
 #[test]
-fn attack_configured_root_move_retains_page_identity_and_uses_new_title() {
+fn configured_root_anchored_move_retains_page_identity_and_uses_new_title() {
+    let anchor = LogseqUuid::from_uuid(uuid(53_002));
     let mut fixture = AuthorityFixture::one_page(
         "attack-configured-root-move",
         "pages/Imported Page 0.md",
-        vec![BlockSpec::root("base", "a")],
+        vec![BlockSpec::root("base", "a").with_uuid(anchor)],
     );
     let page_id = fixture.pages[0].page_id;
     write(
@@ -1371,7 +1429,7 @@ fn attack_configured_root_move_retains_page_identity_and_uses_new_title() {
     .unwrap();
     fixture.overwrite(
         "notes/deep/renamed.md",
-        b"title:: Configured Root Rename\n\n- base\n",
+        format!("title:: Configured Root Rename\n\n- edited\n  id:: {anchor}\n").as_bytes(),
     );
     fixture.graph = Graph::open(&fixture.graph_root);
 
@@ -1385,6 +1443,144 @@ fn attack_configured_root_move_retains_page_identity_and_uses_new_title() {
             && diagnostic.contains("notes/deep/renamed.md"),
         "move must retain PageId while re-evaluating destination title semantics: {diagnostic}"
     );
+}
+
+#[test]
+fn title_edited_move_without_uuid_is_conservative_delete_create() {
+    let fixture = AuthorityFixture::one_page(
+        "title-edited-move-without-anchor",
+        "pages/old.md",
+        vec![BlockSpec::root("base", "a")],
+    );
+    let old_page_id = fixture.pages[0].page_id;
+    fs::remove_file(fixture.graph_root.join("pages/old.md")).unwrap();
+    fixture.overwrite("pages/new.md", b"title:: New\n\n- base\n");
+
+    let plan = fixture.plan(&["pages/old.md", "pages/new.md"]);
+    assert_eq!(plan.status(), ImportPlanStatus::Reconcile, "{plan:?}");
+    assert!(plan
+        .matches()
+        .unwrap()
+        .pages()
+        .iter()
+        .all(|matched| matched.page_id() != old_page_id));
+}
+
+#[test]
+fn cross_format_title_edited_move_without_uuid_is_conservative_delete_create() {
+    let fixture = AuthorityFixture::one_page(
+        "cross-format-move-without-anchor",
+        "pages/old.md",
+        vec![BlockSpec::root("base", "a")],
+    );
+    let old_page_id = fixture.pages[0].page_id;
+    fs::remove_file(fixture.graph_root.join("pages/old.md")).unwrap();
+    fixture.overwrite("pages/new.org", b"#+TiTlE: New\n\n* base\n");
+
+    let plan = fixture.plan(&["pages/old.md", "pages/new.org"]);
+    assert_eq!(plan.status(), ImportPlanStatus::Reconcile, "{plan:?}");
+    assert!(plan
+        .matches()
+        .unwrap()
+        .pages()
+        .iter()
+        .all(|matched| matched.page_id() != old_page_id));
+}
+
+#[test]
+fn duplicate_uuid_evidence_blocks_page_move_identity() {
+    let anchor = LogseqUuid::from_uuid(uuid(53_003));
+    let fixture = AuthorityFixture::one_page(
+        "duplicate-anchor-move",
+        "pages/old.md",
+        vec![BlockSpec::root("base", "a").with_uuid(anchor)],
+    );
+    fs::remove_file(fixture.graph_root.join("pages/old.md")).unwrap();
+    fixture.overwrite(
+        "pages/new.md",
+        format!("- first\n  id:: {anchor}\n- second\n  id:: {anchor}\n").as_bytes(),
+    );
+
+    let plan = fixture.plan(&["pages/old.md", "pages/new.md"]);
+    assert!(blocked_reasons(&plan).contains(&ImportBlockReason::AmbiguousDestructiveMatch));
+}
+
+#[test]
+fn one_source_to_several_uuid_anchored_destinations_blocks() {
+    let first = LogseqUuid::from_uuid(uuid(53_004));
+    let second = LogseqUuid::from_uuid(uuid(53_005));
+    let fixture = AuthorityFixture::one_page(
+        "one-source-several-destinations",
+        "pages/old.md",
+        vec![
+            BlockSpec::root("first", "a").with_uuid(first),
+            BlockSpec::root("second", "b").with_uuid(second),
+        ],
+    );
+    fs::remove_file(fixture.graph_root.join("pages/old.md")).unwrap();
+    fixture.overwrite(
+        "pages/new-a.md",
+        format!("title:: New A\n\n- edited first\n  id:: {first}\n").as_bytes(),
+    );
+    fixture.overwrite(
+        "pages/new-b.md",
+        format!("title:: New B\n\n- edited second\n  id:: {second}\n").as_bytes(),
+    );
+
+    let plan = fixture.plan(&["pages/old.md", "pages/new-a.md", "pages/new-b.md"]);
+    assert!(blocked_reasons(&plan).contains(&ImportBlockReason::AmbiguousDestructiveMatch));
+}
+
+#[test]
+fn several_sources_to_one_uuid_anchored_destination_blocks() {
+    let first = LogseqUuid::from_uuid(uuid(53_006));
+    let second = LogseqUuid::from_uuid(uuid(53_007));
+    let fixture = AuthorityFixture::new(
+        "several-sources-one-destination",
+        vec![
+            PageSpec {
+                path: "pages/old-a.md".into(),
+                blocks: vec![BlockSpec::root("first", "a").with_uuid(first)],
+                name: Some("Old A".into()),
+                preamble: Some("title:: Old A".into()),
+            },
+            PageSpec {
+                path: "pages/old-b.md".into(),
+                blocks: vec![BlockSpec::root("second", "a").with_uuid(second)],
+                name: Some("Old B".into()),
+                preamble: Some("title:: Old B".into()),
+            },
+        ],
+    );
+    fs::remove_file(fixture.graph_root.join("pages/old-a.md")).unwrap();
+    fs::remove_file(fixture.graph_root.join("pages/old-b.md")).unwrap();
+    fixture.overwrite(
+        "pages/new.md",
+        format!("- edited first\n  id:: {first}\n- edited second\n  id:: {second}\n").as_bytes(),
+    );
+
+    let plan = fixture.plan(&["pages/old-a.md", "pages/old-b.md", "pages/new.md"]);
+    assert!(blocked_reasons(&plan).contains(&ImportBlockReason::AmbiguousDestructiveMatch));
+}
+
+#[test]
+fn partial_affected_move_scope_does_not_retain_page_identity() {
+    let anchor = LogseqUuid::from_uuid(uuid(53_008));
+    let fixture = AuthorityFixture::one_page(
+        "partial-move-scope",
+        "pages/old.md",
+        vec![BlockSpec::root("base", "a").with_uuid(anchor)],
+    );
+    fs::remove_file(fixture.graph_root.join("pages/old.md")).unwrap();
+    fixture.overwrite(
+        "pages/new.md",
+        format!("- edited\n  id:: {anchor}\n").as_bytes(),
+    );
+
+    let old_only = fixture.plan(&["pages/old.md"]);
+    assert!(old_only.matches().unwrap().pages().is_empty());
+    let new_only = fixture.plan(&["pages/new.md"]);
+    assert!(new_only.matches().unwrap().pages().is_empty());
 }
 
 #[test]
@@ -1625,5 +1821,46 @@ fn large_noop_and_many_error_scopes_obey_complete_numeric_work_ceilings() {
         errors.instrumentation().recorded_work_units() <= PAGE_COUNT * 4096,
         "many-error work ceiling exceeded: {:?}",
         errors.instrumentation()
+    );
+}
+
+#[test]
+fn large_disjoint_delete_create_sets_use_indexed_anchored_page_work() {
+    const PAGE_COUNT: usize = 64;
+    let fixture = AuthorityFixture::new(
+        "large-disjoint-delete-create",
+        (0..PAGE_COUNT)
+            .map(|index| PageSpec {
+                path: format!("pages/old-{index:04}.md"),
+                blocks: vec![BlockSpec::root(format!("old block {index}"), "a")],
+                name: Some(format!("Old {index}")),
+                preamble: Some(format!("title:: Old {index}")),
+            })
+            .collect(),
+    );
+    let mut affected = Vec::with_capacity(PAGE_COUNT * 2);
+    for index in 0..PAGE_COUNT {
+        let old = format!("pages/old-{index:04}.md");
+        let new = format!("pages/new-{index:04}.md");
+        fs::remove_file(fixture.graph_root.join(&old)).unwrap();
+        fixture.overwrite(
+            &new,
+            format!("title:: New {index}\n\n- unrelated new block {index}\n").as_bytes(),
+        );
+        affected.push(old);
+        affected.push(new);
+    }
+    let paths = affected.iter().map(String::as_str).collect::<Vec<_>>();
+
+    let plan = fixture.plan(&paths);
+    assert_eq!(plan.status(), ImportPlanStatus::Reconcile, "{plan:?}");
+    assert!(plan.matches().unwrap().pages().is_empty());
+    let work = plan.instrumentation();
+    assert_eq!(work.anchored_page_owner_inserts, PAGE_COUNT);
+    assert_eq!(work.anchored_page_owner_lookups, 0);
+    assert_eq!(work.anchored_page_edge_inserts, 0);
+    assert!(
+        work.recorded_work_units() <= PAGE_COUNT * 2 * 8192,
+        "indexed disjoint-set work ceiling exceeded: {work:?}"
     );
 }
