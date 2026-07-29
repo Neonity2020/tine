@@ -9,6 +9,12 @@
 //! ```compile_fail
 //! use tine_core::oplog::ProjectionPolicy;
 //! ```
+//!
+//! The deterministic projection crash hook remains crate-private:
+//!
+//! ```compile_fail
+//! use tine_core::oplog::projection::fail_next_manifested_projection_during_write_for_harness;
+//! ```
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
@@ -36,8 +42,26 @@ thread_local! {
         const { std::cell::Cell::new(false) };
 }
 
-pub(crate) fn fail_next_manifested_projection_during_write_for_harness() {
-    HARNESS_FAIL_DURING_MANIFESTED_PROJECTION.with(|fail| fail.set(true));
+/// Operation-scoped capability for the deterministic manifested-projection
+/// fault. Dropping it restores the thread's prior hook state, including during
+/// unwinding, so a simulator failure before graph execution cannot fault a
+/// later unrelated projection on the same thread.
+#[must_use = "the manifested-projection fault must remain scoped to its coordinator operation"]
+pub(crate) struct ManifestedProjectionFaultScope {
+    previously_armed: bool,
+}
+
+impl Drop for ManifestedProjectionFaultScope {
+    fn drop(&mut self) {
+        HARNESS_FAIL_DURING_MANIFESTED_PROJECTION.with(|fail| fail.set(self.previously_armed));
+    }
+}
+
+pub(crate) fn fail_next_manifested_projection_during_write_for_harness(
+) -> ManifestedProjectionFaultScope {
+    let previously_armed =
+        HARNESS_FAIL_DURING_MANIFESTED_PROJECTION.with(|fail| fail.replace(true));
+    ManifestedProjectionFaultScope { previously_armed }
 }
 
 fn fail_during_manifested_projection_for_harness() -> Result<(), ProjectionError> {
@@ -440,6 +464,26 @@ pub(crate) fn execute_manifested_projection_work_under_handoff(
     )
 }
 
+fn block_manifested_projection_work(
+    graph: &Graph,
+    receipts: &ProjectionReceiptStore,
+    work_index: &ProjectionWorkIndex,
+    work: &ProjectionWork,
+) -> Result<(), ProjectionError> {
+    let observed = graph
+        .read_projection_input(work.path())
+        .map_err(ProjectionError::Io)?
+        .as_deref()
+        .map(super::BlobDescription::of);
+    work_index
+        .mark_blocked(ProjectionWorkBlockAuthority::guarded_conflict(
+            work,
+            receipts.store_id(),
+            observed,
+        ))
+        .map_err(|error| ProjectionError::Work(error.to_string()))
+}
+
 fn execute_manifested_projection_work_with_runtime(
     graph: &Graph,
     receipts: &ProjectionReceiptStore,
@@ -616,6 +660,10 @@ fn execute_manifested_projection_work_with_runtime(
             authority.release_failed_recovery()?;
             None
         }
+        Some((Err(error), _)) if crate::model::is_projection_semantic_refusal(&error) => {
+            block_manifested_projection_work(graph, receipts, work_index, work)?;
+            return Err(error.into());
+        }
         Some((Err(error), _)) => return Err(error.into()),
         None => None,
     };
@@ -703,20 +751,9 @@ fn execute_manifested_projection_work_with_runtime(
                     if matches!(
                         error.kind(),
                         io::ErrorKind::AlreadyExists | io::ErrorKind::NotFound
-                    ) =>
+                    ) || crate::model::is_projection_semantic_refusal(&error) =>
                 {
-                    let observed = graph
-                        .read_projection_input(work.path())
-                        .map_err(ProjectionError::Io)?
-                        .as_deref()
-                        .map(super::BlobDescription::of);
-                    work_index
-                        .mark_blocked(ProjectionWorkBlockAuthority::guarded_conflict(
-                            work,
-                            receipts.store_id(),
-                            observed,
-                        ))
-                        .map_err(|error| ProjectionError::Work(error.to_string()))?;
+                    block_manifested_projection_work(graph, receipts, work_index, work)?;
                     return Err(error.into());
                 }
                 Err(error) => return Err(error.into()),
@@ -2374,5 +2411,22 @@ mod tests {
             render_projection(&org, None).unwrap().target,
             render_projection(&mixed_org, None).unwrap().target
         );
+    }
+
+    #[test]
+    fn manifested_projection_fault_scope_cleans_up_after_unwind_and_consumption() {
+        assert!(fail_during_manifested_projection_for_harness().is_ok());
+
+        let unwind = std::panic::catch_unwind(|| {
+            let _fault_scope = fail_next_manifested_projection_during_write_for_harness();
+            panic!("deterministic unwind before manifested projection");
+        });
+        assert!(unwind.is_err());
+        assert!(fail_during_manifested_projection_for_harness().is_ok());
+
+        let fault_scope = fail_next_manifested_projection_during_write_for_harness();
+        assert!(fail_during_manifested_projection_for_harness().is_err());
+        drop(fault_scope);
+        assert!(fail_during_manifested_projection_for_harness().is_ok());
     }
 }

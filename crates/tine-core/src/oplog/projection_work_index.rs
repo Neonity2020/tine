@@ -40,6 +40,11 @@ use super::{
 };
 
 const WORK_SCHEMA_VERSION: u32 = 3;
+// v10 orders ready work by portable path and retires an occupied spelling
+// before acquiring another spelling of the same portable key. v9 ordered by
+// exact path, so a case-only rename could acquire first on a case-insensitive
+// filesystem and become terminally blocked before the old inode was retired.
+//
 // v9 requires authenticated insertion-only history transition evidence for
 // every non-exact engine-history binding change. v8 could retain terminal and
 // completed authority across a raw divergent rebind.
@@ -47,7 +52,7 @@ const WORK_SCHEMA_VERSION: u32 = 3;
 // v8 makes each authenticated exact-path completion leaf a bounded current
 // authority (or a constant-size ambiguity marker), rather than a lifetime
 // history of every receipt ever completed at that path.
-const INDEX_SCHEMA_VERSION: u32 = 9;
+const INDEX_SCHEMA_VERSION: u32 = 10;
 const MAX_WORK_ROW_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_PREPARED_BATCH_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_INDEX_NODE_BYTES: u64 = 8 * 1024 * 1024;
@@ -3780,13 +3785,20 @@ fn path_digest(path: &ManagedPath) -> ContentDigest {
 }
 
 fn ready_key(work: &ProjectionWork) -> Result<Vec<u8>, ProjectionWorkError> {
-    let path = work.path().as_str().as_bytes();
-    let path_len = u32::try_from(path.len()).map_err(|_| ProjectionWorkError::NonCanonical)?;
-    let mut key = Vec::with_capacity(68 + path.len());
+    let portable_path = work.path().portable_key();
+    let portable_path = portable_path.as_bytes();
+    let path_len =
+        u32::try_from(portable_path.len()).map_err(|_| ProjectionWorkError::NonCanonical)?;
+    let target_order = match work.target() {
+        ProjectionWorkTarget::Absent => 0,
+        ProjectionWorkTarget::Present(_) => 1,
+    };
+    let mut key = Vec::with_capacity(69 + portable_path.len());
     key.extend_from_slice(work.batch_id().as_uuid().as_bytes());
     key.extend_from_slice(work.page_id().as_uuid().as_bytes());
     key.extend_from_slice(&path_len.to_be_bytes());
-    key.extend_from_slice(path);
+    key.extend_from_slice(portable_path);
+    key.push(target_order);
     key.extend_from_slice(work.work_id().as_bytes());
     validate_key(&key)?;
     Ok(key)
@@ -4612,6 +4624,122 @@ mod tests {
             after_block.status(work.work_id()).unwrap(),
             Some(ProjectionWorkStatus::Blocked)
         );
+    }
+
+    #[test]
+    fn case_alias_rename_retires_old_spelling_before_acquiring_new_spelling() {
+        let fixture = Fixture::new("case-alias-rename-order");
+        let graph_root = fixture.path.join("graph");
+        fs::create_dir_all(graph_root.join("pages")).unwrap();
+        let old_path = "pages/foo.md";
+        let new_path = "pages/Foo.md";
+        let base = b"- before\n";
+        let target = b"- after\n";
+        fs::write(graph_root.join(old_path), base).unwrap();
+        let graph = crate::Graph::open(&graph_root);
+        let _alias = crate::model::projection_case_alias_for_test(new_path, old_path);
+        let page_id = PageId::from_uuid(Uuid::from_u128(31_000));
+        let retirement = fixture.work_for_page(1, old_path, page_id, ProjectionWorkTarget::Absent);
+        let acquisition = fixture.work_for_page(
+            1,
+            new_path,
+            page_id,
+            ProjectionWorkTarget::Present(BlobDescription::of(target)),
+        );
+        assert_eq!(
+            retirement.portable_path_key_digest(),
+            acquisition.portable_path_key_digest()
+        );
+        let mut work = vec![retirement.clone(), acquisition.clone()];
+        work.sort_unstable_by_key(ProjectionWork::work_id);
+        let fingerprint = ContentDigest::of(retirement.batch_id().as_uuid().as_bytes());
+        fixture
+            .index
+            .prepare_batch(retirement.batch_id(), fingerprint, &work, &[])
+            .unwrap();
+        fixture
+            .index
+            .accept_batch(retirement.batch_id(), fingerprint)
+            .unwrap();
+
+        while let Some(next) = fixture.index.next().unwrap() {
+            let result = match next.target() {
+                ProjectionWorkTarget::Absent => {
+                    graph.remove_projection_exact(next.path().as_str(), base)
+                }
+                ProjectionWorkTarget::Present(_) => {
+                    graph.write_projection_exact(next.path().as_str(), None, target)
+                }
+            };
+            match result {
+                Ok(_) => {
+                    fixture
+                        .index
+                        .mark_completed(fixture.completion_authority(&next))
+                        .unwrap();
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::NotFound
+                    ) =>
+                {
+                    let observed = fs::read(graph_root.join(old_path))
+                        .ok()
+                        .map(|bytes| BlobDescription::of(&bytes));
+                    fixture
+                        .index
+                        .mark_blocked(ProjectionWorkBlockAuthority::guarded_conflict(
+                            &next,
+                            fixture.index.receipt_store_id(),
+                            observed,
+                        ))
+                        .unwrap();
+                }
+                Err(error) => panic!("unexpected projection error: {error}"),
+            }
+        }
+
+        assert_eq!(
+            fixture.index.status(retirement.work_id()).unwrap(),
+            Some(ProjectionWorkStatus::Completed)
+        );
+        assert_eq!(
+            fixture.index.status(acquisition.work_id()).unwrap(),
+            Some(ProjectionWorkStatus::Completed)
+        );
+        assert!(!graph_root.join(old_path).exists());
+        assert_eq!(fs::read(graph_root.join(new_path)).unwrap(), target);
+    }
+
+    #[test]
+    fn portable_alias_ready_order_covers_both_directions_and_unicode() {
+        let fixture = Fixture::new("portable-alias-neighbor-order");
+        let page_id = PageId::from_uuid(Uuid::from_u128(31_100));
+        for (old_path, new_path) in [
+            ("pages/foo.md", "pages/Foo.md"),
+            ("pages/Foo.md", "pages/foo.md"),
+            ("pages/Café.md", "pages/Cafe\u{301}.md"),
+            ("pages/Σ.md", "pages/ς.md"),
+        ] {
+            let retirement =
+                fixture.work_for_page(1, old_path, page_id, ProjectionWorkTarget::Absent);
+            let acquisition = fixture.work_for_page(
+                1,
+                new_path,
+                page_id,
+                ProjectionWorkTarget::Present(BlobDescription::of(b"target")),
+            );
+            assert_eq!(
+                retirement.portable_path_key_digest(),
+                acquisition.portable_path_key_digest(),
+                "{old_path} and {new_path} must share portable ownership"
+            );
+            assert!(
+                ready_key(&retirement).unwrap() < ready_key(&acquisition).unwrap(),
+                "{old_path} must retire before {new_path} acquires"
+            );
+        }
     }
 
     #[test]
@@ -5672,14 +5800,14 @@ mod tests {
     }
 
     #[test]
-    fn rejected_v8_claim_fails_closed_as_an_upgrade_without_writes() {
-        let fixture = Fixture::new("rejected-v8-claim");
+    fn rejected_prior_claim_fails_closed_as_an_upgrade_without_writes() {
+        let fixture = Fixture::new("rejected-prior-claim");
         let endpoint = fixture
             .path
             .join("projection-work-index-v1")
             .join(fixture.endpoint_id.to_string());
         let prior_claim = encode_canonical(&ProjectionIndexClaim {
-            schema_version: 8,
+            schema_version: INDEX_SCHEMA_VERSION - 1,
             workspace_id: fixture.workspace_id,
             endpoint_id: fixture.endpoint_id,
             graph_resource_id: fixture.graph_resource_id,
@@ -5692,9 +5820,10 @@ mod tests {
             .unwrap()
             .open_projection_work_index(fixture.binding())
             .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("version 8 requires upgrade to 9"));
+        assert!(error.to_string().contains(&format!(
+            "version {} requires upgrade to {INDEX_SCHEMA_VERSION}",
+            INDEX_SCHEMA_VERSION - 1
+        )));
     }
 
     #[test]

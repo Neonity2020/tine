@@ -3138,6 +3138,390 @@ fn manifested_guarded_conflict_is_the_proof_bearing_block_path() {
     );
 }
 
+#[test]
+fn manifested_semantic_refusals_block_initial_and_reserved_restart_attempts_then_drain() {
+    let dir = TestDir::new("manifested-semantic-refusal-liveness");
+    let graph_root = dir.path().join("graph");
+    fs::create_dir_all(graph_root.join("pages")).unwrap();
+    let graph = Graph::open(&graph_root);
+    let binding = projection_binding(&graph, 75_200);
+    let receipts_root = dir.path().join("receipts");
+    let receipts =
+        ProjectionReceiptStore::open_for_endpoint(&receipts_root, workspace(1), binding).unwrap();
+    let writer = ObjectStore::open(&dir.path().join("archive"), workspace(1)).unwrap();
+    let mut engine = ShardedHotEngine::with_enrolled_projection(
+        ObjectStore::open(&dir.path().join("archive"), workspace(1)).unwrap(),
+        LineageDigest::of(b"projection-test-lineage"),
+        DocumentId::from_uuid(uuid(700)),
+        &graph,
+        &receipts,
+    );
+    let initial_refusal_page = PageId::from_uuid(uuid(701));
+    let restart_refusal_page = PageId::from_uuid(uuid(704));
+    let initial = engine
+        .draft_author_transaction(
+            AuthorBatch {
+                batch_id: BatchId::from_uuid(uuid(75_201)),
+                author_device_id: binding.device_id(),
+                author_session_id: SessionId::from_uuid(uuid(75_202)),
+                crdt_peer_id: CrdtPeerId::from_u64(75_203),
+            },
+            BatchOrigin::LocalMutation,
+            &OperationTransaction::new(vec![
+                SemanticOperation::CreatePage {
+                    page_id: initial_refusal_page,
+                    home_document_id: DocumentId::from_uuid(uuid(702)),
+                    name: tine_core::oplog::LogicalPageName::parse("Initial refusal").unwrap(),
+                    path: ManagedPath::parse("pages/a-initial-refusal.md").unwrap(),
+                    kind: ManagedTextKind::Page,
+                },
+                SemanticOperation::SetPagePreamble {
+                    page_id: initial_refusal_page,
+                    preamble: Some("title:: retained initial".into()),
+                },
+                SemanticOperation::CreateBlock {
+                    block: BlockLocation {
+                        block_id: BlockId::from_uuid(uuid(703)),
+                        home_document_id: DocumentId::from_uuid(uuid(702)),
+                    },
+                    page_id: initial_refusal_page,
+                    parent: None,
+                    order: "a".into(),
+                    content: "before".into(),
+                },
+                SemanticOperation::CreatePage {
+                    page_id: restart_refusal_page,
+                    home_document_id: DocumentId::from_uuid(uuid(705)),
+                    name: tine_core::oplog::LogicalPageName::parse("Restart refusal").unwrap(),
+                    path: ManagedPath::parse("pages/b-restart-refusal.md").unwrap(),
+                    kind: ManagedTextKind::Page,
+                },
+                SemanticOperation::SetPagePreamble {
+                    page_id: restart_refusal_page,
+                    preamble: Some("title:: retained restart".into()),
+                },
+                SemanticOperation::CreateBlock {
+                    block: BlockLocation {
+                        block_id: BlockId::from_uuid(uuid(706)),
+                        home_document_id: DocumentId::from_uuid(uuid(705)),
+                    },
+                    page_id: restart_refusal_page,
+                    parent: None,
+                    order: "a".into(),
+                    content: "before".into(),
+                },
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+    let initial = engine
+        .finalize_author_transaction(initial, &graph, &receipts, binding)
+        .unwrap();
+    writer.publish_prepared(&initial).unwrap();
+    engine
+        .stage_archive_batch(BatchId::from_uuid(uuid(75_201)))
+        .unwrap();
+    for _ in 0..2 {
+        let initial_work = engine
+            .projection_work_index()
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        execute_manifested_projection_work(&graph, &receipts, &mut engine, &initial_work).unwrap();
+    }
+    assert_eq!(
+        fs::read(dir.path().join("graph/pages/a-initial-refusal.md")).unwrap(),
+        b"title:: retained initial\n\n- before\n"
+    );
+    assert_eq!(
+        fs::read(dir.path().join("graph/pages/b-restart-refusal.md")).unwrap(),
+        b"title:: retained restart\n\n- before\n"
+    );
+
+    let initial_external = fs::read(dir.path().join("graph/pages/a-initial-refusal.md")).unwrap();
+    let restart_external = fs::read(dir.path().join("graph/pages/b-restart-refusal.md")).unwrap();
+
+    let batch_id = BatchId::from_uuid(uuid(75_210));
+    let following_page = PageId::from_uuid(uuid(75_213));
+    let following_home = DocumentId::from_uuid(uuid(75_214));
+    let following_block = BlockId::from_uuid(uuid(75_215));
+    let draft = engine
+        .draft_author_transaction(
+            AuthorBatch {
+                batch_id,
+                author_device_id: binding.device_id(),
+                author_session_id: SessionId::from_uuid(uuid(75_211)),
+                crdt_peer_id: CrdtPeerId::from_u64(75_212),
+            },
+            BatchOrigin::LocalMutation,
+            &OperationTransaction::new(vec![
+                SemanticOperation::SetPagePreamble {
+                    page_id: initial_refusal_page,
+                    preamble: Some(String::new()),
+                },
+                SemanticOperation::EditBlockContent {
+                    block: BlockLocation {
+                        block_id: BlockId::from_uuid(uuid(703)),
+                        home_document_id: DocumentId::from_uuid(uuid(702)),
+                    },
+                    content: "moved:: initial property".into(),
+                },
+                SemanticOperation::SetPagePreamble {
+                    page_id: restart_refusal_page,
+                    preamble: Some(String::new()),
+                },
+                SemanticOperation::EditBlockContent {
+                    block: BlockLocation {
+                        block_id: BlockId::from_uuid(uuid(706)),
+                        home_document_id: DocumentId::from_uuid(uuid(705)),
+                    },
+                    content: "moved:: restart property".into(),
+                },
+                SemanticOperation::CreatePage {
+                    page_id: following_page,
+                    home_document_id: following_home,
+                    name: tine_core::oplog::LogicalPageName::parse("Following").unwrap(),
+                    path: ManagedPath::parse("pages/z-following.md").unwrap(),
+                    kind: ManagedTextKind::Page,
+                },
+                SemanticOperation::CreateBlock {
+                    block: BlockLocation {
+                        block_id: following_block,
+                        home_document_id: following_home,
+                    },
+                    page_id: following_page,
+                    parent: None,
+                    order: "a".into(),
+                    content: "following".into(),
+                },
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+    let prepared = engine
+        .finalize_author_transaction(draft, &graph, &receipts, binding)
+        .unwrap();
+    writer.publish_prepared(&prepared).unwrap();
+    assert!(matches!(
+        engine.stage_archive_batch(batch_id).unwrap().disposition(),
+        BatchDisposition::Accepted { .. }
+    ));
+    let ready = engine
+        .projection_work_index()
+        .unwrap()
+        .ready_page(None, 8)
+        .unwrap()
+        .work()
+        .to_vec();
+    assert_eq!(ready.len(), 3);
+    let initial_refusal = ready
+        .iter()
+        .find(|work| work.page_id() == initial_refusal_page)
+        .unwrap()
+        .clone();
+    let restart_refusal = ready
+        .iter()
+        .find(|work| work.page_id() == restart_refusal_page)
+        .unwrap()
+        .clone();
+    let following = ready
+        .iter()
+        .find(|work| work.page_id() == following_page)
+        .unwrap()
+        .clone();
+    assert_eq!(
+        engine
+            .projection_work_index()
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .work_id(),
+        initial_refusal.work_id()
+    );
+
+    let refusal =
+        execute_manifested_projection_work(&graph, &receipts, &mut engine, &initial_refusal)
+            .unwrap_err();
+    assert!(
+        matches!(
+            refusal,
+            ProjectionError::Io(ref error)
+                if error.kind() == std::io::ErrorKind::InvalidData
+                    && error.to_string().contains("refusing to drop an existing page preamble")
+        ),
+        "{refusal:?}"
+    );
+    assert_eq!(
+        engine
+            .projection_work_index()
+            .unwrap()
+            .status(initial_refusal.work_id())
+            .unwrap(),
+        Some(ProjectionWorkStatus::Blocked)
+    );
+    assert_eq!(
+        fs::read(dir.path().join("graph/pages/a-initial-refusal.md")).unwrap(),
+        initial_external
+    );
+    assert_eq!(
+        engine
+            .projection_work_index()
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .work_id(),
+        restart_refusal.work_id()
+    );
+
+    let restart_path = dir.path().join("graph/pages/b-restart-refusal.md");
+    let held_restart_path = dir
+        .path()
+        .join("graph/pages/b-restart-refusal.md.held-for-read-fault");
+    fs::rename(&restart_path, &held_restart_path).unwrap();
+    fs::create_dir(&restart_path).unwrap();
+    let interrupted =
+        execute_manifested_projection_work(&graph, &receipts, &mut engine, &restart_refusal)
+            .unwrap_err();
+    assert!(matches!(interrupted, ProjectionError::Io(_)));
+    fs::remove_dir(&restart_path).unwrap();
+    fs::rename(&held_restart_path, &restart_path).unwrap();
+    assert_eq!(
+        engine
+            .projection_work_index()
+            .unwrap()
+            .status(restart_refusal.work_id())
+            .unwrap(),
+        Some(ProjectionWorkStatus::Ready)
+    );
+    let restart_intent = receipts
+        .incomplete_intents()
+        .unwrap()
+        .into_iter()
+        .find(|intent| {
+            intent.page_id() == restart_refusal.page_id()
+                && intent.path() == restart_refusal.path()
+                && intent.frontier() == restart_refusal.post_frontier()
+        })
+        .unwrap();
+    assert_eq!(
+        receipts
+            .load_attempt_reservations(&restart_intent)
+            .unwrap()
+            .len(),
+        1,
+        "the crash cut must follow durable attempt reservation"
+    );
+    assert_eq!(
+        fs::read(dir.path().join("graph/pages/b-restart-refusal.md")).unwrap(),
+        restart_external
+    );
+
+    let manifests = writer.committed_manifests().unwrap();
+    drop(engine);
+    drop(receipts);
+    drop(graph);
+    let graph = Graph::open(&graph_root);
+    let receipts =
+        ProjectionReceiptStore::open_for_endpoint(&receipts_root, workspace(1), binding).unwrap();
+    let (mut restarted, outcomes) = ShardedHotEngine::open_enrolled_projection(
+        ObjectStore::open(&dir.path().join("archive"), workspace(1)).unwrap(),
+        LineageDigest::of(b"projection-test-lineage"),
+        DocumentId::from_uuid(uuid(700)),
+        &graph,
+        &receipts,
+        &manifests,
+    )
+    .unwrap();
+    assert_eq!(outcomes.len(), manifests.len());
+    assert_eq!(
+        restarted
+            .projection_work_index()
+            .unwrap()
+            .status(initial_refusal.work_id())
+            .unwrap(),
+        Some(ProjectionWorkStatus::Blocked)
+    );
+    assert_eq!(
+        restarted
+            .projection_work_index()
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .work_id(),
+        restart_refusal.work_id()
+    );
+
+    let refusal =
+        execute_manifested_projection_work(&graph, &receipts, &mut restarted, &restart_refusal)
+            .unwrap_err();
+    assert!(
+        matches!(
+            refusal,
+            ProjectionError::Io(ref error)
+                if error.kind() == std::io::ErrorKind::InvalidData
+                    && error.to_string().contains("refusing to drop an existing page preamble")
+        ),
+        "{refusal:?}"
+    );
+    assert_eq!(
+        restarted
+            .projection_work_index()
+            .unwrap()
+            .status(restart_refusal.work_id())
+            .unwrap(),
+        Some(ProjectionWorkStatus::Blocked)
+    );
+    assert_eq!(
+        fs::read(dir.path().join("graph/pages/a-initial-refusal.md")).unwrap(),
+        initial_external
+    );
+    assert_eq!(
+        fs::read(dir.path().join("graph/pages/b-restart-refusal.md")).unwrap(),
+        restart_external
+    );
+    assert_eq!(
+        restarted
+            .projection_work_index()
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .work_id(),
+        following.work_id()
+    );
+    execute_manifested_projection_work(&graph, &receipts, &mut restarted, &following).unwrap();
+    assert_eq!(
+        restarted
+            .projection_work_index()
+            .unwrap()
+            .status(following.work_id())
+            .unwrap(),
+        Some(ProjectionWorkStatus::Completed)
+    );
+    assert!(restarted
+        .projection_work_index()
+        .unwrap()
+        .next()
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        fs::read(dir.path().join("graph/pages/a-initial-refusal.md")).unwrap(),
+        initial_external
+    );
+    assert_eq!(
+        fs::read(dir.path().join("graph/pages/b-restart-refusal.md")).unwrap(),
+        restart_external
+    );
+    assert_eq!(
+        fs::read(dir.path().join("graph/pages/z-following.md")).unwrap(),
+        b"- following\n"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn graph_resource_identity_survives_move_but_rejects_symlink_and_path_substitution() {

@@ -2285,9 +2285,6 @@ pub(crate) mod simulator_harness {
             paths: &[String],
             fault: Option<CoordinatorFault>,
         ) -> Result<(), String> {
-            if let Some(point) = fault {
-                install_fault(point);
-            }
             let graph = self.graph.as_ref().ok_or("coordinator graph is closed")?;
             let receipts = self
                 .receipts
@@ -2300,6 +2297,7 @@ pub(crate) mod simulator_harness {
                 .ok_or("coordinator SQLite is closed")?;
             let tail = self.tail.as_mut().ok_or("coordinator tail is closed")?;
             let requested = paths.iter().map(String::as_str).collect::<Vec<_>>();
+            let _fault_scope = fault.and_then(install_fault);
             match OperationalCoordinator::execute(
                 &LocalRuntimeAdmission::unenrolled_pre_activation(),
                 graph,
@@ -2346,9 +2344,6 @@ pub(crate) mod simulator_harness {
             if self.failed.is_none() && self.enrollment_pending_unprotected {
                 return self.recover_reopened(fault);
             }
-            if let Some(point) = fault {
-                install_fault(point);
-            }
             let failed = self
                 .failed
                 .take()
@@ -2364,6 +2359,7 @@ pub(crate) mod simulator_harness {
                 .as_ref()
                 .ok_or("coordinator receipts are closed")?;
             let engine = self.engine.as_mut().ok_or("coordinator engine is closed")?;
+            let _fault_scope = fault.and_then(install_fault);
             match failed.retry(
                 &LocalRuntimeAdmission::unenrolled_pre_activation(),
                 graph,
@@ -2531,15 +2527,13 @@ pub(crate) mod simulator_harness {
         }
 
         fn recover_reopened(&mut self, fault: Option<CoordinatorFault>) -> Result<(), String> {
-            if let Some(point) = fault {
-                install_fault(point);
-            }
             let graph = self.graph.as_ref().ok_or("coordinator graph is closed")?;
             let receipts = self
                 .receipts
                 .as_ref()
                 .ok_or("coordinator receipts are closed")?;
             let engine = self.engine.as_mut().ok_or("coordinator engine is closed")?;
+            let _fault_scope = fault.and_then(install_fault);
             loop {
                 let work = engine
                     .projection_work_index()
@@ -2841,18 +2835,26 @@ pub(crate) mod simulator_harness {
         }
     }
 
-    fn install_fault(point: CoordinatorFault) {
+    fn install_fault(
+        point: CoordinatorFault,
+    ) -> Option<super::super::projection::ManifestedProjectionFaultScope> {
         match point {
             CoordinatorFault::AfterObjects => {
-                super::super::object_store::fail_next_publish_after_objects_for_harness()
+                super::super::object_store::fail_next_publish_after_objects_for_harness();
+                None
             }
             CoordinatorFault::DuringSqliteApply => {
-                super::super::sqlite::fail_next_apply_during_materialization_for_harness()
+                super::super::sqlite::fail_next_apply_during_materialization_for_harness();
+                None
             }
-            CoordinatorFault::DuringProjection => {
-                super::super::projection::fail_next_manifested_projection_during_write_for_harness()
+            CoordinatorFault::DuringProjection => Some(
+                super::super::projection::fail_next_manifested_projection_during_write_for_harness(
+                ),
+            ),
+            point => {
+                fail_once_at(fault_point(point).expect("ordinary coordinator fault point"));
+                None
             }
-            point => fail_once_at(fault_point(point).expect("ordinary coordinator fault point")),
         }
     }
 

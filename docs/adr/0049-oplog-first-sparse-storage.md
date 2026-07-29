@@ -195,7 +195,7 @@ versions are:
 | Engine-history record / durable root / index | 7 / 5 / 1 |
 | Engine scratch / scratch page | 9 / 1 |
 | Manifested projection intent / annotated base | 2 / 1 |
-| Projection work row / index | 3 / 5 |
+| Projection work row / index | 3 / 10 |
 | Projection-store claim | 5 |
 | Materialization input | 2 |
 | SQLite schema | 8 |
@@ -347,6 +347,12 @@ point-keyed by endpoint/batch/page/path, deterministically ordered, idempotent
 under duplicate/reordered delivery, and recovered directly. Remote-source work
 creates no executable row. Same-path work is superseded only by a causally
 containing frontier; incomparable work is retained.
+
+Ready ordering groups work by the versioned portable path key. Within one
+batch/page/key, retirement (`Absent`) precedes acquisition (`Present`), so a
+case-only or canonically equivalent rename cannot independently schedule the
+new spelling against the still-present old inode on a case-insensitive
+filesystem.
 
 Operations, intent, base, and work are durable before the singular guarded
 `Graph` page write/removal boundary runs. Stable completion references

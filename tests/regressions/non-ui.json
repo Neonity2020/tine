@@ -1621,6 +1621,54 @@
         "failBefore": "proven"
       },
       "notes": "The page and journal regressions change config.edn, reopen from archived authority, apply the external reconciliation transaction, reopen a second time, and assert PageId, accepted logical name, semantic kind, textual referrers, and new-path policy. Every authenticated current-path row is point-checked against exact materialized catalog PageId state before join or import consumption; wrong name digest or kind fails before execution material exists, including after retained-run adoption. Scratch schema 12 and authenticated current-path catalog schema 1 transition to 13 and 2; a schema-12 retained run named by a valid resume point is preserved, refused, and rebuilt only by full immutable-history replay. A real old-path to new-path move still adopts the destination decode, and explicit Tine rename remains the graph-wide RenamePagesAndRewriteReferrers operation."
+    },
+    {
+      "id": "REG-SYNC-PROJECTION-R6-DETERMINISTIC-REFUSAL-LIVENESS-001",
+      "title": "A deterministic projection refusal terminalizes its durable work so restart can drain following pages",
+      "family": "sync-data-safety",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/tests/oplog_projection.rs"
+        ],
+        "scenario": "sync.projection-r6-deterministic-refusal-liveness",
+        "failBefore": "proven"
+      },
+      "notes": "A manifested batch creates two deterministic serializer-firewall refusals plus following work. The first refusal proves the initial-execution cut; the second is interrupted by the real post-reservation/pre-writer fault and reopened from durable engine/receipt state. Both exact graph files remain byte-identical, both Ready rows become evidence-bound Blocked, and authenticated restart selects and completes the following page. The refusal is the production page-preamble corruption firewall; a direct local edit over externally divergent non-round-tripping Org is rejected earlier by the reconciliation gate."
+    },
+    {
+      "id": "REG-SYNC-PROJECTION-R6-PORTABLE-ALIAS-RENAME-ORDER-001",
+      "title": "Case-only page renames retire the old portable-path owner before acquiring the new spelling",
+      "family": "sync-data-safety",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all",
+        "macos",
+        "windows"
+      ],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/model.rs",
+          "crates/tine-core/src/oplog/projection_work_index.rs",
+          "crates/tine-core/tests/oplog_projection.rs"
+        ],
+        "scenario": "sync.projection-r6-portable-alias-rename-order",
+        "failBefore": "proven"
+      },
+      "notes": "A test-only exact-path alias hook models case-insensitive lookup without changing production path resolution: acquiring pages/Foo.md while pages/foo.md owns the same portable key observes the old inode and conflicts, after which retiring the old spelling leaves the page absent. Scheduler coverage requires the old Absent work before the new Present work for both casing directions and neighboring Unicode portable aliases; platform-gated integration coverage exercises the native case-insensitive filesystem when available."
     }
   ]
 }

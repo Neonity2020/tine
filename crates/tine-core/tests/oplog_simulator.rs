@@ -4203,6 +4203,267 @@ fn coordinator_v5_projection_failure_after_acceptance_recovers_without_reaccepti
 }
 
 #[test]
+fn coordinator_projection_fault_does_not_escape_an_early_public_simulator_error() {
+    let ids = Ids::new();
+    let crashed_path = "pages/projection-fault-scope/crashed.md";
+    let crashed = Scenario::from_schedule(
+        "coordinator-projection-fault-scope-crashed",
+        50_407,
+        ids.workspace(),
+        vec![device("alpha", 1)],
+        Vec::new(),
+        Vec::new(),
+        vec![
+            event(
+                1,
+                ScheduledActionKind::Coordinator {
+                    device: "alpha".into(),
+                    action: CoordinatorAction::Setup {
+                        managed_path: crashed_path.into(),
+                        kind: ManagedTextKind::Page,
+                        config_edn: None,
+                    },
+                },
+            ),
+            event(
+                2,
+                ScheduledActionKind::Coordinator {
+                    device: "alpha".into(),
+                    action: CoordinatorAction::Crash,
+                },
+            ),
+            event(
+                3,
+                ScheduledActionKind::Coordinator {
+                    device: "alpha".into(),
+                    action: CoordinatorAction::Execute {
+                        paths: vec![crashed_path.into()],
+                        fault: Some(CoordinatorFault::DuringProjection),
+                    },
+                },
+            ),
+        ],
+        Vec::new(),
+        Vec::new(),
+    )
+    .unwrap();
+    let mut crashed_simulator = DeterministicSimulator::new(crashed).unwrap();
+    assert!(matches!(
+        crashed_simulator.run(),
+        Err(ScenarioError::Coordinator(error))
+            if error.contains("coordinator graph is closed")
+    ));
+
+    let healthy_path = "pages/projection-fault-scope/healthy.md";
+    let healthy = Scenario::from_schedule(
+        "coordinator-projection-fault-scope-healthy",
+        50_408,
+        ids.workspace(),
+        vec![device("alpha", 1)],
+        Vec::new(),
+        Vec::new(),
+        vec![
+            event(
+                1,
+                ScheduledActionKind::Coordinator {
+                    device: "alpha".into(),
+                    action: CoordinatorAction::Setup {
+                        managed_path: healthy_path.into(),
+                        kind: ManagedTextKind::Page,
+                        config_edn: None,
+                    },
+                },
+            ),
+            event(
+                2,
+                ScheduledActionKind::Coordinator {
+                    device: "alpha".into(),
+                    action: CoordinatorAction::ExternalWrite {
+                        path: healthy_path.into(),
+                        bytes_b64: WireBytes(b"- real projection after simulator error\n".to_vec()),
+                    },
+                },
+            ),
+            event(
+                3,
+                ScheduledActionKind::Coordinator {
+                    device: "alpha".into(),
+                    action: CoordinatorAction::Execute {
+                        paths: vec![healthy_path.into()],
+                        fault: None,
+                    },
+                },
+            ),
+            event(
+                4,
+                ScheduledActionKind::Coordinator {
+                    device: "alpha".into(),
+                    action: CoordinatorAction::Assert {
+                        oracle: CoordinatorOracle {
+                            accepted_sequence: Some(2),
+                            sqlite_sequence: Some(2),
+                            frontiers_match: Some(true),
+                            pending_projection_work: Some(0),
+                            tail_unapplied_batches: Some(0),
+                            tail_retained_bytes: Some(0),
+                            handoff: Some(CoordinatorHandoffState::Released),
+                            read_gate: Some(CoordinatorReadGate::Open),
+                            last_outcome: Some(CoordinatorRunOutcome::Complete),
+                            ..CoordinatorOracle::default()
+                        },
+                    },
+                },
+            ),
+        ],
+        Vec::new(),
+        Vec::new(),
+    )
+    .unwrap();
+    let mut healthy_simulator = DeterministicSimulator::new(healthy).unwrap();
+    healthy_simulator.run().unwrap();
+}
+
+#[test]
+fn coordinator_projection_fault_can_be_consumed_repeatedly_without_residue() {
+    let ids = Ids::new();
+    let path = "pages/projection-fault-scope/repeated.md";
+    let scenario = Scenario::from_schedule(
+        "coordinator-projection-fault-scope-repeated",
+        50_409,
+        ids.workspace(),
+        vec![device("alpha", 1)],
+        Vec::new(),
+        Vec::new(),
+        vec![
+            event(
+                1,
+                ScheduledActionKind::Coordinator {
+                    device: "alpha".into(),
+                    action: CoordinatorAction::Setup {
+                        managed_path: path.into(),
+                        kind: ManagedTextKind::Page,
+                        config_edn: None,
+                    },
+                },
+            ),
+            event(
+                2,
+                ScheduledActionKind::Coordinator {
+                    device: "alpha".into(),
+                    action: CoordinatorAction::ExternalWrite {
+                        path: path.into(),
+                        bytes_b64: WireBytes(b"- repeated scoped projection fault\n".to_vec()),
+                    },
+                },
+            ),
+            event(
+                3,
+                ScheduledActionKind::Coordinator {
+                    device: "alpha".into(),
+                    action: CoordinatorAction::Execute {
+                        paths: vec![path.into()],
+                        fault: Some(CoordinatorFault::DuringProjection),
+                    },
+                },
+            ),
+            event(
+                4,
+                ScheduledActionKind::Coordinator {
+                    device: "alpha".into(),
+                    action: CoordinatorAction::Retry { fault: None },
+                },
+            ),
+            event(
+                5,
+                ScheduledActionKind::Coordinator {
+                    device: "alpha".into(),
+                    action: CoordinatorAction::Execute {
+                        paths: vec![path.into()],
+                        fault: Some(CoordinatorFault::DuringProjection),
+                    },
+                },
+            ),
+            event(
+                6,
+                ScheduledActionKind::Coordinator {
+                    device: "alpha".into(),
+                    action: CoordinatorAction::ExternalWrite {
+                        path: path.into(),
+                        bytes_b64: WireBytes(
+                            b"- real projection after successful faulted no-op\n".to_vec(),
+                        ),
+                    },
+                },
+            ),
+            event(
+                7,
+                ScheduledActionKind::Coordinator {
+                    device: "alpha".into(),
+                    action: CoordinatorAction::Execute {
+                        paths: vec![path.into()],
+                        fault: None,
+                    },
+                },
+            ),
+            event(
+                8,
+                ScheduledActionKind::Coordinator {
+                    device: "alpha".into(),
+                    action: CoordinatorAction::ExternalWrite {
+                        path: path.into(),
+                        bytes_b64: WireBytes(
+                            b"- second repeated scoped projection fault\n".to_vec(),
+                        ),
+                    },
+                },
+            ),
+            event(
+                9,
+                ScheduledActionKind::Coordinator {
+                    device: "alpha".into(),
+                    action: CoordinatorAction::Execute {
+                        paths: vec![path.into()],
+                        fault: Some(CoordinatorFault::DuringProjection),
+                    },
+                },
+            ),
+            event(
+                10,
+                ScheduledActionKind::Coordinator {
+                    device: "alpha".into(),
+                    action: CoordinatorAction::Retry { fault: None },
+                },
+            ),
+            event(
+                11,
+                ScheduledActionKind::Coordinator {
+                    device: "alpha".into(),
+                    action: CoordinatorAction::Assert {
+                        oracle: CoordinatorOracle {
+                            accepted_sequence: Some(4),
+                            sqlite_sequence: Some(4),
+                            frontiers_match: Some(true),
+                            pending_projection_work: Some(0),
+                            tail_unapplied_batches: Some(0),
+                            tail_retained_bytes: Some(0),
+                            handoff: Some(CoordinatorHandoffState::Released),
+                            read_gate: Some(CoordinatorReadGate::Open),
+                            last_outcome: Some(CoordinatorRunOutcome::Complete),
+                            ..CoordinatorOracle::default()
+                        },
+                    },
+                },
+            ),
+        ],
+        Vec::new(),
+        Vec::new(),
+    )
+    .unwrap();
+    let mut simulator = DeterministicSimulator::new(scenario).unwrap();
+    simulator.run().unwrap();
+}
+
+#[test]
 fn coordinator_v5_crash_reopen_reconstructs_every_durable_boundary_idempotently() {
     let boundaries = std::iter::once((CoordinatorFault::AfterObjects, false))
         .chain(

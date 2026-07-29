@@ -301,6 +301,27 @@ struct ProjectionTarget {
     filename: String,
 }
 
+#[derive(Debug)]
+struct ProjectionSemanticRefusal(String);
+
+impl std::fmt::Display for ProjectionSemanticRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ProjectionSemanticRefusal {}
+
+fn projection_semantic_refusal(kind: io::ErrorKind, message: impl Into<String>) -> io::Error {
+    io::Error::new(kind, ProjectionSemanticRefusal(message.into()))
+}
+
+pub(crate) fn is_projection_semantic_refusal(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|source| source.is::<ProjectionSemanticRefusal>())
+}
+
 /// One lexical/scope validation result shared by exact points and feed events.
 ///
 /// This deliberately has no twin path. `.markdown` is one exact physical
@@ -328,9 +349,21 @@ fn validate_projection_attempt(
     target: &ProjectionTarget,
     attempt: &ProjectionAttemptReservation,
 ) -> io::Result<()> {
+    #[cfg(test)]
+    let filename = if projection_case_alias_is_armed(&target.relative_path) {
+        target
+            .relative_path
+            .rsplit('/')
+            .next()
+            .expect("validated projection path has a filename")
+    } else {
+        &target.filename
+    };
+    #[cfg(not(test))]
+    let filename = &target.filename;
     let expected = format!(
         ".{}.{}.projection.recovery",
-        target.filename,
+        filename,
         attempt.attempt_id().simple()
     );
     if attempt.target_path().as_str() != target.relative_path
@@ -3038,6 +3071,7 @@ thread_local! {
     static PROJECTION_RECOVERY_FINAL_RETIREMENT: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static PROJECTION_RECOVERY_AFTER_FINAL_REREAD: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static PROJECTION_PARENT_RETARGET: std::cell::RefCell<Option<ProjectionParentRetarget>> = const { std::cell::RefCell::new(None) };
+    static PROJECTION_CASE_ALIAS: std::cell::RefCell<Option<(String, String)>> = const { std::cell::RefCell::new(None) };
     static FAIL_NEXT_PROJECTION_DIRECTORY_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static TEST_PROJECTION_ATTEMPTS: std::cell::RefCell<std::collections::BTreeMap<String, Vec<ProjectionAttemptReservation>>> = const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
     static PROJECTION_EXACT_OPEN_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -3066,6 +3100,57 @@ thread_local! {
     static GRAPH_TEXT_EVENT_REVALIDATION_RACE: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static GRAPH_TEXT_EXACT_FEED_AFTER_PREFLIGHT: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static GRAPH_TEXT_EXACT_FEED_PREPARE_PATH: std::cell::RefCell<Option<Box<dyn FnMut(&str) -> io::Result<()>>>> = std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+pub(crate) struct ProjectionCaseAliasGuard;
+
+#[cfg(test)]
+impl Drop for ProjectionCaseAliasGuard {
+    fn drop(&mut self) {
+        PROJECTION_CASE_ALIAS.with(|alias| {
+            alias.borrow_mut().take();
+        });
+    }
+}
+
+/// Model a case-insensitive exact-path lookup without changing production path
+/// resolution. While `existing` is present, resolving `requested` addresses
+/// that exact physical spelling; after retirement, a create uses `requested`.
+#[cfg(test)]
+pub(crate) fn projection_case_alias_for_test(
+    requested: &str,
+    existing: &str,
+) -> ProjectionCaseAliasGuard {
+    PROJECTION_CASE_ALIAS.with(|alias| {
+        let mut alias = alias.borrow_mut();
+        assert!(
+            alias.is_none(),
+            "projection case-alias hook is already armed"
+        );
+        *alias = Some((requested.to_owned(), existing.to_owned()));
+    });
+    ProjectionCaseAliasGuard
+}
+
+#[cfg(test)]
+fn projection_case_alias_physical_path(root: &Path, requested: &str) -> Option<String> {
+    PROJECTION_CASE_ALIAS.with(|alias| {
+        let alias = alias.borrow();
+        let (hook_requested, existing) = alias.as_ref()?;
+        (hook_requested == requested && fs::symlink_metadata(root.join(existing)).is_ok())
+            .then(|| existing.clone())
+    })
+}
+
+#[cfg(test)]
+fn projection_case_alias_is_armed(requested: &str) -> bool {
+    PROJECTION_CASE_ALIAS.with(|alias| {
+        alias
+            .borrow()
+            .as_ref()
+            .is_some_and(|(hook_requested, _)| hook_requested == requested)
+    })
 }
 
 #[cfg(test)]
@@ -3338,6 +3423,7 @@ pub(crate) fn reset_projection_graph_test_hooks() {
     PROJECTION_RECOVERY_FINAL_RETIREMENT.with(|hook| drop(hook.borrow_mut().take()));
     PROJECTION_RECOVERY_AFTER_FINAL_REREAD.with(|hook| drop(hook.borrow_mut().take()));
     PROJECTION_PARENT_RETARGET.with(|retarget| drop(retarget.borrow_mut().take()));
+    PROJECTION_CASE_ALIAS.with(|alias| drop(alias.borrow_mut().take()));
     FAIL_NEXT_PROJECTION_DIRECTORY_SYNC.with(|fail| fail.set(false));
     TEST_PROJECTION_ATTEMPTS.with(|catalog| catalog.borrow_mut().clear());
     PROJECTION_EXACT_OPEN_COUNT.with(|count| count.set(0));
@@ -9472,12 +9558,33 @@ impl Graph {
             .iter()
             .map(|component| (*component).to_owned())
             .collect::<Vec<_>>();
-        Ok(ProjectionTarget {
+        let target = ProjectionTarget {
             absolute_path: self.root.join(relative_path),
             relative_path: relative_path.to_owned(),
             parent_components,
             filename: (*filename).to_owned(),
-        })
+        };
+        #[cfg(test)]
+        {
+            let mut target = target;
+            if let Some(physical_path) =
+                projection_case_alias_physical_path(&self.root, relative_path)
+            {
+                let physical_components = physical_path.split('/').collect::<Vec<_>>();
+                target.absolute_path = self.root.join(&physical_path);
+                target.parent_components = physical_components[..physical_components.len() - 1]
+                    .iter()
+                    .map(|component| (*component).to_owned())
+                    .collect();
+                target.filename = physical_components
+                    .last()
+                    .expect("test alias path has a filename")
+                    .to_string();
+            }
+            return Ok(target);
+        }
+        #[cfg(not(test))]
+        Ok(target)
     }
 
     fn graph_text_exact_path(
@@ -14361,20 +14468,20 @@ impl Graph {
     ) -> io::Result<ProjectionWriteProof> {
         require_projection_platform()?;
         if usize_to_u64(target.len())? > MAX_PROJECTION_EVIDENCE_BYTES {
-            return Err(io::Error::new(
+            return Err(projection_semantic_refusal(
                 io::ErrorKind::InvalidData,
                 "projection target exceeds the evidence reload bound",
             ));
         }
         let target_text = std::str::from_utf8(target).map_err(|_| {
-            io::Error::new(
+            projection_semantic_refusal(
                 io::ErrorKind::InvalidInput,
                 "projection target is not valid UTF-8",
             )
         })?;
         if let Some(base) = expected_base {
             std::str::from_utf8(base).map_err(|_| {
-                io::Error::new(
+                projection_semantic_refusal(
                     io::ErrorKind::InvalidInput,
                     "projection base is not valid UTF-8",
                 )
@@ -14401,30 +14508,6 @@ impl Graph {
         preflight_projection_chain(&parent.chain)?;
 
         let current = read_projection_optional(parent.final_dir(), &target_path.filename)?;
-        let current_text = current
-            .as_deref()
-            .map(std::str::from_utf8)
-            .transpose()
-            .map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "projection base is not valid UTF-8",
-                )
-            })?;
-        let target_doc = parse_doc(&target_path.absolute_path, target_text);
-        let serialization_base =
-            current_text.or_else(|| expected_base.and_then(|base| std::str::from_utf8(base).ok()));
-        let (_, guarded_target) = self.serialize_page_document(
-            target_doc,
-            &target_path.absolute_path,
-            serialization_base,
-        )?;
-        if guarded_target.as_bytes() != target {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "manifested projection target differs from guarded page serialization",
-            ));
-        }
         let resumed_retirement = current.is_none()
             && expected_base.is_some()
             && self
@@ -14446,6 +14529,30 @@ impl Graph {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "projection target is already visible; use exact recovery",
+            ));
+        }
+        let current_text = current
+            .as_deref()
+            .map(std::str::from_utf8)
+            .transpose()
+            .map_err(|_| {
+                projection_semantic_refusal(
+                    io::ErrorKind::InvalidData,
+                    "projection base is not valid UTF-8",
+                )
+            })?;
+        let target_doc = parse_doc(&target_path.absolute_path, target_text);
+        let serialization_base =
+            current_text.or_else(|| expected_base.and_then(|base| std::str::from_utf8(base).ok()));
+        let (_, guarded_target) = self.serialize_page_document(
+            target_doc,
+            &target_path.absolute_path,
+            serialization_base,
+        )?;
+        if guarded_target.as_bytes() != target {
+            return Err(projection_semantic_refusal(
+                io::ErrorKind::InvalidData,
+                "manifested projection target differs from guarded page serialization",
             ));
         }
         match parent
@@ -15157,7 +15264,7 @@ impl Graph {
     }
 
     #[cfg(test)]
-    fn write_projection_exact(
+    pub(super) fn write_projection_exact(
         &self,
         relative_path: &str,
         expected_base: Option<&[u8]>,
@@ -15184,7 +15291,7 @@ impl Graph {
     }
 
     #[cfg(test)]
-    fn remove_projection_exact(
+    pub(crate) fn remove_projection_exact(
         &self,
         relative_path: &str,
         expected_base: &[u8],
@@ -15795,7 +15902,7 @@ impl Graph {
             ));
         }
         let expected_target_text = std::str::from_utf8(expected_target).map_err(|_| {
-            io::Error::new(
+            projection_semantic_refusal(
                 io::ErrorKind::InvalidInput,
                 "projection recovery target is not valid UTF-8",
             )
@@ -15811,7 +15918,7 @@ impl Graph {
             .map(std::str::from_utf8)
             .transpose()
             .map_err(|_| {
-                io::Error::new(
+                projection_semantic_refusal(
                     io::ErrorKind::InvalidData,
                     "projection recovery base is not valid UTF-8",
                 )
@@ -15820,7 +15927,7 @@ impl Graph {
         let (_, guarded_target) =
             self.serialize_page_document(target_doc, &target_path.absolute_path, base_text)?;
         if guarded_target.as_bytes() != expected_target {
-            return Err(io::Error::new(
+            return Err(projection_semantic_refusal(
                 io::ErrorKind::InvalidData,
                 "replayed projection target differs from guarded page serialization",
             ));
@@ -17365,13 +17472,13 @@ impl Graph {
                 && doc.pre_block.as_deref().unwrap_or("").is_empty()
                 && first_root_is_promotable_page_header(&doc)
             {
-                return Err(io::Error::new(
+                return Err(projection_semantic_refusal(
                     io::ErrorKind::InvalidData,
                     "refusing to drop an existing page preamble while authoring page-header properties",
                 ));
             }
             if let Some(line) = newly_reclassified_page_property_line(existing, &doc) {
-                return Err(io::Error::new(
+                return Err(projection_semantic_refusal(
                     io::ErrorKind::InvalidData,
                     format!("refusing to move page-header property into outline content: {line}"),
                 ));
@@ -17428,7 +17535,7 @@ impl Graph {
                 // the block bodies carry their verbatim text, including any `\r`.
                 if let Some(e) = existing {
                     if !crate::org::org_editable(e) {
-                        return Err(io::Error::new(
+                        return Err(projection_semantic_refusal(
                             io::ErrorKind::PermissionDenied,
                             "org file is read-only (does not round-trip)",
                         ));
@@ -37652,6 +37759,56 @@ mod tests {
             .unwrap();
         assert_eq!(proof.bytes(), b"- after\r\n");
         assert_eq!(fs::read(&crlf_path).unwrap(), b"- after\r\n");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn projection_semantic_refusal_marker_excludes_transient_io() {
+        let policy = projection_semantic_refusal(
+            io::ErrorKind::InvalidData,
+            "deterministic serialization policy refusal",
+        );
+        assert!(is_projection_semantic_refusal(&policy));
+        for kind in [
+            io::ErrorKind::Interrupted,
+            io::ErrorKind::WouldBlock,
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::PermissionDenied,
+        ] {
+            assert!(
+                !is_projection_semantic_refusal(&io::Error::new(kind, "filesystem failure")),
+                "{kind:?} I/O must remain retryable"
+            );
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn native_case_alias_requires_retirement_before_new_spelling() {
+        let dir = scratch("projection-native-case-alias");
+        let old = dir.join("pages/foo.md");
+        let new = dir.join("pages/Foo.md");
+        let base = b"- before\n";
+        let target = b"- after\n";
+        fs::write(&old, base).unwrap();
+        if fs::symlink_metadata(&new).is_err() {
+            let _ = fs::remove_dir_all(&dir);
+            return;
+        }
+        let graph = Graph::open(&dir);
+
+        let conflict = graph
+            .write_projection_exact("pages/Foo.md", None, target)
+            .unwrap_err();
+        assert_eq!(conflict.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&old).unwrap(), base);
+
+        graph.remove_projection_exact("pages/foo.md", base).unwrap();
+        graph
+            .write_projection_exact("pages/Foo.md", None, target)
+            .unwrap();
+        assert_eq!(fs::read(&new).unwrap(), target);
 
         let _ = fs::remove_dir_all(&dir);
     }
