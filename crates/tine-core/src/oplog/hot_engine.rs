@@ -13048,12 +13048,22 @@ impl ShardedHotEngine {
         &self,
         batch_id: BatchId,
     ) -> Result<bool, EngineError> {
+        Ok(self.accepted_frontier_batch_no_op(batch_id)?.is_some())
+    }
+
+    /// Return the accepted no-op bit only after proving the batch's exact
+    /// membership in the current authenticated accepted authority.
+    pub(crate) fn accepted_frontier_batch_no_op(
+        &self,
+        batch_id: BatchId,
+    ) -> Result<Option<bool>, EngineError> {
         self.begin_point_operation();
         if let Some(error) = &self.history_failure {
             return Err(error.clone());
         }
-        let Some(ArchiveStatus::Accepted { evidence, .. }) = self.archive_status(batch_id)? else {
-            return Ok(false);
+        let Some(ArchiveStatus::Accepted { no_op, evidence }) = self.archive_status(batch_id)?
+        else {
+            return Ok(None);
         };
         if evidence.batch_id() != batch_id
             || evidence.acceptance_sequence() == 0
@@ -13101,7 +13111,43 @@ impl ShardedHotEngine {
                 "inline accepted status has no current accepted membership".into(),
             ));
         }
-        Ok(true)
+        Ok(Some(no_op))
+    }
+
+    /// Whether the exact accepted batch is permitted to have no ordinary
+    /// provider manifest. No-op status comes from authenticated accepted
+    /// membership; non-no-op exemption additionally requires the batch's
+    /// sealed durable history record to identify the promoted bootstrap.
+    pub(crate) fn accepted_frontier_batch_allows_manifestless_provider(
+        &self,
+        batch_id: BatchId,
+    ) -> Result<Option<bool>, EngineError> {
+        let Some(no_op) = self.accepted_frontier_batch_no_op(batch_id)? else {
+            return Ok(None);
+        };
+        if no_op {
+            return Ok(Some(true));
+        }
+        let record = self.sealed_history_record(batch_id)?.ok_or_else(|| {
+            EngineError::Archive(format!(
+                "accepted batch {batch_id} has no sealed durable history record"
+            ))
+        })?;
+        let ArchiveStatus::Accepted {
+            no_op: record_no_op,
+            evidence,
+        } = &record.status
+        else {
+            return Err(EngineError::Archive(format!(
+                "accepted batch {batch_id} disagrees with sealed durable history"
+            )));
+        };
+        if *record_no_op || evidence.batch_id() != batch_id {
+            return Err(EngineError::Archive(format!(
+                "accepted batch {batch_id} has conflicting sealed durable history"
+            )));
+        }
+        Ok(Some(record.bootstrap.is_some()))
     }
 
     fn validate_record_catalog_transition(

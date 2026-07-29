@@ -5280,41 +5280,95 @@ impl RuntimeActor {
         {
             return Ok(());
         }
-        let accepted = self
-            .runtime
-            .as_ref()
-            .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
-            .engine()
-            .accepted_frontier_contains_batch_effects(batch_id)
-            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
-        if !accepted {
-            return self.queue_provider_direct_manifest(batch_id);
-        }
-        if provider_manifest_present(
-            self.provider
-                .as_ref()
-                .ok_or(SyncRuntimeRequestError::ActorUnavailable)?,
-            descriptor,
-            batch_id,
-        )? {
-            return Ok(());
-        }
         match store
             .inspect_batch(batch_id)
             .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
         {
-            crate::oplog::BatchInspection::Ready(_) => self.record_provider_publication(batch_id),
+            crate::oplog::BatchInspection::Ready(_) => {
+                let accepted = self
+                    .runtime
+                    .as_ref()
+                    .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
+                    .engine()
+                    .accepted_frontier_contains_batch_effects(batch_id)
+                    .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+                if !accepted {
+                    return self.queue_provider_direct_manifest(batch_id);
+                }
+                if provider_manifest_present(
+                    self.provider
+                        .as_ref()
+                        .ok_or(SyncRuntimeRequestError::ActorUnavailable)?,
+                    descriptor,
+                    batch_id,
+                )? {
+                    return Ok(());
+                }
+                self.record_provider_publication(batch_id)
+            }
             crate::oplog::BatchInspection::Staged { .. } => {
-                Err(SyncRuntimeRequestError::ActorRefused(format!(
-                    "accepted direct provider manifest {batch_id} is absent and its local archive is partial"
-                )))
+                let accepted = self
+                    .runtime
+                    .as_ref()
+                    .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
+                    .engine()
+                    .accepted_frontier_contains_batch_effects(batch_id)
+                    .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+                if accepted {
+                    return Err(SyncRuntimeRequestError::ActorRefused(format!(
+                        "accepted direct provider manifest {batch_id} is absent and its local archive is partial"
+                    )));
+                }
+                // Keep the child in the dependency index and requeue this
+                // incomplete parent through the existing direct-manifest
+                // path. Returning success lets exact object observations
+                // behind the ready child advance the parent; the child stays
+                // blocked until normal admission satisfies this dependency.
+                self.queue_provider_direct_manifest(batch_id)
             }
             crate::oplog::BatchInspection::Absent => {
-                // Promoted-runtime open already proved every ordinary accepted
-                // head archive-ready. The remaining manifest-less direct heads
-                // are authenticated bootstrap/adoption authority shared by the
-                // descriptor, not provider evidence that can be republished.
-                Ok(())
+                if provider_manifest_present(
+                    self.provider
+                        .as_ref()
+                        .ok_or(SyncRuntimeRequestError::ActorUnavailable)?,
+                    descriptor,
+                    batch_id,
+                )? {
+                    let accepted = self
+                        .runtime
+                        .as_ref()
+                        .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
+                        .engine()
+                        .accepted_frontier_contains_batch_effects(batch_id)
+                        .map_err(|error| {
+                            SyncRuntimeRequestError::ActorRefused(error.to_string())
+                        })?;
+                    return if accepted {
+                        Ok(())
+                    } else {
+                        self.queue_provider_direct_manifest(batch_id)
+                    };
+                }
+                let manifestless = self
+                    .runtime
+                    .as_ref()
+                    .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
+                    .engine()
+                    .accepted_frontier_batch_allows_manifestless_provider(batch_id)
+                    .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+                match manifestless {
+                    Some(true) => {
+                        // Manifest absence is not authority. The current
+                        // authenticated membership, plus sealed history for a
+                        // non-no-op, is the bounded proof that this exact
+                        // dependency is manifestless authority.
+                        Ok(())
+                    }
+                    Some(false) => Err(SyncRuntimeRequestError::ActorRefused(format!(
+                        "accepted direct provider manifest {batch_id} and its local archive are absent"
+                    ))),
+                    None => self.queue_provider_direct_manifest(batch_id),
+                }
             }
         }
     }
@@ -5878,7 +5932,7 @@ impl RuntimeActor {
                         .as_ref()
                         .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
                         .engine()
-                        .accepted_batch_is_active(batch_id)
+                        .accepted_frontier_contains_batch_effects(batch_id)
                         .map_err(|error| {
                             SyncRuntimeRequestError::ActorRefused(error.to_string())
                         })?;
@@ -5968,24 +6022,23 @@ impl RuntimeActor {
                     )));
                 }
                 crate::oplog::BatchInspection::Absent => {
-                    let accepted = self
+                    let manifestless = self
                         .runtime
                         .as_ref()
                         .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
                         .engine()
-                        .accepted_batch_is_active(*dependency)
+                        .accepted_frontier_batch_allows_manifestless_provider(*dependency)
                         .map_err(|error| {
                             SyncRuntimeRequestError::ActorRefused(error.to_string())
                         })?;
-                    if !accepted {
+                    if manifestless != Some(true) {
                         return Err(SyncRuntimeRequestError::ActorRefused(format!(
                             "durable outbound dependency {dependency} is absent"
                         )));
                     }
-                    // A synthetic accepted base head is not an archive batch.
-                    // It is already common to both descriptor-bound replicas;
-                    // every publishable immutable ancestor remains required
-                    // above before the child manifest can become visible.
+                    // Only exact current accepted no-op/bootstrap authority may
+                    // be manifestless. Every publishable immutable ancestor
+                    // remains required above before the child becomes visible.
                 }
             }
         }
@@ -6042,11 +6095,21 @@ impl RuntimeActor {
             .inspect_batch(batch_id)
             .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
         {
-            crate::oplog::BatchInspection::Ready(batch) => batch.manifest().clone(),
+            crate::oplog::BatchInspection::Ready(batch) => Some(batch.manifest().clone()),
             crate::oplog::BatchInspection::Absent => {
-                return Err(SyncRuntimeRequestError::ActorRefused(format!(
-                    "accepted recovery batch {batch_id} is absent"
-                )));
+                let manifestless = self
+                    .runtime
+                    .as_ref()
+                    .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
+                    .engine()
+                    .accepted_frontier_batch_allows_manifestless_provider(batch_id)
+                    .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+                if manifestless != Some(true) {
+                    return Err(SyncRuntimeRequestError::ActorRefused(format!(
+                        "accepted recovery batch {batch_id} is absent"
+                    )));
+                }
+                None
             }
             crate::oplog::BatchInspection::Staged { .. } => {
                 return Err(SyncRuntimeRequestError::ActorRefused(format!(
@@ -6054,34 +6117,36 @@ impl RuntimeActor {
                 )));
             }
         };
-        let manifest_bytes = store
-            .read_manifest_bytes(batch_id)
-            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
-        provider_recovery_publication_cut(descriptor.workspace_id(), "before_recovery")?;
-        publish_manifest_recovery(
-            self.provider
-                .as_mut()
-                .ok_or(SyncRuntimeRequestError::ActorUnavailable)?,
-            descriptor,
-            &manifest,
-            &manifest_bytes,
-        )?;
-        let recovered = load_provider_manifest_recovery_exact(
-            self.provider
-                .as_ref()
-                .ok_or(SyncRuntimeRequestError::ActorUnavailable)?,
-            descriptor,
-            batch_id,
-        )?;
-        if recovered.is_none() {
-            return Err(SyncRuntimeRequestError::ActorRefused(format!(
-                "accepted recovery batch {batch_id} is not durably mirrored"
-            )));
+        if let Some(manifest) = manifest {
+            let manifest_bytes = store
+                .read_manifest_bytes(batch_id)
+                .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+            provider_recovery_publication_cut(descriptor.workspace_id(), "before_recovery")?;
+            publish_manifest_recovery(
+                self.provider
+                    .as_mut()
+                    .ok_or(SyncRuntimeRequestError::ActorUnavailable)?,
+                descriptor,
+                &manifest,
+                &manifest_bytes,
+            )?;
+            let recovered = load_provider_manifest_recovery_exact(
+                self.provider
+                    .as_ref()
+                    .ok_or(SyncRuntimeRequestError::ActorUnavailable)?,
+                descriptor,
+                batch_id,
+            )?;
+            if recovered.is_none() {
+                return Err(SyncRuntimeRequestError::ActorRefused(format!(
+                    "accepted recovery batch {batch_id} is not durably mirrored"
+                )));
+            }
+            provider_recovery_publication_cut(
+                descriptor.workspace_id(),
+                "after_recovery_before_canonical",
+            )?;
         }
-        provider_recovery_publication_cut(
-            descriptor.workspace_id(),
-            "after_recovery_before_canonical",
-        )?;
         self.provider_recovery_exact.pop_front();
         if self.provider_recovery_exact.is_empty()
             && !self.provider_recovery_backfill_requested
@@ -6145,7 +6210,7 @@ impl RuntimeActor {
                 .as_ref()
                 .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
                 .engine()
-                .accepted_batch_is_active(manifest.batch_id())
+                .accepted_frontier_contains_batch_effects(manifest.batch_id())
                 .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
             if !accepted {
                 continue;
@@ -6277,7 +6342,7 @@ impl RuntimeActor {
                 .as_ref()
                 .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
                 .engine()
-                .accepted_batch_is_active(batch_id)
+                .accepted_frontier_contains_batch_effects(batch_id)
                 .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
             {
                 if !provider_manifest_present(
@@ -6295,10 +6360,27 @@ impl RuntimeActor {
                             self.record_provider_publication(batch_id)?;
                             return Ok(());
                         }
-                        crate::oplog::BatchInspection::Absent
-                        | crate::oplog::BatchInspection::Staged { .. } => {
+                        crate::oplog::BatchInspection::Absent => {
+                            let manifestless = self
+                                .runtime
+                                .as_ref()
+                                .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
+                                .engine()
+                                .accepted_frontier_batch_allows_manifestless_provider(batch_id)
+                                .map_err(|error| {
+                                    SyncRuntimeRequestError::ActorRefused(error.to_string())
+                                })?;
+                            if manifestless == Some(true) {
+                                self.provider_incomplete.remove(&batch_id);
+                                return Ok(());
+                            }
                             return Err(SyncRuntimeRequestError::ActorRefused(format!(
                                 "accepted provider manifest is absent at {path}"
+                            )));
+                        }
+                        crate::oplog::BatchInspection::Staged { .. } => {
+                            return Err(SyncRuntimeRequestError::ActorRefused(format!(
+                                "accepted provider manifest is absent at {path} and its local archive is partial"
                             )));
                         }
                     }
@@ -11370,6 +11452,77 @@ mod tests {
         panic!("shared batch {batch_id} was not published");
     }
 
+    fn publish_headless_no_op(
+        fixture: &ActivationFixture,
+        base_batch: BatchId,
+        no_op_batch: BatchId,
+    ) -> OperationBatch {
+        let store = ObjectStore::open(
+            &fixture.request.archive_root,
+            fixture.request.identities.workspace_id,
+        )
+        .unwrap();
+        let base_manifest =
+            OperationBatch::decode(&store.read_manifest_bytes(base_batch).unwrap()).unwrap();
+        let semantic_document = base_manifest
+            .required_objects()
+            .iter()
+            .find(|object| object.kind() == crate::oplog::ObjectKind::SemanticEffect)
+            .expect("base batch has a semantic object")
+            .document_id();
+        let empty_effect =
+            crate::oplog::SemanticEffect::new(Vec::new(), Vec::new(), Vec::new()).unwrap();
+        let empty_effect_bytes = empty_effect.encode().unwrap();
+        let empty_effect_object = OperationObject::new(
+            base_manifest.workspace_id(),
+            semantic_document,
+            crate::oplog::ObjectKind::SemanticEffect,
+            empty_effect_bytes.clone(),
+        )
+        .unwrap();
+        let manifest = OperationBatch::new_with_causality(
+            base_manifest.workspace_id(),
+            base_manifest.lineage_digest(),
+            no_op_batch,
+            base_manifest.author_device_id(),
+            base_manifest.author_session_id(),
+            base_manifest.origin(),
+            crate::oplog::BatchCausalDot::new(
+                base_manifest.causal_dot().peer_id(),
+                base_manifest.causal_dot().counter().checked_add(1).unwrap(),
+            )
+            .unwrap(),
+            vec![base_batch],
+            crate::oplog::FrontierV2::new(Vec::new()).unwrap(),
+            crate::oplog::SemanticEffectDigest::of(&empty_effect_bytes),
+            vec![empty_effect_object.descriptor().unwrap()],
+        )
+        .unwrap();
+        assert!(
+            manifest
+                .required_objects()
+                .iter()
+                .all(|object| object.kind() != crate::oplog::ObjectKind::CrdtUpdate),
+            "fixture no-op unexpectedly acquired a document head"
+        );
+        let mut provider = SharedProviderTransport::open(
+            &fixture.request.provider_root,
+            &fixture.request.provider_journal_root,
+        )
+        .unwrap();
+        let descriptor = empty_effect_object.descriptor().unwrap();
+        provider
+            .publish_object(
+                descriptor.content_digest(),
+                &empty_effect_object.encode().unwrap(),
+            )
+            .unwrap();
+        provider
+            .publish_manifest(no_op_batch, &manifest.encode().unwrap())
+            .unwrap();
+        manifest
+    }
+
     fn provider_manifest_recovery_paths(
         fixture: &ActivationFixture,
         batch_id: BatchId,
@@ -12010,6 +12163,170 @@ mod tests {
         assert!(
             manifest.is_file(),
             "accepted exact manifest deletion was not repaired from local archive"
+        );
+    }
+
+    #[test]
+    fn accepted_ordinary_manifest_loss_without_local_archive_blocks() {
+        let fixture = make_shared_fixture("provider-ordinary-manifest-archive-loss", 0xbb28);
+        let _descriptor = activate_and_prepare_shared(&fixture);
+        let handle = active_handle(SyncRuntimeHandle::open(reopen_request(&fixture.request)));
+        settle_shared_provider(&handle);
+        let (batch_id, ..) = submit_shared_page(
+            &handle,
+            0xbb2a,
+            "Ordinary Manifest Archive Loss",
+            "notes/ordinary-manifest-archive-loss.md",
+            "ordinary archive evidence remains required",
+        );
+        publish_shared_batch(&handle, &fixture, batch_id);
+        settle_shared_provider(&handle);
+
+        let relative = format!("manifests/{batch_id}.manifest");
+        let manifest = fixture.request.provider_root.join("outbox").join(&relative);
+        let (recovery_link, recovery_blob, ..) =
+            provider_manifest_recovery_paths(&fixture, batch_id);
+        let local_manifest = fixture
+            .request
+            .archive_root
+            .join("batches")
+            .join(format!("{batch_id}.manifest"));
+        assert!(
+            manifest.is_file()
+                && recovery_link.is_file()
+                && recovery_blob.is_file()
+                && local_manifest.is_file()
+        );
+        fs::remove_file(&manifest).unwrap();
+        fs::remove_file(&recovery_link).unwrap();
+        fs::remove_file(&recovery_blob).unwrap();
+        fs::remove_file(&local_manifest).unwrap();
+
+        handle
+            .observe_provider_paths(vec![relative], false)
+            .unwrap();
+        let mut blocked = None;
+        for _ in 0..32 {
+            match handle.tick().unwrap() {
+                SyncRuntimeTick::RecoveryBlocked(detail) => {
+                    blocked = Some(detail);
+                    break;
+                }
+                SyncRuntimeTick::Recovering | SyncRuntimeTick::Idle => {}
+                other => panic!("ordinary accepted archive loss did not fail closed: {other:?}"),
+            }
+        }
+        assert!(
+            blocked.as_ref().is_some_and(|detail| {
+                detail.contains("accepted provider manifest is absent")
+                    || detail.contains("and its local archive are absent")
+            }),
+            "ordinary accepted archive loss did not retain its exact blocked reason: {blocked:?}"
+        );
+        assert!(
+            !manifest.exists(),
+            "ordinary accepted archive loss was treated as manifestless authority"
+        );
+        assert!(
+            handle.clean_shutdown().is_err(),
+            "ordinary accepted archive loss reached Safe"
+        );
+    }
+
+    #[test]
+    fn outbound_child_blocks_when_ordinary_parent_is_lost() {
+        let fixture = make_shared_fixture("provider-outbound-parent-loss", 0xbb2c);
+        let _descriptor = activate_and_prepare_shared(&fixture);
+        let handle = active_handle(SyncRuntimeHandle::open(reopen_request(&fixture.request)));
+        settle_shared_provider(&handle);
+        let (parent_batch, page_id, ..) = submit_shared_page(
+            &handle,
+            0xbb2e,
+            "Outbound Parent Loss",
+            "notes/outbound-parent-loss.md",
+            "ordinary parent must remain publishable",
+        );
+        publish_shared_batch(&handle, &fixture, parent_batch);
+        settle_shared_provider(&handle);
+
+        let child_batch = submit_durable(
+            &handle,
+            vec![SemanticOperation::SetPagePreamble {
+                page_id,
+                preamble: Some("child must not publish past lost parent".into()),
+            }],
+        );
+        let store = ObjectStore::open(
+            &fixture.request.archive_root,
+            fixture.request.identities.workspace_id,
+        )
+        .unwrap();
+        let child_manifest =
+            OperationBatch::decode(&store.read_manifest_bytes(child_batch).unwrap()).unwrap();
+        assert_eq!(
+            child_manifest.causal_dependency_heads(),
+            &[parent_batch],
+            "fixture child must depend directly on the ordinary parent"
+        );
+
+        let parent_relative = format!("manifests/{parent_batch}.manifest");
+        for tree in ["inbox", "outbox"] {
+            let provider_manifest = fixture
+                .request
+                .provider_root
+                .join(tree)
+                .join(&parent_relative);
+            if provider_manifest.is_file() {
+                fs::remove_file(provider_manifest).unwrap();
+            }
+        }
+        let (recovery_link, recovery_blob, ..) =
+            provider_manifest_recovery_paths(&fixture, parent_batch);
+        fs::remove_file(recovery_link).unwrap();
+        fs::remove_file(recovery_blob).unwrap();
+        fs::remove_file(
+            fixture
+                .request
+                .archive_root
+                .join("batches")
+                .join(format!("{parent_batch}.manifest")),
+        )
+        .unwrap();
+        assert!(matches!(
+            store.inspect_batch(parent_batch).unwrap(),
+            crate::oplog::BatchInspection::Absent
+        ));
+
+        let child_provider_manifest = fixture
+            .request
+            .provider_root
+            .join(format!("outbox/manifests/{child_batch}.manifest"));
+        let mut blocked = None;
+        for _ in 0..64 {
+            match handle.tick().unwrap() {
+                SyncRuntimeTick::RecoveryBlocked(detail) => {
+                    blocked = Some(detail);
+                    break;
+                }
+                SyncRuntimeTick::Recovering | SyncRuntimeTick::Idle => {}
+                other => panic!("ordinary parent loss did not fail closed: {other:?}"),
+            }
+        }
+        assert!(
+            blocked.as_ref().is_some_and(|detail| {
+                detail.contains(&format!(
+                    "durable outbound dependency {parent_batch} is absent"
+                ))
+            }),
+            "outbound publication did not block at its absent ordinary dependency: {blocked:?}"
+        );
+        assert!(
+            !child_provider_manifest.exists(),
+            "child published past its lost ordinary parent"
+        );
+        assert!(
+            handle.clean_shutdown().is_err(),
+            "ordinary parent loss reached Safe with the child unpublished"
         );
     }
 
@@ -13703,6 +14020,175 @@ mod tests {
     }
 
     #[test]
+    fn manifestless_no_op_partial_direct_dependency_blocks() {
+        let (initiator, receiver, initiator_handle, receiver_handle) =
+            joined_shared_pair("provider-no-op-partial-direct", 0xd300);
+        let (base_batch, page_id, ..) = submit_shared_page(
+            &initiator_handle,
+            0xd320,
+            "No Op Partial Direct Base",
+            "notes/no-op-partial-direct-base.md",
+            "stable base before partial dependency",
+        );
+        publish_shared_batch(&initiator_handle, &initiator, base_batch);
+        settle_shared_provider(&initiator_handle);
+        copy_provider_tree(
+            &initiator.request.provider_root,
+            &receiver.request.provider_root,
+        );
+        receiver_handle
+            .observe_provider_paths(vec![format!("manifests/{base_batch}.manifest")], false)
+            .unwrap();
+        settle_shared_provider(&receiver_handle);
+
+        let no_op_batch = BatchId::from_uuid(Uuid::from_u128(0xd325));
+        let no_op_manifest = publish_headless_no_op(&initiator, base_batch, no_op_batch);
+        copy_provider_tree(
+            &initiator.request.provider_root,
+            &receiver.request.provider_root,
+        );
+        let mut no_op_delivery = no_op_manifest
+            .required_objects()
+            .iter()
+            .map(|object| format!("objects/{}.object", object.content_digest()))
+            .collect::<Vec<_>>();
+        no_op_delivery.push(format!("manifests/{no_op_batch}.manifest"));
+        initiator_handle
+            .observe_provider_paths(no_op_delivery.clone(), false)
+            .unwrap();
+        receiver_handle
+            .observe_provider_paths(no_op_delivery, false)
+            .unwrap();
+        settle_shared_provider(&initiator_handle);
+        settle_shared_provider(&receiver_handle);
+
+        let child_batch = submit_durable(
+            &initiator_handle,
+            vec![SemanticOperation::SetPagePreamble {
+                page_id,
+                preamble: Some("partial direct child must remain blocked".into()),
+            }],
+        );
+        let initiator_store = ObjectStore::open(
+            &initiator.request.archive_root,
+            initiator.request.identities.workspace_id,
+        )
+        .unwrap();
+        let locally_authored_child =
+            OperationBatch::decode(&initiator_store.read_manifest_bytes(child_batch).unwrap())
+                .unwrap();
+        let child_manifest = OperationBatch::new_with_causality(
+            locally_authored_child.workspace_id(),
+            locally_authored_child.lineage_digest(),
+            locally_authored_child.batch_id(),
+            locally_authored_child.author_device_id(),
+            locally_authored_child.author_session_id(),
+            locally_authored_child.origin(),
+            locally_authored_child.causal_dot(),
+            vec![no_op_batch],
+            locally_authored_child.dependency_frontier().clone(),
+            locally_authored_child.semantic_effect_digest(),
+            locally_authored_child.required_objects().to_vec(),
+        )
+        .unwrap();
+        assert_eq!(
+            child_manifest.causal_dependency_heads(),
+            &[no_op_batch],
+            "fixture child must reach the direct-dependency check"
+        );
+        let mut provider = SharedProviderTransport::open(
+            &initiator.request.provider_root,
+            &initiator.request.provider_journal_root,
+        )
+        .unwrap();
+        for object in child_manifest.required_objects() {
+            provider
+                .publish_object(
+                    object.content_digest(),
+                    &initiator_store
+                        .read_object_bytes(object.content_digest())
+                        .unwrap(),
+                )
+                .unwrap();
+        }
+        provider
+            .publish_manifest(child_batch, &child_manifest.encode().unwrap())
+            .unwrap();
+        copy_provider_tree(
+            &initiator.request.provider_root,
+            &receiver.request.provider_root,
+        );
+
+        let no_op_relative = format!("manifests/{no_op_batch}.manifest");
+        for tree in ["inbox", "outbox"] {
+            let provider_manifest = receiver
+                .request
+                .provider_root
+                .join(tree)
+                .join(&no_op_relative);
+            if provider_manifest.is_file() {
+                fs::remove_file(provider_manifest).unwrap();
+            }
+        }
+        let missing_object = no_op_manifest.required_objects()[0].content_digest();
+        fs::remove_file(
+            receiver
+                .request
+                .archive_root
+                .join("objects")
+                .join(format!("{missing_object}.object")),
+        )
+        .unwrap();
+        let receiver_store = ObjectStore::open(
+            &receiver.request.archive_root,
+            receiver.request.identities.workspace_id,
+        )
+        .unwrap();
+        assert!(matches!(
+            receiver_store.inspect_batch(no_op_batch).unwrap(),
+            crate::oplog::BatchInspection::Staged { .. }
+        ));
+
+        receiver_handle
+            .observe_provider_paths(vec![format!("manifests/{child_batch}.manifest")], false)
+            .unwrap();
+        let mut blocked = None;
+        for _ in 0..32 {
+            match receiver_handle.tick().unwrap() {
+                SyncRuntimeTick::RecoveryBlocked(detail) => {
+                    blocked = Some(detail);
+                    break;
+                }
+                SyncRuntimeTick::Recovering | SyncRuntimeTick::Idle => {}
+                other => panic!("partial direct dependency did not fail closed: {other:?}"),
+            }
+        }
+        assert!(
+            blocked.as_ref().is_some_and(|detail| {
+                detail.contains(&format!(
+                    "accepted direct provider manifest {no_op_batch} is absent and its local archive is partial"
+                ))
+            }),
+            "partial manifestless direct dependency bypassed archive inspection: {blocked:?}"
+        );
+        assert!(
+            !fs::read(
+                receiver
+                    .graph_root
+                    .join("notes/no-op-partial-direct-base.md")
+            )
+            .unwrap()
+            .windows(b"partial direct child must remain blocked".len())
+            .any(|window| window == b"partial direct child must remain blocked"),
+            "child effects became visible through a partial direct dependency"
+        );
+        assert!(
+            receiver_handle.clean_shutdown().is_err(),
+            "partial direct dependency reached Safe"
+        );
+    }
+
+    #[test]
     fn restarted_provider_child_accepts_manifestless_no_op_dependency_after_duplicate_reordering() {
         let (initiator, receiver, initiator_handle, receiver_handle) =
             joined_shared_pair("provider-no-op-dependency", 0xd400);
@@ -13755,71 +14241,8 @@ mod tests {
         settle_shared_provider(&receiver_handle);
         settle_shared_provider(&observer_handle);
 
-        let initiator_store = ObjectStore::open(
-            &initiator.request.archive_root,
-            initiator.request.identities.workspace_id,
-        )
-        .unwrap();
-        let base_manifest =
-            OperationBatch::decode(&initiator_store.read_manifest_bytes(base_batch).unwrap())
-                .unwrap();
-        let semantic_document = base_manifest
-            .required_objects()
-            .iter()
-            .find(|object| object.kind() == crate::oplog::ObjectKind::SemanticEffect)
-            .expect("base batch has a semantic object")
-            .document_id();
-        let empty_effect =
-            crate::oplog::SemanticEffect::new(Vec::new(), Vec::new(), Vec::new()).unwrap();
-        let empty_effect_bytes = empty_effect.encode().unwrap();
-        let empty_effect_object = OperationObject::new(
-            base_manifest.workspace_id(),
-            semantic_document,
-            crate::oplog::ObjectKind::SemanticEffect,
-            empty_effect_bytes.clone(),
-        )
-        .unwrap();
         let no_op_batch = BatchId::from_uuid(Uuid::from_u128(0xd425));
-        let headless_no_op_manifest = OperationBatch::new_with_causality(
-            base_manifest.workspace_id(),
-            base_manifest.lineage_digest(),
-            no_op_batch,
-            base_manifest.author_device_id(),
-            base_manifest.author_session_id(),
-            base_manifest.origin(),
-            crate::oplog::BatchCausalDot::new(
-                base_manifest.causal_dot().peer_id(),
-                base_manifest.causal_dot().counter().checked_add(1).unwrap(),
-            )
-            .unwrap(),
-            vec![base_batch],
-            crate::oplog::FrontierV2::new(Vec::new()).unwrap(),
-            crate::oplog::SemanticEffectDigest::of(&empty_effect_bytes),
-            vec![empty_effect_object.descriptor().unwrap()],
-        )
-        .unwrap();
-        assert!(
-            headless_no_op_manifest
-                .required_objects()
-                .iter()
-                .all(|object| object.kind() != crate::oplog::ObjectKind::CrdtUpdate),
-            "fixture no-op unexpectedly acquired a document head"
-        );
-        let mut manual_provider = SharedProviderTransport::open(
-            &initiator.request.provider_root,
-            &initiator.request.provider_journal_root,
-        )
-        .unwrap();
-        let empty_effect_descriptor = empty_effect_object.descriptor().unwrap();
-        manual_provider
-            .publish_object(
-                empty_effect_descriptor.content_digest(),
-                &empty_effect_object.encode().unwrap(),
-            )
-            .unwrap();
-        manual_provider
-            .publish_manifest(no_op_batch, &headless_no_op_manifest.encode().unwrap())
-            .unwrap();
+        let headless_no_op_manifest = publish_headless_no_op(&initiator, base_batch, no_op_batch);
         copy_provider_tree(
             &initiator.request.provider_root,
             &receiver.request.provider_root,
@@ -13842,10 +14265,45 @@ mod tests {
             .unwrap();
         settle_shared_provider(&receiver_handle);
         settle_shared_provider(&observer_handle);
+        let no_op_path = format!("manifests/{no_op_batch}.manifest");
+        for tree in ["inbox", "outbox"] {
+            let provider_manifest = observer.request.provider_root.join(tree).join(&no_op_path);
+            if provider_manifest.is_file() {
+                fs::remove_file(provider_manifest).unwrap();
+            }
+        }
+        let observer_local_manifest = observer
+            .request
+            .archive_root
+            .join("batches")
+            .join(format!("{no_op_batch}.manifest"));
+        let observer_local_manifest_bytes = fs::read(&observer_local_manifest).unwrap();
+        fs::remove_file(&observer_local_manifest).unwrap();
+        observer_handle
+            .observe_provider_paths(vec![no_op_path.clone()], false)
+            .unwrap();
+        settle_shared_provider(&observer_handle);
+        let observer_provider = SharedProviderTransport::open(
+            &observer.request.provider_root,
+            &observer.request.provider_journal_root,
+        )
+        .unwrap();
+        assert!(
+            observer_provider.read_exact(&no_op_path).unwrap().is_none(),
+            "exact deletion of authenticated manifest-less no-op authority was republished"
+        );
+        assert!(
+            !observer_local_manifest.exists(),
+            "exact deletion of authenticated manifest-less no-op authority recreated its local archive"
+        );
         assert!(matches!(
             observer_handle.clean_shutdown(),
             Ok(SyncShutdownOutcome::Safe(_))
         ));
+        // Runtime reopen authenticates every accepted archive entry. Restore
+        // the ready local archive while leaving provider evidence absent; the
+        // restart path must repair that ready dependency before the child.
+        fs::write(&observer_local_manifest, observer_local_manifest_bytes).unwrap();
 
         let child_batch = submit_durable(
             &receiver_handle,
@@ -13914,12 +14372,17 @@ mod tests {
             if parent_manifest.is_file() {
                 fs::remove_file(parent_manifest).unwrap();
             }
+            for object in headless_no_op_manifest.required_objects() {
+                let provider_object = observer
+                    .request
+                    .provider_root
+                    .join(tree)
+                    .join(format!("objects/{}.object", object.content_digest()));
+                if provider_object.is_file() {
+                    fs::remove_file(provider_object).unwrap();
+                }
+            }
         }
-        let observer_provider = SharedProviderTransport::open(
-            &observer.request.provider_root,
-            &observer.request.provider_journal_root,
-        )
-        .unwrap();
         assert!(
             observer_provider
                 .read_exact(&format!("manifests/{no_op_batch}.manifest"))
@@ -13943,6 +14406,13 @@ mod tests {
             .unwrap();
         settle_shared_provider(&restarted);
         assert_eq!(restarted.status().unwrap().provider_pending, 0);
+        assert!(
+            observer_provider
+                .read_exact(&format!("manifests/{no_op_batch}.manifest"))
+                .unwrap()
+                .is_some(),
+            "restart did not republish the ready no-op dependency before its child"
+        );
         assert!(
             fs::read(observer.graph_root.join("notes/no-op-dependency-base.md"))
                 .unwrap()
