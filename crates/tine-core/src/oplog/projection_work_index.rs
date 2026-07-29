@@ -575,6 +575,7 @@ impl ProjectionDirectCompletionAuthority {
         receipt_store_id: super::ProjectionReceiptStoreId,
         engine_history_generation: u64,
         engine_history_root: ContentDigest,
+        target: ProjectionWorkTarget,
         intent: &super::ProjectionIntent,
         completion: &super::ProjectionCompletion,
     ) -> Self {
@@ -589,7 +590,7 @@ impl ProjectionDirectCompletionAuthority {
                 page_id: intent.page_id(),
                 path: intent.path().clone(),
                 frontier: intent.frontier().clone(),
-                target: ProjectionWorkTarget::Present(intent.target()),
+                target,
                 intent_id: completion.intent_id(),
                 logical_completion_id: completion.logical_completion_id(),
             },
@@ -1682,45 +1683,6 @@ impl ProjectionWorkIndex {
         Ok(self
             .load_state(&root, work_id)?
             .map(|state| state.status.into_public()))
-    }
-
-    pub(crate) fn completed_release(
-        &self,
-        batch_id: BatchId,
-        manifest_fingerprint: ContentDigest,
-        page_id: PageId,
-        path: &ManagedPath,
-    ) -> Result<ProjectionWork, ProjectionWorkError> {
-        let (_, root) = self.load_head_root()?;
-        let bytes = self
-            .tree_lookup(root.accepted_root, &batch_key(batch_id))?
-            .ok_or(ProjectionWorkError::AcceptedWitnessMissing)?;
-        let witness: AcceptedBatchWitness = decode_canonical(&bytes)?;
-        self.require_accepted_source(&witness)?;
-        if witness.batch_id != batch_id || witness.manifest_fingerprint != manifest_fingerprint {
-            return Err(ProjectionWorkError::AcceptedWitnessMismatch);
-        }
-        let mut found = None;
-        for work_id in witness.work_ids {
-            let state = self
-                .load_state(&root, work_id)?
-                .ok_or(ProjectionWorkError::MissingWork(work_id))?;
-            self.require_binding(&state.work)?;
-            if state.work.page_id() != page_id
-                || state.work.path() != path
-                || state.work.target() != ProjectionWorkTarget::Absent
-            {
-                continue;
-            }
-            if found.is_some() {
-                return Err(ProjectionWorkError::AcceptedWitnessMismatch);
-            }
-            if !matches!(state.status, StoredWorkStatus::Completed { .. }) {
-                return Err(ProjectionWorkError::ConflictingStatus);
-            }
-            found = Some(state.work);
-        }
-        found.ok_or(ProjectionWorkError::AcceptedWitnessMissing)
     }
 
     pub fn next(&self) -> Result<Option<ProjectionWork>, ProjectionWorkError> {
@@ -3067,34 +3029,6 @@ impl ProjectionWorkIndex {
         let source: ProjectionPendingActivation = decode_canonical(&source)?;
         self.require_pending_binding(&source)?;
         if source != *pending {
-            return Err(ProjectionWorkError::AcceptedWitnessMismatch);
-        }
-        Ok(())
-    }
-
-    fn require_accepted_source(
-        &self,
-        witness: &AcceptedBatchWitness,
-    ) -> Result<(), ProjectionWorkError> {
-        if witness.schema_version != INDEX_SCHEMA_VERSION
-            || witness.workspace_id != self.workspace_id
-            || witness.endpoint_id != self.endpoint_id
-            || !strictly_sorted(&witness.work_ids)
-        {
-            return Err(ProjectionWorkError::AcceptedWitnessMismatch);
-        }
-        let source_root = self.load_root(witness.pending_root_digest)?;
-        let source = self
-            .tree_lookup(source_root.pending_root, &batch_key(witness.batch_id))?
-            .ok_or(ProjectionWorkError::PendingActivationMissing)?;
-        let source: ProjectionPendingActivation = decode_canonical(&source)?;
-        self.require_pending_binding(&source)?;
-        self.require_pending_prepared(&source)?;
-        if source.batch_id != witness.batch_id
-            || source.manifest_fingerprint != witness.manifest_fingerprint
-            || source.prepared_digest != witness.prepared_digest
-            || source.work_ids != witness.work_ids
-        {
             return Err(ProjectionWorkError::AcceptedWitnessMismatch);
         }
         Ok(())

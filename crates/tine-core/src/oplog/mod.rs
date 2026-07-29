@@ -96,6 +96,7 @@ pub use batch::{
     MAX_OBJECT_BYTES, OBJECT_ENVELOPE_SCHEMA_VERSION, OPERATION_SCHEMA_VERSION,
     OPLOG_PROTOCOL_VERSION,
 };
+pub(crate) use hot_engine::ProjectionTombstoneAuthorization;
 pub use hot_engine::{
     AcceptedBatch, AcceptedBatchEvidence, AuthorBatch, AuthorTransactionDraft, BatchDisposition,
     BlockContentRewrite, BlockLocation, CapabilityCapturedProjectionInput,

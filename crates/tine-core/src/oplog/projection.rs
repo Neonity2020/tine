@@ -25,9 +25,10 @@ use super::{
     LogseqIdentityOrigin, LogseqUuid, ManifestProjectionPrecondition, ManifestProjectionTarget,
     ManifestedProjectionIntent, MaterializedBlock, MaterializedPage, ObjectKind, ObjectStore,
     PageId, ProjectionCompletion, ProjectionEndpointId, ProjectionIntent, ProjectionPageState,
-    ProjectionPrecondition, ProjectionReceiptStore, ProjectionStoreError, ProjectionWork,
-    ProjectionWorkBlockAuthority, ProjectionWorkIndex, ProjectionWorkStatus, ProjectionWorkTarget,
-    ReceiptError, ShardedHotEngine, StructuralLocator, StructuralSpan, WorkspaceId,
+    ProjectionPrecondition, ProjectionReceiptStore, ProjectionStoreError,
+    ProjectionTombstoneAuthorization, ProjectionWork, ProjectionWorkBlockAuthority,
+    ProjectionWorkIndex, ProjectionWorkStatus, ProjectionWorkTarget, ReceiptError,
+    ShardedHotEngine, StructuralLocator, StructuralSpan, WorkspaceId,
 };
 use crate::doc::{DocBlock, Document, SerializeOpts, StructuralLayoutIdentity};
 use crate::model::ProjectionRecoveryCleanup;
@@ -438,48 +439,39 @@ pub(crate) fn execute_receiver_local_projection_under_handoff(
     let endpoint = engine
         .projection_endpoint_binding()
         .ok_or(ProjectionError::EndpointBindingMismatch)?;
-    let current = engine.authorize_projection_write(source.page_id())?;
-    if current.state().page.path != *source.path()
-        || current.state().frontier != *source.post_frontier()
-        || current.state().claim_evidence != source.claim_evidence()
-    {
-        // A later accepted frontier has superseded this immutable provider
-        // intent. Historical bytes remain evidence, but they may not roll the
-        // receiver's graph back.
-        return Ok(Some(false));
-    }
-    let local_base = graph.read_projection_input(source.path())?;
     let source_absent = matches!(source.target(), ManifestProjectionTarget::Absent);
-    let plan = if source_absent {
+    let tombstone_authorization = if source_absent {
         if source.source_endpoint_id() == endpoint.endpoint_id {
             return Err(ProjectionError::ReceiverEndpointIsSource);
         }
-        engine.authorize_projection_recovery(
-            source.page_id(),
-            source.post_frontier(),
-            source.claim_evidence(),
-        )?;
-        let base = local_base.clone().map(BaseBlob::new);
-        let intent = ProjectionIntent::new(
-            engine.workspace_id(),
-            source.page_id(),
-            source.path().clone(),
-            source.post_frontier().clone(),
-            source.claim_evidence().to_vec(),
-            base.as_ref()
-                .map_or(ProjectionPrecondition::Absent, |base| {
-                    ProjectionPrecondition::Base(base.description())
-                }),
-            super::BlobDescription::of(&[]),
-            Vec::new(),
-        )?;
-        ProjectionPlan {
-            intent,
-            base,
-            target: Vec::new(),
-            guarded_layout: GuardedProjectionLayout::empty(),
-            generated_anchors: Vec::new(),
+        match engine.authorize_projection_tombstone(source) {
+            Ok(authorization) => Some(authorization),
+            Err(EngineError::ProjectionAuthorizationUnavailable) => return Ok(Some(false)),
+            Err(error) => return Err(error.into()),
         }
+    } else {
+        let current = engine.authorize_projection_write(source.page_id())?;
+        if current.state().page.path != *source.path()
+            || current.state().frontier != *source.post_frontier()
+            || current.state().claim_evidence != source.claim_evidence()
+        {
+            // A later accepted frontier has superseded this immutable provider
+            // intent. Historical bytes remain evidence, but they may not roll
+            // the receiver's graph back.
+            return Ok(Some(false));
+        }
+        None
+    };
+    let local_base = graph.read_projection_input(source.path())?;
+    let plan = if source_absent {
+        receiver_tombstone_plan(
+            receipts,
+            engine,
+            tombstone_authorization
+                .as_ref()
+                .expect("Absent source has tombstone authorization"),
+            local_base.as_deref(),
+        )?
     } else {
         derive_receiver_local_projection(
             engine,
@@ -506,13 +498,22 @@ pub(crate) fn execute_receiver_local_projection_under_handoff(
             !source_absent && local_base.as_deref() == Some(plan.target());
         let proof = if target_is_already_exact || has_attempts {
             if source_absent {
-                let base = plan.base().ok_or(ProjectionError::ReceiverSourceAbsent)?;
-                handoff.recover_removed_page_projection(
-                    graph,
-                    plan.intent().path().as_str(),
-                    base.bytes(),
-                    &mut authority,
-                )?
+                match plan.intent().precondition() {
+                    ProjectionPrecondition::Absent => handoff.confirm_removed_page_projection(
+                        graph,
+                        plan.intent().path().as_str(),
+                        &mut authority,
+                    )?,
+                    ProjectionPrecondition::Base(_) => {
+                        let base = plan.base().ok_or(ProjectionError::ReceiverSourceAbsent)?;
+                        handoff.recover_removed_page_projection(
+                            graph,
+                            plan.intent().path().as_str(),
+                            base.bytes(),
+                            &mut authority,
+                        )?
+                    }
+                }
             } else {
                 handoff.recover_page_projection_with_layout(
                     graph,
@@ -550,8 +551,110 @@ pub(crate) fn execute_receiver_local_projection_under_handoff(
         receipts.publish_completion(authority, plan.intent(), &proof)?;
     }
     retire_completed_projection_recovery(graph, receipts, plan.intent())?;
-    record_completed_path(receipts, engine, source.page_id(), plan.intent())?;
+    match tombstone_authorization {
+        Some(authorization) => {
+            record_completed_tombstone_path(receipts, engine, plan.intent(), authorization)?
+        }
+        None => record_completed_path(receipts, engine, source.page_id(), plan.intent())?,
+    }
     Ok(Some(!already_complete))
+}
+
+fn receiver_tombstone_plan(
+    store: &ProjectionReceiptStore,
+    engine: &ShardedHotEngine,
+    authorization: &ProjectionTombstoneAuthorization,
+    local_base: Option<&[u8]>,
+) -> Result<ProjectionPlan, ProjectionError> {
+    let (_, work_index) = engine.enrolled_projection_runtime()?;
+    let completed = work_index
+        .completed_receipts_for_path(authorization.path())
+        .map_err(|error| ProjectionError::Work(error.to_string()))?;
+    let mut deletion = completed.iter().filter(|receipt| {
+        receipt.page_id() == authorization.page_id()
+            && receipt.path() == authorization.path()
+            && receipt.frontier() == authorization.frontier()
+            && receipt.target() == ProjectionWorkTarget::Absent
+    });
+    if let Some(receipt) = deletion.next() {
+        if deletion.next().is_some() {
+            return Err(ProjectionError::ReceiverBaseMismatch);
+        }
+        let (intent, _) = store.load_completed_receipt(receipt)?;
+        let base = store.load_base(&intent)?;
+        return Ok(ProjectionPlan {
+            intent,
+            base,
+            target: Vec::new(),
+            guarded_layout: GuardedProjectionLayout::empty(),
+            generated_anchors: Vec::new(),
+        });
+    }
+
+    let prior_description = match authorization.prior_frontier() {
+        Some(prior_frontier) => {
+            let mut prior = completed.iter().filter_map(|receipt| {
+                (receipt.page_id() == authorization.page_id()
+                    && receipt.path() == authorization.path()
+                    && receipt.frontier() == prior_frontier)
+                    .then(|| match receipt.target() {
+                        ProjectionWorkTarget::Present(description) => Some((receipt, description)),
+                        ProjectionWorkTarget::Absent => None,
+                    })
+                    .flatten()
+            });
+            match prior.next() {
+                Some((receipt, description)) => {
+                    if prior.next().is_some() {
+                        return Err(ProjectionError::ReceiverBaseMismatch);
+                    }
+                    store.load_completed_receipt(receipt)?;
+                    Some(description)
+                }
+                None if local_base.is_some() => {
+                    return Err(ProjectionError::ReceiverBaseMismatch);
+                }
+                None => None,
+            }
+        }
+        None => None,
+    };
+    if local_base
+        .zip(prior_description)
+        .is_some_and(|(bytes, description)| super::BlobDescription::of(bytes) != description)
+        || (local_base.is_some() && prior_description.is_none())
+    {
+        return Err(ProjectionError::ReceiverBaseMismatch);
+    }
+    let precondition = prior_description.map_or(ProjectionPrecondition::Absent, |description| {
+        ProjectionPrecondition::Base(description)
+    });
+    let intent = ProjectionIntent::new(
+        engine.workspace_id(),
+        authorization.page_id(),
+        authorization.path().clone(),
+        authorization.frontier().clone(),
+        Vec::new(),
+        precondition,
+        super::BlobDescription::of(&[]),
+        Vec::new(),
+    )?;
+    let base = match (prior_description, local_base) {
+        (Some(_), Some(bytes)) => Some(BaseBlob::new(bytes.to_vec())),
+        (Some(_), None) => store
+            .load_base(&intent)?
+            .ok_or(ProjectionError::ReceiverBaseMismatch)
+            .map(Some)?,
+        (None, None) => None,
+        (None, Some(_)) => return Err(ProjectionError::ReceiverBaseMismatch),
+    };
+    Ok(ProjectionPlan {
+        intent,
+        base,
+        target: Vec::new(),
+        guarded_layout: GuardedProjectionLayout::empty(),
+        generated_anchors: Vec::new(),
+    })
 }
 
 /// Execute one source-endpoint manifested work row. Recovery reloads immutable
@@ -1303,8 +1406,12 @@ fn record_adopted_formatting_path(
     };
     let (engine_history_generation, engine_history_root) =
         engine.projection_completion_history_authority()?;
-    let authority =
-        store.completed_direct_authority(intent, engine_history_generation, engine_history_root)?;
+    let authority = store.completed_direct_authority(
+        intent,
+        ProjectionWorkTarget::Present(intent.target()),
+        engine_history_generation,
+        engine_history_root,
+    )?;
     work_index
         .mark_formatting_adopted(authority, prior)
         .map_err(|error| ProjectionError::Work(error.to_string()))?;
@@ -1318,6 +1425,30 @@ fn record_bootstrap_completed_path(
     intent: &ProjectionIntent,
 ) -> Result<(), ProjectionError> {
     record_completed_path_with_authorization(store, engine, page_id, intent, true)
+}
+
+fn record_completed_tombstone_path(
+    store: &ProjectionReceiptStore,
+    engine: &ShardedHotEngine,
+    intent: &ProjectionIntent,
+    authorization: ProjectionTombstoneAuthorization,
+) -> Result<(), ProjectionError> {
+    if authorization.page_id() != intent.page_id()
+        || authorization.path() != intent.path()
+        || authorization.frontier() != intent.frontier()
+        || !intent.claim_evidence().is_empty()
+        || intent.target() != super::BlobDescription::of(&[])
+        || !intent.annotations().is_empty()
+    {
+        return Err(ProjectionError::RecoveryIntentMismatch);
+    }
+    record_completed_path_target(
+        store,
+        engine,
+        intent.page_id(),
+        intent,
+        ProjectionWorkTarget::Absent,
+    )
 }
 
 fn record_completed_path_with_authorization(
@@ -1359,12 +1490,27 @@ fn record_completed_path_with_authorization(
         return Err(ProjectionError::RecoveryIntentMismatch);
     }
 
+    record_completed_path_target(
+        store,
+        engine,
+        page_id,
+        intent,
+        ProjectionWorkTarget::Present(intent.target()),
+    )
+}
+
+fn record_completed_path_target(
+    store: &ProjectionReceiptStore,
+    engine: &ShardedHotEngine,
+    page_id: PageId,
+    intent: &ProjectionIntent,
+    target: ProjectionWorkTarget,
+) -> Result<(), ProjectionError> {
     // The compatibility writer still produces a normal enrolled completion.
     // Mirror it into the authenticated completed-path tree when its accepted
     // work row is present, so sparse import never has to fall back to receipt
     // directory enumeration for this path.
     if let Ok((_, work_index)) = engine.enrolled_projection_runtime() {
-        let target = ProjectionWorkTarget::Present(intent.target());
         let mut exact = work_index
             .pending_for_path(intent.path())
             .map_err(|error| ProjectionError::Work(error.to_string()))?
@@ -1389,6 +1535,7 @@ fn record_completed_path_with_authorization(
                 engine.projection_completion_history_authority()?;
             let authority = store.completed_direct_authority(
                 intent,
+                target,
                 engine_history_generation,
                 engine_history_root,
             )?;
@@ -1972,6 +2119,7 @@ pub enum ProjectionError {
     ReceiverSourceMismatch,
     ReceiverEndpointIsSource,
     ReceiverSourceAbsent,
+    ReceiverBaseMismatch,
     EndpointBindingMismatch,
     Archive(String),
     Work(String),
@@ -2034,6 +2182,9 @@ impl fmt::Display for ProjectionError {
             Self::ReceiverSourceAbsent => {
                 f.write_str("receiver-local Present projection cannot derive from an Absent target")
             }
+            Self::ReceiverBaseMismatch => f.write_str(
+                "receiver deletion target lacks exact prior completed projection authority",
+            ),
             Self::EndpointBindingMismatch => {
                 f.write_str("projection endpoint is not enrolled to this graph capability")
             }

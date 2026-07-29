@@ -20,13 +20,15 @@ use crate::model::Graph;
 use crate::oplog::{
     execute_manifested_projection_work, plan_affected_import, plan_projection,
     recover_incomplete_projections, ApplicationRuntimeRoot, AuthorBatch, BatchDisposition,
-    BatchId, BatchOrigin, BlobDescription, BlockId, BlockLocation, BlockOwner, CrdtPeerId, DeviceId,
-    DocumentId, FrontierV2, ImportPlanStatus, LineageDigest, ManagedPath, ManagedTextKind,
-    ObjectStore, OperationTransaction, PageId, PageState, ProjectionClaim,
-    ProjectionEndpointBinding, ProjectionEndpointId, ProjectionIntent, ProjectionPrecondition,
-    ProjectionRecovery, ProjectionWorkStatus, RebuildSource, SemanticOperation, SessionId,
-    ShardedHotEngine, SqliteFrontier, WorkspaceId,
+    BatchId, BatchInspection, BatchOrigin, BlobDescription, BlockId, BlockLocation, BlockOwner,
+    CrdtPeerId, DeviceId, DocumentId, FrontierV2, ImportPlanStatus, LineageDigest,
+    ManagedPath, ManagedTextKind, ManifestProjectionTarget, ManifestedProjectionIntent,
+    ObjectKind, ObjectStore, OperationTransaction, PageId, PageState, ProjectionClaim,
+    ProjectionEndpointBinding, ProjectionEndpointId, ProjectionError, ProjectionIntent,
+    ProjectionPrecondition, ProjectionRecovery, ProjectionWorkStatus, ProjectionWorkTarget,
+    RebuildSource, SemanticOperation, SessionId, ShardedHotEngine, SqliteFrontier, WorkspaceId,
 };
+use crate::oplog::projection::execute_receiver_local_projection_under_handoff;
 use crate::oplog::projection_store::ProjectionCleanupRetirementAuthority;
 use crate::model::{
     fail_next_projection_directory_sync_for_test, projection_graph_test_counters,
@@ -38,6 +40,7 @@ use super::super::{
     completion_filename, projection_store_test_counters, reset_projection_store_test_counters,
     reset_projection_store_test_hooks, ProjectionStoreTestCounters, ATTEMPT_PUBLICATION_HOOK,
     COMPLETIONS_DIR, COMPLETION_RETAINED_SLOT_HOOK, MUTATION_AUTHORITY_CAPTURED_HOOK,
+    MUTATION_AUTHORITY_ACT_HOOK, MUTATION_AUTHORITY_SUFFIX,
 };
 use super::Fixture;
 
@@ -169,6 +172,19 @@ impl CorpusDir {
 impl Drop for CorpusDir {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn copy_regular_tree(source: &Path, destination: &Path) {
+    fs::create_dir_all(destination).unwrap();
+    for entry in fs::read_dir(source).unwrap() {
+        let entry = entry.unwrap();
+        let target = destination.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_regular_tree(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), target).unwrap();
+        }
     }
 }
 
@@ -577,6 +593,681 @@ fn assert_fixture_semantics(manifest: &CorpusManifest) {
     let import = plan_affected_import(&graph, &receipts, &engine, &[page.path.as_str()]);
     assert_eq!(import.status(), ImportPlanStatus::Noop);
     assert!(import.inventory().unwrap().present(&page.path).is_none());
+}
+
+#[test]
+fn already_absent_receiver_projection_completes_foreign_deletion() {
+    let manifest = corpus_manifest();
+    let deleted = manifest
+        .pages
+        .iter()
+        .find(|page| page.deleted)
+        .expect("crash corpus deleted page");
+    let (dir, source_graph, source_receipts, writer, source_engine, _, work) =
+        corpus_manifested_deletion_fixture("receiver-already-absent-deletion", deleted);
+    let source = match writer.inspect_batch(work.batch_id()).unwrap() {
+        BatchInspection::Ready(batch) => batch
+            .objects()
+            .iter()
+            .find(|object| object.kind() == ObjectKind::ProjectionIntent)
+            .map(|object| ManifestedProjectionIntent::decode(object.payload()).unwrap())
+            .expect("foreign deletion projection intent"),
+        other => panic!("deletion batch is not ready: {other:?}"),
+    };
+    assert_eq!(source.target(), &ManifestProjectionTarget::Absent);
+    assert_eq!(source.path().as_str(), deleted.path);
+    drop(source_engine);
+    drop(source_receipts);
+    drop(source_graph);
+
+    let receiver =
+        corpus_provider_receiver(&dir, &source, work.batch_id(), ReceiverInitialTarget::Absent);
+    let receiver_state = receiver
+        .engine
+        .page_state_for_test(source.page_id())
+        .unwrap();
+    assert!(matches!(
+        receiver_state,
+        Some(PageState::Tombstone { .. })
+    ), "receiver state is {receiver_state:?}");
+    assert!(
+        receiver
+            .graph
+            .read_projection_input(source.path())
+            .unwrap()
+            .is_none(),
+        "receiver must begin at the exact already-absent target"
+    );
+
+    let receiver_intent = ProjectionIntent::new(
+        corpus_workspace(1),
+        source.page_id(),
+        source.path().clone(),
+        source.post_frontier().clone(),
+        source.claim_evidence().to_vec(),
+        ProjectionPrecondition::Absent,
+        BlobDescription::of(&[]),
+        Vec::new(),
+    )
+    .unwrap();
+    let handoff = receiver
+        .graph
+        .mint_handoff_safe(corpus_workspace(1), receiver.binding)
+        .unwrap()
+        .into_publisher_guard()
+        .into_published_latch();
+    let executed = execute_receiver_local_projection_under_handoff(
+        &receiver.graph,
+        &receiver.receipts,
+        &receiver.engine,
+        &source,
+        &handoff,
+        true,
+    );
+    assert!(
+        matches!(executed, Ok(Some(true))),
+        "an accepted foreign deletion whose receiver target is already absent must complete: \
+         {executed:?}"
+    );
+    assert!(
+        receiver
+            .receipts
+            .load_completion(&receiver_intent)
+            .unwrap()
+            .is_some(),
+        "receiver-local completion must durably bind the accepted tombstone"
+    );
+    assert!(
+        receiver
+            .graph
+            .read_projection_input(source.path())
+            .unwrap()
+            .is_none(),
+        "already-absent receiver bytes must remain absent"
+    );
+    let completed = receiver
+        .engine
+        .projection_work_index()
+        .unwrap()
+        .completed_receipts_for_path(source.path())
+        .unwrap();
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0].target(), ProjectionWorkTarget::Absent);
+    assert_ne!(
+        completed[0].target(),
+        ProjectionWorkTarget::Present(BlobDescription::of(&[])),
+        "an absent completion must not collapse into a present empty target"
+    );
+    let import = plan_affected_import(
+        &receiver.graph,
+        &receiver.receipts,
+        &receiver.engine,
+        &[source.path().as_str()],
+    );
+    assert_eq!(
+        import.status(),
+        ImportPlanStatus::Noop,
+        "Graph/import interpretation must agree with the oplog tombstone"
+    );
+}
+
+#[test]
+fn projected_receiver_bytes_are_removed_by_foreign_deletion() {
+    let manifest = corpus_manifest();
+    let deleted = deleted_fixture_page(&manifest);
+    let (dir, source_graph, source_receipts, writer, source_engine, _, work) =
+        corpus_manifested_deletion_fixture("receiver-projected-deletion", deleted);
+    let source = manifested_intent_for_work(&writer, &work);
+    drop(source_engine);
+    drop(source_receipts);
+    drop(source_graph);
+    let receiver =
+        corpus_provider_receiver(&dir, &source, work.batch_id(), ReceiverInitialTarget::Projected);
+    let prior = receiver
+        .graph
+        .read_projection_input(source.path())
+        .unwrap()
+        .expect("receiver projected prior bytes");
+    let handoff = receiver
+        .graph
+        .mint_handoff_safe(corpus_workspace(1), receiver.binding)
+        .unwrap()
+        .into_publisher_guard()
+        .into_published_latch();
+    assert_eq!(
+        execute_receiver_local_projection_under_handoff(
+            &receiver.graph,
+            &receiver.receipts,
+            &receiver.engine,
+            &source,
+            &handoff,
+            true,
+        )
+        .unwrap(),
+        Some(true)
+    );
+    assert!(receiver
+        .graph
+        .read_projection_input(source.path())
+        .unwrap()
+        .is_none());
+    let completed = receiver
+        .engine
+        .projection_work_index()
+        .unwrap()
+        .completed_receipts_for_path(source.path())
+        .unwrap();
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0].target(), ProjectionWorkTarget::Absent);
+    assert_ne!(BlobDescription::of(&prior), BlobDescription::of(&[]));
+}
+
+#[test]
+fn changed_receiver_bytes_refuse_foreign_deletion_and_preserve_evidence() {
+    let manifest = corpus_manifest();
+    let deleted = deleted_fixture_page(&manifest);
+    let (dir, source_graph, source_receipts, writer, source_engine, _, work) =
+        corpus_manifested_deletion_fixture("receiver-changed-deletion", deleted);
+    let source = manifested_intent_for_work(&writer, &work);
+    drop(source_engine);
+    drop(source_receipts);
+    drop(source_graph);
+    let receiver =
+        corpus_provider_receiver(&dir, &source, work.batch_id(), ReceiverInitialTarget::Projected);
+    let changed = b"- receiver changed after its completed projection\n";
+    fs::write(receiver.graph_root.join(source.path().as_str()), changed).unwrap();
+    let before = receiver
+        .engine
+        .projection_work_index()
+        .unwrap()
+        .completed_receipts_for_path(source.path())
+        .unwrap();
+    assert_eq!(before.len(), 1);
+    assert!(matches!(
+        before[0].target(),
+        ProjectionWorkTarget::Present(_)
+    ));
+    let handoff = receiver
+        .graph
+        .mint_handoff_safe(corpus_workspace(1), receiver.binding)
+        .unwrap()
+        .into_publisher_guard()
+        .into_published_latch();
+    assert!(matches!(
+        execute_receiver_local_projection_under_handoff(
+            &receiver.graph,
+            &receiver.receipts,
+            &receiver.engine,
+            &source,
+            &handoff,
+            true,
+        ),
+        Err(ProjectionError::ReceiverBaseMismatch)
+    ));
+    assert_eq!(
+        receiver
+            .graph
+            .read_projection_input(source.path())
+            .unwrap()
+            .unwrap(),
+        changed
+    );
+    assert_eq!(
+        receiver
+            .engine
+            .projection_work_index()
+            .unwrap()
+            .completed_receipts_for_path(source.path())
+            .unwrap(),
+        before,
+        "refusal must preserve the prior authenticated completion"
+    );
+    assert!(receiver
+        .receipts
+        .validated_catalog()
+        .unwrap()
+        .iter()
+        .all(|entry| {
+            entry.intent.path() != source.path()
+                || entry.intent.frontier() != source.post_frontier()
+                || entry.completion.is_none()
+        }));
+}
+
+#[test]
+fn already_absent_foreign_deletion_retry_is_idempotent_through_path_indexing() {
+    let manifest = corpus_manifest();
+    let deleted = deleted_fixture_page(&manifest);
+    let (dir, source_graph, source_receipts, writer, source_engine, _, work) =
+        corpus_manifested_deletion_fixture("receiver-absent-retry", deleted);
+    let source = manifested_intent_for_work(&writer, &work);
+    drop(source_engine);
+    drop(source_receipts);
+    drop(source_graph);
+    let receiver =
+        corpus_provider_receiver(&dir, &source, work.batch_id(), ReceiverInitialTarget::Absent);
+    let handoff = receiver
+        .graph
+        .mint_handoff_safe(corpus_workspace(1), receiver.binding)
+        .unwrap()
+        .into_publisher_guard()
+        .into_published_latch();
+    assert_eq!(
+        execute_receiver_local_projection_under_handoff(
+            &receiver.graph,
+            &receiver.receipts,
+            &receiver.engine,
+            &source,
+            &handoff,
+            false,
+        )
+        .unwrap(),
+        None
+    );
+    assert_eq!(
+        execute_receiver_local_projection_under_handoff(
+            &receiver.graph,
+            &receiver.receipts,
+            &receiver.engine,
+            &source,
+            &handoff,
+            true,
+        )
+        .unwrap(),
+        Some(true)
+    );
+    assert_eq!(
+        execute_receiver_local_projection_under_handoff(
+            &receiver.graph,
+            &receiver.receipts,
+            &receiver.engine,
+            &source,
+            &handoff,
+            true,
+        )
+        .unwrap(),
+        Some(false)
+    );
+    let completed = receiver
+        .engine
+        .projection_work_index()
+        .unwrap()
+        .completed_receipts_for_path(source.path())
+        .unwrap();
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0].target(), ProjectionWorkTarget::Absent);
+    receiver
+        .receipts
+        .load_completed_receipt(&completed[0])
+        .unwrap();
+}
+
+#[test]
+fn already_absent_foreign_deletion_recovers_after_attempt_before_confirmation() {
+    let manifest = corpus_manifest();
+    let deleted = deleted_fixture_page(&manifest);
+    let (dir, source_graph, source_receipts, writer, source_engine, _, work) =
+        corpus_manifested_deletion_fixture("receiver-absent-attempt-retry", deleted);
+    let source = manifested_intent_for_work(&writer, &work);
+    drop(source_engine);
+    drop(source_receipts);
+    drop(source_graph);
+    let receiver =
+        corpus_provider_receiver(&dir, &source, work.batch_id(), ReceiverInitialTarget::Absent);
+    let handoff = receiver
+        .graph
+        .mint_handoff_safe(corpus_workspace(1), receiver.binding)
+        .unwrap()
+        .into_publisher_guard()
+        .into_published_latch();
+
+    let receipt_root = receiver.receipts.root_path().to_path_buf();
+    let crash_receipt_root = receipt_root.clone();
+    MUTATION_AUTHORITY_ACT_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            assert!(
+                fs::read_dir(&crash_receipt_root).unwrap().any(|entry| {
+                    entry
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .ends_with(MUTATION_AUTHORITY_SUFFIX)
+                }),
+                "mutation authority must be durable before the crash cut"
+            );
+            panic!("crash before already-absent confirmation");
+        }));
+    });
+    let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        execute_receiver_local_projection_under_handoff(
+            &receiver.graph,
+            &receiver.receipts,
+            &receiver.engine,
+            &source,
+            &handoff,
+            true,
+        )
+    }));
+    assert!(
+        interrupted.is_err(),
+        "the injected cut must interrupt after the absent attempt begins"
+    );
+    let incomplete = receiver
+        .receipts
+        .incomplete_intents()
+        .unwrap()
+        .into_iter()
+        .filter(|intent| {
+            intent.page_id() == source.page_id()
+                && intent.path() == source.path()
+                && intent.frontier() == source.post_frontier()
+                && intent.precondition() == &ProjectionPrecondition::Absent
+        })
+        .collect::<Vec<_>>();
+    let [intent] = incomplete.as_slice() else {
+        panic!("already-absent receiver deletion must retain one exact intent");
+    };
+    assert!(
+        receiver.receipts.load_base(intent).unwrap().is_none(),
+        "an already-absent confirmation attempt must not invent base bytes"
+    );
+    assert_eq!(
+        receiver
+            .receipts
+            .load_attempt_reservations(intent)
+            .unwrap()
+            .len(),
+        1,
+        "the interrupted confirmation must retain its durable attempt"
+    );
+    assert!(receiver.receipts.load_completion(intent).unwrap().is_none());
+    assert!(receiver
+        .graph
+        .read_projection_input(source.path())
+        .unwrap()
+        .is_none());
+
+    let CorpusProviderReceiver {
+        graph_root,
+        graph,
+        receipts,
+        engine,
+        binding,
+    } = receiver;
+    drop(handoff);
+    drop(receipts);
+    drop(graph);
+    let graph = Graph::open(&graph_root);
+    let receipts = crate::oplog::ProjectionReceiptStore::open_for_endpoint(
+        &receipt_root,
+        corpus_workspace(1),
+        binding,
+    )
+    .unwrap();
+    let receiver = CorpusProviderReceiver {
+        graph_root,
+        graph,
+        receipts,
+        engine,
+        binding,
+    };
+    let handoff = receiver
+        .graph
+        .mint_handoff_safe(corpus_workspace(1), receiver.binding)
+        .unwrap()
+        .into_publisher_guard()
+        .into_published_latch();
+
+    assert_eq!(
+        execute_receiver_local_projection_under_handoff(
+            &receiver.graph,
+            &receiver.receipts,
+            &receiver.engine,
+            &source,
+            &handoff,
+            true,
+        )
+        .unwrap(),
+        Some(true)
+    );
+    assert_eq!(
+        execute_receiver_local_projection_under_handoff(
+            &receiver.graph,
+            &receiver.receipts,
+            &receiver.engine,
+            &source,
+            &handoff,
+            true,
+        )
+        .unwrap(),
+        Some(false)
+    );
+    assert!(
+        receiver.receipts.load_base(intent).unwrap().is_none(),
+        "retry confirmation must remain base-free"
+    );
+    assert!(receiver
+        .graph
+        .read_projection_input(source.path())
+        .unwrap()
+        .is_none());
+    let completed = receiver
+        .engine
+        .projection_work_index()
+        .unwrap()
+        .completed_receipts_for_path(source.path())
+        .unwrap();
+    assert_eq!(completed.len(), 1, "path indexing must be idempotent");
+    assert_eq!(completed[0].target(), ProjectionWorkTarget::Absent);
+    let import = plan_affected_import(
+        &receiver.graph,
+        &receiver.receipts,
+        &receiver.engine,
+        &[source.path().as_str()],
+    );
+    assert_eq!(
+        import.status(),
+        ImportPlanStatus::Noop,
+        "Graph/import and accepted oplog tombstone must remain a semantic Noop"
+    );
+    assert!(import
+        .inventory()
+        .unwrap()
+        .present(source.path().as_str())
+        .is_none());
+}
+
+#[test]
+fn accepted_recreation_blocks_stale_foreign_tombstone_removal() {
+    let manifest = corpus_manifest();
+    let deleted = deleted_fixture_page(&manifest);
+    let (dir, source_graph, source_receipts, writer, mut source_engine, _, work) =
+        corpus_manifested_deletion_fixture("receiver-recreated-deletion", deleted);
+    let source = manifested_intent_for_work(&writer, &work);
+    let recreate_batch = BatchId::from_uuid(corpus_uuid(77_000));
+    let recreated_page_id = PageId::from_uuid(corpus_uuid(77_010));
+    let recreated = source_engine
+        .prepare_bootstrap_transaction(
+            AuthorBatch {
+                batch_id: recreate_batch,
+                author_device_id: DeviceId::from_uuid(corpus_uuid(77_001)),
+                author_session_id: SessionId::from_uuid(corpus_uuid(77_002)),
+                crdt_peer_id: CrdtPeerId::from_u64(77_003),
+            },
+            &OperationTransaction::new(vec![SemanticOperation::CreatePage {
+                page_id: recreated_page_id,
+                home_document_id: DocumentId::from_uuid(corpus_uuid(77_011)),
+                name: crate::oplog::LogicalPageName::parse(
+                    "Crash Corpus Projection Recreated",
+                )
+                .unwrap(),
+                path: source.path().clone(),
+                kind: ManagedTextKind::Page,
+            }])
+            .unwrap(),
+        )
+        .unwrap();
+    writer
+        .publish_bootstrap_prepared_for_test(&recreated)
+        .unwrap();
+    assert!(matches!(
+        source_engine
+            .stage_archive_batch(recreate_batch)
+            .unwrap()
+            .disposition(),
+        BatchDisposition::Accepted { .. }
+    ));
+    drop(source_engine);
+    drop(source_receipts);
+    drop(source_graph);
+
+    let mut receiver =
+        corpus_provider_receiver(&dir, &source, work.batch_id(), ReceiverInitialTarget::Absent);
+    assert!(matches!(
+        receiver
+            .engine
+            .stage_archive_batch(recreate_batch)
+            .unwrap()
+            .disposition(),
+        BatchDisposition::Accepted { .. }
+    ));
+    crate::oplog::write_projection_exact(
+        &receiver.graph,
+        &receiver.receipts,
+        &receiver.engine,
+        recreated_page_id,
+        None,
+    )
+    .unwrap();
+    let recreated_bytes = receiver
+        .graph
+        .read_projection_input(source.path())
+        .unwrap()
+        .expect("accepted recreation projection");
+    let handoff = receiver
+        .graph
+        .mint_handoff_safe(corpus_workspace(1), receiver.binding)
+        .unwrap()
+        .into_publisher_guard()
+        .into_published_latch();
+    assert_eq!(
+        execute_receiver_local_projection_under_handoff(
+            &receiver.graph,
+            &receiver.receipts,
+            &receiver.engine,
+            &source,
+            &handoff,
+            true,
+        )
+        .unwrap(),
+        Some(false),
+        "the stale deletion must not authorize against a superseding recreation"
+    );
+    assert_eq!(
+        receiver
+            .graph
+            .read_projection_input(source.path())
+            .unwrap()
+            .unwrap(),
+        recreated_bytes
+    );
+}
+
+#[test]
+fn receiver_foreign_deletion_recovers_after_removal_before_completion() {
+    let manifest = corpus_manifest();
+    let deleted = deleted_fixture_page(&manifest);
+    let (dir, source_graph, source_receipts, writer, source_engine, _, work) =
+        corpus_manifested_deletion_fixture("receiver-removal-retry", deleted);
+    let source = manifested_intent_for_work(&writer, &work);
+    drop(source_engine);
+    drop(source_receipts);
+    drop(source_graph);
+    let receiver =
+        corpus_provider_receiver(&dir, &source, work.batch_id(), ReceiverInitialTarget::Projected);
+    let handoff = receiver
+        .graph
+        .mint_handoff_safe(corpus_workspace(1), receiver.binding)
+        .unwrap()
+        .into_publisher_guard()
+        .into_published_latch();
+    assert_eq!(
+        execute_receiver_local_projection_under_handoff(
+            &receiver.graph,
+            &receiver.receipts,
+            &receiver.engine,
+            &source,
+            &handoff,
+            false,
+        )
+        .unwrap(),
+        None
+    );
+    let incomplete = receiver
+        .receipts
+        .incomplete_intents()
+        .unwrap()
+        .into_iter()
+        .filter(|intent| {
+            intent.page_id() == source.page_id()
+                && intent.path() == source.path()
+                && intent.frontier() == source.post_frontier()
+                && intent.target() == BlobDescription::of(&[])
+        })
+        .collect::<Vec<_>>();
+    let [intent] = incomplete.as_slice() else {
+        panic!("receiver deletion must publish one incomplete exact intent");
+    };
+    let base = receiver
+        .receipts
+        .load_base(intent)
+        .unwrap()
+        .expect("projected receiver deletion base");
+    let reservation = receiver.receipts.reserve_attempt(intent).unwrap();
+    let mut mutation = receiver
+        .receipts
+        .begin_mutation(intent, Some(&reservation))
+        .unwrap();
+    handoff
+        .remove_page_projection(
+            &receiver.graph,
+            intent.path().as_str(),
+            base.bytes(),
+            &mut mutation,
+        )
+        .unwrap();
+    drop(mutation);
+    assert!(receiver
+        .graph
+        .read_projection_input(source.path())
+        .unwrap()
+        .is_none());
+    assert!(receiver.receipts.load_completion(intent).unwrap().is_none());
+
+    assert_eq!(
+        execute_receiver_local_projection_under_handoff(
+            &receiver.graph,
+            &receiver.receipts,
+            &receiver.engine,
+            &source,
+            &handoff,
+            true,
+        )
+        .unwrap(),
+        Some(true)
+    );
+    let completed = receiver
+        .engine
+        .projection_work_index()
+        .unwrap()
+        .completed_receipts_for_path(source.path())
+        .unwrap();
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0].target(), ProjectionWorkTarget::Absent);
+    receiver
+        .receipts
+        .load_completed_receipt(&completed[0])
+        .unwrap();
 }
 
 fn case_spec(id: &str) -> (&'static str, &'static str) {
@@ -1253,6 +1944,148 @@ fn corpus_manifested_deletion_fixture(
         .unwrap()
         .unwrap();
     (dir, graph, receipts, writer, engine, binding, work)
+}
+
+#[derive(Clone, Copy)]
+enum ReceiverInitialTarget {
+    Absent,
+    Projected,
+}
+
+struct CorpusProviderReceiver {
+    graph_root: PathBuf,
+    graph: Graph,
+    receipts: crate::oplog::ProjectionReceiptStore,
+    engine: ShardedHotEngine,
+    binding: ProjectionEndpointBinding,
+}
+
+fn manifested_intent_for_work(
+    archive: &ObjectStore,
+    work: &crate::oplog::ProjectionWork,
+) -> ManifestedProjectionIntent {
+    match archive.inspect_batch(work.batch_id()).unwrap() {
+        BatchInspection::Ready(batch) => batch
+            .objects()
+            .iter()
+            .find(|object| {
+                object.kind() == ObjectKind::ProjectionIntent
+                    && object.document_id() == work.intent().document_id()
+            })
+            .map(|object| ManifestedProjectionIntent::decode(object.payload()).unwrap())
+            .expect("manifested projection work intent"),
+        other => panic!("projection work batch is not ready: {other:?}"),
+    }
+}
+
+/// Build an isolated receiver from the same immutable provider payloads used
+/// by the crash corpus. Archive copying stays behind this shared two-device
+/// boundary so receiver scenarios differ only in their semantic initial
+/// projection target.
+fn corpus_provider_receiver(
+    dir: &CorpusDir,
+    source: &ManifestedProjectionIntent,
+    deletion_batch_id: BatchId,
+    initial_target: ReceiverInitialTarget,
+) -> CorpusProviderReceiver {
+    let workspace = corpus_workspace(1);
+    let archive_root = dir.path().join(format!(
+        "receiver-archive-{}",
+        match initial_target {
+            ReceiverInitialTarget::Absent => "absent",
+            ReceiverInitialTarget::Projected => "projected",
+        }
+    ));
+    drop(ObjectStore::open(&archive_root, workspace).unwrap());
+    for namespace in ["objects", "batches"] {
+        copy_regular_tree(
+            &dir.path().join("archive").join(namespace),
+            &archive_root.join(namespace),
+        );
+    }
+    let receiver_archive = ObjectStore::open(&archive_root, workspace).unwrap();
+    assert!(
+        receiver_archive.committed_manifests().unwrap().len() >= 2,
+        "provider fixture requires create then delete"
+    );
+    drop(receiver_archive);
+
+    let graph_root = dir.path().join(format!(
+        "receiver-graph-{}",
+        match initial_target {
+            ReceiverInitialTarget::Absent => "absent",
+            ReceiverInitialTarget::Projected => "projected",
+        }
+    ));
+    fs::create_dir_all(graph_root.join("pages")).unwrap();
+    fs::create_dir_all(graph_root.join("journals")).unwrap();
+    fs::create_dir_all(
+        graph_root.join(
+            Path::new(source.path().as_str())
+                .parent()
+                .expect("managed projection parent"),
+        ),
+    )
+    .unwrap();
+    let graph = Graph::open(&graph_root);
+    let binding = corpus_binding(
+        &graph,
+        match initial_target {
+            ReceiverInitialTarget::Absent => 75_000,
+            ReceiverInitialTarget::Projected => 76_000,
+        },
+    );
+    assert_ne!(binding.endpoint_id(), source.source_endpoint_id());
+    let receipts = crate::oplog::ProjectionReceiptStore::open_for_endpoint(
+        &dir.path().join(format!(
+            "receiver-receipts-{}",
+            match initial_target {
+                ReceiverInitialTarget::Absent => "absent",
+                ReceiverInitialTarget::Projected => "projected",
+            }
+        )),
+        workspace,
+        binding,
+    )
+    .unwrap();
+    let mut engine = ShardedHotEngine::with_enrolled_projection(
+        ObjectStore::open(&archive_root, workspace).unwrap(),
+        LineageDigest::of(b"crash-corpus-projection-lineage"),
+        DocumentId::from_uuid(corpus_uuid(700)),
+        &graph,
+        &receipts,
+    );
+    assert!(matches!(
+        engine
+            .stage_archive_batch(BatchId::from_uuid(corpus_uuid(704)))
+            .unwrap()
+            .disposition(),
+        BatchDisposition::Accepted { .. }
+    ));
+    if matches!(initial_target, ReceiverInitialTarget::Projected) {
+        crate::oplog::write_projection_exact(
+            &graph,
+            &receipts,
+            &engine,
+            source.page_id(),
+            None,
+        )
+        .unwrap();
+    }
+    assert!(matches!(
+        engine
+            .stage_archive_batch(deletion_batch_id)
+            .unwrap()
+            .disposition(),
+        BatchDisposition::Accepted { .. }
+    ));
+    CorpusProviderReceiver {
+        graph_root,
+        graph,
+        receipts,
+        engine,
+        binding,
+    }
 }
 
 #[cfg(unix)]

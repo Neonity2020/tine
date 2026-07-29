@@ -4581,7 +4581,7 @@ fn capture_import_scope(
                         error.to_string(),
                     )
                 })?;
-                let work = engine
+                let completed = engine
                     .authorize_projected_release(&work_index, &release)
                     .map_err(|error| {
                         authority_block(
@@ -4595,10 +4595,10 @@ fn capture_import_scope(
                     if entry.intent.workspace_id() != engine.workspace_id()
                         || entry.intent.page_id() != release.prior_page_id()
                         || entry.intent.path() != path
-                        || entry.intent.frontier() != work.post_frontier()
+                        || entry.intent.frontier() != completed.frontier()
                         || entry.intent.target() != BlobDescription::of(&[])
-                        || entry.completed.page_id() != work.page_id()
-                        || entry.completed.frontier() != work.post_frontier()
+                        || entry.completed.page_id() != completed.page_id()
+                        || entry.completed.frontier() != completed.frontier()
                         || entry.completed.target() != super::ProjectionWorkTarget::Absent
                     {
                         continue;

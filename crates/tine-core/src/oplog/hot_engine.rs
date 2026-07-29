@@ -3170,6 +3170,38 @@ impl ProjectionWriteAuthorization {
     }
 }
 
+/// Engine-issued proof that one accepted immutable projection intent names the
+/// authenticated current release of an exact path and reaches a catalog
+/// tombstone at its declared durable frontier.
+///
+/// Unlike [`ProjectionWriteAuthorization`], this authority carries no live
+/// [`MaterializedPage`] and can authorize only an absent projection target.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct ProjectionTombstoneAuthorization {
+    page_id: PageId,
+    path: ManagedPath,
+    prior_frontier: Option<FrontierV2>,
+    frontier: FrontierV2,
+}
+
+impl ProjectionTombstoneAuthorization {
+    pub(crate) const fn page_id(&self) -> PageId {
+        self.page_id
+    }
+
+    pub(crate) fn path(&self) -> &ManagedPath {
+        &self.path
+    }
+
+    pub(crate) fn prior_frontier(&self) -> Option<&FrontierV2> {
+        self.prior_frontier.as_ref()
+    }
+
+    pub(crate) fn frontier(&self) -> &FrontierV2 {
+        &self.frontier
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LogseqUuidClaim {
     pub logseq_uuid: LogseqUuid,
@@ -11393,7 +11425,7 @@ impl ShardedHotEngine {
         &self,
         index: &ProjectionWorkIndex,
         release: &PortablePathReleased,
-    ) -> Result<ProjectionWork, EngineError> {
+    ) -> Result<super::ProjectionCompletedReceipt, EngineError> {
         self.begin_point_operation();
         self.ensure_not_blocked()?;
         let endpoint = self.projection_endpoint.ok_or_else(|| {
@@ -11455,14 +11487,30 @@ impl ShardedHotEngine {
                 "projection release is not the authenticated current path fence".into(),
             ));
         }
-        index
-            .completed_release(
-                release.release_batch(),
-                record.manifest_fingerprint,
-                release.prior_page_id(),
-                release.prior_exact_path(),
+        let completed = index
+            .completed_receipts_for_path(release.prior_exact_path())
+            .map_err(|error| EngineError::ProjectionWork(error.to_string()))?;
+        let mut exact = completed.into_iter().filter(|receipt| {
+            receipt.page_id() == release.prior_page_id()
+                && receipt.path() == release.prior_exact_path()
+                && receipt.target() == ProjectionWorkTarget::Absent
+        });
+        let completed = exact.next().ok_or_else(|| {
+            EngineError::ProjectionWork(
+                "projection release has no authenticated absent completion".into(),
             )
-            .map_err(|error| EngineError::ProjectionWork(error.to_string()))
+        })?;
+        if exact.next().is_some()
+            || !self.projection_frontier_contains_path_acquisition(
+                completed.frontier(),
+                release.release_batch(),
+            )?
+        {
+            return Err(EngineError::ProjectionWork(
+                "projection release completion is not exact".into(),
+            ));
+        }
+        Ok(completed)
     }
 
     fn projection_frontier_dominates(
@@ -11558,6 +11606,161 @@ impl ShardedHotEngine {
         Ok(ProjectionWriteAuthorization {
             state,
             claim_root: self.logseq_claim_root,
+        })
+    }
+
+    /// Authorize receiver-local completion of one accepted foreign deletion.
+    ///
+    /// The immutable manifested intent supplies the historical exact path, but
+    /// it grants no authority by itself. This method rebinds it to the current
+    /// durable engine history, reconstructs its exact catalog tombstone,
+    /// verifies every declared frontier head, and requires its release to
+    /// remain the authenticated current portable-path fence. A later
+    /// acquisition or release therefore invalidates this authority even when
+    /// the catalog has returned to an identical tombstone value.
+    pub(crate) fn authorize_projection_tombstone(
+        &self,
+        source: &ManifestedProjectionIntent,
+    ) -> Result<ProjectionTombstoneAuthorization, EngineError> {
+        self.begin_point_operation();
+        self.ensure_not_blocked()?;
+        if source.workspace_id() != self.workspace_id
+            || !matches!(source.target(), ManifestProjectionTarget::Absent)
+            || !source.claim_evidence().is_empty()
+        {
+            return Err(EngineError::ProjectionAuthorizationUnavailable);
+        }
+        let store = self
+            .archive_store
+            .as_ref()
+            .ok_or(EngineError::ProjectionAuthorizationUnavailable)?;
+        let batch = match store
+            .inspect_batch(source.source_batch_id())
+            .map_err(|error| EngineError::Archive(error.to_string()))?
+        {
+            BatchInspection::Ready(batch) => batch,
+            BatchInspection::Absent | BatchInspection::Staged { .. } => {
+                return Err(EngineError::ProjectionAuthorizationUnavailable);
+            }
+        };
+        let durable = self
+            .durable_endpoint_history_record_at_live_head(source.source_batch_id())?
+            .ok_or(EngineError::ProjectionAuthorizationUnavailable)?;
+        if !matches!(durable.status, ArchiveStatus::Accepted { .. })
+            || durable.manifest_fingerprint != batch_fingerprint(&batch)
+            || durable.portable_path_key_version != super::PORTABLE_PATH_KEY_VERSION
+            || durable.portable_path_root != source.portable_path_index_root()
+        {
+            return Err(EngineError::ProjectionAuthorizationUnavailable);
+        }
+        let mut matched_source = false;
+        for object in batch
+            .objects()
+            .iter()
+            .filter(|object| object.kind() == ObjectKind::ProjectionIntent)
+        {
+            let manifested = ManifestedProjectionIntent::decode(object.payload())
+                .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
+            if manifested == *source {
+                if matched_source {
+                    return Err(EngineError::ProjectionAuthorizationUnavailable);
+                }
+                matched_source = true;
+            }
+        }
+        if !matched_source {
+            return Err(EngineError::ProjectionAuthorizationUnavailable);
+        }
+        let prior_frontier = match source.precondition() {
+            ManifestProjectionPrecondition::Absent => None,
+            ManifestProjectionPrecondition::Present { base } => {
+                let object = batch
+                    .objects()
+                    .iter()
+                    .find(|object| {
+                        object.kind() == ObjectKind::AnnotatedBaseBlob
+                            && object.document_id() == base.document_id()
+                            && object.descriptor().is_ok_and(|descriptor| {
+                                descriptor.content_digest() == base.content_digest()
+                                    && descriptor.encoded_byte_length()
+                                        == base.encoded_byte_length()
+                            })
+                    })
+                    .ok_or(EngineError::ProjectionAuthorizationUnavailable)?;
+                let base = AnnotatedProjectionBase::decode(object.payload())
+                    .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
+                if base.workspace_id() != self.workspace_id
+                    || base.source_page_id() != source.page_id()
+                    || base.source_path() != source.path()
+                {
+                    return Err(EngineError::ProjectionAuthorizationUnavailable);
+                }
+                Some(base.prior_frontier().clone())
+            }
+        };
+
+        let documents = self.reconstruct_projection_frontier(source.post_frontier())?;
+        let catalog = documents
+            .get(&self.catalog_document_id)
+            .ok_or(EngineError::MissingDocument(self.catalog_document_id))?;
+        let tombstone = validate_catalog_page(self.catalog_document_id, catalog, source.page_id())?
+            .ok_or(EngineError::PageNotFound(source.page_id()))?;
+        if !matches!(tombstone, PageState::Tombstone { .. }) {
+            return Err(EngineError::ProjectionAuthorizationUnavailable);
+        }
+        let current_catalog = self.clone_validation_document(self.catalog_document_id, 1)?;
+        let current =
+            validate_catalog_page(self.catalog_document_id, &current_catalog, source.page_id())?
+                .ok_or(EngineError::PageNotFound(source.page_id()))?;
+        if current != tombstone {
+            return Err(EngineError::ProjectionAuthorizationUnavailable);
+        }
+
+        let mut accepted_heads = 0_usize;
+        for document in source.post_frontier().documents() {
+            for batch_id in document.direct_dependency_heads() {
+                accepted_heads = accepted_heads.saturating_add(1);
+                let accepted = matches!(
+                    self.archive_status(*batch_id)?,
+                    Some(ArchiveStatus::Accepted { .. })
+                );
+                let ordinary_ready = matches!(
+                    store
+                        .inspect_batch(*batch_id)
+                        .map_err(|error| EngineError::Archive(error.to_string()))?,
+                    BatchInspection::Ready(_)
+                );
+                let bootstrap_ready =
+                    !ordinary_ready && self.load_retained_bootstrap_part(*batch_id)?.is_some();
+                if !accepted || (!ordinary_ready && !bootstrap_ready) {
+                    return Err(EngineError::ProjectionFrontierNotDurable(*batch_id));
+                }
+            }
+        }
+        if accepted_heads == 0 {
+            return Err(EngineError::ProjectionAuthorizationUnavailable);
+        }
+
+        let key = source.path().portable_key().digest();
+        let record = self
+            .portable_path_records_many(&[key])?
+            .remove(&key)
+            .ok_or(EngineError::ProjectionAuthorizationUnavailable)?;
+        let release = record
+            .latest_release()
+            .ok_or(EngineError::ProjectionAuthorizationUnavailable)?;
+        if record.occupied().is_some()
+            || release.prior_page_id() != source.page_id()
+            || release.prior_exact_path() != source.path()
+            || release.release_batch() != source.source_batch_id()
+        {
+            return Err(EngineError::ProjectionAuthorizationUnavailable);
+        }
+        Ok(ProjectionTombstoneAuthorization {
+            page_id: source.page_id(),
+            path: source.path().clone(),
+            prior_frontier,
+            frontier: source.post_frontier().clone(),
         })
     }
 

@@ -1478,6 +1478,7 @@ impl ProjectionReceiptStore {
     pub(crate) fn completed_direct_authority(
         &self,
         intent: &ProjectionIntent,
+        target: ProjectionWorkTarget,
         engine_history_generation: u64,
         engine_history_root: super::ContentDigest,
     ) -> Result<ProjectionDirectCompletionAuthority, ProjectionStoreError> {
@@ -1490,6 +1491,13 @@ impl ProjectionReceiptStore {
             .load_completion(intent)?
             .ok_or(ProjectionStoreError::MissingPriorCompletion)?;
         completion.validate_against(intent)?;
+        let target_matches = match target {
+            ProjectionWorkTarget::Absent => intent.target() == BlobDescription::of(&[]),
+            ProjectionWorkTarget::Present(description) => intent.target() == description,
+        };
+        if !target_matches {
+            return Err(ProjectionStoreError::EndpointBindingMismatch);
+        }
         Ok(
             ProjectionDirectCompletionAuthority::from_durable_completion(
                 endpoint.endpoint_id,
@@ -1497,6 +1505,7 @@ impl ProjectionReceiptStore {
                 self.store_id,
                 engine_history_generation,
                 engine_history_root,
+                target,
                 intent,
                 &completion,
             ),
