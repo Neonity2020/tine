@@ -1346,6 +1346,30 @@
         "failBefore": "proven"
       },
       "notes": "The fail-before/pass-after stress receipt used a 96-batch linear history delivered newest-first: the indexed scheduler converged with exactly 96 manifest registrations while the prior pending-deque scan performed 9,216 readiness inspections. The always-on 24-batch regression preserves the same quadratic discriminator without adding a four-minute suite cost. A focused index neighbor covers multiple parents, an already-active synthetic base head, duplicate registration, unrelated acceptance, exact edge work, and deterministic sibling wake order. Existing shared-provider journeys continue to cover duplicate exact delivery, incomplete manifests becoming complete, restart reconstruction, publication repair, status visibility, and Safe-shutdown refusal while inbound evidence remains blocked."
+    },
+    {
+      "id": "REG-SYNC-SHARED-PROVIDER-R6-FRONTIER-HEADS-001",
+      "title": "SharedActive startup discovers immutable device frontiers without replaying settled provider history",
+      "family": "sync-data-safety",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/oplog/simulator.rs",
+          "crates/tine-core/src/sync_runtime.rs",
+          "src-tauri/src/watcher.rs"
+        ],
+        "scenario": "sync.shared-provider-r6-frontier-head-startup",
+        "failBefore": "proven"
+      },
+      "notes": "A genuine Safe reopen over more than 64 settled manifests enumerates one device head and zero historical manifest/object paths. Unseen device tips walk exact immutable manifests and digest-addressed objects through the dependency index; empty prototype namespaces fall back once and migrate automatically. Crash cuts before head publication and before old-head retirement, unsafe reopen, duplicate/reordered device heads, generated conflict copies, malformed evidence, deleted own heads, and complete namespace loss all remain bounded and cannot let Safe outrun durable discovery publication."
     }
   ]
 }

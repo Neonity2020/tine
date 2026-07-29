@@ -1931,6 +1931,7 @@ impl ProviderRuntime {
                 PROVIDER_OBJECTS_NAMESPACE,
                 PROVIDER_MANIFESTS_NAMESPACE,
                 PROVIDER_ENROLLMENT_NAMESPACE,
+                SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE,
                 PROVIDER_TEMP_NAMESPACE,
                 PROVIDER_REMOVED_NAMESPACE,
                 PROVIDER_RENAME_EVIDENCE_NAMESPACE,
@@ -2265,6 +2266,126 @@ impl ProviderRuntime {
 }
 
 pub(crate) const SHARED_ENROLLMENT_DESCRIPTOR_PATH: &str = "enrollment/shared-enrollment-v1.json";
+pub(crate) const SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE: &str = "frontier-heads-v1";
+const SHARED_PROVIDER_FRONTIER_HEAD_SCHEMA_VERSION: u32 = 1;
+const MAX_SHARED_PROVIDER_FRONTIER_HEAD_BYTES: usize = 256 * 1024;
+const MAX_SHARED_PROVIDER_FRONTIER_TIPS: usize = 4_096;
+
+/// Immutable, content-addressed discovery hint for one device's accepted
+/// causal frontier. A validated record can select exact immutable manifests
+/// for inspection, but never grants graph-write or acceptance authority.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SharedProviderFrontierHeadV1 {
+    schema_version: u32,
+    workspace_id: WorkspaceId,
+    lineage_digest: LineageDigest,
+    descriptor_digest: super::ContentDigest,
+    oplog_protocol_version: u32,
+    author_device_id: DeviceId,
+    accepted_generation: u64,
+    accepted_frontier_root: super::ContentDigest,
+    frontier_tips: Vec<BatchId>,
+}
+
+impl SharedProviderFrontierHeadV1 {
+    pub(crate) fn new(
+        workspace_id: WorkspaceId,
+        lineage_digest: LineageDigest,
+        descriptor_digest: super::ContentDigest,
+        author_device_id: DeviceId,
+        accepted_generation: u64,
+        accepted_frontier_root: super::ContentDigest,
+        mut frontier_tips: Vec<BatchId>,
+    ) -> Result<Self, ScenarioError> {
+        frontier_tips.sort_unstable();
+        frontier_tips.dedup();
+        let record = Self {
+            schema_version: SHARED_PROVIDER_FRONTIER_HEAD_SCHEMA_VERSION,
+            workspace_id,
+            lineage_digest,
+            descriptor_digest,
+            oplog_protocol_version: super::OPLOG_PROTOCOL_VERSION,
+            author_device_id,
+            accepted_generation,
+            accepted_frontier_root,
+            frontier_tips,
+        };
+        record.validate()?;
+        Ok(record)
+    }
+
+    pub(crate) fn encode(&self) -> Result<Vec<u8>, ScenarioError> {
+        self.validate()?;
+        let bytes =
+            serde_json::to_vec(self).map_err(|error| ScenarioError::Encode(error.to_string()))?;
+        if bytes.len() > MAX_SHARED_PROVIDER_FRONTIER_HEAD_BYTES {
+            return Err(ScenarioError::TooLarge(bytes.len()));
+        }
+        Ok(bytes)
+    }
+
+    pub(crate) fn decode(path: &str, bytes: &[u8]) -> Result<Self, ScenarioError> {
+        if bytes.len() > MAX_SHARED_PROVIDER_FRONTIER_HEAD_BYTES {
+            return Err(ScenarioError::TooLarge(bytes.len()));
+        }
+        let record: Self = serde_json::from_slice(bytes)
+            .map_err(|error| ScenarioError::Decode(error.to_string()))?;
+        record.validate()?;
+        if record.encode()? != bytes || record.path()? != path {
+            return Err(ScenarioError::NonCanonical);
+        }
+        Ok(record)
+    }
+
+    pub(crate) fn path(&self) -> Result<String, ScenarioError> {
+        let bytes = self.encode()?;
+        Ok(format!(
+            "{SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE}/{}-{}.head",
+            self.author_device_id,
+            super::ContentDigest::of(&bytes)
+        ))
+    }
+
+    pub(crate) const fn workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
+    }
+
+    pub(crate) const fn lineage_digest(&self) -> LineageDigest {
+        self.lineage_digest
+    }
+
+    pub(crate) const fn descriptor_digest(&self) -> super::ContentDigest {
+        self.descriptor_digest
+    }
+
+    pub(crate) const fn author_device_id(&self) -> DeviceId {
+        self.author_device_id
+    }
+
+    pub(crate) const fn accepted_generation(&self) -> u64 {
+        self.accepted_generation
+    }
+
+    pub(crate) const fn accepted_frontier_root(&self) -> super::ContentDigest {
+        self.accepted_frontier_root
+    }
+
+    pub(crate) fn frontier_tips(&self) -> &[BatchId] {
+        &self.frontier_tips
+    }
+
+    fn validate(&self) -> Result<(), ScenarioError> {
+        if self.schema_version != SHARED_PROVIDER_FRONTIER_HEAD_SCHEMA_VERSION
+            || self.oplog_protocol_version != super::OPLOG_PROTOCOL_VERSION
+            || self.frontier_tips.len() > MAX_SHARED_PROVIDER_FRONTIER_TIPS
+            || self.frontier_tips.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Err(ScenarioError::NonCanonical);
+        }
+        Ok(())
+    }
+}
 
 pub(crate) struct SharedProviderFile {
     pub(crate) path: String,
@@ -2282,6 +2403,8 @@ const PROVIDER_PENDING_PUBLICATION_BYTES: usize = 64;
 pub(crate) struct SharedProviderObservationCursor {
     phase: u8,
     entries: Option<ReadDir>,
+    full: bool,
+    observed_entries: usize,
 }
 
 pub(crate) struct SharedProviderPublicationCursor {
@@ -2353,6 +2476,22 @@ impl SharedProviderTransport {
         )
     }
 
+    pub(crate) fn publish_frontier_head(
+        &mut self,
+        record: &SharedProviderFrontierHeadV1,
+    ) -> Result<String, ScenarioError> {
+        let bytes = record.encode()?;
+        let path = record.path()?;
+        if let Some(existing) = self.read_exact(&path)? {
+            if existing == bytes {
+                return Ok(path);
+            }
+            return Err(ScenarioError::ProviderConflictingBytes(path));
+        }
+        self.publish(&path, &bytes)?;
+        Ok(path)
+    }
+
     fn publish(&mut self, path: &str, bytes: &[u8]) -> Result<(), ScenarioError> {
         let gate = self.journal.acquire_transaction_gate()?;
         let source = format!("generated:{}", provider_digest(bytes));
@@ -2389,6 +2528,9 @@ impl SharedProviderTransport {
             None if path == SHARED_ENROLLMENT_DESCRIPTOR_PATH => {
                 super::enrollment::MAX_ENROLLMENT_RECORD_BYTES
             }
+            None if path.starts_with(&format!("{SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE}/")) => {
+                MAX_SHARED_PROVIDER_FRONTIER_HEAD_BYTES
+            }
             None => MAX_PROVIDER_RESCAN_BYTES,
         };
         let (parent, name) = self
@@ -2398,12 +2540,25 @@ impl SharedProviderTransport {
             .map(|opened| opened.map(|opened| opened.bytes))
     }
 
-    pub(crate) fn observation_cursor(
+    pub(crate) fn head_observation_cursor(
         &self,
     ) -> Result<SharedProviderObservationCursor, ScenarioError> {
         Ok(SharedProviderObservationCursor {
             phase: 0,
             entries: None,
+            full: false,
+            observed_entries: 0,
+        })
+    }
+
+    pub(crate) fn full_observation_cursor(
+        &self,
+    ) -> Result<SharedProviderObservationCursor, ScenarioError> {
+        Ok(SharedProviderObservationCursor {
+            phase: 0,
+            entries: None,
+            full: true,
+            observed_entries: 0,
         })
     }
 
@@ -2441,6 +2596,7 @@ impl SharedProviderTransport {
                     PROVIDER_ENROLLMENT_NAMESPACE
                         | PROVIDER_MANIFESTS_NAMESPACE
                         | PROVIDER_OBJECTS_NAMESPACE
+                        | SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE
                         | PROVIDER_TEMP_NAMESPACE
                         | PROVIDER_REMOVED_NAMESPACE
                         | PROVIDER_RENAME_EVIDENCE_NAMESPACE
@@ -2454,10 +2610,11 @@ impl SharedProviderTransport {
                 }
                 continue;
             }
-            let namespace = match cursor.phase {
-                1 => PROVIDER_ENROLLMENT_NAMESPACE,
-                2 => PROVIDER_MANIFESTS_NAMESPACE,
-                3 => PROVIDER_OBJECTS_NAMESPACE,
+            let namespace = match (cursor.full, cursor.phase) {
+                (_, 1) => PROVIDER_ENROLLMENT_NAMESPACE,
+                (_, 2) => SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE,
+                (true, 3) => PROVIDER_MANIFESTS_NAMESPACE,
+                (true, 4) => PROVIDER_OBJECTS_NAMESPACE,
                 _ => return Ok(None),
             };
             if cursor.entries.is_none() {
@@ -2493,8 +2650,36 @@ impl SharedProviderTransport {
             )
             .map_err(|error| ScenarioError::UnsafeProviderEntry(error.to_string()))?;
             validate_provider_regular_file(&file, &path)?;
+            cursor.observed_entries = cursor.observed_entries.saturating_add(1);
+            if !cursor.full && cursor.observed_entries > MAX_PROVIDER_RESCAN_ENTRIES {
+                return Err(ScenarioError::ProviderRescanLimit);
+            }
             return Ok(Some(path));
         }
+    }
+
+    pub(crate) fn retire_frontier_head(&self, path: &str) -> Result<(), ScenarioError> {
+        if !path.starts_with(&format!("{SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE}/")) {
+            return Err(ScenarioError::InvalidProviderPath(path.into()));
+        }
+        let digest = Sha256::digest(
+            [
+                b"tine/provider-frontier-head-retirement/v1\0".as_slice(),
+                path.as_bytes(),
+            ]
+            .concat(),
+        );
+        let mut event = [0_u8; 8];
+        event.copy_from_slice(&digest[..8]);
+        run_provider_remove_with(
+            &self.runtime,
+            &self.journal,
+            "local",
+            u64::from_be_bytes(event),
+            ProviderTree::Outbox,
+            path,
+            None,
+        )
     }
 
     pub(crate) fn record_pending_publication(
@@ -8118,7 +8303,7 @@ fn valid_provider_path(path: &str) -> bool {
         && !path.contains('\\')
         && !path.starts_with('/')
         && path.split('/').all(|component| {
-            valid_name(component, 128)
+            valid_name(component, 192)
                 && component != "."
                 && component != ".."
                 && !component.contains(':')
@@ -10298,6 +10483,7 @@ fn bounded_provider_files(
                     && [
                         PROVIDER_OBJECTS_NAMESPACE,
                         PROVIDER_MANIFESTS_NAMESPACE,
+                        SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE,
                         PROVIDER_TEMP_NAMESPACE,
                         PROVIDER_REMOVED_NAMESPACE,
                         PROVIDER_RENAME_EVIDENCE_NAMESPACE,
@@ -10353,8 +10539,8 @@ fn bounded_provider_files(
 mod tests {
     use super::*;
     use crate::oplog::{
-        BatchCausalDot, BatchOrigin, CausalPeerId, FrontierV2, ObjectKind, OperationObject,
-        SemanticEffectDigest,
+        BatchCausalDot, BatchOrigin, CausalPeerId, ContentDigest, FrontierV2, ObjectKind,
+        OperationObject, SemanticEffectDigest,
     };
 
     fn fixture_manifest(origin: BatchOrigin, batch_id: BatchId) -> OperationBatch {
@@ -10382,6 +10568,50 @@ mod tests {
             vec![object.descriptor().unwrap()],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn shared_provider_frontier_head_is_canonical_content_addressed_and_bound() {
+        let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(0x5f00));
+        let lineage_digest = LineageDigest::of(b"frontier-head-lineage");
+        let descriptor_digest = ContentDigest::of(b"frontier-head-descriptor");
+        let device_id = DeviceId::from_uuid(Uuid::from_u128(0x5f01));
+        let first = BatchId::from_uuid(Uuid::from_u128(0x5f02));
+        let second = BatchId::from_uuid(Uuid::from_u128(0x5f03));
+        let head = SharedProviderFrontierHeadV1::new(
+            workspace_id,
+            lineage_digest,
+            descriptor_digest,
+            device_id,
+            17,
+            ContentDigest::of(b"accepted frontier root"),
+            vec![second, first, second],
+        )
+        .unwrap();
+        assert_eq!(head.frontier_tips(), &[first, second]);
+        let bytes = head.encode().unwrap();
+        assert!(bytes.len() <= MAX_SHARED_PROVIDER_FRONTIER_HEAD_BYTES);
+        let path = head.path().unwrap();
+        assert!(path.starts_with(&format!(
+            "{SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE}/{device_id}-"
+        )));
+        assert!(path.ends_with(".head"));
+        assert_eq!(
+            SharedProviderFrontierHeadV1::decode(&path, &bytes).unwrap(),
+            head
+        );
+        assert!(SharedProviderFrontierHeadV1::decode(
+            &format!(
+                "{SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE}/{device_id}-{}.head",
+                "0".repeat(64)
+            ),
+            &bytes,
+        )
+        .is_err());
+
+        let mut differing = bytes;
+        differing.extend_from_slice(b" ");
+        assert!(SharedProviderFrontierHeadV1::decode(&path, &differing).is_err());
     }
 
     #[test]

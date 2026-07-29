@@ -528,7 +528,10 @@ fn sparse_provider_observations(
             || !relative.contains('/')
             || relative.starts_with('/')
             || relative.contains('\\')
-            || !matches!(namespace, "enrollment" | "manifests" | "objects")
+            || !matches!(
+                namespace,
+                "enrollment" | "frontier-heads-v1" | "manifests" | "objects"
+            )
             || relative
                 .split('/')
                 .any(|component| component.is_empty() || component == "." || component == "..")
@@ -1144,6 +1147,20 @@ mod tests {
         assert_eq!(
             provider_paths,
             vec!["manifests/12345678-1234-1234-1234-123456789abc.manifest".to_owned()]
+        );
+        assert!(!imprecise);
+
+        let head = root.join(
+            ".tine-sync/v2/shared/outbox/frontier-heads-v1/12345678-1234-1234-1234-123456789abc-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.head",
+        );
+        let (provider_paths, imprecise) =
+            sparse_provider_observations(&root, &HashSet::from([head]), &HashSet::new());
+        assert_eq!(
+            provider_paths,
+            vec![
+                "frontier-heads-v1/12345678-1234-1234-1234-123456789abc-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.head"
+                    .to_owned()
+            ]
         );
         assert!(!imprecise);
 

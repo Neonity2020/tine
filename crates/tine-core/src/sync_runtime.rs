@@ -80,8 +80,9 @@ use crate::oplog::shadow_projection::verify_inactive_bootstrap_shadow_projection
 #[cfg(test)]
 use crate::oplog::simulator::fail_next_pending_publication_marker_creation;
 use crate::oplog::simulator::{
-    inspect_shared_provider_descriptor, SharedProviderObservationCursor,
-    SharedProviderPublicationCursor, SharedProviderTransport, SHARED_ENROLLMENT_DESCRIPTOR_PATH,
+    inspect_shared_provider_descriptor, SharedProviderFrontierHeadV1,
+    SharedProviderObservationCursor, SharedProviderPublicationCursor, SharedProviderTransport,
+    SHARED_ENROLLMENT_DESCRIPTOR_PATH, SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE,
 };
 use crate::oplog::sqlite::ApplicationRuntimeRoot;
 use crate::oplog::watcher_queue::WatcherObservation;
@@ -145,6 +146,19 @@ static PREPARE_SHARED_TEST_CUT: Mutex<Option<WorkspaceId>> = Mutex::new(None);
 #[cfg(test)]
 static PROVIDER_MANIFEST_READINESS_INSPECTIONS: Mutex<BTreeMap<WorkspaceId, usize>> =
     Mutex::new(BTreeMap::new());
+#[cfg(test)]
+static PROVIDER_TRAVERSAL_INSTRUMENTATION: Mutex<
+    BTreeMap<WorkspaceId, ProviderTraversalInstrumentation>,
+> = Mutex::new(BTreeMap::new());
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ProviderTraversalInstrumentation {
+    head_entries: usize,
+    exact_manifests: usize,
+    exact_objects: usize,
+    full_scan_entries: usize,
+}
 
 #[cfg(test)]
 thread_local! {
@@ -2875,7 +2889,8 @@ fn publish_archive_batch(
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ProviderManifestIngress {
     Ready(OperationBatch),
-    Incomplete(BatchId),
+    Incomplete(OperationBatch),
+    Absent(BatchId),
 }
 
 fn provider_manifest_id(path: &str) -> Option<BatchId> {
@@ -2883,6 +2898,24 @@ fn provider_manifest_id(path: &str) -> Option<BatchId> {
         .and_then(|name| name.strip_suffix(".manifest"))
         .and_then(|value| Uuid::parse_str(value).ok())
         .map(BatchId::from_uuid)
+}
+
+fn provider_frontier_head_path(path: &str) -> bool {
+    let Some(name) = path
+        .strip_prefix(SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE)
+        .and_then(|path| path.strip_prefix('/'))
+        .and_then(|name| name.strip_suffix(".head"))
+    else {
+        return false;
+    };
+    let Some((device, digest)) = name.rsplit_once('-') else {
+        return false;
+    };
+    Uuid::parse_str(device).is_ok()
+        && digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn canonical_generated_provider_conflict(path: &str) -> Option<String> {
@@ -2901,6 +2934,11 @@ fn canonical_generated_provider_conflict(path: &str) -> Option<String> {
         }
         ("manifests", "manifest") if Uuid::parse_str(base).is_ok() => Some(canonical),
         ("enrollment", "json") if canonical == SHARED_ENROLLMENT_DESCRIPTOR_PATH => Some(canonical),
+        (SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE, "head")
+            if provider_frontier_head_path(&canonical) =>
+        {
+            Some(canonical)
+        }
         _ => None,
     }
 }
@@ -2948,6 +2986,16 @@ fn reconcile_generated_provider_conflict(
         SharedEnrollmentDescriptorV1::decode(&canonical_bytes)
             .map(|found| found == *descriptor)
             .unwrap_or(false)
+    } else if provider_frontier_head_path(&canonical) {
+        SharedProviderFrontierHeadV1::decode(&canonical, &canonical_bytes)
+            .map(|head| {
+                head.workspace_id() == descriptor.workspace_id()
+                    && head.lineage_digest() == descriptor.lineage_digest()
+                    && descriptor
+                        .digest()
+                        .is_ok_and(|digest| head.descriptor_digest() == digest)
+            })
+            .unwrap_or(false)
     } else {
         false
     };
@@ -2977,7 +3025,7 @@ fn stage_provider_manifest_exact(
         .read_exact(path)
         .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
     else {
-        return Ok(ProviderManifestIngress::Incomplete(batch_id));
+        return Ok(ProviderManifestIngress::Absent(batch_id));
     };
     let manifest = OperationBatch::decode(&bytes)
         .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
@@ -3002,7 +3050,7 @@ fn stage_provider_manifest_exact(
             .read_exact(&object_path)
             .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
         else {
-            return Ok(ProviderManifestIngress::Incomplete(batch_id));
+            return Ok(ProviderManifestIngress::Incomplete(manifest));
         };
         store
             .stage_object_bytes(&object_bytes)
@@ -3013,9 +3061,10 @@ fn stage_provider_manifest_exact(
         .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
     {
         crate::oplog::BatchInspection::Ready(_) => Ok(ProviderManifestIngress::Ready(manifest)),
-        crate::oplog::BatchInspection::Staged { .. } | crate::oplog::BatchInspection::Absent => {
-            Ok(ProviderManifestIngress::Incomplete(batch_id))
+        crate::oplog::BatchInspection::Staged { .. } => {
+            Ok(ProviderManifestIngress::Incomplete(manifest))
         }
+        crate::oplog::BatchInspection::Absent => Ok(ProviderManifestIngress::Incomplete(manifest)),
     }
 }
 
@@ -3425,7 +3474,19 @@ struct RuntimeActor {
     /// completed callback-required scan. Background startup scans do not make
     /// clean shutdown replay settled provider history.
     provider_rescan_required_for_safe: bool,
+    provider_full_scan_requested: bool,
     provider_observation_cursor: Option<SharedProviderObservationCursor>,
+    provider_observation_full: bool,
+    provider_scan_valid_heads: usize,
+    provider_scan_invalid_head: bool,
+    provider_head_generations: BTreeMap<(DeviceId, u64), (ContentDigest, Vec<BatchId>)>,
+    provider_own_heads: BTreeMap<String, SharedProviderFrontierHeadV1>,
+    provider_direct_manifests: VecDeque<BatchId>,
+    provider_direct_queued: BTreeSet<BatchId>,
+    provider_discovery_scan_complete: bool,
+    provider_head_dirty: bool,
+    provider_current_head: Option<String>,
+    provider_head_retirement: VecDeque<String>,
     provider_pending: ProviderDependencyIndex,
     provider_continuation: Option<ProviderArchiveContinuation>,
     provider_incomplete: BTreeSet<BatchId>,
@@ -3593,7 +3654,19 @@ impl RuntimeActor {
             provider_exact: VecDeque::new(),
             provider_rescan_requested: shared_phase == Some(SyncSharedPhase::Active),
             provider_rescan_required_for_safe: false,
+            provider_full_scan_requested: false,
             provider_observation_cursor: None,
+            provider_observation_full: false,
+            provider_scan_valid_heads: 0,
+            provider_scan_invalid_head: false,
+            provider_head_generations: BTreeMap::new(),
+            provider_own_heads: BTreeMap::new(),
+            provider_direct_manifests: VecDeque::new(),
+            provider_direct_queued: BTreeSet::new(),
+            provider_discovery_scan_complete: false,
+            provider_head_dirty: shared_phase == Some(SyncSharedPhase::Active),
+            provider_current_head: None,
+            provider_head_retirement: VecDeque::new(),
             provider_pending: ProviderDependencyIndex::default(),
             provider_continuation: None,
             provider_incomplete: BTreeSet::new(),
@@ -4251,9 +4324,11 @@ impl RuntimeActor {
     }
 
     fn provider_has_work(&self) -> bool {
-        !self.provider_exact.is_empty()
+        let has_work = !self.provider_exact.is_empty()
             || self.provider_rescan_requested
+            || self.provider_full_scan_requested
             || self.provider_observation_cursor.is_some()
+            || !self.provider_direct_manifests.is_empty()
             || !self.provider_pending.is_empty()
             || self.provider_continuation.is_some()
             || !self.provider_incomplete_recheck.is_empty()
@@ -4264,6 +4339,9 @@ impl RuntimeActor {
             || self.provider_descriptor_repair_requested
             || self.provider_publication_repair_requested
             || self.provider_publication_repair_cursor.is_some()
+            || self.provider_head_dirty
+            || !self.provider_head_retirement.is_empty();
+        has_work
     }
 
     fn tick_provider(&mut self) -> SyncRuntimeTick {
@@ -4304,24 +4382,39 @@ impl RuntimeActor {
         }
 
         if !observed_provider_progress {
-            if self.provider_observation_cursor.is_none() && self.provider_rescan_requested {
+            if self.provider_observation_cursor.is_none()
+                && (self.provider_full_scan_requested || self.provider_rescan_requested)
+            {
+                let full = self.provider_full_scan_requested;
                 let cursor = match self
                     .provider
                     .as_ref()
                     .ok_or(SyncRuntimeRequestError::ActorUnavailable)
                     .and_then(|provider| {
-                        provider.observation_cursor().map_err(|error| {
-                            SyncRuntimeRequestError::ActorRefused(error.to_string())
-                        })
+                        if full {
+                            provider.full_observation_cursor()
+                        } else {
+                            provider.head_observation_cursor()
+                        }
+                        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))
                     }) {
                     Ok(cursor) => cursor,
                     Err(error) => return SyncRuntimeTick::RecoveryBlocked(error.to_string()),
                 };
                 self.provider_observation_cursor = Some(cursor);
+                self.provider_observation_full = full;
+                self.provider_scan_valid_heads = 0;
+                self.provider_scan_invalid_head = false;
+                self.provider_head_generations.clear();
+                self.provider_own_heads.clear();
+                if full {
+                    self.provider_full_scan_requested = false;
+                } else {
+                    self.provider_rescan_requested = false;
+                }
                 // The cursor now owns the consumed generation. An imprecise
                 // callback arriving while it is active will set this bit for
                 // exactly one subsequent scan.
-                self.provider_rescan_requested = false;
             }
             if let Some(cursor) = self.provider_observation_cursor.as_mut() {
                 let path = match self
@@ -4337,6 +4430,23 @@ impl RuntimeActor {
                     Err(error) => return SyncRuntimeTick::RecoveryBlocked(error.to_string()),
                 };
                 if let Some(path) = path {
+                    #[cfg(test)]
+                    {
+                        let mut instrumentation =
+                            PROVIDER_TRAVERSAL_INSTRUMENTATION.lock().unwrap();
+                        let counters = instrumentation
+                            .entry(self.binding.workspace_id())
+                            .or_default();
+                        if self.provider_observation_full {
+                            counters.full_scan_entries =
+                                counters.full_scan_entries.saturating_add(1);
+                        } else if provider_frontier_head_path(&path)
+                            || canonical_generated_provider_conflict(&path)
+                                .is_some_and(|canonical| provider_frontier_head_path(&canonical))
+                        {
+                            counters.head_entries = counters.head_entries.saturating_add(1);
+                        }
+                    }
                     match self.process_provider_path(&store, &descriptor, &path) {
                         Ok(()) => {
                             observed_provider_progress = true;
@@ -4350,7 +4460,16 @@ impl RuntimeActor {
                     }
                 } else {
                     self.provider_observation_cursor = None;
-                    if !self.provider_rescan_requested {
+                    if self.provider_observation_full {
+                        self.provider_discovery_scan_complete = true;
+                    } else if self.provider_scan_valid_heads == 0 || self.provider_scan_invalid_head
+                    {
+                        self.provider_full_scan_requested = true;
+                        self.provider_discovery_scan_complete = false;
+                    } else {
+                        self.provider_discovery_scan_complete = true;
+                    }
+                    if !self.provider_rescan_requested && !self.provider_full_scan_requested {
                         self.provider_rescan_required_for_safe = false;
                     }
                     observed_provider_progress = true;
@@ -4358,9 +4477,63 @@ impl RuntimeActor {
             }
         }
 
+        if self.provider_observation_cursor.is_none()
+            && !self.provider_rescan_requested
+            && !self.provider_full_scan_requested
+        {
+            if let Some(batch_id) = self.provider_direct_manifests.front().copied() {
+                let path = format!("manifests/{batch_id}.manifest");
+                #[cfg(test)]
+                {
+                    PROVIDER_TRAVERSAL_INSTRUMENTATION
+                        .lock()
+                        .unwrap()
+                        .entry(self.binding.workspace_id())
+                        .or_default()
+                        .exact_manifests += 1;
+                }
+                match self.process_provider_path(&store, &descriptor, &path) {
+                    Ok(()) => {
+                        self.provider_direct_manifests.pop_front();
+                        self.provider_direct_queued.remove(&batch_id);
+                        if let Ok(crate::oplog::BatchInspection::Staged { manifest, .. }) =
+                            store.inspect_batch(batch_id)
+                        {
+                            for dependency in manifest.causal_dependency_heads() {
+                                if let Err(error) = self.queue_provider_direct_manifest(*dependency)
+                                {
+                                    return SyncRuntimeTick::RecoveryBlocked(error.to_string());
+                                }
+                            }
+                        }
+                        if !self.provider_incomplete.is_empty() {
+                            self.provider_objects_changed = true;
+                        }
+                        #[cfg(test)]
+                        if let Ok(crate::oplog::BatchInspection::Ready(batch)) =
+                            store.inspect_batch(batch_id)
+                        {
+                            PROVIDER_TRAVERSAL_INSTRUMENTATION
+                                .lock()
+                                .unwrap()
+                                .entry(self.binding.workspace_id())
+                                .or_default()
+                                .exact_objects += batch.manifest().required_objects().len();
+                        }
+                        return SyncRuntimeTick::Recovering;
+                    }
+                    Err(error) => {
+                        self.provider_full_scan_requested = true;
+                        return SyncRuntimeTick::RecoveryBlocked(error.to_string());
+                    }
+                }
+            }
+        }
+
         if self.provider_exact.is_empty()
             && self.provider_observation_cursor.is_none()
             && !self.provider_rescan_requested
+            && !self.provider_full_scan_requested
             && self.provider_incomplete_recheck.is_empty()
             && self.provider_objects_changed
         {
@@ -4424,6 +4597,10 @@ impl RuntimeActor {
         match result {
             Ok(ProviderArchiveIngress::Complete) => {
                 self.provider_pending.accept_ready(batch_id);
+                self.provider_head_dirty = true;
+                if !self.provider_incomplete.is_empty() {
+                    self.provider_objects_changed = true;
+                }
                 SyncRuntimeTick::Recovering
             }
             Ok(ProviderArchiveIngress::Pending(continuation)) => {
@@ -4463,6 +4640,174 @@ impl RuntimeActor {
         #[cfg(not(test))]
         let _ = registered;
         Ok(())
+    }
+
+    fn current_provider_head(
+        &self,
+        descriptor: &SharedEnrollmentDescriptorV1,
+    ) -> Result<SharedProviderFrontierHeadV1, SyncRuntimeRequestError> {
+        let engine = self
+            .runtime
+            .as_ref()
+            .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
+            .engine();
+        let frontier = engine
+            .exact_frontier()
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        let root = engine
+            .accepted_frontier_root()
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        let tips = frontier
+            .documents()
+            .iter()
+            .flat_map(|document| document.direct_dependency_heads().iter().copied())
+            .collect();
+        SharedProviderFrontierHeadV1::new(
+            descriptor.workspace_id(),
+            descriptor.lineage_digest(),
+            descriptor
+                .digest()
+                .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?,
+            self.binding.device_id(),
+            root.acceptance_sequence(),
+            root.state_digest(),
+            tips,
+        )
+        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))
+    }
+
+    fn queue_provider_direct_manifest(
+        &mut self,
+        batch_id: BatchId,
+    ) -> Result<(), SyncRuntimeRequestError> {
+        if self.provider_pending.contains(batch_id)
+            || self.provider_direct_queued.contains(&batch_id)
+            || self
+                .runtime
+                .as_ref()
+                .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
+                .engine()
+                .accepted_batch_is_active(batch_id)
+                .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
+        {
+            return Ok(());
+        }
+        self.provider_direct_queued.insert(batch_id);
+        self.provider_direct_manifests.push_back(batch_id);
+        Ok(())
+    }
+
+    fn process_provider_frontier_head(
+        &mut self,
+        descriptor: &SharedEnrollmentDescriptorV1,
+        path: &str,
+    ) -> Result<(), SyncRuntimeRequestError> {
+        let Some(bytes) = self
+            .provider
+            .as_ref()
+            .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
+            .read_exact(path)
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
+        else {
+            self.provider_head_dirty = true;
+            if !self.provider_observation_full {
+                self.provider_full_scan_requested = true;
+            }
+            return Ok(());
+        };
+        let head = match SharedProviderFrontierHeadV1::decode(path, &bytes) {
+            Ok(head)
+                if head.workspace_id() == descriptor.workspace_id()
+                    && head.lineage_digest() == descriptor.lineage_digest()
+                    && descriptor
+                        .digest()
+                        .is_ok_and(|digest| head.descriptor_digest() == digest) =>
+            {
+                head
+            }
+            Ok(_) | Err(_) => {
+                self.provider_scan_invalid_head = true;
+                if !self.provider_observation_full {
+                    self.provider_full_scan_requested = true;
+                }
+                return Ok(());
+            }
+        };
+        let generation_key = (head.author_device_id(), head.accepted_generation());
+        let generation_value = (head.accepted_frontier_root(), head.frontier_tips().to_vec());
+        if self
+            .provider_head_generations
+            .get(&generation_key)
+            .is_some_and(|found| found != &generation_value)
+        {
+            self.provider_scan_invalid_head = true;
+            if !self.provider_observation_full {
+                self.provider_full_scan_requested = true;
+            }
+        } else {
+            self.provider_head_generations
+                .insert(generation_key, generation_value);
+        }
+        self.provider_scan_valid_heads = self.provider_scan_valid_heads.saturating_add(1);
+        if head.author_device_id() == self.binding.device_id() {
+            self.provider_own_heads
+                .insert(path.to_owned(), head.clone());
+        }
+        for tip in head.frontier_tips() {
+            self.queue_provider_direct_manifest(*tip)?;
+        }
+        Ok(())
+    }
+
+    fn tick_provider_head_publication(
+        &mut self,
+        descriptor: &SharedEnrollmentDescriptorV1,
+    ) -> Result<Option<SyncRuntimeTick>, SyncRuntimeRequestError> {
+        let discovery_pending = !self.provider_discovery_scan_complete
+            || self.provider_rescan_requested
+            || self.provider_full_scan_requested
+            || self.provider_observation_cursor.is_some()
+            || !self.provider_exact.is_empty()
+            || !self.provider_direct_manifests.is_empty()
+            || !self.provider_pending.is_empty()
+            || self.provider_continuation.is_some()
+            || !self.provider_incomplete.is_empty()
+            || !self.provider_incomplete_recheck.is_empty()
+            || self.provider_objects_changed;
+        if self.provider_head_dirty && !discovery_pending {
+            let head = self.current_provider_head(descriptor)?;
+            let current_path = self
+                .provider
+                .as_mut()
+                .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
+                .publish_frontier_head(&head)
+                .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+            self.provider_current_head = Some(current_path.clone());
+            self.provider_head_dirty = false;
+            for (path, old) in &self.provider_own_heads {
+                if path != &current_path
+                    && old.accepted_generation() <= head.accepted_generation()
+                    && !self.provider_head_retirement.contains(path)
+                {
+                    self.provider_head_retirement.push_back(path.clone());
+                }
+            }
+            self.provider_own_heads.insert(current_path, head);
+            return Ok(Some(SyncRuntimeTick::Recovering));
+        }
+        if !self.provider_head_dirty {
+            if let Some(path) = self.provider_head_retirement.front().cloned() {
+                self.provider
+                    .as_ref()
+                    .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
+                    .retire_frontier_head(&path)
+                    .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+                self.provider_head_retirement.pop_front();
+                self.provider_own_heads.remove(&path);
+                return Ok(Some(SyncRuntimeTick::Recovering));
+            }
+        }
+        Ok(None)
     }
 
     fn tick_provider_publication(
@@ -4576,7 +4921,7 @@ impl RuntimeActor {
         }
 
         let Some(batch_id) = self.provider_publication_forced.front().copied() else {
-            return Ok(None);
+            return self.tick_provider_head_publication(descriptor);
         };
         let manifest = match store
             .inspect_batch(batch_id)
@@ -4678,13 +5023,23 @@ impl RuntimeActor {
         path: &str,
     ) -> Result<(), SyncRuntimeRequestError> {
         if canonical_generated_provider_conflict(path).is_some() {
-            reconcile_generated_provider_conflict(
+            let reconciled = reconcile_generated_provider_conflict(
                 self.provider
                     .as_ref()
                     .ok_or(SyncRuntimeRequestError::ActorUnavailable)?,
                 descriptor,
                 path,
-            )?;
+            );
+            if path.starts_with(&format!("{SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE}/")) {
+                if reconciled.is_err() {
+                    self.provider_scan_invalid_head = true;
+                    if !self.provider_observation_full {
+                        self.provider_full_scan_requested = true;
+                    }
+                }
+                return Ok(());
+            }
+            reconciled?;
             return Ok(());
         }
         let filename = path.rsplit_once('/').map_or(path, |(_, name)| name);
@@ -4715,6 +5070,9 @@ impl RuntimeActor {
                 ));
             }
             return Ok(());
+        }
+        if provider_frontier_head_path(path) {
+            return self.process_provider_frontier_head(descriptor, path);
         }
         if let Some(batch_id) = provider_manifest_id(path) {
             if self.provider_pending.contains(batch_id) {
@@ -4766,10 +5124,20 @@ impl RuntimeActor {
                 ProviderManifestIngress::Ready(manifest) => {
                     let batch_id = manifest.batch_id();
                     self.provider_incomplete.remove(&batch_id);
+                    for dependency in manifest.causal_dependency_heads() {
+                        self.queue_provider_direct_manifest(*dependency)?;
+                    }
                     self.register_provider_manifest(manifest)?;
                 }
-                ProviderManifestIngress::Incomplete(batch_id) => {
+                ProviderManifestIngress::Incomplete(manifest) => {
+                    let batch_id = manifest.batch_id();
                     self.provider_incomplete.insert(batch_id);
+                }
+                ProviderManifestIngress::Absent(batch_id) => {
+                    self.provider_incomplete.insert(batch_id);
+                    if !self.provider_observation_full {
+                        self.provider_full_scan_requested = true;
+                    }
                 }
             }
             return Ok(());
@@ -5136,6 +5504,7 @@ impl RuntimeActor {
         if self.shared_phase != Some(SyncSharedPhase::Active) {
             return Ok(());
         }
+        self.provider_head_dirty = true;
         let recorded = self
             .provider
             .as_ref()
@@ -5236,6 +5605,7 @@ impl RuntimeActor {
         }
         for _ in 0..MAX_CLEAN_DRAIN_TURNS {
             if self.provider_exact.is_empty()
+                && self.provider_direct_manifests.is_empty()
                 && self.provider_pending.is_empty()
                 && self.provider_continuation.is_none()
                 && self.provider_incomplete.is_empty()
@@ -5247,7 +5617,13 @@ impl RuntimeActor {
                 && !self.provider_descriptor_repair_requested
                 && !self.provider_publication_repair_requested
                 && self.provider_publication_repair_cursor.is_none()
+                && !self.provider_rescan_requested
+                && !self.provider_full_scan_requested
+                && self.provider_observation_cursor.is_none()
                 && !self.provider_rescan_required_for_safe
+                && self.provider_discovery_scan_complete
+                && !self.provider_head_dirty
+                && self.provider_head_retirement.is_empty()
             {
                 return Ok(());
             }
@@ -5283,7 +5659,7 @@ impl RuntimeActor {
             "clean shutdown could not settle the bounded shared-provider queue \
                  (exact={}, inbound={}, incomplete={}, continuation={}, outbound={}{} )",
             self.provider_exact.len(),
-            self.provider_pending.len(),
+            self.provider_pending.len() + self.provider_direct_manifests.len(),
             self.provider_incomplete.len(),
             self.provider_continuation.is_some(),
             usize::from(self.provider_publication_probe)
@@ -5291,7 +5667,9 @@ impl RuntimeActor {
                 + self.provider_publication_forced.len()
                 + usize::from(self.provider_descriptor_repair_requested)
                 + usize::from(self.provider_publication_repair_requested)
-                + usize::from(self.provider_publication_repair_cursor.is_some()),
+                + usize::from(self.provider_publication_repair_cursor.is_some())
+                + usize::from(self.provider_head_dirty)
+                + self.provider_head_retirement.len(),
             continuation,
         )))
     }
@@ -5300,6 +5678,28 @@ impl RuntimeActor {
         &mut self,
     ) -> Result<SyncSharedEnrollmentDescriptor, SyncRuntimeRequestError> {
         self.clean_shutdown()?;
+        let (accepted_generation, accepted_frontier_root, frontier_tips) = {
+            let engine = self
+                .runtime
+                .as_ref()
+                .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
+                .engine();
+            let root = engine
+                .accepted_frontier_root()
+                .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+            let frontier = engine
+                .exact_frontier()
+                .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+            (
+                root.acceptance_sequence(),
+                root.state_digest(),
+                frontier
+                    .documents()
+                    .iter()
+                    .flat_map(|document| document.direct_dependency_heads().iter().copied())
+                    .collect::<Vec<_>>(),
+            )
+        };
         self.feed.take();
         self.runtime.take();
         self.authority.take();
@@ -5319,6 +5719,21 @@ impl RuntimeActor {
                     .encode()
                     .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?,
             )
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        let head = SharedProviderFrontierHeadV1::new(
+            descriptor.workspace_id(),
+            descriptor.lineage_digest(),
+            descriptor
+                .digest()
+                .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?,
+            self.binding.device_id(),
+            accepted_generation,
+            accepted_frontier_root,
+            frontier_tips,
+        )
+        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        provider
+            .publish_frontier_head(&head)
             .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
         activate_shared_initiator(&self.enrollment_root, &self.binding, &descriptor)
             .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
@@ -5360,7 +5775,7 @@ impl RuntimeActor {
                 .provider
                 .as_ref()
                 .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
-                .observation_cursor()
+                .full_observation_cursor()
                 .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
             self.pending_join = Some(PendingSharedJoin {
                 descriptor: descriptor.clone(),
@@ -5420,6 +5835,33 @@ impl RuntimeActor {
                         {
                             return Err(SyncRuntimeRequestError::ActorRefused(
                                 "provider descriptor changed during join".into(),
+                            ));
+                        }
+                    } else if provider_frontier_head_path(&path) {
+                        let bytes = self
+                            .provider
+                            .as_ref()
+                            .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
+                            .read_exact(&path)
+                            .map_err(|error| {
+                                SyncRuntimeRequestError::ActorRefused(error.to_string())
+                            })?
+                            .ok_or_else(|| {
+                                SyncRuntimeRequestError::ActorRefused(format!(
+                                    "provider frontier head disappeared during join at {path}"
+                                ))
+                            })?;
+                        let head = SharedProviderFrontierHeadV1::decode(&path, &bytes).map_err(
+                            |error| SyncRuntimeRequestError::ActorRefused(error.to_string()),
+                        )?;
+                        if head.workspace_id() != descriptor.workspace_id()
+                            || head.lineage_digest() != descriptor.lineage_digest()
+                            || descriptor
+                                .digest()
+                                .map_or(true, |digest| head.descriptor_digest() != digest)
+                        {
+                            return Err(SyncRuntimeRequestError::ActorRefused(
+                                "provider frontier head changed during join".into(),
                             ));
                         }
                     } else if provider_manifest_id(&path).is_some() {
@@ -5550,6 +5992,7 @@ impl RuntimeActor {
             shared_phase: self.shared_phase,
             provider_pending: self.provider_pending.len()
                 + self.provider_exact.len()
+                + self.provider_direct_manifests.len()
                 + self.provider_incomplete.len()
                 + self.provider_incomplete_recheck.len()
                 + usize::from(
@@ -5563,7 +6006,11 @@ impl RuntimeActor {
                 + usize::from(self.provider_publication_repair_requested)
                 + usize::from(self.provider_publication_repair_cursor.is_some())
                 + usize::from(self.provider_rescan_required_for_safe)
-                + usize::from(self.provider_observation_cursor.is_some()),
+                + usize::from(self.provider_observation_cursor.is_some())
+                + usize::from(self.provider_rescan_requested)
+                + usize::from(self.provider_full_scan_requested)
+                + usize::from(self.provider_head_dirty)
+                + self.provider_head_retirement.len(),
         }
     }
 }
@@ -9205,6 +9652,7 @@ mod tests {
             &initiator.request.provider_root,
             &joiner.request.provider_root,
         );
+        reset_provider_traversal_instrumentation(joiner.request.identities.workspace_id);
         let joiner_rejoined =
             active_handle(SyncRuntimeHandle::open(reopen_request(&joiner.request)));
         joiner_rejoined.observe_provider().unwrap();
@@ -9219,6 +9667,11 @@ mod tests {
             }
         }
         assert_eq!(joiner_rejoined.status().unwrap().provider_pending, 0);
+        let tail_traversal =
+            provider_traversal_instrumentation(joiner.request.identities.workspace_id);
+        assert_eq!(tail_traversal.full_scan_entries, 0, "{tail_traversal:?}");
+        assert_eq!(tail_traversal.exact_manifests, 1, "{tail_traversal:?}");
+        assert!(tail_traversal.exact_objects > 0, "{tail_traversal:?}");
         assert!(
             joiner.graph_root.join("notes/層/共有 計画.md").is_file(),
             "provider-delivered immutable history must project after restart/rejoin: {provider_ticks:?}"
@@ -9316,7 +9769,12 @@ mod tests {
         let conflict_bytes = b"provider conflict evidence".to_vec();
         fs::write(&conflict_path, conflict_bytes.as_slice()).unwrap();
         let conflicted = active_handle(SyncRuntimeHandle::open(reopen_request(&joiner.request)));
-        conflicted.observe_provider().unwrap();
+        conflicted
+            .observe_provider_paths(
+                vec!["objects/共有.sync-conflict-20260728.object".to_owned()],
+                false,
+            )
+            .unwrap();
         let mut conflict_block = None;
         for _ in 0..16 {
             let tick = conflicted.tick().unwrap();
@@ -9499,6 +9957,24 @@ mod tests {
             .unwrap_or_default()
     }
 
+    fn reset_provider_traversal_instrumentation(workspace_id: WorkspaceId) {
+        PROVIDER_TRAVERSAL_INSTRUMENTATION
+            .lock()
+            .unwrap()
+            .insert(workspace_id, ProviderTraversalInstrumentation::default());
+    }
+
+    fn provider_traversal_instrumentation(
+        workspace_id: WorkspaceId,
+    ) -> ProviderTraversalInstrumentation {
+        PROVIDER_TRAVERSAL_INSTRUMENTATION
+            .lock()
+            .unwrap()
+            .get(&workspace_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
     fn archive_contains_payload(fixture: &ActivationFixture, expected: &[u8]) -> bool {
         let store = ObjectStore::open(
             &fixture.request.archive_root,
@@ -9537,6 +10013,7 @@ mod tests {
             "first retained delivery",
         );
         publish_shared_batch(&initiator_handle, &initiator, first_batch);
+        settle_shared_provider(&initiator_handle);
         copy_provider_tree(
             &initiator.request.provider_root,
             &receiver.request.provider_root,
@@ -9571,6 +10048,7 @@ mod tests {
             "shutdown-retained delivery",
         );
         publish_shared_batch(&initiator_handle, &initiator, second_batch);
+        settle_shared_provider(&initiator_handle);
         copy_provider_tree(
             &initiator.request.provider_root,
             &receiver.request.provider_root,
@@ -9605,52 +10083,22 @@ mod tests {
             "created behind first cursor",
         );
         publish_shared_batch(&initiator_handle, &initiator, batch_id);
+        settle_shared_provider(&initiator_handle);
 
-        let receiver_outbox = receiver.request.provider_root.join("outbox");
-        let padding = OperationObject::new(
-            receiver.request.identities.workspace_id,
-            DocumentId::from_uuid(Uuid::from_u128(0xb72f)),
-            crate::oplog::ObjectKind::AnnotatedBaseBlob,
-            b"keep the first provider cursor in its object phase".to_vec(),
-        )
-        .unwrap()
-        .encode()
-        .unwrap();
-        let padding_digest = ContentDigest::of(&padding);
-        fs::write(
-            receiver_outbox
-                .join("objects")
-                .join(format!("{padding_digest}.object")),
-            padding,
-        )
-        .unwrap();
-        let manifest_count = fs::read_dir(receiver_outbox.join("manifests"))
-            .unwrap()
-            .count();
-        assert!(
-            fs::read_dir(receiver_outbox.join("objects"))
-                .unwrap()
-                .next()
-                .is_some(),
-            "the test needs an object phase after the manifest cursor"
-        );
         receiver_handle.observe_provider().unwrap();
-        // Consume the descriptor, every manifest that existed when the first
-        // cursor opened, and one object. The manifest phase is now behind this
-        // still-active cursor.
-        for _ in 0..(manifest_count + 2) {
-            let tick = receiver_handle.tick().unwrap();
-            assert!(
-                !matches!(
-                    tick,
-                    SyncRuntimeTick::RecoveryBlocked(_)
-                        | SyncRuntimeTick::Blocked(_)
-                        | SyncRuntimeTick::Terminal(_)
-                        | SyncRuntimeTick::Failed(_)
-                ),
-                "first provider cursor failed: {tick:?}"
-            );
-        }
+        // Consume only the descriptor. The first small head cursor remains
+        // active when the second imprecise callback is linearized.
+        let tick = receiver_handle.tick().unwrap();
+        assert!(
+            !matches!(
+                tick,
+                SyncRuntimeTick::RecoveryBlocked(_)
+                    | SyncRuntimeTick::Blocked(_)
+                    | SyncRuntimeTick::Terminal(_)
+                    | SyncRuntimeTick::Failed(_)
+            ),
+            "first provider cursor failed: {tick:?}"
+        );
         assert!(receiver_handle.status().unwrap().provider_pending > 0);
 
         copy_provider_tree(
@@ -9690,6 +10138,7 @@ mod tests {
             "shared base",
         );
         publish_shared_batch(&initiator_handle, &initiator, create_batch);
+        settle_shared_provider(&initiator_handle);
         copy_provider_tree(
             &initiator.request.provider_root,
             &receiver.request.provider_root,
@@ -9712,6 +10161,7 @@ mod tests {
             ],
         );
         publish_shared_batch(&initiator_handle, &initiator, delete_batch);
+        settle_shared_provider(&initiator_handle);
         copy_provider_tree(
             &initiator.request.provider_root,
             &receiver.request.provider_root,
@@ -9847,6 +10297,23 @@ mod tests {
                 "safe reopen did not republish an accepted manifest"
             );
         }
+        assert_eq!(
+            fs::read_dir(
+                fixture
+                    .request
+                    .provider_root
+                    .join("outbox")
+                    .join(SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE)
+            )
+            .unwrap()
+            .count(),
+            1,
+            "namespace loss repair did not publish a current own-device head"
+        );
+        assert!(matches!(
+            repaired.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
     }
 
     #[test]
@@ -9874,6 +10341,34 @@ mod tests {
             manifest.is_file(),
             "accepted exact manifest deletion was not repaired from local archive"
         );
+    }
+
+    #[test]
+    fn deleted_own_frontier_head_is_republished_from_local_authority() {
+        let fixture = make_shared_fixture("provider-own-head-delete", 0xbb40);
+        let _descriptor = activate_and_prepare_shared(&fixture);
+        let handle = active_handle(SyncRuntimeHandle::open(reopen_request(&fixture.request)));
+        settle_shared_provider(&handle);
+        let heads = fixture
+            .request
+            .provider_root
+            .join("outbox")
+            .join(SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE);
+        let entry = fs::read_dir(&heads).unwrap().next().unwrap().unwrap();
+        let relative = format!(
+            "{SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE}/{}",
+            entry.file_name().to_string_lossy()
+        );
+        fs::remove_file(entry.path()).unwrap();
+        handle
+            .observe_provider_paths(vec![relative], false)
+            .unwrap();
+        settle_shared_provider(&handle);
+        assert_eq!(fs::read_dir(&heads).unwrap().count(), 1);
+        assert!(matches!(
+            handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
     }
 
     #[test]
@@ -10020,6 +10515,202 @@ mod tests {
             resumed.clean_shutdown(),
             Ok(SyncShutdownOutcome::Safe(_))
         ));
+    }
+
+    #[test]
+    fn frontier_head_crash_cuts_repair_before_safe_handoff() {
+        let fixture = make_shared_fixture("provider-head-crash-cuts", 0xb240);
+        let _descriptor = activate_and_prepare_shared(&fixture);
+        let heads = fixture
+            .request
+            .provider_root
+            .join("outbox")
+            .join(SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE);
+
+        let first = active_handle(SyncRuntimeHandle::open(reopen_request(&fixture.request)));
+        settle_shared_provider(&first);
+        let (manifest_cut_batch, ..) = submit_shared_page(
+            &first,
+            0xb250,
+            "Manifest Before Head Cut",
+            "notes/manifest-before-head-cut.md",
+            "durable manifest before head",
+        );
+        publish_shared_batch(&first, &fixture, manifest_cut_batch);
+        assert_eq!(
+            fs::read_dir(&heads).unwrap().count(),
+            1,
+            "the cut must occur after the manifest but before its frontier head"
+        );
+        drop(first);
+
+        let unsafe_repair =
+            active_handle(SyncRuntimeHandle::open(reopen_request(&fixture.request)));
+        settle_shared_provider(&unsafe_repair);
+        assert_eq!(fs::read_dir(&heads).unwrap().count(), 1);
+        let (retirement_cut_batch, ..) = submit_shared_page(
+            &unsafe_repair,
+            0xb260,
+            "Head Before Retirement Cut",
+            "notes/head-before-retirement-cut.md",
+            "durable head before retirement",
+        );
+        publish_shared_batch(&unsafe_repair, &fixture, retirement_cut_batch);
+        for _ in 0..16 {
+            let tick = unsafe_repair.tick().unwrap();
+            assert!(
+                !matches!(
+                    tick,
+                    SyncRuntimeTick::RecoveryBlocked(_)
+                        | SyncRuntimeTick::Blocked(_)
+                        | SyncRuntimeTick::Terminal(_)
+                        | SyncRuntimeTick::Failed(_)
+                ),
+                "head publication failed before retirement cut: {tick:?}"
+            );
+            if fs::read_dir(&heads).unwrap().count() == 2 {
+                break;
+            }
+        }
+        assert_eq!(
+            fs::read_dir(&heads).unwrap().count(),
+            2,
+            "the cut must retain both the durable new and superseded old head"
+        );
+        drop(unsafe_repair);
+
+        let retirement_repair =
+            active_handle(SyncRuntimeHandle::open(reopen_request(&fixture.request)));
+        settle_shared_provider(&retirement_repair);
+        assert_eq!(
+            fs::read_dir(&heads).unwrap().count(),
+            1,
+            "unsafe reopen did not retire the exact superseded own-device head"
+        );
+        assert!(matches!(
+            retirement_repair.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(snapshot)) if snapshot.provider_pending == 0
+        ));
+    }
+
+    #[test]
+    fn two_offline_devices_union_reordered_frontier_heads_without_history_scan() {
+        let (first, second, first_handle, second_handle) =
+            joined_shared_pair("provider-two-offline-heads", 0xb2a0);
+        assert!(matches!(
+            first_handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+        assert!(matches!(
+            second_handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+
+        let first_offline = active_handle(SyncRuntimeHandle::open(reopen_request(&first.request)));
+        let (first_batch, ..) = submit_shared_page(
+            &first_offline,
+            0xb2c0,
+            "First Offline Tail",
+            "notes/first-offline-tail.md",
+            "first offline device",
+        );
+        publish_shared_batch(&first_offline, &first, first_batch);
+        settle_shared_provider(&first_offline);
+        assert!(matches!(
+            first_offline.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+
+        copy_provider_tree(&first.request.provider_root, &second.request.provider_root);
+        copy_provider_tree(&second.request.provider_root, &first.request.provider_root);
+        reset_provider_traversal_instrumentation(second.request.identities.workspace_id);
+        let second_merged = active_handle(SyncRuntimeHandle::open(reopen_request(&second.request)));
+        settle_shared_provider(&second_merged);
+        let second_traversal =
+            provider_traversal_instrumentation(second.request.identities.workspace_id);
+        assert_eq!(
+            second_traversal.full_scan_entries, 0,
+            "{second_traversal:?}"
+        );
+        assert_eq!(second_traversal.exact_manifests, 1, "{second_traversal:?}");
+        assert!(
+            second
+                .graph_root
+                .join("notes/first-offline-tail.md")
+                .is_file(),
+            "second device did not traverse the first device's unseen head"
+        );
+        assert!(
+            second_traversal.head_entries >= 2,
+            "both offline devices' reordered head records were not unioned: {second_traversal:?}"
+        );
+    }
+
+    #[test]
+    fn closed_device_walks_only_an_unseen_linear_tail_from_latest_head() {
+        let (initiator, receiver, initiator_handle, receiver_handle) =
+            joined_shared_pair("provider-head-linear-tail", 0xb2e0);
+        assert!(matches!(
+            receiver_handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+        let (root_batch, page_id, _, document_id) = submit_shared_page(
+            &initiator_handle,
+            0xb300,
+            "Head Linear Tail",
+            "notes/head-linear-tail.md",
+            "tail root",
+        );
+        let middle_batch = submit_durable(
+            &initiator_handle,
+            vec![SemanticOperation::CreateBlock {
+                block: BlockLocation {
+                    block_id: BlockId::from_uuid(Uuid::from_u128(0xb304)),
+                    home_document_id: document_id,
+                },
+                page_id,
+                parent: None,
+                order: "b".into(),
+                content: "tail middle".into(),
+            }],
+        );
+        let tip_batch = submit_durable(
+            &initiator_handle,
+            vec![SemanticOperation::CreateBlock {
+                block: BlockLocation {
+                    block_id: BlockId::from_uuid(Uuid::from_u128(0xb305)),
+                    home_document_id: document_id,
+                },
+                page_id,
+                parent: None,
+                order: "c".into(),
+                content: "tail tip".into(),
+            }],
+        );
+        for batch_id in [root_batch, middle_batch, tip_batch] {
+            publish_shared_batch(&initiator_handle, &initiator, batch_id);
+        }
+        settle_shared_provider(&initiator_handle);
+        copy_provider_tree(
+            &initiator.request.provider_root,
+            &receiver.request.provider_root,
+        );
+
+        reset_provider_traversal_instrumentation(receiver.request.identities.workspace_id);
+        let reopened = active_handle(SyncRuntimeHandle::open(reopen_request(&receiver.request)));
+        settle_shared_provider(&reopened);
+        let traversal =
+            provider_traversal_instrumentation(receiver.request.identities.workspace_id);
+        assert_eq!(traversal.full_scan_entries, 0, "{traversal:?}");
+        assert_eq!(traversal.exact_manifests, 3, "{traversal:?}");
+        assert!(traversal.exact_objects >= 3, "{traversal:?}");
+        assert!(
+            fs::read(receiver.graph_root.join("notes/head-linear-tail.md"))
+                .unwrap()
+                .windows(b"tail tip".len())
+                .any(|window| window == b"tail tip"),
+            "the exact causal dependency walk did not converge the latest tail"
+        );
     }
 
     #[test]
@@ -10357,6 +11048,7 @@ mod tests {
             }
         }
         assert!(manifest.is_file());
+        settle_shared_provider(&initiator_handle);
         copy_provider_tree(
             &initiator.request.provider_root,
             &joiner.request.provider_root,
@@ -10674,6 +11366,74 @@ mod tests {
     }
 
     #[test]
+    fn frontier_head_conflicts_fall_back_and_preserve_unreconciled_bytes() {
+        let fixture = make_shared_fixture("provider-head-conflicts", 0xb480);
+        let _descriptor = activate_and_prepare_shared(&fixture);
+        let handle = active_handle(SyncRuntimeHandle::open(reopen_request(&fixture.request)));
+        settle_shared_provider(&handle);
+        let heads = fixture
+            .request
+            .provider_root
+            .join("outbox")
+            .join(SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE);
+        let canonical = fs::read_dir(&heads).unwrap().next().unwrap().unwrap();
+        let canonical_name = canonical.file_name().to_string_lossy().into_owned();
+        let (stem, extension) = canonical_name.rsplit_once('.').unwrap();
+        let conflict_name = format!("{stem}.sync-conflict-20260729-120000-ABCDEFG.{extension}");
+        let conflict = heads.join(&conflict_name);
+        fs::copy(canonical.path(), &conflict).unwrap();
+        handle
+            .observe_provider_paths(
+                vec![format!(
+                    "{SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE}/{conflict_name}"
+                )],
+                false,
+            )
+            .unwrap();
+        settle_shared_provider(&handle);
+        assert!(
+            !conflict.exists(),
+            "byte-identical generated head conflict was not retired"
+        );
+
+        let differing_name = format!("{stem}.sync-conflict-20260729-120001-HIJKLMN.{extension}");
+        let differing_path = heads.join(&differing_name);
+        let differing = b"differing generated head evidence".to_vec();
+        fs::write(&differing_path, &differing).unwrap();
+        reset_provider_traversal_instrumentation(fixture.request.identities.workspace_id);
+        handle
+            .observe_provider_paths(
+                vec![format!(
+                    "{SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE}/{differing_name}"
+                )],
+                false,
+            )
+            .unwrap();
+        settle_shared_provider(&handle);
+        let traversal = provider_traversal_instrumentation(fixture.request.identities.workspace_id);
+        assert!(traversal.full_scan_entries > 0, "{traversal:?}");
+        assert_eq!(fs::read(&differing_path).unwrap(), differing);
+
+        let malformed_name = format!(
+            "{}-{}.head",
+            fixture.request.identities.device_id,
+            "0".repeat(64)
+        );
+        let malformed = heads.join(&malformed_name);
+        fs::write(&malformed, b"{").unwrap();
+        reset_provider_traversal_instrumentation(fixture.request.identities.workspace_id);
+        handle.observe_provider().unwrap();
+        settle_shared_provider(&handle);
+        let traversal = provider_traversal_instrumentation(fixture.request.identities.workspace_id);
+        assert!(traversal.full_scan_entries > 0, "{traversal:?}");
+        assert_eq!(fs::read(&malformed).unwrap(), b"{");
+        assert!(matches!(
+            handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+    }
+
+    #[test]
     fn settled_provider_history_over_shutdown_budget_is_not_replayed_on_reopen() {
         let fixture = make_shared_fixture("provider-settled-history", 0xb500);
         let _descriptor = activate_and_prepare_shared(&fixture);
@@ -10717,13 +11477,78 @@ mod tests {
             .count()
                 > 64
         );
-        drop(handle);
+        let handoff = handle.clean_shutdown();
+        assert!(
+            matches!(handoff, Ok(SyncShutdownOutcome::Safe(_))),
+            "the settled writer must complete a genuine Safe handoff: {handoff:?}"
+        );
 
+        reset_provider_traversal_instrumentation(fixture.request.identities.workspace_id);
         let reopened = active_handle(SyncRuntimeHandle::open(reopen_request(&fixture.request)));
+        let mut idle = false;
+        let mut turns = 0;
+        for _ in 0..16 {
+            turns += 1;
+            if matches!(reopened.tick().unwrap(), SyncRuntimeTick::Idle) {
+                idle = true;
+                break;
+            }
+        }
+        assert!(
+            idle,
+            "clean reopen must not enumerate settled manifest/object history"
+        );
+        let traversed = provider_traversal_instrumentation(fixture.request.identities.workspace_id);
+        assert_eq!(traversed.full_scan_entries, 0, "{traversed:?}");
+        assert_eq!(traversed.exact_manifests, 0, "{traversed:?}");
+        assert_eq!(traversed.exact_objects, 0, "{traversed:?}");
+        assert_eq!(traversed.head_entries, 1, "{traversed:?}");
+        assert!(
+            turns <= traversed.head_entries + 5,
+            "startup work must be bounded by head residue: turns={turns}, {traversed:?}"
+        );
         assert!(
             matches!(reopened.clean_shutdown(), Ok(SyncShutdownOutcome::Safe(_))),
             "clean shutdown must not replay all settled provider history"
         );
+    }
+
+    #[test]
+    fn headless_legacy_namespace_falls_back_once_then_reopens_from_frontier_head() {
+        let fixture = make_shared_fixture("provider-headless-migration", 0xb700);
+        let _descriptor = activate_and_prepare_shared(&fixture);
+        let heads = fixture
+            .request
+            .provider_root
+            .join("outbox")
+            .join(SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE);
+        for entry in fs::read_dir(&heads).unwrap().map(Result::unwrap) {
+            fs::remove_file(entry.path()).unwrap();
+        }
+
+        reset_provider_traversal_instrumentation(fixture.request.identities.workspace_id);
+        let migrated = active_handle(SyncRuntimeHandle::open(reopen_request(&fixture.request)));
+        settle_shared_provider(&migrated);
+        let fallback = provider_traversal_instrumentation(fixture.request.identities.workspace_id);
+        assert!(fallback.full_scan_entries > 0, "{fallback:?}");
+        assert_eq!(fs::read_dir(&heads).unwrap().count(), 1);
+        assert!(matches!(
+            migrated.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+
+        reset_provider_traversal_instrumentation(fixture.request.identities.workspace_id);
+        let fast = active_handle(SyncRuntimeHandle::open(reopen_request(&fixture.request)));
+        settle_shared_provider(&fast);
+        let clean = provider_traversal_instrumentation(fixture.request.identities.workspace_id);
+        assert_eq!(clean.full_scan_entries, 0, "{clean:?}");
+        assert_eq!(clean.exact_manifests, 0, "{clean:?}");
+        assert_eq!(clean.exact_objects, 0, "{clean:?}");
+        assert_eq!(clean.head_entries, 1, "{clean:?}");
+        assert!(matches!(
+            fast.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
     }
 
     fn user_graph_bytes(root: &Path) -> BTreeMap<String, Vec<u8>> {
