@@ -10,6 +10,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Reverse-delivered experimental shared-provider histories now schedule inbound
+  batches by causal dependency instead of repeatedly scanning the pending
+  queue.** Each ready manifest is registered once, already-active parents are
+  satisfied immediately, and accepting a parent wakes only its deterministically
+  indexed children while blocked work remains visible to status and Safe
+  shutdown.
 - **Experimental shared-provider sync no longer loses oversized or overlapping
   delivery callbacks or preempts an already-observed local file edit.** Rejected
   callbacks retain a bounded rescan before `Safe`, observations arriving during

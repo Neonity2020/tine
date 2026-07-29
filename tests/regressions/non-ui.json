@@ -1324,6 +1324,28 @@
         "failBefore": "source-proven"
       },
       "notes": "Covers commit-last prepare-share and crash-resume from SharePrepared, incremental clean join beyond 4,096 provider entries and 8 MiB, both SharedActive roles across restart, reopening more than 64 settled manifests without historical replay, crash-resumable dependency-closed publication including unsafe local-manifest repair after private pending-marker creation failure, independent poll-mode provider delivery, coalesced incomplete-manifest rechecks after adversely reordered exact object delivery, nested nonstandard Unicode Markdown/Org paths, reordered and duplicate delivery, partial bootstrap and split-genesis refusal, dirty unique local-tail refusal, partition/rejoin, receiver-local projection, superseded-frontier rollback refusal, and convergence. A canonical generated Syncthing or Dropbox conflict copy is removed only after exact path, canonical-content, byte-equality, and no-follow retirement proof; differing, absent-target, malformed, or ambiguous evidence remains byte-exact and visibly blocks without graph writes. Continuously unstable full-scan epochs retain their fence and yield to retry backoff after one retry rebase. Tauri exposes bounded explicit prepare/join actions only inside the experimental sparse-v2 Settings flow, keeps provider polling separate from graph-wide reconciliation, and replaces stopped handles with retryable reopen slots after a transient post-transition reopen failure."
+    },
+    {
+      "id": "REG-SYNC-SHARED-PROVIDER-R6-001",
+      "title": "Reverse-delivered provider histories use dependency-indexed readiness work while retaining every blocked batch",
+      "family": "sync-data-safety",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/sync_runtime.rs"
+        ],
+        "scenario": "sync.shared-provider-r6-dependency-indexed-inbound",
+        "failBefore": "proven"
+      },
+      "notes": "The fail-before/pass-after stress receipt used a 96-batch linear history delivered newest-first: the indexed scheduler converged with exactly 96 manifest registrations while the prior pending-deque scan performed 9,216 readiness inspections. The always-on 24-batch regression preserves the same quadratic discriminator without adding a four-minute suite cost. A focused index neighbor covers multiple parents, an already-active synthetic base head, duplicate registration, unrelated acceptance, exact edge work, and deterministic sibling wake order. Existing shared-provider journeys continue to cover duplicate exact delivery, incomplete manifests becoming complete, restart reconstruction, publication repair, status visibility, and Safe-shutdown refusal while inbound evidence remains blocked."
     }
   ]
 }

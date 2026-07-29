@@ -142,6 +142,9 @@ static ACTOR_THREADS_FINISHED: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 #[cfg(test)]
 static PREPARE_SHARED_TEST_CUT: Mutex<Option<WorkspaceId>> = Mutex::new(None);
+#[cfg(test)]
+static PROVIDER_MANIFEST_READINESS_INSPECTIONS: Mutex<BTreeMap<WorkspaceId, usize>> =
+    Mutex::new(BTreeMap::new());
 
 #[cfg(test)]
 thread_local! {
@@ -2869,9 +2872,9 @@ fn publish_archive_batch(
         .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum ProviderManifestIngress {
-    Ready(BatchId),
+    Ready(OperationBatch),
     Incomplete(BatchId),
 }
 
@@ -3009,7 +3012,7 @@ fn stage_provider_manifest_exact(
         .inspect_batch(batch_id)
         .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
     {
-        crate::oplog::BatchInspection::Ready(_) => Ok(ProviderManifestIngress::Ready(batch_id)),
+        crate::oplog::BatchInspection::Ready(_) => Ok(ProviderManifestIngress::Ready(manifest)),
         crate::oplog::BatchInspection::Staged { .. } | crate::oplog::BatchInspection::Absent => {
             Ok(ProviderManifestIngress::Incomplete(batch_id))
         }
@@ -3298,6 +3301,100 @@ enum SharedJoinStep {
     Complete(SyncSharedEnrollmentDescriptor),
 }
 
+struct PendingProviderBatch {
+    causal_dependencies: Vec<BatchId>,
+    unmet_dependencies: usize,
+}
+
+#[derive(Default)]
+struct ProviderDependencyIndex {
+    pending: BTreeMap<BatchId, PendingProviderBatch>,
+    ready: VecDeque<BatchId>,
+    blocked_by: BTreeMap<BatchId, BTreeSet<BatchId>>,
+}
+
+impl ProviderDependencyIndex {
+    fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.pending.len()
+    }
+
+    fn contains(&self, batch_id: BatchId) -> bool {
+        self.pending.contains_key(&batch_id)
+    }
+
+    fn ready_front(&self) -> Option<BatchId> {
+        self.ready.front().copied()
+    }
+
+    fn register<E>(
+        &mut self,
+        batch_id: BatchId,
+        causal_dependencies: Vec<BatchId>,
+        mut dependency_is_satisfied: impl FnMut(BatchId) -> Result<bool, E>,
+    ) -> Result<bool, E> {
+        if self.contains(batch_id) {
+            return Ok(false);
+        }
+        let mut unmet_dependencies = Vec::new();
+        for dependency in &causal_dependencies {
+            if !dependency_is_satisfied(*dependency)? {
+                unmet_dependencies.push(*dependency);
+            }
+        }
+        let unmet_count = unmet_dependencies.len();
+        self.pending.insert(
+            batch_id,
+            PendingProviderBatch {
+                causal_dependencies,
+                unmet_dependencies: unmet_count,
+            },
+        );
+        if unmet_count == 0 {
+            self.ready.push_back(batch_id);
+        } else {
+            for dependency in unmet_dependencies {
+                self.blocked_by
+                    .entry(dependency)
+                    .or_default()
+                    .insert(batch_id);
+            }
+        }
+        Ok(true)
+    }
+
+    fn accept_ready(&mut self, accepted: BatchId) {
+        assert_eq!(
+            self.ready.pop_front(),
+            Some(accepted),
+            "accepted provider batch is the deterministic ready front"
+        );
+        self.pending
+            .remove(&accepted)
+            .expect("ready provider batch is registered");
+        let Some(dependents) = self.blocked_by.remove(&accepted) else {
+            return;
+        };
+        for dependent in dependents {
+            let pending = self
+                .pending
+                .get_mut(&dependent)
+                .expect("blocked provider dependent is registered");
+            debug_assert!(pending.causal_dependencies.contains(&accepted));
+            pending.unmet_dependencies = pending
+                .unmet_dependencies
+                .checked_sub(1)
+                .expect("blocked provider dependent has an unmet dependency");
+            if pending.unmet_dependencies == 0 {
+                self.ready.push_back(dependent);
+            }
+        }
+    }
+}
+
 struct RuntimeActor {
     graph: Graph,
     receipts: ProjectionReceiptStore,
@@ -3329,7 +3426,7 @@ struct RuntimeActor {
     /// clean shutdown replay settled provider history.
     provider_rescan_required_for_safe: bool,
     provider_observation_cursor: Option<SharedProviderObservationCursor>,
-    provider_pending: VecDeque<BatchId>,
+    provider_pending: ProviderDependencyIndex,
     provider_continuation: Option<ProviderArchiveContinuation>,
     provider_incomplete: BTreeSet<BatchId>,
     provider_incomplete_recheck: VecDeque<BatchId>,
@@ -3497,7 +3594,7 @@ impl RuntimeActor {
             provider_rescan_requested: shared_phase == Some(SyncSharedPhase::Active),
             provider_rescan_required_for_safe: false,
             provider_observation_cursor: None,
-            provider_pending: VecDeque::new(),
+            provider_pending: ProviderDependencyIndex::default(),
             provider_continuation: None,
             provider_incomplete: BTreeSet::new(),
             provider_incomplete_recheck: VecDeque::new(),
@@ -4282,20 +4379,7 @@ impl RuntimeActor {
             };
         }
 
-        if self.provider_continuation.is_none() {
-            match self.prioritize_provider_dependency_ready(&store) {
-                Ok(true) => {}
-                Ok(false) => {
-                    return if observed_provider_progress {
-                        SyncRuntimeTick::Recovering
-                    } else {
-                        SyncRuntimeTick::Idle
-                    };
-                }
-                Err(error) => return SyncRuntimeTick::RecoveryBlocked(error.to_string()),
-            }
-        }
-        let Some(batch_id) = self.provider_pending.front().copied() else {
+        let Some(batch_id) = self.provider_pending.ready_front() else {
             return if observed_provider_progress {
                 SyncRuntimeTick::Recovering
             } else {
@@ -4339,7 +4423,7 @@ impl RuntimeActor {
         };
         match result {
             Ok(ProviderArchiveIngress::Complete) => {
-                self.provider_pending.pop_front();
+                self.provider_pending.accept_ready(batch_id);
                 SyncRuntimeTick::Recovering
             }
             Ok(ProviderArchiveIngress::Pending(continuation)) => {
@@ -4350,54 +4434,35 @@ impl RuntimeActor {
         }
     }
 
-    fn prioritize_provider_dependency_ready(
+    fn register_provider_manifest(
         &mut self,
-        store: &ObjectStore,
-    ) -> Result<bool, SyncRuntimeRequestError> {
-        for index in 0..self.provider_pending.len() {
-            let batch_id = self.provider_pending[index];
-            let manifest = match store
-                .inspect_batch(batch_id)
-                .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
-            {
-                crate::oplog::BatchInspection::Ready(batch) => batch.manifest().clone(),
-                crate::oplog::BatchInspection::Absent => {
-                    return Err(SyncRuntimeRequestError::ActorRefused(format!(
-                        "ready inbound batch {batch_id} is absent"
-                    )));
-                }
-                crate::oplog::BatchInspection::Staged { .. } => {
-                    return Err(SyncRuntimeRequestError::ActorRefused(format!(
-                        "ready inbound batch {batch_id} is partial"
-                    )));
-                }
-            };
-            let mut dependency_ready = true;
-            for dependency in manifest.causal_dependency_heads() {
-                if !self
-                    .runtime
-                    .as_ref()
-                    .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
-                    .engine()
-                    .accepted_batch_is_active(*dependency)
-                    .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
-                {
-                    dependency_ready = false;
-                    break;
-                }
-            }
-            if dependency_ready {
-                if index > 0 {
-                    let batch_id = self
-                        .provider_pending
-                        .remove(index)
-                        .expect("indexed provider batch");
-                    self.provider_pending.push_front(batch_id);
-                }
-                return Ok(true);
-            }
+        manifest: OperationBatch,
+    ) -> Result<(), SyncRuntimeRequestError> {
+        let batch_id = manifest.batch_id();
+        let causal_dependencies = manifest.causal_dependency_heads().to_vec();
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or(SyncRuntimeRequestError::ActorUnavailable)?;
+        let registered =
+            self.provider_pending
+                .register(batch_id, causal_dependencies, |dependency| {
+                    runtime
+                        .engine()
+                        .accepted_batch_is_active(dependency)
+                        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))
+                })?;
+        #[cfg(test)]
+        if registered {
+            *PROVIDER_MANIFEST_READINESS_INSPECTIONS
+                .lock()
+                .expect("provider readiness inspection accounting")
+                .entry(self.binding.workspace_id())
+                .or_default() += 1;
         }
-        Ok(false)
+        #[cfg(not(test))]
+        let _ = registered;
+        Ok(())
     }
 
     fn tick_provider_publication(
@@ -4652,6 +4717,10 @@ impl RuntimeActor {
             return Ok(());
         }
         if let Some(batch_id) = provider_manifest_id(path) {
+            if self.provider_pending.contains(batch_id) {
+                self.provider_incomplete.remove(&batch_id);
+                return Ok(());
+            }
             if self
                 .runtime
                 .as_ref()
@@ -4694,11 +4763,10 @@ impl RuntimeActor {
                 descriptor,
                 path,
             )? {
-                ProviderManifestIngress::Ready(batch_id) => {
+                ProviderManifestIngress::Ready(manifest) => {
+                    let batch_id = manifest.batch_id();
                     self.provider_incomplete.remove(&batch_id);
-                    if !self.provider_pending.contains(&batch_id) {
-                        self.provider_pending.push_back(batch_id);
-                    }
+                    self.register_provider_manifest(manifest)?;
                 }
                 ProviderManifestIngress::Incomplete(batch_id) => {
                     self.provider_incomplete.insert(batch_id);
@@ -9415,6 +9483,22 @@ mod tests {
         panic!("shared batch {batch_id} was not published");
     }
 
+    fn reset_provider_manifest_readiness_inspections(workspace_id: WorkspaceId) {
+        PROVIDER_MANIFEST_READINESS_INSPECTIONS
+            .lock()
+            .unwrap()
+            .insert(workspace_id, 0);
+    }
+
+    fn provider_manifest_readiness_inspections(workspace_id: WorkspaceId) -> usize {
+        PROVIDER_MANIFEST_READINESS_INSPECTIONS
+            .lock()
+            .unwrap()
+            .get(&workspace_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
     fn archive_contains_payload(fixture: &ActivationFixture, expected: &[u8]) -> bool {
         let store = ObjectStore::open(
             &fixture.request.archive_root,
@@ -9936,6 +10020,165 @@ mod tests {
             resumed.clean_shutdown(),
             Ok(SyncShutdownOutcome::Safe(_))
         ));
+    }
+
+    #[test]
+    fn reverse_delivered_provider_chain_has_linear_readiness_work() {
+        // The fail-before/pass-after stress receipt used 96 batches
+        // (9,216 old inspections versus 96 indexed registrations). Keep the
+        // always-on regression smaller while preserving the same quadratic
+        // discriminator.
+        const BATCH_COUNT: usize = 24;
+        let (initiator, receiver, initiator_handle, receiver_handle) =
+            joined_shared_pair("provider-reverse-linear", 0xd000);
+        let mut batches = Vec::with_capacity(BATCH_COUNT);
+        for index in 0..BATCH_COUNT {
+            let seed = 0xd100 + (index as u128) * 4;
+            let (batch_id, ..) = submit_shared_page(
+                &initiator_handle,
+                seed,
+                &format!("Reverse Provider {index}"),
+                &format!("notes/reverse-provider-{index}.md"),
+                &format!("reverse provider payload {index}"),
+            );
+            batches.push(batch_id);
+        }
+        let store = ObjectStore::open(
+            &initiator.request.archive_root,
+            initiator.request.identities.workspace_id,
+        )
+        .unwrap();
+        for pair in batches.windows(2) {
+            let manifest =
+                OperationBatch::decode(&store.read_manifest_bytes(pair[1]).unwrap()).unwrap();
+            assert_eq!(
+                manifest.causal_dependency_heads(),
+                &[pair[0]],
+                "fixture must remain a linear causal chain"
+            );
+        }
+        settle_shared_provider(&initiator_handle);
+        copy_provider_tree(
+            &initiator.request.provider_root,
+            &receiver.request.provider_root,
+        );
+
+        reset_provider_manifest_readiness_inspections(receiver.request.identities.workspace_id);
+        let manifest_paths = batches
+            .iter()
+            .rev()
+            .map(|batch_id| format!("manifests/{batch_id}.manifest"))
+            .collect();
+        receiver_handle
+            .observe_provider_paths(manifest_paths, false)
+            .unwrap();
+        for _ in 0..16_384 {
+            let tick = receiver_handle.tick().unwrap();
+            assert!(
+                !matches!(
+                    tick,
+                    SyncRuntimeTick::RecoveryBlocked(_)
+                        | SyncRuntimeTick::Blocked(_)
+                        | SyncRuntimeTick::Terminal(_)
+                        | SyncRuntimeTick::Failed(_)
+                ),
+                "reverse provider chain failed: {tick:?}"
+            );
+            if matches!(tick, SyncRuntimeTick::Idle)
+                && receiver_handle.status().unwrap().provider_pending == 0
+            {
+                break;
+            }
+        }
+        assert_eq!(receiver_handle.status().unwrap().provider_pending, 0);
+        for index in 0..BATCH_COUNT {
+            assert!(
+                receiver
+                    .graph_root
+                    .join(format!("notes/reverse-provider-{index}.md"))
+                    .is_file(),
+                "reverse-delivered batch {index} did not converge"
+            );
+        }
+        let inspections =
+            provider_manifest_readiness_inspections(receiver.request.identities.workspace_id);
+        assert_eq!(
+            inspections,
+            BATCH_COUNT,
+            "reverse-delivered {BATCH_COUNT}-batch chain must inspect each ready manifest once; \
+             the acceptance ceiling is {} plus separately bounded dependency-edge checks",
+            BATCH_COUNT * 3,
+        );
+    }
+
+    #[test]
+    fn provider_dependency_index_handles_multiple_parents_active_heads_and_duplicates() {
+        let active_base = BatchId::from_uuid(Uuid::from_u128(0xd800));
+        let first_parent = BatchId::from_uuid(Uuid::from_u128(0xd801));
+        let second_parent = BatchId::from_uuid(Uuid::from_u128(0xd802));
+        let unrelated = BatchId::from_uuid(Uuid::from_u128(0xd803));
+        let child_low = BatchId::from_uuid(Uuid::from_u128(0xd810));
+        let child_high = BatchId::from_uuid(Uuid::from_u128(0xd811));
+        let child_dependencies = vec![active_base, first_parent, second_parent];
+        let mut index = ProviderDependencyIndex::default();
+        let mut inspected_dependencies = Vec::new();
+
+        assert!(index
+            .register(child_high, vec![second_parent], |dependency| {
+                inspected_dependencies.push(dependency);
+                Ok::<_, ()>(dependency == active_base)
+            },)
+            .unwrap());
+        assert!(index
+            .register(child_low, child_dependencies.clone(), |dependency| {
+                inspected_dependencies.push(dependency);
+                Ok::<_, ()>(dependency == active_base)
+            },)
+            .unwrap());
+        assert_eq!(
+            index.pending[&child_low].causal_dependencies,
+            child_dependencies
+        );
+        assert_eq!(index.pending[&child_low].unmet_dependencies, 2);
+        assert_eq!(index.ready_front(), None);
+
+        assert!(!index
+            .register(child_low, Vec::new(), |_| -> Result<bool, ()> {
+                panic!("duplicate registration reinspected dependencies")
+            })
+            .unwrap());
+        assert!(index
+            .register(first_parent, Vec::new(), |_| Ok::<_, ()>(false))
+            .unwrap());
+        assert_eq!(index.ready_front(), Some(first_parent));
+        index.accept_ready(first_parent);
+        assert_eq!(index.pending[&child_low].unmet_dependencies, 1);
+        assert_eq!(index.ready_front(), None);
+
+        assert!(index
+            .register(unrelated, Vec::new(), |_| Ok::<_, ()>(false))
+            .unwrap());
+        index.accept_ready(unrelated);
+        assert_eq!(index.ready_front(), None);
+
+        assert!(index
+            .register(second_parent, Vec::new(), |_| Ok::<_, ()>(false))
+            .unwrap());
+        index.accept_ready(second_parent);
+        assert_eq!(
+            index.ready_front(),
+            Some(child_low),
+            "dependents awakened together must use deterministic BatchId order"
+        );
+        index.accept_ready(child_low);
+        assert_eq!(index.ready_front(), Some(child_high));
+        index.accept_ready(child_high);
+        assert!(index.is_empty());
+        assert_eq!(
+            inspected_dependencies,
+            vec![second_parent, active_base, first_parent, second_parent],
+            "each declared dependency edge must be inspected exactly once"
+        );
     }
 
     #[test]
