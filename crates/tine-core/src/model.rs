@@ -480,6 +480,26 @@ pub struct PageEntry {
     pub path: PathBuf,
 }
 
+/// One parser-owned interpretation of a present external graph-text document.
+///
+/// The filename fallback and parser-declared title remain distinct so callers
+/// can compare current content authority with an authenticated prior document
+/// without conflating either fact with an already accepted oplog identity.
+/// Journal conversion is represented only by `effective`: it is applied after
+/// selecting the explicit title or filename fallback, matching OG.
+pub(crate) struct ParsedExternalDocument {
+    pub(crate) format: Format,
+    pub(crate) explicit_title: Option<String>,
+    pub(crate) filename_fallback: PageEntry,
+    pub(crate) effective: PageEntry,
+    pub(crate) parsed: doc::ParsedDocument,
+    pub(crate) revision: String,
+    /// `None` when the caller only needs read-compatible semantics. Import
+    /// requests the existing byte-round-trip admission proof and receives
+    /// `Some(true)` or fails closed before this value can be consumed.
+    pub(crate) source_round_trips: Option<bool>,
+}
+
 /// A block as sent to / received from the frontend.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BlockDto {
@@ -5154,6 +5174,26 @@ impl Graph {
         self.graph_entry_for_relative_path(path.as_str())
     }
 
+    /// Parse one present external document through the canonical content
+    /// semantic boundary. The caller chooses whether import-grade round-trip
+    /// evidence is required; both modes use the same parser-owned identity
+    /// extraction and exact source-span parse.
+    pub(crate) fn parse_external_document(
+        &self,
+        path: &ManagedPath,
+        bytes: &[u8],
+        require_round_trip: bool,
+    ) -> io::Result<ParsedExternalDocument> {
+        let content = std::str::from_utf8(bytes).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("graph text is not UTF-8: {path}"),
+            )
+        })?;
+        let fallback = self.provisional_graph_entry_for_managed_path(path)?;
+        parse_external_document(self, fallback, content, require_round_trip)
+    }
+
     fn decode_present_graph_text(
         &self,
         path: &ManagedPath,
@@ -5162,15 +5202,9 @@ impl Graph {
     ) -> io::Result<(PageEntry, Format)> {
         count_graph_text_admission_parser_invocation();
         graph_text_parse_failure_hook()?;
-        let content = std::str::from_utf8(bytes).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("graph text is not UTF-8: {path}"),
-            )
-        })?;
-        let provisional = self.provisional_graph_entry_for_managed_path(path)?;
-        let format = Format::from_path(Path::new(path.file_name()));
-        let (semantic, _, _) = parse_exact_page(self, &provisional, content)?;
+        let parsed = self.parse_external_document(path, bytes, false)?;
+        let semantic = parsed.effective;
+        let format = parsed.format;
         let actual_name_allocation = checked_add_bytes(
             usize_to_u64(std::mem::size_of::<String>())?,
             usize_to_u64(semantic.name.capacity())?,
@@ -5197,15 +5231,10 @@ impl Graph {
     ) -> io::Result<(PageEntry, Format, u64)> {
         count_graph_text_admission_parser_invocation();
         graph_text_parse_failure_hook()?;
-        let content = std::str::from_utf8(bytes).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("graph text is not UTF-8: {path}"),
-            )
-        })?;
-        let provisional = self.provisional_graph_entry_for_managed_path(path)?;
-        let format = Format::from_path(Path::new(path.file_name()));
-        let (semantic, document, _) = parse_exact_page(self, &provisional, content)?;
+        let parsed = self.parse_external_document(path, bytes, false)?;
+        let semantic = parsed.effective;
+        let format = parsed.format;
+        let document = parsed.parsed.document;
         let actual_name_allocation = checked_add_bytes(
             usize_to_u64(std::mem::size_of::<String>())?,
             usize_to_u64(semantic.name.capacity())?,
@@ -18103,12 +18132,14 @@ fn parsed_page_title(document: &Document, format: Format) -> Option<String> {
         }
         if format == Format::Org {
             let trimmed = line.trim();
-            if let Some(value) = trimmed
-                .strip_prefix("#+TITLE:")
-                .or_else(|| trimmed.strip_prefix("#+title:"))
-                .or_else(|| trimmed.strip_prefix(":TITLE:"))
-                .or_else(|| trimmed.strip_prefix(":title:"))
-            {
+            let directive = trimmed
+                .split_once(':')
+                .and_then(|(key, value)| key.eq_ignore_ascii_case("#+title").then_some(value));
+            let drawer = trimmed.strip_prefix(':').and_then(|rest| {
+                rest.split_once(':')
+                    .and_then(|(key, value)| key.eq_ignore_ascii_case("title").then_some(value))
+            });
+            if let Some(value) = directive.or(drawer) {
                 if !value.trim().is_empty() {
                     return Some(value.trim().to_owned());
                 }
@@ -18190,23 +18221,59 @@ fn effective_page_entry(
     effective
 }
 
+fn parse_external_document(
+    graph: &Graph,
+    fallback: PageEntry,
+    content: &str,
+    require_round_trip: bool,
+) -> io::Result<ParsedExternalDocument> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        #[cfg(test)]
+        GRAPH_TEXT_PARSE_ATTEMPTS.with(|attempts| attempts.set(attempts.get().saturating_add(1)));
+        let format = Format::from_path(&fallback.path);
+        // Preserve the established admission peak: the round-trip parser and
+        // serializer must drop their temporary document before the exact-span
+        // document retained by this boundary is constructed.
+        let source_round_trips = require_round_trip.then(|| match format {
+            Format::Md => doc::markdown_round_trips(content),
+            Format::Org => crate::org::org_editable(content),
+        });
+        let mut parsed = match format {
+            Format::Md => doc::parse_with_source_spans(content),
+            Format::Org => crate::org::parse_org_with_source_spans(content),
+        };
+        #[cfg(test)]
+        if content.contains(TEST_PAGE_PARSE_PANIC_SENTINEL) {
+            panic!("deterministic test sentinel for a page projection panic");
+        }
+        assign_doc_runtime_ids(&mut parsed.document.roots, &fallback.rel_path);
+        let explicit_title = parsed_page_title(&parsed.document, format);
+        let effective = effective_page_entry(&graph.journal_format, &fallback, &parsed.document);
+        ParsedExternalDocument {
+            format,
+            explicit_title,
+            filename_fallback: fallback,
+            effective,
+            parsed,
+            revision: content_rev(content),
+            source_round_trips,
+        }
+    })) {
+        Ok(parsed) => Ok(parsed),
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "external document parser rejected present graph text",
+        )),
+    }
+}
+
 fn parse_exact_page(
     graph: &Graph,
     entry: &PageEntry,
     content: &str,
 ) -> io::Result<(PageEntry, Document, String)> {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        parse_page_content(entry, content)
-    })) {
-        Ok((document, revision)) => {
-            let effective = effective_page_entry(&graph.journal_format, entry, &document);
-            Ok((effective, document, revision))
-        }
-        Err(_) => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("page parser rejected {}", entry.rel_path),
-        )),
-    }
+    let parsed = parse_external_document(graph, entry.clone(), content, false)?;
+    Ok((parsed.effective, parsed.parsed.document, parsed.revision))
 }
 
 /// Count a parsed document without recursive descent, so an externally edited
@@ -26165,13 +26232,20 @@ fn graph_text_observed_semantic_name_upper_bound(
             .split_once("::")
             .and_then(|(key, value)| key.trim().eq_ignore_ascii_case("title").then_some(value))
             .or_else(|| {
-                (format == Format::Org)
-                    .then(|| {
-                        ["#+TITLE:", "#+title:", ":TITLE:", ":title:"]
-                            .into_iter()
-                            .find_map(|prefix| trimmed.strip_prefix(prefix))
-                    })
-                    .flatten()
+                (format == Format::Org).then_some(()).and_then(|()| {
+                    trimmed
+                        .split_once(':')
+                        .and_then(|(key, value)| {
+                            key.eq_ignore_ascii_case("#+title").then_some(value)
+                        })
+                        .or_else(|| {
+                            trimmed.strip_prefix(':').and_then(|rest| {
+                                rest.split_once(':').and_then(|(key, value)| {
+                                    key.eq_ignore_ascii_case("title").then_some(value)
+                                })
+                            })
+                        })
+                })
             });
         if let Some(title) = title {
             observed = observed.max(checked_add_bytes(usize_to_u64(title.trim().len())?, 64)?);
@@ -43053,5 +43127,21 @@ mod tests {
         )
         .unwrap();
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parsed_page_title_accepts_case_insensitive_org_directives_and_drawers() {
+        for (source, expected) in [
+            ("#+title: Lower\n\n* body\n", "Lower"),
+            ("#+TITLE: Upper\n\n* body\n", "Upper"),
+            ("#+TiTlE: Mixed\n\n* body\n", "Mixed"),
+            (":PROPERTIES:\n:TiTlE: Drawer\n:END:\n\n* body\n", "Drawer"),
+        ] {
+            let document = crate::org::parse_org(source);
+            assert_eq!(
+                parsed_page_title(&document, Format::Org).as_deref(),
+                Some(expected)
+            );
+        }
     }
 }

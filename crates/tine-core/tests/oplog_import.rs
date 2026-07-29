@@ -86,6 +86,8 @@ impl BlockSpec {
 struct PageSpec {
     path: String,
     blocks: Vec<BlockSpec>,
+    name: Option<String>,
+    preamble: Option<String>,
 }
 
 struct PageAuthority {
@@ -153,13 +155,21 @@ impl AuthorityFixture {
             operations.push(SemanticOperation::CreatePage {
                 page_id,
                 home_document_id,
-                name: tine_core::oplog::LogicalPageName::parse(format!(
-                    "Imported Page {page_index}"
-                ))
+                name: tine_core::oplog::LogicalPageName::parse(
+                    page.name
+                        .clone()
+                        .unwrap_or_else(|| format!("Imported Page {page_index}")),
+                )
                 .unwrap(),
                 path: ManagedPath::parse(page.path.clone()).unwrap(),
                 kind,
             });
+            if let Some(preamble) = &page.preamble {
+                operations.push(SemanticOperation::SetPagePreamble {
+                    page_id,
+                    preamble: Some(preamble.clone()),
+                });
+            }
             for (index, block) in page.blocks.iter().enumerate() {
                 operations.push(SemanticOperation::CreateBlock {
                     block: BlockLocation {
@@ -241,6 +251,26 @@ impl AuthorityFixture {
             vec![PageSpec {
                 path: path.into(),
                 blocks,
+                name: None,
+                preamble: None,
+            }],
+        )
+    }
+
+    fn one_titled_page(
+        label: &str,
+        path: &str,
+        title: &str,
+        preamble: &str,
+        blocks: Vec<BlockSpec>,
+    ) -> Self {
+        Self::new(
+            label,
+            vec![PageSpec {
+                path: path.into(),
+                blocks,
+                name: Some(title.into()),
+                preamble: Some(preamble.into()),
             }],
         )
     }
@@ -340,6 +370,46 @@ fn hex(bytes: &[u8]) -> String {
         encoded.push(DIGITS[(byte & 0x0f) as usize] as char);
     }
     encoded
+}
+
+/// Paired bootstrap/steady-state fixture constructor. The exact source bytes
+/// first pass through the graph-wide initial inventory and independent
+/// OG-compatible Graph loader, then through affected import planning.
+fn assert_new_external_document_pair(
+    fixture: &AuthorityFixture,
+    path: &str,
+    bytes: &[u8],
+    expected_name: &str,
+    expected_kind: ManagedTextKind,
+) {
+    fixture.overwrite(path, bytes);
+    let oracle = Graph::open(&fixture.graph_root)
+        .list_pages()
+        .into_iter()
+        .find(|entry| entry.rel_path == path)
+        .unwrap();
+    assert_eq!(oracle.name, expected_name);
+    assert_eq!(
+        match oracle.kind {
+            tine_core::PageKind::Page => ManagedTextKind::Page,
+            tine_core::PageKind::Journal => ManagedTextKind::Journal,
+        },
+        expected_kind
+    );
+    let initial = inventory_initial_shadow(&Graph::open(&fixture.graph_root)).unwrap();
+    assert_eq!(initial.present(path).unwrap().bytes(), bytes);
+
+    let plan = fixture.plan(&[path]);
+    assert_eq!(plan.status(), ImportPlanStatus::Reconcile, "{plan:?}");
+    assert_eq!(plan.instrumentation().present_document_parses, 1);
+    let diagnostic = format!("{plan:#?}");
+    assert!(
+        diagnostic.contains("CreatePage")
+            && diagnostic.contains(expected_name)
+            && diagnostic.contains(path)
+            && diagnostic.contains(&format!("kind: {expected_kind:?}")),
+        "bootstrap Graph oracle and affected import differ for {path}: {diagnostic}"
+    );
 }
 
 #[test]
@@ -878,10 +948,14 @@ fn global_exact_matching_retains_unambiguous_cross_page_move_but_not_copy() {
             PageSpec {
                 path: "pages/a.md".into(),
                 blocks: vec![BlockSpec::root("moved", "a")],
+                name: None,
+                preamble: None,
             },
             PageSpec {
                 path: "pages/b.md".into(),
                 blocks: vec![BlockSpec::root("resident", "a")],
+                name: None,
+                preamble: None,
             },
         ],
     );
@@ -907,10 +981,14 @@ fn global_exact_matching_retains_unambiguous_cross_page_move_but_not_copy() {
             PageSpec {
                 path: "pages/a.md".into(),
                 blocks: vec![BlockSpec::root("moved", "a")],
+                name: None,
+                preamble: None,
             },
             PageSpec {
                 path: "pages/b.md".into(),
                 blocks: vec![BlockSpec::root("resident", "a")],
+                name: None,
+                preamble: None,
             },
         ],
     );
@@ -1131,6 +1209,267 @@ fn affected_scope_avoids_unrelated_entries_and_accepts_supported_graph_text() {
 }
 
 #[test]
+fn attack_external_title_change_at_exact_path_updates_logical_page_name() {
+    let fixture = AuthorityFixture::one_page(
+        "attack-exact-path-title-change",
+        "pages/Imported Page 0.md",
+        vec![BlockSpec::root("base", "a")],
+    );
+    let page_id = fixture.pages[0].page_id;
+    let path = "pages/Imported Page 0.md";
+    fixture.overwrite(path, b"title:: Renamed Page\n\n- base\n");
+    let graph_name = Graph::open(&fixture.graph_root)
+        .list_pages()
+        .into_iter()
+        .find(|entry| entry.rel_path == path)
+        .unwrap()
+        .name;
+    assert_eq!(graph_name, "Renamed Page");
+
+    let plan = fixture.plan(&[path]);
+    assert_eq!(plan.status(), ImportPlanStatus::Reconcile, "{plan:?}");
+    let diagnostic = format!("{plan:#?}");
+    assert!(
+        diagnostic.contains("ReconcileExternalPageState")
+            && diagnostic.contains(&page_id.to_string())
+            && diagnostic.contains("Renamed Page"),
+        "accepted identity must follow the parser-owned external title: {diagnostic}"
+    );
+}
+
+#[test]
+fn attack_new_external_page_uses_parser_owned_title_as_logical_name() {
+    let fixture = AuthorityFixture::one_page(
+        "attack-new-external-title",
+        "pages/seed.md",
+        vec![BlockSpec::root("seed", "a")],
+    );
+    let path = "pages/physical-name.md";
+    assert_new_external_document_pair(
+        &fixture,
+        path,
+        b"title:: Logical Title\n\n- external\n",
+        "Logical Title",
+        ManagedTextKind::Page,
+    );
+}
+
+#[test]
+fn new_org_title_spellings_share_graph_and_import_semantics() {
+    let fixture = AuthorityFixture::one_page(
+        "paired-org-title-spellings",
+        "pages/seed.md",
+        vec![BlockSpec::root("seed", "a")],
+    );
+    for (path, bytes, name) in [
+        (
+            "pages/lower.org",
+            b"#+title: Lower Title\n\n* external\n".as_slice(),
+            "Lower Title",
+        ),
+        (
+            "pages/upper.org",
+            b"#+TITLE: Upper Title\n\n* external\n".as_slice(),
+            "Upper Title",
+        ),
+        (
+            "pages/mixed.org",
+            b"#+TiTlE: Mixed Title\n\n* external\n".as_slice(),
+            "Mixed Title",
+        ),
+        (
+            "pages/drawer.org",
+            b":PROPERTIES:\n:TiTlE: Drawer Title\n:END:\n\n* external\n".as_slice(),
+            "Drawer Title",
+        ),
+    ] {
+        assert_new_external_document_pair(&fixture, path, bytes, name, ManagedTextKind::Page);
+    }
+}
+
+#[test]
+fn explicit_titles_precede_directory_and_filename_kind_before_journal_conversion() {
+    let mut fixture = AuthorityFixture::one_page(
+        "paired-title-kind-precedence",
+        "pages/seed.md",
+        vec![BlockSpec::root("seed", "a")],
+    );
+    write(
+        &fixture.graph_root,
+        "logseq/config.edn",
+        b"{:journal/file-name-format \"dd-MM-yyyy\"\n\
+          :journal/page-title-format \"yyyy-MM-dd\"}\n",
+    );
+    fixture.graph = Graph::open(&fixture.graph_root);
+    for (path, bytes, name, kind) in [
+        (
+            "pages/nested/not-a-date.md",
+            b"title:: 25-07-2026\n\n- date title\n".as_slice(),
+            "2026-07-25",
+            ManagedTextKind::Journal,
+        ),
+        (
+            "journals/nested/25-07-2026.md",
+            b"title:: Ordinary Page\n\n- non-date title\n".as_slice(),
+            "Ordinary Page",
+            ManagedTextKind::Page,
+        ),
+        (
+            "archive/deep/physical.org",
+            b"#+TiTlE: 26-07-2026\n\n* date title\n".as_slice(),
+            "2026-07-26",
+            ManagedTextKind::Journal,
+        ),
+    ] {
+        assert_new_external_document_pair(&fixture, path, bytes, name, kind);
+    }
+}
+
+#[test]
+fn attack_unambiguous_rename_with_preamble_edit_retains_page_identity() {
+    let fixture = AuthorityFixture::one_page(
+        "attack-rename-preamble-identity",
+        "pages/old.md",
+        vec![BlockSpec::root("base", "a")],
+    );
+    let page_id = fixture.pages[0].page_id;
+    fs::rename(
+        fixture.graph_root.join("pages/old.md"),
+        fixture.graph_root.join("pages/new.md"),
+    )
+    .unwrap();
+    fixture.overwrite("pages/new.md", b"title:: New\n\n- base\n");
+
+    let plan = fixture.plan(&["pages/old.md", "pages/new.md"]);
+    assert_eq!(plan.status(), ImportPlanStatus::Reconcile, "{plan:?}");
+    assert!(plan.matches().unwrap().pages().iter().any(|matched| {
+        matched.page_id() == page_id
+            && matched.previous_path().as_str() == "pages/old.md"
+            && matched.path().as_str() == "pages/new.md"
+            && matched.basis() == PageMatchBasis::ReceiptBackedStructuralRename
+    }));
+}
+
+#[test]
+fn attack_configured_root_move_retains_page_identity_and_uses_new_title() {
+    let mut fixture = AuthorityFixture::one_page(
+        "attack-configured-root-move",
+        "pages/Imported Page 0.md",
+        vec![BlockSpec::root("base", "a")],
+    );
+    let page_id = fixture.pages[0].page_id;
+    write(
+        &fixture.graph_root,
+        "logseq/config.edn",
+        b"{:pages-directory \"notes\"}\n",
+    );
+    fs::create_dir_all(fixture.graph_root.join("notes/deep")).unwrap();
+    fs::rename(
+        fixture.graph_root.join("pages/Imported Page 0.md"),
+        fixture.graph_root.join("notes/deep/renamed.md"),
+    )
+    .unwrap();
+    fixture.overwrite(
+        "notes/deep/renamed.md",
+        b"title:: Configured Root Rename\n\n- base\n",
+    );
+    fixture.graph = Graph::open(&fixture.graph_root);
+
+    let plan = fixture.plan(&["pages/Imported Page 0.md", "notes/deep/renamed.md"]);
+    assert_eq!(plan.status(), ImportPlanStatus::Reconcile, "{plan:?}");
+    let diagnostic = format!("{plan:#?}");
+    assert!(
+        diagnostic.contains("ReconcileExternalPageState")
+            && diagnostic.contains(&page_id.to_string())
+            && diagnostic.contains("Configured Root Rename")
+            && diagnostic.contains("notes/deep/renamed.md"),
+        "move must retain PageId while re-evaluating destination title semantics: {diagnostic}"
+    );
+}
+
+#[test]
+fn exact_title_removal_and_format_only_edit_follow_authenticated_base_evidence() {
+    let retitled = AuthorityFixture::one_titled_page(
+        "explicit-title-change",
+        "pages/physical.md",
+        "Original Logical",
+        "title:: Original Logical",
+        vec![BlockSpec::root("base", "a")],
+    );
+    let retitled_page_id = retitled.pages[0].page_id;
+    retitled.overwrite("pages/physical.md", b"title:: Current Logical\n\n- base\n");
+    let title_change = retitled.plan(&["pages/physical.md"]);
+    assert_eq!(
+        title_change.status(),
+        ImportPlanStatus::Reconcile,
+        "{title_change:?}"
+    );
+    let diagnostic = format!("{title_change:#?}");
+    assert!(
+        diagnostic.contains("ReconcileExternalPageState")
+            && diagnostic.contains(&retitled_page_id.to_string())
+            && diagnostic.contains("Current Logical"),
+        "explicit title A -> B must reconcile the same PageId: {diagnostic}"
+    );
+
+    let changed = AuthorityFixture::one_titled_page(
+        "explicit-title-removal",
+        "pages/physical.md",
+        "Logical",
+        "title:: Logical",
+        vec![BlockSpec::root("base", "a")],
+    );
+    let page_id = changed.pages[0].page_id;
+    changed.overwrite("pages/physical.md", b"- base\n");
+    let removal = changed.plan(&["pages/physical.md"]);
+    assert_eq!(removal.status(), ImportPlanStatus::Reconcile, "{removal:?}");
+    let diagnostic = format!("{removal:#?}");
+    assert!(
+        diagnostic.contains("ReconcileExternalPageState")
+            && diagnostic.contains(&page_id.to_string())
+            && diagnostic.contains("physical"),
+        "title removal must reconcile to the current filename fallback: {diagnostic}"
+    );
+
+    let formatting = AuthorityFixture::one_titled_page(
+        "explicit-title-formatting",
+        "pages/physical.md",
+        "Logical",
+        "title:: Logical",
+        vec![BlockSpec::root("base", "a")],
+    );
+    formatting.overwrite(
+        "pages/physical.md",
+        b"title::   Logical  \nsubtitle:: retained\n\n- base\n",
+    );
+    let plan = formatting.plan(&["pages/physical.md"]);
+    assert_eq!(plan.status(), ImportPlanStatus::Reconcile, "{plan:?}");
+    let diagnostic = format!("{plan:#?}");
+    assert!(
+        !diagnostic.contains("ReconcileExternalPageState"),
+        "unchanged semantic title formatting must not rename: {diagnostic}"
+    );
+    assert!(diagnostic.contains("SetPagePreamble"));
+}
+
+#[test]
+fn explicit_title_collisions_block_before_authoring() {
+    let fixture = AuthorityFixture::one_page(
+        "explicit-title-collision",
+        "pages/Owned.md",
+        vec![BlockSpec::root("owned", "a")],
+    );
+    fixture.overwrite("pages/first.md", b"title:: Shared Explicit\n\n- first\n");
+    fixture.overwrite("pages/second.md", b"title:: Shared Explicit\n\n- second\n");
+    let affected = fixture.plan(&["pages/first.md", "pages/second.md"]);
+    assert!(blocked_reasons(&affected).contains(&ImportBlockReason::ConflictingLocalTail));
+
+    fixture.overwrite("pages/new.md", b"title:: Imported Page 0\n\n- new\n");
+    let accepted = fixture.plan(&["pages/new.md"]);
+    assert!(blocked_reasons(&accepted).contains(&ImportBlockReason::ConflictingLocalTail));
+}
+
+#[test]
 fn portable_case_and_unicode_collisions_fail_closed_but_exact_owner_remains_valid() {
     let fixture = AuthorityFixture::one_page(
         "portable-collision",
@@ -1182,10 +1521,14 @@ fn deep_input_fails_before_parse_and_inventory_instrumentation_counts_physical_w
             PageSpec {
                 path: "pages/a.md".into(),
                 blocks: vec![BlockSpec::root("short", "a")],
+                name: None,
+                preamble: None,
             },
             PageSpec {
                 path: "pages/b.md".into(),
                 blocks: vec![BlockSpec::root("a somewhat longer block", "a")],
+                name: None,
+                preamble: None,
             },
         ],
     );
@@ -1235,6 +1578,8 @@ fn large_noop_and_many_error_scopes_obey_complete_numeric_work_ceilings() {
         .map(|index| PageSpec {
             path: format!("pages/p{index:04}.md"),
             blocks: vec![BlockSpec::root(format!("block {index}"), "a")],
+            name: None,
+            preamble: None,
         })
         .collect();
     let fixture = AuthorityFixture::new("large-noop", pages);

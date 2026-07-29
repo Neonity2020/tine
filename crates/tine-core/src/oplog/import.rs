@@ -54,7 +54,7 @@ use super::{
 };
 use crate::model::{
     path_is_sync_conflict, BootstrapSourceCapture, BootstrapSourceCaptureInstrumentation,
-    BootstrapSourceChunk, BootstrapSourceEntry, Graph, PageKind,
+    BootstrapSourceChunk, BootstrapSourceEntry, Graph, PageEntry, PageKind,
 };
 
 #[cfg(test)]
@@ -3720,6 +3720,8 @@ pub struct ImportInstrumentation {
     pub catalog_path_inserts: usize,
     pub catalog_path_lookups: usize,
     pub inventory_path_lookups: usize,
+    pub present_document_parses: usize,
+    pub authenticated_base_document_parses: usize,
     pub parsed_nodes: usize,
     pub max_depth: usize,
     pub locator_components_materialized: usize,
@@ -3754,6 +3756,8 @@ impl ImportInstrumentation {
             .saturating_add(self.catalog_path_inserts)
             .saturating_add(self.catalog_path_lookups)
             .saturating_add(self.inventory_path_lookups)
+            .saturating_add(self.present_document_parses)
+            .saturating_add(self.authenticated_base_document_parses)
             .saturating_add(self.parsed_nodes)
             .saturating_add(self.locator_components_materialized)
             .saturating_add(self.structural_class_nodes)
@@ -3772,6 +3776,7 @@ impl ImportInstrumentation {
 pub enum PageMatchBasis {
     SamePathCompletion,
     ReceiptBackedExactRename,
+    ReceiptBackedStructuralRename,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4238,7 +4243,7 @@ pub fn plan_affected_import(
     // Equal bounded collections detect stale diagnostic input only under the
     // explicit quiescent-writer boundary. They are neither a portable atomic
     // filesystem snapshot nor authority for later publication.
-    plan_import(inventory, scope, engine, instrumentation)
+    plan_import(graph, inventory, scope, engine, instrumentation)
 }
 
 #[cfg(test)]
@@ -4822,8 +4827,9 @@ fn authority_block(
 }
 
 fn plan_import(
+    graph: &Graph,
     inventory: RawInventory,
-    scope: ImportScopeSnapshot,
+    mut scope: ImportScopeSnapshot,
     engine: &ShardedHotEngine,
     mut instrumentation: ImportInstrumentation,
 ) -> ImportPlan {
@@ -4916,9 +4922,30 @@ fn plan_import(
         pages: page_matches,
         ..ImportMatches::default()
     };
-    if let Err(block) = match_blocks(&inventory, &completed, &mut matches, &mut instrumentation) {
+    let parsed_documents = match match_blocks(
+        graph,
+        &inventory,
+        &completed,
+        &mut matches,
+        &mut instrumentation,
+    ) {
+        Ok(parsed) => parsed,
+        Err(block) => {
+            return blocked_authority_error(Some(inventory), block, instrumentation);
+        }
+    };
+    if let Err(block) =
+        match_structural_page_moves(&inventory, &completed, &parsed_documents, &mut matches)
+    {
         return blocked_authority_error(Some(inventory), block, instrumentation);
     }
+    let resolved_path_identities =
+        match resolve_import_path_identities(&inventory, &matches, &scope, &parsed_documents) {
+            Ok(identities) => identities,
+            Err(block) => {
+                return blocked_authority_error(Some(inventory), block, instrumentation);
+            }
+        };
 
     let mut completion_ids = completed
         .iter()
@@ -4930,7 +4957,7 @@ fn plan_import(
     }));
     completion_ids.sort_unstable();
     completion_ids.dedup();
-    let derivation_entries = match inventory.derivation_entries(&scope.path_identities) {
+    let derivation_entries = match inventory.derivation_entries(&resolved_path_identities) {
         Ok(entries) => entries,
         Err(error) => {
             return blocked_authority_error(
@@ -4968,13 +4995,18 @@ fn plan_import(
         }
     };
 
-    let page_transition =
-        match build_desired_page_transition(&inventory, &matches, &scope, import_id) {
-            Ok(transition) => transition,
-            Err(block) => {
-                return blocked_authority_error(Some(inventory), block, instrumentation);
-            }
-        };
+    let page_transition = match build_desired_page_transition(
+        &inventory,
+        &matches,
+        &scope,
+        &resolved_path_identities,
+        import_id,
+    ) {
+        Ok(transition) => transition,
+        Err(block) => {
+            return blocked_authority_error(Some(inventory), block, instrumentation);
+        }
+    };
     if let Err(block) = preflight_desired_page_names(&inventory, &page_transition, engine) {
         return blocked_authority_error(Some(inventory), block, instrumentation);
     }
@@ -4993,6 +5025,8 @@ fn plan_import(
     }) || inventory.entries().iter().any(|(path, observation)| {
         matches!(observation, RawObservation::Present(_)) && !completed_paths.contains(path)
     });
+    drop(completed);
+    scope.path_identities = resolved_path_identities;
     let (status, scope, execution, formatting) = if changed {
         match build_execution_material(
             import_id,
@@ -5000,6 +5034,7 @@ fn plan_import(
             &matches,
             &scope,
             &page_transition,
+            &parsed_documents,
             &mut instrumentation,
         ) {
             Ok(BuiltImportMaterial::Semantic(execution)) => (
@@ -5131,10 +5166,93 @@ struct DesiredPageTransition {
     released_name_owners: BTreeSet<PageId>,
 }
 
+fn imported_identity(
+    entry: &PageEntry,
+    path: &ManagedPath,
+) -> Result<ImportedPathIdentity, ImportBlock> {
+    let name = LogicalPageName::parse(entry.name.clone()).map_err(|error| {
+        authority_block(
+            ImportBlockReason::UnsafeInput,
+            Some(path),
+            format!("parsed external document has an invalid logical page name: {error}"),
+        )
+    })?;
+    let kind = match entry.kind {
+        PageKind::Page => ManagedTextKind::Page,
+        PageKind::Journal => ManagedTextKind::Journal,
+    };
+    Ok(ImportedPathIdentity { name, kind })
+}
+
+/// Resolve current document semantics without collapsing filename fallback,
+/// accepted identity, and parser-declared title authority.
+fn resolve_import_path_identities(
+    inventory: &RawInventory,
+    matches: &ImportMatches,
+    scope: &ImportScopeSnapshot,
+    parsed: &ParsedImportDocuments,
+) -> Result<BTreeMap<ManagedPath, ImportedPathIdentity>, ImportBlock> {
+    let mut identities = scope.path_identities.clone();
+    let page_matches = matches
+        .pages()
+        .iter()
+        .map(|matched| (matched.path(), matched))
+        .collect::<BTreeMap<_, _>>();
+    for (path, observation) in inventory.entries() {
+        if !matches!(observation, RawObservation::Present(_)) {
+            continue;
+        }
+        let current = parsed.current.get(path).ok_or_else(|| {
+            authority_block(
+                ImportBlockReason::CorruptBase,
+                Some(path),
+                "present external document has no parser-owned semantic result",
+            )
+        })?;
+        let identity = match page_matches.get(path) {
+            None => imported_identity(current.selected_identity(), path)?,
+            Some(matched) if matched.basis() != PageMatchBasis::SamePathCompletion => {
+                imported_identity(current.selected_identity(), path)?
+            }
+            Some(matched) => {
+                let Some(ScopedPathEvidence::Existing(existing)) =
+                    scope.paths.get(matched.previous_path())
+                else {
+                    return Err(authority_block(
+                        ImportBlockReason::CorruptBase,
+                        Some(path),
+                        "same-path match has no authenticated accepted predecessor",
+                    ));
+                };
+                let base = parsed.base.get(matched.previous_path()).ok_or_else(|| {
+                    receipt_block(
+                        ImportBlockReason::CorruptBase,
+                        matched.previous_path(),
+                        Some(existing.logical_completion_id()),
+                        inventory,
+                        "authenticated completed-base document has no parser-owned semantic result",
+                    )
+                })?;
+                if current.explicit_title == base.explicit_title {
+                    ImportedPathIdentity {
+                        name: existing.materialized_page().name.clone(),
+                        kind: existing.materialized_page().kind,
+                    }
+                } else {
+                    imported_identity(current.selected_identity(), path)?
+                }
+            }
+        };
+        identities.insert(path.clone(), identity);
+    }
+    Ok(identities)
+}
+
 fn build_desired_page_transition(
     inventory: &RawInventory,
     matches: &ImportMatches,
     scope: &ImportScopeSnapshot,
+    path_identities: &BTreeMap<ManagedPath, ImportedPathIdentity>,
     import_id: ImportId,
 ) -> Result<DesiredPageTransition, ImportBlock> {
     let mut page_matches = BTreeMap::<ManagedPath, &PageImportMatch>::new();
@@ -5157,7 +5275,7 @@ fn build_desired_page_transition(
         if !matches!(observation, RawObservation::Present(_)) {
             continue;
         }
-        let path_identity = scope.path_identities.get(path).ok_or_else(|| {
+        let path_identity = path_identities.get(path).ok_or_else(|| {
             authority_block(
                 ImportBlockReason::StaleScope,
                 Some(path),
@@ -5272,6 +5390,7 @@ fn build_execution_material(
     matches: &ImportMatches,
     scope: &ImportScopeSnapshot,
     page_transition: &DesiredPageTransition,
+    parsed_documents: &ParsedImportDocuments,
     instrumentation: &mut ImportInstrumentation,
 ) -> Result<BuiltImportMaterial, ImportExecutionError> {
     let mut current_pages = BTreeMap::<PageId, &ReceiptBackedPage>::new();
@@ -5312,22 +5431,7 @@ fn build_execution_material(
 
     let desired_pages = &page_transition.pages;
 
-    let mut trees = BTreeMap::<ManagedPath, ParsedTree>::new();
-    for (path, observation) in inventory.entries() {
-        let RawObservation::Present(bytes) = observation else {
-            continue;
-        };
-        if std::str::from_utf8(bytes.bytes()).is_err() {
-            return Err(ImportExecutionError::InvalidMaterial(format!(
-                "sealed inventory path {path} is not valid UTF-8"
-            )));
-        }
-        trees.insert(
-            path.clone(),
-            parse_nodes(path, bytes.bytes(), instrumentation)
-                .map_err(|block| ImportExecutionError::InvalidMaterial(block.detail))?,
-        );
-    }
+    let trees = &parsed_documents.current;
 
     let mut block_matches = BTreeMap::<(ManagedPath, StructuralLocator), BlockId>::new();
     for block_match in matches.blocks() {
@@ -5483,14 +5587,7 @@ fn build_execution_material(
             )
         })?;
         let current = current.materialized_page();
-        let current_kind = scope
-            .path_identities
-            .get(&current.path)
-            .ok_or(ImportExecutionError::IncompletePlan(
-                "sealed existing page has no Graph-decoded current managed kind",
-            ))?
-            .kind;
-        if current.name != page.name || current.path != page.path || current_kind != page.kind {
+        if current.name != page.name || current.path != page.path || current.kind != page.kind {
             push_operation(
                 &mut operations,
                 SemanticOperation::ReconcileExternalPageState {
@@ -6013,6 +6110,201 @@ struct ParsedTree {
     nodes: Vec<ParsedNode>,
 }
 
+struct ParsedExternalTree {
+    tree: ParsedTree,
+    explicit_title: Option<String>,
+    filename_fallback: PageEntry,
+    effective: PageEntry,
+}
+
+impl std::ops::Deref for ParsedExternalTree {
+    type Target = ParsedTree;
+
+    fn deref(&self) -> &Self::Target {
+        &self.tree
+    }
+}
+
+impl ParsedExternalTree {
+    fn selected_identity(&self) -> &PageEntry {
+        if self.explicit_title.is_some() {
+            &self.effective
+        } else {
+            &self.filename_fallback
+        }
+    }
+}
+
+struct ParsedImportDocuments {
+    current: BTreeMap<ManagedPath, ParsedExternalTree>,
+    base: BTreeMap<ManagedPath, ParsedExternalTree>,
+}
+
+fn same_external_tree(left: &ParsedTree, right: &ParsedTree) -> bool {
+    left.roots == right.roots
+        && left.nodes.len() == right.nodes.len()
+        && left.nodes.iter().zip(&right.nodes).all(|(left, right)| {
+            left.parent == right.parent
+                && left.sibling_position == right.sibling_position
+                && left.children == right.children
+                && left.raw == right.raw
+        })
+}
+
+/// A title/preamble edit may accompany one otherwise exact external move.
+/// Preserve the receipt-backed PageId only when the parsed block tree gives a
+/// one-to-one source/destination relation; repeated equal trees remain
+/// conservative and block as ambiguous destructive movement.
+fn match_structural_page_moves(
+    inventory: &RawInventory,
+    completed: &[&ReceiptBackedPage],
+    parsed: &ParsedImportDocuments,
+    matches: &mut ImportMatches,
+) -> Result<(), ImportBlock> {
+    let matched_sources = matches
+        .pages
+        .iter()
+        .map(|matched| matched.previous_path.clone())
+        .collect::<BTreeSet<_>>();
+    let matched_destinations = matches
+        .pages
+        .iter()
+        .map(|matched| matched.path.clone())
+        .collect::<BTreeSet<_>>();
+    let candidate_destinations = inventory
+        .entries()
+        .iter()
+        .filter_map(|(path, observation)| {
+            (matches!(observation, RawObservation::Present(_))
+                && !matched_destinations.contains(path))
+            .then_some(path)
+        })
+        .collect::<Vec<_>>();
+
+    let mut source_candidates = BTreeMap::<ManagedPath, Vec<ManagedPath>>::new();
+    let mut destination_sources = BTreeMap::<ManagedPath, Vec<&ReceiptBackedPage>>::new();
+    for page in completed {
+        if matched_sources.contains(page.path())
+            || !matches!(
+                inventory.entries().get(page.path()),
+                Some(RawObservation::Absent)
+            )
+        {
+            continue;
+        }
+        let Some(base) = parsed.base.get(page.path()) else {
+            continue;
+        };
+        let candidates = candidate_destinations
+            .iter()
+            .filter(|path| {
+                parsed
+                    .current
+                    .get(*path)
+                    .is_some_and(|current| same_external_tree(base, current))
+            })
+            .map(|path| (*path).clone())
+            .collect::<Vec<_>>();
+        if candidates.len() > 1 {
+            return Err(ImportBlock {
+                reason: ImportBlockReason::AmbiguousDestructiveMatch,
+                paths: std::iter::once(page.path().as_str().to_owned())
+                    .chain(candidates.iter().map(|path| path.as_str().to_owned()))
+                    .collect(),
+                logical_completion_ids: vec![page.logical_completion_id()],
+                observation: inventory_observation(inventory, page.path().as_str()),
+                detail:
+                    "one absent receipt path has multiple structurally identical new-path candidates"
+                        .into(),
+            });
+        }
+        if let Some(destination) = candidates.first() {
+            source_candidates.insert(page.path().clone(), candidates.clone());
+            destination_sources
+                .entry(destination.clone())
+                .or_default()
+                .push(page);
+        }
+    }
+    if let Some((destination, sources)) = destination_sources
+        .iter()
+        .find(|(_, sources)| sources.len() > 1)
+    {
+        return Err(ImportBlock {
+            reason: ImportBlockReason::AmbiguousDestructiveMatch,
+            paths: sources
+                .iter()
+                .map(|page| page.path().as_str().to_owned())
+                .chain(std::iter::once(destination.as_str().to_owned()))
+                .collect(),
+            logical_completion_ids: sources
+                .iter()
+                .map(|page| page.logical_completion_id())
+                .collect(),
+            observation: inventory_observation(inventory, destination.as_str()),
+            detail:
+                "multiple absent receipt paths claim one structurally identical new destination"
+                    .into(),
+        });
+    }
+    for page in completed {
+        let Some(destination) = source_candidates
+            .get(page.path())
+            .and_then(|candidates| candidates.first())
+        else {
+            continue;
+        };
+        matches.pages.push(PageImportMatch {
+            path: destination.clone(),
+            previous_path: page.path().clone(),
+            page_id: page.page_id(),
+            basis: PageMatchBasis::ReceiptBackedStructuralRename,
+        });
+    }
+    matches
+        .pages
+        .sort_unstable_by(|left, right| left.path.cmp(&right.path));
+    Ok(())
+}
+
+fn parse_external_nodes(
+    graph: &Graph,
+    path: &ManagedPath,
+    bytes: &[u8],
+    instrumentation: &mut ImportInstrumentation,
+) -> Result<ParsedExternalTree, ImportBlock> {
+    let text = std::str::from_utf8(bytes).expect("UTF-8 checked before semantic parsing");
+    let is_org = path.is_org();
+    preflight_depth(path, text, is_org, instrumentation.parsed_nodes)?;
+    let parsed = graph
+        .parse_external_document(path, bytes, true)
+        .map_err(|error| {
+            authority_block(
+                ImportBlockReason::UnsafeInput,
+                Some(path),
+                format!("external document parser rejected source: {error}"),
+            )
+        })?;
+    if parsed.source_round_trips != Some(true) {
+        return Err(authority_block(
+            ImportBlockReason::UnsafeInput,
+            Some(path),
+            if is_org {
+                "external Org source is byte-preserved and read-only because its heading structure is not editable and does not round-trip exactly"
+            } else {
+                "external Markdown source is byte-preserved and read-only because detected formatting does not round-trip exactly"
+            },
+        ));
+    }
+    let tree = flatten_document(path, parsed.parsed, instrumentation)?;
+    Ok(ParsedExternalTree {
+        tree,
+        explicit_title: parsed.explicit_title,
+        filename_fallback: parsed.filename_fallback,
+        effective: parsed.effective,
+    })
+}
+
 fn parse_nodes(
     path: &ManagedPath,
     bytes: &[u8],
@@ -6374,25 +6666,41 @@ fn structural_classes(
 }
 
 fn match_blocks(
+    graph: &Graph,
     inventory: &RawInventory,
     completed: &[&ReceiptBackedPage],
     matches: &mut ImportMatches,
     instrumentation: &mut ImportInstrumentation,
-) -> Result<(), ImportBlock> {
-    let mut external_by_path = BTreeMap::<ManagedPath, ParsedTree>::new();
+) -> Result<ParsedImportDocuments, ImportBlock> {
+    let mut external_by_path = BTreeMap::<ManagedPath, ParsedExternalTree>::new();
     for (path, observation) in inventory.entries() {
         if let RawObservation::Present(bytes) = observation {
+            instrumentation.present_document_parses =
+                instrumentation.present_document_parses.saturating_add(1);
             external_by_path.insert(
                 path.clone(),
-                parse_nodes(path, bytes.bytes(), instrumentation)?,
+                parse_external_nodes(graph, path, bytes.bytes(), instrumentation)?,
             );
         }
     }
-    let mut base_by_path = BTreeMap::<ManagedPath, ParsedTree>::new();
+    let mut base_by_path = BTreeMap::<ManagedPath, ParsedExternalTree>::new();
     for page in completed {
+        instrumentation.authenticated_base_document_parses = instrumentation
+            .authenticated_base_document_parses
+            .saturating_add(1);
         base_by_path.insert(
             page.path().clone(),
-            parse_nodes(page.path(), page.bytes(), instrumentation)?,
+            parse_external_nodes(graph, page.path(), page.bytes(), instrumentation).map_err(
+                |mut block| {
+                    block.reason = ImportBlockReason::CorruptBase;
+                    block.logical_completion_ids = vec![page.logical_completion_id()];
+                    block.detail = format!(
+                        "authenticated completed-base document is not parseable within import limits: {}",
+                        block.detail
+                    );
+                    block
+                },
+            )?,
         );
     }
 
@@ -6633,7 +6941,10 @@ fn match_blocks(
     matches.blocks.sort_unstable_by(|left, right| {
         (&left.path, &left.locator).cmp(&(&right.path, &right.locator))
     });
-    Ok(())
+    Ok(ParsedImportDocuments {
+        current: external_by_path,
+        base: base_by_path,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6855,11 +7166,12 @@ mod tests {
 
     use super::*;
     use crate::oplog::{
-        write_projection_exact, ApplicationRuntimeRoot, AuthorBatch, BatchDisposition, BatchId,
-        BlockLocation, CrdtPeerId, DeviceId, DocumentId, LineageDigest, ManagedTextKind,
-        ObjectStore, OperationTransaction, PortablePathIndexRoot, ProjectionEndpointBinding,
-        ProjectionEndpointId, ProjectionRecovery, RebuildSource, SemanticEffect, SemanticOperation,
-        SessionId, SqliteFrontier, MAX_MATERIALIZATION_QUERY_ROWS,
+        execute_manifested_projection_work, write_projection_exact, ApplicationRuntimeRoot,
+        AuthorBatch, BatchDisposition, BatchId, BlockLocation, CrdtPeerId, DeviceId, DocumentId,
+        LineageDigest, ManagedTextKind, ObjectStore, OperationTransaction, PortablePathIndexRoot,
+        ProjectionEndpointBinding, ProjectionEndpointId, ProjectionRecovery, RebuildSource,
+        SemanticEffect, SemanticOperation, SessionId, SqliteFrontier,
+        MAX_MATERIALIZATION_QUERY_ROWS,
     };
 
     struct TestRoot(PathBuf);
@@ -6896,7 +7208,7 @@ mod tests {
 
     impl SnapshotFixture {
         fn new(label: &str, paths: &[&str]) -> Self {
-            Self::new_with_initial_uuid_and_config(label, paths, None, None, None, None)
+            Self::new_with_initial_uuid_and_config(label, paths, None, None, None, None, None)
         }
 
         fn new_with_initial_uuid(
@@ -6904,11 +7216,27 @@ mod tests {
             paths: &[&str],
             initial_uuid: Option<LogseqUuid>,
         ) -> Self {
-            Self::new_with_initial_uuid_and_config(label, paths, initial_uuid, None, None, None)
+            Self::new_with_initial_uuid_and_config(
+                label,
+                paths,
+                initial_uuid,
+                None,
+                None,
+                None,
+                None,
+            )
         }
 
         fn new_with_graph_config(label: &str, paths: &[&str], config: &str) -> Self {
-            Self::new_with_initial_uuid_and_config(label, paths, None, Some(config), None, None)
+            Self::new_with_initial_uuid_and_config(
+                label,
+                paths,
+                None,
+                Some(config),
+                None,
+                None,
+                None,
+            )
         }
 
         fn new_with_graph_config_names_and_contents(
@@ -6925,6 +7253,26 @@ mod tests {
                 Some(config),
                 Some(names),
                 Some(contents),
+                None,
+            )
+        }
+
+        fn new_with_graph_config_names_contents_and_preambles(
+            label: &str,
+            paths: &[&str],
+            config: &str,
+            names: &[&str],
+            contents: &[&str],
+            preambles: &[&str],
+        ) -> Self {
+            Self::new_with_initial_uuid_and_config(
+                label,
+                paths,
+                None,
+                Some(config),
+                Some(names),
+                Some(contents),
+                Some(preambles),
             )
         }
 
@@ -6935,9 +7283,11 @@ mod tests {
             config: Option<&str>,
             names: Option<&[&str]>,
             contents: Option<&[&str]>,
+            preambles: Option<&[&str]>,
         ) -> Self {
             assert!(names.is_none_or(|names| names.len() == paths.len()));
             assert!(contents.is_none_or(|contents| contents.len() == paths.len()));
+            assert!(preambles.is_none_or(|preambles| preambles.len() == paths.len()));
             let root = TestRoot::new(label);
             let graph_root = root.path().join("graph");
             if let Some(config) = config {
@@ -7010,6 +7360,12 @@ mod tests {
                             _ => format!("page {index}"),
                         }),
                 });
+                if let Some(preambles) = preambles {
+                    operations.push(SemanticOperation::SetPagePreamble {
+                        page_id,
+                        preamble: Some(preambles[index].to_owned()),
+                    });
+                }
                 if index == 0 {
                     if let Some(logseq_uuid) = initial_uuid {
                         operations.push(SemanticOperation::MutateBlockLogseqIdentity {
@@ -7807,6 +8163,51 @@ mod tests {
     }
 
     #[test]
+    fn unchanged_explicit_date_title_preserves_accepted_identity_across_journal_format_change() {
+        let fixture = SnapshotFixture::new_with_graph_config_names_contents_and_preambles(
+            "accepted-explicit-journal-title-policy-reopen",
+            &["journals/physical.md"],
+            "{:journal/file-name-format \"dd-MM-yyyy\"\n\
+              :journal/page-title-format \"yyyy-MM-dd\"}\n",
+            &["2026-07-25"],
+            &["old journal"],
+            &["title:: 25-07-2026"],
+        );
+        let page_id = fixture.intents[0].page_id();
+        fs::write(
+            fixture.graph_root.join("logseq/config.edn"),
+            "{:journal/file-name-format \"dd-MM-yyyy\"\n\
+              :journal/page-title-format \"EEEE, dd-MM-yyyy\"}\n",
+        )
+        .unwrap();
+        let fixture = fixture.reopen_after_config_change();
+        fs::write(
+            fixture.graph_root.join("journals/physical.md"),
+            b"title:: 25-07-2026\n\n- changed journal\n",
+        )
+        .unwrap();
+
+        let plan = fixture.plan(&["journals/physical.md"]);
+        assert_eq!(plan.status(), ImportPlanStatus::Reconcile, "{plan:?}");
+        let operations = &plan.execution_material().unwrap().transaction().operations;
+        assert!(
+            !operations.iter().any(|operation| matches!(
+                operation,
+                SemanticOperation::ReconcileExternalPageState {
+                    page_id: candidate,
+                    ..
+                } if *candidate == page_id
+            )),
+            "unchanged explicit title evidence must preserve the accepted name/kind despite a new journal renderer: {operations:#?}"
+        );
+        assert!(operations.iter().any(|operation| matches!(
+            operation,
+            SemanticOperation::EditBlockContent { content, .. }
+                if content == "changed journal"
+        )));
+    }
+
+    #[test]
     fn semantically_wrong_authenticated_current_path_identity_blocks_before_external_draft() {
         let mut fixture = SnapshotFixture::new_with_graph_config_names_and_contents(
             "semantically-wrong-current-path-identity",
@@ -7849,6 +8250,104 @@ mod tests {
                 ImportPlanStatus::Blocked
             ))
         ));
+    }
+
+    #[test]
+    fn external_title_rename_updates_accepted_owner_after_restart_without_rewriting_referrers() {
+        let mut fixture = SnapshotFixture::new_with_graph_config_names_and_contents(
+            "external-title-rename-referrers",
+            &["pages/physical.md", "pages/referrer.md"],
+            "{:file/name-format :legacy}\n",
+            &["Old Logical", "Referrer"],
+            &["target body", "see [[Old Logical]] and [[New Logical]]"],
+        );
+        let target_page_id = fixture.intents[0].page_id();
+        let referrer_page_id = fixture.intents[1].page_id();
+        let referrer_path = fixture.graph_root.join("pages/referrer.md");
+        let referrer_bytes = fs::read(&referrer_path).unwrap();
+        fs::write(
+            fixture.graph_root.join("pages/physical.md"),
+            b"title:: New Logical\n\n- target body\n",
+        )
+        .unwrap();
+
+        let plan = fixture.plan(&["pages/physical.md"]);
+        assert_eq!(plan.status(), ImportPlanStatus::Reconcile, "{plan:?}");
+        let operations = &plan.execution_material().unwrap().transaction().operations;
+        assert!(operations.iter().any(|operation| matches!(
+            operation,
+            SemanticOperation::ReconcileExternalPageState {
+                page_id,
+                name,
+                ..
+            } if *page_id == target_page_id && name.as_str() == "New Logical"
+        )));
+        assert!(!operations.iter().any(|operation| matches!(
+            operation,
+            SemanticOperation::EditBlockContent { block, .. }
+                if fixture
+                    .engine
+                    .materialize_page(referrer_page_id)
+                    .unwrap()
+                    .blocks
+                    .iter()
+                    .any(|candidate| candidate.block_id == block.block_id)
+        )));
+
+        fixture.apply_external_plan(plan, 7_700);
+        assert_eq!(fs::read(&referrer_path).unwrap(), referrer_bytes);
+        let work = fixture
+            .engine
+            .projection_work_index()
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        execute_manifested_projection_work(
+            &fixture.graph,
+            &fixture.receipts,
+            &mut fixture.engine,
+            &work,
+        )
+        .unwrap();
+        let fixture = fixture.reopen_after_config_change();
+        assert_eq!(
+            fixture
+                .engine
+                .current_page_for_logical_name(&LogicalPageName::parse("New Logical").unwrap())
+                .unwrap(),
+            Some(target_page_id)
+        );
+        assert_eq!(
+            fixture
+                .engine
+                .current_page_for_logical_name(&LogicalPageName::parse("Old Logical").unwrap())
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            fixture
+                .engine
+                .materialize_page(referrer_page_id)
+                .unwrap()
+                .blocks[0]
+                .content,
+            "see [[Old Logical]] and [[New Logical]]"
+        );
+        assert_eq!(
+            Graph::open(&fixture.graph_root)
+                .list_pages()
+                .into_iter()
+                .find(|entry| entry.rel_path == "pages/physical.md")
+                .unwrap()
+                .name,
+            "New Logical"
+        );
+        assert_eq!(
+            fixture.plan(&["pages/physical.md"]).status(),
+            ImportPlanStatus::Noop,
+            "projection receipt and restart must not oscillate the accepted title"
+        );
     }
 
     #[test]
@@ -9223,15 +9722,30 @@ mod tests {
             paths: scope_paths,
             path_identities,
         };
-        let matches = ImportMatches::default();
-        let transition =
-            build_desired_page_transition(&inventory, &matches, &scope, materialized_id).unwrap();
+        let mut matches = ImportMatches::default();
+        let parsed_documents = match_blocks(
+            &graph,
+            &inventory,
+            &[],
+            &mut matches,
+            &mut ImportInstrumentation::default(),
+        )
+        .unwrap();
+        let transition = build_desired_page_transition(
+            &inventory,
+            &matches,
+            &scope,
+            &scope.path_identities,
+            materialized_id,
+        )
+        .unwrap();
         let old = build_execution_material(
             materialized_id,
             &inventory,
             &matches,
             &scope,
             &transition,
+            &parsed_documents,
             &mut ImportInstrumentation::default(),
         )
         .unwrap();
