@@ -98,7 +98,7 @@ const MAX_EPHEMERAL_PORTABLE_PATHS: usize = 4_096;
 // This is a run-local, authenticated view over the accepted catalog. It is
 // deliberately not an object-store, receipt, or projection format.
 #[allow(dead_code)]
-const CURRENT_PATH_CURSOR_SCHEMA_VERSION: u32 = 1;
+const CURRENT_PATH_CURSOR_SCHEMA_VERSION: u32 = 2;
 #[allow(dead_code)]
 pub(crate) const MAX_CURRENT_PATH_CURSOR_PAGE_ROWS: usize = 1_024;
 #[allow(dead_code)]
@@ -122,6 +122,7 @@ pub(crate) struct CurrentPathCatalogRow {
     page_id: PageId,
     path: ManagedPath,
     kind: ManagedTextKind,
+    accepted_name_digest: ContentDigest,
 }
 
 #[allow(dead_code)]
@@ -136,6 +137,10 @@ impl CurrentPathCatalogRow {
 
     pub(crate) const fn kind(&self) -> ManagedTextKind {
         self.kind
+    }
+
+    pub(crate) const fn accepted_name_digest(&self) -> ContentDigest {
+        self.accepted_name_digest
     }
 }
 
@@ -284,6 +289,7 @@ struct CurrentPathCatalogTransition {
 struct CurrentPathCatalogStoredRow {
     path: ManagedPath,
     kind: ManagedTextKind,
+    accepted_name_digest: ContentDigest,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -6264,6 +6270,32 @@ impl ShardedHotEngine {
         self.current_path_cursor_book.borrow().active.len()
     }
 
+    #[cfg(test)]
+    pub(crate) fn replace_current_path_catalog_row_for_test(
+        &mut self,
+        page_id: PageId,
+        path: ManagedPath,
+        kind: ManagedTextKind,
+        accepted_name_digest: ContentDigest,
+    ) {
+        let encoded = encode_current_path_catalog_row(&CurrentPathCatalogStoredRow {
+            path,
+            kind,
+            accepted_name_digest,
+        })
+        .unwrap();
+        self.current_path_catalog.root = self
+            .scratch
+            .as_ref()
+            .unwrap()
+            .authenticated_catalog_upsert(
+                &self.current_path_catalog.root,
+                page_id.as_uuid().into_bytes(),
+                &encoded,
+            )
+            .unwrap();
+    }
+
     /// Authenticated exact-path point lookup against the same current catalog
     /// used by the paged cursor.
     pub(crate) fn current_path_catalog_row_at_path(
@@ -6303,6 +6335,7 @@ impl ShardedHotEngine {
             page_id,
             path: stored.path,
             kind: stored.kind,
+            accepted_name_digest: stored.accepted_name_digest,
         };
         self.validate_current_path_catalog_row(&row)?;
         if row.path != *path {
@@ -6362,6 +6395,7 @@ impl ShardedHotEngine {
                 page_id,
                 path: stored.path,
                 kind: stored.kind,
+                accepted_name_digest: stored.accepted_name_digest,
             };
             let path_bytes = row.path.as_str().len();
             if path_bytes > MAX_CURRENT_PATH_CURSOR_PATH_BYTES {
@@ -6391,6 +6425,7 @@ impl ShardedHotEngine {
                     page_id: PageId::from_uuid(Uuid::from_bytes(key)),
                     path: stored.path,
                     kind: stored.kind,
+                    accepted_name_digest: stored.accepted_name_digest,
                 })?;
                 true
             }
@@ -6576,6 +6611,31 @@ impl ShardedHotEngine {
         }) {
             return Err(EngineError::Archive(
                 "current-path catalog row has missing, duplicate, or corrupt path authority".into(),
+            ));
+        }
+        let catalog = self
+            .visible_documents
+            .get(&self.catalog_document_id)
+            .ok_or_else(|| {
+                EngineError::Archive(
+                    "current-path catalog row has no accepted catalog page state".into(),
+                )
+            })?;
+        let state = validate_catalog_page(self.catalog_document_id, catalog, row.page_id)?;
+        let Some(PageState::Live {
+            name, path, kind, ..
+        }) = state
+        else {
+            return Err(EngineError::Archive(
+                "current-path catalog row is missing its accepted catalog page state".into(),
+            ));
+        };
+        if path != row.path
+            || kind != row.kind
+            || ContentDigest::of(name.as_str().as_bytes()) != row.accepted_name_digest
+        {
+            return Err(EngineError::Archive(
+                "current-path catalog row disagrees with its accepted catalog page state".into(),
             ));
         }
         Ok(())
@@ -20833,9 +20893,12 @@ fn current_path_catalog_row_from_page_state(
     state: &PageState,
 ) -> Option<CurrentPathCatalogStoredRow> {
     match state {
-        PageState::Live { path, kind, .. } => Some(CurrentPathCatalogStoredRow {
+        PageState::Live {
+            name, path, kind, ..
+        } => Some(CurrentPathCatalogStoredRow {
             path: path.clone(),
             kind: *kind,
+            accepted_name_digest: ContentDigest::of(name.as_str().as_bytes()),
         }),
         PageState::Tombstone { .. } => None,
     }
@@ -23700,6 +23763,113 @@ mod validation_tests {
         finish_preauthor_gate_fixture(fixture);
     }
 
+    #[test]
+    fn semantically_wrong_current_path_rows_survive_a_restart_but_fail_before_join() {
+        let mut fixture = preauthor_gate_fixture_with_retention(710_500, true);
+        fixture.author_accepted_round(710_600, "semantic current-path binding");
+        let (digest_page, _, _, digest_path) = fixture.pages[0].clone();
+        let (kind_page, _, _, kind_path) = fixture.pages[1].clone();
+        fixture.engine.replace_current_path_catalog_row_for_test(
+            digest_page,
+            digest_path.clone(),
+            ManagedTextKind::Page,
+            ContentDigest::of(b"authenticated but wrong accepted name"),
+        );
+        fixture.engine.replace_current_path_catalog_row_for_test(
+            kind_page,
+            kind_path.clone(),
+            ManagedTextKind::Journal,
+            ContentDigest::of(b"Gate 1"),
+        );
+        let snapshot = fixture
+            .engine
+            .runtime_resume_snapshot()
+            .unwrap()
+            .expect("the causal fixture must persist its authenticated wrong rows");
+
+        let resumed = fixture.reopen_resuming(Some(&snapshot));
+        assert!(resumed.observation.adopted, "{:?}", resumed.refusal);
+        assert_eq!(resumed.observation.replayed_generations, 0);
+
+        let projection = fixture
+            .engine
+            .projection_work_index
+            .as_ref()
+            .unwrap()
+            .clone();
+        let source =
+            JoinedAuthenticatedExpectedPathSource::new(&fixture.engine, projection.as_ref());
+        assert_eq!(
+            source.expected_path_at(&digest_path, joined_point_request()),
+            Err(ExpectedPathSourceFailure::Corrupt),
+            "an authenticated digest that disagrees with accepted PageId state must fail closed"
+        );
+        assert_eq!(
+            source.expected_path_at(&kind_path, joined_point_request()),
+            Err(ExpectedPathSourceFailure::Corrupt),
+            "an authenticated kind that disagrees with accepted PageId state must fail closed"
+        );
+
+        drop(source);
+        drop(projection);
+        finish_preauthor_gate_fixture(fixture);
+    }
+
+    #[test]
+    fn schema_twelve_retained_marker_named_by_a_resume_point_refuses_and_fully_replays() {
+        let mut fixture = preauthor_gate_fixture_with_retention(710_700, true);
+        fixture.author_accepted_round(710_800, "old scratch format");
+        let snapshot = fixture
+            .engine
+            .runtime_resume_snapshot()
+            .unwrap()
+            .expect("a valid current-format resume point must name the retained run");
+        let old_run = snapshot.scratch_run_id();
+
+        let workspace = fixture.engine.workspace_id();
+        let lineage = fixture.engine.lineage_digest;
+        let catalog = fixture.engine.catalog_document_id;
+        fixture.engine = ShardedHotEngine::new(workspace, lineage, catalog);
+        let old_marker = super::super::scratch_store::rewrite_retained_run_marker_schema_for_test(
+            &fixture.archive_path(),
+            old_run,
+            12,
+        );
+
+        let receipt = fixture.reopen_resuming(Some(&snapshot));
+        assert!(!receipt.observation.adopted);
+        assert!(receipt.observation.refused);
+        assert_eq!(receipt.refused_run_id, Some(old_run));
+        assert_ne!(receipt.engine_run_id, old_run);
+        assert_eq!(receipt.observation.replay_base_generation, 0);
+        assert_eq!(
+            receipt.observation.replayed_generations, receipt.observation.live_history_generation,
+            "an incompatible retained run must be rebuilt only by full immutable-history replay"
+        );
+        assert_eq!(
+            run_directory_bytes(&fixture.root, old_run)["marker"],
+            old_marker,
+            "the incompatible marker must be preserved, never reinterpreted or migrated in place"
+        );
+        assert_eq!(
+            projection_page_states(&fixture.engine, &fixture_page_ids(&fixture)).len(),
+            3,
+            "the authorized fresh-run replay must restore all accepted pages"
+        );
+        assert_eq!(
+            super::super::scratch_store::SCRATCH_SCHEMA_VERSION,
+            13,
+            "this regression is the explicit scratch schema 12 -> 13 transition"
+        );
+        assert_eq!(
+            super::super::scratch_store::AUTHENTICATED_CATALOG_SCHEMA_VERSION,
+            2,
+            "current-path catalog roots and nodes transition from schema 1 -> 2"
+        );
+
+        finish_preauthor_gate_fixture(fixture);
+    }
+
     /// The restore re-checks the snapshot's own run-local quiescence instead of
     /// installing phantom pending counters.
     ///
@@ -25447,6 +25617,7 @@ mod validation_tests {
                 page_id: first,
                 path: ManagedPath::parse("journals/2026_07_26.org").unwrap(),
                 kind: ManagedTextKind::Journal,
+                accepted_name_digest: ContentDigest::of(b"Renamed Journal"),
             }]
         );
         drop(engine);
@@ -25677,26 +25848,6 @@ mod validation_tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    fn replace_authenticated_cursor_row_for_test(
-        engine: &mut ShardedHotEngine,
-        page_id: PageId,
-        path: ManagedPath,
-        kind: ManagedTextKind,
-    ) {
-        let encoded =
-            encode_current_path_catalog_row(&CurrentPathCatalogStoredRow { path, kind }).unwrap();
-        engine.current_path_catalog.root = engine
-            .scratch
-            .as_ref()
-            .unwrap()
-            .authenticated_catalog_upsert(
-                &engine.current_path_catalog.root,
-                page_id.as_uuid().into_bytes(),
-                &encoded,
-            )
-            .unwrap();
-    }
-
     #[test]
     fn current_path_cursor_rejects_missing_duplicate_and_corrupt_path_authority() {
         let (missing_root, mut missing, _) = cursor_fixture(314_000, 2);
@@ -25715,11 +25866,11 @@ mod validation_tests {
             .find(|row| row.page_id() == first)
             .unwrap()
             .path;
-        replace_authenticated_cursor_row_for_test(
-            &mut duplicate,
+        duplicate.replace_current_path_catalog_row_for_test(
             second,
             first_path,
             ManagedTextKind::Page,
+            ContentDigest::of(b"test accepted name"),
         );
         let duplicate_cursor = duplicate.begin_current_path_cursor().unwrap();
         assert!(matches!(
@@ -25780,11 +25931,11 @@ mod validation_tests {
             "x".repeat(MAX_CURRENT_PATH_CURSOR_PATH_BYTES)
         ))
         .unwrap();
-        replace_authenticated_cursor_row_for_test(
-            &mut long_path_engine,
+        long_path_engine.replace_current_path_catalog_row_for_test(
             page_id,
             long_path,
             ManagedTextKind::Page,
+            ContentDigest::of(b"test accepted name"),
         );
         let long_cursor = long_path_engine.begin_current_path_cursor().unwrap();
         assert!(matches!(

@@ -1571,6 +1571,34 @@
         "failBefore": "proven"
       },
       "notes": "The engine proof retains an accepted bootstrap no-op that has no document head and bounds membership to authenticated point reads over exact accepted status, append-only accepted sequence, accepted-batch map, and current accepted authority. The provider regression accepts a synthetic headless dependency, removes its provider manifest, restarts the receiver, duplicates and reorders a real CRDT child's delivery, and requires the child to settle without an absent-manifest shortcut."
+    },
+    {
+      "id": "REG-SYNC-EXTERNAL-NAME-POLICY-AUTHORITY-001",
+      "title": "Config filename-policy changes cannot rename an exactly owned oplog page or journal on a later external edit",
+      "family": "sync-data-safety",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/oplog/import.rs::accepted_page_name_survives_filename_policy_reopen_while_new_pages_use_new_policy",
+          "crates/tine-core/src/oplog/import.rs::accepted_journal_name_survives_journal_policy_reopen_while_new_journals_use_new_policy",
+          "crates/tine-core/src/oplog/import.rs::semantically_wrong_authenticated_current_path_identity_blocks_before_external_draft",
+          "crates/tine-core/src/oplog/hot_engine.rs::semantically_wrong_current_path_rows_survive_a_restart_but_fail_before_join",
+          "crates/tine-core/src/oplog/hot_engine.rs::schema_twelve_retained_marker_named_by_a_resume_point_refuses_and_fully_replays",
+          "crates/tine-core/src/oplog/import.rs::exact_rename_adopts_graph_decoded_destination_name_before_authoring",
+          "crates/tine-core/tests/managed_sync.rs::delivered_rename_moves_the_page_and_rewrites_referrers_as_one_operation"
+        ],
+        "scenario": "sync.external-name-policy-authority",
+        "failBefore": "proven"
+      },
+      "notes": "The page and journal regressions change config.edn, reopen from archived authority, apply the external reconciliation transaction, reopen a second time, and assert PageId, accepted logical name, semantic kind, textual referrers, and new-path policy. Every authenticated current-path row is point-checked against exact materialized catalog PageId state before join or import consumption; wrong name digest or kind fails before execution material exists, including after retained-run adoption. Scratch schema 12 and authenticated current-path catalog schema 1 transition to 13 and 2; a schema-12 retained run named by a valid resume point is preserved, refused, and rebuilt only by full immutable-history replay. A real old-path to new-path move still adopts the destination decode, and explicit Tine rename remains the graph-wide RenamePagesAndRewriteReferrers operation."
     }
   ]
 }

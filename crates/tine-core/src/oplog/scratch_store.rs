@@ -25,14 +25,14 @@ const MARKER_FILE: &str = "marker";
 const LEASE_FILE: &str = "lease";
 const PAGES_FILE: &str = "pages.index";
 const BLOBS_FILE: &str = "blobs.data";
-const SCRATCH_SCHEMA_VERSION: u32 = 12;
+pub(crate) const SCRATCH_SCHEMA_VERSION: u32 = 13;
 const SCRATCH_PAGE_SCHEMA_VERSION: u32 = 1;
 const SCRATCH_LSM_LEVELS: usize = 32;
 const ACCEPTED_SEQUENCE_SCHEMA_VERSION: u32 = 1;
 const ACCEPTED_SEQUENCE_LEAF_CAPACITY: usize = 1;
 const ACCEPTED_SEQUENCE_NODE_FANOUT: usize = 32;
 const AUTHENTICATED_MAP_SCHEMA_VERSION: u32 = 1;
-const AUTHENTICATED_CATALOG_SCHEMA_VERSION: u32 = 1;
+pub(crate) const AUTHENTICATED_CATALOG_SCHEMA_VERSION: u32 = 2;
 const AUTHENTICATED_POINT_MAP_SCHEMA_VERSION: u32 = 1;
 const CAUSAL_ACCUMULATOR_SCHEMA_VERSION: u32 = 1;
 const MAX_AUTHENTICATED_MAP_DEPTH: usize = 256;
@@ -263,9 +263,9 @@ enum ScratchRetention {
     Retained,
 }
 
-/// Schema-12 durable run marker.
+/// Schema-13 durable run marker.
 ///
-/// There is no legacy decode path: schema-11 bytes are rejected, never migrated.
+/// There is no legacy decode path: schema-12 bytes are rejected, never migrated.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ScratchRunMarkerV3 {
@@ -274,6 +274,24 @@ struct ScratchRunMarkerV3 {
     run_id: Uuid,
     retention: ScratchRetention,
     random_owner_nonce: [u8; 32],
+}
+
+#[cfg(test)]
+pub(crate) fn rewrite_retained_run_marker_schema_for_test(
+    archive_root: &std::path::Path,
+    run_id: Uuid,
+    schema_version: u32,
+) -> Vec<u8> {
+    let marker_path = archive_root
+        .join(SCRATCH_DIR)
+        .join(format!("run-{run_id}"))
+        .join(MARKER_FILE);
+    let bytes = fs::read(&marker_path).unwrap();
+    let mut marker: ScratchRunMarkerV3 = decode_canonical(&bytes).unwrap();
+    marker.schema_version = schema_version;
+    let rewritten = encode_canonical(&marker).unwrap();
+    fs::write(marker_path, &rewritten).unwrap();
+    rewritten
 }
 
 /// What one reclamation pass proved about one sibling scratch run.
@@ -3329,11 +3347,11 @@ pub(crate) fn authenticated_map_node_digest(
 }
 
 fn authenticated_catalog_empty_digest() -> ContentDigest {
-    ContentDigest::of(b"tine/oplog/authenticated-current-path-catalog/v1/empty")
+    ContentDigest::of(b"tine/oplog/authenticated-current-path-catalog/v2/empty")
 }
 
 fn authenticated_catalog_node_digest(node: &AuthenticatedCatalogNode) -> ContentDigest {
-    let mut bytes = b"tine/oplog/authenticated-current-path-catalog/v1/node\0".to_vec();
+    let mut bytes = b"tine/oplog/authenticated-current-path-catalog/v2/node\0".to_vec();
     bytes.extend_from_slice(&node.key);
     bytes.extend_from_slice(ContentDigest::of(&node.value).as_bytes());
     for child in [&node.left, &node.right] {

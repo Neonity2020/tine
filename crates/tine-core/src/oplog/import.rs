@@ -4592,6 +4592,29 @@ fn capture_import_scope(
             }
         };
 
+        let accepted_identity = engine
+            .current_path_catalog_row_at_path(path)
+            .map_err(|error| {
+                authority_block(
+                    ImportBlockReason::AuthorityUnavailable,
+                    Some(path),
+                    format!("accepted current-path identity is invalid: {error}"),
+                )
+            })?
+            .ok_or_else(|| {
+                authority_block(
+                    ImportBlockReason::AuthorityUnavailable,
+                    Some(path),
+                    "exact path owner has no accepted current-path identity",
+                )
+            })?;
+        if accepted_identity.page_id() != page_id {
+            return Err(authority_block(
+                ImportBlockReason::AuthorityUnavailable,
+                Some(path),
+                "portable-path owner and accepted current-path PageId disagree",
+            ));
+        }
         let current = engine
             .authorize_projection_write(page_id)
             .map_err(|error| {
@@ -4608,6 +4631,29 @@ fn capture_import_scope(
                 "portable-path ownership and materialized page path disagree",
             ));
         }
+        if accepted_identity.kind() != current.state().page.kind
+            || accepted_identity.accepted_name_digest()
+                != ContentDigest::of(current.state().page.name.as_str().as_bytes())
+        {
+            return Err(authority_block(
+                ImportBlockReason::AuthorityUnavailable,
+                Some(path),
+                "accepted current-path name or kind disagrees with materialized PageId state",
+            ));
+        }
+        // Exact accepted path ownership is the rename boundary. A reopened
+        // Graph may decode the same filename differently after config.edn
+        // changes, but configuration is not authority to rename an oplog page
+        // or change Page versus Journal. Preserve the accepted catalog identity
+        // here; an unowned destination in an actual external path move still
+        // uses the current Graph decoder above.
+        path_identities.insert(
+            path.clone(),
+            ImportedPathIdentity {
+                name: current.state().page.name.clone(),
+                kind: current.state().page.kind,
+            },
+        );
 
         let mut exact = None;
         let mut replay_cache =
@@ -6693,9 +6739,9 @@ mod tests {
 
     use super::*;
     use crate::oplog::{
-        write_projection_exact, ApplicationRuntimeRoot, AuthorBatch, BatchId, BlockLocation,
-        CrdtPeerId, DeviceId, DocumentId, LineageDigest, ManagedTextKind, ObjectStore,
-        OperationTransaction, PortablePathIndexRoot, ProjectionEndpointBinding,
+        write_projection_exact, ApplicationRuntimeRoot, AuthorBatch, BatchDisposition, BatchId,
+        BlockLocation, CrdtPeerId, DeviceId, DocumentId, LineageDigest, ManagedTextKind,
+        ObjectStore, OperationTransaction, PortablePathIndexRoot, ProjectionEndpointBinding,
         ProjectionEndpointId, ProjectionRecovery, RebuildSource, SemanticEffect, SemanticOperation,
         SessionId, SqliteFrontier, MAX_MATERIALIZATION_QUERY_ROWS,
     };
@@ -6734,7 +6780,7 @@ mod tests {
 
     impl SnapshotFixture {
         fn new(label: &str, paths: &[&str]) -> Self {
-            Self::new_with_initial_uuid_and_config(label, paths, None, None)
+            Self::new_with_initial_uuid_and_config(label, paths, None, None, None, None)
         }
 
         fn new_with_initial_uuid(
@@ -6742,11 +6788,28 @@ mod tests {
             paths: &[&str],
             initial_uuid: Option<LogseqUuid>,
         ) -> Self {
-            Self::new_with_initial_uuid_and_config(label, paths, initial_uuid, None)
+            Self::new_with_initial_uuid_and_config(label, paths, initial_uuid, None, None, None)
         }
 
         fn new_with_graph_config(label: &str, paths: &[&str], config: &str) -> Self {
-            Self::new_with_initial_uuid_and_config(label, paths, None, Some(config))
+            Self::new_with_initial_uuid_and_config(label, paths, None, Some(config), None, None)
+        }
+
+        fn new_with_graph_config_names_and_contents(
+            label: &str,
+            paths: &[&str],
+            config: &str,
+            names: &[&str],
+            contents: &[&str],
+        ) -> Self {
+            Self::new_with_initial_uuid_and_config(
+                label,
+                paths,
+                None,
+                Some(config),
+                Some(names),
+                Some(contents),
+            )
         }
 
         fn new_with_initial_uuid_and_config(
@@ -6754,7 +6817,11 @@ mod tests {
             paths: &[&str],
             initial_uuid: Option<LogseqUuid>,
             config: Option<&str>,
+            names: Option<&[&str]>,
+            contents: Option<&[&str]>,
         ) -> Self {
+            assert!(names.is_none_or(|names| names.len() == paths.len()));
+            assert!(contents.is_none_or(|contents| contents.len() == paths.len()));
             let root = TestRoot::new(label);
             let graph_root = root.path().join("graph");
             if let Some(config) = config {
@@ -6801,8 +6868,12 @@ mod tests {
                 operations.push(SemanticOperation::CreatePage {
                     page_id,
                     home_document_id: home,
-                    name: crate::oplog::LogicalPageName::parse(format!("Snapshot Page {index}"))
-                        .unwrap(),
+                    name: crate::oplog::LogicalPageName::parse(
+                        names
+                            .map(|names| names[index].to_owned())
+                            .unwrap_or_else(|| format!("Snapshot Page {index}")),
+                    )
+                    .unwrap(),
                     path: managed_path,
                     kind,
                 });
@@ -6814,10 +6885,14 @@ mod tests {
                     page_id,
                     parent: None,
                     order: "a".into(),
-                    content: match (index, initial_uuid) {
-                        (0, Some(logseq_uuid)) => format!("page {index}\nid:: {logseq_uuid}"),
-                        _ => format!("page {index}"),
-                    },
+                    content: contents
+                        .map(|contents| contents[index].to_owned())
+                        .unwrap_or_else(|| match (index, initial_uuid) {
+                            (0, Some(logseq_uuid)) => {
+                                format!("page {index}\nid:: {logseq_uuid}")
+                            }
+                            _ => format!("page {index}"),
+                        }),
                 });
                 if index == 0 {
                     if let Some(logseq_uuid) = initial_uuid {
@@ -6891,6 +6966,90 @@ mod tests {
 
         fn plan(&self, paths: &[&str]) -> ImportPlan {
             plan_affected_import(&self.graph, &self.receipts, &self.engine, paths)
+        }
+
+        fn reopen_after_config_change(self) -> Self {
+            let Self {
+                _root,
+                graph_root,
+                graph,
+                receipts,
+                engine,
+                intents,
+                empty_history_head,
+            } = self;
+            drop(graph);
+            drop(engine);
+            let graph = Graph::open(&graph_root);
+            let workspace = WorkspaceId::from_uuid(Uuid::from_u128(1));
+            let mut engine = ShardedHotEngine::with_enrolled_projection(
+                ObjectStore::open(&_root.path().join("archive"), workspace).unwrap(),
+                LineageDigest::of(b"snapshot-test"),
+                DocumentId::from_uuid(Uuid::from_u128(4)),
+                &graph,
+                &receipts,
+            );
+            engine.prepare_operational_recovery_replay().unwrap();
+            let manifests = ObjectStore::open(&_root.path().join("archive"), workspace)
+                .unwrap()
+                .committed_manifests()
+                .unwrap();
+            for manifest in manifests {
+                engine
+                    .stage_archive_batch_for_recovery(manifest.batch_id())
+                    .unwrap();
+            }
+            engine.finish_operational_recovery_replay().unwrap();
+            Self {
+                _root,
+                graph_root,
+                graph,
+                receipts,
+                engine,
+                intents,
+                empty_history_head,
+            }
+        }
+
+        fn apply_external_plan(&mut self, plan: ImportPlan, seed: u128) -> BatchId {
+            let endpoint = self.engine.projection_endpoint_binding().unwrap();
+            let material = plan.into_execution_material().unwrap();
+            let batch_id = material.batch_id();
+            let draft = self
+                .engine
+                .draft_external_import_transaction(
+                    AuthorBatch {
+                        batch_id,
+                        author_device_id: endpoint.device_id,
+                        author_session_id: SessionId::from_uuid(Uuid::from_u128(seed)),
+                        crdt_peer_id: CrdtPeerId::from_u64(seed as u64 + 1),
+                    },
+                    material,
+                )
+                .unwrap();
+            let captured = self
+                .engine
+                .capture_external_author_transaction(draft, &self.graph, &self.receipts, endpoint)
+                .unwrap();
+            let prepared = self
+                .engine
+                .finalize_captured_author_transaction(captured, &self.receipts)
+                .unwrap();
+            ObjectStore::open(
+                &self._root.path().join("archive"),
+                self.engine.workspace_id(),
+            )
+            .unwrap()
+            .publish_prepared(&prepared)
+            .unwrap();
+            assert!(matches!(
+                self.engine
+                    .stage_archive_batch(batch_id)
+                    .unwrap()
+                    .disposition(),
+                BatchDisposition::Accepted { .. }
+            ));
+            batch_id
         }
     }
 
@@ -7295,6 +7454,253 @@ mod tests {
             ("literal___marker", ManagedTextKind::Page),
             "TripleLowbar decodes separators before percent escapes, preserving encoded literals"
         );
+    }
+
+    #[test]
+    fn accepted_page_name_survives_filename_policy_reopen_while_new_pages_use_new_policy() {
+        let fixture = SnapshotFixture::new_with_graph_config_names_and_contents(
+            "accepted-page-name-policy-reopen",
+            &["pages/A.B.md", "pages/referrer.md"],
+            "{:file/name-format :legacy}\n",
+            &["A/B", "Referrer"],
+            &["old", "see [[A/B]]"],
+        );
+        let accepted_page_id = fixture.intents[0].page_id();
+        let referrer_page_id = fixture.intents[1].page_id();
+        let accepted_referrer = fixture.engine.materialize_page(referrer_page_id).unwrap();
+        let referrer_block_id = accepted_referrer.blocks[0].block_id;
+
+        fs::write(
+            fixture.graph_root.join("logseq/config.edn"),
+            "{:file/name-format :triple-lowbar}\n",
+        )
+        .unwrap();
+        let mut fixture = fixture.reopen_after_config_change();
+        fs::write(fixture.graph_root.join("pages/A.B.md"), b"- changed\n").unwrap();
+        fs::write(fixture.graph_root.join("pages/New___Page.md"), b"- new\n").unwrap();
+
+        let plan = plan_affected_import(
+            &fixture.graph,
+            &fixture.receipts,
+            &fixture.engine,
+            &["pages/A.B.md", "pages/New___Page.md"],
+        );
+        assert_eq!(plan.status(), ImportPlanStatus::Reconcile);
+        let operations = &plan.execution_material().unwrap().transaction().operations;
+        assert!(
+            !operations.iter().any(|operation| matches!(
+                operation,
+                SemanticOperation::ReconcileExternalPageState { page_id, .. }
+                    if *page_id == accepted_page_id
+            )),
+            "an edit at an exactly owned path must not reinterpret its accepted logical name"
+        );
+        assert!(operations.iter().any(|operation| matches!(
+            operation,
+            SemanticOperation::CreatePage { name, path, kind, .. }
+                if name.as_str() == "New/Page"
+                    && path.as_str() == "pages/New___Page.md"
+                    && *kind == ManagedTextKind::Page
+        )));
+        assert!(
+            !operations.iter().any(|operation| matches!(
+                operation,
+                SemanticOperation::EditBlockContent { block, .. }
+                    if block.block_id == referrer_block_id
+            )),
+            "preserving the accepted page name must leave existing textual referrers untouched"
+        );
+        assert_eq!(
+            fixture
+                .engine
+                .materialize_page(accepted_page_id)
+                .unwrap()
+                .name
+                .as_str(),
+            "A/B"
+        );
+        assert_eq!(accepted_referrer.blocks[0].content, "see [[A/B]]");
+
+        let new_page_id = operations
+            .iter()
+            .find_map(|operation| match operation {
+                SemanticOperation::CreatePage { page_id, path, .. }
+                    if path.as_str() == "pages/New___Page.md" =>
+                {
+                    Some(*page_id)
+                }
+                _ => None,
+            })
+            .unwrap();
+        fixture.apply_external_plan(plan, 7_500);
+        let fixture = fixture.reopen_after_config_change();
+        let accepted = fixture.engine.materialize_page(accepted_page_id).unwrap();
+        assert_eq!(accepted.page_id, accepted_page_id);
+        assert_eq!(accepted.name.as_str(), "A/B");
+        assert_eq!(accepted.path.as_str(), "pages/A.B.md");
+        assert_eq!(accepted.kind, ManagedTextKind::Page);
+        let referrer = fixture.engine.materialize_page(referrer_page_id).unwrap();
+        assert_eq!(referrer.page_id, referrer_page_id);
+        assert_eq!(referrer.name.as_str(), "Referrer");
+        assert_eq!(referrer.kind, ManagedTextKind::Page);
+        assert_eq!(referrer.blocks[0].block_id, referrer_block_id);
+        assert_eq!(referrer.blocks[0].content, "see [[A/B]]");
+        let created = fixture.engine.materialize_page(new_page_id).unwrap();
+        assert_eq!(created.page_id, new_page_id);
+        assert_eq!(created.name.as_str(), "New/Page");
+        assert_eq!(created.path.as_str(), "pages/New___Page.md");
+        assert_eq!(created.kind, ManagedTextKind::Page);
+    }
+
+    #[test]
+    fn accepted_journal_name_survives_journal_policy_reopen_while_new_journals_use_new_policy() {
+        let fixture = SnapshotFixture::new_with_graph_config_names_and_contents(
+            "accepted-journal-name-policy-reopen",
+            &["journals/25.07.2026.md", "pages/referrer.md"],
+            "{:journal/file-name-format \"dd.MM.yyyy\"\n\
+              :journal/page-title-format \"yyyy-MM-dd\"}\n",
+            &["2026-07-25", "Referrer"],
+            &["old journal", "see [[2026-07-25]]"],
+        );
+        let accepted_page_id = fixture.intents[0].page_id();
+        let referrer_page_id = fixture.intents[1].page_id();
+        let accepted_referrer = fixture.engine.materialize_page(referrer_page_id).unwrap();
+        let referrer_block_id = accepted_referrer.blocks[0].block_id;
+
+        fs::write(
+            fixture.graph_root.join("logseq/config.edn"),
+            "{:journal/file-name-format \"MM~dd~yyyy\"\n\
+              :journal/page-title-format \"yyyy-MM-dd\"}\n",
+        )
+        .unwrap();
+        let mut fixture = fixture.reopen_after_config_change();
+        fs::write(
+            fixture.graph_root.join("journals/25.07.2026.md"),
+            b"- changed journal\n",
+        )
+        .unwrap();
+        fs::write(
+            fixture.graph_root.join("journals/07~26~2026.md"),
+            b"- new journal\n",
+        )
+        .unwrap();
+
+        let plan = plan_affected_import(
+            &fixture.graph,
+            &fixture.receipts,
+            &fixture.engine,
+            &["journals/25.07.2026.md", "journals/07~26~2026.md"],
+        );
+        assert_eq!(plan.status(), ImportPlanStatus::Reconcile);
+        let operations = &plan.execution_material().unwrap().transaction().operations;
+        assert!(
+            !operations.iter().any(|operation| matches!(
+                operation,
+                SemanticOperation::ReconcileExternalPageState { page_id, .. }
+                    if *page_id == accepted_page_id
+            )),
+            "an edit at an exactly owned journal path must not reinterpret its accepted name"
+        );
+        assert!(operations.iter().any(|operation| matches!(
+            operation,
+            SemanticOperation::CreatePage { name, path, kind, .. }
+                if name.as_str() == "2026-07-26"
+                    && path.as_str() == "journals/07~26~2026.md"
+                    && *kind == ManagedTextKind::Journal
+        )));
+        assert!(
+            !operations.iter().any(|operation| matches!(
+                operation,
+                SemanticOperation::EditBlockContent { block, .. }
+                    if block.block_id == referrer_block_id
+            )),
+            "preserving the accepted journal name must leave existing textual referrers untouched"
+        );
+        assert_eq!(
+            fixture
+                .engine
+                .materialize_page(accepted_page_id)
+                .unwrap()
+                .name
+                .as_str(),
+            "2026-07-25"
+        );
+        assert_eq!(accepted_referrer.blocks[0].content, "see [[2026-07-25]]");
+
+        let new_journal_id = operations
+            .iter()
+            .find_map(|operation| match operation {
+                SemanticOperation::CreatePage { page_id, path, .. }
+                    if path.as_str() == "journals/07~26~2026.md" =>
+                {
+                    Some(*page_id)
+                }
+                _ => None,
+            })
+            .unwrap();
+        fixture.apply_external_plan(plan, 7_600);
+        let fixture = fixture.reopen_after_config_change();
+        let accepted = fixture.engine.materialize_page(accepted_page_id).unwrap();
+        assert_eq!(accepted.page_id, accepted_page_id);
+        assert_eq!(accepted.name.as_str(), "2026-07-25");
+        assert_eq!(accepted.path.as_str(), "journals/25.07.2026.md");
+        assert_eq!(accepted.kind, ManagedTextKind::Journal);
+        let referrer = fixture.engine.materialize_page(referrer_page_id).unwrap();
+        assert_eq!(referrer.page_id, referrer_page_id);
+        assert_eq!(referrer.name.as_str(), "Referrer");
+        assert_eq!(referrer.kind, ManagedTextKind::Page);
+        assert_eq!(referrer.blocks[0].block_id, referrer_block_id);
+        assert_eq!(referrer.blocks[0].content, "see [[2026-07-25]]");
+        let created = fixture.engine.materialize_page(new_journal_id).unwrap();
+        assert_eq!(created.page_id, new_journal_id);
+        assert_eq!(created.name.as_str(), "2026-07-26");
+        assert_eq!(created.path.as_str(), "journals/07~26~2026.md");
+        assert_eq!(created.kind, ManagedTextKind::Journal);
+    }
+
+    #[test]
+    fn semantically_wrong_authenticated_current_path_identity_blocks_before_external_draft() {
+        let mut fixture = SnapshotFixture::new_with_graph_config_names_and_contents(
+            "semantically-wrong-current-path-identity",
+            &["pages/accepted.md"],
+            "{:file/name-format :legacy}\n",
+            &["Accepted Name"],
+            &["old"],
+        );
+        let page_id = fixture.intents[0].page_id();
+        let path = ManagedPath::parse("pages/accepted.md").unwrap();
+        fixture.engine.replace_current_path_catalog_row_for_test(
+            page_id,
+            path,
+            ManagedTextKind::Journal,
+            ContentDigest::of(b"authenticated but semantically wrong name"),
+        );
+        fixture.engine.reconstruct_run_local_state().unwrap();
+        fs::write(
+            fixture.graph_root.join("pages/accepted.md"),
+            b"- external edit\n",
+        )
+        .unwrap();
+
+        let plan = fixture.plan(&["pages/accepted.md"]);
+        assert_eq!(plan.status(), ImportPlanStatus::Blocked);
+        assert_eq!(
+            plan.blocks()[0].reason,
+            ImportBlockReason::AuthorityUnavailable
+        );
+        assert!(
+            plan.blocks()[0]
+                .detail
+                .contains("accepted catalog page state"),
+            "{}",
+            plan.blocks()[0].detail
+        );
+        assert!(matches!(
+            plan.into_execution_material(),
+            Err(ImportExecutionError::RefusedStatus(
+                ImportPlanStatus::Blocked
+            ))
+        ));
     }
 
     #[test]

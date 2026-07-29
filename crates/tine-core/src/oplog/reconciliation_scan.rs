@@ -627,6 +627,9 @@ pub(crate) struct AuthenticatedExpectedPath {
     pub(crate) page_id: PageId,
     pub(crate) path: ManagedPath,
     pub(crate) kind: ManagedTextKind,
+    /// Exact accepted logical-name evidence without retaining an unbounded
+    /// `LogicalPageName` in every filesystem-scan row.
+    pub(crate) accepted_name_digest: ContentDigest,
     pub(crate) description: BlobDescription,
     pub(crate) owner_binding: ContentDigest,
 }
@@ -846,6 +849,7 @@ impl<'a> JoinedAuthenticatedExpectedPathSource<'a> {
             page_id: row.page_id(),
             path: row.path().clone(),
             kind: row.kind(),
+            accepted_name_digest: row.accepted_name_digest(),
             description,
             owner_binding: joined_owner_binding(source_commitment, row.page_id(), row.path()),
         })
@@ -1182,7 +1186,7 @@ fn joined_source_commitment(
     device_id: super::DeviceId,
 ) -> ContentDigest {
     let mut hasher = Sha256::new();
-    hasher.update(b"tine/reconciliation/joined-expected-path-source/v1\0");
+    hasher.update(b"tine/reconciliation/joined-expected-path-source/v2\0");
     hasher.update(engine.workspace_id().as_uuid().as_bytes());
     hasher.update(engine.lineage_digest().as_bytes());
     hasher.update(engine.accepted_frontier().as_bytes());
@@ -1906,7 +1910,7 @@ fn expected_rows_commitment(
 
 fn expected_rows_hasher(binding: ExpectedPathBinding, total_rows: usize) -> Sha256 {
     let mut hasher = Sha256::new();
-    hasher.update(b"tine/test-only/reconciliation-expected-paths/v1\0");
+    hasher.update(b"tine/test-only/reconciliation-expected-paths/v2\0");
     hasher.update(binding.accepted_frontier.as_bytes());
     hasher.update(binding.projection_generation.to_be_bytes());
     hasher.update((total_rows as u64).to_be_bytes());
@@ -1920,6 +1924,7 @@ fn hash_expected_row(hasher: &mut Sha256, row: &AuthenticatedExpectedPath) {
         ManagedTextKind::Page => [0],
         ManagedTextKind::Journal => [1],
     });
+    hasher.update(row.accepted_name_digest.as_bytes());
     hash_description(hasher, row.description);
     hasher.update(row.owner_binding.as_bytes());
 }
@@ -3146,6 +3151,7 @@ mod tests {
             page_id: PageId::from_uuid(Uuid::from_bytes(page_bytes)),
             path: ManagedPath::parse(path).unwrap(),
             kind,
+            accepted_name_digest: ContentDigest::of(format!("name:{path}").as_bytes()),
             description: BlobDescription::of(bytes),
             owner_binding: ContentDigest::of(format!("owner:{path}").as_bytes()),
         }
