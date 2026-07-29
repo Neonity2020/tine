@@ -149,10 +149,24 @@ thread_local! {
         std::cell::RefCell::new(None);
     static ENROLLED_OPEN_ACT_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         std::cell::RefCell::new(None);
+    static SEALED_HISTORY_AFTER_PREFLIGHT_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+    static SEALED_HISTORY_AUTHORITY_WINDOW_HOOK:
+        std::cell::RefCell<Option<Box<dyn FnMut(SealedHistoryAuthorityWindowStage)>>> =
+        std::cell::RefCell::new(None);
+    static ADVISORY_TRANSITION_CONTENTION_HOOK:
+        std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
     static ENGINE_HISTORY_FAIL_BEFORE_HEAD_SWAP: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
     static ENGINE_HISTORY_FAIL_AFTER_HEAD_SWAP: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum SealedHistoryAuthorityWindowStage {
+    Locked,
+    Validated,
 }
 
 #[cfg(test)]
@@ -196,6 +210,51 @@ pub(crate) fn set_enrolled_open_use_hook(hook: impl FnOnce() + 'static) {
 #[cfg(test)]
 pub(crate) fn set_enrolled_open_act_hook(hook: impl FnOnce() + 'static) {
     ENROLLED_OPEN_ACT_HOOK.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+}
+
+#[cfg(test)]
+fn set_sealed_history_after_preflight_hook(hook: impl FnOnce() + 'static) {
+    SEALED_HISTORY_AFTER_PREFLIGHT_HOOK.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+}
+
+#[cfg(test)]
+fn sealed_history_after_preflight_hook() {
+    SEALED_HISTORY_AFTER_PREFLIGHT_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+#[cfg(test)]
+fn set_sealed_history_authority_window_hook(
+    hook: impl FnMut(SealedHistoryAuthorityWindowStage) + 'static,
+) {
+    SEALED_HISTORY_AUTHORITY_WINDOW_HOOK.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+}
+
+#[cfg(test)]
+fn sealed_history_authority_window_hook(stage: SealedHistoryAuthorityWindowStage) {
+    SEALED_HISTORY_AUTHORITY_WINDOW_HOOK.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if let Some(hook) = slot.as_mut() {
+            hook(stage);
+        }
+        if matches!(stage, SealedHistoryAuthorityWindowStage::Validated) {
+            slot.take();
+        }
+    });
+}
+
+#[cfg(test)]
+fn set_advisory_transition_contention_hook(hook: impl FnOnce() + 'static) {
+    ADVISORY_TRANSITION_CONTENTION_HOOK.with(|slot| {
         *slot.borrow_mut() = Some(Box::new(hook));
     });
 }
@@ -2316,6 +2375,12 @@ impl ObjectStore {
         &self,
         binding: super::hot_engine::ProjectionStorageBinding,
     ) -> Result<SealedControl<DurableEngineHistoryStore>, StoreError> {
+        // Reject incompatible durable evidence before opening the durable lock
+        // can create it. `open_sealed_existing` repeats the validation after
+        // lock acquisition so a substitution in this window still fails shut.
+        self.preflight_engine_history(binding)?;
+        #[cfg(test)]
+        sealed_history_after_preflight_hook();
         let Some(histories) = open_existing_dir_nofollow(&self.capability, ENGINE_HISTORY_DIR)?
         else {
             return Ok(SealedControl::Absent(AbsentControlName {
@@ -2758,7 +2823,6 @@ impl ObjectStore {
         .map_err(|error| StoreError::Scratch(error.to_string()))
     }
 
-    #[cfg(test)]
     fn preflight_engine_history(
         &self,
         binding: super::hot_engine::ProjectionStorageBinding,
@@ -4676,6 +4740,15 @@ impl DurableEngineHistoryStore {
         transition_lock: fs::File,
         counters: Arc<StoreCounters>,
     ) -> Result<Self, StoreError> {
+        // Retain a duplicate handle for the returned store while the guard
+        // borrows the original. This keeps one uninterrupted advisory lock
+        // across every post-open claim/head/root check and construction, then
+        // releases it before callers can invoke a transition method on the
+        // returned store and acquire the same lock themselves.
+        let retained_transition_lock = transition_lock.try_clone()?;
+        let _workspace_guard = AdvisoryTransitionGuard::lock(&transition_lock)?;
+        #[cfg(test)]
+        sealed_history_authority_window_hook(SealedHistoryAuthorityWindowStage::Locked);
         let claim = read_optional_regular(&control, ENGINE_HISTORY_CLAIM_FILE, 256, None)?
             .ok_or(StoreError::MalformedHistoryIndex)?;
         validate_engine_history_claim(
@@ -4702,7 +4775,7 @@ impl DurableEngineHistoryStore {
                 counters,
                 storage_fault: AtomicBool::new(false),
             },
-            transition_lock,
+            transition_lock: retained_transition_lock,
             transition: Mutex::new(()),
             authoritative_head: Mutex::new(None),
             promoted_lineage: None,
@@ -4714,6 +4787,8 @@ impl DurableEngineHistoryStore {
             .authoritative_head
             .lock()
             .map_err(|_| StoreError::MalformedHistoryIndex)? = Some(digest);
+        #[cfg(test)]
+        sealed_history_authority_window_hook(SealedHistoryAuthorityWindowStage::Validated);
         Ok(store)
     }
 
@@ -7366,6 +7441,18 @@ struct AdvisoryTransitionGuard<'a>(&'a fs::File);
 
 impl<'a> AdvisoryTransitionGuard<'a> {
     fn lock(file: &'a fs::File) -> Result<Self, StoreError> {
+        #[cfg(test)]
+        {
+            let contention_hook =
+                ADVISORY_TRANSITION_CONTENTION_HOOK.with(|slot| slot.borrow_mut().take());
+            if let Some(contention_hook) = contention_hook {
+                match fs2::FileExt::try_lock_exclusive(file) {
+                    Ok(()) => return Ok(Self(file)),
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => contention_hook(),
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
         fs2::FileExt::lock_exclusive(file)?;
         Ok(Self(file))
     }
@@ -9433,6 +9520,314 @@ mod history_index_tests {
         assert_eq!(snapshot_tree(&archive_path), before);
         assert!(!control.join(ENGINE_HISTORY_NODES_DIR).exists());
         assert!(!control.join(ENGINE_HISTORY_ROOTS_DIR).exists());
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sealed_history_claim_rejections_are_mutation_free_for_every_open_mode() {
+        #[derive(Clone, Copy)]
+        enum ClaimKind {
+            Prior,
+            Future,
+            Synthetic,
+        }
+
+        #[derive(Clone, Copy)]
+        enum OpenMode {
+            Ordinary,
+            Promoted,
+            HistoryOnly,
+        }
+
+        fn promoted_state(
+            store: &ObjectStore,
+            workspace: WorkspaceId,
+            binding: crate::oplog::hot_engine::ProjectionStorageBinding,
+            seed: u8,
+        ) -> PromotedRuntimeStateV1 {
+            let lineage = LineageDigest::from_bytes([seed; 32]);
+            let import_id = ImportId::from_digest([seed.wrapping_add(1); 32]);
+            let aggregate = BootstrapAggregateManifestV1::empty(
+                workspace,
+                lineage,
+                binding.endpoint.graph_resource_id,
+                import_id,
+            )
+            .unwrap();
+            PromotedRuntimeStateV1 {
+                schema_version: PROMOTED_RUNTIME_STATE_SCHEMA_VERSION,
+                lineage_mode: PromotedLineageModeV1::BootstrapAnchoredHomogeneous,
+                workspace_id: workspace,
+                lineage_digest: lineage,
+                catalog_document_id: DocumentId::from_uuid(Uuid::from_u128(u128::from(seed))),
+                endpoint_id: binding.endpoint.endpoint_id,
+                device_id: binding.endpoint.device_id,
+                graph_resource_id: binding.endpoint.graph_resource_id,
+                receipt_store_id: binding.receipt_store_id,
+                archive_resource_id: store.provision_enrolled_archive_resource_id().unwrap(),
+                archive_control_binding: control_directory_identity(&store.capability)
+                    .unwrap()
+                    .binding_digest(),
+                bootstrap: BootstrapAggregateHistoryBindingV1::for_aggregate(&aggregate).unwrap(),
+                bootstrap_import_id: import_id,
+                anchor_history_generation: 0,
+                anchor_history_index_root: EngineHistoryStore::empty_root(),
+                anchor_acceptance_sequence: 0,
+                anchor_accepted_frontier_state_digest: ContentDigest::of(b"synthetic frontier"),
+                enrollment_verification_digest: ContentDigest::of(b"synthetic verification"),
+                enrollment_binding_digest: ContentDigest::of(b"synthetic enrollment"),
+                promotion_session_id: SessionId::from_uuid(Uuid::from_u128(u128::from(seed) + 1)),
+            }
+        }
+
+        for (mode_label, mode) in [
+            ("ordinary", OpenMode::Ordinary),
+            ("promoted", OpenMode::Promoted),
+            ("history-only", OpenMode::HistoryOnly),
+        ] {
+            for (claim_label, claim_kind) in [
+                ("prior", ClaimKind::Prior),
+                ("future", ClaimKind::Future),
+                ("synthetic", ClaimKind::Synthetic),
+            ] {
+                let root = test_root(&format!("sealed-{mode_label}-{claim_label}"));
+                let workspace = WorkspaceId::from_uuid(Uuid::new_v4());
+                let binding = enrolled_binding(Uuid::new_v4().as_u128());
+                let archive_path = root.join("archive");
+                let store = ObjectStore::open(&archive_path, workspace).unwrap();
+                let expected = matches!(mode, OpenMode::Promoted)
+                    .then(|| promoted_state(&store, workspace, binding, claim_label.len() as u8));
+                let control = archive_path
+                    .join(ENGINE_HISTORY_DIR)
+                    .join(binding.endpoint.endpoint_id.to_string());
+                std::fs::create_dir_all(&control).unwrap();
+                std::fs::write(control.join(ENGINE_HISTORY_HEAD_FILE), b"synthetic-head").unwrap();
+                let claim = match claim_kind {
+                    ClaimKind::Prior => postcard::to_allocvec(&(
+                        ENGINE_HISTORY_ROOT_SCHEMA_VERSION - 1,
+                        workspace,
+                        binding.endpoint.endpoint_id,
+                        binding.endpoint.graph_resource_id,
+                    ))
+                    .unwrap(),
+                    ClaimKind::Future => postcard::to_allocvec(&(
+                        ENGINE_HISTORY_ROOT_SCHEMA_VERSION + 1,
+                        workspace,
+                        binding.endpoint.endpoint_id,
+                        binding.endpoint.graph_resource_id,
+                        binding.receipt_store_id,
+                    ))
+                    .unwrap(),
+                    ClaimKind::Synthetic => b"synthetic history claim".to_vec(),
+                };
+                std::fs::write(control.join(ENGINE_HISTORY_CLAIM_FILE), claim).unwrap();
+                let before = snapshot_tree(&archive_path);
+
+                let rejected = match mode {
+                    OpenMode::Ordinary => store.seal_enrolled_projection(binding).is_err(),
+                    OpenMode::Promoted => store
+                        .seal_promoted_projection(
+                            binding,
+                            expected.as_ref().expect("promoted state"),
+                        )
+                        .is_err(),
+                    OpenMode::HistoryOnly => store.seal_history_only(binding).is_err(),
+                };
+                assert!(rejected, "{mode_label} open accepted a {claim_label} claim");
+                assert_eq!(
+                    snapshot_tree(&archive_path),
+                    before,
+                    "{mode_label} rejection mutated the {claim_label} archive"
+                );
+                assert!(
+                    !archive_path
+                        .join(ENGINE_HISTORY_TRANSITION_LOCK_FILE)
+                        .exists(),
+                    "{mode_label} rejection created the transition lock for a {claim_label} claim"
+                );
+                std::fs::remove_dir_all(root).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn sealed_history_substitution_after_preflight_fails_closed() {
+        let root = test_root("sealed-history-preflight-substitution");
+        let archive = root.join("archive");
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(65));
+        let binding = enrolled_binding(66);
+        let substitute = enrolled_binding(67);
+        let store = ObjectStore::open(&archive, workspace).unwrap();
+        drop(store.open_engine_history(binding).unwrap());
+        drop(store.open_engine_history(substitute).unwrap());
+        std::fs::remove_file(archive.join(ENGINE_HISTORY_TRANSITION_LOCK_FILE)).unwrap();
+
+        let histories = archive.join(ENGINE_HISTORY_DIR);
+        let target = histories.join(binding.endpoint.endpoint_id.to_string());
+        let displaced = histories.join("displaced-after-preflight");
+        let substitute_control = histories.join(substitute.endpoint.endpoint_id.to_string());
+        let target_hook = target.clone();
+        let displaced_hook = displaced.clone();
+        set_sealed_history_after_preflight_hook(move || {
+            std::fs::rename(target_hook, displaced_hook).unwrap();
+            std::fs::rename(substitute_control, target).unwrap();
+        });
+
+        let error = store
+            .seal_history_only(binding)
+            .err()
+            .expect("substituted history must be rejected")
+            .1;
+        assert!(matches!(error, StoreError::MalformedHistoryIndex));
+        assert!(displaced.is_dir(), "the original control was not displaced");
+        assert!(
+            archive.join(ENGINE_HISTORY_TRANSITION_LOCK_FILE).is_file(),
+            "compatible preflight must still reach the durable lock"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn valid_sealed_history_open_recreates_and_uses_transition_lock() {
+        let root = test_root("valid-sealed-history-lock");
+        let archive = root.join("archive");
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(68));
+        let binding = enrolled_binding(69);
+        let store = ObjectStore::open(&archive, workspace).unwrap();
+        drop(store.open_engine_history(binding).unwrap());
+        let lock_path = archive.join(ENGINE_HISTORY_TRANSITION_LOCK_FILE);
+        std::fs::remove_file(&lock_path).unwrap();
+
+        let open = store.seal_history_only(binding).unwrap();
+        assert!(
+            lock_path.is_file(),
+            "valid sealed open did not create the lock"
+        );
+        let (store, history) = open.into_history().unwrap();
+        let guard = AdvisoryTransitionGuard::lock(&history.transition_lock).unwrap();
+        drop(guard);
+        drop(history);
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "subprocess helper invoked by sealed_history_validation_serializes_a_concurrent_valid_transition"]
+    fn sealed_history_transition_subprocess_helper() {
+        let Ok(archive) = std::env::var("TINE_SEALED_OPEN_HELPER_ARCHIVE") else {
+            return;
+        };
+        let contended = std::env::var("TINE_SEALED_OPEN_HELPER_CONTENDED").unwrap();
+        let store = ObjectStore::open(
+            Path::new(&archive),
+            WorkspaceId::from_uuid(Uuid::from_u128(0x7e00)),
+        )
+        .unwrap();
+        let history = store.open_engine_history(enrolled_binding(0x7e01)).unwrap();
+        set_advisory_transition_contention_hook(move || {
+            std::fs::write(contended, b"contended").unwrap();
+        });
+        history
+            .publish(
+                BatchId::from_uuid(Uuid::from_u128(0x7e02)),
+                b"serialized valid history transition",
+                EngineHistoryBinding::empty(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn sealed_history_validation_serializes_a_concurrent_valid_transition() {
+        let root = test_root("sealed-history-transition-serialization");
+        let archive = root.join("archive");
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(0x7e00));
+        let binding = enrolled_binding(0x7e01);
+        let store = ObjectStore::open(&archive, workspace).unwrap();
+        let publishing_history = store.open_engine_history(binding).unwrap();
+        let initial_head = publishing_history.read_live_head_root().unwrap().0;
+        let contended = root.join("child-contended");
+        let child = Arc::new(Mutex::new(None));
+        let child_for_hook = Arc::clone(&child);
+        let archive_for_hook = archive.clone();
+        let contended_for_hook = contended.clone();
+
+        set_sealed_history_authority_window_hook(move |stage| match stage {
+            SealedHistoryAuthorityWindowStage::Locked => {
+                let spawned = std::process::Command::new(std::env::current_exe().unwrap())
+                    .arg("sealed_history_transition_subprocess_helper")
+                    .arg("--ignored")
+                    .arg("--nocapture")
+                    .env(
+                        "TINE_SEALED_OPEN_HELPER_ARCHIVE",
+                        archive_for_hook.as_os_str(),
+                    )
+                    .env(
+                        "TINE_SEALED_OPEN_HELPER_CONTENDED",
+                        contended_for_hook.as_os_str(),
+                    )
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                *child_for_hook.lock().unwrap() = Some(spawned);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while !contended_for_hook.exists() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                assert!(
+                    contended_for_hook.exists(),
+                    "valid subprocess transition did not contend with sealed validation"
+                );
+            }
+            SealedHistoryAuthorityWindowStage::Validated => {
+                assert!(
+                    child_for_hook
+                        .lock()
+                        .unwrap()
+                        .as_mut()
+                        .expect("transition subprocess")
+                        .try_wait()
+                        .unwrap()
+                        .is_none(),
+                    "valid subprocess transition interleaved with sealed authority validation"
+                );
+            }
+        });
+
+        let sealed = store.seal_existing_engine_history(binding).unwrap();
+        let opened = match sealed {
+            SealedControl::Existing(history) => history,
+            SealedControl::Absent(_) => panic!("initialized history reopened as absent"),
+        };
+        assert_eq!(
+            *opened.authoritative_head.lock().unwrap(),
+            Some(initial_head),
+            "sealed validation did not pin the pre-transition authority"
+        );
+        let output = child
+            .lock()
+            .unwrap()
+            .take()
+            .expect("transition subprocess")
+            .wait_with_output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "serialized subprocess transition failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            publishing_history
+                .read_live_head_root()
+                .unwrap()
+                .1
+                .generation,
+            1
+        );
+        drop(opened);
+        drop(publishing_history);
         drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }
