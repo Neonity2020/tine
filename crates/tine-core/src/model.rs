@@ -33670,6 +33670,23 @@ mod tests {
         assert_eq!(entry.kind, PageKind::Page);
         assert_eq!(entry.name, "Top Level");
 
+        // All supported graph-text extensions, including case variants, keep
+        // the same OG filename semantics outside configured roots.
+        for (relative, expected_name) in [
+            ("archive/Lower Md.md", "Lower Md"),
+            ("archive/Lower Markdown.markdown", "Lower Markdown"),
+            ("archive/Lower Org.org", "Lower Org"),
+            ("archive/Upper Md.MD", "Upper Md"),
+            ("archive/Upper Markdown.MARKDOWN", "Upper Markdown"),
+            ("archive/Upper Org.ORG", "Upper Org"),
+        ] {
+            let path = ManagedPath::parse(relative).unwrap();
+            let entry = graph.managed_entry_for_managed_path(&path).unwrap();
+            assert_eq!(entry.kind, PageKind::Page, "{relative}");
+            assert_eq!(entry.name, expected_name, "{relative}");
+            assert_eq!(entry.rel_path, relative, "{relative}");
+        }
+
         // Containers OG itself ignores, hidden paths, provider conflict copies,
         // and spellings the guarded sparse writer cannot project stay refused.
         for refused in [
@@ -33682,8 +33699,6 @@ mod tests {
             ".hidden/note.md",
             "archive/.hidden/note.md",
             "archive/note.sync-conflict-20260726-120000-ABCDEFG.md",
-            "archive/note.markdown",
-            "archive/note.MD",
         ] {
             assert!(
                 graph
@@ -33691,6 +33706,9 @@ mod tests {
                     .is_err(),
                 "accepted {refused}"
             );
+        }
+        for invalid in ["archive/note.txt", "archive/../escape.md"] {
+            assert!(ManagedPath::parse(invalid).is_err(), "accepted {invalid}");
         }
 
         let _ = fs::remove_dir_all(&root);
@@ -33989,8 +34007,11 @@ mod tests {
             .0;
 
         assert!(!shape.contains(".entries("));
+        assert!(!shape.contains("read_dir("));
         assert!(shape.contains("for extension in LOGSEQ_TEXT_EXTENSIONS"));
-        assert!(shape.contains("parent.final_dir().symlink_metadata(&sibling)"));
+        assert!(
+            shape.contains("projection_optional_regular_metadata(parent.final_dir(), &sibling)")
+        );
     }
 
     #[test]
@@ -34013,11 +34034,10 @@ mod tests {
 
             let target = graph.projection_page_target(&target_relative).unwrap();
             let parent = graph.projection_parent(&target, false).unwrap();
-            let error = graph
+            graph
                 .ensure_projection_target_shape(&parent, &target)
-                .unwrap_err();
+                .unwrap();
 
-            assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
             assert_eq!(fs::read(&target_path).unwrap(), target_bytes);
             assert_eq!(fs::read(&twin_path).unwrap(), twin_bytes);
         }
@@ -36920,14 +36940,29 @@ mod tests {
             .write_projection_exact("pages/Special.md", None, b"- target\n")
             .is_err());
 
+        let special_sibling_target = dir.join("pages/SpecialSibling.md");
+        let special_sibling = dir.join("pages/SpecialSibling.org");
+        fs::write(&special_sibling_target, b"- markdown\n").unwrap();
+        fs::create_dir_all(&special_sibling).unwrap();
+        assert!(graph
+            .write_projection_exact(
+                "pages/SpecialSibling.md",
+                Some(b"- markdown\n"),
+                b"- target\n",
+            )
+            .is_err());
+        assert_eq!(fs::read(&special_sibling_target).unwrap(), b"- markdown\n");
+        assert!(special_sibling.is_dir());
+
         let twin_md = dir.join("pages/Twin.md");
         let twin_org = dir.join("pages/Twin.org");
         fs::write(&twin_md, b"- markdown\n").unwrap();
         fs::write(&twin_org, b"* org\n").unwrap();
-        assert!(graph
+        let proof = graph
             .write_projection_exact("pages/Twin.md", Some(b"- markdown\n"), b"- target\n")
-            .is_err());
-        assert_eq!(fs::read(&twin_md).unwrap(), b"- markdown\n");
+            .unwrap();
+        assert_eq!(proof.bytes(), b"- target\n");
+        assert_eq!(fs::read(&twin_md).unwrap(), b"- target\n");
         assert_eq!(fs::read(&twin_org).unwrap(), b"* org\n");
 
         let _ = fs::remove_dir_all(&dir);
