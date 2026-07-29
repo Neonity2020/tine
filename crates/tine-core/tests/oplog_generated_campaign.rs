@@ -10,9 +10,10 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use tine_core::oplog::simulator::{
-    ByteMutation, DeterministicSimulator, IngressExpectation, InvariantAssertion, ProviderLocation,
-    ProviderSource, ProviderTree, ScheduledAction, ScheduledActionKind, StageExpectation,
-    WireBatch, WireBytes, WireItem,
+    ByteMutation, CoordinatorAction, CoordinatorFault, CoordinatorHandoffState, CoordinatorOracle,
+    CoordinatorReadGate, CoordinatorRunOutcome, CoordinatorSqliteMutation, DeterministicSimulator,
+    IngressExpectation, InvariantAssertion, ProviderLocation, ProviderSource, ProviderTree,
+    ScheduledAction, ScheduledActionKind, StageExpectation, WireBatch, WireBytes, WireItem,
 };
 use tine_core::oplog::{
     AuthorBatch, BatchId, BlockId, BlockLocation, CrdtPeerId, DeviceId, DocumentId,
@@ -23,7 +24,9 @@ use tine_core::oplog::{
 use uuid::Uuid;
 
 const FAST_SEED: u64 = 70_600;
-const FAST_COUNT: u64 = 16;
+/// Twenty consecutive seeds exercise every four-way generated variant in all
+/// five families while remaining small enough for the normal focused target.
+const FAST_COUNT: u64 = 20;
 const FIXTURE_CANDIDATE: &str = "1111111111111111111111111111111111111111";
 const MAX_BURN_IN_COUNT: u64 = 100_000;
 
@@ -89,6 +92,57 @@ fn push(actions: &mut Vec<ScheduledAction>, next: &mut u64, action: ScheduledAct
     *next += 1;
 }
 
+fn coordinator(actions: &mut Vec<ScheduledAction>, next: &mut u64, action: CoordinatorAction) {
+    push(
+        actions,
+        next,
+        ScheduledActionKind::Coordinator {
+            device: "alpha".into(),
+            action,
+        },
+    );
+}
+
+fn authored_object_item(batch_id: BatchId) -> String {
+    // This is the production simulator's dynamic AuthorLocal mailbox name for
+    // object zero. Every non-empty semantic transaction has that object.
+    format!("auth/{batch_id}/object/0")
+}
+
+fn legacy_deliver(
+    actions: &mut Vec<ScheduledAction>,
+    next: &mut u64,
+    device: &str,
+    batch_id: BatchId,
+) {
+    push(
+        actions,
+        next,
+        ScheduledActionKind::LegacyDeliver {
+            device: device.into(),
+            batch_id,
+        },
+    );
+}
+
+fn duplicate_authored_object(
+    actions: &mut Vec<ScheduledAction>,
+    next: &mut u64,
+    device: &str,
+    batch_id: BatchId,
+) {
+    push(
+        actions,
+        next,
+        ScheduledActionKind::DeliverItem {
+            device: device.into(),
+            item_id: authored_object_item(batch_id),
+            mutation: ByteMutation::Exact,
+            expected: Some(IngressExpectation::Accepted),
+        },
+    );
+}
+
 fn batch_id(seed: u64, tag: u64) -> BatchId {
     BatchId::from_uuid(id(seed, 100 + tag))
 }
@@ -148,13 +202,17 @@ fn wire_batch(
     }
 }
 
-/// Produces only the two R6 starter families.  The bit keeps a seed's family
-/// stable without adding a random dependency or a second protocol model.
+/// Selects a stable production-simulator family without a random dependency
+/// or a second protocol model.  `seed / 5` advances each family's variant
+/// independently in consecutive five-seed corpus rounds.
 fn generate(seed: u64) -> Scenario {
-    if seed & 1 == 0 {
-        generated_transport(seed)
-    } else {
-        generated_independent_page_edits(seed)
+    match seed % 5 {
+        0 => generated_transport(seed),
+        1 => generated_independent_page_edits(seed),
+        2 => generated_same_target_conflicts(seed),
+        3 => generated_external_reconciliation(seed),
+        4 => generated_sqlite_rebuild(seed),
+        _ => unreachable!("seed modulo five is always within the family range"),
     }
 }
 
@@ -459,6 +517,671 @@ fn generated_independent_page_edits(seed: u64) -> Scenario {
     .expect("generated independent-edit schedule is valid")
 }
 
+fn same_target_root(ids: Ids) -> OperationTransaction {
+    transaction(vec![
+        SemanticOperation::CreatePage {
+            page_id: ids.page_a,
+            home_document_id: ids.home_a,
+            name: tine_core::oplog::LogicalPageName::parse("Generated target").unwrap(),
+            path: path("pages/generated-target.md"),
+            kind: ManagedTextKind::Page,
+        },
+        SemanticOperation::CreateBlock {
+            block: BlockLocation {
+                block_id: ids.block_a,
+                home_document_id: ids.home_a,
+            },
+            page_id: ids.page_a,
+            parent: None,
+            order: "a".into(),
+            content: "generated target base".into(),
+        },
+        SemanticOperation::CreatePage {
+            page_id: ids.page_b,
+            home_document_id: ids.home_b,
+            name: tine_core::oplog::LogicalPageName::parse("Generated referrer").unwrap(),
+            path: path("pages/generated-referrer.md"),
+            kind: ManagedTextKind::Page,
+        },
+        SemanticOperation::CreateBlock {
+            block: BlockLocation {
+                block_id: ids.block_b,
+                home_document_id: ids.home_b,
+            },
+            page_id: ids.page_b,
+            parent: None,
+            order: "a".into(),
+            content: "referrer [[Generated target]]".into(),
+        },
+    ])
+}
+
+/// Covers the R6 same-target families through ordinary local transactions and
+/// raw simulator deliveries.  Gamma and delta deliberately receive the two
+/// concurrent batches in opposing orders; both also see one duplicate.
+fn generated_same_target_conflicts(seed: u64) -> Scenario {
+    let ids = Ids::for_seed(seed);
+    let root = batch_id(seed, 20);
+    let alpha_change = batch_id(seed, 21);
+    let beta_change = batch_id(seed, 22);
+    let variant = ((seed / 5) % 4) as u8;
+    let target = BlockLocation {
+        block_id: ids.block_a,
+        home_document_id: ids.home_a,
+    };
+    let (alpha_transaction, beta_transaction) = match variant {
+        // Same-block text/text.
+        0 => (
+            transaction(vec![SemanticOperation::EditBlockContent {
+                block: target,
+                content: format!("alpha same-block text {seed}"),
+            }]),
+            transaction(vec![SemanticOperation::EditBlockContent {
+                block: target,
+                content: format!("beta same-block text {seed}"),
+            }]),
+        ),
+        // Edit/delete at the original owner location.
+        1 => (
+            transaction(vec![SemanticOperation::EditBlockContent {
+                block: target,
+                content: format!("alpha edit before delete {seed}"),
+            }]),
+            transaction(vec![SemanticOperation::DeleteSubtree {
+                root_block_id: ids.block_a,
+                page_id: ids.page_a,
+            }]),
+        ),
+        // Move/delete at the original owner location.
+        2 => (
+            transaction(vec![SemanticOperation::MoveSubtree {
+                root: target,
+                from_page_id: ids.page_a,
+                to_page_id: ids.page_b,
+                parent: None,
+                order: format!("moved-{seed}"),
+            }]),
+            transaction(vec![SemanticOperation::DeleteSubtree {
+                root_block_id: ids.block_a,
+                page_id: ids.page_a,
+            }]),
+        ),
+        // Rename/rewritten referrer concurrent with an ordinary referrer edit.
+        3 => {
+            let renamed = format!("Generated target {seed}");
+            (
+                transaction(vec![SemanticOperation::RenamePagesAndRewriteReferrers {
+                    page_changes: vec![tine_core::oplog::PageRename {
+                        page_id: ids.page_a,
+                        new_name: tine_core::oplog::LogicalPageName::parse(&renamed).unwrap(),
+                        new_path: path(&format!("pages/generated-target-{seed}.md")),
+                    }],
+                    block_rewrites: vec![tine_core::oplog::BlockContentRewrite {
+                        block: BlockLocation {
+                            block_id: ids.block_b,
+                            home_document_id: ids.home_b,
+                        },
+                        new_content: format!("referrer [[{renamed}]]"),
+                    }],
+                    page_preamble_rewrites: Vec::new(),
+                }]),
+                transaction(vec![SemanticOperation::EditBlockContent {
+                    block: BlockLocation {
+                        block_id: ids.block_b,
+                        home_document_id: ids.home_b,
+                    },
+                    content: format!("beta referrer edit [[Generated target]] {seed}"),
+                }]),
+            )
+        }
+        _ => unreachable!("same-target variant is modulo four"),
+    };
+
+    let mut actions = Vec::new();
+    let mut next = 1;
+    push(
+        &mut actions,
+        &mut next,
+        ScheduledActionKind::AuthorLocal {
+            device: "alpha".into(),
+            batch_id: root,
+            session_id: session_id(seed, 20),
+            transaction: same_target_root(ids),
+        },
+    );
+    for device in ["beta", "gamma", "delta"] {
+        legacy_deliver(&mut actions, &mut next, device, root);
+    }
+    push(
+        &mut actions,
+        &mut next,
+        ScheduledActionKind::AuthorLocal {
+            device: "alpha".into(),
+            batch_id: alpha_change,
+            session_id: session_id(seed, 21),
+            transaction: alpha_transaction,
+        },
+    );
+    push(
+        &mut actions,
+        &mut next,
+        ScheduledActionKind::AuthorLocal {
+            device: "beta".into(),
+            batch_id: beta_change,
+            session_id: session_id(seed, 22),
+            transaction: beta_transaction,
+        },
+    );
+
+    if variant & 1 == 0 {
+        duplicate_authored_object(&mut actions, &mut next, "gamma", alpha_change);
+        legacy_deliver(&mut actions, &mut next, "gamma", alpha_change);
+        legacy_deliver(&mut actions, &mut next, "gamma", beta_change);
+        duplicate_authored_object(&mut actions, &mut next, "delta", beta_change);
+        legacy_deliver(&mut actions, &mut next, "delta", beta_change);
+        legacy_deliver(&mut actions, &mut next, "delta", alpha_change);
+    } else {
+        duplicate_authored_object(&mut actions, &mut next, "gamma", beta_change);
+        legacy_deliver(&mut actions, &mut next, "gamma", beta_change);
+        legacy_deliver(&mut actions, &mut next, "gamma", alpha_change);
+        duplicate_authored_object(&mut actions, &mut next, "delta", alpha_change);
+        legacy_deliver(&mut actions, &mut next, "delta", alpha_change);
+        legacy_deliver(&mut actions, &mut next, "delta", beta_change);
+    }
+    duplicate_authored_object(&mut actions, &mut next, "alpha", beta_change);
+    legacy_deliver(&mut actions, &mut next, "alpha", beta_change);
+    duplicate_authored_object(&mut actions, &mut next, "beta", alpha_change);
+    legacy_deliver(&mut actions, &mut next, "beta", alpha_change);
+    push(
+        &mut actions,
+        &mut next,
+        ScheduledActionKind::AssertInvariant {
+            assertion: InvariantAssertion::Converged {
+                devices: vec![
+                    "alpha".into(),
+                    "beta".into(),
+                    "gamma".into(),
+                    "delta".into(),
+                ],
+            },
+        },
+    );
+
+    Scenario::from_schedule(
+        "r6-generated-same-target-conflicts-v1",
+        seed,
+        workspace(ids),
+        vec![
+            device("alpha", 1),
+            device("beta", 2),
+            device("gamma", 3),
+            device("delta", 4),
+        ],
+        Vec::new(),
+        Vec::new(),
+        actions,
+        Vec::new(),
+        Vec::new(),
+    )
+    .expect("generated same-target conflict schedule is valid")
+}
+
+fn completed_coordinator_oracle(sequence: u64) -> CoordinatorOracle {
+    CoordinatorOracle {
+        accepted_sequence: Some(sequence),
+        sqlite_sequence: Some(sequence),
+        frontiers_match: Some(true),
+        pending_projection_work: Some(0),
+        tail_unapplied_batches: Some(0),
+        tail_retained_bytes: Some(0),
+        handoff: Some(CoordinatorHandoffState::Released),
+        read_gate: Some(CoordinatorReadGate::Open),
+        last_outcome: Some(CoordinatorRunOutcome::Complete),
+        ..CoordinatorOracle::default()
+    }
+}
+
+fn generated_external_reconciliation(seed: u64) -> Scenario {
+    let ids = Ids::for_seed(seed);
+    let variant = ((seed / 5) % 4) as u8;
+    let extension = if variant & 1 == 0 { "md" } else { "org" };
+    let line_ending = if variant & 2 == 0 { "\n" } else { "\r\n" };
+    let old = format!("content/pages/研究/über/r6-generated-{seed}.{extension}");
+    let new = format!("content/pages/研究/über/renamed-{seed}.{extension}");
+    let source = if extension == "md" {
+        format!("- external markdown {seed}{line_ending}\t- nested{line_ending}")
+    } else {
+        format!("* external org {seed}{line_ending}** nested{line_ending}")
+    };
+    let source = WireBytes(source.into_bytes());
+    let mut actions = Vec::new();
+    let mut next = 1;
+
+    coordinator(
+        &mut actions,
+        &mut next,
+        CoordinatorAction::Setup {
+            managed_path: old.clone(),
+            kind: ManagedTextKind::Page,
+            config_edn: Some(WireBytes(
+                b"{:pages-directory \"content/pages\"\n:journals-directory \"content/journals\"}\n"
+                    .to_vec(),
+            )),
+        },
+    );
+    match variant {
+        // Markdown/LF external write and an explicit no-op durable checkpoint.
+        0 => {
+            coordinator(
+                &mut actions,
+                &mut next,
+                CoordinatorAction::ExternalWrite {
+                    path: old.clone(),
+                    bytes_b64: source,
+                },
+            );
+            coordinator(
+                &mut actions,
+                &mut next,
+                CoordinatorAction::Execute {
+                    paths: vec![old.clone()],
+                    fault: None,
+                },
+            );
+            coordinator(
+                &mut actions,
+                &mut next,
+                CoordinatorAction::Assert {
+                    oracle: completed_coordinator_oracle(2),
+                },
+            );
+            coordinator(
+                &mut actions,
+                &mut next,
+                CoordinatorAction::Checkpoint {
+                    name: "external-written".into(),
+                },
+            );
+            coordinator(
+                &mut actions,
+                &mut next,
+                CoordinatorAction::Execute {
+                    paths: vec![old],
+                    fault: None,
+                },
+            );
+            coordinator(
+                &mut actions,
+                &mut next,
+                CoordinatorAction::AssertDurableCheckpoint {
+                    name: "external-written".into(),
+                },
+            );
+        }
+        // Org/LF rename keeps both old and new paths in the production plan.
+        1 => {
+            coordinator(
+                &mut actions,
+                &mut next,
+                CoordinatorAction::ExternalRename {
+                    from_path: old.clone(),
+                    to_path: new.clone(),
+                },
+            );
+            coordinator(
+                &mut actions,
+                &mut next,
+                CoordinatorAction::Execute {
+                    paths: vec![old, new.clone()],
+                    fault: None,
+                },
+            );
+            coordinator(
+                &mut actions,
+                &mut next,
+                CoordinatorAction::Assert {
+                    oracle: completed_coordinator_oracle(2),
+                },
+            );
+            coordinator(
+                &mut actions,
+                &mut next,
+                CoordinatorAction::Checkpoint {
+                    name: "external-renamed".into(),
+                },
+            );
+            coordinator(
+                &mut actions,
+                &mut next,
+                CoordinatorAction::Execute {
+                    paths: vec![new],
+                    fault: None,
+                },
+            );
+            coordinator(
+                &mut actions,
+                &mut next,
+                CoordinatorAction::AssertDurableCheckpoint {
+                    name: "external-renamed".into(),
+                },
+            );
+        }
+        // Markdown/CRLF deletion must end with the meaningful empty image.
+        2 => {
+            coordinator(
+                &mut actions,
+                &mut next,
+                CoordinatorAction::ExternalDelete { path: old.clone() },
+            );
+            coordinator(
+                &mut actions,
+                &mut next,
+                CoordinatorAction::Execute {
+                    paths: vec![old.clone()],
+                    fault: None,
+                },
+            );
+            let mut deleted = completed_coordinator_oracle(2);
+            deleted.managed_files = Some(Vec::new());
+            coordinator(
+                &mut actions,
+                &mut next,
+                CoordinatorAction::Assert { oracle: deleted },
+            );
+            coordinator(
+                &mut actions,
+                &mut next,
+                CoordinatorAction::Checkpoint {
+                    name: "external-deleted".into(),
+                },
+            );
+            coordinator(
+                &mut actions,
+                &mut next,
+                CoordinatorAction::Execute {
+                    paths: vec![old],
+                    fault: None,
+                },
+            );
+            coordinator(
+                &mut actions,
+                &mut next,
+                CoordinatorAction::AssertDurableCheckpoint {
+                    name: "external-deleted".into(),
+                },
+            );
+        }
+        // Org/CRLF write interrupted during projection, then crash/reopen and
+        // production retry of the persisted continuation.
+        3 => {
+            coordinator(
+                &mut actions,
+                &mut next,
+                CoordinatorAction::ExternalWrite {
+                    path: old.clone(),
+                    bytes_b64: source,
+                },
+            );
+            coordinator(
+                &mut actions,
+                &mut next,
+                CoordinatorAction::Execute {
+                    paths: vec![old],
+                    fault: Some(CoordinatorFault::DuringProjection),
+                },
+            );
+            coordinator(
+                &mut actions,
+                &mut next,
+                CoordinatorAction::Assert {
+                    oracle: CoordinatorOracle {
+                        accepted_sequence: Some(2),
+                        sqlite_sequence: Some(2),
+                        frontiers_match: Some(true),
+                        pending_projection_work: Some(1),
+                        tail_unapplied_batches: Some(0),
+                        tail_retained_bytes: Some(0),
+                        handoff: Some(CoordinatorHandoffState::HeldFailedClosed),
+                        read_gate: Some(CoordinatorReadGate::Open),
+                        durable_boundary: Some(
+                            tine_core::oplog::CoordinatorDurableBoundary::DuringProjection,
+                        ),
+                        last_outcome: Some(CoordinatorRunOutcome::FailedClosed {
+                            phase: "ProjectionDrain".into(),
+                        }),
+                        ..CoordinatorOracle::default()
+                    },
+                },
+            );
+            coordinator(&mut actions, &mut next, CoordinatorAction::Crash);
+            coordinator(
+                &mut actions,
+                &mut next,
+                CoordinatorAction::Assert {
+                    oracle: CoordinatorOracle {
+                        handoff: Some(CoordinatorHandoffState::EnrollmentPendingUnprotected),
+                        durable_boundary: Some(
+                            tine_core::oplog::CoordinatorDurableBoundary::DuringProjection,
+                        ),
+                        ..CoordinatorOracle::default()
+                    },
+                },
+            );
+            coordinator(&mut actions, &mut next, CoordinatorAction::Reopen);
+            coordinator(
+                &mut actions,
+                &mut next,
+                CoordinatorAction::Retry { fault: None },
+            );
+            coordinator(
+                &mut actions,
+                &mut next,
+                CoordinatorAction::Assert {
+                    oracle: CoordinatorOracle {
+                        accepted_sequence: Some(2),
+                        sqlite_sequence: Some(2),
+                        frontiers_match: Some(true),
+                        pending_projection_work: Some(0),
+                        tail_unapplied_batches: Some(0),
+                        tail_retained_bytes: Some(0),
+                        handoff: Some(CoordinatorHandoffState::EnrollmentPendingUnprotected),
+                        read_gate: Some(CoordinatorReadGate::Open),
+                        last_outcome: Some(CoordinatorRunOutcome::Complete),
+                        ..CoordinatorOracle::default()
+                    },
+                },
+            );
+            coordinator(
+                &mut actions,
+                &mut next,
+                CoordinatorAction::Checkpoint {
+                    name: "external-crash-recovered".into(),
+                },
+            );
+            coordinator(
+                &mut actions,
+                &mut next,
+                CoordinatorAction::Retry { fault: None },
+            );
+            coordinator(
+                &mut actions,
+                &mut next,
+                CoordinatorAction::AssertCheckpoint {
+                    name: "external-crash-recovered".into(),
+                },
+            );
+        }
+        _ => unreachable!("external reconciliation variant is modulo four"),
+    }
+
+    Scenario::from_schedule(
+        "r6-generated-coordinator-external-v1",
+        seed,
+        workspace(ids),
+        vec![device("alpha", 1)],
+        Vec::new(),
+        Vec::new(),
+        actions,
+        Vec::new(),
+        Vec::new(),
+    )
+    .expect("generated external coordinator schedule is valid")
+}
+
+fn generated_sqlite_rebuild(seed: u64) -> Scenario {
+    let ids = Ids::for_seed(seed);
+    let variant = ((seed / 5) % 4) as u8;
+    let (mutation, interruption) = match variant {
+        0 => (
+            CoordinatorSqliteMutation::Delete,
+            CoordinatorFault::DuringSqliteApply,
+        ),
+        1 => (
+            CoordinatorSqliteMutation::Truncate { len: 0 },
+            CoordinatorFault::AfterSqliteApply,
+        ),
+        2 => (
+            CoordinatorSqliteMutation::Corrupt {
+                offset: 0,
+                mask: 0xff,
+            },
+            CoordinatorFault::BeforeProjection,
+        ),
+        3 => (
+            CoordinatorSqliteMutation::StaleFrontier,
+            CoordinatorFault::DuringProjection,
+        ),
+        _ => unreachable!("SQLite variant is modulo four"),
+    };
+    let path = format!("content/pages/研究/derived/r6-sqlite-{seed}.md");
+    let first = WireBytes(format!("- SQLite baseline {seed}\n\t- nested\n").into_bytes());
+    let interrupted = WireBytes(format!("- SQLite interrupted {seed}\n\t- nested\n").into_bytes());
+    let mut actions = Vec::new();
+    let mut next = 1;
+
+    coordinator(
+        &mut actions,
+        &mut next,
+        CoordinatorAction::Setup {
+            managed_path: path.clone(),
+            kind: ManagedTextKind::Page,
+            config_edn: Some(WireBytes(
+                b"{:pages-directory \"content/pages\"\n:journals-directory \"content/journals\"}\n"
+                    .to_vec(),
+            )),
+        },
+    );
+    coordinator(
+        &mut actions,
+        &mut next,
+        CoordinatorAction::ExternalWrite {
+            path: path.clone(),
+            bytes_b64: first,
+        },
+    );
+    coordinator(
+        &mut actions,
+        &mut next,
+        CoordinatorAction::Execute {
+            paths: vec![path.clone()],
+            fault: None,
+        },
+    );
+    coordinator(
+        &mut actions,
+        &mut next,
+        CoordinatorAction::Assert {
+            oracle: completed_coordinator_oracle(2),
+        },
+    );
+    coordinator(
+        &mut actions,
+        &mut next,
+        CoordinatorAction::ExternalWrite {
+            path: path.clone(),
+            bytes_b64: interrupted,
+        },
+    );
+    coordinator(
+        &mut actions,
+        &mut next,
+        CoordinatorAction::Execute {
+            paths: vec![path.clone()],
+            fault: Some(interruption),
+        },
+    );
+    coordinator(
+        &mut actions,
+        &mut next,
+        CoordinatorAction::Retry { fault: None },
+    );
+    coordinator(
+        &mut actions,
+        &mut next,
+        CoordinatorAction::Assert {
+            oracle: completed_coordinator_oracle(3),
+        },
+    );
+    coordinator(
+        &mut actions,
+        &mut next,
+        CoordinatorAction::Checkpoint {
+            name: "saved-materialization".into(),
+        },
+    );
+    coordinator(
+        &mut actions,
+        &mut next,
+        CoordinatorAction::Sqlite { mutation },
+    );
+    coordinator(
+        &mut actions,
+        &mut next,
+        CoordinatorAction::Assert {
+            oracle: CoordinatorOracle {
+                accepted_sequence: Some(3),
+                frontiers_match: Some(false),
+                read_gate: Some(CoordinatorReadGate::Closed),
+                ..CoordinatorOracle::default()
+            },
+        },
+    );
+    coordinator(
+        &mut actions,
+        &mut next,
+        CoordinatorAction::Sqlite {
+            mutation: CoordinatorSqliteMutation::Reopen,
+        },
+    );
+    coordinator(
+        &mut actions,
+        &mut next,
+        CoordinatorAction::AssertAcceptedArchiveCheckpoint {
+            name: "saved-materialization".into(),
+        },
+    );
+    coordinator(
+        &mut actions,
+        &mut next,
+        CoordinatorAction::AssertMaterializationCheckpoint {
+            name: "saved-materialization".into(),
+        },
+    );
+
+    Scenario::from_schedule(
+        "r6-generated-coordinator-sqlite-rebuild-v1",
+        seed,
+        workspace(ids),
+        vec![device("alpha", 1)],
+        Vec::new(),
+        Vec::new(),
+        actions,
+        Vec::new(),
+        Vec::new(),
+    )
+    .expect("generated SQLite rebuild schedule is valid")
+}
+
 struct CampaignResult {
     count: u64,
     elapsed: Duration,
@@ -606,9 +1329,10 @@ fn required_env_u64(name: &str) -> u64 {
         .unwrap_or_else(|_| panic!("{name} must be an unsigned decimal integer"))
 }
 
-fn report(label: &str, seed: u64, result: &CampaignResult) {
+fn report(label: &str, seed: u64, result: &CampaignResult, frozen_candidate: &FrozenCandidateId) {
     println!(
-        "r6 generated campaign {label}: seed={seed} count={} runtime_ms={} scenarios_per_second={:.2}",
+        "r6 generated campaign {label}: frozen_candidate={} seed={seed} count={} runtime_ms={} scenarios_per_second={:.2}",
+        frozen_candidate.as_str(),
         result.count,
         result.elapsed.as_millis(),
         result.scenarios_per_second(),
@@ -617,25 +1341,30 @@ fn report(label: &str, seed: u64, result: &CampaignResult) {
 
 #[test]
 fn generated_campaign_fast_default() {
-    let result = run_campaign(FAST_SEED, FAST_COUNT, &fixture_candidate());
-    report("fast", FAST_SEED, &result);
+    let frozen_candidate = fixture_candidate();
+    let result = run_campaign(FAST_SEED, FAST_COUNT, &frozen_candidate);
+    report("fast", FAST_SEED, &result, &frozen_candidate);
 }
 
 #[test]
 fn generated_campaign_is_byte_identical_per_seed() {
-    for seed in [0, 1, FAST_SEED, FAST_SEED + 1, u64::MAX] {
-        assert_eq!(
-            generate(seed).encode().unwrap(),
-            generate(seed).encode().unwrap(),
-            "seed {seed} was not byte-identical",
-        );
+    for base in [0, FAST_SEED, 81_920, u64::MAX - (FAST_COUNT - 1)] {
+        for offset in 0..FAST_COUNT {
+            let seed = base + offset;
+            assert_eq!(
+                generate(seed).encode().unwrap(),
+                generate(seed).encode().unwrap(),
+                "seed {seed} was not byte-identical",
+            );
+        }
     }
 }
 
 #[test]
 fn generated_campaign_known_seed_range_replays_green() {
-    let result = run_campaign(81_920, 8, &fixture_candidate());
-    report("known-range", 81_920, &result);
+    let frozen_candidate = fixture_candidate();
+    let result = run_campaign(81_920, FAST_COUNT, &frozen_candidate);
+    report("known-range", 81_920, &result, &frozen_candidate);
 }
 
 #[test]
@@ -648,6 +1377,10 @@ fn generated_campaign_burn_in() {
         (1..=MAX_BURN_IN_COUNT).contains(&count),
         "TINE_R6_CAMPAIGN_COUNT must be within 1..={MAX_BURN_IN_COUNT}",
     );
+    assert!(
+        seed.checked_add(count - 1).is_some(),
+        "TINE_R6_CAMPAIGN_SEED plus TINE_R6_CAMPAIGN_COUNT must not wrap",
+    );
     let result = run_campaign(seed, count, &frozen_candidate);
-    report("burn-in", seed, &result);
+    report("burn-in", seed, &result, &frozen_candidate);
 }
