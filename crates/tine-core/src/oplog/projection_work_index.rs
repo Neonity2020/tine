@@ -2191,6 +2191,58 @@ impl ProjectionWorkIndex {
         self.proof_for_committed_completion(&committed, receipt)
     }
 
+    /// Replace the one authenticated current-path receipt with a new exact-byte
+    /// receipt at the same semantic frontier. `prior` is obtained by an
+    /// authenticated point read and is rechecked under the transition lock, so
+    /// this lane cannot resolve an ambiguity or supersede semantic state.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn mark_formatting_adopted(
+        &self,
+        authority: ProjectionDirectCompletionAuthority,
+        prior: &ProjectionCompletedReceipt,
+    ) -> Result<Option<DurablyPublishedProjectionCompletion>, ProjectionWorkError> {
+        if authority.workspace_id != self.workspace_id
+            || authority.endpoint_id != self.endpoint_id
+            || authority.graph_resource_id != self.graph_resource_id
+            || authority.receipt_store_id != self.receipt_store_id
+            || prior.path() != authority.receipt.path()
+        {
+            return Err(ProjectionWorkError::BindingMismatch);
+        }
+        let (committed, receipt) = self.transition_with_output(|index, _, mut root| {
+            if root.engine_history_generation != authority.engine_history_generation
+                || root.engine_history_root != authority.engine_history_root
+                || authority.engine_history_generation == 0
+                || authority.engine_history_root
+                    == super::object_store::EngineHistoryStore::empty_root()
+            {
+                return Err(ProjectionWorkError::HistoryBindingMismatch);
+            }
+            let key = path_key(authority.receipt.path());
+            let existing = index
+                .tree_lookup(root.completed_paths_root, &key)?
+                .map(|bytes| decode_completed_path_row(&key, &bytes))
+                .transpose()?;
+            let Some(ProjectionCompletedPathRow::Current(current)) = existing else {
+                return Err(ProjectionWorkError::AmbiguousCompletedPath);
+            };
+            if current.receipt != *prior
+                || !ProjectionCompletedPathRow::Current(current.clone())
+                    .state_matches(&authority.receipt)
+            {
+                return Err(ProjectionWorkError::ConflictingStatus);
+            }
+            let next_row = direct_completed_path_row(&authority);
+            root.completed_paths_root = index.tree_insert(
+                root.completed_paths_root,
+                key,
+                encode_completed_path_row(&next_row)?,
+            )?;
+            Ok((root, authority.receipt.clone()))
+        })?;
+        self.proof_for_committed_completion(&committed, receipt)
+    }
+
     #[allow(clippy::result_large_err)]
     pub(crate) fn mark_blocked(
         &self,

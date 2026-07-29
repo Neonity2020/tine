@@ -29,7 +29,7 @@ use super::{
     ProjectionWorkBlockAuthority, ProjectionWorkIndex, ProjectionWorkStatus, ProjectionWorkTarget,
     ReceiptError, ShardedHotEngine, StructuralLocator, StructuralSpan, WorkspaceId,
 };
-use crate::doc::{DocBlock, Document, SerializeOpts};
+use crate::doc::{DocBlock, Document, SerializeOpts, StructuralLayoutIdentity};
 use crate::model::ProjectionRecoveryCleanup;
 use crate::oplog::projection_store::MAX_PENDING_PROJECTION_CLEANUP_PER_PASS;
 use crate::Graph;
@@ -39,6 +39,8 @@ thread_local! {
     // projection boundary: intent and attempt authority are durable, but the
     // graph mutation has not started.
     static HARNESS_FAIL_DURING_MANIFESTED_PROJECTION: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    static HARNESS_FAIL_AFTER_FORMATTING_INTENT: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
 }
 
@@ -64,11 +66,27 @@ pub(crate) fn fail_next_manifested_projection_during_write_for_harness(
     ManifestedProjectionFaultScope { previously_armed }
 }
 
+pub(crate) fn fail_next_formatting_adoption_after_intent_for_harness() {
+    HARNESS_FAIL_AFTER_FORMATTING_INTENT.with(|fail| fail.set(true));
+}
+
 fn fail_during_manifested_projection_for_harness() -> Result<(), ProjectionError> {
     HARNESS_FAIL_DURING_MANIFESTED_PROJECTION.with(|fail| {
         if fail.replace(false) {
             Err(ProjectionError::Work(
                 "deterministic failure during manifested projection".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    })
+}
+
+fn fail_after_formatting_intent_for_harness() -> Result<(), ProjectionError> {
+    HARNESS_FAIL_AFTER_FORMATTING_INTENT.with(|fail| {
+        if fail.replace(false) {
+            Err(ProjectionError::Work(
+                "deterministic failure after formatting-only intent".into(),
             ))
         } else {
             Ok(())
@@ -110,6 +128,7 @@ pub struct ProjectionPlan {
     intent: ProjectionIntent,
     base: Option<BaseBlob>,
     target: Vec<u8>,
+    guarded_layout: GuardedProjectionLayout,
     generated_anchors: Vec<PolicyGeneratedAnchor>,
 }
 
@@ -124,6 +143,10 @@ impl ProjectionPlan {
 
     fn base(&self) -> Option<&BaseBlob> {
         self.base.as_ref()
+    }
+
+    fn guarded_layout(&self) -> &GuardedProjectionLayout {
+        &self.guarded_layout
     }
 
     pub fn generated_anchors(&self) -> &[PolicyGeneratedAnchor] {
@@ -144,7 +167,90 @@ pub struct ProjectionWrite {
 struct RenderedProjection {
     target: Vec<u8>,
     annotations: Vec<AnnotatedIdentity>,
+    base_layout_identities: Vec<StructuralLayoutIdentity>,
     generated_anchors: Vec<PolicyGeneratedAnchor>,
+}
+
+/// Identity-bound formatting authority carried from the pure planner (or an
+/// authenticated manifested base/target pair) into Graph's singular guarded
+/// serializer. Construction stays private to this module so raw target bytes
+/// cannot nominate their own identity mapping at the mutation boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GuardedProjectionLayout {
+    base: Vec<StructuralLayoutIdentity>,
+    target: Vec<StructuralLayoutIdentity>,
+}
+
+impl GuardedProjectionLayout {
+    fn new(base: Vec<StructuralLayoutIdentity>, target_annotations: &[AnnotatedIdentity]) -> Self {
+        Self {
+            base,
+            target: structural_layout_identities(target_annotations),
+        }
+    }
+
+    fn from_authenticated_annotations(
+        base_annotations: Option<&[AnnotatedIdentity]>,
+        target_annotations: &[AnnotatedIdentity],
+    ) -> Self {
+        Self::new(
+            base_annotations.map_or_else(Vec::new, structural_layout_identities),
+            target_annotations,
+        )
+    }
+
+    pub(crate) fn empty() -> Self {
+        Self {
+            base: Vec::new(),
+            target: Vec::new(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn canonical_for_test(document: &Document) -> Self {
+        fn collect(
+            blocks: &[DocBlock],
+            locator: &mut Vec<u32>,
+            identities: &mut Vec<StructuralLayoutIdentity>,
+        ) {
+            for (position, block) in blocks.iter().enumerate() {
+                locator.push(u32::try_from(position).expect("test projection tree is too wide"));
+                identities.push(StructuralLayoutIdentity {
+                    locator: locator.clone(),
+                    block_identity: format!("test-projection-{}", identities.len()),
+                });
+                collect(&block.children, locator, identities);
+                locator.pop();
+            }
+        }
+
+        let mut target = Vec::new();
+        collect(&document.roots, &mut Vec::new(), &mut target);
+        Self {
+            base: Vec::new(),
+            target,
+        }
+    }
+
+    pub(crate) fn base(&self) -> &[StructuralLayoutIdentity] {
+        &self.base
+    }
+
+    pub(crate) fn target(&self) -> &[StructuralLayoutIdentity] {
+        &self.target
+    }
+}
+
+fn structural_layout_identities(
+    annotations: &[AnnotatedIdentity],
+) -> Vec<StructuralLayoutIdentity> {
+    annotations
+        .iter()
+        .map(|annotation| StructuralLayoutIdentity {
+            locator: annotation.locator().components().to_vec(),
+            block_identity: annotation.block_id().to_string(),
+        })
+        .collect()
 }
 
 /// Build exact projection bytes and receipt annotations without touching disk.
@@ -153,13 +259,24 @@ pub fn plan_projection(
     state: &ProjectionPageState,
     expected_base: Option<&[u8]>,
 ) -> Result<ProjectionPlan, ProjectionError> {
-    let rendered = render_projection(state, expected_base)?;
+    plan_projection_with_layout_annotations(workspace_id, state, expected_base, None)
+}
+
+pub(crate) fn plan_projection_with_layout_annotations(
+    workspace_id: WorkspaceId,
+    state: &ProjectionPageState,
+    expected_base: Option<&[u8]>,
+    expected_base_annotations: Option<&[AnnotatedIdentity]>,
+) -> Result<ProjectionPlan, ProjectionError> {
+    let rendered = render_projection(state, expected_base, expected_base_annotations)?;
     let base = expected_base.map(|bytes| BaseBlob::new(bytes.to_vec()));
     let precondition = base
         .as_ref()
         .map_or(ProjectionPrecondition::Absent, |base| {
             ProjectionPrecondition::Base(base.description())
         });
+    let guarded_layout =
+        GuardedProjectionLayout::new(rendered.base_layout_identities, &rendered.annotations);
     let intent = ProjectionIntent::new(
         workspace_id,
         state.page.page_id,
@@ -174,6 +291,7 @@ pub fn plan_projection(
         intent,
         base,
         target: rendered.target,
+        guarded_layout,
         generated_anchors: rendered.generated_anchors,
     })
 }
@@ -181,6 +299,7 @@ pub fn plan_projection(
 fn render_projection(
     state: &ProjectionPageState,
     expected_base: Option<&[u8]>,
+    expected_base_annotations: Option<&[AnnotatedIdentity]>,
 ) -> Result<RenderedProjection, ProjectionError> {
     let format = format_for_page(&state.page)?;
     let base_text = expected_base
@@ -195,11 +314,19 @@ fn render_projection(
         ProjectionRenderMode::Sparse,
         Some(&mut metadata),
     )?;
-    let target = serialize_document(format, &document, base_text).into_bytes();
+    let layout_identities = projection_layout_identities(
+        format,
+        &document,
+        base_text,
+        expected_base_annotations,
+        &metadata.pending_annotations,
+    );
+    let target = serialize_document(format, &document, base_text, &layout_identities).into_bytes();
     let annotations = annotate_serialized_blocks(
         format,
         &document,
         base_text,
+        &layout_identities,
         &target,
         &metadata.pending_annotations,
     )?;
@@ -209,6 +336,7 @@ fn render_projection(
     Ok(RenderedProjection {
         target,
         annotations,
+        base_layout_identities: layout_identities,
         generated_anchors: metadata.generated_anchors,
     })
 }
@@ -230,7 +358,7 @@ fn render_dense_projection_bytes(
         ProjectionRenderMode::DenseInstrumentation,
         None,
     )?;
-    Ok(serialize_document(format, &document, base_text).into_bytes())
+    Ok(serialize_document(format, &document, base_text, &[]).into_bytes())
 }
 
 fn build_projection_document(
@@ -349,6 +477,7 @@ pub(crate) fn execute_receiver_local_projection_under_handoff(
             intent,
             base,
             target: Vec::new(),
+            guarded_layout: GuardedProjectionLayout::empty(),
             generated_anchors: Vec::new(),
         }
     } else {
@@ -385,11 +514,12 @@ pub(crate) fn execute_receiver_local_projection_under_handoff(
                     &mut authority,
                 )?
             } else {
-                handoff.recover_page_projection(
+                handoff.recover_page_projection_with_layout(
                     graph,
                     plan.intent().path().as_str(),
                     plan.base().map(BaseBlob::bytes),
                     plan.target(),
+                    plan.guarded_layout(),
                     &mut authority,
                 )?
             }
@@ -408,11 +538,12 @@ pub(crate) fn execute_receiver_local_projection_under_handoff(
                 )?,
             }
         } else {
-            handoff.write_page_projection(
+            handoff.write_page_projection_with_layout(
                 graph,
                 plan.intent().path().as_str(),
                 local_base.as_deref(),
                 plan.target(),
+                plan.guarded_layout(),
                 &mut authority,
             )?
         };
@@ -579,6 +710,16 @@ fn execute_manifested_projection_work_with_runtime(
             )
         }
     };
+    let guarded_layout = if target.is_some() {
+        GuardedProjectionLayout::from_authenticated_annotations(
+            expected_base
+                .as_ref()
+                .map(AnnotatedProjectionBase::annotations),
+            &annotations,
+        )
+    } else {
+        GuardedProjectionLayout::empty()
+    };
     let local_attempt_intent = ProjectionIntent::new(
         manifested.workspace_id(),
         manifested.page_id(),
@@ -612,17 +753,19 @@ fn execute_manifested_projection_work_with_runtime(
     } else {
         let mut authority = receipts.begin_mutation(&local_attempt_intent, None)?;
         let result = match (handoff, target) {
-            (Some(handoff), Some(target)) => handoff.recover_page_projection(
+            (Some(handoff), Some(target)) => handoff.recover_page_projection_with_layout(
                 graph,
                 manifested.path().as_str(),
                 expected_base.as_ref().map(AnnotatedProjectionBase::bytes),
                 target,
+                &guarded_layout,
                 &mut authority,
             ),
-            (None, Some(target)) => graph.recover_page_projection(
+            (None, Some(target)) => graph.recover_page_projection_with_layout(
                 manifested.path().as_str(),
                 expected_base.as_ref().map(AnnotatedProjectionBase::bytes),
                 target,
+                &guarded_layout,
                 &mut authority,
             ),
             (Some(handoff), None) => {
@@ -685,17 +828,19 @@ fn execute_manifested_projection_work_with_runtime(
                 target.is_some_and(|target| current.as_deref() == Some(target));
             let write_result = if target_is_already_exact {
                 match (handoff, target.expect("exact present target")) {
-                    (Some(handoff), target) => handoff.recover_page_projection(
+                    (Some(handoff), target) => handoff.recover_page_projection_with_layout(
                         graph,
                         manifested.path().as_str(),
                         expected_base.as_ref().map(AnnotatedProjectionBase::bytes),
                         target,
+                        &guarded_layout,
                         &mut authority,
                     ),
-                    (None, target) => graph.recover_page_projection(
+                    (None, target) => graph.recover_page_projection_with_layout(
                         manifested.path().as_str(),
                         expected_base.as_ref().map(AnnotatedProjectionBase::bytes),
                         target,
+                        &guarded_layout,
                         &mut authority,
                     ),
                 }
@@ -709,17 +854,19 @@ fn execute_manifested_projection_work_with_runtime(
                     )
             } else {
                 match (handoff, target) {
-                    (Some(handoff), Some(target)) => handoff.write_page_projection(
+                    (Some(handoff), Some(target)) => handoff.write_page_projection_with_layout(
                         graph,
                         manifested.path().as_str(),
                         expected_base.as_ref().map(AnnotatedProjectionBase::bytes),
                         target,
+                        &guarded_layout,
                         &mut authority,
                     ),
-                    (None, Some(target)) => graph.write_page_projection(
+                    (None, Some(target)) => graph.write_page_projection_with_layout(
                         manifested.path().as_str(),
                         expected_base.as_ref().map(AnnotatedProjectionBase::bytes),
                         target,
+                        &guarded_layout,
                         &mut authority,
                     ),
                     (Some(handoff), None) => {
@@ -785,10 +932,11 @@ pub fn write_projection_exact(
     store.publish_intent(plan.intent(), plan.base().map(BaseBlob::bytes))?;
     let reservation = store.reserve_attempt(plan.intent())?;
     let mut authority = store.begin_mutation(plan.intent(), Some(&reservation))?;
-    let proof = graph.write_page_projection(
+    let proof = graph.write_page_projection_with_layout(
         plan.intent().path().as_str(),
         expected_base,
         plan.target(),
+        plan.guarded_layout(),
         &mut authority,
     )?;
     let completion = store.publish_completion(authority, plan.intent(), &proof)?;
@@ -847,6 +995,61 @@ pub(crate) fn confirm_existing_projection_exact(
     Ok(())
 }
 
+/// Adopt an exact, semantically unchanged external representation as this
+/// endpoint's next projection/import baseline. This publishes only a
+/// device-local intent/base/completion and completed-path point; it does not
+/// author an operation or an operation batch.
+pub(crate) fn adopt_existing_projection_formatting(
+    graph: &Graph,
+    store: &ProjectionReceiptStore,
+    engine: &ShardedHotEngine,
+    handoff: &crate::model::HandoffSafeGuard,
+    page_id: PageId,
+    observed_bytes: &[u8],
+    observed_annotations: &[AnnotatedIdentity],
+) -> Result<(), ProjectionError> {
+    require_endpoint_authority(graph, store, engine)?;
+    let authorization = engine.authorize_projection_write(page_id)?;
+    let current = graph
+        .read_projection_input(&authorization.state().page.path)?
+        .ok_or_else(|| ProjectionError::Work("formatting-only source disappeared".into()))?;
+    if current != observed_bytes {
+        return Err(ProjectionError::Work(
+            "formatting-only source changed after import observation".into(),
+        ));
+    }
+    let plan = plan_projection_with_layout_annotations(
+        engine.workspace_id(),
+        authorization.state(),
+        Some(observed_bytes),
+        Some(observed_annotations),
+    )?;
+    if plan.target() != observed_bytes {
+        return Err(ProjectionError::Work(
+            "formatting-only source is not the exact accepted semantic state".into(),
+        ));
+    }
+    store.publish_intent(plan.intent(), plan.base().map(BaseBlob::bytes))?;
+    fail_after_formatting_intent_for_harness()?;
+    if store.load_completion(plan.intent())?.is_none() {
+        let attempts = store.load_attempt_reservations(plan.intent())?;
+        let mut authority = if attempts.is_empty() {
+            let reservation = store.reserve_attempt(plan.intent())?;
+            store.begin_mutation(plan.intent(), Some(&reservation))?
+        } else {
+            store.begin_mutation(plan.intent(), None)?
+        };
+        let proof = handoff.confirm_existing_page_projection(
+            graph,
+            plan.intent().path().as_str(),
+            plan.target(),
+            &mut authority,
+        )?;
+        store.publish_completion(authority, plan.intent(), &proof)?;
+    }
+    record_adopted_formatting_path(store, engine, page_id, plan.intent())
+}
+
 /// Recover every incomplete intent only when current accepted engine state
 /// replays the exact intent and Graph freshly proves that exact target durable.
 pub fn recover_incomplete_projections(
@@ -865,7 +1068,18 @@ pub fn recover_incomplete_projections(
         )?;
         let base = store.load_base(&intent)?;
         let expected_base = base.as_ref().map(BaseBlob::bytes);
-        let plan = plan_projection(engine.workspace_id(), authorization.state(), expected_base)?;
+        let formatting_adoption =
+            expected_base.is_some_and(|bytes| super::BlobDescription::of(bytes) == intent.target());
+        let plan = if formatting_adoption {
+            plan_projection_with_layout_annotations(
+                engine.workspace_id(),
+                authorization.state(),
+                expected_base,
+                Some(intent.annotations()),
+            )?
+        } else {
+            plan_projection(engine.workspace_id(), authorization.state(), expected_base)?
+        };
         if plan.intent() != &intent {
             return Err(ProjectionError::RecoveryIntentMismatch);
         }
@@ -874,10 +1088,11 @@ pub fn recover_incomplete_projections(
             None
         } else {
             let mut authority = store.begin_mutation(&intent, None)?;
-            let result = graph.recover_page_projection(
+            let result = graph.recover_page_projection_with_layout(
                 intent.path().as_str(),
                 expected_base,
                 plan.target(),
+                plan.guarded_layout(),
                 &mut authority,
             );
             Some((result, authority))
@@ -886,10 +1101,11 @@ pub fn recover_incomplete_projections(
             Some((Ok(proof), authority)) => (proof, authority),
             None => {
                 let mut recovery_authority = store.begin_mutation(&intent, None)?;
-                match graph.recover_page_projection(
+                match graph.recover_page_projection_with_layout(
                     intent.path().as_str(),
                     expected_base,
                     plan.target(),
+                    plan.guarded_layout(),
                     &mut recovery_authority,
                 ) {
                     Ok(proof) => (proof, recovery_authority),
@@ -903,10 +1119,11 @@ pub fn recover_incomplete_projections(
                         let reservation = store.reserve_fallback_attempt(&intent)?;
                         let mut write_authority =
                             store.begin_mutation(&intent, Some(&reservation))?;
-                        let proof = graph.write_page_projection(
+                        let proof = graph.write_page_projection_with_layout(
                             intent.path().as_str(),
                             expected_base,
                             plan.target(),
+                            plan.guarded_layout(),
                             &mut write_authority,
                         )?;
                         (proof, write_authority)
@@ -923,10 +1140,11 @@ pub fn recover_incomplete_projections(
                 recovery_authority.release_failed_recovery()?;
                 let reservation = store.reserve_fallback_attempt(&intent)?;
                 let mut authority = store.begin_mutation(&intent, Some(&reservation))?;
-                let proof = graph.write_page_projection(
+                let proof = graph.write_page_projection_with_layout(
                     intent.path().as_str(),
                     expected_base,
                     plan.target(),
+                    plan.guarded_layout(),
                     &mut authority,
                 )?;
                 (proof, authority)
@@ -938,7 +1156,12 @@ pub fn recover_incomplete_projections(
         // Historical recovery remains compatible and preserves its durable
         // receipt, but a completion that is no longer the current accepted
         // page state must not replace point-addressable import authority.
-        match record_completed_path(store, engine, intent.page_id(), &intent) {
+        let recorded = if formatting_adoption {
+            record_adopted_formatting_path(store, engine, intent.page_id(), &intent)
+        } else {
+            record_completed_path(store, engine, intent.page_id(), &intent)
+        };
+        match recorded {
             Ok(()) | Err(ProjectionError::RecoveryIntentMismatch) => {}
             Err(error) => return Err(error),
         }
@@ -1036,6 +1259,54 @@ fn record_completed_path(
     record_completed_path_with_authorization(store, engine, page_id, intent, false)
 }
 
+fn record_adopted_formatting_path(
+    store: &ProjectionReceiptStore,
+    engine: &ShardedHotEngine,
+    page_id: PageId,
+    intent: &ProjectionIntent,
+) -> Result<(), ProjectionError> {
+    let current = engine.authorize_projection_write(page_id)?;
+    if current.state().page.path != *intent.path()
+        || current.state().frontier != *intent.frontier()
+        || current.state().claim_evidence != intent.claim_evidence()
+    {
+        return Err(ProjectionError::RecoveryIntentMismatch);
+    }
+    let base = store.load_base(intent)?;
+    let Some(base) = base.as_ref() else {
+        return Err(ProjectionError::RecoveryIntentMismatch);
+    };
+    if base.description() != intent.target() {
+        return Err(ProjectionError::RecoveryIntentMismatch);
+    }
+    let replay = plan_projection_with_layout_annotations(
+        engine.workspace_id(),
+        current.state(),
+        Some(base.bytes()),
+        Some(intent.annotations()),
+    )?;
+    if replay.intent() != intent {
+        return Err(ProjectionError::RecoveryIntentMismatch);
+    }
+    let (_, work_index) = engine.enrolled_projection_runtime()?;
+    let prior = work_index
+        .completed_receipts_for_path(intent.path())
+        .map_err(|error| ProjectionError::Work(error.to_string()))?;
+    let [prior] = prior.as_slice() else {
+        return Err(ProjectionError::Work(
+            "formatting adoption requires one exact prior completed-path authority".into(),
+        ));
+    };
+    let (engine_history_generation, engine_history_root) =
+        engine.projection_completion_history_authority()?;
+    let authority =
+        store.completed_direct_authority(intent, engine_history_generation, engine_history_root)?;
+    work_index
+        .mark_formatting_adopted(authority, prior)
+        .map_err(|error| ProjectionError::Work(error.to_string()))?;
+    Ok(())
+}
+
 fn record_bootstrap_completed_path(
     store: &ProjectionReceiptStore,
     engine: &ShardedHotEngine,
@@ -1068,11 +1339,18 @@ fn record_completed_path_with_authorization(
         return Err(ProjectionError::RecoveryIntentMismatch);
     }
     let base = store.load_base(intent)?;
-    let replay = plan_projection(
-        engine.workspace_id(),
-        current.state(),
-        base.as_ref().map(BaseBlob::bytes),
-    )?;
+    let base_bytes = base.as_ref().map(BaseBlob::bytes);
+    let replay =
+        if base_bytes.is_some_and(|bytes| intent.target() == super::BlobDescription::of(bytes)) {
+            plan_projection_with_layout_annotations(
+                engine.workspace_id(),
+                current.state(),
+                base_bytes,
+                Some(intent.annotations()),
+            )?
+        } else {
+            plan_projection(engine.workspace_id(), current.state(), base_bytes)?
+        };
     if replay.intent() != intent {
         return Err(ProjectionError::RecoveryIntentMismatch);
     }
@@ -1478,17 +1756,64 @@ fn u32_index(value: usize) -> Result<u32, ProjectionError> {
     u32::try_from(value).map_err(|_| ProjectionError::TreeTooWide)
 }
 
-fn serialize_document(format: ProjectionFormat, document: &Document, base: Option<&str>) -> String {
-    let serialized = match format {
+fn projection_layout_identities(
+    format: ProjectionFormat,
+    document: &Document,
+    base: Option<&str>,
+    base_annotations: Option<&[AnnotatedIdentity]>,
+    target_annotations: &[PendingAnnotation],
+) -> Vec<StructuralLayoutIdentity> {
+    if let Some(annotations) = base_annotations {
+        return annotations
+            .iter()
+            .map(|annotation| StructuralLayoutIdentity {
+                locator: annotation.locator().components().to_vec(),
+                block_identity: annotation.block_id().to_string(),
+            })
+            .collect();
+    }
+    let source_is_exact_semantic_document = base.is_some_and(|source| {
+        let parsed = match format {
+            ProjectionFormat::Markdown => crate::doc::parse(source),
+            ProjectionFormat::Org => crate::org::parse_org(source),
+        };
+        parsed == *document
+    });
+    if !source_is_exact_semantic_document {
+        return Vec::new();
+    }
+    target_annotations
+        .iter()
+        .map(|annotation| StructuralLayoutIdentity {
+            locator: annotation.locator.clone(),
+            block_identity: annotation.block_id.to_string(),
+        })
+        .collect()
+}
+
+fn serialize_document(
+    format: ProjectionFormat,
+    document: &Document,
+    base: Option<&str>,
+    layout_identities: &[StructuralLayoutIdentity],
+) -> String {
+    match format {
         ProjectionFormat::Markdown => {
-            crate::doc::serialize_with(document, &SerializeOpts::detect(base))
+            let serialized = crate::doc::serialize_with(
+                document,
+                &SerializeOpts::detect_with_layout_identities(base, layout_identities),
+            );
+            if base.is_some_and(|text| text.contains("\r\n")) {
+                serialized.replace('\n', "\r\n")
+            } else {
+                serialized
+            }
         }
-        ProjectionFormat::Org => crate::org::serialize_org_detect(document, base),
-    };
-    if base.is_some_and(|text| text.contains("\r\n")) {
-        serialized.replace('\n', "\r\n")
-    } else {
-        serialized
+        ProjectionFormat::Org => crate::org::serialize_org_detect_with_layout_identities(
+            document,
+            base,
+            layout_identities,
+        ),
     }
 }
 
@@ -1496,6 +1821,7 @@ fn annotate_serialized_blocks(
     format: ProjectionFormat,
     document: &Document,
     base: Option<&str>,
+    layout_identities: &[StructuralLayoutIdentity],
     target: &[u8],
     pending: &[PendingAnnotation],
 ) -> Result<Vec<AnnotatedIdentity>, ProjectionError> {
@@ -1524,7 +1850,7 @@ fn annotate_serialized_blocks(
     if marked_count != pending.len() {
         return Err(ProjectionError::SpanInstrumentationMismatch);
     }
-    let marked_bytes = serialize_document(format, &marked, base).into_bytes();
+    let marked_bytes = serialize_document(format, &marked, base, layout_identities).into_bytes();
 
     let mut clean = Vec::with_capacity(target.len());
     let mut cursor = 0;
@@ -1758,7 +2084,10 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::oplog::{DocumentId, FrontierV2, ManagedPath, MaterializationStats};
+    use crate::oplog::{
+        CrdtPeerCounter, CrdtPeerId, DocumentDependencies, DocumentId, FrontierV2, ManagedPath,
+        MaterializationStats, ProjectionClaimEvidence, ProjectionClaimParticipant,
+    };
 
     #[derive(Debug, Eq, PartialEq)]
     struct CanonicalDocument {
@@ -1911,6 +2240,273 @@ mod tests {
                 "{name} must use canonical LF line endings"
             );
         }
+    }
+
+    fn structural_layout_state(
+        path: &str,
+        blocks: Vec<(u128, Option<u128>, &str, String, Option<LogseqUuid>)>,
+    ) -> ProjectionPageState {
+        let home_document_id = DocumentId::from_uuid(Uuid::from_u128(80_000));
+        let blocks = blocks
+            .into_iter()
+            .map(
+                |(id, parent, order, content, logseq_uuid)| MaterializedBlock {
+                    block_id: BlockId::from_uuid(Uuid::from_u128(id)),
+                    home_document_id,
+                    parent: parent.map(|id| BlockId::from_uuid(Uuid::from_u128(id))),
+                    order: order.into(),
+                    logseq_uuid,
+                    logseq_identity_origin: logseq_uuid
+                        .map(|_| LogseqIdentityOrigin::ExternalImported),
+                    content,
+                },
+            )
+            .collect::<Vec<_>>();
+        let claim_evidence = blocks
+            .iter()
+            .filter_map(|block| {
+                block.logseq_uuid.map(|logseq_uuid| {
+                    ProjectionClaimEvidence::new(
+                        logseq_uuid,
+                        vec![ProjectionClaimParticipant::new(
+                            block.block_id,
+                            block.home_document_id,
+                        )],
+                    )
+                    .unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        let frontier = if claim_evidence.is_empty() {
+            FrontierV2::default()
+        } else {
+            FrontierV2::new(vec![DocumentDependencies::new(
+                home_document_id,
+                vec![CrdtPeerCounter::new(CrdtPeerId::from_u64(80_003), 0)],
+                Vec::new(),
+            )
+            .unwrap()])
+            .unwrap()
+        };
+        ProjectionPageState {
+            page: MaterializedPage {
+                page_id: PageId::from_uuid(Uuid::from_u128(80_001)),
+                home_document_id,
+                name: crate::oplog::LogicalPageName::parse("Structural Layout").unwrap(),
+                path: ManagedPath::parse(path).unwrap(),
+                kind: crate::oplog::ManagedTextKind::Page,
+                preamble: None,
+                blocks,
+                stats: MaterializationStats::default(),
+            },
+            frontier,
+            claim_evidence,
+        }
+    }
+
+    fn reproject_with_source_identities(
+        base_state: &ProjectionPageState,
+        source: &str,
+        target_state: &ProjectionPageState,
+    ) -> ProjectionPlan {
+        let base = plan_projection(
+            WorkspaceId::from_uuid(Uuid::from_u128(80_002)),
+            base_state,
+            Some(source.as_bytes()),
+        )
+        .unwrap();
+        assert_eq!(base.target(), source.as_bytes());
+        plan_projection_with_layout_annotations(
+            WorkspaceId::from_uuid(Uuid::from_u128(80_002)),
+            target_state,
+            Some(source.as_bytes()),
+            Some(base.intent().annotations()),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn structural_trivia_follows_only_receipt_bound_identities_across_nested_edits() {
+        let anchored = LogseqUuid::from_uuid(Uuid::from_u128(80_010));
+        let base = structural_layout_state(
+            "pages/layout.md",
+            vec![
+                (80_011, None, "a", "alpha".into(), None),
+                (80_012, Some(80_011), "a", "child one".into(), None),
+                (80_013, Some(80_011), "b", "child two".into(), None),
+                (
+                    80_014,
+                    None,
+                    "b",
+                    format!("omega\nid:: {anchored}"),
+                    Some(anchored),
+                ),
+            ],
+        );
+        let source =
+            format!("- alpha\n\t- child one\n\n\t- child two\n\n- omega\n  id:: {anchored}\n");
+
+        let reordered = structural_layout_state(
+            "pages/layout.md",
+            vec![
+                (
+                    80_014,
+                    None,
+                    "a",
+                    format!("omega\nid:: {anchored}"),
+                    Some(anchored),
+                ),
+                (80_011, None, "b", "alpha".into(), None),
+                (80_013, Some(80_011), "a", "child two".into(), None),
+                (80_012, Some(80_011), "b", "child one".into(), None),
+            ],
+        );
+        let reordered_projection = reproject_with_source_identities(&base, &source, &reordered);
+        assert_eq!(
+            std::str::from_utf8(reordered_projection.target()).unwrap(),
+            format!("- omega\n  id:: {anchored}\n- alpha\n\n\t- child two\n\t- child one\n")
+        );
+        let unproved = plan_projection(
+            WorkspaceId::from_uuid(Uuid::from_u128(80_002)),
+            &reordered,
+            Some(source.as_bytes()),
+        )
+        .unwrap();
+        assert_eq!(
+            std::str::from_utf8(unproved.target()).unwrap(),
+            format!("- omega\n  id:: {anchored}\n- alpha\n\t- child two\n\t- child one\n"),
+            "without receipt identity, sparse source trivia must canonicalize instead of moving by ordinal"
+        );
+
+        let inserted_deleted = structural_layout_state(
+            "pages/layout.md",
+            vec![
+                (80_011, None, "a", "alpha".into(), None),
+                (80_015, Some(80_011), "a", "inserted".into(), None),
+                (80_013, Some(80_011), "b", "child two".into(), None),
+            ],
+        );
+        let inserted_projection =
+            reproject_with_source_identities(&base, &source, &inserted_deleted);
+        assert_eq!(
+            std::str::from_utf8(inserted_projection.target()).unwrap(),
+            "- alpha\n\t- inserted\n\n\t- child two\n"
+        );
+
+        let changed_in_place = structural_layout_state(
+            "pages/layout.md",
+            vec![
+                (80_011, None, "a", "alpha".into(), None),
+                (80_012, Some(80_011), "a", "child one".into(), None),
+                (80_013, Some(80_011), "b", "child two edited".into(), None),
+                (
+                    80_014,
+                    None,
+                    "b",
+                    format!("omega\nid:: {anchored}"),
+                    Some(anchored),
+                ),
+            ],
+        );
+        let changed_projection =
+            reproject_with_source_identities(&base, &source, &changed_in_place);
+        assert!(std::str::from_utf8(changed_projection.target())
+            .unwrap()
+            .contains("child one\n\n\t- child two edited\n\n- omega"));
+
+        for state_and_projection in [
+            (&reordered, &reordered_projection),
+            (&inserted_deleted, &inserted_projection),
+            (&changed_in_place, &changed_projection),
+        ] {
+            let expected = build_projection_document(
+                state_and_projection.0,
+                ProjectionFormat::Markdown,
+                ProjectionRenderMode::Sparse,
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                crate::doc::parse(std::str::from_utf8(state_and_projection.1.target()).unwrap()),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn org_structural_trivia_is_identity_safe_under_same_count_reorder() {
+        let base = structural_layout_state(
+            "pages/layout.org",
+            vec![
+                (80_021, None, "a", "first".into(), None),
+                (80_022, Some(80_021), "a", "nested".into(), None),
+                (80_023, None, "b", "last".into(), None),
+            ],
+        );
+        let source = "* first\n\n** nested\n\n* last\n";
+        let reordered = structural_layout_state(
+            "pages/layout.org",
+            vec![
+                (80_023, None, "a", "last".into(), None),
+                (80_021, None, "b", "first".into(), None),
+                (80_022, Some(80_021), "a", "nested".into(), None),
+            ],
+        );
+        let projection = reproject_with_source_identities(&base, source, &reordered);
+        assert_eq!(
+            std::str::from_utf8(projection.target()).unwrap(),
+            "* last\n* first\n\n** nested\n"
+        );
+        let expected = build_projection_document(
+            &reordered,
+            ProjectionFormat::Org,
+            ProjectionRenderMode::Sparse,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            crate::org::parse_org(std::str::from_utf8(projection.target()).unwrap()),
+            expected
+        );
+    }
+
+    #[test]
+    fn collapsed_promoted_heading_requires_the_same_sole_semantic_root() {
+        let base = structural_layout_state(
+            "pages/collapsed.md",
+            vec![
+                (80_031, None, "a", "# Parent\ncollapsed:: true".into(), None),
+                (80_032, Some(80_031), "a", "child".into(), None),
+            ],
+        );
+        let source = "# Parent\ncollapsed:: true\n- child\n";
+        let inserted_root = structural_layout_state(
+            "pages/collapsed.md",
+            vec![
+                (80_033, None, "a", "new root".into(), None),
+                (80_031, None, "b", "# Parent\ncollapsed:: true".into(), None),
+                (80_032, Some(80_031), "a", "child".into(), None),
+            ],
+        );
+        let projection = reproject_with_source_identities(&base, source, &inserted_root);
+        let projected = std::str::from_utf8(projection.target()).unwrap();
+        assert!(projected.starts_with("- new root\n- # Parent\n"));
+        let reparsed = crate::doc::parse(projected);
+        assert_eq!(reparsed.roots.len(), 2);
+        assert_eq!(reparsed.roots[0].raw, "new root");
+        assert_eq!(reparsed.roots[1].raw, "# Parent\ncollapsed:: true");
+
+        let changed_child = structural_layout_state(
+            "pages/collapsed.md",
+            vec![
+                (80_031, None, "a", "# Parent\ncollapsed:: true".into(), None),
+                (80_032, Some(80_031), "a", "child edited".into(), None),
+            ],
+        );
+        let retained = reproject_with_source_identities(&base, source, &changed_child);
+        assert!(std::str::from_utf8(retained.target())
+            .unwrap()
+            .starts_with("# Parent\ncollapsed:: true\n- child edited\n"));
     }
 
     #[test]
@@ -2284,7 +2880,7 @@ mod tests {
 
         for case in [markdown, org] {
             let format = format_for_page(&case.state.page).unwrap();
-            let sparse = render_projection(&case.state, case.base).unwrap();
+            let sparse = render_projection(&case.state, case.base, None).unwrap();
             let dense = render_dense_projection_bytes(&case.state, case.base).unwrap();
             let sparse_text = std::str::from_utf8(&sparse.target).unwrap();
             let dense_text = std::str::from_utf8(&dense).unwrap();
@@ -2393,8 +2989,10 @@ mod tests {
             claim_evidence: Vec::new(),
         };
         assert_eq!(
-            render_projection(&markdown, None).unwrap().target,
-            render_projection(&mixed_markdown, None).unwrap().target
+            render_projection(&markdown, None, None).unwrap().target,
+            render_projection(&mixed_markdown, None, None)
+                .unwrap()
+                .target
         );
 
         let org = ProjectionPageState {
@@ -2408,8 +3006,8 @@ mod tests {
             claim_evidence: Vec::new(),
         };
         assert_eq!(
-            render_projection(&org, None).unwrap().target,
-            render_projection(&mixed_org, None).unwrap().target
+            render_projection(&org, None, None).unwrap().target,
+            render_projection(&mixed_org, None, None).unwrap().target
         );
     }
 

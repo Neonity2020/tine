@@ -1669,6 +1669,80 @@
         "failBefore": "proven"
       },
       "notes": "A test-only exact-path alias hook models case-insensitive lookup without changing production path resolution: acquiring pages/Foo.md while pages/foo.md owns the same portable key observes the old inode and conflicts, after which retiring the old spelling leaves the page absent. Scheduler coverage requires the old Absent work before the new Present work for both casing directions and neighboring Unicode portable aliases; platform-gated integration coverage exercises the native case-insensitive filesystem when available."
+    },
+    {
+      "id": "REG-SYNC-IMPORT-STRUCTURAL-TRIVIA-ROUNDTRIP-001",
+      "title": "External-import projection preserves structural trivia byte-exactly without transferring it to a different block",
+      "family": "sync-data-safety",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/doc.rs",
+          "crates/tine-core/src/org.rs",
+          "crates/tine-core/src/oplog/projection.rs",
+          "crates/tine-core/tests/oplog_projection.rs"
+        ],
+        "scenario": "sync.import-structural-trivia-roundtrip",
+        "failBefore": "proven"
+      },
+      "notes": "Fail-before: the minimized Markdown `- a\\n\\n` unit and projection regressions failed because the final block raw retained newline trivia also owned by SerializeOpts, producing SpanInstrumentationMismatch; the independent verifier then proved the first correction still rebound blank lines and a promoted collapsed heading by depth-first ordinal after insert/delete/reorder. Accepted Markdown and Org formatting, including final and inter-block blank lines, CRLF, no final newline, preambles, importer-promoted collapsed headings, literal fences/source blocks/logbooks, and multiple blocks, now remains document-owned formatting. Edited projections carry only receipt-proved locator-to-BlockId ownership into the singular guarded serializer; sparse ID-less blocks without such proof are locally canonicalized, and a collapsed heading remains unbulleted only for the same sole semantic root. Nested insert/delete/reorder, same-count reorder, ID-less and ID-bearing neighbors, changed content without reorder, collapsed-root insertion/reorder, guarded serialization, and reparsed semantic equivalence are covered."
+    },
+    {
+      "id": "REG-SYNC-EXTERNAL-SOURCE-ADMISSION-001",
+      "title": "Non-round-tripping external Markdown and Org remain byte-preserved and blocked before semantic publication",
+      "family": "sync-data-safety",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/oplog/import.rs",
+          "crates/tine-core/tests/oplog_import.rs"
+        ],
+        "scenario": "sync.external-source-prepublication-admission",
+        "failBefore": "proven"
+      },
+      "notes": "Fail-before: minimized steady-state and inactive-bootstrap regressions admitted mixed tab/space Markdown and skipped-level Org as reconciliable/bootstrap material. Bootstrap and steady-state reconciliation now prove exact parse/serialize byte identity under detected source formatting, plus Org editability, before constructing any semantic transaction. Non-round-tripping input stays visibly UnsafeInput-blocked/read-only with exact source bytes intact and no execution material; valid CRLF/space-indented Markdown, valid Org, formatting-only reconciliation, and existing sparse-ID matching remain admitted."
+    },
+    {
+      "id": "REG-SYNC-IMPORT-FORMATTING-NOOP-001",
+      "title": "A formatting-only external import adopts an exact projection baseline without authoring a semantic batch",
+      "family": "sync-data-safety",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/oplog/import.rs",
+          "crates/tine-core/src/oplog/operational_coordinator.rs",
+          "crates/tine-core/src/oplog/projection.rs",
+          "crates/tine-core/src/oplog/projection_work_index.rs",
+          "crates/tine-core/tests/oplog_import.rs"
+        ],
+        "scenario": "sync.import-formatting-only-no-semantic-batch",
+        "failBefore": "proven"
+      },
+      "notes": "Fail-before: the independent verifier used a fixture whose logical name, kind, and path already agreed and changed only round-tripping CRLF/blank-line formatting. Reconciliation produced zero semantic operations, then OperationTransaction's correct non-empty invariant converted that no-op into UnsafeInput. The no-op now has a separate sealed formatting material lane: it publishes endpoint-local intent/base/completion authority, replaces the bounded completed-path baseline only after authenticating the prior receipt and unchanged semantic frontier, and never publishes an operation batch. Crash after intent is recovered after a full Graph/receipt/archive-engine/SQLite/tail restart; exact bytes survive, and a subsequent real semantic edit renders from the adopted formatting baseline."
     }
   ]
 }

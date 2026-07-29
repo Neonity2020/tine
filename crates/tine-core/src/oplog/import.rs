@@ -2228,6 +2228,19 @@ fn spool_bootstrap_operations(
             .then(|| StructuralSpan::new(0, bytes.len() as u64))
             .transpose()
             .map_err(|error| BootstrapStreamingImportError::InvalidSource(error.to_string()))?;
+
+        let mut parser_instrumentation = ImportInstrumentation::default();
+        let tree = parse_nodes(entry.path(), bytes.as_slice(), &mut parser_instrumentation)
+            .map_err(|block| BootstrapStreamingImportError::InvalidSource(block.detail))?;
+        if tree.nodes.len() as u32 > MAX_PARSED_NODES_PER_SOURCE_FILE {
+            return Err(BootstrapStreamingImportError::ResourceLimit {
+                resource: "parser nodes per source file",
+                observed: tree.nodes.len() as u64,
+                limit: u64::from(MAX_PARSED_NODES_PER_SOURCE_FILE),
+            });
+        }
+        // Source admission and parsing complete before the first semantic
+        // operation for this external document is constructible.
         let page_operation = BootstrapOperationRecord::new(
             SemanticOperation::CreatePage {
                 page_id,
@@ -2244,17 +2257,6 @@ fn spool_bootstrap_operations(
             page_operation.encode()?,
         )?;
         operation_count = checked_bootstrap_operation_count(operation_count)?;
-
-        let mut parser_instrumentation = ImportInstrumentation::default();
-        let tree = parse_nodes(entry.path(), bytes.as_slice(), &mut parser_instrumentation)
-            .map_err(|block| BootstrapStreamingImportError::InvalidSource(block.detail))?;
-        if tree.nodes.len() as u32 > MAX_PARSED_NODES_PER_SOURCE_FILE {
-            return Err(BootstrapStreamingImportError::ResourceLimit {
-                resource: "parser nodes per source file",
-                observed: tree.nodes.len() as u64,
-                limit: u64::from(MAX_PARSED_NODES_PER_SOURCE_FILE),
-            });
-        }
         instrumentation.parser_nodes = instrumentation
             .parser_nodes
             .checked_add(tree.nodes.len() as u64)
@@ -3919,6 +3921,7 @@ pub struct ImportPlan {
     matches: Option<ImportMatches>,
     scope: Option<ImportScopeSnapshot>,
     execution: Option<ImportExecutionMaterial>,
+    formatting: Option<ImportFormattingMaterial>,
     blocks: Vec<ImportBlock>,
     instrumentation: ImportInstrumentation,
 }
@@ -3999,6 +4002,12 @@ impl ImportPlan {
             }
         }
     }
+
+    pub(crate) fn into_formatting_material(mut self) -> Option<ImportFormattingMaterial> {
+        (self.status == ImportPlanStatus::Noop)
+            .then(|| self.formatting.take())
+            .flatten()
+    }
 }
 
 /// Minimal crate-internal handoff from receipt-backed import planning to the
@@ -4009,6 +4018,43 @@ pub(crate) struct ImportExecutionMaterial {
     import_id: ImportId,
     transaction: OperationTransaction,
     observation: ExternalImportObservationMaterial,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ImportFormattingPage {
+    page_id: PageId,
+    path: ManagedPath,
+    bytes: Vec<u8>,
+    annotations: Vec<AnnotatedIdentity>,
+}
+
+impl ImportFormattingPage {
+    pub(crate) const fn page_id(&self) -> PageId {
+        self.page_id
+    }
+
+    pub(crate) fn path(&self) -> &ManagedPath {
+        &self.path
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub(crate) fn annotations(&self) -> &[AnnotatedIdentity] {
+        &self.annotations
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ImportFormattingMaterial {
+    pages: Vec<ImportFormattingPage>,
+}
+
+impl ImportFormattingMaterial {
+    pub(crate) fn pages(&self) -> &[ImportFormattingPage] {
+        &self.pages
+    }
 }
 
 // The hot-engine adapter consumes this sealed material for drafting only;
@@ -4947,7 +4993,7 @@ fn plan_import(
     }) || inventory.entries().iter().any(|(path, observation)| {
         matches!(observation, RawObservation::Present(_)) && !completed_paths.contains(path)
     });
-    let execution = if changed {
+    let (status, scope, execution, formatting) = if changed {
         match build_execution_material(
             import_id,
             &inventory,
@@ -4956,7 +5002,15 @@ fn plan_import(
             &page_transition,
             &mut instrumentation,
         ) {
-            Ok(execution) => Some(execution),
+            Ok(BuiltImportMaterial::Semantic(execution)) => (
+                ImportPlanStatus::Reconcile,
+                Some(scope),
+                Some(execution),
+                None,
+            ),
+            Ok(BuiltImportMaterial::Formatting(formatting)) => {
+                (ImportPlanStatus::Noop, None, None, Some(formatting))
+            }
             Err(error) => {
                 return blocked_authority_error(
                     Some(inventory),
@@ -4978,19 +5032,16 @@ fn plan_import(
             }
         }
     } else {
-        None
+        (ImportPlanStatus::Noop, None, None, None)
     };
     ImportPlan {
-        status: if changed {
-            ImportPlanStatus::Reconcile
-        } else {
-            ImportPlanStatus::Noop
-        },
+        status,
         import_id: Some(import_id),
         inventory: Some(inventory),
         matches: Some(matches),
-        scope: changed.then_some(scope),
+        scope,
         execution,
+        formatting,
         blocks: Vec::new(),
         instrumentation,
     }
@@ -5199,6 +5250,11 @@ struct DesiredImportBlock {
     existing: bool,
 }
 
+enum BuiltImportMaterial {
+    Semantic(ImportExecutionMaterial),
+    Formatting(ImportFormattingMaterial),
+}
+
 fn push_operation(
     operations: &mut Vec<SemanticOperation>,
     operation: SemanticOperation,
@@ -5217,7 +5273,7 @@ fn build_execution_material(
     scope: &ImportScopeSnapshot,
     page_transition: &DesiredPageTransition,
     instrumentation: &mut ImportInstrumentation,
-) -> Result<ImportExecutionMaterial, ImportExecutionError> {
+) -> Result<BuiltImportMaterial, ImportExecutionError> {
     let mut current_pages = BTreeMap::<PageId, &ReceiptBackedPage>::new();
     let mut current_blocks = BTreeMap::<BlockId, CurrentImportBlock>::new();
     for evidence in scope.paths.values() {
@@ -5624,13 +5680,50 @@ fn build_execution_material(
         }
     }
 
+    if operations.is_empty() {
+        let mut pages = Vec::new();
+        for entry in observation.entries() {
+            let Some(bytes) = entry.state().bytes() else {
+                return Err(ImportExecutionError::InvalidMaterial(
+                    "operation-free reconciliation contains an absent source".into(),
+                ));
+            };
+            let desired = desired_pages.get(entry.path()).ok_or_else(|| {
+                ImportExecutionError::InvalidMaterial(
+                    "operation-free reconciliation has no desired page".into(),
+                )
+            })?;
+            let current = current_pages.get(&desired.page_id).ok_or_else(|| {
+                ImportExecutionError::InvalidMaterial(
+                    "operation-free reconciliation has no accepted page".into(),
+                )
+            })?;
+            if current.description() == super::BlobDescription::of(bytes) {
+                continue;
+            }
+            pages.push(ImportFormattingPage {
+                page_id: desired.page_id,
+                path: entry.path().clone(),
+                bytes: bytes.to_vec(),
+                annotations: entry.state().annotations().to_vec(),
+            });
+        }
+        if pages.is_empty() {
+            return Err(ImportExecutionError::InvalidMaterial(
+                "changed operation-free reconciliation has no formatting baseline to adopt".into(),
+            ));
+        }
+        return Ok(BuiltImportMaterial::Formatting(ImportFormattingMaterial {
+            pages,
+        }));
+    }
     let transaction = OperationTransaction::new(operations)
         .map_err(|error| ImportExecutionError::InvalidMaterial(error.to_string()))?;
-    Ok(ImportExecutionMaterial {
+    Ok(BuiltImportMaterial::Semantic(ImportExecutionMaterial {
         import_id,
         transaction,
         observation,
-    })
+    }))
 }
 
 pub(crate) fn imported_order(sibling_position: u32) -> String {
@@ -5719,6 +5812,7 @@ fn blocked_inventory_error(
         matches: None,
         scope: None,
         execution: None,
+        formatting: None,
         blocks: vec![ImportBlock {
             reason,
             paths,
@@ -5742,6 +5836,7 @@ fn blocked_authority_error(
         matches: None,
         scope: None,
         execution: None,
+        formatting: None,
         blocks: vec![block],
         instrumentation,
     }
@@ -5924,8 +6019,25 @@ fn parse_nodes(
     instrumentation: &mut ImportInstrumentation,
 ) -> Result<ParsedTree, ImportBlock> {
     let text = std::str::from_utf8(bytes).expect("UTF-8 checked before semantic parsing");
-    preflight_depth(path, text, instrumentation.parsed_nodes)?;
-    let parsed = if path.as_str().ends_with(".org") {
+    let is_org = path.is_org();
+    preflight_depth(path, text, is_org, instrumentation.parsed_nodes)?;
+    let source_admitted = if is_org {
+        crate::org::org_editable(text)
+    } else {
+        crate::doc::markdown_round_trips(text)
+    };
+    if !source_admitted {
+        return Err(authority_block(
+            ImportBlockReason::UnsafeInput,
+            Some(path),
+            if is_org {
+                "external Org source is byte-preserved and read-only because its heading structure is not editable and does not round-trip exactly"
+            } else {
+                "external Markdown source is byte-preserved and read-only because detected formatting does not round-trip exactly"
+            },
+        ));
+    }
+    let parsed = if is_org {
         crate::org::parse_org_with_source_spans(text)
     } else {
         crate::doc::parse_with_source_spans(text)
@@ -5933,10 +6045,14 @@ fn parse_nodes(
     flatten_document(path, parsed, instrumentation)
 }
 
-fn preflight_depth(path: &ManagedPath, text: &str, parsed_nodes: usize) -> Result<(), ImportBlock> {
+fn preflight_depth(
+    path: &ManagedPath,
+    text: &str,
+    is_org: bool,
+    parsed_nodes: usize,
+) -> Result<(), ImportBlock> {
     let mut candidate_nodes = 0_usize;
     for line in text.lines() {
-        let is_org = path.as_str().ends_with(".org");
         let depth = if is_org {
             let stars = line
                 .as_bytes()
@@ -7074,6 +7190,38 @@ mod tests {
         let plan = fixture.plan(&["pages/a.md"]);
         assert_eq!(plan.status(), ImportPlanStatus::Blocked);
         assert_eq!(plan.blocks()[0].reason, ImportBlockReason::StaleScope);
+    }
+
+    #[test]
+    fn source_admission_blocks_non_round_tripping_markdown_and_org_before_material() {
+        for (label, path, source) in [
+            (
+                "mixed-markdown-admission",
+                "pages/a.md",
+                "- changed\n\t- child\n  - grandchild\n",
+            ),
+            (
+                "skipped-org-admission",
+                "pages/a.org",
+                "* changed\n*** skipped\n",
+            ),
+        ] {
+            let fixture = SnapshotFixture::new(label, &[path]);
+            let target = fixture.graph_root.join(path);
+            fs::write(&target, source).unwrap();
+            let plan = fixture.plan(&[path]);
+            assert_eq!(
+                plan.status(),
+                ImportPlanStatus::Blocked,
+                "{label}: {plan:?}"
+            );
+            assert_eq!(plan.blocks()[0].reason, ImportBlockReason::UnsafeInput);
+            assert!(
+                plan.execution_material().is_err(),
+                "{label} exposed semantic execution material"
+            );
+            assert_eq!(fs::read(target).unwrap(), source.as_bytes());
+        }
     }
 
     #[test]
@@ -8312,9 +8460,14 @@ mod tests {
 
         let path = ManagedPath::parse("pages/a.md").unwrap();
         assert_eq!(
-            preflight_depth(&path, "- one more\n", MAX_IMPORT_PARSED_NODES)
-                .unwrap_err()
-                .reason,
+            preflight_depth(
+                &path,
+                "- one more\n",
+                path.is_org(),
+                MAX_IMPORT_PARSED_NODES
+            )
+            .unwrap_err()
+            .reason,
             ImportBlockReason::ResourceLimit
         );
         let tree = ParsedTree {
@@ -8577,6 +8730,52 @@ mod tests {
             objects.push(super::super::OperationObject::decode(&bytes).unwrap());
         }
         super::super::PreparedBatch::new(manifest, objects).unwrap();
+    }
+
+    #[test]
+    fn inactive_bootstrap_refuses_non_round_tripping_source_before_operations() {
+        for (label, path, source) in [
+            (
+                "bootstrap-mixed-markdown",
+                "pages/mixed.md",
+                "- parent\n\t- a\n  - b\n",
+            ),
+            (
+                "bootstrap-skipped-org",
+                "pages/skipped.org",
+                "* parent\n*** child\n",
+            ),
+        ] {
+            let root = TestRoot::new(label);
+            let graph_root = root.path().join("graph");
+            let target = graph_root.join(path);
+            fs::create_dir_all(target.parent().unwrap()).unwrap();
+            fs::write(&target, source).unwrap();
+            let graph = Graph::open(&graph_root);
+            let capture_scratch = root.path().join("capture-scratch");
+            let preparation_scratch = root.path().join("preparation-scratch");
+            fs::create_dir(&capture_scratch).unwrap();
+            fs::create_dir(&preparation_scratch).unwrap();
+            let capture = graph
+                .capture_inactive_bootstrap_sources(&capture_scratch)
+                .unwrap();
+            let workspace = WorkspaceId::from_uuid(Uuid::from_u128(0x5a11));
+            let result = prepare_inactive_bootstrap_import(
+                &graph,
+                capture,
+                workspace,
+                LineageDigest::of(b"inactive-bootstrap-source-admission"),
+                DocumentId::from_uuid(Uuid::from_u128(0x5a12)),
+                ReferenceCatalogPolicyV1::default(),
+                &target_catalog(&root.path().join("archive"), workspace),
+                &preparation_scratch,
+            );
+            assert!(
+                matches!(result, Err(BootstrapStreamingImportError::InvalidSource(_))),
+                "{label} constructed bootstrap publication"
+            );
+            assert_eq!(fs::read(target).unwrap(), source.as_bytes());
+        }
     }
 
     fn synthetic_operation_spool(
@@ -9036,6 +9235,9 @@ mod tests {
             &mut ImportInstrumentation::default(),
         )
         .unwrap();
+        let BuiltImportMaterial::Semantic(old) = old else {
+            panic!("bootstrap differential unexpectedly produced formatting-only material");
+        };
         assert_eq!(streaming_operations, old.transaction.operations);
         let streaming_transaction =
             OperationTransaction::new(streaming_operations.clone()).unwrap();

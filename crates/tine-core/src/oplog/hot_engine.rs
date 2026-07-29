@@ -9632,10 +9632,11 @@ impl ShardedHotEngine {
                         "captured path {path} completion is not its intended semantic predecessor"
                     )));
                 }
-                let replay = super::projection::plan_projection(
+                let replay = super::projection::plan_projection_with_layout_annotations(
                     self.workspace_id,
                     before,
                     Some(&prior.bytes),
+                    Some(prior.intent.annotations()),
                 )
                 .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
                 if replay.target() != prior.bytes {
@@ -9763,19 +9764,26 @@ impl ShardedHotEngine {
                             "Present requirement has no semantic post-state".into(),
                         )
                     })?;
-                    let render_bytes = requirement
+                    let (render_bytes, render_annotations) = requirement
                         .render_base_path
                         .as_ref()
-                        .and_then(|path| render_bases.get(path).map(|(_, base)| base.bytes()))
-                        .or_else(|| match &inputs[&requirement.path] {
-                            CapabilityCapturedProjectionMaterial::Present { bytes, .. } => {
-                                Some(bytes.as_slice())
-                            }
-                            CapabilityCapturedProjectionMaterial::Absent { .. } => None,
+                        .and_then(|path| render_bases.get(path))
+                        .map(|(_, base)| (Some(base.bytes()), Some(base.annotations())))
+                        .unwrap_or_else(|| match &inputs[&requirement.path] {
+                            CapabilityCapturedProjectionMaterial::Present {
+                                bytes,
+                                annotations,
+                                ..
+                            } => (Some(bytes.as_slice()), Some(annotations.as_slice())),
+                            CapabilityCapturedProjectionMaterial::Absent { .. } => (None, None),
                         });
-                    let plan =
-                        super::projection::plan_projection(self.workspace_id, after, render_bytes)
-                            .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
+                    let plan = super::projection::plan_projection_with_layout_annotations(
+                        self.workspace_id,
+                        after,
+                        render_bytes,
+                        render_annotations,
+                    )
+                    .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
                     ManifestProjectionTarget::present(
                         plan.target().to_vec(),
                         plan.intent().annotations().to_vec(),
@@ -10698,14 +10706,13 @@ impl ShardedHotEngine {
                             "projection post frontier has missing or extra documents".into(),
                         ));
                     }
-                    let render_bytes = intent
+                    let render_base = intent
                         .render_base()
                         .or_else(|| intent.precondition().base())
                         .map(|reference| {
                             projection
                                 .bases()
                                 .get(&reference.document_id())
-                                .map(AnnotatedProjectionBase::bytes)
                                 .ok_or_else(|| {
                                     EngineError::ProjectionManifest(
                                         "render base object is unavailable".into(),
@@ -10718,9 +10725,13 @@ impl ShardedHotEngine {
                         frontier: intent.post_frontier().clone(),
                         claim_evidence: expected_evidence,
                     };
-                    let plan =
-                        super::projection::plan_projection(self.workspace_id, &state, render_bytes)
-                            .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
+                    let plan = super::projection::plan_projection_with_layout_annotations(
+                        self.workspace_id,
+                        &state,
+                        render_base.map(AnnotatedProjectionBase::bytes),
+                        render_base.map(AnnotatedProjectionBase::annotations),
+                    )
+                    .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
                     if plan.target() != bytes || plan.intent().annotations() != annotations {
                         return Err(EngineError::ProjectionManifest(
                             "projection target bytes/annotations do not match semantic post-state"
@@ -10884,9 +10895,13 @@ impl ShardedHotEngine {
                 "annotated base prior binding does not match exact semantic state".into(),
             ));
         }
-        let replay =
-            super::projection::plan_projection(self.workspace_id, &state, Some(base.bytes()))
-                .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
+        let replay = super::projection::plan_projection_with_layout_annotations(
+            self.workspace_id,
+            &state,
+            Some(base.bytes()),
+            Some(base.annotations()),
+        )
+        .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
         if replay.target() != base.bytes() || replay.intent().annotations() != base.annotations() {
             return Err(EngineError::ProjectionManifest(
                 "annotated base bytes/annotations are not the exact semantic pre-state".into(),
@@ -12277,9 +12292,13 @@ impl ShardedHotEngine {
                     claim_evidence: claim_evidence.to_vec(),
                 };
                 let target = intent.target().bytes();
-                let rendered =
-                    super::projection::plan_projection(self.workspace_id, &state, target)
-                        .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
+                let rendered = super::projection::plan_projection_with_layout_annotations(
+                    self.workspace_id,
+                    &state,
+                    target,
+                    Some(intent.target().annotations()),
+                )
+                .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
                 if rendered.target() != target.expect("Present target has bytes") {
                     continue;
                 }

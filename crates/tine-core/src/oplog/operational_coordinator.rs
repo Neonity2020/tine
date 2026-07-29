@@ -1056,6 +1056,30 @@ impl OperationalCoordinator {
                 return Ok(OperationalCoordinatorState::Blocked(plan));
             }
             ImportPlanStatus::Noop => {
+                if let Some(formatting) = plan.into_formatting_material() {
+                    let guard = handoff.into_publisher_guard();
+                    for page in formatting.pages() {
+                        if let Err(error) = super::projection::adopt_existing_projection_formatting(
+                            graph,
+                            receipts,
+                            engine,
+                            &guard,
+                            page.page_id(),
+                            page.bytes(),
+                            page.annotations(),
+                        ) {
+                            return Err(OperationalCoordinatorError::new(
+                                OperationalPhase::Planning,
+                                format!(
+                                    "formatting-only baseline adoption for {} failed: {error}",
+                                    page.path()
+                                ),
+                            ));
+                        }
+                    }
+                    drop(guard);
+                    return Ok(OperationalCoordinatorState::Noop);
+                }
                 handoff.cancel();
                 return Ok(OperationalCoordinatorState::Noop);
             }
@@ -3095,12 +3119,13 @@ mod tests {
     use crate::oplog::object_store::{
         fail_next_engine_history_head_swap, fail_next_publish_after_objects,
     };
+    use crate::oplog::projection::fail_next_formatting_adoption_after_intent_for_harness;
     use crate::oplog::{
-        write_projection_exact, AnnotatedProjectionBase, ApplicationRuntimeRoot, BlockId,
-        BlockLocation, DeviceId, DocumentId, LineageDigest, LogicalPageName, ManagedPath,
-        ManagedTextKind, ManifestProjectionPrecondition, ManifestedProjectionIntent, ObjectKind,
-        OperationTransaction, PageId, ProjectionClaim, ProjectionEndpointId, SemanticOperation,
-        TAIL_MAX_BYTES,
+        recover_incomplete_projections, write_projection_exact, AnnotatedProjectionBase,
+        ApplicationRuntimeRoot, BlockId, BlockLocation, DeviceId, DocumentId, LineageDigest,
+        LogicalPageName, ManagedPath, ManagedTextKind, ManifestProjectionPrecondition,
+        ManifestedProjectionIntent, ObjectKind, OperationTransaction, PageId, ProjectionClaim,
+        ProjectionEndpointId, SemanticOperation, TAIL_MAX_BYTES,
     };
 
     struct TestRoot(PathBuf);
@@ -3136,6 +3161,8 @@ mod tests {
         engine: ShardedHotEngine,
         database: SqliteFrontier,
         tail: TailOverlay,
+        lineage: LineageDigest,
+        catalog: DocumentId,
         home_document_id: DocumentId,
         block_id: BlockId,
         intent: super::super::ProjectionIntent,
@@ -3164,7 +3191,29 @@ mod tests {
             )
         }
 
+        fn formatting_only(label: &str) -> Self {
+            Self::new_at_named(
+                label,
+                "pages/Coordinator Page.md",
+                None,
+                ManagedTextKind::Page,
+                "Coordinator Page",
+                true,
+            )
+        }
+
         fn new_at(label: &str, path: &str, config: Option<&str>, kind: ManagedTextKind) -> Self {
+            Self::new_at_named(label, path, config, kind, "Coordinator Page", false)
+        }
+
+        fn new_at_named(
+            label: &str,
+            path: &str,
+            config: Option<&str>,
+            kind: ManagedTextKind,
+            logical_name: &str,
+            imported_orders: bool,
+        ) -> Self {
             let root = TestRoot::new(label);
             let graph_root = root.path().join("graph");
             fs::create_dir_all(&graph_root).unwrap();
@@ -3192,11 +3241,16 @@ mod tests {
             let home = DocumentId::from_uuid(Uuid::from_u128(6));
             let block = BlockId::from_uuid(Uuid::from_u128(7));
             let managed_path = ManagedPath::parse(path).unwrap();
+            let fixture_order = if imported_orders {
+                super::super::import::imported_order(0)
+            } else {
+                "a".into()
+            };
             let transaction = OperationTransaction::new(vec![
                 SemanticOperation::CreatePage {
                     page_id,
                     home_document_id: home,
-                    name: LogicalPageName::parse("Coordinator Page").unwrap(),
+                    name: LogicalPageName::parse(logical_name).unwrap(),
                     path: managed_path,
                     kind,
                 },
@@ -3207,7 +3261,7 @@ mod tests {
                     },
                     page_id,
                     parent: None,
-                    order: "a".into(),
+                    order: fixture_order.clone(),
                     content: "root".into(),
                 },
                 SemanticOperation::CreateBlock {
@@ -3217,7 +3271,7 @@ mod tests {
                     },
                     page_id,
                     parent: Some(block),
-                    order: "a".into(),
+                    order: fixture_order,
                     content: "child".into(),
                 },
             ])
@@ -3283,6 +3337,8 @@ mod tests {
                 engine,
                 database,
                 tail,
+                lineage,
+                catalog,
                 home_document_id: home,
                 block_id: block,
                 intent,
@@ -3366,6 +3422,83 @@ mod tests {
                 .is_empty());
             assert_eq!(self.tail.status().unapplied_batches, 0);
             assert_eq!(self.tail.status().retained_bytes, 0);
+        }
+
+        fn restart_projection_runtime(self) -> Self {
+            let Self {
+                _root,
+                graph_root,
+                archive_root,
+                graph,
+                receipts,
+                archive,
+                engine,
+                database,
+                tail,
+                lineage,
+                catalog,
+                home_document_id,
+                block_id,
+                intent,
+                path,
+            } = self;
+            let endpoint = receipts.endpoint_binding().unwrap();
+            let receipt_root = receipts.root_path().to_path_buf();
+            let workspace = engine.workspace_id();
+            drop(tail);
+            drop(database);
+            drop(engine);
+            drop(archive);
+            drop(receipts);
+            drop(graph);
+
+            let graph = Graph::open(&graph_root);
+            let receipts =
+                ProjectionReceiptStore::open_for_endpoint(&receipt_root, workspace, endpoint)
+                    .unwrap();
+            let archive = ObjectStore::open(&archive_root, workspace).unwrap();
+            let manifests = archive.committed_manifests().unwrap();
+            let engine = ShardedHotEngine::open_enrolled_projection(
+                ObjectStore::open(&archive_root, workspace).unwrap(),
+                lineage,
+                catalog,
+                &graph,
+                &receipts,
+                &manifests,
+            )
+            .unwrap()
+            .0;
+            let runtime =
+                ApplicationRuntimeRoot::open_for_test(&_root.path().join("runtime")).unwrap();
+            let database_path = _root.path().join("sqlite/materialized.sqlite3");
+            let source = RebuildSource::new(&engine, &archive).unwrap();
+            let database = SqliteFrontier::open_or_rebuild(
+                &database_path,
+                &runtime,
+                ProjectionClaim::current(workspace, lineage),
+                source,
+            )
+            .unwrap()
+            .database;
+            let source = RebuildSource::new(&engine, &archive).unwrap();
+            let tail = TailOverlay::from_durable(&database, &source).unwrap();
+            Self {
+                _root,
+                graph_root,
+                archive_root,
+                graph,
+                receipts,
+                archive,
+                engine,
+                database,
+                tail,
+                lineage,
+                catalog,
+                home_document_id,
+                block_id,
+                intent,
+                path,
+            }
         }
     }
 
@@ -4009,6 +4142,83 @@ mod tests {
         assert_eq!(snapshot_tree(&fixture.archive_root), archive);
         assert_eq!(snapshot_tree(fixture.receipts.root_path()), receipts);
         fixture.graph.probe_managed_text_writer().unwrap();
+    }
+
+    #[test]
+    fn formatting_only_noop_adopts_exact_bytes_without_a_semantic_batch() {
+        let mut fixture = Fixture::formatting_only("formatting-only-noop");
+        let path = fixture.path.clone();
+        let formatted = b"- root\r\n\r\n\t- child\r\n";
+        fixture.overwrite(formatted);
+        let accepted = fixture.engine.accepted_frontier_root().unwrap();
+        let sqlite = fixture.database.frontier_root().unwrap();
+        let manifests = fixture.archive.committed_manifests().unwrap();
+        let receipts_before = snapshot_tree(fixture.receipts.root_path());
+        let plan =
+            plan_affected_import(&fixture.graph, &fixture.receipts, &fixture.engine, &[&path]);
+        assert_eq!(plan.status(), ImportPlanStatus::Noop, "{plan:?}");
+
+        assert!(matches!(
+            fixture.execute(&[&path]),
+            OperationalCoordinatorState::Noop
+        ));
+        assert_eq!(fixture.engine.accepted_frontier_root().unwrap(), accepted);
+        assert_eq!(fixture.database.frontier_root().unwrap(), sqlite);
+        assert_eq!(fixture.archive.committed_manifests().unwrap(), manifests);
+        assert_ne!(
+            snapshot_tree(fixture.receipts.root_path()),
+            receipts_before,
+            "the endpoint-local exact baseline must advance"
+        );
+        assert_eq!(fs::read(fixture.graph_root.join(&path)).unwrap(), formatted);
+
+        expect_local_active(fixture.local_edit(49_000, "root edited"));
+        fixture.assert_drained();
+        assert_eq!(
+            fs::read(fixture.graph_root.join(&path)).unwrap(),
+            b"- root edited\r\n\r\n\t- child\r\n",
+            "the next real semantic edit must render from the adopted formatting baseline"
+        );
+    }
+
+    #[test]
+    fn formatting_only_intent_recovers_after_restart_before_the_next_real_edit() {
+        let mut fixture = Fixture::formatting_only("formatting-only-restart");
+        let path = fixture.path.clone();
+        let formatted = b"- root\r\n\r\n\t- child\r\n";
+        fixture.overwrite(formatted);
+        let manifests = fixture.archive.committed_manifests().unwrap();
+        fail_next_formatting_adoption_after_intent_for_harness();
+        let failed = match OperationalCoordinator::execute(
+            &LocalRuntimeAdmission::unenrolled_pre_activation(),
+            &fixture.graph,
+            &fixture.receipts,
+            &mut fixture.engine,
+            &mut fixture.database,
+            &mut fixture.tail,
+            &[&path],
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("formatting adoption fault unexpectedly completed"),
+        };
+        assert_eq!(failed.phase(), OperationalPhase::Planning);
+        assert_eq!(fixture.archive.committed_manifests().unwrap(), manifests);
+        assert_eq!(fs::read(fixture.graph_root.join(&path)).unwrap(), formatted);
+
+        fixture = fixture.restart_projection_runtime();
+        let recovered =
+            recover_incomplete_projections(&fixture.graph, &fixture.receipts, &fixture.engine)
+                .unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert!(matches!(
+            fixture.execute(&[&path]),
+            OperationalCoordinatorState::Noop
+        ));
+        expect_local_active(fixture.local_edit(49_100, "after restart"));
+        assert_eq!(
+            fs::read(fixture.graph_root.join(&path)).unwrap(),
+            b"- after restart\r\n\r\n\t- child\r\n"
+        );
     }
 
     #[test]

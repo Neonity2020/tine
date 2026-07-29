@@ -227,7 +227,7 @@ fn authorized_engine(
     let home = DocumentId::from_uuid(uuid(702));
     let block_id = BlockId::from_uuid(uuid(703));
     let batch_id = BatchId::from_uuid(uuid(704));
-    let author = ShardedHotEngine::new(workspace_id, lineage, catalog);
+    let archive_path = dir.path().join("archive");
     let transaction = OperationTransaction::new(vec![
         SemanticOperation::CreatePage {
             page_id,
@@ -248,19 +248,72 @@ fn authorized_engine(
         },
     ])
     .unwrap();
-    let prepared = author
-        .prepare_bootstrap_transaction(
+    let finalize = |authoring_archive: &Path,
+                    graph: &Graph,
+                    receipts: &ProjectionReceiptStore,
+                    endpoint: ProjectionEndpointBinding| {
+        let author = ShardedHotEngine::with_enrolled_projection(
+            ObjectStore::open(authoring_archive, workspace_id).unwrap(),
+            lineage,
+            catalog,
+            graph,
+            receipts,
+        );
+        let draft = author.draft_author_transaction(
             AuthorBatch {
                 batch_id,
-                author_device_id: DeviceId::from_uuid(uuid(705)),
+                author_device_id: endpoint.device_id(),
                 author_session_id: SessionId::from_uuid(uuid(706)),
                 crdt_peer_id: CrdtPeerId::from_u64(707),
             },
+            BatchOrigin::LocalMutation,
             &transaction,
+        )?;
+        author.finalize_author_transaction(draft, graph, receipts, endpoint)
+    };
+    let finalize_with_isolated_authority = |source: Option<ProjectionEndpointBinding>| {
+        let graph_root = dir.path().join("authoring-graph");
+        fs::create_dir_all(graph_root.join(relative_path).parent().unwrap()).unwrap();
+        let graph = Graph::open(graph_root);
+        let endpoint_id = source
+            .map(ProjectionEndpointBinding::endpoint_id)
+            .unwrap_or_else(|| ProjectionEndpointId::from_uuid(uuid(799)));
+        let device_id = source
+            .map(ProjectionEndpointBinding::device_id)
+            .unwrap_or_else(|| DeviceId::from_uuid(uuid(705)));
+        let endpoint =
+            ProjectionEndpointBinding::enroll_graph(&graph, endpoint_id, device_id).unwrap();
+        let receipts = ProjectionReceiptStore::open_for_endpoint(
+            &dir.path().join("authoring-receipts"),
+            workspace_id,
+            endpoint,
         )
         .unwrap();
+        finalize(
+            &dir.path().join("authoring-archive"),
+            &graph,
+            &receipts,
+            endpoint,
+        )
+        .unwrap()
+    };
+    let prepared = match enrollment {
+        Some((graph, receipts)) => {
+            let endpoint = receipts.endpoint_binding().unwrap();
+            match finalize(&archive_path, graph, receipts, endpoint) {
+                Ok(prepared) => prepared,
+                Err(EngineError::ProjectionManifest(message))
+                    if message.starts_with("local authoring requires reconciliation")
+                        || message.contains("No such file or directory") =>
+                {
+                    finalize_with_isolated_authority(Some(endpoint))
+                }
+                Err(error) => panic!("projection fixture seed could not finalize: {error:?}"),
+            }
+        }
+        None => finalize_with_isolated_authority(None),
+    };
 
-    let archive_path = dir.path().join("archive");
     let writer = ObjectStore::open(&archive_path, workspace_id).unwrap();
     writer.publish_prepared(&prepared).unwrap();
     assert!(matches!(
@@ -402,6 +455,84 @@ fn hierarchy_order_annotations_and_bytes_are_deterministic() {
         let rendered = &first.target()[span.start() as usize..span.end() as usize];
         assert!(rendered.starts_with(b"- ") || rendered.windows(2).any(|pair| pair == b"- "));
         assert!(!rendered.is_empty());
+    }
+}
+
+#[test]
+fn imported_markdown_structural_trivia_is_span_instrumentation_transparent() {
+    let sources = [
+        "- a\n\n",
+        "- a\n\n- b\n",
+        "- a\r\n\r\n- b\r\n\r\n",
+        "- a",
+        "title:: Page\n\n\n- a\n- b\n",
+        "- fenced\n  ```text\n\n  - literal\n  ```\n\n- task\n  :LOGBOOK:\n  CLOCK: [2026-07-29 Wed]\n  :END:\n\n- final\n",
+    ];
+
+    for (case, source) in sources.into_iter().enumerate() {
+        let parsed = tine_core::doc::parse(source);
+        let blocks = parsed
+            .roots
+            .iter()
+            .enumerate()
+            .map(|(index, parsed)| {
+                block(
+                    case as u128 * 100 + index as u128 + 1,
+                    None,
+                    &format!("{index:04}"),
+                    parsed.raw.clone(),
+                    None,
+                )
+            })
+            .collect();
+        let mut state = page("pages/structural-trivia.md", blocks);
+        state.page.preamble = parsed.pre_block;
+        let projected = plan_projection(workspace(1), &state, Some(source.as_bytes()))
+            .unwrap_or_else(|error| panic!("case {case} rejected span instrumentation: {error}"));
+        assert_eq!(
+            projected.target(),
+            source.as_bytes(),
+            "case {case} did not reproduce exact source bytes"
+        );
+    }
+}
+
+#[test]
+fn imported_org_structural_trivia_is_span_instrumentation_transparent() {
+    let sources = [
+        "* a\n\n",
+        "* a\n\n* b\n",
+        "* a\r\n\r\n* b\r\n\r\n",
+        "* a",
+        "#+TITLE: Page\n\n\n* a\n* b\n",
+        "* source\n#+BEGIN_SRC text\n* literal headline\n#+END_SRC\n\n* task\n:LOGBOOK:\nCLOCK: [2026-07-29 Wed]\n:END:\n\n* final\n",
+    ];
+
+    for (case, source) in sources.into_iter().enumerate() {
+        let parsed = tine_core::org::parse_org(source);
+        let blocks = parsed
+            .roots
+            .iter()
+            .enumerate()
+            .map(|(index, parsed)| {
+                block(
+                    case as u128 * 100 + index as u128 + 1,
+                    None,
+                    &format!("{index:04}"),
+                    parsed.raw.clone(),
+                    None,
+                )
+            })
+            .collect();
+        let mut state = page("pages/structural-trivia.org", blocks);
+        state.page.preamble = parsed.pre_block;
+        let projected = plan_projection(workspace(1), &state, Some(source.as_bytes()))
+            .unwrap_or_else(|error| panic!("case {case} rejected span instrumentation: {error}"));
+        assert_eq!(
+            projected.target(),
+            source.as_bytes(),
+            "case {case} did not reproduce exact source bytes"
+        );
     }
 }
 
@@ -1747,16 +1878,17 @@ fn fail_before_legacy_sparse_write_and_recovery_cannot_cross_graph_roots() {
 }
 
 #[test]
-fn receipts_allow_custom_nested_roots_but_graph_authorizes_only_configured_roots() {
+fn receipts_allow_custom_nested_roots_and_graph_rewrites_eligible_external_text() {
     let configured_engine_dir = TestDir::new("configured-root-engine");
     let graph_dir = TestDir::new("configured-root-graph");
     fs::create_dir_all(graph_dir.path().join("logseq")).unwrap();
     fs::write(
         graph_dir.path().join("logseq/config.edn"),
         "{:pages-directory \"archive/pages\"\n\
-          :journals-directory \"archive/journals\"}\n",
+         :journals-directory \"archive/journals\"}\n",
     )
     .unwrap();
+    fs::create_dir_all(graph_dir.path().join("archive/pages")).unwrap();
     let receipts_dir = TestDir::new("configured-root-receipts");
     let graph = Graph::open(graph_dir.path());
     let binding = projection_binding(&graph, 60_060);
@@ -1789,15 +1921,19 @@ fn receipts_allow_custom_nested_roots_but_graph_authorizes_only_configured_roots
         Some((&graph, &store)),
     );
     assert!(ManagedPath::parse("pages/safe.md").is_ok());
-    assert!(write_projection_exact(
+    let unconfigured = write_projection_exact(
         &graph,
         &store,
         &unconfigured_engine,
         unconfigured_page,
         None,
     )
-    .is_err());
-    assert!(!graph_dir.path().join("pages/safe.md").exists());
+    .unwrap();
+    assert_eq!(unconfigured.plan.intent().path().as_str(), "pages/safe.md");
+    assert_eq!(
+        fs::read(graph_dir.path().join("pages/safe.md")).unwrap(),
+        unconfigured.plan.target()
+    );
 }
 
 #[test]
@@ -2378,63 +2514,60 @@ fn transport_ready_dense_looking_manifested_target_is_rejected_before_authority(
 }
 
 #[test]
-fn recovery_replays_intent_frontier_after_engine_and_claim_index_advance() {
-    let engine_dir = TestDir::new("advanced-recovery-engine");
-    let graph_dir = TestDir::new("advanced-recovery-graph");
-    fs::create_dir_all(graph_dir.path().join("pages")).unwrap();
-    fs::create_dir_all(graph_dir.path().join("journals")).unwrap();
-    let receipts_dir = TestDir::new("advanced-recovery-receipts");
-    let graph = Graph::open(graph_dir.path());
-    let (mut engine, page_id, store, _) = enrolled_engine_and_store(
-        &engine_dir,
-        &receipts_dir,
-        &graph,
-        "pages/advanced-recovery.md",
-        "historical",
-        60_110,
-    );
+fn recovery_replays_intent_frontier_after_engine_advance() {
+    let (dir, graph, store, writer, mut engine, binding, page_id, initial_intent, base) =
+        manifested_fixture(
+            "advanced-recovery",
+            "pages/advanced-recovery.md",
+            "historical",
+            60_110,
+        );
 
     let authorization = engine.authorize_projection_write(page_id).unwrap();
-    let historical = plan_projection(workspace(1), authorization.state(), None).unwrap();
-    store.publish_intent(historical.intent(), None).unwrap();
-    fs::write(
-        graph_dir.path().join("pages/advanced-recovery.md"),
-        historical.target(),
-    )
-    .unwrap();
+    let historical = plan_projection(workspace(1), authorization.state(), Some(&base)).unwrap();
+    assert_ne!(historical.intent(), &initial_intent);
 
     let later_batch = BatchId::from_uuid(uuid(720));
-    let later = engine
-        .prepare_bootstrap_transaction(
+    let later_draft = engine
+        .draft_author_transaction(
             AuthorBatch {
                 batch_id: later_batch,
-                author_device_id: DeviceId::from_uuid(uuid(721)),
+                author_device_id: binding.device_id(),
                 author_session_id: SessionId::from_uuid(uuid(722)),
                 crdt_peer_id: CrdtPeerId::from_u64(723),
             },
-            &OperationTransaction::new(vec![SemanticOperation::MutateBlockLogseqIdentity {
+            BatchOrigin::LocalMutation,
+            &OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
                 block: BlockLocation {
                     block_id: BlockId::from_uuid(uuid(703)),
                     home_document_id: DocumentId::from_uuid(uuid(702)),
                 },
-                mutation: tine_core::oplog::LogseqIdentityMutation::AssignExternal {
-                    logseq_uuid: logseq(724),
-                },
+                content: "advanced".into(),
             }])
             .unwrap(),
         )
         .unwrap();
-    let writer = ObjectStore::open(&engine_dir.path().join("archive"), workspace(1)).unwrap();
+    let later = engine
+        .finalize_author_transaction(later_draft, &graph, &store, binding)
+        .unwrap();
     writer.publish_prepared(&later).unwrap();
     assert!(matches!(
         engine.stage_archive_batch(later_batch).unwrap().disposition,
         tine_core::oplog::BatchDisposition::Accepted { .. }
     ));
     assert_eq!(
-        engine.materialize_page(page_id).unwrap().blocks[0].logseq_uuid,
-        Some(logseq(724))
+        engine.materialize_page(page_id).unwrap().blocks[0].content,
+        "advanced"
     );
 
+    store
+        .publish_intent(historical.intent(), Some(&base))
+        .unwrap();
+    fs::write(
+        dir.path().join("graph/pages/advanced-recovery.md"),
+        historical.target(),
+    )
+    .unwrap();
     let recovered = recover_incomplete_projections(&graph, &store, &engine).unwrap();
     assert_eq!(recovered.len(), 1);
     assert_eq!(recovered[0].plan.intent(), historical.intent());

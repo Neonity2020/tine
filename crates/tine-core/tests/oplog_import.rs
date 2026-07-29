@@ -128,7 +128,14 @@ impl AuthorityFixture {
         .unwrap();
         let lineage = LineageDigest::of(b"oplog-import-authority");
         let catalog = DocumentId::from_uuid(uuid(200));
-        let author = ShardedHotEngine::new(workspace(), lineage, catalog);
+        let archive_path = dir.path().join("archive");
+        let author = ShardedHotEngine::with_enrolled_projection(
+            ObjectStore::open(&archive_path, workspace()).unwrap(),
+            lineage,
+            catalog,
+            &graph,
+            &receipts,
+        );
         let mut operations = Vec::new();
         let mut authority = Vec::new();
         for (page_index, page) in pages.iter().enumerate() {
@@ -180,18 +187,22 @@ impl AuthorityFixture {
         }
         let transaction = OperationTransaction::new(operations).unwrap();
         let batch_id = BatchId::from_uuid(uuid(300));
-        let prepared = author
-            .prepare_bootstrap_transaction(
+        let draft = author
+            .draft_author_transaction(
                 AuthorBatch {
                     batch_id,
-                    author_device_id: DeviceId::from_uuid(uuid(301)),
+                    author_device_id: endpoint.device_id(),
                     author_session_id: SessionId::from_uuid(uuid(302)),
                     crdt_peer_id: CrdtPeerId::from_u64(303),
                 },
+                BatchOrigin::LocalMutation,
                 &transaction,
             )
             .unwrap();
-        let archive_path = dir.path().join("archive");
+        let prepared = author
+            .finalize_author_transaction(draft, &graph, &receipts, endpoint)
+            .unwrap();
+        drop(author);
         let writer = ObjectStore::open(&archive_path, workspace()).unwrap();
         writer.publish_prepared(&prepared).unwrap();
         drop(writer);
@@ -253,17 +264,23 @@ impl AuthorityFixture {
         }])
         .unwrap();
         let batch_id = BatchId::from_uuid(uuid(seed));
-        let prepared = self
+        let endpoint = self.receipts.endpoint_binding().unwrap();
+        let draft = self
             .engine
-            .prepare_bootstrap_transaction(
+            .draft_author_transaction(
                 AuthorBatch {
                     batch_id,
-                    author_device_id: DeviceId::from_uuid(uuid(seed + 1)),
+                    author_device_id: endpoint.device_id(),
                     author_session_id: SessionId::from_uuid(uuid(seed + 2)),
                     crdt_peer_id: CrdtPeerId::from_u64(seed as u64 + 3),
                 },
+                BatchOrigin::LocalMutation,
                 &transaction,
             )
+            .unwrap();
+        let prepared = self
+            .engine
+            .finalize_author_transaction(draft, &self.graph, &self.receipts, endpoint)
             .unwrap();
         let writer = ObjectStore::open(&self.archive_path, workspace()).unwrap();
         writer.publish_prepared(&prepared).unwrap();
@@ -473,19 +490,20 @@ fn corrupt_completion_and_conflicting_local_tail_fail_closed() {
         .root_path()
         .join("completions")
         .join(format!("{}.completion", hex(intent_id.as_bytes())));
+    let valid_completion = fs::read(&completion).unwrap();
     fs::write(&completion, b"forged downstream bytes").unwrap();
     let corrupt = fixture.plan(&["pages/page.md"]);
     assert_eq!(corrupt.status(), ImportPlanStatus::Blocked);
     assert!(blocked_reasons(&corrupt).contains(&ImportBlockReason::CorruptBase));
 
-    fs::remove_file(&completion).unwrap();
+    fs::write(&completion, valid_completion).unwrap();
     fixture.append_local_tail(0, 0, "local tail", 400);
+    fs::remove_file(&completion).unwrap();
     let stale = fixture.plan(&["pages/page.md"]);
     assert_eq!(stale.status(), ImportPlanStatus::Blocked);
-    assert!(blocked_reasons(&stale).contains(&ImportBlockReason::MissingBase));
     assert!(
-        !blocked_reasons(&stale).contains(&ImportBlockReason::ConflictingLocalTail),
-        "the corrupt/missing completion remains the earlier fail-closed boundary"
+        blocked_reasons(&stale).contains(&ImportBlockReason::ConflictingLocalTail),
+        "the accepted local mutation must prevent stale external authority: {stale:?}"
     );
 }
 
@@ -649,6 +667,133 @@ fn nested_edits_retain_structure_and_unequal_duplicate_gaps_never_guess() {
             .blocks()
             .is_empty(),
         "unequal duplicate gap must conservatively lose continuity"
+    );
+}
+
+#[test]
+fn non_round_tripping_markdown_and_org_block_before_external_execution() {
+    let markdown = AuthorityFixture::one_page(
+        "mixed-indent-admission",
+        "pages/page.md",
+        vec![BlockSpec::root("parent", "a")],
+    );
+    let mixed = b"- parent changed\n\t- a\n  - b\n";
+    markdown.overwrite("pages/page.md", mixed);
+    let markdown_plan = markdown.plan(&["pages/page.md"]);
+    assert!(blocked_reasons(&markdown_plan).contains(&ImportBlockReason::UnsafeInput));
+    assert_eq!(
+        fs::read(markdown.graph_root.join("pages/page.md")).unwrap(),
+        mixed
+    );
+
+    let org = AuthorityFixture::one_page(
+        "skipped-org-level-admission",
+        "pages/page.org",
+        vec![BlockSpec::root("parent", "a")],
+    );
+    let skipped = b"* parent changed\n*** child\n";
+    org.overwrite("pages/page.org", skipped);
+    let org_plan = org.plan(&["pages/page.org"]);
+    assert!(blocked_reasons(&org_plan).contains(&ImportBlockReason::UnsafeInput));
+    assert_eq!(
+        fs::read(org.graph_root.join("pages/page.org")).unwrap(),
+        skipped
+    );
+}
+
+#[test]
+fn round_tripping_external_edits_remain_admitted_and_formatting_noop_stays_unpublished() {
+    let markdown = AuthorityFixture::one_page(
+        "valid-space-indent-admission",
+        "pages/page.md",
+        vec![BlockSpec::root("parent", "a")],
+    );
+    let valid_markdown = b"- parent edited\r\n  - child edited\r\n\r\n";
+    markdown.overwrite("pages/page.md", valid_markdown);
+    assert_eq!(
+        markdown.plan(&["pages/page.md"]).status(),
+        ImportPlanStatus::Reconcile
+    );
+    assert_eq!(
+        fs::read(markdown.graph_root.join("pages/page.md")).unwrap(),
+        valid_markdown
+    );
+
+    let org = AuthorityFixture::one_page(
+        "valid-org-admission",
+        "pages/page.org",
+        vec![BlockSpec::root("parent", "a")],
+    );
+    let valid_org = b"* parent edited\n** child edited\n";
+    org.overwrite("pages/page.org", valid_org);
+    assert_eq!(
+        org.plan(&["pages/page.org"]).status(),
+        ImportPlanStatus::Reconcile
+    );
+
+    let formatting_only = AuthorityFixture::one_page(
+        "formatting-only-admission",
+        "pages/Imported Page 0.md",
+        vec![BlockSpec::root("parent", "0000000000")],
+    );
+    let crlf = b"- parent\r\n";
+    formatting_only.overwrite("pages/Imported Page 0.md", crlf);
+    let formatting_plan = formatting_only.plan(&["pages/Imported Page 0.md"]);
+    assert_eq!(formatting_plan.status(), ImportPlanStatus::Noop);
+    assert!(formatting_plan.blocks().is_empty());
+    assert_eq!(
+        fs::read(formatting_only.graph_root.join("pages/Imported Page 0.md")).unwrap(),
+        crlf
+    );
+}
+
+#[test]
+fn uppercase_org_external_edits_use_org_admission_and_preserve_nested_structure() {
+    let fixture = AuthorityFixture::one_page(
+        "uppercase-org-import",
+        "pages/Outline.ORG",
+        vec![
+            BlockSpec::root("parent", "a"),
+            BlockSpec::child("child", 0, "a"),
+        ],
+    );
+    let edited = b"* parent edited\n** child edited\n";
+    fixture.overwrite("pages/Outline.ORG", edited);
+
+    let plan = fixture.plan(&["pages/Outline.ORG"]);
+    assert_eq!(plan.status(), ImportPlanStatus::Reconcile, "{plan:?}");
+    assert!(plan.blocks().is_empty());
+    let matches = plan.matches().unwrap().blocks();
+    assert_eq!(matches.len(), 2);
+    assert_eq!(matches[0].locator().components(), &[0]);
+    assert_eq!(matches[0].block_id(), fixture.pages[0].block_ids[0]);
+    assert_eq!(matches[1].locator().components(), &[0, 0]);
+    assert_eq!(matches[1].block_id(), fixture.pages[0].block_ids[1]);
+    assert_eq!(
+        fs::read(fixture.graph_root.join("pages/Outline.ORG")).unwrap(),
+        edited
+    );
+
+    let formatting_only = AuthorityFixture::one_page(
+        "uppercase-org-formatting-only",
+        "pages/Imported Page 0.ORG",
+        vec![
+            BlockSpec::root("parent", "0000000000"),
+            BlockSpec::child("child", 0, "0000000000"),
+        ],
+    );
+    let crlf = b"* parent\r\n** child\r\n";
+    formatting_only.overwrite("pages/Imported Page 0.ORG", crlf);
+    let formatting_plan = formatting_only.plan(&["pages/Imported Page 0.ORG"]);
+    assert_eq!(
+        formatting_plan.status(),
+        ImportPlanStatus::Noop,
+        "{formatting_plan:?}"
+    );
+    assert!(formatting_plan.blocks().is_empty());
+    assert_eq!(
+        fs::read(formatting_only.graph_root.join("pages/Imported Page 0.ORG")).unwrap(),
+        crlf
     );
 }
 

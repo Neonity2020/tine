@@ -13,8 +13,9 @@ use crate::crdt::{
     ProjectionPrecondition,
 };
 use crate::date::{JournalDate, JournalFormat};
-use crate::doc::{self, DocBlock, Document};
+use crate::doc::{self, DocBlock, Document, StructuralLayoutIdentity};
 use crate::graph_text_scope::{GraphTextScope, GraphTextScopeBinding};
+use crate::oplog::projection::GuardedProjectionLayout;
 use crate::oplog::projection_store::{
     ProjectionCleanupRetirementAuthority, ProjectionMutationAuthority,
     ProjectionRecoveryEvidencePublisher, MAX_PROJECTION_EVIDENCE_BYTES,
@@ -29,6 +30,7 @@ use cap_std::fs::{Dir, OpenOptions as CapOpenOptions};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cell::Cell;
+use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
@@ -384,6 +386,83 @@ fn parse_doc(path: &Path, content: &str) -> Document {
         Format::Md => doc::parse(content),
         Format::Org => crate::org::parse_org(content),
     }
+}
+
+fn bind_guarded_projection_identities(
+    document: &mut Document,
+    identities: &[StructuralLayoutIdentity],
+) -> io::Result<()> {
+    fn bind_blocks(
+        blocks: &mut [DocBlock],
+        locator: &mut Vec<u32>,
+        identities: &[StructuralLayoutIdentity],
+        index: &mut usize,
+        seen: &mut HashSet<String>,
+    ) -> io::Result<()> {
+        for (position, block) in blocks.iter_mut().enumerate() {
+            locator.push(u32::try_from(position).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "guarded projection tree is too wide",
+                )
+            })?);
+            let identity = identities.get(*index).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "guarded projection target has incomplete identity authority",
+                )
+            })?;
+            if identity.locator != *locator
+                || identity.block_identity.is_empty()
+                || !seen.insert(identity.block_identity.clone())
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "guarded projection target identity authority is non-canonical",
+                ));
+            }
+            block.uuid.clone_from(&identity.block_identity);
+            *index += 1;
+            bind_blocks(&mut block.children, locator, identities, index, seen)?;
+            locator.pop();
+        }
+        Ok(())
+    }
+
+    let mut index = 0;
+    bind_blocks(
+        &mut document.roots,
+        &mut Vec::new(),
+        identities,
+        &mut index,
+        &mut HashSet::with_capacity(identities.len()),
+    )?;
+    if index != identities.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "guarded projection target has excess identity authority",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn canonical_guarded_projection_layout_for_test(
+    graph: &Graph,
+    relative_path: &str,
+    target: &[u8],
+) -> io::Result<GuardedProjectionLayout> {
+    let target_path = graph.projection_page_target(relative_path)?;
+    let target_text = std::str::from_utf8(target).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "test projection target is not valid UTF-8",
+        )
+    })?;
+    Ok(GuardedProjectionLayout::canonical_for_test(&parse_doc(
+        &target_path.absolute_path,
+        target_text,
+    )))
 }
 
 /// Lightweight entry for the page list / sidebar.
@@ -1053,12 +1132,34 @@ impl HandoffSafeGuard {
         Ok(permit)
     }
 
+    #[cfg(test)]
     pub(crate) fn write_page_projection(
         &self,
         graph: &Graph,
         relative_path: &str,
         expected_base: Option<&[u8]>,
         target: &[u8],
+        authority: &mut ProjectionMutationAuthority,
+    ) -> io::Result<ProjectionWriteProof> {
+        let guarded_layout =
+            canonical_guarded_projection_layout_for_test(graph, relative_path, target)?;
+        self.write_page_projection_with_layout(
+            graph,
+            relative_path,
+            expected_base,
+            target,
+            &guarded_layout,
+            authority,
+        )
+    }
+
+    pub(crate) fn write_page_projection_with_layout(
+        &self,
+        graph: &Graph,
+        relative_path: &str,
+        expected_base: Option<&[u8]>,
+        target: &[u8],
+        guarded_layout: &GuardedProjectionLayout,
         authority: &mut ProjectionMutationAuthority,
     ) -> io::Result<ProjectionWriteProof> {
         #[cfg(test)]
@@ -1070,6 +1171,7 @@ impl HandoffSafeGuard {
                 relative_path,
                 expected_base,
                 target,
+                guarded_layout,
                 reservation,
                 known_attempts,
                 Some(publisher),
@@ -1099,12 +1201,34 @@ impl HandoffSafeGuard {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn recover_page_projection(
         &self,
         graph: &Graph,
         relative_path: &str,
         expected_base: Option<&[u8]>,
         expected_target: &[u8],
+        authority: &mut ProjectionMutationAuthority,
+    ) -> io::Result<ProjectionWriteProof> {
+        let guarded_layout =
+            canonical_guarded_projection_layout_for_test(graph, relative_path, expected_target)?;
+        self.recover_page_projection_with_layout(
+            graph,
+            relative_path,
+            expected_base,
+            expected_target,
+            &guarded_layout,
+            authority,
+        )
+    }
+
+    pub(crate) fn recover_page_projection_with_layout(
+        &self,
+        graph: &Graph,
+        relative_path: &str,
+        expected_base: Option<&[u8]>,
+        expected_target: &[u8],
+        guarded_layout: &GuardedProjectionLayout,
         authority: &mut ProjectionMutationAuthority,
     ) -> io::Result<ProjectionWriteProof> {
         #[cfg(test)]
@@ -1116,6 +1240,7 @@ impl HandoffSafeGuard {
                 relative_path,
                 expected_base,
                 expected_target,
+                guarded_layout,
                 attempts,
             )
         })
@@ -1156,6 +1281,24 @@ impl HandoffSafeGuard {
                 relative_path,
                 reservation,
                 known_attempts,
+            )
+        })
+    }
+
+    pub(crate) fn confirm_existing_page_projection(
+        &self,
+        graph: &Graph,
+        relative_path: &str,
+        expected_target: &[u8],
+        authority: &mut ProjectionMutationAuthority,
+    ) -> io::Result<ProjectionWriteProof> {
+        let write = self.admit_projection_writer(graph)?;
+        authority.consume_write_evidence(relative_path, |reservation, _, _| {
+            graph.confirm_existing_page_projection_with_attempts(
+                &write,
+                relative_path,
+                expected_target,
+                reservation,
             )
         })
     }
@@ -1233,12 +1376,34 @@ impl PublishedHandoffLatch {
         Ok(permit)
     }
 
+    #[cfg(test)]
     pub(crate) fn write_page_projection(
         &self,
         graph: &Graph,
         relative_path: &str,
         expected_base: Option<&[u8]>,
         target: &[u8],
+        authority: &mut ProjectionMutationAuthority,
+    ) -> io::Result<ProjectionWriteProof> {
+        let guarded_layout =
+            canonical_guarded_projection_layout_for_test(graph, relative_path, target)?;
+        self.write_page_projection_with_layout(
+            graph,
+            relative_path,
+            expected_base,
+            target,
+            &guarded_layout,
+            authority,
+        )
+    }
+
+    pub(crate) fn write_page_projection_with_layout(
+        &self,
+        graph: &Graph,
+        relative_path: &str,
+        expected_base: Option<&[u8]>,
+        target: &[u8],
+        guarded_layout: &GuardedProjectionLayout,
         authority: &mut ProjectionMutationAuthority,
     ) -> io::Result<ProjectionWriteProof> {
         #[cfg(test)]
@@ -1250,6 +1415,7 @@ impl PublishedHandoffLatch {
                 relative_path,
                 expected_base,
                 target,
+                guarded_layout,
                 reservation,
                 known_attempts,
                 Some(publisher),
@@ -1279,12 +1445,34 @@ impl PublishedHandoffLatch {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn recover_page_projection(
         &self,
         graph: &Graph,
         relative_path: &str,
         expected_base: Option<&[u8]>,
         expected_target: &[u8],
+        authority: &mut ProjectionMutationAuthority,
+    ) -> io::Result<ProjectionWriteProof> {
+        let guarded_layout =
+            canonical_guarded_projection_layout_for_test(graph, relative_path, expected_target)?;
+        self.recover_page_projection_with_layout(
+            graph,
+            relative_path,
+            expected_base,
+            expected_target,
+            &guarded_layout,
+            authority,
+        )
+    }
+
+    pub(crate) fn recover_page_projection_with_layout(
+        &self,
+        graph: &Graph,
+        relative_path: &str,
+        expected_base: Option<&[u8]>,
+        expected_target: &[u8],
+        guarded_layout: &GuardedProjectionLayout,
         authority: &mut ProjectionMutationAuthority,
     ) -> io::Result<ProjectionWriteProof> {
         #[cfg(test)]
@@ -1296,6 +1484,7 @@ impl PublishedHandoffLatch {
                 relative_path,
                 expected_base,
                 expected_target,
+                guarded_layout,
                 attempts,
             )
         })
@@ -14347,11 +14536,31 @@ impl Graph {
 
     /// Oplog entry into the singular page serializer and commit boundary.
     /// The exact recovery reservation is durable before this can mutate a name.
+    #[cfg(test)]
     pub(crate) fn write_page_projection(
         &self,
         relative_path: &str,
         expected_base: Option<&[u8]>,
         target: &[u8],
+        authority: &mut ProjectionMutationAuthority,
+    ) -> io::Result<ProjectionWriteProof> {
+        let guarded_layout =
+            canonical_guarded_projection_layout_for_test(self, relative_path, target)?;
+        self.write_page_projection_with_layout(
+            relative_path,
+            expected_base,
+            target,
+            &guarded_layout,
+            authority,
+        )
+    }
+
+    pub(crate) fn write_page_projection_with_layout(
+        &self,
+        relative_path: &str,
+        expected_base: Option<&[u8]>,
+        target: &[u8],
+        guarded_layout: &GuardedProjectionLayout,
         authority: &mut ProjectionMutationAuthority,
     ) -> io::Result<ProjectionWriteProof> {
         #[cfg(test)]
@@ -14363,6 +14572,7 @@ impl Graph {
                 relative_path,
                 expected_base,
                 target,
+                guarded_layout,
                 reservation,
                 known_attempts,
                 Some(publisher),
@@ -14384,76 +14594,95 @@ impl Graph {
     ) -> io::Result<ProjectionWriteProof> {
         let write = self.admit_retained_managed_text_writer()?;
         authority.consume_write_evidence(relative_path, |reservation, _, _| {
-            require_projection_platform()?;
-            if usize_to_u64(expected_target.len())? > MAX_PROJECTION_EVIDENCE_BYTES {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "projection target exceeds the evidence reload bound",
-                ));
-            }
-            let expected_text = std::str::from_utf8(expected_target).map_err(|_| {
+            self.confirm_existing_page_projection_with_attempts(
+                &write,
+                relative_path,
+                expected_target,
+                reservation,
+            )
+        })
+    }
+
+    fn confirm_existing_page_projection_with_attempts(
+        &self,
+        write: &ManagedTextWritePermit,
+        relative_path: &str,
+        expected_target: &[u8],
+        reservation: &ProjectionAttemptReservation,
+    ) -> io::Result<ProjectionWriteProof> {
+        require_projection_platform()?;
+        if usize_to_u64(expected_target.len())? > MAX_PROJECTION_EVIDENCE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "projection target exceeds the evidence reload bound",
+            ));
+        }
+        let expected_text = std::str::from_utf8(expected_target).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "projection target is not valid UTF-8",
+            )
+        })?;
+        let target = self.projection_page_target(relative_path)?;
+        validate_projection_attempt(&target, reservation)?;
+        let lock = self.page_lock(&target.absolute_path);
+        let _guard = lock.lock().unwrap();
+        let parent = self.projection_parent(&target, false)?;
+        preflight_projection_chain(&parent.chain)?;
+        self.ensure_projection_target_shape(&parent, &target)?;
+        self.validate_current_graph_text_collision(
+            write,
+            &target.absolute_path,
+            self.managed_optional_file_identity(write, &target.absolute_path)?,
+        )?;
+        let (file, current) =
+            open_and_read_projection_regular(parent.final_dir(), &target.filename)?;
+        if current != expected_target {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "existing projection target changed before confirmation",
+            ));
+        }
+        let document = parse_doc(&target.absolute_path, expected_text);
+        let (_, guarded) = self.serialize_page_document(
+            document,
+            &target.absolute_path,
+            Some(expected_text),
+            &[],
+        )?;
+        if guarded.as_bytes() != expected_target {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "existing projection differs from guarded page serialization",
+            ));
+        }
+        file.sync_all()?;
+        sync_projection_chain_required(&parent.chain)?;
+        self.ensure_projection_parent_binding(&parent, &target)?;
+        self.ensure_projection_target_shape(&parent, &target)?;
+        self.validate_current_graph_text_collision(
+            write,
+            &target.absolute_path,
+            self.managed_optional_file_identity(write, &target.absolute_path)?,
+        )?;
+        let reread =
+            read_projection_optional(parent.final_dir(), &target.filename)?.ok_or_else(|| {
                 io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "projection target is not valid UTF-8",
+                    io::ErrorKind::AlreadyExists,
+                    "existing projection disappeared during confirmation",
                 )
             })?;
-            let target = self.projection_page_target(relative_path)?;
-            validate_projection_attempt(&target, reservation)?;
-            let lock = self.page_lock(&target.absolute_path);
-            let _guard = lock.lock().unwrap();
-            let parent = self.projection_parent(&target, false)?;
-            preflight_projection_chain(&parent.chain)?;
-            self.ensure_projection_target_shape(&parent, &target)?;
-            self.validate_current_graph_text_collision(
-                &write,
-                &target.absolute_path,
-                self.managed_optional_file_identity(&write, &target.absolute_path)?,
-            )?;
-            let (file, current) =
-                open_and_read_projection_regular(parent.final_dir(), &target.filename)?;
-            if current != expected_target {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "bootstrap projection target changed before confirmation",
-                ));
-            }
-            let document = parse_doc(&target.absolute_path, expected_text);
-            let (_, guarded) =
-                self.serialize_page_document(document, &target.absolute_path, Some(expected_text))?;
-            if guarded.as_bytes() != expected_target {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "bootstrap projection differs from guarded page serialization",
-                ));
-            }
-            file.sync_all()?;
-            sync_projection_chain_required(&parent.chain)?;
-            self.ensure_projection_parent_binding(&parent, &target)?;
-            self.ensure_projection_target_shape(&parent, &target)?;
-            self.validate_current_graph_text_collision(
-                &write,
-                &target.absolute_path,
-                self.managed_optional_file_identity(&write, &target.absolute_path)?,
-            )?;
-            let reread = read_projection_optional(parent.final_dir(), &target.filename)?
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        "bootstrap projection disappeared during confirmation",
-                    )
-                })?;
-            if reread != expected_target {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "bootstrap projection changed during confirmation",
-                ));
-            }
-            Ok(ProjectionWriteProof::new(
-                target.relative_path,
-                reread,
-                Vec::new(),
-            ))
-        })
+        if reread != expected_target {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "existing projection changed during confirmation",
+            ));
+        }
+        Ok(ProjectionWriteProof::new(
+            target.relative_path,
+            reread,
+            Vec::new(),
+        ))
     }
 
     fn write_page_projection_with_attempts(
@@ -14462,6 +14691,7 @@ impl Graph {
         relative_path: &str,
         expected_base: Option<&[u8]>,
         target: &[u8],
+        guarded_layout: &GuardedProjectionLayout,
         reservation: &ProjectionAttemptReservation,
         known_attempts: &[ProjectionAttemptReservation],
         evidence_publisher: Option<&ProjectionRecoveryEvidencePublisher<'_>>,
@@ -14479,14 +14709,16 @@ impl Graph {
                 "projection target is not valid UTF-8",
             )
         })?;
-        if let Some(base) = expected_base {
-            std::str::from_utf8(base).map_err(|_| {
-                projection_semantic_refusal(
-                    io::ErrorKind::InvalidInput,
-                    "projection base is not valid UTF-8",
-                )
-            })?;
-        }
+        let expected_base_text =
+            expected_base
+                .map(std::str::from_utf8)
+                .transpose()
+                .map_err(|_| {
+                    projection_semantic_refusal(
+                        io::ErrorKind::InvalidInput,
+                        "projection base is not valid UTF-8",
+                    )
+                })?;
         let target_path = self.projection_page_target(relative_path)?;
         validate_projection_attempt(&target_path, reservation)?;
         for attempt in known_attempts {
@@ -14541,13 +14773,16 @@ impl Graph {
                     "projection base is not valid UTF-8",
                 )
             })?;
-        let target_doc = parse_doc(&target_path.absolute_path, target_text);
-        let serialization_base =
-            current_text.or_else(|| expected_base.and_then(|base| std::str::from_utf8(base).ok()));
+        let mut target_doc = parse_doc(&target_path.absolute_path, target_text);
+        bind_guarded_projection_identities(&mut target_doc, guarded_layout.target()).map_err(
+            |error| projection_semantic_refusal(error.kind(), error.to_string()),
+        )?;
+        let serialization_base = current_text.or(expected_base_text);
         let (_, guarded_target) = self.serialize_page_document(
             target_doc,
             &target_path.absolute_path,
             serialization_base,
+            guarded_layout.base(),
         )?;
         if guarded_target.as_bytes() != target {
             return Err(projection_semantic_refusal(
@@ -15279,11 +15514,22 @@ impl Graph {
             attempts.push(reservation.clone());
             attempts.clone()
         });
+        let document = parse_doc(
+            &self.projection_page_target(relative_path)?.absolute_path,
+            std::str::from_utf8(target).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "test target is not valid UTF-8",
+                )
+            })?,
+        );
+        let guarded_layout = GuardedProjectionLayout::canonical_for_test(&document);
         self.write_page_projection_with_attempts(
             &write,
             relative_path,
             expected_base,
             target,
+            &guarded_layout,
             &reservation,
             &attempts,
             None,
@@ -15349,11 +15595,23 @@ impl Graph {
                 .cloned()
                 .unwrap_or_default()
         });
+        let target_path = self.projection_page_target(relative_path)?;
+        let document = parse_doc(
+            &target_path.absolute_path,
+            std::str::from_utf8(expected_target).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "test target is not valid UTF-8",
+                )
+            })?,
+        );
+        let guarded_layout = GuardedProjectionLayout::canonical_for_test(&document);
         self.recover_page_projection_with_attempts(
             &write,
             relative_path,
             None,
             expected_target,
+            &guarded_layout,
             &attempts,
         )
     }
@@ -15865,11 +16123,31 @@ impl Graph {
 
     /// Reconstruct projection evidence only from an exact target that is freshly
     /// synced and reread through the same retained no-follow capability.
+    #[cfg(test)]
     pub(crate) fn recover_page_projection(
         &self,
         relative_path: &str,
         expected_base: Option<&[u8]>,
         expected_target: &[u8],
+        authority: &mut ProjectionMutationAuthority,
+    ) -> io::Result<ProjectionWriteProof> {
+        let guarded_layout =
+            canonical_guarded_projection_layout_for_test(self, relative_path, expected_target)?;
+        self.recover_page_projection_with_layout(
+            relative_path,
+            expected_base,
+            expected_target,
+            &guarded_layout,
+            authority,
+        )
+    }
+
+    pub(crate) fn recover_page_projection_with_layout(
+        &self,
+        relative_path: &str,
+        expected_base: Option<&[u8]>,
+        expected_target: &[u8],
+        guarded_layout: &GuardedProjectionLayout,
         authority: &mut ProjectionMutationAuthority,
     ) -> io::Result<ProjectionWriteProof> {
         #[cfg(test)]
@@ -15881,6 +16159,7 @@ impl Graph {
                 relative_path,
                 expected_base,
                 expected_target,
+                guarded_layout,
                 attempts,
             )
         })
@@ -15892,6 +16171,7 @@ impl Graph {
         relative_path: &str,
         expected_base: Option<&[u8]>,
         expected_target: &[u8],
+        guarded_layout: &GuardedProjectionLayout,
         attempts: &[ProjectionAttemptReservation],
     ) -> io::Result<ProjectionWriteProof> {
         require_projection_platform()?;
@@ -15907,6 +16187,16 @@ impl Graph {
                 "projection recovery target is not valid UTF-8",
             )
         })?;
+        let expected_base_text =
+            expected_base
+                .map(std::str::from_utf8)
+                .transpose()
+                .map_err(|_| {
+                    projection_semantic_refusal(
+                        io::ErrorKind::InvalidData,
+                        "projection recovery base is not valid UTF-8",
+                    )
+                })?;
         let target_path = self.projection_page_target(relative_path)?;
         for attempt in attempts {
             validate_projection_attempt(&target_path, attempt)?;
@@ -15914,18 +16204,16 @@ impl Graph {
         let lock = self.page_lock(&target_path.absolute_path);
         let _guard = lock.lock().unwrap();
         let parent = self.projection_parent(&target_path, false)?;
-        let base_text = expected_base
-            .map(std::str::from_utf8)
-            .transpose()
-            .map_err(|_| {
-                projection_semantic_refusal(
-                    io::ErrorKind::InvalidData,
-                    "projection recovery base is not valid UTF-8",
-                )
-            })?;
-        let target_doc = parse_doc(&target_path.absolute_path, expected_target_text);
-        let (_, guarded_target) =
-            self.serialize_page_document(target_doc, &target_path.absolute_path, base_text)?;
+        let mut target_doc = parse_doc(&target_path.absolute_path, expected_target_text);
+        bind_guarded_projection_identities(&mut target_doc, guarded_layout.target()).map_err(
+            |error| projection_semantic_refusal(error.kind(), error.to_string()),
+        )?;
+        let (_, guarded_target) = self.serialize_page_document(
+            target_doc,
+            &target_path.absolute_path,
+            expected_base_text,
+            guarded_layout.base(),
+        )?;
         if guarded_target.as_bytes() != expected_target {
             return Err(projection_semantic_refusal(
                 io::ErrorKind::InvalidData,
@@ -17359,7 +17647,7 @@ impl Graph {
                 bind_document_title_property(&mut doc, &page.name);
             }
         }
-        let (doc, content) = self.serialize_page_document(doc, path, existing)?;
+        let (doc, content) = self.serialize_page_document(doc, path, existing, &[])?;
         // No-op save: identical bytes already on disk (e.g. focus/blur with no real
         // edit, or a forced flush of an unchanged page). Skip the write, the
         // watcher record, AND — crucially — the cache update below.
@@ -17445,6 +17733,7 @@ impl Graph {
         mut doc: Document,
         path: &Path,
         existing: Option<&str>,
+        layout_identities: &[StructuralLayoutIdentity],
     ) -> io::Result<(Document, String)> {
         // (A new journal's `path` was named by `path_for` using the graph's
         // `:journal/file-name-format` — so custom-format graphs create the correct
@@ -17505,7 +17794,8 @@ impl Graph {
                 // post-property blank line, indent) so an unchanged save is
                 // byte-identical and edits produce a minimal diff — critical to
                 // avoid Syncthing churn against Logseq.
-                let opts = doc::SerializeOpts::detect(existing);
+                let opts =
+                    doc::SerializeOpts::detect_with_layout_identities(existing, layout_identities);
                 let mut content = doc::serialize_with(&doc, &opts);
                 // A5: if the ONLY difference from disk is whitespace trivia the
                 // serializer doesn't round-trip byte-exactly (post-property
@@ -17541,7 +17831,11 @@ impl Graph {
                         ));
                     }
                 }
-                crate::org::serialize_org_detect(&doc, existing)
+                crate::org::serialize_org_detect_with_layout_identities(
+                    &doc,
+                    existing,
+                    layout_identities,
+                )
             }
         };
         Ok((doc, content))
@@ -37823,6 +38117,8 @@ mod tests {
         let reserved = dir.join("pages").join(reservation.recovery_filename());
         fs::write(&reserved, b"- forged\n").unwrap();
         let write = graph.admit_retained_managed_text_writer().unwrap();
+        let document = parse_doc(&path, "- target\n");
+        let guarded_layout = GuardedProjectionLayout::canonical_for_test(&document);
 
         assert!(graph
             .write_page_projection_with_attempts(
@@ -37830,6 +38126,7 @@ mod tests {
                 "pages/Collision.md",
                 Some(b"- base\n"),
                 b"- target\n",
+                &guarded_layout,
                 &reservation,
                 std::slice::from_ref(&reservation),
                 None,

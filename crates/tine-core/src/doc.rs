@@ -11,6 +11,7 @@
 //! structured views (`properties`, `marker`, `collapsed`) are computed on top.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::ops::Range;
 
 /// Recognized task markers (leading keyword of a block).
@@ -46,6 +47,30 @@ pub struct Document {
 pub(crate) struct ParsedDocument {
     pub(crate) document: Document,
     pub(crate) block_spans: Vec<Range<usize>>,
+    /// Empty structural lines immediately before each block header, in
+    /// depth-first/source order. These are document formatting, not block raw.
+    pub(crate) blank_lines_before_blocks: Vec<usize>,
+    /// Empty separator lines between the preamble and first block.
+    pub(crate) blank_lines_after_preamble: usize,
+    /// Empty lines before the first block when no semantic preamble exists.
+    pub(crate) leading_blank_lines: usize,
+    /// The first root is an importer-style collapsed ATX heading that remains
+    /// unbulleted while owning the following outline blocks as children.
+    pub(crate) promoted_collapsed_preamble_heading: bool,
+}
+
+/// One receipt-proved association between a source structural locator and the
+/// stable identity of the semantic block that occupied it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StructuralLayoutIdentity {
+    pub(crate) locator: Vec<u32>,
+    pub(crate) block_identity: String,
+}
+
+#[derive(Clone, Debug)]
+struct IdentityBoundBlankLines {
+    block_identity: String,
+    blank_lines: usize,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -813,7 +838,7 @@ fn markdown_property_line(line: &str) -> bool {
 fn promote_preamble_collapsed_heading(
     pre_block: &mut Option<String>,
     roots: &mut Vec<DocBlock>,
-) -> Option<usize> {
+) -> Option<(usize, usize)> {
     if roots.is_empty() {
         return None;
     }
@@ -848,7 +873,7 @@ fn promote_preamble_collapsed_heading(
         pre_end -= 1;
     }
     *pre_block = (pre_end > 0).then(|| lines[..pre_end].join("\n"));
-    Some(start)
+    Some((start, start.saturating_sub(pre_end)))
 }
 
 pub fn parse(content: &str) -> Document {
@@ -880,7 +905,10 @@ pub(crate) fn parse_with_source_spans(content: &str) -> ParsedDocument {
         normalized_to_original = None;
         content
     };
-    let body = content.strip_suffix('\n').unwrap_or(content);
+    // The complete terminal newline run is document formatting. Keeping even
+    // one of its empty lines in the final block raw gives both the block and
+    // SerializeOpts ownership of the same bytes.
+    let body = content.trim_end_matches('\n');
     let lines: Vec<&str> = if body.is_empty() {
         Vec::new()
     } else {
@@ -911,6 +939,14 @@ pub(crate) fn parse_with_source_spans(content: &str) -> ParsedDocument {
     } else {
         Some(pre_lines[..pre_end].join("\n"))
     };
+    let (mut blank_lines_after_preamble, mut leading_blank_lines) = if pre_end == 0 {
+        // The source has no semantic preamble, so this value is dormant for an
+        // exact reserialization. Retain the canonical one-blank separator for
+        // a later edit that promotes/inserts a page-property preamble.
+        (1, pre_lines.len())
+    } else {
+        (pre_lines.len().saturating_sub(pre_end), 0)
+    };
 
     // Build the block forest with a stack of frames keyed by indent column.
     struct Frame {
@@ -936,6 +972,8 @@ pub(crate) fn parse_with_source_spans(content: &str) -> ParsedDocument {
     let mut stack: Vec<Frame> = Vec::new();
     let mut roots: Vec<DocBlock> = Vec::new();
     let mut block_starts = Vec::new();
+    let mut blank_lines_before_blocks = Vec::new();
+    let mut pending_blank_lines = 0_usize;
 
     // Collapse frames at indent column >= `keep_above` into their parents.
     fn fold_to(stack: &mut Vec<Frame>, roots: &mut Vec<DocBlock>, keep_above: usize) {
@@ -964,6 +1002,10 @@ pub(crate) fn parse_with_source_spans(content: &str) -> ParsedDocument {
             .last()
             .map(|f| f.fence.is_some() || f.org_block.is_some())
             .unwrap_or(false);
+        if !in_literal && !stack.is_empty() && line.trim().is_empty() {
+            pending_blank_lines = pending_blank_lines.saturating_add(1);
+            continue;
+        }
         // A `- ` line starts a new block only when we're outside both literal
         // region kinds of the current top frame.
         if !in_literal {
@@ -984,10 +1026,16 @@ pub(crate) fn parse_with_source_spans(content: &str) -> ParsedDocument {
                     org_block,
                 });
                 block_starts.push(line_starts[pre_lines.len() + line_idx]);
+                blank_lines_before_blocks.push(pending_blank_lines);
+                pending_blank_lines = 0;
                 continue;
             }
         }
         if let Some(top) = stack.last_mut() {
+            for _ in 0..pending_blank_lines {
+                top.raw.push('\n');
+            }
+            pending_blank_lines = 0;
             // Continuation line: strip the block's content-start indentation.
             let stripped = strip_n_ws(line, top.content_start);
             top.raw.push('\n');
@@ -1011,8 +1059,18 @@ pub(crate) fn parse_with_source_spans(content: &str) -> ParsedDocument {
     }
     fold_to(&mut stack, &mut roots, 0);
 
-    if let Some(promoted_line) = promote_preamble_collapsed_heading(&mut pre_block, &mut roots) {
+    let mut promoted_collapsed_preamble_heading = false;
+    if let Some((promoted_line, separator_lines)) =
+        promote_preamble_collapsed_heading(&mut pre_block, &mut roots)
+    {
+        promoted_collapsed_preamble_heading = true;
         block_starts.insert(0, line_starts[promoted_line]);
+        blank_lines_before_blocks.insert(0, 0);
+        if pre_block.is_some() {
+            blank_lines_after_preamble = separator_lines;
+        } else {
+            leading_blank_lines = separator_lines;
+        }
     }
 
     let original_offset = |normalized_offset: usize| {
@@ -1034,6 +1092,10 @@ pub(crate) fn parse_with_source_spans(content: &str) -> ParsedDocument {
     ParsedDocument {
         document: Document { pre_block, roots },
         block_spans,
+        blank_lines_before_blocks,
+        blank_lines_after_preamble,
+        leading_blank_lines,
+        promoted_collapsed_preamble_heading,
     }
 }
 
@@ -1054,8 +1116,17 @@ fn strip_n_ws(line: &str, n: usize) -> &str {
 pub struct SerializeOpts {
     /// Number of trailing `\n` characters to end the file with.
     pub trailing_newlines: usize,
-    /// Emit a blank line between the page-property pre-block and the first block.
-    pub blank_after_props: bool,
+    /// Empty separator lines between the page preamble and first block.
+    pub blank_lines_after_preamble: usize,
+    /// Empty lines before the first block when no semantic preamble exists.
+    pub leading_blank_lines: usize,
+    /// Source-order layout is safe only when the complete semantic document is
+    /// unchanged. Edited documents use the identity-bound subset below.
+    source_document: Option<Document>,
+    source_blank_lines_before_blocks: Vec<usize>,
+    identity_bound_blank_lines: Vec<IdentityBoundBlankLines>,
+    source_promoted_collapsed_preamble_heading: bool,
+    promoted_collapsed_block_identity: Option<String>,
     /// Whitespace for one level of indentation (e.g. `"\t"` or `"  "`).
     pub indent: String,
 }
@@ -1064,7 +1135,13 @@ impl Default for SerializeOpts {
     fn default() -> Self {
         SerializeOpts {
             trailing_newlines: 1,
-            blank_after_props: true,
+            blank_lines_after_preamble: 1,
+            leading_blank_lines: 0,
+            source_document: None,
+            source_blank_lines_before_blocks: Vec::new(),
+            identity_bound_blank_lines: Vec::new(),
+            source_promoted_collapsed_preamble_heading: false,
+            promoted_collapsed_block_identity: None,
             indent: "\t".into(),
         }
     }
@@ -1074,30 +1151,128 @@ impl SerializeOpts {
     /// Infer the formatting of an existing on-disk file so a save reproduces it.
     /// `None` (new file) falls back to the default.
     pub fn detect(existing: Option<&str>) -> SerializeOpts {
+        Self::detect_with_layout_identities(existing, &[])
+    }
+
+    pub(crate) fn detect_with_layout_identities(
+        existing: Option<&str>,
+        identities: &[StructuralLayoutIdentity],
+    ) -> SerializeOpts {
         match existing {
             None => SerializeOpts::default(),
-            Some(s) => SerializeOpts {
-                // Count trailing `\n` within the trailing run of newline bytes, so
-                // a CRLF file's `\r` doesn't truncate the count (`…\r\n\r\n` ⇒ 2).
-                trailing_newlines: s
-                    .bytes()
-                    .rev()
-                    .take_while(|b| *b == b'\n' || *b == b'\r')
-                    .filter(|b| *b == b'\n')
-                    .count(),
-                blank_after_props: blank_after_props(s),
-                indent: detect_indent(s),
-            },
+            Some(s) => {
+                let parsed = parse_with_source_spans(s);
+                Self::from_parsed_source(s, parsed, detect_indent(s), identities)
+            }
         }
+    }
+
+    pub(crate) fn from_parsed_source(
+        source: &str,
+        parsed: ParsedDocument,
+        indent: String,
+        identities: &[StructuralLayoutIdentity],
+    ) -> SerializeOpts {
+        let mut locator_indexes = HashMap::with_capacity(parsed.block_spans.len());
+        collect_locator_indexes(
+            &parsed.document.roots,
+            &mut Vec::new(),
+            &mut locator_indexes,
+        );
+        let mut identity_bound_blank_lines = Vec::with_capacity(identities.len());
+        let mut promoted_collapsed_block_identity = None;
+        for identity in identities {
+            let Some(index) = locator_indexes.get(identity.locator.as_slice()).copied() else {
+                continue;
+            };
+            let Some(blank_lines) = parsed.blank_lines_before_blocks.get(index).copied() else {
+                continue;
+            };
+            identity_bound_blank_lines.push(IdentityBoundBlankLines {
+                block_identity: identity.block_identity.clone(),
+                blank_lines,
+            });
+            if parsed.promoted_collapsed_preamble_heading && identity.locator.as_slice() == [0] {
+                promoted_collapsed_block_identity = Some(identity.block_identity.clone());
+            }
+        }
+        SerializeOpts {
+            // Count trailing `\n` within the trailing run of newline bytes, so
+            // a CRLF file's `\r` doesn't truncate the count.
+            trailing_newlines: source
+                .bytes()
+                .rev()
+                .take_while(|b| *b == b'\n' || *b == b'\r')
+                .filter(|b| *b == b'\n')
+                .count(),
+            blank_lines_after_preamble: parsed.blank_lines_after_preamble,
+            leading_blank_lines: parsed.leading_blank_lines,
+            source_document: Some(parsed.document),
+            source_blank_lines_before_blocks: parsed.blank_lines_before_blocks,
+            identity_bound_blank_lines,
+            source_promoted_collapsed_preamble_heading: parsed.promoted_collapsed_preamble_heading,
+            promoted_collapsed_block_identity,
+            indent,
+        }
+    }
+
+    pub(crate) fn resolved_blank_lines(&self, doc: &Document) -> Vec<usize> {
+        if self.source_document.as_ref() == Some(doc) {
+            return self.source_blank_lines_before_blocks.clone();
+        }
+        let by_identity = self
+            .identity_bound_blank_lines
+            .iter()
+            .map(|layout| (layout.block_identity.as_str(), layout.blank_lines))
+            .collect::<HashMap<_, _>>();
+        let mut resolved = Vec::new();
+        collect_identity_bound_blank_lines(&doc.roots, &by_identity, &mut resolved);
+        if let Some(first) = resolved.first_mut() {
+            // Moving an inter-block separator ahead of the first target block
+            // would turn it into page-leading trivia (and, for Org, a semantic
+            // preamble). That local context is no longer the source context.
+            *first = 0;
+        }
+        resolved
+    }
+
+    pub(crate) fn preserves_promoted_collapsed_heading(&self, doc: &Document) -> bool {
+        if self.source_document.as_ref() == Some(doc) {
+            return self.source_promoted_collapsed_preamble_heading;
+        }
+        doc.roots.len() == 1
+            && doc.roots.first().is_some_and(|block| {
+                !block.uuid.is_empty()
+                    && self.promoted_collapsed_block_identity.as_deref()
+                        == Some(block.uuid.as_str())
+            })
     }
 }
 
-/// Does the file put a blank line between its pre-block and the first bullet?
-fn blank_after_props(s: &str) -> bool {
-    let lines: Vec<&str> = s.split('\n').collect();
-    match lines.iter().position(|l| bullet(l).is_some()) {
-        Some(i) if i > 0 => lines[i - 1].trim().is_empty(),
-        _ => true,
+fn collect_locator_indexes(
+    blocks: &[DocBlock],
+    locator: &mut Vec<u32>,
+    indexes: &mut HashMap<Vec<u32>, usize>,
+) {
+    for (position, block) in blocks.iter().enumerate() {
+        let Ok(position) = u32::try_from(position) else {
+            return;
+        };
+        locator.push(position);
+        indexes.insert(locator.clone(), indexes.len());
+        collect_locator_indexes(&block.children, locator, indexes);
+        locator.pop();
+    }
+}
+
+fn collect_identity_bound_blank_lines(
+    blocks: &[DocBlock],
+    by_identity: &HashMap<&str, usize>,
+    resolved: &mut Vec<usize>,
+) {
+    for block in blocks {
+        resolved.push(by_identity.get(block.uuid.as_str()).copied().unwrap_or(0));
+        collect_identity_bound_blank_lines(&block.children, by_identity, resolved);
     }
 }
 
@@ -1147,21 +1322,62 @@ pub fn serialize_with(doc: &Document, opts: &SerializeOpts) -> String {
         for line in pre.split('\n') {
             out.push(line.to_string());
         }
-        // Blank separator before blocks — only when blocks follow and the file
-        // used one.
-        if !doc.roots.is_empty() && opts.blank_after_props {
-            out.push(String::new());
+        if !doc.roots.is_empty() {
+            out.extend(std::iter::repeat_with(String::new).take(opts.blank_lines_after_preamble));
         }
+    } else if !doc.roots.is_empty() {
+        out.extend(std::iter::repeat_with(String::new).take(opts.leading_blank_lines));
     }
+    let blank_lines_before_blocks = opts.resolved_blank_lines(doc);
+    let promoted_collapsed_preamble_heading = opts.preserves_promoted_collapsed_heading(doc);
+    let mut block_index = 0_usize;
     for block in &doc.roots {
-        emit_block(block, 0, &opts.indent, &mut out);
+        emit_block(
+            block,
+            0,
+            &opts.indent,
+            &blank_lines_before_blocks,
+            &mut block_index,
+            promoted_collapsed_preamble_heading,
+            &mut out,
+        );
     }
     let mut s = out.join("\n");
     s.push_str(&"\n".repeat(opts.trailing_newlines));
     s
 }
 
-fn emit_block(block: &DocBlock, level: usize, unit: &str, out: &mut Vec<String>) {
+fn emit_block(
+    block: &DocBlock,
+    level: usize,
+    unit: &str,
+    blank_lines_before_blocks: &[usize],
+    block_index: &mut usize,
+    promoted_collapsed_preamble_heading: bool,
+    out: &mut Vec<String>,
+) {
+    let unbulleted_promoted_heading = promoted_collapsed_preamble_heading && *block_index == 0;
+    let blank_lines = blank_lines_before_blocks
+        .get(*block_index)
+        .copied()
+        .unwrap_or(0);
+    out.extend(std::iter::repeat_with(String::new).take(blank_lines));
+    *block_index = block_index.saturating_add(1);
+    if unbulleted_promoted_heading {
+        out.extend(block.raw.split('\n').map(ToOwned::to_owned));
+        for child in &block.children {
+            emit_block(
+                child,
+                level,
+                unit,
+                blank_lines_before_blocks,
+                block_index,
+                promoted_collapsed_preamble_heading,
+                out,
+            );
+        }
+        return;
+    }
     let ind = unit.repeat(level);
     let mut lines = block.raw.split('\n');
     let first = lines.next().unwrap_or("");
@@ -1178,8 +1394,27 @@ fn emit_block(block: &DocBlock, level: usize, unit: &str, out: &mut Vec<String>)
         }
     }
     for child in &block.children {
-        emit_block(child, level + 1, unit, out);
+        emit_block(
+            child,
+            level + 1,
+            unit,
+            blank_lines_before_blocks,
+            block_index,
+            promoted_collapsed_preamble_heading,
+            out,
+        );
     }
+}
+
+/// Whether detected Markdown formatting plus the parsed document reproduces
+/// the exact source bytes. Mixed line endings and non-uniform indentation fail
+/// closed because detected formatting deliberately has one representation.
+pub fn markdown_round_trips(content: &str) -> bool {
+    let mut rendered = serialize_with(&parse(content), &SerializeOpts::detect(Some(content)));
+    if content.contains("\r\n") {
+        rendered = rendered.replace('\n', "\r\n");
+    }
+    rendered == content
 }
 
 #[cfg(test)]
@@ -1234,6 +1469,35 @@ mod property_fence_tests {
         );
         assert_eq!(SerializeOpts::detect(Some("- a\r\n")).trailing_newlines, 1);
         assert_eq!(SerializeOpts::detect(Some("- a\n\n")).trailing_newlines, 2);
+    }
+
+    #[test]
+    fn structural_blank_line_trivia_round_trips_without_entering_block_raw() {
+        let cases = [
+            ("final-blank-lines", "- a\n\n"),
+            ("between-blocks", "- a\n\n- b\n"),
+            ("crlf", "- a\r\n\r\n- b\r\n\r\n"),
+            ("no-final-newline", "- a"),
+            ("leading-blank-lines", "\n\n- a\n"),
+            ("preamble", "title:: Page\n\n\n- a\n"),
+            (
+                "fence-and-logbook",
+                "- fenced\n  ```text\n\n  - literal\n  ```\n\n- task\n  :LOGBOOK:\n  CLOCK: [2026-07-29 Wed]\n  :END:\n\n- final\n",
+            ),
+        ];
+
+        for (name, source) in cases {
+            let parsed = parse(source);
+            assert!(
+                markdown_round_trips(source),
+                "{name} must retain exact structural trivia"
+            );
+            assert!(
+                parsed.roots.iter().all(|block| !block.raw.ends_with('\n')),
+                "{name} leaked document-owned trailing trivia into a root raw: {:?}",
+                parsed.roots
+            );
+        }
     }
 }
 
