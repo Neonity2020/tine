@@ -10804,14 +10804,16 @@ fn provider_rename_named_noreplace(
         .map_err(|_| std::io::Error::new(ErrorKind::InvalidInput, "invalid provider target"))?;
     // SAFETY: both names are live C strings and are resolved relative to
     // retained directory capabilities. RENAME_NOREPLACE atomically consumes
-    // the exact source name without overwriting a destination.
+    // the exact source name without overwriting a destination. Calling the
+    // syscall avoids Android's API-30-only renameat2 wrapper.
     let result = unsafe {
-        libc::renameat2(
+        libc::syscall(
+            libc::SYS_renameat2,
             source_dir.as_fd().as_raw_fd(),
             source.as_ptr(),
             destination_dir.as_fd().as_raw_fd(),
             destination.as_ptr(),
-            libc::RENAME_NOREPLACE as _,
+            libc::RENAME_NOREPLACE as libc::c_uint,
         )
     };
     if result == 0 {
@@ -10855,13 +10857,15 @@ fn provider_exchange_names(
         .map_err(|_| std::io::Error::new(ErrorKind::InvalidInput, "invalid provider target"))?;
     // SAFETY: both names are live and capability-relative. RENAME_EXCHANGE
     // ensures that any racing replacement is preserved in diagnostic storage.
+    // Calling the syscall avoids Android's API-30-only renameat2 wrapper.
     let result = unsafe {
-        libc::renameat2(
+        libc::syscall(
+            libc::SYS_renameat2,
             source_dir.as_fd().as_raw_fd(),
             source.as_ptr(),
             destination_dir.as_fd().as_raw_fd(),
             destination.as_ptr(),
-            libc::RENAME_EXCHANGE as _,
+            libc::RENAME_EXCHANGE as libc::c_uint,
         )
     };
     if result == 0 {

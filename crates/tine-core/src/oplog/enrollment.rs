@@ -6814,8 +6814,11 @@ fn rename_noreplace(directory: &Dir, from: &str, to: &str) -> std::io::Result<()
     let to = CString::new(to)
         .map_err(|_| std::io::Error::new(ErrorKind::InvalidInput, "invalid record name"))?;
     // SAFETY: both names are live relative C strings beneath one retained dir.
+    // Android's renameat2 wrapper is API-30-only, while syscall is available
+    // across the supported Android range.
     let result = unsafe {
-        libc::renameat2(
+        libc::syscall(
+            libc::SYS_renameat2,
             directory.as_fd().as_raw_fd(),
             from.as_ptr(),
             directory.as_fd().as_raw_fd(),
