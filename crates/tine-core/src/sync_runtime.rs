@@ -18374,6 +18374,85 @@ mod tests {
     }
 
     #[test]
+    fn shared_provider_new_nested_path_converges_after_duplicate_delivery_and_receiver_crash() {
+        let (first, second, first_handle, second_handle) =
+            joined_shared_pair("provider-new-nested-path-crash", 0xe500);
+        let path = "notes/provider-created/deep/physical-source.md";
+        fs::create_dir_all(first.graph_root.join(path).parent().unwrap()).unwrap();
+        assert!(first.graph_root.join("notes").is_dir());
+        assert!(second.graph_root.join("notes").is_dir());
+        assert!(!second.graph_root.join(path).parent().unwrap().exists());
+        assert!(matches!(
+            first_handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+        fs::write(
+            first.graph_root.join(path),
+            b"- provider-created nested page\n",
+        )
+        .unwrap();
+        let source_handle = active_handle(SyncRuntimeHandle::open(reopen_request(&first.request)));
+        let admission = drain_until_settled(&source_handle);
+        assert!(
+            admitted_an_epoch(&admission),
+            "source external edit did not enter immutable history: {admission:?}"
+        );
+        settle_shared_provider(&source_handle);
+        let source = load_editor_named(&source_handle, "physical-source", SyncPageKind::Page);
+        assert_eq!(source.name, "physical-source");
+        assert_eq!(source.path, path);
+        assert!(source
+            .blocks
+            .iter()
+            .any(|block| block.content == "provider-created nested page"));
+        assert!(matches!(
+            source_handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+        let graph = Graph::open(&first.graph_root);
+        let parsed_entry = graph
+            .list_pages()
+            .into_iter()
+            .find(|entry| entry.rel_path == path)
+            .expect("independent parser lost the source page");
+        let parsed_source = graph.load_page(&parsed_entry).unwrap();
+        assert_eq!(parsed_source.name, source.name);
+        assert!(parsed_source
+            .blocks
+            .iter()
+            .any(|block| block.raw.contains("provider-created nested page")));
+
+        copy_provider_tree(&first.request.provider_root, &second.request.provider_root);
+        second_handle.observe_provider().unwrap();
+        for _ in 0..32 {
+            let _ = second_handle.tick().unwrap();
+        }
+        drop(second_handle);
+
+        copy_provider_tree(&first.request.provider_root, &second.request.provider_root);
+        copy_provider_tree(&first.request.provider_root, &second.request.provider_root);
+        let receiver = active_handle(SyncRuntimeHandle::open(reopen_request(&second.request)));
+        receiver.observe_provider().unwrap();
+        let mut last_tick = SyncRuntimeTick::Idle;
+        for _ in 0..256 {
+            last_tick = receiver.tick().unwrap();
+            if receiver.status().unwrap().provider_pending == 0 {
+                break;
+            }
+        }
+        let status = receiver.status().unwrap();
+        assert_eq!(
+            status.provider_pending, 0,
+            "eventual duplicate delivery plus receiver restart did not converge: \
+             {status:?}, last tick {last_tick:?}"
+        );
+        assert_eq!(
+            fs::read(second.graph_root.join(path)).unwrap(),
+            fs::read(first.graph_root.join(path)).unwrap()
+        );
+    }
+
+    #[test]
     fn closed_device_walks_only_an_unseen_linear_tail_from_latest_head() {
         let (initiator, receiver, initiator_handle, receiver_handle) =
             joined_shared_pair("provider-head-linear-tail", 0xb2e0);

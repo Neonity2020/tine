@@ -1904,6 +1904,35 @@
         "failBefore": "proven"
       },
       "notes": "Fail-before: a public editor save changed Markdown title:: from Editor Title Before to Editor Title After while preserving the blocks. Graph::open observed the new title immediately, but authoritative oplog replay, SQLite, and the restarted editor retained Editor Title Before. Editor saves now use the canonical external-document parser and the identity decision shared with import, preserve a title-only edit's physical path, and atomically compose logical rename, parser-derived kind, final content, collision checks, referrer rewrites, and every affected page. Shared semantic scenarios cover Markdown and Org title add/change/removal, existing and new Page/Journal transitions, nested and nonstandard paths, policy changes, no-op reimport, and two restarts."
+    },
+    {
+      "id": "REG-SYNC-RECEIVER-NESTED-PARENT-CONVERGENCE-001",
+      "title": "Provider-delivered nested pages converge even when receiver parent directories do not yet exist",
+      "family": "sync-data-safety",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/sync_runtime.rs::shared_provider_new_nested_path_converges_after_duplicate_delivery_and_receiver_crash",
+          "crates/tine-core/src/model.rs::projection_input_absence_and_publication_cover_nested_unicode_layouts",
+          "crates/tine-core/src/model.rs::projection_retry_resumes_after_synced_partial_parent_chain",
+          "crates/tine-core/src/model.rs::missing_nested_tombstone_completes_without_creating_parents",
+          "crates/tine-core/src/model.rs::missing_nested_tombstone_refuses_parent_and_target_appearance_before_proof",
+          "crates/tine-core/src/model.rs::projection_missing_capture_rejects_regular_file_intermediate",
+          "crates/tine-core/src/model.rs::projection_missing_capture_rejects_symlink_intermediate_without_escape",
+          "crates/tine-core/src/model.rs::projection_missing_capture_rejects_reparse_intermediate_without_escape"
+        ],
+        "scenario": "sync.receiver-nested-parent-convergence",
+        "failBefore": "proven"
+      },
+      "notes": "Fail-before: an honest offline device created notes/provider-created/deep/physical-source.md and published it through ordinary external-file admission. After complete provider delivery, receiver crash/restart, and duplicate redelivery, a receiver lacking only provider-created/deep remained permanently blocked with authenticated expected-path authority missing and never projected the page. Pre-creating only that parent chain made the exact scenario converge. Projection input capture now reports a stably missing ancestor as semantic absence while ordinary files, symlinks/reparse points, special entries, permission failures, and traversal races remain errors. Present publication reaches the retained-capability recursive writer; a retry resumes after a synced partial chain, while a proven nested tombstone completes without creating parents. The original duplicate-delivery/restart scenario now drains provider work and produces parser-visible receiver bytes."
     }
   ]
 }

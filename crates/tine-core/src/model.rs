@@ -347,6 +347,11 @@ impl ProjectionParent {
     }
 }
 
+enum ProjectionParentCapture {
+    Missing,
+    Present(ProjectionParent),
+}
+
 fn validate_projection_attempt(
     target: &ProjectionTarget,
     attempt: &ProjectionAttemptReservation,
@@ -3337,6 +3342,7 @@ thread_local! {
     static PROJECTION_PARENT_RETARGET: std::cell::RefCell<Option<ProjectionParentRetarget>> = const { std::cell::RefCell::new(None) };
     static PROJECTION_CASE_ALIAS: std::cell::RefCell<Option<(String, String)>> = const { std::cell::RefCell::new(None) };
     static FAIL_NEXT_PROJECTION_DIRECTORY_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAIL_AFTER_PROJECTION_PARENT_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static TEST_PROJECTION_ATTEMPTS: std::cell::RefCell<std::collections::BTreeMap<String, Vec<ProjectionAttemptReservation>>> = const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
     static PROJECTION_EXACT_OPEN_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static PROJECTION_GRAPH_CALLS: std::cell::Cell<ProjectionGraphTestCounters> = const { std::cell::Cell::new(ProjectionGraphTestCounters { write_calls: 0, remove_calls: 0, recovery_calls: 0 }) };
@@ -3689,6 +3695,7 @@ pub(crate) fn reset_projection_graph_test_hooks() {
     PROJECTION_PARENT_RETARGET.with(|retarget| drop(retarget.borrow_mut().take()));
     PROJECTION_CASE_ALIAS.with(|alias| drop(alias.borrow_mut().take()));
     FAIL_NEXT_PROJECTION_DIRECTORY_SYNC.with(|fail| fail.set(false));
+    FAIL_AFTER_PROJECTION_PARENT_SYNC.with(|fail| fail.set(false));
     TEST_PROJECTION_ATTEMPTS.with(|catalog| catalog.borrow_mut().clear());
     PROJECTION_EXACT_OPEN_COUNT.with(|count| count.set(0));
     MANAGED_INVENTORY_READ_RACE.with(|hook| drop(hook.borrow_mut().take()));
@@ -4071,6 +4078,25 @@ fn projection_directory_sync_hook(_dir: &Path) -> io::Result<()> {
 
 #[cfg(not(test))]
 fn projection_directory_sync_hook(_dir: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+fn projection_parent_after_sync_hook() -> io::Result<()> {
+    FAIL_AFTER_PROJECTION_PARENT_SYNC.with(|fail| {
+        if fail.replace(false) {
+            Err(io::Error::new(
+                io::ErrorKind::Other,
+                "injected crash after projection parent creation and sync",
+            ))
+        } else {
+            Ok(())
+        }
+    })
+}
+
+#[cfg(not(test))]
+fn projection_parent_after_sync_hook() -> io::Result<()> {
     Ok(())
 }
 
@@ -6350,7 +6376,9 @@ impl Graph {
         let target = self.projection_page_target(path.as_str())?;
         let lock = self.page_lock(&target.absolute_path);
         let _guard = lock.lock().unwrap();
-        let parent = self.projection_parent(&target, false)?;
+        let Some(parent) = self.projection_parent_optional(&target)? else {
+            return Ok(None);
+        };
         self.ensure_projection_parent_binding(&parent, &target)?;
         self.ensure_projection_target_shape(&parent, &target)?;
         read_projection_optional(parent.final_dir(), &target.filename)
@@ -6412,20 +6440,9 @@ impl Graph {
         require_projection_platform()?;
         self.ensure_projection_root_binding()?;
         let target = self.projection_page_target(path.as_str())?;
-        let parent = match self.projection_parent(&target, false) {
-            Ok(parent) => parent,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                self.ensure_projection_root_binding()?;
-                return match self.projection_parent(&target, false) {
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-                    Ok(_) => Err(io::Error::new(
-                        io::ErrorKind::Interrupted,
-                        "managed parent appeared during absence capture",
-                    )),
-                    Err(error) => Err(error),
-                };
-            }
-            Err(error) => return Err(error),
+        let parent = match self.projection_parent_optional(&target)? {
+            Some(parent) => parent,
+            None => return Ok(None),
         };
         self.ensure_projection_parent_binding(&parent, &target)?;
         projection_optional_regular_metadata(parent.final_dir(), &target.filename)?;
@@ -9925,12 +9942,62 @@ impl Graph {
                 Err(error) if create_missing && error.kind() == io::ErrorKind::NotFound => {
                     current.create_dir(component)?;
                     sync_projection_directory_required(current)?;
+                    projection_parent_after_sync_hook()?;
                 }
                 Err(error) => return Err(error),
             }
             chain.push(open_projection_dir_nofollow(current, component)?);
         }
         Ok(ProjectionParent { chain })
+    }
+
+    fn projection_parent_optional(
+        &self,
+        target: &ProjectionTarget,
+    ) -> io::Result<Option<ProjectionParent>> {
+        match self.projection_parent_capture(target)? {
+            ProjectionParentCapture::Present(parent) => Ok(Some(parent)),
+            ProjectionParentCapture::Missing => {
+                self.ensure_projection_root_binding()?;
+                match self.projection_parent_capture(target)? {
+                    ProjectionParentCapture::Missing => {
+                        self.ensure_projection_root_binding()?;
+                        Ok(None)
+                    }
+                    ProjectionParentCapture::Present(_) => Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "projection parent appeared during absence capture",
+                    )),
+                }
+            }
+        }
+    }
+
+    fn projection_parent_capture(
+        &self,
+        target: &ProjectionTarget,
+    ) -> io::Result<ProjectionParentCapture> {
+        let root = self.projection_root.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "graph has no retained no-follow projection capability",
+            )
+        })?;
+        let mut chain = vec![root.try_clone()?];
+        for component in &target.parent_components {
+            let current = chain.last().expect("projection chain contains root");
+            match projection_real_directory(current, component) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    return Ok(ProjectionParentCapture::Missing);
+                }
+                Err(error) => return Err(error),
+            }
+            // A component that disappears or changes after successful shape
+            // validation is a traversal race, not semantic absence.
+            chain.push(open_projection_dir_nofollow(current, component)?);
+        }
+        Ok(ProjectionParentCapture::Present(ProjectionParent { chain }))
     }
 
     fn ensure_projection_target_shape(
@@ -15569,7 +15636,28 @@ impl Graph {
         let lock = self.page_lock(&target.absolute_path);
         let _guard = lock.lock().unwrap();
         self.validate_current_graph_text_collision(write, &target.absolute_path, None)?;
-        let parent = self.projection_parent(&target, false)?;
+        let Some(parent) = self.projection_parent_optional(&target)? else {
+            let hooks = combine_projection_hook_results(
+                projection_post_publish_hook(&target.absolute_path),
+                projection_post_publish_collision_hook(),
+            );
+            let validation = (|| {
+                self.validate_current_graph_text_collision(write, &target.absolute_path, None)?;
+                match self.projection_parent_optional(&target)? {
+                    None => Ok(()),
+                    Some(_) => Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "projection confirmation parent appeared during absence proof",
+                    )),
+                }
+            })();
+            combine_projection_hook_validation(hooks, validation)?;
+            return Ok(ProjectionWriteProof::new(
+                target.relative_path,
+                Vec::new(),
+                Vec::new(),
+            ));
+        };
         self.ensure_projection_target_shape(&parent, &target)?;
         if read_projection_optional(parent.final_dir(), &target.filename)?.is_some() {
             return Err(io::Error::new(
@@ -34516,6 +34604,190 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn projection_input_absence_and_publication_cover_nested_unicode_layouts() {
+        let dir = scratch("projection-input-nested-unicode");
+        fs::create_dir_all(dir.join("logseq")).unwrap();
+        fs::write(
+            dir.join("logseq/config.edn"),
+            "{:pages-directory \"archive/pages\"\n\
+              :journals-directory \"archive/journals\"}\n",
+        )
+        .unwrap();
+        let graph = Graph::open(&dir);
+        let cases = [
+            (
+                "archive/pages/題材/深い/ノート.md",
+                b"- configured Unicode page\n".as_slice(),
+            ),
+            (
+                "archive/pagesish/自由/Elsewhere.md",
+                b"- graph-wide nonstandard page\n".as_slice(),
+            ),
+        ];
+
+        for (relative, expected) in cases {
+            let path = ManagedPath::parse(relative).unwrap();
+            assert_eq!(graph.read_projection_input(&path).unwrap(), None);
+            assert!(
+                !dir.join(relative).parent().unwrap().exists(),
+                "input capture synthesized missing parents for {relative}"
+            );
+
+            let proof = graph
+                .write_projection_exact(relative, None, expected)
+                .unwrap();
+            assert_eq!(proof.path(), relative);
+            assert_eq!(fs::read(dir.join(relative)).unwrap(), expected);
+            assert_eq!(
+                graph.read_projection_input(&path).unwrap().as_deref(),
+                Some(expected)
+            );
+        }
+
+        let independent = Graph::open(&dir);
+        for relative in cases.map(|(relative, _)| relative) {
+            assert!(
+                independent
+                    .list_pages()
+                    .iter()
+                    .any(|entry| entry.rel_path == relative),
+                "independent graph scan did not observe {relative}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn projection_retry_resumes_after_synced_partial_parent_chain() {
+        let dir = scratch("projection-partial-parent-retry");
+        let relative = "pages/created/synced/deep/Projection.md";
+        let path = dir.join(relative);
+        let graph = Graph::open(&dir);
+
+        FAIL_AFTER_PROJECTION_PARENT_SYNC.with(|fail| fail.set(true));
+        assert!(graph
+            .write_projection_exact(relative, None, b"- retry target\n")
+            .is_err());
+        assert!(dir.join("pages/created").is_dir());
+        assert!(!dir.join("pages/created/synced").exists());
+        assert!(!path.exists());
+
+        let proof = graph
+            .write_projection_exact(relative, None, b"- retry target\n")
+            .unwrap();
+        assert_eq!(proof.bytes(), b"- retry target\n");
+        assert_eq!(fs::read(&path).unwrap(), b"- retry target\n");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_nested_tombstone_completes_without_creating_parents() {
+        let dir = scratch("projection-missing-nested-tombstone");
+        let relative = "pages/deleted/deep/Gone.md";
+        let path = ManagedPath::parse(relative).unwrap();
+        let graph = Graph::open(&dir);
+
+        assert_eq!(graph.read_projection_input(&path).unwrap(), None);
+        let proof = graph.confirm_removed_projection_exact(relative).unwrap();
+        assert_eq!(proof.path(), relative);
+        assert!(proof.bytes().is_empty());
+        assert!(!dir.join(relative).parent().unwrap().exists());
+        assert!(!dir.join(relative).exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_nested_tombstone_refuses_parent_and_target_appearance_before_proof() {
+        let dir = scratch("projection-missing-tombstone-race");
+        let relative = "pages/deleted/deep/Gone.md";
+        let target = dir.join(relative);
+        let graph = Graph::open(&dir);
+
+        PROJECTION_POST_PUBLISH_COLLISION.with(|hook| {
+            let target = target.clone();
+            *hook.borrow_mut() = Some(Box::new(move || {
+                fs::create_dir_all(target.parent().unwrap())?;
+                fs::write(target, b"- appeared externally\n")
+            }));
+        });
+        assert!(graph.confirm_removed_projection_exact(relative).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"- appeared externally\n");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn projection_missing_capture_rejects_regular_file_intermediate() {
+        let dir = scratch("projection-regular-intermediate");
+        let blocker = dir.join("pages/blocker");
+        fs::write(&blocker, b"retained ordinary file").unwrap();
+        let relative = "pages/blocker/deep/Projection.md";
+        let graph = Graph::open(&dir);
+
+        assert!(graph
+            .read_projection_input(&ManagedPath::parse(relative).unwrap())
+            .is_err());
+        assert!(graph
+            .write_projection_exact(relative, None, b"- target\n")
+            .is_err());
+        assert_eq!(fs::read(&blocker).unwrap(), b"retained ordinary file");
+        assert!(!dir.join(relative).exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn projection_missing_capture_rejects_symlink_intermediate_without_escape() {
+        use std::os::unix::fs::symlink;
+
+        let dir = scratch("projection-symlink-intermediate");
+        let outside = scratch("projection-symlink-intermediate-outside");
+        symlink(&outside, dir.join("pages/linked")).unwrap();
+        let relative = "pages/linked/deep/Projection.md";
+        let graph = Graph::open(&dir);
+
+        assert!(graph
+            .read_projection_input(&ManagedPath::parse(relative).unwrap())
+            .is_err());
+        assert!(graph
+            .write_projection_exact(relative, None, b"- target\n")
+            .is_err());
+        assert!(!outside.join("deep/Projection.md").exists());
+        assert!(dir.join("pages/linked").symlink_metadata().is_ok());
+
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn projection_missing_capture_rejects_reparse_intermediate_without_escape() {
+        use std::os::windows::fs::symlink_dir;
+
+        let dir = scratch("projection-reparse-intermediate");
+        let outside = scratch("projection-reparse-intermediate-outside");
+        symlink_dir(&outside, dir.join("pages/linked")).unwrap();
+        let relative = "pages/linked/deep/Projection.md";
+        let graph = Graph::open(&dir);
+
+        assert!(graph
+            .read_projection_input(&ManagedPath::parse(relative).unwrap())
+            .is_err());
+        assert!(graph
+            .write_projection_exact(relative, None, b"- target\n")
+            .is_err());
+        assert!(!outside.join("deep/Projection.md").exists());
+        assert!(dir.join("pages/linked").symlink_metadata().is_ok());
+
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&outside);
     }
 
     #[test]
