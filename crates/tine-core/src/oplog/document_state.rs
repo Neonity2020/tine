@@ -1287,7 +1287,7 @@ mod tests {
         drop(exact);
         drop(external);
         drop(scratch);
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     #[test]
@@ -1362,7 +1362,7 @@ mod tests {
         drop(external_a);
         drop(external_b);
         drop(scratch);
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     #[test]
@@ -1425,7 +1425,7 @@ mod tests {
         drop(external_a);
         drop(external_b);
         drop(scratch);
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     #[test]
@@ -1453,7 +1453,7 @@ mod tests {
         assert!(writer.staged.is_empty());
 
         drop(scratch);
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     #[test]
@@ -1480,7 +1480,7 @@ mod tests {
         assert_eq!(writer.staged_hits, 0);
 
         drop(scratch);
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     #[test]
@@ -1607,7 +1607,7 @@ mod tests {
         drop(current_join);
         drop(base);
         drop(scratch);
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     #[test]
@@ -1726,6 +1726,6 @@ mod tests {
         drop(base_a);
         drop(base_b);
         drop(scratch);
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 }

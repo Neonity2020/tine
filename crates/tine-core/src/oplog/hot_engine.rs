@@ -23836,7 +23836,7 @@ mod validation_tests {
             drop(replayed);
             drop(expected);
             drop(store);
-            std::fs::remove_dir_all(root).unwrap();
+            crate::test_support::remove_dir_all(root);
         };
 
         replay_case("zero", false);
@@ -24312,7 +24312,7 @@ mod validation_tests {
 
         drop(engine);
         drop(writer);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     fn create_page_with_block(
@@ -25728,7 +25728,7 @@ mod validation_tests {
     fn finish_preauthor_gate_fixture(fixture: PreauthorGateFixture) {
         let root = fixture.root.clone();
         drop(fixture);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -26397,7 +26397,7 @@ mod validation_tests {
         );
         drop(engine);
         drop(writer);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     fn cursor_fixture(
@@ -26586,7 +26586,7 @@ mod validation_tests {
         drop(projection);
         drop(engine);
         drop(writer);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -26764,7 +26764,7 @@ mod validation_tests {
         drop(projection);
         drop(engine);
         drop(writer);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -26830,7 +26830,7 @@ mod validation_tests {
         drop(projection);
         drop(engine);
         drop(writer);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -26877,7 +26877,7 @@ mod validation_tests {
         drop(projection);
         drop(engine);
         drop(writer);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -26913,7 +26913,7 @@ mod validation_tests {
         drop(projection);
         drop(engine);
         drop(writer);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -26971,7 +26971,7 @@ mod validation_tests {
         drop(projection);
         drop(engine);
         drop(writer);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -27053,7 +27053,7 @@ mod validation_tests {
         drop(stale_history);
         drop(engine);
         drop(writer);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -27086,7 +27086,7 @@ mod validation_tests {
         drop(projection);
         drop(engine);
         drop(writer);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -27118,7 +27118,7 @@ mod validation_tests {
             .iter()
             .all(|row| row.kind() == ManagedTextKind::Page));
         drop(engine);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -27158,7 +27158,7 @@ mod validation_tests {
             }]
         );
         drop(engine);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -27209,7 +27209,7 @@ mod validation_tests {
         );
         assert_eq!(collect_cursor_rows(&engine, 1), expected);
         drop(engine);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -27256,7 +27256,7 @@ mod validation_tests {
         assert_eq!(collect_cursor_rows(&engine, 2), expected);
         drop(engine);
         drop(writer);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -27288,7 +27288,7 @@ mod validation_tests {
         assert!(page.rows().is_empty());
         assert!(!page.has_more());
         drop(engine);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -27309,7 +27309,7 @@ mod validation_tests {
         assert_eq!(exact_page.rows().len(), 2);
         assert!(!exact_page.has_more());
         drop(engine);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -27346,8 +27346,8 @@ mod validation_tests {
         ));
         drop(first);
         drop(engine);
-        std::fs::remove_dir_all(first_root).unwrap();
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(first_root);
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -27382,7 +27382,7 @@ mod validation_tests {
             Err(EngineError::Archive(message)) if message.contains("stale or consumed")
         ));
         drop(engine);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -27430,9 +27430,9 @@ mod validation_tests {
         drop(corrupt);
         drop(duplicate);
         drop(missing);
-        std::fs::remove_dir_all(corrupt_root).unwrap();
-        std::fs::remove_dir_all(duplicate_root).unwrap();
-        std::fs::remove_dir_all(missing_root).unwrap();
+        crate::test_support::remove_dir_all(corrupt_root);
+        crate::test_support::remove_dir_all(duplicate_root);
+        crate::test_support::remove_dir_all(missing_root);
     }
 
     #[test]
@@ -27511,9 +27511,9 @@ mod validation_tests {
         drop(aggregate_engine);
         drop(long_path_engine);
         drop(engine);
-        std::fs::remove_dir_all(aggregate_root).unwrap();
-        std::fs::remove_dir_all(long_root).unwrap();
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(aggregate_root);
+        crate::test_support::remove_dir_all(long_root);
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -27554,7 +27554,7 @@ mod validation_tests {
             second_page_reads <= super::super::scratch_store::AUTHENTICATED_CATALOG_MAX_DEPTH + 8
         );
         drop(engine);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     fn block_state(
@@ -30386,7 +30386,7 @@ mod validation_tests {
         );
         drop(engine);
         drop(writer);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -30759,7 +30759,7 @@ mod validation_tests {
             .is_some());
         drop(reopened);
         drop(writer);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -30887,7 +30887,7 @@ mod validation_tests {
 
         drop(engine);
         drop(writer);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -30979,7 +30979,7 @@ mod validation_tests {
 
         drop(engine);
         drop(writer);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -31061,7 +31061,7 @@ mod validation_tests {
 
         drop(engine);
         drop(writer);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -31132,7 +31132,7 @@ mod validation_tests {
 
         drop(reopened);
         drop(writer);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -31366,7 +31366,7 @@ mod validation_tests {
 
         drop(reopened);
         drop(writer);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -31400,7 +31400,7 @@ mod validation_tests {
 
         drop(reopened);
         drop(writer);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -31451,7 +31451,7 @@ mod validation_tests {
 
         drop(engine);
         drop(writer);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -31507,7 +31507,7 @@ mod validation_tests {
 
         drop(engine);
         drop(writer);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -31683,7 +31683,7 @@ mod validation_tests {
 
         drop(reopened);
         drop(writer);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -32009,7 +32009,7 @@ mod validation_tests {
 
         drop(engine);
         drop(writer);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -32171,7 +32171,7 @@ mod validation_tests {
         drop(right_author);
         drop(reopened);
         drop(writer);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -32338,7 +32338,7 @@ mod validation_tests {
         drop(left_author);
         drop(right_author);
         drop(writer);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -32539,7 +32539,7 @@ mod validation_tests {
         drop(receiver);
         drop(author);
         drop(writer);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     /// Direct-dependency registration is charged per dependency and resumes
@@ -32858,7 +32858,7 @@ mod validation_tests {
         drop(receiver);
         drop(author);
         drop(writer);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     /// A reconstructed engine must rediscover the exact remaining dependent
@@ -33059,7 +33059,7 @@ mod validation_tests {
         drop(receiver);
         drop(author);
         drop(writer);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -33253,7 +33253,7 @@ mod validation_tests {
         }
         drop(author);
         drop(writer);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -33556,7 +33556,7 @@ mod validation_tests {
         assert!(observed.iter().all(|result| result == &observed[0]));
         drop(author);
         drop(writer);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -33721,7 +33721,7 @@ mod validation_tests {
         }
         drop(receiver);
         drop(writer);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -33909,7 +33909,7 @@ mod validation_tests {
         }
         drop(receiver);
         drop(writer);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -34064,7 +34064,7 @@ mod validation_tests {
             }));
         drop(engine);
         drop(writer);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     /// Accepted fingerprint residency must not enter the author staleness
@@ -34435,7 +34435,7 @@ mod validation_tests {
 
         drop(reopened);
         drop(writer);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     /// Author `batches` accepted batches of `pages_per_batch` pages, each with
@@ -34576,7 +34576,7 @@ mod validation_tests {
             .expect("a quiescent run-local state encodes inside the resume-point ceiling");
         drop(engine);
         drop(writer);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
         encoded.len()
     }
 
@@ -34686,7 +34686,7 @@ mod validation_tests {
             );
             drop(engine);
             drop(writer);
-            std::fs::remove_dir_all(root).unwrap();
+            crate::test_support::remove_dir_all(root);
         }
     }
 
@@ -34712,7 +34712,7 @@ mod validation_tests {
         );
         drop(engine);
         drop(writer);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 }
 
@@ -35196,7 +35196,7 @@ mod replay_benchmark {
         );
         drop(engine);
         drop(writer);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -35351,7 +35351,7 @@ mod replay_benchmark {
         drop(right_author);
         drop(left_author);
         drop(writer);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -35730,7 +35730,7 @@ mod replay_benchmark {
         assert_eq!(replay.reference_catalog_root().unwrap(), &duplicate_root);
         assert_eq!(replay.reference_catalog.hot_entry_count(), 0);
         drop(replay);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]

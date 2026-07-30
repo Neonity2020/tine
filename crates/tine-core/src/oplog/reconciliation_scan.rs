@@ -3354,7 +3354,7 @@ mod tests {
             GraphTextScanFailureClass::UnstableEpoch,
             GraphTextScanFailureReason::FilesystemEvidenceChanged,
         );
-        fs::remove_dir_all(&moved).unwrap();
+        crate::test_support::remove_dir_all(&moved);
 
         let graph = temp.graph();
         let config = temp.root.join("logseq/config.edn");
@@ -3435,7 +3435,7 @@ mod tests {
             GraphTextScanFailureClass::UnstableEpoch,
             GraphTextScanFailureReason::FilesystemEvidenceChanged,
         );
-        fs::remove_dir_all(&moved).unwrap();
+        crate::test_support::remove_dir_all(&moved);
     }
 
     #[cfg(unix)]

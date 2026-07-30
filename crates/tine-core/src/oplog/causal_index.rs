@@ -465,6 +465,6 @@ mod tests {
         assert!(record.contains(BatchCausalDot::new(peer_b, 1).unwrap()));
         assert_eq!(store.stats().scratch_syncs, 0);
         drop(store);
-        std::fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 }

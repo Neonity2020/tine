@@ -14764,14 +14764,9 @@ mod tests {
             bytes.len()
         );
         let blocked = simulator.provider_snapshots().unwrap();
-        assert_eq!(
-            blocked[0]
-                .entries
-                .iter()
-                .filter(|entry| entry.temporary)
-                .count(),
-            2
-        );
+        // Anonymous O_TMPFILE staging has no directory entry; the named
+        // fallback exposes temporary entries. Neither mode may publish a
+        // canonical provider entry while the device is partitioned.
         assert!(blocked[0].entries.iter().all(|entry| entry.temporary));
         assert!(simulator.provider_ingress_receipts().is_empty());
 

@@ -2897,7 +2897,7 @@ mod tests {
         fn reset_shadow(&self) {
             let path = self.roots.canonical_root().join(SHADOW_ROOT_DIRECTORY);
             if path.exists() {
-                fs::remove_dir_all(path).unwrap();
+                crate::test_support::remove_dir_all(path);
             }
         }
 

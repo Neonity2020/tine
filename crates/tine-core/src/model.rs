@@ -14822,7 +14822,7 @@ impl Graph {
             self.managed_optional_file_identity(write, &target.absolute_path)?,
         )?;
         let (file, current) =
-            open_and_read_projection_regular(parent.final_dir(), &target.filename)?;
+            sync_open_and_read_projection_regular(parent.final_dir(), &target.filename)?;
         if current != expected_target {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -15042,10 +15042,11 @@ impl Graph {
                         )?;
                         if let Some(expected_base) = expected_base.filter(|_| !resumed_retirement) {
                             let retired = reservation.recovery_filename().to_owned();
-                            let (displaced_file, displaced) = open_and_read_projection_regular(
-                                parent.final_dir(),
-                                &target_path.filename,
-                            )?;
+                            let (displaced_file, displaced) =
+                                sync_open_and_read_projection_regular(
+                                    parent.final_dir(),
+                                    &target_path.filename,
+                                )?;
                             let displaced_identity =
                                 canonical_projection_file_resource_id(&displaced_file)?;
                             if displaced != expected_base {
@@ -15055,6 +15056,7 @@ impl Graph {
                                 ));
                             }
                             displaced_file.sync_all()?;
+                            drop(displaced_file);
                             let captured = ProjectionRecoveryEvidence::new_bound(
                                 &target_path.relative_path,
                                 retired.clone(),
@@ -15457,7 +15459,7 @@ impl Graph {
             projection_late_collision_hook()?;
             validate_retirement_boundary()?;
             let (displaced_file, displaced) =
-                open_and_read_projection_regular(parent.final_dir(), &target.filename)?;
+                sync_open_and_read_projection_regular(parent.final_dir(), &target.filename)?;
             let displaced_identity = canonical_projection_file_resource_id(&displaced_file)?;
             if displaced != expected_base {
                 return Err(io::Error::new(
@@ -15466,6 +15468,7 @@ impl Graph {
                 ));
             }
             displaced_file.sync_all()?;
+            drop(displaced_file);
             let captured = ProjectionRecoveryEvidence::new_bound(
                 &target.relative_path,
                 retired.clone(),
@@ -16124,6 +16127,7 @@ impl Graph {
             )?;
             return Ok(ProjectionRecoveryCleanup::ConflictRetained { relative_path });
         }
+        drop(opened);
 
         preflight_projection_chain(&parent.chain)?;
         self.ensure_projection_parent_binding(&parent, &target)?;
@@ -16460,7 +16464,7 @@ impl Graph {
         )?;
 
         let (file, current) =
-            open_and_read_projection_regular(parent.final_dir(), &target_path.filename)?;
+            sync_open_and_read_projection_regular(parent.final_dir(), &target_path.filename)?;
         if current != expected_target {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -21165,7 +21169,7 @@ fn open_projection_retirement_optional(
     quarantine: &Dir,
     name: &str,
 ) -> io::Result<ProjectionCleanupResource> {
-    let mut file = match open_projection_file_nofollow(quarantine, name) {
+    let mut file = match open_projection_file_nofollow_for_sync(quarantine, name) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return Ok(ProjectionCleanupResource::Missing);
@@ -36401,7 +36405,7 @@ mod tests {
         }
 
         fn restore(root: &Path, retained: &Path) {
-            fs::remove_dir_all(root).unwrap();
+            crate::test_support::remove_dir_all(root);
             fs::rename(retained, root).unwrap();
         }
 
@@ -39983,7 +39987,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    #[cfg(any(unix, windows))]
+    #[cfg(unix)]
     #[test]
     fn stale_graph_writes_retained_resource_not_replacement_reserved_by_another_gate() {
         let dir = scratch("handoff-stale-root");
@@ -40019,7 +40023,7 @@ mod tests {
         let _ = fs::remove_dir_all(&moved);
     }
 
-    #[cfg(any(unix, windows))]
+    #[cfg(unix)]
     #[test]
     fn root_replacement_after_admission_writes_retained_resource() {
         let dir = scratch("handoff-admission-root-race");
@@ -40048,7 +40052,7 @@ mod tests {
         let _ = fs::remove_dir_all(&moved);
     }
 
-    #[cfg(any(unix, windows))]
+    #[cfg(unix)]
     #[test]
     fn root_replacement_while_writer_waits_for_page_lock_writes_retained_resource() {
         let dir = scratch("handoff-root-replacement-page-lock");
@@ -40085,7 +40089,7 @@ mod tests {
         let _ = fs::remove_dir_all(&moved);
     }
 
-    #[cfg(any(unix, windows))]
+    #[cfg(unix)]
     #[test]
     fn replacement_after_final_check_cannot_redirect_mutation_into_reserved_root() {
         let dir = scratch("handoff-capability-final-window");
@@ -40131,7 +40135,7 @@ mod tests {
         let _ = fs::remove_dir_all(&moved);
     }
 
-    #[cfg(any(unix, windows))]
+    #[cfg(unix)]
     #[test]
     fn sync_identity_migration_keeps_nested_multi_page_inventory_and_writes_on_retained_a() {
         let dir = scratch("handoff-sync-id-migration-retained");
@@ -40212,7 +40216,7 @@ mod tests {
         let _ = fs::remove_dir_all(&moved);
     }
 
-    #[cfg(any(unix, windows))]
+    #[cfg(unix)]
     #[test]
     fn managed_sync_enable_genesis_receipts_restart_and_store_state_stay_on_retained_a() {
         let dir = scratch("handoff-managed-sync-enable-retained");
@@ -42321,7 +42325,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    #[cfg(any(unix, windows))]
+    #[cfg(unix)]
     #[test]
     fn managed_restore_preconditions_and_operation_truth_stay_on_retained_a() {
         let dir = scratch("handoff-managed-restore-retained");
@@ -42369,7 +42373,7 @@ mod tests {
         let _ = fs::remove_dir_all(&moved);
     }
 
-    #[cfg(any(unix, windows))]
+    #[cfg(unix)]
     #[test]
     fn rename_inventory_and_referrer_reads_stay_on_retained_a_after_reserved_b_replacement() {
         let dir = scratch("handoff-rename-selection-retained");
@@ -42429,7 +42433,7 @@ mod tests {
         let _ = fs::remove_dir_all(&moved);
     }
 
-    #[cfg(any(unix, windows))]
+    #[cfg(unix)]
     #[test]
     fn journal_migration_selection_stays_on_nested_retained_a_after_reserved_b_replacement() {
         let dir = scratch("handoff-journal-selection-retained");
@@ -42486,7 +42490,7 @@ mod tests {
         let _ = fs::remove_dir_all(&moved);
     }
 
-    #[cfg(any(unix, windows))]
+    #[cfg(unix)]
     #[test]
     fn save_force_save_and_delete_selection_stay_on_retained_a_after_reserved_b_replacement() {
         let dir = scratch("handoff-save-delete-selection-retained");
@@ -42540,7 +42544,7 @@ mod tests {
         let _ = fs::remove_dir_all(&moved);
     }
 
-    #[cfg(any(unix, windows))]
+    #[cfg(unix)]
     #[test]
     fn watcher_rename_and_delete_detection_use_retained_a_under_reserved_b() {
         let dir = scratch("handoff-watcher-selection-retained");
@@ -42625,7 +42629,7 @@ mod tests {
         let _ = fs::remove_dir_all(&moved);
     }
 
-    #[cfg(any(unix, windows))]
+    #[cfg(unix)]
     #[test]
     fn hls_selection_migration_and_legacy_cleanup_stay_on_retained_a_under_reserved_b() {
         let dir = scratch("handoff-hls-selection-retained");
@@ -42699,7 +42703,7 @@ mod tests {
         let _ = fs::remove_dir_all(&moved);
     }
 
-    #[cfg(any(unix, windows))]
+    #[cfg(unix)]
     #[test]
     fn root_replacement_during_rename_rollback_restores_retained_a_and_leaves_b_untouched() {
         let dir = scratch("handoff-capability-rollback-window");
@@ -42762,7 +42766,7 @@ mod tests {
         let _ = fs::remove_dir_all(&moved);
     }
 
-    #[cfg(any(unix, windows))]
+    #[cfg(unix)]
     #[test]
     fn handoff_resource_gate_survives_moved_root_reopen() {
         let dir = scratch("handoff-moved-reopen-gate");
@@ -43228,7 +43232,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    #[cfg(any(unix, windows))]
+    #[cfg(unix)]
     #[test]
     fn handoff_retained_resource_identity_survives_supported_move_but_not_replacement() {
         let dir = scratch("handoff-resource-move");
@@ -43265,7 +43269,7 @@ mod tests {
         let _ = fs::remove_dir_all(&moved);
     }
 
-    #[cfg(any(unix, windows))]
+    #[cfg(unix)]
     #[test]
     fn graph_text_scope_binding_tracks_policy_and_retained_resource_across_move() {
         let dir = scratch("graph-text-scope-binding");
@@ -43306,6 +43310,33 @@ mod tests {
 
         let _ = fs::remove_dir_all(&moved);
         let _ = fs::remove_dir_all(&copied);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_live_graph_root_move_is_denied_without_rebinding() {
+        let dir = scratch("windows-live-root-move-denied");
+        let moved = dir.with_file_name("tine-windows-live-root-move-denied-moved");
+        let _ = fs::remove_dir_all(&moved);
+        let graph = Graph::open(&dir);
+        let binding = graph.graph_text_scope_binding().unwrap();
+
+        let error = fs::rename(&dir, &moved).unwrap_err();
+        assert_eq!(
+            error.raw_os_error(),
+            Some(windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION as i32)
+        );
+        assert_eq!(graph.graph_text_scope_binding().unwrap(), binding);
+        graph
+            .write_projection_exact("pages/still-bound.md", None, b"- retained\n")
+            .unwrap();
+        assert_eq!(
+            fs::read(dir.join("pages/still-bound.md")).unwrap(),
+            b"- retained\n"
+        );
+
+        drop(graph);
+        crate::test_support::remove_dir_all(&dir);
     }
 
     fn bootstrap_capture_entries(capture: &BootstrapSourceCapture) -> Vec<BootstrapSourceEntry> {

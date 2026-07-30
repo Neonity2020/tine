@@ -657,7 +657,7 @@ mod tests {
         assert_eq!(result, DiscoveryClassification::Absent);
         assert!(!runtime.exists());
         assert!(!archive.exists());
-        fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     fn find_named_file(root: &Path, expected: &str) -> PathBuf {

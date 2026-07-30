@@ -2626,7 +2626,7 @@ mod tests {
         for directory in [BACKUP_ROOT_DIRECTORY, RESTORE_ROOT_DIRECTORY] {
             let path = roots.canonical_root.join(directory);
             if path.exists() {
-                fs::remove_dir_all(path).unwrap();
+                crate::test_support::remove_dir_all(path);
             }
         }
     }

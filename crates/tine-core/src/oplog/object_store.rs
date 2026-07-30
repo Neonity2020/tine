@@ -1015,7 +1015,7 @@ mod discovery_inspector_tests {
             ArchiveDiscoveryInspection::Residue
         );
         assert!(std::fs::read_dir(&archive).unwrap().next().is_none());
-        std::fs::remove_dir_all(parent).unwrap();
+        crate::test_support::remove_dir_all(parent);
     }
 }
 
@@ -8186,7 +8186,7 @@ mod history_index_tests {
                 snapshot.lock().unwrap().clone().expect("attack hook ran"),
                 "rejection mutated the foreign {label} archive"
             );
-            std::fs::remove_dir_all(root).unwrap();
+            crate::test_support::remove_dir_all(root);
         }
     }
 
@@ -8223,7 +8223,7 @@ mod history_index_tests {
                 snapshot_tree_with_identity(&archive),
                 snapshot.lock().unwrap().clone().expect("attack hook ran")
             );
-            std::fs::remove_dir_all(root).unwrap();
+            crate::test_support::remove_dir_all(root);
         }
     }
 
@@ -8268,7 +8268,7 @@ mod history_index_tests {
             attacked.lock().unwrap().clone().expect("attack hook ran"),
             "rollback rejection mutated the archive"
         );
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -8316,7 +8316,7 @@ mod history_index_tests {
             1,
             "the sealed baseline was forgotten after a rejected rollback"
         );
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -8413,7 +8413,7 @@ mod history_index_tests {
         ));
         drop(history);
         drop(store);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -8472,7 +8472,7 @@ mod history_index_tests {
         ));
         drop(history);
         drop(store);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -8566,7 +8566,7 @@ mod history_index_tests {
 
         drop(rollback_history);
         drop(rollback_store);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     /// Deterministic, well-spread batch identifiers. Multiplying by an odd
@@ -8687,7 +8687,7 @@ mod history_index_tests {
 
             drop(reopened);
             drop(reopened_store);
-            std::fs::remove_dir_all(root).unwrap();
+            crate::test_support::remove_dir_all(root);
         }
 
         // The unmemoized proof cost tracks the post-anchor history — which is
@@ -8833,7 +8833,7 @@ mod history_index_tests {
             drop(repaired_store);
         }
 
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     /// A publication that failed on a missing index node must not leave behind
@@ -8908,7 +8908,7 @@ mod history_index_tests {
 
         drop(history);
         drop(store);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     /// Deeper immutable nodes stay a *previously authenticated* in-memory fact:
@@ -9032,7 +9032,7 @@ mod history_index_tests {
         drop(repaired);
         drop(repaired_store);
 
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     /// The projection-work caller re-anchors on the head it just accepted, so
@@ -9081,7 +9081,7 @@ mod history_index_tests {
 
         drop(history);
         drop(store);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -9362,7 +9362,7 @@ mod history_index_tests {
 
         drop(history);
         drop(store);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -9439,7 +9439,7 @@ mod history_index_tests {
         assert_eq!(snapshot(&archive_path), before);
         drop(history);
         drop(store);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -9482,7 +9482,7 @@ mod history_index_tests {
         assert_eq!(reopened_history.current_with_binding().unwrap(), before);
         drop(reopened_history);
         drop(reopened);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -9533,7 +9533,7 @@ mod history_index_tests {
         assert!(!control.join(ENGINE_HISTORY_NODES_DIR).exists());
         assert!(!control.join(ENGINE_HISTORY_ROOTS_DIR).exists());
         drop(store);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -9658,7 +9658,7 @@ mod history_index_tests {
                         .exists(),
                     "{mode_label} rejection created the transition lock for a {claim_label} claim"
                 );
-                std::fs::remove_dir_all(root).unwrap();
+                crate::test_support::remove_dir_all(root);
             }
         }
     }
@@ -9697,7 +9697,7 @@ mod history_index_tests {
             archive.join(ENGINE_HISTORY_TRANSITION_LOCK_FILE).is_file(),
             "compatible preflight must still reach the durable lock"
         );
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -9721,7 +9721,7 @@ mod history_index_tests {
         drop(guard);
         drop(history);
         drop(store);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -9841,7 +9841,7 @@ mod history_index_tests {
         drop(opened);
         drop(publishing_history);
         drop(store);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -9919,7 +9919,7 @@ mod history_index_tests {
         }
 
         drop(store);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[cfg(any(
@@ -9986,7 +9986,7 @@ mod history_index_tests {
         ));
         drop(history);
         drop(store);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -10164,7 +10164,7 @@ mod history_index_tests {
 
         drop(index);
         drop(store);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 }
 

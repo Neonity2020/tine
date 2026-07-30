@@ -1723,7 +1723,7 @@ mod tests {
         assert!(!complete.has_more.pages);
         assert!(!complete.has_more.blocks);
 
-        fs::remove_dir_all(dir).unwrap();
+        crate::test_support::remove_dir_all(dir);
     }
 
     #[test]
@@ -1915,7 +1915,7 @@ mod tests {
                 if display_text == "Re\u{301}sume\u{301}"
                     && evidence[0].spans == vec![MatchSpan { start: 0, end: 8 }]
         ));
-        fs::remove_dir_all(dir).unwrap();
+        crate::test_support::remove_dir_all(dir);
     }
 
     #[test]
@@ -1999,7 +1999,7 @@ mod tests {
             "a unique page name must retain ordinary alias matching"
         );
 
-        fs::remove_dir_all(dir).unwrap();
+        crate::test_support::remove_dir_all(dir);
     }
 
     #[test]
@@ -2125,7 +2125,7 @@ mod tests {
 
         let no_explain = graph.run_graph_search("foo", 10, 10, false);
         assert!(no_explain.explanation.branches.is_empty());
-        fs::remove_dir_all(dir).unwrap();
+        crate::test_support::remove_dir_all(dir);
     }
 
     #[test]
@@ -2159,7 +2159,7 @@ mod tests {
                     && path == "pages/Opinion Diffusion.md"
                     && block.raw != "duplicate foo"
         )));
-        fs::remove_dir_all(dir).unwrap();
+        crate::test_support::remove_dir_all(dir);
     }
 
     #[test]
@@ -2189,7 +2189,7 @@ mod tests {
                 ..
             }) if display_text == "research hub" && matched_alias == "research hub"
         ));
-        fs::remove_dir_all(dir).unwrap();
+        crate::test_support::remove_dir_all(dir);
     }
 
     #[test]
@@ -2210,7 +2210,7 @@ mod tests {
             .unwrap();
         assert_eq!(text, "regex ABC");
         assert_eq!(evidence[0].spans, vec![MatchSpan { start: 6, end: 9 }]);
-        fs::remove_dir_all(dir).unwrap();
+        crate::test_support::remove_dir_all(dir);
     }
 
     #[test]
@@ -2241,7 +2241,7 @@ mod tests {
                 );
             }
         }
-        fs::remove_dir_all(dir).unwrap();
+        crate::test_support::remove_dir_all(dir);
     }
 
     #[test]
@@ -2300,6 +2300,6 @@ mod tests {
         });
         assert!(execution.cancelled);
         assert!(execution.hits.is_empty());
-        fs::remove_dir_all(dir).unwrap();
+        crate::test_support::remove_dir_all(dir);
     }
 }

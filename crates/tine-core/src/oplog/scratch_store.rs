@@ -4438,7 +4438,7 @@ mod tests {
         );
         assert_eq!(store.stats().scratch_syncs, 0);
         drop(store);
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     #[test]
@@ -4495,7 +4495,7 @@ mod tests {
             1_024
         );
         drop(store);
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     #[test]
@@ -4532,7 +4532,7 @@ mod tests {
             Err(ScratchError::KeyDigestCollision)
         ));
         drop(store);
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     #[test]
@@ -4587,7 +4587,7 @@ mod tests {
             32
         );
         drop(store);
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     #[test]
@@ -4617,7 +4617,7 @@ mod tests {
         assert_eq!(store.stats().page_reads, before.page_reads);
 
         drop(store);
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     #[test]
@@ -4643,7 +4643,7 @@ mod tests {
         assert_eq!(store.stats().page_reads, 1);
 
         drop(store);
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     #[test]
@@ -4675,7 +4675,7 @@ mod tests {
         ));
 
         drop(store);
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     #[test]
@@ -4723,7 +4723,7 @@ mod tests {
         assert_eq!(store.stats().page_reads, 2);
 
         drop(store);
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     #[test]
@@ -4801,7 +4801,7 @@ mod tests {
         );
 
         drop(store);
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     #[test]
@@ -4849,7 +4849,7 @@ mod tests {
         assert!(store.stats().page_reads > before.page_reads);
 
         drop(store);
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     #[test]
@@ -4864,7 +4864,7 @@ mod tests {
         drop(second);
         assert!(path.join(SCRATCH_DIR).join(&first_name).is_dir());
         drop(first);
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     #[test]
@@ -4890,7 +4890,7 @@ mod tests {
         assert_eq!(restarted.stats().scratch_syncs, 0);
         assert!(!run_path.exists());
         drop(restarted);
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     #[test]
@@ -4917,7 +4917,7 @@ mod tests {
             b"tampered".to_vec()
         );
         drop(restarted);
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     #[cfg(unix)]
@@ -4945,7 +4945,7 @@ mod tests {
             .file_type()
             .is_symlink());
         drop(restarted);
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     #[cfg(unix)]
@@ -4978,7 +4978,7 @@ mod tests {
         assert_eq!(restarted.stats().stale_runs_reclaimed, 0);
         assert!(fifo.exists());
         drop(restarted);
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     #[test]
@@ -4996,7 +4996,7 @@ mod tests {
         drop(store);
 
         assert!(!run.exists());
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     #[test]
@@ -5018,7 +5018,7 @@ mod tests {
 
         drop(adopted);
         assert_eq!(run_snapshot(&path, run_id), after_owner);
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     #[test]
@@ -5060,7 +5060,7 @@ mod tests {
             b"second blob".to_vec()
         );
         drop(reopened);
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     #[test]
@@ -5078,7 +5078,7 @@ mod tests {
             drop(adopted);
             assert_eq!(run_snapshot(&path, run_id), baseline);
         }
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     #[test]
@@ -5099,7 +5099,7 @@ mod tests {
         let last = ScratchStore::adopt_retained(&archive, workspace(25), run_id).unwrap();
         assert_eq!(last.run_id(), run_id);
         drop(last);
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     #[test]
@@ -5117,7 +5117,7 @@ mod tests {
         let adopted = ScratchStore::adopt_retained(&archive, workspace(26), run_id).unwrap();
         assert_retained_contents(&adopted, &root, &blob);
         drop(adopted);
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     #[test]
@@ -5161,7 +5161,7 @@ mod tests {
         let adopted = ScratchStore::adopt_retained(&archive, workspace(28), run_id).unwrap();
         assert_retained_contents(&adopted, &root, &blob);
         drop(adopted);
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     /// Exact schema-11 marker shape. It exists only to prove those bytes are
@@ -5202,7 +5202,7 @@ mod tests {
 
         write_marker(&path, run_id, &authentic);
         drop(ScratchStore::adopt_retained(&archive, workspace(30), run_id).unwrap());
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     #[test]
@@ -5218,7 +5218,7 @@ mod tests {
                 ScratchStore::adopt_retained(&archive, workspace(31), run_id).is_err(),
                 "adopted a run missing {missing}"
             );
-            fs::remove_dir_all(path).unwrap();
+            crate::test_support::remove_dir_all(path);
         }
 
         {
@@ -5227,7 +5227,7 @@ mod tests {
             let (run_id, _, _, _) = seed_retained_run(&archive, workspace(31));
             fs::write(run_path(&path, run_id).join("stray"), b"extra").unwrap();
             assert!(ScratchStore::adopt_retained(&archive, workspace(31), run_id).is_err());
-            fs::remove_dir_all(path).unwrap();
+            crate::test_support::remove_dir_all(path);
         }
 
         // A bare directory is a partially created run, never an adoptable one.
@@ -5239,7 +5239,7 @@ mod tests {
             fs::create_dir(run_path(&path, bare)).unwrap();
             assert!(ScratchStore::adopt_retained(&archive, workspace(31), bare).is_err());
             assert_eq!(fs::read_dir(run_path(&path, bare)).unwrap().count(), 0);
-            fs::remove_dir_all(path).unwrap();
+            crate::test_support::remove_dir_all(path);
         }
     }
 
@@ -5283,7 +5283,7 @@ mod tests {
             .is_err());
         assert!(adopted.read_blob(&truncated_blob).is_err());
         drop(adopted);
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     #[cfg(unix)]
@@ -5308,7 +5308,7 @@ mod tests {
         symlink(&decoy, &pages).unwrap();
         assert!(ScratchStore::adopt_retained(&archive, workspace(33), run_id).is_err());
         assert_eq!(fs::read(&decoy).unwrap(), b"decoy bytes".to_vec());
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     #[test]
@@ -5345,7 +5345,7 @@ mod tests {
         let adopted = ScratchStore::adopt_retained(&archive, workspace(34), retained_id).unwrap();
         assert_retained_contents(&adopted, &root, &blob);
         drop(adopted);
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     /// Durable shapes of a sibling scratch run that a reclamation pass cannot
@@ -5545,7 +5545,7 @@ mod tests {
             let recovered = ScratchStore::open(&archive, workspace(40)).unwrap();
             drop(recovered);
             drop(live);
-            fs::remove_dir_all(path).unwrap();
+            crate::test_support::remove_dir_all(path);
         }
     }
 
@@ -5572,7 +5572,7 @@ mod tests {
             assert_eq!(dir_snapshot(&sibling), before, "{kind:?} residue changed");
 
             drop(store);
-            fs::remove_dir_all(path).unwrap();
+            crate::test_support::remove_dir_all(path);
         }
     }
 
@@ -5615,7 +5615,7 @@ mod tests {
         assert_retained_contents(&adopted, &root, &blob);
         drop(adopted);
         drop(live);
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     /// An ordinary transient I/O error while inspecting one sibling is not
@@ -5639,7 +5639,7 @@ mod tests {
         assert_eq!(second.stats().stale_runs_reclaimed, 1);
         assert!(!stale.exists());
         drop(second);
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     /// Repeated open/retry converges and never weakens lease contention: an
@@ -5694,7 +5694,7 @@ mod tests {
             Some(b"live".to_vec())
         );
         drop(live);
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     const ADOPT_HELPER_ROOT: &str = "TINE_SCRATCH_ADOPT_HELPER_ROOT";
@@ -5803,7 +5803,7 @@ mod tests {
         drop(after_release);
 
         assert_eq!(run_snapshot(&path, run_id), baseline);
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     // ---- Retained-run reclamation under a complete reachability proof ----
@@ -5879,7 +5879,7 @@ mod tests {
                 ..RetainedRunReclamation::default()
             }
         );
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     /// The census is the *other* half of the bound, and it must be
@@ -5936,7 +5936,7 @@ mod tests {
         );
         assert!(run_path(&path, foreign).exists());
         drop(ephemeral);
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     /// The `Unsafe -> Safe` drain: every resume point is cleared first, so the
@@ -5956,7 +5956,7 @@ mod tests {
         assert!(!run_path(&path, first).exists());
         assert!(!run_path(&path, second).exists());
         assert!(namespace_entry_names(&path).is_empty());
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     /// Ephemeral runs keep their own lifecycle. This pass carries no authority
@@ -5978,7 +5978,7 @@ mod tests {
             }
         );
         assert_eq!(dir_snapshot(&stale), before);
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     /// A run whose exclusive lease is held is live. Reachability alone never
@@ -6011,7 +6011,7 @@ mod tests {
             1
         );
         assert!(!run_path(&path, run_id).exists());
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     /// Every durable shape the pass cannot authenticate is preserved untouched
@@ -6032,7 +6032,7 @@ mod tests {
             assert!(sibling.exists(), "{kind:?} residue was removed");
             assert_eq!(dir_snapshot(&sibling), before, "{kind:?} residue changed");
             assert!(!run_path(&path, orphan).exists(), "{kind:?}");
-            fs::remove_dir_all(path).unwrap();
+            crate::test_support::remove_dir_all(path);
         }
     }
 
@@ -6056,7 +6056,7 @@ mod tests {
             }
         );
         assert_eq!(dir_snapshot(&foreign_path), before);
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     /// Deletion is capability-relative and no-follow. A symlinked or special
@@ -6098,7 +6098,7 @@ mod tests {
             b"decoy bytes".to_vec()
         );
         assert!(fs::symlink_metadata(&fifo).unwrap().file_type().is_fifo());
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     /// An archive that never opened a scratch namespace proves an empty
@@ -6112,7 +6112,7 @@ mod tests {
             RetainedRunReclamation::default()
         );
         assert!(!path.join(SCRATCH_DIR).exists());
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     /// Publish-then-delete can transiently leave two retained runs; a complete
@@ -6138,7 +6138,7 @@ mod tests {
             namespace_entry_names(&path),
             BTreeSet::from([format!("run-{rotated}")])
         );
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     /// The lease is the only liveness oracle that survives SIGKILL, so the
@@ -6187,6 +6187,6 @@ mod tests {
             1
         );
         assert!(!run_path(&path, run_id).exists());
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 }

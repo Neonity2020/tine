@@ -5964,8 +5964,8 @@ mod tests {
         drop(store);
         drop(reopened);
         drop(graph);
-        fs::remove_dir_all(&graph_parent).unwrap();
-        fs::remove_dir_all(&receipt_parent).unwrap();
+        crate::test_support::remove_dir_all(&graph_parent);
+        crate::test_support::remove_dir_all(&receipt_parent);
         set_projection_cleanup_time_for_test(None);
     }
 

@@ -2372,7 +2372,7 @@ mod tests {
         assert_eq!(found.latest_release().unwrap().prior_page_id(), page(9));
         drop(reopened_index);
         drop(reopened);
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     #[test]
@@ -2420,7 +2420,7 @@ mod tests {
         );
         drop(index);
         drop(archive);
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
 
         let (path, archive, index) = store("blob-substitution");
         let foo_ref = index.put_exact_name(&foo).unwrap();
@@ -2447,7 +2447,7 @@ mod tests {
         ));
         drop(index);
         drop(archive);
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     #[test]
@@ -2475,7 +2475,7 @@ mod tests {
                 (_, result) => panic!("unexpected store version result: {result:?}"),
             }
             drop(archive);
-            fs::remove_dir_all(path).unwrap();
+            crate::test_support::remove_dir_all(path);
         }
 
         for found in [0, 2] {
@@ -2535,7 +2535,7 @@ mod tests {
             }
             drop(index);
             drop(archive);
-            fs::remove_dir_all(path).unwrap();
+            crate::test_support::remove_dir_all(path);
         }
 
         for found in [0, 2] {
@@ -2578,7 +2578,7 @@ mod tests {
             }
             drop(index);
             drop(archive);
-            fs::remove_dir_all(path).unwrap();
+            crate::test_support::remove_dir_all(path);
         }
 
         for found in [0, 2] {
@@ -2596,7 +2596,7 @@ mod tests {
             }
             drop(index);
             drop(archive);
-            fs::remove_dir_all(path).unwrap();
+            crate::test_support::remove_dir_all(path);
         }
     }
 
@@ -2634,7 +2634,7 @@ mod tests {
 
         drop(index);
         drop(archive);
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     #[test]
@@ -2707,7 +2707,7 @@ mod tests {
 
         drop(index);
         drop(archive);
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     #[test]
@@ -2800,7 +2800,7 @@ mod tests {
         drop(scratch);
         drop(index);
         drop(archive);
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     #[test]
@@ -2977,7 +2977,7 @@ mod tests {
         drop(scratch);
         drop(index);
         drop(archive);
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     fn authenticated_page_points_for_test(
@@ -3264,7 +3264,7 @@ mod tests {
 
         drop(index);
         drop(archive);
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     #[test]
@@ -3326,7 +3326,7 @@ mod tests {
 
         drop(index);
         drop(archive);
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     #[test]
@@ -3565,7 +3565,7 @@ mod tests {
             let encoded = second.conflicts[0].encode().unwrap();
             drop(index);
             drop(archive);
-            fs::remove_dir_all(path).unwrap();
+            crate::test_support::remove_dir_all(path);
             encoded
         }
 
@@ -3627,7 +3627,7 @@ mod tests {
             let encoded = conflict.conflicts[0].encode().unwrap();
             drop(index);
             drop(archive);
-            fs::remove_dir_all(path).unwrap();
+            crate::test_support::remove_dir_all(path);
             encoded
         }
 
@@ -3842,7 +3842,7 @@ mod tests {
 
         drop(index);
         drop(archive);
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     #[test]
@@ -3967,6 +3967,6 @@ mod tests {
 
         drop(index);
         drop(archive);
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 }

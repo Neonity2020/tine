@@ -1903,8 +1903,8 @@ mod tests {
         assert_eq!(maintenance.removed, 1);
         assert!(maintenance.preserved_residue());
 
-        std::fs::remove_dir_all(plain_root).unwrap();
-        std::fs::remove_dir_all(resume_root_parent(&nested_root)).unwrap();
+        crate::test_support::remove_dir_all(plain_root);
+        crate::test_support::remove_dir_all(resume_root_parent(&nested_root));
     }
 
     /// The outermost directory `resume_root` created for a nested case.
@@ -2099,7 +2099,7 @@ mod tests {
             ResumePointSet::read(&dir),
             Err(ResumePointError::TooLarge { .. })
         ));
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -2156,7 +2156,7 @@ mod tests {
                 payload: 1
             })
         );
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -2168,7 +2168,7 @@ mod tests {
         assert!(set.latest().is_none());
         assert_eq!(set.next_sequence().unwrap(), 1);
         assert_eq!(set.reachable_runs().len(), 0);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -2190,7 +2190,7 @@ mod tests {
         );
         assert_eq!(set.latest().unwrap(), &newer);
         assert_eq!(set.next_sequence().unwrap(), 43);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -2202,7 +2202,7 @@ mod tests {
         std::fs::write(root.join(format!(".tmp-{}", Uuid::new_v4())), b"torn").unwrap();
         let set = ResumePointSet::read(&dir).unwrap();
         assert_eq!(set.points(), &[published]);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -2215,7 +2215,7 @@ mod tests {
             ResumePointSet::read(&dir),
             Err(ResumePointError::UnexpectedEntry(_))
         ));
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[cfg(unix)]
@@ -2231,7 +2231,7 @@ mod tests {
             Err(ResumePointError::UnexpectedEntry(_))
         ));
         assert!(root.join("decoy").exists());
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[cfg(unix)]
@@ -2251,7 +2251,7 @@ mod tests {
             Err(ResumePointError::UnexpectedEntry(_))
         ));
         assert!(fifo.exists());
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -2263,7 +2263,7 @@ mod tests {
             ResumePointSet::read(&dir),
             Err(ResumePointError::UnexpectedEntry(_))
         ));
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -2294,7 +2294,7 @@ mod tests {
             ResumePointSet::read(&dir).unwrap().points(),
             &[point(MAX_RETAINED_RESUME_POINTS as u64 + 1)]
         );
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -2310,7 +2310,7 @@ mod tests {
             MAX_RETAINED_RESUME_POINTS + 3
         );
         assert!(ResumePointSet::read(&dir).unwrap().points().is_empty());
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -2351,7 +2351,7 @@ mod tests {
         // And the torn bytes still deny the reachability proof afterwards, so
         // no retained run can be reclaimed on their account.
         assert!(ResumePointSet::read(&dir).is_err());
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     /// The exact sync-provider and desktop residue family from the campaign's
@@ -2405,7 +2405,7 @@ mod tests {
                 ResumePointSet::read(&dir).is_err(),
                 "{stranger} must still deny the proof after the drain"
             );
-            std::fs::remove_dir_all(root).unwrap();
+            crate::test_support::remove_dir_all(root);
         }
     }
 
@@ -2455,7 +2455,7 @@ mod tests {
             b"a file the drain must not unlink"
         );
         assert!(root.join(point(3).file_name()).is_dir());
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     /// The reachability proof must stay non-forgeable.
@@ -2670,7 +2670,7 @@ mod tests {
         assert!(reachable.contains(Uuid::from_u128(0x9301)));
         assert!(reachable.contains(Uuid::from_u128(0x9302)));
         assert!(!reachable.contains(Uuid::from_u128(0x9303)));
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -2687,7 +2687,7 @@ mod tests {
         assert_eq!(ResumePointSet::read(&dir).unwrap().points(), &[newer]);
         // Idempotent: a repeated prune at the same watermark removes nothing.
         assert_eq!(prune_resume_points_below(&dir, 2).unwrap().removed, 0);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     #[test]
@@ -2701,7 +2701,7 @@ mod tests {
         assert_eq!(clear_resume_points_in(&dir).unwrap().removed, 1);
         assert_eq!(ResumePointSet::read(&dir).unwrap().points(), &[safe]);
         assert_eq!(clear_resume_points_in(&dir).unwrap().removed, 0);
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 
     /// The publication temp class stays ignored rather than becoming residue:
@@ -2726,6 +2726,6 @@ mod tests {
             }
         );
         assert!(root.join(&temp).exists());
-        std::fs::remove_dir_all(root).unwrap();
+        crate::test_support::remove_dir_all(root);
     }
 }

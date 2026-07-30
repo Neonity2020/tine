@@ -992,7 +992,7 @@ mod tests {
             Some(b"new".to_vec())
         );
         assert!(store.stats().reads < 100);
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     #[test]
@@ -1023,7 +1023,7 @@ mod tests {
             after.reads - before.reads <= INTRODUCTIONS * 3,
             "prefix lookup must read only the participant subtree"
         );
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     #[test]
@@ -1053,7 +1053,7 @@ mod tests {
         ));
         assert_point_traversals_reject(&store, wrong_leaf_root, &key);
 
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     #[test]
@@ -1095,6 +1095,6 @@ mod tests {
         let after_prefix = store.stats();
         assert!(after_prefix.reads - after_insert.reads <= hard_bound);
 
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 }

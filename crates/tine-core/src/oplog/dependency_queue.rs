@@ -1381,7 +1381,7 @@ mod tests {
         assert_eq!(roots.ready_queue_len, 0);
         assert_eq!(store.stats().scratch_syncs, 0);
         drop(store);
-        std::fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     #[test]
@@ -1474,7 +1474,7 @@ mod tests {
         );
         assert_eq!(pending_registration(&roots), 0);
         drop(store);
-        std::fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     #[test]
@@ -1652,7 +1652,7 @@ mod tests {
         assert_eq!(step, RegistrationStep::AlreadyComplete);
         assert_eq!(again, record);
         drop(store);
-        std::fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     #[test]
@@ -1721,7 +1721,7 @@ mod tests {
         );
         assert_eq!(pending_fanout(&roots), 0);
         drop(store);
-        std::fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     #[test]
@@ -1791,7 +1791,7 @@ mod tests {
         assert_eq!(child_record.dependency_set_commitment(), child_fingerprint);
         assert_eq!(point_state_counts(&store, &roots, child).unwrap(), (1, 0));
         drop(store);
-        std::fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     #[test]
@@ -1955,7 +1955,7 @@ mod tests {
                 "{case:?}"
             );
             drop(store);
-            std::fs::remove_dir_all(path).unwrap();
+            crate::test_support::remove_dir_all(path);
         }
     }
 
@@ -2129,6 +2129,6 @@ mod tests {
             "measured scratch bytes remain within the same linear physical metric"
         );
         drop(store);
-        std::fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 }

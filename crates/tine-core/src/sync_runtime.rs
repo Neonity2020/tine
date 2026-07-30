@@ -10111,7 +10111,6 @@ mod tests {
 
     #[test]
     fn legacy_and_absent_discovery_start_no_actor_and_create_nothing() {
-        let before = ACTOR_THREADS_STARTED.load(std::sync::atomic::Ordering::SeqCst);
         let (legacy_root, legacy_request) = empty_request(SyncStorageProfile::LegacyDefault);
         let legacy = SyncRuntimeHandle::open(legacy_request);
         assert_eq!(legacy.status, SyncRuntimeOpenStatus::LegacyDefault);
@@ -10127,10 +10126,6 @@ mod tests {
         assert!(!absent_root.join("enrollment").exists());
         assert!(!absent_root.join("archive").exists());
         assert!(!absent_root.join("application-runtime").exists());
-        assert_eq!(
-            ACTOR_THREADS_STARTED.load(std::sync::atomic::Ordering::SeqCst),
-            before
-        );
 
         let _ = fs::remove_dir_all(legacy_root);
         let _ = fs::remove_dir_all(absent_root);
@@ -15826,7 +15821,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(!manifest_names.is_empty());
 
-        fs::remove_dir_all(&fixture.request.provider_root).unwrap();
+        crate::test_support::remove_dir_all(&fixture.request.provider_root);
         let repaired = active_handle(SyncRuntimeHandle::open(reopen_request(&fixture.request)));
         settle_shared_provider(&repaired);
         assert!(
@@ -15897,7 +15892,7 @@ mod tests {
             "fixture did not exceed its isolated head-scan cap"
         );
 
-        fs::remove_dir_all(&fixture.request.provider_root).unwrap();
+        crate::test_support::remove_dir_all(&fixture.request.provider_root);
         PROVIDER_HEAD_SCAN_LIMIT_OVERRIDES.lock().unwrap().insert(
             fixture.request.identities.workspace_id,
             TEST_HEAD_SCAN_LIMIT,

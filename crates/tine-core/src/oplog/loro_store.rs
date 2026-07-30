@@ -1521,7 +1521,7 @@ mod tests {
         drop(reopened);
         drop(control);
         drop(scratch);
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
         work
     }
 
@@ -1559,7 +1559,7 @@ mod tests {
         drop(reopened);
         drop(control);
         drop(scratch);
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     #[test]
@@ -1616,7 +1616,7 @@ mod tests {
         drop(reopened);
         drop(store);
         drop(scratch);
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     #[test]
@@ -1640,8 +1640,8 @@ mod tests {
         let (ascending, ascending_path) = build(0..257);
         let (descending, descending_path) = build((0..257).rev());
         assert_eq!(ascending, descending);
-        fs::remove_dir_all(ascending_path).unwrap();
-        fs::remove_dir_all(descending_path).unwrap();
+        crate::test_support::remove_dir_all(ascending_path);
+        crate::test_support::remove_dir_all(descending_path);
     }
 
     #[test]
@@ -1677,7 +1677,7 @@ mod tests {
         drop(reopened);
         drop(store);
         drop(scratch);
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     #[test]
@@ -1731,7 +1731,7 @@ mod tests {
         drop(reopened);
         drop(store);
         drop(scratch);
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     #[test]
@@ -1789,7 +1789,7 @@ mod tests {
         drop(child);
         drop(parent);
         drop(scratch);
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     #[test]
@@ -1816,7 +1816,7 @@ mod tests {
         );
         drop(store);
         drop(scratch);
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     #[test]
@@ -1840,7 +1840,7 @@ mod tests {
         drop(reopened);
         drop(store);
         drop(scratch);
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     #[test]
@@ -1878,7 +1878,7 @@ mod tests {
         drop(reopened);
         drop(store);
         drop(scratch);
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     #[test]
@@ -1901,7 +1901,7 @@ mod tests {
         drop(reopened);
         drop(store);
         drop(scratch);
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     #[test]
@@ -1979,7 +1979,7 @@ mod tests {
         drop(reopened);
         drop(control);
         drop(scratch);
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     #[test]
@@ -2034,6 +2034,6 @@ mod tests {
         );
         drop(store);
         drop(scratch);
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 }

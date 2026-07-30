@@ -4319,7 +4319,7 @@ mod tests {
 
     impl Drop for Fixture {
         fn drop(&mut self) {
-            fs::remove_dir_all(&self.path).unwrap();
+            crate::test_support::remove_dir_all(&self.path);
         }
     }
 
@@ -6096,7 +6096,7 @@ mod tests {
         assert!(!control.join("roots").exists());
         assert!(!control.join("prepared").exists());
         drop(store);
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     #[test]

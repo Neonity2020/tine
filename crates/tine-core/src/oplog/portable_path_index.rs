@@ -346,7 +346,7 @@ mod tests {
         fs::write(node_path, bytes).unwrap();
 
         assert!(store.lookup(root, key).is_err());
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     #[test]
@@ -379,7 +379,7 @@ mod tests {
         let root = PortablePathIndexRoot(raw_root);
 
         assert!(store.lookup(root, key).is_err());
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 
     #[test]
@@ -463,6 +463,6 @@ mod tests {
             current.latest_release().unwrap().release_batch(),
             BatchId::from_uuid(Uuid::from_u128(2_400))
         );
-        fs::remove_dir_all(path).unwrap();
+        crate::test_support::remove_dir_all(path);
     }
 }
