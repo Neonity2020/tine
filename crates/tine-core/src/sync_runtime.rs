@@ -30,7 +30,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::model::{sync_conflict_base, AcceptedExternalDocumentIdentity, Graph, PageKind};
+use crate::model::{
+    sync_conflict_base, AcceptedExternalDocumentIdentity, BlockDto, Graph, PageDto, PageEntry,
+    PageKind,
+};
 use crate::oplog::discovery::{
     discover_startup, AmbiguousEvidence, DiscoveryClassification, DiscoveryComponent,
     DiscoveryRequest, LocalActiveAdvisory, NonActiveStage, StartupStorageProfile,
@@ -142,6 +145,10 @@ pub const MAX_SYNC_EDITOR_DEPTH: usize = 128;
 pub const MAX_SYNC_EDITOR_TEMP_KEY_BYTES: usize = 256;
 /// Aggregate retained editor request bytes, independently of per-field caps.
 pub const MAX_SYNC_EDITOR_REQUEST_BYTES: usize = MAX_LOCAL_MUTATION_TEXT_BYTES;
+/// Application-page block IDs without external Logseq identity are deliberately
+/// outside UUID syntax so the frontend cannot mistake sparse storage identity
+/// for a portable block reference.
+pub const SYNC_APPLICATION_INTERNAL_BLOCK_PREFIX: &str = "sparse-v2:";
 const MAX_EDITOR_SETTLE_TURNS: usize = 64;
 const BOOTSTRAP_RECEIPT_MARKER_SCHEMA_VERSION: u32 = 1;
 const BOOTSTRAP_RECEIPT_MARKER_FILE: &str = "bootstrap-projection-receipts-v1.json";
@@ -845,6 +852,15 @@ impl From<ManagedTextKind> for SyncPageKind {
     }
 }
 
+impl From<PageKind> for SyncPageKind {
+    fn from(value: PageKind) -> Self {
+        match value {
+            PageKind::Page => Self::Page,
+            PageKind::Journal => Self::Journal,
+        }
+    }
+}
+
 impl From<SyncPageKind> for ManagedTextKind {
     fn from(value: SyncPageKind) -> Self {
         match value {
@@ -1064,6 +1080,145 @@ pub enum SyncEditorSaveOutcome {
         affected_page_ids: Vec<String>,
     },
 }
+
+/// Full parser-owned page inventory. The underlying graph inventory has its
+/// own retained-file/byte bounds and never inherits the 10,000-row sparse
+/// query cap.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SyncApplicationPageInventoryOutcome {
+    Loaded { pages: Vec<PageEntry> },
+    Deferred { state: SyncEditorDeferred },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "selector", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SyncApplicationPageSelector {
+    Logical {
+        name: String,
+        page_kind: SyncPageKind,
+    },
+    ExactPath {
+        path: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SyncApplicationPageLoadRequest {
+    pub page: SyncApplicationPageSelector,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SyncApplicationNewPageDraftDto {
+    pub name: String,
+    pub page_kind: SyncPageKind,
+    pub revision: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SyncApplicationPageLoadOutcome {
+    Loaded {
+        page: PageDto,
+        revision: String,
+    },
+    Missing {
+        draft: Option<SyncApplicationNewPageDraftDto>,
+    },
+    Ambiguous,
+    Deferred {
+        state: SyncEditorDeferred,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "target", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SyncApplicationPageSaveTarget {
+    Existing {
+        path: String,
+        revision: String,
+    },
+    New {
+        name: String,
+        page_kind: SyncPageKind,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SyncApplicationPageSaveRequest {
+    pub target: SyncApplicationPageSaveTarget,
+    pub page: PageDto,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncApplicationPageConflict {
+    StaleBase,
+    MissingPage,
+    PageAlreadyExists,
+    AmbiguousPageName,
+    DerivedPathOccupied,
+    UnknownOrForeignBlock,
+    ReadOnly,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SyncApplicationPageSaveOutcome {
+    Saved {
+        batch_id: String,
+        page: PageDto,
+        revision: String,
+    },
+    Unchanged {
+        page: PageDto,
+        revision: String,
+    },
+    Conflict {
+        reason: SyncApplicationPageConflict,
+    },
+    Deferred {
+        state: SyncEditorDeferred,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SyncApplicationPageInvalidRequest {
+    InvalidName,
+    InvalidPath,
+    DuplicateBlockId,
+    MalformedPage,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SyncApplicationPageRequestError {
+    InvalidRequest(SyncApplicationPageInvalidRequest),
+    RequestTooLarge(SyncEditorRequestSize),
+    ActorRefused,
+    ActorUnavailable,
+}
+
+impl fmt::Display for SyncApplicationPageRequestError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidRequest(reason) => {
+                write!(formatter, "invalid application page request: {reason:?}")
+            }
+            Self::RequestTooLarge(size) => write!(
+                formatter,
+                "application page request exceeds bounds: {} blocks, depth {}, {} identity bytes, {} text bytes",
+                size.blocks, size.depth, size.temporary_key_bytes, size.text_bytes
+            ),
+            Self::ActorRefused => formatter.write_str("sync actor refused application page intent"),
+            Self::ActorUnavailable => formatter.write_str("sync actor is unavailable"),
+        }
+    }
+}
+
+impl std::error::Error for SyncApplicationPageRequestError {}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SyncEditorRequestSize {
@@ -1912,6 +2067,64 @@ impl SyncRuntimeHandle {
             .map_err(|_| SyncEditorRequestError::ActorUnavailable)?
     }
 
+    /// Return the complete parser-owned application inventory without routing
+    /// it through the capped sparse query API.
+    pub fn application_page_inventory(
+        &self,
+    ) -> Result<SyncApplicationPageInventoryOutcome, SyncApplicationPageRequestError> {
+        let _operation = self.inner.operation.lock().unwrap();
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.send(ActorRequest::ApplicationPageInventory {
+            reply: reply_sender,
+        })
+        .map_err(map_application_actor_error)?;
+        reply_receiver
+            .recv()
+            .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?
+    }
+
+    /// Load one canonical application DTO by logical identity or exact managed
+    /// path. Parsing, sparse identity matching, and DTO construction all occur
+    /// in the same actor turn.
+    pub fn load_application_page(
+        &self,
+        request: SyncApplicationPageLoadRequest,
+    ) -> Result<SyncApplicationPageLoadOutcome, SyncApplicationPageRequestError> {
+        let _operation = self.inner.operation.lock().unwrap();
+        validate_application_load_request(&request)?;
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.send(ActorRequest::LoadApplicationPage {
+            request,
+            reply: reply_sender,
+        })
+        .map_err(map_application_actor_error)?;
+        reply_receiver
+            .recv()
+            .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?
+    }
+
+    /// Save one complete frontend page through the actor's existing semantic
+    /// transaction writer. Caller block IDs are only matching labels; the
+    /// actor allocates every genuinely new durable block identity. This
+    /// boundary deliberately has no force-overwrite mode: stale, missing,
+    /// occupied, foreign-identity, and read-only cases return typed refusal.
+    pub fn save_application_page(
+        &self,
+        request: SyncApplicationPageSaveRequest,
+    ) -> Result<SyncApplicationPageSaveOutcome, SyncApplicationPageRequestError> {
+        let _operation = self.inner.operation.lock().unwrap();
+        validate_application_save_request(&request)?;
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.send(ActorRequest::SaveApplicationPage {
+            request,
+            reply: reply_sender,
+        })
+        .map_err(map_application_actor_error)?;
+        reply_receiver
+            .recv()
+            .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?
+    }
+
     /// A public request may be too large to retain verbatim, but that never
     /// makes its observation disposable. The actor's one-owner queue already
     /// gives this marker an epoch, status visibility, and a full graph scan
@@ -2196,6 +2409,10 @@ fn map_local_actor_error(_: SyncRuntimeRequestError) -> SyncLocalMutationRequest
 
 fn map_editor_actor_error(_: SyncRuntimeRequestError) -> SyncEditorRequestError {
     SyncEditorRequestError::ActorUnavailable
+}
+
+fn map_application_actor_error(_: SyncRuntimeRequestError) -> SyncApplicationPageRequestError {
+    SyncApplicationPageRequestError::ActorUnavailable
 }
 
 fn check_query_limit(limit: usize, request_bytes: usize) -> Result<(), SyncRuntimeRequestError> {
@@ -2805,6 +3022,235 @@ fn ensure_reconciliation_baseline_with_runtime(
         Err(error) => return Err(display(error)),
     }
     Ok(())
+}
+
+struct ApplicationBlockRef<'a> {
+    block: &'a BlockDto,
+    parent: Option<usize>,
+    depth: usize,
+}
+
+fn flatten_application_blocks(blocks: &[BlockDto]) -> Vec<ApplicationBlockRef<'_>> {
+    let mut output = Vec::new();
+    let mut stack = blocks
+        .iter()
+        .rev()
+        .map(|block| (block, None, 1_usize))
+        .collect::<Vec<_>>();
+    while let Some((block, parent, depth)) = stack.pop() {
+        let index = output.len();
+        output.push(ApplicationBlockRef {
+            block,
+            parent,
+            depth,
+        });
+        stack.extend(
+            block
+                .children
+                .iter()
+                .rev()
+                .map(|child| (child, Some(index), depth.saturating_add(1))),
+        );
+    }
+    output
+}
+
+fn flatten_application_blocks_bounded(
+    blocks: &[BlockDto],
+) -> Result<Vec<ApplicationBlockRef<'_>>, SyncApplicationPageRequestError> {
+    if blocks.len() > MAX_SYNC_EDITOR_BLOCKS {
+        return Err(SyncApplicationPageRequestError::RequestTooLarge(
+            SyncEditorRequestSize {
+                blocks: MAX_SYNC_EDITOR_BLOCKS + 1,
+                ..SyncEditorRequestSize::default()
+            },
+        ));
+    }
+    let mut output = Vec::with_capacity(blocks.len());
+    let mut stack = blocks
+        .iter()
+        .rev()
+        .map(|block| (block, None, 1_usize))
+        .collect::<Vec<_>>();
+    let mut max_depth = 0_usize;
+    while let Some((block, parent, depth)) = stack.pop() {
+        max_depth = max_depth.max(depth);
+        if output.len() == MAX_SYNC_EDITOR_BLOCKS || depth > MAX_SYNC_EDITOR_DEPTH {
+            return Err(SyncApplicationPageRequestError::RequestTooLarge(
+                SyncEditorRequestSize {
+                    blocks: output.len().saturating_add(1),
+                    depth: max_depth,
+                    ..SyncEditorRequestSize::default()
+                },
+            ));
+        }
+        let retained_after_current = output.len().saturating_add(stack.len()).saturating_add(1);
+        if block.children.len() > MAX_SYNC_EDITOR_BLOCKS.saturating_sub(retained_after_current) {
+            return Err(SyncApplicationPageRequestError::RequestTooLarge(
+                SyncEditorRequestSize {
+                    blocks: MAX_SYNC_EDITOR_BLOCKS + 1,
+                    depth: max_depth,
+                    ..SyncEditorRequestSize::default()
+                },
+            ));
+        }
+        let index = output.len();
+        output.push(ApplicationBlockRef {
+            block,
+            parent,
+            depth,
+        });
+        stack.extend(
+            block
+                .children
+                .iter()
+                .rev()
+                .map(|child| (child, Some(index), depth.saturating_add(1))),
+        );
+    }
+    Ok(output)
+}
+
+fn validate_application_load_request(
+    request: &SyncApplicationPageLoadRequest,
+) -> Result<(), SyncApplicationPageRequestError> {
+    match &request.page {
+        SyncApplicationPageSelector::Logical { name, .. } => {
+            if name.len() > MAX_SYNC_EDITOR_REQUEST_BYTES {
+                return Err(SyncApplicationPageRequestError::RequestTooLarge(
+                    SyncEditorRequestSize {
+                        text_bytes: MAX_SYNC_EDITOR_REQUEST_BYTES + 1,
+                        ..SyncEditorRequestSize::default()
+                    },
+                ));
+            }
+            LogicalPageName::parse(name.clone()).map_err(|_| {
+                SyncApplicationPageRequestError::InvalidRequest(
+                    SyncApplicationPageInvalidRequest::InvalidName,
+                )
+            })?;
+        }
+        SyncApplicationPageSelector::ExactPath { path } => {
+            if path.len() > MAX_LOCAL_MUTATION_PATH_BYTES {
+                return Err(SyncApplicationPageRequestError::RequestTooLarge(
+                    SyncEditorRequestSize {
+                        text_bytes: MAX_SYNC_EDITOR_REQUEST_BYTES.min(path.len()),
+                        ..SyncEditorRequestSize::default()
+                    },
+                ));
+            }
+            ManagedPath::parse(path.clone()).map_err(|_| {
+                SyncApplicationPageRequestError::InvalidRequest(
+                    SyncApplicationPageInvalidRequest::InvalidPath,
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_application_save_request(
+    request: &SyncApplicationPageSaveRequest,
+) -> Result<(), SyncApplicationPageRequestError> {
+    let mut size = validate_application_page_bounds(&request.page)?;
+    match &request.target {
+        SyncApplicationPageSaveTarget::Existing { path, revision } => {
+            if path.len() > MAX_LOCAL_MUTATION_PATH_BYTES {
+                editor_charge_text(&mut size, path.len());
+                return Err(SyncApplicationPageRequestError::RequestTooLarge(size));
+            }
+            if ManagedPath::parse(path.clone()).is_err() {
+                return Err(SyncApplicationPageRequestError::InvalidRequest(
+                    SyncApplicationPageInvalidRequest::InvalidPath,
+                ));
+            }
+            editor_charge_text(&mut size, path.len());
+            editor_charge_text(&mut size, revision.len());
+        }
+        SyncApplicationPageSaveTarget::New { name, .. } => {
+            LogicalPageName::parse(name.clone()).map_err(|_| {
+                SyncApplicationPageRequestError::InvalidRequest(
+                    SyncApplicationPageInvalidRequest::InvalidName,
+                )
+            })?;
+            editor_charge_text(&mut size, name.len());
+        }
+    }
+    if editor_request_too_large(size) {
+        return Err(SyncApplicationPageRequestError::RequestTooLarge(size));
+    }
+    Ok(())
+}
+
+fn validate_application_page_bounds(
+    page: &PageDto,
+) -> Result<SyncEditorRequestSize, SyncApplicationPageRequestError> {
+    let flattened = flatten_application_blocks_bounded(&page.blocks)?;
+    let mut size = SyncEditorRequestSize {
+        blocks: flattened.len().min(MAX_SYNC_EDITOR_BLOCKS + 1),
+        ..SyncEditorRequestSize::default()
+    };
+    for value in [
+        Some(page.name.as_str()),
+        Some(page.title.as_str()),
+        page.pre_block.as_deref(),
+        page.rev.as_deref(),
+        Some(page.path.as_str()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        editor_charge_text(&mut size, value.len());
+    }
+    if flattened.len() > MAX_SYNC_EDITOR_BLOCKS {
+        return Err(SyncApplicationPageRequestError::RequestTooLarge(size));
+    }
+    let mut identities = HashSet::with_capacity(flattened.len());
+    for item in flattened {
+        size.depth = size.depth.max(item.depth);
+        size.temporary_key_bytes = bounded_charge(
+            size.temporary_key_bytes,
+            item.block.id.len(),
+            MAX_SYNC_EDITOR_REQUEST_BYTES,
+        );
+        if !identities.insert(item.block.id.as_str()) {
+            return Err(SyncApplicationPageRequestError::InvalidRequest(
+                SyncApplicationPageInvalidRequest::DuplicateBlockId,
+            ));
+        }
+        for value in [
+            Some(item.block.id.as_str()),
+            Some(item.block.raw.as_str()),
+            item.block.marker.as_deref(),
+            item.block.priority.as_deref(),
+            item.block.scheduled.as_deref(),
+            item.block.deadline.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            editor_charge_text(&mut size, value.len());
+        }
+        for value in &item.block.breadcrumb {
+            editor_charge_text(&mut size, value.len());
+        }
+        for value in &item.block.tags {
+            editor_charge_text(&mut size, value.len());
+        }
+        for (name, value) in &item.block.properties {
+            editor_charge_text(&mut size, name.len());
+            editor_charge_text(&mut size, value.len());
+        }
+        if item.block.page_property {
+            return Err(SyncApplicationPageRequestError::InvalidRequest(
+                SyncApplicationPageInvalidRequest::MalformedPage,
+            ));
+        }
+        if editor_request_too_large(size) {
+            return Err(SyncApplicationPageRequestError::RequestTooLarge(size));
+        }
+    }
+    Ok(size)
 }
 
 fn validate_editor_load_request(
@@ -3961,6 +4407,21 @@ enum ActorRequest {
         request: SyncRuntimeQueryRequest,
         reply: mpsc::Sender<Result<SyncRuntimeQueryReply, SyncRuntimeRequestError>>,
     },
+    ApplicationPageInventory {
+        reply: mpsc::Sender<
+            Result<SyncApplicationPageInventoryOutcome, SyncApplicationPageRequestError>,
+        >,
+    },
+    LoadApplicationPage {
+        request: SyncApplicationPageLoadRequest,
+        reply:
+            mpsc::Sender<Result<SyncApplicationPageLoadOutcome, SyncApplicationPageRequestError>>,
+    },
+    SaveApplicationPage {
+        request: SyncApplicationPageSaveRequest,
+        reply:
+            mpsc::Sender<Result<SyncApplicationPageSaveOutcome, SyncApplicationPageRequestError>>,
+    },
     LoadEditorPage {
         request: SyncEditorLoadRequest,
         reply: mpsc::Sender<Result<SyncEditorLoadOutcome, SyncEditorRequestError>>,
@@ -4037,6 +4498,21 @@ fn actor_thread(
         let should_stop = match request {
             ActorRequest::Query { request, reply } => {
                 let result = actor.query(request);
+                let _ = reply.send(result);
+                false
+            }
+            ActorRequest::ApplicationPageInventory { reply } => {
+                let result = actor.application_page_inventory();
+                let _ = reply.send(result);
+                false
+            }
+            ActorRequest::LoadApplicationPage { request, reply } => {
+                let result = actor.load_application_page(request);
+                let _ = reply.send(result);
+                false
+            }
+            ActorRequest::SaveApplicationPage { request, reply } => {
+                let result = actor.save_application_page(request);
                 let _ = reply.send(result);
                 false
             }
@@ -4164,6 +4640,18 @@ struct EditorCurrentPage {
     page: MaterializedPage,
     blocks: Vec<MaterializedBlock>,
     dto: SyncEditablePageDto,
+}
+
+struct ApplicationCurrentPage {
+    page: PageDto,
+    revision: String,
+    editor: EditorCurrentPage,
+}
+
+enum ApplicationExactLoad {
+    Loaded(ApplicationCurrentPage),
+    Missing,
+    Ambiguous,
 }
 
 enum EditorNameState {
@@ -4978,6 +5466,315 @@ impl RuntimeActor {
                         .map(sync_reference_hit)
                         .collect(),
                 ))
+            }
+        }
+    }
+
+    fn application_page_inventory(
+        &mut self,
+    ) -> Result<SyncApplicationPageInventoryOutcome, SyncApplicationPageRequestError> {
+        if let EditorTurnReadiness::Deferred(state) = self.prepare_editor_turn() {
+            return Ok(SyncApplicationPageInventoryOutcome::Deferred { state });
+        }
+        self.application_inventory_ready()
+            .map(|pages| SyncApplicationPageInventoryOutcome::Loaded { pages })
+    }
+
+    fn application_inventory_ready(
+        &self,
+    ) -> Result<Vec<PageEntry>, SyncApplicationPageRequestError> {
+        let pages = self.graph.list_pages();
+        if !self.graph.page_index_failures().is_empty() {
+            return Err(SyncApplicationPageRequestError::ActorRefused);
+        }
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
+        let read = runtime
+            .database()
+            .materialized_read()
+            .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+        ensure_editor_frontier(runtime, read.acceptance_sequence())
+            .map_err(map_editor_application_error)?;
+        let mut exact_paths = HashSet::with_capacity(pages.len());
+        for entry in &pages {
+            if !exact_paths.insert(entry.rel_path.clone()) {
+                return Err(SyncApplicationPageRequestError::ActorRefused);
+            }
+            let path = ManagedPath::parse(entry.rel_path.clone())
+                .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+            let page_id = match runtime
+                .engine()
+                .current_page_at_path(&path)
+                .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?
+            {
+                CurrentPageAtPath::ExactOwner(owner) => owner.page_id(),
+                CurrentPageAtPath::Released(_)
+                | CurrentPageAtPath::Unowned
+                | CurrentPageAtPath::PortableCollision(_)
+                | CurrentPageAtPath::ReleasedPortableCollision(_) => {
+                    return Err(SyncApplicationPageRequestError::ActorRefused)
+                }
+            };
+            let authoritative = runtime
+                .engine()
+                .materialize_page(page_id)
+                .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+            let projected = read
+                .page(page_id)
+                .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?
+                .ok_or(SyncApplicationPageRequestError::ActorRefused)?;
+            if authoritative.path != path
+                || projected.page_id != authoritative.page_id
+                || projected.home_document_id != authoritative.home_document_id
+                || projected.name != authoritative.name.as_str()
+                || projected.name_key != authoritative.name.canonical_key()
+                || projected.path != authoritative.path
+                || projected.kind != authoritative.kind
+                || projected.preamble != authoritative.preamble
+            {
+                return Err(SyncApplicationPageRequestError::ActorRefused);
+            }
+        }
+        Ok(pages)
+    }
+
+    fn load_application_page(
+        &mut self,
+        request: SyncApplicationPageLoadRequest,
+    ) -> Result<SyncApplicationPageLoadOutcome, SyncApplicationPageRequestError> {
+        if let EditorTurnReadiness::Deferred(state) = self.prepare_editor_turn() {
+            return Ok(SyncApplicationPageLoadOutcome::Deferred { state });
+        }
+        match request.page {
+            SyncApplicationPageSelector::ExactPath { path } => {
+                self.application_load_outcome_from_exact(path)
+            }
+            SyncApplicationPageSelector::Logical { name, page_kind } => {
+                let runtime = self
+                    .runtime
+                    .as_ref()
+                    .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
+                match editor_name_state(runtime, &self.graph, name, page_kind)
+                    .map_err(map_editor_application_error)?
+                {
+                    EditorNameState::Missing { name, revision, .. } => {
+                        Ok(SyncApplicationPageLoadOutcome::Missing {
+                            draft: Some(SyncApplicationNewPageDraftDto {
+                                name: name.as_str().to_owned(),
+                                page_kind,
+                                revision,
+                            }),
+                        })
+                    }
+                    EditorNameState::Ambiguous | EditorNameState::PathOccupied => {
+                        Ok(SyncApplicationPageLoadOutcome::Ambiguous)
+                    }
+                    EditorNameState::Exact(page_id) => {
+                        let current = self.load_application_page_id_ready(page_id)?;
+                        Ok(SyncApplicationPageLoadOutcome::Loaded {
+                            page: current.page,
+                            revision: current.revision,
+                        })
+                    }
+                }
+            }
+        }
+    }
+
+    fn application_load_outcome_from_exact(
+        &self,
+        path: String,
+    ) -> Result<SyncApplicationPageLoadOutcome, SyncApplicationPageRequestError> {
+        match self.load_application_exact_ready(&path)? {
+            ApplicationExactLoad::Loaded(current) => Ok(SyncApplicationPageLoadOutcome::Loaded {
+                page: current.page,
+                revision: current.revision,
+            }),
+            ApplicationExactLoad::Missing => {
+                Ok(SyncApplicationPageLoadOutcome::Missing { draft: None })
+            }
+            ApplicationExactLoad::Ambiguous => Ok(SyncApplicationPageLoadOutcome::Ambiguous),
+        }
+    }
+
+    fn load_application_exact_ready(
+        &self,
+        path: &str,
+    ) -> Result<ApplicationExactLoad, SyncApplicationPageRequestError> {
+        let path = ManagedPath::parse(path.to_owned()).map_err(|_| {
+            SyncApplicationPageRequestError::InvalidRequest(
+                SyncApplicationPageInvalidRequest::InvalidPath,
+            )
+        })?;
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
+        let page_id = match runtime
+            .engine()
+            .current_page_at_path(&path)
+            .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?
+        {
+            CurrentPageAtPath::ExactOwner(owner) => owner.page_id(),
+            CurrentPageAtPath::Unowned | CurrentPageAtPath::Released(_) => {
+                return Ok(ApplicationExactLoad::Missing)
+            }
+            CurrentPageAtPath::PortableCollision(_)
+            | CurrentPageAtPath::ReleasedPortableCollision(_) => {
+                return Ok(ApplicationExactLoad::Ambiguous)
+            }
+        };
+        let current = self.load_application_page_id_ready(page_id)?;
+        if current.editor.page.path != path {
+            return Err(SyncApplicationPageRequestError::ActorRefused);
+        }
+        Ok(ApplicationExactLoad::Loaded(current))
+    }
+
+    fn load_application_page_id_ready(
+        &self,
+        page_id: PageId,
+    ) -> Result<ApplicationCurrentPage, SyncApplicationPageRequestError> {
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
+        let editor = load_current_editor_page(runtime, page_id)
+            .map_err(map_editor_application_error)?
+            .ok_or(SyncApplicationPageRequestError::ActorRefused)?;
+        let parsed = self
+            .graph
+            .load_by_path(editor.page.path.as_str())
+            .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?
+            .ok_or(SyncApplicationPageRequestError::ActorRefused)?;
+        join_application_page(parsed, editor)
+    }
+
+    fn save_application_page(
+        &mut self,
+        request: SyncApplicationPageSaveRequest,
+    ) -> Result<SyncApplicationPageSaveOutcome, SyncApplicationPageRequestError> {
+        if let EditorTurnReadiness::Deferred(state) = self.prepare_editor_turn() {
+            return Ok(SyncApplicationPageSaveOutcome::Deferred { state });
+        }
+        let editor_request = match &request.target {
+            SyncApplicationPageSaveTarget::Existing { path, revision } => {
+                let current = match self.load_application_exact_ready(path)? {
+                    ApplicationExactLoad::Loaded(current) => current,
+                    ApplicationExactLoad::Missing => {
+                        return Ok(SyncApplicationPageSaveOutcome::Conflict {
+                            reason: SyncApplicationPageConflict::MissingPage,
+                        })
+                    }
+                    ApplicationExactLoad::Ambiguous => {
+                        return Ok(SyncApplicationPageSaveOutcome::Conflict {
+                            reason: SyncApplicationPageConflict::AmbiguousPageName,
+                        })
+                    }
+                };
+                if current.revision != *revision {
+                    return Ok(SyncApplicationPageSaveOutcome::Conflict {
+                        reason: SyncApplicationPageConflict::StaleBase,
+                    });
+                }
+                if current.page.read_only {
+                    return Ok(SyncApplicationPageSaveOutcome::Conflict {
+                        reason: SyncApplicationPageConflict::ReadOnly,
+                    });
+                }
+                validate_existing_application_page_shape(&request.page, &current.page)?;
+                let blocks = match application_editor_blocks_existing(&request.page, &current) {
+                    Ok(blocks) => blocks,
+                    Err(reason) => return Ok(SyncApplicationPageSaveOutcome::Conflict { reason }),
+                };
+                SyncEditorSaveRequest {
+                    target: SyncEditorSaveTarget::Existing {
+                        page_id: current.editor.page.page_id.to_string(),
+                        revision: revision.clone(),
+                    },
+                    preamble: request.page.pre_block.clone(),
+                    blocks,
+                }
+            }
+            SyncApplicationPageSaveTarget::New { name, page_kind } => {
+                validate_new_application_page_shape(&request.page, name, *page_kind, &self.graph)?;
+                let runtime = self
+                    .runtime
+                    .as_ref()
+                    .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
+                let current_revision =
+                    match editor_name_state(runtime, &self.graph, name.clone(), *page_kind)
+                        .map_err(map_editor_application_error)?
+                    {
+                        EditorNameState::Missing { revision, .. } => revision,
+                        EditorNameState::Exact(_) => {
+                            return Ok(SyncApplicationPageSaveOutcome::Conflict {
+                                reason: SyncApplicationPageConflict::PageAlreadyExists,
+                            })
+                        }
+                        EditorNameState::Ambiguous => {
+                            return Ok(SyncApplicationPageSaveOutcome::Conflict {
+                                reason: SyncApplicationPageConflict::AmbiguousPageName,
+                            })
+                        }
+                        EditorNameState::PathOccupied => {
+                            return Ok(SyncApplicationPageSaveOutcome::Conflict {
+                                reason: SyncApplicationPageConflict::DerivedPathOccupied,
+                            })
+                        }
+                    };
+                SyncEditorSaveRequest {
+                    target: SyncEditorSaveTarget::New {
+                        name: name.clone(),
+                        page_kind: *page_kind,
+                        revision: current_revision,
+                    },
+                    preamble: request.page.pre_block.clone(),
+                    blocks: application_editor_blocks_new(&request.page)?,
+                }
+            }
+        };
+        validate_editor_save_request(&editor_request).map_err(map_editor_application_error)?;
+        match self
+            .save_editor_page(editor_request)
+            .map_err(map_editor_application_error)?
+        {
+            SyncEditorSaveOutcome::Durable { batch_id, page, .. } => {
+                let accepted = self.reload_application_page(&page.path)?;
+                Ok(SyncApplicationPageSaveOutcome::Saved {
+                    batch_id,
+                    page: accepted.page,
+                    revision: accepted.revision,
+                })
+            }
+            SyncEditorSaveOutcome::Unchanged { page, .. } => {
+                let accepted = self.reload_application_page(&page.path)?;
+                Ok(SyncApplicationPageSaveOutcome::Unchanged {
+                    page: accepted.page,
+                    revision: accepted.revision,
+                })
+            }
+            SyncEditorSaveOutcome::Conflict { reason } => {
+                Ok(SyncApplicationPageSaveOutcome::Conflict {
+                    reason: map_application_conflict(reason),
+                })
+            }
+            SyncEditorSaveOutcome::Deferred { state, .. } => {
+                Ok(SyncApplicationPageSaveOutcome::Deferred { state })
+            }
+        }
+    }
+
+    fn reload_application_page(
+        &self,
+        path: &str,
+    ) -> Result<ApplicationCurrentPage, SyncApplicationPageRequestError> {
+        match self.load_application_exact_ready(path)? {
+            ApplicationExactLoad::Loaded(current) => Ok(current),
+            ApplicationExactLoad::Missing | ApplicationExactLoad::Ambiguous => {
+                Err(SyncApplicationPageRequestError::ActorRefused)
             }
         }
     }
@@ -9145,6 +9942,226 @@ fn editor_deferred_from_local(outcome: SyncLocalMutationOutcome) -> SyncEditorDe
     }
 }
 
+fn map_editor_application_error(error: SyncEditorRequestError) -> SyncApplicationPageRequestError {
+    match error {
+        SyncEditorRequestError::RequestTooLarge(size) => {
+            SyncApplicationPageRequestError::RequestTooLarge(size)
+        }
+        SyncEditorRequestError::ActorUnavailable => {
+            SyncApplicationPageRequestError::ActorUnavailable
+        }
+        SyncEditorRequestError::InvalidRequest(_) | SyncEditorRequestError::ActorRefused => {
+            SyncApplicationPageRequestError::ActorRefused
+        }
+    }
+}
+
+fn map_application_conflict(reason: SyncEditorConflict) -> SyncApplicationPageConflict {
+    match reason {
+        SyncEditorConflict::StaleBase => SyncApplicationPageConflict::StaleBase,
+        SyncEditorConflict::MissingPage => SyncApplicationPageConflict::MissingPage,
+        SyncEditorConflict::PageAlreadyExists => SyncApplicationPageConflict::PageAlreadyExists,
+        SyncEditorConflict::AmbiguousPageName => SyncApplicationPageConflict::AmbiguousPageName,
+        SyncEditorConflict::DerivedPathOccupied => SyncApplicationPageConflict::DerivedPathOccupied,
+        SyncEditorConflict::UnknownOrForeignBlock => {
+            SyncApplicationPageConflict::UnknownOrForeignBlock
+        }
+    }
+}
+
+fn join_application_page(
+    mut parsed: PageDto,
+    editor: EditorCurrentPage,
+) -> Result<ApplicationCurrentPage, SyncApplicationPageRequestError> {
+    if parsed.guide
+        || parsed.name != editor.page.name.as_str()
+        || SyncPageKind::from(parsed.kind) != SyncPageKind::from(editor.page.kind)
+        || parsed.path != editor.page.path.as_str()
+        || parsed.pre_block != editor.page.preamble
+    {
+        return Err(SyncApplicationPageRequestError::ActorRefused);
+    }
+    let parsed_blocks = flatten_application_blocks(&parsed.blocks);
+    if parsed_blocks.len() != editor.dto.blocks.len() || parsed_blocks.len() != editor.blocks.len()
+    {
+        return Err(SyncApplicationPageRequestError::ActorRefused);
+    }
+    let materialized = editor
+        .blocks
+        .iter()
+        .map(|block| (block.block_id, block))
+        .collect::<HashMap<_, _>>();
+    let sparse_indexes = editor
+        .dto
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(index, block)| match &block.key {
+            SyncEditorBlockKey::Existing(id) => parse_editor_block_id(id)
+                .map(|id| (id, index))
+                .map_err(map_editor_application_error),
+            SyncEditorBlockKey::Temporary(_) => Err(SyncApplicationPageRequestError::ActorRefused),
+        })
+        .collect::<Result<HashMap<_, _>, _>>()?;
+    let mut frontend_ids = Vec::with_capacity(parsed_blocks.len());
+    let mut seen_frontend_ids = HashSet::with_capacity(parsed_blocks.len());
+    for (index, parsed_block) in parsed_blocks.iter().enumerate() {
+        let editor_block = &editor.dto.blocks[index];
+        let sparse_id = match &editor_block.key {
+            SyncEditorBlockKey::Existing(id) => {
+                parse_editor_block_id(id).map_err(map_editor_application_error)?
+            }
+            SyncEditorBlockKey::Temporary(_) => {
+                return Err(SyncApplicationPageRequestError::ActorRefused)
+            }
+        };
+        let actor_block = materialized
+            .get(&sparse_id)
+            .ok_or(SyncApplicationPageRequestError::ActorRefused)?;
+        let actor_parent_index = actor_block
+            .parent
+            .map(|parent| {
+                sparse_indexes
+                    .get(&parent)
+                    .copied()
+                    .ok_or(SyncApplicationPageRequestError::ActorRefused)
+            })
+            .transpose()?;
+        if parsed_block.parent != actor_parent_index
+            || parsed_block.block.raw != editor_block.content
+        {
+            return Err(SyncApplicationPageRequestError::ActorRefused);
+        }
+        let frontend_id = match actor_block.logseq_uuid {
+            Some(logseq_uuid) => logseq_uuid.to_string(),
+            None => format!("{SYNC_APPLICATION_INTERNAL_BLOCK_PREFIX}{sparse_id}"),
+        };
+        if !seen_frontend_ids.insert(frontend_id.clone()) {
+            return Err(SyncApplicationPageRequestError::ActorRefused);
+        }
+        frontend_ids.push(frontend_id);
+    }
+    rewrite_application_block_ids(&mut parsed.blocks, &frontend_ids, &mut 0);
+    let revision = editor.dto.revision.clone();
+    Ok(ApplicationCurrentPage {
+        page: parsed,
+        revision,
+        editor,
+    })
+}
+
+fn rewrite_application_block_ids(
+    blocks: &mut [BlockDto],
+    identities: &[String],
+    index: &mut usize,
+) {
+    for block in blocks {
+        block.id.clone_from(&identities[*index]);
+        *index += 1;
+        rewrite_application_block_ids(&mut block.children, identities, index);
+    }
+}
+
+fn validate_existing_application_page_shape(
+    requested: &PageDto,
+    current: &PageDto,
+) -> Result<(), SyncApplicationPageRequestError> {
+    if requested.name != current.name
+        || requested.kind != current.kind
+        || requested.title != current.title
+        || requested.format != current.format
+        || requested.read_only != current.read_only
+        || requested.path != current.path
+        || requested.guide
+    {
+        return Err(SyncApplicationPageRequestError::InvalidRequest(
+            SyncApplicationPageInvalidRequest::MalformedPage,
+        ));
+    }
+    Ok(())
+}
+
+fn validate_new_application_page_shape(
+    page: &PageDto,
+    name: &str,
+    page_kind: SyncPageKind,
+    graph: &Graph,
+) -> Result<(), SyncApplicationPageRequestError> {
+    if page.name != name
+        || SyncPageKind::from(page.kind) != page_kind
+        || page.title != page.name
+        || page
+            .pre_block
+            .as_ref()
+            .is_some_and(|preamble| preamble.contains('\0'))
+        || page.rev.is_some()
+        || page.format != graph.preferred_format()
+        || page.read_only
+        || !page.path.is_empty()
+        || page.guide
+    {
+        return Err(SyncApplicationPageRequestError::InvalidRequest(
+            SyncApplicationPageInvalidRequest::MalformedPage,
+        ));
+    }
+    Ok(())
+}
+
+fn application_editor_blocks_existing(
+    page: &PageDto,
+    current: &ApplicationCurrentPage,
+) -> Result<Vec<SyncEditorBlockDto>, SyncApplicationPageConflict> {
+    let current_blocks = flatten_application_blocks(&current.page.blocks);
+    let exposed = current_blocks
+        .iter()
+        .zip(&current.editor.dto.blocks)
+        .map(|(block, editor)| (block.block.id.as_str(), editor.key.clone()))
+        .collect::<HashMap<_, _>>();
+    let requested = flatten_application_blocks(&page.blocks);
+    let mut keys = Vec::with_capacity(requested.len());
+    for (index, block) in requested.iter().enumerate() {
+        let key = match exposed.get(block.block.id.as_str()) {
+            Some(key) => key.clone(),
+            None if block
+                .block
+                .id
+                .starts_with(SYNC_APPLICATION_INTERNAL_BLOCK_PREFIX) =>
+            {
+                return Err(SyncApplicationPageConflict::UnknownOrForeignBlock)
+            }
+            None => SyncEditorBlockKey::Temporary(format!("gateway-{index}")),
+        };
+        keys.push(key);
+    }
+    Ok(requested
+        .iter()
+        .enumerate()
+        .map(|(index, block)| SyncEditorBlockDto {
+            key: keys[index].clone(),
+            parent: block.parent.map(|parent| keys[parent].clone()),
+            content: block.block.raw.clone(),
+        })
+        .collect())
+}
+
+fn application_editor_blocks_new(
+    page: &PageDto,
+) -> Result<Vec<SyncEditorBlockDto>, SyncApplicationPageRequestError> {
+    let requested = flatten_application_blocks(&page.blocks);
+    let keys = (0..requested.len())
+        .map(|index| SyncEditorBlockKey::Temporary(format!("gateway-{index}")))
+        .collect::<Vec<_>>();
+    Ok(requested
+        .iter()
+        .enumerate()
+        .map(|(index, block)| SyncEditorBlockDto {
+            key: keys[index].clone(),
+            parent: block.parent.map(|parent| keys[parent].clone()),
+            content: block.block.raw.clone(),
+        })
+        .collect())
+}
+
 fn editor_name_state(
     runtime: &PromotedLocalRuntime,
     graph: &Graph,
@@ -9189,7 +10206,7 @@ fn editor_name_state(
             return Ok(EditorNameState::PathOccupied)
         }
     }
-    let revision = new_editor_revision(runtime, &name, &path, page_kind)?;
+    let revision = new_editor_revision(&name, &path, page_kind);
     Ok(EditorNameState::Missing {
         name,
         path,
@@ -9246,7 +10263,7 @@ fn load_current_editor_page(
         blocks: ordered,
         revision: String::new(),
     };
-    dto.revision = existing_editor_revision(runtime, &dto)?;
+    dto.revision = existing_editor_revision(&authoritative, &dto)?;
     let blocks = authoritative.blocks.clone();
     Ok(Some(EditorCurrentPage {
         page: authoritative,
@@ -9363,47 +10380,58 @@ fn ordered_editor_blocks(
 }
 
 fn existing_editor_revision(
-    runtime: &PromotedLocalRuntime,
+    authoritative: &MaterializedPage,
     page: &SyncEditablePageDto,
 ) -> Result<String, SyncEditorRequestError> {
-    let frontier = runtime
-        .engine()
-        .accepted_frontier_root()
-        .map_err(|_| SyncEditorRequestError::ActorRefused)?;
     let mut without_revision = page.clone();
     without_revision.revision.clear();
     let snapshot =
         serde_json::to_vec(&without_revision).map_err(|_| SyncEditorRequestError::ActorRefused)?;
     let mut hasher = Sha256::new();
-    hasher.update(b"tine/sync-editor-existing-revision/v1\0");
-    hasher.update(frontier.acceptance_sequence().to_be_bytes());
-    hasher.update(frontier.state_digest().as_bytes());
+    hasher.update(b"tine/sync-editor-existing-revision/v2\0");
+    hasher.update(authoritative.page_id.as_uuid().as_bytes());
+    hasher.update(authoritative.home_document_id.as_uuid().as_bytes());
     hasher.update((snapshot.len() as u64).to_be_bytes());
     hasher.update(snapshot);
+    hasher.update((authoritative.blocks.len() as u64).to_be_bytes());
+    for block in &authoritative.blocks {
+        hasher.update(block.block_id.as_uuid().as_bytes());
+        hasher.update(block.home_document_id.as_uuid().as_bytes());
+        match block.logseq_uuid {
+            Some(uuid) => {
+                hasher.update([1]);
+                hasher.update(uuid.as_uuid().as_bytes());
+            }
+            None => hasher.update([0]),
+        }
+        match &block.logseq_identity_origin {
+            Some(origin) => {
+                hasher.update([1]);
+                let encoded =
+                    serde_json::to_vec(origin).map_err(|_| SyncEditorRequestError::ActorRefused)?;
+                hasher.update((encoded.len() as u64).to_be_bytes());
+                hasher.update(encoded);
+            }
+            None => hasher.update([0]),
+        }
+    }
     Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn new_editor_revision(
-    runtime: &PromotedLocalRuntime,
     name: &LogicalPageName,
     path: &ManagedPath,
     page_kind: SyncPageKind,
-) -> Result<String, SyncEditorRequestError> {
-    let frontier = runtime
-        .engine()
-        .accepted_frontier_root()
-        .map_err(|_| SyncEditorRequestError::ActorRefused)?;
+) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"tine/sync-editor-new-revision/v1\0");
-    hasher.update(frontier.acceptance_sequence().to_be_bytes());
-    hasher.update(frontier.state_digest().as_bytes());
+    hasher.update(b"tine/sync-editor-new-revision/v2\0");
     hash_editor_field(&mut hasher, name.as_str());
     hash_editor_field(&mut hasher, path.as_str());
     hasher.update([match page_kind {
         SyncPageKind::Page => 1,
         SyncPageKind::Journal => 2,
     }]);
-    Ok(format!("{:x}", hasher.finalize()))
+    format!("{:x}", hasher.finalize())
 }
 
 fn hash_editor_field(hasher: &mut Sha256, value: &str) {
@@ -10030,6 +11058,7 @@ fn map_tick(drain: ExactExternalFeedDrain) -> SyncRuntimeTick {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Format;
     use crate::oplog::enrollment::EnrollmentDiscoveryHandoff;
     use crate::oplog::exact_external_feed::tests::RuntimeHostFixture;
     use crate::oplog::{BlockLocation, LogicalPageName, PageRename};
@@ -10906,7 +11935,7 @@ mod tests {
             .observe_watcher(vec![SyncWatcherObservation::managed_path(path).unwrap()])
             .unwrap();
         settle_exact_feed(handle)
-            .unwrap_or_else(|state| panic!("external page did not settle: {state:?}"));
+            .unwrap_or_else(|state| panic!("external page {path:?} did not settle: {state:?}"));
     }
 
     fn load_editor_named(
@@ -10948,6 +11977,546 @@ mod tests {
             SyncEditorLoadOutcome::Loaded { page } => page,
             other => panic!("editor page ID did not load: {other:?}"),
         }
+    }
+
+    fn load_application_exact(handle: &SyncRuntimeHandle, path: &str) -> (PageDto, String) {
+        match handle
+            .load_application_page(SyncApplicationPageLoadRequest {
+                page: SyncApplicationPageSelector::ExactPath { path: path.into() },
+            })
+            .unwrap_or_else(|error| panic!("application page {path:?} failed: {error:?}"))
+        {
+            SyncApplicationPageLoadOutcome::Loaded { page, revision } => (page, revision),
+            other => panic!("application page did not load: {other:?}"),
+        }
+    }
+
+    fn load_application_logical(
+        handle: &SyncRuntimeHandle,
+        name: &str,
+        page_kind: SyncPageKind,
+    ) -> (PageDto, String) {
+        match handle
+            .load_application_page(SyncApplicationPageLoadRequest {
+                page: SyncApplicationPageSelector::Logical {
+                    name: name.into(),
+                    page_kind,
+                },
+            })
+            .unwrap()
+        {
+            SyncApplicationPageLoadOutcome::Loaded { page, revision } => (page, revision),
+            other => panic!("application page did not load: {other:?}"),
+        }
+    }
+
+    fn erase_application_block_ids(blocks: &mut [BlockDto]) {
+        for block in blocks {
+            block.id = "<identity>".into();
+            erase_application_block_ids(&mut block.children);
+        }
+    }
+
+    fn assert_parser_dto_semantics(expected: &PageDto, actual: &PageDto) {
+        let mut expected = expected.clone();
+        let mut actual = actual.clone();
+        erase_application_block_ids(&mut expected.blocks);
+        erase_application_block_ids(&mut actual.blocks);
+        assert_eq!(
+            serde_json::to_value(expected).unwrap(),
+            serde_json::to_value(actual).unwrap()
+        );
+    }
+
+    fn accepted_application_save(
+        handle: &SyncRuntimeHandle,
+        outcome: SyncApplicationPageSaveOutcome,
+        name: &str,
+        page_kind: SyncPageKind,
+    ) -> (PageDto, String) {
+        match outcome {
+            SyncApplicationPageSaveOutcome::Saved { page, revision, .. }
+            | SyncApplicationPageSaveOutcome::Unchanged { page, revision } => (page, revision),
+            SyncApplicationPageSaveOutcome::Deferred {
+                state: SyncEditorDeferred::RetryableRetainedPublication { .. },
+            } => {
+                settle_local_mutation(handle);
+                load_application_logical(handle, name, page_kind)
+            }
+            other => panic!("application save was not accepted: {other:?}"),
+        }
+    }
+
+    fn new_application_page(
+        name: &str,
+        page_kind: SyncPageKind,
+        pre_block: Option<&str>,
+        blocks: Vec<BlockDto>,
+    ) -> PageDto {
+        PageDto {
+            name: name.into(),
+            kind: sync_model_page_kind(page_kind),
+            title: name.into(),
+            pre_block: pre_block.map(str::to_owned),
+            blocks,
+            rev: None,
+            format: Format::Md,
+            read_only: false,
+            path: String::new(),
+            guide: false,
+        }
+    }
+
+    #[test]
+    fn application_gateway_inventory_and_loads_are_parser_owned_with_safe_block_identity() {
+        let fixture = RuntimeHostFixture::safe("sync-runtime-application-parser-gateway");
+        let request = fixture.request();
+        let database_path = request.database_path.clone();
+        let handle = active_handle(SyncRuntimeHandle::open(request));
+        drive_initial_feed(&handle);
+        let genuine = "7f46e275-4f95-4f58-a485-bb8e16726c42";
+        admit_external_page(
+            &handle,
+            &fixture,
+            "content/nested pages/Ordinary Ω.md",
+            format!(
+                "title:: Ordinary Ω\nicon:: 🧭\n\n- TODO [#A] parent #gateway\n  collapsed:: true\n  id:: {genuine}\n  custom:: value\n  - child λ\n"
+            )
+            .as_bytes(),
+        );
+        admit_external_page(
+            &handle,
+            &fixture,
+            "diary/日記/2026_07_30.org",
+            b"* TODO journal root\n** journal child\n",
+        );
+        let inventory = match handle.application_page_inventory().unwrap() {
+            SyncApplicationPageInventoryOutcome::Loaded { pages } => pages,
+            other => panic!("application inventory was not ready: {other:?}"),
+        };
+        let inventory_semantics = inventory
+            .iter()
+            .map(|entry| {
+                (
+                    entry.rel_path.clone(),
+                    entry.name.clone(),
+                    entry.kind,
+                    entry.date_key,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(inventory_semantics
+            .iter()
+            .any(|(path, name, kind, date_key)| {
+                path == "content/nested pages/Ordinary Ω.md"
+                    && name == "Ordinary Ω"
+                    && *kind == PageKind::Page
+                    && date_key.is_none()
+            }));
+        assert!(inventory_semantics.iter().any(|(path, _, kind, date_key)| {
+            path == "diary/日記/2026_07_30.org" && *kind == PageKind::Journal && date_key.is_some()
+        }));
+
+        let graph = Graph::open(fixture.graph_root());
+        for path in [
+            "content/nested pages/Ordinary Ω.md",
+            "diary/日記/2026_07_30.org",
+        ] {
+            let expected = graph.load_by_path(path).unwrap().unwrap();
+            let (actual, _) = load_application_exact(&handle, path);
+            assert_parser_dto_semantics(&expected, &actual);
+        }
+        let (ordinary, _) = load_application_exact(&handle, "content/nested pages/Ordinary Ω.md");
+        assert_eq!(ordinary.blocks[0].id, genuine);
+        assert_eq!(
+            Uuid::parse_str(&ordinary.blocks[0].id).unwrap().to_string(),
+            genuine
+        );
+        assert!(ordinary.blocks[0].children[0]
+            .id
+            .starts_with(SYNC_APPLICATION_INTERNAL_BLOCK_PREFIX));
+        assert!(Uuid::parse_str(&ordinary.blocks[0].children[0].id).is_err());
+        assert!(ordinary.blocks[0].collapsed);
+        assert_eq!(ordinary.blocks[0].marker.as_deref(), Some("TODO"));
+        assert_eq!(ordinary.blocks[0].priority.as_deref(), Some("A"));
+        assert!(ordinary.blocks[0].tags.iter().any(|tag| tag == "gateway"));
+        assert!(ordinary.blocks[0]
+            .properties
+            .iter()
+            .any(|(name, value)| name == "custom" && value == "value"));
+
+        let connection = rusqlite::Connection::open(database_path).unwrap();
+        connection
+            .execute(
+                "UPDATE pages SET preamble = ?1 WHERE path = ?2",
+                rusqlite::params![
+                    "counterfeit unrelated inventory row",
+                    "diary/日記/2026_07_30.org"
+                ],
+            )
+            .unwrap();
+        assert!(matches!(
+            handle.application_page_inventory(),
+            Err(SyncApplicationPageRequestError::ActorRefused)
+        ));
+        let (logical, _) = load_application_logical(&handle, " /ORDINARY Ω/ ", SyncPageKind::Page);
+        assert_parser_dto_semantics(&ordinary, &logical);
+        connection
+            .execute(
+                "UPDATE pages SET preamble = NULL WHERE path = ?1",
+                ["diary/日記/2026_07_30.org"],
+            )
+            .unwrap();
+        drop(connection);
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
+    fn application_gateway_join_preserves_parser_read_only_org() {
+        let root = std::env::temp_dir().join(format!(
+            "tine-sync-runtime-read-only-gateway-{}",
+            Uuid::new_v4()
+        ));
+        fs::create_dir_all(root.join("pages")).unwrap();
+        fs::write(root.join("pages/Read Only.org"), b"* root\n*** child\n").unwrap();
+        let graph = Graph::open(&root);
+        let parsed = graph.load_by_path("pages/Read Only.org").unwrap().unwrap();
+        assert!(parsed.read_only);
+        let flattened = flatten_application_blocks(&parsed.blocks);
+        let page_id = PageId::from_uuid(Uuid::from_u128(0x7710));
+        let home_document_id = DocumentId::from_uuid(Uuid::from_u128(0x7711));
+        let block_ids = (0..flattened.len())
+            .map(|index| BlockId::from_uuid(Uuid::from_u128(0x7720 + index as u128)))
+            .collect::<Vec<_>>();
+        let blocks = flattened
+            .iter()
+            .enumerate()
+            .map(|(index, block)| MaterializedBlock {
+                block_id: block_ids[index],
+                home_document_id,
+                parent: block.parent.map(|parent| block_ids[parent]),
+                order: crate::oplog::import::imported_order(index as u32),
+                logseq_uuid: None,
+                logseq_identity_origin: None,
+                content: block.block.raw.clone(),
+            })
+            .collect::<Vec<_>>();
+        let materialized = MaterializedPage {
+            page_id,
+            home_document_id,
+            name: LogicalPageName::parse(parsed.name.clone()).unwrap(),
+            path: ManagedPath::parse(parsed.path.clone()).unwrap(),
+            kind: ManagedTextKind::Page,
+            preamble: parsed.pre_block.clone(),
+            blocks: blocks.clone(),
+            stats: crate::oplog::MaterializationStats::default(),
+        };
+        let mut dto = SyncEditablePageDto {
+            page_id: page_id.to_string(),
+            name: parsed.name.clone(),
+            path: parsed.path.clone(),
+            page_kind: SyncPageKind::Page,
+            preamble: parsed.pre_block.clone(),
+            blocks: blocks
+                .iter()
+                .enumerate()
+                .map(|(index, block)| SyncEditorBlockDto {
+                    key: SyncEditorBlockKey::Existing(block.block_id.to_string()),
+                    parent: flattened[index]
+                        .parent
+                        .map(|parent| SyncEditorBlockKey::Existing(block_ids[parent].to_string())),
+                    content: block.content.clone(),
+                })
+                .collect(),
+            revision: String::new(),
+        };
+        dto.revision = existing_editor_revision(&materialized, &dto).unwrap();
+        let joined = join_application_page(
+            parsed,
+            EditorCurrentPage {
+                page: materialized,
+                blocks,
+                dto,
+            },
+        )
+        .unwrap();
+        assert!(joined.page.read_only);
+        assert!(joined
+            .page
+            .blocks
+            .iter()
+            .all(|block| block.id.starts_with(SYNC_APPLICATION_INTERNAL_BLOCK_PREFIX)));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn application_gateway_saves_remap_new_ids_and_use_page_local_revisions() {
+        let fixture = RuntimeHostFixture::safe("sync-runtime-application-save-gateway");
+        let handle = active_handle(SyncRuntimeHandle::open(fixture.request()));
+        drive_initial_feed(&handle);
+        admit_external_page(
+            &handle,
+            &fixture,
+            "content/nested pages/Alpha.md",
+            b"- alpha root\n  - alpha child\n- delete me\n",
+        );
+        admit_external_page(
+            &handle,
+            &fixture,
+            "content/nested pages/Beta.md",
+            b"- beta original\n",
+        );
+
+        let (mut alpha, alpha_revision) =
+            load_application_logical(&handle, "Alpha", SyncPageKind::Page);
+        assert!(alpha.rev.is_some());
+        alpha.rev = None;
+        let stale_alpha_revision = alpha_revision.clone();
+        let stale_alpha = alpha.clone();
+        let (mut beta, beta_revision) =
+            load_application_logical(&handle, "Beta", SyncPageKind::Page);
+        beta.blocks[0].raw = "beta unrelated edit".into();
+        let _ = accepted_application_save(
+            &handle,
+            handle
+                .save_application_page(SyncApplicationPageSaveRequest {
+                    target: SyncApplicationPageSaveTarget::Existing {
+                        path: beta.path.clone(),
+                        revision: beta_revision,
+                    },
+                    page: beta,
+                })
+                .unwrap(),
+            "Beta",
+            SyncPageKind::Page,
+        );
+
+        let mut child = alpha.blocks[0].children.remove(0);
+        child.children.push(BlockDto {
+            id: "arbitrary frontend\nidentity".into(),
+            raw: "inserted nested".into(),
+            ..BlockDto::default()
+        });
+        alpha.blocks = vec![child, alpha.blocks.remove(0)];
+        let saved_alpha = accepted_application_save(
+            &handle,
+            handle
+                .save_application_page(SyncApplicationPageSaveRequest {
+                    target: SyncApplicationPageSaveTarget::Existing {
+                        path: alpha.path.clone(),
+                        revision: alpha_revision,
+                    },
+                    page: alpha,
+                })
+                .unwrap(),
+            "Alpha",
+            SyncPageKind::Page,
+        );
+        assert_eq!(saved_alpha.0.blocks.len(), 2);
+        assert_eq!(saved_alpha.0.blocks[0].raw, "alpha child");
+        assert_eq!(saved_alpha.0.blocks[0].children[0].raw, "inserted nested");
+        assert!(saved_alpha.0.blocks[0].children[0]
+            .id
+            .starts_with(SYNC_APPLICATION_INTERNAL_BLOCK_PREFIX));
+        assert_ne!(
+            saved_alpha.0.blocks[0].children[0].id,
+            "arbitrary frontend\nidentity"
+        );
+        assert!(matches!(
+            handle
+                .save_application_page(SyncApplicationPageSaveRequest {
+                    target: SyncApplicationPageSaveTarget::Existing {
+                        path: saved_alpha.0.path.clone(),
+                        revision: saved_alpha.1.clone(),
+                    },
+                    page: saved_alpha.0.clone(),
+                })
+                .unwrap(),
+            SyncApplicationPageSaveOutcome::Unchanged { .. }
+        ));
+
+        let mut stale_alpha = stale_alpha;
+        stale_alpha.blocks[0].raw = "must conflict".into();
+        assert!(matches!(
+            handle
+                .save_application_page(SyncApplicationPageSaveRequest {
+                    target: SyncApplicationPageSaveTarget::Existing {
+                        path: stale_alpha.path.clone(),
+                        revision: stale_alpha_revision,
+                    },
+                    page: stale_alpha,
+                })
+                .unwrap(),
+            SyncApplicationPageSaveOutcome::Conflict {
+                reason: SyncApplicationPageConflict::StaleBase
+            }
+        ));
+
+        let temporary = Uuid::new_v4().to_string();
+        let created = accepted_application_save(
+            &handle,
+            handle
+                .save_application_page(SyncApplicationPageSaveRequest {
+                    target: SyncApplicationPageSaveTarget::New {
+                        name: "Created Ω".into(),
+                        page_kind: SyncPageKind::Page,
+                    },
+                    page: new_application_page(
+                        "Created Ω",
+                        SyncPageKind::Page,
+                        Some("icon:: 🌱"),
+                        vec![BlockDto {
+                            id: temporary.clone(),
+                            raw: "created root".into(),
+                            children: vec![BlockDto {
+                                id: "any temporary child".into(),
+                                raw: "created child".into(),
+                                ..BlockDto::default()
+                            }],
+                            ..BlockDto::default()
+                        }],
+                    ),
+                })
+                .unwrap(),
+            "Created Ω",
+            SyncPageKind::Page,
+        );
+        assert_ne!(created.0.blocks[0].id, temporary);
+        assert!(created.0.blocks[0]
+            .id
+            .starts_with(SYNC_APPLICATION_INTERNAL_BLOCK_PREFIX));
+        assert_eq!(
+            load_application_exact(&handle, &created.0.path).1,
+            created.1
+        );
+
+        admit_external_page(
+            &handle,
+            &fixture,
+            "content/nested pages/Atomic Existing.md",
+            b"- existing owner\n",
+        );
+        let occupied_name = "Atomic Occupied";
+        let occupied_path = Graph::open(fixture.graph_root())
+            .new_sparse_page_path(occupied_name, PageKind::Page)
+            .unwrap();
+        admit_external_page(
+            &handle,
+            &fixture,
+            occupied_path.as_str(),
+            b"title:: Different Atomic Owner\n\n- occupied path\n",
+        );
+        let manifests_before = fixture.manifest_count();
+        let applied_before = fixture.applied_batch_count();
+        let files_before = snapshot_graph_files(fixture.graph_root());
+        let status_before = handle.status().unwrap();
+        let target = |name: &str| SyncApplicationPageSaveTarget::New {
+            name: name.into(),
+            page_kind: SyncPageKind::Page,
+        };
+        for (target, page, reason) in [
+            (
+                target("Atomic Existing"),
+                new_application_page("Atomic Existing", SyncPageKind::Page, None, Vec::new()),
+                SyncApplicationPageConflict::PageAlreadyExists,
+            ),
+            (
+                SyncApplicationPageSaveTarget::New {
+                    name: "Atomic Existing".into(),
+                    page_kind: SyncPageKind::Journal,
+                },
+                new_application_page("Atomic Existing", SyncPageKind::Journal, None, Vec::new()),
+                SyncApplicationPageConflict::AmbiguousPageName,
+            ),
+            (
+                target(occupied_name),
+                new_application_page(occupied_name, SyncPageKind::Page, None, Vec::new()),
+                SyncApplicationPageConflict::DerivedPathOccupied,
+            ),
+        ] {
+            assert!(matches!(
+                handle
+                    .save_application_page(SyncApplicationPageSaveRequest { target, page })
+                    .unwrap(),
+                SyncApplicationPageSaveOutcome::Conflict { reason: actual } if actual == reason
+            ));
+        }
+        let oversized = (0..=MAX_SYNC_EDITOR_BLOCKS)
+            .map(|index| BlockDto {
+                id: format!("oversized-{index}"),
+                raw: "body".into(),
+                ..BlockDto::default()
+            })
+            .collect();
+        assert!(matches!(
+            handle.save_application_page(SyncApplicationPageSaveRequest {
+                target: target("Oversized Gateway"),
+                page: new_application_page(
+                    "Oversized Gateway",
+                    SyncPageKind::Page,
+                    None,
+                    oversized,
+                ),
+            }),
+            Err(SyncApplicationPageRequestError::RequestTooLarge(_))
+        ));
+        let mut deep = BlockDto {
+            id: "deep-leaf".into(),
+            raw: "leaf".into(),
+            ..BlockDto::default()
+        };
+        for depth in 0..MAX_SYNC_EDITOR_DEPTH {
+            deep = BlockDto {
+                id: format!("deep-{depth}"),
+                raw: "parent".into(),
+                children: vec![deep],
+                ..BlockDto::default()
+            };
+        }
+        assert!(matches!(
+            handle.save_application_page(SyncApplicationPageSaveRequest {
+                target: target("Deep Gateway"),
+                page: new_application_page("Deep Gateway", SyncPageKind::Page, None, vec![deep],),
+            }),
+            Err(SyncApplicationPageRequestError::RequestTooLarge(_))
+        ));
+        let duplicate = vec![
+            BlockDto {
+                id: "duplicate".into(),
+                raw: "one".into(),
+                ..BlockDto::default()
+            },
+            BlockDto {
+                id: "duplicate".into(),
+                raw: "two".into(),
+                ..BlockDto::default()
+            },
+        ];
+        assert!(matches!(
+            handle.save_application_page(SyncApplicationPageSaveRequest {
+                target: target("Malformed Gateway"),
+                page: new_application_page(
+                    "Malformed Gateway",
+                    SyncPageKind::Page,
+                    None,
+                    duplicate,
+                ),
+            }),
+            Err(SyncApplicationPageRequestError::InvalidRequest(
+                SyncApplicationPageInvalidRequest::DuplicateBlockId
+            ))
+        ));
+        assert_eq!(fixture.manifest_count(), manifests_before);
+        assert_eq!(fixture.applied_batch_count(), applied_before);
+        assert_eq!(snapshot_graph_files(fixture.graph_root()), files_before);
+        assert_eq!(handle.status().unwrap(), status_before);
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
     }
 
     fn retain_editor_save(handle: &SyncRuntimeHandle, request: SyncEditorSaveRequest) -> PageId {
@@ -11448,6 +13017,9 @@ mod tests {
         let loaded = load_editor_named(&handle, "Duplicate Owner", SyncPageKind::Page);
         assert_eq!(loaded.path, path);
         assert_eq!(loaded.blocks[0].content, "first owner");
+        let (application, _) = load_application_exact(&handle, path);
+        assert_eq!(application.path, path);
+        assert_eq!(application.blocks[0].raw, "first owner");
         let manifests_before = fixture.manifest_count();
         let applied_before = fixture.applied_batch_count();
         let files_before = snapshot_graph_files(fixture.graph_root());
