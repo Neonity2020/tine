@@ -78,6 +78,11 @@ const suites = {
   "og-parity-pilot": [
     ["og-parity-references", "scripts/e2e-og-parity-references.mjs", {}],
   ],
+  // Experimental candidate gate: intentionally separate from broad release
+  // coverage so it is run only with the exact sparse-v2 candidate receipt.
+  "sparse-v2-recovery": [
+    ["sparse-v2-recovery", "scripts/e2e-sparse-v2-recovery.mjs", {}],
+  ],
   "linux-smoke": [
     ["caret-agenda", "scripts/e2e-caret.mjs", { CARET_MODE: "agenda", CARET_LABEL: "runner" }],
     ["multigraph", "scripts/e2e-multigraph.mjs", {}],

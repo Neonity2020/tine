@@ -215,6 +215,15 @@
       "nonRequirements": ["Exact scrollbar palette/RGB, thumb dimensions, CSS selector, or DOM structure."],
       "stability": "stable"
     },
+    "scripts/e2e-sparse-v2-recovery.mjs": {
+      "contracts": [
+        { "class": "exact-safety-interoperability", "userOutcome": "Explicit sparse-v2 activation and return to standard Markdown mode preserve the graph's authority transition and user-visible Markdown continuity across real native restarts.", "blocking": true, "authority": "Tine sparse-v2 local authority-transition and Markdown interoperability contract" },
+        { "class": "core-operation", "userOutcome": "Users can edit an existing UTF-named page and create a new page in sparse v2, then reopen both saved edits after restart and after returning to standard Markdown mode.", "blocking": true }
+      ],
+      "acceptableVariations": ["Settings layout, native dialog decoration, page-list order, and restart timing may vary while visible content and Markdown continuity remain intact."],
+      "nonRequirements": ["Sparse private-storage layout, internal digests, exact native-dialog pixels, or animation timing."],
+      "stability": "burn-in"
+    },
     "scripts/e2e-search-parity.mjs": {
       "contracts": [{ "class": "core-operation", "userOutcome": "Ctrl-K search preserves canonical Unicode matching, current-page scope, evidence, Shift-Enter sidebar opening, and the selected physical owner for same-name page and block results.", "blocking": true }],
       "acceptableVariations": ["Search result layout and ranking among equally valid matches may evolve."],
