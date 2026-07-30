@@ -465,30 +465,45 @@ pub(crate) fn execute_receiver_local_projection_under_handoff(
     let endpoint = engine
         .projection_endpoint_binding()
         .ok_or(ProjectionError::EndpointBindingMismatch)?;
+    if source.source_endpoint_id() == endpoint.endpoint_id {
+        return Err(ProjectionError::ReceiverEndpointIsSource);
+    }
     let source_absent = matches!(source.target(), ManifestProjectionTarget::Absent);
+    let mut effective_candidate = None;
     let tombstone_authorization = if source_absent {
-        if source.source_endpoint_id() == endpoint.endpoint_id {
-            return Err(ProjectionError::ReceiverEndpointIsSource);
-        }
         match engine.authorize_projection_tombstone(source) {
             Ok(authorization) => Some(authorization),
             Err(EngineError::ProjectionAuthorizationUnavailable) => return Ok(Some(false)),
             Err(error) => return Err(error.into()),
         }
     } else {
-        let current = engine.authorize_projection_write(source.page_id())?;
-        if current.state().page.path != *source.path()
-            || current.state().frontier != *source.post_frontier()
-            || current.state().claim_evidence != source.claim_evidence()
-        {
-            // A later accepted frontier has superseded this immutable provider
-            // intent. Historical bytes remain evidence, but they may not roll
-            // the receiver's graph back.
-            return Ok(Some(false));
+        match engine.authorize_projection_write(source.page_id()) {
+            Ok(current) => {
+                if current.state().page.path != *source.path()
+                    || current.state().frontier != *source.post_frontier()
+                    || current.state().claim_evidence != source.claim_evidence()
+                {
+                    // A later accepted frontier has superseded this immutable provider
+                    // intent. Historical bytes remain evidence, but they may not roll
+                    // the receiver's graph back.
+                    return Ok(Some(false));
+                }
+            }
+            Err(EngineError::ProjectionAuthorizationUnavailable) => {
+                match engine.authenticate_effective_title_projection_candidate(source) {
+                    Ok(candidate) => effective_candidate = Some(candidate),
+                    Err(EngineError::ProjectionAuthorizationUnavailable) => {
+                        return Ok(Some(false));
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            Err(error) => return Err(error.into()),
         }
         None
     };
     let local_base = graph.read_projection_input(source.path())?;
+    let mut effective_prior_completion = None;
     let plan = if source_absent {
         receiver_tombstone_plan(
             receipts,
@@ -498,6 +513,26 @@ pub(crate) fn execute_receiver_local_projection_under_handoff(
                 .expect("Absent source has tombstone authorization"),
             local_base.as_deref(),
         )?
+    } else if let Some(candidate) = effective_candidate.as_ref() {
+        let (completed_intent, completion) =
+            receipts.load_completed_receipt(candidate.lifecycle_completion())?;
+        let local_base = local_base
+            .as_deref()
+            .ok_or(ProjectionError::ReceiverBaseMismatch)?;
+        let authorization = engine.authorize_effective_title_projection_write(
+            candidate,
+            source,
+            &completed_intent,
+            &completion,
+            local_base,
+        )?;
+        let plan = plan_projection(
+            engine.workspace_id(),
+            authorization.state(),
+            Some(local_base),
+        )?;
+        effective_prior_completion = Some((completed_intent, completion));
+        plan
     } else {
         derive_receiver_local_projection(
             engine,
@@ -581,7 +616,40 @@ pub(crate) fn execute_receiver_local_projection_under_handoff(
         Some(authorization) => {
             record_completed_tombstone_path(receipts, engine, plan.intent(), authorization)?
         }
-        None => record_completed_path(receipts, engine, source.page_id(), plan.intent())?,
+        None => {
+            if let Some((completed_intent, completion)) = effective_prior_completion.as_ref() {
+                let candidate = effective_candidate
+                    .as_ref()
+                    .expect("effective prior completion has a candidate");
+                let exact_local_base = local_base
+                    .as_deref()
+                    .ok_or(ProjectionError::ReceiverBaseMismatch)?;
+                let authorization = engine.authorize_effective_title_projection_write(
+                    candidate,
+                    source,
+                    completed_intent,
+                    completion,
+                    exact_local_base,
+                )?;
+                let replay = plan_projection(
+                    engine.workspace_id(),
+                    authorization.state(),
+                    Some(exact_local_base),
+                )?;
+                if replay.intent() != plan.intent() {
+                    return Err(ProjectionError::RecoveryIntentMismatch);
+                }
+                record_completed_path_target(
+                    receipts,
+                    engine,
+                    source.page_id(),
+                    plan.intent(),
+                    ProjectionWorkTarget::Present(plan.intent().target()),
+                )?;
+            } else {
+                record_completed_path(receipts, engine, source.page_id(), plan.intent())?;
+            }
+        }
     }
     Ok(Some(!already_complete))
 }

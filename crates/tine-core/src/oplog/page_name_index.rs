@@ -459,6 +459,77 @@ pub(crate) struct PageNamePublicationCandidateV1 {
     ephemeral: Option<EphemeralPageNameOwnershipCandidateV1>,
 }
 
+/// Authenticated exact-name provenance for one occupied canonical key.
+///
+/// The fields stay private so callers cannot manufacture an exact-title
+/// selection without reading it through an ownership root (or the bounded
+/// no-store test authority).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AuthenticatedPageNameExactStateV1 {
+    canonical_key: PageNameKeyDigest,
+    page_id: PageId,
+    exact_name: LogicalPageName,
+    exact_state_batch: BatchId,
+    exact_state_dot: BatchCausalDot,
+}
+
+impl PageNamePublicationCandidateV1 {
+    pub(crate) fn authenticated_ephemeral_exact_state(
+        &self,
+        prior: &EphemeralPageNameOwnershipStateV1,
+        key: PageNameKeyDigest,
+    ) -> Result<Option<AuthenticatedPageNameExactStateV1>, StoreError> {
+        let record = self
+            .ephemeral
+            .as_ref()
+            .and_then(|candidate| candidate.records.get(&key))
+            .or_else(|| prior.records.get(&key));
+        let Some(occupied) = record.and_then(PageNameOwnershipRecordV1::occupied) else {
+            return Ok(None);
+        };
+        let lookup_key = (key, occupied.exact_name.clone());
+        let exact_name = self
+            .ephemeral
+            .as_ref()
+            .and_then(|candidate| candidate.exact_names.get(&lookup_key))
+            .or_else(|| prior.exact_names.get(&lookup_key))
+            .cloned()
+            .ok_or(StoreError::MissingExactLogicalPageNameBlob(
+                occupied.exact_name.content_digest,
+            ))?;
+        validate_exact_name_ref(key, &occupied.exact_name, &exact_name)?;
+        Ok(Some(AuthenticatedPageNameExactStateV1 {
+            canonical_key: key,
+            page_id: occupied.page_id,
+            exact_name,
+            exact_state_batch: occupied.exact_state_batch,
+            exact_state_dot: occupied.exact_state_dot,
+        }))
+    }
+}
+
+impl AuthenticatedPageNameExactStateV1 {
+    pub(crate) const fn canonical_key(&self) -> PageNameKeyDigest {
+        self.canonical_key
+    }
+
+    pub(crate) const fn page_id(&self) -> PageId {
+        self.page_id
+    }
+
+    pub(crate) const fn exact_name(&self) -> &LogicalPageName {
+        &self.exact_name
+    }
+
+    pub(crate) const fn exact_state_batch(&self) -> BatchId {
+        self.exact_state_batch
+    }
+
+    pub(crate) const fn exact_state_dot(&self) -> BatchCausalDot {
+        self.exact_state_dot
+    }
+}
+
 impl EphemeralPageNameOwnershipStateV1 {
     pub(crate) fn resolve_current(&self, key: PageNameKeyDigest) -> Option<PageId> {
         self.records
@@ -483,6 +554,34 @@ impl EphemeralPageNameOwnershipStateV1 {
             }
         }
         self.exact_names.extend(candidate.exact_names);
+    }
+
+    pub(crate) fn authenticated_exact_state(
+        &self,
+        key: PageNameKeyDigest,
+    ) -> Result<Option<AuthenticatedPageNameExactStateV1>, StoreError> {
+        let Some(occupied) = self
+            .records
+            .get(&key)
+            .and_then(PageNameOwnershipRecordV1::occupied)
+        else {
+            return Ok(None);
+        };
+        let exact_name = self
+            .exact_names
+            .get(&(key, occupied.exact_name.clone()))
+            .cloned()
+            .ok_or(StoreError::MissingExactLogicalPageNameBlob(
+                occupied.exact_name.content_digest,
+            ))?;
+        validate_exact_name_ref(key, &occupied.exact_name, &exact_name)?;
+        Ok(Some(AuthenticatedPageNameExactStateV1 {
+            canonical_key: key,
+            page_id: occupied.page_id,
+            exact_name,
+            exact_state_batch: occupied.exact_state_batch,
+            exact_state_dot: occupied.exact_state_dot,
+        }))
     }
 
     #[cfg(test)]
@@ -833,34 +932,38 @@ fn prepare_page_name_transition_core(
         {
             if existing.page_id == page_id {
                 let existing_name = access.read_exact_name(key, &existing.exact_name)?;
-                if existing_name == exact_name {
-                    continue;
-                }
-                let proposed_wins = delta
+                let proposed_exact_name = delta
                     .after
                     .as_ref()
                     .and_then(PageState::live_name)
-                    .is_some_and(|name| name == &exact_name);
-                let current_wins = current_pages[&page_id]
-                    .as_ref()
-                    .and_then(PageState::live_name)
-                    .is_some_and(|name| name == &exact_name);
-                let (state_batch, state_dot) = if proposed_wins {
-                    (batch_id, causal_dot)
-                } else if current_wins {
-                    (existing.exact_state_batch, existing.exact_state_dot)
-                } else {
-                    return Err(StoreError::MalformedPageNameIndex.into());
+                    .filter(|name| name.key_digest() == key);
+                let title_bearing = delta.before.as_ref().and_then(PageState::live_name)
+                    != delta.after.as_ref().and_then(PageState::live_name);
+                let Some(proposed_exact_name) = proposed_exact_name.filter(|_| title_bearing)
+                else {
+                    continue;
                 };
+                if &existing_name == proposed_exact_name {
+                    continue;
+                }
+                // A causally later exact-title event always wins. Concurrent
+                // events use the lexicographically greatest immutable
+                // (causal dot, batch id), independent of delivery order.
+                let proposed_wins = contains(existing.exact_state_dot, existing.exact_state_batch)
+                    || (causal_dot, batch_id)
+                        > (existing.exact_state_dot, existing.exact_state_batch);
+                if !proposed_wins {
+                    continue;
+                }
                 let replacement = PageNameOwnershipRecordV1::new(
                     key,
                     Some(PageNameOwnershipOccupiedV1::new(
                         page_id,
-                        access.put_exact_name(&exact_name)?,
+                        access.put_exact_name(proposed_exact_name)?,
                         existing.acquisition_batch,
                         existing.acquisition_dot,
-                        state_batch,
-                        state_dot,
+                        batch_id,
+                        causal_dot,
                     )),
                     records
                         .get(&key)
@@ -1549,6 +1652,27 @@ impl PageNameOwnershipStore {
                 Ok(record)
             })
             .transpose()
+    }
+
+    pub(crate) fn authenticated_exact_state(
+        &self,
+        root: &PageNameOwnershipRootV1,
+        key: PageNameKeyDigest,
+    ) -> Result<Option<AuthenticatedPageNameExactStateV1>, StoreError> {
+        let Some(record) = self.lookup(root, key)? else {
+            return Ok(None);
+        };
+        let Some(occupied) = record.occupied() else {
+            return Ok(None);
+        };
+        let exact_name = self.read_exact_name(key, occupied.exact_name())?;
+        Ok(Some(AuthenticatedPageNameExactStateV1 {
+            canonical_key: key,
+            page_id: occupied.page_id(),
+            exact_name,
+            exact_state_batch: occupied.exact_state_batch(),
+            exact_state_dot: occupied.exact_state_dot(),
+        }))
     }
 
     pub(crate) fn lookup_many(
@@ -2256,6 +2380,27 @@ mod tests {
         let (path, archive, index) = store("blob-tamper");
         let foo = LogicalPageName::parse("Foo").unwrap();
         let foo_ref = index.put_exact_name(&foo).unwrap();
+        let root = index
+            .insert_many(
+                &PageNameOwnershipRootV1::empty(),
+                &BTreeMap::from([(
+                    foo.key_digest(),
+                    PageNameOwnershipRecordV1::new(
+                        foo.key_digest(),
+                        Some(PageNameOwnershipOccupiedV1::new(
+                            page(1),
+                            foo_ref.clone(),
+                            batch(2),
+                            dot(1),
+                            batch(3),
+                            dot(2),
+                        )),
+                        None,
+                    )
+                    .unwrap(),
+                )]),
+            )
+            .unwrap();
         let blob_path = path
             .join(PAGE_NAME_OWNERSHIP_INDEX_DIR_FOR_TEST)
             .join("exact-names")
@@ -2267,6 +2412,12 @@ mod tests {
             index.read_exact_name(foo.key_digest(), &foo_ref),
             Err(StoreError::ExactLogicalPageNameBlobPathMismatch(_))
         ));
+        assert!(
+            index
+                .authenticated_exact_state(&root, foo.key_digest())
+                .is_err(),
+            "corrupt selected exact-name proof must fail closed"
+        );
         drop(index);
         drop(archive);
         fs::remove_dir_all(path).unwrap();
@@ -2487,7 +2638,7 @@ mod tests {
     }
 
     #[test]
-    fn early_and_late_one_key_lookup_remain_point_local_in_large_index() {
+    fn early_and_late_authenticated_exact_state_remains_point_local_in_large_index() {
         const ENTRIES: usize = 1_024;
 
         let (path, archive, index) = store("point-cost");
@@ -2521,10 +2672,13 @@ mod tests {
         assert_eq!(root.entry_count(), ENTRIES as u64);
 
         let before_early = index.stats();
-        assert!(index.lookup(&root, insertion_order[0]).unwrap().is_some());
+        assert!(index
+            .authenticated_exact_state(&root, insertion_order[0])
+            .unwrap()
+            .is_some());
         let after_early = index.stats();
         assert!(index
-            .lookup(&root, insertion_order[ENTRIES - 1])
+            .authenticated_exact_state(&root, insertion_order[ENTRIES - 1])
             .unwrap()
             .is_some());
         let after_late = index.stats();
@@ -2533,23 +2687,23 @@ mod tests {
         let early_bytes = after_early.bytes_read - before_early.bytes_read;
         let late_bytes = after_late.bytes_read - after_early.bytes_read;
         eprintln!(
-            "page-name point lookup counters: entries={ENTRIES} early_reads={early_reads} \
+            "page-name exact-state point counters: entries={ENTRIES} early_reads={early_reads} \
              late_reads={late_reads} early_bytes={early_bytes} late_bytes={late_bytes}"
         );
         assert!(
-            early_reads <= 64,
-            "early point lookup read {early_reads} nodes"
+            early_reads <= 65,
+            "early authenticated exact-state read {early_reads} objects"
         );
         assert!(
-            late_reads <= 64,
-            "late point lookup read {late_reads} nodes"
+            late_reads <= 65,
+            "late authenticated exact-state read {late_reads} objects"
         );
         assert!(
             early_reads.abs_diff(late_reads) <= 16,
             "lookup depth depended on insertion position: {early_reads} vs {late_reads}"
         );
-        assert!(early_bytes <= 64 * 1024);
-        assert!(late_bytes <= 64 * 1024);
+        assert!(early_bytes <= 72 * 1024);
+        assert!(late_bytes <= 72 * 1024);
 
         drop(index);
         drop(archive);
@@ -3597,6 +3751,42 @@ mod tests {
         )
         .unwrap();
         assert_eq!(reverse.root, converged.root);
+
+        let causal_name = live_state("FoO");
+        let causal_batch = batch(0xd09);
+        let causal_dot = BatchCausalDot::new(
+            CausalPeerId::from_device_id(DeviceId::from_uuid(Uuid::from_u128(0x100))),
+            1,
+        )
+        .unwrap();
+        assert!(
+            (causal_dot, causal_batch) < (dot(3), batch(0xd12)),
+            "fixture must prove causal order outranks tuple order"
+        );
+        let causal_later = transition(
+            &index,
+            &converged.root,
+            causal_batch,
+            causal_dot,
+            &authenticated_page_points_for_test(vec![(page_id, Some(lower.clone()))]),
+            &[page_delta(
+                page_id,
+                Some(lower.clone()),
+                Some(causal_name.clone()),
+            )],
+            vec![(page_id, Some(lower.clone()))],
+            vec![(page_id, Some(causal_name.clone()))],
+            &[batch(0xd12)],
+        )
+        .unwrap();
+        let selected = index
+            .authenticated_exact_state(&causal_later.root, causal_name.name().key_digest())
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.page_id(), page_id);
+        assert_eq!(selected.exact_name(), causal_name.name());
+        assert_eq!(selected.exact_state_batch(), causal_batch);
+        assert_eq!(selected.exact_state_dot(), causal_dot);
 
         let tombstone = PageState::Tombstone {
             name: LogicalPageName::parse("Foo").unwrap(),

@@ -327,6 +327,8 @@ pub struct AcceptedBatchEvent {
     event_binding_digest: ContentDigest,
     semantic_effect: Vec<u8>,
     semantic_effect_digest: SemanticEffectDigest,
+    effective_semantic_effect: Vec<u8>,
+    effective_transitions: Vec<super::hot_engine::AuthenticatedPageLocalEffectiveTransition>,
     dependency_frontier: FrontierV2,
     prior_frontier_root: AcceptedFrontierRoot,
     post_frontier_root: AcceptedFrontierRoot,
@@ -400,7 +402,7 @@ impl AcceptedBatchEvent {
                 }
             }
         }
-        Self::from_validated(&validated, &evidence)
+        Self::from_validated(&validated, &evidence)?.with_effective_view(engine)
     }
 
     fn from_indexed(
@@ -442,7 +444,7 @@ impl AcceptedBatchEvent {
                 found: validated.manifest().lineage_digest(),
             });
         }
-        Self::from_validated(&validated, evidence)
+        Self::from_validated(&validated, evidence)?.with_effective_view(engine)
     }
 
     fn from_validated(
@@ -561,6 +563,13 @@ impl AcceptedBatchEvent {
             event_binding_digest,
             semantic_effect,
             semantic_effect_digest,
+            effective_semantic_effect: decoded.encode().map_err(|error| {
+                ProjectionError::InvalidAcceptedEvent(format!(
+                    "cannot encode initial effective semantic view for {}: {error}",
+                    manifest.batch_id()
+                ))
+            })?,
+            effective_transitions: Vec::new(),
             dependency_frontier: manifest.dependency_frontier().clone(),
             prior_frontier_root: evidence.prior_frontier_root().clone(),
             post_frontier_root: evidence.post_frontier_root().clone(),
@@ -570,6 +579,26 @@ impl AcceptedBatchEvent {
             causal_dot: manifest.causal_dot(),
             retained_bytes,
         })
+    }
+
+    fn with_effective_view(mut self, engine: &ShardedHotEngine) -> Result<Self, ProjectionError> {
+        let authored = SemanticEffect::decode(&self.semantic_effect).map_err(|error| {
+            ProjectionError::InvalidAcceptedEvent(format!(
+                "accepted batch {} authored effect cannot be decoded: {error}",
+                self.batch_id
+            ))
+        })?;
+        let view = engine
+            .accepted_effective_semantic_view(self.batch_id, &authored)
+            .map_err(|error| ProjectionError::InvalidAcceptedEvent(error.to_string()))?;
+        self.effective_semantic_effect = view.effect().encode().map_err(|error| {
+            ProjectionError::InvalidAcceptedEvent(format!(
+                "accepted batch {} effective effect cannot be encoded: {error}",
+                self.batch_id
+            ))
+        })?;
+        self.effective_transitions = view.transitions().to_vec();
+        Ok(self)
     }
 
     pub const fn batch_id(&self) -> BatchId {
@@ -585,7 +614,17 @@ impl AcceptedBatchEvent {
     }
 
     pub fn semantic_effect(&self) -> &[u8] {
+        &self.effective_semantic_effect
+    }
+
+    pub(crate) fn authored_semantic_effect(&self) -> &[u8] {
         &self.semantic_effect
+    }
+
+    pub(crate) fn effective_transitions(
+        &self,
+    ) -> &[super::hot_engine::AuthenticatedPageLocalEffectiveTransition] {
+        &self.effective_transitions
     }
 
     pub const fn semantic_effect_digest(&self) -> SemanticEffectDigest {
@@ -1080,6 +1119,36 @@ fn authenticate_event_for_engine(
             event.batch_id()
         )));
     }
+    let authored = SemanticEffect::decode(event.authored_semantic_effect()).map_err(|error| {
+        ProjectionError::InvalidAcceptedEvent(format!(
+            "accepted event {} authored effect is invalid: {error}",
+            event.batch_id()
+        ))
+    })?;
+    if SemanticEffectDigest::of(event.authored_semantic_effect()) != event.semantic_effect_digest()
+    {
+        return Err(ProjectionError::InvalidAcceptedEvent(format!(
+            "accepted event {} authored manifest binding changed",
+            event.batch_id()
+        )));
+    }
+    let expected = engine
+        .accepted_effective_semantic_view(event.batch_id(), &authored)
+        .map_err(|error| ProjectionError::InvalidAcceptedEvent(error.to_string()))?;
+    let expected_bytes = expected.effect().encode().map_err(|error| {
+        ProjectionError::InvalidAcceptedEvent(format!(
+            "accepted event {} effective effect is invalid: {error}",
+            event.batch_id()
+        ))
+    })?;
+    if expected_bytes != event.semantic_effect()
+        || expected.transitions() != event.effective_transitions()
+    {
+        return Err(ProjectionError::InvalidAcceptedEvent(format!(
+            "accepted event {} effective transition proof changed",
+            event.batch_id()
+        )));
+    }
     Ok(())
 }
 
@@ -1218,7 +1287,16 @@ pub(crate) fn materialize_accepted_event(
             .materialize_page_at_accepted_root(event.post_frontier_root(), page_id)
             .map_err(|error| ProjectionError::Materialization(error.to_string()))?
         {
-            Some(page) => {
+            Some(mut page) => {
+                if let Some(transition) = event
+                    .effective_transitions()
+                    .iter()
+                    .find(|transition| transition.page_id() == page_id)
+                {
+                    transition
+                        .apply_to_materialized(&mut page)
+                        .map_err(|error| ProjectionError::Materialization(error.to_string()))?;
+                }
                 replacements.push(materialized_page_input(page));
             }
             None => deletions.push(page_id),
@@ -11099,6 +11177,11 @@ mod tests {
         publish_and_stage_archive(&mut engine, &store, &edit);
         let edit_event =
             AcceptedBatchEvent::from_accepted(&engine, &store, edit.manifest().batch_id()).unwrap();
+        assert_eq!(
+            edit_event.authored_semantic_effect(),
+            edit_event.semantic_effect(),
+            "an ordinary rename must keep authored and effective bytes identical"
+        );
 
         let historical = materialize_accepted_event(&engine, &create_event).unwrap();
         let historical_page = &historical.replacements()[0];

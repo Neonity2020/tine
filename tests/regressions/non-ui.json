@@ -1906,6 +1906,31 @@
       "notes": "Fail-before: a public editor save changed Markdown title:: from Editor Title Before to Editor Title After while preserving the blocks. Graph::open observed the new title immediately, but authoritative oplog replay, SQLite, and the restarted editor retained Editor Title Before. Editor saves now use the canonical external-document parser and the identity decision shared with import, preserve a title-only edit's physical path, and atomically compose logical rename, parser-derived kind, final content, collision checks, referrer rewrites, and every affected page. Shared semantic scenarios cover Markdown and Org title add/change/removal, existing and new Page/Journal transitions, nested and nonstandard paths, policy changes, no-op reimport, and two restarts."
     },
     {
+      "id": "REG-SYNC-CANONICAL-EQUIVALENT-EXACT-TITLE-CONVERGENCE-001",
+      "title": "Concurrent canonical-equivalent titles select one exact authored event across durable views",
+      "family": "sync-data-safety",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/sync_runtime.rs::concurrent_offline_canonical_equivalent_editor_titles_preserve_exact_semantics",
+          "crates/tine-core/src/sync_runtime.rs::concurrent_explicit_and_filename_fallback_titles_converge_in_both_winner_directions",
+          "crates/tine-core/src/sync_runtime.rs::effective_title_projection_authority_is_point_bounded_with_a_wide_unrelated_frontier",
+          "crates/tine-core/src/oplog/hot_engine.rs::projection_accepted_frontier_binding_is_point_bounded_and_rejects_advance"
+        ],
+        "scenario": "sync.canonical-equivalent-exact-title-convergence",
+        "failBefore": "proven"
+      },
+      "notes": "Fail-before at bc08c72e: two honest offline replicas renamed one PageId to NFC and NFD spellings sharing one canonical key. After full provider union and restart, each retained its local exact title and provider recovery never completed. One whole authored exact-name event must win by causal order, then stable (BatchCausalDot, BatchId) order for concurrency, without normalizing the winning UTF-8. Fixed-provenance reversed delivery also swaps explicit-title and filename-fallback authorship to prove both presence/removal winner directions."
+    },
+    {
       "id": "REG-SYNC-RECEIVER-NESTED-PARENT-CONVERGENCE-001",
       "title": "Provider-delivered nested pages converge even when receiver parent directories do not yet exist",
       "family": "sync-data-safety",

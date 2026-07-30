@@ -477,6 +477,173 @@ pub struct PagePreambleDelta {
     pub after: Option<PagePreambleState>,
 }
 
+/// The authenticated explicit-title post-state selected for one page.
+///
+/// `Absent` is deliberately distinct from a missing optional delta: the
+/// selected immutable effect was inspected and proved to carry no explicit
+/// title after the selected transition.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum EffectiveExplicitTitleState {
+    Present(PagePreambleDelta),
+    Absent {
+        page_id: PageId,
+        home_document_id: DocumentId,
+    },
+}
+
+impl EffectiveExplicitTitleState {
+    pub(crate) fn from_authenticated_transition(
+        page_id: PageId,
+        home_document_id: DocumentId,
+        path: &ManagedPath,
+        selected_name: &LogicalPageName,
+        transition: Option<PagePreambleDelta>,
+    ) -> Result<Self, SemanticError> {
+        let Some(transition) = transition else {
+            return Ok(Self::Absent {
+                page_id,
+                home_document_id,
+            });
+        };
+        if transition.page_id != page_id
+            || transition.home_document_id != home_document_id
+            || transition.after.as_ref().is_none_or(|after| {
+                after.page_id != page_id || after.home_document_id != home_document_id
+            })
+        {
+            return Err(SemanticError::InvalidEffectiveTitleSplice);
+        }
+        let after = transition
+            .after
+            .as_ref()
+            .expect("authenticated transition has an after state");
+        match explicit_title_line(after.preamble.as_deref(), path.is_org()) {
+            Some((_, _, title)) if title == selected_name.as_str() => Ok(Self::Present(transition)),
+            None => Ok(Self::Absent {
+                page_id,
+                home_document_id,
+            }),
+            Some(_) => Err(SemanticError::InvalidEffectiveTitleSplice),
+        }
+    }
+
+    pub(crate) const fn page_id(&self) -> PageId {
+        match self {
+            Self::Present(delta) => delta.page_id,
+            Self::Absent { page_id, .. } => *page_id,
+        }
+    }
+
+    pub(crate) const fn home_document_id(&self) -> DocumentId {
+        match self {
+            Self::Present(delta) => delta.home_document_id,
+            Self::Absent {
+                home_document_id, ..
+            } => *home_document_id,
+        }
+    }
+
+    pub(crate) fn apply_to_preamble(
+        &self,
+        path: &ManagedPath,
+        preamble: &mut Option<String>,
+    ) -> Result<(), SemanticError> {
+        let selected = match self {
+            Self::Present(delta) => delta
+                .after
+                .as_ref()
+                .and_then(|after| after.preamble.as_deref()),
+            Self::Absent { .. } => None,
+        };
+        *preamble = splice_explicit_title(preamble.as_deref(), selected, path.is_org())?;
+        Ok(())
+    }
+}
+
+fn explicit_title_line(preamble: Option<&str>, is_org: bool) -> Option<(usize, usize, String)> {
+    let preamble = preamble?;
+    let mut offset = 0;
+    for chunk in preamble.split_inclusive('\n') {
+        let line = chunk.strip_suffix('\n').unwrap_or(chunk);
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let value = crate::doc::parse_property_line(line)
+            .and_then(|(key, value)| key.eq_ignore_ascii_case("title").then_some(value))
+            .or_else(|| {
+                is_org.then(|| {
+                    let trimmed = line.trim();
+                    trimmed
+                        .split_once(':')
+                        .and_then(|(key, value)| {
+                            key.eq_ignore_ascii_case("#+title").then_some(value)
+                        })
+                        .or_else(|| {
+                            trimmed.strip_prefix(':').and_then(|rest| {
+                                rest.split_once(':').and_then(|(key, value)| {
+                                    key.eq_ignore_ascii_case("title").then_some(value)
+                                })
+                            })
+                        })
+                        .map(str::to_owned)
+                })?
+            });
+        if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
+            return Some((offset, offset + line.len(), value.trim().to_owned()));
+        }
+        offset += chunk.len();
+    }
+    None
+}
+
+fn splice_explicit_title(
+    current: Option<&str>,
+    selected: Option<&str>,
+    is_org: bool,
+) -> Result<Option<String>, SemanticError> {
+    let selected_line = match selected {
+        Some(selected) => {
+            let (start, end, _) = explicit_title_line(Some(selected), is_org)
+                .ok_or(SemanticError::InvalidEffectiveTitleSplice)?;
+            Some(&selected[start..end])
+        }
+        None => None,
+    };
+    let Some(current) = current else {
+        return Ok(selected_line.map(str::to_owned));
+    };
+    let current_title = explicit_title_line(Some(current), is_org);
+    match (current_title, selected_line) {
+        (Some((start, end, _)), Some(selected_line)) => {
+            let mut result =
+                String::with_capacity(current.len() - (end - start) + selected_line.len());
+            result.push_str(&current[..start]);
+            result.push_str(selected_line);
+            result.push_str(&current[end..]);
+            Ok(Some(result))
+        }
+        (Some((mut start, mut end, _)), None) => {
+            if current[end..].starts_with('\n') {
+                end += 1;
+            } else if start > 0 && current[..start].ends_with('\n') {
+                start -= 1;
+            }
+            let mut result = String::with_capacity(current.len() - (end - start));
+            result.push_str(&current[..start]);
+            result.push_str(&current[end..]);
+            Ok((!result.is_empty()).then_some(result))
+        }
+        (None, Some(selected_line)) => {
+            let mut result = String::with_capacity(selected_line.len() + 1 + current.len());
+            result.push_str(selected_line);
+            if !current.is_empty() {
+                result.push('\n');
+                result.push_str(current);
+            }
+            Ok(Some(result))
+        }
+        (None, None) => Ok(Some(current.to_owned())),
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BlockDelta {
@@ -565,6 +732,89 @@ impl SemanticEffect {
             && self.page_preambles.is_empty()
             && self.blocks.is_empty()
             && self.memberships.is_empty()
+    }
+
+    /// Build the transient effective view for one authenticated exact-title
+    /// selection. Only title-bearing post-state is replaced; every other page,
+    /// path, kind, home, block, and membership facet remains authored.
+    pub(crate) fn splice_title_post_state(
+        &self,
+        page_id: PageId,
+        selected_name: &LogicalPageName,
+        selected_explicit_title: &EffectiveExplicitTitleState,
+    ) -> Result<Self, SemanticError> {
+        let mut pages = self.pages.clone();
+        let page_index = pages
+            .binary_search_by_key(&page_id, |delta| delta.page_id)
+            .map_err(|_| SemanticError::InvalidEffectiveTitleSplice)?;
+        let selected_key = selected_name.key_digest();
+        let (home_document_id, path) = match pages[page_index].after.as_ref() {
+            Some(PageState::Live {
+                home_document_id,
+                path,
+                ..
+            }) => (*home_document_id, path.clone()),
+            Some(PageState::Tombstone { .. }) | None => {
+                return Err(SemanticError::InvalidEffectiveTitleSplice);
+            }
+        };
+        let after = pages[page_index]
+            .after
+            .as_mut()
+            .ok_or(SemanticError::InvalidEffectiveTitleSplice)?;
+        match after {
+            PageState::Live { name, .. } if name.key_digest() == selected_key => {
+                *name = selected_name.clone();
+            }
+            PageState::Live { .. } | PageState::Tombstone { .. } => {
+                return Err(SemanticError::InvalidEffectiveTitleSplice);
+            }
+        }
+        if pages[page_index].before == pages[page_index].after {
+            pages.remove(page_index);
+        }
+
+        if selected_explicit_title.page_id() != page_id
+            || selected_explicit_title.home_document_id() != home_document_id
+        {
+            return Err(SemanticError::InvalidEffectiveTitleSplice);
+        }
+        let mut page_preambles = self.page_preambles.clone();
+        let current = page_preambles.binary_search_by_key(&(home_document_id, page_id), |delta| {
+            (delta.home_document_id, delta.page_id)
+        });
+        match (current, selected_explicit_title) {
+            (Ok(index), selected) => {
+                let after = page_preambles[index]
+                    .after
+                    .as_mut()
+                    .ok_or(SemanticError::InvalidEffectiveTitleSplice)?;
+                selected.apply_to_preamble(&path, &mut after.preamble)?;
+                if page_preambles[index].before == page_preambles[index].after {
+                    page_preambles.remove(index);
+                }
+            }
+            (Err(_), EffectiveExplicitTitleState::Present(selected)) => {
+                let mut inserted = selected.clone();
+                let before = inserted
+                    .before
+                    .as_ref()
+                    .ok_or(SemanticError::InvalidEffectiveTitleSplice)?;
+                let mut after = before.clone();
+                selected_explicit_title.apply_to_preamble(&path, &mut after.preamble)?;
+                inserted.after = Some(after);
+                if inserted.before != inserted.after {
+                    page_preambles.push(inserted);
+                }
+            }
+            (Err(_), EffectiveExplicitTitleState::Absent { .. }) => {}
+        }
+        Self::new_with_page_preambles(
+            pages,
+            page_preambles,
+            self.blocks.clone(),
+            self.memberships.clone(),
+        )
     }
 
     pub fn encode(&self) -> Result<Vec<u8>, SemanticError> {
@@ -731,6 +981,7 @@ pub enum SemanticError {
     PagePreambleTooLarge(usize),
     InvalidOrderKey,
     InvalidLogseqIdentityState,
+    InvalidEffectiveTitleSplice,
     NonCanonical,
     UnchangedDelta,
     InvalidPageLifecycle,
@@ -759,6 +1010,9 @@ impl fmt::Display for SemanticError {
             Self::InvalidOrderKey => f.write_str("invalid membership order key"),
             Self::InvalidLogseqIdentityState => {
                 f.write_str("Logseq UUID and identity origin must be present together")
+            }
+            Self::InvalidEffectiveTitleSplice => {
+                f.write_str("authenticated effective title splice is inconsistent")
             }
             Self::NonCanonical => f.write_str("semantic effect is not canonically ordered/encoded"),
             Self::UnchangedDelta => f.write_str("semantic effect contains an unchanged delta"),
@@ -834,6 +1088,249 @@ mod tests {
 
     fn effect(kind: ManagedTextKind) -> SemanticEffect {
         page_effect(None, Some(live(kind))).unwrap()
+    }
+
+    #[test]
+    fn authenticated_title_splice_changes_only_title_bearing_post_state() {
+        let target = page_id(1);
+        let unrelated = page_id(2);
+        let deleted = page_id(5);
+        let home = document_id(2);
+        let block_id = BlockId::from_uuid(Uuid::from_u128(3));
+        let before_target = PageState::Live {
+            name: LogicalPageName::parse("Original").unwrap(),
+            path: ManagedPath::parse("pages/physical.md").unwrap(),
+            home_document_id: home,
+            kind: ManagedTextKind::Page,
+        };
+        let authored_target = PageState::Live {
+            name: LogicalPageName::parse("Cafe\u{301} Plan").unwrap(),
+            path: ManagedPath::parse("pages/physical.md").unwrap(),
+            home_document_id: home,
+            kind: ManagedTextKind::Page,
+        };
+        let unrelated_after = PageState::Live {
+            name: LogicalPageName::parse("Unrelated").unwrap(),
+            path: ManagedPath::parse("pages/unrelated.md").unwrap(),
+            home_document_id: document_id(4),
+            kind: ManagedTextKind::Page,
+        };
+        let deleted_before = PageState::Live {
+            name: LogicalPageName::parse("Deleted Unrelated").unwrap(),
+            path: ManagedPath::parse("pages/deleted-unrelated.md").unwrap(),
+            home_document_id: document_id(6),
+            kind: ManagedTextKind::Page,
+        };
+        let deleted_after = PageState::Tombstone {
+            name: LogicalPageName::parse("Deleted Unrelated").unwrap(),
+            home_document_id: document_id(6),
+            kind: ManagedTextKind::Page,
+        };
+        let block_before = BlockState {
+            block_id,
+            home_document_id: home,
+            owner: BlockOwner::Page(target),
+            logseq_uuid: None,
+            logseq_identity_origin: None,
+            content: "before".into(),
+        };
+        let block_after = BlockState {
+            content: "after".into(),
+            ..block_before.clone()
+        };
+        let membership_before = MembershipClaim::new(home, None, "a").unwrap();
+        let membership_after = MembershipClaim::new(home, None, "b").unwrap();
+        let authored = SemanticEffect::new_with_page_preambles(
+            vec![
+                PageDelta {
+                    page_id: target,
+                    before: Some(before_target),
+                    after: Some(authored_target),
+                },
+                PageDelta {
+                    page_id: unrelated,
+                    before: None,
+                    after: Some(unrelated_after),
+                },
+                PageDelta {
+                    page_id: deleted,
+                    before: Some(deleted_before),
+                    after: Some(deleted_after),
+                },
+            ],
+            vec![PagePreambleDelta {
+                page_id: target,
+                home_document_id: home,
+                before: Some(PagePreambleState {
+                    page_id: target,
+                    home_document_id: home,
+                    preamble: None,
+                }),
+                after: Some(PagePreambleState {
+                    page_id: target,
+                    home_document_id: home,
+                    preamble: Some("title:: Cafe\u{301} Plan".into()),
+                }),
+            }],
+            vec![BlockDelta {
+                block_id,
+                home_document_id: home,
+                before: Some(block_before),
+                after: Some(block_after),
+            }],
+            vec![MembershipDelta {
+                page_id: target,
+                block_id,
+                before: Some(membership_before),
+                after: Some(membership_after),
+            }],
+        )
+        .unwrap();
+        let selected_name = LogicalPageName::parse("Café Plan").unwrap();
+        let selected_preamble = PagePreambleDelta {
+            page_id: target,
+            home_document_id: home,
+            before: Some(PagePreambleState {
+                page_id: target,
+                home_document_id: home,
+                preamble: None,
+            }),
+            after: Some(PagePreambleState {
+                page_id: target,
+                home_document_id: home,
+                preamble: Some("title:: Café Plan".into()),
+            }),
+        };
+        let selected_explicit_title = EffectiveExplicitTitleState::from_authenticated_transition(
+            target,
+            home,
+            &ManagedPath::parse("pages/physical.md").unwrap(),
+            &selected_name,
+            Some(selected_preamble.clone()),
+        )
+        .unwrap();
+        let effective = authored
+            .splice_title_post_state(target, &selected_name, &selected_explicit_title)
+            .unwrap();
+
+        assert_eq!(effective.pages().len(), authored.pages().len());
+        assert_eq!(effective.pages()[1], authored.pages()[1]);
+        assert_eq!(effective.pages()[2], authored.pages()[2]);
+        assert_eq!(effective.blocks(), authored.blocks());
+        assert_eq!(effective.memberships(), authored.memberships());
+        assert_eq!(
+            effective.pages()[0].before,
+            authored.pages()[0].before,
+            "the authored pre-state remains the immutable dependency assertion"
+        );
+        assert_eq!(
+            effective.pages()[0].after.as_ref().unwrap().name(),
+            &selected_name
+        );
+        assert_eq!(
+            effective.page_preambles()[0].after.as_ref(),
+            selected_preamble.after.as_ref()
+        );
+    }
+
+    #[test]
+    fn authenticated_title_splice_covers_explicit_fallback_presence_and_removal() {
+        let page_id = page_id(0x510);
+        let home = document_id(0x511);
+        let path = ManagedPath::parse("pages/physical.md").unwrap();
+        let original = LogicalPageName::parse("Original").unwrap();
+        let authored_name = LogicalPageName::parse("Cafe\u{301} Plan").unwrap();
+        let selected_name = LogicalPageName::parse("Café Plan").unwrap();
+        let page_delta = || PageDelta {
+            page_id,
+            before: Some(PageState::Live {
+                name: original.clone(),
+                path: path.clone(),
+                home_document_id: home,
+                kind: ManagedTextKind::Page,
+            }),
+            after: Some(PageState::Live {
+                name: authored_name.clone(),
+                path: path.clone(),
+                home_document_id: home,
+                kind: ManagedTextKind::Page,
+            }),
+        };
+        let preamble_state = |preamble: Option<&str>| PagePreambleState {
+            page_id,
+            home_document_id: home,
+            preamble: preamble.map(str::to_owned),
+        };
+
+        let authored_explicit = SemanticEffect::new_with_page_preambles(
+            vec![page_delta()],
+            vec![PagePreambleDelta {
+                page_id,
+                home_document_id: home,
+                before: Some(preamble_state(Some("alias:: keep\nproperty:: before"))),
+                after: Some(preamble_state(Some(
+                    "alias:: keep\ntitle:: Cafe\u{301} Plan\nproperty:: after",
+                ))),
+            }],
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        let selected_fallback = EffectiveExplicitTitleState::from_authenticated_transition(
+            page_id,
+            home,
+            &path,
+            &selected_name,
+            None,
+        )
+        .unwrap();
+        let fallback_effective = authored_explicit
+            .splice_title_post_state(page_id, &selected_name, &selected_fallback)
+            .unwrap();
+        assert_eq!(
+            fallback_effective.pages()[0].after.as_ref().unwrap().name(),
+            &selected_name
+        );
+        assert_eq!(
+            fallback_effective.page_preambles()[0]
+                .after
+                .as_ref()
+                .unwrap()
+                .preamble
+                .as_deref(),
+            Some("alias:: keep\nproperty:: after"),
+            "selected fallback removes only the losing explicit title"
+        );
+
+        let authored_fallback =
+            SemanticEffect::new(vec![page_delta()], Vec::new(), Vec::new()).unwrap();
+        let selected_transition = PagePreambleDelta {
+            page_id,
+            home_document_id: home,
+            before: Some(preamble_state(Some("alias:: keep"))),
+            after: Some(preamble_state(Some("alias:: keep\ntitle:: Café Plan"))),
+        };
+        let selected_explicit = EffectiveExplicitTitleState::from_authenticated_transition(
+            page_id,
+            home,
+            &path,
+            &selected_name,
+            Some(selected_transition),
+        )
+        .unwrap();
+        let explicit_effective = authored_fallback
+            .splice_title_post_state(page_id, &selected_name, &selected_explicit)
+            .unwrap();
+        let inserted = &explicit_effective.page_preambles()[0];
+        assert_eq!(
+            inserted.before.as_ref().unwrap().preamble.as_deref(),
+            Some("alias:: keep")
+        );
+        assert_eq!(
+            inserted.after.as_ref().unwrap().preamble.as_deref(),
+            Some("title:: Café Plan\nalias:: keep"),
+            "selected explicit title is added without dropping unrelated preamble"
+        );
     }
 
     #[test]

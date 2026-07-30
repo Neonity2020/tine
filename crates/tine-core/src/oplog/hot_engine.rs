@@ -29,9 +29,9 @@ use super::page_name_index::{
     extract_authenticated_catalog_page_names, extract_authoritative_catalog_page_names,
     extract_validated_catalog_page_names, prepare_ephemeral_page_name_transition,
     prepare_page_name_transition, AuthenticatedCatalogPageNameCheckpointV1,
-    AuthoritativeCatalogPageNameObservationsV1, EphemeralPageNameOwnershipStateV1,
-    PageNameConflictEvidenceV1, PageNameOwnershipRootV1, PageNameOwnershipStore,
-    PageNamePublicationCandidateV1, PageNameTransitionError,
+    AuthenticatedPageNameExactStateV1, AuthoritativeCatalogPageNameObservationsV1,
+    EphemeralPageNameOwnershipStateV1, PageNameConflictEvidenceV1, PageNameOwnershipRootV1,
+    PageNameOwnershipStore, PageNamePublicationCandidateV1, PageNameTransitionError,
 };
 use super::portable_path_index::{
     PortablePathIndexRoot, PortablePathIndexStore, PortablePathOccupied, PortablePathRecord,
@@ -49,7 +49,8 @@ use super::reference_catalog::{
 };
 use super::scratch_store::{ScratchAuthenticatedCatalogRoot, ScratchRoots, ScratchStore};
 use super::semantic::{
-    LogseqIdentityOrigin, PagePreambleDelta, PagePreambleState, PolicyGeneratedAnchorReason,
+    EffectiveExplicitTitleState, LogseqIdentityOrigin, PagePreambleDelta, PagePreambleState,
+    PolicyGeneratedAnchorReason,
 };
 use super::uuid_claim_index::{LogseqClaimIndexRoot, LogseqClaimIndexStore};
 use super::{
@@ -60,10 +61,10 @@ use super::{
     ManifestObjectRef, ManifestProjectionPrecondition, ManifestProjectionTarget,
     ManifestedProjectionIntent, MembershipClaim, MembershipDelta, ObjectKind, ObjectStore,
     OperationBatch, OperationObject, PageDelta, PageId, PageState, PortablePathKeyDigest,
-    PreparedBatch, ProjectionClaimEvidence, ProjectionClaimParticipant, ProjectionCompletion,
-    ProjectionEndpointId, ProjectionIntent, ProjectionReceiptStore, ProjectionWork,
-    ProjectionWorkIndex, ProjectionWorkTarget, SemanticEffect, SemanticEffectDigest, SemanticError,
-    SessionId, ValidatedBatch, WorkspaceId,
+    PreparedBatch, ProjectionClaimEvidence, ProjectionClaimParticipant, ProjectionCompletedReceipt,
+    ProjectionCompletion, ProjectionEndpointId, ProjectionIntent, ProjectionReceiptStore,
+    ProjectionWork, ProjectionWorkIndex, ProjectionWorkTarget, SemanticEffect,
+    SemanticEffectDigest, SemanticError, SessionId, ValidatedBatch, WorkspaceId,
 };
 use crate::{Graph, GraphTextScopeBinding};
 
@@ -316,6 +317,216 @@ struct PreparedTransactionParts {
     prospective_documents: BTreeMap<DocumentId, LoroDoc>,
     portable_path_root: PortablePathIndexRoot,
     external_observation: Option<ExternalImportObservationMaterial>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum EffectiveTitleTransitionSeal {
+    Authenticated,
+}
+
+const MAX_TRANSIENT_EFFECTIVE_VIEWS: usize = 256;
+
+/// A nonconstructible, transient proof that one page-local exact-title
+/// post-state was selected by authenticated ownership provenance.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AuthenticatedPageLocalEffectiveTransition {
+    seal: EffectiveTitleTransitionSeal,
+    page_id: PageId,
+    canonical_key: super::PageNameKeyDigest,
+    selected_name: LogicalPageName,
+    selected_batch: BatchId,
+    selected_dot: BatchCausalDot,
+    selected_explicit_title: EffectiveExplicitTitleState,
+    selected_intent: ManifestedProjectionIntent,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AuthenticatedEffectiveProjectionClosure {
+    transition: AuthenticatedPageLocalEffectiveTransition,
+    lifecycle_completion: ProjectionCompletedReceipt,
+}
+
+#[derive(Clone)]
+pub(crate) struct AuthenticatedEffectiveTitleProjectionCandidate {
+    seal: EffectiveTitleTransitionSeal,
+    state: ProjectionPageState,
+    source: ManifestedProjectionIntent,
+    lifecycle_completion: ProjectionCompletedReceipt,
+    accepted_frontier: AuthenticatedProjectionAcceptedFrontier,
+}
+
+impl AuthenticatedEffectiveTitleProjectionCandidate {
+    pub(crate) const fn lifecycle_completion(&self) -> &ProjectionCompletedReceipt {
+        &self.lifecycle_completion
+    }
+}
+
+/// Run-local proof that one materialized projection state was selected while
+/// this exact engine capability agreed with the live durable-history head and
+/// its current accepted-frontier point authority.
+///
+/// This is intentionally transient and nonconstructible outside this module.
+/// The accepted root is the bounded commitment to the whole frontier; callers
+/// never receive authority by enumerating its documents or direct heads.
+#[derive(Clone)]
+struct AuthenticatedProjectionAcceptedFrontier {
+    runtime_authority: EngineAuthority,
+    accepted_frontier_root: AcceptedFrontierRoot,
+    durable_history: super::object_store::EngineHistoryAuthority,
+}
+
+impl AuthenticatedProjectionAcceptedFrontier {
+    fn matches(&self, other: &Self) -> bool {
+        self.runtime_authority.matches(&other.runtime_authority)
+            && self.accepted_frontier_root == other.accepted_frontier_root
+            && self.durable_history == other.durable_history
+    }
+}
+
+fn same_projection_state_authority(
+    left: &ProjectionPageState,
+    right: &ProjectionPageState,
+) -> bool {
+    left.frontier == right.frontier
+        && left.claim_evidence == right.claim_evidence
+        && left.page.page_id == right.page.page_id
+        && left.page.home_document_id == right.page.home_document_id
+        && left.page.name == right.page.name
+        && left.page.path == right.page.path
+        && left.page.kind == right.page.kind
+        && left.page.preamble == right.page.preamble
+        && left.page.blocks == right.page.blocks
+}
+
+impl AuthenticatedPageLocalEffectiveTransition {
+    pub(crate) const fn page_id(&self) -> PageId {
+        self.page_id
+    }
+
+    pub(crate) const fn selected_name(&self) -> &LogicalPageName {
+        &self.selected_name
+    }
+
+    pub(crate) const fn selected_explicit_title(&self) -> &EffectiveExplicitTitleState {
+        &self.selected_explicit_title
+    }
+
+    pub(crate) fn apply_to_materialized(
+        &self,
+        page: &mut MaterializedPage,
+    ) -> Result<(), EngineError> {
+        if page.page_id != self.page_id
+            || page.name.key_digest() != self.canonical_key
+            || self.selected_name.key_digest() != self.canonical_key
+            || self.selected_intent.source_batch_id() != self.selected_batch
+            || self.selected_intent.page_id() != self.page_id
+            || self.selected_intent.path() != &page.path
+        {
+            return Err(EngineError::Archive(
+                "authenticated effective title is misbound to materialized page".into(),
+            ));
+        }
+        page.name = self.selected_name.clone();
+        if self.selected_explicit_title.page_id() != page.page_id
+            || self.selected_explicit_title.home_document_id() != page.home_document_id
+        {
+            return Err(EngineError::Archive(
+                "authenticated effective preamble is misbound to materialized page".into(),
+            ));
+        }
+        self.selected_explicit_title
+            .apply_to_preamble(&page.path, &mut page.preamble)?;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AuthenticatedEffectiveSemanticView {
+    effect: SemanticEffect,
+    transitions: Vec<AuthenticatedPageLocalEffectiveTransition>,
+}
+
+impl AuthenticatedEffectiveSemanticView {
+    pub(crate) const fn effect(&self) -> &SemanticEffect {
+        &self.effect
+    }
+
+    pub(crate) fn transitions(&self) -> &[AuthenticatedPageLocalEffectiveTransition] {
+        &self.transitions
+    }
+
+    fn apply_to_catalog_pages(
+        &self,
+        pages: &mut BTreeMap<PageId, PageState>,
+    ) -> Result<(), EngineError> {
+        for transition in &self.transitions {
+            let state = pages.get_mut(&transition.page_id).ok_or_else(|| {
+                EngineError::Archive(
+                    "effective title page is absent from validated catalog observations".into(),
+                )
+            })?;
+            match state {
+                PageState::Live { name, .. } if name.key_digest() == transition.canonical_key => {
+                    name.clone_from(&transition.selected_name);
+                }
+                PageState::Live { .. } | PageState::Tombstone { .. } => {
+                    return Err(EngineError::Archive(
+                        "effective title page contradicts validated catalog observations".into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_to_snapshots(
+        &self,
+        snapshots: &mut BTreeMap<DocumentId, SemanticDocumentSnapshot>,
+    ) -> Result<(), EngineError> {
+        for transition in &self.transitions {
+            for snapshot in snapshots.values_mut() {
+                match snapshot {
+                    SemanticDocumentSnapshot::Catalog(pages) => {
+                        if let Some(state) = pages.get_mut(&transition.page_id) {
+                            match state {
+                                PageState::Live { name, .. }
+                                    if name.key_digest() == transition.canonical_key =>
+                                {
+                                    name.clone_from(&transition.selected_name);
+                                }
+                                PageState::Live { .. } | PageState::Tombstone { .. } => {
+                                    return Err(EngineError::Archive(
+                                        "effective title snapshot contradicts selected ownership"
+                                            .into(),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    SemanticDocumentSnapshot::Shard {
+                        page_id,
+                        page_preamble,
+                        ..
+                    } if *page_id == Some(transition.page_id) => {
+                        let preamble = page_preamble.as_mut().ok_or_else(|| {
+                            EngineError::Archive(
+                                "effective title preamble page binding mismatch".into(),
+                            )
+                        })?;
+                        transition
+                            .selected_explicit_title
+                            .apply_to_preamble(
+                                transition.selected_intent.path(),
+                                &mut preamble.preamble,
+                            )
+                            .map_err(EngineError::from)?;
+                    }
+                    SemanticDocumentSnapshot::Shard { .. } => {}
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Opaque object-store proof paired with one authenticated scratch checkpoint.
@@ -3241,6 +3452,10 @@ struct HistoryWorkStats {
     external_history_blob_reads: usize,
     recovery_history_record_reads: usize,
     projection_reconciliation_history_record_reads: usize,
+    effective_title_projection_authority_calls: usize,
+    effective_title_projection_point_proofs: usize,
+    effective_title_projection_frontier_head_visits: usize,
+    effective_title_projection_max_accepted_documents: usize,
     ancestry_traversals: usize,
     dependency_head_visits: usize,
     causal_accumulator_parent_points: usize,
@@ -3399,6 +3614,10 @@ pub struct EngineInstrumentation {
     pub external_history_blob_reads: usize,
     pub recovery_history_record_reads: usize,
     pub projection_reconciliation_history_record_reads: usize,
+    pub effective_title_projection_authority_calls: usize,
+    pub effective_title_projection_point_proofs: usize,
+    pub effective_title_projection_frontier_head_visits: usize,
+    pub effective_title_projection_max_accepted_documents: usize,
     pub ancestry_traversals: usize,
     pub dependency_head_visits: usize,
     pub causal_accumulator_parent_points: usize,
@@ -3886,6 +4105,8 @@ pub struct ShardedHotEngine {
     /// Same-process reconstruction deliberately clears this cache and
     /// reauthenticates once before resuming from the durable queue cursor.
     bounded_staging_cache: BTreeMap<BatchId, ValidatedBatch>,
+    transient_effective_views: BTreeMap<BatchId, AuthenticatedEffectiveSemanticView>,
+    transient_effective_view_order: VecDeque<BatchId>,
     archive_store: Option<Arc<ObjectStore>>,
     projection_endpoint: Option<ProjectionEndpointBinding>,
     projection_receipt_store_id: Option<super::ProjectionReceiptStoreId>,
@@ -4047,6 +4268,8 @@ impl ShardedHotEngine {
             bootstrap_parts: None,
             bootstrap_residency: Arc::new(BootstrapResidencyLedger::default()),
             bounded_staging_cache: BTreeMap::new(),
+            transient_effective_views: BTreeMap::new(),
+            transient_effective_view_order: VecDeque::new(),
             archive_store: None,
             projection_endpoint: None,
             projection_receipt_store_id: None,
@@ -6159,6 +6382,13 @@ impl ShardedHotEngine {
             recovery_history_record_reads: work.recovery_history_record_reads,
             projection_reconciliation_history_record_reads: work
                 .projection_reconciliation_history_record_reads,
+            effective_title_projection_authority_calls: work
+                .effective_title_projection_authority_calls,
+            effective_title_projection_point_proofs: work.effective_title_projection_point_proofs,
+            effective_title_projection_frontier_head_visits: work
+                .effective_title_projection_frontier_head_visits,
+            effective_title_projection_max_accepted_documents: work
+                .effective_title_projection_max_accepted_documents,
             ancestry_traversals: work.ancestry_traversals,
             dependency_head_visits: work.dependency_head_visits,
             causal_accumulator_parent_points: work.causal_accumulator_parent_points,
@@ -6702,9 +6932,20 @@ impl ShardedHotEngine {
                 "current-path catalog row is missing its accepted catalog page state".into(),
             ));
         };
+        let effective_name = match self
+            .authenticated_page_name_exact_state(&self.page_name_root, name.key_digest())?
+        {
+            Some(selection) if selection.page_id() == row.page_id => selection.exact_name().clone(),
+            Some(_) => {
+                return Err(EngineError::Archive(
+                    "current-path catalog row has contradictory page-name ownership".into(),
+                ));
+            }
+            None => name,
+        };
         if path != row.path
             || kind != row.kind
-            || ContentDigest::of(name.as_str().as_bytes()) != row.accepted_name_digest
+            || ContentDigest::of(effective_name.as_str().as_bytes()) != row.accepted_name_digest
         {
             return Err(EngineError::Archive(
                 "current-path catalog row disagrees with its accepted catalog page state".into(),
@@ -7226,7 +7467,7 @@ impl ShardedHotEngine {
         }
         let mut desired = BTreeMap::<PageId, Option<CurrentPathCatalogStoredRow>>::new();
         for delta in effect.pages() {
-            let before = delta
+            let mut before = delta
                 .before
                 .as_ref()
                 .and_then(current_path_catalog_row_from_page_state);
@@ -7242,7 +7483,7 @@ impl ShardedHotEngine {
                     )));
                 }
             }
-            if desired.insert(delta.page_id, after).is_some() {
+            if desired.insert(delta.page_id, after.clone()).is_some() {
                 return Err(EngineError::Archive(
                     "current-path catalog delta contains a duplicate page".into(),
                 ));
@@ -7256,10 +7497,43 @@ impl ShardedHotEngine {
                 .map(|encoded| decode_current_path_catalog_row(&encoded))
                 .transpose()?;
             if stored.as_ref() != before.as_ref() {
-                return Err(EngineError::Archive(
-                    "current-path catalog is missing or corrupt before-row authority".into(),
-                ));
+                let current = self.current_effective_path_catalog_row(delta.page_id)?;
+                let authored_before = delta.before.as_ref();
+                let authored_after = delta.after.as_ref();
+                let canonical_title_only = match (authored_before, authored_after, &current) {
+                    (
+                        Some(PageState::Live {
+                            name: before_name,
+                            path: before_path,
+                            kind: before_kind,
+                            ..
+                        }),
+                        Some(PageState::Live {
+                            name: after_name,
+                            path: after_path,
+                            kind: after_kind,
+                            ..
+                        }),
+                        Some((current, current_key)),
+                    ) => {
+                        let _ = before_name;
+                        after_name.key_digest() == *current_key
+                            && before_path == after_path
+                            && before_kind == after_kind
+                            && current.path == *before_path
+                            && current.kind == *before_kind
+                    }
+                    _ => false,
+                };
+                if !canonical_title_only || stored.as_ref() != current.as_ref().map(|(row, _)| row)
+                {
+                    return Err(EngineError::Archive(
+                        "current-path catalog is missing or corrupt before-row authority".into(),
+                    ));
+                }
+                before = current.map(|(row, _)| row);
             }
+            debug_assert_eq!(stored.as_ref(), before.as_ref());
         }
 
         let mut root = self.current_path_catalog.root.clone();
@@ -7287,6 +7561,35 @@ impl ShardedHotEngine {
                 accepted_frontier_root,
             },
         })
+    }
+
+    fn current_effective_path_catalog_row(
+        &self,
+        page_id: PageId,
+    ) -> Result<Option<(CurrentPathCatalogStoredRow, super::PageNameKeyDigest)>, EngineError> {
+        let Some(catalog) = self.visible_documents.get(&self.catalog_document_id) else {
+            return Ok(None);
+        };
+        let Some(mut state) = validate_catalog_page(self.catalog_document_id, catalog, page_id)?
+        else {
+            return Ok(None);
+        };
+        let mut effective_key = None;
+        if let PageState::Live { name, .. } = &mut state {
+            let key = name.key_digest();
+            if let Some(selection) =
+                self.authenticated_page_name_exact_state(&self.page_name_root, key)?
+            {
+                if selection.page_id() != page_id || selection.canonical_key() != key {
+                    return Err(EngineError::Archive(
+                        "current effective path row has contradictory page-name ownership".into(),
+                    ));
+                }
+                name.clone_from(selection.exact_name());
+            }
+            effective_key = Some(name.key_digest());
+        }
+        Ok(current_path_catalog_row_from_page_state(&state).zip(effective_key))
     }
 
     fn commit_current_path_catalog_transition(&mut self, transition: CurrentPathCatalogTransition) {
@@ -11555,14 +11858,18 @@ impl ShardedHotEngine {
 
     pub fn materialize_page(&self, page_id: PageId) -> Result<MaterializedPage, EngineError> {
         self.materialize_page_inner(page_id, false)
-            .map(|(page, _, _)| page)
+            .map(|(page, _, _, _)| page)
     }
 
     pub fn materialize_page_for_projection(
         &self,
         page_id: PageId,
     ) -> Result<ProjectionPageState, EngineError> {
-        let (page, frontier, claim_evidence) = self.materialize_page_inner(page_id, true)?;
+        let (page, frontier, claim_evidence, effective_closure) =
+            self.materialize_page_inner(page_id, true)?;
+        if effective_closure.is_some() {
+            return Err(EngineError::ProjectionAuthorizationUnavailable);
+        }
         Ok(ProjectionPageState {
             page,
             frontier: frontier.expect("projection materialization requested a frontier"),
@@ -11606,6 +11913,199 @@ impl ShardedHotEngine {
         Ok(ProjectionWriteAuthorization {
             state,
             claim_root: self.logseq_claim_root,
+        })
+    }
+
+    pub(crate) fn authenticate_effective_title_projection_candidate(
+        &self,
+        source: &ManifestedProjectionIntent,
+    ) -> Result<AuthenticatedEffectiveTitleProjectionCandidate, EngineError> {
+        self.begin_point_operation();
+        self.ensure_not_blocked()?;
+        let (page, frontier, claim_evidence, effective_closure) =
+            self.materialize_page_inner(source.page_id(), true)?;
+        let effective_closure =
+            effective_closure.ok_or(EngineError::ProjectionAuthorizationUnavailable)?;
+        if effective_closure.transition.selected_intent != *source {
+            return Err(EngineError::ProjectionAuthorizationUnavailable);
+        }
+        let state = ProjectionPageState {
+            page,
+            frontier: frontier.expect("projection materialization requested a frontier"),
+            claim_evidence,
+        };
+        let accepted_frontier = self.authenticate_projection_accepted_frontier()?;
+        Ok(AuthenticatedEffectiveTitleProjectionCandidate {
+            seal: EffectiveTitleTransitionSeal::Authenticated,
+            state,
+            source: source.clone(),
+            lifecycle_completion: effective_closure.lifecycle_completion,
+            accepted_frontier,
+        })
+    }
+
+    pub(crate) fn authorize_effective_title_projection_write(
+        &self,
+        candidate: &AuthenticatedEffectiveTitleProjectionCandidate,
+        source: &ManifestedProjectionIntent,
+        completed_intent: &ProjectionIntent,
+        completion: &ProjectionCompletion,
+        exact_local_base: &[u8],
+    ) -> Result<ProjectionWriteAuthorization, EngineError> {
+        let fresh = self.authenticate_effective_title_projection_candidate(source)?;
+        if candidate.seal != EffectiveTitleTransitionSeal::Authenticated
+            || candidate.source != *source
+            || fresh.seal != candidate.seal
+            || fresh.source != candidate.source
+            || fresh.lifecycle_completion != candidate.lifecycle_completion
+            || !fresh
+                .accepted_frontier
+                .matches(&candidate.accepted_frontier)
+            || !same_projection_state_authority(&fresh.state, &candidate.state)
+        {
+            return Err(EngineError::ProjectionAuthorizationUnavailable);
+        }
+        completion
+            .validate_against(completed_intent)
+            .map_err(|_| EngineError::ProjectionAuthorizationUnavailable)?;
+        let completed_intent_id = completed_intent
+            .id()
+            .map_err(|_| EngineError::ProjectionAuthorizationUnavailable)?;
+        let lifecycle = &candidate.lifecycle_completion;
+        if completed_intent.workspace_id() != self.workspace_id
+            || lifecycle.page_id() != completed_intent.page_id()
+            || lifecycle.path() != completed_intent.path()
+            || lifecycle.frontier() != completed_intent.frontier()
+            || lifecycle.intent_id() != completed_intent_id
+            || lifecycle.logical_completion_id() != completion.logical_completion_id()
+            || lifecycle.target() != ProjectionWorkTarget::Present(completed_intent.target())
+            || completed_intent.page_id() != candidate.state.page.page_id
+            || completed_intent.path() != &candidate.state.page.path
+            || super::BlobDescription::of(exact_local_base) != completed_intent.target()
+        {
+            return Err(EngineError::ProjectionAuthorizationUnavailable);
+        }
+        let ManifestProjectionTarget::Present {
+            bytes, annotations, ..
+        } = source.target()
+        else {
+            return Err(EngineError::ProjectionAuthorizationUnavailable);
+        };
+        let replay = super::projection::plan_projection_with_layout_annotations(
+            self.workspace_id,
+            &candidate.state,
+            Some(exact_local_base),
+            Some(annotations),
+        )
+        .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
+        if replay.target() != bytes || replay.intent().annotations() != annotations {
+            return Err(EngineError::ProjectionAuthorizationUnavailable);
+        }
+        Ok(ProjectionWriteAuthorization {
+            state: candidate.state.clone(),
+            claim_root: self.logseq_claim_root,
+        })
+    }
+
+    fn authenticate_projection_accepted_frontier(
+        &self,
+    ) -> Result<AuthenticatedProjectionAcceptedFrontier, EngineError> {
+        let mut work = self.history_work.get();
+        work.effective_title_projection_authority_calls = work
+            .effective_title_projection_authority_calls
+            .saturating_add(1);
+        self.history_work.set(work);
+
+        let accepted_frontier_root = self.accepted_frontier_root()?;
+        let accepted_documents =
+            usize::try_from(accepted_frontier_root.document_count()).unwrap_or(usize::MAX);
+        let mut work = self.history_work.get();
+        work.effective_title_projection_max_accepted_documents = work
+            .effective_title_projection_max_accepted_documents
+            .max(accepted_documents);
+        self.history_work.set(work);
+        let acceptance_sequence = accepted_frontier_root.acceptance_sequence();
+        if acceptance_sequence == 0 {
+            return Err(EngineError::ProjectionAuthorizationUnavailable);
+        }
+        let (latest_accepted_batch, accepted_evidence) = self
+            .accepted_batch_entry_at(acceptance_sequence)?
+            .ok_or(EngineError::ProjectionAuthorizationUnavailable)?;
+        let accepted_evidence =
+            accepted_evidence.ok_or(EngineError::ProjectionAuthorizationUnavailable)?;
+        let mut work = self.history_work.get();
+        work.effective_title_projection_point_proofs = work
+            .effective_title_projection_point_proofs
+            .saturating_add(1);
+        self.history_work.set(work);
+        if accepted_evidence.batch_id() != latest_accepted_batch
+            || accepted_evidence.acceptance_sequence() != acceptance_sequence
+            || accepted_evidence.post_frontier_root() != &accepted_frontier_root
+        {
+            return Err(EngineError::ProjectionAuthorizationUnavailable);
+        }
+
+        let accepted_no_op = self
+            .accepted_frontier_batch_no_op(latest_accepted_batch)?
+            .ok_or(EngineError::ProjectionAuthorizationUnavailable)?;
+        let mut work = self.history_work.get();
+        work.effective_title_projection_point_proofs = work
+            .effective_title_projection_point_proofs
+            .saturating_add(1);
+        self.history_work.set(work);
+
+        let history = self
+            .history_store
+            .as_ref()
+            .ok_or(EngineError::ProjectionAuthorizationUnavailable)?;
+        let durable_history = history
+            .current_authority()
+            .map_err(|error| EngineError::Archive(error.to_string()))?;
+        if durable_history.generation != self.history_generation
+            || durable_history.index_root != self.history_root
+        {
+            return Err(EngineError::ProjectionAuthorizationUnavailable);
+        }
+        let durable_record = self
+            .durable_endpoint_history_record_at_live_head(latest_accepted_batch)?
+            .ok_or(EngineError::ProjectionAuthorizationUnavailable)?;
+        let confirmed_history = history
+            .current_authority()
+            .map_err(|error| EngineError::Archive(error.to_string()))?;
+        let mut work = self.history_work.get();
+        work.effective_title_projection_point_proofs = work
+            .effective_title_projection_point_proofs
+            .saturating_add(1);
+        self.history_work.set(work);
+        if confirmed_history != durable_history {
+            return Err(EngineError::ProjectionAuthorizationUnavailable);
+        }
+        let ArchiveStatus::Accepted {
+            no_op: durable_no_op,
+            evidence: durable_evidence,
+        } = &durable_record.status
+        else {
+            return Err(EngineError::ProjectionAuthorizationUnavailable);
+        };
+        if *durable_no_op != accepted_no_op
+            || durable_evidence.batch_id() != latest_accepted_batch
+            || durable_evidence.manifest_fingerprint() != accepted_evidence.manifest_fingerprint()
+            || durable_evidence.event_binding_digest() != accepted_evidence.event_binding_digest()
+            || durable_evidence.acceptance_sequence() != acceptance_sequence
+            || durable_evidence.affected_documents() != accepted_evidence.affected_documents()
+            || durable_evidence.reference_catalog_delta()
+                != accepted_evidence.reference_catalog_delta()
+            || accepted_frontier_cross_run_facts(durable_evidence.prior_frontier_root())
+                != accepted_frontier_cross_run_facts(accepted_evidence.prior_frontier_root())
+            || accepted_frontier_cross_run_facts(durable_evidence.post_frontier_root())
+                != accepted_frontier_cross_run_facts(&accepted_frontier_root)
+        {
+            return Err(EngineError::ProjectionAuthorizationUnavailable);
+        }
+        Ok(AuthenticatedProjectionAcceptedFrontier {
+            runtime_authority: self.runtime_authority.clone(),
+            accepted_frontier_root,
+            durable_history,
         })
     }
 
@@ -11843,7 +12343,12 @@ impl ShardedHotEngine {
             .as_ref()
             .ok_or(EngineError::ProjectionAuthorizationUnavailable)?;
         let documents = self.reconstruct_projection_frontier(frontier)?;
-        let page = self.materialize_page_from_documents(page_id, &documents)?;
+        let mut page = self.materialize_page_from_documents(page_id, &documents)?;
+        if let Some(transition) =
+            self.effective_title_at_page_name_root(&self.page_name_root, page_id, &page.name)?
+        {
+            transition.apply_to_materialized(&mut page)?;
+        }
         let mut requested =
             page_logseq_references(&page.path, page.preamble.as_deref(), &page.blocks);
         requested.extend(page.blocks.iter().filter_map(|block| block.logseq_uuid));
@@ -12236,6 +12741,7 @@ impl ShardedHotEngine {
             MaterializedPage,
             Option<FrontierV2>,
             Vec<ProjectionClaimEvidence>,
+            Option<AuthenticatedEffectiveProjectionClosure>,
         ),
         EngineError,
     > {
@@ -12408,7 +12914,7 @@ impl ShardedHotEngine {
             }
         }
         let reads_after = self.archive_read_stats();
-        let page = MaterializedPage {
+        let mut page = MaterializedPage {
             page_id,
             home_document_id: page_document_id,
             name,
@@ -12429,17 +12935,33 @@ impl ShardedHotEngine {
                     .saturating_sub(reads_before.object_reads),
             },
         };
+        let effective_selection =
+            self.title_selection_at_page_name_root(&self.page_name_root, page_id, &page.name)?;
+        let effective_transition = effective_selection
+            .as_ref()
+            .filter(|selection| selection.exact_name() != &page.name)
+            .map(|selection| self.authenticate_selected_title_transition(selection, None))
+            .transpose()?;
+        if let Some(transition) = &effective_transition {
+            transition.apply_to_materialized(&mut page)?;
+        }
         let frontier = include_frontier
             .then(|| FrontierV2::new(frontier_documents.into_values().collect()))
             .transpose()?;
-        let frontier = match frontier {
-            Some(frontier) => Some(
-                self.page_stable_projection_frontier(&page, &frontier, &claim_evidence)?
-                    .unwrap_or(frontier),
-            ),
-            None => None,
+        let (frontier, effective_closure) = match frontier {
+            Some(frontier) => match self.page_stable_projection_frontier(
+                &page,
+                &frontier,
+                &claim_evidence,
+                effective_selection.as_ref(),
+                effective_transition.as_ref(),
+            )? {
+                Some((stable, closure)) => (Some(stable), closure),
+                None => (Some(frontier), None),
+            },
+            None => (None, None),
         };
-        Ok((page, frontier, claim_evidence))
+        Ok((page, frontier, claim_evidence, effective_closure))
     }
 
     fn page_stable_projection_frontier(
@@ -12447,7 +12969,10 @@ impl ShardedHotEngine {
         page: &MaterializedPage,
         current: &FrontierV2,
         claim_evidence: &[ProjectionClaimEvidence],
-    ) -> Result<Option<FrontierV2>, EngineError> {
+        effective_selection: Option<&AuthenticatedPageNameExactStateV1>,
+        effective_transition: Option<&AuthenticatedPageLocalEffectiveTransition>,
+    ) -> Result<Option<(FrontierV2, Option<AuthenticatedEffectiveProjectionClosure>)>, EngineError>
+    {
         let path_key = page.path.portable_key().digest();
         let Some(occupied) = self
             .portable_path_records_many(&[path_key])?
@@ -12474,7 +12999,7 @@ impl ShardedHotEngine {
             if completion.page_id() != page.page_id || completion.path() != &page.path {
                 continue;
             }
-            let ProjectionWorkTarget::Present(completed_target) = completion.target() else {
+            let ProjectionWorkTarget::Present(_) = completion.target() else {
                 continue;
             };
             if !self.projection_frontier_contains_path_acquisition(
@@ -12483,13 +13008,104 @@ impl ShardedHotEngine {
             )? {
                 continue;
             }
-            if lifecycle_completion
-                .replace((completion.frontier(), completed_target))
-                .is_some()
-            {
+            if lifecycle_completion.replace(completion.clone()).is_some() {
                 return Ok(None);
             }
         }
+        let derived_transition;
+        let effective_transition = match effective_transition {
+            Some(transition) => Some(transition),
+            None => {
+                derived_transition = match (effective_selection, lifecycle_completion.as_ref()) {
+                    (Some(selection), Some(completion))
+                        if !self.projection_frontier_contains_path_acquisition(
+                            completion.frontier(),
+                            selection.exact_state_batch(),
+                        )? =>
+                    {
+                        Some(self.authenticate_selected_title_transition(selection, None)?)
+                    }
+                    _ => None,
+                };
+                derived_transition.as_ref()
+            }
+        };
+        let current_catalog = current
+            .documents()
+            .iter()
+            .find(|document| document.document_id() == self.catalog_document_id);
+        if let Some(transition) = effective_transition {
+            let intent = &transition.selected_intent;
+            if transition.seal != EffectiveTitleTransitionSeal::Authenticated
+                || transition.page_id != page.page_id
+                || transition.selected_name != page.name
+                || transition.selected_batch != intent.source_batch_id()
+                || transition.selected_dot
+                    != self
+                        .load_observed_manifest(transition.selected_batch)?
+                        .causal_dot()
+                || intent.page_id() != page.page_id
+                || intent.path() != &page.path
+                || intent.claim_evidence() != claim_evidence
+                || !matches!(intent.target(), ManifestProjectionTarget::Present { .. })
+                || !self.projection_frontier_contains_path_acquisition(
+                    intent.post_frontier(),
+                    occupied.acquisition_batch(),
+                )?
+            {
+                return Ok(None);
+            }
+            let mismatched_completion = lifecycle_completion.as_ref().filter(|completion| {
+                intent.post_frontier() != completion.frontier()
+                    || intent
+                        .target()
+                        .description()
+                        .map(ProjectionWorkTarget::Present)
+                        != Some(completion.target())
+            });
+            let Some(candidate_catalog) = intent
+                .post_frontier()
+                .documents()
+                .iter()
+                .find(|document| document.document_id() == self.catalog_document_id)
+            else {
+                return Ok(None);
+            };
+            let Some(current_catalog) = current_catalog else {
+                return Ok(None);
+            };
+            let current_catalog_frontier = FrontierV2::new(vec![current_catalog.clone()])?;
+            let candidate_catalog_frontier = FrontierV2::new(vec![candidate_catalog.clone()])?;
+            if !self.projection_frontier_dominates(
+                &current_catalog_frontier,
+                &candidate_catalog_frontier,
+            )? {
+                return Ok(None);
+            }
+            let state = ProjectionPageState {
+                page: page.clone(),
+                frontier: intent.post_frontier().clone(),
+                claim_evidence: claim_evidence.to_vec(),
+            };
+            let target = intent.target().bytes();
+            let rendered = super::projection::plan_projection_with_layout_annotations(
+                self.workspace_id,
+                &state,
+                target,
+                Some(intent.target().annotations()),
+            )
+            .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
+            if rendered.target() != target.expect("Present target has bytes") {
+                return Err(EngineError::ProjectionAuthorizationUnavailable);
+            }
+            let effective_closure =
+                mismatched_completion.map(|completion| AuthenticatedEffectiveProjectionClosure {
+                    transition: transition.clone(),
+                    lifecycle_completion: completion.clone(),
+                });
+            return Ok(Some((intent.post_frontier().clone(), effective_closure)));
+        }
+
         let mut candidate_batches = BTreeSet::new();
         for document in current
             .documents()
@@ -12503,10 +13119,6 @@ impl ShardedHotEngine {
             .iter()
             .filter(|document| document.document_id() != self.catalog_document_id)
             .collect::<Vec<_>>();
-        let current_catalog = current
-            .documents()
-            .iter()
-            .find(|document| document.document_id() == self.catalog_document_id);
         let mut stable = None;
         for batch_id in candidate_batches {
             for intent in self.load_accepted_projection_intents(batch_id)? {
@@ -12525,9 +13137,13 @@ impl ShardedHotEngine {
                 {
                     continue;
                 }
-                if lifecycle_completion.is_some_and(|(frontier, target)| {
-                    intent.post_frontier() != frontier
-                        || intent.target().description() != Some(target)
+                if lifecycle_completion.as_ref().is_some_and(|completion| {
+                    intent.post_frontier() != completion.frontier()
+                        || intent
+                            .target()
+                            .description()
+                            .map(ProjectionWorkTarget::Present)
+                            != Some(completion.target())
                 }) {
                     continue;
                 }
@@ -12582,7 +13198,7 @@ impl ShardedHotEngine {
                 }
             }
         }
-        Ok(stable)
+        Ok(stable.map(|frontier| (frontier, None)))
     }
 
     fn projection_frontier_contains_path_acquisition(
@@ -12636,7 +13252,7 @@ impl ShardedHotEngine {
         let mut blocks = Vec::new();
         let mut memberships = Vec::new();
         let mut paths = BTreeMap::<ManagedPath, Vec<PageId>>::new();
-        for (page_id, state) in all_pages {
+        for (page_id, mut state) in all_pages {
             if let PageState::Live { path, .. } = &state {
                 paths.entry(path.clone()).or_default().push(page_id);
                 let materialized = self.materialize_page(page_id)?;
@@ -12661,6 +13277,9 @@ impl ShardedHotEngine {
                         logseq_identity_origin: block.logseq_identity_origin,
                         content: block.content,
                     });
+                }
+                if let PageState::Live { name, .. } = &mut state {
+                    name.clone_from(&materialized.name);
                 }
                 pages.push((page_id, state));
             }
@@ -14393,7 +15012,7 @@ impl ShardedHotEngine {
             &new_exact_shard_candidates,
             &declared_effect,
         )?;
-        let after_snapshots = snapshot_engine_documents_excluding(
+        let mut after_snapshots = snapshot_engine_documents_excluding(
             self.catalog_document_id,
             &after,
             true,
@@ -14692,6 +15311,20 @@ impl ShardedHotEngine {
             || page_name_blocked
             || !allow_publication
             || self.is_blocked();
+        let effective_view = if quarantined {
+            None
+        } else {
+            let view = self.proposed_effective_semantic_view(
+                batch_id,
+                &declared_effect,
+                page_names.as_ref(),
+            )?;
+            if let Some(pages) = divergent_validated_catalog_pages.as_mut() {
+                view.apply_to_catalog_pages(pages)?;
+            }
+            view.apply_to_snapshots(&mut after_snapshots)?;
+            Some(view)
+        };
         #[cfg(test)]
         self.record_replay_timing(|timing| {
             timing.post_identity_conflict_terminal_nanos = timing
@@ -14703,17 +15336,29 @@ impl ShardedHotEngine {
         let logseq_claim_candidate = if quarantined {
             None
         } else {
-            Some(self.prepare_logseq_claim_updates(
-                batch_id,
-                self.archive[&batch_id].manifest().causal_dot(),
-                &declared_effect,
-            )?)
+            Some(
+                self.prepare_logseq_claim_updates(
+                    batch_id,
+                    self.archive[&batch_id].manifest().causal_dot(),
+                    effective_view
+                        .as_ref()
+                        .expect("visible batch has an effective semantic view")
+                        .effect(),
+                )?,
+            )
         };
         let reference_catalog = if quarantined {
             None
         } else {
             let reference_source_observations = ValidatedReferenceSourceObservations {
-                catalog_pages: validated_catalog_pages,
+                catalog_pages: divergent_validated_catalog_pages.as_ref().or_else(|| {
+                    after_snapshots
+                        .values()
+                        .find_map(|snapshot| match snapshot {
+                            SemanticDocumentSnapshot::Catalog(pages) => Some(pages),
+                            SemanticDocumentSnapshot::Shard { .. } => None,
+                        })
+                }),
                 exact_current_documents: &proven_exact_current_documents,
                 after_snapshots: &after_snapshots,
                 new_shards: &validated_new_shards,
@@ -14724,7 +15369,10 @@ impl ShardedHotEngine {
                 .unwrap_or(&self.page_name_root);
             Some(
                 self.prepare_reference_catalog_updates(
-                    &declared_effect,
+                    effective_view
+                        .as_ref()
+                        .expect("visible batch has an effective semantic view")
+                        .effect(),
                     &replacements,
                     &reference_source_observations,
                     post_page_name_root,
@@ -14835,8 +15483,13 @@ impl ShardedHotEngine {
                     .delta(),
             )?;
         let current_path_catalog_root = accepted_evidence.post_frontier_root.clone();
-        let current_path_catalog_transition = self
-            .prepare_current_path_catalog_transition(&declared_effect, current_path_catalog_root)?;
+        let current_path_catalog_transition = self.prepare_current_path_catalog_transition(
+            effective_view
+                .as_ref()
+                .expect("accepted batch has an effective semantic view")
+                .effect(),
+            current_path_catalog_root,
+        )?;
         let status_evidence = accepted_evidence.clone();
         let page_name_binding = self.page_name_durable_candidate(page_names.as_ref(), None)?;
         let catalog_heads = self.prospective_catalog_heads(batch_id, &updates);
@@ -14957,6 +15610,12 @@ impl ShardedHotEngine {
         if let Some(error) = projection_preparation_error {
             self.history_failure = Some(error);
         }
+        self.remember_effective_semantic_view(
+            batch_id,
+            effective_view
+                .as_ref()
+                .expect("accepted batch has an effective semantic view"),
+        );
         Ok(BatchApplication::Accepted {
             no_op: declared_effect.is_empty(),
             evidence: status_evidence,
@@ -15270,6 +15929,447 @@ impl ShardedHotEngine {
         } else {
             self.ephemeral_page_names.commit(candidate);
         }
+    }
+
+    fn authenticated_page_name_exact_state(
+        &self,
+        root: &PageNameOwnershipRootV1,
+        key: super::PageNameKeyDigest,
+    ) -> Result<Option<AuthenticatedPageNameExactStateV1>, EngineError> {
+        match &self.page_name_index {
+            Some(index) => index
+                .authenticated_exact_state(root, key)
+                .map_err(|error| EngineError::Archive(error.to_string())),
+            None => self
+                .ephemeral_page_names
+                .authenticated_exact_state(key)
+                .map_err(|error| EngineError::Archive(error.to_string())),
+        }
+    }
+
+    fn proposed_page_name_exact_state(
+        &self,
+        candidate: &PageNamePublicationCandidateV1,
+        key: super::PageNameKeyDigest,
+    ) -> Result<Option<AuthenticatedPageNameExactStateV1>, EngineError> {
+        match &self.page_name_index {
+            Some(index) => index
+                .authenticated_exact_state(&candidate.root, key)
+                .map_err(|error| EngineError::Archive(error.to_string())),
+            None => candidate
+                .authenticated_ephemeral_exact_state(&self.ephemeral_page_names, key)
+                .map_err(|error| EngineError::Archive(error.to_string())),
+        }
+    }
+
+    fn load_accepted_validated_batch(
+        &self,
+        batch_id: BatchId,
+    ) -> Result<ValidatedBatch, EngineError> {
+        if let Some(batch) = self.archive.get(&batch_id) {
+            return Ok(batch.clone());
+        }
+        let store = self
+            .archive_store
+            .as_ref()
+            .ok_or(EngineError::MissingDependency(batch_id))?;
+        match store
+            .inspect_batch(batch_id)
+            .map_err(|error| EngineError::Archive(error.to_string()))?
+        {
+            BatchInspection::Ready(batch) => Ok(batch),
+            BatchInspection::Absent | BatchInspection::Staged { .. } => {
+                Err(EngineError::MissingDependency(batch_id))
+            }
+        }
+    }
+
+    fn authenticate_selected_title_transition(
+        &self,
+        selection: &AuthenticatedPageNameExactStateV1,
+        allow_unsealed_batch: Option<BatchId>,
+    ) -> Result<AuthenticatedPageLocalEffectiveTransition, EngineError> {
+        let selected_batch = self.load_accepted_validated_batch(selection.exact_state_batch())?;
+        if selected_batch.manifest().causal_dot() != selection.exact_state_dot() {
+            return Err(EngineError::Archive(
+                "selected exact-title batch/dot binding mismatch".into(),
+            ));
+        }
+        if allow_unsealed_batch != Some(selection.exact_state_batch()) {
+            let selected_record = if self.history_store.is_some() {
+                self.sealed_history_record(selection.exact_state_batch())?
+            } else {
+                self.cold_history_record(selection.exact_state_batch())?
+            }
+            .ok_or_else(|| {
+                EngineError::Archive(format!(
+                    "selected exact-title batch {} has no sealed history record",
+                    selection.exact_state_batch()
+                ))
+            })?;
+            if !matches!(selected_record.status, ArchiveStatus::Accepted { .. })
+                || batch_fingerprint(&selected_batch) != selected_record.manifest_fingerprint
+            {
+                return Err(EngineError::Archive(
+                    "selected exact-title batch is not bound to accepted sealed history".into(),
+                ));
+            }
+        }
+        let semantic_objects = selected_batch
+            .objects()
+            .iter()
+            .filter(|object| object.kind() == ObjectKind::SemanticEffect)
+            .collect::<Vec<_>>();
+        if semantic_objects.len() != 1 {
+            return Err(EngineError::Archive(
+                "selected exact-title batch has non-unique semantic effect".into(),
+            ));
+        }
+        let selected_effect = SemanticEffect::decode(semantic_objects[0].payload())?;
+        if SemanticEffectDigest::of(semantic_objects[0].payload())
+            != selected_batch.manifest().semantic_effect_digest()
+        {
+            return Err(EngineError::Archive(
+                "selected exact-title semantic effect is not manifest-bound".into(),
+            ));
+        }
+        let matching_pages = selected_effect
+            .pages()
+            .iter()
+            .filter(|delta| {
+                delta.page_id == selection.page_id()
+                    && delta.after.as_ref().is_some_and(|after| {
+                        after.name() == selection.exact_name()
+                            && after.name().key_digest() == selection.canonical_key()
+                    })
+            })
+            .collect::<Vec<_>>();
+        if matching_pages.len() != 1 {
+            return Err(EngineError::Archive(
+                "selected exact-title batch has missing or duplicate matching page delta".into(),
+            ));
+        }
+        let selected_after = matching_pages[0]
+            .after
+            .as_ref()
+            .expect("matching selected page has an after state");
+        let PageState::Live {
+            path,
+            home_document_id,
+            ..
+        } = selected_after
+        else {
+            return Err(EngineError::Archive(
+                "selected exact-title page delta is not live".into(),
+            ));
+        };
+        let matching_preambles = selected_effect
+            .page_preambles()
+            .iter()
+            .filter(|delta| delta.page_id == selection.page_id())
+            .collect::<Vec<_>>();
+        if matching_preambles.len() > 1 {
+            return Err(EngineError::Archive(
+                "selected exact-title batch has duplicate page preamble transitions".into(),
+            ));
+        }
+        let selected_explicit_title = EffectiveExplicitTitleState::from_authenticated_transition(
+            selection.page_id(),
+            *home_document_id,
+            path,
+            selection.exact_name(),
+            matching_preambles.first().cloned().cloned(),
+        )?;
+        let projection = super::projection_manifest::validate_projection_object_set(
+            selected_batch.manifest(),
+            selected_batch.objects(),
+        )
+        .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
+        let matching_intents = projection
+            .intents()
+            .iter()
+            .filter(|intent| {
+                intent.source_batch_id() == selection.exact_state_batch()
+                    && intent.page_id() == selection.page_id()
+                    && intent.path() == path
+                    && matches!(intent.target(), ManifestProjectionTarget::Present { .. })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if matching_intents.len() != 1 {
+            return Err(EngineError::Archive(
+                "selected exact-title batch has missing or duplicate matching projection intent"
+                    .into(),
+            ));
+        }
+        Ok(AuthenticatedPageLocalEffectiveTransition {
+            seal: EffectiveTitleTransitionSeal::Authenticated,
+            page_id: selection.page_id(),
+            canonical_key: selection.canonical_key(),
+            selected_name: selection.exact_name().clone(),
+            selected_batch: selection.exact_state_batch(),
+            selected_dot: selection.exact_state_dot(),
+            selected_explicit_title,
+            selected_intent: matching_intents
+                .into_iter()
+                .next()
+                .expect("one selected intent"),
+        })
+    }
+
+    fn effective_semantic_view_from_selections(
+        &self,
+        batch_id: BatchId,
+        authored: &SemanticEffect,
+        allow_unsealed_batch: Option<BatchId>,
+        mut selection_for: impl FnMut(
+            super::PageNameKeyDigest,
+        )
+            -> Result<Option<AuthenticatedPageNameExactStateV1>, EngineError>,
+    ) -> Result<AuthenticatedEffectiveSemanticView, EngineError> {
+        let mut effect = authored.clone();
+        let mut transitions = Vec::new();
+        for delta in authored.pages() {
+            let (Some(before), Some(after)) = (&delta.before, &delta.after) else {
+                continue;
+            };
+            let (PageState::Live { name: before, .. }, PageState::Live { name: after, .. }) =
+                (before, after)
+            else {
+                continue;
+            };
+            if before == after {
+                continue;
+            }
+            let selection = selection_for(after.key_digest())?.ok_or_else(|| {
+                EngineError::Archive(
+                    "accepted exact-title transition has no occupied ownership record".into(),
+                )
+            })?;
+            if selection.page_id() != delta.page_id
+                || selection.canonical_key() != after.key_digest()
+            {
+                return Err(EngineError::Archive(
+                    "accepted exact-title ownership record is bound to another page".into(),
+                ));
+            }
+            if selection.exact_state_batch() == batch_id {
+                if selection.exact_name() != after {
+                    return Err(EngineError::Archive(
+                        "accepted exact-title batch selected contradictory UTF-8".into(),
+                    ));
+                }
+                // The authored event is already the selected immutable
+                // post-state. Keep the ordinary path byte-identical and free
+                // of any selected-history prerequisite. During acceptance,
+                // however, its unsealed proof may still need to overlay the
+                // receiver's merged CRDT snapshots before publication.
+                if allow_unsealed_batch == Some(batch_id) {
+                    let selected_batch = self.load_accepted_validated_batch(batch_id)?;
+                    let projection = super::projection_manifest::validate_projection_object_set(
+                        selected_batch.manifest(),
+                        selected_batch.objects(),
+                    )
+                    .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
+                    if !projection.intents().is_empty() {
+                        transitions.push(self.authenticate_selected_title_transition(
+                            &selection,
+                            allow_unsealed_batch,
+                        )?);
+                    }
+                }
+                continue;
+            }
+            let proof =
+                self.authenticate_selected_title_transition(&selection, allow_unsealed_batch)?;
+            effect = effect
+                .splice_title_post_state(
+                    delta.page_id,
+                    proof.selected_name(),
+                    proof.selected_explicit_title(),
+                )
+                .map_err(EngineError::from)?;
+            transitions.push(proof);
+        }
+        Ok(AuthenticatedEffectiveSemanticView {
+            effect,
+            transitions,
+        })
+    }
+
+    fn proposed_effective_semantic_view(
+        &self,
+        batch_id: BatchId,
+        authored: &SemanticEffect,
+        page_names: Option<&PageNamePublicationCandidateV1>,
+    ) -> Result<AuthenticatedEffectiveSemanticView, EngineError> {
+        if authored.pages().is_empty() {
+            return Ok(AuthenticatedEffectiveSemanticView {
+                effect: authored.clone(),
+                transitions: Vec::new(),
+            });
+        }
+        let page_names = page_names.ok_or_else(|| {
+            EngineError::Archive("accepted page effect has no proposed page-name root".into())
+        })?;
+        self.effective_semantic_view_from_selections(batch_id, authored, Some(batch_id), |key| {
+            self.proposed_page_name_exact_state(page_names, key)
+        })
+    }
+
+    fn remember_effective_semantic_view(
+        &mut self,
+        batch_id: BatchId,
+        view: &AuthenticatedEffectiveSemanticView,
+    ) {
+        if self
+            .transient_effective_views
+            .insert(batch_id, view.clone())
+            .is_some()
+        {
+            self.transient_effective_view_order
+                .retain(|current| *current != batch_id);
+        }
+        self.transient_effective_view_order.push_back(batch_id);
+        while self.transient_effective_view_order.len() > MAX_TRANSIENT_EFFECTIVE_VIEWS {
+            if let Some(expired) = self.transient_effective_view_order.pop_front() {
+                self.transient_effective_views.remove(&expired);
+            }
+        }
+    }
+
+    pub(crate) fn accepted_effective_semantic_view(
+        &self,
+        batch_id: BatchId,
+        authored: &SemanticEffect,
+    ) -> Result<AuthenticatedEffectiveSemanticView, EngineError> {
+        if let Some(view) = self.transient_effective_views.get(&batch_id) {
+            return Ok(view.clone());
+        }
+        let title_keys = authored
+            .pages()
+            .iter()
+            .filter_map(|delta| match (&delta.before, &delta.after) {
+                (
+                    Some(PageState::Live { name: before, .. }),
+                    Some(PageState::Live { name: after, .. }),
+                ) if before != after => Some(after.key_digest()),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        if title_keys.is_empty() {
+            return Ok(AuthenticatedEffectiveSemanticView {
+                effect: authored.clone(),
+                transitions: Vec::new(),
+            });
+        }
+        let manifest = self.load_observed_manifest(batch_id)?;
+        let authored_bytes = authored.encode()?;
+        if SemanticEffectDigest::of(&authored_bytes) != manifest.semantic_effect_digest() {
+            return Err(EngineError::Archive(
+                "accepted authored effect is not bound to its immutable manifest".into(),
+            ));
+        }
+        if self.history_store.is_none() {
+            let evidence = self.accepted_batch_evidence(batch_id)?;
+            if evidence.post_frontier_root() == &self.accepted_frontier_root {
+                return self.effective_semantic_view_from_selections(
+                    batch_id,
+                    authored,
+                    None,
+                    |key| self.authenticated_page_name_exact_state(&self.page_name_root, key),
+                );
+            }
+            for key in title_keys {
+                let selection =
+                    self.authenticated_page_name_exact_state(&self.page_name_root, key)?;
+                let Some(selection) = selection else {
+                    return Err(EngineError::Archive(
+                        "accepted exact-title event has no current ownership record".into(),
+                    ));
+                };
+                if selection.exact_state_batch() == batch_id {
+                    continue;
+                }
+                let selected_manifest =
+                    self.load_observed_manifest(selection.exact_state_batch())?;
+                let selected_clock = self.derive_ephemeral_causal_clock(&selected_manifest)?;
+                let causally_later = selected_clock
+                    .binary_search_by_key(&manifest.causal_dot().peer_id(), |(peer, _)| *peer)
+                    .ok()
+                    .is_some_and(|index| {
+                        selected_clock[index].1 >= manifest.causal_dot().counter()
+                    });
+                if !causally_later {
+                    return Err(EngineError::Archive(
+                        "concurrent historical exact-title selection requires sealed history"
+                            .into(),
+                    ));
+                }
+            }
+            return Ok(AuthenticatedEffectiveSemanticView {
+                effect: authored.clone(),
+                transitions: Vec::new(),
+            });
+        }
+        let record = self.sealed_history_record(batch_id)?.ok_or_else(|| {
+            EngineError::Archive(format!(
+                "accepted exact-title batch {batch_id} has no sealed history record"
+            ))
+        })?;
+        let ArchiveStatus::Accepted { evidence, .. } = &record.status else {
+            return Err(EngineError::Archive(
+                "accepted exact-title batch is not accepted sealed history".into(),
+            ));
+        };
+        if evidence.batch_id() != batch_id
+            || record.manifest_fingerprint != batch_fingerprint_from_manifest(&manifest)
+        {
+            return Err(EngineError::Archive(
+                "accepted exact-title history record is misbound".into(),
+            ));
+        }
+        self.effective_semantic_view_from_selections(batch_id, authored, None, |key| {
+            self.authenticated_page_name_exact_state(&record.page_names.ownership_root, key)
+        })
+    }
+
+    fn effective_title_at_page_name_root(
+        &self,
+        root: &PageNameOwnershipRootV1,
+        page_id: PageId,
+        authored_name: &LogicalPageName,
+    ) -> Result<Option<AuthenticatedPageLocalEffectiveTransition>, EngineError> {
+        let Some(selection) =
+            self.title_selection_at_page_name_root(root, page_id, authored_name)?
+        else {
+            return Ok(None);
+        };
+        if selection.exact_name() == authored_name {
+            return Ok(None);
+        }
+        self.authenticate_selected_title_transition(&selection, None)
+            .map(Some)
+    }
+
+    fn title_selection_at_page_name_root(
+        &self,
+        root: &PageNameOwnershipRootV1,
+        page_id: PageId,
+        authored_name: &LogicalPageName,
+    ) -> Result<Option<AuthenticatedPageNameExactStateV1>, EngineError> {
+        let Some(selection) =
+            self.authenticated_page_name_exact_state(root, authored_name.key_digest())?
+        else {
+            return Ok(None);
+        };
+        if selection.page_id() != page_id || selection.canonical_key() != authored_name.key_digest()
+        {
+            return Err(EngineError::Archive(
+                "materialized page-name key is owned by another PageId".into(),
+            ));
+        }
+        Ok(Some(selection))
     }
 
     fn prepare_reference_catalog_updates(
@@ -15824,7 +16924,7 @@ impl ShardedHotEngine {
         }
         let before_snapshots =
             snapshot_documents_with_validation(self.catalog_document_id, &before_documents, false)?;
-        let after_snapshots = snapshot_documents(self.catalog_document_id, &pending_documents)?;
+        let mut after_snapshots = snapshot_documents(self.catalog_document_id, &pending_documents)?;
         let exact_page_name_before = if declared_effect.pages().is_empty() {
             AuthoritativeCatalogPageNameObservationsV1::default()
         } else {
@@ -15988,8 +17088,11 @@ impl ShardedHotEngine {
             }
             return Ok(Some(BatchApplication::Quarantined));
         }
+        let effective_view =
+            self.proposed_effective_semantic_view(batch_id, declared_effect, page_names.as_ref())?;
+        effective_view.apply_to_snapshots(&mut after_snapshots)?;
         let logseq_claim_candidate =
-            self.prepare_logseq_claim_updates(batch_id, causal_dot, &declared_effect)?;
+            self.prepare_logseq_claim_updates(batch_id, causal_dot, effective_view.effect())?;
         let post_page_name_root = page_names
             .as_ref()
             .map(|candidate| &candidate.root)
@@ -15997,13 +17100,18 @@ impl ShardedHotEngine {
         let exact_current_documents = updates.keys().copied().collect();
         let validated_new_shards = ValidatedNewShardEffects::default();
         let reference_source_observations = ValidatedReferenceSourceObservations {
-            catalog_pages: derived_catalog_pages,
+            catalog_pages: after_snapshots
+                .values()
+                .find_map(|snapshot| match snapshot {
+                    SemanticDocumentSnapshot::Catalog(pages) => Some(pages),
+                    SemanticDocumentSnapshot::Shard { .. } => None,
+                }),
             exact_current_documents: &exact_current_documents,
             after_snapshots: &after_snapshots,
             new_shards: &validated_new_shards,
         };
         let reference_catalog = self.prepare_reference_catalog_updates(
-            &declared_effect,
+            effective_view.effect(),
             &pending_engine_documents,
             &reference_source_observations,
             post_page_name_root,
@@ -16020,8 +17128,10 @@ impl ShardedHotEngine {
                 reference_catalog.delta(),
             )?;
         let current_path_catalog_root = accepted_evidence.post_frontier_root.clone();
-        let current_path_catalog_transition = self
-            .prepare_current_path_catalog_transition(&declared_effect, current_path_catalog_root)?;
+        let current_path_catalog_transition = self.prepare_current_path_catalog_transition(
+            effective_view.effect(),
+            current_path_catalog_root,
+        )?;
         let status_evidence = accepted_evidence.clone();
         let page_name_binding = self.page_name_durable_candidate(page_names.as_ref(), None)?;
         let catalog_heads = self.prospective_catalog_heads(batch_id, updates);
@@ -16101,6 +17211,7 @@ impl ShardedHotEngine {
         if let Some(error) = projection_preparation_error {
             self.history_failure = Some(error);
         }
+        self.remember_effective_semantic_view(batch_id, &effective_view);
         Ok(Some(BatchApplication::Accepted {
             no_op: declared_effect.is_empty(),
             evidence: status_evidence,
@@ -24603,6 +25714,52 @@ mod validation_tests {
         let root = fixture.root.clone();
         drop(fixture);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn projection_accepted_frontier_binding_is_point_bounded_and_rejects_advance() {
+        let mut fixture = preauthor_gate_fixture(89_000);
+        let before = fixture.engine.instrumentation();
+        let candidate = fixture
+            .engine
+            .authenticate_projection_accepted_frontier()
+            .unwrap();
+        let authenticated = fixture.engine.instrumentation();
+        assert_eq!(
+            authenticated.effective_title_projection_authority_calls
+                - before.effective_title_projection_authority_calls,
+            1
+        );
+        assert_eq!(
+            authenticated.effective_title_projection_point_proofs
+                - before.effective_title_projection_point_proofs,
+            3
+        );
+        assert_eq!(
+            authenticated.effective_title_projection_frontier_head_visits
+                - before.effective_title_projection_frontier_head_visits,
+            0
+        );
+
+        fixture.author_accepted_round(89_100, "accepted authority advanced");
+        let fresh = fixture
+            .engine
+            .authenticate_projection_accepted_frontier()
+            .unwrap();
+        assert!(
+            !candidate.matches(&fresh),
+            "a prior transient projection authority survived an accepted-state advance"
+        );
+        assert_eq!(
+            fixture
+                .engine
+                .materialize_page(fixture.pages[0].0)
+                .unwrap()
+                .blocks[0]
+                .content,
+            "accepted authority advanced"
+        );
+        finish_preauthor_gate_fixture(fixture);
     }
 
     #[test]

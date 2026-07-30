@@ -18453,6 +18453,525 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_offline_canonical_equivalent_editor_titles_preserve_exact_semantics() {
+        assert_eq!(
+            crate::refs::page_key("Café Plan"),
+            crate::refs::page_key("Cafe\u{301} Plan"),
+            "fixture titles must share one canonical identity"
+        );
+        let (first, second, first_handle, second_handle) =
+            joined_shared_pair("concurrent-editor-title-unicode", 0xe700);
+        let target_path = "notes/physical-target.markdown";
+        let (target_batch, target_page_id, _, _) = submit_shared_page(
+            &first_handle,
+            0xe720,
+            "Concurrent Original",
+            target_path,
+            "target body",
+        );
+        publish_shared_batch(&first_handle, &first, target_batch);
+        settle_shared_provider(&first_handle);
+        copy_provider_tree(&first.request.provider_root, &second.request.provider_root);
+        second_handle.observe_provider().unwrap();
+        settle_shared_provider(&second_handle);
+
+        for (handle, title) in [
+            (&first_handle, "Café Plan"),
+            (&second_handle, "Cafe\u{301} Plan"),
+        ] {
+            let target = load_editor_id(handle, target_page_id);
+            assert_eq!(
+                retain_editor_save(
+                    handle,
+                    SyncEditorSaveRequest {
+                        target: SyncEditorSaveTarget::Existing {
+                            page_id: target.page_id,
+                            revision: target.revision,
+                        },
+                        preamble: Some(format!("title:: {title}")),
+                        blocks: target.blocks,
+                    },
+                ),
+                target_page_id
+            );
+            settle_shared_provider(handle);
+        }
+        assert!(matches!(
+            first_handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+        assert!(matches!(
+            second_handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+        drop(first_handle);
+        drop(second_handle);
+
+        copy_provider_tree(&first.request.provider_root, &second.request.provider_root);
+        copy_provider_tree(&second.request.provider_root, &first.request.provider_root);
+        let first_merged = active_handle(SyncRuntimeHandle::open(reopen_request(&first.request)));
+        let second_merged = active_handle(SyncRuntimeHandle::open(reopen_request(&second.request)));
+        let mut last_ticks = (SyncRuntimeTick::Idle, SyncRuntimeTick::Idle);
+        for _ in 0..256 {
+            let first_tick = first_merged.tick().unwrap();
+            let second_tick = second_merged.tick().unwrap();
+            last_ticks = (first_tick.clone(), second_tick.clone());
+            if matches!(first_tick, SyncRuntimeTick::Idle)
+                && matches!(second_tick, SyncRuntimeTick::Idle)
+                && first_merged.status().unwrap().provider_pending == 0
+                && second_merged.status().unwrap().provider_pending == 0
+            {
+                break;
+            }
+        }
+        let first_status = first_merged.status().unwrap();
+        let second_status = second_merged.status().unwrap();
+        let load = |handle: &SyncRuntimeHandle| {
+            handle
+                .load_editor_page(SyncEditorLoadRequest {
+                    page: SyncEditorPageSelector::PageId {
+                        page_id: target_page_id.to_string(),
+                    },
+                })
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "converged editor load failed: {error:?}; first={first_status:?}; \
+                         second={second_status:?}; last_ticks={last_ticks:?}"
+                    )
+                })
+        };
+        let first_page = match load(&first_merged) {
+            SyncEditorLoadOutcome::Loaded { page } => page,
+            outcome => panic!(
+                "first replica did not retain the concurrently titled page: {outcome:?}; \
+                 first={first_status:?}; second={second_status:?}; last_ticks={last_ticks:?}"
+            ),
+        };
+        let second_page = match load(&second_merged) {
+            SyncEditorLoadOutcome::Loaded { page } => page,
+            outcome => panic!(
+                "second replica did not retain the concurrently titled page: {outcome:?}; \
+                 first={first_status:?}; second={second_status:?}; last_ticks={last_ticks:?}"
+            ),
+        };
+        assert_eq!(
+            first_page.name, second_page.name,
+            "same provider union selected different exact authored titles; \
+             first={first_status:?}; second={second_status:?}; last_ticks={last_ticks:?}"
+        );
+        assert!(
+            ["Café Plan", "Cafe\u{301} Plan"].contains(&first_page.name.as_str()),
+            "winner must preserve one authored UTF-8 spelling"
+        );
+        assert_eq!(first_page.preamble, second_page.preamble);
+        assert_eq!(
+            first_page.preamble.as_deref(),
+            Some(format!("title:: {}", first_page.name).as_str())
+        );
+        for graph_root in [&first.graph_root, &second.graph_root] {
+            let parsed = Graph::open(graph_root)
+                .list_pages()
+                .into_iter()
+                .find(|entry| entry.rel_path == target_path)
+                .expect("independent graph parser lost the title target");
+            assert_eq!(
+                parsed.name, first_page.name,
+                "independent graph bytes disagree with the effective title at {graph_root:?}; \
+                 first={first_status:?}; second={second_status:?}; last_ticks={last_ticks:?}"
+            );
+        }
+        assert_eq!(
+            fs::read(first.graph_root.join(target_path)).unwrap(),
+            fs::read(second.graph_root.join(target_path)).unwrap()
+        );
+        for handle in [&first_merged, &second_merged] {
+            let sqlite_page = match handle
+                .query(SyncRuntimeQueryRequest::ListPages {
+                    page_kind: None,
+                    limit: MAX_MATERIALIZATION_QUERY_ROWS,
+                })
+                .unwrap()
+            {
+                SyncRuntimeQueryReply::Pages(pages) => pages
+                    .into_iter()
+                    .find(|page| page.page_id == target_page_id.to_string())
+                    .expect("SQLite lost the title target"),
+                other => panic!("SQLite page list returned the wrong reply: {other:?}"),
+            };
+            assert_eq!(sqlite_page.name, first_page.name);
+            assert_eq!(sqlite_page.path, target_path);
+        }
+
+        let (unrelated_batch, _, _, _) = submit_shared_page(
+            &first_merged,
+            0xe740,
+            "Unrelated After Title Race",
+            "notes/unrelated-after-title-race.md",
+            "unrelated catalog state must not change the selected exact title",
+        );
+        publish_shared_batch(&first_merged, &first, unrelated_batch);
+        settle_shared_provider(&first_merged);
+        copy_provider_tree(&first.request.provider_root, &second.request.provider_root);
+        second_merged.observe_provider().unwrap();
+        settle_shared_provider(&second_merged);
+        assert_eq!(
+            load_editor_id(&first_merged, target_page_id).name,
+            first_page.name
+        );
+        assert_eq!(
+            load_editor_id(&second_merged, target_page_id).name,
+            first_page.name
+        );
+
+        let provider_manifest_count = || {
+            fs::read_dir(first.request.provider_root.join("outbox/manifests"))
+                .unwrap()
+                .count()
+        };
+        let manifests_before_noop = provider_manifest_count();
+        first_merged
+            .observe_watcher(vec![
+                SyncWatcherObservation::managed_path(target_path).unwrap()
+            ])
+            .unwrap();
+        settle_exact_feed(&first_merged)
+            .unwrap_or_else(|state| panic!("unchanged title reimport did not settle: {state:?}"));
+        assert_eq!(
+            provider_manifest_count(),
+            manifests_before_noop,
+            "unchanged title reimport published a semantic batch"
+        );
+        assert!(matches!(
+            first_merged.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+        assert!(matches!(
+            second_merged.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+        drop(first_merged);
+        drop(second_merged);
+
+        let first_restarted =
+            active_handle(SyncRuntimeHandle::open(reopen_request(&first.request)));
+        let second_restarted =
+            active_handle(SyncRuntimeHandle::open(reopen_request(&second.request)));
+        drive_initial_feed(&first_restarted);
+        drive_initial_feed(&second_restarted);
+        let first_after_restart = load_editor_id(&first_restarted, target_page_id);
+        let second_after_restart = load_editor_id(&second_restarted, target_page_id);
+        assert_eq!(first_after_restart.name, first_page.name);
+        assert_eq!(second_after_restart.name, first_page.name);
+        assert_eq!(first_after_restart.preamble, first_page.preamble);
+        assert_eq!(second_after_restart.preamble, first_page.preamble);
+        for handle in [&first_restarted, &second_restarted] {
+            let sqlite_page = match handle
+                .query(SyncRuntimeQueryRequest::ListPages {
+                    page_kind: None,
+                    limit: MAX_MATERIALIZATION_QUERY_ROWS,
+                })
+                .unwrap()
+            {
+                SyncRuntimeQueryReply::Pages(pages) => pages
+                    .into_iter()
+                    .find(|page| page.page_id == target_page_id.to_string())
+                    .expect("second-restart SQLite lost the title target"),
+                other => panic!("second-restart SQLite returned the wrong reply: {other:?}"),
+            };
+            assert_eq!(sqlite_page.name, first_page.name);
+            assert_eq!(sqlite_page.path, target_path);
+        }
+        assert!(matches!(
+            first_restarted.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+        assert!(matches!(
+            second_restarted.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+    }
+
+    #[test]
+    fn concurrent_explicit_and_filename_fallback_titles_converge_in_both_winner_directions() {
+        fn run_case(label: &str, seed: u128, first_is_explicit: bool) -> bool {
+            let (first, second, first_handle, second_handle) = joined_shared_pair(label, seed);
+            let target_path = "notes/Café Plan.md";
+            let (target_batch, target_page_id, _, _) = submit_shared_page(
+                &first_handle,
+                seed + 0x20,
+                "Concurrent Original",
+                target_path,
+                "explicit versus fallback body",
+            );
+            publish_shared_batch(&first_handle, &first, target_batch);
+            settle_shared_provider(&first_handle);
+            copy_provider_tree(&first.request.provider_root, &second.request.provider_root);
+            second_handle.observe_provider().unwrap();
+            settle_shared_provider(&second_handle);
+            let common_title_batch = submit_durable(
+                &first_handle,
+                vec![SemanticOperation::SetPagePreamble {
+                    page_id: target_page_id,
+                    preamble: Some("title:: Concurrent Original".into()),
+                }],
+            );
+            publish_shared_batch(&first_handle, &first, common_title_batch);
+            settle_shared_provider(&first_handle);
+            copy_provider_tree(&first.request.provider_root, &second.request.provider_root);
+            second_handle.observe_provider().unwrap();
+            settle_shared_provider(&second_handle);
+
+            for (handle, explicit) in [
+                (&first_handle, first_is_explicit),
+                (&second_handle, !first_is_explicit),
+            ] {
+                let target = load_editor_id(handle, target_page_id);
+                assert_eq!(
+                    retain_editor_save(
+                        handle,
+                        SyncEditorSaveRequest {
+                            target: SyncEditorSaveTarget::Existing {
+                                page_id: target.page_id,
+                                revision: target.revision,
+                            },
+                            preamble: explicit.then(|| "title:: Cafe\u{301} Plan".to_owned()),
+                            blocks: target.blocks,
+                        },
+                    ),
+                    target_page_id
+                );
+                settle_shared_provider(handle);
+            }
+            assert!(matches!(
+                first_handle.clean_shutdown(),
+                Ok(SyncShutdownOutcome::Safe(_))
+            ));
+            assert!(matches!(
+                second_handle.clean_shutdown(),
+                Ok(SyncShutdownOutcome::Safe(_))
+            ));
+            drop(first_handle);
+            drop(second_handle);
+
+            copy_provider_tree(&first.request.provider_root, &second.request.provider_root);
+            copy_provider_tree(&second.request.provider_root, &first.request.provider_root);
+            let first_merged =
+                active_handle(SyncRuntimeHandle::open(reopen_request(&first.request)));
+            let second_merged =
+                active_handle(SyncRuntimeHandle::open(reopen_request(&second.request)));
+            for _ in 0..256 {
+                let first_tick = first_merged.tick().unwrap();
+                let second_tick = second_merged.tick().unwrap();
+                if matches!(first_tick, SyncRuntimeTick::Idle)
+                    && matches!(second_tick, SyncRuntimeTick::Idle)
+                    && first_merged.status().unwrap().provider_pending == 0
+                    && second_merged.status().unwrap().provider_pending == 0
+                {
+                    break;
+                }
+            }
+            assert_eq!(first_merged.status().unwrap().provider_pending, 0);
+            assert_eq!(second_merged.status().unwrap().provider_pending, 0);
+            let first_page = load_editor_id(&first_merged, target_page_id);
+            let second_page = load_editor_id(&second_merged, target_page_id);
+            assert_eq!(first_page.name, second_page.name);
+            assert_eq!(first_page.preamble, second_page.preamble);
+            let explicit_won = first_page.name == "Cafe\u{301} Plan";
+            if explicit_won {
+                assert_eq!(
+                    first_page.preamble.as_deref(),
+                    Some("title:: Cafe\u{301} Plan")
+                );
+            } else {
+                assert_eq!(first_page.name, "Café Plan");
+                assert!(
+                    first_page.preamble.as_deref().is_none_or(|preamble| {
+                        !preamble.lines().any(|line| {
+                            crate::doc::parse_property_line(line)
+                                .is_some_and(|(key, _)| key.eq_ignore_ascii_case("title"))
+                        })
+                    }),
+                    "selected filename fallback retained an explicit title"
+                );
+            }
+            for graph_root in [&first.graph_root, &second.graph_root] {
+                let parsed = Graph::open(graph_root)
+                    .list_pages()
+                    .into_iter()
+                    .find(|entry| entry.rel_path == target_path)
+                    .expect("explicit/fallback convergence lost the physical page");
+                assert_eq!(parsed.name, first_page.name);
+            }
+            assert_eq!(
+                fs::read(first.graph_root.join(target_path)).unwrap(),
+                fs::read(second.graph_root.join(target_path)).unwrap()
+            );
+            assert!(matches!(
+                first_merged.clean_shutdown(),
+                Ok(SyncShutdownOutcome::Safe(_))
+            ));
+            assert!(matches!(
+                second_merged.clean_shutdown(),
+                Ok(SyncShutdownOutcome::Safe(_))
+            ));
+            explicit_won
+        }
+
+        let first_assignment = run_case("explicit-fallback-first-explicit", 0xe800, true);
+        let reversed_assignment = run_case("explicit-fallback-first-fallback", 0xe900, false);
+        assert_ne!(
+            first_assignment, reversed_assignment,
+            "swapping explicit/fallback over fixed endpoint provenance must exercise both winners"
+        );
+    }
+
+    #[test]
+    fn effective_title_projection_authority_is_point_bounded_with_a_wide_unrelated_frontier() {
+        const UNRELATED_PAGES: usize = 24;
+        let (first, second, first_handle, second_handle) =
+            joined_shared_pair("effective-title-point-authority", 0xea00);
+        let target_path = "notes/effective-title-point-target.md";
+        let (target_batch, target_page_id, _, _) = submit_shared_page(
+            &first_handle,
+            0xea20,
+            "Point Authority Original",
+            target_path,
+            "point authority target",
+        );
+        publish_shared_batch(&first_handle, &first, target_batch);
+        settle_shared_provider(&first_handle);
+        copy_provider_tree(&first.request.provider_root, &second.request.provider_root);
+        second_handle.observe_provider().unwrap();
+        settle_shared_provider(&second_handle);
+
+        for index in 0..UNRELATED_PAGES {
+            let seed = 0xeb00 + (index as u128) * 4;
+            let (batch, ..) = submit_shared_page(
+                &first_handle,
+                seed,
+                &format!("Point Authority Unrelated {index}"),
+                &format!("notes/point-authority-unrelated-{index}.md"),
+                "unrelated accepted-frontier payload",
+            );
+            publish_shared_batch(&first_handle, &first, batch);
+        }
+        settle_shared_provider(&first_handle);
+        copy_provider_tree(&first.request.provider_root, &second.request.provider_root);
+        second_handle.observe_provider().unwrap();
+        settle_shared_provider(&second_handle);
+
+        for (handle, title) in [
+            (&first_handle, "Café Point Authority"),
+            (&second_handle, "Cafe\u{301} Point Authority"),
+        ] {
+            let target = load_editor_id(handle, target_page_id);
+            assert_eq!(
+                retain_editor_save(
+                    handle,
+                    SyncEditorSaveRequest {
+                        target: SyncEditorSaveTarget::Existing {
+                            page_id: target.page_id,
+                            revision: target.revision,
+                        },
+                        preamble: Some(format!("title:: {title}")),
+                        blocks: target.blocks,
+                    },
+                ),
+                target_page_id
+            );
+            settle_shared_provider(handle);
+        }
+
+        let first_before = first_handle.engine_instrumentation().unwrap();
+        let second_before = second_handle.engine_instrumentation().unwrap();
+        copy_provider_tree(&first.request.provider_root, &second.request.provider_root);
+        copy_provider_tree(&second.request.provider_root, &first.request.provider_root);
+        first_handle.observe_provider().unwrap();
+        second_handle.observe_provider().unwrap();
+        settle_shared_provider(&first_handle);
+        settle_shared_provider(&second_handle);
+        let first_after = first_handle.engine_instrumentation().unwrap();
+        let second_after = second_handle.engine_instrumentation().unwrap();
+
+        let authority_calls = first_after.effective_title_projection_authority_calls
+            - first_before.effective_title_projection_authority_calls
+            + second_after.effective_title_projection_authority_calls
+            - second_before.effective_title_projection_authority_calls;
+        let point_proofs = first_after.effective_title_projection_point_proofs
+            - first_before.effective_title_projection_point_proofs
+            + second_after.effective_title_projection_point_proofs
+            - second_before.effective_title_projection_point_proofs;
+        let frontier_head_visits = first_after.effective_title_projection_frontier_head_visits
+            - first_before.effective_title_projection_frontier_head_visits
+            + second_after.effective_title_projection_frontier_head_visits
+            - second_before.effective_title_projection_frontier_head_visits;
+        assert!(
+            authority_calls > 0,
+            "fixture did not exercise transient effective-title projection authority"
+        );
+        assert_eq!(
+            point_proofs,
+            authority_calls * 3,
+            "effective-title authority work must remain a fixed three point proofs per authentication"
+        );
+        assert_eq!(
+            frontier_head_visits, 0,
+            "effective-title authority enumerated direct dependency heads"
+        );
+        for (calls_before, calls_after, instrumentation) in [
+            (
+                first_before.effective_title_projection_authority_calls,
+                first_after.effective_title_projection_authority_calls,
+                first_after,
+            ),
+            (
+                second_before.effective_title_projection_authority_calls,
+                second_after.effective_title_projection_authority_calls,
+                second_after,
+            ),
+        ] {
+            if calls_after > calls_before {
+                assert!(
+                    instrumentation.effective_title_projection_max_accepted_documents
+                        >= UNRELATED_PAGES + 1,
+                    "point authority did not run against the deliberately wide accepted frontier"
+                );
+            }
+        }
+
+        let first_page = load_editor_id(&first_handle, target_page_id);
+        let second_page = load_editor_id(&second_handle, target_page_id);
+        assert_eq!(first_page.name, second_page.name);
+        assert_eq!(first_page.preamble, second_page.preamble);
+        assert!(["Café Point Authority", "Cafe\u{301} Point Authority"]
+            .contains(&first_page.name.as_str()));
+        assert_eq!(
+            first_page.preamble.as_deref(),
+            Some(format!("title:: {}", first_page.name).as_str())
+        );
+        for graph_root in [&first.graph_root, &second.graph_root] {
+            let parsed = Graph::open(graph_root)
+                .list_pages()
+                .into_iter()
+                .find(|entry| entry.rel_path == target_path)
+                .expect("wide-frontier convergence lost the physical target");
+            assert_eq!(parsed.name, first_page.name);
+        }
+        assert_eq!(
+            fs::read(first.graph_root.join(target_path)).unwrap(),
+            fs::read(second.graph_root.join(target_path)).unwrap()
+        );
+        assert!(matches!(
+            first_handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+        assert!(matches!(
+            second_handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+    }
+
+    #[test]
     fn closed_device_walks_only_an_unseen_linear_tail_from_latest_head() {
         let (initiator, receiver, initiator_handle, receiver_handle) =
             joined_shared_pair("provider-head-linear-tail", 0xb2e0);
