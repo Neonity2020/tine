@@ -26,6 +26,7 @@ import type {
   SyncIdentityPlan,
   ManagedSyncEnableResult,
   SparseV2Status,
+  SparseV2CancelResult,
   SparseV2Tick,
   SparseV2QueryRequest,
   SparseV2QueryReply,
@@ -234,6 +235,7 @@ export interface Backend {
   enableManagedSync(): Promise<ManagedSyncEnableResult>;
   sparseV2Status(): Promise<SparseV2Status>;
   activateSparseV2(): Promise<SparseV2Status>;
+  cancelSparseV2(): Promise<SparseV2CancelResult>;
   prepareSparseV2Share(): Promise<SparseV2Status>;
   joinSparseV2Shared(): Promise<SparseV2Status>;
   sparseV2Query(request: SparseV2QueryRequest): Promise<SparseV2QueryReply>;
@@ -697,6 +699,11 @@ class TauriBackend implements Backend {
   }
   async activateSparseV2() {
     const result = await this.call<SparseV2Status>("activate_sparse_v2");
+    this.bindingGeneration = result.binding_generation;
+    return result;
+  }
+  async cancelSparseV2() {
+    const result = await this.call<SparseV2CancelResult>("cancel_sparse_v2");
     this.bindingGeneration = result.binding_generation;
     return result;
   }

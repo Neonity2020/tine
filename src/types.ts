@@ -234,8 +234,16 @@ export type SparseV2Status = SparseV2Availability & {
   runtime: SparseV2RuntimeStatus | null;
   can_activate: boolean;
   can_retry: boolean;
+  can_cancel: boolean;
+  cancel_reason: string | null;
   binding_generation: number;
 };
+
+export interface SparseV2CancelResult {
+  status: SparseV2Status;
+  binding_generation: number;
+  recovery_statement: string;
+}
 
 export type SparseV2EntityId =
   | { entity_type: "page"; id: string }

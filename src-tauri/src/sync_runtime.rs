@@ -27,6 +27,7 @@ use uuid::Uuid;
 const BINDING_SCHEMA_VERSION: u32 = 2;
 const SPARSE_BINDING_DIR: &str = "sparse-v2";
 const SPARSE_BINDING_FILE: &str = "binding.json";
+const SPARSE_RECOVERY_DIR: &str = "sparse-v2-recovery";
 static BINDING_WRITE: Mutex<()> = Mutex::new(());
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
@@ -163,6 +164,13 @@ fn sparse_private_root(app: &tauri::AppHandle, graph_root: &Path) -> Result<Path
 
 fn binding_path(app: &tauri::AppHandle, graph_root: &Path) -> Result<PathBuf, String> {
     Ok(sparse_private_root(app, graph_root)?.join(SPARSE_BINDING_FILE))
+}
+
+fn sparse_recovery_root(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_data_dir()
+        .map(|root| root.join(SPARSE_RECOVERY_DIR))
+        .map_err(|error| format!("couldn't resolve private app-data directory: {error}"))
 }
 
 fn read_binding_at(
@@ -447,6 +455,8 @@ pub(crate) struct SparseV2StatusDto {
     runtime: Option<SparseV2RuntimeStatusDto>,
     can_activate: bool,
     can_retry: bool,
+    can_cancel: bool,
+    cancel_reason: Option<String>,
     binding_generation: u64,
 }
 
@@ -457,6 +467,8 @@ impl SparseV2StatusDto {
             runtime: None,
             can_activate: true,
             can_retry: false,
+            can_cancel: false,
+            cancel_reason: None,
             binding_generation,
         }
     }
@@ -472,6 +484,11 @@ impl SparseV2StatusDto {
             runtime: None,
             can_activate: false,
             can_retry: false,
+            can_cancel: false,
+            cancel_reason: Some(
+                "This graph exposes shared sparse-v2 enrollment evidence; cancellation is unsafe."
+                    .into(),
+            ),
             binding_generation,
         }
     }
@@ -508,12 +525,22 @@ impl SparseV2StatusDto {
             runtime,
             can_activate: false,
             can_retry,
+            can_cancel: false,
+            cancel_reason: None,
             binding_generation,
         }
     }
 }
 
 pub(crate) fn runtime_status(snapshot: SyncRuntimeStatusSnapshot) -> SparseV2RuntimeStatusDto {
+    // Core's bounded provider diagnostic includes an uninitialized recovery-
+    // coverage sentinel even for a purely local runtime. At the app boundary it
+    // is provider work only once a shared role/phase exists.
+    let provider_pending = if snapshot.shared_role.is_some() || snapshot.shared_phase.is_some() {
+        snapshot.provider_pending
+    } else {
+        0
+    };
     SparseV2RuntimeStatusDto {
         lifecycle: match snapshot.lifecycle {
             SyncRuntimeLifecycle::Active => "active",
@@ -552,7 +579,7 @@ pub(crate) fn runtime_status(snapshot: SyncRuntimeStatusSnapshot) -> SparseV2Run
             SyncSharedPhase::Joining => "joining".into(),
             SyncSharedPhase::Active => "active".into(),
         }),
-        provider_pending: snapshot.provider_pending,
+        provider_pending,
     }
 }
 
@@ -591,6 +618,60 @@ pub(crate) fn shutdown_status(outcome: SyncShutdownOutcome) -> SparseV2RuntimeSt
             runtime_status(snapshot)
         }
     }
+}
+
+fn provider_namespace_has_evidence(path: &Path) -> Result<bool, String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "couldn't inspect sparse-v2 provider evidence: {error}"
+        )),
+    }
+}
+
+fn binding_names_shared_state(binding: &SparseV2Binding) -> bool {
+    matches!(
+        binding.availability(),
+        SparseV2Availability::Retryable { stage, .. }
+            if matches!(
+                stage.as_str(),
+                "share_prepared" | "joining" | "shared_active"
+            )
+    )
+}
+
+fn cancel_eligibility(binding: &SparseV2Binding, provider_namespace: &Path) -> Result<(), String> {
+    let provider_evidence = provider_namespace_has_evidence(provider_namespace)?;
+    if binding_names_shared_state(binding) {
+        return Err(
+            "This sparse-v2 binding has entered shared enrollment, so returning to standard Markdown mode is unsafe."
+                .into(),
+        );
+    }
+    if let Some(handle) = binding.handle() {
+        let status = handle
+            .status()
+            .map_err(|error| format!("couldn't prove sparse-v2 rollback is local: {error}"))?;
+        let names_shared_runtime = status.shared_role.is_some() || status.shared_phase.is_some();
+        // A local-only core snapshot currently counts its absent provider
+        // recovery-coverage sentinel as one pending item. It cannot represent
+        // provider work when both shared runtime identity and the complete
+        // graph-local provider namespace are absent.
+        if names_shared_runtime || (status.provider_pending != 0 && provider_evidence) {
+            return Err(
+                "This sparse-v2 runtime names shared/provider work, so returning to standard Markdown mode is unsafe."
+                    .into(),
+            );
+        }
+    }
+    if provider_evidence {
+        return Err(
+            "Shared/provider sparse-v2 evidence exists, so returning to standard Markdown mode is unsafe."
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 #[derive(Default)]
@@ -678,18 +759,35 @@ fn active_handle(
         .ok_or_else(|| SPARSE_V2_NOT_ACTIVE.to_string())
 }
 
-#[tauri::command]
-pub(crate) fn sparse_v2_status(
-    state: crate::state::GraphContext<'_>,
-) -> Result<SparseV2StatusDto, String> {
-    let slot = crate::state::slot_for_context(&state)?;
+fn sparse_v2_status_for_slot(slot: &crate::state::GraphSlot) -> Result<SparseV2StatusDto, String> {
     Ok(match slot.sparse_binding() {
-        Some(binding) => SparseV2StatusDto::from_binding(binding, slot.binding_generation),
+        Some(binding) => {
+            let mut status = SparseV2StatusDto::from_binding(binding, slot.binding_generation);
+            match cancel_eligibility(binding, &slot.root_key.join(".tine-sync/v2")) {
+                Ok(()) => {
+                    status.can_cancel = true;
+                    status.cancel_reason = None;
+                }
+                Err(reason) => {
+                    status.can_cancel = false;
+                    status.cancel_reason = Some(reason);
+                }
+            }
+            status
+        }
         None => match inspect_shared_enrollment(&slot.root_key.join(".tine-sync/v2/shared"))? {
             Some(descriptor) => SparseV2StatusDto::joinable(slot.binding_generation, &descriptor),
             None => SparseV2StatusDto::legacy(slot.binding_generation),
         },
     })
+}
+
+#[tauri::command]
+pub(crate) fn sparse_v2_status(
+    state: crate::state::GraphContext<'_>,
+) -> Result<SparseV2StatusDto, String> {
+    let slot = crate::state::slot_for_context(&state)?;
+    sparse_v2_status_for_slot(&slot)
 }
 
 /// Explicitly retire one legacy authority and activate/resume sparse v2.
@@ -712,10 +810,7 @@ pub(crate) fn activate_sparse_v2(
     if let Some(binding) = slot.sparse_binding() {
         let action = binding.action();
         if action == SparseV2BindingAction::ReturnRetained {
-            return Ok(SparseV2StatusDto::from_binding(
-                binding,
-                slot.binding_generation,
-            ));
+            return sparse_v2_status_for_slot(&slot);
         }
         let record = state
             .state
@@ -744,12 +839,7 @@ pub(crate) fn activate_sparse_v2(
             .unwrap()
             .bind(label, Arc::clone(&replacement))?;
         crate::state::poke_watcher(&state.state);
-        return Ok(SparseV2StatusDto::from_binding(
-            replacement
-                .sparse_binding()
-                .expect("replacement is sparse v2"),
-            replacement.binding_generation,
-        ));
+        return sparse_v2_status_for_slot(&replacement);
     }
 
     let graph = slot.legacy_graph()?;
@@ -811,12 +901,186 @@ pub(crate) fn activate_sparse_v2(
         .unwrap()
         .bind(label, Arc::clone(&replacement))?;
     crate::state::poke_watcher(&state.state);
-    Ok(SparseV2StatusDto::from_binding(
-        replacement
-            .sparse_binding()
-            .expect("replacement is sparse v2"),
-        replacement.binding_generation,
-    ))
+    sparse_v2_status_for_slot(&replacement)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub(crate) struct SparseV2CancelResult {
+    status: SparseV2StatusDto,
+    binding_generation: u64,
+    recovery_statement: String,
+}
+
+fn archive_private_root(private_root: &Path, recovery_root: &Path) -> Result<PathBuf, String> {
+    let metadata = std::fs::symlink_metadata(private_root)
+        .map_err(|error| format!("couldn't inspect sparse-v2 private state: {error}"))?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err("sparse-v2 private state is not a local directory; rollback refused".into());
+    }
+    std::fs::create_dir_all(recovery_root)
+        .map_err(|error| format!("couldn't prepare sparse-v2 recovery storage: {error}"))?;
+    let key = private_root
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or("sparse-v2 private state has no valid local key")?;
+    let destination = recovery_root.join(format!("{key}-{}", Uuid::new_v4()));
+    std::fs::rename(private_root, &destination).map_err(|error| {
+        format!("couldn't preserve sparse-v2 recovery state atomically: {error}")
+    })?;
+    Ok(destination)
+}
+
+fn require_safe_sparse_shutdown(slot: &crate::state::GraphSlot) -> Result<(), String> {
+    let Some(handle) = slot.sparse_runtime() else {
+        return Ok(());
+    };
+    match handle.clean_shutdown() {
+        Ok(SyncShutdownOutcome::Safe(_)) => Ok(()),
+        Ok(SyncShutdownOutcome::Terminal(_)) => {
+            Err("sparse-v2 clean shutdown did not prove a safe local stop".into())
+        }
+        Err(error) => Err(format!("sparse-v2 clean shutdown refused: {error}")),
+    }
+}
+
+fn restore_sparse_slot(
+    state: &crate::state::AppState,
+    label: &str,
+    slot: Arc<crate::state::GraphSlot>,
+    reason: String,
+) -> Result<SparseV2CancelResult, String> {
+    state
+        .graphs
+        .write()
+        .unwrap()
+        .bind(label.to_string(), slot)
+        .map_err(|restore| {
+            format!("{reason}; sparse authority could not be restored in memory: {restore}")
+        })?;
+    crate::state::poke_watcher(state);
+    Err(reason)
+}
+
+fn cancel_sparse_v2_at_paths_with_archive(
+    state: &crate::state::AppState,
+    label: &str,
+    slot: Arc<crate::state::GraphSlot>,
+    private_root: &Path,
+    recovery_root: &Path,
+    approved_assets: Option<&Path>,
+    shutdown: impl FnOnce(&crate::state::GraphSlot) -> Result<(), String>,
+    archive: impl FnOnce(&Path, &Path) -> Result<PathBuf, String>,
+) -> Result<SparseV2CancelResult, String> {
+    let binding = slot
+        .sparse_binding()
+        .ok_or("this graph is already using standard Markdown authority")?;
+    let record = read_binding_at(&private_root.join(SPARSE_BINDING_FILE), &slot.root_key)?
+        .ok_or("the exact sparse-v2 binding for this graph is missing")?;
+    if record.graph_meta.root != slot.root_key.display().to_string()
+        || slot.graph_meta().root != record.graph_meta.root
+    {
+        return Err("the sparse-v2 slot and persisted binding do not name the exact graph".into());
+    }
+    cancel_eligibility(binding, &slot.root_key.join(".tine-sync/v2"))?;
+
+    let removed = state.graphs.write().unwrap().remove(label);
+    if removed.is_some() {
+        crate::state::poke_watcher(state);
+    }
+    if removed.as_ref().is_none_or(|current| {
+        current.binding_generation != slot.binding_generation || current.root_key != slot.root_key
+    }) {
+        if let Some(current) = removed {
+            state
+                .graphs
+                .write()
+                .unwrap()
+                .bind(label.to_string(), current)?;
+            crate::state::poke_watcher(state);
+        }
+        return Err("graph binding changed during sparse-v2 rollback".into());
+    }
+
+    if let Err(error) = shutdown(&slot) {
+        return restore_sparse_slot(state, label, slot, error);
+    }
+
+    if let Err(error) = archive(private_root, recovery_root) {
+        return restore_sparse_slot(state, label, slot, error);
+    }
+
+    let graph = tine_core::model::Graph::open_checked_with_assets(
+        &record.graph_root,
+        approved_assets,
+    )
+    .map_err(|error| {
+        format!(
+            "Sparse-v2 state was safely preserved, but standard Markdown could not reopen: {error}. Restart Tine to reopen the unchanged Markdown graph."
+        )
+    })?;
+    let replacement = Arc::new(crate::state::GraphSlot::new(graph, slot.root_key.clone()));
+    state
+        .graphs
+        .write()
+        .unwrap()
+        .bind(label.to_string(), Arc::clone(&replacement))
+        .map_err(|error| {
+            format!(
+                "Sparse-v2 state was safely preserved, but standard Markdown could not be rebound: {error}. Restart Tine to reopen the unchanged Markdown graph."
+            )
+        })?;
+    crate::state::poke_watcher(state);
+    let status = SparseV2StatusDto::legacy(replacement.binding_generation);
+    Ok(SparseV2CancelResult {
+        binding_generation: replacement.binding_generation,
+        status,
+        recovery_statement:
+            "Standard Markdown mode is active. The complete private sparse-v2 state was preserved in app recovery storage."
+                .into(),
+    })
+}
+
+fn cancel_sparse_v2_at_paths(
+    state: &crate::state::AppState,
+    label: &str,
+    slot: Arc<crate::state::GraphSlot>,
+    private_root: &Path,
+    recovery_root: &Path,
+    approved_assets: Option<&Path>,
+    shutdown: impl FnOnce(&crate::state::GraphSlot) -> Result<(), String>,
+) -> Result<SparseV2CancelResult, String> {
+    cancel_sparse_v2_at_paths_with_archive(
+        state,
+        label,
+        slot,
+        private_root,
+        recovery_root,
+        approved_assets,
+        shutdown,
+        archive_private_root,
+    )
+}
+
+#[tauri::command]
+pub(crate) fn cancel_sparse_v2(
+    app: tauri::AppHandle,
+    state: crate::state::GraphContext<'_>,
+) -> Result<SparseV2CancelResult, String> {
+    let label = state.window.label().to_string();
+    let _transition = state.state.graph_load.lock().unwrap();
+    let slot = crate::state::slot_for_context(&state)?;
+    let private_root = sparse_private_root(&app, &slot.root_key)?;
+    let recovery_root = sparse_recovery_root(&app)?;
+    let approved_assets = crate::settings::approved_external_assets(&app, &slot.root_key);
+    cancel_sparse_v2_at_paths(
+        &state.state,
+        &label,
+        slot,
+        &private_root,
+        &recovery_root,
+        approved_assets.as_deref(),
+        require_safe_sparse_shutdown,
+    )
 }
 
 /// Publish the already-safe local archive into the single shared v2
@@ -867,12 +1131,7 @@ pub(crate) fn prepare_sparse_v2_share(
         .unwrap()
         .bind(label, Arc::clone(&replacement))?;
     crate::state::poke_watcher(&state.state);
-    Ok(SparseV2StatusDto::from_binding(
-        replacement
-            .sparse_binding()
-            .expect("replacement is sparse v2"),
-        replacement.binding_generation,
-    ))
+    sparse_v2_status_for_slot(&replacement)
 }
 
 /// Explicitly retire the second device's legacy reader/watcher, derive its
@@ -926,12 +1185,7 @@ pub(crate) fn join_sparse_v2_shared(
             .unwrap()
             .bind(label, Arc::clone(&replacement))?;
         crate::state::poke_watcher(&state.state);
-        return Ok(SparseV2StatusDto::from_binding(
-            replacement
-                .sparse_binding()
-                .expect("replacement is sparse v2"),
-            replacement.binding_generation,
-        ));
+        return sparse_v2_status_for_slot(&replacement);
     }
     let graph = slot.legacy_graph()?;
     let graph_meta = graph.meta();
@@ -1067,12 +1321,7 @@ pub(crate) fn join_sparse_v2_shared(
         .unwrap()
         .bind(label, Arc::clone(&replacement))?;
     crate::state::poke_watcher(&state.state);
-    Ok(SparseV2StatusDto::from_binding(
-        replacement
-            .sparse_binding()
-            .expect("replacement is sparse v2"),
-        replacement.binding_generation,
-    ))
+    sparse_v2_status_for_slot(&replacement)
 }
 
 #[tauri::command]
@@ -1146,6 +1395,7 @@ pub(crate) fn clean_shutdown_slot(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use tine_core::model::Graph;
     use tine_core::sync_runtime::{
         SyncEditorBlockDto, SyncEditorBlockKey, SyncEditorLoadOutcome, SyncEditorLoadRequest,
@@ -1153,6 +1403,427 @@ mod tests {
         SyncEntityId, SyncPageKind, SyncPageNameResolutionDto, SyncRuntimeQueryReply,
         SyncRuntimeQueryRequest, SyncSearchHitDto, SyncWatcherObservation,
     };
+
+    struct RollbackFixture {
+        root: PathBuf,
+        graph_root: PathBuf,
+        private_root: PathBuf,
+        recovery_root: PathBuf,
+        markdown_path: PathBuf,
+        markdown_bytes: Vec<u8>,
+        binding_bytes: Vec<u8>,
+        state: crate::state::AppState,
+        slot: Arc<crate::state::GraphSlot>,
+    }
+
+    impl RollbackFixture {
+        fn new(stage: Option<&str>) -> Self {
+            let root =
+                std::env::temp_dir().join(format!("tine-sparse-rollback-{}", Uuid::new_v4()));
+            let graph_root = root.join("graph");
+            let private_root = root.join("app-data/sparse-v2/graph-key");
+            let recovery_root = root.join("app-data/sparse-v2-recovery");
+            let markdown_path = graph_root.join("pages/rollback.md");
+            let markdown_bytes = b"- Markdown remains authoritative\n".to_vec();
+            std::fs::create_dir_all(graph_root.join("pages")).unwrap();
+            std::fs::create_dir_all(graph_root.join("journals")).unwrap();
+            std::fs::write(&markdown_path, &markdown_bytes).unwrap();
+            let graph = Graph::open(&graph_root);
+            let meta = graph.meta();
+            drop(graph);
+            let record = SparseV2ActivationRecord::new(&graph_root, meta.clone(), DeviceId::new());
+            persist_binding_at(&private_root.join(SPARSE_BINDING_FILE), &record).unwrap();
+            std::fs::write(private_root.join("diagnostic-bytes"), b"preserve exactly").unwrap();
+            let binding_bytes = std::fs::read(private_root.join(SPARSE_BINDING_FILE)).unwrap();
+            let binding = retryable_binding(
+                stage.unwrap_or("shadow_import"),
+                "incomplete local activation".into(),
+            );
+            let slot = Arc::new(crate::state::GraphSlot::from_sparse_v2(
+                binding,
+                graph_root.clone(),
+                meta,
+            ));
+            let state = crate::state::AppState {
+                graphs: std::sync::RwLock::new(crate::state::GraphRegistry::default()),
+                graph_load: Mutex::new(()),
+                watch_ctl: Mutex::new(None),
+                last_focused: Mutex::new(None),
+                capture_graph: Mutex::new(None),
+                sync_runtime: SyncRuntimeFacade,
+                #[cfg(desktop)]
+                next_window: std::sync::atomic::AtomicU64::new(1),
+            };
+            state
+                .graphs
+                .write()
+                .unwrap()
+                .bind("main".into(), Arc::clone(&slot))
+                .unwrap();
+            Self {
+                root,
+                graph_root,
+                private_root,
+                recovery_root,
+                markdown_path,
+                markdown_bytes,
+                binding_bytes,
+                state,
+                slot,
+            }
+        }
+
+        fn make_active(&mut self) {
+            let record = read_binding_at(
+                &self.private_root.join(SPARSE_BINDING_FILE),
+                &self.graph_root,
+            )
+            .unwrap()
+            .unwrap();
+            let activated =
+                SyncRuntimeHandle::activate_or_resume_local(SyncLocalActivationRequest {
+                    graph_root: self.graph_root.clone(),
+                    archive_root: self.private_root.join("archive"),
+                    enrollment_root: self.private_root.join("enrollment"),
+                    receipt_root: self.private_root.join("receipts"),
+                    database_path: self.private_root.join("projection/materialization.sqlite"),
+                    application_runtime_root: self.private_root.join("runtime"),
+                    migration_backup_root: self.private_root.join("migration-backup"),
+                    capture_root: self.private_root.join("capture"),
+                    preparation_root: self.private_root.join("preparation"),
+                    provider_root: self.graph_root.join(".tine-sync/v2/shared"),
+                    provider_journal_root: self.private_root.join("provider/device/journal"),
+                    identities: SyncLocalActivationIdentities {
+                        workspace_id: record.workspace_id,
+                        lineage_digest: record.lineage_digest,
+                        catalog_document_id: record.catalog_document_id,
+                        endpoint_id: record.endpoint_id,
+                        device_id: record.device_id,
+                        preparation_id: record.preparation_id,
+                        session_id: record.activation_session_id,
+                    },
+                });
+            assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+            let active = Arc::new(crate::state::GraphSlot::from_sparse_v2(
+                SparseV2Binding::from_activation(activated),
+                self.graph_root.clone(),
+                SyncRuntimeFacade::graph_meta(&record),
+            ));
+            self.state
+                .graphs
+                .write()
+                .unwrap()
+                .bind("main".into(), Arc::clone(&active))
+                .unwrap();
+            self.slot = active;
+            self.binding_bytes =
+                std::fs::read(self.private_root.join(SPARSE_BINDING_FILE)).unwrap();
+        }
+    }
+
+    impl Drop for RollbackFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn snapshot_tree(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        fn visit(base: &Path, current: &Path, found: &mut BTreeMap<PathBuf, Vec<u8>>) {
+            let mut entries = std::fs::read_dir(current)
+                .unwrap()
+                .map(|entry| entry.unwrap())
+                .collect::<Vec<_>>();
+            entries.sort_by_key(|entry| entry.file_name());
+            for entry in entries {
+                let path = entry.path();
+                if entry.file_type().unwrap().is_dir() {
+                    visit(base, &path, found);
+                } else {
+                    found.insert(
+                        path.strip_prefix(base).unwrap().to_path_buf(),
+                        std::fs::read(path).unwrap(),
+                    );
+                }
+            }
+        }
+        let mut found = BTreeMap::new();
+        if root.is_dir() {
+            visit(root, root, &mut found);
+        }
+        found
+    }
+
+    #[test]
+    fn transition_status_uses_the_exact_slots_rollback_eligibility() {
+        let local = RollbackFixture::new(Some("shadow_import"));
+        let local_status = sparse_v2_status_for_slot(&local.slot).unwrap();
+        assert!(matches!(
+            local_status.availability,
+            SparseV2Availability::Retryable { ref stage, .. } if stage == "shadow_import"
+        ));
+        assert!(local_status.can_cancel);
+        assert_eq!(local_status.cancel_reason, None);
+        assert_eq!(
+            local_status.binding_generation,
+            local.slot.binding_generation
+        );
+
+        for stage in ["share_prepared", "joining", "shared_active"] {
+            let shared = RollbackFixture::new(Some(stage));
+            let shared_status = sparse_v2_status_for_slot(&shared.slot).unwrap();
+            assert!(!shared_status.can_cancel, "{stage}");
+            assert!(
+                shared_status
+                    .cancel_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("entered shared enrollment")),
+                "{stage}: {:?}",
+                shared_status.cancel_reason
+            );
+        }
+
+        let provider = RollbackFixture::new(Some("shadow_import"));
+        std::fs::create_dir_all(provider.graph_root.join(".tine-sync/v2")).unwrap();
+        let provider_status = sparse_v2_status_for_slot(&provider.slot).unwrap();
+        assert!(!provider_status.can_cancel);
+        assert!(provider_status
+            .cancel_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("Shared/provider")));
+    }
+
+    #[test]
+    fn incomplete_local_activation_retires_without_touching_markdown_and_preserves_private_bytes() {
+        let fixture = RollbackFixture::new(Some("shadow_import"));
+        let result = cancel_sparse_v2_at_paths(
+            &fixture.state,
+            "main",
+            Arc::clone(&fixture.slot),
+            &fixture.private_root,
+            &fixture.recovery_root,
+            None,
+            require_safe_sparse_shutdown,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            result.status.availability,
+            SparseV2Availability::LegacyDefault
+        ));
+        assert_eq!(result.binding_generation, result.status.binding_generation);
+        assert!(result
+            .recovery_statement
+            .contains("complete private sparse-v2 state"));
+        assert!(!fixture.private_root.exists());
+        let archives = std::fs::read_dir(&fixture.recovery_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(archives.len(), 1);
+        assert_eq!(
+            std::fs::read(archives[0].join(SPARSE_BINDING_FILE)).unwrap(),
+            fixture.binding_bytes
+        );
+        assert_eq!(
+            std::fs::read(archives[0].join("diagnostic-bytes")).unwrap(),
+            b"preserve exactly"
+        );
+        assert_eq!(
+            std::fs::read(&fixture.markdown_path).unwrap(),
+            fixture.markdown_bytes
+        );
+        assert!(fixture
+            .state
+            .graphs
+            .read()
+            .unwrap()
+            .slot("main")
+            .unwrap()
+            .legacy_graph()
+            .is_ok());
+        assert!(read_binding_at(
+            &fixture.private_root.join(SPARSE_BINDING_FILE),
+            &fixture.graph_root
+        )
+        .unwrap()
+        .is_none());
+        assert!(Graph::open_checked(&fixture.graph_root).is_ok());
+    }
+
+    #[test]
+    fn active_local_rollback_requires_and_completes_a_clean_safe_shutdown() {
+        std::thread::Builder::new()
+            .name("tine-sparse-active-rollback-test".into())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(active_local_rollback_requires_and_completes_a_clean_safe_shutdown_inner)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn active_local_rollback_requires_and_completes_a_clean_safe_shutdown_inner() {
+        let mut fixture = RollbackFixture::new(Some("shadow_import"));
+        fixture.make_active();
+        let handle = fixture.slot.sparse_runtime().unwrap();
+        for _ in 0..128 {
+            let before = handle.status().unwrap();
+            if !before.watcher.pending && before.provider_pending == 0 {
+                break;
+            }
+            handle.tick().unwrap();
+        }
+        let before = fixture.slot.sparse_runtime().unwrap().status().unwrap();
+        assert_eq!(before.lifecycle, SyncRuntimeLifecycle::Active);
+        assert!(
+            before.shared_role.is_none() && before.shared_phase.is_none(),
+            "fresh local activation unexpectedly named shared work: {before:?}"
+        );
+        assert_eq!(runtime_status(before).provider_pending, 0);
+
+        cancel_sparse_v2_at_paths(
+            &fixture.state,
+            "main",
+            Arc::clone(&fixture.slot),
+            &fixture.private_root,
+            &fixture.recovery_root,
+            None,
+            require_safe_sparse_shutdown,
+        )
+        .unwrap();
+
+        assert_eq!(
+            fixture
+                .slot
+                .sparse_runtime()
+                .unwrap()
+                .status()
+                .unwrap()
+                .lifecycle,
+            SyncRuntimeLifecycle::StoppedSafe
+        );
+        assert!(fixture
+            .state
+            .graphs
+            .read()
+            .unwrap()
+            .slot("main")
+            .unwrap()
+            .legacy_graph()
+            .is_ok());
+    }
+
+    #[test]
+    fn shutdown_refusal_restores_sparse_authority_and_changes_no_durable_bytes() {
+        let fixture = RollbackFixture::new(Some("shadow_import"));
+        let private_before = snapshot_tree(&fixture.private_root);
+        let markdown_before = std::fs::read(&fixture.markdown_path).unwrap();
+        let generation = fixture.slot.binding_generation;
+
+        let error = cancel_sparse_v2_at_paths(
+            &fixture.state,
+            "main",
+            Arc::clone(&fixture.slot),
+            &fixture.private_root,
+            &fixture.recovery_root,
+            None,
+            |_| Err("injected clean shutdown refusal".into()),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("injected clean shutdown refusal"));
+        let restored = fixture.state.graphs.read().unwrap().slot("main").unwrap();
+        assert!(restored.is_sparse_v2());
+        assert_eq!(restored.binding_generation, generation);
+        assert_eq!(snapshot_tree(&fixture.private_root), private_before);
+        assert_eq!(
+            std::fs::read(&fixture.markdown_path).unwrap(),
+            markdown_before
+        );
+        assert!(!fixture.recovery_root.exists());
+    }
+
+    #[test]
+    fn archive_rename_failure_restores_the_same_sparse_slot_and_all_bytes() {
+        let fixture = RollbackFixture::new(Some("shadow_import"));
+        let private_before = snapshot_tree(&fixture.private_root);
+        let markdown_before = std::fs::read(&fixture.markdown_path).unwrap();
+        let generation = fixture.slot.binding_generation;
+
+        let error = cancel_sparse_v2_at_paths_with_archive(
+            &fixture.state,
+            "main",
+            Arc::clone(&fixture.slot),
+            &fixture.private_root,
+            &fixture.recovery_root,
+            None,
+            |_| {
+                assert!(fixture.state.graphs.read().unwrap().slot("main").is_none());
+                Ok(())
+            },
+            |private_root, recovery_root| {
+                assert_eq!(private_root, fixture.private_root);
+                assert_eq!(recovery_root, fixture.recovery_root);
+                assert!(fixture.state.graphs.read().unwrap().slot("main").is_none());
+                Err("injected archive rename failure".into())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("injected archive rename failure"));
+        let restored = fixture.state.graphs.read().unwrap().slot("main").unwrap();
+        assert!(Arc::ptr_eq(&restored, &fixture.slot));
+        assert_eq!(restored.binding_generation, generation);
+        assert_eq!(snapshot_tree(&fixture.private_root), private_before);
+        assert_eq!(
+            std::fs::read(&fixture.markdown_path).unwrap(),
+            markdown_before
+        );
+        assert!(!fixture.recovery_root.exists());
+    }
+
+    #[test]
+    fn any_shared_or_provider_evidence_refuses_rollback_before_shutdown() {
+        let provider = RollbackFixture::new(Some("shadow_import"));
+        std::fs::create_dir_all(provider.graph_root.join(".tine-sync/v2")).unwrap();
+        std::fs::write(
+            provider.graph_root.join(".tine-sync/v2/provider-evidence"),
+            b"shared",
+        )
+        .unwrap();
+        let provider_error = cancel_sparse_v2_at_paths(
+            &provider.state,
+            "main",
+            Arc::clone(&provider.slot),
+            &provider.private_root,
+            &provider.recovery_root,
+            None,
+            |_| panic!("provider evidence must refuse before shutdown"),
+        )
+        .unwrap_err();
+        assert!(provider_error.contains("Shared/provider"));
+        assert!(provider
+            .state
+            .graphs
+            .read()
+            .unwrap()
+            .slot("main")
+            .unwrap()
+            .is_sparse_v2());
+
+        let shared = RollbackFixture::new(Some("joining"));
+        let shared_error = cancel_sparse_v2_at_paths(
+            &shared.state,
+            "main",
+            Arc::clone(&shared.slot),
+            &shared.private_root,
+            &shared.recovery_root,
+            None,
+            |_| panic!("shared lifecycle must refuse before shutdown"),
+        )
+        .unwrap_err();
+        assert!(shared_error.contains("entered shared enrollment"));
+        assert!(shared.private_root.exists());
+    }
 
     #[test]
     fn facade_legacy_default_inspects_nothing_and_retains_nothing() {

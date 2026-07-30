@@ -637,6 +637,8 @@ export function mockBackend(): Backend {
     runtime: null,
     can_activate: true,
     can_retry: false,
+    can_cancel: false,
+    cancel_reason: null,
     binding_generation: 1,
   };
   const find = (name: string) =>
@@ -910,9 +912,28 @@ export function mockBackend(): Backend {
         },
         can_activate: false,
         can_retry: false,
+        can_cancel: true,
+        cancel_reason: null,
         binding_generation: sparseV2.binding_generation + 1,
       };
       return sparseV2;
+    },
+    async cancelSparseV2() {
+      sparseV2 = {
+        state: "legacy_default",
+        runtime: null,
+        can_activate: true,
+        can_retry: false,
+        can_cancel: false,
+        cancel_reason: null,
+        binding_generation: sparseV2.binding_generation + 1,
+      };
+      return {
+        status: sparseV2,
+        binding_generation: sparseV2.binding_generation,
+        recovery_statement:
+          "Standard Markdown mode is active. The complete private sparse-v2 state was preserved in app recovery storage.",
+      };
     },
     async prepareSparseV2Share() {
       if (!sparseV2.runtime) throw new Error("sparse v2 is not active");

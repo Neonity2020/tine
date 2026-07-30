@@ -8,6 +8,7 @@ import {
   clearSettingsTabRequest,
   setJournalTemplate,
   setGraphTransitioning,
+  bumpGraphEpoch,
   theme,
   toggleTheme,
   workflow,
@@ -105,7 +106,7 @@ import { openPage, openFile } from "../router";
 import { commandDefaults, eventToBindingString, setKeybindingsSuspended } from "../keybindings";
 import { ShortcutsSettingsPane } from "./HelpShortcuts";
 import { switchGraph, loadGraphPath } from "../graph";
-import { flushAll } from "../store";
+import { flushAll, resetStore } from "../store";
 import { backend, isTauri, type BackupInfo } from "../backend";
 import type { AssetInfo, TrashStats, JournalFile, SyncConflict, SyncConflictDiff, DiffRow, MergeDecision, SparseV2Status } from "../types";
 import { formatJournal } from "../journal";
@@ -1884,6 +1885,7 @@ function ManagedSyncPanel(): JSX.Element {
   const [loading, setLoading] = createSignal(true);
   const [enabling, setEnabling] = createSignal(false);
   const [sharing, setSharing] = createSignal(false);
+  const [cancelling, setCancelling] = createSignal(false);
   const retryable = () => {
     const value = status();
     return value?.state === "retryable" ? value : null;
@@ -1909,6 +1911,20 @@ function ManagedSyncPanel(): JSX.Element {
   };
   onMount(() => void refresh());
 
+  const refreshAuthorityState = () => {
+    resetStore();
+    bumpGraphEpoch();
+  };
+
+  const failureDetail = (value: SparseV2Status): string => {
+    if (value.state === "retryable") return value.detail;
+    if (value.state === "refused") {
+      return value.detail ? `${value.reason_code}: ${value.detail}` : value.reason_code;
+    }
+    if (value.state === "blocked") return value.reason_code;
+    return "Sparse-v2 activation did not become active.";
+  };
+
   const enable = async () => {
     setEnabling(true);
     setGraphTransitioning(true);
@@ -1927,12 +1943,11 @@ function ManagedSyncPanel(): JSX.Element {
       if (!confirmed) return;
       const result = await backend().activateSparseV2();
       setStatus(result);
+      refreshAuthorityState();
       if (result.state === "active") {
         pushToast("Sparse-v2 operation-log authority is active.", "success");
-      } else if (result.state === "retryable") {
-        pushToast(`Sparse-v2 activation can be retried from ${result.stage}.`, "error");
       } else {
-        pushToast("Sparse-v2 activation is blocked; the graph was not returned to legacy writes.", "error");
+        pushToast(`Sparse-v2 activation did not complete: ${failureDetail(result)}`, "error");
       }
     } catch (error) {
       pushToast(`Sparse v2 was not enabled: ${String(error)}`, "error");
@@ -1956,8 +1971,11 @@ function ManagedSyncPanel(): JSX.Element {
       ))) return;
       const result = await backend().prepareSparseV2Share();
       setStatus(result);
+      refreshAuthorityState();
       pushToast(
-        result.state === "active" ? "Shared sparse-v2 enrollment is active." : "Shared enrollment remains retryable.",
+        result.state === "active"
+          ? "Shared sparse-v2 enrollment is active."
+          : `Shared enrollment did not complete: ${failureDetail(result)}`,
         result.state === "active" ? "success" : "error"
       );
     } catch (error) {
@@ -1982,8 +2000,11 @@ function ManagedSyncPanel(): JSX.Element {
       ))) return;
       const result = await backend().joinSparseV2Shared();
       setStatus(result);
+      refreshAuthorityState();
       pushToast(
-        result.state === "active" ? "This device joined the shared sparse-v2 graph." : "Shared join remains retryable.",
+        result.state === "active"
+          ? "This device joined the shared sparse-v2 graph."
+          : `Shared join did not complete: ${failureDetail(result)}`,
         result.state === "active" ? "success" : "error"
       );
     } catch (error) {
@@ -1991,6 +2012,47 @@ function ManagedSyncPanel(): JSX.Element {
     } finally {
       setGraphTransitioning(false);
       setSharing(false);
+    }
+  };
+
+  const cancelSparse = async () => {
+    setCancelling(true);
+    setGraphTransitioning(true);
+    try {
+      try {
+        await flushAll();
+      } catch {
+        // Sparse authority may be unavailable in the exact failure state this
+        // rollback repairs. Keep the store intact and retry after legacy
+        // authority has been rebound.
+      }
+      if (!(await backend().confirm(
+        "Return this graph to standard Markdown mode?\n\n" +
+          "Markdown remains the graph. Tine will cleanly stop this local sparse-v2 authority and preserve its complete private state in app recovery storage for recovery or diagnosis. " +
+          "Pending in-memory edits will be retried after standard Markdown authority returns."
+      ))) return;
+      const result = await backend().cancelSparseV2();
+      setStatus(result.status);
+      let flushed = false;
+      try {
+        flushed = await flushAll();
+      } catch {
+        // Report the durable rollback separately from the still-unsaved pages.
+      }
+      if (!flushed) {
+        pushToast(
+          "Standard Markdown mode is active, but your in-memory edits remain unsaved; resolve conflicts or retry saving before reloading or closing the graph.",
+          "error"
+        );
+        return;
+      }
+      refreshAuthorityState();
+      pushToast(result.recovery_statement, "success");
+    } catch (error) {
+      pushToast(`Couldn't return to standard Markdown mode: ${String(error)}`, "error");
+    } finally {
+      setGraphTransitioning(false);
+      setCancelling(false);
     }
   };
 
@@ -2061,6 +2123,34 @@ function ManagedSyncPanel(): JSX.Element {
                   {(value) => (
                     <span class="settings-value">Refused · {value().reason_code}</span>
                   )}
+                </Show>
+                <Show
+                  when={
+                    current().state !== "legacy_default" && current().state !== "joinable"
+                  }
+                >
+                  <Show
+                    when={current().can_cancel}
+                    fallback={
+                      <div class="settings-hint" style={{ "margin-top": "8px" }}>
+                        {current().cancel_reason ??
+                          "Returning to standard Markdown mode is unavailable because local-only safety could not be proved."}
+                      </div>
+                    }
+                  >
+                    <div style={{ "margin-top": "8px" }}>
+                      <button
+                        class="settings-btn settings-btn-danger"
+                        disabled={cancelling()}
+                        onClick={() => void cancelSparse()}
+                      >
+                        {cancelling() ? "Returning…" : "Return to standard Markdown mode"}
+                      </button>
+                      <div class="settings-hint" style={{ "margin-top": "4px" }}>
+                        Markdown remains the graph; private sparse-v2 state is preserved for recovery or diagnosis.
+                      </div>
+                    </div>
+                  </Show>
                 </Show>
                 <Show when={retryable()}>
                   {(value) => (
