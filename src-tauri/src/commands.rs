@@ -10,7 +10,12 @@ use std::sync::Arc;
 use tauri::{State, WebviewWindow};
 use tine_core::date::JournalDate;
 use tine_core::model::{
-    BacklinkFilterContext, BacklinkFilterTarget, PageDto, PageEntry, PageKind, RefGroup,
+    BacklinkFilterContext, BacklinkFilterTarget, BlockDto, PageDto, PageEntry, PageKind, RefGroup,
+};
+use tine_core::sync_runtime::{
+    SyncApplicationPageInventoryOutcome, SyncApplicationPageLoadOutcome,
+    SyncApplicationPageLoadRequest, SyncApplicationPageSaveOutcome, SyncApplicationPageSaveRequest,
+    SyncApplicationPageSaveTarget, SyncApplicationPageSelector, SyncRuntimeHandle,
 };
 
 #[tauri::command]
@@ -227,9 +232,123 @@ mod asset_ingress_tests {
     }
 }
 
+fn sparse_application_handle(
+    slot: &crate::state::GraphSlot,
+) -> Result<Option<&SyncRuntimeHandle>, String> {
+    if slot.is_sparse_v2() {
+        crate::sync_runtime::active_handle(slot).map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
+fn sparse_page_inventory(handle: &SyncRuntimeHandle) -> Result<Vec<PageEntry>, String> {
+    let outcome = handle
+        .application_page_inventory()
+        .map_err(|error| error.to_string())?;
+    map_sparse_page_inventory(outcome)
+}
+
+fn map_sparse_page_inventory(
+    outcome: SyncApplicationPageInventoryOutcome,
+) -> Result<Vec<PageEntry>, String> {
+    match outcome {
+        SyncApplicationPageInventoryOutcome::Loaded { pages } => Ok(pages),
+        SyncApplicationPageInventoryOutcome::Deferred { state } => Err(format!(
+            "sparse-v2 page inventory is deferred ({state:?}); retry after sparse synchronization recovers"
+        )),
+    }
+}
+
+fn map_sparse_page_load(
+    outcome: SyncApplicationPageLoadOutcome,
+) -> Result<Option<PageDto>, String> {
+    match outcome {
+        SyncApplicationPageLoadOutcome::Loaded {
+            mut page,
+            revision,
+        } => {
+            page.rev = Some(revision);
+            Ok(Some(page))
+        }
+        SyncApplicationPageLoadOutcome::Missing { .. } => Ok(None),
+        SyncApplicationPageLoadOutcome::Ambiguous => {
+            Err("sparse-v2 page load is ambiguous; no legacy fallback was attempted".into())
+        }
+        SyncApplicationPageLoadOutcome::Deferred { state } => Err(format!(
+            "sparse-v2 page load is deferred ({state:?}); retry after sparse synchronization recovers"
+        )),
+    }
+}
+
+fn load_sparse_page(
+    handle: &SyncRuntimeHandle,
+    selector: SyncApplicationPageSelector,
+) -> Result<Option<PageDto>, String> {
+    let outcome = handle
+        .load_application_page(SyncApplicationPageLoadRequest { page: selector })
+        .map_err(|error| error.to_string())?;
+    map_sparse_page_load(outcome)
+}
+
+fn sparse_save_request(
+    page: PageDto,
+    base_rev: Option<String>,
+    force: bool,
+) -> Result<SyncApplicationPageSaveRequest, String> {
+    if force {
+        return Err(
+            "force save is refused under sparse-v2 authority; reload the page and resolve the conflict"
+                .into(),
+        );
+    }
+    let target = match base_rev {
+        Some(revision) => SyncApplicationPageSaveTarget::Existing {
+            path: page.path.clone(),
+            revision,
+        },
+        None => SyncApplicationPageSaveTarget::New {
+            name: page.name.clone(),
+            page_kind: page.kind.into(),
+        },
+    };
+    Ok(SyncApplicationPageSaveRequest { target, page })
+}
+
+fn map_sparse_page_save(outcome: SyncApplicationPageSaveOutcome) -> Result<String, String> {
+    match outcome {
+        SyncApplicationPageSaveOutcome::Saved { revision, .. }
+        | SyncApplicationPageSaveOutcome::Unchanged { revision, .. } => Ok(revision),
+        SyncApplicationPageSaveOutcome::Conflict { reason } => {
+            Err(format!("conflict: {reason:?}"))
+        }
+        SyncApplicationPageSaveOutcome::Deferred { state } => Err(format!(
+            "sparse-v2 page save is deferred ({state:?}); retry after sparse synchronization recovers"
+        )),
+    }
+}
+
+fn save_sparse_page_with<E>(
+    page: PageDto,
+    base_rev: Option<String>,
+    force: bool,
+    save: impl FnOnce(SyncApplicationPageSaveRequest) -> Result<SyncApplicationPageSaveOutcome, E>,
+) -> Result<String, String>
+where
+    E: std::fmt::Display,
+{
+    let request = sparse_save_request(page, base_rev, force)?;
+    let outcome = save(request).map_err(|error| error.to_string())?;
+    map_sparse_page_save(outcome)
+}
+
 #[tauri::command]
 pub(crate) fn list_pages(state: GraphContext<'_>) -> Result<Vec<PageEntry>, String> {
-    with_graph(&state, |g| Ok(g.list_pages()))
+    let slot = slot_for_context(&state)?;
+    match sparse_application_handle(&slot)? {
+        Some(handle) => sparse_page_inventory(handle),
+        None => Ok(slot.legacy_graph()?.list_pages()),
+    }
 }
 
 #[tauri::command]
@@ -298,6 +417,42 @@ where
     })
 }
 
+fn canonical_journal_entry(entry: &PageEntry) -> bool {
+    let relative = std::path::Path::new(&entry.rel_path);
+    let path = if entry.rel_path.is_empty() {
+        entry.path.as_path()
+    } else {
+        relative
+    };
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| JournalDate::from_file_stem(stem).is_some())
+}
+
+fn journal_feed_inventory(mut entries: Vec<PageEntry>, as_of_day: i64) -> Vec<PageEntry> {
+    entries.retain(|entry| {
+        entry.kind == PageKind::Journal && entry.date_key.is_some_and(|day| day <= as_of_day)
+    });
+    let mut positions = std::collections::HashMap::new();
+    let mut deduplicated: Vec<PageEntry> = Vec::new();
+    for entry in entries {
+        let day = entry
+            .date_key
+            .expect("feed inventory only contains dated journals");
+        if let Some(&position) = positions.get(&day) {
+            if canonical_journal_entry(&entry) && !canonical_journal_entry(&deduplicated[position])
+            {
+                deduplicated[position] = entry;
+            }
+        } else {
+            positions.insert(day, deduplicated.len());
+            deduplicated.push(entry);
+        }
+    }
+    deduplicated.sort_by_key(|entry| std::cmp::Reverse(entry.date_key.unwrap_or(0)));
+    deduplicated
+}
+
 /// Feed-only pagination. `before_day` is an ordinal-day cursor rather than a
 /// mutable vector offset, so a file disappearing after inventory cannot make a
 /// later day duplicate or disappear from the next request.
@@ -307,15 +462,34 @@ pub(crate) fn journal_feed_page(
     before_day: Option<i64>,
     state: GraphContext<'_>,
 ) -> Result<JournalFeedPage, String> {
-    with_graph(&state, |g| {
-        let as_of_day = JournalDate::today().ordinal_key();
-        let entries = g.feed_journals_desc_through(JournalDate::from_ordinal(as_of_day));
-        collect_journal_feed_page(entries, limit, before_day, as_of_day, |entry| {
-            // A journal deleted from disk between inventory and load is skipped,
-            // but its day still advances the cursor in the helper above.
-            g.load_page(entry)
-        })
-    })
+    let slot = slot_for_context(&state)?;
+    let as_of_day = JournalDate::today().ordinal_key();
+    match sparse_application_handle(&slot)? {
+        Some(handle) => {
+            let entries = journal_feed_inventory(sparse_page_inventory(handle)?, as_of_day);
+            collect_journal_feed_page(entries, limit, before_day, as_of_day, |entry| {
+                match load_sparse_page(
+                    handle,
+                    SyncApplicationPageSelector::ExactPath {
+                        path: entry.rel_path.clone(),
+                    },
+                ) {
+                    Ok(Some(page)) => Ok(page),
+                    Ok(None) => Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+                    Err(error) => Err(std::io::Error::other(error)),
+                }
+            })
+        }
+        None => {
+            let graph = slot.legacy_graph()?;
+            let entries = graph.feed_journals_desc_through(JournalDate::from_ordinal(as_of_day));
+            collect_journal_feed_page(entries, limit, before_day, as_of_day, |entry| {
+                // A journal deleted from disk between inventory and load is skipped,
+                // but its day still advances the cursor in the helper above.
+                graph.load_page(entry)
+            })
+        }
+    }
 }
 
 #[cfg(test)]
@@ -469,9 +643,20 @@ pub(crate) fn get_page(
     kind: PageKind,
     state: GraphContext<'_>,
 ) -> Result<Option<PageDto>, String> {
-    with_graph(&state, |g| {
-        g.load_named(&name, kind).map_err(|e| e.to_string())
-    })
+    let slot = slot_for_context(&state)?;
+    match sparse_application_handle(&slot)? {
+        Some(handle) => load_sparse_page(
+            handle,
+            SyncApplicationPageSelector::Logical {
+                name,
+                page_kind: kind.into(),
+            },
+        ),
+        None => slot
+            .legacy_graph()?
+            .load_named(&name, kind)
+            .map_err(|error| error.to_string()),
+    }
 }
 
 /// One raw source file of the open graph, for the in-app lsdoc↔mldoc diff panel.
@@ -556,20 +741,27 @@ pub(crate) fn save_page(
     force: Option<bool>,
     state: GraphContext<'_>,
 ) -> Result<String, String> {
-    with_graph(&state, |g| {
-        let res = if force.unwrap_or(false) {
-            g.force_save_page(&page)
-        } else {
-            g.save_page(&page, base_rev.as_deref())
-        };
-        res.map_err(|e| {
-            if e.kind() == std::io::ErrorKind::AlreadyExists {
-                "conflict".to_string()
+    let slot = slot_for_context(&state)?;
+    match sparse_application_handle(&slot)? {
+        Some(handle) => save_sparse_page_with(page, base_rev, force.unwrap_or(false), |request| {
+            handle.save_application_page(request)
+        }),
+        None => {
+            let graph = slot.legacy_graph()?;
+            let result = if force.unwrap_or(false) {
+                graph.force_save_page(&page)
             } else {
-                e.to_string()
-            }
-        })
-    })
+                graph.save_page(&page, base_rev.as_deref())
+            };
+            result.map_err(|error| {
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    "conflict".to_string()
+                } else {
+                    error.to_string()
+                }
+            })
+        }
+    }
 }
 
 #[tauri::command]
@@ -1250,9 +1442,57 @@ pub(crate) fn list_templates(
     with_graph(&state, |g| Ok(g.templates()))
 }
 
+fn application_property_line(line: &str) -> bool {
+    let Some(separator) = line.find("::") else {
+        return false;
+    };
+    let key = line[..separator].trim();
+    !key.is_empty()
+        && key.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | '/')
+        })
+}
+
+fn application_blocks_have_content(blocks: &[BlockDto]) -> bool {
+    blocks.iter().any(|block| {
+        block
+            .raw
+            .lines()
+            .any(|line| !line.trim().is_empty() && !application_property_line(line))
+            || application_blocks_have_content(&block.children)
+    })
+}
+
+fn sparse_journal_content_days(handle: &SyncRuntimeHandle) -> Result<Vec<i64>, String> {
+    let entries = sparse_page_inventory(handle)?;
+    let mut days = Vec::new();
+    for entry in entries {
+        if entry.kind != PageKind::Journal {
+            continue;
+        }
+        let Some(day) = entry.date_key else {
+            continue;
+        };
+        let page = load_sparse_page(
+            handle,
+            SyncApplicationPageSelector::ExactPath {
+                path: entry.rel_path,
+            },
+        )?;
+        if page.is_some_and(|page| application_blocks_have_content(&page.blocks)) {
+            days.push(day);
+        }
+    }
+    Ok(days)
+}
+
 #[tauri::command]
 pub(crate) fn journal_content_days(state: GraphContext<'_>) -> Result<Vec<i64>, String> {
-    with_graph(&state, |g| Ok(g.journal_content_days()))
+    let slot = slot_for_context(&state)?;
+    match sparse_application_handle(&slot)? {
+        Some(handle) => sparse_journal_content_days(handle),
+        None => Ok(slot.legacy_graph()?.journal_content_days()),
+    }
 }
 
 #[tauri::command]
@@ -2158,7 +2398,290 @@ pub(crate) fn get_page_by_path(
     path: String,
     state: GraphContext<'_>,
 ) -> Result<Option<PageDto>, String> {
-    with_graph(&state, |g| g.load_by_path(&path).map_err(|e| e.to_string()))
+    let slot = slot_for_context(&state)?;
+    match sparse_application_handle(&slot)? {
+        Some(handle) => load_sparse_page(handle, SyncApplicationPageSelector::ExactPath { path }),
+        None => slot
+            .legacy_graph()?
+            .load_by_path(&path)
+            .map_err(|error| error.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod application_page_authority_tests {
+    use super::*;
+    use std::cell::Cell;
+    use tempfile::TempDir;
+    use tine_core::model::Graph;
+    use tine_core::sync_runtime::{SyncApplicationPageConflict, SyncEditorDeferred, SyncPageKind};
+
+    fn page(name: &str, kind: PageKind, path: &str, raw: &str) -> PageDto {
+        let mut block = BlockDto::default();
+        block.id = format!("{name}-block");
+        block.raw = raw.into();
+        serde_json::from_value(serde_json::json!({
+            "name": name,
+            "kind": match kind {
+                PageKind::Page => "page",
+                PageKind::Journal => "journal",
+            },
+            "title": name,
+            "pre_block": null,
+            "blocks": [block],
+            "rev": "frontend-revision",
+            "path": path,
+        }))
+        .unwrap()
+    }
+
+    fn graph_with_files(files: &[(&str, &str)]) -> (TempDir, Graph) {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("pages")).unwrap();
+        std::fs::create_dir_all(temp.path().join("journals")).unwrap();
+        for (relative, content) in files {
+            let path = temp.path().join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        }
+        let graph = Graph::open(temp.path());
+        (temp, graph)
+    }
+
+    fn inventory_entry(day: i64, path: &str) -> PageEntry {
+        PageEntry {
+            name: day.to_string(),
+            kind: PageKind::Journal,
+            date_key: Some(day),
+            rel_path: path.into(),
+            path: std::path::PathBuf::from(path),
+        }
+    }
+
+    #[test]
+    fn sparse_load_mapping_sets_actor_revision_and_fails_closed() {
+        let loaded = map_sparse_page_load(SyncApplicationPageLoadOutcome::Loaded {
+            page: page("Loaded", PageKind::Page, "pages/Loaded.md", "- body"),
+            revision: "actor-revision".into(),
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(loaded.rev.as_deref(), Some("actor-revision"));
+
+        assert!(
+            map_sparse_page_load(SyncApplicationPageLoadOutcome::Missing { draft: None })
+                .unwrap()
+                .is_none()
+        );
+        let ambiguous =
+            map_sparse_page_load(SyncApplicationPageLoadOutcome::Ambiguous).unwrap_err();
+        assert!(ambiguous.contains("ambiguous"));
+        assert!(ambiguous.contains("no legacy fallback"));
+        let deferred = map_sparse_page_load(SyncApplicationPageLoadOutcome::Deferred {
+            state: SyncEditorDeferred::RetryableExternalWork,
+        })
+        .unwrap_err();
+        assert!(deferred.contains("deferred"));
+        assert!(deferred.contains("retry"));
+    }
+
+    #[test]
+    fn sparse_inventory_mapping_preserves_full_parser_inventory_and_deferral() {
+        let pages = vec![
+            inventory_entry(20260729, "journals/2026_07_29.md"),
+            inventory_entry(20260729, "journals/Jul 29th, 2026.md"),
+        ];
+        let loaded =
+            map_sparse_page_inventory(SyncApplicationPageInventoryOutcome::Loaded { pages })
+                .unwrap();
+        assert_eq!(loaded.len(), 2, "inventory mapping must not deduplicate");
+        assert_ne!(loaded[0].rel_path, loaded[1].rel_path);
+
+        let deferred = map_sparse_page_inventory(SyncApplicationPageInventoryOutcome::Deferred {
+            state: SyncEditorDeferred::RetryableExternalWork,
+        })
+        .unwrap_err();
+        assert!(deferred.contains("inventory is deferred"));
+        assert!(deferred.contains("retry"));
+    }
+
+    #[test]
+    fn sparse_save_targets_existing_path_or_new_name_without_draft_token() {
+        let nested_utf_path = "pages/研究/Crème brûlée.md";
+        let existing = sparse_save_request(
+            page("Crème brûlée", PageKind::Page, nested_utf_path, "- edited"),
+            Some("actor-base".into()),
+            false,
+        )
+        .unwrap();
+        match existing.target {
+            SyncApplicationPageSaveTarget::Existing { path, revision } => {
+                assert_eq!(path, nested_utf_path);
+                assert_eq!(revision, "actor-base");
+            }
+            other => panic!("expected exact existing target, got {other:?}"),
+        }
+
+        let new_page =
+            sparse_save_request(page("New page", PageKind::Page, "", "- new"), None, false)
+                .unwrap();
+        match &new_page.target {
+            SyncApplicationPageSaveTarget::New { name, page_kind } => {
+                assert_eq!(name, "New page");
+                assert_eq!(*page_kind, SyncPageKind::Page);
+            }
+            other => panic!("expected new target, got {other:?}"),
+        }
+        let encoded = serde_json::to_value(&new_page.target).unwrap();
+        assert!(encoded.get("revision").is_none());
+        assert!(encoded.get("draft").is_none());
+    }
+
+    #[test]
+    fn sparse_save_maps_saved_unchanged_conflict_and_refuses_force_before_actor() {
+        let saved = map_sparse_page_save(SyncApplicationPageSaveOutcome::Saved {
+            batch_id: "batch".into(),
+            page: page("Saved", PageKind::Page, "pages/Saved.md", "- body"),
+            revision: "saved-revision".into(),
+        })
+        .unwrap();
+        assert_eq!(saved, "saved-revision");
+        let unchanged = map_sparse_page_save(SyncApplicationPageSaveOutcome::Unchanged {
+            page: page("Saved", PageKind::Page, "pages/Saved.md", "- body"),
+            revision: "unchanged-revision".into(),
+        })
+        .unwrap();
+        assert_eq!(unchanged, "unchanged-revision");
+        let conflict = map_sparse_page_save(SyncApplicationPageSaveOutcome::Conflict {
+            reason: SyncApplicationPageConflict::StaleBase,
+        })
+        .unwrap_err();
+        assert!(conflict.contains("conflict"));
+
+        let called = Cell::new(false);
+        let refused = save_sparse_page_with(
+            page("Saved", PageKind::Page, "pages/Saved.md", "- body"),
+            Some("stale".into()),
+            true,
+            |_request| -> Result<SyncApplicationPageSaveOutcome, &'static str> {
+                called.set(true);
+                unreachable!("force must be refused before actor invocation")
+            },
+        )
+        .unwrap_err();
+        assert!(refused.contains("force save is refused"));
+        assert!(!called.get());
+    }
+
+    #[test]
+    fn sparse_exact_selector_preserves_nested_utf_path() {
+        let path = "journals/归档/2026_07_29–夜.md";
+        let request = SyncApplicationPageLoadRequest {
+            page: SyncApplicationPageSelector::ExactPath { path: path.into() },
+        };
+        match request.page {
+            SyncApplicationPageSelector::ExactPath { path: actual } => {
+                assert_eq!(actual, path);
+            }
+            other => panic!("expected exact-path selector, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sparse_feed_inventory_matches_legacy_order_and_cutoff() {
+        let (_temp, graph) = graph_with_files(&[
+            ("journals/2026_07_29.md", "- newest\n"),
+            ("journals/2026_07_28.md", "- older\n"),
+            ("journals/2099_01_01.md", "- future\n"),
+            ("pages/ordinary.md", "- page\n"),
+        ]);
+        let cutoff = 20260729;
+        let sparse = journal_feed_inventory(graph.list_pages(), cutoff)
+            .into_iter()
+            .map(|entry| entry.rel_path)
+            .collect::<Vec<_>>();
+        let legacy = graph
+            .feed_journals_desc_through(JournalDate::from_ordinal(cutoff))
+            .into_iter()
+            .map(|entry| entry.rel_path)
+            .collect::<Vec<_>>();
+        assert_eq!(sparse, legacy);
+    }
+
+    #[test]
+    fn sparse_feed_prefers_canonical_duplicate_and_bounds_page_loads() {
+        let entries = vec![
+            inventory_entry(20260729, "journals/Jul 29th, 2026.md"),
+            inventory_entry(20260729, "journals/2026_07_29.md"),
+            inventory_entry(20260728, "journals/2026_07_28.md"),
+        ];
+        let inventory = journal_feed_inventory(entries, 20260729);
+        assert_eq!(
+            inventory
+                .iter()
+                .map(|entry| entry.rel_path.as_str())
+                .collect::<Vec<_>>(),
+            ["journals/2026_07_29.md", "journals/2026_07_28.md"]
+        );
+        let loads = Cell::new(0);
+        let feed = collect_journal_feed_page(inventory, 1, None, 20260729, |entry| {
+            loads.set(loads.get() + 1);
+            Ok(page(
+                &entry.name,
+                PageKind::Journal,
+                &entry.rel_path,
+                "- content",
+            ))
+        })
+        .unwrap();
+        assert_eq!(feed.pages.len(), 1);
+        assert_eq!(loads.get(), 1);
+        assert_eq!(feed.next_before_day, Some(20260729));
+    }
+
+    #[test]
+    fn sparse_content_detection_matches_legacy_and_includes_nested_blocks() {
+        let (_temp, graph) = graph_with_files(&[
+            (
+                "journals/2026_07_29.md",
+                "- property:: only\n  - nested content\n",
+            ),
+            ("journals/2026_07_28.md", "- property:: only\n"),
+            ("journals/2026_07_27.md", "-    \n"),
+            ("pages/ordinary.md", "- ordinary\n"),
+        ]);
+        let legacy = graph.journal_content_days();
+        let mut mapped = Vec::new();
+        for entry in graph.list_pages() {
+            if entry.kind != PageKind::Journal {
+                continue;
+            }
+            let Some(day) = entry.date_key else {
+                continue;
+            };
+            let loaded = graph.load_by_path(&entry.rel_path).unwrap().unwrap();
+            if application_blocks_have_content(&loaded.blocks) {
+                mapped.push(day);
+            }
+        }
+        assert_eq!(mapped, legacy);
+        assert!(mapped.contains(&20260729));
+        assert!(!mapped.contains(&20260728));
+        assert!(!mapped.contains(&20260727));
+    }
+
+    #[test]
+    fn legacy_page_load_and_unchanged_save_helpers_retain_their_contract() {
+        let (_temp, graph) = graph_with_files(&[("pages/legacy.md", "- unchanged legacy body\n")]);
+        let loaded = graph.load_named("legacy", PageKind::Page).unwrap().unwrap();
+        let base = loaded.rev.clone().unwrap();
+        assert_eq!(
+            graph.save_page(&loaded, Some(&base)).unwrap(),
+            base,
+            "unchanged legacy saves still return the on-disk revision"
+        );
+        assert_eq!(graph.list_pages().len(), 1);
+    }
 }
 
 /// Reconcile a duplicate-day pair: append the blocks of `src` to `dst`, then trash

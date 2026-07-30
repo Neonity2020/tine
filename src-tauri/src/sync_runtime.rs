@@ -750,9 +750,10 @@ impl SyncRuntimeFacade {
 }
 
 const LEGACY_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
-pub(crate) const SPARSE_V2_NOT_ACTIVE: &str = "sparse v2 is not active";
+pub(crate) const SPARSE_V2_NOT_ACTIVE: &str =
+    "sparse-v2 authority has no live runtime; retry sparse-v2 activation or roll back to standard Markdown mode";
 
-fn active_handle(
+pub(crate) fn active_handle(
     slot: &crate::state::GraphSlot,
 ) -> Result<&tine_core::sync_runtime::SyncRuntimeHandle, String> {
     slot.sparse_runtime()
@@ -1551,6 +1552,17 @@ mod tests {
             visit(root, root, &mut found);
         }
         found
+    }
+
+    #[test]
+    fn sparse_binding_without_live_handle_gives_actionable_recovery() {
+        let fixture = RollbackFixture::new(Some("shadow_import"));
+        assert_eq!(
+            active_handle(&fixture.slot).unwrap_err(),
+            SPARSE_V2_NOT_ACTIVE
+        );
+        assert!(SPARSE_V2_NOT_ACTIVE.contains("retry sparse-v2 activation"));
+        assert!(SPARSE_V2_NOT_ACTIVE.contains("roll back"));
     }
 
     #[test]
