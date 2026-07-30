@@ -13360,6 +13360,9 @@ impl ShardedHotEngine {
                 "reference catalog recovery requires complete authenticated history replay".into(),
             ));
         }
+        if self.workspace_blocked_error().is_some() {
+            return Ok(());
+        }
         self.reference_catalog
             .ensure_ready()
             .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))
