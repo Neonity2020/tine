@@ -25,7 +25,7 @@ import type { JournalFeedPage, PageDto, RefGroup } from "../types";
 import { TagPageTable, TagTableToggle } from "./Page";
 import { PageView, reloadJournalsFeedFromStart, withToday } from "./Page";
 import { focusBlock, mainPaneRouter, resetTabsToJournals, tabRoute } from "../router";
-import { clearConflict, clearRecent, closeContextMenu, contextMenu, graphEpoch, markConflict, recentPages, rightSidebar, setRightSidebar } from "../ui";
+import { bumpGraphEpoch, clearConflict, clearRecent, closeContextMenu, contextMenu, graphEpoch, markConflict, recentPages, rightSidebar, setRightSidebar } from "../ui";
 
 beforeAll(async () => {
   await initParser();
@@ -89,6 +89,59 @@ function feedResponse(pages: PageDto[], patch: Partial<JournalFeedPage> = {}): J
 }
 
 describe("Journals feed generation lifecycle", () => {
+  it("saves an edited page route when activation reset abandons the Journals reload", async () => {
+    vi.useFakeTimers();
+    const existing: PageDto = {
+      name: "Résumé 日本語",
+      kind: "page",
+      title: "Résumé 日本語",
+      pre_block: null,
+      rev: "sparse-load-rev",
+      blocks: [{ id: "nested-utf", raw: "nested UTF original", collapsed: false, children: [] }],
+    };
+    vi.spyOn(backend(), "journalFeedPage").mockImplementation(() => new Promise(() => {}));
+    vi.spyOn(backend(), "getPage").mockResolvedValue(existing);
+    const save = vi.spyOn(backend(), "savePage").mockResolvedValue("sparse-saved-rev");
+    const mounted = mount(() => <PageView />);
+    try {
+      await flushMicrotasks();
+      // This is Settings' post-activation refresh. Its Journals request is still
+      // pending when the user immediately opens a regular page from inventory.
+      resetStore();
+      bumpGraphEpoch();
+      await flushMicrotasks();
+      mainPaneRouter.openPage(existing.name, existing.kind, { inPlace: true });
+      await flushMicrotasks();
+      await flushMicrotasks();
+
+      expect(doc.loaded).toBe(true);
+      startEditing("nested-utf", existing.blocks[0].raw.length);
+      await tick();
+      const editor = mounted.root.querySelector<HTMLTextAreaElement>("textarea.block-editor");
+      expect(editor).not.toBeNull();
+      const edited = "nested UTF original sparse v2 saved existing UTF page";
+      editor!.value = edited;
+      editor!.dispatchEvent(new InputEvent("input", {
+        bubbles: true,
+        inputType: "insertText",
+        data: "page",
+      }));
+      editor!.blur();
+
+      await vi.advanceTimersByTimeAsync(400);
+      expect(save).toHaveBeenCalledWith(
+        expect.objectContaining({
+          name: existing.name,
+          blocks: [expect.objectContaining({ raw: edited })],
+        }),
+        "sparse-load-rev",
+        false,
+      );
+    } finally {
+      mounted.dispose();
+    }
+  });
+
   it("settles an initial Journals route load without reacting to its own feed replacement", async () => {
     const api = vi.spyOn(backend(), "journalFeedPage").mockResolvedValue(feedResponse([journalDto("settled")]));
     const mounted = mount(() => <PageView />);
@@ -1040,6 +1093,39 @@ describe("page route loading", () => {
       await tick();
       expect(root.textContent).toContain("new route content");
       expect(root.textContent).not.toContain("obsolete slow-page failure");
+    } finally {
+      dispose();
+    }
+  });
+
+  it("does not arm persistence from an obsolete successful page load", async () => {
+    const stale: PageDto = {
+      name: "Stale page",
+      kind: "page",
+      title: "Stale page",
+      pre_block: null,
+      rev: "stale-rev",
+      blocks: [{ id: "stale-block", raw: "obsolete content", collapsed: false, children: [] }],
+    };
+    let resolveStale!: (value: PageDto) => void;
+    vi.spyOn(backend(), "getPage").mockImplementation((name) => {
+      if (name === stale.name) {
+        return new Promise((resolve) => { resolveStale = resolve; });
+      }
+      return new Promise(() => {});
+    });
+    mainPaneRouter.openPage(stale.name, stale.kind, { inPlace: true });
+
+    const { dispose } = mount(() => <PageView />);
+    try {
+      await flushMicrotasks();
+      mainPaneRouter.openPage("Current page", "page", { inPlace: true });
+      await flushMicrotasks();
+      resolveStale(stale);
+      await flushMicrotasks();
+
+      expect(pageByName(stale.name)).toBeUndefined();
+      expect(doc.loaded).toBe(false);
     } finally {
       dispose();
     }

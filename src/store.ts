@@ -384,6 +384,16 @@ export function ensurePageLoaded(dto: PageDto) {
   evictIfNeeded();
 }
 
+/** Load a page selected by the main graph router. `ensurePageLoaded` also serves
+ * the isolated quick-capture window, where `doc.loaded` must stay false so its
+ * scratch editor can never write the graph. A successfully resolved main route,
+ * however, is sufficient to arm ordinary persistence even when an invalidated
+ * Journals reload has not landed yet. */
+export function loadRoutedPage(dto: PageDto) {
+  ensurePageLoaded(dto);
+  setDoc("loaded", true);
+}
+
 /** Load/reload bundled Guide pages into the working set without making them the
  *  main feed. Re-open uses this to re-derive the read-only virtual pages from
  *  the backend templates instead of trusting stale in-memory copies. */
