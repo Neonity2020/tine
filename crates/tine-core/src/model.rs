@@ -6255,9 +6255,9 @@ impl Graph {
             retired = true;
 
             let (retired_file, retired_bytes) =
-                open_and_read_projection_regular(target.parent(), &recovery)?;
+                sync_open_and_read_projection_regular(target.parent(), &recovery)?;
             let retired_identity = canonical_projection_file_resource_id(&retired_file)?;
-            retired_file.sync_all()?;
+            drop(retired_file);
             sync_projection_chain_required(&target.chain)?;
             if retired_identity != expected_identity
                 || expected_bytes.is_some_and(|expected| retired_bytes != expected)
@@ -21055,6 +21055,35 @@ fn open_projection_file_nofollow(_dir: &Dir, _name: &str) -> io::Result<fs::File
     ))
 }
 
+#[cfg(not(windows))]
+fn open_projection_file_nofollow_for_sync(dir: &Dir, name: &str) -> io::Result<fs::File> {
+    open_projection_file_nofollow(dir, name)
+}
+
+#[cfg(windows)]
+fn open_projection_file_nofollow_for_sync(dir: &Dir, name: &str) -> io::Result<fs::File> {
+    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
+    use std::os::windows::fs::MetadataExt;
+
+    #[cfg(test)]
+    PROJECTION_EXACT_OPEN_COUNT.with(|count| count.set(count.get() + 1));
+    let mut options = CapOpenOptions::new();
+    options.read(true).write(true).follow(FollowSymlinks::No);
+    let file = dir.open_with(name, &options)?.into_std();
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.file_attributes()
+            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+            != 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "projection sync target is not a regular no-follow file",
+        ));
+    }
+    Ok(file)
+}
+
 fn open_and_read_projection_regular(dir: &Dir, name: &str) -> io::Result<(fs::File, Vec<u8>)> {
     open_and_read_projection_regular_with_limit(dir, name, MAX_PROJECTION_EVIDENCE_BYTES)
 }
@@ -21279,7 +21308,7 @@ fn sync_and_read_projection_regular(dir: &Dir, name: &str) -> io::Result<Vec<u8>
 }
 
 fn sync_open_and_read_projection_regular(dir: &Dir, name: &str) -> io::Result<(fs::File, Vec<u8>)> {
-    let mut file = open_projection_file_nofollow(dir, name)?;
+    let mut file = open_projection_file_nofollow_for_sync(dir, name)?;
     let len = file.metadata()?.len();
     if len > MAX_PROJECTION_EVIDENCE_BYTES {
         return Err(io::Error::new(
@@ -27624,8 +27653,10 @@ fn preserve_and_restore_projection_recovery(
 }
 
 /// Verify directory durability support before the first live-name mutation.
-/// Linux/Android/macOS and Windows can all reject directory flushing on a
-/// particular filesystem; that must fail before retirement/publication.
+/// Unix targets probe the filesystem and fail before retirement/publication
+/// when directory flushing is unavailable. Windows first validates the retained
+/// exact directory capability, then records its documented lack of a
+/// directory-entry flush primitive as a platform limitation.
 fn preflight_projection_chain(chain: &[Dir]) -> io::Result<()> {
     for dir in chain.iter().rev() {
         sync_projection_directory_required(dir)?;
@@ -27701,11 +27732,15 @@ fn rename_projection_between_noreplace(
     use std::os::windows::ffi::OsStrExt as _;
     use std::os::windows::fs::MetadataExt as _;
     use std::os::windows::io::AsRawHandle as _;
-    use windows_sys::Win32::Storage::FileSystem::{
-        FileRenameInfoEx, SetFileInformationByHandle, DELETE, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, SYNCHRONIZE,
+    use windows_sys::Wdk::Storage::FileSystem::{
+        FileRenameInformation, NtSetInformationFile, FILE_RENAME_INFORMATION,
     };
+    use windows_sys::Win32::Foundation::RtlNtStatusToDosError;
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, SYNCHRONIZE,
+    };
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
     fn valid_leaf(name: &str) -> bool {
         !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\\', '\0'])
@@ -27719,9 +27754,9 @@ fn rename_projection_between_noreplace(
     }
 
     // Open the source itself with DELETE access through the retained directory
-    // capability. FileRenameInfoEx then renames that exact handle relative to
-    // the retained destination directory. A filesystem that cannot provide the
-    // primitive rejects this call before the live source name is retired.
+    // capability. FileRenameInformation then renames that exact handle relative
+    // to the retained destination directory. A filesystem that cannot provide
+    // the primitive rejects this call before the live source name is retired.
     let mut options = CapOpenOptions::new();
     options
         .follow(FollowSymlinks::No)
@@ -27746,40 +27781,45 @@ fn rename_projection_between_noreplace(
         .len()
         .checked_mul(std::mem::size_of::<u16>())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "target name too long"))?;
-    let information_length = std::mem::offset_of!(FILE_RENAME_INFO, FileName)
+    let information_length = std::mem::size_of::<FILE_RENAME_INFORMATION>()
         .checked_add(destination_bytes)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "target name too long"))?;
-    let words = information_length.div_ceil(std::mem::size_of::<usize>());
-    let mut storage = vec![0_usize; words];
-    let information = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    let information_words = information_length.div_ceil(std::mem::size_of::<usize>());
+    let information_length = u32::try_from(information_length)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "target name too long"))?;
+    let destination_bytes = u32::try_from(destination_bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "target name too long"))?;
+    let mut storage = vec![0_usize; information_words];
+    let information = storage.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
     let root = destination_dir.try_clone()?.into_std_file();
+    let mut io_status = IO_STATUS_BLOCK::default();
 
-    // FileRenameInfoEx with a zero Flags field omits every replacement mode.
-    // Windows therefore atomically fails when the destination name is occupied.
-    // The aligned allocation covers FILE_RENAME_INFO through its variable UTF-16
-    // tail, and both the source and root-directory handles outlive the call.
-    let renamed = unsafe {
-        (*information).Anonymous.Flags = 0;
+    // FileRenameInformation with ReplaceIfExists false atomically fails when
+    // the destination name is occupied. The usize-backed allocation aligns the
+    // locked binding's variable-tail structure, and both the exact source and
+    // retained destination-directory handles outlive the call.
+    let status = unsafe {
+        (*information).Anonymous.ReplaceIfExists = false;
         (*information).RootDirectory = root.as_raw_handle();
-        (*information).FileNameLength = u32::try_from(destination_bytes)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "target name too long"))?;
+        (*information).FileNameLength = destination_bytes;
         std::ptr::copy_nonoverlapping(
             destination.as_ptr(),
             (*information).FileName.as_mut_ptr(),
             destination.len(),
         );
-        SetFileInformationByHandle(
+        NtSetInformationFile(
             source.as_raw_handle(),
-            FileRenameInfoEx,
+            &mut io_status,
             information.cast(),
-            u32::try_from(information_length)
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "target name too long"))?,
+            information_length,
+            FileRenameInformation,
         )
     };
-    if renamed != 0 {
+    if status >= 0 {
         Ok(())
     } else {
-        Err(io::Error::last_os_error())
+        let error = unsafe { RtlNtStatusToDosError(status) };
+        Err(io::Error::from_raw_os_error(error as i32))
     }
 }
 
@@ -29615,6 +29655,81 @@ mod tests {
     #[test]
     fn foreign_destination_before_restore_keeps_retired_original_recoverable() {
         assert_post_retirement_foreign_destination(true);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_handle_relative_noreplace_renames_the_exact_source() {
+        let path = scratch("windows-handle-relative-noreplace-success");
+        let source = path.join("pages/source");
+        let destination = path.join("pages/destination");
+        fs::write(&source, b"exact source bytes").unwrap();
+        let source_identity =
+            canonical_projection_file_resource_id(&fs::File::open(&source).unwrap()).unwrap();
+        let dir = Dir::open_ambient_dir(path.join("pages"), ambient_authority()).unwrap();
+
+        rename_projection_noreplace(&dir, "source", "destination").unwrap();
+
+        assert!(!source.exists());
+        assert_eq!(fs::read(&destination).unwrap(), b"exact source bytes");
+        assert_eq!(
+            canonical_projection_file_resource_id(&fs::File::open(&destination).unwrap()).unwrap(),
+            source_identity
+        );
+        assert_eq!(
+            regular_file_tree(&path),
+            std::collections::BTreeMap::from([(
+                PathBuf::from("pages/destination"),
+                b"exact source bytes".to_vec(),
+            )])
+        );
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_handle_relative_noreplace_moves_between_nonstandard_retained_directories_with_unicode(
+    ) {
+        let path = scratch("windows-cross-directory-unicode-noreplace");
+        let source_path = path.join("source tree").join("nested.dir");
+        let destination_path = path.join("destination-tree").join("nested space");
+        fs::create_dir_all(&source_path).unwrap();
+        fs::create_dir_all(&destination_path).unwrap();
+        let source = source_path.join("exact-source");
+        let destination_name = "résumé-東京.md";
+        let destination = destination_path.join(destination_name);
+        let bytes = b"cross-directory exact source bytes";
+        fs::write(&source, bytes).unwrap();
+        let source_identity =
+            canonical_projection_file_resource_id(&fs::File::open(&source).unwrap()).unwrap();
+        let source_dir = Dir::open_ambient_dir(&source_path, ambient_authority()).unwrap();
+        let destination_dir =
+            Dir::open_ambient_dir(&destination_path, ambient_authority()).unwrap();
+
+        rename_projection_between_noreplace(
+            &source_dir,
+            "exact-source",
+            &destination_dir,
+            destination_name,
+        )
+        .unwrap();
+
+        assert!(!source.exists());
+        assert_eq!(fs::read(&destination).unwrap(), bytes);
+        assert_eq!(
+            canonical_projection_file_resource_id(&fs::File::open(&destination).unwrap()).unwrap(),
+            source_identity
+        );
+        assert_eq!(
+            regular_file_tree(&path),
+            std::collections::BTreeMap::from([(
+                PathBuf::from("destination-tree")
+                    .join("nested space")
+                    .join(destination_name),
+                bytes.to_vec(),
+            )])
+        );
+        let _ = fs::remove_dir_all(path);
     }
 
     #[cfg(windows)]
@@ -33085,7 +33200,33 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_directory_flush_limitation_does_not_block_save_or_rename() {
+    fn windows_first_save_and_ordinary_rename_preserve_exact_projection() {
+        let dir = scratch("windows-first-save-ordinary-rename");
+        let graph = Graph::open(&dir);
+        let page = markdown_page_dto("Original", "Original", "- first save bytes\n").unwrap();
+
+        graph.save_page(&page, None).unwrap();
+
+        let original = dir.join("pages/Original.md");
+        let renamed = dir.join("pages/Renamed.md");
+        assert_eq!(fs::read(&original).unwrap(), b"- first save bytes\n");
+        assert!(!renamed.exists());
+
+        graph.rename_page("Original", "Renamed").unwrap();
+
+        assert!(!original.exists());
+        assert_eq!(fs::read(&renamed).unwrap(), b"- first save bytes\n");
+        let page_names = fs::read_dir(dir.join("pages"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(page_names, [std::ffi::OsString::from("Renamed.md")]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_directory_durability_limit_does_not_block_save_or_rename() {
         let dir = scratch("windows-directory-flush-save-rename");
         let original = dir.join("pages/Original.md");
         fs::write(&original, "- before\n").unwrap();
@@ -33097,6 +33238,9 @@ mod tests {
             .unwrap();
         page.blocks[0].raw = "after".into();
         graph.save_page(&page, page.rev.as_deref()).unwrap();
+        assert_eq!(fs::read(&original).unwrap(), b"- after\n");
+        assert!(!dir.join("pages/Renamed.md").exists());
+
         graph.rename_page("Original", "Renamed").unwrap();
 
         assert!(!original.exists());

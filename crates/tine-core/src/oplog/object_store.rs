@@ -7318,13 +7318,12 @@ fn publish_immutable(
     bytes: &[u8],
     collision: Collision,
 ) -> Result<(), StoreError> {
-    // Windows validates the retained directory capability, reopens that exact
-    // object by handle with write access, and attempts FlushFileBuffers before
-    // inserting an immutable target name. Both handles are retained and reused
-    // afterward, so namespace retargeting cannot redirect the probe.
-    // ERROR_INVALID_PARAMETER from only the final flush is the documented
-    // residual: file bytes stay flushed and insertion stays atomic, but
-    // directory-entry durability is unavailable on that platform/filesystem.
+    // Windows clones, retains, and validates the exact directory capability
+    // before inserting an immutable target name. Win32 exposes no documented
+    // directory-entry flush, so that validated state explicitly records the
+    // platform limitation; it never classifies an I/O error as success. File
+    // bytes stay flushed and insertion stays atomic, but the directory entry is
+    // not promised to survive a crash.
     let publication_sync = PublicationDirSync::open(dir).map_err(StoreError::from)?;
     publication_sync.preflight().map_err(StoreError::from)?;
     let temp_name = format!(".tmp-{}", Uuid::new_v4());

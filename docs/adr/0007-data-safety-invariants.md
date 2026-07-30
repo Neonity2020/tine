@@ -41,12 +41,16 @@ We will treat data safety as a first-class invariant set, not best-effort:
   rare edge case" is not grounds to skip a data-loss fix.
 - **Windows crash-durability limit:** regular-file bytes are still flushed with
   `FlushFileBuffers`, and publication still uses atomic name operations. After
-  Tine clones and validates the retained directory capability, it uses
-  `ReOpenFile` to request write access to that exact object without another
-  pathname lookup, and validates the reopened handle as a real directory rather
-  than a reparse point. Windows may then return `ERROR_INVALID_PARAMETER` from
-  `FlushFileBuffers` because portable directory-entry fsync is unavailable.
-  Only that final directory-flush result is treated as a platform limitation;
-  clone, reopen, metadata, validation, and all other errors remain fatal.
-  Consequently, flushed file bytes and atomic publication are retained, but
-  Tine does not claim that the directory entry itself survives a Windows crash.
+  Tine clones the retained directory capability, validates that exact handle as
+  a real directory rather than a reparse point, and retains it across
+  publication. No path is opened after validation to re-establish that
+  directory. Win32 documents `FlushFileBuffers` for a `GENERIC_WRITE` file
+  handle, but does not identify it as an operation that accepts a directory
+  handle; requesting `GENERIC_WRITE` on a directory also requests namespace
+  mutation rights rather than a narrow durability right. Tine therefore models
+  directory-entry flushing as unsupported on Windows only after capability
+  clone, metadata, and validation have succeeded. No reopen or flush error is
+  whitelisted. Regular-file flush, clone, metadata, validation, publication,
+  and all unrelated errors remain fatal. Consequently, flushed file bytes and
+  atomic publication are retained, but Tine does not claim that the directory
+  entry itself survives a Windows crash.
