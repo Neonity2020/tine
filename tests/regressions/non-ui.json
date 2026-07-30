@@ -1877,6 +1877,33 @@
         "failBefore": "proven"
       },
       "notes": "Fail-before: the independent verifier used a fixture whose logical name, kind, and path already agreed and changed only round-tripping CRLF/blank-line formatting. Reconciliation produced zero semantic operations, then OperationTransaction's correct non-empty invariant converted that no-op into UnsafeInput. The no-op now has a separate sealed formatting material lane: it publishes endpoint-local intent/base/completion authority, replaces the bounded completed-path baseline only after authenticating the prior receipt and unchanged semantic frontier, and never publishes an operation batch. Crash after intent is recovered after a full Graph/receipt/archive-engine/SQLite/tail restart; exact bytes survive, and a subsequent real semantic edit renders from the adopted formatting baseline."
+    },
+    {
+      "id": "REG-SYNC-EDITOR-TITLE-SEMANTIC-DIVERGENCE-001",
+      "title": "Editor title changes remain one atomic logical rename across Graph, oplog, SQLite, projection, and restart",
+      "family": "sync-data-safety",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/sync_runtime.rs::fresh_attack_round3_editor_title_change_must_preserve_graph_oplog_sqlite_equivalence",
+          "crates/tine-core/src/sync_runtime.rs::editor_parser_authority_matrix_covers_markdown_org_title_and_kind_transitions",
+          "crates/tine-core/src/sync_runtime.rs::new_markdown_and_org_pages_are_born_with_parsed_final_identity_at_selected_path",
+          "crates/tine-core/src/sync_runtime.rs::editor_final_name_collisions_refuse_existing_and_new_saves_before_publication",
+          "crates/tine-core/src/sync_runtime.rs::editor_title_content_and_referrer_changes_share_one_atomic_user_authoritative_save",
+          "crates/tine-core/src/sync_runtime.rs::editor_content_saves_retain_accepted_identity_across_filename_and_journal_policy_changes"
+        ],
+        "scenario": "sync.editor-title-semantic-equivalence",
+        "failBefore": "proven"
+      },
+      "notes": "Fail-before: a public editor save changed Markdown title:: from Editor Title Before to Editor Title After while preserving the blocks. Graph::open observed the new title immediately, but authoritative oplog replay, SQLite, and the restarted editor retained Editor Title Before. Editor saves now use the canonical external-document parser and the identity decision shared with import, preserve a title-only edit's physical path, and atomically compose logical rename, parser-derived kind, final content, collision checks, referrer rewrites, and every affected page. Shared semantic scenarios cover Markdown and Org title add/change/removal, existing and new Page/Journal transitions, nested and nonstandard paths, policy changes, no-op reimport, and two restarts."
     }
   ]
 }

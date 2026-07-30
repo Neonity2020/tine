@@ -500,6 +500,61 @@ pub(crate) struct ParsedExternalDocument {
     pub(crate) source_round_trips: Option<bool>,
 }
 
+/// An already accepted exact-path identity that may survive parser-policy
+/// changes only while the parser-owned explicit-title evidence is unchanged.
+pub(crate) struct AcceptedExternalDocumentIdentity<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) kind: PageKind,
+    pub(crate) explicit_title: Option<&'a str>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ExternalDocumentIdentity {
+    pub(crate) name: String,
+    pub(crate) kind: PageKind,
+}
+
+impl ParsedExternalDocument {
+    /// Apply the one accepted-versus-explicit-versus-filename identity rule
+    /// shared by affected import and local editor authoring.
+    pub(crate) fn resolve_identity(
+        &self,
+        accepted: Option<AcceptedExternalDocumentIdentity<'_>>,
+    ) -> ExternalDocumentIdentity {
+        resolve_external_document_identity(
+            self.explicit_title.as_deref(),
+            &self.filename_fallback,
+            &self.effective,
+            accepted,
+        )
+    }
+}
+
+pub(crate) fn resolve_external_document_identity(
+    explicit_title: Option<&str>,
+    filename_fallback: &PageEntry,
+    effective: &PageEntry,
+    accepted: Option<AcceptedExternalDocumentIdentity<'_>>,
+) -> ExternalDocumentIdentity {
+    if let Some(accepted) = accepted {
+        if explicit_title == accepted.explicit_title {
+            return ExternalDocumentIdentity {
+                name: accepted.name.to_owned(),
+                kind: accepted.kind,
+            };
+        }
+    }
+    let selected = if explicit_title.is_some() {
+        effective
+    } else {
+        filename_fallback
+    };
+    ExternalDocumentIdentity {
+        name: selected.name.clone(),
+        kind: selected.kind,
+    }
+}
+
 /// A block as sent to / received from the frontend.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BlockDto {

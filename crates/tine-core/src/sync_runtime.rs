@@ -30,7 +30,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::model::{sync_conflict_base, Graph, PageKind};
+use crate::model::{sync_conflict_base, AcceptedExternalDocumentIdentity, Graph, PageKind};
 use crate::oplog::discovery::{
     discover_startup, AmbiguousEvidence, DiscoveryClassification, DiscoveryComponent,
     DiscoveryRequest, LocalActiveAdvisory, NonActiveStage, StartupStorageProfile,
@@ -70,7 +70,7 @@ use crate::oplog::operational_coordinator::{
     LocalPublishedContinuation, OperationalCoordinator, OperationalPhase,
     ProviderArchiveContinuation, ProviderArchiveIngress,
 };
-use crate::oplog::projection::confirm_existing_projection_exact;
+use crate::oplog::projection::{confirm_existing_projection_exact, render_requested_page_document};
 use crate::oplog::projection_store::ProjectionReceiptStore;
 use crate::oplog::reconciliation_baseline::{
     BaselineTimestamp, ReconciliationBaseline, ReconciliationBaselineBinding,
@@ -5036,7 +5036,7 @@ impl RuntimeActor {
             });
         }
 
-        let (page_id, transaction) = match &request.target {
+        let (page_id, transaction, affected_page_ids) = match &request.target {
             SyncEditorSaveTarget::Existing { page_id, revision } => {
                 let page_id = parse_editor_page_id(page_id)?;
                 let runtime = self
@@ -5053,8 +5053,90 @@ impl RuntimeActor {
                         reason: SyncEditorConflict::StaleBase,
                     });
                 }
-                let transaction = build_existing_editor_transaction(&current, &request)?;
-                (page_id, transaction)
+                let resolved = resolve_editor_block_ids(&request.blocks)?;
+                let requested_page = requested_existing_editor_page(&current, &request, &resolved)?;
+                let base = self
+                    .graph
+                    .read_projection_input(&current.page.path)
+                    .map_err(|_| SyncEditorRequestError::ActorRefused)?
+                    .ok_or(SyncEditorRequestError::ActorRefused)?;
+                let target = render_requested_page_document(&requested_page, Some(&base))
+                    .map_err(|_| SyncEditorRequestError::ActorRefused)?;
+                let accepted_target = render_requested_page_document(&current.page, Some(&base))
+                    .map_err(|_| SyncEditorRequestError::ActorRefused)?;
+                let accepted_source = self
+                    .graph
+                    .parse_external_document(&current.page.path, &accepted_target, false)
+                    .map_err(|_| SyncEditorRequestError::ActorRefused)?;
+                let parsed = self
+                    .graph
+                    .parse_external_document(&current.page.path, &target, false)
+                    .map_err(|_| SyncEditorRequestError::ActorRefused)?;
+                let identity = parsed.resolve_identity(Some(AcceptedExternalDocumentIdentity {
+                    name: current.page.name.as_str(),
+                    kind: match current.page.kind {
+                        ManagedTextKind::Page => PageKind::Page,
+                        ManagedTextKind::Journal => PageKind::Journal,
+                    },
+                    explicit_title: accepted_source.explicit_title.as_deref(),
+                }));
+                let final_name = LogicalPageName::parse(identity.name).map_err(|_| {
+                    SyncEditorRequestError::InvalidRequest(SyncEditorInvalidRequest::InvalidName)
+                })?;
+                let final_kind = model_sync_page_kind(identity.kind);
+                match runtime
+                    .engine()
+                    .current_page_for_logical_name(&final_name)
+                    .map_err(|_| SyncEditorRequestError::ActorRefused)?
+                {
+                    Some(owner) if owner != page_id => {
+                        return Ok(SyncEditorSaveOutcome::Conflict {
+                            reason: SyncEditorConflict::PageAlreadyExists,
+                        })
+                    }
+                    Some(_) => {}
+                    None if final_name == current.page.name => {
+                        return Err(SyncEditorRequestError::ActorRefused)
+                    }
+                    None => {}
+                }
+
+                let mut operations = Vec::new();
+                let mut affected = BTreeSet::from([page_id]);
+                if final_name != current.page.name {
+                    let store = runtime
+                        .engine()
+                        .archive_store()
+                        .ok_or(SyncEditorRequestError::ActorRefused)?;
+                    let mut query = runtime
+                        .database()
+                        .frontier_reference_query(runtime.engine(), store)
+                        .map_err(|_| SyncEditorRequestError::ActorRefused)?;
+                    let plan = query
+                        .plan_page_rename(&current.page.name, final_name, current.page.path.clone())
+                        .map_err(|_| SyncEditorRequestError::ActorRefused)?;
+                    affected.extend(plan.touched_sources().iter().copied());
+                    operations.extend(plan.transaction().operations.iter().cloned());
+                }
+                if final_kind != current.page.kind {
+                    operations.push(SemanticOperation::SetPageKind {
+                        page_id,
+                        kind: final_kind,
+                    });
+                }
+                if let Some(content) =
+                    build_existing_editor_transaction(&current, &request, &resolved)?
+                {
+                    // Requested page bytes are authoritative over any stale
+                    // target-page snapshot carried by the rename planner.
+                    operations.extend(content.operations);
+                }
+                let transaction = finish_editor_transaction(operations)?;
+                (
+                    page_id,
+                    transaction,
+                    affected.into_iter().map(|id| id.to_string()).collect(),
+                )
             }
             SyncEditorSaveTarget::New {
                 name,
@@ -5095,19 +5177,50 @@ impl RuntimeActor {
                 }
                 let page_id = PageId::new();
                 let home_document_id = DocumentId::new();
-                let transaction = build_new_editor_transaction(
+                let resolved = resolve_editor_block_ids(&request.blocks)?;
+                let requested_page = requested_new_editor_page(
                     page_id,
                     home_document_id,
                     logical_name,
-                    path,
-                    *page_kind,
+                    path.clone(),
+                    (*page_kind).into(),
                     &request,
+                    &resolved,
                 )?;
-                (page_id, Some(transaction))
+                let target = render_requested_page_document(&requested_page, None)
+                    .map_err(|_| SyncEditorRequestError::ActorRefused)?;
+                let parsed = self
+                    .graph
+                    .parse_external_document(&path, &target, false)
+                    .map_err(|_| SyncEditorRequestError::ActorRefused)?;
+                let identity = parsed.resolve_identity(None);
+                let final_name = LogicalPageName::parse(identity.name).map_err(|_| {
+                    SyncEditorRequestError::InvalidRequest(SyncEditorInvalidRequest::InvalidName)
+                })?;
+                let final_kind = model_sync_page_kind(identity.kind);
+                if runtime
+                    .engine()
+                    .current_page_for_logical_name(&final_name)
+                    .map_err(|_| SyncEditorRequestError::ActorRefused)?
+                    .is_some()
+                {
+                    return Ok(SyncEditorSaveOutcome::Conflict {
+                        reason: SyncEditorConflict::PageAlreadyExists,
+                    });
+                }
+                let transaction = build_new_editor_transaction(
+                    page_id,
+                    home_document_id,
+                    final_name,
+                    path,
+                    final_kind.into(),
+                    &request,
+                    &resolved,
+                )?;
+                (page_id, Some(transaction), vec![page_id.to_string()])
             }
         };
 
-        let affected_page_ids = vec![page_id.to_string()];
         let Some(transaction) = transaction else {
             let runtime = self
                 .runtime
@@ -9305,16 +9418,23 @@ fn sync_model_page_kind(kind: SyncPageKind) -> PageKind {
     }
 }
 
-fn build_existing_editor_transaction(
+fn model_sync_page_kind(kind: PageKind) -> ManagedTextKind {
+    match kind {
+        PageKind::Page => ManagedTextKind::Page,
+        PageKind::Journal => ManagedTextKind::Journal,
+    }
+}
+
+fn requested_existing_editor_page(
     current: &EditorCurrentPage,
     request: &SyncEditorSaveRequest,
-) -> Result<Option<OperationTransaction>, SyncEditorRequestError> {
+    resolved: &[BlockId],
+) -> Result<MaterializedPage, SyncEditorRequestError> {
     let current_by_id = current
         .blocks
         .iter()
         .map(|block| (block.block_id, block))
         .collect::<HashMap<_, _>>();
-    let resolved = resolve_editor_block_ids(&request.blocks)?;
     if resolved
         .iter()
         .zip(&request.blocks)
@@ -9327,7 +9447,112 @@ fn build_existing_editor_transaction(
             SyncEditorInvalidRequest::InvalidExistingId,
         ));
     }
-    let desired = desired_editor_memberships(&request.blocks, &resolved)?;
+    let desired = desired_editor_memberships(&request.blocks, resolved)?;
+    let blocks = request
+        .blocks
+        .iter()
+        .zip(resolved)
+        .zip(desired)
+        .map(|((block, block_id), (parent, order))| {
+            let (home_document_id, logseq_uuid, logseq_identity_origin) = match &block.key {
+                SyncEditorBlockKey::Existing(_) => {
+                    let existing = current_by_id
+                        .get(block_id)
+                        .expect("existing editor ID was validated");
+                    (
+                        existing.home_document_id,
+                        existing.logseq_uuid,
+                        existing.logseq_identity_origin.clone(),
+                    )
+                }
+                SyncEditorBlockKey::Temporary(_) => (current.page.home_document_id, None, None),
+            };
+            MaterializedBlock {
+                block_id: *block_id,
+                home_document_id,
+                parent,
+                order,
+                logseq_uuid,
+                logseq_identity_origin,
+                content: block.content.clone(),
+            }
+        })
+        .collect();
+    let mut page = current.page.clone();
+    page.preamble.clone_from(&request.preamble);
+    page.blocks = blocks;
+    Ok(page)
+}
+
+fn requested_new_editor_page(
+    page_id: PageId,
+    home_document_id: DocumentId,
+    name: LogicalPageName,
+    path: ManagedPath,
+    kind: ManagedTextKind,
+    request: &SyncEditorSaveRequest,
+    resolved: &[BlockId],
+) -> Result<MaterializedPage, SyncEditorRequestError> {
+    if request
+        .blocks
+        .iter()
+        .any(|block| matches!(block.key, SyncEditorBlockKey::Existing(_)))
+    {
+        return Err(SyncEditorRequestError::InvalidRequest(
+            SyncEditorInvalidRequest::InvalidExistingId,
+        ));
+    }
+    let desired = desired_editor_memberships(&request.blocks, resolved)?;
+    let blocks = request
+        .blocks
+        .iter()
+        .zip(resolved)
+        .zip(desired)
+        .map(|((block, block_id), (parent, order))| MaterializedBlock {
+            block_id: *block_id,
+            home_document_id,
+            parent,
+            order,
+            logseq_uuid: None,
+            logseq_identity_origin: None,
+            content: block.content.clone(),
+        })
+        .collect();
+    Ok(MaterializedPage {
+        page_id,
+        home_document_id,
+        name,
+        path,
+        kind,
+        preamble: request.preamble.clone(),
+        blocks,
+        stats: crate::oplog::MaterializationStats::default(),
+    })
+}
+
+fn build_existing_editor_transaction(
+    current: &EditorCurrentPage,
+    request: &SyncEditorSaveRequest,
+    resolved: &[BlockId],
+) -> Result<Option<OperationTransaction>, SyncEditorRequestError> {
+    let current_by_id = current
+        .blocks
+        .iter()
+        .map(|block| (block.block_id, block))
+        .collect::<HashMap<_, _>>();
+    if resolved
+        .iter()
+        .zip(&request.blocks)
+        .any(|(block_id, block)| {
+            matches!(block.key, SyncEditorBlockKey::Existing(_))
+                && !current_by_id.contains_key(block_id)
+        })
+    {
+        return Err(SyncEditorRequestError::InvalidRequest(
+            SyncEditorInvalidRequest::InvalidExistingId,
+        ));
+    }
+    let desired = desired_editor_memberships(&request.blocks, resolved)?;
     let depths = editor_outline_depths(&request.blocks);
     let mut operations = Vec::new();
 
@@ -9445,6 +9670,7 @@ fn build_new_editor_transaction(
     path: ManagedPath,
     page_kind: SyncPageKind,
     request: &SyncEditorSaveRequest,
+    resolved: &[BlockId],
 ) -> Result<OperationTransaction, SyncEditorRequestError> {
     if request
         .blocks
@@ -9455,8 +9681,7 @@ fn build_new_editor_transaction(
             SyncEditorInvalidRequest::InvalidExistingId,
         ));
     }
-    let resolved = resolve_editor_block_ids(&request.blocks)?;
-    let desired = desired_editor_memberships(&request.blocks, &resolved)?;
+    let desired = desired_editor_memberships(&request.blocks, resolved)?;
     let depths = editor_outline_depths(&request.blocks);
     let mut operations = vec![SemanticOperation::CreatePage {
         page_id,
@@ -10716,6 +10941,311 @@ mod tests {
             .unwrap_or_else(|| panic!("missing editor block containing {needle:?}: {page:?}"))
     }
 
+    fn load_editor_id(handle: &SyncRuntimeHandle, page_id: PageId) -> SyncEditablePageDto {
+        match handle
+            .load_editor_page(SyncEditorLoadRequest {
+                page: SyncEditorPageSelector::PageId {
+                    page_id: page_id.to_string(),
+                },
+            })
+            .unwrap()
+        {
+            SyncEditorLoadOutcome::Loaded { page } => page,
+            other => panic!("editor page ID did not load: {other:?}"),
+        }
+    }
+
+    fn retain_editor_save(handle: &SyncRuntimeHandle, request: SyncEditorSaveRequest) -> PageId {
+        let outcome = handle.save_editor_page(request).unwrap();
+        let page_id = match &outcome {
+            SyncEditorSaveOutcome::Durable { page, .. } => {
+                parse_editor_page_id(&page.page_id).unwrap()
+            }
+            SyncEditorSaveOutcome::Deferred {
+                state: SyncEditorDeferred::RetryableRetainedPublication { .. },
+                affected_page_ids,
+            } => {
+                let page_id = parse_editor_page_id(
+                    affected_page_ids
+                        .first()
+                        .expect("retained editor save names its target page"),
+                )
+                .unwrap();
+                settle_local_mutation(handle);
+                page_id
+            }
+            other => panic!("editor save was not retained or durable: {other:?}"),
+        };
+        page_id
+    }
+
+    #[derive(Clone, Copy)]
+    struct ExistingEditorIdentityScenario {
+        label: &'static str,
+        config: Option<&'static [u8]>,
+        path: &'static str,
+        initial: &'static [u8],
+        initial_name: &'static str,
+        initial_kind: SyncPageKind,
+        requested_preamble: Option<&'static str>,
+        expected_name: &'static str,
+        expected_kind: SyncPageKind,
+    }
+
+    struct EditorIdentityEvidence {
+        graph_name: String,
+        graph_kind: PageKind,
+        replayed_name: String,
+        replayed_kind: ManagedTextKind,
+        sqlite_name: String,
+        sqlite_kind: SyncPageKind,
+        sqlite_path: String,
+        projection: String,
+        restarted: SyncEditablePageDto,
+        second_restart: SyncEditablePageDto,
+        no_op_reimport_preserved_publication_count: bool,
+    }
+
+    fn run_existing_editor_identity_scenario(
+        scenario: &ExistingEditorIdentityScenario,
+    ) -> EditorIdentityEvidence {
+        let open_scenario = |phase, opened: SyncRuntimeOpenResult| {
+            assert_eq!(
+                opened.status,
+                SyncRuntimeOpenStatus::Active,
+                "{} {phase} open was refused",
+                scenario.label
+            );
+            opened.handle.expect("active scenario startup has a handle")
+        };
+        let fixture = match scenario.config {
+            Some(config) => RuntimeHostFixture::safe_with_config(scenario.label, config),
+            None => RuntimeHostFixture::safe(scenario.label),
+        };
+        let request = fixture.request();
+        fs::create_dir_all(
+            fixture
+                .graph_root()
+                .join(scenario.path)
+                .parent()
+                .expect("scenario path has a parent"),
+        )
+        .unwrap();
+        let handle = open_scenario("initial", SyncRuntimeHandle::open(request.clone()));
+        drive_initial_feed(&handle);
+        admit_external_page(&handle, &fixture, scenario.path, scenario.initial);
+
+        let loaded = load_editor_named(&handle, scenario.initial_name, scenario.initial_kind);
+        assert_eq!(loaded.path, scenario.path);
+        let page_id = retain_editor_save(
+            &handle,
+            SyncEditorSaveRequest {
+                target: SyncEditorSaveTarget::Existing {
+                    page_id: loaded.page_id,
+                    revision: loaded.revision,
+                },
+                preamble: scenario.requested_preamble.map(str::to_owned),
+                blocks: loaded.blocks,
+            },
+        );
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+        drop(handle);
+
+        let graph_entry = Graph::open(fixture.graph_root())
+            .list_pages()
+            .into_iter()
+            .find(|entry| entry.rel_path == scenario.path)
+            .expect("edited physical path remains present");
+        let projection = fs::read_to_string(fixture.graph_root().join(scenario.path)).unwrap();
+
+        let restarted_handle =
+            open_scenario("first restart", SyncRuntimeHandle::open(request.clone()));
+        drive_initial_feed(&restarted_handle);
+        let restarted = load_editor_id(&restarted_handle, page_id);
+        let sqlite_page = match restarted_handle
+            .query(SyncRuntimeQueryRequest::ListPages {
+                page_kind: None,
+                limit: MAX_MATERIALIZATION_QUERY_ROWS,
+            })
+            .unwrap()
+        {
+            SyncRuntimeQueryReply::Pages(pages) => pages
+                .into_iter()
+                .find(|page| page.page_id == page_id.to_string())
+                .expect("SQLite page list contains the edited page"),
+            other => panic!("SQLite page list returned the wrong reply: {other:?}"),
+        };
+        let manifests_before_noop = fixture.manifest_count();
+        restarted_handle
+            .observe_watcher(vec![
+                SyncWatcherObservation::managed_path(scenario.path).unwrap()
+            ])
+            .unwrap();
+        settle_exact_feed(&restarted_handle)
+            .unwrap_or_else(|state| panic!("unchanged reimport did not settle: {state:?}"));
+        let no_op_reimport_preserved_publication_count =
+            fixture.manifest_count() == manifests_before_noop;
+        assert!(matches!(
+            restarted_handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+        drop(restarted_handle);
+
+        let second_handle = open_scenario("second restart", SyncRuntimeHandle::open(request));
+        drive_initial_feed(&second_handle);
+        let second_restart = load_editor_id(&second_handle, page_id);
+        assert!(matches!(
+            second_handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+        let replayed = fixture.replay_materialized_page(page_id);
+
+        EditorIdentityEvidence {
+            graph_name: graph_entry.name,
+            graph_kind: graph_entry.kind,
+            replayed_name: replayed.name.as_str().to_owned(),
+            replayed_kind: replayed.kind,
+            sqlite_name: sqlite_page.name,
+            sqlite_kind: sqlite_page.kind,
+            sqlite_path: sqlite_page.path,
+            projection,
+            restarted,
+            second_restart,
+            no_op_reimport_preserved_publication_count,
+        }
+    }
+
+    fn assert_editor_identity_evidence(
+        scenario: &ExistingEditorIdentityScenario,
+        evidence: &EditorIdentityEvidence,
+    ) {
+        let expected_model_kind = sync_model_page_kind(scenario.expected_kind);
+        let expected_managed_kind: ManagedTextKind = scenario.expected_kind.into();
+        assert_eq!(evidence.graph_name, scenario.expected_name);
+        assert_eq!(evidence.graph_kind, expected_model_kind);
+        assert_eq!(evidence.replayed_name, scenario.expected_name);
+        assert_eq!(evidence.replayed_kind, expected_managed_kind);
+        assert_eq!(evidence.sqlite_name, scenario.expected_name);
+        assert_eq!(evidence.sqlite_kind, scenario.expected_kind);
+        assert_eq!(evidence.sqlite_path, scenario.path);
+        assert_eq!(evidence.restarted.name, scenario.expected_name);
+        assert_eq!(evidence.restarted.page_kind, scenario.expected_kind);
+        assert_eq!(evidence.restarted.path, scenario.path);
+        assert_eq!(evidence.second_restart, evidence.restarted);
+        assert!(evidence.no_op_reimport_preserved_publication_count);
+        if let Some(preamble) = scenario.requested_preamble {
+            assert!(
+                evidence.projection.contains(preamble),
+                "projection does not contain the requested parser-owned preamble: {:?}",
+                evidence.projection
+            );
+        }
+    }
+
+    struct NewEditorIdentityScenario {
+        label: &'static str,
+        config: &'static [u8],
+        draft_name: &'static str,
+        draft_kind: SyncPageKind,
+        preamble: &'static str,
+        expected_name: &'static str,
+        expected_kind: SyncPageKind,
+        expected_extension: &'static str,
+    }
+
+    fn run_new_editor_identity_scenario(
+        scenario: &NewEditorIdentityScenario,
+    ) -> (
+        SyncEditablePageDto,
+        crate::model::PageEntry,
+        MaterializedPage,
+        SyncPageDto,
+        String,
+    ) {
+        let fixture = RuntimeHostFixture::safe_with_config(scenario.label, scenario.config);
+        let request = fixture.request();
+        let graph = Graph::open(fixture.graph_root());
+        let selected_path = graph
+            .new_sparse_page_path(
+                scenario.draft_name,
+                sync_model_page_kind(scenario.draft_kind),
+            )
+            .unwrap();
+        let handle = active_handle(SyncRuntimeHandle::open(request.clone()));
+        drive_initial_feed(&handle);
+        let draft = match handle
+            .load_editor_page(SyncEditorLoadRequest {
+                page: SyncEditorPageSelector::Name {
+                    name: scenario.draft_name.into(),
+                    page_kind: scenario.draft_kind,
+                },
+            })
+            .unwrap()
+        {
+            SyncEditorLoadOutcome::NewPage { draft } => draft,
+            other => panic!("new-page scenario did not produce a draft: {other:?}"),
+        };
+        let page_id = retain_editor_save(
+            &handle,
+            SyncEditorSaveRequest {
+                target: SyncEditorSaveTarget::New {
+                    name: draft.name,
+                    page_kind: draft.page_kind,
+                    revision: draft.revision,
+                },
+                preamble: Some(scenario.preamble.into()),
+                blocks: vec![SyncEditorBlockDto {
+                    key: SyncEditorBlockKey::Temporary("body".into()),
+                    parent: None,
+                    content: "new explicit-title body".into(),
+                }],
+            },
+        );
+        let saved = load_editor_id(&handle, page_id);
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+        drop(handle);
+
+        let graph_entry = Graph::open(fixture.graph_root())
+            .list_pages()
+            .into_iter()
+            .find(|entry| entry.rel_path == selected_path.as_str())
+            .expect("new editor page retained the actor-selected target path");
+        let projection =
+            fs::read_to_string(fixture.graph_root().join(selected_path.as_str())).unwrap();
+        let restarted = active_handle(SyncRuntimeHandle::open(request));
+        drive_initial_feed(&restarted);
+        let restarted_page = load_editor_id(&restarted, page_id);
+        let sqlite_page = match restarted
+            .query(SyncRuntimeQueryRequest::ListPages {
+                page_kind: None,
+                limit: MAX_MATERIALIZATION_QUERY_ROWS,
+            })
+            .unwrap()
+        {
+            SyncRuntimeQueryReply::Pages(pages) => pages
+                .into_iter()
+                .find(|page| page.page_id == page_id.to_string())
+                .expect("SQLite contains the new page"),
+            other => panic!("SQLite page list returned the wrong reply: {other:?}"),
+        };
+        assert!(matches!(
+            restarted.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+        let replayed = fixture.replay_materialized_page(page_id);
+
+        assert_eq!(saved, restarted_page);
+        assert_eq!(saved.path, selected_path.as_str());
+        assert!(saved.path.ends_with(scenario.expected_extension));
+        (saved, graph_entry, replayed, sqlite_page, projection)
+    }
+
     #[test]
     fn editor_projection_match_covers_every_existing_mutation_base() {
         let page_id = PageId::from_uuid(Uuid::new_v4());
@@ -11237,6 +11767,526 @@ mod tests {
             handle.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(_)
         ));
+    }
+
+    #[test]
+    fn fresh_attack_round3_editor_title_change_must_preserve_graph_oplog_sqlite_equivalence() {
+        let scenario = ExistingEditorIdentityScenario {
+            label: "fresh-attack-r3-editor-title-authority",
+            config: None,
+            path: "content/nested pages/physical-editor-title.md",
+            initial: b"title:: Editor Title Before\n\n- body\n",
+            initial_name: "Editor Title Before",
+            initial_kind: SyncPageKind::Page,
+            requested_preamble: Some("title:: Editor Title After"),
+            expected_name: "Editor Title After",
+            expected_kind: SyncPageKind::Page,
+        };
+        let evidence = run_existing_editor_identity_scenario(&scenario);
+
+        assert_eq!(
+            (
+                evidence.graph_name.as_str(),
+                evidence.replayed_name.as_str(),
+                evidence.sqlite_name.as_str(),
+                evidence.restarted.name.as_str(),
+            ),
+            (
+                "Editor Title After",
+                "Editor Title After",
+                "Editor Title After",
+                "Editor Title After",
+            ),
+            "parser-owned title changes accepted by the editor must be one logical rename \
+             across Graph, authoritative oplog replay, SQLite, and restart"
+        );
+    }
+
+    #[test]
+    fn editor_parser_authority_matrix_covers_markdown_org_title_and_kind_transitions() {
+        const DATE_CONFIG: &[u8] = br#"{:pages-directory "content/nested pages"
+            :journals-directory "diary"
+            :journal/file-name-format "dd-MM-yyyy"
+            :journal/page-title-format "yyyy-MM-dd"}"#;
+        let scenarios = [
+            ExistingEditorIdentityScenario {
+                label: "editor-md-title-add",
+                config: None,
+                path: "content/nested pages/deep/Markdown Add.md",
+                initial: b"- body\n",
+                initial_name: "Markdown Add",
+                initial_kind: SyncPageKind::Page,
+                requested_preamble: Some("title:: Markdown Added"),
+                expected_name: "Markdown Added",
+                expected_kind: SyncPageKind::Page,
+            },
+            ExistingEditorIdentityScenario {
+                label: "editor-md-title-change",
+                config: None,
+                path: "archive/nonstandard/Markdown Change.markdown",
+                initial: b"title:: Markdown Before\n\n- body\n",
+                initial_name: "Markdown Before",
+                initial_kind: SyncPageKind::Page,
+                requested_preamble: Some("title:: Markdown After"),
+                expected_name: "Markdown After",
+                expected_kind: SyncPageKind::Page,
+            },
+            ExistingEditorIdentityScenario {
+                label: "editor-md-title-remove",
+                config: None,
+                path: "content/nested pages/deep/Markdown Removal.md",
+                initial: b"title:: Markdown Explicit\n\n- body\n",
+                initial_name: "Markdown Explicit",
+                initial_kind: SyncPageKind::Page,
+                requested_preamble: None,
+                expected_name: "Markdown Removal",
+                expected_kind: SyncPageKind::Page,
+            },
+            ExistingEditorIdentityScenario {
+                label: "editor-org-title-add",
+                config: None,
+                path: "archive/nonstandard/deep/Org Add.org",
+                initial: b"* body\n",
+                initial_name: "Org Add",
+                initial_kind: SyncPageKind::Page,
+                requested_preamble: Some("#+TITLE: Org Added"),
+                expected_name: "Org Added",
+                expected_kind: SyncPageKind::Page,
+            },
+            ExistingEditorIdentityScenario {
+                label: "editor-org-title-change",
+                config: None,
+                path: "content/nested pages/deep/Org Change.org",
+                initial: b"#+TITLE: Org Before\n\n* body\n",
+                initial_name: "Org Before",
+                initial_kind: SyncPageKind::Page,
+                requested_preamble: Some("#+TITLE: Org After"),
+                expected_name: "Org After",
+                expected_kind: SyncPageKind::Page,
+            },
+            ExistingEditorIdentityScenario {
+                label: "editor-org-title-remove",
+                config: None,
+                path: "archive/nonstandard/deep/Org Removal.org",
+                initial: b"#+TITLE: Org Explicit\n\n* body\n",
+                initial_name: "Org Explicit",
+                initial_kind: SyncPageKind::Page,
+                requested_preamble: None,
+                expected_name: "Org Removal",
+                expected_kind: SyncPageKind::Page,
+            },
+            ExistingEditorIdentityScenario {
+                label: "editor-title-page-to-journal",
+                config: Some(DATE_CONFIG),
+                path: "archive/nonstandard/Kind To Journal.md",
+                initial: b"title:: Kind Before\n\n- body\n",
+                initial_name: "Kind Before",
+                initial_kind: SyncPageKind::Page,
+                requested_preamble: Some("title:: 25-07-2026"),
+                expected_name: "2026-07-25",
+                expected_kind: SyncPageKind::Journal,
+            },
+            ExistingEditorIdentityScenario {
+                label: "editor-title-journal-to-page",
+                config: Some(DATE_CONFIG),
+                path: "archive/nonstandard/Kind To Page.org",
+                initial: b"#+TITLE: 25-07-2026\n\n* body\n",
+                initial_name: "2026-07-25",
+                initial_kind: SyncPageKind::Journal,
+                requested_preamble: Some("#+TITLE: Ordinary After"),
+                expected_name: "Ordinary After",
+                expected_kind: SyncPageKind::Page,
+            },
+        ];
+
+        for scenario in scenarios {
+            let evidence = run_existing_editor_identity_scenario(&scenario);
+            assert_editor_identity_evidence(&scenario, &evidence);
+            if scenario.requested_preamble.is_none() {
+                assert!(
+                    !evidence.projection.to_ascii_lowercase().contains("title"),
+                    "{} retained a removed explicit title: {:?}",
+                    scenario.label,
+                    evidence.projection
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn new_markdown_and_org_pages_are_born_with_parsed_final_identity_at_selected_path() {
+        const MARKDOWN_CONFIG: &[u8] = br#"{:pages-directory "content/nested pages"
+            :journals-directory "diary"
+            :preferred-format "Markdown"}"#;
+        const ORG_CONFIG: &[u8] = br#"{:pages-directory "content/nested pages"
+            :journals-directory "diary"
+            :preferred-format "Org"}"#;
+        const MARKDOWN_DATE_CONFIG: &[u8] = br#"{:pages-directory "content/nested pages"
+            :journals-directory "diary"
+            :preferred-format "Markdown"
+            :journal/file-name-format "dd-MM-yyyy"
+            :journal/page-title-format "yyyy-MM-dd"}"#;
+        const ORG_DATE_CONFIG: &[u8] = br#"{:pages-directory "content/nested pages"
+            :journals-directory "diary"
+            :preferred-format "Org"
+            :journal/file-name-format "dd-MM-yyyy"
+            :journal/page-title-format "yyyy-MM-dd"}"#;
+        let scenarios = [
+            NewEditorIdentityScenario {
+                label: "editor-new-markdown-explicit-title",
+                config: MARKDOWN_CONFIG,
+                draft_name: "Markdown Physical Draft",
+                draft_kind: SyncPageKind::Page,
+                preamble: "title:: Markdown Final",
+                expected_name: "Markdown Final",
+                expected_kind: SyncPageKind::Page,
+                expected_extension: ".md",
+            },
+            NewEditorIdentityScenario {
+                label: "editor-new-org-explicit-title",
+                config: ORG_CONFIG,
+                draft_name: "Org Physical Draft",
+                draft_kind: SyncPageKind::Page,
+                preamble: "#+TITLE: Org Final",
+                expected_name: "Org Final",
+                expected_kind: SyncPageKind::Page,
+                expected_extension: ".org",
+            },
+            NewEditorIdentityScenario {
+                label: "editor-new-markdown-page-to-journal",
+                config: MARKDOWN_DATE_CONFIG,
+                draft_name: "Markdown Physical Page Draft",
+                draft_kind: SyncPageKind::Page,
+                preamble: "title:: 25-07-2026",
+                expected_name: "2026-07-25",
+                expected_kind: SyncPageKind::Journal,
+                expected_extension: ".md",
+            },
+            NewEditorIdentityScenario {
+                label: "editor-new-org-journal-to-page",
+                config: ORG_DATE_CONFIG,
+                draft_name: "2026-07-26",
+                draft_kind: SyncPageKind::Journal,
+                preamble: "#+TITLE: Ordinary Org Final",
+                expected_name: "Ordinary Org Final",
+                expected_kind: SyncPageKind::Page,
+                expected_extension: ".org",
+            },
+        ];
+
+        for scenario in scenarios {
+            let (editor, graph, replayed, sqlite, projection) =
+                run_new_editor_identity_scenario(&scenario);
+            assert_eq!(editor.name, scenario.expected_name);
+            assert_eq!(editor.page_kind, scenario.expected_kind);
+            assert_eq!(graph.name, scenario.expected_name);
+            assert_eq!(graph.kind, sync_model_page_kind(scenario.expected_kind));
+            assert_eq!(replayed.name.as_str(), scenario.expected_name);
+            assert_eq!(replayed.kind, ManagedTextKind::from(scenario.expected_kind));
+            assert_eq!(sqlite.name, scenario.expected_name);
+            assert_eq!(sqlite.kind, scenario.expected_kind);
+            assert_eq!(sqlite.path, editor.path);
+            assert!(projection.contains(scenario.preamble));
+            assert!(projection.contains("new explicit-title body"));
+        }
+    }
+
+    #[test]
+    fn editor_final_name_collisions_refuse_existing_and_new_saves_before_publication() {
+        let fixture = RuntimeHostFixture::safe("editor-final-name-collision");
+        let handle = active_handle(SyncRuntimeHandle::open(fixture.request()));
+        drive_initial_feed(&handle);
+        let target_path = "content/nested pages/Collision Target.md";
+        let owner_path = "content/nested pages/Collision Owner.md";
+        admit_external_page(
+            &handle,
+            &fixture,
+            target_path,
+            b"title:: Collision Before\n\n- target body\n",
+        );
+        admit_external_page(
+            &handle,
+            &fixture,
+            owner_path,
+            b"title:: Collision Final\n\n- owner body\n",
+        );
+        let target = load_editor_named(&handle, "Collision Before", SyncPageKind::Page);
+        let draft = match handle
+            .load_editor_page(SyncEditorLoadRequest {
+                page: SyncEditorPageSelector::Name {
+                    name: "Collision New Physical".into(),
+                    page_kind: SyncPageKind::Page,
+                },
+            })
+            .unwrap()
+        {
+            SyncEditorLoadOutcome::NewPage { draft } => draft,
+            other => panic!("collision scenario did not produce a draft: {other:?}"),
+        };
+        let manifests_before = fixture.manifest_count();
+        let applied_before = fixture.applied_batch_count();
+        let files_before = snapshot_graph_files(fixture.graph_root());
+
+        assert_eq!(
+            handle
+                .save_editor_page(SyncEditorSaveRequest {
+                    target: SyncEditorSaveTarget::Existing {
+                        page_id: target.page_id,
+                        revision: target.revision,
+                    },
+                    preamble: Some("title:: Collision Final".into()),
+                    blocks: target.blocks,
+                })
+                .unwrap(),
+            SyncEditorSaveOutcome::Conflict {
+                reason: SyncEditorConflict::PageAlreadyExists
+            }
+        );
+        assert_eq!(
+            handle
+                .save_editor_page(SyncEditorSaveRequest {
+                    target: SyncEditorSaveTarget::New {
+                        name: draft.name,
+                        page_kind: draft.page_kind,
+                        revision: draft.revision,
+                    },
+                    preamble: Some("title:: Collision Final".into()),
+                    blocks: vec![SyncEditorBlockDto {
+                        key: SyncEditorBlockKey::Temporary("body".into()),
+                        parent: None,
+                        content: "must not publish".into(),
+                    }],
+                })
+                .unwrap(),
+            SyncEditorSaveOutcome::Conflict {
+                reason: SyncEditorConflict::PageAlreadyExists
+            }
+        );
+        assert_eq!(fixture.manifest_count(), manifests_before);
+        assert_eq!(fixture.applied_batch_count(), applied_before);
+        assert_eq!(snapshot_graph_files(fixture.graph_root()), files_before);
+        assert_eq!(
+            fs::read(fixture.graph_root().join(target_path)).unwrap(),
+            b"title:: Collision Before\n\n- target body\n"
+        );
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
+    fn editor_title_content_and_referrer_changes_share_one_atomic_user_authoritative_save() {
+        let fixture = RuntimeHostFixture::safe("editor-atomic-title-content-referrers");
+        let request = fixture.request();
+        let handle = active_handle(SyncRuntimeHandle::open(request.clone()));
+        drive_initial_feed(&handle);
+        let target_path = "content/nested pages/deep/physical atomic target.md";
+        let referrer_path = "content/nested pages/deep/atomic referrer.md";
+        fs::create_dir_all(fixture.graph_root().join(target_path).parent().unwrap()).unwrap();
+        admit_external_page(
+            &handle,
+            &fixture,
+            target_path,
+            b"title:: Atomic Before\nself:: [[Atomic Before]]\nstatus:: before\n\n- target before [[Atomic Before]]\n",
+        );
+        admit_external_page(
+            &handle,
+            &fixture,
+            referrer_path,
+            b"related:: [[Atomic Before]]\n\n- referrer [[Atomic Before]]\n",
+        );
+        let mut target = load_editor_named(&handle, "Atomic Before", SyncPageKind::Page);
+        target.blocks[0].content = "target user final [[Atomic Before]]".into();
+        let target_id = parse_editor_page_id(&target.page_id).unwrap();
+        let referrer = load_editor_named(&handle, "atomic referrer", SyncPageKind::Page);
+        let referrer_id = parse_editor_page_id(&referrer.page_id).unwrap();
+
+        let outcome = handle
+            .save_editor_page(SyncEditorSaveRequest {
+                target: SyncEditorSaveTarget::Existing {
+                    page_id: target.page_id,
+                    revision: target.revision,
+                },
+                preamble: Some(
+                    "title:: Atomic After\nself:: [[Atomic Before]]\nstatus:: user final".into(),
+                ),
+                blocks: target.blocks,
+            })
+            .unwrap();
+        let affected = match outcome {
+            SyncEditorSaveOutcome::Durable {
+                affected_page_ids, ..
+            } => affected_page_ids,
+            SyncEditorSaveOutcome::Deferred {
+                state: SyncEditorDeferred::RetryableRetainedPublication { .. },
+                affected_page_ids,
+            } => {
+                settle_local_mutation(&handle);
+                affected_page_ids
+            }
+            other => panic!("atomic editor rename was not retained or durable: {other:?}"),
+        };
+        assert_eq!(
+            affected.into_iter().collect::<BTreeSet<_>>(),
+            BTreeSet::from([target_id.to_string(), referrer_id.to_string()])
+        );
+
+        let saved_target = load_editor_id(&handle, target_id);
+        let saved_referrer = load_editor_id(&handle, referrer_id);
+        assert_eq!(saved_target.name, "Atomic After");
+        assert_eq!(saved_target.path, target_path);
+        assert_eq!(
+            saved_target.preamble.as_deref(),
+            Some("title:: Atomic After\nself:: [[Atomic Before]]\nstatus:: user final")
+        );
+        assert_eq!(
+            saved_target.blocks[0].content,
+            "target user final [[Atomic Before]]"
+        );
+        assert_eq!(
+            saved_referrer.preamble.as_deref(),
+            Some("related:: [[Atomic After]]")
+        );
+        assert_eq!(
+            saved_referrer.blocks[0].content,
+            "referrer [[Atomic After]]"
+        );
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+        drop(handle);
+
+        let restarted = active_handle(SyncRuntimeHandle::open(request));
+        drive_initial_feed(&restarted);
+        assert_eq!(load_editor_id(&restarted, target_id), saved_target);
+        assert_eq!(load_editor_id(&restarted, referrer_id), saved_referrer);
+        assert!(matches!(
+            restarted.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
+    fn editor_content_saves_retain_accepted_identity_across_filename_and_journal_policy_changes() {
+        struct PolicyScenario {
+            label: &'static str,
+            initial_config: &'static [u8],
+            current_config: &'static [u8],
+            path: &'static str,
+            initial: &'static [u8],
+            accepted_name: &'static str,
+            accepted_kind: SyncPageKind,
+        }
+        let scenarios = [
+            PolicyScenario {
+                label: "editor-filename-policy-retention",
+                initial_config: br#"{:pages-directory "content/nested pages"
+                    :journals-directory "diary"
+                    :file/name-format :legacy}"#,
+                current_config: br#"{:pages-directory "content/nested pages"
+                    :journals-directory "diary"
+                    :file/name-format :triple-lowbar}"#,
+                path: "content/nested pages/A.B.md",
+                initial: b"- before policy change\n",
+                accepted_name: "A/B",
+                accepted_kind: SyncPageKind::Page,
+            },
+            PolicyScenario {
+                label: "editor-journal-policy-retention",
+                initial_config: br#"{:pages-directory "content/nested pages"
+                    :journals-directory "diary"
+                    :journal/file-name-format "dd-MM-yyyy"
+                    :journal/page-title-format "yyyy-MM-dd"}"#,
+                current_config: br#"{:pages-directory "content/nested pages"
+                    :journals-directory "diary"
+                    :journal/file-name-format "dd-MM-yyyy"
+                    :journal/page-title-format "MMM d, yyyy"}"#,
+                path: "diary/physical journal policy.md",
+                initial: b"title:: 25-07-2026\n\n- before journal policy change\n",
+                accepted_name: "2026-07-25",
+                accepted_kind: SyncPageKind::Journal,
+            },
+        ];
+
+        for scenario in scenarios {
+            let fixture =
+                RuntimeHostFixture::safe_with_config(scenario.label, scenario.initial_config);
+            let request = fixture.request();
+            let first = active_handle(SyncRuntimeHandle::open(request.clone()));
+            drive_initial_feed(&first);
+            admit_external_page(&first, &fixture, scenario.path, scenario.initial);
+            let accepted_row = match first
+                .query(SyncRuntimeQueryRequest::ListPages {
+                    page_kind: None,
+                    limit: MAX_MATERIALIZATION_QUERY_ROWS,
+                })
+                .unwrap()
+            {
+                SyncRuntimeQueryReply::Pages(pages) => pages
+                    .into_iter()
+                    .find(|page| page.path == scenario.path)
+                    .unwrap_or_else(|| panic!("{} was not imported", scenario.label)),
+                other => panic!("SQLite page list returned the wrong reply: {other:?}"),
+            };
+            assert_eq!(
+                accepted_row.name, scenario.accepted_name,
+                "{}",
+                scenario.label
+            );
+            assert_eq!(
+                accepted_row.kind, scenario.accepted_kind,
+                "{}",
+                scenario.label
+            );
+            let accepted = load_editor_id(&first, parse_page_id(&accepted_row.page_id).unwrap());
+            let page_id = parse_editor_page_id(&accepted.page_id).unwrap();
+            assert!(matches!(
+                first.clean_shutdown().unwrap(),
+                SyncShutdownOutcome::Safe(_)
+            ));
+            drop(first);
+
+            fs::write(
+                fixture.graph_root().join("logseq/config.edn"),
+                scenario.current_config,
+            )
+            .unwrap();
+            let reopened = active_handle(SyncRuntimeHandle::open(request.clone()));
+            drive_initial_feed(&reopened);
+            let mut loaded = load_editor_id(&reopened, page_id);
+            loaded.blocks[0].content.push_str(" edited");
+            retain_editor_save(
+                &reopened,
+                SyncEditorSaveRequest {
+                    target: SyncEditorSaveTarget::Existing {
+                        page_id: loaded.page_id,
+                        revision: loaded.revision,
+                    },
+                    preamble: loaded.preamble,
+                    blocks: loaded.blocks,
+                },
+            );
+            let saved = load_editor_id(&reopened, page_id);
+            assert_eq!(saved.name, scenario.accepted_name);
+            assert_eq!(saved.page_kind, scenario.accepted_kind);
+            assert_eq!(saved.path, scenario.path);
+            assert!(saved.blocks[0].content.ends_with(" edited"));
+            assert!(matches!(
+                reopened.clean_shutdown().unwrap(),
+                SyncShutdownOutcome::Safe(_)
+            ));
+            drop(reopened);
+
+            let restarted = active_handle(SyncRuntimeHandle::open(request));
+            drive_initial_feed(&restarted);
+            assert_eq!(load_editor_id(&restarted, page_id), saved);
+            assert!(matches!(
+                restarted.clean_shutdown().unwrap(),
+                SyncShutdownOutcome::Safe(_)
+            ));
+        }
     }
 
     #[test]

@@ -53,8 +53,9 @@ use super::{
     StructuralSpan, WorkspaceId, DIFF_SCHEMA_VERSION,
 };
 use crate::model::{
-    path_is_sync_conflict, BootstrapSourceCapture, BootstrapSourceCaptureInstrumentation,
-    BootstrapSourceChunk, BootstrapSourceEntry, Graph, PageEntry, PageKind,
+    path_is_sync_conflict, resolve_external_document_identity, AcceptedExternalDocumentIdentity,
+    BootstrapSourceCapture, BootstrapSourceCaptureInstrumentation, BootstrapSourceChunk,
+    BootstrapSourceEntry, Graph, PageEntry, PageKind,
 };
 
 #[cfg(test)]
@@ -5181,17 +5182,18 @@ struct DesiredPageTransition {
 }
 
 fn imported_identity(
-    entry: &PageEntry,
+    name: &str,
+    kind: PageKind,
     path: &ManagedPath,
 ) -> Result<ImportedPathIdentity, ImportBlock> {
-    let name = LogicalPageName::parse(entry.name.clone()).map_err(|error| {
+    let name = LogicalPageName::parse(name.to_owned()).map_err(|error| {
         authority_block(
             ImportBlockReason::UnsafeInput,
             Some(path),
             format!("parsed external document has an invalid logical page name: {error}"),
         )
     })?;
-    let kind = match entry.kind {
+    let kind = match kind {
         PageKind::Page => ManagedTextKind::Page,
         PageKind::Journal => ManagedTextKind::Journal,
     };
@@ -5223,11 +5225,9 @@ fn resolve_import_path_identities(
                 "present external document has no parser-owned semantic result",
             )
         })?;
-        let identity = match page_matches.get(path) {
-            None => imported_identity(current.selected_identity(), path)?,
-            Some(matched) if matched.basis() != PageMatchBasis::SamePathCompletion => {
-                imported_identity(current.selected_identity(), path)?
-            }
+        let accepted = match page_matches.get(path) {
+            None => None,
+            Some(matched) if matched.basis() != PageMatchBasis::SamePathCompletion => None,
             Some(matched) => {
                 let Some(ScopedPathEvidence::Existing(existing)) =
                     scope.paths.get(matched.previous_path())
@@ -5247,16 +5247,23 @@ fn resolve_import_path_identities(
                         "authenticated completed-base document has no parser-owned semantic result",
                     )
                 })?;
-                if current.explicit_title == base.explicit_title {
-                    ImportedPathIdentity {
-                        name: existing.materialized_page().name.clone(),
-                        kind: existing.materialized_page().kind,
-                    }
-                } else {
-                    imported_identity(current.selected_identity(), path)?
-                }
+                Some(AcceptedExternalDocumentIdentity {
+                    name: existing.materialized_page().name.as_str(),
+                    kind: match existing.materialized_page().kind {
+                        ManagedTextKind::Page => PageKind::Page,
+                        ManagedTextKind::Journal => PageKind::Journal,
+                    },
+                    explicit_title: base.explicit_title.as_deref(),
+                })
             }
         };
+        let identity = resolve_external_document_identity(
+            current.explicit_title.as_deref(),
+            &current.filename_fallback,
+            &current.effective,
+            accepted,
+        );
+        let identity = imported_identity(&identity.name, identity.kind, path)?;
         identities.insert(path.clone(), identity);
     }
     Ok(identities)
@@ -6136,16 +6143,6 @@ impl std::ops::Deref for ParsedExternalTree {
 
     fn deref(&self) -> &Self::Target {
         &self.tree
-    }
-}
-
-impl ParsedExternalTree {
-    fn selected_identity(&self) -> &PageEntry {
-        if self.explicit_title.is_some() {
-            &self.effective
-        } else {
-            &self.filename_fallback
-        }
     }
 }
 

@@ -1613,13 +1613,14 @@ pub(crate) mod tests {
     }
 
     fn configured_fixture(label: &str) -> Fixture {
-        Fixture::new(
+        configured_fixture_with_config(
             label,
-            Some(
-                b"{:pages-directory \"content/nested pages\" :journals-directory \"diary/\xE6\x97\xA5\xE8\xA8\x98\"}\n",
-            ),
-            [],
+            b"{:pages-directory \"content/nested pages\" :journals-directory \"diary/\xE6\x97\xA5\xE8\xA8\x98\"}\n",
         )
+    }
+
+    fn configured_fixture_with_config(label: &str, config: &[u8]) -> Fixture {
+        Fixture::new(label, Some(config), [])
     }
 
     #[test]
@@ -2594,7 +2595,14 @@ pub(crate) mod tests {
 
     impl RuntimeHostFixture {
         pub(crate) fn safe(label: &str) -> Self {
-            let mut fixture = configured_fixture(label);
+            Self::safe_with_fixture(label, configured_fixture(label))
+        }
+
+        pub(crate) fn safe_with_config(label: &str, config: &[u8]) -> Self {
+            Self::safe_with_fixture(label, configured_fixture_with_config(label, config))
+        }
+
+        fn safe_with_fixture(label: &str, mut fixture: Fixture) -> Self {
             let enrollment = fixture.enrollment_root(label);
             let enrollment_path = enrollment.path().to_path_buf();
             let paths = PromotedPaths::new(&fixture, label);

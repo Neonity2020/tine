@@ -302,15 +302,23 @@ fn render_projection(
     expected_base: Option<&[u8]>,
     expected_base_annotations: Option<&[AnnotatedIdentity]>,
 ) -> Result<RenderedProjection, ProjectionError> {
-    let format = format_for_page(&state.page)?;
+    render_projection_page(&state.page, expected_base, expected_base_annotations)
+}
+
+fn render_projection_page(
+    page: &MaterializedPage,
+    expected_base: Option<&[u8]>,
+    expected_base_annotations: Option<&[AnnotatedIdentity]>,
+) -> Result<RenderedProjection, ProjectionError> {
+    let format = format_for_page(page)?;
     let base_text = expected_base
         .map(|bytes| {
             std::str::from_utf8(bytes).map_err(|_| ProjectionError::InvalidUtf8("projection base"))
         })
         .transpose()?;
-    let mut metadata = ProjectionMetadata::with_capacity(state.page.blocks.len());
-    let document = build_projection_document(
-        state,
+    let mut metadata = ProjectionMetadata::with_capacity(page.blocks.len());
+    let document = build_page_document(
+        page,
         format,
         ProjectionRenderMode::Sparse,
         Some(&mut metadata),
@@ -342,6 +350,15 @@ fn render_projection(
     })
 }
 
+/// Render a complete editor-requested page through the exact projection
+/// serializer without creating an intent or touching the graph directory.
+pub(crate) fn render_requested_page_document(
+    page: &MaterializedPage,
+    expected_base: Option<&[u8]>,
+) -> Result<Vec<u8>, ProjectionError> {
+    render_projection_page(page, expected_base, None).map(|rendered| rendered.target)
+}
+
 #[cfg(test)]
 fn render_dense_projection_bytes(
     state: &ProjectionPageState,
@@ -368,14 +385,23 @@ fn build_projection_document(
     mode: ProjectionRenderMode,
     mut metadata: Option<&mut ProjectionMetadata>,
 ) -> Result<Document, ProjectionError> {
-    let forest = ValidatedForest::new(&state.page.blocks)?;
-    let raw_ids = collect_raw_logseq_ids(&state.page.blocks, format);
-    validate_logseq_state(&state.page.blocks, &raw_ids)?;
+    build_page_document(&state.page, format, mode, metadata.as_deref_mut())
+}
+
+fn build_page_document(
+    page: &MaterializedPage,
+    format: ProjectionFormat,
+    mode: ProjectionRenderMode,
+    mut metadata: Option<&mut ProjectionMetadata>,
+) -> Result<Document, ProjectionError> {
+    let forest = ValidatedForest::new(&page.blocks)?;
+    let raw_ids = collect_raw_logseq_ids(&page.blocks, format);
+    validate_logseq_state(&page.blocks, &raw_ids)?;
 
     let mut roots = Vec::with_capacity(forest.roots.len());
     for (root_position, index) in forest.roots.iter().copied().enumerate() {
         roots.push(build_doc_block(
-            &state.page.blocks,
+            &page.blocks,
             &forest,
             index,
             vec![u32_index(root_position)?],
@@ -387,7 +413,7 @@ fn build_projection_document(
     }
 
     Ok(Document {
-        pre_block: state.page.preamble.clone(),
+        pre_block: page.preamble.clone(),
         roots,
     })
 }
