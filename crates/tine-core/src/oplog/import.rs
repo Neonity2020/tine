@@ -2232,7 +2232,13 @@ fn spool_bootstrap_operations(
 
         let mut parser_instrumentation = ImportInstrumentation::default();
         let tree = parse_nodes(entry.path(), bytes.as_slice(), &mut parser_instrumentation)
-            .map_err(|block| BootstrapStreamingImportError::InvalidSource(block.detail))?;
+            .map_err(|block| {
+                BootstrapStreamingImportError::InvalidSource(format!(
+                    "{}: {}",
+                    entry.path(),
+                    block.detail
+                ))
+            })?;
         if tree.nodes.len() as u32 > MAX_PARSED_NODES_PER_SOURCE_FILE {
             return Err(BootstrapStreamingImportError::ResourceLimit {
                 resource: "parser nodes per source file",
@@ -2271,8 +2277,15 @@ fn spool_bootstrap_operations(
             .max(tree.nodes.len() as u64);
         let mut node_ids = Vec::with_capacity(tree.nodes.len());
         for index in 0..tree.nodes.len() {
-            let locator = materialize_locator(&tree, index, &mut parser_instrumentation)
-                .map_err(|block| BootstrapStreamingImportError::InvalidSource(block.detail))?;
+            let locator = materialize_locator(&tree, index, &mut parser_instrumentation).map_err(
+                |block| {
+                    BootstrapStreamingImportError::InvalidSource(format!(
+                        "{}: {}",
+                        entry.path(),
+                        block.detail
+                    ))
+                },
+            )?;
             let block_id =
                 import_id.unmatched_block_id(&ImportLocator::block(entry.path().clone(), locator));
             let parent = tree.nodes[index].parent.map(|parent| node_ids[parent]);
@@ -9398,9 +9411,12 @@ mod tests {
                 &target_catalog(&root.path().join("archive"), workspace),
                 &preparation_scratch,
             );
+            let Err(BootstrapStreamingImportError::InvalidSource(detail)) = result else {
+                panic!("{label} constructed bootstrap publication");
+            };
             assert!(
-                matches!(result, Err(BootstrapStreamingImportError::InvalidSource(_))),
-                "{label} constructed bootstrap publication"
+                detail.starts_with(&format!("{path}: ")),
+                "{label} omitted the graph-relative source path: {detail}"
             );
             assert_eq!(fs::read(target).unwrap(), source.as_bytes());
         }
