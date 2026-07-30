@@ -21102,12 +21102,22 @@ fn open_projection_file_nofollow_for_sync(dir: &Dir, name: &str) -> io::Result<f
 #[cfg(windows)]
 fn open_projection_file_nofollow_for_sync(dir: &Dir, name: &str) -> io::Result<fs::File> {
     use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
+    use cap_std::fs::OpenOptionsExt as _;
     use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
 
     #[cfg(test)]
     PROJECTION_EXACT_OPEN_COUNT.with(|count| count.set(count.get() + 1));
     let mut options = CapOpenOptions::new();
-    options.read(true).write(true).follow(FollowSymlinks::No);
+    options
+        .read(true)
+        .write(true)
+        .follow(FollowSymlinks::No)
+        .access_mode(GENERIC_READ | GENERIC_WRITE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
     let file = dir.open_with(name, &options)?.into_std();
     let metadata = file.metadata()?;
     if !metadata.is_file()
@@ -27519,7 +27529,7 @@ fn validate_projection_recovery_object_exact(
     expected_identity: ContentDigest,
 ) -> io::Result<()> {
     let (recovery_file, recovery_bytes) =
-        open_and_read_projection_regular(parent.final_dir(), recovery)?;
+        sync_open_and_read_projection_regular(parent.final_dir(), recovery)?;
     let recovery_identity = canonical_projection_file_resource_id(&recovery_file)?;
     if recovery_identity != expected_identity {
         return Err(io::Error::new(
