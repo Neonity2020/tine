@@ -8872,6 +8872,51 @@ mod tests {
     }
 
     #[test]
+    fn sparse_observation_accepts_promoted_heading_spans_and_locators_in_source_order() {
+        let fixture = SnapshotFixture::new("promoted-heading-sparse-spans", &["pages/a.md"]);
+        let bytes = b"# Project\n\t- child one\n\t- child two\n- sibling\n\t- nested sibling child";
+        fs::write(fixture.graph_root.join("pages/a.md"), bytes).unwrap();
+        let plan = fixture.plan(&["pages/a.md"]);
+        assert_eq!(plan.status(), ImportPlanStatus::Reconcile);
+        let annotations = plan.execution_material().unwrap().observation().entries()[0]
+            .state()
+            .annotations();
+        let starts = [
+            b"# Project".as_slice(),
+            b"\t- child one".as_slice(),
+            b"\t- child two".as_slice(),
+            b"- sibling".as_slice(),
+            b"\t- nested sibling child".as_slice(),
+        ]
+        .map(|needle| {
+            bytes
+                .windows(needle.len())
+                .position(|window| window == needle)
+                .unwrap() as u64
+        });
+        assert_eq!(
+            annotations
+                .iter()
+                .map(|annotation| (annotation.span().start(), annotation.span().end()))
+                .collect::<Vec<_>>(),
+            vec![
+                (starts[0], starts[1]),
+                (starts[1], starts[2]),
+                (starts[2], starts[3]),
+                (starts[3], starts[4]),
+                (starts[4], bytes.len() as u64),
+            ]
+        );
+        assert_eq!(
+            annotations
+                .iter()
+                .map(|annotation| annotation.locator().components().to_vec())
+                .collect::<Vec<_>>(),
+            vec![vec![0], vec![0, 0], vec![0, 1], vec![1], vec![1, 0]]
+        );
+    }
+
+    #[test]
     fn parser_owned_spans_cover_literal_regions_crlf_preambles_and_multiple_roots() {
         fn offsets(text: &[u8], needles: &[&[u8]]) -> Vec<u64> {
             needles
@@ -8959,6 +9004,56 @@ mod tests {
         );
         assert_eq!(tree.roots, vec![0]);
         assert_eq!(tree.nodes[0].children, vec![1, 2]);
+    }
+
+    #[test]
+    fn lsdoc_promoted_heading_nested_run_has_exact_crlf_parser_owned_spans() {
+        let bytes = b"title:: Synthetic\r\n\r\n# Project \xce\xa9\r\n\t- child one\r\n\t- child two\r\n- sibling\r\n\t- nested sibling child\r\n";
+        let path = ManagedPath::parse("pages/promoted-nested.md").unwrap();
+        let mut instrumentation = ImportInstrumentation::default();
+        let tree = parse_nodes(&path, bytes, &mut instrumentation).unwrap();
+        let starts = [
+            b"# Project \xce\xa9".as_slice(),
+            b"\t- child one".as_slice(),
+            b"\t- child two".as_slice(),
+            b"- sibling".as_slice(),
+            b"\t- nested sibling child".as_slice(),
+        ]
+        .map(|needle| {
+            bytes
+                .windows(needle.len())
+                .position(|window| window == needle)
+                .unwrap() as u64
+        });
+        assert_eq!(
+            tree.nodes
+                .iter()
+                .map(|node| (node.span.start(), node.span.end()))
+                .collect::<Vec<_>>(),
+            vec![
+                (starts[0], starts[1]),
+                (starts[1], starts[2]),
+                (starts[2], starts[3]),
+                (starts[3], starts[4]),
+                (starts[4], bytes.len() as u64),
+            ]
+        );
+        assert_eq!(tree.roots, vec![0, 3]);
+        assert_eq!(tree.nodes[0].children, vec![1, 2]);
+        assert_eq!(tree.nodes[3].children, vec![4]);
+    }
+
+    #[test]
+    fn inactive_bootstrap_accepts_lsdoc_promoted_heading_source() {
+        let source =
+            "# Project\n\t- child one\n\t- child two\n- sibling\n\t- nested sibling child\n";
+        let (_root, prepared, _) = prepare_streaming_bootstrap(
+            "bootstrap-promoted-heading",
+            &[("pages/promoted.md", source)],
+        );
+        assert_eq!(prepared.aggregate().parts().len(), 1);
+        assert_eq!(prepared.instrumentation().parser_nodes, 5);
+        assert!(prepared.instrumentation().source_spans >= 5);
     }
 
     #[test]

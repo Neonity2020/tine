@@ -54,9 +54,10 @@ pub(crate) struct ParsedDocument {
     pub(crate) blank_lines_after_preamble: usize,
     /// Empty lines before the first block when no semantic preamble exists.
     pub(crate) leading_blank_lines: usize,
-    /// The first root is an importer-style collapsed ATX heading that remains
-    /// unbulleted while owning the following outline blocks as children.
-    pub(crate) promoted_collapsed_preamble_heading: bool,
+    /// Exact source layout when the first root is an lsdoc-authorized ATX
+    /// preamble heading that remains unbulleted while owning following outline
+    /// blocks as children. Org documents never have this Markdown-only layout.
+    pub(crate) promoted_heading_layout: Option<PromotedHeadingLayout>,
 }
 
 /// One receipt-proved association between a source structural locator and the
@@ -810,70 +811,231 @@ fn has_bounded_org_closer(following: &[&str], content_start: usize, name: &str) 
     false
 }
 
-fn markdown_property_line(line: &str) -> bool {
-    let Some((key, _)) = line.trim().split_once("::") else {
-        return false;
-    };
-    !key.is_empty()
-        && key
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '/' | '-'))
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PromotedHeadingLayout {
+    /// Importer compatibility: unindented bullets following a collapsed heading
+    /// were historically interpreted as that heading's children.
+    FlatChildren,
+    /// Native Markdown outline: lsdoc reports the owned bullets deeper than the
+    /// unbulleted heading, so children retain one indentation level on write.
+    NestedChildren,
 }
 
-/// Recover a Logseq block shape emitted by some importers/plugins:
-///
-/// ```markdown
-/// # Parent heading
-/// collapsed:: true
-/// - child
-/// - child
-/// ```
-///
-/// The ATX heading is not list-bulleted, so the generic outline parser would put
-/// it in the page preamble and expose its children as roots. Logseq nevertheless
-/// treats this particular shape as one collapsed parent. Promote it narrowly:
-/// only an ATX heading at the END of the preamble, followed solely by block
-/// property lines and carrying `collapsed:: true`. Ordinary page prose/headings
-/// and genuine page properties remain untouched.
-fn promote_preamble_collapsed_heading(
-    pre_block: &mut Option<String>,
-    roots: &mut Vec<DocBlock>,
-) -> Option<(usize, usize)> {
-    if roots.is_empty() {
-        return None;
+#[derive(Clone, Copy, Debug)]
+struct PreambleHeadingPromotion {
+    heading_line: usize,
+    owned_outline_end: Option<usize>,
+    layout: PromotedHeadingLayout,
+}
+
+fn outline_event(block: &lsdoc::ast::Block) -> Option<(u32, lsdoc::ast::Span)> {
+    use lsdoc::ast::Block;
+    match block {
+        Block::Heading {
+            level,
+            span: Some(span),
+            ..
+        }
+        | Block::Bullet {
+            level,
+            span: Some(span),
+            ..
+        } => Some((*level, *span)),
+        _ => None,
     }
-    let Some(pre) = pre_block.as_deref() else {
-        return None;
-    };
-    let lines: Vec<&str> = pre.split('\n').collect();
-    let Some(start) = lines.iter().rposition(|line| {
-        let trimmed = line.trim_start();
-        let hashes = trimmed.chars().take_while(|c| *c == '#').count();
-        (1..=6).contains(&hashes) && trimmed.as_bytes().get(hashes) == Some(&b' ')
-    }) else {
-        return None;
-    };
-    if !lines[start + 1..]
+}
+
+/// Ask lsdoc whether the semantic suffix of Tine's preamble is an unbulleted
+/// heading followed by an outline run it owns. The old structural scanner still
+/// materializes the blocks for this bridge; lsdoc alone authorizes the heading
+/// and supplies the levels/spans that bound ownership.
+fn preamble_heading_promotion(
+    body: &str,
+    lines: &[&str],
+    line_starts: &[usize],
+    pre_end: usize,
+    first_bullet_line: usize,
+) -> Option<PreambleHeadingPromotion> {
+    use lsdoc::ast::Block;
+
+    let first_outline_start = *line_starts.get(first_bullet_line)?;
+    let semantic_preamble_end = pre_end
+        .checked_sub(1)
+        .and_then(|line| line_starts.get(line).zip(lines.get(line)))
+        .map(|(start, line)| start.saturating_add(line.len()))?;
+    // Necessary-only fast path: every Markdown ATX heading contains `#` in
+    // its semantic preamble source. Keep this deliberately broader than syntax
+    // recognition (including unusual leading whitespace); lsdoc below remains
+    // the sole authority for whether any such byte is actually a heading.
+    if !lines[..pre_end]
         .iter()
-        .all(|line| !line.trim().is_empty() && markdown_property_line(line))
+        .any(|line| line.as_bytes().contains(&b'#'))
     {
         return None;
     }
-
-    let raw = lines[start..].join("\n");
-    let mut parent = DocBlock::new(raw);
-    if parent.heading_level().is_none() || !parent.collapsed() {
+    let blocks = lsdoc::parse(body, "md");
+    let (heading_index, heading_level, heading_span) = blocks
+        .iter()
+        .enumerate()
+        .filter_map(|(index, block)| match block {
+            Block::Heading {
+                level,
+                span: Some(span),
+                ..
+            } if span.0 < first_outline_start => Some((index, *level, *span)),
+            _ => None,
+        })
+        .next_back()?;
+    let heading_line = line_starts.binary_search(&heading_span.0).ok()?;
+    if heading_line >= pre_end {
         return None;
     }
-    parent.children = std::mem::take(roots);
-    roots.push(parent);
 
-    let mut pre_end = start;
-    while pre_end > 0 && lines[pre_end - 1].trim().is_empty() {
-        pre_end -= 1;
+    let mut suffix_owned_through = heading_span.1;
+    let mut first_outline = None;
+    for block in &blocks[heading_index + 1..] {
+        if let Some(event) = outline_event(block) {
+            first_outline = Some(event);
+            break;
+        }
+        match block {
+            Block::Properties {
+                span: Some(span), ..
+            } if span.0 < first_outline_start => {
+                suffix_owned_through = suffix_owned_through.max(span.1);
+            }
+            Block::Paragraph {
+                span: Some(span), ..
+            } if span.1 <= first_outline_start
+                && body
+                    .get(span.0..span.1)
+                    .is_some_and(|source| source.trim().is_empty()) =>
+            {
+                suffix_owned_through = suffix_owned_through.max(span.1);
+            }
+            _ => return None,
+        }
     }
-    *pre_block = (pre_end > 0).then(|| lines[..pre_end].join("\n"));
-    Some((start, start.saturating_sub(pre_end)))
+    if suffix_owned_through < semantic_preamble_end {
+        return None;
+    }
+
+    let (first_level, first_span) = first_outline?;
+    if first_span.0 != first_outline_start {
+        return None;
+    }
+    let raw = lines[heading_line..pre_end].join("\n");
+    let layout = if first_level > heading_level {
+        PromotedHeadingLayout::NestedChildren
+    } else if first_level == heading_level && DocBlock::new(raw).collapsed() {
+        PromotedHeadingLayout::FlatChildren
+    } else {
+        return None;
+    };
+    let owned_outline_end = match layout {
+        PromotedHeadingLayout::FlatChildren => None,
+        PromotedHeadingLayout::NestedChildren => blocks[heading_index + 1..]
+            .iter()
+            .filter_map(outline_event)
+            .skip(1)
+            .find_map(|(level, span)| (level <= heading_level).then_some(span.0)),
+    };
+    Some(PreambleHeadingPromotion {
+        heading_line,
+        owned_outline_end,
+        layout,
+    })
+}
+
+/// Ask lsdoc whether writing `raw` as an unbulleted heading followed by one
+/// serializer-level child still forms a bounded nested-heading promotion. The
+/// synthetic root boundary prevents the probe child from claiming an
+/// unbounded suffix; no handwritten heading or property grammar participates.
+fn lsdoc_authorizes_nested_heading_raw(raw: &str, indent: &str) -> bool {
+    const CHILD_PROBE: &str = "tine nested-heading child probe";
+    const BOUNDARY_PROBE: &str = "tine nested-heading boundary probe";
+
+    let first_bullet_line = raw.split('\n').count();
+    let body = format!("{raw}\n{indent}- {CHILD_PROBE}\n- {BOUNDARY_PROBE}");
+    let lines = body.split('\n').collect::<Vec<_>>();
+    let mut line_starts = Vec::with_capacity(lines.len());
+    let mut line_start = 0_usize;
+    for line in &lines {
+        line_starts.push(line_start);
+        line_start = line_start.saturating_add(line.len()).saturating_add(1);
+    }
+    let boundary_start = line_starts
+        .get(first_bullet_line.saturating_add(1))
+        .copied();
+
+    matches!(
+        preamble_heading_promotion(
+            &body,
+            &lines,
+            &line_starts,
+            first_bullet_line,
+            first_bullet_line,
+        ),
+        Some(PreambleHeadingPromotion {
+            heading_line: 0,
+            owned_outline_end: Some(owned_outline_end),
+            layout: PromotedHeadingLayout::NestedChildren,
+        }) if Some(owned_outline_end) == boundary_start
+    )
+}
+
+fn block_subtree_len(block: &DocBlock) -> usize {
+    block.children.iter().fold(1_usize, |total, child| {
+        total.saturating_add(block_subtree_len(child))
+    })
+}
+
+/// Promote the lsdoc-authorized preamble heading and only the structural roots
+/// whose source headers fall inside lsdoc's owned outline interval.
+fn promote_preamble_heading(
+    pre_block: &mut Option<String>,
+    roots: &mut Vec<DocBlock>,
+    block_starts: &[usize],
+    lines: &[&str],
+    pre_end: usize,
+    promotion: PreambleHeadingPromotion,
+) -> Option<(usize, usize)> {
+    if roots.is_empty() || pre_block.is_none() {
+        return None;
+    }
+
+    let raw = lines[promotion.heading_line..pre_end].join("\n");
+    let mut parent = DocBlock::new(raw);
+    let mut block_index = 0_usize;
+    let mut owned_roots = 0_usize;
+    let mut boundary_aligned = promotion.owned_outline_end.is_none();
+    for root in roots.iter() {
+        let start = *block_starts.get(block_index)?;
+        if promotion
+            .owned_outline_end
+            .is_some_and(|owned_outline_end| start >= owned_outline_end)
+        {
+            boundary_aligned = Some(start) == promotion.owned_outline_end;
+            break;
+        }
+        owned_roots = owned_roots.saturating_add(1);
+        block_index = block_index.saturating_add(block_subtree_len(root));
+    }
+    if owned_roots == 0 || !boundary_aligned {
+        return None;
+    }
+    parent.children = roots.drain(..owned_roots).collect();
+    roots.insert(0, parent);
+
+    let mut prefix_end = promotion.heading_line;
+    while prefix_end > 0 && lines[prefix_end - 1].trim().is_empty() {
+        prefix_end -= 1;
+    }
+    *pre_block = (prefix_end > 0).then(|| lines[..prefix_end].join("\n"));
+    Some((
+        promotion.heading_line,
+        promotion.heading_line.saturating_sub(prefix_end),
+    ))
 }
 
 pub fn parse(content: &str) -> Document {
@@ -947,6 +1109,9 @@ pub(crate) fn parse_with_source_spans(content: &str) -> ParsedDocument {
     } else {
         (pre_lines.len().saturating_sub(pre_end), 0)
     };
+    let heading_promotion = first_bullet.and_then(|first_bullet_line| {
+        preamble_heading_promotion(body, &lines, &line_starts, pre_end, first_bullet_line)
+    });
 
     // Build the block forest with a stack of frames keyed by indent column.
     struct Frame {
@@ -1059,17 +1224,29 @@ pub(crate) fn parse_with_source_spans(content: &str) -> ParsedDocument {
     }
     fold_to(&mut stack, &mut roots, 0);
 
-    let mut promoted_collapsed_preamble_heading = false;
-    if let Some((promoted_line, separator_lines)) =
-        promote_preamble_collapsed_heading(&mut pre_block, &mut roots)
-    {
-        promoted_collapsed_preamble_heading = true;
-        block_starts.insert(0, line_starts[promoted_line]);
-        blank_lines_before_blocks.insert(0, 0);
-        if pre_block.is_some() {
-            blank_lines_after_preamble = separator_lines;
-        } else {
-            leading_blank_lines = separator_lines;
+    let mut promoted_heading_layout = None;
+    if let Some(promotion) = heading_promotion {
+        let blank_lines_after_heading = blank_lines_after_preamble;
+        if let Some((promoted_line, separator_lines)) = promote_preamble_heading(
+            &mut pre_block,
+            &mut roots,
+            &block_starts,
+            &lines,
+            pre_end,
+            promotion,
+        ) {
+            promoted_heading_layout = Some(promotion.layout);
+            block_starts.insert(0, line_starts[promoted_line]);
+            blank_lines_before_blocks.insert(0, 0);
+            if let Some(first_child_blank_lines) = blank_lines_before_blocks.get_mut(1) {
+                *first_child_blank_lines =
+                    first_child_blank_lines.saturating_add(blank_lines_after_heading);
+            }
+            if pre_block.is_some() {
+                blank_lines_after_preamble = separator_lines;
+            } else {
+                leading_blank_lines = separator_lines;
+            }
         }
     }
 
@@ -1095,7 +1272,7 @@ pub(crate) fn parse_with_source_spans(content: &str) -> ParsedDocument {
         blank_lines_before_blocks,
         blank_lines_after_preamble,
         leading_blank_lines,
-        promoted_collapsed_preamble_heading,
+        promoted_heading_layout,
     }
 }
 
@@ -1125,8 +1302,8 @@ pub struct SerializeOpts {
     source_document: Option<Document>,
     source_blank_lines_before_blocks: Vec<usize>,
     identity_bound_blank_lines: Vec<IdentityBoundBlankLines>,
-    source_promoted_collapsed_preamble_heading: bool,
-    promoted_collapsed_block_identity: Option<String>,
+    source_promoted_heading_layout: Option<PromotedHeadingLayout>,
+    promoted_heading_identity: Option<String>,
     /// Whitespace for one level of indentation (e.g. `"\t"` or `"  "`).
     pub indent: String,
 }
@@ -1140,8 +1317,8 @@ impl Default for SerializeOpts {
             source_document: None,
             source_blank_lines_before_blocks: Vec::new(),
             identity_bound_blank_lines: Vec::new(),
-            source_promoted_collapsed_preamble_heading: false,
-            promoted_collapsed_block_identity: None,
+            source_promoted_heading_layout: None,
+            promoted_heading_identity: None,
             indent: "\t".into(),
         }
     }
@@ -1180,7 +1357,8 @@ impl SerializeOpts {
             &mut locator_indexes,
         );
         let mut identity_bound_blank_lines = Vec::with_capacity(identities.len());
-        let mut promoted_collapsed_block_identity = None;
+        let source_promoted_heading_layout = parsed.promoted_heading_layout;
+        let mut promoted_heading_identity = None;
         for identity in identities {
             let Some(index) = locator_indexes.get(identity.locator.as_slice()).copied() else {
                 continue;
@@ -1192,8 +1370,8 @@ impl SerializeOpts {
                 block_identity: identity.block_identity.clone(),
                 blank_lines,
             });
-            if parsed.promoted_collapsed_preamble_heading && identity.locator.as_slice() == [0] {
-                promoted_collapsed_block_identity = Some(identity.block_identity.clone());
+            if source_promoted_heading_layout.is_some() && identity.locator.as_slice() == [0] {
+                promoted_heading_identity = Some(identity.block_identity.clone());
             }
         }
         SerializeOpts {
@@ -1210,8 +1388,8 @@ impl SerializeOpts {
             source_document: Some(parsed.document),
             source_blank_lines_before_blocks: parsed.blank_lines_before_blocks,
             identity_bound_blank_lines,
-            source_promoted_collapsed_preamble_heading: parsed.promoted_collapsed_preamble_heading,
-            promoted_collapsed_block_identity,
+            source_promoted_heading_layout,
+            promoted_heading_identity,
             indent,
         }
     }
@@ -1236,16 +1414,32 @@ impl SerializeOpts {
         resolved
     }
 
-    pub(crate) fn preserves_promoted_collapsed_heading(&self, doc: &Document) -> bool {
+    fn promoted_heading_layout(&self, doc: &Document) -> Option<PromotedHeadingLayout> {
         if self.source_document.as_ref() == Some(doc) {
-            return self.source_promoted_collapsed_preamble_heading;
+            return self.source_promoted_heading_layout;
         }
-        doc.roots.len() == 1
-            && doc.roots.first().is_some_and(|block| {
-                !block.uuid.is_empty()
-                    && self.promoted_collapsed_block_identity.as_deref()
-                        == Some(block.uuid.as_str())
-            })
+        let promoted_identity_remains_first = doc.roots.first().is_some_and(|block| {
+            !block.uuid.is_empty()
+                && self.promoted_heading_identity.as_deref() == Some(block.uuid.as_str())
+        });
+        match self.source_promoted_heading_layout {
+            Some(PromotedHeadingLayout::FlatChildren)
+                if promoted_identity_remains_first && doc.roots.len() == 1 =>
+            {
+                Some(PromotedHeadingLayout::FlatChildren)
+            }
+            Some(PromotedHeadingLayout::NestedChildren)
+                if promoted_identity_remains_first
+                    && doc.roots[0].children.first().is_some()
+                    && lsdoc_authorizes_nested_heading_raw(
+                        &doc.roots[0].raw,
+                        self.indent.as_str(),
+                    ) =>
+            {
+                Some(PromotedHeadingLayout::NestedChildren)
+            }
+            _ => None,
+        }
     }
 }
 
@@ -1329,7 +1523,7 @@ pub fn serialize_with(doc: &Document, opts: &SerializeOpts) -> String {
         out.extend(std::iter::repeat_with(String::new).take(opts.leading_blank_lines));
     }
     let blank_lines_before_blocks = opts.resolved_blank_lines(doc);
-    let promoted_collapsed_preamble_heading = opts.preserves_promoted_collapsed_heading(doc);
+    let promoted_heading_layout = opts.promoted_heading_layout(doc);
     let mut block_index = 0_usize;
     for block in &doc.roots {
         emit_block(
@@ -1338,7 +1532,7 @@ pub fn serialize_with(doc: &Document, opts: &SerializeOpts) -> String {
             &opts.indent,
             &blank_lines_before_blocks,
             &mut block_index,
-            promoted_collapsed_preamble_heading,
+            promoted_heading_layout,
             &mut out,
         );
     }
@@ -1353,10 +1547,10 @@ fn emit_block(
     unit: &str,
     blank_lines_before_blocks: &[usize],
     block_index: &mut usize,
-    promoted_collapsed_preamble_heading: bool,
+    promoted_heading_layout: Option<PromotedHeadingLayout>,
     out: &mut Vec<String>,
 ) {
-    let unbulleted_promoted_heading = promoted_collapsed_preamble_heading && *block_index == 0;
+    let unbulleted_promoted_heading = promoted_heading_layout.is_some() && *block_index == 0;
     let blank_lines = blank_lines_before_blocks
         .get(*block_index)
         .copied()
@@ -1365,14 +1559,18 @@ fn emit_block(
     *block_index = block_index.saturating_add(1);
     if unbulleted_promoted_heading {
         out.extend(block.raw.split('\n').map(ToOwned::to_owned));
+        let child_level = match promoted_heading_layout {
+            Some(PromotedHeadingLayout::NestedChildren) => level.saturating_add(1),
+            Some(PromotedHeadingLayout::FlatChildren) | None => level,
+        };
         for child in &block.children {
             emit_block(
                 child,
-                level,
+                child_level,
                 unit,
                 blank_lines_before_blocks,
                 block_index,
-                promoted_collapsed_preamble_heading,
+                promoted_heading_layout,
                 out,
             );
         }
@@ -1400,7 +1598,7 @@ fn emit_block(
             unit,
             blank_lines_before_blocks,
             block_index,
-            promoted_collapsed_preamble_heading,
+            promoted_heading_layout,
             out,
         );
     }
@@ -1410,7 +1608,10 @@ fn emit_block(
 /// the exact source bytes. Mixed line endings and non-uniform indentation fail
 /// closed because detected formatting deliberately has one representation.
 pub fn markdown_round_trips(content: &str) -> bool {
-    let mut rendered = serialize_with(&parse(content), &SerializeOpts::detect(Some(content)));
+    let parsed = parse_with_source_spans(content);
+    let document = parsed.document.clone();
+    let opts = SerializeOpts::from_parsed_source(content, parsed, detect_indent(content), &[]);
+    let mut rendered = serialize_with(&document, &opts);
     if content.contains("\r\n") {
         rendered = rendered.replace('\n', "\r\n");
     }
@@ -1498,6 +1699,253 @@ mod property_fence_tests {
                 parsed.roots
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod promoted_heading_tests {
+    use super::*;
+
+    const NESTED_SOURCE: &str =
+        "# Project\n\t- child one\n\t- child two\n- sibling\n\t- nested sibling child";
+
+    fn assign_layout_identities(doc: &mut Document) -> Vec<StructuralLayoutIdentity> {
+        fn visit(
+            blocks: &mut [DocBlock],
+            locator: &mut Vec<u32>,
+            identities: &mut Vec<StructuralLayoutIdentity>,
+        ) {
+            for (position, block) in blocks.iter_mut().enumerate() {
+                locator.push(position as u32);
+                block.uuid = format!("block-{}", identities.len());
+                identities.push(StructuralLayoutIdentity {
+                    locator: locator.clone(),
+                    block_identity: block.uuid.clone(),
+                });
+                visit(&mut block.children, locator, identities);
+                locator.pop();
+            }
+        }
+
+        let mut identities = Vec::new();
+        visit(&mut doc.roots, &mut Vec::new(), &mut identities);
+        identities
+    }
+
+    fn semantic_locators(doc: &Document) -> Vec<(Vec<u32>, String)> {
+        fn visit(
+            blocks: &[DocBlock],
+            locator: &mut Vec<u32>,
+            locators: &mut Vec<(Vec<u32>, String)>,
+        ) {
+            for (position, block) in blocks.iter().enumerate() {
+                locator.push(position as u32);
+                locators.push((locator.clone(), block.raw.clone()));
+                visit(&block.children, locator, locators);
+                locator.pop();
+            }
+        }
+
+        let mut locators = Vec::new();
+        visit(&doc.roots, &mut Vec::new(), &mut locators);
+        locators
+    }
+
+    #[test]
+    fn lsdoc_nested_outline_promotes_only_the_heading_owned_run() {
+        let doc = parse(NESTED_SOURCE);
+        assert_eq!(doc.pre_block, None);
+        assert_eq!(doc.roots.len(), 2);
+        assert_eq!(doc.roots[0].raw, "# Project");
+        assert_eq!(
+            doc.roots[0]
+                .children
+                .iter()
+                .map(|block| block.raw.as_str())
+                .collect::<Vec<_>>(),
+            vec!["child one", "child two"]
+        );
+        assert_eq!(doc.roots[1].raw, "sibling");
+        assert_eq!(doc.roots[1].children.len(), 1);
+        assert_eq!(doc.roots[1].children[0].raw, "nested sibling child");
+        assert_eq!(
+            serialize_with(&doc, &SerializeOpts::detect(Some(NESTED_SOURCE))),
+            NESTED_SOURCE
+        );
+        assert!(markdown_round_trips(NESTED_SOURCE));
+    }
+
+    #[test]
+    fn edited_promoted_heading_keeps_nested_layout_while_identity_stays_first() {
+        let mut doc = parse(NESTED_SOURCE);
+        let identities = assign_layout_identities(&mut doc);
+        let opts = SerializeOpts::detect_with_layout_identities(Some(NESTED_SOURCE), &identities);
+
+        doc.roots[0].children[0].raw = "child one edited".into();
+        doc.roots.push(DocBlock::new("later sibling"));
+
+        assert_eq!(
+            serialize_with(&doc, &opts),
+            "# Project\n\t- child one edited\n\t- child two\n- sibling\n\t- nested sibling child\n- later sibling"
+        );
+    }
+
+    #[test]
+    fn edited_promoted_heading_without_children_canonicalizes_before_later_sibling() {
+        let source = "# Project\n\t- only child\n- sibling";
+        let mut doc = parse(source);
+        let identities = assign_layout_identities(&mut doc);
+        let opts = SerializeOpts::detect_with_layout_identities(Some(source), &identities);
+        doc.roots[0].children.clear();
+        let expected_locators = semantic_locators(&doc);
+
+        let rendered = serialize_with(&doc, &opts);
+        assert_eq!(rendered, "- # Project\n- sibling");
+        let reparsed = parse(&rendered);
+        assert_eq!(reparsed, doc);
+        assert_eq!(semantic_locators(&reparsed), expected_locators);
+    }
+
+    #[test]
+    fn edited_promoted_heading_without_children_canonicalizes_as_sole_root() {
+        let source = "# Project\n\t- only child";
+        let mut doc = parse(source);
+        let identities = assign_layout_identities(&mut doc);
+        let opts = SerializeOpts::detect_with_layout_identities(Some(source), &identities);
+        doc.roots[0].children.clear();
+        let expected_locators = semantic_locators(&doc);
+
+        let rendered = serialize_with(&doc, &opts);
+        assert_eq!(rendered, "- # Project");
+        let reparsed = parse(&rendered);
+        assert_eq!(reparsed, doc);
+        assert_eq!(semantic_locators(&reparsed), expected_locators);
+    }
+
+    #[test]
+    fn edited_promoted_heading_non_heading_raw_canonicalizes_complete_tree() {
+        let mut doc = parse(NESTED_SOURCE);
+        let identities = assign_layout_identities(&mut doc);
+        let opts = SerializeOpts::detect_with_layout_identities(Some(NESTED_SOURCE), &identities);
+        doc.roots[0].raw = "Project renamed".into();
+        let expected_locators = semantic_locators(&doc);
+
+        let rendered = serialize_with(&doc, &opts);
+        assert_eq!(
+            rendered,
+            "- Project renamed\n\t- child one\n\t- child two\n- sibling\n\t- nested sibling child"
+        );
+        let reparsed = parse(&rendered);
+        assert_eq!(reparsed, doc);
+        assert_eq!(semantic_locators(&reparsed), expected_locators);
+    }
+
+    #[test]
+    fn legacy_collapsed_heading_keeps_flat_children() {
+        let source = "# Parent\ncollapsed:: true\n- child\n- sibling";
+        let doc = parse(source);
+        assert_eq!(doc.pre_block, None);
+        assert_eq!(doc.roots.len(), 1);
+        assert_eq!(doc.roots[0].raw, "# Parent\ncollapsed:: true");
+        assert_eq!(doc.roots[0].children.len(), 2);
+        assert_eq!(
+            serialize_with(&doc, &SerializeOpts::detect(Some(source))),
+            source
+        );
+    }
+
+    #[test]
+    fn edited_legacy_flat_heading_with_later_root_canonicalizes_without_reparenting() {
+        let source = "# Parent\ncollapsed:: true\n- child\n- sibling";
+        let mut doc = parse(source);
+        let identities = assign_layout_identities(&mut doc);
+        let opts = SerializeOpts::detect_with_layout_identities(Some(source), &identities);
+        doc.roots.push(DocBlock::new("later root"));
+
+        let rendered = serialize_with(&doc, &opts);
+        assert_eq!(
+            rendered,
+            "- # Parent\n  collapsed:: true\n\t- child\n\t- sibling\n- later root"
+        );
+        let reparsed = parse(&rendered);
+        assert_eq!(reparsed, doc);
+        assert_eq!(
+            semantic_locators(&reparsed),
+            vec![
+                (vec![0], "# Parent\ncollapsed:: true".into()),
+                (vec![0, 0], "child".into()),
+                (vec![0, 1], "sibling".into()),
+                (vec![1], "later root".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn unrepresentable_heading_boundary_after_child_run_fails_closed() {
+        for source in [
+            "# Parent\n\t- child\n# Same-level boundary",
+            "## Parent\n\t\t- child\n# Shallower boundary",
+        ] {
+            let parsed = parse_with_source_spans(source);
+            assert_eq!(parsed.promoted_heading_layout, None, "{source:?}");
+            assert!(
+                parsed.document.pre_block.is_some(),
+                "the heading must remain preamble when its boundary cannot be represented: {source:?}"
+            );
+            assert!(
+                !markdown_round_trips(source),
+                "bootstrap must refuse a source whose boundary Tine cannot preserve: {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn promoted_heading_multi_level_indent_jump_preserves_semantics() {
+        let source = "# Project\n\t\t\t- deep child\n- sibling";
+        let parsed = parse_with_source_spans(source);
+        assert_eq!(
+            parsed.promoted_heading_layout,
+            Some(PromotedHeadingLayout::NestedChildren)
+        );
+        let expected = parsed.document.clone();
+        let opts = SerializeOpts::from_parsed_source(source, parsed, detect_indent(source), &[]);
+        let rendered = serialize_with(&expected, &opts);
+        assert_eq!(rendered, "# Project\n\t- deep child\n- sibling");
+        assert_eq!(parse(&rendered), expected);
+    }
+
+    #[test]
+    fn promoted_heading_with_lone_cr_fails_closed() {
+        let source = "# Project\r\t- child\r- sibling";
+        assert!(!markdown_round_trips(source));
+    }
+
+    #[test]
+    fn ordinary_heading_does_not_own_a_same_level_bullet() {
+        let source = "# Notes\n- ordinary root";
+        let doc = parse(source);
+        assert_eq!(doc.pre_block.as_deref(), Some("# Notes"));
+        assert_eq!(doc.roots.len(), 1);
+        assert_eq!(doc.roots[0].raw, "ordinary root");
+        assert_eq!(
+            serialize_with(&doc, &SerializeOpts::detect(Some(source))),
+            source
+        );
+    }
+
+    #[test]
+    fn promoted_heading_keeps_blank_lines_on_both_sides() {
+        let source = "title:: Page\n\n# Project\n\n\t- child\n- sibling";
+        let doc = parse(source);
+        assert_eq!(doc.pre_block.as_deref(), Some("title:: Page"));
+        assert_eq!(doc.roots.len(), 2);
+        assert_eq!(doc.roots[0].raw, "# Project");
+        assert_eq!(doc.roots[0].children[0].raw, "child");
+        assert_eq!(
+            serialize_with(&doc, &SerializeOpts::detect(Some(source))),
+            source
+        );
+        assert!(markdown_round_trips(source));
     }
 }
 

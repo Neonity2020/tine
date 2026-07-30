@@ -119,7 +119,7 @@ pub(crate) fn parse_org_with_source_spans(content: &str) -> ParsedDocument {
             blank_lines_before_blocks: Vec::new(),
             blank_lines_after_preamble: 0,
             leading_blank_lines: 0,
-            promoted_collapsed_preamble_heading: false,
+            promoted_heading_layout: None,
         };
     }
     let lines: Vec<&str> = body.split('\n').collect();
@@ -205,7 +205,7 @@ pub(crate) fn parse_org_with_source_spans(content: &str) -> ParsedDocument {
         blank_lines_before_blocks,
         blank_lines_after_preamble: 0,
         leading_blank_lines: 0,
-        promoted_collapsed_preamble_heading: false,
+        promoted_heading_layout: None,
     }
 }
 
