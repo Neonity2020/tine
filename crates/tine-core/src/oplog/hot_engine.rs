@@ -16056,6 +16056,7 @@ impl ShardedHotEngine {
         let PageState::Live {
             path,
             home_document_id,
+            kind,
             ..
         } = selected_after
         else {
@@ -16078,6 +16079,7 @@ impl ShardedHotEngine {
             *home_document_id,
             path,
             selection.exact_name(),
+            *kind,
             matching_preambles.first().cloned().cloned(),
         )?;
         let projection = super::projection_manifest::validate_projection_object_set(

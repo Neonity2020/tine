@@ -497,6 +497,7 @@ impl EffectiveExplicitTitleState {
         home_document_id: DocumentId,
         path: &ManagedPath,
         selected_name: &LogicalPageName,
+        selected_kind: ManagedTextKind,
         transition: Option<PagePreambleDelta>,
     ) -> Result<Self, SemanticError> {
         let Some(transition) = transition else {
@@ -517,8 +518,14 @@ impl EffectiveExplicitTitleState {
             .after
             .as_ref()
             .expect("authenticated transition has an after state");
+        // Journal preambles retain the configured authored date while the
+        // authenticated PageState carries the parser-normalized logical name.
         match explicit_title_line(after.preamble.as_deref(), path.is_org()) {
-            Some((_, _, title)) if title == selected_name.as_str() => Ok(Self::Present(transition)),
+            Some((_, _, title))
+                if selected_kind == ManagedTextKind::Journal || title == selected_name.as_str() =>
+            {
+                Ok(Self::Present(transition))
+            }
             None => Ok(Self::Absent {
                 page_id,
                 home_document_id,
@@ -1206,6 +1213,7 @@ mod tests {
             home,
             &ManagedPath::parse("pages/physical.md").unwrap(),
             &selected_name,
+            ManagedTextKind::Page,
             Some(selected_preamble.clone()),
         )
         .unwrap();
@@ -1281,6 +1289,7 @@ mod tests {
             home,
             &path,
             &selected_name,
+            ManagedTextKind::Page,
             None,
         )
         .unwrap();
@@ -1315,6 +1324,7 @@ mod tests {
             home,
             &path,
             &selected_name,
+            ManagedTextKind::Page,
             Some(selected_transition),
         )
         .unwrap();
@@ -1330,6 +1340,45 @@ mod tests {
             inserted.after.as_ref().unwrap().preamble.as_deref(),
             Some("title:: Café Plan\nalias:: keep"),
             "selected explicit title is added without dropping unrelated preamble"
+        );
+
+        let journal_name = LogicalPageName::parse("2026-07-25").unwrap();
+        let journal_transition = PagePreambleDelta {
+            page_id,
+            home_document_id: home,
+            before: Some(preamble_state(Some("alias:: keep"))),
+            after: Some(preamble_state(Some("alias:: keep\ntitle:: 25-07-2026"))),
+        };
+        assert_eq!(
+            EffectiveExplicitTitleState::from_authenticated_transition(
+                page_id,
+                home,
+                &path,
+                &journal_name,
+                ManagedTextKind::Page,
+                Some(journal_transition.clone()),
+            ),
+            Err(SemanticError::InvalidEffectiveTitleSplice),
+            "ordinary pages still require exact parser-owned title text"
+        );
+        let selected_journal = EffectiveExplicitTitleState::from_authenticated_transition(
+            page_id,
+            home,
+            &path,
+            &journal_name,
+            ManagedTextKind::Journal,
+            Some(journal_transition),
+        )
+        .unwrap();
+        let mut journal_preamble = Some("title:: losing\nproperty:: keep".to_owned());
+        selected_journal
+            .apply_to_preamble(&path, &mut journal_preamble)
+            .unwrap();
+        assert_eq!(
+            journal_preamble.as_deref(),
+            Some("title:: 25-07-2026\nproperty:: keep"),
+            "journal authority preserves the authenticated authored title while the parser owns \
+             its normalized logical name"
         );
     }
 
