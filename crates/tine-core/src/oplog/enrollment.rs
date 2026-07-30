@@ -6820,7 +6820,7 @@ fn rename_noreplace(directory: &Dir, from: &str, to: &str) -> std::io::Result<()
             from.as_ptr(),
             directory.as_fd().as_raw_fd(),
             to.as_ptr(),
-            libc::RENAME_NOREPLACE,
+            libc::RENAME_NOREPLACE as libc::c_uint,
         )
     };
     if result == 0 {
