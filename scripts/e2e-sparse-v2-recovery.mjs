@@ -167,15 +167,17 @@ function captureRoot(name) {
 }
 
 async function exactElement(selector, text) {
+  const expected = text.normalize("NFC");
   for (const element of await browser.$$(selector)) {
-    if ((await element.getText()).trim() === text) return element;
+    if ((await element.getText()).trim().normalize("NFC") === expected) return element;
   }
   return undefined;
 }
 
 async function elementContaining(selector, text) {
+  const expected = text.normalize("NFC");
   for (const element of await browser.$$(selector)) {
-    if ((await element.getText()).includes(text)) return element;
+    if ((await element.getText()).normalize("NFC").includes(expected)) return element;
   }
   return undefined;
 }
@@ -209,7 +211,8 @@ async function assertVisible(text, label) {
 async function assertTitle(name) {
   const title = await browser.$("h1.page-title");
   await title.waitForExist({ timeout: 15_000 });
-  await browser.waitUntil(async () => (await title.getText()).trim() === name, {
+  await browser.waitUntil(async () =>
+    (await title.getText()).trim().normalize("NFC") === name.normalize("NFC"), {
     timeout: 15_000,
     timeoutMsg: `did not open ${JSON.stringify(name)}`,
   });
