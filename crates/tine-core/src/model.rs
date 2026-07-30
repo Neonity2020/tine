@@ -6393,7 +6393,13 @@ impl Graph {
         destination: &Path,
         trash: &Path,
     ) -> io::Result<()> {
-        self.managed_create_dir_all(permit, trash)?;
+        self.managed_create_dir_all(permit, trash).map_err(|error| {
+            let display = trash.strip_prefix(&self.root).unwrap_or(trash).display();
+            io::Error::new(
+                error.kind(),
+                format!("could not prepare trash path {display}: {error}"),
+            )
+        })?;
         self.managed_move_noreplace(permit, source, destination)
     }
 
