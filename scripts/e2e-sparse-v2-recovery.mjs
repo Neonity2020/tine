@@ -168,10 +168,14 @@ function captureRoot(name) {
 
 async function exactElement(selector, text) {
   const expected = text.normalize("NFC");
-  for (const element of await browser.$$(selector)) {
-    if ((await element.getText()).trim().normalize("NFC") === expected) return element;
-  }
-  return undefined;
+  // WebKitWebDriver's getText() can report an empty string for a visible,
+  // non-interactive div. Inspect text only to locate the rendered row, then
+  // perform the actual user action through WebDriver below.
+  const index = await browser.execute((candidateSelector, candidateText) =>
+    [...document.querySelectorAll(candidateSelector)].findIndex((element) =>
+      (element.textContent ?? "").trim().normalize("NFC") === candidateText
+    ), selector, expected);
+  return index >= 0 ? (await browser.$$(selector))[index] : undefined;
 }
 
 async function elementContaining(selector, text) {
