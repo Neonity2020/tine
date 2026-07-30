@@ -1399,9 +1399,12 @@ mod tests {
     use std::collections::BTreeMap;
     use tine_core::model::Graph;
     use tine_core::sync_runtime::{
-        SyncEditorBlockDto, SyncEditorBlockKey, SyncEditorLoadOutcome, SyncEditorLoadRequest,
-        SyncEditorPageSelector, SyncEditorSaveOutcome, SyncEditorSaveRequest, SyncEditorSaveTarget,
-        SyncEntityId, SyncPageKind, SyncPageNameResolutionDto, SyncRuntimeQueryReply,
+        SyncApplicationPageLoadOutcome, SyncApplicationPageLoadRequest,
+        SyncApplicationPageSaveOutcome, SyncApplicationPageSaveRequest,
+        SyncApplicationPageSaveTarget, SyncApplicationPageSelector, SyncEditorBlockDto,
+        SyncEditorBlockKey, SyncEditorLoadOutcome, SyncEditorLoadRequest, SyncEditorPageSelector,
+        SyncEditorSaveOutcome, SyncEditorSaveRequest, SyncEditorSaveTarget, SyncEntityId,
+        SyncLocalMutationOutcome, SyncPageKind, SyncPageNameResolutionDto, SyncRuntimeQueryReply,
         SyncRuntimeQueryRequest, SyncSearchHitDto, SyncWatcherObservation,
     };
 
@@ -1998,13 +2001,13 @@ mod tests {
         let root = std::env::temp_dir().join(format!("tine-sparse-app-journey-{}", Uuid::new_v4()));
         let graph_root = root.join("graph");
         let private = root.join("private");
-        let relative = "archive/層/計画.md";
+        let relative = "archive/層/Résumé 日本語.md";
         std::fs::create_dir_all(graph_root.join("pages")).unwrap();
         std::fs::create_dir_all(graph_root.join("journals")).unwrap();
         std::fs::create_dir_all(graph_root.join("archive/層")).unwrap();
         std::fs::write(
             graph_root.join(relative),
-            "- present before sparse activation\n",
+            "- nested UTF original content — café 日本語\n",
         )
         .unwrap();
 
@@ -2081,6 +2084,79 @@ mod tests {
         }
 
         let loaded = handle
+            .load_application_page(SyncApplicationPageLoadRequest {
+                page: SyncApplicationPageSelector::ExactPath {
+                    path: relative.into(),
+                },
+            })
+            .unwrap();
+        let SyncApplicationPageLoadOutcome::Loaded { mut page, revision } = loaded else {
+            panic!(
+                "activation did not expose the existing page through the app gateway: {loaded:?}"
+            );
+        };
+        page.blocks[0]
+            .raw
+            .push_str(" sparse v2 saved existing UTF page");
+        let saved = handle
+            .save_application_page(SyncApplicationPageSaveRequest {
+                target: SyncApplicationPageSaveTarget::Existing {
+                    path: relative.into(),
+                    revision,
+                },
+                page,
+            })
+            .unwrap();
+        let SyncApplicationPageSaveOutcome::Saved {
+            page: saved_page,
+            revision: saved_revision,
+            ..
+        } = saved
+        else {
+            panic!(
+                "activation-imported existing page did not save through the app gateway: {saved:?}"
+            );
+        };
+        assert_eq!(saved_page.path, relative);
+        assert_eq!(
+            saved_page.blocks[0].raw,
+            "nested UTF original content — café 日本語 sparse v2 saved existing UTF page"
+        );
+        let reloaded = handle
+            .load_application_page(SyncApplicationPageLoadRequest {
+                page: SyncApplicationPageSelector::ExactPath {
+                    path: relative.into(),
+                },
+            })
+            .unwrap();
+        assert!(
+            matches!(
+                &reloaded,
+                SyncApplicationPageLoadOutcome::Loaded {
+                    page,
+                    revision,
+                } if page.path == relative
+                    && page.blocks[0].raw
+                        == "nested UTF original content — café 日本語 sparse v2 saved existing UTF page"
+                    && revision == &saved_revision
+            ),
+            "application gateway did not reload its accepted semantic result: {reloaded:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(graph_root.join(relative)).unwrap(),
+            "- nested UTF original content — café 日本語 sparse v2 saved existing UTF page\n"
+        );
+        let independently_parsed = Graph::open(&graph_root)
+            .load_by_path(relative)
+            .unwrap()
+            .expect("materialized nested UTF page must remain independently parseable");
+        assert_eq!(independently_parsed.path, relative);
+        assert_eq!(
+            independently_parsed.blocks[0].raw,
+            "nested UTF original content — café 日本語 sparse v2 saved existing UTF page"
+        );
+
+        let loaded = handle
             .load_editor_page(SyncEditorLoadRequest {
                 page: SyncEditorPageSelector::Name {
                     name: "Boundary page".into(),
@@ -2106,7 +2182,30 @@ mod tests {
                 }],
             })
             .unwrap();
-        assert!(matches!(saved, SyncEditorSaveOutcome::Durable { .. }));
+        if matches!(
+            saved,
+            SyncEditorSaveOutcome::Deferred {
+                state: tine_core::sync_runtime::SyncEditorDeferred::RetryableRetainedPublication { .. },
+                ..
+            }
+        ) {
+            let mut durable = false;
+            for _ in 0..64 {
+                if matches!(
+                    handle.tick().unwrap(),
+                    SyncRuntimeTick::LocalMutation(SyncLocalMutationOutcome::Durable { .. })
+                ) {
+                    durable = true;
+                    break;
+                }
+            }
+            assert!(durable, "retained new-page save did not become durable");
+        } else {
+            assert!(
+                matches!(saved, SyncEditorSaveOutcome::Durable { .. }),
+                "new-page save after existing-page save was not accepted: {saved:?}"
+            );
+        }
 
         let searched = handle
             .query(SyncRuntimeQueryRequest::Search {
@@ -2147,7 +2246,7 @@ mod tests {
         let reloaded = handle
             .load_editor_page(SyncEditorLoadRequest {
                 page: SyncEditorPageSelector::Name {
-                    name: "計画".into(),
+                    name: "Résumé 日本語".into(),
                     page_kind: SyncPageKind::Page,
                 },
             })

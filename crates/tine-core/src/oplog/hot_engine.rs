@@ -12382,15 +12382,19 @@ impl ShardedHotEngine {
         for document in frontier.documents() {
             for batch_id in document.direct_dependency_heads() {
                 accepted_heads = accepted_heads.saturating_add(1);
-                if !matches!(
+                let accepted = matches!(
                     self.archive_status(*batch_id)?,
                     Some(ArchiveStatus::Accepted { .. })
-                ) || !matches!(
+                );
+                let ordinary_ready = matches!(
                     store
                         .inspect_batch(*batch_id)
                         .map_err(|error| EngineError::Archive(error.to_string()))?,
                     BatchInspection::Ready(_)
-                ) {
+                );
+                let bootstrap_ready =
+                    !ordinary_ready && self.load_retained_bootstrap_part(*batch_id)?.is_some();
+                if !accepted || (!ordinary_ready && !bootstrap_ready) {
                     return Err(EngineError::ProjectionFrontierNotDurable(*batch_id));
                 }
             }
