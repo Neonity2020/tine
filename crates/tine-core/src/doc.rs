@@ -1618,6 +1618,24 @@ pub fn markdown_round_trips(content: &str) -> bool {
     rendered == content
 }
 
+/// Whether parsing and format-preserving serialization retain the complete
+/// document model, even when insignificant source trivia is canonicalized.
+///
+/// Sparse-v2 admission uses this structural criterion: activation preserves the
+/// original source bytes and its backup, so harmless whitespace normalization
+/// must not prevent import. A later edit may canonicalize that trivia, but it
+/// may not change block content or ancestry.
+pub fn markdown_structurally_round_trips(content: &str) -> bool {
+    let parsed = parse_with_source_spans(content);
+    let document = parsed.document.clone();
+    let opts = SerializeOpts::from_parsed_source(content, parsed, detect_indent(content), &[]);
+    let mut rendered = serialize_with(&document, &opts);
+    if content.contains("\r\n") {
+        rendered = rendered.replace('\n', "\r\n");
+    }
+    parse(&rendered) == document
+}
+
 #[cfg(test)]
 mod property_fence_tests {
     use super::*;
@@ -1699,6 +1717,26 @@ mod property_fence_tests {
                 parsed.roots
             );
         }
+    }
+
+    #[test]
+    fn whitespace_bearing_continuation_blank_is_structurally_safe() {
+        let source = concat!(
+            "- ### Synthetic parent\n",
+            "\t- First line,\n",
+            "\t  wrapped continuation\n",
+            "\t  \n",
+            "\t  final paragraph"
+        );
+
+        assert!(
+            !markdown_round_trips(source),
+            "the byte-exact diagnostic must still report canonicalized trivia"
+        );
+        assert!(
+            markdown_structurally_round_trips(source),
+            "formatting-only blank-line trivia must not block sparse activation"
+        );
     }
 }
 

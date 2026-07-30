@@ -6419,7 +6419,7 @@ fn parse_external_nodes(
             if is_org {
                 "external Org source is byte-preserved and read-only because its heading structure is not editable and does not round-trip exactly"
             } else {
-                "external Markdown source is byte-preserved and read-only because detected formatting does not round-trip exactly"
+                "external Markdown source is byte-preserved and read-only because parsing and reserialization change its block structure"
             },
         ));
     }
@@ -6443,7 +6443,7 @@ fn parse_nodes(
     let source_admitted = if is_org {
         crate::org::org_editable(text)
     } else {
-        crate::doc::markdown_round_trips(text)
+        crate::doc::markdown_structurally_round_trips(text)
     };
     if !source_admitted {
         return Err(authority_block(
@@ -6452,7 +6452,7 @@ fn parse_nodes(
             if is_org {
                 "external Org source is byte-preserved and read-only because its heading structure is not editable and does not round-trip exactly"
             } else {
-                "external Markdown source is byte-preserved and read-only because detected formatting does not round-trip exactly"
+                "external Markdown source is byte-preserved and read-only because parsing and reserialization change its block structure"
             },
         ));
     }
@@ -7679,19 +7679,12 @@ mod tests {
     }
 
     #[test]
-    fn source_admission_blocks_non_round_tripping_markdown_and_org_before_material() {
-        for (label, path, source) in [
-            (
-                "mixed-markdown-admission",
-                "pages/a.md",
-                "- changed\n\t- child\n  - grandchild\n",
-            ),
-            (
-                "skipped-org-admission",
-                "pages/a.org",
-                "* changed\n*** skipped\n",
-            ),
-        ] {
+    fn source_admission_blocks_non_round_tripping_org_before_material() {
+        for (label, path, source) in [(
+            "skipped-org-admission",
+            "pages/a.org",
+            "* changed\n*** skipped\n",
+        )] {
             let fixture = SnapshotFixture::new(label, &[path]);
             let target = fixture.graph_root.join(path);
             fs::write(&target, source).unwrap();
@@ -7708,6 +7701,22 @@ mod tests {
             );
             assert_eq!(fs::read(target).unwrap(), source.as_bytes());
         }
+    }
+
+    #[test]
+    fn source_admission_accepts_structurally_round_tripping_markdown_before_material() {
+        let source = "- changed\n\t- child\n  - grandchild\n";
+        let fixture = SnapshotFixture::new("mixed-markdown-admission", &["pages/a.md"]);
+        let target = fixture.graph_root.join("pages/a.md");
+        fs::write(&target, source).unwrap();
+
+        let plan = fixture.plan(&["pages/a.md"]);
+        assert_eq!(plan.status(), ImportPlanStatus::Reconcile, "{plan:?}");
+        assert!(
+            plan.execution_material().is_ok(),
+            "structurally stable Markdown must expose execution material"
+        );
+        assert_eq!(fs::read(target).unwrap(), source.as_bytes());
     }
 
     #[test]
@@ -9469,19 +9478,12 @@ mod tests {
     }
 
     #[test]
-    fn inactive_bootstrap_refuses_non_round_tripping_source_before_operations() {
-        for (label, path, source) in [
-            (
-                "bootstrap-mixed-markdown",
-                "pages/mixed.md",
-                "- parent\n\t- a\n  - b\n",
-            ),
-            (
-                "bootstrap-skipped-org",
-                "pages/skipped.org",
-                "* parent\n*** child\n",
-            ),
-        ] {
+    fn inactive_bootstrap_refuses_non_round_tripping_org_before_operations() {
+        for (label, path, source) in [(
+            "bootstrap-skipped-org",
+            "pages/skipped.org",
+            "* parent\n*** child\n",
+        )] {
             let root = TestRoot::new(label);
             let graph_root = root.path().join("graph");
             let target = graph_root.join(path);
@@ -9515,6 +9517,41 @@ mod tests {
             );
             assert_eq!(fs::read(target).unwrap(), source.as_bytes());
         }
+    }
+
+    #[test]
+    fn inactive_bootstrap_accepts_structurally_round_tripping_markdown() {
+        let source = "- parent\n\t- a\n  - b\n";
+        let root = TestRoot::new("bootstrap-mixed-markdown");
+        let graph_root = root.path().join("graph");
+        let target = graph_root.join("pages/mixed.md");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, source).unwrap();
+        let graph = Graph::open(&graph_root);
+        let capture_scratch = root.path().join("capture-scratch");
+        let preparation_scratch = root.path().join("preparation-scratch");
+        fs::create_dir(&capture_scratch).unwrap();
+        fs::create_dir(&preparation_scratch).unwrap();
+        let capture = graph
+            .capture_inactive_bootstrap_sources(&capture_scratch)
+            .unwrap();
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(0x5a21));
+
+        let result = prepare_inactive_bootstrap_import(
+            &graph,
+            capture,
+            workspace,
+            LineageDigest::of(b"inactive-bootstrap-structural-admission"),
+            DocumentId::from_uuid(Uuid::from_u128(0x5a22)),
+            ReferenceCatalogPolicyV1::default(),
+            &target_catalog(&root.path().join("archive"), workspace),
+            &preparation_scratch,
+        );
+
+        if let Err(error) = result {
+            panic!("structurally stable Markdown must construct bootstrap publication: {error:?}");
+        }
+        assert_eq!(fs::read(target).unwrap(), source.as_bytes());
     }
 
     fn synthetic_operation_spool(

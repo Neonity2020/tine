@@ -18446,7 +18446,7 @@ fn parse_external_document(
         // serializer must drop their temporary document before the exact-span
         // document retained by this boundary is constructed.
         let source_round_trips = require_round_trip.then(|| match format {
-            Format::Md => doc::markdown_round_trips(content),
+            Format::Md => doc::markdown_structurally_round_trips(content),
             Format::Org => crate::org::org_editable(content),
         });
         let mut parsed = match format {

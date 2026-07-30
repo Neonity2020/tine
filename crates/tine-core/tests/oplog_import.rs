@@ -741,21 +741,7 @@ fn nested_edits_retain_structure_and_unequal_duplicate_gaps_never_guess() {
 }
 
 #[test]
-fn non_round_tripping_markdown_and_org_block_before_external_execution() {
-    let markdown = AuthorityFixture::one_page(
-        "mixed-indent-admission",
-        "pages/page.md",
-        vec![BlockSpec::root("parent", "a")],
-    );
-    let mixed = b"- parent changed\n\t- a\n  - b\n";
-    markdown.overwrite("pages/page.md", mixed);
-    let markdown_plan = markdown.plan(&["pages/page.md"]);
-    assert!(blocked_reasons(&markdown_plan).contains(&ImportBlockReason::UnsafeInput));
-    assert_eq!(
-        fs::read(markdown.graph_root.join("pages/page.md")).unwrap(),
-        mixed
-    );
-
+fn non_round_tripping_org_blocks_before_external_execution() {
     let org = AuthorityFixture::one_page(
         "skipped-org-level-admission",
         "pages/page.org",
@@ -772,13 +758,36 @@ fn non_round_tripping_markdown_and_org_block_before_external_execution() {
 }
 
 #[test]
+fn structurally_round_tripping_markdown_reaches_external_execution() {
+    let markdown = AuthorityFixture::one_page(
+        "mixed-indent-admission",
+        "pages/page.md",
+        vec![BlockSpec::root("parent", "a")],
+    );
+    let mixed = b"- parent changed\n\t- a\n  - b\n";
+    markdown.overwrite("pages/page.md", mixed);
+
+    let markdown_plan = markdown.plan(&["pages/page.md"]);
+    assert_eq!(markdown_plan.status(), ImportPlanStatus::Reconcile);
+    assert!(
+        markdown_plan.blocks().is_empty(),
+        "structurally stable Markdown must not expose refusal blocks"
+    );
+    assert_eq!(
+        fs::read(markdown.graph_root.join("pages/page.md")).unwrap(),
+        mixed
+    );
+}
+
+#[test]
 fn round_tripping_external_edits_remain_admitted_and_formatting_noop_stays_unpublished() {
     let markdown = AuthorityFixture::one_page(
         "valid-space-indent-admission",
         "pages/page.md",
         vec![BlockSpec::root("parent", "a")],
     );
-    let valid_markdown = b"- parent edited\r\n  - child edited\r\n\r\n";
+    let valid_markdown =
+        b"- parent edited\r\n  - child edited\r\n    wrapped\r\n    \r\n    final paragraph";
     markdown.overwrite("pages/page.md", valid_markdown);
     assert_eq!(
         markdown.plan(&["pages/page.md"]).status(),
