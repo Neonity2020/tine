@@ -3308,6 +3308,34 @@ struct GraphTextAdmissionTestCounters {
 }
 
 #[cfg(test)]
+impl GraphTextAdmissionTestCounters {
+    fn difference_since(self, earlier: Self) -> Self {
+        macro_rules! difference {
+            ($field:ident) => {
+                self.$field.checked_sub(earlier.$field).unwrap_or_else(|| {
+                    panic!(
+                        "admission {} counter reset during measurement",
+                        stringify!($field)
+                    )
+                })
+            };
+        }
+        Self {
+            builder_enumerations: difference!(builder_enumerations),
+            point_query_attempts: difference!(point_query_attempts),
+            parser_invocations: difference!(parser_invocations),
+            index_map_insertions: difference!(index_map_insertions),
+            event_map_key_reads: difference!(event_map_key_reads),
+            event_map_key_writes: difference!(event_map_key_writes),
+            event_reverse_members: difference!(event_reverse_members),
+            persistent_node_allocations: difference!(persistent_node_allocations),
+            persistent_rotations: difference!(persistent_rotations),
+            persistent_payload_members: difference!(persistent_payload_members),
+        }
+    }
+}
+
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct ManagedMigrationWriterBoundary {
     final_reread_retained: u64,
@@ -34035,10 +34063,10 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&receipts);
 
-        // A portable collision withdraws the published target under the exact
-        // durable attempt-derived name. After reopen and disambiguation,
-        // recovery finds both target copies before allowing the existing
-        // operation-first guarded fallback.
+        // Exact durable projection authority retains a portable sibling
+        // without letting it redirect the operation or hide the injected hook
+        // error. Reopened recovery uses the attempt-bound evidence while both
+        // exact spellings remain visible.
         let dir = scratch("projection-post-publish-hook-error-collision-authority");
         let receipts = dir.with_file_name(format!(
             "tine-projection-post-publish-hook-error-collision-authority-receipts-{}",
@@ -34061,6 +34089,7 @@ mod tests {
             projection_attempt_target_recovery_filename(&target_path, &reservation).unwrap();
         let published_name =
             projection_attempt_published_recovery_filename(&target_path, &reservation).unwrap();
+        let retired_name = reservation.recovery_filename().to_owned();
         let mut authority = store.begin_mutation(&intent, Some(&reservation)).unwrap();
         PROJECTION_POST_PUBLISH_COLLISION.with(|hook| {
             let alias = alias.clone();
@@ -34075,34 +34104,34 @@ mod tests {
         let error = graph
             .write_page_projection(path, Some(base), projected, &mut authority)
             .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{error}");
-        assert!(!target.exists());
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted, "{error}");
+        assert_eq!(fs::read(&target).unwrap(), projected);
         assert_eq!(fs::read(&alias).unwrap(), b"- alias\n");
-        for name in [&attempted_name, &published_name] {
-            assert_eq!(fs::read(dir.join("pages").join(name)).unwrap(), projected);
-        }
+        assert_eq!(
+            fs::read(dir.join("pages").join(&attempted_name)).unwrap(),
+            projected
+        );
+        assert!(!dir.join("pages").join(&published_name).exists());
+        assert_eq!(
+            fs::read(dir.join("pages").join(&retired_name)).unwrap(),
+            base
+        );
         drop(authority);
         drop(store);
         drop(graph);
 
         let graph = Graph::open(&dir);
         let store = ProjectionReceiptStore::open(&receipts, workspace_id).unwrap();
-        fs::remove_file(&alias).unwrap();
         let mut recovery = store.begin_mutation(&intent, None).unwrap();
-        let error = graph
-            .recover_page_projection(path, Some(base), projected, &mut recovery)
-            .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::NotFound, "{error}");
-        recovery.release_failed_recovery().unwrap();
-        let fallback = store.reserve_fallback_attempt(&intent).unwrap();
-        let mut fallback_authority = store.begin_mutation(&intent, Some(&fallback)).unwrap();
         let proof = graph
-            .write_page_projection(path, Some(base), projected, &mut fallback_authority)
+            .recover_page_projection(path, Some(base), projected, &mut recovery)
             .unwrap();
         store
-            .reconstruct_completion(fallback_authority, &intent, projected, &proof)
+            .reconstruct_completion(recovery, &intent, projected, &proof)
             .unwrap();
+        assert!(store.load_completion(&intent).unwrap().is_some());
         assert_eq!(fs::read(&target).unwrap(), projected);
+        assert_eq!(fs::read(&alias).unwrap(), b"- alias\n");
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&receipts);
 
@@ -35996,7 +36025,7 @@ mod tests {
             let token = graph.arm_graph_text_admission_feed(0).unwrap();
             graph.initial_shadow_raw_managed_text_inventory().unwrap();
             fs::write(root.join("Target.md"), b"title:: After\n").unwrap();
-            reset_graph_text_admission_test_counters();
+            let before = graph_text_admission_test_counters();
             graph
                 .apply_graph_text_admission_event(
                     &token,
@@ -36006,10 +36035,20 @@ mod tests {
                     },
                 )
                 .unwrap();
-            let counters = graph_text_admission_test_counters();
+            let counters = graph_text_admission_test_counters().difference_since(before);
             let _ = fs::remove_dir_all(root);
             counters
         }
+
+        reset_graph_text_admission_test_counters();
+        let mut prior_work = PersistentMap::default();
+        for key in 0..64 {
+            prior_work.insert(key, key);
+        }
+        assert!(
+            graph_text_admission_test_counters().persistent_rotations > 4,
+            "regression setup must exceed the per-event rotation ceiling"
+        );
 
         let small = one_event(8);
         let large = one_event(512);
