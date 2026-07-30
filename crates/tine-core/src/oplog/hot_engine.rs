@@ -8025,6 +8025,7 @@ impl ShardedHotEngine {
         batch_id: BatchId,
     ) -> Result<StageOutcome, EngineError> {
         self.begin_point_operation();
+        self.ensure_terminal_staging_authority()?;
         if store.workspace_id() != self.workspace_id {
             return Err(EngineError::WorkspaceMismatch {
                 expected: self.workspace_id,
@@ -8057,6 +8058,7 @@ impl ShardedHotEngine {
 
     pub fn stage_archive_batch(&mut self, batch_id: BatchId) -> Result<StageOutcome, EngineError> {
         self.begin_point_operation();
+        self.ensure_terminal_staging_authority()?;
         self.stage_archive_batch_internal(batch_id, None, None)
     }
 
@@ -8066,6 +8068,7 @@ impl ShardedHotEngine {
         max_work: usize,
     ) -> Result<BoundedStageOutcome, EngineError> {
         self.begin_point_operation();
+        self.ensure_terminal_staging_authority()?;
         let mut budget = StageWorkBudget::new(max_work);
         if max_work == 0 {
             return Err(EngineError::Archive(
@@ -8260,6 +8263,9 @@ impl ShardedHotEngine {
         // retain every identity claim, and extend canonical fatal evidence;
         // the internal admission path prevents any of it from becoming
         // visible while the workspace is blocked.
+        if let Err(error) = self.ensure_terminal_staging_authority() {
+            return self.outcome(batch_id, BatchDisposition::Rejected { error }, Vec::new());
+        }
         let outcome = self.stage_ready_internal(batch, false, None, None);
         self.resolve_pending_author(batch_id, &outcome.disposition);
         outcome
@@ -13336,6 +13342,23 @@ impl ShardedHotEngine {
         }
         if let Some(error) = self.workspace_blocked_error() {
             return Err(error);
+        }
+        self.reference_catalog
+            .ensure_ready()
+            .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))
+    }
+
+    /// Ordinary ingress may extend a terminal workspace's non-visible evidence
+    /// lane, but it may not bypass incomplete authenticated recovery or missing
+    /// reference-catalog authority.
+    fn ensure_terminal_staging_authority(&self) -> Result<(), EngineError> {
+        if let Some(error) = &self.history_failure {
+            return Err(error.clone());
+        }
+        if self.authenticated_history_replay {
+            return Err(EngineError::ReferenceCatalog(
+                "reference catalog recovery requires complete authenticated history replay".into(),
+            ));
         }
         self.reference_catalog
             .ensure_ready()
