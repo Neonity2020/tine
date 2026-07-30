@@ -8051,7 +8051,6 @@ impl ShardedHotEngine {
         batch_id: BatchId,
     ) -> Result<StageOutcome, EngineError> {
         self.begin_point_operation();
-        self.ensure_not_blocked()?;
         if store.workspace_id() != self.workspace_id {
             return Err(EngineError::WorkspaceMismatch {
                 expected: self.workspace_id,
@@ -8084,16 +8083,6 @@ impl ShardedHotEngine {
 
     pub fn stage_archive_batch(&mut self, batch_id: BatchId) -> Result<StageOutcome, EngineError> {
         self.begin_point_operation();
-        if let Err(error) = self.ensure_not_blocked() {
-            // A duplicate final rejection/quarantine is the public continuation
-            // token for fanout that was durably left by a prior bounded call.
-            // Draining that already-authorized recursive work must remain
-            // possible after quarantine latched the workspace; no new offered
-            // batch is admitted through this exception.
-            if !self.is_resumable_final_fanout(batch_id) {
-                return Err(error);
-            }
-        }
         self.stage_archive_batch_internal(batch_id, None, None)
     }
 
@@ -8103,11 +8092,6 @@ impl ShardedHotEngine {
         max_work: usize,
     ) -> Result<BoundedStageOutcome, EngineError> {
         self.begin_point_operation();
-        if let Err(error) = self.ensure_not_blocked() {
-            if !self.is_resumable_final_fanout(batch_id) {
-                return Err(error);
-            }
-        }
         let mut budget = StageWorkBudget::new(max_work);
         if max_work == 0 {
             return Err(EngineError::Archive(
@@ -8297,9 +8281,11 @@ impl ShardedHotEngine {
 
     pub fn stage_ready(&mut self, batch: ValidatedBatch) -> StageOutcome {
         let batch_id = batch.manifest().batch_id();
-        if let Err(error) = self.ensure_not_blocked() {
-            return self.outcome(batch_id, BatchDisposition::Rejected { error }, Vec::new());
-        }
+        // A terminal workspace still admits immutable validated history into
+        // its terminal lane. Later ingress can complete dependency frontiers,
+        // retain every identity claim, and extend canonical fatal evidence;
+        // the internal admission path prevents any of it from becoming
+        // visible while the workspace is blocked.
         let outcome = self.stage_ready_internal(batch, false, None, None);
         self.resolve_pending_author(batch_id, &outcome.disposition);
         outcome
@@ -31653,10 +31639,20 @@ mod validation_tests {
             reopened.configure_reference_catalog_policy(ReferenceCatalogPolicyV1::default()),
             Err(expected.clone())
         );
-        assert!(matches!(
-            reopened.stage_archive_batch(mutation.manifest().batch_id()),
-            Err(error) if error == expected
-        ));
+        let terminal_ingress = reopened
+            .stage_archive_batch(mutation.manifest().batch_id())
+            .unwrap();
+        assert_eq!(
+            terminal_ingress.disposition(),
+            BatchDisposition::Rejected {
+                error: expected.clone(),
+            }
+        );
+        assert_eq!(
+            terminal_ingress.status().workspace(),
+            reopened.status().workspace()
+        );
+        assert_eq!(reopened.workspace_blocked_error(), Some(expected));
 
         drop(reopened);
         drop(writer);
