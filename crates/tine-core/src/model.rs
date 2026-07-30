@@ -17649,6 +17649,9 @@ impl Graph {
         page: &PageDto,
         path: &Path,
         loaded: Option<&ExactGraphLoadedPage>,
+        // Ordinary frontend saves carry their load revision in the separate
+        // base_rev argument; PageDto.rev is not part of the working-store DTO.
+        loaded_rev: Option<&str>,
     ) -> io::Result<()> {
         if page.path.is_empty() {
             return Ok(());
@@ -17660,7 +17663,7 @@ impl Graph {
             )
         })?;
         let retained = self.loaded_file_identities.read().unwrap();
-        let retained_matches = page.rev.as_deref().is_some_and(|revision| {
+        let retained_matches = loaded_rev.is_some_and(|revision| {
             retained
                 .get(path)
                 .is_some_and(|(captured_revision, captured_identity)| {
@@ -17701,7 +17704,7 @@ impl Graph {
         // avoids re-reading the file 2-3× per save, which is felt on NFS.
         let validation =
             self.validate_graph_text_target(&write, &path, Some((page.kind, &page.name)))?;
-        self.require_pinned_save_owner(page, &path, validation.target.as_ref())?;
+        self.require_pinned_save_owner(page, &path, validation.target.as_ref(), base_rev)?;
         if validation.requested_identity_elsewhere {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -17796,7 +17799,12 @@ impl Graph {
         // decoding failure into permission to overwrite unknown bytes.
         let validation =
             self.validate_graph_text_target(&write, &path, Some((page.kind, &page.name)))?;
-        self.require_pinned_save_owner(page, &path, validation.target.as_ref())?;
+        self.require_pinned_save_owner(
+            page,
+            &path,
+            validation.target.as_ref(),
+            page.rev.as_deref(),
+        )?;
         if validation.requested_identity_elsewhere {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,

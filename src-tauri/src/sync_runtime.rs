@@ -1666,6 +1666,52 @@ mod tests {
     }
 
     #[test]
+    fn rollback_reload_save_uses_current_disk_revision_and_later_external_write_conflicts() {
+        let fixture = RollbackFixture::new(Some("shadow_import"));
+        cancel_sparse_v2_at_paths(
+            &fixture.state,
+            "main",
+            Arc::clone(&fixture.slot),
+            &fixture.private_root,
+            &fixture.recovery_root,
+            None,
+            require_safe_sparse_shutdown,
+        )
+        .unwrap();
+
+        let replacement = fixture.state.graphs.read().unwrap().slot("main").unwrap();
+        let graph = replacement.legacy_graph().unwrap();
+        let mut reloaded = graph
+            .load_named("rollback", tine_core::model::PageKind::Page)
+            .unwrap()
+            .unwrap();
+        let baseline = reloaded.rev.take().unwrap();
+        reloaded.blocks[0].raw = "ordinary edit after rollback".into();
+        let saved = graph.save_page(&reloaded, Some(&baseline)).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&fixture.markdown_path).unwrap(),
+            "- ordinary edit after rollback\n"
+        );
+
+        let mut current = graph
+            .load_named("rollback", tine_core::model::PageKind::Page)
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.rev.take().as_deref(), Some(saved.as_str()));
+        current.blocks[0].raw = "must not overwrite external bytes".into();
+        std::fs::write(&fixture.markdown_path, b"- genuinely external edit\n").unwrap();
+
+        assert_eq!(
+            graph.save_page(&current, Some(&saved)).unwrap_err().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(
+            std::fs::read_to_string(&fixture.markdown_path).unwrap(),
+            "- genuinely external edit\n"
+        );
+    }
+
+    #[test]
     fn active_local_rollback_requires_and_completes_a_clean_safe_shutdown() {
         std::thread::Builder::new()
             .name("tine-sparse-active-rollback-test".into())
