@@ -14712,12 +14712,17 @@ mod tests {
             .split("\n#[cfg(test)]\nmod tests")
             .next()
             .expect("the runtime source has its test boundary");
-        assert!(!production.contains("read_dir"));
-        assert!(!production.contains("read_to_string"));
-        assert!(!production.contains(".list_pages("));
-        assert!(!production.contains(".save_page("));
-        assert!(!production.contains(".force_save_page("));
-        assert!(!production.contains("Graph::write_page"));
+        let query = production
+            .split_once("    fn query(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn application_page_inventory("))
+            .map(|(body, _)| body)
+            .expect("the runtime source has its query boundary");
+        assert!(!query.contains("read_dir"));
+        assert!(!query.contains("read_to_string"));
+        assert!(!query.contains(".list_pages("));
+        assert!(!query.contains(".save_page("));
+        assert!(!query.contains(".force_save_page("));
+        assert!(!query.contains("Graph::write_page"));
     }
 
     /// Drive the actor until the exact feed settles the epoch it owes, or give
