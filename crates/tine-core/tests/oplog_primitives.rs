@@ -243,8 +243,10 @@ fn intent_wire_size_does_not_scale_with_base_byte_length() {
 fn managed_paths_are_canonical_safe_graph_relative_paths() {
     for valid in [
         "pages/a.md",
+        "pages/a.markdown",
         "pages/nested/a.org",
         "journals/2026_07_22.md",
+        "journals/a.MD",
         "journals/archive/day.org",
         "archive/pages/foo.md",
         "custom/notes/topic.org",
@@ -259,7 +261,6 @@ fn managed_paths_are_canonical_safe_graph_relative_paths() {
         "/pages/a.md",
         "pages",
         "pages/a.txt",
-        "pages/a.markdown",
         "pages/../a.md",
         "pages/./a.md",
         "pages//a.md",
@@ -279,7 +280,6 @@ fn managed_paths_are_canonical_safe_graph_relative_paths() {
         "pages/trailing /a.md",
         "pages/.md",
         "config.edn",
-        "journals/a.MD",
         " pages/a.md",
         "pages/a.md ",
     ] {
