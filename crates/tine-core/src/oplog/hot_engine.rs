@@ -7432,12 +7432,15 @@ impl ShardedHotEngine {
     }
 
     /// Preflight the authenticated scratch current-path trie before durable
-    /// acceptance publication. Its inputs are the semantic effect already
-    /// checked against the accepted catalog transition; it never reads
+    /// acceptance publication. The semantic effect bounds the touched page
+    /// keys, while the validated prospective catalog supplies their actual
+    /// post-join state. The authored before/after rows are not current-state
+    /// authority when a concurrent old-base update arrives. This never reads
     /// receipts, projections, or graph files.
     fn prepare_current_path_catalog_transition(
         &self,
         effect: &SemanticEffect,
+        prospective_catalog_pages: Option<&BTreeMap<PageId, PageState>>,
         accepted_frontier_root: AcceptedFrontierRoot,
     ) -> Result<CurrentPathCatalogTransition, EngineError> {
         if effect.pages().len() > MAX_TRANSACTION_OPERATIONS {
@@ -7465,15 +7468,18 @@ impl ShardedHotEngine {
                 "authenticated current-path catalog authority is unavailable".into(),
             ));
         }
+        let prospective_catalog_pages = if effect.pages().is_empty() {
+            None
+        } else {
+            Some(
+                prospective_catalog_pages
+                    .ok_or(EngineError::MissingDocument(self.catalog_document_id))?,
+            )
+        };
         let mut desired = BTreeMap::<PageId, Option<CurrentPathCatalogStoredRow>>::new();
         for delta in effect.pages() {
-            let mut before = delta
-                .before
-                .as_ref()
-                .and_then(current_path_catalog_row_from_page_state);
-            let after = delta
-                .after
-                .as_ref()
+            let after = prospective_catalog_pages
+                .and_then(|pages| pages.get(&delta.page_id))
                 .and_then(current_path_catalog_row_from_page_state);
             if let Some(after) = &after {
                 if after.path.as_str().len() > MAX_CURRENT_PATH_CURSOR_PATH_BYTES {
@@ -7496,44 +7502,12 @@ impl ShardedHotEngine {
                 .map_err(|error| EngineError::Archive(error.to_string()))?
                 .map(|encoded| decode_current_path_catalog_row(&encoded))
                 .transpose()?;
-            if stored.as_ref() != before.as_ref() {
-                let current = self.current_effective_path_catalog_row(delta.page_id)?;
-                let authored_before = delta.before.as_ref();
-                let authored_after = delta.after.as_ref();
-                let canonical_title_only = match (authored_before, authored_after, &current) {
-                    (
-                        Some(PageState::Live {
-                            name: before_name,
-                            path: before_path,
-                            kind: before_kind,
-                            ..
-                        }),
-                        Some(PageState::Live {
-                            name: after_name,
-                            path: after_path,
-                            kind: after_kind,
-                            ..
-                        }),
-                        Some((current, current_key)),
-                    ) => {
-                        let _ = before_name;
-                        after_name.key_digest() == *current_key
-                            && before_path == after_path
-                            && before_kind == after_kind
-                            && current.path == *before_path
-                            && current.kind == *before_kind
-                    }
-                    _ => false,
-                };
-                if !canonical_title_only || stored.as_ref() != current.as_ref().map(|(row, _)| row)
-                {
-                    return Err(EngineError::Archive(
-                        "current-path catalog is missing or corrupt before-row authority".into(),
-                    ));
-                }
-                before = current.map(|(row, _)| row);
+            let current = self.current_effective_path_catalog_row(delta.page_id)?;
+            if stored.as_ref() != current.as_ref().map(|(row, _)| row) {
+                return Err(EngineError::Archive(
+                    "current-path catalog is missing or corrupt before-row authority".into(),
+                ));
             }
-            debug_assert_eq!(stored.as_ref(), before.as_ref());
         }
 
         let mut root = self.current_path_catalog.root.clone();
@@ -8638,6 +8612,11 @@ impl ShardedHotEngine {
             Some(record) => Ok(Some(record)),
             None => self.cold_history_record(offered_batch_id),
         };
+        // Authenticated recovery replays durable accepted history into a fresh
+        // scratch run and truthfully reports that reconstruction as Accepted.
+        // Ordinary ingress seeing the same durable record is a duplicate even
+        // if it also has to finish resumable scratch fanout before returning.
+        let mut duplicate_accepted = false;
         match history_record {
             Ok(Some(existing)) => {
                 if existing.manifest_fingerprint != fingerprint {
@@ -8648,6 +8627,8 @@ impl ShardedHotEngine {
                         Vec::new(),
                     );
                 }
+                duplicate_accepted = !self.authenticated_history_replay
+                    && matches!(existing.status, ArchiveStatus::Accepted { .. });
                 if matches!(
                     existing.status,
                     ArchiveStatus::Rejected(_) | ArchiveStatus::Quarantined
@@ -9262,6 +9243,9 @@ impl ShardedHotEngine {
             );
         }
         let disposition = match self.archive_status(offered_batch_id) {
+            Ok(Some(ArchiveStatus::Accepted { no_op, .. })) if duplicate_accepted => {
+                BatchDisposition::DuplicateAccepted { no_op }
+            }
             Ok(Some(ArchiveStatus::Accepted { no_op, .. })) => BatchDisposition::Accepted { no_op },
             Ok(Some(ArchiveStatus::Quarantined)) => BatchDisposition::Quarantined,
             Ok(Some(ArchiveStatus::Rejected(error))) => BatchDisposition::Rejected { error },
@@ -15469,11 +15453,20 @@ impl ShardedHotEngine {
                     .delta(),
             )?;
         let current_path_catalog_root = accepted_evidence.post_frontier_root.clone();
+        let prospective_catalog_pages = divergent_validated_catalog_pages.as_ref().or_else(|| {
+            after_snapshots
+                .values()
+                .find_map(|snapshot| match snapshot {
+                    SemanticDocumentSnapshot::Catalog(pages) => Some(pages),
+                    SemanticDocumentSnapshot::Shard { .. } => None,
+                })
+        });
         let current_path_catalog_transition = self.prepare_current_path_catalog_transition(
             effective_view
                 .as_ref()
                 .expect("accepted batch has an effective semantic view")
                 .effect(),
+            prospective_catalog_pages,
             current_path_catalog_root,
         )?;
         let status_evidence = accepted_evidence.clone();
@@ -17116,8 +17109,16 @@ impl ShardedHotEngine {
                 reference_catalog.delta(),
             )?;
         let current_path_catalog_root = accepted_evidence.post_frontier_root.clone();
+        let prospective_catalog_pages =
+            after_snapshots
+                .values()
+                .find_map(|snapshot| match snapshot {
+                    SemanticDocumentSnapshot::Catalog(pages) => Some(pages),
+                    SemanticDocumentSnapshot::Shard { .. } => None,
+                });
         let current_path_catalog_transition = self.prepare_current_path_catalog_transition(
             effective_view.effect(),
+            prospective_catalog_pages,
             current_path_catalog_root,
         )?;
         let status_evidence = accepted_evidence.clone();
