@@ -37,7 +37,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 #[cfg(windows)]
-use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
+use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _, OsMetadataExt as CapOsMetadataExt};
 #[cfg(unix)]
 use cap_std::fs::MetadataExt as CapMetadataExt;
 #[cfg(windows)]
@@ -7544,7 +7544,7 @@ fn entry_file_identity(
                 match directory.symlink_metadata(name) {
                     Ok(metadata)
                         if !metadata.is_file()
-                            || metadata.file_attributes()
+                            || CapOsMetadataExt::file_attributes(&metadata)
                                 & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
                                 != 0 =>
                     {
@@ -14535,6 +14535,25 @@ mod tests {
                 Err(ProjectionError::UnsafePath(_))
             ));
         });
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_entry_file_identity_classifies_reparse_lease_as_replaced() {
+        use std::os::windows::fs::symlink_file;
+
+        let dir = TestDir::new("windows-entry-file-identity-reparse");
+        let target = dir.path().join("target");
+        let lease = dir.path().join("lease");
+        fs::write(&target, b"not authoritative").unwrap();
+        symlink_file(&target, &lease).unwrap();
+        let directory = CapDir::open_ambient_dir(dir.path(), ambient_authority()).unwrap();
+
+        assert!(matches!(
+            entry_file_identity(&directory, "lease", &lease),
+            Err(LeasePathResolutionError::Replaced(_))
+        ));
+        assert_eq!(fs::read(&target).unwrap(), b"not authoritative");
     }
 
     #[test]

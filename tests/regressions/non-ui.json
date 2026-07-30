@@ -1933,6 +1933,30 @@
         "failBefore": "proven"
       },
       "notes": "Fail-before: an honest offline device created notes/provider-created/deep/physical-source.md and published it through ordinary external-file admission. After complete provider delivery, receiver crash/restart, and duplicate redelivery, a receiver lacking only provider-created/deep remained permanently blocked with authenticated expected-path authority missing and never projected the page. Pre-creating only that parent chain made the exact scenario converge. Projection input capture now reports a stably missing ancestor as semantic absence while ordinary files, symlinks/reparse points, special entries, permission failures, and traversal races remain errors. Present publication reaches the retained-capability recursive writer; a retry resumes after a synced partial chain, while a proven nested tombstone completes without creating parents. The original duplicate-delivery/restart scenario now drains provider work and produces parser-visible receiver bytes."
+    },
+    {
+      "id": "REG-SYNC-WINDOWS-FILESYSTEM-API-PARITY-001",
+      "title": "Windows projection and SQLite lease safety use stable public held-handle filesystem APIs",
+      "family": "sync-data-safety",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "windows"
+      ],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/model.rs::projection_windows_held_handle_link_count_tracks_one_and_two_links",
+          "crates/tine-core/src/model.rs::projection_missing_capture_rejects_reparse_intermediate_without_escape",
+          "crates/tine-core/src/oplog/sqlite.rs::windows_entry_file_identity_classifies_reparse_lease_as_replaced"
+        ],
+        "scenario": "sync.windows-filesystem-api-parity",
+        "failBefore": "proven"
+      },
+      "notes": "Fail-before: hosted Windows run 30507282266 at exact candidate 7792d3062936e28c2da2089693fd9f644e43305e failed to compile because projection_file_link_count used unstable std::os::windows::fs::MetadataExt::number_of_links and entry_file_identity resolved file_attributes on cap_std metadata to a private implementation method. Projection link count now comes from GetFileInformationByHandle on the already-held file handle, and capability metadata attributes use explicit public cap_fs_ext::OsMetadataExt dispatch. Existing no-follow opens, pre-open and held-handle reparse checks, single-link refusal, identity validation, and error classification remain unchanged."
     }
   ]
 }

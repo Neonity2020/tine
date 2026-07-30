@@ -27151,10 +27151,19 @@ fn projection_file_link_count(file: &fs::File) -> io::Result<u64> {
 
 #[cfg(windows)]
 fn projection_file_link_count(file: &fs::File) -> io::Result<u64> {
-    use std::os::windows::fs::MetadataExt;
-    Ok(u64::from(file.metadata()?.number_of_links().ok_or_else(
-        || io::Error::new(io::ErrorKind::Unsupported, "file link count is unavailable"),
-    )?))
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: `file` retains the exact live handle and `information` is a
+    // correctly sized writable result value.
+    let result = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) };
+    if result == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(u64::from(information.nNumberOfLinks))
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -40344,6 +40353,29 @@ mod tests {
             .list_pages()
             .iter()
             .any(|entry| entry.path == page && entry.kind == PageKind::Page));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn projection_windows_held_handle_link_count_tracks_one_and_two_links() {
+        let dir = scratch("projection-windows-held-handle-link-count");
+        let target = dir.join("pages/Target.md");
+        let alias = dir.join("pages/Alias.md");
+        fs::write(&target, b"- retained\n").unwrap();
+        let file = fs::File::open(&target).unwrap();
+
+        assert_eq!(projection_file_link_count(&file).unwrap(), 1);
+        fs::hard_link(&target, &alias).unwrap();
+        assert_eq!(projection_file_link_count(&file).unwrap(), 2);
+
+        let graph = Graph::open(&dir);
+        let migration = graph.migrate_sync_identities().unwrap_err();
+        assert_eq!(migration.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read(&target).unwrap(), b"- retained\n");
+        assert_eq!(fs::read(&alias).unwrap(), b"- retained\n");
+        assert!(!dir.join(".tine-sync").exists());
 
         let _ = fs::remove_dir_all(&dir);
     }
