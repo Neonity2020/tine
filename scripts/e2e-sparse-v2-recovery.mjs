@@ -255,12 +255,16 @@ async function editCurrentPage(marker, file, label) {
   await waitForFileText(file, marker, label);
 }
 
-async function openGraphSettings() {
+async function openSyncSettings() {
   const trigger = await browser.$('button[title^="Settings"]');
   await trigger.waitForExist({ timeout: 10_000 });
   await trigger.click();
   await browser.$(".settings-modal").waitForExist({ timeout: 10_000 });
-  await clickExactText(".settings-nav-item", "Graph", "Graph settings tab");
+  await clickExactText(
+    ".settings-nav-item",
+    "Backups & recovery",
+    "Backups & recovery settings tab",
+  );
   await assertVisible("Managed sync", "managed-sync settings");
 }
 
@@ -431,7 +435,7 @@ try {
   };
 
   phase = "activate sparse v2";
-  await openGraphSettings();
+  await openSyncSettings();
   await clickButtonAndConfirm("Enable sparse v2", "enable-sparse-v2");
   await assertVisible("Active · sparse v2", "active sparse-v2 authority status");
   await closeSettings();
@@ -473,7 +477,7 @@ try {
   receipt.milestones.sparseV2Restart = { existingPageRendered: true, newPageRendered: true };
 
   phase = "return to standard Markdown mode";
-  await openGraphSettings();
+  await openSyncSettings();
   await clickButtonAndConfirm("Return to standard Markdown mode", "return-to-standard-markdown");
   await assertVisible("Enable sparse v2", "standard Markdown authority status");
   await closeSettings();
