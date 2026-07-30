@@ -7,7 +7,7 @@
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::Manager;
 use tine_core::model::GraphMeta;
 use tine_core::oplog::{
@@ -803,15 +803,26 @@ pub(crate) fn activate_sparse_v2(
     app: tauri::AppHandle,
     state: crate::state::GraphContext<'_>,
 ) -> Result<SparseV2StatusDto, String> {
+    let started = Instant::now();
     let label = state.window.label().to_string();
+    crate::debug::diag("sparse-v2 activation requested");
     let _transition = state.state.graph_load.lock().unwrap();
     let slot = crate::state::slot_for_context(&state)?;
     let root = slot.root_key.clone();
 
     if let Some(binding) = slot.sparse_binding() {
         let action = binding.action();
+        crate::debug::diag(format!(
+            "sparse-v2 activation resuming retained authority: action={action:?}, availability={:?}",
+            binding.availability()
+        ));
         if action == SparseV2BindingAction::ReturnRetained {
-            return sparse_v2_status_for_slot(&slot);
+            let result = sparse_v2_status_for_slot(&slot);
+            crate::debug::diag(format!(
+                "sparse-v2 retained activation completed after {} ms: {result:?}",
+                started.elapsed().as_millis()
+            ));
+            return result;
         }
         let record = state
             .state
@@ -819,6 +830,7 @@ pub(crate) fn activate_sparse_v2(
             .binding_record(&app, &root)?
             .ok_or("sparse-v2 opt-in binding is missing")?;
         let graph_meta = SyncRuntimeFacade::graph_meta(&record);
+        let core_started = Instant::now();
         let binding = match action {
             SparseV2BindingAction::ReopenActive => {
                 state.state.sync_runtime.open_record(&app, &record)?
@@ -830,6 +842,11 @@ pub(crate) fn activate_sparse_v2(
                 unreachable!("retained bindings return before replacement")
             }
         };
+        crate::debug::diag(format!(
+            "sparse-v2 retained core operation completed after {} ms: availability={:?}",
+            core_started.elapsed().as_millis(),
+            binding.availability()
+        ));
         let replacement = Arc::new(crate::state::GraphSlot::from_sparse_v2(
             binding, root, graph_meta,
         ));
@@ -840,7 +857,12 @@ pub(crate) fn activate_sparse_v2(
             .unwrap()
             .bind(label, Arc::clone(&replacement))?;
         crate::state::poke_watcher(&state.state);
-        return sparse_v2_status_for_slot(&replacement);
+        let result = sparse_v2_status_for_slot(&replacement);
+        crate::debug::diag(format!(
+            "sparse-v2 retained activation published after {} ms: {result:?}",
+            started.elapsed().as_millis()
+        ));
+        return result;
     }
 
     let graph = slot.legacy_graph()?;
@@ -851,8 +873,13 @@ pub(crate) fn activate_sparse_v2(
             .state
             .sync_runtime
             .prepare_binding_record(&app, &root, graph_meta.clone())?;
+    crate::debug::diag(format!(
+        "sparse-v2 fresh activation prepared private binding after {} ms",
+        started.elapsed().as_millis()
+    ));
 
     slot.begin_legacy_retirement()?;
+    crate::debug::diag("sparse-v2 legacy authority retirement started");
     let removed = state.state.graphs.write().unwrap().remove(&label);
     if removed
         .as_ref()
@@ -864,6 +891,10 @@ pub(crate) fn activate_sparse_v2(
     crate::state::poke_watcher(&state.state);
 
     if let Err(error) = slot.wait_for_legacy_drain(LEGACY_DRAIN_TIMEOUT) {
+        crate::debug::diag(format!(
+            "sparse-v2 legacy authority drain failed after {} ms: {error}",
+            started.elapsed().as_millis()
+        ));
         slot.cancel_legacy_retirement()?;
         state
             .state
@@ -874,12 +905,20 @@ pub(crate) fn activate_sparse_v2(
         crate::state::poke_watcher(&state.state);
         return Err(format!("sparse-v2 handoff is retryable: {error}"));
     }
+    crate::debug::diag(format!(
+        "sparse-v2 legacy authority drained after {} ms",
+        started.elapsed().as_millis()
+    ));
 
     if let Err(error) = state
         .state
         .sync_runtime
         .persist_binding_record(&app, &record)
     {
+        crate::debug::diag(format!(
+            "sparse-v2 private binding persistence failed after {} ms: {error}",
+            started.elapsed().as_millis()
+        ));
         slot.cancel_legacy_retirement()?;
         state
             .state
@@ -890,8 +929,18 @@ pub(crate) fn activate_sparse_v2(
         crate::state::poke_watcher(&state.state);
         return Err(error);
     }
+    crate::debug::diag(format!(
+        "sparse-v2 private binding persisted after {} ms; starting core bootstrap",
+        started.elapsed().as_millis()
+    ));
 
+    let core_started = Instant::now();
     let binding = state.state.sync_runtime.activate_record(&app, &record)?;
+    crate::debug::diag(format!(
+        "sparse-v2 core bootstrap completed after {} ms: availability={:?}",
+        core_started.elapsed().as_millis(),
+        binding.availability()
+    ));
     let replacement = Arc::new(crate::state::GraphSlot::from_sparse_v2(
         binding, root, graph_meta,
     ));
@@ -902,7 +951,12 @@ pub(crate) fn activate_sparse_v2(
         .unwrap()
         .bind(label, Arc::clone(&replacement))?;
     crate::state::poke_watcher(&state.state);
-    sparse_v2_status_for_slot(&replacement)
+    let result = sparse_v2_status_for_slot(&replacement);
+    crate::debug::diag(format!(
+        "sparse-v2 fresh activation published after {} ms: {result:?}",
+        started.elapsed().as_millis()
+    ));
+    result
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
