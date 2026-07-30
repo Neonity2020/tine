@@ -5,6 +5,7 @@
 pub mod config;
 pub mod crdt;
 pub mod date;
+mod directory_durability;
 pub mod doc;
 pub mod edn;
 pub mod graph_text_scope;

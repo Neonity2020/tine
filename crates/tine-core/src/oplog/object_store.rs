@@ -36,6 +36,7 @@ use sha2::{Digest, Sha256};
 use smallvec::SmallVec;
 use uuid::Uuid;
 
+use crate::directory_durability::ValidatedDirectorySync as PublicationDirSync;
 use crate::model::HandoffSafe;
 
 use super::enrollment::{EnrollmentBindingV1, ResumePointEnrollmentBinding};
@@ -7317,12 +7318,14 @@ fn publish_immutable(
     bytes: &[u8],
     collision: Collision,
 ) -> Result<(), StoreError> {
-    // Windows must establish that this directory supports the required
-    // write-capable FlushFileBuffers operation before inserting an immutable
-    // target name. The retained handle is reused for the post-insertion flush,
-    // so namespace retargeting cannot redirect durability to another path.
-    let publication_sync = PublicationDirSync::open(dir)?;
-    publication_sync.preflight()?;
+    // Windows validates a write-capable no-follow directory handle and attempts
+    // FlushFileBuffers before inserting an immutable target name. The retained
+    // handle is reused afterward, so namespace retargeting cannot redirect the
+    // probe. ERROR_INVALID_PARAMETER is the one documented residual: file bytes
+    // stay flushed and insertion stays atomic, but directory-entry durability is
+    // unavailable on that platform/filesystem.
+    let publication_sync = PublicationDirSync::open(dir).map_err(StoreError::from)?;
+    publication_sync.preflight().map_err(StoreError::from)?;
     let temp_name = format!(".tmp-{}", Uuid::new_v4());
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
@@ -7335,10 +7338,10 @@ fn publish_immutable(
             // A post-insertion sync error can leave the correct immutable
             // target present. Retrying is safe: the AlreadyExists path below
             // verifies identical bytes and retries this same required sync.
-            Ok(()) => publication_sync.sync(),
+            Ok(()) => publication_sync.sync().map_err(StoreError::from),
             Err(error) if error.kind() == ErrorKind::AlreadyExists => {
                 verify_existing(dir, filename, bytes, collision)?;
-                publication_sync.sync()
+                publication_sync.sync().map_err(StoreError::from)
             }
             Err(error) => Err(error.into()),
         }
@@ -10215,101 +10218,8 @@ fn rename_noreplace(_dir: &Dir, _from: &str, _to: &str) -> std::io::Result<()> {
     ))
 }
 
-#[cfg(unix)]
 pub(crate) fn sync_dir_required(dir: &Dir) -> Result<(), StoreError> {
-    // cap-std may retain an O_PATH directory capability, which is suitable for
-    // openat but cannot itself be fsynced. Open the capability's `.` as a real
-    // directory descriptor and propagate the result of syncing that handle.
-    let dot = c".";
-    // SAFETY: `dot` is a static C string and `dir` is an opened directory.
-    let fd = unsafe {
-        libc::openat(
-            dir.as_fd().as_raw_fd(),
-            dot.as_ptr(),
-            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY,
-        )
-    };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    // SAFETY: `openat` returned a newly owned directory descriptor.
-    unsafe { fs::File::from_raw_fd(fd) }.sync_all()?;
-    Ok(())
-}
-
-#[cfg(windows)]
-pub(crate) fn sync_dir_required(dir: &Dir) -> Result<(), StoreError> {
-    PublicationDirSync::open(dir)?.sync()
-}
-
-#[cfg(not(any(unix, windows)))]
-pub(crate) fn sync_dir_required(_dir: &Dir) -> Result<(), StoreError> {
-    Err(std::io::Error::new(
-        ErrorKind::Unsupported,
-        "directory durability is unsupported on this target",
-    )
-    .into())
-}
-
-#[cfg(windows)]
-struct PublicationDirSync(fs::File);
-
-#[cfg(windows)]
-impl PublicationDirSync {
-    fn open(dir: &Dir) -> Result<Self, StoreError> {
-        let mut options = OpenOptions::new();
-        options
-            .read(true)
-            .write(true)
-            .follow(FollowSymlinks::No)
-            .maybe_dir(true);
-        let file = dir.open_with(".", &options)?.into_std();
-        let metadata = file.metadata()?;
-        if metadata.file_attributes()
-            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
-            != 0
-            || !metadata.is_dir()
-        {
-            return Err(StoreError::UnsafeEntry(
-                "directory durability handle is not a real no-follow directory".into(),
-            ));
-        }
-        Ok(Self(file))
-    }
-
-    fn preflight(&self) -> Result<(), StoreError> {
-        self.sync()
-    }
-
-    fn sync(&self) -> Result<(), StoreError> {
-        use windows_sys::Win32::Storage::FileSystem::FlushFileBuffers;
-
-        // SAFETY: the handle remains owned by `self` for the call. `open`
-        // requested GENERIC_WRITE, which FlushFileBuffers requires, together
-        // with directory and no-follow semantics.
-        if unsafe { FlushFileBuffers(self.0.as_raw_handle()) } == 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        Ok(())
-    }
-}
-
-#[cfg(not(windows))]
-struct PublicationDirSync<'a>(&'a Dir);
-
-#[cfg(not(windows))]
-impl<'a> PublicationDirSync<'a> {
-    fn open(dir: &'a Dir) -> Result<Self, StoreError> {
-        Ok(Self(dir))
-    }
-
-    fn preflight(&self) -> Result<(), StoreError> {
-        Ok(())
-    }
-
-    fn sync(&self) -> Result<(), StoreError> {
-        sync_dir_required(self.0)
-    }
+    crate::directory_durability::sync_dir_required(dir).map_err(Into::into)
 }
 
 #[cfg(test)]

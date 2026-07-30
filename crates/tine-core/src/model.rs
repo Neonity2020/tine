@@ -27889,55 +27889,8 @@ fn sync_projection_chain_required(chain: &[Dir]) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
 fn sync_projection_directory_required(dir: &Dir) -> io::Result<()> {
-    use std::os::fd::{AsFd, AsRawFd, FromRawFd};
-
-    let fd = unsafe {
-        libc::openat(
-            dir.as_fd().as_raw_fd(),
-            c".".as_ptr(),
-            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY,
-        )
-    };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    unsafe { fs::File::from_raw_fd(fd) }.sync_all()
-}
-
-#[cfg(windows)]
-fn sync_projection_directory_required(dir: &Dir) -> io::Result<()> {
-    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _, OpenOptionsMaybeDirExt as _};
-    use std::os::windows::{fs::MetadataExt, io::AsRawHandle};
-    use windows_sys::Win32::Storage::FileSystem::{FlushFileBuffers, FILE_ATTRIBUTE_REPARSE_POINT};
-
-    let mut options = CapOpenOptions::new();
-    options
-        .read(true)
-        .write(true)
-        .follow(FollowSymlinks::No)
-        .maybe_dir(true);
-    let file = dir.open_with(".", &options)?.into_std();
-    let metadata = file.metadata()?;
-    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "projection durability handle is not a real no-follow directory",
-        ));
-    }
-    if unsafe { FlushFileBuffers(file.as_raw_handle()) } == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-#[cfg(not(any(unix, windows)))]
-fn sync_projection_directory_required(_dir: &Dir) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "projection directory durability is unsupported on this platform",
-    ))
+    crate::directory_durability::sync_dir_required(dir)
 }
 
 #[cfg(unix)]
@@ -33127,6 +33080,30 @@ mod tests {
         );
         assert!(!Arc::ptr_eq(&bounded_first, &bounded_after_affected));
         assert!(third.groups.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_directory_flush_limitation_does_not_block_save_or_rename() {
+        let dir = scratch("windows-directory-flush-save-rename");
+        let original = dir.join("pages/Original.md");
+        fs::write(&original, "- before\n").unwrap();
+        let graph = Graph::open(&dir);
+
+        let mut page = graph
+            .load_named("Original", PageKind::Page)
+            .unwrap()
+            .unwrap();
+        page.blocks[0].raw = "after".into();
+        graph.save_page(&page, page.rev.as_deref()).unwrap();
+        graph.rename_page("Original", "Renamed").unwrap();
+
+        assert!(!original.exists());
+        assert_eq!(
+            fs::read_to_string(dir.join("pages/Renamed.md")).unwrap(),
+            "- after\n"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
