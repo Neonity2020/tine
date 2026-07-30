@@ -1793,6 +1793,15 @@ impl ObjectStore {
         self.publish_bootstrap_prepared_fixture(batch)
     }
 
+    /// Seed only a bootstrap-origin manifest for an incomplete-store fixture.
+    #[cfg(test)]
+    pub(crate) fn stage_bootstrap_manifest_bytes_for_test(
+        &self,
+        bytes: &[u8],
+    ) -> Result<BatchId, StoreError> {
+        self.stage_manifest_bytes_impl(bytes, true)
+    }
+
     fn publish_bootstrap_prepared_fixture(&self, batch: &PreparedBatch) -> Result<(), StoreError> {
         assert_eq!(
             batch.manifest().origin(),

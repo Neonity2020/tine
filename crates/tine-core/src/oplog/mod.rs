@@ -26,6 +26,8 @@ pub(crate) mod evidence_index;
 pub(crate) mod exact_external_feed;
 pub(crate) mod external_import;
 pub mod hot_engine;
+#[cfg(test)]
+mod hot_engine_integration_tests;
 pub mod identity;
 pub mod import;
 // P2N7 composes the single VerifiedLocal -> LocalActive runtime boundary. It

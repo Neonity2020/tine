@@ -1,8 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use loro::{ExportMode, LoroDoc};
-use serde::{Deserialize, Serialize};
-use tine_core::oplog::{
+use crate::oplog::{
     AuthorBatch, BatchCausalDot, BatchDisposition, BatchError, BatchId, BatchInspection,
     BatchOrigin, BlockDelta, BlockLocation, BlockOwner, CausalPeerId, ContentDigest,
     CrdtPeerCounter, CrdtPeerId, DeterministicSimulator, DeviceId, DocumentCausalDigest,
@@ -18,7 +16,9 @@ use tine_core::oplog::{
     WorkspaceStatus, MANAGED_ENTITY_SET_VERSION, OPERATION_SCHEMA_VERSION,
     SEMANTIC_EFFECT_SCHEMA_VERSION,
 };
-use tine_core::Graph;
+use crate::Graph;
+use loro::{ExportMode, LoroDoc};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 struct TestDir(PathBuf);
@@ -52,8 +52,8 @@ struct Ids {
     home_a: DocumentId,
     home_b: DocumentId,
     home_c: DocumentId,
-    block_a: tine_core::oplog::BlockId,
-    block_c: tine_core::oplog::BlockId,
+    block_a: crate::oplog::BlockId,
+    block_c: crate::oplog::BlockId,
 }
 
 impl Ids {
@@ -68,8 +68,8 @@ impl Ids {
             home_a: DocumentId::from_uuid(uuid(20)),
             home_b: DocumentId::from_uuid(uuid(21)),
             home_c: DocumentId::from_uuid(uuid(22)),
-            block_a: tine_core::oplog::BlockId::from_uuid(uuid(30)),
-            block_c: tine_core::oplog::BlockId::from_uuid(uuid(31)),
+            block_a: crate::oplog::BlockId::from_uuid(uuid(30)),
+            block_c: crate::oplog::BlockId::from_uuid(uuid(31)),
         }
     }
 
@@ -99,8 +99,29 @@ fn tx(operations: Vec<SemanticOperation>) -> OperationTransaction {
     OperationTransaction::new(operations).unwrap()
 }
 
+fn publish_fixture(store: &ObjectStore, prepared: &PreparedBatch) {
+    match prepared.manifest().origin() {
+        BatchOrigin::BootstrapImport => store.publish_bootstrap_prepared_for_test(prepared),
+        BatchOrigin::LocalMutation | BatchOrigin::ExternalReconciliation { .. } => {
+            store.publish_prepared(prepared)
+        }
+    }
+    .unwrap();
+}
+
+fn stage_fixture_manifest(store: &ObjectStore, prepared: &PreparedBatch) {
+    let bytes = prepared.manifest().encode().unwrap();
+    match prepared.manifest().origin() {
+        BatchOrigin::BootstrapImport => store.stage_bootstrap_manifest_bytes_for_test(&bytes),
+        BatchOrigin::LocalMutation | BatchOrigin::ExternalReconciliation { .. } => {
+            store.stage_manifest_bytes(&bytes)
+        }
+    }
+    .unwrap();
+}
+
 fn ready(store: &ObjectStore, prepared: &PreparedBatch) -> ValidatedBatch {
-    store.publish_prepared(prepared).unwrap();
+    publish_fixture(store, prepared);
     match store.inspect_batch(prepared.manifest().batch_id()).unwrap() {
         BatchInspection::Ready(batch) => batch,
         other => panic!("expected Ready, found {other:?}"),
@@ -152,7 +173,7 @@ fn correction11_authenticated_document_dependency_heads_fail_closed() {
     let archive_path = dir.path().join("archive");
     let writer = ObjectStore::open(&archive_path, ids.workspace).unwrap();
     let prepared = genesis(ids, &ids.engine());
-    writer.publish_prepared(&prepared).unwrap();
+    publish_fixture(&writer, &prepared);
 
     let reader = ObjectStore::open(&archive_path, ids.workspace).unwrap();
     let mut engine = ShardedHotEngine::with_archive_store(reader, ids.lineage, ids.catalog);
@@ -188,21 +209,21 @@ fn genesis(ids: Ids, engine: &ShardedHotEngine) -> PreparedBatch {
                 SemanticOperation::CreatePage {
                     page_id: ids.page_a,
                     home_document_id: ids.home_a,
-                    name: tine_core::oplog::LogicalPageName::parse("A").unwrap(),
+                    name: crate::oplog::LogicalPageName::parse("A").unwrap(),
                     path: path("pages/A.md"),
                     kind: ManagedTextKind::Page,
                 },
                 SemanticOperation::CreatePage {
                     page_id: ids.page_b,
                     home_document_id: ids.home_b,
-                    name: tine_core::oplog::LogicalPageName::parse("B").unwrap(),
+                    name: crate::oplog::LogicalPageName::parse("B").unwrap(),
                     path: path("pages/B.md"),
                     kind: ManagedTextKind::Page,
                 },
                 SemanticOperation::CreatePage {
                     page_id: ids.page_c,
                     home_document_id: ids.home_c,
-                    name: tine_core::oplog::LogicalPageName::parse("C").unwrap(),
+                    name: crate::oplog::LogicalPageName::parse("C").unwrap(),
                     path: path("pages/C.md"),
                     kind: ManagedTextKind::Page,
                 },
@@ -239,21 +260,21 @@ fn pages_only_genesis(ids: Ids, engine: &ShardedHotEngine, batch: u128) -> Prepa
                 SemanticOperation::CreatePage {
                     page_id: ids.page_a,
                     home_document_id: ids.home_a,
-                    name: tine_core::oplog::LogicalPageName::parse("A").unwrap(),
+                    name: crate::oplog::LogicalPageName::parse("A").unwrap(),
                     path: path("pages/A.md"),
                     kind: ManagedTextKind::Page,
                 },
                 SemanticOperation::CreatePage {
                     page_id: ids.page_b,
                     home_document_id: ids.home_b,
-                    name: tine_core::oplog::LogicalPageName::parse("B").unwrap(),
+                    name: crate::oplog::LogicalPageName::parse("B").unwrap(),
                     path: path("pages/B.md"),
                     kind: ManagedTextKind::Page,
                 },
                 SemanticOperation::CreatePage {
                     page_id: ids.page_c,
                     home_document_id: ids.home_c,
-                    name: tine_core::oplog::LogicalPageName::parse("C").unwrap(),
+                    name: crate::oplog::LogicalPageName::parse("C").unwrap(),
                     path: path("pages/C.md"),
                     kind: ManagedTextKind::Page,
                 },
@@ -265,7 +286,7 @@ fn pages_only_genesis(ids: Ids, engine: &ShardedHotEngine, batch: u128) -> Prepa
 fn create_blocks(
     engine: &ShardedHotEngine,
     batch: u128,
-    blocks: &[(tine_core::oplog::BlockId, PageId, DocumentId, &str)],
+    blocks: &[(crate::oplog::BlockId, PageId, DocumentId, &str)],
 ) -> PreparedBatch {
     engine
         .prepare_bootstrap_transaction(
@@ -353,14 +374,14 @@ fn page_kind_is_durable_across_create_rename_mutation_delete_and_replay() {
     let create_operation = SemanticOperation::CreatePage {
         page_id: ids.page_a,
         home_document_id: ids.home_a,
-        name: tine_core::oplog::LogicalPageName::parse("A").unwrap(),
+        name: crate::oplog::LogicalPageName::parse("A").unwrap(),
         path: path("shared/A.md"),
         kind: ManagedTextKind::Journal,
     };
     let page_operation = SemanticOperation::CreatePage {
         page_id: ids.page_a,
         home_document_id: ids.home_a,
-        name: tine_core::oplog::LogicalPageName::parse("A").unwrap(),
+        name: crate::oplog::LogicalPageName::parse("A").unwrap(),
         path: path("shared/A.md"),
         kind: ManagedTextKind::Page,
     };
@@ -516,7 +537,7 @@ fn page_kind_is_durable_across_create_rename_mutation_delete_and_replay() {
     assert_eq!(
         delete_effect.pages()[0].after,
         Some(PageState::Tombstone {
-            name: tine_core::oplog::LogicalPageName::parse("A").unwrap(),
+            name: crate::oplog::LogicalPageName::parse("A").unwrap(),
             home_document_id: ids.home_a,
             kind: ManagedTextKind::Page,
         })
@@ -580,7 +601,7 @@ fn page_kind_mismatch_between_effect_and_catalog_object_is_rejected() {
             &tx(vec![SemanticOperation::CreatePage {
                 page_id: ids.page_a,
                 home_document_id: ids.home_a,
-                name: tine_core::oplog::LogicalPageName::parse("A").unwrap(),
+                name: crate::oplog::LogicalPageName::parse("A").unwrap(),
                 path: path("shared/A.md"),
                 kind: ManagedTextKind::Page,
             }]),
@@ -600,7 +621,7 @@ fn page_kind_mismatch_between_effect_and_catalog_object_is_rejected() {
                         home_document_id,
                         ..
                     } => PageState::Live {
-                        name: tine_core::oplog::LogicalPageName::parse("A").unwrap(),
+                        name: crate::oplog::LogicalPageName::parse("A").unwrap(),
                         path: path.clone(),
                         home_document_id: *home_document_id,
                         kind: ManagedTextKind::Journal,
@@ -608,7 +629,7 @@ fn page_kind_mismatch_between_effect_and_catalog_object_is_rejected() {
                     PageState::Tombstone {
                         home_document_id, ..
                     } => PageState::Tombstone {
-                        name: tine_core::oplog::LogicalPageName::parse("A").unwrap(),
+                        name: crate::oplog::LogicalPageName::parse("A").unwrap(),
                         home_document_id: *home_document_id,
                         kind: ManagedTextKind::Journal,
                     },
@@ -664,7 +685,7 @@ fn page_kind_changing_deletion_matching_catalog_and_effect_is_rejected() {
             &tx(vec![SemanticOperation::CreatePage {
                 page_id: ids.page_a,
                 home_document_id: ids.home_a,
-                name: tine_core::oplog::LogicalPageName::parse("A").unwrap(),
+                name: crate::oplog::LogicalPageName::parse("A").unwrap(),
                 path: path("shared/A.md"),
                 kind: ManagedTextKind::Page,
             }]),
@@ -708,7 +729,7 @@ fn page_kind_changing_deletion_matching_catalog_and_effect_is_rejected() {
         .insert(
             &ids.page_a.to_string(),
             serde_json::to_string(&PageState::Tombstone {
-                name: tine_core::oplog::LogicalPageName::parse("A").unwrap(),
+                name: crate::oplog::LogicalPageName::parse("A").unwrap(),
                 home_document_id: ids.home_a,
                 kind: ManagedTextKind::Journal,
             })
@@ -728,7 +749,7 @@ fn page_kind_changing_deletion_matching_catalog_and_effect_is_rejected() {
         .unwrap();
     assert_eq!(delta.before.as_ref().unwrap().kind(), ManagedTextKind::Page);
     delta.after = Some(PageState::Tombstone {
-        name: tine_core::oplog::LogicalPageName::parse("A").unwrap(),
+        name: crate::oplog::LogicalPageName::parse("A").unwrap(),
         home_document_id: ids.home_a,
         kind: ManagedTextKind::Journal,
     });
@@ -1571,7 +1592,7 @@ fn policy_generated_identity_requires_typed_same_batch_content_or_user_action() 
         })
     );
 
-    let exported_block = tine_core::oplog::BlockId::from_uuid(uuid(43_104));
+    let exported_block = crate::oplog::BlockId::from_uuid(uuid(43_104));
     let exported_uuid = LogseqUuid::from_uuid(uuid(43_105));
     let exported = engine
         .prepare_bootstrap_transaction(
@@ -1625,7 +1646,7 @@ fn sparse_uuid_claim_index_converges_and_invalidates_reference_frontiers() {
     let dir = TestDir::new("sparse-uuid-claims");
     let archive = store(&dir, ids);
     let (mut seed, genesis_ready) = seed_engine(ids, &archive);
-    let block_b = tine_core::oplog::BlockId::from_uuid(uuid(44_001));
+    let block_b = crate::oplog::BlockId::from_uuid(uuid(44_001));
     let create_b = seed
         .prepare_bootstrap_transaction(
             author(44_002, 44_002),
@@ -1902,7 +1923,7 @@ fn store_backed_uuid_claim_lookup_stays_point_local_and_hot_memory_bounded() {
     let mut operations = Vec::with_capacity(CLAIMS * 2);
     let mut target = None;
     for index in 0..CLAIMS {
-        let block_id = tine_core::oplog::BlockId::from_uuid(uuid(45_000 + index as u128));
+        let block_id = crate::oplog::BlockId::from_uuid(uuid(45_000 + index as u128));
         let logseq_uuid = LogseqUuid::from_uuid(uuid(46_000 + index as u128));
         target = Some((block_id, logseq_uuid));
         operations.push(SemanticOperation::CreateBlock {
@@ -1969,7 +1990,7 @@ fn author_cannot_alias_a_page_home_to_the_catalog() {
         &tx(vec![SemanticOperation::CreatePage {
             page_id: ids.page_a,
             home_document_id: ids.catalog,
-            name: tine_core::oplog::LogicalPageName::parse("A").unwrap(),
+            name: crate::oplog::LogicalPageName::parse("A").unwrap(),
             path: path("pages/A.md"),
             kind: ManagedTextKind::Page,
         }]),
@@ -2260,7 +2281,7 @@ fn accepted_sparse_reload_reads_only_target_object_but_ingress_stays_fail_closed
     let archive = ObjectStore::open(&archive_path, ids.workspace).unwrap();
     let fixture = ids.engine();
     let prepared = genesis(ids, &fixture);
-    archive.publish_prepared(&prepared).unwrap();
+    publish_fixture(&archive, &prepared);
     let batch_id = prepared.manifest().batch_id();
     let mut engine = ShardedHotEngine::with_archive_store(archive, ids.lineage, ids.catalog);
     assert!(matches!(
@@ -2311,7 +2332,7 @@ fn accepted_sparse_reload_rejects_target_manifest_or_object_mutation_and_missing
         let archive_path = dir.path().join("archive");
         let archive = ObjectStore::open(&archive_path, ids.workspace).unwrap();
         let prepared = genesis(ids, &ids.engine());
-        archive.publish_prepared(&prepared).unwrap();
+        publish_fixture(&archive, &prepared);
         let batch_id = prepared.manifest().batch_id();
         let home_descriptor = prepared
             .manifest()
@@ -2369,11 +2390,11 @@ fn correction11_cold_aged_page_reopens_replays_and_authors_without_history_range
     for index in 0..PAGES {
         let page_id = PageId::from_uuid(uuid(80_000 + index as u128));
         let home_document_id = DocumentId::from_uuid(uuid(81_000 + index as u128));
-        let block_id = tine_core::oplog::BlockId::from_uuid(uuid(82_000 + index as u128));
+        let block_id = crate::oplog::BlockId::from_uuid(uuid(82_000 + index as u128));
         operations.push(SemanticOperation::CreatePage {
             page_id,
             home_document_id,
-            name: tine_core::oplog::LogicalPageName::parse(format!("Aged {index:03}")).unwrap(),
+            name: crate::oplog::LogicalPageName::parse(format!("Aged {index:03}")).unwrap(),
             path: path(&format!("pages/Aged {index:03}.md")),
             kind: ManagedTextKind::Page,
         });
@@ -2407,7 +2428,7 @@ fn correction11_cold_aged_page_reopens_replays_and_authors_without_history_range
 
     let cold_page = PageId::from_uuid(uuid(80_000));
     let cold_home = DocumentId::from_uuid(uuid(81_000));
-    let cold_block = tine_core::oplog::BlockId::from_uuid(uuid(82_000));
+    let cold_block = crate::oplog::BlockId::from_uuid(uuid(82_000));
     let edit = author_engine
         .prepare_bootstrap_transaction(
             author(83_001, 83_000),
@@ -2489,7 +2510,7 @@ fn correction11_cold_aged_page_reopens_replays_and_authors_without_history_range
             }]),
         )
         .unwrap();
-    writer.publish_prepared(&authored).unwrap();
+    publish_fixture(&writer, &authored);
     let before_authored_stage = replay.instrumentation();
     assert!(matches!(
         replay
@@ -2541,8 +2562,8 @@ fn external_cold_replay_concurrent_old_base_map_and_text_edits_converge() {
         let right = right
             .prepare_bootstrap_transaction(right_author, &right_tx)
             .unwrap();
-        archive.publish_prepared(&left).unwrap();
-        archive.publish_prepared(&right).unwrap();
+        publish_fixture(&archive, &left);
+        publish_fixture(&archive, &right);
         [left.manifest().batch_id(), right.manifest().batch_id()]
     };
 
@@ -2632,7 +2653,7 @@ fn correction11_late_block_creation_after_long_causal_chain_has_zero_ancestry_wa
     let reader = ObjectStore::open(&archive_path, ids.workspace).unwrap();
     let mut engine = ShardedHotEngine::with_archive_store(reader, ids.lineage, ids.catalog);
     let initial = pages_only_genesis(ids, &engine, 84_000);
-    writer.publish_prepared(&initial).unwrap();
+    publish_fixture(&writer, &initial);
     engine
         .stage_archive_batch(initial.manifest().batch_id())
         .unwrap();
@@ -2651,7 +2672,7 @@ fn correction11_late_block_creation_after_long_causal_chain_has_zero_ancestry_wa
                 }]),
             )
             .unwrap();
-        writer.publish_prepared(&edit).unwrap();
+        publish_fixture(&writer, &edit);
         assert!(matches!(
             engine
                 .stage_archive_batch(edit.manifest().batch_id())
@@ -2676,7 +2697,7 @@ fn correction11_late_block_creation_after_long_causal_chain_has_zero_ancestry_wa
             }]),
         )
         .unwrap();
-    writer.publish_prepared(&create).unwrap();
+    publish_fixture(&writer, &create);
     assert!(matches!(
         engine
             .stage_archive_batch(create.manifest().batch_id())
@@ -2706,7 +2727,7 @@ fn sparse_archive_open_cost_is_independent_of_unrelated_batch_count() {
     let archive_path = dir.path().join("archive");
     let writer = ObjectStore::open(&archive_path, ids.workspace).unwrap();
     let baseline = genesis(ids, &ids.engine());
-    writer.publish_prepared(&baseline).unwrap();
+    publish_fixture(&writer, &baseline);
     let reader = ObjectStore::open(&archive_path, ids.workspace).unwrap();
     let mut engine = ShardedHotEngine::with_archive_store(reader, ids.lineage, ids.catalog);
     engine
@@ -2721,14 +2742,14 @@ fn sparse_archive_open_cost_is_independent_of_unrelated_batch_count() {
                 &tx(vec![SemanticOperation::CreatePage {
                     page_id: PageId::from_uuid(uuid(60_000 + index as u128)),
                     home_document_id: DocumentId::from_uuid(uuid(70_000 + index as u128)),
-                    name: tine_core::oplog::LogicalPageName::parse(format!("Unrelated {index:08}"))
+                    name: crate::oplog::LogicalPageName::parse(format!("Unrelated {index:08}"))
                         .unwrap(),
                     path: path(&format!("pages/Unrelated {index:08}.md")),
                     kind: ManagedTextKind::Page,
                 }]),
             )
             .unwrap();
-        writer.publish_prepared(&prepared).unwrap();
+        publish_fixture(&writer, &prepared);
     }
     let started = Instant::now();
     let page = engine.materialize_page(ids.page_a).unwrap();
@@ -2754,9 +2775,7 @@ fn incomplete_store_batch_becomes_ready_without_early_visibility() {
     let archive = store(&dir, ids);
     let mut engine = ids.engine();
     let prepared = genesis(ids, &engine);
-    archive
-        .stage_manifest_bytes(&prepared.manifest().encode().unwrap())
-        .unwrap();
+    stage_fixture_manifest(&archive, &prepared);
     assert!(matches!(
         engine
             .stage_from_store(&archive, prepared.manifest().batch_id())
@@ -2853,7 +2872,7 @@ fn conflicting_reuse_of_an_accepted_batch_id_rejects_without_rollback() {
             &tx(vec![SemanticOperation::CreatePage {
                 page_id: ids.page_a,
                 home_document_id: ids.home_a,
-                name: tine_core::oplog::LogicalPageName::parse("Conflicting").unwrap(),
+                name: crate::oplog::LogicalPageName::parse("Conflicting").unwrap(),
                 path: path("pages/Conflicting.md"),
                 kind: ManagedTextKind::Page,
             }]),
@@ -2912,7 +2931,7 @@ fn crdt_payload_is_bound_to_batch_and_same_batch_replay_is_a_duplicate_noop() {
 #[test]
 fn concurrent_same_block_id_in_distinct_homes_blocks_canonically_in_every_order() {
     let ids = Ids::new();
-    let block_id = tine_core::oplog::BlockId::from_uuid(uuid(32));
+    let block_id = crate::oplog::BlockId::from_uuid(uuid(32));
     let dir = TestDir::new("concurrent-immutable-home-conflict");
     let archive_path = dir.path().join("archive");
     let archive = ObjectStore::open(&archive_path, ids.workspace).unwrap();
@@ -2925,21 +2944,21 @@ fn concurrent_same_block_id_in_distinct_homes_blocks_canonically_in_every_order(
                 SemanticOperation::CreatePage {
                     page_id: ids.page_a,
                     home_document_id: ids.home_a,
-                    name: tine_core::oplog::LogicalPageName::parse("A").unwrap(),
+                    name: crate::oplog::LogicalPageName::parse("A").unwrap(),
                     path: path("pages/A.md"),
                     kind: ManagedTextKind::Page,
                 },
                 SemanticOperation::CreatePage {
                     page_id: ids.page_b,
                     home_document_id: ids.home_b,
-                    name: tine_core::oplog::LogicalPageName::parse("B").unwrap(),
+                    name: crate::oplog::LogicalPageName::parse("B").unwrap(),
                     path: path("pages/B.md"),
                     kind: ManagedTextKind::Page,
                 },
             ]),
         )
         .unwrap();
-    archive.publish_prepared(&genesis).unwrap();
+    publish_fixture(&archive, &genesis);
     let genesis_id = genesis.manifest().batch_id();
     let genesis_ready = match archive.inspect_batch(genesis_id).unwrap() {
         BatchInspection::Ready(batch) => batch,
@@ -2986,8 +3005,8 @@ fn concurrent_same_block_id_in_distinct_homes_blocks_canonically_in_every_order(
             }]),
         )
         .unwrap();
-    archive.publish_prepared(&created_a).unwrap();
-    archive.publish_prepared(&created_b).unwrap();
+    publish_fixture(&archive, &created_a);
+    publish_fixture(&archive, &created_b);
     let batch_a_id = created_a.manifest().batch_id();
     let batch_b_id = created_b.manifest().batch_id();
     let batch_a = match archive.inspect_batch(batch_a_id).unwrap() {
@@ -3031,8 +3050,8 @@ fn concurrent_same_block_id_in_distinct_homes_blocks_canonically_in_every_order(
             }]),
         )
         .unwrap();
-    archive.publish_prepared(&dependent_a).unwrap();
-    archive.publish_prepared(&dependent_b).unwrap();
+    publish_fixture(&archive, &dependent_a);
+    publish_fixture(&archive, &dependent_b);
     let dependent_a_id = dependent_a.manifest().batch_id();
     let dependent_b_id = dependent_b.manifest().batch_id();
     let dependent_a = match archive.inspect_batch(dependent_a_id).unwrap() {
@@ -3153,8 +3172,8 @@ fn concurrent_same_block_id_in_distinct_homes_blocks_canonically_in_every_order(
 #[test]
 fn crossed_concurrent_identity_collisions_converge_live_and_from_fresh_store() {
     let ids = Ids::new();
-    let block_x = tine_core::oplog::BlockId::from_uuid(uuid(40));
-    let block_y = tine_core::oplog::BlockId::from_uuid(uuid(41));
+    let block_x = crate::oplog::BlockId::from_uuid(uuid(40));
+    let block_y = crate::oplog::BlockId::from_uuid(uuid(41));
     let dir = TestDir::new("crossed-identity-collisions");
     let archive_path = dir.path().join("archive");
     let archive = ObjectStore::open(&archive_path, ids.workspace).unwrap();
@@ -3255,12 +3274,12 @@ fn crossed_concurrent_identity_collisions_converge_live_and_from_fresh_store() {
 #[test]
 fn concurrent_same_home_duplicate_creation_converges_after_fresh_replay() {
     let ids = Ids::new();
-    let block_id = tine_core::oplog::BlockId::from_uuid(uuid(56));
+    let block_id = crate::oplog::BlockId::from_uuid(uuid(56));
     let dir = TestDir::new("same-home-duplicate-replay");
     let archive_path = dir.path().join("archive");
     let archive = ObjectStore::open(&archive_path, ids.workspace).unwrap();
     let genesis = pages_only_genesis(ids, &ids.engine(), 300);
-    archive.publish_prepared(&genesis).unwrap();
+    publish_fixture(&archive, &genesis);
     let genesis_ready = ready(&archive, &genesis);
 
     let mut author_a = ids.engine();
@@ -3283,8 +3302,8 @@ fn concurrent_same_home_duplicate_creation_converges_after_fresh_replay() {
             }]),
         )
         .unwrap();
-    archive.publish_prepared(&claim_a).unwrap();
-    archive.publish_prepared(&claim_b).unwrap();
+    publish_fixture(&archive, &claim_a);
+    publish_fixture(&archive, &claim_b);
 
     let mut snapshots = Vec::new();
     for order in [
@@ -3317,7 +3336,7 @@ fn concurrent_same_home_duplicate_creation_converges_after_fresh_replay() {
 #[test]
 fn three_concurrent_identity_claims_and_later_blocked_ingress_have_one_evidence_set() {
     let ids = Ids::new();
-    let block_id = tine_core::oplog::BlockId::from_uuid(uuid(42));
+    let block_id = crate::oplog::BlockId::from_uuid(uuid(42));
     let dir = TestDir::new("three-identity-claims");
     let archive = store(&dir, ids);
     let genesis = pages_only_genesis(ids, &ids.engine(), 210);
@@ -3438,8 +3457,8 @@ fn permutations_of_four() -> Vec<[usize; 4]> {
 #[test]
 fn correction6_four_independent_claims_retain_complete_evidence_in_all_orders() {
     let ids = Ids::new();
-    let block_x = tine_core::oplog::BlockId::from_uuid(uuid(46));
-    let block_y = tine_core::oplog::BlockId::from_uuid(uuid(47));
+    let block_x = crate::oplog::BlockId::from_uuid(uuid(46));
+    let block_y = crate::oplog::BlockId::from_uuid(uuid(47));
     let dir = TestDir::new("correction6-four-independent-claims");
     let archive_path = dir.path().join("archive");
     let archive = ObjectStore::open(&archive_path, ids.workspace).unwrap();
@@ -3517,9 +3536,9 @@ fn correction6_four_independent_claims_retain_complete_evidence_in_all_orders() 
 #[test]
 fn correction6_blocked_frontier_validates_child_before_parent_and_finds_new_conflict() {
     let ids = Ids::new();
-    let conflict_x = tine_core::oplog::BlockId::from_uuid(uuid(48));
-    let conflict_y = tine_core::oplog::BlockId::from_uuid(uuid(49));
-    let parent_block = tine_core::oplog::BlockId::from_uuid(uuid(50));
+    let conflict_x = crate::oplog::BlockId::from_uuid(uuid(48));
+    let conflict_y = crate::oplog::BlockId::from_uuid(uuid(49));
+    let parent_block = crate::oplog::BlockId::from_uuid(uuid(50));
     let dir = TestDir::new("correction6-blocked-frontier-chain");
     let archive = store(&dir, ids);
     let genesis = pages_only_genesis(ids, &ids.engine(), 250);
@@ -3637,8 +3656,8 @@ fn correction6_blocked_frontier_validates_child_before_parent_and_finds_new_conf
 #[test]
 fn correction6_latching_batch_retains_novel_claim_for_later_conflict() {
     let ids = Ids::new();
-    let block_x = tine_core::oplog::BlockId::from_uuid(uuid(51));
-    let block_y = tine_core::oplog::BlockId::from_uuid(uuid(52));
+    let block_x = crate::oplog::BlockId::from_uuid(uuid(51));
+    let block_y = crate::oplog::BlockId::from_uuid(uuid(52));
     let dir = TestDir::new("correction6-latch-batch-novel-claim");
     let archive = store(&dir, ids);
     let genesis = pages_only_genesis(ids, &ids.engine(), 270);
@@ -3688,8 +3707,8 @@ fn correction6_latching_batch_retains_novel_claim_for_later_conflict() {
 #[test]
 fn correction6_quarantined_parent_makes_causal_duplicate_child_reject() {
     let ids = Ids::new();
-    let conflict = tine_core::oplog::BlockId::from_uuid(uuid(54));
-    let causal_duplicate = tine_core::oplog::BlockId::from_uuid(uuid(55));
+    let conflict = crate::oplog::BlockId::from_uuid(uuid(54));
+    let causal_duplicate = crate::oplog::BlockId::from_uuid(uuid(55));
     let dir = TestDir::new("correction6-terminal-causal-duplicate");
     let archive = store(&dir, ids);
     let genesis = pages_only_genesis(ids, &ids.engine(), 280);
@@ -3806,7 +3825,7 @@ fn correction6_quarantined_parent_makes_causal_duplicate_child_reject() {
 #[test]
 fn author_refuses_same_batch_cross_home_duplicate_without_retained_claim() {
     let ids = Ids::new();
-    let block_id = tine_core::oplog::BlockId::from_uuid(uuid(43));
+    let block_id = crate::oplog::BlockId::from_uuid(uuid(43));
     let dir = TestDir::new("same-batch-identity-duplicate");
     let archive = store(&dir, ids);
     let genesis = pages_only_genesis(ids, &ids.engine(), 220);
@@ -3852,8 +3871,8 @@ fn author_refuses_same_batch_cross_home_duplicate_without_retained_claim() {
 #[test]
 fn mid_drain_acceptance_and_blocked_duplicate_report_truthful_batch_dispositions() {
     let ids = Ids::new();
-    let conflict_id = tine_core::oplog::BlockId::from_uuid(uuid(44));
-    let dependency_id = tine_core::oplog::BlockId::from_uuid(uuid(45));
+    let conflict_id = crate::oplog::BlockId::from_uuid(uuid(44));
+    let dependency_id = crate::oplog::BlockId::from_uuid(uuid(45));
     let dir = TestDir::new("mid-drain-blocked-status");
     let archive = store(&dir, ids);
     let genesis = pages_only_genesis(ids, &ids.engine(), 230);
@@ -3943,7 +3962,7 @@ fn mid_drain_acceptance_and_blocked_duplicate_report_truthful_batch_dispositions
 #[test]
 fn subtree_reorder_and_rename_referrer_transaction_preserve_atomic_semantics() {
     let ids = Ids::new();
-    let child = tine_core::oplog::BlockId::from_uuid(uuid(32));
+    let child = crate::oplog::BlockId::from_uuid(uuid(32));
     let dir = TestDir::new("operation-surface");
     let archive = store(&dir, ids);
     let (mut engine, _) = seed_engine(ids, &archive);
@@ -3997,19 +4016,19 @@ fn subtree_reorder_and_rename_referrer_transaction_preserve_atomic_semantics() {
         .prepare_bootstrap_transaction(
             author(106, 106),
             &tx(vec![SemanticOperation::RenamePagesAndRewriteReferrers {
-                page_changes: vec![tine_core::oplog::PageRename {
+                page_changes: vec![crate::oplog::PageRename {
                     page_id: ids.page_a,
-                    new_name: tine_core::oplog::LogicalPageName::parse("A Renamed").unwrap(),
+                    new_name: crate::oplog::LogicalPageName::parse("A Renamed").unwrap(),
                     new_path: path("pages/A Renamed.md"),
                 }],
-                block_rewrites: vec![tine_core::oplog::BlockContentRewrite {
+                block_rewrites: vec![crate::oplog::BlockContentRewrite {
                     block: BlockLocation {
                         block_id: child,
                         home_document_id: ids.home_a,
                     },
                     new_content: "ref [[A Renamed]]".into(),
                 }],
-                page_preamble_rewrites: vec![tine_core::oplog::PagePreambleRewrite {
+                page_preamble_rewrites: vec![crate::oplog::PagePreambleRewrite {
                     page_id: ids.page_a,
                     new_preamble: Some("title:: [[A Renamed]]".into()),
                 }],
@@ -4050,7 +4069,7 @@ fn subtree_reorder_and_rename_referrer_transaction_preserve_atomic_semantics() {
 #[test]
 fn namespace_rename_updates_sorted_pages_preambles_and_blocks_atomically() {
     let ids = Ids::new();
-    let child_block = tine_core::oplog::BlockId::from_uuid(uuid(32));
+    let child_block = crate::oplog::BlockId::from_uuid(uuid(32));
     let dir = TestDir::new("namespace-rename");
     let archive = store(&dir, ids);
     let mut engine = ids.engine();
@@ -4061,14 +4080,14 @@ fn namespace_rename_updates_sorted_pages_preambles_and_blocks_atomically() {
                 SemanticOperation::CreatePage {
                     page_id: ids.page_a,
                     home_document_id: ids.home_a,
-                    name: tine_core::oplog::LogicalPageName::parse("Area").unwrap(),
+                    name: crate::oplog::LogicalPageName::parse("Area").unwrap(),
                     path: path("pages/area.md"),
                     kind: ManagedTextKind::Page,
                 },
                 SemanticOperation::CreatePage {
                     page_id: ids.page_b,
                     home_document_id: ids.home_b,
-                    name: tine_core::oplog::LogicalPageName::parse("Area/Child").unwrap(),
+                    name: crate::oplog::LogicalPageName::parse("Area/Child").unwrap(),
                     path: path("pages/area___child.md"),
                     kind: ManagedTextKind::Page,
                 },
@@ -4113,26 +4132,26 @@ fn namespace_rename_updates_sorted_pages_preambles_and_blocks_atomically() {
             author(43_001, 43_001),
             &tx(vec![SemanticOperation::RenamePagesAndRewriteReferrers {
                 page_changes: vec![
-                    tine_core::oplog::PageRename {
+                    crate::oplog::PageRename {
                         page_id: ids.page_a,
-                        new_name: tine_core::oplog::LogicalPageName::parse("Domain").unwrap(),
+                        new_name: crate::oplog::LogicalPageName::parse("Domain").unwrap(),
                         new_path: path("pages/domain.md"),
                     },
-                    tine_core::oplog::PageRename {
+                    crate::oplog::PageRename {
                         page_id: ids.page_b,
-                        new_name: tine_core::oplog::LogicalPageName::parse("Domain/Child").unwrap(),
+                        new_name: crate::oplog::LogicalPageName::parse("Domain/Child").unwrap(),
                         new_path: path("pages/domain___child.md"),
                     },
                 ],
                 block_rewrites: vec![
-                    tine_core::oplog::BlockContentRewrite {
+                    crate::oplog::BlockContentRewrite {
                         block: BlockLocation {
                             block_id: ids.block_a,
                             home_document_id: ids.home_a,
                         },
                         new_content: "see [[Domain/Child]]".into(),
                     },
-                    tine_core::oplog::BlockContentRewrite {
+                    crate::oplog::BlockContentRewrite {
                         block: BlockLocation {
                             block_id: child_block,
                             home_document_id: ids.home_b,
@@ -4141,11 +4160,11 @@ fn namespace_rename_updates_sorted_pages_preambles_and_blocks_atomically() {
                     },
                 ],
                 page_preamble_rewrites: vec![
-                    tine_core::oplog::PagePreambleRewrite {
+                    crate::oplog::PagePreambleRewrite {
                         page_id: ids.page_a,
                         new_preamble: Some("alias:: [[Domain/Child]]".into()),
                     },
-                    tine_core::oplog::PagePreambleRewrite {
+                    crate::oplog::PagePreambleRewrite {
                         page_id: ids.page_b,
                         new_preamble: Some("parent:: [[Domain]]".into()),
                     },
@@ -4193,14 +4212,14 @@ fn namespace_rename_updates_sorted_pages_preambles_and_blocks_atomically() {
 #[test]
 fn rename_shape_state_and_wire_validation_fail_before_mutation() {
     let ids = Ids::new();
-    let page_a = tine_core::oplog::PageRename {
+    let page_a = crate::oplog::PageRename {
         page_id: ids.page_a,
-        new_name: tine_core::oplog::LogicalPageName::parse("Renamed A").unwrap(),
+        new_name: crate::oplog::LogicalPageName::parse("Renamed A").unwrap(),
         new_path: path("pages/Renamed A.md"),
     };
-    let page_b = tine_core::oplog::PageRename {
+    let page_b = crate::oplog::PageRename {
         page_id: ids.page_b,
-        new_name: tine_core::oplog::LogicalPageName::parse("Renamed B").unwrap(),
+        new_name: crate::oplog::LogicalPageName::parse("Renamed B").unwrap(),
         new_path: path("pages/Renamed B.md"),
     };
     let operation = SemanticOperation::RenamePagesAndRewriteReferrers {
@@ -4237,11 +4256,11 @@ fn rename_shape_state_and_wire_validation_fail_before_mutation() {
         OperationTransaction::new(vec![SemanticOperation::RenamePagesAndRewriteReferrers {
             page_changes: vec![page_a.clone()],
             block_rewrites: vec![
-                tine_core::oplog::BlockContentRewrite {
+                crate::oplog::BlockContentRewrite {
                     block,
                     new_content: "one".into(),
                 },
-                tine_core::oplog::BlockContentRewrite {
+                crate::oplog::BlockContentRewrite {
                     block,
                     new_content: "two".into(),
                 },
@@ -4255,11 +4274,11 @@ fn rename_shape_state_and_wire_validation_fail_before_mutation() {
             page_changes: vec![page_a.clone()],
             block_rewrites: Vec::new(),
             page_preamble_rewrites: vec![
-                tine_core::oplog::PagePreambleRewrite {
+                crate::oplog::PagePreambleRewrite {
                     page_id: ids.page_a,
                     new_preamble: Some("one".into()),
                 },
-                tine_core::oplog::PagePreambleRewrite {
+                crate::oplog::PagePreambleRewrite {
                     page_id: ids.page_a,
                     new_preamble: Some("two".into()),
                 },
@@ -4270,7 +4289,7 @@ fn rename_shape_state_and_wire_validation_fail_before_mutation() {
     assert!(
         OperationTransaction::new(vec![SemanticOperation::RenamePagesAndRewriteReferrers {
             page_changes: vec![page_a.clone()],
-            block_rewrites: vec![tine_core::oplog::BlockContentRewrite {
+            block_rewrites: vec![crate::oplog::BlockContentRewrite {
                 block,
                 new_content: "x".repeat(4 * 1024 * 1024 + 1),
             }],
@@ -4304,9 +4323,9 @@ fn rename_shape_state_and_wire_validation_fail_before_mutation() {
         engine.prepare_bootstrap_transaction(
             author(43_010, 43_010),
             &tx(vec![SemanticOperation::RenamePagesAndRewriteReferrers {
-                page_changes: vec![tine_core::oplog::PageRename {
+                page_changes: vec![crate::oplog::PageRename {
                     page_id: PageId::from_uuid(uuid(999)),
-                    new_name: tine_core::oplog::LogicalPageName::parse("Missing").unwrap(),
+                    new_name: crate::oplog::LogicalPageName::parse("Missing").unwrap(),
                     new_path: path("pages/Missing.md"),
                 }],
                 block_rewrites: Vec::new(),
@@ -4349,7 +4368,7 @@ fn external_page_state_reconciliation_is_origin_gated() {
     let (engine, _) = seed_engine(ids, &archive);
     let operation = SemanticOperation::ReconcileExternalPageState {
         page_id: ids.page_a,
-        name: tine_core::oplog::LogicalPageName::parse("External Exact").unwrap(),
+        name: crate::oplog::LogicalPageName::parse("External Exact").unwrap(),
         path: path("nested/storage/external.md"),
         kind: ManagedTextKind::Journal,
     };
@@ -4371,11 +4390,11 @@ fn external_page_state_reconciliation_is_origin_gated() {
         engine.draft_author_transaction(
             author(43_022, 43_022),
             BatchOrigin::ExternalReconciliation {
-                import_id: tine_core::oplog::ImportId::derive(
+                import_id: crate::oplog::ImportId::derive(
                     ids.workspace,
                     &[],
                     &[],
-                    tine_core::oplog::DIFF_SCHEMA_VERSION,
+                    crate::oplog::DIFF_SCHEMA_VERSION,
                 )
                 .unwrap(),
             },
@@ -5026,7 +5045,7 @@ fn concurrent_portable_alias_creates_quarantine_with_order_independent_evidence(
             &tx(vec![SemanticOperation::CreatePage {
                 page_id: ids.page_a,
                 home_document_id: ids.home_a,
-                name: tine_core::oplog::LogicalPageName::parse("Foo").unwrap(),
+                name: crate::oplog::LogicalPageName::parse("Foo").unwrap(),
                 path: path("pages/Foo.md"),
                 kind: ManagedTextKind::Page,
             }]),
@@ -5039,7 +5058,7 @@ fn concurrent_portable_alias_creates_quarantine_with_order_independent_evidence(
             &tx(vec![SemanticOperation::CreatePage {
                 page_id: ids.page_b,
                 home_document_id: ids.home_b,
-                name: tine_core::oplog::LogicalPageName::parse("foo").unwrap(),
+                name: crate::oplog::LogicalPageName::parse("foo").unwrap(),
                 path: path("pages/foo.md"),
                 kind: ManagedTextKind::Page,
             }]),
@@ -5099,7 +5118,7 @@ fn durable_terminal_portable_latch_blocks_projection_state_after_restart() {
             &tx(vec![SemanticOperation::CreatePage {
                 page_id: ids.page_c,
                 home_document_id: ids.home_c,
-                name: tine_core::oplog::LogicalPageName::parse("Baseline").unwrap(),
+                name: crate::oplog::LogicalPageName::parse("Baseline").unwrap(),
                 path: path("pages/Baseline.md"),
                 kind: ManagedTextKind::Page,
             }]),
@@ -5116,7 +5135,7 @@ fn durable_terminal_portable_latch_blocks_projection_state_after_restart() {
             &tx(vec![SemanticOperation::CreatePage {
                 page_id: ids.page_a,
                 home_document_id: ids.home_a,
-                name: tine_core::oplog::LogicalPageName::parse("Foo").unwrap(),
+                name: crate::oplog::LogicalPageName::parse("Foo").unwrap(),
                 path: path("pages/Foo.md"),
                 kind: ManagedTextKind::Page,
             }]),
@@ -5128,14 +5147,14 @@ fn durable_terminal_portable_latch_blocks_projection_state_after_restart() {
             &tx(vec![SemanticOperation::CreatePage {
                 page_id: ids.page_b,
                 home_document_id: ids.home_b,
-                name: tine_core::oplog::LogicalPageName::parse("foo").unwrap(),
+                name: crate::oplog::LogicalPageName::parse("foo").unwrap(),
                 path: path("pages/foo.md"),
                 kind: ManagedTextKind::Page,
             }]),
         )
         .unwrap();
-    writer.publish_prepared(&left).unwrap();
-    writer.publish_prepared(&right).unwrap();
+    publish_fixture(&writer, &left);
+    publish_fixture(&writer, &right);
 
     let reader = ObjectStore::open(&archive_path, ids.workspace).unwrap();
     let mut engine = ShardedHotEngine::with_enrolled_projection(
@@ -5223,7 +5242,7 @@ fn durable_page_name_latch_restores_typed_evidence_without_legacy_fatal_evidence
             &tx(vec![SemanticOperation::CreatePage {
                 page_id: ids.page_c,
                 home_document_id: ids.home_c,
-                name: tine_core::oplog::LogicalPageName::parse("Baseline").unwrap(),
+                name: crate::oplog::LogicalPageName::parse("Baseline").unwrap(),
                 path: path("pages/baseline.md"),
                 kind: ManagedTextKind::Page,
             }]),
@@ -5240,7 +5259,7 @@ fn durable_page_name_latch_restores_typed_evidence_without_legacy_fatal_evidence
             &tx(vec![SemanticOperation::CreatePage {
                 page_id: ids.page_a,
                 home_document_id: ids.home_a,
-                name: tine_core::oplog::LogicalPageName::parse("Shared Name").unwrap(),
+                name: crate::oplog::LogicalPageName::parse("Shared Name").unwrap(),
                 path: path("pages/left-distinct.md"),
                 kind: ManagedTextKind::Page,
             }]),
@@ -5252,14 +5271,14 @@ fn durable_page_name_latch_restores_typed_evidence_without_legacy_fatal_evidence
             &tx(vec![SemanticOperation::CreatePage {
                 page_id: ids.page_b,
                 home_document_id: ids.home_b,
-                name: tine_core::oplog::LogicalPageName::parse("shared name").unwrap(),
+                name: crate::oplog::LogicalPageName::parse("shared name").unwrap(),
                 path: path("pages/right-distinct.md"),
                 kind: ManagedTextKind::Page,
             }]),
         )
         .unwrap();
-    writer.publish_prepared(&left).unwrap();
-    writer.publish_prepared(&right).unwrap();
+    publish_fixture(&writer, &left);
+    publish_fixture(&writer, &right);
 
     let mut engine = ShardedHotEngine::with_enrolled_projection(
         ObjectStore::open(&archive_path, ids.workspace).unwrap(),
@@ -5397,7 +5416,7 @@ fn store_backed_portable_index_is_affected_only_and_missing_root_fails_closed() 
     let archive_path = dir.path().join("archive");
     let writer = ObjectStore::open(&archive_path, ids.workspace).unwrap();
     let bootstrap = genesis(ids, &ids.engine());
-    writer.publish_prepared(&bootstrap).unwrap();
+    publish_fixture(&writer, &bootstrap);
 
     let reader = ObjectStore::open(&archive_path, ids.workspace).unwrap();
     let mut engine = ShardedHotEngine::with_archive_store(reader, ids.lineage, ids.catalog);
@@ -5418,7 +5437,7 @@ fn store_backed_portable_index_is_affected_only_and_missing_root_fails_closed() 
             }]),
         )
         .unwrap();
-    writer.publish_prepared(&rename).unwrap();
+    publish_fixture(&writer, &rename);
     assert!(matches!(
         engine
             .stage_archive_batch(rename.manifest().batch_id())
@@ -5436,7 +5455,7 @@ fn store_backed_portable_index_is_affected_only_and_missing_root_fails_closed() 
     );
     assert_ne!(
         engine.portable_path_index_root().unwrap(),
-        tine_core::oplog::PortablePathIndexRoot::empty()
+        crate::oplog::PortablePathIndexRoot::empty()
     );
 
     let root = engine.portable_path_index_root().unwrap().digest();
@@ -6023,7 +6042,7 @@ fn scenario_encoding_scheduler_and_production_engine_simulation_are_deterministi
     let create = tx(vec![SemanticOperation::CreatePage {
         page_id: ids.page_a,
         home_document_id: ids.home_a,
-        name: tine_core::oplog::LogicalPageName::parse("A").unwrap(),
+        name: crate::oplog::LogicalPageName::parse("A").unwrap(),
         path: path("pages/A.md"),
         kind: ManagedTextKind::Page,
     }]);
@@ -6076,7 +6095,7 @@ fn scenario_encoding_scheduler_and_production_engine_simulation_are_deterministi
 #[test]
 fn simulator_assert_converged_checks_terminal_history_not_only_evidence() {
     let ids = Ids::new();
-    let block_id = tine_core::oplog::BlockId::from_uuid(uuid(46));
+    let block_id = crate::oplog::BlockId::from_uuid(uuid(46));
     let devices = vec![
         ScenarioDevice {
             name: "alpha".into(),
@@ -6108,14 +6127,14 @@ fn simulator_assert_converged_checks_terminal_history_not_only_evidence() {
                     SemanticOperation::CreatePage {
                         page_id: ids.page_a,
                         home_document_id: ids.home_a,
-                        name: tine_core::oplog::LogicalPageName::parse("A").unwrap(),
+                        name: crate::oplog::LogicalPageName::parse("A").unwrap(),
                         path: path("pages/A.md"),
                         kind: ManagedTextKind::Page,
                     },
                     SemanticOperation::CreatePage {
                         page_id: ids.page_b,
                         home_document_id: ids.home_b,
-                        name: tine_core::oplog::LogicalPageName::parse("B").unwrap(),
+                        name: crate::oplog::LogicalPageName::parse("B").unwrap(),
                         path: path("pages/B.md"),
                         kind: ManagedTextKind::Page,
                     },
@@ -6172,14 +6191,14 @@ fn simulator_assert_converged_checks_terminal_history_not_only_evidence() {
     let mut simulator = DeterministicSimulator::new(scenario).unwrap();
     assert!(matches!(
         simulator.run(),
-        Err(tine_core::oplog::ScenarioError::Diverged { action_index: 6 })
+        Err(crate::oplog::ScenarioError::Diverged { action_index: 6 })
     ));
 }
 
 #[test]
 fn simulator_offered_oracle_compares_opposite_pre_latch_histories() {
     let ids = Ids::new();
-    let block_id = tine_core::oplog::BlockId::from_uuid(uuid(53));
+    let block_id = crate::oplog::BlockId::from_uuid(uuid(53));
     let devices = vec![
         ScenarioDevice {
             name: "left".into(),
@@ -6216,14 +6235,14 @@ fn simulator_offered_oracle_compares_opposite_pre_latch_histories() {
                     SemanticOperation::CreatePage {
                         page_id: ids.page_a,
                         home_document_id: ids.home_a,
-                        name: tine_core::oplog::LogicalPageName::parse("A").unwrap(),
+                        name: crate::oplog::LogicalPageName::parse("A").unwrap(),
                         path: path("pages/A.md"),
                         kind: ManagedTextKind::Page,
                     },
                     SemanticOperation::CreatePage {
                         page_id: ids.page_b,
                         home_document_id: ids.home_b,
-                        name: tine_core::oplog::LogicalPageName::parse("B").unwrap(),
+                        name: crate::oplog::LogicalPageName::parse("B").unwrap(),
                         path: path("pages/B.md"),
                         kind: ManagedTextKind::Page,
                     },
@@ -6333,7 +6352,7 @@ fn scenario_reducer_removes_irrelevant_authors_and_orphan_deliveries() {
                 transaction: tx(vec![SemanticOperation::CreatePage {
                     page_id: ids.page_c,
                     home_document_id: ids.home_c,
-                    name: tine_core::oplog::LogicalPageName::parse("Irrelevant").unwrap(),
+                    name: crate::oplog::LogicalPageName::parse("Irrelevant").unwrap(),
                     path: path("pages/Irrelevant.md"),
                     kind: ManagedTextKind::Page,
                 }]),
@@ -6349,7 +6368,7 @@ fn scenario_reducer_removes_irrelevant_authors_and_orphan_deliveries() {
                 transaction: tx(vec![SemanticOperation::CreatePage {
                     page_id: ids.page_a,
                     home_document_id: ids.home_a,
-                    name: tine_core::oplog::LogicalPageName::parse("Failure").unwrap(),
+                    name: crate::oplog::LogicalPageName::parse("Failure").unwrap(),
                     path: path("pages/Failure.md"),
                     kind: ManagedTextKind::Page,
                 }]),
