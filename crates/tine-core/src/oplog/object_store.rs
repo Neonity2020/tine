@@ -7318,12 +7318,13 @@ fn publish_immutable(
     bytes: &[u8],
     collision: Collision,
 ) -> Result<(), StoreError> {
-    // Windows validates a write-capable no-follow directory handle and attempts
-    // FlushFileBuffers before inserting an immutable target name. The retained
-    // handle is reused afterward, so namespace retargeting cannot redirect the
-    // probe. ERROR_INVALID_PARAMETER is the one documented residual: file bytes
-    // stay flushed and insertion stays atomic, but directory-entry durability is
-    // unavailable on that platform/filesystem.
+    // Windows validates the retained directory capability, reopens that exact
+    // object by handle with write access, and attempts FlushFileBuffers before
+    // inserting an immutable target name. Both handles are retained and reused
+    // afterward, so namespace retargeting cannot redirect the probe.
+    // ERROR_INVALID_PARAMETER from only the final flush is the documented
+    // residual: file bytes stay flushed and insertion stays atomic, but
+    // directory-entry durability is unavailable on that platform/filesystem.
     let publication_sync = PublicationDirSync::open(dir).map_err(StoreError::from)?;
     publication_sync.preflight().map_err(StoreError::from)?;
     let temp_name = format!(".tmp-{}", Uuid::new_v4());

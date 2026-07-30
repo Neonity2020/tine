@@ -41,9 +41,12 @@ We will treat data safety as a first-class invariant set, not best-effort:
   rare edge case" is not grounds to skip a data-loss fix.
 - **Windows crash-durability limit:** regular-file bytes are still flushed with
   `FlushFileBuffers`, and publication still uses atomic name operations. After
-  Tine proves that its no-follow handle is a real directory and not a reparse
-  point, Windows may return `ERROR_INVALID_PARAMETER` because portable
-  directory-entry fsync is unavailable. Only that directory-flush result is
-  treated as a platform limitation; other errors remain fatal. Consequently,
-  flushed file bytes and atomic publication are retained, but Tine does not
-  claim that the directory entry itself survives a Windows crash.
+  Tine clones and validates the retained directory capability, it uses
+  `ReOpenFile` to request write access to that exact object without another
+  pathname lookup, and validates the reopened handle as a real directory rather
+  than a reparse point. Windows may then return `ERROR_INVALID_PARAMETER` from
+  `FlushFileBuffers` because portable directory-entry fsync is unavailable.
+  Only that final directory-flush result is treated as a platform limitation;
+  clone, reopen, metadata, validation, and all other errors remain fatal.
+  Consequently, flushed file bytes and atomic publication are retained, but
+  Tine does not claim that the directory entry itself survives a Windows crash.
