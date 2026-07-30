@@ -46,6 +46,64 @@ const windowsScenarios = [
   "e2e-tab-overflow.mjs",
 ];
 
+function yamlBlock(lines, key, indent) {
+  const header = `${" ".repeat(indent)}${key}:`;
+  const start = lines.findIndex((line) => line === header);
+  assert.ok(start >= 0, `CI workflow is missing YAML mapping ${key}`);
+
+  let end = start + 1;
+  while (end < lines.length) {
+    const line = lines[end];
+    if (line.trim() && line.length - line.trimStart().length <= indent) {
+      break;
+    }
+    end += 1;
+  }
+  return lines.slice(start + 1, end);
+}
+
+function yamlScalar(lines, key, indent) {
+  const prefix = `${" ".repeat(indent)}${key}:`;
+  const line = lines.find((candidate) => candidate.startsWith(prefix));
+  assert.ok(line, `CI workflow is missing YAML scalar ${key}`);
+  return line.slice(prefix.length).trim();
+}
+
+function yamlNamedStep(lines, name) {
+  const marker = `- name: ${name}`;
+  const start = lines.findIndex((line) => line.trimStart() === marker);
+  assert.ok(start >= 0, `CI workflow is missing step ${name}`);
+  const indent = lines[start].length - lines[start].trimStart().length;
+
+  let end = start + 1;
+  while (end < lines.length) {
+    const line = lines[end];
+    if (line.trimStart().startsWith("- ") && line.length - line.trimStart().length === indent) {
+      break;
+    }
+    end += 1;
+  }
+  return lines.slice(start, end);
+}
+
+function yamlLiteral(lines, key) {
+  const line = lines.find((candidate) => candidate.trimStart() === `${key}: |`);
+  assert.ok(line, `CI workflow is missing literal ${key}`);
+  const indent = line.length - line.trimStart().length;
+  const start = lines.indexOf(line) + 1;
+  let end = start;
+  while (end < lines.length) {
+    const candidate = lines[end];
+    if (candidate.trim() && candidate.length - candidate.trimStart().length <= indent) {
+      break;
+    }
+    end += 1;
+  }
+  return lines.slice(start, end).map((candidate) => candidate.trim()).join("\n").trimEnd();
+}
+
+const ciYaml = ciWorkflow.split(/\r?\n/);
+
 const successfulFullCiRun = {
   id: 1234,
   event: "workflow_dispatch",
@@ -117,23 +175,107 @@ assert.match(
 );
 assert.match(
   ciWorkflow,
-  /test:\n    name: Full CI \/ Linux tests and release contracts[\s\S]*?uses: dtolnay\/rust-toolchain@stable\n        with:\n          targets: wasm32-unknown-unknown[\s\S]*?name: Standalone plugin template builds and conforms\n        run: npm run plugin:template-check/,
+  /test:\n    name: Full CI \/ Linux tests and release contracts[\s\S]*?uses: dtolnay\/rust-toolchain@1\.96\.0\n        with:\n          targets: wasm32-unknown-unknown[\s\S]*?name: Standalone plugin template builds and conforms\n        run: npm run plugin:template-check/,
   "the Linux full-CI plugin-template check does not install the WASM target"
 );
-assert.match(
-  ciWorkflow,
-  /windows-compile:[\s\S]*?inputs\.scope == 'full'[\s\S]*?inputs\.scope == 'windows'/,
-  "the Windows lane cannot distinguish full and focused dispatches"
+const ciOn = yamlBlock(ciYaml, "on", 0);
+const dispatch = yamlBlock(ciOn, "workflow_dispatch", 2);
+const dispatchInputs = yamlBlock(dispatch, "inputs", 4);
+const windowsTestInput = yamlBlock(dispatchInputs, "windows_test_name", 6);
+assert.equal(yamlScalar(windowsTestInput, "required", 8), "false");
+assert.equal(yamlScalar(windowsTestInput, "default", 8), '""');
+assert.equal(yamlScalar(windowsTestInput, "type", 8), "string");
+
+const runName = yamlScalar(ciYaml, "run-name", 0);
+assert.ok(runName.includes("focused Windows / {0}"), "focused dispatches are not labeled in run metadata");
+assert.ok(
+  runName.includes("format('focused Windows / {0}', inputs.windows_test_name)"),
+  "focused run metadata does not expose the exact selected test name"
 );
-assert.match(
-  ciWorkflow,
-  /android-core-compile:[\s\S]*?inputs\.scope == 'full'[\s\S]*?inputs\.scope == 'android'/,
-  "the Android lane cannot distinguish full and focused dispatches"
+assert.ok(runName.includes("full suite / {0}"), "full dispatches are not labeled in run metadata");
+
+const ciJobs = yamlBlock(ciYaml, "jobs", 0);
+const scopeValidation = yamlBlock(ciJobs, "validate-windows-focused-test-input", 2);
+assert.equal(
+  yamlScalar(scopeValidation, "if", 4),
+  "github.event_name == 'workflow_dispatch' && inputs.windows_test_name != '' && inputs.scope != 'windows'"
 );
-assert.match(
-  ciWorkflow,
-  /bench:[\s\S]*?inputs\.scope == 'full'[\s\S]*?inputs\.scope == 'performance'/,
-  "the performance lane cannot distinguish full and focused dispatches"
+const scopeValidationScript = yamlLiteral(
+  yamlNamedStep(scopeValidation, "Reject Windows focused test outside Windows scope"),
+  "run"
+);
+assert.ok(scopeValidationScript.includes("::error::windows_test_name may only be used with scope=windows."));
+assert.ok(scopeValidationScript.endsWith("exit 1"));
+const needsWindowsScope = (scope, testName) => testName !== "" && scope !== "windows";
+for (const scope of ["full", "android", "performance"]) {
+  assert.equal(needsWindowsScope(scope, "model::tests::focused"), true, `${scope} must reject a filter`);
+}
+assert.equal(needsWindowsScope("windows", "model::tests::focused"), false);
+assert.equal(needsWindowsScope("full", ""), false);
+
+const windowsCompile = yamlBlock(ciJobs, "windows-compile", 2);
+assert.equal(
+  yamlScalar(windowsCompile, "if", 4),
+  "github.event_name == 'workflow_dispatch' && (inputs.scope == 'windows' || (inputs.scope == 'full' && inputs.windows_test_name == ''))"
+);
+const runsWindowsLane = (scope, testName) => scope === "windows" || (scope === "full" && testName === "");
+assert.equal(runsWindowsLane("full", ""), true);
+assert.equal(runsWindowsLane("full", "config::tests::focused"), false);
+assert.equal(runsWindowsLane("windows", "config::tests::focused"), true);
+const fullWindowsCore = yamlNamedStep(windowsCompile, "Windows core tests (full suite; release gate)");
+assert.equal(yamlScalar(fullWindowsCore, "if", 8), "inputs.windows_test_name == ''");
+assert.equal(yamlScalar(fullWindowsCore, "run", 8), "cargo test -p tine-core");
+
+const focusedWindowsCore = yamlNamedStep(
+  windowsCompile,
+  "Windows core test (focused exact serial) / ${{ inputs.windows_test_name }}"
+);
+assert.equal(yamlScalar(focusedWindowsCore, "if", 8), "inputs.scope == 'windows' && inputs.windows_test_name != ''");
+assert.equal(yamlScalar(focusedWindowsCore, "shell", 8), "pwsh");
+assert.equal(
+  yamlScalar(yamlBlock(focusedWindowsCore, "env", 8), "TINE_WINDOWS_RUST_TEST", 10),
+  "${{ inputs.windows_test_name }}"
+);
+const focusedWindowsScript = yamlLiteral(focusedWindowsCore, "run");
+assert.ok(focusedWindowsScript.includes("$testName = $env:TINE_WINDOWS_RUST_TEST.Trim()"));
+assert.ok(focusedWindowsScript.includes("[string]::IsNullOrWhiteSpace($testName)"));
+assert.ok(focusedWindowsScript.includes("$testName -notmatch '^[A-Za-z0-9_]+(?:::[A-Za-z0-9_]+)*$'"));
+assert.ok(focusedWindowsScript.includes("$listedTests = & cargo test -p tine-core --lib -- --list"));
+assert.ok(focusedWindowsScript.includes('$_ -ceq "${testName}: test"'));
+assert.ok(focusedWindowsScript.includes("if ($matchingTests.Count -ne 1)"));
+assert.ok(focusedWindowsScript.includes('"--lib"'));
+assert.ok(focusedWindowsScript.includes("$testName"));
+assert.ok(focusedWindowsScript.includes('"--exact"'));
+assert.ok(focusedWindowsScript.includes('"--nocapture"'));
+assert.ok(focusedWindowsScript.includes('"--test-threads=1"'));
+assert.ok(focusedWindowsScript.includes("& cargo @cargoArgs"));
+
+const exactHarnessMatches = (listedTests, testName) =>
+  listedTests.split(/\r?\n/).filter((line) => line === `${testName}: test`);
+const knownHarnessName = "model::tests::active_rename_projection_scan_budget_has_exact_pre_commit_boundary";
+assert.equal(exactHarnessMatches(`${knownHarnessName}: test`, knownHarnessName).length, 1);
+assert.equal(exactHarnessMatches(`${knownHarnessName}: test`, "model::tests::unknown_name").length, 0);
+assert.equal(exactHarnessMatches(`${knownHarnessName}: test`, knownHarnessName.toUpperCase()).length, 0);
+assert.equal(exactHarnessMatches(`${knownHarnessName}: test\n${knownHarnessName}: test`, knownHarnessName).length, 2);
+const safeRustTestPath = /^[A-Za-z0-9_]+(?:::[A-Za-z0-9_]+)*$/;
+assert.equal("   \t".trim(), "");
+assert.equal(safeRustTestPath.test(knownHarnessName), true);
+assert.equal(safeRustTestPath.test("model::tests::unknown name"), false);
+assert.equal(safeRustTestPath.test("model::tests::unknown; exit 0"), false);
+
+const tauriCompile = yamlNamedStep(windowsCompile, "Windows Tauri shell compiles");
+assert.equal(yamlScalar(tauriCompile, "run", 8), "cargo check -p tine --features custom-protocol");
+const fullLinux = yamlBlock(ciJobs, "test", 2);
+const androidCompile = yamlBlock(ciJobs, "android-core-compile", 2);
+const performanceBench = yamlBlock(ciJobs, "bench", 2);
+assert.equal(yamlScalar(fullLinux, "if", 4), "github.event_name == 'workflow_dispatch' && inputs.scope == 'full'");
+assert.equal(
+  yamlScalar(androidCompile, "if", 4),
+  "github.event_name == 'workflow_dispatch' && (inputs.scope == 'full' || inputs.scope == 'android')"
+);
+assert.equal(
+  yamlScalar(performanceBench, "if", 4),
+  "github.event_name == 'workflow_dispatch' && (inputs.scope == 'full' || inputs.scope == 'performance')"
 );
 assert.doesNotMatch(flatpakWorkflow, /\n  push:/, "the expensive Flatpak build still runs automatically on pushes");
 assert.match(flatpakMetadataWorkflow, /\n  pull_request:/, "lightweight Flatpak metadata validation is not on PRs");

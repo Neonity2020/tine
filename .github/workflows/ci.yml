@@ -5,7 +5,7 @@
 # Pull requests get one lightweight Linux validation job and docs-only PRs skip it.
 name: ci
 
-run-name: ci / ${{ github.event_name == 'workflow_dispatch' && inputs.scope || 'pull-request' }} / ${{ github.sha }}
+run-name: ci / ${{ github.event_name == 'workflow_dispatch' && (inputs.windows_test_name != '' && format('focused Windows / {0}', inputs.windows_test_name) || format('full suite / {0}', inputs.scope)) || 'pull-request / full suite' }} / ${{ github.sha }}
 
 on:
   pull_request:
@@ -28,6 +28,11 @@ on:
           - windows
           - android
           - performance
+      windows_test_name:
+        description: Full Rust harness name for one exact Windows tine-core test (windows scope only)
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
@@ -75,6 +80,16 @@ jobs:
 
       - name: Rust core tests
         run: cargo test -p tine-core
+
+  validate-windows-focused-test-input:
+    name: CI dispatch input validation / Windows focused test scope
+    if: github.event_name == 'workflow_dispatch' && inputs.windows_test_name != '' && inputs.scope != 'windows'
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Reject Windows focused test outside Windows scope
+        run: |
+          echo "::error::windows_test_name may only be used with scope=windows."
+          exit 1
 
   test:
     name: Full CI / Linux tests and release contracts
@@ -161,7 +176,7 @@ jobs:
   # implementation, while Android's libc declarations differ from desktop Linux.
   windows-compile:
     name: Full CI / Windows compile and core tests
-    if: github.event_name == 'workflow_dispatch' && (inputs.scope == 'full' || inputs.scope == 'windows')
+    if: github.event_name == 'workflow_dispatch' && (inputs.scope == 'windows' || (inputs.scope == 'full' && inputs.windows_test_name == ''))
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -175,8 +190,48 @@ jobs:
           workspaces: ". -> target"
       - run: npm ci
       - run: npm run build
-      - name: Windows core tests (including junction filesystem behavior)
+      - name: Windows core tests (full suite; release gate)
+        if: inputs.windows_test_name == ''
         run: cargo test -p tine-core
+      - name: Windows core test (focused exact serial) / ${{ inputs.windows_test_name }}
+        if: inputs.scope == 'windows' && inputs.windows_test_name != ''
+        shell: pwsh
+        env:
+          TINE_WINDOWS_RUST_TEST: ${{ inputs.windows_test_name }}
+        run: |
+          $testName = $env:TINE_WINDOWS_RUST_TEST.Trim()
+          if ([string]::IsNullOrWhiteSpace($testName)) {
+            Write-Error "windows_test_name must name one tine-core lib test."
+            exit 1
+          }
+          if ($testName -notmatch '^[A-Za-z0-9_]+(?:::[A-Za-z0-9_]+)*$') {
+            Write-Error "windows_test_name must use only Rust test path characters."
+            exit 1
+          }
+          $listedTests = & cargo test -p tine-core --lib -- --list
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+          $matchingTests = @($listedTests | Where-Object { $_ -ceq "${testName}: test" })
+          if ($matchingTests.Count -ne 1) {
+            Write-Error "Expected exactly one tine-core lib test named '$testName'; found $($matchingTests.Count)."
+            exit 1
+          }
+          $cargoArgs = @(
+            "test"
+            "-p"
+            "tine-core"
+            "--lib"
+            "--"
+            $testName
+            "--exact"
+            "--nocapture"
+            "--test-threads=1"
+          )
+          & cargo @cargoArgs
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
       - name: Windows Tauri shell compiles
         run: cargo check -p tine --features custom-protocol
 
