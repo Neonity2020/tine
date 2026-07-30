@@ -193,6 +193,10 @@ assert.ok(
   "focused run metadata does not expose the exact selected test name"
 );
 assert.ok(runName.includes("full suite / {0}"), "full dispatches are not labeled in run metadata");
+assert.ok(runName.includes("${{ github.sha }}"), "CI run metadata does not expose the exact dispatched SHA");
+const ciPermissions = yamlBlock(ciYaml, "permissions", 0);
+assert.equal(yamlScalar(ciPermissions, "contents", 2), "read");
+assert.doesNotMatch(ciPermissions.join("\n"), /write/, "CI must not request write permissions");
 
 const ciJobs = yamlBlock(ciYaml, "jobs", 0);
 const scopeValidation = yamlBlock(ciJobs, "validate-windows-focused-test-input", 2);
@@ -267,11 +271,115 @@ const tauriCompile = yamlNamedStep(windowsCompile, "Windows Tauri shell compiles
 assert.equal(yamlScalar(tauriCompile, "run", 8), "cargo check -p tine --features custom-protocol");
 const fullLinux = yamlBlock(ciJobs, "test", 2);
 const androidCompile = yamlBlock(ciJobs, "android-core-compile", 2);
+const androidTestApk = yamlBlock(ciJobs, "android-test-apk", 2);
 const performanceBench = yamlBlock(ciJobs, "bench", 2);
 assert.equal(yamlScalar(fullLinux, "if", 4), "github.event_name == 'workflow_dispatch' && inputs.scope == 'full'");
 assert.equal(
   yamlScalar(androidCompile, "if", 4),
   "github.event_name == 'workflow_dispatch' && (inputs.scope == 'full' || inputs.scope == 'android')"
+);
+assert.equal(yamlScalar(androidTestApk, "name", 4), "Android test APK / signed arm64 / ${{ github.sha }}");
+assert.equal(
+  yamlScalar(androidTestApk, "if", 4),
+  "github.event_name == 'workflow_dispatch' && inputs.scope == 'android'"
+);
+const runsAndroidTestApk = (event, scope) => event === "workflow_dispatch" && scope === "android";
+assert.equal(runsAndroidTestApk("workflow_dispatch", "android"), true);
+assert.equal(runsAndroidTestApk("pull_request", "android"), false);
+for (const scope of ["full", "windows", "performance"]) {
+  assert.equal(runsAndroidTestApk("workflow_dispatch", scope), false, `${scope} must not build a test APK`);
+}
+
+const androidTestJava = yamlNamedStep(androidTestApk, "Set up Java 17");
+assert.equal(yamlScalar(androidTestJava, "uses", 8), "actions/setup-java@v4");
+assert.equal(yamlScalar(yamlBlock(androidTestJava, "with", 8), "distribution", 10), "temurin");
+assert.equal(yamlScalar(yamlBlock(androidTestJava, "with", 8), "java-version", 10), '"17"');
+const androidTestNode = yamlNamedStep(androidTestApk, "Set up Node 20");
+assert.equal(yamlScalar(androidTestNode, "uses", 8), "actions/setup-node@v4");
+assert.equal(yamlScalar(yamlBlock(androidTestNode, "with", 8), "node-version", 10), "20");
+const androidTestRust = yamlNamedStep(androidTestApk, "Set up Rust 1.96.0");
+assert.equal(yamlScalar(androidTestRust, "uses", 8), "dtolnay/rust-toolchain@1.96.0");
+assert.equal(
+  yamlScalar(yamlBlock(androidTestRust, "with", 8), "targets", 10),
+  "aarch64-linux-android"
+);
+const androidTestSdk = yamlLiteral(yamlNamedStep(androidTestApk, "Install Android SDK packages"), "run");
+assert.match(androidTestSdk, /"platforms;android-36" "platforms;android-35"/);
+assert.match(androidTestSdk, /"build-tools;35\.0\.0" "ndk;26\.3\.11579264" "platform-tools"/);
+assert.match(
+  androidTestSdk,
+  /for v in NDK_HOME ANDROID_NDK_HOME ANDROID_NDK_ROOT ANDROID_NDK_LATEST_HOME; do[\s\S]*?echo "\$v=\$NDK" >> "\$GITHUB_ENV"/
+);
+assert.match(androidTestSdk, /! -name "26\.3\.11579264" -exec rm -rf \{\} \+/);
+assert.match(androidTestSdk, /rm -rf "\$ANDROID_SDK_ROOT\/ndk-bundle"/);
+assert.equal(yamlScalar(yamlNamedStep(androidTestApk, "Install JS deps"), "run", 8), "npm ci");
+
+const androidSigningCheck = yamlLiteral(yamlNamedStep(androidTestApk, "Require Android signing secrets"), "run");
+for (const secret of [
+  "ANDROID_KEYSTORE_BASE64",
+  "ANDROID_KEYSTORE_PASSWORD",
+  "ANDROID_KEY_ALIAS",
+  "ANDROID_KEY_PASSWORD",
+]) {
+  assert.match(androidSigningCheck, new RegExp(`\\b${secret}\\b`), `${secret} is not fail-closed`);
+}
+assert.match(androidSigningCheck, /exit "\$missing"/);
+const androidSigningConfig = yamlNamedStep(androidTestApk, "Write signing config from secrets");
+const androidSigningEnv = yamlBlock(androidSigningConfig, "env", 8);
+for (const secret of [
+  "ANDROID_KEYSTORE_BASE64",
+  "ANDROID_KEYSTORE_PASSWORD",
+  "ANDROID_KEY_ALIAS",
+  "ANDROID_KEY_PASSWORD",
+]) {
+  assert.match(
+    androidSigningEnv.join("\n"),
+    new RegExp(`secrets\\.${secret}`),
+    `${secret} is not passed only to the signing-config step`
+  );
+}
+const androidSigningScript = yamlLiteral(androidSigningConfig, "run");
+assert.match(androidSigningScript, /base64 -d > "\$RUNNER_TEMP\/tine-test-apk\.jks"/);
+assert.match(androidSigningScript, /src-tauri\/gen\/android\/keystore\.properties/);
+
+const androidVersion = yamlLiteral(yamlNamedStep(androidTestApk, "Set Android test version"), "run");
+assert.match(androidVersion, /short_sha="\$\{GITHUB_SHA:0:12\}"/);
+assert.match(androidVersion, /version_name="0\.7\.0-sync-\$short_sha"/);
+assert.match(androidVersion, /tauri\.android\.versionName=%s\\ntauri\.android\.versionCode=%s/);
+assert.match(androidVersion, /"\$version_name" "6999"/);
+const androidIdentifier = yamlLiteral(yamlNamedStep(androidTestApk, "Pin Android identifier to page.tine.app"), "run");
+assert.match(androidIdentifier, /c\.identifier='page\.tine\.app'/);
+const androidBuild = yamlLiteral(yamlNamedStep(androidTestApk, "Build signed Android test APK"), "run");
+assert.match(androidBuild, /RUSTFLAGS="--remap-path-prefix=\$GITHUB_WORKSPACE=\/build --remap-path-prefix=\$HOME\/\.cargo=\/cargo"/);
+assert.match(androidBuild, /npx tauri android build --target aarch64 --apk/);
+const androidLoaderCheck = yamlLiteral(
+  yamlNamedStep(androidTestApk, "Verify Android 9 native-loader compatibility"),
+  "run"
+);
+assert.match(androidLoaderCheck, /unzip -p "\$apk" lib\/arm64-v8a\/libtine_lib\.so/);
+assert.match(androidLoaderCheck, /renameat2/);
+
+const androidUploads = androidTestApk.filter((line) => line.trim() === "uses: actions/upload-artifact@v4");
+assert.equal(androidUploads.length, 1, "the test-APK job must upload only one artifact");
+const androidUpload = yamlNamedStep(androidTestApk, "Upload signed Android test APK");
+assert.equal(yamlScalar(yamlBlock(androidUpload, "with", 8), "name", 10), "tine-android-test-apk-${{ github.sha }}");
+assert.equal(
+  yamlScalar(yamlBlock(androidUpload, "with", 8), "path", 10),
+  "Tine_${{ steps.android-version.outputs.version_name }}_android-arm64.apk"
+);
+assert.equal(yamlScalar(yamlBlock(androidUpload, "with", 8), "if-no-files-found", 10), "error");
+assert.equal(yamlScalar(yamlBlock(androidUpload, "with", 8), "retention-days", 10), "3");
+const androidCleanup = yamlNamedStep(androidTestApk, "Remove Android test signing material");
+assert.equal(yamlScalar(androidCleanup, "if", 8), "always()");
+const androidCleanupScript = yamlLiteral(androidCleanup, "run");
+assert.match(androidCleanupScript, /tine-test-apk\.jks/);
+assert.match(androidCleanupScript, /libtine_lib\.so/);
+assert.match(androidCleanupScript, /src-tauri\/gen\/android\/keystore\.properties/);
+assert.match(androidCleanupScript, /src-tauri\/gen\/android\/app\/tauri\.properties/);
+assert.doesNotMatch(
+  androidTestApk.join("\n"),
+  /contents:\s*write|actions\/create-release|action-gh-release|gh release|git tag|git push|publish|deploy/i,
+  "the test-APK lane must stay read-only and never release, tag, publish, or deploy"
 );
 assert.equal(
   yamlScalar(performanceBench, "if", 4),
