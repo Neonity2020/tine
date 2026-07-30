@@ -4654,6 +4654,16 @@ enum ApplicationExactLoad {
     Ambiguous,
 }
 
+enum ApplicationSaveReloadTarget {
+    ExistingPath(String),
+    CreatedPage,
+}
+
+enum ApplicationPublicationSettlement {
+    Durable,
+    Deferred(SyncEditorDeferred),
+}
+
 enum EditorNameState {
     Missing {
         name: LogicalPageName,
@@ -5659,7 +5669,7 @@ impl RuntimeActor {
         if let EditorTurnReadiness::Deferred(state) = self.prepare_editor_turn() {
             return Ok(SyncApplicationPageSaveOutcome::Deferred { state });
         }
-        let editor_request = match &request.target {
+        let (editor_request, reload_target) = match &request.target {
             SyncApplicationPageSaveTarget::Existing { path, revision } => {
                 let current = match self.load_application_exact_ready(path)? {
                     ApplicationExactLoad::Loaded(current) => current,
@@ -5689,14 +5699,17 @@ impl RuntimeActor {
                     Ok(blocks) => blocks,
                     Err(reason) => return Ok(SyncApplicationPageSaveOutcome::Conflict { reason }),
                 };
-                SyncEditorSaveRequest {
-                    target: SyncEditorSaveTarget::Existing {
-                        page_id: current.editor.page.page_id.to_string(),
-                        revision: revision.clone(),
+                (
+                    SyncEditorSaveRequest {
+                        target: SyncEditorSaveTarget::Existing {
+                            page_id: current.editor.page.page_id.to_string(),
+                            revision: revision.clone(),
+                        },
+                        preamble: request.page.pre_block.clone(),
+                        blocks,
                     },
-                    preamble: request.page.pre_block.clone(),
-                    blocks,
-                }
+                    ApplicationSaveReloadTarget::ExistingPath(path.clone()),
+                )
             }
             SyncApplicationPageSaveTarget::New { name, page_kind } => {
                 validate_new_application_page_shape(&request.page, name, *page_kind, &self.graph)?;
@@ -5725,15 +5738,18 @@ impl RuntimeActor {
                             })
                         }
                     };
-                SyncEditorSaveRequest {
-                    target: SyncEditorSaveTarget::New {
-                        name: name.clone(),
-                        page_kind: *page_kind,
-                        revision: current_revision,
+                (
+                    SyncEditorSaveRequest {
+                        target: SyncEditorSaveTarget::New {
+                            name: name.clone(),
+                            page_kind: *page_kind,
+                            revision: current_revision,
+                        },
+                        preamble: request.page.pre_block.clone(),
+                        blocks: application_editor_blocks_new(&request.page)?,
                     },
-                    preamble: request.page.pre_block.clone(),
-                    blocks: application_editor_blocks_new(&request.page)?,
-                }
+                    ApplicationSaveReloadTarget::CreatedPage,
+                )
             }
         };
         validate_editor_save_request(&editor_request).map_err(map_editor_application_error)?;
@@ -5761,9 +5777,99 @@ impl RuntimeActor {
                     reason: map_application_conflict(reason),
                 })
             }
+            SyncEditorSaveOutcome::Deferred {
+                state: SyncEditorDeferred::RetryableRetainedPublication { batch_id, phase },
+                affected_page_ids,
+            } => match self.settle_application_publication(&batch_id, phase)? {
+                ApplicationPublicationSettlement::Durable => {
+                    let accepted = match reload_target {
+                        ApplicationSaveReloadTarget::ExistingPath(path) => {
+                            self.reload_application_page(&path)?
+                        }
+                        ApplicationSaveReloadTarget::CreatedPage => {
+                            let [page_id] = affected_page_ids.as_slice() else {
+                                return Err(SyncApplicationPageRequestError::ActorRefused);
+                            };
+                            self.load_application_page_id_ready(
+                                parse_editor_page_id(page_id)
+                                    .map_err(map_editor_application_error)?,
+                            )?
+                        }
+                    };
+                    Ok(SyncApplicationPageSaveOutcome::Saved {
+                        batch_id,
+                        page: accepted.page,
+                        revision: accepted.revision,
+                    })
+                }
+                ApplicationPublicationSettlement::Deferred(state) => {
+                    Ok(SyncApplicationPageSaveOutcome::Deferred { state })
+                }
+            },
             SyncEditorSaveOutcome::Deferred { state, .. } => {
                 Ok(SyncApplicationPageSaveOutcome::Deferred { state })
             }
+        }
+    }
+
+    fn settle_application_publication(
+        &mut self,
+        expected_batch_id: &str,
+        mut phase: SyncLocalMutationPhase,
+    ) -> Result<ApplicationPublicationSettlement, SyncApplicationPageRequestError> {
+        self.require_pending_application_publication(expected_batch_id)?;
+        for _ in 0..MAX_EDITOR_SETTLE_TURNS {
+            let outcome = self
+                .advance_local_mutation_once()
+                .ok_or(SyncApplicationPageRequestError::ActorRefused)?;
+            match outcome {
+                SyncLocalMutationOutcome::Durable { batch_id } => {
+                    if batch_id.to_string() != expected_batch_id {
+                        return Err(SyncApplicationPageRequestError::ActorRefused);
+                    }
+                    return Ok(ApplicationPublicationSettlement::Durable);
+                }
+                SyncLocalMutationOutcome::RetryableRetainedRecovery {
+                    batch_id: Some(batch_id),
+                    phase: next_phase,
+                } => {
+                    if batch_id.to_string() != expected_batch_id {
+                        return Err(SyncApplicationPageRequestError::ActorRefused);
+                    }
+                    self.require_pending_application_publication(expected_batch_id)?;
+                    phase = next_phase;
+                }
+                outcome @ (SyncLocalMutationOutcome::Blocked { .. }
+                | SyncLocalMutationOutcome::Revoked { .. }) => {
+                    return Ok(ApplicationPublicationSettlement::Deferred(
+                        editor_deferred_from_local(outcome),
+                    ));
+                }
+                SyncLocalMutationOutcome::RetryableRetainedRecovery { batch_id: None, .. } => {
+                    return Err(SyncApplicationPageRequestError::ActorRefused)
+                }
+            }
+        }
+        self.require_pending_application_publication(expected_batch_id)?;
+        Ok(ApplicationPublicationSettlement::Deferred(
+            SyncEditorDeferred::RetryableRetainedPublication {
+                batch_id: expected_batch_id.to_owned(),
+                phase,
+            },
+        ))
+    }
+
+    fn require_pending_application_publication(
+        &self,
+        expected_batch_id: &str,
+    ) -> Result<(), SyncApplicationPageRequestError> {
+        match &self.local_mutation {
+            Some(PendingLocalMutation::Published(continuation))
+                if continuation.batch_id().to_string() == expected_batch_id =>
+            {
+                Ok(())
+            }
+            _ => Err(SyncApplicationPageRequestError::ActorRefused),
         }
     }
 
@@ -12513,6 +12619,184 @@ mod tests {
         assert_eq!(fixture.applied_batch_count(), applied_before);
         assert_eq!(snapshot_graph_files(fixture.graph_root()), files_before);
         assert_eq!(handle.status().unwrap(), status_before);
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
+    fn application_gateway_settles_current_retained_publication_before_returning_saved() {
+        let fixture = RuntimeHostFixture::safe("sync-runtime-application-save-settlement");
+        let handle = active_handle(SyncRuntimeHandle::open(fixture.request()));
+        drive_initial_feed(&handle);
+        let existing_path = "content/nested pages/Application Settlement.md";
+        admit_external_page(
+            &handle,
+            &fixture,
+            existing_path,
+            b"- before application save\n",
+        );
+
+        let (mut existing, existing_revision) = load_application_exact(&handle, existing_path);
+        existing.blocks[0].raw = "accepted existing application save".into();
+        let existing = match handle
+            .save_application_page(SyncApplicationPageSaveRequest {
+                target: SyncApplicationPageSaveTarget::Existing {
+                    path: existing_path.into(),
+                    revision: existing_revision,
+                },
+                page: existing,
+            })
+            .unwrap()
+        {
+            SyncApplicationPageSaveOutcome::Saved { page, revision, .. } => (page, revision),
+            other => panic!("existing application save was not durable: {other:?}"),
+        };
+        assert_eq!(
+            fs::read(fixture.graph_root().join(existing_path)).unwrap(),
+            b"- accepted existing application save\n"
+        );
+        let existing_reload = load_application_exact(&handle, existing_path);
+        assert_parser_dto_semantics(&existing.0, &existing_reload.0);
+        assert_eq!(existing.1, existing_reload.1);
+
+        let manifests_before_new = fixture.manifest_count();
+        handle
+            .install_repeated_operational_fault(OperationalFaultPoint::AfterManifest, 1)
+            .unwrap();
+        let requested = new_application_page(
+            "Created Through Application Ω",
+            SyncPageKind::Page,
+            Some("icon:: 🌱"),
+            vec![BlockDto {
+                id: "temporary-created-root".into(),
+                raw: "durably created λ".into(),
+                ..BlockDto::default()
+            }],
+        );
+        let created = match handle
+            .save_application_page(SyncApplicationPageSaveRequest {
+                target: SyncApplicationPageSaveTarget::New {
+                    name: requested.name.clone(),
+                    page_kind: SyncPageKind::Page,
+                },
+                page: requested,
+            })
+            .unwrap()
+        {
+            SyncApplicationPageSaveOutcome::Saved { page, revision, .. } => (page, revision),
+            other => panic!("new application save was not durable: {other:?}"),
+        };
+
+        assert_eq!(fixture.manifest_count(), manifests_before_new + 1);
+        assert_eq!(
+            fs::read(fixture.graph_root().join(&created.0.path)).unwrap(),
+            "icon:: 🌱\n\n- durably created λ\n".as_bytes()
+        );
+        let created_reload = load_application_exact(&handle, &created.0.path);
+        assert_parser_dto_semantics(&created.0, &created_reload.0);
+        assert_eq!(created.1, created_reload.1);
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
+    fn application_gateway_does_not_admit_request_behind_prior_retained_publication() {
+        let fixture = RuntimeHostFixture::safe("sync-runtime-application-prior-publication");
+        let handle = active_handle(SyncRuntimeHandle::open(fixture.request()));
+        drive_initial_feed(&handle);
+        let prior_path = "content/nested pages/Prior Editor Publication.md";
+        admit_external_page(
+            &handle,
+            &fixture,
+            prior_path,
+            b"- before prior publication\n",
+        );
+        let prior = load_editor_named(&handle, "Prior Editor Publication", SyncPageKind::Page);
+        let mut prior_blocks = prior.blocks.clone();
+        prior_blocks[0].content = "settled prior publication".into();
+        handle
+            .install_repeated_operational_fault(OperationalFaultPoint::AfterStage, 2)
+            .unwrap();
+        let prior_batch = match handle
+            .save_editor_page(SyncEditorSaveRequest {
+                target: SyncEditorSaveTarget::Existing {
+                    page_id: prior.page_id,
+                    revision: prior.revision,
+                },
+                preamble: prior.preamble,
+                blocks: prior_blocks,
+            })
+            .unwrap()
+        {
+            SyncEditorSaveOutcome::Deferred {
+                state: SyncEditorDeferred::RetryableRetainedPublication { batch_id, .. },
+                ..
+            } => batch_id,
+            other => panic!("low-level editor save did not retain publication: {other:?}"),
+        };
+
+        let manifests_after_prior = fixture.manifest_count();
+        let requested = new_application_page(
+            "Request Behind Prior Publication",
+            SyncPageKind::Page,
+            None,
+            vec![BlockDto {
+                id: "temporary-behind-prior".into(),
+                raw: "admit exactly once".into(),
+                ..BlockDto::default()
+            }],
+        );
+        assert!(matches!(
+            handle
+                .save_application_page(SyncApplicationPageSaveRequest {
+                    target: SyncApplicationPageSaveTarget::New {
+                        name: requested.name.clone(),
+                        page_kind: SyncPageKind::Page,
+                    },
+                    page: requested.clone(),
+                })
+                .unwrap(),
+            SyncApplicationPageSaveOutcome::Deferred {
+                state: SyncEditorDeferred::RetryableRetainedPublication { batch_id, .. },
+            } if batch_id == prior_batch
+        ));
+        assert_eq!(fixture.manifest_count(), manifests_after_prior);
+        let requested_path = Graph::open(fixture.graph_root())
+            .new_sparse_page_path(&requested.name, PageKind::Page)
+            .unwrap();
+        assert!(!fixture.graph_root().join(requested_path.as_str()).exists());
+
+        settle_local_mutation(&handle);
+        assert_eq!(
+            fs::read(fixture.graph_root().join(prior_path)).unwrap(),
+            b"- settled prior publication\n"
+        );
+        let created = match handle
+            .save_application_page(SyncApplicationPageSaveRequest {
+                target: SyncApplicationPageSaveTarget::New {
+                    name: requested.name.clone(),
+                    page_kind: SyncPageKind::Page,
+                },
+                page: requested,
+            })
+            .unwrap()
+        {
+            SyncApplicationPageSaveOutcome::Saved { page, revision, .. } => (page, revision),
+            other => panic!("application request was not admitted after prior work: {other:?}"),
+        };
+        assert_eq!(fixture.manifest_count(), manifests_after_prior + 1);
+        assert_eq!(
+            fs::read(fixture.graph_root().join(&created.0.path)).unwrap(),
+            b"- admit exactly once\n"
+        );
+        assert_eq!(
+            load_application_exact(&handle, &created.0.path).1,
+            created.1
+        );
         assert!(matches!(
             handle.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(_)
