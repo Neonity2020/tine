@@ -60,6 +60,21 @@ use crate::oplog::{
     ShardedHotEngine, WorkspaceId,
 };
 
+#[test]
+fn activation_uses_the_enrollment_transitions_post_commit_reopen_without_repeating_it() {
+    let source = include_str!("../local_active.rs");
+    let start = source.find("fn activate_with_optional_cut(").unwrap();
+    let end = source[start..]
+        .find("/// The sole fresh-process")
+        .map(|offset| start + offset)
+        .unwrap();
+    let activation = &source[start..end];
+    assert!(
+        !activation.contains("reopen_local_active_record("),
+        "activate_verified_local_record already returns a fresh post-commit reopen; repeating it is graph-sized duplicate construction"
+    );
+}
+
 struct TestRoot(PathBuf);
 
 impl TestRoot {
@@ -1660,6 +1675,7 @@ fn full_scan_dispatch_with_wrong_authority_never_mutates_the_baseline() {
             engine: &mut engine,
             database: &mut database,
             tail: &mut tail,
+            bootstrap: None,
             baseline: &mut baseline,
             observed_at: BaselineTimestamp::from_millis(1).unwrap(),
         }),
@@ -1698,6 +1714,7 @@ fn full_scan_dispatch_with_wrong_authority_never_mutates_the_baseline() {
             engine: &mut engine,
             database: &mut database,
             tail: &mut tail,
+            bootstrap: None,
             baseline: &mut baseline,
             observed_at: BaselineTimestamp::from_millis(2).unwrap(),
         })
@@ -1995,6 +2012,8 @@ impl PromotedPaths {
             archive_root: &fixture.archive_root,
             database_path: &self.database_path,
             application_runtime_root: &self.runtime_root,
+            graph_root: &fixture.graph_root,
+            migration_backup_root: fixture.roots.canonical_root(),
         }
     }
 }
@@ -3738,6 +3757,7 @@ const HELPER_WORLD: &str = "TINE_LOCAL_ACTIVE_HELPER_WORLD";
 #[derive(serde::Serialize, serde::Deserialize)]
 struct HelperWorld {
     graph_root: PathBuf,
+    migration_backup_root: PathBuf,
     receipt_root: PathBuf,
     archive_root: PathBuf,
     enrollment_root: PathBuf,
@@ -3757,6 +3777,7 @@ impl HelperWorld {
     ) -> Self {
         Self {
             graph_root: fixture.graph_root.clone(),
+            migration_backup_root: fixture.roots.canonical_root().to_path_buf(),
             receipt_root: fixture.root.path().join("receipts"),
             archive_root: fixture.archive_root.clone(),
             enrollment_root: root.path().to_path_buf(),
@@ -3777,6 +3798,7 @@ impl HelperWorld {
         };
         HelperOpen {
             graph: Graph::open(&self.graph_root),
+            graph_root: self.graph_root.clone(),
             receipts: ProjectionReceiptStore::open_for_endpoint(
                 &self.receipt_root,
                 self.workspace,
@@ -3784,6 +3806,7 @@ impl HelperWorld {
             )
             .unwrap(),
             archive_root: self.archive_root.clone(),
+            migration_backup_root: self.migration_backup_root.clone(),
             database_path: self.database_path.clone(),
             runtime_root: ApplicationRuntimeRoot::open_for_test(&self.runtime_root).unwrap(),
             enrollment_root: enrollment_application_root_for_test(&self.enrollment_root).unwrap(),
@@ -3793,8 +3816,10 @@ impl HelperWorld {
 
 struct HelperOpen {
     graph: Graph,
+    graph_root: PathBuf,
     receipts: ProjectionReceiptStore,
     archive_root: PathBuf,
+    migration_backup_root: PathBuf,
     database_path: PathBuf,
     runtime_root: ApplicationRuntimeRoot,
     enrollment_root: EnrollmentApplicationRoot,
@@ -3808,6 +3833,8 @@ impl HelperOpen {
             archive_root: &self.archive_root,
             database_path: &self.database_path,
             application_runtime_root: &self.runtime_root,
+            graph_root: &self.graph_root,
+            migration_backup_root: &self.migration_backup_root,
         }
     }
 }
@@ -4533,6 +4560,8 @@ fn a_takeover_refuses_wrong_workspace_archive_anchor_history_and_sqlite_evidence
         archive_root: &copied_root,
         database_path: &copied_paths.database_path,
         application_runtime_root: &copied_paths.runtime_root,
+        graph_root: &fixture.graph_root,
+        migration_backup_root: fixture.roots.canonical_root(),
     };
     let before = authoritative_world(&fixture, &root);
     takeover_error(

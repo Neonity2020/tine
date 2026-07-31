@@ -30,6 +30,7 @@ use super::{
         ReconciliationScheduler, ReconciliationSchedulerLimits, ReconciliationSchedulerStatus,
         ReconciliationTrigger, ReconciliationWork,
     },
+    shadow_projection::BootstrapProjectionAuthority,
     BatchId, ContentDigest, ManagedPath, ProjectionReceiptStore, ShardedHotEngine, SqliteFrontier,
     TailOverlay,
 };
@@ -53,6 +54,7 @@ pub(crate) struct ReconciliationSessionDependencies<'a> {
     pub(crate) engine: &'a mut ShardedHotEngine,
     pub(crate) database: &'a mut SqliteFrontier,
     pub(crate) tail: &'a mut TailOverlay,
+    pub(crate) bootstrap: Option<&'a BootstrapProjectionAuthority>,
     pub(crate) baseline: &'a mut ReconciliationBaseline,
     pub(crate) observed_at: BaselineTimestamp,
 }
@@ -691,15 +693,17 @@ impl LiveReconciliationSessionDispatch<'_> {
             engine,
             database,
             tail,
+            bootstrap,
             ..
         } = &mut self.dependencies;
-        match OperationalCoordinator::execute(
+        match OperationalCoordinator::execute_with_bootstrap(
             admission,
             graph,
             receipts,
             engine,
             database,
             tail,
+            *bootstrap,
             &requested_paths,
         ) {
             Ok(OperationalCoordinatorState::Noop) => ReconciliationSessionDispatchOutcome::Noop,
@@ -764,6 +768,7 @@ impl LiveReconciliationSessionDispatch<'_> {
                 graph,
                 engine,
                 baseline,
+                bootstrap,
                 observed_at,
                 ..
             } = &mut self.dependencies;
@@ -783,7 +788,14 @@ impl LiveReconciliationSessionDispatch<'_> {
                     };
                 }
             };
-            let source = JoinedAuthenticatedExpectedPathSource::new(engine, projection);
+            let source = bootstrap.map_or_else(
+                || JoinedAuthenticatedExpectedPathSource::new(engine, projection),
+                |bootstrap| {
+                    JoinedAuthenticatedExpectedPathSource::with_bootstrap(
+                        engine, projection, bootstrap,
+                    )
+                },
+            );
             #[cfg(test)]
             let result = if let Some(hook) = self.before_second_scan_pass.as_mut() {
                 super::reconciliation_scan::scan_graph_text_with_hook(
@@ -850,10 +862,11 @@ impl LiveReconciliationSessionDispatch<'_> {
             engine,
             database,
             tail,
+            bootstrap,
             ..
         } = &mut self.dependencies;
         let outcome = match execute_stable_scan_import(
-            scan, admission, graph, receipts, engine, database, tail,
+            scan, admission, graph, receipts, engine, database, tail, *bootstrap,
         ) {
             ReconciliationImportOutcome::Noop => ReconciliationSessionDispatchOutcome::Noop,
             ReconciliationImportOutcome::Complete(completion) => {
@@ -992,6 +1005,7 @@ impl ReconciliationSessionDispatch for LiveReconciliationSessionDispatch<'_> {
         let ReconciliationSessionDependencies {
             engine,
             baseline,
+            bootstrap,
             observed_at,
             ..
         } = &mut self.dependencies;
@@ -999,7 +1013,12 @@ impl ReconciliationSessionDispatch for LiveReconciliationSessionDispatch<'_> {
             Ok(projection) => projection,
             Err(_) => return ReconciliationSessionBaselineFinish::Unavailable,
         };
-        let source = JoinedAuthenticatedExpectedPathSource::new(engine, projection);
+        let source = bootstrap.map_or_else(
+            || JoinedAuthenticatedExpectedPathSource::new(engine, projection),
+            |bootstrap| {
+                JoinedAuthenticatedExpectedPathSource::with_bootstrap(engine, projection, bootstrap)
+            },
+        );
         match finish_stable_scan_baseline(baseline, &source, pending, terminal, *observed_at) {
             Ok(BaselineAdapterStatus::Clean { .. }) => ReconciliationSessionBaselineFinish::Clean,
             Ok(BaselineAdapterStatus::NeedPostDrainFullScan { .. }) => {
@@ -1185,6 +1204,7 @@ mod tests {
                 engine: &mut self.engine,
                 database: &mut self.database,
                 tail: &mut self.tail,
+                bootstrap: None,
                 baseline: &mut self.baseline,
                 observed_at: BaselineTimestamp::from_millis(self.next_timestamp).unwrap(),
             }
@@ -1241,6 +1261,7 @@ mod tests {
                 engine: &mut unenrolled,
                 database: &mut fixture.database,
                 tail: &mut fixture.tail,
+                bootstrap: None,
                 baseline: &mut fixture.baseline,
                 observed_at: BaselineTimestamp::from_millis(1).unwrap(),
             }),
@@ -1261,6 +1282,7 @@ mod tests {
                 engine: &mut unenrolled,
                 database: &mut fixture.database,
                 tail: &mut fixture.tail,
+                bootstrap: None,
                 baseline: &mut fixture.baseline,
                 observed_at: BaselineTimestamp::from_millis(2).unwrap(),
             }),

@@ -9,6 +9,7 @@ use std::sync::Arc;
 use tauri::{Emitter, Manager, State};
 use tine_core::crdt::ManagedSyncStoreState;
 use tine_core::model::{Graph, GraphMeta};
+use tine_core::sync_runtime::inspect_shared_enrollment_for_cold_discovery;
 
 pub(crate) fn ensure_managed_sync_safety_snapshot(
     app: &tauri::AppHandle,
@@ -155,16 +156,62 @@ struct LoadedGraph {
 }
 
 fn refuse_unclaimed_sparse_archive(root: &Path) -> Result<(), String> {
+    refuse_unclaimed_sparse_archive_with(root, |shared| {
+        inspect_shared_enrollment_for_cold_discovery(shared).map(|descriptor| descriptor.is_some())
+    })
+}
+
+fn refuse_unclaimed_sparse_archive_with(
+    root: &Path,
+    inspect_shared: impl FnOnce(&Path) -> Result<bool, String>,
+) -> Result<(), String> {
+    const REFUSAL: &str = "Tine-managed storage data exists without its required local recovery information, so this graph could not be opened safely.";
     let archive = root.join(".tine-sync/v2");
-    match std::fs::symlink_metadata(&archive) {
-        Ok(_) => Err(
-            "Tine-managed storage data exists without its required local recovery information, so this graph could not be opened safely."
-                .into(),
-        ),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(format!(
-            "Couldn't verify Tine-managed storage data before opening this graph: {error}"
-        )),
+    let metadata = match std::fs::symlink_metadata(&archive) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "Couldn't verify Tine-managed storage data before opening this graph: {error}"
+            ));
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(REFUSAL.into());
+    }
+    let mut entries = std::fs::read_dir(&archive).map_err(|error| {
+        format!("Couldn't verify Tine-managed storage data before opening this graph: {error}")
+    })?;
+    let Some(shared) = entries.next().transpose().map_err(|error| {
+        format!("Couldn't verify Tine-managed storage data before opening this graph: {error}")
+    })?
+    else {
+        return Err(REFUSAL.into());
+    };
+    if shared.file_name() != "shared"
+        || !shared
+            .file_type()
+            .map_err(|error| {
+                format!(
+                    "Couldn't verify Tine-managed storage data before opening this graph: {error}"
+                )
+            })?
+            .is_dir()
+        || entries
+            .next()
+            .transpose()
+            .map_err(|error| {
+                format!(
+                    "Couldn't verify Tine-managed storage data before opening this graph: {error}"
+                )
+            })?
+            .is_some()
+    {
+        return Err(REFUSAL.into());
+    }
+    match inspect_shared(&shared.path()) {
+        Ok(true) => Ok(()),
+        Ok(false) | Err(_) => Err(REFUSAL.into()),
     }
 }
 
@@ -648,6 +695,51 @@ mod tests {
             refuse_unclaimed_sparse_archive(&dir).unwrap_err(),
             "Tine-managed storage data exists without its required local recovery information, so this graph could not be opened safely."
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cold_shared_discovery_requires_the_sole_real_v2_shared_namespace() {
+        const REFUSAL: &str = "Tine-managed storage data exists without its required local recovery information, so this graph could not be opened safely.";
+        let dir = scratch("cold-shared-layout");
+        let v2 = dir.join(".tine-sync/v2");
+        let shared = v2.join("shared");
+        std::fs::create_dir_all(&shared).unwrap();
+        assert_eq!(
+            refuse_unclaimed_sparse_archive_with(&dir, |path| {
+                assert_eq!(path, shared);
+                Ok(true)
+            }),
+            Ok(())
+        );
+
+        std::fs::write(v2.join("unknown"), b"retain").unwrap();
+        assert_eq!(
+            refuse_unclaimed_sparse_archive_with(&dir, |_| Ok(true)).unwrap_err(),
+            REFUSAL
+        );
+        std::fs::remove_file(v2.join("unknown")).unwrap();
+        assert_eq!(
+            refuse_unclaimed_sparse_archive_with(&dir, |_| Ok(false)).unwrap_err(),
+            REFUSAL
+        );
+        assert_eq!(
+            refuse_unclaimed_sparse_archive_with(&dir, |_| Err("malformed".into())).unwrap_err(),
+            REFUSAL
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            std::fs::remove_dir_all(&shared).unwrap();
+            let target = dir.join("provider-target");
+            std::fs::create_dir_all(&target).unwrap();
+            symlink(&target, &shared).unwrap();
+            assert_eq!(
+                refuse_unclaimed_sparse_archive_with(&dir, |_| Ok(true)).unwrap_err(),
+                REFUSAL
+            );
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 

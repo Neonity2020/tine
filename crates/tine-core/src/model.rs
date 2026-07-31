@@ -14766,29 +14766,6 @@ impl Graph {
         })
     }
 
-    /// Confirm an already-visible bootstrap projection without rewriting it.
-    ///
-    /// This is enrollment-only evidence: the durable mutation reservation is
-    /// still consumed exactly once, while the retained graph capability
-    /// freshly syncs and rereads the exact target before minting the ordinary
-    /// completion proof used by the receipt store.
-    pub(crate) fn confirm_existing_page_projection(
-        &self,
-        relative_path: &str,
-        expected_target: &[u8],
-        authority: &mut ProjectionMutationAuthority,
-    ) -> io::Result<ProjectionWriteProof> {
-        let write = self.admit_retained_managed_text_writer()?;
-        authority.consume_write_evidence(relative_path, |reservation, _, _| {
-            self.confirm_existing_page_projection_with_attempts(
-                &write,
-                relative_path,
-                expected_target,
-                reservation,
-            )
-        })
-    }
-
     fn confirm_existing_page_projection_with_attempts(
         &self,
         write: &ManagedTextWritePermit,

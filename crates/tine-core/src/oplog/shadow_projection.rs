@@ -5,10 +5,10 @@
 //! and publishes only below a retained device-local root that is physically
 //! and structurally disjoint from the live graph.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt as _;
 #[cfg(windows)]
@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 
 use cap_std::ambient_authority;
 use cap_std::fs::Dir;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::bootstrap_import::{BOOTSTRAP_FRONTIER_SCHEMA_VERSION, BOOTSTRAP_IMPORT_SCHEMA_VERSION};
@@ -31,11 +32,12 @@ use super::import::{
 use super::migration_backup::{
     verify_migration_source_backup, MigrationBackupError, MigrationBackupRoot, VerifiedSourceBackup,
 };
-use super::object_store::{open_dir_nofollow, sync_dir_required};
+use super::object_store::{open_dir_nofollow, open_file_nofollow, sync_dir_required};
 use super::sqlite::{OpenProjection, VerifiedBootstrapSqliteProjection};
 use super::{
-    plan_projection, BlobDescription, CanonicalGraphResourceId, ContentDigest, ManagedPath,
-    ManagedTextKind, PageId, ProjectionIntent, ProjectionPrecondition, WorkspaceId,
+    plan_projection, BlobDescription, CanonicalGraphResourceId, ContentDigest, DeviceId,
+    LineageDigest, ManagedPath, ManagedTextKind, PageId, ProjectionEndpointId, ProjectionIntent,
+    ProjectionPrecondition, ProjectionReceiptStoreId, WorkspaceId,
     CATALOG_PAGE_STATE_SCHEMA_VERSION, DIFF_SCHEMA_VERSION, MANAGED_ENTITY_SET_VERSION,
     MANIFEST_ENCODING_VERSION, OBJECT_ENVELOPE_SCHEMA_VERSION, OPERATION_SCHEMA_VERSION,
     OPLOG_PROTOCOL_VERSION, PROJECTION_POLICY_VERSION, PROJECTION_SCHEMA_VERSION,
@@ -68,6 +70,58 @@ const CATALOG_PAGE_ROWS: usize = 128;
 const MAX_MANIFEST_ENTRY_BYTES: usize = BOOTSTRAP_SOURCE_MAX_FILE_BYTES as usize * 3;
 const MAX_MANIFEST_BYTES: u64 = BOOTSTRAP_SOURCE_MAX_TOTAL_BYTES * 4;
 const MAX_SMALL_EVIDENCE_BYTES: u64 = 1024 * 1024;
+const PROMOTED_BOOTSTRAP_PROJECTION_BINDING_SCHEMA_VERSION: u32 = 1;
+pub(crate) const MAX_BOOTSTRAP_PROJECTION_LOCATOR_RETAINED_BYTES: u64 = 256 * 1024 * 1024;
+
+#[cfg(test)]
+fn complete_shadow_verification_calls() -> &'static std::sync::Mutex<HashMap<WorkspaceId, u64>> {
+    static CALLS: std::sync::OnceLock<std::sync::Mutex<HashMap<WorkspaceId, u64>>> =
+        std::sync::OnceLock::new();
+    CALLS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn reset_complete_shadow_verification_calls_for_test(workspace: WorkspaceId) {
+    complete_shadow_verification_calls()
+        .lock()
+        .unwrap()
+        .insert(workspace, 0);
+}
+
+#[cfg(test)]
+pub(crate) fn complete_shadow_verification_calls_for_test(workspace: WorkspaceId) -> u64 {
+    complete_shadow_verification_calls()
+        .lock()
+        .unwrap()
+        .get(&workspace)
+        .copied()
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+fn aggregate_reopen_calls() -> &'static std::sync::Mutex<HashMap<WorkspaceId, u64>> {
+    static CALLS: std::sync::OnceLock<std::sync::Mutex<HashMap<WorkspaceId, u64>>> =
+        std::sync::OnceLock::new();
+    CALLS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn reset_aggregate_reopen_calls_for_test(workspace: WorkspaceId) {
+    aggregate_reopen_calls()
+        .lock()
+        .unwrap()
+        .insert(workspace, 0);
+}
+
+#[cfg(test)]
+pub(crate) fn aggregate_reopen_calls_for_test(workspace: WorkspaceId) -> u64 {
+    aggregate_reopen_calls()
+        .lock()
+        .unwrap()
+        .get(&workspace)
+        .copied()
+        .unwrap_or(0)
+}
 
 #[cfg(test)]
 thread_local! {
@@ -298,6 +352,277 @@ pub(crate) struct ShadowProjectionInstrumentation {
     pub(crate) tree_entries_visited: u64,
 }
 
+/// Constant-size durable binding for the immutable shadow publication retained
+/// after bootstrap promotion.  It is inert serialized evidence; only
+/// [`BootstrapProjectionAuthority::reopen`] turns it into a read-only
+/// capability after authenticating the exact retained publication.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PromotedBootstrapProjectionBindingV1 {
+    schema_version: u32,
+    binding_digest: ContentDigest,
+    workspace_id: WorkspaceId,
+    lineage_digest: LineageDigest,
+    endpoint_id: ProjectionEndpointId,
+    device_id: DeviceId,
+    graph_resource_id: CanonicalGraphResourceId,
+    receipt_store_id: ProjectionReceiptStoreId,
+    archive_control_binding: ContentDigest,
+    backup_root_identity: ContentDigest,
+    publication_id: ContentDigest,
+    bootstrap_publication_id: ContentDigest,
+    bootstrap_aggregate_digest: ContentDigest,
+    bootstrap_import_id: ContentDigest,
+    bootstrap_part_count: u32,
+    accepted_frontier_state_digest: ContentDigest,
+    history_generation: u64,
+    history_root: ContentDigest,
+    catalog_root: ContentDigest,
+    catalog_rows: u64,
+    manifest_header: BlobDescription,
+    manifest: BlobDescription,
+    proof: BlobDescription,
+    commit_marker: BlobDescription,
+    shadow_evidence_digest: ContentDigest,
+    staged_inventory_digest: ContentDigest,
+    staged_file_count: u64,
+    staged_total_bytes: u64,
+}
+
+impl PromotedBootstrapProjectionBindingV1 {
+    pub(crate) fn from_verified(
+        verified: &VerifiedShadowProjection,
+    ) -> Result<Self, ShadowProjectionError> {
+        let authority = verified.authority_binding();
+        let storage = authority.storage_binding();
+        let bootstrap = authority.bootstrap_binding();
+        let header = manifest_header_from_verified(verified)?;
+        let mut binding = Self {
+            schema_version: PROMOTED_BOOTSTRAP_PROJECTION_BINDING_SCHEMA_VERSION,
+            binding_digest: ContentDigest::of(b"pending promoted bootstrap binding"),
+            workspace_id: verified.workspace_id(),
+            lineage_digest: authority.lineage_digest(),
+            endpoint_id: storage.endpoint.endpoint_id(),
+            device_id: storage.endpoint.device_id(),
+            graph_resource_id: verified.graph_resource(),
+            receipt_store_id: storage.receipt_store_id,
+            archive_control_binding: authority.archive_identity().binding_digest(),
+            backup_root_identity: verified.physical_root_identity(),
+            publication_id: verified.publication_id(),
+            bootstrap_publication_id: ContentDigest::from_bytes(
+                *bootstrap.publication_id().as_bytes(),
+            ),
+            bootstrap_aggregate_digest: ContentDigest::from_bytes(
+                *bootstrap.aggregate_digest().as_bytes(),
+            ),
+            bootstrap_import_id: ContentDigest::from_bytes(*authority.import_id().as_bytes()),
+            bootstrap_part_count: bootstrap.part_count(),
+            accepted_frontier_state_digest: verified.catalog_binding().accepted_frontier(),
+            history_generation: verified.catalog_binding().history_generation(),
+            history_root: verified.catalog_binding().history_root(),
+            catalog_root: verified.catalog_binding().catalog_root(),
+            catalog_rows: verified.catalog_binding().catalog_rows(),
+            manifest_header: BlobDescription::of(&header),
+            manifest: verified.manifest(),
+            proof: verified.proof(),
+            commit_marker: verified.commit_marker(),
+            shadow_evidence_digest: verified.evidence_digest(),
+            staged_inventory_digest: verified.staged_inventory_digest(),
+            staged_file_count: verified.staged_file_count(),
+            staged_total_bytes: verified.staged_total_bytes(),
+        };
+        binding.binding_digest = binding.compute_binding_digest();
+        binding.validate()?;
+        Ok(binding)
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), ShadowProjectionError> {
+        if self.schema_version != PROMOTED_BOOTSTRAP_PROJECTION_BINDING_SCHEMA_VERSION {
+            return Err(ShadowProjectionError::BindingMismatch(
+                "promoted bootstrap projection binding schema is unsupported",
+            ));
+        }
+        if self.binding_digest != self.compute_binding_digest() {
+            return Err(ShadowProjectionError::BindingMismatch(
+                "promoted bootstrap projection binding digest is invalid",
+            ));
+        }
+        if self.catalog_rows != self.staged_file_count
+            || self.staged_total_bytes > BOOTSTRAP_SOURCE_MAX_TOTAL_BYTES
+            || self.catalog_rows > BOOTSTRAP_SOURCE_MAX_FILES
+            || self.manifest.byte_length() > MAX_MANIFEST_BYTES
+            || self.proof.byte_length() > MAX_SMALL_EVIDENCE_BYTES
+            || self.commit_marker.byte_length() > MAX_SMALL_EVIDENCE_BYTES
+            || self.manifest_header.byte_length() > MAX_SMALL_EVIDENCE_BYTES
+        {
+            return Err(ShadowProjectionError::CorruptOrConflicting(
+                "promoted bootstrap projection binding exceeds retained bounds",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Structurally valid inert state used only by object-store tests whose
+    /// subject is durable-history encoding rather than runtime promotion.
+    #[cfg(test)]
+    pub(crate) fn synthetic_for_object_store_test(
+        workspace_id: WorkspaceId,
+        lineage_digest: LineageDigest,
+        endpoint_id: ProjectionEndpointId,
+        device_id: DeviceId,
+        graph_resource_id: CanonicalGraphResourceId,
+        receipt_store_id: ProjectionReceiptStoreId,
+        archive_control_binding: ContentDigest,
+        bootstrap_publication_id: ContentDigest,
+        bootstrap_aggregate_digest: ContentDigest,
+        bootstrap_import_id: ContentDigest,
+        bootstrap_part_count: u32,
+        accepted_frontier_state_digest: ContentDigest,
+        history_generation: u64,
+        history_root: ContentDigest,
+    ) -> Self {
+        let empty = BlobDescription::of(&[]);
+        let mut binding = Self {
+            schema_version: PROMOTED_BOOTSTRAP_PROJECTION_BINDING_SCHEMA_VERSION,
+            binding_digest: ContentDigest::of(b"pending synthetic bootstrap binding"),
+            workspace_id,
+            lineage_digest,
+            endpoint_id,
+            device_id,
+            graph_resource_id,
+            receipt_store_id,
+            archive_control_binding,
+            backup_root_identity: ContentDigest::of(b"synthetic backup root"),
+            publication_id: ContentDigest::of(b"synthetic shadow publication"),
+            bootstrap_publication_id,
+            bootstrap_aggregate_digest,
+            bootstrap_import_id,
+            bootstrap_part_count,
+            accepted_frontier_state_digest,
+            history_generation,
+            history_root,
+            catalog_root: ContentDigest::of(b"synthetic empty catalog"),
+            catalog_rows: 0,
+            manifest_header: empty,
+            manifest: empty,
+            proof: empty,
+            commit_marker: empty,
+            shadow_evidence_digest: ContentDigest::of(b"synthetic shadow evidence"),
+            staged_inventory_digest: ContentDigest::of(b"synthetic empty inventory"),
+            staged_file_count: 0,
+            staged_total_bytes: 0,
+        };
+        binding.binding_digest = binding.compute_binding_digest();
+        binding
+    }
+
+    fn compute_binding_digest(&self) -> ContentDigest {
+        let mut hasher = Sha256::new();
+        hasher.update(b"tine/promoted-bootstrap-projection-binding/v1\0");
+        hasher.update(self.schema_version.to_be_bytes());
+        hasher.update(self.workspace_id.as_uuid().as_bytes());
+        hasher.update(self.lineage_digest.as_bytes());
+        hasher.update(self.endpoint_id.as_uuid().as_bytes());
+        hasher.update(self.device_id.as_uuid().as_bytes());
+        hasher.update(self.graph_resource_id.as_bytes());
+        hasher.update(self.receipt_store_id.as_bytes());
+        for digest in [
+            self.archive_control_binding,
+            self.backup_root_identity,
+            self.publication_id,
+            self.bootstrap_publication_id,
+            self.bootstrap_aggregate_digest,
+            self.bootstrap_import_id,
+            self.accepted_frontier_state_digest,
+            self.history_root,
+            self.catalog_root,
+            self.shadow_evidence_digest,
+            self.staged_inventory_digest,
+        ] {
+            hasher.update(digest.as_bytes());
+        }
+        hasher.update(self.bootstrap_part_count.to_be_bytes());
+        hasher.update(self.history_generation.to_be_bytes());
+        hasher.update(self.catalog_rows.to_be_bytes());
+        for description in [
+            self.manifest_header,
+            self.manifest,
+            self.proof,
+            self.commit_marker,
+        ] {
+            hasher.update(description.sha256());
+            hasher.update(description.byte_length().to_be_bytes());
+        }
+        hasher.update(self.staged_file_count.to_be_bytes());
+        hasher.update(self.staged_total_bytes.to_be_bytes());
+        ContentDigest::from_bytes(hasher.finalize().into())
+    }
+
+    pub(crate) const fn workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
+    }
+
+    pub(crate) const fn lineage_digest(&self) -> LineageDigest {
+        self.lineage_digest
+    }
+
+    pub(crate) const fn endpoint_id(&self) -> ProjectionEndpointId {
+        self.endpoint_id
+    }
+
+    pub(crate) const fn device_id(&self) -> DeviceId {
+        self.device_id
+    }
+
+    pub(crate) const fn graph_resource_id(&self) -> CanonicalGraphResourceId {
+        self.graph_resource_id
+    }
+
+    pub(crate) const fn receipt_store_id(&self) -> ProjectionReceiptStoreId {
+        self.receipt_store_id
+    }
+
+    pub(crate) const fn archive_control_binding(&self) -> ContentDigest {
+        self.archive_control_binding
+    }
+
+    pub(crate) const fn bootstrap_publication_id(&self) -> ContentDigest {
+        self.bootstrap_publication_id
+    }
+
+    pub(crate) const fn bootstrap_aggregate_digest(&self) -> ContentDigest {
+        self.bootstrap_aggregate_digest
+    }
+
+    pub(crate) const fn bootstrap_import_id(&self) -> ContentDigest {
+        self.bootstrap_import_id
+    }
+
+    pub(crate) const fn bootstrap_part_count(&self) -> u32 {
+        self.bootstrap_part_count
+    }
+
+    pub(crate) const fn accepted_frontier_state_digest(&self) -> ContentDigest {
+        self.accepted_frontier_state_digest
+    }
+
+    pub(crate) const fn history_generation(&self) -> u64 {
+        self.history_generation
+    }
+
+    pub(crate) const fn history_root(&self) -> ContentDigest {
+        self.history_root
+    }
+
+    pub(crate) const fn catalog_rows(&self) -> u64 {
+        self.catalog_rows
+    }
+
+    pub(crate) const fn authority_digest(&self) -> ContentDigest {
+        self.shadow_evidence_digest
+    }
+}
+
 /// Crate-private proof that an inactive accepted bootstrap renders exactly to
 /// a committed, device-local shadow tree. It grants no graph-write or
 /// enrollment authority.
@@ -325,6 +650,7 @@ pub(crate) struct VerifiedShadowProjection {
     staged_file_count: u64,
     staged_total_bytes: u64,
     proof: BlobDescription,
+    commit_marker: BlobDescription,
     evidence_digest: ContentDigest,
     schema: ShadowProjectionSchemaBinding,
     instrumentation: ShadowProjectionInstrumentation,
@@ -353,6 +679,7 @@ impl PartialEq for VerifiedShadowProjection {
             && self.staged_file_count == other.staged_file_count
             && self.staged_total_bytes == other.staged_total_bytes
             && self.proof == other.proof
+            && self.commit_marker == other.commit_marker
             && self.evidence_digest == other.evidence_digest
             && self.schema == other.schema
     }
@@ -435,6 +762,10 @@ impl VerifiedShadowProjection {
 
     pub(crate) const fn proof(&self) -> BlobDescription {
         self.proof
+    }
+
+    pub(crate) const fn commit_marker(&self) -> BlobDescription {
+        self.commit_marker
     }
 
     pub(crate) const fn evidence_digest(&self) -> ContentDigest {
@@ -552,6 +883,543 @@ impl ShadowProjectionEvidenceCursor {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BootstrapProjectionEntryLocator {
+    offset: u64,
+    length: u64,
+    entry: BlobDescription,
+    page_id: PageId,
+    kind: ManagedTextKind,
+    source: BlobDescription,
+}
+
+#[derive(Default)]
+struct BootstrapProjectionRuntimeCounters {
+    manifest_scans: std::sync::atomic::AtomicU64,
+    manifest_entry_reads: std::sync::atomic::AtomicU64,
+    payload_reads: std::sync::atomic::AtomicU64,
+    payload_bytes: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BootstrapProjectionAuthorityInstrumentation {
+    pub(crate) manifest_scans: u64,
+    pub(crate) manifest_entry_reads: u64,
+    pub(crate) payload_reads: u64,
+    pub(crate) payload_bytes: u64,
+    pub(crate) locator_rows: usize,
+    pub(crate) locator_retained_bytes: u64,
+    pub(crate) graph_scans: u64,
+    pub(crate) fsyncs: u64,
+    pub(crate) journal_transitions: u64,
+}
+
+/// One authenticated bootstrap baseline loaded by exact path.  The entry and
+/// payload are bounded and owned only for this point result; the aggregate
+/// authority never retains source bytes.
+pub(crate) struct BootstrapProjectionBaseline {
+    intent: ProjectionIntent,
+    kind: ManagedTextKind,
+    source: Vec<u8>,
+    owner_binding: ContentDigest,
+}
+
+impl BootstrapProjectionBaseline {
+    pub(crate) const fn intent(&self) -> &ProjectionIntent {
+        &self.intent
+    }
+
+    pub(crate) const fn kind(&self) -> ManagedTextKind {
+        self.kind
+    }
+
+    pub(crate) fn source_bytes(&self) -> &[u8] {
+        &self.source
+    }
+
+    pub(crate) const fn owner_binding(&self) -> ContentDigest {
+        self.owner_binding
+    }
+}
+
+/// Read-only promoted bootstrap-baseline capability.  Reopen authenticates the
+/// manifest in exactly one pass and retains only bounded path locators.  Every
+/// point lookup rereads and authenticates one named manifest entry and, when
+/// present, its one payload file through retained no-follow directory handles.
+pub(crate) struct BootstrapProjectionAuthority {
+    binding: PromotedBootstrapProjectionBindingV1,
+    publication: Dir,
+    payload: Dir,
+    locators: HashMap<ManagedPath, BootstrapProjectionEntryLocator>,
+    locator_retained_bytes: u64,
+    counters: std::sync::Arc<BootstrapProjectionRuntimeCounters>,
+}
+
+impl fmt::Debug for BootstrapProjectionAuthority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BootstrapProjectionAuthority")
+            .field("workspace_id", &self.binding.workspace_id)
+            .field("publication_id", &self.binding.publication_id)
+            .field("locator_rows", &self.locators.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl BootstrapProjectionAuthority {
+    pub(crate) fn reopen(
+        roots: &MigrationBackupRoot,
+        binding: &PromotedBootstrapProjectionBindingV1,
+    ) -> Result<Self, ShadowProjectionError> {
+        #[cfg(test)]
+        {
+            let mut calls = aggregate_reopen_calls().lock().unwrap();
+            let calls = calls.entry(binding.workspace_id()).or_default();
+            *calls = calls.saturating_add(1);
+        }
+        binding.validate()?;
+        roots.freshly_validate_retained_roots()?;
+        if roots.root_identity() != binding.backup_root_identity
+            || roots.graph_resource() != binding.graph_resource_id
+        {
+            return Err(ShadowProjectionError::BindingMismatch(
+                "promoted bootstrap projection backup or graph resource changed",
+            ));
+        }
+
+        let root = Dir::open_ambient_dir(roots.canonical_root(), ambient_authority())?;
+        let base = open_dir_nofollow(&root, SHADOW_ROOT_DIRECTORY)
+            .map_err(|error| ShadowProjectionError::Io(io::Error::other(error.to_string())))?;
+        let workspace = open_dir_nofollow(&base, &binding.workspace_id.to_string())
+            .map_err(|error| ShadowProjectionError::Io(io::Error::other(error.to_string())))?;
+        let publication_name = hex(binding.publication_id.as_bytes());
+        let publication = open_dir_nofollow(&workspace, &publication_name)
+            .map_err(|error| ShadowProjectionError::Io(io::Error::other(error.to_string())))?;
+        let payload = open_dir_nofollow(&publication, PAYLOAD_DIRECTORY)
+            .map_err(|error| ShadowProjectionError::Io(io::Error::other(error.to_string())))?;
+
+        let proof = read_capability_file(&publication, PROOF_FILE, MAX_SMALL_EVIDENCE_BYTES)?;
+        if BlobDescription::of(&proof) != binding.proof {
+            return Err(ShadowProjectionError::CorruptOrConflicting(
+                "promoted shadow proof changed",
+            ));
+        }
+        let marker =
+            read_capability_file(&publication, COMMIT_MARKER_FILE, MAX_SMALL_EVIDENCE_BYTES)?;
+        if BlobDescription::of(&marker) != binding.commit_marker
+            || marker
+                .get(marker.len().saturating_sub(32)..)
+                .is_none_or(|suffix| suffix != binding.shadow_evidence_digest.as_bytes())
+        {
+            return Err(ShadowProjectionError::CorruptOrConflicting(
+                "promoted shadow commit evidence changed",
+            ));
+        }
+
+        let counters = std::sync::Arc::new(BootstrapProjectionRuntimeCounters::default());
+        let (locators, locator_retained_bytes) =
+            scan_promoted_manifest_once(&publication, binding, &counters)?;
+        if locators.len() as u64 != binding.catalog_rows {
+            return Err(ShadowProjectionError::CorruptOrConflicting(
+                "promoted shadow locator count differs from its catalog binding",
+            ));
+        }
+        Ok(Self {
+            binding: binding.clone(),
+            publication,
+            payload,
+            locators,
+            locator_retained_bytes,
+            counters,
+        })
+    }
+
+    pub(crate) const fn binding(&self) -> &PromotedBootstrapProjectionBindingV1 {
+        &self.binding
+    }
+
+    pub(crate) fn baseline_at(
+        &self,
+        path: &ManagedPath,
+    ) -> Result<Option<BootstrapProjectionBaseline>, ShadowProjectionError> {
+        let Some(locator) = self.locators.get(path).copied() else {
+            return Ok(None);
+        };
+        let mut manifest = open_file_nofollow(&self.publication, MANIFEST_FILE)?;
+        manifest.seek(SeekFrom::Start(locator.offset))?;
+        let length =
+            usize::try_from(locator.length).map_err(|_| ShadowProjectionError::ResourceLimit {
+                resource: "promoted manifest entry allocation",
+                observed: locator.length,
+                limit: MAX_MANIFEST_ENTRY_BYTES as u64,
+            })?;
+        if length > MAX_MANIFEST_ENTRY_BYTES {
+            return Err(ShadowProjectionError::ResourceLimit {
+                resource: "promoted manifest entry bytes",
+                observed: locator.length,
+                limit: MAX_MANIFEST_ENTRY_BYTES as u64,
+            });
+        }
+        let mut entry_bytes = vec![0_u8; length];
+        manifest.read_exact(&mut entry_bytes).map_err(|_| {
+            ShadowProjectionError::CorruptOrConflicting(
+                "promoted shadow manifest entry is truncated",
+            )
+        })?;
+        if BlobDescription::of(&entry_bytes) != locator.entry {
+            return Err(ShadowProjectionError::CorruptOrConflicting(
+                "promoted shadow manifest entry changed after reopen",
+            ));
+        }
+        self.counters
+            .manifest_entry_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut cursor = Cursor::new(entry_bytes.as_slice());
+        let evidence = read_manifest_evidence(&mut cursor)?;
+        if cursor.position() != locator.length
+            || evidence.path != *path
+            || evidence.page_id != locator.page_id
+            || evidence.kind != locator.kind
+            || evidence.source != locator.source
+        {
+            return Err(ShadowProjectionError::CorruptOrConflicting(
+                "promoted shadow locator does not authenticate its named entry",
+            ));
+        }
+        validate_promoted_entry(&self.binding, &evidence)?;
+        let source = read_payload_at(&self.payload, path, evidence.source)?;
+        self.counters
+            .payload_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.counters
+            .payload_bytes
+            .fetch_add(source.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        Ok(Some(BootstrapProjectionBaseline {
+            owner_binding: bootstrap_entry_owner_binding(
+                self.binding.shadow_evidence_digest,
+                &evidence,
+            )?,
+            intent: evidence.intent,
+            kind: evidence.kind,
+            source,
+        }))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn instrumentation(&self) -> BootstrapProjectionAuthorityInstrumentation {
+        BootstrapProjectionAuthorityInstrumentation {
+            manifest_scans: self
+                .counters
+                .manifest_scans
+                .load(std::sync::atomic::Ordering::Relaxed),
+            manifest_entry_reads: self
+                .counters
+                .manifest_entry_reads
+                .load(std::sync::atomic::Ordering::Relaxed),
+            payload_reads: self
+                .counters
+                .payload_reads
+                .load(std::sync::atomic::Ordering::Relaxed),
+            payload_bytes: self
+                .counters
+                .payload_bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            locator_rows: self.locators.len(),
+            locator_retained_bytes: self.locator_retained_bytes,
+            graph_scans: 0,
+            fsyncs: 0,
+            journal_transitions: 0,
+        }
+    }
+}
+
+struct ManifestScanReader {
+    file: File,
+    overall: Sha256,
+    entry: Option<Sha256>,
+    position: u64,
+    entry_start: u64,
+}
+
+impl ManifestScanReader {
+    fn new(file: File) -> Self {
+        Self {
+            file,
+            overall: Sha256::new(),
+            entry: None,
+            position: 0,
+            entry_start: 0,
+        }
+    }
+
+    fn begin_entry(&mut self) {
+        self.entry_start = self.position;
+        self.entry = Some(Sha256::new());
+    }
+
+    fn finish_entry(&mut self) -> (u64, BlobDescription) {
+        let length = self.position - self.entry_start;
+        let digest = self
+            .entry
+            .take()
+            .expect("entry hashing is active")
+            .finalize();
+        (length, BlobDescription::from_parts(digest.into(), length))
+    }
+
+    fn finish(self) -> BlobDescription {
+        BlobDescription::from_parts(self.overall.finalize().into(), self.position)
+    }
+}
+
+impl Read for ManifestScanReader {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        let read = self.file.read(output)?;
+        self.overall.update(&output[..read]);
+        if let Some(entry) = &mut self.entry {
+            entry.update(&output[..read]);
+        }
+        self.position = self.position.saturating_add(read as u64);
+        Ok(read)
+    }
+}
+
+fn scan_promoted_manifest_once(
+    publication: &Dir,
+    binding: &PromotedBootstrapProjectionBindingV1,
+    counters: &BootstrapProjectionRuntimeCounters,
+) -> Result<(HashMap<ManagedPath, BootstrapProjectionEntryLocator>, u64), ShadowProjectionError> {
+    let file = open_file_nofollow(publication, MANIFEST_FILE)?;
+    let metadata = file.metadata()?;
+    if !metadata_is_real_file(&metadata) || metadata.len() != binding.manifest.byte_length() {
+        return Err(ShadowProjectionError::CorruptOrConflicting(
+            "promoted shadow manifest has the wrong no-follow shape or length",
+        ));
+    }
+    let mut reader = ManifestScanReader::new(file);
+    let header_length = usize::try_from(binding.manifest_header.byte_length()).map_err(|_| {
+        ShadowProjectionError::CorruptOrConflicting(
+            "promoted shadow manifest header does not fit this platform",
+        )
+    })?;
+    let mut header = vec![0_u8; header_length];
+    reader.read_exact(&mut header).map_err(|_| {
+        ShadowProjectionError::CorruptOrConflicting("promoted shadow manifest header is truncated")
+    })?;
+    if BlobDescription::of(&header) != binding.manifest_header {
+        return Err(ShadowProjectionError::BindingMismatch(
+            "promoted shadow manifest header changed",
+        ));
+    }
+
+    let row_count = usize::try_from(binding.catalog_rows).map_err(|_| {
+        ShadowProjectionError::ResourceLimit {
+            resource: "promoted shadow locator rows",
+            observed: binding.catalog_rows,
+            limit: BOOTSTRAP_SOURCE_MAX_FILES,
+        }
+    })?;
+    let mut locators = HashMap::new();
+    locators
+        .try_reserve(row_count)
+        .map_err(|_| ShadowProjectionError::ResourceLimit {
+            resource: "promoted shadow locator allocation",
+            observed: binding.catalog_rows,
+            limit: BOOTSTRAP_SOURCE_MAX_FILES,
+        })?;
+    let mut retained = (locators.capacity() as u64)
+        .saturating_mul(
+            std::mem::size_of::<(ManagedPath, BootstrapProjectionEntryLocator)>() as u64,
+        );
+    let mut previous = None::<ManagedPath>;
+    let mut inventory = Sha256::new();
+    inventory.update(b"tine/inactive-shadow-projection-inventory/v1\0");
+    for _ in 0..row_count {
+        reader.begin_entry();
+        let evidence = read_manifest_evidence(&mut reader)?;
+        let start = reader.entry_start;
+        let (length, entry) = reader.finish_entry();
+        if previous
+            .as_ref()
+            .is_some_and(|prior| prior >= &evidence.path)
+        {
+            return Err(ShadowProjectionError::CorruptOrConflicting(
+                "promoted shadow manifest paths are duplicated or reordered",
+            ));
+        }
+        validate_promoted_entry(binding, &evidence)?;
+        hash_file_evidence(&mut inventory, &evidence)?;
+        retained = retained
+            .checked_add(evidence.path.as_str().len() as u64)
+            .ok_or(ShadowProjectionError::ResourceLimit {
+                resource: "promoted shadow locator retained bytes",
+                observed: u64::MAX,
+                limit: MAX_BOOTSTRAP_PROJECTION_LOCATOR_RETAINED_BYTES,
+            })?;
+        enforce_limit(
+            "promoted shadow locator retained bytes",
+            retained,
+            MAX_BOOTSTRAP_PROJECTION_LOCATOR_RETAINED_BYTES,
+        )?;
+        let locator = BootstrapProjectionEntryLocator {
+            offset: start,
+            length,
+            entry,
+            page_id: evidence.page_id,
+            kind: evidence.kind,
+            source: evidence.source,
+        };
+        if locators.insert(evidence.path.clone(), locator).is_some() {
+            return Err(ShadowProjectionError::CorruptOrConflicting(
+                "promoted shadow manifest contains a duplicate path",
+            ));
+        }
+        previous = Some(evidence.path);
+    }
+    let mut trailing = [0_u8; 1];
+    if reader.read(&mut trailing)? != 0 {
+        return Err(ShadowProjectionError::CorruptOrConflicting(
+            "promoted shadow manifest contains trailing entries",
+        ));
+    }
+    if reader.finish() != binding.manifest
+        || ContentDigest::from_bytes(inventory.finalize().into()) != binding.staged_inventory_digest
+    {
+        return Err(ShadowProjectionError::CorruptOrConflicting(
+            "promoted shadow manifest or inventory digest changed",
+        ));
+    }
+    counters
+        .manifest_scans
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok((locators, retained))
+}
+
+fn validate_promoted_entry(
+    binding: &PromotedBootstrapProjectionBindingV1,
+    evidence: &ShadowProjectionFileEvidence,
+) -> Result<(), ShadowProjectionError> {
+    let intent_bytes = evidence
+        .intent
+        .encode()
+        .map_err(|error| ShadowProjectionError::Projection(error.to_string()))?;
+    if evidence.intent.workspace_id() != binding.workspace_id
+        || evidence.intent.page_id() != evidence.page_id
+        || evidence.intent.path() != &evidence.path
+        || evidence.intent.target() != evidence.source
+        || evidence.intent.precondition() != &ProjectionPrecondition::Base(evidence.source)
+        || ProjectionIntent::decode(&intent_bytes)
+            .map_err(|error| ShadowProjectionError::Projection(error.to_string()))?
+            != evidence.intent
+    {
+        return Err(ShadowProjectionError::BindingMismatch(
+            "promoted shadow entry page, path, source, or intent binding differs",
+        ));
+    }
+    Ok(())
+}
+
+fn bootstrap_entry_owner_binding(
+    authority: ContentDigest,
+    evidence: &ShadowProjectionFileEvidence,
+) -> Result<ContentDigest, ShadowProjectionError> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"tine/promoted-bootstrap-projection-owner/v1\0");
+    hasher.update(authority.as_bytes());
+    hasher.update(evidence.page_id.as_uuid().as_bytes());
+    hasher.update((evidence.path.as_str().len() as u64).to_be_bytes());
+    hasher.update(evidence.path.as_str().as_bytes());
+    hasher.update(
+        evidence
+            .intent
+            .id()
+            .map_err(|error| ShadowProjectionError::Projection(error.to_string()))?
+            .as_bytes(),
+    );
+    Ok(ContentDigest::from_bytes(hasher.finalize().into()))
+}
+
+fn read_capability_file(
+    directory: &Dir,
+    name: &str,
+    maximum: u64,
+) -> Result<Vec<u8>, ShadowProjectionError> {
+    let mut file = open_file_nofollow(directory, name)?;
+    let metadata = file.metadata()?;
+    if !metadata_is_real_file(&metadata) {
+        return Err(ShadowProjectionError::CorruptOrConflicting(
+            "promoted shadow evidence is not a regular no-follow file",
+        ));
+    }
+    enforce_limit("promoted shadow evidence bytes", metadata.len(), maximum)?;
+    let capacity =
+        usize::try_from(metadata.len()).map_err(|_| ShadowProjectionError::ResourceLimit {
+            resource: "promoted shadow evidence allocation",
+            observed: metadata.len(),
+            limit: maximum,
+        })?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(capacity)
+        .map_err(|_| ShadowProjectionError::ResourceLimit {
+            resource: "promoted shadow evidence allocation",
+            observed: metadata.len(),
+            limit: maximum,
+        })?;
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn read_payload_at(
+    payload: &Dir,
+    path: &ManagedPath,
+    expected: BlobDescription,
+) -> Result<Vec<u8>, ShadowProjectionError> {
+    validate_managed_path_depth(path)?;
+    let mut components = path.as_str().split('/').peekable();
+    let mut directory = payload.try_clone()?;
+    let mut leaf = None;
+    while let Some(component) = components.next() {
+        if components.peek().is_none() {
+            leaf = Some(component);
+        } else {
+            directory = open_dir_nofollow(&directory, component)
+                .map_err(|error| ShadowProjectionError::Io(io::Error::other(error.to_string())))?;
+        }
+    }
+    let leaf = leaf.ok_or(ShadowProjectionError::CorruptOrConflicting(
+        "promoted shadow payload path is empty",
+    ))?;
+    let mut file = open_file_nofollow(&directory, leaf)?;
+    let metadata = file.metadata()?;
+    if !metadata_is_real_file(&metadata) || metadata.len() != expected.byte_length() {
+        return Err(ShadowProjectionError::CorruptOrConflicting(
+            "promoted shadow payload has the wrong no-follow shape or length",
+        ));
+    }
+    enforce_limit(
+        "promoted shadow payload bytes",
+        metadata.len(),
+        BOOTSTRAP_SOURCE_MAX_FILE_BYTES,
+    )?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(metadata.len() as usize)
+        .map_err(|_| ShadowProjectionError::ResourceLimit {
+            resource: "promoted shadow payload allocation",
+            observed: metadata.len(),
+            limit: BOOTSTRAP_SOURCE_MAX_FILE_BYTES,
+        })?;
+    file.read_to_end(&mut bytes)?;
+    if BlobDescription::of(&bytes) != expected {
+        return Err(ShadowProjectionError::CorruptOrConflicting(
+            "promoted shadow payload digest changed",
+        ));
+    }
+    Ok(bytes)
+}
+
 #[derive(Clone, Copy)]
 struct SourceSummary {
     file_count: u64,
@@ -589,6 +1457,12 @@ pub(crate) fn verify_inactive_bootstrap_shadow_projection(
     sqlite: &OpenProjection,
     sqlite_projection: &VerifiedBootstrapSqliteProjection,
 ) -> Result<VerifiedShadowProjection, ShadowProjectionError> {
+    #[cfg(test)]
+    {
+        let mut calls = complete_shadow_verification_calls().lock().unwrap();
+        let calls = calls.entry(authority.binding().workspace_id()).or_default();
+        *calls = calls.saturating_add(1);
+    }
     validate_bindings(
         graph,
         roots,
@@ -750,7 +1624,7 @@ pub(crate) fn verify_inactive_bootstrap_shadow_projection(
         proof,
         staged,
     )?;
-    publish_small_file_atomic(
+    let commit_marker = publish_small_file_atomic(
         &paths.final_directory,
         COMMIT_MARKER_STAGE_FILE,
         COMMIT_MARKER_FILE,
@@ -842,6 +1716,7 @@ pub(crate) fn verify_inactive_bootstrap_shadow_projection(
         staged_file_count: staged.file_count,
         staged_total_bytes: staged.total_bytes,
         proof,
+        commit_marker,
         evidence_digest,
         schema: ShadowProjectionSchemaBinding::CURRENT,
         instrumentation,
@@ -1527,83 +2402,19 @@ impl ManifestReader {
         if self.remaining == 0 {
             return Ok(None);
         }
-        let path = ManagedPath::parse(
-            String::from_utf8(read_bounded_bytes(
-                &mut self.file,
-                BOOTSTRAP_SOURCE_MAX_PATH_BYTES,
-                "manifest path",
-            )?)
-            .map_err(|_| {
-                ShadowProjectionError::CorruptOrConflicting("manifest path is not UTF-8")
-            })?,
-        )
-        .map_err(|_| ShadowProjectionError::CorruptOrConflicting("manifest path is unsafe"))?;
+        let evidence = read_manifest_evidence(&mut self.file)?;
         if self
             .previous
             .as_ref()
-            .is_some_and(|previous| previous >= &path)
+            .is_some_and(|previous| previous >= &evidence.path)
         {
             return Err(ShadowProjectionError::CorruptOrConflicting(
                 "manifest paths are duplicated or reordered",
             ));
         }
-        let kind = match read_u8(&mut self.file)? {
-            0 => ManagedTextKind::Page,
-            1 => ManagedTextKind::Journal,
-            _ => {
-                return Err(ShadowProjectionError::CorruptOrConflicting(
-                    "manifest managed kind is invalid",
-                ))
-            }
-        };
-        let logical_name = String::from_utf8(read_bounded_bytes(
-            &mut self.file,
-            usize::try_from(BOOTSTRAP_SOURCE_MAX_LOGICAL_NAME_BYTES).map_err(|_| {
-                ShadowProjectionError::CorruptOrConflicting(
-                    "logical-name bound does not fit this platform",
-                )
-            })?,
-            "manifest logical name",
-        )?)
-        .map_err(|_| {
-            ShadowProjectionError::CorruptOrConflicting("manifest logical name is not UTF-8")
-        })?;
-        let page_id = PageId::from_uuid(uuid::Uuid::from_bytes(read_array_16(&mut self.file)?));
-        let source = read_description(&mut self.file)?;
-        enforce_limit(
-            "manifest source file bytes",
-            source.byte_length(),
-            BOOTSTRAP_SOURCE_MAX_FILE_BYTES,
-        )?;
-        let source_file_resource = ContentDigest::from_bytes(read_array_32(&mut self.file)?);
-        let source_link_count = read_u64(&mut self.file)?;
-        let source_chunk_count = read_u32(&mut self.file)?;
-        let intent_bytes = read_bounded_bytes(
-            &mut self.file,
-            MAX_MANIFEST_ENTRY_BYTES,
-            "projection intent",
-        )?;
-        let intent_description = read_description(&mut self.file)?;
-        if BlobDescription::of(&intent_bytes) != intent_description {
-            return Err(ShadowProjectionError::CorruptOrConflicting(
-                "manifest projection intent description differs",
-            ));
-        }
-        let intent = ProjectionIntent::decode(&intent_bytes)
-            .map_err(|error| ShadowProjectionError::Projection(error.to_string()))?;
         self.remaining -= 1;
-        self.previous = Some(path.clone());
-        Ok(Some(ShadowProjectionFileEvidence {
-            path,
-            kind,
-            logical_name,
-            page_id,
-            source,
-            source_file_resource,
-            source_link_count,
-            source_chunk_count,
-            intent,
-        }))
+        self.previous = Some(evidence.path.clone());
+        Ok(Some(evidence))
     }
 
     fn finish(mut self) -> Result<(), ShadowProjectionError> {
@@ -1620,6 +2431,80 @@ impl ManifestReader {
         }
         Ok(())
     }
+}
+
+fn read_manifest_evidence(
+    reader: &mut impl Read,
+) -> Result<ShadowProjectionFileEvidence, ShadowProjectionError> {
+    let path = ManagedPath::parse(
+        String::from_utf8(read_bounded_bytes(
+            reader,
+            BOOTSTRAP_SOURCE_MAX_PATH_BYTES,
+            "manifest path",
+        )?)
+        .map_err(|_| ShadowProjectionError::CorruptOrConflicting("manifest path is not UTF-8"))?,
+    )
+    .map_err(|_| ShadowProjectionError::CorruptOrConflicting("manifest path is unsafe"))?;
+    let kind = match read_u8(reader)? {
+        0 => ManagedTextKind::Page,
+        1 => ManagedTextKind::Journal,
+        _ => {
+            return Err(ShadowProjectionError::CorruptOrConflicting(
+                "manifest managed kind is invalid",
+            ));
+        }
+    };
+    let logical_name = String::from_utf8(read_bounded_bytes(
+        reader,
+        usize::try_from(BOOTSTRAP_SOURCE_MAX_LOGICAL_NAME_BYTES).map_err(|_| {
+            ShadowProjectionError::CorruptOrConflicting(
+                "logical-name bound does not fit this platform",
+            )
+        })?,
+        "manifest logical name",
+    )?)
+    .map_err(|_| {
+        ShadowProjectionError::CorruptOrConflicting("manifest logical name is not UTF-8")
+    })?;
+    let page_id = PageId::from_uuid(uuid::Uuid::from_bytes(read_array_16(reader)?));
+    let source = read_description(reader)?;
+    enforce_limit(
+        "manifest source file bytes",
+        source.byte_length(),
+        BOOTSTRAP_SOURCE_MAX_FILE_BYTES,
+    )?;
+    let source_file_resource = ContentDigest::from_bytes(read_array_32(reader)?);
+    let source_link_count = read_u64(reader)?;
+    let source_chunk_count = read_u32(reader)?;
+    let intent_bytes = read_bounded_bytes(reader, MAX_MANIFEST_ENTRY_BYTES, "projection intent")?;
+    let intent_description = read_description(reader)?;
+    if BlobDescription::of(&intent_bytes) != intent_description {
+        return Err(ShadowProjectionError::CorruptOrConflicting(
+            "manifest projection intent description differs",
+        ));
+    }
+    let intent = ProjectionIntent::decode(&intent_bytes)
+        .map_err(|error| ShadowProjectionError::Projection(error.to_string()))?;
+    if intent
+        .encode()
+        .map_err(|error| ShadowProjectionError::Projection(error.to_string()))?
+        != intent_bytes
+    {
+        return Err(ShadowProjectionError::CorruptOrConflicting(
+            "manifest projection intent is not canonical",
+        ));
+    }
+    Ok(ShadowProjectionFileEvidence {
+        path,
+        kind,
+        logical_name,
+        page_id,
+        source,
+        source_file_resource,
+        source_link_count,
+        source_chunk_count,
+        intent,
+    })
 }
 
 fn manifest_header(
@@ -3115,6 +4000,237 @@ mod tests {
             page_ids["notes/b/same-copy.org"]
         );
         rich.assert_graph_unchanged();
+    }
+
+    #[test]
+    fn promoted_bootstrap_authority_reopens_once_and_reads_only_named_exact_entries() {
+        let fixture = rich_fixture("promoted-aggregate-point-lookup");
+        let verified = fixture.verify().unwrap();
+        let binding = PromotedBootstrapProjectionBindingV1::from_verified(&verified).unwrap();
+        let mut expected = BTreeMap::new();
+        let mut cursor = verified.file_evidence_cursor().unwrap();
+        while let Some(entry) = cursor.next().unwrap() {
+            expected.insert(
+                entry.path().clone(),
+                (
+                    entry.page_id(),
+                    fs::read(fixture.graph_root.join(entry.path().as_str())).unwrap(),
+                ),
+            );
+        }
+        cursor.finish().unwrap();
+        drop(verified);
+
+        let authority = BootstrapProjectionAuthority::reopen(&fixture.roots, &binding).unwrap();
+        let opened = authority.instrumentation();
+        assert_eq!(opened.manifest_scans, 1);
+        assert_eq!(opened.locator_rows, expected.len());
+        assert!(opened.locator_retained_bytes <= MAX_BOOTSTRAP_PROJECTION_LOCATOR_RETAINED_BYTES);
+        assert_eq!(
+            (
+                opened.graph_scans,
+                opened.fsyncs,
+                opened.journal_transitions
+            ),
+            (0, 0, 0)
+        );
+        for (path, (page_id, bytes)) in &expected {
+            let baseline = authority.baseline_at(path).unwrap().unwrap();
+            assert_eq!(baseline.intent().path(), path);
+            assert_eq!(baseline.intent().page_id(), *page_id);
+            assert_eq!(baseline.intent().target(), BlobDescription::of(bytes));
+            assert_eq!(baseline.source_bytes(), bytes);
+        }
+        let after_hits = authority.instrumentation();
+        assert_eq!(after_hits.manifest_scans, 1);
+        assert_eq!(after_hits.manifest_entry_reads, expected.len() as u64);
+        assert_eq!(after_hits.payload_reads, expected.len() as u64);
+        assert!(authority
+            .baseline_at(&ManagedPath::parse("notes/missing-計画.markdown").unwrap())
+            .unwrap()
+            .is_none());
+        assert_eq!(authority.instrumentation(), after_hits);
+
+        drop(authority);
+        let reopened = BootstrapProjectionAuthority::reopen(&fixture.roots, &binding).unwrap();
+        assert_eq!(reopened.instrumentation().manifest_scans, 1);
+        let unicode = ManagedPath::parse(
+            expected
+                .keys()
+                .find(|path| path.as_str().contains("Déjà"))
+                .unwrap()
+                .as_str(),
+        )
+        .unwrap();
+        assert_eq!(
+            reopened
+                .baseline_at(&unicode)
+                .unwrap()
+                .unwrap()
+                .source_bytes(),
+            expected[&unicode].1.as_slice()
+        );
+
+        let mut wrong_endpoint = binding.clone();
+        wrong_endpoint.endpoint_id = ProjectionEndpointId::from_uuid(Uuid::from_u128(0xdead));
+        assert!(BootstrapProjectionAuthority::reopen(&fixture.roots, &wrong_endpoint).is_err());
+        let mut wrong_archive = binding.clone();
+        wrong_archive.archive_control_binding = ContentDigest::of(b"wrong archive");
+        assert!(BootstrapProjectionAuthority::reopen(&fixture.roots, &wrong_archive).is_err());
+        let mut wrong_workspace = binding.clone();
+        wrong_workspace.workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(0xbeef));
+        assert!(BootstrapProjectionAuthority::reopen(&fixture.roots, &wrong_workspace).is_err());
+        let mut wrong_graph = binding.clone();
+        wrong_graph.graph_resource_id =
+            CanonicalGraphResourceId::from_capability_identity(b"wrong", b"graph");
+        assert!(BootstrapProjectionAuthority::reopen(&fixture.roots, &wrong_graph).is_err());
+        let mut stale = binding.clone();
+        stale.accepted_frontier_state_digest = ContentDigest::of(b"stale frontier");
+        assert!(BootstrapProjectionAuthority::reopen(&fixture.roots, &stale).is_err());
+        fixture.assert_graph_unchanged();
+    }
+
+    #[test]
+    fn promoted_bootstrap_point_lookup_rejects_changed_payload_bytes() {
+        let fixture = Fixture::new(
+            "promoted-point-corruption",
+            None,
+            vec![("pages/exact.md".into(), b"- exact bytes\n".to_vec())],
+        );
+        let verified = fixture.verify().unwrap();
+        let binding = PromotedBootstrapProjectionBindingV1::from_verified(&verified).unwrap();
+        let path = ManagedPath::parse("pages/exact.md").unwrap();
+        let authority = BootstrapProjectionAuthority::reopen(&fixture.roots, &binding).unwrap();
+        fs::write(
+            verified
+                .directory()
+                .join(PAYLOAD_DIRECTORY)
+                .join(path.as_str()),
+            b"- corrupt byte\n",
+        )
+        .unwrap();
+        assert!(authority.baseline_at(&path).is_err());
+    }
+
+    #[test]
+    fn promoted_bootstrap_reopen_rejects_duplicate_path_and_wrong_page_entry() {
+        fn one(label: &str) -> (Fixture, VerifiedShadowProjection) {
+            let fixture = Fixture::new(
+                label,
+                None,
+                vec![("pages/exact.md".into(), b"- exact bytes\n".to_vec())],
+            );
+            let verified = fixture.verify().unwrap();
+            (fixture, verified)
+        }
+
+        let (duplicate_fixture, duplicate_verified) = one("promoted-duplicate-path");
+        let mut duplicate_binding =
+            PromotedBootstrapProjectionBindingV1::from_verified(&duplicate_verified).unwrap();
+        let manifest_path = duplicate_verified.directory().join(MANIFEST_FILE);
+        let mut manifest = fs::read(&manifest_path).unwrap();
+        let header = usize::try_from(duplicate_binding.manifest_header.byte_length()).unwrap();
+        let entry = manifest[header..].to_vec();
+        manifest.extend_from_slice(&entry);
+        fs::write(&manifest_path, &manifest).unwrap();
+        duplicate_binding.catalog_rows = 2;
+        duplicate_binding.staged_file_count = 2;
+        duplicate_binding.manifest = BlobDescription::of(&manifest);
+        duplicate_binding.binding_digest = duplicate_binding.compute_binding_digest();
+        let error =
+            BootstrapProjectionAuthority::reopen(&duplicate_fixture.roots, &duplicate_binding)
+                .err()
+                .expect("duplicate path must fail");
+        assert!(error.to_string().contains("duplicated"), "{error}");
+
+        let (page_fixture, page_verified) = one("promoted-wrong-page");
+        let mut page_binding =
+            PromotedBootstrapProjectionBindingV1::from_verified(&page_verified).unwrap();
+        let manifest_path = page_verified.directory().join(MANIFEST_FILE);
+        let mut manifest = fs::read(&manifest_path).unwrap();
+        let mut offset = usize::try_from(page_binding.manifest_header.byte_length()).unwrap();
+        let path_length = u32::from_be_bytes(manifest[offset..offset + 4].try_into().unwrap());
+        offset += 4 + usize::try_from(path_length).unwrap() + 1;
+        let name_length = u32::from_be_bytes(manifest[offset..offset + 4].try_into().unwrap());
+        offset += 4 + usize::try_from(name_length).unwrap();
+        manifest[offset] ^= 0xff;
+        fs::write(&manifest_path, &manifest).unwrap();
+        page_binding.manifest = BlobDescription::of(&manifest);
+        page_binding.binding_digest = page_binding.compute_binding_digest();
+        assert!(BootstrapProjectionAuthority::reopen(&page_fixture.roots, &page_binding).is_err());
+    }
+
+    #[test]
+    #[ignore = "manual release 10,000-page aggregate authority receipt"]
+    fn promoted_bootstrap_10000_page_point_lookup_release_receipt() {
+        let mut files = Vec::with_capacity(10_000);
+        for page in 0..10_000 {
+            let path = format!(
+                "notes/規模-{}/層-{}/Página-{page}-計画.{}",
+                page % 17,
+                page % 31,
+                if page % 3 == 0 { "markdown" } else { "md" }
+            );
+            let mut bytes = format!("title:: Synthetic {page}\r\n\r\n").into_bytes();
+            for block in 0..10 {
+                bytes.extend_from_slice(
+                    format!("- block {page}-{block} exact café 計画\r\n").as_bytes(),
+                );
+            }
+            files.push((path, bytes));
+        }
+        let started = std::time::Instant::now();
+        let fixture_started = std::time::Instant::now();
+        let fixture = Fixture::new("promoted-aggregate-10000", None, files);
+        let fixture_ms = fixture_started.elapsed().as_millis();
+        let verify_started = std::time::Instant::now();
+        let verified = fixture.verify().unwrap();
+        let verify_ms = verify_started.elapsed().as_millis();
+        let binding = PromotedBootstrapProjectionBindingV1::from_verified(&verified).unwrap();
+        let cold_started = std::time::Instant::now();
+        let authority = BootstrapProjectionAuthority::reopen(&fixture.roots, &binding).unwrap();
+        let cold = cold_started.elapsed();
+        let lookup_started = std::time::Instant::now();
+        for page in 0..10_000 {
+            let path = ManagedPath::parse(format!(
+                "notes/規模-{}/層-{}/Página-{page}-計画.{}",
+                page % 17,
+                page % 31,
+                if page % 3 == 0 { "markdown" } else { "md" }
+            ))
+            .unwrap();
+            let baseline = authority.baseline_at(&path).unwrap().unwrap();
+            assert_eq!(
+                fs::read(fixture.graph_root.join(path.as_str())).unwrap(),
+                baseline.source_bytes()
+            );
+            let missing = ManagedPath::parse(format!("notes/missing/不存在-{page}.md")).unwrap();
+            assert!(authority.baseline_at(&missing).unwrap().is_none());
+        }
+        let lookup = lookup_started.elapsed();
+        let counters = authority.instrumentation();
+        assert_eq!(counters.manifest_scans, 1);
+        assert_eq!(counters.locator_rows, 10_000);
+        assert_eq!(counters.manifest_entry_reads, 10_000);
+        assert_eq!(counters.payload_reads, 10_000);
+        assert_eq!(
+            (
+                counters.graph_scans,
+                counters.fsyncs,
+                counters.journal_transitions
+            ),
+            (0, 0, 0)
+        );
+        assert!(counters.locator_retained_bytes <= MAX_BOOTSTRAP_PROJECTION_LOCATOR_RETAINED_BYTES);
+        eprintln!(
+            "aggregate-10000 total_ms={} fixture_ms={} shadow_verify_ms={} cold_reopen_ms={} lookups_ms={} locator_bytes={}",
+            started.elapsed().as_millis(),
+            fixture_ms,
+            verify_ms,
+            cold.as_millis(),
+            lookup.as_millis(),
+            counters.locator_retained_bytes
+        );
     }
 
     #[test]

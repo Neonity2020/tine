@@ -2720,6 +2720,25 @@ impl VerifiedLocalEvidence {
     }
 }
 
+/// Process-local proof that the complete backup/SQLite/shadow set was freshly
+/// validated for the exact `VerifiedLocal` record immediately before its
+/// commit/readback sequence. It is intentionally neither cloneable nor
+/// serializable; fresh-process reopen continues through the full proof path.
+pub(crate) struct RetainedVerifiedLocalValidation {
+    evidence: VerifiedLocalEvidence,
+    expected: VerifiedLocalV1,
+}
+
+impl RetainedVerifiedLocalValidation {
+    pub(crate) const fn evidence(&self) -> &VerifiedLocalEvidence {
+        &self.evidence
+    }
+
+    pub(crate) fn into_evidence(self) -> VerifiedLocalEvidence {
+        self.evidence
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum VerifiedLocalCompositionError {
     Enrollment(EnrollmentError),
@@ -2808,6 +2827,83 @@ pub(crate) fn compose_verified_local(
     proofs: &VerifiedLocalProofSet<'_>,
 ) -> Result<VerifiedLocalEvidence, VerifiedLocalCompositionError> {
     compose_verified_local_at_cut(root, binding, preparation_id, proofs, CommitCut::None)
+}
+
+pub(crate) fn compose_verified_local_retaining_validation(
+    root: &EnrollmentApplicationRoot,
+    binding: EnrollmentBindingV1,
+    preparation_id: PreparationId,
+    proofs: &VerifiedLocalProofSet<'_>,
+) -> Result<RetainedVerifiedLocalValidation, VerifiedLocalCompositionError> {
+    let shadow = ShadowImportV1::new(
+        preparation_id,
+        ContentDigest::from_bytes(
+            *proofs
+                .prepared
+                .source_capture()
+                .inventory_description()
+                .sha256(),
+        ),
+    );
+    let mut writer = match EnrollmentWriter::open_existing(root, &binding)? {
+        EnrollmentOpen::Absent => EnrollmentWriter::create(root, binding.clone(), shadow.clone())?,
+        EnrollmentOpen::Present(writer) => writer,
+    };
+    match writer.current().record.lifecycle() {
+        EnrollmentLifecycleV1::ShadowImport(current) if current == &shadow => {}
+        EnrollmentLifecycleV1::VerifiedLocal(current)
+            if current.preparation_id == shadow.preparation_id
+                && current.source_inventory_digest == shadow.source_inventory_digest => {}
+        EnrollmentLifecycleV1::ShadowImport(_) | EnrollmentLifecycleV1::VerifiedLocal(_) => {
+            return Err(EnrollmentError::InitialPreparationMismatch.into());
+        }
+        _ => {
+            return Err(VerifiedLocalCompositionError::WrongLifecycle(
+                "only ShadowImport can enter retained VerifiedLocal activation",
+            ));
+        }
+    }
+    validate_verified_local_binding(&binding, proofs)?;
+    proofs
+        .accepted_authority
+        .store()
+        .validate_enrolled_archive_resource_id(binding.archive_resource_id())
+        .map_err(|error| {
+            VerifiedLocalCompositionError::ProofBinding(format!(
+                "persisted archive resource claim does not authenticate retained validation: {error}"
+            ))
+        })?;
+    let expected = verified_local_from_validated_proofs(
+        &binding,
+        preparation_id,
+        proofs,
+        proofs.accepted_authority,
+        proofs.source_backup,
+        proofs.shadow_projection,
+    )?;
+    match writer.current().record.lifecycle() {
+        EnrollmentLifecycleV1::ShadowImport(_) => {
+            let current = writer.current().digest;
+            writer.transition(
+                current,
+                EnrollmentLifecycleV1::VerifiedLocal(expected.clone()),
+            )?;
+        }
+        EnrollmentLifecycleV1::VerifiedLocal(current) if current == &expected => {}
+        EnrollmentLifecycleV1::VerifiedLocal(_) => {
+            return Err(VerifiedLocalCompositionError::ProofMismatch(
+                "committed VerifiedLocal differs from retained validation",
+            ));
+        }
+        _ => {
+            return Err(VerifiedLocalCompositionError::WrongLifecycle(
+                "enrollment changed during retained VerifiedLocal composition",
+            ));
+        }
+    }
+    drop(writer);
+    let evidence = reopen_verified_local_against_expected(root, &binding, &expected)?;
+    Ok(RetainedVerifiedLocalValidation { evidence, expected })
 }
 
 /// Persist or resume only the durable `ShadowImport` predecessor of the
@@ -2979,9 +3075,34 @@ pub(crate) fn reopen_verified_local(
             "enrollment head does not bind the freshly reopened proofs",
         ));
     }
-    let expected_head = reader.current().digest;
     drop(reader);
 
+    reopen_verified_local_against_expected(root, binding, &expected)
+}
+
+fn reopen_verified_local_against_expected(
+    root: &EnrollmentApplicationRoot,
+    binding: &EnrollmentBindingV1,
+    expected: &VerifiedLocalV1,
+) -> Result<VerifiedLocalEvidence, VerifiedLocalCompositionError> {
+    let reader = match EnrollmentReader::open_existing(root, binding)? {
+        EnrollmentOpen::Absent => {
+            return Err(VerifiedLocalCompositionError::WrongLifecycle(
+                "VerifiedLocal enrollment disappeared before retained readback",
+            ));
+        }
+        EnrollmentOpen::Present(reader) => reader,
+    };
+    let expected_head = reader.current().digest;
+    if !matches!(
+        reader.current().record.lifecycle(),
+        EnrollmentLifecycleV1::VerifiedLocal(verified) if verified == expected
+    ) {
+        return Err(VerifiedLocalCompositionError::ProofMismatch(
+            "enrollment head does not bind retained VerifiedLocal validation",
+        ));
+    }
+    drop(reader);
     let reopened = match EnrollmentReader::open_existing(root, binding)? {
         EnrollmentOpen::Absent => {
             return Err(VerifiedLocalCompositionError::WrongLifecycle(
@@ -2992,7 +3113,7 @@ pub(crate) fn reopen_verified_local(
     };
     let reopened_verified = match reopened.current().record.lifecycle() {
         EnrollmentLifecycleV1::VerifiedLocal(verified)
-            if reopened.current().digest == expected_head && verified == &expected =>
+            if reopened.current().digest == expected_head && verified == expected =>
         {
             verified
         }
@@ -3831,6 +3952,78 @@ pub(crate) fn activate_verified_local_record(
     activate_verified_local_record_at_cut(root, evidence, session_id, proofs, CommitCut::None)
 }
 
+pub(crate) fn activate_verified_local_record_with_retained_validation(
+    root: &EnrollmentApplicationRoot,
+    validation: &RetainedVerifiedLocalValidation,
+    session_id: SessionId,
+) -> Result<CommittedLocalActive, VerifiedLocalCompositionError> {
+    let evidence = validation.evidence();
+    let binding = evidence.binding();
+    let already_active = {
+        let reader = match EnrollmentReader::open_existing(root, binding)? {
+            EnrollmentOpen::Absent => {
+                return Err(VerifiedLocalCompositionError::WrongLifecycle(
+                    "enrollment is absent",
+                ));
+            }
+            EnrollmentOpen::Present(reader) => reader,
+        };
+        match reader.current().record.lifecycle() {
+            EnrollmentLifecycleV1::VerifiedLocal(verified)
+                if reader.current().digest == evidence.enrollment_head()
+                    && verified == &validation.expected =>
+            {
+                false
+            }
+            EnrollmentLifecycleV1::LocalActive(_) => true,
+            EnrollmentLifecycleV1::VerifiedLocal(_) => {
+                return Err(VerifiedLocalCompositionError::StaleEvidence(
+                    "VerifiedLocal head changed after retained proof validation",
+                ));
+            }
+            _ => {
+                return Err(VerifiedLocalCompositionError::WrongLifecycle(
+                    "retained validation cannot activate this lifecycle",
+                ));
+            }
+        }
+    };
+    if !already_active {
+        let mut writer = match EnrollmentWriter::open_existing(root, binding)? {
+            EnrollmentOpen::Absent => {
+                return Err(VerifiedLocalCompositionError::WrongLifecycle(
+                    "enrollment disappeared during activation",
+                ));
+            }
+            EnrollmentOpen::Present(writer) => writer,
+        };
+        let current = writer.current().digest;
+        let anchor = match writer.current().record.lifecycle() {
+            EnrollmentLifecycleV1::VerifiedLocal(verified)
+                if current == evidence.enrollment_head() && verified == &validation.expected =>
+            {
+                LocalActiveAnchorV1::from_verified_local(verified, current)
+            }
+            _ => {
+                return Err(VerifiedLocalCompositionError::StaleEvidence(
+                    "enrollment head changed before retained activation commit",
+                ));
+            }
+        };
+        writer.transition(
+            current,
+            local_active_lifecycle(
+                writer.current().record.lifecycle(),
+                evidence.verification_digest(),
+                anchor,
+                LocalActiveHandoff::Unsafe { session_id },
+            ),
+        )?;
+        drop(writer);
+    }
+    reopen_local_active_record_against_evidence(root, evidence, session_id)
+}
+
 #[cfg(test)]
 pub(crate) fn activate_verified_local_record_at_cut_for_test(
     root: &EnrollmentApplicationRoot,
@@ -3963,6 +4156,15 @@ pub(crate) fn reopen_local_active_record(
             "freshly revalidated proofs do not reproduce the retained verification digest",
         ));
     }
+    reopen_local_active_record_against_evidence(root, evidence, session_id)
+}
+
+fn reopen_local_active_record_against_evidence(
+    root: &EnrollmentApplicationRoot,
+    evidence: &VerifiedLocalEvidence,
+    session_id: SessionId,
+) -> Result<CommittedLocalActive, VerifiedLocalCompositionError> {
+    let binding = &evidence.binding;
     let reader = match EnrollmentReader::open_existing(root, binding)? {
         EnrollmentOpen::Absent => {
             return Err(VerifiedLocalCompositionError::WrongLifecycle(
@@ -4938,9 +5140,28 @@ fn freshly_validate_verified_local(
         ));
     }
 
-    let authority = fresh_authority.binding();
+    verified_local_from_validated_proofs(
+        enrollment_binding,
+        preparation_id,
+        proofs,
+        &fresh_authority,
+        &fresh_backup,
+        &fresh_shadow,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verified_local_from_validated_proofs(
+    enrollment_binding: &EnrollmentBindingV1,
+    preparation_id: PreparationId,
+    proofs: &VerifiedLocalProofSet<'_>,
+    validated_authority: &InactiveBootstrapAcceptedAuthority,
+    validated_backup: &VerifiedSourceBackup,
+    validated_shadow: &VerifiedShadowProjection,
+) -> Result<VerifiedLocalV1, VerifiedLocalCompositionError> {
+    let authority = validated_authority.binding();
     let frontier = authority.accepted_frontier();
-    let aggregate = fresh_authority.publication().aggregate();
+    let aggregate = validated_authority.publication().aggregate();
     let bootstrap_batch_id = aggregate.parts().last().map(|part| part.batch_id());
     let bootstrap_terminal_part_id = authority
         .predecessor_terminal()
@@ -4953,9 +5174,9 @@ fn freshly_validate_verified_local(
     let proof_binding_digest = verified_local_proof_binding_digest(
         enrollment_binding,
         proofs,
-        &fresh_authority,
-        &fresh_backup,
-        &fresh_shadow,
+        validated_authority,
+        validated_backup,
+        validated_shadow,
         reference_policy_digest,
         bootstrap_batch_id,
     )?;
@@ -4965,12 +5186,12 @@ fn freshly_validate_verified_local(
         source_inventory_digest: ContentDigest::from_bytes(
             *source.inventory_description().sha256(),
         ),
-        source_file_count: fresh_shadow.file_count(),
-        source_chunk_count: fresh_shadow.chunk_count(),
-        source_total_bytes: fresh_shadow.total_bytes(),
-        backup_manifest: fresh_backup.manifest(),
-        backup_restore_proof: fresh_backup.restore_proof(),
-        backup_evidence_digest: fresh_backup.evidence_digest(),
+        source_file_count: validated_shadow.file_count(),
+        source_chunk_count: validated_shadow.chunk_count(),
+        source_total_bytes: validated_shadow.total_bytes(),
+        backup_manifest: validated_backup.manifest(),
+        backup_restore_proof: validated_backup.restore_proof(),
+        backup_evidence_digest: validated_backup.evidence_digest(),
         bootstrap_import_id: ContentDigest::from_bytes(*authority.import_id().as_bytes()),
         bootstrap_part_count: authority.part_count(),
         bootstrap_terminal_part_id,
@@ -4982,16 +5203,16 @@ fn freshly_validate_verified_local(
             history_root: authority.history_root(),
         },
         accepted_history_record_count: authority.cold_record_count(),
-        catalog_row_count: fresh_shadow.catalog_binding().catalog_rows(),
+        catalog_row_count: validated_shadow.catalog_binding().catalog_rows(),
         sqlite_accepted_batch_count: proofs.sqlite_projection.accepted_batch_count(),
         sqlite_semantic_projection_digest: proofs.sqlite_projection.semantic_projection_digest(),
         sqlite_materialized_row_digest: proofs.sqlite_projection.materialized_row_digest(),
-        staged_projection_manifest: fresh_shadow.manifest(),
-        staged_projection_proof: fresh_shadow.proof(),
-        staged_file_count: fresh_shadow.staged_file_count(),
-        staged_total_bytes: fresh_shadow.staged_total_bytes(),
-        byte_compare_digest: fresh_shadow.staged_inventory_digest(),
-        shadow_evidence_digest: fresh_shadow.evidence_digest(),
+        staged_projection_manifest: validated_shadow.manifest(),
+        staged_projection_proof: validated_shadow.proof(),
+        staged_file_count: validated_shadow.staged_file_count(),
+        staged_total_bytes: validated_shadow.staged_total_bytes(),
+        byte_compare_digest: validated_shadow.staged_inventory_digest(),
+        shadow_evidence_digest: validated_shadow.evidence_digest(),
         proof_binding_digest,
     };
     verified.validate_fields()?;

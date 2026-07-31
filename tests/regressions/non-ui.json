@@ -1337,7 +1337,79 @@
         "scenario": "sync.sparse-v2-explicit-app-authority-vertical-slice",
         "failBefore": "source-proven"
       },
-      "notes": "The app persists stable caller-owned activation identities only after every tracked legacy Graph lease drains, while graph refresh and migration share the same transition lock, then publishes exactly one sparse actor or a visible retryable/blocked binding. The recursive root watcher closes its installation interval with one full reconciliation, keeps nested and case-variant Markdown/Org events incremental, and ignores explicit unmanaged file events. The journey activates a pre-populated nested Unicode graph without rewriting its bytes, confirms exact bootstrap receipts, authors and queries through the exact adjacent-tagged actor wire, imports an external edit through the watcher queue, reaches Safe shutdown, exposes stopped runtime as retryable, reopens authenticated LocalActive state, and proves legacy routes remain refused. Focused core cuts prove one-time receipt confirmation resumes before actor publication and a later missing private completion blocks reconciliation without changing externally edited graph bytes."
+      "notes": "The app persists stable caller-owned activation identities only after every tracked legacy Graph lease drains, while graph refresh and migration share the same transition lock, then publishes exactly one sparse actor or a visible retryable/blocked binding. The recursive root watcher closes its installation interval with one full reconciliation, keeps nested and case-variant Markdown/Org events incremental, and ignores explicit unmanaged file events. The journey activates a pre-populated nested Unicode graph without rewriting its bytes, reopens its authenticated aggregate bootstrap baseline, authors and queries through the exact adjacent-tagged actor wire, imports an external edit through the watcher queue, reaches Safe shutdown, exposes stopped runtime as retryable, reopens authenticated LocalActive state, and proves legacy routes remain refused. Focused core cuts prove aggregate promotion resumes before actor publication and later missing or corrupt private baseline authority blocks reconciliation without changing externally edited graph bytes."
+    },
+    {
+      "id": "REG-SYNC-SPARSE-V2-AGGREGATE-BOOTSTRAP-AUTHORITY-001",
+      "title": "Managed-storage activation retains one authenticated bootstrap baseline and does not publish one durable projection receipt per existing page",
+      "family": "sync-data-safety",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "core-native",
+      "status": "fixing",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/oplog/shadow_projection.rs",
+          "crates/tine-core/src/oplog/local_active.rs",
+          "crates/tine-core/src/oplog/reconciliation_scan.rs",
+          "crates/tine-core/src/sync_runtime.rs"
+        ],
+        "scenario": "sync.sparse-v2-aggregate-bootstrap-projection-authority",
+        "failBefore": "source-proven"
+      },
+      "notes": "The accepted bootstrap already publishes byte-identical per-path projection evidence in one immutable shadow manifest, but the current activation prototype replays the ordinary durable projection protocol once per page before opening reconciliation. The replacement must durably bind and freshly reopen that exact publication, build one bounded manifest locator pass, use an ordinary authenticated receipt when one exists and otherwise use the exact bootstrap entry only at its bound page/path/frontier, and keep untouched Markdown byte-exact. Activation creates zero ordinary bootstrap receipts; a later real projection or accepted import creates the ordinary receipt that supersedes the immutable fallback across restart. Corrupt, duplicate, missing, stale, or cross-workspace/endpoint/archive/graph evidence fails closed without live Markdown or SQLite authority fallback. Structural counters and the release scale receipt enforce constant durable activation commits, one aggregate scan, and bounded point reads independent of graph size."
+    },
+    {
+      "id": "REG-SYNC-SPARSE-V2-ACTIVATION-RESPONSIVENESS-001",
+      "title": "Managed-storage activation stays off the async command thread, reports bounded semantic progress, and completes with near-linear work",
+      "family": "sync-data-safety",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "native-app",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/sync_runtime.rs",
+          "src-tauri/src/sync_runtime.rs"
+        ],
+        "scenario": "sync.sparse-v2-activation-responsive-progress-scaled",
+        "failBefore": "proven"
+      },
+      "notes": "The source-boundary regression requires the complete graph transition, including lock ownership and exact-slot re-resolution, to run behind spawn_blocking without carrying borrowed Tauri state across await. Core fixtures retain exact graph bytes and crash-resume stages while recording ordered semantic phases. Two nested Unicode synthetic scales retain ordinary references, properties, and tasks; instrumentation records source files, bytes, blocks, and per-phase elapsed time and rejects plainly superlinear shared construction."
+    },
+    {
+      "id": "REG-SYNC-SPARSE-V2-COLD-JOIN-DISCOVERY-001",
+      "title": "A cold graph is joinable only from one complete canonical supported shared descriptor with no ambiguous v2 residue",
+      "family": "sync-data-safety",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "native-app",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/sync_runtime.rs",
+          "src-tauri/src/graph.rs",
+          "src-tauri/src/sync_runtime.rs"
+        ],
+        "scenario": "sync.sparse-v2-cold-shared-descriptor-classifier",
+        "failBefore": "proven"
+      },
+      "notes": "Absent v2 remains an ordinary Direct Markdown open. A real v2 directory whose sole top-level entry is a provider-capable shared namespace may be discovered only when its bounded enrollment namespace contains exactly the canonical supported descriptor. Partial, malformed, unsupported, symlinked, conflict-copy, sibling-descriptor, unsafe, unknown, or extra v2 evidence remains a hard refusal without creating a private binding, auto-joining, deleting, or reinterpreting bytes."
     },
     {
       "id": "REG-SYNC-SHARED-PROVIDER-R5-001",

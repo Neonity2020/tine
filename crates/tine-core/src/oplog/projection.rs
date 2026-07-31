@@ -1156,55 +1156,6 @@ pub fn write_projection_exact(
     Ok(ProjectionWrite { plan, completion })
 }
 
-/// Establish ordinary exact-path receipt authority for one graph file whose
-/// bytes were already admitted by the inactive-bootstrap proof.
-///
-/// The graph operation is read-only and refuses any byte or identity change.
-/// Its durable intent, reservation, completion, and completed-path index entry
-/// are the same authorities later projection and reconciliation use.
-pub(crate) fn confirm_existing_projection_exact(
-    graph: &Graph,
-    store: &ProjectionReceiptStore,
-    engine: &ShardedHotEngine,
-    page_id: PageId,
-) -> Result<(), ProjectionError> {
-    require_endpoint_authority(graph, store, engine)?;
-    retire_pending_projection_recovery(graph, store)?;
-    let authorization = engine.authorize_bootstrap_projection_confirmation(page_id)?;
-    let current = graph
-        .read_projection_input(&authorization.state().page.path)?
-        .ok_or_else(|| {
-            ProjectionError::Work(
-                "bootstrap projection disappeared before receipt confirmation".into(),
-            )
-        })?;
-    let plan = plan_projection(engine.workspace_id(), authorization.state(), Some(&current))?;
-    if plan.target() != current {
-        return Err(ProjectionError::Work(
-            "bootstrap projection does not round-trip to its accepted semantic state".into(),
-        ));
-    }
-    store.publish_intent(plan.intent(), plan.base().map(BaseBlob::bytes))?;
-    if store.load_completion(plan.intent())?.is_none() {
-        let attempts = store.load_attempt_reservations(plan.intent())?;
-        let mut authority = if attempts.is_empty() {
-            let reservation = store.reserve_attempt(plan.intent())?;
-            store.begin_mutation(plan.intent(), Some(&reservation))?
-        } else {
-            store.begin_mutation(plan.intent(), None)?
-        };
-        let proof = graph.confirm_existing_page_projection(
-            plan.intent().path().as_str(),
-            plan.target(),
-            &mut authority,
-        )?;
-        store.publish_completion(authority, plan.intent(), &proof)?;
-    }
-    retire_completed_projection_recovery(graph, store, plan.intent())?;
-    record_bootstrap_completed_path(store, engine, page_id, plan.intent())?;
-    Ok(())
-}
-
 /// Adopt an exact, semantically unchanged external representation as this
 /// endpoint's next projection/import baseline. This publishes only a
 /// device-local intent/base/completion and completed-path point; it does not
@@ -1466,7 +1417,7 @@ fn record_completed_path(
     page_id: PageId,
     intent: &ProjectionIntent,
 ) -> Result<(), ProjectionError> {
-    record_completed_path_with_authorization(store, engine, page_id, intent, false)
+    record_completed_path_with_authorization(store, engine, page_id, intent)
 }
 
 fn record_adopted_formatting_path(
@@ -1521,15 +1472,6 @@ fn record_adopted_formatting_path(
     Ok(())
 }
 
-fn record_bootstrap_completed_path(
-    store: &ProjectionReceiptStore,
-    engine: &ShardedHotEngine,
-    page_id: PageId,
-    intent: &ProjectionIntent,
-) -> Result<(), ProjectionError> {
-    record_completed_path_with_authorization(store, engine, page_id, intent, true)
-}
-
 fn record_completed_tombstone_path(
     store: &ProjectionReceiptStore,
     engine: &ShardedHotEngine,
@@ -1559,17 +1501,12 @@ fn record_completed_path_with_authorization(
     engine: &ShardedHotEngine,
     page_id: PageId,
     intent: &ProjectionIntent,
-    bootstrap_confirmation: bool,
 ) -> Result<(), ProjectionError> {
     // Revalidate the completed intent against the current accepted page before
     // exposing it as point-addressable authority. Historical recovery is
     // allowed to inspect an old frontier, but it must never replace the
     // authority for a newer accepted frontier or a reused path.
-    let current = if bootstrap_confirmation {
-        engine.authorize_bootstrap_projection_confirmation(page_id)?
-    } else {
-        engine.authorize_projection_write(page_id)?
-    };
+    let current = engine.authorize_projection_write(page_id)?;
     if current.state().page.path != *intent.path()
         || current.state().frontier != *intent.frontier()
         || current.state().claim_evidence != intent.claim_evidence()

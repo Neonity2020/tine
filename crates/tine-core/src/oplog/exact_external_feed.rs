@@ -898,7 +898,7 @@ impl ExactExternalFeedState {
                     .unwrap_or_else(|| ExecuteReconciliationError::Runtime(error.to_string())));
             }
         };
-        let (admission, engine, database, tail) = match window.parts() {
+        let (admission, engine, database, tail, bootstrap) = match window.parts_with_bootstrap() {
             Ok(parts) => parts,
             Err(error) => {
                 return Err(error
@@ -915,6 +915,7 @@ impl ExactExternalFeedState {
             engine,
             database,
             tail,
+            bootstrap: Some(bootstrap),
             baseline,
             observed_at,
         };
@@ -1403,6 +1404,8 @@ pub(crate) mod tests {
                 archive_root: &fixture.archive_root,
                 database_path: &self.database_path,
                 application_runtime_root: &self.runtime_root,
+                graph_root: &fixture.graph_root,
+                migration_backup_root: fixture.backup_roots.canonical_root(),
             }
         }
     }
@@ -2654,6 +2657,7 @@ pub(crate) mod tests {
                 receipt_root: self.fixture.receipts.root_path().to_path_buf(),
                 database_path: self.paths.database_path.clone(),
                 application_runtime_root: self.paths.runtime_root.path().to_path_buf(),
+                migration_backup_root: self.fixture.backup_roots.canonical_root().to_path_buf(),
                 provider_root: self.fixture.graph_root.join(".tine-sync/v2/shared"),
                 provider_journal_root: self
                     .paths

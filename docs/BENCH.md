@@ -367,6 +367,31 @@ does not measure or pass the cap. P1 must measure real envelope sizes, retained-
 memory, applier behavior, and visible backpressure before format freeze or
 activation; P2 must prove frontier-transaction and rebuild behavior.
 
+## Managed-storage activation scaling (2026-07-31)
+
+The focused native receipt used the repository test profile on the checkout's
+overlay filesystem at base `2794a909`, after removing one duplicate graph-sized
+post-commit proof reopen. Both corpora use nested Unicode paths and content plus
+ordinary page references, block properties, and TODO/DONE tasks. The command was:
+
+```bash
+rtk proxy cargo test -p tine-core activation_scaled_manual_phase_receipt -- --ignored --nocapture
+```
+
+| input | files | bytes | blocks | capture | prepare | publish/install | backup | SQLite | shadow/bytes | promote/receipts | baseline/actor | total |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| small | 35 | 26,926 | 258 | 49 ms | 1,556 ms | 1,579 ms | 34 ms | 974 ms | 9,551 ms | 20,188 ms | 1,323 ms | 35,260 ms |
+| large | 67 | 53,966 | 514 | 87 ms | 3,163 ms | 3,221 ms | 58 ms | 2,540 ms | 25,685 ms | 62,573 ms | 2,521 ms | 99,854 ms |
+
+The source-byte ratio is 2.004x and wall-time ratio is 2.832x, or 1.413x
+normalized growth. The retained regression ceiling is 1.5x normalized wall
+time plus a one-second fixed-cost allowance, which rejects quadratic growth at
+these approximately doubled scales while tolerating debug-build and scheduler
+noise. Exact graph bytes and all eight semantic phase transitions are checked
+at both scales. These are diagnostic debug-build figures, not a user-facing
+latency budget; the absolute time remains material and release-filesystem
+measurements are still required before treating it as representative.
+
 ## Deferred
 
 - **Tab-switch** and **per-keystroke typing** metrics — dropped from this pass

@@ -412,7 +412,7 @@ impl AppState {
 pub(crate) struct GraphContext<'a, R: Runtime = tauri::Wry> {
     pub(crate) state: State<'a, AppState>,
     pub(crate) window: WebviewWindow<R>,
-    binding_generation: Option<u64>,
+    pub(crate) binding_generation: Option<u64>,
 }
 
 impl<'r, 'de: 'r, R: Runtime> CommandArg<'de, R> for GraphContext<'r, R> {

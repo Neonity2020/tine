@@ -48,6 +48,7 @@ use super::resume_point::{
     ResumePointSet, RuntimeResumePointV2, MAX_RETAINED_RESUME_POINTS, RESUME_POINT_DIR,
 };
 use super::scratch_store::MAX_RETAINED_SCRATCH_RUNS;
+use super::shadow_projection::PromotedBootstrapProjectionBindingV1;
 use super::simulator::SimulatorBootstrapFixtureIngress;
 use super::sqlite::{ProjectionError, WorkspaceRuntimeProof};
 use super::watcher_queue::WatcherQuiescedProof;
@@ -105,7 +106,7 @@ const PROMOTED_RUNTIME_STATE_FILE: &str = "promoted-runtime.state";
 /// The first honest promoted-runtime state format. No earlier experimental
 /// bytes were ever published, and any other value is rejected rather than
 /// reinterpreted.
-pub(crate) const PROMOTED_RUNTIME_STATE_SCHEMA_VERSION: u32 = 1;
+pub(crate) const PROMOTED_RUNTIME_STATE_SCHEMA_VERSION: u32 = 2;
 const MAX_PROMOTED_RUNTIME_STATE_BYTES: u64 = 4096;
 const MAX_ENGINE_HISTORY_RECORD_BYTES: u64 = 1024 * 1024;
 const MAX_ENGINE_HISTORY_INDEX_BYTES: u64 = 2 * 1024 * 1024;
@@ -654,6 +655,9 @@ pub(crate) struct PromotedRuntimeStateV1 {
     pub(crate) enrollment_binding_digest: ContentDigest,
     /// The session that performed the one-time promotion.
     pub(crate) promotion_session_id: SessionId,
+    /// Exact immutable shadow publication retained as the bootstrap projection
+    /// fallback until individual pages acquire ordinary durable receipts.
+    pub(crate) bootstrap_projection: PromotedBootstrapProjectionBindingV1,
 }
 
 impl PromotedRuntimeStateV1 {
@@ -663,6 +667,11 @@ impl PromotedRuntimeStateV1 {
                 self.schema_version,
             ));
         }
+        self.bootstrap_projection.validate().map_err(|_| {
+            StoreError::PromotedRuntimeStateMismatch(
+                "bootstrap projection authority binding is invalid",
+            )
+        })?;
         let parts = u64::from(self.bootstrap.part_count());
         if self.bootstrap.final_frontier().accepted_count() != self.bootstrap.part_count() {
             return Err(StoreError::PromotedRuntimeStateMismatch(
@@ -978,6 +987,22 @@ pub(crate) fn create_discovery_promoted_archive_for_test(
         archive_resource_id: binding.archive_resource_id(),
         archive_control_binding: control_directory_identity(&store.capability)?.binding_digest(),
         bootstrap: BootstrapAggregateHistoryBindingV1::for_aggregate(&aggregate)?,
+        bootstrap_projection: PromotedBootstrapProjectionBindingV1::synthetic_for_object_store_test(
+            binding.workspace_id(),
+            binding.lineage_digest(),
+            binding.endpoint_id(),
+            binding.device_id(),
+            binding.graph_resource_id(),
+            binding.receipt_store_id(),
+            control_directory_identity(&store.capability)?.binding_digest(),
+            ContentDigest::from_bytes(*aggregate.publication_id().as_bytes()),
+            ContentDigest::from_bytes(*aggregate.aggregate_digest().as_bytes()),
+            active.bootstrap_import_id,
+            aggregate.parts().len() as u32,
+            active.anchor_accepted_frontier_state_digest,
+            active.anchor_history_generation,
+            active.anchor_history_index_root,
+        ),
         bootstrap_import_id,
         anchor_history_generation: active.anchor_history_generation,
         anchor_history_index_root: active.anchor_history_index_root,
@@ -7542,7 +7567,7 @@ fn open_engine_history_transition_lock(_root: &Dir) -> Result<fs::File, StoreErr
 }
 
 #[cfg(unix)]
-fn open_file_nofollow(dir: &Dir, path: &str) -> std::io::Result<fs::File> {
+pub(crate) fn open_file_nofollow(dir: &Dir, path: &str) -> std::io::Result<fs::File> {
     let path = CString::new(path)
         .map_err(|_| std::io::Error::new(ErrorKind::InvalidInput, "invalid stored filename"))?;
     // SAFETY: `path` is a live NUL-terminated string and `dir` is an opened
@@ -7564,7 +7589,7 @@ fn open_file_nofollow(dir: &Dir, path: &str) -> std::io::Result<fs::File> {
 }
 
 #[cfg(windows)]
-fn open_file_nofollow(dir: &Dir, path: &str) -> std::io::Result<fs::File> {
+pub(crate) fn open_file_nofollow(dir: &Dir, path: &str) -> std::io::Result<fs::File> {
     let mut options = OpenOptions::new();
     options.read(true).follow(FollowSymlinks::No);
     let file = dir.open_with(path, &options)?.into_std();
@@ -7573,7 +7598,7 @@ fn open_file_nofollow(dir: &Dir, path: &str) -> std::io::Result<fs::File> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn open_file_nofollow(_dir: &Dir, _path: &str) -> std::io::Result<fs::File> {
+pub(crate) fn open_file_nofollow(_dir: &Dir, _path: &str) -> std::io::Result<fs::File> {
     Err(std::io::Error::new(
         ErrorKind::Unsupported,
         "atomic no-follow reads are unsupported on this target",
@@ -9582,6 +9607,25 @@ mod history_index_tests {
                     .unwrap()
                     .binding_digest(),
                 bootstrap: BootstrapAggregateHistoryBindingV1::for_aggregate(&aggregate).unwrap(),
+                bootstrap_projection:
+                    PromotedBootstrapProjectionBindingV1::synthetic_for_object_store_test(
+                        workspace,
+                        lineage,
+                        binding.endpoint.endpoint_id,
+                        binding.endpoint.device_id,
+                        binding.endpoint.graph_resource_id,
+                        binding.receipt_store_id,
+                        control_directory_identity(&store.capability)
+                            .unwrap()
+                            .binding_digest(),
+                        ContentDigest::from_bytes(*aggregate.publication_id().as_bytes()),
+                        ContentDigest::from_bytes(*aggregate.aggregate_digest().as_bytes()),
+                        ContentDigest::from_bytes(*import_id.as_bytes()),
+                        aggregate.parts().len() as u32,
+                        ContentDigest::of(b"synthetic frontier"),
+                        0,
+                        EngineHistoryStore::empty_root(),
+                    ),
                 bootstrap_import_id: import_id,
                 anchor_history_generation: 0,
                 anchor_history_index_root: EngineHistoryStore::empty_root(),
@@ -11605,6 +11649,25 @@ mod resume_point_store_tests {
                     .unwrap()
                     .binding_digest(),
                 bootstrap: BootstrapAggregateHistoryBindingV1::for_aggregate(&aggregate).unwrap(),
+                bootstrap_projection:
+                    PromotedBootstrapProjectionBindingV1::synthetic_for_object_store_test(
+                        workspace,
+                        lineage,
+                        binding.endpoint.endpoint_id,
+                        binding.endpoint.device_id,
+                        graph_resource_id,
+                        binding.receipt_store_id,
+                        control_directory_identity(&archive_capability)
+                            .unwrap()
+                            .binding_digest(),
+                        ContentDigest::from_bytes(*aggregate.publication_id().as_bytes()),
+                        ContentDigest::from_bytes(*aggregate.aggregate_digest().as_bytes()),
+                        ContentDigest::from_bytes(*import_id.as_bytes()),
+                        aggregate.parts().len() as u32,
+                        ContentDigest::of(b"anchor frontier"),
+                        0,
+                        EngineHistoryStore::empty_root(),
+                    ),
                 bootstrap_import_id: import_id,
                 anchor_history_generation: 0,
                 anchor_history_index_root: EngineHistoryStore::empty_root(),

@@ -6,7 +6,8 @@
 
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use tauri::Manager;
 use tine_core::model::GraphMeta;
@@ -14,13 +15,13 @@ use tine_core::oplog::{
     DeviceId, DocumentId, LineageDigest, ProjectionEndpointId, SessionId, WorkspaceId,
 };
 use tine_core::sync_runtime::{
-    inspect_shared_enrollment, SyncAmbiguousEvidence, SyncLocalActivationIdentities,
-    SyncLocalActivationRequest, SyncLocalActivationResult, SyncLocalActivationStage,
-    SyncLocalActivationStatus, SyncNonActiveStage, SyncRuntimeComponent, SyncRuntimeHandle,
-    SyncRuntimeLifecycle, SyncRuntimeOpenRequest, SyncRuntimeOpenResult, SyncRuntimeOpenStatus,
-    SyncRuntimeRecovery, SyncRuntimeStatusSnapshot, SyncRuntimeTick,
-    SyncSharedEnrollmentDescriptor, SyncSharedPhase, SyncSharedRole, SyncShutdownOutcome,
-    SyncStorageProfile,
+    inspect_shared_enrollment_for_cold_discovery, SyncAmbiguousEvidence,
+    SyncLocalActivationIdentities, SyncLocalActivationPhase, SyncLocalActivationRequest,
+    SyncLocalActivationResult, SyncLocalActivationStage, SyncLocalActivationStatus,
+    SyncNonActiveStage, SyncRuntimeComponent, SyncRuntimeHandle, SyncRuntimeLifecycle,
+    SyncRuntimeOpenRequest, SyncRuntimeOpenResult, SyncRuntimeOpenStatus, SyncRuntimeRecovery,
+    SyncRuntimeStatusSnapshot, SyncRuntimeTick, SyncSharedEnrollmentDescriptor, SyncSharedPhase,
+    SyncSharedRole, SyncShutdownOutcome, SyncStorageProfile,
 };
 use uuid::Uuid;
 
@@ -108,6 +109,7 @@ impl SparseV2ActivationRecord {
             receipt_root: private.join("receipts"),
             database_path: private.join("projection/materialization.sqlite"),
             application_runtime_root: private.join("runtime"),
+            migration_backup_root: private.join("migration-backup"),
             provider_root: PathBuf::from(&self.graph_root).join(".tine-sync/v2/shared"),
             provider_journal_root: private.join("provider/device/journal"),
         })
@@ -735,8 +737,20 @@ impl SyncRuntimeFacade {
         app: &tauri::AppHandle,
         record: &SparseV2ActivationRecord,
     ) -> Result<SparseV2Binding, String> {
+        self.activate_record_with_progress(app, record, |_| {})
+    }
+
+    pub(crate) fn activate_record_with_progress(
+        &self,
+        app: &tauri::AppHandle,
+        record: &SparseV2ActivationRecord,
+        progress: impl FnMut(SyncLocalActivationPhase),
+    ) -> Result<SparseV2Binding, String> {
         Ok(SparseV2Binding::from_activation(
-            SyncRuntimeHandle::activate_or_resume_local(record.activation_request(app)?),
+            SyncRuntimeHandle::activate_or_resume_local_with_progress(
+                record.activation_request(app)?,
+                progress,
+            ),
         ))
     }
 
@@ -747,8 +761,71 @@ impl SyncRuntimeFacade {
 }
 
 const LEGACY_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+const ACTIVATION_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 pub(crate) const SPARSE_V2_NOT_ACTIVE: &str =
     "Tine-managed storage is not ready. Retry setup or return to Direct Markdown.";
+
+struct ActivationHeartbeat {
+    stop: mpsc::Sender<()>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl ActivationHeartbeat {
+    fn start(started: Instant, latest_phase: Arc<Mutex<Option<SyncLocalActivationPhase>>>) -> Self {
+        let (stop, stopped) = mpsc::channel();
+        let join = std::thread::spawn(move || loop {
+            match stopped.recv_timeout(ACTIVATION_HEARTBEAT_INTERVAL) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    let phase = latest_phase
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .map(SyncLocalActivationPhase::diagnostic_name)
+                        .unwrap_or("core bootstrap setup");
+                    crate::debug::diag(format!(
+                        "sparse-v2 activation heartbeat after {} ms: phase={phase}",
+                        started.elapsed().as_millis()
+                    ));
+                }
+            }
+        });
+        Self {
+            stop,
+            join: Some(join),
+        }
+    }
+}
+
+impl Drop for ActivationHeartbeat {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+fn activate_record_with_diagnostics(
+    facade: &SyncRuntimeFacade,
+    app: &tauri::AppHandle,
+    record: &SparseV2ActivationRecord,
+) -> Result<SparseV2Binding, String> {
+    let started = Instant::now();
+    let latest_phase = Arc::new(Mutex::new(None));
+    let heartbeat = ActivationHeartbeat::start(started, Arc::clone(&latest_phase));
+    let result = facade.activate_record_with_progress(app, record, |phase| {
+        *latest_phase
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(phase);
+        crate::debug::diag(format!(
+            "sparse-v2 activation phase after {} ms: {}",
+            started.elapsed().as_millis(),
+            phase.diagnostic_name()
+        ));
+    });
+    drop(heartbeat);
+    result
+}
 
 pub(crate) fn active_handle(
     slot: &crate::state::GraphSlot,
@@ -773,10 +850,16 @@ fn sparse_v2_status_for_slot(slot: &crate::state::GraphSlot) -> Result<SparseV2S
             }
             status
         }
-        None => match inspect_shared_enrollment(&slot.root_key.join(".tine-sync/v2/shared"))? {
-            Some(descriptor) => SparseV2StatusDto::joinable(slot.binding_generation, &descriptor),
-            None => SparseV2StatusDto::legacy(slot.binding_generation),
-        },
+        None => {
+            match inspect_shared_enrollment_for_cold_discovery(
+                &slot.root_key.join(".tine-sync/v2/shared"),
+            )? {
+                Some(descriptor) => {
+                    SparseV2StatusDto::joinable(slot.binding_generation, &descriptor)
+                }
+                None => SparseV2StatusDto::legacy(slot.binding_generation),
+            }
+        }
     })
 }
 
@@ -796,15 +879,30 @@ pub(crate) fn sparse_v2_status(
 /// retryable/blocked) is published as sparse authority; there is no writer
 /// fallback.
 #[tauri::command]
-pub(crate) fn activate_sparse_v2(
+pub(crate) async fn activate_sparse_v2(
     app: tauri::AppHandle,
     state: crate::state::GraphContext<'_>,
 ) -> Result<SparseV2StatusDto, String> {
-    let started = Instant::now();
     let label = state.window.label().to_string();
+    let binding_generation = state.binding_generation.ok_or("missing-graph-binding")?;
+    drop(state);
+    tauri::async_runtime::spawn_blocking(move || {
+        activate_sparse_v2_blocking(&app, &label, binding_generation)
+    })
+    .await
+    .map_err(|error| format!("Tine-managed storage setup worker failed: {error}"))?
+}
+
+fn activate_sparse_v2_blocking(
+    app: &tauri::AppHandle,
+    label: &str,
+    binding_generation: u64,
+) -> Result<SparseV2StatusDto, String> {
+    let started = Instant::now();
+    let state = app.state::<crate::state::AppState>();
     crate::debug::diag("sparse-v2 activation requested");
-    let _transition = state.state.graph_load.lock().unwrap();
-    let slot = crate::state::slot_for_context(&state)?;
+    let _transition = state.graph_load.lock().unwrap();
+    let slot = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))?;
     let root = slot.root_key.clone();
 
     if let Some(binding) = slot.sparse_binding() {
@@ -822,18 +920,15 @@ pub(crate) fn activate_sparse_v2(
             return result;
         }
         let record = state
-            .state
             .sync_runtime
-            .binding_record(&app, &root)?
+            .binding_record(app, &root)?
             .ok_or("Tine-managed storage setup is missing.")?;
         let graph_meta = SyncRuntimeFacade::graph_meta(&record);
         let core_started = Instant::now();
         let binding = match action {
-            SparseV2BindingAction::ReopenActive => {
-                state.state.sync_runtime.open_record(&app, &record)?
-            }
+            SparseV2BindingAction::ReopenActive => state.sync_runtime.open_record(app, &record)?,
             SparseV2BindingAction::ActivateOrResume => {
-                state.state.sync_runtime.activate_record(&app, &record)?
+                activate_record_with_diagnostics(&state.sync_runtime, app, &record)?
             }
             SparseV2BindingAction::ReturnRetained => {
                 unreachable!("retained bindings return before replacement")
@@ -848,12 +943,11 @@ pub(crate) fn activate_sparse_v2(
             binding, root, graph_meta,
         ));
         state
-            .state
             .graphs
             .write()
             .unwrap()
-            .bind(label, Arc::clone(&replacement))?;
-        crate::state::poke_watcher(&state.state);
+            .bind(label.to_string(), Arc::clone(&replacement))?;
+        crate::state::poke_watcher(&state);
         let result = sparse_v2_status_for_slot(&replacement);
         crate::debug::diag(format!(
             "sparse-v2 retained activation published after {} ms: {result:?}",
@@ -865,11 +959,9 @@ pub(crate) fn activate_sparse_v2(
     let graph = slot.legacy_graph()?;
     let graph_meta = graph.meta();
     drop(graph);
-    let record =
-        state
-            .state
-            .sync_runtime
-            .prepare_binding_record(&app, &root, graph_meta.clone())?;
+    let record = state
+        .sync_runtime
+        .prepare_binding_record(app, &root, graph_meta.clone())?;
     crate::debug::diag(format!(
         "sparse-v2 fresh activation prepared private binding after {} ms",
         started.elapsed().as_millis()
@@ -877,7 +969,7 @@ pub(crate) fn activate_sparse_v2(
 
     slot.begin_legacy_retirement()?;
     crate::debug::diag("sparse-v2 legacy authority retirement started");
-    let removed = state.state.graphs.write().unwrap().remove(&label);
+    let removed = state.graphs.write().unwrap().remove(label);
     if removed
         .as_ref()
         .is_none_or(|removed| removed.binding_generation != slot.binding_generation)
@@ -887,7 +979,7 @@ pub(crate) fn activate_sparse_v2(
             "The graph changed while Tine-managed storage was being set up. Retry setup.".into(),
         );
     }
-    crate::state::poke_watcher(&state.state);
+    crate::state::poke_watcher(&state);
 
     if let Err(error) = slot.wait_for_legacy_drain(LEGACY_DRAIN_TIMEOUT) {
         crate::debug::diag(format!(
@@ -896,12 +988,11 @@ pub(crate) fn activate_sparse_v2(
         ));
         slot.cancel_legacy_retirement()?;
         state
-            .state
             .graphs
             .write()
             .unwrap()
-            .bind(label, Arc::clone(&slot))?;
-        crate::state::poke_watcher(&state.state);
+            .bind(label.to_string(), Arc::clone(&slot))?;
+        crate::state::poke_watcher(&state);
         return Err(format!(
             "Tine-managed storage setup can be retried: {error}"
         ));
@@ -911,23 +1002,18 @@ pub(crate) fn activate_sparse_v2(
         started.elapsed().as_millis()
     ));
 
-    if let Err(error) = state
-        .state
-        .sync_runtime
-        .persist_binding_record(&app, &record)
-    {
+    if let Err(error) = state.sync_runtime.persist_binding_record(app, &record) {
         crate::debug::diag(format!(
             "sparse-v2 private binding persistence failed after {} ms: {error}",
             started.elapsed().as_millis()
         ));
         slot.cancel_legacy_retirement()?;
         state
-            .state
             .graphs
             .write()
             .unwrap()
-            .bind(label, Arc::clone(&slot))?;
-        crate::state::poke_watcher(&state.state);
+            .bind(label.to_string(), Arc::clone(&slot))?;
+        crate::state::poke_watcher(&state);
         return Err(error);
     }
     crate::debug::diag(format!(
@@ -936,7 +1022,7 @@ pub(crate) fn activate_sparse_v2(
     ));
 
     let core_started = Instant::now();
-    let binding = state.state.sync_runtime.activate_record(&app, &record)?;
+    let binding = activate_record_with_diagnostics(&state.sync_runtime, app, &record)?;
     crate::debug::diag(format!(
         "sparse-v2 core bootstrap completed after {} ms: availability={:?}",
         core_started.elapsed().as_millis(),
@@ -946,12 +1032,11 @@ pub(crate) fn activate_sparse_v2(
         binding, root, graph_meta,
     ));
     state
-        .state
         .graphs
         .write()
         .unwrap()
-        .bind(label, Arc::clone(&replacement))?;
-    crate::state::poke_watcher(&state.state);
+        .bind(label.to_string(), Arc::clone(&replacement))?;
+    crate::state::poke_watcher(&state);
     let result = sparse_v2_status_for_slot(&replacement);
     crate::debug::diag(format!(
         "sparse-v2 fresh activation published after {} ms: {result:?}",
@@ -1203,8 +1288,9 @@ pub(crate) fn join_sparse_v2_shared(
     let label = state.window.label().to_string();
     let _transition = state.state.graph_load.lock().unwrap();
     let slot = crate::state::slot_for_context(&state)?;
-    let descriptor = inspect_shared_enrollment(&slot.root_key.join(".tine-sync/v2/shared"))?
-        .ok_or("This graph does not yet contain sync data from another device.")?;
+    let descriptor =
+        inspect_shared_enrollment_for_cold_discovery(&slot.root_key.join(".tine-sync/v2/shared"))?
+            .ok_or("This graph does not yet contain sync data from another device.")?;
     if slot.sparse_binding().is_some() {
         let record = state
             .state
@@ -1465,6 +1551,44 @@ mod tests {
         SyncLocalMutationOutcome, SyncPageKind, SyncPageNameResolutionDto, SyncRuntimeQueryReply,
         SyncRuntimeQueryRequest, SyncSearchHitDto, SyncWatcherObservation,
     };
+
+    #[test]
+    fn activation_command_owns_the_complete_transition_inside_spawn_blocking() {
+        let source = include_str!("sync_runtime.rs");
+        let start = source
+            .find("pub(crate) async fn activate_sparse_v2")
+            .expect("activation command must be async");
+        let end = source[start..]
+            .find("#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]")
+            .map(|offset| start + offset)
+            .expect("activation command boundary");
+        let command = &source[start..end];
+        let blocking = command
+            .find("tauri::async_runtime::spawn_blocking(move ||")
+            .expect("activation transition must enter spawn_blocking");
+        let before_blocking = &command[..blocking];
+        assert!(
+            !before_blocking.contains("graph_load.lock")
+                && !before_blocking.contains("slot_for_context"),
+            "graph authority and the transition lock must be resolved inside the owned blocking operation"
+        );
+        assert!(
+            command[blocking..]
+                .contains("activate_sparse_v2_blocking(&app, &label, binding_generation)"),
+            "the blocking operation must re-resolve the exact graph generation from owned inputs"
+        );
+    }
+
+    #[test]
+    fn activation_heartbeat_stops_and_joins_without_waiting_for_the_interval() {
+        let started = Instant::now();
+        let heartbeat = ActivationHeartbeat::start(started, Arc::new(Mutex::new(None)));
+        drop(heartbeat);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "heartbeat shutdown waited for the ten-second reporting interval"
+        );
+    }
 
     struct RollbackFixture {
         root: PathBuf,
@@ -1959,6 +2083,7 @@ mod tests {
             receipt_root: root.join("missing-receipts"),
             database_path: root.join("missing.sqlite"),
             application_runtime_root: root.join("missing-runtime"),
+            migration_backup_root: root.join("missing-migration-backup"),
             provider_root: root.join("missing-provider"),
             provider_journal_root: root.join("missing-provider-journal/device/journal"),
         });
@@ -2149,6 +2274,7 @@ mod tests {
             receipt_root: request.receipt_root.clone(),
             database_path: request.database_path.clone(),
             application_runtime_root: request.application_runtime_root.clone(),
+            migration_backup_root: request.migration_backup_root.clone(),
             provider_root: request.provider_root.clone(),
             provider_journal_root: request.provider_journal_root.clone(),
         };

@@ -41,7 +41,7 @@ use crate::oplog::discovery::{
 use crate::oplog::enrollment::{
     activate_shared_initiator, activate_shared_joiner,
     begin_or_resume_local_activation_reservation, begin_or_resume_shadow_import,
-    compose_verified_local, inspect_local_activation_reservation_at,
+    compose_verified_local_retaining_validation, inspect_local_activation_reservation_at,
     inspect_shared_enrollment_descriptor, open_existing_enrollment_application_root,
     prepare_shared_enrollment, prepare_shared_join, EnrollmentApplicationRoot, EnrollmentBindingV1,
     EnrollmentDiscoveryHandoff, LocalActivationIdentityV1, LocalActivationReservationBindingV1,
@@ -57,10 +57,11 @@ use crate::oplog::import::{
     reopen_inactive_bootstrap_accepted_authority,
 };
 use crate::oplog::local_active::{
-    activate_verified_local, reopen_promoted_local_runtime_existing_projection,
-    seal_local_runtime_promotion, take_over_promoted_local_runtime_recovering_projection,
-    InactiveBootstrapRuntimeSession, LocalActiveAuthority, LocalActiveRuntime,
-    PromotedLocalRuntime, PromotedRuntimeOpen, RuntimeRecoveryState,
+    activate_verified_local_with_retained_validation,
+    reopen_promoted_local_runtime_existing_projection, seal_local_runtime_promotion,
+    take_over_promoted_local_runtime_recovering_projection, InactiveBootstrapRuntimeSession,
+    LocalActiveAuthority, LocalActiveRuntime, PromotedLocalRuntime, PromotedRuntimeOpen,
+    RuntimeRecoveryState,
 };
 use crate::oplog::migration_backup::{verify_migration_source_backup, MigrationBackupRoot};
 use crate::oplog::object_store::{
@@ -73,7 +74,7 @@ use crate::oplog::operational_coordinator::{
     LocalPublishedContinuation, OperationalCoordinator, OperationalPhase,
     ProviderArchiveContinuation, ProviderArchiveIngress,
 };
-use crate::oplog::projection::{confirm_existing_projection_exact, render_requested_page_document};
+use crate::oplog::projection::render_requested_page_document;
 use crate::oplog::projection_store::ProjectionReceiptStore;
 use crate::oplog::reconciliation_baseline::{
     BaselineTimestamp, ReconciliationBaseline, ReconciliationBaselineBinding,
@@ -83,9 +84,9 @@ use crate::oplog::shadow_projection::verify_inactive_bootstrap_shadow_projection
 #[cfg(test)]
 use crate::oplog::simulator::fail_next_pending_publication_marker_creation;
 use crate::oplog::simulator::{
-    inspect_shared_provider_descriptor, provider_transient_path, SharedProviderFrontierHeadV1,
-    SharedProviderManifestRecoveryLinkV1, SharedProviderObservation,
-    SharedProviderObservationCursor, SharedProviderPublicationCursor,
+    inspect_cold_shared_provider_descriptor, inspect_shared_provider_descriptor,
+    provider_transient_path, SharedProviderFrontierHeadV1, SharedProviderManifestRecoveryLinkV1,
+    SharedProviderObservation, SharedProviderObservationCursor, SharedProviderPublicationCursor,
     SharedProviderPublicationIntentV1, SharedProviderTransport, MAX_PROVIDER_RESCAN_ENTRIES,
     SHARED_ENROLLMENT_DESCRIPTOR_PATH, SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE,
     SHARED_PROVIDER_MANIFEST_RECOVERY_BLOBS_NAMESPACE,
@@ -150,10 +151,6 @@ pub const MAX_SYNC_EDITOR_REQUEST_BYTES: usize = MAX_LOCAL_MUTATION_TEXT_BYTES;
 /// for a portable block reference.
 pub const SYNC_APPLICATION_INTERNAL_BLOCK_PREFIX: &str = "sparse-v2:";
 const MAX_EDITOR_SETTLE_TURNS: usize = 64;
-const BOOTSTRAP_RECEIPT_MARKER_SCHEMA_VERSION: u32 = 1;
-const BOOTSTRAP_RECEIPT_MARKER_FILE: &str = "bootstrap-projection-receipts-v1.json";
-const MAX_BOOTSTRAP_RECEIPT_MARKER_BYTES: u64 = 4096;
-static BOOTSTRAP_RECEIPT_MARKER_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ProviderRecoveryCoverageRoot {
@@ -461,22 +458,6 @@ thread_local! {
     };
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct BootstrapReceiptMarker {
-    schema_version: u32,
-    enrollment_binding_digest: ContentDigest,
-}
-
-impl BootstrapReceiptMarker {
-    fn for_binding(binding: &EnrollmentBindingV1) -> Result<Self, String> {
-        Ok(Self {
-            schema_version: BOOTSTRAP_RECEIPT_MARKER_SCHEMA_VERSION,
-            enrollment_binding_digest: binding.binding_digest().map_err(display)?,
-        })
-    }
-}
-
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ActivationTestCut {
@@ -484,7 +465,6 @@ enum ActivationTestCut {
     AfterArchiveClaimBeforeEnrollmentHead,
     AfterShadowImport,
     AfterVerifiedLocal,
-    AfterBootstrapReceipt,
 }
 
 #[cfg(test)]
@@ -502,7 +482,6 @@ fn activation_cut(cut: &'static str) -> Result<(), String> {
             }
             "after_shadow_import" => ActivationTestCut::AfterShadowImport,
             "after_verified_local" => ActivationTestCut::AfterVerifiedLocal,
-            "after_bootstrap_receipt" => ActivationTestCut::AfterBootstrapReceipt,
             _ => return Ok(()),
         };
         if ACTIVATION_TEST_CUT.with(|pending| {
@@ -556,6 +535,7 @@ pub struct SyncRuntimeOpenRequest {
     pub receipt_root: PathBuf,
     pub database_path: PathBuf,
     pub application_runtime_root: PathBuf,
+    pub migration_backup_root: PathBuf,
     pub provider_root: PathBuf,
     pub provider_journal_root: PathBuf,
 }
@@ -641,6 +621,44 @@ pub fn inspect_shared_enrollment(
         .transpose()?
         .map(SyncSharedEnrollmentDescriptor::from_core)
         .transpose()
+}
+
+pub fn inspect_shared_enrollment_for_cold_discovery(
+    provider_root: &Path,
+) -> Result<Option<SyncSharedEnrollmentDescriptor>, String> {
+    inspect_cold_shared_provider_descriptor(provider_root)
+        .map_err(display)?
+        .map(|bytes| SharedEnrollmentDescriptorV1::decode(&bytes).map_err(display))
+        .transpose()?
+        .map(SyncSharedEnrollmentDescriptor::from_core)
+        .transpose()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SyncLocalActivationPhase {
+    SourceCapture,
+    BootstrapImportPreparation,
+    ImmutablePublicationInstall,
+    BackupProof,
+    SqliteOpenBuild,
+    ShadowReconstructionByteVerification,
+    PromotionReceiptConfirmation,
+    ReconciliationBaselineActorOpen,
+}
+
+impl SyncLocalActivationPhase {
+    pub const fn diagnostic_name(self) -> &'static str {
+        match self {
+            Self::SourceCapture => "source capture",
+            Self::BootstrapImportPreparation => "bootstrap import preparation",
+            Self::ImmutablePublicationInstall => "immutable publication/install",
+            Self::BackupProof => "backup proof",
+            Self::SqliteOpenBuild => "SQLite open/build",
+            Self::ShadowReconstructionByteVerification => "shadow reconstruction/byte verification",
+            Self::PromotionReceiptConfirmation => "promotion/aggregate authority confirmation",
+            Self::ReconciliationBaselineActorOpen => "reconciliation baseline and actor open",
+        }
+    }
 }
 
 /// Typed result of an explicit local activation/resume attempt.
@@ -1707,6 +1725,13 @@ impl SyncRuntimeHandle {
     pub fn activate_or_resume_local(
         request: SyncLocalActivationRequest,
     ) -> SyncLocalActivationResult {
+        Self::activate_or_resume_local_with_progress(request, |_| {})
+    }
+
+    pub fn activate_or_resume_local_with_progress(
+        request: SyncLocalActivationRequest,
+        mut progress: impl FnMut(SyncLocalActivationPhase),
+    ) -> SyncLocalActivationResult {
         let graph = match Graph::open_checked(&request.graph_root) {
             Ok(graph) => graph,
             Err(error) => {
@@ -1764,6 +1789,7 @@ impl SyncRuntimeHandle {
                 if !identities_match_binding(&request.identities, &advisory.binding) {
                     return activation_blocked("explicit_identity_binding_mismatch");
                 }
+                progress(SyncLocalActivationPhase::ReconciliationBaselineActorOpen);
                 if let Err(detail) =
                     ensure_reconciliation_baseline(&request, &graph, &advisory.binding)
                 {
@@ -1834,7 +1860,7 @@ impl SyncRuntimeHandle {
             _ => unreachable!("activation discovery branch already returned"),
         };
 
-        let result = activate_non_active_local(&request, &graph, existing_binding);
+        let result = activate_non_active_local(&request, &graph, existing_binding, &mut progress);
         match result {
             Ok(()) => activation_open_runtime(request),
             Err(detail) => {
@@ -2501,6 +2527,7 @@ fn activate_non_active_local(
     request: &SyncLocalActivationRequest,
     graph: &Graph,
     existing_binding: Option<EnrollmentBindingV1>,
+    progress: &mut dyn FnMut(SyncLocalActivationPhase),
 ) -> Result<(), String> {
     prepare_activation_private_paths(request)?;
     let enrollment = EnrollmentApplicationRoot::open_explicit_private(&request.enrollment_root)
@@ -2533,6 +2560,7 @@ fn activate_non_active_local(
 
     // Capture precedes every graph-local sparse archive write. The capture is
     // read-only and revalidated internally before bootstrap authoring.
+    progress(SyncLocalActivationPhase::SourceCapture);
     let capture = graph
         .capture_inactive_bootstrap_sources(&request.capture_root)
         .map_err(display)?;
@@ -2612,6 +2640,7 @@ fn activate_non_active_local(
     let authoring_capability = authoring_store
         .bootstrap_authoring_capability()
         .map_err(display)?;
+    progress(SyncLocalActivationPhase::BootstrapImportPreparation);
     let prepared = prepare_inactive_bootstrap_import(
         graph,
         capture,
@@ -2630,6 +2659,7 @@ fn activate_non_active_local(
         endpoint,
         receipt_store_id: receipts.store_id(),
     };
+    progress(SyncLocalActivationPhase::ImmutablePublicationInstall);
     let verified = publish_install_verify_inactive_bootstrap(
         &prepared,
         ObjectStore::open(&request.archive_root, binding.workspace_id()).map_err(display)?,
@@ -2642,11 +2672,13 @@ fn activate_non_active_local(
     )
     .map_err(display)?;
 
+    progress(SyncLocalActivationPhase::BackupProof);
     let backup_root =
         MigrationBackupRoot::open(&request.migration_backup_root, &request.graph_root)
             .map_err(display)?;
     let source_backup =
         verify_migration_source_backup(&backup_root, &prepared, &verified).map_err(display)?;
+    progress(SyncLocalActivationPhase::SqliteOpenBuild);
     let inactive = InactiveBootstrapRuntimeSession::open(
         &request.archive_root,
         binding.workspace_id(),
@@ -2655,6 +2687,7 @@ fn activate_non_active_local(
         &accepted_authority,
     )
     .map_err(display)?;
+    progress(SyncLocalActivationPhase::ShadowReconstructionByteVerification);
     let shadow = verify_inactive_bootstrap_shadow_projection(
         graph,
         &backup_root,
@@ -2677,15 +2710,20 @@ fn activate_non_active_local(
         sqlite_projection: inactive.sqlite_proof(),
         shadow_projection: &shadow,
     };
-    let verified_local =
-        compose_verified_local(&enrollment, binding.clone(), preparation_id, &proofs)
-            .map_err(display)?;
+    let verified_local = compose_verified_local_retaining_validation(
+        &enrollment,
+        binding.clone(),
+        preparation_id,
+        &proofs,
+    )
+    .map_err(display)?;
     activation_cut("after_verified_local")?;
+    progress(SyncLocalActivationPhase::PromotionReceiptConfirmation);
     let local_runtime = LocalActiveRuntime {
         engine: accepted_authority.accepted_engine(),
         projection: inactive.projection(),
     };
-    let mut authority = activate_verified_local(
+    let mut authority = activate_verified_local_with_retained_validation(
         &enrollment,
         verified_local,
         request.identities.session_id,
@@ -2704,6 +2742,8 @@ fn activate_non_active_local(
         archive_root: &request.archive_root,
         database_path: &request.database_path,
         application_runtime_root: &application_runtime_root,
+        graph_root: &request.graph_root,
+        migration_backup_root: &request.migration_backup_root,
     };
     let mut promoted = inactive
         .promote(sealed, &authority, &promoted_open)
@@ -2712,17 +2752,10 @@ fn activate_non_active_local(
             error.to_string()
         })?;
 
-    confirm_bootstrap_projection_receipts(
-        graph,
-        &receipts,
-        promoted.engine(),
-        &application_runtime_root,
-        &binding,
-    )?;
-
     // The actor will reopen this exact database. Creating or validating the
     // baseline before that handout makes reconciliation a proven prerequisite
     // of the retained public handle rather than a deferred first-tick action.
+    progress(SyncLocalActivationPhase::ReconciliationBaselineActorOpen);
     ensure_reconciliation_baseline_with_runtime(&application_runtime_root, graph, &binding)?;
     promoted
         .quiesce_and_mark_safe(&mut authority, graph)
@@ -2730,119 +2763,6 @@ fn activate_non_active_local(
     drop(promoted);
     drop(authority);
     Ok(())
-}
-
-fn confirm_bootstrap_projection_receipts(
-    graph: &Graph,
-    receipts: &ProjectionReceiptStore,
-    engine: &crate::oplog::ShardedHotEngine,
-    runtime_root: &ApplicationRuntimeRoot,
-    binding: &EnrollmentBindingV1,
-) -> Result<(), String> {
-    const PAGE_ROWS: usize = 32;
-    let marker = BootstrapReceiptMarker::for_binding(binding)?;
-    let marker_path = runtime_root.path().join(BOOTSTRAP_RECEIPT_MARKER_FILE);
-    if bootstrap_receipt_marker_matches(&marker_path, &marker)? {
-        return Ok(());
-    }
-    let binding = engine.current_path_catalog_binding().map_err(display)?;
-    let mut remaining = binding.catalog_rows();
-    let mut cursor = (remaining != 0)
-        .then(|| engine.begin_current_path_cursor())
-        .transpose()
-        .map_err(display)?;
-    while let Some(current) = cursor {
-        let page = engine
-            .current_path_cursor_page(current, PAGE_ROWS)
-            .map_err(display)?;
-        let (rows, next) = page.into_parts();
-        let row_count = u64::try_from(rows.len())
-            .map_err(|_| "bootstrap receipt page length exceeds u64".to_owned())?;
-        remaining = remaining.checked_sub(row_count).ok_or_else(|| {
-            "bootstrap receipt cursor exceeded authenticated row count".to_owned()
-        })?;
-        for row in rows {
-            let completed = engine
-                .projection_work_index()
-                .map_err(display)?
-                .completed_receipts_for_path(row.path())
-                .map_err(display)?;
-            if completed.is_empty() {
-                confirm_existing_projection_exact(graph, receipts, engine, row.page_id())
-                    .map_err(display)?;
-                activation_cut("after_bootstrap_receipt")?;
-            }
-        }
-        cursor = next;
-    }
-    if remaining != 0 {
-        return Err(format!(
-            "bootstrap receipt cursor ended with {remaining} authenticated rows missing"
-        ));
-    }
-    persist_bootstrap_receipt_marker(&marker_path, &marker)?;
-    Ok(())
-}
-
-fn bootstrap_receipt_marker_matches(
-    path: &Path,
-    expected: &BootstrapReceiptMarker,
-) -> Result<bool, String> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => {
-            return Err(format!(
-                "cannot inspect bootstrap receipt completion marker: {error}"
-            ));
-        }
-    };
-    if metadata.file_type().is_symlink()
-        || !metadata.is_file()
-        || metadata.len() > MAX_BOOTSTRAP_RECEIPT_MARKER_BYTES
-    {
-        return Err("bootstrap receipt completion marker has unsafe shape".into());
-    }
-    let bytes = fs::read(path)
-        .map_err(|error| format!("cannot read bootstrap receipt completion marker: {error}"))?;
-    let marker: BootstrapReceiptMarker = serde_json::from_slice(&bytes)
-        .map_err(|error| format!("bootstrap receipt completion marker is corrupt: {error}"))?;
-    let canonical = serde_json::to_vec(&marker)
-        .map_err(|error| format!("cannot encode bootstrap receipt completion marker: {error}"))?;
-    if canonical != bytes {
-        return Err("bootstrap receipt completion marker is not canonical".into());
-    }
-    if &marker != expected {
-        return Err("bootstrap receipt completion marker names another enrollment".into());
-    }
-    Ok(true)
-}
-
-fn persist_bootstrap_receipt_marker(
-    path: &Path,
-    marker: &BootstrapReceiptMarker,
-) -> Result<(), String> {
-    let encoded = serde_json::to_string(marker)
-        .map_err(|error| format!("cannot encode bootstrap receipt completion marker: {error}"))?;
-    crate::model::atomic_update(path, &BOOTSTRAP_RECEIPT_MARKER_LOCK, |content| {
-        if content != "{}\n" {
-            let existing: BootstrapReceiptMarker =
-                serde_json::from_str(content).map_err(|error| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("bootstrap receipt completion marker is corrupt: {error}"),
-                    )
-                })?;
-            if &existing != marker {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::AlreadyExists,
-                    "bootstrap receipt completion marker names another enrollment",
-                ));
-            }
-        }
-        Ok(encoded.clone())
-    })
-    .map_err(|error| format!("cannot persist bootstrap receipt completion marker: {error}"))
 }
 
 fn activation_open_runtime(request: SyncLocalActivationRequest) -> SyncLocalActivationResult {
@@ -2856,6 +2776,7 @@ fn activation_open_runtime(request: SyncLocalActivationRequest) -> SyncLocalActi
             receipt_root: request.receipt_root,
             database_path: request.database_path,
             application_runtime_root: request.application_runtime_root,
+            migration_backup_root: request.migration_backup_root,
             provider_root: request.provider_root,
             provider_journal_root: request.provider_journal_root,
         },
@@ -5068,6 +4989,8 @@ impl RuntimeActor {
             archive_root: &request.archive_root,
             database_path: &request.database_path,
             application_runtime_root: &application_runtime_root,
+            graph_root: &request.graph_root,
+            migration_backup_root: &request.migration_backup_root,
         };
         let unsafe_reopen = matches!(&advisory.handoff, EnrollmentDiscoveryHandoff::Unsafe { .. });
         let (authority, runtime) = match advisory.handoff {
@@ -5087,13 +5010,6 @@ impl RuntimeActor {
             }
         }
         .map_err(display)?;
-        confirm_bootstrap_projection_receipts(
-            &graph,
-            &receipts,
-            runtime.engine(),
-            &application_runtime_root,
-            &advisory.binding,
-        )?;
         let recovery = map_recovery(runtime.recovery());
         let feed =
             ExactExternalFeedState::open(&graph, &receipts, &runtime, baseline).map_err(display)?;
@@ -11212,6 +11128,7 @@ mod tests {
                 receipt_root: root.join("receipts"),
                 database_path: root.join("projection.sqlite"),
                 application_runtime_root: root.join("application-runtime"),
+                migration_backup_root: root.join("migration-backup"),
                 provider_root: root.join("graph/.tine-sync/v2/shared"),
                 provider_journal_root: root.join("application-runtime/provider/device/journal"),
             },
@@ -16065,6 +15982,32 @@ mod tests {
                 request,
             }
         }
+
+        fn scaled(label: &str, seed: u128, additional_pages: usize) -> Self {
+            let fixture = Self::nested_unicode(label, seed);
+            for page in 0..additional_pages {
+                let directory = fixture
+                    .graph_root
+                    .join(format!("notes/規模/{}/深い", page % 8));
+                fs::create_dir_all(&directory).unwrap();
+                let mut content =
+                    format!("title:: Synthetic {page}\nalias:: Scale Alias {page}\n\n");
+                for block in 0..10 {
+                    content.push_str(&format!(
+                        "- {} task {page}-{block} references [[Synthetic {}]] and #[[scale-tag]]\n  priority:: {}\n  owner:: [[Team {block}]]\n",
+                        if block % 2 == 0 { "TODO" } else { "DONE" },
+                        page.saturating_sub(1),
+                        if block % 3 == 0 { "A" } else { "B" },
+                    ));
+                }
+                fs::write(
+                    directory.join(format!("P\u{00e1}gina-{page}-\u{8a08}\u{753b}.md")),
+                    content.as_bytes(),
+                )
+                .unwrap();
+            }
+            fixture
+        }
     }
 
     impl Drop for ActivationFixture {
@@ -16268,6 +16211,7 @@ mod tests {
             receipt_root: request.receipt_root.clone(),
             database_path: request.database_path.clone(),
             application_runtime_root: request.application_runtime_root.clone(),
+            migration_backup_root: request.migration_backup_root.clone(),
             provider_root: request.provider_root.clone(),
             provider_journal_root: request.provider_journal_root.clone(),
         }
@@ -17120,6 +17064,70 @@ mod tests {
         let handle = active.handle.expect("fixture LocalActive");
         drive_initial_feed(&handle);
         handle.prepare_shared().expect("fixture SharedActive")
+    }
+
+    #[test]
+    fn cold_shared_descriptor_discovery_requires_one_canonical_supported_regular_file() {
+        let fixture = ActivationFixture::nested_unicode("cold-conflict-control", 0xa185);
+        let descriptor = activate_and_prepare_shared(&fixture);
+        let enrollment = fixture.request.provider_root.join("outbox/enrollment");
+        let canonical = enrollment.join("shared-enrollment-v1.json");
+        assert_eq!(
+            inspect_shared_enrollment_for_cold_discovery(&fixture.request.provider_root)
+                .unwrap()
+                .unwrap(),
+            descriptor
+        );
+
+        fs::write(
+            enrollment.join("shared-enrollment-v1.sync-conflict-20260731-120000-ABCDEFG.json"),
+            &descriptor.encoded,
+        )
+        .unwrap();
+
+        assert!(
+            inspect_shared_enrollment_for_cold_discovery(&fixture.request.provider_root).is_err(),
+            "the plain canonical-path inspection misses sibling conflict evidence and must not be used for cold discovery"
+        );
+        fs::remove_file(
+            enrollment.join("shared-enrollment-v1.sync-conflict-20260731-120000-ABCDEFG.json"),
+        )
+        .unwrap();
+
+        fs::write(&canonical, b"{").unwrap();
+        assert!(
+            inspect_shared_enrollment_for_cold_discovery(&fixture.request.provider_root).is_err()
+        );
+        fs::write(&canonical, &descriptor.encoded).unwrap();
+
+        let mut unsupported: serde_json::Value =
+            serde_json::from_slice(&descriptor.encoded).unwrap();
+        let object = unsupported.as_object_mut().unwrap();
+        let schema = if object.contains_key("schema_version") {
+            object.get_mut("schema_version")
+        } else {
+            object.get_mut("schemaVersion")
+        }
+        .expect("shared descriptor schema field");
+        *schema = serde_json::Value::from(u64::MAX);
+        fs::write(&canonical, serde_json::to_vec(&unsupported).unwrap()).unwrap();
+        assert!(
+            inspect_shared_enrollment_for_cold_discovery(&fixture.request.provider_root).is_err()
+        );
+        fs::write(&canonical, &descriptor.encoded).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let target = fixture.root.join("descriptor-target");
+            fs::write(&target, &descriptor.encoded).unwrap();
+            fs::remove_file(&canonical).unwrap();
+            symlink(&target, &canonical).unwrap();
+            assert!(
+                inspect_shared_enrollment_for_cold_discovery(&fixture.request.provider_root)
+                    .is_err()
+            );
+        }
     }
 
     fn settle_shared_provider(handle: &SyncRuntimeHandle) {
@@ -22971,6 +22979,163 @@ mod tests {
         files
     }
 
+    #[derive(Debug)]
+    struct ActivationScaleReceipt {
+        source_files: usize,
+        source_bytes: usize,
+        blocks: usize,
+        total_ms: u128,
+        phase_ms: Vec<(SyncLocalActivationPhase, u128)>,
+    }
+
+    fn activation_source_counts(root: &Path) -> (usize, usize, usize) {
+        let sources = user_graph_bytes(root);
+        sources
+            .iter()
+            .filter(|(path, _)| {
+                matches!(
+                    Path::new(path.as_str())
+                        .extension()
+                        .and_then(|value| value.to_str()),
+                    Some("md" | "markdown" | "org")
+                )
+            })
+            .map(|(_, source)| source)
+            .fold(
+                (0_usize, 0_usize, 0_usize),
+                |(files, bytes, blocks), source| {
+                    (
+                        files + 1,
+                        bytes + source.len(),
+                        blocks
+                            + source
+                                .split(|byte| *byte == b'\n')
+                                .filter(|line| {
+                                    line.starts_with(b"- ")
+                                        || line.starts_with(b"* ")
+                                        || line.starts_with(b"** ")
+                                })
+                                .count(),
+                    )
+                },
+            )
+    }
+
+    fn activate_with_scale_receipt(fixture: &ActivationFixture) -> ActivationScaleReceipt {
+        let (source_files, source_bytes, blocks) = activation_source_counts(&fixture.graph_root);
+        let before = user_graph_bytes(&fixture.graph_root);
+        let started = std::time::Instant::now();
+        let mut transitions = Vec::new();
+        let activated = SyncRuntimeHandle::activate_or_resume_local_with_progress(
+            fixture.request.clone(),
+            |phase| transitions.push((phase, started.elapsed())),
+        );
+        let total = started.elapsed();
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        assert_eq!(user_graph_bytes(&fixture.graph_root), before);
+        let expected = [
+            SyncLocalActivationPhase::SourceCapture,
+            SyncLocalActivationPhase::BootstrapImportPreparation,
+            SyncLocalActivationPhase::ImmutablePublicationInstall,
+            SyncLocalActivationPhase::BackupProof,
+            SyncLocalActivationPhase::SqliteOpenBuild,
+            SyncLocalActivationPhase::ShadowReconstructionByteVerification,
+            SyncLocalActivationPhase::PromotionReceiptConfirmation,
+            SyncLocalActivationPhase::ReconciliationBaselineActorOpen,
+        ];
+        assert_eq!(
+            transitions
+                .iter()
+                .map(|(phase, _)| *phase)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        let phase_ms = transitions
+            .iter()
+            .enumerate()
+            .map(|(index, (phase, at))| {
+                let end = transitions
+                    .get(index + 1)
+                    .map(|(_, next)| *next)
+                    .unwrap_or(total);
+                (*phase, end.saturating_sub(*at).as_millis())
+            })
+            .collect();
+        drop(activated.handle);
+        ActivationScaleReceipt {
+            source_files,
+            source_bytes,
+            blocks,
+            total_ms: total.as_millis(),
+            phase_ms,
+        }
+    }
+
+    fn assert_activation_near_linear(
+        small: &ActivationScaleReceipt,
+        large: &ActivationScaleReceipt,
+    ) {
+        // Permit at most 1.5x normalized wall time plus a one-second fixed-cost
+        // allowance. A quadratic implementation at the retained ~2x input
+        // scales fails this discriminator, while fsync and scheduler noise do
+        // not turn an otherwise linear debug-build receipt flaky.
+        let observed = 2_u128
+            .saturating_mul(large.total_ms)
+            .saturating_mul(small.source_bytes as u128);
+        let ceiling = 3_u128
+            .saturating_mul(small.total_ms.saturating_add(1_000))
+            .saturating_mul(large.source_bytes as u128);
+        assert!(
+            observed <= ceiling,
+            "scaled activation exceeded the near-linear normalized ceiling: small={small:?}, large={large:?}"
+        );
+    }
+
+    #[test]
+    fn activation_progress_is_ordered_exact_byte_and_structurally_near_linear() {
+        let small = ActivationFixture::scaled("scale-small", 0xa090, 4);
+        let large = ActivationFixture::scaled("scale-large", 0xa0a0, 8);
+        let small_receipt = activate_with_scale_receipt(&small);
+        let large_receipt = activate_with_scale_receipt(&large);
+        eprintln!("activation scale small: {small_receipt:?}");
+        eprintln!("activation scale large: {large_receipt:?}");
+        assert_eq!(large_receipt.source_files, small_receipt.source_files + 4);
+        assert!(large_receipt.source_bytes > small_receipt.source_bytes);
+        assert!(large_receipt.blocks > small_receipt.blocks);
+        assert_eq!(small_receipt.phase_ms.len(), 8);
+        assert_eq!(large_receipt.phase_ms.len(), 8);
+        assert_activation_near_linear(&small_receipt, &large_receipt);
+    }
+
+    #[test]
+    #[ignore = "manual release 1,000/10,000-page activation timing receipt"]
+    fn activation_scaled_manual_phase_receipt() {
+        let small = ActivationFixture::scaled("manual-scale-small", 0xa0b0, 997);
+        let large = ActivationFixture::scaled("manual-scale-large", 0xa0c0, 9_997);
+        let small_receipt = activate_with_scale_receipt(&small);
+        let large_receipt = activate_with_scale_receipt(&large);
+        eprintln!("activation manual scale small: {small_receipt:?}");
+        eprintln!("activation manual scale large: {large_receipt:?}");
+        assert_eq!(small_receipt.source_files, 1_000);
+        assert_eq!(large_receipt.source_files, 10_000);
+        assert!(large_receipt.blocks >= 99_000);
+        assert!(
+            large_receipt.total_ms
+                <= small_receipt.total_ms.saturating_mul(15).saturating_add(500),
+            "10,000-page activation violated the two-scale ceiling: small={small_receipt:?}, large={large_receipt:?}"
+        );
+        let cold_started = std::time::Instant::now();
+        let reopened = SyncRuntimeHandle::open(reopen_request(&large.request));
+        assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
+        let cold_ms = cold_started.elapsed().as_millis();
+        eprintln!("activation manual cold reopen ms: {cold_ms}");
+        assert!(
+            large_receipt.total_ms.saturating_add(cold_ms) < 10_000,
+            "release activation plus cold reopen exceeded 10 seconds"
+        );
+        drop(reopened.handle);
+    }
+
     fn tree_has_file_named(root: &Path, name: &str) -> bool {
         let mut pending = vec![root.to_path_buf()];
         while let Some(directory) = pending.pop() {
@@ -23013,10 +23178,319 @@ mod tests {
         assert_eq!(
             user_graph_bytes(&fixture.graph_root),
             before,
-            "bootstrap receipt confirmation and the initial exact feed must remain read-only"
+            "aggregate bootstrap authority confirmation and the initial exact feed must remain read-only"
         );
         assert!(matches!(
             handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
+    fn fresh_activation_retains_one_bootstrap_authority_and_zero_ordinary_page_receipts() {
+        let fixture = ActivationFixture::nested_unicode("aggregate-bootstrap-authority", 0xa180);
+        let before = user_graph_bytes(&fixture.graph_root);
+
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("activation must retain an actor");
+        assert_eq!(user_graph_bytes(&fixture.graph_root), before);
+
+        let graph = Graph::open_checked(&fixture.graph_root).unwrap();
+        let endpoint = ProjectionEndpointBinding {
+            endpoint_id: fixture.request.identities.endpoint_id,
+            device_id: fixture.request.identities.device_id,
+            graph_resource_id: graph.canonical_resource_id().unwrap(),
+        };
+        drop(graph);
+        let receipts = ProjectionReceiptStore::open_for_endpoint(
+            &fixture.request.receipt_root,
+            fixture.request.identities.workspace_id,
+            endpoint,
+        )
+        .unwrap();
+        let ordinary_catalog = receipts.validated_catalog().unwrap();
+        assert!(
+            ordinary_catalog.is_empty(),
+            "activation must create zero per-page intents, attempts, completions, or completed-path transitions: {ordinary_catalog:?}"
+        );
+        assert!(
+            !fixture
+                .request
+                .application_runtime_root
+                .join("bootstrap-projection-receipts-v1.json")
+                .exists(),
+            "aggregate authority replaces the eager-receipt completion marker"
+        );
+        drop(handle);
+    }
+
+    #[test]
+    fn uninterrupted_activation_reuses_complete_proof_but_fresh_reopen_revalidates() {
+        use crate::oplog::shadow_projection::{
+            aggregate_reopen_calls_for_test, complete_shadow_verification_calls_for_test,
+            reset_aggregate_reopen_calls_for_test,
+            reset_complete_shadow_verification_calls_for_test,
+        };
+
+        let fixture = ActivationFixture::nested_unicode("retained-complete-proof", 0xa1b0);
+        let workspace = fixture.request.identities.workspace_id;
+        reset_complete_shadow_verification_calls_for_test(workspace);
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        assert_eq!(
+            complete_shadow_verification_calls_for_test(workspace),
+            1,
+            "adjacent VerifiedLocal/LocalActive/promotion transitions reran full shadow proof"
+        );
+        let handle = activated.handle.unwrap();
+        drive_initial_feed(&handle);
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+
+        reset_aggregate_reopen_calls_for_test(workspace);
+        let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+        assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
+        assert_eq!(
+            aggregate_reopen_calls_for_test(workspace),
+            1,
+            "fresh-process promoted open must perform one complete aggregate publication validation"
+        );
+        drop(reopened.handle);
+    }
+
+    #[test]
+    fn first_external_change_publishes_an_ordinary_receipt_that_supersedes_after_restart() {
+        const PATH: &str = "Root.md";
+        let fixture = ActivationFixture::nested_unicode("bootstrap-supersession", 0xa1d0);
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("activation must retain an actor");
+        drive_initial_feed(&handle);
+
+        let graph = Graph::open_checked(&fixture.graph_root).unwrap();
+        let endpoint = ProjectionEndpointBinding {
+            endpoint_id: fixture.request.identities.endpoint_id,
+            device_id: fixture.request.identities.device_id,
+            graph_resource_id: graph.canonical_resource_id().unwrap(),
+        };
+        drop(graph);
+        let completion_count = || {
+            ProjectionReceiptStore::open_for_endpoint(
+                &fixture.request.receipt_root,
+                fixture.request.identities.workspace_id,
+                endpoint,
+            )
+            .unwrap()
+            .validated_catalog()
+            .unwrap()
+            .into_iter()
+            .filter(|entry| entry.completion.is_some())
+            .count()
+        };
+        assert_eq!(completion_count(), 0);
+
+        let edited = b"title:: Root logical\r\n\r\n- externally changed exact bytes\r\n";
+        fs::write(fixture.graph_root.join(PATH), edited).unwrap();
+        handle
+            .observe_watcher(vec![SyncWatcherObservation::managed_path(PATH).unwrap()])
+            .unwrap();
+        let settled = drain_until_settled(&handle);
+        assert!(
+            settled
+                .iter()
+                .any(|tick| matches!(tick, SyncRuntimeTick::AdmittedComplete { .. })),
+            "bootstrap-backed external edit did not complete: {settled:?}"
+        );
+        assert_eq!(fs::read(fixture.graph_root.join(PATH)).unwrap(), edited);
+        let after_import = completion_count();
+        assert_eq!(after_import, 1);
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+
+        let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+        assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
+        let reopened = reopened.handle.expect("promoted runtime must reopen");
+        drive_initial_feed(&reopened);
+        assert_eq!(completion_count(), after_import);
+        assert_eq!(fs::read(fixture.graph_root.join(PATH)).unwrap(), edited);
+        assert!(matches!(
+            reopened.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
+    fn first_local_edit_uses_bootstrap_then_ordinary_receipt_supersedes_after_restart() {
+        const PATH: &str =
+            "notes/層/\u{017e}lu\u{0165}ou\u{010d}k\u{00fd}/nested/D\u{00e9}j\u{00e0} 計画.md";
+        const FIRST_EDIT: &str = "Unicode café — edited locally";
+        const SECOND_EDIT: &str = "Unicode café — accepted after restart";
+
+        fn bootstrap_payload(root: &Path, managed_path: &str) -> PathBuf {
+            let suffix = Path::new("payload").join(managed_path);
+            let mut pending = vec![root.to_path_buf()];
+            while let Some(directory) = pending.pop() {
+                for entry in fs::read_dir(directory).unwrap().map(Result::unwrap) {
+                    if entry.file_type().unwrap().is_dir() {
+                        pending.push(entry.path());
+                    } else if entry.path().ends_with(&suffix) {
+                        return entry.path();
+                    }
+                }
+            }
+            panic!("bootstrap payload for {managed_path} was not retained");
+        }
+
+        let fixture = ActivationFixture::nested_unicode("local-bootstrap-supersession", 0xa1e0);
+        fs::write(
+            fixture.graph_root.join(PATH),
+            "- Unicode café\r\n".as_bytes(),
+        )
+        .unwrap();
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("activation must retain an actor");
+        drive_initial_feed(&handle);
+
+        let graph = Graph::open_checked(&fixture.graph_root).unwrap();
+        let endpoint = ProjectionEndpointBinding {
+            endpoint_id: fixture.request.identities.endpoint_id,
+            device_id: fixture.request.identities.device_id,
+            graph_resource_id: graph.canonical_resource_id().unwrap(),
+        };
+        drop(graph);
+        let completed_paths = || {
+            ProjectionReceiptStore::open_for_endpoint(
+                &fixture.request.receipt_root,
+                fixture.request.identities.workspace_id,
+                endpoint,
+            )
+            .unwrap()
+            .validated_catalog()
+            .unwrap()
+            .into_iter()
+            .filter_map(|entry| entry.completion.map(|_| entry.intent.path().clone()))
+            .collect::<Vec<_>>()
+        };
+        assert!(
+            completed_paths().is_empty(),
+            "activation must not synthesize ordinary page completions"
+        );
+
+        let pages = handle
+            .query(SyncRuntimeQueryRequest::ListPages {
+                page_kind: Some(SyncPageKind::Page),
+                limit: 16,
+            })
+            .unwrap();
+        let SyncRuntimeQueryReply::Pages(pages) = pages else {
+            panic!("page list returned the wrong reply variant");
+        };
+        let page_id = pages
+            .into_iter()
+            .find(|page| page.path == PATH)
+            .expect("nested Unicode bootstrap page must be materialized")
+            .page_id;
+        let mut page = match handle
+            .load_editor_page(SyncEditorLoadRequest {
+                page: SyncEditorPageSelector::PageId {
+                    page_id: page_id.clone(),
+                },
+            })
+            .unwrap()
+        {
+            SyncEditorLoadOutcome::Loaded { page } => page,
+            other => panic!("bootstrap page did not load for editing: {other:?}"),
+        };
+        assert_eq!(page.blocks[0].content, "Unicode café");
+        page.blocks[0].content = FIRST_EDIT.into();
+        let saved = handle
+            .save_editor_page(SyncEditorSaveRequest {
+                target: SyncEditorSaveTarget::Existing {
+                    page_id: page.page_id,
+                    revision: page.revision,
+                },
+                preamble: page.preamble,
+                blocks: page.blocks,
+            })
+            .unwrap();
+        assert!(
+            matches!(saved, SyncEditorSaveOutcome::Durable { .. }),
+            "bootstrap-backed local edit did not publish: {saved:?}"
+        );
+        assert_eq!(
+            fs::read(fixture.graph_root.join(PATH)).unwrap(),
+            format!("- {FIRST_EDIT}\r\n").as_bytes()
+        );
+        assert_eq!(
+            completed_paths(),
+            vec![ManagedPath::parse(PATH).unwrap()],
+            "the first real projection must complete only the edited page"
+        );
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+
+        let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+        assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
+        let reopened = reopened.handle.expect("promoted runtime must reopen");
+        drive_initial_feed(&reopened);
+        let mut page = match reopened
+            .load_editor_page(SyncEditorLoadRequest {
+                page: SyncEditorPageSelector::PageId { page_id },
+            })
+            .unwrap()
+        {
+            SyncEditorLoadOutcome::Loaded { page } => page,
+            other => panic!("locally edited page did not reopen: {other:?}"),
+        };
+        assert_eq!(page.blocks[0].content, FIRST_EDIT);
+
+        fs::write(
+            bootstrap_payload(&fixture.request.migration_backup_root, PATH),
+            b"corrupt aggregate fallback",
+        )
+        .unwrap();
+        page.blocks[0].content = SECOND_EDIT.into();
+        let saved = reopened
+            .save_editor_page(SyncEditorSaveRequest {
+                target: SyncEditorSaveTarget::Existing {
+                    page_id: page.page_id,
+                    revision: page.revision,
+                },
+                preamble: page.preamble,
+                blocks: page.blocks,
+            })
+            .unwrap();
+        match saved {
+            SyncEditorSaveOutcome::Durable { .. } => {}
+            SyncEditorSaveOutcome::Deferred {
+                state: SyncEditorDeferred::RetryableRetainedPublication { .. },
+                ..
+            } => {
+                settle_local_mutation(&reopened);
+            }
+            other => {
+                panic!(
+                    "restart did not select the ordinary receipt over aggregate fallback: {other:?}"
+                );
+            }
+        }
+        assert_eq!(
+            fs::read(fixture.graph_root.join(PATH)).unwrap(),
+            format!("- {SECOND_EDIT}\r\n").as_bytes()
+        );
+        let completed = completed_paths();
+        assert_eq!(completed.len(), 2);
+        assert!(completed.iter().all(|path| path.as_str() == PATH));
+        assert!(matches!(
+            reopened.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(_)
         ));
     }
@@ -23030,7 +23504,11 @@ mod tests {
         let fixture = ActivationFixture::nested_unicode(label, seed);
         let before = user_graph_bytes(&fixture.graph_root);
         fail_once_at_activation_cut(cut);
-        let interrupted = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        let mut interrupted_phases = Vec::new();
+        let interrupted = SyncRuntimeHandle::activate_or_resume_local_with_progress(
+            fixture.request.clone(),
+            |phase| interrupted_phases.push(phase),
+        );
         assert!(matches!(
             interrupted.status,
             SyncLocalActivationStatus::Retryable { durable_stage, .. }
@@ -23038,12 +23516,23 @@ mod tests {
         ));
         assert!(interrupted.handle.is_none());
         assert_eq!(user_graph_bytes(&fixture.graph_root), before);
+        assert!(interrupted_phases
+            .first()
+            .is_none_or(|phase| *phase == SyncLocalActivationPhase::SourceCapture));
 
-        let resumed = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        let mut resumed_phases = Vec::new();
+        let resumed = SyncRuntimeHandle::activate_or_resume_local_with_progress(
+            fixture.request.clone(),
+            |phase| resumed_phases.push(phase),
+        );
         assert_eq!(resumed.status, SyncLocalActivationStatus::Active);
         let handle = resumed
             .handle
             .expect("resumed activation must become active");
+        assert_eq!(
+            resumed_phases.last(),
+            Some(&SyncLocalActivationPhase::ReconciliationBaselineActorOpen)
+        );
         assert_eq!(user_graph_bytes(&fixture.graph_root), before);
         drop(handle);
     }
@@ -23087,157 +23576,6 @@ mod tests {
             SyncLocalActivationStage::VerifiedLocal,
             0xa500,
         );
-    }
-
-    #[test]
-    fn partial_bootstrap_receipt_confirmation_resumes_before_actor_publication() {
-        let fixture = ActivationFixture::nested_unicode("partial-bootstrap-receipts", 0xa550);
-        let before = user_graph_bytes(&fixture.graph_root);
-        fail_once_at_activation_cut(ActivationTestCut::AfterBootstrapReceipt);
-        let interrupted = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
-        assert!(matches!(
-            interrupted.status,
-            SyncLocalActivationStatus::Retryable {
-                durable_stage: SyncLocalActivationStage::LocalActive,
-                ..
-            }
-        ));
-        assert!(interrupted.handle.is_none());
-        assert_eq!(user_graph_bytes(&fixture.graph_root), before);
-
-        let resumed = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
-        assert_eq!(resumed.status, SyncLocalActivationStatus::Active);
-        let handle = resumed
-            .handle
-            .expect("actor startup must resume exact bootstrap receipt confirmation");
-        drive_initial_feed(&handle);
-        assert_eq!(user_graph_bytes(&fixture.graph_root), before);
-        assert!(matches!(
-            handle.clean_shutdown().unwrap(),
-            SyncShutdownOutcome::Safe(_)
-        ));
-    }
-
-    #[test]
-    fn bootstrap_marker_never_authorizes_reconciliation_with_a_missing_required_completion() {
-        let fixture = ActivationFixture::nested_unicode("missing-bootstrap-completion", 0xa575);
-        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
-        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
-        let handle = activated.handle.expect("activation must retain an actor");
-        drive_initial_feed(&handle);
-        assert!(matches!(
-            handle.clean_shutdown().unwrap(),
-            SyncShutdownOutcome::Safe(_)
-        ));
-
-        let marker = fixture
-            .request
-            .application_runtime_root
-            .join(BOOTSTRAP_RECEIPT_MARKER_FILE);
-        assert!(
-            marker.is_file(),
-            "the regression requires the O(1) bootstrap marker fast path"
-        );
-
-        let graph = Graph::open_checked(&fixture.graph_root).unwrap();
-        let endpoint = ProjectionEndpointBinding {
-            endpoint_id: fixture.request.identities.endpoint_id,
-            device_id: fixture.request.identities.device_id,
-            graph_resource_id: graph.canonical_resource_id().unwrap(),
-        };
-        drop(graph);
-        let receipts = ProjectionReceiptStore::open_for_endpoint(
-            &fixture.request.receipt_root,
-            fixture.request.identities.workspace_id,
-            endpoint,
-        )
-        .unwrap();
-        let catalog = receipts.validated_catalog().unwrap();
-        let required = catalog
-            .iter()
-            .find(|entry| entry.completion.is_some())
-            .expect("bootstrap must publish at least one required completion");
-        let target = fixture.graph_root.join(required.intent.path().as_str());
-        let completion = fixture
-            .request
-            .receipt_root
-            .join("completions")
-            .join(format!("{}.completion", required.intent.id().unwrap()));
-        assert!(completion.is_file());
-        fs::remove_file(&completion).unwrap();
-
-        let external = b"- external bytes must survive missing receipt evidence\n";
-        fs::write(&target, external).unwrap();
-        let graph_after_external_edit = user_graph_bytes(&fixture.graph_root);
-        #[cfg(unix)]
-        let target_identity_after_external_edit = {
-            use std::os::unix::fs::MetadataExt;
-            let metadata = fs::metadata(&target).unwrap();
-            (
-                metadata.dev(),
-                metadata.ino(),
-                metadata.mtime(),
-                metadata.mtime_nsec(),
-            )
-        };
-
-        let reopened = SyncRuntimeHandle::open(SyncRuntimeOpenRequest {
-            profile: SyncStorageProfile::ExperimentalLocal,
-            graph_root: fixture.request.graph_root.clone(),
-            archive_root: fixture.request.archive_root.clone(),
-            enrollment_root: fixture.request.enrollment_root.clone(),
-            receipt_root: fixture.request.receipt_root.clone(),
-            database_path: fixture.request.database_path.clone(),
-            application_runtime_root: fixture.request.application_runtime_root.clone(),
-            provider_root: fixture.request.provider_root.clone(),
-            provider_journal_root: fixture.request.provider_journal_root.clone(),
-        });
-        assert_eq!(
-            reopened.status,
-            SyncRuntimeOpenStatus::Active,
-            "the marker intentionally keeps actor open O(1)"
-        );
-        let reopened = reopened.handle.expect("active reopen must retain an actor");
-        let failure = (0..64).find_map(|_| match reopened.tick().unwrap() {
-            SyncRuntimeTick::Failed(detail)
-            | SyncRuntimeTick::Blocked(detail)
-            | SyncRuntimeTick::Terminal(detail) => Some(detail),
-            SyncRuntimeTick::Idle
-            | SyncRuntimeTick::Recovering
-            | SyncRuntimeTick::RetryFull
-            | SyncRuntimeTick::RecoveryBlocked(_)
-            | SyncRuntimeTick::LocalMutation(_) => None,
-            SyncRuntimeTick::AdmittedNoop { .. } | SyncRuntimeTick::AdmittedComplete { .. } => {
-                panic!("missing required completion was admitted")
-            }
-        });
-        let failure = failure.expect("missing completion must fail closed during reconciliation");
-        assert!(
-            failure.contains("reconciliation coordinator blocked"),
-            "missing receipt did not block at the reconciliation boundary: {failure}"
-        );
-        assert_eq!(fs::read(&target).unwrap(), external);
-        assert_eq!(
-            user_graph_bytes(&fixture.graph_root),
-            graph_after_external_edit,
-            "receipt failure must happen before any Tine graph write"
-        );
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            let metadata = fs::metadata(&target).unwrap();
-            assert_eq!(
-                (
-                    metadata.dev(),
-                    metadata.ino(),
-                    metadata.mtime(),
-                    metadata.mtime_nsec(),
-                ),
-                target_identity_after_external_edit,
-                "the guarded temp-and-rename writer must not run before receipt failure"
-            );
-        }
-        drop(reopened);
     }
 
     #[test]

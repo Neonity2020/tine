@@ -13,6 +13,7 @@ use super::{
         ProjectionExpectedPathHead, ProjectionExpectedPathReadBudget, ProjectionWorkError,
         ProjectionWorkIndex,
     },
+    shadow_projection::BootstrapProjectionAuthority,
     BlobDescription, CanonicalGraphResourceId, ContentDigest, ManagedPath, ManagedTextKind, PageId,
     PortablePathKey, ProjectionWorkTarget,
 };
@@ -748,6 +749,7 @@ pub(crate) trait AuthenticatedExpectedPathSource {
 pub(crate) struct JoinedAuthenticatedExpectedPathSource<'a> {
     engine: &'a ShardedHotEngine,
     projection: &'a ProjectionWorkIndex,
+    bootstrap: Option<&'a BootstrapProjectionAuthority>,
 }
 
 impl<'a> JoinedAuthenticatedExpectedPathSource<'a> {
@@ -755,7 +757,23 @@ impl<'a> JoinedAuthenticatedExpectedPathSource<'a> {
         engine: &'a ShardedHotEngine,
         projection: &'a ProjectionWorkIndex,
     ) -> Self {
-        Self { engine, projection }
+        Self {
+            engine,
+            projection,
+            bootstrap: None,
+        }
+    }
+
+    pub(crate) const fn with_bootstrap(
+        engine: &'a ShardedHotEngine,
+        projection: &'a ProjectionWorkIndex,
+        bootstrap: &'a BootstrapProjectionAuthority,
+    ) -> Self {
+        Self {
+            engine,
+            projection,
+            bootstrap: Some(bootstrap),
+        }
     }
 
     pub(crate) fn current_scan_identity(
@@ -808,7 +826,8 @@ impl<'a> JoinedAuthenticatedExpectedPathSource<'a> {
             accepted_frontier: engine.accepted_frontier(),
             projection_generation: projection.generation(),
         };
-        let source_commitment = joined_source_commitment(engine, projection, endpoint.device_id());
+        let source_commitment =
+            joined_source_commitment(engine, projection, endpoint.device_id(), self.bootstrap);
         Ok((engine, projection, binding, source_commitment))
     }
 
@@ -837,21 +856,51 @@ impl<'a> JoinedAuthenticatedExpectedPathSource<'a> {
         let receipt = self
             .projection
             .completed_receipt_at_expected_path_head_bounded(head, row.path(), budget)
-            .map_err(map_projection_expected_failure)?
+            .map_err(map_projection_expected_failure)?;
+        if let Some(receipt) = receipt {
+            if receipt.page_id() != row.page_id() || receipt.path() != row.path() {
+                return Err(ExpectedPathSourceFailure::Corrupt);
+            }
+            let ProjectionWorkTarget::Present(description) = receipt.target() else {
+                return Err(ExpectedPathSourceFailure::Missing);
+            };
+            return Ok(AuthenticatedExpectedPath {
+                page_id: row.page_id(),
+                path: row.path().clone(),
+                kind: row.kind(),
+                accepted_name_digest: row.accepted_name_digest(),
+                description,
+                owner_binding: joined_owner_binding(source_commitment, row.page_id(), row.path()),
+            });
+        }
+
+        let bootstrap = self.bootstrap.ok_or(ExpectedPathSourceFailure::Missing)?;
+        let baseline = bootstrap
+            .baseline_at(row.path())
+            .map_err(|_| ExpectedPathSourceFailure::Corrupt)?
             .ok_or(ExpectedPathSourceFailure::Missing)?;
-        if receipt.page_id() != row.page_id() || receipt.path() != row.path() {
+        let state = self
+            .engine
+            .materialize_page_for_projection(row.page_id())
+            .map_err(map_engine_expected_failure)?;
+        if baseline.intent().workspace_id() != self.engine.workspace_id()
+            || baseline.intent().page_id() != row.page_id()
+            || baseline.intent().path() != row.path()
+            || baseline.kind() != row.kind()
+            || state.page.page_id != row.page_id()
+            || state.page.path != *row.path()
+            || &state.frontier != baseline.intent().frontier()
+            || baseline.intent().target() != BlobDescription::of(baseline.source_bytes())
+        {
             return Err(ExpectedPathSourceFailure::Corrupt);
         }
-        let ProjectionWorkTarget::Present(description) = receipt.target() else {
-            return Err(ExpectedPathSourceFailure::Missing);
-        };
         Ok(AuthenticatedExpectedPath {
             page_id: row.page_id(),
             path: row.path().clone(),
             kind: row.kind(),
             accepted_name_digest: row.accepted_name_digest(),
-            description,
-            owner_binding: joined_owner_binding(source_commitment, row.page_id(), row.path()),
+            description: baseline.intent().target(),
+            owner_binding: bootstrap_owner_binding(source_commitment, baseline.owner_binding()),
         })
     }
 
@@ -1184,6 +1233,7 @@ fn joined_source_commitment(
     engine: CurrentPathCatalogBinding,
     projection: ProjectionExpectedPathHead,
     device_id: super::DeviceId,
+    bootstrap: Option<&BootstrapProjectionAuthority>,
 ) -> ContentDigest {
     let mut hasher = Sha256::new();
     hasher.update(b"tine/reconciliation/joined-expected-path-source/v2\0");
@@ -1203,6 +1253,24 @@ fn joined_source_commitment(
     hasher.update(projection.engine_history_generation().to_be_bytes());
     hasher.update(projection.engine_history_root().as_bytes());
     hasher.update(projection.completed_paths_root().as_bytes());
+    match bootstrap {
+        None => hasher.update([0]),
+        Some(bootstrap) => {
+            hasher.update([1]);
+            hasher.update(bootstrap.binding().authority_digest().as_bytes());
+        }
+    }
+    ContentDigest::from_bytes(hasher.finalize().into())
+}
+
+fn bootstrap_owner_binding(
+    source_commitment: ContentDigest,
+    bootstrap_owner_binding: ContentDigest,
+) -> ContentDigest {
+    let mut hasher = Sha256::new();
+    hasher.update(b"tine/reconciliation/bootstrap-expected-path-owner/v1\0");
+    hasher.update(source_commitment.as_bytes());
+    hasher.update(bootstrap_owner_binding.as_bytes());
     ContentDigest::from_bytes(hasher.finalize().into())
 }
 

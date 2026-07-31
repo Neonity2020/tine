@@ -21,6 +21,7 @@ use super::{
         ExpectedPathSourceFailure, GraphTextCandidateBinding, GraphTextScanCandidate,
         GraphTextScanDiagnosticKind, JoinedAuthenticatedExpectedPathSource, StableGraphTextScan,
     },
+    shadow_projection::BootstrapProjectionAuthority,
     ImportPlan, ManagedPath, ManagedTextKind, ProjectionReceiptStore, ShardedHotEngine,
     SqliteFrontier, TailOverlay,
 };
@@ -430,6 +431,7 @@ struct LiveCoordinatorCall<'a> {
     engine: &'a mut ShardedHotEngine,
     database: &'a mut SqliteFrontier,
     tail: &'a mut TailOverlay,
+    bootstrap: Option<&'a BootstrapProjectionAuthority>,
 }
 
 impl ReconciliationCoordinatorCall for LiveCoordinatorCall<'_> {
@@ -443,13 +445,14 @@ impl ReconciliationCoordinatorCall for LiveCoordinatorCall<'_> {
         CoordinatorDisposition<Self::Blocked, Self::FailedClosed>,
         OperationalCoordinatorError,
     > {
-        OperationalCoordinator::execute(
+        OperationalCoordinator::execute_with_bootstrap(
             self.admission,
             self.graph,
             self.receipts,
             self.engine,
             self.database,
             self.tail,
+            self.bootstrap,
             paths,
         )
         .map(|state| match state {
@@ -479,6 +482,7 @@ pub(crate) fn execute_stable_scan_import(
     engine: &mut ShardedHotEngine,
     database: &mut SqliteFrontier,
     tail: &mut TailOverlay,
+    bootstrap: Option<&BootstrapProjectionAuthority>,
 ) -> ReconciliationImportOutcome {
     let prepared = {
         let projection = match engine.projection_work_index() {
@@ -492,10 +496,13 @@ pub(crate) fn execute_stable_scan_import(
                 );
             }
         };
-        let authority = LiveReconciliationImportAuthority {
-            graph,
-            source: JoinedAuthenticatedExpectedPathSource::new(engine, projection),
-        };
+        let source = bootstrap.map_or_else(
+            || JoinedAuthenticatedExpectedPathSource::new(engine, projection),
+            |bootstrap| {
+                JoinedAuthenticatedExpectedPathSource::with_bootstrap(engine, projection, bootstrap)
+            },
+        );
+        let authority = LiveReconciliationImportAuthority { graph, source };
         prepare_stable_scan(&scan, &authority, PreparationLimits::default())
     };
     let paths = match prepared {
@@ -517,6 +524,7 @@ pub(crate) fn execute_stable_scan_import(
         engine,
         database,
         tail,
+        bootstrap,
     };
     match hand_off_once(&paths, &mut coordinator) {
         CoordinatorHandoff::Blocked(plan) => {

@@ -3228,6 +3228,19 @@ impl SharedProviderTransport {
 pub(crate) fn inspect_shared_provider_descriptor(
     provider_root: &Path,
 ) -> Result<Option<Vec<u8>>, ScenarioError> {
+    inspect_shared_provider_descriptor_with(provider_root, false)
+}
+
+pub(crate) fn inspect_cold_shared_provider_descriptor(
+    provider_root: &Path,
+) -> Result<Option<Vec<u8>>, ScenarioError> {
+    inspect_shared_provider_descriptor_with(provider_root, true)
+}
+
+fn inspect_shared_provider_descriptor_with(
+    provider_root: &Path,
+    require_sole_enrollment_entry: bool,
+) -> Result<Option<Vec<u8>>, ScenarioError> {
     let metadata = match fs::symlink_metadata(provider_root) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
@@ -3243,6 +3256,39 @@ pub(crate) fn inspect_shared_provider_descriptor(
     validate_provider_directory_owner(&root, "shared provider root")?;
     let outbox = open_provider_directory(&root, "outbox")?;
     let enrollment = open_provider_directory(&outbox, PROVIDER_ENROLLMENT_NAMESPACE)?;
+    if require_sole_enrollment_entry {
+        let mut entries = enrollment
+            .entries()
+            .map_err(|error| ScenarioError::Io(error.to_string()))?;
+        let entry = entries
+            .next()
+            .transpose()
+            .map_err(|error| ScenarioError::Io(error.to_string()))?
+            .ok_or_else(|| {
+                ScenarioError::UnsafeProviderEntry(
+                    "enrollment is missing its canonical descriptor".into(),
+                )
+            })?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| ScenarioError::UnsafeProviderEntry("enrollment/non-UTF-8".into()))?;
+        if name != "shared-enrollment-v1.json"
+            || !entry
+                .file_type()
+                .map_err(|error| ScenarioError::Io(error.to_string()))?
+                .is_file()
+            || entries
+                .next()
+                .transpose()
+                .map_err(|error| ScenarioError::Io(error.to_string()))?
+                .is_some()
+        {
+            return Err(ScenarioError::UnsafeProviderEntry(format!(
+                "{PROVIDER_ENROLLMENT_NAMESPACE}/{name}"
+            )));
+        }
+    }
     open_provider_regular_optional(
         &enrollment,
         "shared-enrollment-v1.json",

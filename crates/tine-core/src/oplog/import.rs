@@ -42,6 +42,7 @@ use super::object_store::{
     PreparedBootstrapHistoryRecordV1, StoreError, ValidatedBootstrapPublicationV1,
 };
 use super::receipt::ImportIdDerivation;
+use super::shadow_projection::BootstrapProjectionAuthority;
 use super::{
     plan_projection, AnnotatedIdentity, BatchId, BatchOrigin, BlobDescription, BlockId,
     BlockLocation, ContentDigest, CrdtPeerId, CurrentPageAtPath, DeviceId, DocumentId, ImportId,
@@ -3677,7 +3678,8 @@ struct InventoryPathFingerprint {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct AffectedReceiptEntry {
-    completed: ProjectionCompletedReceipt,
+    completed: Option<ProjectionCompletedReceipt>,
+    bootstrap_base: Option<ExactBytes>,
     intent: ProjectionIntent,
     completion: ProjectionCompletion,
 }
@@ -4171,6 +4173,16 @@ pub fn plan_affected_import(
     engine: &ShardedHotEngine,
     requested_paths: &[&str],
 ) -> ImportPlan {
+    plan_affected_import_with_bootstrap(graph, receipts, engine, None, requested_paths)
+}
+
+pub(crate) fn plan_affected_import_with_bootstrap(
+    graph: &Graph,
+    receipts: &ProjectionReceiptStore,
+    engine: &ShardedHotEngine,
+    bootstrap: Option<&BootstrapProjectionAuthority>,
+    requested_paths: &[&str],
+) -> ImportPlan {
     let mut instrumentation = ImportInstrumentation {
         requested_paths: requested_paths.len(),
         ..ImportInstrumentation::default()
@@ -4195,7 +4207,7 @@ pub fn plan_affected_import(
         }
     };
     let (catalog, catalog_authority) =
-        match capture_affected_catalog(receipts, engine, &paths, &mut instrumentation) {
+        match capture_affected_catalog(receipts, engine, bootstrap, &paths, &mut instrumentation) {
             Ok(snapshot) => snapshot,
             Err(block) => return blocked_authority_error(None, block, instrumentation),
         };
@@ -4237,7 +4249,7 @@ pub fn plan_affected_import(
             }
         };
     let (_, post_catalog_authority) =
-        match capture_affected_catalog(receipts, engine, &paths, &mut instrumentation) {
+        match capture_affected_catalog(receipts, engine, bootstrap, &paths, &mut instrumentation) {
             Ok(snapshot) => snapshot,
             Err(mut block) => {
                 block.reason = ImportBlockReason::StaleScope;
@@ -4412,6 +4424,7 @@ fn capture_inventory(
 fn capture_affected_catalog(
     receipts: &ProjectionReceiptStore,
     engine: &ShardedHotEngine,
+    bootstrap: Option<&BootstrapProjectionAuthority>,
     requested_paths: &[ManagedPath],
     instrumentation: &mut ImportInstrumentation,
 ) -> Result<(AffectedReceiptCatalog, CatalogAuthority), ImportBlock> {
@@ -4502,11 +4515,80 @@ fn capture_affected_catalog(
             hasher.update((completion_bytes.len() as u64).to_be_bytes());
             hasher.update(completion_bytes);
             entries.push(AffectedReceiptEntry {
-                completed,
+                completed: Some(completed),
+                bootstrap_base: None,
                 intent,
                 completion,
             });
             captured_entries = captured_entries.saturating_add(1);
+        }
+        if entries.is_empty() {
+            if let Some(bootstrap) = bootstrap {
+                let baseline = bootstrap.baseline_at(path).map_err(|error| {
+                    authority_block(
+                        ImportBlockReason::CorruptBase,
+                        Some(path),
+                        format!("aggregate bootstrap baseline lookup failed: {error}"),
+                    )
+                })?;
+                if let Some(baseline) = baseline {
+                    if captured_entries == MAX_IMPORT_CATALOG_ENTRIES {
+                        return Err(authority_block(
+                            ImportBlockReason::ResourceLimit,
+                            Some(path),
+                            "affected aggregate baseline entry budget exceeded",
+                        ));
+                    }
+                    let intent = baseline.intent().clone();
+                    let base = ExactBytes::from_description(
+                        baseline.source_bytes().to_vec(),
+                        BlobDescription::of(baseline.source_bytes()),
+                    );
+                    let completion =
+                        ProjectionCompletion::for_intent(&intent, baseline.source_bytes())
+                            .map_err(|error| {
+                                authority_block(
+                                    ImportBlockReason::CorruptBase,
+                                    Some(path),
+                                    format!("aggregate bootstrap completion is invalid: {error}"),
+                                )
+                            })?;
+                    let intent_bytes = intent.encode().map_err(|error| {
+                        authority_block(
+                            ImportBlockReason::CorruptBase,
+                            Some(path),
+                            error.to_string(),
+                        )
+                    })?;
+                    let completion_bytes = completion.encode().map_err(|error| {
+                        authority_block(
+                            ImportBlockReason::CorruptBase,
+                            Some(path),
+                            error.to_string(),
+                        )
+                    })?;
+                    instrumentation.catalog_entries =
+                        instrumentation.catalog_entries.saturating_add(1);
+                    instrumentation.catalog_bytes_hashed = instrumentation
+                        .catalog_bytes_hashed
+                        .saturating_add(intent_bytes.len() as u64)
+                        .saturating_add(completion_bytes.len() as u64)
+                        .saturating_add(32);
+                    hasher.update(b"aggregate-bootstrap-baseline\0");
+                    hasher.update(baseline.owner_binding().as_bytes());
+                    hasher.update((intent_bytes.len() as u64).to_be_bytes());
+                    hasher.update(intent_bytes);
+                    hasher.update((completion_bytes.len() as u64).to_be_bytes());
+                    hasher.update(completion_bytes);
+                    entries.push(AffectedReceiptEntry {
+                        completed: None,
+                        bootstrap_base: Some(base),
+                        intent,
+                        completion,
+                    });
+                    captured_entries = captured_entries.saturating_add(1);
+                }
+            }
         }
         catalog.by_path.insert(path.clone(), entries);
     }
@@ -4611,9 +4693,11 @@ fn capture_import_scope(
                         || entry.intent.path() != path
                         || entry.intent.frontier() != completed.frontier()
                         || entry.intent.target() != BlobDescription::of(&[])
-                        || entry.completed.page_id() != completed.page_id()
-                        || entry.completed.frontier() != completed.frontier()
-                        || entry.completed.target() != super::ProjectionWorkTarget::Absent
+                        || entry.completed.as_ref().is_none_or(|entry| {
+                            entry.page_id() != completed.page_id()
+                                || entry.frontier() != completed.frontier()
+                                || entry.target() != super::ProjectionWorkTarget::Absent
+                        })
                     {
                         continue;
                     }
@@ -4756,13 +4840,16 @@ fn capture_import_scope(
                     IMPORT_REPLAY_LIMITS,
                     path,
                 )?;
-                let base = receipts.load_base(&entry.intent).map_err(|error| {
-                    authority_block(
-                        ImportBlockReason::CorruptBase,
-                        Some(path),
-                        format!("canonical base evidence is unavailable: {error}"),
-                    )
-                })?;
+                let base = match &entry.bootstrap_base {
+                    Some(base) => Some(super::BaseBlob::new(base.bytes().to_vec())),
+                    None => receipts.load_base(&entry.intent).map_err(|error| {
+                        authority_block(
+                            ImportBlockReason::CorruptBase,
+                            Some(path),
+                            format!("canonical base evidence is unavailable: {error}"),
+                        )
+                    })?,
+                };
                 let replay = plan_projection(
                     engine.workspace_id(),
                     current.state(),
@@ -4784,7 +4871,10 @@ fn capture_import_scope(
                 slot.insert(replay.into_intent_and_target());
             }
             let (replayed_intent, _) = &replay_cache[&base_key];
-            if entry.intent.matches_replay_except_frontier(replayed_intent) {
+            if entry.intent.matches_replay_except_frontier(replayed_intent)
+                && (entry.bootstrap_base.is_none()
+                    || entry.intent.frontier() == &current.state().frontier)
+            {
                 if exact.is_some() {
                     return Err(authority_block(
                         ImportBlockReason::CorruptBase,
@@ -7603,7 +7693,13 @@ mod tests {
                 .unwrap();
             let captured = self
                 .engine
-                .capture_external_author_transaction(draft, &self.graph, &self.receipts, endpoint)
+                .capture_external_author_transaction(
+                    draft,
+                    &self.graph,
+                    &self.receipts,
+                    endpoint,
+                    None,
+                )
                 .unwrap();
             let prepared = self
                 .engine
@@ -9150,7 +9246,7 @@ mod tests {
         let mut instrumentation = ImportInstrumentation::default();
         let requested = vec![ManagedPath::parse("pages/a.md").unwrap()];
         let block =
-            capture_affected_catalog(&receipts, &reopened, &requested, &mut instrumentation)
+            capture_affected_catalog(&receipts, &reopened, None, &requested, &mut instrumentation)
                 .unwrap_err();
         assert_eq!(block.reason, ImportBlockReason::AuthorityUnavailable);
         assert_eq!(instrumentation.catalog_entries, 0);
@@ -11359,6 +11455,7 @@ mod tests {
                 &fixture.graph,
                 &fixture.receipts,
                 endpoint,
+                None,
             ),
             Err(crate::oplog::EngineError::ProjectionManifest(message))
                 if message.contains("observation") && message.contains("stale")

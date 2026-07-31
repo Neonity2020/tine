@@ -277,10 +277,11 @@ use std::path::Path;
 use crate::model::Graph;
 
 use super::enrollment::{
-    activate_verified_local_record, reopen_local_active_from_durable_state,
-    reopen_local_active_record, reopen_promoted_bootstrap_anchor, transition_local_active_handoff,
-    CommittedLocalActive, EnrollmentApplicationRoot, EnrollmentBindingV1, LocalActiveHandoff,
-    LocalActiveSync, PromotedBootstrapAnchor, RetainedEnrollmentSession, UnsafeHandoffPredecessor,
+    activate_verified_local_record, activate_verified_local_record_with_retained_validation,
+    reopen_local_active_from_durable_state, reopen_promoted_bootstrap_anchor,
+    transition_local_active_handoff, CommittedLocalActive, EnrollmentApplicationRoot,
+    EnrollmentBindingV1, LocalActiveHandoff, LocalActiveSync, PromotedBootstrapAnchor,
+    RetainedEnrollmentSession, RetainedVerifiedLocalValidation, UnsafeHandoffPredecessor,
     VerifiedLocalCompositionError, VerifiedLocalEvidence, VerifiedLocalProofSet,
 };
 use super::hot_engine::{
@@ -288,6 +289,7 @@ use super::hot_engine::{
     RuntimeResumeObservation, ShardedHotEngine,
 };
 use super::import::InactiveBootstrapAcceptedAuthority;
+use super::migration_backup::MigrationBackupRoot;
 use super::object_store::{
     EngineHistoryAuthority, EngineScratchRetentionPlan, PromotedLineageModeV1,
     PromotedRuntimeStateV1, ResumeAcceleratorUnavailable, ResumeAdoptionCandidate,
@@ -296,6 +298,9 @@ use super::object_store::{
 };
 use super::projection_store::ProjectionReceiptStore;
 use super::resume_point::{ResumeEnrollmentAdmission, ResumePointMaintenance};
+use super::shadow_projection::{
+    BootstrapProjectionAuthority, PromotedBootstrapProjectionBindingV1,
+};
 use super::sqlite::{
     ApplicationRuntimeRoot, LeasedWorkspaceProjection, OpenProjection, ProjectionClaim,
     ProjectionError, RebuildSource, SqliteFrontier, TailOverlay, VerifiedBootstrapSqliteProjection,
@@ -1254,6 +1259,50 @@ pub(crate) fn activate_verified_local(
     activate_with_optional_cut(root, evidence, session_id, proofs, runtime, None)
 }
 
+/// Same-process activation path carrying the one freshly validated complete
+/// proof across the adjacent VerifiedLocal commit and LocalActive readback.
+/// Fresh-process reopen deliberately does not have this capability.
+pub(crate) fn activate_verified_local_with_retained_validation(
+    root: &EnrollmentApplicationRoot,
+    validation: RetainedVerifiedLocalValidation,
+    session_id: SessionId,
+    proofs: &VerifiedLocalProofSet<'_>,
+    runtime: &LocalActiveRuntime<'_>,
+) -> Result<LocalActiveAuthority, LocalActivationError> {
+    let evidence = validation.evidence();
+    let endpoint = authenticate_activation_runtime(evidence, proofs, runtime)?;
+    let activation_acceptance_sequence = runtime
+        .engine
+        .accepted_frontier_root()
+        .map_err(|error| LocalActivationError::RuntimeBinding(error.to_string()))?
+        .acceptance_sequence();
+    let reopened =
+        activate_verified_local_record_with_retained_validation(root, &validation, session_id)?;
+    if reopened.verification_digest() != evidence.verification_digest()
+        || reopened.sync() != LocalActiveSync::Idle
+        || reopened.handoff() != (LocalActiveHandoff::Unsafe { session_id })
+        || reopened.binding() != evidence.binding()
+    {
+        return Err(LocalActivationError::Enrollment(
+            VerifiedLocalCompositionError::StaleEvidence(
+                "retained LocalActive head did not survive activation readback",
+            ),
+        ));
+    }
+    let evidence = validation.into_evidence();
+    Ok(LocalActiveAuthority {
+        application_root: root.clone(),
+        verification_digest: reopened.verification_digest(),
+        enrollment_head: reopened.enrollment_head(),
+        handoff: reopened.handoff(),
+        evidence,
+        session_id,
+        endpoint,
+        activation_acceptance_sequence,
+        _seal: seal::Seal,
+    })
+}
+
 #[cfg(test)]
 pub(crate) fn activate_verified_local_at_cut_for_test(
     root: &EnrollmentApplicationRoot,
@@ -1281,7 +1330,11 @@ fn activate_with_optional_cut(
         .map_err(|error| LocalActivationError::RuntimeBinding(error.to_string()))?
         .acceptance_sequence();
 
-    let committed = match cut {
+    // The enrollment transition returns the result of its own post-commit
+    // `reopen_local_active_record`, including a fresh complete proof-set
+    // validation. Reopening that same record a second time here repeated the
+    // graph-sized verification without observing an intervening operation.
+    let reopened = match cut {
         #[cfg(test)]
         Some(cut) => super::enrollment::activate_verified_local_record_at_cut_for_test(
             root, &evidence, session_id, proofs, cut,
@@ -1293,9 +1346,7 @@ fn activate_with_optional_cut(
 
     // Final proof: the committed head must be exactly this session's
     // Unsafe+Idle LocalActive record for the exact verification digest.
-    let reopened = reopen_local_active_record(root, &evidence, session_id, proofs)?;
-    if reopened.enrollment_head() != committed.enrollment_head()
-        || reopened.verification_digest() != evidence.verification_digest()
+    if reopened.verification_digest() != evidence.verification_digest()
         || reopened.sync() != LocalActiveSync::Idle
         || reopened.handoff() != (LocalActiveHandoff::Unsafe { session_id })
         || reopened.binding() != evidence.binding()
@@ -1658,6 +1709,8 @@ pub(crate) struct PromotedRuntimeOpen<'a> {
     /// Device-local disposable SQLite projection path.
     pub(crate) database_path: &'a Path,
     pub(crate) application_runtime_root: &'a ApplicationRuntimeRoot,
+    pub(crate) graph_root: &'a Path,
+    pub(crate) migration_backup_root: &'a Path,
 }
 
 /// Phase one of promotion: durably bind the promoted runtime.
@@ -1749,6 +1802,14 @@ pub(crate) fn seal_local_runtime_promotion(
             )))
         })?;
 
+    let bootstrap_projection = PromotedBootstrapProjectionBindingV1::from_verified(
+        proofs.shadow_projection,
+    )
+    .map_err(|error| {
+        RuntimePromotionError::Activation(LocalActivationError::RuntimeBinding(format!(
+            "bootstrap projection binding failed: {error}"
+        )))
+    })?;
     let state = PromotedRuntimeStateV1 {
         schema_version: PROMOTED_RUNTIME_STATE_SCHEMA_VERSION,
         lineage_mode: PromotedLineageModeV1::BootstrapAnchoredHomogeneous,
@@ -1772,6 +1833,7 @@ pub(crate) fn seal_local_runtime_promotion(
             .binding_digest()
             .map_err(VerifiedLocalCompositionError::Enrollment)?,
         promotion_session_id: authority.session_id,
+        bootstrap_projection,
     };
     // The composed state must agree with the anchor the committed VerifiedLocal
     // record binds, not merely with the live retained authority.
@@ -1782,6 +1844,7 @@ pub(crate) fn seal_local_runtime_promotion(
             "retained accepted frontier is not the verified LocalActive frontier",
         ));
     }
+    validate_bootstrap_projection_state(&state)?;
 
     publish_promotion_state(archive, &state)?;
 
@@ -1869,6 +1932,65 @@ fn promoted_storage_binding(
     }
 }
 
+fn validate_bootstrap_projection_state(
+    state: &PromotedRuntimeStateV1,
+) -> Result<(), RuntimePromotionError> {
+    let binding = &state.bootstrap_projection;
+    binding.validate().map_err(|error| {
+        RuntimePromotionError::Activation(LocalActivationError::RuntimeBinding(error.to_string()))
+    })?;
+    macro_rules! require_binding {
+        ($condition:expr, $field:literal) => {
+            if !$condition {
+                return Err(RuntimePromotionError::Anchor(concat!(
+                    "bootstrap projection authority does not bind promoted runtime ",
+                    $field
+                )));
+            }
+        };
+    }
+    require_binding!(binding.workspace_id() == state.workspace_id, "workspace");
+    require_binding!(binding.lineage_digest() == state.lineage_digest, "lineage");
+    require_binding!(binding.endpoint_id() == state.endpoint_id, "endpoint");
+    require_binding!(binding.device_id() == state.device_id, "device");
+    require_binding!(
+        binding.graph_resource_id() == state.graph_resource_id,
+        "graph resource"
+    );
+    require_binding!(
+        binding.receipt_store_id() == state.receipt_store_id,
+        "receipt store"
+    );
+    require_binding!(
+        binding.archive_control_binding() == state.archive_control_binding,
+        "archive control directory"
+    );
+    require_binding!(
+        binding.bootstrap_publication_id()
+            == ContentDigest::from_bytes(*state.bootstrap.publication_id().as_bytes()),
+        "bootstrap publication"
+    );
+    require_binding!(
+        binding.bootstrap_aggregate_digest()
+            == ContentDigest::from_bytes(*state.bootstrap.aggregate_digest().as_bytes()),
+        "bootstrap aggregate"
+    );
+    require_binding!(
+        binding.bootstrap_import_id()
+            == ContentDigest::from_bytes(*state.bootstrap_import_id.as_bytes()),
+        "bootstrap import"
+    );
+    require_binding!(
+        binding.bootstrap_part_count() == state.bootstrap.part_count(),
+        "bootstrap part count"
+    );
+    require_binding!(
+        binding.accepted_frontier_state_digest() == state.anchor_accepted_frontier_state_digest,
+        "accepted frontier"
+    );
+    Ok(())
+}
+
 /// The opaque promoted local runtime.
 ///
 /// It owns the writable enrolled engine, the device-local SQLite projection,
@@ -1914,6 +2036,7 @@ pub(crate) struct PromotedLocalRuntime {
     /// runtime drops.
     projection: LeasedWorkspaceProjection,
     tail: TailOverlay,
+    bootstrap_projection: BootstrapProjectionAuthority,
     /// Core-owned watcher intake for this exact endpoint. Only a cloneable
     /// intake handle escapes; the quiesce owner stays inseparable from the
     /// runtime whose Safe transition it gates.
@@ -2675,6 +2798,7 @@ impl PromotedLocalRuntime {
             engine,
             projection,
             tail,
+            bootstrap_projection,
             revocation,
             ..
         } = self;
@@ -2703,6 +2827,7 @@ impl PromotedLocalRuntime {
             engine,
             database,
             tail,
+            bootstrap_projection,
         })
     }
 
@@ -3533,6 +3658,7 @@ pub(crate) struct PromotedRuntimeSession<'a> {
     engine: &'a mut ShardedHotEngine,
     database: &'a mut SqliteFrontier,
     tail: &'a mut TailOverlay,
+    bootstrap_projection: &'a BootstrapProjectionAuthority,
 }
 
 impl PromotedRuntimeSession<'_> {
@@ -3649,6 +3775,31 @@ impl PromotedRuntimeSession<'_> {
             self.engine,
             self.database,
             self.tail,
+        ))
+    }
+
+    pub(crate) fn parts_with_bootstrap(
+        &mut self,
+    ) -> Result<
+        (
+            LocalRuntimeAdmission<'_>,
+            &mut ShardedHotEngine,
+            &mut SqliteFrontier,
+            &mut TailOverlay,
+            &BootstrapProjectionAuthority,
+        ),
+        WorkspaceAuthorityRefusal,
+    > {
+        self.admission
+            .reprove(WorkspaceAuthorityBoundary::MutableParts)?;
+        Ok((
+            LocalRuntimeAdmission {
+                provenance: AdmissionProvenance::Promoted(&self.admission),
+            },
+            self.engine,
+            self.database,
+            self.tail,
+            self.bootstrap_projection,
         ))
     }
 }
@@ -4498,6 +4649,9 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
             "the retained enrollment session is not this promotion's enrollment",
         ));
     }
+    if let Err(error) = validate_bootstrap_projection_state(&state) {
+        refuse!(error);
+    }
     let archive = try_refuse!(ObjectStore::open(open.archive_root, state.workspace_id));
     // Workspace ownership, before anything else. A retained lease must be this
     // exact archive's and this exact workspace's; a lease for a look-alike
@@ -4526,6 +4680,25 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
         &state,
         "promoted archive control directory identity changed",
     ));
+    let backup_roots = match MigrationBackupRoot::open(open.migration_backup_root, open.graph_root)
+    {
+        Ok(roots) => roots,
+        Err(error) => release!(RuntimePromotionError::Activation(
+            LocalActivationError::RuntimeBinding(format!(
+                "promoted bootstrap projection backup root failed: {error}"
+            )),
+        )),
+    };
+    let bootstrap_projection =
+        match BootstrapProjectionAuthority::reopen(&backup_roots, &state.bootstrap_projection) {
+            Ok(authority) => authority,
+            Err(error) => release!(RuntimePromotionError::Activation(
+                LocalActivationError::RuntimeBinding(format!(
+                    "promoted bootstrap projection reopen failed: {error}"
+                )),
+            )),
+        };
+    drop(backup_roots);
     // The retained immutable publication and the durable reference-catalog
     // authority the cold record binds must both be present before the enrolled
     // open recovers from them.
@@ -4795,6 +4968,7 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
         engine: Box::new(engine),
         projection,
         tail,
+        bootstrap_projection,
         watcher,
         // A freshly minted runtime has just proved the lease it holds, so it
         // starts un-revoked. Nothing ever puts it back here.
@@ -5276,6 +5450,8 @@ mod bounded_admission {
                 archive_root: &fixture.archive_root,
                 database_path: &self.database_path,
                 application_runtime_root: &self.runtime_root,
+                graph_root: &fixture.graph_root,
+                migration_backup_root: fixture.roots.canonical_root(),
             }
         }
     }

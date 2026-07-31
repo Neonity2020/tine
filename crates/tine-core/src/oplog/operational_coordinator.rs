@@ -14,16 +14,19 @@ use crate::Graph;
 
 use super::enrollment::{EnrollmentError, VerifiedLocalCompositionError};
 use super::hot_engine::{LocalAuthorCapture, ReconciliationNeeded};
+use super::import::plan_affected_import_with_bootstrap;
 use super::local_active::{
     LocalRuntimeAdmission, PromotedRuntimeSession, RuntimePromotionError, RuntimeRevocation,
     WorkspaceAuthorityBoundary, WorkspaceAuthorityRefusal,
 };
+#[cfg(test)]
+use super::plan_affected_import;
+use super::shadow_projection::BootstrapProjectionAuthority;
 use super::{
-    plan_affected_import, AcceptedBatchEvent, AuthorBatch, BatchDisposition, BatchId,
-    BatchInspection, BatchOrigin, ContentDigest, CrdtPeerId, ImportId, ImportPlan,
-    ImportPlanStatus, ObjectStore, OperationTransaction, PreparedBatch, ProjectionEndpointBinding,
-    ProjectionReceiptStore, RebuildSource, SessionId, ShardedHotEngine, SqliteFrontier,
-    TailOverlay, TailReservation,
+    AcceptedBatchEvent, AuthorBatch, BatchDisposition, BatchId, BatchInspection, BatchOrigin,
+    ContentDigest, CrdtPeerId, ImportId, ImportPlan, ImportPlanStatus, ObjectStore,
+    OperationTransaction, PreparedBatch, ProjectionEndpointBinding, ProjectionReceiptStore,
+    RebuildSource, SessionId, ShardedHotEngine, SqliteFrontier, TailOverlay, TailReservation,
 };
 
 const CRDT_PEER_PROBE_BUDGET: u64 = 8;
@@ -1028,6 +1031,28 @@ impl OperationalCoordinator {
         tail: &mut TailOverlay,
         requested_paths: &[&str],
     ) -> Result<OperationalCoordinatorState, OperationalCoordinatorError> {
+        Self::execute_with_bootstrap(
+            admission,
+            graph,
+            receipts,
+            engine,
+            database,
+            tail,
+            None,
+            requested_paths,
+        )
+    }
+
+    pub(crate) fn execute_with_bootstrap(
+        admission: &LocalRuntimeAdmission<'_>,
+        graph: &Graph,
+        receipts: &ProjectionReceiptStore,
+        engine: &mut ShardedHotEngine,
+        database: &mut SqliteFrontier,
+        tail: &mut TailOverlay,
+        bootstrap: Option<&BootstrapProjectionAuthority>,
+        requested_paths: &[&str],
+    ) -> Result<OperationalCoordinatorState, OperationalCoordinatorError> {
         authorize_coordinator(admission, graph, engine)?;
         let endpoint = engine.projection_endpoint_binding().ok_or_else(|| {
             OperationalCoordinatorError::new(
@@ -1048,7 +1073,13 @@ impl OperationalCoordinator {
             })?;
         fault(OperationalFaultPoint::AfterHandoff)?;
 
-        let plan = plan_affected_import(graph, receipts, engine, requested_paths);
+        let plan = plan_affected_import_with_bootstrap(
+            graph,
+            receipts,
+            engine,
+            bootstrap,
+            requested_paths,
+        );
         fault(OperationalFaultPoint::AfterPlan)?;
         match plan.status() {
             ImportPlanStatus::Blocked => {
@@ -1108,7 +1139,7 @@ impl OperationalCoordinator {
             })?;
         fault(OperationalFaultPoint::AfterDraft)?;
         let captured = engine
-            .capture_external_author_transaction(draft, graph, receipts, endpoint)
+            .capture_external_author_transaction(draft, graph, receipts, endpoint, bootstrap)
             .map_err(|error| {
                 OperationalCoordinatorError::new(OperationalPhase::Capture, error.to_string())
             })?;
@@ -1169,7 +1200,7 @@ impl OperationalCoordinator {
         receipts: &ProjectionReceiptStore,
         transaction: &OperationTransaction,
     ) -> LocalMutationCoordinatorState {
-        let (admission, engine, database, tail) = match session.parts() {
+        let (admission, engine, database, tail, bootstrap) = match session.parts_with_bootstrap() {
             Ok(parts) => parts,
             Err(refusal) => {
                 return LocalMutationCoordinatorState::blocked(
@@ -1184,6 +1215,7 @@ impl OperationalCoordinator {
             engine,
             database,
             tail,
+            Some(bootstrap),
             LocalDraftSource::Promoted,
             transaction,
         ) {
@@ -1235,6 +1267,7 @@ impl OperationalCoordinator {
             engine,
             database,
             tail,
+            None,
             LocalDraftSource::Raw(author),
             transaction,
         ) {
@@ -1258,6 +1291,7 @@ fn execute_local_inner(
     engine: &mut ShardedHotEngine,
     database: &mut SqliteFrontier,
     tail: &mut TailOverlay,
+    bootstrap: Option<&BootstrapProjectionAuthority>,
     source: LocalDraftSource,
     transaction: &OperationTransaction,
 ) -> Result<LocalMutationCoordinatorState, OperationalCoordinatorError> {
@@ -1324,7 +1358,7 @@ fn execute_local_inner(
     };
     fault(OperationalFaultPoint::AfterDraft)?;
     let captured = match engine
-        .capture_local_author_transaction(draft, graph, receipts, endpoint)
+        .capture_local_author_transaction(draft, graph, receipts, endpoint, bootstrap)
         .map_err(|error| {
             OperationalCoordinatorError::new(OperationalPhase::Capture, error.to_string())
         })? {

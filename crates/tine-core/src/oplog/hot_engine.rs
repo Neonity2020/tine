@@ -52,6 +52,7 @@ use super::semantic::{
     EffectiveExplicitTitleState, LogseqIdentityOrigin, PagePreambleDelta, PagePreambleState,
     PolicyGeneratedAnchorReason,
 };
+use super::shadow_projection::BootstrapProjectionAuthority;
 use super::uuid_claim_index::{LogseqClaimIndexRoot, LogseqClaimIndexStore};
 use super::{
     AnnotatedIdentity, AnnotatedProjectionBase, BatchCausalDot, BatchId, BatchInspection,
@@ -2476,7 +2477,28 @@ impl ProjectionRequirement {
 struct CapabilityCapturedPriorProjection {
     pub(crate) bytes: Vec<u8>,
     pub(crate) intent: ProjectionIntent,
-    pub(crate) completion: ProjectionCompletion,
+    pub(crate) completion: Option<ProjectionCompletion>,
+    pub(crate) bootstrap_owner_binding: Option<ContentDigest>,
+}
+
+impl CapabilityCapturedPriorProjection {
+    fn validate_authority(&self) -> Result<(), EngineError> {
+        match (&self.completion, self.bootstrap_owner_binding) {
+            (Some(completion), None) => completion
+                .validate_against(&self.intent)
+                .map_err(|error| EngineError::ProjectionManifest(error.to_string())),
+            (None, Some(_)) => Ok(()),
+            _ => Err(EngineError::ProjectionManifest(
+                "captured prior projection has ambiguous authority".into(),
+            )),
+        }
+    }
+
+    fn logical_completion_id(&self) -> Option<super::LogicalCompletionId> {
+        self.completion
+            .as_ref()
+            .map(ProjectionCompletion::logical_completion_id)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2561,7 +2583,8 @@ impl CapabilityCapturedProjectionInput {
                 prior: Some(CapabilityCapturedPriorProjection {
                     bytes: bytes.clone(),
                     intent: prior_intent.clone(),
-                    completion: prior_completion.clone(),
+                    completion: Some(prior_completion.clone()),
+                    bootstrap_owner_binding: None,
                 }),
             },
         };
@@ -2591,12 +2614,16 @@ impl CapabilityCapturedProjectionInput {
                 bytes,
                 prior: Some(prior),
                 ..
-            } => CapabilityCapturedProjectionState::Present {
+            } if prior.completion.is_some() => CapabilityCapturedProjectionState::Present {
                 bytes: bytes.clone(),
                 prior_intent: prior.intent.clone(),
-                prior_completion: prior.completion.clone(),
+                prior_completion: prior
+                    .completion
+                    .clone()
+                    .expect("ordinary prior was selected by its completion"),
             },
-            CapabilityCapturedProjectionMaterial::Absent { .. }
+            CapabilityCapturedProjectionMaterial::Present { prior: Some(_), .. }
+            | CapabilityCapturedProjectionMaterial::Absent { .. }
             | CapabilityCapturedProjectionMaterial::Present { prior: None, .. } => {
                 CapabilityCapturedProjectionState::Absent
             }
@@ -9517,13 +9544,14 @@ impl ShardedHotEngine {
         graph: &Graph,
         receipts: &ProjectionReceiptStore,
         source: ProjectionEndpointBinding,
+        bootstrap: Option<&BootstrapProjectionAuthority>,
     ) -> Result<LocalAuthorCapture, EngineError> {
         if draft.origin != BatchOrigin::LocalMutation || draft.external_observation.is_some() {
             return Err(EngineError::ProjectionManifest(
                 "local author capture requires an unobserved LocalMutation draft".into(),
             ));
         }
-        match self.capture_author_transaction(draft, graph, receipts, source, false)? {
+        match self.capture_author_transaction(draft, graph, receipts, source, false, bootstrap)? {
             Ok(captured) => Ok(LocalAuthorCapture::Captured(captured)),
             Err(reconciliation) => Ok(LocalAuthorCapture::ReconciliationNeeded(reconciliation)),
         }
@@ -9535,6 +9563,7 @@ impl ShardedHotEngine {
         graph: &Graph,
         receipts: &ProjectionReceiptStore,
         source: ProjectionEndpointBinding,
+        bootstrap: Option<&BootstrapProjectionAuthority>,
     ) -> Result<CapturedAuthorTransaction, EngineError> {
         if !matches!(draft.origin, BatchOrigin::ExternalReconciliation { .. })
             || draft.external_observation.is_none()
@@ -9543,7 +9572,7 @@ impl ShardedHotEngine {
                 "external author capture requires a sealed reconciliation draft".into(),
             ));
         }
-        self.capture_author_transaction(draft, graph, receipts, source, true)?
+        self.capture_author_transaction(draft, graph, receipts, source, true, bootstrap)?
             .map_err(|_| {
                 EngineError::ProjectionManifest(
                     "external author capture unexpectedly requested local reconciliation".into(),
@@ -9558,6 +9587,7 @@ impl ShardedHotEngine {
         receipts: &ProjectionReceiptStore,
         source: ProjectionEndpointBinding,
         external: bool,
+        bootstrap: Option<&BootstrapProjectionAuthority>,
     ) -> Result<Result<CapturedAuthorTransaction, ReconciliationNeeded>, EngineError> {
         self.ensure_not_blocked()?;
         if source.device_id != draft.author.author_device_id {
@@ -9700,8 +9730,75 @@ impl ShardedHotEngine {
                         Some(CapabilityCapturedPriorProjection {
                             bytes: replay.target().to_vec(),
                             intent,
-                            completion,
+                            completion: Some(completion),
+                            bootstrap_owner_binding: None,
                         })
+                    }
+                } else if completed.is_empty() {
+                    let baseline = bootstrap
+                        .map(|bootstrap| bootstrap.baseline_at(path))
+                        .transpose()
+                        .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?
+                        .flatten();
+                    if let Some(baseline) = baseline {
+                        let before = draft.pages[&requirement.page_id]
+                            .before
+                            .as_ref()
+                            .expect("prior requirement was selected from a semantic pre-state");
+                        let owner = self
+                            .current_path_catalog_row_at_path(path)?
+                            .ok_or_else(|| {
+                                EngineError::ProjectionManifest(format!(
+                                    "aggregate bootstrap predecessor for {path} has no current owner"
+                                ))
+                            })?;
+                        if owner.page_id() != requirement.page_id
+                            || owner.path() != path
+                            || owner.kind() != baseline.kind()
+                            || baseline.intent().workspace_id() != self.workspace_id
+                            || baseline.intent().page_id() != requirement.page_id
+                            || baseline.intent().path() != path
+                            || baseline.intent().frontier() != &before.frontier
+                            || baseline.intent().target()
+                                != super::BlobDescription::of(baseline.source_bytes())
+                        {
+                            return Err(EngineError::ProjectionManifest(format!(
+                                "aggregate bootstrap predecessor for {path} is stale or mismatched"
+                            )));
+                        } else {
+                            let replay = super::projection::plan_projection(
+                                self.workspace_id,
+                                before,
+                                Some(baseline.source_bytes()),
+                            )
+                            .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
+                            if replay.intent() != baseline.intent() {
+                                return Err(EngineError::ProjectionManifest(format!(
+                                    "aggregate bootstrap predecessor replay for {path} differs"
+                                )));
+                            } else {
+                                charge_preauthoring_capture_bytes(
+                                    &mut retained_bytes,
+                                    replay.target().len(),
+                                    "aggregate bootstrap projection bytes",
+                                )?;
+                                authority_matches = true;
+                                Some(CapabilityCapturedPriorProjection {
+                                    bytes: replay.target().to_vec(),
+                                    intent: baseline.intent().clone(),
+                                    completion: None,
+                                    bootstrap_owner_binding: Some(baseline.owner_binding()),
+                                })
+                            }
+                        }
+                    } else {
+                        if bootstrap.is_some() {
+                            return Err(EngineError::ProjectionManifest(format!(
+                                "aggregate bootstrap predecessor for {path} is missing"
+                            )));
+                        }
+                        authority_matches = false;
+                        None
                     }
                 } else {
                     None
@@ -9816,7 +9913,7 @@ impl ShardedHotEngine {
         receipts: &ProjectionReceiptStore,
         source: ProjectionEndpointBinding,
     ) -> Result<PreparedBatch, EngineError> {
-        match self.capture_local_author_transaction(draft, graph, receipts, source)? {
+        match self.capture_local_author_transaction(draft, graph, receipts, source, None)? {
             LocalAuthorCapture::Captured(captured) => {
                 self.finalize_captured_author_transaction(captured, receipts)
             }
@@ -9956,10 +10053,7 @@ impl ShardedHotEngine {
                 | CapabilityCapturedProjectionMaterial::Present { prior, .. } => prior.as_ref(),
             };
             if let Some(prior) = prior {
-                prior
-                    .completion
-                    .validate_against(&prior.intent)
-                    .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
+                prior.validate_authority()?;
                 let before = roles
                     .semantic_predecessor
                     .and_then(|index| {
@@ -10007,7 +10101,7 @@ impl ShardedHotEngine {
                         source.endpoint_id,
                         before.page.page_id,
                         path.clone(),
-                        Some(prior.completion.logical_completion_id()),
+                        prior.logical_completion_id(),
                         before.frontier.clone(),
                         prior.bytes.clone(),
                         replay.intent().annotations().to_vec(),
@@ -10054,7 +10148,7 @@ impl ShardedHotEngine {
                     path.clone(),
                     prior
                         .as_ref()
-                        .map(|prior| prior.completion.logical_completion_id()),
+                        .and_then(CapabilityCapturedPriorProjection::logical_completion_id),
                     prior_frontier,
                     bytes.clone(),
                     annotations.clone(),
@@ -12237,49 +12331,6 @@ impl ShardedHotEngine {
             path: source.path().clone(),
             prior_frontier,
             frontier: source.post_frontier().clone(),
-        })
-    }
-
-    /// Authorize read-only receipt confirmation for a page admitted by the
-    /// immutable bootstrap publication.
-    ///
-    /// Bootstrap batches live in their own archive namespace, so the ordinary
-    /// projection writer's per-batch `inspect_batch` check cannot recognize
-    /// them. This narrower authority requires a promoted lineage and an exact
-    /// current-catalog owner; callers still have to prove the graph bytes
-    /// unchanged before publishing a receipt.
-    pub(crate) fn authorize_bootstrap_projection_confirmation(
-        &self,
-        page_id: PageId,
-    ) -> Result<ProjectionWriteAuthorization, EngineError> {
-        self.begin_point_operation();
-        self.ensure_not_blocked()?;
-        if self.promoted_lineage().is_none() || self.archive_store.is_none() {
-            return Err(EngineError::ProjectionAuthorizationUnavailable);
-        }
-        let state = self.materialize_page_for_projection(page_id)?;
-        let owner = self
-            .current_path_catalog_row_at_path(&state.page.path)?
-            .ok_or(EngineError::ProjectionAuthorizationUnavailable)?;
-        if owner.page_id() != page_id {
-            return Err(EngineError::ProjectionAuthorizationUnavailable);
-        }
-        let mut bootstrap_heads = 0_usize;
-        for document in state.frontier.documents() {
-            for batch_id in document.direct_dependency_heads() {
-                bootstrap_heads = bootstrap_heads.saturating_add(1);
-                if self.load_retained_bootstrap_part(*batch_id)?.is_none() {
-                    return Err(EngineError::ProjectionAuthorizationUnavailable);
-                }
-            }
-        }
-        if bootstrap_heads == 0 {
-            return Err(EngineError::ProjectionAuthorizationUnavailable);
-        }
-        self.projection_completion_history_authority()?;
-        Ok(ProjectionWriteAuthorization {
-            state,
-            claim_root: self.logseq_claim_root,
         })
     }
 
@@ -24398,7 +24449,13 @@ mod validation_tests {
             let draft = self.draft_edits(seed, &[(0, content)]);
             let captured = match self
                 .engine
-                .capture_local_author_transaction(draft, &self.graph, &self.receipts, self.endpoint)
+                .capture_local_author_transaction(
+                    draft,
+                    &self.graph,
+                    &self.receipts,
+                    self.endpoint,
+                    None,
+                )
                 .unwrap()
             {
                 LocalAuthorCapture::Captured(captured) => captured,
@@ -24499,7 +24556,7 @@ mod validation_tests {
             )
             .unwrap();
         let captured = match engine
-            .capture_local_author_transaction(draft, &graph, &receipts, endpoint)
+            .capture_local_author_transaction(draft, &graph, &receipts, endpoint, None)
             .unwrap()
         {
             LocalAuthorCapture::Captured(captured) => captured,
@@ -25383,6 +25440,7 @@ mod validation_tests {
                 &fixture.graph,
                 &fixture.receipts,
                 fixture.endpoint,
+                None,
             )
             .unwrap()
         {
@@ -25798,6 +25856,7 @@ mod validation_tests {
                 &fixture.graph,
                 &fixture.receipts,
                 fixture.endpoint,
+                None,
             )
             .unwrap()
         {
@@ -25824,6 +25883,7 @@ mod validation_tests {
                 &fixture.graph,
                 &fixture.receipts,
                 fixture.endpoint,
+                None,
             )
             .unwrap()
         {
@@ -25865,6 +25925,7 @@ mod validation_tests {
                 &fixture.graph,
                 &fixture.receipts,
                 fixture.endpoint,
+                None,
             )
             .unwrap()
         {
@@ -25913,6 +25974,7 @@ mod validation_tests {
                 &fixture.graph,
                 &fixture.receipts,
                 fixture.endpoint,
+                None,
             )
             .unwrap()
         {
@@ -25957,6 +26019,7 @@ mod validation_tests {
                 &fixture.graph,
                 &fixture.receipts,
                 fixture.endpoint,
+                None,
             )
             .unwrap()
         {
@@ -26005,6 +26068,7 @@ mod validation_tests {
                 &fixture.graph,
                 &fixture.receipts,
                 fixture.endpoint,
+                None,
             )
             .unwrap()
         {
@@ -26028,6 +26092,7 @@ mod validation_tests {
                 &fixture.graph,
                 &fixture.receipts,
                 fixture.endpoint,
+                None,
             )
             .unwrap()
         {
@@ -26051,6 +26116,7 @@ mod validation_tests {
                 &fixture.graph,
                 &fixture.receipts,
                 fixture.endpoint,
+                None,
             )
             .unwrap()
         {
@@ -26065,6 +26131,7 @@ mod validation_tests {
                 &fixture.graph,
                 &fixture.receipts,
                 fixture.endpoint,
+                None,
             )
             .unwrap()
         {
@@ -26228,6 +26295,7 @@ mod validation_tests {
                 &fixture.graph,
                 &fixture.receipts,
                 fixture.endpoint,
+                None,
             )
             .unwrap()
         {
@@ -34355,6 +34423,7 @@ mod validation_tests {
                 &fixture.graph,
                 &fixture.receipts,
                 fixture.endpoint,
+                None,
             ),
             Err(EngineError::AuthorDraftStale)
         ));
@@ -34368,6 +34437,7 @@ mod validation_tests {
                 &fixture.graph,
                 &fixture.receipts,
                 fixture.endpoint,
+                None,
             )
             .unwrap()
         {
