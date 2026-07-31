@@ -1,5 +1,6 @@
 #![allow(clippy::result_large_err)]
 
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
@@ -10,9 +11,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use cap_std::fs::Dir;
 use serde::{Deserialize, Serialize};
 
+use super::authenticated_patricia::{
+    PatriciaIndexConstruction, PatriciaIndexRoot, PatriciaIndexStore,
+};
 #[cfg(test)]
-use super::authenticated_patricia::PatriciaIndexStats;
-use super::authenticated_patricia::{PatriciaIndexRoot, PatriciaIndexStore};
+use super::authenticated_patricia::{PatriciaIndexConstructionStats, PatriciaIndexStats};
 use super::object_store::{publish_immutable_exact, read_optional_regular, StoreError};
 use super::{
     BlockId, BlockOwner, ContentDigest, DocumentId, LogicalPageName, LogseqUuid, ManagedPath,
@@ -895,6 +898,29 @@ impl ReferenceCatalogStore {
             .transpose()
     }
 
+    fn posting_constructed(
+        &self,
+        root: &ReferenceCatalogRootV2,
+        page_id: PageId,
+        construction: &PatriciaIndexConstruction,
+    ) -> Result<Option<ReferenceSourcePostingV2>, ReferenceCatalogError> {
+        let value = self
+            .patricia
+            .construction_lookup(
+                construction,
+                PatriciaIndexRoot::from_digest(root.facts_root),
+                page_id.as_uuid().as_bytes(),
+            )
+            .map_err(store_error)?;
+        value
+            .map(|value| {
+                let digest = digest_value(&value)?;
+                let reference = self.posting_reference(page_id, digest)?;
+                self.read_posting(&reference)
+            })
+            .transpose()
+    }
+
     fn reverse_candidates(
         &self,
         root: &ReferenceCatalogRootV2,
@@ -1166,6 +1192,23 @@ impl ReferenceCatalogStore {
 pub(crate) struct ReferenceCatalogCandidateV2 {
     delta: ReferenceCatalogDeltaV2,
     memory: Option<MemoryCatalog>,
+    construction: Option<ReferenceCatalogConstructionEvidenceV2>,
+}
+
+#[derive(Debug)]
+struct ReferenceCatalogConstructionEvidenceV2 {
+    construction_id: uuid::Uuid,
+    store: Arc<ReferenceCatalogStore>,
+    structurally_validated: Cell<bool>,
+}
+
+/// Opaque proof that this exact candidate was prepared by the active private
+/// construction transaction. Callers can borrow it but cannot manufacture or
+/// retarget it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ReferenceCatalogPreparedCandidateV2<'a> {
+    candidate: &'a ReferenceCatalogCandidateV2,
+    evidence: &'a ReferenceCatalogConstructionEvidenceV2,
 }
 
 impl ReferenceCatalogCandidateV2 {
@@ -1175,6 +1218,15 @@ impl ReferenceCatalogCandidateV2 {
 
     pub(crate) const fn delta(&self) -> &ReferenceCatalogDeltaV2 {
         &self.delta
+    }
+
+    pub(crate) fn prepared_candidate(&self) -> Option<ReferenceCatalogPreparedCandidateV2<'_>> {
+        self.construction
+            .as_ref()
+            .map(|evidence| ReferenceCatalogPreparedCandidateV2 {
+                candidate: self,
+                evidence,
+            })
     }
 }
 
@@ -1190,6 +1242,11 @@ struct MemoryCatalog {
 enum ReferenceCatalogBackend {
     Memory(MemoryCatalog),
     Store(Arc<ReferenceCatalogStore>),
+    Construction {
+        store: Arc<ReferenceCatalogStore>,
+        construction_id: uuid::Uuid,
+        patricia: RefCell<PatriciaIndexConstruction>,
+    },
     RecoveryRequired(Arc<ReferenceCatalogStore>),
 }
 
@@ -1198,6 +1255,24 @@ pub(crate) struct ReferenceCatalogStateV2 {
     policy: ReferenceCatalogPolicyV1,
     root: ReferenceCatalogRootV2,
     backend: ReferenceCatalogBackend,
+    #[cfg(test)]
+    completed_construction_stats: Option<PatriciaIndexConstructionStats>,
+    #[cfg(test)]
+    prepared_candidate_validations: Cell<usize>,
+    #[cfg(test)]
+    full_delta_validations: Cell<usize>,
+    #[cfg(test)]
+    final_catalog_validations: Cell<usize>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ReferenceCatalogConstructionWorkStats {
+    pub(crate) peak_resident_bytes: usize,
+    pub(crate) buffer_flushes: usize,
+    pub(crate) prepared_candidate_validations: usize,
+    pub(crate) full_delta_validations: usize,
+    pub(crate) final_catalog_validations: usize,
 }
 
 impl ReferenceCatalogStateV2 {
@@ -1212,6 +1287,14 @@ impl ReferenceCatalogStateV2 {
             policy,
             root,
             backend: ReferenceCatalogBackend::Memory(MemoryCatalog::default()),
+            #[cfg(test)]
+            completed_construction_stats: None,
+            #[cfg(test)]
+            prepared_candidate_validations: Cell::new(0),
+            #[cfg(test)]
+            full_delta_validations: Cell::new(0),
+            #[cfg(test)]
+            final_catalog_validations: Cell::new(0),
         })
     }
 
@@ -1223,6 +1306,21 @@ impl ReferenceCatalogStateV2 {
             return Err(ReferenceCatalogError::AuthorityMismatch);
         }
         self.backend = ReferenceCatalogBackend::Store(store);
+        Ok(())
+    }
+
+    pub(crate) fn attach_construction_store(
+        &mut self,
+        store: Arc<ReferenceCatalogStore>,
+    ) -> Result<(), ReferenceCatalogError> {
+        if self.root.source_count != 0 {
+            return Err(ReferenceCatalogError::AuthorityMismatch);
+        }
+        self.backend = ReferenceCatalogBackend::Construction {
+            store,
+            construction_id: uuid::Uuid::new_v4(),
+            patricia: RefCell::new(PatriciaIndexConstruction::default()),
+        };
         Ok(())
     }
 
@@ -1238,6 +1336,14 @@ impl ReferenceCatalogStateV2 {
             policy,
             root,
             backend: ReferenceCatalogBackend::RecoveryRequired(store),
+            #[cfg(test)]
+            completed_construction_stats: None,
+            #[cfg(test)]
+            prepared_candidate_validations: Cell::new(0),
+            #[cfg(test)]
+            full_delta_validations: Cell::new(0),
+            #[cfg(test)]
+            final_catalog_validations: Cell::new(0),
         })
     }
 
@@ -1256,12 +1362,14 @@ impl ReferenceCatalogStateV2 {
             }
             ReferenceCatalogBackend::Memory(_) => Ok(()),
             ReferenceCatalogBackend::Store(_) => Ok(()),
+            ReferenceCatalogBackend::Construction { .. } => Ok(()),
         }
     }
 
     pub(crate) fn store_handle(&self) -> Option<Arc<ReferenceCatalogStore>> {
         match &self.backend {
             ReferenceCatalogBackend::Store(store)
+            | ReferenceCatalogBackend::Construction { store, .. }
             | ReferenceCatalogBackend::RecoveryRequired(store) => Some(Arc::clone(store)),
             ReferenceCatalogBackend::Memory(_) => None,
         }
@@ -1272,6 +1380,9 @@ impl ReferenceCatalogStateV2 {
             ReferenceCatalogBackend::RecoveryRequired(store) => Arc::clone(store),
             ReferenceCatalogBackend::Memory(_) => return Ok(()),
             ReferenceCatalogBackend::Store(_) => return Ok(()),
+            ReferenceCatalogBackend::Construction { .. } => {
+                return Err(ReferenceCatalogError::AuthorityMismatch);
+            }
         };
         store.validate_catalog_root(&self.root)?;
         self.backend = ReferenceCatalogBackend::Store(store);
@@ -1285,6 +1396,9 @@ impl ReferenceCatalogStateV2 {
         match &self.backend {
             ReferenceCatalogBackend::Memory(memory) => Ok(memory.postings.get(&page_id).cloned()),
             ReferenceCatalogBackend::Store(store) => store.posting(&self.root, page_id),
+            ReferenceCatalogBackend::Construction {
+                store, patricia, ..
+            } => store.posting_constructed(&self.root, page_id, &patricia.borrow()),
             ReferenceCatalogBackend::RecoveryRequired(_) => {
                 Err(ReferenceCatalogError::RecoveryRequired)
             }
@@ -1304,6 +1418,9 @@ impl ReferenceCatalogStateV2 {
         root.validate()?;
         match &self.backend {
             ReferenceCatalogBackend::Store(store) => store.posting(root, page_id),
+            ReferenceCatalogBackend::Construction {
+                store, patricia, ..
+            } => store.posting_constructed(root, page_id, &patricia.borrow()),
             ReferenceCatalogBackend::Memory(memory) if root == &self.root => {
                 Ok(memory.postings.get(&page_id).cloned())
             }
@@ -1323,6 +1440,9 @@ impl ReferenceCatalogStateV2 {
         root.validate()?;
         match &self.backend {
             ReferenceCatalogBackend::Store(store) => store.reverse_candidates(root, target, limit),
+            ReferenceCatalogBackend::Construction { .. } => {
+                Err(ReferenceCatalogError::StoreRequired)
+            }
             ReferenceCatalogBackend::Memory(memory) if root == &self.root => {
                 let prefix = reverse_candidate_prefix(target);
                 let mut candidates = BTreeSet::new();
@@ -1354,7 +1474,13 @@ impl ReferenceCatalogStateV2 {
     ) -> Result<(), ReferenceCatalogError> {
         match &self.backend {
             ReferenceCatalogBackend::Store(store)
-            | ReferenceCatalogBackend::RecoveryRequired(store) => store.validate_delta(delta),
+            | ReferenceCatalogBackend::RecoveryRequired(store) => {
+                #[cfg(test)]
+                self.full_delta_validations
+                    .set(self.full_delta_validations.get().saturating_add(1));
+                store.validate_delta(delta)
+            }
+            ReferenceCatalogBackend::Construction { .. } => delta.validate(),
             ReferenceCatalogBackend::Memory(_) => delta.validate(),
         }
     }
@@ -1364,6 +1490,7 @@ impl ReferenceCatalogStateV2 {
         match &self.backend {
             ReferenceCatalogBackend::Memory(memory) => memory.postings.len(),
             ReferenceCatalogBackend::Store(_) | ReferenceCatalogBackend::RecoveryRequired(_) => 0,
+            ReferenceCatalogBackend::Construction { .. } => 0,
         }
     }
 
@@ -1371,8 +1498,24 @@ impl ReferenceCatalogStateV2 {
     pub(crate) fn store_stats(&self) -> PatriciaIndexStats {
         match &self.backend {
             ReferenceCatalogBackend::Store(store)
+            | ReferenceCatalogBackend::Construction { store, .. }
             | ReferenceCatalogBackend::RecoveryRequired(store) => store.stats(),
             ReferenceCatalogBackend::Memory(_) => PatriciaIndexStats::default(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn construction_work_stats(&self) -> ReferenceCatalogConstructionWorkStats {
+        let patricia = match &self.backend {
+            ReferenceCatalogBackend::Construction { patricia, .. } => patricia.borrow().stats(),
+            _ => self.completed_construction_stats.unwrap_or_default(),
+        };
+        ReferenceCatalogConstructionWorkStats {
+            peak_resident_bytes: patricia.peak_resident_bytes,
+            buffer_flushes: patricia.flushes,
+            prepared_candidate_validations: self.prepared_candidate_validations.get(),
+            full_delta_validations: self.full_delta_validations.get(),
+            final_catalog_validations: self.final_catalog_validations.get(),
         }
     }
 
@@ -1395,6 +1538,18 @@ impl ReferenceCatalogStateV2 {
             ),
             ReferenceCatalogBackend::Store(store) => self.prepare_store(
                 store,
+                sources,
+                page_names,
+                external_uuid_claim_authority_root,
+            ),
+            ReferenceCatalogBackend::Construction {
+                store,
+                construction_id,
+                patricia,
+            } => self.prepare_store_construction(
+                store,
+                *construction_id,
+                &mut patricia.borrow_mut(),
                 sources,
                 page_names,
                 external_uuid_claim_authority_root,
@@ -1500,6 +1655,7 @@ impl ReferenceCatalogStateV2 {
         Ok(ReferenceCatalogCandidateV2 {
             delta,
             memory: Some(memory),
+            construction: None,
         })
     }
 
@@ -1633,11 +1789,218 @@ impl ReferenceCatalogStateV2 {
         Ok(ReferenceCatalogCandidateV2 {
             delta,
             memory: None,
+            construction: None,
         })
     }
 
+    fn prepare_store_construction(
+        &self,
+        store: &Arc<ReferenceCatalogStore>,
+        construction_id: uuid::Uuid,
+        construction: &mut PatriciaIndexConstruction,
+        sources: BTreeMap<PageId, Option<ReferenceSourcePageV1>>,
+        page_names: &PageNameOwnershipRootV1,
+        external_uuid_claim_authority_root: ContentDigest,
+    ) -> Result<ReferenceCatalogCandidateV2, ReferenceCatalogError> {
+        let mut facts_root = PatriciaIndexRoot::from_digest(self.root.facts_root);
+        let mut coverage_root = PatriciaIndexRoot::from_digest(self.root.source_coverage_root);
+        let mut reverse_root = PatriciaIndexRoot::from_digest(self.root.reverse_candidates_root);
+        let mut source_count = self.root.source_count;
+        let mut replacements = Vec::with_capacity(sources.len());
+        let mut fact_updates = BTreeMap::new();
+        let mut coverage_updates = BTreeMap::new();
+        let mut removals = Vec::new();
+        let mut reverse_updates = BTreeMap::new();
+        let mut reverse_removals = BTreeSet::new();
+        for (page_id, source) in sources {
+            let key = page_id.as_uuid().as_bytes().to_vec();
+            let prior_posting_digest = store
+                .patricia
+                .construction_lookup(construction, facts_root, &key)
+                .map_err(store_error)?
+                .map(|value| digest_value(&value))
+                .transpose()?;
+            let prior_reverse_keys = prior_posting_digest
+                .map(|digest| {
+                    let reference = store.posting_reference(page_id, digest)?;
+                    store
+                        .read_posting(&reference)
+                        .map(|posting| reverse_candidate_keys(&posting))
+                })
+                .transpose()?
+                .unwrap_or_default();
+            let posting = source
+                .map(|source| extract_source_posting(&self.policy, source))
+                .transpose()?;
+            let post_reverse_keys = posting
+                .as_ref()
+                .map(reverse_candidate_keys)
+                .unwrap_or_default();
+            reverse_removals.extend(prior_reverse_keys.difference(&post_reverse_keys).cloned());
+            reverse_updates.extend(
+                post_reverse_keys
+                    .into_iter()
+                    .map(|key| (key, REVERSE_VALUE.to_vec())),
+            );
+            let post_posting = match posting {
+                Some(posting) => {
+                    let reference = store.publish_posting(&posting)?;
+                    fact_updates.insert(key.clone(), reference.digest.as_bytes().to_vec());
+                    coverage_updates.insert(key.clone(), COVERAGE_VALUE.to_vec());
+                    if prior_posting_digest.is_none() {
+                        source_count = source_count
+                            .checked_add(1)
+                            .ok_or(ReferenceCatalogError::Allocation)?;
+                    }
+                    Some(reference)
+                }
+                None => {
+                    removals.push(key);
+                    if prior_posting_digest.is_some() {
+                        source_count = source_count
+                            .checked_sub(1)
+                            .ok_or(ReferenceCatalogError::MalformedTransition)?;
+                    }
+                    None
+                }
+            };
+            replacements.push(ReferenceCatalogReplacementV2 {
+                page_id,
+                prior_posting_digest,
+                post_posting,
+            });
+        }
+        facts_root = store
+            .patricia
+            .construction_insert_many(construction, facts_root, &fact_updates)
+            .map_err(store_error)?;
+        coverage_root = store
+            .patricia
+            .construction_insert_many(construction, coverage_root, &coverage_updates)
+            .map_err(store_error)?;
+        facts_root = store
+            .patricia
+            .construction_remove_many(construction, facts_root, &removals)
+            .map_err(store_error)?;
+        coverage_root = store
+            .patricia
+            .construction_remove_many(construction, coverage_root, &removals)
+            .map_err(store_error)?;
+        reverse_root = store
+            .patricia
+            .construction_insert_many(construction, reverse_root, &reverse_updates)
+            .map_err(store_error)?;
+        reverse_root = store
+            .patricia
+            .construction_remove_many(
+                construction,
+                reverse_root,
+                &reverse_removals.into_iter().collect::<Vec<_>>(),
+            )
+            .map_err(store_error)?;
+        construction.checkpoint([facts_root, coverage_root, reverse_root]);
+        let post_root = ReferenceCatalogRootV2::new(
+            &self.policy,
+            source_count,
+            coverage_root.digest(),
+            facts_root.digest(),
+            reverse_root.digest(),
+            page_names,
+            external_uuid_claim_authority_root,
+        )?;
+        let transition = if replacements.is_empty() {
+            ReferenceTransitionBindingV2::Empty
+        } else {
+            ReferenceTransitionBindingV2::Stored(store.publish_transition(&replacements)?)
+        };
+        let delta = ReferenceCatalogDeltaV2 {
+            schema_version: REFERENCE_CATALOG_SCHEMA_VERSION,
+            prior_root: self.root.clone(),
+            post_root,
+            transition,
+        };
+        delta.encode()?;
+        Ok(ReferenceCatalogCandidateV2 {
+            delta,
+            memory: None,
+            construction: Some(ReferenceCatalogConstructionEvidenceV2 {
+                construction_id,
+                store: Arc::clone(store),
+                structurally_validated: Cell::new(false),
+            }),
+        })
+    }
+
+    pub(crate) fn validate_prepared_candidate(
+        &self,
+        prepared: ReferenceCatalogPreparedCandidateV2<'_>,
+        accepted_delta: &ReferenceCatalogDeltaV2,
+        accepted_root: &ReferenceCatalogRootV2,
+    ) -> Result<(), ReferenceCatalogError> {
+        let ReferenceCatalogBackend::Construction {
+            store,
+            construction_id,
+            ..
+        } = &self.backend
+        else {
+            return Err(ReferenceCatalogError::AuthorityMismatch);
+        };
+        prepared.candidate.delta.validate()?;
+        if prepared.evidence.construction_id != *construction_id
+            || !Arc::ptr_eq(&prepared.evidence.store, store)
+            || prepared.candidate.delta != *accepted_delta
+            || prepared.candidate.delta.prior_root != self.root
+            || prepared.candidate.delta.post_root != *accepted_root
+            || prepared.candidate.root() != accepted_root
+        {
+            return Err(ReferenceCatalogError::AuthorityMismatch);
+        }
+        prepared.evidence.structurally_validated.set(true);
+        #[cfg(test)]
+        self.prepared_candidate_validations
+            .set(self.prepared_candidate_validations.get().saturating_add(1));
+        Ok(())
+    }
+
+    pub(crate) fn finish_construction(&mut self) -> Result<(), ReferenceCatalogError> {
+        let store = match &mut self.backend {
+            ReferenceCatalogBackend::Construction {
+                store, patricia, ..
+            } => {
+                #[cfg(test)]
+                {
+                    self.completed_construction_stats = Some(patricia.get_mut().stats());
+                }
+                store
+                    .patricia
+                    .finish_construction(patricia.get_mut())
+                    .map_err(store_error)?;
+                Arc::clone(store)
+            }
+            ReferenceCatalogBackend::Memory(_)
+            | ReferenceCatalogBackend::Store(_)
+            | ReferenceCatalogBackend::RecoveryRequired(_) => return Ok(()),
+        };
+        // This is the sole construction-time full-catalog proof. It runs only
+        // after every staged node and posting is immutable-published, before
+        // the detached candidate can leave its authoring session.
+        store.validate_catalog_root(&self.root)?;
+        #[cfg(test)]
+        self.final_catalog_validations
+            .set(self.final_catalog_validations.get().saturating_add(1));
+        self.backend = ReferenceCatalogBackend::Store(store);
+        Ok(())
+    }
+
     pub(crate) fn commit(&mut self, candidate: ReferenceCatalogCandidateV2) {
-        debug_assert_eq!(candidate.delta.prior_root, self.root);
+        assert_eq!(candidate.delta.prior_root, self.root);
+        assert!(
+            candidate
+                .construction
+                .as_ref()
+                .is_none_or(|evidence| evidence.structurally_validated.get()),
+            "construction candidate must be structurally cross-checked before commit"
+        );
         if let Some(memory) = candidate.memory {
             self.backend = ReferenceCatalogBackend::Memory(memory);
         }
@@ -2286,6 +2649,92 @@ mod tests {
             state.hot_entry_count(),
             MAX_EPHEMERAL_REFERENCE_CATALOG_SOURCES
         );
+    }
+
+    #[test]
+    fn prepared_construction_candidate_is_bound_to_exact_delta_roots_and_catalog() {
+        let names = PageNameOwnershipRootV1::empty();
+        let uuid_root = ContentDigest::of(b"prepared-construction-uuid-root");
+        let (path, durable) = store("prepared-construction");
+        let mut state =
+            ReferenceCatalogStateV2::empty(ReferenceCatalogPolicyV1::default(), &names, uuid_root)
+                .unwrap();
+        state
+            .attach_construction_store(Arc::clone(&durable))
+            .unwrap();
+        let candidate = state
+            .prepare(
+                BTreeMap::from([(page(1), Some(source(page(1), "[[Target]]")))]),
+                &names,
+                uuid_root,
+            )
+            .unwrap();
+        let prepared = candidate.prepared_candidate().unwrap();
+        let delta = candidate.delta().clone();
+        let prior_root = delta.prior_root.clone();
+        let post_root = candidate.root().clone();
+
+        assert_eq!(
+            state.validate_prepared_candidate(prepared, &delta, &prior_root),
+            Err(ReferenceCatalogError::AuthorityMismatch),
+            "post root cannot be substituted"
+        );
+        let mut wrong_prior = delta.clone();
+        wrong_prior.prior_root = post_root.clone();
+        assert_eq!(
+            state.validate_prepared_candidate(prepared, &wrong_prior, &post_root),
+            Err(ReferenceCatalogError::AuthorityMismatch),
+            "prior root cannot be substituted"
+        );
+        let mut wrong_post = delta.clone();
+        wrong_post.post_root = prior_root.clone();
+        assert_eq!(
+            state.validate_prepared_candidate(prepared, &wrong_post, &post_root),
+            Err(ReferenceCatalogError::AuthorityMismatch),
+            "delta cannot be substituted"
+        );
+
+        let mut substituted_candidate_state =
+            ReferenceCatalogStateV2::empty(ReferenceCatalogPolicyV1::default(), &names, uuid_root)
+                .unwrap();
+        substituted_candidate_state
+            .attach_construction_store(Arc::clone(&durable))
+            .unwrap();
+        let substituted_candidate = substituted_candidate_state
+            .prepare(
+                BTreeMap::from([(page(2), Some(source(page(2), "[[Other]]")))]),
+                &names,
+                uuid_root,
+            )
+            .unwrap();
+        assert_eq!(
+            state.validate_prepared_candidate(
+                substituted_candidate.prepared_candidate().unwrap(),
+                substituted_candidate.delta(),
+                substituted_candidate.root(),
+            ),
+            Err(ReferenceCatalogError::AuthorityMismatch),
+            "prepared candidate cannot be substituted even within the same catalog store"
+        );
+
+        let (_other_path, other_durable) = store("prepared-construction-other");
+        let mut other =
+            ReferenceCatalogStateV2::empty(ReferenceCatalogPolicyV1::default(), &names, uuid_root)
+                .unwrap();
+        other.attach_construction_store(other_durable).unwrap();
+        assert_eq!(
+            other.validate_prepared_candidate(prepared, &delta, &post_root),
+            Err(ReferenceCatalogError::AuthorityMismatch),
+            "catalog capability cannot be substituted"
+        );
+
+        state
+            .validate_prepared_candidate(prepared, &delta, &post_root)
+            .unwrap();
+        state.commit(candidate);
+        state.finish_construction().unwrap();
+        assert_eq!(state.root(), &post_root);
+        std::fs::remove_dir_all(path).unwrap();
     }
 
     #[test]

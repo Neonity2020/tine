@@ -10149,6 +10149,24 @@ mod tests {
         let work = prepared.candidate().bootstrap_catalog_work_stats();
         assert_eq!(work.full_catalog_author_clones, 0);
         assert_eq!(work.reference_fallback_document_reconstructions, 0);
+        assert!(
+            work.reference_catalog_peak_resident_bytes
+                <= super::super::authenticated_patricia::MAX_PATRICIA_CONSTRUCTION_RESIDENT_BYTES,
+            "private Patricia construction exceeded its fixed resident budget: {work:?}"
+        );
+        assert_eq!(
+            work.reference_catalog_prepared_validations,
+            prepared.aggregate().parts().len(),
+            "each accepted part must consume one exact prepared-candidate proof"
+        );
+        assert_eq!(
+            work.reference_catalog_full_delta_validations, 0,
+            "private same-call construction must not replay prepared catalog deltas"
+        );
+        assert_eq!(
+            work.reference_catalog_final_validations, 1,
+            "the complete reachable catalog must be validated exactly once before the candidate leaves construction"
+        );
         assert_eq!(
             work.authenticated_page_identity_lookups,
             PAGE_COUNT * 3,

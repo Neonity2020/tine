@@ -40,8 +40,8 @@ use super::portable_path_index::{
 use super::reference_catalog::{
     affected_reference_sources, reference_source_is_org, ReferenceCandidateTargetV2,
     ReferenceCatalogCandidateV2, ReferenceCatalogDeltaV2, ReferenceCatalogError,
-    ReferenceCatalogPolicyV1, ReferenceCatalogRootV2, ReferenceCatalogStateV2,
-    ReferenceCatalogStore, ReferenceSourceBlockV1, ReferenceSourcePageV1,
+    ReferenceCatalogPolicyV1, ReferenceCatalogPreparedCandidateV2, ReferenceCatalogRootV2,
+    ReferenceCatalogStateV2, ReferenceCatalogStore, ReferenceSourceBlockV1, ReferenceSourcePageV1,
 };
 #[cfg(test)]
 use super::reference_catalog::{
@@ -1934,6 +1934,11 @@ pub(crate) struct BootstrapCatalogWorkStats {
     pub(crate) authenticated_page_identity_lookups: usize,
     pub(crate) full_catalog_author_clones: usize,
     pub(crate) reference_fallback_document_reconstructions: usize,
+    pub(crate) reference_catalog_peak_resident_bytes: usize,
+    pub(crate) reference_catalog_buffer_flushes: usize,
+    pub(crate) reference_catalog_prepared_validations: usize,
+    pub(crate) reference_catalog_full_delta_validations: usize,
+    pub(crate) reference_catalog_final_validations: usize,
 }
 
 #[allow(dead_code)]
@@ -1969,11 +1974,17 @@ impl DetachedBootstrapCandidate {
     #[cfg(test)]
     pub(crate) fn bootstrap_catalog_work_stats(&self) -> BootstrapCatalogWorkStats {
         let reference = self.engine.reference_source_observations.get();
+        let construction = self.engine.reference_catalog.construction_work_stats();
         BootstrapCatalogWorkStats {
             authenticated_page_identity_lookups: reference.authenticated_page_identity_lookups,
             full_catalog_author_clones: self.engine.read_only_catalog_clones.get(),
             reference_fallback_document_reconstructions: reference
                 .fallback_document_reconstructions,
+            reference_catalog_peak_resident_bytes: construction.peak_resident_bytes,
+            reference_catalog_buffer_flushes: construction.buffer_flushes,
+            reference_catalog_prepared_validations: construction.prepared_candidate_validations,
+            reference_catalog_full_delta_validations: construction.full_delta_validations,
+            reference_catalog_final_validations: construction.final_catalog_validations,
         }
     }
 
@@ -2152,6 +2163,41 @@ impl DetachedBootstrapAuthoringSession {
         reference_catalog_policy: ReferenceCatalogPolicyV1,
         indexes: &BootstrapAuthoringCapability,
     ) -> Result<Self, EngineError> {
+        Self::new_with_catalog_mode(
+            workspace_id,
+            lineage_digest,
+            catalog_document_id,
+            reference_catalog_policy,
+            indexes,
+            true,
+        )
+    }
+
+    fn new_replay(
+        workspace_id: WorkspaceId,
+        lineage_digest: LineageDigest,
+        catalog_document_id: DocumentId,
+        reference_catalog_policy: ReferenceCatalogPolicyV1,
+        indexes: &BootstrapAuthoringCapability,
+    ) -> Result<Self, EngineError> {
+        Self::new_with_catalog_mode(
+            workspace_id,
+            lineage_digest,
+            catalog_document_id,
+            reference_catalog_policy,
+            indexes,
+            false,
+        )
+    }
+
+    fn new_with_catalog_mode(
+        workspace_id: WorkspaceId,
+        lineage_digest: LineageDigest,
+        catalog_document_id: DocumentId,
+        reference_catalog_policy: ReferenceCatalogPolicyV1,
+        indexes: &BootstrapAuthoringCapability,
+        private_construction: bool,
+    ) -> Result<Self, EngineError> {
         if indexes.workspace_id() != workspace_id {
             return Err(EngineError::Archive(
                 "detached bootstrap authoring capability belongs to another workspace".into(),
@@ -2183,11 +2229,18 @@ impl DetachedBootstrapAuthoringSession {
         candidate.portable_path_index = Some(indexes.portable_path_index());
         candidate.logseq_claim_index = Some(indexes.logseq_claim_index());
         candidate.page_name_index = Some(indexes.page_name_index());
-        candidate
-            .reference_catalog
-            .attach_store(indexes.reference_catalog())
-            .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))?;
         candidate.configure_reference_catalog_policy(reference_catalog_policy)?;
+        if private_construction {
+            candidate
+                .reference_catalog
+                .attach_construction_store(indexes.reference_catalog())
+                .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))?;
+        } else {
+            candidate
+                .reference_catalog
+                .attach_store(indexes.reference_catalog())
+                .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))?;
+        }
         Ok(Self {
             candidate: Some(candidate),
             scratch_root: Some(scratch_root),
@@ -2319,7 +2372,7 @@ impl DetachedBootstrapAuthoringSession {
     }
 
     pub(crate) fn finish(self) -> Result<DetachedBootstrapCandidate, EngineError> {
-        let candidate = self.candidate.ok_or_else(|| {
+        let mut candidate = self.candidate.ok_or_else(|| {
             EngineError::InvalidTransaction(
                 "detached bootstrap authoring session is poisoned or consumed".into(),
             )
@@ -2332,6 +2385,10 @@ impl DetachedBootstrapAuthoringSession {
                 "detached bootstrap authoring session is incomplete".into(),
             ));
         }
+        candidate
+            .reference_catalog
+            .finish_construction()
+            .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))?;
         Ok(DetachedBootstrapCandidate {
             engine: candidate,
             scratch_root: self
@@ -2442,7 +2499,7 @@ where
     let indexes = store
         .bootstrap_authoring_capability()
         .map_err(|error| EngineError::Archive(error.to_string()))?;
-    let mut session = DetachedBootstrapAuthoringSession::new(
+    let mut session = DetachedBootstrapAuthoringSession::new_replay(
         preparation.workspace_id,
         preparation.lineage_digest,
         preparation.catalog_document_id,
@@ -4185,6 +4242,7 @@ impl BootstrapAuthoringTraceSnapshot {
                     .reference_source_observations
                     .get()
                     .fallback_document_reconstructions,
+                ..BootstrapCatalogWorkStats::default()
             },
         }
     }
@@ -14771,6 +14829,7 @@ impl ShardedHotEngine {
             self.durable_history_binding(),
             self.logseq_claim_root,
             self.reference_catalog.root().clone(),
+            None,
         )
     }
 
@@ -14782,6 +14841,7 @@ impl ShardedHotEngine {
         binding: super::object_store::EngineHistoryBinding,
         logseq_claim_root: LogseqClaimIndexRoot,
         reference_catalog_root: ReferenceCatalogRootV2,
+        prepared_reference_catalog: Option<ReferenceCatalogPreparedCandidateV2<'_>>,
     ) -> Result<(), EngineError> {
         if matches!(status, ArchiveStatus::Staged) {
             return Err(EngineError::Archive(
@@ -14809,9 +14869,17 @@ impl ShardedHotEngine {
                     "accepted evidence is not cross-bound to durable history authority".into(),
                 ));
             }
-            self.reference_catalog
-                .validate_delta(&evidence.reference_catalog_delta)
-                .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))?;
+            match prepared_reference_catalog {
+                Some(prepared) => self.reference_catalog.validate_prepared_candidate(
+                    prepared,
+                    &evidence.reference_catalog_delta,
+                    &reference_catalog_root,
+                ),
+                None => self
+                    .reference_catalog
+                    .validate_delta(&evidence.reference_catalog_delta),
+            }
+            .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))?;
         }
         if let Some(index) = &self.logseq_claim_index {
             index
@@ -16559,6 +16627,7 @@ impl ShardedHotEngine {
                 binding,
                 self.logseq_claim_root,
                 self.reference_catalog.root().clone(),
+                None,
             ) {
                 self.precommit_history_publication_failure = Some(error.clone());
                 return Err(error);
@@ -16618,6 +16687,9 @@ impl ShardedHotEngine {
             .expect("visible batch prepared reference catalog")
             .root()
             .clone();
+        let prepared_reference_catalog = reference_catalog
+            .as_ref()
+            .and_then(ReferenceCatalogCandidateV2::prepared_candidate);
         #[cfg(test)]
         let durable_history_started = Instant::now();
         if let Err(error) = self.persist_durable_final_status_with_binding(
@@ -16633,6 +16705,7 @@ impl ShardedHotEngine {
                 .expect("visible batch prepared UUID claims")
                 .0,
             reference_root,
+            prepared_reference_catalog,
         ) {
             self.precommit_history_publication_failure = Some(error.clone());
             return Err(error);
@@ -18196,6 +18269,7 @@ impl ShardedHotEngine {
                 binding,
                 self.logseq_claim_root,
                 self.reference_catalog.root().clone(),
+                None,
             ) {
                 self.precommit_history_publication_failure = Some(error.clone());
                 return Err(error);
@@ -18278,6 +18352,7 @@ impl ShardedHotEngine {
             self.durable_history_binding_with_page_names(catalog_binding, page_name_binding);
         binding.portable_path_root = portable_paths.root.digest();
         let fingerprint = self.archive_fingerprints[&batch_id];
+        let prepared_reference_catalog = reference_catalog.prepared_candidate();
         if let Err(error) = self.persist_durable_final_status_with_binding(
             batch_id,
             fingerprint,
@@ -18288,6 +18363,7 @@ impl ShardedHotEngine {
             binding,
             logseq_claim_candidate.0,
             reference_catalog.root().clone(),
+            prepared_reference_catalog,
         ) {
             self.precommit_history_publication_failure = Some(error.clone());
             return Err(error);
@@ -25330,6 +25406,17 @@ mod validation_tests {
             assert!(replayed.engine.archive_store.is_none());
             assert!(replayed.engine.history_store.is_none());
             assert!(replayed.engine.projection_work_index.is_none());
+            let replay_validation = replayed.engine.reference_catalog.construction_work_stats();
+            assert_eq!(replay_validation.prepared_candidate_validations, 0);
+            if multipart {
+                assert!(
+                    replay_validation.full_delta_validations >= 2,
+                    "fresh direct-loaded replay must retain a full catalog-delta validation for every part"
+                );
+            } else {
+                assert_eq!(replay_validation.full_delta_validations, 0);
+            }
+            assert_eq!(replay_validation.final_catalog_validations, 0);
             drop(replayed);
             drop(expected);
             drop(store);
