@@ -53,8 +53,9 @@ use crate::oplog::exact_external_feed::{
 };
 use crate::oplog::hot_engine::{ProjectionEndpointBinding, ProjectionStorageBinding};
 use crate::oplog::import::{
-    prepare_inactive_bootstrap_import, publish_install_verify_inactive_bootstrap,
-    retain_inactive_bootstrap_accepted_authority,
+    prepare_inactive_bootstrap_import_with_progress, publish_install_verify_inactive_bootstrap,
+    retain_inactive_bootstrap_accepted_authority, BootstrapPreparationProgress,
+    BootstrapPreparationSubphase, BootstrapPreparationSummary,
 };
 #[cfg(test)]
 use crate::oplog::import::{
@@ -726,7 +727,8 @@ pub fn inspect_shared_enrollment_for_cold_discovery(
         .transpose()
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SyncLocalActivationPhase {
     SourceCapture,
     BootstrapImportPreparation,
@@ -736,6 +738,134 @@ pub enum SyncLocalActivationPhase {
     ShadowReconstructionByteVerification,
     PromotionReceiptConfirmation,
     ReconciliationBaselineActorOpen,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncBootstrapPreparationSubphase {
+    SourceProtocol,
+    OperationSpool,
+    Partition,
+    DetachedAuthoring,
+    Sealing,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SyncBootstrapPreparationSummary {
+    pub source_files: u64,
+    pub source_bytes: u64,
+    pub parser_nodes: u64,
+    pub operations: u64,
+    pub parts: u32,
+    pub prepared_bytes: u64,
+    pub source_protocol_micros: u64,
+    pub operation_spool_micros: u64,
+    pub partition_micros: u64,
+    pub detached_authoring_micros: u64,
+    pub sealing_micros: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SyncLocalActivationProgress {
+    Phase {
+        phase: SyncLocalActivationPhase,
+    },
+    BootstrapPreparationSubphase {
+        subphase: SyncBootstrapPreparationSubphase,
+    },
+    BootstrapDetachedAuthoring {
+        completed: u32,
+        total: u32,
+    },
+    BootstrapPreparationSummary {
+        summary: SyncBootstrapPreparationSummary,
+    },
+}
+
+impl SyncLocalActivationProgress {
+    pub fn diagnostic_name(&self) -> String {
+        match self {
+            Self::Phase { phase } => phase.diagnostic_name().into(),
+            Self::BootstrapPreparationSubphase { subphase } => format!(
+                "bootstrap preparation: {}",
+                match subphase {
+                    SyncBootstrapPreparationSubphase::SourceProtocol => "source protocol",
+                    SyncBootstrapPreparationSubphase::OperationSpool => "operation spool",
+                    SyncBootstrapPreparationSubphase::Partition => "partition",
+                    SyncBootstrapPreparationSubphase::DetachedAuthoring => "detached authoring",
+                    SyncBootstrapPreparationSubphase::Sealing => "sealing",
+                }
+            ),
+            Self::BootstrapDetachedAuthoring { completed, total } => {
+                format!("bootstrap preparation: detached authoring {completed}/{total} parts")
+            }
+            Self::BootstrapPreparationSummary { summary } => format!(
+                "bootstrap preparation complete: source_files={}, source_bytes={}, parser_nodes={}, operations={}, parts={}, prepared_bytes={}, durations_us=source_protocol:{},operation_spool:{},partition:{},detached_authoring:{},sealing:{}",
+                summary.source_files,
+                summary.source_bytes,
+                summary.parser_nodes,
+                summary.operations,
+                summary.parts,
+                summary.prepared_bytes,
+                summary.source_protocol_micros,
+                summary.operation_spool_micros,
+                summary.partition_micros,
+                summary.detached_authoring_micros,
+                summary.sealing_micros,
+            ),
+        }
+    }
+}
+
+impl From<BootstrapPreparationSubphase> for SyncBootstrapPreparationSubphase {
+    fn from(subphase: BootstrapPreparationSubphase) -> Self {
+        match subphase {
+            BootstrapPreparationSubphase::SourceProtocol => Self::SourceProtocol,
+            BootstrapPreparationSubphase::OperationSpool => Self::OperationSpool,
+            BootstrapPreparationSubphase::Partition => Self::Partition,
+            BootstrapPreparationSubphase::DetachedAuthoring => Self::DetachedAuthoring,
+            BootstrapPreparationSubphase::Sealing => Self::Sealing,
+        }
+    }
+}
+
+impl From<BootstrapPreparationSummary> for SyncBootstrapPreparationSummary {
+    fn from(summary: BootstrapPreparationSummary) -> Self {
+        Self {
+            source_files: summary.source_files,
+            source_bytes: summary.source_bytes,
+            parser_nodes: summary.parser_nodes,
+            operations: summary.operations,
+            parts: summary.parts,
+            prepared_bytes: summary.prepared_bytes,
+            source_protocol_micros: summary.source_protocol_micros,
+            operation_spool_micros: summary.operation_spool_micros,
+            partition_micros: summary.partition_micros,
+            detached_authoring_micros: summary.detached_authoring_micros,
+            sealing_micros: summary.sealing_micros,
+        }
+    }
+}
+
+impl From<BootstrapPreparationProgress> for SyncLocalActivationProgress {
+    fn from(progress: BootstrapPreparationProgress) -> Self {
+        match progress {
+            BootstrapPreparationProgress::Subphase(subphase) => {
+                Self::BootstrapPreparationSubphase {
+                    subphase: subphase.into(),
+                }
+            }
+            BootstrapPreparationProgress::DetachedAuthoring { completed, total } => {
+                Self::BootstrapDetachedAuthoring { completed, total }
+            }
+            BootstrapPreparationProgress::Summary(summary) => {
+                Self::BootstrapPreparationSummary {
+                    summary: summary.into(),
+                }
+            }
+        }
+    }
 }
 
 impl SyncLocalActivationPhase {
@@ -1915,6 +2045,17 @@ impl SyncRuntimeHandle {
         request: SyncLocalActivationRequest,
         mut progress: impl FnMut(SyncLocalActivationPhase),
     ) -> SyncLocalActivationResult {
+        Self::activate_or_resume_local_with_detailed_progress(request, |detail| {
+            if let SyncLocalActivationProgress::Phase { phase } = detail {
+                progress(phase);
+            }
+        })
+    }
+
+    pub fn activate_or_resume_local_with_detailed_progress(
+        request: SyncLocalActivationRequest,
+        mut progress: impl FnMut(SyncLocalActivationProgress),
+    ) -> SyncLocalActivationResult {
         let graph = match Graph::open_checked(&request.graph_root) {
             Ok(graph) => graph,
             Err(error) => {
@@ -1972,7 +2113,9 @@ impl SyncRuntimeHandle {
                 if !identities_match_binding(&request.identities, &advisory.binding) {
                     return activation_blocked("explicit_identity_binding_mismatch");
                 }
-                progress(SyncLocalActivationPhase::ReconciliationBaselineActorOpen);
+                progress(SyncLocalActivationProgress::Phase {
+                    phase: SyncLocalActivationPhase::ReconciliationBaselineActorOpen,
+                });
                 if let Err(detail) =
                     ensure_reconciliation_baseline(&request, &graph, &advisory.binding)
                 {
@@ -2731,7 +2874,7 @@ fn activate_non_active_local(
     request: SyncLocalActivationRequest,
     graph: Graph,
     existing_binding: Option<EnrollmentBindingV1>,
-    progress: &mut dyn FnMut(SyncLocalActivationPhase),
+    progress: &mut dyn FnMut(SyncLocalActivationProgress),
 ) -> Result<SameProcessActivationHandoff, String> {
     prepare_activation_private_paths(&request)?;
     let enrollment = EnrollmentApplicationRoot::open_explicit_private(&request.enrollment_root)
@@ -2764,7 +2907,9 @@ fn activate_non_active_local(
 
     // Capture precedes every graph-local sparse archive write. The capture is
     // read-only and revalidated internally before bootstrap authoring.
-    progress(SyncLocalActivationPhase::SourceCapture);
+    progress(SyncLocalActivationProgress::Phase {
+        phase: SyncLocalActivationPhase::SourceCapture,
+    });
     let capture = graph
         .capture_inactive_bootstrap_sources(&request.capture_root)
         .map_err(display)?;
@@ -2844,8 +2989,10 @@ fn activate_non_active_local(
     let authoring_capability = authoring_store
         .bootstrap_authoring_capability()
         .map_err(display)?;
-    progress(SyncLocalActivationPhase::BootstrapImportPreparation);
-    let prepared = prepare_inactive_bootstrap_import(
+    progress(SyncLocalActivationProgress::Phase {
+        phase: SyncLocalActivationPhase::BootstrapImportPreparation,
+    });
+    let prepared = prepare_inactive_bootstrap_import_with_progress(
         &graph,
         capture,
         binding.workspace_id(),
@@ -2854,6 +3001,7 @@ fn activate_non_active_local(
         ReferenceCatalogPolicyV1::default(),
         &authoring_capability,
         &request.preparation_root,
+        |detail| progress(detail.into()),
     )
     .map_err(display)?;
     drop(authoring_capability);
@@ -2863,7 +3011,9 @@ fn activate_non_active_local(
         endpoint,
         receipt_store_id: receipts.store_id(),
     };
-    progress(SyncLocalActivationPhase::ImmutablePublicationInstall);
+    progress(SyncLocalActivationProgress::Phase {
+        phase: SyncLocalActivationPhase::ImmutablePublicationInstall,
+    });
     let verified = publish_install_verify_inactive_bootstrap(
         &prepared,
         ObjectStore::open(&request.archive_root, binding.workspace_id()).map_err(display)?,
@@ -2877,13 +3027,17 @@ fn activate_non_active_local(
     )
     .map_err(display)?;
 
-    progress(SyncLocalActivationPhase::BackupProof);
+    progress(SyncLocalActivationProgress::Phase {
+        phase: SyncLocalActivationPhase::BackupProof,
+    });
     let backup_root =
         MigrationBackupRoot::open(&request.migration_backup_root, &request.graph_root)
             .map_err(display)?;
     let source_backup =
         verify_migration_source_backup(&backup_root, &prepared, &verified).map_err(display)?;
-    progress(SyncLocalActivationPhase::SqliteOpenBuild);
+    progress(SyncLocalActivationProgress::Phase {
+        phase: SyncLocalActivationPhase::SqliteOpenBuild,
+    });
     let inactive = InactiveBootstrapRuntimeSession::open(
         &request.archive_root,
         binding.workspace_id(),
@@ -2892,7 +3046,9 @@ fn activate_non_active_local(
         &accepted_authority,
     )
     .map_err(display)?;
-    progress(SyncLocalActivationPhase::ShadowReconstructionByteVerification);
+    progress(SyncLocalActivationProgress::Phase {
+        phase: SyncLocalActivationPhase::ShadowReconstructionByteVerification,
+    });
     let shadow = verify_inactive_bootstrap_shadow_projection(
         &graph,
         &backup_root,
@@ -2933,7 +3089,9 @@ fn activate_non_active_local(
     )
     .map_err(display)?;
     activation_cut("after_verified_local")?;
-    progress(SyncLocalActivationPhase::PromotionReceiptConfirmation);
+    progress(SyncLocalActivationProgress::Phase {
+        phase: SyncLocalActivationPhase::PromotionReceiptConfirmation,
+    });
     let local_runtime = LocalActiveRuntime {
         engine: accepted_authority.accepted_engine(),
         projection: inactive.projection(),
@@ -2971,7 +3129,9 @@ fn activate_non_active_local(
     // below. Opening it here makes reconciliation a proven prerequisite while
     // avoiding a second database, archive, engine, or receipt-store open in
     // the uninterrupted activation transaction.
-    progress(SyncLocalActivationPhase::ReconciliationBaselineActorOpen);
+    progress(SyncLocalActivationProgress::Phase {
+        phase: SyncLocalActivationPhase::ReconciliationBaselineActorOpen,
+    });
     let baseline =
         open_reconciliation_baseline_with_runtime(&application_runtime_root, &graph, &binding)?;
     let promotion_session_id = promoted.promotion_session_id();
@@ -23484,6 +23644,90 @@ mod tests {
             observed <= ceiling,
             "scaled activation exceeded the near-linear normalized ceiling: small={small:?}, large={large:?}"
         );
+    }
+
+    #[test]
+    fn detailed_activation_progress_reports_preparation_parts_and_summary_observationally() {
+        let fixture = ActivationFixture::nested_unicode("detailed-progress", 0xa08f);
+        let before = user_graph_bytes(&fixture.graph_root);
+        let mut updates = Vec::new();
+        let activated = SyncRuntimeHandle::activate_or_resume_local_with_detailed_progress(
+            fixture.request.clone(),
+            |update| updates.push(update),
+        );
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        assert_eq!(user_graph_bytes(&fixture.graph_root), before);
+
+        let phases = updates
+            .iter()
+            .filter_map(|update| match update {
+                SyncLocalActivationProgress::Phase { phase } => Some(*phase),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            phases,
+            vec![
+                SyncLocalActivationPhase::SourceCapture,
+                SyncLocalActivationPhase::BootstrapImportPreparation,
+                SyncLocalActivationPhase::ImmutablePublicationInstall,
+                SyncLocalActivationPhase::BackupProof,
+                SyncLocalActivationPhase::SqliteOpenBuild,
+                SyncLocalActivationPhase::ShadowReconstructionByteVerification,
+                SyncLocalActivationPhase::PromotionReceiptConfirmation,
+                SyncLocalActivationPhase::ReconciliationBaselineActorOpen,
+            ]
+        );
+        let subphases = updates
+            .iter()
+            .filter_map(|update| match update {
+                SyncLocalActivationProgress::BootstrapPreparationSubphase { subphase } => {
+                    Some(*subphase)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            subphases,
+            vec![
+                SyncBootstrapPreparationSubphase::SourceProtocol,
+                SyncBootstrapPreparationSubphase::OperationSpool,
+                SyncBootstrapPreparationSubphase::Partition,
+                SyncBootstrapPreparationSubphase::DetachedAuthoring,
+                SyncBootstrapPreparationSubphase::Sealing,
+            ]
+        );
+        let authored = updates
+            .iter()
+            .filter_map(|update| match update {
+                SyncLocalActivationProgress::BootstrapDetachedAuthoring {
+                    completed,
+                    total,
+                } => Some((*completed, *total)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let total = authored.first().expect("initial part progress").1;
+        assert_eq!(
+            authored,
+            (0..=total).map(|completed| (completed, total)).collect::<Vec<_>>()
+        );
+        let summary = updates
+            .iter()
+            .find_map(|update| match update {
+                SyncLocalActivationProgress::BootstrapPreparationSummary { summary } => {
+                    Some(summary)
+                }
+                _ => None,
+            })
+            .expect("final preparation summary");
+        assert_eq!(summary.parts, total);
+        assert_eq!(summary.source_files, 3);
+        assert!(summary.source_bytes > 0);
+        assert!(summary.parser_nodes > 0);
+        assert!(summary.operations > 0);
+        assert!(summary.prepared_bytes > 0);
+        drop(activated.handle);
     }
 
     #[test]

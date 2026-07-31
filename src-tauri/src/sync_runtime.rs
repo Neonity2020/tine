@@ -9,19 +9,19 @@ use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 use tine_core::model::GraphMeta;
 use tine_core::oplog::{
     DeviceId, DocumentId, LineageDigest, ProjectionEndpointId, SessionId, WorkspaceId,
 };
 use tine_core::sync_runtime::{
     inspect_shared_enrollment_for_cold_discovery, SyncAmbiguousEvidence,
-    SyncLocalActivationIdentities, SyncLocalActivationPhase, SyncLocalActivationRequest,
-    SyncLocalActivationResult, SyncLocalActivationStage, SyncLocalActivationStatus,
-    SyncNonActiveStage, SyncRuntimeComponent, SyncRuntimeHandle, SyncRuntimeLifecycle,
-    SyncRuntimeOpenRequest, SyncRuntimeOpenResult, SyncRuntimeOpenStatus, SyncRuntimeRecovery,
-    SyncRuntimeStatusSnapshot, SyncRuntimeTick, SyncSharedEnrollmentDescriptor, SyncSharedPhase,
-    SyncSharedRole, SyncShutdownOutcome, SyncStorageProfile,
+    SyncLocalActivationIdentities, SyncLocalActivationPhase, SyncLocalActivationProgress,
+    SyncLocalActivationRequest, SyncLocalActivationResult, SyncLocalActivationStage,
+    SyncLocalActivationStatus, SyncNonActiveStage, SyncRuntimeComponent, SyncRuntimeHandle,
+    SyncRuntimeLifecycle, SyncRuntimeOpenRequest, SyncRuntimeOpenResult, SyncRuntimeOpenStatus,
+    SyncRuntimeRecovery, SyncRuntimeStatusSnapshot, SyncRuntimeTick, SyncSharedEnrollmentDescriptor,
+    SyncSharedPhase, SyncSharedRole, SyncShutdownOutcome, SyncStorageProfile,
 };
 use uuid::Uuid;
 
@@ -754,6 +754,20 @@ impl SyncRuntimeFacade {
         ))
     }
 
+    pub(crate) fn activate_record_with_detailed_progress(
+        &self,
+        app: &tauri::AppHandle,
+        record: &SparseV2ActivationRecord,
+        progress: impl FnMut(SyncLocalActivationProgress),
+    ) -> Result<SparseV2Binding, String> {
+        Ok(SparseV2Binding::from_activation(
+            SyncRuntimeHandle::activate_or_resume_local_with_detailed_progress(
+                record.activation_request(app)?,
+                progress,
+            ),
+        ))
+    }
+
     #[cfg(test)]
     fn open_explicit(&self, request: SyncRuntimeOpenRequest) -> SyncRuntimeOpenResult {
         SyncRuntimeHandle::open(request)
@@ -762,6 +776,7 @@ impl SyncRuntimeFacade {
 
 const LEGACY_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const ACTIVATION_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+const ACTIVATION_PROGRESS_EVENT: &str = "sparse-v2-activation-progress";
 pub(crate) const SPARSE_V2_NOT_ACTIVE: &str =
     "Tine-managed storage is not ready. Retry setup or return to Direct files.";
 
@@ -770,20 +785,30 @@ struct ActivationHeartbeat {
     join: Option<JoinHandle<()>>,
 }
 
+fn latest_activation_progress_name(
+    latest_progress: &Arc<Mutex<Option<SyncLocalActivationProgress>>>,
+) -> String {
+    latest_progress
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .map(SyncLocalActivationProgress::diagnostic_name)
+        .unwrap_or_else(|| "core bootstrap setup".into())
+}
+
 impl ActivationHeartbeat {
-    fn start(started: Instant, latest_phase: Arc<Mutex<Option<SyncLocalActivationPhase>>>) -> Self {
+    fn start(
+        started: Instant,
+        latest_progress: Arc<Mutex<Option<SyncLocalActivationProgress>>>,
+    ) -> Self {
         let (stop, stopped) = mpsc::channel();
         let join = std::thread::spawn(move || loop {
             match stopped.recv_timeout(ACTIVATION_HEARTBEAT_INTERVAL) {
                 Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    let phase = latest_phase
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .map(SyncLocalActivationPhase::diagnostic_name)
-                        .unwrap_or("core bootstrap setup");
+                    let progress = latest_activation_progress_name(&latest_progress);
                     crate::debug::diag(format!(
-                        "sparse-v2 activation heartbeat after {} ms: phase={phase}",
+                        "sparse-v2 activation heartbeat after {} ms: progress={progress}",
                         started.elapsed().as_millis()
                     ));
                 }
@@ -805,22 +830,38 @@ impl Drop for ActivationHeartbeat {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+struct SparseV2ActivationProgressEvent {
+    binding_generation: u64,
+    progress: SyncLocalActivationProgress,
+}
+
 fn activate_record_with_diagnostics(
     facade: &SyncRuntimeFacade,
     app: &tauri::AppHandle,
+    label: &str,
+    binding_generation: u64,
     record: &SparseV2ActivationRecord,
 ) -> Result<SparseV2Binding, String> {
     let started = Instant::now();
-    let latest_phase = Arc::new(Mutex::new(None));
-    let heartbeat = ActivationHeartbeat::start(started, Arc::clone(&latest_phase));
-    let result = facade.activate_record_with_progress(app, record, |phase| {
-        *latest_phase
+    let latest_progress = Arc::new(Mutex::new(None));
+    let heartbeat = ActivationHeartbeat::start(started, Arc::clone(&latest_progress));
+    let result = facade.activate_record_with_detailed_progress(app, record, |progress| {
+        let diagnostic = progress.diagnostic_name();
+        let _ = app.emit_to(
+            label,
+            ACTIVATION_PROGRESS_EVENT,
+            SparseV2ActivationProgressEvent {
+                binding_generation,
+                progress: progress.clone(),
+            },
+        );
+        *latest_progress
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(phase);
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(progress);
         crate::debug::diag(format!(
-            "sparse-v2 activation phase after {} ms: {}",
+            "sparse-v2 activation progress after {} ms: {diagnostic}",
             started.elapsed().as_millis(),
-            phase.diagnostic_name()
         ));
     });
     drop(heartbeat);
@@ -928,7 +969,13 @@ fn activate_sparse_v2_blocking(
         let binding = match action {
             SparseV2BindingAction::ReopenActive => state.sync_runtime.open_record(app, &record)?,
             SparseV2BindingAction::ActivateOrResume => {
-                activate_record_with_diagnostics(&state.sync_runtime, app, &record)?
+                activate_record_with_diagnostics(
+                    &state.sync_runtime,
+                    app,
+                    label,
+                    binding_generation,
+                    &record,
+                )?
             }
             SparseV2BindingAction::ReturnRetained => {
                 unreachable!("retained bindings return before replacement")
@@ -1022,7 +1069,13 @@ fn activate_sparse_v2_blocking(
     ));
 
     let core_started = Instant::now();
-    let binding = activate_record_with_diagnostics(&state.sync_runtime, app, &record)?;
+    let binding = activate_record_with_diagnostics(
+        &state.sync_runtime,
+        app,
+        label,
+        binding_generation,
+        &record,
+    )?;
     crate::debug::diag(format!(
         "sparse-v2 core bootstrap completed after {} ms: availability={:?}",
         core_started.elapsed().as_millis(),
@@ -1588,6 +1641,29 @@ mod tests {
             started.elapsed() < Duration::from_secs(1),
             "heartbeat shutdown waited for the ten-second reporting interval"
         );
+    }
+
+    #[test]
+    fn activation_heartbeat_reports_latest_detailed_part_progress() {
+        let latest = Arc::new(Mutex::new(Some(
+            SyncLocalActivationProgress::BootstrapDetachedAuthoring {
+                completed: 2,
+                total: 5,
+            },
+        )));
+        assert_eq!(
+            latest_activation_progress_name(&latest),
+            "bootstrap preparation: detached authoring 2/5 parts"
+        );
+        let event = SparseV2ActivationProgressEvent {
+            binding_generation: 17,
+            progress: latest.lock().unwrap().clone().unwrap(),
+        };
+        let serialized = serde_json::to_value(event).unwrap();
+        assert_eq!(serialized["binding_generation"], 17);
+        assert_eq!(serialized["progress"]["kind"], "bootstrap_detached_authoring");
+        assert_eq!(serialized["progress"]["completed"], 2);
+        assert_eq!(serialized["progress"]["total"], 5);
     }
 
     struct RollbackFixture {

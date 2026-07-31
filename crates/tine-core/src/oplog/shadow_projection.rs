@@ -222,6 +222,12 @@ pub(crate) enum ShadowProjectionError {
     Io(io::Error),
     Backup(MigrationBackupError),
     BindingMismatch(&'static str),
+    NormalSparseMismatch {
+        path: String,
+        source_bytes: usize,
+        projected_bytes: usize,
+        detail: NormalSparseMismatchDetail,
+    },
     CorruptOrConflicting(&'static str),
     Projection(String),
     ResourceLimit {
@@ -232,6 +238,13 @@ pub(crate) enum ShadowProjectionError {
     InjectedCrashCut(&'static str),
 }
 
+#[derive(Debug)]
+pub(crate) enum NormalSparseMismatchDetail {
+    FirstDifferingByte(usize),
+    CommonPrefixEnded,
+    BindingChecks(Vec<&'static str>),
+}
+
 impl fmt::Display for ShadowProjectionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -239,6 +252,30 @@ impl fmt::Display for ShadowProjectionError {
             Self::Backup(error) => error.fmt(formatter),
             Self::BindingMismatch(detail) | Self::CorruptOrConflicting(detail) => {
                 formatter.write_str(detail)
+            }
+            Self::NormalSparseMismatch {
+                path,
+                source_bytes,
+                projected_bytes,
+                detail,
+            } => {
+                write!(
+                    formatter,
+                    "normal sparse projection mismatch for {path}: source byte length={source_bytes}, projected byte length={projected_bytes}; "
+                )?;
+                match detail {
+                    NormalSparseMismatchDetail::FirstDifferingByte(offset) => {
+                        write!(formatter, "first differing byte offset {offset}")
+                    }
+                    NormalSparseMismatchDetail::CommonPrefixEnded => {
+                        formatter.write_str("common prefix ended")
+                    }
+                    NormalSparseMismatchDetail::BindingChecks(checks) => write!(
+                        formatter,
+                        "bytes are equal; failed non-byte binding checks: {}",
+                        checks.join(", ")
+                    ),
+                }
             }
             Self::Projection(detail) => formatter.write_str(detail),
             Self::ResourceLimit {
@@ -2050,17 +2087,40 @@ fn require_byte_identical_projection(
     path: &ManagedPath,
     description: BlobDescription,
 ) -> Result<(), ShadowProjectionError> {
-    if target != source
-        || intent.page_id() != page_id
-        || intent.path() != path
-        || intent.target() != description
-        || intent.precondition() != &ProjectionPrecondition::Base(description)
-    {
-        return Err(ShadowProjectionError::BindingMismatch(
-            "normal sparse projection is not byte-identical to captured source",
-        ));
-    }
-    Ok(())
+    let detail = if target != source {
+        target
+            .iter()
+            .zip(source)
+            .position(|(projected, captured)| projected != captured)
+            .map_or(
+                NormalSparseMismatchDetail::CommonPrefixEnded,
+                NormalSparseMismatchDetail::FirstDifferingByte,
+            )
+    } else {
+        let mut checks = Vec::new();
+        if intent.page_id() != page_id {
+            checks.push("intent page");
+        }
+        if intent.path() != path {
+            checks.push("intent path");
+        }
+        if intent.target() != description {
+            checks.push("intent target");
+        }
+        if intent.precondition() != &ProjectionPrecondition::Base(description) {
+            checks.push("intent precondition");
+        }
+        if checks.is_empty() {
+            return Ok(());
+        }
+        NormalSparseMismatchDetail::BindingChecks(checks)
+    };
+    Err(ShadowProjectionError::NormalSparseMismatch {
+        path: path.as_str().to_owned(),
+        source_bytes: source.len(),
+        projected_bytes: target.len(),
+        detail,
+    })
 }
 
 fn publish_payloads_and_manifest(
@@ -5402,8 +5462,7 @@ mod tests {
         assert!(fixture.verify().is_err());
     }
 
-    #[test]
-    fn renderer_id_injection_and_normalization_mismatches_fail_closed() {
+    fn synthetic_normal_sparse_mismatch() -> (PageId, ManagedPath, Vec<u8>, ProjectionIntent) {
         let workspace = WorkspaceId::from_uuid(Uuid::from_u128(0x8200));
         let page_id = PageId::from_uuid(Uuid::from_u128(0x8201));
         let block_id = BlockId::from_uuid(Uuid::from_u128(0x8202));
@@ -5443,18 +5502,69 @@ mod tests {
             )
             .unwrap()],
         };
-        let source = b"- target\r\n";
-        let plan = plan_projection(workspace, &state, Some(source)).unwrap();
-        assert_ne!(plan.target(), source);
-        assert!(require_byte_identical_projection(
-            plan.target(),
-            plan.intent(),
-            source,
+        let path = ManagedPath::parse("pages/renderer.md").unwrap();
+        let source = b"- target\r\n".to_vec();
+        let plan = plan_projection(workspace, &state, Some(&source)).unwrap();
+        (page_id, path, source, plan.intent().clone())
+    }
+
+    #[test]
+    fn normal_sparse_content_mismatch_reports_path_lengths_and_first_offset() {
+        let (page_id, path, source, intent) = synthetic_normal_sparse_mismatch();
+        let mut projected = source.clone();
+        projected[3] = b'X';
+        let error = require_byte_identical_projection(
+            &projected,
+            &intent,
+            &source,
             page_id,
-            &ManagedPath::parse("pages/renderer.md").unwrap(),
-            BlobDescription::of(source),
+            &path,
+            BlobDescription::of(&source),
         )
-        .is_err());
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("pages/renderer.md"), "{error}");
+        assert!(error.contains("source byte length=10"), "{error}");
+        assert!(error.contains("projected byte length=10"), "{error}");
+        assert!(error.contains("first differing byte offset 3"), "{error}");
+        assert!(!error.contains("target\r\n"), "{error}");
+    }
+
+    #[test]
+    fn normal_sparse_prefix_mismatch_reports_common_prefix_end() {
+        let (page_id, path, source, intent) = synthetic_normal_sparse_mismatch();
+        let projected = &source[..source.len() - 2];
+        let error = require_byte_identical_projection(
+            projected,
+            &intent,
+            &source,
+            page_id,
+            &path,
+            BlobDescription::of(&source),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("pages/renderer.md"), "{error}");
+        assert!(error.contains("source byte length=10"), "{error}");
+        assert!(error.contains("projected byte length=8"), "{error}");
+        assert!(error.contains("common prefix ended"), "{error}");
+    }
+
+    #[test]
+    fn normal_sparse_equal_bytes_name_failed_non_byte_binding_checks() {
+        let (page_id, path, source, intent) = synthetic_normal_sparse_mismatch();
+        let error = require_byte_identical_projection(
+            &source,
+            &intent,
+            &source,
+            page_id,
+            &path,
+            BlobDescription::of(&source),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("bytes are equal"), "{error}");
+        assert!(error.contains("intent target"), "{error}");
     }
 
     #[test]

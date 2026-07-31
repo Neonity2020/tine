@@ -27,6 +27,7 @@ import type {
   ManagedSyncEnableResult,
   SparseV2Status,
   SparseV2CancelResult,
+  SparseV2ActivationProgressEvent,
   SparseV2Tick,
   SparseV2QueryRequest,
   SparseV2QueryReply,
@@ -234,6 +235,10 @@ export interface Backend {
   managedSyncIdentityPlan(): Promise<SyncIdentityPlan>;
   enableManagedSync(): Promise<ManagedSyncEnableResult>;
   sparseV2Status(): Promise<SparseV2Status>;
+  onSparseV2ActivationProgress(
+    bindingGeneration: number,
+    cb: (progress: SparseV2ActivationProgressEvent["progress"]) => void
+  ): Promise<() => void>;
   activateSparseV2(): Promise<SparseV2Status>;
   cancelSparseV2(): Promise<SparseV2CancelResult>;
   prepareSparseV2Share(): Promise<SparseV2Status>;
@@ -696,6 +701,15 @@ class TauriBackend implements Backend {
   }
   sparseV2Status() {
     return this.call<SparseV2Status>("sparse_v2_status");
+  }
+  async onSparseV2ActivationProgress(
+    bindingGeneration: number,
+    cb: (progress: SparseV2ActivationProgressEvent["progress"]) => void
+  ): Promise<() => void> {
+    const { listen } = await import("@tauri-apps/api/event");
+    return listen<SparseV2ActivationProgressEvent>("sparse-v2-activation-progress", (event) => {
+      if (event.payload.binding_generation === bindingGeneration) cb(event.payload.progress);
+    });
   }
   async activateSparseV2() {
     const result = await this.call<SparseV2Status>("activate_sparse_v2");

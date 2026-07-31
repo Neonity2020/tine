@@ -4,7 +4,7 @@ import { Settings } from "./Settings";
 import { closeSettings, openSettings, setToasts, toasts } from "../ui";
 import { backend } from "../backend";
 import * as store from "../store";
-import type { SparseV2Status } from "../types";
+import type { SparseV2ActivationProgress, SparseV2Status } from "../types";
 
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
 const showSparsePanel = async (root: HTMLElement) => {
@@ -150,6 +150,77 @@ describe("Settings storage transitions", () => {
     expect(root.textContent).toContain("Retry setup");
     expect(root.textContent).toContain("Setup paused. You can retry setup when you are ready.");
     expect(root.textContent).toContain("Return to Direct files");
+    dispose();
+  });
+
+  it("shows scoped indeterminate and part progress and unsubscribes for fresh setup and retry", async () => {
+    const calls: string[] = [];
+    const listeners: Array<(progress: SparseV2ActivationProgress) => void> = [];
+    const resolvers: Array<(status: SparseV2Status) => void> = [];
+    vi.spyOn(backend(), "sparseV2Status").mockResolvedValue(legacy());
+    vi.spyOn(backend(), "confirm").mockResolvedValue(true);
+    vi.spyOn(store, "flushAll").mockResolvedValue(true);
+    vi.spyOn(backend(), "onSparseV2ActivationProgress").mockImplementation(
+      async (generation, listener) => {
+        calls.push(`listen-${generation}`);
+        listeners.push(listener);
+        return () => calls.push(`unlisten-${generation}`);
+      }
+    );
+    vi.spyOn(backend(), "activateSparseV2").mockImplementation(
+      () => new Promise<SparseV2Status>((resolve) => {
+        calls.push("activate");
+        resolvers.push(resolve);
+      })
+    );
+
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <Settings />, root);
+    await showSparsePanel(root);
+    const enable = [...root.querySelectorAll("button")].find((button) =>
+      button.textContent?.includes("Enable Tine-managed storage")
+    ) as HTMLButtonElement;
+    enable.click();
+    await tick();
+    await tick();
+
+    expect(calls).toEqual(["listen-10", "activate"]);
+    listeners[0]({ kind: "phase", phase: "source_capture" });
+    await tick();
+    let progress = root.querySelector(".settings-activation-progress progress") as HTMLProgressElement;
+    expect(root.textContent).toContain("Capturing source files");
+    expect(progress.hasAttribute("value")).toBe(false);
+
+    listeners[0]({ kind: "bootstrap_detached_authoring", completed: 2, total: 4 });
+    await tick();
+    progress = root.querySelector(".settings-activation-progress progress") as HTMLProgressElement;
+    expect(root.textContent).toContain("Building operation history (2 of 4 parts)");
+    expect(progress.value).toBe(2);
+    expect(progress.max).toBe(4);
+
+    resolvers[0](localRetryable());
+    await tick();
+    await tick();
+    expect(calls).toContain("unlisten-10");
+    expect(root.querySelector(".settings-activation-progress")).toBeNull();
+
+    const retry = [...root.querySelectorAll("button")].find(
+      (button) => button.textContent === "Retry setup"
+    ) as HTMLButtonElement;
+    retry.click();
+    await tick();
+    await tick();
+    expect(calls.slice(-2)).toEqual(["listen-11", "activate"]);
+    listeners[1]({ kind: "bootstrap_preparation_subphase", subphase: "sealing" });
+    await tick();
+    progress = root.querySelector(".settings-activation-progress progress") as HTMLProgressElement;
+    expect(root.textContent).toContain("Sealing prepared history");
+    expect(progress.hasAttribute("value")).toBe(false);
+    resolvers[1](localActive());
+    await tick();
+    await tick();
+    expect(calls).toContain("unlisten-11");
     dispose();
   });
 

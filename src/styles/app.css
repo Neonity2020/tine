@@ -1954,6 +1954,16 @@ textarea {
   color: var(--text-muted);
   font-size: 12px;
 }
+.settings-activation-progress {
+  display: grid;
+  gap: 5px;
+  width: min(320px, 100%);
+  margin-top: 8px;
+}
+.settings-activation-progress progress {
+  display: block;
+  width: 100%;
+}
 /* A setting laid out vertically: label + control on the top line, the
    explanatory hint on its own full-width line below (so long hints wrap
    cleanly instead of being crammed into the right column). Matches the

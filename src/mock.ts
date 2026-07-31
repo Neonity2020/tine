@@ -888,6 +888,9 @@ export function mockBackend(): Backend {
     async sparseV2Status() {
       return sparseV2;
     },
+    async onSparseV2ActivationProgress() {
+      return () => {};
+    },
     async activateSparseV2() {
       sparseV2 = {
         state: "active",

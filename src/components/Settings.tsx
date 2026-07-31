@@ -108,7 +108,7 @@ import { ShortcutsSettingsPane } from "./HelpShortcuts";
 import { switchGraph, loadGraphPath } from "../graph";
 import { flushAll, resetStore } from "../store";
 import { backend, isTauri, type BackupInfo } from "../backend";
-import type { AssetInfo, TrashStats, JournalFile, SyncConflict, SyncConflictDiff, DiffRow, MergeDecision, SparseV2Status } from "../types";
+import type { AssetInfo, TrashStats, JournalFile, SyncConflict, SyncConflictDiff, DiffRow, MergeDecision, SparseV2ActivationProgress, SparseV2Status } from "../types";
 import { formatJournal } from "../journal";
 import { installedPlugins, pluginManager, type ManagedPlugin } from "../plugins/manager";
 import {
@@ -1936,6 +1936,7 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
   const [status, setStatus] = createSignal<SparseV2Status | null>(null);
   const [loading, setLoading] = createSignal(true);
   const [enabling, setEnabling] = createSignal(false);
+  const [activationProgress, setActivationProgress] = createSignal<SparseV2ActivationProgress | null>(null);
   const [sharing, setSharing] = createSignal(false);
   const [cancelling, setCancelling] = createSignal(false);
   const retryable = () => {
@@ -1949,6 +1950,41 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
   const refused = () => {
     const value = status();
     return value?.state === "refused" ? value : null;
+  };
+  const activationPartProgress = () => {
+    const progress = activationProgress();
+    return progress?.kind === "bootstrap_detached_authoring" && progress.total > 0
+      ? progress
+      : null;
+  };
+  const activationProgressLabel = () => {
+    const progress = activationProgress();
+    if (!progress) return "Preparing Tine-managed storage…";
+    if (progress.kind === "bootstrap_detached_authoring") {
+      return `Building operation history (${progress.completed} of ${progress.total} parts)…`;
+    }
+    if (progress.kind === "bootstrap_preparation_subphase") {
+      return {
+        source_protocol: "Preparing source inventory…",
+        operation_spool: "Planning graph operations…",
+        partition: "Dividing setup work into parts…",
+        detached_authoring: "Building operation history…",
+        sealing: "Sealing prepared history…",
+      }[progress.subphase];
+    }
+    if (progress.kind === "bootstrap_preparation_summary") {
+      return "Prepared graph operation history…";
+    }
+    return {
+      source_capture: "Capturing source files…",
+      bootstrap_import_preparation: "Preparing graph operation history…",
+      immutable_publication_install: "Installing prepared history…",
+      backup_proof: "Verifying the safety backup…",
+      sqlite_open_build: "Building the local index…",
+      shadow_reconstruction_byte_verification: "Verifying exact file reconstruction…",
+      promotion_receipt_confirmation: "Confirming managed storage…",
+      reconciliation_baseline_actor_open: "Starting managed storage…",
+    }[progress.phase];
   };
 
   const refresh = async () => {
@@ -1977,7 +2013,9 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
 
   const enable = async () => {
     setEnabling(true);
+    setActivationProgress(null);
     setGraphTransitioning(true);
+    let unlisten: (() => void) | undefined;
     try {
       if (!(await flushAll())) {
         pushToast("Resolve pending save conflicts before enabling Tine-managed storage.", "error");
@@ -1989,6 +2027,18 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
           `Existing Markdown/Org files stay in place and remain Logseq-compatible.`
       );
       if (!confirmed) return;
+      const generation = status()?.binding_generation;
+      if (generation !== undefined) {
+        try {
+          unlisten = await backend().onSparseV2ActivationProgress(
+            generation,
+            setActivationProgress
+          );
+        } catch {
+          // Progress is observational; setup must continue if event listening
+          // is unavailable in an older or closing WebView.
+        }
+      }
       const result = await backend().activateSparseV2();
       setStatus(result);
       refreshAuthorityState();
@@ -2000,6 +2050,8 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
     } catch {
       pushToast("Tine-managed storage was not enabled. Retry setup.", "error");
     } finally {
+      unlisten?.();
+      setActivationProgress(null);
       setGraphTransitioning(false);
       setEnabling(false);
     }
@@ -2151,6 +2203,23 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
                     <button class="settings-btn" disabled={enabling()} onClick={() => void enable()}>
                       {enabling() ? "Retrying..." : "Retry setup"}
                     </button>
+                  </Show>
+                  <Show when={enabling()}>
+                    <div class="settings-activation-progress" role="status" aria-live="polite">
+                      <div class="settings-hint">{activationProgressLabel()}</div>
+                      <Show
+                        when={activationPartProgress()}
+                        fallback={<progress aria-label={activationProgressLabel()} />}
+                      >
+                        {(part) => (
+                          <progress
+                            aria-label={activationProgressLabel()}
+                            value={part().completed}
+                            max={part().total}
+                          />
+                        )}
+                      </Show>
+                    </div>
                   </Show>
                   <Show when={current().state === "active"}>
                     <span class="settings-value">Tine-managed storage active</span>

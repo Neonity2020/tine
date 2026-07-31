@@ -245,6 +245,48 @@ export interface SparseV2CancelResult {
   recovery_statement: string;
 }
 
+export type SparseV2ActivationPhase =
+  | "source_capture"
+  | "bootstrap_import_preparation"
+  | "immutable_publication_install"
+  | "backup_proof"
+  | "sqlite_open_build"
+  | "shadow_reconstruction_byte_verification"
+  | "promotion_receipt_confirmation"
+  | "reconciliation_baseline_actor_open";
+
+export type SparseV2BootstrapPreparationSubphase =
+  | "source_protocol"
+  | "operation_spool"
+  | "partition"
+  | "detached_authoring"
+  | "sealing";
+
+export interface SparseV2BootstrapPreparationSummary {
+  source_files: number;
+  source_bytes: number;
+  parser_nodes: number;
+  operations: number;
+  parts: number;
+  prepared_bytes: number;
+  source_protocol_micros: number;
+  operation_spool_micros: number;
+  partition_micros: number;
+  detached_authoring_micros: number;
+  sealing_micros: number;
+}
+
+export type SparseV2ActivationProgress =
+  | { kind: "phase"; phase: SparseV2ActivationPhase }
+  | { kind: "bootstrap_preparation_subphase"; subphase: SparseV2BootstrapPreparationSubphase }
+  | { kind: "bootstrap_detached_authoring"; completed: number; total: number }
+  | { kind: "bootstrap_preparation_summary"; summary: SparseV2BootstrapPreparationSummary };
+
+export interface SparseV2ActivationProgressEvent {
+  binding_generation: number;
+  progress: SparseV2ActivationProgress;
+}
+
 export type SparseV2EntityId =
   | { entity_type: "page"; id: string }
   | { entity_type: "block"; id: string };

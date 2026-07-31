@@ -202,6 +202,55 @@ pub(crate) struct BootstrapStreamingImportInstrumentation {
     pub(crate) preparation_sealing_micros: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BootstrapPreparationSubphase {
+    SourceProtocol,
+    OperationSpool,
+    Partition,
+    DetachedAuthoring,
+    Sealing,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BootstrapPreparationSummary {
+    pub(crate) source_files: u64,
+    pub(crate) source_bytes: u64,
+    pub(crate) parser_nodes: u64,
+    pub(crate) operations: u64,
+    pub(crate) parts: u32,
+    pub(crate) prepared_bytes: u64,
+    pub(crate) source_protocol_micros: u64,
+    pub(crate) operation_spool_micros: u64,
+    pub(crate) partition_micros: u64,
+    pub(crate) detached_authoring_micros: u64,
+    pub(crate) sealing_micros: u64,
+}
+
+impl From<&BootstrapStreamingImportInstrumentation> for BootstrapPreparationSummary {
+    fn from(instrumentation: &BootstrapStreamingImportInstrumentation) -> Self {
+        Self {
+            source_files: instrumentation.source_files,
+            source_bytes: instrumentation.source_bytes,
+            parser_nodes: instrumentation.parser_nodes,
+            operations: instrumentation.operations,
+            parts: instrumentation.parts,
+            prepared_bytes: instrumentation.prepared_bytes,
+            source_protocol_micros: instrumentation.source_protocol_micros,
+            operation_spool_micros: instrumentation.operation_spool_micros,
+            partition_micros: instrumentation.partition_micros,
+            detached_authoring_micros: instrumentation.detached_authoring_micros,
+            sealing_micros: instrumentation.preparation_sealing_micros,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum BootstrapPreparationProgress {
+    Subphase(BootstrapPreparationSubphase),
+    DetachedAuthoring { completed: u32, total: u32 },
+    Summary(BootstrapPreparationSummary),
+}
+
 #[derive(Debug)]
 pub(crate) enum BootstrapStreamingImportError {
     Io(io::Error),
@@ -2902,6 +2951,7 @@ fn author_bootstrap_parts(
     part_count: u32,
     working: &Path,
     instrumentation: &mut BootstrapStreamingImportInstrumentation,
+    progress: &mut dyn FnMut(BootstrapPreparationProgress),
 ) -> Result<AuthoredBootstrapParts, BootstrapStreamingImportError> {
     let profile_digest = BootstrapPartitionProfileV1::v1().digest();
     // The provisional evidence and the exact descriptor have the same part
@@ -3072,6 +3122,10 @@ fn author_bootstrap_parts(
         engine_materials.push(engine_material);
         predecessor = Some(evidence.part_id());
         drop(records);
+        progress(BootstrapPreparationProgress::DetachedAuthoring {
+            completed: ordinal + 1,
+            total: part_count,
+        });
         #[cfg(test)]
         if std::env::var_os("TINE_ACTIVATION_TRACE").is_some() {
             eprintln!(
@@ -3285,6 +3339,31 @@ pub(crate) fn prepare_inactive_bootstrap_import(
     reference_catalog: &BootstrapAuthoringCapability,
     scratch: &Path,
 ) -> Result<InactiveBootstrapPreparedPublication, BootstrapStreamingImportError> {
+    prepare_inactive_bootstrap_import_with_progress(
+        graph,
+        capture,
+        workspace_id,
+        lineage_digest,
+        catalog_document_id,
+        reference_catalog_policy,
+        reference_catalog,
+        scratch,
+        |_| {},
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_inactive_bootstrap_import_with_progress(
+    graph: &Graph,
+    capture: BootstrapSourceCapture,
+    workspace_id: WorkspaceId,
+    lineage_digest: LineageDigest,
+    catalog_document_id: DocumentId,
+    reference_catalog_policy: ReferenceCatalogPolicyV1,
+    reference_catalog: &BootstrapAuthoringCapability,
+    scratch: &Path,
+    mut progress: impl FnMut(BootstrapPreparationProgress),
+) -> Result<InactiveBootstrapPreparedPublication, BootstrapStreamingImportError> {
     if reference_catalog.workspace_id() != workspace_id {
         return Err(invalid_bootstrap_orchestration(
             "bootstrap reference-catalog capability belongs to another workspace",
@@ -3300,6 +3379,9 @@ pub(crate) fn prepare_inactive_bootstrap_import(
     let mut instrumentation = BootstrapStreamingImportInstrumentation::default();
     record_capture_instrumentation(&mut instrumentation, capture.instrumentation());
 
+    progress(BootstrapPreparationProgress::Subphase(
+        BootstrapPreparationSubphase::SourceProtocol,
+    ));
     let phase_started = Instant::now();
     let source =
         prepare_bootstrap_source_protocol(workspace_id, &capture, &working, &mut instrumentation)?;
@@ -3311,6 +3393,9 @@ pub(crate) fn prepare_inactive_bootstrap_import(
             instrumentation.source_protocol_micros / 1_000
         );
     }
+    progress(BootstrapPreparationProgress::Subphase(
+        BootstrapPreparationSubphase::OperationSpool,
+    ));
     let phase_started = Instant::now();
     let operations = spool_bootstrap_operations(
         &capture,
@@ -3327,6 +3412,9 @@ pub(crate) fn prepare_inactive_bootstrap_import(
             instrumentation.operation_spool_micros / 1_000
         );
     }
+    progress(BootstrapPreparationProgress::Subphase(
+        BootstrapPreparationSubphase::Partition,
+    ));
     let phase_started = Instant::now();
     let part_count =
         partition_bootstrap_operation_spool(&operations, &working, &mut instrumentation)?;
@@ -3345,6 +3433,13 @@ pub(crate) fn prepare_inactive_bootstrap_import(
     let final_capture = capture.verify_before_inactive_bootstrap_authoring(graph)?;
     record_capture_instrumentation(&mut instrumentation, &final_capture);
     let retained_reference_catalog_policy = reference_catalog_policy.clone();
+    progress(BootstrapPreparationProgress::Subphase(
+        BootstrapPreparationSubphase::DetachedAuthoring,
+    ));
+    progress(BootstrapPreparationProgress::DetachedAuthoring {
+        completed: 0,
+        total: part_count,
+    });
     let phase_started = Instant::now();
     let authored = author_bootstrap_parts(
         workspace_id,
@@ -3357,6 +3452,7 @@ pub(crate) fn prepare_inactive_bootstrap_import(
         part_count,
         &working,
         &mut instrumentation,
+        &mut progress,
     )?;
     instrumentation.detached_authoring_micros = elapsed_micros(phase_started);
     #[cfg(test)]
@@ -3401,6 +3497,9 @@ pub(crate) fn prepare_inactive_bootstrap_import(
     )?;
     write_exact_new(&artifacts.join(BOOTSTRAP_STREAM_COMMIT), &commit_bytes)?;
 
+    progress(BootstrapPreparationProgress::Subphase(
+        BootstrapPreparationSubphase::Sealing,
+    ));
     let phase_started = Instant::now();
     let sealed_directory = root.join(hex_bootstrap_digest(commit.publication_id().as_bytes()));
     seal_bootstrap_preparation(&artifacts, &sealed_directory, &commit_bytes)?;
@@ -3426,6 +3525,9 @@ pub(crate) fn prepare_inactive_bootstrap_import(
         );
     }
     let _ = fs::remove_dir_all(&working);
+    progress(BootstrapPreparationProgress::Summary(
+        BootstrapPreparationSummary::from(&instrumentation),
+    ));
 
     Ok(InactiveBootstrapPreparedPublication {
         source_capture: capture,
@@ -10757,6 +10859,7 @@ mod tests {
         boundaries.flush().unwrap();
         boundaries.get_ref().sync_all().unwrap();
         let mut instrumentation = BootstrapStreamingImportInstrumentation::default();
+        let mut progress = |_| {};
         let workspace = WorkspaceId::from_uuid(Uuid::from_u128(0x5d05));
         let authored = author_bootstrap_parts(
             workspace,
@@ -10773,6 +10876,7 @@ mod tests {
             2,
             &working,
             &mut instrumentation,
+            &mut progress,
         )
         .unwrap();
         assert_eq!(authored.descriptors.len(), 2);
@@ -10827,6 +10931,7 @@ mod tests {
 
         let workspace = WorkspaceId::from_uuid(Uuid::from_u128(0x6f00_0001));
         let mut instrumentation = BootstrapStreamingImportInstrumentation::default();
+        let mut progress = |_| {};
         let authored = author_bootstrap_parts(
             workspace,
             LineageDigest::of(b"declaration-payload-bound"),
@@ -10842,6 +10947,7 @@ mod tests {
             1,
             &working,
             &mut instrumentation,
+            &mut progress,
         )
         .unwrap();
         assert_eq!(authored.descriptors.len(), 1);
