@@ -20,8 +20,9 @@ use tine_core::sync_runtime::{
     SyncLocalActivationRequest, SyncLocalActivationResult, SyncLocalActivationStage,
     SyncLocalActivationStatus, SyncNonActiveStage, SyncRuntimeComponent, SyncRuntimeHandle,
     SyncRuntimeLifecycle, SyncRuntimeOpenRequest, SyncRuntimeOpenResult, SyncRuntimeOpenStatus,
-    SyncRuntimeRecovery, SyncRuntimeStatusSnapshot, SyncRuntimeTick, SyncSharedEnrollmentDescriptor,
-    SyncSharedPhase, SyncSharedRole, SyncShutdownOutcome, SyncStorageProfile,
+    SyncRuntimeRecovery, SyncRuntimeStatusSnapshot, SyncRuntimeTick,
+    SyncSharedEnrollmentDescriptor, SyncSharedPhase, SyncSharedRole, SyncShutdownOutcome,
+    SyncStorageProfile,
 };
 use uuid::Uuid;
 
@@ -968,15 +969,13 @@ fn activate_sparse_v2_blocking(
         let core_started = Instant::now();
         let binding = match action {
             SparseV2BindingAction::ReopenActive => state.sync_runtime.open_record(app, &record)?,
-            SparseV2BindingAction::ActivateOrResume => {
-                activate_record_with_diagnostics(
-                    &state.sync_runtime,
-                    app,
-                    label,
-                    binding_generation,
-                    &record,
-                )?
-            }
+            SparseV2BindingAction::ActivateOrResume => activate_record_with_diagnostics(
+                &state.sync_runtime,
+                app,
+                label,
+                binding_generation,
+                &record,
+            )?,
             SparseV2BindingAction::ReturnRetained => {
                 unreachable!("retained bindings return before replacement")
             }
@@ -1661,7 +1660,10 @@ mod tests {
         };
         let serialized = serde_json::to_value(event).unwrap();
         assert_eq!(serialized["binding_generation"], 17);
-        assert_eq!(serialized["progress"]["kind"], "bootstrap_detached_authoring");
+        assert_eq!(
+            serialized["progress"]["kind"],
+            "bootstrap_detached_authoring"
+        );
         assert_eq!(serialized["progress"]["completed"], 2);
         assert_eq!(serialized["progress"]["total"], 5);
     }

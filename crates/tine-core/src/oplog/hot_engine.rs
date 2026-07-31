@@ -24,6 +24,8 @@ use super::identity::BootstrapPartId;
 use super::import::ImportExecutionMaterial;
 use super::object_store::{
     BlockClaimIndexRoot, BlockClaimIndexStore, BlockClaimIndexValue, BootstrapAuthoringCapability,
+    CompletedDetachedBootstrapPublication, ControlDirectoryIdentity,
+    DetachedBootstrapPublicationSession,
 };
 use super::page_name_index::{
     extract_authenticated_catalog_page_names, extract_authoritative_catalog_page_names,
@@ -1926,6 +1928,33 @@ pub(crate) struct DetachedBootstrapCandidate {
     scratch_root: DetachedBootstrapScratchRoot,
     part_count: u32,
     last_part: Option<BootstrapPartId>,
+    index_durability: DetachedBootstrapIndexDurability,
+}
+
+enum DetachedBootstrapIndexDurability {
+    Authored(CompletedDetachedBootstrapPublication),
+    ReplayedArchive {
+        workspace_id: WorkspaceId,
+        archive_identity: ControlDirectoryIdentity,
+    },
+}
+
+impl DetachedBootstrapIndexDurability {
+    const fn workspace_id(&self) -> WorkspaceId {
+        match self {
+            Self::Authored(completed) => completed.workspace_id(),
+            Self::ReplayedArchive { workspace_id, .. } => *workspace_id,
+        }
+    }
+
+    const fn archive_identity(&self) -> ControlDirectoryIdentity {
+        match self {
+            Self::Authored(completed) => completed.archive_identity(),
+            Self::ReplayedArchive {
+                archive_identity, ..
+            } => *archive_identity,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1941,6 +1970,14 @@ pub(crate) struct BootstrapCatalogWorkStats {
     pub(crate) reference_catalog_final_validations: usize,
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct DetachedBootstrapPublicationStats {
+    pub(crate) immutable_publications: usize,
+    pub(crate) verified_existing_publications: usize,
+    pub(crate) successful_batch_completions: usize,
+}
+
 #[allow(dead_code)]
 impl DetachedBootstrapCandidate {
     pub(crate) const fn part_count(&self) -> u32 {
@@ -1949,6 +1986,26 @@ impl DetachedBootstrapCandidate {
 
     pub(crate) const fn last_part(&self) -> Option<BootstrapPartId> {
         self.last_part
+    }
+
+    pub(crate) const fn index_archive_identity(&self) -> ControlDirectoryIdentity {
+        self.index_durability.archive_identity()
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn detached_publication_stats(
+        &self,
+    ) -> Option<DetachedBootstrapPublicationStats> {
+        match &self.index_durability {
+            DetachedBootstrapIndexDurability::Authored(completed) => {
+                Some(DetachedBootstrapPublicationStats {
+                    immutable_publications: completed.publication_count(),
+                    verified_existing_publications: completed.existing_publication_count(),
+                    successful_batch_completions: 1,
+                })
+            }
+            DetachedBootstrapIndexDurability::ReplayedArchive { .. } => None,
+        }
     }
 
     pub(crate) fn accepted_frontier_root(&self) -> Result<AcceptedFrontierRoot, EngineError> {
@@ -2116,6 +2173,8 @@ pub(crate) struct DetachedBootstrapAuthoringSession {
     continuity: Option<DetachedBootstrapContinuity>,
     next_ordinal: u32,
     last_part: Option<BootstrapPartId>,
+    publication: Option<DetachedBootstrapPublicationSession>,
+    archive_identity: ControlDirectoryIdentity,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2203,6 +2262,32 @@ impl DetachedBootstrapAuthoringSession {
                 "detached bootstrap authoring capability belongs to another workspace".into(),
             ));
         }
+        let (
+            publication,
+            reference_catalog,
+            portable_path_index,
+            logseq_claim_index,
+            page_name_index,
+        ) = if private_construction {
+            let (publication, indexes) = indexes
+                .begin_detached_authoring()
+                .map_err(|error| EngineError::Archive(error.to_string()))?;
+            (
+                Some(publication),
+                indexes.reference_catalog(),
+                indexes.portable_path_index(),
+                indexes.logseq_claim_index(),
+                indexes.page_name_index(),
+            )
+        } else {
+            (
+                None,
+                indexes.reference_catalog(),
+                indexes.portable_path_index(),
+                indexes.logseq_claim_index(),
+                indexes.page_name_index(),
+            )
+        };
         let scratch_root = DetachedBootstrapScratchRoot::create()?;
         let scratch = Arc::new(
             ScratchStore::create_retained(&scratch_root.root, workspace_id)
@@ -2226,19 +2311,19 @@ impl DetachedBootstrapAuthoringSession {
         // Every authenticated root an accepted bootstrap cold record binds is
         // built here, in the target archive's durable stores. The promoted
         // runtime opens the identical stores, so there is one construction.
-        candidate.portable_path_index = Some(indexes.portable_path_index());
-        candidate.logseq_claim_index = Some(indexes.logseq_claim_index());
-        candidate.page_name_index = Some(indexes.page_name_index());
+        candidate.portable_path_index = Some(portable_path_index);
+        candidate.logseq_claim_index = Some(logseq_claim_index);
+        candidate.page_name_index = Some(page_name_index);
         candidate.configure_reference_catalog_policy(reference_catalog_policy)?;
         if private_construction {
             candidate
                 .reference_catalog
-                .attach_construction_store(indexes.reference_catalog())
+                .attach_construction_store(reference_catalog)
                 .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))?;
         } else {
             candidate
                 .reference_catalog
-                .attach_store(indexes.reference_catalog())
+                .attach_store(reference_catalog)
                 .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))?;
         }
         Ok(Self {
@@ -2247,6 +2332,8 @@ impl DetachedBootstrapAuthoringSession {
             continuity: None,
             next_ordinal: 0,
             last_part: None,
+            publication,
+            archive_identity: indexes.archive_identity(),
         })
     }
 
@@ -2389,6 +2476,22 @@ impl DetachedBootstrapAuthoringSession {
             .reference_catalog
             .finish_construction()
             .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))?;
+        let index_durability = match self.publication {
+            Some(publication) => DetachedBootstrapIndexDurability::Authored(
+                publication
+                    .finish()
+                    .map_err(|error| EngineError::Archive(error.to_string()))?,
+            ),
+            None => DetachedBootstrapIndexDurability::ReplayedArchive {
+                workspace_id: candidate.workspace_id,
+                archive_identity: self.archive_identity,
+            },
+        };
+        if index_durability.workspace_id() != candidate.workspace_id {
+            return Err(EngineError::Archive(
+                "detached bootstrap index durability proof belongs to another workspace".into(),
+            ));
+        }
         Ok(DetachedBootstrapCandidate {
             engine: candidate,
             scratch_root: self
@@ -2396,6 +2499,7 @@ impl DetachedBootstrapAuthoringSession {
                 .expect("live candidate owns its scratch root"),
             part_count: self.next_ordinal,
             last_part: self.last_part,
+            index_durability,
         })
     }
 
@@ -13540,6 +13644,16 @@ impl ShardedHotEngine {
         self.ensure_not_blocked()?;
         self.resolve_logseq_uuid_current(logseq_uuid)
             .map(|(resolution, _, _)| resolution)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reference_posting_for_test(
+        &self,
+        page_id: PageId,
+    ) -> Result<Option<super::reference_catalog::ReferenceSourcePostingV2>, EngineError> {
+        self.reference_catalog
+            .posting(page_id)
+            .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))
     }
 
     fn logseq_claim_record(
@@ -25338,6 +25452,10 @@ mod validation_tests {
                     scratch_root: author.scratch_root.take().unwrap(),
                     part_count: 2,
                     last_part: Some(second_descriptor.part_id()),
+                    index_durability: DetachedBootstrapIndexDurability::ReplayedArchive {
+                        workspace_id: workspace,
+                        archive_identity: catalog_capability.archive_identity(),
+                    },
                 };
                 (aggregate, expected)
             } else {

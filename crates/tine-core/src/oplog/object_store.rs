@@ -160,6 +160,8 @@ thread_local! {
         const { std::cell::Cell::new(false) };
     static ENGINE_HISTORY_FAIL_AFTER_HEAD_SWAP: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    static DETACHED_BOOTSTRAP_FAIL_BEFORE_BATCH_FINISH: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
@@ -177,6 +179,29 @@ pub(crate) fn fail_next_engine_history_head_swap() {
 #[cfg(test)]
 pub(crate) fn fail_next_engine_history_after_head_swap() {
     ENGINE_HISTORY_FAIL_AFTER_HEAD_SWAP.with(|fail| fail.set(true));
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_detached_bootstrap_batch_finish() {
+    DETACHED_BOOTSTRAP_FAIL_BEFORE_BATCH_FINISH.with(|fail| fail.set(true));
+}
+
+#[cfg(test)]
+fn detached_bootstrap_batch_finish_hook() -> Result<(), StoreError> {
+    DETACHED_BOOTSTRAP_FAIL_BEFORE_BATCH_FINISH.with(|fail| {
+        if fail.replace(false) {
+            Err(StoreError::Io(std::io::Error::other(
+                "deterministic failure before detached bootstrap batch finish",
+            )))
+        } else {
+            Ok(())
+        }
+    })
+}
+
+#[cfg(not(test))]
+fn detached_bootstrap_batch_finish_hook() -> Result<(), StoreError> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1474,13 +1499,163 @@ impl ValidatedBootstrapPublicationV1 {
     }
 }
 
+enum DetachedBootstrapPublicationState {
+    Open(tine_storage::ExactImmutablePublicationBatch),
+    Poisoned,
+    Finished,
+}
+
+struct DetachedBootstrapPublicationShared {
+    state: Mutex<DetachedBootstrapPublicationState>,
+}
+
+/// Cloneable write-only handle shared by the authenticated index stores of one
+/// detached bootstrap authoring session. Once the owning session finishes or
+/// any publication fails, later writes fail closed.
+#[derive(Clone)]
+pub(crate) struct DetachedBootstrapImmutablePublisher {
+    shared: Arc<DetachedBootstrapPublicationShared>,
+}
+
+impl fmt::Debug for DetachedBootstrapImmutablePublisher {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DetachedBootstrapImmutablePublisher")
+            .finish_non_exhaustive()
+    }
+}
+
+impl DetachedBootstrapImmutablePublisher {
+    pub(crate) fn publish(
+        &self,
+        dir: &Dir,
+        filename: &str,
+        bytes: &[u8],
+        kind: &'static str,
+    ) -> Result<(), StoreError> {
+        let mut state = self.shared.state.lock().map_err(|_| {
+            StoreError::Bootstrap(
+                "detached bootstrap immutable publication batch mutex is poisoned".into(),
+            )
+        })?;
+        let result = match &mut *state {
+            DetachedBootstrapPublicationState::Open(batch) => batch.publish(dir, filename, bytes),
+            DetachedBootstrapPublicationState::Poisoned => {
+                return Err(StoreError::Bootstrap(
+                    "detached bootstrap immutable publication batch is poisoned".into(),
+                ));
+            }
+            DetachedBootstrapPublicationState::Finished => {
+                return Err(StoreError::Bootstrap(
+                    "detached bootstrap immutable publication batch is closed".into(),
+                ));
+            }
+        };
+        if let Err(error) = result {
+            *state = DetachedBootstrapPublicationState::Poisoned;
+            return Err(publication_error(error, Collision::Exact(kind)));
+        }
+        Ok(())
+    }
+}
+
+/// Unique completion authority for one archive-bound detached authoring batch.
+/// Store writers receive only cloneable publication handles, never this token.
+pub(crate) struct DetachedBootstrapPublicationSession {
+    publisher: DetachedBootstrapImmutablePublisher,
+    workspace_id: WorkspaceId,
+    archive_identity: ControlDirectoryIdentity,
+}
+
+/// Non-serializable evidence that every immutable authenticated-index object
+/// authored by one detached session is beneath its archive durability barrier.
+pub(crate) struct CompletedDetachedBootstrapPublication {
+    physical: tine_storage::CompletedExactImmutablePublicationBatch,
+    workspace_id: WorkspaceId,
+    archive_identity: ControlDirectoryIdentity,
+}
+
+impl CompletedDetachedBootstrapPublication {
+    pub(crate) const fn workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
+    }
+
+    pub(crate) const fn archive_identity(&self) -> ControlDirectoryIdentity {
+        self.archive_identity
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn publication_count(&self) -> usize {
+        self.physical.publication_count()
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn existing_publication_count(&self) -> usize {
+        self.physical.existing_publication_count()
+    }
+}
+
+impl DetachedBootstrapPublicationSession {
+    fn new(
+        archive: &Dir,
+        workspace_id: WorkspaceId,
+        archive_identity: ControlDirectoryIdentity,
+    ) -> Result<Self, StoreError> {
+        let physical = tine_storage::ExactImmutablePublicationBatch::new(archive)
+            .map_err(filesystem_error_without_collision)?;
+        Ok(Self {
+            publisher: DetachedBootstrapImmutablePublisher {
+                shared: Arc::new(DetachedBootstrapPublicationShared {
+                    state: Mutex::new(DetachedBootstrapPublicationState::Open(physical)),
+                }),
+            },
+            workspace_id,
+            archive_identity,
+        })
+    }
+
+    fn publisher(&self) -> DetachedBootstrapImmutablePublisher {
+        self.publisher.clone()
+    }
+
+    pub(crate) fn finish(self) -> Result<CompletedDetachedBootstrapPublication, StoreError> {
+        let mut state = self.publisher.shared.state.lock().map_err(|_| {
+            StoreError::Bootstrap(
+                "detached bootstrap immutable publication batch mutex is poisoned".into(),
+            )
+        })?;
+        let batch =
+            match std::mem::replace(&mut *state, DetachedBootstrapPublicationState::Poisoned) {
+                DetachedBootstrapPublicationState::Open(batch) => batch,
+                DetachedBootstrapPublicationState::Poisoned => {
+                    return Err(StoreError::Bootstrap(
+                        "detached bootstrap immutable publication batch is poisoned".into(),
+                    ));
+                }
+                DetachedBootstrapPublicationState::Finished => {
+                    return Err(StoreError::Bootstrap(
+                        "detached bootstrap immutable publication batch is already finished".into(),
+                    ));
+                }
+            };
+        detached_bootstrap_batch_finish_hook()?;
+        let physical = batch.finish().map_err(filesystem_error_without_collision)?;
+        *state = DetachedBootstrapPublicationState::Finished;
+        Ok(CompletedDetachedBootstrapPublication {
+            physical,
+            workspace_id: self.workspace_id,
+            archive_identity: self.archive_identity,
+        })
+    }
+}
+
 /// Uncommitted bootstrap-only immutable publication. Files are inserted under
 /// their final content-addressed names without individual barriers; `finish`
 /// authenticates the closed set and flushes the filesystem once. The ordinary
 /// object publication path remains unchanged.
 pub(crate) struct BootstrapPublicationBatch<'a> {
     store: &'a ObjectStore,
-    physical: tine_storage::ExactImmutablePublicationBatch<'a>,
+    physical: tine_storage::ExactImmutablePublicationBatch,
     inventory_root: Option<SourceInventoryRootV1>,
     inventory_pages: BTreeMap<u32, ()>,
     blob_root: Option<SourceBlobChunkRootV1>,
@@ -1549,10 +1724,38 @@ impl LoadedBootstrapPartV1 {
 pub(crate) struct BootstrapAuthoringCapability {
     workspace_id: WorkspaceId,
     archive_identity: ControlDirectoryIdentity,
+    archive: Arc<Dir>,
     reference_catalog: Arc<super::reference_catalog::ReferenceCatalogStore>,
     portable_path_index: Arc<super::portable_path_index::PortablePathIndexStore>,
     logseq_claim_index: Arc<super::uuid_claim_index::LogseqClaimIndexStore>,
     page_name_index: Arc<super::page_name_index::PageNameOwnershipStore>,
+}
+
+pub(crate) struct DetachedBootstrapAuthoringIndexes {
+    reference_catalog: Arc<super::reference_catalog::ReferenceCatalogStore>,
+    portable_path_index: Arc<super::portable_path_index::PortablePathIndexStore>,
+    logseq_claim_index: Arc<super::uuid_claim_index::LogseqClaimIndexStore>,
+    page_name_index: Arc<super::page_name_index::PageNameOwnershipStore>,
+}
+
+impl DetachedBootstrapAuthoringIndexes {
+    pub(crate) fn reference_catalog(&self) -> Arc<super::reference_catalog::ReferenceCatalogStore> {
+        Arc::clone(&self.reference_catalog)
+    }
+
+    pub(crate) fn portable_path_index(
+        &self,
+    ) -> Arc<super::portable_path_index::PortablePathIndexStore> {
+        Arc::clone(&self.portable_path_index)
+    }
+
+    pub(crate) fn logseq_claim_index(&self) -> Arc<super::uuid_claim_index::LogseqClaimIndexStore> {
+        Arc::clone(&self.logseq_claim_index)
+    }
+
+    pub(crate) fn page_name_index(&self) -> Arc<super::page_name_index::PageNameOwnershipStore> {
+        Arc::clone(&self.page_name_index)
+    }
 }
 
 impl BootstrapAuthoringCapability {
@@ -1580,6 +1783,39 @@ impl BootstrapAuthoringCapability {
 
     pub(crate) fn page_name_index(&self) -> Arc<super::page_name_index::PageNameOwnershipStore> {
         Arc::clone(&self.page_name_index)
+    }
+
+    pub(crate) fn begin_detached_authoring(
+        &self,
+    ) -> Result<
+        (
+            DetachedBootstrapPublicationSession,
+            DetachedBootstrapAuthoringIndexes,
+        ),
+        StoreError,
+    > {
+        let publication = DetachedBootstrapPublicationSession::new(
+            &self.archive,
+            self.workspace_id,
+            self.archive_identity,
+        )?;
+        let publisher = publication.publisher();
+        let indexes = DetachedBootstrapAuthoringIndexes {
+            reference_catalog: Arc::new(
+                self.reference_catalog
+                    .for_detached_bootstrap(publisher.clone())?,
+            ),
+            portable_path_index: Arc::new(
+                self.portable_path_index
+                    .for_detached_bootstrap(publisher.clone())?,
+            ),
+            logseq_claim_index: Arc::new(
+                self.logseq_claim_index
+                    .for_detached_bootstrap(publisher.clone())?,
+            ),
+            page_name_index: Arc::new(self.page_name_index.for_detached_bootstrap(publisher)?),
+        };
+        Ok((publication, indexes))
     }
 }
 
@@ -1879,10 +2115,13 @@ impl ObjectStore {
         Ok(())
     }
 
-    pub(crate) fn begin_bootstrap_publication_batch(&self) -> BootstrapPublicationBatch<'_> {
-        BootstrapPublicationBatch {
+    pub(crate) fn begin_bootstrap_publication_batch(
+        &self,
+    ) -> Result<BootstrapPublicationBatch<'_>, StoreError> {
+        Ok(BootstrapPublicationBatch {
             store: self,
-            physical: tine_storage::ExactImmutablePublicationBatch::new(&self.capability),
+            physical: tine_storage::ExactImmutablePublicationBatch::new(&self.capability)
+                .map_err(filesystem_error_without_collision)?,
             inventory_root: None,
             inventory_pages: BTreeMap::new(),
             blob_root: None,
@@ -1892,7 +2131,7 @@ impl ObjectStore {
             expected_objects: BTreeMap::new(),
             objects: BTreeMap::new(),
             parts: BTreeMap::new(),
-        }
+        })
     }
 
     pub(crate) fn publish_bootstrap_source_inventory_page(
@@ -2894,6 +3133,7 @@ impl ObjectStore {
         Ok(BootstrapAuthoringCapability {
             workspace_id: self.workspace_id,
             archive_identity: self.canonical_archive_identity()?,
+            archive: Arc::new(self.capability.try_clone()?),
             reference_catalog: Arc::new(self.open_reference_catalog()?),
             portable_path_index: Arc::new(self.open_portable_path_index()?),
             logseq_claim_index: Arc::new(self.open_logseq_claim_index()?),
@@ -10786,11 +11026,28 @@ mod bootstrap_store_tests {
         assert!(!fixture.archive.join(BOOTSTRAP_DIR).exists());
     }
 
+    #[test]
+    fn detached_publisher_closes_without_changing_ordinary_index_publication() {
+        let fixture = EmptyBootstrapFixture::new("detached-publisher-closed");
+        let store = fixture.store();
+        let capability = store.bootstrap_authoring_capability().unwrap();
+        let (publication, indexes) = capability.begin_detached_authoring().unwrap();
+        let completed = publication.finish().unwrap();
+        assert_eq!(completed.publication_count(), 0);
+
+        let name = crate::oplog::LogicalPageName::parse("Closed detached publisher").unwrap();
+        assert!(matches!(
+            indexes.page_name_index().put_exact_name(&name),
+            Err(StoreError::Bootstrap(message)) if message.contains("closed")
+        ));
+        capability.page_name_index().put_exact_name(&name).unwrap();
+    }
+
     fn stage_fixture_bootstrap_batch<'a>(
         fixture: &BootstrapFixture,
         store: &'a ObjectStore,
     ) -> BootstrapPublicationBatch<'a> {
-        let mut publication = store.begin_bootstrap_publication_batch();
+        let mut publication = store.begin_bootstrap_publication_batch().unwrap();
         for page in &fixture.inventory_pages {
             publication
                 .publish_source_inventory_page(fixture.inventory_root, page)

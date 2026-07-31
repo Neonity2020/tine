@@ -201,6 +201,15 @@ impl PortablePathIndexStore {
         Self { patricia }
     }
 
+    pub(crate) fn for_detached_bootstrap(
+        &self,
+        publisher: super::object_store::DetachedBootstrapImmutablePublisher,
+    ) -> Result<Self, StoreError> {
+        Ok(Self {
+            patricia: self.patricia.for_detached_bootstrap(publisher)?,
+        })
+    }
+
     pub(crate) fn stats(&self) -> PatriciaIndexStats {
         self.patricia.stats()
     }

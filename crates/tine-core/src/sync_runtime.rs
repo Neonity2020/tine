@@ -859,11 +859,9 @@ impl From<BootstrapPreparationProgress> for SyncLocalActivationProgress {
             BootstrapPreparationProgress::DetachedAuthoring { completed, total } => {
                 Self::BootstrapDetachedAuthoring { completed, total }
             }
-            BootstrapPreparationProgress::Summary(summary) => {
-                Self::BootstrapPreparationSummary {
-                    summary: summary.into(),
-                }
-            }
+            BootstrapPreparationProgress::Summary(summary) => Self::BootstrapPreparationSummary {
+                summary: summary.into(),
+            },
         }
     }
 }
@@ -23700,17 +23698,18 @@ mod tests {
         let authored = updates
             .iter()
             .filter_map(|update| match update {
-                SyncLocalActivationProgress::BootstrapDetachedAuthoring {
-                    completed,
-                    total,
-                } => Some((*completed, *total)),
+                SyncLocalActivationProgress::BootstrapDetachedAuthoring { completed, total } => {
+                    Some((*completed, *total))
+                }
                 _ => None,
             })
             .collect::<Vec<_>>();
         let total = authored.first().expect("initial part progress").1;
         assert_eq!(
             authored,
-            (0..=total).map(|completed| (completed, total)).collect::<Vec<_>>()
+            (0..=total)
+                .map(|completed| (completed, total))
+                .collect::<Vec<_>>()
         );
         let summary = updates
             .iter()

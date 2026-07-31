@@ -6,7 +6,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use cap_std::fs::Dir;
 use serde::{Deserialize, Serialize};
 
-use super::object_store::{publish_immutable_exact, read_optional_regular, StoreError};
+use super::object_store::{
+    publish_immutable_exact, read_optional_regular, DetachedBootstrapImmutablePublisher, StoreError,
+};
 use super::ContentDigest;
 
 const NODE_SCHEMA_VERSION: u32 = 1;
@@ -70,6 +72,7 @@ struct Counters {
 #[derive(Debug)]
 pub(crate) struct PatriciaIndexStore {
     nodes: Dir,
+    detached_publisher: Option<DetachedBootstrapImmutablePublisher>,
     counters: Counters,
 }
 
@@ -188,8 +191,20 @@ impl PatriciaIndexStore {
     pub(crate) fn new(nodes: Dir) -> Self {
         Self {
             nodes,
+            detached_publisher: None,
             counters: Counters::default(),
         }
+    }
+
+    pub(crate) fn for_detached_bootstrap(
+        &self,
+        publisher: DetachedBootstrapImmutablePublisher,
+    ) -> Result<Self, StoreError> {
+        Ok(Self {
+            nodes: self.nodes.try_clone()?,
+            detached_publisher: Some(publisher),
+            counters: Counters::default(),
+        })
     }
 
     pub(crate) fn stats(&self) -> PatriciaIndexStats {
@@ -951,12 +966,22 @@ impl PatriciaIndexStore {
             return Err(StoreError::MalformedLogseqClaimIndex);
         }
         let digest = ContentDigest::of(&bytes);
-        publish_immutable_exact(
-            &self.nodes,
-            &node_filename(digest),
-            &bytes,
-            "Logseq UUID claim index node",
-        )?;
+        let filename = node_filename(digest);
+        if let Some(publisher) = &self.detached_publisher {
+            publisher.publish(
+                &self.nodes,
+                &filename,
+                &bytes,
+                "authenticated Patricia index node",
+            )?;
+        } else {
+            publish_immutable_exact(
+                &self.nodes,
+                &filename,
+                &bytes,
+                "Logseq UUID claim index node",
+            )?;
+        }
         self.counters.writes.fetch_add(1, Ordering::Relaxed);
         self.counters
             .bytes_written

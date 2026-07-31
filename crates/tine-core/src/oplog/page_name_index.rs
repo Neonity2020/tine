@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use super::authenticated_patricia::{PatriciaIndexRoot, PatriciaIndexStats, PatriciaIndexStore};
 use super::object_store::{
     ensure_directory_nofollow, open_dir_nofollow, publish_immutable_exact, read_optional_regular,
-    StoreError,
+    DetachedBootstrapImmutablePublisher, StoreError,
 };
 use super::scratch_store::{ScratchLsmRoot, ScratchPageKind, ScratchStore};
 use super::{
@@ -1539,6 +1539,7 @@ impl Default for PageNameOwnershipRootV1 {
 pub(crate) struct PageNameOwnershipStore {
     patricia: PatriciaIndexStore,
     exact_names: Dir,
+    detached_publisher: Option<DetachedBootstrapImmutablePublisher>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1581,6 +1582,18 @@ impl PageNameOwnershipStore {
         Ok(Self {
             patricia: PatriciaIndexStore::new(open_dir_nofollow(&index, NODES_DIR)?),
             exact_names: open_dir_nofollow(&index, EXACT_NAMES_DIR)?,
+            detached_publisher: None,
+        })
+    }
+
+    pub(crate) fn for_detached_bootstrap(
+        &self,
+        publisher: DetachedBootstrapImmutablePublisher,
+    ) -> Result<Self, StoreError> {
+        Ok(Self {
+            patricia: self.patricia.for_detached_bootstrap(publisher.clone())?,
+            exact_names: self.exact_names.try_clone()?,
+            detached_publisher: Some(publisher),
         })
     }
 
@@ -1593,12 +1606,22 @@ impl PageNameOwnershipStore {
         name: &LogicalPageName,
     ) -> Result<ExactLogicalPageNameRefV1, StoreError> {
         let (bytes, name_ref) = encode_exact_name_blob(name)?;
-        publish_immutable_exact(
-            &self.exact_names,
-            &exact_name_blob_filename(name_ref.content_digest),
-            &bytes,
-            "exact logical page-name blob",
-        )?;
+        let filename = exact_name_blob_filename(name_ref.content_digest);
+        if let Some(publisher) = &self.detached_publisher {
+            publisher.publish(
+                &self.exact_names,
+                &filename,
+                &bytes,
+                "exact logical page-name blob",
+            )?;
+        } else {
+            publish_immutable_exact(
+                &self.exact_names,
+                &filename,
+                &bytes,
+                "exact logical page-name blob",
+            )?;
+        }
         Ok(name_ref)
     }
 

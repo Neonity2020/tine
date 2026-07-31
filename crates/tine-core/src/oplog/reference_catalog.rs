@@ -16,7 +16,9 @@ use super::authenticated_patricia::{
 };
 #[cfg(test)]
 use super::authenticated_patricia::{PatriciaIndexConstructionStats, PatriciaIndexStats};
-use super::object_store::{publish_immutable_exact, read_optional_regular, StoreError};
+use super::object_store::{
+    publish_immutable_exact, read_optional_regular, DetachedBootstrapImmutablePublisher, StoreError,
+};
 use super::{
     BlockId, BlockOwner, ContentDigest, DocumentId, LogicalPageName, LogseqUuid, ManagedPath,
     PageId, PageNameKeyDigest, PageNameOwnershipRootV1, SemanticEffect,
@@ -663,6 +665,7 @@ struct PostingManifestV2 {
 pub(crate) struct ReferenceCatalogStore {
     postings: Dir,
     patricia: PatriciaIndexStore,
+    detached_publisher: Option<DetachedBootstrapImmutablePublisher>,
 }
 
 impl ReferenceCatalogStore {
@@ -670,6 +673,31 @@ impl ReferenceCatalogStore {
         Self {
             postings,
             patricia: PatriciaIndexStore::new(nodes),
+            detached_publisher: None,
+        }
+    }
+
+    pub(crate) fn for_detached_bootstrap(
+        &self,
+        publisher: DetachedBootstrapImmutablePublisher,
+    ) -> Result<Self, StoreError> {
+        Ok(Self {
+            postings: self.postings.try_clone()?,
+            patricia: self.patricia.for_detached_bootstrap(publisher.clone())?,
+            detached_publisher: Some(publisher),
+        })
+    }
+
+    fn publish_exact(
+        &self,
+        filename: &str,
+        bytes: &[u8],
+        kind: &'static str,
+    ) -> Result<(), StoreError> {
+        if let Some(publisher) = &self.detached_publisher {
+            publisher.publish(&self.postings, filename, bytes, kind)
+        } else {
+            publish_immutable_exact(&self.postings, filename, bytes, kind)
         }
     }
 
@@ -711,8 +739,7 @@ impl ReferenceCatalogStore {
         let bytes = encode_canonical(&manifest)?;
         require_object_size(&bytes)?;
         let digest = ContentDigest::of(&bytes);
-        publish_immutable_exact(
-            &self.postings,
+        self.publish_exact(
             &posting_filename(digest),
             &bytes,
             "reference posting manifest",
@@ -737,13 +764,8 @@ impl ReferenceCatalogStore {
         let bytes = encode_canonical(&chunk)?;
         require_object_size(&bytes)?;
         let digest = ContentDigest::of(&bytes);
-        publish_immutable_exact(
-            &self.postings,
-            &chunk_filename(digest),
-            &bytes,
-            "reference posting chunk",
-        )
-        .map_err(store_error)?;
+        self.publish_exact(&chunk_filename(digest), &bytes, "reference posting chunk")
+            .map_err(store_error)?;
         Ok(PostingChunkRefV2 {
             digest,
             encoded_byte_length: bytes.len() as u64,
@@ -759,8 +781,7 @@ impl ReferenceCatalogStore {
         let bytes = encode_canonical(&replacements)?;
         require_object_size(&bytes)?;
         let digest = ContentDigest::of(&bytes);
-        publish_immutable_exact(
-            &self.postings,
+        self.publish_exact(
             &transition_filename(digest),
             &bytes,
             "reference catalog transition",

@@ -812,6 +812,8 @@ fn validate_inactive_bootstrap_preparation(
         || prepared.candidate.part_count() != aggregate.parts().len() as u32
         || prepared.candidate.last_part() != aggregate.final_frontier().last_part()
         || prepared.engine_materials.len() != aggregate.parts().len()
+        || prepared.candidate.index_archive_identity()
+            != prepared.reference_catalog_archive_identity
     {
         return Err(invalid_bootstrap_orchestration(
             "workspace, graph, capture, candidate, or aggregate identity mismatch",
@@ -954,7 +956,7 @@ fn publish_inactive_bootstrap_prefix(
     instrumentation: &mut InactiveBootstrapOrchestrationInstrumentation,
 ) -> Result<DurablyStagedBootstrapPrefix, BootstrapStreamingImportError> {
     let aggregate = prepared.aggregate();
-    let mut publication = store.begin_bootstrap_publication_batch();
+    let mut publication = store.begin_bootstrap_publication_batch()?;
     for ordinal in 0..aggregate.source_inventory_page_count() {
         let page = prepared.source_inventory_page(ordinal)?;
         publication.publish_source_inventory_page(aggregate.source_inventory_root(), &page)?;
@@ -1240,6 +1242,7 @@ pub(crate) fn retain_inactive_bootstrap_accepted_authority(
     if store.workspace_id() != verified.workspace_id
         || archive_identity != verified.archive_identity
         || prepared.reference_catalog_archive_identity != archive_identity
+        || prepared.candidate.index_archive_identity() != archive_identity
     {
         return Err(invalid_bootstrap_orchestration(
             "retained bootstrap store or preparation identity changed",
@@ -3528,6 +3531,12 @@ pub(crate) fn prepare_inactive_bootstrap_import_with_progress(
     progress(BootstrapPreparationProgress::Summary(
         BootstrapPreparationSummary::from(&instrumentation),
     ));
+
+    if authored.candidate.index_archive_identity() != reference_catalog.archive_identity() {
+        return Err(invalid_bootstrap_orchestration(
+            "detached candidate durability proof belongs to another archive",
+        ));
+    }
 
     Ok(InactiveBootstrapPreparedPublication {
         source_capture: capture,
@@ -10180,6 +10189,31 @@ mod tests {
         (root, prepared, workspace)
     }
 
+    fn prepare_streaming_bootstrap_attempt(
+        root: &TestRoot,
+        suffix: &str,
+        workspace: WorkspaceId,
+    ) -> Result<InactiveBootstrapPreparedPublication, BootstrapStreamingImportError> {
+        let graph = Graph::open(&root.path().join("graph"));
+        let capture_scratch = root.path().join(format!("capture-{suffix}"));
+        let preparation_scratch = root.path().join(format!("preparation-{suffix}"));
+        fs::create_dir(&capture_scratch).unwrap();
+        fs::create_dir(&preparation_scratch).unwrap();
+        let capture = graph
+            .capture_inactive_bootstrap_sources(&capture_scratch)
+            .unwrap();
+        prepare_inactive_bootstrap_import(
+            &graph,
+            capture,
+            workspace,
+            LineageDigest::of(b"inactive-streaming-bootstrap-retry-test"),
+            DocumentId::from_uuid(Uuid::from_u128(0x5a22)),
+            ReferenceCatalogPolicyV1::default(),
+            &target_catalog(&root.path().join("archive"), workspace),
+            &preparation_scratch,
+        )
+    }
+
     #[test]
     #[ignore = "calibrated bootstrap-authoring trace"]
     fn inactive_streaming_bootstrap_authoring_trace_calibrated() {
@@ -10187,11 +10221,25 @@ mod tests {
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(100);
+        let dense = std::env::var_os("TINE_BOOTSTRAP_TRACE_DENSE").is_some();
         let owned = (0..file_count)
             .map(|file_index| {
                 let path = format!("pages/trace-{file_index:04}.md");
                 let contents = (0..10)
-                    .map(|block_index| format!("- trace {file_index:04}/{block_index:02}\n"))
+                    .map(|block_index| {
+                        if dense {
+                            format!(
+                                "- trace {file_index:04}/{block_index:02} [[trace-{:04}]]\n  id:: {}\n",
+                                (file_index + 1) % file_count,
+                                Uuid::from_u128(
+                                    0x5a40_0000
+                                        + (file_index * 10 + block_index) as u128
+                                )
+                            )
+                        } else {
+                            format!("- trace {file_index:04}/{block_index:02}\n")
+                        }
+                    })
                     .collect::<String>();
                 (path, contents)
             })
@@ -10201,14 +10249,23 @@ mod tests {
             .map(|(path, contents)| (path.as_str(), contents.as_str()))
             .collect::<Vec<_>>();
         let (_root, prepared, _) = prepare_streaming_bootstrap("authoring-trace", &files);
+        let publication = prepared.candidate().detached_publication_stats().unwrap();
+        assert_eq!(publication.successful_batch_completions, 1);
         eprintln!(
-            "bootstrap authoring trace files={} operations={} parts={} max_part_documents={} max_part_operations={} detached_authoring_ms={:.3}",
+            "bootstrap authoring trace files={} dense={} operations={} parts={} immutable_publications={} batch_completions={} source_protocol_ms={:.3} spool_ms={:.3} partition_ms={:.3} detached_authoring_ms={:.3} sealing_ms={:.3} max_part_documents={} max_part_operations={}",
             file_count,
+            dense,
             prepared.instrumentation().operations,
             prepared.instrumentation().parts,
+            publication.immutable_publications,
+            publication.successful_batch_completions,
+            prepared.instrumentation().source_protocol_micros as f64 / 1_000.0,
+            prepared.instrumentation().operation_spool_micros as f64 / 1_000.0,
+            prepared.instrumentation().partition_micros as f64 / 1_000.0,
+            prepared.instrumentation().detached_authoring_micros as f64 / 1_000.0,
+            prepared.instrumentation().preparation_sealing_micros as f64 / 1_000.0,
             prepared.instrumentation().max_part_documents,
             prepared.instrumentation().peak_owned_part_operations,
-            prepared.instrumentation().detached_authoring_micros as f64 / 1_000.0,
         );
     }
 
@@ -10308,6 +10365,205 @@ mod tests {
             BootstrapAggregateCommitV1::decode(&prepared.commit_bytes().unwrap()).unwrap(),
             prepared.commit()
         );
+        let publication = prepared.candidate().detached_publication_stats().unwrap();
+        assert_eq!(publication.immutable_publications, 0);
+        assert_eq!(publication.successful_batch_completions, 1);
+    }
+
+    #[test]
+    fn detached_bootstrap_density_changes_object_work_not_completion_or_semantics() {
+        let sparse_files = [
+            ("pages/Sparse 0.md", "title:: Sparse 0\n\n- plain zero\n"),
+            ("pages/Sparse 1.md", "title:: Sparse 1\n\n- plain one\n"),
+        ];
+        let dense_uuid_0 = LogseqUuid::from_uuid(Uuid::from_u128(0x5a10));
+        let dense_uuid_1 = LogseqUuid::from_uuid(Uuid::from_u128(0x5a11));
+        let dense_owned = [
+            (
+                "pages/Dense 0.md",
+                format!(
+                    "title:: Dense 0\n\n- dense zero [[Dense 1]]\n  id:: {}\n",
+                    dense_uuid_0.as_uuid()
+                ),
+            ),
+            (
+                "pages/Dense 1.md",
+                format!(
+                    "title:: Dense 1\n\n- dense one [[Dense 0]]\n  id:: {}\n",
+                    dense_uuid_1.as_uuid()
+                ),
+            ),
+        ];
+        let dense_files = dense_owned
+            .iter()
+            .map(|(path, contents)| (*path, contents.as_str()))
+            .collect::<Vec<_>>();
+        let (_sparse_root, sparse, _) =
+            prepare_streaming_bootstrap("detached-batch-sparse", &sparse_files);
+        let (_dense_root, dense, _) =
+            prepare_streaming_bootstrap("detached-batch-dense", &dense_files);
+
+        let sparse_stats = sparse.candidate().detached_publication_stats().unwrap();
+        let dense_stats = dense.candidate().detached_publication_stats().unwrap();
+        assert!(sparse_stats.immutable_publications > 0);
+        assert!(
+            dense_stats.immutable_publications > sparse_stats.immutable_publications,
+            "reference/UUID density should increase immutable object work: sparse={sparse_stats:?} dense={dense_stats:?}"
+        );
+        assert_eq!(sparse_stats.successful_batch_completions, 1);
+        assert_eq!(dense_stats.successful_batch_completions, 1);
+
+        for (prepared, expected) in [
+            (
+                &sparse,
+                [
+                    ("pages/Sparse 0.md", "Sparse 0", "plain zero"),
+                    ("pages/Sparse 1.md", "Sparse 1", "plain one"),
+                ],
+            ),
+            (
+                &dense,
+                [
+                    ("pages/Dense 0.md", "Dense 0", "dense zero [[Dense 1]]"),
+                    ("pages/Dense 1.md", "Dense 1", "dense one [[Dense 0]]"),
+                ],
+            ),
+        ] {
+            for (path, name, content) in expected {
+                let path = ManagedPath::parse(path).unwrap();
+                let page_id = prepared
+                    .aggregate()
+                    .import_id()
+                    .unmatched_page_id(&ImportLocator::page(path));
+                let page = prepared
+                    .candidate()
+                    .accepted_engine()
+                    .materialize_page(page_id)
+                    .unwrap();
+                assert_eq!(page.name.as_str(), name);
+                assert_eq!(page.blocks.len(), 1);
+                assert!(page.blocks[0].content.starts_with(content));
+            }
+        }
+
+        for (path, uuid) in [
+            ("pages/Dense 0.md", dense_uuid_0),
+            ("pages/Dense 1.md", dense_uuid_1),
+        ] {
+            let page_id = dense
+                .aggregate()
+                .import_id()
+                .unmatched_page_id(&ImportLocator::page(ManagedPath::parse(path).unwrap()));
+            let page = dense
+                .candidate()
+                .accepted_engine()
+                .materialize_page(page_id)
+                .unwrap();
+            assert_eq!(page.blocks[0].logseq_uuid, Some(uuid));
+            assert!(matches!(
+                dense.candidate().accepted_engine().resolve_logseq_uuid(uuid).unwrap(),
+                super::super::hot_engine::LogseqUuidResolution::Unique(claim)
+                    if claim.page_id == page_id && claim.block_id == page.blocks[0].block_id
+            ));
+            let posting = dense
+                .candidate()
+                .accepted_engine()
+                .reference_posting_for_test(page_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(posting.facts().len(), 1);
+            assert!(matches!(
+                &posting.facts()[0],
+                super::super::reference_catalog::ReferenceFactV1::PageName(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn detached_bootstrap_retry_verifies_abandoned_objects_before_yielding_candidate() {
+        let root = TestRoot::new("detached-batch-retry");
+        let graph_root = root.path().join("graph/pages");
+        fs::create_dir_all(&graph_root).unwrap();
+        fs::write(
+            graph_root.join("retry.md"),
+            "title:: Retry\n\n- retry [[Retry]]\n  id:: 00000000-0000-0000-0000-000000005a23\n",
+        )
+        .unwrap();
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(0x5a21));
+
+        let clean_root = TestRoot::new("detached-batch-clean");
+        let clean_graph_root = clean_root.path().join("graph/pages");
+        fs::create_dir_all(&clean_graph_root).unwrap();
+        fs::copy(
+            graph_root.join("retry.md"),
+            clean_graph_root.join("retry.md"),
+        )
+        .unwrap();
+        let clean = prepare_streaming_bootstrap_attempt(&clean_root, "clean", workspace).unwrap();
+        let clean_stats = clean.candidate().detached_publication_stats().unwrap();
+
+        super::super::object_store::fail_next_detached_bootstrap_batch_finish();
+        let interrupted = prepare_streaming_bootstrap_attempt(&root, "interrupted", workspace);
+        assert!(interrupted.is_err());
+
+        let retried = prepare_streaming_bootstrap_attempt(&root, "retry", workspace).unwrap();
+        let stats = retried.candidate().detached_publication_stats().unwrap();
+        assert!(stats.immutable_publications > 0);
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        assert!(
+            stats.verified_existing_publications > clean_stats.verified_existing_publications,
+            "retry did not add byte-verification work for abandoned exact objects: clean={clean_stats:?} retry={stats:?}"
+        );
+        assert_eq!(stats.successful_batch_completions, 1);
+        assert_eq!(
+            retried.candidate().index_archive_identity(),
+            target_catalog(&root.path().join("archive"), workspace).archive_identity()
+        );
+    }
+
+    #[test]
+    fn detached_bootstrap_conflicting_abandoned_content_address_fails_closed() {
+        let root = TestRoot::new("detached-batch-conflict");
+        let graph_root = root.path().join("graph/pages");
+        fs::create_dir_all(&graph_root).unwrap();
+        fs::write(graph_root.join("conflict.md"), "- conflict\n").unwrap();
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(0x5a31));
+
+        super::super::object_store::fail_next_detached_bootstrap_batch_finish();
+        assert!(prepare_streaming_bootstrap_attempt(&root, "interrupted", workspace).is_err());
+        let nodes = root.path().join("archive/portable-path-index-v1");
+        let node = fs::read_dir(&nodes)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "patricia-node")
+            })
+            .expect("abandoned detached authoring left a Patricia node");
+        fs::write(&node, b"conflicting bytes").unwrap();
+
+        let retry = prepare_streaming_bootstrap_attempt(&root, "retry", workspace);
+        assert!(
+            retry.is_err(),
+            "a conflicting content-addressed immutable name must fail closed"
+        );
+        assert_eq!(fs::read(node).unwrap(), b"conflicting bytes");
+    }
+
+    #[test]
+    fn detached_candidate_durability_proof_refuses_a_different_archive() {
+        let (root, prepared, workspace) = prepare_streaming_bootstrap(
+            "detached-candidate-archive-mismatch",
+            &[("pages/bound.md", "- archive bound\n")],
+        );
+        let wrong_archive = root.path().join("wrong-archive");
+        let result = publish_install_verify_inactive_bootstrap(
+            &prepared,
+            ObjectStore::open(&wrong_archive, workspace).unwrap(),
+            orchestration_binding(&prepared, 0x5a41),
+        );
+        assert!(result.is_err());
+        assert!(!wrong_archive.join("bootstrap-v1").exists());
     }
 
     #[test]
