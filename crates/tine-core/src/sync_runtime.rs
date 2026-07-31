@@ -2043,7 +2043,8 @@ impl SyncRuntimeHandle {
             _ => unreachable!("activation discovery branch already returned"),
         };
 
-        let result = activate_non_active_local(request.clone(), graph, existing_binding, &mut progress);
+        let result =
+            activate_non_active_local(request.clone(), graph, existing_binding, &mut progress);
         match result {
             Ok(handoff) => activation_open_same_process_runtime(request, handoff),
             Err(detail) => {
@@ -2971,18 +2972,17 @@ fn activate_non_active_local(
     // avoiding a second database, archive, engine, or receipt-store open in
     // the uninterrupted activation transaction.
     progress(SyncLocalActivationPhase::ReconciliationBaselineActorOpen);
-    let baseline = open_reconciliation_baseline_with_runtime(
-        &application_runtime_root,
-        &graph,
-        &binding,
-    )?;
+    let baseline =
+        open_reconciliation_baseline_with_runtime(&application_runtime_root, &graph, &binding)?;
     let promotion_session_id = promoted.promotion_session_id();
     let promoted_state_digest = promoted.promoted_state_digest().map_err(display)?;
     if authority.binding() != &binding
         || authority.session_id() != request.identities.session_id
         || promotion_session_id != request.identities.session_id
     {
-        return Err("same-process activation handoff binding changed after LocalActive proof".into());
+        return Err(
+            "same-process activation handoff binding changed after LocalActive proof".into(),
+        );
     }
     Ok(SameProcessActivationHandoff {
         graph,
@@ -3194,7 +3194,9 @@ fn ensure_reconciliation_baseline_with_runtime(
     graph: &Graph,
     binding: &EnrollmentBindingV1,
 ) -> Result<(), String> {
-    drop(open_reconciliation_baseline_with_runtime(runtime, graph, binding)?);
+    drop(open_reconciliation_baseline_with_runtime(
+        runtime, graph, binding,
+    )?);
     Ok(())
 }
 
@@ -3213,7 +3215,9 @@ fn open_reconciliation_baseline_with_runtime(
     .map_err(display)?;
     match ReconciliationBaseline::open_existing(&trusted, baseline_binding.clone()) {
         Ok(baseline) => Ok(baseline),
-        Err(error) if error.is_missing() => ReconciliationBaseline::create_fresh(&trusted, baseline_binding).map_err(display),
+        Err(error) if error.is_missing() => {
+            ReconciliationBaseline::create_fresh(&trusted, baseline_binding).map_err(display)
+        }
         Err(error) => return Err(display(error)),
     }
 }
@@ -5357,7 +5361,9 @@ impl RuntimeActor {
             || runtime.promotion_session_id() != promotion_session_id
             || runtime.promoted_state_digest().map_err(display)? != promoted_state_digest
         {
-            return Err("same-process activation handoff binding does not match retained proof".into());
+            return Err(
+                "same-process activation handoff binding does not match retained proof".into(),
+            );
         }
         #[cfg(test)]
         record_retained_activation_handoff(binding.workspace_id());
@@ -5396,24 +5402,22 @@ impl RuntimeActor {
         let feed =
             ExactExternalFeedState::open(&graph, &receipts, &runtime, baseline).map_err(display)?;
         let last_watcher = map_watcher(runtime.watcher_status());
-        let shared = inspect_shared_enrollment_descriptor(&enrollment_root, &binding)
-            .map_err(display)?;
+        let shared =
+            inspect_shared_enrollment_descriptor(&enrollment_root, &binding).map_err(display)?;
         let shared_descriptor = shared.as_ref().map(|(descriptor, _)| descriptor.clone());
         let shared_role = shared.map(|(_, role)| match role {
             SharedEnrollmentRole::Initiator => SyncSharedRole::Initiator,
             SharedEnrollmentRole::Joiner => SyncSharedRole::Joiner,
         });
-        let shared_phase = crate::oplog::enrollment::inspect_shared_enrollment_phase(
-            &enrollment_root,
-            &binding,
-        )
-        .map_err(display)?
-        .map(|phase| match phase {
-            SharedEnrollmentPhase::SharePrepared => SyncSharedPhase::SharePrepared,
-            SharedEnrollmentPhase::Joining => SyncSharedPhase::Joining,
-            SharedEnrollmentPhase::SharedActiveInitiator
-            | SharedEnrollmentPhase::SharedActiveJoiner => SyncSharedPhase::Active,
-        });
+        let shared_phase =
+            crate::oplog::enrollment::inspect_shared_enrollment_phase(&enrollment_root, &binding)
+                .map_err(display)?
+                .map(|phase| match phase {
+                    SharedEnrollmentPhase::SharePrepared => SyncSharedPhase::SharePrepared,
+                    SharedEnrollmentPhase::Joining => SyncSharedPhase::Joining,
+                    SharedEnrollmentPhase::SharedActiveInitiator
+                    | SharedEnrollmentPhase::SharedActiveJoiner => SyncSharedPhase::Active,
+                });
         let accepted_root = runtime.engine().accepted_frontier_root().map_err(display)?;
         let accepted_audit_root = ProviderRecoveryCoverageRoot::from_frontier(&accepted_root);
         let provider_accepted_manifest_audit = (shared_phase == Some(SyncSharedPhase::Active))

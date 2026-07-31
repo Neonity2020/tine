@@ -2681,7 +2681,9 @@ impl PromotedLocalRuntime {
     /// Digest of the exact durable promotion state this retained runtime
     /// already authenticated during its construction.
     pub(crate) fn promoted_state_digest(&self) -> Result<ContentDigest, RuntimePromotionError> {
-        self.state.state_digest().map_err(RuntimePromotionError::Store)
+        self.state
+            .state_digest()
+            .map_err(RuntimePromotionError::Store)
     }
 
     /// Whether automatic external Markdown/Org import may run under this
