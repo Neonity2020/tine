@@ -15,6 +15,7 @@ pub mod model;
 pub mod onboarding;
 pub mod oplog;
 pub mod org;
+mod outline;
 pub mod pdf;
 pub mod publish;
 pub mod query;

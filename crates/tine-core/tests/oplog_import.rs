@@ -1708,14 +1708,15 @@ fn portable_case_and_unicode_collisions_fail_closed_but_exact_owner_remains_vali
 }
 
 #[test]
-fn deep_input_fails_before_parse_and_inventory_instrumentation_counts_physical_work() {
+fn parser_owned_deep_input_is_refused_and_inventory_counts_physical_work() {
     let deep = AuthorityFixture::one_page(
         "deep-budget",
         "pages/deep.md",
         vec![BlockSpec::root("base", "a")],
     );
-    let mut external = "\t".repeat(tine_core::oplog::MAX_IMPORT_DEPTH);
-    external.push_str("- too deep\n");
+    let external = (0..=tine_core::oplog::MAX_IMPORT_DEPTH)
+        .map(|depth| format!("{}- depth {depth}\n", "  ".repeat(depth)))
+        .collect::<String>();
     deep.overwrite("pages/deep.md", external.as_bytes());
     let blocked = deep.plan(&["pages/deep.md"]);
     assert!(blocked_reasons(&blocked).contains(&ImportBlockReason::ResourceLimit));

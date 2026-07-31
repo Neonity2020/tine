@@ -2096,6 +2096,7 @@ fn annotate_serialized_blocks(
     let mut marked = document.clone();
     let mut marked_count = 0;
     mark_document_blocks(
+        format,
         &mut marked.roots,
         pending,
         &marker_prefix,
@@ -2156,6 +2157,7 @@ fn annotate_serialized_blocks(
 }
 
 fn mark_document_blocks(
+    format: ProjectionFormat,
     blocks: &mut [DocBlock],
     pending: &[PendingAnnotation],
     marker_prefix: &str,
@@ -2170,9 +2172,19 @@ fn mark_document_blocks(
         }
         let start = span_marker(marker_prefix, *index, 'S');
         let end = span_marker(marker_prefix, *index, 'E');
-        block.raw = format!("{start}{}{end}", block.raw);
+        let start_offset = match format {
+            ProjectionFormat::Markdown => {
+                crate::outline::markdown_unbulleted_heading_line_end(&block.raw).unwrap_or(0)
+            }
+            ProjectionFormat::Org => 0,
+        };
+        block.raw = format!(
+            "{}{start}{}{end}",
+            &block.raw[..start_offset],
+            &block.raw[start_offset..]
+        );
         *index += 1;
-        mark_document_blocks(&mut block.children, pending, marker_prefix, index)?;
+        mark_document_blocks(format, &mut block.children, pending, marker_prefix, index)?;
     }
     Ok(())
 }
@@ -2729,12 +2741,12 @@ mod tests {
     }
 
     #[test]
-    fn collapsed_promoted_heading_requires_the_same_sole_semantic_root() {
+    fn collapsed_heading_projection_retains_parser_owned_sibling_topology() {
         let base = structural_layout_state(
             "pages/collapsed.md",
             vec![
                 (80_031, None, "a", "# Parent\ncollapsed:: true".into(), None),
-                (80_032, Some(80_031), "a", "child".into(), None),
+                (80_032, None, "b", "child".into(), None),
             ],
         );
         let source = "# Parent\ncollapsed:: true\n- child\n";
@@ -2743,22 +2755,23 @@ mod tests {
             vec![
                 (80_033, None, "a", "new root".into(), None),
                 (80_031, None, "b", "# Parent\ncollapsed:: true".into(), None),
-                (80_032, Some(80_031), "a", "child".into(), None),
+                (80_032, None, "c", "child".into(), None),
             ],
         );
         let projection = reproject_with_source_identities(&base, source, &inserted_root);
         let projected = std::str::from_utf8(projection.target()).unwrap();
         assert!(projected.starts_with("- new root\n- # Parent\n"));
         let reparsed = crate::doc::parse(projected);
-        assert_eq!(reparsed.roots.len(), 2);
+        assert_eq!(reparsed.roots.len(), 3);
         assert_eq!(reparsed.roots[0].raw, "new root");
         assert_eq!(reparsed.roots[1].raw, "# Parent\ncollapsed:: true");
+        assert_eq!(reparsed.roots[2].raw, "child");
 
         let changed_child = structural_layout_state(
             "pages/collapsed.md",
             vec![
                 (80_031, None, "a", "# Parent\ncollapsed:: true".into(), None),
-                (80_032, Some(80_031), "a", "child edited".into(), None),
+                (80_032, None, "b", "child edited".into(), None),
             ],
         );
         let retained = reproject_with_source_identities(&base, source, &changed_child);

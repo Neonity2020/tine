@@ -6400,9 +6400,7 @@ fn parse_external_nodes(
     bytes: &[u8],
     instrumentation: &mut ImportInstrumentation,
 ) -> Result<ParsedExternalTree, ImportBlock> {
-    let text = std::str::from_utf8(bytes).expect("UTF-8 checked before semantic parsing");
     let is_org = path.is_org();
-    preflight_depth(path, text, is_org, instrumentation.parsed_nodes)?;
     let parsed = graph
         .parse_external_document(path, bytes, true)
         .map_err(|error| {
@@ -6412,6 +6410,7 @@ fn parse_external_nodes(
                 format!("external document parser rejected source: {error}"),
             )
         })?;
+    enforce_outline_limits(path, &parsed.parsed, instrumentation.parsed_nodes)?;
     if parsed.source_round_trips != Some(true) {
         return Err(authority_block(
             ImportBlockReason::UnsafeInput,
@@ -6439,11 +6438,23 @@ fn parse_nodes(
 ) -> Result<ParsedTree, ImportBlock> {
     let text = std::str::from_utf8(bytes).expect("UTF-8 checked before semantic parsing");
     let is_org = path.is_org();
-    preflight_depth(path, text, is_org, instrumentation.parsed_nodes)?;
-    let source_admitted = if is_org {
-        crate::org::org_editable(text)
+    let parsed = if is_org {
+        crate::org::try_parse_org_with_source_spans(text)
     } else {
-        crate::doc::markdown_structurally_round_trips(text)
+        crate::doc::try_parse_with_source_spans(text)
+    }
+    .map_err(|error| {
+        authority_block(
+            ImportBlockReason::UnsafeInput,
+            Some(path),
+            format!("lsdoc outline cannot be represented safely: {error}"),
+        )
+    })?;
+    enforce_outline_limits(path, &parsed, instrumentation.parsed_nodes)?;
+    let source_admitted = if is_org {
+        crate::org::org_editable_parsed(text, &parsed)
+    } else {
+        crate::doc::markdown_structurally_round_trips_parsed(text, &parsed)
     };
     if !source_admitted {
         return Err(authority_block(
@@ -6456,67 +6467,31 @@ fn parse_nodes(
             },
         ));
     }
-    let parsed = if is_org {
-        crate::org::parse_org_with_source_spans(text)
-    } else {
-        crate::doc::parse_with_source_spans(text)
-    };
     flatten_document(path, parsed, instrumentation)
 }
 
-fn preflight_depth(
+fn enforce_outline_limits(
     path: &ManagedPath,
-    text: &str,
-    is_org: bool,
+    parsed: &crate::doc::ParsedDocument,
     parsed_nodes: usize,
 ) -> Result<(), ImportBlock> {
-    let mut candidate_nodes = 0_usize;
-    for line in text.lines() {
-        let depth = if is_org {
-            let stars = line
-                .as_bytes()
-                .iter()
-                .take_while(|byte| **byte == b'*')
-                .count();
-            if stars > 0 && line.as_bytes().get(stars) == Some(&b' ') {
-                candidate_nodes = candidate_nodes.saturating_add(1);
-            }
-            stars
-        } else {
-            let tabs = line
-                .as_bytes()
-                .iter()
-                .take_while(|byte| **byte == b'\t')
-                .count();
-            let spaces = line
-                .as_bytes()
-                .iter()
-                .skip(tabs)
-                .take_while(|byte| **byte == b' ')
-                .count();
-            let content = &line[tabs + spaces..];
-            if content == "-" || content.starts_with("- ") {
-                candidate_nodes = candidate_nodes.saturating_add(1);
-            }
-            tabs.saturating_add(spaces / 2).saturating_add(1)
-        };
-        if depth > MAX_IMPORT_DEPTH {
-            return Err(authority_block(
-                ImportBlockReason::ResourceLimit,
-                Some(path),
-                format!(
-                    "document nesting depth exceeds import limit {MAX_IMPORT_DEPTH} before parsing"
-                ),
-            ));
-        }
+    if parsed.outline_depth > MAX_IMPORT_DEPTH {
+        return Err(authority_block(
+            ImportBlockReason::ResourceLimit,
+            Some(path),
+            format!(
+                "parser-owned document nesting depth {} exceeds import limit {MAX_IMPORT_DEPTH}",
+                parsed.outline_depth
+            ),
+        ));
     }
-    let observed = parsed_nodes.saturating_add(candidate_nodes);
+    let observed = parsed_nodes.saturating_add(parsed.outline_nodes);
     if observed > MAX_IMPORT_PARSED_NODES {
         return Err(authority_block(
             ImportBlockReason::ResourceLimit,
             Some(path),
             format!(
-                "parsed-node budget would be exceeded before parsing: observed {observed}, limit {MAX_IMPORT_PARSED_NODES}"
+                "parser-owned outline exceeds parsed-node budget: observed {observed}, limit {MAX_IMPORT_PARSED_NODES}"
             ),
         ));
     }
@@ -7717,6 +7692,57 @@ mod tests {
             "structurally stable Markdown must expose execution material"
         );
         assert_eq!(fs::read(target).unwrap(), source.as_bytes());
+    }
+
+    #[test]
+    fn source_admission_refuses_overlapping_lsdoc_events_without_touching_bytes() {
+        let source = "- $$x$$ # #+BEGIN_NOTE\r\nx\r\n#+END_NOTE";
+        let fixture = SnapshotFixture::new("overlapping-outline-admission", &["pages/overlap.md"]);
+        let target = fixture.graph_root.join("pages/overlap.md");
+        fs::write(&target, source).unwrap();
+
+        let plan = fixture.plan(&["pages/overlap.md"]);
+        assert_eq!(plan.status(), ImportPlanStatus::Blocked);
+        assert_eq!(
+            plan.blocks()
+                .iter()
+                .map(|block| block.reason)
+                .collect::<Vec<_>>(),
+            vec![ImportBlockReason::UnsafeInput]
+        );
+        assert!(
+            plan.blocks()[0]
+                .detail
+                .contains("external document parser rejected source"),
+            "{:?}",
+            plan.blocks()[0]
+        );
+        assert_eq!(fs::read(target).unwrap(), source.as_bytes());
+    }
+
+    #[test]
+    fn parser_owned_markdown_and_org_admission_preserves_exact_source_bytes() {
+        for (label, path, source) in [
+            (
+                "parser-owned-markdown-source",
+                "pages/parser-owned.md",
+                "title:: café\r\n\r\n# Project Ω\r\n\t- child\r\n- sibling\r\n",
+            ),
+            (
+                "parser-owned-org-source",
+                "pages/parser-owned.org",
+                "#+TITLE: café\r\n\r\n* Project Ω\r\n** child\r\n* sibling\r\n",
+            ),
+        ] {
+            let fixture = SnapshotFixture::new(label, &[path]);
+            let target = fixture.graph_root.join(path);
+            fs::write(&target, source).unwrap();
+
+            let plan = fixture.plan(&[path]);
+            assert_eq!(plan.status(), ImportPlanStatus::Reconcile, "{plan:?}");
+            assert!(plan.execution_material().is_ok(), "{plan:?}");
+            assert_eq!(fs::read(target).unwrap(), source.as_bytes());
+        }
     }
 
     #[test]
@@ -8982,7 +9008,35 @@ mod tests {
     }
 
     #[test]
-    fn promoted_collapsed_preamble_heading_has_an_exact_parser_owned_span() {
+    fn import_admission_reuses_the_parser_owned_document() {
+        let markdown_path = ManagedPath::parse("pages/reused.md").unwrap();
+        let mut instrumentation = ImportInstrumentation::default();
+        crate::outline::reset_parse_attempts();
+        parse_nodes(
+            &markdown_path,
+            b"- parent\n  - child\n",
+            &mut instrumentation,
+        )
+        .unwrap();
+        assert_eq!(
+            crate::outline::parse_attempts(),
+            2,
+            "Markdown admission needs the original parse and canonical reparse"
+        );
+
+        let org_path = ManagedPath::parse("pages/reused.org").unwrap();
+        let mut instrumentation = ImportInstrumentation::default();
+        crate::outline::reset_parse_attempts();
+        parse_nodes(&org_path, b"* parent\n** child\n", &mut instrumentation).unwrap();
+        assert_eq!(
+            crate::outline::parse_attempts(),
+            1,
+            "Org admission reproduces bytes from the original parse"
+        );
+    }
+
+    #[test]
+    fn collapsed_heading_and_flat_bullets_have_exact_parser_owned_sibling_spans() {
         let bytes =
             b"page:: property\r\n\r\n# Collapsed\r\ncollapsed:: true\r\n- child\r\n- sibling\r\n";
         let path = ManagedPath::parse("pages/promoted.md").unwrap();
@@ -9011,8 +9065,8 @@ mod tests {
                 (sibling, bytes.len() as u64),
             ]
         );
-        assert_eq!(tree.roots, vec![0]);
-        assert_eq!(tree.nodes[0].children, vec![1, 2]);
+        assert_eq!(tree.roots, vec![0, 1, 2]);
+        assert!(tree.nodes.iter().all(|node| node.children.is_empty()));
     }
 
     #[test]
@@ -9192,15 +9246,11 @@ mod tests {
         assert!(charge_budget("aggregate raw bytes", u64::MAX, 1, MAX_IMPORT_RAW_BYTES).is_err());
 
         let path = ManagedPath::parse("pages/a.md").unwrap();
+        let parsed = crate::doc::try_parse_with_source_spans("- one more\n").unwrap();
         assert_eq!(
-            preflight_depth(
-                &path,
-                "- one more\n",
-                path.is_org(),
-                MAX_IMPORT_PARSED_NODES
-            )
-            .unwrap_err()
-            .reason,
+            enforce_outline_limits(&path, &parsed, MAX_IMPORT_PARSED_NODES)
+                .unwrap_err()
+                .reason,
             ImportBlockReason::ResourceLimit
         );
         let tree = ParsedTree {

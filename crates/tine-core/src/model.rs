@@ -18442,17 +18442,16 @@ fn parse_external_document(
         #[cfg(test)]
         GRAPH_TEXT_PARSE_ATTEMPTS.with(|attempts| attempts.set(attempts.get().saturating_add(1)));
         let format = Format::from_path(&fallback.path);
-        // Preserve the established admission peak: the round-trip parser and
-        // serializer must drop their temporary document before the exact-span
-        // document retained by this boundary is constructed.
-        let source_round_trips = require_round_trip.then(|| match format {
-            Format::Md => doc::markdown_structurally_round_trips(content),
-            Format::Org => crate::org::org_editable(content),
-        });
         let mut parsed = match format {
             Format::Md => doc::parse_with_source_spans(content),
             Format::Org => crate::org::parse_org_with_source_spans(content),
         };
+        // Admission reuses this retained parse. Markdown needs only the
+        // canonical reparse; Org reproduces bytes directly from these spans.
+        let source_round_trips = require_round_trip.then(|| match format {
+            Format::Md => doc::markdown_structurally_round_trips_parsed(content, &parsed),
+            Format::Org => crate::org::org_editable_parsed(content, &parsed),
+        });
         #[cfg(test)]
         if content.contains(TEST_PAGE_PARSE_PANIC_SENTINEL) {
             panic!("deterministic test sentinel for a page projection panic");
@@ -29029,6 +29028,33 @@ mod tests {
         fs::create_dir_all(dir.join("journals")).unwrap();
         fs::create_dir_all(dir.join("pages")).unwrap();
         dir
+    }
+
+    #[test]
+    fn external_document_admission_reuses_the_retained_parse() {
+        let dir = scratch("external-admission-parse-count");
+        let graph = Graph::open(&dir);
+        for (relative, content, expected_attempts) in [
+            ("pages/reused.md", "- parent\n  - child\n", 2),
+            ("pages/reused.org", "* parent\n** child\n", 1),
+        ] {
+            let entry = PageEntry {
+                name: "reused".into(),
+                kind: PageKind::Page,
+                date_key: None,
+                rel_path: relative.into(),
+                path: dir.join(relative),
+            };
+            crate::outline::reset_parse_attempts();
+            let parsed = parse_external_document(&graph, entry, content, true).unwrap();
+            assert_eq!(parsed.source_round_trips, Some(true));
+            assert_eq!(
+                crate::outline::parse_attempts(),
+                expected_attempts,
+                "{relative}"
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 
     fn bootstrap_capture_scratch(tag: &str) -> PathBuf {

@@ -58,6 +58,11 @@ pub(crate) struct ParsedDocument {
     /// preamble heading that remains unbulleted while owning following outline
     /// blocks as children. Org documents never have this Markdown-only layout.
     pub(crate) promoted_heading_layout: Option<PromotedHeadingLayout>,
+    /// Parser-owned outline event count and maximum representable tree depth.
+    /// Sync admission consumes these instead of running a second handwritten
+    /// structural grammar over the source.
+    pub(crate) outline_nodes: usize,
+    pub(crate) outline_depth: usize,
 }
 
 /// One receipt-proved association between a source structural locator and the
@@ -676,275 +681,14 @@ pub(crate) fn parse_property_line(line: &str) -> Option<(String, String)> {
     Some((key.to_string(), value))
 }
 
-/// Number of leading whitespace characters (tabs and spaces). Used as an
-/// indent "column" for nesting. Tabs and spaces each count as one; within a
-/// single file indentation is consistent (all tabs or all N-spaces), so column
-/// comparison recovers nesting regardless of which a file uses. Output is
-/// always canonicalized to TABs.
-fn leading_ws(line: &str) -> usize {
-    line.bytes()
-        .take_while(|b| *b == b'\t' || *b == b' ')
-        .count()
-}
-
-/// Classify a line as a bullet at a given indent column, returning its content
-/// (text after the `- ` marker). Returns `None` for non-bullet lines.
-fn bullet(line: &str) -> Option<(usize, &str)> {
-    let col = leading_ws(line);
-    let rest = &line[col..];
-    if rest == "-" {
-        Some((col, ""))
-    } else if let Some(content) = rest.strip_prefix("- ") {
-        Some((col, content))
-    } else {
-        None
-    }
-}
-
-/// Parse a file's contents into a [`Document`].
-/// The fence marker at the start of a line: `(char, run-length)` for a run of >=3
-/// backticks or tildes (leading whitespace ignored); else `None`.
-pub(crate) fn fence_marker(text: &str) -> Option<(char, usize)> {
-    let t = text.trim_start();
-    let c = t.chars().next()?;
-    if c != '`' && c != '~' {
-        return None;
-    }
-    let n = t.chars().take_while(|&x| x == c).count();
-    (n >= 3).then_some((c, n))
-}
-
-/// Given the current open fence (if any) and a line, return the new fence state:
-/// open on the first valid marker, close only on a matching one (same char, >=
-/// the opener's length). Shared by the block parser, `property_lines`, and
-/// `visible_lines` so "inside a code fence?" is decided one way.
-pub(crate) fn next_fence(cur: Option<(char, usize)>, line: &str) -> Option<(char, usize)> {
-    match cur {
-        None => fence_marker(line),
-        Some((c, n)) => match fence_marker(line) {
-            Some((c2, n2)) if c2 == c && n2 >= n => None, // closing fence
-            _ => Some((c, n)),                            // still inside
-        },
-    }
-}
-
-/// mldoc `Parsers.is_space`: space, tab, SUB, or form feed.
-fn mldoc_is_space(b: u8) -> bool {
-    matches!(b, b' ' | b'\t' | 0x1a | 0x0c)
-}
-
-fn mldoc_spaces_len(s: &str) -> usize {
-    s.as_bytes()
-        .iter()
-        .take_while(|&&b| mldoc_is_space(b))
-        .count()
-}
-
-fn mldoc_trim_spaces_start(s: &str) -> &str {
-    &s[mldoc_spaces_len(s)..]
-}
-
-/// lsdoc's line-local `ocaml_start`: space, tab, or form feed, but not SUB.
-fn ocaml_spaces_len(s: &str) -> usize {
-    s.as_bytes()
-        .iter()
-        .take_while(|&&b| matches!(b, b' ' | b'\t' | 0x0c))
-        .count()
-}
-
-// Transcribed from lsdoc v2 `block_begin_name`: after mldoc-space trimming,
-// BEGIN is ASCII-case-insensitive and the non-empty name ends at mldoc space.
-fn block_begin_name(s: &str) -> Option<String> {
-    let t = mldoc_trim_spaces_start(s);
-    if !t.get(..8)?.eq_ignore_ascii_case("#+BEGIN_") {
-        return None;
-    }
-    let rest = &t[8..];
-    let mut end = 0usize;
-    let bytes = rest.as_bytes();
-    while end < bytes.len() && !mldoc_is_space(bytes[end]) {
-        end += 1;
-    }
-    (end > 0).then(|| rest[..end].to_string())
-}
-
-fn starts_ci(s: &str, prefix: &str) -> bool {
-    let p = prefix.as_bytes();
-    let b = s.as_bytes();
-    b.len() >= p.len() && b[..p.len()].eq_ignore_ascii_case(p)
-}
-
-// Transcribed from lsdoc v2 `block_end_matches_name` / EndTrie: the first
-// later END suffix with the opener name as an ASCII-case-insensitive prefix
-// closes the region; no boundary after the name is required.
-fn block_end_matches_name(text: &str, name: &str) -> bool {
-    let t = &text[ocaml_spaces_len(text)..];
-    let Some(suffix) = t.get(6..) else {
-        return false;
-    };
-    starts_ci(t, "#+END_")
-        && suffix.len() >= name.len()
-        && suffix.as_bytes()[..name.len()].eq_ignore_ascii_case(name.as_bytes())
-}
-
-/// Prove that an org opener's first compatible END is in the same physical
-/// continuation lane before a bullet that would fold the opener frame.
-fn has_bounded_org_closer(following: &[&str], content_start: usize, name: &str) -> bool {
-    let mut fence = None;
-    for line in following {
-        // A bullet shallower than the opener block's content lane is a genuine
-        // child/sibling and bounds the lookahead. A bullet inside an inner fence
-        // remains literal.
-        if fence.is_none() && bullet(line).is_some_and(|(bullet_col, _)| bullet_col < content_start)
-        {
-            return false;
-        }
-
-        // mldoc takes the first name-compatible END. It is safe to rescue this
-        // outline region only when that same END is in the block-content lane.
-        if block_end_matches_name(line, name) {
-            return ocaml_spaces_len(line) == content_start;
-        }
-
-        fence = next_fence(fence, line);
-    }
-    false
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PromotedHeadingLayout {
-    /// Importer compatibility: unindented bullets following a collapsed heading
-    /// were historically interpreted as that heading's children.
-    FlatChildren,
+    /// The first parser-owned block is an unbulleted ATX heading, but its next
+    /// outline event is a sibling rather than a child.
+    UnbulletedRoot,
     /// Native Markdown outline: lsdoc reports the owned bullets deeper than the
     /// unbulleted heading, so children retain one indentation level on write.
     NestedChildren,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct PreambleHeadingPromotion {
-    heading_line: usize,
-    owned_outline_end: Option<usize>,
-    layout: PromotedHeadingLayout,
-}
-
-fn outline_event(block: &lsdoc::ast::Block) -> Option<(u32, lsdoc::ast::Span)> {
-    use lsdoc::ast::Block;
-    match block {
-        Block::Heading {
-            level,
-            span: Some(span),
-            ..
-        }
-        | Block::Bullet {
-            level,
-            span: Some(span),
-            ..
-        } => Some((*level, *span)),
-        _ => None,
-    }
-}
-
-/// Ask lsdoc whether the semantic suffix of Tine's preamble is an unbulleted
-/// heading followed by an outline run it owns. The old structural scanner still
-/// materializes the blocks for this bridge; lsdoc alone authorizes the heading
-/// and supplies the levels/spans that bound ownership.
-fn preamble_heading_promotion(
-    body: &str,
-    lines: &[&str],
-    line_starts: &[usize],
-    pre_end: usize,
-    first_bullet_line: usize,
-) -> Option<PreambleHeadingPromotion> {
-    use lsdoc::ast::Block;
-
-    let first_outline_start = *line_starts.get(first_bullet_line)?;
-    let semantic_preamble_end = pre_end
-        .checked_sub(1)
-        .and_then(|line| line_starts.get(line).zip(lines.get(line)))
-        .map(|(start, line)| start.saturating_add(line.len()))?;
-    // Necessary-only fast path: every Markdown ATX heading contains `#` in
-    // its semantic preamble source. Keep this deliberately broader than syntax
-    // recognition (including unusual leading whitespace); lsdoc below remains
-    // the sole authority for whether any such byte is actually a heading.
-    if !lines[..pre_end]
-        .iter()
-        .any(|line| line.as_bytes().contains(&b'#'))
-    {
-        return None;
-    }
-    let blocks = lsdoc::parse(body, "md");
-    let (heading_index, heading_level, heading_span) = blocks
-        .iter()
-        .enumerate()
-        .filter_map(|(index, block)| match block {
-            Block::Heading {
-                level,
-                span: Some(span),
-                ..
-            } if span.0 < first_outline_start => Some((index, *level, *span)),
-            _ => None,
-        })
-        .next_back()?;
-    let heading_line = line_starts.binary_search(&heading_span.0).ok()?;
-    if heading_line >= pre_end {
-        return None;
-    }
-
-    let mut suffix_owned_through = heading_span.1;
-    let mut first_outline = None;
-    for block in &blocks[heading_index + 1..] {
-        if let Some(event) = outline_event(block) {
-            first_outline = Some(event);
-            break;
-        }
-        match block {
-            Block::Properties {
-                span: Some(span), ..
-            } if span.0 < first_outline_start => {
-                suffix_owned_through = suffix_owned_through.max(span.1);
-            }
-            Block::Paragraph {
-                span: Some(span), ..
-            } if span.1 <= first_outline_start
-                && body
-                    .get(span.0..span.1)
-                    .is_some_and(|source| source.trim().is_empty()) =>
-            {
-                suffix_owned_through = suffix_owned_through.max(span.1);
-            }
-            _ => return None,
-        }
-    }
-    if suffix_owned_through < semantic_preamble_end {
-        return None;
-    }
-
-    let (first_level, first_span) = first_outline?;
-    if first_span.0 != first_outline_start {
-        return None;
-    }
-    let raw = lines[heading_line..pre_end].join("\n");
-    let layout = if first_level > heading_level {
-        PromotedHeadingLayout::NestedChildren
-    } else if first_level == heading_level && DocBlock::new(raw).collapsed() {
-        PromotedHeadingLayout::FlatChildren
-    } else {
-        return None;
-    };
-    let owned_outline_end = match layout {
-        PromotedHeadingLayout::FlatChildren => None,
-        PromotedHeadingLayout::NestedChildren => blocks[heading_index + 1..]
-            .iter()
-            .filter_map(outline_event)
-            .skip(1)
-            .find_map(|(level, span)| (level <= heading_level).then_some(span.0)),
-    };
-    Some(PreambleHeadingPromotion {
-        heading_line,
-        owned_outline_end,
-        layout,
-    })
 }
 
 /// Ask lsdoc whether writing `raw` as an unbulleted heading followed by one
@@ -955,335 +699,34 @@ fn lsdoc_authorizes_nested_heading_raw(raw: &str, indent: &str) -> bool {
     const CHILD_PROBE: &str = "tine nested-heading child probe";
     const BOUNDARY_PROBE: &str = "tine nested-heading boundary probe";
 
-    let first_bullet_line = raw.split('\n').count();
     let body = format!("{raw}\n{indent}- {CHILD_PROBE}\n- {BOUNDARY_PROBE}");
-    let lines = body.split('\n').collect::<Vec<_>>();
-    let mut line_starts = Vec::with_capacity(lines.len());
-    let mut line_start = 0_usize;
-    for line in &lines {
-        line_starts.push(line_start);
-        line_start = line_start.saturating_add(line.len()).saturating_add(1);
-    }
-    let boundary_start = line_starts
-        .get(first_bullet_line.saturating_add(1))
-        .copied();
-
     matches!(
-        preamble_heading_promotion(
-            &body,
-            &lines,
-            &line_starts,
-            first_bullet_line,
-            first_bullet_line,
-        ),
-        Some(PreambleHeadingPromotion {
-            heading_line: 0,
-            owned_outline_end: Some(owned_outline_end),
-            layout: PromotedHeadingLayout::NestedChildren,
-        }) if Some(owned_outline_end) == boundary_start
+        crate::outline::parse_document(&body, crate::outline::OutlineFormat::Markdown),
+        Ok(ParsedDocument {
+            document: Document { roots, .. },
+            promoted_heading_layout: Some(PromotedHeadingLayout::NestedChildren),
+            ..
+        }) if roots.len() == 2
+            && roots[0].raw == raw
+            && roots[0].children.len() == 1
+            && roots[0].children[0].raw == CHILD_PROBE
+            && roots[1].raw == BOUNDARY_PROBE
     )
-}
-
-fn block_subtree_len(block: &DocBlock) -> usize {
-    block.children.iter().fold(1_usize, |total, child| {
-        total.saturating_add(block_subtree_len(child))
-    })
-}
-
-/// Promote the lsdoc-authorized preamble heading and only the structural roots
-/// whose source headers fall inside lsdoc's owned outline interval.
-fn promote_preamble_heading(
-    pre_block: &mut Option<String>,
-    roots: &mut Vec<DocBlock>,
-    block_starts: &[usize],
-    lines: &[&str],
-    pre_end: usize,
-    promotion: PreambleHeadingPromotion,
-) -> Option<(usize, usize)> {
-    if roots.is_empty() || pre_block.is_none() {
-        return None;
-    }
-
-    let raw = lines[promotion.heading_line..pre_end].join("\n");
-    let mut parent = DocBlock::new(raw);
-    let mut block_index = 0_usize;
-    let mut owned_roots = 0_usize;
-    let mut boundary_aligned = promotion.owned_outline_end.is_none();
-    for root in roots.iter() {
-        let start = *block_starts.get(block_index)?;
-        if promotion
-            .owned_outline_end
-            .is_some_and(|owned_outline_end| start >= owned_outline_end)
-        {
-            boundary_aligned = Some(start) == promotion.owned_outline_end;
-            break;
-        }
-        owned_roots = owned_roots.saturating_add(1);
-        block_index = block_index.saturating_add(block_subtree_len(root));
-    }
-    if owned_roots == 0 || !boundary_aligned {
-        return None;
-    }
-    parent.children = roots.drain(..owned_roots).collect();
-    roots.insert(0, parent);
-
-    let mut prefix_end = promotion.heading_line;
-    while prefix_end > 0 && lines[prefix_end - 1].trim().is_empty() {
-        prefix_end -= 1;
-    }
-    *pre_block = (prefix_end > 0).then(|| lines[..prefix_end].join("\n"));
-    Some((
-        promotion.heading_line,
-        promotion.heading_line.saturating_sub(prefix_end),
-    ))
 }
 
 pub fn parse(content: &str) -> Document {
     parse_with_source_spans(content).document
 }
 
-pub(crate) fn parse_with_source_spans(content: &str) -> ParsedDocument {
-    // Normalize CRLF / lone CR to LF so the in-memory model never carries a stray
-    // `\r` (which would otherwise pollute property / `id::` values and break
-    // matching). The file's original line endings are reproduced at the write
-    // boundary (model.rs `write_page`), not here — the model is LF-canonical.
-    let original_len = content.len();
-    let normalized;
-    let normalized_to_original;
-    let content = if content.contains('\r') {
-        let mut bytes = Vec::with_capacity(content.len());
-        let mut offsets = Vec::with_capacity(content.len() + 1);
-        for (offset, byte) in content.bytes().enumerate() {
-            if byte != b'\r' {
-                offsets.push(offset);
-                bytes.push(byte);
-            }
-        }
-        offsets.push(content.len());
-        normalized = String::from_utf8(bytes).expect("removing CR preserves valid UTF-8");
-        normalized_to_original = Some(offsets);
-        normalized.as_str()
-    } else {
-        normalized_to_original = None;
-        content
-    };
-    // The complete terminal newline run is document formatting. Keeping even
-    // one of its empty lines in the final block raw gives both the block and
-    // SerializeOpts ownership of the same bytes.
-    let body = content.trim_end_matches('\n');
-    let lines: Vec<&str> = if body.is_empty() {
-        Vec::new()
-    } else {
-        body.split('\n').collect()
-    };
-    let mut line_starts = Vec::with_capacity(lines.len());
-    let mut line_start = 0_usize;
-    for line in &lines {
-        line_starts.push(line_start);
-        line_start = line_start.saturating_add(line.len()).saturating_add(1);
-    }
-
-    // Find the first bullet to split pre-block from block region.
-    let first_bullet = lines.iter().position(|l| bullet(l).is_some());
-
-    let (pre_lines, block_lines) = match first_bullet {
-        Some(i) => (&lines[..i], &lines[i..]),
-        None => (&lines[..], &[][..]),
-    };
-
-    // Pre-block: drop trailing blank lines (the separator is re-added on write).
-    let mut pre_end = pre_lines.len();
-    while pre_end > 0 && pre_lines[pre_end - 1].trim().is_empty() {
-        pre_end -= 1;
-    }
-    let mut pre_block = if pre_end == 0 {
-        None
-    } else {
-        Some(pre_lines[..pre_end].join("\n"))
-    };
-    let (mut blank_lines_after_preamble, mut leading_blank_lines) = if pre_end == 0 {
-        // The source has no semantic preamble, so this value is dormant for an
-        // exact reserialization. Retain the canonical one-blank separator for
-        // a later edit that promotes/inserts a page-property preamble.
-        (1, pre_lines.len())
-    } else {
-        (pre_lines.len().saturating_sub(pre_end), 0)
-    };
-    let heading_promotion = first_bullet.and_then(|first_bullet_line| {
-        preamble_heading_promotion(body, &lines, &line_starts, pre_end, first_bullet_line)
-    });
-
-    // Build the block forest with a stack of frames keyed by indent column.
-    struct Frame {
-        col: usize,
-        /// Column where the block's text starts (`col` + 2 for the `- `).
-        content_start: usize,
-        raw: String,
-        children: Vec<DocBlock>,
-        /// The open fence marker `(char, length)` if this block's content is
-        /// currently inside a fenced code block — `Some` means every following
-        /// line is literal continuation (even one that looks like a `- ` bullet),
-        /// so fenced code isn't shredded into child blocks. A fence closes only on
-        /// a marker of the SAME char and at least the opener's length, so a ````
-        /// fence containing ``` (or `~~~`) round-trips correctly.
-        fence: Option<(char, usize)>,
-        /// The lowercased name of a terminated `#+BEGIN_<name>` region. This is
-        /// independent of `fence`: an org closer is honored inside an inner code
-        /// fence, and fence state keeps updating while the org region is open.
-        org_block: Option<String>,
-    }
-    // fence_marker / next_fence are module-level (shared with property_lines /
-    // visible_lines so "is this line inside a code fence" has ONE implementation).
-    let mut stack: Vec<Frame> = Vec::new();
-    let mut roots: Vec<DocBlock> = Vec::new();
-    let mut block_starts = Vec::new();
-    let mut blank_lines_before_blocks = Vec::new();
-    let mut pending_blank_lines = 0_usize;
-
-    // Collapse frames at indent column >= `keep_above` into their parents.
-    fn fold_to(stack: &mut Vec<Frame>, roots: &mut Vec<DocBlock>, keep_above: usize) {
-        while let Some(top) = stack.last() {
-            if top.col >= keep_above {
-                let f = stack.pop().unwrap();
-                let block = DocBlock {
-                    raw: f.raw,
-                    children: f.children,
-                    uuid: String::new(),
-                    is_org: false,
-                    proj: std::sync::OnceLock::new(),
-                };
-                match stack.last_mut() {
-                    Some(parent) => parent.children.push(block),
-                    None => roots.push(block),
-                }
-            } else {
-                break;
-            }
-        }
-    }
-
-    for (line_idx, line) in block_lines.iter().enumerate() {
-        let in_literal = stack
-            .last()
-            .map(|f| f.fence.is_some() || f.org_block.is_some())
-            .unwrap_or(false);
-        if !in_literal && !stack.is_empty() && line.trim().is_empty() {
-            pending_blank_lines = pending_blank_lines.saturating_add(1);
-            continue;
-        }
-        // A `- ` line starts a new block only when we're outside both literal
-        // region kinds of the current top frame.
-        if !in_literal {
-            if let Some((col, content)) = bullet(line) {
-                // New block: fold every block at this column or deeper, so the
-                // remaining stack top (shallower column) becomes the parent.
-                fold_to(&mut stack, &mut roots, col);
-                let org_block = block_begin_name(content).and_then(|name| {
-                    has_bounded_org_closer(&block_lines[line_idx + 1..], col + 2, &name)
-                        .then(|| name.to_ascii_lowercase())
-                });
-                stack.push(Frame {
-                    col,
-                    content_start: col + 2,
-                    raw: content.to_string(),
-                    children: Vec::new(),
-                    fence: next_fence(None, content), // bullet line may open a fence
-                    org_block,
-                });
-                block_starts.push(line_starts[pre_lines.len() + line_idx]);
-                blank_lines_before_blocks.push(pending_blank_lines);
-                pending_blank_lines = 0;
-                continue;
-            }
-        }
-        if let Some(top) = stack.last_mut() {
-            for _ in 0..pending_blank_lines {
-                top.raw.push('\n');
-            }
-            pending_blank_lines = 0;
-            // Continuation line: strip the block's content-start indentation.
-            let stripped = strip_n_ws(line, top.content_start);
-            top.raw.push('\n');
-            top.raw.push_str(stripped);
-
-            if let Some(name) = top.org_block.as_deref() {
-                // END indexing is independent of fence context in mldoc.
-                if block_end_matches_name(stripped, name) {
-                    top.org_block = None;
-                }
-            } else if top.fence.is_none() {
-                // An already-open code fence suppresses BEGIN recognition.
-                top.org_block = block_begin_name(stripped).and_then(|name| {
-                    has_bounded_org_closer(&block_lines[line_idx + 1..], top.content_start, &name)
-                        .then(|| name.to_ascii_lowercase())
-                });
-            }
-            top.fence = next_fence(top.fence, stripped);
-        }
-        // (A continuation before any bullet can't happen: it'd be pre-block.)
-    }
-    fold_to(&mut stack, &mut roots, 0);
-
-    let mut promoted_heading_layout = None;
-    if let Some(promotion) = heading_promotion {
-        let blank_lines_after_heading = blank_lines_after_preamble;
-        if let Some((promoted_line, separator_lines)) = promote_preamble_heading(
-            &mut pre_block,
-            &mut roots,
-            &block_starts,
-            &lines,
-            pre_end,
-            promotion,
-        ) {
-            promoted_heading_layout = Some(promotion.layout);
-            block_starts.insert(0, line_starts[promoted_line]);
-            blank_lines_before_blocks.insert(0, 0);
-            if let Some(first_child_blank_lines) = blank_lines_before_blocks.get_mut(1) {
-                *first_child_blank_lines =
-                    first_child_blank_lines.saturating_add(blank_lines_after_heading);
-            }
-            if pre_block.is_some() {
-                blank_lines_after_preamble = separator_lines;
-            } else {
-                leading_blank_lines = separator_lines;
-            }
-        }
-    }
-
-    let original_offset = |normalized_offset: usize| {
-        normalized_to_original
-            .as_ref()
-            .map_or(normalized_offset, |offsets| offsets[normalized_offset])
-    };
-    let block_spans = block_starts
-        .iter()
-        .enumerate()
-        .map(|(index, start)| {
-            original_offset(*start)
-                ..block_starts
-                    .get(index + 1)
-                    .map_or_else(|| original_len, |end| original_offset(*end))
-        })
-        .collect();
-
-    ParsedDocument {
-        document: Document { pre_block, roots },
-        block_spans,
-        blank_lines_before_blocks,
-        blank_lines_after_preamble,
-        leading_blank_lines,
-        promoted_heading_layout,
-    }
+pub(crate) fn try_parse_with_source_spans(
+    content: &str,
+) -> Result<ParsedDocument, crate::outline::OutlineAdapterError> {
+    crate::outline::parse_document(content, crate::outline::OutlineFormat::Markdown)
 }
 
-/// Remove up to `n` leading whitespace characters (tabs or spaces).
-fn strip_n_ws(line: &str, n: usize) -> &str {
-    let bytes = line.as_bytes();
-    let mut i = 0;
-    while i < n && i < bytes.len() && (bytes[i] == b'\t' || bytes[i] == b' ') {
-        i += 1;
-    }
-    &line[i..]
+pub(crate) fn parse_with_source_spans(content: &str) -> ParsedDocument {
+    try_parse_with_source_spans(content)
+        .unwrap_or_else(|error| panic!("unrepresentable lsdoc Markdown outline: {error}"))
 }
 
 /// Formatting knobs detected from a file so re-saving preserves its existing
@@ -1415,31 +858,42 @@ impl SerializeOpts {
     }
 
     fn promoted_heading_layout(&self, doc: &Document) -> Option<PromotedHeadingLayout> {
-        if self.source_document.as_ref() == Some(doc) {
-            return self.source_promoted_heading_layout;
+        let first = doc.roots.first()?;
+        let source_unchanged = self.source_document.as_ref() == Some(doc);
+        let promoted_identity_remains_first = !first.uuid.is_empty()
+            && self.promoted_heading_identity.as_deref() == Some(first.uuid.as_str());
+        let promoted_root_authorized = source_unchanged || promoted_identity_remains_first;
+        authorized_promoted_heading_layout(
+            doc,
+            self.source_promoted_heading_layout,
+            self.indent.as_str(),
+            promoted_root_authorized,
+        )
+    }
+}
+
+fn authorized_promoted_heading_layout(
+    doc: &Document,
+    source_layout: Option<PromotedHeadingLayout>,
+    indent: &str,
+    promoted_root_authorized: bool,
+) -> Option<PromotedHeadingLayout> {
+    let first = doc.roots.first()?;
+    match source_layout {
+        Some(PromotedHeadingLayout::UnbulletedRoot)
+            if promoted_root_authorized
+                && lsdoc_authorizes_nested_heading_raw(&first.raw, indent) =>
+        {
+            Some(PromotedHeadingLayout::UnbulletedRoot)
         }
-        let promoted_identity_remains_first = doc.roots.first().is_some_and(|block| {
-            !block.uuid.is_empty()
-                && self.promoted_heading_identity.as_deref() == Some(block.uuid.as_str())
-        });
-        match self.source_promoted_heading_layout {
-            Some(PromotedHeadingLayout::FlatChildren)
-                if promoted_identity_remains_first && doc.roots.len() == 1 =>
-            {
-                Some(PromotedHeadingLayout::FlatChildren)
-            }
+        Some(PromotedHeadingLayout::NestedChildren)
+            if promoted_root_authorized
+                && first.children.first().is_some()
+                && lsdoc_authorizes_nested_heading_raw(&first.raw, indent) =>
+        {
             Some(PromotedHeadingLayout::NestedChildren)
-                if promoted_identity_remains_first
-                    && doc.roots[0].children.first().is_some()
-                    && lsdoc_authorizes_nested_heading_raw(
-                        &doc.roots[0].raw,
-                        self.indent.as_str(),
-                    ) =>
-            {
-                Some(PromotedHeadingLayout::NestedChildren)
-            }
-            _ => None,
         }
+        _ => None,
     }
 }
 
@@ -1511,33 +965,53 @@ pub fn serialize(doc: &Document) -> String {
 
 /// Serialize, reproducing a file's detected formatting (see [`SerializeOpts`]).
 pub fn serialize_with(doc: &Document, opts: &SerializeOpts) -> String {
+    let blank_lines_before_blocks = opts.resolved_blank_lines(doc);
+    let promoted_heading_layout = opts.promoted_heading_layout(doc);
+    serialize_with_layout(
+        doc,
+        opts.trailing_newlines,
+        opts.blank_lines_after_preamble,
+        opts.leading_blank_lines,
+        &opts.indent,
+        &blank_lines_before_blocks,
+        promoted_heading_layout,
+    )
+}
+
+fn serialize_with_layout(
+    doc: &Document,
+    trailing_newlines: usize,
+    blank_lines_after_preamble: usize,
+    leading_blank_lines: usize,
+    indent: &str,
+    blank_lines_before_blocks: &[usize],
+    promoted_heading_layout: Option<PromotedHeadingLayout>,
+) -> String {
     let mut out: Vec<String> = Vec::new();
     if let Some(pre) = &doc.pre_block {
         for line in pre.split('\n') {
             out.push(line.to_string());
         }
         if !doc.roots.is_empty() {
-            out.extend(std::iter::repeat_with(String::new).take(opts.blank_lines_after_preamble));
+            out.extend(std::iter::repeat_with(String::new).take(blank_lines_after_preamble));
         }
     } else if !doc.roots.is_empty() {
-        out.extend(std::iter::repeat_with(String::new).take(opts.leading_blank_lines));
+        out.extend(std::iter::repeat_with(String::new).take(leading_blank_lines));
     }
-    let blank_lines_before_blocks = opts.resolved_blank_lines(doc);
-    let promoted_heading_layout = opts.promoted_heading_layout(doc);
     let mut block_index = 0_usize;
     for block in &doc.roots {
         emit_block(
             block,
             0,
-            &opts.indent,
-            &blank_lines_before_blocks,
+            indent,
+            blank_lines_before_blocks,
             &mut block_index,
             promoted_heading_layout,
             &mut out,
         );
     }
     let mut s = out.join("\n");
-    s.push_str(&"\n".repeat(opts.trailing_newlines));
+    s.push_str(&"\n".repeat(trailing_newlines));
     s
 }
 
@@ -1560,8 +1034,10 @@ fn emit_block(
     if unbulleted_promoted_heading {
         out.extend(block.raw.split('\n').map(ToOwned::to_owned));
         let child_level = match promoted_heading_layout {
-            Some(PromotedHeadingLayout::NestedChildren) => level.saturating_add(1),
-            Some(PromotedHeadingLayout::FlatChildren) | None => level,
+            Some(PromotedHeadingLayout::UnbulletedRoot | PromotedHeadingLayout::NestedChildren) => {
+                level.saturating_add(1)
+            }
+            None => level,
         };
         for child in &block.children {
             emit_block(
@@ -1608,7 +1084,9 @@ fn emit_block(
 /// the exact source bytes. Mixed line endings and non-uniform indentation fail
 /// closed because detected formatting deliberately has one representation.
 pub fn markdown_round_trips(content: &str) -> bool {
-    let parsed = parse_with_source_spans(content);
+    let Ok(parsed) = try_parse_with_source_spans(content) else {
+        return false;
+    };
     let document = parsed.document.clone();
     let opts = SerializeOpts::from_parsed_source(content, parsed, detect_indent(content), &[]);
     let mut rendered = serialize_with(&document, &opts);
@@ -1626,14 +1104,36 @@ pub fn markdown_round_trips(content: &str) -> bool {
 /// must not prevent import. A later edit may canonicalize that trivia, but it
 /// may not change block content or ancestry.
 pub fn markdown_structurally_round_trips(content: &str) -> bool {
-    let parsed = parse_with_source_spans(content);
-    let document = parsed.document.clone();
-    let opts = SerializeOpts::from_parsed_source(content, parsed, detect_indent(content), &[]);
-    let mut rendered = serialize_with(&document, &opts);
+    let Ok(parsed) = try_parse_with_source_spans(content) else {
+        return false;
+    };
+    markdown_structurally_round_trips_parsed(content, &parsed)
+}
+
+pub(crate) fn markdown_structurally_round_trips_parsed(
+    content: &str,
+    parsed: &ParsedDocument,
+) -> bool {
+    let indent = detect_indent(content);
+    let mut rendered = serialize_with_layout(
+        &parsed.document,
+        content
+            .bytes()
+            .rev()
+            .take_while(|byte| matches!(byte, b'\n' | b'\r'))
+            .filter(|byte| *byte == b'\n')
+            .count(),
+        parsed.blank_lines_after_preamble,
+        parsed.leading_blank_lines,
+        &indent,
+        &parsed.blank_lines_before_blocks,
+        parsed.promoted_heading_layout,
+    );
     if content.contains("\r\n") {
         rendered = rendered.replace('\n', "\r\n");
     }
-    parse(&rendered) == document
+    try_parse_with_source_spans(&rendered)
+        .is_ok_and(|canonical| canonical.document == parsed.document)
 }
 
 #[cfg(test)]
@@ -1814,6 +1314,18 @@ mod promoted_heading_tests {
     }
 
     #[test]
+    fn heading_led_markdown_admission_uses_original_and_canonical_parses_only() {
+        crate::outline::reset_parse_attempts();
+
+        assert!(markdown_structurally_round_trips(NESTED_SOURCE));
+        assert_eq!(
+            crate::outline::parse_attempts(),
+            2,
+            "heading-led admission needs only the retained original parse and canonical reparse"
+        );
+    }
+
+    #[test]
     fn edited_promoted_heading_keeps_nested_layout_while_identity_stays_first() {
         let mut doc = parse(NESTED_SOURCE);
         let identities = assign_layout_identities(&mut doc);
@@ -1879,17 +1391,17 @@ mod promoted_heading_tests {
     }
 
     #[test]
-    fn legacy_collapsed_heading_keeps_flat_children() {
+    fn legacy_collapsed_heading_uses_parser_owned_same_level_topology() {
         let source = "# Parent\ncollapsed:: true\n- child\n- sibling";
         let doc = parse(source);
         assert_eq!(doc.pre_block, None);
-        assert_eq!(doc.roots.len(), 1);
+        assert_eq!(doc.roots.len(), 3);
         assert_eq!(doc.roots[0].raw, "# Parent\ncollapsed:: true");
-        assert_eq!(doc.roots[0].children.len(), 2);
-        assert_eq!(
-            serialize_with(&doc, &SerializeOpts::detect(Some(source))),
-            source
-        );
+        assert_eq!(doc.roots[1].raw, "child");
+        assert_eq!(doc.roots[2].raw, "sibling");
+        assert!(doc.roots.iter().all(|root| root.children.is_empty()));
+        assert!(markdown_round_trips(source));
+        assert!(markdown_structurally_round_trips(source));
     }
 
     #[test]
@@ -1903,7 +1415,7 @@ mod promoted_heading_tests {
         let rendered = serialize_with(&doc, &opts);
         assert_eq!(
             rendered,
-            "- # Parent\n  collapsed:: true\n\t- child\n\t- sibling\n- later root"
+            "# Parent\ncollapsed:: true\n- child\n- sibling\n- later root"
         );
         let reparsed = parse(&rendered);
         assert_eq!(reparsed, doc);
@@ -1911,29 +1423,24 @@ mod promoted_heading_tests {
             semantic_locators(&reparsed),
             vec![
                 (vec![0], "# Parent\ncollapsed:: true".into()),
-                (vec![0, 0], "child".into()),
-                (vec![0, 1], "sibling".into()),
-                (vec![1], "later root".into()),
+                (vec![1], "child".into()),
+                (vec![2], "sibling".into()),
+                (vec![3], "later root".into()),
             ]
         );
     }
 
     #[test]
-    fn unrepresentable_heading_boundary_after_child_run_fails_closed() {
+    fn parser_owned_heading_boundary_after_child_run_is_representable() {
         for source in [
             "# Parent\n\t- child\n# Same-level boundary",
             "## Parent\n\t\t- child\n# Shallower boundary",
         ] {
             let parsed = parse_with_source_spans(source);
-            assert_eq!(parsed.promoted_heading_layout, None, "{source:?}");
-            assert!(
-                parsed.document.pre_block.is_some(),
-                "the heading must remain preamble when its boundary cannot be represented: {source:?}"
-            );
-            assert!(
-                !markdown_round_trips(source),
-                "bootstrap must refuse a source whose boundary Tine cannot preserve: {source:?}"
-            );
+            assert_eq!(parsed.document.pre_block, None, "{source:?}");
+            assert_eq!(parsed.document.roots.len(), 2, "{source:?}");
+            assert_eq!(parsed.document.roots[0].children.len(), 1, "{source:?}");
+            assert!(markdown_structurally_round_trips(source), "{source:?}");
         }
     }
 
@@ -1953,22 +1460,42 @@ mod promoted_heading_tests {
     }
 
     #[test]
+    fn promoted_heading_mixed_indent_canonicalizes_without_reparenting() {
+        let source = "    # Parent\n      - child\n- root\n  - other child";
+        let parsed = parse_with_source_spans(source);
+        assert_eq!(
+            parsed.promoted_heading_layout,
+            Some(PromotedHeadingLayout::NestedChildren)
+        );
+        let expected = parsed.document.clone();
+        let expected_locators = semantic_locators(&expected);
+        let opts = SerializeOpts::from_parsed_source(source, parsed, detect_indent(source), &[]);
+
+        let rendered = serialize_with(&expected, &opts);
+        assert_eq!(
+            rendered,
+            "-     # Parent\n  - child\n- root\n  - other child"
+        );
+        let reparsed = parse(&rendered);
+        assert_eq!(reparsed, expected);
+        assert_eq!(semantic_locators(&reparsed), expected_locators);
+    }
+
+    #[test]
     fn promoted_heading_with_lone_cr_fails_closed() {
         let source = "# Project\r\t- child\r- sibling";
         assert!(!markdown_round_trips(source));
     }
 
     #[test]
-    fn ordinary_heading_does_not_own_a_same_level_bullet() {
+    fn ordinary_heading_and_same_level_bullet_are_parser_owned_siblings() {
         let source = "# Notes\n- ordinary root";
         let doc = parse(source);
-        assert_eq!(doc.pre_block.as_deref(), Some("# Notes"));
-        assert_eq!(doc.roots.len(), 1);
-        assert_eq!(doc.roots[0].raw, "ordinary root");
-        assert_eq!(
-            serialize_with(&doc, &SerializeOpts::detect(Some(source))),
-            source
-        );
+        assert_eq!(doc.pre_block, None);
+        assert_eq!(doc.roots.len(), 2);
+        assert_eq!(doc.roots[0].raw, "# Notes");
+        assert_eq!(doc.roots[1].raw, "ordinary root");
+        assert!(markdown_structurally_round_trips(source));
     }
 
     #[test]
@@ -2082,46 +1609,51 @@ mod org_container_outline_tests {
     #[test]
     fn continuation_begin_cannot_swallow_same_lane_sibling() {
         let input = "- parent\n  #+BEGIN_QUOTE\n- sibling\n  #+END_QUOTE";
-        let doc = parse_round_trip(input);
-        assert_eq!(doc.roots.len(), 2);
-        assert_eq!(doc.roots[0].raw, "parent\n#+BEGIN_QUOTE");
-        assert_eq!(doc.roots[1].raw, "sibling\n#+END_QUOTE");
-        assert!(doc.roots.iter().all(|block| block.children.is_empty()));
+        let doc = parse(input);
+        assert_eq!(doc.roots.len(), 1);
+        assert_eq!(
+            doc.roots[0].raw,
+            "parent\n#+BEGIN_QUOTE\n- sibling\n#+END_QUOTE"
+        );
+        assert!(doc.roots[0].children.is_empty());
+        assert!(markdown_structurally_round_trips(input));
     }
 
     #[test]
     fn nested_child_closer_lane_does_not_open_region() {
         let tabbed = "- #+BEGIN_QUOTE\n\t- child\n\t  #+END_QUOTE";
-        let doc = parse_round_trip(tabbed);
+        let doc = parse(tabbed);
         assert_eq!(doc.roots.len(), 1);
-        assert_eq!(doc.roots[0].children.len(), 1);
-        assert_eq!(doc.roots[0].children[0].raw, "child\n#+END_QUOTE");
+        assert!(doc.roots[0].children.is_empty());
+        assert_eq!(doc.roots[0].raw, "#+BEGIN_QUOTE\n- child\n #+END_QUOTE");
+        assert!(markdown_structurally_round_trips(tabbed));
 
         let spaced = "- #+BEGIN_QUOTE\n  - child\n    #+END_QUOTE";
-        let doc = parse_round_trip(spaced);
+        let doc = parse(spaced);
         assert_eq!(doc.roots.len(), 1);
-        assert_eq!(doc.roots[0].children.len(), 1);
-        assert_eq!(doc.roots[0].children[0].raw, "child\n#+END_QUOTE");
+        assert!(doc.roots[0].children.is_empty());
+        assert_eq!(doc.roots[0].raw, "#+BEGIN_QUOTE\n- child\n  #+END_QUOTE");
+        assert!(markdown_structurally_round_trips(spaced));
     }
 
     #[test]
     fn tab_child_before_matching_end_opens_no_region() {
         let input = "- \t#+BEGIN_QUOTE\n\t- x\n\t  #+END_QUOTE";
-        let doc = parse_round_trip(input);
+        let doc = parse(input);
         assert_eq!(doc.roots.len(), 1);
-        assert_eq!(doc.roots[0].raw, "\t#+BEGIN_QUOTE");
-        assert_eq!(doc.roots[0].children.len(), 1);
-        assert_eq!(doc.roots[0].children[0].raw, "x\n#+END_QUOTE");
+        assert!(doc.roots[0].children.is_empty());
+        assert_eq!(doc.roots[0].raw, "\t#+BEGIN_QUOTE\n- x\n #+END_QUOTE");
+        assert!(markdown_structurally_round_trips(input));
     }
 
     #[test]
     fn continuation_opener_before_tab_child_opens_no_region() {
         let input = "- p\n  \t#+BEGIN_QUOTE\n\t- x\n\t  #+END_QUOTE";
-        let doc = parse_round_trip(input);
+        let doc = parse(input);
         assert_eq!(doc.roots.len(), 1);
-        assert_eq!(doc.roots[0].raw, "p\n\t#+BEGIN_QUOTE");
-        assert_eq!(doc.roots[0].children.len(), 1);
-        assert_eq!(doc.roots[0].children[0].raw, "x\n#+END_QUOTE");
+        assert!(doc.roots[0].children.is_empty());
+        assert_eq!(doc.roots[0].raw, "p\n\t#+BEGIN_QUOTE\n- x\n #+END_QUOTE");
+        assert!(markdown_structurally_round_trips(input));
     }
 
     #[test]
@@ -2190,14 +1722,15 @@ mod org_container_outline_tests {
         let doc = parse(old_mac);
         assert_eq!(
             serialize_with(&doc, &SerializeOpts::detect(Some(old_mac))),
-            "- #+BEGIN_QUOTE  - x  #+END_QUOTE"
+            "- #+BEGIN_QUOTE\n\t- x\n\t  #+END_QUOTE"
         );
         assert_ne!(
             serialize_with(&doc, &SerializeOpts::detect(Some(old_mac))),
             old_mac
         );
         assert_eq!(doc.roots.len(), 1);
-        assert!(doc.roots[0].children.is_empty());
+        assert_eq!(doc.roots[0].children.len(), 1);
+        assert_eq!(doc.roots[0].children[0].raw, "x\n#+END_QUOTE");
     }
 }
 

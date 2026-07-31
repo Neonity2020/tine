@@ -10,6 +10,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Sparse-v2 activation now uses lsdoc as the single Markdown and Org outline
+  authority.** Parser-owned source spans and topology replace Tine's duplicate
+  structural scanners, so Logseq-compatible headings, multiline blocks, mixed
+  indentation, and other unusual but parseable layouts import without changing
+  their meaning. Admission remains fail-closed when a layout cannot be
+  represented safely.
 - **Reverse-delivered experimental shared-provider histories now schedule inbound
   batches by causal dependency instead of repeatedly scanning the pending
   queue.** Each ready manifest is registered once, already-active parents are

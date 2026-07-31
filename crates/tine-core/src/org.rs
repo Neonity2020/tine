@@ -22,54 +22,6 @@
 
 use crate::doc::{DocBlock, Document, ParsedDocument, SerializeOpts, StructuralLayoutIdentity};
 
-/// Heading level of a line if it is an org headline (`*`/`**`/… followed by a
-/// space, tab, CR or end-of-line), else `None`. Headlines start at column 0.
-/// `**bold**` (stars immediately followed by a non-space) is NOT a headline,
-/// matching org; `** title` (stars then space) IS a level-2 headline.
-fn headline_level(line: &str) -> Option<usize> {
-    let stars = line.bytes().take_while(|&b| b == b'*').count();
-    if stars == 0 {
-        return None;
-    }
-    let rest = &line[stars..];
-    if rest.is_empty() || rest.starts_with(' ') || rest.starts_with('\t') || rest.starts_with('\r')
-    {
-        Some(stars)
-    } else {
-        None
-    }
-}
-
-/// Scan a file's lines for the real headlines, in document order, returning
-/// `(line_index, level)` for each. Lines inside an org block
-/// (`#+BEGIN_x` … `#+END_x`, any `x`, case-insensitive, leading whitespace
-/// allowed) are content, so a `*`-line there is not mistaken for a headline.
-fn scan_headlines(lines: &[&str]) -> Vec<(usize, usize)> {
-    let mut out = Vec::new();
-    let mut block_depth: usize = 0;
-    for (i, line) in lines.iter().enumerate() {
-        let trimmed = line.trim_start_matches([' ', '\t']);
-        let b = trimmed.as_bytes();
-        if b.len() >= 2 && b[0] == b'#' && b[1] == b'+' {
-            let kw = &trimmed[2..];
-            if kw.len() >= 6 && kw[..6].eq_ignore_ascii_case("begin_") {
-                block_depth += 1;
-                continue;
-            }
-            if kw.len() >= 4 && kw[..4].eq_ignore_ascii_case("end_") {
-                block_depth = block_depth.saturating_sub(1);
-                continue;
-            }
-        }
-        if block_depth == 0 {
-            if let Some(level) = headline_level(line) {
-                out.push((i, level));
-            }
-        }
-    }
-    out
-}
-
 /// Number of trailing `\n` bytes (the document-level trailing-newline run),
 /// stripped on parse and reproduced on serialize so block bodies stay free of
 /// trailing-blank artifacts.
@@ -88,149 +40,15 @@ pub fn parse_org(content: &str) -> Document {
     parse_org_with_source_spans(content).document
 }
 
-pub(crate) fn parse_org_with_source_spans(content: &str) -> ParsedDocument {
-    // Keep the semantic model LF-canonical. Exact source byte offsets are mapped
-    // back below, and serialization detects/reinstates CRLF at the write boundary.
-    let original_len = content.len();
-    let normalized;
-    let normalized_to_original;
-    let content = if content.contains('\r') {
-        let mut bytes = Vec::with_capacity(content.len());
-        let mut offsets = Vec::with_capacity(content.len() + 1);
-        for (offset, byte) in content.bytes().enumerate() {
-            if byte != b'\r' {
-                offsets.push(offset);
-                bytes.push(byte);
-            }
-        }
-        offsets.push(content.len());
-        normalized = String::from_utf8(bytes).expect("removing CR preserves valid UTF-8");
-        normalized_to_original = Some(offsets);
-        normalized.as_str()
-    } else {
-        normalized_to_original = None;
-        content
-    };
-    let body = content.trim_end_matches('\n');
-    if body.is_empty() {
-        return ParsedDocument {
-            document: Document::default(),
-            block_spans: Vec::new(),
-            blank_lines_before_blocks: Vec::new(),
-            blank_lines_after_preamble: 0,
-            leading_blank_lines: 0,
-            promoted_heading_layout: None,
-        };
-    }
-    let lines: Vec<&str> = body.split('\n').collect();
-    let heads = scan_headlines(&lines);
-    let mut line_starts = Vec::with_capacity(lines.len());
-    let mut line_start = 0_usize;
-    for line in &lines {
-        line_starts.push(line_start);
-        line_start = line_start.saturating_add(line.len()).saturating_add(1);
-    }
-
-    let first = heads.first().map(|h| h.0).unwrap_or(lines.len());
-    let pre_block = if first == 0 {
-        None
-    } else {
-        Some(lines[..first].join("\n"))
-    };
-
-    // One (level, block) per headline; body = lines up to the next headline.
-    let mut flat: Vec<(usize, DocBlock)> = Vec::with_capacity(heads.len());
-    let mut blank_lines_before_blocks = Vec::with_capacity(heads.len());
-    let mut pending_blank_lines = 0_usize;
-    for (n, &(start, level)) in heads.iter().enumerate() {
-        let end = heads.get(n + 1).map(|h| h.0).unwrap_or(lines.len());
-        let mut seg = &lines[start..end];
-        blank_lines_before_blocks.push(pending_blank_lines);
-        pending_blank_lines = 0;
-        // Empty lines immediately before the next real headline are structural
-        // separators. They are not semantic body text owned by the preceding
-        // block, so marker instrumentation must be free to change that raw
-        // without absorbing or duplicating the separator.
-        if n + 1 < heads.len() {
-            let mut content_end = seg.len();
-            while content_end > 1 && seg[content_end - 1].trim().is_empty() {
-                content_end -= 1;
-            }
-            pending_blank_lines = seg.len().saturating_sub(content_end);
-            seg = &seg[..content_end];
-        }
-        // Drop the `level` stars and exactly one following space, so a block's raw
-        // is the title text with no leading marker (matching the markdown path,
-        // where `- ` is stripped). A second space, a tab, or no space is kept, so
-        // serialize re-adds one space and still round-trips multi-space headlines.
-        let after = &seg[0][level..];
-        let first_content = after.strip_prefix(' ').unwrap_or(after);
-        let raw = if seg.len() == 1 {
-            first_content.to_string()
-        } else {
-            let mut s = String::with_capacity(first_content.len() + 16);
-            s.push_str(first_content);
-            for l in &seg[1..] {
-                s.push('\n');
-                s.push_str(l);
-            }
-            s
-        };
-        let mut b = DocBlock::new(raw);
-        b.is_org = true; // org-format block → lsdoc parses inline refs in org mode
-        flat.push((level, b));
-    }
-
-    let original_offset = |normalized_offset: usize| {
-        normalized_to_original
-            .as_ref()
-            .map_or(normalized_offset, |offsets| offsets[normalized_offset])
-    };
-    let block_spans = heads
-        .iter()
-        .enumerate()
-        .map(|(index, (line, _))| {
-            original_offset(line_starts[*line])
-                ..heads.get(index + 1).map_or(original_len, |(next, _)| {
-                    original_offset(line_starts[*next])
-                })
-        })
-        .collect();
-    ParsedDocument {
-        document: Document {
-            pre_block,
-            roots: build_tree(flat),
-        },
-        block_spans,
-        blank_lines_before_blocks,
-        blank_lines_after_preamble: 0,
-        leading_blank_lines: 0,
-        promoted_heading_layout: None,
-    }
+pub(crate) fn try_parse_org_with_source_spans(
+    content: &str,
+) -> Result<ParsedDocument, crate::outline::OutlineAdapterError> {
+    crate::outline::parse_document(content, crate::outline::OutlineFormat::Org)
 }
 
-/// Assemble a flat list of `(level, block)` in document order into a forest,
-/// nesting each block under the nearest preceding block of smaller level.
-fn build_tree(flat: Vec<(usize, DocBlock)>) -> Vec<DocBlock> {
-    let mut roots: Vec<DocBlock> = Vec::new();
-    let mut stack: Vec<(usize, DocBlock)> = Vec::new();
-    fn attach(stack: &mut Vec<(usize, DocBlock)>, roots: &mut Vec<DocBlock>, done: DocBlock) {
-        match stack.last_mut() {
-            Some((_, parent)) => parent.children.push(done),
-            None => roots.push(done),
-        }
-    }
-    for (level, blk) in flat {
-        while stack.last().is_some_and(|(l, _)| *l >= level) {
-            let (_, done) = stack.pop().unwrap();
-            attach(&mut stack, &mut roots, done);
-        }
-        stack.push((level, blk));
-    }
-    while let Some((_, done)) = stack.pop() {
-        attach(&mut stack, &mut roots, done);
-    }
-    roots
+pub(crate) fn parse_org_with_source_spans(content: &str) -> ParsedDocument {
+    try_parse_org_with_source_spans(content)
+        .unwrap_or_else(|error| panic!("unrepresentable lsdoc Org outline: {error}"))
 }
 
 /// Serialize a [`Document`] to org text with one trailing newline (the common
@@ -345,7 +163,22 @@ pub(crate) fn serialize_org_detect_with_layout_identities(
 /// Whether `serialize_org(parse_org(content))` reproduces `content`
 /// byte-for-byte (including its exact trailing-newline run).
 pub fn org_round_trips(content: &str) -> bool {
-    serialize_org_detect(&parse_org(content), Some(content)) == content
+    let Ok(parsed) = try_parse_org_with_source_spans(content) else {
+        return false;
+    };
+    org_editable_parsed(content, &parsed)
+}
+
+pub(crate) fn org_editable_parsed(content: &str, parsed: &ParsedDocument) -> bool {
+    let mut rendered = serialize_org_with_layout(
+        &parsed.document,
+        trailing_newlines(content),
+        &parsed.blank_lines_before_blocks,
+    );
+    if content.contains("\r\n") {
+        rendered = rendered.replace('\n', "\r\n");
+    }
+    rendered == content
 }
 
 /// Whether Tine may safely **edit and write** this org file — i.e. it
