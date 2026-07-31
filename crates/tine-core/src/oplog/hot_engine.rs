@@ -3424,6 +3424,142 @@ pub struct MaterializedPage {
     pub stats: MaterializationStats,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct AcceptedDocumentCacheKey {
+    frontier_state_digest: ContentDigest,
+    document_id: DocumentId,
+    causal_state_digest: DocumentCausalDigest,
+}
+
+/// Event-local exact-document loader for one authenticated accepted root.
+///
+/// The root is authenticated once at construction. Every cached document is
+/// additionally keyed by its identity, its exact causal state, and the root
+/// state that selected it. The whole value is intentionally short lived: the
+/// SQLite adapter constructs one per accepted event and drops it before the
+/// next event is applied.
+pub(crate) struct AcceptedRootMaterializer<'engine> {
+    engine: &'engine ShardedHotEngine,
+    root: AcceptedFrontierRoot,
+    documents: BTreeMap<AcceptedDocumentCacheKey, LoroDoc>,
+    document_keys: BTreeMap<DocumentId, AcceptedDocumentCacheKey>,
+    exact_document_loads: usize,
+    exact_catalog_loads: usize,
+}
+
+impl AcceptedRootMaterializer<'_> {
+    pub(crate) const fn exact_document_loads(&self) -> usize {
+        self.exact_document_loads
+    }
+
+    pub(crate) const fn exact_catalog_loads(&self) -> usize {
+        self.exact_catalog_loads
+    }
+
+    fn load_document(
+        &mut self,
+        document_id: DocumentId,
+    ) -> Result<Option<AcceptedDocumentCacheKey>, EngineError> {
+        let Some(dependencies) = self
+            .engine
+            .accepted_frontier_document(&self.root, document_id)?
+        else {
+            return Ok(None);
+        };
+        let key = AcceptedDocumentCacheKey {
+            frontier_state_digest: self.root.state_digest(),
+            document_id,
+            causal_state_digest: dependencies.causal_state_digest(),
+        };
+        if let Some(existing) = self.document_keys.get(&document_id) {
+            if existing != &key {
+                return Err(EngineError::FrontierVectorMismatch(document_id));
+            }
+            return Ok(Some(key));
+        }
+        let frontier = FrontierV2::new(vec![dependencies]).map_err(EngineError::from)?;
+        let mut reconstructed = self.engine.reconstruct_projection_frontier(&frontier)?;
+        let document = reconstructed
+            .remove(&document_id)
+            .ok_or(EngineError::MissingDocument(document_id))?;
+        self.documents.insert(key, document);
+        self.document_keys.insert(document_id, key);
+        self.exact_document_loads = self.exact_document_loads.saturating_add(1);
+        if document_id == self.engine.catalog_document_id {
+            self.exact_catalog_loads = self.exact_catalog_loads.saturating_add(1);
+        }
+        Ok(Some(key))
+    }
+
+    fn document(&self, key: AcceptedDocumentCacheKey) -> Result<&LoroDoc, EngineError> {
+        self.documents
+            .get(&key)
+            .ok_or(EngineError::MissingDocument(key.document_id))
+    }
+
+    pub(crate) fn materialize_page(
+        &mut self,
+        page_id: PageId,
+    ) -> Result<Option<MaterializedPage>, EngineError> {
+        let reads_before = self.engine.archive_read_stats();
+        let Some(catalog_key) = self.load_document(self.engine.catalog_document_id)? else {
+            return Ok(None);
+        };
+        let page_state = {
+            let catalog = self.document(catalog_key)?;
+            validate_catalog_page(self.engine.catalog_document_id, catalog, page_id)?
+        };
+        let Some(PageState::Live {
+            home_document_id: page_document_id,
+            ..
+        }) = page_state
+        else {
+            return Ok(None);
+        };
+        let page_key = self
+            .load_document(page_document_id)?
+            .ok_or(EngineError::MissingDocument(page_document_id))?;
+        let home_document_ids = {
+            let page_document = self.document(page_key)?;
+            validate_shard(
+                self.engine.catalog_document_id,
+                page_document_id,
+                page_document,
+            )?;
+            if shard_page_id(page_document)? != Some(page_id) {
+                return Err(EngineError::MalformedDocument {
+                    document_id: page_document_id,
+                    reason: "membership shard page identity mismatch".into(),
+                });
+            }
+            read_memberships(page_document_id, page_document)?
+                .values()
+                .map(|claim| claim.home_document_id)
+                .collect::<BTreeSet<_>>()
+        };
+        for home_document_id in home_document_ids {
+            self.load_document(home_document_id)?
+                .ok_or(EngineError::MissingDocument(home_document_id))?;
+        }
+        let engine = self.engine;
+        let document_keys = &self.document_keys;
+        let documents = &self.documents;
+        let mut page = engine.materialize_page_from_document_lookup(page_id, |document_id| {
+            document_keys
+                .get(&document_id)
+                .and_then(|key| documents.get(key))
+        })?;
+        let reads_after = self.engine.archive_read_stats();
+        page.stats.physical_manifest_reads = reads_after
+            .manifest_reads
+            .saturating_sub(reads_before.manifest_reads);
+        page.stats.physical_object_reads = reads_after
+            .object_reads
+            .saturating_sub(reads_before.object_reads);
+        Ok(Some(page))
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProjectionPageState {
     pub page: MaterializedPage,
@@ -7199,6 +7335,22 @@ impl ShardedHotEngine {
             .remove(&document_id)
             .ok_or(EngineError::MissingDocument(document_id))
             .map(Some)
+    }
+
+    pub(crate) fn accepted_root_materializer(
+        &self,
+        root: &AcceptedFrontierRoot,
+    ) -> Result<AcceptedRootMaterializer<'_>, EngineError> {
+        self.begin_point_operation();
+        self.authenticate_accepted_frontier_root(root)?;
+        Ok(AcceptedRootMaterializer {
+            engine: self,
+            root: root.clone(),
+            documents: BTreeMap::new(),
+            document_keys: BTreeMap::new(),
+            exact_document_loads: 0,
+            exact_catalog_loads: 0,
+        })
     }
 
     pub(crate) fn materialize_page_at_accepted_root(
@@ -12766,8 +12918,17 @@ impl ShardedHotEngine {
         page_id: PageId,
         documents: &BTreeMap<DocumentId, LoroDoc>,
     ) -> Result<MaterializedPage, EngineError> {
-        let catalog = documents
-            .get(&self.catalog_document_id)
+        self.materialize_page_from_document_lookup(page_id, |document_id| {
+            documents.get(&document_id)
+        })
+    }
+
+    fn materialize_page_from_document_lookup<'document>(
+        &self,
+        page_id: PageId,
+        mut document: impl FnMut(DocumentId) -> Option<&'document LoroDoc>,
+    ) -> Result<MaterializedPage, EngineError> {
+        let catalog = document(self.catalog_document_id)
             .ok_or(EngineError::MissingDocument(self.catalog_document_id))?;
         let page_state = validate_catalog_page(self.catalog_document_id, catalog, page_id)?
             .ok_or(EngineError::PageNotFound(page_id))?;
@@ -12781,9 +12942,8 @@ impl ShardedHotEngine {
         else {
             return Err(EngineError::PageDeleted(page_id));
         };
-        let page_document = documents
-            .get(&page_document_id)
-            .ok_or(EngineError::MissingDocument(page_document_id))?;
+        let page_document =
+            document(page_document_id).ok_or(EngineError::MissingDocument(page_document_id))?;
         validate_shard(self.catalog_document_id, page_document_id, page_document)?;
         if shard_page_id(page_document)? != Some(page_id) {
             return Err(EngineError::MalformedDocument {
@@ -12802,8 +12962,7 @@ impl ShardedHotEngine {
         }
         let mut blocks = Vec::new();
         for (home_document_id, claims) in &by_home {
-            let home = documents
-                .get(home_document_id)
+            let home = document(*home_document_id)
                 .ok_or(EngineError::MissingDocument(*home_document_id))?;
             validate_shard(self.catalog_document_id, *home_document_id, home)?;
             for (block_id, claim) in claims {

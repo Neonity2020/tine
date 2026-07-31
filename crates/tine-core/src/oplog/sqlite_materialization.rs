@@ -50,11 +50,29 @@ const REFERENCE_CATALOG_BINDING_OVERHEAD_BYTES: usize = 64;
 const REFERENCE_CATALOG_COVERAGE_OVERHEAD_BYTES: usize = 80;
 // Packet 3 attaches the already-authenticated reference-catalog transition to
 // the same SQL transaction as the ordinary page materialization. The
-// authenticated reverse-candidate contract is persisted as SQLite schema v10.
+// authenticated reverse-candidate contract is persisted as SQLite schema v10;
+// schema v11 adds page-led cleanup and authoritative FTS ownership.
 const MATERIALIZATION_INPUT_SCHEMA_VERSION: u32 = 4;
 pub(crate) const REFERENCE_EXTRACTOR_DEPENDENCY_STAMP_SCHEMA_VERSION: u32 = 2;
 const REFERENCE_EXTRACTOR_DEPENDENCY_STAMP_DOMAIN: &[u8] =
     b"tine/sqlite-reference-extractor-dependency-stamp/v2";
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ApplyChangeInstrumentation {
+    pub(crate) cleanup_page_attempts: usize,
+    pub(crate) cleanup_existing_pages: usize,
+    pub(crate) cleanup_owned_rows: usize,
+    pub(crate) cleanup_fts_rowids: usize,
+    pub(crate) reference_coverage_count: Option<u64>,
+    pub(crate) reference_coverage_inductive_checks: usize,
+    pub(crate) reference_coverage_full_scans: usize,
+}
+
+#[derive(Clone, Copy)]
+enum CoverageValidation {
+    FullScan,
+    FreshInductive { prior_count: u64 },
+}
 
 pub(crate) const MATERIALIZATION_STAMP_DDL: &str = "CREATE TABLE materialization_stamp (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -303,6 +321,13 @@ pub(crate) const SEARCH_FTS_DDL: &str = "CREATE VIRTUAL TABLE search_fts USING f
     text,
     tokenize = 'unicode61 remove_diacritics 0'
 )";
+pub(crate) const SEARCH_FTS_OWNERS_DDL: &str = "CREATE TABLE search_fts_owners (
+    rowid INTEGER PRIMARY KEY,
+    entity_type INTEGER NOT NULL CHECK (entity_type IN (0, 1)),
+    entity_id BLOB NOT NULL CHECK (length(entity_id) = 16),
+    page_id BLOB NOT NULL CHECK (length(page_id) = 16),
+    UNIQUE (entity_type, entity_id)
+) STRICT";
 
 pub(crate) const PAGES_NAME_INDEX_DDL: &str = "CREATE INDEX pages_name_idx ON pages(name, page_id)";
 pub(crate) const PAGES_NAME_KEY_INDEX_DDL: &str =
@@ -310,6 +335,8 @@ pub(crate) const PAGES_NAME_KEY_INDEX_DDL: &str =
 pub(crate) const PAGES_PATH_INDEX_DDL: &str = "CREATE INDEX pages_path_idx ON pages(path, page_id)";
 pub(crate) const BLOCKS_PAGE_ORDER_INDEX_DDL: &str =
     "CREATE INDEX blocks_page_order_idx ON blocks(page_id, order_key, block_id)";
+pub(crate) const SEARCH_FTS_OWNERS_PAGE_INDEX_DDL: &str =
+    "CREATE INDEX search_fts_owners_page_idx ON search_fts_owners(page_id, rowid)";
 pub(crate) const REFERENCES_TARGET_INDEX_DDL: &str = "CREATE INDEX references_target_idx
     ON refs(target_type, target_id, source_page_id, source_type, source_id)";
 pub(crate) const REFERENCES_SOURCE_INDEX_DDL: &str = "CREATE INDEX references_source_idx
@@ -346,14 +373,20 @@ pub(crate) const REFERENCE_ALIAS_BINDINGS_NORMALIZED_ALIAS_INDEX_DDL: &str =
     ON reference_alias_bindings(normalized_alias, catalog_root_digest, candidate_ordinal)";
 pub(crate) const PROPERTIES_LOOKUP_INDEX_DDL: &str = "CREATE INDEX properties_lookup_idx
     ON properties(name, value, page_id, owner_type, owner_id)";
+pub(crate) const PROPERTIES_PAGE_INDEX_DDL: &str = "CREATE INDEX properties_page_idx
+    ON properties(page_id, owner_type, owner_id, name, ordinal)";
 pub(crate) const TAGS_LOOKUP_INDEX_DDL: &str =
     "CREATE INDEX tags_lookup_idx ON tags(tag, page_id, owner_type, owner_id)";
+pub(crate) const TAGS_PAGE_INDEX_DDL: &str =
+    "CREATE INDEX tags_page_idx ON tags(page_id, owner_type, owner_id, ordinal)";
 pub(crate) const TASKS_MARKER_INDEX_DDL: &str =
     "CREATE INDEX tasks_marker_idx ON tasks(marker, page_id, block_id)";
 pub(crate) const TASKS_DEADLINE_INDEX_DDL: &str =
     "CREATE INDEX tasks_deadline_idx ON tasks(deadline, scheduled, page_id, block_id)";
+pub(crate) const TASKS_PAGE_INDEX_DDL: &str =
+    "CREATE INDEX tasks_page_idx ON tasks(page_id, block_id)";
 
-const MATERIALIZATION_TABLE_COLUMNS: [(&str, &[&str]); 14] = [
+const MATERIALIZATION_TABLE_COLUMNS: [(&str, &[&str]); 15] = [
     (
         "materialization_stamp",
         &[
@@ -510,9 +543,13 @@ const MATERIALIZATION_TABLE_COLUMNS: [(&str, &[&str]); 14] = [
             "deadline",
         ],
     ),
+    (
+        "search_fts_owners",
+        &["rowid", "entity_type", "entity_id", "page_id"],
+    ),
 ];
 
-const MATERIALIZATION_SCHEMA_OBJECTS: [(&str, &str, &str); 34] = [
+const MATERIALIZATION_SCHEMA_OBJECTS: [(&str, &str, &str); 39] = [
     ("table", "materialization_stamp", MATERIALIZATION_STAMP_DDL),
     (
         "table",
@@ -551,6 +588,7 @@ const MATERIALIZATION_SCHEMA_OBJECTS: [(&str, &str, &str); 34] = [
     ("table", "properties", PROPERTIES_DDL),
     ("table", "tags", TAGS_DDL),
     ("table", "tasks", TASKS_DDL),
+    ("table", "search_fts_owners", SEARCH_FTS_OWNERS_DDL),
     ("table", "search_fts", SEARCH_FTS_DDL),
     ("index", "pages_name_idx", PAGES_NAME_INDEX_DDL),
     ("index", "pages_name_key_idx", PAGES_NAME_KEY_INDEX_DDL),
@@ -559,6 +597,11 @@ const MATERIALIZATION_SCHEMA_OBJECTS: [(&str, &str, &str); 34] = [
         "index",
         "blocks_page_order_idx",
         BLOCKS_PAGE_ORDER_INDEX_DDL,
+    ),
+    (
+        "index",
+        "search_fts_owners_page_idx",
+        SEARCH_FTS_OWNERS_PAGE_INDEX_DDL,
     ),
     (
         "index",
@@ -625,8 +668,11 @@ const MATERIALIZATION_SCHEMA_OBJECTS: [(&str, &str, &str); 34] = [
         "properties_lookup_idx",
         PROPERTIES_LOOKUP_INDEX_DDL,
     ),
+    ("index", "properties_page_idx", PROPERTIES_PAGE_INDEX_DDL),
     ("index", "tags_lookup_idx", TAGS_LOOKUP_INDEX_DDL),
+    ("index", "tags_page_idx", TAGS_PAGE_INDEX_DDL),
     ("index", "tasks_marker_idx", TASKS_MARKER_INDEX_DDL),
+    ("index", "tasks_page_idx", TASKS_PAGE_INDEX_DDL),
 ];
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -2131,11 +2177,13 @@ pub(crate) fn initialize_schema(
          {PROPERTIES_DDL};
          {TAGS_DDL};
          {TASKS_DDL};
+         {SEARCH_FTS_OWNERS_DDL};
          {SEARCH_FTS_DDL};
          {PAGES_NAME_INDEX_DDL};
          {PAGES_NAME_KEY_INDEX_DDL};
          {PAGES_PATH_INDEX_DDL};
          {BLOCKS_PAGE_ORDER_INDEX_DDL};
+         {SEARCH_FTS_OWNERS_PAGE_INDEX_DDL};
          {REFERENCES_TARGET_INDEX_DDL};
          {REFERENCES_SOURCE_INDEX_DDL};
          {REFERENCE_SOURCE_COVERAGE_SOURCE_INDEX_DDL};
@@ -2149,9 +2197,12 @@ pub(crate) fn initialize_schema(
          {REFERENCE_ALIAS_DECLARATIONS_SOURCE_INDEX_DDL};
          {REFERENCE_ALIAS_BINDINGS_NORMALIZED_ALIAS_INDEX_DDL};
          {PROPERTIES_LOOKUP_INDEX_DDL};
+         {PROPERTIES_PAGE_INDEX_DDL};
          {TAGS_LOOKUP_INDEX_DDL};
+         {TAGS_PAGE_INDEX_DDL};
          {TASKS_MARKER_INDEX_DDL};
-         {TASKS_DEADLINE_INDEX_DDL};"
+         {TASKS_DEADLINE_INDEX_DDL};
+         {TASKS_PAGE_INDEX_DDL};"
     ))?;
     connection.execute(
         "INSERT INTO materialization_stamp (
@@ -2342,10 +2393,61 @@ pub(crate) fn recorded_digest(
     bytes.map(decode_digest).transpose()
 }
 
+/// One full disposable-candidate proof after all inductive per-part updates
+/// and before publication. Ordinary incremental application continues to use
+/// the per-transaction full coverage check.
+pub(crate) fn finalize_fresh_bootstrap(
+    connection: &Connection,
+    expected_catalog_root: &ReferenceCatalogRootV2,
+    inductive_coverage_count: u64,
+) -> Result<(), MaterializationError> {
+    let coverage_count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM reference_source_coverage",
+        [],
+        |row| row.get(0),
+    )?;
+    let coverage_count = u64::try_from(coverage_count).map_err(|_| {
+        MaterializationError::Corrupt("reference source coverage count is negative".into())
+    })?;
+    if coverage_count != inductive_coverage_count
+        || coverage_count != expected_catalog_root.source_count()
+    {
+        return Err(MaterializationError::Incomplete(format!(
+            "final SQLite reference source coverage {coverage_count} differs from inductive count {inductive_coverage_count} or authenticated catalog count {}",
+            expected_catalog_root.source_count(),
+        )));
+    }
+
+    let owner_count: i64 =
+        connection.query_row("SELECT COUNT(*) FROM search_fts_owners", [], |row| {
+            row.get(0)
+        })?;
+    let fts_count: i64 =
+        connection.query_row("SELECT COUNT(*) FROM search_fts", [], |row| row.get(0))?;
+    let mismatches: i64 = connection.query_row(
+        "SELECT COUNT(*)
+         FROM search_fts_owners AS owner
+         LEFT JOIN search_fts AS fts ON fts.rowid = owner.rowid
+         WHERE fts.rowid IS NULL
+            OR fts.entity_type != CASE owner.entity_type WHEN 0 THEN 'page' ELSE 'block' END
+            OR fts.entity_id != lower(hex(owner.entity_id))
+            OR fts.page_id != lower(hex(owner.page_id))",
+        [],
+        |row| row.get(0),
+    )?;
+    if owner_count != fts_count || mismatches != 0 {
+        return Err(MaterializationError::Corrupt(
+            "FTS rows differ from their authoritative owner mapping".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn apply_reference_catalog_change(
     transaction: &Transaction<'_>,
     input: &ReferenceCatalogMaterializationInput,
-) -> Result<(Vec<u8>, ContentDigest, ContentDigest, ContentDigest), MaterializationError> {
+    coverage_validation: CoverageValidation,
+) -> Result<(Vec<u8>, ContentDigest, ContentDigest, ContentDigest, u64), MaterializationError> {
     input.validate()?;
     let post_root_bytes = input
         .post_catalog_root
@@ -2369,7 +2471,16 @@ fn apply_reference_catalog_change(
         .collect::<BTreeSet<_>>();
     let mut altered_aliases = BTreeSet::new();
     let mut prior_alias_candidates = BTreeMap::<String, BTreeSet<PageId>>::new();
+    let mut replaced_coverage_rows = 0_u64;
     for page_id in &sources {
+        let existed: i64 = transaction.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM reference_source_coverage WHERE source_page_id = ?1
+             )",
+            params![page_id.as_uuid().as_bytes().as_slice()],
+            |row| row.get(0),
+        )?;
+        replaced_coverage_rows = replaced_coverage_rows.saturating_add(u64::from(existed != 0));
         let mut statement = transaction.prepare(
             "SELECT normalized_alias FROM reference_alias_declarations
              WHERE source_page_id = ?1",
@@ -2542,12 +2653,35 @@ fn apply_reference_catalog_change(
             )?;
         }
     }
-    let coverage_count: i64 = transaction.query_row(
-        "SELECT COUNT(*) FROM reference_source_coverage",
-        [],
-        |row| row.get(0),
-    )?;
-    if u64::try_from(coverage_count).ok() != Some(input.post_catalog_root.source_count()) {
+    let coverage_count = match coverage_validation {
+        CoverageValidation::FullScan => {
+            let count: i64 = transaction.query_row(
+                "SELECT COUNT(*) FROM reference_source_coverage",
+                [],
+                |row| row.get(0),
+            )?;
+            u64::try_from(count).map_err(|_| {
+                MaterializationError::Corrupt("reference source coverage count is negative".into())
+            })?
+        }
+        CoverageValidation::FreshInductive { prior_count } => {
+            if prior_count != input.prior_catalog_root.source_count() {
+                return Err(MaterializationError::Incomplete(format!(
+                    "inductive SQLite reference source coverage {prior_count} does not match authenticated prior catalog source count {}",
+                    input.prior_catalog_root.source_count(),
+                )));
+            }
+            prior_count
+                .checked_sub(replaced_coverage_rows)
+                .and_then(|count| count.checked_add(input.coverage.len() as u64))
+                .ok_or_else(|| {
+                    MaterializationError::Corrupt(
+                        "inductive reference source coverage count overflowed".into(),
+                    )
+                })?
+        }
+    };
+    if coverage_count != input.post_catalog_root.source_count() {
         return Err(MaterializationError::Incomplete(
             format!(
                 "SQLite reference source coverage {coverage_count} does not match authenticated catalog source count {}",
@@ -2560,6 +2694,7 @@ fn apply_reference_catalog_change(
         post_root_digest,
         coverage_digest,
         extractor_stamp_digest,
+        coverage_count,
     ))
 }
 
@@ -2571,7 +2706,54 @@ pub(crate) fn apply_change(
     input_digest: ContentDigest,
     post_frontier_digest: ContentDigest,
     authenticated_reference: Option<&AuthenticatedReferenceMaterialization>,
-) -> Result<(), MaterializationError> {
+) -> Result<ApplyChangeInstrumentation, MaterializationError> {
+    apply_change_inner(
+        transaction,
+        change,
+        semantic_effect,
+        sequence,
+        input_digest,
+        post_frontier_digest,
+        authenticated_reference,
+        CoverageValidation::FullScan,
+    )
+}
+
+pub(crate) fn apply_change_fresh_bootstrap(
+    transaction: &Transaction<'_>,
+    change: &MaterializationChange,
+    semantic_effect: &[u8],
+    sequence: u64,
+    input_digest: ContentDigest,
+    post_frontier_digest: ContentDigest,
+    authenticated_reference: Option<&AuthenticatedReferenceMaterialization>,
+    prior_reference_coverage_count: u64,
+) -> Result<ApplyChangeInstrumentation, MaterializationError> {
+    apply_change_inner(
+        transaction,
+        change,
+        semantic_effect,
+        sequence,
+        input_digest,
+        post_frontier_digest,
+        authenticated_reference,
+        CoverageValidation::FreshInductive {
+            prior_count: prior_reference_coverage_count,
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_change_inner(
+    transaction: &Transaction<'_>,
+    change: &MaterializationChange,
+    semantic_effect: &[u8],
+    sequence: u64,
+    input_digest: ContentDigest,
+    post_frontier_digest: ContentDigest,
+    authenticated_reference: Option<&AuthenticatedReferenceMaterialization>,
+    coverage_validation: CoverageValidation,
+) -> Result<ApplyChangeInstrumentation, MaterializationError> {
     change.validate_shape()?;
     let effect = SemanticEffect::decode(semantic_effect)
         .map_err(|error| MaterializationError::InvalidInput(error.to_string()))?;
@@ -2593,24 +2775,45 @@ pub(crate) fn apply_change(
         .iter()
         .flat_map(|page| page.blocks.iter().map(|block| block.block_id))
         .collect::<BTreeSet<_>>();
+    let mut instrumentation = ApplyChangeInstrumentation::default();
     for page_id in &change.deletions {
-        delete_page(transaction, *page_id, true, &retained_blocks)?;
+        let cleanup = delete_page(transaction, *page_id, true, &retained_blocks)?;
+        instrumentation.cleanup_page_attempts += 1;
+        instrumentation.cleanup_existing_pages += cleanup.existing_pages;
+        instrumentation.cleanup_owned_rows += cleanup.owned_rows;
+        instrumentation.cleanup_fts_rowids += cleanup.fts_rowids;
     }
     for page in &change.replacements {
-        delete_page(transaction, page.page_id, false, &retained_blocks)?;
+        let cleanup = delete_page(transaction, page.page_id, false, &retained_blocks)?;
+        instrumentation.cleanup_page_attempts += 1;
+        instrumentation.cleanup_existing_pages += cleanup.existing_pages;
+        instrumentation.cleanup_owned_rows += cleanup.owned_rows;
+        instrumentation.cleanup_fts_rowids += cleanup.fts_rowids;
     }
     for page in &change.replacements {
         insert_page(transaction, page)?;
     }
     let reference_values = change
         .reference_catalog()
-        .map(|input| apply_reference_catalog_change(transaction, input))
+        .map(|input| apply_reference_catalog_change(transaction, input, coverage_validation))
         .transpose()?;
     let sequence = i64::try_from(sequence)
         .map_err(|_| MaterializationError::Corrupt("acceptance sequence exceeds SQLite".into()))?;
-    if let Some((catalog_root, catalog_root_digest, coverage_digest, extractor_stamp_digest)) =
-        reference_values
+    if let Some((
+        catalog_root,
+        catalog_root_digest,
+        coverage_digest,
+        extractor_stamp_digest,
+        coverage_count,
+    )) = reference_values
     {
+        instrumentation.reference_coverage_count = Some(coverage_count);
+        match coverage_validation {
+            CoverageValidation::FullScan => instrumentation.reference_coverage_full_scans = 1,
+            CoverageValidation::FreshInductive { .. } => {
+                instrumentation.reference_coverage_inductive_checks = 1;
+            }
+        }
         let authenticated = authenticated_reference
             .expect("reference values require authenticated transition evidence");
         let catalog_change = postcard::to_allocvec(change.reference_catalog().expect("present"))
@@ -2699,7 +2902,7 @@ pub(crate) fn apply_change(
             params![sequence, post_frontier_digest.as_bytes().as_slice()],
         )?;
     }
-    Ok(())
+    Ok(instrumentation)
 }
 
 #[cfg(test)]
@@ -2709,6 +2912,7 @@ pub(crate) fn reset(
 ) -> Result<(), MaterializationError> {
     transaction.execute_batch(
         "DELETE FROM search_fts;
+         DELETE FROM search_fts_owners;
          DELETE FROM tasks;
          DELETE FROM tags;
          DELETE FROM properties;
@@ -2737,14 +2941,30 @@ pub(crate) fn reset(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct PageCleanupInstrumentation {
+    existing_pages: usize,
+    owned_rows: usize,
+    fts_rowids: usize,
+}
+
 fn delete_page(
     transaction: &Transaction<'_>,
     page_id: PageId,
     remove_incoming_page_references: bool,
     retained_blocks: &BTreeSet<BlockId>,
-) -> Result<(), MaterializationError> {
+) -> Result<PageCleanupInstrumentation, MaterializationError> {
     let page_uuid = page_id.as_uuid();
     let page = page_uuid.as_bytes();
+    let existing: i64 = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pages WHERE page_id = ?1)",
+        params![page.as_slice()],
+        |row| row.get(0),
+    )?;
+    let mut instrumentation = PageCleanupInstrumentation {
+        existing_pages: usize::from(existing != 0),
+        ..PageCleanupInstrumentation::default()
+    };
     let old_blocks = {
         let mut statement =
             transaction.prepare("SELECT block_id FROM blocks WHERE page_id = ?1")?;
@@ -2758,17 +2978,31 @@ fn delete_page(
             .collect::<Result<Vec<_>, _>>()?;
         block_ids
     };
-    transaction.execute(
-        "DELETE FROM search_fts
-         WHERE (entity_type = 'page' AND entity_id = lower(hex(?1)))
-            OR (entity_type = 'block' AND page_id = lower(hex(?1)))",
-        params![page.as_slice()],
-    )?;
-    transaction.execute(
-        "DELETE FROM refs
+    let fts_rowids = {
+        let mut statement = transaction
+            .prepare("SELECT rowid FROM search_fts_owners WHERE page_id = ?1 ORDER BY rowid")?;
+        let rowids = statement
+            .query_map(params![page.as_slice()], |row| row.get::<_, i64>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        rowids
+    };
+    instrumentation.fts_rowids = fts_rowids.len();
+    for rowid in fts_rowids {
+        transaction.execute("DELETE FROM search_fts WHERE rowid = ?1", params![rowid])?;
+    }
+    instrumentation.owned_rows = instrumentation
+        .owned_rows
+        .saturating_add(transaction.execute(
+            "DELETE FROM search_fts_owners WHERE page_id = ?1",
+            params![page.as_slice()],
+        )?);
+    instrumentation.owned_rows = instrumentation
+        .owned_rows
+        .saturating_add(transaction.execute(
+            "DELETE FROM refs
          WHERE source_page_id = ?1",
-        params![page.as_slice()],
-    )?;
+            params![page.as_slice()],
+        )?);
     if remove_incoming_page_references {
         transaction.execute(
             "DELETE FROM refs WHERE target_type = 0 AND target_id = ?1",
@@ -2783,27 +3017,37 @@ fn delete_page(
             )?;
         }
     }
-    transaction.execute(
-        "DELETE FROM properties WHERE page_id = ?1",
-        params![page.as_slice()],
-    )?;
-    transaction.execute(
-        "DELETE FROM tags WHERE page_id = ?1",
-        params![page.as_slice()],
-    )?;
-    transaction.execute(
-        "DELETE FROM tasks WHERE page_id = ?1",
-        params![page.as_slice()],
-    )?;
-    transaction.execute(
-        "DELETE FROM blocks WHERE page_id = ?1",
-        params![page.as_slice()],
-    )?;
-    transaction.execute(
-        "DELETE FROM pages WHERE page_id = ?1",
-        params![page.as_slice()],
-    )?;
-    Ok(())
+    instrumentation.owned_rows = instrumentation
+        .owned_rows
+        .saturating_add(transaction.execute(
+            "DELETE FROM properties WHERE page_id = ?1",
+            params![page.as_slice()],
+        )?);
+    instrumentation.owned_rows = instrumentation
+        .owned_rows
+        .saturating_add(transaction.execute(
+            "DELETE FROM tags WHERE page_id = ?1",
+            params![page.as_slice()],
+        )?);
+    instrumentation.owned_rows = instrumentation
+        .owned_rows
+        .saturating_add(transaction.execute(
+            "DELETE FROM tasks WHERE page_id = ?1",
+            params![page.as_slice()],
+        )?);
+    instrumentation.owned_rows = instrumentation
+        .owned_rows
+        .saturating_add(transaction.execute(
+            "DELETE FROM blocks WHERE page_id = ?1",
+            params![page.as_slice()],
+        )?);
+    instrumentation.owned_rows = instrumentation
+        .owned_rows
+        .saturating_add(transaction.execute(
+            "DELETE FROM pages WHERE page_id = ?1",
+            params![page.as_slice()],
+        )?);
+    Ok(instrumentation)
 }
 
 fn insert_page(
@@ -2935,10 +3179,30 @@ fn insert_fts(
     page_id: PageId,
     text: &str,
 ) -> Result<(), MaterializationError> {
+    let entity_type_value = match entity_type {
+        "page" => 0_i64,
+        "block" => 1_i64,
+        _ => {
+            return Err(MaterializationError::InvalidInput(
+                "unknown FTS entity type".into(),
+            ));
+        }
+    };
     transaction.execute(
-        "INSERT INTO search_fts (entity_type, entity_id, page_id, text)
-         VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO search_fts_owners (entity_type, entity_id, page_id)
+         VALUES (?1, ?2, ?3)",
         params![
+            entity_type_value,
+            entity_id.as_bytes().as_slice(),
+            page_id.as_uuid().as_bytes().as_slice(),
+        ],
+    )?;
+    let rowid = transaction.last_insert_rowid();
+    transaction.execute(
+        "INSERT INTO search_fts (rowid, entity_type, entity_id, page_id, text)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            rowid,
             entity_type,
             entity_id.simple().to_string(),
             page_id.as_uuid().simple().to_string(),
@@ -3977,7 +4241,7 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_v10_reference_schema_is_exact_strict_and_checked() {
+    fn sqlite_v11_materialization_schema_is_exact_strict_and_checked() {
         let connection = Connection::open_in_memory().unwrap();
         initialize_schema(&connection, ContentDigest::of(b"empty frontier")).unwrap();
         validate_schema(&connection).unwrap();
@@ -4007,6 +4271,10 @@ mod tests {
             assert!(found.contains("STRICT"));
         }
         for index in [
+            "search_fts_owners_page_idx",
+            "properties_page_idx",
+            "tags_page_idx",
+            "tasks_page_idx",
             "reference_source_coverage_source_idx",
             "reference_postings_source_idx",
             "reference_postings_normalized_name_idx",
@@ -4038,6 +4306,18 @@ mod tests {
             legacy_refs_retained,
             "v2 refs remain until call sites migrate"
         );
+        let owner_table: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'search_fts_owners'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            canonical_sql(&owner_table),
+            canonical_sql(SEARCH_FTS_OWNERS_DDL)
+        );
+        assert!(owner_table.contains("STRICT"));
 
         assert!(connection
             .execute_batch(
@@ -4060,6 +4340,113 @@ mod tests {
                  ) VALUES ('not-a-blob', zeroblob(32), zeroblob(32))"
             )
             .is_err());
+    }
+
+    #[test]
+    fn page_cleanup_selects_only_exact_owned_fts_rowids_and_page_led_facets() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        initialize_schema(&connection, ContentDigest::of(b"empty frontier")).unwrap();
+        let changed_page = page_id(0x1100);
+        let untouched_page = page_id(0x1200);
+        let changed = MaterializedPageInput {
+            page_id: changed_page,
+            home_document_id: document_id(0x1101),
+            name: "Changed".into(),
+            name_key: "changed".into(),
+            path: ManagedPath::parse("pages/changed.md").unwrap(),
+            kind: ManagedTextKind::Page,
+            preamble: Some("owner:: page\n#page-tag".into()),
+            searchable_text: "Changed owner page tag".into(),
+            references: Vec::new(),
+            properties: vec![MaterializedProperty {
+                name: "owner".into(),
+                value: "page".into(),
+            }],
+            tags: vec!["page-tag".into()],
+            blocks: vec![MaterializedBlockInput {
+                block_id: block_id(0x1102),
+                home_document_id: document_id(0x1101),
+                parent: None,
+                order: "a".into(),
+                content: "TODO owner:: block #block-tag".into(),
+                searchable_text: "TODO owner block block-tag".into(),
+                heading_level: None,
+                collapsed: false,
+                logseq_uuid: None,
+                logseq_identity_origin: None,
+                references: Vec::new(),
+                properties: vec![MaterializedProperty {
+                    name: "owner".into(),
+                    value: "block".into(),
+                }],
+                tags: vec!["block-tag".into()],
+                task: Some(MaterializedTask {
+                    marker: "TODO".into(),
+                    priority: None,
+                    scheduled: None,
+                    deadline: None,
+                }),
+            }],
+        };
+        let untouched = MaterializedPageInput {
+            page_id: untouched_page,
+            home_document_id: document_id(0x1201),
+            name: "Untouched".into(),
+            name_key: "untouched".into(),
+            path: ManagedPath::parse("pages/untouched.md").unwrap(),
+            kind: ManagedTextKind::Page,
+            preamble: None,
+            searchable_text: "Untouched".into(),
+            references: Vec::new(),
+            properties: Vec::new(),
+            tags: Vec::new(),
+            blocks: Vec::new(),
+        };
+        let transaction = connection.transaction().unwrap();
+        insert_page(&transaction, &changed).unwrap();
+        insert_page(&transaction, &untouched).unwrap();
+        let changed_uuid = changed_page.as_uuid();
+        let changed_blob = changed_uuid.as_bytes().as_slice();
+        let expected_owned_rows: usize = [
+            ("search_fts_owners", "page_id"),
+            ("refs", "source_page_id"),
+            ("properties", "page_id"),
+            ("tags", "page_id"),
+            ("tasks", "page_id"),
+            ("blocks", "page_id"),
+            ("pages", "page_id"),
+        ]
+        .into_iter()
+        .map(|(table, column)| {
+            transaction
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE {column} = ?1"),
+                    params![changed_blob],
+                    |row| row.get::<_, usize>(0),
+                )
+                .unwrap()
+        })
+        .sum();
+        let cleanup = delete_page(&transaction, changed_page, true, &BTreeSet::new()).unwrap();
+        assert_eq!(cleanup.existing_pages, 1);
+        assert_eq!(cleanup.fts_rowids, 2);
+        assert_eq!(cleanup.owned_rows, expected_owned_rows);
+        let absent = delete_page(&transaction, page_id(0x1300), true, &BTreeSet::new()).unwrap();
+        assert_eq!(absent, PageCleanupInstrumentation::default());
+        assert_eq!(
+            transaction
+                .query_row("SELECT COUNT(*) FROM search_fts", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            transaction
+                .query_row("SELECT COUNT(*) FROM pages", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        transaction.commit().unwrap();
     }
 
     #[test]

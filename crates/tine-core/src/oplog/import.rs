@@ -12435,7 +12435,10 @@ mod tests {
             &one_authority,
         )
         .unwrap();
-        assert_eq!(one_proof.accepted_batch_count(), 1);
+        assert_eq!(
+            one_proof.accepted_batch_count(),
+            one.aggregate().parts().len() as u64
+        );
         assert_eq!(
             one_proof.claim(),
             crate::oplog::ProjectionClaim::current(
@@ -12454,7 +12457,10 @@ mod tests {
                 .materialized_row_digest_for_harness()
                 .unwrap()
         );
-        assert_eq!(one_proof.bootstrap_rebuild().bootstrap_part_reads, 1);
+        assert_eq!(
+            one_proof.bootstrap_rebuild().bootstrap_part_reads,
+            one.aggregate().parts().len()
+        );
         assert_eq!(one_proof.bootstrap_rebuild().max_live_bootstrap_parts, 1);
         assert_materialized_snapshot_matches(&one_authority, &one_opened.database);
         assert!(!one_archive.join("projection-work").exists());
@@ -12515,6 +12521,16 @@ mod tests {
         assert_eq!(multi_opened.rebuild.accepted_events_applied, 2);
         assert_eq!(multi_opened.rebuild.max_live_events, 1);
         assert_eq!(multi_opened.rebuild.max_live_evidence_records, 1);
+        assert_eq!(multi_opened.rebuild.accepted_root_authentications, 2);
+        assert_eq!(multi_opened.rebuild.exact_catalog_loads, 2);
+        assert_eq!(
+            multi_opened.rebuild.reference_coverage_inductive_checks,
+            multi.aggregate().parts().len()
+        );
+        assert_eq!(multi_opened.rebuild.reference_coverage_full_scans, 1);
+        assert_eq!(multi_opened.rebuild.final_semantic_equivalence_proofs, 1);
+        assert_eq!(multi_opened.rebuild.final_row_digest_equivalence_proofs, 1);
+        assert!(multi_opened.rebuild.cleanup_fts_rowids <= multi_opened.rebuild.cleanup_owned_rows);
         assert_eq!(multi_proof.bootstrap_rebuild().max_live_bootstrap_parts, 1);
         assert_materialized_snapshot_matches(&multi_authority, &multi_opened.database);
         assert_eq!(

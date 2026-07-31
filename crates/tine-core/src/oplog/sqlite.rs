@@ -65,11 +65,11 @@ use super::{
 };
 
 pub const SQLITE_APPLICATION_ID: u32 = 0x5449_4e45;
-pub const SQLITE_SCHEMA_VERSION: u32 = 10;
+pub const SQLITE_SCHEMA_VERSION: u32 = 11;
 pub const TAIL_MAX_BYTES: usize = 16 * 1024 * 1024;
 pub const TAIL_MAX_BATCHES: usize = 10_000;
 
-const EXPECTED_TABLES: [&str; 26] = [
+const EXPECTED_TABLES: [&str; 27] = [
     "accepted_batch_nodes",
     "applied_batches",
     "blocks",
@@ -94,10 +94,11 @@ const EXPECTED_TABLES: [&str; 26] = [
     "search_fts_data",
     "search_fts_docsize",
     "search_fts_idx",
+    "search_fts_owners",
     "tags",
     "tasks",
 ];
-const EXPECTED_INDEXES: [&str; 22] = [
+const EXPECTED_INDEXES: [&str; 26] = [
     "applied_batches_acceptance_sequence_uq",
     "applied_batches_batch_id_uq",
     "blocks_page_order_idx",
@@ -105,6 +106,7 @@ const EXPECTED_INDEXES: [&str; 22] = [
     "pages_name_key_idx",
     "pages_path_idx",
     "properties_lookup_idx",
+    "properties_page_idx",
     "reference_alias_bindings_normalized_alias_idx",
     "reference_alias_declarations_source_idx",
     "reference_name_bindings_raw_name_idx",
@@ -117,9 +119,12 @@ const EXPECTED_INDEXES: [&str; 22] = [
     "reference_uuid_bindings_resolved_block_idx",
     "references_source_idx",
     "references_target_idx",
+    "search_fts_owners_page_idx",
     "tags_lookup_idx",
+    "tags_page_idx",
     "tasks_deadline_idx",
     "tasks_marker_idx",
+    "tasks_page_idx",
 ];
 const META_DDL: &str = "CREATE TABLE meta (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -1271,10 +1276,30 @@ fn materialized_page_input(page: super::MaterializedPage) -> super::Materialized
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct EventMaterializationInstrumentation {
+    accepted_root_authentications: usize,
+    exact_document_loads: usize,
+    exact_catalog_loads: usize,
+}
+
 pub(crate) fn materialize_accepted_event(
     engine: &ShardedHotEngine,
     event: &AcceptedBatchEvent,
 ) -> Result<super::MaterializationChange, ProjectionError> {
+    materialize_accepted_event_with_stats(engine, event).map(|(change, _)| change)
+}
+
+fn materialize_accepted_event_with_stats(
+    engine: &ShardedHotEngine,
+    event: &AcceptedBatchEvent,
+) -> Result<
+    (
+        super::MaterializationChange,
+        EventMaterializationInstrumentation,
+    ),
+    ProjectionError,
+> {
     authenticate_event_for_engine(engine, event)?;
     let effect = SemanticEffect::decode(event.semantic_effect())
         .map_err(|error| ProjectionError::Materialization(error.to_string()))?;
@@ -1287,6 +1312,55 @@ pub(crate) fn materialize_accepted_event(
             event.batch_id()
         )));
     }
+    let affected_pages = super::reference_catalog::affected_reference_sources(&effect);
+    let mut replacements = Vec::new();
+    let mut deletions = Vec::new();
+    let mut instrumentation = EventMaterializationInstrumentation::default();
+    let mut materializer = (!affected_pages.is_empty())
+        .then(|| engine.accepted_root_materializer(event.post_frontier_root()))
+        .transpose()
+        .map_err(|error| ProjectionError::Materialization(error.to_string()))?;
+    if materializer.is_some() {
+        instrumentation.accepted_root_authentications = 1;
+    }
+    for page_id in affected_pages {
+        match materializer
+            .as_mut()
+            .expect("nonempty affected pages construct a materializer")
+            .materialize_page(page_id)
+            .map_err(|error| ProjectionError::Materialization(error.to_string()))?
+        {
+            Some(mut page) => {
+                if let Some(transition) = event
+                    .effective_transitions()
+                    .iter()
+                    .find(|transition| transition.page_id() == page_id)
+                {
+                    transition
+                        .apply_to_materialized(&mut page)
+                        .map_err(|error| ProjectionError::Materialization(error.to_string()))?;
+                }
+                replacements.push(materialized_page_input(page));
+            }
+            None => deletions.push(page_id),
+        }
+    }
+    if let Some(materializer) = materializer {
+        instrumentation.exact_document_loads = materializer.exact_document_loads();
+        instrumentation.exact_catalog_loads = materializer.exact_catalog_loads();
+    }
+    let change = super::MaterializationChange::new(event.batch_id(), replacements, deletions)?;
+    Ok((change, instrumentation))
+}
+
+#[cfg(test)]
+fn materialize_accepted_event_pointwise(
+    engine: &ShardedHotEngine,
+    event: &AcceptedBatchEvent,
+) -> Result<super::MaterializationChange, ProjectionError> {
+    authenticate_event_for_engine(engine, event)?;
+    let effect = SemanticEffect::decode(event.semantic_effect())
+        .map_err(|error| ProjectionError::Materialization(error.to_string()))?;
     let mut replacements = Vec::new();
     let mut deletions = Vec::new();
     for page_id in super::reference_catalog::affected_reference_sources(&effect) {
@@ -1567,6 +1641,17 @@ pub struct RebuildInstrumentation {
     pub accepted_sequence_page_reads: usize,
     pub accepted_sequence_bytes_read: usize,
     pub max_accepted_sequence_page_bytes: usize,
+    pub accepted_root_authentications: usize,
+    pub exact_document_loads: usize,
+    pub exact_catalog_loads: usize,
+    pub cleanup_page_attempts: usize,
+    pub cleanup_existing_pages: usize,
+    pub cleanup_owned_rows: usize,
+    pub cleanup_fts_rowids: usize,
+    pub reference_coverage_inductive_checks: usize,
+    pub reference_coverage_full_scans: usize,
+    pub final_semantic_equivalence_proofs: usize,
+    pub final_row_digest_equivalence_proofs: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2221,6 +2306,7 @@ pub struct SqliteFrontier {
     runtime_authority: EngineAuthority,
     required_frontier_root: AcceptedFrontierRoot,
     checkpoint_each_apply: bool,
+    fresh_reference_coverage_count: Option<u64>,
     _lease: Arc<HeldApplierLocks>,
 }
 
@@ -2643,6 +2729,7 @@ impl SqliteFrontier {
                     runtime_authority: source.runtime_authority.clone(),
                     required_frontier_root: source.exact_frontier_root.clone(),
                     checkpoint_each_apply: true,
+                    fresh_reference_coverage_count: None,
                     _lease: lease,
                 },
                 recovery: ProjectionRecovery::OpenedExisting,
@@ -2680,6 +2767,7 @@ impl SqliteFrontier {
                                 runtime_authority: source.runtime_authority.clone(),
                                 required_frontier_root: source.exact_frontier_root.clone(),
                                 checkpoint_each_apply: true,
+                                fresh_reference_coverage_count: None,
                                 _lease: lease,
                             },
                             recovery: ProjectionRecovery::RebuiltPreservingEvidence {
@@ -2701,6 +2789,7 @@ impl SqliteFrontier {
                             runtime_authority: source.runtime_authority.clone(),
                             required_frontier_root: source.exact_frontier_root.clone(),
                             checkpoint_each_apply: true,
+                            fresh_reference_coverage_count: None,
                             _lease: lease,
                         },
                         recovery: ProjectionRecovery::OpenedExisting,
@@ -2812,6 +2901,7 @@ impl SqliteFrontier {
                 runtime_authority: source.runtime_authority.clone(),
                 required_frontier_root: source.exact_frontier_root.clone(),
                 checkpoint_each_apply: true,
+                fresh_reference_coverage_count: None,
                 _lease: lease,
             },
             rebuild,
@@ -2836,6 +2926,7 @@ impl SqliteFrontier {
             runtime_authority,
             required_frontier_root: AcceptedFrontierRoot::empty(),
             checkpoint_each_apply: false,
+            fresh_reference_coverage_count: Some(0),
             _lease: lease,
         })
     }
@@ -3014,13 +3105,35 @@ impl SqliteFrontier {
         event: &AcceptedBatchEvent,
         engine: &ShardedHotEngine,
     ) -> Result<ApplyDisposition, ProjectionError> {
+        self.apply_engine_owned_accepted_with_stats(event, engine)
+            .map(|(disposition, _, _)| disposition)
+    }
+
+    fn apply_engine_owned_accepted_with_stats(
+        &mut self,
+        event: &AcceptedBatchEvent,
+        engine: &ShardedHotEngine,
+    ) -> Result<
+        (
+            ApplyDisposition,
+            EventMaterializationInstrumentation,
+            super::sqlite_materialization::ApplyChangeInstrumentation,
+        ),
+        ProjectionError,
+    > {
         if !self.runtime_authority.matches(engine.runtime_authority()) {
             return Err(ProjectionError::AuthorityMismatch);
         }
-        let materialization = materialize_accepted_event(engine, event)?;
+        let (materialization, materialization_stats) =
+            materialize_accepted_event_with_stats(engine, event)?;
         let materialization =
             attach_authenticated_reference_catalog(engine, event, materialization)?;
-        self.apply_internal_with_materialization(event, ApplyFault::None, Some(&materialization))
+        let (disposition, apply_stats) = self.apply_internal_with_materialization_and_stats(
+            event,
+            ApplyFault::None,
+            Some(&materialization),
+        )?;
+        Ok((disposition, materialization_stats, apply_stats))
     }
 
     #[cfg(test)]
@@ -3334,7 +3447,20 @@ impl SqliteFrontier {
             instrumentation.max_live_events = instrumentation.max_live_events.max(1);
             instrumentation.max_live_evidence_records =
                 instrumentation.max_live_evidence_records.max(1);
-            self.apply_engine_owned_accepted(&event, source.engine)?;
+            let (_, materialization_stats, apply_stats) =
+                self.apply_engine_owned_accepted_with_stats(&event, source.engine)?;
+            instrumentation.accepted_root_authentications +=
+                materialization_stats.accepted_root_authentications;
+            instrumentation.exact_document_loads += materialization_stats.exact_document_loads;
+            instrumentation.exact_catalog_loads += materialization_stats.exact_catalog_loads;
+            instrumentation.cleanup_page_attempts += apply_stats.cleanup_page_attempts;
+            instrumentation.cleanup_existing_pages += apply_stats.cleanup_existing_pages;
+            instrumentation.cleanup_owned_rows += apply_stats.cleanup_owned_rows;
+            instrumentation.cleanup_fts_rowids += apply_stats.cleanup_fts_rowids;
+            instrumentation.reference_coverage_inductive_checks +=
+                apply_stats.reference_coverage_inductive_checks;
+            instrumentation.reference_coverage_full_scans +=
+                apply_stats.reference_coverage_full_scans;
             instrumentation.accepted_events_applied += 1;
             maybe_abort_rebuild_test(instrumentation.accepted_events_applied);
         }
@@ -3354,6 +3480,38 @@ impl SqliteFrontier {
                 "rebuild did not reach the engine's accepted event count".into(),
             ));
         }
+        if instrumentation.exact_catalog_loads > instrumentation.accepted_root_authentications
+            || instrumentation.accepted_root_authentications
+                > instrumentation.accepted_events_applied
+            || instrumentation.cleanup_fts_rowids > instrumentation.cleanup_owned_rows
+            || instrumentation.reference_coverage_inductive_checks
+                != instrumentation.accepted_events_applied
+            || instrumentation.reference_coverage_full_scans != 0
+        {
+            return Err(ProjectionError::Rebuild(
+                "fresh candidate structural accounting invariant failed".into(),
+            ));
+        }
+        let inductive_coverage_count = self.fresh_reference_coverage_count.ok_or_else(|| {
+            ProjectionError::Rebuild(
+                "fresh candidate lost its inductive reference coverage state".into(),
+            )
+        })?;
+        super::sqlite_materialization::finalize_fresh_bootstrap(
+            &self.connection,
+            source.exact_frontier_root.reference_catalog_root(),
+            inductive_coverage_count,
+        )?;
+        instrumentation.reference_coverage_full_scans += 1;
+        // Every preceding row transition was committed atomically with one
+        // authenticated archive event, and the exact terminal frontier above
+        // equals the source authority. These two complete scans close that
+        // inductive semantic/materialized-row proof while the file is still an
+        // unpublished candidate; publication happens only after this returns.
+        let _semantic_digest = self.semantic_projection_digest()?;
+        instrumentation.final_semantic_equivalence_proofs += 1;
+        let _row_digest = self.materialized_row_digest_for_harness()?;
+        instrumentation.final_row_digest_equivalence_proofs += 1;
         Ok((instrumentation, cursor.bootstrap_instrumentation()))
     }
 
@@ -3372,6 +3530,22 @@ impl SqliteFrontier {
         fault: ApplyFault,
         materialization: Option<&super::MaterializationChange>,
     ) -> Result<ApplyDisposition, ProjectionError> {
+        self.apply_internal_with_materialization_and_stats(event, fault, materialization)
+            .map(|(disposition, _)| disposition)
+    }
+
+    fn apply_internal_with_materialization_and_stats(
+        &mut self,
+        event: &AcceptedBatchEvent,
+        fault: ApplyFault,
+        materialization: Option<&super::MaterializationChange>,
+    ) -> Result<
+        (
+            ApplyDisposition,
+            super::sqlite_materialization::ApplyChangeInstrumentation,
+        ),
+        ProjectionError,
+    > {
         #[cfg(not(test))]
         let _ = fault;
         self.validate_event_claim(event)?;
@@ -3419,7 +3593,10 @@ impl SqliteFrontier {
                             }
                         }
                     }
-                    return Ok(ApplyDisposition::Duplicate);
+                    return Ok((
+                        ApplyDisposition::Duplicate,
+                        super::sqlite_materialization::ApplyChangeInstrumentation::default(),
+                    ));
                 }
                 return Err(ProjectionError::FrontierRegression);
             }
@@ -3576,6 +3753,7 @@ impl SqliteFrontier {
         {
             return Err(ProjectionError::FrontierRegression);
         }
+        let mut apply_stats = super::sqlite_materialization::ApplyChangeInstrumentation::default();
         if let (Some(materialization), Some(input_digest)) =
             (materialization, materialization_digest)
         {
@@ -3584,15 +3762,27 @@ impl SqliteFrontier {
                 .is_some()
                 .then(|| authenticated_reference_materialization(event))
                 .transpose()?;
-            super::sqlite_materialization::apply_change(
-                &transaction,
-                materialization,
-                event.semantic_effect(),
-                event.acceptance_sequence,
-                input_digest,
-                ContentDigest::of(&post_frontier_root),
-                authenticated_reference.as_ref(),
-            )?;
+            apply_stats = match self.fresh_reference_coverage_count {
+                Some(prior_count) => super::sqlite_materialization::apply_change_fresh_bootstrap(
+                    &transaction,
+                    materialization,
+                    event.semantic_effect(),
+                    event.acceptance_sequence,
+                    input_digest,
+                    ContentDigest::of(&post_frontier_root),
+                    authenticated_reference.as_ref(),
+                    prior_count,
+                )?,
+                None => super::sqlite_materialization::apply_change(
+                    &transaction,
+                    materialization,
+                    event.semantic_effect(),
+                    event.acceptance_sequence,
+                    input_digest,
+                    ContentDigest::of(&post_frontier_root),
+                    authenticated_reference.as_ref(),
+                )?,
+            };
         }
         fail_during_apply_for_harness()?;
         #[cfg(test)]
@@ -3614,6 +3804,11 @@ impl SqliteFrontier {
             ],
         )?;
         transaction.commit()?;
+        if self.fresh_reference_coverage_count.is_some() {
+            if let Some(next_count) = apply_stats.reference_coverage_count {
+                self.fresh_reference_coverage_count = Some(next_count);
+            }
+        }
         if self.checkpoint_each_apply {
             write_projection_checkpoint(&self.path, self.claim, &event.post_frontier_root)?;
         }
@@ -3621,7 +3816,7 @@ impl SqliteFrontier {
         if matches!(fault, ApplyFault::AbortAfterCommit) {
             std::process::abort();
         }
-        Ok(ApplyDisposition::Applied)
+        Ok((ApplyDisposition::Applied, apply_stats))
     }
 
     fn validate_event_claim(&self, event: &AcceptedBatchEvent) -> Result<(), ProjectionError> {
@@ -10876,7 +11071,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_7_reopen_rebuilds_without_serving_stale_contradictory_page_rows() {
+    fn prior_schema_reopen_rebuilds_without_serving_stale_contradictory_page_rows() {
         let ids = TestIds::new(1_775);
         let dir = TestDir::new("schema-7-materialization-name-rebuild");
         let (mut database, mut engine, store) = open_empty(&dir, ids);
@@ -10928,7 +11123,7 @@ mod tests {
             .unwrap();
         database
             .connection
-            .pragma_update(None, "user_version", 7)
+            .pragma_update(None, "user_version", SQLITE_SCHEMA_VERSION - 1)
             .unwrap();
         let database_path = database.path().to_path_buf();
         drop(database);
@@ -10941,10 +11136,13 @@ mod tests {
         .unwrap();
         let ProjectionRecovery::RebuiltPreservingEvidence { reason, .. } = &reopened.recovery
         else {
-            panic!("schema-7 database was reopened without a disposable rebuild");
+            panic!("prior-schema database was reopened without a disposable rebuild");
         };
         assert!(
-            reason.contains(&format!("user_version 7 != {SQLITE_SCHEMA_VERSION}")),
+            reason.contains(&format!(
+                "user_version {} != {SQLITE_SCHEMA_VERSION}",
+                SQLITE_SCHEMA_VERSION - 1
+            )),
             "unexpected rebuild reason: {reason}"
         );
         let rebuilt_rows: i64 = reopened
@@ -11488,6 +11686,145 @@ mod tests {
             deleted_rebuild.database.frontier_root().unwrap(),
             engine.accepted_frontier_root().unwrap()
         );
+    }
+
+    #[test]
+    fn event_scoped_materialization_matches_pointwise_for_rich_multi_page_transitions() {
+        let ids = TestIds::new(2_225);
+        let second_page = PageId::from_uuid(uuid(2_240));
+        let second_document = DocumentId::from_uuid(uuid(2_241));
+        let second_block = BlockId::from_uuid(uuid(2_242));
+        let dir = TestDir::new("event-scoped-materialization");
+        let store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
+        let engine_store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
+        let mut engine =
+            ShardedHotEngine::with_archive_store(engine_store, ids.lineage, ids.catalog);
+
+        let create = engine
+            .prepare_bootstrap_transaction(
+                author(2_250),
+                &OperationTransaction::new(vec![
+                    SemanticOperation::CreatePage {
+                        page_id: ids.page,
+                        home_document_id: ids.document,
+                        name: crate::oplog::LogicalPageName::parse("Rich Source").unwrap(),
+                        path: ManagedPath::parse("pages/rich-source.md").unwrap(),
+                        kind: ManagedTextKind::Page,
+                    },
+                    SemanticOperation::CreatePage {
+                        page_id: second_page,
+                        home_document_id: second_document,
+                        name: crate::oplog::LogicalPageName::parse("Rich Target").unwrap(),
+                        path: ManagedPath::parse("pages/rich-target.md").unwrap(),
+                        kind: ManagedTextKind::Page,
+                    },
+                    SemanticOperation::CreateBlock {
+                        block: BlockLocation {
+                            block_id: ids.block,
+                            home_document_id: ids.document,
+                        },
+                        page_id: ids.page,
+                        parent: None,
+                        order: "a".into(),
+                        content:
+                            "TODO [#A] [[Rich Target]] #project\nowner:: Ada\nalias:: Source Alias"
+                                .into(),
+                    },
+                    SemanticOperation::CreateBlock {
+                        block: BlockLocation {
+                            block_id: second_block,
+                            home_document_id: second_document,
+                        },
+                        page_id: second_page,
+                        parent: None,
+                        order: "a".into(),
+                        content: "Target content".into(),
+                    },
+                ])
+                .unwrap(),
+            )
+            .unwrap();
+        publish_and_stage_archive(&mut engine, &store, &create);
+        let create_event =
+            AcceptedBatchEvent::from_accepted(&engine, &store, create.manifest().batch_id())
+                .unwrap();
+        let (scoped_create, create_stats) =
+            materialize_accepted_event_with_stats(&engine, &create_event).unwrap();
+        let point_create = materialize_accepted_event_pointwise(&engine, &create_event).unwrap();
+        assert_eq!(scoped_create, point_create);
+        assert_eq!(scoped_create.replacements().len(), 2);
+        assert_eq!(create_stats.accepted_root_authentications, 1);
+        assert_eq!(create_stats.exact_catalog_loads, 1);
+        assert_eq!(
+            attach_authenticated_reference_catalog(&engine, &create_event, scoped_create.clone(),)
+                .unwrap(),
+            attach_authenticated_reference_catalog(&engine, &create_event, point_create).unwrap(),
+            "aliases and raw reference evidence must be identical"
+        );
+
+        let moved = engine
+            .prepare_bootstrap_transaction(
+                author(2_251),
+                &OperationTransaction::new(vec![SemanticOperation::MoveSubtree {
+                    root: BlockLocation {
+                        block_id: ids.block,
+                        home_document_id: ids.document,
+                    },
+                    from_page_id: ids.page,
+                    to_page_id: second_page,
+                    parent: None,
+                    order: "b".into(),
+                }])
+                .unwrap(),
+            )
+            .unwrap();
+        publish_and_stage_archive(&mut engine, &store, &moved);
+        let move_event =
+            AcceptedBatchEvent::from_accepted(&engine, &store, moved.manifest().batch_id())
+                .unwrap();
+        let (scoped_move, move_stats) =
+            materialize_accepted_event_with_stats(&engine, &move_event).unwrap();
+        let point_move = materialize_accepted_event_pointwise(&engine, &move_event).unwrap();
+        assert_eq!(scoped_move, point_move);
+        assert_eq!(scoped_move.replacements().len(), 2);
+        assert_eq!(move_stats.accepted_root_authentications, 1);
+        assert_eq!(move_stats.exact_catalog_loads, 1);
+        let moved_block = scoped_move
+            .replacements()
+            .iter()
+            .find(|page| page.page_id == second_page)
+            .unwrap()
+            .blocks
+            .iter()
+            .find(|block| block.block_id == ids.block)
+            .unwrap();
+        assert_eq!(moved_block.home_document_id, ids.document);
+        assert_eq!(moved_block.task.as_ref().unwrap().marker, "TODO");
+        assert_eq!(moved_block.properties[0].name, "owner");
+        assert!(moved_block.tags.contains(&"project".to_owned()));
+
+        let deleted = engine
+            .prepare_bootstrap_transaction(
+                author(2_252),
+                &OperationTransaction::new(vec![SemanticOperation::DeletePage {
+                    page_id: ids.page,
+                }])
+                .unwrap(),
+            )
+            .unwrap();
+        publish_and_stage_archive(&mut engine, &store, &deleted);
+        let delete_event =
+            AcceptedBatchEvent::from_accepted(&engine, &store, deleted.manifest().batch_id())
+                .unwrap();
+        let (scoped_delete, delete_stats) =
+            materialize_accepted_event_with_stats(&engine, &delete_event).unwrap();
+        assert_eq!(
+            scoped_delete,
+            materialize_accepted_event_pointwise(&engine, &delete_event).unwrap()
+        );
+        assert_eq!(scoped_delete.deletions(), &[ids.page]);
+        assert_eq!(delete_stats.accepted_root_authentications, 1);
+        assert_eq!(delete_stats.exact_catalog_loads, 1);
     }
 
     #[test]
@@ -15480,6 +15817,13 @@ mod tests {
         );
         wait_for_file(&dir.path().join("helper-ready"));
         assert!(!helper.wait().unwrap().success());
+        if path.exists() {
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                b"corrupt before rebuild",
+                "an aborted candidate must not replace the prior projection path"
+            );
+        }
         let reopened = open_test_projection(
             &path,
             ids.claim(),
@@ -15494,6 +15838,34 @@ mod tests {
         assert_eq!(
             reopened.database.frontier().unwrap(),
             accepted_engine.exact_frontier().unwrap()
+        );
+        assert_eq!(reopened.rebuild.reference_coverage_full_scans, 1);
+        assert_eq!(
+            reopened.rebuild.reference_coverage_inductive_checks,
+            reopened.rebuild.accepted_events_applied
+        );
+        let retry_semantic_digest = reopened.database.semantic_projection_digest().unwrap();
+        let retry_row_digest = reopened
+            .database
+            .materialized_row_digest_for_harness()
+            .unwrap();
+        drop(reopened);
+        let clean = open_test_projection(
+            &dir.path().join("clean-rebuild.sqlite"),
+            ids.claim(),
+            RebuildSource::new(&accepted_engine, &store).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            clean.database.semantic_projection_digest().unwrap(),
+            retry_semantic_digest
+        );
+        assert_eq!(
+            clean
+                .database
+                .materialized_row_digest_for_harness()
+                .unwrap(),
+            retry_row_digest
         );
     }
 
