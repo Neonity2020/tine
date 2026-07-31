@@ -5578,6 +5578,7 @@ dependencies = [
 name = "tine-storage"
 version = "0.6.5"
 dependencies = [
+ "cap-fs-ext",
  "cap-std",
  "libc",
  "uuid",

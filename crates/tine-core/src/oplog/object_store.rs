@@ -36,9 +36,6 @@ use sha2::{Digest, Sha256};
 use smallvec::SmallVec;
 use uuid::Uuid;
 
-use crate::model::HandoffSafe;
-use tine_storage::ValidatedDirectorySync as PublicationDirSync;
-
 use super::enrollment::{EnrollmentBindingV1, ResumePointEnrollmentBinding};
 use super::hot_engine::RuntimeResumeSnapshot;
 use super::identity::{parse_digest, ARCHIVE_INSTANCE_CLAIM_FILE};
@@ -69,6 +66,7 @@ use super::{
     DocumentId, ImportId, LineageDigest, ObjectDescriptor, OperationBatch, OperationObject,
     PreparedBatch, SessionId, ValidatedBatch, WorkspaceId, MAX_MANIFEST_BYTES, MAX_OBJECT_BYTES,
 };
+use crate::model::HandoffSafe;
 
 const OBJECTS_DIR: &str = "objects";
 const BATCHES_DIR: &str = "batches";
@@ -1482,6 +1480,7 @@ impl ValidatedBootstrapPublicationV1 {
 /// object publication path remains unchanged.
 pub(crate) struct BootstrapPublicationBatch<'a> {
     store: &'a ObjectStore,
+    physical: tine_storage::ExactImmutablePublicationBatch<'a>,
     inventory_root: Option<SourceInventoryRootV1>,
     inventory_pages: BTreeMap<u32, ()>,
     blob_root: Option<SourceBlobChunkRootV1>,
@@ -1883,6 +1882,7 @@ impl ObjectStore {
     pub(crate) fn begin_bootstrap_publication_batch(&self) -> BootstrapPublicationBatch<'_> {
         BootstrapPublicationBatch {
             store: self,
+            physical: tine_storage::ExactImmutablePublicationBatch::new(&self.capability),
             inventory_root: None,
             inventory_pages: BTreeMap::new(),
             blob_root: None,
@@ -7337,14 +7337,7 @@ pub(crate) fn open_existing_dir_nofollow(
     root: &Dir,
     name: &str,
 ) -> Result<Option<Dir>, StoreError> {
-    match root.symlink_metadata(name) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => Err(
-            StoreError::UnsafeEntry(format!("{name} is not a real no-follow directory")),
-        ),
-        Ok(_) => open_dir_nofollow(root, name).map(Some),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.into()),
-    }
+    tine_storage::open_existing_dir_nofollow(root, name).map_err(filesystem_error_without_collision)
 }
 
 #[cfg(unix)]
@@ -7398,18 +7391,7 @@ pub(crate) fn control_directory_identity(
 }
 
 pub(crate) fn ensure_directory_nofollow(root: &Dir, name: &str) -> Result<(), StoreError> {
-    match root.symlink_metadata(name) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-            return Err(StoreError::UnsafeEntry(format!(
-                "{name} is not a real no-follow directory"
-            )));
-        }
-        Ok(_) => return Ok(()),
-        Err(error) if error.kind() == ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
-    root.create_dir(name)?;
-    sync_dir_required(root)
+    tine_storage::ensure_directory_nofollow(root, name).map_err(filesystem_error_without_collision)
 }
 
 /// Create only the immediate parent of an explicitly bound object-store root.
@@ -7441,7 +7423,6 @@ fn ensure_directory(root: &Dir, name: &str) -> Result<(), StoreError> {
 }
 
 impl BootstrapPublicationBatch<'_> {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn stage(
         &mut self,
         dir: &Dir,
@@ -7449,22 +7430,9 @@ impl BootstrapPublicationBatch<'_> {
         bytes: &[u8],
         collision: Collision,
     ) -> Result<(), StoreError> {
-        stage_immutable_unflushed(dir, filename, bytes, collision)
-    }
-
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    fn stage(
-        &mut self,
-        dir: &Dir,
-        filename: &str,
-        bytes: &[u8],
-        collision: Collision,
-    ) -> Result<(), StoreError> {
-        // The ordinary immutable publisher flushes both newly inserted files
-        // and exact-existing retry residue. Portable batching therefore keeps
-        // the pre-existing durability construction without retaining one open
-        // directory capability per artifact.
-        publish_immutable(dir, filename, bytes, collision)
+        self.physical
+            .publish(dir, filename, bytes)
+            .map_err(|error| publication_error(error, collision))
     }
 
     #[cfg(test)]
@@ -7700,7 +7668,10 @@ impl BootstrapPublicationBatch<'_> {
             &bytes,
             Collision::Bootstrap("bootstrap aggregate", name.clone()),
         )?;
-        flush_bootstrap_batch(self.store)?;
+        let _completed = self
+            .physical
+            .finish()
+            .map_err(filesystem_error_without_collision)?;
         Ok(DurablyStagedBootstrapPrefix {
             workspace_id: self.store.workspace_id,
             archive_identity: self.store.canonical_archive_identity()?,
@@ -7709,98 +7680,14 @@ impl BootstrapPublicationBatch<'_> {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn stage_immutable_unflushed(
-    dir: &Dir,
-    filename: &str,
-    bytes: &[u8],
-    collision: Collision,
-) -> Result<(), StoreError> {
-    let temp_name = format!(".tmp-{}", Uuid::new_v4());
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    let mut temp = dir.open_with(&temp_name, &options)?;
-    temp.write_all(bytes)?;
-    drop(temp);
-    match rename_noreplace(dir, &temp_name, filename) {
-        Ok(()) => {}
-        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-            verify_existing(dir, filename, bytes, collision)?;
-        }
-        Err(error) => return Err(error.into()),
-    }
-    if let Err(error) = dir.remove_file(&temp_name) {
-        if error.kind() != ErrorKind::NotFound {
-            return Err(error.into());
-        }
-    }
-    Ok(())
-}
-
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn flush_bootstrap_batch(store: &ObjectStore) -> Result<(), StoreError> {
-    // SAFETY: the retained capability owns a live directory descriptor.
-    let result = unsafe { libc::syncfs(store.capability.as_fd().as_raw_fd()) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error().into())
-    }
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
-fn flush_bootstrap_batch(_store: &ObjectStore) -> Result<(), StoreError> {
-    // Every artifact, including exact-existing retry residue, already passed
-    // through the ordinary durable immutable publisher on portable platforms.
-    Ok(())
-}
-
 fn publish_immutable(
     dir: &Dir,
     filename: &str,
     bytes: &[u8],
     collision: Collision,
 ) -> Result<(), StoreError> {
-    // Windows clones, retains, and validates the exact directory capability
-    // before inserting an immutable target name. Win32 exposes no documented
-    // directory-entry flush, so that validated state explicitly records the
-    // platform limitation; it never classifies an I/O error as success. File
-    // bytes stay flushed and insertion stays atomic, but the directory entry is
-    // not promised to survive a crash.
-    let publication_sync = PublicationDirSync::open(dir).map_err(StoreError::from)?;
-    publication_sync.preflight().map_err(StoreError::from)?;
-    let temp_name = format!(".tmp-{}", Uuid::new_v4());
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    let mut temp = dir.open_with(&temp_name, &options)?;
-    let result = (|| {
-        temp.write_all(bytes)?;
-        temp.sync_all()?;
-        drop(temp);
-        match rename_noreplace(dir, &temp_name, filename) {
-            // A post-insertion sync error can leave the correct immutable
-            // target present. Retrying is safe: the AlreadyExists path below
-            // verifies identical bytes and retries this same required sync.
-            Ok(()) => publication_sync.sync().map_err(StoreError::from),
-            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-                verify_existing(dir, filename, bytes, collision)?;
-                publication_sync.sync().map_err(StoreError::from)
-            }
-            Err(error) => Err(error.into()),
-        }
-    })();
-    let cleanup = dir.remove_file(&temp_name);
-    if let Err(error) = result {
-        let _ = cleanup;
-        return Err(error);
-    }
-    if cleanup
-        .as_ref()
-        .is_err_and(|error| error.kind() != ErrorKind::NotFound)
-    {
-        cleanup?;
-    }
-    Ok(())
+    tine_storage::publish_immutable_exact(dir, filename, bytes)
+        .map_err(|error| publication_error(error, collision))
 }
 
 pub(crate) fn publish_immutable_exact(
@@ -7812,28 +7699,39 @@ pub(crate) fn publish_immutable_exact(
     publish_immutable(dir, filename, bytes, Collision::Exact(kind))
 }
 
-fn verify_existing(
-    dir: &Dir,
-    filename: &str,
-    expected: &[u8],
-    collision: Collision,
-) -> Result<(), StoreError> {
-    let existing = match read_required_regular(
-        dir,
-        filename,
-        expected.len() as u64,
-        Some(expected.len() as u64),
-    ) {
-        Ok(existing) => existing,
-        Err(StoreError::StoredLengthMismatch { .. } | StoreError::StoredFileTooLarge { .. }) => {
-            return Err(collision_error(collision));
-        }
-        Err(error) => return Err(error),
-    };
-    if existing == expected {
-        return Ok(());
+fn publication_error(error: tine_storage::FilesystemError, collision: Collision) -> StoreError {
+    match error {
+        tine_storage::FilesystemError::ByteCollision => collision_error(collision),
+        error => filesystem_error_without_collision(error),
     }
-    Err(collision_error(collision))
+}
+
+fn filesystem_error_without_collision(error: tine_storage::FilesystemError) -> StoreError {
+    match error {
+        tine_storage::FilesystemError::Io(error) => StoreError::Io(error),
+        tine_storage::FilesystemError::UnsafeEntry(message) => StoreError::UnsafeEntry(message),
+        tine_storage::FilesystemError::StoredLengthMismatch {
+            path,
+            expected,
+            actual,
+        } => StoreError::StoredLengthMismatch {
+            path,
+            expected,
+            actual,
+        },
+        tine_storage::FilesystemError::StoredFileTooLarge {
+            path,
+            length,
+            limit,
+        } => StoreError::StoredFileTooLarge {
+            path,
+            length,
+            limit,
+        },
+        tine_storage::FilesystemError::ByteCollision => {
+            StoreError::ImmutableCollision("immutable publication")
+        }
+    }
 }
 
 fn collision_error(collision: Collision) -> StoreError {
@@ -7975,106 +7873,13 @@ fn open_engine_history_transition_lock(_root: &Dir) -> Result<fs::File, StoreErr
     .into())
 }
 
-#[cfg(unix)]
 pub(crate) fn open_file_nofollow(dir: &Dir, path: &str) -> std::io::Result<fs::File> {
-    let path = CString::new(path)
-        .map_err(|_| std::io::Error::new(ErrorKind::InvalidInput, "invalid stored filename"))?;
-    // SAFETY: `path` is a live NUL-terminated string and `dir` is an opened
-    // directory capability. O_NOFOLLOW binds validation and reading to the
-    // same opened regular-file handle.
-    let fd = unsafe {
-        libc::openat(
-            dir.as_fd().as_raw_fd(),
-            path.as_ptr(),
-            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
-        )
-    };
-    if fd < 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        // SAFETY: `openat` returned a newly owned descriptor.
-        Ok(unsafe { fs::File::from_raw_fd(fd) })
-    }
+    tine_storage::open_file_nofollow(dir, path)
 }
 
-#[cfg(windows)]
-pub(crate) fn open_file_nofollow(dir: &Dir, path: &str) -> std::io::Result<fs::File> {
-    let mut options = OpenOptions::new();
-    options.read(true).follow(FollowSymlinks::No);
-    let file = dir.open_with(path, &options)?.into_std();
-    reject_windows_reparse(&file, path)?;
-    Ok(file)
-}
-
-#[cfg(not(any(unix, windows)))]
-pub(crate) fn open_file_nofollow(_dir: &Dir, _path: &str) -> std::io::Result<fs::File> {
-    Err(std::io::Error::new(
-        ErrorKind::Unsupported,
-        "atomic no-follow reads are unsupported on this target",
-    ))
-}
-
-#[cfg(unix)]
 pub(crate) fn open_dir_nofollow(dir: &Dir, path: &str) -> Result<Dir, StoreError> {
-    let path = CString::new(path)
-        .map_err(|_| std::io::Error::new(ErrorKind::InvalidInput, "invalid directory name"))?;
-    // SAFETY: as in `open_file_nofollow`; O_DIRECTORY rejects non-directories
-    // and O_NOFOLLOW rejects a final-component symlink in the same operation.
-    let fd = unsafe {
-        libc::openat(
-            dir.as_fd().as_raw_fd(),
-            path.as_ptr(),
-            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW,
-        )
-    };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
+    tine_storage::open_dir_nofollow(dir, path).map_err(filesystem_error_without_collision)
     // SAFETY: `openat` returned a newly owned directory descriptor.
-    Ok(Dir::from_std_file(unsafe { fs::File::from_raw_fd(fd) }))
-}
-
-#[cfg(windows)]
-pub(crate) fn open_dir_nofollow(dir: &Dir, path: &str) -> Result<Dir, StoreError> {
-    let mut options = OpenOptions::new();
-    options
-        .read(true)
-        .follow(FollowSymlinks::No)
-        .maybe_dir(true);
-    let file = dir.open_with(path, &options)?.into_std();
-    let metadata = file.metadata()?;
-    if metadata.file_attributes()
-        & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
-        != 0
-        || !metadata.is_dir()
-    {
-        return Err(StoreError::UnsafeEntry(format!(
-            "{path} is not a real no-follow directory"
-        )));
-    }
-    Ok(Dir::from_std_file(file))
-}
-
-#[cfg(windows)]
-fn reject_windows_reparse(file: &fs::File, path: &str) -> std::io::Result<()> {
-    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
-
-    if file.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-        return Err(std::io::Error::new(
-            ErrorKind::InvalidData,
-            format!("opened path is a reparse point: {path}"),
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(not(any(unix, windows)))]
-pub(crate) fn open_dir_nofollow(_dir: &Dir, _path: &str) -> Result<Dir, StoreError> {
-    Err(std::io::Error::new(
-        ErrorKind::Unsupported,
-        "atomic no-follow directory opens are unsupported on this target",
-    )
-    .into())
 }
 
 pub(crate) fn read_optional_regular(
@@ -8083,53 +7888,8 @@ pub(crate) fn read_optional_regular(
     limit: u64,
     expected_length: Option<u64>,
 ) -> Result<Option<Vec<u8>>, StoreError> {
-    let mut file = match open_file_nofollow(dir, path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    let metadata = file.metadata()?;
-    if !metadata.is_file() {
-        return Err(StoreError::UnsafeEntry(format!(
-            "stored path is not a regular no-follow file: {path}"
-        )));
-    }
-    let length = metadata.len();
-    if let Some(expected) = expected_length {
-        if length != expected {
-            return Err(StoreError::StoredLengthMismatch {
-                path: path.into(),
-                expected,
-                actual: length,
-            });
-        }
-    }
-    if length > limit {
-        return Err(StoreError::StoredFileTooLarge {
-            path: path.into(),
-            length,
-            limit,
-        });
-    }
-    let mut bytes = Vec::new();
-    Read::by_ref(&mut file)
-        .take(limit.saturating_add(1))
-        .read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > limit {
-        return Err(StoreError::StoredFileTooLarge {
-            path: path.into(),
-            length: bytes.len() as u64,
-            limit,
-        });
-    }
-    if bytes.len() as u64 != length {
-        return Err(StoreError::StoredLengthMismatch {
-            path: path.into(),
-            expected: length,
-            actual: bytes.len() as u64,
-        });
-    }
-    Ok(Some(bytes))
+    tine_storage::read_optional_regular(dir, path, limit, expected_length)
+        .map_err(filesystem_error_without_collision)
 }
 
 fn read_required_regular(
@@ -8138,12 +7898,8 @@ fn read_required_regular(
     limit: u64,
     expected_length: Option<u64>,
 ) -> Result<Vec<u8>, StoreError> {
-    read_optional_regular(dir, path, limit, expected_length)?.ok_or_else(|| {
-        StoreError::Io(std::io::Error::new(
-            ErrorKind::NotFound,
-            format!("missing stored file {path}"),
-        ))
-    })
+    tine_storage::read_required_regular(dir, path, limit, expected_length)
+        .map_err(filesystem_error_without_collision)
 }
 
 fn object_filename(digest: ContentDigest) -> String {
@@ -10625,59 +10381,7 @@ pub(crate) fn require_regular_entry(
     file_type: &cap_std::fs::FileType,
     name: &str,
 ) -> Result<(), StoreError> {
-    if file_type.is_symlink() || !file_type.is_file() {
-        Err(StoreError::UnsafeEntry(format!(
-            "namespace entry is not a regular no-follow file: {name}"
-        )))
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn rename_noreplace(dir: &Dir, from: &str, to: &str) -> std::io::Result<()> {
-    let from = CString::new(from)
-        .map_err(|_| std::io::Error::new(ErrorKind::InvalidInput, "invalid temporary name"))?;
-    let to = CString::new(to)
-        .map_err(|_| std::io::Error::new(ErrorKind::InvalidInput, "invalid target name"))?;
-    // SAFETY: both C strings are alive for the call, contain no interior NUL,
-    // and both relative paths are resolved beneath the already-open directory.
-    let result = unsafe {
-        libc::renameat2(
-            dir.as_fd().as_raw_fd(),
-            from.as_ptr(),
-            dir.as_fd().as_raw_fd(),
-            to.as_ptr(),
-            libc::RENAME_NOREPLACE,
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-#[cfg(any(target_os = "macos", target_os = "android", windows))]
-fn rename_noreplace(dir: &Dir, from: &str, to: &str) -> std::io::Result<()> {
-    // Hard-link creation is an atomic exclusive name insertion on these
-    // platforms: it fails if `to` already exists. Both names are in the same
-    // opened directory and the source is a private, synced regular file.
-    dir.hard_link(from, dir, to)?;
-    dir.remove_file(from)
-}
-
-#[cfg(not(any(
-    target_os = "linux",
-    target_os = "macos",
-    target_os = "android",
-    windows
-)))]
-fn rename_noreplace(_dir: &Dir, _from: &str, _to: &str) -> std::io::Result<()> {
-    Err(std::io::Error::new(
-        ErrorKind::Unsupported,
-        "atomic no-clobber publication is unsupported on this target",
-    ))
+    tine_storage::require_regular_entry(file_type, name).map_err(filesystem_error_without_collision)
 }
 
 pub(crate) fn sync_dir_required(dir: &Dir) -> Result<(), StoreError> {
