@@ -2107,9 +2107,27 @@ impl DetachedBootstrapAuthoringSession {
                 ));
             }
 
+            #[cfg(test)]
+            let prepare_started = std::time::Instant::now();
             let prepared = candidate.prepare_bootstrap_transaction(author, transaction)?;
+            #[cfg(test)]
+            if std::env::var_os("TINE_ACTIVATION_TRACE").is_some() {
+                eprintln!(
+                    "bootstrap prepare transaction: {} ms",
+                    prepare_started.elapsed().as_millis()
+                );
+            }
+            #[cfg(test)]
+            let advance_started = std::time::Instant::now();
             let (no_op, accepted_evidence) =
                 candidate.advance_detached_bootstrap_candidate(prepared.clone())?;
+            #[cfg(test)]
+            if std::env::var_os("TINE_ACTIVATION_TRACE").is_some() {
+                eprintln!(
+                    "bootstrap advance candidate: {} ms",
+                    advance_started.elapsed().as_millis()
+                );
+            }
             let engine_material = DetachedBootstrapAcceptedEngineMaterial {
                 no_op,
                 accepted_evidence,
@@ -4231,6 +4249,8 @@ pub struct ShardedHotEngine {
     #[cfg(test)]
     catalog_checkpoint_loads: Cell<CatalogCheckpointLoadStats>,
     #[cfg(test)]
+    read_only_catalog_clones: Cell<usize>,
+    #[cfg(test)]
     reference_source_observations: Cell<ReferenceSourceObservationStats>,
     #[cfg(test)]
     canonical_snapshot_calls: Cell<usize>,
@@ -4362,6 +4382,8 @@ impl ShardedHotEngine {
             replay_timing: Cell::new(ReplayTimingStats::default()),
             #[cfg(test)]
             catalog_checkpoint_loads: Cell::new(CatalogCheckpointLoadStats::default()),
+            #[cfg(test)]
+            read_only_catalog_clones: Cell::new(0),
             #[cfg(test)]
             reference_source_observations: Cell::new(ReferenceSourceObservationStats::default()),
             #[cfg(test)]
@@ -10405,17 +10427,19 @@ impl ShardedHotEngine {
         let mut working = BTreeMap::<DocumentId, EngineDocument>::new();
         let mut before_vectors = BTreeMap::<DocumentId, VersionVector>::new();
         let mut before_snapshots = BTreeMap::<DocumentId, SemanticDocumentSnapshot>::new();
+        let mut read_only_catalog = None;
         for operation in &transaction.operations {
             self.apply_author_operation(
                 &mut working,
                 &mut before_vectors,
                 &mut before_snapshots,
+                &mut read_only_catalog,
                 author.crdt_peer_id,
                 origin,
                 operation,
             )?;
         }
-        self.validate_logseq_identity_triggers(transaction, &working)?;
+        self.validate_logseq_identity_triggers(transaction, &working, &mut read_only_catalog)?;
 
         let affected: Vec<DocumentId> = working.keys().copied().collect();
         if matches!(origin, BatchOrigin::ExternalReconciliation { .. })
@@ -18546,6 +18570,7 @@ impl ShardedHotEngine {
         working: &mut BTreeMap<DocumentId, EngineDocument>,
         before_vectors: &mut BTreeMap<DocumentId, VersionVector>,
         before_snapshots: &mut BTreeMap<DocumentId, SemanticDocumentSnapshot>,
+        read_only_catalog: &mut Option<LoroDoc>,
         peer_id: CrdtPeerId,
         origin: BatchOrigin,
         operation: &SemanticOperation,
@@ -18655,7 +18680,8 @@ impl ShardedHotEngine {
                         "page preamble exceeds the semantic bound".into(),
                     ));
                 }
-                let page_document_id = self.page_home_from_working(working, *page_id)?;
+                let page_document_id =
+                    self.page_home_from_working(working, read_only_catalog, *page_id)?;
                 let was_working = working.contains_key(&page_document_id);
                 let shard = self.ensure_working_document(
                     working,
@@ -18709,7 +18735,8 @@ impl ShardedHotEngine {
                 order,
                 content,
             } => {
-                let page_home = self.page_home_from_working(working, *page_id)?;
+                let page_home =
+                    self.page_home_from_working(working, read_only_catalog, *page_id)?;
                 if block.home_document_id != page_home {
                     return Err(EngineError::InvalidTransaction(
                         "new block home must be its creation page shard".into(),
@@ -18842,8 +18869,10 @@ impl ShardedHotEngine {
                 parent,
                 order,
             } => {
-                let source_id = self.page_home_from_working(working, *from_page_id)?;
-                let destination_id = self.page_home_from_working(working, *to_page_id)?;
+                let source_id =
+                    self.page_home_from_working(working, read_only_catalog, *from_page_id)?;
+                let destination_id =
+                    self.page_home_from_working(working, read_only_catalog, *to_page_id)?;
                 let source = self.ensure_working_document(
                     working,
                     before_vectors,
@@ -18909,7 +18938,8 @@ impl ShardedHotEngine {
                 parent,
                 order,
             } => {
-                let page_document_id = self.page_home_from_working(working, *page_id)?;
+                let page_document_id =
+                    self.page_home_from_working(working, read_only_catalog, *page_id)?;
                 let page = self.ensure_working_document(
                     working,
                     before_vectors,
@@ -18928,7 +18958,8 @@ impl ShardedHotEngine {
                 root_block_id,
                 page_id,
             } => {
-                let page_document_id = self.page_home_from_working(working, *page_id)?;
+                let page_document_id =
+                    self.page_home_from_working(working, read_only_catalog, *page_id)?;
                 let page = self.ensure_working_document(
                     working,
                     before_vectors,
@@ -18994,7 +19025,8 @@ impl ShardedHotEngine {
                     }
                 }
                 for rewrite in page_preamble_rewrites {
-                    let page_document_id = self.page_home_from_working(working, rewrite.page_id)?;
+                    let page_document_id =
+                        self.page_home_from_working(working, read_only_catalog, rewrite.page_id)?;
                     let shard = self.ensure_working_document(
                         working,
                         before_vectors,
@@ -19060,6 +19092,7 @@ impl ShardedHotEngine {
                         working,
                         before_vectors,
                         before_snapshots,
+                        read_only_catalog,
                         peer_id,
                         origin,
                         &SemanticOperation::SetPagePreamble {
@@ -19073,6 +19106,7 @@ impl ShardedHotEngine {
                         working,
                         before_vectors,
                         before_snapshots,
+                        read_only_catalog,
                         peer_id,
                         origin,
                         &SemanticOperation::EditBlockContent {
@@ -19126,6 +19160,7 @@ impl ShardedHotEngine {
         &self,
         transaction: &OperationTransaction,
         working: &BTreeMap<DocumentId, EngineDocument>,
+        read_only_catalog: &mut Option<LoroDoc>,
     ) -> Result<(), EngineError> {
         let mut content_blocks = BTreeSet::new();
         for operation in &transaction.operations {
@@ -19158,12 +19193,10 @@ impl ShardedHotEngine {
             return Ok(());
         }
 
-        let loaded_catalog;
         let catalog = if let Some(catalog) = working.get(&self.catalog_document_id) {
             catalog.document()
         } else {
-            loaded_catalog = self.clone_visible_document(self.catalog_document_id, 1)?;
-            &loaded_catalog
+            self.read_only_catalog(read_only_catalog)?
         };
         let before_catalog = self.visible_documents.get(&self.catalog_document_id);
 
@@ -19255,20 +19288,35 @@ impl ShardedHotEngine {
     fn page_home_from_working(
         &self,
         working: &BTreeMap<DocumentId, EngineDocument>,
+        read_only_catalog: &mut Option<LoroDoc>,
         page_id: PageId,
     ) -> Result<DocumentId, EngineError> {
-        let loaded;
         let catalog = if let Some(catalog) = working.get(&self.catalog_document_id) {
             catalog.document()
         } else if self.scratch.is_some() {
-            loaded = self.clone_visible_document(self.catalog_document_id, 1)?;
-            &loaded
+            self.read_only_catalog(read_only_catalog)?
         } else {
             self.visible_documents
                 .get(&self.catalog_document_id)
                 .ok_or(EngineError::PageNotFound(page_id))?
         };
         Ok(require_live_page(catalog, page_id)?.home_document_id())
+    }
+
+    fn read_only_catalog<'a>(
+        &self,
+        read_only_catalog: &'a mut Option<LoroDoc>,
+    ) -> Result<&'a LoroDoc, EngineError> {
+        if read_only_catalog.is_none() {
+            let catalog = self.clone_visible_document(self.catalog_document_id, 1)?;
+            #[cfg(test)]
+            self.read_only_catalog_clones
+                .set(self.read_only_catalog_clones.get().saturating_add(1));
+            *read_only_catalog = Some(catalog);
+        }
+        Ok(read_only_catalog
+            .as_ref()
+            .expect("read-only catalog was populated"))
     }
 }
 
@@ -23665,6 +23713,193 @@ mod validation_tests {
     }
 
     #[test]
+    fn detached_content_prepare_memoizes_catalog_without_affecting_it() {
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(91_070));
+        let lineage = LineageDigest::of(b"detached-content-catalog-cache");
+        let catalog = DocumentId::from_uuid(Uuid::from_u128(91_071));
+        let page = PageId::from_uuid(Uuid::from_u128(91_072));
+        let missing_page = PageId::from_uuid(Uuid::from_u128(91_073));
+        let home = DocumentId::from_uuid(Uuid::from_u128(91_074));
+        let parent = BlockId::from_uuid(Uuid::from_u128(91_075));
+        let children = [
+            BlockId::from_uuid(Uuid::from_u128(91_076)),
+            BlockId::from_uuid(Uuid::from_u128(91_077)),
+            BlockId::from_uuid(Uuid::from_u128(91_078)),
+        ];
+        let import_id = ImportId::from_digest([0x46; 32]);
+        let declaration = create_page_with_block(
+            page,
+            home,
+            parent,
+            "Cached Catalog",
+            "pages/cached-catalog.md",
+        );
+        let first_evidence =
+            detached_evidence(import_id, 0, 3, None, declaration.operations.len() as u32);
+        let content = OperationTransaction::new(
+            children
+                .iter()
+                .enumerate()
+                .map(|(index, block_id)| SemanticOperation::CreateBlock {
+                    block: BlockLocation {
+                        block_id: *block_id,
+                        home_document_id: home,
+                    },
+                    page_id: page,
+                    parent: Some(parent),
+                    order: format!("child-{index}"),
+                    content: format!("child {index}"),
+                })
+                .collect(),
+        )
+        .unwrap();
+        let second_evidence = detached_evidence(
+            import_id,
+            1,
+            3,
+            Some(first_evidence.part_id()),
+            content.operations.len() as u32,
+        );
+        let deletion =
+            OperationTransaction::new(vec![SemanticOperation::DeletePage { page_id: page }])
+                .unwrap();
+        let third_evidence = detached_evidence(
+            import_id,
+            2,
+            3,
+            Some(second_evidence.part_id()),
+            deletion.operations.len() as u32,
+        );
+
+        let durable = TemporaryBootstrapCatalog::create(workspace, "catalog-cache");
+        let mut session = DetachedBootstrapAuthoringSession::new(
+            workspace,
+            lineage,
+            catalog,
+            ReferenceCatalogPolicyV1::default(),
+            durable.capability(),
+        )
+        .unwrap();
+        let declaration_before = session
+            .candidate
+            .as_ref()
+            .unwrap()
+            .read_only_catalog_clones
+            .get();
+        session
+            .author_part(
+                detached_author(first_evidence, 91_079),
+                &declaration,
+                first_evidence,
+            )
+            .unwrap();
+        let declaration_after = session
+            .candidate
+            .as_ref()
+            .unwrap()
+            .read_only_catalog_clones
+            .get();
+        assert_eq!(
+            declaration_after - declaration_before,
+            0,
+            "CreatePage followed by CreateBlock must resolve from the mutable catalog"
+        );
+
+        let content_before = session
+            .candidate
+            .as_ref()
+            .unwrap()
+            .read_only_catalog_clones
+            .get();
+        let authored_content = session
+            .author_part(
+                detached_author(second_evidence, 91_079),
+                &content,
+                second_evidence,
+            )
+            .unwrap();
+        let content_after = session
+            .candidate
+            .as_ref()
+            .unwrap()
+            .read_only_catalog_clones
+            .get();
+        assert_eq!(
+            content_after - content_before,
+            1,
+            "repeated page-home lookups must reconstruct the visible catalog once"
+        );
+        assert_eq!(
+            authored_content
+                .engine_material()
+                .accepted_evidence()
+                .affected_documents()
+                .iter()
+                .map(DocumentDependencies::document_id)
+                .collect::<Vec<_>>(),
+            vec![home]
+        );
+        assert_eq!(
+            authored_content
+                .prepared()
+                .objects()
+                .iter()
+                .filter(|object| object.kind() == ObjectKind::CrdtUpdate)
+                .map(OperationObject::document_id)
+                .collect::<Vec<_>>(),
+            vec![home],
+            "the read-only catalog must not emit a CRDT update"
+        );
+        let effect = authored_content
+            .prepared()
+            .objects()
+            .iter()
+            .find(|object| object.kind() == ObjectKind::SemanticEffect)
+            .map(|object| SemanticEffect::decode(object.payload()).unwrap())
+            .unwrap();
+        assert!(
+            effect.pages().is_empty(),
+            "the read-only catalog must not produce page semantic effects"
+        );
+
+        session
+            .author_part(
+                detached_author(third_evidence, 91_079),
+                &deletion,
+                third_evidence,
+            )
+            .unwrap();
+        let candidate = session.candidate.as_ref().unwrap();
+        let create_on = |page_id, block_id| {
+            OperationTransaction::new(vec![SemanticOperation::CreateBlock {
+                block: BlockLocation {
+                    block_id,
+                    home_document_id: home,
+                },
+                page_id,
+                parent: None,
+                order: "after-delete".into(),
+                content: "must fail".into(),
+            }])
+            .unwrap()
+        };
+        assert!(matches!(
+            candidate.prepare_bootstrap_transaction(
+                test_author(91_080, 91_079),
+                &create_on(page, BlockId::from_uuid(Uuid::from_u128(91_081))),
+            ),
+            Err(EngineError::PageDeleted(found)) if found == page
+        ));
+        assert!(matches!(
+            candidate.prepare_bootstrap_transaction(
+                test_author(91_082, 91_079),
+                &create_on(missing_page, BlockId::from_uuid(Uuid::from_u128(91_083))),
+            ),
+            Err(EngineError::PageNotFound(found)) if found == missing_page
+        ));
+    }
+
+    #[test]
     fn detached_bootstrap_direct_loaded_replay_matches_zero_and_dependent_authored_state() {
         let replay_case = |label: &str, multipart: bool| {
             let workspace = WorkspaceId::from_uuid(Uuid::new_v4());
@@ -27685,11 +27920,13 @@ mod validation_tests {
         let mut working = BTreeMap::new();
         let mut before_vectors = BTreeMap::new();
         let mut before_snapshots = BTreeMap::new();
+        let mut read_only_catalog = None;
         assert!(matches!(
             engine.apply_author_operation(
                 &mut working,
                 &mut before_vectors,
                 &mut before_snapshots,
+                &mut read_only_catalog,
                 CrdtPeerId::from_u64(68_005),
                 BatchOrigin::LocalMutation,
                 &operation.operations[0],
@@ -27702,6 +27939,7 @@ mod validation_tests {
                 &mut working,
                 &mut before_vectors,
                 &mut before_snapshots,
+                &mut read_only_catalog,
                 CrdtPeerId::from_u64(68_006),
                 BatchOrigin::ExternalReconciliation {
                     import_id: super::super::ImportId::derive(

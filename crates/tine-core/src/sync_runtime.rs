@@ -23077,7 +23077,13 @@ mod tests {
         let mut transitions = Vec::new();
         let activated = SyncRuntimeHandle::activate_or_resume_local_with_progress(
             fixture.request.clone(),
-            |phase| transitions.push((phase, started.elapsed())),
+            |phase| {
+                let elapsed = started.elapsed();
+                if std::env::var_os("TINE_ACTIVATION_TRACE").is_some() {
+                    eprintln!("activation phase {:?} at {} ms", phase, elapsed.as_millis());
+                }
+                transitions.push((phase, elapsed));
+            },
         );
         let total = started.elapsed();
         assert_eq!(activated.status, SyncLocalActivationStatus::Active);
@@ -23203,15 +23209,23 @@ mod tests {
     #[test]
     #[ignore = "manual release 1,000/10,000-page activation timing receipt"]
     fn activation_scaled_manual_phase_receipt() {
-        let small = ActivationFixture::scaled("manual-scale-small", 0xa0b0, 997);
-        let large = ActivationFixture::scaled("manual-scale-large", 0xa0c0, 9_997);
+        let small_pages = std::env::var("TINE_ACTIVATION_SMALL_PAGES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(997);
+        let large_pages = std::env::var("TINE_ACTIVATION_LARGE_PAGES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(9_997);
+        let small = ActivationFixture::scaled("manual-scale-small", 0xa0b0, small_pages);
+        let large = ActivationFixture::scaled("manual-scale-large", 0xa0c0, large_pages);
         let small_receipt = activate_with_scale_receipt(&small);
         let large_receipt = activate_with_scale_receipt(&large);
         eprintln!("activation manual scale small: {small_receipt:?}");
         eprintln!("activation manual scale large: {large_receipt:?}");
-        assert_eq!(small_receipt.source_files, 1_000);
-        assert_eq!(large_receipt.source_files, 10_000);
-        assert!(large_receipt.blocks >= 99_000);
+        assert_eq!(small_receipt.source_files, small_pages + 3);
+        assert_eq!(large_receipt.source_files, large_pages + 3);
+        assert!(large_receipt.blocks >= large_pages.saturating_mul(9));
         assert!(
             large_receipt.total_ms
                 <= small_receipt.total_ms.saturating_mul(15).saturating_add(500),

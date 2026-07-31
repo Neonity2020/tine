@@ -2907,6 +2907,8 @@ fn author_bootstrap_parts(
     let mut authored_operations = 0_u64;
 
     for ordinal in 0..part_count {
+        #[cfg(test)]
+        let part_started = Instant::now();
         let boundary = boundaries.next()?.ok_or_else(|| {
             BootstrapStreamingImportError::InvalidOperation(
                 "part-boundary spool ended early".into(),
@@ -3037,6 +3039,16 @@ fn author_bootstrap_parts(
         engine_materials.push(engine_material);
         predecessor = Some(evidence.part_id());
         drop(records);
+        #[cfg(test)]
+        if std::env::var_os("TINE_ACTIVATION_TRACE").is_some() {
+            eprintln!(
+                "bootstrap authored part {}/{}: {} operations in {} ms",
+                ordinal + 1,
+                part_count,
+                operation_count,
+                part_started.elapsed().as_millis()
+            );
+        }
     }
     if boundaries.next()?.is_some() || operations.next()?.is_some() {
         return Err(BootstrapStreamingImportError::InvalidOperation(
@@ -3259,6 +3271,13 @@ pub(crate) fn prepare_inactive_bootstrap_import(
     let source =
         prepare_bootstrap_source_protocol(workspace_id, &capture, &working, &mut instrumentation)?;
     instrumentation.source_protocol_micros = elapsed_micros(phase_started);
+    #[cfg(test)]
+    if std::env::var_os("TINE_ACTIVATION_TRACE").is_some() {
+        eprintln!(
+            "bootstrap source protocol: {} ms",
+            instrumentation.source_protocol_micros / 1_000
+        );
+    }
     let phase_started = Instant::now();
     let operations = spool_bootstrap_operations(
         &capture,
@@ -3268,10 +3287,24 @@ pub(crate) fn prepare_inactive_bootstrap_import(
         &mut instrumentation,
     )?;
     instrumentation.operation_spool_micros = elapsed_micros(phase_started);
+    #[cfg(test)]
+    if std::env::var_os("TINE_ACTIVATION_TRACE").is_some() {
+        eprintln!(
+            "bootstrap operation spool: {} ms",
+            instrumentation.operation_spool_micros / 1_000
+        );
+    }
     let phase_started = Instant::now();
     let part_count =
         partition_bootstrap_operation_spool(&operations, &working, &mut instrumentation)?;
     instrumentation.partition_micros = elapsed_micros(phase_started);
+    #[cfg(test)]
+    if std::env::var_os("TINE_ACTIVATION_TRACE").is_some() {
+        eprintln!(
+            "bootstrap partition: {} ms",
+            instrumentation.partition_micros / 1_000
+        );
+    }
     let graph_resource = graph.canonical_resource_id()?;
 
     // This is deliberately the final source action. Everything below owns only
@@ -3293,6 +3326,13 @@ pub(crate) fn prepare_inactive_bootstrap_import(
         &mut instrumentation,
     )?;
     instrumentation.detached_authoring_micros = elapsed_micros(phase_started);
+    #[cfg(test)]
+    if std::env::var_os("TINE_ACTIVATION_TRACE").is_some() {
+        eprintln!(
+            "bootstrap detached authoring: {} ms",
+            instrumentation.detached_authoring_micros / 1_000
+        );
+    }
 
     let profile_digest = BootstrapPartitionProfileV1::v1().digest();
     let initial_frontier = ArchiveLocalFrontierBindingV1::initial(source.import_id, profile_digest);
@@ -3345,6 +3385,13 @@ pub(crate) fn prepare_inactive_bootstrap_import(
     let decoded_commit = BootstrapAggregateCommitV1::decode(&sealed_commit)?;
     decoded_commit.validate_aggregate(&aggregate)?;
     instrumentation.preparation_sealing_micros = elapsed_micros(phase_started);
+    #[cfg(test)]
+    if std::env::var_os("TINE_ACTIVATION_TRACE").is_some() {
+        eprintln!(
+            "bootstrap preparation sealing: {} ms",
+            instrumentation.preparation_sealing_micros / 1_000
+        );
+    }
     let _ = fs::remove_dir_all(&working);
 
     Ok(InactiveBootstrapPreparedPublication {
