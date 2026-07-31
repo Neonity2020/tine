@@ -162,6 +162,8 @@ thread_local! {
         const { std::cell::Cell::new(false) };
     static DETACHED_BOOTSTRAP_FAIL_BEFORE_BATCH_FINISH: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    static DETACHED_BOOTSTRAP_BATCH_FINISH_COUNT: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -198,6 +200,14 @@ fn detached_bootstrap_batch_finish_hook() -> Result<(), StoreError> {
         }
     })
 }
+
+#[cfg(test)]
+fn note_detached_bootstrap_batch_finished() {
+    DETACHED_BOOTSTRAP_BATCH_FINISH_COUNT.with(|count| count.set(count.get().saturating_add(1)));
+}
+
+#[cfg(not(test))]
+fn note_detached_bootstrap_batch_finished() {}
 
 #[cfg(not(test))]
 fn detached_bootstrap_batch_finish_hook() -> Result<(), StoreError> {
@@ -1640,6 +1650,7 @@ impl DetachedBootstrapPublicationSession {
             };
         detached_bootstrap_batch_finish_hook()?;
         let physical = batch.finish().map_err(filesystem_error_without_collision)?;
+        note_detached_bootstrap_batch_finished();
         *state = DetachedBootstrapPublicationState::Finished;
         Ok(CompletedDetachedBootstrapPublication {
             physical,
@@ -7946,7 +7957,9 @@ fn publication_error(error: tine_storage::FilesystemError, collision: Collision)
     }
 }
 
-fn filesystem_error_without_collision(error: tine_storage::FilesystemError) -> StoreError {
+pub(crate) fn filesystem_error_without_collision(
+    error: tine_storage::FilesystemError,
+) -> StoreError {
     match error {
         tine_storage::FilesystemError::Io(error) => StoreError::Io(error),
         tine_storage::FilesystemError::UnsafeEntry(message) => StoreError::UnsafeEntry(message),
@@ -11032,15 +11045,41 @@ mod bootstrap_store_tests {
         let store = fixture.store();
         let capability = store.bootstrap_authoring_capability().unwrap();
         let (publication, indexes) = capability.begin_detached_authoring().unwrap();
+        DETACHED_BOOTSTRAP_BATCH_FINISH_COUNT.with(|count| count.set(0));
+        let detached_root = indexes
+            .logseq_claim_index()
+            .insert_many(
+                super::super::uuid_claim_index::LogseqClaimIndexRoot::empty(),
+                &BTreeMap::from([(b"detached key".to_vec(), b"detached value".to_vec())]),
+            )
+            .unwrap();
         let completed = publication.finish().unwrap();
-        assert_eq!(completed.publication_count(), 0);
+        assert_eq!(completed.publication_count(), 1);
+        assert_eq!(completed.existing_publication_count(), 0);
+        DETACHED_BOOTSTRAP_BATCH_FINISH_COUNT.with(|count| assert_eq!(count.get(), 1));
 
-        let name = crate::oplog::LogicalPageName::parse("Closed detached publisher").unwrap();
         assert!(matches!(
-            indexes.page_name_index().put_exact_name(&name),
+            indexes.logseq_claim_index().insert_many(
+                detached_root,
+                &BTreeMap::from([(b"post-finish key".to_vec(), b"value".to_vec())]),
+            ),
             Err(StoreError::Bootstrap(message)) if message.contains("closed")
         ));
-        capability.page_name_index().put_exact_name(&name).unwrap();
+
+        let ordinary_root = capability
+            .logseq_claim_index()
+            .insert_many(
+                super::super::uuid_claim_index::LogseqClaimIndexRoot::empty(),
+                &BTreeMap::from([(b"ordinary key".to_vec(), b"ordinary value".to_vec())]),
+            )
+            .unwrap();
+        assert_eq!(
+            capability
+                .logseq_claim_index()
+                .lookup(ordinary_root, b"ordinary key")
+                .unwrap(),
+            Some(b"ordinary value".to_vec())
+        );
     }
 
     fn stage_fixture_bootstrap_batch<'a>(

@@ -10,6 +10,8 @@ use super::{
     MANAGED_ENTITY_SET_VERSION,
 };
 
+pub use tine_storage::ContentDigest;
+
 pub const OPLOG_PROTOCOL_VERSION: u32 = 2;
 pub const OPERATION_SCHEMA_VERSION: u32 = 7;
 pub const OBJECT_ENVELOPE_SCHEMA_VERSION: u32 = 2;
@@ -77,10 +79,6 @@ macro_rules! digest_type {
     };
 }
 
-digest_type!(
-    /// SHA-256 identity of a complete encoded operation object.
-    ContentDigest
-);
 digest_type!(
     /// Immutable workspace lineage or genesis digest carried by every batch.
     LineageDigest

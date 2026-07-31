@@ -5581,6 +5581,9 @@ dependencies = [
  "cap-fs-ext",
  "cap-std",
  "libc",
+ "postcard",
+ "serde",
+ "sha2",
  "uuid",
  "windows-sys 0.61.2",
 ]
