@@ -10046,6 +10046,82 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "calibrated bootstrap-authoring trace"]
+    fn inactive_streaming_bootstrap_authoring_trace_calibrated() {
+        let file_count = std::env::var("TINE_BOOTSTRAP_TRACE_FILES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(100);
+        let owned = (0..file_count)
+            .map(|file_index| {
+                let path = format!("pages/trace-{file_index:04}.md");
+                let contents = (0..10)
+                    .map(|block_index| format!("- trace {file_index:04}/{block_index:02}\n"))
+                    .collect::<String>();
+                (path, contents)
+            })
+            .collect::<Vec<_>>();
+        let files = owned
+            .iter()
+            .map(|(path, contents)| (path.as_str(), contents.as_str()))
+            .collect::<Vec<_>>();
+        let (_root, prepared, _) = prepare_streaming_bootstrap("authoring-trace", &files);
+        eprintln!(
+            "bootstrap authoring trace files={} operations={} parts={} max_part_documents={} max_part_operations={} detached_authoring_ms={:.3}",
+            file_count,
+            prepared.instrumentation().operations,
+            prepared.instrumentation().parts,
+            prepared.instrumentation().max_part_documents,
+            prepared.instrumentation().peak_owned_part_operations,
+            prepared.instrumentation().detached_authoring_micros as f64 / 1_000.0,
+        );
+    }
+
+    #[test]
+    #[ignore = "1000-page structural bootstrap-authoring proof"]
+    fn inactive_streaming_bootstrap_1000_page_catalog_work_is_linear() {
+        const PAGE_COUNT: usize = 1_000;
+        let owned = (0..PAGE_COUNT)
+            .map(|index| {
+                (
+                    format!("pages/linear-{index:04}.md"),
+                    format!("- linear block {index:04}\n"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let files = owned
+            .iter()
+            .map(|(path, contents)| (path.as_str(), contents.as_str()))
+            .collect::<Vec<_>>();
+        let (_root, prepared, _) = prepare_streaming_bootstrap("authoring-linear-1000", &files);
+
+        assert_eq!(prepared.instrumentation().page_capsules, PAGE_COUNT as u64);
+        assert_eq!(prepared.instrumentation().parts, 17);
+        assert_eq!(prepared.aggregate().parts().len(), 17);
+        assert!(
+            prepared.instrumentation().peak_owned_part_operations
+                <= u64::from(MAX_OPERATIONS_PER_BOOTSTRAP_PART)
+        );
+        assert!(
+            prepared.instrumentation().max_part_manifest_bytes
+                <= BOOTSTRAP_STREAM_MAX_MANIFEST_BYTES as u64
+        );
+        assert!(
+            prepared.instrumentation().max_part_payload_descriptors
+                <= u64::from(MAX_OPERATIONS_PER_BOOTSTRAP_PART)
+        );
+
+        let work = prepared.candidate().bootstrap_catalog_work_stats();
+        assert_eq!(work.full_catalog_author_clones, 0);
+        assert_eq!(work.reference_fallback_document_reconstructions, 0);
+        assert_eq!(
+            work.authenticated_page_identity_lookups,
+            PAGE_COUNT * 3,
+            "author page-home resolution, prospective-reference validation, and reference-source preparation must each use one bounded authenticated point per page"
+        );
+    }
+
+    #[test]
     fn inactive_streaming_bootstrap_zero_source_is_canonical_and_sealed() {
         let (_root, prepared, _) = prepare_streaming_bootstrap("streaming-zero", &[]);
         assert!(prepared.aggregate().parts().is_empty());
@@ -10512,7 +10588,11 @@ mod tests {
 
     #[test]
     fn inactive_streaming_bootstrap_authors_4096_and_4097_operation_boundaries() {
-        for (block_count, expected_parts) in [(4095, 1), (4096, 2)] {
+        for (block_count, expected_operations) in [
+            (4_095, vec![1, 4_095]),
+            (4_096, vec![1, 4_096]),
+            (4_097, vec![1, 4_096, 1]),
+        ] {
             let mut source = String::new();
             for index in 0..block_count {
                 source.push_str(&format!("- block {index:04}\n"));
@@ -10520,23 +10600,19 @@ mod tests {
             let label = format!("streaming-author-boundary-{block_count}");
             let (_root, prepared, _) =
                 prepare_streaming_bootstrap(&label, &[("pages/boundary.md", &source)]);
-            assert_eq!(prepared.aggregate().parts().len(), expected_parts);
             assert_eq!(
-                prepared.aggregate().parts()[0]
+                prepared
+                    .aggregate()
+                    .parts()
+                    .iter()
+                    .map(|part| part
                     .evidence()
                     .operation_root()
-                    .operation_count(),
-                4096
+                    .operation_count())
+                    .collect::<Vec<_>>(),
+                expected_operations,
+                "the declaration phase is canonical and a huge page splits only at the hard content-operation bound"
             );
-            if expected_parts == 2 {
-                assert_eq!(
-                    prepared.aggregate().parts()[1]
-                        .evidence()
-                        .operation_root()
-                        .operation_count(),
-                    1
-                );
-            }
         }
     }
 
@@ -10838,7 +10914,10 @@ mod tests {
         let BuiltImportMaterial::Semantic(old) = old else {
             panic!("bootstrap differential unexpectedly produced formatting-only material");
         };
-        assert_eq!(streaming_operations, old.transaction.operations);
+        // The streaming profile intentionally authors all page declarations
+        // before content capsules. The materialized differential groups by
+        // operation kind, so equality is the semantic state produced below,
+        // not incidental transaction ordering across those two builders.
         let streaming_transaction =
             OperationTransaction::new(streaming_operations.clone()).unwrap();
         let canonical_snapshot = |transaction: &OperationTransaction| {

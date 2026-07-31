@@ -101,6 +101,7 @@ const MAX_EPHEMERAL_PORTABLE_PATHS: usize = 4_096;
 // deliberately not an object-store, receipt, or projection format.
 #[allow(dead_code)]
 const CURRENT_PATH_CURSOR_SCHEMA_VERSION: u32 = 2;
+const CURRENT_PATH_CATALOG_ROW_SCHEMA_VERSION: u32 = 2;
 #[allow(dead_code)]
 pub(crate) const MAX_CURRENT_PATH_CURSOR_PAGE_ROWS: usize = 1_024;
 #[allow(dead_code)]
@@ -286,12 +287,24 @@ struct CurrentPathCatalogTransition {
     catalog: CurrentPathCatalog,
 }
 
+/// Authenticated point evidence for one live catalog page.
+///
+/// Version 2 adds the immutable home so block-only authoring and validation
+/// can prove page identity without reconstructing the complete CRDT catalog.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CurrentPathCatalogStoredRow {
+    schema_version: u32,
     path: ManagedPath,
     kind: ManagedTextKind,
     accepted_name_digest: ContentDigest,
+    home_document_id: DocumentId,
+}
+
+#[derive(Default)]
+struct AuthorCatalogLookup {
+    document: Option<LoroDoc>,
+    page_homes: BTreeMap<PageId, DocumentId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1914,6 +1927,14 @@ pub(crate) struct DetachedBootstrapCandidate {
     last_part: Option<BootstrapPartId>,
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct BootstrapCatalogWorkStats {
+    pub(crate) authenticated_page_identity_lookups: usize,
+    pub(crate) full_catalog_author_clones: usize,
+    pub(crate) reference_fallback_document_reconstructions: usize,
+}
+
 #[allow(dead_code)]
 impl DetachedBootstrapCandidate {
     pub(crate) const fn part_count(&self) -> u32 {
@@ -1942,6 +1963,17 @@ impl DetachedBootstrapCandidate {
     /// recovered from this borrow.
     pub(crate) const fn accepted_engine(&self) -> &ShardedHotEngine {
         &self.engine
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bootstrap_catalog_work_stats(&self) -> BootstrapCatalogWorkStats {
+        let reference = self.engine.reference_source_observations.get();
+        BootstrapCatalogWorkStats {
+            authenticated_page_identity_lookups: reference.authenticated_page_identity_lookups,
+            full_catalog_author_clones: self.engine.read_only_catalog_clones.get(),
+            reference_fallback_document_reconstructions: reference
+                .fallback_document_reconstructions,
+        }
     }
 }
 
@@ -2108,24 +2140,40 @@ impl DetachedBootstrapAuthoringSession {
             }
 
             #[cfg(test)]
+            let trace_enabled = std::env::var_os("TINE_ACTIVATION_TRACE").is_some();
+            #[cfg(test)]
+            let before_prepare =
+                trace_enabled.then(|| BootstrapAuthoringTraceSnapshot::new(&candidate));
+            #[cfg(test)]
             let prepare_started = std::time::Instant::now();
             let prepared = candidate.prepare_bootstrap_transaction(author, transaction)?;
             #[cfg(test)]
-            if std::env::var_os("TINE_ACTIVATION_TRACE").is_some() {
+            if trace_enabled {
+                let after_prepare = BootstrapAuthoringTraceSnapshot::new(&candidate);
                 eprintln!(
-                    "bootstrap prepare transaction: {} ms",
-                    prepare_started.elapsed().as_millis()
+                    "bootstrap prepare transaction: ordinal={} operations={} elapsed_ms={:.3} {}",
+                    evidence.ordinal(),
+                    operation_count,
+                    prepare_started.elapsed().as_secs_f64() * 1_000.0,
+                    after_prepare.delta(before_prepare.as_ref().expect("trace snapshot exists")),
                 );
             }
+            #[cfg(test)]
+            let before_advance =
+                trace_enabled.then(|| BootstrapAuthoringTraceSnapshot::new(&candidate));
             #[cfg(test)]
             let advance_started = std::time::Instant::now();
             let (no_op, accepted_evidence) =
                 candidate.advance_detached_bootstrap_candidate(prepared.clone())?;
             #[cfg(test)]
-            if std::env::var_os("TINE_ACTIVATION_TRACE").is_some() {
+            if trace_enabled {
+                let after_advance = BootstrapAuthoringTraceSnapshot::new(&candidate);
                 eprintln!(
-                    "bootstrap advance candidate: {} ms",
-                    advance_started.elapsed().as_millis()
+                    "bootstrap advance candidate: ordinal={} operations={} elapsed_ms={:.3} {}",
+                    evidence.ordinal(),
+                    operation_count,
+                    advance_started.elapsed().as_secs_f64() * 1_000.0,
+                    after_advance.delta(before_advance.as_ref().expect("trace snapshot exists")),
                 );
             }
             let engine_material = DetachedBootstrapAcceptedEngineMaterial {
@@ -3689,6 +3737,90 @@ struct ReplayTimingStats {
 }
 
 #[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+struct BootstrapAuthoringTraceSnapshot {
+    validation_phase_nanos: [u128; 10],
+    replay_timing: ReplayTimingStats,
+    instrumentation: EngineInstrumentation,
+    acceptance_sequence: u64,
+    accepted_documents: u64,
+    visible_document_heads: usize,
+    detached_manifests: usize,
+    catalog_work: BootstrapCatalogWorkStats,
+}
+
+#[cfg(test)]
+impl BootstrapAuthoringTraceSnapshot {
+    fn new(engine: &ShardedHotEngine) -> Self {
+        Self {
+            validation_phase_nanos: engine.validation_phase_nanos,
+            replay_timing: engine.replay_timing.get(),
+            instrumentation: engine.instrumentation(),
+            acceptance_sequence: engine.next_acceptance_sequence,
+            accepted_documents: engine.accepted_frontier_root.document_count(),
+            visible_document_heads: engine.visible_document_heads.len(),
+            detached_manifests: engine.detached_accepted_manifests.len(),
+            catalog_work: BootstrapCatalogWorkStats {
+                authenticated_page_identity_lookups: engine
+                    .reference_source_observations
+                    .get()
+                    .authenticated_page_identity_lookups,
+                full_catalog_author_clones: engine.read_only_catalog_clones.get(),
+                reference_fallback_document_reconstructions: engine
+                    .reference_source_observations
+                    .get()
+                    .fallback_document_reconstructions,
+            },
+        }
+    }
+
+    fn delta(&self, before: &Self) -> String {
+        let phase_micros = std::array::from_fn::<_, 10, _>(|index| {
+            self.validation_phase_nanos[index].saturating_sub(before.validation_phase_nanos[index])
+                / 1_000
+        });
+        let replay = self.replay_timing.delta_since(before.replay_timing);
+        let before_catalog_work = before.catalog_work;
+        let after = self.instrumentation;
+        let before_instrumentation = before.instrumentation;
+        format!(
+            "phases_us={phase_micros:?} replay={replay:?} prepare_transactions={} prepare_head_visits={} author_clones={} author_clone_ops={} stage_clones={} stage_clone_ops={} structural_reuses={} point_reads={} state_read_bytes={} state_written_bytes={} external_flushes={} external_point_reads={} external_range_scans={} scratch_reads={} scratch_read_bytes={} scratch_syncs={} page_identity_lookups={} full_catalog_author_clones={} reference_fallback_reconstructions={} accepted_sequence={} accepted_documents={} visible_document_heads={} detached_manifests={}",
+            after.prepare_transactions.saturating_sub(before_instrumentation.prepare_transactions),
+            after.prepare_document_head_visits.saturating_sub(before_instrumentation.prepare_document_head_visits),
+            after.author_snapshot_clones.saturating_sub(before_instrumentation.author_snapshot_clones),
+            after.author_snapshot_clone_ops.saturating_sub(before_instrumentation.author_snapshot_clone_ops),
+            after.stage_snapshot_clones.saturating_sub(before_instrumentation.stage_snapshot_clones),
+            after.stage_snapshot_clone_ops.saturating_sub(before_instrumentation.stage_snapshot_clone_ops),
+            after.stage_structural_buffer_reuses.saturating_sub(before_instrumentation.stage_structural_buffer_reuses),
+            after.document_point_reads.saturating_sub(before_instrumentation.document_point_reads),
+            after.state_page_bytes_read.saturating_sub(before_instrumentation.state_page_bytes_read),
+            after.state_page_bytes_written.saturating_sub(before_instrumentation.state_page_bytes_written),
+            after.external_flushes.saturating_sub(before_instrumentation.external_flushes),
+            after.external_point_reads.saturating_sub(before_instrumentation.external_point_reads),
+            after.external_range_scans.saturating_sub(before_instrumentation.external_range_scans),
+            after.scratch_page_reads.saturating_sub(before_instrumentation.scratch_page_reads),
+            after.scratch_page_bytes_read.saturating_sub(before_instrumentation.scratch_page_bytes_read),
+            after.scratch_syncs.saturating_sub(before_instrumentation.scratch_syncs),
+            self.catalog_work
+                .authenticated_page_identity_lookups
+                .saturating_sub(before_catalog_work.authenticated_page_identity_lookups),
+            self.catalog_work
+                .full_catalog_author_clones
+                .saturating_sub(before_catalog_work.full_catalog_author_clones),
+            self.catalog_work
+                .reference_fallback_document_reconstructions
+                .saturating_sub(
+                    before_catalog_work.reference_fallback_document_reconstructions,
+                ),
+            self.acceptance_sequence,
+            self.accepted_documents,
+            self.visible_document_heads,
+            self.detached_manifests,
+        )
+    }
+}
+
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct CatalogCheckpointLoadStats {
     authenticated_exact: usize,
@@ -3703,10 +3835,55 @@ struct ReferenceSourceObservationStats {
     carried_new_shards: usize,
     carried_after_snapshots: usize,
     fallback_document_reconstructions: usize,
+    authenticated_page_identity_lookups: usize,
 }
 
 #[cfg(test)]
 impl ReplayTimingStats {
+    fn delta_since(self, before: Self) -> Self {
+        macro_rules! delta {
+            ($field:ident) => {
+                self.$field.saturating_sub(before.$field)
+            };
+        }
+        Self {
+            identity_portable_paths_nanos: delta!(identity_portable_paths_nanos),
+            identity_page_names_nanos: delta!(identity_page_names_nanos),
+            identity_binding_nanos: delta!(identity_binding_nanos),
+            identity_roles_nanos: delta!(identity_roles_nanos),
+            post_identity_conflict_terminal_nanos: delta!(post_identity_conflict_terminal_nanos),
+            claim_and_catalog_preparation_nanos: delta!(claim_and_catalog_preparation_nanos),
+            reference_catalog_source_nanos: delta!(reference_catalog_source_nanos),
+            reference_catalog_postings_patricia_nanos: delta!(
+                reference_catalog_postings_patricia_nanos
+            ),
+            exact_checkpoint_preparation_nanos: delta!(exact_checkpoint_preparation_nanos),
+            current_checkpoint_preparation_nanos: delta!(current_checkpoint_preparation_nanos),
+            durable_history_nanos: delta!(durable_history_nanos),
+            external_checkpoint_phase_calls: delta!(external_checkpoint_phase_calls),
+            external_checkpoint_nonempty_calls: delta!(external_checkpoint_nonempty_calls),
+            external_checkpoint_documents: delta!(external_checkpoint_documents),
+            checkpoint_chunks: delta!(checkpoint_chunks),
+            checkpoint_existing_hits: delta!(checkpoint_existing_hits),
+            checkpoint_staged_hits: delta!(checkpoint_staged_hits),
+            checkpoint_new_chunks: delta!(checkpoint_new_chunks),
+            blob_dedup_lsm_flushes: delta!(blob_dedup_lsm_flushes),
+            blob_dedup_lsm_insert_nanos: delta!(blob_dedup_lsm_insert_nanos),
+            checkpoint_chunk_digest_nanos: delta!(checkpoint_chunk_digest_nanos),
+            blob_dedup_lookup_nanos: delta!(blob_dedup_lookup_nanos),
+            checkpoint_blob_append_nanos: delta!(checkpoint_blob_append_nanos),
+            checkpoint_whole_digest_nanos: delta!(checkpoint_whole_digest_nanos),
+            loro_external_flush_nanos: delta!(loro_external_flush_nanos),
+            state_checkpoint_export_nanos: delta!(state_checkpoint_export_nanos),
+            external_witness_root_nanos: delta!(external_witness_root_nanos),
+            blob_tree_nanos: delta!(blob_tree_nanos),
+            external_record_validation_nanos: delta!(external_record_validation_nanos),
+            external_record_encoding_nanos: delta!(external_record_encoding_nanos),
+            external_exact_map_insert_nanos: delta!(external_exact_map_insert_nanos),
+            external_current_map_insert_nanos: delta!(external_current_map_insert_nanos),
+        }
+    }
+
     fn add_document_state_work(&mut self, work: &super::document_state::DocumentStateWork) {
         self.external_checkpoint_phase_calls = self
             .external_checkpoint_phase_calls
@@ -6522,6 +6699,15 @@ impl ShardedHotEngine {
         self.reference_source_observations.set(observations);
     }
 
+    #[cfg(test)]
+    fn record_authenticated_page_identity_lookup(&self) {
+        let mut observations = self.reference_source_observations.get();
+        observations.authenticated_page_identity_lookups = observations
+            .authenticated_page_identity_lookups
+            .saturating_add(1);
+        self.reference_source_observations.set(observations);
+    }
+
     pub fn instrumentation(&self) -> EngineInstrumentation {
         let work = self.history_work.get();
         let logseq_claims = self
@@ -6765,10 +6951,17 @@ impl ShardedHotEngine {
         kind: ManagedTextKind,
         accepted_name_digest: ContentDigest,
     ) {
+        let home_document_id = self
+            .authenticated_current_page_catalog_row(page_id)
+            .unwrap()
+            .expect("test replacement requires an existing current-page row")
+            .home_document_id;
         let encoded = encode_current_path_catalog_row(&CurrentPathCatalogStoredRow {
+            schema_version: CURRENT_PATH_CATALOG_ROW_SCHEMA_VERSION,
             path,
             kind,
             accepted_name_digest,
+            home_document_id,
         })
         .unwrap();
         self.current_path_catalog.root = self
@@ -6781,6 +6974,35 @@ impl ShardedHotEngine {
                 &encoded,
             )
             .unwrap();
+    }
+
+    /// One page's authenticated current catalog identity at the engine's exact
+    /// accepted frontier. The fixed-depth point trie avoids reconstructing the
+    /// growing CRDT catalog for block-only validation and authoring.
+    fn authenticated_current_page_catalog_row(
+        &self,
+        page_id: PageId,
+    ) -> Result<Option<CurrentPathCatalogStoredRow>, EngineError> {
+        let Some(store) = self.scratch.as_ref() else {
+            return Ok(None);
+        };
+        if !self.current_path_catalog.available
+            || self.current_path_catalog.accepted_frontier_root != self.accepted_frontier_root
+        {
+            return Err(EngineError::Archive(
+                "authenticated current-page catalog authority is unavailable or stale".into(),
+            ));
+        }
+        #[cfg(test)]
+        self.record_authenticated_page_identity_lookup();
+        store
+            .authenticated_catalog_lookup(
+                &self.current_path_catalog.root,
+                page_id.as_uuid().into_bytes(),
+            )
+            .map_err(|error| EngineError::Archive(error.to_string()))?
+            .map(|encoded| decode_current_path_catalog_row(&encoded))
+            .transpose()
     }
 
     /// Authenticated exact-path point lookup against the same current catalog
@@ -10579,7 +10801,7 @@ impl ShardedHotEngine {
         let mut working = BTreeMap::<DocumentId, EngineDocument>::new();
         let mut before_vectors = BTreeMap::<DocumentId, VersionVector>::new();
         let mut before_snapshots = BTreeMap::<DocumentId, SemanticDocumentSnapshot>::new();
-        let mut read_only_catalog = None;
+        let mut read_only_catalog = AuthorCatalogLookup::default();
         for operation in &transaction.operations {
             self.apply_author_operation(
                 &mut working,
@@ -16630,21 +16852,34 @@ impl ShardedHotEngine {
         let affected = affected_reference_sources(effect);
         let mut sources = BTreeMap::new();
         for page_id in affected {
-            let page_state = if let Some(catalog_pages) = observations.catalog_pages {
+            let page_identity = if let Some(catalog_pages) = observations.catalog_pages {
                 #[cfg(test)]
                 self.record_carried_reference_catalog_page();
-                catalog_pages.get(&page_id).cloned()
+                catalog_pages.get(&page_id).and_then(|state| match state {
+                    PageState::Live {
+                        path,
+                        home_document_id,
+                        ..
+                    } => Some((path.clone(), *home_document_id)),
+                    PageState::Tombstone { .. } => None,
+                })
+            } else if self.scratch.is_some() {
+                self.authenticated_current_page_catalog_row(page_id)?
+                    .map(|row| (row.path, row.home_document_id))
             } else {
                 let catalog =
                     self.reference_candidate_document(self.catalog_document_id, replacements)?;
                 validate_catalog_page(self.catalog_document_id, catalog.document(), page_id)?
+                    .and_then(|state| match state {
+                        PageState::Live {
+                            path,
+                            home_document_id,
+                            ..
+                        } => Some((path, home_document_id)),
+                        PageState::Tombstone { .. } => None,
+                    })
             };
-            let Some(PageState::Live {
-                path,
-                home_document_id,
-                ..
-            }) = page_state
-            else {
+            let Some((path, home_document_id)) = page_identity else {
                 sources.insert(page_id, None);
                 continue;
             };
@@ -18251,14 +18486,16 @@ impl ShardedHotEngine {
         let catalog;
         let loaded_pages;
         let pages = if let Some(pages) = validated_catalog_pages {
-            pages
+            Some(pages)
         } else if let Some(replacement) = replacements.get(&self.catalog_document_id) {
             loaded_pages = validate_catalog(self.catalog_document_id, replacement.document())?;
-            &loaded_pages
+            Some(&loaded_pages)
+        } else if self.scratch.is_some() {
+            None
         } else {
             catalog = self.clone_validation_document(self.catalog_document_id, 1)?;
             loaded_pages = validate_catalog(self.catalog_document_id, &catalog)?;
-            &loaded_pages
+            Some(&loaded_pages)
         };
 
         // A changed catalog entry must name an extant immutable home whose
@@ -18334,13 +18571,19 @@ impl ShardedHotEngine {
                 document_id: *document_id,
                 reason: "shard has no page identity".into(),
             })?;
-            let Some(page_state) = pages.get(&page_id) else {
+            let expected_home_document_id = if let Some(pages) = pages {
+                pages.get(&page_id).map(PageState::home_document_id)
+            } else {
+                self.authenticated_current_page_catalog_row(page_id)?
+                    .map(|row| row.home_document_id)
+            };
+            let Some(expected_home_document_id) = expected_home_document_id else {
                 return Err(EngineError::MalformedDocument {
                     document_id: *document_id,
                     reason: format!("shard identity references missing catalog page {page_id}"),
                 });
             };
-            if page_state.home_document_id() != *document_id {
+            if expected_home_document_id != *document_id {
                 return Err(EngineError::MalformedDocument {
                     document_id: *document_id,
                     reason: format!("shard identity {page_id} is not its catalog home"),
@@ -18729,7 +18972,7 @@ impl ShardedHotEngine {
         working: &mut BTreeMap<DocumentId, EngineDocument>,
         before_vectors: &mut BTreeMap<DocumentId, VersionVector>,
         before_snapshots: &mut BTreeMap<DocumentId, SemanticDocumentSnapshot>,
-        read_only_catalog: &mut Option<LoroDoc>,
+        read_only_catalog: &mut AuthorCatalogLookup,
         peer_id: CrdtPeerId,
         origin: BatchOrigin,
         operation: &SemanticOperation,
@@ -19319,7 +19562,7 @@ impl ShardedHotEngine {
         &self,
         transaction: &OperationTransaction,
         working: &BTreeMap<DocumentId, EngineDocument>,
-        read_only_catalog: &mut Option<LoroDoc>,
+        read_only_catalog: &mut AuthorCatalogLookup,
     ) -> Result<(), EngineError> {
         let mut content_blocks = BTreeSet::new();
         for operation in &transaction.operations {
@@ -19447,33 +19690,51 @@ impl ShardedHotEngine {
     fn page_home_from_working(
         &self,
         working: &BTreeMap<DocumentId, EngineDocument>,
-        read_only_catalog: &mut Option<LoroDoc>,
+        read_only_catalog: &mut AuthorCatalogLookup,
         page_id: PageId,
     ) -> Result<DocumentId, EngineError> {
-        let catalog = if let Some(catalog) = working.get(&self.catalog_document_id) {
-            catalog.document()
-        } else if self.scratch.is_some() {
-            self.read_only_catalog(read_only_catalog)?
-        } else {
-            self.visible_documents
-                .get(&self.catalog_document_id)
-                .ok_or(EngineError::PageNotFound(page_id))?
-        };
+        if let Some(catalog) = working.get(&self.catalog_document_id) {
+            return Ok(require_live_page(catalog.document(), page_id)?.home_document_id());
+        }
+        if self.scratch.is_some() {
+            if let Some(home_document_id) = read_only_catalog.page_homes.get(&page_id) {
+                return Ok(*home_document_id);
+            }
+            if let Some(row) = self.authenticated_current_page_catalog_row(page_id)? {
+                read_only_catalog
+                    .page_homes
+                    .insert(page_id, row.home_document_id);
+                return Ok(row.home_document_id);
+            }
+            let catalog = self.read_only_catalog(read_only_catalog)?;
+            return match read_page_state(catalog, page_id)? {
+                Some(PageState::Tombstone { .. }) => Err(EngineError::PageDeleted(page_id)),
+                None => Err(EngineError::PageNotFound(page_id)),
+                Some(PageState::Live { .. }) => Err(EngineError::Archive(
+                    "authenticated current-page catalog is missing a live page identity".into(),
+                )),
+            };
+        }
+        let catalog = self
+            .visible_documents
+            .get(&self.catalog_document_id)
+            .ok_or(EngineError::PageNotFound(page_id))?;
         Ok(require_live_page(catalog, page_id)?.home_document_id())
     }
 
     fn read_only_catalog<'a>(
         &self,
-        read_only_catalog: &'a mut Option<LoroDoc>,
+        read_only_catalog: &'a mut AuthorCatalogLookup,
     ) -> Result<&'a LoroDoc, EngineError> {
-        if read_only_catalog.is_none() {
+        if read_only_catalog.document.is_none() {
             let catalog = self.clone_visible_document(self.catalog_document_id, 1)?;
             #[cfg(test)]
             self.read_only_catalog_clones
                 .set(self.read_only_catalog_clones.get().saturating_add(1));
-            *read_only_catalog = Some(catalog);
+            read_only_catalog.document = Some(catalog);
         }
         Ok(read_only_catalog
+            .document
             .as_ref()
             .expect("read-only catalog was populated"))
     }
@@ -22579,11 +22840,16 @@ fn current_path_catalog_row_from_page_state(
 ) -> Option<CurrentPathCatalogStoredRow> {
     match state {
         PageState::Live {
-            name, path, kind, ..
+            name,
+            path,
+            kind,
+            home_document_id,
         } => Some(CurrentPathCatalogStoredRow {
+            schema_version: CURRENT_PATH_CATALOG_ROW_SCHEMA_VERSION,
             path: path.clone(),
             kind: *kind,
             accepted_name_digest: ContentDigest::of(name.as_str().as_bytes()),
+            home_document_id: *home_document_id,
         }),
         PageState::Tombstone { .. } => None,
     }
@@ -22600,7 +22866,9 @@ fn decode_current_path_catalog_row(
 ) -> Result<CurrentPathCatalogStoredRow, EngineError> {
     let row: CurrentPathCatalogStoredRow =
         postcard::from_bytes(encoded).map_err(|error| EngineError::Archive(error.to_string()))?;
-    if encode_current_path_catalog_row(&row)? != encoded {
+    if row.schema_version != CURRENT_PATH_CATALOG_ROW_SCHEMA_VERSION
+        || encode_current_path_catalog_row(&row)? != encoded
+    {
         return Err(EngineError::Archive(
             "current-path catalog row has non-canonical scratch encoding".into(),
         ));
@@ -23872,7 +24140,7 @@ mod validation_tests {
     }
 
     #[test]
-    fn detached_content_prepare_memoizes_catalog_without_affecting_it() {
+    fn detached_content_uses_authenticated_page_identity_without_affecting_catalog() {
         let workspace = WorkspaceId::from_uuid(Uuid::from_u128(91_070));
         let lineage = LineageDigest::of(b"detached-content-catalog-cache");
         let catalog = DocumentId::from_uuid(Uuid::from_u128(91_071));
@@ -23968,6 +24236,12 @@ mod validation_tests {
             .candidate
             .as_ref()
             .unwrap()
+            .reference_source_observations
+            .get();
+        let content_catalog_clones_before = session
+            .candidate
+            .as_ref()
+            .unwrap()
             .read_only_catalog_clones
             .get();
         let authored_content = session
@@ -23981,12 +24255,24 @@ mod validation_tests {
             .candidate
             .as_ref()
             .unwrap()
-            .read_only_catalog_clones
+            .reference_source_observations
             .get();
         assert_eq!(
-            content_after - content_before,
-            1,
-            "repeated page-home lookups must reconstruct the visible catalog once"
+            content_after.authenticated_page_identity_lookups
+                - content_before.authenticated_page_identity_lookups,
+            3,
+            "authoring, prospective-reference validation, and reference-source preparation each require one authenticated point lookup"
+        );
+        assert_eq!(
+            session
+                .candidate
+                .as_ref()
+                .unwrap()
+                .read_only_catalog_clones
+                .get()
+                - content_catalog_clones_before,
+            0,
+            "block-only detached authoring must not reconstruct the full catalog"
         );
         assert_eq!(
             authored_content
@@ -27628,6 +27914,28 @@ mod validation_tests {
     }
 
     #[test]
+    fn current_page_catalog_row_binds_home_evidence_schema() {
+        let row = CurrentPathCatalogStoredRow {
+            schema_version: CURRENT_PATH_CATALOG_ROW_SCHEMA_VERSION,
+            path: ManagedPath::parse("pages/schema.md").unwrap(),
+            kind: ManagedTextKind::Page,
+            accepted_name_digest: ContentDigest::of(b"Schema"),
+            home_document_id: DocumentId::from_uuid(Uuid::from_u128(310_180)),
+        };
+        let encoded = encode_current_path_catalog_row(&row).unwrap();
+        assert_eq!(decode_current_path_catalog_row(&encoded).unwrap(), row);
+
+        let stale = CurrentPathCatalogStoredRow {
+            schema_version: CURRENT_PATH_CATALOG_ROW_SCHEMA_VERSION - 1,
+            ..row
+        };
+        assert!(
+            decode_current_path_catalog_row(&encode_current_path_catalog_row(&stale).unwrap())
+                .is_err()
+        );
+    }
+
+    #[test]
     fn current_path_cursor_survives_reconstruction_and_later_block_only_transition() {
         let (root, mut engine, ids) = cursor_fixture(310_200, 1);
         let page_id = ids[0];
@@ -28079,7 +28387,7 @@ mod validation_tests {
         let mut working = BTreeMap::new();
         let mut before_vectors = BTreeMap::new();
         let mut before_snapshots = BTreeMap::new();
-        let mut read_only_catalog = None;
+        let mut read_only_catalog = AuthorCatalogLookup::default();
         assert!(matches!(
             engine.apply_author_operation(
                 &mut working,
@@ -35671,7 +35979,7 @@ mod replay_benchmark {
     }
 
     #[test]
-    fn divergent_current_reference_source_retains_authenticated_fallback() {
+    fn divergent_current_reference_source_retains_bounded_authenticated_fallback() {
         let workspace = WorkspaceId::from_uuid(Uuid::from_u128(969_000));
         let catalog = DocumentId::from_uuid(Uuid::from_u128(969_001));
         let page_id = PageId::from_uuid(Uuid::from_u128(969_002));
@@ -35790,7 +36098,8 @@ mod replay_benchmark {
             BatchDisposition::Accepted { .. }
         ));
         let exact_sources = receiver.reference_source_observations.get();
-        assert_eq!(exact_sources.fallback_document_reconstructions, 1);
+        assert_eq!(exact_sources.fallback_document_reconstructions, 0);
+        assert_eq!(exact_sources.authenticated_page_identity_lookups, 2);
         assert!(exact_sources.carried_shards >= 1);
         assert!(exact_sources.carried_after_snapshots >= 1);
 
@@ -35806,9 +36115,10 @@ mod replay_benchmark {
         ));
         let divergent_sources = receiver.reference_source_observations.get();
         assert_eq!(
-            divergent_sources.fallback_document_reconstructions, 2,
-            "the unchanged catalog and divergent replacement must both use fallback"
+            divergent_sources.fallback_document_reconstructions, 1,
+            "only the divergent replacement must reconstruct a document"
         );
+        assert_eq!(divergent_sources.authenticated_page_identity_lookups, 2);
         assert_eq!(
             divergent_sources.carried_shards, 0,
             "a divergent-current shard must not reuse its exact-after snapshot"
