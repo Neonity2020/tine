@@ -28021,7 +28021,7 @@ fn sync_projection_chain_required(chain: &[Dir]) -> io::Result<()> {
 }
 
 fn sync_projection_directory_required(dir: &Dir) -> io::Result<()> {
-    crate::directory_durability::sync_dir_required(dir)
+    tine_storage::sync_dir_required(dir)
 }
 
 #[cfg(unix)]

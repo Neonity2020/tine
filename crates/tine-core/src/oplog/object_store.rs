@@ -36,8 +36,8 @@ use sha2::{Digest, Sha256};
 use smallvec::SmallVec;
 use uuid::Uuid;
 
-use crate::directory_durability::ValidatedDirectorySync as PublicationDirSync;
 use crate::model::HandoffSafe;
+use tine_storage::ValidatedDirectorySync as PublicationDirSync;
 
 use super::enrollment::{EnrollmentBindingV1, ResumePointEnrollmentBinding};
 use super::hot_engine::RuntimeResumeSnapshot;
@@ -10681,7 +10681,7 @@ fn rename_noreplace(_dir: &Dir, _from: &str, _to: &str) -> std::io::Result<()> {
 }
 
 pub(crate) fn sync_dir_required(dir: &Dir) -> Result<(), StoreError> {
-    crate::directory_durability::sync_dir_required(dir).map_err(Into::into)
+    tine_storage::sync_dir_required(dir).map_err(Into::into)
 }
 
 #[cfg(test)]

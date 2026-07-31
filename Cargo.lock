@@ -5559,6 +5559,7 @@ dependencies = [
  "sha2",
  "slotmap",
  "smallvec",
+ "tine-storage",
  "unicode-normalization",
  "unicode-segmentation",
  "uuid",
@@ -5571,6 +5572,16 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "tine-storage"
+version = "0.6.5"
+dependencies = [
+ "cap-std",
+ "libc",
+ "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

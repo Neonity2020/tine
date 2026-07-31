@@ -1,4 +1,4 @@
-//! Shared directory-entry durability behavior for graph projections and oplog
+//! Directory-entry durability primitives shared by graph projections and oplog
 //! publication.
 //!
 //! Regular files are flushed by their callers before an atomic name operation.
@@ -17,8 +17,9 @@ use cap_std::fs::Dir;
 use std::fs;
 use std::io;
 
+/// A directory capability validated for a durable name-operation publication.
 #[cfg(windows)]
-pub(crate) struct ValidatedDirectorySync {
+pub struct ValidatedDirectorySync {
     // Retain the exact validated object for the whole publication. cap-std
     // opens directory capabilities without FILE_SHARE_DELETE, so this object
     // cannot be renamed or deleted underneath the operation.
@@ -26,8 +27,9 @@ pub(crate) struct ValidatedDirectorySync {
     entry_durability: WindowsDirectoryEntryDurability,
 }
 
+/// A directory capability validated for a durable name-operation publication.
 #[cfg(not(windows))]
-pub(crate) struct ValidatedDirectorySync<'a>(&'a Dir);
+pub struct ValidatedDirectorySync<'a>(&'a Dir);
 
 #[cfg(any(test, windows))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -37,7 +39,8 @@ enum WindowsDirectoryEntryDurability {
 
 #[cfg(windows)]
 impl ValidatedDirectorySync {
-    pub(crate) fn open(dir: &Dir) -> io::Result<Self> {
+    /// Validate and retain `dir` for the duration of a publication.
+    pub fn open(dir: &Dir) -> io::Result<Self> {
         use std::os::windows::fs::MetadataExt as _;
         use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
 
@@ -57,11 +60,13 @@ impl ValidatedDirectorySync {
         })
     }
 
-    pub(crate) fn preflight(&self) -> io::Result<()> {
+    /// Validate that directory synchronization can proceed.
+    pub fn preflight(&self) -> io::Result<()> {
         self.sync()
     }
 
-    pub(crate) fn sync(&self) -> io::Result<()> {
+    /// Synchronize the directory entry or report the platform durability limit.
+    pub fn sync(&self) -> io::Result<()> {
         match self.entry_durability {
             // This state is constructed only after the retained handle's clone,
             // metadata query, and exact-target validation have succeeded. It
@@ -74,15 +79,18 @@ impl ValidatedDirectorySync {
 
 #[cfg(unix)]
 impl<'a> ValidatedDirectorySync<'a> {
-    pub(crate) fn open(dir: &'a Dir) -> io::Result<Self> {
+    /// Validate and retain `dir` for the duration of a publication.
+    pub fn open(dir: &'a Dir) -> io::Result<Self> {
         Ok(Self(dir))
     }
 
-    pub(crate) fn preflight(&self) -> io::Result<()> {
+    /// Validate that directory synchronization can proceed.
+    pub fn preflight(&self) -> io::Result<()> {
         Ok(())
     }
 
-    pub(crate) fn sync(&self) -> io::Result<()> {
+    /// Synchronize the directory entry.
+    pub fn sync(&self) -> io::Result<()> {
         use std::os::fd::{AsFd as _, AsRawFd as _, FromRawFd as _};
 
         // cap-std may retain an O_PATH capability, which is suitable for openat
@@ -104,15 +112,18 @@ impl<'a> ValidatedDirectorySync<'a> {
 
 #[cfg(not(any(unix, windows)))]
 impl<'a> ValidatedDirectorySync<'a> {
-    pub(crate) fn open(dir: &'a Dir) -> io::Result<Self> {
+    /// Validate and retain `dir` for the duration of a publication.
+    pub fn open(dir: &'a Dir) -> io::Result<Self> {
         Ok(Self(dir))
     }
 
-    pub(crate) fn preflight(&self) -> io::Result<()> {
+    /// Validate that directory synchronization can proceed.
+    pub fn preflight(&self) -> io::Result<()> {
         Ok(())
     }
 
-    pub(crate) fn sync(&self) -> io::Result<()> {
+    /// Synchronize the directory entry.
+    pub fn sync(&self) -> io::Result<()> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "directory durability is unsupported on this target",
@@ -120,7 +131,8 @@ impl<'a> ValidatedDirectorySync<'a> {
     }
 }
 
-pub(crate) fn sync_dir_required(dir: &Dir) -> io::Result<()> {
+/// Synchronize `dir` after a required durable directory-entry update.
+pub fn sync_dir_required(dir: &Dir) -> io::Result<()> {
     ValidatedDirectorySync::open(dir)?.sync()
 }
 
