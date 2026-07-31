@@ -312,6 +312,29 @@ struct PendingAuthorDocuments {
     documents: BTreeMap<DocumentId, LoroDoc>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RetainedCatalogLane {
+    Visible,
+    Terminal,
+    TerminalFallbackVisible,
+}
+
+/// Process-only identity of the exact current catalog authority selected by
+/// validation. Content-only publications advance other documents without
+/// changing this frontier, while catalog publications and terminal-lane
+/// transitions necessarily change it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RetainedCatalogAuthority {
+    lane: RetainedCatalogLane,
+    peer_counters: Vec<CrdtPeerCounter>,
+    direct_heads: Vec<BatchId>,
+}
+
+struct RetainedValidatedCatalog {
+    authority: RetainedCatalogAuthority,
+    pages: Arc<BTreeMap<PageId, PageState>>,
+}
+
 struct PreparedTransactionParts {
     prepared: PreparedBatch,
     semantic_effect: SemanticEffect,
@@ -3561,6 +3584,14 @@ struct CatalogCheckpointLoadStats {
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct RetainedCatalogStats {
+    authenticated_loads: usize,
+    complete_validations: usize,
+    hits: usize,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct ReferenceSourceObservationStats {
     carried_catalog_pages: usize,
     carried_shards: usize,
@@ -4216,6 +4247,9 @@ pub struct ShardedHotEngine {
     // preparing the next bounded edit never snapshots accumulated CRDT history.
     spare_documents: RefCell<BTreeMap<DocumentId, LoroDoc>>,
     pending_author_documents: RefCell<Option<PendingAuthorDocuments>>,
+    /// An untrusted process-only derivative. Every lookup compares its key to
+    /// the canonical current catalog lane and exact frontier before reuse.
+    retained_validated_catalog: RefCell<Option<RetainedValidatedCatalog>>,
     visible_document_lru: VecDeque<DocumentId>,
     visible_document_heads: BTreeMap<DocumentId, BTreeSet<BatchId>>,
     // Lazily created only after the terminal latch. This CRDT frontier
@@ -4250,6 +4284,8 @@ pub struct ShardedHotEngine {
     catalog_checkpoint_loads: Cell<CatalogCheckpointLoadStats>,
     #[cfg(test)]
     read_only_catalog_clones: Cell<usize>,
+    #[cfg(test)]
+    retained_catalog_stats: Cell<RetainedCatalogStats>,
     #[cfg(test)]
     reference_source_observations: Cell<ReferenceSourceObservationStats>,
     #[cfg(test)]
@@ -4359,6 +4395,7 @@ impl ShardedHotEngine {
             visible_documents: BTreeMap::new(),
             spare_documents: RefCell::new(BTreeMap::new()),
             pending_author_documents: RefCell::new(None),
+            retained_validated_catalog: RefCell::new(None),
             visible_document_lru: VecDeque::new(),
             visible_document_heads: BTreeMap::new(),
             terminal_documents: BTreeMap::new(),
@@ -4384,6 +4421,8 @@ impl ShardedHotEngine {
             catalog_checkpoint_loads: Cell::new(CatalogCheckpointLoadStats::default()),
             #[cfg(test)]
             read_only_catalog_clones: Cell::new(0),
+            #[cfg(test)]
+            retained_catalog_stats: Cell::new(RetainedCatalogStats::default()),
             #[cfg(test)]
             reference_source_observations: Cell::new(ReferenceSourceObservationStats::default()),
             #[cfg(test)]
@@ -5776,6 +5815,7 @@ impl ShardedHotEngine {
         self.logseq_claim_root = record.logseq_claim_root;
         self.reference_catalog = reference_catalog;
         self.scratch_roots = snapshot.scratch_roots.clone();
+        self.retained_validated_catalog.borrow_mut().take();
         self.block_claim_root = snapshot.block_claim_root;
         self.accepted_frontier_root = snapshot.accepted_frontier_root.clone();
         self.next_acceptance_sequence = snapshot.next_acceptance_sequence;
@@ -6352,6 +6392,27 @@ impl ShardedHotEngine {
         let mut loads = self.catalog_checkpoint_loads.get();
         loads.current = loads.current.saturating_add(1);
         self.catalog_checkpoint_loads.set(loads);
+    }
+
+    #[cfg(test)]
+    fn record_retained_catalog_load(&self) {
+        let mut stats = self.retained_catalog_stats.get();
+        stats.authenticated_loads = stats.authenticated_loads.saturating_add(1);
+        self.retained_catalog_stats.set(stats);
+    }
+
+    #[cfg(test)]
+    fn record_retained_catalog_validation(&self) {
+        let mut stats = self.retained_catalog_stats.get();
+        stats.complete_validations = stats.complete_validations.saturating_add(1);
+        self.retained_catalog_stats.set(stats);
+    }
+
+    #[cfg(test)]
+    fn record_retained_catalog_hit(&self) {
+        let mut stats = self.retained_catalog_stats.get();
+        stats.hits = stats.hits.saturating_add(1);
+        self.retained_catalog_stats.set(stats);
     }
 
     #[cfg(test)]
@@ -17475,6 +17536,96 @@ impl ShardedHotEngine {
         }
     }
 
+    fn selected_catalog_lane_and_heads(&self) -> (RetainedCatalogLane, Vec<BatchId>) {
+        if self.is_blocked() {
+            if let Some(heads) = self.terminal_document_heads.get(&self.catalog_document_id) {
+                return (
+                    RetainedCatalogLane::Terminal,
+                    heads.iter().copied().collect(),
+                );
+            }
+            return (
+                RetainedCatalogLane::TerminalFallbackVisible,
+                self.visible_document_heads
+                    .get(&self.catalog_document_id)
+                    .into_iter()
+                    .flatten()
+                    .copied()
+                    .collect(),
+            );
+        }
+        (
+            RetainedCatalogLane::Visible,
+            self.visible_document_heads
+                .get(&self.catalog_document_id)
+                .into_iter()
+                .flatten()
+                .copied()
+                .collect(),
+        )
+    }
+
+    fn catalog_authority_from_document(
+        &self,
+        document: &LoroDoc,
+    ) -> Result<RetainedCatalogAuthority, EngineError> {
+        let (lane, direct_heads) = self.selected_catalog_lane_and_heads();
+        Ok(RetainedCatalogAuthority {
+            lane,
+            peer_counters: canonical_peer_counters(&document.oplog_vv())?,
+            direct_heads,
+        })
+    }
+
+    /// Return the canonical current authority without loading scratch bytes.
+    /// Catalog documents are deliberately retained hot after publication and
+    /// resume adoption. If that invariant is unavailable, refusing a hit is
+    /// conservative: the authenticated miss path below remains authoritative.
+    fn current_catalog_authority(&self) -> Result<Option<RetainedCatalogAuthority>, EngineError> {
+        let (lane, _) = self.selected_catalog_lane_and_heads();
+        let document = match lane {
+            RetainedCatalogLane::Visible | RetainedCatalogLane::TerminalFallbackVisible => {
+                self.visible_documents.get(&self.catalog_document_id)
+            }
+            RetainedCatalogLane::Terminal => self.terminal_documents.get(&self.catalog_document_id),
+        };
+        document
+            .map(|document| self.catalog_authority_from_document(document))
+            .transpose()
+    }
+
+    fn retained_validated_catalog_pages(
+        &self,
+    ) -> Result<Arc<BTreeMap<PageId, PageState>>, EngineError> {
+        let current_authority = self.current_catalog_authority()?;
+        if let Some(authority) = current_authority.as_ref() {
+            if let Some(retained) = self.retained_validated_catalog.borrow().as_ref() {
+                if &retained.authority == authority {
+                    #[cfg(test)]
+                    self.record_retained_catalog_hit();
+                    return Ok(Arc::clone(&retained.pages));
+                }
+            }
+        }
+
+        // A mismatch never consults retained material. Reconstruct through the
+        // existing authenticated current-document path, then completely
+        // validate before installing the process-only derivative.
+        self.retained_validated_catalog.borrow_mut().take();
+        #[cfg(test)]
+        self.record_retained_catalog_load();
+        let catalog = self.clone_validation_document(self.catalog_document_id, 1)?;
+        #[cfg(test)]
+        self.record_retained_catalog_validation();
+        let pages = Arc::new(validate_catalog(self.catalog_document_id, &catalog)?);
+        let authority = self.catalog_authority_from_document(&catalog)?;
+        *self.retained_validated_catalog.borrow_mut() = Some(RetainedValidatedCatalog {
+            authority,
+            pages: Arc::clone(&pages),
+        });
+        Ok(pages)
+    }
+
     fn load_external_validation_document(
         &self,
         document_id: DocumentId,
@@ -18097,9 +18248,8 @@ impl ShardedHotEngine {
             loaded_pages = validate_catalog(self.catalog_document_id, replacement.document())?;
             &loaded_pages
         } else {
-            catalog = self.clone_validation_document(self.catalog_document_id, 1)?;
-            loaded_pages = validate_catalog(self.catalog_document_id, &catalog)?;
-            &loaded_pages
+            catalog = self.retained_validated_catalog_pages()?;
+            &catalog
         };
 
         // A changed catalog entry must name an extant immutable home whose
@@ -19288,19 +19438,14 @@ impl ShardedHotEngine {
     fn page_home_from_working(
         &self,
         working: &BTreeMap<DocumentId, EngineDocument>,
-        read_only_catalog: &mut Option<LoroDoc>,
+        _read_only_catalog: &mut Option<LoroDoc>,
         page_id: PageId,
     ) -> Result<DocumentId, EngineError> {
-        let catalog = if let Some(catalog) = working.get(&self.catalog_document_id) {
-            catalog.document()
-        } else if self.scratch.is_some() {
-            self.read_only_catalog(read_only_catalog)?
-        } else {
-            self.visible_documents
-                .get(&self.catalog_document_id)
-                .ok_or(EngineError::PageNotFound(page_id))?
-        };
-        Ok(require_live_page(catalog, page_id)?.home_document_id())
+        if let Some(catalog) = working.get(&self.catalog_document_id) {
+            return Ok(require_live_page(catalog.document(), page_id)?.home_document_id());
+        }
+        let pages = self.retained_validated_catalog_pages()?;
+        Ok(require_live_page_state(&pages, page_id)?.home_document_id())
     }
 
     fn read_only_catalog<'a>(
@@ -22457,6 +22602,17 @@ fn require_live_page(document: &LoroDoc, page_id: PageId) -> Result<PageState, E
     }
 }
 
+fn require_live_page_state<'a>(
+    pages: &'a BTreeMap<PageId, PageState>,
+    page_id: PageId,
+) -> Result<&'a PageState, EngineError> {
+    match pages.get(&page_id) {
+        Some(state @ PageState::Live { .. }) => Ok(state),
+        Some(PageState::Tombstone { .. }) => Err(EngineError::PageDeleted(page_id)),
+        None => Err(EngineError::PageNotFound(page_id)),
+    }
+}
+
 fn insert_page_state(
     document: &LoroDoc,
     page_id: PageId,
@@ -23713,7 +23869,7 @@ mod validation_tests {
     }
 
     #[test]
-    fn detached_content_prepare_memoizes_catalog_without_affecting_it() {
+    fn detached_content_parts_retain_exact_validated_catalog_without_affecting_batches() {
         let workspace = WorkspaceId::from_uuid(Uuid::from_u128(91_070));
         let lineage = LineageDigest::of(b"detached-content-catalog-cache");
         let catalog = DocumentId::from_uuid(Uuid::from_u128(91_071));
@@ -23734,9 +23890,7 @@ mod validation_tests {
             "Cached Catalog",
             "pages/cached-catalog.md",
         );
-        let first_evidence =
-            detached_evidence(import_id, 0, 3, None, declaration.operations.len() as u32);
-        let content = OperationTransaction::new(
+        let first_content = OperationTransaction::new(
             children
                 .iter()
                 .enumerate()
@@ -23753,23 +23907,55 @@ mod validation_tests {
                 .collect(),
         )
         .unwrap();
-        let second_evidence = detached_evidence(
-            import_id,
-            1,
-            3,
-            Some(first_evidence.part_id()),
-            content.operations.len() as u32,
-        );
+        let second_content = OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
+            block: BlockLocation {
+                block_id: children[0],
+                home_document_id: home,
+            },
+            content: "edited across part two".into(),
+        }])
+        .unwrap();
+        let third_content = OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
+            block: BlockLocation {
+                block_id: children[1],
+                home_document_id: home,
+            },
+            content: "edited across part three".into(),
+        }])
+        .unwrap();
+        let moved_path = ManagedPath::parse("pages/cached-catalog-moved.md").unwrap();
+        let catalog_mutation = OperationTransaction::new(vec![SemanticOperation::EditPagePath {
+            page_id: page,
+            path: moved_path.clone(),
+        }])
+        .unwrap();
         let deletion =
             OperationTransaction::new(vec![SemanticOperation::DeletePage { page_id: page }])
                 .unwrap();
-        let third_evidence = detached_evidence(
-            import_id,
-            2,
-            3,
-            Some(second_evidence.part_id()),
-            deletion.operations.len() as u32,
-        );
+        let transactions = [
+            &declaration,
+            &first_content,
+            &second_content,
+            &third_content,
+            &catalog_mutation,
+            &deletion,
+        ];
+        let mut predecessor = None;
+        let evidences = transactions
+            .iter()
+            .enumerate()
+            .map(|(ordinal, transaction)| {
+                let evidence = detached_evidence(
+                    import_id,
+                    ordinal as u32,
+                    transactions.len() as u32,
+                    predecessor,
+                    transaction.operations.len() as u32,
+                );
+                predecessor = Some(evidence.part_id());
+                evidence
+            })
+            .collect::<Vec<_>>();
 
         let durable = TemporaryBootstrapCatalog::create(workspace, "catalog-cache");
         let mut session = DetachedBootstrapAuthoringSession::new(
@@ -23780,95 +23966,139 @@ mod validation_tests {
             durable.capability(),
         )
         .unwrap();
-        let declaration_before = session
-            .candidate
-            .as_ref()
-            .unwrap()
-            .read_only_catalog_clones
-            .get();
-        session
+        let mut retained_observations = Vec::new();
+        let declaration_part = session
             .author_part(
-                detached_author(first_evidence, 91_079),
-                &declaration,
-                first_evidence,
+                detached_author(evidences[0], 91_079),
+                transactions[0],
+                evidences[0],
             )
             .unwrap();
-        let declaration_after = session
-            .candidate
-            .as_ref()
-            .unwrap()
-            .read_only_catalog_clones
-            .get();
-        assert_eq!(
-            declaration_after - declaration_before,
-            0,
-            "CreatePage followed by CreateBlock must resolve from the mutable catalog"
-        );
-
-        let content_before = session
-            .candidate
-            .as_ref()
-            .unwrap()
-            .read_only_catalog_clones
-            .get();
-        let authored_content = session
-            .author_part(
-                detached_author(second_evidence, 91_079),
-                &content,
-                second_evidence,
-            )
-            .unwrap();
-        let content_after = session
-            .candidate
-            .as_ref()
-            .unwrap()
-            .read_only_catalog_clones
-            .get();
-        assert_eq!(
-            content_after - content_before,
-            1,
-            "repeated page-home lookups must reconstruct the visible catalog once"
-        );
-        assert_eq!(
-            authored_content
+        retained_observations.push((
+            encoded_prepared(declaration_part.prepared()),
+            declaration_part
                 .engine_material()
                 .accepted_evidence()
                 .affected_documents()
                 .iter()
                 .map(DocumentDependencies::document_id)
                 .collect::<Vec<_>>(),
-            vec![home]
-        );
-        assert_eq!(
-            authored_content
+            declaration_part
                 .prepared()
                 .objects()
                 .iter()
-                .filter(|object| object.kind() == ObjectKind::CrdtUpdate)
-                .map(OperationObject::document_id)
-                .collect::<Vec<_>>(),
-            vec![home],
-            "the read-only catalog must not emit a CRDT update"
-        );
-        let effect = authored_content
-            .prepared()
-            .objects()
-            .iter()
-            .find(|object| object.kind() == ObjectKind::SemanticEffect)
-            .map(|object| SemanticEffect::decode(object.payload()).unwrap())
-            .unwrap();
-        assert!(
-            effect.pages().is_empty(),
-            "the read-only catalog must not produce page semantic effects"
+                .find(|object| object.kind() == ObjectKind::SemanticEffect)
+                .map(|object| SemanticEffect::decode(object.payload()).unwrap())
+                .unwrap(),
+        ));
+        let declaration_stats = session
+            .candidate
+            .as_ref()
+            .unwrap()
+            .retained_catalog_stats
+            .get();
+        assert_eq!(
+            declaration_stats,
+            RetainedCatalogStats::default(),
+            "CreatePage followed by CreateBlock must use the mutable catalog"
         );
 
-        session
-            .author_part(
-                detached_author(third_evidence, 91_079),
-                &deletion,
-                third_evidence,
-            )
+        for index in 1..=3 {
+            let authored = session
+                .author_part(
+                    detached_author(evidences[index], 91_079),
+                    transactions[index],
+                    evidences[index],
+                )
+                .unwrap();
+            let affected = authored
+                .engine_material()
+                .accepted_evidence()
+                .affected_documents()
+                .iter()
+                .map(DocumentDependencies::document_id)
+                .collect::<Vec<_>>();
+            let effect = authored
+                .prepared()
+                .objects()
+                .iter()
+                .find(|object| object.kind() == ObjectKind::SemanticEffect)
+                .map(|object| SemanticEffect::decode(object.payload()).unwrap())
+                .unwrap();
+            assert_eq!(affected, vec![home]);
+            assert!(effect.pages().is_empty());
+            assert_eq!(
+                authored
+                    .prepared()
+                    .objects()
+                    .iter()
+                    .filter(|object| object.kind() == ObjectKind::CrdtUpdate)
+                    .map(OperationObject::document_id)
+                    .collect::<Vec<_>>(),
+                vec![home],
+                "retained catalog reads must not emit catalog CRDT updates"
+            );
+            retained_observations.push((encoded_prepared(authored.prepared()), affected, effect));
+        }
+        let content_stats = session
+            .candidate
+            .as_ref()
+            .unwrap()
+            .retained_catalog_stats
+            .get();
+        assert_eq!(content_stats.authenticated_loads, 1);
+        assert_eq!(content_stats.complete_validations, 1);
+        assert!(content_stats.hits >= 3);
+
+        let materialized = session
+            .candidate
+            .as_ref()
+            .unwrap()
+            .materialize_page(page)
             .unwrap();
+        let contents = materialized
+            .blocks
+            .into_iter()
+            .map(|block| (block.block_id, block.content))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(contents[&children[0]], "edited across part two");
+        assert_eq!(contents[&children[1]], "edited across part three");
+
+        for index in 4..=5 {
+            let authored = session
+                .author_part(
+                    detached_author(evidences[index], 91_079),
+                    transactions[index],
+                    evidences[index],
+                )
+                .unwrap();
+            retained_observations.push((
+                encoded_prepared(authored.prepared()),
+                authored
+                    .engine_material()
+                    .accepted_evidence()
+                    .affected_documents()
+                    .iter()
+                    .map(DocumentDependencies::document_id)
+                    .collect::<Vec<_>>(),
+                authored
+                    .prepared()
+                    .objects()
+                    .iter()
+                    .find(|object| object.kind() == ObjectKind::SemanticEffect)
+                    .map(|object| SemanticEffect::decode(object.payload()).unwrap())
+                    .unwrap(),
+            ));
+            if index == 4 {
+                let candidate = session.candidate.as_ref().unwrap();
+                let pages = candidate.retained_validated_catalog_pages().unwrap();
+                assert_eq!(pages[&page].path(), Some(&moved_path));
+                let stats = candidate.retained_catalog_stats.get();
+                assert_eq!(stats.authenticated_loads, 2);
+                assert_eq!(stats.complete_validations, 2);
+            }
+        }
+
         let candidate = session.candidate.as_ref().unwrap();
         let create_on = |page_id, block_id| {
             OperationTransaction::new(vec![SemanticOperation::CreateBlock {
@@ -23897,6 +24127,128 @@ mod validation_tests {
             ),
             Err(EngineError::PageNotFound(found)) if found == missing_page
         ));
+        let terminal_stats = candidate.retained_catalog_stats.get();
+        assert_eq!(terminal_stats.authenticated_loads, 3);
+        assert_eq!(terminal_stats.complete_validations, 3);
+        session.finish().unwrap();
+
+        let uncached_durable = TemporaryBootstrapCatalog::create(workspace, "catalog-no-cache");
+        let mut uncached = DetachedBootstrapAuthoringSession::new(
+            workspace,
+            lineage,
+            catalog,
+            ReferenceCatalogPolicyV1::default(),
+            uncached_durable.capability(),
+        )
+        .unwrap();
+        let mut uncached_observations = Vec::new();
+        for (index, transaction) in transactions.iter().enumerate() {
+            uncached
+                .candidate
+                .as_ref()
+                .unwrap()
+                .retained_validated_catalog
+                .borrow_mut()
+                .take();
+            let authored = uncached
+                .author_part(
+                    detached_author(evidences[index], 91_079),
+                    transaction,
+                    evidences[index],
+                )
+                .unwrap();
+            uncached_observations.push((
+                encoded_prepared(authored.prepared()),
+                authored
+                    .engine_material()
+                    .accepted_evidence()
+                    .affected_documents()
+                    .iter()
+                    .map(DocumentDependencies::document_id)
+                    .collect::<Vec<_>>(),
+                authored
+                    .prepared()
+                    .objects()
+                    .iter()
+                    .find(|object| object.kind() == ObjectKind::SemanticEffect)
+                    .map(|object| SemanticEffect::decode(object.payload()).unwrap())
+                    .unwrap(),
+            ));
+        }
+        assert_eq!(retained_observations, uncached_observations);
+        uncached.finish().unwrap();
+    }
+
+    #[test]
+    fn retained_catalog_miss_preserves_complete_malformed_catalog_failure() {
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(91_090));
+        let catalog_id = DocumentId::from_uuid(Uuid::from_u128(91_091));
+        let mut engine = ShardedHotEngine::new(
+            workspace,
+            LineageDigest::of(b"retained-malformed-catalog"),
+            catalog_id,
+        );
+        let catalog = LoroDoc::new();
+        catalog.set_peer_id(91_092).unwrap();
+        engine.visible_documents.insert(catalog_id, catalog);
+        assert!(engine
+            .retained_validated_catalog_pages()
+            .unwrap()
+            .is_empty());
+        engine.visible_documents[&catalog_id]
+            .get_map("unexpected-catalog-root")
+            .insert("value", true)
+            .unwrap();
+        let expected =
+            validate_catalog(catalog_id, &engine.visible_documents[&catalog_id]).unwrap_err();
+        let actual = engine.retained_validated_catalog_pages().unwrap_err();
+        assert_eq!(actual, expected);
+        assert!(engine.retained_validated_catalog.borrow().is_none());
+        assert_eq!(
+            engine.retained_catalog_stats.get(),
+            RetainedCatalogStats {
+                authenticated_loads: 2,
+                complete_validations: 2,
+                hits: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn retained_catalog_key_tracks_terminal_lane_fallback() {
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(91_095));
+        let catalog_id = DocumentId::from_uuid(Uuid::from_u128(91_096));
+        let mut engine = ShardedHotEngine::new(
+            workspace,
+            LineageDigest::of(b"retained-terminal-catalog-lane"),
+            catalog_id,
+        );
+        let catalog = LoroDoc::new();
+        catalog.set_peer_id(91_097).unwrap();
+        engine.visible_documents.insert(catalog_id, catalog);
+        engine.retained_validated_catalog_pages().unwrap();
+
+        engine.fatal_handle = Some(FatalEvidenceHandle::default());
+        engine.retained_validated_catalog_pages().unwrap();
+
+        assert_eq!(
+            engine.retained_catalog_stats.get(),
+            RetainedCatalogStats {
+                authenticated_loads: 2,
+                complete_validations: 2,
+                hits: 0,
+            }
+        );
+        assert_eq!(
+            engine
+                .retained_validated_catalog
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .authority
+                .lane,
+            RetainedCatalogLane::TerminalFallbackVisible
+        );
     }
 
     #[test]
