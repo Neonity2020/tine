@@ -265,7 +265,7 @@ async function openSyncSettings() {
     "Backups & recovery",
     "Backups & recovery settings tab",
   );
-  await assertVisible("Managed sync", "managed-sync settings");
+  await assertVisible("Storage & sync", "storage-and-sync settings");
 }
 
 async function closeSettings() {
@@ -436,8 +436,8 @@ try {
 
   phase = "activate sparse v2";
   await openSyncSettings();
-  await clickButtonAndConfirm("Enable sparse v2", "enable-sparse-v2");
-  await assertVisible("Active · sparse v2", "active sparse-v2 authority status");
+  await clickButtonAndConfirm("Enable Tine-managed storage...", "enable-tine-managed-storage");
+  await assertVisible("Tine-managed storage active", "active Tine-managed storage status");
   await closeSettings();
 
   phase = "sparse v2 inventory and existing-page save";
@@ -478,8 +478,8 @@ try {
 
   phase = "return to standard Markdown mode";
   await openSyncSettings();
-  await clickButtonAndConfirm("Return to standard Markdown mode", "return-to-standard-markdown");
-  await assertVisible("Enable sparse v2", "standard Markdown authority status");
+  await clickButtonAndConfirm("Return to Direct Markdown", "return-to-direct-markdown");
+  await assertVisible("Enable Tine-managed storage...", "Direct Markdown status");
   await closeSettings();
 
   phase = "standard Markdown save and restart";

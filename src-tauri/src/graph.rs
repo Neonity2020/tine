@@ -158,12 +158,12 @@ fn refuse_unclaimed_sparse_archive(root: &Path) -> Result<(), String> {
     let archive = root.join(".tine-sync/v2");
     match std::fs::symlink_metadata(&archive) {
         Ok(_) => Err(
-            "sparse-v2 archive exists without its private app-data binding; legacy graph open refused"
+            "Tine-managed storage data exists without its required local recovery information, so this graph could not be opened safely."
                 .into(),
         ),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(format!(
-            "couldn't inspect sparse-v2 archive before legacy graph open: {error}"
+            "Couldn't verify Tine-managed storage data before opening this graph: {error}"
         )),
     }
 }
@@ -646,7 +646,7 @@ mod tests {
         std::fs::create_dir_all(dir.join(".tine-sync/v2")).unwrap();
         assert_eq!(
             refuse_unclaimed_sparse_archive(&dir).unwrap_err(),
-            "sparse-v2 archive exists without its private app-data binding; legacy graph open refused"
+            "Tine-managed storage data exists without its required local recovery information, so this graph could not be opened safely."
         );
         let _ = std::fs::remove_dir_all(dir);
     }

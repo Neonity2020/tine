@@ -932,11 +932,11 @@ export function mockBackend(): Backend {
         status: sparseV2,
         binding_generation: sparseV2.binding_generation,
         recovery_statement:
-          "Standard Markdown mode is active. The complete private sparse-v2 state was preserved in app recovery storage.",
+          "Direct Markdown is active. Complete recovery state was preserved.",
       };
     },
     async prepareSparseV2Share() {
-      if (!sparseV2.runtime) throw new Error("sparse v2 is not active");
+      if (!sparseV2.runtime) throw new Error("Tine-managed storage is not active");
       sparseV2 = {
         ...sparseV2,
         runtime: {
@@ -948,7 +948,7 @@ export function mockBackend(): Backend {
       return sparseV2;
     },
     async joinSparseV2Shared() {
-      if (!sparseV2.runtime) throw new Error("sparse v2 is not active");
+      if (!sparseV2.runtime) throw new Error("Tine-managed storage is not active");
       sparseV2 = {
         ...sparseV2,
         runtime: {
@@ -972,7 +972,7 @@ export function mockBackend(): Backend {
       return { state: "idle", detail: null, epoch: null };
     },
     async sparseV2CleanShutdown() {
-      if (!sparseV2.runtime) throw new Error("sparse v2 is not active");
+      if (!sparseV2.runtime) throw new Error("Tine-managed storage is not active");
       const runtime = { ...sparseV2.runtime, lifecycle: "stopped_safe" as const };
       sparseV2 = {
         ...sparseV2,

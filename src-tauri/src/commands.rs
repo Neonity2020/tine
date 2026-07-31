@@ -254,9 +254,9 @@ fn map_sparse_page_inventory(
 ) -> Result<Vec<PageEntry>, String> {
     match outcome {
         SyncApplicationPageInventoryOutcome::Loaded { pages } => Ok(pages),
-        SyncApplicationPageInventoryOutcome::Deferred { state } => Err(format!(
-            "sparse-v2 page inventory is deferred ({state:?}); retry after sparse synchronization recovers"
-        )),
+        SyncApplicationPageInventoryOutcome::Deferred { state: _ } => Err(
+            "Tine-managed storage is updating the page list. Try again when it finishes.".into(),
+        ),
     }
 }
 
@@ -272,12 +272,13 @@ fn map_sparse_page_load(
             Ok(Some(page))
         }
         SyncApplicationPageLoadOutcome::Missing { .. } => Ok(None),
-        SyncApplicationPageLoadOutcome::Ambiguous => {
-            Err("sparse-v2 page load is ambiguous; no legacy fallback was attempted".into())
-        }
-        SyncApplicationPageLoadOutcome::Deferred { state } => Err(format!(
-            "sparse-v2 page load is deferred ({state:?}); retry after sparse synchronization recovers"
-        )),
+        SyncApplicationPageLoadOutcome::Ambiguous => Err(
+            "Tine-managed storage could not identify this page. Reload it and resolve any conflicts."
+                .into(),
+        ),
+        SyncApplicationPageLoadOutcome::Deferred { state: _ } => Err(
+            "Tine-managed storage is updating this page. Try again when it finishes.".into(),
+        ),
     }
 }
 
@@ -297,10 +298,7 @@ fn sparse_save_request(
     force: bool,
 ) -> Result<SyncApplicationPageSaveRequest, String> {
     if force {
-        return Err(
-            "force save is refused under sparse-v2 authority; reload the page and resolve the conflict"
-                .into(),
-        );
+        return Err("Force save is unavailable while Tine-managed storage is active. Reload the page and resolve the conflict.".into());
     }
     let target = match base_rev {
         Some(revision) => SyncApplicationPageSaveTarget::Existing {
@@ -319,12 +317,10 @@ fn map_sparse_page_save(outcome: SyncApplicationPageSaveOutcome) -> Result<Strin
     match outcome {
         SyncApplicationPageSaveOutcome::Saved { revision, .. }
         | SyncApplicationPageSaveOutcome::Unchanged { revision, .. } => Ok(revision),
-        SyncApplicationPageSaveOutcome::Conflict { reason } => {
-            Err(format!("conflict: {reason:?}"))
-        }
-        SyncApplicationPageSaveOutcome::Deferred { state } => Err(format!(
-            "sparse-v2 page save is deferred ({state:?}); retry after sparse synchronization recovers"
-        )),
+        SyncApplicationPageSaveOutcome::Conflict { reason } => Err(format!("conflict: {reason:?}")),
+        SyncApplicationPageSaveOutcome::Deferred { state: _ } => Err(
+            "Tine-managed storage is updating this page. Try saving again when it finishes.".into(),
+        ),
     }
 }
 
@@ -2475,14 +2471,14 @@ mod application_page_authority_tests {
         );
         let ambiguous =
             map_sparse_page_load(SyncApplicationPageLoadOutcome::Ambiguous).unwrap_err();
-        assert!(ambiguous.contains("ambiguous"));
-        assert!(ambiguous.contains("no legacy fallback"));
+        assert!(ambiguous.contains("could not identify this page"));
+        assert!(ambiguous.contains("Reload it"));
         let deferred = map_sparse_page_load(SyncApplicationPageLoadOutcome::Deferred {
             state: SyncEditorDeferred::RetryableExternalWork,
         })
         .unwrap_err();
-        assert!(deferred.contains("deferred"));
-        assert!(deferred.contains("retry"));
+        assert!(deferred.contains("updating this page"));
+        assert!(deferred.contains("Try again"));
     }
 
     #[test]
@@ -2501,8 +2497,8 @@ mod application_page_authority_tests {
             state: SyncEditorDeferred::RetryableExternalWork,
         })
         .unwrap_err();
-        assert!(deferred.contains("inventory is deferred"));
-        assert!(deferred.contains("retry"));
+        assert!(deferred.contains("updating the page list"));
+        assert!(deferred.contains("Try again"));
     }
 
     #[test]
@@ -2569,7 +2565,7 @@ mod application_page_authority_tests {
             },
         )
         .unwrap_err();
-        assert!(refused.contains("force save is refused"));
+        assert!(refused.contains("Force save is unavailable"));
         assert!(!called.get());
     }
 

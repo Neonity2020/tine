@@ -11,7 +11,8 @@ use tine_core::crdt::ManagedSyncStoreState;
 use tine_core::model::Graph;
 
 pub(crate) type WindowKey = String;
-pub(crate) const SPARSE_V2_UNSUPPORTED: &str = "unsupported in sparse v2";
+pub(crate) const SPARSE_V2_UNSUPPORTED: &str =
+    "This action is unavailable while Tine-managed storage is active.";
 static NEXT_BINDING: AtomicU64 = AtomicU64::new(1);
 
 /// Read-only graph lease used by the auxiliary Quick Capture WebView. Capture

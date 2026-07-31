@@ -2,15 +2,14 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import type { SparseV2QueryReply } from "./types";
 
-describe("experimental sparse-v2 app boundary", () => {
+describe("Tine-managed storage app boundary", () => {
   const backend = readFileSync("src/backend.ts", "utf8");
   const settings = readFileSync("src/components/Settings.tsx", "utf8");
   const app = readFileSync("src/App.tsx", "utf8");
   const native = readFileSync("src-tauri/src/lib.rs", "utf8");
 
-  it("is explicit-only and refreshes the graph binding after authority transfer", () => {
-    expect(settings).toContain("Enable experimental sparse-v2 storage for this graph?");
-    expect(settings).toContain("never default-enabled");
+  it("is explicit-only and refreshes the graph binding after setup", () => {
+    expect(settings).toContain("Enable Tine-managed storage for this graph?");
     expect(backend).toMatch(
       /activateSparseV2\(\)[\s\S]*activate_sparse_v2[\s\S]*this\.bindingGeneration = result\.binding_generation/
     );
@@ -34,12 +33,18 @@ describe("experimental sparse-v2 app boundary", () => {
     ]) {
       expect(native).toContain(command);
     }
-    expect(settings).toContain("Prepare sharing…");
-    expect(settings).toContain("Join shared sparse v2…");
-    expect(settings).toContain("single enrollment descriptor last");
-    expect(settings).toContain("Independent or dirty local history is never auto-merged");
-    expect(settings).toContain("Return to standard Markdown mode");
-    expect(settings).toContain("private sparse-v2 state is preserved for recovery or diagnosis");
+    for (const copy of [
+      "Storage & sync",
+      "Enable Tine-managed storage...",
+      "Retry setup",
+      "Tine-managed storage active",
+      "Set up sync with another device...",
+      "Join this synced graph...",
+      "Return to Direct Markdown",
+    ]) {
+      expect(settings).toContain(copy);
+    }
+    expect(settings).not.toMatch(/sparse v2|sparse-v2|enrollment/i);
   });
 
   it("models the adjacent-tagged query reply wire shape", () => {
@@ -77,8 +82,9 @@ describe("experimental sparse-v2 app boundary", () => {
     ]);
   });
 
-  it("keeps the window open when sparse clean shutdown refuses Safe", () => {
+  it("keeps the window open when managed storage cannot stop safely", () => {
     expect(app).toContain("sparse-v2-shutdown-refused");
+    expect(app).toContain("Tine-managed storage could not verify a clean stop.");
     expect(app).toContain("The window remains open so you can retry");
     expect(app).toMatch(
       /sparse-v2-shutdown-refused[\s\S]*allowClose = false;[\s\S]*safeClose\.reset\(\);[\s\S]*return;/

@@ -209,7 +209,7 @@ const SETTING_SEARCH: SettingSearchEntry[] = [
   { tab: "files", label: "Diagram editors", description: "drawio Excalidraw commands", level: "advanced" },
   { tab: "backups", label: "Snapshots to keep", description: "recovery retention conflicts" },
   { tab: "graph", label: "Graph", description: "folder export publish" },
-  { tab: "graph", label: "Managed sync", description: "experimental sparse v2 operation log recovery" },
+  { tab: "graph", label: "Storage & sync", description: "Direct Markdown Tine-managed storage recovery" },
   { tab: "improve", label: "Help improve Tine", description: "diagnostics divergences anonymize" },
   { tab: "shortcuts", label: "Keyboard shortcuts", description: "key bindings commands remap" },
   { tab: "about", label: "About", description: "version licenses updates" },
@@ -1903,8 +1903,8 @@ function ManagedSyncPanel(): JSX.Element {
     setLoading(true);
     try {
       setStatus(await backend().sparseV2Status());
-    } catch (error) {
-      pushToast(`Couldn't read sparse-v2 status: ${String(error)}`, "error");
+    } catch {
+      pushToast("Couldn't read Tine-managed storage status. Try again.", "error");
     } finally {
       setLoading(false);
     }
@@ -1917,12 +1917,10 @@ function ManagedSyncPanel(): JSX.Element {
   };
 
   const failureDetail = (value: SparseV2Status): string => {
-    if (value.state === "retryable") return value.detail;
-    if (value.state === "refused") {
-      return value.detail ? `${value.reason_code}: ${value.detail}` : value.reason_code;
-    }
-    if (value.state === "blocked") return value.reason_code;
-    return "Sparse-v2 activation did not become active.";
+    if (value.state === "retryable") return "Setup can be retried.";
+    if (value.state === "refused") return "This graph cannot use Tine-managed storage.";
+    if (value.state === "blocked") return "Setup is waiting until it can continue safely.";
+    return "Tine-managed storage did not become active.";
   };
 
   const enable = async () => {
@@ -1930,27 +1928,25 @@ function ManagedSyncPanel(): JSX.Element {
     setGraphTransitioning(true);
     try {
       if (!(await flushAll())) {
-        pushToast("Resolve pending save conflicts before enabling sparse v2.", "error");
+        pushToast("Resolve pending save conflicts before enabling Tine-managed storage.", "error");
         return;
       }
       const confirmed = await backend().confirm(
-        `Enable experimental sparse-v2 storage for this graph?\n\n` +
-          `Tine will create and verify a private app-data operation log, SQLite projection, ` +
-          `and restore proof before changing authority. Existing Markdown/Org bytes stay in place. ` +
-          `Only the immutable archive namespace .tine-sync/v2 is created inside the graph. ` +
-          `This explicit opt-in will be resumed on later starts and legacy writer routes will be refused.`
+        `Enable Tine-managed storage for this graph?\n\n` +
+          `Tine first verifies a private operation history, local index, backup, and exact Markdown reconstruction. ` +
+          `Existing Markdown/Org files stay in place and remain Logseq-compatible.`
       );
       if (!confirmed) return;
       const result = await backend().activateSparseV2();
       setStatus(result);
       refreshAuthorityState();
       if (result.state === "active") {
-        pushToast("Sparse-v2 operation-log authority is active.", "success");
+        pushToast("Tine-managed storage is active.", "success");
       } else {
-        pushToast(`Sparse-v2 activation did not complete: ${failureDetail(result)}`, "error");
+        pushToast(`Tine-managed storage setup did not complete: ${failureDetail(result)}`, "error");
       }
-    } catch (error) {
-      pushToast(`Sparse v2 was not enabled: ${String(error)}`, "error");
+    } catch {
+      pushToast("Tine-managed storage was not enabled. Retry setup.", "error");
     } finally {
       setGraphTransitioning(false);
       setEnabling(false);
@@ -1966,20 +1962,20 @@ function ManagedSyncPanel(): JSX.Element {
         return;
       }
       if (!(await backend().confirm(
-        "Prepare this sparse-v2 graph for another Tine device?\n\n" +
-          "Tine will publish immutable archive objects first and the single enrollment descriptor last under .tine-sync/v2/shared. This remains experimental."
+        "Set up sync with another device?\n\n" +
+          "Tine writes sync data under this graph's existing internal directory. Existing Markdown/Org files stay in place and remain Logseq-compatible."
       ))) return;
       const result = await backend().prepareSparseV2Share();
       setStatus(result);
       refreshAuthorityState();
       pushToast(
         result.state === "active"
-          ? "Shared sparse-v2 enrollment is active."
-          : `Shared enrollment did not complete: ${failureDetail(result)}`,
+          ? "Sync is ready to use on another device."
+          : `Sync setup did not complete: ${failureDetail(result)}`,
         result.state === "active" ? "success" : "error"
       );
-    } catch (error) {
-      pushToast(`Couldn't prepare shared enrollment: ${String(error)}`, "error");
+    } catch {
+      pushToast("Couldn't set up sync. Retry setup.", "error");
     } finally {
       setGraphTransitioning(false);
       setSharing(false);
@@ -1995,20 +1991,20 @@ function ManagedSyncPanel(): JSX.Element {
         return;
       }
       if (!(await backend().confirm(
-        "Join the shared sparse-v2 enrollment visible in this graph?\n\n" +
-          "Tine will verify the exact shared lineage and bootstrap before creating this device's private binding. Independent or dirty local history is never auto-merged."
+        "Join this synced graph?\n\n" +
+          "Tine verifies that this device is joining the same graph history before it continues. Existing Markdown/Org files stay in place and remain Logseq-compatible."
       ))) return;
       const result = await backend().joinSparseV2Shared();
       setStatus(result);
       refreshAuthorityState();
       pushToast(
         result.state === "active"
-          ? "This device joined the shared sparse-v2 graph."
-          : `Shared join did not complete: ${failureDetail(result)}`,
+          ? "This device joined the synced graph."
+          : `Joining the synced graph did not complete: ${failureDetail(result)}`,
         result.state === "active" ? "success" : "error"
       );
-    } catch (error) {
-      pushToast(`Couldn't join shared enrollment: ${String(error)}`, "error");
+    } catch {
+      pushToast("Couldn't join the synced graph. Retry setup.", "error");
     } finally {
       setGraphTransitioning(false);
       setSharing(false);
@@ -2022,14 +2018,14 @@ function ManagedSyncPanel(): JSX.Element {
       try {
         await flushAll();
       } catch {
-        // Sparse authority may be unavailable in the exact failure state this
-        // rollback repairs. Keep the store intact and retry after legacy
-        // authority has been rebound.
+        // Setup may be unavailable in the exact failure state this rollback
+        // repairs. Keep the store intact and retry after Direct Markdown
+        // has been restored.
       }
       if (!(await backend().confirm(
-        "Return this graph to standard Markdown mode?\n\n" +
-          "Markdown remains the graph. Tine will cleanly stop this local sparse-v2 authority and preserve its complete private state in app recovery storage for recovery or diagnosis. " +
-          "Pending in-memory edits will be retried after standard Markdown authority returns."
+        "Return to Direct Markdown?\n\n" +
+          "Tine preserves complete recovery state before switching this graph back to Direct Markdown. " +
+          "Pending in-memory edits will be retried after Direct Markdown returns."
       ))) return;
       const result = await backend().cancelSparseV2();
       setStatus(result.status);
@@ -2041,15 +2037,15 @@ function ManagedSyncPanel(): JSX.Element {
       }
       if (!flushed) {
         pushToast(
-          "Standard Markdown mode is active, but your in-memory edits remain unsaved; resolve conflicts or retry saving before reloading or closing the graph.",
+          "Direct Markdown is active, but your in-memory edits remain unsaved; resolve conflicts or retry saving before reloading or closing the graph.",
           "error"
         );
         return;
       }
       refreshAuthorityState();
       pushToast(result.recovery_statement, "success");
-    } catch (error) {
-      pushToast(`Couldn't return to standard Markdown mode: ${String(error)}`, "error");
+    } catch {
+      pushToast("Couldn't return to Direct Markdown. Try again.", "error");
     } finally {
       setGraphTransitioning(false);
       setCancelling(false);
@@ -2058,7 +2054,7 @@ function ManagedSyncPanel(): JSX.Element {
 
   return (
     <>
-      <div class="settings-section">Managed sync</div>
+      <div class="settings-section">Storage &amp; sync</div>
       <Show
         when={!loading()}
         fallback={<div class="settings-hint settings-block">Checking sync state…</div>}
@@ -2066,63 +2062,54 @@ function ManagedSyncPanel(): JSX.Element {
         <Show
           when={status()}
           fallback={
-            <div class="settings-hint settings-block">Sparse-v2 status is unavailable.</div>
+            <div class="settings-hint settings-block">Tine-managed storage status is unavailable.</div>
           }
         >
           {(current) => (
             <div class="settings-row">
-              <span class="settings-label">Operation log</span>
+              <span class="settings-label">Storage mode</span>
               <div>
                 <Show when={current().state === "legacy_default"}>
                   <button class="settings-btn" disabled={enabling()} onClick={() => void enable()}>
-                    {enabling() ? "Enabling…" : "Enable sparse v2…"}
+                    {enabling() ? "Setting up..." : "Enable Tine-managed storage..."}
                   </button>
                 </Show>
                 <Show when={current().state === "joinable"}>
                   <button class="settings-btn" disabled={sharing()} onClick={() => void joinShare()}>
-                    {sharing() ? "Joining…" : "Join shared sparse v2…"}
+                    {sharing() ? "Joining..." : "Join this synced graph..."}
                   </button>
                 </Show>
                 <Show when={retryable()}>
                   <button class="settings-btn" disabled={enabling()} onClick={() => void enable()}>
-                    {enabling() ? "Retrying…" : "Retry sparse-v2 activation"}
+                    {enabling() ? "Retrying..." : "Retry setup"}
                   </button>
                 </Show>
                 <Show when={current().state === "active"}>
-                  <span class="settings-value">
-                    Active · sparse v2
-                    {current().runtime?.shared_phase === "active" && current().runtime?.shared_role
-                      ? ` · shared ${current().runtime?.shared_role}`
-                      : ""}
-                  </span>
+                  <span class="settings-value">Tine-managed storage active</span>
                   <Show when={!current().runtime?.shared_phase || current().runtime?.shared_phase === "share_prepared"}>
                     <div style={{ "margin-top": "6px" }}>
                       <button class="settings-btn" disabled={sharing()} onClick={() => void prepareShare()}>
                         {sharing()
-                          ? "Preparing…"
+                          ? "Setting up..."
                           : current().runtime?.shared_phase === "share_prepared"
-                            ? "Resume preparing sharing"
-                            : "Prepare sharing…"}
+                            ? "Retry setup"
+                            : "Set up sync with another device..."}
                       </button>
                     </div>
                   </Show>
                   <Show when={current().runtime?.shared_phase === "joining"}>
                     <div style={{ "margin-top": "6px" }}>
                       <button class="settings-btn" disabled={sharing()} onClick={() => void joinShare()}>
-                        {sharing() ? "Joining…" : "Resume shared join"}
+                        {sharing() ? "Joining..." : "Join this synced graph..."}
                       </button>
                     </div>
                   </Show>
                 </Show>
                 <Show when={blocked()}>
-                  {(value) => (
-                    <span class="settings-value">Blocked · {value().reason_code}</span>
-                  )}
+                  <span class="settings-value">Tine-managed storage needs attention.</span>
                 </Show>
                 <Show when={refused()}>
-                  {(value) => (
-                    <span class="settings-value">Refused · {value().reason_code}</span>
-                  )}
+                  <span class="settings-value">Tine-managed storage is unavailable for this graph.</span>
                 </Show>
                 <Show
                   when={
@@ -2133,8 +2120,7 @@ function ManagedSyncPanel(): JSX.Element {
                     when={current().can_cancel}
                     fallback={
                       <div class="settings-hint" style={{ "margin-top": "8px" }}>
-                        {current().cancel_reason ??
-                          "Returning to standard Markdown mode is unavailable because local-only safety could not be proved."}
+                        Return to Direct Markdown is unavailable because safety could not be verified.
                       </div>
                     }
                   >
@@ -2144,47 +2130,37 @@ function ManagedSyncPanel(): JSX.Element {
                         disabled={cancelling()}
                         onClick={() => void cancelSparse()}
                       >
-                        {cancelling() ? "Returning…" : "Return to standard Markdown mode"}
+                        {cancelling() ? "Returning..." : "Return to Direct Markdown"}
                       </button>
                       <div class="settings-hint" style={{ "margin-top": "4px" }}>
-                        Markdown remains the graph; private sparse-v2 state is preserved for recovery or diagnosis.
+                        Complete recovery state is preserved before returning to Direct Markdown.
                       </div>
                     </div>
                   </Show>
                 </Show>
                 <Show when={retryable()}>
-                  {(value) => (
-                    <div class="settings-hint" style={{ "margin-top": "4px" }}>
-                      Resume point: {value().stage} · {value().detail}
-                    </div>
-                  )}
+                  <div class="settings-hint" style={{ "margin-top": "4px" }}>
+                    Setup paused. You can retry setup when you are ready.
+                  </div>
                 </Show>
                 <Show when={current().runtime}>
                   {(runtime) => (
                     <>
-                      <div class="settings-hint" style={{ "margin-top": "4px" }}>
-                        Runtime: {runtime().lifecycle}
-                        {runtime().recovery ? ` · recovery: ${runtime().recovery}` : ""}
-                      </div>
                       <Show when={runtime().watcher.pending || runtime().watcher.deferred}>
                         <div class="settings-hint">
-                          External changes pending
-                          {runtime().watcher.pending_requires_full_scan ? " · recovery scan required" : ""}
+                          Updating external changes...
                         </div>
                       </Show>
                       <Show when={runtime().provider_pending > 0}>
                         <div class="settings-hint">
-                          Provider reconciliation pending · {runtime().provider_pending}
+                          Sync updates are pending.
                         </div>
-                      </Show>
-                      <Show when={runtime().detail}>
-                        <div class="settings-hint">{runtime().detail}</div>
                       </Show>
                     </>
                   )}
                 </Show>
                 <div class="settings-hint" style={{ "margin-top": "6px" }}>
-                  Experimental · explicit per graph · private app-data state · never default-enabled
+                  Tine keeps durable history and a local index while continuously maintaining your compatible Markdown/Org tree.
                 </div>
               </div>
             </div>

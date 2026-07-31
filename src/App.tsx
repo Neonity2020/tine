@@ -627,7 +627,7 @@ export function App(): JSX.Element {
   onMount(() => {
     let unsub = () => {};
     void backend()
-      .onManagedSyncError((message) => pushToast(`Managed sync stopped: ${message}`, "error"))
+      .onManagedSyncError(() => pushToast("Tine-managed storage stopped. Open Storage & sync to retry setup.", "error"))
       .then((u) => (unsub = u));
     onCleanup(() => unsub());
   });
@@ -684,7 +684,7 @@ export function App(): JSX.Element {
             safeClose.reset();
             closeInProgress = false;
             pushToast(
-              "Sparse-v2 shutdown could not prove a clean handoff. The window remains open so you can retry or inspect recovery status.",
+              "Tine-managed storage could not verify a clean stop. The window remains open so you can retry or inspect recovery status.",
               "error"
             );
             return;

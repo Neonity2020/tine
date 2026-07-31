@@ -84,15 +84,12 @@ impl SparseV2ActivationRecord {
 
     fn validate_for(&self, graph_root: &Path) -> Result<(), String> {
         if self.schema_version != BINDING_SCHEMA_VERSION {
-            return Err(format!(
-                "unsupported sparse-v2 binding schema {}",
-                self.schema_version
-            ));
+            return Err("Tine-managed storage has an unsupported local setup version.".into());
         }
         if self.graph_root != graph_root.display().to_string()
             || self.graph_meta.root != self.graph_root
         {
-            return Err("sparse-v2 binding belongs to another graph root".into());
+            return Err("Tine-managed storage data belongs to a different graph.".into());
         }
         Ok(())
     }
@@ -180,10 +177,12 @@ fn read_binding_at(
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(format!("couldn't read sparse-v2 binding: {error}")),
+        Err(error) => {
+            return Err(format!("Couldn't read Tine-managed storage data: {error}"));
+        }
     };
     let record: SparseV2ActivationRecord = serde_json::from_slice(&bytes)
-        .map_err(|error| format!("sparse-v2 binding is corrupt: {error}"))?;
+        .map_err(|error| format!("Tine-managed storage data is corrupted: {error}"))?;
     record.validate_for(graph_root)?;
     Ok(Some(record))
 }
@@ -208,12 +207,12 @@ fn persist_binding_at(path: &Path, record: &SparseV2ActivationRecord) -> Result<
         if found_value != expected_value {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
-                "another sparse-v2 activation binding already owns this graph",
+                "Tine-managed storage is already set up for this graph.",
             ));
         }
         Ok(encoded.clone())
     })
-    .map_err(|error| format!("couldn't persist sparse-v2 binding: {error}"))
+    .map_err(|error| format!("Couldn't save Tine-managed storage setup: {error}"))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
@@ -244,11 +243,11 @@ impl SparseV2Availability {
             SyncRuntimeOpenStatus::Active => Self::Active,
             SyncRuntimeOpenStatus::Absent => Self::Retryable {
                 stage: "absent".into(),
-                detail: "explicit sparse-v2 activation has not completed".into(),
+                detail: "Tine-managed storage setup has not completed.".into(),
             },
             SyncRuntimeOpenStatus::ExistingNonActive(stage) => Self::Retryable {
                 stage: non_active_stage(stage).into(),
-                detail: "explicit sparse-v2 activation can be resumed".into(),
+                detail: "Tine-managed storage setup can be resumed.".into(),
             },
             SyncRuntimeOpenStatus::Blocked { reason_code } => Self::Blocked { reason_code },
             SyncRuntimeOpenStatus::UnsupportedOrIncompatible(component) => Self::Refused {
@@ -284,7 +283,8 @@ impl SparseV2Availability {
             SyncLocalActivationStatus::LegacyV1Refused => Self::Refused {
                 reason_code: "legacy_v1_present".into(),
                 detail: Some(
-                    "sparse v2 never opens or rewrites the experimental legacy v1 store".into(),
+                    "Tine-managed storage will not alter incompatible existing storage data."
+                        .into(),
                 ),
             },
             SyncLocalActivationStatus::UnsupportedOrIncompatible(component) => Self::Refused {
@@ -486,7 +486,7 @@ impl SparseV2StatusDto {
             can_retry: false,
             can_cancel: false,
             cancel_reason: Some(
-                "This graph exposes shared sparse-v2 enrollment evidence; cancellation is unsafe."
+                "This graph is already synced with another device, so returning to Direct Markdown is unavailable."
                     .into(),
             ),
             binding_generation,
@@ -503,18 +503,17 @@ impl SparseV2StatusDto {
         let availability = match runtime.as_ref().map(|status| status.lifecycle.as_str()) {
             Some("stopped_safe") => SparseV2Availability::Retryable {
                 stage: "local_active".into(),
-                detail: "the prior sparse-v2 runtime stopped safely and must be reopened".into(),
+                detail: "Tine-managed storage stopped safely and needs to be reopened.".into(),
             },
             Some("stopped_crashed") => SparseV2Availability::Retryable {
                 stage: "local_active".into(),
-                detail: "the prior sparse-v2 runtime stopped unexpectedly and must be reopened"
+                detail: "Tine-managed storage needs to be reopened after it stopped unexpectedly."
                     .into(),
             },
             None if retained_status.as_ref().is_some_and(Result::is_err) => {
                 SparseV2Availability::Retryable {
                     stage: "local_active".into(),
-                    detail: "the retained sparse-v2 runtime is unavailable and must be reopened"
-                        .into(),
+                    detail: "Tine-managed storage needs to be reopened.".into(),
                 }
             }
             _ => binding.availability().clone(),
@@ -624,9 +623,7 @@ fn provider_namespace_has_evidence(path: &Path) -> Result<bool, String> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(format!(
-            "couldn't inspect sparse-v2 provider evidence: {error}"
-        )),
+        Err(error) => Err(format!("Couldn't inspect sync data: {error}")),
     }
 }
 
@@ -645,14 +642,14 @@ fn cancel_eligibility(binding: &SparseV2Binding, provider_namespace: &Path) -> R
     let provider_evidence = provider_namespace_has_evidence(provider_namespace)?;
     if binding_names_shared_state(binding) {
         return Err(
-            "This sparse-v2 binding has entered shared enrollment, so returning to standard Markdown mode is unsafe."
+            "This graph is synced with another device, so returning to Direct Markdown is unavailable."
                 .into(),
         );
     }
     if let Some(handle) = binding.handle() {
-        let status = handle
-            .status()
-            .map_err(|error| format!("couldn't prove sparse-v2 rollback is local: {error}"))?;
+        let status = handle.status().map_err(|error| {
+            format!("Couldn't verify that returning to Direct Markdown is safe: {error}")
+        })?;
         let names_shared_runtime = status.shared_role.is_some() || status.shared_phase.is_some();
         // A local-only core snapshot currently counts its absent provider
         // recovery-coverage sentinel as one pending item. It cannot represent
@@ -660,14 +657,14 @@ fn cancel_eligibility(binding: &SparseV2Binding, provider_namespace: &Path) -> R
         // graph-local provider namespace are absent.
         if names_shared_runtime || (status.provider_pending != 0 && provider_evidence) {
             return Err(
-                "This sparse-v2 runtime names shared/provider work, so returning to standard Markdown mode is unsafe."
+                "This graph is synced with another device, so returning to Direct Markdown is unavailable."
                     .into(),
             );
         }
     }
     if provider_evidence {
         return Err(
-            "Shared/provider sparse-v2 evidence exists, so returning to standard Markdown mode is unsafe."
+            "This graph is synced with another device, so returning to Direct Markdown is unavailable."
                 .into(),
         );
     }
@@ -687,7 +684,7 @@ impl SyncRuntimeFacade {
         let record = read_binding_at(&private.join(SPARSE_BINDING_FILE), graph_root)?;
         if record.is_none() && std::fs::symlink_metadata(&private).is_ok() {
             return Err(
-                "sparse-v2 private app-data residue exists without a valid binding; legacy open refused"
+                "Tine-managed storage data is incomplete, so this graph could not be opened safely."
                     .into(),
             );
         }
@@ -751,7 +748,7 @@ impl SyncRuntimeFacade {
 
 const LEGACY_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const SPARSE_V2_NOT_ACTIVE: &str =
-    "sparse-v2 authority has no live runtime; retry sparse-v2 activation or roll back to standard Markdown mode";
+    "Tine-managed storage is not ready. Retry setup or return to Direct Markdown.";
 
 pub(crate) fn active_handle(
     slot: &crate::state::GraphSlot,
@@ -828,7 +825,7 @@ pub(crate) fn activate_sparse_v2(
             .state
             .sync_runtime
             .binding_record(&app, &root)?
-            .ok_or("sparse-v2 opt-in binding is missing")?;
+            .ok_or("Tine-managed storage setup is missing.")?;
         let graph_meta = SyncRuntimeFacade::graph_meta(&record);
         let core_started = Instant::now();
         let binding = match action {
@@ -886,7 +883,9 @@ pub(crate) fn activate_sparse_v2(
         .is_none_or(|removed| removed.binding_generation != slot.binding_generation)
     {
         slot.cancel_legacy_retirement()?;
-        return Err("graph binding changed during sparse-v2 handoff".into());
+        return Err(
+            "The graph changed while Tine-managed storage was being set up. Retry setup.".into(),
+        );
     }
     crate::state::poke_watcher(&state.state);
 
@@ -903,7 +902,9 @@ pub(crate) fn activate_sparse_v2(
             .unwrap()
             .bind(label, Arc::clone(&slot))?;
         crate::state::poke_watcher(&state.state);
-        return Err(format!("sparse-v2 handoff is retryable: {error}"));
+        return Err(format!(
+            "Tine-managed storage setup can be retried: {error}"
+        ));
     }
     crate::debug::diag(format!(
         "sparse-v2 legacy authority drained after {} ms",
@@ -967,20 +968,22 @@ pub(crate) struct SparseV2CancelResult {
 }
 
 fn archive_private_root(private_root: &Path, recovery_root: &Path) -> Result<PathBuf, String> {
-    let metadata = std::fs::symlink_metadata(private_root)
-        .map_err(|error| format!("couldn't inspect sparse-v2 private state: {error}"))?;
+    let metadata = std::fs::symlink_metadata(private_root).map_err(|error| {
+        format!("Couldn't inspect Tine-managed storage recovery state: {error}")
+    })?;
     if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
-        return Err("sparse-v2 private state is not a local directory; rollback refused".into());
+        return Err("Tine-managed storage recovery state is not a local directory, so returning to Direct Markdown is unavailable.".into());
     }
-    std::fs::create_dir_all(recovery_root)
-        .map_err(|error| format!("couldn't prepare sparse-v2 recovery storage: {error}"))?;
+    std::fs::create_dir_all(recovery_root).map_err(|error| {
+        format!("Couldn't prepare Tine-managed storage recovery state: {error}")
+    })?;
     let key = private_root
         .file_name()
         .and_then(|value| value.to_str())
-        .ok_or("sparse-v2 private state has no valid local key")?;
+        .ok_or("Tine-managed storage recovery state has no valid local key.")?;
     let destination = recovery_root.join(format!("{key}-{}", Uuid::new_v4()));
     std::fs::rename(private_root, &destination).map_err(|error| {
-        format!("couldn't preserve sparse-v2 recovery state atomically: {error}")
+        format!("Couldn't preserve Tine-managed storage recovery state: {error}")
     })?;
     Ok(destination)
 }
@@ -992,9 +995,11 @@ fn require_safe_sparse_shutdown(slot: &crate::state::GraphSlot) -> Result<(), St
     match handle.clean_shutdown() {
         Ok(SyncShutdownOutcome::Safe(_)) => Ok(()),
         Ok(SyncShutdownOutcome::Terminal(_)) => {
-            Err("sparse-v2 clean shutdown did not prove a safe local stop".into())
+            Err("Tine-managed storage could not verify a safe local stop.".into())
         }
-        Err(error) => Err(format!("sparse-v2 clean shutdown refused: {error}")),
+        Err(error) => Err(format!(
+            "Tine-managed storage could not stop safely: {error}"
+        )),
     }
 }
 
@@ -1010,7 +1015,7 @@ fn restore_sparse_slot(
         .unwrap()
         .bind(label.to_string(), slot)
         .map_err(|restore| {
-            format!("{reason}; sparse authority could not be restored in memory: {restore}")
+            format!("{reason}; Tine-managed storage could not be restored in memory: {restore}")
         })?;
     crate::state::poke_watcher(state);
     Err(reason)
@@ -1028,13 +1033,13 @@ fn cancel_sparse_v2_at_paths_with_archive(
 ) -> Result<SparseV2CancelResult, String> {
     let binding = slot
         .sparse_binding()
-        .ok_or("this graph is already using standard Markdown authority")?;
+        .ok_or("This graph is already using Direct Markdown.")?;
     let record = read_binding_at(&private_root.join(SPARSE_BINDING_FILE), &slot.root_key)?
-        .ok_or("the exact sparse-v2 binding for this graph is missing")?;
+        .ok_or("Tine-managed storage setup for this graph is missing.")?;
     if record.graph_meta.root != slot.root_key.display().to_string()
         || slot.graph_meta().root != record.graph_meta.root
     {
-        return Err("the sparse-v2 slot and persisted binding do not name the exact graph".into());
+        return Err("Tine-managed storage data does not match this graph.".into());
     }
     cancel_eligibility(binding, &slot.root_key.join(".tine-sync/v2"))?;
 
@@ -1053,7 +1058,7 @@ fn cancel_sparse_v2_at_paths_with_archive(
                 .bind(label.to_string(), current)?;
             crate::state::poke_watcher(state);
         }
-        return Err("graph binding changed during sparse-v2 rollback".into());
+        return Err("The graph changed while returning to Direct Markdown. Try again.".into());
     }
 
     if let Err(error) = shutdown(&slot) {
@@ -1070,7 +1075,7 @@ fn cancel_sparse_v2_at_paths_with_archive(
     )
     .map_err(|error| {
         format!(
-            "Sparse-v2 state was safely preserved, but standard Markdown could not reopen: {error}. Restart Tine to reopen the unchanged Markdown graph."
+            "Tine-managed storage recovery state was preserved, but Direct Markdown could not reopen: {error}. Restart Tine to reopen the unchanged Markdown graph."
         )
     })?;
     let replacement = Arc::new(crate::state::GraphSlot::new(graph, slot.root_key.clone()));
@@ -1081,7 +1086,7 @@ fn cancel_sparse_v2_at_paths_with_archive(
         .bind(label.to_string(), Arc::clone(&replacement))
         .map_err(|error| {
             format!(
-                "Sparse-v2 state was safely preserved, but standard Markdown could not be rebound: {error}. Restart Tine to reopen the unchanged Markdown graph."
+                "Tine-managed storage recovery state was preserved, but Direct Markdown could not be restored: {error}. Restart Tine to reopen the unchanged Markdown graph."
             )
         })?;
     crate::state::poke_watcher(state);
@@ -1089,9 +1094,8 @@ fn cancel_sparse_v2_at_paths_with_archive(
     Ok(SparseV2CancelResult {
         binding_generation: replacement.binding_generation,
         status,
-        recovery_statement:
-            "Standard Markdown mode is active. The complete private sparse-v2 state was preserved in app recovery storage."
-                .into(),
+        recovery_statement: "Direct Markdown is active. Complete recovery state was preserved."
+            .into(),
     })
 }
 
@@ -1152,7 +1156,7 @@ pub(crate) fn prepare_sparse_v2_share(
         .state
         .sync_runtime
         .binding_record(&app, &slot.root_key)?
-        .ok_or("sparse-v2 opt-in binding is missing")?;
+        .ok_or("Tine-managed storage setup is missing.")?;
     active_handle(&slot)?
         .prepare_shared()
         .map_err(|error| error.to_string())?;
@@ -1200,13 +1204,13 @@ pub(crate) fn join_sparse_v2_shared(
     let _transition = state.state.graph_load.lock().unwrap();
     let slot = crate::state::slot_for_context(&state)?;
     let descriptor = inspect_shared_enrollment(&slot.root_key.join(".tine-sync/v2/shared"))?
-        .ok_or("the shared enrollment descriptor is not provider-visible")?;
+        .ok_or("This graph does not yet contain sync data from another device.")?;
     if slot.sparse_binding().is_some() {
         let record = state
             .state
             .sync_runtime
             .binding_record(&app, &slot.root_key)?
-            .ok_or("sparse-v2 opt-in binding is missing")?;
+            .ok_or("Tine-managed storage setup is missing.")?;
         active_handle(&slot)?
             .join_shared(descriptor)
             .map_err(|error| error.to_string())?;
@@ -1259,7 +1263,7 @@ pub(crate) fn join_sparse_v2_shared(
         .is_none_or(|removed| removed.binding_generation != slot.binding_generation)
     {
         slot.cancel_legacy_retirement()?;
-        return Err("graph binding changed during sparse-v2 join handoff".into());
+        return Err("The graph changed while joining sync. Try again.".into());
     }
     crate::state::poke_watcher(&state.state);
     if let Err(error) = slot.wait_for_legacy_drain(LEGACY_DRAIN_TIMEOUT) {
@@ -1271,7 +1275,7 @@ pub(crate) fn join_sparse_v2_shared(
             .unwrap()
             .bind(label, Arc::clone(&slot))?;
         crate::state::poke_watcher(&state.state);
-        return Err(format!("sparse-v2 join handoff is retryable: {error}"));
+        return Err(format!("Joining sync can be retried: {error}"));
     }
     if let Err(error) = state
         .state
@@ -1618,8 +1622,8 @@ mod tests {
             active_handle(&fixture.slot).unwrap_err(),
             SPARSE_V2_NOT_ACTIVE
         );
-        assert!(SPARSE_V2_NOT_ACTIVE.contains("retry sparse-v2 activation"));
-        assert!(SPARSE_V2_NOT_ACTIVE.contains("roll back"));
+        assert!(SPARSE_V2_NOT_ACTIVE.contains("Retry setup"));
+        assert!(SPARSE_V2_NOT_ACTIVE.contains("return to Direct Markdown"));
     }
 
     #[test]
@@ -1645,7 +1649,7 @@ mod tests {
                 shared_status
                     .cancel_reason
                     .as_deref()
-                    .is_some_and(|reason| reason.contains("entered shared enrollment")),
+                    .is_some_and(|reason| reason.contains("synced with another device")),
                 "{stage}: {:?}",
                 shared_status.cancel_reason
             );
@@ -1658,7 +1662,7 @@ mod tests {
         assert!(provider_status
             .cancel_reason
             .as_deref()
-            .is_some_and(|reason| reason.contains("Shared/provider")));
+            .is_some_and(|reason| reason.contains("synced with another device")));
     }
 
     #[test]
@@ -1682,7 +1686,7 @@ mod tests {
         assert_eq!(result.binding_generation, result.status.binding_generation);
         assert!(result
             .recovery_statement
-            .contains("complete private sparse-v2 state"));
+            .contains("Complete recovery state was preserved"));
         assert!(!fixture.private_root.exists());
         let archives = std::fs::read_dir(&fixture.recovery_root)
             .unwrap()
@@ -1915,7 +1919,7 @@ mod tests {
             |_| panic!("provider evidence must refuse before shutdown"),
         )
         .unwrap_err();
-        assert!(provider_error.contains("Shared/provider"));
+        assert!(provider_error.contains("synced with another device"));
         assert!(provider
             .state
             .graphs
@@ -1936,7 +1940,7 @@ mod tests {
             |_| panic!("shared lifecycle must refuse before shutdown"),
         )
         .unwrap_err();
-        assert!(shared_error.contains("entered shared enrollment"));
+        assert!(shared_error.contains("synced with another device"));
         assert!(shared.private_root.exists());
     }
 

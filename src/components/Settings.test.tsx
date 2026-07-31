@@ -25,7 +25,7 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-describe("Settings sparse-v2 authority transitions", () => {
+describe("Settings storage transitions", () => {
   const legacy = (): SparseV2Status => ({
     state: "legacy_default",
     runtime: null,
@@ -76,7 +76,7 @@ describe("Settings sparse-v2 authority transitions", () => {
     binding_generation: 11,
   });
 
-  it("flushes before activation, exposes returned failure detail, and invalidates stale pages", async () => {
+  it("flushes before setup, offers retry, and invalidates stale pages", async () => {
     const calls: string[] = [];
     vi.spyOn(backend(), "sparseV2Status").mockResolvedValue(legacy());
     vi.spyOn(backend(), "confirm").mockResolvedValue(true);
@@ -95,7 +95,7 @@ describe("Settings sparse-v2 authority transitions", () => {
     const dispose = render(() => <Settings />, root);
     await showSparsePanel(root);
     const enable = [...root.querySelectorAll("button")].find((button) =>
-      button.textContent?.includes("Enable sparse v2")
+      button.textContent?.includes("Enable Tine-managed storage")
     ) as HTMLButtonElement;
     enable.click();
     await tick();
@@ -103,11 +103,12 @@ describe("Settings sparse-v2 authority transitions", () => {
 
     expect(calls).toEqual(["flush", "activate"]);
     expect(reset).toHaveBeenCalled();
-    expect(toasts().at(-1)?.message).toContain(
-      "projection proof paused on the exact test cut"
+    expect(toasts().at(-1)?.message).toBe(
+      "Tine-managed storage setup did not complete: Setup can be retried."
     );
-    expect(root.textContent).toContain("Resume point: shadow_import");
-    expect(root.textContent).toContain("Return to standard Markdown mode");
+    expect(root.textContent).toContain("Retry setup");
+    expect(root.textContent).toContain("Setup paused. You can retry setup when you are ready.");
+    expect(root.textContent).toContain("Return to Direct Markdown");
     dispose();
   });
 
@@ -130,7 +131,7 @@ describe("Settings sparse-v2 authority transitions", () => {
       return {
         status,
         binding_generation: 12,
-        recovery_statement: "Private sparse-v2 recovery state was preserved.",
+        recovery_statement: "Direct Markdown is active. Complete recovery state was preserved.",
       };
     });
 
@@ -139,7 +140,7 @@ describe("Settings sparse-v2 authority transitions", () => {
     const dispose = render(() => <Settings />, root);
     await showSparsePanel(root);
     const rollback = [...root.querySelectorAll("button")].find((button) =>
-      button.textContent?.includes("Return to standard Markdown mode")
+      button.textContent?.includes("Return to Direct Markdown")
     ) as HTMLButtonElement;
     expect(rollback).toBeTruthy();
     rollback.click();
@@ -150,13 +151,13 @@ describe("Settings sparse-v2 authority transitions", () => {
     expect(reset).toHaveBeenCalledOnce();
     expect(confirm).toHaveBeenCalledWith(
       expect.stringContaining(
-        "Pending in-memory edits will be retried after standard Markdown authority returns."
+        "Pending in-memory edits will be retried after Direct Markdown returns."
       )
     );
     expect(toasts().at(-1)?.message).toBe(
-      "Private sparse-v2 recovery state was preserved."
+      "Direct Markdown is active. Complete recovery state was preserved."
     );
-    expect(root.textContent).toContain("Enable sparse v2");
+    expect(root.textContent).toContain("Enable Tine-managed storage");
     dispose();
   });
 
@@ -168,7 +169,7 @@ describe("Settings sparse-v2 authority transitions", () => {
     vi.spyOn(backend(), "cancelSparseV2").mockResolvedValue({
       status: { ...legacy(), binding_generation: 12 },
       binding_generation: 12,
-      recovery_statement: "Private sparse-v2 recovery state was preserved.",
+      recovery_statement: "Direct Markdown is active. Complete recovery state was preserved.",
     });
 
     const root = document.createElement("div");
@@ -176,7 +177,7 @@ describe("Settings sparse-v2 authority transitions", () => {
     const dispose = render(() => <Settings />, root);
     await showSparsePanel(root);
     const rollback = [...root.querySelectorAll("button")].find((button) =>
-      button.textContent?.includes("Return to standard Markdown mode")
+      button.textContent?.includes("Return to Direct Markdown")
     ) as HTMLButtonElement;
     rollback.click();
     await tick();
@@ -185,7 +186,7 @@ describe("Settings sparse-v2 authority transitions", () => {
     expect(flush).toHaveBeenCalledTimes(2);
     expect(reset).toHaveBeenCalledOnce();
     expect(toasts().at(-1)?.message).toBe(
-      "Private sparse-v2 recovery state was preserved."
+      "Direct Markdown is active. Complete recovery state was preserved."
     );
     dispose();
   });
@@ -205,7 +206,7 @@ describe("Settings sparse-v2 authority transitions", () => {
       return {
         status,
         binding_generation: 12,
-        recovery_statement: "Private sparse-v2 recovery state was preserved.",
+        recovery_statement: "Direct Markdown is active. Complete recovery state was preserved.",
       };
     });
 
@@ -214,7 +215,7 @@ describe("Settings sparse-v2 authority transitions", () => {
     const dispose = render(() => <Settings />, root);
     await showSparsePanel(root);
     const rollback = [...root.querySelectorAll("button")].find((button) =>
-      button.textContent?.includes("Return to standard Markdown mode")
+      button.textContent?.includes("Return to Direct Markdown")
     ) as HTMLButtonElement;
     rollback.click();
     await tick();
@@ -222,9 +223,9 @@ describe("Settings sparse-v2 authority transitions", () => {
 
     expect(calls).toEqual(["flush", "cancel", "flush"]);
     expect(reset).not.toHaveBeenCalled();
-    expect(root.textContent).toContain("Enable sparse v2");
+    expect(root.textContent).toContain("Enable Tine-managed storage");
     expect(toasts().at(-1)?.message).toContain(
-      "Standard Markdown mode is active, but your in-memory edits remain unsaved"
+      "Direct Markdown is active, but your in-memory edits remain unsaved"
     );
     expect(toasts().at(-1)?.message).toContain("resolve conflicts or retry");
     dispose();
@@ -234,7 +235,7 @@ describe("Settings sparse-v2 authority transitions", () => {
     vi.spyOn(backend(), "sparseV2Status").mockResolvedValue({
       ...localActive(),
       can_cancel: false,
-      cancel_reason: "Shared/provider sparse-v2 evidence exists.",
+      cancel_reason: "Sync data already exists for another device.",
     });
     const cancel = vi.spyOn(backend(), "cancelSparseV2");
     const root = document.createElement("div");
@@ -242,8 +243,14 @@ describe("Settings sparse-v2 authority transitions", () => {
     const dispose = render(() => <Settings />, root);
     await showSparsePanel(root);
 
-    expect(root.textContent).not.toContain("Return to standard Markdown mode");
-    expect(root.textContent).toContain("Shared/provider sparse-v2 evidence exists.");
+    expect(
+      [...root.querySelectorAll("button")].find(
+        (button) => button.textContent === "Return to Direct Markdown"
+      )
+    ).toBeUndefined();
+    expect(root.textContent).toContain(
+      "Return to Direct Markdown is unavailable because safety could not be verified."
+    );
     expect(cancel).not.toHaveBeenCalled();
     dispose();
   });
