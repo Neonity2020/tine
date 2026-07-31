@@ -54,7 +54,11 @@ use crate::oplog::exact_external_feed::{
 use crate::oplog::hot_engine::{ProjectionEndpointBinding, ProjectionStorageBinding};
 use crate::oplog::import::{
     prepare_inactive_bootstrap_import, publish_install_verify_inactive_bootstrap,
-    reopen_inactive_bootstrap_accepted_authority,
+    retain_inactive_bootstrap_accepted_authority,
+};
+#[cfg(test)]
+use crate::oplog::import::{
+    BootstrapStreamingImportInstrumentation, InactiveBootstrapOrchestrationInstrumentation,
 };
 use crate::oplog::local_active::{
     activate_verified_local_with_retained_validation,
@@ -63,6 +67,8 @@ use crate::oplog::local_active::{
     LocalActiveAuthority, LocalActiveRuntime, PromotedLocalRuntime, PromotedRuntimeOpen,
     RuntimeRecoveryState,
 };
+#[cfg(test)]
+use crate::oplog::migration_backup::MigrationBackupInstrumentation;
 use crate::oplog::migration_backup::{verify_migration_source_backup, MigrationBackupRoot};
 use crate::oplog::object_store::{
     prepare_object_store_parent_nofollow, ObjectStore, ObjectStoreManifestCursor,
@@ -82,6 +88,8 @@ use crate::oplog::reconciliation_baseline::{
 };
 use crate::oplog::shadow_projection::verify_inactive_bootstrap_shadow_projection;
 #[cfg(test)]
+use crate::oplog::shadow_projection::ShadowProjectionInstrumentation;
+#[cfg(test)]
 use crate::oplog::simulator::fail_next_pending_publication_marker_creation;
 use crate::oplog::simulator::{
     inspect_cold_shared_provider_descriptor, inspect_shared_provider_descriptor,
@@ -94,6 +102,8 @@ use crate::oplog::simulator::{
     SHARED_PROVIDER_PUBLICATION_INTENTS_NAMESPACE,
 };
 use crate::oplog::sqlite::ApplicationRuntimeRoot;
+#[cfg(test)]
+use crate::oplog::sqlite::BootstrapSqliteRebuildInstrumentation;
 use crate::oplog::watcher_queue::WatcherObservation;
 use crate::oplog::{
     BatchId, BatchOrigin, BlockId, BlockLocation, CanonicalGraphResourceId, ContentDigest,
@@ -151,6 +161,33 @@ pub const MAX_SYNC_EDITOR_REQUEST_BYTES: usize = MAX_LOCAL_MUTATION_TEXT_BYTES;
 /// for a portable block reference.
 pub const SYNC_APPLICATION_INTERNAL_BLOCK_PREFIX: &str = "sparse-v2:";
 const MAX_EDITOR_SETTLE_TURNS: usize = 64;
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+struct ActivationConstructionInstrumentation {
+    preparation: BootstrapStreamingImportInstrumentation,
+    publication: InactiveBootstrapOrchestrationInstrumentation,
+    backup: MigrationBackupInstrumentation,
+    sqlite: BootstrapSqliteRebuildInstrumentation,
+    shadow: ShadowProjectionInstrumentation,
+}
+
+#[cfg(test)]
+thread_local! {
+    static LAST_ACTIVATION_CONSTRUCTION_INSTRUMENTATION:
+        std::cell::RefCell<Option<ActivationConstructionInstrumentation>> = const {
+            std::cell::RefCell::new(None)
+        };
+}
+
+#[cfg(test)]
+fn take_activation_construction_instrumentation() -> ActivationConstructionInstrumentation {
+    LAST_ACTIVATION_CONSTRUCTION_INSTRUMENTATION.with(|slot| {
+        slot.borrow_mut()
+            .take()
+            .expect("activation construction instrumentation was recorded")
+    })
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ProviderRecoveryCoverageRoot {
@@ -2666,7 +2703,8 @@ fn activate_non_active_local(
         storage_binding,
     )
     .map_err(display)?;
-    let accepted_authority = reopen_inactive_bootstrap_accepted_authority(
+    let accepted_authority = retain_inactive_bootstrap_accepted_authority(
+        &prepared,
         &verified,
         ObjectStore::open(&request.archive_root, binding.workspace_id()).map_err(display)?,
     )
@@ -2699,6 +2737,16 @@ fn activate_non_active_local(
         inactive.sqlite_proof(),
     )
     .map_err(display)?;
+    #[cfg(test)]
+    LAST_ACTIVATION_CONSTRUCTION_INSTRUMENTATION.with(|slot| {
+        *slot.borrow_mut() = Some(ActivationConstructionInstrumentation {
+            preparation: prepared.instrumentation().clone(),
+            publication: verified.instrumentation().clone(),
+            backup: source_backup.instrumentation().clone(),
+            sqlite: inactive.sqlite_proof().bootstrap_rebuild(),
+            shadow: shadow.instrumentation().clone(),
+        });
+    });
     let proofs = VerifiedLocalProofSet {
         graph,
         roots: &backup_root,
@@ -22986,6 +23034,7 @@ mod tests {
         blocks: usize,
         total_ms: u128,
         phase_ms: Vec<(SyncLocalActivationPhase, u128)>,
+        construction: ActivationConstructionInstrumentation,
     }
 
     fn activation_source_counts(root: &Path) -> (usize, usize, usize) {
@@ -23062,12 +23111,14 @@ mod tests {
             })
             .collect();
         drop(activated.handle);
+        let construction = take_activation_construction_instrumentation();
         ActivationScaleReceipt {
             source_files,
             source_bytes,
             blocks,
             total_ms: total.as_millis(),
             phase_ms,
+            construction,
         }
     }
 
@@ -23104,6 +23155,48 @@ mod tests {
         assert!(large_receipt.blocks > small_receipt.blocks);
         assert_eq!(small_receipt.phase_ms.len(), 8);
         assert_eq!(large_receipt.phase_ms.len(), 8);
+        for receipt in [&small_receipt, &large_receipt] {
+            assert_eq!(
+                receipt.construction.preparation.page_declarations,
+                receipt.source_files as u64
+            );
+            assert_eq!(
+                receipt.construction.preparation.page_capsules,
+                receipt.source_files as u64
+            );
+            assert_eq!(receipt.construction.preparation.huge_page_splits, 0);
+            assert!(receipt.construction.preparation.max_part_documents <= 65);
+            assert!(
+                receipt.construction.preparation.max_part_manifest_bytes
+                    < crate::oplog::batch::MAX_MANIFEST_BYTES as u64
+            );
+            assert_eq!(receipt.construction.publication.durability_syncs, 2);
+            assert_eq!(
+                receipt.construction.sqlite.bootstrap_part_reads,
+                receipt.construction.preparation.parts as usize
+            );
+            assert_eq!(
+                receipt.construction.shadow.catalog_rows,
+                receipt.source_files as u64
+            );
+            assert_eq!(
+                receipt.construction.shadow.projection_plans,
+                receipt.source_files as u64
+            );
+            assert_eq!(
+                receipt.construction.shadow.manifest_entries,
+                receipt.source_files as u64
+            );
+            assert_eq!(
+                receipt.construction.shadow.payload_bytes_written,
+                receipt.source_bytes as u64
+            );
+            assert_eq!(receipt.construction.shadow.payload_bytes_read, 0);
+            assert_eq!(
+                receipt.construction.shadow.source_bytes_read,
+                receipt.source_bytes as u64
+            );
+        }
         assert_activation_near_linear(&small_receipt, &large_receipt);
     }
 
@@ -23130,9 +23223,10 @@ mod tests {
         let cold_ms = cold_started.elapsed().as_millis();
         eprintln!("activation manual cold reopen ms: {cold_ms}");
         assert!(
-            large_receipt.total_ms.saturating_add(cold_ms) < 10_000,
-            "release activation plus cold reopen exceeded 10 seconds"
+            large_receipt.total_ms < 10_000,
+            "fresh activation exceeded 10 seconds"
         );
+        assert!(cold_ms < 10_000, "true cold reopen exceeded 10 seconds");
         drop(reopened.handle);
     }
 

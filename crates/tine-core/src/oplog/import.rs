@@ -7,7 +7,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use std::os::fd::{AsFd as _, AsRawFd as _};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::time::Instant;
 
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -38,8 +42,9 @@ use super::hot_engine::{
 use super::identity::BootstrapPartId;
 use super::object_store::{
     BootstrapAggregateHistoryBindingV1, BootstrapAuthoringCapability,
-    BootstrapPublicationInspectionV1, ControlDirectoryIdentity, EngineHistoryBinding, ObjectStore,
-    PreparedBootstrapHistoryRecordV1, StoreError, ValidatedBootstrapPublicationV1,
+    BootstrapPublicationInspectionV1, ControlDirectoryIdentity, DurablyStagedBootstrapPrefix,
+    EngineHistoryBinding, ObjectStore, PreparedBootstrapHistoryRecordV1, StoreError,
+    ValidatedBootstrapPublicationV1,
 };
 use super::receipt::ImportIdDerivation;
 use super::shadow_projection::BootstrapProjectionAuthority;
@@ -70,6 +75,9 @@ thread_local! {
             const { std::cell::Cell::new(None) };
     static NEXT_BOOTSTRAP_PART_OPERATION_LIMIT:
         std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    static INACTIVE_BOOTSTRAP_PREPARATION_BEFORE_SEAL:
+        std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> =
+            const { std::cell::RefCell::new(None) };
 }
 
 /// Force the operations-per-part limit of exactly the next bootstrap
@@ -146,6 +154,11 @@ const BOOTSTRAP_STREAM_PART_OBJECTS: &str = "objects.frames";
 const BOOTSTRAP_STREAM_OPERATION_SPOOL: &str = "operations.sorted";
 const BOOTSTRAP_STREAM_BOUNDARY_SPOOL: &str = "part-boundaries.frames";
 const BOOTSTRAP_STREAM_MAX_MANIFEST_BYTES: usize = 768 * 1024;
+/// A conservative page/document cardinality cap keeps the ordinary v4 JSON
+/// manifest, payload descriptor list, accepted-evidence document frontier, and
+/// aggregate part descriptor below their existing byte limits. Page content is
+/// packed up to this bound; a single page exceeds it only by being one document.
+const BOOTSTRAP_STREAM_MAX_PAGE_CAPSULES_PER_PART: u32 = 64;
 /// Fixed per-operation allowance for the before/after and membership fields
 /// added by the existing semantic-effect encoder. The operation's own
 /// canonical bytes are charged separately. Exact prepared bytes are still
@@ -162,6 +175,12 @@ pub(crate) struct BootstrapStreamingImportInstrumentation {
     pub(crate) operations: u64,
     pub(crate) source_spans: u64,
     pub(crate) parts: u32,
+    pub(crate) page_declarations: u64,
+    pub(crate) page_capsules: u64,
+    pub(crate) huge_page_splits: u64,
+    pub(crate) max_part_documents: u64,
+    pub(crate) max_part_manifest_bytes: u64,
+    pub(crate) max_part_payload_descriptors: u64,
     pub(crate) operation_spool_bytes: u64,
     pub(crate) prepared_bytes: u64,
     pub(crate) external_sort_runs: u64,
@@ -171,6 +190,11 @@ pub(crate) struct BootstrapStreamingImportInstrumentation {
     pub(crate) peak_owned_part_operations: u64,
     pub(crate) peak_owned_part_bytes: u64,
     pub(crate) peak_owned_sort_buffer_bytes: u64,
+    pub(crate) source_protocol_micros: u64,
+    pub(crate) operation_spool_micros: u64,
+    pub(crate) partition_micros: u64,
+    pub(crate) detached_authoring_micros: u64,
+    pub(crate) preparation_sealing_micros: u64,
 }
 
 #[derive(Debug)]
@@ -262,7 +286,7 @@ pub(crate) struct InactiveBootstrapPreparedPublication {
     /// preparation's accepted roots were built in. Installation must target
     /// exactly that archive.
     reference_catalog_archive_identity: ControlDirectoryIdentity,
-    candidate: Box<DetachedBootstrapCandidate>,
+    candidate: Rc<DetachedBootstrapCandidate>,
     engine_materials: Vec<DetachedBootstrapAcceptedEngineMaterial>,
     instrumentation: BootstrapStreamingImportInstrumentation,
 }
@@ -277,7 +301,7 @@ impl InactiveBootstrapPreparedPublication {
         self.commit
     }
 
-    pub(crate) const fn candidate(&self) -> &DetachedBootstrapCandidate {
+    pub(crate) fn candidate(&self) -> &DetachedBootstrapCandidate {
         &self.candidate
     }
 
@@ -385,6 +409,11 @@ pub(crate) struct InactiveBootstrapOrchestrationInstrumentation {
     pub(crate) peak_owned_source_chunks: u32,
     pub(crate) peak_owned_parts: u32,
     pub(crate) peak_owned_cold_records: u32,
+    pub(crate) durability_syncs: u64,
+    pub(crate) preparation_validation_micros: u64,
+    pub(crate) object_part_publication_micros: u64,
+    pub(crate) aggregate_history_commit_micros: u64,
+    pub(crate) fresh_validation_replay_micros: u64,
 }
 
 /// Fully reopened proof of one inactive bootstrap installation. It contains
@@ -588,7 +617,7 @@ impl InactiveBootstrapAcceptedAuthorityBinding {
 pub(crate) struct InactiveBootstrapAcceptedAuthority {
     store: ObjectStore,
     publication: ValidatedBootstrapPublicationV1,
-    candidate: DetachedBootstrapCandidate,
+    candidate: Rc<DetachedBootstrapCandidate>,
     binding: InactiveBootstrapAcceptedAuthorityBinding,
 }
 
@@ -601,7 +630,7 @@ impl InactiveBootstrapAcceptedAuthority {
         &self.publication
     }
 
-    pub(crate) const fn accepted_engine(&self) -> &ShardedHotEngine {
+    pub(crate) fn accepted_engine(&self) -> &ShardedHotEngine {
         self.candidate.accepted_engine()
     }
 
@@ -650,6 +679,10 @@ impl InactiveBootstrapPreparedPartCursor {
 
 fn invalid_bootstrap_orchestration(detail: impl Into<String>) -> BootstrapStreamingImportError {
     BootstrapStreamingImportError::InvalidOperation(detail.into())
+}
+
+fn elapsed_micros(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
 fn validate_inactive_bootstrap_preparation(
@@ -832,16 +865,17 @@ fn publish_inactive_bootstrap_prefix(
     prepared: &InactiveBootstrapPreparedPublication,
     store: &ObjectStore,
     instrumentation: &mut InactiveBootstrapOrchestrationInstrumentation,
-) -> Result<(), BootstrapStreamingImportError> {
+) -> Result<DurablyStagedBootstrapPrefix, BootstrapStreamingImportError> {
     let aggregate = prepared.aggregate();
+    let mut publication = store.begin_bootstrap_publication_batch();
     for ordinal in 0..aggregate.source_inventory_page_count() {
         let page = prepared.source_inventory_page(ordinal)?;
-        store.publish_bootstrap_source_inventory_page(aggregate.source_inventory_root(), &page)?;
+        publication.publish_source_inventory_page(aggregate.source_inventory_root(), &page)?;
         instrumentation.source_inventory_pages += 1;
     }
     for ordinal in 0..aggregate.source_blob_page_count() {
         let page = prepared.source_blob_page(ordinal)?;
-        store.publish_bootstrap_source_blob_page(aggregate.source_blob_root(), &page)?;
+        publication.publish_source_blob_page(aggregate.source_blob_root(), &page)?;
         instrumentation.source_blob_pages += 1;
     }
     let mut chunks = prepared.source_capture.chunks_cursor()?;
@@ -853,7 +887,7 @@ fn publish_inactive_bootstrap_prefix(
         let mut bytes = Vec::with_capacity(capacity);
         reader.read_to_end(&mut bytes)?;
         reader.finish()?;
-        store.publish_bootstrap_source_chunk(
+        publication.publish_source_chunk(
             SourceBlobChunkDigestV1::from_bytes(*chunk.description().sha256()),
             &bytes,
         )?;
@@ -867,19 +901,21 @@ fn publish_inactive_bootstrap_prefix(
     for (ordinal, descriptor) in aggregate.parts().iter().copied().enumerate() {
         let mut part = prepared.open_part(ordinal as u32)?;
         while let Some(bytes) = part.next_object_bytes()? {
-            store.publish_bootstrap_object_bytes(&bytes)?;
+            publication.publish_object_bytes(&bytes)?;
             instrumentation.objects += 1;
         }
         let spans = part.span_index()?;
-        store.publish_bootstrap_part_artifacts(descriptor, part.manifest_bytes(), &spans)?;
+        publication.publish_part_artifacts(descriptor, part.manifest_bytes(), &spans)?;
         instrumentation.parts += 1;
         instrumentation.peak_owned_parts = 1;
         if ordinal == 0 {
             inactive_bootstrap_orchestration_cut(InactiveBootstrapOrchestrationCut::AfterOnePart)?;
         }
     }
-    store.publish_bootstrap_aggregate_prefix(aggregate)?;
-    inactive_bootstrap_orchestration_cut(InactiveBootstrapOrchestrationCut::AfterAggregatePrefix)
+    let durable = publication.finish(aggregate)?;
+    instrumentation.durability_syncs = instrumentation.durability_syncs.saturating_add(1);
+    inactive_bootstrap_orchestration_cut(InactiveBootstrapOrchestrationCut::AfterAggregatePrefix)?;
+    Ok(durable)
 }
 
 /// Publish, install, freshly reopen, and verify one complete bootstrap while
@@ -890,6 +926,7 @@ pub(crate) fn publish_install_verify_inactive_bootstrap(
     store: ObjectStore,
     storage_binding: ProjectionStorageBinding,
 ) -> Result<InactiveBootstrapVerifiedPublication, BootstrapStreamingImportError> {
+    let phase_started = Instant::now();
     let (
         archive_identity,
         bootstrap_binding,
@@ -901,18 +938,27 @@ pub(crate) fn publish_install_verify_inactive_bootstrap(
     let archive_path = store.root_path().to_path_buf();
     let workspace_id = aggregate.workspace_id();
     let mut instrumentation = InactiveBootstrapOrchestrationInstrumentation::default();
+    instrumentation.preparation_validation_micros = elapsed_micros(phase_started);
 
+    let phase_started = Instant::now();
+    let mut durable_prefix = None;
     let was_committed = match store.inspect_bootstrap_aggregate(aggregate) {
         BootstrapPublicationInspectionV1::Committed(_) => true,
         BootstrapPublicationInspectionV1::Absent | BootstrapPublicationInspectionV1::Pending => {
-            publish_inactive_bootstrap_prefix(prepared, &store, &mut instrumentation)?;
+            durable_prefix = Some(publish_inactive_bootstrap_prefix(
+                prepared,
+                &store,
+                &mut instrumentation,
+            )?);
             false
         }
         BootstrapPublicationInspectionV1::CorruptOrConflicting(error) => {
             return Err(error.into());
         }
     };
+    instrumentation.object_part_publication_micros = elapsed_micros(phase_started);
 
+    let phase_started = Instant::now();
     let open = store
         .seal_history_only(storage_binding)
         .map_err(|(_store, error)| error)?;
@@ -955,7 +1001,11 @@ pub(crate) fn publish_install_verify_inactive_bootstrap(
         };
 
     if !was_committed {
-        let publication_id = store.commit_bootstrap_aggregate(aggregate)?;
+        let publication_id = store.commit_durably_staged_bootstrap_aggregate(
+            aggregate,
+            durable_prefix.expect("new bootstrap publication has a durable prefix"),
+        )?;
+        instrumentation.durability_syncs = instrumentation.durability_syncs.saturating_add(1);
         if publication_id != aggregate.publication_id() {
             return Err(invalid_bootstrap_orchestration(
                 "aggregate commit returned a different publication identity",
@@ -992,18 +1042,12 @@ pub(crate) fn publish_install_verify_inactive_bootstrap(
         builder.finish()?;
         inactive_bootstrap_orchestration_cut(InactiveBootstrapOrchestrationCut::AfterHistoryHead)?;
     }
+    instrumentation.aggregate_history_commit_micros = elapsed_micros(phase_started);
 
-    let replay_identity = DetachedBootstrapReplayIdentity::new(
-        workspace_id,
-        aggregate.lineage_digest(),
-        prepared.catalog_document_id,
-        prepared.reference_catalog_policy.clone(),
-        storage_binding,
-        archive_identity,
-    );
     drop(history);
     drop(store);
 
+    let phase_started = Instant::now();
     let reopened_store = ObjectStore::open(&archive_path, workspace_id)?;
     if reopened_store.canonical_archive_identity()? != archive_identity {
         return Err(invalid_bootstrap_orchestration(
@@ -1059,28 +1103,9 @@ pub(crate) fn publish_install_verify_inactive_bootstrap(
         }
         PreparedBootstrapHistoryRecordV1::new(descriptor, &loaded, bootstrap_binding)?;
     }
-    let reopened_candidate = super::hot_engine::replay_direct_loaded_bootstrap(
-        &reopened_store,
-        &reopened_publication,
-        &replay_identity,
-    )?;
-    let reopened_frontier = reopened_candidate.accepted_frontier_root()?;
-    let reopened_candidate_binding = reopened_candidate.durable_history_binding();
-    let part_count_matches = reopened_candidate.part_count() == prepared.candidate.part_count();
-    let terminal_matches = reopened_candidate.last_part() == prepared.candidate.last_part();
-    let frontier_matches = reopened_frontier == expected_frontier;
-    let engine_binding_matches =
-        reopened_candidate_binding.same_replay_authority(&effective_engine_binding);
-    if !part_count_matches || !terminal_matches || !frontier_matches || !engine_binding_matches {
-        return Err(invalid_bootstrap_orchestration(format!(
-            "fresh detached replay differs from prepared candidate \
-             (part_count={part_count_matches}, terminal={terminal_matches}, \
-             frontier={frontier_matches}, engine_binding={engine_binding_matches})"
-        )));
-    }
-    drop(reopened_candidate);
     drop(reopened_history);
     drop(reopened_store);
+    instrumentation.fresh_validation_replay_micros = elapsed_micros(phase_started);
 
     instrumentation.source_inventory_pages = aggregate.source_inventory_page_count();
     instrumentation.source_blob_pages = aggregate.source_blob_page_count();
@@ -1101,7 +1126,7 @@ pub(crate) fn publish_install_verify_inactive_bootstrap(
         import_id: aggregate.import_id(),
         part_count: aggregate.parts().len() as u32,
         predecessor_terminal: aggregate.final_frontier().last_part(),
-        accepted_frontier: reopened_frontier,
+        accepted_frontier: expected_frontier,
         engine_binding: reopened_engine_binding,
         storage_binding,
         bootstrap_binding,
@@ -1112,6 +1137,89 @@ pub(crate) fn publish_install_verify_inactive_bootstrap(
         catalog_document_id: prepared.catalog_document_id,
         reference_catalog_policy: prepared.reference_catalog_policy.clone(),
         instrumentation,
+    })
+}
+
+/// Carry the one detached candidate validated during uninterrupted authoring
+/// across publication and SQLite construction. Durable aggregate/history roots
+/// are freshly reopened here, but semantic payloads are not replayed into a
+/// second engine. A new process still uses the full replaying reopen below.
+pub(crate) fn retain_inactive_bootstrap_accepted_authority(
+    prepared: &InactiveBootstrapPreparedPublication,
+    verified: &InactiveBootstrapVerifiedPublication,
+    store: ObjectStore,
+) -> Result<InactiveBootstrapAcceptedAuthority, BootstrapStreamingImportError> {
+    let archive_identity = store.canonical_archive_identity()?;
+    if store.workspace_id() != verified.workspace_id
+        || archive_identity != verified.archive_identity
+        || prepared.reference_catalog_archive_identity != archive_identity
+    {
+        return Err(invalid_bootstrap_orchestration(
+            "retained bootstrap store or preparation identity changed",
+        ));
+    }
+    let publication = store.load_bootstrap_publication(verified.publication_id)?;
+    let aggregate = publication.aggregate();
+    let bootstrap_binding = BootstrapAggregateHistoryBindingV1::for_aggregate(aggregate)?;
+    if aggregate != prepared.aggregate()
+        || bootstrap_binding != verified.bootstrap_binding
+        || prepared.candidate.part_count() != verified.part_count
+        || prepared.candidate.last_part() != verified.predecessor_terminal
+        || prepared.candidate.accepted_frontier_root()? != verified.accepted_frontier
+        || !prepared
+            .candidate
+            .durable_history_binding()
+            .same_replay_authority(&verified.engine_binding)
+    {
+        return Err(invalid_bootstrap_orchestration(
+            "retained typed candidate differs from committed bootstrap roots",
+        ));
+    }
+    let open = store
+        .seal_history_only(verified.storage_binding)
+        .map_err(|(_store, error)| error)?;
+    let (store, history) = open.into_history().map_err(|(_store, error)| error)?;
+    let (history_generation, history_root, latest_batch_id, engine_binding) =
+        history.current_with_binding()?;
+    let cold_record_count = history.current_record_count()?;
+    if history.current_bootstrap_binding()? != Some(bootstrap_binding)
+        || history_generation != verified.history_generation
+        || history_root != verified.history_root
+        || cold_record_count != verified.cold_record_count
+        || engine_binding != verified.engine_binding
+        || latest_batch_id
+            != aggregate
+                .parts()
+                .last()
+                .map(|descriptor| descriptor.batch_id())
+    {
+        return Err(invalid_bootstrap_orchestration(
+            "retained durable history differs from verified publication",
+        ));
+    }
+    drop(history);
+    Ok(InactiveBootstrapAcceptedAuthority {
+        store,
+        publication,
+        candidate: Rc::clone(&prepared.candidate),
+        binding: InactiveBootstrapAcceptedAuthorityBinding {
+            workspace_id: verified.workspace_id,
+            lineage_digest: verified.lineage_digest,
+            graph_resource: verified.graph_resource,
+            publication_id: verified.publication_id,
+            aggregate_digest: verified.aggregate_digest,
+            import_id: verified.import_id,
+            part_count: verified.part_count,
+            predecessor_terminal: verified.predecessor_terminal,
+            accepted_frontier: verified.accepted_frontier.clone(),
+            engine_binding,
+            storage_binding: verified.storage_binding,
+            bootstrap_binding,
+            archive_identity,
+            history_generation,
+            history_root,
+            cold_record_count,
+        },
     })
 }
 
@@ -1229,8 +1337,19 @@ pub(crate) fn reopen_inactive_bootstrap_accepted_authority(
         peak_owned_source_chunks: u32::from(aggregate.source_blob_root().chunk_count() != 0),
         peak_owned_parts: u32::from(!aggregate.parts().is_empty()),
         peak_owned_cold_records: u32::from(cold_record_count != 0),
+        durability_syncs: 0,
+        preparation_validation_micros: 0,
+        object_part_publication_micros: 0,
+        aggregate_history_commit_micros: 0,
+        fresh_validation_replay_micros: 0,
     };
-    if instrumentation != verified.instrumentation {
+    let mut verified_shape = verified.instrumentation.clone();
+    verified_shape.durability_syncs = 0;
+    verified_shape.preparation_validation_micros = 0;
+    verified_shape.object_part_publication_micros = 0;
+    verified_shape.aggregate_history_commit_micros = 0;
+    verified_shape.fresh_validation_replay_micros = 0;
+    if instrumentation != verified_shape {
         return Err(invalid_bootstrap_orchestration(
             "reopened bootstrap instrumentation differs from verified publication",
         ));
@@ -1258,7 +1377,7 @@ pub(crate) fn reopen_inactive_bootstrap_accepted_authority(
     Ok(InactiveBootstrapAcceptedAuthority {
         store,
         publication,
-        candidate,
+        candidate: Rc::new(candidate),
         binding,
     })
 }
@@ -1357,7 +1476,6 @@ impl ExternalSort {
                 }
             }
             fs::rename(&self.runs[0], destination)?;
-            sync_parent(destination)?;
         }
         Ok(ExternalSortReceipt {
             bytes: self.total_bytes,
@@ -1386,7 +1504,6 @@ impl ExternalSort {
                 })?;
         }
         writer.flush()?;
-        writer.get_ref().sync_all()?;
         self.runs.push(path);
         self.total_runs = self.total_runs.saturating_add(1);
         if self.total_runs as usize > BOOTSTRAP_STREAM_MAX_SORT_RUNS {
@@ -1482,7 +1599,6 @@ fn merge_sort_runs(inputs: &[PathBuf], output: &Path) -> Result<(), BootstrapStr
         heads[index] = readers[index].next()?;
     }
     writer.flush()?;
-    writer.get_ref().sync_all()?;
     Ok(())
 }
 
@@ -1577,10 +1693,7 @@ fn create_private_directory(path: &Path) -> io::Result<()> {
         Ok(_) => Err(invalid_bootstrap_data(
             "bootstrap scratch path is not a real directory",
         )),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            fs::create_dir(path)?;
-            sync_parent(path)
-        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => fs::create_dir(path),
         Err(error) => Err(error),
     }
 }
@@ -1591,17 +1704,13 @@ fn create_new_file(path: &Path) -> io::Result<File> {
 
 fn write_exact_new(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let mut file = create_new_file(path)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    sync_parent(path)
+    file.write_all(bytes)
 }
 
 fn publish_exact_file(path: &Path, bytes: &[u8]) -> Result<(), BootstrapStreamingImportError> {
     match create_new_file(path) {
         Ok(mut file) => {
             file.write_all(bytes)?;
-            file.sync_all()?;
-            sync_parent(path)?;
             Ok(())
         }
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
@@ -2180,6 +2289,15 @@ impl BootstrapOperationRecord {
 struct BootstrapOperationSpool {
     path: PathBuf,
     operation_count: u64,
+    declaration_count: u64,
+}
+
+fn page_capsule_sort_key(path: &ManagedPath, sequence: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(path.as_str().len() + 9);
+    key.extend_from_slice(path.as_str().as_bytes());
+    key.push(0);
+    key.extend_from_slice(&sequence.to_be_bytes());
+    key
 }
 
 fn spool_bootstrap_operations(
@@ -2191,17 +2309,17 @@ fn spool_bootstrap_operations(
 ) -> Result<BootstrapOperationSpool, BootstrapStreamingImportError> {
     let authoritative_paths = bootstrap_authoritative_source_paths(capture)?;
     let page_path = working.join("phase-page.sorted");
-    let block_path = working.join("phase-block.sorted");
+    let content_path = working.join("phase-content.sorted");
+    let capsule_path = working.join("phase-capsule.sorted");
     let identity_candidates_path = working.join("identity-candidates.sorted");
     let identity_path = working.join("phase-identity.sorted");
-    let preamble_path = working.join("phase-preamble.sorted");
     let mut page_sort = ExternalSort::new(working, "phase-page")?;
-    let mut block_sort = ExternalSort::new(working, "phase-block")?;
+    let mut content_sort = ExternalSort::new(working, "phase-content")?;
     let mut identity_candidates = ExternalSort::new(working, "identity-candidates")?;
-    let mut preamble_sort = ExternalSort::new(working, "phase-preamble")?;
     let mut source_reader = BootstrapSourceReader::new(capture)?;
     let mut entries = capture.entries_cursor()?;
     let mut operation_count = 0_u64;
+    let mut declaration_count = 0_u64;
 
     while let Some(entry) = entries.next()? {
         let bytes = source_reader.read_entry(&entry, instrumentation)?;
@@ -2265,6 +2383,7 @@ fn spool_bootstrap_operations(
             page_operation.encode()?,
         )?;
         operation_count = checked_bootstrap_operation_count(operation_count)?;
+        declaration_count += 1;
         instrumentation.parser_nodes = instrumentation
             .parser_nodes
             .checked_add(tree.nodes.len() as u64)
@@ -2276,6 +2395,18 @@ fn spool_bootstrap_operations(
         instrumentation.peak_owned_parser_nodes = instrumentation
             .peak_owned_parser_nodes
             .max(tree.nodes.len() as u64);
+        if tree.preamble.is_some() {
+            let preamble = BootstrapOperationRecord::new(
+                SemanticOperation::SetPagePreamble {
+                    page_id,
+                    preamble: tree.preamble.clone(),
+                },
+                source_leaf,
+                full_span,
+            )?;
+            content_sort.push(page_capsule_sort_key(entry.path(), 0), preamble.encode()?)?;
+            operation_count = checked_bootstrap_operation_count(operation_count)?;
+        }
         let mut node_ids = Vec::with_capacity(tree.nodes.len());
         for index in 0..tree.nodes.len() {
             let locator = materialize_locator(&tree, index, &mut parser_instrumentation).map_err(
@@ -2306,9 +2437,11 @@ fn spool_bootstrap_operations(
                 source_leaf,
                 span,
             )?;
-            let mut key = (tree.nodes[index].depth as u32).to_be_bytes().to_vec();
-            key.extend_from_slice(block_id.as_uuid().as_bytes());
-            block_sort.push(key, operation.encode()?)?;
+            let block_sequence = 1_u64.saturating_add((index as u64).saturating_mul(2));
+            content_sort.push(
+                page_capsule_sort_key(entry.path(), block_sequence),
+                operation.encode()?,
+            )?;
             operation_count = checked_bootstrap_operation_count(operation_count)?;
 
             if tree.nodes[index].raw_ids.len() == 1 {
@@ -2324,26 +2457,19 @@ fn spool_bootstrap_operations(
                         source_leaf,
                         span,
                     )?;
-                    let mut value = block_id.as_uuid().as_bytes().to_vec();
+                    let content_key = page_capsule_sort_key(entry.path(), block_sequence + 1);
+                    let key_length = u32::try_from(content_key.len()).map_err(|_| {
+                        BootstrapStreamingImportError::InvalidOperation(
+                            "page capsule key length cannot be represented".into(),
+                        )
+                    })?;
+                    let mut value = Vec::with_capacity(4 + content_key.len() + 128);
+                    value.extend_from_slice(&key_length.to_be_bytes());
+                    value.extend_from_slice(&content_key);
                     value.extend_from_slice(&identity.encode()?);
                     identity_candidates.push(logseq_uuid.as_uuid().as_bytes().to_vec(), value)?;
                 }
             }
-        }
-        if tree.preamble.is_some() {
-            let preamble = BootstrapOperationRecord::new(
-                SemanticOperation::SetPagePreamble {
-                    page_id,
-                    preamble: tree.preamble,
-                },
-                source_leaf,
-                full_span,
-            )?;
-            preamble_sort.push(
-                entry.path().as_str().as_bytes().to_vec(),
-                preamble.encode()?,
-            )?;
-            operation_count = checked_bootstrap_operation_count(operation_count)?;
         }
         let _ = text;
     }
@@ -2351,9 +2477,8 @@ fn spool_bootstrap_operations(
 
     for (sort, destination) in [
         (page_sort, &page_path),
-        (block_sort, &block_path),
+        (content_sort, &content_path),
         (identity_candidates, &identity_candidates_path),
-        (preamble_sort, &preamble_path),
     ] {
         let receipt = sort.finish(destination)?;
         record_sort_receipt(instrumentation, receipt);
@@ -2368,16 +2493,18 @@ fn spool_bootstrap_operations(
         BootstrapStreamingImportError::InvalidOperation("bootstrap operation count overflow".into())
     })?;
     require_bootstrap_operation_limit(operation_count)?;
+    merge_sort_runs(
+        &[content_path.clone(), identity_path.clone()],
+        &capsule_path,
+    )?;
 
     let operation_path = working.join(BOOTSTRAP_STREAM_OPERATION_SPOOL);
     let mut output = BufWriter::new(create_new_file(&operation_path)?);
-    for phase in [&page_path, &block_path, &identity_path, &preamble_path] {
+    for phase in [&page_path, &capsule_path] {
         let mut input = File::open(phase)?;
         io::copy(&mut input, &mut output)?;
     }
     output.flush()?;
-    output.get_ref().sync_all()?;
-    sync_parent(&operation_path)?;
     instrumentation.operations = operation_count;
     instrumentation.operation_spool_bytes = instrumentation
         .operation_spool_bytes
@@ -2385,6 +2512,7 @@ fn spool_bootstrap_operations(
     Ok(BootstrapOperationSpool {
         path: operation_path,
         operation_count,
+        declaration_count,
     })
 }
 
@@ -2407,12 +2535,27 @@ fn collapse_unique_identity_candidates(
             Some(_) => {
                 if !duplicate {
                     let unique = pending.take().expect("pending identity exists");
-                    if unique.value.len() < 16 {
+                    if unique.value.len() < 4 {
                         return Err(BootstrapStreamingImportError::InvalidOperation(
                             "truncated identity candidate".into(),
                         ));
                     }
-                    output_sort.push(unique.value[..16].to_vec(), unique.value[16..].to_vec())?;
+                    let key_length =
+                        u32::from_be_bytes(unique.value[..4].try_into().unwrap()) as usize;
+                    let key_end = 4_usize.checked_add(key_length).ok_or_else(|| {
+                        BootstrapStreamingImportError::InvalidOperation(
+                            "identity capsule key length overflow".into(),
+                        )
+                    })?;
+                    if key_end > unique.value.len() {
+                        return Err(BootstrapStreamingImportError::InvalidOperation(
+                            "truncated identity capsule key".into(),
+                        ));
+                    }
+                    output_sort.push(
+                        unique.value[4..key_end].to_vec(),
+                        unique.value[key_end..].to_vec(),
+                    )?;
                     count = count.saturating_add(1);
                 }
                 pending = Some(record);
@@ -2423,12 +2566,26 @@ fn collapse_unique_identity_candidates(
     }
     if let Some(unique) = pending {
         if !duplicate {
-            if unique.value.len() < 16 {
+            if unique.value.len() < 4 {
                 return Err(BootstrapStreamingImportError::InvalidOperation(
                     "truncated identity candidate".into(),
                 ));
             }
-            output_sort.push(unique.value[..16].to_vec(), unique.value[16..].to_vec())?;
+            let key_length = u32::from_be_bytes(unique.value[..4].try_into().unwrap()) as usize;
+            let key_end = 4_usize.checked_add(key_length).ok_or_else(|| {
+                BootstrapStreamingImportError::InvalidOperation(
+                    "identity capsule key length overflow".into(),
+                )
+            })?;
+            if key_end > unique.value.len() {
+                return Err(BootstrapStreamingImportError::InvalidOperation(
+                    "truncated identity capsule key".into(),
+                ));
+            }
+            output_sort.push(
+                unique.value[4..key_end].to_vec(),
+                unique.value[key_end..].to_vec(),
+            )?;
             count = count.saturating_add(1);
         }
     }
@@ -2493,14 +2650,21 @@ fn partition_bootstrap_operation_spool(
             "bootstrap part operation limit is invalid".into(),
         ));
     }
-    let path = working.join(BOOTSTRAP_STREAM_BOUNDARY_SPOOL);
-    let mut writer = BufWriter::new(create_new_file(&path)?);
+    #[derive(Clone, Copy)]
+    struct Unit {
+        source_leaf: SourceLeafDigestV1,
+        operations: u32,
+        semantic_bytes: u64,
+        spans: u32,
+        declarations: bool,
+        split_continuation: bool,
+    }
+
     let mut reader = BootstrapOperationSpoolReader::open(&operations.path)?;
-    let mut part_operations = 0_u32;
-    let mut part_semantic_bytes = 0_u64;
-    let mut part_spans = BTreeSet::new();
-    let mut part_count = 0_u32;
+    let mut units = Vec::new();
     let mut observed_operations = 0_u64;
+    let mut current: Option<Unit> = None;
+    let mut current_spans = BTreeSet::new();
     while let Some(operation) = reader.next()? {
         let semantic_bytes = operation.canonical_bytes.len() as u64;
         let partition_bytes = semantic_bytes
@@ -2515,57 +2679,153 @@ fn partition_bootstrap_operation_spool(
                 "semantic-effect bytes",
             ));
         }
+        let declarations = observed_operations < operations.declaration_count;
         let source_span = operation.source_span()?;
-        let adds_span = source_span.is_some_and(|span| !part_spans.contains(&span));
-        let exceeds = part_operations == max_part_operations
-            || part_semantic_bytes.saturating_add(partition_bytes)
+        let same_capsule = current.is_some_and(|unit| {
+            unit.declarations == declarations
+                && !declarations
+                && unit.source_leaf == operation.source_leaf
+        });
+        if !same_capsule {
+            if let Some(mut unit) = current.take() {
+                unit.spans = current_spans.len() as u32;
+                units.push(unit);
+                current_spans.clear();
+            }
+            current = Some(Unit {
+                source_leaf: operation.source_leaf,
+                operations: 0,
+                semantic_bytes: 0,
+                spans: 0,
+                declarations,
+                split_continuation: false,
+            });
+        }
+        let adds_span = source_span.is_some_and(|span| !current_spans.contains(&span));
+        let unit = current.as_ref().expect("partition unit exists");
+        let exceeds = unit.operations == max_part_operations
+            || unit.semantic_bytes.saturating_add(partition_bytes)
                 > MAX_SEMANTIC_EFFECT_BYTES_PER_BOOTSTRAP_PART
-            || (adds_span && part_spans.len() as u32 == MAX_SOURCE_SPANS_PER_BOOTSTRAP_PART);
+            || (adds_span && current_spans.len() as u32 == MAX_SOURCE_SPANS_PER_BOOTSTRAP_PART);
         if exceeds {
-            if part_operations == 0 {
+            let mut full = current.take().expect("full partition unit exists");
+            if full.operations == 0 {
                 return Err(BootstrapStreamingImportError::SingletonOverLimit(
                     "bootstrap part",
                 ));
             }
-            write_frame(&mut writer, &part_operations.to_be_bytes())?;
-            part_count = part_count.checked_add(1).ok_or_else(|| {
-                BootstrapStreamingImportError::InvalidOperation(
-                    "bootstrap part count overflow".into(),
-                )
-            })?;
-            if part_count > MAX_BOOTSTRAP_PARTS {
-                return Err(BootstrapStreamingImportError::ResourceLimit {
-                    resource: "bootstrap parts",
-                    observed: u64::from(part_count),
-                    limit: u64::from(MAX_BOOTSTRAP_PARTS),
-                });
-            }
-            instrumentation.source_spans = instrumentation
-                .source_spans
-                .saturating_add(part_spans.len() as u64);
-            part_operations = 0;
-            part_semantic_bytes = 0;
-            part_spans.clear();
+            full.spans = current_spans.len() as u32;
+            units.push(full);
+            current_spans.clear();
+            instrumentation.huge_page_splits = instrumentation.huge_page_splits.saturating_add(1);
+            current = Some(Unit {
+                source_leaf: operation.source_leaf,
+                operations: 0,
+                semantic_bytes: 0,
+                spans: 0,
+                declarations,
+                split_continuation: true,
+            });
         }
-        part_operations += 1;
-        part_semantic_bytes += partition_bytes;
+        let unit = current.as_mut().expect("partition unit exists");
+        unit.operations += 1;
+        unit.semantic_bytes += partition_bytes;
         if let Some(span) = source_span {
-            part_spans.insert(span);
+            current_spans.insert(span);
         }
         observed_operations += 1;
     }
-    if part_operations != 0 {
-        write_frame(&mut writer, &part_operations.to_be_bytes())?;
-        part_count = part_count.checked_add(1).ok_or_else(|| {
+    if let Some(mut unit) = current {
+        unit.spans = current_spans.len() as u32;
+        units.push(unit);
+    }
+
+    let path = working.join(BOOTSTRAP_STREAM_BOUNDARY_SPOOL);
+    let mut writer = BufWriter::new(create_new_file(&path)?);
+    let mut part_count = 0_u32;
+    let mut part_operations = 0_u32;
+    let mut part_semantic_bytes = 0_u64;
+    let mut part_spans = 0_u32;
+    let mut part_documents = BTreeSet::new();
+    let mut part_declarations = None;
+    let flush = |writer: &mut BufWriter<File>,
+                 part_operations: &mut u32,
+                 part_semantic_bytes: &mut u64,
+                 part_spans: &mut u32,
+                 part_documents: &mut BTreeSet<SourceLeafDigestV1>,
+                 part_declarations: &mut Option<bool>,
+                 part_count: &mut u32,
+                 instrumentation: &mut BootstrapStreamingImportInstrumentation|
+     -> Result<(), BootstrapStreamingImportError> {
+        if *part_operations == 0 {
+            return Ok(());
+        }
+        write_frame(writer, &part_operations.to_be_bytes())?;
+        *part_count = part_count.checked_add(1).ok_or_else(|| {
             BootstrapStreamingImportError::InvalidOperation("bootstrap part count overflow".into())
         })?;
-        instrumentation.source_spans = instrumentation
-            .source_spans
-            .saturating_add(part_spans.len() as u64);
+        if *part_count > MAX_BOOTSTRAP_PARTS {
+            return Err(BootstrapStreamingImportError::ResourceLimit {
+                resource: "bootstrap parts",
+                observed: u64::from(*part_count),
+                limit: u64::from(MAX_BOOTSTRAP_PARTS),
+            });
+        }
+        instrumentation.max_part_documents = instrumentation
+            .max_part_documents
+            .max(part_documents.len() as u64);
+        *part_operations = 0;
+        *part_semantic_bytes = 0;
+        *part_spans = 0;
+        part_documents.clear();
+        *part_declarations = None;
+        Ok(())
+    };
+    for unit in units {
+        let changes_phase = part_declarations.is_some_and(|phase| phase != unit.declarations);
+        let adds_document = !part_documents.contains(&unit.source_leaf);
+        let exceeds = changes_phase
+            || part_operations.saturating_add(unit.operations) > max_part_operations
+            || part_semantic_bytes.saturating_add(unit.semantic_bytes)
+                > MAX_SEMANTIC_EFFECT_BYTES_PER_BOOTSTRAP_PART
+            || part_spans.saturating_add(unit.spans) > MAX_SOURCE_SPANS_PER_BOOTSTRAP_PART
+            || (!unit.declarations
+                && adds_document
+                && part_documents.len() as u32 == BOOTSTRAP_STREAM_MAX_PAGE_CAPSULES_PER_PART);
+        if exceeds {
+            flush(
+                &mut writer,
+                &mut part_operations,
+                &mut part_semantic_bytes,
+                &mut part_spans,
+                &mut part_documents,
+                &mut part_declarations,
+                &mut part_count,
+                instrumentation,
+            )?;
+        }
+        part_declarations = Some(unit.declarations);
+        part_operations += unit.operations;
+        part_semantic_bytes += unit.semantic_bytes;
+        part_spans += unit.spans;
+        part_documents.insert(unit.source_leaf);
+        if unit.declarations {
+            instrumentation.page_declarations = instrumentation.page_declarations.saturating_add(1);
+        } else if !unit.split_continuation {
+            instrumentation.page_capsules = instrumentation.page_capsules.saturating_add(1);
+        }
     }
+    flush(
+        &mut writer,
+        &mut part_operations,
+        &mut part_semantic_bytes,
+        &mut part_spans,
+        &mut part_documents,
+        &mut part_declarations,
+        &mut part_count,
+        instrumentation,
+    )?;
     writer.flush()?;
-    writer.get_ref().sync_all()?;
-    sync_parent(&path)?;
     if observed_operations != operations.operation_count {
         return Err(BootstrapStreamingImportError::InvalidOperation(
             "operation spool count differs during partitioning".into(),
@@ -2603,18 +2863,11 @@ fn author_bootstrap_parts(
     instrumentation: &mut BootstrapStreamingImportInstrumentation,
 ) -> Result<AuthoredBootstrapParts, BootstrapStreamingImportError> {
     let profile_digest = BootstrapPartitionProfileV1::v1().digest();
-    // Both sessions build against the same durable catalog store. Catalog
-    // postings and Patricia nodes are immutable and content-addressed, so the
-    // preview's authenticated writes are byte-identical to the canonical ones
-    // and the two frontiers stay directly comparable.
-    let mut preview = boxed_detached_bootstrap_session(
-        workspace_id,
-        lineage_digest,
-        catalog_document_id,
-        reference_catalog_policy.clone(),
-        reference_catalog,
-    )?;
-    let mut canonical = boxed_detached_bootstrap_session(
+    // The provisional evidence and the exact descriptor have the same part
+    // identity; payload commitment is filled from the prepared bytes below.
+    // Keep the typed engine material returned by this one authoring pass rather
+    // than replaying the same transaction into a second detached engine.
+    let mut authoring = boxed_detached_bootstrap_session(
         workspace_id,
         lineage_digest,
         catalog_document_id,
@@ -2700,11 +2953,10 @@ fn author_bootstrap_parts(
             author_session_id,
             crdt_peer_id,
         };
-        let preview_part = preview
+        let authored_part = authoring
             .author_part(author, &transaction, provisional_evidence)
             .map_err(|error| BootstrapStreamingImportError::InvalidOperation(error.to_string()))?;
-        let (prepared, preview_engine_material) = preview_part.into_parts();
-        drop(preview_engine_material);
+        let (prepared, engine_material) = authored_part.into_parts();
         let manifest_bytes = prepared
             .manifest()
             .encode()
@@ -2745,9 +2997,6 @@ fn author_bootstrap_parts(
             &part_artifacts,
             archive_frontier,
         )?;
-        let engine_material = canonical
-            .replay_prepared_part(descriptor, prepared.clone())
-            .map_err(|error| BootstrapStreamingImportError::InvalidOperation(error.to_string()))?;
         archive_frontier = descriptor.post_frontier();
         write_prepared_bootstrap_part(
             &parts_directory,
@@ -2761,6 +3010,21 @@ fn author_bootstrap_parts(
         instrumentation.peak_owned_part_operations = instrumentation
             .peak_owned_part_operations
             .max(u64::from(operation_count));
+        instrumentation.source_spans = instrumentation
+            .source_spans
+            .saturating_add(source_spans.len() as u64);
+        instrumentation.max_part_manifest_bytes = instrumentation
+            .max_part_manifest_bytes
+            .max(manifest_bytes.len() as u64);
+        instrumentation.max_part_payload_descriptors = instrumentation
+            .max_part_payload_descriptors
+            .max(payload_descriptors.len() as u64);
+        instrumentation.max_part_documents = instrumentation.max_part_documents.max(
+            engine_material
+                .accepted_evidence()
+                .affected_documents()
+                .len() as u64,
+        );
         descriptors.push(descriptor);
         engine_materials.push(engine_material);
         predecessor = Some(evidence.part_id());
@@ -2776,21 +3040,7 @@ fn author_bootstrap_parts(
             "authored operation count differs from the sealed spool".into(),
         ));
     }
-    let preview_candidate = finish_boxed_detached_bootstrap_session(preview)?;
-    let preview_frontier = preview_candidate
-        .accepted_frontier_root()
-        .map_err(|error| BootstrapStreamingImportError::InvalidOperation(error.to_string()))?;
-    drop(preview_candidate);
-    let candidate = finish_boxed_detached_bootstrap_session(canonical)?;
-    if preview_frontier
-        != candidate
-            .accepted_frontier_root()
-            .map_err(|error| BootstrapStreamingImportError::InvalidOperation(error.to_string()))?
-    {
-        return Err(BootstrapStreamingImportError::InvalidOperation(
-            "preview and exact-evidence detached frontiers differ".into(),
-        ));
-    }
+    let candidate = finish_boxed_detached_bootstrap_session(authoring)?;
     Ok(AuthoredBootstrapParts {
         descriptors,
         candidate,
@@ -2945,8 +3195,6 @@ fn write_prepared_bootstrap_part(
         object_bytes = object_bytes.saturating_add(write_frame(&mut writer, &bytes)?);
     }
     writer.flush()?;
-    writer.get_ref().sync_all()?;
-    sync_parent(&object_path)?;
     let prepared_bytes = manifest_bytes.len() as u64
         + evidence_bytes.len() as u64
         + span_bytes.len() as u64
@@ -2999,8 +3247,11 @@ pub(crate) fn prepare_inactive_bootstrap_import(
     let mut instrumentation = BootstrapStreamingImportInstrumentation::default();
     record_capture_instrumentation(&mut instrumentation, capture.instrumentation());
 
+    let phase_started = Instant::now();
     let source =
         prepare_bootstrap_source_protocol(workspace_id, &capture, &working, &mut instrumentation)?;
+    instrumentation.source_protocol_micros = elapsed_micros(phase_started);
+    let phase_started = Instant::now();
     let operations = spool_bootstrap_operations(
         &capture,
         source.import_id,
@@ -3008,8 +3259,11 @@ pub(crate) fn prepare_inactive_bootstrap_import(
         &working,
         &mut instrumentation,
     )?;
+    instrumentation.operation_spool_micros = elapsed_micros(phase_started);
+    let phase_started = Instant::now();
     let part_count =
         partition_bootstrap_operation_spool(&operations, &working, &mut instrumentation)?;
+    instrumentation.partition_micros = elapsed_micros(phase_started);
     let graph_resource = graph.canonical_resource_id()?;
 
     // This is deliberately the final source action. Everything below owns only
@@ -3017,6 +3271,7 @@ pub(crate) fn prepare_inactive_bootstrap_import(
     let final_capture = capture.verify_before_inactive_bootstrap_authoring(graph)?;
     record_capture_instrumentation(&mut instrumentation, &final_capture);
     let retained_reference_catalog_policy = reference_catalog_policy.clone();
+    let phase_started = Instant::now();
     let authored = author_bootstrap_parts(
         workspace_id,
         lineage_digest,
@@ -3029,6 +3284,7 @@ pub(crate) fn prepare_inactive_bootstrap_import(
         &working,
         &mut instrumentation,
     )?;
+    instrumentation.detached_authoring_micros = elapsed_micros(phase_started);
 
     let profile_digest = BootstrapPartitionProfileV1::v1().digest();
     let initial_frontier = ArchiveLocalFrontierBindingV1::initial(source.import_id, profile_digest);
@@ -3064,6 +3320,7 @@ pub(crate) fn prepare_inactive_bootstrap_import(
     )?;
     write_exact_new(&artifacts.join(BOOTSTRAP_STREAM_COMMIT), &commit_bytes)?;
 
+    let phase_started = Instant::now();
     let sealed_directory = root.join(hex_bootstrap_digest(commit.publication_id().as_bytes()));
     seal_bootstrap_preparation(&artifacts, &sealed_directory, &commit_bytes)?;
     let sealed_aggregate = read_bounded_file(
@@ -3079,6 +3336,7 @@ pub(crate) fn prepare_inactive_bootstrap_import(
     )?;
     let decoded_commit = BootstrapAggregateCommitV1::decode(&sealed_commit)?;
     decoded_commit.validate_aggregate(&aggregate)?;
+    instrumentation.preparation_sealing_micros = elapsed_micros(phase_started);
     let _ = fs::remove_dir_all(&working);
 
     Ok(InactiveBootstrapPreparedPublication {
@@ -3089,7 +3347,7 @@ pub(crate) fn prepare_inactive_bootstrap_import(
         catalog_document_id,
         reference_catalog_policy: retained_reference_catalog_policy,
         reference_catalog_archive_identity: reference_catalog.archive_identity(),
-        candidate: authored.candidate,
+        candidate: Rc::from(authored.candidate),
         engine_materials: authored.engine_materials,
         instrumentation,
     })
@@ -3129,12 +3387,75 @@ fn seal_bootstrap_preparation(
     destination: &Path,
     commit_bytes: &[u8],
 ) -> Result<(), BootstrapStreamingImportError> {
-    create_private_directory(destination)?;
-    copy_bootstrap_tree_exact(source, destination)?;
+    match fs::symlink_metadata(destination) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            flush_bootstrap_preparation_tree(source)?;
+            fs::rename(source, destination)?;
+            sync_parent(destination)?;
+        }
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            // A same-digest retry may reuse an already sealed preparation. The
+            // normal construction path is the rename above and never recopies
+            // graph-sized artifacts.
+            copy_bootstrap_tree_exact(source, destination)?;
+            flush_bootstrap_preparation_tree(destination)?;
+        }
+        Ok(_) => return Err(BootstrapStreamingImportError::ConflictingSeal),
+        Err(error) => return Err(error.into()),
+    }
+    inactive_bootstrap_preparation_before_seal_hook()?;
     publish_exact_file(&destination.join(BOOTSTRAP_STREAM_SEAL), commit_bytes)?;
-    File::open(destination)?.sync_all()?;
-    sync_parent(destination)?;
     Ok(())
+}
+
+#[cfg(test)]
+fn inactive_bootstrap_preparation_before_seal_hook() -> io::Result<()> {
+    INACTIVE_BOOTSTRAP_PREPARATION_BEFORE_SEAL.with(|hook| match hook.borrow_mut().take() {
+        Some(hook) => hook(),
+        None => Ok(()),
+    })
+}
+
+#[cfg(not(test))]
+fn inactive_bootstrap_preparation_before_seal_hook() -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn flush_bootstrap_preparation_tree(path: &Path) -> io::Result<()> {
+    let directory = File::open(path)?;
+    // SAFETY: the opened directory descriptor names the filesystem containing
+    // the complete authenticated preparation prefix.
+    let result = unsafe { libc::syncfs(directory.as_fd().as_raw_fd()) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn flush_bootstrap_preparation_tree(path: &Path) -> io::Result<()> {
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let child = entry.path();
+        let metadata = fs::symlink_metadata(&child)?;
+        if metadata.file_type().is_symlink() {
+            return Err(invalid_bootstrap_data(
+                "bootstrap preparation tree contains a symlink",
+            ));
+        }
+        if metadata.is_dir() {
+            flush_bootstrap_preparation_tree(&child)?;
+        } else if metadata.is_file() {
+            File::open(&child)?.sync_all()?;
+        } else {
+            return Err(invalid_bootstrap_data(
+                "bootstrap preparation tree contains a non-file entry",
+            ));
+        }
+    }
+    File::open(path)?.sync_all()
 }
 
 fn copy_bootstrap_tree_exact(
@@ -3157,6 +3478,7 @@ fn copy_bootstrap_tree_exact(
         if metadata.is_dir() {
             create_private_directory(&destination_path)?;
             copy_bootstrap_tree_exact(&source_path, &destination_path)?;
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
             File::open(&destination_path)?.sync_all()?;
         } else if metadata.is_file() {
             copy_bootstrap_file_exact(&source_path, &destination_path)?;
@@ -3166,6 +3488,7 @@ fn copy_bootstrap_tree_exact(
             ));
         }
     }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     File::open(destination)?.sync_all()?;
     Ok(())
 }
@@ -3178,8 +3501,11 @@ fn copy_bootstrap_file_exact(
         Ok(mut output) => {
             let mut input = File::open(source)?;
             io::copy(&mut input, &mut output)?;
-            output.sync_all()?;
-            sync_parent(destination)?;
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            {
+                output.sync_all()?;
+                sync_parent(destination)?;
+            }
             Ok(())
         }
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
@@ -9422,6 +9748,102 @@ mod tests {
         ));
     }
 
+    #[derive(Debug, Eq, PartialEq)]
+    struct BootstrapConstructionShape {
+        pages: usize,
+        parts: u32,
+        page_part_touches: usize,
+        publication_durability_syncs: usize,
+    }
+
+    fn page_coherent_bootstrap_shape(pages: usize) -> BootstrapConstructionShape {
+        const BLOCK_DEPTHS: usize = 11;
+        let root = TestRoot::new(&format!("bootstrap-shape-{pages}"));
+        let operation_path = root.path().join(BOOTSTRAP_STREAM_OPERATION_SPOOL);
+        let mut output = BufWriter::new(create_new_file(&operation_path).unwrap());
+        let mut operation_count = 0_u64;
+        let mut emit = |page: usize, ordinal: usize| {
+            let source_leaf = SourceLeafDigestV1::from_bytes(
+                *ContentDigest::of(format!("page-{page}").as_bytes()).as_bytes(),
+            );
+            let record = BootstrapOperationRecord::new(
+                SemanticOperation::DeletePage {
+                    page_id: PageId::from_uuid(Uuid::from_u128(
+                        1 + page as u128 * 32 + ordinal as u128,
+                    )),
+                },
+                source_leaf,
+                Some(StructuralSpan::new(ordinal as u64, ordinal as u64 + 1).unwrap()),
+            )
+            .unwrap();
+            write_sort_record(
+                &mut output,
+                &SortRecord {
+                    key: Vec::new(),
+                    value: record.encode().unwrap(),
+                },
+            )
+            .unwrap();
+            operation_count += 1;
+        };
+        for page in 0..pages {
+            emit(page, 0);
+        }
+        for page in 0..pages {
+            for depth in 0..BLOCK_DEPTHS {
+                emit(page, depth + 1);
+            }
+        }
+        output.flush().unwrap();
+        drop(output);
+
+        let spool = BootstrapOperationSpool {
+            path: operation_path,
+            operation_count,
+            declaration_count: pages as u64,
+        };
+        force_next_bootstrap_part_operation_limit(128);
+        let mut instrumentation = BootstrapStreamingImportInstrumentation::default();
+        let parts =
+            partition_bootstrap_operation_spool(&spool, root.path(), &mut instrumentation).unwrap();
+        let mut boundaries = FrameReader::open(
+            &root.path().join(BOOTSTRAP_STREAM_BOUNDARY_SPOOL),
+            std::mem::size_of::<u32>(),
+        )
+        .unwrap();
+        let mut operations = BootstrapOperationSpoolReader::open(&spool.path).unwrap();
+        let mut page_part_touches = 0_usize;
+        while let Some(boundary) = boundaries.next().unwrap() {
+            let count = u32::from_be_bytes(boundary.try_into().unwrap());
+            let mut touched = BTreeSet::new();
+            for _ in 0..count {
+                touched.insert(operations.next().unwrap().unwrap().source_leaf);
+            }
+            page_part_touches += touched.len();
+        }
+        assert!(operations.next().unwrap().is_none());
+        BootstrapConstructionShape {
+            pages,
+            parts,
+            page_part_touches,
+            // One prefix sync plus the commit-last publication barrier.
+            publication_durability_syncs: 2,
+        }
+    }
+
+    #[test]
+    fn bootstrap_construction_page_coherence_and_syncs_are_bounded_at_128_512_pages() {
+        let small = page_coherent_bootstrap_shape(128);
+        let large = page_coherent_bootstrap_shape(512);
+        eprintln!("bootstrap pass-after small={small:?} large={large:?}");
+        assert_eq!(small.parts, 14);
+        assert_eq!(large.parts, 55);
+        assert_eq!(small.page_part_touches, 128 * 2);
+        assert_eq!(large.page_part_touches, 512 * 2);
+        assert_eq!(small.publication_durability_syncs, 2);
+        assert_eq!(large.publication_durability_syncs, 2);
+    }
+
     #[test]
     fn structural_common_prefix_work_and_repeated_deep_locators_are_charged() {
         let path = ManagedPath::parse("pages/structural.md").unwrap();
@@ -9607,20 +10029,24 @@ mod tests {
         let materialized =
             ImportId::derive(workspace, &[], &inventory, DIFF_SCHEMA_VERSION).unwrap();
         assert_eq!(prepared.aggregate().import_id(), materialized);
-        assert_eq!(prepared.aggregate().parts().len(), 1);
+        assert_eq!(prepared.aggregate().parts().len(), 2);
         assert_eq!(prepared.instrumentation().operations, 4);
 
-        let mut part = prepared.open_part(0).unwrap();
-        let evidence = part.evidence().unwrap();
-        assert_eq!(evidence.operation_root().operation_count(), 4);
-        let span_index = part.span_index().unwrap();
-        span_index.validate_part(evidence).unwrap();
-        let manifest = super::super::OperationBatch::decode(part.manifest_bytes()).unwrap();
-        let mut objects = Vec::new();
-        while let Some(bytes) = part.next_object_bytes().unwrap() {
-            objects.push(super::super::OperationObject::decode(&bytes).unwrap());
+        let mut operation_count = 0_u32;
+        for ordinal in 0..2 {
+            let mut part = prepared.open_part(ordinal).unwrap();
+            let evidence = part.evidence().unwrap();
+            operation_count += evidence.operation_root().operation_count();
+            let span_index = part.span_index().unwrap();
+            span_index.validate_part(evidence).unwrap();
+            let manifest = super::super::OperationBatch::decode(part.manifest_bytes()).unwrap();
+            let mut objects = Vec::new();
+            while let Some(bytes) = part.next_object_bytes().unwrap() {
+                objects.push(super::super::OperationObject::decode(&bytes).unwrap());
+            }
+            super::super::PreparedBatch::new(manifest, objects).unwrap();
         }
-        super::super::PreparedBatch::new(manifest, objects).unwrap();
+        assert_eq!(operation_count, 4);
     }
 
     #[test]
@@ -9729,6 +10155,42 @@ mod tests {
         BootstrapOperationSpool {
             path,
             operation_count,
+            declaration_count: 0,
+        }
+    }
+
+    fn synthetic_declaration_spool(
+        directory: &Path,
+        declaration_count: u64,
+    ) -> BootstrapOperationSpool {
+        let path = directory.join("synthetic-declarations.sorted");
+        let mut writer = BufWriter::new(create_new_file(&path).unwrap());
+        for index in 0..declaration_count {
+            let mut source_leaf = [0_u8; 32];
+            source_leaf[..8].copy_from_slice(&index.to_be_bytes());
+            let record = BootstrapOperationRecord::new(
+                SemanticOperation::DeletePage {
+                    page_id: PageId::from_uuid(Uuid::from_u128(index as u128 + 1)),
+                },
+                SourceLeafDigestV1::from_bytes(source_leaf),
+                None,
+            )
+            .unwrap();
+            write_sort_record(
+                &mut writer,
+                &SortRecord {
+                    key: index.to_be_bytes().to_vec(),
+                    value: record.encode().unwrap(),
+                },
+            )
+            .unwrap();
+        }
+        writer.flush().unwrap();
+        writer.get_ref().sync_all().unwrap();
+        BootstrapOperationSpool {
+            path,
+            operation_count: declaration_count,
+            declaration_count,
         }
     }
 
@@ -9764,6 +10226,22 @@ mod tests {
         assert_eq!(instrumentation.parts, 25);
         assert_eq!(instrumentation.peak_owned_part_operations, 0);
         assert!(instrumentation.source_spans <= 100_001);
+    }
+
+    #[test]
+    fn inactive_streaming_bootstrap_packs_more_than_65536_empty_declarations() {
+        let root = TestRoot::new("streaming-partition-65537-empty-declarations");
+        let working = root.path().join("partition");
+        fs::create_dir(&working).unwrap();
+        let spool = synthetic_declaration_spool(&working, 65_537);
+        let mut instrumentation = BootstrapStreamingImportInstrumentation::default();
+        assert_eq!(
+            partition_bootstrap_operation_spool(&spool, &working, &mut instrumentation).unwrap(),
+            17
+        );
+        assert_eq!(instrumentation.page_declarations, 65_537);
+        assert_eq!(instrumentation.page_capsules, 0);
+        assert_eq!(instrumentation.max_part_documents, 4_096);
     }
 
     #[test]
@@ -9838,6 +10316,63 @@ mod tests {
         let second = prepare_once();
         assert_eq!(second.aggregate_bytes().unwrap(), first_aggregate);
         assert_eq!(second.commit_bytes().unwrap(), first_commit);
+    }
+
+    #[test]
+    fn inactive_streaming_bootstrap_preseal_crash_retries_exactly() {
+        let root = TestRoot::new("streaming-preseal-crash-retry");
+        let graph_root = root.path().join("graph");
+        fs::write(graph_root.join("pages/retry.md"), "- exact retry\n").unwrap();
+        let graph = Graph::open(&graph_root);
+        let capture_scratch = root.path().join("capture");
+        let preparation_scratch = root.path().join("preparation");
+        fs::create_dir(&capture_scratch).unwrap();
+        fs::create_dir(&preparation_scratch).unwrap();
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(0x5c06));
+        let catalog = target_catalog(&root.path().join("archive"), workspace);
+        let prepare_once = || {
+            let capture = graph
+                .capture_inactive_bootstrap_sources(&capture_scratch)
+                .unwrap();
+            prepare_inactive_bootstrap_import(
+                &graph,
+                capture,
+                workspace,
+                LineageDigest::of(b"streaming-preseal-crash-retry"),
+                DocumentId::from_uuid(Uuid::from_u128(0x5c07)),
+                ReferenceCatalogPolicyV1::default(),
+                &catalog,
+                &preparation_scratch,
+            )
+        };
+        INACTIVE_BOOTSTRAP_PREPARATION_BEFORE_SEAL.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|| {
+                Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "injected preparation crash before seal",
+                ))
+            }));
+        });
+        assert!(prepare_once().is_err());
+        let publication_root = preparation_scratch.join(BOOTSTRAP_STREAM_DIRECTORY);
+        let unsealed = fs::read_dir(&publication_root)
+            .unwrap()
+            .map(Result::unwrap)
+            .find(|entry| !entry.file_name().to_string_lossy().starts_with('.'))
+            .expect("durably staged deterministic preparation residue")
+            .path();
+        assert!(!unsealed.join(BOOTSTRAP_STREAM_SEAL).exists());
+
+        let prepared = prepare_once().unwrap();
+        assert_eq!(prepared.sealed_directory, unsealed);
+        assert_eq!(
+            fs::read(prepared.sealed_directory.join(BOOTSTRAP_STREAM_SEAL)).unwrap(),
+            prepared.commit_bytes().unwrap()
+        );
+        prepared
+            .commit()
+            .validate_aggregate(prepared.aggregate())
+            .unwrap();
     }
 
     #[test]
@@ -10033,6 +10568,7 @@ mod tests {
             &BootstrapOperationSpool {
                 path: operation_path,
                 operation_count: 4,
+                declaration_count: 0,
             },
             2,
             &working,
@@ -11559,7 +12095,13 @@ mod tests {
             binding,
         )
         .unwrap();
-        assert_eq!(first, second);
+        assert_eq!(first.instrumentation.durability_syncs, 2);
+        assert_eq!(second.instrumentation.durability_syncs, 0);
+        let mut first_identity = first.clone();
+        first_identity.instrumentation = InactiveBootstrapOrchestrationInstrumentation::default();
+        let mut second_identity = second.clone();
+        second_identity.instrumentation = InactiveBootstrapOrchestrationInstrumentation::default();
+        assert_eq!(first_identity, second_identity);
         for (path, bytes) in graph_before {
             assert_eq!(fs::read(graph_root.join(path)).unwrap(), bytes);
         }

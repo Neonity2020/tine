@@ -24628,8 +24628,12 @@ fn seal_bootstrap_source_chunk(
         return Err(bootstrap_source_capture_error("source chunk exceeds 1 MiB"));
     }
     let destination = directory.join(hex_digest(description.sha256()));
-    match atomic_write_new(&destination, bytes) {
-        Ok(()) => Ok(()),
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&destination)
+    {
+        Ok(mut file) => file.write_all(bytes),
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
             verify_capture_file(&destination, description)
         }
@@ -25496,7 +25500,7 @@ fn seal_bootstrap_source_capture(
         &working.join(BOOTSTRAP_SOURCE_CHUNK_DIRECTORY),
         &working.join(BOOTSTRAP_SOURCE_CHUNKS),
     )?;
-    sync_bootstrap_source_directory(&working.join(BOOTSTRAP_SOURCE_CHUNK_DIRECTORY))?;
+    flush_bootstrap_source_prefix(working)?;
     let manifest = encode_bootstrap_source_manifest(&capture)?;
     atomic_write_new(&working.join(BOOTSTRAP_SOURCE_MANIFEST), &manifest)?;
     sync_bootstrap_source_directory(working)?;
@@ -25516,6 +25520,7 @@ fn seal_bootstrap_source_capture(
         Err(error) if error.kind() == io::ErrorKind::NotFound => fs::create_dir(sealed_parent)?,
         Err(error) => return Err(error),
     }
+    bootstrap_source_capture_before_seal_rename_hook()?;
     match move_file_noreplace(working, &sealed) {
         Ok(()) => {
             sync_bootstrap_source_directory(sealed_parent)?;
@@ -25653,6 +25658,45 @@ fn sync_bootstrap_source_directory(path: &Path) -> io::Result<()> {
     sync_projection_directory_required(&directory)
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn flush_bootstrap_source_prefix(path: &Path) -> io::Result<()> {
+    use std::os::fd::{AsFd as _, AsRawFd as _};
+
+    let directory = fs::File::open(path)?;
+    // SAFETY: the opened directory descriptor names the filesystem holding
+    // every authenticated spool, chunk, and directory in the capture prefix.
+    let result = unsafe { libc::syncfs(directory.as_fd().as_raw_fd()) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn flush_bootstrap_source_prefix(path: &Path) -> io::Result<()> {
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let child = entry.path();
+        let metadata = fs::symlink_metadata(&child)?;
+        if metadata.file_type().is_symlink() {
+            return Err(bootstrap_source_capture_error(
+                "source capture prefix contains a symlink",
+            ));
+        }
+        if metadata.is_dir() {
+            flush_bootstrap_source_prefix(&child)?;
+        } else if metadata.is_file() {
+            fs::File::open(&child)?.sync_all()?;
+        } else {
+            return Err(bootstrap_source_capture_error(
+                "source capture prefix contains a non-file entry",
+            ));
+        }
+    }
+    sync_bootstrap_source_directory(path)
+}
+
 fn verify_bootstrap_source_capture(
     graph: &Graph,
     capture: &BootstrapSourceCapture,
@@ -25700,6 +25744,20 @@ fn verify_bootstrap_source_capture(
 thread_local! {
     static BOOTSTRAP_SOURCE_CAPTURE_BETWEEN_PASSES: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = const { std::cell::RefCell::new(None) };
     static BOOTSTRAP_SOURCE_CAPTURE_BEFORE_FINAL_PROOF: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = const { std::cell::RefCell::new(None) };
+    static BOOTSTRAP_SOURCE_CAPTURE_BEFORE_SEAL_RENAME: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn bootstrap_source_capture_before_seal_rename_hook() -> io::Result<()> {
+    BOOTSTRAP_SOURCE_CAPTURE_BEFORE_SEAL_RENAME.with(|hook| match hook.borrow_mut().take() {
+        Some(hook) => hook(),
+        None => Ok(()),
+    })
+}
+
+#[cfg(not(test))]
+fn bootstrap_source_capture_before_seal_rename_hook() -> io::Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -43618,12 +43676,30 @@ mod tests {
         )
         .unwrap();
         let graph = Graph::open(&root);
+        BOOTSTRAP_SOURCE_CAPTURE_BEFORE_SEAL_RENAME.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|| {
+                Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "injected pre-rename capture crash",
+                ))
+            }));
+        });
+        assert!(graph.capture_inactive_bootstrap_sources(&scratch).is_err());
         let first = graph.capture_inactive_bootstrap_sources(&scratch).unwrap();
         let second = graph.capture_inactive_bootstrap_sources(&scratch).unwrap();
         assert_eq!(
             bootstrap_capture_entries(&first),
             bootstrap_capture_entries(&second)
         );
+        assert_eq!(
+            fs::read(first.sealed_directory.join(BOOTSTRAP_SOURCE_ENTRIES)).unwrap(),
+            fs::read(second.sealed_directory.join(BOOTSTRAP_SOURCE_ENTRIES)).unwrap()
+        );
+        first
+            .open_chunk(&bootstrap_capture_chunks(&first)[0])
+            .unwrap()
+            .finish()
+            .unwrap();
         fs::write(
             first.sealed_directory.join(BOOTSTRAP_SOURCE_MANIFEST),
             b"conflict",

@@ -1476,6 +1476,31 @@ impl ValidatedBootstrapPublicationV1 {
     }
 }
 
+/// Uncommitted bootstrap-only immutable publication. Files are inserted under
+/// their final content-addressed names without individual barriers; `finish`
+/// authenticates the closed set and flushes the filesystem once. The ordinary
+/// object publication path remains unchanged.
+pub(crate) struct BootstrapPublicationBatch<'a> {
+    store: &'a ObjectStore,
+    inventory_root: Option<SourceInventoryRootV1>,
+    inventory_pages: BTreeMap<u32, ()>,
+    blob_root: Option<SourceBlobChunkRootV1>,
+    blob_pages: BTreeMap<u32, ()>,
+    expected_chunks: BTreeMap<SourceBlobChunkDigestV1, ()>,
+    chunks: BTreeMap<SourceBlobChunkDigestV1, ()>,
+    expected_objects: BTreeMap<ContentDigest, ()>,
+    objects: BTreeMap<ContentDigest, ()>,
+    parts: BTreeMap<super::identity::BootstrapPartId, ()>,
+}
+
+/// Non-serializable proof that every prefix byte named by one aggregate was
+/// flushed before its commit-last marker can be published.
+pub(crate) struct DurablyStagedBootstrapPrefix {
+    workspace_id: WorkspaceId,
+    archive_identity: ControlDirectoryIdentity,
+    aggregate_digest: BootstrapAggregateDigestV1,
+}
+
 #[derive(Debug)]
 pub(crate) struct LoadedBootstrapPartV1 {
     manifest: OperationBatch,
@@ -1855,6 +1880,21 @@ impl ObjectStore {
         Ok(())
     }
 
+    pub(crate) fn begin_bootstrap_publication_batch(&self) -> BootstrapPublicationBatch<'_> {
+        BootstrapPublicationBatch {
+            store: self,
+            inventory_root: None,
+            inventory_pages: BTreeMap::new(),
+            blob_root: None,
+            blob_pages: BTreeMap::new(),
+            expected_chunks: BTreeMap::new(),
+            chunks: BTreeMap::new(),
+            expected_objects: BTreeMap::new(),
+            objects: BTreeMap::new(),
+            parts: BTreeMap::new(),
+        }
+    }
+
     pub(crate) fn publish_bootstrap_source_inventory_page(
         &self,
         root: SourceInventoryRootV1,
@@ -2013,6 +2053,30 @@ impl ObjectStore {
     ) -> Result<BootstrapPublicationIdV1, StoreError> {
         self.require_bootstrap_aggregate_context(aggregate)?;
         self.validate_bootstrap_aggregate_artifacts(aggregate, true)?;
+        self.check_or_establish_lineage(aggregate.lineage_digest())?;
+        let commit = BootstrapAggregateCommitV1::for_aggregate(aggregate)?;
+        let bytes = commit.encode()?;
+        let publication_id = aggregate.publication_id();
+        let name = hex_bytes(publication_id.as_bytes());
+        let dir = self.bootstrap_namespace(BOOTSTRAP_COMMITS_DIR, true)?;
+        publish_bootstrap_immutable(&dir, &name, &bytes, "bootstrap commit", name.clone())?;
+        Ok(publication_id)
+    }
+
+    pub(crate) fn commit_durably_staged_bootstrap_aggregate(
+        &self,
+        aggregate: &BootstrapAggregateManifestV1,
+        staged: DurablyStagedBootstrapPrefix,
+    ) -> Result<BootstrapPublicationIdV1, StoreError> {
+        self.require_bootstrap_aggregate_context(aggregate)?;
+        if staged.workspace_id != self.workspace_id
+            || staged.archive_identity != self.canonical_archive_identity()?
+            || staged.aggregate_digest != aggregate.aggregate_digest()
+        {
+            return Err(StoreError::BootstrapArtifactMismatch(
+                "durably staged bootstrap prefix binding",
+            ));
+        }
         self.check_or_establish_lineage(aggregate.lineage_digest())?;
         let commit = BootstrapAggregateCommitV1::for_aggregate(aggregate)?;
         let bytes = commit.encode()?;
@@ -7346,6 +7410,321 @@ fn ensure_directory(root: &Dir, name: &str) -> Result<(), StoreError> {
     ensure_directory_nofollow(root, name)
 }
 
+impl BootstrapPublicationBatch<'_> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn stage(
+        &mut self,
+        dir: &Dir,
+        filename: &str,
+        bytes: &[u8],
+        collision: Collision,
+    ) -> Result<(), StoreError> {
+        stage_immutable_unflushed(dir, filename, bytes, collision)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    fn stage(
+        &mut self,
+        dir: &Dir,
+        filename: &str,
+        bytes: &[u8],
+        collision: Collision,
+    ) -> Result<(), StoreError> {
+        // The ordinary immutable publisher flushes both newly inserted files
+        // and exact-existing retry residue. Portable batching therefore keeps
+        // the pre-existing durability construction without retaining one open
+        // directory capability per artifact.
+        publish_immutable(dir, filename, bytes, collision)
+    }
+
+    #[cfg(test)]
+    const fn retained_artifact_handle_count(&self) -> usize {
+        0
+    }
+
+    pub(crate) fn publish_source_inventory_page(
+        &mut self,
+        root: SourceInventoryRootV1,
+        page: &SourceInventoryIndexPageV1,
+    ) -> Result<(), StoreError> {
+        if self.inventory_root.is_some_and(|bound| bound != root) {
+            return Err(StoreError::BootstrapArtifactMismatch(
+                "source inventory batch root",
+            ));
+        }
+        let dir = self.store.bootstrap_index_root_dir(
+            BOOTSTRAP_SOURCE_INVENTORY_DIR,
+            root.digest(),
+            true,
+        )?;
+        let bytes = page.encode()?;
+        let filename = bootstrap_page_filename(page.page_ordinal());
+        self.stage(
+            &dir,
+            &filename,
+            &bytes,
+            Collision::Bootstrap(
+                "source inventory page",
+                format!("{}/{}", hex_bytes(root.digest()), page.page_ordinal()),
+            ),
+        )?;
+        self.inventory_root = Some(root);
+        self.inventory_pages.insert(page.page_ordinal(), ());
+        Ok(())
+    }
+
+    pub(crate) fn publish_source_blob_page(
+        &mut self,
+        root: SourceBlobChunkRootV1,
+        page: &SourceBlobIndexPageV1,
+    ) -> Result<(), StoreError> {
+        if self.blob_root.is_some_and(|bound| bound != root) {
+            return Err(StoreError::BootstrapArtifactMismatch(
+                "source blob batch root",
+            ));
+        }
+        let dir =
+            self.store
+                .bootstrap_index_root_dir(BOOTSTRAP_SOURCE_BLOB_DIR, root.digest(), true)?;
+        let bytes = page.encode()?;
+        let filename = bootstrap_page_filename(page.page_ordinal());
+        self.stage(
+            &dir,
+            &filename,
+            &bytes,
+            Collision::Bootstrap(
+                "source blob page",
+                format!("{}/{}", hex_bytes(root.digest()), page.page_ordinal()),
+            ),
+        )?;
+        self.blob_root = Some(root);
+        self.blob_pages.insert(page.page_ordinal(), ());
+        for entry in page.entries() {
+            self.expected_chunks.insert(entry.content_digest(), ());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn publish_source_chunk(
+        &mut self,
+        digest: SourceBlobChunkDigestV1,
+        bytes: &[u8],
+    ) -> Result<(), StoreError> {
+        if bytes.is_empty()
+            || bytes.len() > MAX_SOURCE_BLOB_CHUNK_BYTES as usize
+            || ContentDigest::of(bytes).as_bytes() != digest.as_bytes()
+        {
+            return Err(StoreError::BootstrapArtifactMismatch(
+                "source chunk digest or length",
+            ));
+        }
+        let dir = self
+            .store
+            .bootstrap_namespace(BOOTSTRAP_SOURCE_CHUNKS_DIR, true)?;
+        let identity = hex_bytes(digest.as_bytes());
+        self.stage(
+            &dir,
+            &identity,
+            bytes,
+            Collision::Bootstrap("source chunk", identity.clone()),
+        )?;
+        self.chunks.insert(digest, ());
+        Ok(())
+    }
+
+    pub(crate) fn publish_object_bytes(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<ContentDigest, StoreError> {
+        let object = OperationObject::decode(bytes)?;
+        if object.workspace_id() != self.store.workspace_id {
+            return Err(StoreError::WorkspaceMismatch {
+                expected: self.store.workspace_id,
+                found: object.workspace_id(),
+            });
+        }
+        let digest = ContentDigest::of(bytes);
+        let dir = self
+            .store
+            .bootstrap_namespace(BOOTSTRAP_OBJECTS_DIR, true)?;
+        self.stage(
+            &dir,
+            &object_filename(digest),
+            bytes,
+            Collision::Bootstrap("bootstrap operation object", digest.to_string()),
+        )?;
+        self.objects.insert(digest, ());
+        Ok(digest)
+    }
+
+    pub(crate) fn publish_part_artifacts(
+        &mut self,
+        descriptor: BootstrapPartDescriptorV1,
+        manifest_bytes: &[u8],
+        spans: &BootstrapPartSpanIndexV1,
+    ) -> Result<(), StoreError> {
+        let manifest = OperationBatch::decode(manifest_bytes)?;
+        self.store
+            .require_bootstrap_manifest(descriptor, &manifest)?;
+        let manifest_digest = ContentDigest::of(manifest_bytes);
+        let span_bytes = spans.encode()?;
+        descriptor.validate_loaded_artifacts(
+            BootstrapManifestFingerprintV1::from_bytes(*manifest_digest.as_bytes()),
+            &manifest
+                .required_objects()
+                .iter()
+                .map(|object| {
+                    PayloadObjectDescriptorV1::new(
+                        object.content_digest(),
+                        object.encoded_byte_length(),
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            &[FullObjectDescriptorV1::manifest_defined(
+                *ContentDigest::of(&span_bytes).as_bytes(),
+                span_bytes.len() as u64,
+            )?],
+        )?;
+        spans.validate_part(descriptor.evidence())?;
+        for object in manifest.required_objects() {
+            self.expected_objects.insert(object.content_digest(), ());
+        }
+
+        let parts = self.store.bootstrap_namespace(BOOTSTRAP_PARTS_DIR, true)?;
+        let part_name = hex_bytes(descriptor.part_id().as_bytes());
+        self.stage(
+            &parts,
+            &part_name,
+            manifest_bytes,
+            Collision::Bootstrap("bootstrap part manifest", part_name.clone()),
+        )?;
+        let evidence = descriptor.evidence();
+        let evidence_bytes = evidence.encode()?;
+        let evidence_name = hex_bytes(evidence.evidence_digest().as_bytes());
+        let evidence_dir = self
+            .store
+            .bootstrap_namespace(BOOTSTRAP_EVIDENCE_DIR, true)?;
+        self.stage(
+            &evidence_dir,
+            &evidence_name,
+            &evidence_bytes,
+            Collision::Bootstrap("bootstrap part evidence", evidence_name.clone()),
+        )?;
+        let span_dir = self
+            .store
+            .bootstrap_namespace(BOOTSTRAP_PART_SPANS_DIR, true)?;
+        self.stage(
+            &span_dir,
+            &part_name,
+            &span_bytes,
+            Collision::Bootstrap("bootstrap part span index", part_name.clone()),
+        )?;
+        self.parts.insert(descriptor.part_id(), ());
+        Ok(())
+    }
+
+    pub(crate) fn finish(
+        mut self,
+        aggregate: &BootstrapAggregateManifestV1,
+    ) -> Result<DurablyStagedBootstrapPrefix, StoreError> {
+        self.store.require_bootstrap_aggregate_context(aggregate)?;
+        let inventory_ordinals = (0..aggregate.source_inventory_page_count())
+            .map(|ordinal| (ordinal, ()))
+            .collect::<BTreeMap<_, _>>();
+        let blob_ordinals = (0..aggregate.source_blob_page_count())
+            .map(|ordinal| (ordinal, ()))
+            .collect::<BTreeMap<_, _>>();
+        let parts = aggregate
+            .parts()
+            .iter()
+            .map(|part| (part.part_id(), ()))
+            .collect::<BTreeMap<_, _>>();
+        let expected_inventory_root = (aggregate.source_inventory_page_count() != 0)
+            .then_some(aggregate.source_inventory_root());
+        let expected_blob_root =
+            (aggregate.source_blob_page_count() != 0).then_some(aggregate.source_blob_root());
+        if self.inventory_root != expected_inventory_root
+            || self.inventory_pages != inventory_ordinals
+            || self.blob_root != expected_blob_root
+            || self.blob_pages != blob_ordinals
+            || self.expected_chunks != self.chunks
+            || self
+                .expected_objects
+                .keys()
+                .any(|digest| !self.objects.contains_key(digest))
+            || self.parts != parts
+        {
+            return Err(StoreError::BootstrapArtifactMismatch(
+                "batched bootstrap prefix closed set",
+            ));
+        }
+        let bytes = aggregate.encode()?;
+        let digest = aggregate.aggregate_digest();
+        let name = hex_bytes(digest.as_bytes());
+        let dir = self
+            .store
+            .bootstrap_namespace(BOOTSTRAP_AGGREGATES_DIR, true)?;
+        self.stage(
+            &dir,
+            &name,
+            &bytes,
+            Collision::Bootstrap("bootstrap aggregate", name.clone()),
+        )?;
+        flush_bootstrap_batch(self.store)?;
+        Ok(DurablyStagedBootstrapPrefix {
+            workspace_id: self.store.workspace_id,
+            archive_identity: self.store.canonical_archive_identity()?,
+            aggregate_digest: digest,
+        })
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn stage_immutable_unflushed(
+    dir: &Dir,
+    filename: &str,
+    bytes: &[u8],
+    collision: Collision,
+) -> Result<(), StoreError> {
+    let temp_name = format!(".tmp-{}", Uuid::new_v4());
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    let mut temp = dir.open_with(&temp_name, &options)?;
+    temp.write_all(bytes)?;
+    drop(temp);
+    match rename_noreplace(dir, &temp_name, filename) {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            verify_existing(dir, filename, bytes, collision)?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    if let Err(error) = dir.remove_file(&temp_name) {
+        if error.kind() != ErrorKind::NotFound {
+            return Err(error.into());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn flush_bootstrap_batch(store: &ObjectStore) -> Result<(), StoreError> {
+    // SAFETY: the retained capability owns a live directory descriptor.
+    let result = unsafe { libc::syncfs(store.capability.as_fd().as_raw_fd()) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error().into())
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn flush_bootstrap_batch(_store: &ObjectStore) -> Result<(), StoreError> {
+    // Every artifact, including exact-existing retry residue, already passed
+    // through the ordinary durable immutable publisher on portable platforms.
+    Ok(())
+}
+
 fn publish_immutable(
     dir: &Dir,
     filename: &str,
@@ -10671,6 +11050,58 @@ mod bootstrap_store_tests {
         ));
         assert!(store.committed_manifests().unwrap().is_empty());
         assert!(!fixture.archive.join(BOOTSTRAP_DIR).exists());
+    }
+
+    fn stage_fixture_bootstrap_batch<'a>(
+        fixture: &BootstrapFixture,
+        store: &'a ObjectStore,
+    ) -> BootstrapPublicationBatch<'a> {
+        let mut publication = store.begin_bootstrap_publication_batch();
+        for page in &fixture.inventory_pages {
+            publication
+                .publish_source_inventory_page(fixture.inventory_root, page)
+                .unwrap();
+        }
+        for page in &fixture.blob_pages {
+            publication
+                .publish_source_blob_page(fixture.blob_root, page)
+                .unwrap();
+        }
+        for (digest, bytes) in &fixture.source_chunks {
+            publication.publish_source_chunk(*digest, bytes).unwrap();
+        }
+        for part in &fixture.parts {
+            for object in &part.object_bytes {
+                publication.publish_object_bytes(object).unwrap();
+            }
+            publication
+                .publish_part_artifacts(part.descriptor, &part.manifest_bytes, &part.spans)
+                .unwrap();
+        }
+        publication
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn bootstrap_batch_retains_no_per_artifact_handles() {
+        let fixture = BootstrapFixture::new("batch-no-retained-handles", 8);
+        let store = fixture.store();
+        let publication = stage_fixture_bootstrap_batch(&fixture, &store);
+        assert_eq!(publication.retained_artifact_handle_count(), 0);
+        publication.finish(&fixture.aggregate).unwrap();
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    #[test]
+    fn portable_bootstrap_batch_republishes_exact_residue_durably() {
+        let fixture = BootstrapFixture::new("portable-batch-exact-residue", 2);
+        let store = fixture.store();
+        stage_fixture_bootstrap_batch(&fixture, &store)
+            .finish(&fixture.aggregate)
+            .unwrap();
+        let retry = stage_fixture_bootstrap_batch(&fixture, &store);
+        assert_eq!(retry.retained_artifact_handle_count(), 0);
+        retry.finish(&fixture.aggregate).unwrap();
     }
 
     #[test]
