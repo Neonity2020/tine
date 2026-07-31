@@ -2454,6 +2454,37 @@ fn fail_during_apply_for_harness() -> Result<(), ProjectionError> {
 }
 
 impl SqliteFrontier {
+    /// Re-authenticate the already-verified inactive-bootstrap projection for
+    /// the uninterrupted promoted runtime without rebuilding it.
+    ///
+    /// The process token separately binds `proof.authority_binding()` to the
+    /// exact promotion state and retained candidate. This check proves the
+    /// reopened database still carries the same semantic rows, frontier, and
+    /// reference-catalog authority before writable runtime authority exists.
+    pub(crate) fn authenticate_same_process_bootstrap_reuse(
+        &self,
+        proof: &VerifiedBootstrapSqliteProjection,
+    ) -> Result<(), ProjectionError> {
+        let frontier = self.frontier_root()?;
+        let accepted_batch_count = u64::try_from(self.applied_batch_count()?)
+            .map_err(|_| ProjectionError::Rebuild("SQLite accepted count overflowed".into()))?;
+        if self.claim != proof.claim()
+            || frontier != *proof.frontier_root()
+            || accepted_batch_count != proof.accepted_batch_count()
+            || self.required_frontier_root != frontier
+            || self.semantic_projection_digest()? != proof.semantic_projection_digest()
+            || self.materialized_row_digest_for_harness()? != proof.materialized_row_digest()
+            || (accepted_batch_count != 0
+                && self.authenticated_reference_catalog_root()?
+                    != *frontier.reference_catalog_root())
+        {
+            return Err(ProjectionError::Rebuild(
+                "promoted SQLite reopen differs from retained bootstrap proof".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn freshly_verify_inactive_bootstrap(
         &self,
         authority: &InactiveBootstrapAcceptedAuthority,

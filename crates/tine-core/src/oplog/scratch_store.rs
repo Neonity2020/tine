@@ -990,6 +990,65 @@ impl ScratchStore {
         Self::create_run(archive_capability, workspace_id, ScratchRetention::Retained)
     }
 
+    /// Clone one live retained run into another capability while preserving
+    /// its exact marker identity and byte address space.
+    ///
+    /// Loro roots authenticate the scratch marker digest, so migration cannot
+    /// mint a fresh run identity and merely copy pages. The detached bootstrap
+    /// source is already retained and immutable after authoring; this creates
+    /// the same canonical `run-<uuid>` beneath the enrolled archive, writes the
+    /// identical marker, takes a distinct destination lease, and copies the two
+    /// append-only data files from offset zero. Any failure removes only the
+    /// destination directory created by this call.
+    pub(super) fn clone_retained_into(
+        &self,
+        archive_capability: &Dir,
+    ) -> Result<Self, ScratchError> {
+        if self.marker.retention != ScratchRetention::Retained {
+            return Err(ScratchError::UnsafeEntry(
+                "scratch migration source is not retained".into(),
+            ));
+        }
+        super::object_store::ensure_directory_nofollow(archive_capability, SCRATCH_DIR)?;
+        let namespace = super::object_store::open_dir_nofollow(archive_capability, SCRATCH_DIR)?;
+        let run_name = format!("run-{}", self.run_id());
+        namespace.create_dir(&run_name)?;
+        let construction = (|| {
+            super::object_store::sync_dir_required(&namespace)?;
+            let run = super::object_store::open_dir_nofollow(&namespace, &run_name)?;
+            write_new_regular(&run, MARKER_FILE, &encode_canonical(&self.marker)?)?;
+            let lease = create_new_regular(&run, LEASE_FILE)?;
+            lock_exclusive_nonblocking(&lease)?
+                .then_some(())
+                .ok_or_else(|| {
+                    ScratchError::UnsafeEntry("migrated scratch lease was already locked".into())
+                })?;
+            let pages = create_new_regular(&run, PAGES_FILE)?;
+            let blobs = create_new_regular(&run, BLOBS_FILE)?;
+            let migrated = Self {
+                namespace: namespace.try_clone()?,
+                run,
+                run_name: run_name.clone(),
+                marker: self.marker.clone(),
+                lease,
+                pages: Mutex::new(pages),
+                blobs: Mutex::new(blobs),
+                counters: Arc::new(ScratchCounters::default()),
+                document_current_filter: Mutex::new(FixedPointFilter::saturated()),
+                blob_dedup_filter: Mutex::new(CoveredBlobDedupFilter::default()),
+            };
+            migrated.copy_exact_from(self)?;
+            Ok(migrated)
+        })();
+        match construction {
+            Ok(migrated) => Ok(migrated),
+            Err(error) => {
+                remove_partial_own_run(&namespace, &run_name);
+                Err(error)
+            }
+        }
+    }
+
     /// Construct one fresh run transactionally from the namespace's viewpoint.
     ///
     /// Once the run directory exists, every later failure removes exactly that
@@ -1224,6 +1283,58 @@ impl ScratchStore {
 
     pub(crate) fn binding_digest(&self) -> Result<ContentDigest, ScratchError> {
         Ok(ContentDigest::of(&encode_canonical(&self.marker)?))
+    }
+
+    /// Copy the exact run-local byte address space from another exclusively
+    /// owned scratch run into this newly-created empty run.
+    ///
+    /// Scratch roots contain file offsets, so this is deliberately a raw,
+    /// prefix-preserving migration rather than a logical rewrite. Both stores
+    /// remain leased for the whole copy. The destination must be empty and the
+    /// workspace must match; a partial copy is never returned to an engine.
+    pub(super) fn copy_exact_from(&self, source: &Self) -> Result<(), ScratchError> {
+        if self.workspace_id() != source.workspace_id()
+            || self.marker != source.marker
+            || self.binding_digest()? != source.binding_digest()?
+        {
+            return Err(ScratchError::UnsafeEntry(
+                "scratch migration source and destination identity mismatch".into(),
+            ));
+        }
+
+        fn copy_file(
+            source: &Mutex<fs::File>,
+            destination: &Mutex<fs::File>,
+        ) -> Result<(), ScratchError> {
+            let mut source = source.lock().map_err(|_| ScratchError::Poisoned)?;
+            let mut destination = destination.lock().map_err(|_| ScratchError::Poisoned)?;
+            if destination.metadata()?.len() != 0 {
+                return Err(ScratchError::UnsafeEntry(
+                    "scratch migration destination is not empty".into(),
+                ));
+            }
+            source.seek(SeekFrom::Start(0))?;
+            destination.seek(SeekFrom::Start(0))?;
+            let expected = source.metadata()?.len();
+            let copied = std::io::copy(&mut *source, &mut *destination)?;
+            if copied != expected || destination.metadata()?.len() != expected {
+                return Err(ScratchError::UnsafeEntry(
+                    "scratch migration did not copy the exact byte extent".into(),
+                ));
+            }
+            Ok(())
+        }
+
+        copy_file(&source.pages, &self.pages)?;
+        copy_file(&source.blobs, &self.blobs)?;
+        // A migrated store did not observe the inserts behind the copied
+        // bytes, exactly like an adopted store. Its negative cache must
+        // therefore fail toward a real authenticated read.
+        *self
+            .document_current_filter
+            .lock()
+            .map_err(|_| ScratchError::Poisoned)? = FixedPointFilter::saturated();
+        Ok(())
     }
 
     pub(crate) fn clone_pages_file(&self) -> Result<fs::File, ScratchError> {

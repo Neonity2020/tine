@@ -272,7 +272,7 @@
 //! [`PromotedLocalRuntime`].
 
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::model::Graph;
 
@@ -288,13 +288,13 @@ use super::hot_engine::{
     EngineError, EngineOpenRetention, LocalAuthorGeneration, ProjectionStorageBinding,
     RuntimeResumeObservation, ShardedHotEngine,
 };
-use super::import::InactiveBootstrapAcceptedAuthority;
+use super::import::{InactiveBootstrapAcceptedAuthority, RetainedBootstrapPromotionCandidate};
 use super::migration_backup::MigrationBackupRoot;
 use super::object_store::{
-    EngineHistoryAuthority, EngineScratchRetentionPlan, PromotedLineageModeV1,
-    PromotedRuntimeStateV1, ResumeAcceleratorUnavailable, ResumeAdoptionCandidate,
-    RetainedRunMaintenanceReport, SafeTransitionCommitError, SafeTransitionError, StoreError,
-    PROMOTED_RUNTIME_STATE_SCHEMA_VERSION,
+    EngineHistoryAuthority, EngineHistoryBinding, EngineScratchRetentionPlan,
+    PromotedLineageModeV1, PromotedRuntimeStateV1, ResumeAcceleratorUnavailable,
+    ResumeAdoptionCandidate, RetainedRunMaintenanceReport, SafeTransitionCommitError,
+    SafeTransitionError, StoreError, PROMOTED_RUNTIME_STATE_SCHEMA_VERSION,
 };
 use super::projection_store::ProjectionReceiptStore;
 use super::resume_point::{ResumeEnrollmentAdmission, ResumePointMaintenance};
@@ -312,7 +312,8 @@ use super::watcher_queue::{
     WatcherSettlementError,
 };
 use super::{
-    ContentDigest, DeviceId, ObjectStore, ProjectionEndpointBinding, SessionId, WorkspaceId,
+    BatchId, ContentDigest, DeviceId, ObjectStore, ProjectionEndpointBinding, SessionId,
+    WorkspaceId,
 };
 
 /// A private seal. Sibling modules can name the sealed types but can never
@@ -3946,6 +3947,28 @@ pub(crate) fn open_promoted_local_runtime<W: PromotedWorkspaceAuthority>(
     open: &PromotedRuntimeOpen<'_>,
     workspace: W,
 ) -> Result<PromotedLocalRuntime, W::Refusal> {
+    open_promoted_local_runtime_with_candidate(sealed, authority, open, workspace, None)
+}
+
+/// Process-only evidence consumed by the uninterrupted bootstrap promotion.
+///
+/// The candidate was retained by the exact inactive authority that opened the
+/// SQLite projection, and the proof describes that exact database. This value
+/// is neither cloneable nor serializable and is destroyed on success, refusal,
+/// or fallback.
+struct SameProcessPromotionToken {
+    candidate: RetainedBootstrapPromotionCandidate,
+    sqlite_proof: VerifiedBootstrapSqliteProjection,
+    database_path: PathBuf,
+}
+
+fn open_promoted_local_runtime_with_candidate<W: PromotedWorkspaceAuthority>(
+    sealed: SealedRuntimePromotion,
+    authority: &LocalActiveAuthority,
+    open: &PromotedRuntimeOpen<'_>,
+    workspace: W,
+    same_process: Option<SameProcessPromotionToken>,
+) -> Result<PromotedLocalRuntime, W::Refusal> {
     // The enrollment lease comes first, exactly as the documented global lock
     // order requires: enrollment lease, then archive/engine lease, then graph
     // and process-local locks. The promoted runtime retains this session for
@@ -3961,6 +3984,7 @@ pub(crate) fn open_promoted_local_runtime<W: PromotedWorkspaceAuthority>(
     let committed = enrollment.committed();
     if committed.verification_digest() != sealed.state.enrollment_verification_digest
         || committed.session_id() != Some(authority.session_id)
+        || committed.enrollment_head() != authority.enrollment_head
     {
         return Err(workspace.refuse(RuntimePromotionError::Enrollment(
             VerifiedLocalCompositionError::StaleEvidence(
@@ -3980,6 +4004,7 @@ pub(crate) fn open_promoted_local_runtime<W: PromotedWorkspaceAuthority>(
         RuntimeRecoveryState::FirstPromotion,
         Some((authority, open.graph)),
         PromotedProjectionOpen::AllowRebuild,
+        same_process,
     )
 }
 
@@ -4175,11 +4200,20 @@ thread_local! {
     /// a receipt.
     static FAIL_AFTER_PROMOTED_DATABASE_OPEN: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    /// Makes the next process-only candidate fail its typed binding check. The
+    /// open must discard it and take the unchanged ordinary replay fallback.
+    static FAIL_NEXT_SAME_PROCESS_PROMOTION_TOKEN_MATCH: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
 pub(crate) fn fail_next_promotion_after_the_database_opens_for_test() {
     FAIL_AFTER_PROMOTED_DATABASE_OPEN.with(|flag| flag.set(true));
+}
+
+#[cfg(test)]
+pub(crate) fn mismatch_next_same_process_promotion_token_for_test() {
+    FAIL_NEXT_SAME_PROCESS_PROMOTION_TOKEN_MATCH.with(|flag| flag.set(true));
 }
 
 fn fail_after_promoted_database_open() -> bool {
@@ -4354,6 +4388,7 @@ fn reopen_promoted_local_runtime_with_adoption(
         recovery,
         None,
         projection_open,
+        None,
     )?;
 
     // Only now, with complete recovery proved, may an authority exist. The
@@ -4561,10 +4596,55 @@ fn read_promotion_state_for_anchor(
 /// Everything here is derived from the retained cold record and publication,
 /// never from process-local evidence, so a restarted process derives it exactly
 /// the same way.
+struct AuthenticatedBootstrapRuntimeAuthority {
+    history: EngineHistoryAuthority,
+    latest_batch_id: Option<BatchId>,
+    engine_binding: EngineHistoryBinding,
+}
+
+fn same_process_token_matches(
+    token: &SameProcessPromotionToken,
+    state: &PromotedRuntimeStateV1,
+    authority: &LocalActiveAuthority,
+) -> bool {
+    #[cfg(test)]
+    if FAIL_NEXT_SAME_PROCESS_PROMOTION_TOKEN_MATCH.with(|flag| flag.replace(false)) {
+        return false;
+    }
+    let binding = token.candidate.binding();
+    let storage = binding.storage_binding();
+    binding.workspace_id() == state.workspace_id
+        && binding.lineage_digest() == state.lineage_digest
+        && binding.graph_resource() == state.graph_resource_id
+        && binding.bootstrap_binding() == state.bootstrap
+        && binding.import_id() == state.bootstrap_import_id
+        && binding.archive_identity().binding_digest() == state.archive_control_binding
+        && binding.history_generation() == state.anchor_history_generation
+        && binding.history_root() == state.anchor_history_index_root
+        && binding.accepted_frontier().acceptance_sequence() == state.anchor_acceptance_sequence
+        && binding.accepted_frontier().state_digest() == state.anchor_accepted_frontier_state_digest
+        && storage.endpoint.endpoint_id() == state.endpoint_id
+        && storage.endpoint.device_id() == state.device_id
+        && storage.endpoint.graph_resource_id() == state.graph_resource_id
+        && storage.receipt_store_id == state.receipt_store_id
+        && token.sqlite_proof.authority_binding() == binding
+        && token.sqlite_proof.claim()
+            == ProjectionClaim::current(state.workspace_id, state.lineage_digest)
+        && token.sqlite_proof.frontier_root() == binding.accepted_frontier()
+        && authority.session_id == state.promotion_session_id
+        && authority.verification_digest == state.enrollment_verification_digest
+        && authority.evidence.binding().workspace_id() == state.workspace_id
+        && authority
+            .evidence
+            .binding()
+            .binding_digest()
+            .is_ok_and(|digest| digest == state.enrollment_binding_digest)
+}
+
 fn require_promoted_bootstrap_runtime_authority(
     archive: &ObjectStore,
     state: &PromotedRuntimeStateV1,
-) -> Result<(), RuntimePromotionError> {
+) -> Result<AuthenticatedBootstrapRuntimeAuthority, RuntimePromotionError> {
     // Duplicated from the caller's already-authenticated retained capability,
     // never reopened from `archive.root_path()`: the promoted lineage's runtime
     // authority must be derived from the exact archive that was authenticated.
@@ -4574,23 +4654,32 @@ fn require_promoted_bootstrap_runtime_authority(
             "durable history bootstrap binding is not the promoted lineage",
         ));
     }
+    let (generation, index_root, latest_batch_id, engine_binding) =
+        history.current_with_binding()?;
     let binding = super::hot_engine::bootstrap_reference_catalog_binding(&history)?;
     drop(history);
-    let Some((_policy, root)) = binding else {
-        return Ok(());
-    };
-    // The retained immutable publication must still load and be exactly this
-    // lineage's publication before any runtime authority is derived from it.
-    let publication = store.load_bootstrap_publication(state.bootstrap.publication_id())?;
-    if publication.aggregate().aggregate_digest() != state.bootstrap.aggregate_digest()
-        || publication.aggregate().import_id() != state.bootstrap_import_id
-    {
-        return Err(RuntimePromotionError::Anchor(
-            "retained bootstrap publication is not the promoted lineage's publication",
-        ));
+    if let Some((_policy, root)) = binding {
+        // The retained immutable publication must still load and be exactly this
+        // lineage's publication before any runtime authority is derived from it.
+        let publication = store.load_bootstrap_publication(state.bootstrap.publication_id())?;
+        if publication.aggregate().aggregate_digest() != state.bootstrap.aggregate_digest()
+            || publication.aggregate().import_id() != state.bootstrap_import_id
+        {
+            return Err(RuntimePromotionError::Anchor(
+                "retained bootstrap publication is not the promoted lineage's publication",
+            ));
+        }
+        super::hot_engine::require_promoted_bootstrap_reference_catalog(&store, &root)
+            .map_err(RuntimePromotionError::Engine)?;
     }
-    super::hot_engine::require_promoted_bootstrap_reference_catalog(&store, &root)
-        .map_err(RuntimePromotionError::Engine)
+    Ok(AuthenticatedBootstrapRuntimeAuthority {
+        history: EngineHistoryAuthority {
+            generation,
+            index_root,
+        },
+        latest_batch_id,
+        engine_binding,
+    })
 }
 
 /// Open, recover, and authenticate every promoted runtime component, then mint
@@ -4617,6 +4706,7 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
     recovery: RuntimeRecoveryState,
     post_open: Option<(&LocalActiveAuthority, &Graph)>,
     projection_open: PromotedProjectionOpen,
+    same_process: Option<SameProcessPromotionToken>,
 ) -> Result<PromotedLocalRuntime, W::Refusal> {
     // Everything below stays in one stack frame on purpose: `PromotedLocalRuntime`
     // and the recovered engine are tens of kilobytes, so an extra function
@@ -4702,7 +4792,7 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
     // The retained immutable publication and the durable reference-catalog
     // authority the cold record binds must both be present before the enrolled
     // open recovers from them.
-    try_release!(require_promoted_bootstrap_runtime_authority(
+    let bootstrap_runtime_authority = try_release!(require_promoted_bootstrap_runtime_authority(
         &archive, &state
     ));
 
@@ -4757,7 +4847,7 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
     // than selected between two sibling entry points here: this function is
     // deliberately one stack frame (see above), and a second engine-sized
     // result slot in it overflows a debug test thread's stack.
-    let (snapshot, unavailable) = match (&retention_plan, candidate) {
+    let (snapshot, mut unavailable) = match (&retention_plan, candidate) {
         (EngineScratchRetentionPlan::Ephemeral { reason, .. }, _) => (
             None,
             Some(ResumeAcceleratorUnavailable::ProofDenied(reason.clone())),
@@ -4771,13 +4861,70 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
             )),
         ),
     };
-    let retention = match retention_plan {
-        EngineScratchRetentionPlan::Ephemeral { .. } => EngineOpenRetention::Ephemeral,
-        EngineScratchRetentionPlan::Retained { .. } => EngineOpenRetention::Retained {
+    let mut verified_same_process_sqlite = None;
+    let migrated = match (same_process, &retention_plan) {
+        (Some(token), EngineScratchRetentionPlan::Retained { .. })
+            if post_open.is_some_and(|(authority, _)| {
+                same_process_token_matches(&token, &state, authority)
+            }) =>
+        {
+            let SameProcessPromotionToken {
+                candidate,
+                sqlite_proof,
+                database_path,
+            } = token;
+            match bootstrap_runtime_authority.latest_batch_id {
+                Some(latest_batch_id) => {
+                    match candidate.candidate().migrate_for_same_process_promotion(
+                        &archive,
+                        bootstrap_runtime_authority.history,
+                        latest_batch_id,
+                        &bootstrap_runtime_authority.engine_binding,
+                        state.lineage_digest,
+                        state.catalog_document_id,
+                    ) {
+                        Ok(migrated) => {
+                            if open.database_path == database_path {
+                                verified_same_process_sqlite = Some(sqlite_proof);
+                            }
+                            unavailable = None;
+                            Some(migrated)
+                        }
+                        Err(error) => {
+                            unavailable = Some(ResumeAcceleratorUnavailable::Unavailable(format!(
+                                "same-process bootstrap migration refused: {error}"
+                            )));
+                            None
+                        }
+                    }
+                }
+                None => {
+                    unavailable = Some(ResumeAcceleratorUnavailable::Unavailable(
+                        "same-process bootstrap history has no terminal record".into(),
+                    ));
+                    None
+                }
+            }
+        }
+        (Some(_), _) => {
+            unavailable = Some(ResumeAcceleratorUnavailable::Unavailable(
+                "same-process bootstrap token did not authenticate this promotion".into(),
+            ));
+            None
+        }
+        (None, _) => None,
+    };
+    let retention = match (retention_plan.clone(), migrated) {
+        (_, Some((retained, resume))) => EngineOpenRetention::MigratedBootstrap {
+            retained: Box::new(retained),
+            resume,
+        },
+        (EngineScratchRetentionPlan::Ephemeral { .. }, None) => EngineOpenRetention::Ephemeral,
+        (EngineScratchRetentionPlan::Retained { .. }, None) => EngineOpenRetention::Retained {
             resume: snapshot.as_deref(),
         },
     };
-    let (engine, _receipt, _outcomes) =
+    let (engine, receipt, _outcomes) =
         try_release!(ShardedHotEngine::open_enrolled_projection_with_retention(
             archive,
             state.lineage_digest,
@@ -4788,6 +4935,11 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
             &committed_manifests,
             retention,
         ));
+    if let Some(error) = receipt.refusal.as_ref() {
+        unavailable = Some(ResumeAcceleratorUnavailable::Unavailable(format!(
+            "runtime resume restore refused: {error}"
+        )));
+    }
     let resume_open = RuntimeResumeOpenStatus {
         plan: retention_plan,
         unavailable,
@@ -4862,6 +5014,11 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
     let publication = try_release!(store
         .load_bootstrap_publication(state.bootstrap.publication_id())
         .map_err(RuntimePromotionError::Store));
+    let projection_open = if verified_same_process_sqlite.is_some() {
+        PromotedProjectionOpen::ExistingOnly
+    } else {
+        projection_open
+    };
     // The database is opened through the retained workspace lease's single
     // applier slot, never through the compatibility entry point that would take
     // a second, temporary workspace lease of its own. A failed open returns the
@@ -4927,6 +5084,14 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
         close_and_release!(RuntimePromotionError::Anchor(
             "promoted SQLite projection is not at the current accepted frontier",
         ));
+    }
+    if let Some(proof) = verified_same_process_sqlite.as_ref() {
+        if let Err(error) = projection
+            .database()
+            .authenticate_same_process_bootstrap_reuse(proof)
+        {
+            close_and_release!(RuntimePromotionError::Sqlite(error));
+        }
     }
     let tail_source = match RebuildSource::from_promoted_runtime(&engine, store, &publication) {
         Ok(source) => source,
@@ -5043,6 +5208,7 @@ fn resume_enrollment_admission(
 pub(crate) struct InactiveBootstrapRuntimeSession {
     projection: LeasedWorkspaceProjection,
     sqlite_proof: VerifiedBootstrapSqliteProjection,
+    promotion_candidate: RetainedBootstrapPromotionCandidate,
 }
 
 impl InactiveBootstrapRuntimeSession {
@@ -5087,6 +5253,7 @@ impl InactiveBootstrapRuntimeSession {
         .map(|(projection, sqlite_proof)| Self {
             projection,
             sqlite_proof,
+            promotion_candidate: authority.retain_promotion_candidate(),
         })
     }
 
@@ -5111,8 +5278,24 @@ impl InactiveBootstrapRuntimeSession {
         authority: &LocalActiveAuthority,
         open: &PromotedRuntimeOpen<'_>,
     ) -> Result<PromotedLocalRuntime, RetainedPromotionRefusal> {
-        let lease = self.projection.close_retaining_lease();
-        open_promoted_local_runtime(sealed, authority, open, RetainedWorkspaceLease::new(lease))
+        let Self {
+            projection,
+            sqlite_proof,
+            promotion_candidate,
+        } = self;
+        let database_path = projection.database().path().to_path_buf();
+        let lease = projection.close_retaining_lease();
+        open_promoted_local_runtime_with_candidate(
+            sealed,
+            authority,
+            open,
+            RetainedWorkspaceLease::new(lease),
+            Some(SameProcessPromotionToken {
+                candidate: promotion_candidate,
+                sqlite_proof,
+                database_path,
+            }),
+        )
     }
 }
 

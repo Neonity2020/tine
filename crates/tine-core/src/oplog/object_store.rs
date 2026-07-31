@@ -2764,6 +2764,36 @@ impl ObjectStore {
         RetainedEngineScratch::seal(self, scratch)
     }
 
+    /// Mint a retained archive-local run containing the exact byte address
+    /// space of one live detached scratch run.
+    ///
+    /// This is the one-way same-process bootstrap migration seam. The source
+    /// remains owned and leased by its detached candidate, the destination is
+    /// freshly created beneath this exact archive capability, and no caller can
+    /// supply roots independently of the source bytes. The enrolled engine
+    /// still has to restore and authenticate a `RuntimeResumeSnapshot` against
+    /// durable history before these reconstructible bytes become usable.
+    pub(crate) fn create_retained_engine_scratch_from(
+        &self,
+        source: &super::scratch_store::ScratchStore,
+    ) -> Result<RetainedEngineScratch, StoreError> {
+        match source.clone_retained_into(&self.capability) {
+            Ok(retained) => RetainedEngineScratch::seal(self, retained),
+            Err(copy_error) => self
+                .adopt_retained_engine_scratch(
+                    source.run_id(),
+                    source
+                        .binding_digest()
+                        .map_err(|error| StoreError::Scratch(error.to_string()))?,
+                )
+                .map_err(|adoption_error| {
+                    StoreError::Scratch(format!(
+                        "retained scratch migration failed ({copy_error}); retry adoption failed ({adoption_error})"
+                    ))
+                }),
+        }
+    }
+
     /// Adopt exactly one already-published retained run.
     ///
     /// Four independent facts must hold before this returns, and every one of

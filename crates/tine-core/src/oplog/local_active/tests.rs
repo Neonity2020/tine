@@ -3156,6 +3156,14 @@ fn promoted_runtime_values_cannot_be_cloned_serialized_or_deserialized() {
     assert!(!Probe::<PromotedLocalRuntime>::CLONEABLE);
     assert!(!SerdeProbe::<PromotedLocalRuntime>::SERIALIZABLE);
     assert!(!DeserializeProbe::<PromotedLocalRuntime>::DESERIALIZABLE);
+    assert!(!Probe::<super::SameProcessPromotionToken>::CLONEABLE);
+    assert!(!SerdeProbe::<super::SameProcessPromotionToken>::SERIALIZABLE);
+    assert!(!DeserializeProbe::<super::SameProcessPromotionToken>::DESERIALIZABLE);
+    assert!(!Probe::<crate::oplog::import::RetainedBootstrapPromotionCandidate>::CLONEABLE);
+    assert!(!SerdeProbe::<crate::oplog::import::RetainedBootstrapPromotionCandidate>::SERIALIZABLE);
+    assert!(!DeserializeProbe::<
+        crate::oplog::import::RetainedBootstrapPromotionCandidate,
+    >::DESERIALIZABLE);
     assert!(!Probe::<SealedRuntimePromotion>::CLONEABLE);
     assert!(!SerdeProbe::<SealedRuntimePromotion>::SERIALIZABLE);
     assert!(!DeserializeProbe::<SealedRuntimePromotion>::DESERIALIZABLE);
@@ -3552,12 +3560,14 @@ fn assert_promoted_reopen_refuses_a_tampered_archive_claim(
     fixture.assert_graph_unchanged();
 }
 
-/// Promoted recovery replays its immutable bootstrap parts one at a time.
+/// Uninterrupted promotion migrates its accepted candidate without replay;
+/// fresh-process recovery still replays immutable bootstrap parts one at a
+/// time.
 ///
 /// Restart resident memory must be one bootstrap part, not the whole graph, so
-/// the observed maximum bootstrap-part residency has to be exactly one over a
-/// genuinely multi-part publication — on the same-process promoted open and
-/// again on a fresh-process reopen that holds no retained evidence at all.
+/// the same-process promoted engine must report zero payload reads and zero
+/// replayed generations. A fresh-process reopen that holds no retained evidence
+/// must still read every part with maximum residency exactly one.
 ///
 /// The counter measures payload *ownership*, not a staging bracket, and this
 /// test proves that executably rather than by assertion: the test-only preload
@@ -3600,19 +3610,42 @@ fn promoted_recovery_streams_exactly_one_bootstrap_part_at_a_time() {
 
     let root = fixture.enrollment_root("promote-stream-parts");
     let binding = fixture.enrollment_binding();
-    let paths = PromotedPaths::new(&fixture, "stream-parts");
+    let mut paths = PromotedPaths::new(&fixture, "stream-parts");
+    // Production activation promotes the already-verified bootstrap database
+    // in place. Use that exact path so this receipt also proves the successful
+    // one-shot path opens existing SQLite without a rebuild.
+    paths.database_path = fixture.root.path().join("bootstrap.sqlite");
     let session = SessionId::new();
     let (authority, runtime) = promote(&mut fixture, &root, session, &paths);
 
     let same_process = runtime.engine().bootstrap_recovery_instrumentation();
     assert_eq!(
-        same_process.bootstrap_part_reads, part_count,
-        "recovery must read every bootstrap part exactly once"
+        same_process.bootstrap_part_reads,
+        0,
+        "same-process promotion must not reread bootstrap parts: {:?}",
+        runtime.resume_open_status()
     );
-    assert!(same_process.bootstrap_object_reads > 0);
+    assert_eq!(same_process.bootstrap_object_reads, 0);
+    assert_eq!(same_process.max_live_bootstrap_parts, 0);
+    let same_process_resume = runtime.resume_open_status().observation();
+    assert!(same_process_resume.adopted);
     assert_eq!(
-        same_process.max_live_bootstrap_parts, 1,
-        "at most one bootstrap part payload may be resident at a time"
+        same_process_resume.replay_base_generation,
+        part_count as u64
+    );
+    assert_eq!(
+        same_process_resume.live_history_generation,
+        part_count as u64
+    );
+    assert_eq!(same_process_resume.replayed_generations, 0);
+    assert!(matches!(
+        runtime.projection().recovery,
+        crate::oplog::sqlite::ProjectionRecovery::OpenedExisting
+    ));
+    assert_eq!(
+        runtime.projection().rebuild,
+        crate::oplog::sqlite::RebuildInstrumentation::default(),
+        "same-process promotion must use the verified projection without rebuilding"
     );
 
     // The instrument itself is exercised against the forbidden shape. Holding
@@ -3624,14 +3657,8 @@ fn promoted_recovery_streams_exactly_one_bootstrap_part_at_a_time() {
         .engine()
         .probe_preloaded_bootstrap_part_residency()
         .unwrap();
-    assert_eq!(
-        preloaded.bootstrap_part_reads, same_process.bootstrap_part_reads,
-        "the preload probe must read exactly the parts the replay reads"
-    );
-    assert_eq!(
-        preloaded.bootstrap_object_reads, same_process.bootstrap_object_reads,
-        "the preload probe must read exactly the objects the replay reads"
-    );
+    assert_eq!(preloaded.bootstrap_part_reads, part_count);
+    assert!(preloaded.bootstrap_object_reads > 0);
     assert_eq!(
         preloaded.max_live_bootstrap_parts, part_count,
         "holding every prepared part at once must be visible as {part_count} resident parts"
@@ -3650,16 +3677,27 @@ fn promoted_recovery_streams_exactly_one_bootstrap_part_at_a_time() {
         same_process
     );
 
-    // A restarted process reconstructs everything from durable state; the same
-    // residency bound must hold on that path too.
+    let same_process_observation = public_runtime_observation(&runtime);
+
+    // A restarted process reconstructs everything from durable state; full
+    // replay and its aggregate-backed part validation remain mandatory.
     drop(runtime);
     drop(authority);
     remove_every_resume_point(&fixture.archive_root);
     let (_reopened_authority, reopened) =
         reopen_promoted_local_runtime(&root, &binding, session, &paths.open(&fixture)).unwrap();
     let fresh_process = reopened.engine().bootstrap_recovery_instrumentation();
-    assert_eq!(fresh_process, same_process);
+    assert_eq!(fresh_process.bootstrap_part_reads, part_count);
+    assert_eq!(
+        fresh_process.bootstrap_object_reads,
+        preloaded.bootstrap_object_reads
+    );
     assert_eq!(fresh_process.max_live_bootstrap_parts, 1);
+    let fresh_resume = reopened.resume_open_status().observation();
+    assert!(!fresh_resume.adopted);
+    assert_eq!(fresh_resume.replay_base_generation, 0);
+    assert_eq!(fresh_resume.live_history_generation, part_count as u64);
+    assert_eq!(fresh_resume.replayed_generations, part_count as u64);
     let (fresh_preloaded, fresh_live_after_release) = reopened
         .engine()
         .probe_preloaded_bootstrap_part_residency()
@@ -3669,6 +3707,201 @@ fn promoted_recovery_streams_exactly_one_bootstrap_part_at_a_time() {
     assert_eq!(
         reopened.engine().bootstrap_recovery_instrumentation(),
         fresh_process
+    );
+    let fresh_process_observation = public_runtime_observation(&reopened);
+    assert_publicly_indistinguishable(
+        &same_process_observation,
+        &fresh_process_observation,
+        "same-process bootstrap migration versus fresh full replay",
+    );
+    fixture.assert_graph_unchanged();
+}
+
+/// A process token is an accelerator, never authority. If its exact typed
+/// binding does not match, the retained workspace lease stays continuously
+/// held and the unchanged ordinary full replay path constructs the runtime.
+#[test]
+fn a_same_process_promotion_token_mismatch_falls_back_under_the_retained_lease() {
+    force_next_bootstrap_part_operation_limit(1);
+    let mut fixture = Fixture::new(
+        "promotion-token-mismatch",
+        None,
+        vec![(
+            "pages/token.md".into(),
+            b"title:: Token\n\n- one\n- two\n".to_vec(),
+        )],
+    );
+    let part_count = fixture.verified.part_count() as usize;
+    assert!(part_count > 1);
+    let root = fixture.enrollment_root("promotion-token-mismatch");
+    let paths = PromotedPaths::new(&fixture, "promotion-token-mismatch");
+    let session = SessionId::new();
+
+    mismatch_next_same_process_promotion_token_for_test();
+    let before = PromotedRuntimeInstrumentation::capture();
+    let (_authority, runtime) = promote(&mut fixture, &root, session, &paths);
+    let replay = runtime.engine().bootstrap_recovery_instrumentation();
+    assert_eq!(replay.bootstrap_part_reads, part_count);
+    assert!(replay.bootstrap_object_reads > 0);
+    assert_eq!(replay.max_live_bootstrap_parts, 1);
+    let observation = runtime.resume_open_status().observation();
+    assert!(!observation.adopted);
+    assert_eq!(observation.replay_base_generation, 0);
+    assert_eq!(observation.replayed_generations, part_count as u64);
+    assert_eq!(
+        before.since().workspace_lease_acquisitions,
+        0,
+        "discarding the token must not release and reacquire the workspace lease"
+    );
+    fixture.assert_graph_unchanged();
+}
+
+/// A byte-identical archive substituted after the immutable promotion state
+/// was published cannot consume the process token or the continuously held
+/// workspace lease. Restoring the original directory lets the caller retry
+/// with that exact returned lease and candidate.
+#[test]
+fn archive_replacement_after_promotion_publication_refuses_and_retries_under_the_same_lease() {
+    let mut fixture = Fixture::new(
+        "same-process-archive-replacement",
+        None,
+        vec![(
+            "pages/archive.md".into(),
+            b"title:: Archive\n\n- retained lease\n".to_vec(),
+        )],
+    );
+    let root = fixture.enrollment_root("same-process-archive-replacement");
+    let paths = PromotedPaths::new(&fixture, "same-process-archive-replacement");
+    let session = SessionId::new();
+    let authority = activate_verified_local(
+        &root,
+        fixture.compose(&root),
+        session,
+        &fixture.proofs(),
+        &fixture.runtime(),
+    )
+    .unwrap();
+    let refused_seal =
+        seal_local_runtime_promotion(&authority, &fixture.proofs(), &fixture.runtime()).unwrap();
+    let retry_seal =
+        seal_local_runtime_promotion(&authority, &fixture.proofs(), &fixture.runtime()).unwrap();
+    let bootstrap = fixture.take_bootstrap_session();
+
+    // Keep the live archive and its retained lease open on the renamed inode,
+    // then put a byte-identical but physically distinct archive at the enrolled
+    // pathname. Content alone is deliberately insufficient authority.
+    let enrolled_path = fixture.archive_root.clone();
+    let relocated = fixture
+        .root
+        .path()
+        .join("archive-relocated-after-publication");
+    fs::rename(&enrolled_path, &relocated).unwrap();
+    copy_tree(&relocated, &enrolled_path);
+    let replacement_before = snapshot_file_digests(&enrolled_path);
+
+    let before = PromotedRuntimeInstrumentation::capture();
+    let (lease, error) = bootstrap
+        .promote(refused_seal, &authority, &paths.open(&fixture))
+        .err()
+        .expect("a replacement archive must not receive writable authority")
+        .into_parts();
+    assert!(
+        matches!(
+            error,
+            RuntimePromotionError::Store(crate::oplog::StoreError::Io(_))
+        ),
+        "unexpected archive replacement refusal: {error}"
+    );
+    assert_eq!(before.since().workspace_lease_acquisitions, 0);
+    assert!(
+        !paths.database_path.exists(),
+        "the replacement must be refused before a promoted SQLite writer exists"
+    );
+    assert_eq!(
+        snapshot_file_digests(&enrolled_path),
+        replacement_before,
+        "the refused replacement archive must remain byte-identical"
+    );
+    let relocated_store = ObjectStore::open(&relocated, fixture.workspace).unwrap();
+    assert!(matches!(
+        WorkspaceRuntimeLease::acquire(&relocated_store, fixture.workspace),
+        Err(ProjectionError::LeaseContended(_))
+    ));
+
+    // Put the exact original archive back. The refusal returned the same lease,
+    // so reopening the bootstrap projection and retrying requires no archive
+    // release/reacquire gap and can still use the process-only candidate.
+    fs::remove_dir_all(&enrolled_path).unwrap();
+    fs::rename(&relocated, &enrolled_path).unwrap();
+    let bootstrap = fixture.reopen_bootstrap_session(lease);
+    let runtime = bootstrap
+        .promote(retry_seal, &authority, &paths.open(&fixture))
+        .map_err(|refusal| refusal.into_parts().1)
+        .unwrap();
+    assert_eq!(
+        runtime
+            .engine()
+            .bootstrap_recovery_instrumentation()
+            .bootstrap_part_reads,
+        0
+    );
+    assert_eq!(before.since().workspace_lease_acquisitions, 0);
+    fixture.assert_graph_unchanged();
+}
+
+/// Damage to reconstructible candidate bytes after the durable promotion state
+/// was published cannot become writable authority. Resume restoration detects
+/// it, rotates to an ordinary full replay, and keeps the retained workspace
+/// lease throughout.
+#[test]
+fn corrupted_same_process_candidate_falls_back_before_writable_authority() {
+    force_next_bootstrap_part_operation_limit(1);
+    let mut fixture = Fixture::new(
+        "promotion-candidate-corruption",
+        None,
+        vec![(
+            "pages/corrupt-candidate.md".into(),
+            b"title:: Candidate\n\n- one\n- two\n".to_vec(),
+        )],
+    );
+    let root = fixture.enrollment_root("promotion-candidate-corruption");
+    let paths = PromotedPaths::new(&fixture, "promotion-candidate-corruption");
+    let session = SessionId::new();
+    let authority = activate_verified_local(
+        &root,
+        fixture.compose(&root),
+        session,
+        &fixture.proofs(),
+        &fixture.runtime(),
+    )
+    .unwrap();
+    let sealed =
+        seal_local_runtime_promotion(&authority, &fixture.proofs(), &fixture.runtime()).unwrap();
+    fixture
+        .authority
+        .corrupt_retained_candidate_scratch_for_test();
+
+    let before = PromotedRuntimeInstrumentation::capture();
+    let bootstrap = fixture.take_bootstrap_session();
+    let runtime = bootstrap
+        .promote(sealed, &authority, &paths.open(&fixture))
+        .map_err(|refusal| refusal.into_parts().1)
+        .unwrap();
+    let replay = runtime.engine().bootstrap_recovery_instrumentation();
+    assert_eq!(
+        replay.bootstrap_part_reads,
+        fixture.verified.part_count() as usize
+    );
+    assert!(!runtime.resume_open_status().observation().adopted);
+    assert!(matches!(
+        runtime.resume_open_status().unavailable(),
+        Some(ResumeAcceleratorUnavailable::Unavailable(reason))
+            if reason.contains("same-process bootstrap migration refused")
+    ));
+    assert_eq!(
+        before.since().workspace_lease_acquisitions,
+        0,
+        "candidate refusal must remain under the continuously held lease"
     );
     fixture.assert_graph_unchanged();
 }
@@ -4956,6 +5189,14 @@ fn a_refused_retained_promotion_returns_the_exact_lease_at_every_failure_boundar
         .map_err(|refusal| refusal.into_parts().1)
         .unwrap();
     assert_eq!(runtime.recovery(), RuntimeRecoveryState::FirstPromotion);
+    assert_eq!(
+        runtime
+            .engine()
+            .bootstrap_recovery_instrumentation()
+            .bootstrap_part_reads,
+        0,
+        "retry must safely re-adopt the already migrated candidate rather than replay"
+    );
     assert_eq!(
         before.since().workspace_lease_acquisitions,
         0,
@@ -6515,11 +6756,24 @@ struct PublicRuntimeObservation {
     sqlite_accepted: AcceptedFrontierRoot,
     sqlite_effects: Vec<String>,
     projection_work: Vec<String>,
+    projected_documents: BTreeMap<String, Vec<u8>>,
 }
 
 fn public_runtime_observation(runtime: &PromotedLocalRuntime) -> PublicRuntimeObservation {
+    let snapshot = runtime.engine().canonical_snapshot().unwrap();
+    let projected_documents = snapshot
+        .pages
+        .iter()
+        .map(|(page_id, _)| {
+            let page = runtime.engine().materialize_page(*page_id).unwrap();
+            let path = page.path.as_str().to_owned();
+            let bytes =
+                crate::oplog::projection::render_requested_page_document(&page, None).unwrap();
+            (path, bytes)
+        })
+        .collect();
     PublicRuntimeObservation {
-        snapshot: runtime.engine().canonical_snapshot().unwrap(),
+        snapshot,
         accepted: runtime.engine().accepted_frontier_root().unwrap(),
         history: format!(
             "{:?}",
@@ -6534,6 +6788,7 @@ fn public_runtime_observation(runtime: &PromotedLocalRuntime) -> PublicRuntimeOb
             .map(|effect| format!("{effect:?}"))
             .collect(),
         projection_work: projection_work_fingerprint(runtime),
+        projected_documents,
     }
 }
 
@@ -6581,6 +6836,10 @@ fn assert_publicly_indistinguishable(
     assert_eq!(
         adopted.projection_work, replayed.projection_work,
         "{what}: ready projection work"
+    );
+    assert_eq!(
+        adopted.projected_documents, replayed.projected_documents,
+        "{what}: projected Markdown/Org bytes"
     );
 }
 

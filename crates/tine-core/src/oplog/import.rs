@@ -626,6 +626,27 @@ pub(crate) struct InactiveBootstrapAcceptedAuthority {
     binding: InactiveBootstrapAcceptedAuthorityBinding,
 }
 
+/// One-shot process-local access to the exact detached candidate retained by
+/// an inactive bootstrap authority.
+///
+/// This handle is intentionally neither `Clone` nor serializable. It carries
+/// no writable authority and exposes no engine directly; promotion can only
+/// consume it through the durable-binding migration path.
+pub(crate) struct RetainedBootstrapPromotionCandidate {
+    candidate: Rc<DetachedBootstrapCandidate>,
+    binding: InactiveBootstrapAcceptedAuthorityBinding,
+}
+
+impl RetainedBootstrapPromotionCandidate {
+    pub(crate) fn candidate(&self) -> &DetachedBootstrapCandidate {
+        &self.candidate
+    }
+
+    pub(crate) const fn binding(&self) -> &InactiveBootstrapAcceptedAuthorityBinding {
+        &self.binding
+    }
+}
+
 impl InactiveBootstrapAcceptedAuthority {
     pub(crate) const fn store(&self) -> &ObjectStore {
         &self.store
@@ -641,6 +662,18 @@ impl InactiveBootstrapAcceptedAuthority {
 
     pub(crate) const fn binding(&self) -> &InactiveBootstrapAcceptedAuthorityBinding {
         &self.binding
+    }
+
+    pub(crate) fn retain_promotion_candidate(&self) -> RetainedBootstrapPromotionCandidate {
+        RetainedBootstrapPromotionCandidate {
+            candidate: Rc::clone(&self.candidate),
+            binding: self.binding.clone(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn corrupt_retained_candidate_scratch_for_test(&self) {
+        self.candidate.corrupt_scratch_for_promotion_test();
     }
 }
 

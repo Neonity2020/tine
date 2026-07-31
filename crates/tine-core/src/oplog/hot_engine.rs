@@ -1910,7 +1910,7 @@ impl DetachedBootstrapScratchRoot {
 
 impl Drop for DetachedBootstrapScratchRoot {
     fn drop(&mut self) {
-        let _ = self.root.remove_dir(super::scratch_store::SCRATCH_DIR);
+        let _ = self.root.remove_dir_all(super::scratch_store::SCRATCH_DIR);
         let _ = self.parent.remove_dir(&self.name);
     }
 }
@@ -1974,6 +1974,115 @@ impl DetachedBootstrapCandidate {
             reference_fallback_document_reconstructions: reference
                 .fallback_document_reconstructions,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn corrupt_scratch_for_promotion_test(&self) {
+        self.engine
+            .scratch
+            .as_ref()
+            .expect("detached candidate scratch")
+            .truncate_pages_for_test();
+    }
+
+    /// Migrate this exact live detached candidate into a canonical retained
+    /// archive run and describe it as an authenticated-recovery predecessor.
+    ///
+    /// The returned snapshot is process-only typed evidence. Its durable
+    /// fields come from the freshly opened sealed history, while every
+    /// run-local root comes from this candidate and addresses a byte-for-byte
+    /// copy made under both scratch leases. The ordinary enrolled restore path
+    /// must still re-read the cold head record, validate every durable index
+    /// root, and probe the migrated run before it can skip any generation.
+    pub(crate) fn migrate_for_same_process_promotion(
+        &self,
+        store: &ObjectStore,
+        history: super::object_store::EngineHistoryAuthority,
+        latest_batch_id: BatchId,
+        durable_binding: &super::object_store::EngineHistoryBinding,
+        expected_lineage: LineageDigest,
+        expected_catalog_document_id: DocumentId,
+    ) -> Result<
+        (
+            super::object_store::RetainedEngineScratch,
+            Box<RuntimeResumeSnapshot>,
+        ),
+        EngineError,
+    > {
+        let engine = &self.engine;
+        if self.part_count == 0
+            || history.generation != u64::from(self.part_count)
+            || engine.workspace_id != store.workspace_id()
+            || engine.lineage_digest != expected_lineage
+            || engine.catalog_document_id != expected_catalog_document_id
+            || !engine
+                .durable_history_binding()
+                .same_replay_authority(durable_binding)
+            || engine.history_failure.is_some()
+            || engine.is_blocked()
+            || !engine.portable_path_conflicts.is_empty()
+            || !engine.page_name_conflicts.is_empty()
+            || engine.fatal_evidence.is_some()
+            || engine.has_pending_author_work()
+            || !scratch_roots_are_stage_quiescent(&engine.scratch_roots)
+            || !engine.current_path_catalog.available
+            || engine.current_path_catalog.accepted_frontier_root != engine.accepted_frontier_root
+            || engine.next_acceptance_sequence != engine.accepted_frontier_root.acceptance_sequence
+        {
+            return Err(EngineError::Archive(
+                "detached bootstrap candidate is not an exact quiescent durable predecessor".into(),
+            ));
+        }
+        engine
+            .reference_catalog
+            .ensure_ready()
+            .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))?;
+        let (terminal_batch_id, terminal_evidence) = engine
+            .accepted_batch_entry_at(u64::from(self.part_count))?
+            .ok_or_else(|| {
+                EngineError::Archive(
+                    "detached bootstrap candidate has no terminal accepted entry".into(),
+                )
+            })?;
+        let terminal_evidence = terminal_evidence.ok_or_else(|| {
+            EngineError::Archive(
+                "detached bootstrap candidate terminal entry has no accepted evidence".into(),
+            )
+        })?;
+        if terminal_batch_id != latest_batch_id
+            || terminal_evidence.batch_id != latest_batch_id
+            || terminal_evidence.acceptance_sequence != history.generation
+            || terminal_evidence.post_frontier_root != engine.accepted_frontier_root
+        {
+            return Err(EngineError::Archive(
+                "detached bootstrap terminal frontier is not the durable history head".into(),
+            ));
+        }
+        let source = engine.scratch.as_ref().ok_or_else(|| {
+            EngineError::Archive("detached bootstrap candidate has no scratch store".into())
+        })?;
+        let retained = store
+            .create_retained_engine_scratch_from(source)
+            .map_err(|error| EngineError::Archive(error.to_string()))?;
+        let snapshot = Box::new(RuntimeResumeSnapshot {
+            history_generation: history.generation,
+            history_index_root: history.index_root,
+            history_latest_batch_id: latest_batch_id,
+            scratch_run_id: retained.run_id(),
+            scratch_binding_digest: retained.binding_digest(),
+            scratch_roots: engine.scratch_roots.clone(),
+            block_claim_root: engine.block_claim_root,
+            accepted_frontier_root: engine.accepted_frontier_root.clone(),
+            next_acceptance_sequence: engine.next_acceptance_sequence,
+            current_path_catalog_root: engine.current_path_catalog.root.clone(),
+            current_path_catalog_available: engine.current_path_catalog.available,
+            current_path_catalog_frontier: engine
+                .current_path_catalog
+                .accepted_frontier_root
+                .clone(),
+            catalog_checkpoint_binding: engine.catalog_checkpoint_binding(),
+        });
+        Ok((retained, snapshot))
     }
 }
 
@@ -2049,7 +2158,7 @@ impl DetachedBootstrapAuthoringSession {
         }
         let scratch_root = DetachedBootstrapScratchRoot::create()?;
         let scratch = Arc::new(
-            ScratchStore::open(&scratch_root.root, workspace_id)
+            ScratchStore::create_retained(&scratch_root.root, workspace_id)
                 .map_err(|error| EngineError::Archive(error.to_string()))?,
         );
         let mut candidate = Box::new(ShardedHotEngine::new(
@@ -4341,7 +4450,6 @@ impl RunLocalCatalogHotState {
 /// engine one: only the lifecycle can see whether another retained run could
 /// later be proved unreachable, and an engine that mints one it can never
 /// collect is a permanent archive leak.
-#[derive(Clone, Copy, Debug)]
 pub(crate) enum EngineOpenRetention<'a> {
     /// A disposable run and a full replay. Nothing is retained, so this engine
     /// can neither be resumed from nor publish a resume point.
@@ -4350,6 +4458,13 @@ pub(crate) enum EngineOpenRetention<'a> {
     /// snapshot records still holds. `None` is a fresh retained run.
     Retained {
         resume: Option<&'a RuntimeResumeSnapshot>,
+    },
+    /// A retained run migrated from the exact same-process detached bootstrap
+    /// candidate. The owned capability prevents a release/re-adopt gap; the
+    /// snapshot still passes through the identical durable restore validator.
+    MigratedBootstrap {
+        retained: Box<super::object_store::RetainedEngineScratch>,
+        resume: Box<RuntimeResumeSnapshot>,
     },
 }
 
@@ -4981,21 +5096,23 @@ impl ShardedHotEngine {
         // capability, before anything is moved into an engine. A refusal here
         // is a plain fallback, so the fresh run is minted from the same
         // capability and the candidate's bytes are never opened for writing.
-        let (retained, adopted, mut refused_run_id, mut refusal) = match retention {
-            EngineOpenRetention::Ephemeral => (None, None, None, None),
+        let (retained, migrated_resume, adopted, mut refused_run_id, mut refusal) = match retention
+        {
+            EngineOpenRetention::Ephemeral => (None, None, None, None, None),
             EngineOpenRetention::Retained {
                 resume: Some(snapshot),
             } => match store.adopt_retained_engine_scratch(
                 snapshot.scratch_run_id,
                 snapshot.scratch_binding_digest,
             ) {
-                Ok(retained) => (Some(retained), Some(snapshot), None, None),
+                Ok(retained) => (Some(retained), None, Some(snapshot), None, None),
                 Err(error) => (
                     Some(
                         store
                             .create_retained_engine_scratch()
                             .map_err(|error| EngineError::Archive(error.to_string()))?,
                     ),
+                    None,
                     None,
                     Some(snapshot.scratch_run_id),
                     Some(EngineError::Archive(error.to_string())),
@@ -5010,8 +5127,13 @@ impl ShardedHotEngine {
                 None,
                 None,
                 None,
+                None,
             ),
+            EngineOpenRetention::MigratedBootstrap { retained, resume } => {
+                (Some(*retained), Some(resume), None, None, None)
+            }
         };
+        let adopted = migrated_resume.as_deref().or(adopted);
         let mut engine = Self::with_enrolled_projection_promoted(
             store,
             lineage_digest,
