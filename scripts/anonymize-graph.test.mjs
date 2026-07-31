@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { lstat, mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { link, lstat, mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, extname, join, relative } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -46,7 +46,12 @@ function punctuationAndWhitespaceMask(text) {
 }
 
 async function expectFailure(source, destination) {
-  await assert.rejects(() => anonymizeGraph({ source, destination }), AnonymizeError);
+  let failure;
+  await assert.rejects(() => anonymizeGraph({ source, destination }), (error) => {
+    failure = error;
+    return error instanceof AnonymizeError;
+  });
+  return failure;
 }
 
 test("recursively exports Markdown and Org files from nested and custom directories", async (t) => {
@@ -157,6 +162,32 @@ test("does not retain fixture secrets in content, paths, report, or CLI stdout",
   assert.doesNotMatch(run.stdout, /source/u);
 });
 
+test("exports exhausted one-glyph domains by salted derangement without relaxing longer secrets", async (t) => {
+  const source = await fixture(t);
+  const destination = join(source, "..", "anonymized-glyph-domains");
+  const digits = [..."0123456789"];
+  const upper = [..."ABCDEFGHIJKLMNOPQRSTUVWXYZ"];
+  const lower = [..."abcdefghijklmnopqrstuvwxyz"];
+  const numericSecret = "98765432101234567890";
+  const wordSecret = "ConfidentialIdentifier";
+  await writeGraph(source, {
+    "pages/domains.md": `${digits.join(" ")}\n${upper.join(" ")}\n${lower.join(" ")}\n${numericSecret} ${wordSecret}\n`,
+  });
+
+  await anonymizeGraph({ source, destination, salt: Buffer.alloc(32, 11) });
+  const output = (await listFiles(destination)).find((file) => extname(file.path).toLowerCase() === ".md").text;
+  const [outputDigits, outputUpper, outputLower, outputSecrets] = output.trim().split("\n").map((line) => line.split(" "));
+
+  for (const [original, transformed] of [[digits, outputDigits], [upper, outputUpper], [lower, outputLower]]) {
+    assert.equal(new Set(transformed).size, original.length);
+    assert.deepEqual(transformed.map((token) => Buffer.byteLength(token)), original.map((token) => Buffer.byteLength(token)));
+    transformed.forEach((token, index) => assert.notEqual(token, original[index]));
+  }
+  assert.equal(outputSecrets.length, 2);
+  assert.notEqual(outputSecrets[0], numericSecret);
+  assert.notEqual(outputSecrets[1], wordSecret);
+});
+
 test("fails closed for symlinks, invalid UTF-8, existing or nested destinations, and portable path collisions", async (t) => {
   const root = await fixture(t);
 
@@ -195,24 +226,124 @@ test("fails closed for symlinks, invalid UTF-8, existing or nested destinations,
   await assert.rejects(() => lstat(collisionDestination));
 });
 
-test("omits internal and non-managed files", async (t) => {
-  const source = await fixture(t);
-  const destination = join(source, "..", "anonymized-omissions");
-  await writeGraph(source, {
-    "pages/managed.md": "- included\n",
-    "assets/secret.md": "private asset text\n",
-    ".git/secret.md": "private git text\n",
-    ".tine-sync/secret.org": "private sync text\n",
+test("omits the full fixed, hidden-component, and provider policy before vocabulary mapping", async (t) => {
+  const root = await fixture(t);
+  const baselineSource = join(root, "baseline");
+  const excludedSource = join(root, "excluded");
+  const baselineDestination = join(root, "baseline-output");
+  const excludedDestination = join(root, "excluded-output");
+  const included = {
+    "pages/managed.md": "- included stable 24680\n",
+    "logseq/allowed.md": "- allowed stable text\n",
+  };
+  await writeGraph(baselineSource, included);
+  await writeGraph(excludedSource, {
+    ...included,
+    "ASSETS/asset-secret.md": "private asset vocabulary 0\n",
+    "Publish/publish-secret.org": "private publish vocabulary 1\n",
+    ".TINE-SYNC/sync-secret.md": "private sync vocabulary 2\n",
+    ".git/git-secret.md": "private git vocabulary 3\n",
+    "deep/.hidden/hidden-secret.md": "private hidden vocabulary 4\n",
+    "deep/Node_Modules/pkg/dependency-secret.md": "private dependency vocabulary 5\n",
+    "Logseq/.RECYCLE/recycle-secret.md": "private recycle vocabulary 6\n",
+    "LOGSEQ/BAK/backup-secret.md": "private backup vocabulary 7\n",
+    "logseq/VERSION-FILES/version-secret.md": "private version vocabulary 8\n",
+    "logseq/.TINE-TRASH/trash-secret.md": "private trash vocabulary 9\n",
+    "pages/page.sync-conflict-20260731-120000-ABCDEF.md": "private provider vocabulary alpha\n",
+    "pages/page (conflicted copy 2026-07-31).md": "private provider vocabulary beta\n",
     "pages/secret.pdf": "not managed",
     "custom/not-managed.txt": "not managed",
   });
 
-  const summary = await anonymizeGraph({ source, destination });
-  const exported = await listFiles(destination);
-  const combined = exported.map((file) => `${file.path}\n${file.text}`).join("\n");
+  const salt = Buffer.alloc(32, 12);
+  const baseline = await anonymizeGraph({ source: baselineSource, destination: baselineDestination, salt });
+  const excluded = await anonymizeGraph({ source: excludedSource, destination: excludedDestination, salt });
+  const baselineFiles = (await listFiles(baselineDestination)).filter((file) => file.path !== "anonymization-report.txt");
+  const excludedFiles = (await listFiles(excludedDestination)).filter((file) => file.path !== "anonymization-report.txt");
 
-  assert.equal(summary.fileCount, 1);
-  assert.doesNotMatch(combined, /asset|git|sync|private|managed\.txt|\.pdf/u);
+  assert.equal(baseline.fileCount, 2);
+  assert.equal(excluded.fileCount, 2);
+  assert.deepEqual(excludedFiles, baselineFiles);
+});
+
+test("fails closed before inventory when config.edn has a hidden policy", async (t) => {
+  const source = await fixture(t);
+  const destination = join(source, "..", "hidden-policy-output");
+  await writeGraph(source, {
+    "pages/included.md": "- included\n",
+    "private/secret.md": "- secret\n",
+    "logseq/config.edn": "{:hidden [\"private\"]}\n",
+  });
+
+  const failure = await expectFailure(source, destination);
+  assert.match(failure.message, /:hidden policy/u);
+  assert.doesNotMatch(failure.message, /private|secret/u);
+  await assert.rejects(() => lstat(destination));
+});
+
+test("rejects portable-equivalent source identities without destination residue", async (t) => {
+  const root = await fixture(t);
+  const cases = [
+    ["ascii", "pages/Foo.md", "pages/foo.md"],
+    ["normalization", "pages/Café.md", "pages/Cafe\u0301.md"],
+    ["full-fold", "pages/Straße.md", "pages/STRASSE.md"],
+  ];
+  for (const [label, left, right] of cases) {
+    const source = join(root, `${label}-source`);
+    const destination = join(root, `${label}-output`);
+    await writeGraph(source, { [left]: "- left\n", [right]: "- right\n" });
+    const failure = await expectFailure(source, destination);
+    assert.match(failure.message, /portable identity/u);
+    assert.doesNotMatch(failure.message, /Foo|Café|Cafe|Straße|STRASSE/u);
+    await assert.rejects(() => lstat(destination));
+  }
+});
+
+test("exports a unique non-ASCII nested path with path/content identity intact", async (t) => {
+  const source = await fixture(t);
+  const destination = join(source, "..", "unicode-output");
+  await writeGraph(source, {
+    "pages/客户/秘密.md": "- [[秘密]] belongs to 客户\n",
+  });
+
+  await anonymizeGraph({ source, destination, salt: Buffer.alloc(32, 13) });
+  const output = (await listFiles(destination)).find((file) => extname(file.path).toLowerCase() === ".md");
+  const outputStem = basename(output.path, extname(output.path));
+  const outputDirectory = output.path.split("/").at(-2);
+  assert.equal(output.text.match(/\[\[([^\]]+)\]\]/u)?.[1], outputStem);
+  assert.ok(output.text.includes(outputDirectory));
+  assert.doesNotMatch(`${output.path}\n${output.text}`, /客户|秘密/u);
+});
+
+test("rejects a hard-linked managed file without leaving output", async (t) => {
+  const root = await fixture(t);
+  const source = join(root, "hard-link-source");
+  const destination = join(root, "hard-link-output");
+  const outside = join(root, "outside-secret.md");
+  await writeFile(outside, "- outside secret\n");
+  await mkdir(join(source, "pages"), { recursive: true });
+  await link(outside, join(source, "pages", "linked.md"));
+
+  const failure = await expectFailure(source, destination);
+  assert.match(failure.message, /hard links/u);
+  assert.doesNotMatch(failure.message, /outside|secret|linked/u);
+  await assert.rejects(() => lstat(destination));
+});
+
+test("protected-range lookup work grows linearly by deterministic comparison count", async (t) => {
+  const root = await fixture(t);
+  const run = async (lines) => {
+    const source = join(root, `work-${lines}-source`);
+    const destination = join(root, `work-${lines}-output`);
+    await writeGraph(source, { "pages/work.md": "- TODO private\n".repeat(lines) });
+    return anonymizeGraph({ source, destination, salt: Buffer.alloc(32, 14) });
+  };
+
+  const small = await run(256);
+  const large = await run(512);
+  assert.ok(small.protectedRangeComparisons > 0);
+  assert.ok(large.protectedRangeComparisons > small.protectedRangeComparisons);
+  assert.ok(large.protectedRangeComparisons <= small.protectedRangeComparisons * 2.05 + 8);
 });
 
 test("handles thousands of synthetic managed files with count and byte invariants", async (t) => {

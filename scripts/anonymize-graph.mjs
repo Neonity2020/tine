@@ -15,7 +15,6 @@ import { fileURLToPath } from "node:url";
 const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 const encoder = new TextEncoder();
 const MANAGED_EXTENSIONS = new Set([".md", ".markdown", ".org"]);
-const OMITTED_DIRECTORIES = new Set([".git", ".tine-sync", "assets"]);
 const STRUCTURAL_ROOT_DIRECTORIES = new Set(["pages", "journals"]);
 const REPORT_NAME = "anonymization-report.txt";
 const WORD_RE = /[\p{L}\p{M}\p{N}]+/gu;
@@ -66,6 +65,52 @@ function isManagedFile(name) {
   return MANAGED_EXTENSIONS.has(extname(name).toLowerCase());
 }
 
+function componentsStartWith(parts, prefix) {
+  return parts.length >= prefix.length && prefix.every((part, index) => parts[index].toLowerCase() === part);
+}
+
+function isFixedExcluded(parts) {
+  const lowered = parts.map((part) => part.toLowerCase());
+  return lowered.includes("node_modules")
+    || componentsStartWith(parts, ["assets"])
+    || componentsStartWith(parts, ["publish"])
+    || componentsStartWith(parts, [".tine-sync"])
+    || componentsStartWith(parts, ["logseq", ".recycle"])
+    || componentsStartWith(parts, ["logseq", "bak"])
+    || componentsStartWith(parts, ["logseq", "version-files"])
+    || componentsStartWith(parts, ["logseq", ".tine-trash"]);
+}
+
+function isProviderConflictCopy(filename) {
+  const extension = extname(filename);
+  const stem = extension ? filename.slice(0, -extension.length) : filename;
+  return stem.includes(".sync-conflict-") || (stem.includes(" (") && stem.includes("conflicted copy"));
+}
+
+function componentIsManagedPortable(component) {
+  if (!component || component === "." || component === ".." || /[<>:"\\|?*\u0000-\u001f\u007f-\u009f]/u.test(component) || /[. ]$/u.test(component)) {
+    return false;
+  }
+  const stem = component.split(".", 1)[0].toUpperCase();
+  return !/^(?:CON|PRN|AUX|NUL|COM[1-9¹²³]|LPT[1-9¹²³])$/u.test(stem);
+}
+
+function shouldDescend(parts) {
+  return parts.every(componentIsManagedPortable)
+    && !parts.some((part) => part.startsWith("."))
+    && !isFixedExcluded(parts);
+}
+
+function isGraphTextEligible(parts) {
+  const filename = parts.at(-1);
+  return shouldDescend(parts.slice(0, -1))
+    && componentIsManagedPortable(filename)
+    && !filename.startsWith(".")
+    && !isFixedExcluded(parts)
+    && !isProviderConflictCopy(filename)
+    && isManagedFile(filename);
+}
+
 function isContained(child, parent) {
   const value = relative(parent, child);
   return value === "" || (!value.startsWith("..") && !value.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`) && !value.includes("\0"));
@@ -106,11 +151,24 @@ function grammarProtectedRanges(text) {
   }
 
   ranges.sort((a, b) => a.start - b.start || a.end - b.end);
-  return ranges;
+  const merged = [];
+  for (const range of ranges) {
+    const prior = merged.at(-1);
+    if (prior && range.start <= prior.end) prior.end = Math.max(prior.end, range.end);
+    else merged.push({ ...range });
+  }
+  return merged;
 }
 
-function isProtected(start, end, ranges) {
-  return ranges.some((range) => range.start <= start && range.end >= end);
+function isProtected(start, end, ranges, cursor, work) {
+  while (cursor.index < ranges.length) {
+    work.comparisons += 1;
+    if (ranges[cursor.index].end > start) break;
+    cursor.index += 1;
+  }
+  if (cursor.index >= ranges.length) return false;
+  work.comparisons += 1;
+  return ranges[cursor.index].start <= start && ranges[cursor.index].end >= end;
 }
 
 function alphabetFor(ch) {
@@ -134,10 +192,72 @@ class PseudonymMap {
     this.tokenOwners = new Map();
     this.uuids = new Map();
     this.uuidOwners = new Map();
+    this.protectedRangeWork = { comparisons: 0 };
+    this.assignSingleCharacterTokens();
   }
 
   digest(label, input, counter) {
     return createHmac("sha256", this.salt).update(label).update("\0").update(input).update("\0").update(String(counter)).digest();
+  }
+
+  saltedOrder(label, owner, values) {
+    return [...values].sort((left, right) => {
+      const leftDigest = this.digest(label, `${owner}\0${left}`, 0);
+      const rightDigest = this.digest(label, `${owner}\0${right}`, 0);
+      return Buffer.compare(leftDigest, rightDigest) || left.localeCompare(right);
+    });
+  }
+
+  matchSingleCharacterGroup(tokens, alphabet, permitSourceGlyphs) {
+    const owners = new Map();
+    const candidatesByToken = new Map(tokens.map((token) => [token, this.saltedOrder(
+      "single-token-candidate",
+      token,
+      alphabet.filter((candidate) => candidate !== token
+        && !GENERATED_PUBLIC_WORDS.has(candidate.toLowerCase())
+        && (permitSourceGlyphs || !this.forbiddenTokens.has(candidate))),
+    )]));
+
+    const assign = (token, visited) => {
+      for (const candidate of candidatesByToken.get(token)) {
+        if (visited.has(candidate)) continue;
+        visited.add(candidate);
+        const prior = owners.get(candidate);
+        if (prior === undefined || assign(prior, visited)) {
+          owners.set(candidate, token);
+          return true;
+        }
+      }
+      return false;
+    };
+
+    for (const token of this.saltedOrder("single-token-owner", "group", tokens)) {
+      if (!assign(token, new Set())) return undefined;
+    }
+    return new Map([...owners].map(([candidate, token]) => [token, candidate]));
+  }
+
+  assignSingleCharacterTokens() {
+    const groups = new Map();
+    for (const token of this.forbiddenTokens) {
+      if ([...token].length !== 1) continue;
+      const alphabet = alphabetFor(token);
+      const group = groups.get(alphabet) ?? [];
+      group.push(token);
+      groups.set(alphabet, group);
+    }
+    for (const [alphabet, tokens] of groups) {
+      let assignments = this.matchSingleCharacterGroup(tokens, alphabet, false);
+      // A saturated one-glyph source domain has no private glyph outside its
+      // own vocabulary. In that mathematically unavoidable case, use a salted
+      // collision-free derangement. Multi-character tokens never take this path.
+      assignments ??= this.matchSingleCharacterGroup(tokens, alphabet, true);
+      if (!assignments) safeError("A same-shape pseudonym could not be represented without a collision.");
+      for (const [token, candidate] of assignments) {
+        this.tokens.set(token, candidate);
+        this.tokenOwners.set(candidate, token);
+      }
+    }
   }
 
   token(token) {
@@ -177,34 +297,47 @@ class PseudonymMap {
 
   transform(text, preserveGrammar = false) {
     const ranges = preserveGrammar ? grammarProtectedRanges(text) : [];
+    const rangeCursor = { index: 0 };
     let out = "";
     let cursor = 0;
     for (const match of text.matchAll(UUID_RE)) {
-      out += this.transformWords(text.slice(cursor, match.index), cursor, ranges);
+      out += this.transformWords(text.slice(cursor, match.index), cursor, ranges, rangeCursor);
       out += this.uuid(match[0]);
       cursor = match.index + match[0].length;
     }
-    out += this.transformWords(text.slice(cursor), cursor, ranges);
+    out += this.transformWords(text.slice(cursor), cursor, ranges, rangeCursor);
     return out;
   }
 
-  transformWords(segment, offset, ranges) {
-    return segment.replace(WORD_RE, (token, index) => isProtected(offset + index, offset + index + token.length, ranges) ? token : this.token(token));
+  transformWords(segment, offset, ranges, rangeCursor) {
+    return segment.replace(WORD_RE, (token, index) => isProtected(
+      offset + index,
+      offset + index + token.length,
+      ranges,
+      rangeCursor,
+      this.protectedRangeWork,
+    ) ? token : this.token(token));
   }
 }
 
 function portableComponent(component) {
-  if (!component || component === "." || component === ".." || /[<>:"/\\|?*\u0000-\u001f]/u.test(component) || /[. ]$/u.test(component)) {
+  if (!componentIsManagedPortable(component)) {
     safeError("An output path component is not portable.");
   }
-  const stem = component.split(".")[0].toLowerCase();
-  if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/u.test(stem) || encoder.encode(component).length > 240) {
+  if (encoder.encode(component).length > 240) {
     safeError("An output path component is not portable.");
   }
 }
 
+function conservativePortableFold(component) {
+  // Upper-then-lower expands the full-fold cases that plain lowercasing misses
+  // (ß/ss, final sigma, ligatures). It can conservatively collapse additional
+  // rare spellings, which makes this exporter refuse rather than split identity.
+  return component.normalize("NFD").toUpperCase().toLowerCase().normalize("NFC");
+}
+
 function portablePathKey(parts) {
-  return parts.map((part) => part.normalize("NFC").toLowerCase()).join("/");
+  return parts.map(conservativePortableFold).join("/");
 }
 
 function pathTokenStats(parts, text, state) {
@@ -232,6 +365,22 @@ async function readGraph(source) {
     safeError("The source directory could not be resolved safely.");
   }
 
+  const configPath = join(canonicalSource, "logseq", "config.edn");
+  try {
+    const configStat = await lstat(configPath);
+    if (configStat.isSymbolicLink() || !configStat.isFile() || configStat.nlink !== 1) {
+      safeError("The graph configuration could not be read safely.");
+    }
+    const config = decoder.decode(await readFile(configPath));
+    if (config.includes("\0")) safeError("The graph configuration could not be read safely.");
+    if (config.includes(":hidden")) {
+      safeError("Graphs with a configured or ambiguous :hidden policy cannot be exported safely.");
+    }
+  } catch (error) {
+    if (error instanceof AnonymizeError) throw error;
+    if (error?.code !== "ENOENT") safeError("The graph configuration could not be read safely.");
+  }
+
   const files = [];
   async function walk(directory, parts) {
     let children;
@@ -243,6 +392,9 @@ async function readGraph(source) {
     children.sort((a, b) => a.name.localeCompare(b.name));
     for (const child of children) {
       const childPath = join(directory, child.name);
+      const childParts = [...parts, child.name];
+      if (child.isDirectory() && !shouldDescend(childParts)) continue;
+      if (!child.isDirectory() && !isGraphTextEligible(childParts)) continue;
       let stat;
       try {
         stat = await lstat(childPath);
@@ -251,11 +403,12 @@ async function readGraph(source) {
       }
       if (stat.isSymbolicLink()) safeError("The source contains a symbolic link.");
       if (stat.isDirectory()) {
-        if (OMITTED_DIRECTORIES.has(child.name)) continue;
-        await walk(childPath, [...parts, child.name]);
+        if (!shouldDescend(childParts)) continue;
+        await walk(childPath, childParts);
         continue;
       }
-      if (!stat.isFile() || !isManagedFile(child.name)) continue;
+      if (!stat.isFile() || !isGraphTextEligible(childParts)) continue;
+      if (stat.nlink !== 1) safeError("A managed source file has multiple hard links.");
       let bytes;
       let text;
       try {
@@ -265,7 +418,7 @@ async function readGraph(source) {
         safeError("A managed file is not valid UTF-8 text.");
       }
       if (text.includes("\0")) safeError("A managed file contains unsupported text.");
-      files.push({ parts: [...parts, child.name], text, bytes: bytes.length });
+      files.push({ parts: childParts, text, bytes: bytes.length });
     }
   }
 
@@ -285,7 +438,23 @@ function collectSourceVocabulary(files) {
   return { tokens, uuids };
 }
 
+function assertNoPortableSourceCollisions(files) {
+  const seenNodes = new Map();
+  for (const file of files) {
+    for (let index = 1; index <= file.parts.length; index += 1) {
+      const key = portablePathKey(file.parts.slice(0, index));
+      const exact = file.parts.slice(0, index).join("\0");
+      const prior = seenNodes.get(key);
+      if (prior !== undefined && prior !== exact) {
+        safeError("Two source paths have the same portable identity.");
+      }
+      seenNodes.set(key, exact);
+    }
+  }
+}
+
 function planExport(files, salt) {
+  assertNoPortableSourceCollisions(files);
   const vocabulary = collectSourceVocabulary(files);
   const mapper = new PseudonymMap(salt, vocabulary.tokens, vocabulary.uuids);
   const seenNodes = new Map();
@@ -327,6 +496,7 @@ function planExport(files, salt) {
     maximumDirectoryDepth,
     uuidOccurrences: uuidStats.occurrences,
     distinctUuids: uuidStats.values.size,
+    protectedRangeComparisons: mapper.protectedRangeWork.comparisons,
   };
 }
 
