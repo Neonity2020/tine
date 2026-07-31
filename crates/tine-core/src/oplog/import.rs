@@ -159,6 +159,11 @@ const BOOTSTRAP_STREAM_MAX_MANIFEST_BYTES: usize = 768 * 1024;
 /// aggregate part descriptor below their existing byte limits. Page content is
 /// packed up to this bound; a single page exceeds it only by being one document.
 const BOOTSTRAP_STREAM_MAX_PAGE_CAPSULES_PER_PART: u32 = 64;
+/// Page declarations are small, but authoring adds payload metadata beyond the
+/// declaration operation itself. This cap leaves ample room under the separate
+/// 4,096-payload-object bound while still fitting one million empty pages into
+/// the existing 1,024-part aggregate limit.
+const BOOTSTRAP_STREAM_MAX_PAGE_DECLARATIONS_PER_PART: u32 = 2048;
 /// Fixed per-operation allowance for the before/after and membership fields
 /// added by the existing semantic-effect encoder. The operation's own
 /// canonical bytes are charged separately. Exact prepared bytes are still
@@ -2789,6 +2794,9 @@ fn partition_bootstrap_operation_spool(
             || part_semantic_bytes.saturating_add(unit.semantic_bytes)
                 > MAX_SEMANTIC_EFFECT_BYTES_PER_BOOTSTRAP_PART
             || part_spans.saturating_add(unit.spans) > MAX_SOURCE_SPANS_PER_BOOTSTRAP_PART
+            || (unit.declarations
+                && adds_document
+                && part_documents.len() as u32 == BOOTSTRAP_STREAM_MAX_PAGE_DECLARATIONS_PER_PART)
             || (!unit.declarations
                 && adds_document
                 && part_documents.len() as u32 == BOOTSTRAP_STREAM_MAX_PAGE_CAPSULES_PER_PART);
@@ -10237,11 +10245,11 @@ mod tests {
         let mut instrumentation = BootstrapStreamingImportInstrumentation::default();
         assert_eq!(
             partition_bootstrap_operation_spool(&spool, &working, &mut instrumentation).unwrap(),
-            17
+            33
         );
         assert_eq!(instrumentation.page_declarations, 65_537);
         assert_eq!(instrumentation.page_capsules, 0);
-        assert_eq!(instrumentation.max_part_documents, 4_096);
+        assert_eq!(instrumentation.max_part_documents, 2_048);
     }
 
     #[test]
@@ -10580,6 +10588,78 @@ mod tests {
         assert_eq!(
             authored.descriptors[1].evidence().predecessor(),
             Some(authored.descriptors[0].part_id())
+        );
+    }
+
+    #[test]
+    fn inactive_streaming_bootstrap_declaration_part_stays_below_payload_object_bound() {
+        let root = TestRoot::new("streaming-declaration-payload-bound");
+        let working = root.path().join("author");
+        fs::create_dir(&working).unwrap();
+        let operation_path = working.join(BOOTSTRAP_STREAM_OPERATION_SPOOL);
+        let mut writer = BufWriter::new(create_new_file(&operation_path).unwrap());
+        for index in 0..BOOTSTRAP_STREAM_MAX_PAGE_DECLARATIONS_PER_PART {
+            let path = format!("pages/declaration-{index}.md");
+            let record = BootstrapOperationRecord::new(
+                SemanticOperation::CreatePage {
+                    page_id: PageId::from_uuid(Uuid::from_u128(0x6d00_0000 + index as u128)),
+                    home_document_id: DocumentId::from_uuid(Uuid::from_u128(
+                        0x6e00_0000 + index as u128,
+                    )),
+                    name: LogicalPageName::parse(&format!("Declaration {index}")).unwrap(),
+                    path: ManagedPath::parse(&path).unwrap(),
+                    kind: ManagedTextKind::Page,
+                },
+                SourceLeafDigestV1::from_bytes(*ContentDigest::of(path.as_bytes()).as_bytes()),
+                None,
+            )
+            .unwrap();
+            write_sort_record(
+                &mut writer,
+                &SortRecord {
+                    key: index.to_be_bytes().to_vec(),
+                    value: record.encode().unwrap(),
+                },
+            )
+            .unwrap();
+        }
+        writer.flush().unwrap();
+        let boundary_path = working.join(BOOTSTRAP_STREAM_BOUNDARY_SPOOL);
+        let mut boundaries = BufWriter::new(create_new_file(&boundary_path).unwrap());
+        write_frame(
+            &mut boundaries,
+            &BOOTSTRAP_STREAM_MAX_PAGE_DECLARATIONS_PER_PART.to_be_bytes(),
+        )
+        .unwrap();
+        boundaries.flush().unwrap();
+
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(0x6f00_0001));
+        let mut instrumentation = BootstrapStreamingImportInstrumentation::default();
+        let authored = author_bootstrap_parts(
+            workspace,
+            LineageDigest::of(b"declaration-payload-bound"),
+            DocumentId::from_uuid(Uuid::from_u128(0x6f00_0002)),
+            ReferenceCatalogPolicyV1::default(),
+            &target_catalog(&root.path().join("archive"), workspace),
+            ImportId::from_digest([0x6f; 32]),
+            &BootstrapOperationSpool {
+                path: operation_path,
+                operation_count: u64::from(BOOTSTRAP_STREAM_MAX_PAGE_DECLARATIONS_PER_PART),
+                declaration_count: u64::from(BOOTSTRAP_STREAM_MAX_PAGE_DECLARATIONS_PER_PART),
+            },
+            1,
+            &working,
+            &mut instrumentation,
+        )
+        .unwrap();
+        assert_eq!(authored.descriptors.len(), 1);
+        assert_eq!(
+            instrumentation.max_part_documents,
+            u64::from(BOOTSTRAP_STREAM_MAX_PAGE_DECLARATIONS_PER_PART) + 1
+        );
+        assert!(
+            instrumentation.max_part_payload_descriptors
+                <= u64::from(MAX_OPERATIONS_PER_BOOTSTRAP_PART)
         );
     }
 
