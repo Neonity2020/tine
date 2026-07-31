@@ -5,7 +5,7 @@
 //! and publishes only below a retained device-local root that is physically
 //! and structurally disjoint from the live graph.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
@@ -24,7 +24,8 @@ use sha2::{Digest, Sha256};
 
 use super::bootstrap_import::{BOOTSTRAP_FRONTIER_SCHEMA_VERSION, BOOTSTRAP_IMPORT_SCHEMA_VERSION};
 use super::hot_engine::{
-    CurrentPathCatalogBinding, CurrentPathCatalogRow, MAX_CURRENT_PATH_CURSOR_PAGE_ROWS,
+    CurrentPathCatalogBinding, CurrentPathCatalogRow, ProjectionPageState,
+    BOOTSTRAP_MATERIALIZATION_CHUNK_PAGES, MAX_CURRENT_PATH_CURSOR_PAGE_ROWS,
 };
 use super::import::{
     bootstrap_authoritative_source_paths, InactiveBootstrapAcceptedAuthority,
@@ -347,6 +348,9 @@ pub(crate) struct ShadowProjectionInstrumentation {
     pub(crate) payload_bytes_read: u64,
     pub(crate) manifest_entries: u64,
     pub(crate) projection_plans: u64,
+    pub(crate) bulk_materialization_chunks: u64,
+    pub(crate) bulk_pages_materialized: u64,
+    pub(crate) peak_bulk_pages: u64,
     pub(crate) peak_owned_source_bytes: u64,
     pub(crate) peak_owned_catalog_rows: u64,
     pub(crate) tree_entries_visited: u64,
@@ -1430,6 +1434,12 @@ struct SourceSummary {
     max_depth: usize,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ValidatedCurrentPathCatalog {
+    binding: CurrentPathCatalogBinding,
+    rows: BTreeMap<ManagedPath, CurrentPathCatalogRow>,
+}
+
 #[derive(Clone, Copy)]
 struct StagedInventoryProof {
     digest: ContentDigest,
@@ -1480,7 +1490,8 @@ pub(crate) fn verify_inactive_bootstrap_shadow_projection(
         )
     })?;
     let summary = summarize_source(capture, &authoritative_paths)?;
-    let catalog_binding = traverse_complete_catalog(authority, &authoritative_paths)?;
+    let catalog = traverse_complete_catalog(authority, &authoritative_paths)?;
+    let catalog_binding = catalog.binding;
     let publication_id = shadow_publication_id(
         roots,
         prepared,
@@ -1530,7 +1541,7 @@ pub(crate) fn verify_inactive_bootstrap_shadow_projection(
             &header,
             prepared,
             authority,
-            catalog_binding,
+            &catalog,
             &mut instrumentation,
         )?;
         sync_tree(
@@ -1581,7 +1592,7 @@ pub(crate) fn verify_inactive_bootstrap_shadow_projection(
             &header,
             prepared,
             authority,
-            catalog_binding,
+            &catalog,
             summary,
             &mut instrumentation,
         )?
@@ -1637,7 +1648,7 @@ pub(crate) fn verify_inactive_bootstrap_shadow_projection(
         .map_err(|error| ShadowProjectionError::Projection(error.to_string()))?;
     roots.freshly_validate_retained_roots()?;
     let final_catalog = traverse_complete_catalog(authority, &authoritative_paths)?;
-    if final_catalog != catalog_binding {
+    if final_catalog != catalog {
         return Err(ShadowProjectionError::BindingMismatch(
             "accepted current-path catalog changed during shadow projection",
         ));
@@ -1857,7 +1868,7 @@ fn summarize_source(
 fn traverse_complete_catalog(
     authority: &InactiveBootstrapAcceptedAuthority,
     authoritative_paths: &HashSet<ManagedPath>,
-) -> Result<CurrentPathCatalogBinding, ShadowProjectionError> {
+) -> Result<ValidatedCurrentPathCatalog, ShadowProjectionError> {
     let engine = authority.accepted_engine();
     let binding = engine
         .current_path_catalog_binding()
@@ -1869,6 +1880,7 @@ fn traverse_complete_catalog(
     );
     let mut count = 0_u64;
     let mut seen = HashSet::new();
+    let mut by_path = BTreeMap::new();
     while let Some(token) = cursor.take() {
         let page = engine
             .current_path_cursor_page(
@@ -1876,10 +1888,13 @@ fn traverse_complete_catalog(
                 CATALOG_PAGE_ROWS.min(MAX_CURRENT_PATH_CURSOR_PAGE_ROWS),
             )
             .map_err(|error| ShadowProjectionError::Projection(error.to_string()))?;
-        let (rows, next) = page.into_parts();
-        count = checked_add(count, rows.len() as u64, "current-path catalog rows")?;
-        for row in rows {
-            if !authoritative_paths.contains(row.path()) || !seen.insert(row.path().clone()) {
+        let (page_rows, next) = page.into_parts();
+        count = checked_add(count, page_rows.len() as u64, "current-path catalog rows")?;
+        for row in page_rows {
+            if !authoritative_paths.contains(row.path())
+                || !seen.insert(row.path().clone())
+                || by_path.insert(row.path().clone(), row).is_some()
+            {
                 return Err(ShadowProjectionError::BindingMismatch(
                     "current-path catalog grants authority outside the selected source winners",
                 ));
@@ -1915,7 +1930,10 @@ fn traverse_complete_catalog(
             "current-path catalog frontier differs from bootstrap authority",
         ));
     }
-    Ok(binding)
+    Ok(ValidatedCurrentPathCatalog {
+        binding,
+        rows: by_path,
+    })
 }
 
 fn read_source_file(
@@ -1978,44 +1996,24 @@ fn read_source_file(
 }
 
 fn plan_exact_source(
-    authority: &InactiveBootstrapAcceptedAuthority,
-    catalog_binding: CurrentPathCatalogBinding,
-    authoritative_paths: &HashSet<ManagedPath>,
+    catalog: &ValidatedCurrentPathCatalog,
     entry: &BootstrapSourceEntry,
     source: &[u8],
+    state: Option<&ProjectionPageState>,
     instrumentation: &mut ShadowProjectionInstrumentation,
 ) -> Result<Option<(CurrentPathCatalogRow, ProjectionIntent)>, ShadowProjectionError> {
-    let engine = authority.accepted_engine();
-    if engine
-        .current_path_catalog_binding()
-        .map_err(|error| ShadowProjectionError::Projection(error.to_string()))?
-        != catalog_binding
-    {
-        return Err(ShadowProjectionError::BindingMismatch(
-            "accepted catalog changed during per-file projection",
-        ));
-    }
-    let selected = authoritative_paths.contains(entry.path());
-    if !selected {
+    let Some(row) = catalog.rows.get(entry.path()) else {
         // The complete catalog traversal proves no skipped path has authority.
         return Ok(None);
-    }
-    let row = engine
-        .current_path_catalog_row_at_path(entry.path())
-        .map_err(|error| ShadowProjectionError::Projection(error.to_string()))?;
-    let Some(row) = row else {
-        return Err(ShadowProjectionError::BindingMismatch(
-            "authoritative source path is missing from accepted current-path catalog",
-        ));
     };
     if row.path() != entry.path() || row.kind() != entry.kind() {
         return Err(ShadowProjectionError::BindingMismatch(
             "source path kind differs from accepted catalog",
         ));
     }
-    let state = engine
-        .materialize_page_for_projection(row.page_id())
-        .map_err(|error| ShadowProjectionError::Projection(error.to_string()))?;
+    let state = state.ok_or(ShadowProjectionError::BindingMismatch(
+        "authoritative source path is missing its bounded materialization",
+    ))?;
     if state.page.page_id != row.page_id()
         || state.page.path != *entry.path()
         || state.page.kind != entry.kind()
@@ -2025,7 +2023,7 @@ fn plan_exact_source(
             "materialized page identity, path, kind, or logical name differs from source",
         ));
     }
-    let plan = plan_projection(binding_workspace(catalog_binding), &state, Some(source))
+    let plan = plan_projection(binding_workspace(catalog.binding), state, Some(source))
         .map_err(|error| ShadowProjectionError::Projection(error.to_string()))?;
     instrumentation.projection_plans =
         checked_add(instrumentation.projection_plans, 1, "projection plans")?;
@@ -2037,7 +2035,7 @@ fn plan_exact_source(
         entry.path(),
         entry.description(),
     )?;
-    Ok(Some((row, plan.intent().clone())))
+    Ok(Some((row.clone(), plan.intent().clone())))
 }
 
 fn binding_workspace(binding: CurrentPathCatalogBinding) -> WorkspaceId {
@@ -2071,7 +2069,7 @@ fn publish_payloads_and_manifest(
     header: &[u8],
     prepared: &InactiveBootstrapPreparedPublication,
     authority: &InactiveBootstrapAcceptedAuthority,
-    catalog_binding: CurrentPathCatalogBinding,
+    catalog: &ValidatedCurrentPathCatalog,
     instrumentation: &mut ShadowProjectionInstrumentation,
 ) -> Result<(BlobDescription, StagedInventoryProof), ShadowProjectionError> {
     let mut output = ResumableExactFile::open(
@@ -2096,92 +2094,140 @@ fn publish_payloads_and_manifest(
         )
     })?;
     let capture = prepared.source_capture();
-    let authoritative_paths = bootstrap_authoritative_source_paths(capture).map_err(|_| {
-        ShadowProjectionError::CorruptOrConflicting(
-            "source collision-authority selection is invalid",
-        )
-    })?;
     let mut entries = capture.entries_cursor()?;
     let mut chunks = capture.chunks_cursor()?;
+    let materializer = (!catalog.rows.is_empty())
+        .then(|| {
+            authority
+                .accepted_engine()
+                .bootstrap_bulk_materializer(authority.binding().accepted_frontier())
+                .map_err(|error| ShadowProjectionError::Projection(error.to_string()))
+        })
+        .transpose()?;
     let mut first_write = true;
     let mut inventory = Sha256::new();
     inventory.update(b"tine/inactive-shadow-projection-inventory/v1\0");
     let mut file_count = 0_u64;
     let mut total_bytes = 0_u64;
-    while let Some(entry) = entries.next()? {
-        let source = read_source_file(capture, &entry, &mut chunks, instrumentation)?;
-        let Some((row, intent)) = plan_exact_source(
-            authority,
-            catalog_binding,
-            &authoritative_paths,
-            &entry,
-            &source,
-            instrumentation,
-        )?
-        else {
-            continue;
-        };
-        let destination = payload_path(payload, entry.path())?;
-        ensure_managed_parent_directories(payload, entry.path())?;
-        if first_write
-            && source.len() > 1
-            && take_crash_cut(ShadowProjectionCrashCut::PartialPayloadWrite)
-        {
-            let mut output = ResumableExactFile::open(
+    loop {
+        let mut entry_chunk = Vec::with_capacity(BOOTSTRAP_MATERIALIZATION_CHUNK_PAGES);
+        while entry_chunk.len() < BOOTSTRAP_MATERIALIZATION_CHUNK_PAGES {
+            let Some(entry) = entries.next()? else {
+                break;
+            };
+            entry_chunk.push(entry);
+        }
+        if entry_chunk.is_empty() {
+            break;
+        }
+        let page_ids = entry_chunk
+            .iter()
+            .filter_map(|entry| {
+                catalog
+                    .rows
+                    .get(entry.path())
+                    .map(CurrentPathCatalogRow::page_id)
+            })
+            .collect::<Vec<_>>();
+        if !page_ids.is_empty() {
+            instrumentation.bulk_materialization_chunks = checked_add(
+                instrumentation.bulk_materialization_chunks,
+                1,
+                "shadow bulk materialization chunks",
+            )?;
+            instrumentation.bulk_pages_materialized = checked_add(
+                instrumentation.bulk_pages_materialized,
+                page_ids.len() as u64,
+                "shadow bulk materialized pages",
+            )?;
+            instrumentation.peak_bulk_pages =
+                instrumentation.peak_bulk_pages.max(page_ids.len() as u64);
+        }
+        let states = materializer
+            .as_ref()
+            .expect("a nonempty catalog constructed a bulk materializer")
+            .materialize_pages_for_projection(&page_ids)
+            .map_err(|error| ShadowProjectionError::Projection(error.to_string()))?;
+        let states = page_ids
+            .into_iter()
+            .zip(states)
+            .filter_map(|(page_id, state)| state.map(|state| (page_id, state)))
+            .collect::<BTreeMap<_, _>>();
+        for entry in entry_chunk {
+            let source = read_source_file(capture, &entry, &mut chunks, instrumentation)?;
+            let state = catalog
+                .rows
+                .get(entry.path())
+                .and_then(|row| states.get(&row.page_id()));
+            let Some((row, intent)) =
+                plan_exact_source(catalog, &entry, &source, state, instrumentation)?
+            else {
+                continue;
+            };
+            let destination = payload_path(payload, entry.path())?;
+            ensure_managed_parent_directories(payload, entry.path())?;
+            if first_write
+                && source.len() > 1
+                && take_crash_cut(ShadowProjectionCrashCut::PartialPayloadWrite)
+            {
+                let mut output = ResumableExactFile::open(
+                    &destination,
+                    "shadow payload conflicts with staged exact bytes",
+                )?;
+                let prefix = (source.len() / 2).clamp(1, source.len() - 1);
+                output.write_all(&source[..prefix]).map_err(|_| {
+                    ShadowProjectionError::CorruptOrConflicting(
+                        "shadow payload partial write failed",
+                    )
+                })?;
+                output.flush()?;
+                return Err(ShadowProjectionError::InjectedCrashCut(
+                    ShadowProjectionCrashCut::PartialPayloadWrite.label(),
+                ));
+            }
+            let mut payload_output = ResumableExactFile::open(
                 &destination,
                 "shadow payload conflicts with staged exact bytes",
             )?;
-            let prefix = (source.len() / 2).clamp(1, source.len() - 1);
-            output.write_all(&source[..prefix]).map_err(|_| {
-                ShadowProjectionError::CorruptOrConflicting("shadow payload partial write failed")
+            payload_output.write_all(&source).map_err(|_| {
+                ShadowProjectionError::CorruptOrConflicting(
+                    "shadow payload conflicts with staged exact bytes",
+                )
             })?;
-            output.flush()?;
-            return Err(ShadowProjectionError::InjectedCrashCut(
-                ShadowProjectionCrashCut::PartialPayloadWrite.label(),
-            ));
+            let description = payload_output.finish_payload()?;
+            if description != entry.description() {
+                return Err(ShadowProjectionError::CorruptOrConflicting(
+                    "staged payload description differs from captured source",
+                ));
+            }
+            emit_manifest_entry(&mut output, &entry, row.page_id(), &intent)?;
+            instrumentation.manifest_entries =
+                checked_add(instrumentation.manifest_entries, 1, "manifest entries")?;
+            let evidence = ShadowProjectionFileEvidence {
+                path: entry.path().clone(),
+                kind: entry.kind(),
+                logical_name: entry.logical_name().to_owned(),
+                page_id: row.page_id(),
+                source: entry.description(),
+                source_file_resource: entry.file_resource(),
+                source_link_count: entry.link_count(),
+                source_chunk_count: entry.chunk_count(),
+                intent,
+            };
+            hash_file_evidence(&mut inventory, &evidence)?;
+            file_count = checked_add(file_count, 1, "published shadow files")?;
+            total_bytes = checked_add(
+                total_bytes,
+                description.byte_length(),
+                "published shadow bytes",
+            )?;
+            instrumentation.payload_bytes_written = checked_add(
+                instrumentation.payload_bytes_written,
+                source.len() as u64,
+                "payload bytes written",
+            )?;
+            first_write = false;
         }
-        let mut payload_output = ResumableExactFile::open(
-            &destination,
-            "shadow payload conflicts with staged exact bytes",
-        )?;
-        payload_output.write_all(&source).map_err(|_| {
-            ShadowProjectionError::CorruptOrConflicting(
-                "shadow payload conflicts with staged exact bytes",
-            )
-        })?;
-        let description = payload_output.finish_payload()?;
-        if description != entry.description() {
-            return Err(ShadowProjectionError::CorruptOrConflicting(
-                "staged payload description differs from captured source",
-            ));
-        }
-        emit_manifest_entry(&mut output, &entry, row.page_id(), &intent)?;
-        instrumentation.manifest_entries =
-            checked_add(instrumentation.manifest_entries, 1, "manifest entries")?;
-        let evidence = ShadowProjectionFileEvidence {
-            path: entry.path().clone(),
-            kind: entry.kind(),
-            logical_name: entry.logical_name().to_owned(),
-            page_id: row.page_id(),
-            source: entry.description(),
-            source_file_resource: entry.file_resource(),
-            source_link_count: entry.link_count(),
-            source_chunk_count: entry.chunk_count(),
-            intent,
-        };
-        hash_file_evidence(&mut inventory, &evidence)?;
-        file_count = checked_add(file_count, 1, "published shadow files")?;
-        total_bytes = checked_add(
-            total_bytes,
-            description.byte_length(),
-            "published shadow bytes",
-        )?;
-        instrumentation.payload_bytes_written = checked_add(
-            instrumentation.payload_bytes_written,
-            source.len() as u64,
-            "payload bytes written",
-        )?;
-        first_write = false;
     }
     if chunks.next()?.is_some() {
         return Err(ShadowProjectionError::CorruptOrConflicting(
@@ -2192,7 +2238,7 @@ fn publish_payloads_and_manifest(
         .accepted_engine()
         .current_path_catalog_binding()
         .map_err(|error| ShadowProjectionError::Projection(error.to_string()))?
-        != catalog_binding
+        != catalog.binding
     {
         return Err(ShadowProjectionError::BindingMismatch(
             "accepted catalog changed during payload publication",
@@ -2313,7 +2359,7 @@ fn verify_projection_directory(
     header: &[u8],
     prepared: &InactiveBootstrapPreparedPublication,
     authority: &InactiveBootstrapAcceptedAuthority,
-    catalog_binding: CurrentPathCatalogBinding,
+    catalog: &ValidatedCurrentPathCatalog,
     summary: SourceSummary,
     instrumentation: &mut ShadowProjectionInstrumentation,
 ) -> Result<(BlobDescription, StagedInventoryProof), ShadowProjectionError> {
@@ -2333,59 +2379,105 @@ fn verify_projection_directory(
     let manifest = describe_regular_file(&manifest_path, MAX_MANIFEST_BYTES)?;
     let mut reader = ManifestReader::open(&manifest_path, summary.file_count, header.to_vec())?;
     let capture = prepared.source_capture();
-    let authoritative_paths = bootstrap_authoritative_source_paths(capture).map_err(|_| {
-        ShadowProjectionError::CorruptOrConflicting(
-            "source collision-authority selection is invalid",
-        )
-    })?;
     let mut entries = capture.entries_cursor()?;
     let mut chunks = capture.chunks_cursor()?;
+    let materializer = (!catalog.rows.is_empty())
+        .then(|| {
+            authority
+                .accepted_engine()
+                .bootstrap_bulk_materializer(authority.binding().accepted_frontier())
+                .map_err(|error| ShadowProjectionError::Projection(error.to_string()))
+        })
+        .transpose()?;
     let mut inventory = Sha256::new();
     inventory.update(b"tine/inactive-shadow-projection-inventory/v1\0");
     let mut file_count = 0_u64;
     let mut total_bytes = 0_u64;
-    while let Some(entry) = entries.next()? {
-        let source = read_source_file(capture, &entry, &mut chunks, instrumentation)?;
-        let Some((row, expected_intent)) = plan_exact_source(
-            authority,
-            catalog_binding,
-            &authoritative_paths,
-            &entry,
-            &source,
-            instrumentation,
-        )?
-        else {
-            continue;
-        };
-        let actual = reader
-            .next()?
-            .ok_or(ShadowProjectionError::CorruptOrConflicting(
-                "shadow manifest ended before source entries",
-            ))?;
-        if actual.path != *entry.path()
-            || actual.kind != entry.kind()
-            || actual.logical_name != entry.logical_name()
-            || actual.page_id != row.page_id()
-            || actual.source != entry.description()
-            || actual.source_file_resource != entry.file_resource()
-            || actual.source_link_count != entry.link_count()
-            || actual.source_chunk_count != entry.chunk_count()
-            || actual.intent != expected_intent
-        {
-            return Err(ShadowProjectionError::BindingMismatch(
-                "shadow manifest per-file evidence differs from source and accepted authority",
-            ));
+    loop {
+        let mut entry_chunk = Vec::with_capacity(BOOTSTRAP_MATERIALIZATION_CHUNK_PAGES);
+        while entry_chunk.len() < BOOTSTRAP_MATERIALIZATION_CHUNK_PAGES {
+            let Some(entry) = entries.next()? else {
+                break;
+            };
+            entry_chunk.push(entry);
         }
-        let staged_path = payload_path(&payload, entry.path())?;
-        let staged = compare_regular_file_bytes(&staged_path, &source, instrumentation)?;
-        if staged != entry.description() {
-            return Err(ShadowProjectionError::CorruptOrConflicting(
-                "shadow payload differs from source bytes",
-            ));
+        if entry_chunk.is_empty() {
+            break;
         }
-        hash_file_evidence(&mut inventory, &actual)?;
-        file_count = checked_add(file_count, 1, "verified shadow files")?;
-        total_bytes = checked_add(total_bytes, staged.byte_length(), "verified shadow bytes")?;
+        let page_ids = entry_chunk
+            .iter()
+            .filter_map(|entry| {
+                catalog
+                    .rows
+                    .get(entry.path())
+                    .map(CurrentPathCatalogRow::page_id)
+            })
+            .collect::<Vec<_>>();
+        if !page_ids.is_empty() {
+            instrumentation.bulk_materialization_chunks = checked_add(
+                instrumentation.bulk_materialization_chunks,
+                1,
+                "shadow bulk verification chunks",
+            )?;
+            instrumentation.bulk_pages_materialized = checked_add(
+                instrumentation.bulk_pages_materialized,
+                page_ids.len() as u64,
+                "shadow bulk verified pages",
+            )?;
+            instrumentation.peak_bulk_pages =
+                instrumentation.peak_bulk_pages.max(page_ids.len() as u64);
+        }
+        let states = materializer
+            .as_ref()
+            .expect("a nonempty catalog constructed a bulk materializer")
+            .materialize_pages_for_projection(&page_ids)
+            .map_err(|error| ShadowProjectionError::Projection(error.to_string()))?;
+        let states = page_ids
+            .into_iter()
+            .zip(states)
+            .filter_map(|(page_id, state)| state.map(|state| (page_id, state)))
+            .collect::<BTreeMap<_, _>>();
+        for entry in entry_chunk {
+            let source = read_source_file(capture, &entry, &mut chunks, instrumentation)?;
+            let state = catalog
+                .rows
+                .get(entry.path())
+                .and_then(|row| states.get(&row.page_id()));
+            let Some((row, expected_intent)) =
+                plan_exact_source(catalog, &entry, &source, state, instrumentation)?
+            else {
+                continue;
+            };
+            let actual = reader
+                .next()?
+                .ok_or(ShadowProjectionError::CorruptOrConflicting(
+                    "shadow manifest ended before source entries",
+                ))?;
+            if actual.path != *entry.path()
+                || actual.kind != entry.kind()
+                || actual.logical_name != entry.logical_name()
+                || actual.page_id != row.page_id()
+                || actual.source != entry.description()
+                || actual.source_file_resource != entry.file_resource()
+                || actual.source_link_count != entry.link_count()
+                || actual.source_chunk_count != entry.chunk_count()
+                || actual.intent != expected_intent
+            {
+                return Err(ShadowProjectionError::BindingMismatch(
+                    "shadow manifest per-file evidence differs from source and accepted authority",
+                ));
+            }
+            let staged_path = payload_path(&payload, entry.path())?;
+            let staged = compare_regular_file_bytes(&staged_path, &source, instrumentation)?;
+            if staged != entry.description() {
+                return Err(ShadowProjectionError::CorruptOrConflicting(
+                    "shadow payload differs from source bytes",
+                ));
+            }
+            hash_file_evidence(&mut inventory, &actual)?;
+            file_count = checked_add(file_count, 1, "verified shadow files")?;
+            total_bytes = checked_add(total_bytes, staged.byte_length(), "verified shadow bytes")?;
+        }
     }
     if chunks.next()?.is_some() || reader.next()?.is_some() {
         return Err(ShadowProjectionError::CorruptOrConflicting(
@@ -4044,6 +4136,19 @@ mod tests {
         assert_eq!(proof.authority_binding(), rich.authority.binding());
         assert_eq!(proof.catalog_binding().catalog_rows(), proof.file_count());
         assert!(proof.instrumentation().peak_owned_source_bytes <= BOOTSTRAP_SOURCE_MAX_FILE_BYTES);
+        assert_eq!(
+            proof.instrumentation().bulk_pages_materialized,
+            proof.file_count()
+        );
+        assert!(proof.instrumentation().bulk_materialization_chunks > 0);
+        assert!(
+            proof.instrumentation().peak_bulk_pages <= BOOTSTRAP_MATERIALIZATION_CHUNK_PAGES as u64
+        );
+        assert!(rich.sqlite.rebuild.bulk_materialization_chunks > 0);
+        assert!(
+            rich.sqlite.rebuild.peak_bulk_pages
+                <= crate::oplog::hot_engine::BOOTSTRAP_MATERIALIZATION_CHUNK_PAGES
+        );
         let mut cursor = proof.file_evidence_cursor().unwrap();
         let mut seen = 0;
         let mut page_ids = BTreeMap::new();

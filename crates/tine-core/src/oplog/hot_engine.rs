@@ -3582,6 +3582,311 @@ pub(crate) struct AcceptedRootMaterializer<'engine> {
     exact_catalog_loads: usize,
 }
 
+/// Maximum page residency of one private bootstrap materialization step.
+///
+/// The catalog checkpoint is retained for the attempt, while membership and
+/// home checkpoints live only for one chunk and are dropped before the next.
+pub(crate) const BOOTSTRAP_MATERIALIZATION_CHUNK_PAGES: usize = 64;
+
+#[derive(Debug)]
+struct BootstrapBulkPage {
+    page: MaterializedPage,
+    dependencies: Vec<DocumentDependencies>,
+}
+
+/// Process-local materializer for one already-authenticated accepted root.
+///
+/// This capability is deliberately private to bootstrap construction. It
+/// authenticates the root and catalog once, then uses the authenticated LSM
+/// multi-point primitives for each bounded page chunk. No decoded membership
+/// or home document survives a call.
+pub(crate) struct BootstrapBulkMaterializer<'engine> {
+    engine: &'engine ShardedHotEngine,
+    root: AcceptedFrontierRoot,
+    catalog: LoroDoc,
+    catalog_dependencies: DocumentDependencies,
+    exact_document_loads: Cell<usize>,
+}
+
+impl BootstrapBulkMaterializer<'_> {
+    pub(crate) fn exact_document_loads(&self) -> usize {
+        self.exact_document_loads.get()
+    }
+
+    fn materialize_chunk(
+        &self,
+        page_ids: &[PageId],
+    ) -> Result<Vec<Option<BootstrapBulkPage>>, EngineError> {
+        if page_ids.len() > BOOTSTRAP_MATERIALIZATION_CHUNK_PAGES {
+            return Err(EngineError::Archive(format!(
+                "bootstrap materialization chunk has {} pages, bound {}",
+                page_ids.len(),
+                BOOTSTRAP_MATERIALIZATION_CHUNK_PAGES
+            )));
+        }
+        let requested = page_ids.iter().copied().collect::<BTreeSet<_>>();
+        if requested.len() != page_ids.len() {
+            return Err(EngineError::Archive(
+                "bootstrap materialization chunk repeats a page identity".into(),
+            ));
+        }
+
+        let mut page_documents = BTreeMap::<PageId, DocumentId>::new();
+        let mut results = page_ids
+            .iter()
+            .map(|page_id| {
+                let state = validate_catalog_page(
+                    self.engine.catalog_document_id,
+                    &self.catalog,
+                    *page_id,
+                )?;
+                if let Some(PageState::Live {
+                    home_document_id, ..
+                }) = state
+                {
+                    page_documents.insert(*page_id, home_document_id);
+                }
+                Ok(None)
+            })
+            .collect::<Result<Vec<Option<BootstrapBulkPage>>, EngineError>>()?;
+        if page_documents.is_empty() {
+            return Ok(results);
+        }
+
+        let membership_ids = page_documents
+            .values()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let mut documents = self
+            .engine
+            .load_documents_at_authenticated_root_many(&self.root, &membership_ids)?;
+        self.exact_document_loads.set(
+            self.exact_document_loads
+                .get()
+                .saturating_add(membership_ids.len()),
+        );
+        let mut page_homes = BTreeMap::<PageId, BTreeSet<DocumentId>>::new();
+        for (page_id, document_id) in &page_documents {
+            let (_, membership) = documents
+                .get(document_id)
+                .ok_or(EngineError::MissingDocument(*document_id))?;
+            validate_shard(self.engine.catalog_document_id, *document_id, membership)?;
+            if shard_page_id(membership)? != Some(*page_id) {
+                return Err(EngineError::MalformedDocument {
+                    document_id: *document_id,
+                    reason: "membership shard page identity mismatch".into(),
+                });
+            }
+            page_homes.insert(
+                *page_id,
+                read_memberships(*document_id, membership)?
+                    .values()
+                    .map(|claim| claim.home_document_id)
+                    .collect(),
+            );
+        }
+        let missing_homes = page_homes
+            .values()
+            .flatten()
+            .copied()
+            .filter(|document_id| !documents.contains_key(document_id))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        documents.extend(
+            self.engine
+                .load_documents_at_authenticated_root_many(&self.root, &missing_homes)?,
+        );
+        self.exact_document_loads.set(
+            self.exact_document_loads
+                .get()
+                .saturating_add(missing_homes.len()),
+        );
+
+        for (index, page_id) in page_ids.iter().copied().enumerate() {
+            let Some(page_document_id) = page_documents.get(&page_id).copied() else {
+                continue;
+            };
+            let homes = page_homes
+                .get(&page_id)
+                .expect("every live page has derived home documents");
+            let mut dependencies = Vec::with_capacity(homes.len().saturating_add(2));
+            dependencies.push(self.catalog_dependencies.clone());
+            dependencies.push(
+                documents
+                    .get(&page_document_id)
+                    .ok_or(EngineError::MissingDocument(page_document_id))?
+                    .0
+                    .clone(),
+            );
+            for home_document_id in homes {
+                if *home_document_id == page_document_id {
+                    continue;
+                }
+                dependencies.push(
+                    documents
+                        .get(home_document_id)
+                        .ok_or(EngineError::MissingDocument(*home_document_id))?
+                        .0
+                        .clone(),
+                );
+            }
+            dependencies.sort_unstable_by_key(DocumentDependencies::document_id);
+            dependencies.dedup_by_key(|dependency| dependency.document_id());
+            let page =
+                self.engine
+                    .materialize_page_from_document_lookup(page_id, |document_id| {
+                        if document_id == self.engine.catalog_document_id {
+                            Some(&self.catalog)
+                        } else {
+                            documents.get(&document_id).map(|(_, document)| document)
+                        }
+                    })?;
+            results[index] = Some(BootstrapBulkPage { page, dependencies });
+        }
+        Ok(results)
+    }
+
+    pub(crate) fn materialize_pages(
+        &self,
+        page_ids: &[PageId],
+    ) -> Result<Vec<Option<MaterializedPage>>, EngineError> {
+        self.materialize_chunk(page_ids).map(|pages| {
+            pages
+                .into_iter()
+                .map(|page| page.map(|page| page.page))
+                .collect()
+        })
+    }
+
+    pub(crate) fn materialize_pages_for_projection(
+        &self,
+        page_ids: &[PageId],
+    ) -> Result<Vec<Option<ProjectionPageState>>, EngineError> {
+        self.materialize_chunk(page_ids)?
+            .into_iter()
+            .map(|page| {
+                page.map(|page| self.finish_projection_page(page))
+                    .transpose()
+            })
+            .collect()
+    }
+
+    fn finish_projection_page(
+        &self,
+        mut bulk: BootstrapBulkPage,
+    ) -> Result<ProjectionPageState, EngineError> {
+        let mut frontier_documents = bulk
+            .dependencies
+            .into_iter()
+            .map(|dependency| (dependency.document_id(), dependency))
+            .collect::<BTreeMap<_, _>>();
+        let block_claims: BTreeMap<_, _> = bulk
+            .page
+            .blocks
+            .iter()
+            .filter_map(|block| {
+                block.logseq_uuid.map(|uuid| {
+                    (
+                        uuid,
+                        (
+                            block.block_id,
+                            block.home_document_id,
+                            block.logseq_identity_origin,
+                        ),
+                    )
+                })
+            })
+            .collect();
+        let mut referenced = page_logseq_references(
+            &bulk.page.path,
+            bulk.page.preamble.as_deref(),
+            &bulk.page.blocks,
+        );
+        referenced.extend(block_claims.keys().copied());
+        let mut claim_evidence = Vec::new();
+        for logseq_uuid in referenced {
+            let (resolution, evidence, homes) =
+                self.engine.resolve_logseq_uuid_current(logseq_uuid)?;
+            if let Some((block_id, home_document_id, origin)) =
+                block_claims.get(&logseq_uuid).copied()
+            {
+                match resolution {
+                    LogseqUuidResolution::Unique(claim)
+                        if claim.block_id == block_id
+                            && claim.home_document_id == home_document_id
+                            && claim.page_id == bulk.page.page_id
+                            && Some(claim.origin) == origin => {}
+                    LogseqUuidResolution::Ambiguous { claim_count } => {
+                        return Err(EngineError::AmbiguousLogseqUuid {
+                            logseq_uuid,
+                            claim_count,
+                        });
+                    }
+                    LogseqUuidResolution::Unclaimed | LogseqUuidResolution::Unique(_) => {
+                        return Err(EngineError::ProjectionIdentityAuthorityUnavailable {
+                            logseq_uuid,
+                            block_id,
+                        });
+                    }
+                }
+            } else if let LogseqUuidResolution::Ambiguous { claim_count } = resolution {
+                return Err(EngineError::AmbiguousLogseqUuid {
+                    logseq_uuid,
+                    claim_count,
+                });
+            }
+            for (home_document_id, home) in homes {
+                frontier_documents.entry(home_document_id).or_insert(
+                    self.engine
+                        .current_document_dependencies(home_document_id, &home)?,
+                );
+            }
+            if let Some(evidence) = evidence {
+                claim_evidence.push(evidence);
+            }
+        }
+
+        let effective_selection = self.engine.title_selection_at_page_name_root(
+            &self.engine.page_name_root,
+            bulk.page.page_id,
+            &bulk.page.name,
+        )?;
+        let effective_transition = effective_selection
+            .as_ref()
+            .filter(|selection| selection.exact_name() != &bulk.page.name)
+            .map(|selection| {
+                self.engine
+                    .authenticate_selected_title_transition(selection, None)
+            })
+            .transpose()?;
+        if let Some(transition) = &effective_transition {
+            transition.apply_to_materialized(&mut bulk.page)?;
+        }
+        let frontier = FrontierV2::new(frontier_documents.into_values().collect())?;
+        let (frontier, effective_closure) = match self.engine.page_stable_projection_frontier(
+            &bulk.page,
+            &frontier,
+            &claim_evidence,
+            effective_selection.as_ref(),
+            effective_transition.as_ref(),
+        )? {
+            Some((stable, closure)) => (stable, closure),
+            None => (frontier, None),
+        };
+        if effective_closure.is_some() {
+            return Err(EngineError::ProjectionAuthorizationUnavailable);
+        }
+        Ok(ProjectionPageState {
+            page: bulk.page,
+            frontier,
+            claim_evidence,
+        })
+    }
+}
+
 impl AcceptedRootMaterializer<'_> {
     pub(crate) const fn exact_document_loads(&self) -> usize {
         self.exact_document_loads
@@ -4580,6 +4885,10 @@ pub struct ShardedHotEngine {
     // after validation. Prior object envelopes live in neither this map nor
     // `archive`; sharded candidate documents are carried by run-local scratch.
     detached_accepted_manifests: BTreeMap<BatchId, OperationBatch>,
+    // Immutable, constant-size manifest bindings retained beside the detached
+    // manifests so checkpoint authentication does not rehash a whole part for
+    // each document materialized from it.
+    detached_accepted_manifest_fingerprints: BTreeMap<BatchId, ContentDigest>,
     // A promoted lineage's oldest accepted batches were published in the
     // archive's immutable bootstrap namespace, not the ordinary object
     // namespace. This retains only the validated publication handle and the
@@ -4757,6 +5066,7 @@ impl ShardedHotEngine {
             catalog_document_id,
             archive: BTreeMap::new(),
             detached_accepted_manifests: BTreeMap::new(),
+            detached_accepted_manifest_fingerprints: BTreeMap::new(),
             bootstrap_parts: None,
             bootstrap_residency: Arc::new(BootstrapResidencyLedger::default()),
             bounded_staging_cache: BTreeMap::new(),
@@ -7587,6 +7897,119 @@ impl ShardedHotEngine {
             .transpose()
     }
 
+    fn accepted_frontier_documents_many_authenticated(
+        &self,
+        root: &AcceptedFrontierRoot,
+        document_ids: &[DocumentId],
+    ) -> Result<Vec<Option<DocumentDependencies>>, EngineError> {
+        validate_accepted_frontier_root(root)?;
+        if document_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let Some(scratch_root) = &root.scratch_root else {
+            if root != &self.accepted_frontier_root {
+                return Err(EngineError::Archive(
+                    "historical frontier multi-point queries require store-backed accepted history"
+                        .into(),
+                ));
+            }
+            return Ok(document_ids
+                .iter()
+                .map(|document_id| self.accepted_frontier.get(document_id).cloned())
+                .collect());
+        };
+        let store = self.scratch.as_ref().ok_or_else(|| {
+            EngineError::Archive(
+                "store-backed accepted frontier root has no authenticated scratch store".into(),
+            )
+        })?;
+        let keys = document_ids
+            .iter()
+            .map(|document_id| document_id.as_uuid().as_bytes().to_vec())
+            .collect::<Vec<_>>();
+        store
+            .lookup_many(
+                scratch_root,
+                super::scratch_store::ScratchPageKind::AcceptedFrontier,
+                &keys,
+            )
+            .map_err(|error| EngineError::Archive(error.to_string()))?
+            .into_iter()
+            .zip(document_ids)
+            .map(|(bytes, document_id)| {
+                bytes
+                    .map(|bytes| decode_accepted_document(*document_id, &bytes))
+                    .transpose()
+            })
+            .collect()
+    }
+
+    fn load_documents_at_authenticated_root_many(
+        &self,
+        root: &AcceptedFrontierRoot,
+        document_ids: &[DocumentId],
+    ) -> Result<BTreeMap<DocumentId, (DocumentDependencies, LoroDoc)>, EngineError> {
+        if document_ids.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let dependencies =
+            self.accepted_frontier_documents_many_authenticated(root, document_ids)?;
+        let requested = dependencies
+            .iter()
+            .flatten()
+            .map(|dependency| (dependency.document_id(), dependency.causal_state_digest()))
+            .collect::<Vec<_>>();
+        if requested.len() != document_ids.len() {
+            let missing = document_ids
+                .iter()
+                .zip(&dependencies)
+                .find_map(|(document_id, dependency)| dependency.is_none().then_some(*document_id))
+                .expect("different dependency count identifies one missing document");
+            return Err(EngineError::MissingDocument(missing));
+        }
+        let Some(store) = &self.scratch else {
+            let frontier = FrontierV2::new(dependencies.into_iter().flatten().collect())?;
+            let documents = self.reconstruct_frontier(&frontier)?;
+            return frontier
+                .documents()
+                .iter()
+                .cloned()
+                .map(|dependency| {
+                    let document = documents
+                        .get(&dependency.document_id())
+                        .cloned()
+                        .ok_or(EngineError::MissingDocument(dependency.document_id()))?;
+                    Ok((dependency.document_id(), (dependency, document)))
+                })
+                .collect();
+        };
+        let loaded = super::document_state::load_external_exact_many(
+            store,
+            &self.scratch_roots,
+            super::document_state::DocumentLane::Visible,
+            &requested,
+        )
+        .map_err(|error| EngineError::Archive(error.to_string()))?;
+        dependencies
+            .into_iter()
+            .flatten()
+            .zip(loaded)
+            .map(|(dependency, loaded)| {
+                let document_id = dependency.document_id();
+                let (record, document, state_work) =
+                    loaded.ok_or(EngineError::FrontierVectorMismatch(document_id))?;
+                self.record_document_state_work(state_work);
+                self.validate_external_record_anchor(document_id, &record)?;
+                if record.peer_counters() != dependency.peer_counters()
+                    || record.exact_direct_heads() != dependency.direct_dependency_heads()
+                {
+                    return Err(EngineError::FrontierVectorMismatch(document_id));
+                }
+                Ok((document_id, (dependency, document.into_document())))
+            })
+            .collect()
+    }
+
     fn authenticate_accepted_frontier_root(
         &self,
         root: &AcceptedFrontierRoot,
@@ -7650,6 +8073,27 @@ impl ShardedHotEngine {
             document_keys: BTreeMap::new(),
             exact_document_loads: 0,
             exact_catalog_loads: 0,
+        })
+    }
+
+    pub(crate) fn bootstrap_bulk_materializer(
+        &self,
+        root: &AcceptedFrontierRoot,
+    ) -> Result<BootstrapBulkMaterializer<'_>, EngineError> {
+        self.begin_point_operation();
+        self.authenticate_accepted_frontier_root(root)?;
+        let mut catalog =
+            self.load_documents_at_authenticated_root_many(root, &[self.catalog_document_id])?;
+        let (catalog_dependencies, catalog) = catalog
+            .remove(&self.catalog_document_id)
+            .ok_or(EngineError::MissingDocument(self.catalog_document_id))?;
+        validate_catalog(self.catalog_document_id, &catalog)?;
+        Ok(BootstrapBulkMaterializer {
+            engine: self,
+            root: root.clone(),
+            catalog,
+            catalog_dependencies,
+            exact_document_loads: Cell::new(1),
         })
     }
 
@@ -9866,6 +10310,7 @@ impl ShardedHotEngine {
         debug_assert!(self.projection_work_index.is_none());
         let batch_id = prepared.manifest().batch_id();
         let manifest = prepared.manifest().clone();
+        let manifest_fingerprint = batch_fingerprint_from_manifest(&manifest);
         // The scratch-backed path registers the causal record and prepares
         // exact/current sharded checkpoints before committing the in-memory
         // candidate. `persisted` here means resumable scratch work only: this
@@ -9901,6 +10346,8 @@ impl ShardedHotEngine {
         };
         self.archive.remove(&batch_id);
         self.detached_accepted_manifests.insert(batch_id, manifest);
+        self.detached_accepted_manifest_fingerprints
+            .insert(batch_id, manifest_fingerprint);
         Ok((no_op, evidence))
     }
 
@@ -18550,19 +18997,15 @@ impl ShardedHotEngine {
         let Some(manifest) = self.detached_accepted_manifests.get(&batch_id) else {
             return Ok(false);
         };
-        if batch_fingerprint_from_manifest(manifest) != manifest_fingerprint {
+        if self.detached_accepted_manifest_fingerprints.get(&batch_id)
+            != Some(&manifest_fingerprint)
+        {
             return Err(EngineError::Archive(
                 "detached document checkpoint manifest anchor mismatch".into(),
             ));
         }
-        let descriptors = manifest
-            .required_objects()
-            .iter()
-            .filter(|descriptor| {
-                descriptor.kind() == ObjectKind::CrdtUpdate
-                    && descriptor.document_id() == document_id
-            })
-            .collect::<Vec<_>>();
+        let descriptors =
+            manifest.required_objects_for_document_kind(document_id, ObjectKind::CrdtUpdate);
         if descriptors.len() != 1 || descriptors[0].content_digest() != update_digest {
             return Err(EngineError::Archive(
                 "detached document checkpoint update anchor mismatch".into(),

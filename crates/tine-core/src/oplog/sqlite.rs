@@ -1281,6 +1281,9 @@ struct EventMaterializationInstrumentation {
     accepted_root_authentications: usize,
     exact_document_loads: usize,
     exact_catalog_loads: usize,
+    bulk_materialization_chunks: usize,
+    bulk_pages_materialized: usize,
+    peak_bulk_pages: usize,
 }
 
 pub(crate) fn materialize_accepted_event(
@@ -1351,6 +1354,88 @@ fn materialize_accepted_event_with_stats(
     }
     let change = super::MaterializationChange::new(event.batch_id(), replacements, deletions)?;
     Ok((change, instrumentation))
+}
+
+/// Materialize one inactive-bootstrap event at its authenticated accepted root.
+/// The private capability retains the event's validated catalog while batching
+/// every membership and home checkpoint needed by the affected page chunk.
+fn materialize_inactive_bootstrap_event_bulk(
+    engine: &ShardedHotEngine,
+    event: &AcceptedBatchEvent,
+) -> Result<
+    (
+        super::MaterializationChange,
+        EventMaterializationInstrumentation,
+    ),
+    ProjectionError,
+> {
+    authenticate_event_for_engine(engine, event)?;
+    let effect = SemanticEffect::decode(event.semantic_effect())
+        .map_err(|error| ProjectionError::Materialization(error.to_string()))?;
+    let canonical_effect = effect
+        .encode()
+        .map_err(|error| ProjectionError::Materialization(error.to_string()))?;
+    if canonical_effect != event.semantic_effect() {
+        return Err(ProjectionError::InvalidAcceptedEvent(format!(
+            "accepted event {} has a non-canonical semantic effect",
+            event.batch_id()
+        )));
+    }
+    let affected_pages = super::reference_catalog::affected_reference_sources(&effect)
+        .into_iter()
+        .collect::<Vec<_>>();
+    let materializer = (!affected_pages.is_empty())
+        .then(|| {
+            engine
+                .bootstrap_bulk_materializer(event.post_frontier_root())
+                .map_err(|error| ProjectionError::Materialization(error.to_string()))
+        })
+        .transpose()?;
+    let mut replacements = Vec::new();
+    let mut deletions = Vec::new();
+    for page_ids in affected_pages.chunks(super::hot_engine::BOOTSTRAP_MATERIALIZATION_CHUNK_PAGES)
+    {
+        let pages = materializer
+            .as_ref()
+            .expect("nonempty affected pages construct a bulk materializer")
+            .materialize_pages(page_ids)
+            .map_err(|error| ProjectionError::Materialization(error.to_string()))?;
+        for (page_id, page) in page_ids.iter().copied().zip(pages) {
+            match page {
+                Some(mut page) => {
+                    if let Some(transition) = event
+                        .effective_transitions()
+                        .iter()
+                        .find(|transition| transition.page_id() == page_id)
+                    {
+                        transition
+                            .apply_to_materialized(&mut page)
+                            .map_err(|error| ProjectionError::Materialization(error.to_string()))?;
+                    }
+                    replacements.push(materialized_page_input(page));
+                }
+                None => deletions.push(page_id),
+            }
+        }
+    }
+    let change = super::MaterializationChange::new(event.batch_id(), replacements, deletions)?;
+    Ok((
+        change,
+        EventMaterializationInstrumentation {
+            accepted_root_authentications: usize::from(materializer.is_some()),
+            exact_document_loads: materializer
+                .as_ref()
+                .map_or(0, |materializer| materializer.exact_document_loads()),
+            exact_catalog_loads: usize::from(materializer.is_some()),
+            bulk_materialization_chunks: affected_pages
+                .len()
+                .div_ceil(super::hot_engine::BOOTSTRAP_MATERIALIZATION_CHUNK_PAGES),
+            bulk_pages_materialized: affected_pages.len(),
+            peak_bulk_pages: affected_pages
+                .len()
+                .min(super::hot_engine::BOOTSTRAP_MATERIALIZATION_CHUNK_PAGES),
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -1644,6 +1729,9 @@ pub struct RebuildInstrumentation {
     pub accepted_root_authentications: usize,
     pub exact_document_loads: usize,
     pub exact_catalog_loads: usize,
+    pub bulk_materialization_chunks: usize,
+    pub bulk_pages_materialized: usize,
+    pub peak_bulk_pages: usize,
     pub cleanup_page_attempts: usize,
     pub cleanup_existing_pages: usize,
     pub cleanup_owned_rows: usize,
@@ -3472,18 +3560,51 @@ impl SqliteFrontier {
         ProjectionError,
     > {
         let mut instrumentation = RebuildInstrumentation::default();
+        let inactive_bulk = matches!(source.loader, RebuildLoader::InactiveBootstrap { .. });
         let mut cursor = source.cursor()?;
         while let Some(event) = cursor.next_event()? {
             instrumentation.accepted_events_validated += 1;
             instrumentation.max_live_events = instrumentation.max_live_events.max(1);
             instrumentation.max_live_evidence_records =
                 instrumentation.max_live_evidence_records.max(1);
-            let (_, materialization_stats, apply_stats) =
-                self.apply_engine_owned_accepted_with_stats(&event, source.engine)?;
-            instrumentation.accepted_root_authentications +=
-                materialization_stats.accepted_root_authentications;
-            instrumentation.exact_document_loads += materialization_stats.exact_document_loads;
-            instrumentation.exact_catalog_loads += materialization_stats.exact_catalog_loads;
+            let apply_stats = if inactive_bulk {
+                let (materialization, materialization_stats) =
+                    materialize_inactive_bootstrap_event_bulk(source.engine, &event)?;
+                let materialization =
+                    attach_authenticated_reference_catalog(source.engine, &event, materialization)?;
+                instrumentation.accepted_root_authentications +=
+                    materialization_stats.accepted_root_authentications;
+                instrumentation.exact_document_loads += materialization_stats.exact_document_loads;
+                instrumentation.exact_catalog_loads += materialization_stats.exact_catalog_loads;
+                instrumentation.bulk_materialization_chunks +=
+                    materialization_stats.bulk_materialization_chunks;
+                instrumentation.bulk_pages_materialized +=
+                    materialization_stats.bulk_pages_materialized;
+                instrumentation.peak_bulk_pages = instrumentation
+                    .peak_bulk_pages
+                    .max(materialization_stats.peak_bulk_pages);
+                self.apply_internal_with_materialization_and_stats(
+                    &event,
+                    ApplyFault::None,
+                    Some(&materialization),
+                )?
+                .1
+            } else {
+                let (_, materialization_stats, apply_stats) =
+                    self.apply_engine_owned_accepted_with_stats(&event, source.engine)?;
+                instrumentation.accepted_root_authentications +=
+                    materialization_stats.accepted_root_authentications;
+                instrumentation.exact_document_loads += materialization_stats.exact_document_loads;
+                instrumentation.exact_catalog_loads += materialization_stats.exact_catalog_loads;
+                instrumentation.bulk_materialization_chunks +=
+                    materialization_stats.bulk_materialization_chunks;
+                instrumentation.bulk_pages_materialized +=
+                    materialization_stats.bulk_pages_materialized;
+                instrumentation.peak_bulk_pages = instrumentation
+                    .peak_bulk_pages
+                    .max(materialization_stats.peak_bulk_pages);
+                apply_stats
+            };
             instrumentation.cleanup_page_attempts += apply_stats.cleanup_page_attempts;
             instrumentation.cleanup_existing_pages += apply_stats.cleanup_existing_pages;
             instrumentation.cleanup_owned_rows += apply_stats.cleanup_owned_rows;
@@ -11782,7 +11903,37 @@ mod tests {
         let (scoped_create, create_stats) =
             materialize_accepted_event_with_stats(&engine, &create_event).unwrap();
         let point_create = materialize_accepted_event_pointwise(&engine, &create_event).unwrap();
+        let bulk_materializer = engine
+            .bootstrap_bulk_materializer(create_event.post_frontier_root())
+            .unwrap();
+        let bulk_pages = bulk_materializer
+            .materialize_pages(&[ids.page, second_page])
+            .unwrap()
+            .into_iter()
+            .map(|page| materialized_page_input(page.unwrap()))
+            .collect();
+        let bulk_create =
+            MaterializationChange::new(create_event.batch_id(), bulk_pages, vec![]).unwrap();
         assert_eq!(scoped_create, point_create);
+        assert_eq!(bulk_create, scoped_create);
+        let mut bulk_projection = bulk_materializer
+            .materialize_pages_for_projection(&[ids.page, second_page])
+            .unwrap();
+        let mut point_projection = vec![
+            Some(engine.materialize_page_for_projection(ids.page).unwrap()),
+            Some(engine.materialize_page_for_projection(second_page).unwrap()),
+        ];
+        for state in bulk_projection
+            .iter_mut()
+            .chain(point_projection.iter_mut())
+            .flatten()
+        {
+            state.page.stats = crate::oplog::MaterializationStats::default();
+        }
+        assert_eq!(
+            bulk_projection, point_projection,
+            "bounded bulk projection semantics must equal ordinary pointwise projection"
+        );
         assert_eq!(scoped_create.replacements().len(), 2);
         assert_eq!(create_stats.accepted_root_authentications, 1);
         assert_eq!(create_stats.exact_catalog_loads, 1);

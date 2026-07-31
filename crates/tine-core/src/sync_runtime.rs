@@ -23199,6 +23199,15 @@ mod tests {
             );
             assert_eq!(receipt.construction.shadow.payload_bytes_read, 0);
             assert_eq!(
+                receipt.construction.shadow.bulk_pages_materialized,
+                receipt.source_files as u64
+            );
+            assert!(receipt.construction.shadow.bulk_materialization_chunks > 0);
+            assert!(
+                receipt.construction.shadow.peak_bulk_pages
+                    <= crate::oplog::hot_engine::BOOTSTRAP_MATERIALIZATION_CHUNK_PAGES as u64
+            );
+            assert_eq!(
                 receipt.construction.shadow.source_bytes_read,
                 receipt.source_bytes as u64
             );

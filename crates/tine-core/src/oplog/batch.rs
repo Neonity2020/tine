@@ -365,6 +365,26 @@ impl OperationBatch {
         &self.required_objects
     }
 
+    /// Select one document/kind range from the canonical descriptor order.
+    ///
+    /// Bootstrap checkpoint validation calls this once per decoded document;
+    /// keeping it logarithmic avoids rescanning a large immutable part for
+    /// every page in the private construction attempt.
+    pub(crate) fn required_objects_for_document_kind(
+        &self,
+        document_id: DocumentId,
+        kind: ObjectKind,
+    ) -> &[ObjectDescriptor] {
+        let key = (document_id, kind);
+        let start = self
+            .required_objects
+            .partition_point(|descriptor| (descriptor.document_id(), descriptor.kind()) < key);
+        let end = start
+            + self.required_objects[start..]
+                .partition_point(|descriptor| (descriptor.document_id(), descriptor.kind()) == key);
+        &self.required_objects[start..end]
+    }
+
     fn from_wire(wire: OperationBatchWire) -> Self {
         Self {
             manifest_encoding_version: wire.manifest_encoding_version,
