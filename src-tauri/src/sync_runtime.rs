@@ -488,7 +488,7 @@ impl SparseV2StatusDto {
             can_retry: false,
             can_cancel: false,
             cancel_reason: Some(
-                "This graph is already synced with another device, so returning to Direct Markdown is unavailable."
+                "This graph is already synced with another device, so returning to Direct files is unavailable."
                     .into(),
             ),
             binding_generation,
@@ -644,13 +644,13 @@ fn cancel_eligibility(binding: &SparseV2Binding, provider_namespace: &Path) -> R
     let provider_evidence = provider_namespace_has_evidence(provider_namespace)?;
     if binding_names_shared_state(binding) {
         return Err(
-            "This graph is synced with another device, so returning to Direct Markdown is unavailable."
+            "This graph is synced with another device, so returning to Direct files is unavailable."
                 .into(),
         );
     }
     if let Some(handle) = binding.handle() {
         let status = handle.status().map_err(|error| {
-            format!("Couldn't verify that returning to Direct Markdown is safe: {error}")
+            format!("Couldn't verify that returning to Direct files is safe: {error}")
         })?;
         let names_shared_runtime = status.shared_role.is_some() || status.shared_phase.is_some();
         // A local-only core snapshot currently counts its absent provider
@@ -659,14 +659,14 @@ fn cancel_eligibility(binding: &SparseV2Binding, provider_namespace: &Path) -> R
         // graph-local provider namespace are absent.
         if names_shared_runtime || (status.provider_pending != 0 && provider_evidence) {
             return Err(
-                "This graph is synced with another device, so returning to Direct Markdown is unavailable."
+                "This graph is synced with another device, so returning to Direct files is unavailable."
                     .into(),
             );
         }
     }
     if provider_evidence {
         return Err(
-            "This graph is synced with another device, so returning to Direct Markdown is unavailable."
+            "This graph is synced with another device, so returning to Direct files is unavailable."
                 .into(),
         );
     }
@@ -763,7 +763,7 @@ impl SyncRuntimeFacade {
 const LEGACY_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const ACTIVATION_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 pub(crate) const SPARSE_V2_NOT_ACTIVE: &str =
-    "Tine-managed storage is not ready. Retry setup or return to Direct Markdown.";
+    "Tine-managed storage is not ready. Retry setup or return to Direct files.";
 
 struct ActivationHeartbeat {
     stop: mpsc::Sender<()>,
@@ -1057,7 +1057,7 @@ fn archive_private_root(private_root: &Path, recovery_root: &Path) -> Result<Pat
         format!("Couldn't inspect Tine-managed storage recovery state: {error}")
     })?;
     if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
-        return Err("Tine-managed storage recovery state is not a local directory, so returning to Direct Markdown is unavailable.".into());
+        return Err("Tine-managed storage recovery state is not a local directory, so returning to Direct files is unavailable.".into());
     }
     std::fs::create_dir_all(recovery_root).map_err(|error| {
         format!("Couldn't prepare Tine-managed storage recovery state: {error}")
@@ -1118,7 +1118,7 @@ fn cancel_sparse_v2_at_paths_with_archive(
 ) -> Result<SparseV2CancelResult, String> {
     let binding = slot
         .sparse_binding()
-        .ok_or("This graph is already using Direct Markdown.")?;
+        .ok_or("This graph is already using Direct files.")?;
     let record = read_binding_at(&private_root.join(SPARSE_BINDING_FILE), &slot.root_key)?
         .ok_or("Tine-managed storage setup for this graph is missing.")?;
     if record.graph_meta.root != slot.root_key.display().to_string()
@@ -1143,7 +1143,7 @@ fn cancel_sparse_v2_at_paths_with_archive(
                 .bind(label.to_string(), current)?;
             crate::state::poke_watcher(state);
         }
-        return Err("The graph changed while returning to Direct Markdown. Try again.".into());
+        return Err("The graph changed while returning to Direct files. Try again.".into());
     }
 
     if let Err(error) = shutdown(&slot) {
@@ -1160,7 +1160,7 @@ fn cancel_sparse_v2_at_paths_with_archive(
     )
     .map_err(|error| {
         format!(
-            "Tine-managed storage recovery state was preserved, but Direct Markdown could not reopen: {error}. Restart Tine to reopen the unchanged Markdown graph."
+            "Tine-managed storage recovery state was preserved, but Direct files could not reopen: {error}. Restart Tine to reopen the unchanged Markdown/Org graph."
         )
     })?;
     let replacement = Arc::new(crate::state::GraphSlot::new(graph, slot.root_key.clone()));
@@ -1171,7 +1171,7 @@ fn cancel_sparse_v2_at_paths_with_archive(
         .bind(label.to_string(), Arc::clone(&replacement))
         .map_err(|error| {
             format!(
-                "Tine-managed storage recovery state was preserved, but Direct Markdown could not be restored: {error}. Restart Tine to reopen the unchanged Markdown graph."
+                "Tine-managed storage recovery state was preserved, but Direct files could not be restored: {error}. Restart Tine to reopen the unchanged Markdown/Org graph."
             )
         })?;
     crate::state::poke_watcher(state);
@@ -1179,7 +1179,7 @@ fn cancel_sparse_v2_at_paths_with_archive(
     Ok(SparseV2CancelResult {
         binding_generation: replacement.binding_generation,
         status,
-        recovery_statement: "Direct Markdown is active. Complete recovery state was preserved."
+        recovery_statement: "Direct file mode is active. Complete recovery state was preserved."
             .into(),
     })
 }
@@ -1747,7 +1747,7 @@ mod tests {
             SPARSE_V2_NOT_ACTIVE
         );
         assert!(SPARSE_V2_NOT_ACTIVE.contains("Retry setup"));
-        assert!(SPARSE_V2_NOT_ACTIVE.contains("return to Direct Markdown"));
+        assert!(SPARSE_V2_NOT_ACTIVE.contains("return to Direct files"));
     }
 
     #[test]

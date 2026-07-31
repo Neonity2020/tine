@@ -1409,7 +1409,7 @@
         "scenario": "sync.sparse-v2-cold-shared-descriptor-classifier",
         "failBefore": "proven"
       },
-      "notes": "Absent v2 remains an ordinary Direct Markdown open. A real v2 directory whose sole top-level entry is a provider-capable shared namespace may be discovered only when its bounded enrollment namespace contains exactly the canonical supported descriptor. Partial, malformed, unsupported, symlinked, conflict-copy, sibling-descriptor, unsafe, unknown, or extra v2 evidence remains a hard refusal without creating a private binding, auto-joining, deleting, or reinterpreting bytes."
+      "notes": "Absent v2 remains an ordinary Direct files open. A real v2 directory whose sole top-level entry is a provider-capable shared namespace may be discovered only when its bounded enrollment namespace contains exactly the canonical supported descriptor. Partial, malformed, unsupported, symlinked, conflict-copy, sibling-descriptor, unsafe, unknown, or extra v2 evidence remains a hard refusal without creating a private binding, auto-joining, deleting, or reinterpreting bytes."
     },
     {
       "id": "REG-SYNC-SHARED-PROVIDER-R5-001",

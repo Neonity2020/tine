@@ -932,7 +932,7 @@ export function mockBackend(): Backend {
         status: sparseV2,
         binding_generation: sparseV2.binding_generation,
         recovery_statement:
-          "Direct Markdown is active. Complete recovery state was preserved.",
+          "Direct file mode is active. Complete recovery state was preserved.",
       };
     },
     async prepareSparseV2Share() {

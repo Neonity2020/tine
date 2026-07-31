@@ -478,8 +478,8 @@ try {
 
   phase = "return to standard Markdown mode";
   await openSyncSettings();
-  await clickButtonAndConfirm("Return to Direct Markdown", "return-to-direct-markdown");
-  await assertVisible("Enable Tine-managed storage...", "Direct Markdown status");
+  await clickButtonAndConfirm("Return to Direct files", "return-to-direct-files");
+  await assertVisible("Enable Tine-managed storage...", "Direct files status");
   await closeSettings();
 
   phase = "standard Markdown save and restart";

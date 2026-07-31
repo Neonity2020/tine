@@ -171,7 +171,13 @@ const TABS: { id: Tab; label: string }[] = [
   { id: "about", label: "About" },
 ];
 
-type SettingSearchEntry = { tab: Tab; label: string; description: string; aliases?: string[]; level?: "advanced" };
+type SettingSearchEntry = {
+  tab: Tab;
+  label: string;
+  description: string;
+  aliases?: string[];
+  level?: "advanced" | "experimental";
+};
 const SETTING_SEARCH: SettingSearchEntry[] = [
   { tab: "appearance", label: "Theme", description: "light dark gallery colors" },
   { tab: "appearance", label: "Accent color", description: "interface highlight color" },
@@ -209,7 +215,12 @@ const SETTING_SEARCH: SettingSearchEntry[] = [
   { tab: "files", label: "Diagram editors", description: "drawio Excalidraw commands", level: "advanced" },
   { tab: "backups", label: "Snapshots to keep", description: "recovery retention conflicts" },
   { tab: "graph", label: "Graph", description: "folder export publish" },
-  { tab: "graph", label: "Storage & sync", description: "Direct Markdown Tine-managed storage recovery" },
+  {
+    tab: "backups",
+    label: "Storage & sync",
+    description: "Direct files Tine-managed storage recovery",
+    level: "experimental",
+  },
   { tab: "improve", label: "Help improve Tine", description: "diagnostics divergences anonymize" },
   { tab: "shortcuts", label: "Keyboard shortcuts", description: "key bindings commands remap" },
   { tab: "about", label: "About", description: "version licenses updates" },
@@ -223,6 +234,10 @@ function settingMatches(entry: SettingSearchEntry, query: string): boolean {
 
 function advancedMatch(tab: Tab, query: string): boolean {
   return !!query.trim() && SETTING_SEARCH.some((entry) => entry.tab === tab && entry.level === "advanced" && settingMatches(entry, query));
+}
+
+function experimentalMatch(tab: Tab, query: string): boolean {
+  return !!query.trim() && SETTING_SEARCH.some((entry) => entry.tab === tab && entry.level === "experimental" && settingMatches(entry, query));
 }
 
 export function Settings(): JSX.Element {
@@ -361,7 +376,10 @@ export function Settings(): JSX.Element {
                       {(entry) => (
                         <button type="button" class="settings-search-result" onClick={() => openSearchResult(entry)}>
                           <span>{entry.label}</span>
-                          <small>{TABS.find((candidate) => candidate.id === entry.tab)?.label}{entry.level === "advanced" ? " › Advanced" : ""}</small>
+                          <small>
+                            {TABS.find((candidate) => candidate.id === entry.tab)?.label}
+                            {entry.level === "advanced" ? " › Advanced" : entry.level === "experimental" ? " › Experimental" : ""}
+                          </small>
                         </button>
                       )}
                     </For>
@@ -381,7 +399,7 @@ export function Settings(): JSX.Element {
                 <FilesTab search={settingsQuery()} />
               </Show>
               <Show when={tab() === "backups"}>
-                <BackupsTab />
+                <BackupsTab search={settingsQuery()} />
               </Show>
               <Show when={tab() === "graph"}>
                 <GraphTab publishMsg={publishMsg()} doPublish={doPublish} />
@@ -981,9 +999,16 @@ function OgField(props: {
   );
 }
 
-function AdvancedSection(props: { tab: Tab; forceOpen: boolean; children: JSX.Element }): JSX.Element {
-  const layerId = `settings-advanced-${createUniqueId()}`;
-  const key = `tine.settings.advanced.${props.tab}`;
+function SettingsDisclosure(props: {
+  label: string;
+  storageKey: string;
+  layerPrefix: string;
+  forceOpen?: boolean;
+  className?: string;
+  children: JSX.Element;
+}): JSX.Element {
+  const layerId = `${props.layerPrefix}-${createUniqueId()}`;
+  const key = props.storageKey;
   let initial = false;
   try { initial = localStorage.getItem(key) === "1"; } catch {}
   const [open, setOpen] = createSignal(initial);
@@ -1009,7 +1034,7 @@ function AdvancedSection(props: { tab: Tab; forceOpen: boolean; children: JSX.El
     onCleanup(unregister);
   });
   return (
-    <section class="settings-advanced">
+    <section class={`settings-advanced ${props.className ?? ""}`}>
       <button
         ref={button}
         type="button"
@@ -1026,12 +1051,39 @@ function AdvancedSection(props: { tab: Tab; forceOpen: boolean; children: JSX.El
           }
         }}
       >
-        <span aria-hidden="true">{expanded() ? "▾" : "▸"}</span> Advanced
+        <span aria-hidden="true">{expanded() ? "▾" : "▸"}</span> {props.label}
       </button>
       <Show when={expanded()}>
         <div class="settings-advanced-body">{props.children}</div>
       </Show>
     </section>
+  );
+}
+
+function AdvancedSection(props: { tab: Tab; forceOpen: boolean; children: JSX.Element }): JSX.Element {
+  return (
+    <SettingsDisclosure
+      label="Advanced"
+      storageKey={`tine.settings.advanced.${props.tab}`}
+      layerPrefix="settings-advanced"
+      forceOpen={props.forceOpen}
+    >
+      {props.children}
+    </SettingsDisclosure>
+  );
+}
+
+function ExperimentalSection(props: { forceOpen: boolean; children: JSX.Element }): JSX.Element {
+  return (
+    <SettingsDisclosure
+      label="Experimental"
+      storageKey="tine.settings.experimental.storage"
+      layerPrefix="settings-experimental"
+      className="settings-experimental"
+      forceOpen={props.forceOpen}
+    >
+      {props.children}
+    </SettingsDisclosure>
   );
 }
 
@@ -1880,7 +1932,7 @@ function GraphTab(props: { publishMsg: string; doPublish: () => void }): JSX.Ele
   );
 }
 
-function ManagedSyncPanel(): JSX.Element {
+function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
   const [status, setStatus] = createSignal<SparseV2Status | null>(null);
   const [loading, setLoading] = createSignal(true);
   const [enabling, setEnabling] = createSignal(false);
@@ -2019,13 +2071,13 @@ function ManagedSyncPanel(): JSX.Element {
         await flushAll();
       } catch {
         // Setup may be unavailable in the exact failure state this rollback
-        // repairs. Keep the store intact and retry after Direct Markdown
+        // repairs. Keep the store intact and retry after Direct files
         // has been restored.
       }
       if (!(await backend().confirm(
-        "Return to Direct Markdown?\n\n" +
-          "Tine preserves complete recovery state before switching this graph back to Direct Markdown. " +
-          "Pending in-memory edits will be retried after Direct Markdown returns."
+        "Return to Direct files?\n\n" +
+          "Tine preserves complete recovery state before switching this graph back to Direct files. " +
+          "Pending in-memory edits will be retried after Direct files returns."
       ))) return;
       const result = await backend().cancelSparseV2();
       setStatus(result.status);
@@ -2037,15 +2089,21 @@ function ManagedSyncPanel(): JSX.Element {
       }
       if (!flushed) {
         pushToast(
-          "Direct Markdown is active, but your in-memory edits remain unsaved; resolve conflicts or retry saving before reloading or closing the graph.",
+          "Direct files is active, but your in-memory edits remain unsaved; resolve conflicts or retry saving before reloading or closing the graph.",
           "error"
         );
         return;
       }
       refreshAuthorityState();
-      pushToast(result.recovery_statement, "success");
+      // Older native builds may still use the former mode name in this recovery text.
+      pushToast(
+        result.recovery_statement
+          .replace(/\bDirect\s+Markdown\b/g, "Direct file mode")
+          .replace(/^Direct files is active\./, "Direct file mode is active."),
+        "success"
+      );
     } catch {
-      pushToast("Couldn't return to Direct Markdown. Try again.", "error");
+      pushToast("Couldn't return to Direct files. Try again.", "error");
     } finally {
       setGraphTransitioning(false);
       setCancelling(false);
@@ -2055,123 +2113,134 @@ function ManagedSyncPanel(): JSX.Element {
   return (
     <>
       <div class="settings-section">Storage &amp; sync</div>
-      <Show
-        when={!loading()}
-        fallback={<div class="settings-hint settings-block">Checking sync state…</div>}
-      >
+      <ExperimentalSection forceOpen={props.forceOpen}>
+        <div class="settings-experimental-warning" role="note">
+          <strong>Testing only.</strong> Tine-managed storage is for testing and is not yet mature. You can keep using Direct files in the meantime.
+        </div>
         <Show
-          when={status()}
-          fallback={
-            <div class="settings-hint settings-block">Tine-managed storage status is unavailable.</div>
-          }
+          when={!loading()}
+          fallback={<div class="settings-hint settings-block">Checking sync state…</div>}
         >
-          {(current) => (
-            <div class="settings-row">
-              <span class="settings-label">Storage mode</span>
-              <div>
-                <Show when={current().state === "legacy_default"}>
-                  <button class="settings-btn" disabled={enabling()} onClick={() => void enable()}>
-                    {enabling() ? "Setting up..." : "Enable Tine-managed storage..."}
-                  </button>
-                </Show>
-                <Show when={current().state === "joinable"}>
-                  <button class="settings-btn" disabled={sharing()} onClick={() => void joinShare()}>
-                    {sharing() ? "Joining..." : "Join this synced graph..."}
-                  </button>
-                </Show>
-                <Show when={retryable()}>
-                  <button class="settings-btn" disabled={enabling()} onClick={() => void enable()}>
-                    {enabling() ? "Retrying..." : "Retry setup"}
-                  </button>
-                </Show>
-                <Show when={current().state === "active"}>
-                  <span class="settings-value">Tine-managed storage active</span>
-                  <Show when={!current().runtime?.shared_phase || current().runtime?.shared_phase === "share_prepared"}>
+          <Show
+            when={status()}
+            fallback={
+              <div class="settings-hint settings-block">Tine-managed storage status is unavailable.</div>
+            }
+          >
+            {(current) => (
+              <div class="settings-row">
+                <span class="settings-label">Storage mode</span>
+                <div>
+                  <Show when={current().state === "legacy_default"}>
+                    <span class="settings-value">Direct files</span>
+                    <div class="settings-hint" style={{ "margin-top": "4px" }}>
+                      Uses your graph’s Markdown or Org files directly.
+                    </div>
                     <div style={{ "margin-top": "6px" }}>
-                      <button class="settings-btn" disabled={sharing()} onClick={() => void prepareShare()}>
-                        {sharing()
-                          ? "Setting up..."
-                          : current().runtime?.shared_phase === "share_prepared"
-                            ? "Retry setup"
-                            : "Set up sync with another device..."}
+                      <button class="settings-btn" disabled={enabling()} onClick={() => void enable()}>
+                        {enabling() ? "Setting up..." : "Enable Tine-managed storage..."}
                       </button>
                     </div>
                   </Show>
-                  <Show when={current().runtime?.shared_phase === "joining"}>
-                    <div style={{ "margin-top": "6px" }}>
-                      <button class="settings-btn" disabled={sharing()} onClick={() => void joinShare()}>
-                        {sharing() ? "Joining..." : "Join this synced graph..."}
-                      </button>
-                    </div>
+                  <Show when={current().state === "joinable"}>
+                    <button class="settings-btn" disabled={sharing()} onClick={() => void joinShare()}>
+                      {sharing() ? "Joining..." : "Join this synced graph..."}
+                    </button>
                   </Show>
-                </Show>
-                <Show when={blocked()}>
-                  <span class="settings-value">Tine-managed storage needs attention.</span>
-                </Show>
-                <Show when={refused()}>
-                  <span class="settings-value">Tine-managed storage is unavailable for this graph.</span>
-                </Show>
-                <Show
-                  when={
-                    current().state !== "legacy_default" && current().state !== "joinable"
-                  }
-                >
-                  <Show
-                    when={current().can_cancel}
-                    fallback={
-                      <div class="settings-hint" style={{ "margin-top": "8px" }}>
-                        Return to Direct Markdown is unavailable because safety could not be verified.
+                  <Show when={retryable()}>
+                    <button class="settings-btn" disabled={enabling()} onClick={() => void enable()}>
+                      {enabling() ? "Retrying..." : "Retry setup"}
+                    </button>
+                  </Show>
+                  <Show when={current().state === "active"}>
+                    <span class="settings-value">Tine-managed storage active</span>
+                    <Show when={!current().runtime?.shared_phase || current().runtime?.shared_phase === "share_prepared"}>
+                      <div style={{ "margin-top": "6px" }}>
+                        <button class="settings-btn" disabled={sharing()} onClick={() => void prepareShare()}>
+                          {sharing()
+                            ? "Setting up..."
+                            : current().runtime?.shared_phase === "share_prepared"
+                              ? "Retry setup"
+                              : "Set up sync with another device..."}
+                        </button>
                       </div>
+                    </Show>
+                    <Show when={current().runtime?.shared_phase === "joining"}>
+                      <div style={{ "margin-top": "6px" }}>
+                        <button class="settings-btn" disabled={sharing()} onClick={() => void joinShare()}>
+                          {sharing() ? "Joining..." : "Join this synced graph..."}
+                        </button>
+                      </div>
+                    </Show>
+                  </Show>
+                  <Show when={blocked()}>
+                    <span class="settings-value">Tine-managed storage needs attention.</span>
+                  </Show>
+                  <Show when={refused()}>
+                    <span class="settings-value">Tine-managed storage is unavailable for this graph.</span>
+                  </Show>
+                  <Show
+                    when={
+                      current().state !== "legacy_default" && current().state !== "joinable"
                     }
                   >
-                    <div style={{ "margin-top": "8px" }}>
-                      <button
-                        class="settings-btn settings-btn-danger"
-                        disabled={cancelling()}
-                        onClick={() => void cancelSparse()}
-                      >
-                        {cancelling() ? "Returning..." : "Return to Direct Markdown"}
-                      </button>
-                      <div class="settings-hint" style={{ "margin-top": "4px" }}>
-                        Complete recovery state is preserved before returning to Direct Markdown.
+                    <Show
+                      when={current().can_cancel}
+                      fallback={
+                        <div class="settings-hint" style={{ "margin-top": "8px" }}>
+                          Return to Direct files is unavailable because safety could not be verified.
+                        </div>
+                      }
+                    >
+                      <div style={{ "margin-top": "8px" }}>
+                        <button
+                          class="settings-btn settings-btn-danger"
+                          disabled={cancelling()}
+                          onClick={() => void cancelSparse()}
+                        >
+                          {cancelling() ? "Returning..." : "Return to Direct files"}
+                        </button>
+                        <div class="settings-hint" style={{ "margin-top": "4px" }}>
+                          Complete recovery state is preserved before returning to Direct files.
+                        </div>
                       </div>
+                    </Show>
+                  </Show>
+                  <Show when={retryable()}>
+                    <div class="settings-hint" style={{ "margin-top": "4px" }}>
+                      Setup paused. You can retry setup when you are ready.
                     </div>
                   </Show>
-                </Show>
-                <Show when={retryable()}>
-                  <div class="settings-hint" style={{ "margin-top": "4px" }}>
-                    Setup paused. You can retry setup when you are ready.
+                  <Show when={current().runtime}>
+                    {(runtime) => (
+                      <>
+                        <Show when={runtime().watcher.pending || runtime().watcher.deferred}>
+                          <div class="settings-hint">
+                            Updating external changes...
+                          </div>
+                        </Show>
+                        <Show when={runtime().provider_pending > 0}>
+                          <div class="settings-hint">
+                            Sync updates are pending.
+                          </div>
+                        </Show>
+                      </>
+                    )}
+                  </Show>
+                  <div class="settings-hint" style={{ "margin-top": "6px" }}>
+                    Tine keeps durable history and a local index while continuously maintaining your compatible Markdown/Org tree.
                   </div>
-                </Show>
-                <Show when={current().runtime}>
-                  {(runtime) => (
-                    <>
-                      <Show when={runtime().watcher.pending || runtime().watcher.deferred}>
-                        <div class="settings-hint">
-                          Updating external changes...
-                        </div>
-                      </Show>
-                      <Show when={runtime().provider_pending > 0}>
-                        <div class="settings-hint">
-                          Sync updates are pending.
-                        </div>
-                      </Show>
-                    </>
-                  )}
-                </Show>
-                <div class="settings-hint" style={{ "margin-top": "6px" }}>
-                  Tine keeps durable history and a local index while continuously maintaining your compatible Markdown/Org tree.
                 </div>
               </div>
-            </div>
-          )}
+            )}
+          </Show>
         </Show>
-      </Show>
+      </ExperimentalSection>
     </>
   );
 }
 
-function BackupsTab(): JSX.Element {
+function BackupsTab(props: { search: string }): JSX.Element {
   const [keep, setKeep] = createSignal(12);
   const [list, setList] = createSignal<BackupInfo[]>([]);
   const [busy, setBusy] = createSignal(false);
@@ -2253,10 +2322,10 @@ function BackupsTab(): JSX.Element {
 
   return (
     <>
-      <ManagedSyncPanel />
+      <ManagedSyncPanel forceOpen={experimentalMatch("backups", props.search)} />
 
       <div class="settings-hint settings-block">
-        Tine snapshots your graph’s markdown to a local folder each time it opens
+          Tine snapshots your graph’s Markdown/Org files to a local folder each time it opens
         (outside the graph, so Syncthing never sees it). A safety net against a bad
         write — independent of OG Logseq’s own backups.
       </div>

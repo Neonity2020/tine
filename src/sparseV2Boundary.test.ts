@@ -40,7 +40,7 @@ describe("Tine-managed storage app boundary", () => {
       "Tine-managed storage active",
       "Set up sync with another device...",
       "Join this synced graph...",
-      "Return to Direct Markdown",
+      "Return to Direct files",
     ]) {
       expect(settings).toContain(copy);
     }

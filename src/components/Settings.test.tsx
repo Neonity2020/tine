@@ -15,6 +15,11 @@ const showSparsePanel = async (root: HTMLElement) => {
   ) as HTMLButtonElement;
   backupsTab.click();
   await tick();
+  const experimental = [...root.querySelectorAll("button")].find(
+    (button) => button.textContent?.includes("Experimental")
+  ) as HTMLButtonElement;
+  experimental.click();
+  await tick();
 };
 
 afterEach(() => {
@@ -76,6 +81,42 @@ describe("Settings storage transitions", () => {
     binding_generation: 11,
   });
 
+  it("discloses managed storage as experimental and keeps Direct files available", async () => {
+    vi.spyOn(backend(), "sparseV2Status").mockResolvedValue(legacy());
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <Settings />, root);
+    openSettings();
+    await tick();
+    const backupsTab = [...root.querySelectorAll(".settings-nav-item")].find(
+      (button) => button.textContent === "Backups & recovery"
+    ) as HTMLButtonElement;
+    backupsTab.click();
+    await tick();
+
+    const experimental = [...root.querySelectorAll("button")].find(
+      (button) => button.textContent?.includes("Experimental")
+    ) as HTMLButtonElement;
+    expect(experimental.getAttribute("aria-expanded")).toBe("false");
+    expect(root.textContent).not.toContain("Enable Tine-managed storage");
+
+    const search = root.querySelector(".settings-search-input") as HTMLInputElement;
+    search.value = "storage sync";
+    search.dispatchEvent(new InputEvent("input", { bubbles: true }));
+    await tick();
+    const result = root.querySelector(".settings-search-result") as HTMLButtonElement;
+    expect(result.textContent).toContain("Backups & recovery › Experimental");
+    result.click();
+    await tick();
+
+    expect(experimental.getAttribute("aria-expanded")).toBe("true");
+    expect(root.textContent).toContain("Tine-managed storage is for testing and is not yet mature.");
+    expect(root.textContent).toContain("You can keep using Direct files in the meantime.");
+    expect(root.textContent).toContain("Uses your graph’s Markdown or Org files directly.");
+    expect(root.textContent).toContain("Enable Tine-managed storage");
+    dispose();
+  });
+
   it("flushes before setup, offers retry, and invalidates stale pages", async () => {
     const calls: string[] = [];
     vi.spyOn(backend(), "sparseV2Status").mockResolvedValue(legacy());
@@ -108,7 +149,7 @@ describe("Settings storage transitions", () => {
     );
     expect(root.textContent).toContain("Retry setup");
     expect(root.textContent).toContain("Setup paused. You can retry setup when you are ready.");
-    expect(root.textContent).toContain("Return to Direct Markdown");
+    expect(root.textContent).toContain("Return to Direct files");
     dispose();
   });
 
@@ -131,7 +172,7 @@ describe("Settings storage transitions", () => {
       return {
         status,
         binding_generation: 12,
-        recovery_statement: "Direct Markdown is active. Complete recovery state was preserved.",
+        recovery_statement: "Direct file mode is active. Complete recovery state was preserved.",
       };
     });
 
@@ -140,7 +181,7 @@ describe("Settings storage transitions", () => {
     const dispose = render(() => <Settings />, root);
     await showSparsePanel(root);
     const rollback = [...root.querySelectorAll("button")].find((button) =>
-      button.textContent?.includes("Return to Direct Markdown")
+      button.textContent?.includes("Return to Direct files")
     ) as HTMLButtonElement;
     expect(rollback).toBeTruthy();
     rollback.click();
@@ -151,11 +192,11 @@ describe("Settings storage transitions", () => {
     expect(reset).toHaveBeenCalledOnce();
     expect(confirm).toHaveBeenCalledWith(
       expect.stringContaining(
-        "Pending in-memory edits will be retried after Direct Markdown returns."
+        "Pending in-memory edits will be retried after Direct files returns."
       )
     );
     expect(toasts().at(-1)?.message).toBe(
-      "Direct Markdown is active. Complete recovery state was preserved."
+      "Direct file mode is active. Complete recovery state was preserved."
     );
     expect(root.textContent).toContain("Enable Tine-managed storage");
     dispose();
@@ -169,7 +210,7 @@ describe("Settings storage transitions", () => {
     vi.spyOn(backend(), "cancelSparseV2").mockResolvedValue({
       status: { ...legacy(), binding_generation: 12 },
       binding_generation: 12,
-      recovery_statement: "Direct Markdown is active. Complete recovery state was preserved.",
+      recovery_statement: "Direct file mode is active. Complete recovery state was preserved.",
     });
 
     const root = document.createElement("div");
@@ -177,7 +218,7 @@ describe("Settings storage transitions", () => {
     const dispose = render(() => <Settings />, root);
     await showSparsePanel(root);
     const rollback = [...root.querySelectorAll("button")].find((button) =>
-      button.textContent?.includes("Return to Direct Markdown")
+      button.textContent?.includes("Return to Direct files")
     ) as HTMLButtonElement;
     rollback.click();
     await tick();
@@ -186,7 +227,7 @@ describe("Settings storage transitions", () => {
     expect(flush).toHaveBeenCalledTimes(2);
     expect(reset).toHaveBeenCalledOnce();
     expect(toasts().at(-1)?.message).toBe(
-      "Direct Markdown is active. Complete recovery state was preserved."
+      "Direct file mode is active. Complete recovery state was preserved."
     );
     dispose();
   });
@@ -206,7 +247,7 @@ describe("Settings storage transitions", () => {
       return {
         status,
         binding_generation: 12,
-        recovery_statement: "Direct Markdown is active. Complete recovery state was preserved.",
+        recovery_statement: "Direct file mode is active. Complete recovery state was preserved.",
       };
     });
 
@@ -215,7 +256,7 @@ describe("Settings storage transitions", () => {
     const dispose = render(() => <Settings />, root);
     await showSparsePanel(root);
     const rollback = [...root.querySelectorAll("button")].find((button) =>
-      button.textContent?.includes("Return to Direct Markdown")
+      button.textContent?.includes("Return to Direct files")
     ) as HTMLButtonElement;
     rollback.click();
     await tick();
@@ -225,7 +266,7 @@ describe("Settings storage transitions", () => {
     expect(reset).not.toHaveBeenCalled();
     expect(root.textContent).toContain("Enable Tine-managed storage");
     expect(toasts().at(-1)?.message).toContain(
-      "Direct Markdown is active, but your in-memory edits remain unsaved"
+      "Direct files is active, but your in-memory edits remain unsaved"
     );
     expect(toasts().at(-1)?.message).toContain("resolve conflicts or retry");
     dispose();
@@ -245,11 +286,11 @@ describe("Settings storage transitions", () => {
 
     expect(
       [...root.querySelectorAll("button")].find(
-        (button) => button.textContent === "Return to Direct Markdown"
+        (button) => button.textContent === "Return to Direct files"
       )
     ).toBeUndefined();
     expect(root.textContent).toContain(
-      "Return to Direct Markdown is unavailable because safety could not be verified."
+      "Return to Direct files is unavailable because safety could not be verified."
     );
     expect(cancel).not.toHaveBeenCalled();
     dispose();
