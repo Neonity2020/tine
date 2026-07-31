@@ -10112,8 +10112,10 @@ mod tests {
 
     #[test]
     #[ignore = "1000-page structural bootstrap-authoring proof"]
-    fn inactive_streaming_bootstrap_1000_page_catalog_work_is_linear() {
+    fn inactive_streaming_bootstrap_1000_page_catalog_and_document_io_are_linear() {
         const PAGE_COUNT: usize = 1_000;
+        const MAX_SCRATCH_PAGE_READS_PER_CAPSULE: usize = 256;
+        const MAX_SCRATCH_BYTES_PER_CAPSULE: usize = 384 * 1024;
         let owned = (0..PAGE_COUNT)
             .map(|index| {
                 (
@@ -10151,6 +10153,22 @@ mod tests {
             work.authenticated_page_identity_lookups,
             PAGE_COUNT * 3,
             "author page-home resolution, prospective-reference validation, and reference-source preparation must each use one bounded authenticated point per page"
+        );
+        let io = prepared.candidate().accepted_engine().instrumentation();
+        eprintln!(
+            "bootstrap document I/O pages={PAGE_COUNT} scratch_reads={} scratch_bytes={} logical_document_reads={} external_point_reads={}",
+            io.scratch_page_reads,
+            io.scratch_page_bytes_read,
+            io.document_point_reads,
+            io.external_point_reads,
+        );
+        assert!(
+            io.scratch_page_reads <= PAGE_COUNT * MAX_SCRATCH_PAGE_READS_PER_CAPSULE,
+            "authenticated scratch page reads exceeded the linear capsule ceiling: {io:?}"
+        );
+        assert!(
+            io.scratch_page_bytes_read <= PAGE_COUNT * MAX_SCRATCH_BYTES_PER_CAPSULE,
+            "authenticated scratch bytes exceeded the linear capsule ceiling: {io:?}"
         );
     }
 

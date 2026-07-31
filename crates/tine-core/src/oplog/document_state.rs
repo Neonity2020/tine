@@ -737,6 +737,34 @@ pub(crate) fn load_external_current(
     )
 }
 
+pub(crate) fn load_external_current_many(
+    store: &Arc<ScratchStore>,
+    roots: &ScratchRoots,
+    lane: DocumentLane,
+    document_ids: &[DocumentId],
+) -> Result<
+    Vec<
+        Option<(
+            ExternalDocumentStateRecord,
+            ExternalDocument,
+            DocumentStateWork,
+        )>,
+    >,
+    DocumentStateError,
+> {
+    load_external_records_many(
+        store,
+        roots,
+        ScratchPageKind::DocumentExternalCurrent,
+        &roots.external_document_current_root,
+        document_ids
+            .iter()
+            .map(|document_id| current_key(lane, *document_id))
+            .collect(),
+        |index, record| record.document_id == document_ids[index] && record.lane == lane,
+    )
+}
+
 pub(crate) fn load_external_exact(
     store: &Arc<ScratchStore>,
     roots: &ScratchRoots,
@@ -761,6 +789,40 @@ pub(crate) fn load_external_exact(
             record.document_id == document_id
                 && record.lane == lane
                 && record.causal_digest == causal_digest
+        },
+    )
+}
+
+pub(crate) fn load_external_exact_many(
+    store: &Arc<ScratchStore>,
+    roots: &ScratchRoots,
+    lane: DocumentLane,
+    documents: &[(DocumentId, DocumentCausalDigest)],
+) -> Result<
+    Vec<
+        Option<(
+            ExternalDocumentStateRecord,
+            ExternalDocument,
+            DocumentStateWork,
+        )>,
+    >,
+    DocumentStateError,
+> {
+    load_external_records_many(
+        store,
+        roots,
+        ScratchPageKind::DocumentExternalExact,
+        &roots.external_document_state_root,
+        documents
+            .iter()
+            .map(|(document_id, causal_digest)| {
+                external_exact_key(lane, *document_id, *causal_digest)
+            })
+            .collect(),
+        |index, record| {
+            record.document_id == documents[index].0
+                && record.lane == lane
+                && record.causal_digest == documents[index].1
         },
     )
 }
@@ -902,6 +964,57 @@ fn load_external_record(
     let Some(bytes) = store.lookup(root, kind, &key)? else {
         return Ok(None);
     };
+    Ok(Some(load_external_record_value(
+        store, roots, &bytes, binding,
+    )?))
+}
+
+fn load_external_records_many(
+    store: &Arc<ScratchStore>,
+    roots: &ScratchRoots,
+    kind: ScratchPageKind,
+    root: &super::scratch_store::ScratchLsmRoot,
+    keys: Vec<Vec<u8>>,
+    binding: impl Fn(usize, &ExternalDocumentStateRecord) -> bool,
+) -> Result<
+    Vec<
+        Option<(
+            ExternalDocumentStateRecord,
+            ExternalDocument,
+            DocumentStateWork,
+        )>,
+    >,
+    DocumentStateError,
+> {
+    store
+        .lookup_many(root, kind, &keys)?
+        .into_iter()
+        .enumerate()
+        .map(|(index, bytes)| {
+            bytes
+                .map(|bytes| {
+                    load_external_record_value(store, roots, &bytes, |record| {
+                        binding(index, record)
+                    })
+                })
+                .transpose()
+        })
+        .collect()
+}
+
+fn load_external_record_value(
+    store: &Arc<ScratchStore>,
+    roots: &ScratchRoots,
+    bytes: &[u8],
+    binding: impl Fn(&ExternalDocumentStateRecord) -> bool,
+) -> Result<
+    (
+        ExternalDocumentStateRecord,
+        ExternalDocument,
+        DocumentStateWork,
+    ),
+    DocumentStateError,
+> {
     let record: ExternalDocumentStateRecord = decode_canonical(&bytes)?;
     validate_external_record(store, &record)?;
     if !binding(&record) {
@@ -926,14 +1039,14 @@ fn load_external_record(
         ..DocumentStateWork::default()
     };
     record_loro_store_work(&mut work, history_before, history_after);
-    Ok(Some((
+    Ok((
         record,
         ExternalDocument {
             document,
             history_store,
         },
         work,
-    )))
+    ))
 }
 
 fn record_loro_store_work(

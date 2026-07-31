@@ -1470,6 +1470,87 @@ impl ScratchStore {
         Ok(None)
     }
 
+    /// Resolve a bounded set of logical LSM points while authenticating each
+    /// potentially relevant immutable segment at most once.
+    ///
+    /// A scratch LSM segment is one authenticated page. Repeating `lookup`
+    /// for every document therefore re-read and re-hashed the same growing
+    /// segment once per key. This method preserves newest-generation and
+    /// tombstone semantics, but shares each physical segment read across all
+    /// requested points. Results remain aligned with `keys`, including
+    /// duplicate keys.
+    pub(crate) fn lookup_many(
+        &self,
+        root: &ScratchLsmRoot,
+        kind: ScratchPageKind,
+        keys: &[Vec<u8>],
+    ) -> Result<Vec<Option<Vec<u8>>>, ScratchError> {
+        validate_root(root)?;
+        self.counters
+            .point_reads
+            .fetch_add(keys.len(), Ordering::Relaxed);
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut resolved = vec![false; keys.len()];
+        if kind == ScratchPageKind::DocumentCurrent {
+            let filter = self
+                .document_current_filter
+                .lock()
+                .map_err(|_| ScratchError::Poisoned)?;
+            for (index, key) in keys.iter().enumerate() {
+                if !filter.might_contain(key) {
+                    resolved[index] = true;
+                }
+            }
+        } else if kind == ScratchPageKind::BlobDedup {
+            let filter = self
+                .blob_dedup_filter
+                .lock()
+                .map_err(|_| ScratchError::Poisoned)?;
+            for (index, key) in keys.iter().enumerate() {
+                if filter.proves_absent(root, key) {
+                    resolved[index] = true;
+                }
+            }
+        }
+
+        let mut values = vec![None; keys.len()];
+        let mut segments = root
+            .levels
+            .iter()
+            .flatten()
+            .collect::<Vec<&ScratchSegmentRef>>();
+        segments.sort_unstable_by_key(|segment| std::cmp::Reverse(segment.generation));
+        for segment_ref in segments {
+            let selected = keys
+                .iter()
+                .enumerate()
+                .filter_map(|(index, key)| {
+                    (!resolved[index]
+                        && key.as_slice() >= segment_ref.page_ref.key_min.as_slice()
+                        && key.as_slice() <= segment_ref.page_ref.key_max.as_slice())
+                    .then_some(index)
+                })
+                .collect::<Vec<_>>();
+            if selected.is_empty() {
+                continue;
+            }
+            let segment = self.read_segment(kind, segment_ref)?;
+            for index in selected {
+                if let Ok(record_index) = segment
+                    .entries
+                    .binary_search_by(|record| record.key.as_slice().cmp(keys[index].as_slice()))
+                {
+                    values[index] = segment.entries[record_index].value.clone();
+                    resolved[index] = true;
+                }
+            }
+        }
+        Ok(values)
+    }
+
     pub(crate) fn authenticated_point_lookup(
         &self,
         root: &ScratchAuthenticatedPointRoot,
@@ -4548,6 +4629,94 @@ mod tests {
             vec![(b"a".to_vec(), b"new".to_vec())]
         );
         assert_eq!(store.stats().scratch_syncs, 0);
+        drop(store);
+        crate::test_support::remove_dir_all(path);
+    }
+
+    #[test]
+    fn authenticated_lsm_lookup_many_is_semantically_exact_and_reads_each_segment_once() {
+        let path = std::env::temp_dir().join(format!("tine-scratch-lsm-many-{}", Uuid::new_v4()));
+        let archive = archive(&path);
+        let store = ScratchStore::open(&archive, workspace(11)).unwrap();
+        let original = (0_u8..64)
+            .map(|index| {
+                (
+                    format!("key-{index:02}").into_bytes(),
+                    Some(format!("old-{index:02}").into_bytes()),
+                )
+            })
+            .collect();
+        let mut root = store
+            .insert_many(
+                &ScratchLsmRoot::default(),
+                ScratchPageKind::BatchStatus,
+                &original,
+            )
+            .unwrap();
+        root = store
+            .insert_many(
+                &root,
+                ScratchPageKind::BatchStatus,
+                &BTreeMap::from([
+                    (b"key-00".to_vec(), Some(b"new-00".to_vec())),
+                    (b"key-63".to_vec(), Some(b"new-63".to_vec())),
+                ]),
+            )
+            .unwrap();
+        root = store
+            .insert_many(
+                &root,
+                ScratchPageKind::BatchStatus,
+                &BTreeMap::from([(b"key-32".to_vec(), None)]),
+            )
+            .unwrap();
+        let keys = (0_u8..64)
+            .map(|index| format!("key-{index:02}").into_bytes())
+            .chain([b"key-absent".to_vec(), b"key-00".to_vec()])
+            .collect::<Vec<_>>();
+
+        let repeated_before = store.stats();
+        let repeated = keys
+            .iter()
+            .map(|key| {
+                store
+                    .lookup(&root, ScratchPageKind::BatchStatus, key)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let repeated_after = store.stats();
+        let batch_before = repeated_after;
+        let batched = store
+            .lookup_many(&root, ScratchPageKind::BatchStatus, &keys)
+            .unwrap();
+        let batch_after = store.stats();
+
+        assert_eq!(batched, repeated);
+        assert_eq!(batched[0], Some(b"new-00".to_vec()));
+        assert_eq!(batched[32], None);
+        assert_eq!(batched[63], Some(b"new-63".to_vec()));
+        assert_eq!(batched[64], None);
+        assert_eq!(batched[65], batched[0]);
+        assert_eq!(
+            batch_after.point_reads - batch_before.point_reads,
+            keys.len(),
+            "batching must preserve logical authenticated point accounting"
+        );
+        assert!(
+            batch_after.page_reads - batch_before.page_reads
+                <= root.levels.iter().flatten().count(),
+            "a batched point set read an immutable LSM segment more than once"
+        );
+        assert!(
+            batch_after.page_reads - batch_before.page_reads
+                < repeated_after.page_reads - repeated_before.page_reads,
+            "batched physical reads did not improve over repeated point opens"
+        );
+        assert!(
+            batch_after.page_bytes_read - batch_before.page_bytes_read
+                < repeated_after.page_bytes_read - repeated_before.page_bytes_read,
+            "batched physical bytes did not improve over repeated point opens"
+        );
         drop(store);
         crate::test_support::remove_dir_all(path);
     }

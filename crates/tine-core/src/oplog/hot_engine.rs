@@ -603,6 +603,7 @@ impl EngineDocument {
 
 struct CurrentFrontierDocuments {
     documents: BTreeMap<DocumentId, EngineDocument>,
+    current_documents: BTreeMap<DocumentId, (EngineDocument, BTreeSet<BatchId>, bool)>,
     authenticated_catalog_page_names: Option<AuthenticatedCatalogPageNameCheckpointV1>,
 }
 
@@ -3893,7 +3894,7 @@ impl BootstrapAuthoringTraceSnapshot {
         let after = self.instrumentation;
         let before_instrumentation = before.instrumentation;
         format!(
-            "phases_us={phase_micros:?} replay={replay:?} prepare_transactions={} prepare_head_visits={} author_clones={} author_clone_ops={} stage_clones={} stage_clone_ops={} structural_reuses={} point_reads={} state_read_bytes={} state_written_bytes={} external_flushes={} external_point_reads={} external_range_scans={} scratch_reads={} scratch_read_bytes={} scratch_syncs={} page_identity_lookups={} full_catalog_author_clones={} reference_fallback_reconstructions={} accepted_sequence={} accepted_documents={} visible_document_heads={} detached_manifests={}",
+            "phases_us={phase_micros:?} replay={replay:?} prepare_transactions={} prepare_head_visits={} author_clones={} author_clone_ops={} stage_clones={} stage_clone_ops={} structural_reuses={} point_reads={} state_read_bytes={} state_written_bytes={} external_flushes={} external_point_reads={} external_range_scans={} scratch_reads={} scratch_read_bytes={} scratch_syncs={} block_claim_validation_us={} block_claim_lookup_us={} block_claim_encode_us={} block_claim_insert_us={} page_identity_lookups={} full_catalog_author_clones={} reference_fallback_reconstructions={} accepted_sequence={} accepted_documents={} visible_document_heads={} detached_manifests={}",
             after.prepare_transactions.saturating_sub(before_instrumentation.prepare_transactions),
             after.prepare_document_head_visits.saturating_sub(before_instrumentation.prepare_document_head_visits),
             after.author_snapshot_clones.saturating_sub(before_instrumentation.author_snapshot_clones),
@@ -3910,6 +3911,22 @@ impl BootstrapAuthoringTraceSnapshot {
             after.scratch_page_reads.saturating_sub(before_instrumentation.scratch_page_reads),
             after.scratch_page_bytes_read.saturating_sub(before_instrumentation.scratch_page_bytes_read),
             after.scratch_syncs.saturating_sub(before_instrumentation.scratch_syncs),
+            after
+                .block_claim_validation_nanos
+                .saturating_sub(before_instrumentation.block_claim_validation_nanos)
+                / 1_000,
+            after
+                .block_claim_lookup_nanos
+                .saturating_sub(before_instrumentation.block_claim_lookup_nanos)
+                / 1_000,
+            after
+                .block_claim_encode_nanos
+                .saturating_sub(before_instrumentation.block_claim_encode_nanos)
+                / 1_000,
+            after
+                .block_claim_insert_nanos
+                .saturating_sub(before_instrumentation.block_claim_insert_nanos)
+                / 1_000,
             self.catalog_work
                 .authenticated_page_identity_lookups
                 .saturating_sub(before_catalog_work.authenticated_page_identity_lookups),
@@ -10924,6 +10941,31 @@ impl ShardedHotEngine {
         let mut before_vectors = BTreeMap::<DocumentId, VersionVector>::new();
         let mut before_snapshots = BTreeMap::<DocumentId, SemanticDocumentSnapshot>::new();
         let mut read_only_catalog = AuthorCatalogLookup::default();
+        let mut authenticated_direct_heads = BTreeMap::<DocumentId, BTreeSet<BatchId>>::new();
+        if self.scratch.is_some() && origin == BatchOrigin::BootstrapImport {
+            let document_ids =
+                explicit_bootstrap_author_documents(self.catalog_document_id, transaction);
+            for (document_id, (document, direct_heads, _)) in
+                self.load_external_validation_documents_many(&document_ids)?
+            {
+                document
+                    .document()
+                    .set_peer_id(author.crdt_peer_id.as_u64())
+                    .map_err(loro_error)?;
+                before_vectors.insert(document_id, document.document().oplog_vv());
+                before_snapshots.insert(
+                    document_id,
+                    snapshot_document(
+                        self.catalog_document_id,
+                        document_id,
+                        document.document(),
+                        false,
+                    )?,
+                );
+                authenticated_direct_heads.insert(document_id, direct_heads);
+                working.insert(document_id, document);
+            }
+        }
         for operation in &transaction.operations {
             self.apply_author_operation(
                 &mut working,
@@ -10958,10 +11000,13 @@ impl ShardedHotEngine {
                     .get(document_id)
                     .expect("affected before vector exists"),
             )?;
-            let direct_heads: Vec<_> = self
-                .document_dependency_heads(*document_id, false)?
-                .into_iter()
-                .collect();
+            let direct_heads: Vec<_> = match authenticated_direct_heads.remove(document_id) {
+                Some(heads) => heads.into_iter().collect(),
+                None => self
+                    .document_dependency_heads(*document_id, false)?
+                    .into_iter()
+                    .collect(),
+            };
             let mut work_stats = self.history_work.get();
             work_stats.prepare_document_head_visits = work_stats
                 .prepare_document_head_visits
@@ -15229,6 +15274,59 @@ impl ShardedHotEngine {
         if let Some(store) = &self.scratch {
             let mut documents = BTreeMap::new();
             let mut authenticated_catalog_page_names = None;
+            let lane = if self.is_blocked() {
+                super::document_state::DocumentLane::Terminal
+            } else {
+                super::document_state::DocumentLane::Visible
+            };
+            let exact_requests = frontier
+                .documents()
+                .iter()
+                .filter(|dependencies| {
+                    dependencies.document_id() != self.catalog_document_id
+                        || requested_catalog_page_ids.is_empty()
+                })
+                .map(|dependencies| {
+                    (
+                        dependencies.document_id(),
+                        dependencies.causal_state_digest(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut exact_loaded = super::document_state::load_external_exact_many(
+                store,
+                &self.scratch_roots,
+                lane,
+                &exact_requests,
+            )
+            .map_err(|error| EngineError::Archive(error.to_string()))?;
+            if lane == super::document_state::DocumentLane::Terminal {
+                let missing = exact_loaded
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, loaded)| loaded.is_none().then_some(exact_requests[index]))
+                    .collect::<Vec<_>>();
+                let mut visible = super::document_state::load_external_exact_many(
+                    store,
+                    &self.scratch_roots,
+                    super::document_state::DocumentLane::Visible,
+                    &missing,
+                )
+                .map_err(|error| EngineError::Archive(error.to_string()))?
+                .into_iter();
+                for slot in &mut exact_loaded {
+                    if slot.is_none() {
+                        *slot = visible
+                            .next()
+                            .expect("one visible fallback result per missing terminal point");
+                    }
+                }
+            }
+            let mut exact_loaded = exact_requests
+                .into_iter()
+                .map(|(document_id, _)| document_id)
+                .zip(exact_loaded)
+                .collect::<BTreeMap<_, _>>();
             for dependencies in frontier.documents() {
                 if dependencies.document_id() == self.catalog_document_id
                     && !requested_catalog_page_ids.is_empty()
@@ -15242,29 +15340,9 @@ impl ShardedHotEngine {
                     authenticated_catalog_page_names = Some(page_names);
                     continue;
                 }
-                let lane = if self.is_blocked() {
-                    super::document_state::DocumentLane::Terminal
-                } else {
-                    super::document_state::DocumentLane::Visible
-                };
-                let mut loaded = super::document_state::load_external_exact(
-                    store,
-                    &self.scratch_roots,
-                    lane,
-                    dependencies.document_id(),
-                    dependencies.causal_state_digest(),
-                )
-                .map_err(|error| EngineError::Archive(error.to_string()))?;
-                if loaded.is_none() && lane == super::document_state::DocumentLane::Terminal {
-                    loaded = super::document_state::load_external_exact(
-                        store,
-                        &self.scratch_roots,
-                        super::document_state::DocumentLane::Visible,
-                        dependencies.document_id(),
-                        dependencies.causal_state_digest(),
-                    )
-                    .map_err(|error| EngineError::Archive(error.to_string()))?;
-                }
+                let loaded = exact_loaded
+                    .remove(&dependencies.document_id())
+                    .expect("one batched exact result per frontier document");
                 let Some((record, document, state_work)) = loaded else {
                     return Err(EngineError::FrontierVectorMismatch(
                         dependencies.document_id(),
@@ -15284,6 +15362,8 @@ impl ShardedHotEngine {
                     EngineDocument::External(document),
                 );
             }
+            let current_ids = updates.keys().copied().collect::<Vec<_>>();
+            let current_documents = self.load_external_validation_documents_many(&current_ids)?;
             for (document_id, update) in updates {
                 if documents.contains_key(document_id) {
                     continue;
@@ -15305,20 +15385,10 @@ impl ShardedHotEngine {
                     authenticated_catalog_page_names = Some(page_names);
                     continue;
                 }
-                let current = super::document_state::load_external_current(
-                    store,
-                    &self.scratch_roots,
-                    if self.is_blocked() {
-                        super::document_state::DocumentLane::Terminal
-                    } else {
-                        super::document_state::DocumentLane::Visible
-                    },
-                    *document_id,
-                )
-                .map_err(|error| EngineError::Archive(error.to_string()))?;
-                if let Some((record, _, state_work)) = current {
-                    self.record_document_state_work(state_work);
-                    self.validate_external_record_anchor(*document_id, &record)?;
+                if current_documents
+                    .get(document_id)
+                    .is_some_and(|(_, _, present)| *present)
+                {
                     return Err(EngineError::FrontierVectorMismatch(*document_id));
                 }
                 documents.insert(
@@ -15331,6 +15401,7 @@ impl ShardedHotEngine {
             }
             return Ok(Some(CurrentFrontierDocuments {
                 documents,
+                current_documents,
                 authenticated_catalog_page_names,
             }));
         }
@@ -15362,6 +15433,7 @@ impl ShardedHotEngine {
         }
         Ok(Some(CurrentFrontierDocuments {
             documents,
+            current_documents: BTreeMap::new(),
             authenticated_catalog_page_names: None,
         }))
     }
@@ -15465,6 +15537,7 @@ impl ShardedHotEngine {
             .collect::<Vec<_>>();
         let CurrentFrontierDocuments {
             documents: mut before,
+            current_documents: mut preloaded_current_documents,
             authenticated_catalog_page_names,
         } = match self.current_frontier_documents(
             &frontier,
@@ -15480,6 +15553,7 @@ impl ShardedHotEngine {
                         (document_id, EngineDocument::InMemory(document))
                     })
                     .collect(),
+                current_documents: BTreeMap::new(),
                 authenticated_catalog_page_names: None,
             },
             None => {
@@ -15668,7 +15742,13 @@ impl ShardedHotEngine {
                         .then(|| hot_heads.cloned().unwrap_or_default()),
                 )
             } else if self.scratch.is_some() {
-                let (document, heads) = self.load_external_validation_document(*document_id)?;
+                let (document, heads, _) = preloaded_current_documents
+                    .remove(document_id)
+                    .ok_or_else(|| {
+                        EngineError::Archive(
+                            "batched current document evidence is unexpectedly unavailable".into(),
+                        )
+                    })?;
                 (Some(document), Some(heads))
             } else {
                 let current = self.clone_validation_document(*document_id, 1)?;
@@ -18037,6 +18117,82 @@ impl ShardedHotEngine {
         ))
     }
 
+    fn load_external_validation_documents_many(
+        &self,
+        document_ids: &[DocumentId],
+    ) -> Result<BTreeMap<DocumentId, (EngineDocument, BTreeSet<BatchId>, bool)>, EngineError> {
+        let store = self
+            .scratch
+            .as_ref()
+            .expect("external validation requires scratch");
+        let lane = if self.is_blocked() {
+            super::document_state::DocumentLane::Terminal
+        } else {
+            super::document_state::DocumentLane::Visible
+        };
+        #[cfg(test)]
+        for document_id in document_ids {
+            self.record_current_catalog_load(*document_id);
+        }
+        let mut loaded = super::document_state::load_external_current_many(
+            store,
+            &self.scratch_roots,
+            lane,
+            document_ids,
+        )
+        .map_err(|error| EngineError::Archive(error.to_string()))?;
+        if lane == super::document_state::DocumentLane::Terminal {
+            let missing = loaded
+                .iter()
+                .enumerate()
+                .filter_map(|(index, loaded)| loaded.is_none().then_some(document_ids[index]))
+                .collect::<Vec<_>>();
+            let mut visible = super::document_state::load_external_current_many(
+                store,
+                &self.scratch_roots,
+                super::document_state::DocumentLane::Visible,
+                &missing,
+            )
+            .map_err(|error| EngineError::Archive(error.to_string()))?
+            .into_iter();
+            for slot in &mut loaded {
+                if slot.is_none() {
+                    *slot = visible
+                        .next()
+                        .expect("one visible fallback result per missing terminal point");
+                }
+            }
+        }
+        document_ids
+            .iter()
+            .copied()
+            .zip(loaded)
+            .map(|(document_id, loaded)| {
+                if let Some((record, document, state_work)) = loaded {
+                    self.record_document_state_work(state_work);
+                    self.validate_external_record_anchor(document_id, &record)?;
+                    let heads = record.exact_direct_heads().iter().copied().collect();
+                    Ok((
+                        document_id,
+                        (EngineDocument::External(document), heads, true),
+                    ))
+                } else {
+                    Ok((
+                        document_id,
+                        (
+                            EngineDocument::External(
+                                super::document_state::ExternalDocument::empty(Arc::clone(store))
+                                    .map_err(|error| EngineError::Archive(error.to_string()))?,
+                            ),
+                            BTreeSet::new(),
+                            false,
+                        ),
+                    ))
+                }
+            })
+            .collect()
+    }
+
     fn validate_external_record_anchor(
         &self,
         document_id: DocumentId,
@@ -19881,6 +20037,47 @@ fn affected_projection_pages(effect: &SemanticEffect) -> BTreeSet<PageId> {
         pages.insert(delta.page_id);
     }
     pages
+}
+
+fn explicit_bootstrap_author_documents(
+    catalog_document_id: DocumentId,
+    transaction: &OperationTransaction,
+) -> Vec<DocumentId> {
+    let mut documents = BTreeSet::new();
+    for operation in &transaction.operations {
+        match operation {
+            SemanticOperation::CreatePage {
+                home_document_id, ..
+            } => {
+                documents.insert(catalog_document_id);
+                documents.insert(*home_document_id);
+            }
+            SemanticOperation::EditPagePath { .. }
+            | SemanticOperation::SetPageKind { .. }
+            | SemanticOperation::DeletePage { .. }
+            | SemanticOperation::ReconcileExternalPageState { .. } => {
+                documents.insert(catalog_document_id);
+            }
+            SemanticOperation::CreateBlock { block, .. }
+            | SemanticOperation::EditBlockContent { block, .. }
+            | SemanticOperation::MutateBlockLogseqIdentity { block, .. } => {
+                documents.insert(block.home_document_id);
+            }
+            SemanticOperation::RenamePagesAndRewriteReferrers { block_rewrites, .. } => {
+                documents.insert(catalog_document_id);
+                documents.extend(
+                    block_rewrites
+                        .iter()
+                        .map(|rewrite| rewrite.block.home_document_id),
+                );
+            }
+            SemanticOperation::SetPagePreamble { .. }
+            | SemanticOperation::MoveSubtree { .. }
+            | SemanticOperation::ReorderBlock { .. }
+            | SemanticOperation::DeleteSubtree { .. } => {}
+        }
+    }
+    documents.into_iter().collect()
 }
 
 fn projection_requirements(
