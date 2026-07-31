@@ -2,30 +2,27 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
-#[cfg(unix)]
-use std::os::fd::{AsRawFd, FromRawFd};
-#[cfg(windows)]
-use std::os::windows::fs::MetadataExt as _;
-#[cfg(windows)]
-use std::os::windows::io::AsRawHandle as _;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-#[cfg(windows)]
-use cap_fs_ext::OsMetadataExt as _;
-use cap_std::fs::{Dir, OpenOptions};
+use cap_std::fs::Dir;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::{BatchId, ContentDigest, WorkspaceId};
 
-pub(crate) const SCRATCH_DIR: &str = "engine-scratch-v2";
-const MARKER_FILE: &str = "marker";
-const LEASE_FILE: &str = "lease";
-const PAGES_FILE: &str = "pages.index";
-const BLOBS_FILE: &str = "blobs.data";
-pub(crate) const SCRATCH_SCHEMA_VERSION: u32 = 13;
+pub(crate) const SCRATCH_DIR: &str = tine_storage::SCRATCH_DIR;
+#[cfg(test)]
+const MARKER_FILE: &str = tine_storage::SCRATCH_MARKER_FILE;
+#[cfg(test)]
+const LEASE_FILE: &str = tine_storage::SCRATCH_LEASE_FILE;
+#[cfg(test)]
+const PAGES_FILE: &str = tine_storage::SCRATCH_PAGES_FILE;
+#[cfg(test)]
+const BLOBS_FILE: &str = tine_storage::SCRATCH_BLOBS_FILE;
+#[cfg(test)]
+pub(crate) const SCRATCH_SCHEMA_VERSION: u32 = tine_storage::SCRATCH_SCHEMA_VERSION;
 const SCRATCH_PAGE_SCHEMA_VERSION: u32 = 1;
 const SCRATCH_LSM_LEVELS: usize = 32;
 const ACCEPTED_SEQUENCE_SCHEMA_VERSION: u32 = 1;
@@ -48,7 +45,6 @@ pub(crate) const AUTHENTICATED_POINT_MAX_IO_PER_MUTATION: usize =
     8 * (AUTHENTICATED_POINT_MAX_DEPTH + 1);
 const CURRENT_FILTER_WORDS: usize = 16_384;
 const MAX_COVERED_BLOB_DEDUP_ROOTS: usize = 256;
-const MAX_MARKER_BYTES: u64 = 4 * 1024;
 /// Expected bound on the retained runs one workspace holds after a complete
 /// reachability pass converges.
 ///
@@ -100,17 +96,6 @@ struct ScratchCounters {
     // This deliberately has no increment site. Any future scratch sync must
     // become visible to the normal-flow regression gates.
     scratch_syncs: AtomicUsize,
-    stale_runs_reclaimed: AtomicUsize,
-    live_runs_skipped: AtomicUsize,
-    /// Retained runs an ordinary reclamation pass observed and deliberately
-    /// left intact. This is the deterministic counter that proves reclamation
-    /// never silently deletes adoptable state.
-    retained_runs_preserved: AtomicUsize,
-    /// Sibling entries a reclamation pass could not authenticate or classify,
-    /// and therefore preserved untouched. This is the deterministic counter
-    /// that proves an unclassifiable sibling is skipped rather than deleted or
-    /// allowed to veto the caller's own fresh run.
-    unclassified_runs_preserved: AtomicUsize,
 }
 
 #[derive(Debug)]
@@ -235,10 +220,7 @@ impl ScratchCounters {
             point_reads: self.point_reads.load(Ordering::Relaxed),
             range_reads: self.range_reads.load(Ordering::Relaxed),
             scratch_syncs: self.scratch_syncs.load(Ordering::Relaxed),
-            stale_runs_reclaimed: self.stale_runs_reclaimed.load(Ordering::Relaxed),
-            live_runs_skipped: self.live_runs_skipped.load(Ordering::Relaxed),
-            retained_runs_preserved: self.retained_runs_preserved.load(Ordering::Relaxed),
-            unclassified_runs_preserved: self.unclassified_runs_preserved.load(Ordering::Relaxed),
+            ..ScratchStats::default()
         }
     }
 }
@@ -249,6 +231,7 @@ impl ScratchCounters {
 /// durable property of its own bytes rather than caller-asserted or path-derived
 /// state. It is deliberately not an ambient registry: only the exact directory
 /// capability plus this marker can classify a run.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 enum ScratchRetention {
@@ -266,6 +249,7 @@ enum ScratchRetention {
 /// Schema-13 durable run marker.
 ///
 /// There is no legacy decode path: schema-12 bytes are rejected, never migrated.
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ScratchRunMarkerV3 {
@@ -292,28 +276,6 @@ pub(crate) fn rewrite_retained_run_marker_schema_for_test(
     let rewritten = encode_canonical(&marker).unwrap();
     fs::write(marker_path, &rewritten).unwrap();
     rewritten
-}
-
-/// What one reclamation pass proved about one sibling scratch run.
-///
-/// Only `Reclaimed` unlinks bytes, and it is reachable only from a complete
-/// authentication of that run's own marker, entry set, and free lease.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum StaleRunDisposition {
-    /// The reclaiming store's own run.
-    OwnRun,
-    /// Authenticated ephemeral run of this workspace whose lease was free. Its
-    /// bytes were removed.
-    Reclaimed,
-    /// Authenticated run whose exclusive lease another owner still holds.
-    LivePreserved,
-    /// Authenticated adoptable run.
-    RetainedPreserved,
-    /// Could not be authenticated or classified: absent, torn, old-schema,
-    /// foreign, or unreadable marker; incomplete or stray entry set; a
-    /// non-directory or non-UTF-8 name; or an ordinary per-run I/O error.
-    /// Its bytes are preserved untouched.
-    Unclassified,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -945,13 +907,7 @@ pub(crate) struct ScratchRoots {
 /// The authoritative archive is not reachable through this type. All removal
 /// is capability-relative beneath the exact scratch namespace.
 pub(crate) struct ScratchStore {
-    namespace: Dir,
-    run: Dir,
-    run_name: String,
-    marker: ScratchRunMarkerV3,
-    lease: fs::File,
-    pages: Mutex<fs::File>,
-    blobs: Mutex<fs::File>,
+    physical: tine_storage::ScratchRun<WorkspaceId>,
     counters: Arc<ScratchCounters>,
     document_current_filter: Mutex<FixedPointFilter>,
     blob_dedup_filter: Mutex<CoveredBlobDedupFilter>,
@@ -960,8 +916,7 @@ pub(crate) struct ScratchStore {
 impl fmt::Debug for ScratchStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ScratchStore")
-            .field("run_name", &self.run_name)
-            .field("workspace_id", &self.marker.workspace_id)
+            .field("physical", &self.physical)
             .finish_non_exhaustive()
     }
 }
@@ -971,11 +926,12 @@ impl ScratchStore {
         archive_capability: &Dir,
         workspace_id: WorkspaceId,
     ) -> Result<Self, ScratchError> {
-        Self::create_run(
+        let physical = tine_storage::ScratchRun::create_ephemeral_observed(
             archive_capability,
             workspace_id,
-            ScratchRetention::Ephemeral,
-        )
+            observe_scratch_construction,
+        )?;
+        Ok(Self::from_physical(physical, false))
     }
 
     /// Create a fresh adoptable run beneath the same directory capability.
@@ -987,7 +943,12 @@ impl ScratchStore {
         archive_capability: &Dir,
         workspace_id: WorkspaceId,
     ) -> Result<Self, ScratchError> {
-        Self::create_run(archive_capability, workspace_id, ScratchRetention::Retained)
+        let physical = tine_storage::ScratchRun::create_retained_observed(
+            archive_capability,
+            workspace_id,
+            observe_scratch_construction,
+        )?;
+        Ok(Self::from_physical(physical, false))
     }
 
     /// Clone one live retained run into another capability while preserving
@@ -1004,155 +965,24 @@ impl ScratchStore {
         &self,
         archive_capability: &Dir,
     ) -> Result<Self, ScratchError> {
-        if self.marker.retention != ScratchRetention::Retained {
-            return Err(ScratchError::UnsafeEntry(
-                "scratch migration source is not retained".into(),
-            ));
-        }
-        super::object_store::ensure_directory_nofollow(archive_capability, SCRATCH_DIR)?;
-        let namespace = super::object_store::open_dir_nofollow(archive_capability, SCRATCH_DIR)?;
-        let run_name = format!("run-{}", self.run_id());
-        namespace.create_dir(&run_name)?;
-        let construction = (|| {
-            super::object_store::sync_dir_required(&namespace)?;
-            let run = super::object_store::open_dir_nofollow(&namespace, &run_name)?;
-            write_new_regular(&run, MARKER_FILE, &encode_canonical(&self.marker)?)?;
-            let lease = create_new_regular(&run, LEASE_FILE)?;
-            lock_exclusive_nonblocking(&lease)?
-                .then_some(())
-                .ok_or_else(|| {
-                    ScratchError::UnsafeEntry("migrated scratch lease was already locked".into())
-                })?;
-            let pages = create_new_regular(&run, PAGES_FILE)?;
-            let blobs = create_new_regular(&run, BLOBS_FILE)?;
-            let migrated = Self {
-                namespace: namespace.try_clone()?,
-                run,
-                run_name: run_name.clone(),
-                marker: self.marker.clone(),
-                lease,
-                pages: Mutex::new(pages),
-                blobs: Mutex::new(blobs),
-                counters: Arc::new(ScratchCounters::default()),
-                document_current_filter: Mutex::new(FixedPointFilter::saturated()),
-                blob_dedup_filter: Mutex::new(CoveredBlobDedupFilter::default()),
-            };
-            migrated.copy_exact_from(self)?;
-            Ok(migrated)
-        })();
-        match construction {
-            Ok(migrated) => Ok(migrated),
-            Err(error) => {
-                remove_partial_own_run(&namespace, &run_name);
-                Err(error)
-            }
-        }
+        let physical = self.physical.clone_retained_into(archive_capability)?;
+        Ok(Self::from_physical(physical, true))
     }
 
-    /// Construct one fresh run transactionally from the namespace's viewpoint.
-    ///
-    /// Once the run directory exists, every later failure removes exactly that
-    /// directory before returning the original error, so a fallible open, write,
-    /// lock, or durability step can never publish a partially constructed run
-    /// into the shared namespace. The removal is capability-relative and named:
-    /// a sibling run is unreachable from it.
-    fn create_run(
-        archive_capability: &Dir,
-        workspace_id: WorkspaceId,
-        retention: ScratchRetention,
-    ) -> Result<Self, ScratchError> {
-        super::object_store::ensure_directory_nofollow(archive_capability, SCRATCH_DIR)?;
-        let namespace = super::object_store::open_dir_nofollow(archive_capability, SCRATCH_DIR)?;
-        let run_id = Uuid::new_v4();
-        let run_name = format!("run-{run_id}");
-        // The run directory must be minted by this exact call. `create_dir`
-        // fails closed on any pre-existing entry, including a symlink, so the
-        // cleanup below can only ever remove a directory this construction
-        // created and never an existing sibling.
-        namespace.create_dir(&run_name)?;
-        let construction =
-            Self::construct_own_run(&namespace, &run_name, run_id, workspace_id, retention);
-        let store = match construction {
-            Ok(store) => store,
-            Err(error) => {
-                remove_partial_own_run(&namespace, &run_name);
-                return Err(error);
-            }
-        };
-        // Reclamation is opportunistic garbage collection of disposable
-        // sibling state. It is infallible by construction and carries no veto
-        // over this fresh run.
-        store.reclaim_stale_runs();
-        #[cfg(test)]
-        if let Err(error) = inject_create_run_fault(ScratchCreateBoundary::AfterReclaim) {
-            // The identity was never returned to a caller and the run holds no
-            // data yet, so removing it cannot orphan adoptable bytes.
-            store.cleanup_own_run();
-            return Err(error);
-        }
-        Ok(store)
-    }
-
-    /// Everything after the run directory exists. Every fallible step here is
-    /// covered by the caller's removal of that exact run.
-    fn construct_own_run(
-        namespace: &Dir,
-        run_name: &str,
-        run_id: Uuid,
-        workspace_id: WorkspaceId,
-        retention: ScratchRetention,
-    ) -> Result<Self, ScratchError> {
-        #[cfg(test)]
-        inject_create_run_fault(ScratchCreateBoundary::AfterRunDirectory)?;
-        super::object_store::sync_dir_required(namespace)?;
-        #[cfg(test)]
-        inject_create_run_fault(ScratchCreateBoundary::AfterNamespaceSync)?;
-        let run = super::object_store::open_dir_nofollow(namespace, run_name)?;
-        #[cfg(test)]
-        inject_create_run_fault(ScratchCreateBoundary::AfterRunOpen)?;
-        let nonce_a = Uuid::new_v4();
-        let nonce_b = Uuid::new_v4();
-        let mut random_owner_nonce = [0_u8; 32];
-        random_owner_nonce[..16].copy_from_slice(nonce_a.as_bytes());
-        random_owner_nonce[16..].copy_from_slice(nonce_b.as_bytes());
-        let marker = ScratchRunMarkerV3 {
-            schema_version: SCRATCH_SCHEMA_VERSION,
-            workspace_id,
-            run_id,
-            retention,
-            random_owner_nonce,
-        };
-        write_new_regular(&run, MARKER_FILE, &encode_canonical(&marker)?)?;
-        #[cfg(test)]
-        inject_create_run_fault(ScratchCreateBoundary::AfterMarkerWrite)?;
-        let lease = create_new_regular(&run, LEASE_FILE)?;
-        #[cfg(test)]
-        inject_create_run_fault(ScratchCreateBoundary::AfterLeaseCreate)?;
-        lock_exclusive_nonblocking(&lease)?
-            .then_some(())
-            .ok_or_else(|| {
-                ScratchError::UnsafeEntry("new scratch lease was already locked".into())
-            })?;
-        #[cfg(test)]
-        inject_create_run_fault(ScratchCreateBoundary::AfterLeaseLock)?;
-        let pages = create_new_regular(&run, PAGES_FILE)?;
-        #[cfg(test)]
-        inject_create_run_fault(ScratchCreateBoundary::AfterPagesCreate)?;
-        let blobs = create_new_regular(&run, BLOBS_FILE)?;
-        #[cfg(test)]
-        inject_create_run_fault(ScratchCreateBoundary::AfterBlobsCreate)?;
-        Ok(Self {
-            namespace: namespace.try_clone()?,
-            run,
-            run_name: run_name.to_owned(),
-            marker,
-            lease,
-            pages: Mutex::new(pages),
-            blobs: Mutex::new(blobs),
+    fn from_physical(
+        physical: tine_storage::ScratchRun<WorkspaceId>,
+        saturated_filter: bool,
+    ) -> Self {
+        Self {
+            physical,
             counters: Arc::new(ScratchCounters::default()),
-            document_current_filter: Mutex::new(FixedPointFilter::default()),
+            document_current_filter: Mutex::new(if saturated_filter {
+                FixedPointFilter::saturated()
+            } else {
+                FixedPointFilter::default()
+            }),
             blob_dedup_filter: Mutex::new(CoveredBlobDedupFilter::default()),
-        })
+        }
     }
 
     /// Adopt the retained run with exactly this run identity.
@@ -1167,100 +997,61 @@ impl ScratchStore {
         workspace_id: WorkspaceId,
         run_id: Uuid,
     ) -> Result<Self, ScratchError> {
-        let namespace = super::object_store::open_dir_nofollow(archive_capability, SCRATCH_DIR)?;
-        let run_name = format!("run-{run_id}");
-        // Reject a non-canonical identity spelling before it can name a
-        // directory; `open_dir_nofollow` then rejects a symlinked alias.
-        if parse_run_name(&run_name)? != run_id {
-            return Err(ScratchError::MalformedMarker(run_name));
-        }
-        let run = super::object_store::open_dir_nofollow(&namespace, &run_name)?;
-
-        // Take the exact existing exclusive run lease first, so every later
-        // validation observes a run no other owner may be mutating. A failed
-        // validation drops this file and releases the lock.
-        let lease = open_regular_read_write_nofollow(&run, LEASE_FILE)?;
-        if !lock_exclusive_nonblocking(&lease)? {
-            return Err(ScratchError::UnsafeEntry(format!(
-                "retained scratch run {run_name:?} is still leased"
-            )));
-        }
-
-        let marker_bytes = read_regular_nofollow(&run, MARKER_FILE, MAX_MARKER_BYTES)?;
-        let marker: ScratchRunMarkerV3 = decode_canonical(&marker_bytes)?;
-        if marker.schema_version != SCRATCH_SCHEMA_VERSION
-            || marker.workspace_id != workspace_id
-            || marker.run_id != run_id
-            || marker.retention != ScratchRetention::Retained
-        {
-            return Err(ScratchError::MalformedMarker(run_name));
-        }
-        validate_run_entries(&run)?;
-
-        // Opened read-write with no create, truncate, or replacement publication:
-        // existing page and blob bytes remain exactly as the previous owner left
-        // them, and later appends land after them.
-        let pages = open_regular_read_write_nofollow(&run, PAGES_FILE)?;
-        let blobs = open_regular_read_write_nofollow(&run, BLOBS_FILE)?;
-
-        // This process never observed the inserts behind the adopted bytes, so
-        // the document-current negative filter must not answer "absent". The
-        // covered blob-dedup filter is already fail-closed for unseen roots: it
-        // recognizes only exact roots reached from a covered parent, and an
-        // adopted root is not one.
-        Ok(Self {
-            namespace,
-            run,
-            run_name,
-            marker,
-            lease,
-            pages: Mutex::new(pages),
-            blobs: Mutex::new(blobs),
-            counters: Arc::new(ScratchCounters::default()),
-            document_current_filter: Mutex::new(FixedPointFilter::saturated()),
-            blob_dedup_filter: Mutex::new(CoveredBlobDedupFilter::default()),
-        })
+        let physical =
+            tine_storage::ScratchRun::adopt_retained(archive_capability, workspace_id, run_id)?;
+        Ok(Self::from_physical(physical, true))
     }
 
     pub(crate) const fn run_id(&self) -> Uuid {
-        self.marker.run_id
+        self.physical.run_id()
     }
 
     #[cfg(test)]
-    const fn retention(&self) -> ScratchRetention {
-        self.marker.retention
+    fn retention(&self) -> ScratchRetention {
+        match self.physical.retention() {
+            tine_storage::ScratchRetention::Ephemeral => ScratchRetention::Ephemeral,
+            tine_storage::ScratchRetention::Retained => ScratchRetention::Retained,
+        }
     }
 
     pub(crate) fn stats(&self) -> ScratchStats {
-        self.counters.snapshot()
+        let lifecycle = self.physical.lifecycle_stats();
+        ScratchStats {
+            stale_runs_reclaimed: lifecycle.stale_runs_reclaimed,
+            live_runs_skipped: lifecycle.live_runs_skipped,
+            retained_runs_preserved: lifecycle.retained_runs_preserved,
+            unclassified_runs_preserved: lifecycle.unclassified_runs_preserved,
+            ..self.counters.snapshot()
+        }
     }
 
     pub(crate) const fn workspace_id(&self) -> WorkspaceId {
-        self.marker.workspace_id
+        *self.physical.owner()
     }
 
     #[cfg(test)]
     pub(crate) fn truncate_pages_for_test(&self) {
-        self.pages
-            .lock()
-            .expect("scratch pages lock")
-            .set_len(0)
-            .expect("truncate scratch pages");
+        self.physical
+            .with_pages(|pages| pages.set_len(0).expect("truncate scratch pages"))
+            .expect("scratch pages lock");
     }
 
     #[cfg(test)]
     pub(crate) fn tamper_page_byte_for_test(&self, offset: u64) {
-        let mut pages = self.pages.lock().expect("scratch pages lock");
-        pages
-            .seek(SeekFrom::Start(offset))
-            .expect("seek scratch page");
-        let mut byte = [0_u8; 1];
-        pages.read_exact(&mut byte).expect("read scratch page byte");
-        byte[0] ^= 0x80;
-        pages
-            .seek(SeekFrom::Start(offset))
-            .expect("seek scratch page");
-        pages.write_all(&byte).expect("tamper scratch page byte");
+        self.physical
+            .with_pages(|pages| {
+                pages
+                    .seek(SeekFrom::Start(offset))
+                    .expect("seek scratch page");
+                let mut byte = [0_u8; 1];
+                pages.read_exact(&mut byte).expect("read scratch page byte");
+                byte[0] ^= 0x80;
+                pages
+                    .seek(SeekFrom::Start(offset))
+                    .expect("seek scratch page");
+                pages.write_all(&byte).expect("tamper scratch page byte");
+            })
+            .expect("scratch pages lock");
     }
 
     #[cfg(test)]
@@ -1282,67 +1073,11 @@ impl ScratchStore {
     }
 
     pub(crate) fn binding_digest(&self) -> Result<ContentDigest, ScratchError> {
-        Ok(ContentDigest::of(&encode_canonical(&self.marker)?))
-    }
-
-    /// Copy the exact run-local byte address space from another exclusively
-    /// owned scratch run into this newly-created empty run.
-    ///
-    /// Scratch roots contain file offsets, so this is deliberately a raw,
-    /// prefix-preserving migration rather than a logical rewrite. Both stores
-    /// remain leased for the whole copy. The destination must be empty and the
-    /// workspace must match; a partial copy is never returned to an engine.
-    pub(super) fn copy_exact_from(&self, source: &Self) -> Result<(), ScratchError> {
-        if self.workspace_id() != source.workspace_id()
-            || self.marker != source.marker
-            || self.binding_digest()? != source.binding_digest()?
-        {
-            return Err(ScratchError::UnsafeEntry(
-                "scratch migration source and destination identity mismatch".into(),
-            ));
-        }
-
-        fn copy_file(
-            source: &Mutex<fs::File>,
-            destination: &Mutex<fs::File>,
-        ) -> Result<(), ScratchError> {
-            let mut source = source.lock().map_err(|_| ScratchError::Poisoned)?;
-            let mut destination = destination.lock().map_err(|_| ScratchError::Poisoned)?;
-            if destination.metadata()?.len() != 0 {
-                return Err(ScratchError::UnsafeEntry(
-                    "scratch migration destination is not empty".into(),
-                ));
-            }
-            source.seek(SeekFrom::Start(0))?;
-            destination.seek(SeekFrom::Start(0))?;
-            let expected = source.metadata()?.len();
-            let copied = std::io::copy(&mut *source, &mut *destination)?;
-            if copied != expected || destination.metadata()?.len() != expected {
-                return Err(ScratchError::UnsafeEntry(
-                    "scratch migration did not copy the exact byte extent".into(),
-                ));
-            }
-            Ok(())
-        }
-
-        copy_file(&source.pages, &self.pages)?;
-        copy_file(&source.blobs, &self.blobs)?;
-        // A migrated store did not observe the inserts behind the copied
-        // bytes, exactly like an adopted store. Its negative cache must
-        // therefore fail toward a real authenticated read.
-        *self
-            .document_current_filter
-            .lock()
-            .map_err(|_| ScratchError::Poisoned)? = FixedPointFilter::saturated();
-        Ok(())
+        self.physical.binding_digest().map_err(Into::into)
     }
 
     pub(crate) fn clone_pages_file(&self) -> Result<fs::File, ScratchError> {
-        self.pages
-            .lock()
-            .map_err(|_| ScratchError::Poisoned)?
-            .try_clone()
-            .map_err(Into::into)
+        self.physical.clone_pages_file().map_err(Into::into)
     }
 
     pub(crate) fn insert_many(
@@ -2697,9 +2432,13 @@ impl ScratchStore {
         }
         let digest = ContentDigest::of(bytes);
         let encoded_len = u32::try_from(bytes.len()).map_err(|_| ScratchError::MalformedBlob)?;
-        let mut file = self.blobs.lock().map_err(|_| ScratchError::Poisoned)?;
-        let offset = file.seek(SeekFrom::End(0))?;
-        file.write_all(bytes)?;
+        let offset = self
+            .physical
+            .with_blobs(|file| -> Result<_, ScratchError> {
+                let offset = file.seek(SeekFrom::End(0))?;
+                file.write_all(bytes)?;
+                Ok(offset)
+            })??;
         self.counters.blob_writes.fetch_add(1, Ordering::Relaxed);
         self.counters
             .blob_bytes_written
@@ -2718,10 +2457,12 @@ impl ScratchStore {
             return Err(ScratchError::MalformedBlob);
         }
         let mut bytes = vec![0_u8; length];
-        let mut file = self.blobs.lock().map_err(|_| ScratchError::Poisoned)?;
-        file.seek(SeekFrom::Start(blob_ref.offset))?;
-        file.read_exact(&mut bytes)
-            .map_err(|_| ScratchError::MalformedBlob)?;
+        self.physical
+            .with_blobs(|file| -> Result<_, ScratchError> {
+                file.seek(SeekFrom::Start(blob_ref.offset))?;
+                file.read_exact(&mut bytes)
+                    .map_err(|_| ScratchError::MalformedBlob)
+            })??;
         if ContentDigest::of(&bytes) != blob_ref.digest {
             return Err(ScratchError::BlobDigestMismatch(blob_ref.digest));
         }
@@ -2756,9 +2497,13 @@ impl ScratchStore {
         }
         let digest = ContentDigest::of(&bytes);
         let encoded_len = u32::try_from(bytes.len()).map_err(|_| ScratchError::MalformedPage)?;
-        let mut file = self.pages.lock().map_err(|_| ScratchError::Poisoned)?;
-        let offset = file.seek(SeekFrom::End(0))?;
-        file.write_all(&bytes)?;
+        let offset = self
+            .physical
+            .with_pages(|file| -> Result<_, ScratchError> {
+                let offset = file.seek(SeekFrom::End(0))?;
+                file.write_all(&bytes)?;
+                Ok(offset)
+            })??;
         self.counters.page_writes.fetch_add(1, Ordering::Relaxed);
         self.counters
             .page_bytes_written
@@ -2787,10 +2532,12 @@ impl ScratchStore {
             return Err(ScratchError::MalformedPage);
         }
         let mut bytes = vec![0_u8; length];
-        let mut file = self.pages.lock().map_err(|_| ScratchError::Poisoned)?;
-        file.seek(SeekFrom::Start(page_ref.offset))?;
-        file.read_exact(&mut bytes)
-            .map_err(|_| ScratchError::MalformedPage)?;
+        self.physical
+            .with_pages(|file| -> Result<_, ScratchError> {
+                file.seek(SeekFrom::Start(page_ref.offset))?;
+                file.read_exact(&mut bytes)
+                    .map_err(|_| ScratchError::MalformedPage)
+            })??;
         if ContentDigest::of(&bytes) != page_ref.digest {
             return Err(ScratchError::PageDigestMismatch(page_ref.digest));
         }
@@ -3189,111 +2936,6 @@ impl ScratchStore {
             return Err(ScratchError::PageBindingMismatch);
         }
         Ok(node)
-    }
-
-    /// Opportunistic reclamation of sibling scratch runs.
-    ///
-    /// This is garbage collection of disposable, reconstructible run-local
-    /// state, never a gate on the caller's own fresh run, so it is infallible
-    /// by construction: a sibling this pass cannot authenticate has no veto
-    /// over creating a new run.
-    ///
-    /// A sibling is removed only when its own durable marker authenticates it
-    /// as an ephemeral run of this exact workspace, its entry set is complete,
-    /// and its exclusive lease is free. Every other outcome preserves the
-    /// sibling's bytes exactly and is counted instead.
-    fn reclaim_stale_runs(&self) {
-        let Ok(entries) = self.namespace.entries() else {
-            // The namespace itself could not be enumerated. Nothing is proved
-            // about any sibling, so nothing is removed.
-            self.counters
-                .unclassified_runs_preserved
-                .fetch_add(1, Ordering::Relaxed);
-            return;
-        };
-        for entry in entries {
-            let disposition = entry
-                .map_err(ScratchError::from)
-                .and_then(|entry| self.reclaim_sibling_run(&entry))
-                .unwrap_or(StaleRunDisposition::Unclassified);
-            let counter = match disposition {
-                StaleRunDisposition::OwnRun => continue,
-                StaleRunDisposition::Reclaimed => &self.counters.stale_runs_reclaimed,
-                StaleRunDisposition::LivePreserved => &self.counters.live_runs_skipped,
-                StaleRunDisposition::RetainedPreserved => &self.counters.retained_runs_preserved,
-                StaleRunDisposition::Unclassified => &self.counters.unclassified_runs_preserved,
-            };
-            counter.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    /// Classify exactly one sibling entry, reclaiming it only when its own
-    /// bytes prove that is safe.
-    ///
-    /// Every `Err` here means "not proved safe to touch": the caller converts
-    /// it into [`StaleRunDisposition::Unclassified`], which preserves the
-    /// sibling untouched. Errors are deliberately not propagated to the caller
-    /// of `ScratchStore::open`.
-    fn reclaim_sibling_run(
-        &self,
-        entry: &cap_std::fs::DirEntry,
-    ) -> Result<StaleRunDisposition, ScratchError> {
-        let name = entry
-            .file_name()
-            .to_str()
-            .ok_or_else(|| ScratchError::UnsafeEntry("non-UTF-8 scratch run".into()))?
-            .to_owned();
-        if name == self.run_name {
-            return Ok(StaleRunDisposition::OwnRun);
-        }
-        #[cfg(test)]
-        inject_sibling_inspection_fault()?;
-        let run_id = parse_run_name(&name)?;
-        require_real_directory(entry, &name)?;
-        let run = super::object_store::open_dir_nofollow(&self.namespace, &name)?;
-        let marker_bytes = read_regular_nofollow(&run, MARKER_FILE, MAX_MARKER_BYTES)?;
-        let marker: ScratchRunMarkerV3 = decode_canonical(&marker_bytes)?;
-        if marker.schema_version != SCRATCH_SCHEMA_VERSION
-            || marker.workspace_id != self.marker.workspace_id
-            || marker.run_id != run_id
-        {
-            return Err(ScratchError::MalformedMarker(name));
-        }
-        validate_run_entries(&run)?;
-        if marker.retention == ScratchRetention::Retained {
-            // Ordinary reclamation carries no authority to discard adoptable
-            // state: opening a fresh run proves nothing about which retained
-            // runs a resume point still reaches. Collecting an orphan is
-            // `reclaim_unreachable_retained_runs`, which the caller invokes
-            // with a complete authenticated reachability proof.
-            return Ok(StaleRunDisposition::RetainedPreserved);
-        }
-        let lease = open_regular_read_write_nofollow(&run, LEASE_FILE)?;
-        if !lock_exclusive_nonblocking(&lease)? {
-            return Ok(StaleRunDisposition::LivePreserved);
-        }
-        remove_stale_run(&self.namespace, &run, &name, lease)?;
-        Ok(StaleRunDisposition::Reclaimed)
-    }
-
-    fn cleanup_own_run(&self) {
-        for name in [PAGES_FILE, BLOBS_FILE, MARKER_FILE] {
-            let _ = self.run.remove_file(name);
-        }
-        unlock(&self.lease);
-        let _ = self.run.remove_file(LEASE_FILE);
-        let _ = self.namespace.remove_dir(&self.run_name);
-    }
-}
-
-impl Drop for ScratchStore {
-    fn drop(&mut self) {
-        match self.marker.retention {
-            ScratchRetention::Ephemeral => self.cleanup_own_run(),
-            // Release only the exclusive lease. Every marker, page, blob, and
-            // index byte stays exactly as written so the run stays adoptable.
-            ScratchRetention::Retained => unlock(&self.lease),
-        }
     }
 }
 
@@ -3821,95 +3463,6 @@ fn validate_segment(segment: &ScratchSegment) -> Result<(), ScratchError> {
     Ok(())
 }
 
-fn parse_run_name(name: &str) -> Result<Uuid, ScratchError> {
-    let suffix = name
-        .strip_prefix("run-")
-        .ok_or_else(|| ScratchError::UnsafeEntry(format!("unknown scratch entry {name:?}")))?;
-    let run_id = Uuid::parse_str(suffix)
-        .map_err(|_| ScratchError::UnsafeEntry(format!("malformed scratch run {name:?}")))?;
-    if format!("run-{run_id}") != name {
-        return Err(ScratchError::UnsafeEntry(format!(
-            "non-canonical scratch run {name:?}"
-        )));
-    }
-    Ok(run_id)
-}
-
-fn validate_run_entries(run: &Dir) -> Result<(), ScratchError> {
-    let mut seen = BTreeMap::new();
-    for entry in run.entries()? {
-        let entry = entry?;
-        let name = entry
-            .file_name()
-            .to_str()
-            .ok_or_else(|| ScratchError::UnsafeEntry("non-UTF-8 scratch entry".into()))?
-            .to_owned();
-        if ![MARKER_FILE, LEASE_FILE, PAGES_FILE, BLOBS_FILE].contains(&name.as_str()) {
-            return Err(ScratchError::UnsafeEntry(format!(
-                "unknown scratch run entry {name:?}"
-            )));
-        }
-        require_regular_entry(&entry, &name)?;
-        if seen.insert(name.clone(), ()).is_some() {
-            return Err(ScratchError::UnsafeEntry(format!(
-                "duplicate scratch run entry {name:?}"
-            )));
-        }
-    }
-    for required in [MARKER_FILE, LEASE_FILE, PAGES_FILE, BLOBS_FILE] {
-        if !seen.contains_key(required) {
-            return Err(ScratchError::UnsafeEntry(format!(
-                "scratch run is missing {required:?}"
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn remove_stale_run(
-    namespace: &Dir,
-    run: &Dir,
-    run_name: &str,
-    lease: fs::File,
-) -> Result<(), ScratchError> {
-    // Validate the complete entry set before unlinking anything. No recursive
-    // ambient deletion is used and no authoritative namespace is reachable.
-    validate_run_entries(run)?;
-    for name in [PAGES_FILE, BLOBS_FILE, MARKER_FILE] {
-        run.remove_file(name)?;
-    }
-    unlock(&lease);
-    drop(lease);
-    run.remove_file(LEASE_FILE)?;
-    namespace.remove_dir(run_name)?;
-    Ok(())
-}
-
-/// What one reachability-proof pass proved about one sibling of the scratch
-/// namespace.
-///
-/// Only `Reclaimed` unlinks bytes. It is reachable exclusively from a complete
-/// authentication of that run's own marker and entry set, a proof that no
-/// resume point still names it, and the acquisition of its own exclusive lease.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RetainedRunDisposition {
-    /// Authenticated retained run this workspace's resume points still name.
-    Reachable,
-    /// Authenticated retained run, unreachable and unleased. Its bytes were
-    /// removed.
-    Reclaimed,
-    /// Authenticated retained run whose exclusive lease another owner holds.
-    LivePreserved,
-    /// Authenticated ephemeral run. This pass carries no authority over the
-    /// ordinary reclamation lifecycle, so it is left exactly as found.
-    EphemeralPreserved,
-    /// Could not be authenticated or classified: absent, torn, old-schema,
-    /// foreign, or unreadable marker; incomplete or stray entry set; a
-    /// non-directory, symlinked, special, or non-canonical name; or an ordinary
-    /// per-run I/O error. Its bytes are preserved untouched.
-    Unclassified,
-}
-
 /// The outcome of one retained-run reachability pass.
 ///
 /// Every field is a preservation count except `retained_reclaimed`, which is
@@ -3977,97 +3530,23 @@ pub(super) fn reclaim_unreachable_retained_runs(
     workspace_id: WorkspaceId,
     reachable: &super::resume_point::ReachableRetainedRuns,
 ) -> Result<RetainedRunReclamation, ScratchError> {
-    let mut outcome = RetainedRunReclamation::default();
-    let Some(namespace) = open_scratch_namespace(archive_capability)? else {
-        // No scratch namespace was ever opened here. There is nothing to prove
-        // and nothing to create.
-        return Ok(outcome);
-    };
-    for entry in namespace.entries()? {
-        let disposition = entry
-            .map_err(ScratchError::from)
-            .and_then(|entry| {
-                classify_retained_sibling(&namespace, &entry, workspace_id, reachable)
-            })
-            .unwrap_or(RetainedRunDisposition::Unclassified);
-        let counter = match disposition {
-            RetainedRunDisposition::Reachable => &mut outcome.retained_reachable,
-            RetainedRunDisposition::Reclaimed => &mut outcome.retained_reclaimed,
-            RetainedRunDisposition::LivePreserved => &mut outcome.retained_live_skipped,
-            RetainedRunDisposition::EphemeralPreserved => &mut outcome.ephemeral_preserved,
-            RetainedRunDisposition::Unclassified => &mut outcome.unclassified_preserved,
-        };
-        *counter += 1;
-    }
-    Ok(outcome)
-}
-
-/// Open the scratch namespace of one archive, or prove there is not one.
-///
-/// A present entry that is not a real no-follow directory is an error rather
-/// than an absence: absence means "nothing was ever created here", and a
-/// symlink or file wearing the namespace name proves nothing of the sort.
-fn open_scratch_namespace(archive_capability: &Dir) -> Result<Option<Dir>, ScratchError> {
-    match archive_capability.symlink_metadata(SCRATCH_DIR) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-            return Err(ScratchError::UnsafeEntry(format!(
-                "{SCRATCH_DIR} is not a real no-follow directory"
-            )));
-        }
-        Ok(_) => {}
-    }
-    Ok(Some(super::object_store::open_dir_nofollow(
-        archive_capability,
-        SCRATCH_DIR,
-    )?))
-}
-
-/// What one sibling of the scratch namespace authenticates as, read-only.
-///
-/// Deliberately carries **no** deletion authority and takes no lease: it is the
-/// shared substrate of the reachability pass and of the census, and separating
-/// it is what lets the census count a population without acquiring, mutating,
-/// or contending anything.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum AuthenticatedScratchSibling {
-    Retained(Uuid),
-    Ephemeral,
-}
-
-/// Authenticate exactly one sibling from its own durable bytes.
-///
-/// Every `Err` means "not classified", which both callers turn into a
-/// preserved-untouched outcome.
-fn authenticate_scratch_sibling(
-    namespace: &Dir,
-    entry: &cap_std::fs::DirEntry,
-    workspace_id: WorkspaceId,
-) -> Result<(String, AuthenticatedScratchSibling), ScratchError> {
-    let name = entry
-        .file_name()
-        .to_str()
-        .ok_or_else(|| ScratchError::UnsafeEntry("non-UTF-8 scratch run".into()))?
-        .to_owned();
-    let run_id = parse_run_name(&name)?;
-    require_real_directory(entry, &name)?;
-    let run = super::object_store::open_dir_nofollow(namespace, &name)?;
-    let marker_bytes = read_regular_nofollow(&run, MARKER_FILE, MAX_MARKER_BYTES)?;
-    let marker: ScratchRunMarkerV3 = decode_canonical(&marker_bytes)?;
-    if marker.schema_version != SCRATCH_SCHEMA_VERSION
-        || marker.workspace_id != workspace_id
-        || marker.run_id != run_id
-    {
-        return Err(ScratchError::MalformedMarker(name));
-    }
-    validate_run_entries(&run)?;
-    let kind = if marker.retention == ScratchRetention::Retained {
-        AuthenticatedScratchSibling::Retained(run_id)
-    } else {
-        AuthenticatedScratchSibling::Ephemeral
-    };
-    Ok((name, kind))
+    // SAFETY: `ReachableRetainedRuns` can only be minted by the complete,
+    // authenticated resume-point scan (or by this module's test-only mint).
+    // The predicate therefore represents the full reachable membership set.
+    let outcome = unsafe {
+        tine_storage::reclaim_unreachable_retained_runs(
+            archive_capability,
+            &workspace_id,
+            |run_id| reachable.contains(run_id),
+        )
+    }?;
+    Ok(RetainedRunReclamation {
+        retained_reachable: outcome.retained_reachable,
+        retained_reclaimed: outcome.retained_reclaimed,
+        retained_live_skipped: outcome.retained_live_skipped,
+        ephemeral_preserved: outcome.ephemeral_preserved,
+        unclassified_preserved: outcome.unclassified_preserved,
+    })
 }
 
 /// A read-only population count of one archive's scratch namespace.
@@ -4093,70 +3572,12 @@ pub(super) fn census_retained_runs(
     archive_capability: &Dir,
     workspace_id: WorkspaceId,
 ) -> Result<RetainedRunCensus, ScratchError> {
-    let mut census = RetainedRunCensus::default();
-    let Some(namespace) = open_scratch_namespace(archive_capability)? else {
-        return Ok(census);
-    };
-    for entry in namespace.entries()? {
-        match entry
-            .map_err(ScratchError::from)
-            .and_then(|entry| authenticate_scratch_sibling(&namespace, &entry, workspace_id))
-        {
-            Ok((_, AuthenticatedScratchSibling::Retained(_))) => census.retained += 1,
-            Ok((_, AuthenticatedScratchSibling::Ephemeral)) => census.ephemeral += 1,
-            Err(_) => census.unclassified += 1,
-        }
-    }
-    Ok(census)
-}
-
-/// Classify exactly one sibling, removing it only when its own bytes and the
-/// supplied complete proof together say that is safe.
-///
-/// Every `Err` here means "not proved safe to touch"; the caller converts it
-/// into [`RetainedRunDisposition::Unclassified`], which preserves the sibling
-/// untouched.
-fn classify_retained_sibling(
-    namespace: &Dir,
-    entry: &cap_std::fs::DirEntry,
-    workspace_id: WorkspaceId,
-    reachable: &super::resume_point::ReachableRetainedRuns,
-) -> Result<RetainedRunDisposition, ScratchError> {
-    let (name, sibling) = authenticate_scratch_sibling(namespace, entry, workspace_id)?;
-    let AuthenticatedScratchSibling::Retained(run_id) = sibling else {
-        return Ok(RetainedRunDisposition::EphemeralPreserved);
-    };
-    if reachable.contains(run_id) {
-        return Ok(RetainedRunDisposition::Reachable);
-    }
-    let run = super::object_store::open_dir_nofollow(namespace, &name)?;
-    // Unreachable is necessary but not sufficient. Acquiring the run's own
-    // exclusive lease is what proves no live owner is mutating these bytes,
-    // and it is taken only after reachability has already been excluded so a
-    // live reachable run is never even contended.
-    let lease = open_regular_read_write_nofollow(&run, LEASE_FILE)?;
-    if !lock_exclusive_nonblocking(&lease)? {
-        return Ok(RetainedRunDisposition::LivePreserved);
-    }
-    remove_stale_run(namespace, &run, &name, lease)?;
-    Ok(RetainedRunDisposition::Reclaimed)
-}
-
-/// Best-effort removal of exactly the run directory a failed construction
-/// created.
-///
-/// Every step is capability-relative beneath the scratch namespace and named,
-/// so no recursive or ambient deletion is used and no sibling run is reachable.
-/// Failures are deliberately swallowed: the caller returns the original
-/// construction error, and residue this pass cannot remove is preserved for a
-/// later reclamation pass rather than escalated into a second failure.
-fn remove_partial_own_run(namespace: &Dir, run_name: &str) {
-    if let Ok(run) = super::object_store::open_dir_nofollow(namespace, run_name) {
-        for name in [PAGES_FILE, BLOBS_FILE, MARKER_FILE, LEASE_FILE] {
-            let _ = run.remove_file(name);
-        }
-    }
-    let _ = namespace.remove_dir(run_name);
+    let census = tine_storage::census_retained_runs(archive_capability, &workspace_id)?;
+    Ok(RetainedRunCensus {
+        retained: census.retained,
+        ephemeral: census.ephemeral,
+        unclassified: census.unclassified,
+    })
 }
 
 /// Named fallible boundaries of one run construction, after the run directory
@@ -4241,123 +3662,43 @@ fn inject_sibling_inspection_fault() -> Result<(), ScratchError> {
     })
 }
 
-fn create_new_regular(dir: &Dir, name: &str) -> Result<fs::File, ScratchError> {
-    let mut options = OpenOptions::new();
-    options.read(true).write(true).create_new(true);
-    let file = dir.open_with(name, &options)?.into_std();
-    ensure_opened_regular(&file, name)?;
-    Ok(file)
-}
-
-fn write_new_regular(dir: &Dir, name: &str, bytes: &[u8]) -> Result<(), ScratchError> {
-    let mut file = create_new_regular(dir, name)?;
-    file.write_all(bytes)?;
-    Ok(())
-}
-
-fn open_regular_read_write_nofollow(dir: &Dir, name: &str) -> Result<fs::File, ScratchError> {
-    #[cfg(unix)]
+fn observe_scratch_construction(
+    boundary: tine_storage::ScratchConstructionBoundary,
+) -> Result<(), tine_storage::ScratchRunError> {
+    #[cfg(test)]
     {
-        use std::ffi::CString;
-        use std::os::fd::AsFd as _;
-        let path = CString::new(name)
-            .map_err(|_| ScratchError::UnsafeEntry("invalid scratch filename".into()))?;
-        // SAFETY: the path is a live C string and dirfd is an opened capability.
-        let fd = unsafe {
-            libc::openat(
-                dir.as_fd().as_raw_fd(),
-                path.as_ptr(),
-                libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-            )
+        use tine_storage::ScratchConstructionBoundary as StorageBoundary;
+
+        if boundary == StorageBoundary::InspectSibling {
+            return inject_sibling_inspection_fault().map_err(core_fault_to_storage);
+        }
+        let boundary = match boundary {
+            StorageBoundary::AfterRunDirectory => ScratchCreateBoundary::AfterRunDirectory,
+            StorageBoundary::AfterNamespaceSync => ScratchCreateBoundary::AfterNamespaceSync,
+            StorageBoundary::AfterRunOpen => ScratchCreateBoundary::AfterRunOpen,
+            StorageBoundary::AfterMarkerWrite => ScratchCreateBoundary::AfterMarkerWrite,
+            StorageBoundary::AfterLeaseCreate => ScratchCreateBoundary::AfterLeaseCreate,
+            StorageBoundary::AfterLeaseLock => ScratchCreateBoundary::AfterLeaseLock,
+            StorageBoundary::AfterPagesCreate => ScratchCreateBoundary::AfterPagesCreate,
+            StorageBoundary::AfterBlobsCreate => ScratchCreateBoundary::AfterBlobsCreate,
+            StorageBoundary::AfterReclaim => ScratchCreateBoundary::AfterReclaim,
+            StorageBoundary::InspectSibling => unreachable!("handled above"),
         };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        // SAFETY: a successful openat returned an owned descriptor.
-        let file = unsafe { fs::File::from_raw_fd(fd) };
-        ensure_opened_regular(&file, name)?;
-        Ok(file)
+        inject_create_run_fault(boundary).map_err(core_fault_to_storage)
     }
-    #[cfg(windows)]
+    #[cfg(not(test))]
     {
-        use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
-        let mut options = OpenOptions::new();
-        options.read(true).write(true);
-        options.follow(FollowSymlinks::No);
-        let file = dir.open_with(name, &options)?.into_std();
-        ensure_opened_regular(&file, name)?;
-        return Ok(file);
+        let _ = boundary;
+        Ok(())
     }
 }
 
-fn read_regular_nofollow(dir: &Dir, name: &str, limit: u64) -> Result<Vec<u8>, ScratchError> {
-    let mut file = open_regular_read_write_nofollow(dir, name)?;
-    let metadata = file.metadata()?;
-    if metadata.len() > limit {
-        return Err(ScratchError::UnsafeEntry(format!(
-            "scratch file {name:?} exceeds its bound"
-        )));
+#[cfg(test)]
+fn core_fault_to_storage(error: ScratchError) -> tine_storage::ScratchRunError {
+    match error {
+        ScratchError::Io(error) => tine_storage::ScratchRunError::Io(error),
+        error => tine_storage::ScratchRunError::Io(error.to_string()),
     }
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.read_to_end(&mut bytes)?;
-    Ok(bytes)
-}
-
-fn ensure_opened_regular(file: &fs::File, name: &str) -> Result<(), ScratchError> {
-    let metadata = file.metadata()?;
-    #[cfg(windows)]
-    {
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return Err(ScratchError::UnsafeEntry(format!(
-                "{name:?} is a reparse point"
-            )));
-        }
-    }
-    if !metadata.is_file() {
-        return Err(ScratchError::UnsafeEntry(format!(
-            "{name:?} is not a regular file"
-        )));
-    }
-    Ok(())
-}
-
-fn require_real_directory(entry: &cap_std::fs::DirEntry, name: &str) -> Result<(), ScratchError> {
-    let file_type = entry.file_type()?;
-    if file_type.is_symlink() || !file_type.is_dir() {
-        return Err(ScratchError::UnsafeEntry(format!(
-            "{name:?} is not a real directory"
-        )));
-    }
-    #[cfg(windows)]
-    {
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-        if entry.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return Err(ScratchError::UnsafeEntry(format!(
-                "{name:?} is a reparse point"
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn require_regular_entry(entry: &cap_std::fs::DirEntry, name: &str) -> Result<(), ScratchError> {
-    let file_type = entry.file_type()?;
-    if file_type.is_symlink() || !file_type.is_file() {
-        return Err(ScratchError::UnsafeEntry(format!(
-            "{name:?} is not a regular file"
-        )));
-    }
-    #[cfg(windows)]
-    {
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-        if entry.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return Err(ScratchError::UnsafeEntry(format!(
-                "{name:?} is a reparse point"
-            )));
-        }
-    }
-    Ok(())
 }
 
 fn encode_canonical<T: Serialize>(value: &T) -> Result<Vec<u8>, ScratchError> {
@@ -4370,70 +3711,6 @@ fn decode_canonical<T: DeserializeOwned + Serialize>(bytes: &[u8]) -> Result<T, 
         return Err(ScratchError::MalformedPage);
     }
     Ok(value)
-}
-
-#[cfg(unix)]
-fn lock_exclusive_nonblocking(file: &fs::File) -> Result<bool, ScratchError> {
-    // SAFETY: flock only observes the live owned descriptor.
-    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if result == 0 {
-        return Ok(true);
-    }
-    let error = std::io::Error::last_os_error();
-    if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
-        return Ok(false);
-    }
-    Err(error.into())
-}
-
-#[cfg(unix)]
-fn unlock(file: &fs::File) {
-    // SAFETY: flock only observes the live owned descriptor.
-    let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
-}
-
-#[cfg(windows)]
-fn lock_exclusive_nonblocking(file: &fs::File) -> Result<bool, ScratchError> {
-    use windows_sys::Win32::Foundation::{ERROR_LOCK_VIOLATION, FALSE};
-    use windows_sys::Win32::Storage::FileSystem::{
-        LockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
-    };
-    let mut overlapped = unsafe { std::mem::zeroed() };
-    // SAFETY: the handle and OVERLAPPED remain live for the synchronous call.
-    let result = unsafe {
-        LockFileEx(
-            file.as_raw_handle() as _,
-            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
-            0,
-            u32::MAX,
-            u32::MAX,
-            &mut overlapped,
-        )
-    };
-    if result != FALSE {
-        return Ok(true);
-    }
-    let error = std::io::Error::last_os_error();
-    if error.raw_os_error() == Some(ERROR_LOCK_VIOLATION as i32) {
-        return Ok(false);
-    }
-    Err(error.into())
-}
-
-#[cfg(windows)]
-fn unlock(file: &fs::File) {
-    use windows_sys::Win32::Storage::FileSystem::UnlockFileEx;
-    let mut overlapped = unsafe { std::mem::zeroed() };
-    // SAFETY: the handle and OVERLAPPED remain live for the synchronous call.
-    let _ = unsafe {
-        UnlockFileEx(
-            file.as_raw_handle() as _,
-            0,
-            u32::MAX,
-            u32::MAX,
-            &mut overlapped,
-        )
-    };
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4488,6 +3765,18 @@ impl From<std::io::Error> for ScratchError {
 impl From<super::object_store::StoreError> for ScratchError {
     fn from(error: super::object_store::StoreError) -> Self {
         Self::Io(error.to_string())
+    }
+}
+
+impl From<tine_storage::ScratchRunError> for ScratchError {
+    fn from(error: tine_storage::ScratchRunError) -> Self {
+        match error {
+            tine_storage::ScratchRunError::Io(error) => Self::Io(error),
+            tine_storage::ScratchRunError::UnsafeEntry(reason) => Self::UnsafeEntry(reason),
+            tine_storage::ScratchRunError::MalformedMarker(run) => Self::MalformedMarker(run),
+            tine_storage::ScratchRunError::MalformedEncoding => Self::MalformedPage,
+            tine_storage::ScratchRunError::Poisoned => Self::Poisoned,
+        }
     }
 }
 
@@ -4582,6 +3871,68 @@ mod tests {
             store.read_blob(blob).unwrap(),
             b"retained blob bytes".to_vec()
         );
+    }
+
+    #[test]
+    fn pre_extraction_schema_13_marker_reopens_through_storage_and_core_unchanged() {
+        const PRE_EXTRACTION_MARKER: [u8; 68] = [
+            0x0d, 0x10, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b,
+            0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
+            0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x01, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25,
+            0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f, 0x30, 0x31, 0x32, 0x33,
+            0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f,
+        ];
+        let path = scratch_root("pre-extraction-marker");
+        let archive = archive(&path);
+        let workspace_id = WorkspaceId::from_uuid(Uuid::from_bytes([
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f,
+        ]));
+        let run_id = Uuid::from_bytes([
+            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
+            0x1e, 0x1f,
+        ]);
+        let old_marker = ScratchRunMarkerV3 {
+            schema_version: 13,
+            workspace_id,
+            run_id,
+            retention: ScratchRetention::Retained,
+            random_owner_nonce: std::array::from_fn(|index| 0x20 + index as u8),
+        };
+        assert_eq!(
+            encode_canonical(&old_marker).unwrap(),
+            PRE_EXTRACTION_MARKER
+        );
+
+        let run = run_path(&path, run_id);
+        fs::create_dir_all(&run).unwrap();
+        fs::write(run.join(MARKER_FILE), PRE_EXTRACTION_MARKER).unwrap();
+        fs::write(run.join(LEASE_FILE), []).unwrap();
+        fs::write(run.join(PAGES_FILE), b"pre-extraction pages").unwrap();
+        fs::write(run.join(BLOBS_FILE), b"pre-extraction blobs").unwrap();
+        let baseline = run_snapshot(&path, run_id);
+
+        let physical =
+            tine_storage::ScratchRun::adopt_retained(&archive, workspace_id, run_id).unwrap();
+        assert_eq!(
+            physical.binding_digest().unwrap(),
+            ContentDigest::of(&PRE_EXTRACTION_MARKER)
+        );
+        drop(physical);
+        assert_eq!(run_snapshot(&path, run_id), baseline);
+
+        let facade = ScratchStore::adopt_retained(&archive, workspace_id, run_id).unwrap();
+        assert_eq!(
+            facade.binding_digest().unwrap(),
+            ContentDigest::of(&PRE_EXTRACTION_MARKER)
+        );
+        drop(facade);
+        assert_eq!(run_snapshot(&path, run_id), baseline);
+        assert_eq!(
+            namespace_entry_names(&path),
+            BTreeSet::from([format!("run-{run_id}")])
+        );
+        crate::test_support::remove_dir_all(path);
     }
 
     #[test]
@@ -5137,7 +4488,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("tine-scratch-lease-{}", Uuid::new_v4()));
         let archive = archive(&path);
         let first = ScratchStore::open(&archive, workspace(2)).unwrap();
-        let first_name = first.run_name.clone();
+        let first_name = format!("run-{}", first.run_id());
         let second = ScratchStore::open(&archive, workspace(2)).unwrap();
         assert!(second.stats().live_runs_skipped >= 1);
         assert!(path.join(SCRATCH_DIR).join(&first_name).is_dir());
@@ -5152,16 +4503,12 @@ mod tests {
         let path = std::env::temp_dir().join(format!("tine-scratch-stale-{}", Uuid::new_v4()));
         let archive = archive(&path);
         let first = ScratchStore::open(&archive, workspace(4)).unwrap();
-        let run_name = first.run_name.clone();
-        let marker = first.marker.clone();
+        let run_name = format!("run-{}", first.run_id());
+        let marker = run_snapshot(&path, first.run_id())[MARKER_FILE].clone();
         drop(first);
         let run_path = path.join(SCRATCH_DIR).join(&run_name);
         fs::create_dir(&run_path).unwrap();
-        fs::write(
-            run_path.join(MARKER_FILE),
-            encode_canonical(&marker).unwrap(),
-        )
-        .unwrap();
+        fs::write(run_path.join(MARKER_FILE), marker).unwrap();
         for name in [LEASE_FILE, PAGES_FILE, BLOBS_FILE] {
             fs::write(run_path.join(name), []).unwrap();
         }
@@ -5178,7 +4525,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("tine-scratch-marker-{}", Uuid::new_v4()));
         let archive = archive(&path);
         let first = ScratchStore::open(&archive, workspace(5)).unwrap();
-        let run_name = first.run_name.clone();
+        let run_name = format!("run-{}", first.run_id());
         drop(first);
         let run_path = path.join(SCRATCH_DIR).join(run_name);
         fs::create_dir(&run_path).unwrap();
@@ -5207,7 +4554,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("tine-scratch-link-{}", Uuid::new_v4()));
         let archive = archive(&path);
         let first = ScratchStore::open(&archive, workspace(3)).unwrap();
-        let run_path = path.join(SCRATCH_DIR).join(&first.run_name);
+        let run_path = run_path(&path, first.run_id());
         drop(first);
         fs::create_dir(&run_path).unwrap();
         symlink("/tmp", run_path.join("marker")).unwrap();
@@ -5237,16 +4584,12 @@ mod tests {
         let path = std::env::temp_dir().join(format!("tine-scratch-fifo-{}", Uuid::new_v4()));
         let archive = archive(&path);
         let first = ScratchStore::open(&archive, workspace(6)).unwrap();
-        let run_name = first.run_name.clone();
-        let marker = first.marker.clone();
+        let run_name = format!("run-{}", first.run_id());
+        let marker = run_snapshot(&path, first.run_id())[MARKER_FILE].clone();
         drop(first);
         let run_path = path.join(SCRATCH_DIR).join(run_name);
         fs::create_dir(&run_path).unwrap();
-        fs::write(
-            run_path.join(MARKER_FILE),
-            encode_canonical(&marker).unwrap(),
-        )
-        .unwrap();
+        fs::write(run_path.join(MARKER_FILE), marker).unwrap();
         fs::write(run_path.join(LEASE_FILE), []).unwrap();
         fs::write(run_path.join(BLOBS_FILE), []).unwrap();
         let fifo = run_path.join(PAGES_FILE);
@@ -5602,15 +4945,11 @@ mod tests {
         // regression does.
         let stale = ScratchStore::open(&archive, workspace(34)).unwrap();
         let stale_id = stale.run_id();
-        let stale_marker = stale.marker.clone();
+        let stale_marker = run_snapshot(&path, stale_id)[MARKER_FILE].clone();
         drop(stale);
         let stale_path = run_path(&path, stale_id);
         fs::create_dir(&stale_path).unwrap();
-        fs::write(
-            stale_path.join(MARKER_FILE),
-            encode_canonical(&stale_marker).unwrap(),
-        )
-        .unwrap();
+        fs::write(stale_path.join(MARKER_FILE), stale_marker).unwrap();
         for name in [LEASE_FILE, PAGES_FILE, BLOBS_FILE] {
             fs::write(stale_path.join(name), []).unwrap();
         }
@@ -5800,7 +5139,7 @@ mod tests {
 
             // A live sibling proves the cleanup is scoped to the failing run.
             let live = ScratchStore::open(&archive, workspace(40)).unwrap();
-            let live_name = live.run_name.clone();
+            let live_name = format!("run-{}", live.run_id());
             let live_bytes = run_snapshot(&path, live.run_id());
 
             fail_next_scratch_run_creation_at(boundary);
