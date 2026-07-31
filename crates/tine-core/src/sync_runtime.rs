@@ -266,6 +266,14 @@ static ACTOR_THREADS_STARTED: std::sync::atomic::AtomicUsize =
 #[cfg(test)]
 static ACTOR_THREADS_FINISHED: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+/// Structural accounting for the two actor-start boundaries. This is keyed by
+/// workspace because actor creation happens on a dedicated thread, so a
+/// thread-local counter could not distinguish an uninterrupted handoff from a
+/// cold recovery in the test caller.
+#[cfg(test)]
+static ACTIVATION_ACTOR_OPEN_INSTRUMENTATION: Mutex<
+    BTreeMap<WorkspaceId, ActivationActorOpenInstrumentation>,
+> = Mutex::new(BTreeMap::new());
 #[cfg(test)]
 static PREPARE_SHARED_TEST_CUT: Mutex<Option<WorkspaceId>> = Mutex::new(None);
 #[cfg(test)]
@@ -288,6 +296,53 @@ static PROVIDER_ACCEPTED_AUDIT_LIMIT_OVERRIDES: Mutex<BTreeMap<WorkspaceId, usiz
 static PROVIDER_ACCEPTED_AUDIT_TEST_CUTS: Mutex<
     BTreeMap<WorkspaceId, (BatchId, ProviderAcceptedAuditTestCut)>,
 > = Mutex::new(BTreeMap::new());
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ActivationActorOpenInstrumentation {
+    cold_actor_opens: u64,
+    retained_handoffs: u64,
+}
+
+#[cfg(test)]
+fn record_cold_actor_open(workspace: WorkspaceId) {
+    ACTIVATION_ACTOR_OPEN_INSTRUMENTATION
+        .lock()
+        .unwrap()
+        .entry(workspace)
+        .or_default()
+        .cold_actor_opens += 1;
+}
+
+#[cfg(test)]
+fn record_retained_activation_handoff(workspace: WorkspaceId) {
+    ACTIVATION_ACTOR_OPEN_INSTRUMENTATION
+        .lock()
+        .unwrap()
+        .entry(workspace)
+        .or_default()
+        .retained_handoffs += 1;
+}
+
+#[cfg(test)]
+fn reset_activation_actor_open_instrumentation(workspace: WorkspaceId) {
+    ACTIVATION_ACTOR_OPEN_INSTRUMENTATION
+        .lock()
+        .unwrap()
+        .remove(&workspace);
+}
+
+#[cfg(test)]
+fn activation_actor_open_instrumentation(
+    workspace: WorkspaceId,
+) -> ActivationActorOpenInstrumentation {
+    ACTIVATION_ACTOR_OPEN_INSTRUMENTATION
+        .lock()
+        .unwrap()
+        .get(&workspace)
+        .copied()
+        .unwrap_or_default()
+}
 #[cfg(test)]
 static PROVIDER_RECOVERY_PUBLICATION_TEST_CUTS: Mutex<
     BTreeMap<WorkspaceId, ProviderRecoveryPublicationTestCut>,
@@ -1752,6 +1807,97 @@ impl SyncRuntimeHandle {
         }
     }
 
+    /// Private activation-only actor start. The move-only handoff is produced
+    /// only by the uninterrupted `VerifiedLocal -> LocalActive -> promoted`
+    /// transaction, so this path must not rediscover or reopen the retained
+    /// graph, receipt store, engine, SQLite projection, or baseline.
+    fn open_from_same_process_activation(
+        request: SyncRuntimeOpenRequest,
+        handoff: SameProcessActivationHandoff,
+    ) -> SyncRuntimeOpenResult {
+        let graph_resource_id = handoff.binding.graph_resource_id();
+        #[cfg(test)]
+        let workspace_id = handoff.binding.workspace_id();
+        let initial = SyncRuntimeStatusSnapshot {
+            lifecycle: SyncRuntimeLifecycle::Active,
+            recovery: None,
+            watcher: SyncWatcherStatus::default(),
+            last_tick: None,
+            detail: Some("actor startup is adopting retained activation proof".into()),
+            shared_role: None,
+            shared_phase: None,
+            provider_pending: 0,
+        };
+        let status = Arc::new(RwLock::new(initial));
+        let (sender, receiver) = mpsc::sync_channel(ACTOR_CHANNEL_CAPACITY);
+        let (started_sender, started_receiver) = mpsc::sync_channel(1);
+        let actor_status = Arc::clone(&status);
+        let thread_name = format!("tine-sync-{}", &graph_resource_id.to_string()[..12]);
+        let join = match thread::Builder::new()
+            .name(thread_name)
+            .stack_size(ACTOR_STACK_BYTES)
+            .spawn(move || {
+                #[cfg(test)]
+                ACTOR_THREADS_STARTED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    actor_thread_from_same_process_activation(
+                        request,
+                        handoff,
+                        receiver,
+                        started_sender,
+                        &actor_status,
+                    )
+                }));
+                if result.is_err() {
+                    *actor_status.write().unwrap() = SyncRuntimeStatusSnapshot {
+                        lifecycle: SyncRuntimeLifecycle::StoppedCrashed,
+                        recovery: None,
+                        watcher: SyncWatcherStatus::default(),
+                        last_tick: None,
+                        detail: Some("sync actor panicked".into()),
+                        shared_role: None,
+                        shared_phase: None,
+                        provider_pending: 0,
+                    };
+                }
+                #[cfg(test)]
+                ACTOR_THREADS_FINISHED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }) {
+            Ok(join) => join,
+            Err(error) => return refused(format!("cannot start sync actor thread: {error}")),
+        };
+
+        match started_receiver.recv() {
+            Ok(Ok(snapshot)) => {
+                *status.write().unwrap() = snapshot;
+                SyncRuntimeOpenResult {
+                    status: SyncRuntimeOpenStatus::Active,
+                    handle: Some(Self {
+                        inner: Arc::new(HandleInner {
+                            enrollment_operation: Mutex::new(()),
+                            operation: Mutex::new(()),
+                            sender: Mutex::new(Some(sender)),
+                            join: Mutex::new(Some(join)),
+                            status,
+                            #[cfg(test)]
+                            workspace_id,
+                        }),
+                    }),
+                }
+            }
+            Ok(Err(detail)) => {
+                drop(sender);
+                let _ = join.join();
+                refused(detail)
+            }
+            Err(_) => {
+                drop(sender);
+                let _ = join.join();
+                refused("sync actor stopped during startup".into())
+            }
+        }
+    }
+
     /// Explicitly activate or resume one bounded local sparse-oplog runtime.
     ///
     /// This is intentionally separate from [`Self::open`]: ordinary startup
@@ -1897,9 +2043,9 @@ impl SyncRuntimeHandle {
             _ => unreachable!("activation discovery branch already returned"),
         };
 
-        let result = activate_non_active_local(&request, &graph, existing_binding, &mut progress);
+        let result = activate_non_active_local(request.clone(), graph, existing_binding, &mut progress);
         match result {
-            Ok(()) => activation_open_runtime(request),
+            Ok(handoff) => activation_open_same_process_runtime(request, handoff),
             Err(detail) => {
                 activation_failure_after(&request, graph_resource_id, initial_stage, detail)
             }
@@ -2560,13 +2706,33 @@ fn validate_query_request(
 /// their proof-bearing capabilities outside this module.  Every operation
 /// before the final actor open is explicitly requested by
 /// `SyncLocalActivationRequest`; normal graph startup cannot reach here.
+/// The one private, process-local activation handoff. It carries every
+/// capability that was proven while building the inactive bootstrap and then
+/// promoted under the same workspace lease. It is deliberately move-only and
+/// private to this module: a fresh process cannot construct it from durable
+/// state, a failed proof never reaches it, and its graph, archive, SQLite,
+/// receipt, enrollment, and binding-generation facts remain inseparable until
+/// the actor accepts ownership.
+struct SameProcessActivationHandoff {
+    graph: Graph,
+    receipts: ProjectionReceiptStore,
+    authority: LocalActiveAuthority,
+    runtime: PromotedLocalRuntime,
+    baseline: ReconciliationBaseline,
+    enrollment_root: EnrollmentApplicationRoot,
+    binding: EnrollmentBindingV1,
+    session_id: SessionId,
+    promotion_session_id: SessionId,
+    promoted_state_digest: ContentDigest,
+}
+
 fn activate_non_active_local(
-    request: &SyncLocalActivationRequest,
-    graph: &Graph,
+    request: SyncLocalActivationRequest,
+    graph: Graph,
     existing_binding: Option<EnrollmentBindingV1>,
     progress: &mut dyn FnMut(SyncLocalActivationPhase),
-) -> Result<(), String> {
-    prepare_activation_private_paths(request)?;
+) -> Result<SameProcessActivationHandoff, String> {
+    prepare_activation_private_paths(&request)?;
     let enrollment = EnrollmentApplicationRoot::open_explicit_private(&request.enrollment_root)
         .map_err(display)?;
     let application_runtime_root =
@@ -2574,7 +2740,7 @@ fn activate_non_active_local(
             .map_err(display)?;
 
     let endpoint = ProjectionEndpointBinding::enroll_graph(
-        graph,
+        &graph,
         request.identities.endpoint_id,
         request.identities.device_id,
     )
@@ -2610,7 +2776,7 @@ fn activate_non_active_local(
             begin_or_resume_local_activation_reservation(
                 &enrollment,
                 LocalActivationReservationBindingV1::new(
-                    local_activation_identity(request, graph_resource_id),
+                    local_activation_identity(&request, graph_resource_id),
                     receipts.store_id(),
                     graph_text_scope_binding,
                     source_inventory_digest,
@@ -2679,7 +2845,7 @@ fn activate_non_active_local(
         .map_err(display)?;
     progress(SyncLocalActivationPhase::BootstrapImportPreparation);
     let prepared = prepare_inactive_bootstrap_import(
-        graph,
+        &graph,
         capture,
         binding.workspace_id(),
         binding.lineage_digest(),
@@ -2727,7 +2893,7 @@ fn activate_non_active_local(
     .map_err(display)?;
     progress(SyncLocalActivationPhase::ShadowReconstructionByteVerification);
     let shadow = verify_inactive_bootstrap_shadow_projection(
-        graph,
+        &graph,
         &backup_root,
         &prepared,
         &verified,
@@ -2748,7 +2914,7 @@ fn activate_non_active_local(
         });
     });
     let proofs = VerifiedLocalProofSet {
-        graph,
+        graph: &graph,
         roots: &backup_root,
         prepared: &prepared,
         verified_publication: &verified,
@@ -2771,7 +2937,7 @@ fn activate_non_active_local(
         engine: accepted_authority.accepted_engine(),
         projection: inactive.projection(),
     };
-    let mut authority = activate_verified_local_with_retained_validation(
+    let authority = activate_verified_local_with_retained_validation(
         &enrollment,
         verified_local,
         request.identities.session_id,
@@ -2785,7 +2951,7 @@ fn activate_non_active_local(
     drop(proofs);
 
     let promoted_open = PromotedRuntimeOpen {
-        graph,
+        graph: &graph,
         receipts: &receipts,
         archive_root: &request.archive_root,
         database_path: &request.database_path,
@@ -2793,24 +2959,43 @@ fn activate_non_active_local(
         graph_root: &request.graph_root,
         migration_backup_root: &request.migration_backup_root,
     };
-    let mut promoted = inactive
+    let promoted = inactive
         .promote(sealed, &authority, &promoted_open)
         .map_err(|refusal| {
             let (_returned_lease, error) = refusal.into_parts();
             error.to_string()
         })?;
 
-    // The actor will reopen this exact database. Creating or validating the
-    // baseline before that handout makes reconciliation a proven prerequisite
-    // of the retained public handle rather than a deferred first-tick action.
+    // The actor receives this exact baseline and the retained promoted runtime
+    // below. Opening it here makes reconciliation a proven prerequisite while
+    // avoiding a second database, archive, engine, or receipt-store open in
+    // the uninterrupted activation transaction.
     progress(SyncLocalActivationPhase::ReconciliationBaselineActorOpen);
-    ensure_reconciliation_baseline_with_runtime(&application_runtime_root, graph, &binding)?;
-    promoted
-        .quiesce_and_mark_safe(&mut authority, graph)
-        .map_err(display)?;
-    drop(promoted);
-    drop(authority);
-    Ok(())
+    let baseline = open_reconciliation_baseline_with_runtime(
+        &application_runtime_root,
+        &graph,
+        &binding,
+    )?;
+    let promotion_session_id = promoted.promotion_session_id();
+    let promoted_state_digest = promoted.promoted_state_digest().map_err(display)?;
+    if authority.binding() != &binding
+        || authority.session_id() != request.identities.session_id
+        || promotion_session_id != request.identities.session_id
+    {
+        return Err("same-process activation handoff binding changed after LocalActive proof".into());
+    }
+    Ok(SameProcessActivationHandoff {
+        graph,
+        receipts,
+        authority,
+        runtime: promoted,
+        baseline,
+        enrollment_root: enrollment,
+        binding,
+        session_id: request.identities.session_id,
+        promotion_session_id,
+        promoted_state_digest,
+    })
 }
 
 fn activation_open_runtime(request: SyncLocalActivationRequest) -> SyncLocalActivationResult {
@@ -2841,6 +3026,40 @@ fn activation_open_runtime(request: SyncLocalActivationRequest) -> SyncLocalActi
         SyncRuntimeOpenResult { status, .. } => activation_retryable(
             SyncLocalActivationStage::LocalActive,
             format!("LocalActive runtime reopen refused after proof: {status:?}"),
+        ),
+    }
+}
+
+fn activation_open_same_process_runtime(
+    request: SyncLocalActivationRequest,
+    handoff: SameProcessActivationHandoff,
+) -> SyncLocalActivationResult {
+    let opened = SyncRuntimeHandle::open_from_same_process_activation(
+        SyncRuntimeOpenRequest {
+            profile: SyncStorageProfile::ExperimentalLocal,
+            graph_root: request.graph_root,
+            enrollment_root: request.enrollment_root,
+            archive_root: request.archive_root,
+            receipt_root: request.receipt_root,
+            database_path: request.database_path,
+            application_runtime_root: request.application_runtime_root,
+            migration_backup_root: request.migration_backup_root,
+            provider_root: request.provider_root,
+            provider_journal_root: request.provider_journal_root,
+        },
+        handoff,
+    );
+    match opened {
+        SyncRuntimeOpenResult {
+            status: SyncRuntimeOpenStatus::Active,
+            handle: Some(handle),
+        } => SyncLocalActivationResult {
+            status: SyncLocalActivationStatus::Active,
+            handle: Some(handle),
+        },
+        SyncRuntimeOpenResult { status, .. } => activation_retryable(
+            SyncLocalActivationStage::LocalActive,
+            format!("same-process LocalActive handoff refused after proof: {status:?}"),
         ),
     }
 }
@@ -2975,6 +3194,15 @@ fn ensure_reconciliation_baseline_with_runtime(
     graph: &Graph,
     binding: &EnrollmentBindingV1,
 ) -> Result<(), String> {
+    drop(open_reconciliation_baseline_with_runtime(runtime, graph, binding)?);
+    Ok(())
+}
+
+fn open_reconciliation_baseline_with_runtime(
+    runtime: &ApplicationRuntimeRoot,
+    graph: &Graph,
+    binding: &EnrollmentBindingV1,
+) -> Result<ReconciliationBaseline, String> {
     let trusted = TrustedPrivateApplicationRuntimeRoot::from_application_runtime_root(runtime);
     let baseline_binding = ReconciliationBaselineBinding::new(
         binding.workspace_id(),
@@ -2984,13 +3212,10 @@ fn ensure_reconciliation_baseline_with_runtime(
     )
     .map_err(display)?;
     match ReconciliationBaseline::open_existing(&trusted, baseline_binding.clone()) {
-        Ok(baseline) => drop(baseline),
-        Err(error) if error.is_missing() => {
-            ReconciliationBaseline::create_fresh(&trusted, baseline_binding).map_err(display)?;
-        }
+        Ok(baseline) => Ok(baseline),
+        Err(error) if error.is_missing() => ReconciliationBaseline::create_fresh(&trusted, baseline_binding).map_err(display),
         Err(error) => return Err(display(error)),
     }
-    Ok(())
 }
 
 struct ApplicationBlockRef<'a> {
@@ -4450,13 +4675,39 @@ fn actor_thread(
     started: SyncSender<Result<SyncRuntimeStatusSnapshot, String>>,
     shared_status: &RwLock<SyncRuntimeStatusSnapshot>,
 ) {
-    let mut actor = match RuntimeActor::open(request, advisory, session_id) {
+    let actor = match RuntimeActor::open(request, advisory, session_id) {
         Ok(actor) => actor,
         Err(error) => {
             let _ = started.send(Err(error));
             return;
         }
     };
+    run_actor_loop(actor, receiver, started, shared_status);
+}
+
+fn actor_thread_from_same_process_activation(
+    request: SyncRuntimeOpenRequest,
+    handoff: SameProcessActivationHandoff,
+    receiver: Receiver<ActorRequest>,
+    started: SyncSender<Result<SyncRuntimeStatusSnapshot, String>>,
+    shared_status: &RwLock<SyncRuntimeStatusSnapshot>,
+) {
+    let actor = match RuntimeActor::open_from_same_process_activation(request, handoff) {
+        Ok(actor) => actor,
+        Err(error) => {
+            let _ = started.send(Err(error));
+            return;
+        }
+    };
+    run_actor_loop(actor, receiver, started, shared_status);
+}
+
+fn run_actor_loop(
+    mut actor: RuntimeActor,
+    receiver: Receiver<ActorRequest>,
+    started: SyncSender<Result<SyncRuntimeStatusSnapshot, String>>,
+    shared_status: &RwLock<SyncRuntimeStatusSnapshot>,
+) {
     let snapshot = actor.snapshot();
     *shared_status.write().unwrap() = snapshot.clone();
     if started.send(Ok(snapshot)).is_err() {
@@ -4985,6 +5236,8 @@ impl RuntimeActor {
         advisory: LocalActiveAdvisory,
         session_id: SessionId,
     ) -> Result<Self, String> {
+        #[cfg(test)]
+        record_cold_actor_open(advisory.binding.workspace_id());
         let graph = Graph::open_checked(&request.graph_root).map_err(display)?;
         let graph_resource_id = graph.canonical_resource_id().map_err(display)?;
         if graph_resource_id != advisory.binding.graph_resource_id() {
@@ -5058,11 +5311,92 @@ impl RuntimeActor {
             }
         }
         .map_err(display)?;
+
+        Self::from_proven_resources(
+            request,
+            graph,
+            receipts,
+            authority,
+            runtime,
+            baseline,
+            enrollment_root,
+            advisory.binding,
+            session_id,
+            advisory.promotion_session_id,
+            advisory.promoted_state_digest,
+            unsafe_reopen,
+        )
+    }
+
+    /// Install one activation's retained proof into its first actor without
+    /// interpreting any durable recovery record again. The handoff is private,
+    /// move-only, and made only after the final LocalActive proof, exact
+    /// promotion binding, SQLite frontier proof, and baseline open all hold.
+    /// A process restart cannot construct it; its only route remains `open`,
+    /// above, which deliberately performs complete recovery.
+    fn open_from_same_process_activation(
+        request: SyncRuntimeOpenRequest,
+        handoff: SameProcessActivationHandoff,
+    ) -> Result<Self, String> {
+        let SameProcessActivationHandoff {
+            graph,
+            receipts,
+            authority,
+            runtime,
+            baseline,
+            enrollment_root,
+            binding,
+            session_id,
+            promotion_session_id,
+            promoted_state_digest,
+        } = handoff;
+        if request.profile != SyncStorageProfile::ExperimentalLocal
+            || authority.binding() != &binding
+            || authority.session_id() != session_id
+            || runtime.recovery() != RuntimeRecoveryState::FirstPromotion
+            || runtime.promotion_session_id() != promotion_session_id
+            || runtime.promoted_state_digest().map_err(display)? != promoted_state_digest
+        {
+            return Err("same-process activation handoff binding does not match retained proof".into());
+        }
+        #[cfg(test)]
+        record_retained_activation_handoff(binding.workspace_id());
+        Self::from_proven_resources(
+            request,
+            graph,
+            receipts,
+            authority,
+            runtime,
+            baseline,
+            enrollment_root,
+            binding,
+            session_id,
+            promotion_session_id,
+            promoted_state_digest,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_proven_resources(
+        request: SyncRuntimeOpenRequest,
+        graph: Graph,
+        receipts: ProjectionReceiptStore,
+        authority: LocalActiveAuthority,
+        runtime: PromotedLocalRuntime,
+        baseline: ReconciliationBaseline,
+        enrollment_root: EnrollmentApplicationRoot,
+        binding: EnrollmentBindingV1,
+        session_id: SessionId,
+        promotion_session_id: SessionId,
+        promoted_state_digest: ContentDigest,
+        unsafe_reopen: bool,
+    ) -> Result<Self, String> {
         let recovery = map_recovery(runtime.recovery());
         let feed =
             ExactExternalFeedState::open(&graph, &receipts, &runtime, baseline).map_err(display)?;
         let last_watcher = map_watcher(runtime.watcher_status());
-        let shared = inspect_shared_enrollment_descriptor(&enrollment_root, &advisory.binding)
+        let shared = inspect_shared_enrollment_descriptor(&enrollment_root, &binding)
             .map_err(display)?;
         let shared_descriptor = shared.as_ref().map(|(descriptor, _)| descriptor.clone());
         let shared_role = shared.map(|(_, role)| match role {
@@ -5071,7 +5405,7 @@ impl RuntimeActor {
         });
         let shared_phase = crate::oplog::enrollment::inspect_shared_enrollment_phase(
             &enrollment_root,
-            &advisory.binding,
+            &binding,
         )
         .map_err(display)?
         .map(|phase| match phase {
@@ -5124,9 +5458,9 @@ impl RuntimeActor {
             stopped_safe: false,
             enrollment_root,
             session_id,
-            promotion_session_id: advisory.promotion_session_id,
-            promoted_state_digest: advisory.promoted_state_digest,
-            binding: advisory.binding,
+            promotion_session_id,
+            promoted_state_digest,
+            binding,
             provider_root: request.provider_root,
             provider_journal_root: request.provider_journal_root,
             provider,
@@ -23353,12 +23687,27 @@ mod tests {
         let fixture = ActivationFixture::nested_unicode("retained-complete-proof", 0xa1b0);
         let workspace = fixture.request.identities.workspace_id;
         reset_complete_shadow_verification_calls_for_test(workspace);
+        reset_aggregate_reopen_calls_for_test(workspace);
+        reset_activation_actor_open_instrumentation(workspace);
         let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
         assert_eq!(activated.status, SyncLocalActivationStatus::Active);
         assert_eq!(
             complete_shadow_verification_calls_for_test(workspace),
             1,
             "adjacent VerifiedLocal/LocalActive/promotion transitions reran full shadow proof"
+        );
+        assert_eq!(
+            aggregate_reopen_calls_for_test(workspace),
+            1,
+            "uninterrupted activation must reopen the bootstrap aggregate only for promotion, not again for actor startup"
+        );
+        assert_eq!(
+            activation_actor_open_instrumentation(workspace),
+            ActivationActorOpenInstrumentation {
+                cold_actor_opens: 0,
+                retained_handoffs: 1,
+            },
+            "uninterrupted activation must hand the retained graph, receipts, SQLite, and engine directly to its actor"
         );
         let handle = activated.handle.unwrap();
         drive_initial_feed(&handle);
@@ -23368,12 +23717,21 @@ mod tests {
         ));
 
         reset_aggregate_reopen_calls_for_test(workspace);
+        reset_activation_actor_open_instrumentation(workspace);
         let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
         assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
         assert_eq!(
             aggregate_reopen_calls_for_test(workspace),
             1,
             "fresh-process promoted open must perform one complete aggregate publication validation"
+        );
+        assert_eq!(
+            activation_actor_open_instrumentation(workspace),
+            ActivationActorOpenInstrumentation {
+                cold_actor_opens: 1,
+                retained_handoffs: 0,
+            },
+            "a fresh reopen must retain the complete recovery boundary"
         );
         drop(reopened.handle);
     }

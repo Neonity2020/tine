@@ -2668,6 +2668,22 @@ impl PromotedLocalRuntime {
         self.recovery
     }
 
+    /// The durable promotion session this retained runtime already proved.
+    ///
+    /// This is diagnostic binding data only; it vends no promotion authority.
+    /// The same-process actor handoff carries it alongside this move-only
+    /// runtime so later local-authorship receipts keep the exact durable
+    /// promotion identity without reopening the promotion record.
+    pub(crate) const fn promotion_session_id(&self) -> SessionId {
+        self.state.promotion_session_id
+    }
+
+    /// Digest of the exact durable promotion state this retained runtime
+    /// already authenticated during its construction.
+    pub(crate) fn promoted_state_digest(&self) -> Result<ContentDigest, RuntimePromotionError> {
+        self.state.state_digest().map_err(RuntimePromotionError::Store)
+    }
+
     /// Whether automatic external Markdown/Org import may run under this
     /// runtime. Unsafe/crash recovery starts blocked, then becomes live-session
     /// allowed only after the exact-feed owner completes and revalidates the
