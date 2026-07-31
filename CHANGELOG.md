@@ -10,6 +10,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Sparse-v2 now detects sampled interior corruption in its disposable SQLite
+  projection during reopen.** Versioned, bounded fingerprints cover up to 1 MiB
+  across the interior of each database and WAL file in addition to their edges;
+  a mismatch preserves forensic evidence and rebuilds from oplog authority.
 - **Sparse-v2 activation now uses lsdoc as the single Markdown and Org outline
   authority.** Parser-owned source spans and topology replace Tine's duplicate
   structural scanners, so Logseq-compatible headings, multiline blocks, mixed

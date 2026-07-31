@@ -14203,6 +14203,28 @@ mod tests {
             COUNTERFEIT,
         );
         assert!(patched > 0);
+        let graph = Graph::open_checked(&request.graph_root).unwrap();
+        let advisory = match discover_startup(&DiscoveryRequest {
+            profile: StartupStorageProfile::ExperimentalSparse,
+            graph_resource_id: graph.canonical_resource_id().unwrap(),
+            runtime_root: &request.enrollment_root,
+            archive_root: &request.archive_root,
+        }) {
+            DiscoveryClassification::ExistingLocalActive(advisory) => advisory,
+            other => panic!("corruption fixture was no longer LocalActive: {other:?}"),
+        };
+        // Bind this counterfeit fixture into the bounded checkpoint so this
+        // existing regression continues to prove the later affected-page
+        // semantic authority fence independently of accidental-corruption
+        // sampling.
+        crate::oplog::sqlite::refresh_projection_checkpoint_for_harness(
+            &request.database_path,
+            crate::oplog::sqlite::ProjectionClaim::current(
+                advisory.binding.workspace_id(),
+                advisory.binding.lineage_digest(),
+            ),
+        )
+        .unwrap();
         let reopened = active_handle(SyncRuntimeHandle::open(request.clone()));
         drive_initial_feed(&reopened);
         let manifests_before_refusal = fixture.manifest_count();

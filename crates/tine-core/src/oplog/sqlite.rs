@@ -277,8 +277,15 @@ const APPLIED_BATCH_COLUMNS: [&str; 20] = [
 ];
 const FORENSIC_SUFFIXES: [&str; 4] = ["", "-wal", "-shm", "-auth"];
 const FORENSIC_NAMES: [&str; 4] = ["database", "wal", "shm", "auth"];
-const PROJECTION_CHECKPOINT_SCHEMA_VERSION: u32 = 1;
+const PROJECTION_CHECKPOINT_SCHEMA_VERSION: u32 = 2;
 const PROJECTION_FINGERPRINT_CHUNK_BYTES: usize = 64 * 1024;
+// Interior sampling is a bounded accidental-corruption tripwire, not
+// byte-complete authentication. The affected-page hot-engine comparison
+// remains the semantic authority fence.
+const PROJECTION_INTERIOR_SAMPLE_BYTES: usize = 1024 * 1024;
+const PROJECTION_INTERIOR_SAMPLE_RANGE_BYTES: usize = 16 * 1024;
+const PROJECTION_INTERIOR_SAMPLE_MAX_RANGES: usize =
+    PROJECTION_INTERIOR_SAMPLE_BYTES / PROJECTION_INTERIOR_SAMPLE_RANGE_BYTES;
 const MAX_PROJECTION_CHECKPOINT_BYTES: u64 = 64 * 1024;
 const MAX_AUTHENTICATED_MAP_DEPTH: usize = 256;
 const OBJECT_STORE_LEASE_NAMESPACE: &str = ".tine-runtime";
@@ -1463,6 +1470,7 @@ struct BoundedFileCheckpoint {
     length: u64,
     first_chunk_digest: ContentDigest,
     last_chunk_digest: ContentDigest,
+    interior_sample_digest: ContentDigest,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2335,7 +2343,18 @@ pub(crate) fn refresh_projection_checkpoint_for_harness(
     )?;
     let root = read_frontier_root(&connection)?;
     drop(connection);
-    write_projection_checkpoint(path, claim, &root)
+    write_projection_checkpoint(path, claim, &root)?;
+    let wal_path = sidecar_path(path, "-wal");
+    if fs::symlink_metadata(&wal_path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.len() == 0)
+    {
+        fs::remove_file(wal_path)?;
+        let shm_path = sidecar_path(path, "-shm");
+        if fs::symlink_metadata(&shm_path).is_ok_and(|metadata| metadata.is_file()) {
+            fs::remove_file(shm_path)?;
+        }
+    }
+    Ok(())
 }
 
 fn fail_during_apply_for_harness() -> Result<(), ProjectionError> {
@@ -3994,16 +4013,18 @@ fn bounded_file_checkpoint(path: &Path) -> Result<BoundedFileCheckpoint, Project
     } else {
         last.copy_from_slice(&first);
     }
-    let mut first_bound = b"tine/sqlite/checkpoint/v1/first\0".to_vec();
+    let mut first_bound = b"tine/sqlite/checkpoint/v2/first\0".to_vec();
     first_bound.extend_from_slice(&length.to_be_bytes());
     first_bound.extend_from_slice(&first);
-    let mut last_bound = b"tine/sqlite/checkpoint/v1/last\0".to_vec();
+    let mut last_bound = b"tine/sqlite/checkpoint/v2/last\0".to_vec();
     last_bound.extend_from_slice(&length.to_be_bytes());
     last_bound.extend_from_slice(&last);
+    let interior_sample_digest = bounded_file_checkpoint_interior_digest(&mut file, length)?;
     Ok(BoundedFileCheckpoint {
         length,
         first_chunk_digest: ContentDigest::of(&first_bound),
         last_chunk_digest: ContentDigest::of(&last_bound),
+        interior_sample_digest,
     })
 }
 
@@ -4011,6 +4032,78 @@ fn bounded_file_checkpoint_sample_bytes(length: u64) -> u64 {
     length
         .min(PROJECTION_FINGERPRINT_CHUNK_BYTES as u64)
         .saturating_mul(2)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CheckpointInteriorRange {
+    offset: u64,
+    length: usize,
+}
+
+fn bounded_file_checkpoint_interior_ranges(length: u64) -> Vec<CheckpointInteriorRange> {
+    let edge_length = length.min(PROJECTION_FINGERPRINT_CHUNK_BYTES as u64);
+    let interior_start = edge_length;
+    let interior_end = length.saturating_sub(edge_length);
+    let interior_length = interior_end.saturating_sub(interior_start);
+    if interior_length == 0 {
+        return Vec::new();
+    }
+    if interior_length <= PROJECTION_INTERIOR_SAMPLE_BYTES as u64 {
+        return vec![CheckpointInteriorRange {
+            offset: interior_start,
+            length: usize::try_from(interior_length)
+                .expect("bounded interior sample length fits usize"),
+        }];
+    }
+
+    let range_length = PROJECTION_INTERIOR_SAMPLE_RANGE_BYTES as u64;
+    let available_start_span = interior_length - range_length;
+    let denominator = (PROJECTION_INTERIOR_SAMPLE_MAX_RANGES - 1) as u128;
+    (0..PROJECTION_INTERIOR_SAMPLE_MAX_RANGES)
+        .map(|index| {
+            let relative_offset = (u128::from(available_start_span) * index as u128) / denominator;
+            CheckpointInteriorRange {
+                offset: interior_start
+                    + u64::try_from(relative_offset)
+                        .expect("sample offset derived from a u64 file length"),
+                length: PROJECTION_INTERIOR_SAMPLE_RANGE_BYTES,
+            }
+        })
+        .collect()
+}
+
+fn bounded_file_checkpoint_interior_digest(
+    file: &mut File,
+    length: u64,
+) -> Result<ContentDigest, ProjectionError> {
+    let ranges = bounded_file_checkpoint_interior_ranges(length);
+    let mut bound = Vec::with_capacity(
+        b"tine/sqlite/checkpoint/v2/interior-sample\0".len()
+            + std::mem::size_of::<u64>()
+            + std::mem::size_of::<u32>()
+            + ranges.len() * (std::mem::size_of::<u64>() * 2)
+            + ranges.iter().map(|range| range.length).sum::<usize>(),
+    );
+    bound.extend_from_slice(b"tine/sqlite/checkpoint/v2/interior-sample\0");
+    bound.extend_from_slice(&length.to_be_bytes());
+    bound.extend_from_slice(
+        &u32::try_from(ranges.len())
+            .expect("checkpoint interior range count is bounded")
+            .to_be_bytes(),
+    );
+    for range in ranges {
+        bound.extend_from_slice(&range.offset.to_be_bytes());
+        bound.extend_from_slice(
+            &u64::try_from(range.length)
+                .expect("checkpoint interior range length fits u64")
+                .to_be_bytes(),
+        );
+        file.seek(SeekFrom::Start(range.offset))?;
+        let start = bound.len();
+        bound.resize(start + range.length, 0);
+        file.read_exact(&mut bound[start..])?;
+    }
+    Ok(ContentDigest::of(&bound))
 }
 
 fn initialize_schema(
@@ -8680,6 +8773,35 @@ pub(crate) fn corrupt_equal_length_interior_block_payload(
     original: &[u8],
     counterfeit: &[u8],
 ) -> usize {
+    corrupt_equal_length_interior_block_payload_with_coverage(
+        database_path,
+        original,
+        counterfeit,
+        false,
+    )
+}
+
+#[cfg(test)]
+fn corrupt_equal_length_sampled_interior_block_payload(
+    database_path: &Path,
+    original: &[u8],
+    counterfeit: &[u8],
+) -> usize {
+    corrupt_equal_length_interior_block_payload_with_coverage(
+        database_path,
+        original,
+        counterfeit,
+        true,
+    )
+}
+
+#[cfg(test)]
+fn corrupt_equal_length_interior_block_payload_with_coverage(
+    database_path: &Path,
+    original: &[u8],
+    counterfeit: &[u8],
+    select_sampled: bool,
+) -> usize {
     assert_eq!(
         original.len(),
         counterfeit.len(),
@@ -8711,29 +8833,41 @@ pub(crate) fn corrupt_equal_length_interior_block_payload(
     let mut bytes = fs::read(database_path).unwrap();
     assert!(
         bytes.len() > PROJECTION_FINGERPRINT_CHUNK_BYTES * 2,
-        "fixture database is too small to have an unauthenticated interior"
+        "fixture database is too small to have an edge-excluded interior"
     );
-    let interior_end = bytes.len() - PROJECTION_FINGERPRINT_CHUNK_BYTES;
     let mut patched = 0;
+    let sampled_ranges = bounded_file_checkpoint_interior_ranges(bytes.len() as u64);
+    let interior_start = PROJECTION_FINGERPRINT_CHUNK_BYTES;
+    let interior_end = bytes.len() - PROJECTION_FINGERPRINT_CHUNK_BYTES;
     for page in block_pages {
         let page_start = page.saturating_sub(1).saturating_mul(page_size);
-        let start = page_start.max(PROJECTION_FINGERPRINT_CHUNK_BYTES);
+        let start = page_start.max(interior_start);
         let end = page_start
             .saturating_add(page_size)
             .min(interior_end)
             .saturating_sub(original.len());
-        if start <= end {
-            for offset in start..=end {
-                if &bytes[offset..offset + original.len()] == original {
-                    bytes[offset..offset + counterfeit.len()].copy_from_slice(counterfeit);
-                    patched += 1;
-                }
+        if start > end {
+            continue;
+        }
+        for offset in start..=end {
+            if &bytes[offset..offset + original.len()] != original {
+                continue;
+            }
+            let replacement_end = offset + counterfeit.len();
+            let fully_sampled = sampled_ranges.iter().any(|range| {
+                let range_start = usize::try_from(range.offset).unwrap();
+                let range_end = range_start + range.length;
+                offset >= range_start && replacement_end <= range_end
+            });
+            if !select_sampled || fully_sampled {
+                bytes[offset..replacement_end].copy_from_slice(counterfeit);
+                patched += 1;
             }
         }
     }
     assert!(
         patched > 0,
-        "fixture found no block-table payload in the unauthenticated database interior"
+        "fixture found no block-table payload in the selected database interior coverage"
     );
     fs::write(database_path, bytes).unwrap();
     patched
@@ -12260,7 +12394,7 @@ mod tests {
     }
 
     #[test]
-    fn projection_sidecar_fingerprint_reads_only_bounded_edge_chunks() {
+    fn projection_checkpoint_large_sparse_file_has_fixed_interior_accounting() {
         let dir = TestDir::new("bounded-sidecar-fingerprint");
         let path = dir.path().join("large-wal");
         let length = 64_u64 * 1024 * 1024;
@@ -12279,6 +12413,215 @@ mod tests {
         assert_eq!(
             bounded_file_checkpoint_sample_bytes(length),
             (PROJECTION_FINGERPRINT_CHUNK_BYTES * 2) as u64
+        );
+        let ranges = bounded_file_checkpoint_interior_ranges(length);
+        assert_eq!(ranges, bounded_file_checkpoint_interior_ranges(length));
+        assert_eq!(ranges.len(), PROJECTION_INTERIOR_SAMPLE_MAX_RANGES);
+        assert_eq!(
+            ranges.iter().map(|range| range.length).sum::<usize>(),
+            PROJECTION_INTERIOR_SAMPLE_BYTES
+        );
+        assert!(ranges
+            .windows(2)
+            .all(|pair| pair[0].offset + pair[0].length as u64 <= pair[1].offset));
+        assert!(ranges.iter().all(|range| range.offset
+            >= PROJECTION_FINGERPRINT_CHUNK_BYTES as u64
+            && range.offset + range.length as u64
+                <= length - PROJECTION_FINGERPRINT_CHUNK_BYTES as u64));
+
+        let maximum_ranges = bounded_file_checkpoint_interior_ranges(u64::MAX);
+        assert_eq!(maximum_ranges.len(), PROJECTION_INTERIOR_SAMPLE_MAX_RANGES);
+        assert_eq!(
+            maximum_ranges
+                .iter()
+                .map(|range| range.length)
+                .sum::<usize>(),
+            PROJECTION_INTERIOR_SAMPLE_BYTES
+        );
+    }
+
+    #[test]
+    fn projection_checkpoint_small_file_coverage_is_complete_without_duplicate_interior_ranges() {
+        let edge = PROJECTION_FINGERPRINT_CHUNK_BYTES as u64;
+        assert!(bounded_file_checkpoint_interior_ranges(edge).is_empty());
+        assert!(bounded_file_checkpoint_interior_ranges(edge * 2).is_empty());
+
+        let interior_length = 32_u64 * 1024;
+        let length = edge * 2 + interior_length;
+        assert_eq!(
+            bounded_file_checkpoint_interior_ranges(length),
+            vec![CheckpointInteriorRange {
+                offset: edge,
+                length: interior_length as usize,
+            }]
+        );
+        assert_eq!(
+            bounded_file_checkpoint_sample_bytes(length) + interior_length,
+            length
+        );
+    }
+
+    #[test]
+    fn projection_checkpoint_interior_differential_leaves_length_and_edges_unchanged() {
+        let dir = TestDir::new("interior-checkpoint-differential");
+        let path = dir.path().join("large-database");
+        let length = 64_u64 * 1024 * 1024;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        file.set_len(length).unwrap();
+        file.write_all(&[1]).unwrap();
+        file.seek(SeekFrom::Start(length - 1)).unwrap();
+        file.write_all(&[2]).unwrap();
+        drop(file);
+        let before = bounded_file_checkpoint(&path).unwrap();
+
+        let range = bounded_file_checkpoint_interior_ranges(length)
+            [PROJECTION_INTERIOR_SAMPLE_MAX_RANGES / 2];
+        let mut file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.seek(SeekFrom::Start(
+            range.offset + u64::try_from(range.length / 2).unwrap(),
+        ))
+        .unwrap();
+        file.write_all(&[3]).unwrap();
+        drop(file);
+        let after = bounded_file_checkpoint(&path).unwrap();
+
+        assert_eq!(after.length, before.length);
+        assert_eq!(after.first_chunk_digest, before.first_chunk_digest);
+        assert_eq!(after.last_chunk_digest, before.last_chunk_digest);
+        assert_ne!(after.interior_sample_digest, before.interior_sample_digest);
+    }
+
+    #[test]
+    fn sampled_interior_block_corruption_rebuilds_from_authority_and_preserves_evidence() {
+        const BLOCK_COUNT: usize = 128;
+        const ORIGINAL: &[u8] = b"authoritative-row";
+        const COUNTERFEIT: &[u8] = b"counterfeited-row";
+
+        let ids = TestIds::new(2_385);
+        let dir = TestDir::new("sampled-interior-corruption");
+        let engine_store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
+        let store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
+        let mut engine =
+            ShardedHotEngine::with_archive_store(engine_store, ids.lineage, ids.catalog);
+        let mut operations = vec![SemanticOperation::CreatePage {
+            page_id: ids.page,
+            home_document_id: ids.document,
+            name: crate::oplog::LogicalPageName::parse("Interior authority").unwrap(),
+            path: ManagedPath::parse("pages/interior-authority.md").unwrap(),
+            kind: ManagedTextKind::Page,
+        }];
+        let expected_contents = (0..BLOCK_COUNT)
+            .map(|index| format!("authoritative-row-{index:04}-{}", "x".repeat(192)))
+            .collect::<Vec<_>>();
+        for (index, content) in expected_contents.iter().enumerate() {
+            operations.push(SemanticOperation::CreateBlock {
+                block: BlockLocation {
+                    block_id: BlockId::from_uuid(uuid(40_000 + index as u128)),
+                    home_document_id: ids.document,
+                },
+                page_id: ids.page,
+                parent: None,
+                order: format!("{index:04}"),
+                content: content.clone(),
+            });
+        }
+        let prepared = engine
+            .prepare_bootstrap_transaction(
+                author(2_386),
+                &OperationTransaction::new(operations).unwrap(),
+            )
+            .unwrap();
+        publish_and_stage_archive(&mut engine, &store, &prepared);
+        let path = dir.path().join("frontier.sqlite");
+        let opened = open_test_projection(
+            &path,
+            ids.claim(),
+            RebuildSource::new(&engine, &store).unwrap(),
+        )
+        .unwrap();
+        drop(opened);
+
+        let patched =
+            corrupt_equal_length_sampled_interior_block_payload(&path, ORIGINAL, COUNTERFEIT);
+        assert!(patched > 0);
+        let recovered = open_test_projection(
+            &path,
+            ids.claim(),
+            RebuildSource::new(&engine, &store).unwrap(),
+        )
+        .unwrap();
+        let ProjectionRecovery::RebuiltPreservingEvidence { evidence, .. } = &recovered.recovery
+        else {
+            panic!(
+                "sampled interior corruption was not quarantined: {:?}",
+                recovered.recovery
+            );
+        };
+        let database_evidence = evidence
+            .iter()
+            .find(|item| item.original_path == path)
+            .expect("rebuild did not preserve the corrupt database");
+        assert!(fs::read(&database_evidence.preserved_path)
+            .unwrap()
+            .windows(COUNTERFEIT.len())
+            .any(|window| window == COUNTERFEIT));
+
+        let mut statement = recovered
+            .database
+            .connection
+            .prepare(
+                "SELECT content FROM blocks
+                 WHERE page_id = ?1
+                 ORDER BY order_key",
+            )
+            .unwrap();
+        let actual_contents = statement
+            .query_map([ids.page.as_uuid().as_bytes().as_slice()], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(actual_contents, expected_contents);
+        assert_eq!(
+            recovered.database.frontier().unwrap(),
+            engine.exact_frontier().unwrap()
+        );
+    }
+
+    #[test]
+    fn previous_projection_checkpoint_version_is_rebuilt_not_reinterpreted() {
+        let ids = TestIds::new(2_387);
+        let dir = TestDir::new("old-checkpoint-version");
+        let (database, engine, store) = open_empty(&dir, ids);
+        let path = database.path().to_path_buf();
+        drop(database);
+
+        let checkpoint_path = sidecar_path(&path, "-auth");
+        let bytes = fs::read(&checkpoint_path).unwrap();
+        let mut envelope: ProjectionCheckpointEnvelope = postcard::from_bytes(&bytes).unwrap();
+        envelope.checkpoint.schema_version = PROJECTION_CHECKPOINT_SCHEMA_VERSION - 1;
+        envelope.digest = ContentDigest::of(&postcard::to_allocvec(&envelope.checkpoint).unwrap());
+        fs::write(&checkpoint_path, postcard::to_allocvec(&envelope).unwrap()).unwrap();
+
+        let recovered = open_test_projection(
+            &path,
+            ids.claim(),
+            RebuildSource::new(&engine, &store).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            recovered.recovery,
+            ProjectionRecovery::RebuiltPreservingEvidence { .. }
+        ));
+        assert_eq!(
+            recovered.database.frontier().unwrap(),
+            FrontierV2::default()
         );
     }
 
