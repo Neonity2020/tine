@@ -49,14 +49,13 @@ const GENERATED_PUBLIC_WORDS = new Set([
   "properties", "end", "begin", "scheduled", "deadline", "closed",
 ]);
 
-const ALPHABETS = {
-  upper: [..."ABCDEFGHIJKLMNOPQRSTUVWXYZ"],
-  lower: [..."abcdefghijklmnopqrstuvwxyz"],
-  digit: [..."0123456789"],
-  two: [..."äöüßáéíóúñçøåæþðšž"],
-  three: [..."中文日本語水火木金土月日天地人山川"],
-  four: ["𐐀", "𐐁", "𐐂", "𐐃", "𐐄", "𐐅", "𐐆", "𐐇", "𐐈", "𐐉"],
+const ASCII_ALPHABETS = {
+  upper: { key: "upper", values: [..."ABCDEFGHIJKLMNOPQRSTUVWXYZ"], valueSet: new Set("ABCDEFGHIJKLMNOPQRSTUVWXYZ") },
+  lower: { key: "lower", values: [..."abcdefghijklmnopqrstuvwxyz"], valueSet: new Set("abcdefghijklmnopqrstuvwxyz") },
+  digit: { key: "digit", values: [..."0123456789"], valueSet: new Set("0123456789") },
 };
+const UNICODE_WORD_CHARACTER_RE = /^[\p{L}\p{M}\p{N}]$/u;
+let unicodeAlphabets;
 
 export class AnonymizeError extends Error {
   constructor(message) {
@@ -183,15 +182,40 @@ function isProtected(start, end, ranges, cursor, work) {
 }
 
 function alphabetFor(ch) {
-  if (ch >= "A" && ch <= "Z") return ALPHABETS.upper;
-  if (ch >= "a" && ch <= "z") return ALPHABETS.lower;
-  if (ch >= "0" && ch <= "9") return ALPHABETS.digit;
-  switch (encoder.encode(ch).length) {
-    case 2: return ALPHABETS.two;
-    case 3: return ALPHABETS.three;
-    case 4: return ALPHABETS.four;
-    default: safeError("Managed text contains an unsupported character encoding.");
+  if (ch >= "A" && ch <= "Z") return ASCII_ALPHABETS.upper;
+  if (ch >= "a" && ch <= "z") return ASCII_ALPHABETS.lower;
+  if (ch >= "0" && ch <= "9") return ASCII_ALPHABETS.digit;
+  const byteLength = encoder.encode(ch).length;
+  if (byteLength < 2 || byteLength > 4) safeError("Managed text contains an unsupported character encoding.");
+  if (unicodeAlphabets === undefined) unicodeAlphabets = buildUnicodeAlphabets();
+  return unicodeAlphabets.get(byteLength);
+}
+
+function buildUnicodeAlphabets() {
+  const valuesByLength = new Map([[2, []], [3, []], [4, []]]);
+  // A single representative for each conservative portable identity prevents
+  // generated path components from differing only by case or normalization.
+  const portableIdentities = new Set(
+    [..."ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"].map(conservativePortableFold),
+  );
+  for (let codePoint = 0x80; codePoint <= 0x10ffff; codePoint += 1) {
+    if (codePoint >= 0xd800 && codePoint <= 0xdfff) continue;
+    const character = String.fromCodePoint(codePoint);
+    if (!UNICODE_WORD_CHARACTER_RE.test(character) || character.normalize("NFC") !== character) continue;
+    const identity = conservativePortableFold(character);
+    if (portableIdentities.has(identity) || !componentIsManagedPortable(character)) continue;
+    portableIdentities.add(identity);
+    valuesByLength.get(encoder.encode(character).length)?.push(character);
   }
+  return new Map([...valuesByLength].map(([byteLength, values]) => [
+    byteLength,
+    { key: `utf8-${byteLength}`, values, valueSet: new Set(values) },
+  ]));
+}
+
+function greatestCommonDivisor(left, right) {
+  while (right !== 0n) [left, right] = [right, left % right];
+  return left;
 }
 
 class PseudonymMap {
@@ -200,11 +224,10 @@ class PseudonymMap {
     this.forbiddenTokens = forbiddenTokens;
     this.forbiddenUuids = forbiddenUuids;
     this.tokens = new Map();
-    this.tokenOwners = new Map();
     this.uuids = new Map();
     this.uuidOwners = new Map();
     this.protectedRangeWork = { comparisons: 0 };
-    this.assignSingleCharacterTokens();
+    this.assignTokens();
   }
 
   digest(label, input, counter) {
@@ -212,78 +235,105 @@ class PseudonymMap {
   }
 
   saltedOrder(label, owner, values) {
-    return [...values].sort((left, right) => {
-      const leftDigest = this.digest(label, `${owner}\0${left}`, 0);
-      const rightDigest = this.digest(label, `${owner}\0${right}`, 0);
-      return Buffer.compare(leftDigest, rightDigest) || left.localeCompare(right);
-    });
+    return [...values]
+      .map((value) => ({ value, digest: this.digest(label, `${owner}\0${value}`, 0) }))
+      .sort((left, right) => Buffer.compare(left.digest, right.digest) || left.value.localeCompare(right.value))
+      .map(({ value }) => value);
   }
 
-  matchSingleCharacterGroup(tokens, alphabet, permitSourceGlyphs) {
-    const owners = new Map();
-    const candidatesByToken = new Map(tokens.map((token) => [token, this.saltedOrder(
-      "single-token-candidate",
-      token,
-      alphabet.filter((candidate) => candidate !== token
-        && !GENERATED_PUBLIC_WORDS.has(candidate.toLowerCase())
-        && (permitSourceGlyphs || !this.forbiddenTokens.has(candidate))),
-    )]));
+  digestInteger(label, input) {
+    return BigInt(`0x${this.digest(label, input, 0).toString("hex")}`);
+  }
 
-    const assign = (token, visited) => {
-      for (const candidate of candidatesByToken.get(token)) {
-        if (visited.has(candidate)) continue;
-        visited.add(candidate);
-        const prior = owners.get(candidate);
-        if (prior === undefined || assign(prior, visited)) {
-          owners.set(candidate, token);
-          return true;
-        }
-      }
-      return false;
-    };
-
-    for (const token of this.saltedOrder("single-token-owner", "group", tokens)) {
-      if (!assign(token, new Set())) return undefined;
+  *shapeCandidates(shapeKey, alphabets) {
+    const sizes = alphabets.map(({ values }) => BigInt(values.length));
+    const domainSize = sizes.reduce((product, size) => product * size, 1n);
+    if (domainSize === 0n) return;
+    let index = this.digestInteger("shape-start", shapeKey) % domainSize;
+    let step = domainSize === 1n ? 1n : this.digestInteger("shape-step", shapeKey) % domainSize;
+    if (step === 0n) step = 1n;
+    while (greatestCommonDivisor(step, domainSize) !== 1n) {
+      step = step + 1n === domainSize ? 1n : step + 1n;
     }
-    return new Map([...owners].map(([candidate, token]) => [token, candidate]));
+    for (let visited = 0n; visited < domainSize; visited += 1n) {
+      let remaining = index;
+      const characters = Array(alphabets.length);
+      for (let position = alphabets.length - 1; position >= 0; position -= 1) {
+        characters[position] = alphabets[position].values[Number(remaining % sizes[position])];
+        remaining /= sizes[position];
+      }
+      yield characters.join("");
+      index = (index + step) % domainSize;
+    }
   }
 
-  assignSingleCharacterTokens() {
+  candidateIsAdmissible(candidate) {
+    return candidate.normalize("NFC") === candidate
+      && componentIsManagedPortable(candidate)
+      && !GENERATED_PUBLIC_WORDS.has(candidate.toLowerCase());
+  }
+
+  assignGroup(shapeKey, alphabets, groupTokens) {
+    const owners = this.saltedOrder("shape-owner", shapeKey, groupTokens);
+    const absentCandidates = [];
+    for (const candidate of this.shapeCandidates(shapeKey, alphabets)) {
+      if (!this.candidateIsAdmissible(candidate) || this.forbiddenTokens.has(candidate)) continue;
+      absentCandidates.push(candidate);
+      if (absentCandidates.length === owners.length) break;
+    }
+
+    const sourceCandidates = this.saltedOrder(
+      "shape-source-candidate",
+      shapeKey,
+      groupTokens.filter((token) => [...token].every(
+        (character, index) => alphabets[index].valueSet.has(character),
+      ) && this.candidateIsAdmissible(token)),
+    );
+    const neededSourceCandidates = owners.length - absentCandidates.length;
+    if (sourceCandidates.length < neededSourceCandidates) {
+      safeError("A same-shape pseudonym could not be represented without a collision.");
+    }
+    const selected = this.saltedOrder(
+      "shape-selected-candidate",
+      shapeKey,
+      [...absentCandidates, ...sourceCandidates.slice(0, neededSourceCandidates)],
+    );
+
+    const fixed = [];
+    for (let index = 0; index < owners.length; index += 1) {
+      if (owners[index] === selected[index]) fixed.push(index);
+    }
+    if (fixed.length > 1) {
+      const candidates = fixed.map((index) => selected[index]);
+      for (let index = 0; index < fixed.length; index += 1) {
+        selected[fixed[index]] = candidates[(index + 1) % candidates.length];
+      }
+    } else if (fixed.length === 1) {
+      const other = owners.length === 1 ? -1 : (fixed[0] === 0 ? 1 : 0);
+      if (other < 0) safeError("A same-shape pseudonym could not be represented without a collision.");
+      [selected[fixed[0]], selected[other]] = [selected[other], selected[fixed[0]]];
+    }
+    for (let index = 0; index < owners.length; index += 1) {
+      if (owners[index] === selected[index]) safeError("A same-shape pseudonym could not be represented without a collision.");
+      this.tokens.set(owners[index], selected[index]);
+    }
+  }
+
+  assignTokens() {
     const groups = new Map();
     for (const token of this.forbiddenTokens) {
-      if ([...token].length !== 1) continue;
-      const alphabet = alphabetFor(token);
-      const group = groups.get(alphabet) ?? [];
-      group.push(token);
-      groups.set(alphabet, group);
+      const alphabets = [...token].map(alphabetFor);
+      const shapeKey = alphabets.map(({ key }) => key).join("/");
+      const group = groups.get(shapeKey) ?? { alphabets, tokens: [] };
+      group.tokens.push(token);
+      groups.set(shapeKey, group);
     }
-    for (const [alphabet, tokens] of groups) {
-      let assignments = this.matchSingleCharacterGroup(tokens, alphabet, false);
-      // A saturated one-glyph source domain has no private glyph outside its
-      // own vocabulary. In that mathematically unavoidable case, use a salted
-      // collision-free derangement. Multi-character tokens never take this path.
-      assignments ??= this.matchSingleCharacterGroup(tokens, alphabet, true);
-      if (!assignments) safeError("A same-shape pseudonym could not be represented without a collision.");
-      for (const [token, candidate] of assignments) {
-        this.tokens.set(token, candidate);
-        this.tokenOwners.set(candidate, token);
-      }
-    }
+    for (const [shapeKey, { alphabets, tokens }] of groups) this.assignGroup(shapeKey, alphabets, tokens);
   }
 
   token(token) {
     const known = this.tokens.get(token);
     if (known !== undefined) return known;
-    const alphabets = [...token].map(alphabetFor);
-    for (let counter = 0; counter < 100_000; counter += 1) {
-      const digest = this.digest("token", token, counter);
-      const candidate = alphabets.map((alphabet, index) => alphabet[digest[index % digest.length] % alphabet.length]).join("");
-      const owner = this.tokenOwners.get(candidate);
-      if (candidate === token || this.forbiddenTokens.has(candidate) || GENERATED_PUBLIC_WORDS.has(candidate.toLowerCase()) || (owner !== undefined && owner !== token)) continue;
-      this.tokens.set(token, candidate);
-      this.tokenOwners.set(candidate, token);
-      return candidate;
-    }
     safeError("A same-shape pseudonym could not be represented without a collision.");
   }
 
@@ -849,6 +899,7 @@ function help() {
     "",
     "Creates a local, structural reproduction containing only anonymized Markdown/Org text.",
     "Ordinary Logseq :hidden path prefixes are excluded before files or vocabulary are inventoried.",
+    "Pseudonyms preserve character shapes and UTF-8 byte lengths, including saturated bounded domains.",
     "The destination must not exist. No files are uploaded, and the source is never modified.",
     "Review the result before sharing: anonymization reduces risk but is not a formal privacy proof.",
   ].join("\n");

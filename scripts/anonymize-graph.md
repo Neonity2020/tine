@@ -37,14 +37,20 @@ and repeated page/block identities so the result retains graph activation shape.
 The salt and reverse map are never written. Review the output before sharing:
 anonymization reduces risk; it is not a formal privacy proof.
 
-One-character alphabets have an unavoidable low-entropy limit. If every digit
-or ASCII letter is present as its own token, the output must reuse those public
-glyphs; a salted collision-free derangement still preserves equality and
-distinctness and never leaves a token unchanged. This exception applies only to
-single-character tokens. Longer private words and numeric identifiers retain
-the strict rule that no source token may be emitted as their fallback. The
-portable Unicode collision check is deliberately conservative and may refuse
-rare distinct spellings rather than split an identity.
+Pseudonyms are selected from cached Unicode letter/mark/number domains with the
+same UTF-8 bytes per character. Unicode candidates are normalized and deduped
+by a conservative portable identity so generated path components remain safe.
+Selection traverses the full domain deterministically; it is not limited to a
+small sample or to the first 256 candidates.
+
+Bounded shapes have an unavoidable low-entropy limit. If every admissible value
+is present (for example `00` through `99`), the output must reuse values from
+that public format domain. A salted collision-free derangement still preserves
+equality and distinctness and never leaves a token unchanged. This exception
+applies to any saturated shape, not only single-character tokens. Source-free
+candidates remain preferred, and parser-reserved or non-portable values remain
+inadmissible. The exporter refuses only when the resulting same-shape domain is
+mathematically too small for a collision-free non-identity mapping.
 
 To make an archive without embedding the source directory name, write the
 archive beside the export and archive its contents from inside the destination:

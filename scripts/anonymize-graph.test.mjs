@@ -45,6 +45,34 @@ function punctuationAndWhitespaceMask(text) {
   return [...text].map((ch) => /[\p{L}\p{M}\p{N}]/u.test(ch) ? "x" : ch).join("");
 }
 
+function unicodeWordCharacters(byteLength, count) {
+  const characters = [];
+  for (let codePoint = 0x80; codePoint <= 0x10ffff && characters.length < count; codePoint += 1) {
+    if (codePoint >= 0xd800 && codePoint <= 0xdfff) continue;
+    const character = String.fromCodePoint(codePoint);
+    if (Buffer.byteLength(character) === byteLength
+      && /^[\p{L}\p{M}\p{N}]$/u.test(character)
+      && character.normalize("NFC") === character) characters.push(character);
+  }
+  assert.equal(characters.length, count);
+  return characters;
+}
+
+function fixedWidthTokens(alphabet, width) {
+  let tokens = [""];
+  for (let index = 0; index < width; index += 1) {
+    tokens = tokens.flatMap((prefix) => alphabet.map((character) => `${prefix}${character}`));
+  }
+  return tokens;
+}
+
+function assertDomainPermutation(original, transformed) {
+  assert.equal(transformed.length, original.length);
+  assert.equal(new Set(transformed).size, original.length);
+  assert.deepEqual(transformed.map((token) => Buffer.byteLength(token)), original.map((token) => Buffer.byteLength(token)));
+  transformed.forEach((token, index) => assert.notEqual(token, original[index]));
+}
+
 async function expectFailure(source, destination) {
   let failure;
   await assert.rejects(() => anonymizeGraph({ source, destination }), (error) => {
@@ -186,6 +214,50 @@ test("exports exhausted one-glyph domains by salted derangement without relaxing
   assert.equal(outputSecrets.length, 2);
   assert.notEqual(outputSecrets[0], numericSecret);
   assert.notEqual(outputSecrets[1], wordSecret);
+});
+
+test("supports realistic two-byte and three-byte single-character vocabularies deterministically", async (t) => {
+  const root = await fixture(t);
+  const source = join(root, "source");
+  const firstDestination = join(root, "first-output");
+  const secondDestination = join(root, "second-output");
+  const twoByte = unicodeWordCharacters(2, 320);
+  const threeByte = unicodeWordCharacters(3, 320);
+  await writeGraph(source, { "pages/unicode.md": `${twoByte.join(" ")}\n${threeByte.join(" ")}\n` });
+
+  const salt = Buffer.alloc(32, 18);
+  await anonymizeGraph({ source, destination: firstDestination, salt });
+  await anonymizeGraph({ source, destination: secondDestination, salt });
+  const first = (await listFiles(firstDestination)).find((file) => extname(file.path).toLowerCase() === ".md").text;
+  const second = (await listFiles(secondDestination)).find((file) => extname(file.path).toLowerCase() === ".md").text;
+  const [outputTwoByte, outputThreeByte] = first.trim().split("\n").map((line) => line.split(" "));
+
+  assert.equal(first, second);
+  assertDomainPermutation(twoByte, outputTwoByte);
+  assertDomainPermutation(threeByte, outputThreeByte);
+});
+
+test("exports saturated multi-character shape domains by deterministic derangement", async (t) => {
+  const root = await fixture(t);
+  const source = join(root, "source");
+  const firstDestination = join(root, "first-output");
+  const secondDestination = join(root, "second-output");
+  const digits = fixedWidthTokens([..."0123456789"], 2);
+  // "id" and "at" are protected parser grammar, so saturate the admissible two-letter
+  // lowercase domain rather than requiring it as a generated pseudonym.
+  const lower = fixedWidthTokens([..."abcdefghijklmnopqrstuvwxyz"], 2).filter((token) => !["at", "id"].includes(token));
+  await writeGraph(source, { "pages/domains.md": `${digits.join(" ")}\n${lower.join(" ")}\n` });
+
+  const salt = Buffer.alloc(32, 19);
+  await anonymizeGraph({ source, destination: firstDestination, salt });
+  await anonymizeGraph({ source, destination: secondDestination, salt });
+  const first = (await listFiles(firstDestination)).find((file) => extname(file.path).toLowerCase() === ".md").text;
+  const second = (await listFiles(secondDestination)).find((file) => extname(file.path).toLowerCase() === ".md").text;
+  const [outputDigits, outputLower] = first.trim().split("\n").map((line) => line.split(" "));
+
+  assert.equal(first, second);
+  assertDomainPermutation(digits, outputDigits);
+  assertDomainPermutation(lower, outputLower);
 });
 
 test("fails closed for symlinks, invalid UTF-8, existing or nested destinations, and portable path collisions", async (t) => {
