@@ -541,30 +541,49 @@ fn find_file_with_prefix(root: &Path, prefix: &str) -> PathBuf {
     panic!("missing file with prefix {prefix}");
 }
 
-#[test]
-fn activation_of_zero_one_and_multipart_verified_local_is_exact_and_writes_no_graph_bytes() {
+/// The same semantic activation shapes exercised by both the initial commit
+/// and the durable restart path.
+fn local_active_shape_fixtures(label: &str) -> [Fixture; 4] {
     let mut multipart_bytes = Vec::new();
     for ordinal in 0..4096 {
         multipart_bytes.extend_from_slice(format!("- operation {ordinal:04}\n").as_bytes());
     }
-    let cases = [
-        Fixture::new("zero", None, Vec::new()),
+    [
+        Fixture::new(&format!("{label}-zero"), None, Vec::new()),
         Fixture::new(
-            "one",
+            &format!("{label}-one"),
             None,
             vec![("pages/one.md".into(), b"- one\n".to_vec())],
         ),
         Fixture::new(
-            "multipart-4096",
+            &format!("{label}-multipart-4096"),
             None,
             vec![("pages/multipart.md".into(), multipart_bytes)],
         ),
-        rich_fixture("rich-nested-unicode"),
-    ];
-    // Zero, one, and genuinely multipart bootstraps must all activate.
-    assert_eq!(cases[0].verified.part_count(), 0);
-    assert_eq!(cases[1].verified.part_count(), 1);
-    assert!(cases[2].verified.part_count() >= 2);
+        rich_fixture(&format!("{label}-rich-nested-unicode")),
+    ]
+}
+
+fn assert_local_active_fixture_shapes(cases: &[Fixture; 4]) {
+    let zero_parts = cases[0].verified.part_count();
+    let one_source_parts = cases[1].verified.part_count();
+    let multipart_parts = cases[2].verified.part_count();
+
+    assert_eq!(zero_parts, 0);
+    assert!(
+        one_source_parts > zero_parts,
+        "one managed source must produce a nonempty bootstrap"
+    );
+    assert!(
+        multipart_parts >= 2 && multipart_parts >= one_source_parts,
+        "the large source must remain genuinely multipart and use no fewer parts than the one-source bootstrap: one={one_source_parts}, multipart={multipart_parts}"
+    );
+}
+
+#[test]
+fn activation_of_zero_one_and_multipart_verified_local_is_exact_and_writes_no_graph_bytes() {
+    let cases = local_active_shape_fixtures("activate");
+    assert_local_active_fixture_shapes(&cases);
 
     for fixture in &cases {
         let root = fixture.enrollment_root("activate");
@@ -611,27 +630,8 @@ fn activation_of_zero_one_and_multipart_verified_local_is_exact_and_writes_no_gr
 /// live runtime handles to work from.
 #[test]
 fn restart_reopens_local_active_from_durable_state_without_any_retained_evidence() {
-    let mut multipart_bytes = Vec::new();
-    for ordinal in 0..4096 {
-        multipart_bytes.extend_from_slice(format!("- operation {ordinal:04}\n").as_bytes());
-    }
-    let cases = [
-        Fixture::new("restart-zero", None, Vec::new()),
-        Fixture::new(
-            "restart-one",
-            None,
-            vec![("pages/one.md".into(), b"- one\n".to_vec())],
-        ),
-        Fixture::new(
-            "restart-multipart-4096",
-            None,
-            vec![("pages/multipart.md".into(), multipart_bytes)],
-        ),
-        rich_fixture("restart-rich-nested-unicode"),
-    ];
-    assert_eq!(cases[0].verified.part_count(), 0);
-    assert_eq!(cases[1].verified.part_count(), 1);
-    assert!(cases[2].verified.part_count() >= 2);
+    let cases = local_active_shape_fixtures("restart");
+    assert_local_active_fixture_shapes(&cases);
 
     for fixture in &cases {
         let root = fixture.enrollment_root("restart");
@@ -7014,7 +7014,8 @@ fn publish_expecting_success(
 /// The complete retained-resume lifecycle, in the exact order production runs
 /// it, and the equivalence that makes it safe.
 ///
-/// 1. Nothing published: a retained run and a complete authenticated replay.
+/// 1. Nothing published: uninterrupted promotion migrates the authenticated
+///    bootstrap candidate into a retained run without replay.
 /// 2. The quiescent publication — the only place a resume point is ever minted
 ///    — plus the bounded reclamation its witness authorizes.
 /// 3. A restart adopts the published point and replays only the durable tail
@@ -7034,23 +7035,39 @@ fn the_resume_accelerator_publishes_adopts_and_reclaims_across_restarts() {
         let paths = PromotedPaths::new(&fixture, "resume-lifecycle");
         let session = SessionId::new();
 
+        assert!(
+            resume_point_entries(&fixture.archive_root).is_empty(),
+            "the initial promotion has no published resume point to adopt"
+        );
+
         with_promoted_runtime(
             &mut fixture,
             &root,
             &paths,
             session,
             |fixture, authority, runtime| {
-                // (1) The open itself saw no predecessor point and replayed.
+                // (1) The uninterrupted initial promotion has no predecessor
+                //     point. It adopts the already-authenticated same-process
+                //     bootstrap candidate instead of replaying its parts.
                 let opened = runtime.resume_open_status().clone();
                 assert!(
                     opened.retained(),
-                    "a provable resume-point directory authorizes a retained run: {opened:?}"
+                    "the provable retention plan authorizes a retained run: {opened:?}"
                 );
-                assert!(!opened.adopted());
+                assert_eq!(runtime.recovery(), RuntimeRecoveryState::FirstPromotion);
+                assert!(opened.adopted());
+                assert_eq!(opened.unavailable(), None);
+                let initial = opened.observation();
+                assert!(!initial.refused);
+                assert!(
+                    initial.live_history_generation > 0,
+                    "the nonempty bootstrap must have durable history: {initial:?}"
+                );
                 assert_eq!(
-                    opened.unavailable(),
-                    Some(&ResumeAcceleratorUnavailable::NeverPublished)
+                    initial.replay_base_generation, initial.live_history_generation,
+                    "same-process promotion adopts the exact bootstrap head"
                 );
+                assert_eq!(initial.replayed_generations, 0);
                 // (2) Before returning the writable runtime, the constructor
                 //     made the report-only quiescent publication unavoidable.
                 assert!(matches!(
