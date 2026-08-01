@@ -3492,13 +3492,15 @@ mod tests {
                     .unwrap();
             let archive = ObjectStore::open(&archive_root, workspace).unwrap();
             let manifests = archive.committed_manifests().unwrap();
-            let engine = ShardedHotEngine::open_enrolled_projection(
+            let engine = ShardedHotEngine::open_enrolled_projection_resuming(
                 ObjectStore::open(&archive_root, workspace).unwrap(),
                 lineage,
                 catalog,
                 &graph,
                 &receipts,
+                None,
                 &manifests,
+                None,
             )
             .unwrap()
             .0;
