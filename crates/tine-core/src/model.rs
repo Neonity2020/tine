@@ -43427,17 +43427,44 @@ mod tests {
         entries
     }
 
-    fn bootstrap_capture_entry_spool(capture: &BootstrapSourceCapture) -> Vec<u8> {
-        fs::read(capture.sealed_directory.join(BOOTSTRAP_SOURCE_ENTRIES)).unwrap()
+    #[derive(Debug, Eq, PartialEq)]
+    struct BootstrapCapturedSource {
+        path: String,
+        kind: ManagedTextKind,
+        logical_name: String,
+        chunk_lengths: Vec<u64>,
+        bytes: Vec<u8>,
     }
 
-    fn bootstrap_capture_chunks(capture: &BootstrapSourceCapture) -> Vec<BootstrapSourceChunk> {
-        let mut cursor = capture.chunks_cursor().unwrap();
-        let mut chunks = Vec::new();
-        while let Some(chunk) = cursor.next().unwrap() {
-            chunks.push(chunk);
+    fn bootstrap_capture_sources(capture: &BootstrapSourceCapture) -> Vec<BootstrapCapturedSource> {
+        let entries = bootstrap_capture_entries(capture);
+        let mut chunks = capture.chunks_cursor().unwrap();
+        let mut sources = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let mut bytes = Vec::new();
+            let mut chunk_lengths = Vec::with_capacity(entry.chunk_count() as usize);
+            for ordinal in 0..entry.chunk_count() {
+                let chunk = chunks.next().unwrap().unwrap();
+                assert_eq!(chunk.path(), entry.path());
+                assert_eq!(chunk.ordinal(), ordinal);
+                let mut reader = capture.open_chunk(&chunk).unwrap();
+                let mut chunk_bytes = Vec::new();
+                reader.read_to_end(&mut chunk_bytes).unwrap();
+                reader.finish().unwrap();
+                chunk_lengths.push(chunk_bytes.len() as u64);
+                bytes.extend_from_slice(&chunk_bytes);
+            }
+            assert_eq!(bytes.len() as u64, entry.description().byte_length());
+            sources.push(BootstrapCapturedSource {
+                path: entry.path().as_str().to_owned(),
+                kind: entry.kind(),
+                logical_name: entry.logical_name().to_owned(),
+                chunk_lengths,
+                bytes,
+            });
         }
-        chunks
+        assert!(chunks.next().unwrap().is_none());
+        sources
     }
 
     #[test]
@@ -43537,7 +43564,7 @@ mod tests {
         let mut many = b"- ".to_vec();
         many.extend(std::iter::repeat_n(b'x', BOOTSTRAP_SOURCE_CHUNK_BYTES * 2));
         many.extend_from_slice(b"\n");
-        fs::write(root.join("pages/many.org"), many).unwrap();
+        fs::write(root.join("pages/many.org"), &many).unwrap();
         let first_scratch = bootstrap_capture_scratch("chunks-first");
         let second_scratch = bootstrap_capture_scratch("chunks-second");
         let graph = Graph::open(&root);
@@ -43547,26 +43574,39 @@ mod tests {
         let second = graph
             .capture_inactive_bootstrap_sources(&second_scratch)
             .unwrap();
+        let first_sources = bootstrap_capture_sources(&first);
+        let second_sources = bootstrap_capture_sources(&second);
+        assert_eq!(first_sources, second_sources);
         assert_eq!(
-            bootstrap_capture_entries(&first),
-            bootstrap_capture_entries(&second)
+            first_sources,
+            vec![
+                BootstrapCapturedSource {
+                    path: "pages/empty.md".to_owned(),
+                    kind: ManagedTextKind::Page,
+                    logical_name: "empty".to_owned(),
+                    chunk_lengths: vec![],
+                    bytes: vec![],
+                },
+                BootstrapCapturedSource {
+                    path: "pages/many.org".to_owned(),
+                    kind: ManagedTextKind::Page,
+                    logical_name: "many".to_owned(),
+                    chunk_lengths: vec![
+                        BOOTSTRAP_SOURCE_CHUNK_BYTES as u64,
+                        BOOTSTRAP_SOURCE_CHUNK_BYTES as u64,
+                        3,
+                    ],
+                    bytes: many,
+                },
+                BootstrapCapturedSource {
+                    path: "pages/one.md".to_owned(),
+                    kind: ManagedTextKind::Page,
+                    logical_name: "one".to_owned(),
+                    chunk_lengths: vec![6],
+                    bytes: b"- one\n".to_vec(),
+                },
+            ]
         );
-        assert_eq!(first.entries, second.entries);
-        assert_eq!(
-            bootstrap_capture_entry_spool(&first),
-            bootstrap_capture_entry_spool(&second)
-        );
-        assert_eq!(
-            bootstrap_capture_chunks(&first),
-            bootstrap_capture_chunks(&second)
-        );
-        let entries = bootstrap_capture_entries(&first);
-        assert_eq!(entries[0].path().as_str(), "pages/empty.md");
-        assert_eq!(entries[0].chunk_count(), 0);
-        assert_eq!(entries[1].chunk_count(), 3);
-        assert_eq!(entries[2].chunk_count(), 1);
-        let chunk = bootstrap_capture_chunks(&first).into_iter().next().unwrap();
-        first.open_chunk(&chunk).unwrap().finish().unwrap();
         assert!(first.instrumentation().peak_owned_rows < 20_000);
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&first_scratch);
@@ -43688,18 +43728,9 @@ mod tests {
         let first = graph.capture_inactive_bootstrap_sources(&scratch).unwrap();
         let second = graph.capture_inactive_bootstrap_sources(&scratch).unwrap();
         assert_eq!(
-            bootstrap_capture_entries(&first),
-            bootstrap_capture_entries(&second)
+            bootstrap_capture_sources(&first),
+            bootstrap_capture_sources(&second)
         );
-        assert_eq!(
-            fs::read(first.sealed_directory.join(BOOTSTRAP_SOURCE_ENTRIES)).unwrap(),
-            fs::read(second.sealed_directory.join(BOOTSTRAP_SOURCE_ENTRIES)).unwrap()
-        );
-        first
-            .open_chunk(&bootstrap_capture_chunks(&first)[0])
-            .unwrap()
-            .finish()
-            .unwrap();
         fs::write(
             first.sealed_directory.join(BOOTSTRAP_SOURCE_MANIFEST),
             b"conflict",
