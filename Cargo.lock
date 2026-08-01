@@ -5580,6 +5580,7 @@ version = "0.6.5"
 dependencies = [
  "cap-fs-ext",
  "cap-std",
+ "fs2",
  "libc",
  "postcard",
  "rusqlite",
