@@ -994,17 +994,22 @@ impl BootstrapProjectionBaseline {
     }
 }
 
-/// Read-only promoted bootstrap-baseline capability.  Reopen authenticates the
-/// manifest in exactly one pass and retains only bounded path locators.  Every
-/// point lookup rereads and authenticates one named manifest entry and, when
-/// present, its one payload file through retained no-follow directory handles.
+/// Read-only promoted bootstrap-baseline capability. Reopen authenticates the
+/// compact promoted binding and retained roots. The first point lookup scans
+/// the immutable manifest once to build bounded path locators; every lookup
+/// then rereads and authenticates its named manifest entry and, when present,
+/// its payload file through retained no-follow directory handles.
 pub(crate) struct BootstrapProjectionAuthority {
     binding: PromotedBootstrapProjectionBindingV1,
     publication: Dir,
     payload: Dir,
-    locators: HashMap<ManagedPath, BootstrapProjectionEntryLocator>,
-    locator_retained_bytes: u64,
+    locators: std::sync::Mutex<Option<BootstrapProjectionLocators>>,
     counters: std::sync::Arc<BootstrapProjectionRuntimeCounters>,
+}
+
+struct BootstrapProjectionLocators {
+    rows: HashMap<ManagedPath, BootstrapProjectionEntryLocator>,
+    retained_bytes: u64,
 }
 
 impl fmt::Debug for BootstrapProjectionAuthority {
@@ -1013,7 +1018,15 @@ impl fmt::Debug for BootstrapProjectionAuthority {
             .debug_struct("BootstrapProjectionAuthority")
             .field("workspace_id", &self.binding.workspace_id)
             .field("publication_id", &self.binding.publication_id)
-            .field("locator_rows", &self.locators.len())
+            .field(
+                "locator_rows",
+                &self
+                    .locators
+                    .lock()
+                    .ok()
+                    .and_then(|locators| locators.as_ref().map(|locators| locators.rows.len()))
+                    .unwrap_or_default(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -1069,19 +1082,11 @@ impl BootstrapProjectionAuthority {
         }
 
         let counters = std::sync::Arc::new(BootstrapProjectionRuntimeCounters::default());
-        let (locators, locator_retained_bytes) =
-            scan_promoted_manifest_once(&publication, binding, &counters)?;
-        if locators.len() as u64 != binding.catalog_rows {
-            return Err(ShadowProjectionError::CorruptOrConflicting(
-                "promoted shadow locator count differs from its catalog binding",
-            ));
-        }
         Ok(Self {
             binding: binding.clone(),
             publication,
             payload,
-            locators,
-            locator_retained_bytes,
+            locators: std::sync::Mutex::new(None),
             counters,
         })
     }
@@ -1094,7 +1099,30 @@ impl BootstrapProjectionAuthority {
         &self,
         path: &ManagedPath,
     ) -> Result<Option<BootstrapProjectionBaseline>, ShadowProjectionError> {
-        let Some(locator) = self.locators.get(path).copied() else {
+        let locator = {
+            let mut locators = self.locators.lock().map_err(|_| {
+                ShadowProjectionError::CorruptOrConflicting(
+                    "promoted shadow locator authority is poisoned",
+                )
+            })?;
+            if locators.is_none() {
+                let (rows, retained_bytes) =
+                    scan_promoted_manifest_once(&self.publication, &self.binding, &self.counters)?;
+                if rows.len() as u64 != self.binding.catalog_rows {
+                    return Err(ShadowProjectionError::CorruptOrConflicting(
+                        "promoted shadow locator count differs from its catalog binding",
+                    ));
+                }
+                *locators = Some(BootstrapProjectionLocators {
+                    rows,
+                    retained_bytes,
+                });
+            }
+            locators
+                .as_ref()
+                .and_then(|locators| locators.rows.get(path).copied())
+        };
+        let Some(locator) = locator else {
             return Ok(None);
         };
         let mut manifest = open_file_nofollow(&self.publication, MANIFEST_FILE)?;
@@ -1159,6 +1187,16 @@ impl BootstrapProjectionAuthority {
 
     #[cfg(test)]
     pub(crate) fn instrumentation(&self) -> BootstrapProjectionAuthorityInstrumentation {
+        let (locator_rows, locator_retained_bytes) = self
+            .locators
+            .lock()
+            .ok()
+            .and_then(|locators| {
+                locators
+                    .as_ref()
+                    .map(|locators| (locators.rows.len(), locators.retained_bytes))
+            })
+            .unwrap_or_default();
         BootstrapProjectionAuthorityInstrumentation {
             manifest_scans: self
                 .counters
@@ -1176,8 +1214,8 @@ impl BootstrapProjectionAuthority {
                 .counters
                 .payload_bytes
                 .load(std::sync::atomic::Ordering::Relaxed),
-            locator_rows: self.locators.len(),
-            locator_retained_bytes: self.locator_retained_bytes,
+            locator_rows,
+            locator_retained_bytes,
             graph_scans: 0,
             fsyncs: 0,
             journal_transitions: 0,
@@ -4504,8 +4542,8 @@ mod tests {
 
         let authority = BootstrapProjectionAuthority::reopen(&fixture.roots, &binding).unwrap();
         let opened = authority.instrumentation();
-        assert_eq!(opened.manifest_scans, 1);
-        assert_eq!(opened.locator_rows, expected.len());
+        assert_eq!(opened.manifest_scans, 0);
+        assert_eq!(opened.locator_rows, 0);
         assert!(opened.locator_retained_bytes <= MAX_BOOTSTRAP_PROJECTION_LOCATOR_RETAINED_BYTES);
         assert_eq!(
             (
@@ -4524,6 +4562,7 @@ mod tests {
         }
         let after_hits = authority.instrumentation();
         assert_eq!(after_hits.manifest_scans, 1);
+        assert_eq!(after_hits.locator_rows, expected.len());
         assert_eq!(after_hits.manifest_entry_reads, expected.len() as u64);
         assert_eq!(after_hits.payload_reads, expected.len() as u64);
         assert!(authority
@@ -4534,7 +4573,7 @@ mod tests {
 
         drop(authority);
         let reopened = BootstrapProjectionAuthority::reopen(&fixture.roots, &binding).unwrap();
-        assert_eq!(reopened.instrumentation().manifest_scans, 1);
+        assert_eq!(reopened.instrumentation().manifest_scans, 0);
         let unicode = ManagedPath::parse(
             expected
                 .keys()
@@ -4618,10 +4657,13 @@ mod tests {
         duplicate_binding.staged_file_count = 2;
         duplicate_binding.manifest = BlobDescription::of(&manifest);
         duplicate_binding.binding_digest = duplicate_binding.compute_binding_digest();
-        let error =
+        let authority =
             BootstrapProjectionAuthority::reopen(&duplicate_fixture.roots, &duplicate_binding)
-                .err()
-                .expect("duplicate path must fail");
+                .unwrap();
+        let error = authority
+            .baseline_at(&ManagedPath::parse("pages/exact.md").unwrap())
+            .err()
+            .expect("duplicate path must fail on first access");
         assert!(error.to_string().contains("duplicated"), "{error}");
 
         let (page_fixture, page_verified) = one("promoted-wrong-page");
@@ -4638,7 +4680,11 @@ mod tests {
         fs::write(&manifest_path, &manifest).unwrap();
         page_binding.manifest = BlobDescription::of(&manifest);
         page_binding.binding_digest = page_binding.compute_binding_digest();
-        assert!(BootstrapProjectionAuthority::reopen(&page_fixture.roots, &page_binding).is_err());
+        let authority =
+            BootstrapProjectionAuthority::reopen(&page_fixture.roots, &page_binding).unwrap();
+        assert!(authority
+            .baseline_at(&ManagedPath::parse("pages/exact.md").unwrap())
+            .is_err());
     }
 
     #[test]

@@ -71,6 +71,11 @@ use crate::oplog::local_active::{
     RuntimeRecoveryState,
 };
 #[cfg(test)]
+use crate::oplog::local_active::{
+    reset_promoted_runtime_open_instrumentation, take_promoted_runtime_open_instrumentation,
+    PromotedRuntimeOpenInstrumentation,
+};
+#[cfg(test)]
 use crate::oplog::migration_backup::MigrationBackupInstrumentation;
 use crate::oplog::migration_backup::{verify_migration_source_backup, MigrationBackupRoot};
 use crate::oplog::object_store::{
@@ -16859,6 +16864,15 @@ mod tests {
         }
 
         fn scaled(label: &str, seed: u128, additional_pages: usize) -> Self {
+            Self::scaled_with_blocks(label, seed, additional_pages, 10)
+        }
+
+        fn scaled_with_blocks(
+            label: &str,
+            seed: u128,
+            additional_pages: usize,
+            blocks_per_page: usize,
+        ) -> Self {
             let fixture = Self::nested_unicode(label, seed);
             for page in 0..additional_pages {
                 let directory = fixture
@@ -16867,7 +16881,7 @@ mod tests {
                 fs::create_dir_all(&directory).unwrap();
                 let mut content =
                     format!("title:: Synthetic {page}\nalias:: Scale Alias {page}\n\n");
-                for block in 0..10 {
+                for block in 0..blocks_per_page {
                     content.push_str(&format!(
                         "- {} task {page}-{block} references [[Synthetic {}]] and #[[scale-tag]]\n  priority:: {}\n  owner:: [[Team {block}]]\n",
                         if block % 2 == 0 { "TODO" } else { "DONE" },
@@ -24200,6 +24214,7 @@ mod tests {
         named_page: StartupBenchmarkNamedPage,
         graph_state: StartupBenchmarkGraphState,
         open: RuntimeOpenInstrumentation,
+        promoted: PromotedRuntimeOpenInstrumentation,
         resume: crate::oplog::hot_engine::RuntimeResumeObservation,
     }
 
@@ -24302,6 +24317,7 @@ mod tests {
     ) -> ManagedStartupBenchmarkReceipt {
         let workspace_id = request.identities.workspace_id;
         reset_runtime_open_instrumentation(workspace_id);
+        reset_promoted_runtime_open_instrumentation(workspace_id);
         let started = Instant::now();
         let opened = SyncRuntimeHandle::open(reopen_request(request));
         let backend_open = started.elapsed();
@@ -24314,6 +24330,7 @@ mod tests {
             .handle
             .expect("active reopen retains a runtime handle");
         let open = take_runtime_open_instrumentation(workspace_id);
+        let promoted = take_promoted_runtime_open_instrumentation(workspace_id);
         let resume = handle
             .engine_instrumentation()
             .expect("managed reopen exposes engine instrumentation")
@@ -24326,6 +24343,14 @@ mod tests {
             open.accounted(),
             open.total,
             "managed-open phases must account for the complete measured startup: {open:?}"
+        );
+        assert!(
+            promoted.total <= open.actor_promoted_runtime_reopen,
+            "promoted-open receipt cannot outlive its actor phase: {promoted:?}, actor={open:?}"
+        );
+        assert!(
+            promoted.engine.total <= promoted.engine_open,
+            "enrolled-engine receipt cannot outlive its caller phase: {promoted:?}"
         );
 
         let started = Instant::now();
@@ -24390,6 +24415,7 @@ mod tests {
             named_page,
             graph_state,
             open,
+            promoted,
             resume,
         }
     }
@@ -24436,6 +24462,32 @@ mod tests {
         )
     }
 
+    fn startup_promoted_open_phase_receipt(
+        promoted: &PromotedRuntimeOpenInstrumentation,
+    ) -> String {
+        let engine = &promoted.engine;
+        format!(
+            "total_ms={:.3} bootstrap_anchor_ms={:.3} enrollment_session_ms={:.3} promotion_state_ms={:.3} mint_ms={:.3} handoff_and_final_proof_ms={:.3} bootstrap_projection_ms={:.3} bootstrap_runtime_authority_ms={:.3} resume_candidate_ms={:.3} engine_open_ms={:.3} sqlite_open_ms={:.3} tail_construction_ms={:.3} engine_total_ms={:.3} engine_construction_ms={:.3} engine_resume_restore_ms={:.3} engine_bootstrap_part_recovery_ms={:.3} engine_bootstrap_parts={}",
+            startup_ms(promoted.total),
+            startup_ms(promoted.bootstrap_anchor),
+            startup_ms(promoted.enrollment_session),
+            startup_ms(promoted.promotion_state),
+            startup_ms(promoted.mint),
+            startup_ms(promoted.handoff_and_final_proof),
+            startup_ms(promoted.bootstrap_projection),
+            startup_ms(promoted.bootstrap_runtime_authority),
+            startup_ms(promoted.resume_candidate),
+            startup_ms(promoted.engine_open),
+            startup_ms(promoted.sqlite_open),
+            startup_ms(promoted.tail_construction),
+            startup_ms(engine.total),
+            startup_ms(engine.engine_construction),
+            startup_ms(engine.resume_restore),
+            startup_ms(engine.bootstrap_part_recovery),
+            engine.bootstrap_parts_examined,
+        )
+    }
+
     #[test]
     #[ignore = "manual release benchmark: 1,000-page direct Markdown versus managed reopen"]
     fn managed_startup_reopen_1000_page_manual_benchmark() {
@@ -24443,20 +24495,33 @@ mod tests {
             !cfg!(debug_assertions),
             "this receipt is release-only; run cargo test -p tine-core --release managed_startup_reopen_1000_page_manual_benchmark -- --ignored --nocapture"
         );
-        const ADDITIONAL_PAGES: usize = 997;
-        const EXPECTED_PAGES: usize = ADDITIONAL_PAGES + 3;
         const NAMED_PAGE: &str = "Synthetic 0";
+        let additional_pages = std::env::var("TINE_MANAGED_STARTUP_BENCH_PAGES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|pages| *pages > 0)
+            .unwrap_or(997);
+        let expected_pages = additional_pages + 3;
+        let blocks_per_page = std::env::var("TINE_MANAGED_STARTUP_BENCH_BLOCKS_PER_PAGE")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|blocks| *blocks > 0)
+            .unwrap_or(10);
         let runs = std::env::var("TINE_MANAGED_STARTUP_BENCH_RUNS")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|runs| *runs > 0)
             .unwrap_or(5);
-        let fixture =
-            ActivationFixture::scaled("managed-startup-reopen-1000-page", 0xa0d0, ADDITIONAL_PAGES);
+        let fixture = ActivationFixture::scaled_with_blocks(
+            "managed-startup-reopen-1000-page",
+            0xa0d0,
+            additional_pages,
+            blocks_per_page,
+        );
         let source = user_graph_bytes(&fixture.graph_root);
         let (source_files, source_bytes, blocks) = activation_source_counts(&fixture.graph_root);
-        assert_eq!(source_files, EXPECTED_PAGES);
-        assert!(source_bytes > 0 && blocks >= ADDITIONAL_PAGES * 10);
+        assert_eq!(source_files, expected_pages);
+        assert!(source_bytes > 0 && blocks >= additional_pages * blocks_per_page);
 
         // Activation/import is intentionally outside the comparison. It happens
         // once, then a successful Safe handoff leaves each measured managed open
@@ -24488,13 +24553,13 @@ mod tests {
             // either backend; each sample still constructs a fresh Graph or actor.
             let (direct_receipt, managed_receipt) = if run % 2 == 0 {
                 let direct =
-                    measure_direct_startup(&fixture.graph_root, NAMED_PAGE, EXPECTED_PAGES);
-                let managed = measure_managed_startup(&fixture.request, NAMED_PAGE, EXPECTED_PAGES);
+                    measure_direct_startup(&fixture.graph_root, NAMED_PAGE, expected_pages);
+                let managed = measure_managed_startup(&fixture.request, NAMED_PAGE, expected_pages);
                 (direct, managed)
             } else {
-                let managed = measure_managed_startup(&fixture.request, NAMED_PAGE, EXPECTED_PAGES);
+                let managed = measure_managed_startup(&fixture.request, NAMED_PAGE, expected_pages);
                 let direct =
-                    measure_direct_startup(&fixture.graph_root, NAMED_PAGE, EXPECTED_PAGES);
+                    measure_direct_startup(&fixture.graph_root, NAMED_PAGE, expected_pages);
                 (direct, managed)
             };
             assert_eq!(
@@ -24506,7 +24571,7 @@ mod tests {
                 "direct whole-graph parse and managed whole-graph query must expose the same pages"
             );
             eprintln!(
-                "managed_startup_bench run={} direct_open_ms={:.3} direct_first_named_page_ms={:.3} direct_whole_graph_on_demand_ms={:.3} direct_paced_background_warmer_ms={:.3} managed_open_ms={:.3} managed_first_named_page_ms={:.3} managed_whole_graph_on_demand_ms={:.3} managed_deferred_catch_up_and_shutdown_ms={:.3} managed_resume={:?} managed_open_phases: {}",
+                "managed_startup_bench run={} direct_open_ms={:.3} direct_first_named_page_ms={:.3} direct_whole_graph_on_demand_ms={:.3} direct_paced_background_warmer_ms={:.3} managed_open_ms={:.3} managed_first_named_page_ms={:.3} managed_whole_graph_on_demand_ms={:.3} managed_deferred_catch_up_and_shutdown_ms={:.3} managed_resume={:?} managed_open_phases: {} managed_promoted_open_phases: {}",
                 run + 1,
                 startup_ms(direct_receipt.milestones.backend_open),
                 startup_ms(direct_receipt.milestones.first_named_page),
@@ -24518,6 +24583,7 @@ mod tests {
                 startup_ms(managed_receipt.deferred_catch_up_and_shutdown),
                 managed_receipt.resume,
                 startup_open_phase_receipt(&managed_receipt.open),
+                startup_promoted_open_phase_receipt(&managed_receipt.promoted),
             );
             direct.push(direct_receipt);
             managed.push(managed_receipt);

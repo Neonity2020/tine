@@ -271,8 +271,15 @@
 //! derived from *both* a live [`LocalActiveAuthority`] and the exact
 //! [`PromotedLocalRuntime`].
 
+#[cfg(test)]
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Mutex;
+#[cfg(test)]
+use std::time::{Duration, Instant};
 
 use crate::model::Graph;
 
@@ -356,6 +363,87 @@ pub(crate) struct PromotedRuntimeInstrumentation {
     /// plus one no-follow resolution of the exact lease pathname each. It is a
     /// boundary fact, so an unchanged-head admission must perform none.
     pub(crate) workspace_lease_identity_revalidations: usize,
+}
+
+/// Test-only phase receipt for the promoted-runtime portion of an existing
+/// managed open. It is keyed by workspace because the actor thread emits it
+/// and the benchmark caller consumes it after the thread joins.
+#[cfg(test)]
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PromotedRuntimeOpenInstrumentation {
+    pub(crate) total: Duration,
+    pub(crate) bootstrap_anchor: Duration,
+    pub(crate) enrollment_session: Duration,
+    pub(crate) promotion_state: Duration,
+    pub(crate) mint: Duration,
+    pub(crate) handoff_and_final_proof: Duration,
+    pub(crate) bootstrap_projection: Duration,
+    pub(crate) bootstrap_runtime_authority: Duration,
+    pub(crate) resume_candidate: Duration,
+    pub(crate) engine_open: Duration,
+    pub(crate) sqlite_open: Duration,
+    pub(crate) tail_construction: Duration,
+    pub(crate) engine: super::hot_engine::EnrolledProjectionOpenInstrumentation,
+}
+
+#[cfg(test)]
+static PROMOTED_RUNTIME_OPEN_INSTRUMENTATION: Mutex<
+    BTreeMap<WorkspaceId, PromotedRuntimeOpenInstrumentation>,
+> = Mutex::new(BTreeMap::new());
+
+#[cfg(test)]
+pub(crate) fn reset_promoted_runtime_open_instrumentation(workspace: WorkspaceId) {
+    PROMOTED_RUNTIME_OPEN_INSTRUMENTATION
+        .lock()
+        .unwrap()
+        .remove(&workspace);
+}
+
+#[cfg(test)]
+pub(crate) fn take_promoted_runtime_open_instrumentation(
+    workspace: WorkspaceId,
+) -> PromotedRuntimeOpenInstrumentation {
+    PROMOTED_RUNTIME_OPEN_INSTRUMENTATION
+        .lock()
+        .unwrap()
+        .remove(&workspace)
+        .expect("promoted runtime timing was recorded")
+}
+
+#[cfg(test)]
+fn record_promoted_runtime_mint(
+    workspace: WorkspaceId,
+    timing: PromotedRuntimeOpenInstrumentation,
+) {
+    let mut records = PROMOTED_RUNTIME_OPEN_INSTRUMENTATION.lock().unwrap();
+    let record = records.entry(workspace).or_default();
+    record.bootstrap_projection = timing.bootstrap_projection;
+    record.bootstrap_runtime_authority = timing.bootstrap_runtime_authority;
+    record.resume_candidate = timing.resume_candidate;
+    record.engine_open = timing.engine_open;
+    record.sqlite_open = timing.sqlite_open;
+    record.tail_construction = timing.tail_construction;
+    record.engine = timing.engine;
+}
+
+#[cfg(test)]
+fn record_promoted_runtime_reopen(
+    workspace: WorkspaceId,
+    total: Duration,
+    bootstrap_anchor: Duration,
+    enrollment_session: Duration,
+    promotion_state: Duration,
+    mint: Duration,
+    handoff_and_final_proof: Duration,
+) {
+    let mut records = PROMOTED_RUNTIME_OPEN_INSTRUMENTATION.lock().unwrap();
+    let record = records.entry(workspace).or_default();
+    record.total = total;
+    record.bootstrap_anchor = bootstrap_anchor;
+    record.enrollment_session = enrollment_session;
+    record.promotion_state = promotion_state;
+    record.mint = mint;
+    record.handoff_and_final_proof = handoff_and_final_proof;
 }
 
 #[cfg(test)]
@@ -4343,7 +4431,13 @@ fn reopen_promoted_local_runtime_with_adoption(
     publication: TakeoverPublication,
     projection_open: PromotedProjectionOpen,
 ) -> Result<(LocalActiveAuthority, PromotedLocalRuntime), RuntimePromotionError> {
+    #[cfg(test)]
+    let reopened_started = Instant::now();
+    #[cfg(test)]
+    let phase_started = Instant::now();
     let anchor = reopen_promoted_bootstrap_anchor(root, binding)?;
+    #[cfg(test)]
+    let bootstrap_anchor = phase_started.elapsed();
     // The committed record decides which of the three durable predecessors this
     // open is recovering from. A competing session is refused here, before any
     // archive, engine, SQLite, or lease work happens, unless this is an explicit
@@ -4385,8 +4479,16 @@ fn reopen_promoted_local_runtime_with_adoption(
     // work, exactly as the documented global lock order requires. The promoted
     // runtime retains this session for its whole lifetime, so it is acquired
     // once, here, and every journal mutation below borrows it.
+    #[cfg(test)]
+    let phase_started = Instant::now();
     let enrollment = RetainedEnrollmentSession::open(root, binding, anchor.verification_digest())?;
+    #[cfg(test)]
+    let enrollment_session = phase_started.elapsed();
+    #[cfg(test)]
+    let phase_started = Instant::now();
     let state = read_promotion_state_for_anchor(open.archive_root, binding, &anchor)?;
+    #[cfg(test)]
+    let promotion_state = phase_started.elapsed();
     // The archive-rooted workspace runtime lease is taken inside this call and
     // retained for the whole writable runtime. The line above has already read
     // the archive's durable promoted-runtime state — unavoidably, since a
@@ -4394,6 +4496,8 @@ fn reopen_promoted_local_runtime_with_adoption(
     // — so the accurate claim is that nothing read before the lease can become
     // authority: `authorize_promoted_lineage` rereads this exact state under
     // the lease and requires byte equality before it authorizes anything.
+    #[cfg(test)]
+    let phase_started = Instant::now();
     let mut runtime = mint_promoted_runtime(
         state,
         enrollment,
@@ -4408,6 +4512,10 @@ fn reopen_promoted_local_runtime_with_adoption(
         projection_open,
         None,
     )?;
+    #[cfg(test)]
+    let mint = phase_started.elapsed();
+    #[cfg(test)]
+    let handoff_started = Instant::now();
 
     // Only now, with complete recovery proved, may an authority exist. The
     // durable handoff protocol is the existing one: an `Unsafe { session }`
@@ -4511,6 +4619,16 @@ fn reopen_promoted_local_runtime_with_adoption(
     // This is a recovery boundary, so it is the unabridged proof.
     runtime.prove_binding(open.graph, &authority, BindingProofDepth::Boundary)?;
     automatically_publish_post_open(&mut runtime, &authority, open.graph);
+    #[cfg(test)]
+    record_promoted_runtime_reopen(
+        binding.workspace_id(),
+        reopened_started.elapsed(),
+        bootstrap_anchor,
+        enrollment_session,
+        promotion_state,
+        mint,
+        handoff_started.elapsed(),
+    );
     Ok((authority, runtime))
 }
 
@@ -4608,16 +4726,18 @@ fn read_promotion_state_for_anchor(
     Ok(state)
 }
 
-/// Prove the promoted lineage's retained immutable publication and durable
-/// reference-catalog authority are both present and exactly this lineage's.
+/// Prove the promoted lineage's retained immutable publication and compact
+/// durable-history authority are both present and exactly this lineage's.
 ///
-/// Everything here is derived from the retained cold record and publication,
-/// never from process-local evidence, so a restarted process derives it exactly
-/// the same way.
+/// Current record/index/reference authority is authenticated once by the engine
+/// open below. Keeping this boundary compact avoids decoding and traversing the
+/// same graph-sized authority before the engine receives its sealed history
+/// capability.
 struct AuthenticatedBootstrapRuntimeAuthority {
     history: EngineHistoryAuthority,
     latest_batch_id: Option<BatchId>,
     engine_binding: EngineHistoryBinding,
+    publication: Arc<super::object_store::ValidatedBootstrapPublicationV1>,
 }
 
 fn same_process_token_matches(
@@ -4662,6 +4782,7 @@ fn same_process_token_matches(
 fn require_promoted_bootstrap_runtime_authority(
     archive: &ObjectStore,
     state: &PromotedRuntimeStateV1,
+    defer_immutable_leaves: bool,
 ) -> Result<AuthenticatedBootstrapRuntimeAuthority, RuntimePromotionError> {
     // Duplicated from the caller's already-authenticated retained capability,
     // never reopened from `archive.root_path()`: the promoted lineage's runtime
@@ -4674,21 +4795,19 @@ fn require_promoted_bootstrap_runtime_authority(
     }
     let (generation, index_root, latest_batch_id, engine_binding) =
         history.current_with_binding()?;
-    let binding = super::hot_engine::bootstrap_reference_catalog_binding(&history)?;
-    drop(history);
-    if let Some((_policy, root)) = binding {
-        // The retained immutable publication must still load and be exactly this
-        // lineage's publication before any runtime authority is derived from it.
-        let publication = store.load_bootstrap_publication(state.bootstrap.publication_id())?;
-        if publication.aggregate().aggregate_digest() != state.bootstrap.aggregate_digest()
-            || publication.aggregate().import_id() != state.bootstrap_import_id
-        {
-            return Err(RuntimePromotionError::Anchor(
-                "retained bootstrap publication is not the promoted lineage's publication",
-            ));
-        }
-        super::hot_engine::require_promoted_bootstrap_reference_catalog(&store, &root)
-            .map_err(RuntimePromotionError::Engine)?;
+    // The retained immutable publication must still load and be exactly this
+    // lineage's publication before any runtime authority is derived from it.
+    let publication = if defer_immutable_leaves {
+        store.load_bootstrap_publication_deferred(state.bootstrap.publication_id())?
+    } else {
+        store.load_bootstrap_publication(state.bootstrap.publication_id())?
+    };
+    if publication.aggregate().aggregate_digest() != state.bootstrap.aggregate_digest()
+        || publication.aggregate().import_id() != state.bootstrap_import_id
+    {
+        return Err(RuntimePromotionError::Anchor(
+            "retained bootstrap publication is not the promoted lineage's publication",
+        ));
     }
     Ok(AuthenticatedBootstrapRuntimeAuthority {
         history: EngineHistoryAuthority {
@@ -4697,6 +4816,7 @@ fn require_promoted_bootstrap_runtime_authority(
         },
         latest_batch_id,
         engine_binding,
+        publication: Arc::new(publication),
     })
 }
 
@@ -4726,6 +4846,10 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
     projection_open: PromotedProjectionOpen,
     same_process: Option<SameProcessPromotionToken>,
 ) -> Result<PromotedLocalRuntime, W::Refusal> {
+    #[cfg(test)]
+    let workspace_id = state.workspace_id;
+    #[cfg(test)]
+    let mut timing = PromotedRuntimeOpenInstrumentation::default();
     // Everything below stays in one stack frame on purpose: `PromotedLocalRuntime`
     // and the recovered engine are tens of kilobytes, so an extra function
     // boundary would copy them again on a debug-build test stack. The three
@@ -4788,6 +4912,8 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
         &state,
         "promoted archive control directory identity changed",
     ));
+    #[cfg(test)]
+    let phase_started = Instant::now();
     let backup_roots = match MigrationBackupRoot::open(open.migration_backup_root, open.graph_root)
     {
         Ok(roots) => roots,
@@ -4807,13 +4933,10 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
             )),
         };
     drop(backup_roots);
-    // The retained immutable publication and the durable reference-catalog
-    // authority the cold record binds must both be present before the enrolled
-    // open recovers from them.
-    let bootstrap_runtime_authority = try_release!(require_promoted_bootstrap_runtime_authority(
-        &archive, &state
-    ));
-
+    #[cfg(test)]
+    {
+        timing.bootstrap_projection = phase_started.elapsed();
+    }
     // ---- Resume accelerator selection, under the retained workspace lease. ----
     //
     // Authority boundary. A published resume point names a retained scratch run
@@ -4825,6 +4948,8 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
     // been written.
     #[cfg(test)]
     resume_lifecycle_cut_reached(ResumeLifecycleCut::BeforeCandidateRead);
+    #[cfg(test)]
+    let phase_started = Instant::now();
     try_release!(workspace_lease.revalidate_identity());
     // Both reads go through a duplicate of the *retained* archive capability —
     // never a re-resolved pathname — so the same physical directory the lease
@@ -4849,6 +4974,10 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
         };
         (plan, candidate)
     };
+    #[cfg(test)]
+    {
+        timing.resume_candidate = phase_started.elapsed();
+    }
 
     // Recovery replays the archive's committed manifests. This is the existing
     // enrolled-recovery cost and reads no graph text.
@@ -4879,6 +5008,21 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
             )),
         ),
     };
+    // A usable candidate already authenticates the adopted current frontier,
+    // so bootstrap part/source leaves may stay lazy. Every fallback performs
+    // the historical validation, and an engine-side adoption refusal upgrades
+    // this compact publication proof before replay.
+    #[cfg(test)]
+    let phase_started = Instant::now();
+    let bootstrap_runtime_authority = try_release!(require_promoted_bootstrap_runtime_authority(
+        &archive,
+        &state,
+        snapshot.is_some(),
+    ));
+    #[cfg(test)]
+    {
+        timing.bootstrap_runtime_authority = phase_started.elapsed();
+    }
     let mut verified_same_process_sqlite = None;
     let migrated = match (same_process, &retention_plan) {
         (Some(token), EngineScratchRetentionPlan::Retained { .. })
@@ -4942,6 +5086,8 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
             resume: snapshot.as_deref(),
         },
     };
+    #[cfg(test)]
+    let phase_started = Instant::now();
     let (engine, receipt, _outcomes) =
         try_release!(ShardedHotEngine::open_enrolled_projection_with_retention(
             archive,
@@ -4952,7 +5098,13 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
             Some(&state),
             &committed_manifests,
             retention,
+            Some(Arc::clone(&bootstrap_runtime_authority.publication)),
         ));
+    #[cfg(test)]
+    {
+        timing.engine_open = phase_started.elapsed();
+        timing.engine = super::hot_engine::take_enrolled_projection_open_instrumentation();
+    }
     if let Some(error) = receipt.refusal.as_ref() {
         unavailable = Some(ResumeAcceleratorUnavailable::Unavailable(format!(
             "runtime resume restore refused: {error}"
@@ -5029,9 +5181,7 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
     // immutable bootstrap parts, which live in the archive's bootstrap
     // namespace rather than the ordinary object namespace. The publication
     // identity comes from the authorized promotion state.
-    let publication = try_release!(store
-        .load_bootstrap_publication(state.bootstrap.publication_id())
-        .map_err(RuntimePromotionError::Store));
+    let publication = Arc::clone(&bootstrap_runtime_authority.publication);
     let projection_open = if verified_same_process_sqlite.is_some() {
         PromotedProjectionOpen::ExistingOnly
     } else {
@@ -5042,6 +5192,8 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
     // a second, temporary workspace lease of its own. A failed open returns the
     // slot *and* the lease, which is what makes it retryable without ever
     // releasing the archive.
+    #[cfg(test)]
+    let phase_started = Instant::now();
     let (projection, ()) = match LeasedWorkspaceProjection::open_under::<(), ProjectionError>(
         workspace_lease,
         |slot| {
@@ -5075,6 +5227,10 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
             return Err(custody.refuse_returning(lease, RuntimePromotionError::Sqlite(error)))
         }
     };
+    #[cfg(test)]
+    {
+        timing.sqlite_open = phase_started.elapsed();
+    }
 
     // The lease now lives inside `projection`, so a failure has to close the
     // database to get it back — which releases the database-adjacent lock and
@@ -5111,6 +5267,8 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
             close_and_release!(RuntimePromotionError::Sqlite(error));
         }
     }
+    #[cfg(test)]
+    let phase_started = Instant::now();
     let tail_source = match RebuildSource::from_promoted_runtime(&engine, store, &publication) {
         Ok(source) => source,
         Err(error) => close_and_release!(RuntimePromotionError::from(error)),
@@ -5124,6 +5282,10 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
             LocalActivationError::RuntimeBinding(other.to_string()),
         )),
     };
+    #[cfg(test)]
+    {
+        timing.tail_construction = phase_started.elapsed();
+    }
     // The archive identity facts above were authenticated for exactly this
     // session binding generation, so an unchanged-head admission may carry
     // them and any change forces the reread again.
@@ -5164,6 +5326,8 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
     if let Some((authority, graph)) = post_open {
         automatically_publish_post_open(&mut runtime, authority, graph);
     }
+    #[cfg(test)]
+    record_promoted_runtime_mint(workspace_id, timing);
     Ok(*runtime)
 }
 

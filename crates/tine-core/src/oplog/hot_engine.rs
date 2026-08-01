@@ -40,10 +40,11 @@ use super::portable_path_index::{
     PortablePathReleased,
 };
 use super::reference_catalog::{
-    affected_reference_sources, reference_source_is_org, ReferenceCandidateTargetV2,
-    ReferenceCatalogCandidateV2, ReferenceCatalogDeltaV2, ReferenceCatalogError,
-    ReferenceCatalogPolicyV1, ReferenceCatalogPreparedCandidateV2, ReferenceCatalogRootV2,
-    ReferenceCatalogStateV2, ReferenceCatalogStore, ReferenceSourceBlockV1, ReferenceSourcePageV1,
+    affected_reference_sources, reference_source_is_org, AuthenticatedReferenceCatalogRootNodes,
+    ReferenceCandidateTargetV2, ReferenceCatalogCandidateV2, ReferenceCatalogDeltaV2,
+    ReferenceCatalogError, ReferenceCatalogPolicyV1, ReferenceCatalogPreparedCandidateV2,
+    ReferenceCatalogRootV2, ReferenceCatalogStateV2, ReferenceCatalogStore, ReferenceSourceBlockV1,
+    ReferenceSourcePageV1,
 };
 #[cfg(test)]
 use super::reference_catalog::{
@@ -2677,57 +2678,6 @@ pub(crate) fn replay_direct_loaded_bootstrap_validating_history(
     Ok((candidate, terminal_history_binding))
 }
 
-/// The reference-catalog policy and root the latest immutable cold record binds.
-///
-/// Returns `None` for an empty history, which binds no record at all.
-pub(crate) fn bootstrap_reference_catalog_binding(
-    history: &super::object_store::DurableEngineHistoryStore,
-) -> Result<Option<(ReferenceCatalogPolicyV1, ReferenceCatalogRootV2)>, EngineError> {
-    let (_, index_root, latest_batch_id, _) = history
-        .current_with_binding()
-        .map_err(|error| EngineError::Archive(error.to_string()))?;
-    let Some(latest_batch_id) = latest_batch_id else {
-        return Ok(None);
-    };
-    let bytes = history
-        .lookup(index_root, latest_batch_id)
-        .map_err(|error| EngineError::Archive(error.to_string()))?
-        .ok_or_else(|| EngineError::Archive("latest durable history record is absent".into()))?;
-    history.note_history_decode();
-    let record = decode_history_record(latest_batch_id, &bytes)?;
-    Ok(Some((
-        record.reference_catalog_policy,
-        record.reference_catalog_root,
-    )))
-}
-
-/// Prove the durable reference catalog a promoted lineage needs is present.
-///
-/// Bootstrap authoring, bootstrap replay, and the promoted enrolled runtime all
-/// build the reference catalog in the same durable authenticated Patricia store
-/// of the same archive, so the catalog root every accepted cold record binds is
-/// openable there by construction. This check is that invariant made explicit
-/// at the promotion boundary: it fully validates the bound root against the
-/// live durable store before any runtime authority is derived from it, and
-/// fails closed on a missing, truncated, or divergent catalog rather than
-/// reinterpreting or rebuilding the root under a different construction.
-pub(crate) fn require_promoted_bootstrap_reference_catalog(
-    store: &ObjectStore,
-    expected_root: &ReferenceCatalogRootV2,
-) -> Result<(), EngineError> {
-    let catalog = store
-        .open_reference_catalog()
-        .map_err(|error| EngineError::Archive(error.to_string()))?;
-    catalog
-        .validate_catalog_root(expected_root)
-        .map_err(|error| {
-            EngineError::ReferenceCatalog(format!(
-                "promoted archive has no durable reference catalog for the catalog root its \
-                 immutable cold record binds: {error}"
-            ))
-        })
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProjectionEndpointBinding {
     pub(crate) endpoint_id: ProjectionEndpointId,
@@ -3668,6 +3618,19 @@ struct ColdHistoryRecord {
     reference_catalog_policy: ReferenceCatalogPolicyV1,
     reference_catalog_root: ReferenceCatalogRootV2,
     status: ArchiveStatus,
+}
+
+/// Move-only proof of the current durable authority established by the
+/// enrolled open before recovery resets run-local state.
+///
+/// It retains exactly one decoded current record, never historical records.
+/// Exact-current resume consumes it; stale or refused resume drops it and takes
+/// the unchanged full replay path.
+struct CurrentDurableAuthorityProof {
+    history: super::object_store::EngineHistoryAuthority,
+    latest_batch_id: BatchId,
+    record: ColdHistoryRecord,
+    reference_catalog_root_nodes: AuthenticatedReferenceCatalogRootNodes,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -5010,6 +4973,55 @@ pub(crate) struct RuntimeResumeReceipt {
     pub(crate) refusal: Option<EngineError>,
 }
 
+/// Test-only phase receipt for the enrolled engine portion of a promoted
+/// runtime reopen. The lifecycle receipt consumes this on the actor thread;
+/// production opens neither take clocks nor retain a receipt.
+#[cfg(test)]
+#[derive(Clone, Debug, Default)]
+pub(crate) struct EnrolledProjectionOpenInstrumentation {
+    pub(crate) total: std::time::Duration,
+    pub(crate) engine_construction: std::time::Duration,
+    pub(crate) resume_restore: std::time::Duration,
+    pub(crate) bootstrap_part_recovery: std::time::Duration,
+    pub(crate) bootstrap_parts_examined: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    static ENROLLED_PROJECTION_OPEN_INSTRUMENTATION:
+        RefCell<Option<EnrolledProjectionOpenInstrumentation>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn reset_enrolled_projection_open_instrumentation() {
+    ENROLLED_PROJECTION_OPEN_INSTRUMENTATION.with(|slot| {
+        *slot.borrow_mut() = Some(EnrolledProjectionOpenInstrumentation::default());
+    });
+}
+
+#[cfg(test)]
+fn update_enrolled_projection_open_instrumentation(
+    update: impl FnOnce(&mut EnrolledProjectionOpenInstrumentation),
+) {
+    ENROLLED_PROJECTION_OPEN_INSTRUMENTATION.with(|slot| {
+        update(
+            slot.borrow_mut()
+                .as_mut()
+                .expect("enrolled projection timing was initialized"),
+        );
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn take_enrolled_projection_open_instrumentation(
+) -> EnrolledProjectionOpenInstrumentation {
+    ENROLLED_PROJECTION_OPEN_INSTRUMENTATION.with(|slot| {
+        slot.borrow_mut()
+            .take()
+            .expect("enrolled projection timing was recorded")
+    })
+}
+
 pub(crate) enum AcceptedBatchCursor<'a> {
     Scratch(super::scratch_store::ScratchAcceptedSequenceCursor<'a>),
     Inline(std::collections::btree_map::Iter<'a, u64, BatchId>),
@@ -5127,6 +5139,9 @@ pub struct ShardedHotEngine {
     history_failure: Option<EngineError>,
     durable_authority_mode: DurableAuthorityMode,
     authenticated_history_replay: bool,
+    current_durable_authority: Option<CurrentDurableAuthorityProof>,
+    validated_run_local_current_authority: Option<super::object_store::EngineHistoryAuthority>,
+    adoptable_current_history_head: Option<(super::object_store::EngineHistoryAuthority, BatchId)>,
     /// Highest durable history generation already covered by an *authenticated
     /// predecessor state* rather than by this replay.
     ///
@@ -5168,6 +5183,7 @@ pub struct ShardedHotEngine {
     fatal_evidence: Option<ImmutableHomeEvidence>,
     fatal_handle: Option<FatalEvidenceHandle>,
     visible_documents: BTreeMap<DocumentId, LoroDoc>,
+    lazy_catalog_document: OnceLock<Result<Option<LoroDoc>, EngineError>>,
     // A second current-state buffer is reused across ordinary authorship.
     // It accumulates the same incremental updates as the visible buffer, so
     // preparing the next bounded edit never snapshots accumulated CRDT history.
@@ -5289,6 +5305,9 @@ impl ShardedHotEngine {
             history_failure: None,
             durable_authority_mode: DurableAuthorityMode::Ephemeral,
             authenticated_history_replay: false,
+            current_durable_authority: None,
+            validated_run_local_current_authority: None,
+            adoptable_current_history_head: None,
             replay_base_generation: 0,
             resume_observation: RuntimeResumeObservation::default(),
             authenticated_replayed_batches: BTreeSet::new(),
@@ -5315,6 +5334,7 @@ impl ShardedHotEngine {
             fatal_evidence: None,
             fatal_handle: None,
             visible_documents: BTreeMap::new(),
+            lazy_catalog_document: OnceLock::new(),
             spare_documents: RefCell::new(BTreeMap::new()),
             pending_author_documents: RefCell::new(None),
             visible_document_lru: VecDeque::new(),
@@ -5502,6 +5522,7 @@ impl ShardedHotEngine {
             receipts,
             None,
             None,
+            false,
         )
     }
 
@@ -5527,6 +5548,7 @@ impl ShardedHotEngine {
             receipts,
             Some(promotion),
             None,
+            false,
         )
     }
 
@@ -5595,6 +5617,7 @@ impl ShardedHotEngine {
             promotion,
             committed_manifests,
             EngineOpenRetention::Retained { resume },
+            None,
         )
     }
 
@@ -5621,7 +5644,12 @@ impl ShardedHotEngine {
         promotion: Option<&super::object_store::PromotedRuntimeStateV1>,
         committed_manifests: &[OperationBatch],
         retention: EngineOpenRetention<'_>,
+        bootstrap_publication: Option<Arc<super::object_store::ValidatedBootstrapPublicationV1>>,
     ) -> Result<(Self, RuntimeResumeReceipt, Vec<StageOutcome>), EngineError> {
+        #[cfg(test)]
+        reset_enrolled_projection_open_instrumentation();
+        #[cfg(test)]
+        let open_started = Instant::now();
         // Stage one: try to take the named run, on the still-borrowed archive
         // capability, before anything is moved into an engine. A refusal here
         // is a plain fallback, so the fresh run is minted from the same
@@ -5664,6 +5692,8 @@ impl ShardedHotEngine {
             }
         };
         let adopted = migrated_resume.as_deref().or(adopted);
+        #[cfg(test)]
+        let phase_started = Instant::now();
         let mut engine = Self::with_enrolled_projection_promoted(
             store,
             lineage_digest,
@@ -5672,7 +5702,12 @@ impl ShardedHotEngine {
             receipts,
             promotion,
             retained,
+            adopted.is_some(),
         );
+        #[cfg(test)]
+        update_enrolled_projection_open_instrumentation(|timing| {
+            timing.engine_construction = phase_started.elapsed();
+        });
         // An archive-boundary refusal — absent, leased, ephemeral or foreign
         // marker, torn entry set, binding mismatch — is a refusal exactly like a
         // restore-time one. It happens before the engine exists, so it is
@@ -5685,12 +5720,25 @@ impl ShardedHotEngine {
             engine.resume_observation.refused = true;
         }
         if engine.history_failure.is_none() {
-            if let Err(error) = engine.attach_promoted_bootstrap_parts() {
+            let attached = match bootstrap_publication {
+                Some(publication) => engine.attach_promoted_bootstrap_publication(publication),
+                None => engine.attach_promoted_bootstrap_parts(),
+            };
+            if let Err(error) = attached {
+                engine.history_failure = Some(error);
+            }
+        }
+        if refusal.is_some() && engine.history_failure.is_none() {
+            if let Err(error) = engine.validate_retained_bootstrap_publication() {
                 engine.history_failure = Some(error);
             }
         }
         let (outcomes, rotated) =
             engine.complete_enrolled_projection_recovery_resuming(committed_manifests, adopted)?;
+        #[cfg(test)]
+        update_enrolled_projection_open_instrumentation(|timing| {
+            timing.total = open_started.elapsed();
+        });
         if let Some((run_id, error)) = rotated {
             refused_run_id = Some(run_id);
             refusal = Some(error);
@@ -5715,6 +5763,7 @@ impl ShardedHotEngine {
         receipts: &ProjectionReceiptStore,
         promotion: Option<&super::object_store::PromotedRuntimeStateV1>,
         retained: Option<super::object_store::RetainedEngineScratch>,
+        retain_current_authority: bool,
     ) -> Self {
         let workspace_id = store.workspace_id();
         let endpoint = receipts.endpoint_binding();
@@ -5761,6 +5810,7 @@ impl ShardedHotEngine {
                 lineage_digest,
                 catalog_document_id,
                 retained,
+                retain_current_authority,
             ),
             Err((store, error)) => Self::failed_archive_open(
                 store,
@@ -5809,6 +5859,7 @@ impl ShardedHotEngine {
             lineage_digest,
             catalog_document_id,
             None,
+            false,
         )
     }
 
@@ -5817,6 +5868,7 @@ impl ShardedHotEngine {
         lineage_digest: LineageDigest,
         catalog_document_id: DocumentId,
         retained: Option<super::object_store::RetainedEngineScratch>,
+        retain_current_authority: bool,
     ) -> Self {
         let binding = open.binding();
         let endpoint = binding.endpoint;
@@ -5954,8 +6006,14 @@ impl ShardedHotEngine {
                                 .as_ref()
                                 .expect("history store installed before page-name proof")
                                 .note_history_decode();
-                            let record = decode_history_record(latest_batch_id, &bytes)?;
-                            engine.validate_record_catalog_transition(&record)?;
+                            let record = if retain_current_authority {
+                                decode_authenticated_current_history_leaf(latest_batch_id, &bytes)?
+                            } else {
+                                decode_history_record(latest_batch_id, &bytes)?
+                            };
+                            if !retain_current_authority {
+                                engine.validate_record_catalog_transition(&record)?;
+                            }
                             if record.generation != generation
                                 || history_record_binding(&record) != binding
                                 || (!record.page_names.conflicts.is_empty()
@@ -5992,13 +6050,29 @@ impl ShardedHotEngine {
                                 })?;
                             engine.reference_catalog =
                                 ReferenceCatalogStateV2::restore_recovery_required(
-                                    record.reference_catalog_policy,
-                                    record.reference_catalog_root,
+                                    record.reference_catalog_policy.clone(),
+                                    record.reference_catalog_root.clone(),
                                     &record.page_names.ownership_root,
                                     record.logseq_claim_root.digest(),
                                     reference_store,
                                 )
                                 .map_err(|error| EngineError::Archive(error.to_string()))?;
+                            if retain_current_authority {
+                                let reference_catalog_root_nodes =
+                                    engine.reference_catalog.authenticate_root_nodes().map_err(
+                                        |error| EngineError::ReferenceCatalog(error.to_string()),
+                                    )?;
+                                engine.current_durable_authority =
+                                    Some(CurrentDurableAuthorityProof {
+                                        history: super::object_store::EngineHistoryAuthority {
+                                            generation,
+                                            index_root: root,
+                                        },
+                                        latest_batch_id,
+                                        record,
+                                        reference_catalog_root_nodes,
+                                    });
+                            }
                         }
                     }
                     Ok(())
@@ -6101,15 +6175,22 @@ impl ShardedHotEngine {
         self.prepare_operational_recovery_replay()?;
         let mut rotation = None;
         if let Some(snapshot) = resume {
+            #[cfg(test)]
+            let phase_started = Instant::now();
             if let Err(refusal) = self.restore_adopted_predecessor_state(snapshot) {
                 // The restore is all-or-nothing: it validates everything before
                 // it installs anything, so the engine is still exactly at the
                 // baseline `prepare_operational_recovery_replay` produced. All
                 // that is left is to stop writing into the run we no longer
                 // trust — its bytes stay untouched — and replay everything.
+                self.validate_retained_bootstrap_publication()?;
                 let refused = self.rotate_to_fresh_retained_scratch()?;
                 rotation = Some((refused, refusal));
             }
+            #[cfg(test)]
+            update_enrolled_projection_open_instrumentation(|timing| {
+                timing.resume_restore = phase_started.elapsed();
+            });
         }
         let mut outcomes = Vec::with_capacity(committed_manifests.len());
         // A promoted lineage's oldest durable records are its bootstrap parts,
@@ -6122,36 +6203,51 @@ impl ShardedHotEngine {
         // conflict with `&mut self` staging. Each part is then loaded, staged,
         // and dropped before the next ordinal is read, so restart resident
         // memory is one bootstrap part rather than the whole graph.
+        #[cfg(test)]
+        let phase_started = Instant::now();
         if let Some(plan) = self.retained_bootstrap_recovery_plan()? {
-            for ordinal in 0..plan.part_count {
-                let part = plan
-                    .publication
-                    .aggregate()
-                    .parts()
-                    .get(ordinal)
-                    .ok_or_else(|| {
-                        EngineError::Archive(
-                            "retained bootstrap publication lost a part ordinal".into(),
-                        )
-                    })?
-                    .batch_id();
-                // One authenticated point lookup, and no part payload load at
-                // all, decides whether the adopted predecessor already covers
-                // this ordinal.
-                if self.covered_by_predecessor_state(part)? {
-                    continue;
+            if !self.adopted_predecessor_covers_bootstrap(&plan)? {
+                #[cfg(test)]
+                update_enrolled_projection_open_instrumentation(|timing| {
+                    timing.bootstrap_parts_examined = plan.part_count;
+                });
+                for ordinal in 0..plan.part_count {
+                    let part = plan
+                        .publication
+                        .aggregate()
+                        .parts()
+                        .get(ordinal)
+                        .ok_or_else(|| {
+                            EngineError::Archive(
+                                "retained bootstrap publication lost a part ordinal".into(),
+                            )
+                        })?
+                        .batch_id();
+                    // Historical point coverage remains the fallback for a
+                    // stale adopted predecessor that does not cover the whole
+                    // aggregate prefix.
+                    let covered = self.covered_by_predecessor_state(part)?;
+                    if covered {
+                        continue;
+                    }
+                    self.validated_run_local_current_authority = None;
+                    let outcome = self.stage_one_retained_bootstrap_part(&plan, ordinal)?;
+                    if let Some(error) = &self.history_failure {
+                        return Err(error.clone());
+                    }
+                    outcomes.push(outcome);
                 }
-                let outcome = self.stage_one_retained_bootstrap_part(&plan, ordinal)?;
-                if let Some(error) = &self.history_failure {
-                    return Err(error.clone());
-                }
-                outcomes.push(outcome);
             }
         }
+        #[cfg(test)]
+        update_enrolled_projection_open_instrumentation(|timing| {
+            timing.bootstrap_part_recovery = phase_started.elapsed();
+        });
         for manifest in committed_manifests {
             if self.covered_by_predecessor_state(manifest.batch_id())? {
                 continue;
             }
+            self.validated_run_local_current_authority = None;
             let outcome = self.stage_archive_batch_for_recovery(manifest.batch_id())?;
             if let Some(error) = &self.history_failure {
                 return Err(error.clone());
@@ -6181,6 +6277,50 @@ impl ShardedHotEngine {
         Ok(self
             .authenticated_recovery_history_record(batch_id)?
             .is_some_and(|record| record.generation <= self.replay_base_generation))
+    }
+
+    /// O(1) proof that an adopted predecessor covers the exact immutable
+    /// bootstrap prefix installed by this promoted lineage.
+    ///
+    /// `ExactBootstrapHistoryBuilderV1` is the sole mint of a bootstrap-bound
+    /// history root: it installs every aggregate descriptor in ordinal order,
+    /// assigns generations `1..=part_count`, and only then publishes the root
+    /// carrying the aggregate binding. Every later promoted history root keeps
+    /// that binding unchanged. Adoption has already proved the live history is
+    /// an insertion-only descendant of `replay_base_generation` and that its
+    /// accepted frontier is the predecessor record's frontier. Therefore the
+    /// compact generation and accepted-count checks below cover the whole
+    /// prefix without decoding each immutable cold record again.
+    fn adopted_predecessor_covers_bootstrap(
+        &self,
+        plan: &BootstrapRecoveryPlan,
+    ) -> Result<bool, EngineError> {
+        if self.replay_base_generation == 0 {
+            return Ok(false);
+        }
+        let binding = super::object_store::BootstrapAggregateHistoryBindingV1::for_aggregate(
+            plan.publication.aggregate(),
+        )
+        .map_err(|error| EngineError::Archive(error.to_string()))?;
+        let part_count = u64::from(binding.part_count());
+        Ok(self
+            .promoted_lineage()
+            .is_some_and(|promotion| promotion.bootstrap() == binding)
+            && plan.part_count == binding.part_count() as usize
+            && self.replay_base_generation >= part_count
+            && self.next_acceptance_sequence >= part_count
+            && self.scratch_roots.accepted_batch_map_root.count() >= part_count)
+    }
+
+    fn validate_retained_bootstrap_publication(&self) -> Result<(), EngineError> {
+        let Some(retained) = &self.bootstrap_parts else {
+            return Ok(());
+        };
+        self.archive_store
+            .as_ref()
+            .ok_or_else(|| EngineError::Archive("engine has no immutable archive store".into()))?
+            .validate_bootstrap_publication(&retained.publication)
+            .map_err(|error| EngineError::Archive(error.to_string()))
     }
 
     /// Stop using the retained run this open was given and mint a fresh one.
@@ -6228,6 +6368,18 @@ impl ShardedHotEngine {
         let publication = store
             .load_bootstrap_publication(promotion.bootstrap().publication_id())
             .map_err(|error| EngineError::Archive(error.to_string()))?;
+        self.attach_promoted_bootstrap_publication(Arc::new(publication))
+    }
+
+    fn attach_promoted_bootstrap_publication(
+        &mut self,
+        publication: Arc<super::object_store::ValidatedBootstrapPublicationV1>,
+    ) -> Result<(), EngineError> {
+        let promotion = self.promoted_lineage().cloned().ok_or_else(|| {
+            EngineError::Archive(
+                "bootstrap publication attachment requires a promoted lineage".into(),
+            )
+        })?;
         let aggregate = publication.aggregate();
         if super::object_store::BootstrapAggregateHistoryBindingV1::for_aggregate(aggregate)
             .map_err(|error| EngineError::Archive(error.to_string()))?
@@ -6248,7 +6400,7 @@ impl ShardedHotEngine {
             }
         }
         self.bootstrap_parts = Some(RetainedBootstrapParts {
-            publication: Arc::new(publication),
+            publication,
             ordinals,
         });
         Ok(())
@@ -6495,10 +6647,17 @@ impl ShardedHotEngine {
         // reports "nothing to publish this cycle" here, where the reason is
         // visible, rather than publishing a point that every later restart
         // silently refuses into a full replay.
-        if !self
-            .sealed_history_record(latest_batch_id)?
-            .as_ref()
-            .is_some_and(record_is_adoptable_predecessor)
+        let authority = super::object_store::EngineHistoryAuthority {
+            generation,
+            index_root,
+        };
+        let already_authenticated =
+            self.adoptable_current_history_head == Some((authority, latest_batch_id));
+        if !already_authenticated
+            && !self
+                .sealed_history_record(latest_batch_id)?
+                .as_ref()
+                .is_some_and(record_is_adoptable_predecessor)
         {
             return Ok(None);
         }
@@ -6626,31 +6785,64 @@ impl ShardedHotEngine {
             ));
         }
 
+        // The enrolled construction already authenticated the current durable
+        // record and compact roots once. An exact-current snapshot may consume
+        // that move-only proof; a stale snapshot takes the ordinary descendant
+        // and historical-record path below.
+        let exact_current = self.current_durable_authority_proof_is_live()?
+            && self
+                .current_durable_authority
+                .as_ref()
+                .is_some_and(|proof| {
+                    proof.history.generation == snapshot.history_generation
+                        && proof.history.index_root == snapshot.history_index_root
+                        && proof.latest_batch_id == snapshot.history_latest_batch_id
+                });
+        let current_proof = exact_current.then(|| {
+            self.current_durable_authority
+                .take()
+                .expect("exact-current proof was present")
+        });
+
         // 1. The live sealed history must be exactly, or insertion-only
         //    descended from, the authority the snapshot records. That is what
         //    turns "records at or below the base are already covered" into a
         //    proof: no record in that range can have changed.
-        let transition =
-            self.authenticate_history_descends_from(super::object_store::EngineHistoryAuthority {
-                generation: snapshot.history_generation,
-                index_root: snapshot.history_index_root,
-            })?;
-        if transition.after().generation != self.history_generation
-            || transition.after().index_root != self.history_root
-        {
-            return Err(EngineError::Archive(
-                "durable history moved during a runtime resume restore".into(),
-            ));
+        if current_proof.is_none() {
+            let transition = self.authenticate_history_descends_from(
+                super::object_store::EngineHistoryAuthority {
+                    generation: snapshot.history_generation,
+                    index_root: snapshot.history_index_root,
+                },
+            )?;
+            if transition.after().generation != self.history_generation
+                || transition.after().index_root != self.history_root
+            {
+                return Err(EngineError::Archive(
+                    "durable history moved during a runtime resume restore".into(),
+                ));
+            }
         }
 
         // 2. Read the predecessor record itself, at the live sealed root.
-        let record = self
-            .authenticated_recovery_history_record(snapshot.history_latest_batch_id)?
-            .ok_or_else(|| {
-                EngineError::Archive(
-                    "runtime resume predecessor record is absent from durable history".into(),
-                )
-            })?;
+        let (record, reference_catalog_root_nodes, exact_current_authority) = match current_proof {
+            Some(proof) => (
+                proof.record,
+                Some(proof.reference_catalog_root_nodes),
+                Some(proof.history),
+            ),
+            None => (
+                self.authenticated_recovery_history_record(snapshot.history_latest_batch_id)?
+                    .ok_or_else(|| {
+                        EngineError::Archive(
+                            "runtime resume predecessor record is absent from durable history"
+                                .into(),
+                        )
+                    })?,
+                None,
+                None,
+            ),
+        };
         if record.generation != snapshot.history_generation {
             return Err(EngineError::Archive(
                 "runtime resume predecessor record is not at the recorded generation".into(),
@@ -6679,39 +6871,13 @@ impl ShardedHotEngine {
                 "runtime resume accepted frontier is not the predecessor record's authority".into(),
             ));
         }
-
         // 3. Re-authenticate every durable-derived root against this archive's
         //    own indexes, exactly as an enrolled open does at the live head.
-        record
-            .page_names
-            .validate()
-            .map_err(|error| EngineError::Archive(error.to_string()))?;
-        self.page_name_index
-            .as_ref()
-            .ok_or_else(|| {
-                EngineError::Archive("enrolled runtime has no page-name ownership index".into())
-            })?
-            .validate_root(&record.page_names.ownership_root)
-            .map_err(|error| EngineError::Archive(error.to_string()))?;
         let portable_path_root = record.portable_path_root;
-        self.portable_path_index
-            .as_ref()
-            .ok_or_else(|| {
-                EngineError::Archive("enrolled runtime has no portable-path index".into())
-            })?
-            .validate_root(portable_path_root)
-            .map_err(|error| EngineError::Archive(error.to_string()))?;
-        self.logseq_claim_index
-            .as_ref()
-            .ok_or_else(|| {
-                EngineError::Archive("enrolled runtime has no external UUID-claim index".into())
-            })?
-            .validate_root(record.logseq_claim_root)
-            .map_err(|error| EngineError::Archive(error.to_string()))?;
         let reference_store = self.reference_catalog.store_handle().ok_or_else(|| {
             EngineError::Archive("enrolled runtime has no reference catalog store".into())
         })?;
-        let mut reference_catalog = ReferenceCatalogStateV2::restore_recovery_required(
+        let mut recovered_reference_catalog = ReferenceCatalogStateV2::restore_recovery_required(
             record.reference_catalog_policy.clone(),
             record.reference_catalog_root.clone(),
             &record.page_names.ownership_root,
@@ -6719,27 +6885,59 @@ impl ShardedHotEngine {
             reference_store,
         )
         .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))?;
-        // Authenticates the restored catalog root against the durable catalog
-        // store and returns the backend to ordinary readable service, which the
-        // tail replay needs.
-        reference_catalog
-            .finish_recovery()
-            .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))?;
-
+        if reference_catalog_root_nodes.is_none() {
+            record
+                .page_names
+                .validate()
+                .map_err(|error| EngineError::Archive(error.to_string()))?;
+            self.page_name_index
+                .as_ref()
+                .ok_or_else(|| {
+                    EngineError::Archive("enrolled runtime has no page-name ownership index".into())
+                })?
+                .validate_root(&record.page_names.ownership_root)
+                .map_err(|error| EngineError::Archive(error.to_string()))?;
+            self.portable_path_index
+                .as_ref()
+                .ok_or_else(|| {
+                    EngineError::Archive("enrolled runtime has no portable-path index".into())
+                })?
+                .validate_root(portable_path_root)
+                .map_err(|error| EngineError::Archive(error.to_string()))?;
+            self.logseq_claim_index
+                .as_ref()
+                .ok_or_else(|| {
+                    EngineError::Archive("enrolled runtime has no external UUID-claim index".into())
+                })?
+                .validate_root(record.logseq_claim_root)
+                .map_err(|error| EngineError::Archive(error.to_string()))?;
+            // Stale candidates retain the complete historical validation.
+            recovered_reference_catalog
+                .finish_recovery()
+                .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))?;
+        }
         // 4. Read the run-local roots back out of the adopted run. This is the
         //    step a truncated or tampered `pages.index` cannot survive: every
         //    read below is digest- and kind-checked against the recorded root.
         //    It also returns the run-local hot state the restore installs, so
         //    that state is read under exactly the same all-or-nothing proof.
-        let run_local = self.probe_adopted_run_local_roots(snapshot, &record)?;
-
+        let run_local = self.probe_adopted_run_local_roots(
+            snapshot,
+            &record,
+            reference_catalog_root_nodes.is_some(),
+        )?;
         // 5. Everything is proved. Install.
         self.page_name_root = record.page_names.ownership_root.clone();
         self.page_name_conflicts = BTreeMap::new();
         self.portable_path_root = portable_path_root;
         self.portable_path_conflicts = BTreeMap::new();
         self.logseq_claim_root = record.logseq_claim_root;
-        self.reference_catalog = reference_catalog;
+        if let Some(root_nodes) = reference_catalog_root_nodes {
+            recovered_reference_catalog
+                .finish_recovery_from_root_nodes(root_nodes)
+                .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))?;
+        }
+        self.reference_catalog = recovered_reference_catalog;
         self.scratch_roots = snapshot.scratch_roots.clone();
         self.block_claim_root = snapshot.block_claim_root;
         self.accepted_frontier_root = snapshot.accepted_frontier_root.clone();
@@ -6756,6 +6954,9 @@ impl ShardedHotEngine {
         // against a `None` semantic pre-state.
         run_local.install(self);
         self.replay_base_generation = snapshot.history_generation;
+        self.validated_run_local_current_authority = exact_current_authority;
+        self.adoptable_current_history_head =
+            exact_current_authority.map(|authority| (authority, record.batch_id));
         self.resume_observation.adopted = true;
         Ok(())
     }
@@ -6797,6 +6998,7 @@ impl ShardedHotEngine {
         &self,
         snapshot: &RuntimeResumeSnapshot,
         record: &ColdHistoryRecord,
+        defer_catalog_document: bool,
     ) -> Result<RunLocalCatalogHotState, EngineError> {
         let scratch = self.scratch.as_ref().ok_or_else(|| {
             EngineError::Archive("runtime resume restore requires a run-local scratch".into())
@@ -6828,7 +7030,11 @@ impl ShardedHotEngine {
         // state a full replay would have staged, and reading it here is what
         // lets the restore stay all-or-nothing — the install happens only after
         // every proof below has succeeded.
-        let hot_state = self.load_run_local_catalog_hot_state(&snapshot.scratch_roots)?;
+        let hot_state = if defer_catalog_document {
+            self.load_run_local_catalog_authority(&snapshot.scratch_roots)?
+        } else {
+            self.load_run_local_catalog_hot_state(&snapshot.scratch_roots)?
+        };
         let catalog_heads = hot_state.catalog_heads;
         let catalog_document = hot_state.catalog_document;
         // The snapshot's own catalog checkpoint binding commits the two external
@@ -6957,6 +7163,48 @@ impl ShardedHotEngine {
         })
     }
 
+    fn load_run_local_catalog_authority(
+        &self,
+        roots: &ScratchRoots,
+    ) -> Result<RunLocalCatalogHotState, EngineError> {
+        let scratch = self.scratch.as_ref().ok_or_else(|| {
+            EngineError::Archive(
+                "run-local catalog authority requires an authenticated scratch".into(),
+            )
+        })?;
+        let Some(state) = super::document_state::load_external_current_record(
+            scratch,
+            roots,
+            super::document_state::DocumentLane::Visible,
+            self.catalog_document_id,
+        )
+        .map_err(|error| EngineError::Archive(error.to_string()))?
+        else {
+            return Ok(RunLocalCatalogHotState {
+                catalog_heads: BTreeSet::new(),
+                catalog_document: None,
+            });
+        };
+        self.validate_external_record_anchor(self.catalog_document_id, &state)?;
+        Ok(RunLocalCatalogHotState {
+            catalog_heads: state.exact_direct_heads().iter().copied().collect(),
+            catalog_document: None,
+        })
+    }
+
+    fn current_catalog_document(&self) -> Result<Option<&LoroDoc>, EngineError> {
+        if let Some(catalog) = self.visible_documents.get(&self.catalog_document_id) {
+            return Ok(Some(catalog));
+        }
+        match self.lazy_catalog_document.get_or_init(|| {
+            self.load_run_local_catalog_hot_state(&self.scratch_roots)
+                .map(|state| state.catalog_document)
+        }) {
+            Ok(document) => Ok(document.as_ref()),
+            Err(error) => Err(error.clone()),
+        }
+    }
+
     /// Rebuild every run-local derived structure from the retained
     /// authenticated durable roots, without replaying immutable history.
     ///
@@ -7030,6 +7278,9 @@ impl ShardedHotEngine {
         rebuilt.history_root = self.history_root;
         rebuilt.history_failure = self.history_failure.clone();
         rebuilt.durable_authority_mode = self.durable_authority_mode;
+        rebuilt.current_durable_authority = self.current_durable_authority.take();
+        rebuilt.validated_run_local_current_authority = self.validated_run_local_current_authority;
+        rebuilt.adoptable_current_history_head = self.adoptable_current_history_head;
         rebuilt.block_claim_index = self.block_claim_index.take();
         rebuilt.block_claim_root = self.block_claim_root.clone();
         rebuilt.logseq_claim_index = self.logseq_claim_index.take();
@@ -7044,6 +7295,7 @@ impl ShardedHotEngine {
         rebuilt.next_acceptance_sequence = self.next_acceptance_sequence;
         rebuilt.current_path_catalog = self.current_path_catalog.clone();
         rebuilt.fatal_evidence = self.fatal_evidence.clone();
+        rebuilt.lazy_catalog_document = std::mem::take(&mut self.lazy_catalog_document);
         // Telemetry is observational rather than continuation authority; keep
         // cumulative work accounting across the reconstructed journey.
         rebuilt.history_work.set(self.history_work.get());
@@ -7067,8 +7319,10 @@ impl ShardedHotEngine {
                 "terminal enrolled authority cannot enter operational recovery replay".into(),
             ));
         }
-        self.verify_current_durable_page_name_authority()?;
-
+        if !self.current_durable_authority_proof_is_live()? {
+            self.current_durable_authority = None;
+            self.verify_current_durable_page_name_authority()?;
+        }
         let reference_policy = self.reference_catalog.policy().clone();
         let mut replay = Self::new(
             self.workspace_id,
@@ -7089,6 +7343,7 @@ impl ShardedHotEngine {
         replay.history_root = self.history_root;
         replay.durable_authority_mode = self.durable_authority_mode;
         replay.authenticated_history_replay = true;
+        replay.current_durable_authority = self.current_durable_authority.take();
         // A fresh replay baseline covers nothing. Only
         // `restore_adopted_predecessor_state` may raise this, and only after it
         // has authenticated the predecessor it names.
@@ -7174,7 +7429,9 @@ impl ShardedHotEngine {
         self.resume_observation.live_history_generation = self.history_generation;
         self.resume_observation.replay_base_generation = base;
         self.resume_observation.replayed_generations = replayed_records;
-        self.verify_current_durable_page_name_authority()?;
+        if !self.validated_run_local_current_authority_is_live()? {
+            self.verify_current_durable_page_name_authority()?;
+        }
         let history_transition = self.authenticated_projection_history_transition()?;
         self.reference_catalog
             .finish_recovery()
@@ -7974,14 +8231,11 @@ impl ShardedHotEngine {
                 "current-path catalog row has missing, duplicate, or corrupt path authority".into(),
             ));
         }
-        let catalog = self
-            .visible_documents
-            .get(&self.catalog_document_id)
-            .ok_or_else(|| {
-                EngineError::Archive(
-                    "current-path catalog row has no accepted catalog page state".into(),
-                )
-            })?;
+        let catalog = self.current_catalog_document()?.ok_or_else(|| {
+            EngineError::Archive(
+                "current-path catalog row has no accepted catalog page state".into(),
+            )
+        })?;
         let state = validate_catalog_page(self.catalog_document_id, catalog, row.page_id)?;
         let Some(PageState::Live {
             name, path, kind, ..
@@ -8814,7 +9068,7 @@ impl ShardedHotEngine {
         &self,
         page_id: PageId,
     ) -> Result<Option<(CurrentPathCatalogStoredRow, super::PageNameKeyDigest)>, EngineError> {
-        let Some(catalog) = self.visible_documents.get(&self.catalog_document_id) else {
+        let Some(catalog) = self.current_catalog_document()? else {
             return Ok(None);
         };
         let Some(mut state) = validate_catalog_page(self.catalog_document_id, catalog, page_id)?
@@ -9054,6 +9308,42 @@ impl ShardedHotEngine {
                 .map_err(|error| EngineError::Archive(error.to_string())),
             None => Ok(self.ephemeral_page_names.resolve_current(name.key_digest())),
         }
+    }
+
+    fn current_durable_authority_proof_is_live(&self) -> Result<bool, EngineError> {
+        let Some(proof) = &self.current_durable_authority else {
+            return Ok(false);
+        };
+        if proof.history.generation != self.history_generation
+            || proof.history.index_root != self.history_root
+        {
+            return Ok(false);
+        }
+        let live = self
+            .history_store
+            .as_ref()
+            .ok_or_else(|| EngineError::Archive("engine has no durable engine history".into()))?
+            .current_authority()
+            .map_err(|error| EngineError::Archive(error.to_string()))?;
+        Ok(live == proof.history)
+    }
+
+    fn validated_run_local_current_authority_is_live(&self) -> Result<bool, EngineError> {
+        let Some(validated) = self.validated_run_local_current_authority else {
+            return Ok(false);
+        };
+        if validated.generation != self.history_generation
+            || validated.index_root != self.history_root
+        {
+            return Ok(false);
+        }
+        let live = self
+            .history_store
+            .as_ref()
+            .ok_or_else(|| EngineError::Archive("engine has no durable engine history".into()))?
+            .current_authority()
+            .map_err(|error| EngineError::Archive(error.to_string()))?;
+        Ok(live == validated)
     }
 
     pub(crate) fn verify_current_durable_page_name_authority(&self) -> Result<(), EngineError> {
@@ -13816,8 +14106,7 @@ impl ShardedHotEngine {
         }
 
         let catalog = self
-            .visible_documents
-            .get(&self.catalog_document_id)
+            .current_catalog_document()?
             .ok_or(EngineError::ProjectionAuthorizationUnavailable)?;
         let mut homes = BTreeMap::new();
         let mut live = BTreeMap::<BlockId, LogseqUuidClaim>::new();
@@ -14076,8 +14365,7 @@ impl ShardedHotEngine {
         self.ensure_not_blocked()?;
         let reads_before = self.archive_read_stats();
         let catalog = self
-            .visible_documents
-            .get(&self.catalog_document_id)
+            .current_catalog_document()?
             .ok_or(EngineError::PageNotFound(page_id))?;
         let mut frontier_documents = BTreeMap::new();
         if include_frontier {
@@ -14570,7 +14858,7 @@ impl ShardedHotEngine {
         self.canonical_snapshot_calls
             .set(self.canonical_snapshot_calls.get().saturating_add(1));
         self.ensure_not_blocked()?;
-        let Some(catalog) = self.visible_documents.get(&self.catalog_document_id) else {
+        let Some(catalog) = self.current_catalog_document()? else {
             return Ok(super::CanonicalSnapshot::default());
         };
         let all_pages = validate_catalog(self.catalog_document_id, catalog)?;
@@ -20616,7 +20904,7 @@ impl ShardedHotEngine {
         } else {
             self.read_only_catalog(read_only_catalog)?
         };
-        let before_catalog = self.visible_documents.get(&self.catalog_document_id);
+        let before_catalog = self.current_catalog_document()?;
 
         for operation in &transaction.operations {
             let SemanticOperation::MutateBlockLogseqIdentity {
@@ -22217,8 +22505,7 @@ fn decode_history_record(
     expected_batch_id: BatchId,
     bytes: &[u8],
 ) -> Result<ColdHistoryRecord, EngineError> {
-    let record: ColdHistoryRecord =
-        postcard::from_bytes(bytes).map_err(|error| EngineError::Archive(error.to_string()))?;
+    let record = decode_authenticated_current_history_leaf(expected_batch_id, bytes)?;
     let accepted_evidence_valid = match &record.status {
         ArchiveStatus::Accepted { evidence, .. } => {
             validate_accepted_evidence(evidence).is_ok()
@@ -22226,6 +22513,45 @@ fn decode_history_record(
                 && evidence.manifest_fingerprint == record.manifest_fingerprint
                 && evidence.post_frontier_root.reference_catalog_root
                     == record.reference_catalog_root
+        }
+        _ => true,
+    };
+    if !accepted_evidence_valid || encode_history_record(&record)? != bytes {
+        return Err(EngineError::Archive(
+            "non-canonical or misbound engine history record".into(),
+        ));
+    }
+    Ok(record)
+}
+
+/// Decode one record reached as the latest leaf of an already authenticated
+/// content-addressed history root, without canonically re-encoding its complete
+/// graph-sized accepted evidence.
+///
+/// Ordinary corruption is still rejected by the history trie before this
+/// function receives bytes. The checks here retain the typed schema/binding
+/// boundary needed to construct the adopted-current proof. Full replay and all
+/// non-adopting paths continue to call [`decode_history_record`], including its
+/// complete evidence recomputation and canonical byte comparison.
+fn decode_authenticated_current_history_leaf(
+    expected_batch_id: BatchId,
+    bytes: &[u8],
+) -> Result<ColdHistoryRecord, EngineError> {
+    let record: ColdHistoryRecord =
+        postcard::from_bytes(bytes).map_err(|error| EngineError::Archive(error.to_string()))?;
+    let accepted_shape_valid = match &record.status {
+        ArchiveStatus::Accepted { evidence, .. } => {
+            evidence.schema_version == ACCEPTED_EVIDENCE_SCHEMA_VERSION
+                && evidence.batch_id == record.batch_id
+                && evidence.manifest_fingerprint == record.manifest_fingerprint
+                && evidence.acceptance_sequence == evidence.post_frontier_root.acceptance_sequence
+                && evidence.reference_catalog_delta.prior_root()
+                    == &evidence.prior_frontier_root.reference_catalog_root
+                && evidence.reference_catalog_delta.post_root()
+                    == &evidence.post_frontier_root.reference_catalog_root
+                && evidence.post_frontier_root.reference_catalog_root
+                    == record.reference_catalog_root
+                && validate_accepted_frontier_root(&evidence.post_frontier_root).is_ok()
         }
         _ => true,
     };
@@ -22253,11 +22579,10 @@ fn decode_history_record(
                 record.logseq_claim_root.digest(),
             )
             .is_err()
-        || !accepted_evidence_valid
-        || encode_history_record(&record)? != bytes
+        || !accepted_shape_valid
     {
         return Err(EngineError::Archive(
-            "non-canonical or misbound engine history record".into(),
+            "malformed or misbound authenticated current history record".into(),
         ));
     }
     Ok(record)

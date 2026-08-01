@@ -2343,6 +2343,23 @@ impl ObjectStore {
         &self,
         publication_id: BootstrapPublicationIdV1,
     ) -> Result<ValidatedBootstrapPublicationV1, StoreError> {
+        self.load_bootstrap_publication_with_validation(publication_id, true)
+    }
+
+    /// Authenticate the compact commit/aggregate root while deferring old
+    /// immutable part and source-index leaves to their ordinary verified reads.
+    pub(crate) fn load_bootstrap_publication_deferred(
+        &self,
+        publication_id: BootstrapPublicationIdV1,
+    ) -> Result<ValidatedBootstrapPublicationV1, StoreError> {
+        self.load_bootstrap_publication_with_validation(publication_id, false)
+    }
+
+    fn load_bootstrap_publication_with_validation(
+        &self,
+        publication_id: BootstrapPublicationIdV1,
+        validate_artifacts: bool,
+    ) -> Result<ValidatedBootstrapPublicationV1, StoreError> {
         let commits = self.bootstrap_namespace(BOOTSTRAP_COMMITS_DIR, false)?;
         let commit_name = hex_bytes(publication_id.as_bytes());
         let commit_bytes = read_required_regular(
@@ -2377,7 +2394,9 @@ impl ObjectStore {
         }
         self.require_bootstrap_aggregate_context(&aggregate)?;
         self.require_lineage(aggregate.lineage_digest())?;
-        self.validate_bootstrap_aggregate_artifacts(&aggregate, false)?;
+        if validate_artifacts {
+            self.validate_bootstrap_aggregate_artifacts(&aggregate, false)?;
+        }
 
         let final_commit = read_required_regular(
             &commits,
@@ -2397,6 +2416,13 @@ impl ObjectStore {
             ));
         }
         Ok(ValidatedBootstrapPublicationV1 { aggregate })
+    }
+
+    pub(crate) fn validate_bootstrap_publication(
+        &self,
+        publication: &ValidatedBootstrapPublicationV1,
+    ) -> Result<(), StoreError> {
+        self.validate_bootstrap_aggregate_artifacts(publication.aggregate(), false)
     }
 
     pub(crate) fn load_bootstrap_part(

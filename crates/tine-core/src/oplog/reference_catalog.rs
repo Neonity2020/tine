@@ -1286,6 +1286,18 @@ pub(crate) struct ReferenceCatalogStateV2 {
     final_catalog_validations: Cell<usize>,
 }
 
+/// Move-only proof that the authenticated root node of every tree named by one
+/// catalog root was present under the held archive capability.
+///
+/// The proof deliberately does not claim that every historical immutable leaf
+/// was eagerly traversed. Content-addressed point reads continue to verify each
+/// leaf when it is used and fail closed on missing or corrupt bytes. This is the
+/// restart analogue of an adopted scratch root: current authority is established
+/// before service, while cold immutable leaves remain lazy.
+pub(crate) struct AuthenticatedReferenceCatalogRootNodes {
+    root: ReferenceCatalogRootV2,
+}
+
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ReferenceCatalogConstructionWorkStats {
@@ -1406,6 +1418,46 @@ impl ReferenceCatalogStateV2 {
             }
         };
         store.validate_catalog_root(&self.root)?;
+        self.backend = ReferenceCatalogBackend::Store(store);
+        Ok(())
+    }
+
+    /// Authenticate only the compact root nodes needed to defer old immutable
+    /// leaves during an adopted-current restart.
+    pub(crate) fn authenticate_root_nodes(
+        &self,
+    ) -> Result<AuthenticatedReferenceCatalogRootNodes, ReferenceCatalogError> {
+        let store = match &self.backend {
+            ReferenceCatalogBackend::Store(store)
+            | ReferenceCatalogBackend::RecoveryRequired(store) => Arc::clone(store),
+            ReferenceCatalogBackend::Memory(_) | ReferenceCatalogBackend::Construction { .. } => {
+                return Err(ReferenceCatalogError::StoreRequired);
+            }
+        };
+        store.require_catalog_root_nodes(&self.root)?;
+        Ok(AuthenticatedReferenceCatalogRootNodes {
+            root: self.root.clone(),
+        })
+    }
+
+    /// Return a recovery-required catalog to readable service from a move-only
+    /// proof minted under the same held archive capability for this exact root.
+    pub(crate) fn finish_recovery_from_root_nodes(
+        &mut self,
+        proof: AuthenticatedReferenceCatalogRootNodes,
+    ) -> Result<(), ReferenceCatalogError> {
+        let store = match &self.backend {
+            ReferenceCatalogBackend::RecoveryRequired(store) => Arc::clone(store),
+            ReferenceCatalogBackend::Memory(_) | ReferenceCatalogBackend::Store(_) => {
+                return Err(ReferenceCatalogError::AuthorityMismatch);
+            }
+            ReferenceCatalogBackend::Construction { .. } => {
+                return Err(ReferenceCatalogError::AuthorityMismatch);
+            }
+        };
+        if self.root != proof.root {
+            return Err(ReferenceCatalogError::AuthorityMismatch);
+        }
         self.backend = ReferenceCatalogBackend::Store(store);
         Ok(())
     }

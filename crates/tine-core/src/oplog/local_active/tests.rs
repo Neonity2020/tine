@@ -7171,6 +7171,14 @@ fn assert_damaged_candidate_replays_in_full(
             // The runtime is genuinely usable, not merely constructed.
             runtime.engine().accepted_frontier_root().unwrap();
             runtime.database().frontier_root().unwrap();
+            assert!(
+                runtime
+                    .engine()
+                    .instrumentation()
+                    .recovery_history_record_reads
+                    >= opened.observation().live_history_generation as usize,
+                "{label}: refused adoption must retain complete per-record replay validation"
+            );
         },
     );
     drop(held);
@@ -7293,6 +7301,22 @@ fn a_clean_safe_restart_adopts_the_exact_safe_bound_point() {
                 let opened = runtime.resume_open_status().clone();
                 assert!(opened.adopted(), "{opened:?}");
                 assert_eq!(opened.unavailable(), None);
+                assert!(
+                    runtime
+                        .engine()
+                        .instrumentation()
+                        .recovery_history_record_reads
+                        <= 1,
+                    "an exact-current adopted open may read only the current head for its automatic successor publication, never historical bootstrap records"
+                );
+                assert_eq!(
+                    runtime
+                        .engine()
+                        .bootstrap_recovery_instrumentation()
+                        .bootstrap_part_reads,
+                    0,
+                    "the aggregate-prefix proof must avoid bootstrap payload replay"
+                );
                 public_runtime_observation(runtime)
             },
         );
@@ -7306,6 +7330,17 @@ fn a_clean_safe_restart_adopts_the_exact_safe_bound_point() {
             SessionId::new(),
             |_, _, runtime| {
                 assert!(!runtime.resume_open_status().adopted());
+                assert!(
+                    runtime
+                        .engine()
+                        .instrumentation()
+                        .recovery_history_record_reads
+                        >= runtime
+                            .resume_open_status()
+                            .observation()
+                            .live_history_generation as usize,
+                    "the no-candidate control must perform complete per-record replay validation"
+                );
                 public_runtime_observation(runtime)
             },
         );
