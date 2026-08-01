@@ -1842,7 +1842,10 @@ impl<'a> SqliteMaterializedRead<'a> {
         page_id: PageId,
     ) -> Result<Option<MaterializedPageRow>, MaterializationError> {
         self.inner
-            .page(page_id.as_uuid().into_bytes())?
+            .page_with_header_validation(
+                page_id.as_uuid().into_bytes(),
+                validate_storage_page_header,
+            )?
             .map(page_row_from_storage)
             .transpose()
     }
@@ -1863,7 +1866,11 @@ impl<'a> SqliteMaterializedRead<'a> {
         limit: usize,
     ) -> Result<Vec<MaterializedPageRow>, MaterializationError> {
         convert_rows(
-            self.inner.pages_by_name(name, limit)?,
+            self.inner.pages_by_name_with_header_validation(
+                name,
+                limit,
+                validate_storage_page_header,
+            )?,
             page_row_from_storage,
         )
     }
@@ -1874,7 +1881,11 @@ impl<'a> SqliteMaterializedRead<'a> {
         limit: usize,
     ) -> Result<Vec<MaterializedPageRow>, MaterializationError> {
         convert_rows(
-            self.inner.pages_by_name_key(name_key, limit)?,
+            self.inner.pages_by_name_key_with_header_validation(
+                name_key,
+                limit,
+                validate_storage_page_header,
+            )?,
             page_row_from_storage,
         )
     }
@@ -1887,7 +1898,12 @@ impl<'a> SqliteMaterializedRead<'a> {
     ) -> Result<Vec<MaterializedPageRow>, MaterializationError> {
         convert_rows(
             self.inner
-                .pages_by_name_key_and_kind(name_key, text_kind_to_sql(kind), limit)?,
+                .pages_by_name_key_and_kind_with_header_validation(
+                    name_key,
+                    text_kind_to_sql(kind),
+                    limit,
+                    validate_storage_page_header,
+                )?,
             page_row_from_storage,
         )
     }
@@ -1898,7 +1914,11 @@ impl<'a> SqliteMaterializedRead<'a> {
         limit: usize,
     ) -> Result<Vec<MaterializedPageRow>, MaterializationError> {
         convert_rows(
-            self.inner.pages_by_path(&path.as_str().to_owned(), limit)?,
+            self.inner.pages_by_path_with_header_validation(
+                &path.as_str().to_owned(),
+                limit,
+                validate_storage_page_header,
+            )?,
             page_row_from_storage,
         )
     }
@@ -1909,7 +1929,11 @@ impl<'a> SqliteMaterializedRead<'a> {
         limit: usize,
     ) -> Result<Vec<MaterializedPageRow>, MaterializationError> {
         convert_rows(
-            self.inner.pages(kind.map(text_kind_to_sql), limit)?,
+            self.inner.pages_with_header_validation(
+                kind.map(text_kind_to_sql),
+                limit,
+                validate_storage_page_header,
+            )?,
             page_row_from_storage,
         )
     }
@@ -1990,6 +2014,18 @@ fn convert_rows<T, U>(
     convert: impl Fn(T) -> Result<U, MaterializationError>,
 ) -> Result<Vec<U>, MaterializationError> {
     rows.into_iter().map(convert).collect()
+}
+
+fn validate_storage_page_header(
+    path: &str,
+    kind: i64,
+) -> Result<(), storage::MaterializationError> {
+    ManagedPath::parse(path).map_err(|error| {
+        storage::MaterializationError::Corrupt(format!("malformed managed path row: {error}"))
+    })?;
+    text_kind_from_sql(kind)
+        .map(|_| ())
+        .map_err(|error| storage::MaterializationError::Corrupt(error.to_string()))
 }
 
 fn page_row_from_storage(
@@ -2781,6 +2817,63 @@ mod tests {
                 resource: "materialization read output bytes",
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn malformed_page_path_precedes_aggregate_read_budget_exhaustion() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        initialize_schema(&connection, ContentDigest::of(b"empty")).unwrap();
+        let searchable_text = format!("needle {}", "x".repeat(1024 * 1024 - "needle ".len()));
+        let pages_per_change = 33;
+        let mut final_frontier = ContentDigest::of(b"empty");
+        for group in 0..2 {
+            let replacements = (0..pages_per_change)
+                .map(|index| {
+                    page_input(
+                        page_id(700_000 + (group * pages_per_change + index) as u128),
+                        searchable_text.clone(),
+                    )
+                })
+                .collect();
+            let change = MaterializationChange::new(
+                batch_id(700_000 + group as u128),
+                replacements,
+                Vec::new(),
+            )
+            .unwrap();
+            let digest = change.digest().unwrap();
+            final_frontier = ContentDigest::of(&[group as u8 + 1]);
+            let semantic_effect = semantic_effect_for_replacements(change.replacements());
+            let transaction = connection.transaction().unwrap();
+            apply_change(
+                &transaction,
+                &change,
+                &semantic_effect,
+                group as u64 + 1,
+                digest,
+                final_frontier,
+                None,
+            )
+            .unwrap();
+            transaction.commit().unwrap();
+        }
+
+        connection
+            .execute(
+                "UPDATE pages SET path = ?1 WHERE page_id = ?2",
+                params![
+                    "../corrupt.md",
+                    page_id(700_000).as_uuid().as_bytes().as_slice(),
+                ],
+            )
+            .unwrap();
+
+        let read = SqliteMaterializedRead::new(&connection, 2, final_frontier).unwrap();
+        assert!(matches!(
+            read.pages(None, pages_per_change * 2),
+            Err(MaterializationError::Corrupt(message))
+                if message.contains("malformed managed path row")
         ));
     }
 }
