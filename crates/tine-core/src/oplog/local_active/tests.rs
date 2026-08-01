@@ -6851,12 +6851,7 @@ fn assert_publicly_indistinguishable(
 /// production open actually runs on, so the harness — not the production path —
 /// is the constraint here. No assertion changes; only where the body runs does.
 fn on_a_deep_stack(body: impl FnOnce() + Send + 'static) {
-    std::thread::Builder::new()
-        .stack_size(32 * 1024 * 1024)
-        .spawn(body)
-        .expect("the deep-stack lifecycle test thread spawns")
-        .join()
-        .expect("the lifecycle test body must not panic");
+    crate::test_support::run_on_deep_stack(body);
 }
 
 /// Clears the resume-lifecycle cut on entry *and* on drop, including during a

@@ -2308,128 +2308,135 @@ pub(crate) mod tests {
 
     #[test]
     fn crash_after_terminal_reconcile_before_ack_replays_without_duplicate_semantic_admission() {
-        let mut fixture = configured_fixture("crash-before-ack");
-        let enrollment = fixture.enrollment_root("crash-before-ack");
-        let binding = fixture.enrollment_binding();
-        let paths = PromotedPaths::new(&fixture, "crash-before-ack");
-        let (mut authority, mut runtime) = promoted_safe_reopen(&mut fixture, &enrollment, &paths);
-        let baseline = fixture.baseline(&fixture.graph, "crash-before-ack", false);
-        let mut owner =
-            ExactExternalFeedState::open(&fixture.graph, &fixture.receipts, &runtime, baseline)
-                .unwrap();
-        let mut clock = 0;
-        assert_admitted(drive_terminal(
-            &mut owner,
-            &fixture.graph,
-            &fixture.receipts,
-            &mut authority,
-            &mut runtime,
-            &mut clock,
-        ));
-
-        let markdown = "content/nested pages/deep/Caf\u{e9} note.md";
-        fs::write(
-            fixture.graph_root.join(markdown),
-            b"- admitted exactly once\n",
-        )
-        .unwrap();
-        owner
-            .observe(
+        crate::test_support::run_on_deep_stack(|| {
+            let mut fixture = configured_fixture("crash-before-ack");
+            let enrollment = fixture.enrollment_root("crash-before-ack");
+            let binding = fixture.enrollment_binding();
+            let paths = PromotedPaths::new(&fixture, "crash-before-ack");
+            let (mut authority, mut runtime) =
+                promoted_safe_reopen(&mut fixture, &enrollment, &paths);
+            let baseline = fixture.baseline(&fixture.graph, "crash-before-ack", false);
+            let mut owner =
+                ExactExternalFeedState::open(&fixture.graph, &fixture.receipts, &runtime, baseline)
+                    .unwrap();
+            let mut clock = 0;
+            assert_admitted(drive_terminal(
+                &mut owner,
                 &fixture.graph,
-                &runtime,
-                [WatcherObservation::ManagedPath(
-                    ManagedPath::parse(markdown).unwrap(),
-                )],
+                &fixture.receipts,
+                &mut authority,
+                &mut runtime,
+                &mut clock,
+            ));
+
+            let markdown = "content/nested pages/deep/Caf\u{e9} note.md";
+            fs::write(
+                fixture.graph_root.join(markdown),
+                b"- admitted exactly once\n",
             )
             .unwrap();
-        let acknowledged_before = runtime.watcher_status().acknowledged;
-        let manifests_before = fixture.manifest_count();
-        EXACT_FEED_AFTER_TERMINAL_BEFORE_ACK_HOOK.with(|hook| {
-            *hook.borrow_mut() = Some(Box::new(|| {
-                Err(io::Error::new(
-                    io::ErrorKind::Interrupted,
-                    "injected crash after terminal reconcile before ack",
-                ))
-            }));
-        });
-        let failed = drive_terminal(
-            &mut owner,
-            &fixture.graph,
-            &fixture.receipts,
-            &mut authority,
-            &mut runtime,
-            &mut clock,
-        );
-        assert!(
-            matches!(failed, ExactExternalFeedDrain::Failed(_)),
-            "unexpected crash-cut result: {failed:?}"
-        );
-        assert_eq!(runtime.watcher_status().acknowledged, acknowledged_before);
-        assert!(runtime.watcher_status().pending);
-        assert_eq!(fixture.manifest_count(), manifests_before + 1);
-        let committed_after_crash = fixture.manifest_count();
-
-        // Dropping the process-local owner loses its in-memory epoch. The
-        // crash takeover starts recovery-gated and cannot use exact-path import
-        // authority before a full recovery catch-up or a fresh Safe reopen.
-        drop(owner);
-        drop(runtime);
-        drop(authority);
-        let reopened_graph = Graph::open(&fixture.graph_root);
-        let takeover_session = SessionId::new();
-        let (mut takeover_authority, mut takeover_runtime) = take_over_promoted_local_runtime(
-            &enrollment,
-            &binding,
-            takeover_session,
-            &paths.open(&fixture, &reopened_graph),
-        )
-        .unwrap();
-        assert!(matches!(
-            takeover_runtime.automatic_external_import(),
-            ExternalImportAdmission::Blocked(_)
-        ));
-
-        // This fixture's exact-feed owner crashed after terminal reconcile but
-        // before queue acknowledgement, leaving the old graph-feed owner
-        // terminal. Use the existing test-only Safe proof boundary to exercise
-        // the later fresh-safe-reopen deterministic replay neighbor without
-        // broadening this packet into exact-feed lease-drop recovery.
-        takeover_runtime
-            .quiesce_and_mark_safe_without_watcher_dependency_for_test(
-                &mut takeover_authority,
-                &reopened_graph,
-            )
-            .unwrap();
-        drop(takeover_runtime);
-        drop(takeover_authority);
-        let (mut authority, mut runtime) = reopen_promoted_local_runtime(
-            &enrollment,
-            &binding,
-            SessionId::new(),
-            &paths.open(&fixture, &reopened_graph),
-        )
-        .unwrap();
-        assert_eq!(runtime.recovery(), RuntimeRecoveryState::AdoptedSafeHandoff);
-        let baseline = fixture.baseline(&reopened_graph, "crash-before-ack", true);
-        let mut reopened =
-            ExactExternalFeedState::open(&reopened_graph, &fixture.receipts, &runtime, baseline)
+            owner
+                .observe(
+                    &fixture.graph,
+                    &runtime,
+                    [WatcherObservation::ManagedPath(
+                        ManagedPath::parse(markdown).unwrap(),
+                    )],
+                )
                 .unwrap();
-        assert!(runtime.watcher_status().pending_requires_full_scan);
-        assert_admitted(drive_terminal(
-            &mut reopened,
-            &reopened_graph,
-            &fixture.receipts,
-            &mut authority,
-            &mut runtime,
-            &mut clock,
-        ));
-        assert_eq!(
-            fixture.manifest_count(),
-            committed_after_crash,
-            "the fresh forced scan must reuse deterministic import/receipt identity"
-        );
-        let status = runtime.watcher_status();
-        assert_eq!(status.acknowledged, status.latest_enqueue);
+            let acknowledged_before = runtime.watcher_status().acknowledged;
+            let manifests_before = fixture.manifest_count();
+            EXACT_FEED_AFTER_TERMINAL_BEFORE_ACK_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(|| {
+                    Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "injected crash after terminal reconcile before ack",
+                    ))
+                }));
+            });
+            let failed = drive_terminal(
+                &mut owner,
+                &fixture.graph,
+                &fixture.receipts,
+                &mut authority,
+                &mut runtime,
+                &mut clock,
+            );
+            assert!(
+                matches!(failed, ExactExternalFeedDrain::Failed(_)),
+                "unexpected crash-cut result: {failed:?}"
+            );
+            assert_eq!(runtime.watcher_status().acknowledged, acknowledged_before);
+            assert!(runtime.watcher_status().pending);
+            assert_eq!(fixture.manifest_count(), manifests_before + 1);
+            let committed_after_crash = fixture.manifest_count();
+
+            // Dropping the process-local owner loses its in-memory epoch. The
+            // crash takeover starts recovery-gated and cannot use exact-path import
+            // authority before a full recovery catch-up or a fresh Safe reopen.
+            drop(owner);
+            drop(runtime);
+            drop(authority);
+            let reopened_graph = Graph::open(&fixture.graph_root);
+            let takeover_session = SessionId::new();
+            let (mut takeover_authority, mut takeover_runtime) = take_over_promoted_local_runtime(
+                &enrollment,
+                &binding,
+                takeover_session,
+                &paths.open(&fixture, &reopened_graph),
+            )
+            .unwrap();
+            assert!(matches!(
+                takeover_runtime.automatic_external_import(),
+                ExternalImportAdmission::Blocked(_)
+            ));
+
+            // This fixture's exact-feed owner crashed after terminal reconcile but
+            // before queue acknowledgement, leaving the old graph-feed owner
+            // terminal. Use the existing test-only Safe proof boundary to exercise
+            // the later fresh-safe-reopen deterministic replay neighbor without
+            // broadening this packet into exact-feed lease-drop recovery.
+            takeover_runtime
+                .quiesce_and_mark_safe_without_watcher_dependency_for_test(
+                    &mut takeover_authority,
+                    &reopened_graph,
+                )
+                .unwrap();
+            drop(takeover_runtime);
+            drop(takeover_authority);
+            let (mut authority, mut runtime) = reopen_promoted_local_runtime(
+                &enrollment,
+                &binding,
+                SessionId::new(),
+                &paths.open(&fixture, &reopened_graph),
+            )
+            .unwrap();
+            assert_eq!(runtime.recovery(), RuntimeRecoveryState::AdoptedSafeHandoff);
+            let baseline = fixture.baseline(&reopened_graph, "crash-before-ack", true);
+            let mut reopened = ExactExternalFeedState::open(
+                &reopened_graph,
+                &fixture.receipts,
+                &runtime,
+                baseline,
+            )
+            .unwrap();
+            assert!(runtime.watcher_status().pending_requires_full_scan);
+            assert_admitted(drive_terminal(
+                &mut reopened,
+                &reopened_graph,
+                &fixture.receipts,
+                &mut authority,
+                &mut runtime,
+                &mut clock,
+            ));
+            assert_eq!(
+                fixture.manifest_count(),
+                committed_after_crash,
+                "the fresh forced scan must reuse deterministic import/receipt identity"
+            );
+            let status = runtime.watcher_status();
+            assert_eq!(status.acknowledged, status.latest_enqueue);
+        });
     }
 
     #[test]

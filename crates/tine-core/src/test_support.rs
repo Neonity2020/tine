@@ -1,6 +1,8 @@
 use std::fs;
 use std::path::Path;
 
+const TEST_DEEP_STACK_BYTES: usize = 32 * 1024 * 1024;
+
 #[track_caller]
 pub(crate) fn remove_dir_all(path: impl AsRef<Path>) {
     let path = path.as_ref();
@@ -15,4 +17,19 @@ pub(crate) fn remove_dir_all(path: impl AsRef<Path>) {
             path.display()
         ),
     }
+}
+
+/// Run one test body on a deliberately deep stack.
+///
+/// Promoted/runtime opens in production already run on much larger stacks than
+/// libtest's default worker threads provide, so this keeps stack-sensitive test
+/// bodies aligned with the production contract without changing assertions or
+/// production code paths.
+pub(crate) fn run_on_deep_stack(body: impl FnOnce() + Send + 'static) {
+    std::thread::Builder::new()
+        .stack_size(TEST_DEEP_STACK_BYTES)
+        .spawn(body)
+        .expect("the deep-stack test thread spawns")
+        .join()
+        .expect("the deep-stack test body must not panic");
 }
