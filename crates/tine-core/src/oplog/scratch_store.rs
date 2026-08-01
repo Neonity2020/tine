@@ -1,9 +1,9 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::fs;
+#[cfg(test)]
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use cap_std::fs::Dir;
 use serde::de::DeserializeOwned;
@@ -23,8 +23,8 @@ const PAGES_FILE: &str = tine_storage::SCRATCH_PAGES_FILE;
 const BLOBS_FILE: &str = tine_storage::SCRATCH_BLOBS_FILE;
 #[cfg(test)]
 pub(crate) const SCRATCH_SCHEMA_VERSION: u32 = tine_storage::SCRATCH_SCHEMA_VERSION;
-const SCRATCH_PAGE_SCHEMA_VERSION: u32 = 1;
-const SCRATCH_LSM_LEVELS: usize = 32;
+#[cfg(test)]
+const SCRATCH_LSM_LEVELS: usize = tine_storage::SCRATCH_LSM_LEVELS;
 const ACCEPTED_SEQUENCE_SCHEMA_VERSION: u32 = 1;
 const ACCEPTED_SEQUENCE_LEAF_CAPACITY: usize = 1;
 const ACCEPTED_SEQUENCE_NODE_FANOUT: usize = 32;
@@ -57,8 +57,7 @@ const MAX_COVERED_BLOB_DEDUP_ROOTS: usize = 256;
 /// high would make the leak permanent, and a pass that deleted to satisfy a
 /// count would be deleting evidence it had not proved unreachable.
 pub(crate) const MAX_RETAINED_SCRATCH_RUNS: usize = 2;
-const MAX_PAGE_BYTES: usize = 256 * 1024 * 1024;
-const MAX_BLOB_BYTES: usize = 256 * 1024 * 1024;
+const MAX_PAGE_BYTES: usize = tine_storage::MAX_SCRATCH_PAGE_BYTES;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ScratchStats {
@@ -78,24 +77,6 @@ pub(crate) struct ScratchStats {
     pub live_runs_skipped: usize,
     pub retained_runs_preserved: usize,
     pub unclassified_runs_preserved: usize,
-}
-
-#[derive(Debug, Default)]
-struct ScratchCounters {
-    page_reads: AtomicUsize,
-    page_writes: AtomicUsize,
-    page_bytes_read: AtomicUsize,
-    page_bytes_written: AtomicUsize,
-    max_page_bytes_read: AtomicUsize,
-    blob_reads: AtomicUsize,
-    blob_writes: AtomicUsize,
-    blob_bytes_read: AtomicUsize,
-    blob_bytes_written: AtomicUsize,
-    point_reads: AtomicUsize,
-    range_reads: AtomicUsize,
-    // This deliberately has no increment site. Any future scratch sync must
-    // become visible to the normal-flow regression gates.
-    scratch_syncs: AtomicUsize,
 }
 
 #[derive(Debug)]
@@ -205,26 +186,6 @@ impl CoveredBlobDedupFilter {
     }
 }
 
-impl ScratchCounters {
-    fn snapshot(&self) -> ScratchStats {
-        ScratchStats {
-            page_reads: self.page_reads.load(Ordering::Relaxed),
-            page_writes: self.page_writes.load(Ordering::Relaxed),
-            page_bytes_read: self.page_bytes_read.load(Ordering::Relaxed),
-            page_bytes_written: self.page_bytes_written.load(Ordering::Relaxed),
-            max_page_bytes_read: self.max_page_bytes_read.load(Ordering::Relaxed),
-            blob_reads: self.blob_reads.load(Ordering::Relaxed),
-            blob_writes: self.blob_writes.load(Ordering::Relaxed),
-            blob_bytes_read: self.blob_bytes_read.load(Ordering::Relaxed),
-            blob_bytes_written: self.blob_bytes_written.load(Ordering::Relaxed),
-            point_reads: self.point_reads.load(Ordering::Relaxed),
-            range_reads: self.range_reads.load(Ordering::Relaxed),
-            scratch_syncs: self.scratch_syncs.load(Ordering::Relaxed),
-            ..ScratchStats::default()
-        }
-    }
-}
-
 /// Durable retention mode of one scratch run.
 ///
 /// This is authenticated by the run marker itself, so a run's disposition is a
@@ -310,81 +271,15 @@ pub(crate) enum ScratchPageKind {
     CurrentPathCatalog = 27,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ScratchPageRef {
-    offset: u64,
-    encoded_len: u32,
-    digest: ContentDigest,
-    kind: ScratchPageKind,
-    key_min: Vec<u8>,
-    key_max: Vec<u8>,
-}
-
-impl ScratchPageRef {
-    pub(crate) fn key_min(&self) -> &[u8] {
-        &self.key_min
-    }
-
-    pub(crate) fn key_max(&self) -> &[u8] {
-        &self.key_max
+impl tine_storage::ScratchPageTag for ScratchPageKind {
+    fn saturation_tag() -> Self {
+        Self::DocumentExternalExact
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ScratchPageEnvelope {
-    schema_version: u32,
-    kind: ScratchPageKind,
-    key_min: Vec<u8>,
-    key_max: Vec<u8>,
-    payload: Vec<u8>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ScratchBlobRef {
-    offset: u64,
-    encoded_len: u32,
-    digest: ContentDigest,
-}
-
-impl ScratchBlobRef {
-    pub(crate) const fn digest(&self) -> ContentDigest {
-        self.digest
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ScratchRecord {
-    key: Vec<u8>,
-    value: Option<Vec<u8>>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ScratchSegment {
-    schema_version: u32,
-    kind: ScratchPageKind,
-    generation: u64,
-    entries: Vec<ScratchRecord>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ScratchSegmentRef {
-    generation: u64,
-    entry_count: u64,
-    page_ref: ScratchPageRef,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ScratchLsmRoot {
-    next_generation: u64,
-    levels: Vec<Option<ScratchSegmentRef>>,
-}
+pub(crate) type ScratchPageRef = tine_storage::ScratchPageRef<ScratchPageKind>;
+pub(crate) type ScratchBlobRef = tine_storage::ScratchBlobRef;
+pub(crate) type ScratchLsmRoot = tine_storage::ScratchLsmRoot<ScratchPageKind>;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -694,15 +589,6 @@ struct CausalAccumulatorNode {
     right: Option<AuthenticatedMapChild>,
 }
 
-impl Default for ScratchLsmRoot {
-    fn default() -> Self {
-        Self {
-            next_generation: 0,
-            levels: vec![None; SCRATCH_LSM_LEVELS],
-        }
-    }
-}
-
 /// The widest key any lane carried by a runtime resume point actually stores.
 ///
 /// The LSM lanes in [`ScratchRoots`] are keyed by fixed-width identities and
@@ -722,42 +608,6 @@ pub(crate) const MAX_CARRIED_SCRATCH_KEY_BYTES: usize = 1 + 16 + 32;
 /// offsets and generations encode as full 10-byte varints), not the widest
 /// reachable ones. A fail-closed byte ceiling has to bound every record that
 /// can be encoded, so over-approximating is the point.
-#[cfg(test)]
-impl ScratchPageRef {
-    pub(crate) fn saturated_for_test(key_bytes: usize) -> Self {
-        Self {
-            offset: u64::MAX,
-            encoded_len: u32::MAX,
-            digest: ContentDigest::of(b"saturated scratch page"),
-            kind: ScratchPageKind::DocumentExternalExact,
-            key_min: vec![0xff; key_bytes],
-            key_max: vec![0xff; key_bytes],
-        }
-    }
-}
-
-#[cfg(test)]
-impl ScratchLsmRoot {
-    /// Every one of the format's fixed [`SCRATCH_LSM_LEVELS`] levels occupied.
-    ///
-    /// The levels are a binary counter over flushes, so all 32 occupied at once
-    /// is the counter's maximum — representable by construction and the only
-    /// state this root's width can reach.
-    pub(crate) fn saturated_for_test(key_bytes: usize) -> Self {
-        Self {
-            next_generation: u64::MAX,
-            levels: vec![
-                Some(ScratchSegmentRef {
-                    generation: u64::MAX,
-                    entry_count: u64::MAX,
-                    page_ref: ScratchPageRef::saturated_for_test(key_bytes),
-                });
-                SCRATCH_LSM_LEVELS
-            ],
-        }
-    }
-}
-
 #[cfg(test)]
 impl ScratchAuthenticatedPointRoot {
     pub(crate) fn saturated_for_test(key_bytes: usize) -> Self {
@@ -908,7 +758,6 @@ pub(crate) struct ScratchRoots {
 /// is capability-relative beneath the exact scratch namespace.
 pub(crate) struct ScratchStore {
     physical: tine_storage::ScratchRun<WorkspaceId>,
-    counters: Arc<ScratchCounters>,
     document_current_filter: Mutex<FixedPointFilter>,
     blob_dedup_filter: Mutex<CoveredBlobDedupFilter>,
 }
@@ -975,7 +824,6 @@ impl ScratchStore {
     ) -> Self {
         Self {
             physical,
-            counters: Arc::new(ScratchCounters::default()),
             document_current_filter: Mutex::new(if saturated_filter {
                 FixedPointFilter::saturated()
             } else {
@@ -1016,12 +864,24 @@ impl ScratchStore {
 
     pub(crate) fn stats(&self) -> ScratchStats {
         let lifecycle = self.physical.lifecycle_stats();
+        let operations = self.physical.operation_stats();
         ScratchStats {
+            page_reads: operations.page_reads,
+            page_writes: operations.page_writes,
+            page_bytes_read: operations.page_bytes_read,
+            page_bytes_written: operations.page_bytes_written,
+            max_page_bytes_read: operations.max_page_bytes_read,
+            blob_reads: operations.blob_reads,
+            blob_writes: operations.blob_writes,
+            blob_bytes_read: operations.blob_bytes_read,
+            blob_bytes_written: operations.blob_bytes_written,
+            point_reads: operations.point_reads,
+            range_reads: operations.range_reads,
+            scratch_syncs: operations.scratch_syncs,
             stale_runs_reclaimed: lifecycle.stale_runs_reclaimed,
             live_runs_skipped: lifecycle.live_runs_skipped,
             retained_runs_preserved: lifecycle.retained_runs_preserved,
             unclassified_runs_preserved: lifecycle.unclassified_runs_preserved,
-            ..self.counters.snapshot()
         }
     }
 
@@ -1086,74 +946,25 @@ impl ScratchStore {
         kind: ScratchPageKind,
         records: &BTreeMap<Vec<u8>, Option<Vec<u8>>>,
     ) -> Result<ScratchLsmRoot, ScratchError> {
-        if records.is_empty() {
-            return Ok(root.clone());
-        }
-        validate_root(root)?;
-        let generation = root
-            .next_generation
-            .checked_add(1)
-            .ok_or(ScratchError::MalformedPage)?;
-        let mut merged = records.clone();
-        let mut next = root.clone();
-        next.next_generation = generation;
-        for level in 0..SCRATCH_LSM_LEVELS {
-            if let Some(existing) = next.levels[level].take() {
-                let old = self.read_segment(kind, &existing)?;
-                for record in old.entries {
-                    merged.entry(record.key).or_insert(record.value);
-                }
-                continue;
-            }
-            let entries = merged
-                .into_iter()
-                .map(|(key, value)| ScratchRecord { key, value })
-                .collect::<Vec<_>>();
-            let segment = ScratchSegment {
-                schema_version: SCRATCH_PAGE_SCHEMA_VERSION,
-                kind,
-                generation,
-                entries,
-            };
-            validate_segment(&segment)?;
-            let key_min = segment
-                .entries
-                .first()
-                .expect("nonempty insertion")
-                .key
-                .clone();
-            let key_max = segment
-                .entries
-                .last()
-                .expect("nonempty insertion")
-                .key
-                .clone();
-            let page_ref = self.append_page(kind, key_min, key_max, &segment)?;
-            next.levels[level] = Some(ScratchSegmentRef {
-                generation,
-                entry_count: segment.entries.len() as u64,
-                page_ref,
-            });
-            if kind == ScratchPageKind::DocumentCurrent {
-                let mut filter = self
-                    .document_current_filter
-                    .lock()
-                    .map_err(|_| ScratchError::Poisoned)?;
-                for (key, value) in records {
-                    if value.is_some() {
-                        filter.insert(key);
-                    }
+        let next = self.physical.insert_many(root, kind, records)?;
+        if next != *root && kind == ScratchPageKind::DocumentCurrent {
+            let mut filter = self
+                .document_current_filter
+                .lock()
+                .map_err(|_| ScratchError::Poisoned)?;
+            for (key, value) in records {
+                if value.is_some() {
+                    filter.insert(key);
                 }
             }
-            if kind == ScratchPageKind::BlobDedup {
-                self.blob_dedup_filter
-                    .lock()
-                    .map_err(|_| ScratchError::Poisoned)?
-                    .record_insert(root, &next, records);
-            }
-            return Ok(next);
         }
-        Err(ScratchError::IndexCapacity)
+        if next != *root && kind == ScratchPageKind::BlobDedup {
+            self.blob_dedup_filter
+                .lock()
+                .map_err(|_| ScratchError::Poisoned)?
+                .record_insert(root, &next, records);
+        }
+        Ok(next)
     }
 
     pub(crate) fn lookup(
@@ -1162,47 +973,25 @@ impl ScratchStore {
         kind: ScratchPageKind,
         key: &[u8],
     ) -> Result<Option<Vec<u8>>, ScratchError> {
-        validate_root(root)?;
-        self.counters.point_reads.fetch_add(1, Ordering::Relaxed);
-        if kind == ScratchPageKind::DocumentCurrent
-            && !self
-                .document_current_filter
-                .lock()
-                .map_err(|_| ScratchError::Poisoned)?
-                .might_contain(key)
-        {
-            return Ok(None);
-        }
-        if kind == ScratchPageKind::BlobDedup
-            && self
-                .blob_dedup_filter
-                .lock()
-                .map_err(|_| ScratchError::Poisoned)?
-                .proves_absent(root, key)
-        {
-            return Ok(None);
-        }
-        let mut segments = root
-            .levels
-            .iter()
-            .flatten()
-            .collect::<Vec<&ScratchSegmentRef>>();
-        segments.sort_unstable_by_key(|segment| std::cmp::Reverse(segment.generation));
-        for segment_ref in segments {
-            if key < segment_ref.page_ref.key_min.as_slice()
-                || key > segment_ref.page_ref.key_max.as_slice()
-            {
-                continue;
-            }
-            let segment = self.read_segment(kind, segment_ref)?;
-            if let Ok(index) = segment
-                .entries
-                .binary_search_by(|record| record.key.as_slice().cmp(key))
-            {
-                return Ok(segment.entries[index].value.clone());
-            }
-        }
-        Ok(None)
+        self.physical
+            .lookup_with_absence_policy(root, kind, key, || {
+                if kind == ScratchPageKind::DocumentCurrent {
+                    Ok(!self
+                        .document_current_filter
+                        .lock()
+                        .map_err(|_| tine_storage::ScratchRunError::Poisoned)?
+                        .might_contain(key))
+                } else if kind == ScratchPageKind::BlobDedup {
+                    Ok(self
+                        .blob_dedup_filter
+                        .lock()
+                        .map_err(|_| tine_storage::ScratchRunError::Poisoned)?
+                        .proves_absent(root, key))
+                } else {
+                    Ok(false)
+                }
+            })
+            .map_err(Into::into)
     }
 
     /// Resolve a bounded set of logical LSM points while authenticating each
@@ -1220,70 +1009,33 @@ impl ScratchStore {
         kind: ScratchPageKind,
         keys: &[Vec<u8>],
     ) -> Result<Vec<Option<Vec<u8>>>, ScratchError> {
-        validate_root(root)?;
-        self.counters
-            .point_reads
-            .fetch_add(keys.len(), Ordering::Relaxed);
-        if keys.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let mut resolved = vec![false; keys.len()];
-        if kind == ScratchPageKind::DocumentCurrent {
-            let filter = self
-                .document_current_filter
-                .lock()
-                .map_err(|_| ScratchError::Poisoned)?;
-            for (index, key) in keys.iter().enumerate() {
-                if !filter.might_contain(key) {
-                    resolved[index] = true;
+        self.physical
+            .lookup_many_with_absence_policy(root, kind, keys, || {
+                let mut known_absent = vec![false; keys.len()];
+                if kind == ScratchPageKind::DocumentCurrent {
+                    let filter = self
+                        .document_current_filter
+                        .lock()
+                        .map_err(|_| tine_storage::ScratchRunError::Poisoned)?;
+                    for (index, key) in keys.iter().enumerate() {
+                        if !filter.might_contain(key) {
+                            known_absent[index] = true;
+                        }
+                    }
+                } else if kind == ScratchPageKind::BlobDedup {
+                    let filter = self
+                        .blob_dedup_filter
+                        .lock()
+                        .map_err(|_| tine_storage::ScratchRunError::Poisoned)?;
+                    for (index, key) in keys.iter().enumerate() {
+                        if filter.proves_absent(root, key) {
+                            known_absent[index] = true;
+                        }
+                    }
                 }
-            }
-        } else if kind == ScratchPageKind::BlobDedup {
-            let filter = self
-                .blob_dedup_filter
-                .lock()
-                .map_err(|_| ScratchError::Poisoned)?;
-            for (index, key) in keys.iter().enumerate() {
-                if filter.proves_absent(root, key) {
-                    resolved[index] = true;
-                }
-            }
-        }
-
-        let mut values = vec![None; keys.len()];
-        let mut segments = root
-            .levels
-            .iter()
-            .flatten()
-            .collect::<Vec<&ScratchSegmentRef>>();
-        segments.sort_unstable_by_key(|segment| std::cmp::Reverse(segment.generation));
-        for segment_ref in segments {
-            let selected = keys
-                .iter()
-                .enumerate()
-                .filter_map(|(index, key)| {
-                    (!resolved[index]
-                        && key.as_slice() >= segment_ref.page_ref.key_min.as_slice()
-                        && key.as_slice() <= segment_ref.page_ref.key_max.as_slice())
-                    .then_some(index)
-                })
-                .collect::<Vec<_>>();
-            if selected.is_empty() {
-                continue;
-            }
-            let segment = self.read_segment(kind, segment_ref)?;
-            for index in selected {
-                if let Ok(record_index) = segment
-                    .entries
-                    .binary_search_by(|record| record.key.as_slice().cmp(keys[index].as_slice()))
-                {
-                    values[index] = segment.entries[record_index].value.clone();
-                    resolved[index] = true;
-                }
-            }
-        }
-        Ok(values)
+                Ok(known_absent)
+            })
+            .map_err(Into::into)
     }
 
     pub(crate) fn authenticated_point_lookup(
@@ -1294,7 +1046,7 @@ impl ScratchStore {
     ) -> Result<Option<Vec<u8>>, ScratchError> {
         validate_authenticated_point_root(root)?;
         validate_authenticated_point_key(logical_key)?;
-        self.counters.point_reads.fetch_add(1, Ordering::Relaxed);
+        self.physical.record_point_reads(1);
         let key_digest = authenticated_point_key_digest(kind, logical_key);
         let mut current = root.root.as_ref().map(|page_ref| AuthenticatedPointChild {
             key_digest: root
@@ -1639,7 +1391,7 @@ impl ScratchStore {
         kind: ScratchPageKind,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, ScratchError> {
         validate_authenticated_point_root(root)?;
-        self.counters.range_reads.fetch_add(1, Ordering::Relaxed);
+        self.physical.record_range_read();
         let mut entries = Vec::with_capacity(root.count as usize);
         let mut stack = Vec::<AuthenticatedPointChild>::new();
         let mut current = root.root.as_ref().map(|page_ref| AuthenticatedPointChild {
@@ -1754,7 +1506,7 @@ impl ScratchStore {
         sequence: u64,
     ) -> Result<Option<AcceptedSequenceEntry>, ScratchError> {
         validate_accepted_sequence_root(root)?;
-        self.counters.point_reads.fetch_add(1, Ordering::Relaxed);
+        self.physical.record_point_reads(1);
         if sequence == 0 || sequence > root.len {
             return Ok(None);
         }
@@ -1844,7 +1596,7 @@ impl ScratchStore {
         after: Option<[u8; 16]>,
     ) -> Result<ScratchAuthenticatedCatalogCursor<'a>, ScratchError> {
         validate_authenticated_catalog_root(root)?;
-        self.counters.range_reads.fetch_add(1, Ordering::Relaxed);
+        self.physical.record_range_read();
         Ok(ScratchAuthenticatedCatalogCursor {
             store: self,
             stack: Vec::new(),
@@ -1865,7 +1617,7 @@ impl ScratchStore {
         key: [u8; 16],
     ) -> Result<Option<Vec<u8>>, ScratchError> {
         validate_authenticated_catalog_root(root)?;
-        self.counters.point_reads.fetch_add(1, Ordering::Relaxed);
+        self.physical.record_point_reads(1);
         let mut current = root.root.as_ref().map(|page_ref| AuthenticatedMapChild {
             key: root.root_key.expect("validated nonempty catalog root"),
             digest: root.root_digest,
@@ -2395,27 +2147,9 @@ impl ScratchStore {
         kind: ScratchPageKind,
         prefix: &[u8],
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, ScratchError> {
-        validate_root(root)?;
-        self.counters.range_reads.fetch_add(1, Ordering::Relaxed);
-        let mut segments = root
-            .levels
-            .iter()
-            .flatten()
-            .collect::<Vec<&ScratchSegmentRef>>();
-        segments.sort_unstable_by_key(|segment| segment.generation);
-        let mut merged = BTreeMap::<Vec<u8>, Option<Vec<u8>>>::new();
-        for segment_ref in segments {
-            let segment = self.read_segment(kind, segment_ref)?;
-            for record in segment.entries {
-                if record.key.starts_with(prefix) {
-                    merged.insert(record.key, record.value);
-                }
-            }
-        }
-        Ok(merged
-            .into_iter()
-            .filter_map(|(key, value)| value.map(|value| (key, value)))
-            .collect())
+        self.physical
+            .scan_prefix(root, kind, prefix)
+            .map_err(Into::into)
     }
 
     pub(crate) fn materialize(
@@ -2427,50 +2161,11 @@ impl ScratchStore {
     }
 
     pub(crate) fn append_blob(&self, bytes: &[u8]) -> Result<ScratchBlobRef, ScratchError> {
-        if bytes.is_empty() || bytes.len() > MAX_BLOB_BYTES {
-            return Err(ScratchError::MalformedBlob);
-        }
-        let digest = ContentDigest::of(bytes);
-        let encoded_len = u32::try_from(bytes.len()).map_err(|_| ScratchError::MalformedBlob)?;
-        let offset = self
-            .physical
-            .with_blobs(|file| -> Result<_, ScratchError> {
-                let offset = file.seek(SeekFrom::End(0))?;
-                file.write_all(bytes)?;
-                Ok(offset)
-            })??;
-        self.counters.blob_writes.fetch_add(1, Ordering::Relaxed);
-        self.counters
-            .blob_bytes_written
-            .fetch_add(bytes.len(), Ordering::Relaxed);
-        Ok(ScratchBlobRef {
-            offset,
-            encoded_len,
-            digest,
-        })
+        self.physical.append_blob(bytes).map_err(Into::into)
     }
 
     pub(crate) fn read_blob(&self, blob_ref: &ScratchBlobRef) -> Result<Vec<u8>, ScratchError> {
-        let length =
-            usize::try_from(blob_ref.encoded_len).map_err(|_| ScratchError::MalformedBlob)?;
-        if length == 0 || length > MAX_BLOB_BYTES {
-            return Err(ScratchError::MalformedBlob);
-        }
-        let mut bytes = vec![0_u8; length];
-        self.physical
-            .with_blobs(|file| -> Result<_, ScratchError> {
-                file.seek(SeekFrom::Start(blob_ref.offset))?;
-                file.read_exact(&mut bytes)
-                    .map_err(|_| ScratchError::MalformedBlob)
-            })??;
-        if ContentDigest::of(&bytes) != blob_ref.digest {
-            return Err(ScratchError::BlobDigestMismatch(blob_ref.digest));
-        }
-        self.counters.blob_reads.fetch_add(1, Ordering::Relaxed);
-        self.counters
-            .blob_bytes_read
-            .fetch_add(bytes.len(), Ordering::Relaxed);
-        Ok(bytes)
+        self.physical.read_blob(blob_ref).map_err(Into::into)
     }
 
     pub(crate) fn append_page<T: Serialize>(
@@ -2480,42 +2175,9 @@ impl ScratchStore {
         key_max: Vec<u8>,
         value: &T,
     ) -> Result<ScratchPageRef, ScratchError> {
-        if key_min.is_empty() || key_min > key_max {
-            return Err(ScratchError::MalformedPage);
-        }
-        let payload = encode_canonical(value)?;
-        let envelope = ScratchPageEnvelope {
-            schema_version: SCRATCH_PAGE_SCHEMA_VERSION,
-            kind,
-            key_min: key_min.clone(),
-            key_max: key_max.clone(),
-            payload,
-        };
-        let bytes = encode_canonical(&envelope)?;
-        if bytes.len() > MAX_PAGE_BYTES {
-            return Err(ScratchError::PageTooLarge(bytes.len()));
-        }
-        let digest = ContentDigest::of(&bytes);
-        let encoded_len = u32::try_from(bytes.len()).map_err(|_| ScratchError::MalformedPage)?;
-        let offset = self
-            .physical
-            .with_pages(|file| -> Result<_, ScratchError> {
-                let offset = file.seek(SeekFrom::End(0))?;
-                file.write_all(&bytes)?;
-                Ok(offset)
-            })??;
-        self.counters.page_writes.fetch_add(1, Ordering::Relaxed);
-        self.counters
-            .page_bytes_written
-            .fetch_add(bytes.len(), Ordering::Relaxed);
-        Ok(ScratchPageRef {
-            offset,
-            encoded_len,
-            digest,
-            kind,
-            key_min,
-            key_max,
-        })
+        self.physical
+            .append_page(kind, key_min, key_max, value)
+            .map_err(Into::into)
     }
 
     pub(crate) fn read_page<T: DeserializeOwned + Serialize>(
@@ -2523,64 +2185,9 @@ impl ScratchStore {
         page_ref: &ScratchPageRef,
         expected_kind: ScratchPageKind,
     ) -> Result<T, ScratchError> {
-        if page_ref.kind != expected_kind {
-            return Err(ScratchError::PageBindingMismatch);
-        }
-        let length =
-            usize::try_from(page_ref.encoded_len).map_err(|_| ScratchError::MalformedPage)?;
-        if length == 0 || length > MAX_PAGE_BYTES {
-            return Err(ScratchError::MalformedPage);
-        }
-        let mut bytes = vec![0_u8; length];
         self.physical
-            .with_pages(|file| -> Result<_, ScratchError> {
-                file.seek(SeekFrom::Start(page_ref.offset))?;
-                file.read_exact(&mut bytes)
-                    .map_err(|_| ScratchError::MalformedPage)
-            })??;
-        if ContentDigest::of(&bytes) != page_ref.digest {
-            return Err(ScratchError::PageDigestMismatch(page_ref.digest));
-        }
-        let envelope: ScratchPageEnvelope = decode_canonical(&bytes)?;
-        if envelope.schema_version != SCRATCH_PAGE_SCHEMA_VERSION
-            || envelope.kind != expected_kind
-            || envelope.key_min != page_ref.key_min
-            || envelope.key_max != page_ref.key_max
-        {
-            return Err(ScratchError::PageBindingMismatch);
-        }
-        self.counters.page_reads.fetch_add(1, Ordering::Relaxed);
-        self.counters
-            .page_bytes_read
-            .fetch_add(bytes.len(), Ordering::Relaxed);
-        self.counters
-            .max_page_bytes_read
-            .fetch_max(bytes.len(), Ordering::Relaxed);
-        decode_canonical(&envelope.payload)
-    }
-
-    fn read_segment(
-        &self,
-        kind: ScratchPageKind,
-        segment_ref: &ScratchSegmentRef,
-    ) -> Result<ScratchSegment, ScratchError> {
-        let segment: ScratchSegment = self.read_page(&segment_ref.page_ref, kind)?;
-        validate_segment(&segment)?;
-        if segment.kind != kind
-            || segment.generation != segment_ref.generation
-            || segment.entries.len() as u64 != segment_ref.entry_count
-            || segment
-                .entries
-                .first()
-                .is_none_or(|record| record.key != segment_ref.page_ref.key_min)
-            || segment
-                .entries
-                .last()
-                .is_none_or(|record| record.key != segment_ref.page_ref.key_max)
-        {
-            return Err(ScratchError::PageBindingMismatch);
-        }
-        Ok(segment)
+            .read_page(page_ref, expected_kind)
+            .map_err(Into::into)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3429,40 +3036,6 @@ fn validate_causal_accumulator_node(node: &CausalAccumulatorNode) -> Result<(), 
     Ok(())
 }
 
-fn validate_root(root: &ScratchLsmRoot) -> Result<(), ScratchError> {
-    if root.levels.len() != SCRATCH_LSM_LEVELS {
-        return Err(ScratchError::MalformedPage);
-    }
-    for segment in root.levels.iter().flatten() {
-        if segment.generation == 0
-            || segment.generation > root.next_generation
-            || segment.entry_count == 0
-        {
-            return Err(ScratchError::MalformedPage);
-        }
-    }
-    Ok(())
-}
-
-fn validate_segment(segment: &ScratchSegment) -> Result<(), ScratchError> {
-    if segment.schema_version != SCRATCH_PAGE_SCHEMA_VERSION
-        || segment.generation == 0
-        || segment.entries.is_empty()
-    {
-        return Err(ScratchError::MalformedPage);
-    }
-    let mut previous: Option<&[u8]> = None;
-    for record in &segment.entries {
-        if record.key.is_empty()
-            || previous.is_some_and(|previous| previous >= record.key.as_slice())
-        {
-            return Err(ScratchError::MalformedPage);
-        }
-        previous = Some(&record.key);
-    }
-    Ok(())
-}
-
 /// The outcome of one retained-run reachability pass.
 ///
 /// Every field is a preservation count except `retained_reclaimed`, which is
@@ -3701,10 +3274,12 @@ fn core_fault_to_storage(error: ScratchError) -> tine_storage::ScratchRunError {
     }
 }
 
+#[cfg(test)]
 fn encode_canonical<T: Serialize>(value: &T) -> Result<Vec<u8>, ScratchError> {
     postcard::to_allocvec(value).map_err(|_| ScratchError::MalformedPage)
 }
 
+#[cfg(test)]
 fn decode_canonical<T: DeserializeOwned + Serialize>(bytes: &[u8]) -> Result<T, ScratchError> {
     let value: T = postcard::from_bytes(bytes).map_err(|_| ScratchError::MalformedPage)?;
     if encode_canonical(&value)? != bytes {
@@ -3775,6 +3350,17 @@ impl From<tine_storage::ScratchRunError> for ScratchError {
             tine_storage::ScratchRunError::UnsafeEntry(reason) => Self::UnsafeEntry(reason),
             tine_storage::ScratchRunError::MalformedMarker(run) => Self::MalformedMarker(run),
             tine_storage::ScratchRunError::MalformedEncoding => Self::MalformedPage,
+            tine_storage::ScratchRunError::MalformedPage => Self::MalformedPage,
+            tine_storage::ScratchRunError::MalformedBlob => Self::MalformedBlob,
+            tine_storage::ScratchRunError::PageTooLarge(length) => Self::PageTooLarge(length),
+            tine_storage::ScratchRunError::PageDigestMismatch(digest) => {
+                Self::PageDigestMismatch(digest)
+            }
+            tine_storage::ScratchRunError::BlobDigestMismatch(digest) => {
+                Self::BlobDigestMismatch(digest)
+            }
+            tine_storage::ScratchRunError::PageBindingMismatch => Self::PageBindingMismatch,
+            tine_storage::ScratchRunError::IndexCapacity => Self::IndexCapacity,
             tine_storage::ScratchRunError::Poisoned => Self::Poisoned,
         }
     }
@@ -3932,6 +3518,125 @@ mod tests {
             namespace_entry_names(&path),
             BTreeSet::from([format!("run-{run_id}")])
         );
+        crate::test_support::remove_dir_all(path);
+    }
+
+    #[test]
+    fn pre_extraction_page_blob_lsm_wire_reopens_and_appends_across_boundary() {
+        const SEGMENT_BYTES: &[u8] = &[
+            1, 7, 1, 2, 5, 97, 108, 112, 104, 97, 1, 3, 111, 110, 101, 5, 111, 109, 101, 103, 97, 0,
+        ];
+        const PAGE_BYTES: &[u8] = &[
+            1, 7, 5, 97, 108, 112, 104, 97, 5, 111, 109, 101, 103, 97, 22, 1, 7, 1, 2, 5, 97, 108,
+            112, 104, 97, 1, 3, 111, 110, 101, 5, 111, 109, 101, 103, 97, 0,
+        ];
+        const PAGE_REF_BYTES: &[u8] = &[
+            0, 37, 64, 49, 98, 97, 53, 99, 102, 48, 97, 100, 102, 55, 101, 97, 102, 49, 50, 100,
+            53, 57, 98, 51, 53, 52, 57, 102, 49, 99, 49, 53, 97, 52, 102, 57, 52, 102, 57, 102, 49,
+            57, 48, 97, 55, 98, 102, 55, 54, 56, 54, 49, 49, 57, 98, 56, 56, 99, 97, 57, 99, 49,
+            57, 55, 99, 53, 99, 7, 5, 97, 108, 112, 104, 97, 5, 111, 109, 101, 103, 97,
+        ];
+        const ROOT_BYTES: &[u8] = &[
+            1, 32, 1, 1, 2, 0, 37, 64, 49, 98, 97, 53, 99, 102, 48, 97, 100, 102, 55, 101, 97, 102,
+            49, 50, 100, 53, 57, 98, 51, 53, 52, 57, 102, 49, 99, 49, 53, 97, 52, 102, 57, 52, 102,
+            57, 102, 49, 57, 48, 97, 55, 98, 102, 55, 54, 56, 54, 49, 49, 57, 98, 56, 56, 99, 97,
+            57, 99, 49, 57, 55, 99, 53, 99, 7, 5, 97, 108, 112, 104, 97, 5, 111, 109, 101, 103, 97,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0,
+        ];
+        const BLOB_REF_BYTES: &[u8] = &[
+            0, 12, 64, 53, 101, 52, 98, 49, 99, 51, 49, 99, 57, 57, 52, 49, 100, 48, 55, 50, 98,
+            56, 53, 49, 53, 98, 49, 48, 52, 100, 53, 97, 99, 52, 51, 97, 98, 57, 56, 101, 97, 102,
+            50, 57, 98, 57, 101, 57, 57, 55, 49, 99, 101, 100, 48, 55, 51, 101, 52, 51, 56, 102,
+            49, 56, 97, 50, 55,
+        ];
+        let path = scratch_root("pre-extraction-data-wire");
+        let archive = archive(&path);
+        let workspace_id = workspace(91);
+        let store = ScratchStore::create_retained(&archive, workspace_id).unwrap();
+        let run_id = store.run_id();
+        let records = BTreeMap::from([
+            (b"alpha".to_vec(), Some(b"one".to_vec())),
+            (b"omega".to_vec(), None),
+        ]);
+        let root = store
+            .insert_many(
+                &ScratchLsmRoot::default(),
+                ScratchPageKind::DocumentExact,
+                &records,
+            )
+            .unwrap();
+        let page_ref = root.levels[0].as_ref().unwrap().page_ref.clone();
+        let blob_ref = store.append_blob(b"fixture blob").unwrap();
+        let initial = run_snapshot(&path, run_id);
+        assert_eq!(initial[PAGES_FILE], PAGE_BYTES);
+        assert_eq!(&initial[PAGES_FILE][15..], SEGMENT_BYTES);
+        assert_eq!(initial[BLOBS_FILE], b"fixture blob");
+        assert_eq!(encode_canonical(&page_ref).unwrap(), PAGE_REF_BYTES);
+        assert_eq!(encode_canonical(&root).unwrap(), ROOT_BYTES);
+        assert_eq!(encode_canonical(&blob_ref).unwrap(), BLOB_REF_BYTES);
+        assert_eq!(page_ref.offset, 0);
+        assert_eq!(page_ref.encoded_len, 37);
+        assert_eq!(
+            page_ref.digest.to_string(),
+            "1ba5cf0adf7eaf12d59b3549f1c15a4f94f9f190a7bf7686119b88ca9c197c5c"
+        );
+        assert_eq!(blob_ref.offset, 0);
+        assert_eq!(blob_ref.encoded_len, 12);
+        assert_eq!(
+            blob_ref.digest.to_string(),
+            "5e4b1c31c9941d072b8515b104d5ac43ab98eaf29b9e9971ced073e438f18a27"
+        );
+        drop(store);
+
+        let physical =
+            tine_storage::ScratchRun::adopt_retained(&archive, workspace_id, run_id).unwrap();
+        assert_eq!(
+            physical
+                .lookup(&root, ScratchPageKind::DocumentExact, b"alpha")
+                .unwrap(),
+            Some(b"one".to_vec())
+        );
+        assert_eq!(physical.read_blob(&blob_ref).unwrap(), b"fixture blob");
+        let storage_root = physical
+            .insert_many(
+                &root,
+                ScratchPageKind::DocumentExact,
+                &BTreeMap::from([(b"storage".to_vec(), Some(b"two".to_vec()))]),
+            )
+            .unwrap();
+        let storage_blob = physical.append_blob(b"storage blob").unwrap();
+        drop(physical);
+        let after_storage = run_snapshot(&path, run_id);
+        for name in [PAGES_FILE, BLOBS_FILE] {
+            assert_eq!(&after_storage[name][..initial[name].len()], &initial[name]);
+        }
+
+        let facade = ScratchStore::adopt_retained(&archive, workspace_id, run_id).unwrap();
+        assert_eq!(
+            facade
+                .lookup(&storage_root, ScratchPageKind::DocumentExact, b"storage")
+                .unwrap(),
+            Some(b"two".to_vec())
+        );
+        assert_eq!(facade.read_blob(&blob_ref).unwrap(), b"fixture blob");
+        assert_eq!(facade.read_blob(&storage_blob).unwrap(), b"storage blob");
+        let _facade_root = facade
+            .insert_many(
+                &storage_root,
+                ScratchPageKind::DocumentExact,
+                &BTreeMap::from([(b"facade".to_vec(), Some(b"three".to_vec()))]),
+            )
+            .unwrap();
+        let _facade_blob = facade.append_blob(b"facade blob").unwrap();
+        drop(facade);
+        let after_facade = run_snapshot(&path, run_id);
+        for name in [PAGES_FILE, BLOBS_FILE] {
+            assert_eq!(
+                &after_facade[name][..after_storage[name].len()],
+                &after_storage[name]
+            );
+        }
         crate::test_support::remove_dir_all(path);
     }
 
