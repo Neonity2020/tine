@@ -3521,6 +3521,32 @@ fn graph_text_admission_test_counters() -> GraphTextAdmissionTestCounters {
 }
 
 #[cfg(test)]
+fn measure_graph_text_admission_point_queries<T>(
+    query: impl FnOnce() -> T,
+) -> (T, GraphTextAdmissionTestCounters) {
+    reset_graph_text_admission_test_counters();
+    let result = query();
+    (result, graph_text_admission_test_counters())
+}
+
+#[cfg(test)]
+fn assert_graph_text_admission_point_query_only(
+    counters: GraphTextAdmissionTestCounters,
+    exact_attempts: usize,
+) {
+    assert_eq!(counters.point_query_attempts, exact_attempts);
+    assert_eq!(counters.builder_enumerations, 0);
+    assert_eq!(counters.parser_invocations, 0);
+    assert_eq!(counters.index_map_insertions, 0);
+    assert_eq!(counters.event_map_key_reads, 0);
+    assert_eq!(counters.event_map_key_writes, 0);
+    assert_eq!(counters.event_reverse_members, 0);
+    assert_eq!(counters.persistent_node_allocations, 0);
+    assert_eq!(counters.persistent_rotations, 0);
+    assert_eq!(counters.persistent_payload_members, 0);
+}
+
+#[cfg(test)]
 pub(crate) fn reset_graph_text_parser_counter_for_scan_test() {
     reset_graph_text_admission_test_counters();
 }
@@ -35763,60 +35789,31 @@ mod tests {
 
     #[test]
     fn unarmed_and_poisoned_admission_queries_never_enumerate() {
+        fn assert_epoch_query_rejected_without_side_work(graph: &Graph) {
+            let (result, counters) =
+                measure_graph_text_admission_point_queries(|| graph.graph_text_admission_epoch());
+            assert!(result.is_err());
+            assert_graph_text_admission_point_query_only(counters, 1);
+        }
+
         let unbuilt_root = scratch("admission-query-unbuilt");
         let unbuilt = Graph::open(&unbuilt_root);
-        reset_graph_text_admission_test_counters();
-        assert!(unbuilt.graph_text_admission_epoch().is_err());
-        assert_eq!(
-            graph_text_admission_test_counters(),
-            GraphTextAdmissionTestCounters {
-                builder_enumerations: 0,
-                point_query_attempts: 1,
-                ..GraphTextAdmissionTestCounters::default()
-            }
-        );
+        assert_epoch_query_rejected_without_side_work(&unbuilt);
 
         let building_root = scratch("admission-query-building");
         let building = Graph::open(&building_root);
         building.begin_graph_text_admission_build().unwrap();
-        reset_graph_text_admission_test_counters();
-        assert!(building.graph_text_admission_epoch().is_err());
-        assert_eq!(
-            graph_text_admission_test_counters(),
-            GraphTextAdmissionTestCounters {
-                builder_enumerations: 0,
-                point_query_attempts: 1,
-                ..GraphTextAdmissionTestCounters::default()
-            }
-        );
+        assert_epoch_query_rejected_without_side_work(&building);
 
         let root = scratch("admission-query-boundary");
         fs::create_dir_all(root.join("deep/tree")).unwrap();
         fs::write(root.join("deep/tree/Page.md"), b"- page\n").unwrap();
         let graph = Graph::open(&root);
         graph.initial_shadow_raw_managed_text_inventory().unwrap();
-        reset_graph_text_admission_test_counters();
-        assert!(graph.graph_text_admission_epoch().is_err());
-        assert_eq!(
-            graph_text_admission_test_counters(),
-            GraphTextAdmissionTestCounters {
-                builder_enumerations: 0,
-                point_query_attempts: 1,
-                ..GraphTextAdmissionTestCounters::default()
-            }
-        );
+        assert_epoch_query_rejected_without_side_work(&graph);
 
         graph.poison_graph_text_admission("injected poison");
-        reset_graph_text_admission_test_counters();
-        assert!(graph.graph_text_admission_epoch().is_err());
-        assert_eq!(
-            graph_text_admission_test_counters(),
-            GraphTextAdmissionTestCounters {
-                builder_enumerations: 0,
-                point_query_attempts: 1,
-                ..GraphTextAdmissionTestCounters::default()
-            }
-        );
+        assert_epoch_query_rejected_without_side_work(&graph);
         let _ = fs::remove_dir_all(&unbuilt_root);
         let _ = fs::remove_dir_all(&building_root);
         let _ = fs::remove_dir_all(&root);
@@ -36578,12 +36575,13 @@ mod tests {
         let epoch = graph.graph_text_admission_epoch().unwrap();
         let path = ManagedPath::parse("deep/tree/Page.Markdown").unwrap();
 
-        reset_graph_text_admission_test_counters();
         PROJECTION_EXACT_OPEN_COUNT.with(|count| count.set(0));
-        let observation = graph
-            .graph_text_admission_exact(&epoch, &path)
-            .unwrap()
-            .into_present();
+        let (observation, counters) = measure_graph_text_admission_point_queries(|| {
+            graph
+                .graph_text_admission_exact(&epoch, &path)
+                .unwrap()
+                .into_present()
+        });
         assert_eq!(observation.current.bytes, b"title:: Current\n\n- body\n");
         assert_eq!(
             observation.current.description,
@@ -36594,13 +36592,7 @@ mod tests {
             observation.record.file_resource_id
         );
         assert_eq!(observation.current.link_count, 1);
-        assert_eq!(
-            graph_text_admission_test_counters(),
-            GraphTextAdmissionTestCounters {
-                point_query_attempts: 1,
-                ..GraphTextAdmissionTestCounters::default()
-            }
-        );
+        assert_graph_text_admission_point_query_only(counters, 1);
         PROJECTION_EXACT_OPEN_COUNT.with(|count| assert!(count.get() >= 4));
 
         let _ = fs::remove_dir_all(&root);
@@ -36973,19 +36965,16 @@ mod tests {
                 generation: 1,
                 feed_sequence: 0,
             };
-            reset_graph_text_admission_test_counters();
-            assert!(graph.graph_text_admission_epoch().is_err());
-            assert!(graph
-                .graph_text_admission_exact(&forged, &ManagedPath::parse(member).unwrap())
-                .is_err());
-            assert_eq!(
-                graph_text_admission_test_counters(),
-                GraphTextAdmissionTestCounters {
-                    builder_enumerations: 0,
-                    point_query_attempts: 2,
-                    ..GraphTextAdmissionTestCounters::default()
-                }
-            );
+            let member = ManagedPath::parse(member).unwrap();
+            let ((epoch, exact), counters) = measure_graph_text_admission_point_queries(|| {
+                (
+                    graph.graph_text_admission_epoch(),
+                    graph.graph_text_admission_exact(&forged, &member),
+                )
+            });
+            assert!(epoch.is_err());
+            assert!(exact.is_err());
+            assert_graph_text_admission_point_query_only(counters, 2);
             assert!(matches!(
                 &*graph.graph_text_admission.read().unwrap(),
                 GraphTextAdmissionState::Poisoned { .. }
