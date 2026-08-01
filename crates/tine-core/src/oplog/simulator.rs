@@ -2861,6 +2861,18 @@ impl SharedProviderTransport {
         )
     }
 
+    pub(crate) fn publish_object_exact(
+        &mut self,
+        digest: super::ContentDigest,
+        bytes: &[u8],
+    ) -> Result<(), ScenarioError> {
+        self.publish_exact(
+            &format!("{PROVIDER_OBJECTS_NAMESPACE}/{digest}.object"),
+            bytes,
+            super::MAX_OBJECT_BYTES,
+        )
+    }
+
     pub(crate) fn publish_manifest(
         &mut self,
         batch_id: super::BatchId,
@@ -2947,6 +2959,84 @@ impl SharedProviderTransport {
             &location,
             bytes,
         )?;
+        self.runtime.put_complete(
+            &self.journal,
+            &gate,
+            &source,
+            &source,
+            &location,
+            bytes,
+            None,
+            None,
+        )
+    }
+
+    fn publish_exact(
+        &mut self,
+        path: &str,
+        bytes: &[u8],
+        limit: usize,
+    ) -> Result<(), ScenarioError> {
+        let gate = self.journal.acquire_transaction_gate()?;
+        let source = format!("generated:{}", provider_digest(bytes));
+        let location = ProviderLocation {
+            device: "local".into(),
+            tree: ProviderTree::Outbox,
+            path: path.into(),
+        };
+        self.journal.recycle_completed_put_for_absent_destination(
+            &gate,
+            &source,
+            &source,
+            &self.runtime,
+            &location,
+            bytes,
+        )?;
+        let retry = self
+            .journal
+            .load(
+                &gate,
+                ProviderJournalOperation::Put,
+                &source,
+                &source,
+                location.tree,
+                &location.path,
+                None,
+            )?
+            .is_some();
+        if !retry {
+            let (destination_dir, destination_name) =
+                self.runtime
+                    .parent_and_name(location.tree, &location.path, true)?;
+            if let Some(existing) = open_provider_regular_optional(
+                &destination_dir,
+                &destination_name,
+                limit,
+                &location.path,
+            )? {
+                if existing.bytes != bytes {
+                    return Err(ScenarioError::ProviderConflictingBytes(
+                        location.path.clone(),
+                    ));
+                }
+                sync_provider_publication_directories(&destination_dir, None)?;
+                let current = open_provider_regular_optional(
+                    &destination_dir,
+                    &destination_name,
+                    limit,
+                    &location.path,
+                )?
+                .ok_or_else(|| ScenarioError::UnsafeProviderEntry(location.path.clone()))?;
+                if current.bytes != bytes
+                    || !provider_files_have_same_identity(&existing.file, &current.file)?
+                {
+                    return Err(ScenarioError::ProviderConflictingBytes(
+                        location.path.clone(),
+                    ));
+                }
+                return Ok(());
+            }
+        }
         self.runtime.put_complete(
             &self.journal,
             &gate,
@@ -10483,6 +10573,11 @@ std::thread_local! {
 #[cfg(test)]
 pub(crate) fn fail_next_pending_publication_marker_creation() {
     FAIL_PENDING_PUBLICATION_MARKER_CREATION.with(|fail| fail.set(true));
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_provider_publication_after_physical_write() {
+    FAIL_PROVIDER_PUBLICATION_AFTER_PHYSICAL_WRITE.with(|fail| fail.set(true));
 }
 
 #[cfg(test)]

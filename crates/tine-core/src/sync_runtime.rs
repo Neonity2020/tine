@@ -98,7 +98,10 @@ use crate::oplog::shadow_projection::verify_inactive_bootstrap_shadow_projection
 #[cfg(test)]
 use crate::oplog::shadow_projection::ShadowProjectionInstrumentation;
 #[cfg(test)]
-use crate::oplog::simulator::fail_next_pending_publication_marker_creation;
+use crate::oplog::simulator::{
+    fail_next_pending_publication_marker_creation,
+    fail_next_provider_publication_after_physical_write,
+};
 use crate::oplog::simulator::{
     inspect_cold_shared_provider_descriptor, inspect_shared_provider_descriptor,
     provider_transient_path, SharedProviderFrontierHeadV1, SharedProviderManifestRecoveryLinkV1,
@@ -2792,6 +2795,22 @@ impl SyncRuntimeHandle {
             .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)
     }
 
+    #[cfg(test)]
+    fn install_provider_publication_after_physical_write_fault(
+        &self,
+    ) -> Result<(), SyncRuntimeRequestError> {
+        let _operation = self.inner.operation.lock().unwrap();
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.send(
+            ActorRequest::InstallProviderPublicationAfterPhysicalWriteFault {
+                reply: reply_sender,
+            },
+        )?;
+        reply_receiver
+            .recv()
+            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)
+    }
+
     fn send(&self, request: ActorRequest) -> Result<(), SyncRuntimeRequestError> {
         self.inner
             .sender
@@ -4183,6 +4202,24 @@ fn publish_manifest_recovery(
         .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))
 }
 
+fn publish_provider_object_exact(
+    provider: &mut SharedProviderTransport,
+    digest: ContentDigest,
+    bytes: &[u8],
+) -> Result<(), SyncRuntimeRequestError> {
+    if ContentDigest::of(bytes) != digest {
+        return Err(SyncRuntimeRequestError::ActorRefused(format!(
+            "local provider object bytes do not match {digest}"
+        )));
+    }
+    // Physical visibility is not publication completion. The transport owns
+    // both the authenticated retry journal and the exact-existing durability
+    // proof, including directory sync and same-file identity revalidation.
+    provider
+        .publish_object_exact(digest, bytes)
+        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))
+}
+
 fn publish_complete_archive(
     store: &ObjectStore,
     provider: &mut SharedProviderTransport,
@@ -4197,9 +4234,7 @@ fn publish_complete_archive(
             let bytes = store
                 .read_object_bytes(object.content_digest())
                 .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
-            provider
-                .publish_object(object.content_digest(), &bytes)
-                .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+            publish_provider_object_exact(provider, object.content_digest(), &bytes)?;
         }
     }
     let mut intents = Vec::with_capacity(manifests.len());
@@ -4258,9 +4293,7 @@ fn publish_archive_batch(
         let bytes = store
             .read_object_bytes(object.content_digest())
             .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
-        provider
-            .publish_object(object.content_digest(), &bytes)
-            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+        publish_provider_object_exact(provider, object.content_digest(), &bytes)?;
     }
     let manifest_bytes = store
         .read_manifest_bytes(batch_id)
@@ -5035,6 +5068,8 @@ enum ActorRequest {
     },
     #[cfg(test)]
     InstallPendingPublicationMarkerCreationFault { reply: mpsc::Sender<()> },
+    #[cfg(test)]
+    InstallProviderPublicationAfterPhysicalWriteFault { reply: mpsc::Sender<()> },
     CleanShutdown {
         reply: mpsc::Sender<Result<SyncShutdownOutcome, SyncRuntimeRequestError>>,
     },
@@ -5211,6 +5246,12 @@ fn run_actor_loop(
             #[cfg(test)]
             ActorRequest::InstallPendingPublicationMarkerCreationFault { reply } => {
                 fail_next_pending_publication_marker_creation();
+                let _ = reply.send(());
+                false
+            }
+            #[cfg(test)]
+            ActorRequest::InstallProviderPublicationAfterPhysicalWriteFault { reply } => {
+                fail_next_provider_publication_after_physical_write();
                 let _ = reply.send(());
                 false
             }
@@ -8201,13 +8242,13 @@ impl RuntimeActor {
                         batch_id,
                         "repair_publication",
                     )?;
-                    self.provider
-                        .as_mut()
-                        .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
-                        .publish_object(digest, &local_object)
-                        .map_err(|error| {
-                            SyncRuntimeRequestError::ActorRefused(error.to_string())
-                        })?;
+                    publish_provider_object_exact(
+                        self.provider
+                            .as_mut()
+                            .ok_or(SyncRuntimeRequestError::ActorUnavailable)?,
+                        digest,
+                        &local_object,
+                    )?;
                     self.provider_head_dirty = true;
                 }
             }
@@ -11485,7 +11526,14 @@ fn projected_editor_name_state(
         .map_err(|_| SyncEditorRequestError::ActorRefused)?;
     match owners.as_slice() {
         [owner] => return Ok(EditorNameState::Exact(owner.page_id)),
-        [_, ..] => return Ok(EditorNameState::Ambiguous),
+        [_, ..] => {
+            // SQLite remains the fast exact-frontier source for the ordinary
+            // unique case, but duplicate rows are not authority to hide the
+            // authenticated name/kind/path state. Authenticate only this
+            // exceptional branch so clean, unambiguous reads keep the catalog
+            // cold, independent of which counterfeit IDs SQLite returned.
+            return editor_name_state(runtime, graph, name.as_str().into(), page_kind);
+        }
         [] => {}
     }
     let path = graph
@@ -14422,26 +14470,82 @@ mod tests {
         let path = "content/nested pages/Duplicate Owner.md";
         admit_external_page(&handle, &fixture, path, b"- first owner\n");
 
-        let duplicate_page = Uuid::new_v4();
-        let duplicate_home = Uuid::new_v4();
+        let genuine = load_editor_named(&handle, "Duplicate Owner", SyncPageKind::Page);
+        let genuine_page = Uuid::parse_str(&genuine.page_id).unwrap();
+        let counterfeit_pages = [
+            Uuid::from_u128(0x11),
+            Uuid::from_u128(0x12),
+            Uuid::from_u128(0x13),
+            Uuid::from_u128(0x14),
+        ];
+        assert!(counterfeit_pages
+            .iter()
+            .all(|page_id| page_id.as_bytes() < genuine_page.as_bytes()));
         let connection = rusqlite::Connection::open(&database_path).unwrap();
-        connection
-            .execute(
-                "INSERT INTO pages(
+        let insert_counterfeit =
+            |page_id: Uuid, home_id: Uuid, name: &str, name_key: &str, counterfeit_path: &str| {
+                connection
+                    .execute(
+                        "INSERT INTO pages(
                     page_id, home_document_id, name, name_key, path,
                     text_kind, preamble, searchable_text
                  )
-                 SELECT ?1, ?2, name, name_key, ?3,
+                 SELECT ?1, ?2, ?3, ?4, ?5,
                         text_kind, preamble, searchable_text
-                 FROM pages WHERE path = ?4",
-                rusqlite::params![
-                    duplicate_page.as_bytes().as_slice(),
-                    duplicate_home.as_bytes().as_slice(),
-                    "other/nonstandard/duplicate.markdown",
-                    path,
-                ],
-            )
-            .unwrap();
+                 FROM pages WHERE path = ?6",
+                        rusqlite::params![
+                            page_id.as_bytes().as_slice(),
+                            home_id.as_bytes().as_slice(),
+                            name,
+                            name_key,
+                            counterfeit_path,
+                            path,
+                        ],
+                    )
+                    .unwrap();
+            };
+        let duplicate_name = LogicalPageName::parse("Duplicate Owner").unwrap();
+        for (page_id, home_id, counterfeit_path) in [
+            (
+                counterfeit_pages[0],
+                Uuid::from_u128(0x21),
+                "other/nonstandard/duplicate-one.markdown",
+            ),
+            (
+                counterfeit_pages[1],
+                Uuid::from_u128(0x22),
+                "other/nonstandard/duplicate-two.markdown",
+            ),
+        ] {
+            insert_counterfeit(
+                page_id,
+                home_id,
+                duplicate_name.as_str(),
+                &duplicate_name.canonical_key(),
+                counterfeit_path,
+            );
+        }
+        let absent_name = LogicalPageName::parse("Authenticated Absent").unwrap();
+        for (page_id, home_id, counterfeit_path) in [
+            (
+                counterfeit_pages[2],
+                Uuid::from_u128(0x23),
+                "other/nonstandard/absent-one.markdown",
+            ),
+            (
+                counterfeit_pages[3],
+                Uuid::from_u128(0x24),
+                "other/nonstandard/absent-two.markdown",
+            ),
+        ] {
+            insert_counterfeit(
+                page_id,
+                home_id,
+                absent_name.as_str(),
+                &absent_name.canonical_key(),
+                counterfeit_path,
+            );
+        }
 
         assert_eq!(
             handle
@@ -14483,10 +14587,47 @@ mod tests {
         assert_eq!(snapshot_graph_files(fixture.graph_root()), files_before);
         assert_eq!(handle.status().unwrap(), status_before);
 
+        let draft = match handle
+            .load_editor_page(SyncEditorLoadRequest {
+                page: SyncEditorPageSelector::Name {
+                    name: absent_name.as_str().into(),
+                    page_kind: SyncPageKind::Page,
+                },
+            })
+            .unwrap()
+        {
+            SyncEditorLoadOutcome::NewPage { draft } => draft,
+            other => panic!("authenticated-absent name was hidden by counterfeit rows: {other:?}"),
+        };
+        let saved = handle
+            .save_editor_page(SyncEditorSaveRequest {
+                target: SyncEditorSaveTarget::New {
+                    name: draft.name,
+                    page_kind: draft.page_kind,
+                    revision: draft.revision,
+                },
+                preamble: None,
+                blocks: vec![SyncEditorBlockDto {
+                    key: SyncEditorBlockKey::Temporary("legitimate-root".into()),
+                    parent: None,
+                    content: "authenticated absence permits creation".into(),
+                }],
+            })
+            .unwrap();
+        assert!(
+            matches!(saved, SyncEditorSaveOutcome::Durable { .. }),
+            "authenticated absence did not permit the legitimate mutation: {saved:?}"
+        );
+
         connection
             .execute(
-                "DELETE FROM pages WHERE page_id = ?1",
-                rusqlite::params![duplicate_page.as_bytes().as_slice()],
+                "DELETE FROM pages WHERE page_id IN (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    counterfeit_pages[0].as_bytes().as_slice(),
+                    counterfeit_pages[1].as_bytes().as_slice(),
+                    counterfeit_pages[2].as_bytes().as_slice(),
+                    counterfeit_pages[3].as_bytes().as_slice(),
+                ],
             )
             .unwrap();
         drop(connection);
@@ -19950,6 +20091,18 @@ mod tests {
             .join("batches")
             .join(format!("{first_batch}.manifest"));
         let local_manifest_bytes = fs::read(&local_manifest).unwrap();
+        let first_manifest = OperationBatch::decode(&local_manifest_bytes).unwrap();
+        let first_provider_objects = first_manifest
+            .required_objects()
+            .iter()
+            .map(|object| {
+                receiver
+                    .request
+                    .provider_root
+                    .join(format!("outbox/objects/{}.object", object.content_digest()))
+            })
+            .collect::<Vec<_>>();
+        assert!(first_provider_objects.iter().all(|path| path.is_file()));
         assert!(receiver
             .request
             .provider_root
@@ -19960,13 +20113,27 @@ mod tests {
         fs::remove_file(&recovery_blob).unwrap();
         fs::remove_file(&local_manifest).unwrap();
 
-        let refused = SyncRuntimeHandle::open(reopen_request(&receiver.request));
+        let refused = active_handle(SyncRuntimeHandle::open(reopen_request(&receiver.request)));
+        let mut blocked = None;
+        for _ in 0..4_096 {
+            match refused.tick_provider_for_test().unwrap() {
+                SyncRuntimeTick::RecoveryBlocked(detail) => {
+                    blocked = Some(detail);
+                    break;
+                }
+                SyncRuntimeTick::Idle | SyncRuntimeTick::Recovering => {}
+                other => panic!("accepted-manifest revalidation returned {other:?}"),
+            }
+        }
         assert!(
-            matches!(refused.status, SyncRuntimeOpenStatus::OpenRefused { .. }),
-            "authenticated restart admitted an archive missing accepted non-tip authority: {:?}",
-            refused.status
+            blocked.as_ref().is_some_and(|detail| {
+                detail.contains("accepted provider manifest is absent")
+                    || detail.contains("and its local archive are absent")
+            }),
+            "bounded restart revalidation did not fail closed on missing accepted non-tip authority: {blocked:?}"
         );
-        assert!(refused.handle.is_none());
+        drop(refused);
+        assert!(first_provider_objects.iter().all(|path| path.is_file()));
         fs::write(&local_manifest, local_manifest_bytes).unwrap();
 
         PROVIDER_ACCEPTED_AUDIT_LIMIT_OVERRIDES
@@ -19974,10 +20141,9 @@ mod tests {
             .unwrap()
             .insert(receiver.request.identities.workspace_id, 1);
         let restarted = active_handle(SyncRuntimeHandle::open(reopen_request(&receiver.request)));
-        settle_shared_provider_authority(&restarted);
         let mut recovering_pages = 0;
         let mut repaired = false;
-        for _ in 0..64 {
+        for _ in 0..4_096 {
             match restarted.tick_provider_for_test().unwrap() {
                 SyncRuntimeTick::Recovering => recovering_pages += 1,
                 SyncRuntimeTick::Idle => {}
@@ -20927,7 +21093,16 @@ mod tests {
 
         reset_provider_traversal_instrumentation(author.request.identities.workspace_id);
         let repair = active_handle(SyncRuntimeHandle::open(reopen_request(&author.request)));
-        settle_shared_provider(&repair);
+        for _ in 0..4_096 {
+            let tick = repair.tick_provider_for_test().unwrap();
+            assert!(
+                matches!(tick, SyncRuntimeTick::Idle | SyncRuntimeTick::Recovering),
+                "bounded accepted-sequence audit failed: {tick:?}"
+            );
+            if middle_manifest.is_file() {
+                break;
+            }
+        }
         assert!(
             middle_manifest.is_file(),
             "bounded accepted-sequence audit did not repair historical manifest authority"
@@ -21163,10 +21338,12 @@ mod tests {
             .request
             .provider_root
             .join(format!("outbox/manifests/{child_batch}.manifest"));
+        let (child_link, child_blob, ..) = provider_manifest_recovery_paths(&receiver, child_batch);
         assert!(
             !child_manifest.exists(),
             "the child escaped before its newly accepted ancestor was mirrored"
         );
+        assert!(!child_link.exists() && !child_blob.exists());
         let receiver_heads = receiver
             .request
             .provider_root
@@ -21194,9 +21371,10 @@ mod tests {
         );
         assert!(
             receiver_handle.clean_shutdown().is_err(),
-            "the receiver reached Safe before the middle mirror was durable"
+            "the receiver reached Safe before the child mirror was durable"
         );
-        assert!(!middle_link.exists() && !middle_blob.exists());
+        assert!(middle_link.is_file() && middle_blob.is_file());
+        assert!(!child_link.exists() && !child_blob.exists());
         drop(receiver_handle);
         drop(author_handle);
 
@@ -21204,6 +21382,7 @@ mod tests {
             active_handle(SyncRuntimeHandle::open(reopen_request(&receiver.request)));
         settle_shared_provider(&receiver_restarted);
         assert!(middle_link.is_file() && middle_blob.is_file());
+        assert!(child_link.is_file() && child_blob.is_file());
         assert!(child_manifest.is_file());
         let receiver_head = fs::read_dir(&receiver_heads)
             .unwrap()
@@ -21573,8 +21752,8 @@ mod tests {
             .provider_root
             .join(format!("outbox/manifests/{child_batch}.manifest"));
         assert!(
-            !parent_manifest.exists() && !child_manifest.exists(),
-            "the crash cut must precede the next provider tick"
+            parent_manifest.is_file() && !child_manifest.exists(),
+            "the second mutation's safety preflight must publish the accepted parent but leave the newly accepted child durable only in the local archive"
         );
         drop(reopened);
 
@@ -21613,6 +21792,182 @@ mod tests {
             resumed.clean_shutdown(),
             Ok(SyncShutdownOutcome::Safe(_))
         ));
+    }
+
+    #[test]
+    fn provider_object_physical_write_cut_requires_exact_journal_completion_before_manifest_and_head(
+    ) {
+        let fixture = make_shared_fixture("provider-object-durability-cut", 0xb215);
+        let _descriptor = activate_and_prepare_shared(&fixture);
+        let handle = active_handle(SyncRuntimeHandle::open(reopen_request(&fixture.request)));
+        settle_shared_provider(&handle);
+
+        let (batch_id, ..) = submit_shared_page(
+            &handle,
+            0xb216,
+            "Provider Object Durability Cut",
+            "notes/provider-object-durability-cut.md",
+            "exact bytes must complete their retry journal",
+        );
+        let store = ObjectStore::open(
+            &fixture.request.archive_root,
+            fixture.request.identities.workspace_id,
+        )
+        .unwrap();
+        let manifest =
+            OperationBatch::decode(&store.read_manifest_bytes(batch_id).unwrap()).unwrap();
+        let unpublished_objects = manifest
+            .required_objects()
+            .iter()
+            .filter_map(|object| {
+                let digest = object.content_digest();
+                let path = fixture
+                    .request
+                    .provider_root
+                    .join(format!("outbox/objects/{digest}.object"));
+                (!path.exists()).then(|| (digest, store.read_object_bytes(digest).unwrap(), path))
+            })
+            .collect::<Vec<_>>();
+        assert!(!unpublished_objects.is_empty());
+        let provider_manifest = fixture
+            .request
+            .provider_root
+            .join(format!("outbox/manifests/{batch_id}.manifest"));
+        let pending_records = fixture.request.provider_journal_root.join("records");
+        let completed_records = fixture.request.provider_journal_root.join("completed");
+        let mut blocked = None;
+        let mut pending_before_cut = 0;
+        let mut completed_before_cut = 0;
+        for _ in 0..128 {
+            let target_objects_before = unpublished_objects
+                .iter()
+                .filter(|(_, _, path)| path.is_file())
+                .count();
+            let pending_before = fs::read_dir(&pending_records).unwrap().count();
+            let completed_before = fs::read_dir(&completed_records).unwrap().count();
+            handle
+                .install_provider_publication_after_physical_write_fault()
+                .unwrap();
+            match handle.tick().unwrap() {
+                SyncRuntimeTick::RecoveryBlocked(detail) => {
+                    let target_objects_after = unpublished_objects
+                        .iter()
+                        .filter(|(_, _, path)| path.is_file())
+                        .count();
+                    if target_objects_after > target_objects_before {
+                        pending_before_cut = pending_before;
+                        completed_before_cut = completed_before;
+                        blocked = Some(detail);
+                        break;
+                    }
+                }
+                SyncRuntimeTick::Idle | SyncRuntimeTick::Recovering => {}
+                other => panic!("unexpected publication cut tick: {other:?}"),
+            }
+            assert!(
+                !provider_manifest.exists(),
+                "manifest advanced while seeking the target object publication cut"
+            );
+        }
+        assert!(
+            blocked
+                .as_deref()
+                .is_some_and(|detail| detail.contains("injected provider publication")),
+            "the physical-write cut did not block provider advancement: {blocked:?}"
+        );
+        let (_, object_bytes, provider_object) = unpublished_objects
+            .iter()
+            .find(|(_, _, path)| path.is_file())
+            .expect("the target batch did not reach a physical object write");
+        assert_eq!(fs::read(&provider_object).unwrap(), *object_bytes);
+        assert!(fs::read_dir(&pending_records).unwrap().count() > pending_before_cut);
+        assert_eq!(
+            fs::read_dir(&completed_records).unwrap().count(),
+            completed_before_cut
+        );
+        assert!(!provider_manifest.exists());
+        assert!(!provider_head_covers(
+            &fixture,
+            fixture.request.identities.device_id,
+            batch_id
+        ));
+
+        for _ in 0..128 {
+            let tick = handle.tick().unwrap();
+            assert!(
+                matches!(tick, SyncRuntimeTick::Idle | SyncRuntimeTick::Recovering),
+                "exact object retry failed: {tick:?}"
+            );
+            if provider_manifest.is_file() {
+                break;
+            }
+        }
+        assert_eq!(fs::read(&provider_object).unwrap(), *object_bytes);
+        assert_eq!(
+            fs::read_dir(&pending_records).unwrap().count(),
+            pending_before_cut
+        );
+        assert!(fs::read_dir(&completed_records).unwrap().count() > completed_before_cut);
+        assert!(provider_manifest.is_file());
+        settle_shared_provider(&handle);
+        assert!(provider_head_covers(
+            &fixture,
+            fixture.request.identities.device_id,
+            batch_id
+        ));
+
+        let (conflict_batch, ..) = submit_shared_page(
+            &handle,
+            0xb21a,
+            "Provider Object Exact Conflict",
+            "notes/provider-object-exact-conflict.md",
+            "conflicting physical bytes must fail closed",
+        );
+        let conflict_manifest =
+            OperationBatch::decode(&store.read_manifest_bytes(conflict_batch).unwrap()).unwrap();
+        let (conflict_digest, conflict_path) = conflict_manifest
+            .required_objects()
+            .iter()
+            .map(|object| {
+                let digest = object.content_digest();
+                let path = fixture
+                    .request
+                    .provider_root
+                    .join(format!("outbox/objects/{digest}.object"));
+                (digest, path)
+            })
+            .find(|(_, path)| !path.exists())
+            .expect("new batch must require an unpublished object");
+        fs::write(&conflict_path, b"conflicting provider object bytes").unwrap();
+        let conflict_provider_manifest = fixture
+            .request
+            .provider_root
+            .join(format!("outbox/manifests/{conflict_batch}.manifest"));
+        let mut conflict = None;
+        for _ in 0..128 {
+            match handle.tick().unwrap() {
+                SyncRuntimeTick::RecoveryBlocked(detail) => {
+                    conflict = Some(detail);
+                    break;
+                }
+                SyncRuntimeTick::Idle | SyncRuntimeTick::Recovering => {}
+                other => panic!("unexpected exact-conflict tick: {other:?}"),
+            }
+        }
+        assert!(
+            conflict.as_deref().is_some_and(|detail| {
+                detail.contains("conflicting provider bytes")
+                    && detail.contains(&conflict_digest.to_string())
+            }),
+            "conflicting existing bytes did not fail closed: {conflict:?}"
+        );
+        assert!(!conflict_provider_manifest.exists());
+        assert!(!provider_head_covers(
+            &fixture,
+            fixture.request.identities.device_id,
+            conflict_batch
+        ));
+        drop(handle);
     }
 
     #[test]
@@ -21968,17 +22323,9 @@ mod tests {
             first_boundary.head_scan_completions, 0,
             "a chunk boundary was mistaken for discovery EOF: {first_boundary:?}"
         );
-        assert!(
-            first_boundary.intent_entries > 0 && first_boundary.intent_entries < STRANDED_BATCHES,
-            "the first chunk did not split the foreign intent namespace: {first_boundary:?}"
-        );
         assert_eq!(
             first_boundary.full_scan_entries, 0,
             "a valid multi-chunk head+intent scan triggered a broad fallback"
-        );
-        assert!(
-            receiver_startup.status().unwrap().provider_pending > 0,
-            "the first chunk did not retain its observed intent work"
         );
         let heads_at_first_boundary = fs::read_dir(&receiver_heads)
             .unwrap()
@@ -22842,19 +23189,8 @@ mod tests {
                 active_handle(SyncRuntimeHandle::open(reopen_request(&first.request)));
             let second_merged =
                 active_handle(SyncRuntimeHandle::open(reopen_request(&second.request)));
-            for _ in 0..256 {
-                let first_tick = first_merged.tick().unwrap();
-                let second_tick = second_merged.tick().unwrap();
-                if matches!(first_tick, SyncRuntimeTick::Idle)
-                    && matches!(second_tick, SyncRuntimeTick::Idle)
-                    && first_merged.status().unwrap().provider_pending == 0
-                    && second_merged.status().unwrap().provider_pending == 0
-                {
-                    break;
-                }
-            }
-            assert_eq!(first_merged.status().unwrap().provider_pending, 0);
-            assert_eq!(second_merged.status().unwrap().provider_pending, 0);
+            settle_shared_provider(&first_merged);
+            settle_shared_provider(&second_merged);
             let first_page = load_editor_id(&first_merged, target_page_id);
             let second_page = load_editor_id(&second_merged, target_page_id);
             assert_eq!(first_page.name, second_page.name);
@@ -23775,9 +24111,12 @@ mod tests {
             .parent()
             .unwrap()
             .join("pending-publication-v1");
-        assert!(pending_root
-            .join(format!("{parent_batch}.pending"))
-            .is_file());
+        assert!(
+            !pending_root
+                .join(format!("{parent_batch}.pending"))
+                .exists(),
+            "the child mutation's safety preflight must finish the parent's pending publication"
+        );
         assert!(
             !pending_root.join(format!("{child_batch}.pending")).exists(),
             "the injected creation failure must leave no durable child marker"
@@ -23794,7 +24133,7 @@ mod tests {
             .request
             .provider_root
             .join(format!("outbox/manifests/{child_batch}.manifest"));
-        assert!(!parent_manifest.exists() && !child_manifest.exists());
+        assert!(parent_manifest.is_file() && !child_manifest.exists());
 
         // Drop without a retry or Safe handoff: only unsafe local-history
         // repair can rediscover the accepted markerless child.
