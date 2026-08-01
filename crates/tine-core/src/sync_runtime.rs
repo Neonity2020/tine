@@ -18945,6 +18945,72 @@ mod tests {
         manifest
     }
 
+    fn provider_object_paths(manifest: &OperationBatch) -> Vec<String> {
+        manifest
+            .required_objects()
+            .iter()
+            .map(|object| format!("objects/{}.object", object.content_digest()))
+            .collect()
+    }
+
+    fn provider_complete_delivery_paths(manifest: &OperationBatch) -> Vec<String> {
+        let mut delivered = provider_object_paths(manifest);
+        delivered.push(format!("manifests/{}.manifest", manifest.batch_id()));
+        delivered
+    }
+
+    fn direct_dependency_child_manifest(
+        fixture: &ActivationFixture,
+        batch_id: BatchId,
+        dependency_batch: BatchId,
+    ) -> OperationBatch {
+        let store = ObjectStore::open(
+            &fixture.request.archive_root,
+            fixture.request.identities.workspace_id,
+        )
+        .unwrap();
+        let locally_authored =
+            OperationBatch::decode(&store.read_manifest_bytes(batch_id).unwrap()).unwrap();
+        OperationBatch::new_with_causality(
+            locally_authored.workspace_id(),
+            locally_authored.lineage_digest(),
+            locally_authored.batch_id(),
+            locally_authored.author_device_id(),
+            locally_authored.author_session_id(),
+            locally_authored.origin(),
+            locally_authored.causal_dot(),
+            vec![dependency_batch],
+            locally_authored.dependency_frontier().clone(),
+            locally_authored.semantic_effect_digest(),
+            locally_authored.required_objects().to_vec(),
+        )
+        .unwrap()
+    }
+
+    fn publish_manifest_to_provider(fixture: &ActivationFixture, manifest: &OperationBatch) {
+        let store = ObjectStore::open(
+            &fixture.request.archive_root,
+            fixture.request.identities.workspace_id,
+        )
+        .unwrap();
+        let mut provider = SharedProviderTransport::open(
+            &fixture.request.provider_root,
+            &fixture.request.provider_journal_root,
+        )
+        .unwrap();
+        for object in manifest.required_objects() {
+            provider
+                .publish_object(
+                    object.content_digest(),
+                    &store.read_object_bytes(object.content_digest()).unwrap(),
+                )
+                .unwrap();
+        }
+        provider
+            .publish_manifest(manifest.batch_id(), &manifest.encode().unwrap())
+            .unwrap();
+    }
+
     fn provider_manifest_recovery_paths(
         fixture: &ActivationFixture,
         batch_id: BatchId,
@@ -23196,12 +23262,7 @@ mod tests {
             &initiator.request.provider_root,
             &receiver.request.provider_root,
         );
-        let mut no_op_delivery = no_op_manifest
-            .required_objects()
-            .iter()
-            .map(|object| format!("objects/{}.object", object.content_digest()))
-            .collect::<Vec<_>>();
-        no_op_delivery.push(format!("manifests/{no_op_batch}.manifest"));
+        let no_op_delivery = provider_complete_delivery_paths(&no_op_manifest);
         initiator_handle
             .observe_provider_paths(no_op_delivery.clone(), false)
             .unwrap();
@@ -23218,51 +23279,13 @@ mod tests {
                 preamble: Some("partial direct child must remain blocked".into()),
             }],
         );
-        let initiator_store = ObjectStore::open(
-            &initiator.request.archive_root,
-            initiator.request.identities.workspace_id,
-        )
-        .unwrap();
-        let locally_authored_child =
-            OperationBatch::decode(&initiator_store.read_manifest_bytes(child_batch).unwrap())
-                .unwrap();
-        let child_manifest = OperationBatch::new_with_causality(
-            locally_authored_child.workspace_id(),
-            locally_authored_child.lineage_digest(),
-            locally_authored_child.batch_id(),
-            locally_authored_child.author_device_id(),
-            locally_authored_child.author_session_id(),
-            locally_authored_child.origin(),
-            locally_authored_child.causal_dot(),
-            vec![no_op_batch],
-            locally_authored_child.dependency_frontier().clone(),
-            locally_authored_child.semantic_effect_digest(),
-            locally_authored_child.required_objects().to_vec(),
-        )
-        .unwrap();
+        let child_manifest = direct_dependency_child_manifest(&initiator, child_batch, no_op_batch);
         assert_eq!(
             child_manifest.causal_dependency_heads(),
             &[no_op_batch],
             "fixture child must reach the direct-dependency check"
         );
-        let mut provider = SharedProviderTransport::open(
-            &initiator.request.provider_root,
-            &initiator.request.provider_journal_root,
-        )
-        .unwrap();
-        for object in child_manifest.required_objects() {
-            provider
-                .publish_object(
-                    object.content_digest(),
-                    &initiator_store
-                        .read_object_bytes(object.content_digest())
-                        .unwrap(),
-                )
-                .unwrap();
-        }
-        provider
-            .publish_manifest(child_batch, &child_manifest.encode().unwrap())
-            .unwrap();
+        publish_manifest_to_provider(&initiator, &child_manifest);
         copy_provider_tree(
             &initiator.request.provider_root,
             &receiver.request.provider_root,
@@ -23400,12 +23423,7 @@ mod tests {
             &initiator.request.provider_root,
             &observer.request.provider_root,
         );
-        let mut no_op_delivery = headless_no_op_manifest
-            .required_objects()
-            .iter()
-            .map(|object| format!("objects/{}.object", object.content_digest()))
-            .collect::<Vec<_>>();
-        no_op_delivery.push(format!("manifests/{no_op_batch}.manifest"));
+        let no_op_delivery = provider_complete_delivery_paths(&headless_no_op_manifest);
         receiver_handle
             .observe_provider_paths(no_op_delivery.clone(), false)
             .unwrap();
@@ -23461,53 +23479,13 @@ mod tests {
                 preamble: Some("child delivered after restart".into()),
             }],
         );
-        let receiver_store = ObjectStore::open(
-            &receiver.request.archive_root,
-            receiver.request.identities.workspace_id,
-        )
-        .unwrap();
-        let locally_authored_child_manifest =
-            OperationBatch::decode(&receiver_store.read_manifest_bytes(child_batch).unwrap())
-                .unwrap();
-        let child_manifest = OperationBatch::new_with_causality(
-            locally_authored_child_manifest.workspace_id(),
-            locally_authored_child_manifest.lineage_digest(),
-            locally_authored_child_manifest.batch_id(),
-            locally_authored_child_manifest.author_device_id(),
-            locally_authored_child_manifest.author_session_id(),
-            locally_authored_child_manifest.origin(),
-            locally_authored_child_manifest.causal_dot(),
-            vec![no_op_batch],
-            locally_authored_child_manifest
-                .dependency_frontier()
-                .clone(),
-            locally_authored_child_manifest.semantic_effect_digest(),
-            locally_authored_child_manifest.required_objects().to_vec(),
-        )
-        .unwrap();
+        let child_manifest = direct_dependency_child_manifest(&receiver, child_batch, no_op_batch);
         assert_eq!(
             child_manifest.causal_dependency_heads(),
             &[no_op_batch],
             "fixture child must depend directly on the accepted no-op"
         );
-        let mut receiver_provider = SharedProviderTransport::open(
-            &receiver.request.provider_root,
-            &receiver.request.provider_journal_root,
-        )
-        .unwrap();
-        for object in child_manifest.required_objects() {
-            receiver_provider
-                .publish_object(
-                    object.content_digest(),
-                    &receiver_store
-                        .read_object_bytes(object.content_digest())
-                        .unwrap(),
-                )
-                .unwrap();
-        }
-        receiver_provider
-            .publish_manifest(child_batch, &child_manifest.encode().unwrap())
-            .unwrap();
+        publish_manifest_to_provider(&receiver, &child_manifest);
         copy_provider_tree(
             &receiver.request.provider_root,
             &observer.request.provider_root,
@@ -23541,12 +23519,8 @@ mod tests {
         );
 
         let child_path = format!("manifests/{child_batch}.manifest");
-        let mut reordered_duplicate_delivery = child_manifest
-            .required_objects()
-            .iter()
-            .rev()
-            .map(|object| format!("objects/{}.object", object.content_digest()))
-            .collect::<Vec<_>>();
+        let mut reordered_duplicate_delivery = provider_object_paths(&child_manifest);
+        reordered_duplicate_delivery.reverse();
         reordered_duplicate_delivery.insert(0, child_path.clone());
         reordered_duplicate_delivery.push(child_path);
         let restarted = active_handle(SyncRuntimeHandle::open(reopen_request(&observer.request)));
