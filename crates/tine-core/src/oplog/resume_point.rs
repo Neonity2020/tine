@@ -51,6 +51,7 @@ use std::collections::BTreeSet;
 use cap_std::fs::Dir;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use tine_storage::{DigestSealedError, DigestSealedPayload};
 use uuid::Uuid;
 
 use super::enrollment::ResumePointEnrollmentBinding;
@@ -254,27 +255,6 @@ impl From<StoreError> for ResumePointError {
             other => Self::Io(other.to_string()),
         }
     }
-}
-
-/// The sealed on-disk envelope.
-///
-/// Its shape is frozen across every future generation so that the schema fence
-/// stays readable: a v2 payload still decodes as this envelope and is refused
-/// as [`ResumePointError::UnsupportedSchema`] rather than as undifferentiated
-/// garbage. The payload is carried as opaque bytes so `payload_digest` can
-/// cover *every* payload field without the self-reference a digest field
-/// inside the payload would create.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SealedResumePointV2 {
-    schema_version: u32,
-    payload: Vec<u8>,
-    /// Digest over the canonical encoding of the complete payload. Canonical
-    /// re-encode equality already rejects non-canonical residue, but a flipped
-    /// bit inside a `u64` generation still re-encodes to itself; only this
-    /// digest catches that, and it is what stops silent mis-rooting of an
-    /// adopted run.
-    payload_digest: ContentDigest,
 }
 
 /// How a resuming open compares a published point's recorded `LocalActive`
@@ -852,12 +832,8 @@ impl RuntimeResumePointV2 {
     fn encode_bounded(&self, limit: u64) -> Result<Vec<u8>, ResumePointError> {
         self.validate()?;
         let payload = encode_canonical(self)?;
-        let sealed = SealedResumePointV2 {
-            schema_version: RESUME_POINT_SCHEMA_VERSION,
-            payload_digest: ContentDigest::of(&payload),
-            payload,
-        };
-        let bytes = encode_canonical(&sealed)?;
+        let sealed = DigestSealedPayload::new(RESUME_POINT_SCHEMA_VERSION, payload);
+        let bytes = sealed.encode_canonical().map_err(map_sealed_encode_error)?;
         let length = bytes.len() as u64;
         if length > limit {
             return Err(ResumePointError::TooLarge { length, limit });
@@ -873,21 +849,14 @@ impl RuntimeResumePointV2 {
                 limit: MAX_RESUME_POINT_BYTES,
             });
         }
-        let sealed: SealedResumePointV2 = decode_canonical(
-            bytes,
-            "sealed resume-point envelope does not decode",
-            "sealed resume-point envelope is not canonical",
-        )?;
-        if sealed.schema_version != RESUME_POINT_SCHEMA_VERSION {
-            return Err(ResumePointError::UnsupportedSchema(sealed.schema_version));
+        let sealed =
+            DigestSealedPayload::decode_canonical(bytes).map_err(map_sealed_decode_error)?;
+        if sealed.schema_version() != RESUME_POINT_SCHEMA_VERSION {
+            return Err(ResumePointError::UnsupportedSchema(sealed.schema_version()));
         }
-        if ContentDigest::of(&sealed.payload) != sealed.payload_digest {
-            return Err(ResumePointError::Malformed(
-                "resume-point payload digest does not cover these bytes",
-            ));
-        }
+        sealed.verify_digest().map_err(map_sealed_digest_error)?;
         let point: Self = decode_canonical(
-            &sealed.payload,
+            sealed.payload(),
             "resume-point payload does not decode",
             "resume-point payload is not canonical",
         )?;
@@ -1345,6 +1314,27 @@ fn encode_canonical<T: Serialize>(value: &T) -> Result<Vec<u8>, ResumePointError
         .map_err(|_| ResumePointError::Malformed("resume point is not encodable"))
 }
 
+fn map_sealed_encode_error(_error: DigestSealedError) -> ResumePointError {
+    ResumePointError::Malformed("resume point is not encodable")
+}
+
+fn map_sealed_decode_error(error: DigestSealedError) -> ResumePointError {
+    match error {
+        DigestSealedError::Decode => {
+            ResumePointError::Malformed("sealed resume-point envelope does not decode")
+        }
+        DigestSealedError::NonCanonical => {
+            ResumePointError::Malformed("sealed resume-point envelope is not canonical")
+        }
+        DigestSealedError::Encode => map_sealed_encode_error(error),
+        DigestSealedError::DigestMismatch => map_sealed_digest_error(error),
+    }
+}
+
+fn map_sealed_digest_error(_error: DigestSealedError) -> ResumePointError {
+    ResumePointError::Malformed("resume-point payload digest does not cover these bytes")
+}
+
 /// Decode and require the bytes to be the exact canonical encoding of what they
 /// decoded to. This rejects trailing bytes, alternative encodings, and any
 /// residue that happens to parse.
@@ -1504,11 +1494,20 @@ mod tests {
         mutations
     }
 
-    fn seal(bytes: &[u8]) -> SealedResumePointV2 {
+    /// Frozen pre-extraction wire mirror used only to forge outer fields in
+    /// core's precedence and failure-category tests.
+    #[derive(Serialize, Deserialize)]
+    struct SealedResumePointWire {
+        schema_version: u32,
+        payload: Vec<u8>,
+        payload_digest: ContentDigest,
+    }
+
+    fn seal(bytes: &[u8]) -> SealedResumePointWire {
         postcard::from_bytes(bytes).unwrap()
     }
 
-    fn reseal(sealed: &SealedResumePointV2) -> Vec<u8> {
+    fn reseal(sealed: &SealedResumePointWire) -> Vec<u8> {
         postcard::to_allocvec(sealed).unwrap()
     }
 
