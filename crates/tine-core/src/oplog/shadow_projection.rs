@@ -1,4 +1,4 @@
-//! Durable byte-identical projection proof for an inactive bootstrap.
+//! Durable exact-source semantic projection proof for an inactive bootstrap.
 //!
 //! This module owns no graph writer, enrollment transition, activation pointer,
 //! or `LocalActive` capability. It renders through the normal sparse projector
@@ -34,15 +34,21 @@ use super::import::{
 };
 use super::migration_backup::{MigrationBackupError, MigrationBackupRoot, VerifiedSourceBackup};
 use super::object_store::{open_dir_nofollow, open_file_nofollow, sync_dir_required};
+#[cfg(test)]
+use super::plan_projection;
+use super::projection::{
+    plan_projection_adopting_exact_source, ExactSourceProjectionError,
+    ExactSourceSemanticDifference,
+};
 use super::sqlite::{OpenProjection, VerifiedBootstrapSqliteProjection};
 use super::{
-    plan_projection, BlobDescription, CanonicalGraphResourceId, ContentDigest, DeviceId,
-    LineageDigest, ManagedPath, ManagedTextKind, PageId, ProjectionEndpointId, ProjectionIntent,
-    ProjectionPrecondition, ProjectionReceiptStoreId, WorkspaceId,
-    CATALOG_PAGE_STATE_SCHEMA_VERSION, DIFF_SCHEMA_VERSION, MANAGED_ENTITY_SET_VERSION,
-    MANIFEST_ENCODING_VERSION, OBJECT_ENVELOPE_SCHEMA_VERSION, OPERATION_SCHEMA_VERSION,
-    OPLOG_PROTOCOL_VERSION, PROJECTION_POLICY_VERSION, PROJECTION_SCHEMA_VERSION,
-    RECEIPT_SCHEMA_VERSION, SEMANTIC_EFFECT_SCHEMA_VERSION, SQLITE_SCHEMA_VERSION,
+    BlobDescription, CanonicalGraphResourceId, ContentDigest, DeviceId, LineageDigest, ManagedPath,
+    ManagedTextKind, PageId, ProjectionEndpointId, ProjectionIntent, ProjectionPrecondition,
+    ProjectionReceiptStoreId, WorkspaceId, CATALOG_PAGE_STATE_SCHEMA_VERSION, DIFF_SCHEMA_VERSION,
+    MANAGED_ENTITY_SET_VERSION, MANIFEST_ENCODING_VERSION, OBJECT_ENVELOPE_SCHEMA_VERSION,
+    OPERATION_SCHEMA_VERSION, OPLOG_PROTOCOL_VERSION, PROJECTION_POLICY_VERSION,
+    PROJECTION_SCHEMA_VERSION, RECEIPT_SCHEMA_VERSION, SEMANTIC_EFFECT_SCHEMA_VERSION,
+    SQLITE_SCHEMA_VERSION,
 };
 use crate::model::{
     move_file_noreplace, BootstrapSourceCapture, BootstrapSourceChunkCursor, BootstrapSourceEntry,
@@ -228,6 +234,10 @@ pub(crate) enum ShadowProjectionError {
         projected_bytes: usize,
         detail: NormalSparseMismatchDetail,
     },
+    SemanticMismatch {
+        path: String,
+        difference: ExactSourceSemanticDifference,
+    },
     CorruptOrConflicting(&'static str),
     Projection(String),
     ResourceLimit {
@@ -276,6 +286,12 @@ impl fmt::Display for ShadowProjectionError {
                         checks.join(", ")
                     ),
                 }
+            }
+            Self::SemanticMismatch { path, difference } => {
+                write!(
+                    formatter,
+                    "bootstrap source semantic mismatch for {path}: {difference}"
+                )
             }
             Self::Projection(detail) => formatter.write_str(detail),
             Self::ResourceLimit {
@@ -1538,9 +1554,9 @@ struct PublicationPaths {
     final_directory: PathBuf,
 }
 
-/// Build or resume the byte-identical inactive shadow projection and return a
-/// typed proof only after fresh source, backup, SQLite, authority, root, and
-/// committed-byte rereads.
+/// Build or resume the exact-source inactive shadow projection and return a
+/// typed proof only after semantic equivalence plus fresh source, backup,
+/// SQLite, authority, root, and committed-byte rereads.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn verify_inactive_bootstrap_shadow_projection(
     graph: &Graph,
@@ -2126,20 +2142,54 @@ fn plan_exact_source(
     let state = state.ok_or(ShadowProjectionError::BindingMismatch(
         "authoritative source path is missing its bounded materialization",
     ))?;
-    if state.page.page_id != row.page_id()
-        || state.page.path != *entry.path()
-        || state.page.kind != entry.kind()
-        || state.page.name.as_str() != entry.logical_name()
-    {
+    if state.page.page_id != row.page_id() || state.page.path != *entry.path() {
         return Err(ShadowProjectionError::BindingMismatch(
-            "materialized page identity, path, kind, or logical name differs from source",
+            "materialized page identity or path differs from source and accepted catalog",
         ));
     }
-    let plan = plan_projection(binding_workspace(catalog.binding), state, Some(source))
-        .map_err(|error| ShadowProjectionError::Projection(error.to_string()))?;
+    if state.page.kind != entry.kind() {
+        let label = |kind| match kind {
+            ManagedTextKind::Page => "page",
+            ManagedTextKind::Journal => "journal",
+        };
+        return Err(ShadowProjectionError::SemanticMismatch {
+            path: entry.path().as_str().to_owned(),
+            difference: ExactSourceSemanticDifference::PageKind {
+                accepted: label(state.page.kind),
+                source: label(entry.kind()),
+            },
+        });
+    }
+    if state.page.name.as_str() != entry.logical_name() {
+        return Err(ShadowProjectionError::SemanticMismatch {
+            path: entry.path().as_str().to_owned(),
+            difference: ExactSourceSemanticDifference::PageName {
+                accepted: state.page.name.as_str().to_owned(),
+                source: entry.logical_name().to_owned(),
+            },
+        });
+    }
+    if ContentDigest::of(state.page.name.as_str().as_bytes()) != row.accepted_name_digest() {
+        return Err(ShadowProjectionError::BindingMismatch(
+            "materialized page logical name differs from the accepted catalog digest",
+        ));
+    }
+    let plan =
+        plan_projection_adopting_exact_source(binding_workspace(catalog.binding), state, source)
+            .map_err(|error| match error {
+                ExactSourceProjectionError::Projection(error) => {
+                    ShadowProjectionError::Projection(error.to_string())
+                }
+                ExactSourceProjectionError::Semantic(difference) => {
+                    ShadowProjectionError::SemanticMismatch {
+                        path: entry.path().as_str().to_owned(),
+                        difference,
+                    }
+                }
+            })?;
     instrumentation.projection_plans =
         checked_add(instrumentation.projection_plans, 1, "projection plans")?;
-    require_byte_identical_projection(
+    require_exact_source_baseline(
         plan.target(),
         plan.intent(),
         source,
@@ -2154,7 +2204,7 @@ fn binding_workspace(binding: CurrentPathCatalogBinding) -> WorkspaceId {
     binding.workspace_id()
 }
 
-fn require_byte_identical_projection(
+fn require_exact_source_baseline(
     target: &[u8],
     intent: &ProjectionIntent,
     source: &[u8],
@@ -4471,6 +4521,82 @@ mod tests {
     }
 
     #[test]
+    fn managed_shadow_projection_admits_equivalent_layouts_as_exact_source_baselines() {
+        let sources = vec![
+            ("pages/no-final.md".into(), b"- no final newline".to_vec()),
+            (
+                "pages/between-trivia.md".into(),
+                b"- first\n \t\n\n- second\n".to_vec(),
+            ),
+            (
+                "pages/crlf.md".into(),
+                b"title:: CRLF\r\n\r\n- first\r\n\r\n- second\r\n".to_vec(),
+            ),
+            (
+                "pages/blank-continuation.md".into(),
+                concat!(
+                    "- parent\n",
+                    "\t- child first line\n",
+                    "\t  \n",
+                    "\t  child final line\n"
+                )
+                .as_bytes()
+                .to_vec(),
+            ),
+        ];
+        let expected = sources.iter().cloned().collect::<BTreeMap<_, _>>();
+        let fixture = Fixture::new("semantic-layout-variants", None, sources);
+
+        let verified = fixture.verify().unwrap();
+        let binding = PromotedBootstrapProjectionBindingV1::from_verified(&verified).unwrap();
+        let authority = BootstrapProjectionAuthority::reopen(&fixture.roots, &binding).unwrap();
+        for (path, bytes) in expected {
+            assert_eq!(
+                fs::read(verified.directory().join("payload").join(&path)).unwrap(),
+                bytes,
+                "shadow payload for {path} must be byte-exact source"
+            );
+            let path = ManagedPath::parse(path).unwrap();
+            let baseline = authority.baseline_at(&path).unwrap().unwrap();
+            let description = BlobDescription::of(&bytes);
+            assert_eq!(baseline.source_bytes(), bytes);
+            assert_eq!(baseline.intent().target(), description);
+            assert_eq!(
+                baseline.intent().precondition(),
+                &ProjectionPrecondition::Base(description)
+            );
+            let state = fixture
+                .authority
+                .accepted_engine()
+                .materialize_page_for_projection(baseline.intent().page_id())
+                .unwrap();
+            let replay = plan_projection(
+                fixture.authority.binding().workspace_id(),
+                &state,
+                Some(baseline.source_bytes()),
+            )
+            .unwrap();
+            assert_eq!(replay.intent(), baseline.intent());
+            assert_eq!(replay.target(), baseline.source_bytes());
+            let mut edited = state;
+            edited.page.blocks[0].content.push_str(" edited");
+            let next = crate::oplog::projection::plan_projection_with_layout_annotations(
+                fixture.authority.binding().workspace_id(),
+                &edited,
+                Some(baseline.source_bytes()),
+                Some(baseline.intent().annotations()),
+            )
+            .unwrap();
+            assert_ne!(next.target(), baseline.source_bytes());
+            assert_eq!(
+                next.intent().precondition(),
+                &ProjectionPrecondition::Base(description)
+            );
+        }
+        fixture.assert_graph_unchanged();
+    }
+
+    #[test]
     fn shadow_bytes_and_promotion_binding_are_identical_with_zero_and_cached_sessions() {
         let fixture = rich_fixture("lookup-session-differential");
         let zero = fixture.verify_with_lookup_budget(0).unwrap();
@@ -5807,7 +5933,7 @@ mod tests {
         let (page_id, path, source, intent) = synthetic_normal_sparse_mismatch();
         let mut projected = source.clone();
         projected[3] = b'X';
-        let error = require_byte_identical_projection(
+        let error = require_exact_source_baseline(
             &projected,
             &intent,
             &source,
@@ -5828,7 +5954,7 @@ mod tests {
     fn normal_sparse_prefix_mismatch_reports_common_prefix_end() {
         let (page_id, path, source, intent) = synthetic_normal_sparse_mismatch();
         let projected = &source[..source.len() - 2];
-        let error = require_byte_identical_projection(
+        let error = require_exact_source_baseline(
             projected,
             &intent,
             &source,
@@ -5847,7 +5973,7 @@ mod tests {
     #[test]
     fn normal_sparse_equal_bytes_name_failed_non_byte_binding_checks() {
         let (page_id, path, source, intent) = synthetic_normal_sparse_mismatch();
-        let error = require_byte_identical_projection(
+        let error = require_exact_source_baseline(
             &source,
             &intent,
             &source,

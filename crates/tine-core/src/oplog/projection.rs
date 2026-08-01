@@ -263,13 +263,133 @@ pub fn plan_projection(
     plan_projection_with_layout_annotations(workspace_id, state, expected_base, None)
 }
 
+/// Why an exact external source cannot serve as the projection of accepted
+/// semantic state.  These categories are deliberately semantic rather than
+/// byte-oriented so bootstrap admission can report the first useful boundary
+/// that disagrees.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ExactSourceSemanticDifference {
+    UnsupportedSourceLayout(String),
+    PageKind {
+        accepted: &'static str,
+        source: &'static str,
+    },
+    PageName {
+        accepted: String,
+        source: String,
+    },
+    PreambleOrPageProperties,
+    BlockCount {
+        accepted: usize,
+        source: usize,
+    },
+    BlockOrderOrAncestry {
+        accepted_locator: Vec<u32>,
+        source_locator: Vec<u32>,
+    },
+    ExplicitBlockIdentity {
+        locator: Vec<u32>,
+    },
+    BlockContent {
+        locator: Vec<u32>,
+    },
+}
+
+impl fmt::Display for ExactSourceSemanticDifference {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedSourceLayout(detail) => {
+                write!(
+                    formatter,
+                    "source layout is not safely importable: {detail}"
+                )
+            }
+            Self::PageKind { accepted, source } => {
+                write!(
+                    formatter,
+                    "page kind differs: accepted={accepted}, source={source}"
+                )
+            }
+            Self::PageName { accepted, source } => write!(
+                formatter,
+                "page name differs: accepted={accepted:?}, source={source:?}"
+            ),
+            Self::PreambleOrPageProperties => {
+                formatter.write_str("page preamble or page properties differ")
+            }
+            Self::BlockCount { accepted, source } => write!(
+                formatter,
+                "block count differs: accepted={accepted}, source={source}"
+            ),
+            Self::BlockOrderOrAncestry {
+                accepted_locator,
+                source_locator,
+            } => write!(
+                formatter,
+                "block order or ancestry differs: accepted locator {accepted_locator:?}, \
+                 source locator {source_locator:?}"
+            ),
+            Self::ExplicitBlockIdentity { locator } => {
+                write!(
+                    formatter,
+                    "explicit block identity differs at locator {locator:?}"
+                )
+            }
+            Self::BlockContent { locator } => {
+                write!(formatter, "block content differs at locator {locator:?}")
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum ExactSourceProjectionError {
+    Projection(ProjectionError),
+    Semantic(ExactSourceSemanticDifference),
+}
+
+impl From<ProjectionError> for ExactSourceProjectionError {
+    fn from(error: ProjectionError) -> Self {
+        Self::Projection(error)
+    }
+}
+
+/// Prove that `source` is the complete accepted semantic page, then construct
+/// an adoption baseline whose target and precondition both name those exact
+/// bytes. When ordinary rendering would change harmless trivia, source
+/// coordinates come from the parser-owned spans used by external import;
+/// already byte-equal sources retain their established projector annotations.
+pub(crate) fn plan_projection_adopting_exact_source(
+    workspace_id: WorkspaceId,
+    state: &ProjectionPageState,
+    source: &[u8],
+) -> Result<ProjectionPlan, ExactSourceProjectionError> {
+    plan_exact_source_projection(workspace_id, state, source, None)
+}
+
 pub(crate) fn plan_projection_with_layout_annotations(
     workspace_id: WorkspaceId,
     state: &ProjectionPageState,
     expected_base: Option<&[u8]>,
     expected_base_annotations: Option<&[AnnotatedIdentity]>,
 ) -> Result<ProjectionPlan, ProjectionError> {
+    if let Some(source) = expected_base.filter(|_| expected_base_annotations.is_none()) {
+        match plan_exact_source_projection(workspace_id, state, source, expected_base_annotations) {
+            Ok(plan) => return Ok(plan),
+            Err(ExactSourceProjectionError::Semantic(_)) => {}
+            Err(ExactSourceProjectionError::Projection(error)) => return Err(error),
+        }
+    }
     let rendered = render_projection(state, expected_base, expected_base_annotations)?;
+    projection_plan_from_rendered(workspace_id, state, expected_base, rendered)
+}
+
+fn projection_plan_from_rendered(
+    workspace_id: WorkspaceId,
+    state: &ProjectionPageState,
+    expected_base: Option<&[u8]>,
+    rendered: RenderedProjection,
+) -> Result<ProjectionPlan, ProjectionError> {
     let base = expected_base.map(|bytes| BaseBlob::new(bytes.to_vec()));
     let precondition = base
         .as_ref()
@@ -295,6 +415,221 @@ pub(crate) fn plan_projection_with_layout_annotations(
         guarded_layout,
         generated_anchors: rendered.generated_anchors,
     })
+}
+
+fn plan_exact_source_projection(
+    workspace_id: WorkspaceId,
+    state: &ProjectionPageState,
+    source: &[u8],
+    expected_base_annotations: Option<&[AnnotatedIdentity]>,
+) -> Result<ProjectionPlan, ExactSourceProjectionError> {
+    let format = format_for_page(&state.page)?;
+    let source_text =
+        std::str::from_utf8(source).map_err(|_| ProjectionError::InvalidUtf8("projection base"))?;
+    let parsed = match format {
+        ProjectionFormat::Markdown => crate::doc::try_parse_with_source_spans(source_text),
+        ProjectionFormat::Org => crate::org::try_parse_org_with_source_spans(source_text),
+    }
+    .map_err(|error| {
+        ExactSourceProjectionError::Semantic(
+            ExactSourceSemanticDifference::UnsupportedSourceLayout(error.to_string()),
+        )
+    })?;
+    let source_is_importable = match format {
+        ProjectionFormat::Markdown => {
+            crate::doc::markdown_structurally_round_trips_parsed(source_text, &parsed)
+        }
+        ProjectionFormat::Org => crate::org::org_editable_parsed(source_text, &parsed),
+    };
+    if !source_is_importable {
+        return Err(ExactSourceProjectionError::Semantic(
+            ExactSourceSemanticDifference::UnsupportedSourceLayout(match format {
+                ProjectionFormat::Markdown => {
+                    "Markdown parsing and format-preserving serialization change its semantic document"
+                }
+                ProjectionFormat::Org => {
+                    "Org heading structure does not round-trip through the editable representation"
+                }
+            }
+            .into()),
+        ));
+    }
+
+    let mut metadata = ProjectionMetadata::with_capacity(state.page.blocks.len());
+    let accepted = build_page_document(
+        &state.page,
+        format,
+        ProjectionRenderMode::Sparse,
+        Some(&mut metadata),
+    )?;
+    compare_exact_source_semantics(format, &accepted, &parsed.document)
+        .map_err(ExactSourceProjectionError::Semantic)?;
+    if parsed.block_spans.len() != metadata.pending_annotations.len() {
+        return Err(ExactSourceProjectionError::Semantic(
+            ExactSourceSemanticDifference::BlockCount {
+                accepted: metadata.pending_annotations.len(),
+                source: parsed.block_spans.len(),
+            },
+        ));
+    }
+
+    let annotations = metadata
+        .pending_annotations
+        .iter()
+        .zip(&parsed.block_spans)
+        .map(|(pending, span)| {
+            Ok(AnnotatedIdentity::new(
+                StructuralLocator::new(pending.locator.clone())?,
+                StructuralSpan::new(
+                    u64::try_from(span.start).map_err(|_| ProjectionError::ProjectionTooLarge)?,
+                    u64::try_from(span.end).map_err(|_| ProjectionError::ProjectionTooLarge)?,
+                )?,
+                pending.block_id,
+                pending.logseq_uuid,
+            ))
+        })
+        .collect::<Result<Vec<_>, ProjectionError>>()?;
+    metadata
+        .generated_anchors
+        .sort_unstable_by_key(PolicyGeneratedAnchor::block_id);
+    let rendered = render_projection(state, Some(source), expected_base_annotations)?;
+    let rendered_annotations_match = expected_base_annotations
+        .is_none_or(|expected| expected == rendered.annotations.as_slice());
+    if rendered.target == source && rendered_annotations_match {
+        return projection_plan_from_rendered(workspace_id, state, Some(source), rendered)
+            .map_err(ExactSourceProjectionError::Projection);
+    }
+    let base = BaseBlob::new(source.to_vec());
+    let description = base.description();
+    let intent = ProjectionIntent::new(
+        workspace_id,
+        state.page.page_id,
+        state.page.path.clone(),
+        state.frontier.clone(),
+        state.claim_evidence.clone(),
+        ProjectionPrecondition::Base(description),
+        description,
+        annotations.clone(),
+    )
+    .map_err(ProjectionError::from)?;
+    Ok(ProjectionPlan {
+        intent,
+        base: Some(base),
+        target: source.to_vec(),
+        guarded_layout: GuardedProjectionLayout::from_authenticated_annotations(
+            expected_base_annotations.or(Some(&annotations)),
+            &annotations,
+        ),
+        generated_anchors: metadata.generated_anchors,
+    })
+}
+
+struct SemanticBlock<'a> {
+    locator: Vec<u32>,
+    block: &'a DocBlock,
+}
+
+fn semantic_blocks(blocks: &[DocBlock]) -> Vec<SemanticBlock<'_>> {
+    let mut flattened = Vec::new();
+    let mut pending = blocks
+        .iter()
+        .enumerate()
+        .rev()
+        .map(|(position, block)| (vec![position as u32], block))
+        .collect::<Vec<_>>();
+    while let Some((locator, block)) = pending.pop() {
+        flattened.push(SemanticBlock {
+            locator: locator.clone(),
+            block,
+        });
+        for (position, child) in block.children.iter().enumerate().rev() {
+            let mut child_locator = locator.clone();
+            child_locator.push(position as u32);
+            pending.push((child_locator, child));
+        }
+    }
+    flattened
+}
+
+fn explicit_block_ids(block: &DocBlock, format: ProjectionFormat) -> Vec<String> {
+    let mut block = block.clone();
+    block.is_org = format == ProjectionFormat::Org;
+    block
+        .properties()
+        .into_iter()
+        .filter(|(key, _)| crate::doc::property_key_norm(key) == "id")
+        .map(|(_, value)| value.trim().to_owned())
+        .collect()
+}
+
+fn compare_exact_source_semantics(
+    format: ProjectionFormat,
+    accepted: &Document,
+    source: &Document,
+) -> Result<(), ExactSourceSemanticDifference> {
+    if accepted.pre_block != source.pre_block {
+        return Err(ExactSourceSemanticDifference::PreambleOrPageProperties);
+    }
+    let accepted = semantic_blocks(&accepted.roots);
+    let source = semantic_blocks(&source.roots);
+    if accepted.len() != source.len() {
+        return Err(ExactSourceSemanticDifference::BlockCount {
+            accepted: accepted.len(),
+            source: source.len(),
+        });
+    }
+
+    let mut accepted_locations = HashMap::<&str, (usize, &[u32])>::new();
+    let mut source_locations = HashMap::<&str, (usize, &[u32])>::new();
+    for semantic in &accepted {
+        let entry = accepted_locations
+            .entry(semantic.block.raw.as_str())
+            .or_insert((0, semantic.locator.as_slice()));
+        entry.0 += 1;
+    }
+    for semantic in &source {
+        let entry = source_locations
+            .entry(semantic.block.raw.as_str())
+            .or_insert((0, semantic.locator.as_slice()));
+        entry.0 += 1;
+    }
+    for semantic in &accepted {
+        let Some((1, source_locator)) = source_locations.get(semantic.block.raw.as_str()) else {
+            continue;
+        };
+        let Some((1, accepted_locator)) = accepted_locations.get(semantic.block.raw.as_str())
+        else {
+            continue;
+        };
+        if accepted_locator != source_locator {
+            return Err(ExactSourceSemanticDifference::BlockOrderOrAncestry {
+                accepted_locator: accepted_locator.to_vec(),
+                source_locator: source_locator.to_vec(),
+            });
+        }
+    }
+
+    for (accepted, source) in accepted.iter().zip(&source) {
+        if accepted.locator != source.locator {
+            return Err(ExactSourceSemanticDifference::BlockOrderOrAncestry {
+                accepted_locator: accepted.locator.clone(),
+                source_locator: source.locator.clone(),
+            });
+        }
+        if accepted.block.raw != source.block.raw {
+            if explicit_block_ids(accepted.block, format)
+                != explicit_block_ids(source.block, format)
+            {
+                return Err(ExactSourceSemanticDifference::ExplicitBlockIdentity {
+                    locator: accepted.locator.clone(),
+                });
+            }
+            return Err(ExactSourceSemanticDifference::BlockContent {
+                locator: accepted.locator.clone(),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn render_projection(
@@ -2292,8 +2627,8 @@ mod tests {
 
     use super::*;
     use crate::oplog::{
-        CrdtPeerCounter, CrdtPeerId, DocumentDependencies, DocumentId, FrontierV2, ManagedPath,
-        MaterializationStats, ProjectionClaimEvidence, ProjectionClaimParticipant,
+        BlobDescription, CrdtPeerCounter, CrdtPeerId, DocumentDependencies, DocumentId, FrontierV2,
+        ManagedPath, MaterializationStats, ProjectionClaimEvidence, ProjectionClaimParticipant,
     };
 
     #[derive(Debug, Eq, PartialEq)]
@@ -2530,6 +2865,168 @@ mod tests {
             Some(base.intent().annotations()),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn exact_source_adoption_preserves_equivalent_layout_and_source_spans() {
+        let mut state = structural_layout_state(
+            "pages/layout.md",
+            vec![
+                (80_011, None, "a", "alpha".into(), None),
+                (
+                    80_012,
+                    Some(80_011),
+                    "a",
+                    "child\n\ncontinuation".into(),
+                    None,
+                ),
+                (80_013, None, "b", "omega".into(), None),
+            ],
+        );
+        state.page.preamble = Some("title:: Structural Layout".into());
+        let source = concat!(
+            "title:: Structural Layout\r\n",
+            "\r\n",
+            "- alpha\r\n",
+            "\r\n",
+            "\t- child\r\n",
+            "\t  \r\n",
+            "\t  continuation\r\n",
+            " \t\r\n",
+            "- omega"
+        )
+        .as_bytes();
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(80_002));
+
+        let adopted = plan_projection_adopting_exact_source(workspace, &state, source).unwrap();
+        assert_eq!(adopted.target(), source);
+        assert_eq!(adopted.intent().target(), BlobDescription::of(source));
+        assert_eq!(
+            adopted.intent().precondition(),
+            &ProjectionPrecondition::Base(BlobDescription::of(source))
+        );
+        assert_eq!(adopted.intent().annotations().len(), 3);
+        for annotation in adopted.intent().annotations() {
+            let span = annotation.span();
+            let owned = &source[span.start() as usize..span.end() as usize];
+            assert!(owned.starts_with(b"- ") || owned.starts_with(b"\t- "));
+        }
+        let serialized = render_projection(&state, Some(source), None).unwrap();
+        assert_ne!(
+            serialized.target, source,
+            "whitespace-bearing inter-block trivia must exercise semantic adoption rather than byte-identical rendering"
+        );
+        let canonical_source = String::from_utf8(source.to_vec())
+            .unwrap()
+            .replace(" \t\r\n- omega", "\r\n- omega")
+            .into_bytes();
+        let canonical_rendered = render_projection(&state, Some(&canonical_source), None).unwrap();
+        assert_eq!(canonical_rendered.target, canonical_source);
+        let canonical_adopted =
+            plan_projection_adopting_exact_source(workspace, &state, &canonical_source).unwrap();
+        assert_eq!(
+            canonical_rendered.annotations,
+            canonical_adopted.intent().annotations(),
+            "byte-equal sources must remain compatible with canonical projector receipts"
+        );
+
+        let replay = plan_projection(workspace, &state, Some(source)).unwrap();
+        assert_eq!(replay.intent(), adopted.intent());
+        assert_eq!(replay.target(), source);
+
+        let mut edited = state.clone();
+        edited.page.blocks[2].content = "omega edited".into();
+        let next = plan_projection_with_layout_annotations(
+            workspace,
+            &edited,
+            Some(source),
+            Some(adopted.intent().annotations()),
+        )
+        .unwrap();
+        assert_ne!(next.target(), source);
+        assert_eq!(
+            next.intent().precondition(),
+            &ProjectionPrecondition::Base(BlobDescription::of(source))
+        );
+    }
+
+    #[test]
+    fn exact_source_adoption_rejects_each_relevant_semantic_difference() {
+        let explicit = LogseqUuid::from_uuid(Uuid::from_u128(80_020));
+        let mut state = structural_layout_state(
+            "pages/layout.md",
+            vec![
+                (80_011, None, "a", "alpha".into(), None),
+                (80_012, Some(80_011), "a", "bravo".into(), None),
+                (
+                    80_013,
+                    None,
+                    "b",
+                    format!("omega\nid:: {explicit}"),
+                    Some(explicit),
+                ),
+            ],
+        );
+        state.page.preamble = Some("title:: Structural Layout\nstatus:: accepted".into());
+        let different_explicit = LogseqUuid::from_uuid(Uuid::from_u128(80_021));
+        let cases = [
+            (
+                "dropped block",
+                "title:: Structural Layout\nstatus:: accepted\n\n- alpha\n\t- bravo\n",
+                "block count differs",
+            ),
+            (
+                "changed content",
+                &format!(
+                    "title:: Structural Layout\nstatus:: accepted\n\n- alpha changed\n\t- bravo\n- omega\n  id:: {explicit}\n"
+                ),
+                "block content differs",
+            ),
+            (
+                "changed ancestry",
+                &format!(
+                    "title:: Structural Layout\nstatus:: accepted\n\n- alpha\n- bravo\n- omega\n  id:: {explicit}\n"
+                ),
+                "block order or ancestry differs",
+            ),
+            (
+                "changed order",
+                &format!(
+                    "title:: Structural Layout\nstatus:: accepted\n\n- omega\n  id:: {explicit}\n- alpha\n\t- bravo\n"
+                ),
+                "block order or ancestry differs",
+            ),
+            (
+                "changed page property",
+                &format!(
+                    "title:: Structural Layout\nstatus:: changed\n\n- alpha\n\t- bravo\n- omega\n  id:: {explicit}\n"
+                ),
+                "page preamble or page properties differ",
+            ),
+            (
+                "changed explicit identity",
+                &format!(
+                    "title:: Structural Layout\nstatus:: accepted\n\n- alpha\n\t- bravo\n- omega\n  id:: {different_explicit}\n"
+                ),
+                "explicit block identity differs",
+            ),
+        ];
+
+        for (name, source, expected) in cases {
+            let error = plan_projection_adopting_exact_source(
+                WorkspaceId::from_uuid(Uuid::from_u128(80_002)),
+                &state,
+                source.as_bytes(),
+            )
+            .unwrap_err();
+            let ExactSourceProjectionError::Semantic(difference) = error else {
+                panic!("{name} produced a non-semantic error: {error:?}");
+            };
+            assert!(
+                difference.to_string().contains(expected),
+                "{name}: {difference}"
+            );
+        }
     }
 
     #[test]
