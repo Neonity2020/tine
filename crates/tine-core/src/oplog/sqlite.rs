@@ -25,7 +25,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
+use std::io::{ErrorKind, Read, Write};
+#[cfg(test)]
+use std::io::{Seek as _, SeekFrom};
 #[cfg(unix)]
 use std::os::fd::{AsFd as _, AsRawFd as _, FromRawFd as _};
 #[cfg(unix)]
@@ -48,7 +50,8 @@ use fs2::FileExt as _;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use tine_storage::sqlite::{
-    self as storage_frontier, PhysicalSqliteDatabase, SqliteFileSet, SqliteFileSetError,
+    self as storage_frontier, PhysicalFileCheckpoint, PhysicalSqliteDatabase, SqliteFileSet,
+    SqliteFileSetError,
 };
 use uuid::Uuid;
 
@@ -73,14 +76,6 @@ pub const TAIL_MAX_BATCHES: usize = 10_000;
 
 const FORENSIC_NAMES: [&str; 4] = ["database", "wal", "shm", "auth"];
 const PROJECTION_CHECKPOINT_SCHEMA_VERSION: u32 = 2;
-const PROJECTION_FINGERPRINT_CHUNK_BYTES: usize = 64 * 1024;
-// Interior sampling is a bounded accidental-corruption tripwire, not
-// byte-complete authentication. The affected-page hot-engine comparison
-// remains the semantic authority fence.
-const PROJECTION_INTERIOR_SAMPLE_BYTES: usize = 1024 * 1024;
-const PROJECTION_INTERIOR_SAMPLE_RANGE_BYTES: usize = 16 * 1024;
-const PROJECTION_INTERIOR_SAMPLE_MAX_RANGES: usize =
-    PROJECTION_INTERIOR_SAMPLE_BYTES / PROJECTION_INTERIOR_SAMPLE_RANGE_BYTES;
 const MAX_PROJECTION_CHECKPOINT_BYTES: u64 = 64 * 1024;
 const OBJECT_STORE_LEASE_NAMESPACE: &str = ".tine-runtime";
 const SQLITE_WORKSPACE_LEASE_NAMESPACE: &str = "sqlite-workspaces";
@@ -1536,21 +1531,12 @@ pub struct ForensicEvidence {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct BoundedFileCheckpoint {
-    length: u64,
-    first_chunk_digest: ContentDigest,
-    last_chunk_digest: ContentDigest,
-    interior_sample_digest: ContentDigest,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ProjectionCheckpoint {
     schema_version: u32,
     workspace_id: WorkspaceId,
     frontier_root_digest: ContentDigest,
-    database: BoundedFileCheckpoint,
-    wal: Option<BoundedFileCheckpoint>,
+    database: PhysicalFileCheckpoint,
+    wal: Option<PhysicalFileCheckpoint>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -3939,9 +3925,10 @@ fn validate_projection_checkpoint(
         ));
     }
     let expected_root_bytes = canonical_frontier_root_bytes(expected_root)?;
+    let physical_checkpoint = files.physical_checkpoint()?;
     if envelope.checkpoint.frontier_root_digest != ContentDigest::of(&expected_root_bytes)
-        || envelope.checkpoint.database != bounded_file_checkpoint(path)?
-        || envelope.checkpoint.wal != optional_bounded_file_checkpoint(files.wal_path())?
+        || envelope.checkpoint.database != physical_checkpoint.database
+        || envelope.checkpoint.wal != physical_checkpoint.wal
     {
         return Err(ProjectionError::Corrupt(
             "SQLite projection files differ from their authenticated checkpoint".into(),
@@ -3957,12 +3944,13 @@ fn write_projection_checkpoint(
 ) -> Result<(), ProjectionError> {
     let root_bytes = canonical_frontier_root_bytes(root)?;
     let files = SqliteFileSet::new(path);
+    let physical_checkpoint = files.physical_checkpoint()?;
     let checkpoint = ProjectionCheckpoint {
         schema_version: PROJECTION_CHECKPOINT_SCHEMA_VERSION,
         workspace_id: claim.workspace_id,
         frontier_root_digest: ContentDigest::of(&root_bytes),
-        database: bounded_file_checkpoint(path)?,
-        wal: optional_bounded_file_checkpoint(files.wal_path())?,
+        database: physical_checkpoint.database,
+        wal: physical_checkpoint.wal,
     };
     let checkpoint_bytes = postcard::to_allocvec(&checkpoint)
         .map_err(|error| ProjectionError::Corrupt(error.to_string()))?;
@@ -3989,131 +3977,6 @@ fn write_projection_checkpoint(
     file.sync_all()?;
     fs::rename(&temporary, &checkpoint_path)?;
     sync_directory(parent)
-}
-
-fn optional_bounded_file_checkpoint(
-    path: &Path,
-) -> Result<Option<BoundedFileCheckpoint>, ProjectionError> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.len() == 0 => Ok(None),
-        Ok(_) => bounded_file_checkpoint(path).map(Some),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.into()),
-    }
-}
-
-fn bounded_file_checkpoint(path: &Path) -> Result<BoundedFileCheckpoint, ProjectionError> {
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(ProjectionError::UnsafePath(format!(
-            "SQLite projection file {} is not regular",
-            path.display()
-        )));
-    }
-    let length = metadata.len();
-    let chunk_len = usize::try_from(bounded_file_checkpoint_sample_bytes(length) / 2)
-        .map_err(|_| ProjectionError::Corrupt("projection file length exceeds usize".into()))?;
-    let mut file = OpenOptions::new().read(true).open(path)?;
-    let mut first = vec![0_u8; chunk_len];
-    file.read_exact(&mut first)?;
-    let mut last = vec![0_u8; chunk_len];
-    if length > chunk_len as u64 {
-        file.seek(SeekFrom::Start(length - chunk_len as u64))?;
-        file.read_exact(&mut last)?;
-    } else {
-        last.copy_from_slice(&first);
-    }
-    let mut first_bound = b"tine/sqlite/checkpoint/v2/first\0".to_vec();
-    first_bound.extend_from_slice(&length.to_be_bytes());
-    first_bound.extend_from_slice(&first);
-    let mut last_bound = b"tine/sqlite/checkpoint/v2/last\0".to_vec();
-    last_bound.extend_from_slice(&length.to_be_bytes());
-    last_bound.extend_from_slice(&last);
-    let interior_sample_digest = bounded_file_checkpoint_interior_digest(&mut file, length)?;
-    Ok(BoundedFileCheckpoint {
-        length,
-        first_chunk_digest: ContentDigest::of(&first_bound),
-        last_chunk_digest: ContentDigest::of(&last_bound),
-        interior_sample_digest,
-    })
-}
-
-fn bounded_file_checkpoint_sample_bytes(length: u64) -> u64 {
-    length
-        .min(PROJECTION_FINGERPRINT_CHUNK_BYTES as u64)
-        .saturating_mul(2)
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct CheckpointInteriorRange {
-    offset: u64,
-    length: usize,
-}
-
-fn bounded_file_checkpoint_interior_ranges(length: u64) -> Vec<CheckpointInteriorRange> {
-    let edge_length = length.min(PROJECTION_FINGERPRINT_CHUNK_BYTES as u64);
-    let interior_start = edge_length;
-    let interior_end = length.saturating_sub(edge_length);
-    let interior_length = interior_end.saturating_sub(interior_start);
-    if interior_length == 0 {
-        return Vec::new();
-    }
-    if interior_length <= PROJECTION_INTERIOR_SAMPLE_BYTES as u64 {
-        return vec![CheckpointInteriorRange {
-            offset: interior_start,
-            length: usize::try_from(interior_length)
-                .expect("bounded interior sample length fits usize"),
-        }];
-    }
-
-    let range_length = PROJECTION_INTERIOR_SAMPLE_RANGE_BYTES as u64;
-    let available_start_span = interior_length - range_length;
-    let denominator = (PROJECTION_INTERIOR_SAMPLE_MAX_RANGES - 1) as u128;
-    (0..PROJECTION_INTERIOR_SAMPLE_MAX_RANGES)
-        .map(|index| {
-            let relative_offset = (u128::from(available_start_span) * index as u128) / denominator;
-            CheckpointInteriorRange {
-                offset: interior_start
-                    + u64::try_from(relative_offset)
-                        .expect("sample offset derived from a u64 file length"),
-                length: PROJECTION_INTERIOR_SAMPLE_RANGE_BYTES,
-            }
-        })
-        .collect()
-}
-
-fn bounded_file_checkpoint_interior_digest(
-    file: &mut File,
-    length: u64,
-) -> Result<ContentDigest, ProjectionError> {
-    let ranges = bounded_file_checkpoint_interior_ranges(length);
-    let mut bound = Vec::with_capacity(
-        b"tine/sqlite/checkpoint/v2/interior-sample\0".len()
-            + std::mem::size_of::<u64>()
-            + std::mem::size_of::<u32>()
-            + ranges.len() * (std::mem::size_of::<u64>() * 2)
-            + ranges.iter().map(|range| range.length).sum::<usize>(),
-    );
-    bound.extend_from_slice(b"tine/sqlite/checkpoint/v2/interior-sample\0");
-    bound.extend_from_slice(&length.to_be_bytes());
-    bound.extend_from_slice(
-        &u32::try_from(ranges.len())
-            .expect("checkpoint interior range count is bounded")
-            .to_be_bytes(),
-    );
-    for range in ranges {
-        bound.extend_from_slice(&range.offset.to_be_bytes());
-        bound.extend_from_slice(
-            &u64::try_from(range.length)
-                .expect("checkpoint interior range length fits u64")
-                .to_be_bytes(),
-        );
-        file.seek(SeekFrom::Start(range.offset))?;
-        let start = bound.len();
-        bound.resize(start + range.length, 0);
-        file.read_exact(&mut bound[start..])?;
-    }
-    Ok(ContentDigest::of(&bound))
 }
 
 fn initialize_schema(
@@ -6505,6 +6368,7 @@ impl From<SqliteFileSetError> for ProjectionError {
         match value {
             SqliteFileSetError::Io(error) => Self::from(error),
             SqliteFileSetError::UnsafePath(error) => Self::UnsafePath(error),
+            SqliteFileSetError::Corrupt(error) => Self::Corrupt(error),
             SqliteFileSetError::CandidateRetainedSidecars => {
                 Self::Corrupt("checkpointed SQLite candidate retained sidecars".into())
             }
@@ -7356,13 +7220,14 @@ fn corrupt_equal_length_interior_block_payload_with_coverage(
 
     let mut bytes = fs::read(database_path).unwrap();
     assert!(
-        bytes.len() > PROJECTION_FINGERPRINT_CHUNK_BYTES * 2,
+        bytes.len() > storage_frontier::SQLITE_CHECKPOINT_EDGE_BYTES * 2,
         "fixture database is too small to have an edge-excluded interior"
     );
     let mut patched = 0;
-    let sampled_ranges = bounded_file_checkpoint_interior_ranges(bytes.len() as u64);
-    let interior_start = PROJECTION_FINGERPRINT_CHUNK_BYTES;
-    let interior_end = bytes.len() - PROJECTION_FINGERPRINT_CHUNK_BYTES;
+    let sampled_ranges =
+        storage_frontier::physical_checkpoint_interior_ranges_for_test(bytes.len() as u64);
+    let interior_start = storage_frontier::SQLITE_CHECKPOINT_EDGE_BYTES;
+    let interior_end = bytes.len() - storage_frontier::SQLITE_CHECKPOINT_EDGE_BYTES;
     for page in block_pages {
         let page_start = page.saturating_sub(1).saturating_mul(page_size);
         let start = page_start.max(interior_start);
@@ -7378,9 +7243,9 @@ fn corrupt_equal_length_interior_block_payload_with_coverage(
                 continue;
             }
             let replacement_end = offset + counterfeit.len();
-            let fully_sampled = sampled_ranges.iter().any(|range| {
-                let range_start = usize::try_from(range.offset).unwrap();
-                let range_end = range_start + range.length;
+            let fully_sampled = sampled_ranges.iter().any(|(range_offset, range_length)| {
+                let range_start = usize::try_from(*range_offset).unwrap();
+                let range_end = range_start + range_length;
                 offset >= range_start && replacement_end <= range_end
             });
             if !select_sampled || fully_sampled {
@@ -11173,109 +11038,6 @@ mod tests {
     }
 
     #[test]
-    fn projection_checkpoint_large_sparse_file_has_fixed_interior_accounting() {
-        let dir = TestDir::new("bounded-sidecar-fingerprint");
-        let path = dir.path().join("large-wal");
-        let length = 64_u64 * 1024 * 1024;
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .unwrap();
-        file.set_len(length).unwrap();
-        file.seek(SeekFrom::Start(length - 1)).unwrap();
-        file.write_all(&[1]).unwrap();
-        drop(file);
-        let checkpoint = bounded_file_checkpoint(&path).unwrap();
-        assert_eq!(checkpoint.length, length);
-        assert_eq!(
-            bounded_file_checkpoint_sample_bytes(length),
-            (PROJECTION_FINGERPRINT_CHUNK_BYTES * 2) as u64
-        );
-        let ranges = bounded_file_checkpoint_interior_ranges(length);
-        assert_eq!(ranges, bounded_file_checkpoint_interior_ranges(length));
-        assert_eq!(ranges.len(), PROJECTION_INTERIOR_SAMPLE_MAX_RANGES);
-        assert_eq!(
-            ranges.iter().map(|range| range.length).sum::<usize>(),
-            PROJECTION_INTERIOR_SAMPLE_BYTES
-        );
-        assert!(ranges
-            .windows(2)
-            .all(|pair| pair[0].offset + pair[0].length as u64 <= pair[1].offset));
-        assert!(ranges.iter().all(|range| range.offset
-            >= PROJECTION_FINGERPRINT_CHUNK_BYTES as u64
-            && range.offset + range.length as u64
-                <= length - PROJECTION_FINGERPRINT_CHUNK_BYTES as u64));
-
-        let maximum_ranges = bounded_file_checkpoint_interior_ranges(u64::MAX);
-        assert_eq!(maximum_ranges.len(), PROJECTION_INTERIOR_SAMPLE_MAX_RANGES);
-        assert_eq!(
-            maximum_ranges
-                .iter()
-                .map(|range| range.length)
-                .sum::<usize>(),
-            PROJECTION_INTERIOR_SAMPLE_BYTES
-        );
-    }
-
-    #[test]
-    fn projection_checkpoint_small_file_coverage_is_complete_without_duplicate_interior_ranges() {
-        let edge = PROJECTION_FINGERPRINT_CHUNK_BYTES as u64;
-        assert!(bounded_file_checkpoint_interior_ranges(edge).is_empty());
-        assert!(bounded_file_checkpoint_interior_ranges(edge * 2).is_empty());
-
-        let interior_length = 32_u64 * 1024;
-        let length = edge * 2 + interior_length;
-        assert_eq!(
-            bounded_file_checkpoint_interior_ranges(length),
-            vec![CheckpointInteriorRange {
-                offset: edge,
-                length: interior_length as usize,
-            }]
-        );
-        assert_eq!(
-            bounded_file_checkpoint_sample_bytes(length) + interior_length,
-            length
-        );
-    }
-
-    #[test]
-    fn projection_checkpoint_interior_differential_leaves_length_and_edges_unchanged() {
-        let dir = TestDir::new("interior-checkpoint-differential");
-        let path = dir.path().join("large-database");
-        let length = 64_u64 * 1024 * 1024;
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .unwrap();
-        file.set_len(length).unwrap();
-        file.write_all(&[1]).unwrap();
-        file.seek(SeekFrom::Start(length - 1)).unwrap();
-        file.write_all(&[2]).unwrap();
-        drop(file);
-        let before = bounded_file_checkpoint(&path).unwrap();
-
-        let range = bounded_file_checkpoint_interior_ranges(length)
-            [PROJECTION_INTERIOR_SAMPLE_MAX_RANGES / 2];
-        let mut file = OpenOptions::new().write(true).open(&path).unwrap();
-        file.seek(SeekFrom::Start(
-            range.offset + u64::try_from(range.length / 2).unwrap(),
-        ))
-        .unwrap();
-        file.write_all(&[3]).unwrap();
-        drop(file);
-        let after = bounded_file_checkpoint(&path).unwrap();
-
-        assert_eq!(after.length, before.length);
-        assert_eq!(after.first_chunk_digest, before.first_chunk_digest);
-        assert_eq!(after.last_chunk_digest, before.last_chunk_digest);
-        assert_ne!(after.interior_sample_digest, before.interior_sample_digest);
-    }
-
-    #[test]
     fn sampled_interior_block_corruption_rebuilds_from_authority_and_preserves_evidence() {
         const BLOCK_COUNT: usize = 128;
         const ORIGINAL: &[u8] = b"authoritative-row";
@@ -11369,6 +11131,73 @@ mod tests {
         assert_eq!(
             recovered.database.frontier().unwrap(),
             engine.exact_frontier().unwrap()
+        );
+    }
+
+    #[test]
+    fn projection_checkpoint_wire_bytes_match_the_legacy_physical_dto_shape() {
+        #[derive(Serialize)]
+        struct LegacyBoundedFileCheckpoint {
+            length: u64,
+            first_chunk_digest: ContentDigest,
+            last_chunk_digest: ContentDigest,
+            interior_sample_digest: ContentDigest,
+        }
+
+        #[derive(Serialize)]
+        struct LegacyProjectionCheckpoint {
+            schema_version: u32,
+            workspace_id: WorkspaceId,
+            frontier_root_digest: ContentDigest,
+            database: LegacyBoundedFileCheckpoint,
+            wal: Option<LegacyBoundedFileCheckpoint>,
+        }
+
+        #[derive(Serialize)]
+        struct LegacyProjectionCheckpointEnvelope {
+            checkpoint: LegacyProjectionCheckpoint,
+            digest: ContentDigest,
+        }
+
+        fn lower_legacy(checkpoint: PhysicalFileCheckpoint) -> LegacyBoundedFileCheckpoint {
+            LegacyBoundedFileCheckpoint {
+                length: checkpoint.length,
+                first_chunk_digest: checkpoint.first_chunk_digest,
+                last_chunk_digest: checkpoint.last_chunk_digest,
+                interior_sample_digest: checkpoint.interior_sample_digest,
+            }
+        }
+
+        let ids = TestIds::new(2_388);
+        let dir = TestDir::new("checkpoint-wire-differential");
+        let (database, _engine, _store) = open_empty(&dir, ids);
+        let checkpoint_path = SqliteFileSet::new(database.path())
+            .checkpoint_path()
+            .to_path_buf();
+        drop(database);
+        let bytes = fs::read(checkpoint_path).unwrap();
+        let envelope: ProjectionCheckpointEnvelope = postcard::from_bytes(&bytes).unwrap();
+        let current_checkpoint_bytes = postcard::to_allocvec(&envelope.checkpoint).unwrap();
+        let digest = envelope.digest;
+        let checkpoint = envelope.checkpoint;
+        let legacy_checkpoint = LegacyProjectionCheckpoint {
+            schema_version: checkpoint.schema_version,
+            workspace_id: checkpoint.workspace_id,
+            frontier_root_digest: checkpoint.frontier_root_digest,
+            database: lower_legacy(checkpoint.database),
+            wal: checkpoint.wal.map(lower_legacy),
+        };
+        let legacy_checkpoint_bytes = postcard::to_allocvec(&legacy_checkpoint).unwrap();
+
+        assert_eq!(legacy_checkpoint_bytes, current_checkpoint_bytes);
+        assert_eq!(digest, ContentDigest::of(&legacy_checkpoint_bytes));
+        assert_eq!(
+            postcard::to_allocvec(&LegacyProjectionCheckpointEnvelope {
+                checkpoint: legacy_checkpoint,
+                digest,
+            })
+            .unwrap(),
+            bytes
         );
     }
 
