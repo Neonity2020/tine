@@ -25,6 +25,8 @@ use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
+#[cfg(test)]
+use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -190,6 +192,70 @@ fn take_activation_construction_instrumentation() -> ActivationConstructionInstr
     })
 }
 
+/// Timing receipt for the existing-active startup path. This is test-only on
+/// purpose: reopening must not pay for clocks or synchronization in production.
+/// The fields are sequential startup phases; `accounted` therefore represents
+/// the same wall-time interval as `total` apart from the named coordination
+/// remainder.
+#[cfg(test)]
+#[derive(Clone, Debug, Default)]
+struct RuntimeOpenInstrumentation {
+    total: Duration,
+    handle_graph_open: Duration,
+    handle_graph_resource_identity: Duration,
+    handle_discovery: Duration,
+    actor_thread_overhead: Duration,
+    actor_graph_open: Duration,
+    actor_graph_resource_identity: Duration,
+    actor_discovery_revalidation: Duration,
+    actor_enrollment_root_open: Duration,
+    actor_receipt_store_open: Duration,
+    actor_application_runtime_open: Duration,
+    actor_baseline_binding: Duration,
+    actor_baseline_open: Duration,
+    actor_promoted_runtime_reopen: Duration,
+    actor_exact_feed_open: Duration,
+    actor_shared_descriptor_inspection: Duration,
+    actor_shared_phase_inspection: Duration,
+    actor_accepted_frontier_open: Duration,
+    actor_provider_transport_open: Duration,
+    actor_provider_descriptor_probe: Duration,
+    actor_assembly: Duration,
+    actor_total: Duration,
+    coordination_remainder: Duration,
+}
+
+#[cfg(test)]
+impl RuntimeOpenInstrumentation {
+    fn accounted(&self) -> Duration {
+        [
+            self.handle_graph_open,
+            self.handle_graph_resource_identity,
+            self.handle_discovery,
+            self.actor_thread_overhead,
+            self.actor_graph_open,
+            self.actor_graph_resource_identity,
+            self.actor_discovery_revalidation,
+            self.actor_enrollment_root_open,
+            self.actor_receipt_store_open,
+            self.actor_application_runtime_open,
+            self.actor_baseline_binding,
+            self.actor_baseline_open,
+            self.actor_promoted_runtime_reopen,
+            self.actor_exact_feed_open,
+            self.actor_shared_descriptor_inspection,
+            self.actor_shared_phase_inspection,
+            self.actor_accepted_frontier_open,
+            self.actor_provider_transport_open,
+            self.actor_provider_descriptor_probe,
+            self.actor_assembly,
+            self.coordination_remainder,
+        ]
+        .into_iter()
+        .sum()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ProviderRecoveryCoverageRoot {
     acceptance_sequence: u64,
@@ -275,6 +341,12 @@ static ACTOR_THREADS_FINISHED: std::sync::atomic::AtomicUsize =
 static ACTIVATION_ACTOR_OPEN_INSTRUMENTATION: Mutex<
     BTreeMap<WorkspaceId, ActivationActorOpenInstrumentation>,
 > = Mutex::new(BTreeMap::new());
+/// Cross-thread test receipt for `SyncRuntimeHandle::open`. Actor construction
+/// happens on its dedicated thread, so the caller and actor contribute their
+/// sequential phases to one workspace-keyed record.
+#[cfg(test)]
+static RUNTIME_OPEN_INSTRUMENTATION: Mutex<BTreeMap<WorkspaceId, RuntimeOpenInstrumentation>> =
+    Mutex::new(BTreeMap::new());
 #[cfg(test)]
 static PREPARE_SHARED_TEST_CUT: Mutex<Option<WorkspaceId>> = Mutex::new(None);
 #[cfg(test)]
@@ -343,6 +415,74 @@ fn activation_actor_open_instrumentation(
         .get(&workspace)
         .copied()
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+fn record_runtime_actor_open(workspace: WorkspaceId, timing: RuntimeOpenInstrumentation) {
+    let mut records = RUNTIME_OPEN_INSTRUMENTATION.lock().unwrap();
+    let record = records.entry(workspace).or_default();
+    record.actor_graph_open = timing.actor_graph_open;
+    record.actor_graph_resource_identity = timing.actor_graph_resource_identity;
+    record.actor_discovery_revalidation = timing.actor_discovery_revalidation;
+    record.actor_enrollment_root_open = timing.actor_enrollment_root_open;
+    record.actor_receipt_store_open = timing.actor_receipt_store_open;
+    record.actor_application_runtime_open = timing.actor_application_runtime_open;
+    record.actor_baseline_binding = timing.actor_baseline_binding;
+    record.actor_baseline_open = timing.actor_baseline_open;
+    record.actor_promoted_runtime_reopen = timing.actor_promoted_runtime_reopen;
+    record.actor_total = timing.actor_total;
+}
+
+#[cfg(test)]
+fn record_runtime_proven_resources_open(
+    workspace: WorkspaceId,
+    timing: RuntimeOpenInstrumentation,
+) {
+    let mut records = RUNTIME_OPEN_INSTRUMENTATION.lock().unwrap();
+    let record = records.entry(workspace).or_default();
+    record.actor_exact_feed_open = timing.actor_exact_feed_open;
+    record.actor_shared_descriptor_inspection = timing.actor_shared_descriptor_inspection;
+    record.actor_shared_phase_inspection = timing.actor_shared_phase_inspection;
+    record.actor_accepted_frontier_open = timing.actor_accepted_frontier_open;
+    record.actor_provider_transport_open = timing.actor_provider_transport_open;
+    record.actor_provider_descriptor_probe = timing.actor_provider_descriptor_probe;
+    record.actor_assembly = timing.actor_assembly;
+}
+
+#[cfg(test)]
+fn record_runtime_handle_open(
+    workspace: WorkspaceId,
+    total: Duration,
+    handle_graph_open: Duration,
+    handle_graph_resource_identity: Duration,
+    handle_discovery: Duration,
+    actor_thread_elapsed: Duration,
+) {
+    let mut records = RUNTIME_OPEN_INSTRUMENTATION.lock().unwrap();
+    let record = records.entry(workspace).or_default();
+    record.total = total;
+    record.handle_graph_open = handle_graph_open;
+    record.handle_graph_resource_identity = handle_graph_resource_identity;
+    record.handle_discovery = handle_discovery;
+    record.actor_thread_overhead = actor_thread_elapsed.saturating_sub(record.actor_total);
+    record.coordination_remainder = total.saturating_sub(record.accounted());
+}
+
+#[cfg(test)]
+fn reset_runtime_open_instrumentation(workspace: WorkspaceId) {
+    RUNTIME_OPEN_INSTRUMENTATION
+        .lock()
+        .unwrap()
+        .remove(&workspace);
+}
+
+#[cfg(test)]
+fn take_runtime_open_instrumentation(workspace: WorkspaceId) -> RuntimeOpenInstrumentation {
+    RUNTIME_OPEN_INSTRUMENTATION
+        .lock()
+        .unwrap()
+        .remove(&workspace)
+        .expect("existing-active runtime open instrumentation was recorded")
 }
 #[cfg(test)]
 static PROVIDER_RECOVERY_PUBLICATION_TEST_CUTS: Mutex<
@@ -1825,22 +1965,36 @@ impl SyncRuntimeHandle {
             };
         }
 
+        #[cfg(test)]
+        let open_started = Instant::now();
+        #[cfg(test)]
+        let phase_started = Instant::now();
         let graph = match Graph::open_checked(&request.graph_root) {
             Ok(graph) => graph,
             Err(error) => {
                 return refused(format!("cannot retain graph for discovery: {error}"));
             }
         };
+        #[cfg(test)]
+        let handle_graph_open = phase_started.elapsed();
+        #[cfg(test)]
+        let phase_started = Instant::now();
         let graph_resource_id = match graph.canonical_resource_id() {
             Ok(resource) => resource,
             Err(error) => return refused(format!("cannot identify graph for discovery: {error}")),
         };
+        #[cfg(test)]
+        let handle_graph_resource_identity = phase_started.elapsed();
+        #[cfg(test)]
+        let phase_started = Instant::now();
         let classification = discover_startup(&DiscoveryRequest {
             profile: StartupStorageProfile::ExperimentalSparse,
             graph_resource_id,
             runtime_root: &request.enrollment_root,
             archive_root: &request.archive_root,
         });
+        #[cfg(test)]
+        let handle_discovery = phase_started.elapsed();
         drop(graph);
         let advisory = match classification {
             DiscoveryClassification::ExistingLocalActive(advisory) => advisory,
@@ -1869,6 +2023,8 @@ impl SyncRuntimeHandle {
         let (started_sender, started_receiver) = mpsc::sync_channel(1);
         let actor_status = Arc::clone(&status);
         let thread_name = format!("tine-sync-{}", &graph_resource_id.to_string()[..12]);
+        #[cfg(test)]
+        let actor_thread_started = Instant::now();
         let join = match thread::Builder::new()
             .name(thread_name)
             .stack_size(ACTOR_STACK_BYTES)
@@ -1907,6 +2063,15 @@ impl SyncRuntimeHandle {
         match started_receiver.recv() {
             Ok(Ok(snapshot)) => {
                 *status.write().unwrap() = snapshot;
+                #[cfg(test)]
+                record_runtime_handle_open(
+                    workspace_id,
+                    open_started.elapsed(),
+                    handle_graph_open,
+                    handle_graph_resource_identity,
+                    handle_discovery,
+                    actor_thread_started.elapsed(),
+                );
                 SyncRuntimeOpenResult {
                     status: SyncRuntimeOpenStatus::Active,
                     handle: Some(Self {
@@ -5400,12 +5565,26 @@ impl RuntimeActor {
     ) -> Result<Self, String> {
         #[cfg(test)]
         record_cold_actor_open(advisory.binding.workspace_id());
+        #[cfg(test)]
+        let workspace_id = advisory.binding.workspace_id();
+        #[cfg(test)]
+        let actor_started = Instant::now();
+        #[cfg(test)]
+        let phase_started = Instant::now();
         let graph = Graph::open_checked(&request.graph_root).map_err(display)?;
+        #[cfg(test)]
+        let actor_graph_open = phase_started.elapsed();
+        #[cfg(test)]
+        let phase_started = Instant::now();
         let graph_resource_id = graph.canonical_resource_id().map_err(display)?;
         if graph_resource_id != advisory.binding.graph_resource_id() {
             return Err("actor graph does not match discovery binding".into());
         }
+        #[cfg(test)]
+        let actor_graph_resource_identity = phase_started.elapsed();
 
+        #[cfg(test)]
+        let phase_started = Instant::now();
         let fresh = discover_startup(&DiscoveryRequest {
             profile: StartupStorageProfile::ExperimentalSparse,
             graph_resource_id,
@@ -5415,14 +5594,22 @@ impl RuntimeActor {
         if fresh != DiscoveryClassification::ExistingLocalActive(advisory.clone()) {
             return Err("discovered LocalActive evidence changed before actor open".into());
         }
+        #[cfg(test)]
+        let actor_discovery_revalidation = phase_started.elapsed();
 
+        #[cfg(test)]
+        let phase_started = Instant::now();
         let enrollment_root =
             open_existing_enrollment_application_root(&request.enrollment_root).map_err(display)?;
+        #[cfg(test)]
+        let actor_enrollment_root_open = phase_started.elapsed();
         let endpoint = ProjectionEndpointBinding {
             endpoint_id: advisory.binding.endpoint_id(),
             device_id: advisory.binding.device_id(),
             graph_resource_id: advisory.binding.graph_resource_id(),
         };
+        #[cfg(test)]
+        let phase_started = Instant::now();
         let receipts = ProjectionReceiptStore::open_existing_for_endpoint(
             &request.receipt_root,
             advisory.binding.workspace_id(),
@@ -5430,6 +5617,10 @@ impl RuntimeActor {
             advisory.binding.receipt_store_id(),
         )
         .map_err(display)?;
+        #[cfg(test)]
+        let actor_receipt_store_open = phase_started.elapsed();
+        #[cfg(test)]
+        let phase_started = Instant::now();
         let application_runtime_root = ApplicationRuntimeRoot::open_existing_for_runtime_host(
             &request.application_runtime_root,
         )
@@ -5437,6 +5628,10 @@ impl RuntimeActor {
         let trusted_runtime = TrustedPrivateApplicationRuntimeRoot::from_application_runtime_root(
             &application_runtime_root,
         );
+        #[cfg(test)]
+        let actor_application_runtime_open = phase_started.elapsed();
+        #[cfg(test)]
+        let phase_started = Instant::now();
         let baseline_binding = ReconciliationBaselineBinding::new(
             advisory.binding.workspace_id(),
             advisory.binding.endpoint_id(),
@@ -5444,8 +5639,14 @@ impl RuntimeActor {
             graph.graph_text_scope_binding().map_err(display)?,
         )
         .map_err(display)?;
+        #[cfg(test)]
+        let actor_baseline_binding = phase_started.elapsed();
+        #[cfg(test)]
+        let phase_started = Instant::now();
         let baseline = ReconciliationBaseline::open_existing(&trusted_runtime, baseline_binding)
             .map_err(display)?;
+        #[cfg(test)]
+        let actor_baseline_open = phase_started.elapsed();
         let open = PromotedRuntimeOpen {
             graph: &graph,
             receipts: &receipts,
@@ -5456,6 +5657,8 @@ impl RuntimeActor {
             migration_backup_root: &request.migration_backup_root,
         };
         let unsafe_reopen = matches!(&advisory.handoff, EnrollmentDiscoveryHandoff::Unsafe { .. });
+        #[cfg(test)]
+        let phase_started = Instant::now();
         let (authority, runtime) = match advisory.handoff {
             EnrollmentDiscoveryHandoff::Safe => reopen_promoted_local_runtime_existing_projection(
                 &enrollment_root,
@@ -5473,8 +5676,10 @@ impl RuntimeActor {
             }
         }
         .map_err(display)?;
+        #[cfg(test)]
+        let actor_promoted_runtime_reopen = phase_started.elapsed();
 
-        Self::from_proven_resources(
+        let actor = Self::from_proven_resources(
             request,
             graph,
             receipts,
@@ -5487,7 +5692,25 @@ impl RuntimeActor {
             advisory.promotion_session_id,
             advisory.promoted_state_digest,
             unsafe_reopen,
-        )
+        )?;
+        #[cfg(test)]
+        record_runtime_actor_open(
+            workspace_id,
+            RuntimeOpenInstrumentation {
+                actor_graph_open,
+                actor_graph_resource_identity,
+                actor_discovery_revalidation,
+                actor_enrollment_root_open,
+                actor_receipt_store_open,
+                actor_application_runtime_open,
+                actor_baseline_binding,
+                actor_baseline_open,
+                actor_promoted_runtime_reopen,
+                actor_total: actor_started.elapsed(),
+                ..RuntimeOpenInstrumentation::default()
+            },
+        );
+        Ok(actor)
     }
 
     /// Install one activation's retained proof into its first actor without
@@ -5556,17 +5779,29 @@ impl RuntimeActor {
         promoted_state_digest: ContentDigest,
         unsafe_reopen: bool,
     ) -> Result<Self, String> {
+        #[cfg(test)]
+        let workspace_id = binding.workspace_id();
         let recovery = map_recovery(runtime.recovery());
+        #[cfg(test)]
+        let phase_started = Instant::now();
         let feed =
             ExactExternalFeedState::open(&graph, &receipts, &runtime, baseline).map_err(display)?;
+        #[cfg(test)]
+        let actor_exact_feed_open = phase_started.elapsed();
         let last_watcher = map_watcher(runtime.watcher_status());
+        #[cfg(test)]
+        let phase_started = Instant::now();
         let shared =
             inspect_shared_enrollment_descriptor(&enrollment_root, &binding).map_err(display)?;
+        #[cfg(test)]
+        let actor_shared_descriptor_inspection = phase_started.elapsed();
         let shared_descriptor = shared.as_ref().map(|(descriptor, _)| descriptor.clone());
         let shared_role = shared.map(|(_, role)| match role {
             SharedEnrollmentRole::Initiator => SyncSharedRole::Initiator,
             SharedEnrollmentRole::Joiner => SyncSharedRole::Joiner,
         });
+        #[cfg(test)]
+        let phase_started = Instant::now();
         let shared_phase =
             crate::oplog::enrollment::inspect_shared_enrollment_phase(&enrollment_root, &binding)
                 .map_err(display)?
@@ -5576,6 +5811,10 @@ impl RuntimeActor {
                     SharedEnrollmentPhase::SharedActiveInitiator
                     | SharedEnrollmentPhase::SharedActiveJoiner => SyncSharedPhase::Active,
                 });
+        #[cfg(test)]
+        let actor_shared_phase_inspection = phase_started.elapsed();
+        #[cfg(test)]
+        let phase_started = Instant::now();
         let accepted_root = runtime.engine().accepted_frontier_root().map_err(display)?;
         let accepted_audit_root = ProviderRecoveryCoverageRoot::from_frontier(&accepted_root);
         let provider_accepted_manifest_audit = (shared_phase == Some(SyncSharedPhase::Active))
@@ -5584,6 +5823,10 @@ impl RuntimeActor {
         let provider_accepted_manifest_audit_root = (shared_phase == Some(SyncSharedPhase::Active)
             && provider_accepted_manifest_audit.is_none())
         .then_some(accepted_audit_root);
+        #[cfg(test)]
+        let actor_accepted_frontier_open = phase_started.elapsed();
+        #[cfg(test)]
+        let phase_started = Instant::now();
         let provider = if shared_descriptor.is_some() {
             Some(
                 SharedProviderTransport::open(
@@ -5595,6 +5838,10 @@ impl RuntimeActor {
         } else {
             None
         };
+        #[cfg(test)]
+        let actor_provider_transport_open = phase_started.elapsed();
+        #[cfg(test)]
+        let phase_started = Instant::now();
         let provider_descriptor_repair_requested = if shared_phase == Some(SyncSharedPhase::Active)
         {
             provider
@@ -5606,7 +5853,11 @@ impl RuntimeActor {
         } else {
             false
         };
-        Ok(Self {
+        #[cfg(test)]
+        let actor_provider_descriptor_probe = phase_started.elapsed();
+        #[cfg(test)]
+        let phase_started = Instant::now();
+        let actor = Self {
             graph,
             receipts,
             authority: Some(authority),
@@ -5673,7 +5924,22 @@ impl RuntimeActor {
             provider_recovery_backfill_cursor: None,
             pending_join: None,
             _not_send_or_sync: PhantomData,
-        })
+        };
+        #[cfg(test)]
+        record_runtime_proven_resources_open(
+            workspace_id,
+            RuntimeOpenInstrumentation {
+                actor_exact_feed_open,
+                actor_shared_descriptor_inspection,
+                actor_shared_phase_inspection,
+                actor_accepted_frontier_open,
+                actor_provider_transport_open,
+                actor_provider_descriptor_probe,
+                actor_assembly: phase_started.elapsed(),
+                ..RuntimeOpenInstrumentation::default()
+            },
+        );
+        Ok(actor)
     }
 
     fn observe(
@@ -6014,7 +6280,7 @@ impl RuntimeActor {
         &mut self,
         request: SyncApplicationPageLoadRequest,
     ) -> Result<SyncApplicationPageLoadOutcome, SyncApplicationPageRequestError> {
-        if let EditorTurnReadiness::Deferred(state) = self.prepare_editor_turn() {
+        if let EditorTurnReadiness::Deferred(state) = self.prepare_page_read_turn() {
             return Ok(SyncApplicationPageLoadOutcome::Deferred { state });
         }
         match request.page {
@@ -6349,7 +6615,7 @@ impl RuntimeActor {
         &mut self,
         request: SyncEditorLoadRequest,
     ) -> Result<SyncEditorLoadOutcome, SyncEditorRequestError> {
-        if let EditorTurnReadiness::Deferred(state) = self.prepare_editor_turn() {
+        if let EditorTurnReadiness::Deferred(state) = self.prepare_page_read_turn() {
             return Ok(SyncEditorLoadOutcome::Deferred { state });
         }
         let runtime = self
@@ -6359,7 +6625,8 @@ impl RuntimeActor {
         match request.page {
             SyncEditorPageSelector::PageId { page_id } => {
                 let page_id = parse_editor_page_id(&page_id)?;
-                match load_current_editor_page(runtime, page_id)? {
+                let current = load_current_editor_page(runtime, page_id)?;
+                match current {
                     Some(current) => Ok(SyncEditorLoadOutcome::Loaded { page: current.dto }),
                     None => Ok(SyncEditorLoadOutcome::MissingPage),
                 }
@@ -6657,6 +6924,24 @@ impl RuntimeActor {
         } else {
             EditorTurnReadiness::Ready
         }
+    }
+
+    fn prepare_page_read_turn(&mut self) -> EditorTurnReadiness {
+        if self.clean_startup_projection_read_available() {
+            return EditorTurnReadiness::Ready;
+        }
+        self.prepare_editor_turn()
+    }
+
+    fn clean_startup_projection_read_available(&self) -> bool {
+        self.recovery == SyncRuntimeRecovery::AdoptedSafeHandoff
+            && self.local_mutation.is_none()
+            && self.terminal.is_none()
+            && self
+                .feed
+                .as_ref()
+                .zip(self.runtime.as_ref())
+                .is_some_and(|(feed, runtime)| feed.only_startup_catch_up_pending(runtime))
     }
 
     fn execute_editor_transaction(
@@ -15725,11 +16010,18 @@ mod tests {
     }
 
     #[test]
-    fn safe_reopen_honestly_reports_its_deferred_full_scan_catch_up() {
+    fn clean_reopen_reads_an_unchanged_page_before_deferred_full_scan_catch_up() {
         let fixture = RuntimeHostFixture::safe("sync-runtime-unchanged-safe-reopen");
         let request = fixture.request();
         let first = active_handle(SyncRuntimeHandle::open(request.clone()));
         drive_initial_feed(&first);
+        let path = "content/nested pages/clean restart.md";
+        admit_external_page(
+            &first,
+            &fixture,
+            path,
+            b"title:: clean restart\nalias:: restart alias\n\n- TODO unchanged clean restart\n  priority:: A\n  owner:: [[Team]]\n  - nested child\n- second sibling\n",
+        );
         assert!(matches!(
             first.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(_)
@@ -15749,7 +16041,35 @@ mod tests {
             status.watcher
         );
         assert_eq!(fixture.manifest_count(), manifests_before_reopen);
+        let fast_page = load_application_exact(&reopened, path);
+        let (page, _) = &fast_page;
+        assert_eq!(page.path, path);
+        assert!(page.blocks[0].raw.contains("TODO unchanged clean restart"));
+        assert_eq!(page.blocks[0].children[0].raw, "nested child");
+        assert_eq!(page.blocks[1].raw, "second sibling");
+        let logical_fast_page =
+            load_application_logical(&reopened, "clean restart", SyncPageKind::Page);
+        assert_eq!(
+            serde_json::to_value(&logical_fast_page.0).unwrap(),
+            serde_json::to_value(&fast_page.0).unwrap()
+        );
+        assert_eq!(logical_fast_page.1, fast_page.1);
+        assert!(
+            reopened
+                .status()
+                .unwrap()
+                .watcher
+                .pending_requires_full_scan,
+            "the read-only clean-restart path must leave closed-interval detection owed"
+        );
         drive_initial_feed(&reopened);
+        let hydrated_page = load_application_exact(&reopened, path);
+        assert_eq!(
+            serde_json::to_value(&hydrated_page.0).unwrap(),
+            serde_json::to_value(&fast_page.0).unwrap(),
+            "the clean-startup SQLite/file join must match the ordinary hydrated page load"
+        );
+        assert_eq!(hydrated_page.1, fast_page.1);
         assert!(
             !reopened.status().unwrap().watcher.pending,
             "the first actor drain must settle the exact owed catch-up before Safe"
@@ -15790,6 +16110,12 @@ mod tests {
             manifests_before_reopen + 1,
             "the deferred full scan must admit the closed-interval external edit before Safe"
         );
+        let (page, _) = load_application_exact(&reopened, path);
+        assert_eq!(page.path, path);
+        assert_eq!(
+            page.blocks[0].raw,
+            "external Logseq or Syncthing edit while Tine was closed"
+        );
         assert!(matches!(
             reopened.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(_)
@@ -15801,6 +16127,9 @@ mod tests {
         let fixture = RuntimeHostFixture::safe("sync-runtime-crash-drop");
         let request = fixture.request();
         let handle = active_handle(SyncRuntimeHandle::open(request.clone()));
+        drive_initial_feed(&handle);
+        let path = "content/nested pages/present before crash.md";
+        admit_external_page(&handle, &fixture, path, b"- retained crash recovery\n");
         drop(handle);
         assert!(matches!(
             fixture.handoff(),
@@ -15812,10 +16141,12 @@ mod tests {
             reopened.status().unwrap().recovery,
             Some(SyncRuntimeRecovery::TookOverCrashedUnsafe)
         );
-        let ticks = drain_until_settled(&reopened);
+        let (page, _) = load_application_exact(&reopened, path);
+        assert_eq!(page.path, path);
+        assert_eq!(page.blocks[0].raw, "retained crash recovery");
         assert!(
-            admitted_an_epoch(&ticks),
-            "crash takeover must reconcile its forced full scan: {ticks:?}"
+            !reopened.status().unwrap().watcher.pending,
+            "unclean takeover must still complete its recovery scan before serving a page"
         );
         assert!(matches!(
             reopened.clean_shutdown().unwrap(),
@@ -23832,6 +24163,427 @@ mod tests {
         );
         assert!(cold_ms < 10_000, "true cold reopen exceeded 10 seconds");
         drop(reopened.handle);
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct StartupBenchmarkNamedPage {
+        name: String,
+        path: String,
+        blocks: usize,
+        pre_block: Option<String>,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct StartupBenchmarkGraphState {
+        pages: BTreeSet<String>,
+    }
+
+    #[derive(Clone, Debug)]
+    struct StartupBenchmarkMilestones {
+        backend_open: Duration,
+        first_named_page: Duration,
+        whole_graph_on_demand: Duration,
+    }
+
+    #[derive(Clone, Debug)]
+    struct DirectStartupBenchmarkReceipt {
+        milestones: StartupBenchmarkMilestones,
+        paced_background_warmer: Duration,
+        named_page: StartupBenchmarkNamedPage,
+        graph_state: StartupBenchmarkGraphState,
+    }
+
+    #[derive(Clone, Debug)]
+    struct ManagedStartupBenchmarkReceipt {
+        milestones: StartupBenchmarkMilestones,
+        deferred_catch_up_and_shutdown: Duration,
+        named_page: StartupBenchmarkNamedPage,
+        graph_state: StartupBenchmarkGraphState,
+        open: RuntimeOpenInstrumentation,
+        resume: crate::oplog::hot_engine::RuntimeResumeObservation,
+    }
+
+    fn startup_page_semantics(page: &PageDto) -> StartupBenchmarkNamedPage {
+        StartupBenchmarkNamedPage {
+            name: page.name.clone(),
+            path: page.path.clone(),
+            blocks: page.blocks.len(),
+            pre_block: page.pre_block.clone(),
+        }
+    }
+
+    fn startup_direct_kind(kind: PageKind) -> &'static str {
+        match kind {
+            PageKind::Page => "page",
+            PageKind::Journal => "journal",
+        }
+    }
+
+    fn startup_managed_kind(kind: SyncPageKind) -> &'static str {
+        match kind {
+            SyncPageKind::Page => "page",
+            SyncPageKind::Journal => "journal",
+        }
+    }
+
+    fn startup_direct_graph_state(graph: &Graph) -> StartupBenchmarkGraphState {
+        let pages = graph.with_pages(|pages| {
+            pages
+                .iter()
+                .map(|(entry, _)| {
+                    format!(
+                        "{}\u{0}{}\u{0}",
+                        startup_direct_kind(entry.kind),
+                        entry.rel_path,
+                    ) + &entry.name
+                })
+                .collect()
+        });
+        StartupBenchmarkGraphState { pages }
+    }
+
+    fn measure_direct_startup(
+        graph_root: &Path,
+        named_page: &str,
+        expected_pages: usize,
+    ) -> DirectStartupBenchmarkReceipt {
+        let started = Instant::now();
+        let graph = Graph::open_checked(graph_root).expect("direct Markdown graph opens");
+        let backend_open = started.elapsed();
+
+        let started = Instant::now();
+        let page = graph
+            .load_named(named_page, PageKind::Page)
+            .expect("direct named-page request succeeds")
+            .expect("synthetic named page exists");
+        let first_named_page = started.elapsed();
+        let named_page = startup_page_semantics(&page);
+
+        let started = Instant::now();
+        let graph_state = startup_direct_graph_state(&graph);
+        let whole_graph_on_demand = started.elapsed();
+        assert_eq!(
+            graph_state.pages.len(),
+            expected_pages,
+            "direct on-demand graph parse must expose every fixture page"
+        );
+
+        // This is intentionally not one of the three readiness milestones:
+        // direct Markdown normally runs a paced warmer in the background, while
+        // the prior `with_pages` measurement is the foreground work a user waits
+        // on when navigating before that warmer has completed.
+        let warming_graph =
+            Graph::open_checked(graph_root).expect("direct Markdown warmer graph opens");
+        let started = Instant::now();
+        warming_graph.warm_cache();
+        let paced_background_warmer = started.elapsed();
+        assert_eq!(
+            warming_graph.with_pages(|pages| pages.len()),
+            expected_pages,
+            "paced direct warmer must retain the same complete graph state"
+        );
+
+        DirectStartupBenchmarkReceipt {
+            milestones: StartupBenchmarkMilestones {
+                backend_open,
+                first_named_page,
+                whole_graph_on_demand,
+            },
+            paced_background_warmer,
+            named_page,
+            graph_state,
+        }
+    }
+
+    fn measure_managed_startup(
+        request: &SyncLocalActivationRequest,
+        named_page: &str,
+        expected_pages: usize,
+    ) -> ManagedStartupBenchmarkReceipt {
+        let workspace_id = request.identities.workspace_id;
+        reset_runtime_open_instrumentation(workspace_id);
+        let started = Instant::now();
+        let opened = SyncRuntimeHandle::open(reopen_request(request));
+        let backend_open = started.elapsed();
+        assert_eq!(
+            opened.status,
+            SyncRuntimeOpenStatus::Active,
+            "activated fixture reopens an active managed backend"
+        );
+        let handle = opened
+            .handle
+            .expect("active reopen retains a runtime handle");
+        let open = take_runtime_open_instrumentation(workspace_id);
+        let resume = handle
+            .engine_instrumentation()
+            .expect("managed reopen exposes engine instrumentation")
+            .resume;
+        assert!(
+            open.total <= backend_open,
+            "internal managed-open receipt cannot outlive its caller: {open:?}, caller={backend_open:?}"
+        );
+        assert_eq!(
+            open.accounted(),
+            open.total,
+            "managed-open phases must account for the complete measured startup: {open:?}"
+        );
+
+        let started = Instant::now();
+        let page = match handle
+            .load_application_page(SyncApplicationPageLoadRequest {
+                page: SyncApplicationPageSelector::Logical {
+                    name: named_page.to_owned(),
+                    page_kind: SyncPageKind::Page,
+                },
+            })
+            .expect("managed named-page request succeeds")
+        {
+            SyncApplicationPageLoadOutcome::Loaded { page, .. } => page,
+            other => panic!("managed named page was not ready: {other:?}"),
+        };
+        let first_named_page = started.elapsed();
+        let named_page = startup_page_semantics(&page);
+
+        let started = Instant::now();
+        let pages = match handle
+            .query(SyncRuntimeQueryRequest::ListPages {
+                page_kind: None,
+                limit: MAX_SYNC_RUNTIME_QUERY_ROWS,
+            })
+            .expect("managed whole-graph page query succeeds")
+        {
+            SyncRuntimeQueryReply::Pages(pages) => pages,
+            other => panic!("managed whole-graph query returned the wrong reply: {other:?}"),
+        };
+        let whole_graph_on_demand = started.elapsed();
+        let graph_state = StartupBenchmarkGraphState {
+            pages: pages
+                .iter()
+                .map(|page| {
+                    format!("{}\u{0}{}\u{0}", startup_managed_kind(page.kind), page.path,)
+                        + &page.name
+                })
+                .collect(),
+        };
+        assert_eq!(
+            graph_state.pages.len(),
+            expected_pages,
+            "managed whole-graph query must expose every fixture page"
+        );
+
+        let shutdown_started = Instant::now();
+        let shutdown = handle.clean_shutdown();
+        let deferred_catch_up_and_shutdown = shutdown_started.elapsed();
+        assert!(
+            matches!(shutdown, Ok(SyncShutdownOutcome::Safe(_))),
+            "benchmark reopen must preserve the normal safe-handoff path: {shutdown:?}"
+        );
+        drop(handle);
+
+        ManagedStartupBenchmarkReceipt {
+            milestones: StartupBenchmarkMilestones {
+                backend_open,
+                first_named_page,
+                whole_graph_on_demand,
+            },
+            deferred_catch_up_and_shutdown,
+            named_page,
+            graph_state,
+            open,
+            resume,
+        }
+    }
+
+    fn startup_ms(duration: Duration) -> f64 {
+        duration.as_secs_f64() * 1_000.0
+    }
+
+    fn startup_median(samples: &[Duration]) -> Duration {
+        assert!(
+            !samples.is_empty(),
+            "benchmark receipt has at least one sample"
+        );
+        let mut ordered = samples.to_vec();
+        ordered.sort_unstable();
+        ordered[ordered.len() / 2]
+    }
+
+    fn startup_open_phase_receipt(open: &RuntimeOpenInstrumentation) -> String {
+        format!(
+            "total_ms={:.3} handle_graph_open_ms={:.3} handle_identity_ms={:.3} handle_discovery_ms={:.3} actor_thread_overhead_ms={:.3} actor_graph_open_ms={:.3} actor_identity_ms={:.3} actor_discovery_revalidation_ms={:.3} enrollment_open_ms={:.3} receipt_store_open_ms={:.3} application_runtime_open_ms={:.3} baseline_binding_ms={:.3} baseline_open_ms={:.3} promoted_runtime_reopen_ms={:.3} exact_feed_open_ms={:.3} shared_descriptor_ms={:.3} shared_phase_ms={:.3} accepted_frontier_ms={:.3} provider_transport_ms={:.3} provider_descriptor_probe_ms={:.3} actor_assembly_ms={:.3} coordination_remainder_ms={:.3}",
+            startup_ms(open.total),
+            startup_ms(open.handle_graph_open),
+            startup_ms(open.handle_graph_resource_identity),
+            startup_ms(open.handle_discovery),
+            startup_ms(open.actor_thread_overhead),
+            startup_ms(open.actor_graph_open),
+            startup_ms(open.actor_graph_resource_identity),
+            startup_ms(open.actor_discovery_revalidation),
+            startup_ms(open.actor_enrollment_root_open),
+            startup_ms(open.actor_receipt_store_open),
+            startup_ms(open.actor_application_runtime_open),
+            startup_ms(open.actor_baseline_binding),
+            startup_ms(open.actor_baseline_open),
+            startup_ms(open.actor_promoted_runtime_reopen),
+            startup_ms(open.actor_exact_feed_open),
+            startup_ms(open.actor_shared_descriptor_inspection),
+            startup_ms(open.actor_shared_phase_inspection),
+            startup_ms(open.actor_accepted_frontier_open),
+            startup_ms(open.actor_provider_transport_open),
+            startup_ms(open.actor_provider_descriptor_probe),
+            startup_ms(open.actor_assembly),
+            startup_ms(open.coordination_remainder),
+        )
+    }
+
+    #[test]
+    #[ignore = "manual release benchmark: 1,000-page direct Markdown versus managed reopen"]
+    fn managed_startup_reopen_1000_page_manual_benchmark() {
+        assert!(
+            !cfg!(debug_assertions),
+            "this receipt is release-only; run cargo test -p tine-core --release managed_startup_reopen_1000_page_manual_benchmark -- --ignored --nocapture"
+        );
+        const ADDITIONAL_PAGES: usize = 997;
+        const EXPECTED_PAGES: usize = ADDITIONAL_PAGES + 3;
+        const NAMED_PAGE: &str = "Synthetic 0";
+        let runs = std::env::var("TINE_MANAGED_STARTUP_BENCH_RUNS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|runs| *runs > 0)
+            .unwrap_or(5);
+        let fixture =
+            ActivationFixture::scaled("managed-startup-reopen-1000-page", 0xa0d0, ADDITIONAL_PAGES);
+        let source = user_graph_bytes(&fixture.graph_root);
+        let (source_files, source_bytes, blocks) = activation_source_counts(&fixture.graph_root);
+        assert_eq!(source_files, EXPECTED_PAGES);
+        assert!(source_bytes > 0 && blocks >= ADDITIONAL_PAGES * 10);
+
+        // Activation/import is intentionally outside the comparison. It happens
+        // once, then a successful Safe handoff leaves each measured managed open
+        // as a fresh runtime reopening the same user-facing graph bytes.
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let activation_handle = activated
+            .handle
+            .expect("activation retains a runtime handle");
+        drive_initial_feed(&activation_handle);
+        assert!(
+            matches!(
+                activation_handle.clean_shutdown(),
+                Ok(SyncShutdownOutcome::Safe(_))
+            ),
+            "activation must finish with a Safe handoff before reopen measurement"
+        );
+        drop(activation_handle);
+        assert_eq!(
+            user_graph_bytes(&fixture.graph_root),
+            source,
+            "activation and the benchmark must preserve identical graph bytes"
+        );
+
+        let mut direct = Vec::with_capacity(runs);
+        let mut managed = Vec::with_capacity(runs);
+        for run in 0..runs {
+            // Alternate first position to reduce a warm-page-cache advantage for
+            // either backend; each sample still constructs a fresh Graph or actor.
+            let (direct_receipt, managed_receipt) = if run % 2 == 0 {
+                let direct =
+                    measure_direct_startup(&fixture.graph_root, NAMED_PAGE, EXPECTED_PAGES);
+                let managed = measure_managed_startup(&fixture.request, NAMED_PAGE, EXPECTED_PAGES);
+                (direct, managed)
+            } else {
+                let managed = measure_managed_startup(&fixture.request, NAMED_PAGE, EXPECTED_PAGES);
+                let direct =
+                    measure_direct_startup(&fixture.graph_root, NAMED_PAGE, EXPECTED_PAGES);
+                (direct, managed)
+            };
+            assert_eq!(
+                direct_receipt.named_page, managed_receipt.named_page,
+                "direct and managed first named-page loads must have identical user-facing semantics"
+            );
+            assert_eq!(
+                direct_receipt.graph_state, managed_receipt.graph_state,
+                "direct whole-graph parse and managed whole-graph query must expose the same pages"
+            );
+            eprintln!(
+                "managed_startup_bench run={} direct_open_ms={:.3} direct_first_named_page_ms={:.3} direct_whole_graph_on_demand_ms={:.3} direct_paced_background_warmer_ms={:.3} managed_open_ms={:.3} managed_first_named_page_ms={:.3} managed_whole_graph_on_demand_ms={:.3} managed_deferred_catch_up_and_shutdown_ms={:.3} managed_resume={:?} managed_open_phases: {}",
+                run + 1,
+                startup_ms(direct_receipt.milestones.backend_open),
+                startup_ms(direct_receipt.milestones.first_named_page),
+                startup_ms(direct_receipt.milestones.whole_graph_on_demand),
+                startup_ms(direct_receipt.paced_background_warmer),
+                startup_ms(managed_receipt.milestones.backend_open),
+                startup_ms(managed_receipt.milestones.first_named_page),
+                startup_ms(managed_receipt.milestones.whole_graph_on_demand),
+                startup_ms(managed_receipt.deferred_catch_up_and_shutdown),
+                managed_receipt.resume,
+                startup_open_phase_receipt(&managed_receipt.open),
+            );
+            direct.push(direct_receipt);
+            managed.push(managed_receipt);
+        }
+        assert_eq!(
+            user_graph_bytes(&fixture.graph_root),
+            source,
+            "all measured reopen cycles must preserve graph bytes"
+        );
+
+        let direct_open = startup_median(
+            &direct
+                .iter()
+                .map(|receipt| receipt.milestones.backend_open)
+                .collect::<Vec<_>>(),
+        );
+        let direct_first_page = startup_median(
+            &direct
+                .iter()
+                .map(|receipt| receipt.milestones.first_named_page)
+                .collect::<Vec<_>>(),
+        );
+        let direct_whole_graph = startup_median(
+            &direct
+                .iter()
+                .map(|receipt| receipt.milestones.whole_graph_on_demand)
+                .collect::<Vec<_>>(),
+        );
+        let direct_warmer = startup_median(
+            &direct
+                .iter()
+                .map(|receipt| receipt.paced_background_warmer)
+                .collect::<Vec<_>>(),
+        );
+        let managed_open = startup_median(
+            &managed
+                .iter()
+                .map(|receipt| receipt.milestones.backend_open)
+                .collect::<Vec<_>>(),
+        );
+        let managed_first_page = startup_median(
+            &managed
+                .iter()
+                .map(|receipt| receipt.milestones.first_named_page)
+                .collect::<Vec<_>>(),
+        );
+        let managed_whole_graph = startup_median(
+            &managed
+                .iter()
+                .map(|receipt| receipt.milestones.whole_graph_on_demand)
+                .collect::<Vec<_>>(),
+        );
+        eprintln!(
+            "managed_startup_bench median runs={} fixture_files={} fixture_bytes={} fixture_blocks={} direct_open_ms={:.3} direct_first_named_page_ms={:.3} direct_whole_graph_on_demand_ms={:.3} direct_paced_background_warmer_ms={:.3} managed_open_ms={:.3} managed_first_named_page_ms={:.3} managed_whole_graph_on_demand_ms={:.3}",
+            runs,
+            source_files,
+            source_bytes,
+            blocks,
+            startup_ms(direct_open),
+            startup_ms(direct_first_page),
+            startup_ms(direct_whole_graph),
+            startup_ms(direct_warmer),
+            startup_ms(managed_open),
+            startup_ms(managed_first_page),
+            startup_ms(managed_whole_graph),
+        );
     }
 
     fn tree_has_file_named(root: &Path, name: &str) -> bool {

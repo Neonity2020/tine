@@ -1823,6 +1823,7 @@ where
     let output_bytes = plan
         .candidate_bytes()
         .and_then(|bytes| bytes.checked_add(plan.diagnostic_bytes()))
+        .and_then(|bytes| bytes.checked_add(plan.membership_bytes()))
         .ok_or_else(|| scan_bound_failure(started, instrumentation, "candidate byte"))?;
     observe_live_memory(
         &mut instrumentation,
@@ -1834,7 +1835,7 @@ where
             .instrumentation
             .peak_retained_bytes
             .saturating_add(collision_authority.retained_bytes),
-        output_rows as u64,
+        (output_rows as u64).saturating_add(1),
         output_bytes,
         limits,
         started,
@@ -2169,12 +2170,13 @@ fn hash_optional_u64(hasher: &mut Sha256, value: Option<u64>) {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct CandidateMergePlan {
     candidate_count: usize,
     candidate_path_bytes: u64,
     diagnostic_count: usize,
     diagnostic_path_bytes: u64,
+    observed_expected: Vec<bool>,
 }
 
 impl CandidateMergePlan {
@@ -2190,16 +2192,20 @@ impl CandidateMergePlan {
         Ok(())
     }
 
-    fn candidate_bytes(self) -> Option<u64> {
+    fn candidate_bytes(&self) -> Option<u64> {
         (self.candidate_count as u64)
             .checked_mul(mem::size_of::<GraphTextScanCandidate>() as u64)
             .and_then(|bytes| bytes.checked_add(self.candidate_path_bytes))
     }
 
-    fn diagnostic_bytes(self) -> u64 {
+    fn diagnostic_bytes(&self) -> u64 {
         (self.diagnostic_count as u64)
             .saturating_mul(mem::size_of::<GraphTextScanDiagnostic>() as u64)
             .saturating_add(self.diagnostic_path_bytes)
+    }
+
+    fn membership_bytes(&self) -> u64 {
+        (self.observed_expected.capacity() as u64).div_ceil(8)
     }
 }
 
@@ -2346,7 +2352,11 @@ fn plan_candidate_merge<S: AuthenticatedExpectedPathSource>(
     started: Instant,
     instrumentation: &mut GraphTextScanInstrumentation,
 ) -> Result<(WalkedExpectedPathStream, CandidateMergePlan), GraphTextScanFailure> {
-    let mut plan = CandidateMergePlan::default();
+    let mut plan = CandidateMergePlan {
+        observed_expected: vec![false; pass.files.len()],
+        ..CandidateMergePlan::default()
+    };
+    let membership_bytes = plan.membership_bytes();
     for file in &pass.files {
         if file.class == GraphTextScanPathClass::ProviderConflictCopy {
             plan.diagnostic_count = plan
@@ -2380,52 +2390,31 @@ fn plan_candidate_merge<S: AuthenticatedExpectedPathSource>(
         Some(expected_stream),
         pass,
         limits,
-        0,
-        0,
+        1,
+        membership_bytes,
         started,
         instrumentation,
-        |row| match eligible_file_at_path(&pass.files, row.path.as_str()) {
-            Some(file) if file.description == Some(row.description) => Ok(()),
-            Some(_) if !authority.admits(row.path.as_str()) => Ok(()),
-            Some(_) | None => plan.add_candidate_path(row.path.as_str()),
+        |row| {
+            if let Ok(index) = pass
+                .files
+                .binary_search_by(|file| file.exact_relative.as_str().cmp(row.path.as_str()))
+            {
+                if pass.files[index].class.is_eligible() {
+                    plan.observed_expected[index] = true;
+                }
+            }
+            match eligible_file_at_path(&pass.files, row.path.as_str()) {
+                Some(file) if file.description == Some(row.description) => Ok(()),
+                Some(_) if !authority.admits(row.path.as_str()) => Ok(()),
+                Some(_) | None => plan.add_candidate_path(row.path.as_str()),
+            }
         },
     )?;
-    for file in pass.files.iter().filter(|file| file.class.is_eligible()) {
-        if !authority.admits(&file.exact_relative) {
-            continue;
-        }
-        let path = ManagedPath::parse(file.exact_relative.clone())
-            .expect("eligible scan rows retain validated managed paths");
-        let point_bytes = expected_point_retained_bytes(&path);
-        observe_live_memory(
-            instrumentation,
-            pass.instrumentation.peak_retained_rows,
-            pass.instrumentation.peak_retained_bytes,
-            2,
-            point_bytes,
-            limits,
-            started,
-        )?;
-        let expected = source
-            .expected_path_at(
-                &path,
-                expected_point_request(
-                    pass.instrumentation.peak_retained_rows,
-                    pass.instrumentation.peak_retained_bytes,
-                    limits,
-                    started,
-                    *instrumentation,
-                )?,
-            )
-            .map_err(|failure| {
-                expected_source_failure(
-                    started,
-                    *instrumentation,
-                    failure,
-                    format!("expected point {}: {failure}", path.as_str()),
-                )
-            })?;
-        if expected.is_none() {
+    for (index, file) in pass.files.iter().enumerate() {
+        if file.class.is_eligible()
+            && authority.admits(&file.exact_relative)
+            && !plan.observed_expected[index]
+        {
             plan.add_candidate_path(&file.exact_relative)
                 .map_err(|error| scan_io_failure(started, *instrumentation, error))?;
         }
@@ -2476,6 +2465,7 @@ fn derive_candidates<S: AuthenticatedExpectedPathSource>(
     let output_bytes = plan
         .candidate_bytes()
         .and_then(|bytes| bytes.checked_add(plan.diagnostic_bytes()))
+        .and_then(|bytes| bytes.checked_add(plan.membership_bytes()))
         .ok_or_else(|| scan_bound_failure(started, *instrumentation, "candidate byte"))?;
     let walked = walk_expected_stream(
         source,
@@ -2483,7 +2473,7 @@ fn derive_candidates<S: AuthenticatedExpectedPathSource>(
         Some(expected_stream),
         pass,
         limits,
-        output_rows,
+        output_rows.saturating_add(1),
         output_bytes,
         started,
         instrumentation,
@@ -2516,44 +2506,11 @@ fn derive_candidates<S: AuthenticatedExpectedPathSource>(
             "reopened expected stream changed its joined rows".to_owned(),
         ));
     }
-    for file in pass.files.iter().filter(|file| file.class.is_eligible()) {
-        if !authority.admits(&file.exact_relative) {
-            continue;
-        }
-        let path = ManagedPath::parse(file.exact_relative.clone())
-            .expect("eligible scan rows retain validated managed paths");
-        let base_rows = pass
-            .instrumentation
-            .peak_retained_rows
-            .saturating_add(output_rows as u64);
-        let base_bytes = pass
-            .instrumentation
-            .peak_retained_bytes
-            .saturating_add(output_bytes);
-        let point_bytes = expected_point_retained_bytes(&path);
-        observe_live_memory(
-            instrumentation,
-            base_rows,
-            base_bytes,
-            2,
-            point_bytes,
-            limits,
-            started,
-        )?;
-        let expected = source
-            .expected_path_at(
-                &path,
-                expected_point_request(base_rows, base_bytes, limits, started, *instrumentation)?,
-            )
-            .map_err(|failure| {
-                expected_source_failure(
-                    started,
-                    *instrumentation,
-                    failure,
-                    format!("expected point {}: {failure}", path.as_str()),
-                )
-            })?;
-        if expected.is_none() {
+    for (index, file) in pass.files.iter().enumerate() {
+        if file.class.is_eligible()
+            && authority.admits(&file.exact_relative)
+            && !plan.observed_expected[index]
+        {
             candidates.push(creation_candidate(file, binding));
         }
     }
@@ -2563,32 +2520,6 @@ fn derive_candidates<S: AuthenticatedExpectedPathSource>(
     debug_assert_eq!(candidates.len(), plan.candidate_count);
     debug_assert_eq!(diagnostics.len(), plan.diagnostic_count);
     Ok((candidates, diagnostics))
-}
-
-fn expected_point_retained_bytes(path: &ManagedPath) -> u64 {
-    (mem::size_of::<CurrentPathCatalogRow>() as u64)
-        .saturating_add(mem::size_of::<AuthenticatedExpectedPath>() as u64)
-        .saturating_add((path.as_str().len() as u64).saturating_mul(2))
-}
-
-fn expected_point_request(
-    base_rows: u64,
-    base_bytes: u64,
-    limits: GraphTextScanLimits,
-    started: Instant,
-    instrumentation: GraphTextScanInstrumentation,
-) -> Result<ExpectedPathPointRequest, GraphTextScanFailure> {
-    Ok(ExpectedPathPointRequest {
-        maximum_path_bytes: limits.exact_path_bytes,
-        maximum_retained_rows: limits
-            .retained_rows
-            .checked_sub(base_rows as usize)
-            .ok_or_else(|| scan_bound_failure(started, instrumentation, "retained row"))?,
-        maximum_retained_bytes: limits
-            .retained_bytes
-            .checked_sub(base_bytes)
-            .ok_or_else(|| scan_bound_failure(started, instrumentation, "retained byte"))?,
-    })
 }
 
 fn eligible_file_at_path<'a>(
@@ -3016,6 +2947,7 @@ mod tests {
         rows_commitment: Cell<ContentDigest>,
         binding: Cell<ExpectedPathBinding>,
         open_calls: Cell<u64>,
+        point_calls: Cell<u64>,
         maximum_page_rows_seen: Cell<usize>,
         maximum_page_bytes_seen: Cell<u64>,
     }
@@ -3044,6 +2976,7 @@ mod tests {
                 ambiguous,
                 binding: Cell::new(binding),
                 open_calls: Cell::new(0),
+                point_calls: Cell::new(0),
                 maximum_page_rows_seen: Cell::new(0),
                 maximum_page_bytes_seen: Cell::new(0),
             }
@@ -3058,6 +2991,7 @@ mod tests {
                 rows_commitment: Cell::new(expected_rows_commitment(binding, &[])),
                 binding: Cell::new(binding),
                 open_calls: Cell::new(0),
+                point_calls: Cell::new(0),
                 maximum_page_rows_seen: Cell::new(0),
                 maximum_page_bytes_seen: Cell::new(0),
             }
@@ -3187,6 +3121,8 @@ mod tests {
             path: &ManagedPath,
             request: ExpectedPathPointRequest,
         ) -> Result<Option<AuthenticatedExpectedPath>, ExpectedPathSourceFailure> {
+            self.point_calls
+                .set(self.point_calls.get().saturating_add(1));
             if let Some(failure) = self.failure {
                 return Err(failure);
             }
@@ -3270,6 +3206,11 @@ mod tests {
         ]);
 
         let scan = scan_graph_text(&graph, &source, GraphTextScanLimits::default()).unwrap();
+        assert_eq!(
+            source.point_calls.get(),
+            0,
+            "whole-graph candidate derivation must not repin joined authority per observed file"
+        );
         assert_eq!(
             candidate_signature(&scan),
             vec![

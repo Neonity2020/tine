@@ -273,6 +273,18 @@ impl ExactExternalFeedState {
         self.terminal.as_ref()
     }
 
+    /// Whether the only retained watcher work is the uncertainty seeded by
+    /// this fresh owner. A clean-handoff reader may use the already-authenticated
+    /// managed projection while this scan remains owed; any real watcher input
+    /// advances the queue and closes that narrow read-only fast path.
+    pub(crate) fn only_startup_catch_up_pending(&self, runtime: &PromotedLocalRuntime) -> bool {
+        let queue = runtime.watcher_status();
+        queue.pending
+            && queue.latest_enqueue == self.watcher_queue_anchor
+            && queue.acknowledged.sequence() < self.watcher_queue_anchor.sequence()
+            && queue.drain_in_flight.is_none()
+    }
+
     /// Submit normalized watcher observations through the existing bounded
     /// watcher queue.
     ///
