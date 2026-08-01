@@ -1061,11 +1061,7 @@ fn emit_block(
         out.push(format!("{ind}- {first}"));
     }
     for line in lines {
-        if line.is_empty() {
-            out.push(String::new());
-        } else {
-            out.push(format!("{ind}  {line}"));
-        }
+        out.push(format!("{ind}  {line}"));
     }
     for child in &block.children {
         emit_block(
@@ -1201,7 +1197,7 @@ mod property_fence_tests {
             ("preamble", "title:: Page\n\n\n- a\n"),
             (
                 "fence-and-logbook",
-                "- fenced\n  ```text\n\n  - literal\n  ```\n\n- task\n  :LOGBOOK:\n  CLOCK: [2026-07-29 Wed]\n  :END:\n\n- final\n",
+                "- fenced\n  ```text\n  \n  - literal\n  ```\n\n- task\n  :LOGBOOK:\n  CLOCK: [2026-07-29 Wed]\n  :END:\n\n- final\n",
             ),
         ];
 
@@ -1220,22 +1216,60 @@ mod property_fence_tests {
     }
 
     #[test]
-    fn whitespace_bearing_continuation_blank_is_structurally_safe() {
+    fn nested_blank_continuation_lines_round_trip_byte_exactly() {
         let source = concat!(
             "- ### Synthetic parent\n",
             "\t- First line,\n",
             "\t  wrapped continuation\n",
             "\t  \n",
-            "\t  final paragraph"
+            "\t  middle paragraph\n",
+            "\t  \n",
+            "\t  final paragraph\n",
+            "- Synthetic sibling\n"
         );
 
-        assert!(
-            !markdown_round_trips(source),
-            "the byte-exact diagnostic must still report canonicalized trivia"
+        let parsed = parse(source);
+        assert_eq!(
+            parsed.roots[0].children[0].raw,
+            "First line,\nwrapped continuation\n\nmiddle paragraph\n\nfinal paragraph"
         );
         assert!(
-            markdown_structurally_round_trips(source),
-            "formatting-only blank-line trivia must not block sparse activation"
+            markdown_round_trips(source),
+            "blank continuation lines must retain their Logseq continuation prefix"
+        );
+        assert_eq!(
+            serialize(&parsed),
+            source,
+            "parse/serialize must reproduce nested blank continuation bytes"
+        );
+    }
+
+    #[test]
+    fn between_block_blank_trivia_does_not_enter_continuation_content() {
+        let source = concat!(
+            "- First block\n",
+            "\n",
+            "- Second block\n",
+            "  continuation\n",
+            "\n",
+            "- Third block\n"
+        );
+
+        let parsed = parse_with_source_spans(source);
+        assert_eq!(parsed.blank_lines_before_blocks, [0, 1, 1]);
+        assert_eq!(
+            parsed
+                .document
+                .roots
+                .iter()
+                .map(|block| block.raw.as_str())
+                .collect::<Vec<_>>(),
+            ["First block", "Second block\ncontinuation", "Third block"]
+        );
+        assert!(markdown_round_trips(source));
+        assert_eq!(
+            serialize_with(&parsed.document, &SerializeOpts::detect(Some(source))),
+            source
         );
     }
 }

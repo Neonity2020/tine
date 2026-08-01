@@ -4399,6 +4399,40 @@ mod tests {
     }
 
     #[test]
+    fn managed_shadow_projection_preserves_nested_blank_continuation_bytes() {
+        let source = concat!(
+            "- Synthetic parent\n",
+            "\t- Child first line\n",
+            "\t  wrapped continuation\n",
+            "\t  \n",
+            "\t  middle paragraph\n",
+            "\t  \n",
+            "\t  final paragraph\n",
+            "- Synthetic sibling\n"
+        )
+        .as_bytes()
+        .to_vec();
+        let fixture = Fixture::new(
+            "blank-continuation",
+            None,
+            vec![("pages/blank-continuation.md".into(), source.clone())],
+        );
+
+        let proof = fixture.verify().unwrap();
+        assert_eq!(proof.file_count(), 1);
+        assert_eq!(
+            fs::read(
+                proof
+                    .directory()
+                    .join("payload/pages/blank-continuation.md")
+            )
+            .unwrap(),
+            source
+        );
+        fixture.assert_graph_unchanged();
+    }
+
+    #[test]
     fn shadow_bytes_and_promotion_binding_are_identical_with_zero_and_cached_sessions() {
         let fixture = rich_fixture("lookup-session-differential");
         let zero = fixture.verify_with_lookup_budget(0).unwrap();
