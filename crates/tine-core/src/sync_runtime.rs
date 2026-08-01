@@ -20252,14 +20252,20 @@ mod tests {
     fn accepted_non_tip_audit_retries_after_one_shot_provider_read_failure() {
         let (fixture, first_batch) =
             accepted_non_tip_audit_fixture("provider-nontip-audit-read-retry", 0xbb60);
+        let prior = replace_own_provider_head_audit_authority(&fixture, 1, None);
+        let first_sequence = prior.accepted_generation() - 2;
+        replace_own_provider_head_audit_authority(
+            &fixture,
+            prior.accepted_generation(),
+            Some(first_sequence),
+        );
         reset_provider_traversal_instrumentation(fixture.request.identities.workspace_id);
-        let reopened = active_handle(SyncRuntimeHandle::open(reopen_request(&fixture.request)));
-        settle_shared_provider_authority(&reopened);
         fail_once_at_provider_accepted_audit_cut(
             fixture.request.identities.workspace_id,
             first_batch,
             ProviderAcceptedAuditTestCut::ProviderRead,
         );
+        let reopened = active_handle(SyncRuntimeHandle::open(reopen_request(&fixture.request)));
 
         tick_until_provider_audit_cut(&reopened, "provider_read");
         assert!(
@@ -20284,24 +20290,36 @@ mod tests {
     fn accepted_non_tip_audit_retries_after_one_shot_repair_publication_failure() {
         let (fixture, first_batch) =
             accepted_non_tip_audit_fixture("provider-nontip-audit-publication-retry", 0xbb80);
+        let prior = replace_own_provider_head_audit_authority(&fixture, 1, None);
+        let first_sequence = prior.accepted_generation() - 2;
+        replace_own_provider_head_audit_authority(
+            &fixture,
+            prior.accepted_generation(),
+            Some(first_sequence),
+        );
         let provider_manifest = fixture
             .request
             .provider_root
             .join(format!("outbox/manifests/{first_batch}.manifest"));
-        let (recovery_link, recovery_blob, ..) =
-            provider_manifest_recovery_paths(&fixture, first_batch);
-        fs::remove_file(&provider_manifest).unwrap();
-        fs::remove_file(&recovery_link).unwrap();
-        fs::remove_file(&recovery_blob).unwrap();
+        let manifest = OperationBatch::decode(&fs::read(&provider_manifest).unwrap()).unwrap();
+        let missing_object = manifest
+            .required_objects()
+            .first()
+            .expect("accepted fixture manifest has a required object")
+            .content_digest();
+        let provider_object = fixture
+            .request
+            .provider_root
+            .join(format!("outbox/objects/{missing_object}.object"));
+        fs::remove_file(&provider_object).unwrap();
 
         reset_provider_traversal_instrumentation(fixture.request.identities.workspace_id);
-        let reopened = active_handle(SyncRuntimeHandle::open(reopen_request(&fixture.request)));
-        settle_shared_provider_authority(&reopened);
         fail_once_at_provider_accepted_audit_cut(
             fixture.request.identities.workspace_id,
             first_batch,
             ProviderAcceptedAuditTestCut::RepairPublication,
         );
+        let reopened = active_handle(SyncRuntimeHandle::open(reopen_request(&fixture.request)));
 
         tick_until_provider_audit_cut(&reopened, "repair_publication");
         assert!(
@@ -20309,14 +20327,14 @@ mod tests {
             "repair publication failure discarded accepted-audit work"
         );
         assert!(
-            !provider_manifest.exists(),
-            "the pre-publication cut unexpectedly repaired the canonical manifest"
+            !provider_object.exists(),
+            "the pre-publication cut unexpectedly repaired the required object"
         );
 
         settle_shared_provider_authority(&reopened);
         assert!(
-            provider_manifest.is_file() && recovery_link.is_file() && recovery_blob.is_file(),
-            "same-actor retry did not durably repair accepted non-tip authority"
+            provider_manifest.is_file() && provider_object.is_file(),
+            "same-actor retry did not durably repair accepted non-tip object authority"
         );
         let traversal = provider_traversal_instrumentation(fixture.request.identities.workspace_id);
         assert_eq!(traversal.full_scan_entries, 0, "{traversal:?}");
