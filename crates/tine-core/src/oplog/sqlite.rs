@@ -44,10 +44,11 @@ use cap_std::fs::MetadataExt as CapMetadataExt;
 use cap_std::fs::OpenOptions as CapOpenOptions;
 use cap_std::{ambient_authority, fs::Dir as CapDir};
 use fs2::FileExt as _;
-use rusqlite::{
-    params, Connection, OpenFlags, OptionalExtension as _, Transaction, TransactionBehavior,
-};
+#[cfg(test)]
+use rusqlite::TransactionBehavior;
+use rusqlite::{params, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
+use tine_storage::sqlite_frontier as storage_frontier;
 use uuid::Uuid;
 
 use super::hot_engine::{AcceptedFrontierRoot, EngineAuthority};
@@ -64,222 +65,11 @@ use super::{
     OBJECT_ENVELOPE_SCHEMA_VERSION, OPERATION_SCHEMA_VERSION, OPLOG_PROTOCOL_VERSION,
 };
 
-pub const SQLITE_APPLICATION_ID: u32 = 0x5449_4e45;
-pub const SQLITE_SCHEMA_VERSION: u32 = 11;
+pub const SQLITE_APPLICATION_ID: u32 = storage_frontier::SQLITE_APPLICATION_ID;
+pub const SQLITE_SCHEMA_VERSION: u32 = storage_frontier::SQLITE_SCHEMA_VERSION;
 pub const TAIL_MAX_BYTES: usize = 16 * 1024 * 1024;
 pub const TAIL_MAX_BATCHES: usize = 10_000;
 
-const EXPECTED_TABLES: [&str; 27] = [
-    "accepted_batch_nodes",
-    "applied_batches",
-    "blocks",
-    "causal_clock_nodes",
-    "frontier",
-    "frontier_documents",
-    "materialization_batches",
-    "materialization_stamp",
-    "meta",
-    "pages",
-    "properties",
-    "reference_alias_bindings",
-    "reference_alias_declarations",
-    "reference_name_bindings",
-    "reference_postings",
-    "reference_source_coverage",
-    "reference_uuid_bindings",
-    "refs",
-    "search_fts",
-    "search_fts_config",
-    "search_fts_content",
-    "search_fts_data",
-    "search_fts_docsize",
-    "search_fts_idx",
-    "search_fts_owners",
-    "tags",
-    "tasks",
-];
-const EXPECTED_INDEXES: [&str; 26] = [
-    "applied_batches_acceptance_sequence_uq",
-    "applied_batches_batch_id_uq",
-    "blocks_page_order_idx",
-    "pages_name_idx",
-    "pages_name_key_idx",
-    "pages_path_idx",
-    "properties_lookup_idx",
-    "properties_page_idx",
-    "reference_alias_bindings_normalized_alias_idx",
-    "reference_alias_declarations_source_idx",
-    "reference_name_bindings_raw_name_idx",
-    "reference_name_bindings_resolved_page_idx",
-    "reference_postings_normalized_name_idx",
-    "reference_postings_raw_uuid_idx",
-    "reference_postings_source_idx",
-    "reference_source_coverage_source_idx",
-    "reference_uuid_bindings_raw_uuid_idx",
-    "reference_uuid_bindings_resolved_block_idx",
-    "references_source_idx",
-    "references_target_idx",
-    "search_fts_owners_page_idx",
-    "tags_lookup_idx",
-    "tags_page_idx",
-    "tasks_deadline_idx",
-    "tasks_marker_idx",
-    "tasks_page_idx",
-];
-const META_DDL: &str = "CREATE TABLE meta (
-    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    workspace_id BLOB NOT NULL CHECK (length(workspace_id) = 16),
-    lineage_digest BLOB NOT NULL CHECK (length(lineage_digest) = 32),
-    oplog_protocol_version INTEGER NOT NULL,
-    operation_schema_version INTEGER NOT NULL,
-    object_envelope_schema_version INTEGER NOT NULL,
-    manifest_encoding_version INTEGER NOT NULL,
-    managed_entity_set_version INTEGER NOT NULL
-) STRICT";
-const FRONTIER_DDL: &str = "CREATE TABLE frontier (
-    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    frontier_root BLOB NOT NULL,
-    frontier_root_digest BLOB NOT NULL CHECK (length(frontier_root_digest) = 32),
-    applied_batch_count INTEGER NOT NULL CHECK (applied_batch_count >= 0)
-) STRICT";
-const FRONTIER_DOCUMENTS_DDL: &str = "CREATE TABLE frontier_documents (
-    document_id BLOB PRIMARY KEY CHECK (length(document_id) = 16),
-    dependencies BLOB NOT NULL,
-    dependencies_digest BLOB NOT NULL CHECK (length(dependencies_digest) = 32),
-    left_document_id BLOB,
-    left_digest BLOB,
-    right_document_id BLOB,
-    right_digest BLOB,
-    node_digest BLOB NOT NULL CHECK (length(node_digest) = 32),
-    CHECK ((left_document_id IS NULL AND left_digest IS NULL)
-        OR (length(left_document_id) = 16 AND length(left_digest) = 32)),
-    CHECK ((right_document_id IS NULL AND right_digest IS NULL)
-        OR (length(right_document_id) = 16 AND length(right_digest) = 32))
-) STRICT";
-const CAUSAL_CLOCK_NODES_DDL: &str = "CREATE TABLE causal_clock_nodes (
-    node_digest BLOB PRIMARY KEY CHECK (length(node_digest) = 32),
-    peer_id BLOB NOT NULL CHECK (length(peer_id) = 16),
-    counter INTEGER NOT NULL CHECK (counter > 0),
-    value_digest BLOB NOT NULL CHECK (length(value_digest) = 32),
-    left_peer_id BLOB,
-    left_digest BLOB,
-    right_peer_id BLOB,
-    right_digest BLOB,
-    CHECK ((left_peer_id IS NULL AND left_digest IS NULL)
-        OR (length(left_peer_id) = 16 AND length(left_digest) = 32)),
-    CHECK ((right_peer_id IS NULL AND right_digest IS NULL)
-        OR (length(right_peer_id) = 16 AND length(right_digest) = 32))
-) STRICT";
-const ACCEPTED_BATCH_NODES_DDL: &str = "CREATE TABLE accepted_batch_nodes (
-    node_digest BLOB PRIMARY KEY CHECK (length(node_digest) = 32),
-    batch_id BLOB NOT NULL CHECK (length(batch_id) = 16),
-    value_digest BLOB NOT NULL CHECK (length(value_digest) = 32),
-    left_batch_id BLOB,
-    left_digest BLOB,
-    right_batch_id BLOB,
-    right_digest BLOB,
-    CHECK ((left_batch_id IS NULL AND left_digest IS NULL)
-        OR (length(left_batch_id) = 16 AND length(left_digest) = 32)),
-    CHECK ((right_batch_id IS NULL AND right_digest IS NULL)
-        OR (length(right_batch_id) = 16 AND length(right_digest) = 32))
-) STRICT";
-const APPLIED_BATCHES_DDL: &str = "CREATE TABLE applied_batches (
-    sequence INTEGER PRIMARY KEY CHECK (sequence > 0),
-    batch_id BLOB NOT NULL CHECK (length(batch_id) = 16),
-    manifest_digest BLOB NOT NULL CHECK (length(manifest_digest) = 32),
-    semantic_effect BLOB NOT NULL,
-    semantic_effect_digest BLOB NOT NULL CHECK (length(semantic_effect_digest) = 32),
-    dependency_frontier BLOB NOT NULL,
-    dependency_frontier_digest BLOB NOT NULL
-        CHECK (length(dependency_frontier_digest) = 32),
-    prior_frontier_root BLOB NOT NULL,
-    prior_frontier_root_digest BLOB NOT NULL
-        CHECK (length(prior_frontier_root_digest) = 32),
-    post_frontier_root BLOB NOT NULL,
-    post_frontier_root_digest BLOB NOT NULL
-        CHECK (length(post_frontier_root_digest) = 32),
-    affected_documents BLOB NOT NULL,
-    affected_documents_digest BLOB NOT NULL
-        CHECK (length(affected_documents_digest) = 32),
-    causal_dependency_heads BLOB NOT NULL,
-    causal_peer_id BLOB NOT NULL CHECK (length(causal_peer_id) = 16),
-    causal_counter INTEGER NOT NULL CHECK (causal_counter > 0),
-    causal_clock_root_key BLOB NOT NULL CHECK (length(causal_clock_root_key) = 16),
-    causal_clock_root_digest BLOB NOT NULL CHECK (length(causal_clock_root_digest) = 32),
-    acceptance_sequence INTEGER NOT NULL CHECK (acceptance_sequence > 0),
-    retained_bytes INTEGER NOT NULL CHECK (retained_bytes >= 0)
-) STRICT";
-const BATCH_ID_INDEX_DDL: &str =
-    "CREATE UNIQUE INDEX applied_batches_batch_id_uq ON applied_batches(batch_id)";
-const ACCEPTANCE_SEQUENCE_INDEX_DDL: &str = "CREATE UNIQUE INDEX \
-    applied_batches_acceptance_sequence_uq ON applied_batches(acceptance_sequence)";
-const META_COLUMNS: [&str; 8] = [
-    "singleton",
-    "workspace_id",
-    "lineage_digest",
-    "oplog_protocol_version",
-    "operation_schema_version",
-    "object_envelope_schema_version",
-    "manifest_encoding_version",
-    "managed_entity_set_version",
-];
-const FRONTIER_COLUMNS: [&str; 4] = [
-    "singleton",
-    "frontier_root",
-    "frontier_root_digest",
-    "applied_batch_count",
-];
-const FRONTIER_DOCUMENT_COLUMNS: [&str; 8] = [
-    "document_id",
-    "dependencies",
-    "dependencies_digest",
-    "left_document_id",
-    "left_digest",
-    "right_document_id",
-    "right_digest",
-    "node_digest",
-];
-const CAUSAL_CLOCK_NODE_COLUMNS: [&str; 8] = [
-    "node_digest",
-    "peer_id",
-    "counter",
-    "value_digest",
-    "left_peer_id",
-    "left_digest",
-    "right_peer_id",
-    "right_digest",
-];
-const ACCEPTED_BATCH_NODE_COLUMNS: [&str; 7] = [
-    "node_digest",
-    "batch_id",
-    "value_digest",
-    "left_batch_id",
-    "left_digest",
-    "right_batch_id",
-    "right_digest",
-];
-const APPLIED_BATCH_COLUMNS: [&str; 20] = [
-    "sequence",
-    "batch_id",
-    "manifest_digest",
-    "semantic_effect",
-    "semantic_effect_digest",
-    "dependency_frontier",
-    "dependency_frontier_digest",
-    "prior_frontier_root",
-    "prior_frontier_root_digest",
-    "post_frontier_root",
-    "post_frontier_root_digest",
-    "affected_documents",
-    "affected_documents_digest",
-    "causal_dependency_heads",
-    "causal_peer_id",
-    "causal_counter",
-    "causal_clock_root_key",
-    "causal_clock_root_digest",
-    "acceptance_sequence",
-    "retained_bytes",
-];
 const FORENSIC_SUFFIXES: [&str; 4] = ["", "-wal", "-shm", "-auth"];
 const FORENSIC_NAMES: [&str; 4] = ["database", "wal", "shm", "auth"];
 const PROJECTION_CHECKPOINT_SCHEMA_VERSION: u32 = 2;
@@ -292,7 +82,6 @@ const PROJECTION_INTERIOR_SAMPLE_RANGE_BYTES: usize = 16 * 1024;
 const PROJECTION_INTERIOR_SAMPLE_MAX_RANGES: usize =
     PROJECTION_INTERIOR_SAMPLE_BYTES / PROJECTION_INTERIOR_SAMPLE_RANGE_BYTES;
 const MAX_PROJECTION_CHECKPOINT_BYTES: u64 = 64 * 1024;
-const MAX_AUTHENTICATED_MAP_DEPTH: usize = 256;
 const OBJECT_STORE_LEASE_NAMESPACE: &str = ".tine-runtime";
 const SQLITE_WORKSPACE_LEASE_NAMESPACE: &str = "sqlite-workspaces";
 const SQLITE_APPLIER_LEASE_FILE: &str = "sqlite-applier.lock";
@@ -680,6 +469,81 @@ impl AcceptedBatchEvent {
     pub const fn retained_bytes(&self) -> usize {
         self.retained_bytes
     }
+}
+
+fn lower_physical_claim(claim: ProjectionClaim) -> storage_frontier::PhysicalClaim {
+    storage_frontier::PhysicalClaim {
+        workspace_id: claim.workspace_id.as_uuid().into_bytes(),
+        lineage_digest: ContentDigest::from_bytes(*claim.lineage_digest.as_bytes()),
+        oplog_protocol_version: claim.oplog_protocol_version,
+        operation_schema_version: claim.operation_schema_version,
+        object_envelope_schema_version: claim.object_envelope_schema_version,
+        manifest_encoding_version: claim.manifest_encoding_version,
+        managed_entity_set_version: claim.managed_entity_set_version,
+    }
+}
+
+fn lower_physical_frontier_root(
+    root: &AcceptedFrontierRoot,
+) -> Result<storage_frontier::PhysicalFrontierRoot, ProjectionError> {
+    Ok(storage_frontier::PhysicalFrontierRoot {
+        canonical_bytes: canonical_frontier_root_bytes(root)?,
+        acceptance_sequence: root.acceptance_sequence(),
+        document_count: root.document_count(),
+        document_map_root_key: root.document_map_root_key(),
+        document_map_root_digest: root.document_map_root_digest(),
+        batch_map_root_key: root.batch_map_root_key(),
+        batch_map_root_digest: root.batch_map_root_digest(),
+        state_digest: root.state_digest(),
+    })
+}
+
+fn lower_physical_accepted_batch(
+    event: &AcceptedBatchEvent,
+) -> Result<storage_frontier::PhysicalAcceptedBatch, ProjectionError> {
+    let prior_frontier_root = lower_physical_frontier_root(&event.prior_frontier_root)?;
+    let post_frontier_root = lower_physical_frontier_root(&event.post_frontier_root)?;
+    let affected_documents_bytes = canonical_affected_documents_bytes(&event.affected_documents)?;
+    let causal_dependency_heads_bytes = encode_batch_ids(&event.causal_dependency_heads)?;
+    let causal_peer_id = event
+        .causal_dot
+        .peer_id()
+        .as_device_id()
+        .as_uuid()
+        .into_bytes();
+    Ok(storage_frontier::PhysicalAcceptedBatch {
+        batch_id: event.batch_id.as_uuid().into_bytes(),
+        manifest_digest: event.manifest_digest,
+        event_binding_digest: event.event_binding_digest,
+        semantic_effect: event.semantic_effect.clone(),
+        semantic_effect_digest: ContentDigest::from_bytes(*event.semantic_effect_digest.as_bytes()),
+        dependency_frontier: canonical_frontier_bytes(&event.dependency_frontier)?,
+        prior_frontier_root,
+        post_frontier_root,
+        affected_documents: event
+            .affected_documents
+            .iter()
+            .map(|document| {
+                Ok(storage_frontier::PhysicalFrontierDocument {
+                    document_id: document.document_id().as_uuid().into_bytes(),
+                    canonical_bytes: encode_frontier_document(document)?,
+                })
+            })
+            .collect::<Result<_, ProjectionError>>()?,
+        affected_documents_bytes,
+        causal_dependency_heads: event
+            .causal_dependency_heads
+            .iter()
+            .map(|batch_id| batch_id.as_uuid().into_bytes())
+            .collect(),
+        causal_dependency_heads_bytes,
+        causal_peer_id,
+        causal_counter: event.causal_dot.counter(),
+        acceptance_sequence: event.acceptance_sequence,
+        retained_bytes: u64::try_from(event.retained_bytes).map_err(|_| {
+            ProjectionError::InvalidAcceptedEvent("accepted retained bytes exceed u64".into())
+        })?,
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3180,15 +3044,12 @@ impl SqliteFrontier {
     ) -> Result<(), ProjectionError> {
         self.validate_event_claim(event)?;
         if let Some(existing) = load_batch(&self.connection, event.batch_id)? {
-            let mut rows_read = 0;
-            if authenticated_batch_record(
+            if !storage_frontier::authenticate_batch(
                 &self.connection,
-                current_root,
-                event.batch_id,
-                &mut rows_read,
-            )?
-            .is_none()
-            {
+                &lower_physical_frontier_root(current_root)?,
+                event.batch_id.as_uuid().into_bytes(),
+                existing.causal_record_digest()?,
+            )? {
                 return Err(ProjectionError::Corrupt(format!(
                     "stored batch {} is absent from the authenticated accepted map",
                     event.batch_id
@@ -3250,18 +3111,10 @@ impl SqliteFrontier {
     /// lifetime-history scan.
     pub fn diagnose_full_integrity(&self) -> Result<(), ProjectionError> {
         validate_integrity(&self.connection)?;
-        let applied_rows: i64 =
-            self.connection
-                .query_row("SELECT COUNT(*) FROM applied_batches", [], |row| row.get(0))?;
-        let document_rows: i64 =
-            self.connection
-                .query_row("SELECT COUNT(*) FROM frontier_documents", [], |row| {
-                    row.get(0)
-                })?;
+        let (applied_rows, document_rows) =
+            storage_frontier::diagnostic_row_counts(&self.connection)?;
         let root = read_frontier_root(&self.connection)?;
-        if u64::try_from(applied_rows).ok() != Some(root.acceptance_sequence())
-            || u64::try_from(document_rows).ok() != Some(root.document_count())
-        {
+        if applied_rows != root.acceptance_sequence() || document_rows != root.document_count() {
             return Err(ProjectionError::Corrupt(
                 "SQLite diagnostic row counts differ from the authenticated frontier".into(),
             ));
@@ -3278,8 +3131,12 @@ impl SqliteFrontier {
 
     pub fn contains_batch(&self, batch_id: BatchId) -> Result<bool, ProjectionError> {
         let root = read_frontier_root(&self.connection)?;
-        authenticated_batch_record(&self.connection, &root, batch_id, &mut 0)
-            .map(|record| record.is_some())
+        storage_frontier::contains_batch(
+            &self.connection,
+            &lower_physical_frontier_root(&root)?,
+            batch_id.as_uuid().into_bytes(),
+        )
+        .map_err(Into::into)
     }
 
     #[cfg(test)]
@@ -3579,24 +3436,7 @@ impl SqliteFrontier {
     }
 
     pub fn semantic_projection_digest(&self) -> Result<ContentDigest, ProjectionError> {
-        let mut statement = self.connection.prepare(
-            "SELECT batch_id, manifest_digest, semantic_effect, semantic_effect_digest,
-                    dependency_frontier
-             FROM applied_batches ORDER BY batch_id",
-        )?;
-        let mut rows = statement.query([])?;
-        let mut bytes = b"tine/sqlite-frontier/semantic-projection/v1\0".to_vec();
-        while let Some(row) = rows.next()? {
-            for index in 0..5 {
-                let value: Vec<u8> = row.get(index)?;
-                bytes.extend_from_slice(&(value.len() as u64).to_be_bytes());
-                bytes.extend_from_slice(&value);
-            }
-        }
-        let root = canonical_frontier_root_bytes(&read_frontier_root(&self.connection)?)?;
-        bytes.extend_from_slice(&(root.len() as u64).to_be_bytes());
-        bytes.extend_from_slice(&root);
-        Ok(ContentDigest::of(&bytes))
+        storage_frontier::semantic_projection_digest(&self.connection).map_err(Into::into)
     }
 
     /// Exact materialized-row observation for the deterministic simulator.
@@ -3616,19 +3456,13 @@ impl SqliteFrontier {
     pub(crate) fn applied_semantic_effects_for_test(
         &self,
     ) -> Result<Vec<SemanticEffect>, ProjectionError> {
-        let mut statement = self
-            .connection
-            .prepare("SELECT semantic_effect FROM applied_batches ORDER BY sequence")?;
-        let mut rows = statement.query([])?;
-        let mut effects = Vec::new();
-        while let Some(row) = rows.next()? {
-            let bytes: Vec<u8> = row.get(0)?;
-            effects.push(
+        storage_frontier::stored_semantic_effects(&self.connection)?
+            .into_iter()
+            .map(|bytes| {
                 SemanticEffect::decode(&bytes)
-                    .map_err(|error| ProjectionError::Corrupt(error.to_string()))?,
-            );
-        }
-        Ok(effects)
+                    .map_err(|error| ProjectionError::Corrupt(error.to_string()))
+            })
+            .collect()
     }
 
     fn rebuild_stream(
@@ -3768,269 +3602,144 @@ impl SqliteFrontier {
             .map(|change| change.validate_for_event(event))
             .transpose()?;
         let current_root = read_frontier_root(&self.connection)?;
-        if let Some(existing) = load_batch(&self.connection, event.batch_id)? {
-            let mut rows_read = 0;
-            if authenticated_batch_record(
-                &self.connection,
-                &current_root,
-                event.batch_id,
-                &mut rows_read,
-            )?
-            .is_none()
-            {
-                return Err(ProjectionError::Corrupt(format!(
-                    "stored batch {} is absent from the authenticated accepted map",
-                    event.batch_id
-                )));
+        let current_physical = lower_physical_frontier_root(&current_root)?;
+        let batch = lower_physical_accepted_batch(event)?;
+        let (physical_materialization, authenticated_reference) = match materialization {
+            Some(change) => {
+                let authenticated = change
+                    .reference_catalog()
+                    .is_some()
+                    .then(|| authenticated_reference_materialization(event))
+                    .transpose()?;
+                let (physical, authenticated) =
+                    super::sqlite_materialization::lower_validated_change(
+                        change,
+                        event.semantic_effect(),
+                        authenticated.as_ref(),
+                    )?;
+                (Some(physical), authenticated)
             }
-            if existing.matches(event)? {
-                if current_root.acceptance_sequence() >= event.acceptance_sequence
-                    && current_root.state_digest() != event.prior_frontier_root.state_digest()
-                {
-                    if let Some(input_digest) = materialization_digest {
-                        let post_root = canonical_frontier_root_bytes(&event.post_frontier_root)?;
-                        super::sqlite_materialization::ensure_stamp(
-                            &self.connection,
-                            event.acceptance_sequence,
-                            ContentDigest::of(&post_root),
-                        )?;
-                        match super::sqlite_materialization::recorded_digest(
-                            &self.connection,
-                            event.acceptance_sequence,
-                        )? {
-                            Some(found) if found == input_digest => {}
-                            Some(_) | None => {
-                                return Err(super::MaterializationError::DuplicateCollision(
-                                    event.batch_id,
-                                )
-                                .into());
-                            }
-                        }
-                    }
-                    return Ok((
-                        ApplyDisposition::Duplicate,
-                        super::sqlite_materialization::ApplyChangeInstrumentation::default(),
-                    ));
+            None => (None, None),
+        };
+        let mut request = storage_frontier::PhysicalApplyRequest {
+            batch,
+            materialization: physical_materialization,
+            materialization_input_digest: materialization_digest,
+            authenticated_reference,
+            prior_reference_coverage_count: self.fresh_reference_coverage_count,
+            fault: storage_frontier::ApplyFault::None,
+        };
+        let preflight =
+            match storage_frontier::preflight(&self.connection, &current_physical, &request) {
+                Ok(disposition) => disposition,
+                Err(storage_frontier::FrontierError::BatchCollision(_)) => {
+                    let existing =
+                        load_batch(&self.connection, event.batch_id)?.ok_or_else(|| {
+                            ProjectionError::Corrupt(format!(
+                                "colliding batch {} disappeared during physical preflight",
+                                event.batch_id
+                            ))
+                        })?;
+                    let _ = existing.matches(event)?;
+                    return Err(ProjectionError::BatchCollision(event.batch_id));
                 }
-                return Err(ProjectionError::FrontierRegression);
-            }
-            return Err(ProjectionError::BatchCollision(event.batch_id));
-        }
-
-        for dependency in &event.causal_dependency_heads {
-            let mut rows_read = 0;
-            if authenticated_batch_record(
-                &self.connection,
-                &current_root,
-                *dependency,
-                &mut rows_read,
-            )?
-            .is_none()
-            {
-                return Err(ProjectionError::MissingDependency(*dependency));
-            }
-        }
-        let expected_acceptance_sequence = current_root
-            .acceptance_sequence()
-            .checked_add(1)
-            .ok_or_else(|| ProjectionError::Corrupt("applied batch sequence overflowed".into()))?;
-        if event.acceptance_sequence != expected_acceptance_sequence {
-            return Err(ProjectionError::AcceptanceOrder {
-                expected: expected_acceptance_sequence,
-                found: event.acceptance_sequence,
-            });
-        }
-        if current_root != event.prior_frontier_root
-            || event.post_frontier_root.acceptance_sequence() != event.acceptance_sequence
-        {
-            return Err(ProjectionError::FrontierRegression);
-        }
-        let binding = super::AcceptedBatchEvidence::binding_digest_for(
-            event.batch_id,
-            event.manifest_digest,
-            event.semantic_effect_digest,
-            &event.dependency_frontier,
-            &event.causal_dependency_heads,
-        )
-        .map_err(|error| ProjectionError::InvalidAcceptedEvent(error.to_string()))?;
-        if binding != event.event_binding_digest
-            || !current_root
-                .validates_transition(
-                    binding,
-                    event.acceptance_sequence,
-                    event.post_frontier_root.document_count(),
-                    u64::try_from(event.retained_bytes).map_err(|_| {
-                        ProjectionError::InvalidAcceptedEvent(
-                            "accepted retained bytes exceed u64".into(),
-                        )
-                    })?,
-                    &event.affected_documents,
-                    &event.post_frontier_root,
-                )
-                .map_err(|error| ProjectionError::InvalidAcceptedEvent(error.to_string()))?
-        {
-            return Err(ProjectionError::InvalidAcceptedEvent(
-                "accepted event is not bound to its authenticated frontier transition".into(),
-            ));
-        }
-        for document in &event.affected_documents {
-            let _ = authenticated_frontier_document(
-                &self.connection,
-                &current_root,
-                document.document_id(),
-            )?;
-            if !document.direct_dependency_heads().contains(&event.batch_id) {
-                return Err(ProjectionError::InvalidAcceptedEvent(format!(
-                    "affected document {} does not name accepted batch {} as a direct head",
-                    document.document_id(),
-                    event.batch_id
-                )));
-            }
-        }
-        let dependency_frontier = canonical_frontier_bytes(&event.dependency_frontier)?;
-        let prior_frontier_root = canonical_frontier_root_bytes(&event.prior_frontier_root)?;
-        let post_frontier_root = canonical_frontier_root_bytes(&event.post_frontier_root)?;
-        if materialization.is_some() {
-            super::sqlite_materialization::ensure_stamp(
-                &self.connection,
-                current_root.acceptance_sequence(),
-                ContentDigest::of(&prior_frontier_root),
-            )?;
-        }
-        let affected_documents = canonical_affected_documents_bytes(&event.affected_documents)?;
-        let causal_dependencies = encode_batch_ids(&event.causal_dependency_heads)?;
-        let retained_bytes = i64::try_from(event.retained_bytes).map_err(|_| {
-            ProjectionError::InvalidAcceptedEvent("retained-byte count exceeds SQLite".into())
-        })?;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let causal_clock_root = derive_causal_clock_root(&transaction, &current_root, event)?;
-        let causal_record_digest = super::hot_engine::accepted_causal_record_digest(
-            event.batch_id,
-            event.manifest_digest,
-            event.event_binding_digest,
-            event.causal_dot,
-            Some(causal_clock_root.key),
-            causal_clock_root.digest,
-        );
-        let prior_batch_map_root = current_root.batch_map_root_key().map(|key| MapLink {
-            key,
-            digest: current_root.batch_map_root_digest(),
-        });
-        let post_batch_map_root = upsert_accepted_batch_map(
-            &transaction,
-            prior_batch_map_root,
-            event.batch_id,
-            causal_record_digest,
-        )?;
-        if event.post_frontier_root.batch_map_root_key() != Some(post_batch_map_root.key)
-            || event.post_frontier_root.batch_map_root_digest() != post_batch_map_root.digest
-        {
-            return Err(ProjectionError::FrontierRegression);
-        }
-        insert_event(
-            &transaction,
-            usize::try_from(expected_acceptance_sequence)
-                .map_err(|_| ProjectionError::Corrupt("applied sequence exceeds usize".into()))?,
-            event,
-            &dependency_frontier,
-            &prior_frontier_root,
-            &post_frontier_root,
-            &affected_documents,
-            &causal_dependencies,
-            &causal_clock_root,
-            retained_bytes,
-        )?;
-        #[cfg(test)]
-        if matches!(fault, ApplyFault::ReturnAfterInsert) {
-            return Err(ProjectionError::InjectedFailure);
-        }
-        #[cfg(test)]
-        if matches!(fault, ApplyFault::AbortAfterInsert) {
-            std::process::abort();
-        }
-        let mut map_root_key = current_root.document_map_root_key();
-        let mut map_root_digest = current_root.document_map_root_digest();
-        let mut new_documents = 0_u64;
-        for document in &event.affected_documents {
-            let (root, inserted) =
-                upsert_frontier_map(&transaction, map_root_key, map_root_digest, document)?;
-            map_root_key = Some(root.document_id.as_uuid().into_bytes());
-            map_root_digest = root.digest;
-            new_documents = new_documents.saturating_add(u64::from(inserted));
-        }
-        if event.post_frontier_root.document_count()
-            != current_root.document_count().saturating_add(new_documents)
-            || event.post_frontier_root.document_map_root_key() != map_root_key
-            || event.post_frontier_root.document_map_root_digest() != map_root_digest
-        {
-            return Err(ProjectionError::FrontierRegression);
-        }
-        let mut apply_stats = super::sqlite_materialization::ApplyChangeInstrumentation::default();
-        if let (Some(materialization), Some(input_digest)) =
-            (materialization, materialization_digest)
-        {
-            let authenticated_reference = materialization
-                .reference_catalog()
-                .is_some()
-                .then(|| authenticated_reference_materialization(event))
-                .transpose()?;
-            apply_stats = match self.fresh_reference_coverage_count {
-                Some(prior_count) => super::sqlite_materialization::apply_change_fresh_bootstrap(
-                    &transaction,
-                    materialization,
-                    event.semantic_effect(),
-                    event.acceptance_sequence,
-                    input_digest,
-                    ContentDigest::of(&post_frontier_root),
-                    authenticated_reference.as_ref(),
-                    prior_count,
-                )?,
-                None => super::sqlite_materialization::apply_change(
-                    &transaction,
-                    materialization,
-                    event.semantic_effect(),
-                    event.acceptance_sequence,
-                    input_digest,
-                    ContentDigest::of(&post_frontier_root),
-                    authenticated_reference.as_ref(),
-                )?,
+                Err(error) => return Err(error.into()),
             };
+        if matches!(preflight, storage_frontier::PreflightDisposition::Duplicate) {
+            let existing = load_batch(&self.connection, event.batch_id)?.ok_or_else(|| {
+                ProjectionError::Corrupt(format!(
+                    "duplicate batch {} disappeared during physical preflight",
+                    event.batch_id
+                ))
+            })?;
+            if !existing.matches(event)? {
+                return Err(ProjectionError::BatchCollision(event.batch_id));
+            }
         }
-        fail_during_apply_for_harness()?;
-        #[cfg(test)]
-        if matches!(fault, ApplyFault::ReturnAfterMaterialization) {
-            return Err(ProjectionError::InjectedFailure);
+        if matches!(preflight, storage_frontier::PreflightDisposition::New) {
+            let binding = super::AcceptedBatchEvidence::binding_digest_for(
+                event.batch_id,
+                event.manifest_digest,
+                event.semantic_effect_digest,
+                &event.dependency_frontier,
+                &event.causal_dependency_heads,
+            )
+            .map_err(|error| ProjectionError::InvalidAcceptedEvent(error.to_string()))?;
+            if binding != event.event_binding_digest
+                || !current_root
+                    .validates_transition(
+                        binding,
+                        event.acceptance_sequence,
+                        event.post_frontier_root.document_count(),
+                        u64::try_from(event.retained_bytes).map_err(|_| {
+                            ProjectionError::InvalidAcceptedEvent(
+                                "accepted retained bytes exceed u64".into(),
+                            )
+                        })?,
+                        &event.affected_documents,
+                        &event.post_frontier_root,
+                    )
+                    .map_err(|error| ProjectionError::InvalidAcceptedEvent(error.to_string()))?
+            {
+                return Err(ProjectionError::InvalidAcceptedEvent(
+                    "accepted event is not bound to its authenticated frontier transition".into(),
+                ));
+            }
+            for document in &event.affected_documents {
+                let _ = storage_frontier::frontier_document(
+                    &self.connection,
+                    &current_physical,
+                    document.document_id().as_uuid().into_bytes(),
+                )?;
+                if !document.direct_dependency_heads().contains(&event.batch_id) {
+                    return Err(ProjectionError::InvalidAcceptedEvent(format!(
+                        "affected document {} does not name accepted batch {} as a direct head",
+                        document.document_id(),
+                        event.batch_id
+                    )));
+                }
+            }
+            #[cfg(test)]
+            {
+                request.fault = match fault {
+                    ApplyFault::ReturnAfterInsert => {
+                        storage_frontier::ApplyFault::ReturnAfterInsert
+                    }
+                    ApplyFault::ReturnAfterMaterialization => {
+                        storage_frontier::ApplyFault::ReturnAfterMaterialization
+                    }
+                    ApplyFault::AbortAfterInsert => storage_frontier::ApplyFault::AbortAfterInsert,
+                    _ if fail_during_apply_for_harness().is_err() => {
+                        storage_frontier::ApplyFault::ReturnAfterMaterialization
+                    }
+                    _ => storage_frontier::ApplyFault::None,
+                };
+            }
+            #[cfg(not(test))]
+            if fail_during_apply_for_harness().is_err() {
+                request.fault = storage_frontier::ApplyFault::ReturnAfterMaterialization;
+            }
         }
-        transaction.execute(
-            "UPDATE frontier
-             SET frontier_root = ?1,
-                 frontier_root_digest = ?2,
-                 applied_batch_count = ?3
-             WHERE singleton = 1",
-            params![
-                post_frontier_root,
-                ContentDigest::of(&post_frontier_root).as_bytes().as_slice(),
-                i64::try_from(expected_acceptance_sequence).map_err(|_| {
-                    ProjectionError::Corrupt("applied batch sequence exceeds SQLite".into())
-                })?
-            ],
-        )?;
-        transaction.commit()?;
+        let result = storage_frontier::apply(&mut self.connection, &current_physical, &request)?;
         if self.fresh_reference_coverage_count.is_some() {
-            if let Some(next_count) = apply_stats.reference_coverage_count {
+            if let Some(next_count) = result.materialization.reference_coverage_count {
                 self.fresh_reference_coverage_count = Some(next_count);
             }
         }
-        if self.checkpoint_each_apply {
+        let disposition = match result.disposition {
+            storage_frontier::ApplyDisposition::Applied => ApplyDisposition::Applied,
+            storage_frontier::ApplyDisposition::Duplicate => ApplyDisposition::Duplicate,
+        };
+        if matches!(disposition, ApplyDisposition::Applied) && self.checkpoint_each_apply {
             write_projection_checkpoint(&self.path, self.claim, &event.post_frontier_root)?;
         }
         #[cfg(test)]
-        if matches!(fault, ApplyFault::AbortAfterCommit) {
+        if matches!(fault, ApplyFault::AbortAfterCommit)
+            && matches!(disposition, ApplyDisposition::Applied)
+        {
             std::process::abort();
         }
-        Ok((ApplyDisposition::Applied, apply_stats))
+        return Ok((disposition, result.materialization));
     }
 
     fn validate_event_claim(&self, event: &AcceptedBatchEvent) -> Result<(), ProjectionError> {
@@ -4059,66 +3768,6 @@ impl Drop for SqliteFrontier {
             let _ = write_projection_checkpoint(&self.path, self.claim, &root);
         }
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn insert_event(
-    transaction: &Transaction<'_>,
-    sequence: usize,
-    event: &AcceptedBatchEvent,
-    dependency_frontier: &[u8],
-    prior_frontier_root: &[u8],
-    post_frontier_root: &[u8],
-    affected_documents: &[u8],
-    causal_dependencies: &[u8],
-    causal_clock_root: &MapLink,
-    retained_bytes: i64,
-) -> Result<(), ProjectionError> {
-    transaction.execute(
-        "INSERT INTO applied_batches (
-             sequence, batch_id, manifest_digest, semantic_effect,
-             semantic_effect_digest, dependency_frontier,
-             dependency_frontier_digest, prior_frontier_root,
-             prior_frontier_root_digest, post_frontier_root,
-             post_frontier_root_digest, affected_documents,
-             affected_documents_digest, causal_dependency_heads,
-             causal_peer_id, causal_counter, causal_clock_root_key,
-             causal_clock_root_digest,
-             acceptance_sequence, retained_bytes
-         ) VALUES (
-             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
-             ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-             ?17, ?18, ?19, ?20
-         )",
-        params![
-            i64::try_from(sequence)
-                .map_err(|_| ProjectionError::Corrupt("batch sequence exceeds SQLite".into()))?,
-            uuid_blob(&event.batch_id.as_uuid()),
-            event.manifest_digest.as_bytes().as_slice(),
-            &event.semantic_effect,
-            event.semantic_effect_digest.as_bytes().as_slice(),
-            dependency_frontier,
-            ContentDigest::of(dependency_frontier).as_bytes().as_slice(),
-            prior_frontier_root,
-            ContentDigest::of(prior_frontier_root).as_bytes().as_slice(),
-            post_frontier_root,
-            ContentDigest::of(post_frontier_root).as_bytes().as_slice(),
-            affected_documents,
-            ContentDigest::of(affected_documents).as_bytes().as_slice(),
-            causal_dependencies,
-            uuid_blob(&event.causal_dot.peer_id().as_device_id().as_uuid()),
-            i64::try_from(event.causal_dot.counter()).map_err(|_| {
-                ProjectionError::InvalidAcceptedEvent("causal counter exceeds SQLite".into())
-            })?,
-            causal_clock_root.key.as_slice(),
-            causal_clock_root.digest.as_bytes().as_slice(),
-            i64::try_from(event.acceptance_sequence).map_err(|_| {
-                ProjectionError::InvalidAcceptedEvent("acceptance sequence exceeds SQLite".into())
-            })?,
-            retained_bytes,
-        ],
-    )?;
-    Ok(())
 }
 
 fn validate_source(
@@ -4178,24 +3827,19 @@ fn validate_existing(
     if found_frontier != source.exact_frontier_root {
         return Err("SQLite frontier is stale".into());
     }
-    let count: i64 = connection
-        .query_row(
-            "SELECT applied_batch_count FROM frontier WHERE singleton = 1",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|error| error.to_string())?;
+    let count = storage_frontier::read_frontier(&connection)
+        .map_err(|error| error.to_string())?
+        .applied_batch_count;
     let expected_count = i64::try_from(source.accepted_batch_count)
         .map_err(|_| "accepted batch count exceeds SQLite".to_string())?;
-    if count != expected_count {
+    if i64::try_from(count).ok() != Some(expected_count) {
         return Err("SQLite frontier batch count is stale".into());
     }
     if let Some(root_key) = found_frontier.document_map_root_key() {
-        let root_id = DocumentId::from_uuid(Uuid::from_bytes(root_key));
-        load_frontier_map_node(
+        storage_frontier::frontier_document(
             &connection,
-            root_id,
-            Some(found_frontier.document_map_root_digest()),
+            &lower_physical_frontier_root(&found_frontier).map_err(|error| error.to_string())?,
+            root_key,
         )
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "SQLite authenticated frontier root row is missing".to_string())?;
@@ -4217,6 +3861,18 @@ fn validate_existing(
             || final_root != found_frontier
         {
             return Err("SQLite final accepted row is not bound to the frontier root".into());
+        }
+        if !storage_frontier::authenticate_batch(
+            &connection,
+            &lower_physical_frontier_root(&found_frontier).map_err(|error| error.to_string())?,
+            final_record.batch_id.as_uuid().into_bytes(),
+            final_record
+                .causal_record_digest()
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?
+        {
+            return Err("SQLite final accepted row is absent from its authenticated map".into());
         }
     }
     let root_bytes =
@@ -4519,47 +4175,9 @@ fn initialize_schema(
     connection: &Connection,
     claim: ProjectionClaim,
 ) -> Result<(), ProjectionError> {
-    connection.execute_batch(&format!(
-        "PRAGMA application_id = {SQLITE_APPLICATION_ID};
-         PRAGMA user_version = {SQLITE_SCHEMA_VERSION};
-         {META_DDL};
-         {FRONTIER_DDL};
-         {FRONTIER_DOCUMENTS_DDL};
-         {CAUSAL_CLOCK_NODES_DDL};
-         {ACCEPTED_BATCH_NODES_DDL};
-         {APPLIED_BATCHES_DDL};
-         {BATCH_ID_INDEX_DDL};
-         {ACCEPTANCE_SEQUENCE_INDEX_DDL};"
-    ))?;
     let frontier = canonical_frontier_root_bytes(&AcceptedFrontierRoot::empty())?;
-    super::sqlite_materialization::initialize_schema(connection, ContentDigest::of(&frontier))?;
-    connection.execute(
-        "INSERT INTO meta (
-             singleton, workspace_id, lineage_digest, oplog_protocol_version,
-             operation_schema_version, object_envelope_schema_version,
-             manifest_encoding_version, managed_entity_set_version
-         ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![
-            uuid_blob(&claim.workspace_id.as_uuid()),
-            claim.lineage_digest.as_bytes().as_slice(),
-            i64::from(claim.oplog_protocol_version),
-            i64::from(claim.operation_schema_version),
-            i64::from(claim.object_envelope_schema_version),
-            i64::from(claim.manifest_encoding_version),
-            i64::from(claim.managed_entity_set_version),
-        ],
-    )?;
-    connection.execute(
-        "INSERT INTO frontier (
-             singleton, frontier_root, frontier_root_digest, applied_batch_count
-         ) VALUES (1, ?1, ?2, 0)",
-        params![
-            &frontier,
-            ContentDigest::of(&frontier).as_bytes().as_slice()
-        ],
-    )?;
-    validate_schema_and_claim(connection, claim)?;
-    Ok(())
+    storage_frontier::initialize_schema(connection, lower_physical_claim(claim), &frontier)?;
+    return Ok(());
 }
 
 fn open_writable(path: &Path) -> Result<Connection, ProjectionError> {
@@ -4593,241 +4211,8 @@ fn validate_schema_and_claim(
     connection: &Connection,
     claim: ProjectionClaim,
 ) -> Result<(), ProjectionError> {
-    let application_id: u32 =
-        connection.query_row("PRAGMA application_id", [], |row| row.get(0))?;
-    if application_id != SQLITE_APPLICATION_ID {
-        return Err(ProjectionError::SchemaMismatch(format!(
-            "application_id {application_id:#x} != {SQLITE_APPLICATION_ID:#x}"
-        )));
-    }
-    let user_version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if user_version != SQLITE_SCHEMA_VERSION {
-        return Err(ProjectionError::SchemaMismatch(format!(
-            "user_version {user_version} != {SQLITE_SCHEMA_VERSION}"
-        )));
-    }
-    let journal_mode: String = connection.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
-    if !journal_mode.eq_ignore_ascii_case("wal") {
-        return Err(ProjectionError::SchemaMismatch(format!(
-            "journal_mode {journal_mode:?} is not WAL"
-        )));
-    }
-    let tables: BTreeSet<String> = {
-        let mut statement = connection.prepare(
-            "SELECT name FROM sqlite_schema
-             WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
-        )?;
-        let tables = statement
-            .query_map([], |row| row.get(0))?
-            .collect::<Result<_, _>>()?;
-        tables
-    };
-    let expected_tables: BTreeSet<String> =
-        EXPECTED_TABLES.iter().map(|name| (*name).into()).collect();
-    if tables != expected_tables {
-        return Err(ProjectionError::SchemaMismatch(format!(
-            "unexpected P2.1 tables: {tables:?}"
-        )));
-    }
-    let indexes: BTreeSet<String> = {
-        let mut statement = connection.prepare(
-            "SELECT name FROM sqlite_schema
-             WHERE type = 'index' AND name NOT LIKE 'sqlite_%'",
-        )?;
-        let indexes = statement
-            .query_map([], |row| row.get(0))?
-            .collect::<Result<_, _>>()?;
-        indexes
-    };
-    let expected_indexes: BTreeSet<String> =
-        EXPECTED_INDEXES.iter().map(|name| (*name).into()).collect();
-    if indexes != expected_indexes {
-        return Err(ProjectionError::SchemaMismatch(format!(
-            "unexpected P2.1 indexes: {indexes:?}"
-        )));
-    }
-    validate_table_columns(connection, "meta", &META_COLUMNS)?;
-    validate_table_columns(connection, "frontier", &FRONTIER_COLUMNS)?;
-    validate_table_columns(connection, "frontier_documents", &FRONTIER_DOCUMENT_COLUMNS)?;
-    validate_table_columns(connection, "causal_clock_nodes", &CAUSAL_CLOCK_NODE_COLUMNS)?;
-    validate_table_columns(
-        connection,
-        "accepted_batch_nodes",
-        &ACCEPTED_BATCH_NODE_COLUMNS,
-    )?;
-    validate_table_columns(connection, "applied_batches", &APPLIED_BATCH_COLUMNS)?;
-    validate_schema_sql(connection, "table", "meta", META_DDL)?;
-    validate_schema_sql(connection, "table", "frontier", FRONTIER_DDL)?;
-    validate_schema_sql(
-        connection,
-        "table",
-        "frontier_documents",
-        FRONTIER_DOCUMENTS_DDL,
-    )?;
-    validate_schema_sql(
-        connection,
-        "table",
-        "causal_clock_nodes",
-        CAUSAL_CLOCK_NODES_DDL,
-    )?;
-    validate_schema_sql(
-        connection,
-        "table",
-        "accepted_batch_nodes",
-        ACCEPTED_BATCH_NODES_DDL,
-    )?;
-    validate_schema_sql(connection, "table", "applied_batches", APPLIED_BATCHES_DDL)?;
-    validate_schema_sql(
-        connection,
-        "index",
-        "applied_batches_batch_id_uq",
-        BATCH_ID_INDEX_DDL,
-    )?;
-    validate_schema_sql(
-        connection,
-        "index",
-        "applied_batches_acceptance_sequence_uq",
-        ACCEPTANCE_SEQUENCE_INDEX_DDL,
-    )?;
-    super::sqlite_materialization::validate_schema(connection)?;
-    let stored: StoredClaim = connection.query_row(
-        "SELECT workspace_id, lineage_digest, oplog_protocol_version,
-                operation_schema_version, object_envelope_schema_version,
-                manifest_encoding_version, managed_entity_set_version
-         FROM meta WHERE singleton = 1",
-        [],
-        |row| {
-            Ok(StoredClaim {
-                workspace_id: row.get(0)?,
-                lineage_digest: row.get(1)?,
-                oplog_protocol_version: row.get(2)?,
-                operation_schema_version: row.get(3)?,
-                object_envelope_schema_version: row.get(4)?,
-                manifest_encoding_version: row.get(5)?,
-                managed_entity_set_version: row.get(6)?,
-            })
-        },
-    )?;
-    stored.matches(claim)?;
-    let row_counts: (i64, i64) = connection.query_row(
-        "SELECT
-             (SELECT COUNT(*) FROM meta),
-             (SELECT COUNT(*) FROM frontier)",
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
-    if row_counts != (1, 1) {
-        return Err(ProjectionError::Corrupt(
-            "meta/frontier singleton cardinality is invalid".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_table_columns(
-    connection: &Connection,
-    table: &str,
-    expected: &[&str],
-) -> Result<(), ProjectionError> {
-    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
-    let columns: Vec<String> = statement
-        .query_map([], |row| row.get(1))?
-        .collect::<Result<_, _>>()?;
-    if columns != expected {
-        return Err(ProjectionError::SchemaMismatch(format!(
-            "{table} columns {columns:?} != {expected:?}"
-        )));
-    }
-    Ok(())
-}
-
-fn validate_schema_sql(
-    connection: &Connection,
-    object_type: &str,
-    name: &str,
-    expected: &str,
-) -> Result<(), ProjectionError> {
-    let found: String = connection.query_row(
-        "SELECT sql FROM sqlite_schema WHERE type = ?1 AND name = ?2",
-        params![object_type, name],
-        |row| row.get(0),
-    )?;
-    if canonical_sql(&found) != canonical_sql(expected) {
-        return Err(ProjectionError::SchemaMismatch(format!(
-            "{object_type} {name} does not match canonical DDL"
-        )));
-    }
-    Ok(())
-}
-
-fn canonical_sql(sql: &str) -> String {
-    sql.split_ascii_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-struct StoredClaim {
-    workspace_id: Vec<u8>,
-    lineage_digest: Vec<u8>,
-    oplog_protocol_version: i64,
-    operation_schema_version: i64,
-    object_envelope_schema_version: i64,
-    manifest_encoding_version: i64,
-    managed_entity_set_version: i64,
-}
-
-impl StoredClaim {
-    fn matches(&self, claim: ProjectionClaim) -> Result<(), ProjectionError> {
-        let workspace_id = decode_workspace_id(&self.workspace_id)?;
-        if workspace_id != claim.workspace_id {
-            return Err(ProjectionError::WorkspaceMismatch {
-                expected: claim.workspace_id,
-                found: workspace_id,
-            });
-        }
-        let lineage_digest = decode_lineage_digest(&self.lineage_digest)?;
-        if lineage_digest != claim.lineage_digest {
-            return Err(ProjectionError::LineageMismatch {
-                expected: claim.lineage_digest,
-                found: lineage_digest,
-            });
-        }
-        let expected = [
-            (
-                "oplog_protocol_version",
-                self.oplog_protocol_version,
-                i64::from(claim.oplog_protocol_version),
-            ),
-            (
-                "operation_schema_version",
-                self.operation_schema_version,
-                i64::from(claim.operation_schema_version),
-            ),
-            (
-                "object_envelope_schema_version",
-                self.object_envelope_schema_version,
-                i64::from(claim.object_envelope_schema_version),
-            ),
-            (
-                "manifest_encoding_version",
-                self.manifest_encoding_version,
-                i64::from(claim.manifest_encoding_version),
-            ),
-            (
-                "managed_entity_set_version",
-                self.managed_entity_set_version,
-                i64::from(claim.managed_entity_set_version),
-            ),
-        ];
-        for (field, found, expected) in expected {
-            if found != expected {
-                return Err(ProjectionError::ProtocolMismatch {
-                    field,
-                    expected,
-                    found,
-                });
-            }
-        }
-        Ok(())
-    }
+    storage_frontier::validate_schema_and_claim(connection, lower_physical_claim(claim))?;
+    return Ok(());
 }
 
 #[derive(Debug)]
@@ -5019,6 +4404,29 @@ impl StoredBatch {
             .map_err(|error| ProjectionError::Corrupt(error.to_string()))
     }
 
+    fn causal_record_digest(&self) -> Result<ContentDigest, ProjectionError> {
+        let manifest_digest = decode_content_digest(&self.manifest_digest)?;
+        let semantic_effect_digest = decode_semantic_effect_digest(&self.semantic_effect_digest)?;
+        let dependency_frontier = decode_frontier(&self.dependency_frontier)?;
+        let causal_dependency_heads = decode_batch_ids(&self.causal_dependency_heads)?;
+        let binding = super::AcceptedBatchEvidence::binding_digest_for(
+            self.batch_id,
+            manifest_digest,
+            semantic_effect_digest,
+            &dependency_frontier,
+            &causal_dependency_heads,
+        )
+        .map_err(|error| ProjectionError::Corrupt(error.to_string()))?;
+        Ok(super::hot_engine::accepted_causal_record_digest(
+            self.batch_id,
+            manifest_digest,
+            binding,
+            self.causal_dot()?,
+            Some(decode_uuid(&self.causal_clock_root_key)?.into_bytes()),
+            decode_content_digest(&self.causal_clock_root_digest)?,
+        ))
+    }
+
     #[cfg(test)]
     fn authenticated_reference_materialization(
         &self,
@@ -5055,23 +4463,10 @@ impl StoredBatch {
 fn validate_stored_history(
     connection: &Connection,
 ) -> Result<(AcceptedFrontierRoot, u64), ProjectionError> {
-    let mut statement = connection.prepare(
-        "SELECT sequence, batch_id, manifest_digest, semantic_effect,
-                semantic_effect_digest, dependency_frontier,
-                dependency_frontier_digest, prior_frontier_root,
-                prior_frontier_root_digest, post_frontier_root,
-                post_frontier_root_digest, affected_documents,
-                affected_documents_digest, causal_dependency_heads,
-                causal_peer_id, causal_counter, causal_clock_root_key,
-                causal_clock_root_digest,
-                acceptance_sequence, retained_bytes
-         FROM applied_batches ORDER BY sequence",
-    )?;
-    let mut rows = statement.query([])?;
     let mut prior = AcceptedFrontierRoot::empty();
     let mut count = 0_u64;
-    while let Some(row) = rows.next()? {
-        let record = stored_batch_from_row(row)?;
+    for physical in storage_frontier::load_all_batches(connection)? {
+        let record = stored_batch_from_storage(physical)?;
         count = count
             .checked_add(1)
             .ok_or_else(|| ProjectionError::Corrupt("stored history count overflowed".into()))?;
@@ -5081,9 +4476,12 @@ fn validate_stored_history(
             ));
         }
         let post = record.validate_canonical_transition(&prior)?;
-        let mut rows_read = 0;
-        if authenticated_batch_record(connection, &post, record.batch_id, &mut rows_read)?.is_none()
-        {
+        if !storage_frontier::authenticate_batch(
+            connection,
+            &lower_physical_frontier_root(&post)?,
+            record.batch_id.as_uuid().into_bytes(),
+            record.causal_record_digest()?,
+        )? {
             return Err(ProjectionError::Corrupt(format!(
                 "stored batch {} is absent from its authenticated accepted map",
                 record.batch_id
@@ -5098,87 +4496,56 @@ fn load_batch(
     connection: &Connection,
     batch_id: BatchId,
 ) -> Result<Option<StoredBatch>, ProjectionError> {
-    connection
-        .query_row(
-            "SELECT sequence, batch_id, manifest_digest, semantic_effect,
-                    semantic_effect_digest, dependency_frontier,
-                    dependency_frontier_digest, prior_frontier_root,
-                    prior_frontier_root_digest, post_frontier_root,
-                    post_frontier_root_digest, affected_documents,
-                    affected_documents_digest, causal_dependency_heads,
-                    causal_peer_id, causal_counter, causal_clock_root_key,
-                    causal_clock_root_digest,
-                    acceptance_sequence, retained_bytes
-             FROM applied_batches WHERE batch_id = ?1",
-            [uuid_blob(&batch_id.as_uuid())],
-            stored_batch_from_row,
-        )
-        .optional()
-        .map_err(ProjectionError::from)
+    storage_frontier::load_batch(connection, batch_id.as_uuid().into_bytes())?
+        .map(stored_batch_from_storage)
+        .transpose()
 }
 
 fn load_batch_at_sequence(
     connection: &Connection,
     sequence: i64,
 ) -> Result<Option<StoredBatch>, ProjectionError> {
-    connection
-        .query_row(
-            "SELECT sequence, batch_id, manifest_digest, semantic_effect,
-                semantic_effect_digest, dependency_frontier,
-                dependency_frontier_digest, prior_frontier_root,
-                prior_frontier_root_digest, post_frontier_root,
-                post_frontier_root_digest, affected_documents,
-                affected_documents_digest, causal_dependency_heads,
-                causal_peer_id, causal_counter, causal_clock_root_key,
-                causal_clock_root_digest,
-                acceptance_sequence, retained_bytes
-         FROM applied_batches WHERE sequence = ?1",
-            [sequence],
-            stored_batch_from_row,
-        )
-        .optional()
-        .map_err(ProjectionError::from)
+    storage_frontier::load_batch_at_sequence(connection, sequence)?
+        .map(stored_batch_from_storage)
+        .transpose()
 }
 
-fn stored_batch_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredBatch> {
-    let batch_id: Vec<u8> = row.get(1)?;
-    let batch_id = decode_batch_id_sql(&batch_id)?;
+fn stored_batch_from_storage(
+    row: storage_frontier::StoredBatch,
+) -> Result<StoredBatch, ProjectionError> {
     Ok(StoredBatch {
-        sequence: row.get(0)?,
-        batch_id,
-        manifest_digest: row.get(2)?,
-        semantic_effect: row.get(3)?,
-        semantic_effect_digest: row.get(4)?,
-        dependency_frontier: row.get(5)?,
-        dependency_frontier_digest: row.get(6)?,
-        prior_frontier_root: row.get(7)?,
-        prior_frontier_root_digest: row.get(8)?,
-        post_frontier_root: row.get(9)?,
-        post_frontier_root_digest: row.get(10)?,
-        affected_documents: row.get(11)?,
-        affected_documents_digest: row.get(12)?,
-        causal_dependency_heads: row.get(13)?,
-        causal_peer_id: row.get(14)?,
-        causal_counter: row.get(15)?,
-        causal_clock_root_key: row.get(16)?,
-        causal_clock_root_digest: row.get(17)?,
-        acceptance_sequence: row.get(18)?,
-        retained_bytes: row.get(19)?,
+        sequence: row.sequence,
+        batch_id: BatchId::from_uuid(Uuid::from_bytes(row.batch_id)),
+        manifest_digest: row.manifest_digest,
+        semantic_effect: row.semantic_effect,
+        semantic_effect_digest: row.semantic_effect_digest,
+        dependency_frontier: row.dependency_frontier,
+        dependency_frontier_digest: row.dependency_frontier_digest,
+        prior_frontier_root: row.prior_frontier_root,
+        prior_frontier_root_digest: row.prior_frontier_root_digest,
+        post_frontier_root: row.post_frontier_root,
+        post_frontier_root_digest: row.post_frontier_root_digest,
+        affected_documents: row.affected_documents,
+        affected_documents_digest: row.affected_documents_digest,
+        causal_dependency_heads: row.causal_dependency_heads,
+        causal_peer_id: row.causal_peer_id,
+        causal_counter: row.causal_counter,
+        causal_clock_root_key: row.causal_clock_root_key,
+        causal_clock_root_digest: row.causal_clock_root_digest,
+        acceptance_sequence: row.acceptance_sequence,
+        retained_bytes: row.retained_bytes,
     })
 }
 
 fn read_frontier_root(connection: &Connection) -> Result<AcceptedFrontierRoot, ProjectionError> {
-    let (bytes, digest): (Vec<u8>, Vec<u8>) = connection.query_row(
-        "SELECT frontier_root, frontier_root_digest FROM frontier WHERE singleton = 1",
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
-    if digest != ContentDigest::of(&bytes).as_bytes().as_slice() {
+    let stored = storage_frontier::read_frontier(connection)?;
+    let root = decode_frontier_root(&stored.canonical_bytes)?;
+    if stored.applied_batch_count != root.acceptance_sequence() {
         return Err(ProjectionError::Corrupt(
-            "frontier-root digest does not match frontier-root bytes".into(),
+            "frontier applied-batch count differs from its root".into(),
         ));
     }
-    decode_frontier_root(&bytes)
+    Ok(root)
 }
 
 fn canonical_frontier_bytes(frontier: &FrontierV2) -> Result<Vec<u8>, ProjectionError> {
@@ -5285,396 +4652,34 @@ fn decode_frontier_document(
     Ok(document)
 }
 
-#[derive(Clone)]
-struct FrontierMapLink {
-    document_id: DocumentId,
-    digest: ContentDigest,
-}
-
-#[derive(Clone)]
-struct FrontierMapNode {
-    document: DocumentDependencies,
-    encoded: Vec<u8>,
-    value_digest: ContentDigest,
-    left: Option<FrontierMapLink>,
-    right: Option<FrontierMapLink>,
-    node_digest: ContentDigest,
-}
-
-impl FrontierMapNode {
-    fn key(&self) -> [u8; 16] {
-        self.document.document_id().as_uuid().into_bytes()
-    }
-
-    fn recompute_digest(&self) -> ContentDigest {
-        super::scratch_store::authenticated_map_node_digest(
-            self.key(),
-            self.value_digest,
-            self.left
-                .as_ref()
-                .map(|child| (child.document_id.as_uuid().into_bytes(), child.digest)),
-            self.right
-                .as_ref()
-                .map(|child| (child.document_id.as_uuid().into_bytes(), child.digest)),
-        )
-    }
-
-    fn as_link(&self) -> FrontierMapLink {
-        FrontierMapLink {
-            document_id: self.document.document_id(),
-            digest: self.node_digest,
-        }
-    }
-}
-
 fn authenticated_frontier_document(
     connection: &Connection,
     root: &AcceptedFrontierRoot,
     document_id: DocumentId,
 ) -> Result<Option<DocumentDependencies>, ProjectionError> {
-    let mut current = match root.document_map_root_key() {
-        Some(root_id) => Some(FrontierMapLink {
-            document_id: DocumentId::from_uuid(Uuid::from_bytes(root_id)),
-            digest: root.document_map_root_digest(),
-        }),
-        None => {
-            if root.document_count() != 0
-                || root.document_map_root_digest()
-                    != super::scratch_store::authenticated_map_empty_digest()
-            {
-                return Err(ProjectionError::Corrupt(
-                    "empty frontier map root is malformed".into(),
-                ));
-            }
-            None
-        }
-    };
-    let mut depth = 0_usize;
-    while let Some(link) = current {
-        if depth > 256 {
-            return Err(ProjectionError::Corrupt(
-                "frontier map exceeds its bounded depth".into(),
-            ));
-        }
-        let node = load_frontier_map_node(connection, link.document_id, Some(link.digest))?
-            .ok_or_else(|| {
-                ProjectionError::Corrupt(format!(
-                    "authenticated frontier node {} is missing",
-                    link.document_id
-                ))
-            })?;
-        match document_id.cmp(&node.document.document_id()) {
-            std::cmp::Ordering::Equal => return Ok(Some(node.document)),
-            std::cmp::Ordering::Less => current = node.left,
-            std::cmp::Ordering::Greater => current = node.right,
-        }
-        depth += 1;
-    }
-    Ok(None)
-}
-
-fn upsert_frontier_map(
-    transaction: &Transaction<'_>,
-    root_key: Option<[u8; 16]>,
-    root_digest: ContentDigest,
-    document: &DocumentDependencies,
-) -> Result<(FrontierMapLink, bool), ProjectionError> {
-    let current = root_key.map(|key| FrontierMapLink {
-        document_id: DocumentId::from_uuid(Uuid::from_bytes(key)),
-        digest: root_digest,
-    });
-    upsert_frontier_map_link(transaction, current, document, 0)
-}
-
-fn upsert_frontier_map_link(
-    transaction: &Transaction<'_>,
-    current: Option<FrontierMapLink>,
-    document: &DocumentDependencies,
-    depth: usize,
-) -> Result<(FrontierMapLink, bool), ProjectionError> {
-    if depth > 256 {
-        return Err(ProjectionError::Corrupt(
-            "frontier map exceeds its bounded depth".into(),
-        ));
-    }
-    let Some(current) = current else {
-        let encoded = encode_frontier_document(document)?;
-        let value_digest = ContentDigest::of(&encoded);
-        let mut node = FrontierMapNode {
-            document: document.clone(),
-            encoded,
-            value_digest,
-            left: None,
-            right: None,
-            node_digest: super::scratch_store::authenticated_map_empty_digest(),
-        };
-        node.node_digest = node.recompute_digest();
-        store_frontier_map_node(transaction, &node)?;
-        return Ok((node.as_link(), true));
-    };
-    let mut node = load_frontier_map_node(transaction, current.document_id, Some(current.digest))?
-        .ok_or_else(|| {
-            ProjectionError::Corrupt(format!(
-                "authenticated frontier node {} is missing",
-                current.document_id
-            ))
-        })?;
-    let inserted;
-    match document.document_id().cmp(&node.document.document_id()) {
-        std::cmp::Ordering::Equal => {
-            node.document = document.clone();
-            node.encoded = encode_frontier_document(document)?;
-            node.value_digest = ContentDigest::of(&node.encoded);
-            inserted = false;
-        }
-        std::cmp::Ordering::Less => {
-            let (left, was_inserted) =
-                upsert_frontier_map_link(transaction, node.left.take(), document, depth + 1)?;
-            node.left = Some(left);
-            inserted = was_inserted;
-            if node.left.as_ref().is_some_and(|left| {
-                super::scratch_store::authenticated_map_priority_order(
-                    left.document_id.as_uuid().into_bytes(),
-                    node.document.document_id().as_uuid().into_bytes(),
-                )
-                .is_lt()
-            }) {
-                return Ok((rotate_frontier_map_right(transaction, node)?, inserted));
-            }
-        }
-        std::cmp::Ordering::Greater => {
-            let (right, was_inserted) =
-                upsert_frontier_map_link(transaction, node.right.take(), document, depth + 1)?;
-            node.right = Some(right);
-            inserted = was_inserted;
-            if node.right.as_ref().is_some_and(|right| {
-                super::scratch_store::authenticated_map_priority_order(
-                    right.document_id.as_uuid().into_bytes(),
-                    node.document.document_id().as_uuid().into_bytes(),
-                )
-                .is_lt()
-            }) {
-                return Ok((rotate_frontier_map_left(transaction, node)?, inserted));
-            }
-        }
-    }
-    node.node_digest = node.recompute_digest();
-    store_frontier_map_node(transaction, &node)?;
-    Ok((node.as_link(), inserted))
-}
-
-fn rotate_frontier_map_right(
-    transaction: &Transaction<'_>,
-    mut node: FrontierMapNode,
-) -> Result<FrontierMapLink, ProjectionError> {
-    let left = node.left.take().ok_or_else(|| {
-        ProjectionError::Corrupt("frontier map right rotation has no left child".into())
-    })?;
-    let mut left_node = load_frontier_map_node(transaction, left.document_id, Some(left.digest))?
-        .ok_or_else(|| {
-        ProjectionError::Corrupt("frontier map rotation child is missing".into())
-    })?;
-    node.left = left_node.right.take();
-    node.node_digest = node.recompute_digest();
-    store_frontier_map_node(transaction, &node)?;
-    left_node.right = Some(node.as_link());
-    left_node.node_digest = left_node.recompute_digest();
-    store_frontier_map_node(transaction, &left_node)?;
-    Ok(left_node.as_link())
-}
-
-fn rotate_frontier_map_left(
-    transaction: &Transaction<'_>,
-    mut node: FrontierMapNode,
-) -> Result<FrontierMapLink, ProjectionError> {
-    let right = node.right.take().ok_or_else(|| {
-        ProjectionError::Corrupt("frontier map left rotation has no right child".into())
-    })?;
-    let mut right_node =
-        load_frontier_map_node(transaction, right.document_id, Some(right.digest))?.ok_or_else(
-            || ProjectionError::Corrupt("frontier map rotation child is missing".into()),
-        )?;
-    node.right = right_node.left.take();
-    node.node_digest = node.recompute_digest();
-    store_frontier_map_node(transaction, &node)?;
-    right_node.left = Some(node.as_link());
-    right_node.node_digest = right_node.recompute_digest();
-    store_frontier_map_node(transaction, &right_node)?;
-    Ok(right_node.as_link())
-}
-
-fn store_frontier_map_node(
-    transaction: &Transaction<'_>,
-    node: &FrontierMapNode,
-) -> Result<(), ProjectionError> {
-    if node.node_digest != node.recompute_digest() {
-        return Err(ProjectionError::Corrupt(
-            "frontier map node digest is stale".into(),
-        ));
-    }
-    transaction.execute(
-        "INSERT INTO frontier_documents (
-             document_id, dependencies, dependencies_digest,
-             left_document_id, left_digest, right_document_id, right_digest, node_digest
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-         ON CONFLICT(document_id) DO UPDATE SET
-             dependencies = excluded.dependencies,
-             dependencies_digest = excluded.dependencies_digest,
-             left_document_id = excluded.left_document_id,
-             left_digest = excluded.left_digest,
-             right_document_id = excluded.right_document_id,
-             right_digest = excluded.right_digest,
-             node_digest = excluded.node_digest",
-        params![
-            uuid_blob(&node.document.document_id().as_uuid()),
-            &node.encoded,
-            node.value_digest.as_bytes().as_slice(),
-            node.left
-                .as_ref()
-                .map(|child| uuid_blob(&child.document_id.as_uuid())),
-            node.left
-                .as_ref()
-                .map(|child| child.digest.as_bytes().to_vec()),
-            node.right
-                .as_ref()
-                .map(|child| uuid_blob(&child.document_id.as_uuid())),
-            node.right
-                .as_ref()
-                .map(|child| child.digest.as_bytes().to_vec()),
-            node.node_digest.as_bytes().as_slice(),
-        ],
-    )?;
-    Ok(())
-}
-
-fn load_frontier_map_node(
-    connection: &Connection,
-    document_id: DocumentId,
-    expected_digest: Option<ContentDigest>,
-) -> Result<Option<FrontierMapNode>, ProjectionError> {
-    type StoredFrontierMapRow = (
-        Vec<u8>,
-        Vec<u8>,
-        Option<Vec<u8>>,
-        Option<Vec<u8>>,
-        Option<Vec<u8>>,
-        Option<Vec<u8>>,
-        Vec<u8>,
-    );
-    let found: Option<StoredFrontierMapRow> = connection
-        .query_row(
-            "SELECT dependencies, dependencies_digest,
-                    left_document_id, left_digest, right_document_id, right_digest, node_digest
-             FROM frontier_documents WHERE document_id = ?1",
-            [uuid_blob(&document_id.as_uuid())],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                ))
-            },
-        )
-        .optional()?;
-    let Some((encoded, value_digest, left_id, left_digest, right_id, right_digest, node_digest)) =
-        found
-    else {
-        return Ok(None);
-    };
-    let value_digest = decode_content_digest(&value_digest)?;
-    if value_digest != ContentDigest::of(&encoded) {
-        return Err(ProjectionError::Corrupt(format!(
-            "frontier document {document_id} digest mismatch"
-        )));
-    }
-    let decode_link = |id: Option<Vec<u8>>,
-                       digest: Option<Vec<u8>>|
-     -> Result<Option<FrontierMapLink>, ProjectionError> {
-        match (id, digest) {
-            (None, None) => Ok(None),
-            (Some(id), Some(digest)) => Ok(Some(FrontierMapLink {
-                document_id: decode_document_id(&id)?,
-                digest: decode_content_digest(&digest)?,
-            })),
-            _ => Err(ProjectionError::Corrupt(
-                "frontier map child identity/digest pair is incomplete".into(),
-            )),
-        }
-    };
-    let left = decode_link(left_id, left_digest)?;
-    let right = decode_link(right_id, right_digest)?;
-    if left
-        .as_ref()
-        .is_some_and(|child| child.document_id >= document_id)
-        || right
-            .as_ref()
-            .is_some_and(|child| child.document_id <= document_id)
-    {
-        return Err(ProjectionError::Corrupt(
-            "frontier map child ordering is invalid".into(),
-        ));
-    }
-    let mut node = FrontierMapNode {
-        document: decode_frontier_document(document_id, &encoded)?,
-        encoded,
-        value_digest,
-        left,
-        right,
-        node_digest: decode_content_digest(&node_digest)?,
-    };
-    let computed = node.recompute_digest();
-    if node.node_digest != computed || expected_digest.is_some_and(|expected| expected != computed)
-    {
-        return Err(ProjectionError::Corrupt(format!(
-            "frontier document {document_id} is not authenticated by its map root"
-        )));
-    }
-    node.node_digest = computed;
-    Ok(Some(node))
+    let physical_root = lower_physical_frontier_root(root)?;
+    return storage_frontier::frontier_document(
+        connection,
+        &physical_root,
+        document_id.as_uuid().into_bytes(),
+    )?
+    .map(|bytes| decode_frontier_document(document_id, &bytes))
+    .transpose();
 }
 
 fn read_frontier_documents(connection: &Connection) -> Result<FrontierV2, ProjectionError> {
     let root = read_frontier_root(connection)?;
-    let mut pending = root
-        .document_map_root_key()
-        .map(|key| FrontierMapLink {
-            document_id: DocumentId::from_uuid(Uuid::from_bytes(key)),
-            digest: root.document_map_root_digest(),
-        })
+    let physical_root = lower_physical_frontier_root(&root)?;
+    let documents = storage_frontier::read_frontier_documents(connection, &physical_root)?
         .into_iter()
-        .collect::<Vec<_>>();
-    let mut documents = Vec::with_capacity(
-        usize::try_from(root.document_count())
-            .unwrap_or(1_000_000)
-            .min(1_000_000),
-    );
-    while let Some(link) = pending.pop() {
-        let node = load_frontier_map_node(connection, link.document_id, Some(link.digest))?
-            .ok_or_else(|| {
-                ProjectionError::Corrupt(format!(
-                    "authenticated frontier node {} is missing",
-                    link.document_id
-                ))
-            })?;
-        if let Some(right) = node.right.clone() {
-            pending.push(right);
-        }
-        documents.push(node.document);
-        if let Some(left) = node.left {
-            pending.push(left);
-        }
-    }
-    documents.sort_unstable_by_key(DocumentDependencies::document_id);
-    if documents.len() as u64 != root.document_count() {
-        return Err(ProjectionError::Corrupt(
-            "authenticated frontier document count is stale".into(),
-        ));
-    }
-    FrontierV2::new(documents).map_err(|error| ProjectionError::Corrupt(error.to_string()))
+        .map(|document| {
+            decode_frontier_document(
+                DocumentId::from_uuid(Uuid::from_bytes(document.document_id)),
+                &document.canonical_bytes,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    return FrontierV2::new(documents).map_err(|error| ProjectionError::Corrupt(error.to_string()));
 }
 
 fn document_frontier_contains(
@@ -5725,859 +4730,42 @@ fn batch_descends_from_database_measured(
     ancestor: BatchId,
 ) -> Result<(bool, usize), ProjectionError> {
     let root = read_frontier_root(connection)?;
-    let mut rows_read = 0;
-    let descendant_record =
-        authenticated_batch_record(connection, &root, descendant, &mut rows_read)?.ok_or_else(
-            || {
-                ProjectionError::Corrupt(format!(
-                    "descendant batch {descendant} is absent from the authenticated accepted map"
-                ))
-            },
-        )?;
-    let Some(ancestor_record) =
-        authenticated_batch_record(connection, &root, ancestor, &mut rows_read)?
-    else {
-        return Ok((false, rows_read));
-    };
-    let ancestor_dot = ancestor_record.causal_dot()?;
-    let root = descendant_record.clock_root()?;
-    let counter = causal_clock_lookup(
-        connection,
-        Some(root),
-        ancestor_dot.peer_id(),
-        &mut rows_read,
-    )?;
-    Ok((
-        counter.is_some_and(|counter| counter >= ancestor_dot.counter()),
-        rows_read,
-    ))
-}
-
-fn derive_causal_clock_root(
-    transaction: &Transaction<'_>,
-    accepted_root: &AcceptedFrontierRoot,
-    event: &AcceptedBatchEvent,
-) -> Result<MapLink, ProjectionError> {
-    let mut root = None;
-    let mut rows_read = 0;
-    for parent in &event.causal_dependency_heads {
-        let record =
-            authenticated_batch_record(transaction, accepted_root, *parent, &mut rows_read)?
-                .ok_or(ProjectionError::MissingDependency(*parent))?;
-        root = merge_causal_clock_roots(transaction, root, Some(record.clock_root()?))?;
-    }
-    let expected = causal_clock_lookup(
-        transaction,
-        root.clone(),
-        event.causal_dot.peer_id(),
-        &mut rows_read,
-    )?
-    .unwrap_or(0)
-    .checked_add(1)
-    .ok_or_else(|| ProjectionError::Corrupt("causal counter overflowed".into()))?;
-    if event.causal_dot.counter() != expected {
-        return Err(ProjectionError::InvalidAcceptedEvent(format!(
-            "accepted batch {} causal counter {} does not follow {}",
-            event.batch_id,
-            event.causal_dot.counter(),
-            expected.saturating_sub(1)
-        )));
-    }
-    upsert_causal_clock(
-        transaction,
-        root,
-        event.causal_dot.peer_id(),
-        event.causal_dot.counter(),
-    )
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct MapLink {
-    key: [u8; 16],
-    digest: ContentDigest,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct ClockNode {
-    peer: CausalPeerId,
-    counter: u64,
-    left: Option<MapLink>,
-    right: Option<MapLink>,
-}
-
-#[derive(Clone, Debug)]
-struct BatchMapNode {
-    batch_id: BatchId,
-    value_digest: ContentDigest,
-    left: Option<MapLink>,
-    right: Option<MapLink>,
-}
-
-impl StoredBatch {
-    fn clock_root(&self) -> Result<MapLink, ProjectionError> {
-        Ok(MapLink {
-            key: self
-                .causal_clock_root_key
-                .as_slice()
-                .try_into()
-                .map_err(|_| ProjectionError::Corrupt("causal clock root key is invalid".into()))?,
-            digest: decode_content_digest(&self.causal_clock_root_digest)?,
-        })
-    }
-
-    fn causal_record_digest(&self) -> Result<ContentDigest, ProjectionError> {
-        let manifest_digest = decode_content_digest(&self.manifest_digest)?;
-        let semantic_effect_digest = decode_semantic_effect_digest(&self.semantic_effect_digest)?;
-        let dependency_frontier = decode_frontier(&self.dependency_frontier)?;
-        let causal_dependency_heads = decode_batch_ids(&self.causal_dependency_heads)?;
-        let binding = super::AcceptedBatchEvidence::binding_digest_for(
-            self.batch_id,
-            manifest_digest,
-            semantic_effect_digest,
-            &dependency_frontier,
-            &causal_dependency_heads,
-        )
-        .map_err(|error| ProjectionError::Corrupt(error.to_string()))?;
-        let clock_root = self.clock_root()?;
-        Ok(super::hot_engine::accepted_causal_record_digest(
-            self.batch_id,
-            manifest_digest,
-            binding,
-            self.causal_dot()?,
-            Some(clock_root.key),
-            clock_root.digest,
-        ))
-    }
-}
-
-fn authenticated_batch_record(
-    connection: &Connection,
-    root: &AcceptedFrontierRoot,
-    batch_id: BatchId,
-    rows_read: &mut usize,
-) -> Result<Option<StoredBatch>, ProjectionError> {
-    let Some(root_key) = root.batch_map_root_key() else {
-        if root.acceptance_sequence() == 0 {
-            return Ok(None);
-        }
-        return Err(ProjectionError::Corrupt(
-            "nonempty frontier has no authenticated batch-map root".into(),
-        ));
-    };
-    let mut current = Some(MapLink {
-        key: root_key,
-        digest: root.batch_map_root_digest(),
-    });
-    let mut value_digest = None;
-    while let Some(link) = current {
-        let node = load_batch_map_node(connection, &link)?;
-        *rows_read = rows_read.saturating_add(1);
-        match batch_id.cmp(&node.batch_id) {
-            std::cmp::Ordering::Equal => {
-                value_digest = Some(node.value_digest);
-                break;
-            }
-            std::cmp::Ordering::Less => current = node.left,
-            std::cmp::Ordering::Greater => current = node.right,
-        }
-    }
-    let Some(value_digest) = value_digest else {
-        return Ok(None);
-    };
-    let record = load_batch(connection, batch_id)?.ok_or_else(|| {
+    let physical = lower_physical_frontier_root(&root)?;
+    let descendant_record = load_batch(connection, descendant)?.ok_or_else(|| {
         ProjectionError::Corrupt(format!(
-            "authenticated accepted batch {batch_id} is missing its exact record"
+            "descendant batch {descendant} is absent from the authenticated accepted map"
         ))
     })?;
-    *rows_read = rows_read.saturating_add(1);
-    if record.causal_record_digest()? != value_digest {
-        return Err(ProjectionError::Corrupt(format!(
-            "accepted batch {batch_id} differs from its authenticated causal record"
-        )));
-    }
-    let dot = record.causal_dot()?;
-    let counter = causal_clock_lookup(
+    if !storage_frontier::authenticate_batch(
         connection,
-        Some(record.clock_root()?),
-        dot.peer_id(),
-        rows_read,
-    )?;
-    if counter != Some(dot.counter()) {
+        &physical,
+        descendant.as_uuid().into_bytes(),
+        descendant_record.causal_record_digest()?,
+    )? {
         return Err(ProjectionError::Corrupt(format!(
-            "accepted batch {batch_id} causal dot is absent from its authenticated clock"
+            "descendant batch {descendant} is absent from the authenticated accepted map"
         )));
     }
-    Ok(Some(record))
-}
-
-fn causal_clock_lookup(
-    connection: &Connection,
-    mut current: Option<MapLink>,
-    peer: CausalPeerId,
-    rows_read: &mut usize,
-) -> Result<Option<u64>, ProjectionError> {
-    let mut depth = 0;
-    while let Some(link) = current {
-        ensure_authenticated_map_depth(depth, "causal clock lookup")?;
-        let node = load_clock_node(connection, &link)?;
-        *rows_read = rows_read.saturating_add(1);
-        match peer.cmp(&node.peer) {
-            std::cmp::Ordering::Equal => return Ok(Some(node.counter)),
-            std::cmp::Ordering::Less => current = node.left,
-            std::cmp::Ordering::Greater => current = node.right,
-        }
-        depth += 1;
-    }
-    Ok(None)
-}
-
-fn load_clock_node(
-    connection: &Connection,
-    expected: &MapLink,
-) -> Result<ClockNode, ProjectionError> {
-    let stored = connection
-        .query_row(
-            "SELECT peer_id, counter, value_digest, left_peer_id, left_digest,
-                    right_peer_id, right_digest
-             FROM causal_clock_nodes WHERE node_digest = ?1",
-            [expected.digest.as_bytes().as_slice()],
-            |row| {
-                Ok((
-                    row.get::<_, Vec<u8>>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, Vec<u8>>(2)?,
-                    row.get::<_, Option<Vec<u8>>>(3)?,
-                    row.get::<_, Option<Vec<u8>>>(4)?,
-                    row.get::<_, Option<Vec<u8>>>(5)?,
-                    row.get::<_, Option<Vec<u8>>>(6)?,
-                ))
-            },
-        )
-        .optional()?
-        .ok_or_else(|| {
-            ProjectionError::Corrupt(format!(
-                "authenticated causal clock node {} is missing",
-                expected.digest
-            ))
-        })?;
-    let peer = decode_causal_peer(&stored.0)?;
-    let counter = u64::try_from(stored.1)
-        .map_err(|_| ProjectionError::Corrupt("causal clock counter is invalid".into()))?;
-    let value_digest = decode_content_digest(&stored.2)?;
-    let left = decode_map_link(stored.3, stored.4)?;
-    let right = decode_map_link(stored.5, stored.6)?;
-    let node = ClockNode {
-        peer,
-        counter,
-        left,
-        right,
+    let Some(ancestor_record) = load_batch(connection, ancestor)? else {
+        return Ok((false, 0));
     };
-    validate_clock_node(expected, value_digest, &node)?;
-    Ok(node)
-}
-
-fn validate_clock_node(
-    expected: &MapLink,
-    value_digest: ContentDigest,
-    node: &ClockNode,
-) -> Result<(), ProjectionError> {
-    let key = causal_peer_key(node.peer);
-    if expected.key != key
-        || node.counter == 0
-        || value_digest != super::hot_engine::causal_clock_counter_digest(node.peer, node.counter)
-        || !valid_map_children(key, node.left.as_ref(), node.right.as_ref())
-        || super::scratch_store::authenticated_map_node_digest(
-            key,
-            value_digest,
-            node.left.as_ref().map(|child| (child.key, child.digest)),
-            node.right.as_ref().map(|child| (child.key, child.digest)),
-        ) != expected.digest
-    {
-        return Err(ProjectionError::Corrupt(
-            "authenticated causal clock node is misbound".into(),
-        ));
+    if !storage_frontier::authenticate_batch(
+        connection,
+        &physical,
+        ancestor.as_uuid().into_bytes(),
+        ancestor_record.causal_record_digest()?,
+    )? {
+        return Ok((false, 0));
     }
-    Ok(())
-}
-
-fn load_batch_map_node(
-    connection: &Connection,
-    expected: &MapLink,
-) -> Result<BatchMapNode, ProjectionError> {
-    let stored = connection
-        .query_row(
-            "SELECT batch_id, value_digest, left_batch_id, left_digest,
-                    right_batch_id, right_digest
-             FROM accepted_batch_nodes WHERE node_digest = ?1",
-            [expected.digest.as_bytes().as_slice()],
-            |row| {
-                Ok((
-                    row.get::<_, Vec<u8>>(0)?,
-                    row.get::<_, Vec<u8>>(1)?,
-                    row.get::<_, Option<Vec<u8>>>(2)?,
-                    row.get::<_, Option<Vec<u8>>>(3)?,
-                    row.get::<_, Option<Vec<u8>>>(4)?,
-                    row.get::<_, Option<Vec<u8>>>(5)?,
-                ))
-            },
-        )
-        .optional()?
-        .ok_or_else(|| {
-            ProjectionError::Corrupt(format!(
-                "authenticated accepted-batch node {} is missing",
-                expected.digest
-            ))
-        })?;
-    let node = BatchMapNode {
-        batch_id: BatchId::from_uuid(decode_uuid(&stored.0)?),
-        value_digest: decode_content_digest(&stored.1)?,
-        left: decode_map_link(stored.2, stored.3)?,
-        right: decode_map_link(stored.4, stored.5)?,
-    };
-    let key = node.batch_id.as_uuid().into_bytes();
-    if expected.key != key
-        || !valid_map_children(key, node.left.as_ref(), node.right.as_ref())
-        || super::scratch_store::authenticated_map_node_digest(
-            key,
-            node.value_digest,
-            node.left.as_ref().map(|child| (child.key, child.digest)),
-            node.right.as_ref().map(|child| (child.key, child.digest)),
-        ) != expected.digest
-    {
-        return Err(ProjectionError::Corrupt(
-            "authenticated accepted-batch node is misbound".into(),
-        ));
-    }
-    Ok(node)
-}
-
-fn valid_map_children(key: [u8; 16], left: Option<&MapLink>, right: Option<&MapLink>) -> bool {
-    left.is_none_or(|child| {
-        child.key < key
-            && super::scratch_store::authenticated_map_priority_order(key, child.key).is_lt()
-    }) && right.is_none_or(|child| {
-        child.key > key
-            && super::scratch_store::authenticated_map_priority_order(key, child.key).is_lt()
-    })
-}
-
-fn decode_map_link(
-    key: Option<Vec<u8>>,
-    digest: Option<Vec<u8>>,
-) -> Result<Option<MapLink>, ProjectionError> {
-    match (key, digest) {
-        (None, None) => Ok(None),
-        (Some(key), Some(digest)) => Ok(Some(MapLink {
-            key: key
-                .as_slice()
-                .try_into()
-                .map_err(|_| ProjectionError::Corrupt("authenticated map key is invalid".into()))?,
-            digest: decode_content_digest(&digest)?,
-        })),
-        _ => Err(ProjectionError::Corrupt(
-            "authenticated map child is incomplete".into(),
-        )),
-    }
-}
-
-fn causal_peer_key(peer: CausalPeerId) -> [u8; 16] {
-    peer.as_device_id().as_uuid().into_bytes()
-}
-
-fn decode_causal_peer(bytes: &[u8]) -> Result<CausalPeerId, ProjectionError> {
-    Ok(CausalPeerId::from_device_id(super::DeviceId::from_uuid(
-        decode_uuid(bytes)?,
-    )))
-}
-
-fn merge_causal_clock_roots(
-    connection: &Connection,
-    left: Option<MapLink>,
-    right: Option<MapLink>,
-) -> Result<Option<MapLink>, ProjectionError> {
-    merge_causal_clock_roots_measured(connection, left, right, &mut ClockUnionStats::default())
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct ClockUnionStats {
-    nodes_read: usize,
-    nodes_written: usize,
-    shared_subtrees: usize,
-}
-
-type ClockSplit = (Option<MapLink>, Option<u64>, Option<MapLink>);
-
-fn merge_causal_clock_roots_measured(
-    connection: &Connection,
-    left: Option<MapLink>,
-    right: Option<MapLink>,
-    stats: &mut ClockUnionStats,
-) -> Result<Option<MapLink>, ProjectionError> {
-    union_causal_clock_roots(connection, left, right, stats, 0)
-}
-
-fn union_causal_clock_roots(
-    connection: &Connection,
-    left: Option<MapLink>,
-    right: Option<MapLink>,
-    stats: &mut ClockUnionStats,
-    depth: usize,
-) -> Result<Option<MapLink>, ProjectionError> {
-    ensure_authenticated_map_depth(depth, "causal clock union")?;
-    let (left_link, right_link) = match (left, right) {
-        (None, right) => return Ok(right),
-        (left, None) => return Ok(left),
-        (Some(left), Some(right)) => (left, right),
-    };
-    if left_link == right_link {
-        stats.shared_subtrees = stats.shared_subtrees.saturating_add(1);
-        return Ok(Some(left_link));
-    }
-
-    if left_link.key == right_link.key {
-        let left_node = load_clock_node_measured(connection, &left_link, stats)?;
-        let right_node = load_clock_node_measured(connection, &right_link, stats)?;
-        let merged = ClockNode {
-            peer: left_node.peer,
-            counter: left_node.counter.max(right_node.counter),
-            left: union_causal_clock_roots(
-                connection,
-                left_node.left.clone(),
-                right_node.left.clone(),
-                stats,
-                depth + 1,
-            )?,
-            right: union_causal_clock_roots(
-                connection,
-                left_node.right.clone(),
-                right_node.right.clone(),
-                stats,
-                depth + 1,
-            )?,
-        };
-        return Ok(Some(reuse_or_write_clock_node(
+    Ok((
+        storage_frontier::batch_descends_from(
             connection,
-            [(&left_link, &left_node), (&right_link, &right_node)],
-            &merged,
-            stats,
-        )?));
-    }
-
-    if super::scratch_store::authenticated_map_priority_order(left_link.key, right_link.key).is_lt()
-    {
-        let left_node = load_clock_node_measured(connection, &left_link, stats)?;
-        let (right_less, right_counter, right_greater) = split_causal_clock_root(
-            connection,
-            Some(right_link),
-            left_link.key,
-            stats,
-            depth + 1,
-        )?;
-        let merged = ClockNode {
-            peer: left_node.peer,
-            counter: left_node.counter.max(right_counter.unwrap_or(0)),
-            left: union_causal_clock_roots(
-                connection,
-                left_node.left.clone(),
-                right_less,
-                stats,
-                depth + 1,
-            )?,
-            right: union_causal_clock_roots(
-                connection,
-                left_node.right.clone(),
-                right_greater,
-                stats,
-                depth + 1,
-            )?,
-        };
-        Ok(Some(reuse_or_write_clock_node(
-            connection,
-            [(&left_link, &left_node), (&left_link, &left_node)],
-            &merged,
-            stats,
-        )?))
-    } else {
-        let right_node = load_clock_node_measured(connection, &right_link, stats)?;
-        let (left_less, left_counter, left_greater) = split_causal_clock_root(
-            connection,
-            Some(left_link),
-            right_link.key,
-            stats,
-            depth + 1,
-        )?;
-        let merged = ClockNode {
-            peer: right_node.peer,
-            counter: right_node.counter.max(left_counter.unwrap_or(0)),
-            left: union_causal_clock_roots(
-                connection,
-                left_less,
-                right_node.left.clone(),
-                stats,
-                depth + 1,
-            )?,
-            right: union_causal_clock_roots(
-                connection,
-                left_greater,
-                right_node.right.clone(),
-                stats,
-                depth + 1,
-            )?,
-        };
-        Ok(Some(reuse_or_write_clock_node(
-            connection,
-            [(&right_link, &right_node), (&right_link, &right_node)],
-            &merged,
-            stats,
-        )?))
-    }
-}
-
-fn split_causal_clock_root(
-    connection: &Connection,
-    root: Option<MapLink>,
-    key: [u8; 16],
-    stats: &mut ClockUnionStats,
-    depth: usize,
-) -> Result<ClockSplit, ProjectionError> {
-    ensure_authenticated_map_depth(depth, "causal clock split")?;
-    let Some(link) = root else {
-        return Ok((None, None, None));
-    };
-    let node = load_clock_node_measured(connection, &link, stats)?;
-    match key.cmp(&link.key) {
-        std::cmp::Ordering::Equal => Ok((node.left, Some(node.counter), node.right)),
-        std::cmp::Ordering::Less => {
-            let (less, counter, greater_left) =
-                split_causal_clock_root(connection, node.left.clone(), key, stats, depth + 1)?;
-            let greater = ClockNode {
-                left: greater_left,
-                ..node.clone()
-            };
-            let greater = reuse_or_write_clock_node(
-                connection,
-                [(&link, &node), (&link, &node)],
-                &greater,
-                stats,
-            )?;
-            Ok((less, counter, Some(greater)))
-        }
-        std::cmp::Ordering::Greater => {
-            let (less_right, counter, greater) =
-                split_causal_clock_root(connection, node.right.clone(), key, stats, depth + 1)?;
-            let less = ClockNode {
-                right: less_right,
-                ..node.clone()
-            };
-            let less = reuse_or_write_clock_node(
-                connection,
-                [(&link, &node), (&link, &node)],
-                &less,
-                stats,
-            )?;
-            Ok((Some(less), counter, greater))
-        }
-    }
-}
-
-fn load_clock_node_measured(
-    connection: &Connection,
-    link: &MapLink,
-    stats: &mut ClockUnionStats,
-) -> Result<ClockNode, ProjectionError> {
-    let node = load_clock_node(connection, link)?;
-    stats.nodes_read = stats.nodes_read.saturating_add(1);
-    Ok(node)
-}
-
-fn reuse_or_write_clock_node<const N: usize>(
-    connection: &Connection,
-    candidates: [(&MapLink, &ClockNode); N],
-    node: &ClockNode,
-    stats: &mut ClockUnionStats,
-) -> Result<MapLink, ProjectionError> {
-    if let Some((link, _)) = candidates
-        .into_iter()
-        .find(|(_, candidate)| *candidate == node)
-    {
-        stats.shared_subtrees = stats.shared_subtrees.saturating_add(1);
-        return Ok(link.clone());
-    }
-    stats.nodes_written = stats.nodes_written.saturating_add(1);
-    write_clock_node(connection, node)
-}
-
-fn ensure_authenticated_map_depth(depth: usize, operation: &str) -> Result<(), ProjectionError> {
-    if depth > MAX_AUTHENTICATED_MAP_DEPTH {
-        return Err(ProjectionError::Corrupt(format!(
-            "{operation} exceeds its bounded depth"
-        )));
-    }
-    Ok(())
-}
-
-fn upsert_causal_clock(
-    connection: &Connection,
-    root: Option<MapLink>,
-    peer: CausalPeerId,
-    counter: u64,
-) -> Result<MapLink, ProjectionError> {
-    upsert_causal_clock_link(connection, root, peer, counter, 0)
-}
-
-fn upsert_causal_clock_link(
-    connection: &Connection,
-    root: Option<MapLink>,
-    peer: CausalPeerId,
-    counter: u64,
-    depth: usize,
-) -> Result<MapLink, ProjectionError> {
-    ensure_authenticated_map_depth(depth, "causal clock update")?;
-    let Some(root) = root else {
-        return write_clock_node(
-            connection,
-            &ClockNode {
-                peer,
-                counter,
-                left: None,
-                right: None,
-            },
-        );
-    };
-    let mut node = load_clock_node(connection, &root)?;
-    match peer.cmp(&node.peer) {
-        std::cmp::Ordering::Equal => {
-            node.counter = node.counter.max(counter);
-            write_clock_node(connection, &node)
-        }
-        std::cmp::Ordering::Less => {
-            node.left = Some(upsert_causal_clock_link(
-                connection,
-                node.left.take(),
-                peer,
-                counter,
-                depth + 1,
-            )?);
-            if node.left.as_ref().is_some_and(|left| {
-                super::scratch_store::authenticated_map_priority_order(
-                    left.key,
-                    causal_peer_key(node.peer),
-                )
-                .is_lt()
-            }) {
-                rotate_clock_right(connection, node)
-            } else {
-                write_clock_node(connection, &node)
-            }
-        }
-        std::cmp::Ordering::Greater => {
-            node.right = Some(upsert_causal_clock_link(
-                connection,
-                node.right.take(),
-                peer,
-                counter,
-                depth + 1,
-            )?);
-            if node.right.as_ref().is_some_and(|right| {
-                super::scratch_store::authenticated_map_priority_order(
-                    right.key,
-                    causal_peer_key(node.peer),
-                )
-                .is_lt()
-            }) {
-                rotate_clock_left(connection, node)
-            } else {
-                write_clock_node(connection, &node)
-            }
-        }
-    }
-}
-
-fn rotate_clock_right(
-    connection: &Connection,
-    mut node: ClockNode,
-) -> Result<MapLink, ProjectionError> {
-    let left_link = node.left.take().ok_or_else(|| {
-        ProjectionError::Corrupt("causal clock rotation has no left child".into())
-    })?;
-    let mut left = load_clock_node(connection, &left_link)?;
-    node.left = left.right.take();
-    left.right = Some(write_clock_node(connection, &node)?);
-    write_clock_node(connection, &left)
-}
-
-fn rotate_clock_left(
-    connection: &Connection,
-    mut node: ClockNode,
-) -> Result<MapLink, ProjectionError> {
-    let right_link = node.right.take().ok_or_else(|| {
-        ProjectionError::Corrupt("causal clock rotation has no right child".into())
-    })?;
-    let mut right = load_clock_node(connection, &right_link)?;
-    node.right = right.left.take();
-    right.left = Some(write_clock_node(connection, &node)?);
-    write_clock_node(connection, &right)
-}
-
-fn write_clock_node(connection: &Connection, node: &ClockNode) -> Result<MapLink, ProjectionError> {
-    let key = causal_peer_key(node.peer);
-    let value_digest = super::hot_engine::causal_clock_counter_digest(node.peer, node.counter);
-    let digest = super::scratch_store::authenticated_map_node_digest(
-        key,
-        value_digest,
-        node.left.as_ref().map(|child| (child.key, child.digest)),
-        node.right.as_ref().map(|child| (child.key, child.digest)),
-    );
-    let link = MapLink { key, digest };
-    validate_clock_node(&link, value_digest, node)?;
-    connection.execute(
-        "INSERT OR IGNORE INTO causal_clock_nodes (
-             node_digest, peer_id, counter, value_digest, left_peer_id, left_digest,
-             right_peer_id, right_digest
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        params![
-            digest.as_bytes().as_slice(),
-            key.as_slice(),
-            i64::try_from(node.counter)
-                .map_err(|_| ProjectionError::Corrupt("causal counter exceeds SQLite".into()))?,
-            value_digest.as_bytes().as_slice(),
-            node.left.as_ref().map(|child| child.key.as_slice()),
-            node.left
-                .as_ref()
-                .map(|child| child.digest.as_bytes().as_slice()),
-            node.right.as_ref().map(|child| child.key.as_slice()),
-            node.right
-                .as_ref()
-                .map(|child| child.digest.as_bytes().as_slice()),
-        ],
-    )?;
-    let _ = load_clock_node(connection, &link)?;
-    Ok(link)
-}
-
-fn upsert_accepted_batch_map(
-    connection: &Connection,
-    root: Option<MapLink>,
-    batch_id: BatchId,
-    value_digest: ContentDigest,
-) -> Result<MapLink, ProjectionError> {
-    let Some(root) = root else {
-        return write_batch_map_node(
-            connection,
-            &BatchMapNode {
-                batch_id,
-                value_digest,
-                left: None,
-                right: None,
-            },
-        );
-    };
-    let mut node = load_batch_map_node(connection, &root)?;
-    match batch_id.cmp(&node.batch_id) {
-        std::cmp::Ordering::Equal => {
-            node.value_digest = value_digest;
-            write_batch_map_node(connection, &node)
-        }
-        std::cmp::Ordering::Less => {
-            node.left = Some(upsert_accepted_batch_map(
-                connection,
-                node.left.take(),
-                batch_id,
-                value_digest,
-            )?);
-            if node.left.as_ref().is_some_and(|left| {
-                super::scratch_store::authenticated_map_priority_order(
-                    left.key,
-                    node.batch_id.as_uuid().into_bytes(),
-                )
-                .is_lt()
-            }) {
-                rotate_batch_map_right(connection, node)
-            } else {
-                write_batch_map_node(connection, &node)
-            }
-        }
-        std::cmp::Ordering::Greater => {
-            node.right = Some(upsert_accepted_batch_map(
-                connection,
-                node.right.take(),
-                batch_id,
-                value_digest,
-            )?);
-            if node.right.as_ref().is_some_and(|right| {
-                super::scratch_store::authenticated_map_priority_order(
-                    right.key,
-                    node.batch_id.as_uuid().into_bytes(),
-                )
-                .is_lt()
-            }) {
-                rotate_batch_map_left(connection, node)
-            } else {
-                write_batch_map_node(connection, &node)
-            }
-        }
-    }
-}
-
-fn rotate_batch_map_right(
-    connection: &Connection,
-    mut node: BatchMapNode,
-) -> Result<MapLink, ProjectionError> {
-    let left_link = node.left.take().ok_or_else(|| {
-        ProjectionError::Corrupt("accepted batch-map rotation has no left child".into())
-    })?;
-    let mut left = load_batch_map_node(connection, &left_link)?;
-    node.left = left.right.take();
-    left.right = Some(write_batch_map_node(connection, &node)?);
-    write_batch_map_node(connection, &left)
-}
-
-fn rotate_batch_map_left(
-    connection: &Connection,
-    mut node: BatchMapNode,
-) -> Result<MapLink, ProjectionError> {
-    let right_link = node.right.take().ok_or_else(|| {
-        ProjectionError::Corrupt("accepted batch-map rotation has no right child".into())
-    })?;
-    let mut right = load_batch_map_node(connection, &right_link)?;
-    node.right = right.left.take();
-    right.left = Some(write_batch_map_node(connection, &node)?);
-    write_batch_map_node(connection, &right)
-}
-
-fn write_batch_map_node(
-    connection: &Connection,
-    node: &BatchMapNode,
-) -> Result<MapLink, ProjectionError> {
-    let key = node.batch_id.as_uuid().into_bytes();
-    let digest = super::scratch_store::authenticated_map_node_digest(
-        key,
-        node.value_digest,
-        node.left.as_ref().map(|child| (child.key, child.digest)),
-        node.right.as_ref().map(|child| (child.key, child.digest)),
-    );
-    let link = MapLink { key, digest };
-    connection.execute(
-        "INSERT OR IGNORE INTO accepted_batch_nodes (
-             node_digest, batch_id, value_digest, left_batch_id, left_digest,
-             right_batch_id, right_digest
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![
-            digest.as_bytes().as_slice(),
-            key.as_slice(),
-            node.value_digest.as_bytes().as_slice(),
-            node.left.as_ref().map(|child| child.key.as_slice()),
-            node.left
-                .as_ref()
-                .map(|child| child.digest.as_bytes().as_slice()),
-            node.right.as_ref().map(|child| child.key.as_slice()),
-            node.right
-                .as_ref()
-                .map(|child| child.digest.as_bytes().as_slice()),
-        ],
-    )?;
-    let _ = load_batch_map_node(connection, &link)?;
-    Ok(link)
+            &physical,
+            descendant.as_uuid().into_bytes(),
+            ancestor.as_uuid().into_bytes(),
+        )?,
+        0,
+    ))
 }
 
 fn encode_batch_ids(batch_ids: &[BatchId]) -> Result<Vec<u8>, ProjectionError> {
@@ -8250,6 +6438,7 @@ fn validate_opened_lease_file(file: &File, path: &Path) -> Result<(), Projection
     Ok(())
 }
 
+#[cfg(test)]
 fn uuid_blob(uuid: &Uuid) -> Vec<u8> {
     uuid.as_bytes().to_vec()
 }
@@ -8258,6 +6447,7 @@ fn decode_workspace_id(bytes: &[u8]) -> Result<WorkspaceId, ProjectionError> {
     Ok(WorkspaceId::from_uuid(decode_uuid(bytes)?))
 }
 
+#[cfg(test)]
 fn decode_document_id(bytes: &[u8]) -> Result<DocumentId, ProjectionError> {
     Ok(DocumentId::from_uuid(decode_uuid(bytes)?))
 }
@@ -8274,17 +6464,6 @@ fn decode_semantic_effect_digest(bytes: &[u8]) -> Result<SemanticEffectDigest, P
         ProjectionError::Corrupt("semantic-effect digest has invalid length".into())
     })?;
     Ok(SemanticEffectDigest::from_bytes(bytes))
-}
-
-fn decode_batch_id_sql(bytes: &[u8]) -> rusqlite::Result<BatchId> {
-    let uuid = Uuid::from_slice(bytes).map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(
-            bytes.len(),
-            rusqlite::types::Type::Blob,
-            Box::new(error),
-        )
-    })?;
-    Ok(BatchId::from_uuid(uuid))
 }
 
 fn decode_uuid(bytes: &[u8]) -> Result<Uuid, ProjectionError> {
@@ -8449,6 +6628,72 @@ impl From<super::StoreError> for ProjectionError {
 impl From<super::sqlite_materialization::MaterializationError> for ProjectionError {
     fn from(value: super::sqlite_materialization::MaterializationError) -> Self {
         Self::Materialization(value.to_string())
+    }
+}
+
+impl From<storage_frontier::FrontierError> for ProjectionError {
+    fn from(value: storage_frontier::FrontierError) -> Self {
+        match value {
+            storage_frontier::FrontierError::Sqlite(error) => Self::Sqlite(error),
+            storage_frontier::FrontierError::Materialization(error) => Self::from(
+                super::sqlite_materialization::MaterializationError::from(error),
+            ),
+            storage_frontier::FrontierError::Schema(error) => Self::SchemaMismatch(error),
+            storage_frontier::FrontierError::ClaimBytes {
+                field: "workspace_id",
+                expected,
+                found,
+            } => match (decode_workspace_id(&expected), decode_workspace_id(&found)) {
+                (Ok(expected), Ok(found)) => Self::WorkspaceMismatch { expected, found },
+                _ => Self::Corrupt("stored workspace claim has an invalid length".into()),
+            },
+            storage_frontier::FrontierError::ClaimBytes {
+                field: "lineage_digest",
+                expected,
+                found,
+            } => match (
+                decode_lineage_digest(&expected),
+                decode_lineage_digest(&found),
+            ) {
+                (Ok(expected), Ok(found)) => Self::LineageMismatch { expected, found },
+                _ => Self::Corrupt("stored lineage claim has an invalid length".into()),
+            },
+            storage_frontier::FrontierError::ClaimBytes { field, .. } => {
+                Self::Corrupt(format!("stored {field} claim is invalid"))
+            }
+            storage_frontier::FrontierError::ClaimVersion {
+                field,
+                expected,
+                found,
+            } => Self::ProtocolMismatch {
+                field,
+                expected,
+                found,
+            },
+            storage_frontier::FrontierError::Corrupt(error) => Self::Corrupt(error),
+            storage_frontier::FrontierError::InvalidInput(error) => {
+                Self::InvalidAcceptedEvent(error)
+            }
+            storage_frontier::FrontierError::MissingDependency(batch_id) => {
+                Self::MissingDependency(BatchId::from_uuid(Uuid::from_bytes(batch_id)))
+            }
+            storage_frontier::FrontierError::AcceptanceOrder { expected, found } => {
+                Self::AcceptanceOrder { expected, found }
+            }
+            storage_frontier::FrontierError::FrontierRegression => Self::FrontierRegression,
+            storage_frontier::FrontierError::BatchCollision(batch_id) => {
+                Self::BatchCollision(BatchId::from_uuid(Uuid::from_bytes(batch_id)))
+            }
+            storage_frontier::FrontierError::MaterializationCollision(batch_id) => {
+                Self::Materialization(
+                    super::MaterializationError::DuplicateCollision(BatchId::from_uuid(
+                        Uuid::from_bytes(batch_id),
+                    ))
+                    .to_string(),
+                )
+            }
+            storage_frontier::FrontierError::InjectedFailure => Self::InjectedFailure,
+        }
     }
 }
 
@@ -10094,24 +8339,32 @@ mod tests {
                         .execute_batch("DROP TABLE applied_batches")
                         .unwrap();
                     let altered = match case {
-                        "type" => APPLIED_BATCHES_DDL.replacen("batch_id BLOB", "batch_id TEXT", 1),
-                        "primary-key" => APPLIED_BATCHES_DDL.replacen(
+                        "type" => storage_frontier::APPLIED_BATCHES_DDL.replacen(
+                            "batch_id BLOB",
+                            "batch_id TEXT",
+                            1,
+                        ),
+                        "primary-key" => storage_frontier::APPLIED_BATCHES_DDL.replacen(
                             "sequence INTEGER PRIMARY KEY",
                             "sequence INTEGER NOT NULL",
                             1,
                         ),
-                        "check" => APPLIED_BATCHES_DDL.replacen(
+                        "check" => storage_frontier::APPLIED_BATCHES_DDL.replacen(
                             "retained_bytes INTEGER NOT NULL CHECK (retained_bytes >= 0)",
                             "retained_bytes INTEGER NOT NULL",
                             1,
                         ),
-                        "strict" => APPLIED_BATCHES_DDL.replacen(") STRICT", ")", 1),
+                        "strict" => {
+                            storage_frontier::APPLIED_BATCHES_DDL.replacen(") STRICT", ")", 1)
+                        }
                         _ => unreachable!(),
                     };
                     connection.execute_batch(&altered).unwrap();
-                    connection.execute_batch(BATCH_ID_INDEX_DDL).unwrap();
                     connection
-                        .execute_batch(ACCEPTANCE_SEQUENCE_INDEX_DDL)
+                        .execute_batch(storage_frontier::BATCH_ID_INDEX_DDL)
+                        .unwrap();
+                    connection
+                        .execute_batch(storage_frontier::ACCEPTANCE_SEQUENCE_INDEX_DDL)
                         .unwrap();
                 }
                 "unique-index" => {
@@ -13521,109 +11774,6 @@ mod tests {
             large.clock_nodes
         );
         assert!(large.ancestry_rows_read <= 96);
-    }
-
-    fn repeated_fresh_peer_fork_merge_work(batch_count: usize, seed: u128) -> ClockUnionStats {
-        let connection = Connection::open_in_memory().unwrap();
-        connection.execute_batch(CAUSAL_CLOCK_NODES_DDL).unwrap();
-        let mut root = None;
-        let mut stats = ClockUnionStats::default();
-        for index in 0..batch_count {
-            let left_peer =
-                CausalPeerId::from_device_id(DeviceId::from_uuid(uuid(seed + index as u128 * 2)));
-            let right_peer = CausalPeerId::from_device_id(DeviceId::from_uuid(uuid(
-                seed + index as u128 * 2 + 1,
-            )));
-            let left = Some(upsert_causal_clock(&connection, root.clone(), left_peer, 1).unwrap());
-            let right =
-                Some(upsert_causal_clock(&connection, root.clone(), right_peer, 1).unwrap());
-            root = merge_causal_clock_roots_measured(&connection, left, right, &mut stats).unwrap();
-        }
-        stats
-    }
-
-    #[test]
-    fn repeated_fresh_peer_fork_merge_union_is_near_linear() {
-        let work = [100_usize, 200, 400].map(|batch_count| {
-            repeated_fresh_peer_fork_merge_work(batch_count, 90_000 + batch_count as u128 * 10_000)
-        });
-        eprintln!(
-            "clock_union_fresh_peer_sweep batches=100 reads={} writes={} shared={}; batches=200 reads={} writes={} shared={}; batches=400 reads={} writes={} shared={}",
-            work[0].nodes_read,
-            work[0].nodes_written,
-            work[0].shared_subtrees,
-            work[1].nodes_read,
-            work[1].nodes_written,
-            work[1].shared_subtrees,
-            work[2].nodes_read,
-            work[2].nodes_written,
-            work[2].shared_subtrees,
-        );
-        assert!(
-            work[1].nodes_read <= work[0].nodes_read.saturating_mul(3),
-            "doubling 100 -> 200 grew clock-union reads from {} to {}",
-            work[0].nodes_read,
-            work[1].nodes_read
-        );
-        assert!(
-            work[2].nodes_read <= work[1].nodes_read.saturating_mul(3),
-            "doubling 200 -> 400 grew clock-union reads from {} to {}",
-            work[1].nodes_read,
-            work[2].nodes_read
-        );
-        assert!(
-            work[2].nodes_read <= 400 * 256,
-            "400 repeated fork/merges read {} authenticated clock nodes",
-            work[2].nodes_read
-        );
-        assert!(work.iter().all(|stats| stats.shared_subtrees > 0));
-    }
-
-    #[test]
-    fn causal_clock_union_is_canonical_exact_and_order_independent() {
-        let connection = Connection::open_in_memory().unwrap();
-        connection.execute_batch(CAUSAL_CLOCK_NODES_DDL).unwrap();
-        let peers = (0..4_u128)
-            .map(|index| CausalPeerId::from_device_id(DeviceId::from_uuid(uuid(500_000 + index))))
-            .collect::<Vec<_>>();
-        let mut left = None;
-        for (peer, counter) in [(peers[0], 2), (peers[1], 7), (peers[3], 1)] {
-            left = Some(upsert_causal_clock(&connection, left, peer, counter).unwrap());
-        }
-        let mut right = None;
-        for (peer, counter) in [(peers[0], 5), (peers[1], 3), (peers[2], 11)] {
-            right = Some(upsert_causal_clock(&connection, right, peer, counter).unwrap());
-        }
-
-        let left_then_right =
-            merge_causal_clock_roots(&connection, left.clone(), right.clone()).unwrap();
-        let right_then_left =
-            merge_causal_clock_roots(&connection, right.clone(), left.clone()).unwrap();
-        assert_eq!(left_then_right, right_then_left);
-        for (peer, expected) in [(peers[0], 5), (peers[1], 7), (peers[2], 11), (peers[3], 1)] {
-            assert_eq!(
-                causal_clock_lookup(&connection, left_then_right.clone(), peer, &mut 0).unwrap(),
-                Some(expected)
-            );
-        }
-        assert_eq!(
-            merge_causal_clock_roots(&connection, None, left_then_right.clone()).unwrap(),
-            left_then_right
-        );
-        let mut duplicate_stats = ClockUnionStats::default();
-        assert_eq!(
-            merge_causal_clock_roots_measured(
-                &connection,
-                left_then_right.clone(),
-                left_then_right.clone(),
-                &mut duplicate_stats,
-            )
-            .unwrap(),
-            left_then_right
-        );
-        assert_eq!(duplicate_stats.nodes_read, 0);
-        assert_eq!(duplicate_stats.nodes_written, 0);
-        assert_eq!(duplicate_stats.shared_subtrees, 1);
     }
 
     #[test]

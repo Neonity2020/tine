@@ -11,9 +11,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+use rusqlite::Connection;
 #[cfg(test)]
-use rusqlite::params;
-use rusqlite::{Connection, Transaction};
+use rusqlite::{params, Transaction};
 use serde::{Deserialize, Serialize};
 use tine_storage::sqlite_materialization as storage;
 use uuid::Uuid;
@@ -1474,15 +1474,12 @@ fn strictly_sorted_unique_by<T, K: Ord>(values: &[T], key: impl Fn(&T) -> K) -> 
     values.windows(2).all(|pair| key(&pair[0]) < key(&pair[1]))
 }
 
+#[cfg(test)]
 pub(crate) fn initialize_schema(
     connection: &Connection,
     empty_frontier_digest: ContentDigest,
 ) -> Result<(), MaterializationError> {
     storage::initialize_schema(connection, empty_frontier_digest).map_err(Into::into)
-}
-
-pub(crate) fn validate_schema(connection: &Connection) -> Result<(), MaterializationError> {
-    storage::validate_schema(connection).map_err(Into::into)
 }
 
 pub(crate) fn row_digest(connection: &Connection) -> Result<ContentDigest, MaterializationError> {
@@ -1495,13 +1492,6 @@ pub(crate) fn ensure_stamp(
     frontier_digest: ContentDigest,
 ) -> Result<(), MaterializationError> {
     storage::ensure_stamp(connection, sequence, frontier_digest).map_err(Into::into)
-}
-
-pub(crate) fn recorded_digest(
-    connection: &Connection,
-    sequence: u64,
-) -> Result<Option<ContentDigest>, MaterializationError> {
-    storage::recorded_digest(connection, sequence).map_err(Into::into)
 }
 
 pub(crate) fn finalize_fresh_bootstrap(
@@ -1517,6 +1507,7 @@ pub(crate) fn finalize_fresh_bootstrap(
     .map_err(Into::into)
 }
 
+#[cfg(test)]
 pub(crate) fn apply_change(
     transaction: &Transaction<'_>,
     change: &MaterializationChange,
@@ -1539,31 +1530,7 @@ pub(crate) fn apply_change(
     .map_err(Into::into)
 }
 
-pub(crate) fn apply_change_fresh_bootstrap(
-    transaction: &Transaction<'_>,
-    change: &MaterializationChange,
-    semantic_effect: &[u8],
-    sequence: u64,
-    input_digest: ContentDigest,
-    post_frontier_digest: ContentDigest,
-    authenticated_reference: Option<&AuthenticatedReferenceMaterialization>,
-    prior_reference_coverage_count: u64,
-) -> Result<ApplyChangeInstrumentation, MaterializationError> {
-    let (physical, authenticated) =
-        lower_validated_change(change, semantic_effect, authenticated_reference)?;
-    storage::apply_change_fresh_bootstrap(
-        transaction,
-        &physical,
-        sequence,
-        input_digest,
-        post_frontier_digest,
-        authenticated.as_ref(),
-        prior_reference_coverage_count,
-    )
-    .map_err(Into::into)
-}
-
-fn lower_validated_change(
+pub(crate) fn lower_validated_change(
     change: &MaterializationChange,
     semantic_effect: &[u8],
     authenticated_reference: Option<&AuthenticatedReferenceMaterialization>,
