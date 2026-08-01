@@ -206,8 +206,18 @@ impl PortablePathIndexStore {
         publisher: super::object_store::DetachedBootstrapImmutablePublisher,
     ) -> Result<Self, StoreError> {
         Ok(Self {
-            patricia: self.patricia.for_detached_bootstrap(publisher)?,
+            patricia: self
+                .patricia
+                .for_detached_bootstrap_construction(publisher)?,
         })
+    }
+
+    pub(crate) fn finish_detached_construction(
+        &self,
+        root: PortablePathIndexRoot,
+    ) -> Result<(), StoreError> {
+        self.patricia.finish_detached_construction(root.0)?;
+        Ok(())
     }
 
     pub(crate) fn stats(&self) -> PatriciaIndexStats {

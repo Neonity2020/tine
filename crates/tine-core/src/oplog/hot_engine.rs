@@ -1969,6 +1969,7 @@ impl DetachedBootstrapIndexDurability {
 pub(crate) struct BootstrapCatalogWorkStats {
     pub(crate) authenticated_page_identity_lookups: usize,
     pub(crate) full_catalog_author_clones: usize,
+    pub(crate) detached_index_persistent_node_reads: usize,
     pub(crate) reference_fallback_document_reconstructions: usize,
     pub(crate) reference_catalog_peak_resident_bytes: usize,
     pub(crate) reference_catalog_buffer_flushes: usize,
@@ -2039,9 +2040,27 @@ impl DetachedBootstrapCandidate {
     pub(crate) fn bootstrap_catalog_work_stats(&self) -> BootstrapCatalogWorkStats {
         let reference = self.engine.reference_source_observations.get();
         let construction = self.engine.reference_catalog.construction_work_stats();
+        let detached_index_persistent_node_reads = self
+            .engine
+            .portable_path_index
+            .as_ref()
+            .map_or(0, |index| index.stats().reads)
+            .saturating_add(
+                self.engine
+                    .logseq_claim_index
+                    .as_ref()
+                    .map_or(0, |index| index.stats().reads),
+            )
+            .saturating_add(
+                self.engine
+                    .page_name_index
+                    .as_ref()
+                    .map_or(0, |index| index.stats().reads),
+            );
         BootstrapCatalogWorkStats {
             authenticated_page_identity_lookups: reference.authenticated_page_identity_lookups,
             full_catalog_author_clones: self.engine.read_only_catalog_clones.get(),
+            detached_index_persistent_node_reads,
             reference_fallback_document_reconstructions: reference
                 .fallback_document_reconstructions,
             reference_catalog_peak_resident_bytes: construction.peak_resident_bytes,
@@ -2483,6 +2502,21 @@ impl DetachedBootstrapAuthoringSession {
             .reference_catalog
             .finish_construction()
             .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))?;
+        if let Some(index) = candidate.portable_path_index.as_ref() {
+            index
+                .finish_detached_construction(candidate.portable_path_root)
+                .map_err(|error| EngineError::Archive(error.to_string()))?;
+        }
+        if let Some(index) = candidate.logseq_claim_index.as_ref() {
+            index
+                .finish_detached_construction(candidate.logseq_claim_root)
+                .map_err(|error| EngineError::Archive(error.to_string()))?;
+        }
+        if let Some(index) = candidate.page_name_index.as_ref() {
+            index
+                .finish_detached_construction(&candidate.page_name_root)
+                .map_err(|error| EngineError::Archive(error.to_string()))?;
+        }
         let index_durability = match self.publication {
             Some(publication) => DetachedBootstrapIndexDurability::Authored(
                 publication
@@ -9011,12 +9045,24 @@ impl ShardedHotEngine {
         ),
         EngineError,
     > {
+        let document_ids = replacements.keys().copied().collect::<Vec<_>>();
+        let prior_dependencies = self
+            .accepted_frontier_documents_many_authenticated_with_session(
+                &self.accepted_frontier_root,
+                &document_ids,
+                None,
+            )?
+            .into_iter()
+            .enumerate()
+            .map(|(index, dependencies)| (document_ids[index], dependencies))
+            .collect::<BTreeMap<_, _>>();
         let mut changed_documents = BTreeMap::new();
         for (document_id, replacement) in replacements {
             let mut heads = if let Some(heads) = replacement_heads.get(document_id) {
                 heads.clone()
             } else {
-                self.accepted_document_dependencies(*document_id)?
+                prior_dependencies[document_id]
+                    .as_ref()
                     .map(|document| document.direct_dependency_heads().iter().copied().collect())
                     .unwrap_or_default()
             };
@@ -9040,15 +9086,13 @@ impl ShardedHotEngine {
         let new_document_count = changed_documents.keys().try_fold(
             prior_frontier_root.document_count,
             |count, document_id| -> Result<u64, EngineError> {
-                Ok(
-                    if self.accepted_document_dependencies(*document_id)?.is_some() {
-                        count
-                    } else {
-                        count.checked_add(1).ok_or_else(|| {
-                            EngineError::Archive("accepted document count overflowed".into())
-                        })?
-                    },
-                )
+                Ok(if prior_dependencies[document_id].is_some() {
+                    count
+                } else {
+                    count.checked_add(1).ok_or_else(|| {
+                        EngineError::Archive("accepted document count overflowed".into())
+                    })?
+                })
             },
         )?;
         let (post_documents, scratch_root, document_map_root_key, document_map_root_digest) =
@@ -9069,16 +9113,25 @@ impl ShardedHotEngine {
                         &records,
                     )
                     .map_err(|error| EngineError::Archive(error.to_string()))?;
-                for (document_id, dependencies) in &changed_documents {
-                    let value_digest = ContentDigest::of(&encode_accepted_document(dependencies)?);
-                    roots.accepted_document_map_root = store
-                        .authenticated_map_upsert(
-                            &roots.accepted_document_map_root,
-                            document_id.as_uuid().into_bytes(),
-                            value_digest,
-                        )
-                        .map_err(|error| EngineError::Archive(error.to_string()))?;
-                }
+                let authenticated_records = records
+                    .iter()
+                    .map(|(key, value)| {
+                        let key: [u8; 16] = key
+                            .as_slice()
+                            .try_into()
+                            .expect("accepted document keys are UUID bytes");
+                        let value = value
+                            .as_ref()
+                            .expect("accepted frontier mutations are insertions");
+                        (key, ContentDigest::of(value))
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                roots.accepted_document_map_root = store
+                    .authenticated_map_upsert_many(
+                        &roots.accepted_document_map_root,
+                        &authenticated_records,
+                    )
+                    .map_err(|error| EngineError::Archive(error.to_string()))?;
                 if roots.accepted_document_map_root.count() != new_document_count {
                     return Err(EngineError::Archive(
                         "authenticated document map count differs from accepted frontier".into(),
@@ -9309,15 +9362,20 @@ impl ShardedHotEngine {
                     "current-path catalog delta contains a duplicate page".into(),
                 ));
             }
-            let stored = store
-                .authenticated_catalog_lookup(
-                    &self.current_path_catalog.root,
-                    delta.page_id.as_uuid().into_bytes(),
-                )
-                .map_err(|error| EngineError::Archive(error.to_string()))?
-                .map(|encoded| decode_current_path_catalog_row(&encoded))
+        }
+        let desired_keys = desired
+            .keys()
+            .map(|page_id| page_id.as_uuid().into_bytes())
+            .collect::<BTreeSet<_>>();
+        let stored_rows = store
+            .authenticated_catalog_lookup_many(&self.current_path_catalog.root, &desired_keys)
+            .map_err(|error| EngineError::Archive(error.to_string()))?;
+        for page_id in desired.keys().copied() {
+            let stored = stored_rows
+                .get(&page_id.as_uuid().into_bytes())
+                .map(|encoded| decode_current_path_catalog_row(encoded))
                 .transpose()?;
-            let current = self.current_effective_path_catalog_row(delta.page_id)?;
+            let current = self.current_effective_path_catalog_row(page_id)?;
             if stored.as_ref() != current.as_ref().map(|(row, _)| row) {
                 return Err(EngineError::Archive(
                     "current-path catalog is missing or corrupt before-row authority".into(),
@@ -9326,18 +9384,25 @@ impl ShardedHotEngine {
         }
 
         let mut root = self.current_path_catalog.root.clone();
+        let mut removals = Vec::new();
+        let mut upserts = BTreeMap::new();
         for (page_id, after) in desired {
             let key = page_id.as_uuid().into_bytes();
+            match after {
+                Some(after) => {
+                    upserts.insert(key, encode_current_path_catalog_row(&after)?);
+                }
+                None => removals.push(key),
+            }
+        }
+        for key in removals {
             root = store
                 .authenticated_catalog_remove(&root, key)
                 .map_err(|error| EngineError::Archive(error.to_string()))?;
-            if let Some(after) = after {
-                let encoded = encode_current_path_catalog_row(&after)?;
-                root = store
-                    .authenticated_catalog_upsert(&root, key, &encoded)
-                    .map_err(|error| EngineError::Archive(error.to_string()))?;
-            }
         }
+        root = store
+            .authenticated_catalog_upsert_many(&root, &upserts)
+            .map_err(|error| EngineError::Archive(error.to_string()))?;
         if root.count() > MAX_DOCUMENT_ENTRIES as u64 {
             return Err(EngineError::Archive(
                 "current-path catalog entry bound exceeded".into(),
@@ -9484,6 +9549,7 @@ impl ShardedHotEngine {
         Ok(clock.into_iter().collect())
     }
 
+    #[allow(dead_code)]
     fn accepted_document_dependencies(
         &self,
         document_id: DocumentId,
@@ -25851,6 +25917,66 @@ mod validation_tests {
     }
 
     #[test]
+    fn detached_bootstrap_index_reads_stay_bounded_across_declaration_parts() {
+        const PART_COUNT: u32 = 4;
+        const PAGES_PER_PART: usize = 16;
+
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(91_040));
+        let lineage = LineageDigest::of(b"detached-bootstrap-index-construction");
+        let catalog = DocumentId::from_uuid(Uuid::from_u128(91_041));
+        let import_id = ImportId::from_digest([0x43; 32]);
+        let durable = TemporaryBootstrapCatalog::create(workspace, "bounded-index-reads");
+        let mut session = DetachedBootstrapAuthoringSession::new(
+            workspace,
+            lineage,
+            catalog,
+            ReferenceCatalogPolicyV1::default(),
+            durable.capability(),
+        )
+        .unwrap();
+        let mut predecessor = None;
+        let mut sampled_pages = Vec::new();
+
+        for ordinal in 0..PART_COUNT {
+            let (transaction, pages) =
+                create_page_batch(91_100 + u128::from(ordinal) * 1_000, PAGES_PER_PART);
+            sampled_pages.extend([pages[0].clone(), pages[PAGES_PER_PART - 1].clone()]);
+            let evidence = detached_evidence(
+                import_id,
+                ordinal,
+                PART_COUNT,
+                predecessor,
+                transaction.operations.len() as u32,
+            );
+            session
+                .author_part(detached_author(evidence, 91_042), &transaction, evidence)
+                .unwrap();
+            predecessor = Some(evidence.part_id());
+        }
+
+        let completed = session.finish().unwrap();
+        let work = completed.bootstrap_catalog_work_stats();
+        assert!(
+            work.detached_index_persistent_node_reads <= 3,
+            "detached construction reread prior Patricia nodes: {work:?}"
+        );
+        let io = completed.engine.instrumentation();
+        let page_count = PART_COUNT as usize * PAGES_PER_PART;
+        assert!(
+            io.scratch_page_reads <= page_count * 12,
+            "detached authoring reread cumulative scratch graphs: {io:?}"
+        );
+        assert!(
+            io.scratch_page_bytes_read <= page_count * 32 * 1024,
+            "detached authoring reread cumulative scratch bytes: {io:?}"
+        );
+        for (page_id, expected_content) in sampled_pages {
+            let page = completed.engine.materialize_page(page_id).unwrap();
+            assert_eq!(page.blocks[0].content, expected_content);
+        }
+    }
+
+    #[test]
     fn detached_content_uses_authenticated_page_identity_without_affecting_catalog() {
         let workspace = WorkspaceId::from_uuid(Uuid::from_u128(91_070));
         let lineage = LineageDigest::of(b"detached-content-catalog-cache");
@@ -26829,6 +26955,27 @@ mod validation_tests {
             },
         ])
         .unwrap()
+    }
+
+    fn create_page_batch(
+        seed: u128,
+        count: usize,
+    ) -> (OperationTransaction, Vec<(PageId, String)>) {
+        let mut operations = Vec::with_capacity(count * 2);
+        let mut pages = Vec::with_capacity(count);
+        for offset in 0..count {
+            let identity = seed + offset as u128 * 3;
+            let page_id = PageId::from_uuid(Uuid::from_u128(identity));
+            let home_document_id = DocumentId::from_uuid(Uuid::from_u128(identity + 1));
+            let block_id = BlockId::from_uuid(Uuid::from_u128(identity + 2));
+            let name = format!("Bootstrap scale {identity}");
+            let path = format!("pages/bootstrap-scale-{identity}.md");
+            let transaction =
+                create_page_with_block(page_id, home_document_id, block_id, &name, &path);
+            operations.extend(transaction.operations);
+            pages.push((page_id, format!("{name} identity")));
+        }
+        (OperationTransaction::new(operations).unwrap(), pages)
     }
 
     struct PreauthorGateFixture {

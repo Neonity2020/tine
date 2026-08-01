@@ -1,6 +1,7 @@
 #![allow(clippy::result_large_err)]
 
 use std::collections::BTreeMap;
+use std::sync::Mutex;
 
 use cap_std::fs::Dir;
 
@@ -70,6 +71,7 @@ impl tine_storage::PatriciaNodePublisher for CorePatriciaPublisher {
 #[derive(Debug)]
 pub(crate) struct PatriciaIndexStore {
     storage: tine_storage::PatriciaIndexStore,
+    construction: Option<Mutex<Option<PatriciaIndexConstruction>>>,
     #[cfg(test)]
     reclamation_attempts: std::sync::atomic::AtomicUsize,
 }
@@ -78,6 +80,7 @@ impl PatriciaIndexStore {
     pub(crate) fn new(nodes: Dir) -> Self {
         Self {
             storage: tine_storage::PatriciaIndexStore::new(nodes, CorePatriciaPublisher::Ordinary),
+            construction: None,
             #[cfg(test)]
             reclamation_attempts: std::sync::atomic::AtomicUsize::new(0),
         }
@@ -91,10 +94,34 @@ impl PatriciaIndexStore {
             .with_publisher(CorePatriciaPublisher::Detached(publisher))
             .map(|storage| Self {
                 storage,
+                construction: None,
                 #[cfg(test)]
                 reclamation_attempts: std::sync::atomic::AtomicUsize::new(0),
             })
             .map_err(map_storage_error)
+    }
+
+    pub(crate) fn for_detached_bootstrap_construction(
+        &self,
+        publisher: DetachedBootstrapImmutablePublisher,
+    ) -> Result<Self, StoreError> {
+        let mut detached = self.for_detached_bootstrap(publisher)?;
+        detached.construction = Some(Mutex::new(Some(PatriciaIndexConstruction::default())));
+        Ok(detached)
+    }
+
+    fn construction_guard(
+        &self,
+    ) -> Result<Option<std::sync::MutexGuard<'_, Option<PatriciaIndexConstruction>>>, StoreError>
+    {
+        self.construction
+            .as_ref()
+            .map(|construction| {
+                construction
+                    .lock()
+                    .map_err(|_| StoreError::MalformedLogseqClaimIndex)
+            })
+            .transpose()
     }
 
     pub(crate) fn stats(&self) -> PatriciaIndexStats {
@@ -137,7 +164,16 @@ impl PatriciaIndexStore {
     }
 
     pub(crate) fn validate_root(&self, root: PatriciaIndexRoot) -> Result<(), StoreError> {
-        self.storage.validate_root(root).map_err(map_storage_error)
+        let Some(construction) = self.construction_guard()? else {
+            return self.storage.validate_root(root).map_err(map_storage_error);
+        };
+        match construction.as_ref() {
+            Some(construction) => self
+                .storage
+                .construction_validate_root(construction, root)
+                .map_err(map_storage_error),
+            None => self.storage.validate_root(root).map_err(map_storage_error),
+        }
     }
 
     pub(crate) fn lookup(
@@ -145,7 +181,16 @@ impl PatriciaIndexStore {
         root: PatriciaIndexRoot,
         key: &[u8],
     ) -> Result<Option<Vec<u8>>, StoreError> {
-        self.storage.lookup(root, key).map_err(map_storage_error)
+        let Some(construction) = self.construction_guard()? else {
+            return self.storage.lookup(root, key).map_err(map_storage_error);
+        };
+        match construction.as_ref() {
+            Some(construction) => self
+                .storage
+                .construction_lookup(construction, root, key)
+                .map_err(map_storage_error),
+            None => self.storage.lookup(root, key).map_err(map_storage_error),
+        }
     }
 
     #[allow(dead_code)]
@@ -154,9 +199,31 @@ impl PatriciaIndexStore {
         root: PatriciaIndexRoot,
         keys: &[Vec<u8>],
     ) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, StoreError> {
-        self.storage
-            .lookup_many(root, keys)
-            .map_err(map_storage_error)
+        if keys.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(StoreError::MalformedLogseqClaimIndex);
+        }
+        let Some(construction) = self.construction_guard()? else {
+            return self
+                .storage
+                .lookup_many(root, keys)
+                .map_err(map_storage_error);
+        };
+        match construction.as_ref() {
+            Some(construction) => keys
+                .iter()
+                .filter_map(|key| {
+                    self.storage
+                        .construction_lookup(construction, root, key)
+                        .transpose()
+                        .map(|result| result.map(|value| (key.clone(), value)))
+                })
+                .collect::<Result<_, _>>()
+                .map_err(map_storage_error),
+            None => self
+                .storage
+                .lookup_many(root, keys)
+                .map_err(map_storage_error),
+        }
     }
 
     pub(crate) fn lookup_prefix(
@@ -164,9 +231,7 @@ impl PatriciaIndexStore {
         root: PatriciaIndexRoot,
         prefix: &[u8],
     ) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, StoreError> {
-        self.storage
-            .lookup_prefix(root, prefix)
-            .map_err(map_storage_error)
+        self.lookup_prefix_limited(root, prefix, usize::MAX)
     }
 
     pub(crate) fn lookup_prefix_limited(
@@ -175,19 +240,59 @@ impl PatriciaIndexStore {
         prefix: &[u8],
         limit: usize,
     ) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, StoreError> {
-        self.storage
-            .lookup_prefix_limited(root, prefix, limit)
-            .map_err(map_storage_error)
+        let Some(construction) = self.construction_guard()? else {
+            return self
+                .storage
+                .lookup_prefix_limited(root, prefix, limit)
+                .map_err(map_storage_error);
+        };
+        match construction.as_ref() {
+            Some(construction) => self
+                .storage
+                .construction_lookup_prefix_limited(construction, root, prefix, limit)
+                .map_err(map_storage_error),
+            None => self
+                .storage
+                .lookup_prefix_limited(root, prefix, limit)
+                .map_err(map_storage_error),
+        }
     }
 
     pub(crate) fn visit_all(
         &self,
         root: PatriciaIndexRoot,
-        visit: impl FnMut(&[u8], &[u8]) -> bool,
+        mut visit: impl FnMut(&[u8], &[u8]) -> bool,
     ) -> Result<(), StoreError> {
-        self.storage
-            .visit_all(root, visit)
-            .map_err(map_storage_error)
+        let Some(construction_guard) = self.construction_guard()? else {
+            return self
+                .storage
+                .visit_all(root, visit)
+                .map_err(map_storage_error);
+        };
+        match construction_guard.as_ref() {
+            Some(active_construction) => {
+                let mut entries = Vec::new();
+                self.storage
+                    .construction_visit_all(active_construction, root, |key, value| {
+                        entries.push((key.to_vec(), value.to_vec()));
+                        true
+                    })
+                    .map_err(map_storage_error)?;
+                drop(construction_guard);
+                for (key, value) in entries {
+                    if !visit(&key, &value) {
+                        break;
+                    }
+                }
+                Ok(())
+            }
+            None => {
+                drop(construction_guard);
+                self.storage
+                    .visit_all(root, visit)
+                    .map_err(map_storage_error)
+            }
+        }
     }
 
     pub(crate) fn insert_many(
@@ -195,9 +300,28 @@ impl PatriciaIndexStore {
         root: PatriciaIndexRoot,
         records: &BTreeMap<Vec<u8>, Vec<u8>>,
     ) -> Result<PatriciaIndexRoot, StoreError> {
-        self.storage
-            .insert_many(root, records)
-            .map_err(map_storage_error)
+        let Some(mut construction) = self.construction_guard()? else {
+            return self
+                .storage
+                .insert_many(root, records)
+                .map_err(map_storage_error);
+        };
+        match construction.as_mut() {
+            Some(construction) => {
+                construction.set_live_roots([root]);
+                let next = self
+                    .storage
+                    .construction_insert_many(construction, root, records)
+                    .map_err(map_storage_error)?;
+                construction.set_live_roots([next]);
+                construction.checkpoint([next]);
+                Ok(next)
+            }
+            None => self
+                .storage
+                .insert_many(root, records)
+                .map_err(map_storage_error),
+        }
     }
 
     pub(crate) fn insert_many_verify_existing(
@@ -205,6 +329,12 @@ impl PatriciaIndexStore {
         root: PatriciaIndexRoot,
         records: &BTreeMap<Vec<u8>, Vec<u8>>,
     ) -> Result<PatriciaIndexRoot, StoreError> {
+        let constructing = self
+            .construction_guard()?
+            .is_some_and(|construction| construction.is_some());
+        if constructing {
+            return self.insert_many(root, records);
+        }
         self.storage
             .insert_many_verify_existing(root, records)
             .map_err(map_storage_error)
@@ -257,9 +387,50 @@ impl PatriciaIndexStore {
         root: PatriciaIndexRoot,
         keys: &[Vec<u8>],
     ) -> Result<PatriciaIndexRoot, StoreError> {
+        let Some(mut construction) = self.construction_guard()? else {
+            return self
+                .storage
+                .remove_many(root, keys)
+                .map_err(map_storage_error);
+        };
+        match construction.as_mut() {
+            Some(construction) => {
+                construction.set_live_roots([root]);
+                let next = self
+                    .storage
+                    .construction_remove_many(construction, root, keys)
+                    .map_err(map_storage_error)?;
+                construction.set_live_roots([next]);
+                construction.checkpoint([next]);
+                Ok(next)
+            }
+            None => self
+                .storage
+                .remove_many(root, keys)
+                .map_err(map_storage_error),
+        }
+    }
+
+    pub(crate) fn finish_detached_construction(
+        &self,
+        root: PatriciaIndexRoot,
+    ) -> Result<Option<PatriciaIndexConstructionStats>, StoreError> {
+        let Some(mut construction) = self.construction_guard()? else {
+            return Ok(None);
+        };
+        let Some(mut pending) = construction.take() else {
+            return Ok(None);
+        };
+        pending.set_live_roots([root]);
+        pending.checkpoint([root]);
         self.storage
-            .remove_many(root, keys)
-            .map_err(map_storage_error)
+            .finish_construction(&mut pending)
+            .map_err(map_storage_error)?;
+        let stats = pending.stats();
+        self.storage
+            .validate_root(root)
+            .map_err(map_storage_error)?;
+        Ok(Some(stats))
     }
 }
 

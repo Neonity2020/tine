@@ -1822,7 +1822,7 @@ impl BootstrapAuthoringCapability {
             ),
             logseq_claim_index: Arc::new(
                 self.logseq_claim_index
-                    .for_detached_bootstrap(publisher.clone())?,
+                    .for_detached_bootstrap_construction(publisher.clone())?,
             ),
             page_name_index: Arc::new(self.page_name_index.for_detached_bootstrap(publisher)?),
         };

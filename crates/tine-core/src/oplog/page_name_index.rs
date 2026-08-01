@@ -1591,10 +1591,22 @@ impl PageNameOwnershipStore {
         publisher: DetachedBootstrapImmutablePublisher,
     ) -> Result<Self, StoreError> {
         Ok(Self {
-            patricia: self.patricia.for_detached_bootstrap(publisher.clone())?,
+            patricia: self
+                .patricia
+                .for_detached_bootstrap_construction(publisher.clone())?,
             exact_names: self.exact_names.try_clone()?,
             detached_publisher: Some(publisher),
         })
+    }
+
+    pub(crate) fn finish_detached_construction(
+        &self,
+        root: &PageNameOwnershipRootV1,
+    ) -> Result<(), StoreError> {
+        root.validate_version_and_shape()?;
+        self.patricia
+            .finish_detached_construction(root.patricia_root)?;
+        Ok(())
     }
 
     pub(crate) fn stats(&self) -> PatriciaIndexStats {
