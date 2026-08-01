@@ -6206,59 +6206,61 @@ mod bounded_admission {
     /// exact accepted frontier before any authority exists.
     #[test]
     fn sqlite_divergence_is_still_caught_at_the_open_boundary() {
-        let mut fixture = Fixture::new(
-            "sqlite-boundary",
-            vec![("pages/db.md".into(), b"- db\n".to_vec())],
-        );
-        let root = fixture.enrollment_root("sqlite-boundary");
-        let binding = fixture.enrollment_binding();
-        let paths = PromotedPaths::new(&fixture, "sqlite-boundary");
-        let session_id = SessionId::new();
-        let (mut authority, mut runtime) = promote(&mut fixture, &root, session_id, &paths);
-        for seed in [0xB500_u128, 0xB600] {
-            append_local_batch(&fixture, &mut authority, &mut runtime, seed);
-        }
-        let frontier = runtime.engine().accepted_frontier_root().unwrap();
-        assert_eq!(runtime.database().frontier_root().unwrap(), frontier);
-        drop(runtime);
-        drop(authority);
+        crate::test_support::run_on_deep_stack(|| {
+            let mut fixture = Fixture::new(
+                "sqlite-boundary",
+                vec![("pages/db.md".into(), b"- db\n".to_vec())],
+            );
+            let root = fixture.enrollment_root("sqlite-boundary");
+            let binding = fixture.enrollment_binding();
+            let paths = PromotedPaths::new(&fixture, "sqlite-boundary");
+            let session_id = SessionId::new();
+            let (mut authority, mut runtime) = promote(&mut fixture, &root, session_id, &paths);
+            for seed in [0xB500_u128, 0xB600] {
+                append_local_batch(&fixture, &mut authority, &mut runtime, seed);
+            }
+            let frontier = runtime.engine().accepted_frontier_root().unwrap();
+            assert_eq!(runtime.database().frontier_root().unwrap(), frontier);
+            drop(runtime);
+            drop(authority);
 
-        for suffix in ["", "-wal", "-shm"] {
-            let path = PathBuf::from(format!("{}{suffix}", paths.database_path.display()));
-            let _ = fs::remove_file(path);
-        }
-        assert!(!paths.database_path.exists());
+            for suffix in ["", "-wal", "-shm"] {
+                let path = PathBuf::from(format!("{}{suffix}", paths.database_path.display()));
+                let _ = fs::remove_file(path);
+            }
+            assert!(!paths.database_path.exists());
 
-        let before = PromotedRuntimeInstrumentation::capture();
-        let (_authority, reopened) =
-            reopen_promoted_local_runtime(&root, &binding, session_id, &paths.open(&fixture))
-                .unwrap();
-        let boundary = before.since();
-        assert!(
-            boundary.sqlite_frontier_reads > 0,
-            "the open boundary must prove the SQLite frontier"
-        );
-        assert!(
-            boundary.archive_identity_reads > 0,
-            "the open boundary must reread the archive claim and control identity"
-        );
-        assert!(
-            reopened
-                .database()
-                .frontier_root()
-                .unwrap()
-                .same_accepted_authority(&frontier),
-            "a deleted projection must be rebuilt to the exact accepted frontier"
-        );
-        assert!(
-            reopened
-                .engine()
-                .accepted_frontier_root()
-                .unwrap()
-                .same_accepted_authority(&frontier),
-            "the reopened engine must retain the exact accepted authority"
-        );
-        fixture.assert_graph_unchanged();
+            let before = PromotedRuntimeInstrumentation::capture();
+            let (_authority, reopened) =
+                reopen_promoted_local_runtime(&root, &binding, session_id, &paths.open(&fixture))
+                    .unwrap();
+            let boundary = before.since();
+            assert!(
+                boundary.sqlite_frontier_reads > 0,
+                "the open boundary must prove the SQLite frontier"
+            );
+            assert!(
+                boundary.archive_identity_reads > 0,
+                "the open boundary must reread the archive claim and control identity"
+            );
+            assert!(
+                reopened
+                    .database()
+                    .frontier_root()
+                    .unwrap()
+                    .same_accepted_authority(&frontier),
+                "a deleted projection must be rebuilt to the exact accepted frontier"
+            );
+            assert!(
+                reopened
+                    .engine()
+                    .accepted_frontier_root()
+                    .unwrap()
+                    .same_accepted_authority(&frontier),
+                "the reopened engine must retain the exact accepted authority"
+            );
+            fixture.assert_graph_unchanged();
+        });
     }
 
     /// The promoted runtime owns the exclusive journal lease for its whole
