@@ -1284,6 +1284,16 @@ struct EventMaterializationInstrumentation {
     bulk_materialization_chunks: usize,
     bulk_pages_materialized: usize,
     peak_bulk_pages: usize,
+    accepted_frontier_session_hits: usize,
+    accepted_frontier_session_misses: usize,
+    accepted_frontier_session_evictions: usize,
+    accepted_frontier_session_oversize: usize,
+    accepted_frontier_session_peak_resident_bytes: usize,
+    external_exact_session_hits: usize,
+    external_exact_session_misses: usize,
+    external_exact_session_evictions: usize,
+    external_exact_session_oversize: usize,
+    external_exact_session_peak_resident_bytes: usize,
 }
 
 pub(crate) fn materialize_accepted_event(
@@ -1369,6 +1379,24 @@ fn materialize_inactive_bootstrap_event_bulk(
     ),
     ProjectionError,
 > {
+    materialize_inactive_bootstrap_event_bulk_with_budget(
+        engine,
+        event,
+        super::hot_engine::BOOTSTRAP_LOOKUP_SESSION_BYTES_PER_ROOT,
+    )
+}
+
+fn materialize_inactive_bootstrap_event_bulk_with_budget(
+    engine: &ShardedHotEngine,
+    event: &AcceptedBatchEvent,
+    session_budget_bytes_per_root: usize,
+) -> Result<
+    (
+        super::MaterializationChange,
+        EventMaterializationInstrumentation,
+    ),
+    ProjectionError,
+> {
     authenticate_event_for_engine(engine, event)?;
     let effect = SemanticEffect::decode(event.semantic_effect())
         .map_err(|error| ProjectionError::Materialization(error.to_string()))?;
@@ -1387,7 +1415,10 @@ fn materialize_inactive_bootstrap_event_bulk(
     let materializer = (!affected_pages.is_empty())
         .then(|| {
             engine
-                .bootstrap_bulk_materializer(event.post_frontier_root())
+                .bootstrap_bulk_materializer_with_session_budget(
+                    event.post_frontier_root(),
+                    session_budget_bytes_per_root,
+                )
                 .map_err(|error| ProjectionError::Materialization(error.to_string()))
         })
         .transpose()?;
@@ -1419,6 +1450,11 @@ fn materialize_inactive_bootstrap_event_bulk(
         }
     }
     let change = super::MaterializationChange::new(event.batch_id(), replacements, deletions)?;
+    let (accepted_frontier_stats, external_exact_stats) = materializer
+        .as_ref()
+        .map_or_else(Default::default, |materializer| {
+            materializer.lookup_session_stats()
+        });
     Ok((
         change,
         EventMaterializationInstrumentation {
@@ -1434,6 +1470,17 @@ fn materialize_inactive_bootstrap_event_bulk(
             peak_bulk_pages: affected_pages
                 .len()
                 .min(super::hot_engine::BOOTSTRAP_MATERIALIZATION_CHUNK_PAGES),
+            accepted_frontier_session_hits: accepted_frontier_stats.hits,
+            accepted_frontier_session_misses: accepted_frontier_stats.misses,
+            accepted_frontier_session_evictions: accepted_frontier_stats.evictions,
+            accepted_frontier_session_oversize: accepted_frontier_stats.oversize,
+            accepted_frontier_session_peak_resident_bytes: accepted_frontier_stats
+                .peak_resident_bytes,
+            external_exact_session_hits: external_exact_stats.hits,
+            external_exact_session_misses: external_exact_stats.misses,
+            external_exact_session_evictions: external_exact_stats.evictions,
+            external_exact_session_oversize: external_exact_stats.oversize,
+            external_exact_session_peak_resident_bytes: external_exact_stats.peak_resident_bytes,
         },
     ))
 }
@@ -1732,6 +1779,16 @@ pub struct RebuildInstrumentation {
     pub bulk_materialization_chunks: usize,
     pub bulk_pages_materialized: usize,
     pub peak_bulk_pages: usize,
+    pub accepted_frontier_session_hits: usize,
+    pub accepted_frontier_session_misses: usize,
+    pub accepted_frontier_session_evictions: usize,
+    pub accepted_frontier_session_oversize: usize,
+    pub accepted_frontier_session_peak_resident_bytes: usize,
+    pub external_exact_session_hits: usize,
+    pub external_exact_session_misses: usize,
+    pub external_exact_session_evictions: usize,
+    pub external_exact_session_oversize: usize,
+    pub external_exact_session_peak_resident_bytes: usize,
     pub cleanup_page_attempts: usize,
     pub cleanup_existing_pages: usize,
     pub cleanup_owned_rows: usize,
@@ -1740,6 +1797,31 @@ pub struct RebuildInstrumentation {
     pub reference_coverage_full_scans: usize,
     pub final_semantic_equivalence_proofs: usize,
     pub final_row_digest_equivalence_proofs: usize,
+}
+
+impl RebuildInstrumentation {
+    fn record_materialization(&mut self, stats: EventMaterializationInstrumentation) {
+        self.accepted_root_authentications += stats.accepted_root_authentications;
+        self.exact_document_loads += stats.exact_document_loads;
+        self.exact_catalog_loads += stats.exact_catalog_loads;
+        self.bulk_materialization_chunks += stats.bulk_materialization_chunks;
+        self.bulk_pages_materialized += stats.bulk_pages_materialized;
+        self.peak_bulk_pages = self.peak_bulk_pages.max(stats.peak_bulk_pages);
+        self.accepted_frontier_session_hits += stats.accepted_frontier_session_hits;
+        self.accepted_frontier_session_misses += stats.accepted_frontier_session_misses;
+        self.accepted_frontier_session_evictions += stats.accepted_frontier_session_evictions;
+        self.accepted_frontier_session_oversize += stats.accepted_frontier_session_oversize;
+        self.accepted_frontier_session_peak_resident_bytes = self
+            .accepted_frontier_session_peak_resident_bytes
+            .max(stats.accepted_frontier_session_peak_resident_bytes);
+        self.external_exact_session_hits += stats.external_exact_session_hits;
+        self.external_exact_session_misses += stats.external_exact_session_misses;
+        self.external_exact_session_evictions += stats.external_exact_session_evictions;
+        self.external_exact_session_oversize += stats.external_exact_session_oversize;
+        self.external_exact_session_peak_resident_bytes = self
+            .external_exact_session_peak_resident_bytes
+            .max(stats.external_exact_session_peak_resident_bytes);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3572,17 +3654,7 @@ impl SqliteFrontier {
                     materialize_inactive_bootstrap_event_bulk(source.engine, &event)?;
                 let materialization =
                     attach_authenticated_reference_catalog(source.engine, &event, materialization)?;
-                instrumentation.accepted_root_authentications +=
-                    materialization_stats.accepted_root_authentications;
-                instrumentation.exact_document_loads += materialization_stats.exact_document_loads;
-                instrumentation.exact_catalog_loads += materialization_stats.exact_catalog_loads;
-                instrumentation.bulk_materialization_chunks +=
-                    materialization_stats.bulk_materialization_chunks;
-                instrumentation.bulk_pages_materialized +=
-                    materialization_stats.bulk_pages_materialized;
-                instrumentation.peak_bulk_pages = instrumentation
-                    .peak_bulk_pages
-                    .max(materialization_stats.peak_bulk_pages);
+                instrumentation.record_materialization(materialization_stats);
                 self.apply_internal_with_materialization_and_stats(
                     &event,
                     ApplyFault::None,
@@ -3592,17 +3664,7 @@ impl SqliteFrontier {
             } else {
                 let (_, materialization_stats, apply_stats) =
                     self.apply_engine_owned_accepted_with_stats(&event, source.engine)?;
-                instrumentation.accepted_root_authentications +=
-                    materialization_stats.accepted_root_authentications;
-                instrumentation.exact_document_loads += materialization_stats.exact_document_loads;
-                instrumentation.exact_catalog_loads += materialization_stats.exact_catalog_loads;
-                instrumentation.bulk_materialization_chunks +=
-                    materialization_stats.bulk_materialization_chunks;
-                instrumentation.bulk_pages_materialized +=
-                    materialization_stats.bulk_pages_materialized;
-                instrumentation.peak_bulk_pages = instrumentation
-                    .peak_bulk_pages
-                    .max(materialization_stats.peak_bulk_pages);
+                instrumentation.record_materialization(materialization_stats);
                 apply_stats
             };
             instrumentation.cleanup_page_attempts += apply_stats.cleanup_page_attempts;
@@ -11851,7 +11913,13 @@ mod tests {
         let engine_store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
         let mut engine =
             ShardedHotEngine::with_archive_store(engine_store, ids.lineage, ids.catalog);
-
+        let mut zero_budget_database = open_test_projection(
+            &dir.path().join("zero-budget.sqlite"),
+            ids.claim(),
+            RebuildSource::new(&engine, &store).unwrap(),
+        )
+        .unwrap()
+        .database;
         let create = engine
             .prepare_bootstrap_transaction(
                 author(2_250),
@@ -11914,8 +11982,69 @@ mod tests {
             .collect();
         let bulk_create =
             MaterializationChange::new(create_event.batch_id(), bulk_pages, vec![]).unwrap();
+        let (zero_budget_create, zero_budget_stats) =
+            materialize_inactive_bootstrap_event_bulk_with_budget(&engine, &create_event, 0)
+                .unwrap();
+        let (cached_create, cached_stats) = materialize_inactive_bootstrap_event_bulk_with_budget(
+            &engine,
+            &create_event,
+            crate::oplog::hot_engine::BOOTSTRAP_LOOKUP_SESSION_BYTES_PER_ROOT,
+        )
+        .unwrap();
         assert_eq!(scoped_create, point_create);
         assert_eq!(bulk_create, scoped_create);
+        assert_eq!(zero_budget_create, cached_create);
+        assert_eq!(zero_budget_create, scoped_create);
+        assert!(zero_budget_stats.accepted_frontier_session_oversize > 0);
+        assert!(zero_budget_stats.external_exact_session_oversize > 0);
+        assert_eq!(
+            zero_budget_stats.accepted_frontier_session_peak_resident_bytes,
+            0
+        );
+        assert_eq!(
+            zero_budget_stats.external_exact_session_peak_resident_bytes,
+            0
+        );
+        assert!(cached_stats.accepted_frontier_session_misses > 0);
+        assert!(cached_stats.external_exact_session_misses > 0);
+        assert!(
+            cached_stats.accepted_frontier_session_peak_resident_bytes
+                <= crate::oplog::hot_engine::BOOTSTRAP_LOOKUP_SESSION_BYTES_PER_ROOT
+        );
+        assert!(
+            cached_stats.external_exact_session_peak_resident_bytes
+                <= crate::oplog::hot_engine::BOOTSTRAP_LOOKUP_SESSION_BYTES_PER_ROOT
+        );
+        zero_budget_database
+            .apply_authenticated_reference_catalog_materialized_accepted(
+                &create_event,
+                zero_budget_create,
+                &engine,
+            )
+            .unwrap();
+        let zero_budget_frontier = zero_budget_database.frontier_root().unwrap();
+        let zero_budget_row_digest = zero_budget_database
+            .materialized_row_digest_for_harness()
+            .unwrap();
+        drop(zero_budget_database);
+        let cached_projection = open_test_projection(
+            &dir.path().join("cached.sqlite"),
+            ids.claim(),
+            RebuildSource::new(&engine, &store).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            zero_budget_frontier,
+            cached_projection.database.frontier_root().unwrap()
+        );
+        assert_eq!(
+            zero_budget_row_digest,
+            cached_projection
+                .database
+                .materialized_row_digest_for_harness()
+                .unwrap()
+        );
+        drop(cached_projection);
         let mut bulk_projection = bulk_materializer
             .materialize_pages_for_projection(&[ids.page, second_page])
             .unwrap();

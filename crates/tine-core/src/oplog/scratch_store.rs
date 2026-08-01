@@ -280,6 +280,8 @@ impl tine_storage::ScratchPageTag for ScratchPageKind {
 pub(crate) type ScratchPageRef = tine_storage::ScratchPageRef<ScratchPageKind>;
 pub(crate) type ScratchBlobRef = tine_storage::ScratchBlobRef;
 pub(crate) type ScratchLsmRoot = tine_storage::ScratchLsmRoot<ScratchPageKind>;
+pub(crate) type ScratchLookupSession = tine_storage::ScratchLookupSession<ScratchPageKind>;
+pub(crate) type ScratchLookupSessionStats = tine_storage::ScratchLookupSessionStats;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1011,6 +1013,56 @@ impl ScratchStore {
     ) -> Result<Vec<Option<Vec<u8>>>, ScratchError> {
         self.physical
             .lookup_many_with_absence_policy(root, kind, keys, || {
+                let mut known_absent = vec![false; keys.len()];
+                if kind == ScratchPageKind::DocumentCurrent {
+                    let filter = self
+                        .document_current_filter
+                        .lock()
+                        .map_err(|_| tine_storage::ScratchRunError::Poisoned)?;
+                    for (index, key) in keys.iter().enumerate() {
+                        if !filter.might_contain(key) {
+                            known_absent[index] = true;
+                        }
+                    }
+                } else if kind == ScratchPageKind::BlobDedup {
+                    let filter = self
+                        .blob_dedup_filter
+                        .lock()
+                        .map_err(|_| tine_storage::ScratchRunError::Poisoned)?;
+                    for (index, key) in keys.iter().enumerate() {
+                        if filter.proves_absent(root, key) {
+                            known_absent[index] = true;
+                        }
+                    }
+                }
+                Ok(known_absent)
+            })
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn lookup_session(
+        &self,
+        root: &ScratchLsmRoot,
+        kind: ScratchPageKind,
+        budget_bytes: usize,
+    ) -> Result<ScratchLookupSession, ScratchError> {
+        self.physical
+            .lookup_session(root, kind, budget_bytes)
+            .map_err(Into::into)
+    }
+
+    /// Resolve a bounded point set through a run/root/kind-bound decoded
+    /// segment session while retaining the facade-owned absence policy on
+    /// every call.
+    pub(crate) fn lookup_many_with_session(
+        &self,
+        session: &mut ScratchLookupSession,
+        root: &ScratchLsmRoot,
+        kind: ScratchPageKind,
+        keys: &[Vec<u8>],
+    ) -> Result<Vec<Option<Vec<u8>>>, ScratchError> {
+        self.physical
+            .lookup_many_with_session_and_absence_policy(session, root, kind, keys, || {
                 let mut known_absent = vec![false; keys.len()];
                 if kind == ScratchPageKind::DocumentCurrent {
                     let filter = self
@@ -4346,6 +4398,105 @@ mod tests {
 
         drop(adopted);
         assert_eq!(run_snapshot(&path, run_id), after_owner);
+        crate::test_support::remove_dir_all(path);
+    }
+
+    #[test]
+    fn adopted_run_sessions_start_empty_and_filters_cannot_hide_present_points() {
+        let path = scratch_root("retained-session-filters");
+        let archive = archive(&path);
+        let workspace_id = workspace(61);
+        let store = ScratchStore::create_retained(&archive, workspace_id).unwrap();
+        let current_root = store
+            .insert_many(
+                &ScratchLsmRoot::default(),
+                ScratchPageKind::DocumentCurrent,
+                &BTreeMap::from([(b"document".to_vec(), Some(b"current".to_vec()))]),
+            )
+            .unwrap();
+        let dedup_root = store
+            .insert_many(
+                &ScratchLsmRoot::default(),
+                ScratchPageKind::BlobDedup,
+                &BTreeMap::from([(b"digest".to_vec(), Some(b"blob-ref".to_vec()))]),
+            )
+            .unwrap();
+        let run_id = store.run_id();
+        drop(store);
+
+        let adopted = ScratchStore::adopt_retained(&archive, workspace_id, run_id).unwrap();
+        assert!(
+            adopted
+                .document_current_filter
+                .lock()
+                .expect("document filter lock")
+                .saturated
+        );
+        let keys = vec![
+            b"document".to_vec(),
+            b"missing".to_vec(),
+            b"document".to_vec(),
+        ];
+        let ordinary = adopted
+            .lookup_many(&current_root, ScratchPageKind::DocumentCurrent, &keys)
+            .unwrap();
+        let mut current_session = adopted
+            .lookup_session(&current_root, ScratchPageKind::DocumentCurrent, usize::MAX)
+            .unwrap();
+        assert_eq!(
+            current_session.stats(),
+            ScratchLookupSessionStats::default()
+        );
+        assert_eq!(
+            adopted
+                .lookup_many_with_session(
+                    &mut current_session,
+                    &current_root,
+                    ScratchPageKind::DocumentCurrent,
+                    &keys,
+                )
+                .unwrap(),
+            ordinary
+        );
+        assert_eq!(
+            ordinary,
+            vec![Some(b"current".to_vec()), None, Some(b"current".to_vec())]
+        );
+
+        let dedup_keys = vec![b"digest".to_vec(), b"absent".to_vec()];
+        let mut dedup_session = adopted
+            .lookup_session(&dedup_root, ScratchPageKind::BlobDedup, usize::MAX)
+            .unwrap();
+        assert_eq!(
+            adopted
+                .lookup_many_with_session(
+                    &mut dedup_session,
+                    &dedup_root,
+                    ScratchPageKind::BlobDedup,
+                    &dedup_keys,
+                )
+                .unwrap(),
+            vec![Some(b"blob-ref".to_vec()), None]
+        );
+        assert!(current_session.stats().misses > 0);
+        assert!(dedup_session.stats().misses > 0);
+        drop(adopted);
+
+        let restarted = ScratchStore::adopt_retained(&archive, workspace_id, run_id).unwrap();
+        let restarted_session = restarted
+            .lookup_session(&current_root, ScratchPageKind::DocumentCurrent, usize::MAX)
+            .unwrap();
+        assert_eq!(
+            restarted_session.stats(),
+            ScratchLookupSessionStats::default()
+        );
+        assert_eq!(
+            restarted
+                .lookup(&current_root, ScratchPageKind::DocumentCurrent, b"document")
+                .unwrap(),
+            Some(b"current".to_vec())
+        );
+        drop(restarted);
         crate::test_support::remove_dir_all(path);
     }
 

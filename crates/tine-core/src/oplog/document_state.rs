@@ -761,6 +761,7 @@ pub(crate) fn load_external_current_many(
             .iter()
             .map(|document_id| current_key(lane, *document_id))
             .collect(),
+        None,
         |index, record| record.document_id == document_ids[index] && record.lane == lane,
     )
 }
@@ -808,6 +809,25 @@ pub(crate) fn load_external_exact_many(
     >,
     DocumentStateError,
 > {
+    load_external_exact_many_with_session(store, roots, lane, documents, None)
+}
+
+pub(crate) fn load_external_exact_many_with_session(
+    store: &Arc<ScratchStore>,
+    roots: &ScratchRoots,
+    lane: DocumentLane,
+    documents: &[(DocumentId, DocumentCausalDigest)],
+    session: Option<&mut super::scratch_store::ScratchLookupSession>,
+) -> Result<
+    Vec<
+        Option<(
+            ExternalDocumentStateRecord,
+            ExternalDocument,
+            DocumentStateWork,
+        )>,
+    >,
+    DocumentStateError,
+> {
     load_external_records_many(
         store,
         roots,
@@ -819,6 +839,7 @@ pub(crate) fn load_external_exact_many(
                 external_exact_key(lane, *document_id, *causal_digest)
             })
             .collect(),
+        session,
         |index, record| {
             record.document_id == documents[index].0
                 && record.lane == lane
@@ -975,6 +996,7 @@ fn load_external_records_many(
     kind: ScratchPageKind,
     root: &super::scratch_store::ScratchLsmRoot,
     keys: Vec<Vec<u8>>,
+    session: Option<&mut super::scratch_store::ScratchLookupSession>,
     binding: impl Fn(usize, &ExternalDocumentStateRecord) -> bool,
 ) -> Result<
     Vec<
@@ -986,8 +1008,11 @@ fn load_external_records_many(
     >,
     DocumentStateError,
 > {
-    store
-        .lookup_many(root, kind, &keys)?
+    let values = match session {
+        Some(session) => store.lookup_many_with_session(session, root, kind, &keys)?,
+        None => store.lookup_many(root, kind, &keys)?,
+    };
+    values
         .into_iter()
         .enumerate()
         .map(|(index, bytes)| {

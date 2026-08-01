@@ -388,6 +388,16 @@ pub(crate) struct ShadowProjectionInstrumentation {
     pub(crate) bulk_materialization_chunks: u64,
     pub(crate) bulk_pages_materialized: u64,
     pub(crate) peak_bulk_pages: u64,
+    pub(crate) accepted_frontier_session_hits: u64,
+    pub(crate) accepted_frontier_session_misses: u64,
+    pub(crate) accepted_frontier_session_evictions: u64,
+    pub(crate) accepted_frontier_session_oversize: u64,
+    pub(crate) accepted_frontier_session_peak_resident_bytes: u64,
+    pub(crate) external_exact_session_hits: u64,
+    pub(crate) external_exact_session_misses: u64,
+    pub(crate) external_exact_session_evictions: u64,
+    pub(crate) external_exact_session_oversize: u64,
+    pub(crate) external_exact_session_peak_resident_bytes: u64,
     pub(crate) peak_owned_source_bytes: u64,
     pub(crate) peak_owned_catalog_rows: u64,
     pub(crate) tree_entries_visited: u64,
@@ -1504,6 +1514,31 @@ pub(crate) fn verify_inactive_bootstrap_shadow_projection(
     sqlite: &OpenProjection,
     sqlite_projection: &VerifiedBootstrapSqliteProjection,
 ) -> Result<VerifiedShadowProjection, ShadowProjectionError> {
+    verify_inactive_bootstrap_shadow_projection_with_lookup_budget(
+        graph,
+        roots,
+        prepared,
+        verified_publication,
+        source_backup,
+        authority,
+        sqlite,
+        sqlite_projection,
+        super::hot_engine::BOOTSTRAP_LOOKUP_SESSION_BYTES_PER_ROOT,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_inactive_bootstrap_shadow_projection_with_lookup_budget(
+    graph: &Graph,
+    roots: &MigrationBackupRoot,
+    prepared: &InactiveBootstrapPreparedPublication,
+    verified_publication: &InactiveBootstrapVerifiedPublication,
+    source_backup: &VerifiedSourceBackup,
+    authority: &InactiveBootstrapAcceptedAuthority,
+    sqlite: &OpenProjection,
+    sqlite_projection: &VerifiedBootstrapSqliteProjection,
+    session_budget_bytes_per_root: usize,
+) -> Result<VerifiedShadowProjection, ShadowProjectionError> {
     #[cfg(test)]
     {
         let mut calls = complete_shadow_verification_calls().lock().unwrap();
@@ -1580,6 +1615,7 @@ pub(crate) fn verify_inactive_bootstrap_shadow_projection(
             authority,
             &catalog,
             &mut instrumentation,
+            session_budget_bytes_per_root,
         )?;
         sync_tree(
             &paths.stage.join(PAYLOAD_DIRECTORY),
@@ -1632,6 +1668,7 @@ pub(crate) fn verify_inactive_bootstrap_shadow_projection(
             &catalog,
             summary,
             &mut instrumentation,
+            session_budget_bytes_per_root,
         )?
     };
     let proof_bytes = proof_bytes(
@@ -2131,6 +2168,7 @@ fn publish_payloads_and_manifest(
     authority: &InactiveBootstrapAcceptedAuthority,
     catalog: &ValidatedCurrentPathCatalog,
     instrumentation: &mut ShadowProjectionInstrumentation,
+    session_budget_bytes_per_root: usize,
 ) -> Result<(BlobDescription, StagedInventoryProof), ShadowProjectionError> {
     let mut output = ResumableExactFile::open(
         manifest_path,
@@ -2160,7 +2198,10 @@ fn publish_payloads_and_manifest(
         .then(|| {
             authority
                 .accepted_engine()
-                .bootstrap_bulk_materializer(authority.binding().accepted_frontier())
+                .bootstrap_bulk_materializer_with_session_budget(
+                    authority.binding().accepted_frontier(),
+                    session_budget_bytes_per_root,
+                )
                 .map_err(|error| ShadowProjectionError::Projection(error.to_string()))
         })
         .transpose()?;
@@ -2294,6 +2335,7 @@ fn publish_payloads_and_manifest(
             "source chunk spool contains extra entries",
         ));
     }
+    record_bulk_lookup_session_stats(instrumentation, materializer.as_ref())?;
     if authority
         .accepted_engine()
         .current_path_catalog_binding()
@@ -2318,6 +2360,77 @@ fn publish_payloads_and_manifest(
             total_bytes,
         },
     ))
+}
+
+fn session_stat_u64(value: usize, resource: &'static str) -> Result<u64, ShadowProjectionError> {
+    u64::try_from(value).map_err(|_| ShadowProjectionError::ResourceLimit {
+        resource,
+        observed: u64::MAX,
+        limit: u64::MAX - 1,
+    })
+}
+
+fn record_bulk_lookup_session_stats(
+    instrumentation: &mut ShadowProjectionInstrumentation,
+    materializer: Option<&super::hot_engine::BootstrapBulkMaterializer<'_>>,
+) -> Result<(), ShadowProjectionError> {
+    let Some(materializer) = materializer else {
+        return Ok(());
+    };
+    let (accepted, external) = materializer.lookup_session_stats();
+    instrumentation.accepted_frontier_session_hits = checked_add(
+        instrumentation.accepted_frontier_session_hits,
+        session_stat_u64(accepted.hits, "accepted-frontier session hits")?,
+        "accepted-frontier session hits",
+    )?;
+    instrumentation.accepted_frontier_session_misses = checked_add(
+        instrumentation.accepted_frontier_session_misses,
+        session_stat_u64(accepted.misses, "accepted-frontier session misses")?,
+        "accepted-frontier session misses",
+    )?;
+    instrumentation.accepted_frontier_session_evictions = checked_add(
+        instrumentation.accepted_frontier_session_evictions,
+        session_stat_u64(accepted.evictions, "accepted-frontier session evictions")?,
+        "accepted-frontier session evictions",
+    )?;
+    instrumentation.accepted_frontier_session_oversize = checked_add(
+        instrumentation.accepted_frontier_session_oversize,
+        session_stat_u64(accepted.oversize, "accepted-frontier session oversize")?,
+        "accepted-frontier session oversize",
+    )?;
+    instrumentation.accepted_frontier_session_peak_resident_bytes = instrumentation
+        .accepted_frontier_session_peak_resident_bytes
+        .max(session_stat_u64(
+            accepted.peak_resident_bytes,
+            "accepted-frontier session resident bytes",
+        )?);
+    instrumentation.external_exact_session_hits = checked_add(
+        instrumentation.external_exact_session_hits,
+        session_stat_u64(external.hits, "external-exact session hits")?,
+        "external-exact session hits",
+    )?;
+    instrumentation.external_exact_session_misses = checked_add(
+        instrumentation.external_exact_session_misses,
+        session_stat_u64(external.misses, "external-exact session misses")?,
+        "external-exact session misses",
+    )?;
+    instrumentation.external_exact_session_evictions = checked_add(
+        instrumentation.external_exact_session_evictions,
+        session_stat_u64(external.evictions, "external-exact session evictions")?,
+        "external-exact session evictions",
+    )?;
+    instrumentation.external_exact_session_oversize = checked_add(
+        instrumentation.external_exact_session_oversize,
+        session_stat_u64(external.oversize, "external-exact session oversize")?,
+        "external-exact session oversize",
+    )?;
+    instrumentation.external_exact_session_peak_resident_bytes = instrumentation
+        .external_exact_session_peak_resident_bytes
+        .max(session_stat_u64(
+            external.peak_resident_bytes,
+            "external-exact session resident bytes",
+        )?);
+    Ok(())
 }
 
 fn emit_manifest_entry(
@@ -2422,6 +2535,7 @@ fn verify_projection_directory(
     catalog: &ValidatedCurrentPathCatalog,
     summary: SourceSummary,
     instrumentation: &mut ShadowProjectionInstrumentation,
+    session_budget_bytes_per_root: usize,
 ) -> Result<(BlobDescription, StagedInventoryProof), ShadowProjectionError> {
     require_real_directory(directory, "shadow projection is not a real directory")?;
     validate_projection_root_entries(directory, final_directory)?;
@@ -2445,7 +2559,10 @@ fn verify_projection_directory(
         .then(|| {
             authority
                 .accepted_engine()
-                .bootstrap_bulk_materializer(authority.binding().accepted_frontier())
+                .bootstrap_bulk_materializer_with_session_budget(
+                    authority.binding().accepted_frontier(),
+                    session_budget_bytes_per_root,
+                )
                 .map_err(|error| ShadowProjectionError::Projection(error.to_string()))
         })
         .transpose()?;
@@ -2544,6 +2661,7 @@ fn verify_projection_directory(
             "shadow source or manifest contains extra entries",
         ));
     }
+    record_bulk_lookup_session_stats(instrumentation, materializer.as_ref())?;
     reader.finish()?;
     if file_count != summary.file_count || total_bytes != summary.total_bytes {
         return Err(ShadowProjectionError::CorruptOrConflicting(
@@ -3999,6 +4117,23 @@ mod tests {
             )
         }
 
+        fn verify_with_lookup_budget(
+            &self,
+            session_budget_bytes_per_root: usize,
+        ) -> Result<VerifiedShadowProjection, ShadowProjectionError> {
+            verify_inactive_bootstrap_shadow_projection_with_lookup_budget(
+                &self.graph,
+                &self.roots,
+                &self.prepared,
+                &self.verified,
+                &self.backup,
+                &self.authority,
+                &self.sqlite,
+                &self.sqlite_proof,
+                session_budget_bytes_per_root,
+            )
+        }
+
         fn reset_shadow(&self) {
             let path = self.roots.canonical_root().join(SHADOW_ROOT_DIRECTORY);
             if path.exists() {
@@ -4209,6 +4344,34 @@ mod tests {
             rich.sqlite.rebuild.peak_bulk_pages
                 <= crate::oplog::hot_engine::BOOTSTRAP_MATERIALIZATION_CHUNK_PAGES
         );
+        assert!(rich.sqlite.rebuild.accepted_frontier_session_misses > 0);
+        assert!(rich.sqlite.rebuild.external_exact_session_misses > 0);
+        assert!(
+            rich.sqlite
+                .rebuild
+                .accepted_frontier_session_peak_resident_bytes
+                <= crate::oplog::hot_engine::BOOTSTRAP_LOOKUP_SESSION_BYTES_PER_ROOT
+        );
+        assert!(
+            rich.sqlite
+                .rebuild
+                .external_exact_session_peak_resident_bytes
+                <= crate::oplog::hot_engine::BOOTSTRAP_LOOKUP_SESSION_BYTES_PER_ROOT
+        );
+        assert!(proof.instrumentation().accepted_frontier_session_misses > 0);
+        assert!(proof.instrumentation().external_exact_session_misses > 0);
+        assert!(
+            proof
+                .instrumentation()
+                .accepted_frontier_session_peak_resident_bytes
+                <= crate::oplog::hot_engine::BOOTSTRAP_LOOKUP_SESSION_BYTES_PER_ROOT as u64
+        );
+        assert!(
+            proof
+                .instrumentation()
+                .external_exact_session_peak_resident_bytes
+                <= crate::oplog::hot_engine::BOOTSTRAP_LOOKUP_SESSION_BYTES_PER_ROOT as u64
+        );
         let mut cursor = proof.file_evidence_cursor().unwrap();
         let mut seen = 0;
         let mut page_ids = BTreeMap::new();
@@ -4233,6 +4396,57 @@ mod tests {
             page_ids["notes/b/same-copy.org"]
         );
         rich.assert_graph_unchanged();
+    }
+
+    #[test]
+    fn shadow_bytes_and_promotion_binding_are_identical_with_zero_and_cached_sessions() {
+        let fixture = rich_fixture("lookup-session-differential");
+        let zero = fixture.verify_with_lookup_budget(0).unwrap();
+        let zero_bytes = snapshot_files(zero.directory());
+        assert!(zero.instrumentation().accepted_frontier_session_misses > 0);
+        assert!(zero.instrumentation().external_exact_session_misses > 0);
+        assert!(zero.instrumentation().accepted_frontier_session_oversize > 0);
+        assert!(zero.instrumentation().external_exact_session_oversize > 0);
+        assert_eq!(
+            zero.instrumentation()
+                .accepted_frontier_session_peak_resident_bytes,
+            0
+        );
+        assert_eq!(
+            zero.instrumentation()
+                .external_exact_session_peak_resident_bytes,
+            0
+        );
+        let zero_promotion = PromotedBootstrapProjectionBindingV1::from_verified(&zero).unwrap();
+
+        fixture.reset_shadow();
+        let cached = fixture
+            .verify_with_lookup_budget(
+                crate::oplog::hot_engine::BOOTSTRAP_LOOKUP_SESSION_BYTES_PER_ROOT,
+            )
+            .unwrap();
+        let cached_bytes = snapshot_files(cached.directory());
+        assert_eq!(cached, zero);
+        assert_eq!(cached_bytes, zero_bytes);
+        assert!(cached.instrumentation().accepted_frontier_session_misses > 0);
+        assert!(cached.instrumentation().external_exact_session_misses > 0);
+        assert!(
+            cached
+                .instrumentation()
+                .accepted_frontier_session_peak_resident_bytes
+                <= crate::oplog::hot_engine::BOOTSTRAP_LOOKUP_SESSION_BYTES_PER_ROOT as u64
+        );
+        assert!(
+            cached
+                .instrumentation()
+                .external_exact_session_peak_resident_bytes
+                <= crate::oplog::hot_engine::BOOTSTRAP_LOOKUP_SESSION_BYTES_PER_ROOT as u64
+        );
+        assert_eq!(
+            PromotedBootstrapProjectionBindingV1::from_verified(&cached).unwrap(),
+            zero_promotion
+        );
+        fixture.assert_graph_unchanged();
     }
 
     #[test]

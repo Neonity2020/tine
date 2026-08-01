@@ -49,7 +49,10 @@ use super::reference_catalog::{
 use super::reference_catalog::{
     reference_evidence_parse_calls, reset_reference_evidence_parse_calls,
 };
-use super::scratch_store::{ScratchAuthenticatedCatalogRoot, ScratchRoots, ScratchStore};
+use super::scratch_store::{
+    ScratchAuthenticatedCatalogRoot, ScratchLookupSession, ScratchLookupSessionStats, ScratchRoots,
+    ScratchStore,
+};
 use super::semantic::{
     EffectiveExplicitTitleState, LogseqIdentityOrigin, PagePreambleDelta, PagePreambleState,
     PolicyGeneratedAnchorReason,
@@ -3748,6 +3751,7 @@ pub(crate) struct AcceptedRootMaterializer<'engine> {
 /// The catalog checkpoint is retained for the attempt, while membership and
 /// home checkpoints live only for one chunk and are dropped before the next.
 pub(crate) const BOOTSTRAP_MATERIALIZATION_CHUNK_PAGES: usize = 64;
+pub(crate) const BOOTSTRAP_LOOKUP_SESSION_BYTES_PER_ROOT: usize = 32 * 1024 * 1024;
 
 #[derive(Debug)]
 struct BootstrapBulkPage {
@@ -3767,11 +3771,30 @@ pub(crate) struct BootstrapBulkMaterializer<'engine> {
     catalog: LoroDoc,
     catalog_dependencies: DocumentDependencies,
     exact_document_loads: Cell<usize>,
+    accepted_frontier_session: Option<RefCell<ScratchLookupSession>>,
+    external_exact_session: Option<RefCell<ScratchLookupSession>>,
 }
 
 impl BootstrapBulkMaterializer<'_> {
     pub(crate) fn exact_document_loads(&self) -> usize {
         self.exact_document_loads.get()
+    }
+
+    pub(crate) fn lookup_session_stats(
+        &self,
+    ) -> (ScratchLookupSessionStats, ScratchLookupSessionStats) {
+        (
+            self.accepted_frontier_session
+                .as_ref()
+                .map_or_else(ScratchLookupSessionStats::default, |session| {
+                    session.borrow().stats()
+                }),
+            self.external_exact_session
+                .as_ref()
+                .map_or_else(ScratchLookupSessionStats::default, |session| {
+                    session.borrow().stats()
+                }),
+        )
     }
 
     fn materialize_chunk(
@@ -3820,9 +3843,22 @@ impl BootstrapBulkMaterializer<'_> {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
+        let mut accepted_frontier_session = self
+            .accepted_frontier_session
+            .as_ref()
+            .map(RefCell::borrow_mut);
+        let mut external_exact_session = self
+            .external_exact_session
+            .as_ref()
+            .map(RefCell::borrow_mut);
         let mut documents = self
             .engine
-            .load_documents_at_authenticated_root_many(&self.root, &membership_ids)?;
+            .load_documents_at_authenticated_root_many_with_sessions(
+                &self.root,
+                &membership_ids,
+                accepted_frontier_session.as_deref_mut(),
+                external_exact_session.as_deref_mut(),
+            )?;
         self.exact_document_loads.set(
             self.exact_document_loads
                 .get()
@@ -3858,7 +3894,12 @@ impl BootstrapBulkMaterializer<'_> {
             .collect::<Vec<_>>();
         documents.extend(
             self.engine
-                .load_documents_at_authenticated_root_many(&self.root, &missing_homes)?,
+                .load_documents_at_authenticated_root_many_with_sessions(
+                    &self.root,
+                    &missing_homes,
+                    accepted_frontier_session.as_deref_mut(),
+                    external_exact_session.as_deref_mut(),
+                )?,
         );
         self.exact_document_loads.set(
             self.exact_document_loads
@@ -8059,10 +8100,11 @@ impl ShardedHotEngine {
             .transpose()
     }
 
-    fn accepted_frontier_documents_many_authenticated(
+    fn accepted_frontier_documents_many_authenticated_with_session(
         &self,
         root: &AcceptedFrontierRoot,
         document_ids: &[DocumentId],
+        session: Option<&mut ScratchLookupSession>,
     ) -> Result<Vec<Option<DocumentDependencies>>, EngineError> {
         validate_accepted_frontier_root(root)?;
         if document_ids.is_empty() {
@@ -8089,12 +8131,20 @@ impl ShardedHotEngine {
             .iter()
             .map(|document_id| document_id.as_uuid().as_bytes().to_vec())
             .collect::<Vec<_>>();
-        store
-            .lookup_many(
+        let values = match session {
+            Some(session) => store.lookup_many_with_session(
+                session,
                 scratch_root,
                 super::scratch_store::ScratchPageKind::AcceptedFrontier,
                 &keys,
-            )
+            ),
+            None => store.lookup_many(
+                scratch_root,
+                super::scratch_store::ScratchPageKind::AcceptedFrontier,
+                &keys,
+            ),
+        };
+        values
             .map_err(|error| EngineError::Archive(error.to_string()))?
             .into_iter()
             .zip(document_ids)
@@ -8106,16 +8156,21 @@ impl ShardedHotEngine {
             .collect()
     }
 
-    fn load_documents_at_authenticated_root_many(
+    fn load_documents_at_authenticated_root_many_with_sessions(
         &self,
         root: &AcceptedFrontierRoot,
         document_ids: &[DocumentId],
+        accepted_frontier_session: Option<&mut ScratchLookupSession>,
+        external_exact_session: Option<&mut ScratchLookupSession>,
     ) -> Result<BTreeMap<DocumentId, (DocumentDependencies, LoroDoc)>, EngineError> {
         if document_ids.is_empty() {
             return Ok(BTreeMap::new());
         }
-        let dependencies =
-            self.accepted_frontier_documents_many_authenticated(root, document_ids)?;
+        let dependencies = self.accepted_frontier_documents_many_authenticated_with_session(
+            root,
+            document_ids,
+            accepted_frontier_session,
+        )?;
         let requested = dependencies
             .iter()
             .flatten()
@@ -8145,11 +8200,12 @@ impl ShardedHotEngine {
                 })
                 .collect();
         };
-        let loaded = super::document_state::load_external_exact_many(
+        let loaded = super::document_state::load_external_exact_many_with_session(
             store,
             &self.scratch_roots,
             super::document_state::DocumentLane::Visible,
             &requested,
+            external_exact_session,
         )
         .map_err(|error| EngineError::Archive(error.to_string()))?;
         dependencies
@@ -8242,10 +8298,57 @@ impl ShardedHotEngine {
         &self,
         root: &AcceptedFrontierRoot,
     ) -> Result<BootstrapBulkMaterializer<'_>, EngineError> {
+        self.bootstrap_bulk_materializer_with_lookup_budget(
+            root,
+            BOOTSTRAP_LOOKUP_SESSION_BYTES_PER_ROOT,
+        )
+    }
+
+    pub(crate) fn bootstrap_bulk_materializer_with_session_budget(
+        &self,
+        root: &AcceptedFrontierRoot,
+        budget_bytes_per_root: usize,
+    ) -> Result<BootstrapBulkMaterializer<'_>, EngineError> {
+        self.bootstrap_bulk_materializer_with_lookup_budget(root, budget_bytes_per_root)
+    }
+
+    fn bootstrap_bulk_materializer_with_lookup_budget(
+        &self,
+        root: &AcceptedFrontierRoot,
+        budget_bytes_per_root: usize,
+    ) -> Result<BootstrapBulkMaterializer<'_>, EngineError> {
         self.begin_point_operation();
         self.authenticate_accepted_frontier_root(root)?;
-        let mut catalog =
-            self.load_documents_at_authenticated_root_many(root, &[self.catalog_document_id])?;
+        let mut accepted_frontier_session = match (&self.scratch, &root.scratch_root) {
+            (Some(store), Some(scratch_root)) => Some(
+                store
+                    .lookup_session(
+                        scratch_root,
+                        super::scratch_store::ScratchPageKind::AcceptedFrontier,
+                        budget_bytes_per_root,
+                    )
+                    .map_err(|error| EngineError::Archive(error.to_string()))?,
+            ),
+            _ => None,
+        };
+        let mut external_exact_session = match (&self.scratch, &root.scratch_root) {
+            (Some(store), Some(_)) => Some(
+                store
+                    .lookup_session(
+                        &self.scratch_roots.external_document_state_root,
+                        super::scratch_store::ScratchPageKind::DocumentExternalExact,
+                        budget_bytes_per_root,
+                    )
+                    .map_err(|error| EngineError::Archive(error.to_string()))?,
+            ),
+            _ => None,
+        };
+        let mut catalog = self.load_documents_at_authenticated_root_many_with_sessions(
+            root,
+            &[self.catalog_document_id],
+            accepted_frontier_session.as_mut(),
+            external_exact_session.as_mut(),
+        )?;
         let (catalog_dependencies, catalog) = catalog
             .remove(&self.catalog_document_id)
             .ok_or(EngineError::MissingDocument(self.catalog_document_id))?;
@@ -8256,6 +8359,8 @@ impl ShardedHotEngine {
             catalog,
             catalog_dependencies,
             exact_document_loads: Cell::new(1),
+            accepted_frontier_session: accepted_frontier_session.map(RefCell::new),
+            external_exact_session: external_exact_session.map(RefCell::new),
         })
     }
 
