@@ -19,6 +19,10 @@ const STRUCTURAL_ROOT_DIRECTORIES = new Set(["pages", "journals"]);
 const REPORT_NAME = "anonymization-report.txt";
 const WORD_RE = /[\p{L}\p{M}\p{N}]+/gu;
 const UUID_RE = /(?<![\p{L}\p{N}_])[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\p{L}\p{N}_])/giu;
+const MAX_HIDDEN_EDN_BYTES = 64 * 1024;
+const MAX_HIDDEN_EDN_ENTRIES = 1024;
+const MAX_HIDDEN_EDN_DEPTH = 64;
+const MAX_HIDDEN_EDN_FORMS = 4096;
 
 // These are fixed parser grammar, not user identifiers.  In particular, a
 // custom property or directive is *not* protected merely because it looks like
@@ -95,18 +99,25 @@ function componentIsManagedPortable(component) {
   return !/^(?:CON|PRN|AUX|NUL|COM[1-9¹²³]|LPT[1-9¹²³])$/u.test(stem);
 }
 
-function shouldDescend(parts) {
-  return parts.every(componentIsManagedPortable)
-    && !parts.some((part) => part.startsWith("."))
-    && !isFixedExcluded(parts);
+function matchesHiddenPrefix(parts, hiddenPrefixes) {
+  const relative = parts.join("/");
+  return hiddenPrefixes.some((prefix) => relative.startsWith(prefix));
 }
 
-function isGraphTextEligible(parts) {
+function shouldDescend(parts, hiddenPrefixes = []) {
+  return parts.every(componentIsManagedPortable)
+    && !parts.some((part) => part.startsWith("."))
+    && !isFixedExcluded(parts)
+    && !matchesHiddenPrefix(parts, hiddenPrefixes);
+}
+
+function isGraphTextEligible(parts, hiddenPrefixes = []) {
   const filename = parts.at(-1);
-  return shouldDescend(parts.slice(0, -1))
+  return shouldDescend(parts.slice(0, -1), hiddenPrefixes)
     && componentIsManagedPortable(filename)
     && !filename.startsWith(".")
     && !isFixedExcluded(parts)
+    && !matchesHiddenPrefix(parts, hiddenPrefixes)
     && !isProviderConflictCopy(filename)
     && isManagedFile(filename);
 }
@@ -349,6 +360,272 @@ function pathTokenStats(parts, text, state) {
   }
 }
 
+class EdnReader {
+  constructor(source) {
+    this.source = source;
+    this.pos = 0;
+    this.depth = 0;
+    this.forms = 0;
+  }
+
+  peek(offset = 0) {
+    return this.source[this.pos + offset];
+  }
+
+  fail() {
+    throw new Error("invalid EDN");
+  }
+
+  skipInterstitial() {
+    while (true) {
+      while ([" ", "\t", "\n", "\r", ","].includes(this.peek())) this.pos += 1;
+      if (this.peek() !== ";") return;
+      while (this.peek() !== undefined && this.peek() !== "\n") this.pos += 1;
+    }
+  }
+
+  skipInterstitialAndDiscards() {
+    while (true) {
+      this.skipInterstitial();
+      if (this.peek() !== "#" || this.peek(1) !== "_") return;
+      this.withForm(() => {
+        this.pos += 2;
+        this.skipForm();
+      });
+    }
+  }
+
+  beginForm() {
+    this.forms += 1;
+    this.depth += 1;
+    if (this.forms > MAX_HIDDEN_EDN_FORMS || this.depth > MAX_HIDDEN_EDN_DEPTH) this.fail();
+  }
+
+  endForm() {
+    this.depth -= 1;
+  }
+
+  withForm(action) {
+    this.beginForm();
+    try {
+      return action();
+    } finally {
+      this.endForm();
+    }
+  }
+
+  skipForm() {
+    this.skipInterstitialAndDiscards();
+    return this.withForm(() => this.skipFormBody());
+  }
+
+  skipFormBody() {
+    const next = this.peek();
+    if (next === undefined) this.fail();
+    if (next === "\"") return void this.scanString(false);
+    if (next === "[") return this.skipCollection("]", false);
+    if (next === "{") return this.skipCollection("}", true);
+    if (next === "(") return this.skipCollection(")", false);
+    if (next === "#" && this.peek(1) === "{") {
+      this.pos += 1;
+      return this.skipCollection("}", false);
+    }
+    if (next === "#" && this.peek(1) === "(") {
+      this.pos += 1;
+      return this.skipCollection(")", false);
+    }
+    if (next === "#" && this.peek(1) === "\"") {
+      this.pos += 1;
+      return void this.scanString(false);
+    }
+    if (next === "#" && this.peek(1) === "'") {
+      this.pos += 2;
+      return this.skipForm();
+    }
+    if (next === "#" && this.peek(1) === "#") return this.skipAtom();
+    if (next === "#") {
+      this.pos += 1;
+      this.skipAtom();
+      return this.skipForm();
+    }
+    if (["'", "`", "@"].includes(next)) {
+      this.pos += 1;
+      return this.skipForm();
+    }
+    if (next === "~") {
+      this.pos += 1;
+      if (this.peek() === "@") this.pos += 1;
+      return this.skipForm();
+    }
+    if (next === "^") {
+      this.pos += 1;
+      this.skipForm();
+      return this.skipForm();
+    }
+    if (next === "\\") return this.skipCharacter();
+    if (["]", "}", ")"].includes(next)) this.fail();
+    return this.skipAtom();
+  }
+
+  skipCollection(close, map) {
+    this.pos += 1;
+    let forms = 0;
+    while (true) {
+      this.skipInterstitialAndDiscards();
+      if (this.peek() === close) {
+        this.pos += 1;
+        if (map && forms % 2 !== 0) this.fail();
+        return;
+      }
+      if (this.peek() === undefined) this.fail();
+      this.skipForm();
+      forms += 1;
+    }
+  }
+
+  skipAtom() {
+    const start = this.pos;
+    const delimiters = new Set([" ", "\t", "\n", "\r", ",", ";", "\"", "[", "]", "{", "}", "(", ")"]);
+    while (this.peek() !== undefined && !delimiters.has(this.peek())) this.pos += 1;
+    if (this.pos === start) this.fail();
+  }
+
+  skipCharacter() {
+    this.pos += 1;
+    const codePoint = this.source.codePointAt(this.pos);
+    if (codePoint === undefined) this.fail();
+    this.pos += codePoint > 0xffff ? 2 : 1;
+    const delimiters = new Set([" ", "\t", "\n", "\r", ",", ";", "[", "]", "{", "}", "(", ")"]);
+    while (this.peek() !== undefined && !delimiters.has(this.peek())) this.pos += 1;
+  }
+
+  scanString(decode) {
+    if (this.peek() !== "\"") this.fail();
+    this.pos += 1;
+    let output = "";
+    while (true) {
+      const next = this.peek();
+      if (next === undefined) this.fail();
+      if (next === "\"") {
+        this.pos += 1;
+        return decode ? output : undefined;
+      }
+      if (next === "\\") {
+        this.pos += 1;
+        const escaped = this.peek();
+        this.pos += 1;
+        const simple = { "\"": "\"", "\\": "\\", n: "\n", r: "\r", t: "\t", b: "\b", f: "\f" };
+        let character = simple[escaped];
+        if (character === undefined && escaped === "u") {
+          const digits = this.source.slice(this.pos, this.pos + 4);
+          if (!/^[0-9a-f]{4}$/iu.test(digits)) this.fail();
+          const value = Number.parseInt(digits, 16);
+          if (value >= 0xd800 && value <= 0xdfff) this.fail();
+          character = String.fromCodePoint(value);
+          this.pos += 4;
+        } else if (character === undefined) {
+          this.fail();
+        }
+        if (decode) output += character;
+        continue;
+      }
+      const codePoint = this.source.codePointAt(this.pos);
+      const character = String.fromCodePoint(codePoint);
+      this.pos += character.length;
+      if (decode) output += character;
+    }
+  }
+
+  readHiddenValue() {
+    const start = this.pos;
+    this.skipInterstitialAndDiscards();
+    if (this.peek() !== "[") {
+      this.skipForm();
+      if (encoder.encode(this.source.slice(start, this.pos)).length > MAX_HIDDEN_EDN_BYTES) this.fail();
+      return [];
+    }
+    const values = this.withForm(() => {
+      this.pos += 1;
+      const values = [];
+      let entries = 0;
+      while (true) {
+        this.skipInterstitialAndDiscards();
+        if (this.peek() === "]") {
+          this.pos += 1;
+          return values;
+        }
+        if (this.peek() === undefined) this.fail();
+        entries += 1;
+        if (entries > MAX_HIDDEN_EDN_ENTRIES) this.fail();
+        if (this.peek() === "\"") {
+          values.push(this.withForm(() => this.scanString(true)));
+        } else {
+          this.skipForm();
+        }
+      }
+    });
+    if (encoder.encode(this.source.slice(start, this.pos)).length > MAX_HIDDEN_EDN_BYTES) this.fail();
+    return values;
+  }
+}
+
+function parseHiddenPaths(config) {
+  let hiddenPaths;
+  try {
+    if (config.includes("\0")) throw new Error("invalid EDN");
+    const reader = new EdnReader(config);
+    reader.skipInterstitialAndDiscards();
+    if (reader.peek() !== "{") throw new Error("invalid EDN");
+    reader.beginForm();
+    reader.pos += 1;
+    try {
+      while (true) {
+        reader.skipInterstitialAndDiscards();
+        if (reader.peek() === "}") {
+          reader.pos += 1;
+          break;
+        }
+        if (reader.peek() === undefined) throw new Error("invalid EDN");
+        const start = reader.pos;
+        const keyword = reader.peek() === ":";
+        reader.skipForm();
+        const key = keyword ? config.slice(start, reader.pos) : undefined;
+        reader.skipInterstitialAndDiscards();
+        if (reader.peek() === undefined || reader.peek() === "}") throw new Error("invalid EDN");
+        if (key === ":hidden") {
+          if (hiddenPaths !== undefined) throw new Error("duplicate hidden key");
+          hiddenPaths = reader.readHiddenValue();
+        } else {
+          reader.skipForm();
+        }
+      }
+      reader.skipInterstitialAndDiscards();
+      if (reader.pos !== config.length) throw new Error("invalid EDN");
+    } finally {
+      reader.endForm();
+    }
+  } catch {
+    safeError("The graph configuration or hidden policy could not be interpreted safely.");
+  }
+
+  const prefixes = [];
+  let retainedBytes = 0;
+  for (const entry of hiddenPaths ?? []) {
+    if (entry === "") safeError("The graph configuration contains a hide-all hidden policy.");
+    if (entry.startsWith("/")) continue;
+    const normalized = entry.endsWith("/") ? entry.slice(0, -1) : entry;
+    const components = normalized.split("/");
+    if (normalized !== normalized.trim()
+      || normalized.includes("\\")
+      || normalized.includes("\0")
+      || components.some((component) => !componentIsManagedPortable(component))) continue;
+    retainedBytes += encoder.encode(normalized).length;
+    if (retainedBytes > MAX_HIDDEN_EDN_BYTES) safeError("The graph configuration contains an oversized hidden policy.");
+    prefixes.push(normalized);
+  }
+  return [...new Set(prefixes)];
+}
+
 async function readGraph(source) {
   let sourceStat;
   try {
@@ -365,6 +642,7 @@ async function readGraph(source) {
     safeError("The source directory could not be resolved safely.");
   }
 
+  let hiddenPrefixes = [];
   const configPath = join(canonicalSource, "logseq", "config.edn");
   try {
     const configStat = await lstat(configPath);
@@ -372,10 +650,7 @@ async function readGraph(source) {
       safeError("The graph configuration could not be read safely.");
     }
     const config = decoder.decode(await readFile(configPath));
-    if (config.includes("\0")) safeError("The graph configuration could not be read safely.");
-    if (config.includes(":hidden")) {
-      safeError("Graphs with a configured or ambiguous :hidden policy cannot be exported safely.");
-    }
+    hiddenPrefixes = parseHiddenPaths(config);
   } catch (error) {
     if (error instanceof AnonymizeError) throw error;
     if (error?.code !== "ENOENT") safeError("The graph configuration could not be read safely.");
@@ -393,8 +668,8 @@ async function readGraph(source) {
     for (const child of children) {
       const childPath = join(directory, child.name);
       const childParts = [...parts, child.name];
-      if (child.isDirectory() && !shouldDescend(childParts)) continue;
-      if (!child.isDirectory() && !isGraphTextEligible(childParts)) continue;
+      if (child.isDirectory() && !shouldDescend(childParts, hiddenPrefixes)) continue;
+      if (!child.isDirectory() && !isGraphTextEligible(childParts, hiddenPrefixes)) continue;
       let stat;
       try {
         stat = await lstat(childPath);
@@ -403,11 +678,11 @@ async function readGraph(source) {
       }
       if (stat.isSymbolicLink()) safeError("The source contains a symbolic link.");
       if (stat.isDirectory()) {
-        if (!shouldDescend(childParts)) continue;
+        if (!shouldDescend(childParts, hiddenPrefixes)) continue;
         await walk(childPath, childParts);
         continue;
       }
-      if (!stat.isFile() || !isGraphTextEligible(childParts)) continue;
+      if (!stat.isFile() || !isGraphTextEligible(childParts, hiddenPrefixes)) continue;
       if (stat.nlink !== 1) safeError("A managed source file has multiple hard links.");
       let bytes;
       let text;
@@ -573,6 +848,7 @@ function help() {
     "Usage: npm run anonymize-graph -- --source <graph-directory> --destination <new-output-directory>",
     "",
     "Creates a local, structural reproduction containing only anonymized Markdown/Org text.",
+    "Ordinary Logseq :hidden path prefixes are excluded before files or vocabulary are inventoried.",
     "The destination must not exist. No files are uploaded, and the source is never modified.",
     "Review the result before sharing: anonymization reduces risk but is not a formal privacy proof.",
   ].join("\n");

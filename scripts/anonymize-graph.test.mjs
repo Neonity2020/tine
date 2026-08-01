@@ -266,19 +266,103 @@ test("omits the full fixed, hidden-component, and provider policy before vocabul
   assert.deepEqual(excludedFiles, baselineFiles);
 });
 
-test("fails closed before inventory when config.edn has a hidden policy", async (t) => {
+test("configured hidden prefixes are excluded before inventory and vocabulary mapping", async (t) => {
+  const root = await fixture(t);
+  const baselineSource = join(root, "baseline");
+  const hiddenSource = join(root, "hidden");
+  const baselineDestination = join(root, "baseline-output");
+  const hiddenDestination = join(root, "hidden-output");
+  const visible = {
+    "pages/included.md": "- included stable 24680\n",
+    "elsewhere/archive/page.org": "* visible elsewhere\n",
+    "private/visible.md": "- invalid leading slash is inert\n",
+  };
+  await writeGraph(baselineSource, visible);
+  await writeGraph(hiddenSource, {
+    ...visible,
+    "archive/secret.md": "private archive vocabulary alpha\n",
+    "archive-old/secret.org": "private prefix vocabulary beta\n",
+    "archive-note.md": "private file vocabulary gamma\n",
+    "vault/private/secret.md": "private escaped vocabulary delta\n",
+    "vault/private-old/secret.md": "private escaped prefix vocabulary epsilon\n",
+    "logseq/config.edn": [
+      String.raw`{:hidden ["archive/" "vault\u002fprivate/" "/private"`,
+      "          #_ \"discarded\" 42 [:ignored] {:also \"ignored\"}",
+      "          ; \"commented\"",
+      "          ]}",
+    ].join("\n"),
+  });
+
+  const salt = Buffer.alloc(32, 15);
+  const baseline = await anonymizeGraph({ source: baselineSource, destination: baselineDestination, salt });
+  const baselineFiles = (await listFiles(baselineDestination)).filter((file) => file.path !== "anonymization-report.txt");
+  await writeGraph(hiddenSource, {
+    "archive/generated-pseudonym-witness.md": baselineFiles.map((file) => file.text).join("\n"),
+  });
+  const hidden = await anonymizeGraph({ source: hiddenSource, destination: hiddenDestination, salt });
+  const hiddenFiles = (await listFiles(hiddenDestination)).filter((file) => file.path !== "anonymization-report.txt");
+
+  assert.equal(baseline.fileCount, 3);
+  assert.equal(hidden.fileCount, 3);
+  assert.deepEqual(hiddenFiles, baselineFiles);
+});
+
+test("comments, strings, nested forms, and discards containing :hidden are inert", async (t) => {
   const source = await fixture(t);
-  const destination = join(source, "..", "hidden-policy-output");
+  const destination = join(source, "..", "inert-hidden-output");
+  await writeGraph(source, {
+    "pages/included.md": "- included\n",
+    "private/visible.md": "- still visible\n",
+    "logseq/config.edn": [
+      "{:description \"literal :hidden [\\\"private\\\"]\"",
+      " ; :hidden [\"private\"]",
+      " :nested {:hidden [\"private\"]}",
+      " :discarded #_ {:hidden [\"private\"]} true",
+      " :quoted-var #'example/value}",
+    ].join("\n"),
+  });
+
+  const summary = await anonymizeGraph({ source, destination, salt: Buffer.alloc(32, 16) });
+  assert.equal(summary.fileCount, 2);
+  assert.equal((await listFiles(destination)).filter((file) => file.path !== "anonymization-report.txt").length, 2);
+});
+
+test("a large unrelated config value does not consume the hidden-policy byte budget", async (t) => {
+  const source = await fixture(t);
+  const destination = join(source, "..", "large-unrelated-config-output");
   await writeGraph(source, {
     "pages/included.md": "- included\n",
     "private/secret.md": "- secret\n",
-    "logseq/config.edn": "{:hidden [\"private\"]}\n",
+    "logseq/config.edn": `{:description "${"x".repeat(70 * 1024)}" :hidden ["private"]}`,
   });
 
-  const failure = await expectFailure(source, destination);
-  assert.match(failure.message, /:hidden policy/u);
-  assert.doesNotMatch(failure.message, /private|secret/u);
-  await assert.rejects(() => lstat(destination));
+  const summary = await anonymizeGraph({ source, destination, salt: Buffer.alloc(32, 17) });
+  assert.equal(summary.fileCount, 1);
+});
+
+test("malformed, deep, duplicate, empty, and oversized hidden config fails closed", async (t) => {
+  const root = await fixture(t);
+  const cases = [
+    ["malformed", "{:hidden [\"private\"]"],
+    ["deep", `{:hidden [${"[".repeat(70)}nil${"]".repeat(70)}]}`],
+    ["duplicate", "{:hidden [\"private\"] :hidden [\"archive\"]}"],
+    ["empty", "{:hidden [\"\"]}"],
+    ["oversized", `{:hidden [\"${"x".repeat(64 * 1024)}\"]}`],
+  ];
+
+  for (const [label, config] of cases) {
+    const source = join(root, `${label}-source`);
+    const destination = join(root, `${label}-output`);
+    await writeGraph(source, {
+      "pages/included.md": "- included\n",
+      "private/secret.md": "- secret\n",
+      "logseq/config.edn": config,
+    });
+    const failure = await expectFailure(source, destination);
+    assert.match(failure.message, /configuration|hidden/u, label);
+    assert.doesNotMatch(failure.message, /private|secret|archive/u, label);
+    await assert.rejects(() => lstat(destination), label);
+  }
 });
 
 test("rejects portable-equivalent source identities without destination residue", async (t) => {

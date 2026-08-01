@@ -16,12 +16,20 @@ matching fixed names are case-insensitive. Managed symlinks and hard links,
 invalid managed text, unsafe output paths, and portable source or output
 identity collisions fail closed without leaving a destination.
 
-This standalone Node tool cannot safely reuse Tine's private, arbitrary-EDN
-`:hidden` parser without making every export build and launch the Rust core.
-Therefore a `logseq/config.edn` containing `:hidden` (including an ambiguous or
-malformed occurrence) is diagnosed and refused before inventory. Make any
-temporary policy change only in a disposable copy of a graph, never in the
-original.
+Ordinary Logseq `:hidden` vector entries in `logseq/config.edn` are honored
+before directory traversal and vocabulary collection. Entries are literal,
+case-sensitive graph-relative prefixes: `"archive"` hides `archive`,
+`archive/page.md`, and `archive-old/page.md`. One trailing `/` is normalized,
+so `"archive/"` has the same effect. Invalid graph-relative entries are inert,
+matching Tine's graph-text scope; non-string vector forms are safely skipped.
+
+The standalone Node-only EDN reader understands strings and escapes, comments,
+discards, and ordinary nested EDN forms without adding a runtime dependency.
+It requires one complete top-level map and enforces byte, depth, form, and entry
+limits. Malformed or ambiguous input, duplicate `:hidden` keys, and an empty
+hidden entry (Logseq's hide-all spelling) abort before the destination is
+created. This conservative refusal means the exporter never treats an unsafe
+hidden policy as absent.
 
 Each run uses a fresh in-memory random salt and one-way keyed pseudonyms. It
 keeps file byte lengths, line endings, punctuation, supported grammar tokens,
