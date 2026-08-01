@@ -763,6 +763,17 @@ impl LiveReconciliationSessionDispatch<'_> {
                 baseline: None,
             };
         }
+        if let Err(error) = self.dependencies.engine.reconcile_expected_path_history() {
+            return ReconciliationSessionDispatchResult {
+                outcome: ReconciliationSessionDispatchOutcome::Blocked(
+                    BaselineBlockedObservation::new(
+                        BaselineBlockedReason::AuthorityUnavailable,
+                        format!("expected-path history reconciliation failed before scan: {error}"),
+                    ),
+                ),
+                baseline: None,
+            };
+        }
         let (scan, pending_baseline) = {
             let ReconciliationSessionDependencies {
                 graph,

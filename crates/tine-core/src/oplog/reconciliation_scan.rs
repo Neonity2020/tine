@@ -9,6 +9,7 @@ use super::{
         CurrentPathCatalogBinding, CurrentPathCatalogCursor, CurrentPathCatalogRow,
         ShardedHotEngine, MAX_CURRENT_PATH_CURSOR_PAGE_ROWS,
     },
+    object_store::EngineHistoryAuthority,
     projection_work_index::{
         ProjectionExpectedPathHead, ProjectionExpectedPathReadBudget, ProjectionWorkError,
         ProjectionWorkIndex,
@@ -687,9 +688,35 @@ pub(crate) struct AuthenticatedExpectedPathPage {
 pub(crate) enum ExpectedPathSourceFailure {
     Missing,
     Corrupt,
+    CorruptField(ExpectedPathCorruptField),
     Ambiguous,
     Unavailable,
     BoundExceeded,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ExpectedPathCorruptField {
+    WorkspaceId,
+    EndpointId,
+    GraphResourceId,
+    ReceiptStoreId,
+    EngineHistory { generation: bool, root: bool },
+    CursorBinding,
+    CompletedReceiptIdentity,
+    BootstrapAuthority,
+    BootstrapWorkspaceId,
+    BootstrapPageId,
+    BootstrapPath,
+    BootstrapKind,
+    MaterializedPageId,
+    MaterializedPath,
+    BootstrapSemanticRebind,
+    BootstrapTarget,
+    EngineAuthority,
+    ProjectionAuthority,
+    ProjectionBinding,
+    ProjectionAcceptedWitness,
+    ProjectionHistory,
 }
 
 impl fmt::Display for ExpectedPathSourceFailure {
@@ -697,10 +724,61 @@ impl fmt::Display for ExpectedPathSourceFailure {
         formatter.write_str(match self {
             Self::Missing => "authenticated expected-path authority is missing",
             Self::Corrupt => "authenticated expected-path authority is corrupt",
+            Self::CorruptField(field) => {
+                return write!(
+                    formatter,
+                    "authenticated expected-path authority is corrupt: joined {field} mismatch"
+                );
+            }
             Self::Ambiguous => "authenticated expected-path authority is ambiguous",
             Self::Unavailable => "authenticated expected-path authority is unavailable",
             Self::BoundExceeded => "authenticated expected-path page bound exceeded",
         })
+    }
+}
+
+impl fmt::Display for ExpectedPathCorruptField {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WorkspaceId => formatter.write_str("workspace ID"),
+            Self::EndpointId => formatter.write_str("endpoint ID"),
+            Self::GraphResourceId => formatter.write_str("graph resource ID"),
+            Self::ReceiptStoreId => formatter.write_str("receipt store ID"),
+            Self::EngineHistory {
+                generation: true,
+                root: true,
+            } => formatter.write_str("engine history generation and root"),
+            Self::EngineHistory {
+                generation: true,
+                root: false,
+            } => formatter.write_str("engine history generation"),
+            Self::EngineHistory {
+                generation: false,
+                root: true,
+            } => formatter.write_str("engine history root"),
+            Self::EngineHistory {
+                generation: false,
+                root: false,
+            } => formatter.write_str("engine history binding"),
+            Self::CursorBinding => formatter.write_str("cursor binding"),
+            Self::CompletedReceiptIdentity => formatter.write_str("completed receipt identity"),
+            Self::BootstrapAuthority => formatter.write_str("bootstrap authority"),
+            Self::BootstrapWorkspaceId => formatter.write_str("bootstrap workspace ID"),
+            Self::BootstrapPageId => formatter.write_str("bootstrap page ID"),
+            Self::BootstrapPath => formatter.write_str("bootstrap path"),
+            Self::BootstrapKind => formatter.write_str("bootstrap managed-text kind"),
+            Self::MaterializedPageId => formatter.write_str("materialized page ID"),
+            Self::MaterializedPath => formatter.write_str("materialized path"),
+            Self::BootstrapSemanticRebind => {
+                formatter.write_str("bootstrap semantic successor binding")
+            }
+            Self::BootstrapTarget => formatter.write_str("bootstrap target"),
+            Self::EngineAuthority => formatter.write_str("engine authority"),
+            Self::ProjectionAuthority => formatter.write_str("projection authority"),
+            Self::ProjectionBinding => formatter.write_str("projection endpoint/workspace binding"),
+            Self::ProjectionAcceptedWitness => formatter.write_str("projection accepted witness"),
+            Self::ProjectionHistory => formatter.write_str("projection history binding"),
+        }
     }
 }
 
@@ -813,14 +891,51 @@ impl<'a> JoinedAuthenticatedExpectedPathSource<'a> {
             .engine
             .projection_receipt_store_id()
             .ok_or(ExpectedPathSourceFailure::Missing)?;
-        if engine.workspace_id() != projection.workspace_id()
-            || endpoint.endpoint_id() != projection.endpoint_id()
-            || endpoint.graph_resource_id() != projection.graph_resource_id()
-            || receipt_store_id != projection.receipt_store_id()
-            || engine.history_generation() != projection.engine_history_generation()
-            || engine.history_root() != projection.engine_history_root()
-        {
-            return Err(ExpectedPathSourceFailure::Corrupt);
+        if engine.workspace_id() != projection.workspace_id() {
+            return Err(ExpectedPathSourceFailure::CorruptField(
+                ExpectedPathCorruptField::WorkspaceId,
+            ));
+        }
+        if endpoint.endpoint_id() != projection.endpoint_id() {
+            return Err(ExpectedPathSourceFailure::CorruptField(
+                ExpectedPathCorruptField::EndpointId,
+            ));
+        }
+        if endpoint.graph_resource_id() != projection.graph_resource_id() {
+            return Err(ExpectedPathSourceFailure::CorruptField(
+                ExpectedPathCorruptField::GraphResourceId,
+            ));
+        }
+        if receipt_store_id != projection.receipt_store_id() {
+            return Err(ExpectedPathSourceFailure::CorruptField(
+                ExpectedPathCorruptField::ReceiptStoreId,
+            ));
+        }
+        let history_generation_mismatch =
+            engine.history_generation() != projection.engine_history_generation();
+        let history_root_mismatch = engine.history_root() != projection.engine_history_root();
+        if history_generation_mismatch || history_root_mismatch {
+            let projection_history = EngineHistoryAuthority {
+                generation: projection.engine_history_generation(),
+                index_root: projection.engine_history_root(),
+            };
+            if self
+                .engine
+                .authenticate_history_descends_from(projection_history)
+                .is_ok()
+            {
+                // This is a proven insertion-only durable-history extension,
+                // but expected-path authority is not current until the
+                // projection head has reconciled and rebound it. Never join
+                // the two heads merely because the extension is authentic.
+                return Err(ExpectedPathSourceFailure::Unavailable);
+            }
+            return Err(ExpectedPathSourceFailure::CorruptField(
+                ExpectedPathCorruptField::EngineHistory {
+                    generation: history_generation_mismatch,
+                    root: history_root_mismatch,
+                },
+            ));
         }
         let binding = ExpectedPathBinding {
             accepted_frontier: engine.accepted_frontier(),
@@ -859,7 +974,9 @@ impl<'a> JoinedAuthenticatedExpectedPathSource<'a> {
             .map_err(map_projection_expected_failure)?;
         if let Some(receipt) = receipt {
             if receipt.page_id() != row.page_id() || receipt.path() != row.path() {
-                return Err(ExpectedPathSourceFailure::Corrupt);
+                return Err(ExpectedPathSourceFailure::CorruptField(
+                    ExpectedPathCorruptField::CompletedReceiptIdentity,
+                ));
             }
             let ProjectionWorkTarget::Present(description) = receipt.target() else {
                 return Err(ExpectedPathSourceFailure::Missing);
@@ -877,22 +994,44 @@ impl<'a> JoinedAuthenticatedExpectedPathSource<'a> {
         let bootstrap = self.bootstrap.ok_or(ExpectedPathSourceFailure::Missing)?;
         let baseline = bootstrap
             .baseline_at(row.path())
-            .map_err(|_| ExpectedPathSourceFailure::Corrupt)?
+            .map_err(|_| {
+                ExpectedPathSourceFailure::CorruptField(
+                    ExpectedPathCorruptField::BootstrapAuthority,
+                )
+            })?
             .ok_or(ExpectedPathSourceFailure::Missing)?;
         let state = self
             .engine
             .materialize_page_for_projection(row.page_id())
             .map_err(map_engine_expected_failure)?;
-        if baseline.intent().workspace_id() != self.engine.workspace_id()
-            || baseline.intent().page_id() != row.page_id()
-            || baseline.intent().path() != row.path()
-            || baseline.kind() != row.kind()
-            || state.page.page_id != row.page_id()
-            || state.page.path != *row.path()
-            || &state.frontier != baseline.intent().frontier()
-            || baseline.intent().target() != BlobDescription::of(baseline.source_bytes())
-        {
-            return Err(ExpectedPathSourceFailure::Corrupt);
+        let mismatch = if baseline.intent().workspace_id() != self.engine.workspace_id() {
+            Some(ExpectedPathCorruptField::BootstrapWorkspaceId)
+        } else if baseline.intent().page_id() != row.page_id() {
+            Some(ExpectedPathCorruptField::BootstrapPageId)
+        } else if baseline.intent().path() != row.path() {
+            Some(ExpectedPathCorruptField::BootstrapPath)
+        } else if baseline.kind() != row.kind() {
+            Some(ExpectedPathCorruptField::BootstrapKind)
+        } else if state.page.page_id != row.page_id() {
+            Some(ExpectedPathCorruptField::MaterializedPageId)
+        } else if state.page.path != *row.path() {
+            Some(ExpectedPathCorruptField::MaterializedPath)
+        } else if baseline.intent().target() != BlobDescription::of(baseline.source_bytes()) {
+            Some(ExpectedPathCorruptField::BootstrapTarget)
+        } else {
+            None
+        };
+        if let Some(mismatch) = mismatch {
+            return Err(ExpectedPathSourceFailure::CorruptField(mismatch));
+        }
+        if &state.frontier != baseline.intent().frontier() {
+            baseline
+                .rebind_semantic_successor(self.engine.workspace_id(), &state)
+                .map_err(|_| {
+                    ExpectedPathSourceFailure::CorruptField(
+                        ExpectedPathCorruptField::BootstrapSemanticRebind,
+                    )
+                })?;
         }
         Ok(AuthenticatedExpectedPath {
             page_id: row.page_id(),
@@ -913,7 +1052,9 @@ impl<'a> JoinedAuthenticatedExpectedPathSource<'a> {
         if cursor.binding.accepted_frontier != cursor.engine_binding.accepted_frontier()
             || cursor.binding.projection_generation != cursor.projection_head.generation()
         {
-            return Err(ExpectedPathSourceFailure::Corrupt);
+            return Err(ExpectedPathSourceFailure::CorruptField(
+                ExpectedPathCorruptField::CursorBinding,
+            ));
         }
         if request.maximum_rows > cursor.limits.maximum_page_rows
             || request.maximum_path_bytes > cursor.limits.maximum_path_bytes
@@ -1298,7 +1439,7 @@ fn map_engine_expected_failure(error: super::EngineError) -> ExpectedPathSourceF
     } else if detail.contains("bound") || detail.contains("limit") {
         ExpectedPathSourceFailure::BoundExceeded
     } else {
-        ExpectedPathSourceFailure::Corrupt
+        ExpectedPathSourceFailure::CorruptField(ExpectedPathCorruptField::EngineAuthority)
     }
 }
 
@@ -1312,6 +1453,15 @@ fn map_projection_expected_failure(error: ProjectionWorkError) -> ExpectedPathSo
         | ProjectionWorkError::MissingNode(_) => ExpectedPathSourceFailure::Missing,
         ProjectionWorkError::AmbiguousCompletedPath => ExpectedPathSourceFailure::Ambiguous,
         ProjectionWorkError::ConcurrentRootTransition => ExpectedPathSourceFailure::Unavailable,
+        ProjectionWorkError::BindingMismatch => {
+            ExpectedPathSourceFailure::CorruptField(ExpectedPathCorruptField::ProjectionBinding)
+        }
+        ProjectionWorkError::AcceptedWitnessMismatch => ExpectedPathSourceFailure::CorruptField(
+            ExpectedPathCorruptField::ProjectionAcceptedWitness,
+        ),
+        ProjectionWorkError::HistoryBindingMismatch => {
+            ExpectedPathSourceFailure::CorruptField(ExpectedPathCorruptField::ProjectionHistory)
+        }
         ProjectionWorkError::Store(super::object_store::StoreError::StoredFileTooLarge {
             ..
         })
@@ -1320,7 +1470,7 @@ fn map_projection_expected_failure(error: ProjectionWorkError) -> ExpectedPathSo
         | ProjectionWorkError::RetainedMemoryLimitExceeded => {
             ExpectedPathSourceFailure::BoundExceeded
         }
-        _ => ExpectedPathSourceFailure::Corrupt,
+        _ => ExpectedPathSourceFailure::CorruptField(ExpectedPathCorruptField::ProjectionAuthority),
     }
 }
 
@@ -1906,7 +2056,9 @@ fn expected_source_failure(
 ) -> GraphTextScanFailure {
     let reason = match failure {
         ExpectedPathSourceFailure::Missing => GraphTextScanFailureReason::ExpectedAuthorityMissing,
-        ExpectedPathSourceFailure::Corrupt => GraphTextScanFailureReason::ExpectedAuthorityCorrupt,
+        ExpectedPathSourceFailure::Corrupt | ExpectedPathSourceFailure::CorruptField(_) => {
+            GraphTextScanFailureReason::ExpectedAuthorityCorrupt
+        }
         ExpectedPathSourceFailure::Ambiguous => {
             GraphTextScanFailureReason::ExpectedAuthorityAmbiguous
         }

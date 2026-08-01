@@ -11436,7 +11436,6 @@ impl ShardedHotEngine {
                             || baseline.intent().workspace_id() != self.workspace_id
                             || baseline.intent().page_id() != requirement.page_id
                             || baseline.intent().path() != path
-                            || baseline.intent().frontier() != &before.frontier
                             || baseline.intent().target()
                                 != super::BlobDescription::of(baseline.source_bytes())
                         {
@@ -11444,30 +11443,25 @@ impl ShardedHotEngine {
                                 "aggregate bootstrap predecessor for {path} is stale or mismatched"
                             )));
                         } else {
-                            let replay = super::projection::plan_projection(
-                                self.workspace_id,
-                                before,
-                                Some(baseline.source_bytes()),
-                            )
-                            .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
-                            if replay.intent() != baseline.intent() {
-                                return Err(EngineError::ProjectionManifest(format!(
-                                    "aggregate bootstrap predecessor replay for {path} differs"
-                                )));
-                            } else {
-                                charge_preauthoring_capture_bytes(
-                                    &mut retained_bytes,
-                                    replay.target().len(),
-                                    "aggregate bootstrap projection bytes",
-                                )?;
-                                authority_matches = true;
-                                Some(CapabilityCapturedPriorProjection {
-                                    bytes: replay.target().to_vec(),
-                                    intent: baseline.intent().clone(),
-                                    completion: None,
-                                    bootstrap_owner_binding: Some(baseline.owner_binding()),
-                                })
-                            }
+                            let replay = baseline
+                                .rebind_semantic_successor(self.workspace_id, before)
+                                .map_err(|error| {
+                                    EngineError::ProjectionManifest(format!(
+                                        "aggregate bootstrap predecessor semantic rebind for {path} failed: {error}"
+                                    ))
+                                })?;
+                            charge_preauthoring_capture_bytes(
+                                &mut retained_bytes,
+                                replay.target().len(),
+                                "aggregate bootstrap projection bytes",
+                            )?;
+                            authority_matches = true;
+                            Some(CapabilityCapturedPriorProjection {
+                                bytes: replay.target().to_vec(),
+                                intent: replay.intent().clone(),
+                                completion: None,
+                                bootstrap_owner_binding: Some(baseline.owner_binding()),
+                            })
                         }
                     } else {
                         if bootstrap.is_some() {
@@ -13408,6 +13402,15 @@ impl ShardedHotEngine {
             .bind_recovered_history_after_pending_reconciliation(transition)
             .map_err(|error| EngineError::ProjectionWork(error.to_string()))?;
         Ok(())
+    }
+
+    /// Reconcile and bind expected-path projection authority to the current
+    /// authenticated durable engine history before a filesystem
+    /// reconciliation scan consumes it.
+    pub(crate) fn reconcile_expected_path_history(&mut self) -> Result<(), EngineError> {
+        self.ensure_not_blocked()?;
+        let transition = self.authenticated_projection_history_transition()?;
+        self.reconcile_pending_projection_work(transition)
     }
 
     pub(crate) fn authorize_projection_work(
@@ -24996,9 +24999,9 @@ mod validation_tests {
     use crate::oplog::projection_work_index::ProjectionExpectedPathReadBudget;
     use crate::oplog::reconciliation_scan::{
         scan_graph_text, AuthenticatedExpectedPath, AuthenticatedExpectedPathSource,
-        ExpectedPathPageRequest, ExpectedPathPointRequest, ExpectedPathSourceFailure,
-        ExpectedPathStreamLimits, GraphTextCandidateKind, GraphTextScanLimits,
-        JoinedAuthenticatedExpectedPathSource,
+        ExpectedPathCorruptField, ExpectedPathPageRequest, ExpectedPathPointRequest,
+        ExpectedPathSourceFailure, ExpectedPathStreamLimits, GraphTextCandidateKind,
+        GraphTextScanLimits, JoinedAuthenticatedExpectedPathSource,
     };
     use crate::oplog::{BlobDescription, ImportId, ProjectionReceiptStoreId};
 
@@ -29263,7 +29266,8 @@ mod validation_tests {
     }
 
     #[test]
-    fn joined_expected_source_rejects_stale_history_and_cross_identity_indexes() {
+    fn joined_expected_source_retries_authenticated_history_extension_and_rejects_cross_identity_indexes(
+    ) {
         let lineage = LineageDigest::of(b"joined-scan-cross-identity");
         let (root, writer, mut engine, _) = enrolled_test_engine(317_250, lineage);
         stage_cursor_pages(&mut engine, 317_260, 317_270, 1);
@@ -29293,10 +29297,14 @@ mod validation_tests {
             endpoint.endpoint_id(),
             receipt_store_id,
         );
-        assert_eq!(
+        let stale_history_failure =
             JoinedAuthenticatedExpectedPathSource::new(&engine, &stale_history)
-                .current_binding(1024 * 1024),
-            Err(ExpectedPathSourceFailure::Corrupt)
+                .current_binding(1024 * 1024)
+                .unwrap_err();
+        assert_eq!(
+            stale_history_failure,
+            ExpectedPathSourceFailure::Unavailable,
+            "an authenticated insertion-only history extension must retry until projection authority is rebound"
         );
 
         let cross_workspace = open_index(
@@ -29308,7 +29316,9 @@ mod validation_tests {
         assert_eq!(
             JoinedAuthenticatedExpectedPathSource::new(&engine, &cross_workspace)
                 .current_binding(1024 * 1024),
-            Err(ExpectedPathSourceFailure::Corrupt)
+            Err(ExpectedPathSourceFailure::CorruptField(
+                ExpectedPathCorruptField::WorkspaceId
+            ))
         );
 
         let cross_endpoint = open_index(
@@ -29320,7 +29330,9 @@ mod validation_tests {
         assert_eq!(
             JoinedAuthenticatedExpectedPathSource::new(&engine, &cross_endpoint)
                 .current_binding(1024 * 1024),
-            Err(ExpectedPathSourceFailure::Corrupt)
+            Err(ExpectedPathSourceFailure::CorruptField(
+                ExpectedPathCorruptField::EndpointId
+            ))
         );
 
         let cross_receipt = open_index(
@@ -29332,8 +29344,15 @@ mod validation_tests {
         assert_eq!(
             JoinedAuthenticatedExpectedPathSource::new(&engine, &cross_receipt)
                 .current_binding(1024 * 1024),
-            Err(ExpectedPathSourceFailure::Corrupt)
+            Err(ExpectedPathSourceFailure::CorruptField(
+                ExpectedPathCorruptField::ReceiptStoreId
+            ))
         );
+        let receipt_detail = JoinedAuthenticatedExpectedPathSource::new(&engine, &cross_receipt)
+            .current_binding(1024 * 1024)
+            .unwrap_err()
+            .to_string();
+        assert!(receipt_detail.contains("receipt store ID mismatch"));
 
         drop(cross_receipt);
         drop(cross_endpoint);

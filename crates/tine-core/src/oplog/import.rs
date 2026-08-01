@@ -5064,7 +5064,55 @@ fn capture_affected_catalog(
                             "affected aggregate baseline entry budget exceeded",
                         ));
                     }
-                    let intent = baseline.intent().clone();
+                    let owner = engine
+                        .current_path_catalog_row_at_path(path)
+                        .map_err(|error| {
+                            authority_block(
+                                ImportBlockReason::AuthorityUnavailable,
+                                Some(path),
+                                format!("aggregate bootstrap current-path lookup failed: {error}"),
+                            )
+                        })?
+                        .ok_or_else(|| {
+                            authority_block(
+                                ImportBlockReason::ConflictingLocalTail,
+                                Some(path),
+                                "aggregate bootstrap path has no current accepted owner",
+                            )
+                        })?;
+                    let state = engine
+                        .materialize_page_for_projection(owner.page_id())
+                        .map_err(|error| {
+                            authority_block(
+                                ImportBlockReason::AuthorityUnavailable,
+                                Some(path),
+                                format!("aggregate bootstrap page materialization failed: {error}"),
+                            )
+                        })?;
+                    if owner.path() != path
+                        || owner.kind() != baseline.kind()
+                        || state.page.page_id != owner.page_id()
+                        || state.page.path != *path
+                        || state.page.kind != baseline.kind()
+                    {
+                        return Err(authority_block(
+                            ImportBlockReason::ConflictingLocalTail,
+                            Some(path),
+                            "aggregate bootstrap owner identity changed",
+                        ));
+                    }
+                    let rebound = baseline
+                        .rebind_semantic_successor(engine.workspace_id(), &state)
+                        .map_err(|error| {
+                            authority_block(
+                                ImportBlockReason::ConflictingLocalTail,
+                                Some(path),
+                                format!(
+                                    "aggregate bootstrap source does not match current accepted semantics: {error:?}"
+                                ),
+                            )
+                        })?;
+                    let intent = rebound.intent().clone();
                     let base = ExactBytes::from_description(
                         baseline.source_bytes().to_vec(),
                         BlobDescription::of(baseline.source_bytes()),

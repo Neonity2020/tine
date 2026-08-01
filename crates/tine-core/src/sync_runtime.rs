@@ -17503,13 +17503,18 @@ mod tests {
                 },
             ],
         );
+        let mut outbound_ticks = Vec::new();
         for _ in 0..64 {
-            let _ = initiator_reopened.tick().unwrap();
+            outbound_ticks.push(initiator_reopened.tick().unwrap());
             if initiator_reopened.status().unwrap().provider_pending == 0 {
                 break;
             }
         }
-        assert_eq!(initiator_reopened.status().unwrap().provider_pending, 0);
+        assert_eq!(
+            initiator_reopened.status().unwrap().provider_pending,
+            0,
+            "fresh shared restart did not drain outbound work: {outbound_ticks:?}"
+        );
         let provider_scan = SharedProviderTransport::open(
             &initiator.request.provider_root,
             &initiator.request.provider_journal_root,

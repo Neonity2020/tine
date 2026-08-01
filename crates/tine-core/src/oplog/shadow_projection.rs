@@ -38,7 +38,7 @@ use super::object_store::{open_dir_nofollow, open_file_nofollow, sync_dir_requir
 use super::plan_projection;
 use super::projection::{
     plan_projection_adopting_exact_source, ExactSourceProjectionError,
-    ExactSourceSemanticDifference,
+    ExactSourceSemanticDifference, ProjectionPlan,
 };
 use super::sqlite::{OpenProjection, VerifiedBootstrapSqliteProjection};
 use super::{
@@ -1007,6 +1007,48 @@ impl BootstrapProjectionBaseline {
 
     pub(crate) const fn owner_binding(&self) -> ContentDigest {
         self.owner_binding
+    }
+
+    /// Rebind immutable bootstrap bytes to a causally newer page state only
+    /// after the ordinary exact-source planner proves those bytes still encode
+    /// the complete accepted semantics. All non-frontier intent fields must
+    /// remain identical.
+    pub(crate) fn rebind_semantic_successor(
+        &self,
+        workspace_id: WorkspaceId,
+        state: &ProjectionPageState,
+    ) -> Result<ProjectionPlan, ShadowProjectionError> {
+        if self.intent.workspace_id() != workspace_id
+            || self.intent.page_id() != state.page.page_id
+            || self.intent.path() != &state.page.path
+            || self.kind != state.page.kind
+            || self.intent.target() != BlobDescription::of(&self.source)
+        {
+            return Err(ShadowProjectionError::BindingMismatch(
+                "bootstrap baseline does not bind the current page identity",
+            ));
+        }
+        let plan = plan_projection_adopting_exact_source(workspace_id, state, &self.source)
+            .map_err(|error| match error {
+                ExactSourceProjectionError::Projection(error) => {
+                    ShadowProjectionError::Projection(error.to_string())
+                }
+                ExactSourceProjectionError::Semantic(difference) => {
+                    ShadowProjectionError::SemanticMismatch {
+                        path: state.page.path.as_str().to_owned(),
+                        difference,
+                    }
+                }
+            })?;
+        if plan.target() != self.source
+            || !self.intent.matches_replay_except_frontier(plan.intent())
+            || plan.intent().frontier() != &state.frontier
+        {
+            return Err(ShadowProjectionError::BindingMismatch(
+                "bootstrap semantic successor changes a non-frontier intent field",
+            ));
+        }
+        Ok(plan)
     }
 }
 
@@ -5970,7 +6012,13 @@ mod tests {
         assert!(fixture.verify().is_err());
     }
 
-    fn synthetic_normal_sparse_mismatch() -> (PageId, ManagedPath, Vec<u8>, ProjectionIntent) {
+    fn synthetic_normal_sparse_mismatch() -> (
+        PageId,
+        ManagedPath,
+        Vec<u8>,
+        ProjectionIntent,
+        ProjectionPageState,
+    ) {
         let workspace = WorkspaceId::from_uuid(Uuid::from_u128(0x8200));
         let page_id = PageId::from_uuid(Uuid::from_u128(0x8201));
         let block_id = BlockId::from_uuid(Uuid::from_u128(0x8202));
@@ -6013,12 +6061,50 @@ mod tests {
         let path = ManagedPath::parse("pages/renderer.md").unwrap();
         let source = b"- target\r\n".to_vec();
         let plan = plan_projection(workspace, &state, Some(&source)).unwrap();
-        (page_id, path, source, plan.intent().clone())
+        (page_id, path, source, plan.intent().clone(), state)
+    }
+
+    #[test]
+    fn bootstrap_baseline_rebinds_only_frontier_only_semantic_successors() {
+        let (page_id, path, source, _, mut state) = synthetic_normal_sparse_mismatch();
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(0x8200));
+        state.page.blocks[0].logseq_uuid = None;
+        state.page.blocks[0].logseq_identity_origin = None;
+        state.claim_evidence.clear();
+        let baseline_plan =
+            plan_projection_adopting_exact_source(workspace, &state, &source).unwrap();
+        let baseline = BootstrapProjectionBaseline {
+            intent: baseline_plan.intent().clone(),
+            kind: state.page.kind,
+            source: source.clone(),
+            owner_binding: ContentDigest::of(b"semantic-successor-owner"),
+        };
+        let mut successor = state.clone();
+        successor.frontier = FrontierV2::new(vec![DocumentDependencies::new(
+            successor.page.home_document_id,
+            vec![CrdtPeerCounter::new(CrdtPeerId::from_u64(1), 1)],
+            vec![],
+        )
+        .unwrap()])
+        .unwrap();
+
+        let rebound = baseline
+            .rebind_semantic_successor(workspace, &successor)
+            .unwrap();
+        assert_eq!(rebound.target(), source);
+        assert_eq!(rebound.intent().page_id(), page_id);
+        assert_eq!(rebound.intent().path(), &path);
+        assert_eq!(rebound.intent().frontier(), &successor.frontier);
+
+        successor.page.blocks[0].content = "semantic change".into();
+        assert!(baseline
+            .rebind_semantic_successor(workspace, &successor)
+            .is_err());
     }
 
     #[test]
     fn normal_sparse_content_mismatch_reports_path_lengths_and_first_offset() {
-        let (page_id, path, source, intent) = synthetic_normal_sparse_mismatch();
+        let (page_id, path, source, intent, _) = synthetic_normal_sparse_mismatch();
         let mut projected = source.clone();
         projected[3] = b'X';
         let error = require_exact_source_baseline(
@@ -6040,7 +6126,7 @@ mod tests {
 
     #[test]
     fn normal_sparse_prefix_mismatch_reports_common_prefix_end() {
-        let (page_id, path, source, intent) = synthetic_normal_sparse_mismatch();
+        let (page_id, path, source, intent, _) = synthetic_normal_sparse_mismatch();
         let projected = &source[..source.len() - 2];
         let error = require_exact_source_baseline(
             projected,
@@ -6060,7 +6146,7 @@ mod tests {
 
     #[test]
     fn normal_sparse_equal_bytes_name_failed_non_byte_binding_checks() {
-        let (page_id, path, source, intent) = synthetic_normal_sparse_mismatch();
+        let (page_id, path, source, intent, _) = synthetic_normal_sparse_mismatch();
         let error = require_exact_source_baseline(
             &source,
             &intent,
