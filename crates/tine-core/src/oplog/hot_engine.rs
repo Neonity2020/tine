@@ -7283,6 +7283,18 @@ impl ShardedHotEngine {
         if let Some(catalog) = self.visible_documents.get(&self.catalog_document_id) {
             return Ok(Some(catalog));
         }
+        // A fresh ephemeral engine has neither accepted catalog heads nor a
+        // run-local scratch to authenticate. Its canonical catalog is simply
+        // empty. Archive-backed engines and ephemeral engines with accepted
+        // catalog history must still take the authenticated lazy-load path.
+        if self.archive_store.is_none()
+            && self.scratch.is_none()
+            && !self
+                .visible_document_heads
+                .contains_key(&self.catalog_document_id)
+        {
+            return Ok(None);
+        }
         Ok(self.lazy_catalog_hot_state()?.catalog_document.as_ref())
     }
 
@@ -26552,6 +26564,32 @@ mod validation_tests {
         enrolled_test_engine_with_retention(seed, lineage, false)
     }
 
+    fn independent_archive_author(
+        root: &std::path::Path,
+        replica: &str,
+        workspace: WorkspaceId,
+        lineage: LineageDigest,
+        catalog: DocumentId,
+        base: &PreparedBatch,
+    ) -> ShardedHotEngine {
+        let archive_path = root.join(replica);
+        let writer = ObjectStore::open(&archive_path, workspace).unwrap();
+        writer.publish_bootstrap_prepared_for_test(base).unwrap();
+        let mut engine = ShardedHotEngine::with_archive_store(
+            ObjectStore::open(&archive_path, workspace).unwrap(),
+            lineage,
+            catalog,
+        );
+        assert!(matches!(
+            engine
+                .stage_archive_batch(base.manifest().batch_id())
+                .unwrap()
+                .disposition(),
+            BatchDisposition::Accepted { .. }
+        ));
+        engine
+    }
+
     /// The same enrolled fixture, optionally opened on a **retained** run
     /// through the resuming entry point.
     ///
@@ -27552,12 +27590,16 @@ mod validation_tests {
             JoinedAuthenticatedExpectedPathSource::new(&fixture.engine, projection.as_ref());
         assert_eq!(
             source.expected_path_at(&digest_path, joined_point_request()),
-            Err(ExpectedPathSourceFailure::Corrupt),
+            Err(ExpectedPathSourceFailure::CorruptField(
+                ExpectedPathCorruptField::EngineAuthority
+            )),
             "an authenticated digest that disagrees with accepted PageId state must fail closed"
         );
         assert_eq!(
             source.expected_path_at(&kind_path, joined_point_request()),
-            Err(ExpectedPathSourceFailure::Corrupt),
+            Err(ExpectedPathSourceFailure::CorruptField(
+                ExpectedPathCorruptField::EngineAuthority
+            )),
             "an authenticated kind that disagrees with accepted PageId state must fail closed"
         );
 
@@ -29162,7 +29204,9 @@ mod validation_tests {
             .unwrap();
         assert_eq!(
             source.expected_path_at(rows[3].path(), joined_point_request()),
-            Err(ExpectedPathSourceFailure::Corrupt)
+            Err(ExpectedPathSourceFailure::CorruptField(
+                ExpectedPathCorruptField::CompletedReceiptIdentity
+            ))
         );
 
         drop(source);
@@ -29302,7 +29346,9 @@ mod validation_tests {
             .tamper_authenticated_catalog_root_for_test(&engine.current_path_catalog.root);
         assert!(matches!(
             source.read_expected_path_page(&mut cursor, joined_page_request(1)),
-            Err(ExpectedPathSourceFailure::Corrupt)
+            Err(ExpectedPathSourceFailure::CorruptField(
+                ExpectedPathCorruptField::EngineAuthority
+            ))
         ));
 
         drop(cursor);
@@ -34436,18 +34482,8 @@ mod validation_tests {
             BatchDisposition::Accepted { .. }
         ));
 
-        let mut right_author = ShardedHotEngine::with_archive_store(
-            ObjectStore::open(&archive_path, workspace).unwrap(),
-            lineage,
-            catalog,
-        );
-        assert!(matches!(
-            right_author
-                .stage_archive_batch(base.manifest().batch_id())
-                .unwrap()
-                .disposition(),
-            BatchDisposition::Accepted { .. }
-        ));
+        let right_author =
+            independent_archive_author(&root, "right-author", workspace, lineage, catalog, &base);
         let left = base_author
             .prepare_bootstrap_transaction(
                 test_author(8_611, 8_611),
@@ -34501,9 +34537,9 @@ mod validation_tests {
                 receiver.catalog_checkpoint_loads.get(),
                 CatalogCheckpointLoadStats {
                     authenticated_exact: 1,
-                    current: 0,
+                    current: 1,
                 },
-                "exact-current durable replay must retain one authenticated catalog load"
+                "accepted page-name replay must retain bounded exact and current catalog authentication"
             );
             let prior_root = receiver.page_name_index_root().unwrap().clone();
             receiver
@@ -34571,11 +34607,6 @@ mod validation_tests {
             lineage,
             catalog,
         );
-        let mut right_author = ShardedHotEngine::with_archive_store(
-            ObjectStore::open(&archive_path, workspace).unwrap(),
-            lineage,
-            catalog,
-        );
         let base = left_author
             .prepare_bootstrap_transaction(
                 test_author(87_005, 87_005),
@@ -34597,13 +34628,8 @@ mod validation_tests {
                 .disposition(),
             BatchDisposition::Accepted { .. }
         ));
-        assert!(matches!(
-            right_author
-                .stage_archive_batch(base.manifest().batch_id())
-                .unwrap()
-                .disposition(),
-            BatchDisposition::Accepted { .. }
-        ));
+        let right_author =
+            independent_archive_author(&root, "right-author", workspace, lineage, catalog, &base);
         let left = left_author
             .prepare_bootstrap_transaction(
                 test_author(87_010, 87_010),
@@ -38043,8 +38069,12 @@ mod replay_benchmark {
         ));
         let move_sources = engine.reference_source_observations.get();
         assert_eq!(
-            move_sources.fallback_document_reconstructions, 2,
-            "the unchanged catalog and untouched target shard retain authenticated fallback"
+            move_sources.fallback_document_reconstructions, 0,
+            "authenticated page-identity point reads must avoid full document reconstruction"
+        );
+        assert!(
+            (2..=4).contains(&move_sources.authenticated_page_identity_lookups),
+            "the two affected page identities must use bounded authenticated point reads"
         );
         assert!(
             move_sources.carried_shards >= 2,

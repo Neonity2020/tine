@@ -5458,13 +5458,7 @@ fn store_backed_portable_index_is_affected_only_and_missing_root_fails_closed() 
         crate::oplog::PortablePathIndexRoot::empty()
     );
 
-    let root = engine.portable_path_index_root().unwrap().digest();
-    std::fs::remove_file(
-        archive_path
-            .join("portable-path-index-v1")
-            .join(format!("{root}.patricia-node")),
-    )
-    .unwrap();
+    std::fs::remove_dir_all(archive_path.join("portable-path-index-v1")).unwrap();
     assert!(matches!(
         engine.prepare_bootstrap_transaction(
             author(40_301, 40_301),
