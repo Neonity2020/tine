@@ -11,9 +11,28 @@ use super::object_store::{
 
 #[allow(unused_imports)]
 pub(crate) use tine_storage::{
-    PatriciaIndexConstruction, PatriciaIndexConstructionStats, PatriciaIndexRoot,
-    PatriciaIndexStats, MAX_PATRICIA_CONSTRUCTION_RESIDENT_BYTES,
+    PatriciaIndexConstruction, PatriciaIndexConstructionStats, PatriciaIndexReclamationError,
+    PatriciaIndexReclamationReport, PatriciaIndexRoot, PatriciaIndexStats,
+    MAX_PATRICIA_CONSTRUCTION_RESIDENT_BYTES,
 };
+
+#[cfg(test)]
+thread_local! {
+    static NEXT_RECLAMATION_FAILURE: std::cell::Cell<Option<PatriciaReclamationFailureForTest>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(crate) enum PatriciaReclamationFailureForTest {
+    Busy,
+    MalformedAuthority,
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_patricia_reclamation_for_test(failure: PatriciaReclamationFailureForTest) {
+    NEXT_RECLAMATION_FAILURE.with(|next| next.set(Some(failure)));
+}
 
 #[derive(Debug)]
 enum CorePatriciaPublisher {
@@ -51,12 +70,16 @@ impl tine_storage::PatriciaNodePublisher for CorePatriciaPublisher {
 #[derive(Debug)]
 pub(crate) struct PatriciaIndexStore {
     storage: tine_storage::PatriciaIndexStore,
+    #[cfg(test)]
+    reclamation_attempts: std::sync::atomic::AtomicUsize,
 }
 
 impl PatriciaIndexStore {
     pub(crate) fn new(nodes: Dir) -> Self {
         Self {
             storage: tine_storage::PatriciaIndexStore::new(nodes, CorePatriciaPublisher::Ordinary),
+            #[cfg(test)]
+            reclamation_attempts: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -66,7 +89,11 @@ impl PatriciaIndexStore {
     ) -> Result<Self, StoreError> {
         self.storage
             .with_publisher(CorePatriciaPublisher::Detached(publisher))
-            .map(|storage| Self { storage })
+            .map(|storage| Self {
+                storage,
+                #[cfg(test)]
+                reclamation_attempts: std::sync::atomic::AtomicUsize::new(0),
+            })
             .map_err(map_storage_error)
     }
 
@@ -82,6 +109,31 @@ impl PatriciaIndexStore {
         self.storage
             .corrupt_packed_node_for_test(digest)
             .map_err(map_storage_error)
+    }
+
+    pub(crate) fn reclaim_unreachable_packed_files(
+        &self,
+    ) -> Result<PatriciaIndexReclamationReport, PatriciaIndexReclamationError> {
+        #[cfg(test)]
+        {
+            self.reclamation_attempts
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if let Some(failure) = NEXT_RECLAMATION_FAILURE.with(|next| next.take()) {
+                return Err(match failure {
+                    PatriciaReclamationFailureForTest::Busy => PatriciaIndexReclamationError::Busy,
+                    PatriciaReclamationFailureForTest::MalformedAuthority => {
+                        PatriciaIndexReclamationError::MalformedAuthority
+                    }
+                });
+            }
+        }
+        self.storage.reclaim_unreachable_packed_files()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reclamation_attempts(&self) -> usize {
+        self.reclamation_attempts
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub(crate) fn validate_root(&self, root: PatriciaIndexRoot) -> Result<(), StoreError> {

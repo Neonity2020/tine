@@ -716,6 +716,10 @@ impl ReferenceCatalogStore {
             .map_err(store_error)
     }
 
+    pub(crate) const fn patricia_index(&self) -> &PatriciaIndexStore {
+        &self.patricia
+    }
+
     fn publish_posting(
         &self,
         posting: &ReferenceSourcePostingV2,
@@ -1414,6 +1418,15 @@ impl ReferenceCatalogStateV2 {
             ReferenceCatalogBackend::Store(store)
             | ReferenceCatalogBackend::Construction { store, .. }
             | ReferenceCatalogBackend::RecoveryRequired(store) => Some(Arc::clone(store)),
+            ReferenceCatalogBackend::Memory(_) => None,
+        }
+    }
+
+    pub(crate) fn store_ref(&self) -> Option<&ReferenceCatalogStore> {
+        match &self.backend {
+            ReferenceCatalogBackend::Store(store)
+            | ReferenceCatalogBackend::Construction { store, .. }
+            | ReferenceCatalogBackend::RecoveryRequired(store) => Some(store),
             ReferenceCatalogBackend::Memory(_) => None,
         }
     }

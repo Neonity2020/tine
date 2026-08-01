@@ -8,13 +8,17 @@ use uuid::Uuid;
 
 use super::*;
 use crate::model::Graph;
+use crate::oplog::authenticated_patricia::{
+    fail_next_patricia_reclamation_for_test, PatriciaReclamationFailureForTest,
+};
 use crate::oplog::enrollment::{
     compose_verified_local, enrollment_application_root_for_test, fail_next_enrollment_head_read,
     CommitCut, EnrollmentOpen, EnrollmentReader, PreparationId,
 };
 use crate::oplog::hot_engine::{
-    take_last_admitted_local_author, AcceptedFrontierRoot, ProjectionEndpointBinding,
-    ProjectionStorageBinding, MAX_EPHEMERAL_BLOCK_CLAIMS,
+    take_last_admitted_local_author, AcceptedFrontierRoot, AuthenticatedPatriciaIndexKind,
+    PackedPatriciaMaintenanceOutcome, ProjectionEndpointBinding, ProjectionStorageBinding,
+    MAX_EPHEMERAL_BLOCK_CLAIMS,
 };
 use crate::oplog::identity::ARCHIVE_INSTANCE_CLAIM_FILE;
 use crate::oplog::import::{
@@ -7003,12 +7007,166 @@ fn publish_expecting_success(
         ResumePublicationStatus::Published {
             resume_sequence,
             maintenance,
+            ..
         } => (
             resume_sequence,
             maintenance.expect("a successful publication authorizes the maintenance pass"),
         ),
         other => panic!("a quiescent promoted runtime must publish, got {other:?}"),
     }
+}
+
+#[test]
+fn ordinary_startup_read_and_write_never_attempt_packed_patricia_reclamation() {
+    on_a_deep_stack(|| {
+        let mut fixture = Fixture::new(
+            "packed-maintenance-normal-paths",
+            None,
+            vec![("pages/normal.md".into(), b"- normal\n".to_vec())],
+        );
+        let root = fixture.enrollment_root("packed-maintenance-normal-paths");
+        let paths = PromotedPaths::new(&fixture, "packed-maintenance-normal-paths");
+
+        with_promoted_runtime(
+            &mut fixture,
+            &root,
+            &paths,
+            SessionId::new(),
+            |fixture, authority, runtime| {
+                assert!(matches!(
+                    runtime.resume_publication_status(),
+                    Some(ResumePublicationStatus::Published {
+                        packed_maintenance: None,
+                        ..
+                    })
+                ));
+                assert_eq!(runtime.engine().packed_patricia_reclamation_attempts(), 0);
+
+                runtime.engine().accepted_frontier_root().unwrap();
+                assert_eq!(runtime.engine().packed_patricia_reclamation_attempts(), 0);
+
+                append_local_batch(fixture, authority, runtime, 0xE080);
+                assert_eq!(runtime.engine().packed_patricia_reclamation_attempts(), 0);
+            },
+        );
+        fixture.assert_graph_unchanged();
+    });
+}
+
+#[test]
+fn packed_patricia_maintenance_is_post_commit_complete_and_best_effort() {
+    on_a_deep_stack(|| {
+        let mut fixture = Fixture::new(
+            "packed-maintenance-best-effort",
+            None,
+            vec![("pages/maintenance.md".into(), b"- maintenance\n".to_vec())],
+        );
+        let root = fixture.enrollment_root("packed-maintenance-best-effort");
+        let paths = PromotedPaths::new(&fixture, "packed-maintenance-best-effort");
+
+        with_promoted_runtime(
+            &mut fixture,
+            &root,
+            &paths,
+            SessionId::new(),
+            |fixture, authority, runtime| {
+                assert_eq!(runtime.engine().packed_patricia_reclamation_attempts(), 0);
+
+                fail_next_patricia_reclamation_for_test(PatriciaReclamationFailureForTest::Busy);
+                let busy = runtime.publish_quiescent_resume_point(authority, &fixture.graph);
+                let packed = match busy {
+                    ResumePublicationStatus::Published {
+                        maintenance: Some(_),
+                        packed_maintenance: Some(packed),
+                        ..
+                    } => packed,
+                    other => panic!("Busy maintenance must not fail publication: {other:?}"),
+                };
+                assert_eq!(
+                    packed.indexes.each_ref().map(|index| index.kind),
+                    [
+                        AuthenticatedPatriciaIndexKind::LogseqUuidClaims,
+                        AuthenticatedPatriciaIndexKind::PortablePaths,
+                        AuthenticatedPatriciaIndexKind::PageNames,
+                        AuthenticatedPatriciaIndexKind::ReferenceCatalog,
+                    ]
+                );
+                assert_eq!(
+                    packed.indexes[0].outcome,
+                    PackedPatriciaMaintenanceOutcome::Busy
+                );
+                assert_eq!(runtime.engine().packed_patricia_reclamation_attempts(), 4);
+
+                fail_next_patricia_reclamation_for_test(
+                    PatriciaReclamationFailureForTest::MalformedAuthority,
+                );
+                let receipt = runtime
+                    .quiesce_and_mark_safe(authority, &fixture.graph)
+                    .expect("maintenance failure must not block a valid Safe handoff");
+                let packed = match receipt.publication() {
+                    ResumePublicationStatus::Published {
+                        packed_maintenance: Some(packed),
+                        ..
+                    } => packed,
+                    other => panic!("post-Safe maintenance must remain report-only: {other:?}"),
+                };
+                assert!(matches!(
+                    packed.indexes[0].outcome,
+                    PackedPatriciaMaintenanceOutcome::Unavailable(_)
+                ));
+                assert_eq!(runtime.engine().packed_patricia_reclamation_attempts(), 8);
+            },
+        );
+        fixture.assert_graph_unchanged();
+    });
+}
+
+#[test]
+fn packed_patricia_maintenance_requires_a_successful_durable_replacement() {
+    on_a_deep_stack(|| {
+        let mut fixture = Fixture::new(
+            "packed-maintenance-ordering",
+            None,
+            vec![("pages/ordering.md".into(), b"- ordering\n".to_vec())],
+        );
+        let root = fixture.enrollment_root("packed-maintenance-ordering");
+        let paths = PromotedPaths::new(&fixture, "packed-maintenance-ordering");
+
+        with_promoted_runtime(
+            &mut fixture,
+            &root,
+            &paths,
+            SessionId::new(),
+            |fixture, authority, runtime| {
+                remove_every_resume_point(&fixture.archive_root);
+                assert_eq!(runtime.engine().packed_patricia_reclamation_attempts(), 0);
+
+                fail_next_resume_publication_at(ResumePublishBoundary::AfterPrePrune);
+                assert!(matches!(
+                    runtime.publish_quiescent_resume_point(authority, &fixture.graph),
+                    ResumePublicationStatus::NotPublished(_)
+                ));
+                assert_eq!(runtime.engine().packed_patricia_reclamation_attempts(), 0);
+
+                fail_next_resume_publication_at(ResumePublishBoundary::AfterCommit);
+                assert!(matches!(
+                    runtime.publish_quiescent_resume_point(authority, &fixture.graph),
+                    ResumePublicationStatus::NotPublished(_)
+                ));
+                assert_eq!(runtime.engine().packed_patricia_reclamation_attempts(), 0);
+
+                assert!(matches!(
+                    runtime.publish_quiescent_resume_point(authority, &fixture.graph),
+                    ResumePublicationStatus::Published {
+                        packed_maintenance: Some(_),
+                        ..
+                    }
+                ));
+                assert_eq!(runtime.engine().packed_patricia_reclamation_attempts(), 4);
+            },
+        );
+        fixture.assert_graph_unchanged();
+    });
 }
 
 /// The complete retained-resume lifecycle, in the exact order production runs
@@ -8134,6 +8292,7 @@ fn a_takeover_publication_supersedes_the_predecessor_point_and_reclaims_its_run(
             ResumePublicationStatus::Published {
                 resume_sequence,
                 maintenance: Some(maintenance),
+                ..
             } => (resume_sequence, maintenance),
             other => panic!("later quiescence must publish and reclaim: {other:?}"),
         };
@@ -8195,6 +8354,7 @@ fn losing_the_lease_before_reclamation_deletes_nothing_and_latches() {
             ResumePublicationStatus::Published {
                 resume_sequence: 3,
                 maintenance: None,
+                packed_maintenance: None,
             },
             "a lost workspace must skip the maintenance pass, not run it"
         );

@@ -1601,6 +1601,10 @@ impl PageNameOwnershipStore {
         self.patricia.stats()
     }
 
+    pub(crate) const fn patricia_index(&self) -> &PatriciaIndexStore {
+        &self.patricia
+    }
+
     pub(crate) fn put_exact_name(
         &self,
         name: &LogicalPageName,

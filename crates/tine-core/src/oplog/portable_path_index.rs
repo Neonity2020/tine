@@ -214,6 +214,10 @@ impl PortablePathIndexStore {
         self.patricia.stats()
     }
 
+    pub(crate) const fn patricia_index(&self) -> &PatriciaIndexStore {
+        &self.patricia
+    }
+
     pub(crate) fn validate_root(&self, root: PortablePathIndexRoot) -> Result<(), StoreError> {
         self.patricia.validate_root(root.0)
     }

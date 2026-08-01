@@ -246,7 +246,9 @@
 //! 5. **Reclamation.** Only the sealed `PublishedResumePoint` a successful
 //!    publication mints authorizes deletion, and the pass reproves the lease
 //!    once more first. This is the only boundary in this module that can delete
-//!    archive bytes.
+//!    archive bytes. Packed Patricia scanning is enabled only for a caller's
+//!    explicit quiescent publication or after durable Safe; the automatic
+//!    post-open publication never scans those directories.
 //!
 //! The whole thing is an accelerator, so it has no `Err` reaching a caller's
 //! control flow: [`ResumePublicationStatus`] and [`RuntimeResumeOpenStatus`] are
@@ -295,8 +297,8 @@ use super::enrollment::{
     VerifiedLocalCompositionError, VerifiedLocalEvidence, VerifiedLocalProofSet,
 };
 use super::hot_engine::{
-    EngineError, EngineOpenRetention, LocalAuthorGeneration, ProjectionStorageBinding,
-    RuntimeResumeObservation, ShardedHotEngine,
+    EngineError, EngineOpenRetention, LocalAuthorGeneration, PackedPatriciaMaintenanceReport,
+    ProjectionStorageBinding, RuntimeResumeObservation, ShardedHotEngine,
 };
 use super::import::{InactiveBootstrapAcceptedAuthority, RetainedBootstrapPromotionCandidate};
 use super::migration_backup::MigrationBackupRoot;
@@ -2233,14 +2235,24 @@ impl RuntimeResumeOpenStatus {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ResumePublicationStatus {
     /// A replacement point reached durability. `maintenance` is the bounded
-    /// reclamation pass its witness authorized, or `None` when the reclamation
-    /// boundary itself refused — in which case nothing was deleted.
+    /// retained-run reclamation pass its witness authorized, or `None` when
+    /// the reclamation boundary itself refused. `packed_maintenance` is present
+    /// only at an explicit caller-invoked or post-Safe maintenance point;
+    /// automatic post-open publication deliberately leaves it `None` so
+    /// startup never scans an authenticated-index directory.
     Published {
         resume_sequence: u64,
         maintenance: Option<RetainedRunMaintenanceReport>,
+        packed_maintenance: Option<PackedPatriciaMaintenanceReport>,
     },
     /// Nothing was published and nothing was deleted.
     NotPublished(ResumePublicationRefusal),
+}
+
+#[derive(Clone, Copy)]
+enum PackedPatriciaMaintenance {
+    Skip,
+    Run,
 }
 
 /// Why one quiescent publication attempt published nothing.
@@ -2326,8 +2338,9 @@ pub(crate) enum WorkspaceAuthorityBoundary {
     SafeHandoff,
     /// Minting and publishing this endpoint's quiescent resume point.
     ResumePublication,
-    /// The bounded retained-run reclamation pass one publication authorized.
-    /// It is the only boundary in this module that can delete archive bytes.
+    /// The bounded retained-run and packed-Patricia reclamation passes one
+    /// publication authorized. It is the only boundary in this module that can
+    /// delete archive bytes.
     ResumeReclamation,
     /// Coordinator: immutable batch publication into the archive.
     Publication,
@@ -2351,7 +2364,7 @@ impl WorkspaceAuthorityBoundary {
             Self::ProjectionTailDrain => "promoted tail -> SQLite drain",
             Self::SafeHandoff => "promoted Safe handoff",
             Self::ResumePublication => "quiescent resume-point publication",
-            Self::ResumeReclamation => "retained-run reclamation",
+            Self::ResumeReclamation => "post-publication storage reclamation",
             Self::Publication => "coordinator immutable publication",
             Self::ArchiveStage => "coordinator accepted-history archive staging",
             Self::TailAdmission => "coordinator tail admission",
@@ -2912,7 +2925,11 @@ impl PromotedLocalRuntime {
                 )));
             }
             self.post_open_publication_available = false;
-            let retirement = self.publish_quiescent_resume_point_inner(authority, graph);
+            let retirement = self.publish_quiescent_resume_point_inner(
+                authority,
+                graph,
+                PackedPatriciaMaintenance::Skip,
+            );
             self.resume_publication = Some(retirement.clone());
             if !matches!(retirement, ResumePublicationStatus::Published { .. }) {
                 return Err(RuntimePromotionError::Engine(EngineError::Archive(
@@ -3155,7 +3172,8 @@ impl PromotedLocalRuntime {
 
             // Report-only after the Safe commit. Every failure below keeps Safe
             // valid and merely removes the accelerator for the next restart.
-            let publication = self.publish_bound_resume_point(safe_binding);
+            let publication =
+                self.publish_bound_resume_point(safe_binding, PackedPatriciaMaintenance::Run);
             self.resume_publication = Some(publication.clone());
             Ok(SafeHandoffReceipt {
                 permit: SafeHandoffPermit {
@@ -3310,28 +3328,35 @@ impl PromotedLocalRuntime {
     ///
     /// # What it may delete, and under what proof
     ///
-    /// Only [`super::object_store::DurableEngineHistoryStore::reclaim_retained_runs_after_publication`]
-    /// deletes, it consumes the sealed `PublishedResumePoint` this call's own
-    /// successful publication minted, and it re-derives reachability from the
-    /// strict complete-set proof. A denied proof, unclassifiable residue, or a
-    /// still-leased run preserves every byte. The reclamation boundary reproves
-    /// the workspace lease first, so a runtime that lost the archive between its
-    /// publication and its maintenance pass deletes nothing.
+    /// Retained-run deletion consumes the sealed `PublishedResumePoint` this
+    /// call's own successful publication minted and re-derives reachability
+    /// from the strict complete-set proof. Packed Patricia deletion is also
+    /// ordered after that witness; each live store independently authenticates
+    /// its current packed head and takes a nonblocking exclusive maintenance
+    /// lock before it scans. A denied proof, unclassifiable residue, malformed
+    /// authority, or busy store preserves the affected bytes. The reclamation
+    /// boundary reproves the workspace lease first, so a runtime that lost the
+    /// archive between publication and maintenance deletes nothing.
     ///
     /// # Ordering
     ///
     /// `runtime_resume_snapshot -> mint_resume_point -> publish_resume_point ->
-    /// reclaim_retained_runs_after_publication`, explicitly, in that order. The
-    /// snapshot is the only source of run-local facts, the store is the only
-    /// source of identity facts, the enrollment evidence is derived here from
-    /// the retained authenticated session, and only a successful publication
-    /// authorizes the reclamation.
+    /// retained-run reclamation -> optional packed-Patricia reclamation`,
+    /// explicitly, in that order. The optional final step is enabled only for
+    /// caller-invoked quiescent maintenance and the post-Safe publication, not
+    /// automatic post-open publication. The snapshot is the only source of
+    /// run-local facts, the store is the only source of identity facts, and
+    /// only a successful durable publication authorizes either reclamation.
     pub(crate) fn publish_quiescent_resume_point(
         &mut self,
         authority: &LocalActiveAuthority,
         graph: &Graph,
     ) -> ResumePublicationStatus {
-        let status = self.publish_quiescent_resume_point_inner(authority, graph);
+        let status = self.publish_quiescent_resume_point_inner(
+            authority,
+            graph,
+            PackedPatriciaMaintenance::Run,
+        );
         self.resume_publication = Some(status.clone());
         status
     }
@@ -3340,6 +3365,7 @@ impl PromotedLocalRuntime {
         &mut self,
         authority: &LocalActiveAuthority,
         graph: &Graph,
+        packed_maintenance: PackedPatriciaMaintenance,
     ) -> ResumePublicationStatus {
         macro_rules! refuse {
             ($refusal:expr) => {
@@ -3396,7 +3422,7 @@ impl PromotedLocalRuntime {
         {
             refuse!(ResumePublicationRefusal::DrainIncomplete(error.to_string()));
         }
-        self.publish_bound_resume_point(enrollment)
+        self.publish_bound_resume_point(enrollment, packed_maintenance)
     }
 
     /// Snapshot, mint, publish and conditionally reclaim one exact
@@ -3409,6 +3435,7 @@ impl PromotedLocalRuntime {
     fn publish_bound_resume_point(
         &mut self,
         enrollment: super::enrollment::ResumePointEnrollmentBinding,
+        packed_maintenance: PackedPatriciaMaintenance,
     ) -> ResumePublicationStatus {
         macro_rules! refuse {
             ($refusal:expr) => {
@@ -3468,11 +3495,16 @@ impl PromotedLocalRuntime {
             return ResumePublicationStatus::Published {
                 resume_sequence,
                 maintenance: None,
+                packed_maintenance: None,
             };
         }
+        let maintenance = history.reclaim_retained_runs_after_publication(&published);
+        let packed_maintenance = matches!(packed_maintenance, PackedPatriciaMaintenance::Run)
+            .then(|| self.engine.reclaim_unreachable_packed_patricia_files());
         ResumePublicationStatus::Published {
             resume_sequence,
-            maintenance: Some(history.reclaim_retained_runs_after_publication(&published)),
+            maintenance: Some(maintenance),
+            packed_maintenance,
         }
     }
 
@@ -3544,7 +3576,11 @@ impl PromotedLocalRuntime {
             return status;
         }
         self.post_open_publication_available = false;
-        let status = self.publish_quiescent_resume_point_inner(authority, graph);
+        let status = self.publish_quiescent_resume_point_inner(
+            authority,
+            graph,
+            PackedPatriciaMaintenance::Skip,
+        );
         self.resume_publication = Some(status.clone());
         status
     }

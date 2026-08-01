@@ -15,6 +15,9 @@ use loro::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use super::authenticated_patricia::{
+    PatriciaIndexReclamationError, PatriciaIndexReclamationReport, PatriciaIndexStore,
+};
 use super::bootstrap_import::{
     BootstrapImportPartEvidenceV1, BootstrapPartDescriptorV1, BootstrapProfileDigestV1,
     MAX_OPERATIONS_PER_BOOTSTRAP_PART,
@@ -4647,6 +4650,64 @@ pub struct RuntimeResumeObservation {
     pub replayed_generations: u64,
 }
 
+/// The complete authenticated Patricia inventory owned by a store-backed hot
+/// engine. Keeping this closed list beside the shared builder makes adding a
+/// fifth store impossible without updating both ordinary ownership and
+/// maintenance accounting.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AuthenticatedPatriciaIndexKind {
+    LogseqUuidClaims,
+    PortablePaths,
+    PageNames,
+    ReferenceCatalog,
+}
+
+impl AuthenticatedPatriciaIndexKind {
+    const ALL: [Self; 4] = [
+        Self::LogseqUuidClaims,
+        Self::PortablePaths,
+        Self::PageNames,
+        Self::ReferenceCatalog,
+    ];
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum PackedPatriciaMaintenanceOutcome {
+    Reclaimed(PatriciaIndexReclamationReport),
+    Busy,
+    Unavailable(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PackedPatriciaIndexMaintenance {
+    pub(crate) kind: AuthenticatedPatriciaIndexKind,
+    pub(crate) outcome: PackedPatriciaMaintenanceOutcome,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PackedPatriciaMaintenanceReport {
+    pub(crate) indexes: [PackedPatriciaIndexMaintenance; 4],
+}
+
+struct AuthenticatedPatriciaIndexes<'a> {
+    stores: [Option<&'a PatriciaIndexStore>; 4],
+}
+
+impl<'a> AuthenticatedPatriciaIndexes<'a> {
+    fn iter(
+        &'a self,
+    ) -> impl Iterator<
+        Item = (
+            AuthenticatedPatriciaIndexKind,
+            Option<&'a PatriciaIndexStore>,
+        ),
+    > + 'a {
+        AuthenticatedPatriciaIndexKind::ALL
+            .into_iter()
+            .zip(self.stores.iter().copied())
+    }
+}
+
 /// The exact run-local engine state one cross-process resume needs.
 ///
 /// **Derivation.** `reconstruct_run_local_state` is the same-process
@@ -5452,6 +5513,72 @@ impl ShardedHotEngine {
         }
         engine.archive_store = Some(Arc::new(store));
         engine
+    }
+
+    /// Build the complete maintenance inventory from the same live store
+    /// handles ordinary engine work owns. No path is reopened and no directory
+    /// is enumerated while constructing this view.
+    fn authenticated_patricia_indexes(&self) -> AuthenticatedPatriciaIndexes<'_> {
+        AuthenticatedPatriciaIndexes {
+            stores: [
+                self.logseq_claim_index.as_deref(),
+                self.portable_path_index
+                    .as_deref()
+                    .map(PortablePathIndexStore::patricia_index),
+                self.page_name_index
+                    .as_deref()
+                    .map(PageNameOwnershipStore::patricia_index),
+                self.reference_catalog
+                    .store_ref()
+                    .map(ReferenceCatalogStore::patricia_index),
+            ],
+        }
+    }
+
+    /// Best-effort packed-file maintenance for every live authenticated
+    /// Patricia store. Each store authenticates its own current packed head
+    /// before scanning; a busy or malformed store never suppresses the other
+    /// independent attempts.
+    pub(crate) fn reclaim_unreachable_packed_patricia_files(
+        &self,
+    ) -> PackedPatriciaMaintenanceReport {
+        let inventory = self.authenticated_patricia_indexes();
+        let mut indexes = inventory
+            .iter()
+            .map(|(kind, store)| PackedPatriciaIndexMaintenance {
+                kind,
+                outcome: match store {
+                    Some(store) => match store.reclaim_unreachable_packed_files() {
+                        Ok(report) => PackedPatriciaMaintenanceOutcome::Reclaimed(report),
+                        Err(PatriciaIndexReclamationError::Busy) => {
+                            PackedPatriciaMaintenanceOutcome::Busy
+                        }
+                        Err(error) => {
+                            PackedPatriciaMaintenanceOutcome::Unavailable(error.to_string())
+                        }
+                    },
+                    None => PackedPatriciaMaintenanceOutcome::Unavailable(
+                        "authenticated Patricia store is unavailable".to_owned(),
+                    ),
+                },
+            });
+        PackedPatriciaMaintenanceReport {
+            indexes: [
+                indexes.next().expect("closed Patricia inventory entry"),
+                indexes.next().expect("closed Patricia inventory entry"),
+                indexes.next().expect("closed Patricia inventory entry"),
+                indexes.next().expect("closed Patricia inventory entry"),
+            ],
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn packed_patricia_reclamation_attempts(&self) -> usize {
+        self.authenticated_patricia_indexes()
+            .iter()
+            .filter_map(|(_, store)| store)
+            .map(PatriciaIndexStore::reclamation_attempts)
+            .sum()
     }
 
     pub(crate) fn runtime_authority(&self) -> &EngineAuthority {
