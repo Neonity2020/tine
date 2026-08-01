@@ -274,6 +274,13 @@ struct ProviderAcceptedManifestAudit {
     advances_coverage: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProviderAcceptedManifestAuditTick {
+    Complete(ProviderRecoveryCoverageRoot),
+    AwaitingExactProof,
+    PageExhausted,
+}
+
 impl ProviderAcceptedManifestAudit {
     fn after_coverage(covered_sequence: u64, target_sequence: u64) -> Option<Self> {
         (covered_sequence < target_sequence).then_some(Self {
@@ -4627,6 +4634,11 @@ fn stage_provider_manifest_exact(
             ));
         };
         let digest = ContentDigest::of(&object_bytes);
+        if digest != object.content_digest() {
+            return Err(SyncRuntimeRequestError::ActorRefused(format!(
+                "conflicting provider object retained at {object_path}"
+            )));
+        }
         let already_present = store
             .contains_object(digest)
             .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
@@ -4701,19 +4713,19 @@ fn provider_manifest_recovery_link_present(
     Ok(true)
 }
 
-fn provider_manifest_present_with_fingerprint(
+fn load_provider_manifest_with_fingerprint(
     provider: &SharedProviderTransport,
     descriptor: &SharedEnrollmentDescriptorV1,
     batch_id: BatchId,
     expected_fingerprint: ContentDigest,
-) -> Result<bool, SyncRuntimeRequestError> {
+) -> Result<Option<(OperationBatch, Vec<u8>)>, SyncRuntimeRequestError> {
     let path = format!("manifests/{batch_id}.manifest");
     provider_accepted_audit_cut(descriptor.workspace_id(), batch_id, "provider_read")?;
     let Some(bytes) = provider
         .read_exact(&path)
         .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
     else {
-        return Ok(false);
+        return Ok(None);
     };
     let manifest = OperationBatch::decode(&bytes)
         .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
@@ -4726,7 +4738,7 @@ fn provider_manifest_present_with_fingerprint(
             "accepted provider manifest fingerprint conflicts at {path}"
         )));
     }
-    Ok(true)
+    Ok(Some((manifest, bytes)))
 }
 
 fn local_archive_manifest_digest(
@@ -8094,6 +8106,158 @@ impl RuntimeActor {
         Ok(())
     }
 
+    fn prove_provider_accepted_manifest_exact(
+        &mut self,
+        store: &ObjectStore,
+        descriptor: &SharedEnrollmentDescriptorV1,
+        batch_id: BatchId,
+        expected_fingerprint: ContentDigest,
+    ) -> Result<bool, SyncRuntimeRequestError> {
+        let local_manifest = match store
+            .inspect_batch(batch_id)
+            .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
+        {
+            crate::oplog::BatchInspection::Ready(batch) => {
+                let bytes = store
+                    .read_manifest_bytes(batch_id)
+                    .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+                if ContentDigest::of(&bytes) != expected_fingerprint {
+                    return Err(SyncRuntimeRequestError::ActorRefused(format!(
+                        "accepted local manifest fingerprint changed for {batch_id}"
+                    )));
+                }
+                Some((batch.manifest().clone(), bytes))
+            }
+            crate::oplog::BatchInspection::Absent
+            | crate::oplog::BatchInspection::Staged { .. } => None,
+        };
+        let provider_manifest = load_provider_manifest_with_fingerprint(
+            self.provider
+                .as_ref()
+                .ok_or(SyncRuntimeRequestError::ActorUnavailable)?,
+            descriptor,
+            batch_id,
+            expected_fingerprint,
+        )?;
+        let provider_manifest_present = provider_manifest.is_some();
+        let recovered_manifest = if provider_manifest_present || local_manifest.is_some() {
+            None
+        } else {
+            load_provider_manifest_recovery_exact(
+                self.provider
+                    .as_ref()
+                    .ok_or(SyncRuntimeRequestError::ActorUnavailable)?,
+                descriptor,
+                batch_id,
+            )?
+        };
+        let Some((manifest, manifest_bytes)) = provider_manifest
+            .or_else(|| local_manifest.clone())
+            .or(recovered_manifest)
+        else {
+            self.provider_accepted_archive_loss.insert(batch_id);
+            return Ok(false);
+        };
+        if ContentDigest::of(&manifest_bytes) != expected_fingerprint {
+            return Err(SyncRuntimeRequestError::ActorRefused(format!(
+                "accepted provider recovery fingerprint changed for {batch_id}"
+            )));
+        }
+
+        for object in manifest.required_objects() {
+            let digest = object.content_digest();
+            let path = format!("objects/{digest}.object");
+            match self
+                .provider
+                .as_ref()
+                .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
+                .read_exact(&path)
+                .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
+            {
+                Some(bytes) if ContentDigest::of(&bytes) == digest => {}
+                Some(_) => {
+                    return Err(SyncRuntimeRequestError::ActorRefused(format!(
+                        "accepted provider object conflicts at {path}"
+                    )));
+                }
+                None => {
+                    if !store
+                        .contains_object(digest)
+                        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
+                    {
+                        self.provider_accepted_archive_loss.insert(batch_id);
+                        return Ok(false);
+                    }
+                    let local_object = store.read_object_bytes(digest).map_err(|error| {
+                        SyncRuntimeRequestError::ActorRefused(error.to_string())
+                    })?;
+                    if ContentDigest::of(&local_object) != digest {
+                        return Err(SyncRuntimeRequestError::ActorRefused(format!(
+                            "accepted local object fingerprint changed for {batch_id} at {path}"
+                        )));
+                    }
+                    provider_accepted_audit_cut(
+                        descriptor.workspace_id(),
+                        batch_id,
+                        "repair_publication",
+                    )?;
+                    self.provider
+                        .as_mut()
+                        .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
+                        .publish_object(digest, &local_object)
+                        .map_err(|error| {
+                            SyncRuntimeRequestError::ActorRefused(error.to_string())
+                        })?;
+                    self.provider_head_dirty = true;
+                }
+            }
+        }
+
+        if !provider_manifest_present {
+            provider_accepted_audit_cut(descriptor.workspace_id(), batch_id, "repair_publication")?;
+            publish_manifest_recovery(
+                self.provider
+                    .as_mut()
+                    .ok_or(SyncRuntimeRequestError::ActorUnavailable)?,
+                descriptor,
+                &manifest,
+                &manifest_bytes,
+            )?;
+            self.provider
+                .as_mut()
+                .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
+                .publish_manifest(batch_id, &manifest_bytes)
+                .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+            self.provider_head_dirty = true;
+        }
+
+        if local_manifest.is_none() {
+            let path = format!("manifests/{batch_id}.manifest");
+            let (ingress, object_arrived) = stage_provider_manifest_exact(
+                store,
+                self.provider
+                    .as_ref()
+                    .ok_or(SyncRuntimeRequestError::ActorUnavailable)?,
+                descriptor,
+                &path,
+            )?;
+            if object_arrived {
+                self.schedule_provider_incomplete_recheck_after_object_arrival();
+            }
+            match ingress {
+                ProviderManifestIngress::Ready(_) => {
+                    self.provider_incomplete.remove(&batch_id);
+                }
+                ProviderManifestIngress::Incomplete(_) | ProviderManifestIngress::Absent(_) => {
+                    self.provider_accepted_archive_loss.insert(batch_id);
+                    return Ok(false);
+                }
+            }
+        }
+        self.provider_accepted_archive_loss.remove(&batch_id);
+        Ok(true)
+    }
+
     fn tick_provider_accepted_manifest_audit(
         &mut self,
         store: &ObjectStore,
@@ -8102,274 +8266,111 @@ impl RuntimeActor {
         let Some(mut audit) = self.provider_accepted_manifest_audit.take() else {
             return Ok(false);
         };
-        let result =
-            (|| -> Result<Option<ProviderRecoveryCoverageRoot>, SyncRuntimeRequestError> {
-                let probe_limit = {
-                    #[cfg(test)]
-                    {
-                        PROVIDER_ACCEPTED_AUDIT_LIMIT_OVERRIDES
-                            .lock()
-                            .unwrap()
-                            .get(&self.binding.workspace_id())
-                            .copied()
-                            .unwrap_or(MAX_PROVIDER_ACCEPTED_AUDIT_PROBES_PER_TICK)
+        let result = (|| -> Result<ProviderAcceptedManifestAuditTick, SyncRuntimeRequestError> {
+            let probe_limit = {
+                #[cfg(test)]
+                {
+                    PROVIDER_ACCEPTED_AUDIT_LIMIT_OVERRIDES
+                        .lock()
+                        .unwrap()
+                        .get(&self.binding.workspace_id())
+                        .copied()
+                        .unwrap_or(MAX_PROVIDER_ACCEPTED_AUDIT_PROBES_PER_TICK)
+                }
+                #[cfg(not(test))]
+                {
+                    MAX_PROVIDER_ACCEPTED_AUDIT_PROBES_PER_TICK
+                }
+            };
+            for _ in 0..probe_limit {
+                if audit.next_sequence > audit.target_sequence {
+                    let current = self.current_provider_recovery_root()?;
+                    if current.acceptance_sequence > audit.target_sequence {
+                        audit.target_sequence = current.acceptance_sequence;
+                        continue;
                     }
-                    #[cfg(not(test))]
-                    {
-                        MAX_PROVIDER_ACCEPTED_AUDIT_PROBES_PER_TICK
+                    if current.acceptance_sequence != audit.target_sequence {
+                        return Err(SyncRuntimeRequestError::ActorRefused(
+                            "accepted manifest audit observed a non-monotonic accepted sequence"
+                                .into(),
+                        ));
                     }
-                };
-                for _ in 0..probe_limit {
-                    if audit.next_sequence > audit.target_sequence {
-                        let current = self.current_provider_recovery_root()?;
-                        if current.acceptance_sequence > audit.target_sequence {
-                            audit.target_sequence = current.acceptance_sequence;
-                            continue;
-                        }
-                        if current.acceptance_sequence != audit.target_sequence {
-                            return Err(SyncRuntimeRequestError::ActorRefused(
-                                "accepted manifest audit observed a non-monotonic accepted sequence"
-                                    .into(),
-                            ));
-                        }
-                        return Ok(Some(current));
-                    }
-                    #[cfg(test)]
-                    {
-                        let mut instrumentation =
-                            PROVIDER_TRAVERSAL_INSTRUMENTATION.lock().unwrap();
-                        let counters = instrumentation
-                            .entry(self.binding.workspace_id())
-                            .or_default();
-                        counters.accepted_manifest_audit_probes += 1;
-                        counters
-                            .first_accepted_manifest_audit_sequence
-                            .get_or_insert(audit.next_sequence);
-                        counters.last_accepted_manifest_audit_sequence = Some(audit.next_sequence);
-                    }
-                    let (batch_id, evidence) = self
+                    return Ok(ProviderAcceptedManifestAuditTick::Complete(current));
+                }
+                #[cfg(test)]
+                {
+                    let mut instrumentation = PROVIDER_TRAVERSAL_INSTRUMENTATION.lock().unwrap();
+                    let counters = instrumentation
+                        .entry(self.binding.workspace_id())
+                        .or_default();
+                    counters.accepted_manifest_audit_probes += 1;
+                    counters
+                        .first_accepted_manifest_audit_sequence
+                        .get_or_insert(audit.next_sequence);
+                    counters.last_accepted_manifest_audit_sequence = Some(audit.next_sequence);
+                }
+                let (batch_id, evidence) = self
+                    .runtime
+                    .as_ref()
+                    .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
+                    .engine()
+                    .accepted_batch_entry_at(audit.next_sequence)
+                    .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
+                    .ok_or_else(|| {
+                        SyncRuntimeRequestError::ActorRefused(format!(
+                            "accepted manifest audit is missing sequence {}",
+                            audit.next_sequence
+                        ))
+                    })?;
+                let evidence = match evidence {
+                    Some(evidence) => evidence,
+                    None => self
                         .runtime
                         .as_ref()
                         .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
                         .engine()
-                        .accepted_batch_entry_at(audit.next_sequence)
-                        .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?
-                        .ok_or_else(|| {
-                            SyncRuntimeRequestError::ActorRefused(format!(
-                                "accepted manifest audit is missing sequence {}",
-                                audit.next_sequence
-                            ))
-                        })?;
-                    let evidence = match evidence {
-                        Some(evidence) => evidence,
-                        None => self
-                            .runtime
-                            .as_ref()
-                            .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
-                            .engine()
-                            .accepted_batch_evidence(batch_id)
-                            .map_err(|error| {
-                                SyncRuntimeRequestError::ActorRefused(error.to_string())
-                            })?,
-                    };
-                    let manifestless = self
-                        .runtime
-                        .as_ref()
-                        .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
-                        .engine()
-                        .accepted_frontier_batch_allows_manifestless_provider(batch_id)
+                        .accepted_batch_evidence(batch_id)
                         .map_err(|error| {
                             SyncRuntimeRequestError::ActorRefused(error.to_string())
-                        })?;
-                    if manifestless != Some(true) {
-                        let expected_fingerprint = evidence.manifest_fingerprint();
-                        match store.inspect_batch(batch_id).map_err(|error| {
-                            SyncRuntimeRequestError::ActorRefused(error.to_string())
-                        })? {
-                            crate::oplog::BatchInspection::Ready(_) => {
-                                let local_bytes =
-                                    store.read_manifest_bytes(batch_id).map_err(|error| {
-                                        SyncRuntimeRequestError::ActorRefused(error.to_string())
-                                    })?;
-                                if ContentDigest::of(&local_bytes) != expected_fingerprint {
-                                    return Err(SyncRuntimeRequestError::ActorRefused(format!(
-                                        "accepted local manifest fingerprint changed for {batch_id}"
-                                    )));
-                                }
-                                if !provider_manifest_present_with_fingerprint(
-                                    self.provider
-                                        .as_ref()
-                                        .ok_or(SyncRuntimeRequestError::ActorUnavailable)?,
-                                    descriptor,
-                                    batch_id,
-                                    expected_fingerprint,
-                                )? {
-                                    let manifest =
-                                        OperationBatch::decode(&local_bytes).map_err(|error| {
-                                            SyncRuntimeRequestError::ActorRefused(error.to_string())
-                                        })?;
-                                    for object in manifest.required_objects() {
-                                        let path =
-                                            format!("objects/{}.object", object.content_digest());
-                                        let local_object = store
-                                            .read_object_bytes(object.content_digest())
-                                            .map_err(|error| {
-                                                SyncRuntimeRequestError::ActorRefused(
-                                                    error.to_string(),
-                                                )
-                                            })?;
-                                        match self
-                                            .provider
-                                            .as_ref()
-                                            .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
-                                            .read_exact(&path)
-                                            .map_err(|error| {
-                                                SyncRuntimeRequestError::ActorRefused(
-                                                    error.to_string(),
-                                                )
-                                            })? {
-                                            Some(provider_object)
-                                                if provider_object == local_object => {}
-                                            Some(_) => {
-                                                return Err(SyncRuntimeRequestError::ActorRefused(
-                                                    format!(
-                                                        "accepted provider object conflicts at {path}"
-                                                    ),
-                                                ));
-                                            }
-                                            None => self
-                                                .provider
-                                                .as_mut()
-                                                .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
-                                                .publish_object(
-                                                    object.content_digest(),
-                                                    &local_object,
-                                                )
-                                                .map_err(|error| {
-                                                    SyncRuntimeRequestError::ActorRefused(
-                                                        error.to_string(),
-                                                    )
-                                                })?,
-                                        }
-                                    }
-                                    provider_accepted_audit_cut(
-                                        descriptor.workspace_id(),
-                                        batch_id,
-                                        "repair_publication",
-                                    )?;
-                                    publish_manifest_recovery(
-                                        self.provider
-                                            .as_mut()
-                                            .ok_or(SyncRuntimeRequestError::ActorUnavailable)?,
-                                        descriptor,
-                                        &manifest,
-                                        &local_bytes,
-                                    )?;
-                                    self.provider
-                                        .as_mut()
-                                        .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
-                                        .publish_manifest(batch_id, &local_bytes)
-                                        .map_err(|error| {
-                                            SyncRuntimeRequestError::ActorRefused(error.to_string())
-                                        })?;
-                                    self.provider_head_dirty = true;
-                                }
-                            }
-                            crate::oplog::BatchInspection::Absent
-                            | crate::oplog::BatchInspection::Staged { .. } => {
-                                if provider_manifest_present_with_fingerprint(
-                                    self.provider
-                                        .as_ref()
-                                        .ok_or(SyncRuntimeRequestError::ActorUnavailable)?,
-                                    descriptor,
-                                    batch_id,
-                                    expected_fingerprint,
-                                )? {
-                                    let path = format!("manifests/{batch_id}.manifest");
-                                    let bytes = self
-                                        .provider
-                                        .as_ref()
-                                        .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
-                                        .read_exact(&path)
-                                        .map_err(|error| {
-                                            SyncRuntimeRequestError::ActorRefused(error.to_string())
-                                        })?
-                                        .ok_or_else(|| {
-                                            SyncRuntimeRequestError::ActorRefused(format!(
-                                                "accepted provider manifest disappeared at {path}"
-                                            ))
-                                        })?;
-                                    let manifest =
-                                        OperationBatch::decode(&bytes).map_err(|error| {
-                                            SyncRuntimeRequestError::ActorRefused(error.to_string())
-                                        })?;
-                                    publish_manifest_recovery(
-                                        self.provider
-                                            .as_mut()
-                                            .ok_or(SyncRuntimeRequestError::ActorUnavailable)?,
-                                        descriptor,
-                                        &manifest,
-                                        &bytes,
-                                    )?;
-                                    if !self.provider_exact.contains(&path) {
-                                        self.provider_exact.push_back(path);
-                                    }
-                                } else {
-                                    let recovery = load_provider_manifest_recovery_exact(
-                                        self.provider
-                                            .as_ref()
-                                            .ok_or(SyncRuntimeRequestError::ActorUnavailable)?,
-                                        descriptor,
-                                        batch_id,
-                                    )?;
-                                    if let Some((_manifest, bytes)) = recovery {
-                                        if ContentDigest::of(&bytes) != expected_fingerprint {
-                                            return Err(SyncRuntimeRequestError::ActorRefused(format!(
-                                                "accepted provider recovery fingerprint changed for {batch_id}"
-                                            )));
-                                        }
-                                        self.provider
-                                            .as_mut()
-                                            .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
-                                            .publish_manifest(batch_id, &bytes)
-                                            .map_err(|error| {
-                                                SyncRuntimeRequestError::ActorRefused(
-                                                    error.to_string(),
-                                                )
-                                            })?;
-                                        let path = format!("manifests/{batch_id}.manifest");
-                                        if !self.provider_exact.contains(&path) {
-                                            self.provider_exact.push_back(path);
-                                        }
-                                    } else {
-                                        self.provider_accepted_archive_loss.insert(batch_id);
-                                        return Ok(None);
-                                    }
-                                }
-                            }
-                        }
+                        })?,
+                };
+                let manifestless = self
+                    .runtime
+                    .as_ref()
+                    .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
+                    .engine()
+                    .accepted_frontier_batch_allows_manifestless_provider(batch_id)
+                    .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+                if manifestless != Some(true) {
+                    if !self.prove_provider_accepted_manifest_exact(
+                        store,
+                        descriptor,
+                        batch_id,
+                        evidence.manifest_fingerprint(),
+                    )? {
+                        return Ok(ProviderAcceptedManifestAuditTick::AwaitingExactProof);
                     }
-                    if audit.advances_coverage {
-                        self.provider_accepted_manifest_audit_covered_sequence =
-                            audit.next_sequence;
-                    } else {
-                        self.provider_accepted_manifest_revalidation_next_sequence =
-                            audit.next_sequence.checked_add(1).ok_or_else(|| {
-                                SyncRuntimeRequestError::ActorRefused(
-                                    "accepted manifest revalidation sequence overflow".into(),
-                                )
-                            })?;
-                    }
-                    audit.next_sequence = audit.next_sequence.checked_add(1).ok_or_else(|| {
-                        SyncRuntimeRequestError::ActorRefused(
-                            "accepted manifest audit sequence overflow".into(),
-                        )
-                    })?;
                 }
-                Ok(None)
-            })();
+                if audit.advances_coverage {
+                    self.provider_accepted_manifest_audit_covered_sequence = audit.next_sequence;
+                } else {
+                    self.provider_accepted_manifest_revalidation_next_sequence =
+                        audit.next_sequence.checked_add(1).ok_or_else(|| {
+                            SyncRuntimeRequestError::ActorRefused(
+                                "accepted manifest revalidation sequence overflow".into(),
+                            )
+                        })?;
+                }
+                audit.next_sequence = audit.next_sequence.checked_add(1).ok_or_else(|| {
+                    SyncRuntimeRequestError::ActorRefused(
+                        "accepted manifest audit sequence overflow".into(),
+                    )
+                })?;
+            }
+            Ok(ProviderAcceptedManifestAuditTick::PageExhausted)
+        })();
         match result {
-            Ok(Some(current)) => {
+            Ok(ProviderAcceptedManifestAuditTick::Complete(current)) => {
                 if audit.advances_coverage {
                     self.provider_accepted_manifest_audit_covered_sequence =
                         current.acceptance_sequence;
@@ -8383,7 +8384,12 @@ impl RuntimeActor {
                 self.provider_head_dirty = true;
                 Ok(true)
             }
-            Ok(None) => {
+            Ok(ProviderAcceptedManifestAuditTick::AwaitingExactProof) => {
+                self.provider_accepted_manifest_audit = Some(audit);
+                self.publish_provider_accepted_manifest_audit_checkpoint(descriptor)?;
+                Ok(true)
+            }
+            Ok(ProviderAcceptedManifestAuditTick::PageExhausted) => {
                 if audit.advances_coverage {
                     self.provider_accepted_manifest_audit = Some(audit);
                 } else {
@@ -19569,7 +19575,7 @@ mod tests {
         );
         assert!(matches!(
             repaired.clean_shutdown(),
-            Ok(SyncShutdownOutcome::Safe(snapshot)) if snapshot.provider_pending == 0
+            Ok(SyncShutdownOutcome::Safe(ref snapshot)) if snapshot.provider_pending == 0
         ));
     }
 
@@ -19907,6 +19913,176 @@ mod tests {
         replacement
     }
 
+    fn own_provider_manifest_audit_coverage(fixture: &ActivationFixture) -> Option<u64> {
+        fs::read_dir(
+            fixture
+                .request
+                .provider_root
+                .join("outbox")
+                .join(SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE),
+        )
+        .unwrap()
+        .map(Result::unwrap)
+        .filter_map(|entry| {
+            let relative = format!(
+                "{SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE}/{}",
+                entry.file_name().to_string_lossy()
+            );
+            SharedProviderFrontierHeadV1::decode(&relative, &fs::read(entry.path()).unwrap())
+                .ok()
+                .filter(|head| head.author_device_id() == fixture.request.identities.device_id)
+                .and_then(|head| head.accepted_manifest_audit_coverage_sequence())
+        })
+        .max()
+    }
+
+    fn own_provider_manifest_audit_is_current(fixture: &ActivationFixture) -> bool {
+        fs::read_dir(
+            fixture
+                .request
+                .provider_root
+                .join("outbox")
+                .join(SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE),
+        )
+        .unwrap()
+        .map(Result::unwrap)
+        .any(|entry| {
+            let relative = format!(
+                "{SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE}/{}",
+                entry.file_name().to_string_lossy()
+            );
+            SharedProviderFrontierHeadV1::decode(&relative, &fs::read(entry.path()).unwrap())
+                .is_ok_and(|head| {
+                    head.author_device_id() == fixture.request.identities.device_id
+                        && head.has_current_accepted_manifest_audit_coverage()
+                })
+        })
+    }
+
+    fn own_provider_manifest_revalidation_cursor(fixture: &ActivationFixture) -> Option<u64> {
+        fs::read_dir(
+            fixture
+                .request
+                .provider_root
+                .join("outbox")
+                .join(SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE),
+        )
+        .unwrap()
+        .map(Result::unwrap)
+        .filter_map(|entry| {
+            let relative = format!(
+                "{SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE}/{}",
+                entry.file_name().to_string_lossy()
+            );
+            SharedProviderFrontierHeadV1::decode(&relative, &fs::read(entry.path()).unwrap())
+                .ok()
+                .filter(|head| head.author_device_id() == fixture.request.identities.device_id)
+                .and_then(|head| head.accepted_manifest_revalidation_next_sequence())
+        })
+        .max()
+    }
+
+    #[test]
+    fn accepted_non_tip_object_loss_fences_checkpoint_until_repaired() {
+        let (fixture, first_batch) =
+            accepted_non_tip_audit_fixture("provider-nontip-object-audit", 0xbb40_1000);
+        let initial_revalidation = own_provider_manifest_revalidation_cursor(&fixture);
+
+        let provider_manifest = fixture
+            .request
+            .provider_root
+            .join(format!("outbox/manifests/{first_batch}.manifest"));
+        let manifest = OperationBatch::decode(&fs::read(&provider_manifest).unwrap()).unwrap();
+        let lost_object = manifest
+            .required_objects()
+            .iter()
+            .find(|object| object.kind() == crate::oplog::ObjectKind::SemanticEffect)
+            .expect("accepted fixture manifest has a semantic-effect object")
+            .content_digest();
+        let provider_object = fixture
+            .request
+            .provider_root
+            .join(format!("outbox/objects/{lost_object}.object"));
+        let reopened = active_handle(SyncRuntimeHandle::open(reopen_request(&fixture.request)));
+        fs::remove_file(&provider_object).unwrap();
+        fail_once_at_provider_accepted_audit_cut(
+            fixture.request.identities.workspace_id,
+            first_batch,
+            ProviderAcceptedAuditTestCut::RepairPublication,
+        );
+        let mut reached_repair = false;
+        for _ in 0..4_096 {
+            match reopened.tick_provider_for_test().unwrap() {
+                SyncRuntimeTick::RecoveryBlocked(detail)
+                    if detail.contains("repair_publication") =>
+                {
+                    reached_repair = true;
+                    break;
+                }
+                SyncRuntimeTick::Idle | SyncRuntimeTick::Recovering => {}
+                other => panic!("accepted-object audit failed before its repair cut: {other:?}"),
+            }
+        }
+        assert!(reached_repair, "accepted-object audit never reached repair");
+        assert!(!provider_object.exists());
+        assert_eq!(
+            own_provider_manifest_revalidation_cursor(&fixture),
+            initial_revalidation,
+            "accepted audit revalidation advanced past an unproven required object"
+        );
+
+        settle_shared_provider_authority(&reopened);
+        assert!(provider_manifest.is_file() && provider_object.is_file());
+        assert!(own_provider_manifest_audit_is_current(&fixture));
+        assert_eq!(reopened.status().unwrap().provider_pending, 0);
+    }
+
+    #[test]
+    fn accepted_audit_ingests_absent_local_manifest_before_checkpointing() {
+        let (fixture, first_batch) =
+            accepted_non_tip_audit_fixture("provider-audit-absent-local", 0xbb40_2000);
+        let full = replace_own_provider_head_audit_authority(&fixture, 1, None);
+        let first_sequence = full.accepted_generation() - 2;
+        let initial_coverage = first_sequence - 1;
+        replace_own_provider_head_audit_authority(&fixture, initial_coverage, None);
+        PROVIDER_ACCEPTED_AUDIT_LIMIT_OVERRIDES
+            .lock()
+            .unwrap()
+            .insert(fixture.request.identities.workspace_id, 1);
+
+        let reopened = active_handle(SyncRuntimeHandle::open(reopen_request(&fixture.request)));
+        let local_manifest = fixture
+            .request
+            .archive_root
+            .join("batches")
+            .join(format!("{first_batch}.manifest"));
+        fs::remove_file(&local_manifest).unwrap();
+        fail_once_at_provider_accepted_audit_cut(
+            fixture.request.identities.workspace_id,
+            first_batch,
+            ProviderAcceptedAuditTestCut::ProviderRead,
+        );
+        tick_until_provider_audit_cut(&reopened, "provider_read");
+        assert!(!local_manifest.exists());
+        assert_eq!(
+            own_provider_manifest_audit_coverage(&fixture),
+            Some(initial_coverage),
+            "accepted audit checkpoint advanced before exact local ingestion"
+        );
+
+        settle_shared_provider_authority(&reopened);
+        PROVIDER_ACCEPTED_AUDIT_LIMIT_OVERRIDES
+            .lock()
+            .unwrap()
+            .remove(&fixture.request.identities.workspace_id);
+        assert!(
+            local_manifest.is_file(),
+            "accepted provider manifest was not re-ingested into the absent local archive"
+        );
+        assert!(own_provider_manifest_audit_is_current(&fixture));
+        assert_eq!(reopened.status().unwrap().provider_pending, 0);
+    }
+
     #[test]
     fn accepted_non_tip_revalidation_repairs_before_following_mutation() {
         let (fixture, first_batch) =
@@ -20060,10 +20236,16 @@ mod tests {
     }
 
     fn tick_until_provider_audit_cut(handle: &SyncRuntimeHandle, expected: &str) {
-        match handle.clean_shutdown() {
-            Err(SyncRuntimeRequestError::ActorRefused(detail)) if detail.contains(expected) => {}
-            other => panic!("accepted audit cut was not retained as work: {other:?}"),
+        for _ in 0..4_096 {
+            match handle.tick_provider_for_test() {
+                Ok(SyncRuntimeTick::RecoveryBlocked(detail)) if detail.contains(expected) => {
+                    return;
+                }
+                Ok(SyncRuntimeTick::Idle | SyncRuntimeTick::Recovering) => {}
+                other => panic!("accepted audit cut was not retained as work: {other:?}"),
+            }
         }
+        panic!("accepted audit never reached the deterministic {expected} cut");
     }
 
     #[test]
@@ -20088,10 +20270,14 @@ mod tests {
         settle_shared_provider_authority(&reopened);
         let traversal = provider_traversal_instrumentation(fixture.request.identities.workspace_id);
         assert_eq!(traversal.full_scan_entries, 0, "{traversal:?}");
-        assert!(matches!(
-            reopened.clean_shutdown(),
-            Ok(SyncShutdownOutcome::Safe(snapshot)) if snapshot.provider_pending == 0
-        ));
+        let shutdown = reopened.clean_shutdown();
+        assert!(
+            matches!(
+                shutdown,
+                Ok(SyncShutdownOutcome::Safe(ref snapshot)) if snapshot.provider_pending == 0
+            ),
+            "accepted audit retry did not permit Safe: {shutdown:?}"
+        );
     }
 
     #[test]
