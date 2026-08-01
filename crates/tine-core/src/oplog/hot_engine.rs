@@ -6203,6 +6203,22 @@ impl ShardedHotEngine {
                 timing.resume_restore = phase_started.elapsed();
             });
         }
+        let outcomes = self.replay_operational_history(committed_manifests, true)?;
+        Ok((outcomes, rotation))
+    }
+
+    /// Replay every immutable record not covered by an authenticated adopted
+    /// predecessor, then close the operational recovery proof.
+    ///
+    /// Startup normally enters here after adoption has either succeeded or
+    /// rotated away. Deferred-catalog recovery also uses this exact loop after
+    /// it has rotated the already-open engine to a fresh retained run, which
+    /// keeps the exceptional recovery path identical to ordinary full replay.
+    fn replay_operational_history(
+        &mut self,
+        committed_manifests: &[OperationBatch],
+        _record_open_timing: bool,
+    ) -> Result<Vec<StageOutcome>, EngineError> {
         let mut outcomes = Vec::with_capacity(committed_manifests.len());
         // A promoted lineage's oldest durable records are its bootstrap parts,
         // which live in the immutable bootstrap namespace. They are replayed
@@ -6219,9 +6235,11 @@ impl ShardedHotEngine {
         if let Some(plan) = self.retained_bootstrap_recovery_plan()? {
             if !self.adopted_predecessor_covers_bootstrap(&plan)? {
                 #[cfg(test)]
-                update_enrolled_projection_open_instrumentation(|timing| {
-                    timing.bootstrap_parts_examined = plan.part_count;
-                });
+                if _record_open_timing {
+                    update_enrolled_projection_open_instrumentation(|timing| {
+                        timing.bootstrap_parts_examined = plan.part_count;
+                    });
+                }
                 for ordinal in 0..plan.part_count {
                     let part = plan
                         .publication
@@ -6251,9 +6269,11 @@ impl ShardedHotEngine {
             }
         }
         #[cfg(test)]
-        update_enrolled_projection_open_instrumentation(|timing| {
-            timing.bootstrap_part_recovery = phase_started.elapsed();
-        });
+        if _record_open_timing {
+            update_enrolled_projection_open_instrumentation(|timing| {
+                timing.bootstrap_part_recovery = phase_started.elapsed();
+            });
+        }
         for manifest in committed_manifests {
             if self.covered_by_predecessor_state(manifest.batch_id())? {
                 continue;
@@ -6266,7 +6286,7 @@ impl ShardedHotEngine {
             outcomes.push(outcome);
         }
         self.finish_operational_recovery_replay()?;
-        Ok((outcomes, rotation))
+        Ok(outcomes)
     }
 
     /// Whether one durable batch is already covered by the authenticated
@@ -7289,6 +7309,34 @@ impl ShardedHotEngine {
         Ok(())
     }
 
+    /// Retire an adopted run whose deferred catalog could not authenticate.
+    ///
+    /// The refused run is reconstructible accelerator state, never authority.
+    /// Rotate away from it, reset every run-local derivative, and take the
+    /// ordinary authenticated full-replay path over the immutable bootstrap
+    /// and oplog records. The caller may publish the resulting clean retained
+    /// run only after this returns; until then the original refusal remains the
+    /// result of the attempted mutation.
+    pub(crate) fn recover_from_deferred_catalog_refusal(&mut self) -> Result<(), EngineError> {
+        if self.deferred_catalog_checkpoint.is_none() {
+            return Err(EngineError::Archive(
+                "deferred catalog recovery requires an adopted catalog checkpoint".into(),
+            ));
+        }
+        let committed_manifests = self
+            .archive_store
+            .as_ref()
+            .ok_or_else(|| EngineError::Archive("engine has no immutable archive store".into()))?
+            .committed_manifests()
+            .map_err(|error| EngineError::Archive(error.to_string()))?;
+        self.validate_retained_bootstrap_publication()?;
+        self.rotate_to_fresh_retained_scratch()?;
+        self.prepare_operational_recovery_replay()?;
+        self.resume_observation.adopted = false;
+        self.replay_operational_history(&committed_manifests, false)?;
+        Ok(())
+    }
+
     /// Rebuild every run-local derived structure from the retained
     /// authenticated durable roots, without replaying immutable history.
     ///
@@ -7412,6 +7460,7 @@ impl ShardedHotEngine {
             self.verify_current_durable_page_name_authority()?;
         }
         let reference_policy = self.reference_catalog.policy().clone();
+        let catalog_hot_state_loads = self.catalog_hot_state_loads.get();
         let mut replay = Self::new(
             self.workspace_id,
             self.lineage_digest,
@@ -7437,6 +7486,7 @@ impl ShardedHotEngine {
         // has authenticated the predecessor it names.
         replay.replay_base_generation = 0;
         replay.resume_observation = self.resume_observation;
+        replay.catalog_hot_state_loads.set(catalog_hot_state_loads);
         replay.block_claim_index = self.block_claim_index.take();
         replay.logseq_claim_index = self.logseq_claim_index.take();
         replay.portable_path_index = self.portable_path_index.take();

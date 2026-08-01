@@ -255,8 +255,11 @@
 //! otherwise valid `Unsafe -> Safe` handoff.
 //!
 //! Neither status vends a scan, a reachability proof, a record, or any deletion
-//! surface, and neither is read by any admission path: the accelerator is
-//! absent from the keystroke, authoring, and acceptance paths entirely.
+//! surface, and neither is read by ordinary admission: the accelerator is
+//! absent from successful keystroke, authoring, and acceptance paths. The one
+//! exceptional boundary is a deferred catalog authentication refusal, which
+//! refuses that mutation, fully replays immutable history into a fresh run,
+//! and publishes its replacement so the damaged run cannot be re-adopted.
 //!
 //! A proven pathname/file-identity replacement latches a terminal
 //! [`RuntimeRevocation`]; inability to perform an identity check refuses only
@@ -2888,9 +2891,38 @@ impl PromotedLocalRuntime {
         // A mutation cannot use that projection as authority: authenticate and
         // install the retained catalog before any admission proof or handoff
         // transition can authorize engine work.
-        self.engine
-            .authenticate_lazy_catalog_for_mutation()
-            .map_err(RuntimePromotionError::Engine)?;
+        if let Err(refusal) = self.engine.authenticate_lazy_catalog_for_mutation() {
+            // The refused bytes are an accelerator, never mutation authority.
+            // Recover from immutable history into a fresh retained run, then
+            // durably replace the point that named the damaged run. This is
+            // exceptional lifecycle work, reached only by the first refused
+            // mutation of an exact-current adopted open; the mutation still
+            // receives its original authentication refusal.
+            authority.authenticate_runtime(graph, &self.engine)?;
+            let projection = &self.projection;
+            self.revocation
+                .reprove_with(WorkspaceAuthorityBoundary::ResumePublication, || {
+                    projection.revalidate_workspace_lease_identity()
+                })?;
+            if let Err(recovery) = self.engine.recover_from_deferred_catalog_refusal() {
+                return Err(RuntimePromotionError::Engine(EngineError::Archive(
+                    format!(
+                        "deferred catalog authentication refused ({refusal}); full-replay recovery failed: {recovery}"
+                    ),
+                )));
+            }
+            self.post_open_publication_available = false;
+            let retirement = self.publish_quiescent_resume_point_inner(authority, graph);
+            self.resume_publication = Some(retirement.clone());
+            if !matches!(retirement, ResumePublicationStatus::Published { .. }) {
+                return Err(RuntimePromotionError::Engine(EngineError::Archive(
+                    format!(
+                        "deferred catalog authentication refused ({refusal}); recovered history but could not durably retire the adopted accelerator: {retirement:?}"
+                    ),
+                )));
+            }
+            return Err(RuntimePromotionError::Engine(refusal));
+        }
         // Live graph capability and enrolled engine binding, before any journal
         // state is settled. A foreign graph or engine is refused here.
         authority.authenticate_runtime(graph, &self.engine)?;

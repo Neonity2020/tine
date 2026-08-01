@@ -8674,7 +8674,9 @@ fn ordinary_admissions_do_no_resume_lifecycle_work() {
 
 /// An exact-current adopted open may serve projected reads while the engine
 /// catalog stays cold, but it must authenticate the retained catalog bytes
-/// before admitting the first mutation.
+/// before admitting the first mutation. If that authentication refuses, the
+/// damaged accelerator is replaced only after an ordinary immutable-history
+/// replay, so it cannot trap every later restart in the same write refusal.
 #[test]
 fn first_mutation_refuses_when_deferred_catalog_bytes_are_missing() {
     on_a_deep_stack(|| {
@@ -8729,11 +8731,44 @@ fn first_mutation_refuses_when_deferred_catalog_bytes_are_missing() {
                     error,
                     RuntimePromotionError::Engine(EngineError::Archive(_))
                 ));
-                assert_eq!(
-                    runtime.engine().instrumentation().catalog_hot_state_loads,
-                    1
+                assert!(
+                    runtime.engine().instrumentation().catalog_hot_state_loads > 1,
+                    "the refused deferred read must be followed by ordinary replay"
+                );
+                assert!(
+                    !retained_run_directories(&fixture.archive_root).contains(&runs[0]),
+                    "the refused adopted run must be durably retired after full replay"
                 );
             },
+        );
+
+        let recovered = with_reopened_runtime(
+            &fixture,
+            &root,
+            &binding,
+            &paths,
+            session,
+            |fixture, authority, runtime| {
+                append_local_batch(fixture, authority, runtime, 0xE7A0);
+                public_runtime_observation(runtime)
+            },
+        );
+        remove_every_resume_point(&fixture.archive_root);
+        let replayed = with_reopened_runtime(
+            &fixture,
+            &root,
+            &binding,
+            &paths,
+            session,
+            |_, _, runtime| {
+                assert!(!runtime.resume_open_status().adopted());
+                public_runtime_observation(runtime)
+            },
+        );
+        assert_publicly_indistinguishable(
+            &recovered,
+            &replayed,
+            "deferred-catalog refusal recovery must preserve clean replay equivalence",
         );
         fixture.assert_graph_unchanged();
     });
